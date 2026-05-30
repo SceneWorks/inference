@@ -18,7 +18,7 @@ jobs:
     # since MLX's default Metal device is not thread-safe).
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Toolchain versions
         run: |
