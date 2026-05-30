@@ -10,3 +10,4 @@ categories = ["science"]
 readme = "README.md"
 
 [dependencies]
+mlx-rs = "0.25"
