@@ -7,8 +7,7 @@ use mlx_rs::{
     Array, Dtype,
 };
 
-/// Crate-local result type. Refined into a typed error enum in a later story.
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use crate::Result;
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
