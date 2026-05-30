@@ -11,3 +11,4 @@ readme = "README.md"
 
 [dependencies]
 mlx-rs = "0.25"
+thiserror = "2"

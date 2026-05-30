@@ -7,11 +7,14 @@
 //!
 //! Planned families: FLUX / FLUX.2, Qwen-Image, Z-Image (image); Wan2.2, LTX
 //! (video). Adapters: LoRA, LoKr (with stacking), ControlNet.
-
-/// Crate-wide result type. Refined into a typed error enum in a later story.
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+//!
+//! Architecture: a *disciplined hybrid* of the frozen Python mflux fork — see
+//! [`ARCHITECTURE.md`](https://github.com/michaeltrefry/mlx-gen/blob/main/ARCHITECTURE.md).
 
 pub mod adapters;
+pub mod error;
 pub mod models;
 pub mod quant;
 pub mod weights;
+
+pub use error::{Error, Result};

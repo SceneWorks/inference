@@ -6,7 +6,7 @@ use std::path::Path;
 
 use mlx_rs::{Array, Dtype};
 
-use crate::Result;
+use crate::{Error, Result};
 
 /// A loaded set of named tensors (dotted keys, e.g. `"layers.0.attention.to_q.weight"`)
 /// plus the file's string metadata (e.g. a LoKr adapter's `networkType` / `alpha` / `rank`).
@@ -53,7 +53,7 @@ impl Weights {
     pub fn require(&self, key: &str) -> Result<&Array> {
         self.tensors
             .get(key)
-            .ok_or_else(|| format!("missing tensor: {key}").into())
+            .ok_or_else(|| Error::MissingTensor(key.to_string()))
     }
 
     pub fn metadata(&self, key: &str) -> Option<&str> {
