@@ -1,0 +1,7 @@
+# MLX uses a shared default Metal device/stream that is NOT safe to drive from
+# multiple threads concurrently. cargo's test harness runs tests in parallel by
+# default, which SIGSEGVs once more than one test touches MLX at the same time.
+# Force the libtest harness to a single thread for the whole crate so `cargo test`
+# (and CI) just work. Individual ops are still fast; tests run sequentially.
+[env]
+RUST_TEST_THREADS = "1"

@@ -7,3 +7,5 @@
 //!
 //! Planned families: FLUX / FLUX.2, Qwen-Image, Z-Image (image); Wan2.2, LTX
 //! (video). Adapters: LoRA, LoKr (with stacking), ControlNet.
+
+pub mod adapters;
