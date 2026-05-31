@@ -2,15 +2,31 @@
 //! [`descriptor`]/[`load`] entry points and the `inventory` registration that wires it into
 //! `mlx_gen`'s registry.
 //!
-//! The DiT transformer ([`crate::transformer`]) and VAE decoder ([`crate::vae`]) are ported and
-//! parity-tested; the prompt→`cap_feats` text encoder and the flow-match Euler scheduler are
-//! not yet ported, so [`ZImageTurbo::generate`] validates the request and then reports the
-//! pipeline as pending (those are the follow-on stories to the sc-2403 restructure).
+//! [`load`] assembles the full model from a `Tongyi-MAI/Z-Image-Turbo` snapshot directory (see
+//! [`crate::loader`]) — tokenizer, Qwen text encoder, DiT transformer, VAE decoder — and
+//! [`ZImageTurbo::generate`] runs the complete prompt→image pipeline: tokenize → encode →
+//! seeded noise → flow-match Euler denoise over the DiT → VAE decode → RGB8. The chain is
+//! parity-proven against the frozen Python fork on real bf16 weights (sc-2352).
 
+use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, ModelRegistration, Progress, Result,
+    Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Result, WeightsSource,
 };
+use mlx_rs::Dtype;
+
+use crate::loader;
+use crate::pipeline::{
+    create_noise, decoded_to_image, denoise_with_progress, slice_valid, unpack_latents,
+};
+use crate::text_encoder::TextEncoder;
+use crate::transformer::ZImageTransformer;
+use crate::vae::Vae;
+
+/// Z-Image-turbo is guidance-distilled to a fixed 4-step schedule; used when a request omits
+/// `steps`.
+const DEFAULT_STEPS: u32 = 4;
 
 /// Registry id for Z-Image-turbo (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "z_image_turbo";
@@ -44,20 +60,69 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// A loaded Z-Image-turbo generator.
+/// A loaded Z-Image-turbo generator: the four model components assembled from a snapshot
+/// directory, plus the cached descriptor.
 pub struct ZImageTurbo {
     descriptor: ModelDescriptor,
+    tokenizer: TextTokenizer,
+    text_encoder: TextEncoder,
+    transformer: ZImageTransformer,
+    vae: Vae,
 }
 
 /// Construct a [`ZImageTurbo`] from a [`LoadSpec`].
 ///
-/// The DiT transformer + VAE assembly from the weight tree (and the text encoder / scheduler)
-/// land with the pipeline-completion stories; today this establishes the registered model so
-/// the contract + registry are exercised end-to-end.
-pub fn load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+/// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a `Tongyi-MAI/Z-Image-Turbo`
+/// snapshot (the diffusers multi-component tree — `tokenizer/`, `text_encoder/`, `transformer/`,
+/// `vae/`). Weights load dense at their on-disk dtype (bf16); the text encoder promotes to f32
+/// internally. Quantization and an fp32 override are not yet wired in the Rust port (the
+/// validated path is dense bf16) — both are rejected rather than silently ignored.
+pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.quantize.is_some() {
+        return Err(Error::Msg(
+            "z_image_turbo: Q4/Q8 quantization is not yet wired in the Rust port; the validated \
+             path is dense bf16 (drop `quantize` to load)"
+                .into(),
+        ));
+    }
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(
+            "z_image_turbo: only dense bf16 is wired in the Rust port; the text encoder already \
+             runs f32 internally (drop the precision override)"
+                .into(),
+        ));
+    }
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p,
+        WeightsSource::File(_) => {
+            return Err(Error::Msg(
+                "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
+                 transformer/ vae/), not a single .safetensors file"
+                    .into(),
+            ))
+        }
+    };
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
+        tokenizer: loader::load_tokenizer(root)?,
+        text_encoder: loader::load_text_encoder(root)?,
+        transformer: loader::load_transformer(root)?,
+        vae: loader::load_vae(root)?,
     }))
+}
+
+impl ZImageTurbo {
+    /// Prompt → `cap_feats` (f32): tokenize with the Qwen chat template, run the text encoder,
+    /// and slice off the padded tail to the valid caption tokens.
+    fn encode_prompt(&self, prompt: &str) -> Result<mlx_rs::Array> {
+        let t = self.tokenizer.tokenize(prompt)?;
+        let num_valid: i32 = t.attention_mask.as_slice::<i32>().iter().sum();
+        if num_valid == 0 {
+            return Err(Error::Msg("z_image_turbo: empty prompt".into()));
+        }
+        let enc = self.text_encoder.forward(&t.input_ids, &t.attention_mask)?;
+        slice_valid(&enc, num_valid)
+    }
 }
 
 impl Generator for ZImageTurbo {
@@ -72,17 +137,54 @@ impl Generator for ZImageTurbo {
     fn generate(
         &self,
         req: &GenerationRequest,
-        _on_progress: &mut dyn FnMut(Progress),
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        Err(mlx_gen::Error::Msg(
-            "z_image_turbo: end-to-end generation is not yet wired — the Qwen text encoder \
-             (prompt → cap_feats) and the flow-match Euler scheduler are pending ports \
-             (follow-on to the sc-2403 restructure). The DiT transformer and VAE decoder are \
-             ported and parity-tested."
-                .into(),
-        ))
+
+        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+
+        // Prompt → cap_feats (f32), cast to bf16 for the DiT (matches the fork's compute path).
+        let cap = self.encode_prompt(&req.prompt)?;
+        let cap = cap.as_dtype(Dtype::Bfloat16)?;
+
+        // The schedule is resolution-dependent but seed-independent — build it once.
+        let scheduler = FlowMatchEuler::for_image(steps, req.width, req.height);
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        for i in 0..req.count {
+            // Distinct seed per image in a batch (the fork's `seed + i` convention).
+            let seed = base_seed.wrapping_add(i as u64);
+            let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
+            let latents = denoise_with_progress(
+                &self.transformer,
+                &scheduler,
+                noise,
+                &cap,
+                &req.cancel,
+                on_progress,
+            )?;
+
+            on_progress(Progress::Decoding);
+            // [16,1,H,W] -> [1,16,H,W] -> [1,16,1,H,W] for VAE decode.
+            let unpacked = unpack_latents(&latents)?;
+            let sh = unpacked.shape();
+            let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]])?;
+            let decoded = self.vae.decode(&latent5)?.as_dtype(Dtype::Float32)?;
+            images.push(decoded_to_image(&decoded)?);
+        }
+        Ok(GenerationOutput::Images(images))
     }
+}
+
+/// Seed when a request omits one: nanos since the epoch (any nonzero value works; this only sets
+/// which sample is drawn, and a caller wanting reproducibility passes `req.seed`).
+fn default_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
@@ -184,5 +286,23 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&caps, &req).is_err());
+    }
+
+    #[test]
+    fn load_rejects_single_file_source() {
+        // Z-Image is a multi-component snapshot, not a single safetensors file.
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()));
+        // `Box<dyn Generator>` isn't Debug, so use `.err()` rather than `unwrap_err()`.
+        let err = load(&spec).err().expect("expected an error").to_string();
+        assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    #[test]
+    fn load_rejects_quantization() {
+        // Q4/Q8 isn't wired in the Rust port yet — reject rather than silently load bf16.
+        let spec =
+            LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(mlx_gen::Quant::Q8);
+        let err = load(&spec).err().expect("expected an error").to_string();
+        assert!(err.contains("quantization"), "got: {err}");
     }
 }
