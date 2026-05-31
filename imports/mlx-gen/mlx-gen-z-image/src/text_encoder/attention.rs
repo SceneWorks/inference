@@ -71,7 +71,8 @@ impl TextAttention {
         let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
+        // trailing `None` is the MLX ≥0.30 `sinks` arg (no attention sinks).
+        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None)?;
         let o =
             o.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;

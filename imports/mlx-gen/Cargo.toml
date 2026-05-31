@@ -14,7 +14,13 @@ categories = ["science"]
 readme = "README.md"
 
 [dependencies]
-mlx-rs = "0.25"
+# mlx-rs fork pinned to our own GitHub copy by commit SHA (supply-chain capture — immune to the
+# upstream fork being yanked/deleted). `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX
+# core v0.30.6 (vs upstream mlx-rs 0.25.3, welded to MLX 0.25.1 — 2–3.6× slower Metal kernels).
+# The mlx-c C layer is a submodule of ml-explore/mlx-c (Apple), byte-verified vs upstream v0.5.0;
+# pmetal's delta is additive Rust bindings only. Aliased as `mlx-rs` so `use mlx_rs::…` is
+# unchanged. SHA 4b43ffff = the audited 0.25.8 release commit. See the sc-2352 benchmark finding.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "4b43ffff9bb5a614572dcffd41c1bbdeb68200e0" }
 thiserror = "2"
 # Link-time model registration (the DI-container stand-in; see docs/MODEL_ARCHITECTURE.md §4).
 inventory = "0.3"

@@ -11,8 +11,14 @@ RUST_TEST_THREADS = "1"
 # (Metal 310), which trips MLX's kernel gate and defines -DMLX_METAL_NO_NAX, omitting
 # the fast steel_gemm_*_nax / steel_attention_nax kernels -> ~2.5x slower DiT per step.
 # resolve_deployment_target() in the fork honors a higher value, so no fork edit is needed.
-# force=true so a stray lower MACOSX_DEPLOYMENT_TARGET (e.g. a Tauri 10.13 default) can't
-# silently revert us to the slow Metal-310 path. NB: build.rs has no rerun-if-env-changed,
-# so a clean rebuild of pmetal-mlx-sys is required for a change here to take effect.
-# Requires macOS 26 at runtime (same floor Apple's mlx wheel already imposes). See sc-2352.
-MACOSX_DEPLOYMENT_TARGET = { value = "26.0", force = true }
+#
+# NOT forced: cargo only applies this when MACOSX_DEPLOYMENT_TARGET is unset, so a local
+# build (the shipping config) defaults to 26.0 -> Metal 400 -> NAX. CI overrides it to a
+# lower value because GitHub's hosted macOS runners cap at macos-15 / SDK 15 — they can't
+# provide SDK >= 26.2, and MLX 0.30.6's source won't even compile its CPU SIMD against
+# SDK 14. CI therefore builds at Metal 320 to verify correctness; it cannot exercise the
+# NAX fast path (that needs a macOS-26 self-hosted runner). NB: build.rs has no
+# rerun-if-env-changed, so a clean rebuild of pmetal-mlx-sys is required for a change here
+# to take effect. Requires macOS 26 at runtime for the fast path (same floor Apple's mlx
+# wheel imposes). See sc-2352.
+MACOSX_DEPLOYMENT_TARGET = "26.0"
