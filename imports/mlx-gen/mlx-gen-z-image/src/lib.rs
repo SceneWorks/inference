@@ -18,6 +18,7 @@ pub mod final_layer;
 pub mod model;
 pub mod pipeline;
 pub mod rope_embedder;
+pub mod text_encoder;
 pub mod timestep_embedder;
 pub mod transformer;
 pub mod transformer_block;
