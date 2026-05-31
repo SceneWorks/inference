@@ -99,7 +99,8 @@ impl ZImageAttention {
         let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None)?;
+        // 6th arg is `sinks` (MLX ≥0.30 attention-sinks); `None` = standard attention.
+        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
         let o = o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, dim])?;
         self.to_out.forward(&o)
     }

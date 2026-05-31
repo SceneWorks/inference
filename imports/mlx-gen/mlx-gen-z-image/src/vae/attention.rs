@@ -59,7 +59,8 @@ impl VaeAttention {
         let v = proj(&self.v_w, &self.v_b)?;
 
         let scale = (c as f32).powf(-0.5);
-        let o = scaled_dot_product_attention(&q, &k, &v, scale, None)?;
+        // trailing `None` is the MLX ≥0.30 `sinks` arg (no attention sinks).
+        let o = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
         let o = o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, h, w, c])?;
         let o = linear(&o, &self.out_w, &self.out_b)?;
 
