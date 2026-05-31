@@ -15,8 +15,10 @@
 
 pub mod image_processor;
 pub mod text_encoder;
+pub mod transformer;
 pub mod vae;
 
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
 pub use text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
+pub use transformer::{QwenTransformer, QwenTransformerConfig};
 pub use vae::QwenVae;
