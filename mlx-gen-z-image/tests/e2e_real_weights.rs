@@ -214,9 +214,18 @@ fn e2e_full_pipeline_generates_fox() {
     let snap = snapshot();
     let num_valid: i32 = g.metadata("num_valid").unwrap().parse().unwrap();
 
-    // Tokenizer parity: "a fox" with the Qwen chat template reproduces the fork's ids exactly.
+    // Drive the request from the golden's own metadata so this test tracks whatever
+    // (prompt, seed, steps, size) the golden was dumped at — no separate hardcoding to
+    // drift. dump_z_image_golden.py honors ZIMAGE_W/H/STEPS/SEED/PROMPT; this reads them back.
+    let prompt = g.metadata("prompt").unwrap().to_string();
+    let seed: u64 = g.metadata("seed").unwrap().parse().unwrap();
+    let steps: u32 = g.metadata("steps").unwrap().parse().unwrap();
+    let w: u32 = g.metadata("w").unwrap().parse().unwrap();
+    let h: u32 = g.metadata("h").unwrap().parse().unwrap();
+
+    // Tokenizer parity: the prompt with the Qwen chat template reproduces the fork's ids exactly.
     let tok = load_tokenizer(&snap).unwrap();
-    let t = tok.tokenize("a fox").unwrap();
+    let t = tok.tokenize(&prompt).unwrap();
     let take_n =
         |a: &Array| a.reshape(&[-1]).unwrap().as_slice::<i32>()[..num_valid as usize].to_vec();
     assert_eq!(
@@ -229,23 +238,26 @@ fn e2e_full_pipeline_generates_fox() {
     let spec = LoadSpec::new(WeightsSource::Dir(snap));
     let generator = mlx_gen::load("z_image_turbo", &spec).unwrap();
     let req = GenerationRequest {
-        prompt: "a fox".into(),
-        width: 256,
-        height: 256,
-        seed: Some(42),
-        steps: Some(4),
+        prompt: prompt.clone(),
+        width: w,
+        height: h,
+        seed: Some(seed),
+        steps: Some(steps),
         ..Default::default()
     };
     let mut last_step = 0u32;
     let out = generator
         .generate(&req, &mut |p| {
             if let Progress::Step { current, total } = p {
-                assert_eq!(total, 4, "step total");
+                assert_eq!(total, steps, "step total");
                 last_step = last_step.max(current);
             }
         })
         .unwrap();
-    assert_eq!(last_step, 4, "expected 4 denoise-step progress events");
+    assert_eq!(
+        last_step, steps,
+        "expected {steps} denoise-step progress events"
+    );
 
     let img = match out {
         GenerationOutput::Images(mut v) => {
@@ -254,7 +266,7 @@ fn e2e_full_pipeline_generates_fox() {
         }
         other => panic!("expected Images, got {other:?}"),
     };
-    assert_eq!((img.width, img.height), (256, 256), "image size");
+    assert_eq!((img.width, img.height), (w, h), "image size");
 
     // Save the Rust render for visual inspection.
     let out_path =
