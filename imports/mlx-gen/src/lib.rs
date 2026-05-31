@@ -20,6 +20,7 @@ pub mod nn;
 pub mod quant;
 pub mod registry;
 pub mod runtime;
+pub mod scheduler;
 pub mod tokenizer;
 pub mod transform;
 pub mod weights;
@@ -34,6 +35,7 @@ pub use registry::{load, load_transform, ModelRegistration, TransformRegistratio
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, Precision, Progress, Quant, WeightsSource,
 };
+pub use scheduler::FlowMatchEuler;
 pub use transform::{
     TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,
 };
