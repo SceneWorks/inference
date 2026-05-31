@@ -1,21 +1,22 @@
-//! sc-2352: end-to-end validation of the Z-Image port against a real-weights golden run.
+//! sc-2352 / sc-2344: end-to-end validation of the Z-Image port against a real-weights golden run.
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` weights in the HF cache and the
 //! golden produced by `tools/dump_z_image_golden.py` (gitignored, local). Run with:
 //!   cargo test -p mlx-gen-z-image --release --test e2e_real_weights -- --ignored --nocapture
 //!
-//! Validates each stage of the pipeline on real bf16 weights against the fork's intermediates.
+//! The stage tests validate each pipeline stage on real bf16 weights against the fork's
+//! intermediates; the final test drives the **public** `load(id, spec).generate(req)` API and
+//! confirms the rendered image matches the fork's golden.
 
 use std::path::PathBuf;
 
-use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::FlowMatchEuler;
-use mlx_gen_z_image::text_encoder::{TextEncoder, ZTextEncoderConfig};
-use mlx_gen_z_image::vae::{Vae, VaeDecoderConfig};
+use mlx_gen::{
+    FlowMatchEuler, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+};
 use mlx_gen_z_image::{
-    create_noise, decoded_to_image, denoise, unpack_latents, ZImageTransformer,
-    ZImageTransformerConfig,
+    decoded_to_image, denoise, load_text_encoder, load_tokenizer, load_transformer, load_vae,
+    slice_valid, unpack_latents,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -61,31 +62,20 @@ fn bf16(a: &Array) -> Array {
     a.as_dtype(Dtype::Bfloat16).unwrap()
 }
 
-/// cap_feats = encoder_out[0, :num_valid, :] via a range gather (mlx-rs has no slice op).
-fn slice_valid(encoder_out: &Array, num_valid: i32) -> Array {
-    let sh = encoder_out.shape();
-    let (s, h) = (sh[1], sh[2]);
-    let flat = encoder_out.reshape(&[s, h]).unwrap();
-    let idx = Array::from_slice(&(0..num_valid).collect::<Vec<i32>>(), &[num_valid]);
-    flat.take_axis(&idx, 0).unwrap()
-}
-
 #[test]
 #[ignore = "needs real Z-Image weights + local golden"]
 fn e2e_text_encoder_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let num_valid: i32 = g.metadata("num_valid").unwrap().parse().unwrap();
 
-    let w = Weights::from_dir(snapshot().join("text_encoder")).unwrap();
-    let enc = TextEncoder::from_weights(&w, "model", &ZTextEncoderConfig::z_image()).unwrap();
-
+    let enc = load_text_encoder(&snapshot()).unwrap();
     let out = enc
         .forward(
             g.require("input_ids").unwrap(),
             g.require("attention_mask").unwrap(),
         )
         .unwrap();
-    let cap = slice_valid(&out, num_valid);
+    let cap = slice_valid(&out, num_valid).unwrap();
 
     let golden = g.require("cap_feats").unwrap();
     assert_eq!(cap.shape(), golden.shape(), "cap_feats shape");
@@ -105,8 +95,6 @@ fn e2e_text_encoder_matches_golden() {
     println!(
         "cap_feats: max|golden|={max_abs_g:.1} max|diff|={max_diff:.3} peak_rel={peak_rel:.2e} mean|diff|={mean_diff:.5}"
     );
-    println!("mine[0..6]  = {:?}", &a[..6]);
-    println!("golden[0..6]= {:?}", &b[..6]);
     assert!(
         peak_rel < 2e-3,
         "cap_feats diverged from the fork: peak-relative error {peak_rel:.2e} >= 2e-3"
@@ -117,33 +105,12 @@ fn e2e_text_encoder_matches_golden() {
     );
 }
 
-fn load_real_transformer() -> ZImageTransformer {
-    let mut w = Weights::from_dir(snapshot().join("transformer")).unwrap();
-    for (from, to) in [
-        ("t_embedder.mlp.0.weight", "t_embedder.linear1.weight"),
-        ("t_embedder.mlp.0.bias", "t_embedder.linear1.bias"),
-        ("t_embedder.mlp.2.weight", "t_embedder.linear2.weight"),
-        ("t_embedder.mlp.2.bias", "t_embedder.linear2.bias"),
-        (
-            "all_final_layer.2-1.adaLN_modulation.1.weight",
-            "all_final_layer.2-1.adaLN_modulation.0.weight",
-        ),
-        (
-            "all_final_layer.2-1.adaLN_modulation.1.bias",
-            "all_final_layer.2-1.adaLN_modulation.0.bias",
-        ),
-    ] {
-        w.alias(from, to);
-    }
-    ZImageTransformer::from_weights(&w, "", ZImageTransformerConfig::turbo()).unwrap()
-}
-
 #[test]
 #[ignore = "needs real Z-Image weights + local golden"]
 fn e2e_transformer_single_forward_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
-    let transformer = load_real_transformer();
+    let transformer = load_transformer(&snapshot()).unwrap();
 
     // First step in f32 (rules out bf16): v0 = transformer(init, 1 - sigma[0], cap_feats).
     let timestep0 = 1.0 - sigmas[0];
@@ -173,30 +140,9 @@ fn e2e_transformer_single_forward_matches_golden() {
 fn e2e_denoise_loop_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
+    // Use the fork's exact sigmas (not a recomputed schedule) so this isolates the loop, not mu.
     let scheduler = FlowMatchEuler { sigmas };
-
-    let mut w = Weights::from_dir(snapshot().join("transformer")).unwrap();
-    // Checkpoint→internal rename: the DiT timestep embedder is `mlp.{0,2}` on disk, `linear{1,2}`
-    // internally (the fork's weight mapping). Everything else matches directly.
-    for (from, to) in [
-        ("t_embedder.mlp.0.weight", "t_embedder.linear1.weight"),
-        ("t_embedder.mlp.0.bias", "t_embedder.linear1.bias"),
-        ("t_embedder.mlp.2.weight", "t_embedder.linear2.weight"),
-        ("t_embedder.mlp.2.bias", "t_embedder.linear2.bias"),
-        // final layer's adaLN is Sequential(SiLU, Linear) -> Linear at index 1 on disk, 0 internally.
-        (
-            "all_final_layer.2-1.adaLN_modulation.1.weight",
-            "all_final_layer.2-1.adaLN_modulation.0.weight",
-        ),
-        (
-            "all_final_layer.2-1.adaLN_modulation.1.bias",
-            "all_final_layer.2-1.adaLN_modulation.0.bias",
-        ),
-    ] {
-        w.alias(from, to);
-    }
-    let transformer =
-        ZImageTransformer::from_weights(&w, "", ZImageTransformerConfig::turbo()).unwrap();
+    let transformer = load_transformer(&snapshot()).unwrap();
 
     // Match the fork's bf16 path: init noise + cap_feats fed to the DiT as bf16.
     let init = bf16(g.require("init").unwrap());
@@ -217,50 +163,11 @@ fn e2e_denoise_loop_matches_golden() {
     println!("✓ denoise loop matches golden (peak-rel {pr:.2e})");
 }
 
-/// Remap the diffusers VAE checkpoint (`decoder.*`, flat conv names, NCHW conv weights) to the
-/// crate's internal decoder naming (`conv.`/`norm.` wrappers) with conv weights transposed to
-/// NHWC `[out,kH,kW,in]`. Inserts the remapped (un-prefixed) keys alongside the originals.
-fn remap_vae_decoder(w: &mut Weights) {
-    let keys: Vec<String> = w
-        .keys()
-        .filter(|k| k.starts_with("decoder."))
-        .map(String::from)
-        .collect();
-    for k in keys {
-        let rest = k.strip_prefix("decoder.").unwrap();
-        let (target, transpose): (String, bool) = match rest {
-            "conv_in.weight" => ("conv_in.conv.weight".into(), true),
-            "conv_in.bias" => ("conv_in.conv.bias".into(), false),
-            "conv_out.weight" => ("conv_out.conv.weight".into(), true),
-            "conv_out.bias" => ("conv_out.conv.bias".into(), false),
-            "conv_norm_out.weight" => ("conv_norm_out.norm.weight".into(), false),
-            "conv_norm_out.bias" => ("conv_norm_out.norm.bias".into(), false),
-            _ => {
-                let is_conv_w = rest.ends_with(".weight")
-                    && (rest.contains(".conv1.")
-                        || rest.contains(".conv2.")
-                        || rest.contains(".conv_shortcut.")
-                        || rest.contains(".upsamplers.0.conv."));
-                (rest.to_string(), is_conv_w)
-            }
-        };
-        let t = w.require(&k).unwrap().clone();
-        let t = if transpose {
-            t.transpose_axes(&[0, 2, 3, 1]).unwrap() // NCHW -> NHWC conv weight
-        } else {
-            t
-        };
-        w.insert(target, t);
-    }
-}
-
 #[test]
 #[ignore = "needs real Z-Image weights + local golden"]
 fn e2e_vae_and_image_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
-    let mut w = Weights::from_dir(snapshot().join("vae")).unwrap();
-    remap_vae_decoder(&mut w);
-    let vae = Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image()).unwrap();
+    let vae = load_vae(&snapshot()).unwrap();
 
     // golden final_latents [16,1,H,W] -> unpack [1,16,H,W] -> [1,16,1,H,W] for decode.
     let latents = g.require("final_latents").unwrap();
@@ -273,18 +180,7 @@ fn e2e_vae_and_image_matches_golden() {
     let golden = g.require("decoded").unwrap();
     assert_eq!(decoded.shape(), golden.shape(), "decoded shape");
     let pr = peak_rel(&decoded, golden);
-    let m = decoded.as_slice::<f32>();
-    let gg = golden.as_slice::<f32>();
-    let rng = |s: &[f32]| {
-        (
-            s.iter().cloned().fold(f32::MAX, f32::min),
-            s.iter().cloned().fold(f32::MIN, f32::max),
-        )
-    };
     println!("vae: decoded peak_rel={pr:.2e} shape={:?}", decoded.shape());
-    println!("  mine range  = {:?}", rng(m));
-    println!("  golden range= {:?}", rng(gg));
-    println!("  mine[0..4]={:?} golden[0..4]={:?}", &m[..4], &gg[..4]);
     assert!(pr < 2e-2, "VAE decode diverged: peak_rel {pr:.2e}");
 
     // RGB8 image: my decoded vs the golden decoded, both through decoded_to_image.
@@ -309,27 +205,18 @@ fn e2e_vae_and_image_matches_golden() {
     );
 }
 
+/// The integration proof: the full prompt→image pipeline through the **public** Generator API
+/// (`mlx_gen::load("z_image_turbo", …).generate(req)`), compared to the fork's golden render.
 #[test]
 #[ignore = "needs real Z-Image weights + local golden"]
 fn e2e_full_pipeline_generates_fox() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let snap = snapshot();
-    let (w, h, seed, steps) = (256u32, 256u32, 42u64, 4usize);
-
-    // 1. Tokenize "a fox" with the Qwen chat template, pad to 512 — and validate the ids match
-    //    the fork's golden (proves the tokenizer + chat template).
-    let tok = TextTokenizer::from_file(
-        snap.join("tokenizer/tokenizer.json"),
-        TokenizerConfig {
-            max_length: 512,
-            pad_token_id: 151643,
-            chat_template: ChatTemplate::QwenInstruct,
-            pad_to_max_length: true,
-        },
-    )
-    .unwrap();
-    let t = tok.tokenize("a fox").unwrap();
     let num_valid: i32 = g.metadata("num_valid").unwrap().parse().unwrap();
+
+    // Tokenizer parity: "a fox" with the Qwen chat template reproduces the fork's ids exactly.
+    let tok = load_tokenizer(&snap).unwrap();
+    let t = tok.tokenize("a fox").unwrap();
     let take_n =
         |a: &Array| a.reshape(&[-1]).unwrap().as_slice::<i32>()[..num_valid as usize].to_vec();
     assert_eq!(
@@ -338,40 +225,42 @@ fn e2e_full_pipeline_generates_fox() {
         "tokenizer input_ids diverge from the fork"
     );
 
-    // 2. Text encoder -> cap_feats.
-    let te = TextEncoder::from_weights(
-        &Weights::from_dir(snap.join("text_encoder")).unwrap(),
-        "model",
-        &ZTextEncoderConfig::z_image(),
-    )
-    .unwrap();
-    let enc = te.forward(&t.input_ids, &t.attention_mask).unwrap();
-    let cap = slice_valid(&enc, num_valid);
-
-    // 3. Seeded noise -> denoise (everything bf16, matching the fork's path).
-    let transformer = load_real_transformer();
-    let scheduler = FlowMatchEuler::for_image(steps, w, h);
-    let noise = bf16(&create_noise(seed, w, h).unwrap());
-    let latents = denoise(&transformer, &scheduler, noise, &bf16(&cap)).unwrap();
-
-    // 4. VAE decode -> RGB8 image.
-    let mut vw = Weights::from_dir(snap.join("vae")).unwrap();
-    remap_vae_decoder(&mut vw);
-    let vae = Vae::from_weights(&vw, "", &VaeDecoderConfig::default_z_image()).unwrap();
-    let unpacked = unpack_latents(&latents).unwrap();
-    let sh = unpacked.shape();
-    let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]]).unwrap();
-    let decoded = vae
-        .decode(&latent5)
-        .unwrap()
-        .as_dtype(Dtype::Float32)
+    // Full pipeline through the public API: load(id, spec) -> generate(req).
+    let spec = LoadSpec::new(WeightsSource::Dir(snap));
+    let generator = mlx_gen::load("z_image_turbo", &spec).unwrap();
+    let req = GenerationRequest {
+        prompt: "a fox".into(),
+        width: 256,
+        height: 256,
+        seed: Some(42),
+        steps: Some(4),
+        ..Default::default()
+    };
+    let mut last_step = 0u32;
+    let out = generator
+        .generate(&req, &mut |p| {
+            if let Progress::Step { current, total } = p {
+                assert_eq!(total, 4, "step total");
+                last_step = last_step.max(current);
+            }
+        })
         .unwrap();
-    let img = decoded_to_image(&decoded).unwrap();
+    assert_eq!(last_step, 4, "expected 4 denoise-step progress events");
+
+    let img = match out {
+        GenerationOutput::Images(mut v) => {
+            assert_eq!(v.len(), 1, "count=1 -> one image");
+            v.pop().unwrap()
+        }
+        other => panic!("expected Images, got {other:?}"),
+    };
+    assert_eq!((img.width, img.height), (256, 256), "image size");
 
     // Save the Rust render for visual inspection.
-    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/golden/rust_fox.png");
+    let out_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/golden/rust_fox.png");
     image::save_buffer(
-        &out,
+        &out_path,
         &img.pixels,
         img.width,
         img.height,
@@ -379,8 +268,8 @@ fn e2e_full_pipeline_generates_fox() {
     )
     .unwrap();
 
-    // Compare to the fork's golden image (my latents differ from the golden by bf16-loop drift,
-    // so allow a small fraction of pixels to differ).
+    // Compare to the fork's golden image (bf16-loop drift allows a small fraction of pixels to
+    // differ).
     let gimg = decoded_to_image(g.require("decoded").unwrap()).unwrap();
     let differ = img
         .pixels
@@ -389,12 +278,12 @@ fn e2e_full_pipeline_generates_fox() {
         .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
         .count();
     println!(
-        "✓ full pipeline: prompt->image {}x{}; {} / {} pixels differ by >8 from the fork; saved {}",
+        "✓ full pipeline (public generate): prompt->image {}x{}; {} / {} pixels differ by >8 from the fork; saved {}",
         img.width,
         img.height,
         differ,
         img.pixels.len(),
-        out.display()
+        out_path.display()
     );
     assert!(
         differ < img.pixels.len() / 20,

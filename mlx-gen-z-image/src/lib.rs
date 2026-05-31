@@ -6,15 +6,17 @@
 //! `mlx_gen::load("z_image_turbo", …)` resolve. See `docs/MODEL_ARCHITECTURE.md`.
 //!
 //! Ported & parity-proven against the frozen Python mflux fork (tolerance 1e-2 — Metal runs
-//! fp32 matmul in reduced precision): the DiT transformer (block, context block, timestep /
-//! RoPE embedders, final layer, full forward) and the VAE decoder. The Qwen text encoder
-//! (prompt → `cap_feats`) and the flow-match Euler scheduler are the remaining pieces; until
-//! they land, [`ZImageTurbo::generate`](model::ZImageTurbo) reports the pipeline as pending.
+//! fp32 matmul in reduced precision) and validated end-to-end on real bf16 weights (sc-2352):
+//! the Qwen text encoder (prompt → `cap_feats`), the flow-match Euler scheduler, the DiT
+//! transformer (block, context block, timestep / RoPE embedders, final layer, full forward),
+//! and the VAE decoder. [`load`](model::load) assembles the model from a snapshot directory and
+//! [`ZImageTurbo::generate`](model::ZImageTurbo) runs the full prompt→image pipeline.
 
 pub mod attention;
 pub mod context_block;
 pub mod feed_forward;
 pub mod final_layer;
+pub mod loader;
 pub mod model;
 pub mod pipeline;
 pub mod rope_embedder;
@@ -26,8 +28,11 @@ pub mod vae;
 
 pub use context_block::ZImageContextBlock;
 pub use final_layer::FinalLayer;
+pub use loader::{load_text_encoder, load_tokenizer, load_transformer, load_vae};
 pub use model::{descriptor, load, ZImageTurbo, MODEL_ID};
-pub use pipeline::{create_noise, decoded_to_image, denoise, unpack_latents};
+pub use pipeline::{
+    create_noise, decoded_to_image, denoise, denoise_with_progress, slice_valid, unpack_latents,
+};
 pub use rope_embedder::RopeEmbedder;
 pub use timestep_embedder::TimestepEmbedder;
 pub use transformer::{ZImageTransformer, ZImageTransformerConfig};
