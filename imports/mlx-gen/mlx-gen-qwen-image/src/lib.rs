@@ -14,7 +14,9 @@
 //! first slice of the port — Qwen-Image-Edit's reference-image preprocessing.
 
 pub mod image_processor;
+pub mod text_encoder;
 pub mod vae;
 
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
+pub use text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 pub use vae::QwenVae;
