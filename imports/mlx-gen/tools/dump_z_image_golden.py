@@ -21,7 +21,14 @@ from mflux.utils.image_util import ImageUtil
 
 OUT = "/Users/michael/repos/mlx-gen/tools/golden/z_image_golden.safetensors"
 PNG = "/Users/michael/repos/mlx-gen/tools/golden/z_image_golden.png"
-PROMPT, SEED, STEPS, W, H = "a fox", 42, 4, 256, 256
+# Env-overridable so the same golden can be regenerated at any size/prompt for parity checks.
+# Defaults match the fast 256^2 stage-test baseline; set ZIMAGE_* to render at, e.g., 1024^2.
+import os
+PROMPT = os.environ.get("ZIMAGE_PROMPT", "a fox")
+SEED = int(os.environ.get("ZIMAGE_SEED", "42"))
+STEPS = int(os.environ.get("ZIMAGE_STEPS", "4"))
+W = int(os.environ.get("ZIMAGE_W", "256"))
+H = int(os.environ.get("ZIMAGE_H", "256"))
 
 
 class Holder:
