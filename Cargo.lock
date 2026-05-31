@@ -45,9 +45,9 @@ checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
 name = "bindgen"
-version = "0.70.1"
+version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
 dependencies = [
  "bitflags",
  "cexpr",
@@ -547,7 +547,7 @@ name = "mlx-gen"
 version = "0.0.0"
 dependencies = [
  "inventory",
- "mlx-rs",
+ "pmetal-mlx-rs",
  "thiserror",
  "tokenizers",
 ]
@@ -559,14 +559,13 @@ dependencies = [
  "image",
  "inventory",
  "mlx-gen",
- "mlx-rs",
+ "pmetal-mlx-rs",
 ]
 
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a7c4444d624bf6b93db5cc22ebff4fdfa13593fd56154fe33b1f302a557c2c6"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=4b43ffff9bb5a614572dcffd41c1bbdeb68200e0#4b43ffff9bb5a614572dcffd41c1bbdeb68200e0"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -578,48 +577,12 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a819ee8b4434690572b6feb9c3ef0b6e90137e4190b340cf00150703b410aaf9"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=4b43ffff9bb5a614572dcffd41c1bbdeb68200e0#4b43ffff9bb5a614572dcffd41c1bbdeb68200e0"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "mlx-rs"
-version = "0.25.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3a0f592c5839b0237b3072530b1d3c503923579a2009ee0761df3edd1b1f27b"
-dependencies = [
- "dyn-clone",
- "half",
- "itertools 0.14.0",
- "libc",
- "mach-sys",
- "mlx-internal-macros",
- "mlx-macros",
- "mlx-sys",
- "num-complex",
- "num-traits",
- "num_enum",
- "parking_lot",
- "paste",
- "smallvec",
- "strum",
- "thiserror",
-]
-
-[[package]]
-name = "mlx-sys"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e3bc3880111918b2d5018f845d48fd995f9901f16efc81d1fcfd2f4210b8219"
-dependencies = [
- "bindgen",
- "cc",
- "cmake",
 ]
 
 [[package]]
@@ -766,6 +729,39 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "pmetal-mlx-rs"
+version = "0.25.8"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=4b43ffff9bb5a614572dcffd41c1bbdeb68200e0#4b43ffff9bb5a614572dcffd41c1bbdeb68200e0"
+dependencies = [
+ "dyn-clone",
+ "half",
+ "itertools 0.14.0",
+ "libc",
+ "mach-sys",
+ "mlx-internal-macros",
+ "mlx-macros",
+ "num-complex",
+ "num-traits",
+ "num_enum",
+ "parking_lot",
+ "paste",
+ "pmetal-mlx-sys",
+ "smallvec",
+ "strum",
+ "thiserror",
+]
+
+[[package]]
+name = "pmetal-mlx-sys"
+version = "0.2.4"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=4b43ffff9bb5a614572dcffd41c1bbdeb68200e0#4b43ffff9bb5a614572dcffd41c1bbdeb68200e0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
+]
 
 [[package]]
 name = "png"
@@ -938,9 +934,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rustc-hash"
-version = "1.1.0"
+version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustversion"
