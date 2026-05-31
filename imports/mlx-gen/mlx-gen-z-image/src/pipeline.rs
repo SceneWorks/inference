@@ -4,7 +4,7 @@
 //! ([`crate::transformer`]), scheduler ([`mlx_gen::FlowMatchEuler`]) and VAE ([`crate::vae`])
 //! lands once `load()` assembles the model from weights (+ the text encoder).
 
-use mlx_gen::{FlowMatchEuler, Image, Result};
+use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Image, Progress, Result};
 use mlx_rs::ops::{add, maximum, minimum, multiply, round};
 use mlx_rs::{random, Array};
 
@@ -40,25 +40,65 @@ pub fn unpack_latents(latents: &Array) -> Result<Array> {
     Ok(latents.expand_dims(0)?.squeeze_axes(&[2])?)
 }
 
-/// Flow-match Euler denoise loop: each step predicts the velocity with the DiT and takes an
-/// Euler step. `latents` is the seeded init (see [`create_noise`]); `cap_feats` is the
+/// `cap_feats = encoder_out[0, :num_valid, :]` — drop the batch axis and the padded tail. The
+/// text encoder returns `[1, seq, hidden]` (padded to max length); the DiT consumes only the
+/// valid caption tokens. (mlx-rs has no slice op, so this is a range-gather.)
+pub fn slice_valid(encoder_out: &Array, num_valid: i32) -> Result<Array> {
+    let sh = encoder_out.shape();
+    let (s, h) = (sh[1], sh[2]);
+    let flat = encoder_out.reshape(&[s, h])?;
+    let idx = Array::from_slice(&(0..num_valid).collect::<Vec<i32>>(), &[num_valid]);
+    Ok(flat.take_axis(&idx, 0)?)
+}
+
+/// Flow-match Euler denoise loop with progress + cooperative cancellation: each step predicts the
+/// velocity with the DiT and takes an Euler step, emitting a [`Progress::Step`] and checking
+/// `cancel` between steps. `latents` is the seeded init (see [`create_noise`]); `cap_feats` is the
 /// text-encoder conditioning. Returns the final latents (pre-VAE).
 ///
 /// Mirrors the fork's loop: `timestep = 1 - sigma[t]` (the transformer applies its own
-/// `t_scale`), `latents += (sigma[t+1] - sigma[t]) * velocity`. Composes the parity-proven
-/// transformer + scheduler; full-weights numeric parity is the real-hardware E2E (sc-2352).
+/// `t_scale`), `latents += (sigma[t+1] - sigma[t]) * velocity`.
+pub fn denoise_with_progress(
+    transformer: &ZImageTransformer,
+    scheduler: &FlowMatchEuler,
+    latents: Array,
+    cap_feats: &Array,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    let mut latents = latents;
+    let total = scheduler.num_steps() as u32;
+    for t in 0..scheduler.num_steps() {
+        if cancel.is_cancelled() {
+            return Err(Error::Msg("generation cancelled".into()));
+        }
+        let velocity = transformer.forward(&latents, scheduler.timestep(t), cap_feats)?;
+        latents = scheduler.step(&latents, &velocity, t)?;
+        on_progress(Progress::Step {
+            current: t as u32 + 1,
+            total,
+        });
+    }
+    Ok(latents)
+}
+
+/// [`denoise_with_progress`] with no progress callback and no cancellation — the bare loop used
+/// by the stage-wise parity tests. Composes the parity-proven transformer + scheduler; full-weights
+/// numeric parity is the real-hardware E2E (sc-2352).
 pub fn denoise(
     transformer: &ZImageTransformer,
     scheduler: &FlowMatchEuler,
     latents: Array,
     cap_feats: &Array,
 ) -> Result<Array> {
-    let mut latents = latents;
-    for t in 0..scheduler.num_steps() {
-        let velocity = transformer.forward(&latents, scheduler.timestep(t), cap_feats)?;
-        latents = scheduler.step(&latents, &velocity, t)?;
-    }
-    Ok(latents)
+    denoise_with_progress(
+        transformer,
+        scheduler,
+        latents,
+        cap_feats,
+        &CancelFlag::default(),
+        &mut |_| {},
+    )
 }
 
 /// Decoded VAE tensor → RGB8 [`Image`]. Mirrors the fork's `ImageUtil`: denormalize
