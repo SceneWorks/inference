@@ -105,10 +105,14 @@ impl QwenTransformer {
         Ok(())
     }
 
-    /// `hidden_states`: packed image latents `[B, latent_h·latent_w, in_channels]`.
-    /// `encoder_hidden_states`: text features `[B, txt_seq, joint_attention_dim]`.
-    /// `timestep`: the scheduler sigma (flow-match time) for this step. Returns the velocity
-    /// `[B, latent_h·latent_w, patch²·out_channels]`.
+    /// `hidden_states`: packed image latents `[B, img_seq, in_channels]`. For T2I `img_seq =
+    /// latent_h·latent_w` and `cond_grids` is empty; for Qwen-Image-Edit the noise latents are
+    /// concatenated with the packed reference latents, and `cond_grids` lists each reference's
+    /// `(latent_h, latent_w)` so the RoPE covers `[noise] + references` (the dual-latent path).
+    /// `encoder_hidden_states`: text features `[B, txt_seq, joint_attention_dim]`. `timestep`: the
+    /// scheduler sigma. Returns the velocity over the **full** sequence `[B, img_seq, patch²·out]`
+    /// (the caller slices back to the noise prefix for Edit).
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         hidden_states: &Array,
@@ -117,6 +121,7 @@ impl QwenTransformer {
         timestep: f32,
         latent_h: usize,
         latent_w: usize,
+        cond_grids: &[(usize, usize)],
     ) -> Result<Array> {
         let b = hidden_states.shape()[0];
         let img_seq = hidden_states.shape()[1];
@@ -129,8 +134,12 @@ impl QwenTransformer {
         let ts = Array::from_slice(&vec![timestep; b as usize], &[b]);
         let text_emb = self.time_text_embed.forward(&ts)?;
 
+        // RoPE over the noise grid followed by each reference grid (empty for T2I).
+        let mut shapes = Vec::with_capacity(1 + cond_grids.len());
+        shapes.push((latent_h, latent_w));
+        shapes.extend_from_slice(cond_grids);
         let (img_cos, img_sin, txt_cos, txt_sin) =
-            self.rope.forward(latent_h, latent_w, txt_seq as usize)?;
+            self.rope.forward_multi(&shapes, txt_seq as usize)?;
         let mask = build_joint_mask(encoder_hidden_states_mask, b, img_seq)?;
 
         for block in &self.blocks {

@@ -7,7 +7,9 @@
 //! w/8]` only at decode. Conditioning runs **two** transformer forwards per step (positive +
 //! negative) combined by classifier-free guidance.
 
-use mlx_rs::ops::{add, divide, maximum, minimum, multiply, round, subtract, sum_axes};
+use mlx_rs::ops::{
+    add, concatenate_axis, divide, maximum, minimum, multiply, round, subtract, sum_axes,
+};
 use mlx_rs::{random, Array};
 
 use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Image, Progress, Result};
@@ -52,6 +54,18 @@ pub fn unpack_latents(latents: &Array, width: u32, height: u32) -> Result<Array>
     let x = latents.reshape(&[1, lh, lw, c, p, p])?;
     let x = x.transpose_axes(&[0, 3, 1, 4, 2, 5])?;
     Ok(x.reshape(&[1, c, lh * p, lw * p])?)
+}
+
+/// Port of `FluxLatentCreator.pack_latents` (inverse of [`unpack_latents`]): VAE latent
+/// `[1, 16, h/8, w/8]` → packed tokens `[1, (h/16)·(w/16), 64]`. Used by the Qwen-Image-Edit
+/// dual-latent path to fold the encoded reference into the transformer's token sequence.
+pub fn pack_latents(latents: &Array, width: u32, height: u32) -> Result<Array> {
+    let (lh, lw) = ((height / 16) as i32, (width / 16) as i32);
+    let c = LATENT_CHANNELS;
+    let p = PATCH as i32;
+    let x = latents.reshape(&[1, c, lh, p, lw, p])?;
+    let x = x.transpose_axes(&[0, 2, 4, 1, 3, 5])?;
+    Ok(x.reshape(&[1, lh * lw, c * p * p])?)
 }
 
 /// Qwen-Image's flow-match sigma schedule: `linspace(1, 1/n, n)` run through the exponential
@@ -143,8 +157,8 @@ pub fn denoise_with_progress(
             return Err(Error::Msg("generation cancelled".into()));
         }
         let sigma = scheduler.sigmas[t];
-        let pos = transformer.forward(&latents, pos_embeds, None, sigma, lh, lw)?;
-        let neg = transformer.forward(&latents, neg_embeds, None, sigma, lh, lw)?;
+        let pos = transformer.forward(&latents, pos_embeds, None, sigma, lh, lw, &[])?;
+        let neg = transformer.forward(&latents, neg_embeds, None, sigma, lh, lw, &[])?;
         let guided = compute_guided_noise(&pos, &neg, guidance)?;
         latents = scheduler.step(&latents, &guided, t)?;
         on_progress(Progress::Step {
@@ -153,6 +167,59 @@ pub fn denoise_with_progress(
         });
     }
     Ok(latents)
+}
+
+/// Qwen-Image-**Edit** dual-latent denoise loop. Each step concatenates the noise latents with the
+/// (static) packed reference latents over the sequence axis, runs the transformer with the
+/// reference `cond_grids` so the RoPE spans `[noise] + references`, slices the velocity back to the
+/// noise prefix, then applies CFG + an Euler step. Port of `QwenImageEdit.generate_image`'s loop.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_edit_with_progress(
+    transformer: &QwenTransformer,
+    scheduler: &FlowMatchEuler,
+    latents: Array,
+    static_image_latents: &Array,
+    cond_grids: &[(usize, usize)],
+    pos_embeds: &Array,
+    neg_embeds: &Array,
+    guidance: f32,
+    width: u32,
+    height: u32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    let mut latents = latents;
+    let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let total = scheduler.num_steps() as u32;
+    for t in 0..scheduler.num_steps() {
+        if cancel.is_cancelled() {
+            return Err(Error::Msg("generation cancelled".into()));
+        }
+        let noise_seq = latents.shape()[1];
+        let sigma = scheduler.sigmas[t];
+        let hidden = concatenate_axis(&[&latents, static_image_latents], 1)?;
+        let pos = slice_seq(
+            &transformer.forward(&hidden, pos_embeds, None, sigma, lh, lw, cond_grids)?,
+            noise_seq,
+        )?;
+        let neg = slice_seq(
+            &transformer.forward(&hidden, neg_embeds, None, sigma, lh, lw, cond_grids)?,
+            noise_seq,
+        )?;
+        let guided = compute_guided_noise(&pos, &neg, guidance)?;
+        latents = scheduler.step(&latents, &guided, t)?;
+        on_progress(Progress::Step {
+            current: t as u32 + 1,
+            total,
+        });
+    }
+    Ok(latents)
+}
+
+/// Slice the transformer velocity `[1, full_seq, 64]` back to the noise prefix `[1, n, 64]`.
+fn slice_seq(x: &Array, n: i32) -> Result<Array> {
+    let idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
+    Ok(x.take_axis(&idx, 1)?)
 }
 
 /// Decoded VAE tensor → RGB8 [`Image`]. Mirrors the fork's `ImageUtil`: denormalize
@@ -204,6 +271,16 @@ mod tests {
         let lat = unpack_latents(&packed, 512, 768).unwrap();
         // [1, 16, h/8, w/8]
         assert_eq!(lat.shape(), &[1, 16, 96, 64]);
+    }
+
+    #[test]
+    fn pack_is_inverse_of_unpack() {
+        let packed = create_noise(7, 512, 768).unwrap(); // [1, 48*32, 64]
+        let vae_latent = unpack_latents(&packed, 512, 768).unwrap(); // [1,16,96,64]
+        let repacked = pack_latents(&vae_latent, 512, 768).unwrap();
+        assert_eq!(repacked.shape(), packed.shape());
+        let (a, b) = (repacked.as_slice::<f32>(), packed.as_slice::<f32>());
+        assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6));
     }
 
     #[test]
