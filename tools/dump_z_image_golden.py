@@ -19,11 +19,16 @@ from mflux.models.z_image.model.z_image_text_encoder.prompt_encoder import Promp
 from mflux.models.z_image.z_image_initializer import ZImageInitializer
 from mflux.utils.image_util import ImageUtil
 
-OUT = "/Users/michael/repos/mlx-gen/tools/golden/z_image_golden.safetensors"
-PNG = "/Users/michael/repos/mlx-gen/tools/golden/z_image_golden.png"
+import os
+
+# Golden lives next to this script (tools/golden/), gitignored — and is where the Rust e2e test's
+# `CARGO_MANIFEST_DIR/../tools/golden` resolves when run from this checkout/worktree.
+_GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
+os.makedirs(_GOLDEN_DIR, exist_ok=True)
+OUT = os.path.join(_GOLDEN_DIR, "z_image_golden.safetensors")
+PNG = os.path.join(_GOLDEN_DIR, "z_image_golden.png")
 # Env-overridable so the same golden can be regenerated at any size/prompt for parity checks.
 # Defaults match the fast 256^2 stage-test baseline; set ZIMAGE_* to render at, e.g., 1024^2.
-import os
 PROMPT = os.environ.get("ZIMAGE_PROMPT", "a fox")
 SEED = int(os.environ.get("ZIMAGE_SEED", "42"))
 STEPS = int(os.environ.get("ZIMAGE_STEPS", "4"))
@@ -55,9 +60,14 @@ print(f"num_valid tokens: {num_valid}; first ids: {np.array(input_ids[0, :num_va
 
 cap_feats = PromptEncoder.encode_prompt(PROMPT, tok, model.text_encoder)  # [num_valid, 2560]
 
-# Schedule (resolution-dependent mu) + seeded init noise.
-seq_len = (H // 16) * (W // 16)
-mu = S._compute_empirical_mu(seq_len, STEPS)
+# Schedule + seeded init noise. Z-Image-Turbo pins a STATIC time-shift (its
+# scheduler/scheduler_config.json: FlowMatchEulerDiscreteScheduler, shift=3.0,
+# use_dynamic_shifting=false) — NOT the empirical per-step mu (that is the *full* Z-Image
+# model's scheduler). The exponential time-shift with mu=ln(shift) == diffusers' static shift
+# (sc-2536). The Rust port uses FlowMatchEuler::for_static_shift(steps, 3.0) to match.
+import math  # noqa: E402
+
+mu = math.log(3.0)
 sigmas = mx.linspace(1.0, 1.0 / STEPS, STEPS)
 sigmas = S._time_shift_exponential_array(mu, 1.0, sigmas)
 sigmas = mx.concatenate([sigmas, mx.zeros((1,), dtype=sigmas.dtype)], axis=0)

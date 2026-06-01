@@ -83,20 +83,21 @@ fn meta_u32(g: &Weights, k: &str) -> u32 {
 #[ignore = "needs real Z-Image weights + local img2img golden"]
 fn img2img_schedule_and_init_step_match() {
     let g = Weights::from_file(GOLDEN).unwrap();
-    let (steps, w, h) = (meta_u32(&g, "steps"), meta_u32(&g, "w"), meta_u32(&g, "h"));
+    let steps = meta_u32(&g, "steps");
     let strength: f32 = g.metadata("strength").unwrap().parse().unwrap();
     let want_step: usize = g.metadata("init_time_step").unwrap().parse().unwrap();
 
     let got_step = init_time_step(steps as usize, Some(strength));
     assert_eq!(got_step, want_step, "init_time_step");
 
-    let sched = FlowMatchEuler::for_image(steps as usize, w, h);
+    // Z-Image-Turbo uses the static shift=3.0 schedule (sc-2536), not the empirical per-step mu.
+    let sched = FlowMatchEuler::for_static_shift(steps as usize, 3.0);
     let mine = Array::from_slice(&sched.sigmas, &[sched.sigmas.len() as i32]);
     let (peak, _) = rel_errors(&mine, g.require("sigmas").unwrap());
     println!("img2img schedule: init_step={got_step} sigmas peak-rel={peak:.2e}");
     assert!(
         peak < 1e-4,
-        "flow-match sigmas diverge from the fork: {peak:.2e}"
+        "static-shift sigmas diverge from the fork: {peak:.2e}"
     );
 }
 
@@ -146,7 +147,7 @@ fn img2img_blend_matches_fork() {
     let seed: u64 = g.metadata("seed").unwrap().parse().unwrap();
     let init_step: usize = g.metadata("init_time_step").unwrap().parse().unwrap();
 
-    let sched = FlowMatchEuler::for_image(steps as usize, w, h);
+    let sched = FlowMatchEuler::for_static_shift(steps as usize, 3.0);
     let sigma = sched.sigmas[init_step];
     let noise = create_noise(seed, w, h)
         .unwrap()
