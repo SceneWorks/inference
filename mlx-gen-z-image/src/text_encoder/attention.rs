@@ -5,16 +5,17 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, split};
 use mlx_rs::Array;
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::{join, matmul_t, QK_NORM_EPS};
+use super::{join, QK_NORM_EPS};
 
 pub struct TextAttention {
-    q_proj: Array,
-    k_proj: Array,
-    v_proj: Array,
-    o_proj: Array,
+    q_proj: AdaptableLinear,
+    k_proj: AdaptableLinear,
+    v_proj: AdaptableLinear,
+    o_proj: AdaptableLinear,
     q_norm: Array,
     k_norm: Array,
     num_heads: i32,
@@ -31,11 +32,17 @@ impl TextAttention {
         num_kv_heads: i32,
         head_dim: i32,
     ) -> Result<Self> {
+        let dense = |name: &str| -> Result<AdaptableLinear> {
+            Ok(AdaptableLinear::dense(
+                w.require(&join(prefix, name))?.clone(),
+                None,
+            ))
+        };
         Ok(Self {
-            q_proj: w.require(&join(prefix, "q_proj.weight"))?.clone(),
-            k_proj: w.require(&join(prefix, "k_proj.weight"))?.clone(),
-            v_proj: w.require(&join(prefix, "v_proj.weight"))?.clone(),
-            o_proj: w.require(&join(prefix, "o_proj.weight"))?.clone(),
+            q_proj: dense("q_proj.weight")?,
+            k_proj: dense("k_proj.weight")?,
+            v_proj: dense("v_proj.weight")?,
+            o_proj: dense("o_proj.weight")?,
             q_norm: w.require(&join(prefix, "q_norm.weight"))?.clone(),
             k_norm: w.require(&join(prefix, "k_norm.weight"))?.clone(),
             num_heads,
@@ -45,14 +52,37 @@ impl TextAttention {
         })
     }
 
+    /// Quantize the QKV + output projections to Q4/Q8 (group_size 64) — the fork quantizes every
+    /// Linear in the text encoder. `q_norm`/`k_norm` are RMSNorm scales, so they stay dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for lin in [
+            &mut self.q_proj,
+            &mut self.k_proj,
+            &mut self.v_proj,
+            &mut self.o_proj,
+        ] {
+            lin.quantize(bits, None)?;
+        }
+        Ok(())
+    }
+
     /// `x`: `[b, s, hidden]`; `cos`/`sin`: `[1, s, head_dim]`; `mask`: additive `[1,1,s,s]`.
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
 
-        let q = matmul_t(x, &self.q_proj)?.reshape(&[b, s, self.num_heads, self.head_dim])?;
-        let k = matmul_t(x, &self.k_proj)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
-        let v = matmul_t(x, &self.v_proj)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape(&[b, s, self.num_heads, self.head_dim])?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
 
         // per-head RMSNorm (q_norm/k_norm use mlx's default eps, not rms_norm_eps).
         let q = rms_norm(&q, &self.q_norm, QK_NORM_EPS)?;
@@ -76,7 +106,7 @@ impl TextAttention {
         let o =
             o.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;
-        matmul_t(&o, &self.o_proj)
+        self.o_proj.forward(&o)
     }
 }
 

@@ -63,6 +63,11 @@ impl Encoder {
         })
     }
 
+    /// Quantize the encoder's only quantizable Linears — the mid-block spatial attention.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.mid_block.quantize(bits)
+    }
+
     /// `image` NCHW (3 channels) → `2·C` latent-dist channels NCHW (spatial ÷8).
     pub fn forward(&self, image: &Array) -> Result<Array> {
         let mut h = self.conv_in.forward(image)?;

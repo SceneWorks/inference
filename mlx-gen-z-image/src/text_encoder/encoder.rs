@@ -2,12 +2,67 @@
 //! last** layer's hidden states (no final norm), cast to f32. Port of the fork's `TextEncoder`.
 //! These hidden states are the DiT's `cap_feats` conditioning (after slicing to valid tokens).
 
+use mlx_rs::ops::{dequantize, quantize};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::{join, EncoderLayer, TextRope};
+
+/// The token embedding `[vocab, hidden]`, dense or Q4/Q8. The fork's `nn.quantize` predicate hits
+/// `nn.Embedding` too, so a quantized text encoder packs it; `forward` is a row-gather (then
+/// dequantize), mirroring mlx's `QuantizedEmbedding`. Output is cast to f32 (the encoder runs f32).
+enum TokenEmbedding {
+    Dense(Array),
+    Quantized {
+        wq: Array,
+        scales: Array,
+        biases: Array,
+        group_size: i32,
+        bits: i32,
+    },
+}
+
+impl TokenEmbedding {
+    /// Gather rows for `ids` `[b, s]` → `[b, s, hidden]` (f32).
+    fn forward(&self, ids: &Array) -> Result<Array> {
+        let out = match self {
+            TokenEmbedding::Dense(w) => w.take_axis(ids, 0)?,
+            TokenEmbedding::Quantized {
+                wq,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => {
+                // Gather the packed rows + their per-group scales/biases, then dequantize — the
+                // by-&self equivalent of mlx's `QuantizedEmbedding` lookup.
+                let pw = wq.take_axis(ids, 0)?;
+                let sc = scales.take_axis(ids, 0)?;
+                let bi = biases.take_axis(ids, 0)?;
+                dequantize(&pw, &sc, &bi, *group_size, *bits)?
+            }
+        };
+        Ok(out.as_dtype(Dtype::Float32)?)
+    }
+
+    /// Quantize a dense embedding in place (group_size 64), the mlx-rs equivalent of
+    /// `nn.Embedding.to_quantized`. No-op if already quantized.
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        if let TokenEmbedding::Dense(w) = self {
+            let (wq, scales, biases) = quantize(w, 64, bits)?;
+            *self = TokenEmbedding::Quantized {
+                wq,
+                scales,
+                biases,
+                group_size: 64,
+                bits,
+            };
+        }
+        Ok(())
+    }
+}
 
 /// Z-Image text-encoder dimensions (Qwen3-style decoder LM).
 pub struct ZTextEncoderConfig {
@@ -40,14 +95,15 @@ impl ZTextEncoderConfig {
 }
 
 pub struct TextEncoder {
-    embed_tokens: Array,
+    embed_tokens: TokenEmbedding,
     layers: Vec<EncoderLayer>,
     rope: TextRope,
 }
 
 impl TextEncoder {
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &ZTextEncoderConfig) -> Result<Self> {
-        let embed_tokens = w.require(&join(prefix, "embed_tokens.weight"))?.clone();
+        let embed_tokens =
+            TokenEmbedding::Dense(w.require(&join(prefix, "embed_tokens.weight"))?.clone());
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let lp = join(prefix, &format!("layers.{i}"));
@@ -69,16 +125,23 @@ impl TextEncoder {
         })
     }
 
+    /// Quantize the encoder to Q4/Q8 (group_size 64): the token embedding + every layer's Linears
+    /// — the full set the fork's `nn.quantize(text_encoder, …)` hits. Layer norms stay dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.embed_tokens.quantize(bits)?;
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        Ok(())
+    }
+
     /// `input_ids` / `attention_mask`: `[b, s]` int32. Returns `[b, s, hidden]` (f32) — the
     /// second-to-last layer's hidden states, matching the fork's `all_hidden_states[-2]`.
     pub fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
 
-        let embed = self
-            .embed_tokens
-            .take_axis(input_ids, 0)?
-            .as_dtype(Dtype::Float32)?; // [b, s, hidden]
+        let embed = self.embed_tokens.forward(input_ids)?; // [b, s, hidden] f32
         let (cos, sin) = self.rope.forward(s)?;
         let mask = build_mask(attention_mask, b, s)?;
 
