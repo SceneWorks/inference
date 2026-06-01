@@ -16,6 +16,7 @@
 pub mod image_processor;
 pub mod loader;
 pub mod model;
+pub mod model_edit;
 pub mod pipeline;
 pub mod text_encoder;
 pub mod transformer;
@@ -28,6 +29,7 @@ pub use loader::{
     load_vision_language_encoder,
 };
 pub use model::{descriptor, load, QwenImage, MODEL_ID};
+pub use model_edit::QwenImageEdit;
 pub use pipeline::{
     compute_guided_noise, create_noise, decoded_to_image, denoise_edit_with_progress,
     denoise_with_progress, pack_latents, qwen_scheduler, unpack_latents,
@@ -35,4 +37,4 @@ pub use pipeline::{
 pub use text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 pub use transformer::{QwenTransformer, QwenTransformerConfig};
 pub use vae::QwenVae;
-pub use vl_tokenizer::{tokenize_edit, EditInputs};
+pub use vl_tokenizer::{encode_reference_latents, tokenize_edit, EditInputs};

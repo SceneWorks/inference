@@ -34,7 +34,7 @@ const VL_TOKENIZE_GOLDEN: &str = concat!(
     "/../tools/golden/qwen_vl_tokenize_golden.safetensors"
 );
 
-const GRIDS: [&str; 3] = ["g0", "g1", "g2"];
+const GRIDS: [&str; 4] = ["g0", "g1", "g2", "g3"];
 
 fn ints(a: &Array) -> Vec<i32> {
     a.as_slice::<i32>().to_vec()
