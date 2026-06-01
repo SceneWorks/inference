@@ -5,7 +5,8 @@ use mlx_rs::fast::scaled_dot_product_attention;
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
-use mlx_gen::nn::{group_norm, linear};
+use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::nn::group_norm;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -15,31 +16,39 @@ const GN_EPS: f32 = 1e-6;
 pub struct VaeAttention {
     gn_w: Array,
     gn_b: Array,
-    q_w: Array,
-    q_b: Array,
-    k_w: Array,
-    k_b: Array,
-    v_w: Array,
-    v_b: Array,
-    out_w: Array,
-    out_b: Array,
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    out: AdaptableLinear,
 }
 
 impl VaeAttention {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let g = |s: &str| w.require(&format!("{prefix}.{s}")).cloned();
+        let lin = |name: &str| -> Result<AdaptableLinear> {
+            Ok(AdaptableLinear::dense(
+                g(&format!("{name}.weight"))?,
+                Some(g(&format!("{name}.bias"))?),
+            ))
+        };
         Ok(Self {
             gn_w: g("group_norm.weight")?,
             gn_b: g("group_norm.bias")?,
-            q_w: g("to_q.weight")?,
-            q_b: g("to_q.bias")?,
-            k_w: g("to_k.weight")?,
-            k_b: g("to_k.bias")?,
-            v_w: g("to_v.weight")?,
-            v_b: g("to_v.bias")?,
-            out_w: g("to_out.0.weight")?,
-            out_b: g("to_out.0.bias")?,
+            q: lin("to_q")?,
+            k: lin("to_k")?,
+            v: lin("to_v")?,
+            out: lin("to_out.0")?,
         })
+    }
+
+    /// Quantize the QKV + output projections to Q4/Q8 (group_size 64) — the fork's `nn.quantize`
+    /// over the VAE hits these Linears (the only quantizable leaves in the otherwise-conv VAE).
+    /// GroupNorm scales stay dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for lin in [&mut self.q, &mut self.k, &mut self.v, &mut self.out] {
+            lin.quantize(bits, None)?;
+        }
+        Ok(())
     }
 
     pub fn forward(&self, x_nchw: &Array) -> Result<Array> {
@@ -49,20 +58,21 @@ impl VaeAttention {
 
         let normed = group_norm(&x, &self.gn_w, &self.gn_b, GN_GROUPS, GN_EPS)?;
         // (B,H,W,C) -> (B, H*W, 1, C) -> (B, 1, H*W, C) [single head, head_dim = C].
-        let proj = |xw: &Array, xb: &Array| -> Result<Array> {
-            Ok(linear(&normed, xw, xb)?
+        let proj = |lin: &AdaptableLinear| -> Result<Array> {
+            Ok(lin
+                .forward(&normed)?
                 .reshape(&[b, h * w, 1, c])?
                 .transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = proj(&self.q_w, &self.q_b)?;
-        let k = proj(&self.k_w, &self.k_b)?;
-        let v = proj(&self.v_w, &self.v_b)?;
+        let q = proj(&self.q)?;
+        let k = proj(&self.k)?;
+        let v = proj(&self.v)?;
 
         let scale = (c as f32).powf(-0.5);
         // trailing `None` is the MLX ≥0.30 `sinks` arg (no attention sinks).
         let o = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
         let o = o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, h, w, c])?;
-        let o = linear(&o, &self.out_w, &self.out_b)?;
+        let o = self.out.forward(&o)?;
 
         Ok(add(&x, &o)?.transpose_axes(&[0, 3, 1, 2])?) // residual, back to NCHW
     }

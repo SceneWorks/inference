@@ -21,6 +21,12 @@ impl UNetMidBlock {
         })
     }
 
+    /// Quantize the block's only quantizable Linears — the spatial-attention QKV/out (the resnets
+    /// are all conv). Q4/Q8, group_size 64.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attention.quantize(bits)
+    }
+
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let h = self.resnet0.forward(x)?;
         let h = self.attention.forward(&h)?;

@@ -106,19 +106,26 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             ))
         }
     };
-    // Q4/Q8 quantizes the transformer in place after the dense bf16 load (the fork's
-    // `nn.quantize` set, group_size 64). The text encoder + VAE run dense — the generate path's
-    // parity is proven against the fork's quantized `cap_feats` (sc-2532).
+    // Q4/Q8 quantizes the **whole model** in place after the dense bf16 load — the fork's
+    // `nn.quantize` over (transformer, text_encoder, vae), group_size 64, every quantizable Linear
+    // (+ the text encoder's token Embedding). This is what "quantize to Q4/Q8" means everywhere
+    // (mflux/diffusers/mlx-lm): a public consumer asking for Q4 gets the full memory saving and an
+    // output that matches the fork — not a transformer-only partial quantization (sc-2532).
     let mut transformer = loader::load_transformer(root)?;
+    let mut text_encoder = loader::load_text_encoder(root)?;
+    let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
-        transformer.quantize(q.bits())?;
+        let bits = q.bits();
+        transformer.quantize(bits)?;
+        text_encoder.quantize(bits)?;
+        vae.quantize(bits)?;
     }
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
-        text_encoder: loader::load_text_encoder(root)?,
+        text_encoder,
         transformer,
-        vae: loader::load_vae(root)?,
+        vae,
     }))
 }
 

@@ -44,6 +44,14 @@ impl EncoderLayer {
         })
     }
 
+    /// Quantize the block's Linears (attention QKV/out + MLP) to Q4/Q8. The two layer-norm scales
+    /// stay dense (not Linears).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize(bits)?;
+        self.mlp.quantize(bits)?;
+        Ok(())
+    }
+
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
         let h = add(x, &self.attn.forward(&normed, cos, sin, mask)?)?;

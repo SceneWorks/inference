@@ -314,23 +314,19 @@ fn e2e_full_pipeline_generates_fox() {
     );
 }
 
-/// sc-2532: the Q4/Q8 transformer parity gate. Quantize the Rust transformer (group_size 64 — the
-/// fork's `nn.quantize` set, all 276 transformer Linears), feed the fork's seeded init noise +
-/// quantized-text-encoder `cap_feats`, run the denoise loop on the fork's exact sigmas, and confirm
-/// the latents + decoded image match the fork's quantized golden. Mirrors qwen's
-/// `transformer_q8_pipeline_matches_fork`.
+/// sc-2532: the Q4/Q8 **transformer**-isolation diagnostic. Quantize the Rust transformer
+/// (group_size 64 — the fork's `nn.quantize` set, all 276 transformer Linears), feed the fork's
+/// seeded init noise + quantized-text-encoder `cap_feats`, run the denoise loop on the fork's exact
+/// sigmas, and confirm the latents + decoded image match the fork's quantized golden. (The full
+/// product path — quantizing the text encoder + VAE too — is gated by `q{8,4}_full_generate_renders`;
+/// feeding `cap_feats` here isolates the transformer from the text encoder.)
 ///
-/// **Why the px threshold is looser than the bf16 e2e (which is sub-1%).** The quantization itself
-/// is byte-identical to the fork (`q8_packing_byte_identical_to_fork`: same wq/scales/biases/qmm on
-/// a real bf16 weight), and the quantized-Linear *set* matches the fork exactly. The residual
-/// divergence is the Q8/Q4 mode's own perturbation sensitivity: the fork's *own* dense→Q8 output
-/// already moves ~9% of pixels >8 (Q8 is a lossy mode), and it is sensitive to tiny activation
-/// dtype / op-ordering differences (the fork's own bf16-vs-f32-activation Q8 run differs by ~1.7%
-/// px). The Rust DiT runs f32 activations (its `apply_pad` / f32 `t_emb` promote the stream, exactly
-/// as the fork's stream promotes after block 0) vs the fork's bf16 production path, and that ~1e-2
-/// per-step difference compounds over the 4 iterative steps. The result tracks the fork's Q8 more
-/// closely (~5%) than the fork's *dense* output does (~9%), which is the meaningful bar for a faithful
-/// Q-mode. The latent mean-rel gate (~the Q8 noise floor, like qwen's) is the tighter check.
+/// The quantization is byte-identical to the fork (`q8_packing_byte_identical_to_fork`: same
+/// wq/scales/biases/qmm on a real bf16 weight) and the quantized-Linear set matches exactly, so the
+/// only residual is the Q-mode's sensitivity to the binding-level kernel rounding (our source-built
+/// MLX vs the fork's prebuilt wheel — see the bf16-version analysis in sc-2532). At **1024²**
+/// (production) that is sub-1% px>8; at 256² the same arithmetic shows ~5% purely because the
+/// per-pixel metric is coarser there. Golden is regenerated at 1024² (see the `#[ignore]` message).
 fn q_pipeline_matches_fork(
     golden_path: &str,
     bits: i32,
@@ -391,6 +387,20 @@ fn q_pipeline_matches_fork(
 
     let img = decoded_to_image(&decoded).unwrap();
     let gimg = decoded_to_image(golden_dec).unwrap();
+
+    // Save the Rust Q-render next to the fork's golden PNG for visual inspection (like the dense
+    // `rust_fox.png`).
+    let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../tools/golden/rust_q{bits}.png"));
+    image::save_buffer(
+        &out_path,
+        &img.pixels,
+        img.width,
+        img.height,
+        image::ExtendedColorType::Rgb8,
+    )
+    .unwrap();
+
     let differ = img
         .pixels
         .iter()
@@ -399,10 +409,11 @@ fn q_pipeline_matches_fork(
         .count();
     let frac = differ as f32 / img.pixels.len() as f32;
     println!(
-        "Q{bits} pixels >8 apart: {:.3}% ({} / {})",
+        "Q{bits} pixels >8 apart: {:.3}% ({} / {}); saved {}",
         frac * 100.0,
         differ,
-        img.pixels.len()
+        img.pixels.len(),
+        out_path.display()
     );
     assert!(
         frac < max_px_frac,
@@ -468,16 +479,92 @@ fn q8_packing_byte_identical_to_fork() {
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + local Q8 golden (QUANTIZE=8 dump_z_image_golden.py)"]
+#[ignore = "needs real Z-Image weights + Q8 golden @1024² (QUANTIZE=8 ZIMAGE_W=1024 ZIMAGE_H=1024 dump_z_image_golden.py)"]
 fn transformer_q8_pipeline_matches_fork() {
-    // Measured (256², fox, seed 42): latent mean_rel 3.9e-2, px>8 5.16%. Thresholds leave headroom
-    // for machine/run variance while staying well inside the fork's own dense→Q8 envelope (~9% px).
-    q_pipeline_matches_fork(Q8_GOLDEN, 8, 5e-2, 0.07);
+    // Measured (1024², fox, seed 42): latent mean_rel 2.0e-2, px>8 0.78%. Thresholds leave headroom
+    // for machine/run variance.
+    q_pipeline_matches_fork(Q8_GOLDEN, 8, 3e-2, 0.02);
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + local Q4 golden (QUANTIZE=4 dump_z_image_golden.py)"]
+#[ignore = "needs real Z-Image weights + Q4 golden @1024² (QUANTIZE=4 ZIMAGE_W=1024 ZIMAGE_H=1024 dump_z_image_golden.py)"]
 fn transformer_q4_pipeline_matches_fork() {
-    // Measured (256², fox, seed 42): latent mean_rel ~3e-2, px>8 3.88%.
-    q_pipeline_matches_fork(Q4_GOLDEN, 4, 5e-2, 0.07);
+    // Measured (1024², fox, seed 42): latent mean_rel 1.6e-2, px>8 0.64%.
+    q_pipeline_matches_fork(Q4_GOLDEN, 4, 3e-2, 0.02);
+}
+
+/// sc-2532: the **full public product path** — `load("z_image_turbo", spec.with_quant(Q)).generate()`
+/// — end-to-end at the golden's (prompt, seed, size), vs the fork's `quantize=N` render, saving
+/// `rust_q{bits}_full.png` for inspection. This exercises the whole quantized model (transformer +
+/// text encoder + VAE), matching the fork's `nn.quantize`. It's the honest e2e parity gate (the
+/// cap_feats-fed `q_pipeline_matches_fork` can't see a text-encoder scope gap). Quantizing the text
+/// encoder is what drops Q4 from ~18% (transformer-only, dense TE) to sub-1% here (1024²).
+fn q_full_generate_renders(golden_path: &str, quant: mlx_gen::Quant, bits: i32, max_px_frac: f32) {
+    let g = Weights::from_file(golden_path).unwrap();
+    let prompt = g.metadata("prompt").unwrap().to_string();
+    let seed: u64 = g.metadata("seed").unwrap().parse().unwrap();
+    let steps: u32 = g.metadata("steps").unwrap().parse().unwrap();
+    let w: u32 = g.metadata("w").unwrap().parse().unwrap();
+    let h: u32 = g.metadata("h").unwrap().parse().unwrap();
+
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_quant(quant);
+    let generator = mlx_gen::load("z_image_turbo", &spec).unwrap();
+    let req = GenerationRequest {
+        prompt,
+        width: w,
+        height: h,
+        seed: Some(seed),
+        steps: Some(steps),
+        ..Default::default()
+    };
+    let out = generator.generate(&req, &mut |_| {}).unwrap();
+    let img = match out {
+        GenerationOutput::Images(mut v) => v.pop().unwrap(),
+        other => panic!("expected Images, got {other:?}"),
+    };
+    let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../tools/golden/rust_q{bits}_full.png"));
+    image::save_buffer(
+        &out_path,
+        &img.pixels,
+        img.width,
+        img.height,
+        image::ExtendedColorType::Rgb8,
+    )
+    .unwrap();
+
+    let gimg = decoded_to_image(g.require("decoded").unwrap()).unwrap();
+    let differ = img
+        .pixels
+        .iter()
+        .zip(&gimg.pixels)
+        .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
+        .count();
+    let frac = differ as f32 / img.pixels.len() as f32;
+    println!(
+        "Q{bits} full generate vs fork-Q{bits}: {:.3}% px>8 ({}x{}); saved {}",
+        frac * 100.0,
+        img.width,
+        img.height,
+        out_path.display()
+    );
+    assert!(
+        frac < max_px_frac,
+        "Q{bits} full generate diverged: {:.3}%",
+        frac * 100.0
+    );
+}
+
+#[test]
+#[ignore = "needs real Z-Image weights + Q8 golden @1024² (QUANTIZE=8 ZIMAGE_W=1024 ZIMAGE_H=1024)"]
+fn q8_full_generate_renders() {
+    // Measured (1024²): 0.81% px>8 vs fork-Q8 (whole-model quant: transformer + text encoder + VAE).
+    q_full_generate_renders(Q8_GOLDEN, mlx_gen::Quant::Q8, 8, 0.02);
+}
+
+#[test]
+#[ignore = "needs real Z-Image weights + Q4 golden @1024² (QUANTIZE=4 ZIMAGE_W=1024 ZIMAGE_H=1024)"]
+fn q4_full_generate_renders() {
+    // Measured (1024²): 0.73% px>8 vs fork-Q4 (whole-model quant). Transformer-only was ~18%.
+    q_full_generate_renders(Q4_GOLDEN, mlx_gen::Quant::Q4, 4, 0.02);
 }
