@@ -36,7 +36,8 @@ rgb = np.stack([base, (base * 2) % 256, (base * 3) % 256], axis=-1).astype(np.ui
 ref_path = "/tmp/qwen_edit_ref.png"
 Image.fromarray(rgb).save(ref_path)
 
-model = QwenImageEdit()  # defaults → Qwen-Image-Edit-2509
+QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
+model = QwenImageEdit(quantize=QUANTIZE)  # defaults → Qwen-Image-Edit-2509; Q8 quantizes transformer
 
 config, vl_w, vl_h, vae_w, vae_h = model._compute_dimensions(
     width=None,
@@ -103,7 +104,8 @@ out = {
 }
 golden_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(golden_dir, exist_ok=True)
-path_out = os.path.join(golden_dir, "qwen_image_edit_golden.safetensors")
+suffix = f"_q{QUANTIZE}" if QUANTIZE else ""
+path_out = os.path.join(golden_dir, f"qwen_image_edit{suffix}_golden.safetensors")
 mx.save_safetensors(path_out, out)
 print(
     f"out={config.width}x{config.height} vl={vl_w}x{vl_h} cond=({cond_h},{cond_w}) "

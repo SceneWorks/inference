@@ -166,4 +166,81 @@ impl VisionTransformer {
         let reverse_arr = Array::from_slice(&reverse, &[num_groups]);
         Ok(h.take_axis(&reverse_arr, 0)?)
     }
+
+    /// Debug: same as [`forward`](Self::forward) but returns per-stage intermediates for parity
+    /// bisection against the fork (`patch_embed`, `reordered`, `block0`, `blocks_all`, `merger`,
+    /// `final`). Not used in production.
+    pub fn forward_capture(
+        &self,
+        pixel_values: &Array,
+        grids: &[Grid],
+    ) -> Result<Vec<(&'static str, Array)>> {
+        let cfg = &self.cfg;
+        let grid_cfg = cfg.grid_config();
+        let embed = cfg.embed_dim;
+        let rope_dim = cfg.head_dim() / 2;
+        let merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size;
+        let mut caps: Vec<(&'static str, Array)> = Vec::new();
+
+        // The patch-embed conv input (post reshape+transpose to NDHWC), to isolate reshape vs conv.
+        let n = pixel_values.shape()[0];
+        let conv_in = pixel_values
+            .reshape(&[
+                n,
+                cfg.in_channels,
+                cfg.temporal_patch_size,
+                cfg.patch_size,
+                cfg.patch_size,
+            ])?
+            .transpose_axes(&[0, 2, 3, 4, 1])?;
+        caps.push(("conv_input", conv_in));
+
+        let hidden = self.patch_embed.forward(pixel_values)?;
+        caps.push(("patch_embed", hidden.clone()));
+        let seq = hidden.shape()[0];
+        let num_groups = seq / merge_unit;
+
+        let rope = rot_pos_emb(grids, &grid_cfg)?;
+        let (wi, cu_window) = window_index(grids, &grid_cfg);
+        let cu_full = cu_seqlens(grids);
+        let wi_arr = Array::from_slice(&wi, &[num_groups]);
+
+        let hidden = hidden
+            .reshape(&[num_groups, merge_unit, embed])?
+            .take_axis(&wi_arr, 0)?
+            .reshape(&[seq, embed])?;
+        caps.push(("reordered", hidden.clone()));
+        let rope = rope
+            .reshape(&[num_groups, merge_unit, rope_dim])?
+            .take_axis(&wi_arr, 0)?
+            .reshape(&[seq, rope_dim])?;
+        let emb = concatenate_axis(&[&rope, &rope], 1)?;
+        let cos_emb = cos(&emb)?;
+        let sin_emb = sin(&emb)?;
+
+        let mut h = hidden;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let cu = if cfg.fullatt_block_indexes.contains(&(i as i32)) {
+                &cu_full
+            } else {
+                &cu_window
+            };
+            h = block.forward(&h, &cos_emb, &sin_emb, cu)?;
+            if i == 0 {
+                caps.push(("block0", h.clone()));
+            }
+        }
+        caps.push(("blocks_all", h.clone()));
+
+        let h = self.merger.forward(&h)?;
+        caps.push(("merger", h.clone()));
+
+        let mut reverse = vec![0i32; num_groups as usize];
+        for (k, &g) in wi.iter().enumerate() {
+            reverse[g as usize] = k as i32;
+        }
+        let reverse_arr = Array::from_slice(&reverse, &[num_groups]);
+        caps.push(("final", h.take_axis(&reverse_arr, 0)?));
+        Ok(caps)
+    }
 }

@@ -48,6 +48,7 @@ GRIDS = {
     "g0": [[1, 12, 12]],              # llm 6x6  -> pad 2 (normal windowing)
     "g1": [[1, 16, 16]],              # llm 8x8  -> pad == window (exact-multiple edge: all-pad windows)
     "g2": [[1, 12, 12], [1, 8, 8]],   # multi-image (2nd is exact-multiple)
+    "g3": [[1, 28, 28]],              # llm 14x14 -> pad 2, 4x4 windows (production VL grid)
 }
 
 out = {}
@@ -120,8 +121,8 @@ for shard in shards:
 rvt = VisionTransformer()  # defaults == the 2509 vision_config
 rvt.update(tree_unflatten(list(vision_params.items())))
 
-real_grid = mx.array([[1, 12, 12]], dtype=mx.int32)
-real_seq = 1 * 12 * 12
+real_grid = mx.array([[1, 28, 28]], dtype=mx.int32)  # llm 14x14 — exercises larger windowing
+real_seq = 1 * 28 * 28
 real_pixel = mx.random.normal((real_seq, 3 * 2 * 14 * 14)).astype(mx.float32)
 real_out = rvt(real_pixel, real_grid)
 mx.eval(real_out)
