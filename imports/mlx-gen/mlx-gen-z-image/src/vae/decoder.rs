@@ -2,15 +2,16 @@
 //! conv_in → mid-block → up-blocks → GroupNorm-out → SiLU → conv_out, with the scale/shift
 //! that maps latents to the decoder's input range. NCHW throughout.
 
-use mlx_rs::ops::{add, multiply};
+use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::Array;
 
 use super::conv_layers::{ConvLayer, ConvNormOut};
+use super::encoder::{Encoder, VaeEncoderConfig};
 use super::mid_block::UNetMidBlock;
 use super::up_decoder_block::UpDecoderBlock;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// Per-up-block `(num_resnet_layers, add_upsample)`.
 #[derive(Debug, Clone)]
@@ -75,9 +76,12 @@ impl Decoder {
     }
 }
 
-/// The Z-Image VAE (decode side). `decode` undoes the latent scale/shift then runs the decoder.
+/// The Z-Image VAE. `decode` undoes the latent scale/shift then runs the decoder; `encode`
+/// (img2img) runs the encoder and maps the predicted mean into latent space. The encoder is
+/// optional so a decode-only `Vae` can still be built from decoder weights alone.
 pub struct Vae {
     decoder: Decoder,
+    encoder: Option<Encoder>,
     scaling_factor: f32,
     shift_factor: f32,
 }
@@ -89,9 +93,46 @@ impl Vae {
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &VaeDecoderConfig) -> Result<Self> {
         Ok(Self {
             decoder: Decoder::from_weights(w, prefix, cfg)?,
+            encoder: None,
             scaling_factor: Self::SCALING_FACTOR,
             shift_factor: Self::SHIFT_FACTOR,
         })
+    }
+
+    /// Attach the img2img encoder, loaded from `prefix` (the diffusers `encoder.*` tree, remapped
+    /// to the crate's internal naming by [`crate::loader::remap_vae_encoder`]).
+    pub fn with_encoder(
+        mut self,
+        w: &Weights,
+        prefix: &str,
+        cfg: &VaeEncoderConfig,
+    ) -> Result<Self> {
+        self.encoder = Some(Encoder::from_weights(w, prefix, cfg)?);
+        Ok(self)
+    }
+
+    /// Image NCHW `[1,3,H,W]` (or `[1,3,1,H,W]`) → latent `[1,16,H/8,W/8]`. Port of the fork's
+    /// `VAE.encode` composed with `VAEUtil.encode`'s 5-D→4-D fixup: run the encoder, take the
+    /// distribution **mean** (first half of the channels), then map to latent space as
+    /// `(mean - shift) * scaling`.
+    pub fn encode(&self, image: &Array) -> Result<Array> {
+        let encoder = self.encoder.as_ref().ok_or_else(|| {
+            Error::Msg("z_image VAE encoder not loaded (img2img unavailable)".into())
+        })?;
+        let sh = image.shape();
+        let image4 = if sh.len() == 5 {
+            image.reshape(&[sh[0], sh[1], sh[3], sh[4]])?
+        } else {
+            image.clone()
+        };
+        let h = encoder.forward(&image4)?; // [1, 2C, H/8, W/8]
+        let c = h.shape()[1] / 2;
+        let idx = Array::from_slice(&(0..c).collect::<Vec<i32>>(), &[c]);
+        let mean = h.take_axis(&idx, 1)?; // first C channels
+        Ok(multiply(
+            &subtract(&mean, Array::from_slice(&[self.shift_factor], &[1]))?,
+            Array::from_slice(&[self.scaling_factor], &[1]),
+        )?)
     }
 
     /// `latents`: `(B, C, F, H, W)` (F squeezed) or `(B, C, H, W)` → image `(B, 3, 1, H·8, W·8)`.
