@@ -29,6 +29,9 @@ import numpy as np
 from mflux.models.common.config.config import Config
 from mflux.models.common.config.model_config import ModelConfig
 from mflux.models.common.latent_creator.latent_creator import Img2Img, LatentCreator
+from mflux.models.common.schedulers.flow_match_euler_discrete_scheduler import (
+    FlowMatchEulerDiscreteScheduler as S,
+)
 from mflux.models.z_image.latent_creator.z_image_latent_creator import ZImageLatentCreator
 from mflux.models.z_image.model.z_image_text_encoder.prompt_encoder import PromptEncoder
 from mflux.models.z_image.z_image_initializer import ZImageInitializer
@@ -74,18 +77,25 @@ model = Holder()
 ZImageInitializer.init(model, model_config=model_config, quantize=None)
 tok = model.tokenizers["z_image"]
 
-# 0. Config — flow_match_euler_discrete (the Rust port's schedule), with the img2img inputs.
+# 0. Config (for dims + init_time_step, both scheduler-independent) and the STATIC shift=3.0
+# schedule the Rust port uses (Z-Image-Turbo scheduler_config.json: shift=3.0,
+# use_dynamic_shifting=false) — mu=ln(3) makes the exponential time-shift == diffusers' static
+# shift (sc-2536). We build sigmas by hand and do NOT touch config.scheduler.
+import math  # noqa: E402
+
 config = Config(
     width=W,
     height=H,
     guidance=0.0,
-    scheduler="flow_match_euler_discrete",
+    scheduler="flow_match_euler_discrete",  # unused — sigmas built statically below
     image_path=PNG_IN,
     image_strength=STRENGTH,
     model_config=model_config,
     num_inference_steps=STEPS,
 )
-sigmas = config.scheduler.sigmas
+sigmas = mx.linspace(1.0, 1.0 / STEPS, STEPS)
+sigmas = S._time_shift_exponential_array(math.log(3.0), 1.0, sigmas)
+sigmas = mx.concatenate([sigmas, mx.zeros((1,), dtype=sigmas.dtype)], axis=0)
 init_step = config.init_time_step
 print(f"init_time_step={init_step}  strength={STRENGTH}  steps={STEPS}  W={W} H={H}")
 print(f"sigmas={[round(float(s), 5) for s in sigmas]}")
@@ -111,7 +121,7 @@ init_latents = LatentCreator.create_for_txt2img_or_img2img(
         vae=model.vae,
         latent_creator=ZImageLatentCreator,
         image_path=config.image_path,
-        sigmas=config.scheduler.sigmas,
+        sigmas=sigmas,
         init_time_step=config.init_time_step,
         tiling_config=None,
     ),
