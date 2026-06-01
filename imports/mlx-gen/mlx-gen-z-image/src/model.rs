@@ -29,12 +29,21 @@ use crate::vae::Vae;
 /// `steps`.
 const DEFAULT_STEPS: u32 = 4;
 
-/// Flow-match time-shift for Z-Image-Turbo. Pinned by the model's own
+/// Flow-match time-shift for Z-Image-Turbo: the model's own published schedule from
 /// `scheduler/scheduler_config.json` (`FlowMatchEulerDiscreteScheduler`, `shift=3.0`,
-/// `use_dynamic_shifting=false`) — the static schedule used by the diffusers `ZImagePipeline`
-/// (the SceneWorks production path) and approximated by mflux's `linear` scheduler. NOT the
-/// empirical per-step `mu` of `FlowMatchEuler::for_image` (that is the *full* Z-Image model's
-/// scheduler; using it here was the sc-2536 bug).
+/// `use_dynamic_shifting=false`) — static, resolution-independent.
+///
+/// **Deliberate choice (sc-2536; Michael, 2026-06-01) — do NOT "restore" `linear`.** The mflux
+/// MLX path this port replaces (`MlxZImageAdapter` → `generate_image`'s default `linear`
+/// scheduler) actually uses a *dynamic*, resolution-dependent shift (≈3.16 @1024², 1.88 @512²,
+/// 25 @2048²). We use the model's static 3.0 instead: A/B renders (`tools/compare_z_image_
+/// schedulers.py`) are visually identical at 1024² and only differ at lower resolutions, where
+/// 3.0 reads slightly crisper — the preferred look. So 3.0 is an intentional, model-config-backed
+/// deviation from the MLX path, not drift.
+///
+/// (The *original* port's bug — replaced by sc-2536 — was using `FlowMatchEuler::for_image`'s
+/// empirical per-step `mu`, the *full* Z-Image model's scheduler, ≈shift 10. That was wrong;
+/// `linear` and 3.0 are both reasonable, empirical-`mu` was not.)
 const SCHEDULE_SHIFT: f32 = 3.0;
 
 /// Registry id for Z-Image-turbo (matches the SceneWorks worker's `payload.model`).
