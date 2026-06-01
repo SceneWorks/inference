@@ -8,6 +8,9 @@
 pub mod attention;
 pub mod conv_layers;
 pub mod decoder;
+pub mod down_encoder_block;
+pub mod down_sampler;
+pub mod encoder;
 pub mod mid_block;
 pub mod resnet_block;
 pub mod up_decoder_block;
@@ -15,5 +18,8 @@ pub mod up_sampler;
 
 pub use attention::VaeAttention;
 pub use decoder::{Decoder, Vae, VaeDecoderConfig};
+pub use down_encoder_block::DownEncoderBlock;
+pub use down_sampler::DownSampler;
+pub use encoder::{Encoder, VaeEncoderConfig};
 pub use resnet_block::ResnetBlock2D;
 pub use up_sampler::UpSampler;

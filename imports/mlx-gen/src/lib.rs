@@ -14,6 +14,7 @@
 pub mod adapters;
 pub mod error;
 pub mod generator;
+pub mod image;
 pub mod media;
 pub mod nn;
 pub mod quant;

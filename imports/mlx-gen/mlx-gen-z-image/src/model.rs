@@ -11,14 +11,15 @@
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
     Precision, Progress, Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
 use crate::loader;
 use crate::pipeline::{
-    create_noise, decoded_to_image, denoise_with_progress, slice_valid, unpack_latents,
+    add_noise_by_interpolation, create_noise, decoded_to_image, denoise_with_progress,
+    encode_init_latents, init_time_step, slice_valid, unpack_latents,
 };
 use crate::text_encoder::TextEncoder;
 use crate::transformer::ZImageTransformer;
@@ -123,6 +124,30 @@ impl ZImageTurbo {
         let enc = self.text_encoder.forward(&t.input_ids, &t.attention_mask)?;
         slice_valid(&enc, num_valid)
     }
+
+    /// Extract the single img2img init image + its strength from the request's conditioning. The
+    /// per-reference strength wins over `req.strength`. Z-Image img2img conditions on exactly one
+    /// init image, so more than one `Reference` is an error (multi-image is `MultiReference`, which
+    /// this model doesn't advertise).
+    fn resolve_reference<'a>(
+        &self,
+        req: &'a GenerationRequest,
+    ) -> Result<Option<(&'a Image, Option<f32>)>> {
+        let mut reference = None;
+        for c in &req.conditioning {
+            if let Conditioning::Reference { image, strength } = c {
+                if reference.is_some() {
+                    return Err(Error::Msg(
+                        "z_image_turbo: multiple reference images are not supported (single \
+                         img2img init only)"
+                            .into(),
+                    ));
+                }
+                reference = Some((image, strength.or(req.strength)));
+            }
+        }
+        Ok(reference)
+    }
 }
 
 impl Generator for ZImageTurbo {
@@ -144,9 +169,23 @@ impl Generator for ZImageTurbo {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
 
-        // Prompt → cap_feats (f32), cast to bf16 for the DiT (matches the fork's compute path).
+        // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
+        let reference = self.resolve_reference(req)?;
+        let start_step = match reference {
+            Some((_, strength)) => init_time_step(steps, strength),
+            None => 0,
+        };
+        let is_img2img = start_step > 0;
+
+        // Prompt → cap_feats (f32). txt2img runs the DiT in bf16 (the parity-proven path); img2img
+        // matches the fork's f32 init latents, so keep cap f32 too (so the unified stream is one
+        // dtype). The DiT promotes per-op against the bf16 weights either way.
         let cap = self.encode_prompt(&req.prompt)?;
-        let cap = cap.as_dtype(Dtype::Bfloat16)?;
+        let cap = if is_img2img {
+            cap
+        } else {
+            cap.as_dtype(Dtype::Bfloat16)?
+        };
 
         // The schedule is resolution-dependent but seed-independent — build it once.
         let scheduler = FlowMatchEuler::for_image(steps, req.width, req.height);
@@ -155,12 +194,24 @@ impl Generator for ZImageTurbo {
         for i in 0..req.count {
             // Distinct seed per image in a batch (the fork's `seed + i` convention).
             let seed = base_seed.wrapping_add(i as u64);
+            // Seeded noise as bf16 (the fork's `create_noise` casts to model precision).
             let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
+            let latents = if is_img2img {
+                // VAE-encode the init image to clean latents (f32), then blend with the noise at
+                // `sigma = sigmas[init_time_step]` (the fork's `create_for_txt2img_or_img2img`).
+                let (image, _) = reference.expect("is_img2img implies a reference");
+                let clean = encode_init_latents(&self.vae, image, req.width, req.height)?;
+                let sigma = scheduler.sigmas[start_step];
+                add_noise_by_interpolation(&clean, &noise, sigma)?
+            } else {
+                noise
+            };
             let latents = denoise_with_progress(
                 &self.transformer,
                 &scheduler,
-                noise,
+                latents,
                 &cap,
+                start_step,
                 &req.cancel,
                 on_progress,
             )?;

@@ -20,7 +20,7 @@ use mlx_gen::Result;
 
 use crate::text_encoder::{TextEncoder, ZTextEncoderConfig};
 use crate::transformer::{ZImageTransformer, ZImageTransformerConfig};
-use crate::vae::{Vae, VaeDecoderConfig};
+use crate::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 
 /// Qwen3 pad token id (`<|endoftext|>`).
 const PAD_TOKEN_ID: i32 = 151643;
@@ -54,12 +54,17 @@ pub fn load_transformer(root: &Path) -> Result<ZImageTransformer> {
     ZImageTransformer::from_weights(&w, "", ZImageTransformerConfig::turbo())
 }
 
-/// Load the VAE decoder, remapping the diffusers `decoder.*` tree to the internal naming and
-/// transposing conv weights to NHWC.
+/// Load the full VAE (decoder + encoder), remapping both diffusers trees to the internal naming
+/// and transposing conv weights to NHWC. The encoder powers img2img (`Conditioning::Reference`).
 pub fn load_vae(root: &Path) -> Result<Vae> {
     let mut w = Weights::from_dir(root.join("vae"))?;
     remap_vae_decoder(&mut w)?;
-    Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())
+    remap_vae_encoder(&mut w)?;
+    Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
+        &w,
+        "encoder",
+        &VaeEncoderConfig::default_z_image(),
+    )
 }
 
 /// diffusers DiT checkpoint → internal names: the timestep embedder is `t_embedder.mlp.{0,2}` on
@@ -111,6 +116,47 @@ pub fn remap_vae_decoder(w: &mut Weights) -> Result<()> {
                 (rest.to_string(), is_conv_w)
             }
         };
+        let t = w.require(&k)?.clone();
+        let t = if transpose {
+            t.transpose_axes(&[0, 2, 3, 1])? // NCHW -> NHWC conv weight
+        } else {
+            t
+        };
+        w.insert(target, t);
+    }
+    Ok(())
+}
+
+/// diffusers VAE checkpoint (`encoder.*`, flat conv names, NCHW conv weights) → the crate's
+/// internal encoder naming (`conv.`/`norm.` wrappers) with conv weights transposed to NHWC.
+/// Keeps the `encoder.` prefix (the decoder remap drops its prefix; both must coexist in one
+/// `Weights`). Mirrors [`remap_vae_decoder`] but for the down path (`downsamplers` not
+/// `upsamplers`).
+pub fn remap_vae_encoder(w: &mut Weights) -> Result<()> {
+    let keys: Vec<String> = w
+        .keys()
+        .filter(|k| k.starts_with("encoder."))
+        .map(String::from)
+        .collect();
+    for k in keys {
+        let rest = k.strip_prefix("encoder.").unwrap();
+        let (suffix, transpose): (String, bool) = match rest {
+            "conv_in.weight" => ("conv_in.conv.weight".into(), true),
+            "conv_in.bias" => ("conv_in.conv.bias".into(), false),
+            "conv_out.weight" => ("conv_out.conv.weight".into(), true),
+            "conv_out.bias" => ("conv_out.conv.bias".into(), false),
+            "conv_norm_out.weight" => ("conv_norm_out.norm.weight".into(), false),
+            "conv_norm_out.bias" => ("conv_norm_out.norm.bias".into(), false),
+            _ => {
+                let is_conv_w = rest.ends_with(".weight")
+                    && (rest.contains(".conv1.")
+                        || rest.contains(".conv2.")
+                        || rest.contains(".conv_shortcut.")
+                        || rest.contains(".downsamplers.0.conv."));
+                (rest.to_string(), is_conv_w)
+            }
+        };
+        let target = format!("encoder.{suffix}");
         let t = w.require(&k)?.clone();
         let t = if transpose {
             t.transpose_axes(&[0, 2, 3, 1])? // NCHW -> NHWC conv weight

@@ -31,7 +31,9 @@ pub use final_layer::FinalLayer;
 pub use loader::{load_text_encoder, load_tokenizer, load_transformer, load_vae};
 pub use model::{descriptor, load, ZImageTurbo, MODEL_ID};
 pub use pipeline::{
-    create_noise, decoded_to_image, denoise, denoise_with_progress, slice_valid, unpack_latents,
+    add_noise_by_interpolation, create_noise, decoded_to_image, denoise, denoise_with_progress,
+    encode_init_latents, init_time_step, pack_latents, preprocess_init_image, slice_valid,
+    unpack_latents,
 };
 pub use rope_embedder::RopeEmbedder;
 pub use timestep_embedder::TimestepEmbedder;
