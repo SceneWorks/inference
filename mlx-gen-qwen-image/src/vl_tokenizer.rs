@@ -15,7 +15,11 @@ use mlx_rs::Array;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::Result;
 
-use crate::image_processor::{resize_bicubic_u8, ImageInput, QwenImageProcessor};
+use crate::image_processor::{
+    resize_bicubic_u8, resize_lanczos_u8, ImageInput, QwenImageProcessor,
+};
+use crate::pipeline::pack_latents;
+use crate::vae::QwenVae;
 
 /// Inputs for [`crate::text_encoder::QwenVisionLanguageEncoder::encode`].
 pub struct EditInputs {
@@ -92,6 +96,40 @@ pub fn tokenize_edit(
         pixel_values: processed.pixel_values,
         grid_thw: processed.grid_thw,
     })
+}
+
+/// VAE-encode + pack a reference image for the dual-latent path. Resize to `(calc_w, calc_h)` via
+/// **LANCZOS** (the fork's `scale_to_dimensions`), normalize `[0,255] → [-1,1]` as NCHW, VAE-encode,
+/// drop the temporal axis, and `pack_latents`. Returns `(image_latents [1, (calc_h/16)·(calc_w/16),
+/// 64], cond_grid (latent_h, latent_w))`. Port of `QwenEditUtil.create_image_conditioning_latents`
+/// for a single reference (`calc` = the VL condition dims).
+pub fn encode_reference_latents(
+    vae: &QwenVae,
+    image: ImageInput,
+    calc_w: u32,
+    calc_h: u32,
+) -> Result<(Array, (usize, usize))> {
+    let (cw, ch) = (calc_w as usize, calc_h as usize);
+    let resized = if (image.height, image.width) == (ch, cw) {
+        image.data.iter().map(|&p| p as f32).collect::<Vec<f32>>()
+    } else {
+        resize_lanczos_u8(image.data, image.height, image.width, ch, cw)
+    };
+    // [0,255] → [-1,1], laid out NCHW [1, 3, calc_h, calc_w].
+    let plane = ch * cw;
+    let mut nchw = vec![0f32; 3 * plane];
+    for y in 0..ch {
+        for x in 0..cw {
+            for c in 0..3 {
+                let v = resized[(y * cw + x) * 3 + c] / 255.0 * 2.0 - 1.0;
+                nchw[c * plane + y * cw + x] = v;
+            }
+        }
+    }
+    let img = Array::from_slice(&nchw, &[1, 3, calc_h as i32, calc_w as i32]);
+    let latent = vae.encode(&img)?.squeeze_axes(&[2])?; // [1,16,1,h/8,w/8] → [1,16,h/8,w/8]
+    let packed = pack_latents(&latent, calc_w, calc_h)?;
+    Ok((packed, ((calc_h / 16) as usize, (calc_w / 16) as usize)))
 }
 
 #[cfg(test)]
