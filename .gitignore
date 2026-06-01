@@ -19,4 +19,9 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
-/tools/golden/
+# Real-weights parity goldens are large, regenerable, and MLX-version-sensitive — kept out of
+# git (see tools/golden/README.md). The manifest + checksums ARE tracked so a clone documents
+# how to regenerate them and what the committed tests were last validated against.
+/tools/golden/*
+!/tools/golden/README.md
+!/tools/golden/CHECKSUMS.txt

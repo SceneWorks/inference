@@ -1,0 +1,81 @@
+# `tools/golden/` — real-weights parity goldens
+
+This directory holds the reference tensors (`*.safetensors`) and inspection images (`*.png`) that
+the **`#[ignore]`d real-weights parity tests** compare against. **Everything here except this
+`README.md` and `CHECKSUMS.txt` is gitignored** — the goldens are large (the 1024² Z-Image txt2img
+golden alone is ~15 MB), regenerable from the scripts below, and sensitive to the MLX version
+(e.g. the 0.31.1 bump shifted VAE-decode precision), so committing them would bloat history for no
+gain. They also can't be produced — or consumed — without the licensed multi-GB HuggingFace
+weights and a Mac with Metal, which is exactly why the tests that read them are `#[ignore]`d.
+
+## Fixtures vs. goldens — the convention
+
+| | committed? | runs in default `cargo test`? | needs model weights? |
+|---|---|---|---|
+| **`tests/fixtures/*.safetensors`** (per crate) | yes | yes | no — synthetic / small dumped intermediates |
+| **`tools/golden/*` (here)** | no (gitignored) | no (`#[ignore]`) | yes — real HF weights + Metal |
+
+Default-running tests only depend on committed inputs; anything needing un-committable inputs is
+`#[ignore]`d. So a fresh clone's `cargo test` is green without this directory.
+
+## Regenerating
+
+Goldens are produced by running the dump scripts **from the frozen Python `mflux` fork** (which has
+the reference implementation + its `.venv`), pointed at this repo's `tools/`:
+
+```sh
+cd ~/repos/mflux
+uv run python /path/to/mlx-gen/tools/dump_<name>.py        # writes into this dir
+```
+
+Each script writes into `tools/golden/` next to itself (paths are `__file__`-relative, so this
+works from any checkout/worktree). Run the matching `#[ignore]`d test with, e.g.:
+
+```sh
+cargo test -p mlx-gen-z-image --release --test e2e_real_weights -- --ignored --nocapture
+```
+
+Prerequisites: macOS + Metal; the frozen `mflux` fork at `~/repos/mflux`; the model weights in
+`~/.cache/huggingface/hub/` (auto-downloaded by the fork on first run).
+
+## Manifest
+
+### Z-Image (`mlx-gen-z-image`)
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `z_image_golden.safetensors` (+ `.png`) | `dump_z_image_golden.py` | `tests/e2e_real_weights.rs` | txt2img stage + full pipeline. Env: `ZIMAGE_PROMPT/SEED/STEPS/W/H` (use `W=H=1024` for the e2e size; default 256²). Emits the **static shift=3.0** schedule (sc-2536). |
+| `z_image_img2img_golden.safetensors` (+ `*_init.png`, `*_out.png`) | `dump_z_image_img2img_golden.py` | `tests/img2img_real_weights.rs` | img2img (`Conditioning::Reference`). Env: `ZIMAGE_PROMPT/SEED/STEPS/W/H/STRENGTH/IW/IH`. Dumps `init_image_u8` so Rust uses byte-identical pixels. |
+
+### Qwen-Image / Qwen-Image-Edit (`mlx-gen-qwen-image`)
+
+| golden | dump script | consumed by |
+|---|---|---|
+| `qwen_image_golden.safetensors`, `qwen_image_q8_golden.safetensors` | `dump_qwen_image_golden.py` (Q8 via its suffix arg) | `tests/e2e_real_weights.rs` |
+| `qwen_image_edit_golden.safetensors`, `qwen_image_edit_q8_golden.safetensors` | `dump_qwen_image_edit_golden.py` | `tests/edit_real_weights.rs` |
+| `qwen_text_encoder_golden.safetensors` | `dump_qwen_text_encoder_golden.py` | `tests/text_encoder_real_weights.rs` |
+| `qwen_transformer_golden.safetensors` | `dump_qwen_transformer_golden.py` | `tests/transformer_real_weights.rs` |
+| `qwen_vae_golden.safetensors` | `dump_qwen_vae_golden.py` | `tests/vae_real_weights.rs` |
+| `qwen_vision_golden.safetensors`, `qwen_vl_encoder_golden.safetensors`, `qwen_vl_tokenize_golden.safetensors` | `dump_qwen_vision_golden.py`, `dump_qwen_vl_encoder_golden.py`, `dump_qwen_vl_tokenize_golden.py` | `tests/vision_real_weights.rs` |
+| `qwen_edit_rope_golden.safetensors`, `qwen_edit_tokenize_debug.safetensors`, `qwen_edit_vision_stages_debug.safetensors` | `dump_qwen_edit_rope_golden.py`, `dump_qwen_edit_tokenize_debug.py`, `dump_qwen_edit_vision_stages_debug.py` | `tests/edit_real_weights.rs` (debug/bisection gates) |
+
+See each script's module docstring for its exact env vars / arguments.
+
+### Weight-independent
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `pil_resize_golden.safetensors` | `dump_pil_resize_golden.py` | `src/image.rs` (`resize_bicubic_matches_pil`) | Only needs Python + PIL (no model weights). Candidate to shrink + promote into `tests/fixtures/` so its test can run un-`#[ignore]`d on any clone. |
+
+## `CHECKSUMS.txt`
+
+SHA-256 of the goldens the **currently committed tests were last validated against**, as a
+regression tripwire: after regenerating, `shasum -a 256 -c CHECKSUMS.txt` flags an unexpected
+change. Caveats — re-bless (regenerate the file) deliberately when:
+- the MLX version changes (precision drift; see sc-2517), or a scheduler/port fix changes outputs;
+- you regenerate at a different resolution/seed/steps than the committed baseline.
+
+A mismatch across a *different machine/GPU* is possible (Metal float results aren't guaranteed
+bit-identical cross-device) and isn't necessarily a bug — treat `CHECKSUMS.txt` as "what this
+baseline produced," not a hard cross-machine contract. Only the goldens present when the file was
+generated are listed.

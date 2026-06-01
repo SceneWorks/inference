@@ -1,0 +1,2 @@
+e37c3b17d305a5606f0d3b25fbba8df6c05e48c6fafe28efe5545e5d2b520f6b  z_image_golden.safetensors
+281edd4343c60019bb62b3ed00a7d70dc5ce61feb5d8e4bcc7b64aff9c6f14a8  z_image_img2img_golden.safetensors
