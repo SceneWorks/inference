@@ -29,6 +29,14 @@ use crate::vae::Vae;
 /// `steps`.
 const DEFAULT_STEPS: u32 = 4;
 
+/// Flow-match time-shift for Z-Image-Turbo. Pinned by the model's own
+/// `scheduler/scheduler_config.json` (`FlowMatchEulerDiscreteScheduler`, `shift=3.0`,
+/// `use_dynamic_shifting=false`) — the static schedule used by the diffusers `ZImagePipeline`
+/// (the SceneWorks production path) and approximated by mflux's `linear` scheduler. NOT the
+/// empirical per-step `mu` of `FlowMatchEuler::for_image` (that is the *full* Z-Image model's
+/// scheduler; using it here was the sc-2536 bug).
+const SCHEDULE_SHIFT: f32 = 3.0;
+
 /// Registry id for Z-Image-turbo (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "z_image_turbo";
 
@@ -187,8 +195,9 @@ impl Generator for ZImageTurbo {
             cap.as_dtype(Dtype::Bfloat16)?
         };
 
-        // The schedule is resolution-dependent but seed-independent — build it once.
-        let scheduler = FlowMatchEuler::for_image(steps, req.width, req.height);
+        // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
+        // seed-independent — build it once. See SCHEDULE_SHIFT.
+        let scheduler = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
