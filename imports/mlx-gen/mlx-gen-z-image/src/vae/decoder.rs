@@ -63,6 +63,12 @@ impl Decoder {
         })
     }
 
+    /// Quantize the decoder's only quantizable Linears — the mid-block attention (conv_in/out,
+    /// up-blocks, and norms are conv/norm, not quantized).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.mid_block.quantize(bits)
+    }
+
     /// `latents` NCHW → image NCHW (3 channels, spatial ×8).
     pub fn forward(&self, latents: &Array) -> Result<Array> {
         let mut h = self.conv_in.forward(latents)?;
@@ -109,6 +115,18 @@ impl Vae {
     ) -> Result<Self> {
         self.encoder = Some(Encoder::from_weights(w, prefix, cfg)?);
         Ok(self)
+    }
+
+    /// Quantize the VAE's quantizable Linears (the decoder's — and, if loaded, the encoder's —
+    /// mid-block spatial attention) to Q4/Q8. The VAE is otherwise all conv, so this is the full
+    /// set the fork's `nn.quantize(vae, …)` hits. Output is pixel-unchanged in practice (the VAE
+    /// quant is measurably 0% px on the decode), so this is for memory/`nn.quantize` faithfulness.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.decoder.quantize(bits)?;
+        if let Some(encoder) = self.encoder.as_mut() {
+            encoder.quantize(bits)?;
+        }
+        Ok(())
     }
 
     /// Image NCHW `[1,3,H,W]` (or `[1,3,1,H,W]`) → latent `[1,16,H/8,W/8]`. Port of the fork's

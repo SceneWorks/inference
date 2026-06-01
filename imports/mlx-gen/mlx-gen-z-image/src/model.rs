@@ -93,16 +93,11 @@ pub struct ZImageTurbo {
 /// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a `Tongyi-MAI/Z-Image-Turbo`
 /// snapshot (the diffusers multi-component tree — `tokenizer/`, `text_encoder/`, `transformer/`,
 /// `vae/`). Weights load dense at their on-disk dtype (bf16); the text encoder promotes to f32
-/// internally. Quantization and an fp32 override are not yet wired in the Rust port (the
-/// validated path is dense bf16) — both are rejected rather than silently ignored.
+/// internally. `spec.quantize` (Q4/Q8) quantizes the **transformer only** (group_size 64) after
+/// the dense load — the mflux fork's `nn.quantize` predicate matches every Linear in the
+/// transformer. An fp32 precision override is not wired (the validated dense path is bf16) and is
+/// rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(
-            "z_image_turbo: Q4/Q8 quantization is not yet wired in the Rust port; the validated \
-             path is dense bf16 (drop `quantize` to load)"
-                .into(),
-        ));
-    }
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "z_image_turbo: only dense bf16 is wired in the Rust port; the text encoder already \
@@ -120,12 +115,26 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             ))
         }
     };
+    // Q4/Q8 quantizes the **whole model** in place after the dense bf16 load — the fork's
+    // `nn.quantize` over (transformer, text_encoder, vae), group_size 64, every quantizable Linear
+    // (+ the text encoder's token Embedding). This is what "quantize to Q4/Q8" means everywhere
+    // (mflux/diffusers/mlx-lm): a public consumer asking for Q4 gets the full memory saving and an
+    // output that matches the fork — not a transformer-only partial quantization (sc-2532).
+    let mut transformer = loader::load_transformer(root)?;
+    let mut text_encoder = loader::load_text_encoder(root)?;
+    let mut vae = loader::load_vae(root)?;
+    if let Some(q) = spec.quantize {
+        let bits = q.bits();
+        transformer.quantize(bits)?;
+        text_encoder.quantize(bits)?;
+        vae.quantize(bits)?;
+    }
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
-        text_encoder: loader::load_text_encoder(root)?,
-        transformer: loader::load_transformer(root)?,
-        vae: loader::load_vae(root)?,
+        text_encoder,
+        transformer,
+        vae,
     }))
 }
 
@@ -367,11 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_quantization() {
-        // Q4/Q8 isn't wired in the Rust port yet — reject rather than silently load bf16.
-        let spec =
-            LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(mlx_gen::Quant::Q8);
-        let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("quantization"), "got: {err}");
+    fn load_accepts_quantization_spec() {
+        // Q4/Q8 is wired (transformer-only); a quant spec must get past the load entry point and
+        // fail later on the missing snapshot, not on quantization being unsupported.
+        for q in [mlx_gen::Quant::Q4, mlx_gen::Quant::Q8] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(q);
+            let err = load(&spec).err().expect("expected an error").to_string();
+            assert!(!err.contains("quantization"), "got: {err}");
+        }
     }
 }

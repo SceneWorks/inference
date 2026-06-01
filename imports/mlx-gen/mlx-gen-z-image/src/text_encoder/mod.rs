@@ -18,20 +18,9 @@ pub use layer::EncoderLayer;
 pub use mlp::TextMlp;
 pub use rope::TextRope;
 
-use mlx_rs::ops::matmul;
-use mlx_rs::Array;
-
-use mlx_gen::Result;
-
 /// mlx `nn.RMSNorm` default eps — used by the per-head `q_norm`/`k_norm` (which the fork
 /// constructs without an explicit eps). The block-level layer norms use `rms_norm_eps` (1e-6).
 pub(crate) const QK_NORM_EPS: f32 = 1e-5;
-
-/// `y = x · Wᵀ` for a stored `[out, in]` weight (bias-less Linear; the text encoder has no
-/// biases on any projection).
-pub(crate) fn matmul_t(x: &Array, w: &Array) -> Result<Array> {
-    Ok(matmul(x, w.t())?)
-}
 
 /// Join a module prefix with a leaf name, tolerating an empty prefix (so flat fixtures and
 /// real `layers.{i}` trees both resolve without a stray leading dot).
