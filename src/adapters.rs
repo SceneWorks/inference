@@ -96,10 +96,14 @@ impl LinearBase {
                 y
             }
             LinearBase::Quantized(q) => {
-                // pmetal-MLX-0.30.6 quirk: `quantized_matmul` with **bf16 activations** + a small
-                // `in_features` (≤128) returns garbage, while f32 activations are correct for every
-                // shape (verified in `mlx-gen-qwen-image/tests/q8_smoke.rs`). Upcast bf16 → f32 so
-                // the quantized path is correct regardless of input dtype (weights stay Q4/Q8).
+                // Belt-and-suspenders upcast for the NAX 16-bit-GEMM bug (present on both pinned
+                // MLX builds, 0.30.6 and 0.31.1; see `tests/bf16_matmul_sweep.rs`). The buggy op is
+                // the *dense* 16-bit×16-bit Metal GEMM (M≥2 & K≤512, or very large M) — NOT
+                // `quantized_matmul`, which accumulates in fp32 (mlx#963) and is correct at every
+                // shape/dtype. So this bf16→f32 upcast guards a non-bug here and is not strictly
+                // load-bearing; it is kept as a cheap, uniform "16-bit activations never reach a
+                // 16-bit/quant Linear" invariant (and to keep `q8_smoke.rs` green) while the
+                // underlying GEMM bug persists. Weights stay Q4/Q8 throughout.
                 let xf = if x.dtype() == Dtype::Bfloat16 {
                     x.as_dtype(Dtype::Float32)?
                 } else {
