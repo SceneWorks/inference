@@ -403,7 +403,9 @@ fn control_q8_bisect() {
 
     println!("--- Q8 control single forward: Rust vs fork-f32 stages ---");
     for (name, arr) in &stages {
-        let golden = bisect.require(name).unwrap();
+        let Some(golden) = bisect.get(name) else {
+            continue; // "x_tokens" has no bisect-golden entry — compared to the qmm probe below
+        };
         if arr.shape() != golden.shape() {
             println!(
                 "  {name:>14}: SHAPE {:?} vs {:?}",
@@ -424,6 +426,31 @@ fn control_q8_bisect() {
         mean_rel(&v0, bisect.require("v0_scale1").unwrap()),
         peak_rel(&v0, bisect.require("v0_scale1").unwrap())
     );
+
+    // STAGE-INJECTION (resolves the qmm_smallk=0.0 vs bisection x_emb=0.3% contradiction): is Rust's
+    // own `patchify(init)` byte-identical to the fork's patchified init? `qmm_smallK_probe`'s `x` IS
+    // the fork's patchify(init), and `qmm_smallk` already proved Rust's qmm on that exact `x` matches
+    // the fork at 0.0 — so if Rust's `x_tokens` here also equals it, the embedder input is identical
+    // and the x_emb 0.3% must be a measurement artifact; if it diverges, patchify is the source.
+    let qmm_probe = Weights::from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tools/golden/qmm_smallK_probe.safetensors"
+    ))
+    .unwrap();
+    let fork_x = qmm_probe.require("x").unwrap();
+    match stages.iter().find(|(n, _)| *n == "x_tokens") {
+        Some((_, x_tokens)) if x_tokens.shape() == fork_x.shape() => println!(
+            "  patchify x_tokens: Rust vs fork(qmm-probe x) mean_rel={:.3e}  peak_rel={:.3e}",
+            mean_rel(x_tokens, fork_x),
+            peak_rel(x_tokens, fork_x)
+        ),
+        Some((_, x_tokens)) => println!(
+            "  patchify x_tokens: SHAPE {:?} vs fork {:?}",
+            x_tokens.shape(),
+            fork_x.shape()
+        ),
+        None => println!("  patchify x_tokens: not captured"),
+    }
 
     // Base-path (scale=0, control inert) vs the hints (scale=1): if scale=0 has the SAME per-forward
     // error as scale=1, the divergence is in the BASE path, not the control hints.

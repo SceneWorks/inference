@@ -196,6 +196,7 @@ impl ZImageControlTransformer {
         record!("t_emb", t_emb);
 
         let patched = self.base.patchify(x, cap_feats)?;
+        record!("x_tokens", patched.x_tokens); // pre-embed patchify output (the x-embedder input)
 
         // Image stream: embed → set padded positions to x_pad_token → (control refiner) → noise refiner.
         let mut x_emb = self.base.x_embedder.forward(&patched.x_tokens)?;
