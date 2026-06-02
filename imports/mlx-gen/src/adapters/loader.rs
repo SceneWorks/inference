@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use super::{reconstruct_lokr_delta, AdaptableHost, Adapter};
 use crate::runtime::{AdapterKind, AdapterSpec};
@@ -92,6 +92,8 @@ pub fn apply_lokr(host: &mut impl AdaptableHost, w: &Weights, scale: f32) -> Res
                     factors.get("lokr_w2").copied(),
                     factors.get("lokr_w2_a").copied(),
                     factors.get("lokr_w2_b").copied(),
+                    // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609).
+                    Dtype::Bfloat16,
                 )?;
                 lin.push(Adapter::Lokr { delta, scale });
                 report.applied += 1;
