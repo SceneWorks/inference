@@ -6,7 +6,7 @@
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Image, Progress, Result};
-use mlx_rs::ops::{add, maximum, minimum, multiply, round};
+use mlx_rs::ops::{add, multiply};
 use mlx_rs::{random, Array};
 
 use crate::vae::Vae;
@@ -17,9 +17,9 @@ pub const LATENT_CHANNELS: i32 = 16;
 /// VAE spatial downscale (latent is image/8 per side).
 pub const SPATIAL_SCALE: u32 = 8;
 
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
+// The decoded-tensor → Image step is identical across families and now lives in core (F-006);
+// re-exported so `crate::pipeline::decoded_to_image` and the crate's public surface are unchanged.
+pub use mlx_gen::image::decoded_to_image;
 
 /// Seeded txt2img latent noise — shape `[16, 1, height/8, width/8]`, f32. Port of
 /// `ZImageLatentCreator.create_noise` (`mx.random.normal` with `key(seed)`). The fork casts to
@@ -185,41 +185,4 @@ pub fn add_noise_by_interpolation(clean: &Array, noise: &Array, sigma: f32) -> R
     let one_minus = Array::from_slice(&[1.0 - sigma], &[1]);
     let s = Array::from_slice(&[sigma], &[1]);
     Ok(add(&multiply(clean, one_minus)?, &multiply(noise, s)?)?)
-}
-
-/// Decoded VAE tensor → RGB8 [`Image`]. Mirrors the fork's `ImageUtil`: denormalize
-/// `clip(x/2 + 0.5, 0, 1)`, drop the temporal axis if 5-D, `NCHW → NHWC`, then
-/// `(x*255).round()` as `uint8`, taking the first batch element.
-pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
-    let half = scalar(0.5);
-    // denormalize: clip(x*0.5 + 0.5, 0, 1)
-    let x = add(&multiply(decoded, &half)?, &half)?;
-    let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
-    // drop the singleton temporal axis if present (5-D → 4-D)
-    let x = if x.shape().len() == 5 {
-        x.squeeze_axes(&[2])?
-    } else {
-        x
-    };
-    // NCHW → NHWC
-    let x = x.transpose_axes(&[0, 2, 3, 1])?;
-    // (x*255).round() to integer pixel values.
-    let x = round(&multiply(&x, scalar(255.0))?, 0)?;
-
-    let sh = x.shape();
-    let (h, w, c) = (sh[1] as u32, sh[2] as u32, sh[3] as u32);
-    let n = (h * w * c) as usize;
-    // `transpose_axes` yields a strided view; a raw `as_slice` would read physical (pre-transpose)
-    // order. `reshape` re-materializes in C-order, so the slice is logical NHWC. Take batch 0.
-    let total: i32 = sh.iter().product();
-    let flat = x.reshape(&[total])?;
-    let pixels: Vec<u8> = flat.as_slice::<f32>()[..n]
-        .iter()
-        .map(|&v| v as u8)
-        .collect();
-    Ok(Image {
-        width: w,
-        height: h,
-        pixels,
-    })
 }

@@ -8,6 +8,16 @@
 //! arithmetic (not just "a bicubic") is what gives the edit/img2img conditioning images
 //! pixel-parity with the frozen Python fork — an f64-coefficient resampler diverges ±1–2 ULP at
 //! gradient cliffs (sc-2465: 24% e2e px>8). Lives in core so every model reuses one copy.
+//!
+//! Also hosts [`decoded_to_image`] — the VAE-decoded-tensor → [`Image`] denormalize/quantize step,
+//! identical across the provider crates' pipelines (F-006).
+
+use mlx_rs::ops::{add, maximum, minimum, multiply, round};
+use mlx_rs::Array;
+
+use crate::array::scalar;
+use crate::media::Image;
+use crate::Result;
 
 /// PIL `bicubic_filter` (Keys cubic, a = -0.5), support 2.0.
 fn cubic(x: f64) -> f64 {
@@ -187,6 +197,43 @@ pub fn resize_lanczos_u8(
     out_w: usize,
 ) -> Vec<f32> {
     resize_u8(src, in_h, in_w, out_h, out_w, 3.0, &lanczos3)
+}
+
+/// Denormalize a VAE-decoded tensor to an RGB8 [`Image`]: `clip(x·0.5 + 0.5, 0, 1)` → drop the
+/// singleton temporal axis (5-D → 4-D) → NCHW→NHWC → `(x·255).round()` → `u8`, taking batch 0.
+/// Identical across the Z-Image and Qwen-Image pipelines (the decoded tensor must already be f32).
+pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
+    let half = scalar(0.5);
+    // denormalize: clip(x*0.5 + 0.5, 0, 1)
+    let x = add(&multiply(decoded, &half)?, &half)?;
+    let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
+    // drop the singleton temporal axis if present (5-D → 4-D)
+    let x = if x.shape().len() == 5 {
+        x.squeeze_axes(&[2])?
+    } else {
+        x
+    };
+    // NCHW → NHWC
+    let x = x.transpose_axes(&[0, 2, 3, 1])?;
+    // (x*255).round() to integer pixel values.
+    let x = round(&multiply(&x, scalar(255.0))?, 0)?;
+
+    let sh = x.shape();
+    let (h, w, c) = (sh[1] as u32, sh[2] as u32, sh[3] as u32);
+    let n = (h * w * c) as usize;
+    // `transpose_axes` yields a strided view; a raw `as_slice` would read physical (pre-transpose)
+    // order. `reshape` re-materializes in C-order, so the slice is logical NHWC. Take batch 0.
+    let total: i32 = sh.iter().product();
+    let flat = x.reshape(&[total])?;
+    let pixels: Vec<u8> = flat.as_slice::<f32>()[..n]
+        .iter()
+        .map(|&v| v as u8)
+        .collect();
+    Ok(Image {
+        width: w,
+        height: h,
+        pixels,
+    })
 }
 
 #[cfg(test)]
