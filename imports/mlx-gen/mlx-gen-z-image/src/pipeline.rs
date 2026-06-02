@@ -6,9 +6,10 @@
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Image, Progress, Result};
-use mlx_rs::ops::{add, multiply};
+use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array};
 
+use crate::control_transformer::ZImageControlTransformer;
 use crate::vae::Vae;
 use crate::ZImageTransformer;
 
@@ -109,6 +110,45 @@ pub fn denoise(
     )
 }
 
+/// [`denoise_with_progress`] for the ControlNet variant: each step predicts the velocity with the
+/// [`ZImageControlTransformer`], passing the (constant) `control_context` + `control_context_scale`
+/// to every forward (the fork's `ZImageControl._control_predict`). Same Euler step, progress, and
+/// cooperative cancellation as the base loop. `start_step` is `0` for txt2img+control and
+/// `init_time_step` for img2img+control.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control_with_progress(
+    transformer: &ZImageControlTransformer,
+    scheduler: &FlowMatchEuler,
+    latents: Array,
+    cap_feats: &Array,
+    control_context: &Array,
+    control_context_scale: f32,
+    start_step: usize,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    let mut latents = latents;
+    let total = (scheduler.num_steps() - start_step) as u32;
+    for t in start_step..scheduler.num_steps() {
+        if cancel.is_cancelled() {
+            return Err(Error::Msg("generation cancelled".into()));
+        }
+        let velocity = transformer.forward(
+            &latents,
+            scheduler.timestep(t),
+            cap_feats,
+            Some(control_context),
+            control_context_scale,
+        )?;
+        latents = scheduler.step(&latents, &velocity, t)?;
+        on_progress(Progress::Step {
+            current: (t - start_step) as u32 + 1,
+            total,
+        });
+    }
+    Ok(latents)
+}
+
 /// Resolve the img2img start step (the fork's `Config.init_time_step`): for a reference image with
 /// `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`; otherwise `0` (pure txt2img).
 /// Higher strength → later start → fewer denoise steps → output stays closer to the init image
@@ -136,6 +176,27 @@ pub fn encode_init_latents(
     let image_nchw = preprocess_init_image(image, target_width, target_height)?;
     let encoded = vae.encode(&image_nchw)?; // [1, 16, H/8, W/8]
     pack_latents(&encoded)
+}
+
+/// Build the 33-channel VAE-encoded **control context** from a control image (e.g. a rendered
+/// pose skeleton) — the fork's `ZImageControl._encode_control_context`. VAE-encode to 16ch latents
+/// (the exact img2img [`encode_init_latents`] path: LANCZOS → `[-1,1]` NCHW → encode → pack
+/// `[16,1,H/8,W/8]`), then concat a zero mask (1ch) and a zero inpaint latent (16ch) → `[33, 1,
+/// H/8, W/8]`. Pure-pose control has no init image and no mask, so those two channel groups are
+/// zeros; the channel layout (control latent | mask | inpaint) matches the Fun-Controlnet-Union
+/// `control_all_x_embedder`'s 33ch input.
+pub fn encode_control_context(
+    vae: &Vae,
+    control_image: &Image,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Array> {
+    let control_latents = encode_init_latents(vae, control_image, target_width, target_height)?;
+    let sh = control_latents.shape(); // [16, 1, H/8, W/8]
+    let (c, fdim, h, w) = (sh[0], sh[1], sh[2], sh[3]);
+    let mask = Array::from_slice(&vec![0f32; (fdim * h * w) as usize], &[1, fdim, h, w]);
+    let inpaint = Array::from_slice(&vec![0f32; (c * fdim * h * w) as usize], &[c, fdim, h, w]);
+    Ok(concatenate_axis(&[&control_latents, &mask, &inpaint], 0)?)
 }
 
 /// Scale an RGB8 init image to `target` dims with PIL LANCZOS (the fork's `scale_to_dimensions`,

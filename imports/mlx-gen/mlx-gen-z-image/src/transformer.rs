@@ -76,23 +76,27 @@ impl ZImageTransformerConfig {
 }
 
 pub struct ZImageTransformer {
-    cfg: ZImageTransformerConfig,
-    x_embedder: AdaptableLinear,
-    cap_norm_w: Array,
-    cap_linear: AdaptableLinear,
-    t_embedder: TimestepEmbedder,
-    noise_refiner: Vec<ZImageTransformerBlock>,
-    context_refiner: Vec<ZImageContextBlock>,
-    layers: Vec<ZImageTransformerBlock>,
-    rope: RopeEmbedder,
-    final_layer: FinalLayer,
-    x_pad_token: Array,
-    cap_pad_token: Array,
+    // Fields are `pub(crate)` so the ControlNet variant ([`crate::control_transformer`]) can
+    // compose the base submodules into its dual-injection forward without forking the
+    // parity-proven base `forward` (mirrors the fork's `ZImageControlTransformer(ZImageTransformer)`
+    // inheritance).
+    pub(crate) cfg: ZImageTransformerConfig,
+    pub(crate) x_embedder: AdaptableLinear,
+    pub(crate) cap_norm_w: Array,
+    pub(crate) cap_linear: AdaptableLinear,
+    pub(crate) t_embedder: TimestepEmbedder,
+    pub(crate) noise_refiner: Vec<ZImageTransformerBlock>,
+    pub(crate) context_refiner: Vec<ZImageContextBlock>,
+    pub(crate) layers: Vec<ZImageTransformerBlock>,
+    pub(crate) rope: RopeEmbedder,
+    pub(crate) final_layer: FinalLayer,
+    pub(crate) x_pad_token: Array,
+    pub(crate) cap_pad_token: Array,
 }
 
 /// `where(keep == 1, emb, pad)` for `emb` `[N, dim]`, `keep` `[N, 1]` (1 = real, 0 = padded),
 /// `pad` `[1, dim]` — set padded token positions to the learned pad-token embedding.
-fn apply_pad(emb: &Array, keep: &Array, pad: &Array) -> Result<Array> {
+pub(crate) fn apply_pad(emb: &Array, keep: &Array, pad: &Array) -> Result<Array> {
     let inv = subtract(Array::from_slice(&[1.0f32], &[1]), keep)?; // 1 - keep
     Ok(add(&multiply(emb, keep)?, &multiply(pad, &inv)?)?)
 }
@@ -235,7 +239,7 @@ impl ZImageTransformer {
         Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
     }
 
-    fn patchify(&self, image: &Array, cap_feats: &Array) -> Result<Patchified> {
+    pub(crate) fn patchify(&self, image: &Array, cap_feats: &Array) -> Result<Patchified> {
         let (pf, ph, pw) = (
             self.cfg.f_patch_size,
             self.cfg.patch_size,
@@ -289,7 +293,7 @@ impl ZImageTransformer {
         })
     }
 
-    fn unpatchify(&self, x: &Array, size: (i32, i32, i32)) -> Result<Array> {
+    pub(crate) fn unpatchify(&self, x: &Array, size: (i32, i32, i32)) -> Result<Array> {
         let (pf, ph, pw) = (
             self.cfg.f_patch_size,
             self.cfg.patch_size,
@@ -305,24 +309,24 @@ impl ZImageTransformer {
     }
 }
 
-struct Patchified {
-    x_tokens: Array,
-    cap_tokens: Array,
-    x_size: (i32, i32, i32),
-    x_pos_ids: Array,
-    cap_pos_ids: Array,
-    x_keep: Array,
-    cap_keep: Array,
+pub(crate) struct Patchified {
+    pub(crate) x_tokens: Array,
+    pub(crate) cap_tokens: Array,
+    pub(crate) x_size: (i32, i32, i32),
+    pub(crate) x_pos_ids: Array,
+    pub(crate) cap_pos_ids: Array,
+    pub(crate) x_keep: Array,
+    pub(crate) cap_keep: Array,
 }
 
 /// `[0, 1, …, n-1]` as an int32 index array for `take_axis`.
-fn row_indices(n: i32) -> Array {
+pub(crate) fn row_indices(n: i32) -> Array {
     Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n])
 }
 
 /// Append `pad` zero rows to a 2-D `(N, D)` array (padded positions are zeroed post-embed
 /// anyway, so the pre-embed value is irrelevant — zeros match the fork's repeat-then-zero).
-fn pad_rows(a: &Array, pad: i32) -> Result<Array> {
+pub(crate) fn pad_rows(a: &Array, pad: i32) -> Result<Array> {
     if pad <= 0 {
         return Ok(a.clone());
     }

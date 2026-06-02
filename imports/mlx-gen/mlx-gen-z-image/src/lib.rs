@@ -16,10 +16,13 @@
 
 pub mod attention;
 pub mod context_block;
+pub mod control_transformer;
+pub mod control_transformer_block;
 pub mod feed_forward;
 pub mod final_layer;
 pub mod loader;
 pub mod model;
+pub mod model_control;
 pub mod pipeline;
 pub mod rope_embedder;
 pub mod text_encoder;
@@ -29,11 +32,20 @@ pub mod transformer_block;
 pub mod vae;
 
 pub use context_block::ZImageContextBlock;
+pub use control_transformer::{ZImageControlTransformer, CONTROL_IN_DIM};
+pub use control_transformer_block::ZImageControlBlock;
 pub use final_layer::FinalLayer;
-pub use loader::{load_text_encoder, load_tokenizer, load_transformer, load_vae};
+pub use loader::{
+    load_control_transformer, load_text_encoder, load_tokenizer, load_transformer, load_vae,
+};
 pub use model::{descriptor, load, ZImageTurbo, MODEL_ID};
+// The control variant registers itself via `inventory`; its `descriptor`/`load`/`MODEL_ID` clash
+// with the base model's, so reach them through the `model_control` module path (consumers use the
+// registry id `"z_image_turbo_control"`).
+pub use model_control::ZImageTurboControl;
 pub use pipeline::{
-    add_noise_by_interpolation, create_noise, decoded_to_image, denoise, denoise_with_progress,
+    add_noise_by_interpolation, create_noise, decoded_to_image, denoise,
+    denoise_control_with_progress, denoise_with_progress, encode_control_context,
     encode_init_latents, init_time_step, pack_latents, preprocess_init_image, slice_valid,
     unpack_latents,
 };

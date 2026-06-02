@@ -27,8 +27,8 @@ use crate::transformer::ZImageTransformer;
 use crate::vae::Vae;
 
 /// Z-Image-turbo is guidance-distilled to a fixed 4-step schedule; used when a request omits
-/// `steps`.
-const DEFAULT_STEPS: u32 = 4;
+/// `steps`. (`pub(crate)` so the ControlNet variant shares the same default.)
+pub(crate) const DEFAULT_STEPS: u32 = 4;
 
 /// Flow-match time-shift for Z-Image-Turbo: the model's own published schedule from
 /// `scheduler/scheduler_config.json` (`FlowMatchEulerDiscreteScheduler`, `shift=3.0`,
@@ -45,7 +45,10 @@ const DEFAULT_STEPS: u32 = 4;
 /// (The *original* port's bug — replaced by sc-2536 — was using `FlowMatchEuler::for_image`'s
 /// empirical per-step `mu`, the *full* Z-Image model's scheduler, ≈shift 10. That was wrong;
 /// `linear` and 3.0 are both reasonable, empirical-`mu` was not.)
-const SCHEDULE_SHIFT: f32 = 3.0;
+///
+/// `pub(crate)` so the ControlNet variant ([`crate::model_control`]) uses the identical schedule —
+/// it is the same base turbo model, and the parity golden holds the schedule fixed on both sides.
+pub(crate) const SCHEDULE_SHIFT: f32 = 3.0;
 
 /// Registry id for Z-Image-turbo (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "z_image_turbo";

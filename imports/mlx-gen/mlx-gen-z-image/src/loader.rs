@@ -16,8 +16,9 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Result, WeightsSource};
 
+use crate::control_transformer::ZImageControlTransformer;
 use crate::text_encoder::{TextEncoder, ZTextEncoderConfig};
 use crate::transformer::{ZImageTransformer, ZImageTransformerConfig};
 use crate::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
@@ -52,6 +53,22 @@ pub fn load_transformer(root: &Path) -> Result<ZImageTransformer> {
     let mut w = Weights::from_dir(root.join("transformer"))?;
     remap_transformer_keys(&mut w);
     ZImageTransformer::from_weights(&w, "", ZImageTransformerConfig::turbo())
+}
+
+/// Load the ControlNet transformer (sc-2349): the base DiT from the snapshot `root`, overlaid with
+/// the Fun-Controlnet-Union control branch from `control` (a single `.safetensors` `File`, or a
+/// `Dir` of them — the HF cache stores the checkpoint as one file inside a snapshot dir). The
+/// control keys map 1:1 onto the control branch's param tree, so no remap is needed.
+pub fn load_control_transformer(
+    root: &Path,
+    control: &WeightsSource,
+) -> Result<ZImageControlTransformer> {
+    let base = load_transformer(root)?;
+    let control_weights = match control {
+        WeightsSource::File(p) => Weights::from_file(p)?,
+        WeightsSource::Dir(p) => Weights::from_dir(p)?,
+    };
+    ZImageControlTransformer::from_weights(base, &control_weights, "")
 }
 
 /// Load the full VAE (decoder + encoder), remapping both diffusers trees to the internal naming
