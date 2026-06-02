@@ -175,7 +175,7 @@ impl ClipBpeTokenizer {
         let mut flat = Vec::with_capacity(rows.len() * n);
         for row in &rows {
             flat.extend_from_slice(row);
-            flat.extend(std::iter::repeat(PAD_ID).take(n - row.len()));
+            flat.extend(std::iter::repeat_n(PAD_ID, n - row.len()));
         }
         Ok(Array::from_slice(&flat, &[batch, n as i32]))
     }

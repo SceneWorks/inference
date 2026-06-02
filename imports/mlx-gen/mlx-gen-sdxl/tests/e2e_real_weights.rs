@@ -108,12 +108,12 @@ fn accumulate_from_own_prior() {
         let eps = unet
             .forward(&x_unet, t, &conditioning, &pooled, &time_ids)
             .unwrap();
-        let r = |k: i32| eps.take_axis(&Array::from_slice(&[k], &[1]), 0).unwrap();
+        let r = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0).unwrap();
         let (et, en) = (r(0), r(1));
         let ec = mlx_rs::ops::add(
             &en,
-            &mlx_rs::ops::multiply(
-                &mlx_rs::ops::subtract(&et, &en).unwrap(),
+            mlx_rs::ops::multiply(
+                mlx_rs::ops::subtract(&et, &en).unwrap(),
                 mlx_gen::array::scalar(cfg),
             )
             .unwrap(),
@@ -149,9 +149,9 @@ fn rng_stream_matches() {
 }
 
 /// Per-step localization gate: teacher-force each step with the golden's previous latent and assert
-/// the per-step result is bit-exact. Proves the per-step math (UNet eps + CFG + Euler-Ancestral step
-/// + ancestral-RNG draw) is bit-exact; the public `full_pipeline_generates_fox` then confirms the
-/// accumulated render is pixel-parity (sc-2400 S5).
+/// the per-step result is bit-exact. Proves the per-step math (UNet eps, CFG, the Euler-Ancestral
+/// step, and the ancestral-RNG draw) is bit-exact; the public `full_pipeline_generates_fox` then
+/// confirms the accumulated render is pixel-parity (sc-2400 S5).
 #[test]
 #[ignore = "needs the real SDXL snapshot + e2e golden"]
 fn denoise_per_step_matches_golden() {
@@ -199,12 +199,12 @@ fn denoise_per_step_matches_golden() {
         let eps = unet
             .forward(&x_unet, t, &conditioning, &pooled, &time_ids)
             .unwrap();
-        let r = |k: i32| eps.take_axis(&Array::from_slice(&[k], &[1]), 0).unwrap();
+        let r = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0).unwrap();
         let (et, en) = (r(0), r(1));
         let ec = mlx_rs::ops::add(
             &en,
-            &mlx_rs::ops::multiply(
-                &mlx_rs::ops::subtract(&et, &en).unwrap(),
+            mlx_rs::ops::multiply(
+                mlx_rs::ops::subtract(&et, &en).unwrap(),
                 mlx_gen::array::scalar(cfg),
             )
             .unwrap(),

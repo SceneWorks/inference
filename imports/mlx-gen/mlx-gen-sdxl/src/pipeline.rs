@@ -97,7 +97,7 @@ pub fn denoise(
         };
         let eps = d.unet.forward(&x_unet, t, conditioning, pooled, time_ids)?;
         let eps = if cfg_on {
-            let row = |k: i32| eps.take_axis(&Array::from_slice(&[k], &[1]), 0);
+            let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
             let eps_text = row(0)?;
             let eps_neg = row(1)?;
             add(

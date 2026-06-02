@@ -41,7 +41,7 @@ impl EulerSampler {
         let n = cfg.num_train_steps as i32;
         // _linspace(a, b, n) = arange(n)/(n-1) · (b−a) + a, as f32 arrays.
         let arange: Vec<f32> = (0..n).map(|i| i as f32).collect();
-        let x = divide(&Array::from_slice(&arange, &[n]), scalar((n - 1) as f32))?;
+        let x = divide(Array::from_slice(&arange, &[n]), scalar((n - 1) as f32))?;
         let betas = match cfg.beta_schedule {
             BetaSchedule::ScaledLinear => {
                 let (a, b) = ((cfg.beta_start as f64).sqrt(), (cfg.beta_end as f64).sqrt());
@@ -91,7 +91,7 @@ impl EulerSampler {
         let y_hi = scalar(self.sigmas[hi]);
         let delta = scalar(t - lo as f32);
         Ok(add(
-            &multiply(&y_lo, &subtract(&scalar(1.0), &delta)?)?,
+            &multiply(&y_lo, &subtract(scalar(1.0), &delta)?)?,
             &multiply(&delta, &y_hi)?,
         )?)
     }

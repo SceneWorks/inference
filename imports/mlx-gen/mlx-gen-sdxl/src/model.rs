@@ -280,7 +280,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         )));
     }
     // SDXL works in latent space at /8; both dims must be multiples of 8.
-    if req.width % 8 != 0 || req.height % 8 != 0 {
+    if !req.width.is_multiple_of(8) || !req.height.is_multiple_of(8) {
         return Err(Error::Msg(format!(
             "sdxl: width/height must be multiples of 8 (got {}x{})",
             req.width, req.height

@@ -119,12 +119,12 @@ fn img2img_components_bit_exact() {
     let s0 = g.require("step0_latents").unwrap();
     let xu = mlx_rs::ops::concatenate_axis(&[s0, s0], 0).unwrap();
     let eps = unet.forward(&xu, ts[1], &cond, &pooled, &time_ids).unwrap();
-    let row = |k: i32| eps.take_axis(&Array::from_slice(&[k], &[1]), 0).unwrap();
+    let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0).unwrap();
     let (et, en) = (row(0), row(1));
     let eps1 = mlx_rs::ops::add(
         &en,
-        &mlx_rs::ops::multiply(
-            &mlx_rs::ops::subtract(&et, &en).unwrap(),
+        mlx_rs::ops::multiply(
+            mlx_rs::ops::subtract(&et, &en).unwrap(),
             mlx_gen::array::scalar(cfg),
         )
         .unwrap(),

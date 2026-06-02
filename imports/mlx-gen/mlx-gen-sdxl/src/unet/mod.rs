@@ -60,6 +60,9 @@ impl UNet2DConditionModel {
 
         // Down blocks: block i goes block_channels[i] -> block_channels[i+1].
         let mut down_blocks = Vec::with_capacity(n);
+        // `i` indexes five parallel config arrays + the block prefix, not just `boc` — an
+        // `enumerate()` rewrite would be strictly worse here.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             down_blocks.push(UNetBlock2D::from_weights(
                 w,
