@@ -17,9 +17,7 @@ use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use blocks::{rms_norm_channels, CausalConv3d, DownBlock3D, MidBlock3D, UpBlock3D};
-
-const NORM_EPS: f32 = 1e-12;
+use blocks::{rms_norm_channels, CausalConv3d, DownBlock3D, MidBlock3D, UpBlock3D, NORM_EPS};
 
 // fork QwenVAE.LATENTS_{MEAN,STD}, reshaped to (1, 16, 1, 1, 1) for NCTHW broadcast.
 #[rustfmt::skip]

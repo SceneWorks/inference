@@ -157,6 +157,8 @@ pub fn denoise_with_progress(
             return Err(Error::Msg("generation cancelled".into()));
         }
         let sigma = scheduler.sigmas[t];
+        // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
+        // proven maskless (see `build_joint_mask`).
         let pos = transformer.forward(&latents, pos_embeds, None, sigma, lh, lw, &[])?;
         let neg = transformer.forward(&latents, neg_embeds, None, sigma, lh, lw, &[])?;
         let guided = compute_guided_noise(&pos, &neg, guidance)?;
@@ -198,6 +200,7 @@ pub fn denoise_edit_with_progress(
         let noise_seq = latents.shape()[1];
         let sigma = scheduler.sigmas[t];
         let hidden = concatenate_axis(&[&latents, static_image_latents], 1)?;
+        // `None` joint mask (as in T2I): the spliced prompt embeds are full-valid.
         let pos = slice_seq(
             &transformer.forward(&hidden, pos_embeds, None, sigma, lh, lw, cond_grids)?,
             noise_seq,
