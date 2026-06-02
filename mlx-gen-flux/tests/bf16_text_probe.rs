@@ -22,8 +22,8 @@ fn probe(label: &str, a_shape: &[i32], b_shape: &[i32]) {
     let b = random::normal::<f32>(b_shape, None, None, Some(&random::key(1).unwrap())).unwrap();
     let reff = matmul(&a, &b).unwrap();
     let bf16 = matmul(
-        &a.as_dtype(Dtype::Bfloat16).unwrap(),
-        &b.as_dtype(Dtype::Bfloat16).unwrap(),
+        a.as_dtype(Dtype::Bfloat16).unwrap(),
+        b.as_dtype(Dtype::Bfloat16).unwrap(),
     )
     .unwrap();
     println!(

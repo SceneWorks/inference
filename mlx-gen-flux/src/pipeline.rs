@@ -79,7 +79,7 @@ pub fn build_linear_sigmas(
 }
 
 fn validate_multiple_of_16(width: u32, height: u32) -> Result<()> {
-    if width % 16 != 0 || height % 16 != 0 {
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(Error::Msg(format!(
             "flux1: width and height must be multiples of 16, got {width}x{height}"
         )));

@@ -99,6 +99,7 @@ impl FluxTransformer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         hidden_states: &Array,
@@ -146,6 +147,7 @@ impl FluxTransformer {
     /// Bisection helper (sc-2345 parity): capture the embedding-stage and first-joint-block
     /// intermediates so the Rust transformer can be diffed against the fork golden stage-by-stage.
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_capture(
         &self,
         hidden_states: &Array,

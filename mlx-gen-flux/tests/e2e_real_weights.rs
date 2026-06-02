@@ -37,7 +37,7 @@ fn verify_quant(quant: Quant, bits: i32) {
     // with the fork's bf16 *activation* precision — which for FLUX.1-dev is large because the
     // guidance modulation `time_proj(guidance*1000)` rounds heavily in bf16 and the guided 20-step
     // sampler amplifies it (dev Q8 vs a bf16-precision golden = 75% px>8; vs f32-precision = 6%).
-    let g = Weights::from_file(&golden_path(&format!("_q{bits}_f32"))).unwrap();
+    let g = Weights::from_file(golden_path(&format!("_q{bits}_f32"))).unwrap();
     let stored: i32 = g.metadata("quantize").unwrap().parse().unwrap();
     assert_eq!(stored, bits, "golden dumped at a different bit-width");
     let w: u32 = g.metadata("w").unwrap().parse().unwrap();
@@ -88,7 +88,7 @@ fn verify_quant(quant: Quant, bits: i32) {
         let dt = sigmas[i + 1] - sigmas[i];
         latents = add(
             &latents,
-            &multiply(&v, Array::from_slice(&[dt], &[1])).unwrap(),
+            multiply(&v, Array::from_slice(&[dt], &[1])).unwrap(),
         )
         .unwrap();
     }
@@ -204,7 +204,7 @@ fn golden() -> Weights {
         Ok("bf16") => "",
         _ => "_f32",
     };
-    Weights::from_file(&golden_path(suffix)).unwrap()
+    Weights::from_file(golden_path(suffix)).unwrap()
 }
 
 /// (width, height) from the golden metadata.
@@ -377,7 +377,7 @@ fn e2e_transformer_substages_match_golden() {
         .forward_capture(&init, &pe, &pooled, sigmas[0], guid, w, h)
         .unwrap();
     for (name, arr) in &caps {
-        if let Some(golden) = g.require(name).ok() {
+        if let Ok(golden) = g.require(name) {
             let pr = peak_rel(&f32a(arr), golden);
             let mr = mean_abs_rel(&f32a(arr), golden);
             println!(
@@ -410,7 +410,7 @@ fn e2e_rope_table_matches_golden() {
         .reshape(&[seq, half, 4])
         .unwrap();
     let pick = |col: i32| {
-        r.take_axis(&Array::from_slice(&[col], &[1]), 2)
+        r.take_axis(Array::from_slice(&[col], &[1]), 2)
             .unwrap()
             .reshape(&[seq, half])
             .unwrap()
@@ -492,7 +492,7 @@ fn e2e_denoise_loop_matches_golden() {
         let dt = sigmas[i + 1] - sigmas[i];
         latents = add(
             &latents,
-            &multiply(&v, mlx_rs::Array::from_slice(&[dt], &[1])).unwrap(),
+            multiply(&v, mlx_rs::Array::from_slice(&[dt], &[1])).unwrap(),
         )
         .unwrap();
     }
@@ -583,6 +583,7 @@ fn e2e_single_stack_injected_matches_golden() {
 ///     further). Every component matches the f32 fork to <1e-3 and the dev mu-shift scheduler is
 ///     exact (see the other tests) — the divergence is purely Rust's f32 T5/CLIP vs the fork's
 ///     (bf16) embeds, amplified by the guided sampler.
+///
 /// So px>8 here is NOT a parity metric; component f32 parity + the visual render are. The broken
 /// Codex state (bf16-GEMM garbage + wrong CLIP pooled) was 95%+ AND structurally incoherent, so the
 /// variant-aware bound below catches a regression to that without overclaiming parity.
