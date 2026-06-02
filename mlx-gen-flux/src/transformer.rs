@@ -17,7 +17,10 @@ const DIM: i32 = 3072;
 const HEADS: i32 = 24;
 const HEAD_DIM: i32 = 128;
 const LN_EPS: f32 = 1e-6;
-const RMS_EPS: f32 = 1e-6;
+// QK-norm epsilon. The fork builds these as `nn.RMSNorm(128)` with MLX's *default* eps (1e-5) —
+// NOT 1e-6 (which is the AdaLayerNorm's explicit LayerNorm eps). A 1e-6 here is a small uniform
+// bias in every attention block that compounds across the 19 joint + 38 single blocks.
+const RMS_EPS: f32 = 1e-5;
 
 pub struct FluxTransformerConfig {
     pub num_layers: usize,
@@ -139,6 +142,135 @@ impl FluxTransformer {
         let hidden = self.norm_out.forward(&hidden, &text_embeddings)?;
         self.proj_out.forward(&hidden)
     }
+
+    /// Bisection helper (sc-2345 parity): capture the embedding-stage and first-joint-block
+    /// intermediates so the Rust transformer can be diffed against the fork golden stage-by-stage.
+    #[doc(hidden)]
+    pub fn forward_capture(
+        &self,
+        hidden_states: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<(String, Array)>> {
+        let mut out = Vec::new();
+        let hidden = self.x_embedder.forward(hidden_states)?;
+        let encoder = self.context_embedder.forward(prompt_embeds)?;
+        let text_embeddings = self.time_text_embed.forward(
+            sigma * 1000.0,
+            pooled_prompt_embeds,
+            guidance * 1000.0,
+        )?;
+        out.push(("hidden0".into(), hidden.clone()));
+        out.push(("encoder0".into(), encoder.clone()));
+        out.push(("text_embeddings0".into(), text_embeddings.clone()));
+        let rope = self.pos_embed.forward(
+            prompt_embeds.shape()[1] as usize,
+            (height / 16) as usize,
+            (width / 16) as usize,
+        )?;
+        let (e0, h0) = self.blocks[0].forward(&hidden, &encoder, &text_embeddings, &rope)?;
+        out.push(("block0_encoder".into(), e0));
+        out.push(("block0_hidden".into(), h0));
+
+        let mut hidden = hidden;
+        let mut encoder = encoder;
+        for block in &self.blocks {
+            let (e, h) = block.forward(&hidden, &encoder, &text_embeddings, &rope)?;
+            encoder = e;
+            hidden = h;
+        }
+        out.push(("joint_hidden".into(), hidden.clone()));
+        out.push(("encoder_joint".into(), encoder.clone()));
+
+        let txt_seq = encoder.shape()[1];
+        let img_seq = hidden.shape()[1];
+        let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?;
+        for block in &self.single_blocks {
+            joint = block.forward(&joint, &text_embeddings, &rope)?;
+        }
+        let idx = Array::from_slice(
+            &(txt_seq..txt_seq + img_seq).collect::<Vec<i32>>(),
+            &[img_seq],
+        );
+        out.push(("single_img".into(), joint.take_axis(&idx, 1)?));
+        Ok(out)
+    }
+
+    /// Stage-injection (sc-2345): run ONLY the single-block stack on externally supplied
+    /// post-joint tensors, isolating it from upstream accumulation. Returns the img-token slice.
+    #[doc(hidden)]
+    pub fn debug_single_stack(
+        &self,
+        encoder: &Array,
+        hidden: &Array,
+        text_embeddings: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_blocks: usize,
+    ) -> Result<Array> {
+        let txt_seq = encoder.shape()[1];
+        let img_seq = hidden.shape()[1];
+        let rope = self
+            .pos_embed
+            .forward(txt_seq as usize, latent_h, latent_w)?;
+        let mut joint = concatenate_axis(&[encoder, hidden], 1)?;
+        let n = if num_blocks == 0 {
+            self.single_blocks.len()
+        } else {
+            num_blocks
+        };
+        for block in self.single_blocks.iter().take(n) {
+            joint = block.forward(&joint, text_embeddings, &rope)?;
+        }
+        let idx = Array::from_slice(
+            &(txt_seq..txt_seq + img_seq).collect::<Vec<i32>>(),
+            &[img_seq],
+        );
+        Ok(joint.take_axis(&idx, 1)?)
+    }
+
+    /// Expose the RoPE cos/sin table for a given (txt_seq, latent_h, latent_w) — to diff against
+    /// the fork's `EmbedND` output.
+    #[doc(hidden)]
+    pub fn debug_rope(
+        &self,
+        txt_seq: usize,
+        latent_h: usize,
+        latent_w: usize,
+    ) -> Result<(Array, Array)> {
+        let r = self.pos_embed.forward(txt_seq, latent_h, latent_w)?;
+        Ok((r.cos, r.sin))
+    }
+
+    /// Decompose single block 0 into its sub-ops (norm / attn / ff) on injected joint output.
+    #[doc(hidden)]
+    pub fn debug_single_block0(
+        &self,
+        encoder: &Array,
+        hidden: &Array,
+        text_embeddings: &Array,
+        latent_h: usize,
+        latent_w: usize,
+    ) -> Result<Vec<(String, Array)>> {
+        let txt_seq = encoder.shape()[1];
+        let rope = self
+            .pos_embed
+            .forward(txt_seq as usize, latent_h, latent_w)?;
+        let joint = concatenate_axis(&[encoder, hidden], 1)?;
+        let b = &self.single_blocks[0];
+        let (normed, _gate) = b.norm.forward_three(&joint, text_embeddings)?;
+        let attn = b.attn.forward(&normed, &rope)?;
+        let ff = gelu_approximate(b.proj_mlp.forward(&normed)?)?;
+        Ok(vec![
+            ("sb0_norm".into(), normed),
+            ("sb0_attn".into(), attn),
+            ("sb0_ff".into(), ff),
+        ])
+    }
 }
 
 struct TimeTextEmbed {
@@ -171,7 +303,9 @@ impl TimeTextEmbed {
             out = add(&out, &g.forward(&time_proj(&gstep)?)?)?;
         }
         out = add(&out, &self.text.forward(pooled)?)?;
-        Ok(out.as_dtype(Dtype::Bfloat16)?)
+        // Conditioning runs f32 (the whole transformer is f32 activations — the quality target;
+        // the fork's bf16 conditioning is the lossy reference, not the goal).
+        Ok(out)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {

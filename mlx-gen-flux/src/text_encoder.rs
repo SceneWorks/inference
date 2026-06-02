@@ -60,6 +60,12 @@ impl TokenEmbedding {
                 dequantize(&pw, &sc, &bi, *group_size, *bits)?
             }
         };
+        // Text encoders run f32 activations. This is MANDATORY on the pinned NAX MLX build, not a
+        // quality choice: T5 self-attention uses explicit `matmul(q, kᵀ)` with K=head_dim=64 (and
+        // `weights·v` with K=256), i.e. bf16×bf16 GEMMs with M≥2 & K≤512 — the dense 16-bit Metal
+        // GEMM bug ([[pmetal-mlx-bf16-matmul-bug]]). Forcing bf16 here returns garbage (T5/CLIP
+        // mean_rel ~1.0, full pipeline 85% px>8 — sc-2345 experiment). f32 acts (MLX promotes the
+        // bf16 weights per-op) sidestep it and are also the quality target. Do NOT switch to bf16.
         Ok(out.as_dtype(Dtype::Float32)?)
     }
 
@@ -140,12 +146,12 @@ impl ClipTextEncoder {
             1e-5,
         )?;
         let token_ids = host_i32(tokens)?;
-        let idx = token_ids
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, id)| *id)
-            .map(|(idx, _)| idx as i32)
-            .unwrap_or(0);
+        // Pooled output is the hidden state at the *first* argmax of the token ids — the fork's
+        // `mx.argmax(tokens, axis=-1)` (first occurrence on ties). CLIP pads to 77 with the EOS id
+        // (49407), so the EOS and every pad token tie; `Iterator::max_by_key` would return the
+        // LAST tie (a pad position) instead of the EOS, picking the wrong pooled vector.
+        let max_id = token_ids.iter().copied().max().unwrap_or(0);
+        let idx = token_ids.iter().position(|&id| id == max_id).unwrap_or(0) as i32;
         let flat = hidden.reshape(&[s, 768])?;
         let idx = Array::from_slice(&[idx], &[1]);
         Ok(flat.take_axis(&idx, 0)?)
