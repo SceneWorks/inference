@@ -5,7 +5,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::{host_i32, scalar};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
-use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
     add, broadcast_to, dequantize, matmul, multiply, power, quantize, sigmoid, softmax_axis, tanh,
 };
@@ -316,7 +316,7 @@ impl T5TextEncoder {
         for block in &self.blocks {
             hidden = block.forward(&hidden)?;
         }
-        Ok(rms_norm(&hidden, &self.final_ln_w, 1e-6)?)
+        t5_rms_norm(&hidden, &self.final_ln_w, 1e-6)
     }
 }
 
@@ -385,7 +385,7 @@ impl T5Attention {
     }
 
     fn forward(&self, hidden: &Array) -> Result<Array> {
-        let normed = rms_norm(hidden, &self.ln_w, 1e-6)?;
+        let normed = t5_rms_norm(hidden, &self.ln_w, 1e-6)?;
         let q = shape_t5(&self.q.forward(&normed)?)?;
         let k = shape_t5(&self.k.forward(&normed)?)?;
         let v = shape_t5(&self.v.forward(&normed)?)?;
@@ -438,7 +438,7 @@ impl T5FeedForward {
     }
 
     fn forward(&self, hidden: &Array) -> Result<Array> {
-        let normed = rms_norm(hidden, &self.ln_w, 1e-6)?;
+        let normed = t5_rms_norm(hidden, &self.ln_w, 1e-6)?;
         let gelu = new_gelu(&self.wi0.forward(&normed)?)?;
         let linear = self.wi1.forward(&normed)?;
         let ff = self.wo.forward(&multiply(&gelu, &linear)?)?;
@@ -463,6 +463,23 @@ fn new_gelu(x: &Array) -> Result<Array> {
     let inner = multiply(&inner, scalar((2.0_f32 / std::f32::consts::PI).sqrt()))?;
     let gate = add(&tanh(&inner)?, scalar(1.0))?;
     Ok(multiply(&multiply(x, scalar(0.5))?, &gate)?)
+}
+
+/// T5's `T5LayerNorm` — RMS-normalize over the last axis with NO mean subtraction.
+///
+/// This is deliberately the fork's hand-rolled primitive sequence (`weight * x *
+/// rsqrt(mean(x^2) + eps)`), NOT `mlx_rs::fast::rms_norm`. The fused kernel differs from the fork's
+/// primitives by ~1e-7 per call; T5-xxl applies it 49×, so on the wheel that grows to ~3e-3 in
+/// `prompt_embeds` (this exact form is BIT-EXACT to the fork on the wheel — verified sc-2345 review,
+/// 2026-06-02). On the pinned NAX build it removes the fast-vs-manual share of the T5 drift
+/// (dev@512²: 2.66e-3 → 1.87e-3 mean_rel); the rest is irreducible NAX-vs-wheel f32 accumulation over
+/// the 24 layers (block-0 bit-exact, grows monotonically with depth — not a code bug, the deferred
+/// cross-build delta). CLIP is unaffected because it uses `LayerNorm`, whose fused kernel DOES match
+/// the fork. `power(x, 2)` (not `square`) matches the fork's `mx.power(_, 2)` — they differ by 1 ULP.
+fn t5_rms_norm(x: &Array, weight: &Array, eps: f32) -> Result<Array> {
+    let var = power(x, Array::from_slice(&[2.0_f32], &[1]))?.mean_axis(-1, true)?;
+    let normed = multiply(x, &add(&var, scalar(eps))?.rsqrt()?)?;
+    Ok(multiply(weight, &normed)?)
 }
 
 fn shape_t5(x: &Array) -> Result<Array> {
