@@ -28,9 +28,9 @@ from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
 SEED = 42
 PROMPT = "a fox sitting in a forest, photorealistic"
 NEGATIVE = ""  # -> the fork's single-space fallback
-STEPS = 4
-HEIGHT = 512
-WIDTH = 512
+STEPS = int(os.environ.get("QWEN_STEPS", "4"))
+HEIGHT = int(os.environ.get("QWEN_H", "512"))
+WIDTH = int(os.environ.get("QWEN_W", "512"))
 GUIDANCE = 4.0
 QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
 

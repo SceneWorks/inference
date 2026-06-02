@@ -8,7 +8,7 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::Array;
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -32,6 +32,24 @@ pub struct QwenJointAttention {
     num_heads: i32,
     head_dim: i32,
     scale: f32,
+}
+
+impl AdaptableHost for QwenJointAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // Trained-file (diffusers) naming → fields: image stream `to_q/k/v` + `to_out.0`; text
+        // stream `add_{q,k,v}_proj` → `add_{q,k,v}` and `to_add_out`.
+        match path {
+            ["to_q"] => Some(&mut self.to_q),
+            ["to_k"] => Some(&mut self.to_k),
+            ["to_v"] => Some(&mut self.to_v),
+            ["to_out", "0"] => Some(&mut self.to_out),
+            ["add_q_proj"] => Some(&mut self.add_q),
+            ["add_k_proj"] => Some(&mut self.add_k),
+            ["add_v_proj"] => Some(&mut self.add_v),
+            ["to_add_out"] => Some(&mut self.to_add_out),
+            _ => None,
+        }
+    }
 }
 
 impl QwenJointAttention {

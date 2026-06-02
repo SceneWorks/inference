@@ -5,7 +5,7 @@
 use mlx_rs::nn::gelu_approximate;
 use mlx_rs::Array;
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -14,6 +14,17 @@ use super::{join, linear_from};
 pub struct FeedForward {
     mlp_in: AdaptableLinear,
     mlp_out: AdaptableLinear,
+}
+
+impl AdaptableHost for FeedForward {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // Trained-file (diffusers) naming: `{img,txt}_mlp.net.0.proj` (in) / `.net.2` (out).
+        match path {
+            ["net", "0", "proj"] => Some(&mut self.mlp_in),
+            ["net", "2"] => Some(&mut self.mlp_out),
+            _ => None,
+        }
+    }
 }
 
 impl FeedForward {

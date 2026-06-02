@@ -6,7 +6,7 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{add, multiply, split};
 use mlx_rs::Array;
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -21,6 +21,19 @@ pub struct QwenTransformerBlock {
     attn: QwenJointAttention,
     img_ff: FeedForward,
     txt_ff: FeedForward,
+}
+
+impl AdaptableHost for QwenTransformerBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // The fork's `QwenLoRAMapping` targets the joint attention + the two stream MLPs (no
+        // `*_mod` targets). Routes the trained-file naming (`attn.*`, `{img,txt}_mlp.*`).
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["img_mlp", rest @ ..] => self.img_ff.adaptable_mut(rest),
+            ["txt_mlp", rest @ ..] => self.txt_ff.adaptable_mut(rest),
+            _ => None,
+        }
+    }
 }
 
 impl QwenTransformerBlock {

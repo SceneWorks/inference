@@ -52,8 +52,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: true,
             // Edit (reference conditioning) is a separate variant (sc-2465).
             conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA/LoKr wired (sc-2528): the fork's `QwenLoRAMapping` targets routed onto the
+            // transformer's `AdaptableHost`; stacked + mixed via the core seam.
+            supports_lora: true,
+            supports_lokr: true,
             samplers: Vec::new(),
             schedulers: Vec::new(),
             min_size: 256,
@@ -92,14 +94,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "qwen_image: LoRA/LoKr adapter application is not yet wired into load() — the core \
-             seam (LoadSpec.adapters → adapters::loader::apply_adapter_specs) exists, but the \
-             Qwen key→module map lands in sc-2528"
-                .into(),
-        ));
-    }
     let root =
         match &spec.weights {
             WeightsSource::Dir(p) => p,
@@ -119,6 +113,11 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let mut transformer = loader::load_transformer(root)?;
     if let Some(q) = spec.quantize {
         transformer.quantize(q.bits())?;
+    }
+    // LoRA/LoKr (sc-2528): applied after quantization, as forward-time residuals over the
+    // (possibly quantized) transformer — fork-faithful. No-op when `spec.adapters` is empty.
+    if !spec.adapters.is_empty() {
+        crate::adapters::apply_qwen_adapters(&mut transformer, &spec.adapters)?;
     }
     Ok(Box::new(QwenImage {
         descriptor: descriptor(),

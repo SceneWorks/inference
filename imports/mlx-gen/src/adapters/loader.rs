@@ -197,6 +197,77 @@ pub fn apply_adapter_specs(
     Ok(combined)
 }
 
+/// LoRA key namespace prefixes diffusers/peft adapter files use, tried in order; the first that any
+/// key begins with is stripped. LoKr files are bare (no prefix). (kohya `lora_unet_…_` underscore
+/// files flatten the module dots to underscores → they need an explicit per-target pattern matcher,
+/// not path-splitting; tracked as sc-2618.) SceneWorks' trained LoRAs use `transformer.` (peft
+/// `save_lora_weights`) or `diffusion_model.` (sd-scripts export) — both observed on real files.
+pub const COMMON_LORA_PREFIXES: [&str; 2] = ["transformer.", "diffusion_model."];
+
+/// The LoRA namespace prefix present in `w`'s keys, if any (see [`COMMON_LORA_PREFIXES`]).
+pub fn detect_lora_prefix(w: &Weights) -> Option<&'static str> {
+    let keys: Vec<&str> = w.keys().collect();
+    COMMON_LORA_PREFIXES
+        .into_iter()
+        .find(|&p| keys.iter().any(|k| k.starts_with(p)))
+        .map(|v| v as _)
+}
+
+/// [`apply_adapter_specs`] with per-file LoRA-prefix **auto-detection** ([`detect_lora_prefix`])
+/// instead of a fixed prefix — the common provider path, since LoRA files vary
+/// (`transformer.` / `diffusion_model.` / bare) while LoKr keys are bare. The host's key→module map
+/// must match the (prefix-stripped) diffusers module paths.
+pub fn apply_adapter_specs_autoprefix(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+) -> Result<ApplyReport> {
+    let mut combined = ApplyReport::default();
+    for spec in specs {
+        let w = Weights::from_file(&spec.path)?;
+        let prefix = if is_lokr(&w) {
+            None
+        } else {
+            detect_lora_prefix(&w)
+        };
+        let report = apply_adapter_specs(host, std::slice::from_ref(spec), prefix)?;
+        combined.applied += report.applied;
+        combined.unmatched_paths.extend(report.unmatched_paths);
+    }
+    Ok(combined)
+}
+
+/// Provider-facing load-time adapter install: [`apply_adapter_specs_autoprefix`] plus a strict
+/// no-silent-drop policy — errors if a non-empty spec list matched nothing, or if any adapter
+/// target resolved to no module. `model` names the model in the error (e.g. `"z_image_turbo"`).
+/// Both Z-Image and Qwen providers call this; the only per-family piece is the model's
+/// `AdaptableHost` key→module map.
+pub fn apply_adapters_strict(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+    model: &str,
+) -> Result<ApplyReport> {
+    let report = apply_adapter_specs_autoprefix(host, specs)?;
+    if !specs.is_empty() && report.applied == 0 {
+        return Err(format!(
+            "{model} adapters: no target modules matched across {} adapter file(s) — check the \
+             format/prefix (expected diffusers/peft LoRA or LoKr keys; kohya `lora_unet_` files are \
+             not yet supported, sc-2618)",
+            specs.len()
+        )
+        .into());
+    }
+    if !report.unmatched_paths.is_empty() {
+        return Err(format!(
+            "{model} adapters: {} adapter target(s) matched no module (surfaced, not silently \
+             dropped): {:?}",
+            report.unmatched_paths.len(),
+            report.unmatched_paths
+        )
+        .into());
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +527,85 @@ mod tests {
             lin: AdaptableLinear::dense(Array::from_slice(&[1.0f32], &[1, 1]), None),
         };
         assert!(apply_adapter_specs(&mut host, &specs, None).is_err());
+    }
+
+    #[test]
+    fn detect_lora_prefix_variants() {
+        let a = Array::from_slice(&[0.0f32], &[1, 1]);
+        let bare = tmp("detect_bare.safetensors");
+        Array::save_safetensors(vec![("lin.lora_A.weight", &a)], None, &bare).unwrap();
+        assert_eq!(
+            detect_lora_prefix(&Weights::from_file(&bare).unwrap()),
+            None
+        );
+
+        let tf = tmp("detect_tf.safetensors");
+        Array::save_safetensors(vec![("transformer.lin.lora_A.weight", &a)], None, &tf).unwrap();
+        assert_eq!(
+            detect_lora_prefix(&Weights::from_file(&tf).unwrap()),
+            Some("transformer.")
+        );
+
+        let dm = tmp("detect_dm.safetensors");
+        Array::save_safetensors(vec![("diffusion_model.lin.lora_A.weight", &a)], None, &dm)
+            .unwrap();
+        assert_eq!(
+            detect_lora_prefix(&Weights::from_file(&dm).unwrap()),
+            Some("diffusion_model.")
+        );
+    }
+
+    #[test]
+    fn autoprefix_strips_detected_prefix_and_applies() {
+        // base [out=2, in=2]; a `transformer.`-prefixed peft LoRA on path ["lin"].
+        let weight = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
+        let a = Array::from_slice(&[0.1f32, 0.2, -0.1, -0.2], &[2, 2]); // [r=2, in=2]
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]); // [out=2, r=2]
+        let path = tmp("autoprefix_lora.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("transformer.lin.lora_A.weight", &a),
+                ("transformer.lin.lora_B.weight", &b),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+
+        let mut host = OneLinear {
+            lin: AdaptableLinear::dense(weight, None),
+        };
+        let specs = vec![AdapterSpec {
+            path,
+            scale: 1.0,
+            kind: AdapterKind::Lora,
+        }];
+        let report = apply_adapter_specs_autoprefix(&mut host, &specs).unwrap();
+        assert_eq!(
+            report.applied, 1,
+            "transformer.-prefixed key should resolve to lin"
+        );
+        assert!(report.unmatched_paths.is_empty());
+
+        // Strict wrapper: a bare-but-unmatched target errors rather than silently dropping.
+        let miss = tmp("autoprefix_miss.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("transformer.nope.lora_A.weight", &a),
+                ("transformer.nope.lora_B.weight", &b),
+            ],
+            None,
+            &miss,
+        )
+        .unwrap();
+        let mut host2 = OneLinear {
+            lin: AdaptableLinear::dense(Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]), None),
+        };
+        let specs2 = vec![AdapterSpec {
+            path: miss,
+            scale: 1.0,
+            kind: AdapterKind::Lora,
+        }];
+        assert!(apply_adapters_strict(&mut host2, &specs2, "test").is_err());
     }
 }
