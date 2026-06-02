@@ -177,9 +177,11 @@ impl Generator for Flux1 {
         } else {
             0.0
         };
+        // Diffusion activations run in f32 (MLX promotes the bf16 weights per-op). Casting
+        // latents/embeds to bf16 would make `x_embedder` a bf16×bf16 GEMM with K=64 — the dense
+        // 16-bit Metal GEMM bug (M≥2 & K≤512) that returns garbage on the pinned MLX build — and
+        // also discards quality. Same f32-activation path as the Z-Image/Qwen txt2img ports.
         let (prompt_embeds, pooled_prompt_embeds) = self.encode_prompt(&req.prompt)?;
-        let prompt_embeds = prompt_embeds.as_dtype(Dtype::Bfloat16)?;
-        let pooled_prompt_embeds = pooled_prompt_embeds.as_dtype(Dtype::Bfloat16)?;
         let sigmas = build_linear_sigmas(
             steps,
             req.width,
@@ -190,8 +192,7 @@ impl Generator for Flux1 {
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
-            let mut latents =
-                create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
+            let mut latents = create_noise(seed, req.width, req.height)?;
             for t in 0..steps {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Msg("generation cancelled".into()));
