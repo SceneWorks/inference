@@ -15,6 +15,7 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
+use mlx_gen::array::host_i32;
 use mlx_gen::Result;
 
 use super::vision::grid::Grid;
@@ -72,9 +73,9 @@ impl QwenVisionLanguageEncoder {
         let (b, s, h) = (sh[0], sh[1], sh[2]);
         let n_text = b * s;
         let n_vis = vision.shape()[0];
-        let ids = input_ids.as_slice::<i32>();
+        let ids = host_i32(input_ids)?;
 
-        let gather = image_gather_index(ids, self.image_token_id, n_vis, n_text);
+        let gather = image_gather_index(&ids, self.image_token_id, n_vis, n_text);
         let embeds_flat = embeds.reshape(&[n_text, h])?;
         let src = concatenate_axis(&[&embeds_flat, vision], 0)?; // [n_text + n_vis, h]
         let idx = Array::from_slice(&gather, &[n_text]);

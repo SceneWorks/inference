@@ -5,6 +5,7 @@
 use mlx_rs::ops::{dequantize, quantize};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::host_i32;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -158,7 +159,7 @@ impl TextEncoder {
 /// Additive attention mask `[b, 1, s, s]`: `0` where a query may attend (key is causal **and**
 /// not padding), `-inf` otherwise — the fork's causal ⊕ padding combination.
 fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
-    let am = attention_mask.as_slice::<i32>();
+    let am = host_i32(attention_mask)?;
     let (b, s) = (b as usize, s as usize);
     let mut data = vec![0f32; b * s * s];
     for bi in 0..b {

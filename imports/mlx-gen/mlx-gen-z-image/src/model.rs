@@ -8,6 +8,7 @@
 //! seeded noise → flow-match Euler denoise over the DiT → VAE decode → RGB8. The chain is
 //! parity-proven against the frozen Python fork on real bf16 weights (sc-2352).
 
+use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
@@ -143,7 +144,14 @@ impl ZImageTurbo {
     /// and slice off the padded tail to the valid caption tokens.
     fn encode_prompt(&self, prompt: &str) -> Result<mlx_rs::Array> {
         let t = self.tokenizer.tokenize(prompt)?;
-        let num_valid: i32 = t.attention_mask.as_slice::<i32>().iter().sum();
+        // An empty prompt tokenizes to a `[1, 0]` array. Guard on shape before any host readback:
+        // `as_slice`/`host_i32` on a size-0 array would otherwise make the intended error below
+        // unreachable (Qwen T2I guards the same way). `validate_request` already rejects this, so
+        // this is defense-in-depth at the encode boundary.
+        if t.input_ids.shape()[1] == 0 {
+            return Err(Error::Msg("z_image_turbo: empty prompt".into()));
+        }
+        let num_valid: i32 = host_i32(&t.attention_mask)?.iter().sum();
         if num_valid == 0 {
             return Err(Error::Msg("z_image_turbo: empty prompt".into()));
         }
@@ -268,6 +276,11 @@ fn default_seed() -> u64 {
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Rejects unsupported guidance / negative prompt / conditioning / size / count.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    if req.prompt.is_empty() {
+        return Err(mlx_gen::Error::Msg(
+            "z_image_turbo: prompt must not be empty".into(),
+        ));
+    }
     if req.count == 0 || req.count > caps.max_count {
         return Err(mlx_gen::Error::Msg(format!(
             "count {} out of range 1..={}",
@@ -331,16 +344,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_empty_prompt() {
+        // An empty prompt must surface as a typed error (it would otherwise panic in encode via
+        // `as_slice` on the size-0 token array — F-001).
+        let caps = descriptor().capabilities;
+        let req = GenerationRequest::default(); // default prompt is empty
+        let err = validate_request(&caps, &req).unwrap_err().to_string();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
     fn validate_rejects_guidance_and_bad_size() {
         let caps = descriptor().capabilities;
-        // guidance on a distilled model.
+        // guidance on a distilled model (non-empty prompt so the empty-prompt guard doesn't mask it).
         let mut req = GenerationRequest {
+            prompt: "a fox".into(),
             guidance: Some(4.0),
             ..Default::default()
         };
         assert!(validate_request(&caps, &req).is_err());
         // out-of-range size.
         req = GenerationRequest {
+            prompt: "a fox".into(),
             width: 64,
             height: 64,
             ..Default::default()
@@ -358,6 +383,7 @@ mod tests {
     fn validate_rejects_unsupported_conditioning() {
         let caps = descriptor().capabilities;
         let req = GenerationRequest {
+            prompt: "a fox".into(),
             conditioning: vec![Conditioning::Depth {
                 image: mlx_gen::Image::default(),
             }],
