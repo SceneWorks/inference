@@ -49,6 +49,11 @@ pub struct LoadSpec {
     pub weights: WeightsSource,
     pub quantize: Option<Quant>,
     pub precision: Precision,
+    /// Auxiliary control-branch weights overlaid onto the base model at load time — a ControlNet
+    /// checkpoint applied on top of `weights` (e.g. Z-Image's Fun-Controlnet-Union safetensors).
+    /// `None` for the plain base model; a control-variant loader requires it. This is a load-time
+    /// model *component* (unlike per-request LoRA/LoKr adapters in [`AdapterSpec`]).
+    pub control: Option<WeightsSource>,
 }
 
 impl LoadSpec {
@@ -58,12 +63,19 @@ impl LoadSpec {
             weights,
             quantize: None,
             precision: Precision::Bf16,
+            control: None,
         }
     }
 
     /// Builder-style quantization override.
     pub fn with_quant(mut self, quant: Quant) -> Self {
         self.quantize = Some(quant);
+        self
+    }
+
+    /// Builder-style control-branch overlay (the ControlNet checkpoint over the base `weights`).
+    pub fn with_control(mut self, control: WeightsSource) -> Self {
+        self.control = Some(control);
         self
     }
 }
