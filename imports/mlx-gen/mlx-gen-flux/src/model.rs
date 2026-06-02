@@ -230,7 +230,7 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
     if req.prompt.trim().is_empty() {
         return Err(Error::Msg(format!("{}: prompt is required", desc.id)));
     }
-    if req.width % 16 != 0 || req.height % 16 != 0 {
+    if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
         return Err(Error::Msg(format!(
             "{}: width and height must be multiples of 16, got {}x{}",
             desc.id, req.width, req.height
