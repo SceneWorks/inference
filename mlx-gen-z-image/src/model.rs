@@ -11,9 +11,9 @@
 use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Result, WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
+    ModelRegistration, Precision, Progress, Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
@@ -262,16 +262,6 @@ impl Generator for ZImageTurbo {
         }
         Ok(GenerationOutput::Images(images))
     }
-}
-
-/// Seed when a request omits one: nanos since the epoch (any nonzero value works; this only sets
-/// which sample is drawn, and a caller wanting reproducibility passes `req.seed`).
-fn default_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded

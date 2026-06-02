@@ -11,6 +11,7 @@ use mlx_rs::{
 use crate::attention::ZImageAttention;
 use crate::feed_forward::FeedForward;
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -20,10 +21,6 @@ pub struct ZImageBlockConfig {
     pub dim: i32,
     pub n_heads: i32,
     pub norm_eps: f32,
-}
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
 }
 
 pub struct ZImageTransformerBlock {

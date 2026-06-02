@@ -12,9 +12,9 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress,
-    Result, WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Result, WeightsSource,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -215,15 +215,6 @@ fn reference_image(req: &GenerationRequest) -> Option<&Image> {
         Conditioning::Reference { image, .. } => Some(image),
         _ => None,
     })
-}
-
-/// Seed when a request omits one: nanos since the epoch.
-fn default_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 inventory::submit! {

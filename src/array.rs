@@ -27,6 +27,12 @@ pub fn host_i32(a: &Array) -> Result<Vec<i32>> {
         .map_err(|e| Error::Msg(format!("host_i32: not a readable int array: {e}")))
 }
 
+/// A 1-element `[1]` f32 array — the idiomatic way to lift a host scalar into a broadcastable
+/// constant for elementwise ops (`x * scalar(0.5)`).
+pub fn scalar(v: f32) -> Array {
+    Array::from_slice(&[v], &[1])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

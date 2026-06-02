@@ -12,9 +12,9 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
-    WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Result, WeightsSource,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -192,15 +192,6 @@ impl Generator for QwenImage {
         }
         Ok(GenerationOutput::Images(images))
     }
-}
-
-/// Seed when a request omits one: nanos since the epoch (only sets which sample is drawn).
-fn default_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// Capability-driven request validation, factored out for unit testing without loaded weights.

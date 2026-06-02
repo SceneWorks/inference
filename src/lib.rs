@@ -28,8 +28,8 @@ pub mod weights;
 
 pub use error::{Error, Result};
 pub use generator::{
-    Capabilities, Conditioning, ConditioningKind, ControlKind, GenerationOutput, GenerationRequest,
-    Generator, Modality, ModelDescriptor,
+    default_seed, Capabilities, Conditioning, ConditioningKind, ControlKind, GenerationOutput,
+    GenerationRequest, Generator, Modality, ModelDescriptor,
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{load, load_transform, ModelRegistration, TransformRegistration};
