@@ -10,7 +10,7 @@
 use mlx_rs::fast::rms_norm;
 use mlx_rs::Array;
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::host_i32;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -58,6 +58,22 @@ pub struct QwenTransformer {
     proj_out: AdaptableLinear,
     rope: QwenRope3d,
     eps: f32,
+}
+
+/// The Qwen adapter key→module map — the Rust analog of the fork's `QwenLoRAMapping`. Every fork
+/// target is per-block (`transformer_blocks.{i}.{attn.*, img_mlp.*, txt_mlp.*}`); there are no
+/// global targets (`img_in`/`txt_in`/`proj_out` are not trained). Adapter files address modules by
+/// their trained (diffusers) path, routed here to the block hosts.
+impl AdaptableHost for QwenTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            _ => None,
+        }
+    }
 }
 
 impl QwenTransformer {

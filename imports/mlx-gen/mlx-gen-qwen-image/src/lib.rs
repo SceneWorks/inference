@@ -11,8 +11,9 @@
 //! Qwen2.5-VL text encoder, the 60-layer dual-stream MMDiT, the Qwen2-VL image processor +
 //! Qwen2.5-VL vision transformer + reference-latent conditioning (Edit), and transformer-only
 //! Q4/Q8 quantization (sc-2565; the fork keeps the text encoder + VAE dense). LoRA/LoKr and
-//! multi-image Edit are not yet wired (sc-2528 / sc-2529).
+//! multi-image Edit is not yet wired (sc-2529). LoRA/LoKr is wired (sc-2528).
 
+pub mod adapters;
 pub mod image_processor;
 pub mod loader;
 pub mod model;
@@ -23,6 +24,7 @@ pub mod transformer;
 pub mod vae;
 pub mod vl_tokenizer;
 
+pub use adapters::apply_qwen_adapters;
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
 pub use loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_vae, load_vision_encoder,
