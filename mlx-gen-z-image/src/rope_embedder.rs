@@ -6,6 +6,7 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
+use mlx_gen::array::host_i32;
 use mlx_gen::Result;
 
 pub struct RopeEmbedder {
@@ -39,7 +40,7 @@ impl RopeEmbedder {
     /// `ids`: `(N, n_axes)` int32 position ids → `(N, Σ axes_dims / 2, 2)`.
     pub fn forward(&self, ids: &Array) -> Result<Array> {
         let n = ids.shape()[0] as usize;
-        let flat = ids.as_slice::<i32>(); // row-major (N, n_axes)
+        let flat = host_i32(ids)?; // row-major (N, n_axes)
         let mut parts = Vec::with_capacity(self.n_axes);
         for axis in 0..self.n_axes {
             let col: Vec<i32> = (0..n).map(|row| flat[row * self.n_axes + axis]).collect();

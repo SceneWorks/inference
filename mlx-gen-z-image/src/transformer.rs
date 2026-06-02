@@ -196,7 +196,7 @@ impl ZImageTransformer {
         let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
         let t_emb = self.t_embedder.forward(&t)?;
 
-        let patched = self.patchify(x, cap_feats);
+        let patched = self.patchify(x, cap_feats)?;
 
         // Image stream: embed -> set padded positions to x_pad_token -> noise refiner.
         let mut x_emb = self.x_embedder.forward(&patched.x_tokens)?;
@@ -235,7 +235,7 @@ impl ZImageTransformer {
         Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
     }
 
-    fn patchify(&self, image: &Array, cap_feats: &Array) -> Patchified {
+    fn patchify(&self, image: &Array, cap_feats: &Array) -> Result<Patchified> {
         let (pf, ph, pw) = (
             self.cfg.f_patch_size,
             self.cfg.patch_size,
@@ -253,14 +253,13 @@ impl ZImageTransformer {
         let cap_keep: Vec<f32> = (0..cap_total)
             .map(|i| if i < cap_ori { 1.0 } else { 0.0 })
             .collect();
-        let cap_tokens = pad_rows(cap_feats, cap_pad);
+        let cap_tokens = pad_rows(cap_feats, cap_pad)?;
 
         // Image: patchify (C,F,H,W) -> (tokens, pF·pH·pW·C), pad to a multiple of 32.
         let tokens = image
             .reshape(&[c, ft, pf, ht, ph, wt, pw])
             .and_then(|t| t.transpose_axes(&[1, 3, 5, 2, 4, 6, 0]))
-            .and_then(|t| t.reshape(&[ft * ht * wt, pf * ph * pw * c]))
-            .expect("patchify reshape");
+            .and_then(|t| t.reshape(&[ft * ht * wt, pf * ph * pw * c]))?;
         let img_ori = ft * ht * wt;
         let img_pad = (-(img_ori as i64)).rem_euclid(32) as i32;
         let img_total = img_ori + img_pad;
@@ -277,9 +276,9 @@ impl ZImageTransformer {
         let img_keep: Vec<f32> = (0..img_total)
             .map(|i| if i < img_ori { 1.0 } else { 0.0 })
             .collect();
-        let x_tokens = pad_rows(&tokens, img_pad);
+        let x_tokens = pad_rows(&tokens, img_pad)?;
 
-        Patchified {
+        Ok(Patchified {
             x_tokens,
             cap_tokens,
             x_size: (f, h, w),
@@ -287,7 +286,7 @@ impl ZImageTransformer {
             cap_pos_ids: Array::from_slice(&cap_pos, &[cap_total, 3]),
             x_keep: Array::from_slice(&img_keep, &[img_total, 1]),
             cap_keep: Array::from_slice(&cap_keep, &[cap_total, 1]),
-        }
+        })
     }
 
     fn unpatchify(&self, x: &Array, size: (i32, i32, i32)) -> Result<Array> {
@@ -323,11 +322,11 @@ fn row_indices(n: i32) -> Array {
 
 /// Append `pad` zero rows to a 2-D `(N, D)` array (padded positions are zeroed post-embed
 /// anyway, so the pre-embed value is irrelevant — zeros match the fork's repeat-then-zero).
-fn pad_rows(a: &Array, pad: i32) -> Array {
+fn pad_rows(a: &Array, pad: i32) -> Result<Array> {
     if pad <= 0 {
-        return a.clone();
+        return Ok(a.clone());
     }
     let d = a.shape()[1];
     let zeros = Array::from_slice(&vec![0f32; (pad * d) as usize], &[pad, d]);
-    concatenate_axis(&[a, &zeros], 0).expect("pad concat")
+    Ok(concatenate_axis(&[a, &zeros], 0)?)
 }

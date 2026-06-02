@@ -12,6 +12,7 @@
 //! [`ARCHITECTURE.md`](https://github.com/michaeltrefry/mlx-gen/blob/main/ARCHITECTURE.md).
 
 pub mod adapters;
+pub mod array;
 pub mod error;
 pub mod generator;
 pub mod image;
