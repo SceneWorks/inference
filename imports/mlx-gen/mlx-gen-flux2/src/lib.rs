@@ -23,12 +23,13 @@ pub mod model;
 pub mod pipeline;
 pub mod pos_embed;
 pub mod text_encoder;
+pub mod vae;
 
 pub use config::{
     Flux2Config, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_HEIGHT, DEFAULT_STEPS, DEFAULT_WIDTH,
     FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID,
 };
-pub use loader::{load_text_encoder, load_tokenizer};
+pub use loader::{load_text_encoder, load_tokenizer, load_vae};
 pub use model::{descriptor_klein_9b, descriptor_klein_9b_edit, load_klein_9b, load_klein_9b_edit};
 pub use pipeline::{
     create_noise, image_seq_len, pack_latents, patchify_latents, prepare_grid_ids,
@@ -36,3 +37,4 @@ pub use pipeline::{
 };
 pub use pos_embed::Flux2PosEmbed;
 pub use text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
+pub use vae::Flux2Vae;

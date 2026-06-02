@@ -16,6 +16,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use crate::text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
+use crate::vae::Flux2Vae;
 
 /// Qwen2 pad token id (`<|endoftext|>`).
 pub const PAD_TOKEN_ID: i32 = 151643;
@@ -42,4 +43,12 @@ pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
 pub fn load_text_encoder(root: &Path) -> Result<Qwen3TextEncoder> {
     let w = Weights::from_dir(root.join("text_encoder"))?;
     Qwen3TextEncoder::from_weights(&w, "model", &Qwen3TextEncoderConfig::klein_9b())
+}
+
+/// Load the FLUX.2 VAE. The on-disk diffusers keys (`encoder.*`/`decoder.*`/`quant_conv.*`/
+/// `bn.*`) map directly onto the module; conv weights are transposed `[O,I,H,W]→[O,H,W,I]` at
+/// construction.
+pub fn load_vae(root: &Path) -> Result<Flux2Vae> {
+    let w = Weights::from_dir(root.join("vae"))?;
+    Flux2Vae::from_weights(&w)
 }
