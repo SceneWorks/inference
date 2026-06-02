@@ -1,6 +1,6 @@
 """Dump Z-Image latent-lifecycle parity fixtures from the frozen mflux fork.
 
-Run from the fork:  cd ~/repos/mflux && uv run python /Users/michael/repos/mlx-gen/tools/dump_z_latents.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_z_latents.py
 
 (1) Seeded noise: mx.random.normal([16,1,H/8,W/8], key=mx.random.key(seed)) — the version-drift
     RNG-parity gate (the crate links mlx-rs 0.25's bundled MLX vs the fork's 0.31).
@@ -11,7 +11,9 @@ import mlx.core as mx
 import numpy as np
 from mflux.utils.image_util import ImageUtil
 
-OUT = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/z_latents.safetensors"
+from _paths import fixture
+
+OUT = fixture("mlx-gen-z-image/tests/fixtures/z_latents.safetensors")
 tensors = {}
 meta = {}
 

@@ -21,6 +21,8 @@ from mlx.utils import tree_flatten
 from mflux.models.z_image.model.z_image_transformer.transformer_block import ZImageTransformerBlock
 from mflux.models.common.lora.mapping.lokr_loader import LoKrLoader
 
+from _paths import fixture
+
 mx.random.seed(0)
 rng = np.random.default_rng(0)
 DIM, N_HEADS, SEQ = 96, 4, 4
@@ -68,8 +70,8 @@ assert applied == 2, f"expected 2 applied, got {applied}"
 y = block(x, None, freqs_cis, t_emb)
 base["out.y"] = y.astype(mx.float32)
 
-base_path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/lokr_loader.safetensors"
-adapter_path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/lokr_adapter.safetensors"
+base_path = fixture("mlx-gen-z-image/tests/fixtures/lokr_loader.safetensors")
+adapter_path = fixture("mlx-gen-z-image/tests/fixtures/lokr_adapter.safetensors")
 mx.save_safetensors(base_path, base)
 mx.save_safetensors(adapter_path, {k: v.astype(mx.float32) for k, v in adapter.items()}, metadata=meta)
 print(f"wrote {base_path} ({len(base)} tensors)")

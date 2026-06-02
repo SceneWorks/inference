@@ -21,6 +21,8 @@ from mflux.models.z_image.model.z_image_vae.decoder.conv_norm_out import ConvNor
 from mflux.models.z_image.model.z_image_vae.decoder.up_decoder_block import UpDecoderBlock
 from mflux.models.z_image.model.z_image_vae.common.unet_mid_block import UNetMidBlock
 
+from _paths import fixture
+
 mx.random.seed(0)
 out = {}
 
@@ -70,7 +72,7 @@ y = conv_out(h)
 out["in.latent"] = latent.astype(mx.float32)
 out["out.image"] = y.astype(mx.float32)
 
-path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/vae_decoder.safetensors"
+path = fixture("mlx-gen-z-image/tests/fixtures/vae_decoder.safetensors")
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors)")
 print("latent:", latent.shape, "-> image:", y.shape)

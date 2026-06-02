@@ -18,6 +18,8 @@ from mflux.models.z_image.model.z_image_vae.common.resnet_block_2d import Resnet
 from mflux.models.z_image.model.z_image_vae.common.attention import Attention
 from mflux.models.z_image.model.z_image_vae.decoder.up_sampler import UpSampler
 
+from _paths import fixture
+
 mx.random.seed(0)
 out = {}
 
@@ -61,7 +63,7 @@ up_x = mx.random.normal((1, 32, 8, 8))
 out["up.in"] = up_x.astype(mx.float32)
 out["up.out"] = up(up_x).astype(mx.float32)
 
-path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/vae_submodules.safetensors"
+path = fixture("mlx-gen-z-image/tests/fixtures/vae_submodules.safetensors")
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors)")
 for k in ("rb.out", "attn.out", "up.out"):

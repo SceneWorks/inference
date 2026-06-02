@@ -1,6 +1,6 @@
 """Tiny end-to-end denoise-loop parity fixture (sc-2344).
 
-Run from the fork:  cd ~/repos/mflux && uv run python /Users/michael/repos/mlx-gen/tools/dump_denoise_loop.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_denoise_loop.py
 
 Reuses the tiny ZImageTransformer config from dump_z_transformer.py, then runs the flow-match
 Euler loop by hand (mirroring z_image.py): for each step, predict velocity with the DiT and take
@@ -15,7 +15,9 @@ from mflux.models.common.schedulers.flow_match_euler_discrete_scheduler import (
 )
 from mflux.models.z_image.model.z_image_transformer.transformer import ZImageTransformer
 
-OUT = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/denoise_loop.safetensors"
+from _paths import fixture
+
+OUT = fixture("mlx-gen-z-image/tests/fixtures/denoise_loop.safetensors")
 
 mx.random.seed(0)
 CFG = dict(

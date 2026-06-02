@@ -1,6 +1,6 @@
 """sc-2352: Z-Image-turbo timing baseline on the frozen Python mflux fork.
 
-Run from the fork:  cd ~/repos/mflux && uv run python /Users/michael/repos/mlx-gen/tools/bench_z_image_fork.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/bench_z_image_fork.py
 
 Mirrors `mlx-gen-z-image/tests/bench_z_image.rs` so the numbers line up, and reports BOTH the
 fork's eager path (apples-to-apples with the Rust port, which has no compile) and the fork's

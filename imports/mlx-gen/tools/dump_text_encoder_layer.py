@@ -1,6 +1,6 @@
 """Dump a tiny Z-Image text-encoder EncoderLayer (+ RoPE cos/sin) parity fixture from the fork.
 
-Run from the fork:  cd ~/repos/mflux && uv run python /Users/michael/repos/mlx-gen/tools/dump_text_encoder_layer.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_text_encoder_layer.py
 
 The layer exercises attention (GQA + q_norm/k_norm + HF half-split RoPE + causal SDPA) + SwiGLU
 MLP + pre-norm residuals together. cos/sin double as the RoPE golden. Tiny random config.
@@ -11,7 +11,9 @@ from mflux.models.z_image.model.z_image_text_encoder.encoder_layer import Encode
 from mflux.models.z_image.model.z_image_text_encoder.rope import RotaryEmbedding
 from mflux.models.z_image.model.z_image_text_encoder.text_encoder import TextEncoder
 
-OUT = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/text_encoder_layer.safetensors"
+from _paths import fixture
+
+OUT = fixture("mlx-gen-z-image/tests/fixtures/text_encoder_layer.safetensors")
 
 mx.random.seed(0)
 H, NH, NKV, HD, INTER, SEQ = 64, 4, 2, 16, 128, 6

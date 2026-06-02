@@ -15,6 +15,8 @@ import mlx.core as mx
 
 from mflux.models.z_image.model.z_image_transformer.transformer_block import ZImageTransformerBlock
 
+from _paths import fixture
+
 mx.random.seed(0)
 
 DIM, N_HEADS, SEQ = 96, 4, 4
@@ -44,7 +46,7 @@ out["in.t_emb"] = t_emb.astype(mx.float32)
 out["in.freqs_cis"] = freqs_cis.astype(mx.float32)
 out["out.y"] = y.astype(mx.float32)
 
-path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/zblock_small.safetensors"
+path = fixture("mlx-gen-z-image/tests/fixtures/zblock_small.safetensors")
 mx.save_safetensors(path, out)
 print(f"wrote {path}  ({len(out)} tensors, dim={DIM} heads={N_HEADS} seq={SEQ})")
 print("y shape:", y.shape, "y dtype:", y.dtype)
