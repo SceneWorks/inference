@@ -10,6 +10,7 @@
 //! RoPE (two forwards/step, CFG) → slice the noise prefix → VAE decode → RGB8. The dual-latent
 //! denoise core is parity-proven against the fork (`tests/edit_real_weights.rs`).
 
+use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
@@ -28,7 +29,9 @@ use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
-use crate::vl_tokenizer::{condition_resize_dims, encode_reference_latents, tokenize_edit};
+use crate::vl_tokenizer::{
+    condition_resize_dims, encode_reference_latents, preprocess_edit_image, tokenize_edit_text,
+};
 
 /// Qwen-Image-Edit default inference steps (the fork's `num_inference_steps`).
 const DEFAULT_STEPS: u32 = 4;
@@ -113,23 +116,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 impl QwenImageEdit {
-    /// Edit conditioning embeds (f16, matching the fork): tokenize the edit template with the
-    /// reference image, then run the vision-language encoder (vision embeds spliced into the prompt,
-    /// drop-64). `image` borrows the reference pixels.
-    fn encode_edit(&self, prompt: &str, image: ImageInput) -> Result<Array> {
-        let inp = tokenize_edit(&self.tokenizer, &self.processor, prompt, image)?;
-        let grids: Vec<Grid> = inp
-            .grid_thw
-            .as_slice::<i32>()
-            .chunks(3)
-            .map(|c| [c[0], c[1], c[2]])
-            .collect();
-        let embeds = self.vl_encoder.encode(
-            &inp.input_ids,
-            &inp.attention_mask,
-            &inp.pixel_values,
-            &grids,
-        )?;
+    /// Edit conditioning embeds (f16, matching the fork) for one prompt: tokenize the edit template
+    /// (the `<|image_pad|>` run length is `n_image_tokens`, from the shared image preprocess), then
+    /// run the LM over the spliced sequence reusing the already-computed `vision` embeds — so the
+    /// vision tower is **not** re-run for the positive vs negative prompt (F-004).
+    fn encode_edit(&self, prompt: &str, n_image_tokens: usize, vision: &Array) -> Result<Array> {
+        let tok = tokenize_edit_text(&self.tokenizer, prompt, n_image_tokens)?;
+        let embeds =
+            self.vl_encoder
+                .encode_with_vision(&tok.input_ids, &tok.attention_mask, vision)?;
         Ok(embeds.as_dtype(Dtype::Float16)?)
     }
 }
@@ -171,9 +166,23 @@ impl Generator for QwenImageEdit {
         let (vl_w, vl_h) =
             condition_resize_dims(reference.width as usize, reference.height as usize);
 
-        // Positive + negative conditioning embeds (f16) — the fork encodes both with the image.
-        let pos = self.encode_edit(&req.prompt, img())?;
-        let neg = self.encode_edit(req.negative_prompt.as_deref().unwrap_or(""), img())?;
+        // Preprocess the reference once (condition-resize + patchify) and run the 32-block vision
+        // tower once — both depend only on the image, so the positive + negative encodes reuse the
+        // vision embeds rather than re-running the tower per prompt (F-004).
+        let pre = preprocess_edit_image(&self.processor, img())?;
+        let grids: Vec<Grid> = host_i32(&pre.grid_thw)?
+            .chunks(3)
+            .map(|c| [c[0], c[1], c[2]])
+            .collect();
+        let vision = self.vl_encoder.encode_vision(&pre.pixel_values, &grids)?;
+
+        // Positive + negative conditioning embeds (f16): only the LM forward runs per prompt.
+        let pos = self.encode_edit(&req.prompt, pre.n_image_tokens, &vision)?;
+        let neg = self.encode_edit(
+            req.negative_prompt.as_deref().unwrap_or(""),
+            pre.n_image_tokens,
+            &vision,
+        )?;
 
         // Dual-latent reference (static across steps + samples): VAE-encode → pack, + its cond grid.
         let (static_latents, cond_grid) =

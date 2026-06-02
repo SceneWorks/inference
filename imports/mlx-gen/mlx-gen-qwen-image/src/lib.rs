@@ -37,4 +37,7 @@ pub use pipeline::{
 pub use text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 pub use transformer::{QwenTransformer, QwenTransformerConfig};
 pub use vae::QwenVae;
-pub use vl_tokenizer::{encode_reference_latents, tokenize_edit, EditInputs};
+pub use vl_tokenizer::{
+    encode_reference_latents, preprocess_edit_image, tokenize_edit, tokenize_edit_text, EditImage,
+    EditInputs,
+};
