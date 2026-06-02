@@ -25,8 +25,6 @@ use super::QwenTextEncoder;
 pub struct QwenVisionLanguageEncoder {
     lm: QwenTextEncoder,
     visual: VisionTransformer,
-    image_token_id: i32,
-    edit_drop_idx: i32,
 }
 
 impl QwenVisionLanguageEncoder {
@@ -36,12 +34,7 @@ impl QwenVisionLanguageEncoder {
     pub const EDIT_DROP_IDX: i32 = 64;
 
     pub fn new(lm: QwenTextEncoder, visual: VisionTransformer) -> Self {
-        Self {
-            lm,
-            visual,
-            image_token_id: Self::IMAGE_TOKEN_ID,
-            edit_drop_idx: Self::EDIT_DROP_IDX,
-        }
+        Self { lm, visual }
     }
 
     /// `input_ids` / `attention_mask`: `[b, s]` int32; `pixel_values`: `[n_patches, 1176]`; `grids`:
@@ -60,7 +53,7 @@ impl QwenVisionLanguageEncoder {
 
         // Drop the leading template tokens (single un-padded sequence per row).
         let s = hidden.shape()[1];
-        let idx: Vec<i32> = (self.edit_drop_idx..s).collect();
+        let idx: Vec<i32> = (Self::EDIT_DROP_IDX..s).collect();
         let idx = Array::from_slice(&idx, &[idx.len() as i32]);
         Ok(hidden.take_axis(&idx, 1)?)
     }
@@ -75,7 +68,7 @@ impl QwenVisionLanguageEncoder {
         let n_vis = vision.shape()[0];
         let ids = host_i32(input_ids)?;
 
-        let gather = image_gather_index(&ids, self.image_token_id, n_vis, n_text);
+        let gather = image_gather_index(&ids, Self::IMAGE_TOKEN_ID, n_vis, n_text);
         let embeds_flat = embeds.reshape(&[n_text, h])?;
         let src = concatenate_axis(&[&embeds_flat, vision], 0)?; // [n_text + n_vis, h]
         let idx = Array::from_slice(&gather, &[n_text]);

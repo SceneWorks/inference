@@ -56,8 +56,10 @@ impl QwenTransformerBlock {
         txt_sin: &Array,
         mask: Option<&Array>,
     ) -> Result<(Array, Array)> {
-        let img_mod = self.img_mod.forward(&silu(text_embeddings)?)?;
-        let txt_mod = self.txt_mod.forward(&silu(text_embeddings)?)?;
+        // Both modulation projections take the same SiLU'd timestep embedding — compute it once.
+        let act = silu(text_embeddings)?;
+        let img_mod = self.img_mod.forward(&act)?;
+        let txt_mod = self.txt_mod.forward(&act)?;
         let img_mod = split(&img_mod, 2, 1)?; // [mod1, mod2], each [B, 3*dim]
         let txt_mod = split(&txt_mod, 2, 1)?;
 
