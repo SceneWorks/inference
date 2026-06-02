@@ -12,7 +12,6 @@ pub mod attention;
 pub mod encoder;
 pub mod layer;
 pub mod mlp;
-pub mod rope;
 pub mod vision;
 pub mod vision_language;
 
@@ -20,8 +19,9 @@ pub use attention::QwenTextAttention;
 pub use encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 pub use layer::QwenEncoderLayer;
 pub use mlp::QwenMlp;
-pub use rope::TextRope;
 pub use vision_language::QwenVisionLanguageEncoder;
+// The HF half-split text RoPE is identical across families and now lives in core (F-006).
+pub use mlx_gen::nn::TextRope;
 
 use mlx_rs::ops::matmul;
 use mlx_rs::Array;

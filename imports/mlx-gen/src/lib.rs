@@ -12,6 +12,7 @@
 //! [`ARCHITECTURE.md`](https://github.com/michaeltrefry/mlx-gen/blob/main/ARCHITECTURE.md).
 
 pub mod adapters;
+pub mod array;
 pub mod error;
 pub mod generator;
 pub mod image;
@@ -27,8 +28,8 @@ pub mod weights;
 
 pub use error::{Error, Result};
 pub use generator::{
-    Capabilities, Conditioning, ConditioningKind, ControlKind, GenerationOutput, GenerationRequest,
-    Generator, Modality, ModelDescriptor,
+    default_seed, Capabilities, Conditioning, ConditioningKind, ControlKind, GenerationOutput,
+    GenerationRequest, Generator, Modality, ModelDescriptor,
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{load, load_transform, ModelRegistration, TransformRegistration};

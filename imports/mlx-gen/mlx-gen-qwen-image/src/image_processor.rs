@@ -38,8 +38,6 @@ pub struct QwenImageProcessor {
     pub patch_size: usize,
     pub temporal_patch_size: usize,
     pub merge_size: usize,
-    pub image_mean: [f32; 3],
-    pub image_std: [f32; 3],
 }
 
 impl Default for QwenImageProcessor {
@@ -50,8 +48,6 @@ impl Default for QwenImageProcessor {
             patch_size: 14,
             temporal_patch_size: 2,
             merge_size: 2,
-            image_mean: OPENAI_CLIP_MEAN,
-            image_std: OPENAI_CLIP_STD,
         }
     }
 }
@@ -95,7 +91,7 @@ impl QwenImageProcessor {
         let plane = rh * rw;
         let mut chw = vec![0f32; t * c * plane];
         for ch in 0..c {
-            let (mean, std) = (self.image_mean[ch], self.image_std[ch]);
+            let (mean, std) = (OPENAI_CLIP_MEAN[ch], OPENAI_CLIP_STD[ch]);
             for y in 0..rh {
                 for x in 0..rw {
                     let v = (resized[(y * rw + x) * c + ch] / 255.0 - mean) / std;

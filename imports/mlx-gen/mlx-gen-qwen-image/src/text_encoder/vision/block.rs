@@ -8,10 +8,8 @@ use mlx_rs::Array;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::{VisionAttention, VisionMlp};
+use super::{VisionAttention, VisionMlp, EPS};
 use crate::text_encoder::join;
-
-const EPS: f32 = 1e-6;
 
 pub struct VisionBlock {
     norm1: Array,

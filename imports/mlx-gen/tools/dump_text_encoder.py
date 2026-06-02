@@ -1,6 +1,6 @@
 """Dump a tiny full Z-Image TextEncoder forward parity fixture from the fork.
 
-Run from the fork:  cd ~/repos/mflux && uv run python /Users/michael/repos/mlx-gen/tools/dump_text_encoder.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_text_encoder.py
 
 Overrides ModelConfig.precision -> float32 so the encoder's final cast is a no-op (clean f32
 parity; the bf16 cast for the DiT is a downstream concern). attention_mask is all-ones (causal
@@ -12,9 +12,11 @@ import mlx.core as mx
 from mflux.models.common.config import ModelConfig
 from mflux.models.z_image.model.z_image_text_encoder.text_encoder import TextEncoder
 
+from _paths import fixture
+
 ModelConfig.precision = mx.float32  # make the encoder's final .astype(precision) a no-op
 
-OUT = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/text_encoder.safetensors"
+OUT = fixture("mlx-gen-z-image/tests/fixtures/text_encoder.safetensors")
 
 mx.random.seed(1)
 VOCAB, H, NL, NH, NKV, HD, INTER, SEQ = 256, 64, 2, 4, 2, 16, 128, 6

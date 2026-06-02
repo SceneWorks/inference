@@ -14,17 +14,18 @@
 //! the base transformer at `control_context_scale = 0`, and the full control render matches the
 //! fork's control golden — see `tests/z_control_transformer.rs` and `tests/control_real_weights.rs`.
 
+use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Result, WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
+    ModelRegistration, Precision, Progress, Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
 use crate::control_transformer::ZImageControlTransformer;
 use crate::loader;
-use crate::model::{default_seed, validate_request, DEFAULT_STEPS, SCHEDULE_SHIFT};
+use crate::model::{validate_request, DEFAULT_STEPS, SCHEDULE_SHIFT};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, decoded_to_image, denoise_control_with_progress,
     encode_control_context, encode_init_latents, init_time_step, slice_valid, unpack_latents,
@@ -130,7 +131,13 @@ impl ZImageTurboControl {
     /// off the padded tail. (Identical to the base model's `encode_prompt`.)
     fn encode_prompt(&self, prompt: &str) -> Result<mlx_rs::Array> {
         let t = self.tokenizer.tokenize(prompt)?;
-        let num_valid: i32 = t.attention_mask.as_slice::<i32>().iter().sum();
+        // Guard on shape before any host readback (an empty prompt tokenizes to `[1, 0]`) — the
+        // base model's panic-safe encode boundary (F-001/2/7). `validate_request` already rejects
+        // an empty prompt; this is defense-in-depth.
+        if t.input_ids.shape()[1] == 0 {
+            return Err(Error::Msg("z_image_turbo_control: empty prompt".into()));
+        }
+        let num_valid: i32 = host_i32(&t.attention_mask)?.iter().sum();
         if num_valid == 0 {
             return Err(Error::Msg("z_image_turbo_control: empty prompt".into()));
         }

@@ -3,14 +3,15 @@
 //! 60 dual-stream blocks, then `AdaLayerNormContinuous` + `proj_out` back to patch space.
 //!
 //! Weight keys follow the fork's *internal* module tree (e.g. `transformer_blocks.{i}.img_mod_linear`,
-//! `…attn.attn_to_out.0`, `…img_ff.mlp_in`); the on-disk diffusers→internal remapping lands with
-//! the full-model assembly (e2e slice). Per-block weights are exercised by the synthetic-weight
+//! `…attn.attn_to_out.0`, `…img_ff.mlp_in`); the on-disk diffusers→internal remapping is applied by
+//! the loader (`remap_transformer_keys`). Per-block weights are exercised by the synthetic-weight
 //! block parity test; the full 60-layer forward is validated end-to-end against the image golden.
 
 use mlx_rs::fast::rms_norm;
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::array::host_i32;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -162,13 +163,22 @@ impl QwenTransformer {
     }
 }
 
+/// Additive fill for masked-out attention keys — the fork's large-negative joint-mask value
+/// (`QwenTransformer`'s `attention_mask` fill), added to logits before softmax.
+const MASK_FILL: f32 = -1e9;
+
 /// Additive joint mask `[B, 1, 1, txt+img]` (text keys masked where padded; image keys always
 /// attended). Returns `None` when no text token is padded (the fork's all-ones short-circuit).
+///
+/// **Both shipped `generate` paths always pass `txt_mask = None`** (see `pipeline.rs`): the prompt
+/// embeds carry no padding into the transformer, so parity is proven maskless. The construction
+/// below is therefore unreached today; it is kept correct for an external caller that supplies a
+/// genuinely padded text mask, not as a parity gap.
 fn build_joint_mask(txt_mask: Option<&Array>, b: i32, img_seq: i32) -> Result<Option<Array>> {
     let Some(m) = txt_mask else {
         return Ok(None);
     };
-    let mvals = m.as_slice::<i32>();
+    let mvals = host_i32(m)?;
     if mvals.iter().all(|&v| v == 1) {
         return Ok(None);
     }
@@ -179,7 +189,7 @@ fn build_joint_mask(txt_mask: Option<&Array>, b: i32, img_seq: i32) -> Result<Op
         for j in 0..joint {
             let valid = j >= txt_seq || mvals[(bi * txt_seq + j) as usize] == 1;
             if !valid {
-                data[(bi * joint + j) as usize] = -1e9;
+                data[(bi * joint + j) as usize] = MASK_FILL;
             }
         }
     }
