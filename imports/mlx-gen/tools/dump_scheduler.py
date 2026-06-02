@@ -1,6 +1,6 @@
 """Dump flow-match Euler scheduler parity fixtures from the frozen mflux fork.
 
-Run from the fork:  cd ~/repos/mflux && uv run python /Users/michael/repos/mlx-gen/tools/dump_scheduler.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_scheduler.py
 
 Uses the fork's OWN `_compute_empirical_mu` + `_time_shift_exponential_array` as the oracle,
 then reconstructs the sigmas exactly as the scheduler does (linspace(1, 1/n, n) -> time-shift ->
@@ -13,7 +13,9 @@ from mflux.models.common.schedulers.flow_match_euler_discrete_scheduler import (
     FlowMatchEulerDiscreteScheduler as S,
 )
 
-OUT = "/Users/michael/repos/mlx-gen/tests/fixtures/scheduler.safetensors"
+from _paths import fixture
+
+OUT = fixture("tests/fixtures/scheduler.safetensors")
 
 
 def build(num_steps: int, seq_len: int):

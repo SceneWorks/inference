@@ -1,7 +1,7 @@
 """Real-weights Z-Image **img2img** golden — the reference for the mlx-gen img2img port (sc-2533).
 
 Run from the fork:
-  cd ~/repos/mflux && uv run python /Users/michael/Repos/mlx-gen/tools/dump_z_image_img2img_golden.py
+  cd ~/repos/mflux && uv run python tools/dump_z_image_img2img_golden.py
 
 Mirrors `ZImage.generate_image` on the img2img branch (a `Reference` image + `image_strength`),
 using the **flow_match_euler_discrete** scheduler — the schedule the Rust port + the

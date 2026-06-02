@@ -12,7 +12,8 @@
 
 use mlx_rs::Array;
 
-use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::array::host_i32;
+use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
 use mlx_gen::Result;
 
 use crate::image_processor::{
@@ -27,6 +28,15 @@ pub struct EditInputs {
     pub attention_mask: Array,
     pub pixel_values: Array,
     pub grid_thw: Array,
+}
+
+/// The image-only output of [`preprocess_edit_image`] — `pixel_values` + `grid_thw` for the vision
+/// tower, plus the `<|image_pad|>` count the grid expands to. Depends only on the reference image,
+/// so the Edit generator computes it **once** and reuses it for the positive + negative prompts.
+pub struct EditImage {
+    pub pixel_values: Array,
+    pub grid_thw: Array,
+    pub n_image_tokens: usize,
 }
 
 /// Target condition area (fork `CONDITION_IMAGE_SIZE`): the reference is scaled to ~384²,
@@ -58,13 +68,13 @@ pub fn build_edit_text(prompt: &str, n_image_tokens: usize) -> String {
     )
 }
 
-/// Tokenize a reference image + edit prompt for the VL encoder. `image` is RGB uint8 HWC.
-pub fn tokenize_edit(
-    tokenizer: &TextTokenizer,
+/// Image-only half of [`tokenize_edit`]: condition-resize (BICUBIC, /32) + patchify the reference,
+/// returning the `pixel_values`, `grid_thw`, and the `<|image_pad|>` count. `image` is RGB uint8
+/// HWC. Independent of the prompt, so the Edit generator runs this **once** per generation (F-004).
+pub fn preprocess_edit_image(
     processor: &QwenImageProcessor,
-    prompt: &str,
     image: ImageInput,
-) -> Result<EditInputs> {
+) -> Result<EditImage> {
     // 1. Condition resize (BICUBIC, /32) — clip8-rounded f32 back to u8 for the processor.
     let (cw, ch) = condition_resize_dims(image.width, image.height);
     let resized: Vec<u8> = if (image.height, image.width) == (ch, cw) {
@@ -83,18 +93,45 @@ pub fn tokenize_edit(
         width: cw,
     })?;
 
-    // 3. Expand <|image_pad|> to prod(grid)//merge² and tokenize the formatted template.
-    let grid = processed.grid_thw.as_slice::<i32>(); // [grid_t, grid_h, grid_w]
+    // image_pad count = prod(grid) // merge².
+    let grid = host_i32(&processed.grid_thw)?; // [grid_t, grid_h, grid_w]
     let merge2 = (processor.merge_size * processor.merge_size) as i32;
     let n_image_tokens = (grid[0] * grid[1] * grid[2] / merge2) as usize;
-    let text = build_edit_text(prompt, n_image_tokens);
-    let tok = tokenizer.tokenize_preformatted(&text)?;
 
+    Ok(EditImage {
+        pixel_values: processed.pixel_values,
+        grid_thw: processed.grid_thw,
+        n_image_tokens,
+    })
+}
+
+/// Prompt-only half of [`tokenize_edit`]: expand the edit template's `<|image_pad|>` to
+/// `n_image_tokens` copies (from [`preprocess_edit_image`]) and tokenize. Run once per prompt
+/// (positive + negative) while the image preprocessing is shared.
+pub fn tokenize_edit_text(
+    tokenizer: &TextTokenizer,
+    prompt: &str,
+    n_image_tokens: usize,
+) -> Result<TokenizerOutput> {
+    tokenizer.tokenize_preformatted(&build_edit_text(prompt, n_image_tokens))
+}
+
+/// Tokenize a reference image + edit prompt for the VL encoder. `image` is RGB uint8 HWC. Composes
+/// [`preprocess_edit_image`] + [`tokenize_edit_text`]; the Edit generator calls those two directly
+/// so the image work is shared across the positive/negative prompts.
+pub fn tokenize_edit(
+    tokenizer: &TextTokenizer,
+    processor: &QwenImageProcessor,
+    prompt: &str,
+    image: ImageInput,
+) -> Result<EditInputs> {
+    let pre = preprocess_edit_image(processor, image)?;
+    let tok = tokenize_edit_text(tokenizer, prompt, pre.n_image_tokens)?;
     Ok(EditInputs {
         input_ids: tok.input_ids,
         attention_mask: tok.attention_mask,
-        pixel_values: processed.pixel_values,
-        grid_thw: processed.grid_thw,
+        pixel_values: pre.pixel_values,
+        grid_thw: pre.grid_thw,
     })
 }
 

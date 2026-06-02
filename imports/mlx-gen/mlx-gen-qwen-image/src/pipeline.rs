@@ -7,12 +7,11 @@
 //! w/8]` only at decode. Conditioning runs **two** transformer forwards per step (positive +
 //! negative) combined by classifier-free guidance.
 
-use mlx_rs::ops::{
-    add, concatenate_axis, divide, maximum, minimum, multiply, round, subtract, sum_axes,
-};
+use mlx_rs::ops::{add, concatenate_axis, divide, multiply, subtract, sum_axes};
 use mlx_rs::{random, Array};
 
-use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Image, Progress, Result};
+use mlx_gen::array::scalar;
+use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Progress, Result};
 
 use crate::transformer::QwenTransformer;
 
@@ -30,9 +29,9 @@ const SIGMA_BASE_SEQ_LEN: f32 = 256.0;
 const SIGMA_MAX_SEQ_LEN: f32 = 8192.0;
 const SIGMA_SHIFT_TERMINAL: f32 = 0.02;
 
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
+// The decoded-tensor → Image step is identical across families and now lives in core (F-006);
+// re-exported so `crate::pipeline::decoded_to_image` and the crate's public surface are unchanged.
+pub use mlx_gen::image::decoded_to_image;
 
 /// Seeded txt2img latent noise — shape `[1, (h/16)·(w/16), 64]`, f32. Port of
 /// `FluxLatentCreator.create_noise` (`mx.random.normal` with `key(seed)`); the noise is created
@@ -157,6 +156,8 @@ pub fn denoise_with_progress(
             return Err(Error::Msg("generation cancelled".into()));
         }
         let sigma = scheduler.sigmas[t];
+        // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
+        // proven maskless (see `build_joint_mask`).
         let pos = transformer.forward(&latents, pos_embeds, None, sigma, lh, lw, &[])?;
         let neg = transformer.forward(&latents, neg_embeds, None, sigma, lh, lw, &[])?;
         let guided = compute_guided_noise(&pos, &neg, guidance)?;
@@ -198,6 +199,7 @@ pub fn denoise_edit_with_progress(
         let noise_seq = latents.shape()[1];
         let sigma = scheduler.sigmas[t];
         let hidden = concatenate_axis(&[&latents, static_image_latents], 1)?;
+        // `None` joint mask (as in T2I): the spliced prompt embeds are full-valid.
         let pos = slice_seq(
             &transformer.forward(&hidden, pos_embeds, None, sigma, lh, lw, cond_grids)?,
             noise_seq,
@@ -220,39 +222,6 @@ pub fn denoise_edit_with_progress(
 fn slice_seq(x: &Array, n: i32) -> Result<Array> {
     let idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
     Ok(x.take_axis(&idx, 1)?)
-}
-
-/// Decoded VAE tensor → RGB8 [`Image`]. Mirrors the fork's `ImageUtil`: denormalize
-/// `clip(x/2 + 0.5, 0, 1)`, drop the temporal axis (5-D → 4-D), `NCHW → NHWC`, then
-/// `(x*255).round()` as `uint8`, taking the first batch element.
-pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
-    let half = scalar(0.5);
-    let x = add(&multiply(decoded, &half)?, &half)?;
-    let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
-    let x = if x.shape().len() == 5 {
-        x.squeeze_axes(&[2])?
-    } else {
-        x
-    };
-    let x = x.transpose_axes(&[0, 2, 3, 1])?; // NCHW -> NHWC
-    let x = round(&multiply(&x, scalar(255.0))?, 0)?;
-
-    let sh = x.shape();
-    let (h, w, c) = (sh[1] as u32, sh[2] as u32, sh[3] as u32);
-    let n = (h * w * c) as usize;
-    // `transpose_axes` yields a strided view; `reshape` re-materializes C-order so the slice is
-    // logical NHWC. Take batch 0.
-    let total: i32 = sh.iter().product();
-    let flat = x.reshape(&[total])?;
-    let pixels: Vec<u8> = flat.as_slice::<f32>()[..n]
-        .iter()
-        .map(|&v| v as u8)
-        .collect();
-    Ok(Image {
-        width: w,
-        height: h,
-        pixels,
-    })
 }
 
 #[cfg(test)]

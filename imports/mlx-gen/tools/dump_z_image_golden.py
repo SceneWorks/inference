@@ -1,6 +1,6 @@
 """Real-weights Z-Image golden run — the reference for the mlx-gen end-to-end (sc-2352).
 
-Run from the fork:  cd ~/repos/mflux && uv run python /Users/michael/repos/mlx-gen/tools/dump_z_image_golden.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_z_image_golden.py
 
 Loads the real Tongyi-MAI/Z-Image-Turbo models and runs a fixed (prompt, seed, steps, size)
 generation by hand (mirroring z_image.py), dumping EVERY intermediate so the Rust port can be

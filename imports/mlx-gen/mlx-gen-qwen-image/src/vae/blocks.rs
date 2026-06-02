@@ -17,8 +17,9 @@ use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-/// VAE channel-L2 norm eps (fork `QwenImageRMSNorm` default).
-const NORM_EPS: f32 = 1e-12;
+/// VAE channel-L2 norm eps (fork `QwenImageRMSNorm` default). Single source of truth — the parent
+/// `vae` module imports this rather than redefining it.
+pub(super) const NORM_EPS: f32 = 1e-12;
 
 /// Channel-L2 normalization over axis 1: `x / max(‖x‖₂ over C, eps) · √C · weight`.
 /// `weight` is 1-D `(C,)`; `x` is any rank with the channel axis at index 1 (NCTHW or NCHW).

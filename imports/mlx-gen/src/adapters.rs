@@ -18,13 +18,10 @@ use mlx_rs::{
     Array, Dtype,
 };
 
+use crate::array::scalar;
 use crate::Result;
 
 pub mod loader;
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// Reconstruct a LoKr weight delta `ΔW = (alpha/rank) · kron(w1, w2)`, reshaped to the
 /// base weight's logical `[out, in]` and stored at bf16. Each Kronecker factor is either
