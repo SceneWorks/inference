@@ -63,6 +63,12 @@ Prerequisites: macOS + Metal; the frozen `mflux` fork at `~/repos/mflux`; the mo
 
 See each script's module docstring for its exact env vars / arguments.
 
+### FLUX.2-klein (`mlx-gen-flux2`)
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `flux2_te_real.safetensors`, `flux2_te_real_f32.safetensors` | `dump_flux2_te_real_golden.py` (`FLUX2_TE_F32=1` for the f32 ref) | `tests/te_real_weights.rs` | sc-2346 S1 Qwen3 text encoder + tokenizer. The f32 golden is the **correctness** ref (Rust runs f32 activations → peak_rel ~1e-5); the bf16 golden is the fork's production precision (the residual there is bf16-vs-f32 over 36 layers). The committed `tests/fixtures/te_golden.safetensors` (tiny synthetic) proves the encoder math on CI without weights. |
+
 ### Weight-independent
 
 | golden | dump script | consumed by | notes |

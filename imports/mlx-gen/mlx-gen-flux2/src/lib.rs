@@ -18,17 +18,21 @@
 //! text-encoder (S1), VAE (S2), and transformer (S3) modules land.
 
 pub mod config;
+pub mod loader;
 pub mod model;
 pub mod pipeline;
 pub mod pos_embed;
+pub mod text_encoder;
 
 pub use config::{
     Flux2Config, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_HEIGHT, DEFAULT_STEPS, DEFAULT_WIDTH,
     FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID,
 };
+pub use loader::{load_text_encoder, load_tokenizer};
 pub use model::{descriptor_klein_9b, descriptor_klein_9b_edit, load_klein_9b, load_klein_9b_edit};
 pub use pipeline::{
     create_noise, image_seq_len, pack_latents, patchify_latents, prepare_grid_ids,
     prepare_text_ids, schedule, timesteps_x1000, unpack_latents,
 };
 pub use pos_embed::Flux2PosEmbed;
+pub use text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
