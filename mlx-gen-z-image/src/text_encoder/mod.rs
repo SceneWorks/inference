@@ -10,13 +10,13 @@ pub mod attention;
 pub mod encoder;
 pub mod layer;
 pub mod mlp;
-pub mod rope;
 
 pub use attention::TextAttention;
 pub use encoder::{TextEncoder, ZTextEncoderConfig};
 pub use layer::EncoderLayer;
 pub use mlp::TextMlp;
-pub use rope::TextRope;
+// The HF half-split text RoPE is identical across families and now lives in core (F-006).
+pub use mlx_gen::nn::TextRope;
 
 /// mlx `nn.RMSNorm` default eps — used by the per-head `q_norm`/`k_norm` (which the fork
 /// constructs without an explicit eps). The block-level layer norms use `rms_norm_eps` (1e-6).

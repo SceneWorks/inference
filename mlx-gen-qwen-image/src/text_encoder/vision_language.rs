@@ -15,6 +15,7 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
+use mlx_gen::array::host_i32;
 use mlx_gen::Result;
 
 use super::vision::grid::Grid;
@@ -24,8 +25,6 @@ use super::QwenTextEncoder;
 pub struct QwenVisionLanguageEncoder {
     lm: QwenTextEncoder,
     visual: VisionTransformer,
-    image_token_id: i32,
-    edit_drop_idx: i32,
 }
 
 impl QwenVisionLanguageEncoder {
@@ -35,16 +34,40 @@ impl QwenVisionLanguageEncoder {
     pub const EDIT_DROP_IDX: i32 = 64;
 
     pub fn new(lm: QwenTextEncoder, visual: VisionTransformer) -> Self {
-        Self {
-            lm,
-            visual,
-            image_token_id: Self::IMAGE_TOKEN_ID,
-            edit_drop_idx: Self::EDIT_DROP_IDX,
-        }
+        Self { lm, visual }
+    }
+
+    /// Run the vision transformer over the reference patches → vision embeds `[n_vis, hidden]`.
+    /// Depends only on the image (`pixel_values` + `grids`), so the caller computes it **once** and
+    /// reuses it for the positive + negative prompts instead of re-running the 32-block tower (F-004).
+    pub fn encode_vision(&self, pixel_values: &Array, grids: &[Grid]) -> Result<Array> {
+        self.visual.forward(pixel_values, grids)
+    }
+
+    /// Splice precomputed `vision` embeds into the prompt token stream, run the 28 LM layers, and
+    /// drop the leading template tokens. Pair with [`encode_vision`](Self::encode_vision) so the
+    /// vision tower runs once across the positive/negative encodes.
+    pub fn encode_with_vision(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        vision: &Array,
+    ) -> Result<Array> {
+        let embeds = self.lm.embed(input_ids)?; // [b, s, hidden] f32
+        let spliced = self.splice(&embeds, input_ids, vision)?;
+        let hidden = self.lm.forward_from_embeds(&spliced, attention_mask)?; // [b, s, hidden]
+
+        // Drop the leading template tokens (single un-padded sequence per row).
+        let s = hidden.shape()[1];
+        let idx: Vec<i32> = (Self::EDIT_DROP_IDX..s).collect();
+        let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+        Ok(hidden.take_axis(&idx, 1)?)
     }
 
     /// `input_ids` / `attention_mask`: `[b, s]` int32; `pixel_values`: `[n_patches, 1176]`; `grids`:
     /// one `(t, grid_h, grid_w)` per reference image. Returns the prompt embeds `[b, s-64, hidden]`.
+    /// Convenience wrapper = [`encode_vision`](Self::encode_vision) then
+    /// [`encode_with_vision`](Self::encode_with_vision).
     pub fn encode(
         &self,
         input_ids: &Array,
@@ -52,16 +75,8 @@ impl QwenVisionLanguageEncoder {
         pixel_values: &Array,
         grids: &[Grid],
     ) -> Result<Array> {
-        let embeds = self.lm.embed(input_ids)?; // [b, s, hidden] f32
-        let vision = self.visual.forward(pixel_values, grids)?; // [n_vis, hidden]
-        let spliced = self.splice(&embeds, input_ids, &vision)?;
-        let hidden = self.lm.forward_from_embeds(&spliced, attention_mask)?; // [b, s, hidden]
-
-        // Drop the leading template tokens (single un-padded sequence per row).
-        let s = hidden.shape()[1];
-        let idx: Vec<i32> = (self.edit_drop_idx..s).collect();
-        let idx = Array::from_slice(&idx, &[idx.len() as i32]);
-        Ok(hidden.take_axis(&idx, 1)?)
+        let vision = self.encode_vision(pixel_values, grids)?;
+        self.encode_with_vision(input_ids, attention_mask, &vision)
     }
 
     /// Replace `<|image_pad|>` embeddings with the vision embeds (in order) via a single gather:
@@ -72,9 +87,9 @@ impl QwenVisionLanguageEncoder {
         let (b, s, h) = (sh[0], sh[1], sh[2]);
         let n_text = b * s;
         let n_vis = vision.shape()[0];
-        let ids = input_ids.as_slice::<i32>();
+        let ids = host_i32(input_ids)?;
 
-        let gather = image_gather_index(ids, self.image_token_id, n_vis, n_text);
+        let gather = image_gather_index(&ids, Self::IMAGE_TOKEN_ID, n_vis, n_text);
         let embeds_flat = embeds.reshape(&[n_text, h])?;
         let src = concatenate_axis(&[&embeds_flat, vision], 0)?; // [n_text + n_vis, h]
         let idx = Array::from_slice(&gather, &[n_text]);

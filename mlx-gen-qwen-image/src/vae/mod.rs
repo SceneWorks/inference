@@ -5,8 +5,8 @@
 //! Latents are scaled by per-channel `mean`/`std` (fork `QwenVAE.LATENTS_{MEAN,STD}`). Weight keys
 //! mirror the fork's *internal* module tree (`decoder.conv_in.conv3d.weight`,
 //! `encoder.down_blocks.0.resnets.0.…`, etc.), so a `Weights` dumped from a loaded fork VAE drops
-//! straight in. The on-disk-snapshot key remapping (diffusers → this tree) lands with the full
-//! model assembly (e2e slice).
+//! straight in. The on-disk-snapshot key remapping (diffusers → this tree) is applied by the loader
+//! (`remap_vae_keys`).
 
 pub mod blocks;
 
@@ -17,9 +17,7 @@ use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use blocks::{rms_norm_channels, CausalConv3d, DownBlock3D, MidBlock3D, UpBlock3D};
-
-const NORM_EPS: f32 = 1e-12;
+use blocks::{rms_norm_channels, CausalConv3d, DownBlock3D, MidBlock3D, UpBlock3D, NORM_EPS};
 
 // fork QwenVAE.LATENTS_{MEAN,STD}, reshaped to (1, 16, 1, 1, 1) for NCTHW broadcast.
 #[rustfmt::skip]

@@ -107,6 +107,17 @@ impl Default for GenerationRequest {
     }
 }
 
+/// Seed when a [`GenerationRequest`] omits one: nanos since the epoch (any nonzero value works —
+/// this only sets which sample is drawn; a caller wanting reproducibility passes `req.seed`).
+/// Shared by every generator (F-006).
+pub fn default_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 /// Typed conditioning inputs. Each image family uses the subset its `Capabilities` advertises.
 /// (A `VideoClip { clips: Vec<(MediaRef, f32)> }` variant is a known additive extension for the
 /// video port — extend/bridge/replace-person — and does not exist yet.)

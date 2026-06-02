@@ -13,9 +13,8 @@ use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+use super::EPS;
 use crate::text_encoder::join;
-
-const EPS: f32 = 1e-6;
 
 pub struct PatchMerger {
     ln_q: Array,

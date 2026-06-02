@@ -18,6 +18,8 @@ from mflux.models.z_image.model.z_image_transformer.rope_embedder import RopeEmb
 from mflux.models.z_image.model.z_image_transformer.final_layer import FinalLayer
 from mflux.models.z_image.model.z_image_transformer.context_block import ZImageContextBlock
 
+from _paths import fixture
+
 mx.random.seed(0)
 rng = np.random.default_rng(0)
 DIM, N_HEADS, SEQ = 96, 4, 4
@@ -75,7 +77,7 @@ out["cb.in_x"] = cb_x.astype(mx.float32)
 out["cb.in_freqs_cis"] = cb_fc.astype(mx.float32)
 out["cb.out"] = cb(cb_x, None, cb_fc).astype(mx.float32)
 
-path = "/Users/michael/repos/mlx-gen/mlx-gen-z-image/tests/fixtures/z_submodules.safetensors"
+path = fixture("mlx-gen-z-image/tests/fixtures/z_submodules.safetensors")
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors)")
 for k in ("te.out", "rope.out", "fl.out", "cb.out"):

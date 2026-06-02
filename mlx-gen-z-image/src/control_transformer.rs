@@ -195,7 +195,7 @@ impl ZImageControlTransformer {
         let t_emb = self.base.t_embedder.forward(&t)?;
         record!("t_emb", t_emb);
 
-        let patched = self.base.patchify(x, cap_feats);
+        let patched = self.base.patchify(x, cap_feats)?;
 
         // Image stream: embed → set padded positions to x_pad_token → (control refiner) → noise refiner.
         let mut x_emb = self.base.x_embedder.forward(&patched.x_tokens)?;
@@ -340,5 +340,5 @@ fn patchify_control(cc: &Array, patch_size: i32, f_patch_size: i32) -> Result<Ar
         .reshape(&[ft * ht * wt, pf * ph * pw * c])?;
     let ori = ft * ht * wt;
     let pad = (-(ori as i64)).rem_euclid(32) as i32;
-    Ok(crate::transformer::pad_rows(&tokens, pad))
+    crate::transformer::pad_rows(&tokens, pad)
 }

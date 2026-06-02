@@ -12,9 +12,9 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
-    WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Result, WeightsSource,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -37,8 +37,9 @@ const NEGATIVE_FALLBACK: &str = " ";
 pub const MODEL_ID: &str = "qwen_image";
 
 /// Qwen-Image's identity + capabilities — constructible without loading weights (registry
-/// introspection). T2I only for now (Edit reference conditioning is sc-2465); LoRA wiring is a
-/// later slice, so it is advertised off rather than silently ignored.
+/// introspection). This is the **T2I** variant (`qwen_image`); Qwen-Image-Edit ships as a separate
+/// `qwen_image_edit` model (sc-2465). LoRA/LoKr is not yet wired (sc-2528), so it is advertised off
+/// rather than silently ignored.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -80,8 +81,10 @@ pub struct QwenImage {
 ///
 /// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a `Qwen/Qwen-Image` snapshot (the
 /// diffusers multi-component tree). Weights load dense at their on-disk dtype (bf16); the text
-/// encoder promotes to f32 internally. Q8 quantization and an fp32 override are not yet wired (the
-/// validated path is dense bf16) — both are rejected rather than silently ignored.
+/// encoder promotes to f32 internally. `spec.quantize` (Q4/Q8) quantizes the transformer only
+/// (group_size 64) — the fork's full `quantize=N` scope (sc-2565; see the inline note below). An
+/// fp32 precision override is not wired (the validated dense path is bf16) and is rejected rather
+/// than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
@@ -98,9 +101,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    // Q4/Q8 quantizes the **transformer only** (group_size 64) after the dense bf16 load — the
-    // fork's `nn.quantize` predicate matches every Linear, and only the transformer has them
-    // (the text encoder is skip-quantize; the VAE is all conv). Text encoder + VAE stay bf16.
+    // Q4/Q8 quantizes the **transformer only** (group_size 64) after the dense bf16 load. This is
+    // the fork's full `quantize=N` scope, not a descope (sc-2565): `QwenWeightDefinition` marks the
+    // `text_encoder` component `skip_quantization=True` ("Quantization causes significant semantic
+    // degradation"), so its Linears/Embedding are never quantized; and the VAE is all-conv
+    // (`nn.Conv2d`/`Conv3d` lack `to_quantized`), so the fork's `nn.quantize(vae)` is a no-op. The
+    // transformer is the only component with quantizable leaves. (Z-Image differs — its fork *does*
+    // quantize the TE+VAE, hence sc-2532; do not generalize that here.)
     let mut transformer = loader::load_transformer(root)?;
     if let Some(q) = spec.quantize {
         transformer.quantize(q.bits())?;
@@ -185,15 +192,6 @@ impl Generator for QwenImage {
         }
         Ok(GenerationOutput::Images(images))
     }
-}
-
-/// Seed when a request omits one: nanos since the epoch (only sets which sample is drawn).
-fn default_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// Capability-driven request validation, factored out for unit testing without loaded weights.

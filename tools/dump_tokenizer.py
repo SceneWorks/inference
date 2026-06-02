@@ -19,9 +19,14 @@ from transformers import AutoTokenizer
 
 from mflux.models.common.tokenizer.tokenizer import LanguageTokenizer
 
+from _paths import fixture, hf_hub_cache
+
 TOK = (
-    "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/"
-    "snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6/tokenizer"
+    hf_hub_cache()
+    / "models--Tongyi-MAI--Z-Image-Turbo"
+    / "snapshots"
+    / "f332072aa78be7aecdf3ee76d5c247082da564a6"
+    / "tokenizer"
 )
 
 raw = AutoTokenizer.from_pretrained(TOK, local_files_only=True)
@@ -50,6 +55,6 @@ for i, p in enumerate(PROMPTS):
     n = int(mx.sum(mask).item())
     print(f"p{i}: shape={ids.shape} valid={n} prompt={p!r}")
 
-path = "/Users/michael/repos/mlx-gen/tests/fixtures/tokenizer_zimage.safetensors"
+path = fixture("tests/fixtures/tokenizer_zimage.safetensors")
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors); pad_token_id={raw.pad_token_id}")

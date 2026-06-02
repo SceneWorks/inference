@@ -12,6 +12,8 @@ Run from the mflux fork venv:
 
 import mlx.core as mx
 
+from _paths import fixture
+
 mx.random.seed(0)
 
 GROUP_SIZE = 64
@@ -33,6 +35,6 @@ for bits in (8, 4):
     out[f"{p}.qmm"] = qmm.astype(mx.float32)
     print(f"bits={bits}: wq{wq.shape}/{wq.dtype} scales{scales.shape} biases{biases.shape} qmm{qmm.shape}")
 
-path = "/Users/michael/repos/mlx-gen/tests/fixtures/quant_q4q8.safetensors"
+path = fixture("tests/fixtures/quant_q4q8.safetensors")
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors); mlx {mx.__version__ if hasattr(mx, '__version__') else '?'}")

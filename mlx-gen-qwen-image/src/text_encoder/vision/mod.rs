@@ -25,3 +25,6 @@ pub use merger::PatchMerger;
 pub use mlp::VisionMlp;
 pub use patch_embed::VisionPatchEmbed;
 pub use transformer::{VisionConfig, VisionTransformer};
+
+/// Qwen2.5-VL vision RMSNorm epsilon (fork default). Single source of truth for the block + merger.
+const EPS: f32 = 1e-6;
