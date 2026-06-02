@@ -12,6 +12,7 @@ import os
 
 import mlx.core as mx
 
+from _paths import hf_hub_cache
 from mflux.models.z_image.model.z_image_transformer.control_transformer import ZImageControlTransformer
 from mflux.models.z_image.model.z_image_transformer.transformer import ZImageTransformer
 from mflux.models.z_image.model.z_image_transformer.transformer_block import ZImageTransformerBlock
@@ -24,8 +25,7 @@ g = mx.load(os.path.join(_GOLDEN_DIR, "z_image_control_q8_golden.safetensors"))
 def _cw():
     if os.environ.get("CONTROL_WEIGHTS"):
         return os.environ["CONTROL_WEIGHTS"]
-    home = os.path.expanduser("~")
-    return glob.glob(os.path.join(home, ".cache/huggingface/hub/models--alibaba-pai--Z-Image-Turbo-Fun-Controlnet-Union-2.1", "snapshots/*/*.safetensors"))[0]
+    return glob.glob(str(hf_hub_cache() / "models--alibaba-pai--Z-Image-Turbo-Fun-Controlnet-Union-2.1" / "snapshots/*/*.safetensors"))[0]
 
 
 m = ZImageControl(control_weights_path=_cw(), quantize=8).transformer

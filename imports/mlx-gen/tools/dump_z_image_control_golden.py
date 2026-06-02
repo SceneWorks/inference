@@ -26,6 +26,7 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image as PILImage
 
+from _paths import hf_hub_cache
 from mflux.models.common.schedulers.flow_match_euler_discrete_scheduler import (
     FlowMatchEulerDiscreteScheduler as S,
 )
@@ -49,11 +50,10 @@ QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
 def _find_control_weights() -> str:
     if os.environ.get("CONTROL_WEIGHTS"):
         return os.environ["CONTROL_WEIGHTS"]
-    home = os.path.expanduser("~")
-    pat = os.path.join(
-        home,
-        ".cache/huggingface/hub/models--alibaba-pai--Z-Image-Turbo-Fun-Controlnet-Union-2.1",
-        "snapshots/*/*.safetensors",
+    pat = str(
+        hf_hub_cache()
+        / "models--alibaba-pai--Z-Image-Turbo-Fun-Controlnet-Union-2.1"
+        / "snapshots/*/*.safetensors"
     )
     hits = glob.glob(pat)
     if not hits:

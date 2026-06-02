@@ -15,11 +15,12 @@ import os
 
 import mlx.core as mx
 
-HOME = os.path.expanduser("~")
-D = "/Users/michael/Repos/mlx-gen/.claude/worktrees/great-dirac-05f064/tools/golden"
+from _paths import hf_hub_cache
+
+D = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 
 # Real K=64 x-embedder weight [3840, 64] (bf16 on disk) from the Z-Image-Turbo transformer.
-tdir = glob.glob(f"{HOME}/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/*/transformer")[0]
+tdir = glob.glob(str(hf_hub_cache() / "models--Tongyi-MAI--Z-Image-Turbo" / "snapshots/*/transformer"))[0]
 w = None
 for f in glob.glob(f"{tdir}/*.safetensors"):
     t = mx.load(f)

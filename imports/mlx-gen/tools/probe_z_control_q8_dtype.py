@@ -19,6 +19,7 @@ import os
 import mlx.core as mx
 import numpy as np
 
+from _paths import hf_hub_cache
 from mflux.models.z_image.latent_creator.z_image_latent_creator import ZImageLatentCreator
 from mflux.models.z_image.variants.z_image_control import ZImageControl
 from mflux.utils.image_util import ImageUtil
@@ -30,11 +31,10 @@ Q8_GOLDEN = os.path.join(_GOLDEN_DIR, "z_image_control_q8_golden.safetensors")
 def _find_control_weights() -> str:
     if os.environ.get("CONTROL_WEIGHTS"):
         return os.environ["CONTROL_WEIGHTS"]
-    home = os.path.expanduser("~")
-    pat = os.path.join(
-        home,
-        ".cache/huggingface/hub/models--alibaba-pai--Z-Image-Turbo-Fun-Controlnet-Union-2.1",
-        "snapshots/*/*.safetensors",
+    pat = str(
+        hf_hub_cache()
+        / "models--alibaba-pai--Z-Image-Turbo-Fun-Controlnet-Union-2.1"
+        / "snapshots/*/*.safetensors"
     )
     return glob.glob(pat)[0]
 

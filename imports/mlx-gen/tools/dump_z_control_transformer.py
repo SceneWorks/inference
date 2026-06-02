@@ -1,6 +1,6 @@
 """Full Z-Image **ControlNet** DiT forward parity fixture (sc-2349 / sc-2257).
 
-A tiny synthetic ZImageControlTransformer (dim=96, 4 heads, 2 refiner + 4 main layers, in_ch=4,
+A tiny synthetic ZImageControlTransformer (dim=64, 4 heads, 2 refiner + 4 main layers, in_ch=4,
 patch=2) run end-to-end with a random control context. Dumps all weights + inputs + the control-on
 output, the control-off (control_context=None) output, and asserts the fork's own self-consistency
 (control_context_scale=0 == None == base). The Rust parity test rebuilds the same model from these
