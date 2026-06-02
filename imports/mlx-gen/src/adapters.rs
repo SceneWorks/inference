@@ -24,9 +24,12 @@ use crate::Result;
 pub mod loader;
 
 /// Reconstruct a LoKr weight delta `ΔW = (alpha/rank) · kron(w1, w2)`, reshaped to the
-/// base weight's logical `[out, in]` and stored at bf16. Each Kronecker factor is either
+/// base weight's logical `[out, in]` and cast to `out_dtype`. Each Kronecker factor is either
 /// full (`w1` / `w2`) or a low-rank product (`w1_a @ w1_b` / `w2_a @ w2_b`). Mirrors
 /// PEFT/LyCORIS `LoKrLayer.get_delta_weight` (pending the sc-2324 cross-impl parity check).
+///
+/// `out_dtype` is `Bfloat16` for the fork-parity residual path (Z-Image/Qwen — PARITY-BF16,
+/// sc-2609) and `Float32` for the SDXL merge path (f32-everywhere, no fork to match — sc-2640).
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_lokr_delta(
     alpha: f32,
@@ -38,6 +41,7 @@ pub fn reconstruct_lokr_delta(
     w2: Option<&Array>,
     w2_a: Option<&Array>,
     w2_b: Option<&Array>,
+    out_dtype: Dtype,
 ) -> Result<Array> {
     let factor1 = match (w1, w1_a, w1_b) {
         (Some(w), _, _) => w.clone(),
@@ -50,9 +54,7 @@ pub fn reconstruct_lokr_delta(
         _ => return Err("LoKr: w2 missing (need full w2 or w2_a@w2_b)".into()),
     };
     let delta = multiply(&kron(&factor1, &factor2)?, scalar(alpha / rank))?;
-    // PARITY-BF16 (sc-2609): the fork reconstructs the LoKr delta at bf16; f32 would be more precise.
-    // (`residual` already reconciles this delta to the activation dtype, so flipping to f32 is local.)
-    Ok(delta.reshape(base_shape)?.as_dtype(Dtype::Bfloat16)?)
+    Ok(delta.reshape(base_shape)?.as_dtype(out_dtype)?)
 }
 
 /// One adapter's contribution WITHOUT the base, so a host can sum stacked adapters over
@@ -333,6 +335,7 @@ mod tests {
             Some(&Array::from_slice(&[0.7f32, 0.8], &[1, 2])),
             None,
             None,
+            Dtype::Bfloat16,
         )
         .unwrap()
     }

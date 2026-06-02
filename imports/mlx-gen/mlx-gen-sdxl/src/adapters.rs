@@ -1,7 +1,13 @@
-//! SDXL LoRA application (sc-2639) — faithful Rust port of the vendored SceneWorks `lora.py` merge
-//! for the mlx-examples SDXL U-Net.
+//! SDXL adapter application — LoRA (sc-2639, a faithful Rust port of the vendored SceneWorks
+//! `lora.py` merge for the mlx-examples SDXL U-Net) and LoKr (sc-2640).
 //!
-//! Two on-disk formats, both **merged into the dense f32 U-Net weights at load** (`W += δ`, NOT a
+//! **LoKr** (`<module>.lokr_w1/w2` (+ low-rank `_a`/`_b`), `networkType=lokr` + `alpha`/`rank` meta):
+//! the vendored SDXL path *rejects* LoKr, so there is no fork to match — Rust is strictly more
+//! capable. The delta is reconstructed with the validated LyCORIS formula (`reconstruct_lokr_delta`,
+//! f32 for the f32-everywhere SDXL path) and merged (`W += δ·scale`), chaos-safe like LoRA. Keys
+//! resolve through the same kohya table (`lora_unet_<flat>.lokr_*`) or bare/PEFT dotted paths.
+//!
+//! **LoRA** — two on-disk formats, both **merged into the dense f32 U-Net weights at load** (`W += δ`, NOT a
 //! forward-time residual): SDXL's ancestral sampler is chaos-sensitive, and a residual's
 //! `W·x + δ·x` differs from the merged `(W+δ)·x` by ~1 ULP, which cascades to a visible whole-image
 //! divergence. Merging reproduces the vendored merged-weight forward bit-for-bit.
@@ -27,7 +33,8 @@ use std::collections::BTreeMap;
 use mlx_rs::ops::{matmul, multiply};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::adapters::loader::is_lokr;
+use mlx_gen::adapters::{reconstruct_lokr_delta, AdaptableHost};
 use mlx_gen::array::scalar;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
@@ -37,6 +44,17 @@ use crate::unet::UNet2DConditionModel;
 
 const KOHYA_PREFIX: &str = "lora_unet_";
 const PEFT_PREFIX: &str = "base_model.model.unet.";
+
+/// LoKr per-module factor suffixes (each factor is full `lokr_w1`/`lokr_w2` or a low-rank
+/// `_a`/`_b` product). Exact-suffix matched; longest-first so `.lokr_w1_a` wins over `.lokr_w1`.
+const LOKR_SUFFIXES: [&str; 6] = [
+    ".lokr_w1_a",
+    ".lokr_w1_b",
+    ".lokr_w1",
+    ".lokr_w2_a",
+    ".lokr_w2_b",
+    ".lokr_w2",
+];
 
 #[derive(Clone, Copy)]
 enum Role {
@@ -174,10 +192,96 @@ fn merge_one(
     Ok(())
 }
 
-/// Merge every LoRA spec in `specs` into `unet` (sc-2639). LoRA only — LoKr (which the vendored SDXL
-/// path *rejects*) is sc-2640. Builds the kohya `flattened→dotted` table once from the U-Net's
-/// routable surface, then merges each file. Errors if a non-empty spec list merges nothing (a real
-/// format/prefix misconfiguration — e.g. an original-SD `lora_unet_input_blocks_*` file).
+/// Map a LoKr key to `(diffusers_dotted_path, factor_name)`, or `None` if out of surface. kohya
+/// `lora_unet_<flat>.lokr_*` resolves the flattened stem via the table; bare/PEFT `<dotted>.lokr_*`
+/// (with an optional `base_model.model.unet.` prefix) resolves the dotted path directly.
+fn classify_lokr_key(
+    key: &str,
+    kohya_to_dotted: &BTreeMap<String, String>,
+) -> Option<(String, &'static str)> {
+    for suf in LOKR_SUFFIXES {
+        if let Some(stem) = key.strip_suffix(suf) {
+            let factor = &suf[1..]; // drop the leading '.'
+            return if let Some(flat) = stem.strip_prefix(KOHYA_PREFIX) {
+                kohya_to_dotted.get(flat).map(|d| (d.clone(), factor))
+            } else {
+                Some((
+                    stem.strip_prefix(PEFT_PREFIX).unwrap_or(stem).to_string(),
+                    factor,
+                ))
+            };
+        }
+    }
+    None
+}
+
+/// Merge one LoKr file into `unet` at `scale` (sc-2640). The vendored SDXL path *rejects* LoKr, so
+/// there is no fork to match — we reconstruct the delta with the validated LyCORIS formula
+/// (`reconstruct_lokr_delta`, f32 for the f32-everywhere SDXL path) and **merge** it (`W += δ·scale`),
+/// chaos-safe like the LoRA path. `alpha`/`rank` come from the file metadata (alpha defaults to rank).
+fn merge_one_lokr(
+    unet: &mut UNet2DConditionModel,
+    w: &Weights,
+    scale: f32,
+    kohya_to_dotted: &BTreeMap<String, String>,
+    report: &mut SdxlLoraReport,
+) -> Result<()> {
+    let rank = w
+        .metadata("rank")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    let alpha = w
+        .metadata("alpha")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(rank);
+
+    let mut grouped: BTreeMap<String, BTreeMap<&'static str, Array>> = BTreeMap::new();
+    for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
+        match classify_lokr_key(&key, kohya_to_dotted) {
+            Some((path, factor)) => {
+                grouped
+                    .entry(path)
+                    .or_default()
+                    .insert(factor, w.require(&key)?.clone());
+            }
+            None => report.skipped_keys += 1,
+        }
+    }
+
+    for (path, f) in grouped {
+        let parts: Vec<&str> = path.split('.').collect();
+        match unet.adaptable_mut(&parts) {
+            Some(lin) => {
+                let base_shape = lin.base_shape();
+                let delta = reconstruct_lokr_delta(
+                    alpha,
+                    rank,
+                    &base_shape,
+                    f.get("lokr_w1"),
+                    f.get("lokr_w1_a"),
+                    f.get("lokr_w1_b"),
+                    f.get("lokr_w2"),
+                    f.get("lokr_w2_a"),
+                    f.get("lokr_w2_b"),
+                    Dtype::Float32,
+                )?;
+                // The alpha/rank factor is baked into `delta`; apply the user scale on top (scale-0 ⇒
+                // δ·0 ⇒ a bit-exact no-op merge).
+                let delta = multiply(&delta, scalar(scale))?;
+                lin.merge_dense_delta(&delta)?;
+                report.merged += 1;
+            }
+            None => report.skipped_keys += 1,
+        }
+    }
+    Ok(())
+}
+
+/// Merge every adapter spec in `specs` into `unet` — LoRA (sc-2639) and LoKr (sc-2640). The vendored
+/// SDXL path supports LoRA only (it *rejects* LoKr); Rust is strictly more capable. Builds the kohya
+/// `flattened→dotted` table once from the U-Net's routable surface, then merges each file by kind.
+/// Errors if a non-empty spec list merges nothing (a real format/prefix misconfiguration — e.g. an
+/// original-SD `lora_unet_input_blocks_*` file).
 pub fn apply_sdxl_adapters(
     unet: &mut UNet2DConditionModel,
     specs: &[AdapterSpec],
@@ -193,22 +297,31 @@ pub fn apply_sdxl_adapters(
 
     let mut report = SdxlLoraReport::default();
     for spec in specs {
-        if spec.kind != AdapterKind::Lora {
-            return Err(Error::Msg(format!(
-                "sdxl: {:?} adapters are not supported here (LoRA only; LoKr is sc-2640)",
-                spec.kind
-            )));
-        }
         let w = Weights::from_file(&spec.path)?;
-        merge_one(unet, &w, spec.scale, &kohya_to_dotted, &mut report)?;
+        match spec.kind {
+            AdapterKind::Lokr => {
+                merge_one_lokr(unet, &w, spec.scale, &kohya_to_dotted, &mut report)?
+            }
+            AdapterKind::Lora => {
+                // The file metadata is authoritative — a Lora-declared LoKr file would merge nothing
+                // (no `lora_A/B`/`lora_down/up` keys); surface the mismatch loudly.
+                if is_lokr(&w) {
+                    return Err(Error::Msg(format!(
+                        "sdxl: adapter {} declared Lora but its metadata says networkType=lokr",
+                        spec.path.display()
+                    )));
+                }
+                merge_one(unet, &w, spec.scale, &kohya_to_dotted, &mut report)?
+            }
+        }
     }
 
     if report.merged == 0 {
         return Err(Error::Msg(format!(
-            "sdxl: no LoRA target modules matched across {} adapter file(s) — check the format \
-             (expected kohya `lora_unet_` with diffusers block naming, or PEFT \
-             `base_model.model.unet.`; original-SD `lora_unet_input_blocks_*` and conv/ff-only \
-             LoRAs are not supported)",
+            "sdxl: no adapter target modules matched across {} file(s) — check the format \
+             (expected kohya `lora_unet_` with diffusers block naming, PEFT \
+             `base_model.model.unet.`, or LoKr `<module>.lokr_w1/w2` + networkType=lokr; \
+             original-SD `lora_unet_input_blocks_*` and conv/ff-only adapters are not supported)",
             specs.len()
         )));
     }
@@ -282,6 +395,32 @@ mod tests {
             &t
         )
         .is_none());
+    }
+
+    #[test]
+    fn classify_lokr_resolves_factors_via_table_and_bare() {
+        let t = table();
+        // kohya LoKr factor resolves the flattened stem via the table; longest suffix wins
+        // (`.lokr_w1_a` over `.lokr_w1`).
+        let (path, factor) =
+            classify_lokr_key("lora_unet_up_blocks_0_attentions_0_proj_in.lokr_w1_a", &t)
+                .expect("kohya lokr_w1_a should resolve");
+        assert_eq!(path, "up_blocks.0.attentions.0.proj_in");
+        assert_eq!(factor, "lokr_w1_a");
+        assert_eq!(
+            classify_lokr_key("lora_unet_up_blocks_0_attentions_0_proj_in.lokr_w2", &t)
+                .unwrap()
+                .1,
+            "lokr_w2"
+        );
+        // bare / PEFT dotted paths resolve directly (no table); off-surface kohya stems are None.
+        assert_eq!(
+            classify_lokr_key("base_model.model.unet.foo.bar.lokr_w1", &t).unwrap(),
+            ("foo.bar".to_string(), "lokr_w1")
+        );
+        assert!(
+            classify_lokr_key("lora_unet_mid_block_attentions_0_proj_in.lokr_w1", &t).is_none()
+        );
     }
 
     #[test]

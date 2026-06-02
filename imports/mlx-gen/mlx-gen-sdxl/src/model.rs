@@ -57,11 +57,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            // img2img Reference (sc-2638). LoRA (kohya `lora_unet_` + PEFT) is wired (sc-2639);
-            // LoKr lands in sc-2640 (advertised once wired).
+            // img2img Reference (sc-2638). LoRA (kohya `lora_unet_` + PEFT, sc-2639) and LoKr
+            // (sc-2640 — Rust is more capable than the vendored path, which rejects LoKr) are wired.
             conditioning: vec![ConditioningKind::Reference],
             supports_lora: true,
-            supports_lokr: false,
+            supports_lokr: true,
             // Only the wired + parity-proven sampler is advertised. The fork's SDXL path uses the
             // ancestral Euler step exclusively (there is no plain-`euler` SDXL golden), so a request
             // naming any other sampler is rejected in `validate_request` rather than silently
@@ -127,10 +127,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
     let mut unet = loader::load_unet(root)?;
     if !spec.adapters.is_empty() {
-        // Merge LoRA (kohya `lora_unet_` / PEFT) into the dense f32 U-Net weights at load — the
-        // vendored `lora.py` merges pre-quantization, and merging (not a forward-time residual)
-        // keeps the chaos-sensitive ancestral sampler bit-exact (sc-2639). LoKr is rejected here
-        // (sc-2640). Out-of-surface keys (mid_block/ff/conv) are surfaced in the report, not dropped.
+        // Merge LoRA (kohya `lora_unet_` / PEFT, sc-2639) and LoKr (sc-2640) into the dense f32
+        // U-Net weights at load — the vendored `lora.py` merges pre-quantization, and merging (not a
+        // forward-time residual) keeps the chaos-sensitive ancestral sampler bit-exact. Out-of-surface
+        // keys (mid_block/ff/conv) are surfaced in the report, not dropped.
         crate::adapters::apply_sdxl_adapters(&mut unet, &spec.adapters)?;
     }
 
