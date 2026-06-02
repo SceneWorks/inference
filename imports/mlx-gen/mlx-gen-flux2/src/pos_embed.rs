@@ -29,12 +29,15 @@ impl Flux2PosEmbed {
         Self { theta, axes_dim }
     }
 
-    /// `ids`: integer coordinates `[batch, seq, 4]`. Returns `(cos, sin)`, each
-    /// `[batch, seq, sum(axes_dim)/2]` in f32.
+    /// `ids`: integer coordinates with the 4 coordinate axes last — `[…, 4]` (e.g. `[seq, 4]`
+    /// after the batch is dropped, or `[batch, seq, 4]`). Returns `(cos, sin)`, each `[…,
+    /// sum(axes_dim)/2]` in f32. The coordinate axis is taken relative to the end, matching the
+    /// fork's `pos[..., i]`.
     pub fn forward(&self, ids: &Array) -> Result<(Array, Array)> {
         let pos = ids.as_dtype(Dtype::Float32)?;
-        // Split the 4 coordinate axes → each `[batch, seq, 1]`.
-        let axes = split(&pos, 4, 2)?;
+        let last = (pos.shape().len() - 1) as i32;
+        // Split the 4 coordinate axes → each `[…, 1]`.
+        let axes = split(&pos, 4, last)?;
         let mut cos_parts: Vec<Array> = Vec::with_capacity(4);
         let mut sin_parts: Vec<Array> = Vec::with_capacity(4);
         for (i, &dim) in self.axes_dim.iter().enumerate() {
@@ -47,16 +50,16 @@ impl Flux2PosEmbed {
                     1.0 / self.theta.powf(scale)
                 })
                 .collect();
-            let omega = Array::from_slice(&omega, &[1, 1, half as i32]);
-            // [batch, seq, 1] * [1, 1, half] -> [batch, seq, half]
+            // `[1, half]` broadcasts against `[…, 1]` → `[…, half]` for any leading rank.
+            let omega = Array::from_slice(&omega, &[1, half as i32]);
             let out = multiply(&axes[i], &omega)?;
             cos_parts.push(out.cos()?);
             sin_parts.push(out.sin()?);
         }
         let cos_refs: Vec<&Array> = cos_parts.iter().collect();
         let sin_refs: Vec<&Array> = sin_parts.iter().collect();
-        let cos = concatenate_axis(&cos_refs, 2)?;
-        let sin = concatenate_axis(&sin_refs, 2)?;
+        let cos = concatenate_axis(&cos_refs, last)?;
+        let sin = concatenate_axis(&sin_refs, last)?;
         Ok((cos, sin))
     }
 }

@@ -15,7 +15,9 @@ use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+use crate::config::Flux2Config;
 use crate::text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
+use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
 
 /// Qwen2 pad token id (`<|endoftext|>`).
@@ -51,4 +53,26 @@ pub fn load_text_encoder(root: &Path) -> Result<Qwen3TextEncoder> {
 pub fn load_vae(root: &Path) -> Result<Flux2Vae> {
     let w = Weights::from_dir(root.join("vae"))?;
     Flux2Vae::from_weights(&w)
+}
+
+/// Load the MMDiT transformer, applying the diffusers→internal renames (the fork's
+/// `Flux2WeightMapping`): the time embedding `time_guidance_embed.timestep_embedder.linear_{1,2}`
+/// → `time_guidance_embed.linear_{1,2}`, and each double block's Sequential
+/// `transformer_blocks.{i}.attn.to_out.0` → `to_out`. Everything else matches 1:1.
+pub fn load_transformer(root: &Path) -> Result<Flux2Transformer> {
+    let mut w = Weights::from_dir(root.join("transformer"))?;
+    let cfg = Flux2Config::klein_9b();
+    for n in ["linear_1", "linear_2"] {
+        w.alias(
+            &format!("time_guidance_embed.timestep_embedder.{n}.weight"),
+            &format!("time_guidance_embed.{n}.weight"),
+        );
+    }
+    for i in 0..cfg.num_double_layers {
+        w.alias(
+            &format!("transformer_blocks.{i}.attn.to_out.0.weight"),
+            &format!("transformer_blocks.{i}.attn.to_out.weight"),
+        );
+    }
+    Flux2Transformer::from_weights(&w, &cfg)
 }

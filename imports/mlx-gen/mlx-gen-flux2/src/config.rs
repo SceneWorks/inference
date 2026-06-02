@@ -111,6 +111,8 @@ pub struct Flux2Config {
     pub joint_attention_dim: usize,
     /// Single-block SwiGLU expansion ratio (mlp_hidden = mlp_ratio * inner_dim).
     pub mlp_ratio: f32,
+    /// Sinusoidal timestep-embedding width feeding `time_guidance_embed.linear_1` (klein: 256).
+    pub timestep_channels: usize,
 
     // --- 4-axis RoPE over ids (t, h, w, layer) ---
     pub axes_dim: [usize; 4],
@@ -140,6 +142,7 @@ impl Flux2Config {
             out_channels: 128,
             joint_attention_dim: 12288,
             mlp_ratio: 3.0,
+            timestep_channels: 256,
             axes_dim: [32, 32, 32, 32],
             rope_theta: 2000.0,
             te_hidden_size: 4096,
