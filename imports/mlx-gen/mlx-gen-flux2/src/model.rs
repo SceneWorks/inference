@@ -16,12 +16,13 @@ use mlx_gen::{
     default_seed, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
     ModelRegistration, Precision, Progress, Result, WeightsSource,
 };
-use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::Array;
 
 use crate::config::{Flux2Variant, DEFAULT_GUIDANCE};
 use crate::pipeline::{
-    create_noise, prepare_grid_ids, prepare_text_ids, schedule, timesteps_x1000,
+    create_noise, pack_latents, patchify_latents, prepare_grid_ids, prepare_text_ids,
+    preprocess_ref_image, schedule, timesteps_x1000,
 };
 use crate::text_encoder::Qwen3TextEncoder;
 use crate::transformer::Flux2Transformer;
@@ -143,6 +144,44 @@ impl Flux2 {
         let ids = prepare_text_ids(embeds.shape()[1] as usize);
         Ok((embeds, ids))
     }
+
+    /// Edit reference conditioning: resize → VAE-encode → patchify → BN-normalize → pack, plus the
+    /// grid ids at `t = 10` (the per-reference time offset). Returns `(image_latents [1,seq_ref,128],
+    /// image_latent_ids [1,seq_ref,4])`. Mirrors the fork's `prepare_reference_image_conditioning`.
+    fn encode_reference(
+        &self,
+        vae: &Flux2Vae,
+        image: &mlx_gen::media::Image,
+        width: u32,
+        height: u32,
+    ) -> Result<(Array, Array)> {
+        let pre = preprocess_ref_image(image, width, height)?; // NHWC [1,H,W,3]
+        let enc = vae.encode_mean(&pre)?; // NHWC [1,H/8,W/8,32]
+        let enc = enc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for the pipeline helpers
+        let enc = crop_to_even(&enc)?;
+        let patchified = patchify_latents(&enc)?; // [1,128,h,w]
+        let normed = vae.bn_normalize_nchw(&patchified)?;
+        let packed = pack_latents(&normed)?; // [1, seq_ref, 128]
+        let sh = patchified.shape();
+        let ids = prepare_grid_ids(sh[2] as usize, sh[3] as usize, 10);
+        Ok((packed, ids))
+    }
+}
+
+/// Crop a NCHW latent's spatial dims down to even (the fork's `crop_to_even_spatial`), so the 2×2
+/// patchify divides cleanly. A no-op at the standard multiple-of-16 sizes.
+fn crop_to_even(x: &Array) -> Result<Array> {
+    let sh = x.shape();
+    let mut x = x.clone();
+    if sh[2] % 2 != 0 {
+        let idx = Array::from_slice(&(0..sh[2] - 1).collect::<Vec<i32>>(), &[sh[2] - 1]);
+        x = x.take_axis(&idx, 2)?;
+    }
+    if sh[3] % 2 != 0 {
+        let idx = Array::from_slice(&(0..sh[3] - 1).collect::<Vec<i32>>(), &[sh[3] - 1]);
+        x = x.take_axis(&idx, 3)?;
+    }
+    Ok(x)
 }
 
 impl Generator for Flux2 {
@@ -160,16 +199,31 @@ impl Generator for Flux2 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        if self.variant.is_edit() {
-            return Err(Error::Msg(format!(
-                "{}: image-conditioned edit generation is S5",
-                self.descriptor.id
-            )));
-        }
         let (tokenizer, te, transformer, vae) = self.parts()?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(crate::config::DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+
+        // Edit: build the reference-image conditioning (single reference for this story; multi =
+        // sc-2645). The transformer sees the joint sequence `[txt, target, ref]`.
+        let reference = if self.variant.is_edit() {
+            let image = req
+                .conditioning
+                .iter()
+                .find_map(|c| match c {
+                    mlx_gen::Conditioning::Reference { image, .. } => Some(image),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "{}: edit requires a reference image",
+                        self.descriptor.id
+                    ))
+                })?;
+            Some(self.encode_reference(vae, image, req.width, req.height)?)
+        } else {
+            None
+        };
 
         let (prompt_embeds, text_ids) = self.encode(tokenizer, te, &req.prompt)?;
         // klein is distilled (guidance 1.0); CFG dual-forward only kicks in for base variants.
@@ -186,6 +240,23 @@ impl Generator for Flux2 {
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
         let in_channels = self.config.in_channels as i32;
 
+        // For an edit, the transformer's image input/ids are `[target, ref]`; its output keeps the
+        // image stream, of which we take the leading `target_seq` tokens. txt2img has no ref, so the
+        // concat + slice are no-ops.
+        let forward = |latents: &Array, embeds: &Array, ids: &Array, ts: f32| -> Result<Array> {
+            let target_seq = latents.shape()[1];
+            let (hidden, img_ids) = match &reference {
+                Some((ref_lat, ref_ids)) => (
+                    concatenate_axis(&[latents, ref_lat], 1)?,
+                    concatenate_axis(&[&latent_ids, ref_ids], 1)?,
+                ),
+                None => (latents.clone(), latent_ids.clone()),
+            };
+            let out = transformer.forward(&hidden, embeds, &img_ids, ids, ts)?;
+            let idx = Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
+            Ok(out.take_axis(&idx, 1)?)
+        };
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
@@ -194,12 +265,10 @@ impl Generator for Flux2 {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Msg("generation cancelled".into()));
                 }
-                let v =
-                    transformer.forward(&latents, &prompt_embeds, &latent_ids, &text_ids, ts)?;
+                let v = forward(&latents, &prompt_embeds, &text_ids, ts)?;
                 let v = match &negative {
                     Some((neg_embeds, neg_ids)) => {
-                        let vn =
-                            transformer.forward(&latents, neg_embeds, &latent_ids, neg_ids, ts)?;
+                        let vn = forward(&latents, neg_embeds, neg_ids, ts)?;
                         // noise = neg + guidance·(pos − neg)
                         add(&vn, &multiply(&subtract(&v, &vn)?, scalar(guidance))?)?
                     }

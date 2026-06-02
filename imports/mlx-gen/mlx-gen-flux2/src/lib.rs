@@ -34,7 +34,7 @@ pub use loader::{load_text_encoder, load_tokenizer, load_transformer, load_vae};
 pub use model::{descriptor_klein_9b, descriptor_klein_9b_edit, load_klein_9b, load_klein_9b_edit};
 pub use pipeline::{
     create_noise, image_seq_len, pack_latents, patchify_latents, prepare_grid_ids,
-    prepare_text_ids, schedule, timesteps_x1000, unpack_latents,
+    prepare_text_ids, preprocess_ref_image, schedule, timesteps_x1000, unpack_latents,
 };
 pub use pos_embed::Flux2PosEmbed;
 pub use text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};

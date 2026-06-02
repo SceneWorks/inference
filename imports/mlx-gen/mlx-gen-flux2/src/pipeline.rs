@@ -7,6 +7,8 @@
 //! → **pack** to the transformer token sequence `[1, (height/16)·(width/16), 128]`. txt2img
 //! samples noise directly in the packed 128-channel space.
 
+use mlx_gen::image::resize_lanczos_u8;
+use mlx_gen::media::Image;
 use mlx_gen::{Error, FlowMatchEuler, Result};
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::{random, Array};
@@ -130,6 +132,28 @@ pub fn timesteps_x1000(schedule: &FlowMatchEuler) -> Vec<f32> {
         .iter()
         .map(|s| s * 1000.0)
         .collect()
+}
+
+/// Preprocess a reference image for the edit path: PIL-LANCZOS resize to `target_width ×
+/// target_height` (no-op when already sized), normalize `[0,255] → [-1,1]`, lay out as **NHWC**
+/// `[1, H, W, 3]` f32 — the input the FLUX.2 VAE encoder expects. Mirrors the fork's
+/// `ImageUtil.scale_to_dimensions` + `to_array` (`2·x − 1`).
+pub fn preprocess_ref_image(image: &Image, target_width: u32, target_height: u32) -> Result<Array> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    let (tw, th) = (target_width as usize, target_height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(Error::Msg(format!(
+            "flux2 ref image pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    let resized: Vec<f32> = if (ih, iw) == (th, tw) {
+        image.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+    };
+    let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
+    Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))
 }
 
 /// img2img / edit noise blend: `(1 - sigma)·clean + sigma·noise` at the start sigma.

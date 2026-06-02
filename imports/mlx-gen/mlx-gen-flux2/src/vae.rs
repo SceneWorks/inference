@@ -369,13 +369,18 @@ impl Flux2Vae {
         Ok(moments.take_axis(&idx, 3)?)
     }
 
-    /// Forward BatchNorm-stats normalization of a patchified `[B, h, w, 128]` latent (the inverse
-    /// of `decode_packed_latents`' de-normalize): `(x - mean) / std`. Used by img2img / edit.
-    pub fn bn_normalize(&self, patchified: &Array) -> Result<Array> {
+    /// Forward BatchNorm-stats normalization of a **NCHW** patchified `[B, 128, h, w]` latent (the
+    /// inverse of `decode_packed_latents`' de-normalize): `(x - mean) / std`, the fork's
+    /// `bn_normalize_vae_encoded_latents`. Used by edit / img2img to normalize the reference VAE
+    /// latent into the transformer's packed space.
+    pub fn bn_normalize_nchw(&self, patchified: &Array) -> Result<Array> {
+        let c = self.bn_mean.shape()[0];
+        let mean = self.bn_mean.reshape(&[1, c, 1, 1])?;
+        let std = self.bn_std.reshape(&[1, c, 1, 1])?;
         let x = patchified.as_dtype(Dtype::Float32)?;
         Ok(mlx_rs::ops::divide(
-            &mlx_rs::ops::subtract(&x, &self.bn_mean)?,
-            &self.bn_std,
+            &mlx_rs::ops::subtract(&x, &mean)?,
+            &std,
         )?)
     }
 }
