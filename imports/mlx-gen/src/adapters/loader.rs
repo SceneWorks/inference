@@ -6,11 +6,18 @@
 //! carries `networkType=lokr` + `alpha`/`rank` in safetensors metadata, so the delta and
 //! target path are fully determined by the file — no per-model mapping table.
 //!
-//! **LoRA** here covers the PEFT bare-path convention (`‹prefix›‹path›.lora_A/B.weight` +
-//! optional `‹path›.alpha`). The fork's *other* LoRA path — remapping diffusers/kohya key
-//! conventions through per-model `LoRATarget` pattern tables — is model-specific and lands
-//! with each model port (per ARCHITECTURE.md: model-specific orchestration lives with the
-//! model), not in this generic framework.
+//! **LoRA** here covers two on-disk conventions, both family-agnostic:
+//! - **PEFT/diffusers** (`‹prefix›‹path›.lora_A/B.weight` + optional `‹path›.alpha`): dotted module
+//!   paths resolve directly via [`AdaptableHost::adaptable_mut`] ([`apply_lora_peft`]).
+//! - **kohya / sd-scripts** (`lora_unet_‹path, .→_›.lora_down/up.weight` + optional `.alpha`,
+//!   sc-2618): the flattened module path can't be re-split blindly, so it resolves through a
+//!   `flattened → dotted` table built from [`AdaptableHost::adaptable_paths`]
+//!   ([`apply_lora_kohya`]). kohya `lora_down`/`lora_up` == PEFT `lora_A`/`lora_B`, so both feed the
+//!   shared [`install_lora_groups`] and a kohya file yields the identical adapter to its PEFT twin.
+//!
+//! The fork's third, model-specific LoRA path — fused→split key transforms (FLUX.2/FLUX.1 BFL/ComfyUI
+//! `double_blocks_*` qkv split) — is a distinct format tracked as sc-2743; its keys surface as
+//! unmatched here (loud), never silently dropped.
 
 use std::collections::BTreeMap;
 
@@ -157,6 +164,20 @@ pub fn apply_lora_peft(
         }
     }
 
+    install_lora_groups(host, groups, scale)
+}
+
+/// Install grouped `(down=A, up=B, alpha)` LoRA factors onto `host`, one residual per resolved module
+/// path. Shared by the PEFT/diffusers loader ([`apply_lora_peft`]) and the kohya loader
+/// ([`apply_lora_kohya`]): both conventions agree on the math (`A: [r,in]`, `B: [out,r]`, transpose to
+/// the residual form `x·A·B`, fold `alpha/rank` into `B`) and differ only in how keys map to `path`.
+/// A path with a missing `down` or `up` half is skipped (its partner targeted a non-LoRA key);
+/// a path that resolves to no module is surfaced in `unmatched_paths`, never silently dropped.
+fn install_lora_groups(
+    host: &mut impl AdaptableHost,
+    groups: BTreeMap<String, LoraParts>,
+    scale: f32,
+) -> Result<ApplyReport> {
     let mut report = ApplyReport::default();
     for (path, parts) in groups {
         let (Some(a_raw), Some(b_raw)) = (parts.a, parts.b) else {
@@ -185,6 +206,92 @@ struct LoraParts {
     a: Option<Array>,
     b: Option<Array>,
     alpha: Option<f32>,
+}
+
+/// kohya / sd-scripts key prefix: the trained diffusers module path with dots flattened to
+/// underscores, denominated under the denoiser as `lora_unet_…`.
+pub const KOHYA_PREFIX: &str = "lora_unet_";
+
+/// kohya factor suffixes mapped to a [`LoraParts`] role. `lora_down`==PEFT `lora_A`,
+/// `lora_up`==PEFT `lora_B`; the optional `.default` infix is the peft-export form some kohya
+/// converters emit. Order is irrelevant (exact-suffix match).
+const KOHYA_SUFFIXES: [(&str, KohyaRole); 5] = [
+    (".lora_down.weight", KohyaRole::Down),
+    (".lora_up.weight", KohyaRole::Up),
+    (".lora_down.default.weight", KohyaRole::Down),
+    (".lora_up.default.weight", KohyaRole::Up),
+    (".alpha", KohyaRole::Alpha),
+];
+
+#[derive(Clone, Copy)]
+enum KohyaRole {
+    Down,
+    Up,
+    Alpha,
+}
+
+/// `true` if `w` is a kohya-format LoRA — any key carries the `lora_unet_` prefix. (kohya files are
+/// the only convention that flattens the module path; PEFT/diffusers keep dots, LoKr is bare.)
+pub fn is_kohya(w: &Weights) -> bool {
+    w.keys().any(|k| k.starts_with(KOHYA_PREFIX))
+}
+
+/// Build the kohya `flattened-stem → dotted-path` lookup from a host's routable target paths
+/// (`AdaptableHost::adaptable_paths`). The stem is the dotted path with `.`→`_` (the kohya
+/// flattening), WITHOUT the `lora_unet_` prefix. Mirrors the SDXL matcher (sc-2639) and the fork's
+/// explicit `lora_unet_…` patterns, generalized over any [`AdaptableHost`].
+fn kohya_table(paths: &[String]) -> BTreeMap<String, String> {
+    paths
+        .iter()
+        .map(|p| (p.replace('.', "_"), p.clone()))
+        .collect()
+}
+
+/// Install a kohya-format LoRA (`lora_unet_<flattened path>.lora_down/up.weight` + optional `.alpha`)
+/// onto `host`. The flattened stem is resolved against `table` (built from
+/// [`AdaptableHost::adaptable_paths`]) — blind `_`→`.` splitting is impossible because module names
+/// contain underscores (`to_out.0`, `feed_forward.w1`, `img_mlp.net.0.proj`). Resolved factors are
+/// installed through the same [`install_lora_groups`] path as PEFT, so a kohya file produces the
+/// identical adapter to the equivalent PEFT file.
+///
+/// `lora_unet_` keys whose stem is NOT in the table (off-surface, or a fused→split convention like
+/// FLUX.2's BFL `double_blocks_*` — sc-2743) are surfaced in `unmatched_paths` so the strict policy
+/// fails loudly rather than silently dropping them. Keys without the `lora_unet_` prefix (e.g. a
+/// bundled text-encoder `lora_te_…`) are not denoiser targets and are ignored, matching the PEFT
+/// loader's treatment of keys outside its namespace.
+pub fn apply_lora_kohya(
+    host: &mut impl AdaptableHost,
+    w: &Weights,
+    scale: f32,
+    table: &BTreeMap<String, String>,
+) -> Result<ApplyReport> {
+    let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
+    let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
+        let Some(rem) = key.strip_prefix(KOHYA_PREFIX) else {
+            continue; // not a denoiser kohya key (e.g. text-encoder `lora_te_…`) — ignore.
+        };
+        let Some((stem, role)) = KOHYA_SUFFIXES
+            .iter()
+            .find_map(|(suf, role)| rem.strip_suffix(suf).map(|s| (s, *role)))
+        else {
+            continue; // a `lora_unet_` key with an unrecognized suffix — ignore.
+        };
+        let Some(path) = table.get(stem) else {
+            unresolved.insert(stem.to_string());
+            continue;
+        };
+        let parts = groups.entry(path.clone()).or_default();
+        match role {
+            KohyaRole::Down => parts.a = Some(w.require(&key)?.clone()),
+            KohyaRole::Up => parts.b = Some(w.require(&key)?.clone()),
+            KohyaRole::Alpha => parts.alpha = w.require(&key)?.as_slice::<f32>().first().copied(),
+        }
+    }
+
+    let mut report = install_lora_groups(host, groups, scale)?;
+    report.unmatched_paths.extend(unresolved);
+    Ok(report)
 }
 
 /// Load and install every adapter in `specs` onto `host`, stacking in order. Each spec's file is
@@ -225,10 +332,11 @@ pub fn apply_adapter_specs(
 }
 
 /// LoRA key namespace prefixes diffusers/peft adapter files use, tried in order; the first that any
-/// key begins with is stripped. LoKr files are bare (no prefix). (kohya `lora_unet_…_` underscore
-/// files flatten the module dots to underscores → they need an explicit per-target pattern matcher,
-/// not path-splitting; tracked as sc-2618.) SceneWorks' trained LoRAs use `transformer.` (peft
-/// `save_lora_weights`) or `diffusion_model.` (sd-scripts export) — both observed on real files.
+/// key begins with is stripped. LoKr files are bare (no prefix). kohya `lora_unet_…` files flatten
+/// the module dots to underscores and resolve through a separate flattened→dotted table
+/// ([`apply_lora_kohya`], sc-2618), not this prefix strip. SceneWorks' trained LoRAs use
+/// `transformer.` (peft `save_lora_weights`) or `diffusion_model.` (sd-scripts export) — both
+/// observed on real files.
 pub const COMMON_LORA_PREFIXES: [&str; 2] = ["transformer.", "diffusion_model."];
 
 /// The LoRA namespace prefix present in `w`'s keys, if any (see [`COMMON_LORA_PREFIXES`]).
@@ -248,15 +356,27 @@ pub fn apply_adapter_specs_autoprefix(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
 ) -> Result<ApplyReport> {
+    // The kohya `flattened → dotted` table walks the model tree, so build it lazily and only once,
+    // the first time a kohya file is seen across `specs`.
+    let mut kohya: Option<BTreeMap<String, String>> = None;
     let mut combined = ApplyReport::default();
     for spec in specs {
         let w = Weights::from_file(&spec.path)?;
-        let prefix = if is_lokr(&w) {
-            None
+        let report = if !is_lokr(&w) && is_kohya(&w) {
+            // kohya LoRA: dots are flattened to underscores, so keys resolve through the table
+            // rather than the prefix-strip path. (LoKr keeps dotted paths; checked first.)
+            if kohya.is_none() {
+                kohya = Some(kohya_table(&host.adaptable_paths()));
+            }
+            apply_lora_kohya(host, &w, spec.scale, kohya.as_ref().unwrap())?
         } else {
-            detect_lora_prefix(&w)
+            let prefix = if is_lokr(&w) {
+                None
+            } else {
+                detect_lora_prefix(&w)
+            };
+            apply_adapter_specs(host, std::slice::from_ref(spec), prefix)?
         };
-        let report = apply_adapter_specs(host, std::slice::from_ref(spec), prefix)?;
         combined.applied += report.applied;
         combined.unmatched_paths.extend(report.unmatched_paths);
     }
@@ -277,8 +397,8 @@ pub fn apply_adapters_strict(
     if !specs.is_empty() && report.applied == 0 {
         return Err(format!(
             "{model} adapters: no target modules matched across {} adapter file(s) — check the \
-             format/prefix (expected diffusers/peft LoRA or LoKr keys; kohya `lora_unet_` files are \
-             not yet supported, sc-2618)",
+             format/prefix (expected diffusers/peft LoRA, kohya `lora_unet_` LoRA, or LoKr keys; \
+             a kohya file with only fused→split BFL keys — FLUX.2 `double_blocks_*` — is sc-2743)",
             specs.len()
         )
         .into());
@@ -300,9 +420,37 @@ mod tests {
     use super::*;
     use crate::adapters::{AdaptableLinear, Adapter};
     use crate::runtime::{AdapterKind, AdapterSpec};
-    use mlx_rs::ops::all_close;
+    use mlx_rs::ops::{all_close, array_eq};
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    /// A host whose modules live at arbitrary dotted paths — including segment names with internal
+    /// underscores (`feed_forward`, `to_out.0`) so the kohya flattening is genuinely ambiguous and a
+    /// blind `_`→`.` split would mis-route. `adaptable_paths` returns the registered paths, so it
+    /// exercises the real `flattened → dotted` table path.
+    struct MultiHost {
+        mods: HashMap<String, AdaptableLinear>,
+        paths: Vec<String>,
+    }
+    impl MultiHost {
+        fn new(specs: &[(&str, Array)]) -> Self {
+            let mut mods = HashMap::new();
+            let mut paths = Vec::new();
+            for (p, w) in specs {
+                mods.insert((*p).to_string(), AdaptableLinear::dense(w.clone(), None));
+                paths.push((*p).to_string());
+            }
+            Self { mods, paths }
+        }
+    }
+    impl AdaptableHost for MultiHost {
+        fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+            self.mods.get_mut(&path.join("."))
+        }
+        fn adaptable_paths(&self) -> Vec<String> {
+            self.paths.clone()
+        }
+    }
 
     /// Minimal host with a single adaptable linear at path `["lin"]`.
     struct OneLinear {
@@ -718,5 +866,230 @@ mod tests {
             kind: AdapterKind::Lora,
         }];
         assert!(apply_adapters_strict(&mut host2, &specs2, "test").is_err());
+    }
+
+    // ---- kohya `lora_unet_` LoRA (sc-2618) ----
+
+    /// Two modules whose flattened kohya stems are ambiguous under a blind `_`→`.` split: the
+    /// segment `to_out.0` and the segment name `feed_forward` both contain the separator char.
+    fn kohya_two_module_host() -> MultiHost {
+        let w_out = Array::from_slice(
+            &(0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            &[4, 3],
+        );
+        let w_ff = Array::from_slice(
+            &(0..15).map(|i| i as f32 * 0.07).collect::<Vec<_>>(),
+            &[5, 3],
+        );
+        MultiHost::new(&[
+            ("blocks.0.attn.to_out.0", w_out),
+            ("blocks.0.feed_forward.w1", w_ff),
+        ])
+    }
+
+    /// The same (down, up, alpha) factors written in BOTH conventions and applied through the
+    /// provider seam must yield byte-identical adapters — a kohya file is interchangeable with its
+    /// PEFT twin. This is the sc-2618 gate at the core level (no model weights needed).
+    #[test]
+    fn kohya_equiv_to_peft_bit_exact() {
+        // out=4/in=3 and out=5/in=3, rank=2; alpha=4 (≠ rank → exercises the alpha/rank fold).
+        let a_out = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]); // [r,in]
+        let b_out = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]); // [out,r]
+        let a_ff = Array::from_slice(&[0.05f32, -0.15, 0.2, 0.3, -0.25, 0.1], &[2, 3]);
+        let b_ff = Array::from_slice(
+            &[0.2f32, -0.2, 0.1, 0.3, -0.1, 0.4, 0.15, -0.35, 0.05, 0.25],
+            &[5, 2],
+        );
+        let alpha = Array::from_slice(&[4.0f32], &[1]);
+
+        let kohya_path = tmp("equiv_kohya.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("lora_unet_blocks_0_attn_to_out_0.lora_down.weight", &a_out),
+                ("lora_unet_blocks_0_attn_to_out_0.lora_up.weight", &b_out),
+                ("lora_unet_blocks_0_attn_to_out_0.alpha", &alpha),
+                ("lora_unet_blocks_0_feed_forward_w1.lora_down.weight", &a_ff),
+                ("lora_unet_blocks_0_feed_forward_w1.lora_up.weight", &b_ff),
+                ("lora_unet_blocks_0_feed_forward_w1.alpha", &alpha),
+            ],
+            None as Option<&HashMap<String, String>>,
+            &kohya_path,
+        )
+        .unwrap();
+
+        let peft_path = tmp("equiv_peft.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("transformer.blocks.0.attn.to_out.0.lora_A.weight", &a_out),
+                ("transformer.blocks.0.attn.to_out.0.lora_B.weight", &b_out),
+                ("transformer.blocks.0.attn.to_out.0.alpha", &alpha),
+                ("transformer.blocks.0.feed_forward.w1.lora_A.weight", &a_ff),
+                ("transformer.blocks.0.feed_forward.w1.lora_B.weight", &b_ff),
+                ("transformer.blocks.0.feed_forward.w1.alpha", &alpha),
+            ],
+            None as Option<&HashMap<String, String>>,
+            &peft_path,
+        )
+        .unwrap();
+
+        let mut via_kohya = kohya_two_module_host();
+        let rep_k = apply_adapters_strict(
+            &mut via_kohya,
+            &[AdapterSpec {
+                path: kohya_path,
+                scale: 0.75,
+                kind: AdapterKind::Lora,
+            }],
+            "test",
+        )
+        .unwrap();
+        assert_eq!(rep_k.applied, 2, "both kohya modules resolve");
+
+        let mut via_peft = kohya_two_module_host();
+        apply_adapters_strict(
+            &mut via_peft,
+            &[AdapterSpec {
+                path: peft_path,
+                scale: 0.75,
+                kind: AdapterKind::Lora,
+            }],
+            "test",
+        )
+        .unwrap();
+
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        for p in ["blocks.0.attn.to_out.0", "blocks.0.feed_forward.w1"] {
+            let gk = via_kohya.mods.get(p).unwrap().forward(&x).unwrap();
+            let gp = via_peft.mods.get(p).unwrap().forward(&x).unwrap();
+            assert!(
+                array_eq(&gk, &gp, false).unwrap().item::<bool>(),
+                "kohya and peft adapters diverged at {p}"
+            );
+            // And both actually moved off the bare base.
+            let base = AdaptableLinear::dense(
+                via_kohya
+                    .mods
+                    .get(p)
+                    .unwrap()
+                    .dense_weight()
+                    .unwrap()
+                    .0
+                    .clone(),
+                None,
+            )
+            .forward(&x)
+            .unwrap();
+            assert!(
+                !array_eq(&gk, &base, false).unwrap().item::<bool>(),
+                "adapter at {p} was a no-op"
+            );
+        }
+    }
+
+    /// The flattened stem `blocks_0_feed_forward_w1` must resolve to `blocks.0.feed_forward.w1`
+    /// (the table), NOT the blind split `blocks.0.feed.forward.w1` — proving the disambiguation does
+    /// real work.
+    #[test]
+    fn kohya_table_disambiguates_underscore_segment_names() {
+        let mut host = kohya_two_module_host();
+        // The blind `_`→`.` split target does not exist; the correct dotted path does.
+        assert!(host
+            .adaptable_mut(&["blocks", "0", "feed", "forward", "w1"])
+            .is_none());
+        assert!(host
+            .adaptable_mut(&["blocks", "0", "feed_forward", "w1"])
+            .is_some());
+
+        let table = kohya_table(&host.adaptable_paths());
+        assert_eq!(
+            table.get("blocks_0_feed_forward_w1").map(String::as_str),
+            Some("blocks.0.feed_forward.w1")
+        );
+        assert_eq!(
+            table.get("blocks_0_attn_to_out_0").map(String::as_str),
+            Some("blocks.0.attn.to_out.0")
+        );
+    }
+
+    /// A `lora_unet_` key whose stem is off-surface (e.g. FLUX.2 BFL `double_blocks_*`, sc-2743) is
+    /// surfaced in `unmatched_paths` and fails the strict policy — loud, never silently dropped.
+    #[test]
+    fn kohya_offsurface_stem_surfaced_and_strict_errors() {
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
+        let path = tmp("kohya_offsurface.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight",
+                    &a,
+                ),
+                ("lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight", &b),
+            ],
+            None as Option<&HashMap<String, String>>,
+            &path,
+        )
+        .unwrap();
+
+        let mut host = kohya_two_module_host();
+        let table = kohya_table(&host.adaptable_paths());
+        let report =
+            apply_lora_kohya(&mut host, &Weights::from_file(&path).unwrap(), 1.0, &table).unwrap();
+        assert_eq!(report.applied, 0);
+        assert_eq!(
+            report.unmatched_paths,
+            vec!["double_blocks_0_img_attn_qkv".to_string()]
+        );
+
+        // Through the strict provider seam it is a hard error.
+        let mut host2 = kohya_two_module_host();
+        assert!(apply_adapters_strict(
+            &mut host2,
+            &[AdapterSpec {
+                path,
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+            }],
+            "test",
+        )
+        .is_err());
+    }
+
+    /// A kohya adapter at `scale = 0` is a bit-exact no-op (the scale-0 invariant), and `is_kohya`
+    /// detects the format.
+    #[test]
+    fn kohya_scale_zero_is_bit_exact_noop() {
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
+        let path = tmp("kohya_scale0.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("lora_unet_blocks_0_attn_to_out_0.lora_down.weight", &a),
+                ("lora_unet_blocks_0_attn_to_out_0.lora_up.weight", &b),
+            ],
+            None as Option<&HashMap<String, String>>,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+        assert!(is_kohya(&w));
+
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let mut host = kohya_two_module_host();
+        let base = host
+            .mods
+            .get("blocks.0.attn.to_out.0")
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        let table = kohya_table(&host.adaptable_paths());
+        apply_lora_kohya(&mut host, &w, 0.0, &table).unwrap();
+        let out = host
+            .mods
+            .get("blocks.0.attn.to_out.0")
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        assert!(array_eq(&out, &base, false).unwrap().item::<bool>());
     }
 }

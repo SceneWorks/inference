@@ -10,7 +10,7 @@ use mlx_rs::{
 
 use crate::attention::ZImageAttention;
 use crate::feed_forward::FeedForward;
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -111,5 +111,12 @@ impl AdaptableHost for ZImageTransformerBlock {
             ["adaLN_modulation", "0"] => Some(&mut self.ada_ln),
             _ => None,
         }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = vec!["adaLN_modulation.0".to_string()];
+        out.extend(prefixed_paths("attention", &self.attention));
+        out.extend(prefixed_paths("feed_forward", &self.feed_forward));
+        out
     }
 }

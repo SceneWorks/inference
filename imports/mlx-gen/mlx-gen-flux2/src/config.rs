@@ -53,13 +53,17 @@ impl Flux2Variant {
     }
 
     pub fn descriptor(self) -> ModelDescriptor {
-        // Scope of THIS story (sc-2346): txt2img + single-reference edit. Sibling stories extend
-        // the surface: txt2img img2img adds `Reference` (sc-2644), edit adds `MultiReference`
-        // (sc-2645). Advertise what this port delivers, no more, no less.
+        // Conditioning surface by variant: the edit variant consumes one `Reference` (single image,
+        // token concat, sc-2346) or one `MultiReference` (N images, sc-2645); txt2img consumes a
+        // single `Reference` as an **img2img** init image seeding the latents via the noise blend
+        // (sc-2644). Advertise what this port delivers, no more, no less.
         let conditioning = if self.is_edit() {
-            vec![ConditioningKind::Reference]
+            vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
+            ]
         } else {
-            Vec::new()
+            vec![ConditioningKind::Reference]
         };
         ModelDescriptor {
             id: self.id(),
@@ -73,9 +77,10 @@ impl Flux2Variant {
                 supports_guidance: true,
                 supports_true_cfg: false,
                 conditioning,
-                // Transformer-only LoRA/LoKr is a separable capability (sc-2646); not in S0.
-                supports_lora: false,
-                supports_lokr: false,
+                // Transformer-only LoRA/LoKr (sc-2646): both variants share the `Flux2Transformer`,
+                // which hosts the adapters; the VAE + Qwen3 TE are not adapter targets.
+                supports_lora: true,
+                supports_lokr: true,
                 samplers: Vec::new(),
                 schedulers: vec!["flow_match_euler"],
                 min_size: 256,

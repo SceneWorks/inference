@@ -19,7 +19,7 @@ use super::final_layer::FinalLayer;
 use super::rope_embedder::RopeEmbedder;
 use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -373,5 +373,26 @@ impl AdaptableHost for ZImageTransformer {
             ["all_final_layer", _, rest @ ..] => self.final_layer.adaptable_mut(rest),
             _ => None,
         }
+    }
+
+    /// kohya-reachable targets (sc-2618): the block-indexed layer targets across all three layer
+    /// types, in trained-file naming. Globals (`all_x_embedder`/`cap_embedder`/`t_embedder`/
+    /// `all_final_layer`) are excluded — the fork's `ZImageLoRAMapping` carries no `lora_unet_`
+    /// pattern for them (and the patch-size wildcard would make the flattening ambiguous); they stay
+    /// reachable via the dotted diffusers/peft form.
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // `layers` + `noise_refiner` are transformer blocks (with `adaLN_modulation.0`);
+        // `context_refiner` blocks have no adaLN — each block enumerates its own leaves.
+        for (i, b) in self.layers.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("layers.{i}"), b));
+        }
+        for (i, b) in self.noise_refiner.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("noise_refiner.{i}"), b));
+        }
+        for (i, b) in self.context_refiner.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("context_refiner.{i}"), b));
+        }
+        out
     }
 }

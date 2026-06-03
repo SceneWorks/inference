@@ -146,6 +146,16 @@ impl UNetBlock2D {
             }
         }
     }
+
+    /// Emit this block's GEGLU feed-forward LoRA targets (sc-2671 complete coverage) — the FF of
+    /// each cross-attention transformer, beyond the vendored-reachable surface.
+    pub fn lora_target_paths_ff(&self, prefix: &str, out: &mut Vec<String>) {
+        if let Some(attns) = &self.attentions {
+            for (j, a) in attns.iter().enumerate() {
+                a.lora_target_paths_ff(&format!("{prefix}.attentions.{j}"), out);
+            }
+        }
+    }
 }
 
 impl AdaptableHost for UNetBlock2D {
