@@ -53,11 +53,15 @@ impl Flux2Variant {
     }
 
     pub fn descriptor(self) -> ModelDescriptor {
-        // Scope of THIS story (sc-2346): txt2img + single-reference edit. Sibling stories extend
-        // the surface: txt2img img2img adds `Reference` (sc-2644), edit adds `MultiReference`
-        // (sc-2645). Advertise what this port delivers, no more, no less.
+        // Edit consumes one `Reference` (single image) or one `MultiReference` (N images, sc-2645);
+        // both flow in as appended reference tokens with per-image t-offset ids. txt2img has no
+        // conditioning surface here (img2img `Reference` is sc-2644). Advertise what this port
+        // delivers, no more, no less.
         let conditioning = if self.is_edit() {
-            vec![ConditioningKind::Reference]
+            vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
+            ]
         } else {
             Vec::new()
         };

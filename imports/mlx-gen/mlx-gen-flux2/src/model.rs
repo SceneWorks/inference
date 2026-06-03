@@ -160,26 +160,68 @@ impl Flux2 {
         Ok((embeds, ids))
     }
 
-    /// Edit reference conditioning: resize → VAE-encode → patchify → BN-normalize → pack, plus the
-    /// grid ids at `t = 10` (the per-reference time offset). Returns `(image_latents [1,seq_ref,128],
-    /// image_latent_ids [1,seq_ref,4])`. Mirrors the fork's `prepare_reference_image_conditioning`.
-    fn encode_reference(
+    /// Edit reference conditioning for **N** images (the fork's `prepare_reference_image_conditioning`):
+    /// each image → resize → VAE-encode → crop-to-even → 2×2 patchify → BN-normalize → pack, tagged
+    /// with grid ids at `t = 10 + 10·i` (the per-reference time offset), then all refs concatenated
+    /// on the sequence axis. Returns `(image_latents [1, Σseq_ref, 128], image_latent_ids
+    /// [1, Σseq_ref, 4])`. A single reference (N = 1) reduces to the original `t = 10` path. The
+    /// FLUX.2 text encoder is a dense Qwen3 LLM with no vision input, so the prompt embeds are
+    /// independent of the references — multi-image conditioning flows ONLY through these tokens.
+    fn encode_references(
         &self,
         vae: &Flux2Vae,
-        image: &mlx_gen::media::Image,
+        images: &[&mlx_gen::media::Image],
         width: u32,
         height: u32,
     ) -> Result<(Array, Array)> {
-        let pre = preprocess_ref_image(image, width, height)?; // NHWC [1,H,W,3]
-        let enc = vae.encode_mean(&pre)?; // NHWC [1,H/8,W/8,32]
-        let enc = enc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for the pipeline helpers
-        let enc = crop_to_even(&enc)?;
-        let patchified = patchify_latents(&enc)?; // [1,128,h,w]
-        let normed = vae.bn_normalize_nchw(&patchified)?;
-        let packed = pack_latents(&normed)?; // [1, seq_ref, 128]
-        let sh = patchified.shape();
-        let ids = prepare_grid_ids(sh[2] as usize, sh[3] as usize, 10);
-        Ok((packed, ids))
+        let mut packed: Vec<Array> = Vec::with_capacity(images.len());
+        let mut ids: Vec<Array> = Vec::with_capacity(images.len());
+        for (i, image) in images.iter().enumerate() {
+            let pre = preprocess_ref_image(image, width, height)?; // NHWC [1,H,W,3]
+            let enc = vae.encode_mean(&pre)?; // NHWC [1,H/8,W/8,32]
+            let enc = enc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for the pipeline helpers
+            let enc = crop_to_even(&enc)?;
+            let patchified = patchify_latents(&enc)?; // [1,128,h,w]
+            let normed = vae.bn_normalize_nchw(&patchified)?;
+            let sh = patchified.shape();
+            packed.push(pack_latents(&normed)?); // [1, seq_ref, 128]
+            ids.push(prepare_grid_ids(
+                sh[2] as usize,
+                sh[3] as usize,
+                10 + 10 * i as i32,
+            ));
+        }
+        let packed_refs: Vec<&Array> = packed.iter().collect();
+        let id_refs: Vec<&Array> = ids.iter().collect();
+        Ok((
+            concatenate_axis(&packed_refs, 1)?,
+            concatenate_axis(&id_refs, 1)?,
+        ))
+    }
+
+    /// Collect the ordered edit reference images from the request: a single `Reference`, a
+    /// `MultiReference { images }` (N images, sc-2645), or several `Reference`s — flattened in
+    /// conditioning order then image order (the fork passes a flat `image_paths` list). At least
+    /// one reference is required.
+    fn collect_edit_references<'a>(
+        &self,
+        req: &'a GenerationRequest,
+    ) -> Result<Vec<&'a mlx_gen::media::Image>> {
+        let mut refs: Vec<&mlx_gen::media::Image> = Vec::new();
+        for c in &req.conditioning {
+            match c {
+                mlx_gen::Conditioning::Reference { image, .. } => refs.push(image),
+                mlx_gen::Conditioning::MultiReference { images } => refs.extend(images.iter()),
+                _ => {}
+            }
+        }
+        if refs.is_empty() {
+            return Err(Error::Msg(format!(
+                "{}: edit requires at least one reference image",
+                self.descriptor.id
+            )));
+        }
+        Ok(refs)
     }
 }
 
@@ -219,23 +261,12 @@ impl Generator for Flux2 {
         let steps = req.steps.unwrap_or(crate::config::DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
 
-        // Edit: build the reference-image conditioning (single reference for this story; multi =
-        // sc-2645). The transformer sees the joint sequence `[txt, target, ref]`.
+        // Edit: build the reference-image conditioning from one `Reference` or one `MultiReference`
+        // (sc-2645). The transformer sees the joint sequence `[txt, target, ref0, ref1, …]`; its
+        // output keeps the leading `target_seq` image tokens.
         let reference = if self.variant.is_edit() {
-            let image = req
-                .conditioning
-                .iter()
-                .find_map(|c| match c {
-                    mlx_gen::Conditioning::Reference { image, .. } => Some(image),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    Error::Msg(format!(
-                        "{}: edit requires a reference image",
-                        self.descriptor.id
-                    ))
-                })?;
-            Some(self.encode_reference(vae, image, req.width, req.height)?)
+            let images = self.collect_edit_references(req)?;
+            Some(self.encode_references(vae, &images, req.width, req.height)?)
         } else {
             None
         };
@@ -441,6 +472,48 @@ mod tests {
             ..Default::default()
         };
         model.validate(&req).unwrap();
+        assert_eq!(model.collect_edit_references(&req).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn edit_accepts_multi_reference() {
+        // sc-2645: N reference images via `MultiReference`, flattened in order.
+        let model = Flux2::new_for_tests(Flux2Variant::Klein9bEdit);
+        let req = GenerationRequest {
+            prompt: "combine these".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![Image::default(), Image::default(), Image::default()],
+            }],
+            ..Default::default()
+        };
+        model.validate(&req).unwrap();
+        assert_eq!(model.collect_edit_references(&req).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn edit_without_reference_errors() {
+        let model = Flux2::new_for_tests(Flux2Variant::Klein9bEdit);
+        let req = GenerationRequest {
+            prompt: "make it night".into(),
+            ..Default::default()
+        };
+        let err = model.collect_edit_references(&req).unwrap_err().to_string();
+        assert!(err.contains("at least one reference image"));
+    }
+
+    #[test]
+    fn txt2img_rejects_multi_reference() {
+        // Multi-image editing belongs to the edit variant, not txt2img.
+        let model = Flux2::new_for_tests(Flux2Variant::Klein9b);
+        let req = GenerationRequest {
+            prompt: "x".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![Image::default(), Image::default()],
+            }],
+            ..Default::default()
+        };
+        let err = model.validate(&req).unwrap_err().to_string();
+        assert!(err.contains("conditioning"));
     }
 
     #[test]
