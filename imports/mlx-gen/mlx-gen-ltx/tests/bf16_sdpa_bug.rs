@@ -1,14 +1,16 @@
-//! Tripwire for a pmetal bf16 **fused-SDPA** bug (sibling of the bf16-GEMM bug, sc-2714).
+//! Diagnostic for a pmetal bf16 **fused-SDPA** bug (sibling of the bf16-GEMM bug, sc-2714).
 //!
-//! On the pinned NAX build, `mlx::fast::scaled_dot_product_attention` with **bf16** q/k/v and
+//! On the **local NAX build**, `mlx::fast::scaled_dot_product_attention` with **bf16** q/k/v and
 //! `mask=None` at the connector's shape `(1, 32, 128, 128)` (head_dim 128) returns GARBAGE
 //! (≈1.0 mean-relative vs the f32 result) — while bf16 matmul (sc-2714) and bf16 *masked* SDPA
 //! (the Gemma path) are correct. So `mlx-gen-ltx::connector` runs its SDPA in f32 (upcast q/k/v,
-//! cast back) to dodge it.
+//! cast back). The f32 workaround is correct on **every** build, so it stays regardless.
 //!
-//! This test ASSERTS the bug is still present, so it FAILS the day a future MLX fixes the kernel —
-//! at which point the f32-SDPA upcast in `connector::attn` can be removed. Mirrors
-//! `mlx-gen-qwen-image/tests/bf16_matmul_sweep.rs`. Weight-free; runs in the default suite.
+//! **`#[ignore]` — local-only.** The bug is hardware/build-specific: CI's Metal GPU runner has a
+//! CORRECT bf16 maskless SDPA (≈3e-3), so an "assert the bug is present" check would (and did)
+//! fail CI. Run this manually on the NAX machine to confirm the bug still warrants the workaround;
+//! when it drops to the bf16-rounding floor there too, the f32-SDPA upcast in `connector::attn`
+//! can be removed.
 
 use mlx_rs::fast::scaled_dot_product_attention;
 use mlx_rs::ops::{abs, subtract, sum};
@@ -25,6 +27,7 @@ fn mean_rel(got: &Array, want: &Array) -> f32 {
 }
 
 #[test]
+#[ignore = "local NAX-build diagnostic — CI's Metal runner has a correct bf16 maskless SDPA"]
 fn bf16_sdpa_maskless_is_still_broken() {
     let shape = [1, 32, 128, 128];
     let q = random::normal::<f32>(&shape, None, None, None).unwrap();
