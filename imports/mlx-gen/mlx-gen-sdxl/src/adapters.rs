@@ -22,16 +22,18 @@
 //!   directly. (kohya `lora_down`/`lora_up` == PEFT `lora_A`/`lora_B`.)
 //!
 //! Linear-only. Two coverage modes (see [`LoraCoverage`]):
-//! - [`LoraCoverage::Vendored`] (default) matches the vendored reachable surface **exactly** (515
-//!   modules on LCM-LoRA): down/up attention (`to_q/k/v`, `to_out.0`), `proj_in`/`proj_out`, resnet
-//!   `time_emb_proj`. No `mid_block` (the vendored mlx-examples UNet names it `mid_blocks.1.…` so
-//!   diffusers keys miss it), no ff/GEGLU, no conv, no text-encoder.
-//! - [`LoraCoverage::Complete`] (sc-2671, opt-in via `SDXL_LORA_COMPLETE`) is **strictly more correct
-//!   than the vendored path**: it additionally routes `mid_block.attentions.0` (attention + proj) and
+//! - [`LoraCoverage::Complete`] (sc-2671) — **the `model::load` default** (Michael's
+//!   correctness-over-parity call, 2026-06-03): applies SDXL LoRAs in **full**, matching diffusers.
+//!   On top of the vendored-reachable set it routes `mid_block.attentions.0` (attention + proj) and
 //!   the GEGLU feed-forward (`ff.net.0.proj` row-split into the value/gate halves `linear1`/`linear2`,
 //!   `ff.net.2` → `linear3`) of every cross-attention transformer — signal the vendored merge silently
 //!   drops. The per-module merge math is the same proven-bit-exact primitive; only the *reachable set*
 //!   grows (plus the FF row-split, a bit-exact gather of the `B@A` delta).
+//! - [`LoraCoverage::Vendored`] matches the vendored reachable surface **exactly** (515 modules on
+//!   LCM-LoRA): down/up attention (`to_q/k/v`, `to_out.0`), `proj_in`/`proj_out`, resnet
+//!   `time_emb_proj`. No `mid_block` (the vendored mlx-examples UNet names it `mid_blocks.1.…` so
+//!   diffusers keys miss it), no ff/GEGLU, no conv, no text-encoder. `model::load` selects this only
+//!   when `SDXL_LORA_VENDORED` is set — the escape hatch for byte-parity with the retired Python path.
 //!
 //! Either way, conv-shaped and out-of-surface keys are counted as skipped and surfaced in the
 //! returned [`SdxlLoraReport`] — never silently dropped. **LoKr stays at the vendored-equivalent
@@ -93,10 +95,12 @@ pub struct SdxlLoraReport {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LoraCoverage {
     /// Faithful to the vendored `lora.py` (515 modules on LCM-LoRA): no `mid_block`, no GEGLU FF.
-    /// The default, preserving byte-parity with the production SDXL path.
+    /// Byte-parity with the retired Python SDXL path — the `model::load` escape hatch
+    /// (`SDXL_LORA_VENDORED`), no longer the default.
     Vendored,
     /// Strictly more correct than the vendored path (sc-2671): also routes `mid_block.attentions.0`
-    /// and the GEGLU feed-forward of every cross-attention transformer.
+    /// and the GEGLU feed-forward of every cross-attention transformer. **The `model::load` default**
+    /// — applies SDXL LoRAs in full (matching diffusers).
     Complete,
 }
 
@@ -380,11 +384,12 @@ fn merge_one_lokr(
 }
 
 /// Merge every adapter spec in `specs` into `unet` — LoRA (sc-2639) and LoKr (sc-2640) — at the
-/// **vendored-faithful** coverage (the production default; 515 modules on LCM-LoRA). The vendored
-/// SDXL path supports LoRA only (it *rejects* LoKr); Rust is strictly more capable. See
-/// [`apply_sdxl_adapters_with`] for the [`LoraCoverage::Complete`] superset (sc-2671). Errors if a
-/// non-empty spec list merges nothing (a real format/prefix misconfiguration — e.g. an original-SD
-/// `lora_unet_input_blocks_*` file).
+/// **vendored-faithful** coverage (515 modules on LCM-LoRA; byte-parity with the retired Python
+/// path). The vendored SDXL path supports LoRA only (it *rejects* LoKr); Rust is strictly more
+/// capable. NOTE: `model::load` now defaults to [`LoraCoverage::Complete`] (sc-2671) — this faithful
+/// entry point is reached only via the `SDXL_LORA_VENDORED` escape hatch. See
+/// [`apply_sdxl_adapters_with`]. Errors if a non-empty spec list merges nothing (a real
+/// format/prefix misconfiguration — e.g. an original-SD `lora_unet_input_blocks_*` file).
 pub fn apply_sdxl_adapters(
     unet: &mut UNet2DConditionModel,
     specs: &[AdapterSpec],
@@ -394,8 +399,8 @@ pub fn apply_sdxl_adapters(
 
 /// As [`apply_sdxl_adapters`], but with an explicit [`LoraCoverage`]. [`LoraCoverage::Complete`]
 /// (sc-2671) reaches `mid_block` + the GEGLU FF for LoRA — strictly more correct than the vendored
-/// path, at the cost of byte-parity with it. The SDXL [`crate::model::load`] selects this via the
-/// `SDXL_LORA_COMPLETE` env var; the default ([`apply_sdxl_adapters`]) stays vendored-faithful.
+/// path, at the cost of byte-parity with it. The SDXL [`crate::model::load`] uses `Complete` by
+/// default and falls back to `Vendored` only when `SDXL_LORA_VENDORED` is set.
 pub fn apply_sdxl_adapters_with(
     unet: &mut UNet2DConditionModel,
     specs: &[AdapterSpec],
