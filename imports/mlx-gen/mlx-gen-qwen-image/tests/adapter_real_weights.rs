@@ -12,12 +12,14 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource,
 };
-use mlx_gen_qwen_image::{decoded_to_image, loader};
+use mlx_gen_qwen_image::{apply_qwen_adapters, decoded_to_image, loader};
+use mlx_rs::ops::array_eq;
+use mlx_rs::Array;
 
 fn snapshot() -> PathBuf {
     if let Ok(p) = std::env::var("QWEN_IMAGE_SNAPSHOT") {
@@ -185,4 +187,183 @@ fn scale_zero_adapter_is_noop() {
     let differ = base.iter().zip(&zero).filter(|(a, b)| a != b).count();
     println!("✓ qwen scale-0 adapter no-op: {differ} px differ from the no-adapter render");
     assert_eq!(differ, 0, "scale-0 adapter must be a bit-exact no-op");
+}
+
+/// The single installed LoRA's `(a, b)` arrays, or panic.
+fn lora_arrays(adapters: &[Adapter]) -> (Array, Array) {
+    match adapters {
+        [Adapter::Lora { a, b, .. }] => (a.clone(), b.clone()),
+        _ => panic!("expected exactly one LoRA adapter, got {}", adapters.len()),
+    }
+}
+
+/// sc-2618: a kohya `lora_unet_` file resolves the SAME modules and installs the byte-identical
+/// adapter as the equivalent PEFT file, on the REAL Qwen 60-block tree. Drift guard (every kohya
+/// path resolves), collision-free flattening, and a fused/off-surface key errors loudly.
+#[test]
+#[ignore = "needs real Qwen-Image weights"]
+fn kohya_matches_peft_on_real_tree() {
+    let none = None as Option<&std::collections::HashMap<String, String>>;
+    let mut probe = loader::load_transformer(&snapshot()).unwrap();
+    let paths = probe.adaptable_paths();
+    assert!(!paths.is_empty(), "no kohya targets enumerated");
+    for p in &paths {
+        let segs: Vec<&str> = p.split('.').collect();
+        assert!(
+            AdaptableHost::adaptable_mut(&mut probe, &segs).is_some(),
+            "drift: enumerated {p} does not resolve via adaptable_mut"
+        );
+    }
+    let flat: std::collections::BTreeSet<String> =
+        paths.iter().map(|p| p.replace('.', "_")).collect();
+    assert_eq!(
+        flat.len(),
+        paths.len(),
+        "two paths collide when flattened to a kohya stem"
+    );
+
+    // One on-disk spelling per module (drop a `.0` alias when its bare sibling is enumerated; a
+    // no-op for Qwen, which has no aliases).
+    let targets: Vec<String> = paths
+        .iter()
+        .filter(|p| match p.strip_suffix(".0") {
+            Some(base) => !paths.iter().any(|q| q.as_str() == base),
+            None => true,
+        })
+        .cloned()
+        .collect();
+
+    let r = 2i32;
+    let mut kohya: Vec<(String, Array)> = Vec::new();
+    let mut peft: Vec<(String, Array)> = Vec::new();
+    for p in &targets {
+        let segs: Vec<&str> = p.split('.').collect();
+        let shape = AdaptableHost::adaptable_mut(&mut probe, &segs)
+            .unwrap()
+            .base_shape();
+        let (out, inp) = (shape[0], shape[1]);
+        let a = Array::from_slice(
+            &(0..r * inp)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.001)
+                .collect::<Vec<_>>(),
+            &[r, inp],
+        );
+        let b = Array::from_slice(
+            &(0..out * r)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.001)
+                .collect::<Vec<_>>(),
+            &[out, r],
+        );
+        let alpha = Array::from_slice(&[4.0f32], &[1]);
+        let stem = p.replace('.', "_");
+        kohya.push((format!("lora_unet_{stem}.lora_down.weight"), a.clone()));
+        kohya.push((format!("lora_unet_{stem}.lora_up.weight"), b.clone()));
+        kohya.push((format!("lora_unet_{stem}.alpha"), alpha.clone()));
+        peft.push((format!("transformer.{p}.lora_A.weight"), a));
+        peft.push((format!("transformer.{p}.lora_B.weight"), b));
+        peft.push((format!("transformer.{p}.alpha"), alpha));
+    }
+    let dir = std::env::temp_dir().join("mlx_gen_qwen_kohya_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (kpath, ppath) = (dir.join("kohya.safetensors"), dir.join("peft.safetensors"));
+    Array::save_safetensors(
+        kohya
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect::<Vec<_>>(),
+        none,
+        &kpath,
+    )
+    .unwrap();
+    Array::save_safetensors(
+        peft.iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect::<Vec<_>>(),
+        none,
+        &ppath,
+    )
+    .unwrap();
+
+    let mut tk = loader::load_transformer(&snapshot()).unwrap();
+    let rk = apply_qwen_adapters(
+        &mut tk,
+        &[AdapterSpec {
+            path: kpath,
+            scale: 0.8,
+            kind: AdapterKind::Lora,
+        }],
+    )
+    .unwrap();
+    assert_eq!(rk.applied, targets.len(), "kohya: not all targets applied");
+    assert!(
+        rk.unmatched_paths.is_empty(),
+        "kohya unmatched: {:?}",
+        rk.unmatched_paths
+    );
+
+    let mut tp = loader::load_transformer(&snapshot()).unwrap();
+    apply_qwen_adapters(
+        &mut tp,
+        &[AdapterSpec {
+            path: ppath,
+            scale: 0.8,
+            kind: AdapterKind::Lora,
+        }],
+    )
+    .unwrap();
+
+    for p in &targets {
+        let segs: Vec<&str> = p.split('.').collect();
+        let (ka, kb) = lora_arrays(
+            AdaptableHost::adaptable_mut(&mut tk, &segs)
+                .unwrap()
+                .adapters(),
+        );
+        let (pa, pb) = lora_arrays(
+            AdaptableHost::adaptable_mut(&mut tp, &segs)
+                .unwrap()
+                .adapters(),
+        );
+        assert!(
+            array_eq(&ka, &pa, false).unwrap().item::<bool>()
+                && array_eq(&kb, &pb, false).unwrap().item::<bool>(),
+            "kohya and peft installed different adapters at {p}"
+        );
+    }
+    println!(
+        "✓ kohya ≡ peft across {} Qwen modules (byte-identical adapters)",
+        targets.len()
+    );
+
+    // A fused/off-surface kohya key (Qwen has no fused `attn.qkv`) is surfaced and errors.
+    let small = Array::from_slice(&[0.01f32], &[1, 1]);
+    let opath = dir.join("kohya_offsurface.safetensors");
+    Array::save_safetensors(
+        vec![
+            (
+                "lora_unet_transformer_blocks_0_attn_qkv.lora_down.weight",
+                &small,
+            ),
+            (
+                "lora_unet_transformer_blocks_0_attn_qkv.lora_up.weight",
+                &small,
+            ),
+        ],
+        none,
+        &opath,
+    )
+    .unwrap();
+    let mut to = loader::load_transformer(&snapshot()).unwrap();
+    assert!(
+        apply_qwen_adapters(
+            &mut to,
+            &[AdapterSpec {
+                path: opath,
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .is_err(),
+        "an off-surface kohya key must error, not silently drop"
+    );
 }

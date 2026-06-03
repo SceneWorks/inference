@@ -150,4 +150,11 @@ impl AdaptableHost for ZImageAttention {
             _ => None,
         }
     }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["to_q", "to_k", "to_v", "to_out.0"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
 }
