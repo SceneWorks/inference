@@ -14,7 +14,7 @@
 use mlx_rs::{
     module::Param,
     nn::{Linear, QuantizedLinear},
-    ops::{add, kron, matmul, multiply, quantized_matmul},
+    ops::{add, addmm, kron, matmul, multiply, quantized_matmul},
     Array, Dtype,
 };
 
@@ -102,11 +102,20 @@ impl LinearBase {
     fn forward(&self, x: &Array) -> Result<Array> {
         Ok(match self {
             LinearBase::Dense(l) => {
-                let mut y = matmul(x, l.weight.value.t())?;
-                if let Some(b) = l.bias.value.as_ref() {
-                    y = add(&y, b)?;
+                // Mirror MLX `nn.Linear` exactly: the biased case is a FUSED `addmm(bias, x, Wᵀ)`
+                // — accumulate `x·Wᵀ`, add bias, round to the output dtype ONCE. A separate
+                // `matmul` then `add` rounds the matmul, *then* rounds the bias add again — a
+                // ~1.4e-3 double-rounding error per biased Linear in bf16 that compounds over a
+                // deep net (sc-2779; localized in the Wan DiT, q_proj 1.4e-3 → ~4e-7 with addmm).
+                // f32-INVISIBLE and therefore safe for every crate today: with f32 activations
+                // (the current Z-Image/Qwen/FLUX path, even with bf16 weights) `addmm == matmul+add`
+                // bit-for-bit, because nothing rounds to bf16 mid-op (verified, sc-2779). It bites
+                // only once a path runs bf16 activations (the sc-2718–2721 reverts). The unbiased
+                // case stays a plain `matmul`, as mlx-rs's own `Linear::forward` does.
+                match l.bias.value.as_ref() {
+                    Some(b) => addmm(b, x, l.weight.value.t(), 1.0, 1.0)?,
+                    None => matmul(x, l.weight.value.t())?,
                 }
-                y
             }
             LinearBase::Quantized(q) => {
                 // Belt-and-suspenders upcast for the NAX 16-bit-GEMM bug (present on both pinned
@@ -427,6 +436,92 @@ mod tests {
                 .unwrap()
                 .item::<bool>(),
             "bf16 residual diverged from the f32 reference (bf16 GEMM bug?)"
+        );
+    }
+
+    #[test]
+    fn biased_dense_forward_is_fused_addmm() {
+        // sc-2779: the biased dense base must be a FUSED `addmm(bias, x, Wᵀ)`, not `matmul`+`add`.
+        // In bf16 the two differ (double-rounding), so feed bf16 activations and assert the forward
+        // is bit-exact to `addmm` and bit-distinct from `matmul`+`add` — i.e. the fusion is real.
+        let n = 4 * 64;
+        let w = Array::from_slice(
+            &(0..64 * 64)
+                .map(|i| (i as f32 * 0.013).sin() * 0.05)
+                .collect::<Vec<_>>(),
+            &[64, 64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let bias = Array::from_slice(
+            &(0..64)
+                .map(|i| (i as f32 * 0.7).cos() * 0.1)
+                .collect::<Vec<_>>(),
+            &[64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let x = Array::from_slice(
+            &(0..n)
+                .map(|i| (i as f32 * 0.031).sin() * 0.5)
+                .collect::<Vec<_>>(),
+            &[4, 64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+
+        let lin = AdaptableLinear::dense(w.clone(), Some(bias.clone()));
+        let got = lin.forward(&x).unwrap();
+
+        let want_addmm = addmm(&bias, &x, w.t(), 1.0, 1.0).unwrap();
+        assert!(
+            array_eq(&got, &want_addmm, false).unwrap().item::<bool>(),
+            "biased dense forward must be bit-exact to addmm(bias, x, Wᵀ)"
+        );
+
+        // And it must NOT be the double-rounding matmul+add (which is what the bug looked like).
+        let matmul_add = add(matmul(&x, w.t()).unwrap(), &bias).unwrap();
+        assert!(
+            !array_eq(&got, &matmul_add, false).unwrap().item::<bool>(),
+            "bf16 addmm should differ from matmul+add (double-rounding) — fusion not applied?"
+        );
+    }
+
+    #[test]
+    fn biased_dense_forward_f32_acts_match_matmul_add_bit_exact() {
+        // sc-2779 golden-safety invariant: with f32 activations (the current Z-Image/Qwen/FLUX path,
+        // even over bf16 weights), `addmm == matmul+add` bit-for-bit — nothing rounds to bf16
+        // mid-op. This is why lifting the core to addmm cannot regress any current f32-act golden.
+        let w = Array::from_slice(
+            &(0..64 * 64)
+                .map(|i| (i as f32 * 0.013).sin() * 0.05)
+                .collect::<Vec<_>>(),
+            &[64, 64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap(); // bf16 weights
+        let bias = Array::from_slice(
+            &(0..64)
+                .map(|i| (i as f32 * 0.7).cos() * 0.1)
+                .collect::<Vec<_>>(),
+            &[64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let x = Array::from_slice(
+            &(0..4 * 64)
+                .map(|i| (i as f32 * 0.031).sin() * 0.5)
+                .collect::<Vec<_>>(),
+            &[4, 64],
+        ); // f32 activations
+
+        let got = AdaptableLinear::dense(w.clone(), Some(bias.clone()))
+            .forward(&x)
+            .unwrap();
+        let matmul_add = add(matmul(&x, w.t()).unwrap(), &bias).unwrap();
+        assert!(
+            array_eq(&got, &matmul_add, false).unwrap().item::<bool>(),
+            "f32-activation addmm must be bit-exact to matmul+add (no golden regression)"
         );
     }
 
