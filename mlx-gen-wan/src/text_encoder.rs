@@ -273,11 +273,18 @@ fn linear(x: &Array, w: &Array) -> Result<Array> {
 /// is all 0.0, so the encoder is bit-exact to the reference. (`x³` via integer-exponent `power`, as
 /// both the reference and mlx-rs do.)
 pub(crate) fn gelu_tanh(x: &Array) -> Result<Array> {
+    // Cast the scalar constants to `x`'s dtype, mirroring MLX-Python's weak scalar typing
+    // (`float * array` adopts the array dtype). This keeps a bf16 input computing in bf16 (the Wan
+    // DiT FFN) and an f32 input in f32 (the UMT5 TE) — matching `nn.GELU(approx="tanh")` at both. A
+    // plain `scalar(..)` is f32 and would promote a bf16 input to f32 (a ~1e-3 dtype mismatch in the
+    // DiT). `√(2/π)` is still computed in f64 on the host (the S1 f32-parity fix), then cast.
+    let dt = x.dtype();
+    let s = |v: f32| -> Result<Array> { Ok(scalar(v).as_dtype(dt)?) };
     let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
     let x3 = power(x, Array::from_int(3))?;
-    let inner = multiply(&add(x, &multiply(&x3, scalar(0.044_715))?)?, scalar(c))?;
-    let gate = add(&tanh(&inner)?, scalar(1.0))?;
-    Ok(multiply(&multiply(x, scalar(0.5))?, &gate)?)
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    Ok(multiply(&multiply(x, &s(0.5)?)?, &gate)?)
 }
 
 /// `[1, L]` int/float mask → `[1, 1, 1, L]` f32 additive mask (`0` where kept, `MASK_FILL` where

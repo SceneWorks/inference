@@ -1,21 +1,24 @@
 //! S3 parity gate: the Wan DiT (5B) must reproduce the `mlx_video` reference, gated **bf16-against-bf16**
 //! — the production regime (the reference runs bf16 matmuls + bf16 SDPA + bf16 cos/sin with an f32
-//! residual stream; see `tools/dump_s3_fixtures.py`). The DiT now mirrors that exactly (sc-2714 +
-//! sc-2770 patched the NAX bf16 GEMM and SDPA, so bf16 is correct on the pinned build).
+//! residual stream; see `tools/dump_s3_fixtures.py`).
 //!
-//! Observed: patch embedding **bit-exact** (`x_embed` max|Δ| = 0.0); DiT output mean_rel ~4e-2. The
-//! residual is the **cross-build bf16 kernel difference**: the pinned build is MLX 0.31.1 + the
-//! sc-2714/sc-2770 patches (which route the broken NAX bf16 ops to an f32/TF32 fallback), whereas the
-//! production reference is MLX 0.31.2's *native* fixed NAX bf16 kernels — different bf16
-//! implementations, differing at bf16 rounding and accumulating over 30 layers. Bumping the Rust pin
-//! to 0.31.2 (under evaluation) would use production's exact kernels and tighten this toward exact.
-//! (For comparison, gating against an f32-upcast reference gives ~6e-3 — tighter, but it isn't the
-//! production dtype.) True end-to-end parity is the px>8 video gate at S4.
+//! Observed: patch embedding **bit-exact** (`x_embed` max|Δ| = 0.0); DiT output mean_rel ~5e-2. A
+//! stage-bisection (feeding the golden's bit-exact intermediates) localized — and fixed — the two
+//! real port bugs that had dominated an earlier ~6e-2. (a) **Fused Linear**: `nn.Linear` is
+//! `addmm(bias, x, Wᵀ)` (accumulate, add bias, round once); a separate `matmul`+`add` double-rounds in
+//! bf16 (~1.4e-3 per matmul) — fixed in `Linear::forward`. (b) **GELU dtype**: `nn.GELU(approx="tanh")`
+//! weak-casts its scalar constants to the input dtype so a bf16 FFN stays bf16, whereas f32 scalars
+//! promote it to f32 (~1e-3) — fixed in `text_encoder::gelu_tanh`. With those fixed, every per-block
+//! stage is **bit-exact** when fed bit-exact input (cross-attn / FFN ≤ 1e-4). The remaining ~5e-2 is
+//! the **0.31.1-vs-0.31.2 bf16 matmul delta** (~4e-7 per matmul — verified: the same `q_proj` is
+//! 3.97e-7 on a 0.31.1 wheel and 0.0 on 0.31.2) amplified through the 30 attention layers. **f32 ops
+//! are bit-exact across the versions** (S1 T5 = 0.0), so a **0.31.2 pin bump makes the DiT bit-exact**.
+//! True end-to-end parity is the px>8 video gate at S4.
 //!
 //! `#[ignore]` heavy: loads the converted `model.safetensors` (~11 GB) from the snapshot dir
-//! (`WAN_5B_DIR`). Honors "divergence is not rounding" — the residual is a *named* cross-build bf16
-//! kernel difference, with the patch embedding bit-exact and the per-block growth consistent with
-//! bf16 precision (not a code bug).
+//! (`WAN_5B_DIR`). Honors "divergence is not rounding" — the residual is a *named* cross-version
+//! matmul delta (f32 bit-exact, patch embedding bit-exact, per-block math bit-exact, growth consistent
+//! with bf16 precision — not a code bug).
 
 use std::path::PathBuf;
 
@@ -89,8 +92,8 @@ fn dit_forward_matches_reference() {
     let got = out.as_slice::<f32>().to_vec();
     let (max_abs, mean_rel) = diff(&got, g.require("output").unwrap().as_slice::<f32>());
     println!("[output]   max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e}");
-    // Cross-build bf16 kernel difference (0.31.1+patches fallback vs production 0.31.2 native NAX
-    // bf16) accumulated over 30 layers (~4e-2). A 0.31.2 pin bump would tighten this toward exact.
+    // Per-block math is bit-exact (addmm + gelu-dtype fixed); the residual ~5e-2 is the
+    // 0.31.1-vs-0.31.2 bf16 matmul delta (~4e-7/matmul) amplified over 30 layers. 0.31.2 → bit-exact.
     assert!(
         mean_rel < 6e-2,
         "DiT output mean_rel {mean_rel:.3e} too high"
