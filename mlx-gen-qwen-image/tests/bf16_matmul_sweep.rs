@@ -8,18 +8,22 @@
 //! f32, and `quantized_matmul` (fp32 accumulation, mlx#963) were always correct. This was the root
 //! of the FLUX Rust↔fork divergence and forced f32 detours in every adapter/embedder bf16 path.
 //!
-//! FIX (sc-2714). Our `michaeltrefry/mlx-rs` fork patches `mlx/backend/metal/matmul.cpp` to gate
-//! every NAX GEMM dispatch site to f32/TF32 only (`enable_tf32() && dtype == float32`), so 16-bit
-//! operands fall through to the correct non-NAX `steel_gemm_fused`. The f32/TF32 NAX path (the 2.7×
-//! DiT speedup) is untouched. TEMPORARY carry until upstream fixes the NAX 16-bit kernel; see memory
+//! FIX (sc-2772, root cause). The garbage was NOT the dispatch and NOT the MLX version — it was the
+//! metal-kernel COMPILE TARGET. The NAX kernels use Apple's matrix-unit intrinsic
+//! `mpp::tensor_ops::matmul2d`, valid only for macOS >= 26.2 (the same floor `is_nax_available()`
+//! checks). The kernels were being compiled at `-mmacosx-version-min=26.0` (the old
+//! MACOSX_DEPLOYMENT_TARGET), below that floor, so metalfe miscompiled the tensor-op to garbage for
+//! 16-bit while the host still dispatched to it. Building the kernels at 26.2 (mlx-gen's
+//! .cargo/config.toml) makes the NAX 16-bit GEMM correct — proven byte-for-byte vs Apple's official
+//! wheel metallib. The earlier sc-2714 dispatch-gate patch (route 16-bit off NAX) was a WORKAROUND and
+//! is now REMOVED; 16-bit uses the correct, faster NAX matrix unit. See memory
 //! `pmetal-mlx-bf16-matmul-bug`.
 //!
-//! THIS TEST is the per-build guarantor that the patch actually applied: it sweeps the former
-//! garbage zone and asserts 16-bit dense is now correct (≈16-bit rounding, not garbage). It FAILS on
-//! a NAX build that is MISSING the patch (e.g. the FetchContent `git apply` silently no-op'd) or if a
-//! future MLX bump reintroduces the broken dispatch. On non-NAX builds 16-bit dense uses correct
-//! fallback kernels, so it passes there too. Needs no weights, only MLX. When upstream fixes the NAX
-//! kernel and we drop the fork patch, this keeps passing (just stops being load-bearing).
+//! THIS TEST is the per-build guarantor that the NAX 16-bit dense GEMM is correct: it sweeps the
+//! former garbage zone and asserts 16-bit dense matches an f32 reference (≈16-bit rounding, not
+//! garbage). It FAILS on a NAX build whose metal kernels were compiled below the 26.2 floor (e.g.
+//! MACOSX_DEPLOYMENT_TARGET regressed to 26.0). On non-NAX builds 16-bit dense uses correct fallback
+//! kernels, so it passes there too. Needs no weights, only MLX.
 
 use mlx_rs::{ops::matmul, random, Array, Dtype};
 
@@ -34,12 +38,12 @@ fn rel(a: &Array, b: &Array) -> f64 {
     num / den
 }
 
-// Always-on guard: with the sc-2714 fork patch, 16-bit dense is correct across the whole grid, so
-// this asserts correctness on every build (NAX-patched or non-NAX). On a NAX build whose MLX is
-// missing the patch it (rightly) FAILS. Run: `cargo test -p mlx-gen-qwen-image --release --test
-// bf16_matmul_sweep -- --nocapture`.
+// Always-on guard: with the kernels compiled at macOS >= 26.2 (sc-2772), 16-bit dense is correct
+// across the whole grid, so this asserts correctness on every build (NAX or non-NAX). On a NAX build
+// whose metal kernels were compiled below 26.2 it (rightly) FAILS. Run: `cargo test -p
+// mlx-gen-qwen-image --release --test bf16_matmul_sweep -- --nocapture`.
 #[test]
-fn nax_16bit_dense_gemm_is_patched() {
+fn nax_16bit_dense_gemm_is_correct() {
     // Distinct keys for the two operands so no (M,K)==(K,N) cell degenerates to A == B.
     let ka = random::key(0).unwrap();
     let kb = random::key(1).unwrap();
@@ -90,12 +94,12 @@ fn nax_16bit_dense_gemm_is_patched() {
         worst_safe < 0.05,
         "a 16-bit GEMM safe cell diverged ({worst_safe:.4} ≥ 0.05) — unexpected; re-characterize."
     );
-    // GUARANTOR: the former garbage zone is now correct. If this fails on a NAX build, the sc-2714
-    // patch did NOT take effect (check the fork's combined.patch / FetchContent `git apply`) or a
-    // future MLX reintroduced the broken NAX 16-bit dispatch.
+    // GUARANTOR: the former garbage zone is now correct. If this fails on a NAX build, the metal
+    // kernels were compiled below the macOS 26.2 NAX floor (sc-2772) — check MACOSX_DEPLOYMENT_TARGET
+    // in .cargo/config.toml is >= 26.2 (a clean rebuild of pmetal-mlx-sys is needed after a change).
     assert!(
         worst_former_garbage < 0.05,
-        "NAX 16-bit dense GEMM is GARBAGE again ({worst_former_garbage:.4} ≥ 0.05): the sc-2714 \
-         matmul.cpp gate is not in effect. Verify the mlx-rs fork patch applied to the MLX build."
+        "NAX 16-bit dense GEMM is GARBAGE ({worst_former_garbage:.4} ≥ 0.05): the metal kernels were \
+         compiled below the macOS 26.2 NAX floor. Verify MACOSX_DEPLOYMENT_TARGET >= 26.2 (sc-2772)."
     );
 }
