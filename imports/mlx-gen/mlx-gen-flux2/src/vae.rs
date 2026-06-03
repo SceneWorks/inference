@@ -13,6 +13,7 @@ use mlx_rs::fast::scaled_dot_product_attention;
 use mlx_rs::ops::{add, multiply, pad, sqrt};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d, group_norm, linear, silu, upsample_nearest};
 use mlx_gen::weights::Weights;
@@ -97,43 +98,43 @@ impl ResnetBlock2D {
 }
 
 /// Single-head spatial self-attention used in the mid block (the fork's `Flux2AttentionBlock`).
+/// q/k/v/out are `nn.Linear` (with bias) — the only VAE modules the fork's `nn.quantize` hits, so
+/// they are core [`AdaptableLinear`]s; the GroupNorm stays full precision (as do all the convs).
 struct VaeAttention {
     gn_w: Array,
     gn_b: Array,
-    q_w: Array,
-    q_b: Array,
-    k_w: Array,
-    k_b: Array,
-    v_w: Array,
-    v_b: Array,
-    o_w: Array,
-    o_b: Array,
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
 }
 
 impl VaeAttention {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let lin = |n: &str| -> Result<(Array, Array)> {
-            Ok((
+        // q/k/v/out carry bias; weights are loaded f32 (the VAE runs f32). `quantize` casts to bf16
+        // before packing so the scales byte-match the fork's bf16 `nn.quantize` (sc-2604 chokepoint).
+        let lin = |n: &str| -> Result<AdaptableLinear> {
+            Ok(AdaptableLinear::dense(
                 f32w(w, &format!("{prefix}.{n}.weight"))?,
-                f32w(w, &format!("{prefix}.{n}.bias"))?,
+                Some(f32w(w, &format!("{prefix}.{n}.bias"))?),
             ))
         };
-        let (q_w, q_b) = lin("to_q")?;
-        let (k_w, k_b) = lin("to_k")?;
-        let (v_w, v_b) = lin("to_v")?;
-        let (o_w, o_b) = lin("to_out.0")?;
         Ok(Self {
             gn_w: f32w(w, &format!("{prefix}.group_norm.weight"))?,
             gn_b: f32w(w, &format!("{prefix}.group_norm.bias"))?,
-            q_w,
-            q_b,
-            k_w,
-            k_b,
-            v_w,
-            v_b,
-            o_w,
-            o_b,
+            q: lin("to_q")?,
+            k: lin("to_k")?,
+            v: lin("to_v")?,
+            o: lin("to_out.0")?,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.q.quantize(bits, None)?;
+        self.k.quantize(bits, None)?;
+        self.v.quantize(bits, None)?;
+        self.o.quantize(bits, None)?;
+        Ok(())
     }
 
     /// `x`: NHWC `[B, H, W, C]`. Single-head attention over the H·W positions, residual.
@@ -142,12 +143,12 @@ impl VaeAttention {
         let (b, h, w_, c) = (sh[0], sh[1], sh[2], sh[3]);
         let y = group_norm(x, &self.gn_w, &self.gn_b, GN_GROUPS, GN_EPS)?;
         let to_seq = |a: Array| -> Result<Array> { Ok(a.reshape(&[b, 1, h * w_, c])?) };
-        let q = to_seq(linear(&y, &self.q_w, &self.q_b)?)?;
-        let k = to_seq(linear(&y, &self.k_w, &self.k_b)?)?;
-        let v = to_seq(linear(&y, &self.v_w, &self.v_b)?)?;
+        let q = to_seq(self.q.forward(&y)?)?;
+        let k = to_seq(self.k.forward(&y)?)?;
+        let v = to_seq(self.v.forward(&y)?)?;
         let scale = (c as f32).powf(-0.5);
         let o = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
-        let o = linear(&o.reshape(&[b, h, w_, c])?, &self.o_w, &self.o_b)?;
+        let o = self.o.forward(&o.reshape(&[b, h, w_, c])?)?;
         Ok(add(x, &o)?)
     }
 }
@@ -339,12 +340,31 @@ impl Flux2Vae {
         })
     }
 
+    /// Quantize the VAE to Q4/Q8 (group_size 64). The fork's `nn.quantize` predicate only hits
+    /// `nn.Linear`, which in this VAE is exactly the encoder + decoder mid-block attention
+    /// (q/k/v/out). Every Conv2d (incl. `quant_conv`/`post_quant_conv`), GroupNorm, and the
+    /// BatchNorm stats are not Linears, so they stay full precision — matching the fork.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.encoder.mid_attn.quantize(bits)?;
+        self.decoder.mid_attn.quantize(bits)?;
+        Ok(())
+    }
+
     /// Decode latents `[B, h, w, 32]` (NHWC) → image `[B, H, W, 3]` in ~`[-1, 1]`.
     /// `scaling_factor=1.0, shift_factor=0.0`, so the latent passes straight to `post_quant_conv`.
     pub fn decode(&self, latents: &Array) -> Result<Array> {
         let latents = latents.as_dtype(Dtype::Float32)?;
         let z = linear(&latents, &self.post_quant.0, &self.post_quant.1)?;
         self.decoder.forward(&z)
+    }
+
+    /// Test-only (sc-2643 byte-parity gate): the quantized `(wq, scales, biases, group_size, bits)`
+    /// of the encoder mid-block attention `to_q` — the unique f32-loaded Linear-with-bias case
+    /// (the rest of the VAE is Conv/GroupNorm, never quantized). `None` if the VAE is still dense.
+    #[doc(hidden)]
+    pub fn probe_quant_enc_q(&self) -> Option<(&Array, &Array, &Array, i32, i32)> {
+        let (wq, sc, bi, _bias, gs, b) = self.encoder.mid_attn.q.quantized_params()?;
+        Some((wq, sc, bi, gs, b))
     }
 
     /// Decode the transformer's packed output `[B, lat_h, lat_w, 128]` (NHWC): de-normalize with
