@@ -53,12 +53,18 @@ impl Flux2Variant {
     }
 
     pub fn descriptor(self) -> ModelDescriptor {
-        // Both variants accept a single `Reference`, but the semantics differ by variant: for the
-        // edit variant it is the reference image concatenated as extra sequence tokens (sc-2346);
-        // for txt2img it is an **img2img** init image seeding the latents via the noise blend
-        // (sc-2644). Multi-reference edit (`MultiReference`) is sc-2645. Advertise what this port
-        // delivers, no more, no less.
-        let conditioning = vec![ConditioningKind::Reference];
+        // Conditioning surface by variant: the edit variant consumes one `Reference` (single image,
+        // token concat, sc-2346) or one `MultiReference` (N images, sc-2645); txt2img consumes a
+        // single `Reference` as an **img2img** init image seeding the latents via the noise blend
+        // (sc-2644). Advertise what this port delivers, no more, no less.
+        let conditioning = if self.is_edit() {
+            vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
+            ]
+        } else {
+            vec![ConditioningKind::Reference]
+        };
         ModelDescriptor {
             id: self.id(),
             family: "flux2",
