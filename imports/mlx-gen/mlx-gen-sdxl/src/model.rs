@@ -123,7 +123,21 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         // U-Net weights at load — the vendored `lora.py` merges pre-quantization, and merging (not a
         // forward-time residual) keeps the chaos-sensitive ancestral sampler bit-exact. Out-of-surface
         // keys (mid_block/ff/conv) are surfaced in the report, not dropped.
-        crate::adapters::apply_sdxl_adapters(&mut unet, &spec.adapters)?;
+        //
+        // Coverage (sc-2671): the default is vendored-faithful (515 modules; byte-parity with the
+        // production SDXL path). `SDXL_LORA_COMPLETE` opts into the strictly-more-correct superset
+        // (mid_block + GEGLU FF) the vendored `lora.py` silently drops. Kept a flag, not the default,
+        // because the parity target is the vendored path; flipping the default is a deliberate call.
+        let coverage = if std::env::var_os("SDXL_LORA_COMPLETE").is_some() {
+            eprintln!(
+                "sdxl: SDXL_LORA_COMPLETE set — merging the complete LoRA surface (mid_block + ff), \
+                 strictly beyond the vendored 515-module reference (sc-2671)"
+            );
+            crate::adapters::LoraCoverage::Complete
+        } else {
+            crate::adapters::LoraCoverage::Vendored
+        };
+        crate::adapters::apply_sdxl_adapters_with(&mut unet, &spec.adapters, coverage)?;
     }
     let mut te1 = loader::load_text_encoder_1(root)?;
     let mut te2 = loader::load_text_encoder_2(root)?;

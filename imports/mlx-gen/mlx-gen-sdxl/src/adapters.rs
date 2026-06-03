@@ -21,12 +21,21 @@
 //!   what `peft.save_pretrained()` / SceneWorks' `_SdxlLoraBackend` emit. The dotted path resolves
 //!   directly. (kohya `lora_down`/`lora_up` == PEFT `lora_A`/`lora_B`.)
 //!
-//! Linear-only and matching the vendored reachable surface **exactly** (515 modules on LCM-LoRA):
-//! down/up attention (`to_q/k/v`, `to_out.0`), `proj_in`/`proj_out`, resnet `time_emb_proj`. No
-//! `mid_block` (the vendored mlx-examples UNet names it `mid_blocks.1.…` so diffusers keys miss it),
-//! no ff/GEGLU, no conv, no text-encoder. Keys outside that surface are counted as skipped and
-//! surfaced in the returned [`SdxlLoraReport`] — never silently dropped. The correct/complete
-//! superset (mid_block + ff, strictly more than the vendored path) is sc-2671.
+//! Linear-only. Two coverage modes (see [`LoraCoverage`]):
+//! - [`LoraCoverage::Vendored`] (default) matches the vendored reachable surface **exactly** (515
+//!   modules on LCM-LoRA): down/up attention (`to_q/k/v`, `to_out.0`), `proj_in`/`proj_out`, resnet
+//!   `time_emb_proj`. No `mid_block` (the vendored mlx-examples UNet names it `mid_blocks.1.…` so
+//!   diffusers keys miss it), no ff/GEGLU, no conv, no text-encoder.
+//! - [`LoraCoverage::Complete`] (sc-2671, opt-in via `SDXL_LORA_COMPLETE`) is **strictly more correct
+//!   than the vendored path**: it additionally routes `mid_block.attentions.0` (attention + proj) and
+//!   the GEGLU feed-forward (`ff.net.0.proj` row-split into the value/gate halves `linear1`/`linear2`,
+//!   `ff.net.2` → `linear3`) of every cross-attention transformer — signal the vendored merge silently
+//!   drops. The per-module merge math is the same proven-bit-exact primitive; only the *reachable set*
+//!   grows (plus the FF row-split, a bit-exact gather of the `B@A` delta).
+//!
+//! Either way, conv-shaped and out-of-surface keys are counted as skipped and surfaced in the
+//! returned [`SdxlLoraReport`] — never silently dropped. **LoKr stays at the vendored-equivalent
+//! surface regardless of coverage** (sc-2671 is LoRA-only; sc-2640 covered LoKr at that surface).
 
 use std::collections::BTreeMap;
 
@@ -72,11 +81,96 @@ struct LoraTriple {
 
 /// Outcome of applying the SDXL adapter specs: how many module weights were merged, and how many
 /// keys fell outside the routable surface (mid_block / ff / conv / text-encoder — surfaced, not
-/// silently dropped).
+/// silently dropped). `merged` counts *base Linears updated*, so a GEGLU `ff.net.0.proj` LoRA (when
+/// complete coverage row-splits it into `linear1`+`linear2`) contributes 2.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SdxlLoraReport {
     pub merged: usize,
     pub skipped_keys: usize,
+}
+
+/// How much of the U-Net LoRA surface to reach.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoraCoverage {
+    /// Faithful to the vendored `lora.py` (515 modules on LCM-LoRA): no `mid_block`, no GEGLU FF.
+    /// The default, preserving byte-parity with the production SDXL path.
+    Vendored,
+    /// Strictly more correct than the vendored path (sc-2671): also routes `mid_block.attentions.0`
+    /// and the GEGLU feed-forward of every cross-attention transformer.
+    Complete,
+}
+
+/// A diffusers module path the vendored `lora.py` cannot reach — `mid_block.*` (named `mid_blocks.*`
+/// in mlx-examples) or a GEGLU FF leaf (`*.ff.net.*`). Gated out under [`LoraCoverage::Vendored`].
+fn is_complete_only(path: &str) -> bool {
+    path.starts_with("mid_block") || path.contains(".ff.net.")
+}
+
+/// Build the kohya `flattened→dotted` lookup table from a routable-path list.
+fn build_table(paths: Vec<String>) -> BTreeMap<String, String> {
+    paths
+        .into_iter()
+        .map(|p| (p.replace('.', "_"), p))
+        .collect()
+}
+
+/// Rows `[lo, hi)` of a 2-D array. Bit-exact for slicing a `B@A` LoRA delta: matmul output rows are
+/// independent, so `rows(B@A)` equals `(rows(B))@A` to the last bit.
+fn rows(a: &Array, lo: i32, hi: i32) -> Result<Array> {
+    let idx = Array::from_slice(&(lo..hi).collect::<Vec<i32>>(), &[hi - lo]);
+    Ok(a.take_axis(&idx, 0)?)
+}
+
+/// Merge `delta` into the dense Linear at `dotted`, counting the merge (or surfacing a miss as
+/// skipped). The path is the internal module path (FF already translated to `ff.linearN`).
+fn merge_into(
+    unet: &mut UNet2DConditionModel,
+    dotted: &str,
+    delta: &Array,
+    report: &mut SdxlLoraReport,
+) -> Result<()> {
+    let parts: Vec<&str> = dotted.split('.').collect();
+    match unet.adaptable_mut(&parts) {
+        Some(lin) => {
+            lin.merge_dense_delta(delta)?;
+            report.merged += 1;
+        }
+        None => report.skipped_keys += 1,
+    }
+    Ok(())
+}
+
+/// Route a computed LoRA `delta` for diffusers `path` into the U-Net, translating the GEGLU FF:
+/// `ff.net.0.proj` (a fused `[2·hidden, D]` proj) row-splits into the value half `ff.linear1` (rows
+/// `[0:hidden]`) and the gate half `ff.linear2` (`[hidden:2·hidden]`); `ff.net.2` maps to `ff.linear3`.
+/// Every other path (attention / proj / time_emb / mid_block) routes 1:1.
+fn merge_lora_routed(
+    unet: &mut UNet2DConditionModel,
+    path: &str,
+    delta: &Array,
+    report: &mut SdxlLoraReport,
+) -> Result<()> {
+    if let Some(prefix) = path.strip_suffix(".ff.net.0.proj") {
+        let two_h = delta.shape()[0];
+        let h = two_h / 2;
+        merge_into(
+            unet,
+            &format!("{prefix}.ff.linear1"),
+            &rows(delta, 0, h)?,
+            report,
+        )?;
+        merge_into(
+            unet,
+            &format!("{prefix}.ff.linear2"),
+            &rows(delta, h, two_h)?,
+            report,
+        )?;
+        return Ok(());
+    }
+    if let Some(prefix) = path.strip_suffix(".ff.net.2") {
+        return merge_into(unet, &format!("{prefix}.ff.linear3"), delta, report);
+    }
+    merge_into(unet, path, delta, report)
 }
 
 /// Map one safetensors key to `(diffusers_dotted_path, role)`, or `None` if it targets a module
@@ -122,7 +216,7 @@ fn classify_key(key: &str, kohya_to_dotted: &BTreeMap<String, String>) -> Option
 /// `b@a` (K=rank≤512) would hit the dense GEMM bug, so we run the matmul in **f32** (correct) and
 /// round the result back through the source dtype — MLX's f16 matmul equals `round_f16` of the
 /// f32-accumulated product, so this is bit-identical to the reference without touching the bug.
-fn lora_delta(down: &Array, up: &Array, alpha: f32, rank: f32, scale: f32) -> Result<Array> {
+pub fn lora_delta(down: &Array, up: &Array, alpha: f32, rank: f32, scale: f32) -> Result<Array> {
     let src = up.dtype(); // f16 for kohya/community LoRAs; f32 makes the round-trip a no-op.
     let ba = matmul(
         &up.as_dtype(Dtype::Float32)?,
@@ -146,6 +240,7 @@ fn merge_one(
     w: &Weights,
     scale: f32,
     kohya_to_dotted: &BTreeMap<String, String>,
+    coverage: LoraCoverage,
     report: &mut SdxlLoraReport,
 ) -> Result<()> {
     let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
@@ -175,19 +270,19 @@ fn merge_one(
             report.skipped_keys += 2;
             continue;
         }
+        // Under vendored coverage, keep mid_block/ff out. kohya keys for those never reach here (the
+        // table excludes them), but a PEFT key carries its dotted path directly — gate it here so the
+        // faithful 515-module merge is byte-identical regardless of on-disk format.
+        if coverage == LoraCoverage::Vendored && is_complete_only(&path) {
+            report.skipped_keys += 1;
+            continue;
+        }
         let rank = down.shape()[0] as f32;
         let alpha = t.alpha.unwrap_or(rank);
         let delta = lora_delta(&down, &up, alpha, rank, scale)?;
-        let parts: Vec<&str> = path.split('.').collect();
-        match unet.adaptable_mut(&parts) {
-            Some(lin) => {
-                lin.merge_dense_delta(&delta)?;
-                report.merged += 1;
-            }
-            // PEFT keys can name a non-routable path (mid_block/ff); kohya stems always resolve
-            // (the table is built from routable paths). Either way: surfaced, not merged.
-            None => report.skipped_keys += 1,
-        }
+        // Routes 1:1 for attention/proj/time_emb/mid_block; row-splits the GEGLU `ff.net.0.proj`.
+        // A PEFT path naming a genuinely non-routable module surfaces as skipped inside `merge_into`.
+        merge_lora_routed(unet, &path, &delta, report)?;
     }
     Ok(())
 }
@@ -249,6 +344,13 @@ fn merge_one_lokr(
     }
 
     for (path, f) in grouped {
+        // LoKr stays at the vendored-equivalent surface regardless of coverage (sc-2671 extends only
+        // LoRA). mid_block is now routable, so gate it here to keep sc-2640's behaviour unchanged; FF
+        // LoKr keys resolve to no internal Linear anyway (`ff.net.*` has no `adaptable_mut` arm).
+        if is_complete_only(&path) {
+            report.skipped_keys += 1;
+            continue;
+        }
         let parts: Vec<&str> = path.split('.').collect();
         match unet.adaptable_mut(&parts) {
             Some(lin) => {
@@ -277,30 +379,43 @@ fn merge_one_lokr(
     Ok(())
 }
 
-/// Merge every adapter spec in `specs` into `unet` — LoRA (sc-2639) and LoKr (sc-2640). The vendored
-/// SDXL path supports LoRA only (it *rejects* LoKr); Rust is strictly more capable. Builds the kohya
-/// `flattened→dotted` table once from the U-Net's routable surface, then merges each file by kind.
-/// Errors if a non-empty spec list merges nothing (a real format/prefix misconfiguration — e.g. an
-/// original-SD `lora_unet_input_blocks_*` file).
+/// Merge every adapter spec in `specs` into `unet` — LoRA (sc-2639) and LoKr (sc-2640) — at the
+/// **vendored-faithful** coverage (the production default; 515 modules on LCM-LoRA). The vendored
+/// SDXL path supports LoRA only (it *rejects* LoKr); Rust is strictly more capable. See
+/// [`apply_sdxl_adapters_with`] for the [`LoraCoverage::Complete`] superset (sc-2671). Errors if a
+/// non-empty spec list merges nothing (a real format/prefix misconfiguration — e.g. an original-SD
+/// `lora_unet_input_blocks_*` file).
 pub fn apply_sdxl_adapters(
     unet: &mut UNet2DConditionModel,
     specs: &[AdapterSpec],
 ) -> Result<SdxlLoraReport> {
+    apply_sdxl_adapters_with(unet, specs, LoraCoverage::Vendored)
+}
+
+/// As [`apply_sdxl_adapters`], but with an explicit [`LoraCoverage`]. [`LoraCoverage::Complete`]
+/// (sc-2671) reaches `mid_block` + the GEGLU FF for LoRA — strictly more correct than the vendored
+/// path, at the cost of byte-parity with it. The SDXL [`crate::model::load`] selects this via the
+/// `SDXL_LORA_COMPLETE` env var; the default ([`apply_sdxl_adapters`]) stays vendored-faithful.
+pub fn apply_sdxl_adapters_with(
+    unet: &mut UNet2DConditionModel,
+    specs: &[AdapterSpec],
+    coverage: LoraCoverage,
+) -> Result<SdxlLoraReport> {
     if specs.is_empty() {
         return Ok(SdxlLoraReport::default());
     }
-    let kohya_to_dotted: BTreeMap<String, String> = unet
-        .lora_target_paths()
-        .into_iter()
-        .map(|p| (p.replace('.', "_"), p))
-        .collect();
+    // LoKr is always merged against the vendored-equivalent surface; LoRA uses the coverage table.
+    let vendored_table = build_table(unet.lora_target_paths());
+    let complete_table = (coverage == LoraCoverage::Complete)
+        .then(|| build_table(unet.lora_target_paths_complete()));
+    let lora_table = complete_table.as_ref().unwrap_or(&vendored_table);
 
     let mut report = SdxlLoraReport::default();
     for spec in specs {
         let w = Weights::from_file(&spec.path)?;
         match spec.kind {
             AdapterKind::Lokr => {
-                merge_one_lokr(unet, &w, spec.scale, &kohya_to_dotted, &mut report)?
+                merge_one_lokr(unet, &w, spec.scale, &vendored_table, &mut report)?
             }
             AdapterKind::Lora => {
                 // The file metadata is authoritative — a Lora-declared LoKr file would merge nothing
@@ -311,7 +426,7 @@ pub fn apply_sdxl_adapters(
                         spec.path.display()
                     )));
                 }
-                merge_one(unet, &w, spec.scale, &kohya_to_dotted, &mut report)?
+                merge_one(unet, &w, spec.scale, lora_table, coverage, &mut report)?
             }
         }
     }
@@ -421,6 +536,70 @@ mod tests {
         assert!(
             classify_lokr_key("lora_unet_mid_block_attentions_0_proj_in.lokr_w1", &t).is_none()
         );
+    }
+
+    #[test]
+    fn is_complete_only_flags_mid_block_and_ff_only() {
+        // mid_block (any leaf) and GEGLU FF leaves are complete-only.
+        for p in [
+            "mid_block.attentions.0.transformer_blocks.0.attn1.to_q",
+            "mid_block.attentions.0.proj_in",
+            "down_blocks.1.attentions.0.transformer_blocks.0.ff.net.0.proj",
+            "up_blocks.0.attentions.0.transformer_blocks.0.ff.net.2",
+        ] {
+            assert!(is_complete_only(p), "{p} should be complete-only");
+        }
+        // The vendored-faithful surface is NOT complete-only.
+        for p in [
+            "down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q",
+            "down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_out.0",
+            "up_blocks.0.attentions.0.proj_in",
+            "down_blocks.0.resnets.0.time_emb_proj",
+        ] {
+            assert!(
+                !is_complete_only(p),
+                "{p} must stay in the faithful surface"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_complete_table_resolves_mid_block_and_ff_stems() {
+        // A complete-style table additionally carries mid_block + ff diffusers paths.
+        let t: BTreeMap<String, String> = [
+            "mid_block.attentions.0.transformer_blocks.0.attn1.to_q",
+            "mid_block.attentions.0.proj_in",
+            "down_blocks.1.attentions.0.transformer_blocks.0.ff.net.0.proj",
+            "down_blocks.1.attentions.0.transformer_blocks.0.ff.net.2",
+        ]
+        .into_iter()
+        .map(|p| (p.replace('.', "_"), p.to_string()))
+        .collect();
+        let (mid, _) = classify_key(
+            "lora_unet_mid_block_attentions_0_transformer_blocks_0_attn1_to_q.lora_down.weight",
+            &t,
+        )
+        .expect("kohya mid_block attn should resolve under the complete table");
+        assert_eq!(
+            mid,
+            "mid_block.attentions.0.transformer_blocks.0.attn1.to_q"
+        );
+        let (ff, _) = classify_key(
+            "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_ff_net_0_proj.lora_up.weight",
+            &t,
+        )
+        .expect("kohya GEGLU ff.net.0.proj should resolve under the complete table");
+        assert_eq!(
+            ff,
+            "down_blocks.1.attentions.0.transformer_blocks.0.ff.net.0.proj"
+        );
+        // Those same stems are absent from the faithful table → None (proves the gate works by
+        // table construction for kohya keys; PEFT keys are gated by `is_complete_only`).
+        assert!(classify_key(
+            "lora_unet_mid_block_attentions_0_transformer_blocks_0_attn1_to_q.lora_down.weight",
+            &table()
+        )
+        .is_none());
     }
 
     #[test]
