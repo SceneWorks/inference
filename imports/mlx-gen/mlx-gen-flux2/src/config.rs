@@ -53,14 +53,12 @@ impl Flux2Variant {
     }
 
     pub fn descriptor(self) -> ModelDescriptor {
-        // Scope of THIS story (sc-2346): txt2img + single-reference edit. Sibling stories extend
-        // the surface: txt2img img2img adds `Reference` (sc-2644), edit adds `MultiReference`
-        // (sc-2645). Advertise what this port delivers, no more, no less.
-        let conditioning = if self.is_edit() {
-            vec![ConditioningKind::Reference]
-        } else {
-            Vec::new()
-        };
+        // Both variants accept a single `Reference`, but the semantics differ by variant: for the
+        // edit variant it is the reference image concatenated as extra sequence tokens (sc-2346);
+        // for txt2img it is an **img2img** init image seeding the latents via the noise blend
+        // (sc-2644). Multi-reference edit (`MultiReference`) is sc-2645. Advertise what this port
+        // delivers, no more, no less.
+        let conditioning = vec![ConditioningKind::Reference];
         ModelDescriptor {
             id: self.id(),
             family: "flux2",
