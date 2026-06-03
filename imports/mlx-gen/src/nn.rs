@@ -9,20 +9,54 @@
 
 use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{
-    add, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, matmul, multiply, sigmoid,
+    add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, multiply, power, sigmoid,
+    tanh,
 };
 use mlx_rs::Array;
 
+use crate::array::scalar;
 use crate::Result;
 
 /// `y = x · Wᵀ + b` for a stored `[out, in]` weight + bias (PyTorch `nn.Linear` convention).
+///
+/// FUSED `addmm(bias, x, Wᵀ)` — matching MLX's own `nn.Linear` (and the core `AdaptableLinear`
+/// dense path, sc-2779). A separate `matmul` then `add` double-rounds the bias add in bf16
+/// (~1.4e-3/Linear, compounding over a deep net); `addmm` rounds once. f32-invisible (`addmm ==
+/// matmul+add` bit-for-bit with f32 activations, even over bf16 weights), so this is safe for the
+/// current f32-activation text-encoder consumers (LTX, Qwen) and correct once they go bf16.
 pub fn linear(x: &Array, w: &Array, b: &Array) -> Result<Array> {
-    Ok(add(&matmul(x, w.t())?, b)?)
+    Ok(addmm(b, x, w.t(), 1.0, 1.0)?)
 }
 
 /// SiLU / swish activation: `x · sigmoid(x)`.
 pub fn silu(x: &Array) -> Result<Array> {
     Ok(multiply(x, &sigmoid(x)?)?)
+}
+
+/// GELU tanh approximation — `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))` — **dtype-preserving**
+/// and **bit-exact** to MLX-Python's `nn.GELU(approx="tanh")` / `mx.nn.gelu_approx`.
+///
+/// Two traps this avoids, both latent in f32 and surfacing only on a bf16 FFN path (sc-2779):
+///   1. **Scalar dtype.** MLX weak-casts its python-float constants to the *input* dtype, so a
+///      bf16 input computes in bf16. `mlx_rs::nn::gelu_approximate` (and any `scalar(..)`-based
+///      hand-roll) uses f32 constants, which promote a bf16 input to f32 — a ~2.4e-3 mismatch
+///      vs the golden. We cast every constant to `x.dtype()` so bf16 stays bf16 and f32 stays f32.
+///   2. **The `√(2/π)` constant.** `mlx_rs::nn::gelu_approximate` builds it with an f32 MLX `sqrt`
+///      op (1 ULP off MLX-Python's f64-host `math.sqrt`); over a deep f32 path that 1-ULP seed
+///      amplifies (Wan UMT5: ~5e-7 → ~1e-3 over 24 layers — see [[mlx-rs-gelu-approx-f64-constant]]).
+///      We compute it in f64 on the host, then cast.
+///
+/// Result: the f32 path is bit-exact to the reference and a bf16 input is preserved in bf16.
+/// Shared across the family crates' tanh-approx FFNs (Wan today; Qwen/FLUX/FLUX.2/Z-Image as their
+/// forwards move f32→bf16, sc-2718–2721). `x³` via integer-exponent `power`, as MLX does.
+pub fn gelu_tanh(x: &Array) -> Result<Array> {
+    let dt = x.dtype();
+    let s = |v: f32| -> Result<Array> { Ok(scalar(v).as_dtype(dt)?) };
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+    let x3 = power(x, Array::from_int(3))?;
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    Ok(multiply(&multiply(x, &s(0.5)?)?, &gate)?)
 }
 
 /// 2-D conv over NHWC `x` with an mlx `[out, kH, kW, in]` weight (+ optional bias).
@@ -136,6 +170,86 @@ impl TextRope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::ops::{abs, array_eq, max, subtract};
+    use mlx_rs::Dtype;
+
+    #[test]
+    fn linear_is_fused_addmm() {
+        // sc-2779: the shared biased-linear helper must be a FUSED addmm. In bf16, addmm differs
+        // from matmul+add (single vs double rounding), so prove fusion on bf16 inputs.
+        let w = Array::from_slice(
+            &(0..64 * 64)
+                .map(|i| (i as f32 * 0.013).sin() * 0.05)
+                .collect::<Vec<_>>(),
+            &[64, 64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let b = Array::from_slice(
+            &(0..64)
+                .map(|i| (i as f32 * 0.7).cos() * 0.1)
+                .collect::<Vec<_>>(),
+            &[64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let x = Array::from_slice(
+            &(0..4 * 64)
+                .map(|i| (i as f32 * 0.031).sin() * 0.5)
+                .collect::<Vec<_>>(),
+            &[4, 64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+
+        let got = linear(&x, &w, &b).unwrap();
+        let want = addmm(&b, &x, w.t(), 1.0, 1.0).unwrap();
+        assert!(array_eq(&got, &want, false).unwrap().item::<bool>());
+    }
+
+    #[test]
+    fn gelu_tanh_preserves_dtype() {
+        // sc-2779: a bf16 input must stay bf16 (MLX weak-casts the constants to the input dtype),
+        // and an f32 input must stay f32.
+        let x32 = Array::from_slice(&[-2.0f32, -0.5, 0.0, 0.5, 1.0, 3.0], &[2, 3]);
+        assert_eq!(gelu_tanh(&x32).unwrap().dtype(), Dtype::Float32);
+        let xbf = x32.as_dtype(Dtype::Bfloat16).unwrap();
+        assert_eq!(gelu_tanh(&xbf).unwrap().dtype(), Dtype::Bfloat16);
+    }
+
+    #[test]
+    fn gelu_tanh_f32_matches_closed_form() {
+        // f32 path matches the closed form computed with the f64-host √(2/π) constant, bit-exact.
+        let x = Array::from_slice(&[-2.0f32, -0.5, 0.0, 0.5, 1.0, 3.0], &[2, 3]);
+        let c = scalar((2.0_f64 / std::f64::consts::PI).sqrt() as f32);
+        let x3 = power(&x, Array::from_int(3)).unwrap();
+        let inner = multiply(
+            add(&x, multiply(&x3, scalar(0.044_715)).unwrap()).unwrap(),
+            &c,
+        )
+        .unwrap();
+        let gate = add(tanh(&inner).unwrap(), scalar(1.0)).unwrap();
+        let want = multiply(multiply(&x, scalar(0.5)).unwrap(), &gate).unwrap();
+        assert!(array_eq(gelu_tanh(&x).unwrap(), &want, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    fn gelu_tanh_bf16_is_close_to_f32_truth() {
+        // Preserving bf16 must not mean *wrong*: the bf16 result tracks the f32 reference within
+        // bf16 rounding.
+        let x = Array::from_slice(&[-2.0f32, -0.5, 0.0, 0.5, 1.0, 3.0], &[2, 3]);
+        let truth = gelu_tanh(&x).unwrap();
+        let bf = gelu_tanh(&x.as_dtype(Dtype::Bfloat16).unwrap())
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let d = max(abs(subtract(&bf, &truth).unwrap()).unwrap(), None)
+            .unwrap()
+            .item::<f32>();
+        assert!(d < 5e-2, "bf16 gelu_tanh diverged from f32 truth: {d}");
+    }
 
     #[test]
     fn conv3d_1x1x1_sums_input_channels_with_bias() {
