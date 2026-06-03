@@ -124,18 +124,19 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         // forward-time residual) keeps the chaos-sensitive ancestral sampler bit-exact. Out-of-surface
         // keys (mid_block/ff/conv) are surfaced in the report, not dropped.
         //
-        // Coverage (sc-2671): the default is vendored-faithful (515 modules; byte-parity with the
-        // production SDXL path). `SDXL_LORA_COMPLETE` opts into the strictly-more-correct superset
-        // (mid_block + GEGLU FF) the vendored `lora.py` silently drops. Kept a flag, not the default,
-        // because the parity target is the vendored path; flipping the default is a deliberate call.
-        let coverage = if std::env::var_os("SDXL_LORA_COMPLETE").is_some() {
+        // Coverage (sc-2671): default to the strictly-more-correct COMPLETE surface — mid_block +
+        // the GEGLU FF the vendored `lora.py` silently drops — so SDXL LoRAs apply in full, matching
+        // diffusers (Michael's correctness-over-parity call, 2026-06-03). `SDXL_LORA_VENDORED` is the
+        // escape hatch back to the legacy 515-module surface for byte-parity with the retired Python
+        // path.
+        let coverage = if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
             eprintln!(
-                "sdxl: SDXL_LORA_COMPLETE set — merging the complete LoRA surface (mid_block + ff), \
-                 strictly beyond the vendored 515-module reference (sc-2671)"
+                "sdxl: SDXL_LORA_VENDORED set — restricting LoRA to the legacy vendored 515-module \
+                 surface (mid_block + ff dropped; byte-parity with the retired Python path)"
             );
-            crate::adapters::LoraCoverage::Complete
-        } else {
             crate::adapters::LoraCoverage::Vendored
+        } else {
+            crate::adapters::LoraCoverage::Complete
         };
         crate::adapters::apply_sdxl_adapters_with(&mut unet, &spec.adapters, coverage)?;
     }

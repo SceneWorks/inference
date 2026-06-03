@@ -297,10 +297,11 @@ fn complete_render_differs_from_vendored_and_is_sane() {
         ..Default::default()
     };
     let render = |complete: bool| -> Image {
+        // Complete is now the load default; the vendored render opts back via SDXL_LORA_VENDORED.
         if complete {
-            std::env::set_var("SDXL_LORA_COMPLETE", "1");
+            std::env::remove_var("SDXL_LORA_VENDORED");
         } else {
-            std::env::remove_var("SDXL_LORA_COMPLETE");
+            std::env::set_var("SDXL_LORA_VENDORED", "1");
         }
         let spec =
             LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![lora_spec(1.0)]);
@@ -309,7 +310,7 @@ fn complete_render_differs_from_vendored_and_is_sane() {
             GenerationOutput::Images(mut v) => v.pop().unwrap(),
             other => panic!("expected Images, got {other:?}"),
         };
-        std::env::remove_var("SDXL_LORA_COMPLETE");
+        std::env::remove_var("SDXL_LORA_VENDORED");
         img
     };
 
@@ -336,4 +337,101 @@ fn complete_render_differs_from_vendored_and_is_sane() {
         "complete coverage must change the render (the extra mid_block/ff signal is applied)"
     );
     println!("✓ complete vs vendored render differs at {diff} px (>8) — mid/ff signal is live");
+}
+
+/// Eyeball helper (not a parity gate): render the SAME prompt/seed at vendored (515) vs complete
+/// (809) coverage and write both PNGs + an amplified abs-diff to `tools/golden/`, for a side-by-side
+/// look at what signal the vendored path drops. Config overridable via `SDXL_{PROMPT,W,H,STEPS,CFG,SEED}`.
+/// Run: cargo test -p mlx-gen-sdxl --release --test lora_complete_real_weights -- --ignored --nocapture dump_vendored_vs_complete_pngs
+#[test]
+#[ignore = "needs the real SDXL snapshot + LCM-LoRA — writes comparison PNGs"]
+fn dump_vendored_vs_complete_pngs() {
+    let env = |k: &str| std::env::var(k).ok();
+    let prompt = env("SDXL_PROMPT").unwrap_or_else(|| {
+        "a red fox in a snowy forest at dawn, highly detailed, photographic".into()
+    });
+    let w: u32 = env("SDXL_W").and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let h: u32 = env("SDXL_H").and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let steps: u32 = env("SDXL_STEPS").and_then(|s| s.parse().ok()).unwrap_or(8);
+    let cfg: f32 = env("SDXL_CFG").and_then(|s| s.parse().ok()).unwrap_or(2.0);
+    let seed: u64 = env("SDXL_SEED").and_then(|s| s.parse().ok()).unwrap_or(42);
+
+    let req = GenerationRequest {
+        prompt,
+        negative_prompt: Some("blurry, low quality, deformed".into()),
+        width: w,
+        height: h,
+        seed: Some(seed),
+        steps: Some(steps),
+        guidance: Some(cfg),
+        ..Default::default()
+    };
+    let render = |complete: bool| -> Image {
+        // Complete is now the load default; the vendored render opts back via SDXL_LORA_VENDORED.
+        if complete {
+            std::env::remove_var("SDXL_LORA_VENDORED");
+        } else {
+            std::env::set_var("SDXL_LORA_VENDORED", "1");
+        }
+        let spec =
+            LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![lora_spec(1.0)]);
+        let model = mlx_gen::load("sdxl", &spec).unwrap();
+        let img = match model.generate(&req, &mut |_| {}).unwrap() {
+            GenerationOutput::Images(mut v) => v.pop().unwrap(),
+            other => panic!("expected Images, got {other:?}"),
+        };
+        std::env::remove_var("SDXL_LORA_VENDORED");
+        img
+    };
+
+    let vend = render(false);
+    let comp = render(true);
+
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/golden");
+    std::fs::create_dir_all(&out).unwrap();
+    let save = |name: &str, img: &Image| {
+        let p = out.join(name);
+        image::save_buffer(
+            &p,
+            &img.pixels,
+            img.width,
+            img.height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+        p
+    };
+    let pv = save("sdxl_lora_vendored.png", &vend);
+    let pc = save("sdxl_lora_complete.png", &comp);
+    // Amplified (×4, clamped) per-pixel abs diff so the dropped signal is visible.
+    let diff: Vec<u8> = vend
+        .pixels
+        .iter()
+        .zip(&comp.pixels)
+        .map(|(a, b)| (((*a as i32 - *b as i32).abs() * 4).min(255)) as u8)
+        .collect();
+    let pd = out.join("sdxl_lora_diff_x4.png");
+    image::save_buffer(
+        &pd,
+        &diff,
+        vend.width,
+        vend.height,
+        image::ExtendedColorType::Rgb8,
+    )
+    .unwrap();
+
+    let n = vend
+        .pixels
+        .iter()
+        .zip(&comp.pixels)
+        .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
+        .count();
+    println!("VENDORED (515): {}", pv.display());
+    println!("COMPLETE (809): {}", pc.display());
+    println!("DIFF ×4       : {}", pd.display());
+    println!(
+        "{w}x{h} {steps} steps cfg {cfg} seed {seed} — px>8 differing: {n}/{} ({:.1}%)",
+        vend.pixels.len(),
+        100.0 * n as f32 / vend.pixels.len() as f32
+    );
 }
