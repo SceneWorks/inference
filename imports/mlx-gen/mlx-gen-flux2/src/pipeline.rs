@@ -156,6 +156,20 @@ pub fn preprocess_ref_image(image: &Image, target_width: u32, target_height: u32
     Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))
 }
 
+/// img2img start step (the fork's `Config.init_time_step`): `max(1, floor(num_steps · strength))`
+/// for a positive strength clamped to `[0, 1]`, else `0` (pure txt2img). The denoise loop runs
+/// `start_step..num_steps`, and the init image is blended in at `sigmas[start_step]`.
+pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+    match strength {
+        Some(s) if s > 0.0 => {
+            let s = s.clamp(0.0, 1.0);
+            // Python `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
+            ((num_steps as f32 * s) as usize).max(1)
+        }
+        _ => 0,
+    }
+}
+
 /// img2img / edit noise blend: `(1 - sigma)·clean + sigma·noise` at the start sigma.
 /// Mirrors `LatentCreator.add_noise_by_interpolation`. (Used by sc-2644 img2img / S5 edit.)
 pub fn add_noise_by_interpolation(clean: &Array, noise: &Array, sigma: f32) -> Result<Array> {
@@ -171,4 +185,23 @@ fn validate_multiple_of_16(width: u32, height: u32) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_time_step_matches_fork_floor_and_clamp() {
+        // None / zero / negative strength → pure txt2img (start at 0).
+        assert_eq!(init_time_step(4, None), 0);
+        assert_eq!(init_time_step(4, Some(0.0)), 0);
+        assert_eq!(init_time_step(4, Some(-0.5)), 0);
+        // floor(steps · strength), with a floor of 1 for any positive strength.
+        assert_eq!(init_time_step(4, Some(0.1)), 1); // floor(0.4)=0 → clamped up to 1
+        assert_eq!(init_time_step(4, Some(0.6)), 2); // floor(2.4)=2
+        assert_eq!(init_time_step(20, Some(0.6)), 12); // floor(12.0)=12
+                                                       // strength clamped to 1.0.
+        assert_eq!(init_time_step(4, Some(2.0)), 4);
+    }
 }
