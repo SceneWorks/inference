@@ -17,16 +17,18 @@
 //! them in the weight dtype) then casts back to bf16. The patch embedding and the head run
 //! f32-promoted matmuls (bf16 weight × f32 activation), as the reference does (no `.astype` there).
 //!
-//! This is byte-faithful to the production bf16 reference now that **both** NAX 16-bit kernel bugs
-//! are patched on the pinned build: the dense GEMM (sc-2714, `matmul.cpp`) and `fast` SDPA (sc-2770,
-//! `scaled_dot_product_attention.cpp`) — see [[pmetal-mlx-bf16-matmul-bug]]. (An earlier f32-activation
-//! version was a workaround for the then-broken bf16 SDPA; it's obsolete.)
+//! The NAX 16-bit GEMM + SDPA are correct on the pinned build (sc-2772 fixed the metal compile
+//! target to macOS 26.2, where the `mpp::tensor_ops::matmul2d` matrix-unit kernels are valid — see
+//! [[pmetal-mlx-bf16-matmul-bug]]). An earlier f32-activation version was a workaround for the
+//! then-broken bf16 SDPA; it's obsolete. The pinned build is MLX **0.31.1**; the production reference
+//! is **0.31.2** (which reworked the NAX bf16 kernels), so bf16 parity is exact only up to that
+//! cross-version kernel difference (f32 is bit-exact across the two) until the pin moves to 0.31.2.
 
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, cos, matmul, multiply, sigmoid, sin, split};
+use mlx_rs::ops::{add, addmm, concatenate_axis, cos, multiply, sigmoid, sin, split};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::WanModelConfig;
@@ -34,9 +36,12 @@ use crate::patchify::{patchify, unpatchify};
 use crate::rope::RopeTable;
 use crate::text_encoder::gelu_tanh;
 
-/// A `[out, in]` weight + bias (every DiT `nn.Linear` is biased). `forward` is dtype-agnostic — the
-/// result dtype follows `x` (bf16 in × bf16 weight → bf16; f32 in → f32-promoted), so callers cast
-/// `x` to mirror the reference's explicit `.astype` placement.
+/// A `[out, in]` weight + bias (every DiT `nn.Linear` is biased). `forward` mirrors MLX's
+/// `nn.Linear`: a **fused** `addmm(bias, x, Wᵀ)` — accumulate `x·Wᵀ`, add bias, round once. Using a
+/// separate `matmul` + `add` instead double-rounds in bf16 (matmul→bf16, then bias add→bf16), which
+/// is a ~bf16-ULP (~1.4e-3) error per layer that compounds over the 30 blocks — exactly the gap that
+/// localized to `q_proj`. `forward` is dtype-agnostic: the result dtype follows `x` (bf16 in → bf16;
+/// f32 in → f32-promoted, where the fusion is a no-op since nothing rounds to bf16 mid-op).
 struct Linear {
     w: Array,
     b: Array,
@@ -50,7 +55,7 @@ impl Linear {
         })
     }
     fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(add(&matmul(x, self.w.t())?, &self.b)?)
+        Ok(addmm(&self.b, x, self.w.t(), 1.0, 1.0)?)
     }
 }
 
