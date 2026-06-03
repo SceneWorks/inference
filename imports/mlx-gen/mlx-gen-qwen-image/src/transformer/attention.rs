@@ -50,6 +50,22 @@ impl AdaptableHost for QwenJointAttention {
             _ => None,
         }
     }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        [
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+            "to_add_out",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
 }
 
 impl QwenJointAttention {
