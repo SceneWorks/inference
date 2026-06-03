@@ -26,10 +26,16 @@ use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{add, matmul, multiply, power, softmax_axis, subtract, tanh};
+use mlx_rs::ops::{add, matmul, multiply, softmax_axis, subtract};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::WanModelConfig;
+
+/// The dtype-preserving, golden-bit-exact tanh-GELU now lives in shared core `nn` (sc-2779) —
+/// re-exported here so `text_encoder::gelu_tanh` (used by both the UMT5 FFN and the DiT FFN via
+/// `transformer.rs`) keeps resolving. The UMT5 TE feeds it f32 (bit-exact); the DiT FFN feeds it
+/// bf16 (preserved as bf16) — both matching `nn.GELU(approx="tanh")`.
+pub(crate) use mlx_gen::nn::gelu_tanh;
 
 /// The additive value the reference uses to mask padding keys (`F.softmax`'s `dtype.min` analogue;
 /// `mx.where(mask == 0, -3.389e38, 0.0)`). Large enough that `exp` underflows to exactly 0.
@@ -260,31 +266,6 @@ impl Umt5Block {
 /// (bf16) — `matmul` promotes to an f32 GEMM, bit-identical to the reference's f32 weights.
 fn linear(x: &Array, w: &Array) -> Result<Array> {
     Ok(matmul(x, w.t())?)
-}
-
-/// GELU tanh approximation, **bit-exact** to MLX-Python's `nn.GELU(approx="tanh")`:
-/// `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
-///
-/// Deliberately hand-rolled instead of `mlx_rs::nn::gelu_approximate`: mlx-rs computes the `√(2/π)`
-/// constant with an f32 MLX `sqrt` op, whereas MLX-Python computes it in **f64 on the host** then
-/// casts to f32 — a 1-ULP difference in the constant. That seeds a ~5e-7 per-element gap which the
-/// 24 unscaled-attention layers amplify into a ~1e-3 end-to-end divergence. Computing the constant
-/// in f64 here collapses it: with this form the per-op floor (matmul / rms_norm / softmax / gelu)
-/// is all 0.0, so the encoder is bit-exact to the reference. (`x³` via integer-exponent `power`, as
-/// both the reference and mlx-rs do.)
-pub(crate) fn gelu_tanh(x: &Array) -> Result<Array> {
-    // Cast the scalar constants to `x`'s dtype, mirroring MLX-Python's weak scalar typing
-    // (`float * array` adopts the array dtype). This keeps a bf16 input computing in bf16 (the Wan
-    // DiT FFN) and an f32 input in f32 (the UMT5 TE) — matching `nn.GELU(approx="tanh")` at both. A
-    // plain `scalar(..)` is f32 and would promote a bf16 input to f32 (a ~1e-3 dtype mismatch in the
-    // DiT). `√(2/π)` is still computed in f64 on the host (the S1 f32-parity fix), then cast.
-    let dt = x.dtype();
-    let s = |v: f32| -> Result<Array> { Ok(scalar(v).as_dtype(dt)?) };
-    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-    let x3 = power(x, Array::from_int(3))?;
-    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-    Ok(multiply(&multiply(x, &s(0.5)?)?, &gate)?)
 }
 
 /// `[1, L]` int/float mask → `[1, 1, 1, L]` f32 additive mask (`0` where kept, `MASK_FILL` where
