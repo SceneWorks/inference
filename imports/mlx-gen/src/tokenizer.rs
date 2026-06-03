@@ -32,6 +32,12 @@ pub enum ChatTemplate {
     /// `enable_thinking=True`, which adds no `<think>` block):
     /// `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
     QwenInstruct,
+    /// Qwen single-user-turn + generation prompt with `enable_thinking=False` — the form FLUX.2's
+    /// Qwen3 text encoder uses. Identical to [`QwenInstruct`](Self::QwenInstruct) but the
+    /// generation prompt appends an empty `<think>…</think>` block (verified against the fork's
+    /// `apply_chat_template(..., enable_thinking=False)`):
+    /// `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`.
+    QwenInstructNoThink,
     /// Qwen-Image's T2I prompt template (the fork's `LanguageTokenizer` `template=`): a fixed
     /// system instruction + the user prompt + generation prompt. The text encoder later drops the
     /// leading 34 template tokens (`prompt_drop_idx`), keeping the prompt + trailing
@@ -47,6 +53,9 @@ impl ChatTemplate {
             ChatTemplate::QwenInstruct => {
                 format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n")
             }
+            ChatTemplate::QwenInstructNoThink => format!(
+                "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            ),
             ChatTemplate::QwenImage => format!(
                 "<|im_start|>system\nDescribe the image by detailing the color, shape, size, \
                  texture, quantity, text, spatial relationships of the objects and \
@@ -184,6 +193,15 @@ mod tests {
         assert_eq!(
             r,
             "<|im_start|>user\na red fox<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen_instruct_no_think_appends_empty_think_block() {
+        let r = ChatTemplate::QwenInstructNoThink.render("a red fox");
+        assert_eq!(
+            r,
+            "<|im_start|>user\na red fox<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
     }
 
