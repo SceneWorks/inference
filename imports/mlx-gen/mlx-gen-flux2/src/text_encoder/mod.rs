@@ -22,14 +22,15 @@ pub use mlp::Qwen3Mlp;
 // The HF half-split text RoPE is identical across families and lives in core (F-006).
 pub use mlx_gen::nn::TextRope;
 
-use mlx_rs::ops::matmul;
-use mlx_rs::Array;
-
+use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-/// `y = x · Wᵀ` for a stored `[out, in]` weight (bias-less Linear — every Qwen3 projection).
-pub(crate) fn matmul_t(x: &Array, w: &Array) -> Result<Array> {
-    Ok(matmul(x, w.t())?)
+/// Wrap a stored `[out, in]` weight as a bias-less dense [`AdaptableLinear`] — every Qwen3
+/// projection is a bias-less Linear. Dense forward = `matmul(x, wᵀ)`; `quantize` swaps the base to
+/// a Q4/Q8 `quantized_matmul`, the mlx-rs equivalent of the fork's `nn.quantize` over the TE.
+pub(crate) fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
+    Ok(AdaptableLinear::dense(w.require(key)?.clone(), None))
 }
 
 /// Join a module prefix with a leaf name, tolerating an empty prefix.

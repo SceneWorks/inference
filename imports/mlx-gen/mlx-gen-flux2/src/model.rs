@@ -1,9 +1,11 @@
 //! FLUX.2-klein provider registration + the txt2img generation path.
 //!
 //! `load()` assembles the tokenizer, Qwen3 text encoder, MMDiT transformer, and 32-ch VAE from a
-//! snapshot directory. `generate()` runs the flow-match denoise loop (CFG dual-forward when
-//! `guidance > 1`; distilled klein defaults to 1.0 = single forward), then BN-denormalizes +
-//! 2×2-unpatchifies + VAE-decodes. Edit (`flux2_klein_9b_edit`) generation lands in S5.
+//! snapshot directory; `spec.quantize` (Q4/Q8, sc-2643) then quantizes the whole model in place.
+//! `generate()` runs the flow-match denoise loop (CFG dual-forward when `guidance > 1`; distilled
+//! klein defaults to 1.0 = single forward), then BN-denormalizes + 2×2-unpatchifies + VAE-decodes.
+//! Both the txt2img (`flux2_klein_9b`) and single-reference edit (`flux2_klein_9b_edit`) variants
+//! share this path.
 //!
 //! Activations run f32 (matmul(f32, bf16)→f32): dodges the dense 16-bit Metal GEMM bug and is the
 //! quality target. Pixel-parity with the fork's bf16 render is therefore not the gate (see the
@@ -47,8 +49,10 @@ pub fn load_klein_9b_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
+        // The dense path loads at the on-disk dtype and runs f32 activations; an explicit fp32
+        // precision override isn't a separate wired mode. Q4/Q8 (sc-2643) go through `spec.quantize`.
         return Err(Error::Msg(format!(
-            "{}: only dense bf16 is wired (Q4/Q8 = sc-2643)",
+            "{}: only the default precision is wired; drop the precision override (Q4/Q8 = spec.quantize)",
             variant.id()
         )));
     }
@@ -68,11 +72,22 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
             variant.id()
         )));
     }
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(format!(
-            "{}: Q4/Q8 quantization is sc-2643",
-            variant.id()
-        )));
+
+    let mut text_encoder = loader::load_text_encoder(root)?;
+    let mut transformer = loader::load_transformer(root)?;
+    let mut vae = loader::load_vae(root)?;
+    // Q4/Q8 quantizes the **whole model** in place after the dense load — the fork's `nn.quantize`
+    // over (transformer, text_encoder, vae), group_size 64, every quantizable Linear (+ the text
+    // encoder's token Embedding). Full-model scope like Z-Image (sc-2532), unlike Qwen's
+    // transformer-only quant (sc-2565) — quant scope is per-fork. The VAE's quantized surface is
+    // just its two mid-block attentions (everything else there is Conv/GroupNorm). The dense load
+    // runs f32, but `quantize` casts weights to bf16 before packing so the scales byte-match the
+    // fork's bf16 `nn.quantize` (sc-2604).
+    if let Some(q) = spec.quantize {
+        let bits = q.bits();
+        transformer.quantize(bits)?;
+        text_encoder.quantize(bits)?;
+        vae.quantize(bits)?;
     }
 
     Ok(Box::new(Flux2 {
@@ -80,9 +95,9 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         variant,
         config: variant.config(),
         tokenizer: Some(loader::load_tokenizer(root)?),
-        text_encoder: Some(loader::load_text_encoder(root)?),
-        transformer: Some(loader::load_transformer(root)?),
-        vae: Some(loader::load_vae(root)?),
+        text_encoder: Some(text_encoder),
+        transformer: Some(transformer),
+        vae: Some(vae),
     }))
 }
 

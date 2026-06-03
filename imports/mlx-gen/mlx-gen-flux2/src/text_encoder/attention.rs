@@ -6,16 +6,17 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, split};
 use mlx_rs::Array;
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::{join, matmul_t};
+use super::{join, lin};
 
 pub struct Qwen3Attention {
-    q_w: Array,
-    k_w: Array,
-    v_w: Array,
-    o_w: Array,
+    q_w: AdaptableLinear,
+    k_w: AdaptableLinear,
+    v_w: AdaptableLinear,
+    o_w: AdaptableLinear,
     q_norm: Array,
     k_norm: Array,
     num_heads: i32,
@@ -35,10 +36,10 @@ impl Qwen3Attention {
         eps: f32,
     ) -> Result<Self> {
         Ok(Self {
-            q_w: w.require(&join(prefix, "q_proj.weight"))?.clone(),
-            k_w: w.require(&join(prefix, "k_proj.weight"))?.clone(),
-            v_w: w.require(&join(prefix, "v_proj.weight"))?.clone(),
-            o_w: w.require(&join(prefix, "o_proj.weight"))?.clone(),
+            q_w: lin(w, &join(prefix, "q_proj.weight"))?,
+            k_w: lin(w, &join(prefix, "k_proj.weight"))?,
+            v_w: lin(w, &join(prefix, "v_proj.weight"))?,
+            o_w: lin(w, &join(prefix, "o_proj.weight"))?,
             q_norm: w.require(&join(prefix, "q_norm.weight"))?.clone(),
             k_norm: w.require(&join(prefix, "k_norm.weight"))?.clone(),
             num_heads,
@@ -49,14 +50,32 @@ impl Qwen3Attention {
         })
     }
 
+    /// Quantize the q/k/v/o projections (group_size 64). q/k RMSNorm stays full precision.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.q_w.quantize(bits, None)?;
+        self.k_w.quantize(bits, None)?;
+        self.v_w.quantize(bits, None)?;
+        self.o_w.quantize(bits, None)?;
+        Ok(())
+    }
+
     /// `x`: `[b, s, hidden]`; `cos`/`sin`: `[1, s, head_dim]`; `mask`: additive `[b,1,s,s]`.
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
 
-        let q = matmul_t(x, &self.q_w)?.reshape(&[b, s, self.num_heads, self.head_dim])?;
-        let k = matmul_t(x, &self.k_w)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
-        let v = matmul_t(x, &self.v_w)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let q = self
+            .q_w
+            .forward(x)?
+            .reshape(&[b, s, self.num_heads, self.head_dim])?;
+        let k = self
+            .k_w
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let v = self
+            .v_w
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
 
         // Per-head q/k RMSNorm over the head dim (Qwen3), before RoPE — matches the fork order.
         let q = rms_norm(&q, &self.q_norm, self.eps)?;
@@ -80,7 +99,7 @@ impl Qwen3Attention {
         let o =
             o.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;
-        matmul_t(&o, &self.o_w)
+        self.o_w.forward(&o)
     }
 }
 

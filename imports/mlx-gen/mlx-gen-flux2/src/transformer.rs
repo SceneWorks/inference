@@ -4,7 +4,10 @@
 //!
 //! Runs f32 activations (matmul(f32 act, bf16 weight)→f32): the `x_embedder` (K=128, M=seq≥2) is
 //! the dense 16-bit Metal GEMM bug shape, so the whole stack must run f32 — which is also the
-//! quality target. Linears are bias-less plain matmuls (Q4/Q8 = sc-2643, LoRA = sc-2646).
+//! quality target. Linears are bias-less core [`AdaptableLinear`]s so `spec.quantize` can pack
+//! every projection to Q4/Q8 in place (sc-2643; the fork quantizes every transformer `nn.Linear`).
+//! RMSNorm/LayerNorm weights stay full precision. With f32 activations the quantized forward feeds
+//! `quantized_matmul` f32 inputs (no bf16 upcast needed). LoRA over these bases = sc-2646.
 
 use std::f32::consts::LN_10;
 
@@ -12,6 +15,7 @@ use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
@@ -23,8 +27,11 @@ use crate::pos_embed::Flux2PosEmbed;
 const LN_EPS: f32 = 1e-6;
 const RMS_EPS: f32 = 1e-5;
 
-fn matmul_t(x: &Array, w: &Array) -> Result<Array> {
-    Ok(mlx_rs::ops::matmul(x, w.t())?)
+/// Wrap a stored `[out, in]` weight as a bias-less dense [`AdaptableLinear`] (every FLUX.2
+/// transformer projection). Dense forward = `matmul(x, wᵀ)`, bit-identical to the prior raw
+/// `matmul_t`; `quantize` swaps the base to a Q4/Q8 `quantized_matmul`.
+fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
+    Ok(AdaptableLinear::dense(w.require(key)?.clone(), None))
 }
 
 fn require_f32_input(x: &Array) -> Result<Array> {
@@ -35,9 +42,9 @@ fn require_f32_input(x: &Array) -> Result<Array> {
 #[allow(clippy::too_many_arguments)]
 fn process_qkv(
     x: &Array,
-    q_w: &Array,
-    k_w: &Array,
-    v_w: &Array,
+    q_w: &AdaptableLinear,
+    k_w: &AdaptableLinear,
+    v_w: &AdaptableLinear,
     norm_q: &Array,
     norm_k: &Array,
     heads: i32,
@@ -49,9 +56,9 @@ fn process_qkv(
         Ok(a.reshape(&[b, s, heads, head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?)
     };
-    let q = to_bhsd(matmul_t(x, q_w)?)?;
-    let k = to_bhsd(matmul_t(x, k_w)?)?;
-    let v = to_bhsd(matmul_t(x, v_w)?)?;
+    let q = to_bhsd(q_w.forward(x)?)?;
+    let k = to_bhsd(k_w.forward(x)?)?;
+    let v = to_bhsd(v_w.forward(x)?)?;
     let q = rms_norm(&q, norm_q, RMS_EPS)?;
     let k = rms_norm(&k, norm_k, RMS_EPS)?;
     Ok((q, k, v))
@@ -116,22 +123,28 @@ fn timestep_embedding(t: &Array, dim: usize) -> Result<Array> {
 }
 
 struct FeedForward {
-    linear_in: Array,
-    linear_out: Array,
+    linear_in: AdaptableLinear,
+    linear_out: AdaptableLinear,
 }
 
 impl FeedForward {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            linear_in: w.require(&format!("{prefix}.linear_in.weight"))?.clone(),
-            linear_out: w.require(&format!("{prefix}.linear_out.weight"))?.clone(),
+            linear_in: lin(w, &format!("{prefix}.linear_in.weight"))?,
+            linear_out: lin(w, &format!("{prefix}.linear_out.weight"))?,
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let x = matmul_t(x, &self.linear_in)?;
+        let x = self.linear_in.forward(x)?;
         let x = swiglu(&x)?;
-        matmul_t(&x, &self.linear_out)
+        self.linear_out.forward(&x)
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.linear_in.quantize(bits, None)?;
+        self.linear_out.quantize(bits, None)?;
+        Ok(())
     }
 }
 
@@ -142,16 +155,16 @@ struct DoubleBlock {
 }
 
 struct DoubleAttention {
-    to_q: Array,
-    to_k: Array,
-    to_v: Array,
-    to_out: Array,
+    to_q: AdaptableLinear,
+    to_k: AdaptableLinear,
+    to_v: AdaptableLinear,
+    to_out: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
-    add_q: Array,
-    add_k: Array,
-    add_v: Array,
-    to_add_out: Array,
+    add_q: AdaptableLinear,
+    add_k: AdaptableLinear,
+    add_v: AdaptableLinear,
+    to_add_out: AdaptableLinear,
     norm_added_q: Array,
     norm_added_k: Array,
     heads: i32,
@@ -161,22 +174,39 @@ struct DoubleAttention {
 impl DoubleAttention {
     fn from_weights(w: &Weights, prefix: &str, heads: i32, head_dim: i32) -> Result<Self> {
         let g = |n: &str| w.require(&format!("{prefix}.{n}.weight")).cloned();
+        let l = |n: &str| lin(w, &format!("{prefix}.{n}.weight"));
         Ok(Self {
-            to_q: g("to_q")?,
-            to_k: g("to_k")?,
-            to_v: g("to_v")?,
-            to_out: g("to_out")?,
+            to_q: l("to_q")?,
+            to_k: l("to_k")?,
+            to_v: l("to_v")?,
+            to_out: l("to_out")?,
             norm_q: g("norm_q")?,
             norm_k: g("norm_k")?,
-            add_q: g("add_q_proj")?,
-            add_k: g("add_k_proj")?,
-            add_v: g("add_v_proj")?,
-            to_add_out: g("to_add_out")?,
+            add_q: l("add_q_proj")?,
+            add_k: l("add_k_proj")?,
+            add_v: l("add_v_proj")?,
+            to_add_out: l("to_add_out")?,
             norm_added_q: g("norm_added_q")?,
             norm_added_k: g("norm_added_k")?,
             heads,
             head_dim,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        for p in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+            &mut self.add_q,
+            &mut self.add_k,
+            &mut self.add_v,
+            &mut self.to_add_out,
+        ] {
+            p.quantize(bits, None)?;
+        }
+        Ok(())
     }
 
     /// Joint attention. Returns `(img_attn_out, txt_attn_out)`.
@@ -219,8 +249,8 @@ impl DoubleAttention {
             &(txt_seq..o.shape()[1]).collect::<Vec<i32>>(),
             &[o.shape()[1] - txt_seq],
         );
-        let txt_out = matmul_t(&o.take_axis(&txt_idx, 1)?, &self.to_add_out)?;
-        let img_out = matmul_t(&o.take_axis(&img_idx, 1)?, &self.to_out)?;
+        let txt_out = self.to_add_out.forward(&o.take_axis(&txt_idx, 1)?)?;
+        let img_out = self.to_out.forward(&o.take_axis(&img_idx, 1)?)?;
         Ok((img_out, txt_out))
     }
 }
@@ -232,6 +262,13 @@ impl DoubleBlock {
             ff: FeedForward::from_weights(w, &format!("{prefix}.ff"))?,
             ff_context: FeedForward::from_weights(w, &format!("{prefix}.ff_context"))?,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize(bits)?;
+        self.ff.quantize(bits)?;
+        self.ff_context.quantize(bits)?;
+        Ok(())
     }
 
     /// `img_mod` / `txt_mod`: `[(shift_msa,scale_msa,gate_msa),(shift_mlp,scale_mlp,gate_mlp)]`.
@@ -279,8 +316,8 @@ impl DoubleBlock {
 }
 
 struct SingleBlock {
-    to_qkv_mlp: Array,
-    to_out: Array,
+    to_qkv_mlp: AdaptableLinear,
+    to_out: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
     heads: i32,
@@ -291,16 +328,20 @@ struct SingleBlock {
 impl SingleBlock {
     fn from_weights(w: &Weights, prefix: &str, heads: i32, head_dim: i32) -> Result<Self> {
         Ok(Self {
-            to_qkv_mlp: w
-                .require(&format!("{prefix}.attn.to_qkv_mlp_proj.weight"))?
-                .clone(),
-            to_out: w.require(&format!("{prefix}.attn.to_out.weight"))?.clone(),
+            to_qkv_mlp: lin(w, &format!("{prefix}.attn.to_qkv_mlp_proj.weight"))?,
+            to_out: lin(w, &format!("{prefix}.attn.to_out.weight"))?,
             norm_q: w.require(&format!("{prefix}.attn.norm_q.weight"))?.clone(),
             norm_k: w.require(&format!("{prefix}.attn.norm_k.weight"))?.clone(),
             heads,
             head_dim,
             inner: heads * head_dim,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.to_qkv_mlp.quantize(bits, None)?;
+        self.to_out.quantize(bits, None)?;
+        Ok(())
     }
 
     /// `mod`: `(shift, scale, gate)`.
@@ -313,7 +354,7 @@ impl SingleBlock {
     ) -> Result<Array> {
         let (shift, scale, gate) = m;
         let norm = modulate(&layer_norm(hidden, None, None, LN_EPS)?, scale, shift)?;
-        let proj = matmul_t(&norm, &self.to_qkv_mlp)?;
+        let proj = self.to_qkv_mlp.forward(&norm)?;
 
         let sh = proj.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -338,28 +379,32 @@ impl SingleBlock {
 
         let mlp = swiglu(&mlp)?;
         let cat = concatenate_axis(&[&attn, &mlp], -1)?;
-        let attn_output = matmul_t(&cat, &self.to_out)?;
+        let attn_output = self.to_out.forward(&cat)?;
         Ok(add(hidden, &multiply(gate, &attn_output)?)?)
     }
 }
 
 /// Per-stream modulation producer: `silu(temb) → linear → split into `sets` × (shift,scale,gate)`.
 struct Modulation {
-    linear: Array,
+    linear: AdaptableLinear,
     sets: usize,
 }
 
 impl Modulation {
     fn from_weights(w: &Weights, prefix: &str, sets: usize) -> Result<Self> {
         Ok(Self {
-            linear: w.require(&format!("{prefix}.linear.weight"))?.clone(),
+            linear: lin(w, &format!("{prefix}.linear.weight"))?,
             sets,
         })
     }
 
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.linear.quantize(bits, None)
+    }
+
     /// `temb`: `[B, dim]` → `Vec<(shift,scale,gate)>` of length `sets`, each `[B,1,dim]`.
     fn forward(&self, temb: &Array) -> Result<Vec<(Array, Array, Array)>> {
-        let mod_ = matmul_t(&silu(temb)?, &self.linear)?.expand_dims(1)?;
+        let mod_ = self.linear.forward(&silu(temb)?)?.expand_dims(1)?;
         let chunks = split(&mod_, (3 * self.sets) as i32, -1)?;
         Ok((0..self.sets)
             .map(|i| {
@@ -376,17 +421,17 @@ impl Modulation {
 /// The FLUX.2 MMDiT transformer.
 pub struct Flux2Transformer {
     pos_embed: Flux2PosEmbed,
-    time_linear1: Array,
-    time_linear2: Array,
+    time_linear1: AdaptableLinear,
+    time_linear2: AdaptableLinear,
     mod_img: Modulation,
     mod_txt: Modulation,
     mod_single: Modulation,
-    x_embedder: Array,
-    context_embedder: Array,
+    x_embedder: AdaptableLinear,
+    context_embedder: AdaptableLinear,
     double_blocks: Vec<DoubleBlock>,
     single_blocks: Vec<SingleBlock>,
-    norm_out_linear: Array,
-    proj_out: Array,
+    norm_out_linear: AdaptableLinear,
+    proj_out: AdaptableLinear,
     time_channels: usize,
 }
 
@@ -411,31 +456,62 @@ impl Flux2Transformer {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             pos_embed: Flux2PosEmbed::new(cfg.rope_theta, cfg.axes_dim),
-            time_linear1: w.require("time_guidance_embed.linear_1.weight")?.clone(),
-            time_linear2: w.require("time_guidance_embed.linear_2.weight")?.clone(),
+            time_linear1: lin(w, "time_guidance_embed.linear_1.weight")?,
+            time_linear2: lin(w, "time_guidance_embed.linear_2.weight")?,
             mod_img: Modulation::from_weights(w, "double_stream_modulation_img", 2)?,
             mod_txt: Modulation::from_weights(w, "double_stream_modulation_txt", 2)?,
             mod_single: Modulation::from_weights(w, "single_stream_modulation", 1)?,
-            x_embedder: w.require("x_embedder.weight")?.clone(),
-            context_embedder: w.require("context_embedder.weight")?.clone(),
+            x_embedder: lin(w, "x_embedder.weight")?,
+            context_embedder: lin(w, "context_embedder.weight")?,
             double_blocks,
             single_blocks,
-            norm_out_linear: w.require("norm_out.linear.weight")?.clone(),
-            proj_out: w.require("proj_out.weight")?.clone(),
+            norm_out_linear: lin(w, "norm_out.linear.weight")?,
+            proj_out: lin(w, "proj_out.weight")?,
             time_channels: cfg.timestep_channels,
         })
+    }
+
+    /// Quantize every transformer `nn.Linear` to Q4/Q8 (group_size 64) in place — the mlx-rs
+    /// equivalent of the fork's `nn.quantize(transformer, predicate=hasattr to_quantized, bits)`.
+    /// RMSNorm/LayerNorm weights are not Linears, so they stay full precision (as in the fork).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.time_linear1.quantize(bits, None)?;
+        self.time_linear2.quantize(bits, None)?;
+        self.mod_img.quantize(bits)?;
+        self.mod_txt.quantize(bits)?;
+        self.mod_single.quantize(bits)?;
+        self.x_embedder.quantize(bits, None)?;
+        self.context_embedder.quantize(bits, None)?;
+        for b in &mut self.double_blocks {
+            b.quantize(bits)?;
+        }
+        for b in &mut self.single_blocks {
+            b.quantize(bits)?;
+        }
+        self.norm_out_linear.quantize(bits, None)?;
+        self.proj_out.quantize(bits, None)?;
+        Ok(())
+    }
+
+    /// Test-only (sc-2643 byte-parity gate): the quantized `(wq, scales, biases, group_size, bits)`
+    /// of `transformer_blocks.0.attn.to_q` — a representative bias-less, bf16-native Linear. `None`
+    /// if the transformer is still dense.
+    #[doc(hidden)]
+    pub fn probe_quant_to_q(&self) -> Option<(&Array, &Array, &Array, i32, i32)> {
+        let (wq, sc, bi, _bias, gs, b) = self.double_blocks[0].attn.to_q.quantized_params()?;
+        Some((wq, sc, bi, gs, b))
     }
 
     fn temb(&self, timestep: f32) -> Result<Array> {
         // klein has no guidance embedding; timestep is fed as sigma·1000 (>1) so no rescale.
         let t = Array::from_slice(&[timestep], &[1]);
         let emb = timestep_embedding(&t, self.time_channels)?;
-        let h = matmul_t(&emb, &self.time_linear1)?;
-        matmul_t(&silu(&h)?, &self.time_linear2)
+        let h = self.time_linear1.forward(&emb)?;
+        self.time_linear2.forward(&silu(&h)?)
     }
 
     fn norm_out(&self, x: &Array, temb: &Array) -> Result<Array> {
-        let p = matmul_t(&silu(temb)?, &self.norm_out_linear)?; // [B, 2·dim]
+        let p = self.norm_out_linear.forward(&silu(temb)?)?; // [B, 2·dim]
         let parts = split(&p, 2, 1)?;
         let scale = parts[0].expand_dims(1)?; // [B,1,dim]
         let shift = parts[1].expand_dims(1)?;
@@ -458,11 +534,12 @@ impl Flux2Transformer {
         timestep: f32,
     ) -> Result<Array> {
         let temb = self.temb(timestep)?;
-        let mut img = matmul_t(&require_f32_input(hidden_states)?, &self.x_embedder)?;
-        let mut txt = matmul_t(
-            &require_f32_input(encoder_hidden_states)?,
-            &self.context_embedder,
-        )?;
+        let mut img = self
+            .x_embedder
+            .forward(&require_f32_input(hidden_states)?)?;
+        let mut txt = self
+            .context_embedder
+            .forward(&require_f32_input(encoder_hidden_states)?)?;
 
         let drop_batch = |ids: &Array| -> Result<Array> {
             if ids.shape().len() == 3 {
@@ -500,7 +577,7 @@ impl Flux2Transformer {
         );
         let hidden = hidden.take_axis(&img_idx, 1)?;
         let hidden = self.norm_out(&hidden, &temb)?;
-        matmul_t(&hidden, &self.proj_out)
+        self.proj_out.forward(&hidden)
     }
 }
 

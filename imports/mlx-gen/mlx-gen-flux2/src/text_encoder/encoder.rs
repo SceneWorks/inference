@@ -2,7 +2,7 @@
 //! intermediate hidden states. `prompt_embeds` concatenates the outputs of layers 9/18/27 into
 //! the transformer's conditioning. Port of the fork's `Qwen3TextEncoder.get_prompt_embeds`.
 
-use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::{concatenate_axis, dequantize, quantize};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::host_i32;
@@ -10,6 +10,63 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::{join, Qwen3DecoderLayer, TextRope};
+
+/// The Qwen3 token embedding `[vocab, hidden]`, dense or Q4/Q8. The fork's `nn.quantize` predicate
+/// (`hasattr(module,"to_quantized")`) hits `nn.Embedding` too, so a quantized text encoder packs it;
+/// `forward` is a row-gather (then dequantize), mirroring mlx's `QuantizedEmbedding`. The output is
+/// cast to f32 (the encoder runs f32). Mirrors Z-Image's `TokenEmbedding` (sc-2532).
+enum TokenEmbedding {
+    Dense(Array),
+    Quantized {
+        wq: Array,
+        scales: Array,
+        biases: Array,
+        group_size: i32,
+        bits: i32,
+    },
+}
+
+impl TokenEmbedding {
+    /// Gather rows for `ids` `[b, s]` → `[b, s, hidden]` (f32).
+    fn forward(&self, ids: &Array) -> Result<Array> {
+        let out = match self {
+            TokenEmbedding::Dense(w) => w.take_axis(ids, 0)?,
+            TokenEmbedding::Quantized {
+                wq,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => {
+                // Gather the packed rows + their per-group scales/biases, then dequantize — the
+                // by-&self equivalent of mlx's `QuantizedEmbedding` lookup.
+                let pw = wq.take_axis(ids, 0)?;
+                let sc = scales.take_axis(ids, 0)?;
+                let bi = biases.take_axis(ids, 0)?;
+                dequantize(&pw, &sc, &bi, *group_size, *bits)?
+            }
+        };
+        Ok(out.as_dtype(Dtype::Float32)?)
+    }
+
+    /// Quantize a dense embedding in place (group_size 64), the mlx-rs equivalent of
+    /// `nn.Embedding.to_quantized`. The weight is cast to bf16 first so the packing byte-matches the
+    /// fork's bf16 `nn.quantize` (the sc-2604 chokepoint; no-op for a bf16-native checkpoint).
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        if let TokenEmbedding::Dense(w) = self {
+            let wb = w.as_dtype(Dtype::Bfloat16)?;
+            let (wq, scales, biases) = quantize(&wb, 64, bits)?;
+            *self = TokenEmbedding::Quantized {
+                wq,
+                scales,
+                biases,
+                group_size: 64,
+                bits,
+            };
+        }
+        Ok(())
+    }
+}
 
 /// Qwen3 LM dimensions (FLUX.2-klein `text_encoder`).
 pub struct Qwen3TextEncoderConfig {
@@ -41,7 +98,7 @@ impl Qwen3TextEncoderConfig {
 }
 
 pub struct Qwen3TextEncoder {
-    embed_tokens: Array,
+    embed_tokens: TokenEmbedding,
     layers: Vec<Qwen3DecoderLayer>,
     rope: TextRope,
     out_layers: [usize; 3],
@@ -65,19 +122,46 @@ impl Qwen3TextEncoder {
             )?);
         }
         Ok(Self {
-            embed_tokens: w.require(&join(prefix, "embed_tokens.weight"))?.clone(),
+            embed_tokens: TokenEmbedding::Dense(
+                w.require(&join(prefix, "embed_tokens.weight"))?.clone(),
+            ),
             layers,
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             out_layers: cfg.out_layers,
         })
     }
 
+    /// Quantize the text encoder to Q4/Q8 (group_size 64): the token embedding + every layer's
+    /// q/k/v/o + gate/up/down linears — the full set the fork's `nn.quantize(text_encoder, …)` hits
+    /// (`nn.Embedding` + `nn.Linear`). RMSNorms stay full precision; the final `norm` is never loaded.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.embed_tokens.quantize(bits)?;
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    /// Test-only (sc-2643 byte-parity gate): the quantized `(wq, scales, biases, group_size, bits)`
+    /// of the token `embed_tokens` — the unique `nn.Embedding` → `QuantizedEmbedding` case. `None` if
+    /// the encoder is still dense.
+    #[doc(hidden)]
+    pub fn probe_quant_embed(&self) -> Option<(&Array, &Array, &Array, i32, i32)> {
+        match &self.embed_tokens {
+            TokenEmbedding::Quantized {
+                wq,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => Some((wq, scales, biases, *group_size, *bits)),
+            TokenEmbedding::Dense(_) => None,
+        }
+    }
+
     /// Token embedding (f32): `input_ids` `[b, s]` int32 → `[b, s, hidden]`.
     fn embed(&self, input_ids: &Array) -> Result<Array> {
-        Ok(self
-            .embed_tokens
-            .take_axis(input_ids, 0)?
-            .as_dtype(Dtype::Float32)?)
+        self.embed_tokens.forward(input_ids)
     }
 
     /// `input_ids` / `attention_mask`: `[b, s]` int32. Returns `prompt_embeds`
