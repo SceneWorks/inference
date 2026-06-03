@@ -303,6 +303,32 @@ impl AdaptableLinear {
 /// hand-written form of the macro the full adapter framework (sc-2343) will generate.
 pub trait AdaptableHost {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear>;
+
+    /// Enumerate every adapter target reachable through the kohya `lora_unet_` convention, as
+    /// dotted paths in the trained-file (diffusers) naming that [`adaptable_mut`](Self::adaptable_mut)
+    /// accepts. Used to build the `flattened → dotted` lookup that disambiguates kohya keys (whose
+    /// `.`→`_` flattening cannot be re-split blindly — module names like `to_out.0` / `feed_forward.w1`
+    /// already contain underscores). Mirrors the fork's explicit per-target `lora_unet_…` patterns
+    /// (sc-2618): block-indexed layer targets only — the families' fork mappings carry no `lora_unet_`
+    /// pattern for global targets, which stay reachable via the diffusers/peft dotted form.
+    ///
+    /// Every returned path MUST resolve via [`adaptable_mut`](Self::adaptable_mut) and the set MUST be
+    /// collision-free once flattened (both guarded by tests). The default is empty — a host that does
+    /// not override it has no kohya support and a kohya file applied to it surfaces every key as
+    /// unmatched (loud), never silently dropped.
+    fn adaptable_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Prefix each of `host`'s [`AdaptableHost::adaptable_paths`] with `‹prefix›.` — the enumeration
+/// analog of a parent's `["‹prefix›", rest @ ..] => sub.adaptable_mut(rest)` delegation, so a
+/// composite host can build its full path list from its children's relative ones (sc-2618 kohya).
+pub fn prefixed_paths(prefix: &str, host: &impl AdaptableHost) -> Vec<String> {
+    host.adaptable_paths()
+        .iter()
+        .map(|p| format!("{prefix}.{p}"))
+        .collect()
 }
 
 /// Install an adapter onto the [`AdaptableLinear`] addressed by `dotted` (e.g.

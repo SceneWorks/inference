@@ -15,7 +15,7 @@ use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
@@ -581,17 +581,505 @@ impl Flux2Transformer {
     }
 }
 
+// ---- LoRA/LoKr adapter routing (sc-2646) ------------------------------------------------------
+//
+// The Rust analog of the fork's `Flux2LoRAMapping`: map the trained-file (diffusers) module paths
+// to the crate's `AdaptableLinear` fields, across the FULL transformer-only surface (globals +
+// double + single blocks). VAE + Qwen3 TE are NOT LoRA targets. The fork's standard/diffusers
+// naming is what these resolve (bare / `transformer.` / `diffusion_model.` prefixes are stripped by
+// the core loader before the path reaches here); the BFL/ComfyUI fused-qkv-split + kohya `lora_unet_`
+// namings are a separate cross-family format (sc-2618), not handled here.
+
+impl AdaptableHost for Modulation {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["linear"] => Some(&mut self.linear),
+            _ => None,
+        }
+    }
+}
+
+impl AdaptableHost for FeedForward {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["linear_in"] => Some(&mut self.linear_in),
+            ["linear_out"] => Some(&mut self.linear_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["linear_in", "linear_out"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+}
+
+impl AdaptableHost for DoubleAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // Trained-file (diffusers) naming → fields: image stream `to_q/k/v`/`to_out`; text stream
+        // `add_{q,k,v}_proj` → `add_{q,k,v}` and `to_add_out`.
+        match path {
+            ["to_q"] => Some(&mut self.to_q),
+            ["to_k"] => Some(&mut self.to_k),
+            ["to_v"] => Some(&mut self.to_v),
+            // The fork accepts both the bare `to_out` and the HF-style `to_out.0` (diffusers wraps
+            // the output projection in a `Sequential[Linear, Dropout]`); both address this Linear.
+            ["to_out"] | ["to_out", "0"] => Some(&mut self.to_out),
+            ["add_q_proj"] => Some(&mut self.add_q),
+            ["add_k_proj"] => Some(&mut self.add_k),
+            ["add_v_proj"] => Some(&mut self.add_v),
+            ["to_add_out"] => Some(&mut self.to_add_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        // Both `to_out` and the HF-style `to_out.0` alias resolve to the output projection, and the
+        // fork carries a `lora_unet_…_attn_to_out` *and* `…_attn_to_out_0` kohya pattern — emit both
+        // so either flattened spelling resolves.
+        [
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out",
+            "to_out.0",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+            "to_add_out",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+}
+
+impl AdaptableHost for DoubleBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            ["ff_context", rest @ ..] => self.ff_context.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("attn", &self.attn);
+        out.extend(prefixed_paths("ff", &self.ff));
+        out.extend(prefixed_paths("ff_context", &self.ff_context));
+        out
+    }
+}
+
+impl AdaptableHost for SingleBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // The fused `to_qkv_mlp_proj` takes a single LoRA covering q/k/v/mlp jointly (the fork maps
+        // it as one target); `to_out` is the output projection.
+        match path {
+            ["attn", "to_qkv_mlp_proj"] => Some(&mut self.to_qkv_mlp),
+            ["attn", "to_out"] => Some(&mut self.to_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["attn.to_qkv_mlp_proj", "attn.to_out"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+}
+
+impl AdaptableHost for Flux2Transformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            // Globals.
+            ["x_embedder"] => Some(&mut self.x_embedder),
+            ["context_embedder"] => Some(&mut self.context_embedder),
+            ["proj_out"] => Some(&mut self.proj_out),
+            ["norm_out", "linear"] => Some(&mut self.norm_out_linear),
+            ["double_stream_modulation_img", rest @ ..] => self.mod_img.adaptable_mut(rest),
+            ["double_stream_modulation_txt", rest @ ..] => self.mod_txt.adaptable_mut(rest),
+            ["single_stream_modulation", rest @ ..] => self.mod_single.adaptable_mut(rest),
+            ["time_guidance_embed", "linear_1"] => Some(&mut self.time_linear1),
+            ["time_guidance_embed", "linear_2"] => Some(&mut self.time_linear2),
+            // klein is distilled (no guidance embedding), so `guidance_linear_{1,2}` don't exist
+            // here — a LoRA targeting them is correctly surfaced as unmatched.
+            ["transformer_blocks", n, rest @ ..] => self
+                .double_blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["single_transformer_blocks", n, rest @ ..] => self
+                .single_blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// kohya-reachable targets (sc-2618): the diffusers-named double + single block linears. Globals
+    /// (`x_embedder`/`context_embedder`/`proj_out`/`norm_out`/the modulations/`time_guidance_embed`)
+    /// carry no `lora_unet_` pattern in the fork mapping, so they are excluded (reachable via the
+    /// dotted form). The fused→split BFL convention (`double_blocks_*`/`single_blocks_*`) is a
+    /// different format (sc-2743) and is intentionally NOT enumerated → such keys surface as unmatched.
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.double_blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("transformer_blocks.{i}"), b));
+        }
+        for (i, b) in self.single_blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("single_transformer_blocks.{i}"), b));
+        }
+        out
+    }
+}
+
 /// Configuration glue so callers can keep the transformer's dims in one place.
 pub type Flux2TransformerConfig = Flux2Config;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::adapters::{install_adapter, Adapter};
 
     #[test]
     fn timestep_embedding_shape_and_flip() {
         let t = Array::from_slice(&[1000.0f32], &[1]);
         let emb = timestep_embedding(&t, 256).unwrap();
         assert_eq!(emb.shape(), &[1, 256]);
+    }
+
+    // ---- sc-2646 adapter routing (diffusers-name → field translation) -------------------------
+
+    fn dummy_lin() -> AdaptableLinear {
+        AdaptableLinear::dense(Array::from_slice(&[0.0f32], &[1, 1]), None)
+    }
+    fn dummy_arr() -> Array {
+        Array::from_slice(&[1.0f32], &[1])
+    }
+    fn noop_adapter() -> Adapter {
+        Adapter::Lora {
+            a: Array::from_slice(&[0.0f32], &[1, 1]),
+            b: Array::from_slice(&[0.0f32], &[1, 1]),
+            scale: 0.0,
+        }
+    }
+    /// Path resolves iff installing a no-op adapter there succeeds.
+    fn resolves(host: &mut impl AdaptableHost, path: &str) -> bool {
+        install_adapter(host, path, noop_adapter()).is_ok()
+    }
+
+    fn double_attn() -> DoubleAttention {
+        DoubleAttention {
+            to_q: dummy_lin(),
+            to_k: dummy_lin(),
+            to_v: dummy_lin(),
+            to_out: dummy_lin(),
+            norm_q: dummy_arr(),
+            norm_k: dummy_arr(),
+            add_q: dummy_lin(),
+            add_k: dummy_lin(),
+            add_v: dummy_lin(),
+            to_add_out: dummy_lin(),
+            norm_added_q: dummy_arr(),
+            norm_added_k: dummy_arr(),
+            heads: 1,
+            head_dim: 1,
+        }
+    }
+
+    #[test]
+    fn double_attention_routes_diffusers_names() {
+        let mut attn = double_attn();
+        for p in [
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out",
+            "to_out.0", // HF-style diffusers Sequential alias (the fork accepts both)
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+            "to_add_out",
+        ] {
+            assert!(resolves(&mut attn, p), "{p} should resolve");
+        }
+        // Internal field names + off-surface must not resolve.
+        for p in ["add_q", "add_k", "add_v", "to_add_out.0", "qkv"] {
+            assert!(!resolves(&mut attn, p), "{p} must not resolve");
+        }
+    }
+
+    #[test]
+    fn double_block_routes_attn_and_ffs() {
+        let mut block = DoubleBlock {
+            attn: double_attn(),
+            ff: FeedForward {
+                linear_in: dummy_lin(),
+                linear_out: dummy_lin(),
+            },
+            ff_context: FeedForward {
+                linear_in: dummy_lin(),
+                linear_out: dummy_lin(),
+            },
+        };
+        for p in [
+            "attn.to_q",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+            "ff.linear_in",
+            "ff.linear_out",
+            "ff_context.linear_in",
+            "ff_context.linear_out",
+        ] {
+            assert!(resolves(&mut block, p), "{p} should resolve");
+        }
+        for p in ["ff.net.0.proj", "mlp.linear_in", "attn.to_qkv_mlp_proj"] {
+            assert!(!resolves(&mut block, p), "{p} must not resolve");
+        }
+    }
+
+    #[test]
+    fn single_block_routes_fused_qkv_mlp() {
+        let mut block = SingleBlock {
+            to_qkv_mlp: dummy_lin(),
+            to_out: dummy_lin(),
+            norm_q: dummy_arr(),
+            norm_k: dummy_arr(),
+            heads: 1,
+            head_dim: 1,
+            inner: 1,
+        };
+        // The fused projection is addressed by its checkpoint name `attn.to_qkv_mlp_proj`.
+        assert!(resolves(&mut block, "attn.to_qkv_mlp_proj"));
+        assert!(resolves(&mut block, "attn.to_out"));
+        // The internal field name + split q/k/v must NOT resolve (single LoRA covers them jointly).
+        for p in ["to_qkv_mlp", "attn.to_q", "attn.to_qkv_mlp_proj.0"] {
+            assert!(!resolves(&mut block, p), "{p} must not resolve");
+        }
+    }
+
+    #[test]
+    fn modulation_and_feed_forward_route_leaf_names() {
+        let mut m = Modulation {
+            linear: dummy_lin(),
+            sets: 1,
+        };
+        assert!(resolves(&mut m, "linear"));
+        assert!(!resolves(&mut m, "weight"));
+
+        let mut ff = FeedForward {
+            linear_in: dummy_lin(),
+            linear_out: dummy_lin(),
+        };
+        assert!(resolves(&mut ff, "linear_in"));
+        assert!(resolves(&mut ff, "linear_out"));
+        assert!(!resolves(&mut ff, "net.0.proj"));
+    }
+
+    fn ff() -> FeedForward {
+        FeedForward {
+            linear_in: dummy_lin(),
+            linear_out: dummy_lin(),
+        }
+    }
+    fn modulation(sets: usize) -> Modulation {
+        Modulation {
+            linear: dummy_lin(),
+            sets,
+        }
+    }
+
+    /// A minimal transformer (1 double + 1 single block) for the top-level key→module routing —
+    /// the globals' diffusers-name translations + the block-index parse.
+    fn tiny_transformer() -> Flux2Transformer {
+        Flux2Transformer {
+            pos_embed: Flux2PosEmbed::new(2000.0, [32, 32, 32, 32]),
+            time_linear1: dummy_lin(),
+            time_linear2: dummy_lin(),
+            mod_img: modulation(2),
+            mod_txt: modulation(2),
+            mod_single: modulation(1),
+            x_embedder: dummy_lin(),
+            context_embedder: dummy_lin(),
+            double_blocks: vec![DoubleBlock {
+                attn: double_attn(),
+                ff: ff(),
+                ff_context: ff(),
+            }],
+            single_blocks: vec![SingleBlock {
+                to_qkv_mlp: dummy_lin(),
+                to_out: dummy_lin(),
+                norm_q: dummy_arr(),
+                norm_k: dummy_arr(),
+                heads: 1,
+                head_dim: 1,
+                inner: 1,
+            }],
+            norm_out_linear: dummy_lin(),
+            proj_out: dummy_lin(),
+            time_channels: 256,
+        }
+    }
+
+    #[test]
+    fn transformer_routes_full_diffusers_surface() {
+        let mut t = tiny_transformer();
+        // Globals (diffusers names → internal fields).
+        for p in [
+            "x_embedder",
+            "context_embedder",
+            "proj_out",
+            "norm_out.linear",
+            "double_stream_modulation_img.linear",
+            "double_stream_modulation_txt.linear",
+            "single_stream_modulation.linear",
+            "time_guidance_embed.linear_1",
+            "time_guidance_embed.linear_2",
+            // Double block 0.
+            "transformer_blocks.0.attn.to_q",
+            "transformer_blocks.0.attn.add_k_proj",
+            "transformer_blocks.0.attn.to_add_out",
+            "transformer_blocks.0.ff.linear_in",
+            "transformer_blocks.0.ff_context.linear_out",
+            // Single block 0.
+            "single_transformer_blocks.0.attn.to_qkv_mlp_proj",
+            "single_transformer_blocks.0.attn.to_out",
+        ] {
+            assert!(resolves(&mut t, p), "{p} should resolve");
+        }
+        // Off-surface / wrong index / klein-absent guidance linears must NOT resolve.
+        for p in [
+            "norm_out_linear",
+            "time_guidance_embed.guidance_linear_1",
+            "transformer_blocks.1.attn.to_q", // only 1 double block here
+            "single_transformer_blocks.5.attn.to_out",
+            "transformer_blocks.0.attn.qkv",
+            "vae.encoder",
+        ] {
+            assert!(!resolves(&mut t, p), "{p} must not resolve");
+        }
+    }
+
+    // ---- sc-2618 kohya `lora_unet_` routing (no real weights) ---------------------------------
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("mlx_gen_flux2_kohya_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// `adaptable_paths()` is the kohya-reachable surface; every entry must resolve via
+    /// `adaptable_mut` (drift guard) and flatten to a collision-free stem (so the table is 1:1).
+    #[test]
+    fn adaptable_paths_resolve_and_flatten_uniquely() {
+        let mut t = tiny_transformer();
+        let paths = t.adaptable_paths();
+        assert!(!paths.is_empty());
+        // Drift guard: each enumerated path resolves through the matcher.
+        for p in &paths {
+            assert!(
+                resolves(&mut t, p),
+                "enumerated {p} does not resolve via adaptable_mut"
+            );
+        }
+        // Globals are excluded from the kohya surface.
+        for g in [
+            "x_embedder",
+            "proj_out",
+            "norm_out.linear",
+            "time_guidance_embed.linear_1",
+        ] {
+            assert!(
+                !paths.iter().any(|p| p == g),
+                "global {g} must be excluded from kohya"
+            );
+        }
+        // Collision-free flattening.
+        let flat: std::collections::BTreeSet<String> =
+            paths.iter().map(|p| p.replace('.', "_")).collect();
+        assert_eq!(
+            flat.len(),
+            paths.len(),
+            "two paths flattened to the same kohya stem"
+        );
+        // The `to_out` / `to_out.0` aliases both appear (the fork emits both kohya spellings).
+        assert!(paths
+            .iter()
+            .any(|p| p == "transformer_blocks.0.attn.to_out"));
+        assert!(paths
+            .iter()
+            .any(|p| p == "transformer_blocks.0.attn.to_out.0"));
+    }
+
+    /// A diffusers-named kohya file applies through the strict provider seam (every stem resolves);
+    /// a BFL fused key (`double_blocks_*_img_attn_qkv`, sc-2743) is surfaced and errors — loud.
+    #[test]
+    fn kohya_diffusers_applies_and_bfl_errors() {
+        use crate::adapters::apply_flux2_adapters;
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+
+        let small = Array::from_slice(&[0.01f32], &[1, 1]); // [r=1,in=1] / [out=1,r=1]
+        let meta = None as Option<&std::collections::HashMap<String, String>>;
+
+        // One kohya key pair per reachable stem.
+        let mut t = tiny_transformer();
+        let n = t.adaptable_paths().len();
+        let mut arrays: Vec<(String, &Array)> = Vec::new();
+        for stem in t.adaptable_paths().iter().map(|p| p.replace('.', "_")) {
+            arrays.push((format!("lora_unet_{stem}.lora_down.weight"), &small));
+            arrays.push((format!("lora_unet_{stem}.lora_up.weight"), &small));
+        }
+        let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let path = tmp("flux2_kohya_diffusers.safetensors");
+        Array::save_safetensors(refs, meta, &path).unwrap();
+        let report = apply_flux2_adapters(
+            &mut t,
+            &[AdapterSpec {
+                path,
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            report.applied, n,
+            "every diffusers-named kohya stem should resolve"
+        );
+        assert!(report.unmatched_paths.is_empty());
+
+        // A BFL fused-qkv key is a different format (sc-2743) → unmatched → strict error.
+        let bfl = tmp("flux2_kohya_bfl.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight",
+                    &small,
+                ),
+                (
+                    "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight",
+                    &small,
+                ),
+            ],
+            meta,
+            &bfl,
+        )
+        .unwrap();
+        let mut t2 = tiny_transformer();
+        assert!(
+            apply_flux2_adapters(
+                &mut t2,
+                &[AdapterSpec {
+                    path: bfl,
+                    scale: 1.0,
+                    kind: AdapterKind::Lora
+                }],
+            )
+            .is_err(),
+            "a BFL fused-qkv kohya key must error (sc-2743), not silently drop"
+        );
     }
 }

@@ -228,6 +228,36 @@ impl UNet2DConditionModel {
         }
         out
     }
+
+    /// The **complete** LoRA-targetable surface (sc-2671), strictly larger than the vendored-faithful
+    /// [`lora_target_paths`](Self::lora_target_paths): the 515 down/up attention+proj+time_emb paths
+    /// **plus** `mid_block.attentions.0` (attention + `proj_in`/`proj_out`) — which the vendored
+    /// mlx-examples UNet names `mid_blocks.1.…` and so silently drops — **plus** the GEGLU feed-forward
+    /// (`ff.net.0.proj`, `ff.net.2`) of every cross-attention transformer (down + mid + up). Used to
+    /// build the kohya lookup table when complete coverage is requested; `mid_block`/`ff` deltas are
+    /// reachable through [`AdaptableHost::adaptable_mut`] (the merge layer row-splits a `ff.net.0.proj`
+    /// delta into `linear1`/`linear2`). Conv-layer LoRAs remain out of scope (they are not Linears).
+    pub fn lora_target_paths_complete(&self) -> Vec<String> {
+        let mut out = self.lora_target_paths();
+        // mid_block attention + proj (the +82 the vendored path can't reach) and the two mid resnet
+        // `time_emb_proj`s (symmetric with the down/up resnet time_emb already in the faithful 515).
+        self.mid_resnet0
+            .lora_target_paths("mid_block.resnets.0", &mut out);
+        self.mid_transformer
+            .lora_target_paths("mid_block.attentions.0", &mut out);
+        self.mid_resnet1
+            .lora_target_paths("mid_block.resnets.1", &mut out);
+        // GEGLU feed-forward across every cross-attention transformer.
+        for (i, b) in self.down_blocks.iter().enumerate() {
+            b.lora_target_paths_ff(&format!("down_blocks.{i}"), &mut out);
+        }
+        self.mid_transformer
+            .lora_target_paths_ff("mid_block.attentions.0", &mut out);
+        for (k, b) in self.up_blocks.iter().enumerate() {
+            b.lora_target_paths_ff(&format!("up_blocks.{k}"), &mut out);
+        }
+        out
+    }
 }
 
 impl AdaptableHost for UNet2DConditionModel {
@@ -241,7 +271,12 @@ impl AdaptableHost for UNet2DConditionModel {
                 .up_blocks
                 .get_mut(k.parse::<usize>().ok()?)?
                 .adaptable_mut(rest),
-            // mid_block intentionally not routed — faithful to the vendored 515-module surface (sc-2671).
+            // mid_block (sc-2671 complete coverage). Routable here, but the vendored coverage path
+            // gates mid_block/ff keys out so the faithful 515-module merge is unaffected; only the
+            // opt-in complete coverage actually merges into these.
+            ["mid_block", "attentions", "0", rest @ ..] => self.mid_transformer.adaptable_mut(rest),
+            ["mid_block", "resnets", "0", rest @ ..] => self.mid_resnet0.adaptable_mut(rest),
+            ["mid_block", "resnets", "1", rest @ ..] => self.mid_resnet1.adaptable_mut(rest),
             _ => None,
         }
     }
