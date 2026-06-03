@@ -18,21 +18,21 @@ fn flux2_variants_resolve_through_core_registry() {
 }
 
 #[test]
-fn both_variants_advertise_single_reference() {
+fn variants_advertise_expected_conditioning() {
     let edit = mlx_gen::registry::generators()
         .find(|r| (r.descriptor)().id == "flux2_klein_9b_edit")
         .map(|r| (r.descriptor)())
         .unwrap();
-    // Edit consumes a `Reference` as the reference image (token concat).
+    // Edit accepts a single `Reference` (token concat) and N-image `MultiReference` (sc-2645).
     assert!(edit.capabilities.accepts(ConditioningKind::Reference));
-    // Multi-reference edit is sc-2645, not this story.
-    assert!(!edit.capabilities.accepts(ConditioningKind::MultiReference));
+    assert!(edit.capabilities.accepts(ConditioningKind::MultiReference));
 
     let t2i = mlx_gen::registry::generators()
         .find(|r| (r.descriptor)().id == "flux2_klein_9b")
         .map(|r| (r.descriptor)())
         .unwrap();
-    // txt2img consumes a `Reference` as an img2img init image (sc-2644).
+    // txt2img consumes a `Reference` as an img2img init image (sc-2644); multi-image editing is
+    // the edit variant only.
     assert!(t2i.capabilities.accepts(ConditioningKind::Reference));
     assert!(!t2i.capabilities.accepts(ConditioningKind::MultiReference));
 }
