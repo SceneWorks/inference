@@ -10,7 +10,7 @@
 use mlx_rs::fast::rms_norm;
 use mlx_rs::Array;
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::host_i32;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -73,6 +73,17 @@ impl AdaptableHost for QwenTransformer {
                 .adaptable_mut(rest),
             _ => None,
         }
+    }
+
+    /// kohya-reachable targets (sc-2618): the per-block joint-attention + stream-MLP linears, in
+    /// trained-file naming. Qwen's fork mapping has no global targets, so the full kohya surface is
+    /// the `transformer_blocks.{i}.*` set.
+    fn adaptable_paths(&self) -> Vec<String> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| prefixed_paths(&format!("transformer_blocks.{i}"), b))
+            .collect()
     }
 }
 

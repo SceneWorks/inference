@@ -25,6 +25,13 @@ impl AdaptableHost for FeedForward {
             _ => None,
         }
     }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["net.0.proj", "net.2"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
 }
 
 impl FeedForward {

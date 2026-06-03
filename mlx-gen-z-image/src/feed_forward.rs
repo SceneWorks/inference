@@ -52,4 +52,8 @@ impl AdaptableHost for FeedForward {
             _ => None,
         }
     }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["w1", "w2", "w3"].into_iter().map(String::from).collect()
+    }
 }

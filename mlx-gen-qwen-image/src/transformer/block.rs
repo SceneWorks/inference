@@ -6,7 +6,7 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{add, multiply, split};
 use mlx_rs::Array;
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -33,6 +33,13 @@ impl AdaptableHost for QwenTransformerBlock {
             ["txt_mlp", rest @ ..] => self.txt_ff.adaptable_mut(rest),
             _ => None,
         }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("attn", &self.attn);
+        out.extend(prefixed_paths("img_mlp", &self.img_ff));
+        out.extend(prefixed_paths("txt_mlp", &self.txt_ff));
+        out
     }
 }
 

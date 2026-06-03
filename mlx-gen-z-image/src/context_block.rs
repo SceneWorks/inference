@@ -8,7 +8,7 @@ use mlx_rs::Array;
 
 use super::attention::ZImageAttention;
 use super::feed_forward::FeedForward;
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -81,5 +81,12 @@ impl AdaptableHost for ZImageContextBlock {
             ["feed_forward", rest @ ..] => self.feed_forward.adaptable_mut(rest),
             _ => None,
         }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        // No `adaLN_modulation` (see above) — only the attention + feed-forward leaves.
+        let mut out = prefixed_paths("attention", &self.attention);
+        out.extend(prefixed_paths("feed_forward", &self.feed_forward));
+        out
     }
 }
