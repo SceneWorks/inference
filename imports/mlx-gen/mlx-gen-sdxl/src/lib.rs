@@ -28,7 +28,9 @@ pub mod tokenizer;
 pub mod unet;
 pub mod vae;
 
-pub use adapters::{apply_sdxl_adapters, SdxlLoraReport};
+pub use adapters::{
+    apply_sdxl_adapters, apply_sdxl_adapters_with, lora_delta, LoraCoverage, SdxlLoraReport,
+};
 pub use config::{
     BetaSchedule, ClipActivation, ClipTextConfig, DiffusionConfig, UNetConfig, VaeConfig,
 };
