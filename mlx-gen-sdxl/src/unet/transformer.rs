@@ -268,6 +268,18 @@ impl Transformer2D {
                 .lora_target_paths(&format!("{prefix}.transformer_blocks.{k}.attn2"), out);
         }
     }
+
+    /// The GEGLU feed-forward LoRA targets (diffusers naming) under this `attentions.{i}` module:
+    /// each block's `ff.net.0.proj` (the fused value+gate proj, row-split across `linear1`/`linear2`
+    /// at merge) and `ff.net.2`. Kept separate from [`Transformer2D::lora_target_paths`] because the
+    /// vendored `lora.py` can't reach the FF (mlx-examples renames it) — complete coverage (sc-2671)
+    /// adds it on top of the faithful surface.
+    pub fn lora_target_paths_ff(&self, prefix: &str, out: &mut Vec<String>) {
+        for k in 0..self.blocks.len() {
+            out.push(format!("{prefix}.transformer_blocks.{k}.ff.net.0.proj"));
+            out.push(format!("{prefix}.transformer_blocks.{k}.ff.net.2"));
+        }
+    }
 }
 
 // LoRA key→module routing (sc-2639). Diffusers leaf naming; the GEGLU FF and (for the U-Net)
@@ -289,6 +301,14 @@ impl AdaptableHost for TransformerBlock {
         match path {
             ["attn1", rest @ ..] => self.attn1.adaptable_mut(rest),
             ["attn2", rest @ ..] => self.attn2.adaptable_mut(rest),
+            // GEGLU FF (sc-2671 complete coverage). The diffusers `ff.net.0.proj` is row-split into
+            // `linear1` (value) + `linear2` (gate) and `ff.net.2` is `linear3`; the SDXL adapter
+            // merge translates those diffusers FF keys into these internal `ff.linearN` names (and
+            // row-splits a `ff.net.0.proj` delta across linear1/linear2). Unreachable under the
+            // vendored coverage (the merge gates FF keys out there).
+            ["ff", "linear1"] => Some(&mut self.linear1),
+            ["ff", "linear2"] => Some(&mut self.linear2),
+            ["ff", "linear3"] => Some(&mut self.linear3),
             _ => None,
         }
     }
