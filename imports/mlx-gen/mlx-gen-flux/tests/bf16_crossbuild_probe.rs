@@ -48,10 +48,7 @@ fn probe_path() -> String {
 #[ignore = "needs tools/dump_bf16_crossbuild_probe.py run on the mflux wheel first"]
 fn bf16_matmul_sdpa_crossbuild_delta() {
     let g = Weights::from_file(probe_path()).unwrap();
-    println!(
-        "wheel golden mlx={}",
-        g.metadata("mlx").unwrap_or("?")
-    );
+    println!("wheel golden mlx={}", g.metadata("mlx").unwrap_or("?"));
     for name in ["clip_proj", "clip_fc1", "adaln_gemv", "joint_qkv"] {
         let a = g.require(&format!("{name}_a")).unwrap();
         let b = g.require(&format!("{name}_b")).unwrap();
