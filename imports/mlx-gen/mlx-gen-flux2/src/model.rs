@@ -22,6 +22,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
 
 use crate::config::{Flux2Variant, DEFAULT_GUIDANCE};
+use crate::kv_cache::{CacheMode, Flux2KvCache};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
     prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule, timesteps_x1000,
@@ -39,12 +40,20 @@ pub fn descriptor_klein_9b_edit() -> ModelDescriptor {
     Flux2Variant::Klein9bEdit.descriptor()
 }
 
+pub fn descriptor_klein_9b_kv_edit() -> ModelDescriptor {
+    Flux2Variant::Klein9bKvEdit.descriptor()
+}
+
 pub fn load_klein_9b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(Flux2Variant::Klein9b, spec)
 }
 
 pub fn load_klein_9b_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(Flux2Variant::Klein9bEdit, spec)
+}
+
+pub fn load_klein_9b_kv_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(Flux2Variant::Klein9bKvEdit, spec)
 }
 
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
@@ -397,22 +406,38 @@ impl Generator for Flux2 {
             _ => None,
         };
 
-        // For an edit, the transformer's image input/ids are `[target, ref]`; its output keeps the
-        // image stream, of which we take the leading `target_seq` tokens. txt2img has no ref, so the
-        // concat + slice are no-ops.
-        let forward = |latents: &Array, embeds: &Array, ids: &Array, ts: f32| -> Result<Array> {
+        // For an edit, the transformer's image input/ids are `[target, ref]` (or `[target]` only on
+        // a cached KV step); its output keeps the image stream, of which we take the leading
+        // `target_seq` tokens. txt2img has no ref, so the concat + slice are no-ops.
+        // `include_ref=false` drops the reference tokens (the 9b-kv cached step); `cache` threads
+        // the per-seed KV cache through the transformer.
+        let run = |latents: &Array,
+                   embeds: &Array,
+                   ids: &Array,
+                   ts: f32,
+                   include_ref: bool,
+                   cache: Option<&Flux2KvCache>|
+         -> Result<Array> {
             let target_seq = latents.shape()[1];
-            let (hidden, img_ids) = match &reference {
-                Some((ref_lat, ref_ids)) => (
+            let (hidden, img_ids) = match (&reference, include_ref) {
+                (Some((ref_lat, ref_ids)), true) => (
                     concatenate_axis(&[latents, ref_lat], 1)?,
                     concatenate_axis(&[&latent_ids, ref_ids], 1)?,
                 ),
-                None => (latents.clone(), latent_ids.clone()),
+                _ => (latents.clone(), latent_ids.clone()),
             };
-            let out = transformer.forward(&hidden, embeds, &img_ids, ids, ts)?;
+            let out = transformer.forward_with_cache(&hidden, embeds, &img_ids, ids, ts, cache)?;
             let idx = Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
             Ok(out.take_axis(&idx, 1)?)
         };
+
+        // 9b-kv edit: cache reference K/V on step 0, reuse on steps 1+ (the ~2.4× speedup). The
+        // edit path always has a reference, so `num_ref > 0`.
+        let kv_enabled = self.variant.is_kv() && reference.is_some();
+        let num_ref = reference
+            .as_ref()
+            .map(|(r, _)| r.shape()[1] as usize)
+            .unwrap_or(0);
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -423,15 +448,44 @@ impl Generator for Flux2 {
                 Some(clean) => add_noise_by_interpolation(clean, &noise, sched.sigmas[start_step])?,
                 None => noise,
             };
+            // Fresh cache per seed — the cached reference K/V depend on the step-0 target latents.
+            let cache = kv_enabled.then(|| {
+                Flux2KvCache::new(self.config.num_double_layers, self.config.num_single_layers)
+            });
             // img2img skips the first `start_step` steps (the fork loops `range(init_time_step, n)`).
             for (t, &ts) in timesteps.iter().enumerate().skip(start_step) {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Msg("generation cancelled".into()));
                 }
-                let v = forward(&latents, &prompt_embeds, &text_ids, ts)?;
+                // KV step role: the first executed step extracts the reference K/V (running the full
+                // `[txt, target, ref]` forward); later steps run `[txt, target]` only and splice the
+                // cached ref K/V back in. With no cache, every step includes the reference tokens.
+                let (include_ref, cache_ref) = match &cache {
+                    Some(c) => {
+                        let mode = if t == start_step {
+                            CacheMode::Extract
+                        } else {
+                            CacheMode::Cached
+                        };
+                        c.configure(mode, num_ref);
+                        (mode == CacheMode::Extract, Some(c))
+                    }
+                    None => (true, None),
+                };
+                let v = run(
+                    &latents,
+                    &prompt_embeds,
+                    &text_ids,
+                    ts,
+                    include_ref,
+                    cache_ref,
+                )?;
                 let v = match &negative {
                     Some((neg_embeds, neg_ids)) => {
-                        let vn = forward(&latents, neg_embeds, neg_ids, ts)?;
+                        // CFG with the cache mirrors the fork: the same cache feeds both forwards
+                        // (the negative extract overwrites the positive's slots). Distilled klein
+                        // runs guidance 1.0 → no negative pass, so this is the base path in practice.
+                        let vn = run(&latents, neg_embeds, neg_ids, ts, include_ref, cache_ref)?;
                         // noise = neg + guidance·(pos − neg)
                         add(&vn, &multiply(&subtract(&v, &vn)?, scalar(guidance))?)?
                     }
@@ -522,6 +576,10 @@ inventory::submit! {
 
 inventory::submit! {
     ModelRegistration { descriptor: descriptor_klein_9b_edit, load: load_klein_9b_edit }
+}
+
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_klein_9b_kv_edit, load: load_klein_9b_kv_edit }
 }
 
 #[cfg(test)]

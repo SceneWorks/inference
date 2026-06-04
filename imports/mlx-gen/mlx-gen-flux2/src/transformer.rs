@@ -23,7 +23,12 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use crate::config::Flux2Config;
+use crate::kv_cache::{Flux2KvCache, Stream};
 use crate::pos_embed::Flux2PosEmbed;
+
+/// Per-call KV-cache binding handed to an attention layer: `(cache, layer_idx_within_stream)`.
+/// `None` on the dense path (txt2img, plain edit) and inside parity tests.
+type CacheSlot<'a> = Option<(&'a Flux2KvCache, usize)>;
 
 const LN_EPS: f32 = 1e-6;
 const RMS_EPS: f32 = 1e-5;
@@ -210,13 +215,15 @@ impl DoubleAttention {
         Ok(())
     }
 
-    /// Joint attention. Returns `(img_attn_out, txt_attn_out)`.
+    /// Joint attention. Returns `(img_attn_out, txt_attn_out)`. `cache` (the 9b-kv edit path)
+    /// stores/splices the trailing reference K/V for this double-stream layer post-RoPE.
     fn forward(
         &self,
         img: &Array,
         txt: &Array,
         cos: &Array,
         sin: &Array,
+        cache: CacheSlot<'_>,
     ) -> Result<(Array, Array)> {
         let (iq, ik, iv) = process_qkv(
             img,
@@ -243,6 +250,12 @@ impl DoubleAttention {
         let k = concatenate_axis(&[&tk, &ik], 2)?;
         let v = concatenate_axis(&[&tv, &iv], 2)?;
         let (q, k) = apply_rope(&q, &k, cos, sin)?;
+        // KV-cache hook (post-RoPE, pre-SDPA): extract stores the trailing ref K/V; cached splices
+        // it back so the `[txt, target]` queries attend over `[txt, target, ref]`.
+        let (k, v) = match cache {
+            Some((c, idx)) => c.apply(Stream::Double, idx, k, v)?,
+            None => (k, v),
+        };
         let o = attention(&q, &k, &v, self.head_dim)?;
         let txt_seq = txt.shape()[1];
         let txt_idx = Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
@@ -282,6 +295,7 @@ impl DoubleBlock {
         txt_mod: &[(Array, Array, Array); 2],
         cos: &Array,
         sin: &Array,
+        cache: CacheSlot<'_>,
     ) -> Result<(Array, Array)> {
         let (shift_msa, scale_msa, gate_msa) = &img_mod[0];
         let (shift_mlp, scale_mlp, gate_mlp) = &img_mod[1];
@@ -295,7 +309,7 @@ impl DoubleBlock {
             c_shift_msa,
         )?;
 
-        let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt, cos, sin)?;
+        let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt, cos, sin, cache)?;
         img = add(&img, &multiply(gate_msa, &img_attn)?)?;
         txt = add(&txt, &multiply(c_gate_msa, &txt_attn)?)?;
 
@@ -345,13 +359,15 @@ impl SingleBlock {
         Ok(())
     }
 
-    /// `mod`: `(shift, scale, gate)`.
+    /// `mod`: `(shift, scale, gate)`. `cache` (9b-kv edit) stores/splices the trailing reference
+    /// K/V for this single-stream layer post-RoPE.
     fn forward(
         &self,
         hidden: &Array,
         m: &(Array, Array, Array),
         cos: &Array,
         sin: &Array,
+        cache: CacheSlot<'_>,
     ) -> Result<Array> {
         let (shift, scale, gate) = m;
         let norm = modulate(&layer_norm(hidden, None, None, LN_EPS)?, scale, shift)?;
@@ -376,6 +392,10 @@ impl SingleBlock {
         let k = rms_norm(&to_bhsd(k)?, &self.norm_k, RMS_EPS)?;
         let v = to_bhsd(v)?;
         let (q, k) = apply_rope(&q, &k, cos, sin)?;
+        let (k, v) = match cache {
+            Some((c, idx)) => c.apply(Stream::Single, idx, k, v)?,
+            None => (k, v),
+        };
         let attn = attention(&q, &k, &v, self.head_dim)?;
 
         let mlp = swiglu(&mlp)?;
@@ -525,7 +545,7 @@ impl Flux2Transformer {
 
     /// `hidden_states`: `[B, seq_img, in_channels]`; `encoder_hidden_states`: `[B, seq_txt,
     /// joint_attention_dim]`; `img_ids`/`txt_ids`: `[seq, 4]` (or `[1, seq, 4]`). `timestep` is the
-    /// scaled sigma (×1000). Returns the velocity `[B, seq_img, out_channels]`.
+    /// scaled sigma (×1000). Returns the velocity `[B, seq_img, out_channels]`. Dense path: no cache.
     pub fn forward(
         &self,
         hidden_states: &Array,
@@ -533,6 +553,30 @@ impl Flux2Transformer {
         img_ids: &Array,
         txt_ids: &Array,
         timestep: f32,
+    ) -> Result<Array> {
+        self.forward_with_cache(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            None,
+        )
+    }
+
+    /// As [`Self::forward`], with an optional 9b-kv [`Flux2KvCache`] threaded through every
+    /// attention layer (the double + single stacks indexed independently from 0). On the
+    /// [`crate::kv_cache::CacheMode::Extract`] step the `img_ids` carry the reference tokens
+    /// (`[target, ref]`); on [`crate::kv_cache::CacheMode::Cached`] steps they carry `[target]`
+    /// only and the cached ref K/V are spliced back inside each attention.
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        timestep: f32,
+        cache: Option<&Flux2KvCache>,
     ) -> Result<Array> {
         let temb = self.temb(timestep)?;
         let mut img = self
@@ -559,15 +603,23 @@ impl Flux2Transformer {
         let img_mod = [mi[0].clone(), mi[1].clone()];
         let txt_mod = [mt[0].clone(), mt[1].clone()];
 
-        for block in &self.double_blocks {
-            (txt, img) = block.forward(img, txt, &img_mod, &txt_mod, &cos, &sin)?;
+        for (idx, block) in self.double_blocks.iter().enumerate() {
+            (txt, img) = block.forward(
+                img,
+                txt,
+                &img_mod,
+                &txt_mod,
+                &cos,
+                &sin,
+                cache.map(|c| (c, idx)),
+            )?;
         }
 
         let txt_seq = txt.shape()[1];
         let mut hidden = concatenate_axis(&[&txt, &img], 1)?;
         let ms = self.mod_single.forward(&temb)?;
-        for block in &self.single_blocks {
-            hidden = block.forward(&hidden, &ms[0], &cos, &sin)?;
+        for (idx, block) in self.single_blocks.iter().enumerate() {
+            hidden = block.forward(&hidden, &ms[0], &cos, &sin, cache.map(|c| (c, idx)))?;
         }
 
         // Keep only the image tokens.
