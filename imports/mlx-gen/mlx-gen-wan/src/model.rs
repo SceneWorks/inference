@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
+    default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
     MoeExpert, Precision, Progress, Quant, Result, WeightsSource,
 };
@@ -191,10 +191,10 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             supports_guidance: true,
             supports_true_cfg: false,
             conditioning: Vec::new(),
-            // LoRA merges per-expert at load time (sc-2683, PEFT/kohya, MoE high/low); Q4/Q8 (sc-2682)
-            // loads via `spec.quantize` or a pre-quantized snapshot. LoKr is the sibling sc-2393.
+            // LoRA + LoKr merge per-expert at generate time (sc-2683 / sc-2393, PEFT/kohya + LoKr,
+            // MoE high/low); Q4/Q8 (sc-2682) loads via `spec.quantize` or a pre-quantized snapshot.
             supports_lora: true,
-            supports_lokr: false,
+            supports_lokr: true,
             samplers: vec!["unipc", "euler", "dpmpp2m"],
             schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
@@ -281,18 +281,6 @@ impl Wan14b {
     }
 }
 
-/// Validate the adapter specs accepted by the dual-expert loaders: LoRA only (LoKr is the sibling
-/// sc-2393, rejected loudly) and quantization-free (Q4/Q8 is sc-2682 — the merge folds into the
-/// dense bf16 expert weights). `id` names the model in the error.
-fn validate_adapters(id: &str, spec: &LoadSpec) -> Result<()> {
-    if spec.adapters.iter().any(|a| a.kind == AdapterKind::Lokr) {
-        return Err(Error::Msg(format!(
-            "{id}: LoKr adapters are a sibling slice (sc-2393), not yet wired; supply LoRA adapters"
-        )));
-    }
-    Ok(())
-}
-
 /// Resolve the **load-time** quantization to apply in [`Wan14b::generate`], reconciling the requested
 /// `spec.quantize` against a pre-quantized snapshot's `config.json` manifest (`cfg.quantization`).
 ///
@@ -352,7 +340,6 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    validate_adapters("wan2_2_t2v_14b", spec)?;
 
     let config = WanModelConfig::from_model_dir(&root)?;
     if !config.dual_model {
@@ -623,10 +610,10 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             supports_true_cfg: false,
             // A single image is channel-concatenated as the first-frame conditioning (in_dim 36).
             conditioning: vec![ConditioningKind::Reference],
-            // LoRA merges per-expert at load time (sc-2683, PEFT/kohya, MoE high/low); Q4/Q8 (sc-2682)
-            // loads via `spec.quantize` or a pre-quantized snapshot. LoKr is the sibling sc-2393.
+            // LoRA + LoKr merge per-expert at generate time (sc-2683 / sc-2393, PEFT/kohya + LoKr,
+            // MoE high/low); Q4/Q8 (sc-2682) loads via `spec.quantize` or a pre-quantized snapshot.
             supports_lora: true,
-            supports_lokr: false,
+            supports_lokr: true,
             samplers: vec!["unipc", "euler", "dpmpp2m"],
             schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
@@ -661,7 +648,6 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    validate_adapters("wan2_2_i2v_14b", spec)?;
 
     let config = WanModelConfig::from_model_dir(&root)?;
     if !config.is_i2v_concat() {
