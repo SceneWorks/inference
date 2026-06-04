@@ -20,8 +20,8 @@
 //!
 //! The distilled stage-1 sampler is chaos-sensitive, so e2e pixel-parity requires a **bit-exact
 //! per-forward DiT** (sc-2842 — the adaLN timestep table must be built in MLX f32, not host f64). Two
-//! shipped precisions, both gated bit-exact vs their reference golden: [`transformer::Precision::F32Q8`]
-//! (f32 activations × Q8 — the quality target) and [`transformer::Precision::Bf16Q8`] (the reference's
+//! shipped precisions, both gated bit-exact vs their reference golden: [`transformer::Precision::quant_f32`]
+//! (f32 activations × Q8 — the quality target) and [`transformer::Precision::quant_bf16`] (the reference's
 //! native bf16 activations × Q8 — the production-speed path). Q4/Q8-of-everything, I2V, LoRA, LoKr,
 //! and audio are sibling stories.
 
