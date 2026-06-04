@@ -54,13 +54,6 @@ fn load_variant(variant: FluxVariant, spec: &LoadSpec) -> Result<Box<dyn Generat
         }
     };
 
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(format!(
-            "{}: FLUX.1 adapter installation awaits the transformer adaptable-path map",
-            variant.id()
-        )));
-    }
-
     let t5_tokenizer = loader::load_t5_tokenizer(root, variant)?;
     let clip_tokenizer = loader::load_clip_tokenizer(root)?;
     let mut text_encoders = FluxTextEncoders {
@@ -75,6 +68,10 @@ fn load_variant(variant: FluxVariant, spec: &LoadSpec) -> Result<Box<dyn Generat
         transformer.quantize(bits)?;
         vae.quantize(bits)?;
     }
+    // Install LoRA/LoKr adapters AFTER quantization (the fork merges/applies post-quantize too; a
+    // forward-time residual over the now-quantized base, never a fused merge). No-op when empty; a
+    // non-empty spec list that matches nothing — or any unmatched target — errors loudly (sc-2534).
+    crate::adapters::apply_flux_adapters(&mut transformer, &spec.adapters)?;
 
     Ok(Box::new(Flux1 {
         descriptor: descriptor_for(variant),
