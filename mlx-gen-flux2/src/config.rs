@@ -11,6 +11,10 @@ use mlx_gen::{Capabilities, ConditioningKind, Modality, ModelDescriptor};
 
 pub const FLUX2_KLEIN_9B_ID: &str = "flux2_klein_9b";
 pub const FLUX2_KLEIN_9B_EDIT_ID: &str = "flux2_klein_9b_edit";
+/// The KV-cache edit variant (sc-2347). Loads the `-kv`-distilled weights and caches reference
+/// K/V across denoise steps for the ~2.4× single-ref edit speedup. Edit-only — the cache is
+/// meaningless without reference tokens.
+pub const FLUX2_KLEIN_9B_KV_EDIT_ID: &str = "flux2_klein_9b_kv_edit";
 
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
@@ -27,6 +31,8 @@ pub enum Flux2Variant {
     Klein9b,
     /// FLUX.2-klein-9b, distilled, image-conditioned edit (single + multi reference).
     Klein9bEdit,
+    /// FLUX.2-klein-9b-kv, distilled, edit with the reference-K/V cache (sc-2347).
+    Klein9bKvEdit,
 }
 
 impl Flux2Variant {
@@ -34,17 +40,27 @@ impl Flux2Variant {
         match self {
             Self::Klein9b => FLUX2_KLEIN_9B_ID,
             Self::Klein9bEdit => FLUX2_KLEIN_9B_EDIT_ID,
+            Self::Klein9bKvEdit => FLUX2_KLEIN_9B_KV_EDIT_ID,
         }
     }
 
     pub fn hf_model(self) -> &'static str {
-        // Both txt2img and edit load the same 9b snapshot; the edit path differs only in how
-        // reference images are tokenized into extra sequence tokens.
-        "black-forest-labs/FLUX.2-klein-9B"
+        match self {
+            // Both txt2img and plain edit load the same base 9b snapshot; the edit path differs
+            // only in how reference images are tokenized into extra sequence tokens.
+            Self::Klein9b | Self::Klein9bEdit => "black-forest-labs/FLUX.2-klein-9B",
+            // The KV-cache variant is a separately distilled checkpoint (same architecture).
+            Self::Klein9bKvEdit => "black-forest-labs/FLUX.2-klein-9b-kv",
+        }
     }
 
     pub fn is_edit(self) -> bool {
-        matches!(self, Self::Klein9bEdit)
+        matches!(self, Self::Klein9bEdit | Self::Klein9bKvEdit)
+    }
+
+    /// The 9b-kv variant, which caches reference K/V across denoise steps.
+    pub fn is_kv(self) -> bool {
+        matches!(self, Self::Klein9bKvEdit)
     }
 
     /// The dimension-parametric model config for this variant.
@@ -87,7 +103,8 @@ impl Flux2Variant {
                 max_size: 2048,
                 max_count: 8,
                 mac_only: true,
-                supports_kv_cache: false,
+                // Only the 9b-kv edit variant runs the reference-K/V cache (sc-2347).
+                supports_kv_cache: self.is_kv(),
                 // FLUX.2 uses the empirical-mu shifted flow-match schedule.
                 requires_sigma_shift: true,
             },
@@ -186,7 +203,30 @@ mod tests {
     fn descriptors_have_expected_ids() {
         assert_eq!(Flux2Variant::Klein9b.id(), FLUX2_KLEIN_9B_ID);
         assert_eq!(Flux2Variant::Klein9bEdit.id(), FLUX2_KLEIN_9B_EDIT_ID);
+        assert_eq!(Flux2Variant::Klein9bKvEdit.id(), FLUX2_KLEIN_9B_KV_EDIT_ID);
         assert!(Flux2Variant::Klein9bEdit.is_edit());
         assert!(!Flux2Variant::Klein9b.is_edit());
+    }
+
+    #[test]
+    fn kv_variant_is_edit_only_and_caches() {
+        let kv = Flux2Variant::Klein9bKvEdit;
+        assert!(kv.is_edit());
+        assert!(kv.is_kv());
+        assert!(!Flux2Variant::Klein9bEdit.is_kv());
+        assert!(!Flux2Variant::Klein9b.is_kv());
+        // Only the kv variant advertises the cache; it loads the distinct -kv checkpoint.
+        assert!(kv.descriptor().capabilities.supports_kv_cache);
+        assert!(
+            !Flux2Variant::Klein9bEdit
+                .descriptor()
+                .capabilities
+                .supports_kv_cache
+        );
+        assert_eq!(kv.hf_model(), "black-forest-labs/FLUX.2-klein-9b-kv");
+        // Edit conditioning surface (single + multi reference), same as the plain edit variant.
+        let caps = kv.descriptor().capabilities;
+        assert!(caps.accepts(ConditioningKind::Reference));
+        assert!(caps.accepts(ConditioningKind::MultiReference));
     }
 }

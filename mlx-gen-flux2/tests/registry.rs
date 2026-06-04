@@ -6,7 +6,11 @@ use mlx_gen_flux2 as _;
 
 #[test]
 fn flux2_variants_resolve_through_core_registry() {
-    for id in ["flux2_klein_9b", "flux2_klein_9b_edit"] {
+    for id in [
+        "flux2_klein_9b",
+        "flux2_klein_9b_edit",
+        "flux2_klein_9b_kv_edit",
+    ] {
         let reg = mlx_gen::registry::generators()
             .find(|r| (r.descriptor)().id == id)
             .unwrap_or_else(|| panic!("{id} provider should self-register"));
@@ -14,6 +18,26 @@ fn flux2_variants_resolve_through_core_registry() {
         assert_eq!(d.family, "flux2");
         assert!(d.capabilities.requires_sigma_shift);
         assert!(d.capabilities.schedulers.contains(&"flow_match_euler"));
+    }
+}
+
+#[test]
+fn only_kv_variant_advertises_kv_cache() {
+    let kv = mlx_gen::registry::generators()
+        .find(|r| (r.descriptor)().id == "flux2_klein_9b_kv_edit")
+        .map(|r| (r.descriptor)())
+        .expect("the 9b-kv edit variant self-registers (sc-2347)");
+    // The KV-cache edit variant accepts the same reference conditioning as the plain edit.
+    assert!(kv.capabilities.supports_kv_cache);
+    assert!(kv.capabilities.accepts(ConditioningKind::Reference));
+    assert!(kv.capabilities.accepts(ConditioningKind::MultiReference));
+    // The base txt2img + plain edit variants do NOT advertise the cache.
+    for id in ["flux2_klein_9b", "flux2_klein_9b_edit"] {
+        let d = mlx_gen::registry::generators()
+            .find(|r| (r.descriptor)().id == id)
+            .map(|r| (r.descriptor)())
+            .unwrap();
+        assert!(!d.capabilities.supports_kv_cache, "{id} must not cache");
     }
 }
 
@@ -39,7 +63,11 @@ fn variants_advertise_expected_conditioning() {
 
 #[test]
 fn load_resolves_then_fails_on_missing_snapshot() {
-    for id in ["flux2_klein_9b", "flux2_klein_9b_edit"] {
+    for id in [
+        "flux2_klein_9b",
+        "flux2_klein_9b_edit",
+        "flux2_klein_9b_kv_edit",
+    ] {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let err = mlx_gen::load(id, &spec)
             .err()
