@@ -389,7 +389,10 @@ mod tests {
                 sampler: Some(s.into()),
                 ..Default::default()
             };
-            assert!(model.validate(&req).is_ok(), "sampler {s:?} should be accepted on dev");
+            assert!(
+                model.validate(&req).is_ok(),
+                "sampler {s:?} should be accepted on dev"
+            );
         }
         // An unset sampler is the base flow-match path.
         let req = GenerationRequest {
@@ -425,7 +428,10 @@ mod tests {
                 })
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("unsupported sampler"), "sampler {bad:?}: {err}");
+            assert!(
+                err.contains("unsupported sampler"),
+                "sampler {bad:?}: {err}"
+            );
         }
     }
 
@@ -436,11 +442,17 @@ mod tests {
         // The base path keeps the variant's own defaults (dev 25, schnell 4).
         assert_eq!(
             profile_defaults(FluxVariant::Dev, DEFAULT_SAMPLER),
-            (FluxVariant::Dev.default_steps(), crate::config::DEFAULT_GUIDANCE)
+            (
+                FluxVariant::Dev.default_steps(),
+                crate::config::DEFAULT_GUIDANCE
+            )
         );
         assert_eq!(
             profile_defaults(FluxVariant::Schnell, DEFAULT_SAMPLER),
-            (FluxVariant::Schnell.default_steps(), crate::config::DEFAULT_GUIDANCE)
+            (
+                FluxVariant::Schnell.default_steps(),
+                crate::config::DEFAULT_GUIDANCE
+            )
         );
     }
 }

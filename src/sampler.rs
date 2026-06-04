@@ -605,7 +605,11 @@ mod tests {
         assert!((val(&out) - 0.125).abs() < 1e-6, "got {}", val(&out));
         // last step integrates to σ=0: dt = 0.0 − 0.25 = −0.25.
         let last = s.step(&scalar1(0.4), &scalar1(0.2), 3).unwrap();
-        assert!((val(&last) - (0.2 - 0.1)).abs() < 1e-6, "got {}", val(&last));
+        assert!(
+            (val(&last) - (0.2 - 0.1)).abs() < 1e-6,
+            "got {}",
+            val(&last)
+        );
     }
 
     #[test]
