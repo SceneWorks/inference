@@ -1,0 +1,74 @@
+//! S2 video-VAE parity vs the reference `LTX2VideoDecoder` + `VideoEncoder` (sc-2679 S2).
+//!
+//! `#[ignore]`d: needs the real `ltx_2_3_base_q8` `vae_decoder.safetensors` (~800 MB) +
+//! `vae_encoder.safetensors` (~640 MB). The committed golden
+//! (`tests/fixtures/ltx_vae_golden.safetensors`, from `tools/dump_ltx_vae_golden.py`) holds the
+//! reference **f32** decode/encode I/O; this test loads the SAME bf16 weights, upcasts to f32, and
+//! checks the Rust `LtxVideoVae` reproduces both. Honors "divergence is not rounding": the only
+//! expected gap is f32 conv summation ordering (mlx conv3d is the shared op → near bit-exact).
+//!
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test vae_parity -- --ignored --nocapture`
+
+use mlx_rs::ops::{abs, max as max_op, subtract};
+use mlx_rs::Array;
+
+use mlx_gen::weights::Weights;
+use mlx_gen_ltx::config::LtxVaeConfig;
+use mlx_gen_ltx::vae::LtxVideoVae;
+
+const GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/ltx_vae_golden.safetensors"
+);
+
+fn base_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("LTX_BASE_DIR") {
+        return d.into();
+    }
+    let home = std::env::var("HOME").unwrap();
+    std::path::PathBuf::from(home)
+        .join("Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8")
+}
+
+/// `max|Δ| / max|ref|`.
+fn peak_rel(got: &Array, want: &Array) -> f32 {
+    let diff = abs(subtract(got, want).unwrap()).unwrap();
+    let denom = max_op(abs(want).unwrap(), None).unwrap().item::<f32>();
+    max_op(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
+}
+
+fn build() -> (LtxVideoVae, Weights) {
+    let dir = base_dir();
+    let cfg = LtxVaeConfig::from_model_dir(&dir).expect("embedded_config.json vae block");
+    let dec = Weights::from_file(dir.join("vae_decoder.safetensors")).expect("vae_decoder");
+    let enc = Weights::from_file(dir.join("vae_encoder.safetensors")).expect("vae_encoder");
+    let vae = LtxVideoVae::from_weights(&dec, Some(&enc), &cfg).expect("build LtxVideoVae");
+    let golden = Weights::from_file(GOLDEN).expect("golden (run tools/dump_ltx_vae_golden.py)");
+    (vae, golden)
+}
+
+#[test]
+#[ignore = "needs ltx_2_3_base_q8 vae_decoder.safetensors (~800 MB)"]
+fn decode_matches_reference() {
+    let (vae, g) = build();
+    let dec_in = g.require("dec_in").unwrap();
+    let want = g.require("dec_out").unwrap();
+    let got = vae.decode(dec_in).expect("decode");
+    assert_eq!(got.shape(), want.shape(), "decode output shape");
+    let pr = peak_rel(&got, want);
+    eprintln!("decode peak_rel = {pr:.3e} shape={:?}", got.shape());
+    assert!(pr < 5e-3, "decode peak_rel {pr:.3e} too high");
+}
+
+#[test]
+#[ignore = "needs ltx_2_3_base_q8 vae_encoder.safetensors (~640 MB)"]
+fn encode_matches_reference() {
+    let (vae, g) = build();
+    let enc_in = g.require("enc_in").unwrap();
+    let want = g.require("enc_out").unwrap();
+    let got = vae.encode(enc_in).expect("encode");
+    assert_eq!(got.shape(), want.shape(), "encode output shape");
+    let pr = peak_rel(&got, want);
+    eprintln!("encode peak_rel = {pr:.3e} shape={:?}", got.shape());
+    assert!(pr < 5e-3, "encode peak_rel {pr:.3e} too high");
+}

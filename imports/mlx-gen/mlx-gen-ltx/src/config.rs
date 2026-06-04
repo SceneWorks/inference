@@ -255,6 +255,148 @@ impl LtxConfig {
     }
 }
 
+/// One entry of the VAE's `decoder_blocks` / `encoder_blocks` list (`embedded_config.json` →
+/// `vae.{decoder,encoder}_blocks`). `kind` is the block tag (`res_x`, `compress_space[_res]`,
+/// `compress_time[_res]`, `compress_all[_res]`); `num_layers` is the res-block count for `res_x`
+/// groups; `multiplier` is the channel expand/reduce factor for the compress blocks. Channel sizes
+/// themselves ride on the weights — these fields drive the *structure* (block order, res counts,
+/// and the per-compress stride derived from `kind`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaeBlock {
+    pub kind: String,
+    pub num_layers: i32,
+    pub multiplier: i32,
+}
+
+impl VaeBlock {
+    /// The per-axis `(temporal, height, width)` stride implied by a compress block's `kind`. The
+    /// `_res` suffix (encoder `SpaceToDepth`) shares the base name's stride; `res_x` has none.
+    pub fn stride(&self) -> (i32, i32, i32) {
+        match self.kind.trim_end_matches("_res") {
+            "compress_space" => (1, 2, 2),
+            "compress_time" => (2, 1, 1),
+            "compress_all" => (2, 2, 2),
+            _ => (1, 1, 1),
+        }
+    }
+
+    pub fn is_compress(&self) -> bool {
+        self.kind.starts_with("compress_")
+    }
+}
+
+/// The LTX video VAE config (`embedded_config.json` → `vae`), driving the encoder + decoder
+/// structure. `decoder_blocks` is listed in **encoder** order (the decoder reverses it at build
+/// time, matching the reference `_build_up_blocks_from_config`).
+#[derive(Clone, Debug)]
+pub struct LtxVaeConfig {
+    pub latent_channels: i32,
+    pub patch_size: i32,
+    /// `false` for the shipped 2.3 checkpoint → the decoder runs without decode-time noise /
+    /// timestep modulation (no scale-shift tables in the weights). Kept config-gated so a future
+    /// ts-conditioned checkpoint is supported, not silently dropped.
+    pub timestep_conditioning: bool,
+    /// `"zeros"` for 2.3 (the 2.0 default was `"reflect"`). Spatial conv padding mode.
+    pub spatial_padding_mode: String,
+    pub decoder_blocks: Vec<VaeBlock>,
+    pub encoder_blocks: Vec<VaeBlock>,
+}
+
+impl LtxVaeConfig {
+    /// The base / eros 2.3 VAE structure (used as the fallback when no `embedded_config.json` is
+    /// present, and as the unit-test reference). Channel sizes are not encoded here — they ride on
+    /// the weights — only the block order, res counts, and compress kinds.
+    pub fn defaults() -> Self {
+        let b = |kind: &str, n: i32, m: i32| VaeBlock {
+            kind: kind.to_string(),
+            num_layers: n,
+            multiplier: m,
+        };
+        LtxVaeConfig {
+            latent_channels: 128,
+            patch_size: 4,
+            timestep_conditioning: false,
+            spatial_padding_mode: "zeros".into(),
+            decoder_blocks: vec![
+                b("res_x", 4, 1),
+                b("compress_space", 0, 2),
+                b("res_x", 6, 1),
+                b("compress_time", 0, 2),
+                b("res_x", 4, 1),
+                b("compress_all", 0, 1),
+                b("res_x", 2, 1),
+                b("compress_all", 0, 2),
+                b("res_x", 2, 1),
+            ],
+            encoder_blocks: vec![
+                b("res_x", 4, 1),
+                b("compress_space_res", 0, 2),
+                b("res_x", 6, 1),
+                b("compress_time_res", 0, 2),
+                b("res_x", 4, 1),
+                b("compress_all_res", 0, 2),
+                b("res_x", 2, 1),
+                b("compress_all_res", 0, 1),
+                b("res_x", 2, 1),
+            ],
+        }
+    }
+
+    /// Parse the `vae` block of a parsed `embedded_config.json`.
+    pub fn from_embedded_vae(v: &Value) -> Self {
+        let mut cfg = Self::defaults();
+        cfg.latent_channels = get_i32(v, "latent_channels", cfg.latent_channels);
+        cfg.patch_size = get_i32(v, "patch_size", cfg.patch_size);
+        cfg.timestep_conditioning = get_bool(v, "timestep_conditioning", cfg.timestep_conditioning);
+        if let Some(s) = v.get("spatial_padding_mode").and_then(Value::as_str) {
+            cfg.spatial_padding_mode = s.to_string();
+        }
+        if let Some(blocks) = parse_vae_blocks(v.get("decoder_blocks")) {
+            cfg.decoder_blocks = blocks;
+        }
+        if let Some(blocks) = parse_vae_blocks(v.get("encoder_blocks")) {
+            cfg.encoder_blocks = blocks;
+        }
+        cfg
+    }
+
+    /// Load from a model directory's `embedded_config.json` (`vae` block). Falls back to
+    /// [`defaults`](Self::defaults) when the file or block is absent.
+    pub fn from_model_dir(root: &Path) -> Result<Self> {
+        let path = root.join("embedded_config.json");
+        if !path.exists() {
+            return Ok(Self::defaults());
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let root_cfg: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
+        match root_cfg.get("vae") {
+            Some(v) => Ok(Self::from_embedded_vae(v)),
+            None => Ok(Self::defaults()),
+        }
+    }
+}
+
+/// Parse a `[["res_x", {"num_layers": 4}], ["compress_space_res", {"multiplier": 2}], …]` list.
+fn parse_vae_blocks(v: Option<&Value>) -> Option<Vec<VaeBlock>> {
+    let arr = v?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let pair = entry.as_array()?;
+        if pair.len() != 2 {
+            return None;
+        }
+        let kind = pair[0].as_str()?.to_string();
+        let params = &pair[1];
+        out.push(VaeBlock {
+            num_layers: get_i32(params, "num_layers", 0),
+            multiplier: get_i32(params, "multiplier", 1),
+            kind,
+        });
+    }
+    Some(out)
+}
+
 fn get_i32(v: &Value, key: &str, default: i32) -> i32 {
     v.get(key)
         .and_then(Value::as_i64)
