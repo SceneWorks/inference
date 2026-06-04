@@ -18,7 +18,7 @@ use mlx_gen::{Error, Result};
 
 use crate::config::LtxConfig;
 use crate::connector::Connector;
-use crate::gemma::{GemmaConfig, GemmaModel};
+use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 
 const RMS_EPS: f32 = 1e-6;
 
@@ -35,15 +35,19 @@ pub struct LtxTextEncoder {
 impl LtxTextEncoder {
     /// Build from the Gemma weights + the LTX `connector.safetensors` (which carries both the
     /// `video_aggregate_embed` feature-extractor Linear and the video connector). `dtype` = the
-    /// compute dtype (bf16 to match the reference).
+    /// compute dtype (bf16 to match the reference). `gemma_quant` selectively quantizes the Gemma
+    /// backbone (from its snapshot `config.json`; `None` ⇒ dense bf16 — the default `…-bf16` snapshot);
+    /// the connector + feature-extractor Linear always run dense bf16 (the reference never quantizes
+    /// them — they ship dense in `connector.safetensors`).
     pub fn from_weights(
         gemma_w: &Weights,
         connector_w: &Weights,
         gemma_cfg: GemmaConfig,
+        gemma_quant: Option<GemmaQuant>,
         ltx_cfg: &LtxConfig,
         dtype: Dtype,
     ) -> Result<Self> {
-        let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg)?;
+        let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg, gemma_quant)?;
         let load = |key: &str| -> Result<Array> {
             connector_w
                 .get(key)
