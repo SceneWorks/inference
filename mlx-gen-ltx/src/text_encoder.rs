@@ -182,6 +182,13 @@ impl LtxTextEncoder {
         })
     }
 
+    /// The Gemma-3 backbone, exposed so the prompt enhancer (sc-2845) can reuse the **already-loaded**
+    /// text-encoder weights as an autoregressive LLM (the reference `enhance_t2v` path runs generation
+    /// on `self.language_model`).
+    pub fn gemma(&self) -> &GemmaModel {
+        &self.gemma
+    }
+
     /// Encode `(1, L)` token ids + `(1, L)` attention mask → `video_embeddings` `(1, L, 4096)`.
     pub fn encode(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
         Ok(self.encode_with_features(input_ids, attention_mask)?.1)

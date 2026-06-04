@@ -193,6 +193,28 @@ impl TextTokenizer {
             attention_mask: Array::from_slice(&mask, &[1, len]),
         })
     }
+
+    /// Encode `text` to a flat `Vec<i32>` of ids — no padding, no truncation, no chat-template
+    /// wrapping — honoring `add_special_tokens` (the post-processor's BOS/EOS template). Used by
+    /// autoregressive-LM callers that build the full prompt string themselves and need exact ids
+    /// (e.g. the LTX Gemma prompt enhancer, which formats the chat template by hand and tokenizes
+    /// with `add_special_tokens=false`, like the reference `processor(..., add_special_tokens=False)`).
+    /// Special-token *strings* already present in `text` (e.g. `<start_of_turn>`) are still mapped to
+    /// their ids regardless of the flag — the flag only governs the auto-added BOS/EOS.
+    pub fn encode_ids(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>> {
+        let encoding = self
+            .inner
+            .encode(text, add_special_tokens)
+            .map_err(tok_err)?;
+        Ok(encoding.get_ids().iter().map(|&id| id as i32).collect())
+    }
+
+    /// Detokenize `ids` back to text via the loaded tokenizer's decoder. `skip_special_tokens`
+    /// drops special tokens (BOS/EOS/turn markers) from the output, matching HF
+    /// `tokenizer.decode(ids, skip_special_tokens=…)`.
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        self.inner.decode(ids, skip_special_tokens).map_err(tok_err)
+    }
 }
 
 fn empty_row() -> Array {
