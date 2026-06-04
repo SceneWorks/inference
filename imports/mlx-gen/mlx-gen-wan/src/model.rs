@@ -309,6 +309,13 @@ impl Generator for Wan14b {
 
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
+        // trim_first_frames: generate `trim` extra leading temporal chunks (each = vae_stride_t = 4
+        // latent frames → 4 output frames after the non-causal T→4T decode) and discard them after
+        // decode, so the first kept frame sees a full temporal receptive field (port of
+        // generate_wan.py). gen_frames stays 1+4k since frames is and we add a multiple of 4.
+        let trim = req.trim_first_frames.unwrap_or(0) as usize;
+        let trim_out = trim * cfg.vae_stride.0; // discarded output frames = trim · 4
+        let gen_frames = frames + trim * cfg.vae_stride.0;
         // validate() already rejected sub-tile + bad frame counts; round H/W down to the grid.
         let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
         let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
@@ -327,8 +334,9 @@ impl Generator for Wan14b {
             .clone()
             .unwrap_or_else(|| cfg.sample_neg_prompt.clone());
 
-        // Init-noise latent geometry: [z_dim, t_lat, h_lat, w_lat].
-        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
+        // Init-noise latent geometry: [z_dim, t_lat, h_lat, w_lat] for the (possibly trim-extended)
+        // generation length.
+        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
@@ -389,15 +397,21 @@ impl Generator for Wan14b {
 
         // --- Stage 3: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
-        // Auto-select VAE decode tiling from the output dims (memory-bounded for large/long video);
-        // `None` for small outputs → single-pass. decode_to_frames re-checks `needs_tiling`.
-        let tiling = TilingConfig::auto(height as i32, width as i32, frames as i32);
+        // Auto-select VAE decode tiling from the actual decoded output dims (t_lat·4 frames after the
+        // non-causal decode); `None` for small outputs → single-pass. decode_to_frames re-checks
+        // `needs_tiling`.
+        let out_frames = lat[1] * cfg.vae_stride.0 as i32;
+        let tiling = TilingConfig::auto(height as i32, width as i32, out_frames);
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = WanVae::from_weights(&w)?;
             decode_to_frames(&vae, &latents, tiling.as_ref())?
         };
-        let images = frames_to_images(&frames_u8)?;
+        let mut images = frames_to_images(&frames_u8)?;
+        // Discard the extra leading frames generated for `trim_first_frames`.
+        if trim_out > 0 {
+            images.drain(0..trim_out.min(images.len()));
+        }
 
         let fps = req.fps.unwrap_or(cfg.sample_fps);
         Ok(GenerationOutput::Video {

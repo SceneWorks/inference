@@ -72,6 +72,12 @@ pub struct GenerationRequest {
     pub fps: Option<u32>,
     pub duration: Option<f32>,
     pub video_mode: Option<String>,
+    /// Generate this many extra leading temporal chunks (each = `vae_stride_t` latent frames) and
+    /// discard them after decode, so the first *kept* frame has a full temporal receptive field of
+    /// real (non-zero-padded) data — mitigates first-frame VAE/causal-conv artifacts. `None`/0 = off
+    /// (the default). Consumed by Wan video models (`generate_wan.py`'s `trim_first_frames`); video
+    /// models that don't support it ignore it.
+    pub trim_first_frames: Option<u32>,
 
     // --- Control ---
     pub cancel: CancelFlag,
@@ -98,6 +104,7 @@ impl Default for GenerationRequest {
             fps: None,
             duration: None,
             video_mode: None,
+            trim_first_frames: None,
             cancel: CancelFlag::default(),
         }
     }
