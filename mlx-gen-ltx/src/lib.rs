@@ -19,6 +19,7 @@ pub mod config;
 pub mod connector;
 pub mod gemma;
 pub mod model;
+pub mod pipeline;
 pub mod positions;
 pub mod rope;
 pub mod schedule;
@@ -31,6 +32,10 @@ pub mod vae;
 pub use config::{LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use model::{descriptor, load, Ltx, MODEL_ID};
+pub use pipeline::{
+    decode_to_frames, denoise, generate_t2v, generate_t2v_latents, renoise, to_uint8_frames,
+    STAGE1_SIGMAS, STAGE2_SIGMAS,
+};
 pub use text_encoder::LtxTextEncoder;
 pub use tiling::TilingConfig;
 pub use transformer::{to_denoised, LtxDiT, Precision, VideoBlock};
