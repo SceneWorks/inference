@@ -231,6 +231,7 @@ fn run_e2e_gate(dir: &std::path::Path, golden: &str, bf16: bool) {
         ctx,
         &pos2,
         &STAGE2_SIGMAS,
+        None,
         &mut |_| {},
     )
     .expect("stage2");
