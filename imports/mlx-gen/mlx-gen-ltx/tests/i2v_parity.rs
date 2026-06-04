@@ -9,8 +9,9 @@
 //! conditioning + conditioned-denoise math. Strength = 1.0, frame 0 (the reference defaults) → the
 //! conditioned frame is fully pinned: its value in the final latent must equal the clean image latent.
 //!
-//! Both precisions, like `e2e_parity`: `f32` (`Precision::F32Q8`, the quality gate) and the native
-//! `bf16+Q8` production path (`Precision::Bf16Q8`). The per-forward DiT is bit-exact (sc-2842), so the
+//! Both precisions, like `e2e_parity`: `f32` (`Precision::quant_f32`, the quality gate) and the native
+//! `bf16` production path (`Precision::quant_bf16`); the quant bits/group ride on `split_model.json`.
+//! The per-forward DiT is bit-exact (sc-2842), so the
 //! conditioned latents are bit-exact and frames are pixel-parity (px>8 < 1%).
 //!
 //! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test i2v_parity -- --ignored --nocapture`
@@ -20,7 +21,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::conditioning::apply_conditioning;
-use mlx_gen_ltx::config::LtxConfig;
+use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::pipeline::{decode_to_frames, denoise, generate_i2v_latents, STAGE1_SIGMAS};
 use mlx_gen_ltx::positions::create_position_grid;
 use mlx_gen_ltx::transformer::{LtxDiT, Precision};
@@ -84,9 +85,15 @@ fn latent_stat(dec: &Weights, which: &str, dt: Dtype) -> Array {
 
 /// Shared I2V gate: build the model + the conditioning state from the golden's injected samples, gate
 /// `apply_conditioning` + the noiser + the conditioned denoise + the full e2e against `golden_path`.
-fn run_i2v_gate(golden_path: &str, prec: Precision, stat_dt: Dtype) {
+fn run_i2v_gate(golden_path: &str, bf16: bool, stat_dt: Dtype) {
     let dir = base_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("config");
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
+    let prec = if bf16 {
+        Precision::quant_bf16(split.bits, split.group)
+    } else {
+        Precision::quant_f32(split.bits, split.group)
+    };
     let tw = Weights::from_file(dir.join("transformer.safetensors")).expect("transformer");
     let dit = LtxDiT::from_weights(&tw, &cfg, prec).expect("dit");
     let uw = Weights::from_file(dir.join("upsampler.safetensors")).expect("upsampler");
@@ -246,11 +253,11 @@ fn run_i2v_gate(golden_path: &str, prec: Precision, stat_dt: Dtype) {
 #[test]
 #[ignore = "needs ltx_2_3_base_q8 transformer (~20 GB) + upsampler + vae_decoder + the I2V golden"]
 fn i2v_frames_match_reference() {
-    run_i2v_gate(GOLDEN, Precision::F32Q8, Dtype::Float32);
+    run_i2v_gate(GOLDEN, false, Dtype::Float32);
 }
 
 #[test]
 #[ignore = "needs ltx_2_3_base_q8 transformer (~20 GB) + upsampler + vae_decoder + the bf16 I2V golden"]
 fn i2v_frames_match_reference_bf16() {
-    run_i2v_gate(GOLDEN_BF16, Precision::Bf16Q8, Dtype::Bfloat16);
+    run_i2v_gate(GOLDEN_BF16, true, Dtype::Bfloat16);
 }

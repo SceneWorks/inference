@@ -10,18 +10,27 @@
 //! `connector`/transformer/vae); [`resolve_gemma_dir`] locates them via `$LTX_GEMMA_DIR` or the HF
 //! cache (`mlx-community/gemma-3-12b-it-bf16`).
 //!
+//! **Quantization (sc-2686).** The transformer ships **selectively quantized** (attn/ff Linears
+//! packed U32 + `scales`); the **bits/group ride on the checkpoint's `split_model.json`** — `eros`
+//! and `ltx_2_3_base_q4` are **Q4**, `ltx_2_3_base_q8` is **Q8**, group 64 — read into the DiT
+//! [`Precision`], never hardcoded. `LoadSpec::quantize`, when set, only *asserts* the expected level
+//! (LTX can't re-quantize a dense checkpoint — there is no dense LTX transformer; it ships pre-packed),
+//! so a mismatch with the manifest is a load error. Connector / VAE / upsampler are dense bf16 (the
+//! reference quantizes the transformer only); the Gemma text encoder is dense bf16 by default
+//! (reference TE quant rides on the *Gemma* snapshot's `config.json`).
+//!
 //! **Precision.** Selected by `LoadSpec::precision`: `Bf16` (the default) → the reference's **native**
-//! bf16 activations × Q8 ([`Precision::Bf16Q8`]) — the production-speed path; `Fp32` →
-//! [`Precision::F32Q8`] (f32 activations × Q8) — the quality target. Both are bit-exact to their
-//! reference golden (sc-2842). The latent statistics follow the path dtype (so the upsampler + denoise
-//! run in that precision); the VAE decode stays f32 (a post-sampling quality island, pixel-parity
-//! either way), and the Gemma backbone runs bf16 as the reference does. Distilled 2-stage → **no CFG**
-//! (guidance baked in).
+//! bf16 activations × quantized weights ([`Precision::quant_bf16`]) — the production-speed path;
+//! `Fp32` → [`Precision::quant_f32`] (f32 activations × quantized weights) — the quality target. Both
+//! are bit-exact to their reference golden (sc-2842). The latent statistics follow the path dtype (so
+//! the upsampler + denoise run in that precision); the VAE decode stays f32 (a post-sampling quality
+//! island, pixel-parity either way), and the Gemma backbone runs bf16 as the reference does. Distilled
+//! 2-stage → **no CFG** (guidance baked in).
 //!
 //! **I2V (sc-2685):** a single conditioning [`Conditioning::Reference`] image is VAE-encoded at both
 //! stage resolutions and injected as a clean latent at frame 0 (per-frame denoise mask, `image_strength`
 //! → `1 − strength`), driving the conditioned 2-stage denoise ([`generate_i2v_latents`]). The VAE
-//! **encoder** is loaded for this. Q4/Q8-of-everything, LoRA/LoKr, and the audio half are sibling slices.
+//! **encoder** is loaded for this. LoRA/LoKr and the audio half are sibling slices.
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -32,8 +41,8 @@ use mlx_gen::{
     Precision as LoadPrecision, Progress, Result, WeightsSource,
 };
 
-use crate::config::{LtxConfig, LtxVaeConfig};
-use crate::gemma::GemmaConfig;
+use crate::config::{LtxConfig, LtxVaeConfig, SplitModel};
+use crate::gemma::{GemmaConfig, GemmaQuant};
 use crate::pipeline::decode_to_frames;
 use crate::pipeline::{generate_i2v_latents, generate_t2v_latents, preprocess_conditioning_image};
 use crate::positions::create_position_grid;
@@ -125,6 +134,40 @@ fn resolve_gemma_dir() -> Result<std::path::PathBuf> {
     newest.ok_or_else(|| Error::Msg("ltx_2_3: no gemma snapshot in the HF cache".into()))
 }
 
+/// Read the Gemma snapshot's `config.json` top-level `quantization` block — the reference TE-quant
+/// trigger (`utils.apply_quantization`). `None` for the default `…-bf16` snapshot (no block). Only the
+/// `affine` mode is consumed (the one `quantized_matmul`/`dequantize` implement); a non-affine mode is
+/// a hard error rather than a silent mis-decode.
+fn resolve_gemma_quant(gemma_dir: &std::path::Path) -> Result<Option<GemmaQuant>> {
+    let path = gemma_dir.join("config.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::Msg(format!("ltx_2_3: parse gemma config.json: {e}")))?;
+    let Some(q) = v.get("quantization") else {
+        return Ok(None);
+    };
+    if let Some(mode) = q.get("mode").and_then(|m| m.as_str()) {
+        if mode != "affine" {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: gemma quantization mode {mode:?} is not supported (only affine)"
+            )));
+        }
+    }
+    match (
+        q.get("group_size").and_then(|x| x.as_i64()),
+        q.get("bits").and_then(|x| x.as_i64()),
+    ) {
+        (Some(g), Some(b)) => Ok(Some(GemmaQuant {
+            group: g as i32,
+            bits: b as i32,
+        })),
+        _ => Ok(None),
+    }
+}
+
 /// Load the model from a split-weight snapshot directory (the `ltx_2_3_base*` tree). Reads
 /// `embedded_config.json`, locates the Gemma TE separately, and assembles every component.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
@@ -136,23 +179,48 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    // Precision selection. `Bf16` (the [`LoadSpec`] default) → the reference's **native** bf16
-    // activations × Q8 — the production-speed path; `Fp32` → f32 activations × Q8 — the quality
-    // target. Both are bit-exact to their reference golden (sc-2842; the distilled stage-1 sampler is
-    // chaos-sensitive, so each per-forward is bit-exact). The latent statistics (the upsampler's
-    // un-/re-normalize) follow the path dtype so the whole denoise stays in that precision; the VAE
-    // decode stays f32 in both — a post-sampling quality island (pixel-parity either way).
-    let (dit_prec, stat_dt) = match spec.precision {
-        LoadPrecision::Bf16 => (Precision::Bf16Q8, Dtype::Bfloat16),
-        LoadPrecision::Fp32 => (Precision::F32Q8, Dtype::Float32),
-    };
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(
-            "ltx_2_3: Q4/Q8-of-everything is a sibling slice (sc-2686); the transformer is already \
-             shipped Q8"
-                .into(),
-        ));
+    // Quantization geometry rides on the checkpoint's `split_model.json` (sc-2686): the transformer is
+    // shipped selectively quantized (Q4 for `eros`/`base_q4`, Q8 for `base_q8`), bits/group from the
+    // manifest — never hardcoded. The per-Linear `.scales` predicate (in `transformer.rs`) then picks
+    // which Linears are quantized, matching `generate_av.py`'s `_should_quantize`.
+    let split = SplitModel::from_model_dir(root)?;
+    // `spec.quantize`, when set, only *asserts* the expected level. LTX can't re-quantize a dense
+    // checkpoint (there is no dense LTX transformer — it ships pre-packed from the reference
+    // `convert.py`, which casts f32→bf16 before quantizing), so a mismatch is a hard load error
+    // rather than a silent re-quant.
+    if let Some(q) = spec.quantize {
+        if !split.quantized {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: spec.quantize={q:?} but {} carries no split_model.json quant manifest — \
+                 LTX quant is checkpoint-driven; point at a quantized checkpoint (e.g. ltx_2_3_base_q4)",
+                root.display()
+            )));
+        }
+        if q.bits() != split.bits {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: spec.quantize={q:?} (bits {}) disagrees with the checkpoint's \
+                 split_model.json (bits {})",
+                q.bits(),
+                split.bits
+            )));
+        }
     }
+    // Precision selection. `Bf16` (the [`LoadSpec`] default) → the reference's **native** bf16
+    // activations × quantized weights — the production-speed path; `Fp32` → f32 activations ×
+    // quantized weights — the quality target. Both are bit-exact to their reference golden (sc-2842;
+    // the distilled stage-1 sampler is chaos-sensitive, so each per-forward is bit-exact). The latent
+    // statistics (the upsampler's un-/re-normalize) follow the path dtype so the whole denoise stays
+    // in that precision; the VAE decode stays f32 in both — a post-sampling quality island.
+    let (dit_prec, stat_dt) = match spec.precision {
+        LoadPrecision::Bf16 => (
+            Precision::quant_bf16(split.bits, split.group),
+            Dtype::Bfloat16,
+        ),
+        LoadPrecision::Fp32 => (
+            Precision::quant_f32(split.bits, split.group),
+            Dtype::Float32,
+        ),
+    };
     if !spec.adapters.is_empty() {
         return Err(Error::Msg(
             "ltx_2_3: LoRA/LoKr adapters are sibling slices (sc-2687 / sc-2393), not yet wired"
@@ -165,6 +233,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
     let gemma_dir = resolve_gemma_dir()?;
     let gemma_w = Weights::from_dir(&gemma_dir)?;
+    // Selectively quantize the Gemma backbone iff the snapshot's `config.json` says so (the reference
+    // `apply_quantization` path; sc-2686). The default `…-bf16` snapshot ⇒ `None` ⇒ dense bf16 TE.
+    let gemma_quant = resolve_gemma_quant(&gemma_dir)?;
     let connector_w = Weights::from_file(root.join("connector.safetensors"))?;
     let transformer_w = Weights::from_file(root.join("transformer.safetensors"))?;
     let upsampler_w = Weights::from_file(root.join("upsampler.safetensors"))?;
@@ -174,13 +245,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // transformer, and it makes I2V available without a reload (pure-T2V requests never touch it).
     let vae_enc_w = Weights::from_file(root.join("vae_encoder.safetensors"))?;
 
-    // The text encoder runs **bf16** end-to-end (the reference TE dtype; S1-validated). Its bf16
-    // `video_embeddings` enter the F32Q8 DiT, which upcasts the cross-attn context to f32 — exactly
-    // as the f32-upcast reference transformer does.
+    // The text encoder runs **bf16** activations (the reference TE dtype; S1-validated) — dense for the
+    // default `…-bf16` Gemma, or selectively quantized for a quantized snapshot. Its bf16
+    // `video_embeddings` enter the f32/bf16 DiT, which upcasts the cross-attn context as the reference
+    // transformer does.
     let text_encoder = LtxTextEncoder::from_weights(
         &gemma_w,
         &connector_w,
         GemmaConfig::gemma_3_12b(),
+        gemma_quant,
         &config,
         Dtype::Bfloat16,
     )?;
