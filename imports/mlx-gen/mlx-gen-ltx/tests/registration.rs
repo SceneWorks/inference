@@ -1,15 +1,14 @@
-//! Registry wiring + config-driven `load` (sc-2679 S0).
+//! Registry wiring + `load` rejection paths (sc-2679 S0 → S6).
 //!
-//! Verifies `ltx_2_3` self-registers into the `mlx-gen` model registry with the right
-//! descriptor, and that `load` reads the real `embedded_config.json` shape, returns a stub whose
-//! `generate` errors with an explicit "S1–S5 pending" message, and rejects the not-yet-wired
-//! sibling features (quant / adapters / single-file source).
+//! Verifies `ltx_2_3` self-registers into the `mlx-gen` model registry with the right descriptor,
+//! that `load` rejects the not-yet-wired sibling features (quant / adapters / single-file source)
+//! and an incomplete snapshot (S6 `load` assembles the full model — Gemma TE + transformer + VAE —
+//! so a config-only dir no longer loads). The request-validation logic is unit-tested weight-free in
+//! `model.rs` (`validate_request`).
 
 use std::path::PathBuf;
 
-use mlx_gen::{
-    registry, AdapterKind, AdapterSpec, GenerationRequest, LoadSpec, Modality, Quant, WeightsSource,
-};
+use mlx_gen::{registry, AdapterKind, AdapterSpec, LoadSpec, Modality, Quant, WeightsSource};
 
 use mlx_gen_ltx::MODEL_ID;
 
@@ -73,39 +72,16 @@ fn ltx_is_registered() {
 }
 
 #[test]
-fn load_reads_embedded_config_and_stubs_generate() {
+fn load_requires_full_model() {
+    // S6: `load` assembles every component (Gemma TE + connector + transformer + upsampler + VAE),
+    // so a config-only dir (no weight files) errors rather than returning a stub. (The full-model
+    // load + generate is exercised by the real-weights `e2e_parity` gate; request validation is
+    // unit-tested weight-free in `model.rs`.)
     let dir = temp_model_dir("load");
-    let g = registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
-        .expect("load should succeed (reads embedded_config.json)");
-    assert_eq!(g.descriptor().id, MODEL_ID);
-
-    // validate accepts a 64-aligned request; rejects mis-aligned + bad frame counts.
-    let ok = GenerationRequest {
-        width: 512,
-        height: 512,
-        frames: Some(33),
-        ..Default::default()
-    };
-    assert!(g.validate(&ok).is_ok());
-    let bad_size = GenerationRequest {
-        width: 500,
-        height: 512,
-        ..Default::default()
-    };
-    assert!(g.validate(&bad_size).is_err());
-    let bad_frames = GenerationRequest {
-        width: 512,
-        height: 512,
-        frames: Some(32),
-        ..Default::default()
-    };
-    assert!(g.validate(&bad_frames).is_err());
-
-    // generate is an explicit WIP error until S1–S5.
-    let mut noop = |_p| {};
-    let err = g.generate(&ok, &mut noop).unwrap_err().to_string();
-    assert!(err.contains("S1"), "expected WIP message, got: {err}");
-
+    assert!(
+        registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone()))).is_err(),
+        "config-only dir must not load (the full model's weight files are required)"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

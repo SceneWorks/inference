@@ -1,22 +1,51 @@
-//! `mlx-gen-ltx` model entry: the LTX-2.3 **video-only T2V** descriptor, the config-driven
-//! `load`, and registry self-registration.
+//! `mlx-gen-ltx` model entry: the LTX-2.3 **video-only T2V** descriptor, the config-driven `load`,
+//! the public `generate`, and registry self-registration.
 //!
-//! **Scope (sc-2679 S0):** this slice ships the foundation — crate scaffold, registry wiring, the
-//! `embedded_config.json`-driven config, SPLIT 3-D RoPE (double-precision), the f32 position grid,
-//! the distilled sigma schedules, and the legacy Euler step. The denoise pipeline itself (Gemma-3
-//! TE → connector → 48-layer DiT → video VAE → 2-stage upsample/refine) lands across S1–S5, so
-//! `generate` returns an explicit "not yet wired" error until then. `load` already reads + validates
-//! the real model's `embedded_config.json` so the config seam is exercised end-to-end now.
+//! **Scope (sc-2679 S6):** the full end-to-end T2V pipeline is now wired — prompt → Gemma-3 tokenizer
+//! → [`LtxTextEncoder`] (Gemma backbone + feature extractor + connector) → seeded noise → the
+//! 2-stage distilled denoise ([`crate::pipeline`]: stage-1 half-res → 2× [`LatentUpsampler`] →
+//! re-noise → stage-2 full-res) → [`LtxVideoVae`] decode → uint8 RGB frames.
+//!
+//! The Gemma text-encoder weights are a **separate** snapshot (the base model dir holds only the
+//! `connector`/transformer/vae); [`resolve_gemma_dir`] locates them via `$LTX_GEMMA_DIR` or the HF
+//! cache (`mlx-community/gemma-3-12b-it-bf16`).
+//!
+//! **Precision.** Runs the **f32-activation** path (transformer [`Precision::F32Q8`]: f32 activations
+//! × the Q8 weights; f32 TE-connector + VAE; the Gemma backbone runs bf16 as the reference does) —
+//! the port's validated quality target (S3b). Distilled 2-stage → **no CFG** (guidance baked in).
+//! Q4/Q8-of-everything, I2V, LoRA/LoKr, and the audio half are sibling slices.
 
+use mlx_rs::{random, Array, Dtype};
+
+use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
-    Capabilities, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Result, WeightsSource,
+    default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Precision as LoadPrecision, Progress, Result,
+    WeightsSource,
 };
 
-use crate::config::LtxConfig;
+use crate::config::{LtxConfig, LtxVaeConfig};
+use crate::gemma::GemmaConfig;
+use crate::pipeline::decode_to_frames;
+use crate::pipeline::generate_t2v_latents;
+use crate::positions::create_position_grid;
+use crate::text_encoder::LtxTextEncoder;
+use crate::tokenizer::LtxTokenizer;
+use crate::transformer::{LtxDiT, Precision};
+use crate::upsampler::LatentUpsampler;
+use crate::vae::LtxVideoVae;
 
 /// Public registry id: `mlx_gen::load("ltx_2_3", spec)`.
 pub const MODEL_ID: &str = "ltx_2_3";
+
+/// Reference text-encoder token budget (`LTX2TextEncoder.encode` default `max_length=1024`).
+const MAX_PROMPT_TOKENS: usize = 1024;
+/// LTX-2 latent channels.
+const LATENT_CHANNELS: i32 = 128;
+/// VAE temporal compression (8×): `latent_frames = 1 + (frames − 1) / 8`.
+const TEMPORAL_SCALE: u32 = 8;
+/// VAE spatial compression (32×); stage-1 additionally halves resolution.
+const SPATIAL_SCALE: u32 = 32;
 
 /// Stable identity + advertised capabilities for the LTX-2.3 video-only core.
 pub fn descriptor() -> ModelDescriptor {
@@ -46,17 +75,42 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// The loaded LTX-2.3 model. S0 holds the resolved config; the network components (TE, connector,
-/// transformer, VAE, upsampler) attach across S1–S5.
+/// The loaded LTX-2.3 model: the assembled T2V components + the cached descriptor.
 pub struct Ltx {
     descriptor: ModelDescriptor,
-    #[allow(dead_code)] // consumed by the S1–S5 pipeline.
-    config: LtxConfig,
+    tokenizer: LtxTokenizer,
+    text_encoder: LtxTextEncoder,
+    transformer: LtxDiT,
+    upsampler: LatentUpsampler,
+    vae: LtxVideoVae,
+    latent_mean: Array,
+    latent_std: Array,
 }
 
-/// Load the model from a snapshot directory. Reads + validates `embedded_config.json` (the
-/// config seam). Dense f32 activations are the target for LTX (quality + dodging the pmetal bf16
-/// GEMM bug); quantization + adapters are sibling slices, rejected here for now.
+/// Locate the Gemma-3-12B text-encoder snapshot. `$LTX_GEMMA_DIR` wins; otherwise the newest
+/// `mlx-community/gemma-3-12b-it-bf16` snapshot in the HF cache.
+fn resolve_gemma_dir() -> Result<std::path::PathBuf> {
+    if let Ok(d) = std::env::var("LTX_GEMMA_DIR") {
+        return Ok(d.into());
+    }
+    let home = std::env::var("HOME").map_err(|_| Error::Msg("ltx_2_3: HOME unset".into()))?;
+    let base = std::path::PathBuf::from(home)
+        .join(".cache/huggingface/hub/models--mlx-community--gemma-3-12b-it-bf16/snapshots");
+    let newest = std::fs::read_dir(&base)
+        .map_err(|_| {
+            Error::Msg(format!(
+                "ltx_2_3: gemma snapshot not found at {} (set $LTX_GEMMA_DIR)",
+                base.display()
+            ))
+        })?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    newest.ok_or_else(|| Error::Msg("ltx_2_3: no gemma snapshot in the HF cache".into()))
+}
+
+/// Load the model from a split-weight snapshot directory (the `ltx_2_3_base*` tree). Reads
+/// `embedded_config.json`, locates the Gemma TE separately, and assembles every component.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let root =
         match &spec.weights {
@@ -66,15 +120,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    if spec.precision != Precision::Bf16 {
-        // The dense LTX path runs f32 activations regardless; no precision override is wired yet.
+    if spec.precision != LoadPrecision::Bf16 {
         return Err(Error::Msg(
-            "ltx_2_3: precision override is not wired (the dense path runs f32 activations)".into(),
+            "ltx_2_3: precision override is not wired (the path runs f32 activations × Q8)".into(),
         ));
     }
     if spec.quantize.is_some() {
         return Err(Error::Msg(
-            "ltx_2_3: Q4/Q8 quantization is a sibling slice (sc-2686), not yet wired".into(),
+            "ltx_2_3: Q4/Q8-of-everything is a sibling slice (sc-2686); the transformer is already \
+             shipped Q8"
+                .into(),
         ));
     }
     if !spec.adapters.is_empty() {
@@ -85,10 +140,164 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }
 
     let config = LtxConfig::from_model_dir(root)?;
+    let vae_config = LtxVaeConfig::from_model_dir(root)?;
+
+    let gemma_dir = resolve_gemma_dir()?;
+    let gemma_w = Weights::from_dir(&gemma_dir)?;
+    let connector_w = Weights::from_file(root.join("connector.safetensors"))?;
+    let transformer_w = Weights::from_file(root.join("transformer.safetensors"))?;
+    let upsampler_w = Weights::from_file(root.join("upsampler.safetensors"))?;
+    let vae_w = Weights::from_file(root.join("vae_decoder.safetensors"))?;
+
+    // The text encoder runs **bf16** end-to-end (the reference TE dtype; S1-validated). Its bf16
+    // `video_embeddings` enter the F32Q8 DiT, which upcasts the cross-attn context to f32 — exactly
+    // as the f32-upcast reference transformer does.
+    let text_encoder = LtxTextEncoder::from_weights(
+        &gemma_w,
+        &connector_w,
+        GemmaConfig::gemma_3_12b(),
+        &config,
+        Dtype::Bfloat16,
+    )?;
+    let transformer = LtxDiT::from_weights(&transformer_w, &config, Precision::F32Q8)?;
+    let upsampler = LatentUpsampler::from_weights(&upsampler_w)?;
+    let vae = LtxVideoVae::from_weights(&vae_w, None, &vae_config)?;
+    // The VAE `per_channel_statistics` double as the upsampler's latent norm (f32).
+    let latent_mean = to_dtype(
+        vae_w.require("per_channel_statistics.mean")?,
+        Dtype::Float32,
+    )?;
+    let latent_std = to_dtype(vae_w.require("per_channel_statistics.std")?, Dtype::Float32)?;
+
     Ok(Box::new(Ltx {
         descriptor: descriptor(),
-        config,
+        tokenizer: LtxTokenizer::from_dir(&gemma_dir)?,
+        text_encoder,
+        transformer,
+        upsampler,
+        vae,
+        latent_mean,
+        latent_std,
     }))
+}
+
+impl Ltx {
+    /// Latent dims `(frames, stage1_h, stage1_w, stage2_h, stage2_w)` for a request.
+    pub(crate) fn latent_dims(req: &GenerationRequest) -> (usize, usize, usize, usize, usize) {
+        let frames = req.frames.unwrap_or(1).max(1);
+        let latent_frames = 1 + (frames as usize - 1) / TEMPORAL_SCALE as usize;
+        let (h, w) = (req.height, req.width);
+        (
+            latent_frames,
+            (h / 2 / SPATIAL_SCALE) as usize,
+            (w / 2 / SPATIAL_SCALE) as usize,
+            (h / SPATIAL_SCALE) as usize,
+            (w / SPATIAL_SCALE) as usize,
+        )
+    }
+
+    /// Prompt → `video_embeddings` (f32) via the Gemma tokenizer + text encoder.
+    fn encode_prompt(&self, prompt: &str) -> Result<Array> {
+        let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
+        self.text_encoder.encode(&ids, &mask)
+    }
+
+    /// The full T2V path with **injected** stage noise (the deterministic seam `generate` calls with
+    /// RNG-drawn noise and the e2e parity test calls with the reference samples). Encodes the prompt,
+    /// then defers to [`generate_from_embeddings`](Self::generate_from_embeddings).
+    pub(crate) fn generate_with_noise(
+        &self,
+        req: &GenerationRequest,
+        stage1_noise: &Array,
+        stage2_noise: &Array,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let context = self.encode_prompt(&req.prompt)?;
+        self.generate_from_embeddings(req, &context, stage1_noise, stage2_noise, on_progress)
+    }
+
+    /// The T2V path from **injected** text embeddings + noise — the pipeline-only seam (no text
+    /// encoder), so the parity test can gate the 2-stage pipeline + decode against the reference's
+    /// conditioning without loading the Gemma backbone. `context` is `(1, ctx, 4096)`; `stage1_noise`
+    /// `(1, 128, F, h1, w1)` and `stage2_noise` `(1, 128, F, h2, w2)`.
+    pub(crate) fn generate_from_embeddings(
+        &self,
+        req: &GenerationRequest,
+        context: &Array,
+        stage1_noise: &Array,
+        stage2_noise: &Array,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
+        let pos1 = create_position_grid(1, lf, h1, w1);
+        let pos2 = create_position_grid(1, lf, h2, w2);
+
+        let mut step = 0usize;
+        let latents = generate_t2v_latents(
+            &self.transformer,
+            &self.upsampler,
+            stage1_noise,
+            &pos1,
+            stage2_noise,
+            &pos2,
+            context,
+            &self.latent_mean,
+            &self.latent_std,
+            &mut |_| {
+                step += 1;
+                on_progress(Progress::Step {
+                    current: step as u32,
+                    total: 11,
+                });
+            },
+        )?;
+
+        on_progress(Progress::Decoding);
+        let frames = decode_to_frames(&self.vae, &latents)?;
+        let images = frames_to_images(&frames)?;
+        Ok(GenerationOutput::Video {
+            frames: images,
+            fps: req.fps.unwrap_or(24),
+            audio: None,
+        })
+    }
+}
+
+/// Capability-driven request validation (weight-free, so it's unit-testable without a load):
+/// non-empty prompt, 64-aligned width/height (stage-1 runs at //2//32), `num_frames = 1 + 8·k`.
+pub(crate) fn validate_request(req: &GenerationRequest) -> Result<()> {
+    if req.prompt.is_empty() {
+        return Err(Error::Msg("ltx_2_3: prompt must not be empty".into()));
+    }
+    if !req.width.is_multiple_of(64) || !req.height.is_multiple_of(64) {
+        return Err(Error::Msg(format!(
+            "ltx_2_3: width/height must be divisible by 64 (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if let Some(frames) = req.frames {
+        if frames % 8 != 1 {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: num_frames must be 1 + 8·k (got {frames})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `(F, H, W, 3)` uint8 → one [`Image`] per frame.
+pub(crate) fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
+    let sh = frames.shape(); // (F, H, W, 3)
+    let (f, h, w) = (sh[0] as usize, sh[1] as u32, sh[2] as u32);
+    let data = frames.as_slice::<u8>();
+    let per = (h as usize) * (w as usize) * 3;
+    Ok((0..f)
+        .map(|i| Image {
+            width: w,
+            height: h,
+            pixels: data[i * per..(i + 1) * per].to_vec(),
+        })
+        .collect())
 }
 
 impl Generator for Ltx {
@@ -97,36 +306,101 @@ impl Generator for Ltx {
     }
 
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        if !req.width.is_multiple_of(64) || !req.height.is_multiple_of(64) {
-            return Err(Error::Msg(format!(
-                "ltx_2_3: width/height must be divisible by 64 (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        if let Some(frames) = req.frames {
-            if frames % 8 != 1 {
-                return Err(Error::Msg(format!(
-                    "ltx_2_3: num_frames must be 1 + 8·k (got {frames})"
-                )));
-            }
-        }
-        Ok(())
+        validate_request(req)
     }
 
     fn generate(
         &self,
-        _req: &GenerationRequest,
-        _on_progress: &mut dyn FnMut(Progress),
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        Err(Error::Msg(
-            "ltx_2_3: T2V denoise pipeline is not yet wired — S0 ships the scaffold, config, \
-             RoPE, position grid, sigma schedules, and Euler step; the TE/connector/DiT/VAE/2-stage \
-             pipeline lands in S1–S5 (sc-2679)"
-                .into(),
-        ))
+        self.validate(req)?;
+        let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
+        let seed = req.seed.unwrap_or_else(default_seed);
+        // Seeded f32 noise (the f32-activation regime). RNG is not portable to mlx-python, so the
+        // pixel-level parity gate injects the reference samples via `generate_with_noise`.
+        let k1 = random::key(seed)?;
+        let k2 = random::key(seed.wrapping_add(1))?;
+        let stage1_noise = random::normal::<f32>(
+            &[1, LATENT_CHANNELS, lf as i32, h1 as i32, w1 as i32],
+            None,
+            None,
+            Some(&k1),
+        )?;
+        let stage2_noise = random::normal::<f32>(
+            &[1, LATENT_CHANNELS, lf as i32, h2 as i32, w2 as i32],
+            None,
+            None,
+            Some(&k2),
+        )?;
+        self.generate_with_noise(req, &stage1_noise, &stage2_noise, on_progress)
     }
 }
 
 inventory::submit! {
     mlx_gen::ModelRegistration { descriptor, load }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latent_dims_matches_reference_formula() {
+        // 256×256, 9 frames: latent_frames = 1+(9-1)/8 = 2; stage1 = H/2/32 = 4; stage2 = H/32 = 8.
+        let req = GenerationRequest {
+            width: 256,
+            height: 256,
+            frames: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(Ltx::latent_dims(&req), (2, 4, 4, 8, 8));
+        // 512×768, 1 frame: latent_frames = 1; stage1 = 8×12; stage2 = 16×24.
+        let req = GenerationRequest {
+            width: 768,
+            height: 512,
+            frames: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(Ltx::latent_dims(&req), (1, 8, 12, 16, 24));
+    }
+
+    #[test]
+    fn validate_request_enforces_constraints() {
+        let base = GenerationRequest {
+            prompt: "a".into(),
+            width: 512,
+            height: 512,
+            frames: Some(33),
+            ..Default::default()
+        };
+        assert!(validate_request(&base).is_ok());
+        assert!(validate_request(&GenerationRequest {
+            prompt: String::new(),
+            ..base.clone()
+        })
+        .is_err());
+        assert!(validate_request(&GenerationRequest {
+            width: 500,
+            ..base.clone()
+        })
+        .is_err());
+        assert!(validate_request(&GenerationRequest {
+            frames: Some(32),
+            ..base.clone()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn frames_to_images_splits_per_frame() {
+        // (F=2, H=1, W=2, 3): each frame = 6 bytes.
+        let data: Vec<u8> = (0..12).collect();
+        let frames = Array::from_slice(&data, &[2, 1, 2, 3]);
+        let imgs = frames_to_images(&frames).unwrap();
+        assert_eq!(imgs.len(), 2);
+        assert_eq!((imgs[0].width, imgs[0].height), (2, 1));
+        assert_eq!(imgs[0].pixels, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(imgs[1].pixels, vec![6, 7, 8, 9, 10, 11]);
+    }
 }
