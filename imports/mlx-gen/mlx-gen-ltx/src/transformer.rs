@@ -1,25 +1,29 @@
-//! S3 — the LTX-2.3 **DiT** (video stack): 48 × `BasicAVTransformerBlock` (video-only path) plus the
-//! preprocessor (patchify + adaLN-single) and output projection. Port of the `mlx_video` reference
-//! `models/ltx/{transformer,attention,adaln,feed_forward,ltx}.py`.
+//! S3 — the LTX-2.3 **DiT** (video stack): the preprocessor (patchify + adaLN-single) → 48 ×
+//! `BasicAVTransformerBlock` (video-only path) → output projection → velocity. Port of the
+//! `mlx_video` reference `models/ltx/{transformer,attention,adaln,feed_forward,ltx}.py`.
 //!
-//! **S3a (this slice)** ports the per-block math + a single-block parity gate, the riskiest piece:
-//!  - **gated attention** (`to_gate_logits → 2·sigmoid`, zero-init identity), q/k **RMSNorm** over the
-//!    full inner_dim (pre-head, learned weight), **SPLIT 3-D RoPE** on q/k (reusing the S0
-//!    [`crate::rope`]), SDPA, `to_out`;
-//!  - **adaLN-single** with the 9-row `scale_shift_table` (gated 2.3 family): MSA rows 0..3, FF rows
-//!    3..6, text-cross-attn rows 6..9 (`v_has_ca_ada`), each = `table[row] + timestep_proj[row]`;
-//!  - **prompt adaLN** (`prompt_scale_shift_table`, 2 rows) modulating the text context before
-//!    cross-attention;
-//!  - **FeedForward** = `proj_in → gelu(tanh) → proj_out` (core dtype-preserving [`gelu_tanh`]).
+//! Per-block math (S3a): **gated attention** (`to_gate_logits → 2·sigmoid`, zero-init identity), q/k
+//! **RMSNorm** over the full inner_dim (pre-head, learned), **SPLIT 3-D RoPE** on q/k (reusing the S0
+//! [`crate::rope`]), SDPA, `to_out`; **adaLN-single** with the 9-row `scale_shift_table` (gated 2.3
+//! family: MSA rows 0..3, FF rows 3..6, text-cross-attn rows 6..9); **prompt adaLN** modulating the
+//! text context; **FeedForward** = `proj_in → gelu(tanh) → proj_out`.
 //!
-//! The shipped `base_q8` transformer stores the attn/ff Linears **Q8-quantized** (U32 + `scales` +
-//! `biases`, group 64). The full 48-layer forward runs bf16 × Q8 quantized-matmul (S3b); this slice
-//! gates the block **math in f32** by dequantizing those weights (`mx.dequantize`, bit-identical in
-//! Rust and the reference) — isolating block correctness from the quant path, mirroring the S2 VAE
-//! f32 gate. The small Linears (q/k-norm, gate, adaLN) are dense bf16 → f32.
+//! Full forward (S3b): patchify_proj → adaLN-single (timestep → 9·dim) + prompt-adaLN (→ 2·dim) →
+//! caption projection (Identity for 2.3) → SPLIT RoPE from the position grid → 48 blocks → output
+//! (`LayerNorm` affine-false + final 2-row `scale_shift_table` modulated by the embedded timestep) →
+//! `proj_out → 128` velocity. `denoised = latent − σ·velocity`.
+//!
+//! **Quant.** The shipped `base_q8` transformer stores the attn/ff Linears Q8-quantized (U32 +
+//! `scales` + `biases`, group 64) — there is no dense bf16 checkpoint. [`Precision::F32Q8`] is the
+//! production path: **f32 activations × Q8 `quantized_matmul`** (the port's quality target; a single
+//! block is bit-exact to the reference at matched mlx 0.31.2). [`Precision::F32`] additionally
+//! dequantizes the Q8 weights to dense f32 — the S3a block math gate. [`Precision::Bf16Q8`] mirrors
+//! the reference's own bf16 compute, retained for diagnostics.
 
-use mlx_rs::fast::{rms_norm as fast_rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, dequantize, multiply, sigmoid};
+use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
+use mlx_rs::ops::{
+    add, concatenate_axis, dequantize, multiply, quantized_matmul, sigmoid, subtract,
+};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{gelu_tanh, linear};
@@ -27,53 +31,129 @@ use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::Result;
 
 use crate::config::LtxConfig;
-use crate::rope::apply_split_rotary_emb;
+use crate::rope::{apply_split_rotary_emb, precompute_split_freqs_cis};
 
 /// Q8 quant config of the shipped transformer (`split_model.json`: bits 8, group 64).
 const QUANT_BITS: i32 = 8;
 const QUANT_GROUP: i32 = 64;
+/// adaLN-single sinusoidal timestep projection width (PixArt `Timesteps`).
+const TIME_PROJ_DIM: i32 = 256;
 
-fn f32(w: &Weights, key: &str) -> Result<Array> {
-    to_dtype(w.require(key)?, Dtype::Float32)
+/// Compute precision for the DiT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    /// f32 activations, Q8 weights **dequantized** to dense f32 — the S3a block math gate (small).
+    F32,
+    /// **f32 activations × Q8 `quantized_matmul`** (dense weights f32) — the production path and the
+    /// port's quality target. A single block is bit-exact to the reference (mlx 0.31.2); the bf16
+    /// alternative drifts ~3e-2 over the 48-layer residual stream, amplified by the output LayerNorm.
+    F32Q8,
+    /// bf16 activations × Q8 `quantized_matmul` (dense bf16 elsewhere) — matches the reference's own
+    /// compute dtype; retained for reference/diagnostics.
+    Bf16Q8,
+}
+
+impl Precision {
+    fn dtype(self) -> Dtype {
+        match self {
+            Precision::F32 | Precision::F32Q8 => Dtype::Float32,
+            Precision::Bf16Q8 => Dtype::Bfloat16,
+        }
+    }
+
+    /// Whether Q8 weights are kept quantized (`quantized_matmul`) vs dequantized to dense f32.
+    fn keep_quant(self) -> bool {
+        matches!(self, Precision::F32Q8 | Precision::Bf16Q8)
+    }
 }
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
 }
 
+/// Load a non-Linear param (norm weight, scale-shift table) cast to the compute dtype.
+fn param(w: &Weights, key: &str, prec: Precision) -> Result<Array> {
+    to_dtype(w.require(key)?, prec.dtype())
+}
+
 /// `x · (1 + scale) + shift` (adaLN modulation), broadcasting `scale`/`shift` `(B, S', dim)` over the
 /// token axis.
 fn modulate(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    Ok(add(&multiply(x, &add(scale, scalar(1.0))?)?, shift)?)
+    Ok(add(
+        &multiply(x, &add(scale, scalar(1.0).as_dtype(scale.dtype())?)?)?,
+        shift,
+    )?)
 }
 
-/// A dense f32 Linear. Loaded from either a dense bf16 weight or a **dequantized** Q8 weight
-/// (`{prefix}.weight` U32 + `.scales` + `.biases`) — both upcast to f32 for the S3a math gate.
-struct Linear {
-    w: Array, // [out, in] f32
-    b: Array, // [out] f32
+/// A Linear — dense or Q8-quantized, selected by [`Precision`] at load.
+enum Linear {
+    Dense {
+        w: Array, // [out, in]
+        b: Array, // [out]
+    },
+    Quant {
+        q: Array,      // [out, in_packed] U32
+        scales: Array, // [out, in/group]
+        biases: Array,
+        b: Array,
+        group: i32,
+        bits: i32,
+    },
 }
 
 impl Linear {
-    fn load(w: &Weights, prefix: &str) -> Result<Self> {
-        let weight = match w.get(&format!("{prefix}.scales")) {
+    fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
+        let dt = prec.dtype();
+        let b = to_dtype(w.require(&format!("{prefix}.bias"))?, dt)?;
+        match w.get(&format!("{prefix}.scales")) {
             Some(scales) => {
                 let q = w.require(&format!("{prefix}.weight"))?;
                 let biases = w.require(&format!("{prefix}.biases"))?;
-                let dense =
-                    dequantize(q, scales, Some(biases), Some(QUANT_GROUP), Some(QUANT_BITS))?;
-                to_dtype(&dense, Dtype::Float32)?
+                if prec.keep_quant() {
+                    // Keep Q8; `quantized_matmul` dequantizes on the fly with fp32 accumulation and
+                    // is correct for f32 *or* bf16 activations (the Z-Image/Qwen Q8 path). Scales /
+                    // biases are cast to the compute dtype so the on-the-fly dequant matches the
+                    // reference's (f32 for F32Q8 — a lossless upcast of the bf16 file scales).
+                    Ok(Linear::Quant {
+                        q: q.clone(),
+                        scales: to_dtype(scales, Dtype::Bfloat16)?,
+                        biases: to_dtype(biases, Dtype::Bfloat16)?,
+                        b,
+                        group: QUANT_GROUP,
+                        bits: QUANT_BITS,
+                    })
+                } else {
+                    // Dequantize to dense f32 (bit-identical to the reference's mx.dequantize).
+                    let dense =
+                        dequantize(q, scales, Some(biases), Some(QUANT_GROUP), Some(QUANT_BITS))?;
+                    Ok(Linear::Dense {
+                        w: to_dtype(&dense, Dtype::Float32)?,
+                        b,
+                    })
+                }
             }
-            None => f32(w, &format!("{prefix}.weight"))?,
-        };
-        Ok(Self {
-            w: weight,
-            b: f32(w, &format!("{prefix}.bias"))?,
-        })
+            None => Ok(Linear::Dense {
+                w: to_dtype(w.require(&format!("{prefix}.weight"))?, dt)?,
+                b,
+            }),
+        }
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        linear(x, &self.w, &self.b)
+        match self {
+            Linear::Dense { w, b } => linear(x, w, b),
+            Linear::Quant {
+                q,
+                scales,
+                biases,
+                b,
+                group,
+                bits,
+            } => Ok(add(
+                &quantized_matmul(x, q, scales, biases, true, *group, *bits)?,
+                b,
+            )?),
+        }
     }
 }
 
@@ -86,34 +166,34 @@ fn rms_norm_noweight(x: &Array, eps: f32) -> Result<Array> {
 
 /// Multi-head attention with q/k RMSNorm, optional SPLIT RoPE, optional per-head gating. Self-attn
 /// when `context` is `None`; cross-attn otherwise. RoPE `(cos, sin)` applies to q **and** k (self-attn
-/// only; cross-attn passes `pe=None`).
+/// only; cross-attn passes `pe = None`).
 struct Attention {
     to_q: Linear,
     to_k: Linear,
     to_v: Linear,
-    q_norm: Array, // [inner] f32
+    q_norm: Array,
     k_norm: Array,
     to_out: Linear,
-    gate: Option<Linear>, // to_gate_logits [heads, inner]
+    gate: Option<Linear>,
     heads: i32,
     dim_head: i32,
     eps: f32,
 }
 
 impl Attention {
-    fn load(w: &Weights, prefix: &str, cfg: &LtxConfig) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
         let gate = if w.get(&format!("{prefix}.to_gate_logits.weight")).is_some() {
-            Some(Linear::load(w, &format!("{prefix}.to_gate_logits"))?)
+            Some(Linear::load(w, &format!("{prefix}.to_gate_logits"), prec)?)
         } else {
             None
         };
         Ok(Self {
-            to_q: Linear::load(w, &format!("{prefix}.to_q"))?,
-            to_k: Linear::load(w, &format!("{prefix}.to_k"))?,
-            to_v: Linear::load(w, &format!("{prefix}.to_v"))?,
-            q_norm: f32(w, &format!("{prefix}.q_norm.weight"))?,
-            k_norm: f32(w, &format!("{prefix}.k_norm.weight"))?,
-            to_out: Linear::load(w, &format!("{prefix}.to_out"))?,
+            to_q: Linear::load(w, &format!("{prefix}.to_q"), prec)?,
+            to_k: Linear::load(w, &format!("{prefix}.to_k"), prec)?,
+            to_v: Linear::load(w, &format!("{prefix}.to_v"), prec)?,
+            q_norm: param(w, &format!("{prefix}.q_norm.weight"), prec)?,
+            k_norm: param(w, &format!("{prefix}.k_norm.weight"), prec)?,
+            to_out: Linear::load(w, &format!("{prefix}.to_out"), prec)?,
             gate,
             heads: cfg.num_attention_heads,
             dim_head: cfg.attention_head_dim,
@@ -121,7 +201,7 @@ impl Attention {
         })
     }
 
-    /// `(B, S, inner)` q-features → `(B, H, S, head_dim)`.
+    /// `(B, S, inner)` → `(B, H, S, head_dim)`.
     fn to_heads(&self, x: &Array) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -149,12 +229,12 @@ impl Attention {
             kh = apply_split_rotary_emb(&kh, cos, sin)?;
         }
 
-        let scale = (self.dim_head as f32).powf(-0.5);
+        // Match the reference's Python `1.0 / math.sqrt(dim_head)` (f64 → f32), not `d^-0.5` in f32.
+        let scale = (1.0f64 / (self.dim_head as f64).sqrt()) as f32;
         let out = match mask {
             Some(m) => scaled_dot_product_attention(&qh, &kh, &vh, scale, m, None)?,
             None => scaled_dot_product_attention(&qh, &kh, &vh, scale, None, None)?,
         };
-        // (B, H, S, hd) → (B, S, inner).
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
         let inner = self.heads * self.dim_head;
@@ -162,8 +242,8 @@ impl Attention {
 
         if let Some(gate) = &self.gate {
             // Per-head gate: 2·sigmoid(logits) (zero-init → identity), broadcast over head_dim.
-            let logits = gate.forward(x)?; // (B, S, heads)
-            let gates = multiply(&sigmoid(&logits)?, scalar(2.0))?;
+            let logits = gate.forward(x)?;
+            let gates = multiply(&sigmoid(&logits)?, scalar(2.0).as_dtype(logits.dtype())?)?;
             let gates = gates.reshape(&[b, s, self.heads, 1])?;
             out = multiply(&out.reshape(&[b, s, self.heads, self.dim_head])?, &gates)?
                 .reshape(&[b, s, inner])?;
@@ -179,10 +259,10 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn load(w: &Weights, prefix: &str) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
         Ok(Self {
-            proj_in: Linear::load(w, &format!("{prefix}.proj_in"))?,
-            proj_out: Linear::load(w, &format!("{prefix}.proj_out"))?,
+            proj_in: Linear::load(w, &format!("{prefix}.proj_in"), prec)?,
+            proj_out: Linear::load(w, &format!("{prefix}.proj_out"), prec)?,
         })
     }
 
@@ -202,23 +282,20 @@ fn ada_values(table: &Array, timestep: &Array, lo: i32, hi: i32) -> Result<Vec<A
     let ts4 = timestep.reshape(&[b, s, num_ada, dim])?;
     let mut out = Vec::with_capacity((hi - lo) as usize);
     for row in lo..hi {
-        let trow = table
-            .index_axis(row, 0)? // (dim,)
-            .reshape(&[1, 1, dim])?;
-        let tsrow = ts4.index_axis(row, 2)?; // (B, S, dim)
+        let trow = table.index_axis(row, 0)?.reshape(&[1, 1, dim])?;
+        let tsrow = ts4.index_axis(row, 2)?;
         out.push(add(&trow, &tsrow)?);
     }
     Ok(out)
 }
 
-/// Index a single position `i` along `axis`, dropping that axis (like `x.take(i, axis)` then squeeze).
+/// Index a single position `i` along `axis`, dropping that axis.
 trait IndexAxis {
     fn index_axis(&self, i: i32, axis: i32) -> Result<Array>;
 }
 impl IndexAxis for Array {
     fn index_axis(&self, i: i32, axis: i32) -> Result<Array> {
-        let taken = self.take_axis(Array::from_int(i), axis)?;
-        Ok(taken)
+        Ok(self.take_axis(Array::from_int(i), axis)?)
     }
 }
 
@@ -233,25 +310,24 @@ pub struct VideoBlock {
 }
 
 impl VideoBlock {
-    pub fn load(w: &Weights, prefix: &str, cfg: &LtxConfig) -> Result<Self> {
+    /// Load a block (`prefix` e.g. `transformer_blocks.0`) at the given [`Precision`].
+    pub fn load(w: &Weights, prefix: &str, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
         Ok(Self {
-            attn1: Attention::load(w, &format!("{prefix}.attn1"), cfg)?,
-            attn2: Attention::load(w, &format!("{prefix}.attn2"), cfg)?,
-            ff: FeedForward::load(w, &format!("{prefix}.ff"))?,
-            scale_shift_table: f32(w, &format!("{prefix}.scale_shift_table"))?,
-            prompt_scale_shift_table: f32(w, &format!("{prefix}.prompt_scale_shift_table"))?,
+            attn1: Attention::load(w, &format!("{prefix}.attn1"), cfg, prec)?,
+            attn2: Attention::load(w, &format!("{prefix}.attn2"), cfg, prec)?,
+            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec)?,
+            scale_shift_table: param(w, &format!("{prefix}.scale_shift_table"), prec)?,
+            prompt_scale_shift_table: param(
+                w,
+                &format!("{prefix}.prompt_scale_shift_table"),
+                prec,
+            )?,
             eps: cfg.norm_eps as f32,
         })
     }
 
-    /// Forward (gated, `v_has_ca_ada` = 9-row table): MSA(self, RoPE) → text cross-attn (with
-    /// prompt-modulated context) → FeedForward, each adaLN-modulated and gated.
-    ///
-    /// * `x` — `(B, S, inner)` patch features.
-    /// * `timesteps` — `(B, S', 9·inner)` adaLN-single projection.
-    /// * `prompt_timestep` — optional `(B, S', 2·inner)` prompt-adaLN projection.
-    /// * `context` — `(B, ctx, inner)` text embeddings; `mask` its additive attention mask.
-    /// * `cos`/`sin` — SPLIT RoPE tables for the self-attention.
+    /// Forward (gated, 9-row table): MSA(self, RoPE) → text cross-attn (prompt-modulated context) →
+    /// FeedForward, each adaLN-modulated and gated.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -265,10 +341,9 @@ impl VideoBlock {
     ) -> Result<Array> {
         // --- MSA (self-attention) ---
         let msa = ada_values(&self.scale_shift_table, timesteps, 0, 3)?;
-        let (shift_msa, scale_msa, gate_msa) = (&msa[0], &msa[1], &msa[2]);
-        let norm = modulate(&rms_norm_noweight(x, self.eps)?, scale_msa, shift_msa)?;
+        let norm = modulate(&rms_norm_noweight(x, self.eps)?, &msa[1], &msa[0])?;
         let attn = self.attn1.forward(&norm, None, None, Some((cos, sin)))?;
-        let mut x = add(x, &multiply(&attn, gate_msa)?)?;
+        let mut x = add(x, &multiply(&attn, &msa[2])?)?;
 
         // --- prompt-adaLN on the text context ---
         let v_context = {
@@ -285,22 +360,189 @@ impl VideoBlock {
             modulate(context, &p_scale, &p_shift)?
         };
 
-        // --- text cross-attention (9-param adaLN rows 6..9) ---
+        // --- text cross-attention (adaLN rows 6..9) ---
         let ca = ada_values(&self.scale_shift_table, timesteps, 6, 9)?;
-        let (shift_ca, scale_ca, gate_ca) = (&ca[0], &ca[1], &ca[2]);
-        let norm_ca = modulate(&rms_norm_noweight(&x, self.eps)?, scale_ca, shift_ca)?;
+        let norm_ca = modulate(&rms_norm_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
         let cross = self.attn2.forward(&norm_ca, Some(&v_context), mask, None)?;
-        x = add(&x, &multiply(&cross, gate_ca)?)?;
+        x = add(&x, &multiply(&cross, &ca[2])?)?;
 
         // --- FeedForward (adaLN rows 3..6) ---
         let mlp = ada_values(&self.scale_shift_table, timesteps, 3, 6)?;
-        let (shift_mlp, scale_mlp, gate_mlp) = (&mlp[0], &mlp[1], &mlp[2]);
-        let norm_mlp = modulate(&rms_norm_noweight(&x, self.eps)?, scale_mlp, shift_mlp)?;
+        let norm_mlp = modulate(&rms_norm_noweight(&x, self.eps)?, &mlp[1], &mlp[0])?;
         let ff = self.ff.forward(&norm_mlp)?;
-        x = add(&x, &multiply(&ff, gate_mlp)?)?;
+        x = add(&x, &multiply(&ff, &mlp[2])?)?;
 
         Ok(x)
     }
+}
+
+/// PixArt sinusoidal timestep embedding (`flip_sin_to_cos`, `downscale_freq_shift = 0`, max_period
+/// 10000): `concat([cos(t·f), sin(t·f)])` with `f[i] = exp(−ln(10000)·i/half)`. `timesteps` is `(N,)`
+/// f32; returns `(N, TIME_PROJ_DIM)` f32. The log-spaced freqs are host-computed (fed into bf16
+/// downstream, so sub-f32 differences wash out).
+fn timestep_embedding(timesteps: &Array) -> Result<Array> {
+    let half = (TIME_PROJ_DIM / 2) as usize;
+    let ln = (10000f64).ln();
+    let freqs: Vec<f32> = (0..half)
+        .map(|i| (-ln * i as f64 / half as f64).exp() as f32)
+        .collect();
+    let freq = Array::from_slice(&freqs, &[1, half as i32]);
+    let emb = multiply(&timesteps.reshape(&[-1, 1])?, &freq)?; // (N, half)
+    Ok(concatenate_axis(&[&emb.cos()?, &emb.sin()?], 1)?) // (N, dim), cos first
+}
+
+/// adaLN-single (`AdaLayerNormSingle`): `timestep → sinusoidal(256) → MLP(silu) → embedded`, then
+/// `linear(silu(embedded)) → coeff·dim` scale-shift parameters.
+struct AdaLayerNormSingle {
+    ts_lin1: Linear, // 256 → dim
+    ts_lin2: Linear, // dim → dim
+    linear: Linear,  // dim → coeff·dim
+}
+
+impl AdaLayerNormSingle {
+    fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
+        Ok(Self {
+            ts_lin1: Linear::load(w, &format!("{prefix}.emb.timestep_embedder.linear1"), prec)?,
+            ts_lin2: Linear::load(w, &format!("{prefix}.emb.timestep_embedder.linear2"), prec)?,
+            linear: Linear::load(w, &format!("{prefix}.linear"), prec)?,
+        })
+    }
+
+    /// `timestep` is the already-scaled `(N,)` f32. Returns `(scale_shift (N, coeff·dim), embedded
+    /// (N, dim))` in `dt`.
+    fn forward(&self, timestep: &Array, dt: Dtype) -> Result<(Array, Array)> {
+        let proj = timestep_embedding(timestep)?.as_dtype(dt)?;
+        let h = mlx_gen::nn::silu(&self.ts_lin1.forward(&proj)?)?;
+        let embedded = self.ts_lin2.forward(&h)?;
+        let scale_shift = self.linear.forward(&mlx_gen::nn::silu(&embedded)?)?;
+        Ok((scale_shift, embedded))
+    }
+}
+
+/// The LTX-2.3 video DiT: preprocessor + 48 blocks + output projection. Predicts velocity.
+pub struct LtxDiT {
+    patchify_proj: Linear,
+    adaln: AdaLayerNormSingle,
+    prompt_adaln: Option<AdaLayerNormSingle>,
+    blocks: Vec<VideoBlock>,
+    scale_shift_table: Array, // (2, inner)
+    proj_out: Linear,
+    cfg: LtxConfig,
+    prec: Precision,
+}
+
+impl LtxDiT {
+    pub fn from_weights(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+        let blocks = (0..cfg.num_layers)
+            .map(|i| VideoBlock::load(w, &format!("transformer_blocks.{i}"), cfg, prec))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            patchify_proj: Linear::load(w, "patchify_proj", prec)?,
+            adaln: AdaLayerNormSingle::load(w, "adaln_single", prec)?,
+            prompt_adaln: if cfg.apply_gated_attention {
+                Some(AdaLayerNormSingle::load(w, "prompt_adaln_single", prec)?)
+            } else {
+                None
+            },
+            blocks,
+            scale_shift_table: param(w, "scale_shift_table", prec)?,
+            proj_out: Linear::load(w, "proj_out", prec)?,
+            cfg: cfg.clone(),
+            prec,
+        })
+    }
+
+    /// Velocity forward.
+    ///
+    /// * `latent` — `(B, S, in_channels=128)` patchified latent tokens.
+    /// * `timestep` — `(B, 1)` (or `(B,)`) per-sample sigma (T2V; broadcast over tokens).
+    /// * `context` — `(B, ctx, inner)` text embeddings (connector output); `mask` its additive mask.
+    /// * `positions` — `(B, 3, S, 2)` position grid (from [`crate::positions`]).
+    pub fn forward(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        mask: Option<&Array>,
+        positions: &Array,
+    ) -> Result<Array> {
+        let dt = self.prec.dtype();
+        let b = latent.shape()[0];
+        let inner = self.cfg.inner_dim();
+        let coeff = self.cfg.adaln_embedding_coefficient;
+
+        let x = self.patchify_proj.forward(&latent.as_dtype(dt)?)?;
+
+        // adaLN-single timestep projection (scaled by timestep_scale_multiplier).
+        let mult = self.cfg.timestep_scale_multiplier as f32;
+        let ts_flat =
+            multiply(&timestep.as_dtype(Dtype::Float32)?, scalar(mult))?.reshape(&[-1])?;
+        let (ts_emb, emb_ts) = self.adaln.forward(&ts_flat, dt)?;
+        let ts_emb = ts_emb.reshape(&[b, -1, coeff * inner])?;
+        let emb_ts = emb_ts.reshape(&[b, -1, inner])?;
+
+        // prompt-adaLN (gated family): one shared modulation per sample.
+        let prompt_ts = match &self.prompt_adaln {
+            Some(padaln) => {
+                let src = if timestep.ndim() > 1 {
+                    timestep.index_axis(0, 1)?.reshape(&[b, 1])?
+                } else {
+                    timestep.clone()
+                };
+                let src = multiply(&src.as_dtype(Dtype::Float32)?, scalar(mult))?.reshape(&[-1])?;
+                let (pts, _) = padaln.forward(&src, dt)?;
+                Some(pts.reshape(&[b, -1, 2 * inner])?)
+            }
+            None => None,
+        };
+
+        // caption_projection = Identity (2.3): context enters cross-attn as-is.
+        let context = context.as_dtype(dt)?;
+
+        // SPLIT RoPE from the position grid (f32 tables; the block casts per input dtype).
+        let (cos, sin) = precompute_split_freqs_cis(
+            positions,
+            inner,
+            self.cfg.positional_embedding_theta,
+            self.cfg.positional_embedding_max_pos,
+            self.cfg.num_attention_heads,
+        )?;
+
+        let mut h = x;
+        for block in &self.blocks {
+            h = block.forward(&h, &ts_emb, prompt_ts.as_ref(), &context, mask, &cos, &sin)?;
+        }
+
+        // Output: LayerNorm(affine=false) → final 2-row scale_shift (modulated by embedded ts) → proj.
+        let table = self.scale_shift_table.reshape(&[1, 1, 2, inner])?;
+        let ss = add(&table, &emb_ts.reshape(&[b, -1, 1, inner])?)?; // (B, 1, 2, inner)
+        let shift = ss.index_axis(0, 2)?;
+        let scale = ss.index_axis(1, 2)?;
+        let normed = layer_norm(&h, None, None, self.cfg.norm_eps as f32)?;
+        let out = modulate(&normed, &scale, &shift)?;
+        self.proj_out.forward(&out)
+    }
+}
+
+impl LtxDiT {
+    /// The output head in isolation (LayerNorm-affine-false → final scale-shift → proj_out), for the
+    /// S3b bisection: feed the reference post-block hidden + embedded timestep, compare the velocity.
+    pub fn output_head(&self, h: &Array, emb_ts: &Array) -> Result<Array> {
+        let b = h.shape()[0];
+        let inner = self.cfg.inner_dim();
+        let table = self.scale_shift_table.reshape(&[1, 1, 2, inner])?;
+        let ss = add(&table, &emb_ts.reshape(&[b, -1, 1, inner])?)?;
+        let shift = ss.index_axis(0, 2)?;
+        let scale = ss.index_axis(1, 2)?;
+        let normed = layer_norm(h, None, None, self.cfg.norm_eps as f32)?;
+        let out = modulate(&normed, &scale, &shift)?;
+        self.proj_out.forward(&out)
+    }
+}
+
+/// `denoised = latent − σ·velocity` (`to_denoised`): velocity → x₀.
+pub fn to_denoised(latent: &Array, velocity: &Array, sigma: &Array) -> Result<Array> {
+    Ok(subtract(latent, &multiply(velocity, sigma)?)?)
 }
 
 #[cfg(test)]
@@ -313,19 +555,28 @@ mod tests {
         let scale = Array::from_slice(&[0.0f32, 1.0, 0.0, 1.0], &[1, 1, 4]);
         let shift = Array::from_slice(&[1.0f32, 0.0, -1.0, 0.0], &[1, 1, 4]);
         let got = modulate(&x, &scale, &shift).unwrap();
-        // x*(1+scale)+shift = [1*1+1, 2*2+0, 3*1-1, 4*2+0] = [2, 4, 2, 8].
         assert_eq!(got.as_slice::<f32>(), &[2.0, 4.0, 2.0, 8.0]);
     }
 
     #[test]
     fn ada_values_splits_rows() {
-        // table (9, 2); timestep (1, 1, 18) of zeros → ada == table rows.
         let table = Array::from_slice(&(0..18).map(|v| v as f32).collect::<Vec<_>>(), &[9, 2]);
         let ts = Array::zeros::<f32>(&[1, 1, 18]).unwrap();
         let vals = ada_values(&table, &ts, 0, 3).unwrap();
         assert_eq!(vals.len(), 3);
-        // row 0 = [0,1], row1 = [2,3], row2 = [4,5].
         assert_eq!(vals[0].as_slice::<f32>(), &[0.0, 1.0]);
         assert_eq!(vals[2].as_slice::<f32>(), &[4.0, 5.0]);
+    }
+
+    #[test]
+    fn timestep_embedding_shape_and_pad() {
+        // (N=2,) → (2, 256), cos-first (t=0 → cos=1, sin=0).
+        let t = Array::from_slice(&[0.0f32, 1.0], &[2]);
+        let emb = timestep_embedding(&t).unwrap();
+        assert_eq!(emb.shape(), &[2, 256]);
+        let row0 = emb.index_axis(0, 0).unwrap();
+        let s = row0.as_slice::<f32>();
+        assert!((s[0] - 1.0).abs() < 1e-6); // cos(0)
+        assert!(s[128].abs() < 1e-6); // sin(0)
     }
 }

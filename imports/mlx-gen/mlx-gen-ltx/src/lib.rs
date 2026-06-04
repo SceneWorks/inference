@@ -32,5 +32,5 @@ pub use connector::Connector;
 pub use model::{descriptor, load, Ltx, MODEL_ID};
 pub use text_encoder::LtxTextEncoder;
 pub use tiling::TilingConfig;
-pub use transformer::VideoBlock;
+pub use transformer::{to_denoised, LtxDiT, Precision, VideoBlock};
 pub use vae::LtxVideoVae;
