@@ -2,14 +2,18 @@
 //! dual-stream joint blocks, single-stream blocks, FLUX RoPE, time/text/guidance embedding, and
 //! output AdaLayerNorm.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
+use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::nn::gelu;
-use mlx_rs::ops::{add, concatenate_axis, divide, multiply, power, split, subtract};
+use mlx_rs::ops::{add, concatenate_axis, divide, multiply, power, split, subtract, tanh};
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
 use crate::config::FluxVariant;
@@ -22,6 +26,92 @@ const LN_EPS: f32 = 1e-6;
 // NOT 1e-6 (which is the AdaLayerNorm's explicit LayerNorm eps). A 1e-6 here is a small uniform
 // bias in every attention block that compounds across the 19 joint + 38 single blocks.
 const RMS_EPS: f32 = 1e-5;
+
+/// sc-2963 (rollout of the Wan sc-2957 template): when on, the FLUX.1 MMDiT's fusable elementwise
+/// *glue* — adaLN affine (`norm·(1+scale)+shift`), gated residual (`x+gate·y`), the tanh-GELU FFN
+/// activation, and the complex RoPE rotation — runs through `mx.compile` so MLX fuses each chain into
+/// a single Metal kernel (vs one kernel per primitive op when eager). The big GEMMs / SDPA / `mx.fast`
+/// norms stay eager, and the image-FFN exact `gelu` is **already** internally `mx.compile`'d by mlx-rs
+/// (`compiled_gelu`). **Bit-exact** to the eager form (`compile_parity.rs` gates `max|Δ|=0`).
+/// **Enabled by the production denoise loop** ([`crate::model`]); **off by default**.
+static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+pub fn set_compile_glue(on: bool) {
+    COMPILE_GLUE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn compile_glue() -> bool {
+    COMPILE_GLUE.load(Ordering::Relaxed)
+}
+
+/// adaLN affine `normed·(1+scale)+shift` (`scale`/`shift` pre-broadcast to `[B,1,D]`). One fused
+/// kernel when the sc-2963 glue toggle is on. The `1` is cast to `scale`'s dtype before the add — the
+/// fork's weak python `1` adopts the (bf16) modulation dtype so `1+scale` rounds in bf16 (coarse near
+/// 1.0, spacing ~2⁻⁷); a strong f32 `1` would promote the sum to f32 and break bf16 parity (sc-2787).
+fn modulate(normed: &Array, scale: &Array, shift: &Array) -> Result<Array> {
+    let f = |(n, s, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        let one = scalar(1.0).as_dtype(s.dtype())?;
+        add(&multiply(n, &add(s, &one)?)?, sh)
+    };
+    if compile_glue() {
+        Ok(compile(f, true)((normed, scale, shift))?)
+    } else {
+        Ok(f((normed, scale, shift))?)
+    }
+}
+
+/// Gated residual `x + gate·y` (`gate` pre-broadcast to `[B,1,D]`) — one fused kernel when the
+/// sc-2963 glue toggle is on; bit-identical to the eager `add(x, gate·y)`.
+fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
+    let f = |(x, g, y): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(x, &multiply(g, y)?)
+    };
+    if compile_glue() {
+        Ok(compile(f, true)((x, gate, y))?)
+    } else {
+        Ok(f((x, gate, y))?)
+    }
+}
+
+/// The tanh-GELU FFN activation. Body mirrors [`mlx_gen::nn::gelu_tanh`] exactly (dtype-preserving,
+/// f64-host `√(2/π)` — NOT mlx-rs's 1-ULP f32 const, sc-2779); when the sc-2963 glue toggle is on,
+/// MLX fuses its ~8 elementwise ops into one kernel. Off ⇒ defers to the core `gelu_tanh`.
+fn gelu_ffn(x: &Array) -> Result<Array> {
+    if !compile_glue() {
+        return gelu_tanh(x);
+    }
+    let f = |x_: &Array| -> std::result::Result<Array, Exception> {
+        let dt = x_.dtype();
+        let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+        let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+        let x3 = power(x_, Array::from_int(3))?;
+        let inner = multiply(&add(x_, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+        let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+        multiply(&multiply(x_, &s(0.5)?)?, &gate)
+    };
+    Ok(compile(f, true)(x)?)
+}
+
+/// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`, in f32. Fused
+/// into one kernel when the sc-2963 glue toggle is on (vs 6 eager ops, applied to q and k / block).
+fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
+    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
+        let (r, i, c, s) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+        let out0 = subtract(&multiply(r, c)?, &multiply(i, s)?)?;
+        let out1 = add(&multiply(i, c)?, &multiply(r, s)?)?;
+        Ok(vec![out0, out1])
+    };
+    let args = [real.clone(), imag.clone(), cos.clone(), sin.clone()];
+    let mut out = if compile_glue() {
+        compile(f, true)(&args)?
+    } else {
+        f(&args)?
+    };
+    let out1 = out.pop().unwrap();
+    let out0 = out.pop().unwrap();
+    Ok((out0, out1))
+}
 
 pub struct FluxTransformerConfig {
     pub num_layers: usize,
@@ -446,10 +536,10 @@ impl SingleBlock {
         let residual = hidden;
         let (normed, gate) = self.norm.forward_three(hidden, emb)?;
         let attn = self.attn.forward(&normed, rope)?;
-        let ff = gelu_tanh(&self.proj_mlp.forward(&normed)?)?;
+        let ff = gelu_ffn(&self.proj_mlp.forward(&normed)?)?;
         let out = concatenate_axis(&[&attn, &ff], 2)?;
-        let out = multiply(&gate.expand_dims(1)?, &self.proj_out.forward(&out)?)?;
-        Ok(add(residual, &out)?)
+        let proj = self.proj_out.forward(&out)?;
+        gated(residual, &gate.expand_dims(1)?, &proj)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -603,10 +693,7 @@ impl AdaLayerNormZero {
         debug_assert_eq!(self.chunks, 6);
         let p = split(&self.linear.forward(&silu(emb)?)?, 6, 1)?;
         let normed = layer_norm(hidden, None, None, LN_EPS)?;
-        let normed = add(
-            &multiply(&normed, &one_plus(&p[1])?.expand_dims(1)?)?,
-            &p[0].expand_dims(1)?,
-        )?;
+        let normed = modulate(&normed, &p[1].expand_dims(1)?, &p[0].expand_dims(1)?)?;
         Ok((
             normed,
             p[2].clone(),
@@ -620,10 +707,7 @@ impl AdaLayerNormZero {
         debug_assert_eq!(self.chunks, 3);
         let p = split(&self.linear.forward(&silu(emb)?)?, 3, 1)?;
         let normed = layer_norm(hidden, None, None, LN_EPS)?;
-        let normed = add(
-            &multiply(&normed, &one_plus(&p[1])?.expand_dims(1)?)?,
-            &p[0].expand_dims(1)?,
-        )?;
+        let normed = modulate(&normed, &p[1].expand_dims(1)?, &p[0].expand_dims(1)?)?;
         Ok((normed, p[2].clone()))
     }
 
@@ -646,10 +730,7 @@ impl AdaLayerNormContinuous {
     fn forward(&self, x: &Array, emb: &Array) -> Result<Array> {
         let p = split(&self.linear.forward(&silu(emb)?)?, 2, 1)?;
         let normed = layer_norm(x, None, None, LN_EPS)?;
-        Ok(add(
-            &multiply(&normed, &one_plus(&p[0])?.expand_dims(1)?)?,
-            &p[1].expand_dims(1)?,
-        )?)
+        modulate(&normed, &p[0].expand_dims(1)?, &p[1].expand_dims(1)?)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -686,10 +767,13 @@ impl FeedForward {
     fn forward(&self, x: &Array) -> Result<Array> {
         let x = self.linear1.forward(x)?;
         let x = match self.activation {
+            // mlx-rs's exact `gelu` is itself `mx.compile`'d internally (`compiled_gelu`) — already
+            // a single fused kernel, so the sc-2963 glue toggle leaves it alone.
             Activation::Gelu => gelu(x)?,
             // Dtype-preserving, golden-bit-exact tanh-GELU (sc-2779), replacing
-            // `mlx_rs::nn::gelu_approximate` (1-ULP f32 `√(2/π)` + bf16→f32 promotion).
-            Activation::GeluApprox => gelu_tanh(&x)?,
+            // `mlx_rs::nn::gelu_approximate` (1-ULP f32 `√(2/π)` + bf16→f32 promotion). sc-2963
+            // fuses its ~8 ops into one kernel when the glue toggle is on.
+            Activation::GeluApprox => gelu_ffn(&x)?,
         };
         self.linear2.forward(&x)
     }
@@ -808,8 +892,7 @@ fn apply_rope_one(x: &Array, rope: &RopeTable) -> Result<Array> {
     let imag = p[1].reshape(&[b, heads, seq, half])?;
     let cos = rope.cos.reshape(&[1, 1, seq, half])?;
     let sin = rope.sin.reshape(&[1, 1, seq, half])?;
-    let out0 = subtract(&multiply(&real, &cos)?, &multiply(&imag, &sin)?)?;
-    let out1 = add(&multiply(&imag, &cos)?, &multiply(&real, &sin)?)?;
+    let (out0, out1) = rope_rotate(&real, &imag, &cos, &sin)?;
     Ok(
         concatenate_axis(&[&out0.expand_dims(4)?, &out1.expand_dims(4)?], 4)?
             .reshape(&[b, heads, seq, hd])?
@@ -826,16 +909,11 @@ fn apply_norm_ff(
     gate_mlp: &Array,
     ff: &FeedForward,
 ) -> Result<Array> {
-    let hidden = add(hidden, &multiply(&gate_msa.expand_dims(1)?, attn)?)?;
+    let hidden = gated(hidden, &gate_msa.expand_dims(1)?, attn)?;
     let norm = layer_norm(&hidden, None, None, LN_EPS)?;
-    let norm = add(
-        &multiply(&norm, &one_plus(scale_mlp)?.expand_dims(1)?)?,
-        &shift_mlp.expand_dims(1)?,
-    )?;
-    Ok(add(
-        &hidden,
-        &multiply(&gate_mlp.expand_dims(1)?, &ff.forward(&norm)?)?,
-    )?)
+    let norm = modulate(&norm, &scale_mlp.expand_dims(1)?, &shift_mlp.expand_dims(1)?)?;
+    let ff_out = ff.forward(&norm)?;
+    gated(&hidden, &gate_mlp.expand_dims(1)?, &ff_out)
 }
 
 fn time_proj(time_steps: &Array) -> Result<Array> {
@@ -875,14 +953,6 @@ fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLin
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
-}
-
-/// `1 + scale` computed in `scale`'s own dtype (sc-2787). The fork's `1 + scale_msa` uses a weak
-/// python `1` that adopts the modulation dtype, so when conditioning is bf16 the add rounds in bf16
-/// (coarse near 1.0 — bf16 spacing ~2⁻⁷). A strong f32 `scalar(1.0)` would promote the sum to f32 and
-/// drop that rounding, breaking parity with the bf16 reference.
-fn one_plus(scale: &Array) -> Result<Array> {
-    Ok(add(scale, &scalar(1.0).as_dtype(scale.dtype())?)?)
 }
 
 fn join(prefix: &str, suffix: &str) -> String {
@@ -1266,6 +1336,87 @@ mod tests {
         let r = FluxRope::new().forward(5, 4, 3).unwrap();
         assert_eq!(r.cos.shape(), &[17, 64]);
         assert_eq!(r.sin.shape(), &[17, 64]);
+    }
+
+    // ---- sc-2963: the compiled elementwise glue is bit-identical to the eager glue ---------------
+    //
+    // FLUX.1's transformer has a fixed inner dim (no tiny config) and no committed forward fixture,
+    // so the compiled-vs-eager `max|Δ|=0` invariant is gated directly on the private glue helpers the
+    // forward composes (`modulate` / `gated` / `gelu_ffn` / `rope_rotate`) at the production dtypes
+    // (f32 main stream, bf16 modulation/gate conditioning, sc-2787). `mx.compile` must not perturb the
+    // result. Run: `cargo test -p mlx-gen-flux --lib compiled_glue`.
+    fn rnd(shape: &[i32], dt: mlx_rs::Dtype) -> Array {
+        let k = mlx_rs::random::key(0).unwrap();
+        let x = mlx_rs::random::normal::<f32>(shape, None, None, Some(&k)).unwrap();
+        let x = if dt == mlx_rs::Dtype::Float32 {
+            x
+        } else {
+            x.as_dtype(dt).unwrap()
+        };
+        mlx_rs::transforms::eval([&x]).unwrap();
+        x
+    }
+
+    fn max_abs(a: &Array, b: &Array) -> f32 {
+        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
+        mlx_rs::ops::max(&d, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap()
+            .item::<f32>()
+    }
+
+    #[test]
+    fn compiled_glue_bit_identical_to_eager() {
+        use mlx_rs::Dtype::{Bfloat16, Float32};
+        let d = 256i32; // narrower than the real DIM — bit-exactness is dim-independent
+        let (b, s) = (2i32, 16i32);
+
+        // modulate: f32 normed × bf16 (1+scale) + bf16 shift (the bf16-conditioning path).
+        let normed = rnd(&[b, s, d], Float32);
+        let scale = rnd(&[b, 1, d], Bfloat16);
+        let shift = rnd(&[b, 1, d], Bfloat16);
+        set_compile_glue(false);
+        let e = modulate(&normed, &scale, &shift).unwrap();
+        set_compile_glue(true);
+        let c = modulate(&normed, &scale, &shift).unwrap();
+        set_compile_glue(false);
+        assert_eq!(max_abs(&c, &e), 0.0, "modulate compiled vs eager");
+
+        // gated: f32 x + (bf16 gate · f32 y).
+        let x = rnd(&[b, s, d], Float32);
+        let gate = rnd(&[b, 1, d], Bfloat16);
+        let y = rnd(&[b, s, d], Float32);
+        set_compile_glue(false);
+        let e = gated(&x, &gate, &y).unwrap();
+        set_compile_glue(true);
+        let c = gated(&x, &gate, &y).unwrap();
+        set_compile_glue(false);
+        assert_eq!(max_abs(&c, &e), 0.0, "gated compiled vs eager");
+
+        // gelu_ffn: f32 FFN activation (the FLUX main-stream dtype). Eager branch defers to the core
+        // `gelu_tanh`, so this also proves the compiled body matches the core op exactly.
+        let h = rnd(&[b, s, 4 * d], Float32);
+        set_compile_glue(false);
+        let e = gelu_ffn(&h).unwrap();
+        set_compile_glue(true);
+        let c = gelu_ffn(&h).unwrap();
+        set_compile_glue(false);
+        assert_eq!(max_abs(&c, &e), 0.0, "gelu_ffn compiled vs eager");
+
+        // rope_rotate: f32 complex rotation (RoPE runs in f32).
+        let half = 64i32;
+        let real = rnd(&[b, HEADS, s, half], Float32);
+        let imag = rnd(&[b, HEADS, s, half], Float32);
+        let cos = rnd(&[1, 1, s, half], Float32);
+        let sin = rnd(&[1, 1, s, half], Float32);
+        set_compile_glue(false);
+        let (e0, e1) = rope_rotate(&real, &imag, &cos, &sin).unwrap();
+        set_compile_glue(true);
+        let (c0, c1) = rope_rotate(&real, &imag, &cos, &sin).unwrap();
+        set_compile_glue(false);
+        assert_eq!(max_abs(&c0, &e0), 0.0, "rope_rotate real compiled vs eager");
+        assert_eq!(max_abs(&c1, &e1), 0.0, "rope_rotate imag compiled vs eager");
     }
 
     // ---- sc-2657 adapter routing (FluxLoRAMapping → field translation) ------------------------
