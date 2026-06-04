@@ -50,16 +50,19 @@ pub(crate) const ACCEL_SAMPLERS: [&str; 3] = ["lcm", "lightning", "hyper"];
 const LCM_ORIGINAL_STEPS: usize = 50;
 
 /// Per-variant few-step defaults `(steps, CFG, TCD eta)`, applied when the request omits `steps`/
-/// `guidance`. These are the **documented public** defaults — the sc-2758 A/B characterization that
-/// *locks* the per-variant table was not done at implementation time, so they live here as a
-/// one-line-per-variant re-tune (sc-2907). CFG is ≈1 for all three (Lightning/Hyper are trained
-/// CFG-free; LCM-LoRA runs at low/no CFG). Lightning's step count must match the loaded LoRA (2/4/8).
+/// `guidance`. **Locked by the sc-2758 SDXL acceleration A/B characterization** (re-tuned here per
+/// sc-2907; `sdxl` and `realvisxl` came out identical, so the table keys on the sampler only). CFG is
+/// 1.0 (off) for all three — Lightning/Hyper are trained CFG-free and LCM-LoRA runs at low/no CFG —
+/// which also halves the per-step UNet work. Lightning's step count must match the loaded LoRA
+/// (2/4/8); LCM uses a single LoRA at any step count.
 fn accel_defaults(sampler: &str) -> (u32, f32, f32) {
     match sampler {
-        "lcm" => (4, 1.0, 0.0),
+        // LCM is the weakest method and 4 steps is too soft as a default; sc-2758 locks 8 as the
+        // quality floor (the LCM-LoRA is step-free, so this is a plain default, not LoRA-bound).
+        "lcm" => (8, 1.0, 0.0),
         "lightning" => (4, 1.0, 0.0),
-        // Hyper-SD: TCD, deterministic (eta=0) by default — works for the 1/2/4/8-step LoRAs; the
-        // unified LoRA's stochastic eta (~0.3) is a sc-2907 re-tune knob.
+        // Hyper-SD: TCD, deterministic (eta=0) — sc-2758 locked eta=0 for the step-graded
+        // (1/2/4/8-step) LoRAs, which is the default LoRA path here.
         "hyper" => (4, 1.0, 0.0),
         _ => (DEFAULT_STEPS, DEFAULT_GUIDANCE, 0.0),
     }
