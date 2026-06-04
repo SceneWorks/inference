@@ -58,12 +58,7 @@ fn cache_file(repo: &str, file: &str) -> PathBuf {
 }
 
 fn lora_spec(path: PathBuf, scale: f32) -> AdapterSpec {
-    AdapterSpec {
-        path,
-        scale,
-        kind: AdapterKind::Lora,
-        pass_scales: None,
-    }
+    AdapterSpec::new(path, scale, AdapterKind::Lora)
 }
 
 /// `(sampler, accel-LoRA path, steps)` for the three acceleration variants.
