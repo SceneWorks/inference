@@ -167,6 +167,53 @@ fn cached_pass_reconstructs_extract_target_slice() {
     );
 }
 
+/// LoRA ⊥ cache: applying adapters to the transformer must not perturb the cache invariants. The
+/// cache only depends on the (post-RoPE) K/V the linears produce, so `cached(X) == extract(X)[target]`
+/// must still hold *exactly* with a LoRA installed on the attention projections — proving the
+/// `-kv` variant's inherited LoRA path composes cleanly with the cache (sc-2646 + sc-2347).
+#[test]
+fn cache_invariants_hold_with_lora_installed() {
+    use mlx_gen::adapters::{install_adapter, Adapter};
+
+    let mut f = Fixture::load();
+    // Install a non-trivial LoRA on a couple of double-block attention projections. The core
+    // residual is `matmul(matmul(x, a), b)`, so a=[in,r], b=[r,out] (tiny inner = 16). Scale ≠ 0 so
+    // it actually changes the K/V the cache stores.
+    let r = 2i32;
+    let a: Vec<f32> = (0..16 * r).map(|i| (i as f32) * 0.005 - 0.02).collect();
+    let b: Vec<f32> = (0..r * 16).map(|i| (i as f32) * 0.004 - 0.015).collect();
+    for proj in ["to_q", "to_v"] {
+        install_adapter(
+            &mut f.t,
+            &format!("transformer_blocks.0.attn.{proj}"),
+            Adapter::Lora {
+                a: Array::from_slice(&a, &[16, r]),
+                b: Array::from_slice(&b, &[r, 16]),
+                scale: 0.7,
+            },
+        )
+        .unwrap();
+    }
+
+    // Same two exact invariants as the dense case, now over the adapted transformer.
+    let plain = f.forward_full(None);
+    let cache = Flux2KvCache::new(1, 1);
+    cache.configure(CacheMode::Extract, f.ref_seq());
+    let extract = f.forward_full(Some(&cache));
+    assert!(
+        exact_eq(&plain, &extract),
+        "with LoRA: extract must still be byte-identical to the plain forward"
+    );
+
+    cache.configure(CacheMode::Cached, f.ref_seq());
+    let cached = f.forward_cached(&cache);
+    let extract_target = leading(&extract, f.target.shape()[1]);
+    assert!(
+        exact_eq(&cached, &extract_target),
+        "with LoRA: cached forward must still reproduce the extract target slice exactly"
+    );
+}
+
 #[test]
 fn cached_without_populated_cache_errors() {
     let f = Fixture::load();
