@@ -27,11 +27,12 @@
 //! S4 — the [`pipeline`] dense **T2V** machinery: resolution/seq-len math + the CFG denoise loop
 //! (`pipeline::denoise`) + VAE decode → uint8 frames (`pipeline::decode_to_frames`). Parity-gated
 //! e2e against the reference on a tiny seeded model (injected noise+context).
-//! S5 — dual-expert **MoE** routing ([`pipeline::denoise_moe`] + [`Expert`]): per-step boundary swap
-//! (`t ≥ boundary·num_train`) between the high/low-noise experts, with per-expert contexts + cross-KV
-//! + guidance. Parity-gated e2e on two tiny seeded experts (both fired across the boundary).
-//! `Generator::generate` wiring + the real-weight Wan2.2-T2V-A14B e2e remain (the cached `-Diffusers`
-//! checkpoint needs the original-layout checkpoint or a diffusers converter); it errors until then.
+//! S5 — dual-expert **MoE** routing ([`pipeline::denoise_moe`] + [`Expert`]): a per-step boundary
+//! swap (`t ≥ boundary·num_train`) between the high/low-noise experts, each with its own contexts,
+//! cross-KV, and guidance. Parity-gated e2e on two tiny seeded experts (both fired across the
+//! boundary). Live `Generator::generate` + the real-weight Wan2.2-T2V-A14B e2e remain (the cached
+//! `-Diffusers` checkpoint needs the original-layout checkpoint or a diffusers converter); it
+//! errors until then.
 
 pub mod config;
 pub mod model;
