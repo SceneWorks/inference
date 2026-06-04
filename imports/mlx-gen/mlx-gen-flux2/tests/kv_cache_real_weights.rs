@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_gen::media::Image;
-use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource};
 // Link the provider crate so its `inventory::submit!` registrations run (the variants self-register
 // through the core registry; without this the test binary can't resolve the flux2 ids).
 use mlx_gen_flux2 as _;
@@ -105,7 +105,16 @@ fn edit_request(size: u32, nref: usize) -> GenerationRequest {
 }
 
 fn render(id: &str, size: u32, nref: usize) -> Image {
-    let gen = mlx_gen::load(id, &LoadSpec::new(WeightsSource::Dir(kv_snapshot()))).unwrap();
+    render_quant(id, size, nref, None)
+}
+
+/// As [`render`], with an optional whole-model quantization (sc-2643) applied at load — exercises
+/// the cache over quantized linears (their `quantized_matmul` still emits f32 K/V, so the cache is
+/// orthogonal; this proves it runs + stays coherent).
+fn render_quant(id: &str, size: u32, nref: usize, quant: Option<Quant>) -> Image {
+    let mut spec = LoadSpec::new(WeightsSource::Dir(kv_snapshot()));
+    spec.quantize = quant;
+    let gen = mlx_gen::load(id, &spec).unwrap();
     let req = edit_request(size, nref);
     let GenerationOutput::Images(mut images) = gen.generate(&req, &mut |_| {}).unwrap() else {
         panic!("expected images");
@@ -149,6 +158,24 @@ fn kv_cache_edit_is_coherent() {
     assert!(
         mean > 2.0 && mean < 253.0 && std > 5.0,
         "cache-on edit looks degenerate (mean={mean}, std={std}) — cache produced garbage?"
+    );
+}
+
+#[test]
+#[ignore = "needs the real FLUX.2-klein-9b-kv snapshot (~49 GB)"]
+fn q8_kv_cache_edit_is_coherent() {
+    // The cache is orthogonal to weight quantization (it stores f32 activations; quant only touches
+    // weights), so Q8 + cache must produce a coherent edit. This validates the `-kv` variant's
+    // inherited Q4/Q8 path (sc-2643) running *with* the cache.
+    let (size, nref) = (res(), nref());
+    let img = render_quant("flux2_klein_9b_kv_edit", size, nref, Some(Quant::Q8));
+    let (mean, std) = coherence(&img);
+    println!(
+        "flux2 9b-kv edit ({size}², {nref} ref) Q8 + cache-on output: mean={mean:.1} std={std:.1}"
+    );
+    assert!(
+        mean > 2.0 && mean < 253.0 && std > 5.0,
+        "Q8 cache-on edit looks degenerate (mean={mean}, std={std}) — cache×quant broke?"
     );
 }
 
