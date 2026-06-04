@@ -10,9 +10,12 @@
 //! `quantized_matmul` f32 inputs (no bf16 upcast needed). LoRA over these bases = sc-2646.
 
 use std::f32::consts::LN_10;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
+use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, split, subtract};
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
@@ -32,6 +35,24 @@ type CacheSlot<'a> = Option<(&'a Flux2KvCache, usize)>;
 
 const LN_EPS: f32 = 1e-6;
 const RMS_EPS: f32 = 1e-5;
+
+/// sc-2963 (rollout of the Wan sc-2957 template): when on, the FLUX.2 MMDiT's fusable elementwise
+/// *glue* — adaLN affine (`(1+scale)·norm+shift`), SwiGLU activation, gated residual (`x+gate·y`),
+/// and the complex RoPE rotation — runs through `mx.compile` so MLX fuses each chain into a single
+/// Metal kernel (vs one kernel per primitive op when eager). The big GEMMs / SDPA / `mx.fast` norms
+/// stay eager (already single fused kernels). **Bit-exact** to the eager form (`compile_parity.rs`
+/// gates `max|Δ|=0`). **Enabled by the production denoise loop** ([`crate::model`]); left **off by
+/// default** so the reference-parity gates run eager and `compile_parity` can A/B both.
+static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+pub fn set_compile_glue(on: bool) {
+    COMPILE_GLUE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn compile_glue() -> bool {
+    COMPILE_GLUE.load(Ordering::Relaxed)
+}
 
 /// Wrap a stored `[out, in]` weight as a bias-less dense [`AdaptableLinear`] (every FLUX.2
 /// transformer projection). Dense forward = `matmul(x, wᵀ)`, bit-identical to the prior raw
@@ -70,6 +91,27 @@ fn process_qkv(
     Ok((q, k, v))
 }
 
+/// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`. When the
+/// sc-2963 glue toggle is on, MLX fuses the 4 multiplies + add/sub into one kernel (vs 6 eager ops,
+/// applied to both q and k every block). Bit-exact to the eager form.
+fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
+    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
+        let (r, i, c, s) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+        let out0 = subtract(&multiply(r, c)?, &multiply(i, s)?)?;
+        let out1 = add(&multiply(i, c)?, &multiply(r, s)?)?;
+        Ok(vec![out0, out1])
+    };
+    let args = [real.clone(), imag.clone(), cos.clone(), sin.clone()];
+    let mut out = if compile_glue() {
+        compile(f, true)(&args)?
+    } else {
+        f(&args)?
+    };
+    let out1 = out.pop().unwrap();
+    let out0 = out.pop().unwrap();
+    Ok((out0, out1))
+}
+
 /// Interleaved RoPE (`AttentionUtils.apply_rope_bshd`): pairs `(x[2i], x[2i+1])` rotated by
 /// `cos/sin[i]`. `cos`/`sin`: `[S, head_dim/2]`; `q`/`k`: `[B,H,S,head_dim]`.
 fn apply_rope(q: &Array, k: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
@@ -84,8 +126,7 @@ fn apply_rope(q: &Array, k: &Array, cos: &Array, sin: &Array) -> Result<(Array, 
         let p = split(&x5, 2, 4)?;
         let real = p[0].reshape(&[b, h, seq, hd / 2])?;
         let imag = p[1].reshape(&[b, h, seq, hd / 2])?;
-        let out0 = subtract(&multiply(&real, &cos)?, &multiply(&imag, &sin)?)?;
-        let out1 = add(&multiply(&imag, &cos)?, &multiply(&real, &sin)?)?;
+        let (out0, out1) = rope_rotate(&real, &imag, &cos, &sin)?;
         Ok(
             concatenate_axis(&[&out0.expand_dims(4)?, &out1.expand_dims(4)?], 4)?
                 .reshape(&[b, h, seq, hd])?,
@@ -103,15 +144,46 @@ fn attention(q: &Array, k: &Array, v: &Array, head_dim: i32) -> Result<Array> {
         .reshape(&[b, -1, q.shape()[1] * head_dim])?)
 }
 
-/// SwiGLU: split last axis in half, `silu(x1) · x2`.
+/// SwiGLU: split last axis in half, `silu(x1) · x2`. The `split` runs eagerly (a shapeless
+/// `mx.compile` can't infer a split's output shapes); the fusable `silu(x1)·x2` arithmetic is
+/// compiled into one kernel when the sc-2963 glue toggle is on. Bit-exact to the eager
+/// `multiply(silu(x1), x2)` — the inline `a·sigmoid(a)` mirrors [`mlx_gen::nn::silu`] op-for-op.
 fn swiglu(x: &Array) -> Result<Array> {
     let p = split(x, 2, -1)?;
-    Ok(multiply(&silu(&p[0])?, &p[1])?)
+    let f = |(a, b): (&Array, &Array)| -> std::result::Result<Array, Exception> {
+        multiply(&multiply(a, &sigmoid(a)?)?, b) // silu(a)·b
+    };
+    if compile_glue() {
+        Ok(compile(f, true)((&p[0], &p[1]))?)
+    } else {
+        Ok(f((&p[0], &p[1]))?)
+    }
 }
 
-/// `(1 + scale) · norm(x) + shift` with `scale`/`shift` broadcast `[B,1,D]`.
+/// `(1 + scale) · norm(x) + shift` with `scale`/`shift` broadcast `[B,1,D]`. One fused kernel when
+/// the sc-2963 glue toggle is on; the body is bit-identical to the eager affine.
 fn modulate(norm: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    Ok(add(&multiply(norm, &add(scale, scalar(1.0))?)?, shift)?)
+    let f = |(n, s, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(&multiply(n, &add(s, scalar(1.0))?)?, sh)
+    };
+    if compile_glue() {
+        Ok(compile(f, true)((norm, scale, shift))?)
+    } else {
+        Ok(f((norm, scale, shift))?)
+    }
+}
+
+/// Gated residual `x + gate·y` — one fused kernel when the sc-2963 glue toggle is on; bit-identical
+/// to the eager `add(x, gate·y)`.
+fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
+    let f = |(x, g, y): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(x, &multiply(g, y)?)
+    };
+    if compile_glue() {
+        Ok(compile(f, true)((x, gate, y))?)
+    } else {
+        Ok(f((x, gate, y))?)
+    }
 }
 
 /// Sinusoidal timestep embedding (diffusers `_timestep_embedding`, flip_sin_to_cos): `[B]` → `[B,
@@ -310,21 +382,20 @@ impl DoubleBlock {
         )?;
 
         let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt, cos, sin, cache)?;
-        img = add(&img, &multiply(gate_msa, &img_attn)?)?;
-        txt = add(&txt, &multiply(c_gate_msa, &txt_attn)?)?;
+        img = gated(&img, gate_msa, &img_attn)?;
+        txt = gated(&txt, c_gate_msa, &txt_attn)?;
 
         let norm_img2 = modulate(&layer_norm(&img, None, None, LN_EPS)?, scale_mlp, shift_mlp)?;
-        img = add(&img, &multiply(gate_mlp, &self.ff.forward(&norm_img2)?)?)?;
+        let img_ff = self.ff.forward(&norm_img2)?;
+        img = gated(&img, gate_mlp, &img_ff)?;
 
         let norm_txt2 = modulate(
             &layer_norm(&txt, None, None, LN_EPS)?,
             c_scale_mlp,
             c_shift_mlp,
         )?;
-        txt = add(
-            &txt,
-            &multiply(c_gate_mlp, &self.ff_context.forward(&norm_txt2)?)?,
-        )?;
+        let txt_ff = self.ff_context.forward(&norm_txt2)?;
+        txt = gated(&txt, c_gate_mlp, &txt_ff)?;
 
         Ok((txt, img))
     }
@@ -401,7 +472,7 @@ impl SingleBlock {
         let mlp = swiglu(&mlp)?;
         let cat = concatenate_axis(&[&attn, &mlp], -1)?;
         let attn_output = self.to_out.forward(&cat)?;
-        Ok(add(hidden, &multiply(gate, &attn_output)?)?)
+        gated(hidden, gate, &attn_output)
     }
 }
 
