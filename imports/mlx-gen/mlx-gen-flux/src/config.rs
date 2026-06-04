@@ -65,7 +65,7 @@ impl FluxVariant {
                 // Base FLUX.1 txt2img only for this story; Redux/Depth/Fill/Control are later variants.
                 conditioning: vec![ConditioningKind::Reference],
                 supports_lora: true,
-                supports_lokr: false,
+                supports_lokr: true,
                 samplers: Vec::new(),
                 schedulers: vec!["linear"],
                 min_size: 256,

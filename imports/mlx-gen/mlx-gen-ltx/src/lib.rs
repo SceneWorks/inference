@@ -24,6 +24,7 @@ pub mod rope;
 pub mod schedule;
 pub mod text_encoder;
 pub mod tiling;
+pub mod transformer;
 pub mod vae;
 
 pub use config::{LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
@@ -31,4 +32,5 @@ pub use connector::Connector;
 pub use model::{descriptor, load, Ltx, MODEL_ID};
 pub use text_encoder::LtxTextEncoder;
 pub use tiling::TilingConfig;
+pub use transformer::VideoBlock;
 pub use vae::LtxVideoVae;

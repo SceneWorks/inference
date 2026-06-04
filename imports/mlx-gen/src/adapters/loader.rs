@@ -51,6 +51,18 @@ pub fn is_lokr(w: &Weights) -> bool {
         .unwrap_or(false)
 }
 
+/// Read a scalar adapter value (an `alpha`) as `f32`, regardless of its on-disk dtype. Trained
+/// adapters store `alpha` in their compute dtype: real kohya/BFL FLUX LoRAs ship it **bf16** (sc-2657),
+/// and `Array::as_slice::<f32>()` `unwrap`s a hard dtype-mismatch (it never casts), so reading a bf16
+/// scalar that way panics. Cast to f32 first (exact for the small integer alphas these files carry, and
+/// a no-op when already f32); a `[]`- or `[1]`-shaped scalar both read as a one-element slice.
+fn scalar_alpha(a: &Array) -> Result<Option<f32>> {
+    Ok(a.as_dtype(Dtype::Float32)?
+        .as_slice::<f32>()
+        .first()
+        .copied())
+}
+
 /// Outcome of installing an adapter file: how many target modules were adapted, and any
 /// adapter keys that matched no module in the host (surfaced, never silently dropped).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -153,7 +165,7 @@ pub fn apply_lora_peft(
             .and_then(|r| r.strip_suffix(".alpha"))
             .or_else(|| key.strip_suffix(".alpha"))
         {
-            if let Some(new) = w.require(&key)?.as_slice::<f32>().first().copied() {
+            if let Some(new) = scalar_alpha(w.require(&key)?)? {
                 let slot = &mut groups.entry(path.to_string()).or_default().alpha;
                 match *slot {
                     Some(existing) if existing != new => {
@@ -292,7 +304,7 @@ pub fn apply_lora_kohya(
         match role {
             KohyaRole::Down => parts.a = Some(w.require(&key)?.clone()),
             KohyaRole::Up => parts.b = Some(w.require(&key)?.clone()),
-            KohyaRole::Alpha => parts.alpha = w.require(&key)?.as_slice::<f32>().first().copied(),
+            KohyaRole::Alpha => parts.alpha = scalar_alpha(w.require(&key)?)?,
         }
     }
 
@@ -473,7 +485,7 @@ pub fn apply_lora_bfl(
                         None => v.clone(),
                     });
                 }
-                KohyaRole::Alpha => parts.alpha = v.as_slice::<f32>().first().copied(),
+                KohyaRole::Alpha => parts.alpha = scalar_alpha(v)?,
             }
         }
     }
@@ -716,6 +728,62 @@ mod tests {
             scale: 0.5,
         });
 
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let got = host.lin.forward(&x).unwrap();
+        let want = expected.forward(&x).unwrap();
+        assert!(all_close(&got, &want, 1e-5, 1e-5, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    fn lora_bf16_scalar_alpha_reads_without_panic() {
+        // sc-2657: real kohya/BFL FLUX LoRAs ship `alpha` as a **bf16 scalar of shape []**. The alpha
+        // read used `as_slice::<f32>()`, which `unwrap`s a dtype mismatch and would panic on bf16 — a
+        // latent bug masked by every prior test synthesizing f32 alpha. The fix casts to f32 first.
+        // Here a bf16 `[]`-shaped alpha must load AND fold identically to its f32 `[1]`-shaped twin.
+        let weight = Array::from_slice(
+            &(0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            &[4, 3],
+        );
+        let a_raw = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]);
+        let b_raw = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
+        // alpha = 16 (exactly representable in bf16), stored bf16 and 0-d — like the real file.
+        let alpha_bf16 = Array::from_slice(&[16.0f32], &[1])
+            .reshape(&[] as &[i32])
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+
+        let path = tmp("lora_bf16_alpha.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("lin.lora_A.weight", &a_raw),
+                ("lin.lora_B.weight", &b_raw),
+                ("lin.alpha", &alpha_bf16),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+
+        let mut host = OneLinear {
+            lin: AdaptableLinear::dense(weight.clone(), None),
+        };
+        let report = apply_lora_peft(&mut host, &w, 0.5, None).unwrap();
+        assert_eq!(report.applied, 1, "bf16 alpha LoRA should apply, not panic");
+
+        // Reference: identical fold with alpha=16, rank=2 → factor 8.
+        let mut expected = AdaptableLinear::dense(weight, None);
+        expected.push(Adapter::Lora {
+            a: a_raw.t(),
+            b: b_raw
+                .t()
+                .multiply(Array::from_slice(&[8.0f32], &[1]))
+                .unwrap(),
+            scale: 0.5,
+        });
         let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
         let got = host.lin.forward(&x).unwrap();
         let want = expected.forward(&x).unwrap();
