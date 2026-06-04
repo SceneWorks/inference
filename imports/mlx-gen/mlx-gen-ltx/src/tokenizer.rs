@@ -70,4 +70,18 @@ impl LtxTokenizer {
             Array::from_slice(&mask, &[1, n]),
         ))
     }
+
+    /// Tokenize an **already chat-templated** string to a flat id list with `add_special_tokens=false`
+    /// (no auto BOS — the template supplies the `<start_of_turn>` markers itself). The prompt-enhancer
+    /// path (sc-2845) uses this, mirroring the reference `processor(formatted, add_special_tokens=False)`.
+    pub fn encode_chat(&self, text: &str) -> Result<Vec<i32>> {
+        self.inner.encode_ids(text, false)
+    }
+
+    /// Detokenize generated ids → text, dropping special tokens — the reference
+    /// `processor.decode(generated_tokens, skip_special_tokens=True)`.
+    pub fn decode(&self, ids: &[i32]) -> Result<String> {
+        let u: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
+        self.inner.decode(&u, true)
+    }
 }
