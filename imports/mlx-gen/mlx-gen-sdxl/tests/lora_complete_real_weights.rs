@@ -320,7 +320,9 @@ fn complete_conv_deltas_match_reference_byte_exact() {
         .map(|dotted| {
             let b = conv_weight_at(&mut base, dotted);
             let flat = format!("lora_unet_{}", dotted.replace('.', "_"));
-            let d_nhwc = conv_delta_for(&lora, &flat).transpose_axes(&[0, 2, 3, 1]).unwrap();
+            let d_nhwc = conv_delta_for(&lora, &flat)
+                .transpose_axes(&[0, 2, 3, 1])
+                .unwrap();
             add(&b, &d_nhwc).unwrap()
         })
         .collect();

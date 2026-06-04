@@ -72,7 +72,13 @@ pub fn reconstruct_lokr_delta(
 /// the same value an f16 reference fusion would produce, returned as f32 for the caller to cast to
 /// the conv weight's dtype on merge. The merge itself is the chaos-safe `W += δ` (the SDXL ancestral
 /// sampler needs a merged weight, not a forward-time residual — cf. [`AdaptableLinear::merge_dense_delta`]).
-pub fn conv_lora_delta(down: &Array, up: &Array, alpha: f32, rank: f32, scale: f32) -> Result<Array> {
+pub fn conv_lora_delta(
+    down: &Array,
+    up: &Array,
+    alpha: f32,
+    rank: f32,
+    scale: f32,
+) -> Result<Array> {
     let src = up.dtype(); // f16 for kohya/community LoRAs; f32 makes the round-trip a no-op.
     let ds = down.shape(); // [rank, in, kH, kW]
     let us = up.shape(); // [out, rank, 1, 1]
@@ -80,7 +86,10 @@ pub fn conv_lora_delta(down: &Array, up: &Array, alpha: f32, rank: f32, scale: f
     let out = us[0];
     let down2 = down.reshape(&[r, cin * kh * kw])?; // [rank, in·kH·kW]
     let up2 = up.reshape(&[out, r])?; // [out, rank]
-    let ba = matmul(&up2.as_dtype(Dtype::Float32)?, &down2.as_dtype(Dtype::Float32)?)?;
+    let ba = matmul(
+        &up2.as_dtype(Dtype::Float32)?,
+        &down2.as_dtype(Dtype::Float32)?,
+    )?;
     let ba = ba.as_dtype(src)?.as_dtype(Dtype::Float32)?;
     // effective_scale in f64 then f32, matching a reference's Python-float arithmetic.
     let eff = ((alpha as f64 / rank as f64) * scale as f64) as f32;
@@ -795,9 +804,11 @@ mod tests {
             .item::<bool>());
         // The user scale composes multiplicatively (scale 0 ⇒ a zero delta ⇒ no-op merge).
         let zero = conv_lora_delta(&down, &up, 1.0, 1.0, 0.0).unwrap();
-        assert!(array_eq(&zero, Array::zeros::<f32>(&[2, 1, 2, 2]).unwrap(), false)
-            .unwrap()
-            .item::<bool>());
+        assert!(
+            array_eq(&zero, Array::zeros::<f32>(&[2, 1, 2, 2]).unwrap(), false)
+                .unwrap()
+                .item::<bool>()
+        );
     }
 
     #[test]
@@ -809,7 +820,9 @@ mod tests {
         let delta = Array::from_slice(&[0.5f32, 0.25], &[1, 2, 1, 1]);
         conv.merge_conv_delta(&delta).unwrap();
         let want = Array::from_slice(&[1.5f32, 2.25], &[1, 1, 1, 2]);
-        assert!(array_eq(conv.weight(), &want, false).unwrap().item::<bool>());
+        assert!(array_eq(conv.weight(), &want, false)
+            .unwrap()
+            .item::<bool>());
 
         // A zero delta is a bit-exact no-op.
         let mut conv2 = AdaptableConv2d::new(w.clone(), None);
@@ -851,7 +864,10 @@ mod tests {
         let got = conv2.weight().as_slice::<f32>();
         for (j, (&g, &b)) in got.iter().zip(&wv).enumerate() {
             let want = if j == nhwc_idx { b + 5.0 } else { b };
-            assert_eq!(g, want, "conv delta landed at wrong NHWC index (got change at {j})");
+            assert_eq!(
+                g, want,
+                "conv delta landed at wrong NHWC index (got change at {j})"
+            );
         }
     }
 
