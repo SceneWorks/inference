@@ -340,7 +340,20 @@ fn lightning_hyper_match_torch_teacher_forced() {
             let img_t = render(&pe.as_dtype(dt).unwrap(), &pp.as_dtype(dt).unwrap());
             save_png(&format!("sdxl_accel_{tag}_torchcond_tf.png"), &img_t);
             let t8 = px_frac(&img_t.pixels, &gpix, 8) * 100.0;
-            format!("• {tag}: px>8 vs torch — MLX-CLIP {m8:.1}%  torch-CLIP-injected {t8:.1}%")
+            // sc-2919 acceptance: with the conv-layer LoRA now merged (Complete coverage), the
+            // full-LoRA U-Net/LoRA gap (torch-CLIP isolated) collapses from the conv-dropped ~87%
+            // (Lightning) / ~86% (Hyper) to single digits — measured Lightning ≈2.7%, Hyper ≈7.6%
+            // (the residual is the cross-backend few-step-distillation amplification of the 0.7%
+            // backend floor, NOT the dropped conv: the conv merge is byte-exact, see
+            // lora_complete_real_weights). The 15% bound is well below the conv-dropped regression
+            // (~86%) and well above the measured floor-amplified value, so it catches a conv-drop
+            // regression without flaking on backend variance.
+            assert!(
+                t8 < 15.0,
+                "{tag}: full-LoRA torch-CLIP-injected gap {t8:.1}% px>8 — conv-layer LoRA appears \
+                 dropped again (sc-2919 expects single digits; ~86% means conv is not merged)"
+            );
+            format!("• {tag}: px>8 vs torch — MLX-CLIP {m8:.1}%  torch-CLIP-injected {t8:.1}% (conv merged, sc-2919)")
         } else {
             format!(
                 "• {tag}: px>8 vs torch — MLX-CLIP {m8:.1}% (re-dump for the torch-CLIP isolation)"
@@ -349,9 +362,11 @@ fn lightning_hyper_match_torch_teacher_forced() {
         println!("{line}");
 
         // (3) Linear-only isolation (Lightning only): compare the MLX Linear-only merge to a torch
-        // render with the conv LoRA modules STRIPPED (same Linear-only fusion). If this ≈ the backend
-        // floor, the full-fusion gap (1)/(2) is exactly the dropped conv-layer LoRA (sc-2639 boundary),
-        // and the MLX Linear merge itself is faithful to torch.
+        // render with the conv LoRA modules STRIPPED (same Linear-only fusion). This ≈ the backend
+        // floor (measured 0.0%), proving the MLX Linear merge is bit-exact to torch's Linear fusion.
+        // Historically (pre-sc-2919) this row established that the full-fusion gap was *entirely* the
+        // dropped conv-layer LoRA; now that conv is merged (Complete coverage), the full-fusion row
+        // (2) above has itself collapsed to single digits, and this row remains the Linear-merge check.
         if tag == "lightning" {
             if let Ok(gl) = Weights::from_file(
                 golden_dir.join("sdxl_accel_render_lightning_linonly.safetensors"),
@@ -392,8 +407,9 @@ fn lightning_hyper_match_torch_teacher_forced() {
     }
     println!(
         "(SDXL-MLX is faithful to the vendored Apple `mlx_sd` reference, NOT diffusers — the real \
-         sampler parity is the bit-exact scheduler-isolation gate. The full-fusion e2e gap is the \
-         dropped conv-layer LoRA (sc-2639 Linear-only boundary), localized by the base-floor + \
-         Linear-only rows; the CLIP-injected column rules out the text encoder.)"
+         sampler parity is the bit-exact scheduler-isolation gate. With the conv-layer LoRA now \
+         merged (sc-2919, Complete coverage), the full-fusion torch-CLIP-injected gap collapses to \
+         single digits (≈ the few-step-amplified backend floor); the conv merge itself is byte-exact \
+         (lora_complete_real_weights). The remaining MLX-CLIP column is the text-encoder backend gap.)"
     );
 }
