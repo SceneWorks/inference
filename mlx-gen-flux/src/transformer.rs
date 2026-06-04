@@ -2,7 +2,8 @@
 //! dual-stream joint blocks, single-stream blocks, FLUX RoPE, time/text/guidance embedding, and
 //! output AdaLayerNorm.
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -892,14 +893,907 @@ fn join(prefix: &str, suffix: &str) -> String {
     }
 }
 
+// ---- LoRA/LoKr adapter routing (sc-2657) ------------------------------------------------------
+//
+// The Rust analog of the fork's `FluxLoRAMapping`: map trained-file module paths to the crate's
+// `AdaptableLinear` fields across the FULL fork surface — joint (`transformer_blocks`) and single
+// (`single_transformer_blocks`) block linears, INCLUDING the adaLN modulation linears (`norm1.linear`,
+// `norm1_context.linear`, single-block `norm.linear`), which `FluxLoRAMapping` targets and a real kohya
+// FLUX LoRA carries (`*_mod_lin`/`modulation_lin`). The top-level embedders / `time_text_embed` /
+// `norm_out` / `proj_out` are NOT fork LoRA targets and are intentionally omitted. The VAE + T5/CLIP
+// text encoders are not adapter targets. `adaptable_mut` accepts the diffusers checkpoint spelling AND
+// the fork's renamed `model_path` spelling where they differ (`ff.net.0.proj` ≡ `ff.linear1`,
+// `to_out.0` ≡ `to_out`), since the fork's `possible_*_patterns` list both. Per-file LoKr/LoRA dispatch,
+// prefix detection, kohya flattening, BFL fused→split, stacking, and the strict no-silent-drop policy
+// are the shared core seam (sc-2534/2618/2743), exactly as Z-Image (sc-2602), Qwen (sc-2528), and
+// FLUX.2 (sc-2646) use it.
+
+impl AdaptableHost for FeedForward {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            // diffusers checkpoint naming (`ff.net.0.proj`/`ff.net.2`) AND the fork's renamed
+            // `linear1`/`linear2` `model_path` spelling both address these Linears (the fork lists both).
+            ["net", "0", "proj"] | ["linear1"] => Some(&mut self.linear1),
+            ["net", "2"] | ["linear2"] => Some(&mut self.linear2),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        // The diffusers spelling — what a kohya file flattening a diffusers checkpoint contains.
+        ["net.0.proj", "net.2"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+}
+
+impl AdaptableHost for JointAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // Image stream `to_q/k/v`/`to_out.0`; text stream `add_{q,k,v}_proj` → `add_{q,k,v}` and
+        // `to_add_out`. The fork accepts both the bare `to_out` and the HF `to_out.0` (diffusers wraps
+        // the output projection in a `Sequential[Linear, Dropout]`); both address this Linear.
+        match path {
+            ["to_q"] => Some(&mut self.to_q),
+            ["to_k"] => Some(&mut self.to_k),
+            ["to_v"] => Some(&mut self.to_v),
+            ["to_out"] | ["to_out", "0"] => Some(&mut self.to_out),
+            ["add_q_proj"] => Some(&mut self.add_q),
+            ["add_k_proj"] => Some(&mut self.add_k),
+            ["add_v_proj"] => Some(&mut self.add_v),
+            ["to_add_out"] => Some(&mut self.to_add_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        [
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+            "to_add_out",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+}
+
+impl AdaptableHost for SingleAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["to_q"] => Some(&mut self.to_q),
+            ["to_k"] => Some(&mut self.to_k),
+            ["to_v"] => Some(&mut self.to_v),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["to_q", "to_k", "to_v"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+}
+
+impl AdaptableHost for JointBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            ["ff_context", rest @ ..] => self.ff_context.adaptable_mut(rest),
+            ["norm1", "linear"] => Some(&mut self.norm1.linear),
+            ["norm1_context", "linear"] => Some(&mut self.norm1_context.linear),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("attn", &self.attn);
+        out.extend(prefixed_paths("ff", &self.ff));
+        out.extend(prefixed_paths("ff_context", &self.ff_context));
+        out.push("norm1.linear".into());
+        out.push("norm1_context.linear".into());
+        out
+    }
+}
+
+impl AdaptableHost for SingleBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["proj_mlp"] => Some(&mut self.proj_mlp),
+            ["proj_out"] => Some(&mut self.proj_out),
+            ["norm", "linear"] => Some(&mut self.norm.linear),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("attn", &self.attn);
+        out.push("proj_mlp".into());
+        out.push("proj_out".into());
+        out.push("norm.linear".into());
+        out
+    }
+}
+
+impl AdaptableHost for FluxTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["single_transformer_blocks", n, rest @ ..] => self
+                .single_blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            // Top-level embedders / time_text_embed / norm_out / proj_out are not fork LoRA targets.
+            _ => None,
+        }
+    }
+
+    /// kohya-reachable targets (sc-2618): the diffusers-named joint + single block linears (incl. the
+    /// adaLN modulation linears). The fork's `FluxLoRAMapping` itself lists no diffusers-flattened
+    /// `lora_unet_transformer_blocks_*` pattern (its kohya `lora_unet_` patterns are all the BFL fused
+    /// form below), so this is the core's cross-family diffusers-flattened-kohya superset — proven
+    /// generically by the core `kohya_equiv_to_peft_bit_exact` gate + the drift/collision tests, and
+    /// consistent with Z-Image/Qwen/FLUX.2. A real FLUX kohya/ComfyUI file uses the BFL naming and is
+    /// dispatched to [`bfl_targets`](Self::bfl_targets) first (precise), never here.
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("transformer_blocks.{i}"), b));
+        }
+        for (i, b) in self.single_blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("single_transformer_blocks.{i}"), b));
+        }
+        out
+    }
+
+    /// BFL / ComfyUI fused→split targets (sc-2743), the Rust analog of the fork's
+    /// `FluxLoRAMapping._get_bfl_{transformer,single_transformer}_block_targets`. Unlike FLUX.2, the
+    /// fork's FLUX.1 BFL patterns use ONLY the kohya `lora_unet_<flat>` spelling (no `diffusion_model.`/
+    /// `base_model.model.` BFL variants). Two fused→split shapes:
+    /// - joint `double_blocks.{n}.{img,txt}_attn.qkv` → 3-way EQUAL split into `attn.to_q/to_k/to_v`
+    ///   (img) / `add_{q,k,v}_proj` (txt), via `Chunk{n:3}` (up) / `ChunkIfDivisible{n:3}` (down).
+    /// - single `single_blocks.{n}.linear1` → **4-way** split into `attn.to_q/to_k/to_v` + `proj_mlp`,
+    ///   via `Dims{[q,k,v,mlp]}` (up) / `ChunkIfDivisible{n:4}` (down). The dims are config-derived
+    ///   (`[DIM, DIM, DIM, 4·DIM]` = `[3072,3072,3072,12288]`), matching the fork `_split_qkv_mlp_*`.
+    ///
+    /// Everything else is a plain rename (no slice), including the adaLN modulation linears
+    /// (`*_mod_lin`/`modulation_lin` → `norm1.linear`/`norm1_context.linear`/`norm.linear`). Byte-faithful
+    /// to the fork `LoraTransforms` (guarded by tests). Full surface = 19×14 + 38×6 = 494 targets.
+    fn bfl_targets(&self) -> Vec<BflTarget> {
+        let mut out = Vec::new();
+        // FLUX.1 single-block `linear1` = q/k/v (each `DIM`) + mlp (`4·DIM`) fused along dim 0.
+        let single_dims = vec![DIM, DIM, DIM, 4 * DIM];
+
+        // Joint (double) blocks.
+        for i in 0..self.blocks.len() {
+            // Fused qkv → 3-way split: img → to_{q,k,v}; txt → add_{q,k,v}_proj.
+            for (stream, dst) in [
+                ("img", ["to_q", "to_k", "to_v"]),
+                ("txt", ["add_q_proj", "add_k_proj", "add_v_proj"]),
+            ] {
+                let flat = format!("double_blocks_{i}_{stream}_attn_qkv");
+                for idx in 0..3i32 {
+                    out.push(bfl_split(
+                        &format!("transformer_blocks.{i}.attn.{}", dst[idx as usize]),
+                        &flat,
+                        LoraRowSlice::Chunk { n: 3, index: idx },
+                        LoraRowSlice::ChunkIfDivisible { n: 3, index: idx },
+                    ));
+                }
+            }
+            // attn output proj (rename): img.proj → to_out.0; txt.proj → to_add_out.
+            out.push(bfl_rename(
+                &format!("transformer_blocks.{i}.attn.to_out.0"),
+                &format!("double_blocks_{i}_img_attn_proj"),
+            ));
+            out.push(bfl_rename(
+                &format!("transformer_blocks.{i}.attn.to_add_out"),
+                &format!("double_blocks_{i}_txt_attn_proj"),
+            ));
+            // MLP (rename): img_mlp.{0,2} → ff.linear{1,2}; txt_mlp.{0,2} → ff_context.linear{1,2}.
+            for (stream, ff) in [("img", "ff"), ("txt", "ff_context")] {
+                out.push(bfl_rename(
+                    &format!("transformer_blocks.{i}.{ff}.linear1"),
+                    &format!("double_blocks_{i}_{stream}_mlp_0"),
+                ));
+                out.push(bfl_rename(
+                    &format!("transformer_blocks.{i}.{ff}.linear2"),
+                    &format!("double_blocks_{i}_{stream}_mlp_2"),
+                ));
+            }
+            // adaLN modulation (rename): img_mod_lin → norm1.linear; txt_mod_lin → norm1_context.linear.
+            out.push(bfl_rename(
+                &format!("transformer_blocks.{i}.norm1.linear"),
+                &format!("double_blocks_{i}_img_mod_lin"),
+            ));
+            out.push(bfl_rename(
+                &format!("transformer_blocks.{i}.norm1_context.linear"),
+                &format!("double_blocks_{i}_txt_mod_lin"),
+            ));
+        }
+
+        // Single blocks.
+        for i in 0..self.single_blocks.len() {
+            // Fused linear1 → 4-way split: attn.to_{q,k,v} + proj_mlp.
+            let flat = format!("single_blocks_{i}_linear1");
+            let dst = ["attn.to_q", "attn.to_k", "attn.to_v", "proj_mlp"];
+            for idx in 0..4i32 {
+                out.push(bfl_split(
+                    &format!("single_transformer_blocks.{i}.{}", dst[idx as usize]),
+                    &flat,
+                    LoraRowSlice::Dims {
+                        dims: single_dims.clone(),
+                        index: idx,
+                    },
+                    LoraRowSlice::ChunkIfDivisible { n: 4, index: idx },
+                ));
+            }
+            // linear2 → proj_out (rename); modulation_lin → norm.linear (rename).
+            out.push(bfl_rename(
+                &format!("single_transformer_blocks.{i}.proj_out"),
+                &format!("single_blocks_{i}_linear2"),
+            ));
+            out.push(bfl_rename(
+                &format!("single_transformer_blocks.{i}.norm.linear"),
+                &format!("single_blocks_{i}_modulation_lin"),
+            ));
+        }
+
+        out
+    }
+}
+
+/// Every BFL/ComfyUI source-key spelling for one FLUX.1 block linear. Unlike FLUX.2, the fork's
+/// `FluxLoRAMapping` BFL patterns use ONLY the kohya `lora_unet_<flat>` spelling, so each role has a
+/// single key. Returns `(up, down, alpha)` — `lora_up`≡`lora_B`, `lora_down`≡`lora_A`.
+fn bfl_keys(flat: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    (
+        vec![format!("lora_unet_{flat}.lora_up.weight")],
+        vec![format!("lora_unet_{flat}.lora_down.weight")],
+        vec![format!("lora_unet_{flat}.alpha")],
+    )
+}
+
+/// A plain BFL rename (no row-slice): the source factors map straight to `target_path`.
+fn bfl_rename(target_path: &str, flat: &str) -> BflTarget {
+    let (up_keys, down_keys, alpha_keys) = bfl_keys(flat);
+    BflTarget {
+        target_path: target_path.to_string(),
+        up_keys,
+        down_keys,
+        alpha_keys,
+        up_slice: None,
+        down_slice: None,
+    }
+}
+
+/// A BFL fused→split target: the source up/down factors are row-sliced into `target_path`.
+fn bfl_split(
+    target_path: &str,
+    flat: &str,
+    up_slice: LoraRowSlice,
+    down_slice: LoraRowSlice,
+) -> BflTarget {
+    let (up_keys, down_keys, alpha_keys) = bfl_keys(flat);
+    BflTarget {
+        target_path: target_path.to_string(),
+        up_keys,
+        down_keys,
+        alpha_keys,
+        up_slice: Some(up_slice),
+        down_slice: Some(down_slice),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::adapters::{install_adapter, Adapter};
+    use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+    use mlx_rs::ops::array_eq;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     #[test]
     fn flux_rope_shapes_include_text_and_image_tokens() {
         let r = FluxRope::new().forward(5, 4, 3).unwrap();
         assert_eq!(r.cos.shape(), &[17, 64]);
         assert_eq!(r.sin.shape(), &[17, 64]);
+    }
+
+    // ---- sc-2657 adapter routing (FluxLoRAMapping → field translation) ------------------------
+
+    fn dummy_lin() -> AdaptableLinear {
+        AdaptableLinear::dense(Array::from_slice(&[0.0f32], &[1, 1]), None)
+    }
+    fn dummy_arr() -> Array {
+        Array::from_slice(&[1.0f32], &[1])
+    }
+    fn ada_zero(chunks: usize) -> AdaLayerNormZero {
+        AdaLayerNormZero {
+            linear: dummy_lin(),
+            chunks,
+        }
+    }
+    fn joint_attn() -> JointAttention {
+        JointAttention {
+            to_q: dummy_lin(),
+            to_k: dummy_lin(),
+            to_v: dummy_lin(),
+            to_out: dummy_lin(),
+            add_q: dummy_lin(),
+            add_k: dummy_lin(),
+            add_v: dummy_lin(),
+            to_add_out: dummy_lin(),
+            norm_q: dummy_arr(),
+            norm_k: dummy_arr(),
+            norm_added_q: dummy_arr(),
+            norm_added_k: dummy_arr(),
+        }
+    }
+    fn feed_forward() -> FeedForward {
+        FeedForward {
+            linear1: dummy_lin(),
+            linear2: dummy_lin(),
+            activation: Activation::Gelu,
+        }
+    }
+    fn joint_block() -> JointBlock {
+        JointBlock {
+            norm1: ada_zero(6),
+            norm1_context: ada_zero(6),
+            attn: joint_attn(),
+            ff: feed_forward(),
+            ff_context: feed_forward(),
+        }
+    }
+    fn single_block() -> SingleBlock {
+        SingleBlock {
+            norm: ada_zero(3),
+            attn: SingleAttention {
+                to_q: dummy_lin(),
+                to_k: dummy_lin(),
+                to_v: dummy_lin(),
+                norm_q: dummy_arr(),
+                norm_k: dummy_arr(),
+            },
+            proj_mlp: dummy_lin(),
+            proj_out: dummy_lin(),
+        }
+    }
+    fn mlp_embedder() -> MlpEmbedder {
+        MlpEmbedder {
+            linear_1: dummy_lin(),
+            linear_2: dummy_lin(),
+        }
+    }
+    /// A FLUX.1 transformer of dummy 1×1 linears with `n_double` joint + `n_single` single blocks —
+    /// enough to exercise routing/BFL/kohya enumeration without weights (forward is never called).
+    fn test_transformer(n_double: usize, n_single: usize) -> FluxTransformer {
+        FluxTransformer {
+            x_embedder: dummy_lin(),
+            context_embedder: dummy_lin(),
+            time_text_embed: TimeTextEmbed {
+                timestep: mlp_embedder(),
+                text: mlp_embedder(),
+                guidance: Some(mlp_embedder()),
+            },
+            blocks: (0..n_double).map(|_| joint_block()).collect(),
+            single_blocks: (0..n_single).map(|_| single_block()).collect(),
+            norm_out: AdaLayerNormContinuous {
+                linear: dummy_lin(),
+            },
+            proj_out: dummy_lin(),
+            pos_embed: FluxRope::new(),
+        }
+    }
+
+    fn resolves(host: &mut impl AdaptableHost, path: &str) -> bool {
+        let segs: Vec<&str> = path.split('.').collect();
+        host.adaptable_mut(&segs).is_some()
+    }
+
+    /// The full fork `FluxLoRAMapping` surface — joint + single block linears INCLUDING the adaLN
+    /// modulation linears (the diffusers AND fork-renamed spellings) — resolves; off-surface rejects.
+    #[test]
+    fn routing_covers_full_fork_surface() {
+        let mut t = test_transformer(19, 38);
+        let double = [
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.to_out.0",
+            "attn.add_q_proj",
+            "attn.add_k_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+            "ff.net.0.proj", // diffusers spelling
+            "ff.net.2",
+            "ff.linear1", // fork model_path spelling (both resolve)
+            "ff.linear2",
+            "ff_context.net.0.proj",
+            "ff_context.net.2",
+            "norm1.linear",
+            "norm1_context.linear",
+        ];
+        for i in [0usize, 9, 18] {
+            for tgt in double {
+                let p = format!("transformer_blocks.{i}.{tgt}");
+                assert!(resolves(&mut t, &p), "expected {p} to resolve");
+            }
+        }
+        let single = [
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "proj_mlp",
+            "proj_out",
+            "norm.linear",
+        ];
+        for i in [0usize, 19, 37] {
+            for tgt in single {
+                let p = format!("single_transformer_blocks.{i}.{tgt}");
+                assert!(resolves(&mut t, &p), "expected {p} to resolve");
+            }
+        }
+        for p in [
+            "x_embedder",                              // top-level embedder — not a fork LoRA target
+            "context_embedder",                        // ditto
+            "proj_out",                                // top-level output proj — not a target
+            "norm_out.linear",                         // continuous adaLN — not a target
+            "time_text_embed.timestep.linear_1",       // conditioning MLP — not a target
+            "transformer_blocks.19.attn.to_q",         // out of range (19 joint blocks: 0..18)
+            "single_transformer_blocks.38.proj_out",   // out of range (38 single blocks: 0..37)
+            "transformer_blocks.0.attn.add_q",         // internal field, not the file's add_q_proj
+            "transformer_blocks.0.attn.qkv",           // fused name — FLUX.1 model is split
+            "single_transformer_blocks.0.attn.to_out", // single attn has no separate output proj
+        ] {
+            assert!(!resolves(&mut t, p), "expected {p} NOT to resolve");
+        }
+    }
+
+    /// `adaptable_paths()` (the kohya-reachable surface) drift guard: every enumerated path resolves,
+    /// flattens to a collision-free stem, and the count matches the full surface (19×14 + 38×6 = 494).
+    #[test]
+    fn adaptable_paths_resolve_and_flatten_uniquely() {
+        let t = test_transformer(19, 38);
+        let paths = t.adaptable_paths();
+        assert_eq!(paths.len(), 19 * 14 + 38 * 6, "full kohya surface count");
+        let mut probe = test_transformer(19, 38);
+        for p in &paths {
+            assert!(
+                resolves(&mut probe, p),
+                "enumerated {p} does not resolve via adaptable_mut"
+            );
+        }
+        let flat: std::collections::BTreeSet<String> =
+            paths.iter().map(|p| p.replace('.', "_")).collect();
+        assert_eq!(
+            flat.len(),
+            paths.len(),
+            "two enumerated paths collide when flattened to a kohya stem"
+        );
+    }
+
+    /// The full `bfl_targets()` surface (sc-2743): count = 494, every target resolves on the tree,
+    /// target paths are unique, and the single-block `linear1` uses the 4-way `Dims` split while the
+    /// double-block qkv uses the 3-way `Chunk`/`ChunkIfDivisible`.
+    #[test]
+    fn bfl_targets_full_surface() {
+        let mut t = test_transformer(19, 38);
+        let targets = t.bfl_targets();
+        assert_eq!(targets.len(), 19 * 14 + 38 * 6, "full BFL surface count");
+        let mut paths = std::collections::BTreeSet::new();
+        for tg in &targets {
+            assert!(paths.insert(tg.target_path.clone()), "duplicate BFL target");
+            assert!(
+                resolves(&mut t, &tg.target_path),
+                "BFL target {} does not resolve",
+                tg.target_path
+            );
+        }
+        // Single-block to_q: 4-way Dims split with FLUX.1's [DIM,DIM,DIM,4·DIM] dims, index 0.
+        let sq = targets
+            .iter()
+            .find(|tg| tg.target_path == "single_transformer_blocks.0.attn.to_q")
+            .unwrap();
+        match &sq.up_slice {
+            Some(LoraRowSlice::Dims { dims, index }) => {
+                assert_eq!(dims, &vec![DIM, DIM, DIM, 4 * DIM]);
+                assert_eq!(*index, 0);
+            }
+            other => panic!("single to_q up_slice should be Dims, got {other:?}"),
+        }
+        // proj_mlp is the 4th (index 3) slice of the same fused linear1.
+        let pm = targets
+            .iter()
+            .find(|tg| tg.target_path == "single_transformer_blocks.0.proj_mlp")
+            .unwrap();
+        assert!(matches!(
+            &pm.up_slice,
+            Some(LoraRowSlice::Dims { index: 3, .. })
+        ));
+        // Double-block img qkv → to_k: 3-way Chunk (up) / ChunkIfDivisible (down), index 1.
+        let dk = targets
+            .iter()
+            .find(|tg| tg.target_path == "transformer_blocks.0.attn.to_k")
+            .unwrap();
+        assert!(matches!(
+            &dk.up_slice,
+            Some(LoraRowSlice::Chunk { n: 3, index: 1 })
+        ));
+        assert!(matches!(
+            &dk.down_slice,
+            Some(LoraRowSlice::ChunkIfDivisible { n: 3, index: 1 })
+        ));
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("mlx_gen_flux_adapter_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    fn lora_ab(adapters: &[Adapter]) -> (Array, Array) {
+        match adapters {
+            [Adapter::Lora { a, b, .. }] => (a.clone(), b.clone()),
+            _ => panic!("expected exactly one LoRA adapter, got {}", adapters.len()),
+        }
+    }
+
+    /// sc-2743: a BFL *fused* `img_attn.qkv` LoRA reconstructs the BYTE-IDENTICAL `to_q/to_k/to_v`
+    /// adapters as the equivalent diffusers split-target file — the 3-way split. No weights needed
+    /// (the row-slice operates on the source factors, not the base), so this is a CI gate.
+    #[test]
+    fn bfl_fused_qkv_matches_diffusers_split() {
+        let none = None as Option<&HashMap<String, String>>;
+        let (inner, inp, r) = (3072i32, 8i32, 2i32);
+        let head = |seed: i32| -> Vec<f32> {
+            (0..inner * r)
+                .map(|i| (((i + seed) % 17) as f32 - 8.0) * 0.001)
+                .collect()
+        };
+        let (hq, hk, hv) = (head(0), head(5), head(11));
+        let mut fused = hq.clone();
+        fused.extend_from_slice(&hk);
+        fused.extend_from_slice(&hv);
+        let up_fused = Array::from_slice(&fused, &[3 * inner, r]);
+        let up_q = Array::from_slice(&hq, &[inner, r]);
+        let up_k = Array::from_slice(&hk, &[inner, r]);
+        let up_v = Array::from_slice(&hv, &[inner, r]);
+        // Shared down (rank 2 not divisible by 3 → ChunkIfDivisible returns the whole tensor).
+        let down = Array::from_slice(
+            &(0..r * inp)
+                .map(|i| (i as f32 - 4.0) * 0.002)
+                .collect::<Vec<_>>(),
+            &[r, inp],
+        );
+        let alpha = Array::from_slice(&[4.0f32], &[1]);
+
+        let bfl_path = tmp("bfl_qkv.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight",
+                    &up_fused,
+                ),
+                (
+                    "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight",
+                    &down,
+                ),
+                ("lora_unet_double_blocks_0_img_attn_qkv.alpha", &alpha),
+            ],
+            none,
+            &bfl_path,
+        )
+        .unwrap();
+        let peft_path = tmp("bfl_qkv_split_peft.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
+                    &up_q,
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+                    &down,
+                ),
+                ("transformer.transformer_blocks.0.attn.to_q.alpha", &alpha),
+                (
+                    "transformer.transformer_blocks.0.attn.to_k.lora_B.weight",
+                    &up_k,
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_k.lora_A.weight",
+                    &down,
+                ),
+                ("transformer.transformer_blocks.0.attn.to_k.alpha", &alpha),
+                (
+                    "transformer.transformer_blocks.0.attn.to_v.lora_B.weight",
+                    &up_v,
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_v.lora_A.weight",
+                    &down,
+                ),
+                ("transformer.transformer_blocks.0.attn.to_v.alpha", &alpha),
+            ],
+            none,
+            &peft_path,
+        )
+        .unwrap();
+
+        let mut tb = test_transformer(1, 0);
+        let rb = crate::adapters::apply_flux_adapters(
+            &mut tb,
+            &[AdapterSpec {
+                path: bfl_path,
+                scale: 0.8,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .unwrap();
+        assert_eq!(rb.applied, 3, "fused qkv → 3 split targets");
+        assert!(rb.unmatched_paths.is_empty());
+
+        let mut tp = test_transformer(1, 0);
+        crate::adapters::apply_flux_adapters(
+            &mut tp,
+            &[AdapterSpec {
+                path: peft_path,
+                scale: 0.8,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .unwrap();
+
+        for tgt in ["to_q", "to_k", "to_v"] {
+            let segs = ["transformer_blocks", "0", "attn", tgt];
+            let (ba, bb) = lora_ab(tb.adaptable_mut(&segs).unwrap().adapters());
+            let (pa, pb) = lora_ab(tp.adaptable_mut(&segs).unwrap().adapters());
+            assert!(
+                array_eq(&ba, &pa, false).unwrap().item::<bool>()
+                    && array_eq(&bb, &pb, false).unwrap().item::<bool>(),
+                "BFL split ≠ diffusers split at {tgt}"
+            );
+        }
+    }
+
+    /// sc-2743: the FLUX.1-specific 4-way `single_blocks.{n}.linear1` → `to_q/to_k/to_v` + `proj_mlp`
+    /// split reconstructs byte-identically to the diffusers split-target file (the `Dims` boundaries).
+    #[test]
+    fn bfl_fused_single_linear1_matches_diffusers_split() {
+        let none = None as Option<&HashMap<String, String>>;
+        let (r, inp) = (2i32, 8i32);
+        let dims = [DIM, DIM, DIM, 4 * DIM]; // q,k,v,mlp
+        let block = |rows: i32, seed: i32| -> Vec<f32> {
+            (0..rows * r)
+                .map(|i| (((i + seed) % 19) as f32 - 9.0) * 0.001)
+                .collect()
+        };
+        let parts: Vec<Vec<f32>> = dims
+            .iter()
+            .enumerate()
+            .map(|(j, &d)| block(d, j as i32 * 7))
+            .collect();
+        let mut fused = Vec::new();
+        for p in &parts {
+            fused.extend_from_slice(p);
+        }
+        let up_fused = Array::from_slice(&fused, &[dims.iter().sum::<i32>(), r]);
+        let down = Array::from_slice(
+            &(0..r * inp)
+                .map(|i| (i as f32 - 4.0) * 0.002)
+                .collect::<Vec<_>>(),
+            &[r, inp],
+        );
+        let alpha = Array::from_slice(&[8.0f32], &[1]);
+
+        let bfl_path = tmp("bfl_single.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "lora_unet_single_blocks_0_linear1.lora_up.weight",
+                    &up_fused,
+                ),
+                ("lora_unet_single_blocks_0_linear1.lora_down.weight", &down),
+                ("lora_unet_single_blocks_0_linear1.alpha", &alpha),
+            ],
+            none,
+            &bfl_path,
+        )
+        .unwrap();
+
+        let split_targets = ["attn.to_q", "attn.to_k", "attn.to_v", "proj_mlp"];
+        let mut peft: Vec<(String, Array)> = Vec::new();
+        for (j, tgt) in split_targets.iter().enumerate() {
+            let up = Array::from_slice(&parts[j], &[dims[j], r]);
+            peft.push((
+                format!("transformer.single_transformer_blocks.0.{tgt}.lora_B.weight"),
+                up,
+            ));
+            peft.push((
+                format!("transformer.single_transformer_blocks.0.{tgt}.lora_A.weight"),
+                down.clone(),
+            ));
+            peft.push((
+                format!("transformer.single_transformer_blocks.0.{tgt}.alpha"),
+                alpha.clone(),
+            ));
+        }
+        let peft_path = tmp("bfl_single_split_peft.safetensors");
+        Array::save_safetensors(
+            peft.iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect::<Vec<_>>(),
+            none,
+            &peft_path,
+        )
+        .unwrap();
+
+        let mut tb = test_transformer(0, 1);
+        let rb = crate::adapters::apply_flux_adapters(
+            &mut tb,
+            &[AdapterSpec {
+                path: bfl_path,
+                scale: 0.8,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .unwrap();
+        assert_eq!(rb.applied, 4, "fused linear1 → 4 split targets");
+        assert!(rb.unmatched_paths.is_empty());
+
+        let mut tp = test_transformer(0, 1);
+        crate::adapters::apply_flux_adapters(
+            &mut tp,
+            &[AdapterSpec {
+                path: peft_path,
+                scale: 0.8,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .unwrap();
+
+        for tgt in split_targets {
+            let path = format!("single_transformer_blocks.0.{tgt}");
+            let segs: Vec<&str> = path.split('.').collect();
+            let (ba, bb) = lora_ab(tb.adaptable_mut(&segs).unwrap().adapters());
+            let (pa, pb) = lora_ab(tp.adaptable_mut(&segs).unwrap().adapters());
+            assert!(
+                array_eq(&ba, &pa, false).unwrap().item::<bool>()
+                    && array_eq(&bb, &pb, false).unwrap().item::<bool>(),
+                "BFL 4-way split ≠ diffusers split at {tgt}"
+            );
+        }
+    }
+
+    /// scale-0 application is a bit-exact no-op at a resolved Linear, and a mixed LoRA+LoKr spec list
+    /// installs both; an off-surface target errors (strict no-silent-drop).
+    #[test]
+    fn scale_zero_noop_mixed_stack_and_strict() {
+        // scale-0: a no-op adapter installed on a resolved linear leaves its forward unchanged.
+        let mut t = test_transformer(1, 0);
+        let x = Array::from_slice(&[1.0f32], &[1, 1]);
+        let base = t
+            .adaptable_mut(&["transformer_blocks", "0", "attn", "to_q"])
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        install_adapter(
+            &mut t,
+            "transformer_blocks.0.attn.to_q",
+            Adapter::Lora {
+                a: Array::from_slice(&[0.0f32], &[1, 1]),
+                b: Array::from_slice(&[0.0f32], &[1, 1]),
+                scale: 0.0,
+            },
+        )
+        .unwrap();
+        let after = t
+            .adaptable_mut(&["transformer_blocks", "0", "attn", "to_q"])
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        assert!(
+            array_eq(&base, &after, false).unwrap().item::<bool>(),
+            "scale-0 adapter must be a bit-exact no-op"
+        );
+
+        // Mixed LoRA + LoKr spec list targeting two distinct FLUX.1 modules applies both.
+        let lora_path = tmp("mix_lora.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "transformer.transformer_blocks.0.attn.to_v.lora_A.weight",
+                    &Array::from_slice(&[0.1f32], &[1, 1]),
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_v.lora_B.weight",
+                    &Array::from_slice(&[0.2f32], &[1, 1]),
+                ),
+            ],
+            None as Option<&HashMap<String, String>>,
+            &lora_path,
+        )
+        .unwrap();
+        let mut meta = HashMap::new();
+        meta.insert("networkType".to_string(), "lokr".to_string());
+        meta.insert("alpha".to_string(), "1.0".to_string());
+        meta.insert("rank".to_string(), "1".to_string());
+        let lokr_path = tmp("mix_lokr.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "transformer_blocks.0.ff.linear1.lokr_w1",
+                    &Array::from_slice(&[0.5f32], &[1, 1]),
+                ),
+                (
+                    "transformer_blocks.0.ff.linear1.lokr_w2",
+                    &Array::from_slice(&[0.3f32], &[1, 1]),
+                ),
+            ],
+            Some(&meta),
+            &lokr_path,
+        )
+        .unwrap();
+        let mut t2 = test_transformer(1, 0);
+        let report = crate::adapters::apply_flux_adapters(
+            &mut t2,
+            &[
+                AdapterSpec {
+                    path: lora_path,
+                    scale: 1.0,
+                    kind: AdapterKind::Lora,
+                },
+                AdapterSpec {
+                    path: lokr_path,
+                    scale: 1.0,
+                    kind: AdapterKind::Lokr,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(report.applied, 2, "mixed LoRA + LoKr both apply");
+        assert!(report.unmatched_paths.is_empty());
+
+        // Strict no-silent-drop: an off-surface target errors.
+        let miss = tmp("miss.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "transformer.transformer_blocks.0.nope.lora_A.weight",
+                    &Array::from_slice(&[0.1f32], &[1, 1]),
+                ),
+                (
+                    "transformer.transformer_blocks.0.nope.lora_B.weight",
+                    &Array::from_slice(&[0.2f32], &[1, 1]),
+                ),
+            ],
+            None as Option<&HashMap<String, String>>,
+            &miss,
+        )
+        .unwrap();
+        let mut t3 = test_transformer(1, 0);
+        assert!(crate::adapters::apply_flux_adapters(
+            &mut t3,
+            &[AdapterSpec {
+                path: miss,
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .is_err());
     }
 }
