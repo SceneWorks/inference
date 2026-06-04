@@ -27,7 +27,9 @@
 //! Everything runs **f32** (quality target; the reference VAE is gated in f32). The parity gate
 //! honors "divergence is not rounding" — any >1% gap gets root-caused, not written off.
 
-use mlx_rs::ops::{add, concatenate_axis, divide, mean_axes, multiply, pad, subtract, sum_axes};
+use mlx_rs::ops::{
+    add, concatenate_axis, divide, maximum, mean_axes, multiply, pad, subtract, sum_axes,
+};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{conv3d, silu};
@@ -35,6 +37,7 @@ use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{Error, Result};
 
 use crate::config::{LtxVaeConfig, VaeBlock};
+use crate::tiling::TilingConfig;
 
 /// Decoder inline `pixel_norm` epsilon (`decoder.py` `ResnetBlock3DSimple.pixel_norm`).
 const DEC_NORM_EPS: f32 = 1e-8;
@@ -59,10 +62,15 @@ fn contiguous(x: &Array) -> Result<Array> {
     Ok(x.reshape(&[-1])?.reshape(&shape)?)
 }
 
+/// Slice `x` along `axis` to `[start, end)`.
+fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
+    let idx: Vec<i32> = (start..end).collect();
+    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), axis)?)
+}
+
 /// Temporal slice `x[:, :, start:end]` (axis 2).
 fn slice_t(x: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 2)?)
+    slice_axis(x, 2, start, end)
 }
 
 /// `x / sqrt(mean(x² over C, axis 1, keepdims) + eps)` — LTX PixelNorm (no √C scale, no γ).
@@ -479,8 +487,7 @@ impl VideoEncoder {
 
 /// Channel slice `x[:, start:end]` (axis 1).
 fn slice_c(x: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
+    slice_axis(x, 1, start, end)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -549,6 +556,80 @@ impl LtxVideoVae {
             .as_ref()
             .ok_or_else(|| Error::Msg("LtxVideoVae: encode requires encoder weights".into()))?;
         contiguous(&enc.encode(video)?)
+    }
+
+    /// Decode with **tiling** for memory-bounded large/long-video decode (`cfg`). Splits the latent
+    /// into overlapping spatial/temporal tiles, decodes each, and trapezoidally blends them. Falls
+    /// back to the single-pass [`decode`](Self::decode) when `cfg` does not fire for these dims.
+    pub fn decode_tiled(&self, latent: &Array, cfg: &TilingConfig) -> Result<Array> {
+        let sh = latent.shape();
+        let (f, h, w) = (sh[2], sh[3], sh[4]);
+        if !cfg.needs_tiling(f, h, w) {
+            return self.decode(latent);
+        }
+        let plan = cfg.plan(f, h, w);
+
+        // Full-size accumulators (the reference allocates these too); pad-and-add each tile in turn.
+        // `output` carries the batch; `weights` stays `b=1` and broadcasts on the final divide.
+        let mut output: Option<Array> = None; // [b, 3, out_f, out_h, out_w]
+        let mut weights: Option<Array> = None; // [1, 1, out_f, out_h, out_w]
+
+        for t in &plan.t {
+            for hh in &plan.h {
+                for ww in &plan.w {
+                    let tile = slice_axis(latent, 2, t.start, t.end)?;
+                    let tile = slice_axis(&tile, 3, hh.start, hh.end)?;
+                    let tile = slice_axis(&tile, 4, ww.start, ww.end)?;
+                    let dec = self.decoder.decode(&tile)?; // [b, 3, td, hd, wd]
+
+                    let ds = dec.shape();
+                    let at = ds[2].min(t.out_stop - t.out_start);
+                    let ah = ds[3].min(hh.out_stop - hh.out_start);
+                    let aw = ds[4].min(ww.out_stop - ww.out_start);
+
+                    // 1-D masks → outer product [1, 1, at, ah, aw].
+                    let tm = Array::from_slice(&t.mask[..at as usize], &[1, 1, at, 1, 1]);
+                    let hm = Array::from_slice(&hh.mask[..ah as usize], &[1, 1, 1, ah, 1]);
+                    let wm = Array::from_slice(&ww.mask[..aw as usize], &[1, 1, 1, 1, aw]);
+                    let blend = multiply(&multiply(&tm, &hm)?, &wm)?;
+
+                    let dec = slice_axis(&dec, 2, 0, at)?;
+                    let dec = slice_axis(&dec, 3, 0, ah)?;
+                    let dec = slice_axis(&dec, 4, 0, aw)?;
+                    let weighted = multiply(&dec, &blend)?; // [b, 3, at, ah, aw]
+
+                    // Place at (out_start) offsets via zero-pad to the full output shape.
+                    let pads = [
+                        (0, 0),
+                        (0, 0),
+                        (t.out_start, plan.out_f - (t.out_start + at)),
+                        (hh.out_start, plan.out_h - (hh.out_start + ah)),
+                        (ww.out_start, plan.out_w - (ww.out_start + aw)),
+                    ];
+                    let weighted_full = pad(&weighted, &pads[..], None, None)?;
+                    let blend_full = pad(&blend, &pads[..], None, None)?;
+
+                    output = Some(match output {
+                        None => weighted_full,
+                        Some(acc) => add(&acc, &weighted_full)?,
+                    });
+                    weights = Some(match weights {
+                        None => blend_full,
+                        Some(acc) => add(&acc, &blend_full)?,
+                    });
+                    // Keep the lazy graph + peak memory bounded (mirrors the reference mx.eval).
+                    let out_ref = output.as_ref().unwrap();
+                    let w_ref = weights.as_ref().unwrap();
+                    out_ref.eval()?;
+                    w_ref.eval()?;
+                }
+            }
+        }
+
+        let output = output.expect("at least one tile");
+        let weights = weights.expect("at least one tile");
+        let normed = divide(&output, &maximum(&weights, scalar(1e-8))?)?;
+        contiguous(&normed)
     }
 
     /// Whether the encoder is loaded.
