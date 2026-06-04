@@ -10,11 +10,13 @@
 //! Gates the story's "acceleration-LoRA viability on that path":
 //! (1) the PEFT-format Hyper-FLUX LoRA — which targets the top-level GLOBAL projections the fork's
 //!     `FluxLoRAMapping` omits — resolves the FULL surface with ZERO unmatched keys (504 targets);
-//! (2) a scale-0 Hyper LoRA is a bit-exact no-op;
-//! (3) injecting the diffusers golden's init + prompt embeds + sigmas, our transformer (Hyper LoRA at
-//!     scale 0.125) + flow-match loop reproduces the diffusers final latents within the CROSS-BACKEND
-//!     few-step bound (torch ↔ our MLX build is NOT bit-exact — 8 chaotic steps amplify the ~1e-3
-//!     backend delta), and the decoded image is structurally on-prompt (saved PNG for visual parity);
+//! (2) a scale-0 Hyper LoRA is a NEAR no-op (the residual is mathematically zero; only the fork-
+//!     faithful bf16→f32 conditioning-path promotion remains — not bit-exact, see the test doc);
+//! (3) injecting the diffusers golden's init + prompt embeds + sigmas, the Hyper LoRA pulls our
+//!     few-step render TOWARD the diffusers Hyper reference (and away from the base) with a large
+//!     effect — the directional gate, since there is no MLX Hyper-FLUX reference (the fork can't load
+//!     this global LoRA) and the torch reference is NOT bit-exact (cross-backend + diffusers fuses the
+//!     LoRA into bf16 while we residual in f32); the decoded PNG is saved for visual parity;
 //! (4) the public `load(hyper LoRA).generate(sampler="hyper")` render visibly differs from the base
 //!     8-step no-LoRA render — the LoRA + globals flow through end-to-end, not silently dropped.
 
@@ -54,7 +56,8 @@ fn hyper_lora() -> PathBuf {
 }
 
 fn golden() -> Weights {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/golden/flux1_dev_hyper_golden.safetensors");
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../tools/golden/flux1_dev_hyper_golden.safetensors");
     Weights::from_file(p).expect("run tools/dump_hyper_flux_golden.py first")
 }
 
@@ -121,7 +124,9 @@ fn hyper_flux_lora_resolves_all_targets_no_unmatched() {
         "Hyper-FLUX left unmatched keys: {:?}",
         report.unmatched_paths
     );
-    println!("✓ Hyper-FLUX PEFT LoRA resolves all 504 targets (494 blocks + 10 globals), 0 unmatched");
+    println!(
+        "✓ Hyper-FLUX PEFT LoRA resolves all 504 targets (494 blocks + 10 globals), 0 unmatched"
+    );
 }
 
 /// (2) A scale-0 Hyper LoRA is a NEAR no-op — the residual `scale·x·A·B` is mathematically zero, so
@@ -159,7 +164,11 @@ fn injected_latents(g: &Weights, scale: Option<f32>) -> Array {
 
     let mut t = load_transformer(&snapshot(), FluxVariant::Dev).unwrap();
     if let Some(s) = scale {
-        apply_flux_adapters(&mut t, &[AdapterSpec::new(hyper_lora(), s, AdapterKind::Lora)]).unwrap();
+        apply_flux_adapters(
+            &mut t,
+            &[AdapterSpec::new(hyper_lora(), s, AdapterKind::Lora)],
+        )
+        .unwrap();
     }
     let pe = f32a(g.require("prompt_embeds").unwrap());
     let pooled = f32a(g.require("pooled_prompt_embeds").unwrap());
@@ -169,7 +178,11 @@ fn injected_latents(g: &Weights, scale: Option<f32>) -> Array {
             .forward(&latents, &pe, &pooled, sigmas[i], guidance, w, h)
             .unwrap();
         let dt = sigmas[i + 1] - sigmas[i];
-        latents = add(&latents, multiply(&v, Array::from_slice(&[dt], &[1])).unwrap()).unwrap();
+        latents = add(
+            &latents,
+            multiply(&v, Array::from_slice(&[dt], &[1])).unwrap(),
+        )
+        .unwrap();
     }
     latents
 }
@@ -216,7 +229,10 @@ fn hyper_flux_injected_denoise_matches_diffusers() {
     save_png("rust_hyper_flux_injected.png", &hyper_px, w, h);
 
     // Informational: the absolute cross-backend latent/image divergence (see the doc comment).
-    let base_mr = mean_abs_rel(&injected_latents(&g, None), g.require("base_final_latents").unwrap());
+    let base_mr = mean_abs_rel(
+        &injected_latents(&g, None),
+        g.require("base_final_latents").unwrap(),
+    );
     let hyper_mr = mean_abs_rel(&hyper_lat, g.require("final_latents").unwrap());
     println!("[info] cross-backend latent mean_rel — base floor {base_mr:.3e} | hyper {hyper_mr:.3e} (diffusers fuses bf16, we residual f32)");
 
@@ -275,8 +291,12 @@ fn hyper_flux_public_render_differs_from_base() {
     let base = pixels(LoadSpec::new(WeightsSource::Dir(snapshot())), None);
     save_png("rust_hyper_flux_base_no_lora.png", &base, w, h);
     // Hyper: the same 8 steps with the Hyper LoRA @ 0.125 + sampler="hyper".
-    let hyper_spec = LoadSpec::new(WeightsSource::Dir(snapshot()))
-        .with_adapters(vec![AdapterSpec::new(hyper_lora(), lora_scale, AdapterKind::Lora)]);
+    let hyper_spec =
+        LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![AdapterSpec::new(
+            hyper_lora(),
+            lora_scale,
+            AdapterKind::Lora,
+        )]);
     let hyper = pixels(hyper_spec, Some("hyper"));
     save_png("rust_hyper_flux_public.png", &hyper, w, h);
 

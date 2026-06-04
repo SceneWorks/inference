@@ -1417,14 +1417,17 @@ mod tests {
             "time_text_embed.guidance_embedder.linear_1",
             "time_text_embed.guidance_embedder.linear_2",
         ] {
-            assert!(resolves(&mut t, p), "expected global {p} to resolve (sc-2908)");
+            assert!(
+                resolves(&mut t, p),
+                "expected global {p} to resolve (sc-2908)"
+            );
         }
         for p in [
-            "time_text_embed.timestep.linear_1",       // internal field name, not the file's *_embedder
-            "transformer_blocks.19.attn.to_q",         // out of range (19 joint blocks: 0..18)
-            "single_transformer_blocks.38.proj_out",   // out of range (38 single blocks: 0..37)
-            "transformer_blocks.0.attn.add_q",         // internal field, not the file's add_q_proj
-            "transformer_blocks.0.attn.qkv",           // fused name — FLUX.1 model is split
+            "time_text_embed.timestep.linear_1", // internal field name, not the file's *_embedder
+            "transformer_blocks.19.attn.to_q",   // out of range (19 joint blocks: 0..18)
+            "single_transformer_blocks.38.proj_out", // out of range (38 single blocks: 0..37)
+            "transformer_blocks.0.attn.add_q",   // internal field, not the file's add_q_proj
+            "transformer_blocks.0.attn.qkv",     // fused name — FLUX.1 model is split
             "single_transformer_blocks.0.attn.to_out", // single attn has no separate output proj
         ] {
             assert!(!resolves(&mut t, p), "expected {p} NOT to resolve");
@@ -1439,7 +1442,11 @@ mod tests {
     fn adaptable_paths_resolve_and_flatten_uniquely() {
         let t = test_transformer(19, 38);
         let paths = t.adaptable_paths();
-        assert_eq!(paths.len(), 19 * 14 + 38 * 6 + 10, "full kohya surface count (blocks + globals)");
+        assert_eq!(
+            paths.len(),
+            19 * 14 + 38 * 6 + 10,
+            "full kohya surface count (blocks + globals)"
+        );
         let mut probe = test_transformer(19, 38);
         for p in &paths {
             assert!(

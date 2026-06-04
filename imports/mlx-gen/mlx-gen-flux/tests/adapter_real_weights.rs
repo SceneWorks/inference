@@ -165,7 +165,10 @@ fn routing_map_covers_full_fork_surface() {
         "time_text_embed.timestep_embedder.linear_1",
         "time_text_embed.guidance_embedder.linear_2",
     ] {
-        assert!(resolves(&mut t, p), "expected global {p} to resolve (sc-2908)");
+        assert!(
+            resolves(&mut t, p),
+            "expected global {p} to resolve (sc-2908)"
+        );
     }
     for p in [
         "transformer_blocks.19.attn.to_q",
