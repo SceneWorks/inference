@@ -7,7 +7,8 @@
 //!
 //! Two gates:
 //! - `few_step_renders_are_coherent` (acceptance): load SDXL + each accel LoRA, render at the locked
-//!   4-step default, and assert the image is non-degenerate (finite, structured, sane mean). Writes
+//!   per-variant default (sc-2758: LCM 8-step, Lightning/Hyper 4-step), and assert the image is
+//!   non-degenerate (finite, structured, sane mean). Writes
 //!   PNGs to `tools/golden/` for eyeball review. This is the "renders correct few-step output" check
 //!   — bit-exact parity vs a torch reference is impossible (different backend), so the
 //!   *deterministic* parity number is the separate diagnostic below.
@@ -65,12 +66,14 @@ fn lora_spec(path: PathBuf, scale: f32) -> AdapterSpec {
 fn variants() -> Vec<(&'static str, PathBuf, u32)> {
     vec![
         (
+            // sc-2758 locks LCM's default at 8 steps (4 is too soft); the LCM-LoRA is step-free, so
+            // the same single LoRA drives any step count.
             "lcm",
             cache_file(
                 "latent-consistency/lcm-lora-sdxl",
                 "pytorch_lora_weights.safetensors",
             ),
-            4,
+            8,
         ),
         (
             "lightning",
@@ -130,7 +133,8 @@ fn few_step_renders_are_coherent() {
             height: h,
             seed: Some(seed),
             sampler: Some(sampler.to_string()),
-            // steps/guidance default to the per-variant table (4-step / CFG 1).
+            // steps/guidance left unset → the per-variant default table (sc-2758: LCM 8, Lightning/
+            // Hyper 4; CFG 1). The `variants()` step count is what we assert was actually run.
             ..Default::default()
         };
         let mut last = 0u32;
