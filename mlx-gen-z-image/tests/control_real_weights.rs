@@ -247,7 +247,7 @@ fn control_denoise_loop_matches_golden() {
 
 /// DIAGNOSTIC (sc-2720): control denoise under three input-dtype regimes on the same build, vs the
 /// fork's golden — documenting WHY the dtype matters. The fork runs **mixed precision**: bf16 latents
-/// + bf16 cap_feats, but **f32 control_context** (verified against the fork), so the control branch
+/// and cap_feats, but **f32 control_context** (verified against the fork), so the control branch
 /// promotes to f32 and the latents become f32 after step 0. Reproducing that (the `mixed` row) is
 /// what `generate` does and is the closest to the fork. `pure f32` (the old whole-path forcing) is
 /// close but runs the base embeddings in f32 too. `pure bf16` (forcing the control branch to bf16,
