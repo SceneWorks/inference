@@ -5,16 +5,23 @@
 //! transformer via the reference `LoRALinear` (residual over the Q8 base, strength 1.0) and runs the
 //! **native bf16 + Q8** 2-stage distilled denoise from the committed e2e golden's injected inputs →
 //! `tests/fixtures/ltx_lora_golden.safetensors`. The Rust port stacks the same residuals
-//! ([`apply_ltx_adapters`] → [`LtxDiT`] forward) at `Precision::Bf16Q8`, so the chaos-sensitive
-//! stage-1 must reproduce the reference per-forward bit-for-bit.
+//! ([`apply_ltx_adapters`] → [`LtxDiT`] forward) at `Precision::quant_bf16`, so the chaos-sensitive
+//! stage-1 must reproduce the reference per-forward bit-for-bit. The residual math is a pure
+//! per-Linear forward add, identical for the video-only [`LtxDiT`] and the production [`AvDiT`], so a
+//! bit-exact `LtxDiT` gate + a full-surface `AvDiT` routing gate together cover the production path.
 //!
-//! Default LoRA = `LTX2.3_Crisp_Enhance` (attn + ff + gate, 576 video targets, no audio/adaLN).
-//! Override with `LTX_LORA=/path/to/lora.safetensors` (and regenerate the golden the same way).
+//! Default video LoRA = `LTX2.3_Crisp_Enhance` (attn + ff + gate, 576 video targets, no audio/adaLN);
+//! default multi-surface LoRA = `Samantha_ltx2.3` (also trains audio + cross-modal). Override with
+//! `LTX_LORA` / `LTX_LORA_MULTI` (regenerate the golden the same way for a different `LTX_LORA`).
 //!
-//! Gates (all `#[ignore]`, ~20 GB model + the 705 MB LoRA):
+//! Gates (all `#[ignore]`, ~20 GB model + the LoRA):
 //!  1. `lora_routing_resolves_full_crisp_surface` — every Crisp target resolves (applied 576, 0 skipped).
 //!  2. `lora_frames_match_reference` — bit-exact final latents + frames px>8 < 1% vs the golden.
-//!  3. `lora_per_pass_strength_changes_output` — a `[1.0, 0.0]` per-pass schedule (stage-2 LoRA off)
+//!  3. `lora_multi_surface_skips_audio_without_error` — on the video-only `LtxDiT` building block, a
+//!     LoRA's audio targets are reported skipped, never errored.
+//!  4. `lora_full_surface_routes_on_avdit` — on the production `AvDiT`, the same LoRA's audio +
+//!     cross-modal targets all resolve (1632, 0 skipped).
+//!  5. `lora_per_pass_strength_changes_output` — a `[1.0, 0.0]` per-pass schedule (stage-2 LoRA off)
 //!     diverges from the uniform golden, proving the per-pass wiring drives the pipeline.
 //!
 //! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test lora_real_weights -- --ignored --nocapture`
@@ -25,10 +32,10 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::adapters::apply_ltx_adapters;
-use mlx_gen_ltx::config::{LtxConfig, LtxVaeConfig};
+use mlx_gen_ltx::config::{LtxConfig, LtxVaeConfig, SplitModel};
 use mlx_gen_ltx::pipeline::{decode_to_frames, generate_t2v_latents, NUM_DENOISE_PASSES};
 use mlx_gen_ltx::positions::create_position_grid;
-use mlx_gen_ltx::transformer::{LtxDiT, Precision};
+use mlx_gen_ltx::transformer::{AvDiT, LtxDiT, Precision};
 use mlx_gen_ltx::upsampler::LatentUpsampler;
 use mlx_gen_ltx::vae::LtxVideoVae;
 
@@ -53,6 +60,17 @@ fn lora_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap();
     std::path::PathBuf::from(home).join(
         "Library/Application Support/SceneWorks/data/loras/crisp_enhance/LTX2.3_Crisp_Enhance.safetensors",
+    )
+}
+
+/// A multi-surface LoRA that also trains the audio + cross-modal stacks (default `Samantha_ltx2.3`).
+fn multi_lora_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("LTX_LORA_MULTI") {
+        return p.into();
+    }
+    let home = std::env::var("HOME").unwrap();
+    std::path::PathBuf::from(home).join(
+        "Library/Application Support/SceneWorks/data/loras/samantha/Samantha_ltx2.3.safetensors",
     )
 }
 
@@ -86,8 +104,10 @@ fn dit_with_adapters(
     specs: &[AdapterSpec],
 ) -> (LtxDiT, mlx_gen_ltx::LtxLoraReport) {
     let cfg = LtxConfig::from_model_dir(dir).expect("config");
+    let split = SplitModel::from_model_dir(dir).expect("split_model.json");
     let tw = Weights::from_file(dir.join("transformer.safetensors")).expect("transformer");
-    let mut dit = LtxDiT::from_weights(&tw, &cfg, Precision::Bf16Q8).expect("dit");
+    let mut dit = LtxDiT::from_weights(&tw, &cfg, Precision::quant_bf16(split.bits, split.group))
+        .expect("dit");
     let report = apply_ltx_adapters(&mut dit, specs, NUM_DENOISE_PASSES).expect("apply adapters");
     (dit, report)
 }
@@ -190,15 +210,12 @@ fn lora_multi_surface_skips_audio_without_error() {
     // never errored (the reference `apply_loras_to_weights` likewise only counts skips). This guards
     // the "full capability, no silent error" property: loading a production LoRA must not blow up.
     let dir = base_dir();
-    let home = std::env::var("HOME").unwrap();
-    let multi = std::env::var("LTX_LORA_MULTI").map(Into::into).unwrap_or_else(|_| {
-        std::path::PathBuf::from(home)
-            .join("Library/Application Support/SceneWorks/data/loras/samantha/Samantha_ltx2.3.safetensors")
-    });
-    let (_dit, report) =
-        dit_with_adapters(&dir, &[AdapterSpec::new(multi, 1.0, AdapterKind::Lora)]);
+    let (_dit, report) = dit_with_adapters(
+        &dir,
+        &[AdapterSpec::new(multi_lora_path(), 1.0, AdapterKind::Lora)],
+    );
     eprintln!(
-        "multi-surface routing: applied={} skipped={}",
+        "video-only (LtxDiT) routing: applied={} skipped={}",
         report.applied,
         report.skipped.len()
     );
@@ -218,6 +235,41 @@ fn lora_multi_surface_skips_audio_without_error() {
             .iter()
             .all(|p| p.contains("audio") || p.contains("av_ca") || p.contains("a2v")),
         "skipped set must be exactly the audio/cross-modal targets"
+    );
+}
+
+#[test]
+#[ignore = "needs ltx_2_3_base_q8 (~20 GB) + a multi-surface LTX LoRA with audio (default Samantha)"]
+fn lora_full_surface_routes_on_avdit() {
+    // On the **production** dual-modality AvDiT (sc-2684), the same Samantha LoRA's audio + cross-modal
+    // targets now RESOLVE (vs skipped on the video-only LtxDiT building block above): 576 video +
+    // 1056 audio/cross-modal (audio_attn1/2 + audio_ff + audio_to_video_attn + video_to_audio_attn,
+    // 22 per block × 48) = 1632, no skips. Proves the full-surface routing (sc-2687 over sc-2684).
+    let dir = base_dir();
+    let cfg = LtxConfig::from_model_dir(&dir).expect("config");
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
+    let tw = Weights::from_file(dir.join("transformer.safetensors")).expect("transformer");
+    let mut dit = AvDiT::from_weights(&tw, &cfg, Precision::quant_bf16(split.bits, split.group))
+        .expect("avdit");
+    let report = apply_ltx_adapters(
+        &mut dit,
+        &[AdapterSpec::new(multi_lora_path(), 1.0, AdapterKind::Lora)],
+        NUM_DENOISE_PASSES,
+    )
+    .expect("apply adapters");
+    eprintln!(
+        "AvDiT full-surface routing: applied={} skipped={}",
+        report.applied,
+        report.skipped.len()
+    );
+    assert_eq!(
+        report.applied, 1632,
+        "576 video + 1056 audio/cross-modal targets all resolve on AvDiT"
+    );
+    assert!(
+        report.skipped.is_empty(),
+        "no Samantha target should be skipped on AvDiT: {:?}",
+        report.skipped
     );
 }
 

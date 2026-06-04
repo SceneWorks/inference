@@ -31,7 +31,7 @@ use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
-use crate::transformer::LtxDiT;
+use crate::transformer::LtxAdaptable;
 
 /// LoRA key namespace prefixes stripped (longest-first), matching the reference
 /// `_normalize_ltx_lora_key`. SceneWorks' trained LTX LoRAs use `diffusion_model.`.
@@ -128,9 +128,9 @@ fn pass_scales(spec: &AdapterSpec, alpha: f32, rank: f32, num_passes: usize) -> 
     }
 }
 
-/// Install one LoRA file's residuals onto `dit` at `spec`'s strength, accumulating into `report`.
+/// Install one LoRA file's residuals onto `host` at `spec`'s strength, accumulating into `report`.
 fn apply_one(
-    dit: &mut LtxDiT,
+    host: &mut impl LtxAdaptable,
     w: &Weights,
     spec: &AdapterSpec,
     num_passes: usize,
@@ -164,7 +164,7 @@ fn apply_one(
         let rank = down.shape()[0] as f32;
         let alpha = parts.alpha.unwrap_or(rank);
         let scales = pass_scales(spec, alpha, rank, num_passes)?;
-        match dit.adaptable_mut(&segs) {
+        match host.adaptable_mut(&segs) {
             Some(lin) => {
                 // Residual form: a = Aᵀ [in, rank], b = Bᵀ [rank, out]; factors keep their loaded
                 // (bf16) dtype so the residual promotes against the activation like the reference.
@@ -182,7 +182,7 @@ fn apply_one(
 /// if a LoKr file is supplied (sc-2393) or if a non-empty spec list matched no target module
 /// (a format/prefix misconfiguration); per-key skips are reported, not fatal.
 pub fn apply_ltx_adapters(
-    dit: &mut LtxDiT,
+    host: &mut impl LtxAdaptable,
     specs: &[AdapterSpec],
     num_passes: usize,
 ) -> Result<LtxLoraReport> {
@@ -196,7 +196,7 @@ pub fn apply_ltx_adapters(
                 spec.path.display()
             )));
         }
-        apply_one(dit, &w, spec, num_passes, &mut report)?;
+        apply_one(host, &w, spec, num_passes, &mut report)?;
     }
     if !specs.is_empty() && report.applied == 0 {
         return Err(Error::Msg(format!(

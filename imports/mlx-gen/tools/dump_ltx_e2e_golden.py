@@ -12,9 +12,16 @@ the port's correctness isolated from bf16 rounding, mirroring the S3b/S5 gates. 
 **MUST run with mlx 0.31.2** (`quantized_matmul` changed 0.31.0→0.31.2). Run PHASE A first:
     MLX_VIDEO_SRC=~/.cache/uv/archive-v0/DtG1XO51ABFxUGHg ~/Repos/mflux/.venv/bin/python tools/dump_ltx_e2e_te.py
     MLX_VIDEO_SRC=~/.cache/uv/archive-v0/DtG1XO51ABFxUGHg /tmp/mlx312/bin/python tools/dump_ltx_e2e_golden.py
+
+`LTX_MODEL_DIR` selects the checkpoint; the quant bits/group ride on its `split_model.json` (sc-2686).
+Default = `ltx_2_3_base_q8` (writes the un-suffixed Q8 goldens). For the **Q4** acceptance goldens:
+    LTX_MODEL_DIR=…/ltx_2_3_base_q4 MLX_VIDEO_SRC=… /tmp/mlx312/bin/python tools/dump_ltx_e2e_golden.py
+    LTX_BF16=1 LTX_MODEL_DIR=…/ltx_2_3_base_q4 MLX_VIDEO_SRC=… /tmp/mlx312/bin/python tools/dump_ltx_e2e_golden.py
+→ `ltx_e2e_golden_q4.safetensors` (f32) + `ltx_e2e_golden_q4_bf16.safetensors` (bf16).
 """
 
 import glob
+import json
 import os
 import sys
 import types
@@ -53,7 +60,19 @@ from mlx_video.models.ltx.upsampler import load_upsampler, upsample_latents  # n
 from mlx_video.models.ltx.video_vae.decoder import load_vae_decoder  # noqa: E402
 from mlx_video.utils import to_denoised  # noqa: E402
 
-MODEL = Path.home() / "Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8"
+# `LTX_MODEL_DIR` selects the quantized checkpoint (default base_q8). The quant geometry rides on the
+# dir's `split_model.json` (sc-2686): base_q8 ⇒ bits 8, base_q4 ⇒ bits 4, group 64. The Q4 golden
+# (`_q4` suffix) is the sc-2686 acceptance target; the un-suffixed names stay the legacy Q8 goldens.
+MODEL = Path(
+    os.environ.get(
+        "LTX_MODEL_DIR",
+        str(Path.home() / "Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8"),
+    )
+)
+_split = json.loads((MODEL / "split_model.json").read_text())
+Q_BITS = int(_split.get("quantization_bits", 4))
+Q_GROUP = int(_split.get("quantization_group_size", 64))
+Q_SUFFIX = "" if Q_BITS == 8 else f"_q{Q_BITS}"
 STAGE1_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 STAGE2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 # 256×256, 9 frames → latent_frames 2, stage1 4×4, stage2 8×8.
@@ -65,7 +84,15 @@ LF, H1, W1, H2, W2 = 2, 4, 4, 8, 8
 BF16 = os.environ.get("LTX_BF16") == "1"
 ACT = mx.bfloat16 if BF16 else mx.float32
 
-te = mx.load(fixture("tools/golden/ltx_e2e_te.safetensors"))
+# TE conditioning (input_ids + video_embeddings) is **quant-independent** — the text encoder is the
+# bf16 Gemma backbone regardless of the transformer's quant level. PHASE A (`dump_ltx_e2e_te.py`)
+# writes `tools/golden/ltx_e2e_te.safetensors`, but that 24 GB run is transient; the committed Q8
+# e2e golden carries the same tensors, so the Q4 golden reuses the **identical** conditioning (and
+# seed-7 noise below) for a clean A/B vs Q8. `LTX_TE_FIXTURE` overrides the source explicitly.
+_te_path = Path(os.environ.get("LTX_TE_FIXTURE", fixture("tools/golden/ltx_e2e_te.safetensors")))
+if not _te_path.exists():
+    _te_path = Path(fixture("mlx-gen-ltx/tests/fixtures/ltx_e2e_golden.safetensors"))
+te = mx.load(str(_te_path))
 input_ids = te["input_ids"]
 context = te["video_embeddings"].astype(ACT)  # (1, 128, 4096)
 
@@ -98,7 +125,7 @@ model = LTXModel(config)
 raw = mx.load(str(MODEL / "transformer.safetensors"))
 video = {k: v for k, v in raw.items() if "audio" not in k and "av_ca" not in k and "a2v" not in k}
 qpaths = {k.rsplit(".", 1)[0] for k in video if k.endswith(".scales")}
-nn.quantize(model, group_size=64, bits=8,
+nn.quantize(model, group_size=Q_GROUP, bits=Q_BITS,
             class_predicate=lambda p, m: isinstance(m, nn.Linear) and p in qpaths)
 model.load_weights(list(video.items()), strict=False)
 _f32_acts(model)
@@ -179,8 +206,12 @@ tensors = {
     "final_latents": final_latents.astype(ACT),
     "frames": frames,
 }
-name = "ltx_e2e_golden_bf16.safetensors" if BF16 else "ltx_e2e_golden.safetensors"
+name = f"ltx_e2e_golden{Q_SUFFIX}{'_bf16' if BF16 else ''}.safetensors"
 out = fixture(f"mlx-gen-ltx/tests/fixtures/{name}")
 Path(out).parent.mkdir(parents=True, exist_ok=True)
-mx.save_safetensors(out, tensors, metadata={"res": "256x256", "frames": "9", "prec": str(ACT)})
+mx.save_safetensors(
+    out,
+    tensors,
+    metadata={"res": "256x256", "frames": "9", "prec": str(ACT), "bits": str(Q_BITS)},
+)
 print(f"wrote {out}")

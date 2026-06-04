@@ -13,12 +13,16 @@
 //! (`LayerNorm` affine-false + final 2-row `scale_shift_table` modulated by the embedded timestep) →
 //! `proj_out → 128` velocity. `denoised = latent − σ·velocity`.
 //!
-//! **Quant.** The shipped `base_q8` transformer stores the attn/ff Linears Q8-quantized (U32 +
-//! `scales` + `biases`, group 64) — there is no dense bf16 checkpoint. [`Precision::F32Q8`] is the
-//! production path: **f32 activations × Q8 `quantized_matmul`** (the port's quality target; a single
-//! block is bit-exact to the reference at matched mlx 0.31.2). [`Precision::F32`] additionally
-//! dequantizes the Q8 weights to dense f32 — the S3a block math gate. [`Precision::Bf16Q8`] mirrors
-//! the reference's own bf16 compute, retained for diagnostics.
+//! **Quant.** The shipped transformer stores the attn/ff Linears selectively quantized (U32 +
+//! `scales` + `biases`) — there is no dense bf16 checkpoint. The **bits/group ride on the checkpoint's
+//! `split_model.json`** ([`crate::config::SplitModel`]): `base_q8`/`eros`-style at 8 bits, `base_q4`
+//! at 4 bits, group 64 — read into [`Precision`], never hardcoded (sc-2686). The per-Linear predicate
+//! (quantize iff the weights carry `.scales`) mirrors `generate_av.py`'s `_should_quantize`.
+//!
+//! [`Precision::quant_f32`] is the production quality target: **f32 activations × `quantized_matmul`**
+//! (a single block is bit-exact to the reference at matched mlx 0.31.2). [`Precision::quant_bf16`]
+//! mirrors the reference's own bf16 compute (the production-speed path). [`Precision::dense_f32`]
+//! additionally dequantizes the weights to dense f32 — the S3a block-math gate.
 
 use std::cell::Cell;
 
@@ -36,39 +40,72 @@ use mlx_gen::Result;
 use crate::config::LtxConfig;
 use crate::rope::{apply_split_rotary_emb, precompute_split_freqs_cis};
 
-/// Q8 quant config of the shipped transformer (`split_model.json`: bits 8, group 64).
-const QUANT_BITS: i32 = 8;
-const QUANT_GROUP: i32 = 64;
 /// adaLN-single sinusoidal timestep projection width (PixArt `Timesteps`).
 const TIME_PROJ_DIM: i32 = 256;
 
-/// Compute precision for the DiT.
+/// How to run the (selectively quantized) DiT: the activation/compute dtype, whether quantized
+/// weights stay packed (`quantized_matmul`) or are dequantized to dense, and the **checkpoint's**
+/// quant geometry (`bits`/`group` from `split_model.json` — so Q4 and Q8 both load without a code
+/// change; sc-2686). Construct via [`quant_f32`](Self::quant_f32) / [`quant_bf16`](Self::quant_bf16)
+/// / [`dense_f32`](Self::dense_f32).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Precision {
-    /// f32 activations, Q8 weights **dequantized** to dense f32 — the S3a block math gate (small).
-    F32,
-    /// **f32 activations × Q8 `quantized_matmul`** (dense weights f32) — the production path and the
-    /// port's quality target. The **full 48-layer velocity is bit-exact** to the reference (mlx
-    /// 0.31.2) — required because the distilled stage-1 sampler is chaos-sensitive (any per-forward
-    /// seed amplifies to a large latent divergence; sc-2842). The bf16 alternative drifts ~3e-2 over
-    /// the 48-layer residual stream, amplified by the output LayerNorm.
-    F32Q8,
-    /// bf16 activations × Q8 `quantized_matmul` (dense bf16 elsewhere) — matches the reference's own
-    /// compute dtype; retained for reference/diagnostics.
-    Bf16Q8,
+pub struct Precision {
+    mode: Mode,
+    bits: i32,
+    group: i32,
+}
+
+/// The compute mode (independent of the quant bit-width, which rides alongside in [`Precision`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// f32 activations, quantized weights **dequantized** to dense f32 — the S3a block-math gate.
+    DenseF32,
+    /// **f32 activations × `quantized_matmul`** — the production path / quality target. The full
+    /// 48-layer velocity is bit-exact to the reference (mlx 0.31.2), required because the distilled
+    /// stage-1 sampler is chaos-sensitive (sc-2842).
+    QuantF32,
+    /// bf16 activations × `quantized_matmul` — the reference's own compute dtype (production speed).
+    QuantBf16,
 }
 
 impl Precision {
-    fn dtype(self) -> Dtype {
-        match self {
-            Precision::F32 | Precision::F32Q8 => Dtype::Float32,
-            Precision::Bf16Q8 => Dtype::Bfloat16,
+    /// f32 activations, quantized weights dequantized to dense f32 (the block-math gate).
+    pub fn dense_f32(bits: i32, group: i32) -> Self {
+        Self {
+            mode: Mode::DenseF32,
+            bits,
+            group,
         }
     }
 
-    /// Whether Q8 weights are kept quantized (`quantized_matmul`) vs dequantized to dense f32.
+    /// f32 activations × `quantized_matmul` (the production quality target).
+    pub fn quant_f32(bits: i32, group: i32) -> Self {
+        Self {
+            mode: Mode::QuantF32,
+            bits,
+            group,
+        }
+    }
+
+    /// bf16 activations × `quantized_matmul` (the reference's native production-speed path).
+    pub fn quant_bf16(bits: i32, group: i32) -> Self {
+        Self {
+            mode: Mode::QuantBf16,
+            bits,
+            group,
+        }
+    }
+
+    fn dtype(self) -> Dtype {
+        match self.mode {
+            Mode::DenseF32 | Mode::QuantF32 => Dtype::Float32,
+            Mode::QuantBf16 => Dtype::Bfloat16,
+        }
+    }
+
+    /// Whether quantized weights are kept packed (`quantized_matmul`) vs dequantized to dense f32.
     fn keep_quant(self) -> bool {
-        matches!(self, Precision::F32Q8 | Precision::Bf16Q8)
+        matches!(self.mode, Mode::QuantF32 | Mode::QuantBf16)
     }
 }
 
@@ -167,22 +204,24 @@ impl Linear {
                 let q = w.require(&format!("{prefix}.weight"))?;
                 let biases = w.require(&format!("{prefix}.biases"))?;
                 if prec.keep_quant() {
-                    // Keep Q8; `quantized_matmul` dequantizes on the fly with fp32 accumulation and
-                    // is correct for f32 *or* bf16 activations (the Z-Image/Qwen Q8 path). Scales /
-                    // biases are cast to the compute dtype so the on-the-fly dequant matches the
-                    // reference's (f32 for F32Q8 — a lossless upcast of the bf16 file scales).
+                    // Keep the weights packed; `quantized_matmul` dequantizes on the fly with fp32
+                    // accumulation and is correct for f32 *or* bf16 activations at either bit-width
+                    // (the Z-Image/Qwen Q8 path). Scales / biases are cast to the compute dtype so the
+                    // on-the-fly dequant matches the reference's (f32 for quant_f32 — a lossless upcast
+                    // of the bf16 file scales). bits/group come from the checkpoint's split_model.json
+                    // via `prec` (sc-2686), so Q4 and Q8 both load unchanged.
                     LinearKind::Quant {
                         q: q.clone(),
                         scales: to_dtype(scales, dt)?,
                         biases: to_dtype(biases, dt)?,
                         b,
-                        group: QUANT_GROUP,
-                        bits: QUANT_BITS,
+                        group: prec.group,
+                        bits: prec.bits,
                     }
                 } else {
                     // Dequantize to dense f32 (bit-identical to the reference's mx.dequantize).
                     let dense =
-                        dequantize(q, scales, Some(biases), Some(QUANT_GROUP), Some(QUANT_BITS))?;
+                        dequantize(q, scales, Some(biases), Some(prec.group), Some(prec.bits))?;
                     LinearKind::Dense {
                         w: to_dtype(&dense, Dtype::Float32)?,
                         b,
@@ -231,6 +270,36 @@ impl Linear {
     }
 }
 
+/// A model tree that routes a LoRA target's dotted path (post LTX key normalization) to its
+/// [`Linear`] and selects the active denoise pass for all installed residuals. Implemented by the
+/// video-only [`LtxDiT`] building block and the production dual-modality [`AvDiT`], so the adapter
+/// loader ([`crate::adapters::apply_ltx_adapters`]) is generic over both (sc-2687).
+pub trait LtxAdaptable {
+    /// Resolve a target path to its [`Linear`], or `None` if it names no adaptable module (reported
+    /// skipped by the loader, never silently dropped).
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear>;
+    /// Select the active distilled denoise pass for every installed residual (no-op without adapters).
+    fn set_lora_pass(&self, pass: usize);
+}
+
+impl LtxAdaptable for LtxDiT {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        LtxDiT::adaptable_mut(self, path)
+    }
+    fn set_lora_pass(&self, pass: usize) {
+        LtxDiT::set_lora_pass(self, pass)
+    }
+}
+
+impl LtxAdaptable for AvDiT {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        AvDiT::adaptable_mut(self, path)
+    }
+    fn set_lora_pass(&self, pass: usize) {
+        AvDiT::set_lora_pass(self, pass)
+    }
+}
+
 /// `mx.fast.rms_norm(x, ones, eps)` — the block's weightless pre-norm (feature RMS over the last axis).
 fn rms_norm_noweight(x: &Array, eps: f32) -> Result<Array> {
     let dim = *x.shape().last().unwrap();
@@ -255,7 +324,17 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(w: &Weights, prefix: &str, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+    /// Load an attention with explicit `heads`/`dim_head` (the *inner* dims = `heads·dim_head`,
+    /// which the q/k/v project to; cross-modal attns project a different query/context dim into the
+    /// same inner). `eps` is the q/k-RMSNorm epsilon.
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        heads: i32,
+        dim_head: i32,
+        eps: f32,
+        prec: Precision,
+    ) -> Result<Self> {
         let gate = if w.get(&format!("{prefix}.to_gate_logits.weight")).is_some() {
             Some(Linear::load(w, &format!("{prefix}.to_gate_logits"), prec)?)
         } else {
@@ -269,9 +348,9 @@ impl Attention {
             k_norm: param(w, &format!("{prefix}.k_norm.weight"), prec)?,
             to_out: Linear::load(w, &format!("{prefix}.to_out"), prec)?,
             gate,
-            heads: cfg.num_attention_heads,
-            dim_head: cfg.attention_head_dim,
-            eps: cfg.norm_eps as f32,
+            heads,
+            dim_head,
+            eps,
         })
     }
 
@@ -283,12 +362,16 @@ impl Attention {
             .transpose_axes(&[0, 2, 1, 3])?)
     }
 
+    /// `pe` rotates the query (and the key if `k_pe` is `None`); `k_pe` rotates the key separately
+    /// (cross-modal: video-positioned q, audio-positioned k, or vice-versa). `pe == None` ⇒ no RoPE
+    /// on either (text cross-attention). Mirrors `attention.py::Attention.__call__`.
     fn forward(
         &self,
         x: &Array,
         context: Option<&Array>,
         mask: Option<&Array>,
         pe: Option<(&Array, &Array)>,
+        k_pe: Option<(&Array, &Array)>,
     ) -> Result<Array> {
         let ctx = context.unwrap_or(x);
         let q = fast_rms_norm(&self.to_q.forward(x)?, &self.q_norm, self.eps)?;
@@ -300,7 +383,8 @@ impl Attention {
         let vh = self.to_heads(&v)?;
         if let Some((cos, sin)) = pe {
             qh = apply_split_rotary_emb(&qh, cos, sin)?;
-            kh = apply_split_rotary_emb(&kh, cos, sin)?;
+            let (kc, ks) = k_pe.unwrap_or((cos, sin));
+            kh = apply_split_rotary_emb(&kh, kc, ks)?;
         }
 
         // Match the reference's Python `1.0 / math.sqrt(dim_head)` (f64 → f32), not `d^-0.5` in f32.
@@ -423,9 +507,14 @@ pub struct VideoBlock {
 impl VideoBlock {
     /// Load a block (`prefix` e.g. `transformer_blocks.0`) at the given [`Precision`].
     pub fn load(w: &Weights, prefix: &str, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+        let (h, dh, eps) = (
+            cfg.num_attention_heads,
+            cfg.attention_head_dim,
+            cfg.norm_eps as f32,
+        );
         Ok(Self {
-            attn1: Attention::load(w, &format!("{prefix}.attn1"), cfg, prec)?,
-            attn2: Attention::load(w, &format!("{prefix}.attn2"), cfg, prec)?,
+            attn1: Attention::load(w, &format!("{prefix}.attn1"), h, dh, eps, prec)?,
+            attn2: Attention::load(w, &format!("{prefix}.attn2"), h, dh, eps, prec)?,
             ff: FeedForward::load(w, &format!("{prefix}.ff"), prec)?,
             scale_shift_table: param(w, &format!("{prefix}.scale_shift_table"), prec)?,
             prompt_scale_shift_table: param(
@@ -453,7 +542,9 @@ impl VideoBlock {
         // --- MSA (self-attention) ---
         let msa = ada_values(&self.scale_shift_table, timesteps, 0, 3)?;
         let norm = modulate(&rms_norm_noweight(x, self.eps)?, &msa[1], &msa[0])?;
-        let attn = self.attn1.forward(&norm, None, None, Some((cos, sin)))?;
+        let attn = self
+            .attn1
+            .forward(&norm, None, None, Some((cos, sin)), None)?;
         let mut x = add(x, &multiply(&attn, &msa[2])?)?;
 
         // --- prompt-adaLN on the text context ---
@@ -474,7 +565,9 @@ impl VideoBlock {
         // --- text cross-attention (adaLN rows 6..9) ---
         let ca = ada_values(&self.scale_shift_table, timesteps, 6, 9)?;
         let norm_ca = modulate(&rms_norm_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
-        let cross = self.attn2.forward(&norm_ca, Some(&v_context), mask, None)?;
+        let cross = self
+            .attn2
+            .forward(&norm_ca, Some(&v_context), mask, None, None)?;
         x = add(&x, &multiply(&cross, &ca[2])?)?;
 
         // --- FeedForward (adaLN rows 3..6) ---
@@ -689,7 +782,7 @@ impl LtxDiT {
             positions,
             inner,
             self.cfg.positional_embedding_theta,
-            self.cfg.positional_embedding_max_pos,
+            &self.cfg.positional_embedding_max_pos,
             self.cfg.num_attention_heads,
         )?;
 
@@ -793,6 +886,586 @@ impl LtxDiT {
 /// `denoised = latent − σ·velocity` (`to_denoised`): velocity → x₀.
 pub fn to_denoised(latent: &Array, velocity: &Array, sigma: &Array) -> Result<Array> {
     Ok(subtract(latent, &multiply(velocity, sigma)?)?)
+}
+
+// ===================================================================================================
+// AudioVideo DiT (sc-2684) — the dual-modality `BasicAVTransformerBlock` / `LTXModel`.
+// ===================================================================================================
+
+/// `positions[:, 0:1, :, :]` — the time axis as a `(B, 1, T, 2)` grid (the cross-modal RoPE input;
+/// `MultiModalTransformerArgsPreprocessor.prepare`). For the audio grid (already `(B, 1, T, 2)`) this
+/// is a no-op slice.
+fn time_axis(positions: &Array) -> Result<Array> {
+    let sh = positions.shape();
+    let (b, t) = (sh[0], sh[2]);
+    Ok(positions
+        .take_axis(Array::from_int(0), 1)? // (B, T, 2)
+        .reshape(&[b, 1, t, 2])?)
+}
+
+/// One modality's non-block modules + dims — the video or audio half of the AV DiT. Carries the
+/// patchify projection, adaLN-single (timestep → coeff·dim) + prompt-adaLN, the two cross-modal
+/// adaLN-single modules (4-coeff scale-shift + 1-coeff gate), the output scale-shift table, and the
+/// output projection, plus the dims that drive RoPE.
+struct Stream {
+    patchify: Linear,
+    adaln: AdaLayerNormSingle,
+    prompt_adaln: AdaLayerNormSingle,
+    cross_ss_adaln: AdaLayerNormSingle,
+    cross_gate_adaln: AdaLayerNormSingle,
+    scale_shift_table: Array, // (2, inner) output head
+    proj_out: Linear,
+    inner: i32,
+    heads: i32,
+    coeff: i32, // adaLN row count (9 gated)
+    self_max_pos: Vec<i32>,
+    cross_inner: i32, // audio_cross_attention_dim (2048) — the cross-modal RoPE inner
+    cross_max_pos: i32,
+    theta: f64,
+    ts_mult: i32,
+    av_ca_ts_mult: i32,
+    eps: f32,
+    prec: Precision,
+}
+
+/// The per-modality preprocessed args threaded into the block stack + output head.
+struct StreamPrep {
+    x: Array,
+    ts_emb: Array,
+    emb_ts: Array,
+    prompt_ts: Array,
+    context: Array,
+    cos: Array,
+    sin: Array,
+    cross_cos: Array,
+    cross_sin: Array,
+    cross_ss_ts: Array,
+    cross_gate_ts: Array,
+}
+
+/// Borrowed view of a [`StreamPrep`] passed to [`AvBlock::forward`].
+struct StreamArgs<'a> {
+    ts_emb: &'a Array,
+    prompt_ts: &'a Array,
+    context: &'a Array,
+    mask: Option<&'a Array>,
+    cos: &'a Array,
+    sin: &'a Array,
+    cross_cos: &'a Array,
+    cross_sin: &'a Array,
+    cross_ss_ts: &'a Array,
+    cross_gate_ts: &'a Array,
+}
+
+impl StreamPrep {
+    fn args<'a>(&'a self, mask: Option<&'a Array>) -> StreamArgs<'a> {
+        StreamArgs {
+            ts_emb: &self.ts_emb,
+            prompt_ts: &self.prompt_ts,
+            context: &self.context,
+            mask,
+            cos: &self.cos,
+            sin: &self.sin,
+            cross_cos: &self.cross_cos,
+            cross_sin: &self.cross_sin,
+            cross_ss_ts: &self.cross_ss_ts,
+            cross_gate_ts: &self.cross_gate_ts,
+        }
+    }
+}
+
+impl Stream {
+    /// `latent` `(B, S, in)`, per-token `timestep` `(B, S)`, text `context`, `positions` grid.
+    /// Reproduces `TransformerArgsPreprocessor.prepare` + the multimodal cross-PE / cross-timesteps.
+    fn prepare(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        positions: &Array,
+    ) -> Result<StreamPrep> {
+        let dt = self.prec.dtype();
+        let b = latent.shape()[0];
+        let (inner, coeff) = (self.inner, self.coeff);
+
+        let x = self.patchify.forward(&latent.as_dtype(dt)?)?;
+
+        // adaLN-single timestep projection (the `× ts_mult` runs in the input dtype; see the
+        // video-only path's note — bf16 must round `bf16(σ·1000)` first).
+        let mult = scalar(self.ts_mult as f32).as_dtype(timestep.dtype())?;
+        let ts_flat = multiply(timestep, &mult)?.reshape(&[-1])?;
+        let (ts_emb, emb_ts) = self.adaln.forward(&ts_flat, dt)?;
+        let ts_emb = ts_emb.reshape(&[b, -1, coeff * inner])?;
+        let emb_ts = emb_ts.reshape(&[b, -1, inner])?;
+
+        // prompt-adaLN: one shared modulation per sample (timestep[:, :1]).
+        let src = if timestep.ndim() > 1 {
+            timestep.index_axis(0, 1)?.reshape(&[b, 1])?
+        } else {
+            timestep.clone()
+        };
+        let src = multiply(&src, &mult)?.reshape(&[-1])?;
+        let (pts, _) = self.prompt_adaln.forward(&src, dt)?;
+        let prompt_ts = pts.reshape(&[b, -1, 2 * inner])?;
+
+        // Cross-modal scale-shift (4·dim) + gate (1·dim) timesteps. The gate timestep carries the
+        // extra `av_ca_factor = av_ca_ts_mult / ts_mult` (1.0 for 2.3, an exact f32 no-op).
+        let (cross_ss, _) = self.cross_ss_adaln.forward(&ts_flat, dt)?;
+        let cross_ss_ts = cross_ss.reshape(&[b, -1, 4 * inner])?;
+        let factor =
+            scalar(self.av_ca_ts_mult as f32 / self.ts_mult as f32).as_dtype(ts_flat.dtype())?;
+        let gate_in = multiply(&ts_flat, &factor)?;
+        let (cross_gate, _) = self.cross_gate_adaln.forward(&gate_in, dt)?;
+        let cross_gate_ts = cross_gate.reshape(&[b, -1, inner])?;
+
+        // caption_projection = Identity (2.3): context enters cross-attn as-is.
+        let context = context.as_dtype(dt)?;
+
+        // Self-attention SPLIT RoPE (modality inner dim, modality max_pos).
+        let (cos, sin) = precompute_split_freqs_cis(
+            positions,
+            inner,
+            self.theta,
+            &self.self_max_pos,
+            self.heads,
+        )?;
+        // Cross-modal SPLIT RoPE: the time axis only, at the cross inner dim (2048) / cross max_pos.
+        let (cross_cos, cross_sin) = precompute_split_freqs_cis(
+            &time_axis(positions)?,
+            self.cross_inner,
+            self.theta,
+            &[self.cross_max_pos],
+            self.heads,
+        )?;
+
+        Ok(StreamPrep {
+            x,
+            ts_emb,
+            emb_ts,
+            prompt_ts,
+            context,
+            cos,
+            sin,
+            cross_cos,
+            cross_sin,
+            cross_ss_ts,
+            cross_gate_ts,
+        })
+    }
+
+    /// Output head (LayerNorm-affine-false → final 2-row scale-shift → proj_out). Mirrors
+    /// `LTXModel._process_output`.
+    fn output_head(&self, h: &Array, emb_ts: &Array) -> Result<Array> {
+        let b = h.shape()[0];
+        let table = self.scale_shift_table.reshape(&[1, 1, 2, self.inner])?;
+        let ss = add(&table, &emb_ts.reshape(&[b, -1, 1, self.inner])?)?;
+        let shift = ss.index_axis(0, 2)?;
+        let scale = ss.index_axis(1, 2)?;
+        let normed = layer_norm(h, None, None, self.eps)?;
+        self.proj_out.forward(&modulate(&normed, &scale, &shift)?)
+    }
+
+    /// Select the active denoise pass for this stream's LoRA-targetable Linears (the patchify/out
+    /// projections + the four adaLN-single modules). The `scale_shift_table`/gate params carry no
+    /// Linear, so they are unaffected.
+    fn set_lora_pass(&self, pass: usize) {
+        self.patchify.set_lora_pass(pass);
+        self.proj_out.set_lora_pass(pass);
+        self.adaln.set_lora_pass(pass);
+        self.prompt_adaln.set_lora_pass(pass);
+        self.cross_ss_adaln.set_lora_pass(pass);
+        self.cross_gate_adaln.set_lora_pass(pass);
+    }
+}
+
+/// `4·scale-shift + 1·gate` cross-modal adaLN values from the pre-split tables. Returns
+/// `(scale_a2v, shift_a2v, scale_v2a, shift_v2a, gate)` — the row layout of
+/// `scale_shift_table_a2v_ca_{audio,video}` (`get_av_ca_ada_values`).
+fn av_ca_ada(
+    ss_table: &Array,
+    gate_table: &Array,
+    ss_ts: &Array,
+    gate_ts: &Array,
+) -> Result<(Array, Array, Array, Array, Array)> {
+    let ss = ada_values(ss_table, ss_ts, 0, 4)?;
+    let g = ada_values(gate_table, gate_ts, 0, 1)?;
+    Ok((
+        ss[0].clone(),
+        ss[1].clone(),
+        ss[2].clone(),
+        ss[3].clone(),
+        g[0].clone(),
+    ))
+}
+
+/// One AudioVideo transformer block: the video stack + the audio stack + bidirectional cross-modal
+/// attention (`BasicAVTransformerBlock`). Per-block order: video self+text-CA → audio self+text-CA →
+/// cross-modal (a2v updates video, v2a updates audio) → video FF → audio FF.
+struct AvBlock {
+    // Video.
+    attn1: Attention,
+    attn2: Attention,
+    ff: FeedForward,
+    v_sst: Array, // (9, 4096)
+    v_pst: Array, // (2, 4096)
+    // Audio.
+    a_attn1: Attention,
+    a_attn2: Attention,
+    a_ff: FeedForward,
+    a_sst: Array, // (9, 2048)
+    a_pst: Array, // (2, 2048)
+    // Cross-modal.
+    a2v: Attention,       // audio_to_video_attn (Q video, K/V audio)
+    v2a: Attention,       // video_to_audio_attn (Q audio, K/V video)
+    ca_audio_ss: Array,   // (4, 2048)
+    ca_audio_gate: Array, // (1, 2048)
+    ca_video_ss: Array,   // (4, 4096)
+    ca_video_gate: Array, // (1, 4096)
+    eps: f32,
+}
+
+impl AvBlock {
+    fn load(w: &Weights, prefix: &str, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+        let eps = cfg.norm_eps as f32;
+        let (vh, vdh) = (cfg.num_attention_heads, cfg.attention_head_dim);
+        let (ah, adh) = (cfg.audio_num_attention_heads, cfg.audio_attention_head_dim);
+        // Split a (5, dim) cross table into the 4-row scale-shift block + the 1-row gate.
+        let split = |key: &str| -> Result<(Array, Array)> {
+            let t = param(w, &format!("{prefix}.{key}"), prec)?;
+            let ss = t.take_axis(Array::from_slice(&[0, 1, 2, 3], &[4]), 0)?;
+            let gate = t.take_axis(Array::from_slice(&[4], &[1]), 0)?;
+            Ok((ss, gate))
+        };
+        let (ca_audio_ss, ca_audio_gate) = split("scale_shift_table_a2v_ca_audio")?;
+        let (ca_video_ss, ca_video_gate) = split("scale_shift_table_a2v_ca_video")?;
+        Ok(Self {
+            attn1: Attention::load(w, &format!("{prefix}.attn1"), vh, vdh, eps, prec)?,
+            attn2: Attention::load(w, &format!("{prefix}.attn2"), vh, vdh, eps, prec)?,
+            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec)?,
+            v_sst: param(w, &format!("{prefix}.scale_shift_table"), prec)?,
+            v_pst: param(w, &format!("{prefix}.prompt_scale_shift_table"), prec)?,
+            a_attn1: Attention::load(w, &format!("{prefix}.audio_attn1"), ah, adh, eps, prec)?,
+            a_attn2: Attention::load(w, &format!("{prefix}.audio_attn2"), ah, adh, eps, prec)?,
+            a_ff: FeedForward::load(w, &format!("{prefix}.audio_ff"), prec)?,
+            a_sst: param(w, &format!("{prefix}.audio_scale_shift_table"), prec)?,
+            a_pst: param(w, &format!("{prefix}.audio_prompt_scale_shift_table"), prec)?,
+            // Cross-modal attns run at the audio inner dim (heads 32 × head_dim 64 = 2048).
+            a2v: Attention::load(
+                w,
+                &format!("{prefix}.audio_to_video_attn"),
+                ah,
+                adh,
+                eps,
+                prec,
+            )?,
+            v2a: Attention::load(
+                w,
+                &format!("{prefix}.video_to_audio_attn"),
+                ah,
+                adh,
+                eps,
+                prec,
+            )?,
+            ca_audio_ss,
+            ca_audio_gate,
+            ca_video_ss,
+            ca_video_gate,
+            eps,
+        })
+    }
+
+    /// Self+text-CA for one modality (`run_vx`/`run_ax` body, sans FF): MSA (RoPE) → prompt-modulated
+    /// text cross-attention. Returns the updated stream hidden.
+    #[allow(clippy::too_many_arguments)]
+    fn self_and_text(
+        &self,
+        x: &Array,
+        attn1: &Attention,
+        attn2: &Attention,
+        sst: &Array,
+        pst: &Array,
+        a: &StreamArgs,
+    ) -> Result<Array> {
+        let msa = ada_values(sst, a.ts_emb, 0, 3)?;
+        let norm = modulate(&rms_norm_noweight(x, self.eps)?, &msa[1], &msa[0])?;
+        let attn = attn1.forward(&norm, None, None, Some((a.cos, a.sin)), None)?;
+        let mut x = add(x, &multiply(&attn, &msa[2])?)?;
+
+        let p = ada_values(pst, a.prompt_ts, 0, 2)?;
+        let context = modulate(a.context, &p[1], &p[0])?;
+
+        let ca = ada_values(sst, a.ts_emb, 6, 9)?;
+        let norm_ca = modulate(&rms_norm_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
+        let cross = attn2.forward(&norm_ca, Some(&context), a.mask, None, None)?;
+        x = add(&x, &multiply(&cross, &ca[2])?)?;
+        Ok(x)
+    }
+
+    /// FeedForward (adaLN rows 3..6) for one modality.
+    fn feed_forward(
+        &self,
+        x: &Array,
+        ff: &FeedForward,
+        sst: &Array,
+        ts_emb: &Array,
+    ) -> Result<Array> {
+        let mlp = ada_values(sst, ts_emb, 3, 6)?;
+        let norm = modulate(&rms_norm_noweight(x, self.eps)?, &mlp[1], &mlp[0])?;
+        Ok(add(x, &multiply(&ff.forward(&norm)?, &mlp[2])?)?)
+    }
+
+    /// Joint forward: `(vx, ax)` in, `(vx, ax)` out.
+    fn forward(
+        &self,
+        vx: &Array,
+        ax: &Array,
+        v: &StreamArgs,
+        a: &StreamArgs,
+    ) -> Result<(Array, Array)> {
+        // Video / audio self-attention + text cross-attention.
+        let mut vx =
+            self.self_and_text(vx, &self.attn1, &self.attn2, &self.v_sst, &self.v_pst, v)?;
+        let mut ax = self.self_and_text(
+            ax,
+            &self.a_attn1,
+            &self.a_attn2,
+            &self.a_sst,
+            &self.a_pst,
+            a,
+        )?;
+
+        // Cross-modal attention — both directions read the pre-update rms_norm snapshots.
+        let vx_n3 = rms_norm_noweight(&vx, self.eps)?;
+        let ax_n3 = rms_norm_noweight(&ax, self.eps)?;
+        let (sca_a2v, sha_a2v, sca_v2a, sha_v2a, gate_v2a) = av_ca_ada(
+            &self.ca_audio_ss,
+            &self.ca_audio_gate,
+            a.cross_ss_ts,
+            a.cross_gate_ts,
+        )?;
+        let (scv_a2v, shv_a2v, scv_v2a, shv_v2a, gate_a2v) = av_ca_ada(
+            &self.ca_video_ss,
+            &self.ca_video_gate,
+            v.cross_ss_ts,
+            v.cross_gate_ts,
+        )?;
+
+        // Audio-to-Video: Q from video (video cross-PE), K/V from audio (audio cross-PE).
+        let a2v = self.a2v.forward(
+            &modulate(&vx_n3, &scv_a2v, &shv_a2v)?,
+            Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
+            None,
+            Some((v.cross_cos, v.cross_sin)),
+            Some((a.cross_cos, a.cross_sin)),
+        )?;
+        vx = add(&vx, &multiply(&a2v, &gate_a2v)?)?;
+
+        // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
+        let v2a = self.v2a.forward(
+            &modulate(&ax_n3, &sca_v2a, &sha_v2a)?,
+            Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
+            None,
+            Some((a.cross_cos, a.cross_sin)),
+            Some((v.cross_cos, v.cross_sin)),
+        )?;
+        ax = add(&ax, &multiply(&v2a, &gate_v2a)?)?;
+
+        // FeedForward.
+        vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)?;
+        ax = self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb)?;
+        Ok((vx, ax))
+    }
+
+    /// LoRA key→module map for one AV block: the video self/text attns + ff, the audio analogues, and
+    /// the two cross-modal attns (`audio_to_video_attn`/`video_to_audio_attn`). `audio_ff.net.*` →
+    /// `audio_ff.proj_*` is renamed by the loader before reaching here.
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        match path {
+            ["attn1", rest @ ..] => self.attn1.adaptable_mut(rest),
+            ["attn2", rest @ ..] => self.attn2.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            ["audio_attn1", rest @ ..] => self.a_attn1.adaptable_mut(rest),
+            ["audio_attn2", rest @ ..] => self.a_attn2.adaptable_mut(rest),
+            ["audio_ff", rest @ ..] => self.a_ff.adaptable_mut(rest),
+            ["audio_to_video_attn", rest @ ..] => self.a2v.adaptable_mut(rest),
+            ["video_to_audio_attn", rest @ ..] => self.v2a.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn set_lora_pass(&self, pass: usize) {
+        for attn in [
+            &self.attn1,
+            &self.attn2,
+            &self.a_attn1,
+            &self.a_attn2,
+            &self.a2v,
+            &self.v2a,
+        ] {
+            attn.set_lora_pass(pass);
+        }
+        self.ff.set_lora_pass(pass);
+        self.a_ff.set_lora_pass(pass);
+    }
+}
+
+/// The LTX-2.3 **AudioVideo** DiT (`LTXModel` with both stacks). Predicts `(video_velocity,
+/// audio_velocity)` from the two latent token streams + shared text conditioning.
+pub struct AvDiT {
+    video: Stream,
+    audio: Stream,
+    blocks: Vec<AvBlock>,
+}
+
+impl AvDiT {
+    pub fn from_weights(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+        let video = Stream {
+            patchify: Linear::load(w, "patchify_proj", prec)?,
+            adaln: AdaLayerNormSingle::load(w, "adaln_single", prec)?,
+            prompt_adaln: AdaLayerNormSingle::load(w, "prompt_adaln_single", prec)?,
+            cross_ss_adaln: AdaLayerNormSingle::load(
+                w,
+                "av_ca_video_scale_shift_adaln_single",
+                prec,
+            )?,
+            cross_gate_adaln: AdaLayerNormSingle::load(w, "av_ca_a2v_gate_adaln_single", prec)?,
+            scale_shift_table: param(w, "scale_shift_table", prec)?,
+            proj_out: Linear::load(w, "proj_out", prec)?,
+            inner: cfg.inner_dim(),
+            heads: cfg.num_attention_heads,
+            coeff: cfg.adaln_embedding_coefficient,
+            self_max_pos: cfg.positional_embedding_max_pos.to_vec(),
+            cross_inner: cfg.audio_cross_attention_dim,
+            cross_max_pos: cfg.cross_pe_max_pos(),
+            theta: cfg.positional_embedding_theta,
+            ts_mult: cfg.timestep_scale_multiplier,
+            av_ca_ts_mult: cfg.av_ca_timestep_scale_multiplier,
+            eps: cfg.norm_eps as f32,
+            prec,
+        };
+        let audio = Stream {
+            patchify: Linear::load(w, "audio_patchify_proj", prec)?,
+            adaln: AdaLayerNormSingle::load(w, "audio_adaln_single", prec)?,
+            prompt_adaln: AdaLayerNormSingle::load(w, "audio_prompt_adaln_single", prec)?,
+            cross_ss_adaln: AdaLayerNormSingle::load(
+                w,
+                "av_ca_audio_scale_shift_adaln_single",
+                prec,
+            )?,
+            cross_gate_adaln: AdaLayerNormSingle::load(w, "av_ca_v2a_gate_adaln_single", prec)?,
+            scale_shift_table: param(w, "audio_scale_shift_table", prec)?,
+            proj_out: Linear::load(w, "audio_proj_out", prec)?,
+            inner: cfg.audio_inner_dim(),
+            heads: cfg.audio_num_attention_heads,
+            coeff: cfg.adaln_embedding_coefficient,
+            self_max_pos: vec![cfg.audio_positional_embedding_max_pos],
+            cross_inner: cfg.audio_cross_attention_dim,
+            cross_max_pos: cfg.cross_pe_max_pos(),
+            theta: cfg.positional_embedding_theta,
+            ts_mult: cfg.timestep_scale_multiplier,
+            av_ca_ts_mult: cfg.av_ca_timestep_scale_multiplier,
+            eps: cfg.norm_eps as f32,
+            prec,
+        };
+        let blocks = (0..cfg.num_layers)
+            .map(|i| AvBlock::load(w, &format!("transformer_blocks.{i}"), cfg, prec))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            video,
+            audio,
+            blocks,
+        })
+    }
+
+    /// Resolve a LoRA target (diffusers/peft dotted path, post LTX key normalization) to its
+    /// [`Linear`] across the **full** AudioVideo surface (sc-2687): the per-block video/audio self +
+    /// text attns, the two cross-modal attns, both stacks' feed-forwards, and every stream-global
+    /// projection / adaLN-single (video + audio + the four `av_ca_*` cross modules). The module name
+    /// itself selects the stream (`audio_*` / `av_ca_audio_*` / `av_ca_v2a_*` → audio). A target that
+    /// names no module (e.g. the PixArt-spelled adaLN embedder `linear_1/2`, or an out-of-range block)
+    /// resolves to `None` → reported skipped, never silently dropped.
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            // Video-stream globals.
+            ["patchify_proj"] => Some(&mut self.video.patchify),
+            ["proj_out"] => Some(&mut self.video.proj_out),
+            ["adaln_single", rest @ ..] => self.video.adaln.adaptable_mut(rest),
+            ["prompt_adaln_single", rest @ ..] => self.video.prompt_adaln.adaptable_mut(rest),
+            ["av_ca_video_scale_shift_adaln_single", rest @ ..] => {
+                self.video.cross_ss_adaln.adaptable_mut(rest)
+            }
+            ["av_ca_a2v_gate_adaln_single", rest @ ..] => {
+                self.video.cross_gate_adaln.adaptable_mut(rest)
+            }
+            // Audio-stream globals.
+            ["audio_patchify_proj"] => Some(&mut self.audio.patchify),
+            ["audio_proj_out"] => Some(&mut self.audio.proj_out),
+            ["audio_adaln_single", rest @ ..] => self.audio.adaln.adaptable_mut(rest),
+            ["audio_prompt_adaln_single", rest @ ..] => self.audio.prompt_adaln.adaptable_mut(rest),
+            ["av_ca_audio_scale_shift_adaln_single", rest @ ..] => {
+                self.audio.cross_ss_adaln.adaptable_mut(rest)
+            }
+            ["av_ca_v2a_gate_adaln_single", rest @ ..] => {
+                self.audio.cross_gate_adaln.adaptable_mut(rest)
+            }
+            _ => None,
+        }
+    }
+
+    /// Select the active distilled denoise pass for every installed LoRA residual (sc-2687 per-pass
+    /// strength) across both streams and all blocks. The pipeline calls this before each stage; a
+    /// no-adapter model is unaffected.
+    pub fn set_lora_pass(&self, pass: usize) {
+        self.video.set_lora_pass(pass);
+        self.audio.set_lora_pass(pass);
+        for b in &self.blocks {
+            b.set_lora_pass(pass);
+        }
+    }
+
+    /// Joint velocity forward.
+    ///
+    /// * `*_latent` — `(B, S, in_channels)` patchified tokens (video 128, audio 128).
+    /// * `*_timestep` — `(B, S)` per-token sigma.
+    /// * `*_context` — text embeddings (video 4096, audio 2048); `*_mask` their additive masks.
+    /// * `*_positions` — the position grids (video `(B,3,T,2)`, audio `(B,1,T,2)`).
+    ///
+    /// Returns `(video_velocity (B, S_v, 128), audio_velocity (B, S_a, 128))`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        audio_latent: &Array,
+        audio_timestep: &Array,
+        audio_context: &Array,
+        audio_mask: Option<&Array>,
+        audio_positions: &Array,
+    ) -> Result<(Array, Array)> {
+        let vp =
+            self.video
+                .prepare(video_latent, video_timestep, video_context, video_positions)?;
+        let ap =
+            self.audio
+                .prepare(audio_latent, audio_timestep, audio_context, audio_positions)?;
+        let (mut vx, mut ax) = (vp.x.clone(), ap.x.clone());
+        let (va, aa) = (vp.args(video_mask), ap.args(audio_mask));
+        for block in &self.blocks {
+            let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
+            vx = nv;
+            ax = na;
+        }
+        let v_vel = self.video.output_head(&vx, &vp.emb_ts)?;
+        let a_vel = self.audio.output_head(&ax, &ap.emb_ts)?;
+        Ok((v_vel, a_vel))
+    }
 }
 
 #[cfg(test)]
