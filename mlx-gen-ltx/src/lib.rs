@@ -24,6 +24,7 @@ pub mod positions;
 pub mod rope;
 pub mod schedule;
 pub mod text_encoder;
+pub mod tokenizer;
 pub mod transformer;
 pub mod upsampler;
 pub mod vae;
@@ -39,6 +40,7 @@ pub use text_encoder::LtxTextEncoder;
 // Tiling moved to `mlx_gen` core (shared with the Wan VAE — sc-2808). Re-export the module + config
 // so `mlx_gen_ltx::tiling::*` / `mlx_gen_ltx::TilingConfig` keep resolving for existing callers.
 pub use mlx_gen::tiling::{self, TilingConfig};
+pub use tokenizer::LtxTokenizer;
 pub use transformer::{to_denoised, LtxDiT, Precision, VideoBlock};
 pub use upsampler::{upsample_latents, LatentUpsampler};
 pub use vae::LtxVideoVae;
