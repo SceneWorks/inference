@@ -23,10 +23,12 @@ pub mod positions;
 pub mod rope;
 pub mod schedule;
 pub mod text_encoder;
+pub mod tiling;
 pub mod vae;
 
 pub use config::{LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use model::{descriptor, load, Ltx, MODEL_ID};
 pub use text_encoder::LtxTextEncoder;
+pub use tiling::TilingConfig;
 pub use vae::LtxVideoVae;
