@@ -4,8 +4,11 @@
 //! `mlx-video-with-audio` package's LTX video path (`generate_av.py`, `models/ltx/*`,
 //! `models/ltx/video_vae/*`) onto Rust + `mlx-rs`.
 //!
-//! **Scope:** the **video-only** T2V core (sc-2679). The audio half (`generate_av.py`'s AudioVideo
-//! path), I2V, Q4/Q8-of-everything, LoRA, and LoKr are sibling stories.
+//! **Scope:** the **video-only** T2V core (sc-2679) + **single-image I2V** (sc-2685: VAE-encode the
+//! conditioning image at both stage resolutions, inject it as a clean latent at frame 0 with a
+//! per-frame denoise mask). The audio half (`generate_av.py`'s AudioVideo path — whose *video* I2V
+//! conditioning is the same primitives reused), Q4/Q8-of-everything, LoRA, and LoKr are sibling
+//! stories.
 //!
 //! This crate self-registers `ltx_2_3` into the `mlx-gen` model registry; load it with
 //! `mlx_gen::load("ltx_2_3", spec)`.
@@ -21,10 +24,13 @@
 //! The distilled stage-1 sampler is chaos-sensitive, so e2e pixel-parity requires a **bit-exact
 //! per-forward DiT** (sc-2842 — the adaLN timestep table must be built in MLX f32, not host f64). Two
 //! shipped precisions, both gated bit-exact vs their reference golden: [`transformer::Precision::quant_f32`]
-//! (f32 activations × Q8 — the quality target) and [`transformer::Precision::quant_bf16`] (the reference's
-//! native bf16 activations × Q8 — the production-speed path). Q4/Q8-of-everything, I2V, LoRA, LoKr,
-//! and audio are sibling stories.
+//! (f32 activations × quantized weights — the quality target) and [`transformer::Precision::quant_bf16`]
+//! (the reference's native bf16 activations — the production-speed path). The quant geometry (**Q4**/Q8)
+//! rides on the checkpoint's `split_model.json` (sc-2686). **I2V** single-image conditioning (sc-2685)
+//! is wired into the same 2-stage path ([`conditioning`] + [`pipeline::generate_i2v_latents`], gated
+//! bit-exact by `tests/i2v_parity.rs`). LoRA, LoKr, and audio are siblings.
 
+pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod gemma;
@@ -39,12 +45,13 @@ pub mod transformer;
 pub mod upsampler;
 pub mod vae;
 
+pub use conditioning::{apply_conditioning, apply_denoise_mask, I2vConditioning};
 pub use config::{LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use model::{descriptor, load, Ltx, MODEL_ID};
 pub use pipeline::{
-    decode_to_frames, denoise, generate_t2v, generate_t2v_latents, renoise, to_uint8_frames,
-    STAGE1_SIGMAS, STAGE2_SIGMAS,
+    decode_to_frames, denoise, generate_i2v_latents, generate_t2v, generate_t2v_latents,
+    preprocess_conditioning_image, renoise, to_uint8_frames, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 pub use text_encoder::LtxTextEncoder;
 // Tiling moved to `mlx_gen` core (shared with the Wan VAE — sc-2808). Re-export the module + config
