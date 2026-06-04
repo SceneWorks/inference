@@ -5,6 +5,7 @@
 //! configuration, tokenizer loading contracts, text encoders, MMDiT transformer, VAE loading, and
 //! the base txt2img generation path.
 
+pub mod adapters;
 pub mod config;
 pub mod loader;
 pub mod model;
@@ -12,6 +13,7 @@ pub mod pipeline;
 pub mod text_encoder;
 pub mod transformer;
 
+pub use adapters::apply_flux_adapters;
 pub use config::{
     FluxTokenizerKind, FluxVariant, DEFAULT_GUIDANCE, DEFAULT_HEIGHT, DEFAULT_WIDTH, FLUX1_DEV_ID,
     FLUX1_SCHNELL_ID,
