@@ -79,6 +79,19 @@ pub struct GenerationRequest {
     /// models that don't support it ignore it.
     pub trim_first_frames: Option<u32>,
 
+    // --- Prompt enhancement (LTX-2.3, sc-2845; ignored by other models) ---
+    /// Rewrite `prompt` with an autoregressive Gemma-3 LLM before encoding (the reference
+    /// `--enhance-prompt`). Default `false` — the diffusion path is unchanged. On any enhancer
+    /// failure the model falls back to the original prompt (reference-faithful).
+    pub enhance_prompt: bool,
+    /// Use the separate uncensored 4-bit Gemma enhancer (`--use-uncensored-enhancer`) instead of the
+    /// loaded text-encoder backbone. Only consulted when `enhance_prompt` is set.
+    pub use_uncensored_enhancer: bool,
+    /// Max tokens for prompt enhancement (reference default 512 when `None`).
+    pub enhance_max_tokens: Option<u32>,
+    /// Sampling temperature for prompt enhancement (reference default 0.7 when `None`).
+    pub enhance_temperature: Option<f32>,
+
     // --- Control ---
     pub cancel: CancelFlag,
 }
@@ -105,6 +118,10 @@ impl Default for GenerationRequest {
             duration: None,
             video_mode: None,
             trim_first_frames: None,
+            enhance_prompt: false,
+            use_uncensored_enhancer: false,
+            enhance_max_tokens: None,
+            enhance_temperature: None,
             cancel: CancelFlag::default(),
         }
     }

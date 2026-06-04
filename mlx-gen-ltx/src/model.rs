@@ -53,7 +53,8 @@ use mlx_gen::{
 
 use crate::audio_vae::AudioDecoder;
 use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
-use crate::gemma::{GemmaConfig, GemmaQuant};
+use crate::enhance::{self, EnhanceConfig, SampleParams};
+use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 use crate::pipeline::{
     decode_audio_track, decode_to_frames, generate_av_latents, preprocess_conditioning_image,
 };
@@ -193,6 +194,33 @@ fn resolve_gemma_quant(gemma_dir: &std::path::Path) -> Result<Option<GemmaQuant>
         })),
         _ => Ok(None),
     }
+}
+
+/// Locate the **uncensored** 4-bit Gemma enhancer snapshot (sc-2845 `--use-uncensored-enhancer`,
+/// reference `TheCluster/amoral-gemma-3-12B-v2-mlx-4bit`). `$LTX_UNCENSORED_GEMMA_DIR` wins; otherwise
+/// the newest matching snapshot in the HF cache. A standalone mlx_lm checkpoint (`model.` key prefix).
+fn resolve_uncensored_dir() -> Result<std::path::PathBuf> {
+    if let Ok(d) = std::env::var("LTX_UNCENSORED_GEMMA_DIR") {
+        return Ok(d.into());
+    }
+    let home = std::env::var("HOME").map_err(|_| Error::Msg("ltx_2_3: HOME unset".into()))?;
+    let base = std::path::PathBuf::from(home).join(
+        ".cache/huggingface/hub/models--TheCluster--amoral-gemma-3-12B-v2-mlx-4bit/snapshots",
+    );
+    let newest = std::fs::read_dir(&base)
+        .map_err(|_| {
+            Error::Msg(format!(
+                "ltx_2_3: uncensored enhancer snapshot not found at {} — set \
+                 $LTX_UNCENSORED_GEMMA_DIR or download TheCluster/amoral-gemma-3-12B-v2-mlx-4bit",
+                base.display()
+            ))
+        })?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    newest.ok_or_else(|| {
+        Error::Msg("ltx_2_3: no uncensored enhancer snapshot in the HF cache".into())
+    })
 }
 
 /// Load the model from a split-weight snapshot directory (the `ltx_2_3_base*` tree). Reads
@@ -499,6 +527,89 @@ impl Ltx {
         let video = preprocess_conditioning_image(image, px_w, px_h)?; // f32 (1,3,1,px_h,px_w)
         self.vae.encode(&video)
     }
+
+    /// Prompt enhancement (sc-2845). Returns the rewritten prompt when `req.enhance_prompt` is set and
+    /// the enhancer produces non-empty output; `None` (use the original prompt) when off, or — matching
+    /// `generate_av.py`'s try/except — on **any** enhancer failure or empty output. Failures are logged
+    /// to stderr with the reference's `ENHANCER_FALLBACK:` token; success with `ENHANCED_PROMPT:`.
+    fn maybe_enhance(&self, req: &GenerationRequest) -> Option<String> {
+        if !req.enhance_prompt {
+            return None;
+        }
+        match self.run_enhance(req) {
+            Ok(p) if !p.trim().is_empty() => {
+                eprintln!("ENHANCED_PROMPT:{p}");
+                Some(p)
+            }
+            Ok(_) => {
+                eprintln!("ENHANCER_FALLBACK:EmptyOutput:prompt enhancer returned empty output");
+                None
+            }
+            Err(e) => {
+                eprintln!("ENHANCER_FALLBACK:{e}");
+                None
+            }
+        }
+    }
+
+    /// Run the configured enhancer: the uncensored 4-bit Gemma (`use_uncensored_enhancer`) or the
+    /// already-loaded text-encoder backbone. I2V (a `Reference` image present) selects the I2V system
+    /// prompt **only on the uncensored path** — the reference's censored `enhance_t2v` always uses the
+    /// T2V system prompt (`generate_av.py` never calls `enhance_i2v` there), which we match.
+    fn run_enhance(&self, req: &GenerationRequest) -> Result<String> {
+        let is_i2v = req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::Reference { .. }));
+        let temperature = req
+            .enhance_temperature
+            .unwrap_or(enhance::DEFAULT_TEMPERATURE);
+        let cfg = EnhanceConfig {
+            max_tokens: req
+                .enhance_max_tokens
+                .map(|m| m as usize)
+                .unwrap_or(enhance::DEFAULT_MAX_TOKENS),
+            seed: req.seed.unwrap_or(enhance::DEFAULT_SEED),
+        };
+        if req.use_uncensored_enhancer {
+            let (model, tokenizer) = Self::load_uncensored_enhancer()?;
+            let system = if is_i2v {
+                enhance::I2V_SYSTEM_PROMPT
+            } else {
+                enhance::T2V_SYSTEM_PROMPT
+            };
+            enhance::enhance(
+                &model,
+                &tokenizer,
+                system,
+                &req.prompt,
+                &cfg,
+                &SampleParams::uncensored(temperature),
+            )
+        } else {
+            enhance::enhance(
+                self.text_encoder.gemma(),
+                &self.tokenizer,
+                enhance::T2V_SYSTEM_PROMPT,
+                &req.prompt,
+                &cfg,
+                &SampleParams::censored(temperature),
+            )
+        }
+    }
+
+    /// Load the separate uncensored 4-bit Gemma enhancer + its tokenizer on demand (the reference
+    /// `enhance_with_model` loads it per call). A standalone mlx_lm checkpoint → `model.` key prefix;
+    /// its `config.json` `quantization` block drives the 4-bit dequant.
+    fn load_uncensored_enhancer() -> Result<(GemmaModel, LtxTokenizer)> {
+        let dir = resolve_uncensored_dir()?;
+        let w = Weights::from_dir(&dir)?;
+        let quant = resolve_gemma_quant(&dir)?;
+        let model =
+            GemmaModel::from_weights_with_prefix(&w, GemmaConfig::gemma_3_12b(), quant, "model.")?;
+        let tokenizer = LtxTokenizer::from_dir(&dir)?;
+        Ok((model, tokenizer))
+    }
 }
 
 /// Capability-driven request validation (weight-free, so it's unit-testable without a load):
@@ -569,6 +680,21 @@ impl Generator for Ltx {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        // Prompt enhancement (sc-2845): rewrite `req.prompt` before any encoding. Default off; on any
+        // enhancer failure / empty output it falls back to the original prompt (reference-faithful), so
+        // the e2e parity seams (which build requests with `enhance_prompt = false`) are untouched.
+        let enhanced = self.maybe_enhance(req);
+        let owned;
+        let req = match enhanced {
+            Some(prompt) => {
+                owned = GenerationRequest {
+                    prompt,
+                    ..req.clone()
+                };
+                &owned
+            }
+            None => req,
+        };
         let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
         let af = Self::audio_frames(req) as i32;
         let seed = req.seed.unwrap_or_else(default_seed);

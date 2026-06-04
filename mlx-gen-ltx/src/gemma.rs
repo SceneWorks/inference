@@ -33,7 +33,7 @@
 
 use mlx_rs::fast::{rms_norm, rope, scaled_dot_product_attention};
 use mlx_rs::nn::gelu_approximate;
-use mlx_rs::ops::{add, dequantize, matmul, multiply, quantized_matmul};
+use mlx_rs::ops::{add, concatenate_axis, dequantize, matmul, multiply, quantized_matmul};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
@@ -53,6 +53,10 @@ pub struct GemmaConfig {
     pub rope_local_base: f32,
     pub rope_global_base: f32,
     pub sliding_window_pattern: usize,
+    /// Sliding-window length for the local layers (gemma-3-12b: 1024). Only the autoregressive
+    /// [`decode_logits`](GemmaModel::decode_logits) path consults it (the encoder forward runs
+    /// ≤ this length).
+    pub sliding_window: i32,
 }
 
 impl GemmaConfig {
@@ -69,6 +73,7 @@ impl GemmaConfig {
             rope_local_base: 10_000.0,
             rope_global_base: 1_000_000.0,
             sliding_window_pattern: 6,
+            sliding_window: 1024,
         }
     }
 }
@@ -150,6 +155,10 @@ struct GemmaLayer {
     up_proj: GemmaLinear,
     down_proj: GemmaLinear,
     rope_base: f32,
+    /// `true` for the sliding-window (local) layers `(i+1) % pattern != 0`; `false` for the global
+    /// layers. Only consulted by the autoregressive [`decode_logits`](GemmaModel::decode_logits) path
+    /// (the encoder forward runs ≤ sliding_window, so a single full-causal mask suffices there).
+    is_sliding: bool,
 }
 
 /// The Gemma-3 backbone used as the LTX text encoder.
@@ -162,11 +171,24 @@ pub struct GemmaModel {
 }
 
 impl GemmaModel {
-    /// Build from a `Weights` map holding the `language_model.model.*` Gemma tensors (bf16). `quant`
-    /// (the Gemma snapshot's `config.json` `quantization` block) selectively quantizes the LM Linears;
-    /// `None` is the dense bf16 default.
+    /// Build from a `Weights` map holding the `language_model.model.*` Gemma tensors (bf16) — the LTX
+    /// text-encoder snapshot layout. `quant` (the Gemma snapshot's `config.json` `quantization` block)
+    /// selectively quantizes the LM Linears; `None` is the dense bf16 default.
     pub fn from_weights(w: &Weights, cfg: GemmaConfig, quant: Option<GemmaQuant>) -> Result<Self> {
-        let p = "language_model.model.";
+        Self::from_weights_with_prefix(w, cfg, quant, "language_model.model.")
+    }
+
+    /// Like [`from_weights`](Self::from_weights) but with an explicit weight-key prefix. The LTX TE
+    /// snapshot nests the Gemma under `language_model.model.`; a standalone **mlx_lm** Gemma checkpoint
+    /// (e.g. the uncensored 4-bit enhancer `TheCluster/amoral-gemma-3-12B-v2-mlx-4bit`, sc-2845) nests
+    /// it under plain `model.`. Same architecture/tensor names otherwise.
+    pub fn from_weights_with_prefix(
+        w: &Weights,
+        cfg: GemmaConfig,
+        quant: Option<GemmaQuant>,
+        prefix: &str,
+    ) -> Result<Self> {
+        let p = prefix;
         let get = |key: &str| -> Result<Array> {
             w.get(key)
                 .ok_or_else(|| Error::MissingTensor(key.into()))?
@@ -205,6 +227,7 @@ impl GemmaModel {
                 } else {
                     cfg.rope_global_base
                 },
+                is_sliding,
             });
         }
 
@@ -310,6 +333,179 @@ impl GemmaModel {
         }
         hiddens.push(rms_norm(&h, &self.norm, self.cfg.rms_eps)?); // final norm = 49th state
         Ok(hiddens)
+    }
+
+    // --- Autoregressive causal-LM path (sc-2845 prompt enhancement) -------------------------------
+    //
+    // The encoder `forward` above runs the whole prompt once, full-causal, and returns hidden states.
+    // The prompt enhancer instead needs **token-by-token generation**: a KV cache, per-step logits over
+    // the vocabulary (the tied-embedding LM head — Gemma-3 has `final_logit_softcapping=None`, so the
+    // head is exactly `hidden·embedᵀ`), and per-layer sliding-window masking once the sequence exceeds
+    // `sliding_window`. This is a faithful port of `mlx_vlm`'s Gemma-3 generate loop (no numeric-parity
+    // gate — text generation is stochastic). A full K/V cache is kept for every layer; sliding layers
+    // mask older-than-window keys (numerically identical to the reference `RotatingKVCache`).
+
+    /// A fresh, empty [`GemmaKvCache`] sized to this model's layer count.
+    pub fn new_cache(&self) -> GemmaKvCache {
+        GemmaKvCache {
+            layers: (0..self.layers.len()).map(|_| None).collect(),
+        }
+    }
+
+    /// Run `input_ids` `(1, L)` at absolute start position `offset`, appending K/V to `cache`, and
+    /// return the **last position's** logits `(1, vocab)` (bf16). Call once with the full prompt
+    /// (`offset = 0`) to prefill, then once per generated token (`L = 1`, `offset` = current length).
+    pub fn decode_logits(
+        &self,
+        input_ids: &Array,
+        cache: &mut GemmaKvCache,
+        offset: i32,
+    ) -> Result<Array> {
+        let sh = input_ids.shape();
+        let (b, l) = (sh[0], sh[1]);
+        let ids = input_ids.reshape(&[-1])?;
+        let mut h = self
+            .embed
+            .take_axis(&ids, 0)?
+            .reshape(&[b, l, self.cfg.hidden_size])?;
+        h = multiply(&h, &self.embed_scale)?;
+
+        // Two additive masks over the cache `(1,1,L,offset+L)`: full-causal for the global layers,
+        // causal+window for the sliding layers.
+        let k_len = offset + l;
+        let full_mask = self.decode_mask(l, k_len, offset, None)?;
+        let sliding_mask = self.decode_mask(l, k_len, offset, Some(self.cfg.sliding_window))?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let mask = if layer.is_sliding {
+                &sliding_mask
+            } else {
+                &full_mask
+            };
+            h = self.layer_step(layer, &h, mask, cache, i, offset)?;
+        }
+
+        // LM head over the last position only (tied embeddings, post final-norm).
+        let last_idx = Array::from_slice(&[l - 1], &[1]);
+        let last = h
+            .take_axis(&last_idx, 1)?
+            .reshape(&[b, self.cfg.hidden_size])?;
+        let normed = rms_norm(&last, &self.norm, self.cfg.rms_eps)?;
+        matmul(&normed, self.embed.t()).map_err(Error::from)
+    }
+
+    /// One decoder layer with the K/V cache (the cached analogue of [`layer_forward`]).
+    fn layer_step(
+        &self,
+        layer: &GemmaLayer,
+        x: &Array,
+        mask: &Array,
+        cache: &mut GemmaKvCache,
+        layer_idx: usize,
+        offset: i32,
+    ) -> Result<Array> {
+        let r = self.attn_step(
+            layer,
+            &rms_norm(x, &layer.input_ln, self.cfg.rms_eps)?,
+            mask,
+            cache,
+            layer_idx,
+            offset,
+        )?;
+        let h = add(x, &rms_norm(&r, &layer.post_attn_ln, self.cfg.rms_eps)?)?;
+        let r = self.mlp(layer, &rms_norm(&h, &layer.pre_ff_ln, self.cfg.rms_eps)?)?;
+        Ok(add(
+            &h,
+            &rms_norm(&r, &layer.post_ff_ln, self.cfg.rms_eps)?,
+        )?)
+    }
+
+    /// Cached attention: project Q/K/V for the new tokens, q/k-norm + RoPE at `offset`, append K/V to
+    /// the cache, then attend the queries over the **whole** cached K/V under `mask`.
+    fn attn_step(
+        &self,
+        layer: &GemmaLayer,
+        x: &Array,
+        mask: &Array,
+        cache: &mut GemmaKvCache,
+        layer_idx: usize,
+        offset: i32,
+    ) -> Result<Array> {
+        let sh = x.shape();
+        let (b, l) = (sh[0], sh[1]);
+        let (h, kv, d) = (self.cfg.num_heads, self.cfg.num_kv_heads, self.cfg.head_dim);
+        let q = layer
+            .q_proj
+            .forward(x)?
+            .reshape(&[b, l, h, d])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k = layer
+            .k_proj
+            .forward(x)?
+            .reshape(&[b, l, kv, d])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let v = layer
+            .v_proj
+            .forward(x)?
+            .reshape(&[b, l, kv, d])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let q = rms_norm(&q, &layer.q_norm, self.cfg.rms_eps)?;
+        let k = rms_norm(&k, &layer.k_norm, self.cfg.rms_eps)?;
+        let q = rope(&q, d, false, Some(layer.rope_base), 1.0, offset, None)?;
+        let k = rope(&k, d, false, Some(layer.rope_base), 1.0, offset, None)?;
+        let (k_all, v_all) = cache.append(layer_idx, k, v)?;
+        let scale = self.cfg.query_pre_attn_scalar.powf(-0.5);
+        let out = scaled_dot_product_attention(&q, &k_all, &v_all, scale, mask, None)?;
+        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, l, h * d])?;
+        layer.o_proj.forward(&out)
+    }
+
+    /// Additive `(1, 1, q_len, k_len)` bf16 mask for the cached decode. Query row `r` sits at absolute
+    /// position `q_offset + r`; key column `j` at absolute position `j` (no padding). Valid iff causal
+    /// (`j ≤ pos`) and — for a sliding layer — within the window (`pos − j < window`).
+    fn decode_mask(
+        &self,
+        q_len: i32,
+        k_len: i32,
+        q_offset: i32,
+        window: Option<i32>,
+    ) -> Result<Array> {
+        let neg = half_min_bf16();
+        let mut data = vec![0f32; (q_len * k_len) as usize];
+        for r in 0..q_len {
+            let pos = q_offset + r;
+            for j in 0..k_len {
+                let causal = j <= pos;
+                let in_window = window.is_none_or(|w| pos - j < w);
+                if !(causal && in_window) {
+                    data[(r * k_len + j) as usize] = neg;
+                }
+            }
+        }
+        Array::from_slice(&data, &[1, 1, q_len, k_len])
+            .as_dtype(Dtype::Bfloat16)
+            .map_err(Error::from)
+    }
+}
+
+/// Per-layer rolling K/V cache for autoregressive decoding ([`GemmaModel::decode_logits`]). Each entry
+/// holds the concatenated K and V over all positions seen so far `(1, kv_heads, seq, head_dim)`.
+pub struct GemmaKvCache {
+    layers: Vec<Option<(Array, Array)>>,
+}
+
+impl GemmaKvCache {
+    /// Append this step's `(k, v)` to layer `i`'s cache and return the full cached `(k, v)`. (mlx
+    /// `Array` is a cheap handle, so the clone retained in the cache is a refcount bump, not a copy.)
+    fn append(&mut self, i: usize, k: Array, v: Array) -> Result<(Array, Array)> {
+        let merged = match self.layers[i].take() {
+            Some((pk, pv)) => (
+                concatenate_axis(&[&pk, &k], 2)?,
+                concatenate_axis(&[&pv, &v], 2)?,
+            ),
+            None => (k, v),
+        };
+        self.layers[i] = Some((merged.0.clone(), merged.1.clone()));
+        Ok(merged)
     }
 }
 
