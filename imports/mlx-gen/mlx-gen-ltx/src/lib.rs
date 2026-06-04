@@ -4,8 +4,9 @@
 //! `mlx-video-with-audio` package's LTX video path (`generate_av.py`, `models/ltx/*`,
 //! `models/ltx/video_vae/*`) onto Rust + `mlx-rs`.
 //!
-//! **Scope:** the **video-only** T2V core (sc-2679). The audio half (`generate_av.py`'s AudioVideo
-//! path), I2V, Q4/Q8-of-everything, LoRA, and LoKr are sibling stories.
+//! **Scope:** the **video-only** T2V core (sc-2679) plus **LoRA in generate** (sc-2687 — forward-time
+//! residuals + per-pass strength; see [`adapters`]). The audio half (`generate_av.py`'s AudioVideo
+//! path), I2V, Q4/Q8-of-everything, and LoKr (sc-2393) are sibling stories.
 //!
 //! This crate self-registers `ltx_2_3` into the `mlx-gen` model registry; load it with
 //! `mlx_gen::load("ltx_2_3", spec)`.
@@ -22,9 +23,11 @@
 //! per-forward DiT** (sc-2842 — the adaLN timestep table must be built in MLX f32, not host f64). Two
 //! shipped precisions, both gated bit-exact vs their reference golden: [`transformer::Precision::F32Q8`]
 //! (f32 activations × Q8 — the quality target) and [`transformer::Precision::Bf16Q8`] (the reference's
-//! native bf16 activations × Q8 — the production-speed path). Q4/Q8-of-everything, I2V, LoRA, LoKr,
-//! and audio are sibling stories.
+//! native bf16 activations × Q8 — the production-speed path). LoRA in generate is wired (sc-2687,
+//! bit-exact vs the reference residual). Q4/Q8-of-everything, I2V, LoKr (sc-2393), and audio are
+//! sibling stories.
 
+pub mod adapters;
 pub mod config;
 pub mod connector;
 pub mod gemma;
@@ -39,6 +42,7 @@ pub mod transformer;
 pub mod upsampler;
 pub mod vae;
 
+pub use adapters::{apply_ltx_adapters, LtxLoraReport};
 pub use config::{LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use model::{descriptor, load, Ltx, MODEL_ID};
