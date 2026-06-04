@@ -357,36 +357,169 @@ fn kohya_matches_peft_on_real_tree() {
         "✓ kohya ≡ peft across {} FLUX.2 modules (byte-identical adapters)",
         targets.len()
     );
+    // (BFL fused→split is now supported — see `bfl_resolves_and_matches_diffusers_split_on_real_tree`.)
+}
 
-    // A BFL fused-qkv key (sc-2743, a different format) is surfaced and errors.
-    let small = Array::from_slice(&[0.01f32], &[1, 1]);
-    let bpath = dir.join("kohya_bfl.safetensors");
+/// sc-2743: the FULL BFL / ComfyUI surface resolves on the real FLUX.2-klein tree, and a BFL *fused*
+/// qkv LoRA reconstructs the BYTE-IDENTICAL `to_q/to_k/to_v` adapters as the equivalent diffusers
+/// split-target LoRA — proven for the `lora_unet_` AND the `base_model.model.` spellings (so all three
+/// prefix conventions agree). The diffusers path is fork-verified (sc-2646), so this transitively
+/// matches the fork's `LoRALoader` + `Flux2LoRAMapping._get_bfl_*` byte-for-byte.
+#[test]
+#[ignore = "needs real FLUX.2-klein-9b weights"]
+fn bfl_resolves_and_matches_diffusers_split_on_real_tree() {
+    let none = None as Option<&std::collections::HashMap<String, String>>;
+
+    // (1) Full BFL surface resolves + count: 8 globals + 8 double×12 + 24 single×2 = 152.
+    let mut probe = load_transformer(&snapshot()).unwrap();
+    let targets = probe.bfl_targets();
+    assert_eq!(targets.len(), 152, "full BFL target count (8 + 96 + 48)");
+    for tg in &targets {
+        let segs: Vec<&str> = tg.target_path.split('.').collect();
+        assert!(
+            AdaptableHost::adaptable_mut(&mut probe, &segs).is_some(),
+            "BFL target {} does not resolve on the real tree",
+            tg.target_path
+        );
+    }
+
+    // (2) Reconstruct-equivalence for a fused img-qkv (block 0) at REAL shapes: fused up [3·inner, r],
+    // shared down [r, in]. Build the fused up as the dim-0 concat of three per-head [inner, r] blocks
+    // so the diffusers split file can use those blocks directly.
+    let q_shape =
+        AdaptableHost::adaptable_mut(&mut probe, &["transformer_blocks", "0", "attn", "to_q"])
+            .unwrap()
+            .base_shape();
+    let (inner, inp) = (q_shape[0], q_shape[1]);
+    let r = 2i32;
+    let head = |seed: i32| -> Vec<f32> {
+        (0..inner * r)
+            .map(|i| (((i + seed) % 17) as f32 - 8.0) * 0.001)
+            .collect()
+    };
+    let (hq, hk, hv) = (head(0), head(5), head(11));
+    let mut fused = hq.clone();
+    fused.extend_from_slice(&hk);
+    fused.extend_from_slice(&hv);
+    let b_fused = Array::from_slice(&fused, &[3 * inner, r]);
+    let b_q = Array::from_slice(&hq, &[inner, r]);
+    let b_k = Array::from_slice(&hk, &[inner, r]);
+    let b_v = Array::from_slice(&hv, &[inner, r]);
+    let a = Array::from_slice(
+        &(0..r * inp)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.002)
+            .collect::<Vec<_>>(),
+        &[r, inp],
+    );
+    let alpha = Array::from_slice(&[4.0f32], &[1]);
+
+    let dir = std::env::temp_dir().join("mlx_gen_flux2_bfl_rw_test");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Equivalent diffusers split-target file (per-head up, SHARED down, same alpha).
+    let ppath = dir.join("bfl_split_peft.safetensors");
     Array::save_safetensors(
         vec![
             (
-                "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight",
-                &small,
+                "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
+                &b_q,
             ),
             (
-                "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight",
-                &small,
+                "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+                &a,
             ),
+            ("transformer.transformer_blocks.0.attn.to_q.alpha", &alpha),
+            (
+                "transformer.transformer_blocks.0.attn.to_k.lora_B.weight",
+                &b_k,
+            ),
+            (
+                "transformer.transformer_blocks.0.attn.to_k.lora_A.weight",
+                &a,
+            ),
+            ("transformer.transformer_blocks.0.attn.to_k.alpha", &alpha),
+            (
+                "transformer.transformer_blocks.0.attn.to_v.lora_B.weight",
+                &b_v,
+            ),
+            (
+                "transformer.transformer_blocks.0.attn.to_v.lora_A.weight",
+                &a,
+            ),
+            ("transformer.transformer_blocks.0.attn.to_v.alpha", &alpha),
         ],
         none,
-        &bpath,
+        &ppath,
     )
     .unwrap();
-    let mut tb = load_transformer(&snapshot()).unwrap();
-    assert!(
-        apply_flux2_adapters(
+    let mut tp = load_transformer(&snapshot()).unwrap();
+    apply_flux2_adapters(
+        &mut tp,
+        &[AdapterSpec {
+            path: ppath,
+            scale: 0.8,
+            kind: AdapterKind::Lora,
+        }],
+    )
+    .unwrap();
+
+    // The same fused qkv in BOTH the kohya and the base_model.model. spellings must agree with it.
+    for (label, up_key, down_key, alpha_key) in [
+        (
+            "lora_unet_",
+            "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight",
+            "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight",
+            "lora_unet_double_blocks_0_img_attn_qkv.alpha",
+        ),
+        (
+            "base_model.model.",
+            "base_model.model.double_blocks.0.img_attn.qkv.lora_B.weight",
+            "base_model.model.double_blocks.0.img_attn.qkv.lora_A.weight",
+            "base_model.model.double_blocks.0.img_attn.qkv.alpha",
+        ),
+    ] {
+        let bpath = dir.join(format!("bfl_qkv_{}.safetensors", label.replace('.', "_")));
+        Array::save_safetensors(
+            vec![(up_key, &b_fused), (down_key, &a), (alpha_key, &alpha)],
+            none,
+            &bpath,
+        )
+        .unwrap();
+        let mut tb = load_transformer(&snapshot()).unwrap();
+        let rb = apply_flux2_adapters(
             &mut tb,
             &[AdapterSpec {
                 path: bpath,
-                scale: 1.0,
+                scale: 0.8,
                 kind: AdapterKind::Lora,
             }],
         )
-        .is_err(),
-        "a BFL fused-qkv kohya key must error (sc-2743), not silently drop"
-    );
+        .unwrap();
+        assert_eq!(rb.applied, 3, "{label}: fused qkv → 3 split targets");
+        assert!(
+            rb.unmatched_paths.is_empty(),
+            "{label}: unmatched {:?}",
+            rb.unmatched_paths
+        );
+
+        for tgt in ["to_q", "to_k", "to_v"] {
+            let segs = ["transformer_blocks", "0", "attn", tgt];
+            let (ba, bb) = lora_arrays(
+                AdaptableHost::adaptable_mut(&mut tb, &segs)
+                    .unwrap()
+                    .adapters(),
+            );
+            let (pa, pb) = lora_arrays(
+                AdaptableHost::adaptable_mut(&mut tp, &segs)
+                    .unwrap()
+                    .adapters(),
+            );
+            assert!(
+                array_eq(&ba, &pa, false).unwrap().item::<bool>()
+                    && array_eq(&bb, &pb, false).unwrap().item::<bool>(),
+                "{label}: BFL split ≠ diffusers split at {tgt}"
+            );
+        }
+    }
+    println!("✓ BFL fused-qkv ≡ diffusers split on the real FLUX.2 tree (lora_unet_ + base_model.model.)");
 }

@@ -15,6 +15,7 @@ use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::nn::silu;
@@ -735,6 +736,176 @@ impl AdaptableHost for Flux2Transformer {
         }
         out
     }
+
+    /// BFL / ComfyUI fused→split targets (sc-2743), the Rust analog of the fork's
+    /// `Flux2LoRAMapping._get_bfl_*` + the `base_model.model.` global renames. Three things sc-2618's
+    /// diffusers/peft/kohya paths can't do, all here:
+    /// - **fused-qkv split**: the BFL `double_blocks.{n}.{img,txt}_attn.qkv` linear is one fused
+    ///   `[3·inner, …]` projection; FLUX.2's model keeps q/k/v SEPARATE (`attn.to_q/to_k/to_v`,
+    ///   `add_{q,k,v}_proj`), so each destination row-slices its third (equal 3-way; `inner`-independent).
+    /// - **BFL module renames**: `img_attn.proj`→`to_out`, `txt_attn.proj`→`to_add_out`,
+    ///   `{img,txt}_mlp.{0,2}`→`ff{_context}.linear_{in,out}`, `single_blocks.{n}.linear{1,2}`→
+    ///   `attn.{to_qkv_mlp_proj,to_out}` (linear1 stays FUSED in FLUX.2 → no split), and the global
+    ///   `base_model.model.` renames (`img_in`→`x_embedder`, `final_layer.linear`→`proj_out`, …).
+    /// - **the `diffusion_model.` / `base_model.model.` dotted prefixes** carrying BFL module names.
+    ///
+    /// klein-absent globals (`norm_out`, `guidance_linear_*`) have no `base_model.model.` BFL spelling
+    /// in the fork, so they're omitted; their diffusers-named forms stay peft-reachable. The 4-way
+    /// qkv-mlp split (`_split_qkv_mlp_up`) is FLUX.1's (separate `proj_mlp`) and lands with sc-2657.
+    fn bfl_targets(&self) -> Vec<BflTarget> {
+        let mut out = Vec::new();
+
+        // Globals: `base_model.model.` BFL renames only (the diffusers-named globals — bare /
+        // `transformer.` / `diffusion_model.` — are already covered by the peft loader).
+        for (bfl, tgt) in [
+            ("img_in", "x_embedder"),
+            ("txt_in", "context_embedder"),
+            ("time_in.in_layer", "time_guidance_embed.linear_1"),
+            ("time_in.out_layer", "time_guidance_embed.linear_2"),
+            (
+                "double_stream_modulation_img.lin",
+                "double_stream_modulation_img.linear",
+            ),
+            (
+                "double_stream_modulation_txt.lin",
+                "double_stream_modulation_txt.linear",
+            ),
+            (
+                "single_stream_modulation.lin",
+                "single_stream_modulation.linear",
+            ),
+            ("final_layer.linear", "proj_out"),
+        ] {
+            let (up, down, alpha) = bfl_global_keys(bfl);
+            out.push(rename_target(tgt, up, down, alpha));
+        }
+
+        // Double blocks.
+        for i in 0..self.double_blocks.len() {
+            // Fused qkv → split: img → to_{q,k,v}; txt → add_{q,k,v}_proj.
+            for (stream, dst) in [
+                ("img", ["to_q", "to_k", "to_v"]),
+                ("txt", ["add_q_proj", "add_k_proj", "add_v_proj"]),
+            ] {
+                let flat = format!("double_blocks_{i}_{stream}_attn_qkv");
+                let dotted = format!("double_blocks.{i}.{stream}_attn.qkv");
+                let (up, down, alpha) = bfl_block_keys(&flat, &dotted);
+                for idx in 0..3i32 {
+                    out.push(BflTarget {
+                        target_path: format!("transformer_blocks.{i}.attn.{}", dst[idx as usize]),
+                        up_keys: up.clone(),
+                        down_keys: down.clone(),
+                        alpha_keys: alpha.clone(),
+                        up_slice: Some(LoraRowSlice::Chunk { n: 3, index: idx }),
+                        down_slice: Some(LoraRowSlice::ChunkIfDivisible { n: 3, index: idx }),
+                    });
+                }
+            }
+            // attn output proj (rename, no split): img.proj → to_out; txt.proj → to_add_out.
+            for (stream, tgt) in [("img", "to_out"), ("txt", "to_add_out")] {
+                let flat = format!("double_blocks_{i}_{stream}_attn_proj");
+                let dotted = format!("double_blocks.{i}.{stream}_attn.proj");
+                let (up, down, alpha) = bfl_block_keys(&flat, &dotted);
+                out.push(rename_target(
+                    &format!("transformer_blocks.{i}.attn.{tgt}"),
+                    up,
+                    down,
+                    alpha,
+                ));
+            }
+            // MLP (rename): img_mlp.{0,2} → ff.linear_{in,out}; txt_mlp.{0,2} → ff_context.linear_{in,out}.
+            for (stream, ff) in [("img", "ff"), ("txt", "ff_context")] {
+                for (n, lin) in [("0", "linear_in"), ("2", "linear_out")] {
+                    let flat = format!("double_blocks_{i}_{stream}_mlp_{n}");
+                    let dotted = format!("double_blocks.{i}.{stream}_mlp.{n}");
+                    let (up, down, alpha) = bfl_block_keys(&flat, &dotted);
+                    out.push(rename_target(
+                        &format!("transformer_blocks.{i}.{ff}.{lin}"),
+                        up,
+                        down,
+                        alpha,
+                    ));
+                }
+            }
+        }
+
+        // Single blocks (rename, FUSED — no split): linear1 → attn.to_qkv_mlp_proj; linear2 → attn.to_out.
+        for i in 0..self.single_blocks.len() {
+            for (which, tgt) in [("linear1", "to_qkv_mlp_proj"), ("linear2", "to_out")] {
+                let flat = format!("single_blocks_{i}_{which}");
+                let dotted = format!("single_blocks.{i}.{which}");
+                let (up, down, alpha) = bfl_block_keys(&flat, &dotted);
+                out.push(rename_target(
+                    &format!("single_transformer_blocks.{i}.attn.{tgt}"),
+                    up,
+                    down,
+                    alpha,
+                ));
+            }
+        }
+
+        out
+    }
+}
+
+/// A non-split BFL target (a plain module rename): the source factors are copied through, no slice.
+fn rename_target(
+    target_path: &str,
+    up_keys: Vec<String>,
+    down_keys: Vec<String>,
+    alpha_keys: Vec<String>,
+) -> BflTarget {
+    BflTarget {
+        target_path: target_path.to_string(),
+        up_keys,
+        down_keys,
+        alpha_keys,
+        up_slice: None,
+        down_slice: None,
+    }
+}
+
+/// Every BFL source-key spelling for one *block* linear, across the three prefix conventions: kohya
+/// `lora_unet_<flat>` (flattened module path) and the dotted `diffusion_model.<dotted>` /
+/// `base_model.model.<dotted>` (both BFL-named for block layers), partitioned into (up, down, alpha)
+/// — `lora_up`≡`lora_B`, `lora_down`≡`lora_A`. Mirrors the fork's BFL `possible_*_patterns`.
+fn bfl_block_keys(flat: &str, dotted: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let up = vec![
+        format!("lora_unet_{flat}.lora_up.weight"),
+        format!("diffusion_model.{dotted}.lora_B.weight"),
+        format!("diffusion_model.{dotted}.lora_up.weight"),
+        format!("base_model.model.{dotted}.lora_B.weight"),
+        format!("base_model.model.{dotted}.lora_up.weight"),
+    ];
+    let down = vec![
+        format!("lora_unet_{flat}.lora_down.weight"),
+        format!("diffusion_model.{dotted}.lora_A.weight"),
+        format!("diffusion_model.{dotted}.lora_down.weight"),
+        format!("base_model.model.{dotted}.lora_A.weight"),
+        format!("base_model.model.{dotted}.lora_down.weight"),
+    ];
+    let alpha = vec![
+        format!("lora_unet_{flat}.alpha"),
+        format!("diffusion_model.{dotted}.alpha"),
+        format!("base_model.model.{dotted}.alpha"),
+    ];
+    (up, down, alpha)
+}
+
+/// BFL source-key spellings for a *global* linear: only the `base_model.model.<bfl_name>` form adds
+/// new coverage (the diffusers-named globals are peft-reachable), so the fork carries no `lora_unet_`
+/// or `diffusion_model.` BFL-named global pattern. (up, down, alpha).
+fn bfl_global_keys(bfl: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let up = vec![
+        format!("base_model.model.{bfl}.lora_B.weight"),
+        format!("base_model.model.{bfl}.lora_up.weight"),
+    ];
+    let down = vec![
+        format!("base_model.model.{bfl}.lora_A.weight"),
+        format!("base_model.model.{bfl}.lora_down.weight"),
+    ];
+    let alpha = vec![format!("base_model.model.{bfl}.alpha")];
+    (up, down, alpha)
 }
 
 /// Configuration glue so callers can keep the transformer's dims in one place.
@@ -1015,10 +1186,9 @@ mod tests {
             .any(|p| p == "transformer_blocks.0.attn.to_out.0"));
     }
 
-    /// A diffusers-named kohya file applies through the strict provider seam (every stem resolves);
-    /// a BFL fused key (`double_blocks_*_img_attn_qkv`, sc-2743) is surfaced and errors — loud.
+    /// A diffusers-named kohya file applies through the strict provider seam (every stem resolves).
     #[test]
-    fn kohya_diffusers_applies_and_bfl_errors() {
+    fn kohya_diffusers_applies() {
         use crate::adapters::apply_flux2_adapters;
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 
@@ -1050,36 +1220,241 @@ mod tests {
             "every diffusers-named kohya stem should resolve"
         );
         assert!(report.unmatched_paths.is_empty());
+    }
 
-        // A BFL fused-qkv key is a different format (sc-2743) → unmatched → strict error.
-        let bfl = tmp("flux2_kohya_bfl.safetensors");
+    // ---- sc-2743 BFL / ComfyUI fused→split routing (no real weights) --------------------------
+
+    /// The full `bfl_targets()` surface: drift guard (every target resolves), count, collision-free
+    /// target paths, the fused-qkv 3-way fan-out, and the FLUX.2 single-block `linear1` staying FUSED.
+    #[test]
+    fn bfl_targets_resolve_full_surface() {
+        let mut t = tiny_transformer();
+        let targets = t.bfl_targets();
+        // 8 globals + (1 double block × 12) + (1 single block × 2) = 22.
+        assert_eq!(
+            targets.len(),
+            22,
+            "BFL target count for a 1-double + 1-single tiny transformer"
+        );
+        // Drift guard: every BFL target path resolves through the matcher.
+        for tg in &targets {
+            let segs: Vec<&str> = tg.target_path.split('.').collect();
+            assert!(
+                AdaptableHost::adaptable_mut(&mut t, &segs).is_some(),
+                "BFL target {} does not resolve via adaptable_mut",
+                tg.target_path
+            );
+        }
+        // Distinct destinations (the qkv fan-out is across DIFFERENT targets, never a collision).
+        let distinct: std::collections::BTreeSet<&String> =
+            targets.iter().map(|tg| &tg.target_path).collect();
+        assert_eq!(distinct.len(), targets.len(), "two BFL targets collide");
+
+        // Fused img-qkv up key feeds exactly to_q/to_k/to_v with Chunk index 0/1/2.
+        let qkv_up = "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight";
+        let mut fanned: Vec<(String, i32)> = targets
+            .iter()
+            .filter(|tg| tg.up_keys.iter().any(|k| k == qkv_up))
+            .map(|tg| {
+                let idx = match &tg.up_slice {
+                    Some(LoraRowSlice::Chunk { index, .. }) => *index,
+                    _ => panic!("qkv target {} lacks a Chunk up-slice", tg.target_path),
+                };
+                (tg.target_path.clone(), idx)
+            })
+            .collect();
+        fanned.sort();
+        assert_eq!(
+            fanned,
+            vec![
+                ("transformer_blocks.0.attn.to_k".to_string(), 1),
+                ("transformer_blocks.0.attn.to_q".to_string(), 0),
+                ("transformer_blocks.0.attn.to_v".to_string(), 2),
+            ]
+        );
+
+        // FLUX.2 single-block `linear1` stays FUSED → maps to `to_qkv_mlp_proj` with NO slice.
+        let l1 = targets
+            .iter()
+            .find(|tg| tg.target_path == "single_transformer_blocks.0.attn.to_qkv_mlp_proj")
+            .expect("single linear1 target");
+        assert!(
+            l1.up_slice.is_none() && l1.down_slice.is_none(),
+            "FLUX.2 single linear1 must not split (it is fused in the model)"
+        );
+    }
+
+    /// sc-2743 gate at the FLUX.2 dispatch level: a BFL *fused* qkv kohya file resolves and installs
+    /// the BYTE-IDENTICAL `to_q/to_k/to_v` adapters as the equivalent diffusers split-target file
+    /// (the diffusers path is fork-verified, sc-2646 → transitively the BFL path matches the fork).
+    #[test]
+    fn bfl_fused_qkv_resolves_and_splits_like_diffusers() {
+        use crate::adapters::apply_flux2_adapters;
+        use mlx_gen::adapters::Adapter;
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+        let meta = None as Option<&std::collections::HashMap<String, String>>;
+
+        // out=2 per head, 3 heads → fused up [6,1]; r=1 (not ÷3) → shared down [1,in=2]; alpha=4.
+        let (inner, inp, r) = (2i32, 2i32, 1i32);
+        let bq = [0.10f32, 0.11];
+        let bk = [0.20f32, 0.21];
+        let bv = [0.30f32, 0.31];
+        let mut fused = bq.to_vec();
+        fused.extend_from_slice(&bk);
+        fused.extend_from_slice(&bv);
+        let b_fused = Array::from_slice(&fused, &[3 * inner, r]);
+        let b_q = Array::from_slice(&bq, &[inner, r]);
+        let b_k = Array::from_slice(&bk, &[inner, r]);
+        let b_v = Array::from_slice(&bv, &[inner, r]);
+        let a = Array::from_slice(&[0.5f32, -0.5], &[r, inp]);
+        let alpha = Array::from_slice(&[4.0f32], &[1]);
+
+        let bpath = tmp("flux2_bfl_qkv.safetensors");
         Array::save_safetensors(
             vec![
                 (
-                    "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight",
-                    &small,
+                    "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight",
+                    &b_fused,
                 ),
                 (
-                    "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight",
-                    &small,
+                    "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight",
+                    &a,
                 ),
+                ("lora_unet_double_blocks_0_img_attn_qkv.alpha", &alpha),
             ],
             meta,
-            &bfl,
+            &bpath,
         )
         .unwrap();
-        let mut t2 = tiny_transformer();
-        assert!(
-            apply_flux2_adapters(
-                &mut t2,
-                &[AdapterSpec {
-                    path: bfl,
-                    scale: 1.0,
-                    kind: AdapterKind::Lora
-                }],
-            )
-            .is_err(),
-            "a BFL fused-qkv kohya key must error (sc-2743), not silently drop"
+        let mut tb = tiny_transformer();
+        let rb = apply_flux2_adapters(
+            &mut tb,
+            &[AdapterSpec {
+                path: bpath,
+                scale: 0.8,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .unwrap();
+        assert_eq!(rb.applied, 3, "one fused qkv → three split targets");
+        assert!(rb.unmatched_paths.is_empty());
+
+        // Equivalent diffusers split-target file: per-head up, SHARED down, same alpha.
+        let ppath = tmp("flux2_bfl_split_peft.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
+                    &b_q,
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+                    &a,
+                ),
+                ("transformer.transformer_blocks.0.attn.to_q.alpha", &alpha),
+                (
+                    "transformer.transformer_blocks.0.attn.to_k.lora_B.weight",
+                    &b_k,
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_k.lora_A.weight",
+                    &a,
+                ),
+                ("transformer.transformer_blocks.0.attn.to_k.alpha", &alpha),
+                (
+                    "transformer.transformer_blocks.0.attn.to_v.lora_B.weight",
+                    &b_v,
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_v.lora_A.weight",
+                    &a,
+                ),
+                ("transformer.transformer_blocks.0.attn.to_v.alpha", &alpha),
+            ],
+            meta,
+            &ppath,
+        )
+        .unwrap();
+        let mut tp = tiny_transformer();
+        apply_flux2_adapters(
+            &mut tp,
+            &[AdapterSpec {
+                path: ppath,
+                scale: 0.8,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .unwrap();
+
+        for tgt in ["to_q", "to_k", "to_v"] {
+            let segs = ["transformer_blocks", "0", "attn", tgt];
+            let pull = |t: &mut Flux2Transformer| match AdaptableHost::adaptable_mut(t, &segs)
+                .unwrap()
+                .adapters()
+            {
+                [Adapter::Lora { a, b, .. }] => (a.clone(), b.clone()),
+                _ => panic!("expected one LoRA at {tgt}"),
+            };
+            let (ba, bb) = pull(&mut tb);
+            let (pa, pb) = pull(&mut tp);
+            assert!(
+                mlx_rs::ops::array_eq(&ba, &pa, false)
+                    .unwrap()
+                    .item::<bool>()
+                    && mlx_rs::ops::array_eq(&bb, &pb, false)
+                        .unwrap()
+                        .item::<bool>(),
+                "BFL split and diffusers split installed different adapters at {tgt}"
+            );
+        }
+    }
+
+    /// sc-2743: BFL plain renames resolve across all three prefix conventions — `base_model.model.`
+    /// globals (`img_in`→`x_embedder`, `final_layer.linear`→`proj_out`), a `diffusion_model.` dotted
+    /// block (`…img_attn.proj`→`to_out`), and a `base_model.model.` dotted single block
+    /// (`…linear1`→`to_qkv_mlp_proj`).
+    #[test]
+    fn bfl_renames_and_prefixes_resolve() {
+        use crate::adapters::apply_flux2_adapters;
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+        let meta = None as Option<&std::collections::HashMap<String, String>>;
+        let s = Array::from_slice(&[0.01f32], &[1, 1]);
+        let path = tmp("flux2_bfl_renames.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("base_model.model.img_in.lora_A.weight", &s),
+                ("base_model.model.img_in.lora_B.weight", &s),
+                ("base_model.model.final_layer.linear.lora_A.weight", &s),
+                ("base_model.model.final_layer.linear.lora_B.weight", &s),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.proj.lora_A.weight",
+                    &s,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.proj.lora_B.weight",
+                    &s,
+                ),
+                ("base_model.model.single_blocks.0.linear1.lora_A.weight", &s),
+                ("base_model.model.single_blocks.0.linear1.lora_B.weight", &s),
+            ],
+            meta,
+            &path,
+        )
+        .unwrap();
+        let mut t = tiny_transformer();
+        let rep = apply_flux2_adapters(
+            &mut t,
+            &[AdapterSpec {
+                path,
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            rep.applied, 4,
+            "all four BFL renames across the prefix conventions resolve"
         );
+        assert!(rep.unmatched_paths.is_empty());
     }
 }

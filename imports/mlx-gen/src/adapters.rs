@@ -323,6 +323,22 @@ pub trait AdaptableHost {
     fn adaptable_paths(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Enumerate the host's **BFL / ComfyUI** fused→split adapter targets (sc-2743), the orthogonal
+    /// axis to the kohya `lora_unet_` flattening of [`adaptable_paths`](Self::adaptable_paths). A
+    /// [`BflTarget`](loader::BflTarget) maps one source key spelling (in any of the BFL prefix
+    /// conventions — `lora_unet_…`, `diffusion_model.…`, `base_model.model.…`) to a diffusers module
+    /// path, optionally row-slicing the up/down factor so a *fused* source linear (BFL `…img_attn.qkv`,
+    /// `…linear1`) fans out into the model's *split* targets (`attn.to_q/to_k/to_v`, …). Mirrors the
+    /// fork's `Flux2LoRAMapping._get_bfl_*` + the `base_model.model.` global renames.
+    ///
+    /// The default is empty — only FLUX.2/FLUX.1 expose a BFL surface (Z-Image/Qwen/SDXL have none),
+    /// so a BFL file applied to a host without one surfaces every key as unmatched (loud), never
+    /// silently dropped. The per-target slices MUST be byte-faithful to `LoraTransforms` (guarded by
+    /// tests).
+    fn bfl_targets(&self) -> Vec<loader::BflTarget> {
+        Vec::new()
+    }
 }
 
 /// Prefix each of `host`'s [`AdaptableHost::adaptable_paths`] with `‹prefix›.` — the enumeration
