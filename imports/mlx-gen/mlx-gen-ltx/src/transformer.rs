@@ -116,8 +116,8 @@ impl Linear {
                     // reference's (f32 for F32Q8 — a lossless upcast of the bf16 file scales).
                     Ok(Linear::Quant {
                         q: q.clone(),
-                        scales: to_dtype(scales, Dtype::Bfloat16)?,
-                        biases: to_dtype(biases, Dtype::Bfloat16)?,
+                        scales: to_dtype(scales, dt)?,
+                        biases: to_dtype(biases, dt)?,
                         b,
                         group: QUANT_GROUP,
                         bits: QUANT_BITS,
@@ -512,15 +512,57 @@ impl LtxDiT {
         for block in &self.blocks {
             h = block.forward(&h, &ts_emb, prompt_ts.as_ref(), &context, mask, &cos, &sin)?;
         }
+        self.output_head(&h, &emb_ts)
+    }
 
-        // Output: LayerNorm(affine=false) → final 2-row scale_shift (modulated by embedded ts) → proj.
-        let table = self.scale_shift_table.reshape(&[1, 1, 2, inner])?;
-        let ss = add(&table, &emb_ts.reshape(&[b, -1, 1, inner])?)?; // (B, 1, 2, inner)
-        let shift = ss.index_axis(0, 2)?;
-        let scale = ss.index_axis(1, 2)?;
-        let normed = layer_norm(&h, None, None, self.cfg.norm_eps as f32)?;
-        let out = modulate(&normed, &scale, &shift)?;
-        self.proj_out.forward(&out)
+    /// Diagnostic: run the preprocessor + the first `n` blocks and return the hidden state (for the
+    /// per-block bisection of the e2e residual). `n == blocks.len()` is the full pre-output hidden.
+    #[doc(hidden)]
+    pub fn block_hidden(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        mask: Option<&Array>,
+        positions: &Array,
+        n: usize,
+    ) -> Result<Array> {
+        let dt = self.prec.dtype();
+        let b = latent.shape()[0];
+        let inner = self.cfg.inner_dim();
+        let coeff = self.cfg.adaln_embedding_coefficient;
+        let x = self.patchify_proj.forward(&latent.as_dtype(dt)?)?;
+        let mult = self.cfg.timestep_scale_multiplier as f32;
+        let ts_flat =
+            multiply(&timestep.as_dtype(Dtype::Float32)?, scalar(mult))?.reshape(&[-1])?;
+        let (ts_emb, _) = self.adaln.forward(&ts_flat, dt)?;
+        let ts_emb = ts_emb.reshape(&[b, -1, coeff * inner])?;
+        let prompt_ts = match &self.prompt_adaln {
+            Some(padaln) => {
+                let src = if timestep.ndim() > 1 {
+                    timestep.index_axis(0, 1)?.reshape(&[b, 1])?
+                } else {
+                    timestep.clone()
+                };
+                let src = multiply(&src.as_dtype(Dtype::Float32)?, scalar(mult))?.reshape(&[-1])?;
+                let (pts, _) = padaln.forward(&src, dt)?;
+                Some(pts.reshape(&[b, -1, 2 * inner])?)
+            }
+            None => None,
+        };
+        let context = context.as_dtype(dt)?;
+        let (cos, sin) = precompute_split_freqs_cis(
+            positions,
+            inner,
+            self.cfg.positional_embedding_theta,
+            self.cfg.positional_embedding_max_pos,
+            self.cfg.num_attention_heads,
+        )?;
+        let mut h = x;
+        for block in self.blocks.iter().take(n) {
+            h = block.forward(&h, &ts_emb, prompt_ts.as_ref(), &context, mask, &cos, &sin)?;
+        }
+        Ok(h)
     }
 }
 

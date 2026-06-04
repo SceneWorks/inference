@@ -25,6 +25,7 @@ pub mod rope;
 pub mod schedule;
 pub mod text_encoder;
 pub mod tiling;
+pub mod tokenizer;
 pub mod transformer;
 pub mod upsampler;
 pub mod vae;
@@ -38,6 +39,7 @@ pub use pipeline::{
 };
 pub use text_encoder::LtxTextEncoder;
 pub use tiling::TilingConfig;
+pub use tokenizer::LtxTokenizer;
 pub use transformer::{to_denoised, LtxDiT, Precision, VideoBlock};
 pub use upsampler::{upsample_latents, LatentUpsampler};
 pub use vae::LtxVideoVae;
