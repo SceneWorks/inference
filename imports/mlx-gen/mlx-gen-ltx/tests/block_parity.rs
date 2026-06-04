@@ -14,7 +14,7 @@ use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::config::LtxConfig;
-use mlx_gen_ltx::transformer::VideoBlock;
+use mlx_gen_ltx::transformer::{Precision, VideoBlock};
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -43,7 +43,8 @@ fn block_matches_reference() {
     let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
     let w =
         Weights::from_file(dir.join("transformer.safetensors")).expect("transformer.safetensors");
-    let block = VideoBlock::load(&w, "transformer_blocks.0", &cfg).expect("build block");
+    let block =
+        VideoBlock::load(&w, "transformer_blocks.0", &cfg, Precision::F32).expect("build block");
 
     let g = Weights::from_file(GOLDEN).expect("golden (run tools/dump_ltx_block_golden.py)");
     let x = g.require("x").unwrap();
