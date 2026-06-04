@@ -15,12 +15,17 @@
 //!   ([`apply_lora_kohya`]). kohya `lora_down`/`lora_up` == PEFT `lora_A`/`lora_B`, so both feed the
 //!   shared [`install_lora_groups`] and a kohya file yields the identical adapter to its PEFT twin.
 //!
-//! The fork's third, model-specific LoRA path — fused→split key transforms (FLUX.2/FLUX.1 BFL/ComfyUI
-//! `double_blocks_*` qkv split) — is a distinct format tracked as sc-2743; its keys surface as
-//! unmatched here (loud), never silently dropped.
+//! - **BFL / ComfyUI** (`lora_unet_double_blocks_*` / `diffusion_model.…` / `base_model.model.…`,
+//!   sc-2743): a *fused* source linear (`…img_attn.qkv`, `…linear1`) is row-sliced into the model's
+//!   *split* targets (`attn.to_q/to_k/to_v`, …) via per-target [`LoraRowSlice`] transforms, with BFL
+//!   module renames (`img_in`→`x_embedder`). This is fused→split weight surgery, orthogonal to the
+//!   kohya underscore form; the host supplies its table via [`AdaptableHost::bfl_targets`]
+//!   ([`apply_lora_bfl`]). Only FLUX.2/FLUX.1 expose one; for other hosts a BFL file's keys surface as
+//!   unmatched (loud), never silently dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use super::{reconstruct_lokr_delta, AdaptableHost, Adapter};
@@ -254,11 +259,13 @@ fn kohya_table(paths: &[String]) -> BTreeMap<String, String> {
 /// installed through the same [`install_lora_groups`] path as PEFT, so a kohya file produces the
 /// identical adapter to the equivalent PEFT file.
 ///
-/// `lora_unet_` keys whose stem is NOT in the table (off-surface, or a fused→split convention like
-/// FLUX.2's BFL `double_blocks_*` — sc-2743) are surfaced in `unmatched_paths` so the strict policy
-/// fails loudly rather than silently dropping them. Keys without the `lora_unet_` prefix (e.g. a
-/// bundled text-encoder `lora_te_…`) are not denoiser targets and are ignored, matching the PEFT
-/// loader's treatment of keys outside its namespace.
+/// `lora_unet_` keys whose stem is NOT in the table (off-surface) are surfaced in `unmatched_paths`
+/// so the strict policy fails loudly rather than silently dropping them. The BFL fused→split kohya
+/// form (`lora_unet_double_blocks_*`, sc-2743) is routed to [`apply_lora_bfl`] *before* this loader
+/// for a host that exposes [`AdaptableHost::bfl_targets`]; reaching here it has no table entry and is
+/// likewise surfaced. Keys without the `lora_unet_` prefix (e.g. a bundled text-encoder `lora_te_…`)
+/// are not denoiser targets and are ignored, matching the PEFT loader's treatment of out-of-namespace
+/// keys.
 pub fn apply_lora_kohya(
     host: &mut impl AdaptableHost,
     w: &Weights,
@@ -286,6 +293,188 @@ pub fn apply_lora_kohya(
             KohyaRole::Down => parts.a = Some(w.require(&key)?.clone()),
             KohyaRole::Up => parts.b = Some(w.require(&key)?.clone()),
             KohyaRole::Alpha => parts.alpha = w.require(&key)?.as_slice::<f32>().first().copied(),
+        }
+    }
+
+    let mut report = install_lora_groups(host, groups, scale)?;
+    report.unmatched_paths.extend(unresolved);
+    Ok(report)
+}
+
+// ---- BFL / ComfyUI fused→split LoRA (sc-2743) ----------------------------------------------------
+
+/// A row-slice over a raw LoRA factor (applied BEFORE the `[r,in]`/`[out,r]`→residual transpose),
+/// porting the fork's `LoraTransforms` byte-for-byte (sc-2743). The BFL/ComfyUI checkpoints store a
+/// block's q/k/v (and, for FLUX.1, the qkv+mlp) concatenated along dim-0 of a single *fused* linear;
+/// each diffusers split target slices out its own rows. Indices/divisibility match `LoraTransforms`
+/// exactly (verified against the fork venv).
+#[derive(Clone, Debug)]
+pub enum LoraRowSlice {
+    /// Chunk `index` of `n` equal dim-0 chunks (`chunk = shape[0] / n`), ALWAYS sliced — the fork's
+    /// `_split_qkv_up` (the up factor `[n·out, r]` → `[out, r]`). `n=3` for qkv.
+    Chunk { n: i32, index: i32 },
+    /// Chunk `index` of `n` equal dim-0 chunks IFF `shape[0] % n == 0`, else the whole tensor — the
+    /// fork's `_split_qkv_down`/`_split_qkv_mlp_down` (the down factor is *shared* across q/k/v when
+    /// the rank isn't divisible by `n`, which is the usual fused-qkv LoRA, and sliced when it is).
+    ChunkIfDivisible { n: i32, index: i32 },
+    /// The dim-0 slice `[Σdims[..index] .. Σdims[..=index]]` — the fork's `_split_qkv_mlp_up` with
+    /// config-derived `dims` (FLUX.1 `linear1` = `[q,k,v,mlp]`, e.g. `[3072,3072,3072,12288]`). FLUX.2
+    /// keeps qkv+mlp fused (`to_qkv_mlp_proj`) so it never uses this; FLUX.1 (sc-2657) will.
+    Dims { dims: Vec<i32>, index: i32 },
+}
+
+impl LoraRowSlice {
+    fn apply(&self, t: &Array) -> Result<Array> {
+        let rows = t.shape()[0];
+        let (start, end) = match self {
+            LoraRowSlice::Chunk { n, index } => {
+                let chunk = rows / n;
+                (index * chunk, (index + 1) * chunk)
+            }
+            LoraRowSlice::ChunkIfDivisible { n, index } => {
+                if rows % n != 0 {
+                    return Ok(t.clone());
+                }
+                let chunk = rows / n;
+                (index * chunk, (index + 1) * chunk)
+            }
+            LoraRowSlice::Dims { dims, index } => {
+                let i = *index as usize;
+                let start: i32 = dims[..i].iter().sum();
+                (start, start + dims[i])
+            }
+        };
+        // `t[start:end, :]` — byte-identical to the fork's slicing.
+        Ok(t.try_index((start..end, ..))?)
+    }
+}
+
+/// One BFL/ComfyUI adapter target: a set of source key spellings (across the `lora_unet_` /
+/// `diffusion_model.` / `base_model.model.` prefix conventions) mapping to a diffusers module
+/// `target_path`, with an optional [`LoraRowSlice`] on the up/down factor. A *fused* source (BFL
+/// `…img_attn.qkv`) is named by SEVERAL `BflTarget`s — one per split destination (`to_q`/`to_k`/`to_v`)
+/// — that share its key spellings but slice different rows; the loader fans the one source tensor into
+/// all of them. A plain rename (BFL `img_in` → `x_embedder`) is a `BflTarget` with no slice. Mirrors a
+/// fork `LoRATarget` restricted to its BFL patterns + up/down transforms.
+#[derive(Clone, Debug)]
+pub struct BflTarget {
+    /// Diffusers module path that [`AdaptableHost::adaptable_mut`] resolves (concrete, no `{block}`).
+    pub target_path: String,
+    /// Source up-factor (`lora_up`/`lora_B`) key spellings.
+    pub up_keys: Vec<String>,
+    /// Source down-factor (`lora_down`/`lora_A`) key spellings.
+    pub down_keys: Vec<String>,
+    /// Source `alpha` key spellings (no transform, no transpose).
+    pub alpha_keys: Vec<String>,
+    /// Row-slice applied to the up factor (the qkv split). `None` for a plain rename.
+    pub up_slice: Option<LoraRowSlice>,
+    /// Row-slice applied to the down factor (shared-or-split). `None` for a plain rename.
+    pub down_slice: Option<LoraRowSlice>,
+}
+
+/// One contribution of a source key to a target: which target/role it feeds and how to slice it.
+struct BflSlot {
+    target: String,
+    role: KohyaRole,
+    slice: Option<LoraRowSlice>,
+}
+
+/// Invert `targets` into `source_key → [contribution, …]`. One fused source key (e.g. a qkv
+/// `lora_up`) contributes to multiple targets (q/k/v) with different slices, so the value is a list.
+fn bfl_index(targets: &[BflTarget]) -> BTreeMap<String, Vec<BflSlot>> {
+    let mut index: BTreeMap<String, Vec<BflSlot>> = BTreeMap::new();
+    let mut push = |key: &str, target: &str, role: KohyaRole, slice: Option<LoraRowSlice>| {
+        index.entry(key.to_string()).or_default().push(BflSlot {
+            target: target.to_string(),
+            role,
+            slice,
+        });
+    };
+    for t in targets {
+        for k in &t.up_keys {
+            push(k, &t.target_path, KohyaRole::Up, t.up_slice.clone());
+        }
+        for k in &t.down_keys {
+            push(k, &t.target_path, KohyaRole::Down, t.down_slice.clone());
+        }
+        for k in &t.alpha_keys {
+            push(k, &t.target_path, KohyaRole::Alpha, None);
+        }
+    }
+    index
+}
+
+/// `true` if any key in `w` is a known BFL source key for `targets` — i.e. the file uses the BFL /
+/// ComfyUI naming (`double_blocks`/`single_blocks`/`img_in`/… across the three prefix conventions),
+/// which the diffusers/peft/standard-kohya paths cannot resolve. Precise: a standard diffusers/peft
+/// or standard-kohya file shares none of these spellings, so it is never misrouted here.
+pub fn is_bfl(w: &Weights, targets: &[BflTarget]) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    let index = bfl_index(targets);
+    w.keys().any(|k| index.contains_key(k))
+}
+
+/// Recognized LoRA factor suffixes — a key ending in one of these is adapter-shaped (vs. a base
+/// weight or some bundled extra). Used to surface BFL-named keys that resolve to no target.
+const LORA_FACTOR_SUFFIXES: [&str; 5] = [
+    ".lora_up.weight",
+    ".lora_down.weight",
+    ".lora_A.weight",
+    ".lora_B.weight",
+    ".alpha",
+];
+
+/// Install a BFL / ComfyUI fused→split LoRA onto `host` (sc-2743). Each file key is matched against
+/// the inverted [`BflTarget`] index; a matched *fused* source is row-sliced per destination and fanned
+/// into the diffusers split targets (`…img_attn.qkv` → `attn.to_q/to_k/to_v`), a plain rename is copied
+/// through. Resolved factors feed the same [`install_lora_groups`] path as PEFT/kohya (transpose +
+/// `alpha/rank` fold), so a BFL file yields the byte-identical adapter to the equivalent diffusers
+/// split-target LoRA.
+///
+/// An adapter-shaped key that matches NO target — an off-surface BFL key (e.g. a block out of range)
+/// — is surfaced in `unmatched_paths` (loud, never silently dropped). A bundled text-encoder key
+/// (`lora_te_…`/`text_encoder.…`) is not a denoiser target and is ignored, matching the PEFT/kohya
+/// loaders' treatment of out-of-namespace keys.
+pub fn apply_lora_bfl(
+    host: &mut impl AdaptableHost,
+    w: &Weights,
+    scale: f32,
+    targets: &[BflTarget],
+) -> Result<ApplyReport> {
+    let index = bfl_index(targets);
+    let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
+    let mut unresolved: BTreeSet<String> = BTreeSet::new();
+    for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
+        let Some(slots) = index.get(&key) else {
+            // Not a BFL source key: surface it if it's an adapter-shaped denoiser key (off-surface),
+            // ignore a bundled text-encoder adapter (`lora_te_…`/`…text_encoder.…`).
+            let adapter_shaped = LORA_FACTOR_SUFFIXES.iter().any(|s| key.ends_with(s));
+            let foreign_te = key.starts_with("lora_te") || key.contains("text_encoder");
+            if adapter_shaped && !foreign_te {
+                unresolved.insert(key);
+            }
+            continue;
+        };
+        let v = w.require(&key)?;
+        for slot in slots {
+            let parts = groups.entry(slot.target.clone()).or_default();
+            match slot.role {
+                KohyaRole::Down => {
+                    parts.a = Some(match &slot.slice {
+                        Some(s) => s.apply(v)?,
+                        None => v.clone(),
+                    });
+                }
+                KohyaRole::Up => {
+                    parts.b = Some(match &slot.slice {
+                        Some(s) => s.apply(v)?,
+                        None => v.clone(),
+                    });
+                }
+                KohyaRole::Alpha => parts.alpha = v.as_slice::<f32>().first().copied(),
+            }
         }
     }
 
@@ -356,13 +545,26 @@ pub fn apply_adapter_specs_autoprefix(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
 ) -> Result<ApplyReport> {
-    // The kohya `flattened → dotted` table walks the model tree, so build it lazily and only once,
-    // the first time a kohya file is seen across `specs`.
+    // The kohya `flattened → dotted` table and the BFL target list both walk the model tree, so
+    // build each lazily and only once, the first time it is needed across `specs`.
     let mut kohya: Option<BTreeMap<String, String>> = None;
+    let mut bfl: Option<Vec<BflTarget>> = None;
     let mut combined = ApplyReport::default();
     for spec in specs {
         let w = Weights::from_file(&spec.path)?;
-        let report = if !is_lokr(&w) && is_kohya(&w) {
+        // BFL / ComfyUI fused→split naming (sc-2743) is the orthogonal axis to kohya flattening and
+        // shares the `lora_unet_` prefix, so it must be detected BEFORE `is_kohya`. (LoKr first.)
+        let is_bfl_file = if is_lokr(&w) {
+            false
+        } else {
+            if bfl.is_none() {
+                bfl = Some(host.bfl_targets());
+            }
+            is_bfl(&w, bfl.as_ref().unwrap())
+        };
+        let report = if is_bfl_file {
+            apply_lora_bfl(host, &w, spec.scale, bfl.as_ref().unwrap())?
+        } else if !is_lokr(&w) && is_kohya(&w) {
             // kohya LoRA: dots are flattened to underscores, so keys resolve through the table
             // rather than the prefix-strip path. (LoKr keeps dotted paths; checked first.)
             if kohya.is_none() {
@@ -397,8 +599,8 @@ pub fn apply_adapters_strict(
     if !specs.is_empty() && report.applied == 0 {
         return Err(format!(
             "{model} adapters: no target modules matched across {} adapter file(s) — check the \
-             format/prefix (expected diffusers/peft LoRA, kohya `lora_unet_` LoRA, or LoKr keys; \
-             a kohya file with only fused→split BFL keys — FLUX.2 `double_blocks_*` — is sc-2743)",
+             format/prefix (expected diffusers/peft LoRA, kohya `lora_unet_` LoRA, BFL/ComfyUI \
+             fused→split LoRA — for a host with a BFL surface — or LoKr keys)",
             specs.len()
         )
         .into());
@@ -1091,5 +1293,263 @@ mod tests {
             .forward(&x)
             .unwrap();
         assert!(array_eq(&out, &base, false).unwrap().item::<bool>());
+    }
+
+    // ---- BFL / ComfyUI fused→split LoRA (sc-2743) ----
+
+    /// The [`LoraRowSlice`] variants are byte-faithful to the fork's `LoraTransforms`. Expected values
+    /// are pinned to the mflux venv (`LoraTransforms.split_*` on the same inputs, sc-2743): up always
+    /// slices, down is shared unless the rank is divisible, and the qkv-mlp `dims` slice matches the
+    /// `[3072,3072,3072,12288]` boundaries.
+    #[test]
+    fn lora_row_slice_matches_fork_transforms() {
+        // arange(6,2): split_q_up = rows[0:2], split_v_up = rows[4:6].
+        let t6 = Array::from_slice(&(0..12).map(|i| i as f32).collect::<Vec<_>>(), &[6, 2]);
+        let q_up = LoraRowSlice::Chunk { n: 3, index: 0 }.apply(&t6).unwrap();
+        assert_eq!(q_up.shape(), &[2, 2]);
+        assert_eq!(q_up.as_slice::<f32>(), &[0.0, 1.0, 2.0, 3.0]);
+        let v_up = LoraRowSlice::Chunk { n: 3, index: 2 }.apply(&t6).unwrap();
+        assert_eq!(v_up.as_slice::<f32>(), &[8.0, 9.0, 10.0, 11.0]);
+
+        // down: ChunkIfDivisible — whole when rank%3!=0 (the usual fused-qkv LoRA), sliced when ==0.
+        let d4 = Array::from_slice(&(0..8).map(|i| i as f32).collect::<Vec<_>>(), &[4, 2]);
+        let d4q = LoraRowSlice::ChunkIfDivisible { n: 3, index: 0 }
+            .apply(&d4)
+            .unwrap();
+        assert_eq!(d4q.shape(), &[4, 2], "rank 4 not ÷3 → shared whole");
+        assert_eq!(d4q.as_slice::<f32>(), d4.as_slice::<f32>());
+        let d6q = LoraRowSlice::ChunkIfDivisible { n: 3, index: 0 }
+            .apply(&t6)
+            .unwrap();
+        assert_eq!(
+            d6q.as_slice::<f32>(),
+            &[0.0, 1.0, 2.0, 3.0],
+            "rank 6 ÷3 → sliced"
+        );
+
+        // qkv-mlp up `dims` (FLUX.1 `linear1`): q = rows[0:3072], mlp = rows[9216:21504].
+        let dims = vec![3072, 3072, 3072, 12288];
+        let total: i32 = dims.iter().sum();
+        let big = Array::from_slice(
+            &(0..total).map(|i| i as f32).collect::<Vec<_>>(),
+            &[total, 1],
+        );
+        let q = LoraRowSlice::Dims {
+            dims: dims.clone(),
+            index: 0,
+        }
+        .apply(&big)
+        .unwrap();
+        assert_eq!(q.shape(), &[3072, 1]);
+        assert_eq!(q.as_slice::<f32>()[0], 0.0);
+        let mlp = LoraRowSlice::Dims {
+            dims: dims.clone(),
+            index: 3,
+        }
+        .apply(&big)
+        .unwrap();
+        assert_eq!(mlp.shape(), &[12288, 1]);
+        assert_eq!(mlp.as_slice::<f32>()[0], 9216.0);
+    }
+
+    /// A host with three separate per-head linears at `blk.attn.to_{q,k,v}` (`[inner,in]` each).
+    fn three_qkv_host(inner: i32, inp: i32) -> MultiHost {
+        let zeros = || Array::from_slice(&vec![0.0f32; (inner * inp) as usize], &[inner, inp]);
+        MultiHost::new(&[
+            ("blk.attn.to_q", zeros()),
+            ("blk.attn.to_k", zeros()),
+            ("blk.attn.to_v", zeros()),
+        ])
+    }
+
+    /// The sc-2743 gate at the core level: a BFL *fused* qkv LoRA, split via [`apply_lora_bfl`],
+    /// installs the BYTE-IDENTICAL adapter at each of `to_q/to_k/to_v` as the equivalent *diffusers
+    /// split-target* LoRA (the fork-verified PEFT path). The fused up `[3·inner, r]` is row-sliced into
+    /// per-head `[inner, r]`; the down `[r, in]` (rank not ÷3) is shared. No model weights needed.
+    #[test]
+    fn bfl_fused_qkv_equals_diffusers_split() {
+        let (inner, inp, r) = (4i32, 3i32, 2i32);
+        // Per-head up factors, then the fused up = their dim-0 concat (row-major, so flat concat).
+        let bq: Vec<f32> = (0..inner * r)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.01)
+            .collect();
+        let bk: Vec<f32> = (0..inner * r)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.02)
+            .collect();
+        let bv: Vec<f32> = (0..inner * r)
+            .map(|i| ((i % 3) as f32 - 1.0) * 0.03)
+            .collect();
+        let mut fused = Vec::new();
+        fused.extend_from_slice(&bq);
+        fused.extend_from_slice(&bk);
+        fused.extend_from_slice(&bv);
+        let b_fused = Array::from_slice(&fused, &[3 * inner, r]);
+        let b_q = Array::from_slice(&bq, &[inner, r]);
+        let b_k = Array::from_slice(&bk, &[inner, r]);
+        let b_v = Array::from_slice(&bv, &[inner, r]);
+        // Shared down [r, in] (rank 2 not ÷3 → shared across q/k/v) + alpha ≠ rank.
+        let a = Array::from_slice(
+            &(0..r * inp)
+                .map(|i| ((i % 5) as f32 - 2.0) * 0.05)
+                .collect::<Vec<_>>(),
+            &[r, inp],
+        );
+        let alpha = Array::from_slice(&[4.0f32], &[1]);
+
+        // BFL file: one fused qkv linear (kohya `lora_unet_` spelling).
+        let up_key = "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight";
+        let down_key = "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight";
+        let alpha_key = "lora_unet_double_blocks_0_img_attn_qkv.alpha";
+        let bfl_path = tmp("bfl_qkv.safetensors");
+        Array::save_safetensors(
+            vec![(up_key, &b_fused), (down_key, &a), (alpha_key, &alpha)],
+            None as Option<&HashMap<String, String>>,
+            &bfl_path,
+        )
+        .unwrap();
+        let wb = Weights::from_file(&bfl_path).unwrap();
+
+        let mk = |idx: i32, tgt: &str| BflTarget {
+            target_path: tgt.to_string(),
+            up_keys: vec![up_key.to_string()],
+            down_keys: vec![down_key.to_string()],
+            alpha_keys: vec![alpha_key.to_string()],
+            up_slice: Some(LoraRowSlice::Chunk { n: 3, index: idx }),
+            down_slice: Some(LoraRowSlice::ChunkIfDivisible { n: 3, index: idx }),
+        };
+        let targets = vec![
+            mk(0, "blk.attn.to_q"),
+            mk(1, "blk.attn.to_k"),
+            mk(2, "blk.attn.to_v"),
+        ];
+
+        let mut host_bfl = three_qkv_host(inner, inp);
+        let rep = apply_lora_bfl(&mut host_bfl, &wb, 0.7, &targets).unwrap();
+        assert_eq!(rep.applied, 3, "all three split targets installed");
+        assert!(rep.unmatched_paths.is_empty());
+
+        // Equivalent diffusers split-target file: per-head up, SHARED down, same alpha.
+        let peft_path = tmp("bfl_split_peft.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("transformer.blk.attn.to_q.lora_B.weight", &b_q),
+                ("transformer.blk.attn.to_q.lora_A.weight", &a),
+                ("transformer.blk.attn.to_q.alpha", &alpha),
+                ("transformer.blk.attn.to_k.lora_B.weight", &b_k),
+                ("transformer.blk.attn.to_k.lora_A.weight", &a),
+                ("transformer.blk.attn.to_k.alpha", &alpha),
+                ("transformer.blk.attn.to_v.lora_B.weight", &b_v),
+                ("transformer.blk.attn.to_v.lora_A.weight", &a),
+                ("transformer.blk.attn.to_v.alpha", &alpha),
+            ],
+            None as Option<&HashMap<String, String>>,
+            &peft_path,
+        )
+        .unwrap();
+        let wp = Weights::from_file(&peft_path).unwrap();
+        let mut host_peft = three_qkv_host(inner, inp);
+        apply_lora_peft(&mut host_peft, &wp, 0.7, Some("transformer.")).unwrap();
+
+        for p in ["blk.attn.to_q", "blk.attn.to_k", "blk.attn.to_v"] {
+            let pull = |h: &MultiHost| match h.mods.get(p).unwrap().adapters() {
+                [Adapter::Lora { a, b, scale }] => (a.clone(), b.clone(), *scale),
+                _ => panic!("expected one LoRA at {p}"),
+            };
+            let (ba, bb, bs) = pull(&host_bfl);
+            let (pa, pb, ps) = pull(&host_peft);
+            assert_eq!(bs, ps, "scale differs at {p}");
+            assert!(
+                array_eq(&ba, &pa, false).unwrap().item::<bool>()
+                    && array_eq(&bb, &pb, false).unwrap().item::<bool>(),
+                "BFL split and diffusers split installed different adapters at {p}"
+            );
+        }
+    }
+
+    /// `is_bfl` detects a BFL file; an off-surface adapter-shaped key is surfaced (not dropped) while a
+    /// bundled text-encoder key is ignored; and a scale-0 BFL adapter is a bit-exact no-op.
+    #[test]
+    fn bfl_detection_unmatched_and_scale_zero() {
+        let up = Array::from_slice(
+            &(0..8).map(|i| i as f32 * 0.01).collect::<Vec<_>>(),
+            &[4, 2],
+        );
+        let down = Array::from_slice(&[0.1f32, 0.2, -0.1, -0.2, 0.3, -0.3], &[2, 3]);
+        let targets = vec![BflTarget {
+            target_path: "blk.attn.to_out".to_string(),
+            up_keys: vec!["lora_unet_double_blocks_0_img_attn_proj.lora_up.weight".to_string()],
+            down_keys: vec!["lora_unet_double_blocks_0_img_attn_proj.lora_down.weight".to_string()],
+            alpha_keys: vec![],
+            up_slice: None,
+            down_slice: None,
+        }];
+
+        let path = tmp("bfl_detect.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "lora_unet_double_blocks_0_img_attn_proj.lora_up.weight",
+                    &up,
+                ),
+                (
+                    "lora_unet_double_blocks_0_img_attn_proj.lora_down.weight",
+                    &down,
+                ),
+                // off-surface BFL key (no target) → surfaced, not silently dropped.
+                (
+                    "lora_unet_double_blocks_9_img_attn_proj.lora_up.weight",
+                    &up,
+                ),
+                (
+                    "lora_unet_double_blocks_9_img_attn_proj.lora_down.weight",
+                    &down,
+                ),
+                // bundled text-encoder key → ignored (out of denoiser namespace).
+                ("lora_te_text_model_layer_0.lora_up.weight", &up),
+            ],
+            None as Option<&HashMap<String, String>>,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+        assert!(is_bfl(&w, &targets), "a BFL source key marks the file BFL");
+
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let mut host = MultiHost::new(&[(
+            "blk.attn.to_out",
+            Array::from_slice(
+                &(0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+                &[4, 3],
+            ),
+        )]);
+        let base = host
+            .mods
+            .get("blk.attn.to_out")
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+
+        // scale 0 → bit-exact no-op; the off-surface block-9 key is surfaced, the TE key ignored.
+        let rep = apply_lora_bfl(&mut host, &w, 0.0, &targets).unwrap();
+        assert_eq!(rep.applied, 1, "the on-surface proj target installed");
+        // Both block-9 keys (up + down) are surfaced (sorted: down < up); the `lora_te_` key ignored.
+        assert_eq!(
+            rep.unmatched_paths,
+            vec![
+                "lora_unet_double_blocks_9_img_attn_proj.lora_down.weight".to_string(),
+                "lora_unet_double_blocks_9_img_attn_proj.lora_up.weight".to_string(),
+            ],
+            "off-surface BFL keys surfaced; TE key ignored"
+        );
+        let out = host
+            .mods
+            .get("blk.attn.to_out")
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        assert!(
+            array_eq(&out, &base, false).unwrap().item::<bool>(),
+            "scale-0 BFL adapter must be a bit-exact no-op"
+        );
     }
 }
