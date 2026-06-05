@@ -345,8 +345,16 @@ mod tests {
 
     #[test]
     fn union_masks_white_wins() {
-        let a = Image { width: 2, height: 1, pixels: vec![255, 255, 255, 0, 0, 0] };
-        let b = Image { width: 2, height: 1, pixels: vec![0, 0, 0, 0, 0, 0] };
+        let a = Image {
+            width: 2,
+            height: 1,
+            pixels: vec![255, 255, 255, 0, 0, 0],
+        };
+        let b = Image {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 0, 0, 0, 0, 0],
+        };
         let u = union_masks(&a, &b).unwrap();
         assert_eq!(u.pixels, vec![255, 255, 255, 0, 0, 0]);
     }

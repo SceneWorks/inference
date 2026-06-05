@@ -209,10 +209,18 @@ fn denoise_core(
                     time_ids,
                     cc.scale,
                 )?;
-                d.unet
-                    .forward_with_control(&x_unet, timestep, conditioning, pooled, time_ids, &res)?
+                d.unet.forward_with_control(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    &res,
+                )?
             }
-            None => d.unet.forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
+            None => d
+                .unet
+                .forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
         };
         let eps = if cfg_on {
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
@@ -288,7 +296,11 @@ pub fn preprocess_init_image(
 /// Preprocess a ControlNet control image (sc-3058): LANCZOS resize to the target dims, normalize
 /// `[0,255] → [0,1]` (the diffusers control image processor uses `do_normalize=False` ⇒ `[0,1]`, NOT
 /// the `[-1,1]` of a VAE init), lay out NHWC `[1, H, W, 3]` f32.
-pub fn preprocess_control_image(image: &Image, target_width: u32, target_height: u32) -> Result<Array> {
+pub fn preprocess_control_image(
+    image: &Image,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Array> {
     let (iw, ih) = (image.width as usize, image.height as usize);
     let (tw, th) = (target_width as usize, target_height as usize);
     if image.pixels.len() != iw * ih * 3 {

@@ -29,8 +29,8 @@ fn snapshot() -> PathBuf {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--h94--IP-Adapter/snapshots");
+    let snaps =
+        PathBuf::from(home).join(".cache/huggingface/hub/models--h94--IP-Adapter/snapshots");
     std::fs::read_dir(&snaps)
         .expect("HF cache snapshots dir for h94/IP-Adapter")
         .filter_map(|e| e.ok())
@@ -113,10 +113,18 @@ fn ip_adapter_image_path_matches_torch() {
     // Primitive isolations: which sub-op of one encoder layer carries the ~8e-4/layer drift?
     {
         use mlx_rs::fast::layer_norm;
-        let gin = g.require("gelu_in").unwrap().as_dtype(Dtype::Float32).unwrap();
+        let gin = g
+            .require("gelu_in")
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
         let gout = mlx_gen::nn::gelu_exact(&gin).unwrap();
         diagnose("prim gelu_exact", &gout, g.require("gelu_out").unwrap());
-        let lin = g.require("ln_in").unwrap().as_dtype(Dtype::Float32).unwrap();
+        let lin = g
+            .require("ln_in")
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
         let lw = g.require("ln_w").unwrap().as_dtype(Dtype::Float32).unwrap();
         let lb = g.require("ln_b").unwrap().as_dtype(Dtype::Float32).unwrap();
         let lout = layer_norm(&lin, Some(&lw), Some(&lb), 1e-5).unwrap();
@@ -124,8 +132,14 @@ fn ip_adapter_image_path_matches_torch() {
         // Both activation + norm are bit-exact to torch — so the encoder's residual drift is NOT
         // a primitive port bug; it's cross-backend f32 GEMM/SDPA accumulating in CLIP's pre-LN
         // residual stream (sc-3056 finding).
-        assert!(peak_rel(&gout, g.require("gelu_out").unwrap()) < 1e-5, "gelu_exact != torch");
-        assert!(peak_rel(&lout, g.require("ln_out").unwrap()) < 1e-5, "layer_norm != torch");
+        assert!(
+            peak_rel(&gout, g.require("gelu_out").unwrap()) < 1e-5,
+            "gelu_exact != torch"
+        );
+        assert!(
+            peak_rel(&lout, g.require("ln_out").unwrap()) < 1e-5,
+            "layer_norm != torch"
+        );
     }
 
     let snap = snapshot();
@@ -145,9 +159,21 @@ fn ip_adapter_image_path_matches_torch() {
 
     // 1. ViT-H per-layer bisection (localize any drift) + penultimate.
     let states = encoder.hidden_states(&pixel_nhwc).unwrap();
-    diagnose("ViT-H h0 (embed+pre_ln)", &states[0], g.require("vit_h0").unwrap());
-    diagnose("ViT-H h1 (layer 0 out) ", &states[1], g.require("vit_h1").unwrap());
-    diagnose("ViT-H h16 (layer 15 out)", &states[16], g.require("vit_h16").unwrap());
+    diagnose(
+        "ViT-H h0 (embed+pre_ln)",
+        &states[0],
+        g.require("vit_h0").unwrap(),
+    );
+    diagnose(
+        "ViT-H h1 (layer 0 out) ",
+        &states[1],
+        g.require("vit_h1").unwrap(),
+    );
+    diagnose(
+        "ViT-H h16 (layer 15 out)",
+        &states[16],
+        g.require("vit_h16").unwrap(),
+    );
     let vit = states[states.len() - 2].clone();
     let vit_rel = peak_rel(&vit, vit_golden);
     diagnose("ViT-H penultimate       ", &vit, vit_golden);
@@ -170,7 +196,16 @@ fn ip_adapter_image_path_matches_torch() {
     // cross-backend f32 GEMM/SDPA floor over 32 layers (gelu + layer_norm + embeddings are each
     // proven bit-exact above, so this is NOT a port bug). The end-of-chain token error is <1% —
     // negligible for IP-Adapter conditioning at scale 0.5–0.8.
-    assert!(tok_iso_rel < 1e-3, "Resampler (golden in) diverged: {tok_iso_rel:.3e}");
-    assert!(tok_e2e_rel < 1.5e-2, "image->tokens chain diverged: {tok_e2e_rel:.3e}");
-    assert!(vit_rel < 1e-1, "ViT-H penultimate diverged beyond the cross-backend floor: {vit_rel:.3e}");
+    assert!(
+        tok_iso_rel < 1e-3,
+        "Resampler (golden in) diverged: {tok_iso_rel:.3e}"
+    );
+    assert!(
+        tok_e2e_rel < 1.5e-2,
+        "image->tokens chain diverged: {tok_e2e_rel:.3e}"
+    );
+    assert!(
+        vit_rel < 1e-1,
+        "ViT-H penultimate diverged beyond the cross-backend floor: {vit_rel:.3e}"
+    );
 }

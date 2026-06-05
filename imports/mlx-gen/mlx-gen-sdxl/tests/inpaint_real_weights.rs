@@ -14,8 +14,8 @@
 use std::path::PathBuf;
 
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-use mlx_gen_sdxl::{decode_image, encode_init_latents, load_vae};
-use mlx_gen_sdxl as _; // force-link the provider so `inventory` registers "sdxl"
+use mlx_gen_sdxl as _;
+use mlx_gen_sdxl::{decode_image, encode_init_latents, load_vae}; // force-link the provider so `inventory` registers "sdxl"
 
 fn snapshot() -> PathBuf {
     if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
@@ -42,11 +42,19 @@ fn init_image(w: u32, h: u32) -> Image {
             pixels.push(((x + y) % 256) as u8);
         }
     }
-    Image { width: w, height: h, pixels }
+    Image {
+        width: w,
+        height: h,
+        pixels,
+    }
 }
 
 fn solid(w: u32, h: u32, v: u8) -> Image {
-    Image { width: w, height: h, pixels: vec![v; (w * h * 3) as usize] }
+    Image {
+        width: w,
+        height: h,
+        pixels: vec![v; (w * h * 3) as usize],
+    }
 }
 
 fn req(prompt: &str, init: &Image, mask: Option<&Image>, strength: f32) -> GenerationRequest {
@@ -86,26 +94,42 @@ fn inpaint_blend_invariants() {
 
     // Invariant 1: all-white mask ⇒ inpaint ≡ img2img, byte-for-byte.
     let img2img = run(model.as_ref(), &req("a fox in a field", &init, None, 0.85));
-    let inpaint_white = run(model.as_ref(), &req("a fox in a field", &init, Some(&white), 0.85));
+    let inpaint_white = run(
+        model.as_ref(),
+        &req("a fox in a field", &init, Some(&white), 0.85),
+    );
     let diff1 = inpaint_white
         .pixels
         .iter()
         .zip(&img2img.pixels)
         .filter(|(a, b)| a != b)
         .count();
-    println!("[inpaint] white-mask vs img2img: {diff1} / {} px bytes differ", img2img.pixels.len());
+    println!(
+        "[inpaint] white-mask vs img2img: {diff1} / {} px bytes differ",
+        img2img.pixels.len()
+    );
     assert_eq!(diff1, 0, "all-white inpaint must equal plain img2img");
 
     // Invariant 2: all-black mask ⇒ output = VAE round-trip of the init.
-    let inpaint_black = run(model.as_ref(), &req("a fox in a field", &init, Some(&black), 0.85));
+    let inpaint_black = run(
+        model.as_ref(),
+        &req("a fox in a field", &init, Some(&black), 0.85),
+    );
     let vae = load_vae(&snap).unwrap();
-    let roundtrip = decode_image(&vae, &encode_init_latents(&vae, &init, 512, 512).unwrap()).unwrap();
+    let roundtrip =
+        decode_image(&vae, &encode_init_latents(&vae, &init, 512, 512).unwrap()).unwrap();
     let diff2 = inpaint_black
         .pixels
         .iter()
         .zip(&roundtrip.pixels)
         .filter(|(a, b)| a != b)
         .count();
-    println!("[inpaint] black-mask vs VAE round-trip: {diff2} / {} px bytes differ", roundtrip.pixels.len());
-    assert_eq!(diff2, 0, "all-black inpaint must equal the init VAE round-trip");
+    println!(
+        "[inpaint] black-mask vs VAE round-trip: {diff2} / {} px bytes differ",
+        roundtrip.pixels.len()
+    );
+    assert_eq!(
+        diff2, 0,
+        "all-black inpaint must equal the init VAE round-trip"
+    );
 }

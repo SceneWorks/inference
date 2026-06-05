@@ -128,9 +128,9 @@ impl VisionEncoderLayer {
         let k = to_heads(self.k.forward(x)?)?;
         let v = to_heads(self.v.forward(x)?)?;
         let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
-        let o = o
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, n, self.num_heads * self.head_dim])?;
+        let o =
+            o.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, n, self.num_heads * self.head_dim])?;
         self.out.forward(&o)
     }
 }
@@ -166,9 +166,7 @@ impl ClipVisionEncoder {
         let pre_ln_w = w.require(&format!("{p}.pre_layrnorm.weight"))?.clone();
         let pre_ln_b = w.require(&format!("{p}.pre_layrnorm.bias"))?.clone();
         let layers = (0..cfg.num_layers)
-            .map(|i| {
-                VisionEncoderLayer::from_weights(w, &format!("{p}.encoder.layers.{i}"), cfg)
-            })
+            .map(|i| VisionEncoderLayer::from_weights(w, &format!("{p}.encoder.layers.{i}"), cfg))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             patch_embedding,
@@ -198,11 +196,18 @@ impl ClipVisionEncoder {
         )?;
         let x = concatenate_axis(&[&cls, &patches], 1)?;
         // Add the learned position table (one row per token).
-        let pos = self
-            .position_embedding
-            .reshape(&[1, self.position_embedding.shape()[0], self.hidden])?;
+        let pos = self.position_embedding.reshape(&[
+            1,
+            self.position_embedding.shape()[0],
+            self.hidden,
+        ])?;
         let x = add(&x, &pos)?;
-        Ok(layer_norm(&x, Some(&self.pre_ln_w), Some(&self.pre_ln_b), LN_EPS)?)
+        Ok(layer_norm(
+            &x,
+            Some(&self.pre_ln_w),
+            Some(&self.pre_ln_b),
+            LN_EPS,
+        )?)
     }
 
     /// Run the tower and return the **HF-style hidden-state list**: `[pre_ln_out, L0_out, …,

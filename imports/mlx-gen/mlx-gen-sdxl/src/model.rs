@@ -21,8 +21,8 @@ use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Dtype;
 
 use crate::config::DiffusionConfig;
-use crate::loader;
 use crate::inpaint::{preprocess_mask, InpaintBlend};
+use crate::loader;
 use crate::pipeline::{
     decode_image, denoise, denoise_control, denoise_inpaint, encode_conditioning,
     encode_init_latents, preprocess_control_image, text_time_ids, ControlContext, Denoiser,
@@ -322,7 +322,10 @@ impl Generator for Sdxl {
         // [0,1] NHWC and CFG-batch it to match the U-Net input.
         let control_ctx = match control_req {
             Some((image, scale)) => {
-                let cn = self.control.as_ref().expect("control checkpoint validated above");
+                let cn = self
+                    .control
+                    .as_ref()
+                    .expect("control checkpoint validated above");
                 let img = preprocess_control_image(image, req.width, req.height)?;
                 let img = if cfg_on {
                     concatenate_axis(&[&img, &img], 0)?
@@ -433,11 +436,26 @@ impl Generator for Sdxl {
                 )?
             } else if let Some(b) = &blend {
                 denoise_inpaint(
-                    &d, latents, &conditioning, &pooled, &time_ids, cfg, &req.cancel, on_progress, b,
+                    &d,
+                    latents,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    cfg,
+                    &req.cancel,
+                    on_progress,
+                    b,
                 )?
             } else {
                 denoise(
-                    &d, latents, &conditioning, &pooled, &time_ids, cfg, &req.cancel, on_progress,
+                    &d,
+                    latents,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    cfg,
+                    &req.cancel,
+                    on_progress,
                 )?
             };
 
@@ -512,7 +530,9 @@ impl Sdxl {
         for c in &req.conditioning {
             if let Conditioning::Mask { image } = c {
                 if mask.is_some() {
-                    return Err(Error::Msg("sdxl: multiple inpaint masks are not supported".into()));
+                    return Err(Error::Msg(
+                        "sdxl: multiple inpaint masks are not supported".into(),
+                    ));
                 }
                 mask = Some(image);
             }
@@ -522,15 +542,14 @@ impl Sdxl {
 
     /// Extract the single ControlNet control image + `conditioning_scale` (sc-3058). SDXL supports
     /// one control branch; more than one `Control` is an error.
-    fn resolve_control<'a>(
-        &self,
-        req: &'a GenerationRequest,
-    ) -> Result<Option<(&'a Image, f32)>> {
+    fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<Option<(&'a Image, f32)>> {
         let mut control = None;
         for c in &req.conditioning {
             if let Conditioning::Control { image, scale, .. } = c {
                 if control.is_some() {
-                    return Err(Error::Msg("sdxl: multiple control images are not supported".into()));
+                    return Err(Error::Msg(
+                        "sdxl: multiple control images are not supported".into(),
+                    ));
                 }
                 control = Some((image, *scale));
             }

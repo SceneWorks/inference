@@ -22,9 +22,9 @@ use mlx_gen::Result;
 
 use super::block::{BlockSpec, UNetBlock2D};
 use super::embeddings::{SinusoidalPositionalEncoding, TimestepEmbedding};
+use super::nchw_to_nhwc;
 use super::resnet::ResnetBlock2D;
 use super::transformer::Transformer2D;
-use super::nchw_to_nhwc;
 use crate::config::UNetConfig;
 
 /// A plain (non-adapter) conv layer in NHWC. `controlnet_cond_embedding` + the zero-convs are not
@@ -180,6 +180,7 @@ impl ControlNet {
     /// - `encoder_x`: cross-attention conditioning `[B, S, D]` — **text** for tile-CN, the face
     ///   tokens for InstantID. Generic; the branch does not assume text.
     /// - `scale`: `conditioning_scale` applied to every residual.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         x: &Array,

@@ -32,9 +32,18 @@ pub fn preprocess_mask(mask: &Image, width: u32, height: u32) -> Result<Array> {
     let luma: Vec<u8> = if (mask.width as usize, mask.height as usize) == (w, h) {
         rgb_to_luma(&mask.pixels)
     } else {
-        let resized = resize_bicubic_u8(&mask.pixels, mask.height as usize, mask.width as usize, h, w);
+        let resized = resize_bicubic_u8(
+            &mask.pixels,
+            mask.height as usize,
+            mask.width as usize,
+            h,
+            w,
+        );
         // resize returns f32 HWC RGB in [0,255]; collect to u8 then luma.
-        let u8s: Vec<u8> = resized.iter().map(|&v| v.round().clamp(0.0, 255.0) as u8).collect();
+        let u8s: Vec<u8> = resized
+            .iter()
+            .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+            .collect();
         rgb_to_luma(&u8s)
     };
     // Binarize at image res, then nearest 8× downsample.
@@ -116,7 +125,11 @@ mod tests {
                 pixels.extend_from_slice(&[v, v, v]);
             }
         }
-        Image { width: w, height: h, pixels }
+        Image {
+            width: w,
+            height: h,
+            pixels,
+        }
     }
 
     #[test]

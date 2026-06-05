@@ -60,8 +60,8 @@ struct PerceiverAttention {
     norm1_b: Array,
     norm2_w: Array, // LN on the latents
     norm2_b: Array,
-    to_q: AdaptableLinear,  // bias-free
-    to_kv: AdaptableLinear, // bias-free, fused [2*inner, dim]
+    to_q: AdaptableLinear,   // bias-free
+    to_kv: AdaptableLinear,  // bias-free, fused [2*inner, dim]
     to_out: AdaptableLinear, // bias-free
     heads: i32,
     dim_head: i32,
@@ -176,11 +176,8 @@ impl Resampler {
         );
         let layers = (0..cfg.depth)
             .map(|i| -> Result<_> {
-                let attn = PerceiverAttention::from_weights(
-                    w,
-                    &format!("{prefix}.layers.{i}.0"),
-                    cfg,
-                )?;
+                let attn =
+                    PerceiverAttention::from_weights(w, &format!("{prefix}.layers.{i}.0"), cfg)?;
                 let ff = ResamplerFeedForward::from_weights(w, &format!("{prefix}.layers.{i}.1"))?;
                 Ok((attn, ff))
             })
@@ -216,6 +213,11 @@ impl Resampler {
             latents = add(&ff.forward(&latents)?, &latents)?;
         }
         let out = self.proj_out.forward(&latents)?;
-        Ok(layer_norm(&out, Some(&self.norm_out_w), Some(&self.norm_out_b), LN_EPS)?)
+        Ok(layer_norm(
+            &out,
+            Some(&self.norm_out_w),
+            Some(&self.norm_out_b),
+            LN_EPS,
+        )?)
     }
 }

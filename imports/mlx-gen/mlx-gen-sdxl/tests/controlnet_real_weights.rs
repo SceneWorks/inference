@@ -15,9 +15,9 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
+use mlx_gen_sdxl as _; // force-link the provider so `inventory` registers "sdxl"
 use mlx_gen_sdxl::config::UNetConfig;
 use mlx_gen_sdxl::ControlNet;
-use mlx_gen_sdxl as _; // force-link the provider so `inventory` registers "sdxl"
 use mlx_rs::{Array, Dtype};
 
 const GOLDEN: &str = concat!(
@@ -30,9 +30,8 @@ fn cn_weights() -> Weights {
         PathBuf::from(p)
     } else {
         let home = std::env::var("HOME").unwrap();
-        let snaps = PathBuf::from(home).join(
-            ".cache/huggingface/hub/models--xinsir--controlnet-tile-sdxl-1.0/snapshots",
-        );
+        let snaps = PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--xinsir--controlnet-tile-sdxl-1.0/snapshots");
         std::fs::read_dir(&snaps)
             .expect("HF cache snapshots dir for xinsir/controlnet-tile-sdxl-1.0")
             .filter_map(|e| e.ok())
@@ -58,7 +57,10 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
     let b = b.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
     let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
     let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-6);
-    a.iter().zip(b).fold(0f32, |m, (&x, &y)| m.max((x - y).abs())) / peak
+    a.iter()
+        .zip(b)
+        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
+        / peak
 }
 
 #[test]
@@ -67,14 +69,28 @@ fn controlnet_residuals_match_diffusers() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sample = nchw_to_nhwc(g.require("sample").unwrap()); // [1,64,64,4]
     let control = nchw_to_nhwc(g.require("control").unwrap()); // [1,512,512,3]
-    let encoder_x = g.require("encoder_hidden_states").unwrap().as_dtype(Dtype::Float32).unwrap();
-    let text_emb = g.require("text_embeds").unwrap().as_dtype(Dtype::Float32).unwrap();
-    let time_ids = g.require("time_ids").unwrap().as_dtype(Dtype::Float32).unwrap();
+    let encoder_x = g
+        .require("encoder_hidden_states")
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    let text_emb = g
+        .require("text_embeds")
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    let time_ids = g
+        .require("time_ids")
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
     let timestep = g.require("timestep").unwrap().as_slice::<f32>()[0];
 
     let cn = ControlNet::from_weights(&cn_weights(), &UNetConfig::sdxl_base()).unwrap();
     let res = cn
-        .forward(&sample, &control, timestep, &encoder_x, &text_emb, &time_ids, 1.0)
+        .forward(
+            &sample, &control, timestep, &encoder_x, &text_emb, &time_ids, 1.0,
+        )
         .unwrap();
 
     assert_eq!(res.down.len(), 9, "expected 9 down residuals");
@@ -93,8 +109,14 @@ fn controlnet_residuals_match_diffusers() {
     // mid), NOT a port bug — a wrong cond-embedding / zero-conv / block would blow the *shallow*
     // residuals up too. The residuals are scaled by ~0.45 and added to the UNet, so this is
     // negligible end-to-end.
-    assert!(worst_down < 1e-2, "ControlNet down residuals diverged: {worst_down:.3e}");
-    assert!(mid_rel < 2e-2, "ControlNet mid residual beyond the deep-path floor: {mid_rel:.3e}");
+    assert!(
+        worst_down < 1e-2,
+        "ControlNet down residuals diverged: {worst_down:.3e}"
+    );
+    assert!(
+        mid_rel < 2e-2,
+        "ControlNet mid residual beyond the deep-path floor: {mid_rel:.3e}"
+    );
 }
 
 fn base_snapshot() -> PathBuf {
@@ -133,7 +155,11 @@ fn gradient(w: u32, h: u32) -> Image {
             pixels.push(((x + y) % 256) as u8);
         }
     }
-    Image { width: w, height: h, pixels }
+    Image {
+        width: w,
+        height: h,
+        pixels,
+    }
 }
 
 /// e2e wiring check: a ControlNet request at `conditioning_scale = 0` produces 0 residuals and the
@@ -182,6 +208,9 @@ fn controlnet_scale_zero_equals_img2img() {
         .zip(&ctrl0.pixels)
         .filter(|(a, b)| a != b)
         .count();
-    println!("[controlnet] scale=0 vs img2img: {diff} / {} px bytes differ", plain.pixels.len());
+    println!(
+        "[controlnet] scale=0 vs img2img: {diff} / {} px bytes differ",
+        plain.pixels.len()
+    );
     assert_eq!(diff, 0, "ControlNet at scale=0 must equal plain img2img");
 }
