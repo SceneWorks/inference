@@ -26,11 +26,13 @@
 
 use std::cell::Cell;
 
+use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, concatenate_axis, dequantize, divide, matmul, multiply, quantized_matmul, sigmoid,
-    subtract,
+    add, concatenate_axis, dequantize, divide, matmul, multiply, power, quantized_matmul, sigmoid,
+    subtract, tanh,
 };
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{gelu_tanh, linear};
@@ -119,12 +121,51 @@ fn param(w: &Weights, key: &str, prec: Precision) -> Result<Array> {
 }
 
 /// `x · (1 + scale) + shift` (adaLN modulation), broadcasting `scale`/`shift` `(B, S', dim)` over the
-/// token axis.
+/// token axis. One fused kernel when the sc-2963 glue toggle is on (the `1` is cast to `scale`'s dtype
+/// inside, as before — bit-identical and dtype-preserving).
 fn modulate(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    Ok(add(
-        &multiply(x, &add(scale, scalar(1.0).as_dtype(scale.dtype())?)?)?,
-        shift,
-    )?)
+    let f = |(x, sc, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(&multiply(x, &add(sc, &scalar(1.0).as_dtype(sc.dtype())?)?)?, sh)
+    };
+    if crate::compile_glue() {
+        Ok(compile(f, true)((x, scale, shift))?)
+    } else {
+        Ok(f((x, scale, shift))?)
+    }
+}
+
+/// Gated residual `x + out·gate` — one fused kernel (multiply + add) when the sc-2963 glue toggle is
+/// on; bit-identical to the eager `add(x, out·gate)`, dtype-preserving.
+fn gated(x: &Array, out: &Array, gate: &Array) -> Result<Array> {
+    let f = |(x, o, g): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(x, &multiply(o, g)?)
+    };
+    if crate::compile_glue() {
+        Ok(compile(f, true)((x, out, gate))?)
+    } else {
+        Ok(f((x, out, gate))?)
+    }
+}
+
+/// The tanh-GELU FFN activation. Body mirrors [`mlx_gen::nn::gelu_tanh`] exactly (dtype-preserving,
+/// f64-host `√(2/π)`); when the sc-2963 glue toggle is on, MLX fuses its ~8 elementwise ops into one
+/// kernel — by far the biggest per-step glue cost at video sequence (the FFN expansion runs on
+/// `[B, S, ffn]` tensors of tens-to-hundreds of millions of elements). Off ⇒ defers to core
+/// `gelu_tanh`, so the eager path is byte-for-byte the previous behaviour.
+fn gelu_ffn(x: &Array) -> Result<Array> {
+    if !crate::compile_glue() {
+        return gelu_tanh(x);
+    }
+    let f = |x_: &Array| -> std::result::Result<Array, Exception> {
+        let dt = x_.dtype();
+        let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+        let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+        let x3 = power(x_, Array::from_int(3))?;
+        let inner = multiply(&add(x_, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+        let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+        multiply(&multiply(x_, &s(0.5)?)?, &gate)
+    };
+    Ok(compile(f, true)(x)?)
 }
 
 /// A Linear's base weight — dense or Q8-quantized, selected by [`Precision`] at load.
@@ -512,7 +553,7 @@ impl FeedForward {
 
     fn forward(&self, x: &Array) -> Result<Array> {
         self.proj_out
-            .forward(&gelu_tanh(&self.proj_in.forward(x)?)?)
+            .forward(&gelu_ffn(&self.proj_in.forward(x)?)?)
     }
 
     /// LoRA targets: `ff.net.0.proj`→`ff.proj_in`, `ff.net.2`→`ff.proj_out` (renamed by the loader).
@@ -608,7 +649,7 @@ impl VideoBlock {
         let attn = self
             .attn1
             .forward(&norm, None, None, Some((cos, sin)), None)?;
-        let mut x = add(x, &multiply(&attn, &msa[2])?)?;
+        let mut x = gated(x, &attn, &msa[2])?;
 
         // --- prompt-adaLN on the text context ---
         let v_context = {
@@ -631,13 +672,13 @@ impl VideoBlock {
         let cross = self
             .attn2
             .forward(&norm_ca, Some(&v_context), mask, None, None)?;
-        x = add(&x, &multiply(&cross, &ca[2])?)?;
+        x = gated(&x, &cross, &ca[2])?;
 
         // --- FeedForward (adaLN rows 3..6) ---
         let mlp = ada_values(&self.scale_shift_table, timesteps, 3, 6)?;
         let norm_mlp = modulate(&rms_norm_noweight(&x, self.eps)?, &mlp[1], &mlp[0])?;
         let ff = self.ff.forward(&norm_mlp)?;
-        x = add(&x, &multiply(&ff, &mlp[2])?)?;
+        x = gated(&x, &ff, &mlp[2])?;
 
         Ok(x)
     }
@@ -1252,7 +1293,7 @@ impl AvBlock {
         let msa = ada_values(sst, a.ts_emb, 0, 3)?;
         let norm = modulate(&rms_norm_noweight(x, self.eps)?, &msa[1], &msa[0])?;
         let attn = attn1.forward(&norm, None, None, Some((a.cos, a.sin)), None)?;
-        let mut x = add(x, &multiply(&attn, &msa[2])?)?;
+        let mut x = gated(x, &attn, &msa[2])?;
 
         let p = ada_values(pst, a.prompt_ts, 0, 2)?;
         let context = modulate(a.context, &p[1], &p[0])?;
@@ -1260,7 +1301,7 @@ impl AvBlock {
         let ca = ada_values(sst, a.ts_emb, 6, 9)?;
         let norm_ca = modulate(&rms_norm_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
         let cross = attn2.forward(&norm_ca, Some(&context), a.mask, None, None)?;
-        x = add(&x, &multiply(&cross, &ca[2])?)?;
+        x = gated(&x, &cross, &ca[2])?;
         Ok(x)
     }
 
@@ -1274,7 +1315,8 @@ impl AvBlock {
     ) -> Result<Array> {
         let mlp = ada_values(sst, ts_emb, 3, 6)?;
         let norm = modulate(&rms_norm_noweight(x, self.eps)?, &mlp[1], &mlp[0])?;
-        Ok(add(x, &multiply(&ff.forward(&norm)?, &mlp[2])?)?)
+        let ff_out = ff.forward(&norm)?;
+        gated(x, &ff_out, &mlp[2])
     }
 
     /// Joint forward: `(vx, ax)` in, `(vx, ax)` out.
@@ -1321,7 +1363,7 @@ impl AvBlock {
             Some((v.cross_cos, v.cross_sin)),
             Some((a.cross_cos, a.cross_sin)),
         )?;
-        vx = add(&vx, &multiply(&a2v, &gate_a2v)?)?;
+        vx = gated(&vx, &a2v, &gate_a2v)?;
 
         // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
         let v2a = self.v2a.forward(
@@ -1331,7 +1373,7 @@ impl AvBlock {
             Some((a.cross_cos, a.cross_sin)),
             Some((v.cross_cos, v.cross_sin)),
         )?;
-        ax = add(&ax, &multiply(&v2a, &gate_v2a)?)?;
+        ax = gated(&ax, &v2a, &gate_v2a)?;
 
         // FeedForward.
         vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)?;
@@ -1542,6 +1584,64 @@ mod tests {
         let shift = Array::from_slice(&[1.0f32, 0.0, -1.0, 0.0], &[1, 1, 4]);
         let got = modulate(&x, &scale, &shift).unwrap();
         assert_eq!(got.as_slice::<f32>(), &[2.0, 4.0, 2.0, 8.0]);
+    }
+
+    // sc-2963: the compiled glue helpers (`modulate`/`gated`/`gelu_ffn`) the AvDiT forward composes
+    // are bit-identical to eager (`max|Δ|=0`) at both LTX compute dtypes — f32 (the `quant_f32`
+    // quality target) and bf16 (the `quant_bf16` speed path). The block forward has no committed
+    // weights (the Q8 block lives in the 20 GB checkpoint), so this gates the helpers directly.
+    #[test]
+    fn compiled_glue_bit_identical_to_eager() {
+        use mlx_rs::random;
+        let rnd = |shape: &[i32], dt: Dtype| -> Array {
+            let k = random::key(0).unwrap();
+            random::normal::<f32>(shape, None, None, Some(&k))
+                .unwrap()
+                .as_dtype(dt)
+                .unwrap()
+        };
+        let max_abs = |a: &Array, b: &Array| -> f32 {
+            let d = mlx_rs::ops::abs(subtract(a, b).unwrap()).unwrap();
+            mlx_rs::ops::max(&d, None)
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .item::<f32>()
+        };
+        for dt in [Dtype::Float32, Dtype::Bfloat16] {
+            let (b, s, dim, ffn) = (1i32, 32i32, 64i32, 256i32);
+            // modulate: x·(1+scale)+shift, scale/shift broadcast [B,1,dim].
+            let x = rnd(&[b, s, dim], dt);
+            let scale = rnd(&[b, 1, dim], dt);
+            let shift = rnd(&[b, 1, dim], dt);
+            crate::set_compile_glue(false);
+            let me = modulate(&x, &scale, &shift).unwrap();
+            crate::set_compile_glue(true);
+            let mc = modulate(&x, &scale, &shift).unwrap();
+            crate::set_compile_glue(false);
+            assert_eq!(mc.dtype(), dt, "modulate dtype {dt:?}");
+            assert_eq!(max_abs(&mc, &me), 0.0, "modulate {dt:?}");
+
+            // gated: x + out·gate.
+            let out = rnd(&[b, s, dim], dt);
+            let gate = rnd(&[b, 1, dim], dt);
+            crate::set_compile_glue(false);
+            let ge = gated(&x, &out, &gate).unwrap();
+            crate::set_compile_glue(true);
+            let gc = gated(&x, &out, &gate).unwrap();
+            crate::set_compile_glue(false);
+            assert_eq!(max_abs(&gc, &ge), 0.0, "gated {dt:?}");
+
+            // gelu_ffn: the tanh-GELU FFN activation (eager defers to core gelu_tanh).
+            let h = rnd(&[b, s, ffn], dt);
+            crate::set_compile_glue(false);
+            let fe = gelu_ffn(&h).unwrap();
+            crate::set_compile_glue(true);
+            let fc = gelu_ffn(&h).unwrap();
+            crate::set_compile_glue(false);
+            assert_eq!(fc.dtype(), dt, "gelu_ffn dtype {dt:?}");
+            assert_eq!(max_abs(&fc, &fe), 0.0, "gelu_ffn {dt:?}");
+        }
     }
 
     #[test]
