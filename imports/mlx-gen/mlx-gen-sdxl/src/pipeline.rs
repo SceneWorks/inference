@@ -96,6 +96,7 @@ pub fn denoise(
         on_progress,
         None,
         None,
+        None,
     )
 }
 
@@ -124,6 +125,7 @@ pub fn denoise_inpaint(
         cancel,
         on_progress,
         Some(blend),
+        None,
         None,
     )
 }
@@ -154,6 +156,38 @@ pub fn denoise_control(
         on_progress,
         None,
         Some(control),
+        None,
+    )
+}
+
+/// Like [`denoise`] but injects the IP-Adapter image `tokens` (`[B, N, cross_attention_dim]`,
+/// CFG-batched with a zeros uncond row) into every cross-attention at `scale` (sc-3059). Works on
+/// the txt2img or img2img init; `scale = 0` ⇒ identical to [`denoise`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_ip(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    tokens: &Array,
+    scale: f32,
+) -> Result<Array> {
+    denoise_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        None,
+        None,
+        Some((tokens, scale)),
     )
 }
 
@@ -169,6 +203,7 @@ fn denoise_core(
     on_progress: &mut dyn FnMut(Progress),
     inpaint: Option<&InpaintBlend>,
     control: Option<&ControlContext>,
+    ip: Option<(&Array, f32)>,
 ) -> Result<Array> {
     let steps = d.sampler.num_steps();
     // A zero-step denoise (img2img at strength ≤ 1/steps) is a no-op: return the init latents
@@ -197,30 +232,32 @@ fn denoise_core(
             x_in
         };
         let timestep = d.sampler.timestep(i);
-        let eps = match control {
+        let eps = if let Some((tokens, scale)) = ip {
+            // IP-Adapter (sc-3059): inject the image tokens into every cross-attention.
+            d.unet.forward_with_ip(
+                &x_unet,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                (tokens, scale),
+            )?
+        } else if let Some(cc) = control {
             // ControlNet (sc-3058): run the branch on the model input, inject its residuals.
-            Some(cc) => {
-                let res = cc.controlnet.forward(
-                    &x_unet,
-                    &cc.control_image,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    cc.scale,
-                )?;
-                d.unet.forward_with_control(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    &res,
-                )?
-            }
-            None => d
-                .unet
-                .forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
+            let res = cc.controlnet.forward(
+                &x_unet,
+                &cc.control_image,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                cc.scale,
+            )?;
+            d.unet
+                .forward_with_control(&x_unet, timestep, conditioning, pooled, time_ids, &res)?
+        } else {
+            d.unet
+                .forward(&x_unet, timestep, conditioning, pooled, time_ids)?
         };
         let eps = if cfg_on {
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
