@@ -9,8 +9,9 @@ use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
-use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
+
+use crate::silu_glue;
 use mlx_gen::Result;
 
 /// Port of mlx `nn.SinusoidalPositionalEncoding`. Precomputes `sigmas` from `(dims, min_freq,
@@ -123,7 +124,7 @@ impl TimestepEmbedding {
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let x = self.linear1.forward(x)?;
-        let x = silu(&x)?;
+        let x = silu_glue(&x)?;
         self.linear2.forward(&x)
     }
 }

@@ -82,6 +82,10 @@ pub fn denoise(
     if steps == 0 {
         return Ok(latents);
     }
+    // sc-2963 (rollout of sc-2957): fuse the UNet's SiLU activations via `mx.compile` — bit-exact in
+    // fp16 (`max|Δ|=0`, compile_parity.rs), so it does not move the precision-load-bearing fp16
+    // golden. The GELU/GEGLU activations are already compiled (sc-2721). Process-global, idempotent.
+    crate::set_compile_glue(true);
     let cfg_on = cfg > 1.0;
     let total = steps as u32;
     for i in 0..steps {
