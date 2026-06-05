@@ -342,34 +342,6 @@ fn add_hint(x: &Array, hint: &Array, scale: f32) -> Result<Array> {
     }
 }
 
-#[cfg(test)]
-mod sc2963 {
-    use super::*;
-    use mlx_rs::{random, Dtype};
-
-    // sc-2720 guard: `add_hint` mixes a bf16 base stream `x` with an f32 `hint` — the f32 hint must
-    // promote the result to f32 (the fork's mixed-precision flow), and compiled must equal eager.
-    #[test]
-    fn compiled_add_hint_mixed_precision_matches_eager() {
-        let k = random::key(0).unwrap();
-        let x = random::normal::<f32>(&[1, 16, 64], None, None, Some(&k))
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap(); // bf16 base stream
-        let hint = random::normal::<f32>(&[1, 16, 64], None, None, Some(&k)).unwrap(); // f32 control hint
-        crate::set_compile_glue(false);
-        let e = add_hint(&x, &hint, 0.8).unwrap();
-        crate::set_compile_glue(true);
-        let c = add_hint(&x, &hint, 0.8).unwrap();
-        crate::set_compile_glue(false);
-        assert_eq!(e.dtype(), Dtype::Float32, "f32 hint promotes bf16 → f32");
-        assert_eq!(c.dtype(), Dtype::Float32, "compiled preserves the promotion");
-        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&c, &e).unwrap()).unwrap();
-        let m = mlx_rs::ops::max(&d, None).unwrap().item::<f32>();
-        assert_eq!(m, 0.0, "add_hint compiled vs eager");
-    }
-}
-
 /// The control-stack hint index for base-layer `i` (the fork's `*_mapping[i]`), or `None` when no
 /// control block injects there.
 fn hint_index(places: &[usize], i: usize) -> Option<usize> {
@@ -392,4 +364,36 @@ fn patchify_control(cc: &Array, patch_size: i32, f_patch_size: i32) -> Result<Ar
     let ori = ft * ht * wt;
     let pad = (-(ori as i64)).rem_euclid(32) as i32;
     crate::transformer::pad_rows(&tokens, pad)
+}
+
+#[cfg(test)]
+mod sc2963 {
+    use super::*;
+    use mlx_rs::{random, Dtype};
+
+    // sc-2720 guard: `add_hint` mixes a bf16 base stream `x` with an f32 `hint` — the f32 hint must
+    // promote the result to f32 (the fork's mixed-precision flow), and compiled must equal eager.
+    #[test]
+    fn compiled_add_hint_mixed_precision_matches_eager() {
+        let k = random::key(0).unwrap();
+        let x = random::normal::<f32>(&[1, 16, 64], None, None, Some(&k))
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap(); // bf16 base stream
+        let hint = random::normal::<f32>(&[1, 16, 64], None, None, Some(&k)).unwrap(); // f32 control hint
+        crate::set_compile_glue(false);
+        let e = add_hint(&x, &hint, 0.8).unwrap();
+        crate::set_compile_glue(true);
+        let c = add_hint(&x, &hint, 0.8).unwrap();
+        crate::set_compile_glue(false);
+        assert_eq!(e.dtype(), Dtype::Float32, "f32 hint promotes bf16 → f32");
+        assert_eq!(
+            c.dtype(),
+            Dtype::Float32,
+            "compiled preserves the promotion"
+        );
+        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&c, &e).unwrap()).unwrap();
+        let m = mlx_rs::ops::max(&d, None).unwrap().item::<f32>();
+        assert_eq!(m, 0.0, "add_hint compiled vs eager");
+    }
 }

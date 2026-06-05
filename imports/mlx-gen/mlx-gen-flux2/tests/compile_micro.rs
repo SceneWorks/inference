@@ -102,7 +102,9 @@ fn compile_glue_micro() {
         let a = normal(&[b, s, ffn]);
         let bb = normal(&[b, s, ffn]);
         let eager = bench(warmup, iters, || swiglu_body((&a, &bb)).unwrap());
-        let oneshot = bench(warmup, iters, || compile(swiglu_body, true)((&a, &bb)).unwrap());
+        let oneshot = bench(warmup, iters, || {
+            compile(swiglu_body, true)((&a, &bb)).unwrap()
+        });
         let mut held = swiglu_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut((&a, &bb)).unwrap());
         let diff = max_abs_diff(
@@ -148,7 +150,9 @@ fn compile_glue_micro() {
         let y = normal(&[b, s, dim]);
         let g = normal(&[b, 1, dim]);
         let eager = bench(warmup, iters, || gated_body((&x, &g, &y)).unwrap());
-        let oneshot = bench(warmup, iters, || compile(gated_body, true)((&x, &g, &y)).unwrap());
+        let oneshot = bench(warmup, iters, || {
+            compile(gated_body, true)((&x, &g, &y)).unwrap()
+        });
         let mut held = gated_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut((&x, &g, &y)).unwrap());
         let diff = max_abs_diff(
@@ -176,7 +180,9 @@ fn compile_glue_micro() {
             compile(rope_body, true)(&args).unwrap().pop().unwrap()
         });
         let mut held = rope_body.compile(true);
-        let heldt = bench(warmup, iters, || held.call_mut(&args).unwrap().pop().unwrap());
+        let heldt = bench(warmup, iters, || {
+            held.call_mut(&args).unwrap().pop().unwrap()
+        });
         let diff = max_abs_diff(
             &rope_body(&args).unwrap()[0],
             &compile(rope_body, true)(&args).unwrap()[0],

@@ -111,7 +111,10 @@ fn compile_glue_micro() {
         let oneshot = bench(warmup, iters, || compile(gelu_body, true)(&x).unwrap());
         let mut held = gelu_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut(&x).unwrap());
-        let diff = max_abs_diff(&gelu_body(&x).unwrap(), &compile(gelu_body, true)(&x).unwrap());
+        let diff = max_abs_diff(
+            &gelu_body(&x).unwrap(),
+            &compile(gelu_body, true)(&x).unwrap(),
+        );
         println!(
             "[gelu_tanh f32 {b}x{s}x{ffn}] eager={eager:.3} oneshot={oneshot:.3} held={heldt:.3} ms \
              | held speedup={:.2}× saved/call={:.3}ms ×48={:.1}ms | max|Δ|={diff:.2e}",
@@ -151,7 +154,9 @@ fn compile_glue_micro() {
         let o = normal(&[b, s, dim]);
         let g = normal(&[b, 1, dim]);
         let eager = bench(warmup, iters, || gated_body((&x, &o, &g)).unwrap());
-        let oneshot = bench(warmup, iters, || compile(gated_body, true)((&x, &o, &g)).unwrap());
+        let oneshot = bench(warmup, iters, || {
+            compile(gated_body, true)((&x, &o, &g)).unwrap()
+        });
         let mut held = gated_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut((&x, &o, &g)).unwrap());
         let diff = max_abs_diff(
@@ -179,7 +184,9 @@ fn compile_glue_micro() {
             compile(rope_body, true)(&args).unwrap().pop().unwrap()
         });
         let mut held = rope_body.compile(true);
-        let heldt = bench(warmup, iters, || held.call_mut(&args).unwrap().pop().unwrap());
+        let heldt = bench(warmup, iters, || {
+            held.call_mut(&args).unwrap().pop().unwrap()
+        });
         let diff = max_abs_diff(
             &rope_body(&args).unwrap()[0],
             &compile(rope_body, true)(&args).unwrap()[0],

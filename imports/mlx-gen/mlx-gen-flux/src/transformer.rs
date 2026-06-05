@@ -911,7 +911,11 @@ fn apply_norm_ff(
 ) -> Result<Array> {
     let hidden = gated(hidden, &gate_msa.expand_dims(1)?, attn)?;
     let norm = layer_norm(&hidden, None, None, LN_EPS)?;
-    let norm = modulate(&norm, &scale_mlp.expand_dims(1)?, &shift_mlp.expand_dims(1)?)?;
+    let norm = modulate(
+        &norm,
+        &scale_mlp.expand_dims(1)?,
+        &shift_mlp.expand_dims(1)?,
+    )?;
     let ff_out = ff.forward(&norm)?;
     gated(&hidden, &gate_mlp.expand_dims(1)?, &ff_out)
 }

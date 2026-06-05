@@ -134,7 +134,10 @@ fn modulate(x: &Array, mod_params: &Array) -> Result<(Array, Array)> {
     let scale = p[1].expand_dims(1)?;
     let gate = p[2].expand_dims(1)?;
     let f = |(x, sc, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(&multiply(x, &add(sc, &Array::from_slice(&[1.0f32], &[1]))?)?, sh)
+        add(
+            &multiply(x, &add(sc, Array::from_slice(&[1.0f32], &[1]))?)?,
+            sh,
+        )
     };
     let out = if compile_glue() {
         compile(f, true)((x, &scale, &shift))?
