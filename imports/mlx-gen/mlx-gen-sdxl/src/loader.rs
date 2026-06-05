@@ -121,6 +121,47 @@ pub fn load_controlnet(
     crate::unet::ControlNet::from_weights(&w, &UNetConfig::sdxl_base())
 }
 
+/// Load the **IP-Adapter** (sc-3059) from an `h94/IP-Adapter`-layout snapshot directory: the ViT-H
+/// image encoder at `models/image_encoder/model.safetensors` and the IP weights (Resampler +
+/// decoupled-attn K/V pairs) at `sdxl_models/ip-adapter-plus[-face]_sdxl_vit-h.safetensors`
+/// (plus-face preferred, plus as fallback — they share the Resampler architecture). Returns the
+/// image-token encoder + the per-cross-attn K/V pairs to install into the U-Net. Cast to `dtype`.
+pub fn load_ip_adapter(
+    dir: &Path,
+    dtype: Dtype,
+) -> Result<(
+    crate::ip_adapter::IpImageEncoder,
+    Vec<(mlx_rs::Array, mlx_rs::Array)>,
+)> {
+    use crate::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
+    use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
+
+    let mut enc_w = Weights::from_file(dir.join("models/image_encoder/model.safetensors"))?;
+    enc_w.cast_all(dtype)?;
+    let encoder = ClipVisionEncoder::from_weights(&enc_w, &VisionConfig::vit_h_14())?;
+
+    let ip_file = [
+        "sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors",
+        "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors",
+    ]
+    .iter()
+    .map(|f| dir.join(f))
+    .find(|p| p.exists())
+    .ok_or_else(|| {
+        Error::Msg(format!(
+            "ip-adapter: no plus/plus-face sdxl_vit-h weights under {}/sdxl_models",
+            dir.display()
+        ))
+    })?;
+    let mut ip_w = Weights::from_file(&ip_file)?;
+    ip_w.cast_all(dtype)?;
+    let resampler =
+        Resampler::from_weights(&ip_w, "image_proj", &ResamplerConfig::plus_sdxl_vit_h())?;
+    let pairs = load_ip_kv_pairs(&ip_w)?;
+
+    Ok((IpImageEncoder::new(encoder, resampler), pairs))
+}
+
 /// Load the SDXL VAE (encoder + decoder). The VAE always runs **f32**, even when the U-Net/TEs are
 /// fp16 — the vendored `StableDiffusion.__init__` loads `load_autoencoder(model, float16=False)`
 /// unconditionally (the SDXL VAE is fp16-unstable). Prefers the f32 master; if only the fp16 variant

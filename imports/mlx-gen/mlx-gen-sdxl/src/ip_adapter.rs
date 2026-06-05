@@ -12,12 +12,113 @@
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, split};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::image::resize_bicubic_u8;
+use mlx_gen::media::Image;
 use mlx_gen::nn::gelu_exact;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+
+use crate::vision_encoder::ClipVisionEncoder;
+
+/// CLIP ViT image preprocessing for IP-Adapter (`CLIPImageProcessor`): resize the shortest side to
+/// 224 (bicubic), center-crop 224×224, rescale `[0,255]→[0,1]`, normalize by the CLIP mean/std.
+/// Returns NHWC `[1, 224, 224, 3]` f32.
+#[allow(clippy::excessive_precision)] // canonical CLIP mean/std (f32 rounds the last digit)
+pub fn preprocess_clip_image(image: &Image) -> Result<Array> {
+    const SIZE: usize = 224;
+    const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+    const STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(Error::Msg(format!(
+            "ip-adapter image buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    // Resize shortest side to 224 (bicubic), preserving aspect.
+    let scale = SIZE as f64 / iw.min(ih) as f64;
+    let rw = ((iw as f64 * scale).round() as usize).max(SIZE);
+    let rh = ((ih as f64 * scale).round() as usize).max(SIZE);
+    let resized = resize_bicubic_u8(&image.pixels, ih, iw, rh, rw); // HWC f32 [0,255]
+                                                                    // Center-crop 224×224 + normalize.
+    let top = (rh - SIZE) / 2;
+    let left = (rw - SIZE) / 2;
+    let mut out = vec![0f32; SIZE * SIZE * 3];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            for c in 0..3 {
+                let v = resized[((top + y) * rw + (left + x)) * 3 + c] / 255.0;
+                out[(y * SIZE + x) * 3 + c] = (v - MEAN[c]) / STD[c];
+            }
+        }
+    }
+    Ok(Array::from_slice(&out, &[1, SIZE as i32, SIZE as i32, 3]))
+}
+
+/// The IP-Adapter image-token source: the CLIP ViT-H encoder + the Resampler. Produces the 16 image
+/// tokens consumed by the UNet's decoupled cross-attention. (Generic seam: InstantID swaps this for
+/// an ArcFace Resampler, sc-3113 — the UNet injection primitive is identical.)
+pub struct IpImageEncoder {
+    encoder: ClipVisionEncoder,
+    resampler: Resampler,
+}
+
+impl IpImageEncoder {
+    pub fn new(encoder: ClipVisionEncoder, resampler: Resampler) -> Self {
+        Self { encoder, resampler }
+    }
+
+    /// Reference image → `[1, num_queries, output_dim]` IP tokens (16×2048 for plus-vit-h), at the
+    /// resampler's weight dtype. CLIP preprocess → ViT-H penultimate → Resampler.
+    pub fn tokens(&self, image: &Image) -> Result<Array> {
+        let dtype = self.resampler.dtype();
+        let pixels = preprocess_clip_image(image)?.as_dtype(dtype)?;
+        let penultimate = self.encoder.penultimate(&pixels)?;
+        self.resampler.forward(&penultimate)
+    }
+
+    /// A zeros token tensor matching [`tokens`](Self::tokens)'s shape/dtype — the CFG uncond row.
+    pub fn zeros_like_tokens(&self, dtype: Dtype) -> Result<Array> {
+        let n = self.resampler.num_queries;
+        let d = self.resampler.output_dim();
+        Ok(mlx_rs::ops::zeros::<f32>(&[1, n, d])?.as_dtype(dtype)?)
+    }
+}
+
+/// Load the decoupled cross-attention **K/V projection pairs** from an IP-Adapter checkpoint
+/// (`ip_adapter.{n}.to_k_ip/to_v_ip.weight`, bias-free `[hidden, cross_attention_dim]`), returned in
+/// the diffusers `ip_adapter.{1,3,…}` **numeric order** — which is the UNet cross-attention walk
+/// order ([`crate::unet::UNet2DConditionModel::install_ip_adapter`]). 70 pairs for SDXL.
+pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Array, Array)>> {
+    let mut idxs: Vec<u32> = w
+        .keys()
+        .filter_map(|k| {
+            k.strip_prefix("ip_adapter.")
+                .and_then(|r| r.strip_suffix(".to_k_ip.weight"))
+                .and_then(|n| n.parse::<u32>().ok())
+        })
+        .collect();
+    idxs.sort_unstable();
+    if idxs.is_empty() {
+        return Err(Error::Msg(
+            "ip_adapter: no ip_adapter.{n}.to_k_ip.weight keys found".into(),
+        ));
+    }
+    idxs.into_iter()
+        .map(|n| {
+            let k = w
+                .require(&format!("ip_adapter.{n}.to_k_ip.weight"))?
+                .clone();
+            let v = w
+                .require(&format!("ip_adapter.{n}.to_v_ip.weight"))?
+                .clone();
+            Ok((k, v))
+        })
+        .collect()
+}
 
 const LN_EPS: f32 = 1e-5;
 
@@ -163,6 +264,16 @@ pub struct Resampler {
 }
 
 impl Resampler {
+    /// The compute dtype (the learned latents' dtype).
+    pub fn dtype(&self) -> Dtype {
+        self.latents.dtype()
+    }
+
+    /// The output token width (= UNet `cross_attention_dim`, 2048 for SDXL).
+    pub fn output_dim(&self) -> i32 {
+        self.norm_out_w.shape()[0]
+    }
+
     /// Load from the `image_proj` namespace of an IP-Adapter-plus checkpoint.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &ResamplerConfig) -> Result<Self> {
         let latents = w.require(&format!("{prefix}.latents"))?.clone();
