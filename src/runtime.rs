@@ -55,6 +55,12 @@ pub struct LoadSpec {
     /// *component* (it alters the graph), distinct from [`adapters`](Self::adapters) below, which
     /// are forward-time residual overlays on existing linears.
     pub control: Option<WeightsSource>,
+    /// Auxiliary **IP-Adapter** weights overlaid at load time (sc-3059) — the image-prompt
+    /// conditioning checkpoint (image encoder + Resampler + decoupled cross-attn K/V), e.g. an
+    /// `h94/IP-Adapter`-layout snapshot dir. `None` for the plain base model. Like
+    /// [`control`](Self::control), a load-time graph *component* (it adds K/V projections to the
+    /// cross-attention), distinct from forward-time [`adapters`](Self::adapters).
+    pub ip_adapter: Option<WeightsSource>,
     /// LoRA/LoKr adapters baked onto the model at load time. Multiples + mixed LoRA/LoKr stack by
     /// construction (see [`crate::adapters`]). Applied during `load` on the still-mutable model —
     /// the seam, since `Generator::generate`/`Transform::apply` take `&self` and the frozen fork
@@ -70,6 +76,7 @@ impl LoadSpec {
             quantize: None,
             precision: Precision::Bf16,
             control: None,
+            ip_adapter: None,
             adapters: Vec::new(),
         }
     }
@@ -83,6 +90,12 @@ impl LoadSpec {
     /// Builder-style control-branch overlay (the ControlNet checkpoint over the base `weights`).
     pub fn with_control(mut self, control: WeightsSource) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    /// Builder-style IP-Adapter overlay (the image-prompt checkpoint dir over the base `weights`).
+    pub fn with_ip_adapter(mut self, ip_adapter: WeightsSource) -> Self {
+        self.ip_adapter = Some(ip_adapter);
         self
     }
 

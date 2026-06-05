@@ -22,9 +22,10 @@ use mlx_rs::Dtype;
 
 use crate::config::DiffusionConfig;
 use crate::inpaint::{preprocess_mask, InpaintBlend};
+use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
 use crate::pipeline::{
-    decode_image, denoise, denoise_control, denoise_inpaint, encode_conditioning,
+    decode_image, denoise, denoise_control, denoise_inpaint, denoise_ip, encode_conditioning,
     encode_init_latents, preprocess_control_image, text_time_ids, ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
@@ -38,6 +39,9 @@ const DEFAULT_STRENGTH: f32 = 0.8;
 /// Masked-inpaint / outpaint default strength — the worker's `SdxlDiffusersAdapter` uses 0.85 for
 /// `use_inpaint`/`outpaint` (vs 0.6 for a plain edit). An explicit request strength still wins.
 const INPAINT_DEFAULT_STRENGTH: f32 = 0.85;
+/// Default `ip_adapter_scale` (sc-3059) when a request doesn't override it (the worker's plus-face
+/// default ≈ 0.6). In IP mode the `Reference` strength field carries the IP scale.
+const IP_DEFAULT_SCALE: f32 = 0.6;
 
 /// SDXL-base-1.0 production defaults (the SceneWorks `MlxSdxlAdapter`): 30 inference steps,
 /// CFG 7.0, native 1024². Used when a request omits the corresponding field (consumed by the
@@ -131,6 +135,10 @@ pub struct Sdxl {
     /// detail / control checkpoint was supplied. `generate` requires it iff a `Control` conditioning
     /// is passed.
     control: Option<ControlNet>,
+    /// Optional IP-Adapter image-token source (sc-3059), loaded from `LoadSpec::ip_adapter`. When
+    /// present, the model is in "IP mode": a `Reference` conditioning is the image prompt (txt2img +
+    /// IP), not an img2img init. The decoupled-attn K/V projections are installed into `unet`.
+    ip_adapter: Option<IpImageEncoder>,
     vae: Autoencoder,
     sampler: EulerSampler,
     /// DDPM `alphas_cumprod` from the SDXL `scaled_linear` betas — shared by the acceleration
@@ -205,6 +213,23 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         None => None,
     };
 
+    // Optional IP-Adapter (sc-3059) — install the decoupled-attn K/V pairs into the still-mutable,
+    // pre-quant U-Net (so they quantize with it) and keep the image-token encoder.
+    let ip_adapter = match &spec.ip_adapter {
+        Some(WeightsSource::Dir(p)) => {
+            let (enc, pairs) = loader::load_ip_adapter(p, dtype)?;
+            unet.install_ip_adapter(pairs)?;
+            Some(enc)
+        }
+        Some(WeightsSource::File(_)) => {
+            return Err(Error::Msg(
+                "sdxl ip_adapter expects an h94/IP-Adapter snapshot directory, not a single file"
+                    .into(),
+            ));
+        }
+        None => None,
+    };
+
     if let Some(q) = spec.quantize {
         // Q4/Q8 (group_size 64) over every quantizable Linear of the U-Net + both CLIP encoders —
         // applied AFTER the adapter merge (the merge needs the dense weight; `merge_dense_delta`
@@ -234,6 +259,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         te2,
         unet,
         control,
+        ip_adapter,
         vae,
         sampler: EulerSampler::new_with_dtype(&cfg, true, dtype),
         alpha_schedule,
@@ -341,6 +367,33 @@ impl Generator for Sdxl {
             None => None,
         };
 
+        // IP-Adapter (sc-3059): when the model carries IP weights and a Reference is present (no
+        // mask/control/accel), the Reference is the image prompt (txt2img + IP), NOT an img2img init.
+        // The IP scale rides the Reference `strength` field (default 0.6). Tokens are seed-independent
+        // → built once, CFG-batched with a zeros uncond row so the negative pass gets no IP signal.
+        let ip_mode = self.ip_adapter.is_some()
+            && reference.is_some()
+            && mask_img.is_none()
+            && control_req.is_none()
+            && !is_accel;
+        let ip_scale = reference.and_then(|(_, s)| s).unwrap_or(IP_DEFAULT_SCALE);
+        let ip_tokens = if ip_mode {
+            let enc = self
+                .ip_adapter
+                .as_ref()
+                .expect("ip_adapter present in ip_mode");
+            let (image, _) = reference.expect("reference present in ip_mode");
+            let tokens = enc.tokens(image)?;
+            Some(if cfg_on {
+                let zeros = enc.zeros_like_tokens(tokens.dtype())?;
+                concatenate_axis(&[&tokens, &zeros], 0)?
+            } else {
+                tokens
+            })
+        } else {
+            None
+        };
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             // One image per iteration (the vendored `_run_one`, n_images=1), each with its own seed.
@@ -393,7 +446,7 @@ impl Generator for Sdxl {
                     Box::new(AncestralEuler::new(&self.sampler, eff, start_step)),
                     Some(blend),
                 )
-            } else if let Some((image, strength)) = reference {
+            } else if let Some((image, strength)) = reference.filter(|_| !ip_mode) {
                 // img2img (ancestral; the vendored `generate_latents_from_image`): VAE-encode the
                 // init, start at `max_time·strength`, run `int(steps·strength)` steps — NO min-1
                 // floor (strength ≤ 1/steps ⇒ 0 steps ⇒ init returned unchanged, dodging the σ=0
@@ -422,7 +475,20 @@ impl Generator for Sdxl {
                 unet: &self.unet,
                 sampler: sampler.as_ref(),
             };
-            let latents = if let Some(cc) = &control_ctx {
+            let latents = if let Some(tokens) = &ip_tokens {
+                denoise_ip(
+                    &d,
+                    latents,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    cfg,
+                    &req.cancel,
+                    on_progress,
+                    tokens,
+                    ip_scale,
+                )?
+            } else if let Some(cc) = &control_ctx {
                 denoise_control(
                     &d,
                     latents,

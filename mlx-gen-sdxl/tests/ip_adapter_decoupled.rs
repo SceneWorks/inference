@@ -13,6 +13,8 @@
 use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
+use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
+use mlx_gen_sdxl as _; // force-link the provider so `inventory` registers "sdxl"
 use mlx_gen_sdxl::{load_ip_kv_pairs, load_unet_dtype, text_time_ids};
 use mlx_rs::{Array, Dtype};
 
@@ -100,4 +102,90 @@ fn ip_decoupled_attn_remap_and_scale_zero() {
         di > 1e-3,
         "scale>0 must change the prediction (IP branch wired)"
     );
+}
+
+fn h94_snapshot() -> PathBuf {
+    let home = std::env::var("HOME").unwrap();
+    let snaps =
+        PathBuf::from(home).join(".cache/huggingface/hub/models--h94--IP-Adapter/snapshots");
+    std::fs::read_dir(&snaps)
+        .expect("HF cache snapshots dir for h94/IP-Adapter")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a snapshot dir")
+}
+
+fn gradient(w: u32, h: u32) -> Image {
+    let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            pixels.push((x % 256) as u8);
+            pixels.push((y % 256) as u8);
+            pixels.push(((x + y) % 256) as u8);
+        }
+    }
+    Image {
+        width: w,
+        height: h,
+        pixels,
+    }
+}
+
+/// e2e wiring: in IP mode a `Reference` at `ip_adapter_scale = 0` (strength 0) reproduces plain
+/// txt2img byte-for-byte (the IP branch is zeroed and draws no RNG), while `scale > 0` changes the
+/// image. Proves load → token pipeline → denoise_ip → CFG zeros-uncond → scale knob.
+#[test]
+#[ignore = "needs the SDXL base snapshot + h94/IP-Adapter weights"]
+fn ip_generate_scale_zero_equals_txt2img() {
+    let model = mlx_gen_sdxl::load(
+        &LoadSpec::new(WeightsSource::Dir(sdxl_snapshot()))
+            .with_ip_adapter(WeightsSource::Dir(h94_snapshot())),
+    )
+    .unwrap();
+    let refimg = gradient(512, 512);
+
+    let req = |scale: Option<f32>| {
+        let conditioning = match scale {
+            Some(s) => vec![Conditioning::Reference {
+                image: refimg.clone(),
+                strength: Some(s),
+            }],
+            None => vec![],
+        };
+        GenerationRequest {
+            prompt: "a portrait".to_string(),
+            width: 512,
+            height: 512,
+            seed: Some(5),
+            steps: Some(6),
+            conditioning,
+            ..Default::default()
+        }
+    };
+    let run = |r: &GenerationRequest| match model.generate(r, &mut |_| {}).unwrap() {
+        GenerationOutput::Images(mut v) => v.remove(0),
+        _ => unreachable!(),
+    };
+
+    let plain = run(&req(None));
+    let ip0 = run(&req(Some(0.0)));
+    let ip = run(&req(Some(0.6)));
+
+    let diff0 = plain
+        .pixels
+        .iter()
+        .zip(&ip0.pixels)
+        .filter(|(a, b)| a != b)
+        .count();
+    let diffi = plain
+        .pixels
+        .iter()
+        .zip(&ip.pixels)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!("[ip-adapter] txt2img vs IP(scale=0): {diff0} px bytes differ");
+    println!("[ip-adapter] txt2img vs IP(scale=0.6): {diffi} px bytes differ");
+    assert_eq!(diff0, 0, "IP scale=0 must equal plain txt2img");
+    assert!(diffi > 0, "IP scale=0.6 must change the image");
 }
