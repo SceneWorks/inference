@@ -203,6 +203,11 @@ impl Generator for Flux1 {
         let sampler = FlowMatchSampler::new(sigmas);
         let n_steps = sampler.num_steps();
 
+        // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine,
+        // gated residual, tanh-GELU FFN, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
+        // compile_parity.rs) and a per-step win at production geometry. Process-global, idempotent.
+        crate::transformer::set_compile_glue(true);
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);

@@ -12,7 +12,9 @@ use mlx_rs::ops::{add, concatenate_axis};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear};
-use mlx_gen::nn::{conv2d, group_norm, silu};
+use mlx_gen::nn::{conv2d, group_norm};
+
+use crate::silu_glue;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -218,7 +220,7 @@ impl UNet2DConditionModel {
             GN_GROUPS,
             GN_EPS,
         )?;
-        let x = silu(&x)?;
+        let x = silu_glue(&x)?;
         conv2d(&x, self.conv_out.weight(), self.conv_out.bias(), 1, 1)
     }
 

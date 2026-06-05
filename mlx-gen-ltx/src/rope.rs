@@ -14,10 +14,33 @@
 
 use std::f64::consts::PI;
 
+use mlx_rs::error::Exception;
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 use mlx_gen::Result;
+
+/// The GPT-NeoX "rotate-halves" rotation `(first·cos − second·sin, second·cos + first·sin)` on the
+/// already-split f32 halves. Fused into one kernel when the sc-2963 glue toggle is on (vs 6 eager ops,
+/// applied to q and k every block — the dominant elementwise RoPE cost at video sequence). Bit-exact.
+fn rope_rotate(first: &Array, second: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
+    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
+        let (a, b, c, s) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+        let out_first = subtract(&multiply(a, c)?, &multiply(b, s)?)?;
+        let out_second = add(&multiply(b, c)?, &multiply(a, s)?)?;
+        Ok(vec![out_first, out_second])
+    };
+    let args = [first.clone(), second.clone(), cos.clone(), sin.clone()];
+    let mut out = if crate::compile_glue() {
+        compile(f, true)(&args)?
+    } else {
+        f(&args)?
+    };
+    let out_second = out.pop().unwrap();
+    let out_first = out.pop().unwrap();
+    Ok((out_first, out_second))
+}
 
 /// Precompute the SPLIT RoPE `(cos, sin)` tables in double precision.
 ///
@@ -144,10 +167,7 @@ pub fn apply_split_rotary_emb(x: &Array, cos: &Array, sin: &Array) -> Result<Arr
     let sin = sin.as_dtype(mlx_rs::Dtype::Float32)?;
     let axis = (x.ndim() - 1) as i32;
     let halves = split(&x, 2, axis)?;
-    let first = &halves[0];
-    let second = &halves[1];
-    let out_first = subtract(&multiply(first, &cos)?, &multiply(second, &sin)?)?;
-    let out_second = add(&multiply(second, &cos)?, &multiply(first, &sin)?)?;
+    let (out_first, out_second) = rope_rotate(&halves[0], &halves[1], &cos, &sin)?;
     Ok(concatenate_axis(&[&out_first, &out_second], axis)?.as_dtype(in_dtype)?)
 }
 
@@ -195,5 +215,24 @@ mod tests {
             .unwrap()
             .item();
         assert!((xn - yn).abs() / xn < 1e-4, "norm changed: {xn} vs {yn}");
+    }
+
+    // sc-2963: the compiled split-RoPE rotation is bit-identical to eager (`max|Δ|=0`). The full
+    // `apply_split_rotary_emb` computes in f32, so this gates the rotation in f32 on a real input.
+    #[test]
+    fn compiled_rope_bit_identical_to_eager() {
+        let pos = create_position_grid(1, 1, 2, 2);
+        let (cos, sin) =
+            precompute_split_freqs_cis(&pos, 4096, 10000.0, &[20, 2048, 2048], 32).unwrap();
+        let k = mlx_rs::random::key(0).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[1, 32, 4, 128], None, None, Some(&k)).unwrap();
+        crate::set_compile_glue(false);
+        let eager = apply_split_rotary_emb(&x, &cos, &sin).unwrap();
+        crate::set_compile_glue(true);
+        let compiled = apply_split_rotary_emb(&x, &cos, &sin).unwrap();
+        crate::set_compile_glue(false);
+        let d = mlx_rs::ops::abs(subtract(&compiled, &eager).unwrap()).unwrap();
+        let m = mlx_rs::ops::max(&d, None).unwrap().item::<f32>();
+        assert_eq!(m, 0.0, "compiled split-RoPE diverged from eager");
     }
 }
