@@ -84,7 +84,13 @@ impl ResnetBlock2D {
     /// `x`: NHWC `[B, H, W, in]`; `temb`: `Some([B, temb_dim])` for the UNet, `None` for the VAE.
     pub fn forward(&self, x: &Array, temb: Option<&Array>) -> Result<Array> {
         let y = group_norm(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
-        let mut y = conv2d(&silu_glue(&y)?, self.conv1.weight(), self.conv1.bias(), 1, 1)?;
+        let mut y = conv2d(
+            &silu_glue(&y)?,
+            self.conv1.weight(),
+            self.conv1.bias(),
+            1,
+            1,
+        )?;
         // Add the projected time embedding (UNet only), broadcast over H,W.
         if let (Some(proj), Some(t)) = (&self.time_emb_proj, temb) {
             let tp = proj.forward(&silu_glue(t)?)?;
@@ -92,7 +98,13 @@ impl ResnetBlock2D {
             y = add(&y, &tp.reshape(&[tb[0], 1, 1, tb[1]])?)?;
         }
         let y = group_norm(&y, &self.norm2_w, &self.norm2_b, GN_GROUPS, GN_EPS)?;
-        let y = conv2d(&silu_glue(&y)?, self.conv2.weight(), self.conv2.bias(), 1, 1)?;
+        let y = conv2d(
+            &silu_glue(&y)?,
+            self.conv2.weight(),
+            self.conv2.bias(),
+            1,
+            1,
+        )?;
 
         let residual = match &self.shortcut {
             Some(sc) => sc.forward(x)?,

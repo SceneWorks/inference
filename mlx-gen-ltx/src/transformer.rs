@@ -125,7 +125,10 @@ fn param(w: &Weights, key: &str, prec: Precision) -> Result<Array> {
 /// inside, as before — bit-identical and dtype-preserving).
 fn modulate(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
     let f = |(x, sc, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(&multiply(x, &add(sc, &scalar(1.0).as_dtype(sc.dtype())?)?)?, sh)
+        add(
+            &multiply(x, &add(sc, &scalar(1.0).as_dtype(sc.dtype())?)?)?,
+            sh,
+        )
     };
     if crate::compile_glue() {
         Ok(compile(f, true)((x, scale, shift))?)
@@ -552,8 +555,7 @@ impl FeedForward {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        self.proj_out
-            .forward(&gelu_ffn(&self.proj_in.forward(x)?)?)
+        self.proj_out.forward(&gelu_ffn(&self.proj_in.forward(x)?)?)
     }
 
     /// LoRA targets: `ff.net.0.proj`→`ff.proj_in`, `ff.net.2`→`ff.proj_out` (renamed by the loader).

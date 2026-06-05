@@ -80,11 +80,17 @@ fn compile_silu_micro() {
         let oneshot = bench(warmup, iters, || compile(silu_body, true)(&x).unwrap());
         let mut held = silu_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut(&x).unwrap());
-        let diff = max_abs_diff(&silu_body(&x).unwrap(), &compile(silu_body, true)(&x).unwrap());
+        let diff = max_abs_diff(
+            &silu_body(&x).unwrap(),
+            &compile(silu_body, true)(&x).unwrap(),
+        );
         println!(
             "[silu fp16 {}x{}x{}x{}] eager={eager:.3} oneshot={oneshot:.3} held={heldt:.3} ms \
              | held speedup={:.2}× saved/call={:.3}ms ×50={:.1}ms | max|Δ|={diff:.2e}",
-            sh[0], sh[1], sh[2], sh[3],
+            sh[0],
+            sh[1],
+            sh[2],
+            sh[3],
             eager / heldt,
             eager - heldt,
             (eager - heldt) * 50.0

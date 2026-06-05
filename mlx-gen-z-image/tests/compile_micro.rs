@@ -8,6 +8,7 @@
 //!   * **swiglu** — `silu(h1)·h3` (the FFN activation; w1/w3 GEMMs stay eager).
 //!   * **gated** — gated residual `x + gate·normed` (the `mx.fast` RMSNorm stays eager).
 //!   * **rope_rotate** — the complex rotation on `[B, S, H, head_dim/2]` (q and k).
+//!
 //! The control-only `add_hint` (`x + hint·scale`) fuses identically to `gated` (2 ops → 1 kernel).
 //!
 //! Run it:
@@ -94,7 +95,9 @@ fn compile_glue_micro() {
         let h1 = normal(&[b, s, ffn]);
         let h3 = normal(&[b, s, ffn]);
         let eager = bench(warmup, iters, || swiglu_body((&h1, &h3)).unwrap());
-        let oneshot = bench(warmup, iters, || compile(swiglu_body, true)((&h1, &h3)).unwrap());
+        let oneshot = bench(warmup, iters, || {
+            compile(swiglu_body, true)((&h1, &h3)).unwrap()
+        });
         let mut held = swiglu_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut((&h1, &h3)).unwrap());
         let diff = max_abs_diff(
@@ -116,7 +119,9 @@ fn compile_glue_micro() {
         let n = normal(&[b, s, dim]);
         let g = normal(&[b, 1, dim]);
         let eager = bench(warmup, iters, || gated_body((&x, &g, &n)).unwrap());
-        let oneshot = bench(warmup, iters, || compile(gated_body, true)((&x, &g, &n)).unwrap());
+        let oneshot = bench(warmup, iters, || {
+            compile(gated_body, true)((&x, &g, &n)).unwrap()
+        });
         let mut held = gated_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut((&x, &g, &n)).unwrap());
         let diff = max_abs_diff(
@@ -144,7 +149,9 @@ fn compile_glue_micro() {
             compile(rope_body, true)(&args).unwrap().pop().unwrap()
         });
         let mut held = rope_body.compile(true);
-        let heldt = bench(warmup, iters, || held.call_mut(&args).unwrap().pop().unwrap());
+        let heldt = bench(warmup, iters, || {
+            held.call_mut(&args).unwrap().pop().unwrap()
+        });
         let diff = max_abs_diff(
             &rope_body(&args).unwrap()[0],
             &compile(rope_body, true)(&args).unwrap()[0],
