@@ -553,6 +553,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-face"
+version = "0.0.0"
+dependencies = [
+ "inventory",
+ "mlx-gen",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-flux"
 version = "0.0.0"
 dependencies = [
