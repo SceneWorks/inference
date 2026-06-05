@@ -48,3 +48,82 @@ pub use text_encoder::{ClipOutput, ClipTextEncoder};
 pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
 pub use unet::UNet2DConditionModel;
 pub use vae::Autoencoder;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// sc-2963 (rollout of the Wan sc-2957 template): when on, the UNet's remaining fusable elementwise
+/// glue — the **SiLU** activations (`x·sigmoid(x)`: ResNet GN→SiLU, the time-embedding MLP, the output
+/// head) — runs through `mx.compile`, fusing each into one kernel. The GEGLU/erf-GELU activations are
+/// **already** `mx.compile`'d in core `nn` (`gelu_exact`/`gelu_quick`, sc-2721), and the GEGLU
+/// `multiply` is a single op (no fusion to win), so SiLU is the only chain left.
+///
+/// ⚠️ SDXL is **fp16 and precision-load-bearing** ([[sdxl-fp16-sc2721]]): a fused fp16 kernel can round
+/// differently from the same ops unfused (that 1-ULP gap is exactly why `gelu_exact` is compiled). The
+/// reference runs SiLU eager, so the fp16 golden matches **eager** SiLU — fusing SiLU is only safe if
+/// it is **bit-identical** to eager. It is: `tests/compile_parity.rs` proves `max|Δ| = 0` for the
+/// compiled SiLU in fp16 AND f32 (the fused `sigmoid`+`multiply` rounds identically — unlike the
+/// erf/divide GELU chain). So enabling it cannot move the golden. The VAE SiLUs (f32, once per
+/// generation, outside the denoise loop) are left eager. **Enabled by the production denoise loop**
+/// ([`pipeline::denoise`]); **off by default**.
+static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+pub fn set_compile_glue(on: bool) {
+    COMPILE_GLUE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn compile_glue() -> bool {
+    COMPILE_GLUE.load(Ordering::Relaxed)
+}
+
+/// SiLU `x·sigmoid(x)` — one fused kernel when the sc-2963 glue toggle is on, else the eager core
+/// [`mlx_gen::nn::silu`]. Bit-identical to eager in fp16 AND f32 (proven `max|Δ|=0`,
+/// `tests/compile_parity.rs`), so it is golden-safe on the precision-load-bearing fp16 UNet.
+pub(crate) fn silu_glue(x: &mlx_rs::Array) -> mlx_gen::Result<mlx_rs::Array> {
+    use mlx_rs::ops::{multiply, sigmoid};
+    if !compile_glue() {
+        return mlx_gen::nn::silu(x);
+    }
+    let f = |x_: &mlx_rs::Array| -> std::result::Result<mlx_rs::Array, mlx_rs::error::Exception> {
+        multiply(x_, &sigmoid(x_)?)
+    };
+    Ok(mlx_rs::transforms::compile::compile(f, true)(x)?)
+}
+
+#[cfg(test)]
+mod sc2963 {
+    use mlx_rs::{random, Array, Dtype};
+
+    fn max_abs(a: &Array, b: &Array) -> f32 {
+        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
+        mlx_rs::ops::max(&d, None)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .item::<f32>()
+    }
+
+    // sc-2963 invariant: the compiled SiLU is **bit-identical** to the eager core SiLU in **fp16**
+    // (the precision-load-bearing UNet dtype) AND f32 — `max|Δ|=0`. SDXL's fp16 golden matches the
+    // eager (reference) SiLU, so a non-zero gap here would mean enabling compile regresses the golden
+    // (it doesn't — unlike the erf-GELU chain, the fused `sigmoid`+`multiply` rounds identically).
+    #[test]
+    fn compiled_silu_bit_identical_to_eager_fp16_and_f32() {
+        let k = random::key(0).unwrap();
+        for dt in [Dtype::Float16, Dtype::Float32] {
+            let x = random::normal::<f32>(&[4, 64, 64, 320], None, None, Some(&k))
+                .unwrap()
+                .as_dtype(dt)
+                .unwrap();
+            super::set_compile_glue(false);
+            let eager = super::silu_glue(&x).unwrap();
+            super::set_compile_glue(true);
+            let compiled = super::silu_glue(&x).unwrap();
+            super::set_compile_glue(false);
+            assert_eq!(compiled.dtype(), dt, "silu_glue preserves dtype {dt:?}");
+            let d = max_abs(&compiled, &eager);
+            println!("[sdxl silu {dt:?}] max|Δ|={d:.3e}");
+            assert_eq!(d, 0.0, "SDXL compiled SiLU diverged from eager in {dt:?}");
+        }
+    }
+}

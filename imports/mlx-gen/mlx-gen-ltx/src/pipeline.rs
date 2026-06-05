@@ -213,6 +213,11 @@ pub fn generate_t2v_latents(
     latent_std: &Array,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
+    // sc-2963 (rollout of sc-2957): run the AvDiT's fusable elementwise glue (adaLN affine, gated
+    // residuals, tanh-GELU FFN, split-RoPE rotation) through `mx.compile` — bit-exact and the biggest
+    // per-step win of the rollout at video sequence (the FFN GELU dominates). Enabled here at the
+    // production boundary (not inside the shared `denoise`, which the parity tests reuse eager).
+    crate::set_compile_glue(true);
     // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
     dit.set_lora_pass(0);
     let lat = denoise(
@@ -434,6 +439,10 @@ pub fn generate_av_latents(
     video_cond: Option<(&Array, &Array, i32, f32)>,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
+    // sc-2963 (rollout of sc-2957): compiled elementwise glue across the joint video/audio/cross-modal
+    // AvDiT forward — see `generate_t2v_latents`. Bit-exact, dtype-preserving, enabled at the
+    // production boundary (the shared `denoise_av` stays eager for the parity tests).
+    crate::set_compile_glue(true);
     // Stage 1: video init = conditioned+noised (I2V) or pure noise (T2V); audio = pure noise.
     let (vlat1, vstate1): (Array, Option<I2vConditioning>) = match video_cond {
         Some((img1, _, frame_idx, strength)) => {

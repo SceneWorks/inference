@@ -439,6 +439,11 @@ impl Generator for Flux2 {
             .map(|(r, _)| r.shape()[1] as usize)
             .unwrap_or(0);
 
+        // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine,
+        // SwiGLU, gated residual, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
+        // compile_parity.rs) and a per-step win at production geometry. Process-global, idempotent.
+        crate::transformer::set_compile_glue(true);
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
