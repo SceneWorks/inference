@@ -14,6 +14,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::{CancelFlag, DiffusionSampler, Error, Image, Progress, Result};
 
+use crate::inpaint::InpaintBlend;
 use crate::sampler::EulerSampler;
 use crate::text_encoder::ClipTextEncoder;
 use crate::unet::UNet2DConditionModel;
@@ -67,6 +68,58 @@ pub struct Denoiser<'a> {
 #[allow(clippy::too_many_arguments)]
 pub fn denoise(
     d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        None,
+    )
+}
+
+/// Like [`denoise`] but applies the legacy inpaint **mask-blend** after each step (sc-3057):
+/// `latents = (1-mask)·init_noised + mask·latents`. The blend draws no RNG, so the ancestral noise
+/// stream is identical to plain img2img (a full-white mask ⇒ bit-identical to [`denoise`]).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_inpaint(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    blend: &InpaintBlend,
+) -> Result<Array> {
+    denoise_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        Some(blend),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_core(
+    d: &Denoiser,
     mut latents: Array,
     conditioning: &Array,
     pooled: &Array,
@@ -74,6 +127,7 @@ pub fn denoise(
     cfg: f32,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
+    inpaint: Option<&InpaintBlend>,
 ) -> Result<Array> {
     let steps = d.sampler.num_steps();
     // A zero-step denoise (img2img at strength ≤ 1/steps) is a no-op: return the init latents
@@ -125,6 +179,11 @@ pub fn denoise(
             eps
         };
         latents = d.sampler.step(&eps, &latents, i)?;
+        // Legacy inpaint blend (sc-3057): pin the kept region to the init noised to this step's σ,
+        // keep the repaint region freely denoised. No RNG draw → ancestral stream unperturbed.
+        if let Some(b) = inpaint {
+            latents = b.blend(&latents, i)?;
+        }
         // Force evaluation each step (the reference's per-step `mx.eval`). Beyond bounding the lazy
         // graph, this materializes the global-RNG state split between steps so the ancestral noise
         // stream is byte-identical to the reference — leaving it lazy across all steps perturbs the
