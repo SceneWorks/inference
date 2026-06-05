@@ -70,3 +70,27 @@ pub use transformer::{to_denoised, AvDiT, LtxDiT, Precision, VideoBlock};
 pub use upsampler::{upsample_latents, LatentUpsampler};
 pub use vae::LtxVideoVae;
 pub use vocoder::{Generator, LtxVocoder, VocoderWithBwe};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// sc-2963 (rollout of the Wan sc-2957 template): when on, the AvDiT's fusable elementwise *glue* —
+/// adaLN affine (`x·(1+scale)+shift`), the gated residuals (`x+out·gate`), the **tanh-GELU FFN
+/// activation**, and the split (rotate-halves) RoPE rotation — runs through `mx.compile` so MLX fuses
+/// each chain into a single Metal kernel. The big quantized GEMMs / SDPA / `mx.fast` norms stay eager.
+///
+/// This is the same machine that gave Wan **+14%/step**: at video sequence the FFN GELU runs on a
+/// `[B, S, ffn]` tensor of tens-to-hundreds of millions of elements (S up to ~15k at 1280×720), so
+/// fusing its ~8 elementwise ops into one kernel is the dominant win. **Bit-exact** to the eager form.
+/// **Enabled by the production denoise loops** ([`pipeline::denoise`] / [`pipeline::denoise_av`]);
+/// **off by default** so the reference-parity gates run eager. Dtype-preserving (the closures cast
+/// nothing) — the f32 / bf16 / quantized compute paths flow through unchanged.
+static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+pub fn set_compile_glue(on: bool) {
+    COMPILE_GLUE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn compile_glue() -> bool {
+    COMPILE_GLUE.load(Ordering::Relaxed)
+}

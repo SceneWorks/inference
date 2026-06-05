@@ -25,7 +25,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::ops::{add, multiply, sigmoid, subtract};
 use mlx_rs::transforms::compile::{compile, CallMut, Compile};
 use mlx_rs::transforms::eval;
-use mlx_rs::{random, Array, Dtype};
+use mlx_rs::{random, Array};
 
 fn env_usize(var: &str, default: usize) -> usize {
     std::env::var(var)
