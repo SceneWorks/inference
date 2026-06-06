@@ -27,6 +27,7 @@ pub mod pipeline;
 pub mod sampler;
 pub mod text_encoder;
 pub mod tokenizer;
+pub mod training;
 pub mod unet;
 pub mod vae;
 pub mod vision_encoder;
@@ -55,6 +56,7 @@ pub use pipeline::{
 pub use sampler::EulerSampler;
 pub use text_encoder::{ClipOutput, ClipTextEncoder};
 pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
+pub use training::{load_trainer, SdxlTrainer};
 pub use unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 pub use vae::Autoencoder;
 pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
