@@ -42,13 +42,13 @@ fn lora_functional_autograd_converges() {
     let x = random::normal::<f32>(&[n, in_f], None, None, Some(&kx)).unwrap();
     let a_true = random::normal::<f32>(&[rank, in_f], None, None, Some(&kat)).unwrap();
     let b_true = random::normal::<f32>(&[out_f, rank], None, None, Some(&kbt)).unwrap();
-    let y = matmul(&matmul(&x, &a_true.t()).unwrap(), &b_true.t()).unwrap(); // [n, out]
+    let y = matmul(matmul(&x, a_true.t()).unwrap(), b_true.t()).unwrap(); // [n, out]
 
     // Trainable factors in the SAVE orientation: a=[rank,in] small-normal, b=[out,rank] zeros
     // (the Python `_MlxLoRALinear` init — A~N(0,0.02), B=0 → adapter starts as identity).
     let ka = random::key(33).unwrap();
     let mut a = multiply(
-        &random::normal::<f32>(&[rank, in_f], None, None, Some(&ka)).unwrap(),
+        random::normal::<f32>(&[rank, in_f], None, None, Some(&ka)).unwrap(),
         s(0.02),
     )
     .unwrap();
@@ -75,8 +75,8 @@ fn lora_functional_autograd_converges() {
         let loss_fn = move |p: HashMap<Rc<str>, Array>, _: i32| -> MlxResult<Vec<Array>> {
             let a = &p["a"];
             let b = &p["b"];
-            let xa = matmul(&xc, &a.t())?; // [n, rank]
-            let pred = matmul(&xa, &b.t())?; // [n, out]
+            let xa = matmul(&xc, a.t())?; // [n, rank]
+            let pred = matmul(&xa, b.t())?; // [n, out]
             let pred = multiply(&pred, s(scale))?;
             let diff = subtract(&pred, &yc)?;
             let sumsq = diff.square()?.sum(None)?;
