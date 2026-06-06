@@ -12,14 +12,15 @@
 //! the transformer (native safetensors shards → [`sanitize_wan_transformer`], bf16), the T5
 //! (`.pth` → [`sanitize_wan_t5`], bf16), the VAE (f32), and `config.json`.
 //!
-//! **sc-3239: the I2V-A14B dual-expert converter.** [`convert_i2v_14b`] converts both the
-//! `low_noise_model` + `high_noise_model` experts (in_dim 36, optionally Q4/Q8 via
-//! [`quantize_wan_transformer`]), the z16 Wan2.1 VAE ([`sanitize_wan_vae_weights`]), the T5, and the
-//! I2V-14B `config.json`. ⚠ No golden dir exists for I2V-14B and its native source is not cached
-//! (~114 GB), so this path is **structurally** validated (sanitizers + config round-trip + the
-//! byte-proven [`sanitize_wan_transformer`]/pickle-reader/`quantize`) but not yet byte-parity'd
-//! end-to-end — `tests/convert_i2v_14b_parity.rs` is wired and `#[ignore]`d, ready for when a
-//! reference is generated.
+//! **sc-3239: the A14B dual-expert converters.** [`convert_i2v_14b`] (in_dim 36) and
+//! [`convert_t2v_14b`] (in_dim 16) share [`convert_dual_a14b`] — both `low_noise_model` +
+//! `high_noise_model` experts (optionally Q4/Q8 via [`quantize_wan_transformer`]), the z16 Wan2.1 VAE
+//! ([`sanitize_wan_vae_weights`]), the T5, and the respective `config.json` — differing only in that
+//! config. Byte-parity validated end-to-end against a Python `convert_wan` reference on the real
+//! 126 GB native I2V-A14B checkpoint (both 1095-tensor experts + T5 + z16 VAE byte-identical;
+//! `tests/convert_i2v_14b_parity.rs`). T2V-A14B reuses the same byte-proven path; the SceneWorks
+//! manifest ships it a turnkey pre-converted repo, so its native conversion is the optional
+//! supply-chain-independent alternative.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -426,6 +427,52 @@ fn wan22_i2v_14b_config(quantize: Option<(i32, i32)>) -> serde_json::Value {
     cfg
 }
 
+/// The `WanModelConfig.wan22_t2v_14b().to_dict()` config.json (the dual-expert **T2V** preset:
+/// in_dim 16, boundary 0.875, sample_shift 12.0, dual guide scale `[3.0, 4.0]`, no resolution cap).
+fn wan22_t2v_14b_config(quantize: Option<(i32, i32)>) -> serde_json::Value {
+    let mut cfg = serde_json::json!({
+        "model_type": "t2v",
+        "model_version": "2.2",
+        "patch_size": [1, 2, 2],
+        "text_len": 512,
+        "in_dim": 16,
+        "dim": 5120,
+        "ffn_dim": 13824,
+        "freq_dim": 256,
+        "text_dim": 4096,
+        "out_dim": 16,
+        "num_heads": 40,
+        "num_layers": 40,
+        "window_size": [-1, -1],
+        "qk_norm": true,
+        "cross_attn_norm": true,
+        "eps": 1e-6,
+        "vae_stride": [4, 8, 8],
+        "vae_z_dim": 16,
+        "dual_model": true,
+        "boundary": 0.875,
+        "sample_shift": 12.0,
+        "sample_steps": 40,
+        "sample_guide_scale": [3.0, 4.0],
+        "num_train_timesteps": 1000,
+        "sample_fps": 16,
+        "frame_num": 81,
+        "sample_neg_prompt": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+        "max_area": 0,
+        "t5_vocab_size": 256384,
+        "t5_dim": 4096,
+        "t5_dim_attn": 4096,
+        "t5_dim_ffn": 10240,
+        "t5_num_heads": 64,
+        "t5_num_layers": 24,
+        "t5_num_buckets": 32
+    });
+    if let Some((bits, group_size)) = quantize {
+        cfg["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
+    }
+    cfg
+}
+
 /// Convert one native transformer expert dir (`low_noise_model` / `high_noise_model`) → a sanitized,
 /// bf16 (optionally quantized) component file.
 fn convert_expert(
@@ -445,20 +492,15 @@ fn convert_expert(
     Ok(())
 }
 
-/// Convert a native Wan2.2 **I2V-A14B** checkpoint dir into an MLX model dir: the two MoE experts
-/// (`low_noise_model` / `high_noise_model` → `*.safetensors`, in_dim 36, optionally Q4/Q8), the z16
+/// Shared dual-expert A14B conversion (I2V + T2V differ only in the emitted `config`): both MoE
+/// experts (`low_noise_model` / `high_noise_model` → `*.safetensors`, optionally Q4/Q8), the z16
 /// Wan2.1 VAE (`Wan2.1_VAE.pth`, falling back to `Wan2.2_VAE.pth`), the T5, and `config.json`.
-/// `quantize = Some((bits, group_size))` enables selective transformer quantization on both experts.
-///
-/// ⚠ Unlike [`convert_ti2v_5b`] this path has no golden + the native source (~114 GB) is uncached, so
-/// it is validated structurally (sanitizers + config round-trip), not yet byte-parity'd end-to-end.
-pub fn convert_i2v_14b(
-    checkpoint_dir: impl AsRef<Path>,
-    out_dir: impl AsRef<Path>,
+fn convert_dual_a14b(
+    checkpoint_dir: &Path,
+    out_dir: &Path,
+    config: serde_json::Value,
     quantize: Option<(i32, i32)>,
 ) -> Result<PathBuf> {
-    let checkpoint_dir = checkpoint_dir.as_ref();
-    let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
     // 1. Dual experts.
@@ -477,7 +519,7 @@ pub fn convert_i2v_14b(
     }
 
     // 2. Config.
-    write_json(out_dir.join("config.json"), &wan22_i2v_14b_config(quantize))?;
+    write_json(out_dir.join("config.json"), &config)?;
 
     // 3. T5 encoder.
     let t5_pth = checkpoint_dir.join("models_t5_umt5-xxl-enc-bf16.pth");
@@ -487,7 +529,7 @@ pub fn convert_i2v_14b(
     save_map(out_dir.join("t5_encoder.safetensors"), &t5)?;
     drop((raw_t5, t5));
 
-    // 4. VAE — prefer the z16 Wan2.1 VAE; fall back to the z48 Wan2.2 VAE (encoder kept for i2v).
+    // 4. VAE — prefer the z16 Wan2.1 VAE; fall back to the z48 Wan2.2 VAE (encoder kept).
     let vae21 = checkpoint_dir.join("Wan2.1_VAE.pth");
     let vae22 = checkpoint_dir.join("Wan2.2_VAE.pth");
     if vae21.is_file() {
@@ -504,6 +546,40 @@ pub fn convert_i2v_14b(
     }
 
     Ok(out_dir.to_path_buf())
+}
+
+/// Convert a native Wan2.2 **I2V-A14B** checkpoint dir into an MLX model dir (in_dim 36 image-concat
+/// conditioning, optional Q4/Q8). Byte-parity validated end-to-end against a Python `convert_wan`
+/// reference on the real 126 GB native checkpoint (both 1095-tensor experts + T5 + z16 VAE identical).
+pub fn convert_i2v_14b(
+    checkpoint_dir: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    quantize: Option<(i32, i32)>,
+) -> Result<PathBuf> {
+    convert_dual_a14b(
+        checkpoint_dir.as_ref(),
+        out_dir.as_ref(),
+        wan22_i2v_14b_config(quantize),
+        quantize,
+    )
+}
+
+/// Convert a native Wan2.2 **T2V-A14B** checkpoint dir into an MLX model dir (in_dim 16, text-only).
+/// The same byte-validated dual-expert path as [`convert_i2v_14b`], differing only in the emitted
+/// `config.json` (the `wan22_t2v_14b` preset). The SceneWorks manifest ships a turnkey pre-converted
+/// MLX repo for this model, so conversion is optional — this is the native path that avoids that
+/// third-party dependency and fully covers the reference `convert_wan` capability surface.
+pub fn convert_t2v_14b(
+    checkpoint_dir: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    quantize: Option<(i32, i32)>,
+) -> Result<PathBuf> {
+    convert_dual_a14b(
+        checkpoint_dir.as_ref(),
+        out_dir.as_ref(),
+        wan22_t2v_14b_config(quantize),
+        quantize,
+    )
 }
 
 #[cfg(test)]
@@ -813,5 +889,13 @@ mod tests {
         assert_eq!(cfg, WanModelConfig::wan22_i2v_14b());
         let cfgq = WanModelConfig::from_config_json(&wan22_i2v_14b_config(Some((4, 64))));
         assert!(cfgq.quantization.is_some());
+    }
+
+    /// The T2V-14B config.json round-trips through the loader's parser to the `wan22_t2v_14b` preset.
+    #[test]
+    fn t2v_14b_config_round_trips() {
+        use crate::config::WanModelConfig;
+        let cfg = WanModelConfig::from_config_json(&wan22_t2v_14b_config(None));
+        assert_eq!(cfg, WanModelConfig::wan22_t2v_14b());
     }
 }
