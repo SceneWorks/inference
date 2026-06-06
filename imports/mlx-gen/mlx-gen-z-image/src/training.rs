@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use mlx_gen::adapters::{AdaptableHost, Adapter};
+use mlx_gen::adapters::{reconstruct_lokr_delta, AdaptableHost, Adapter};
 use mlx_gen::array::host_i32;
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
@@ -43,7 +43,7 @@ use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::optimizers::{clip_grad_norm, AdamW, Optimizer};
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
-use mlx_rs::{random, Array};
+use mlx_rs::{random, Array, Dtype};
 
 use crate::model::MODEL_ID;
 use crate::pipeline::{encode_init_latents, slice_valid};
@@ -377,8 +377,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
         family: "z_image",
         modality: Modality::Image,
         supports_lora: true,
-        // LoKr training is the next sc-3044 increment (the inference side already consumes LoKr).
-        supports_lokr: false,
+        supports_lokr: true,
     }
 }
 
@@ -438,13 +437,6 @@ impl Trainer for ZImageTurboTrainer {
         if req.items.is_empty() {
             return Err("z_image_turbo trainer: dataset is empty".into());
         }
-        if matches!(req.config.network_type, NetworkType::Lokr) {
-            return Err(
-                "z_image_turbo trainer: LoKr training is not yet wired (sc-3044 follow-up); \
-                        use network_type = lora"
-                    .into(),
-            );
-        }
         if req.config.rank == 0 {
             return Err("z_image_turbo trainer: rank must be > 0".into());
         }
@@ -492,15 +484,31 @@ impl Trainer for ZImageTurboTrainer {
             return Err("z_image_turbo trainer: no usable dataset items (all cancelled?)".into());
         }
 
-        // --- LoRA targets + params + optimizer ---
+        // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let n_layers = self.transformer.cfg.n_layers;
         let target_paths = resolve_target_paths(cfg, n_layers);
-        let (targets, mut params) = build_lora_targets(
-            &mut self.transformer,
-            &target_paths,
-            cfg.rank as i32,
-            cfg.seed,
-        )?;
+        let rank = cfg.rank as f32;
+        let (adapter, mut params) = match cfg.network_type {
+            NetworkType::Lora => {
+                let (targets, params) = build_lora_targets(
+                    &mut self.transformer,
+                    &target_paths,
+                    cfg.rank as i32,
+                    cfg.seed,
+                )?;
+                (TrainAdapter::Lora { targets }, params)
+            }
+            NetworkType::Lokr => {
+                let (targets, params) = build_lokr_targets(
+                    &mut self.transformer,
+                    &target_paths,
+                    cfg.rank as i32,
+                    cfg.decompose_factor,
+                    cfg.seed,
+                )?;
+                (TrainAdapter::Lokr { targets }, params)
+            }
+        };
         let alpha = cfg.alpha;
         let mae = {
             let lt = cfg.loss_type.to_ascii_lowercase();
@@ -550,8 +558,9 @@ impl Trainer for ZImageTurboTrainer {
             let (loss, grads) = compute_loss_grads(
                 &mut self.transformer,
                 &params,
-                &targets,
+                &adapter,
                 alpha,
+                rank,
                 x0,
                 cap,
                 sigma,
@@ -591,7 +600,7 @@ impl Trainer for ZImageTurboTrainer {
             if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
                 std::fs::create_dir_all(&req.output_dir)?;
                 let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
-                save_lora_peft(&params, &targets, alpha, cfg.rank, &ckpt)?;
+                adapter.save(&params, alpha, rank, cfg.decompose_factor, &ckpt)?;
                 on_progress(TrainingProgress::Checkpoint { step });
             }
         }
@@ -600,7 +609,7 @@ impl Trainer for ZImageTurboTrainer {
         on_progress(TrainingProgress::Saving);
         std::fs::create_dir_all(&req.output_dir)?;
         let adapter_path = req.output_dir.join(&req.file_name);
-        save_lora_peft(&params, &targets, alpha, cfg.rank, &adapter_path)?;
+        adapter.save(&params, alpha, rank, cfg.decompose_factor, &adapter_path)?;
         Ok(TrainingOutput {
             adapter_path,
             steps: steps_run,
@@ -675,14 +684,16 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
     Ok(t.clamp(1e-3, 1.0 - 1e-3))
 }
 
-/// One forward+backward over the trainable LoRA factors: inject `params`, run the DiT, regress the
-/// (already-negated) `forward()` output toward the velocity `noise - x0`, return `(loss, grads)`.
+/// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), run the
+/// DiT, regress the (already-negated) `forward()` output toward the velocity `noise - x0`, return
+/// `(loss, grads)`.
 #[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     transformer: &mut ZImageTransformer,
     params: &LoraParams,
-    targets: &[LoraTarget],
+    adapter: &TrainAdapter,
     alpha: f32,
+    rank: f32,
     x0: &Array,
     cap: &Array,
     sigma: f32,
@@ -692,7 +703,7 @@ fn compute_loss_grads(
     let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
     let capf = cap.clone();
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
-        install_training_lora(transformer, &p, targets, alpha)?;
+        adapter.install(transformer, &p, alpha, rank)?;
         let v = transformer
             .forward(&x_t, timestep, &capf)
             .map_err(|e| Exception::custom(e.to_string()))?;
@@ -738,4 +749,233 @@ fn average_grads(grads: LoraParams, accum: u32) -> Result<LoraParams> {
         out.insert(k, multiply(&g, &inv)?);
     }
     Ok(out)
+}
+
+// ===========================================================================================
+// LoKr (LyCORIS Kronecker-product adapter) training.
+// ===========================================================================================
+
+/// One LoKr-trained Linear: its path, the base `[out,in]` shape, and the factor-map keys —
+/// `lokr_w1` always, then either full `lokr_w2` or low-rank `lokr_w2_a`/`lokr_w2_b`.
+struct LokrTarget {
+    path: String,
+    base_shape: Vec<i32>,
+    w1_key: Rc<str>,
+    w2_key: Option<Rc<str>>,
+    w2a_key: Option<Rc<str>>,
+    w2b_key: Option<Rc<str>>,
+}
+
+/// LyCORIS dimension factorization: split `dimension` into `(a, b)`, `a*b = dimension`, `a <= b`,
+/// with `a` as close to `factor` (or balanced/√dimension when `factor < 0`) as a divisor allows.
+/// The LoKr weight `[out,in]` then factors as `kron(w1, w2)` with `w1 = [fac(out).0, fac(in).0]`,
+/// `w2 = [fac(out).1, fac(in).1]`. Port of LyCORIS `factorization`.
+fn factorization(dimension: i32, factor: i32) -> (i32, i32) {
+    if factor > 0 && dimension % factor == 0 {
+        let n = dimension / factor;
+        return if factor > n { (n, factor) } else { (factor, n) };
+    }
+    let factor = if factor < 0 { dimension } else { factor };
+    let (mut m, mut n) = (1i32, dimension);
+    let mut length = m + n;
+    while m < n {
+        let mut new_m = m + 1;
+        while dimension % new_m != 0 {
+            new_m += 1;
+        }
+        let new_n = dimension / new_m;
+        if new_m + new_n > length || new_m > factor {
+            break;
+        }
+        m = new_m;
+        n = new_n;
+        length = m + n;
+    }
+    if m > n {
+        (n, m)
+    } else {
+        (m, n)
+    }
+}
+
+/// Initialise trainable LoKr factors per target. The weight `[out,in]` factors as
+/// `kron(w1[out_a,in_a], w2[out_b,in_b])`; `w2` is low-ranked to `rank` when `rank < min(out_b,in_b)`.
+/// `w1 ~ N(0,0.02)`; the SECOND factor is zero-initialised (`w2` full, or `w2_b` low-rank) so the
+/// initial delta is exactly 0 (the LoKr analog of LoRA's `B = 0`). `factor` is the decompose knob
+/// (`-1` = balanced/auto).
+fn build_lokr_targets(
+    transformer: &mut ZImageTransformer,
+    target_paths: &[String],
+    rank: i32,
+    factor: i32,
+    seed: u64,
+) -> Result<(Vec<LokrTarget>, LoraParams)> {
+    let mut targets = Vec::with_capacity(target_paths.len());
+    let mut params = LoraParams::new();
+    let small = Array::from_slice(&[0.02f32], &[1]);
+    for (i, path) in target_paths.iter().enumerate() {
+        let segs: Vec<&str> = path.split('.').collect();
+        let lin =
+            AdaptableHost::adaptable_mut(transformer, &segs).ok_or_else(|| -> mlx_gen::Error {
+                format!("LoKr target does not resolve on the Z-Image DiT: {path}").into()
+            })?;
+        let shape = lin.base_shape(); // [out, in]
+        let (out_a, out_b) = factorization(shape[0], factor);
+        let (in_a, in_b) = factorization(shape[1], factor);
+
+        let k1 = random::key(seed.wrapping_add(7 * i as u64 + 1))?;
+        let w1 = multiply(
+            &random::normal::<f32>(&[out_a, in_a], None, None, Some(&k1))?,
+            &small,
+        )?;
+        let w1_key: Rc<str> = Rc::from(format!("{path}.lokr_w1"));
+        eval([&w1])?;
+        params.insert(w1_key.clone(), w1);
+
+        let (mut w2_key, mut w2a_key, mut w2b_key) = (None, None, None);
+        if rank > 0 && rank < out_b.min(in_b) {
+            // Low-rank w2 = w2_a @ w2_b; w2_b zero-init → factor2 starts at 0.
+            let k2 = random::key(seed.wrapping_add(7 * i as u64 + 3))?;
+            let w2a = multiply(
+                &random::normal::<f32>(&[out_b, rank], None, None, Some(&k2))?,
+                &small,
+            )?;
+            let w2b = Array::zeros::<f32>(&[rank, in_b])?;
+            let ak: Rc<str> = Rc::from(format!("{path}.lokr_w2_a"));
+            let bk: Rc<str> = Rc::from(format!("{path}.lokr_w2_b"));
+            eval([&w2a, &w2b])?;
+            params.insert(ak.clone(), w2a);
+            params.insert(bk.clone(), w2b);
+            w2a_key = Some(ak);
+            w2b_key = Some(bk);
+        } else {
+            // Full w2, zero-init.
+            let w2 = Array::zeros::<f32>(&[out_b, in_b])?;
+            let wk: Rc<str> = Rc::from(format!("{path}.lokr_w2"));
+            eval([&w2])?;
+            params.insert(wk.clone(), w2);
+            w2_key = Some(wk);
+        }
+        targets.push(LokrTarget {
+            path: path.clone(),
+            base_shape: shape,
+            w1_key,
+            w2_key,
+            w2a_key,
+            w2b_key,
+        });
+    }
+    Ok((targets, params))
+}
+
+/// Inject each target's LoKr delta — reconstructed from the trainable factors EXACTLY as the
+/// inference loader (`reconstruct_lokr_delta` at bf16; `Adapter::Lokr` residual `x·ΔWᵀ`) — so the
+/// trained adapter round-trips bit-for-bit. Differentiable (kron/matmul/cast are traced).
+fn install_training_lokr(
+    transformer: &mut ZImageTransformer,
+    params: &LoraParams,
+    targets: &[LokrTarget],
+    alpha: f32,
+    rank: f32,
+) -> MlxResult<()> {
+    for t in targets {
+        let w1 = params.get(t.w1_key.as_ref());
+        let w2 = t.w2_key.as_ref().and_then(|k| params.get(k.as_ref()));
+        let w2a = t.w2a_key.as_ref().and_then(|k| params.get(k.as_ref()));
+        let w2b = t.w2b_key.as_ref().and_then(|k| params.get(k.as_ref()));
+        let delta = reconstruct_lokr_delta(
+            alpha,
+            rank,
+            &t.base_shape,
+            w1,
+            None,
+            None,
+            w2,
+            w2a,
+            w2b,
+            Dtype::Bfloat16,
+        )
+        .map_err(|e| Exception::custom(e.to_string()))?;
+        let segs: Vec<&str> = t.path.split('.').collect();
+        let lin = AdaptableHost::adaptable_mut(transformer, &segs)
+            .ok_or_else(|| Exception::custom(format!("LoKr target not found: {}", t.path)))?;
+        lin.set_adapters(vec![Adapter::Lokr { delta, scale: 1.0 }]);
+    }
+    Ok(())
+}
+
+/// Write the trainable LoKr factors as safetensors — `{path}.lokr_w1` + (`lokr_w2` | `lokr_w2_a` +
+/// `lokr_w2_b`) — with `networkType=lokr` + `rank`/`alpha`/`decomposeFactor` metadata (the epic-2193
+/// reload contract). `parse_lokr` reconstructs the delta from these shapes.
+fn save_lokr(
+    params: &LoraParams,
+    targets: &[LokrTarget],
+    alpha: f32,
+    rank: f32,
+    decompose_factor: i32,
+    path: &Path,
+) -> Result<()> {
+    let mut entries: Vec<(String, &Array)> = Vec::with_capacity(targets.len() * 3);
+    for t in targets {
+        let keys = [
+            Some(&t.w1_key),
+            t.w2_key.as_ref(),
+            t.w2a_key.as_ref(),
+            t.w2b_key.as_ref(),
+        ];
+        for key in keys.into_iter().flatten() {
+            entries.push((key.to_string(), &params[key.as_ref()]));
+        }
+    }
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("networkType".to_string(), "lokr".to_string());
+    meta.insert("rank".to_string(), (rank as i64).to_string());
+    meta.insert("alpha".to_string(), (alpha as i64).to_string());
+    meta.insert("decomposeFactor".to_string(), decompose_factor.to_string());
+    Array::save_safetensors(entries, Some(&meta), path)?;
+    Ok(())
+}
+
+/// The trainable adapter kind — dispatches the per-step inject and the save the train loop calls,
+/// so one loop drives both LoRA and LoKr.
+enum TrainAdapter {
+    Lora { targets: Vec<LoraTarget> },
+    Lokr { targets: Vec<LokrTarget> },
+}
+
+impl TrainAdapter {
+    fn install(
+        &self,
+        transformer: &mut ZImageTransformer,
+        params: &LoraParams,
+        alpha: f32,
+        rank: f32,
+    ) -> MlxResult<()> {
+        match self {
+            TrainAdapter::Lora { targets } => {
+                install_training_lora(transformer, params, targets, alpha)
+            }
+            TrainAdapter::Lokr { targets } => {
+                install_training_lokr(transformer, params, targets, alpha, rank)
+            }
+        }
+    }
+
+    fn save(
+        &self,
+        params: &LoraParams,
+        alpha: f32,
+        rank: f32,
+        decompose_factor: i32,
+        path: &Path,
+    ) -> Result<()> {
+        match self {
+            TrainAdapter::Lora { targets } => {
+                save_lora_peft(params, targets, alpha, rank as u32, path)
+            }
+            TrainAdapter::Lokr { targets } => {
+                save_lokr(params, targets, alpha, rank, decompose_factor, path)
+            }
+        }
+    }
 }
