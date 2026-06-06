@@ -580,6 +580,7 @@ dependencies = [
  "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "serde_json",
 ]
 
 [[package]]
