@@ -73,6 +73,7 @@ enum Val {
         key: String,
         offset: i64,
         size: Vec<i64>,
+        stride: Vec<i64>,
     },
 }
 
@@ -390,11 +391,13 @@ fn apply_reduce(callable: Val, args: Val) -> Result<Val> {
                 _ => return Err(Error::Msg("pickle: rebuild_tensor offset not int".into())),
             };
             let size = int_tuple(&a[2])?;
+            let stride = int_tuple(&a[3])?;
             Ok(Val::Tensor {
                 dtype,
                 key,
                 offset,
                 size,
+                stride,
             })
         }
         other => Err(Error::Msg(format!(
@@ -413,6 +416,27 @@ fn int_tuple(v: &Val) -> Result<Vec<i64>> {
             _ => Err(Error::Msg("pickle: non-int in shape/stride tuple".into())),
         })
         .collect()
+}
+
+/// Whether `stride` is the C-contiguous (row-major) stride for `size` — so the tensor occupies a
+/// plain `[offset .. offset+numel]` slice of its (possibly shared) storage. Size-1 axes may carry any
+/// stride (PyTorch's contiguity rule). Non-contiguous views (e.g. transposes) are not produced for
+/// saved weights, so they are rejected rather than silently mis-read.
+fn is_c_contiguous(size: &[i64], stride: &[i64]) -> bool {
+    if size.len() != stride.len() {
+        return false;
+    }
+    let mut expected: i64 = 1;
+    for i in (0..size.len()).rev() {
+        if size[i] == 1 {
+            continue;
+        }
+        if stride[i] != expected {
+            return false;
+        }
+        expected *= size[i];
+    }
+    true
 }
 
 /// Decode a raw little-endian storage blob (in `dtype`) of `numel` elements to an f32 vector,
@@ -504,15 +528,18 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
             key,
             offset,
             size,
+            stride,
         } = spec
         else {
             // Non-tensor entries (rare) are skipped — the reference keeps only `torch.Tensor`s.
             continue;
         };
         let numel: usize = size.iter().product::<i64>().max(0) as usize;
-        if offset != 0 {
+        // A tensor is a view into its (possibly shared) storage at `offset`. For a C-contiguous view
+        // that view is the byte slice `[offset .. offset+numel]`; non-contiguous strides are rejected.
+        if !is_c_contiguous(&size, &stride) {
             return Err(Error::Msg(format!(
-                "{name}: non-zero storage_offset {offset} unsupported (saved weights are contiguous)"
+                "{name}: non-contiguous storage stride {stride:?} for size {size:?} unsupported"
             )));
         }
         let blob_name = format!("{prefix}data/{key}");
@@ -520,7 +547,16 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
         zip.by_name(&blob_name)
             .map_err(|e| Error::Msg(format!("read storage {blob_name} for {name}: {e}")))?
             .read_to_end(&mut blob)?;
-        let floats = decode_to_f32(&blob, dtype, numel)?;
+        let elsize = dtype.elem_size();
+        let start = offset as usize * elsize;
+        let end = start + numel * elsize;
+        if end > blob.len() {
+            return Err(Error::Msg(format!(
+                "{name}: storage slice [{start}..{end}] exceeds blob len {} (offset {offset}, numel {numel})",
+                blob.len()
+            )));
+        }
+        let floats = decode_to_f32(&blob[start..end], dtype, numel)?;
         let shape: Vec<i32> = size.iter().map(|&d| d as i32).collect();
         out.insert(name, Array::from_slice(&floats, &shape));
     }
@@ -614,13 +650,28 @@ mod tests {
                 key,
                 offset,
                 size,
+                stride,
             } => {
                 assert_eq!(*dtype, StorageDtype::Float32);
                 assert_eq!(key, "0");
                 assert_eq!(*offset, 0);
                 assert_eq!(size, &vec![2]);
+                assert_eq!(stride, &vec![1]);
             }
             _ => panic!("expected a tensor spec"),
         }
+    }
+
+    #[test]
+    fn c_contiguous_check() {
+        // standard row-major strides
+        assert!(is_c_contiguous(&[160, 12, 3, 3, 3], &[324, 27, 9, 3, 1]));
+        assert!(is_c_contiguous(&[4, 5], &[5, 1]));
+        // size-1 axes may carry any stride
+        assert!(is_c_contiguous(&[3, 1, 1, 1], &[1, 3, 3, 3]));
+        // a transposed (non-contiguous) view is rejected
+        assert!(!is_c_contiguous(&[4, 5], &[1, 4]));
+        // scalar
+        assert!(is_c_contiguous(&[], &[]));
     }
 }
