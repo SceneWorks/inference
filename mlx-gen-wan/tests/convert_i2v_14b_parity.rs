@@ -107,3 +107,41 @@ fn i2v_14b_convert_matches_reference() {
     );
     eprintln!("\nALL Wan I2V-A14B components byte-identical to reference ✓");
 }
+
+/// T2V-A14B byte-parity (same dual-expert path as I2V, in_dim 16 + the t2v config). Driven by
+/// `WAN_T2V_14B_CKPT` (native checkpoint) / `WAN_T2V_14B_GOLDEN` (a Python `convert_wan` reference).
+#[test]
+#[ignore = "needs native Wan2.2-T2V-A14B checkpoint (~126 GB) + a convert_wan reference; set WAN_T2V_14B_{CKPT,GOLDEN}"]
+fn t2v_14b_convert_matches_reference() {
+    let ckpt = env_dir("WAN_T2V_14B_CKPT");
+    let golden = env_dir("WAN_T2V_14B_GOLDEN");
+    assert!(ckpt.is_dir(), "checkpoint dir missing: {}", ckpt.display());
+    assert!(
+        golden.is_dir(),
+        "reference dir missing: {}",
+        golden.display()
+    );
+
+    let out = std::env::temp_dir().join("mlx_gen_wan_t2v_14b_parity_out");
+    let _ = std::fs::remove_dir_all(&out);
+
+    mlx_gen_wan::convert::convert_t2v_14b(&ckpt, &out, None).unwrap();
+
+    for name in [
+        "low_noise_model.safetensors",
+        "high_noise_model.safetensors",
+        "t5_encoder.safetensors",
+        "vae.safetensors",
+    ] {
+        assert_component_parity(&golden, &out, name);
+    }
+    let parse = |p: PathBuf| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()
+    };
+    assert_eq!(
+        parse(golden.join("config.json")),
+        parse(out.join("config.json")),
+        "config.json semantic mismatch"
+    );
+    eprintln!("\nALL Wan T2V-A14B components byte-identical to reference ✓");
+}
