@@ -15,6 +15,7 @@
 
 pub mod checkpoint;
 pub mod dataset;
+pub mod lora;
 pub mod schedule;
 
 use std::path::PathBuf;
