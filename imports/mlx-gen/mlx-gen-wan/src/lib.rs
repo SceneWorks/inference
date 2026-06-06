@@ -51,9 +51,11 @@
 
 pub mod adapters;
 pub mod config;
+pub mod convert;
 pub mod model;
 pub mod patchify;
 pub mod pipeline;
+pub mod pth;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
