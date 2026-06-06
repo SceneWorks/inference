@@ -22,9 +22,16 @@
 //!   * **selective Q4 quantization of the transformer** — MLX `quantize` (group 64) over the same
 //!     Linear set the reference `_quantize_ltx_predicate` selects (`*.to_q/k/v/out`, `*.ff.proj_in/
 //!     out`, `*.audio_ff.proj_in/out`), emitting `.weight`(u32)/`.scales`/`.biases`;
+//!   * **cast every float tensor to bf16** (the reference `--dtype bfloat16` default) — load-bearing
+//!     for the base `Lightricks/LTX-2.3` distilled checkpoint, which ships some adaLN
+//!     `scale_shift_table` tensors in f32 (eros is uniformly bf16, so this is a no-op there);
 //!   * **merge the latent upsampler(s)** from the base `Lightricks/LTX-2.3` repo (the eros repo
 //!     ships none) as raw component copies;
 //!   * **emit** `config.json`, `embedded_config.json`, `split_model.json`, `quantize_config.json`.
+//!
+//! Validated byte-for-byte against three goldens: `ltx_2_3_eros` (Q4) and the base `ltx_2_3_base_q4`
+//! / `ltx_2_3_base_q8` (the base distilled checkpoint at Q4 and Q8) — so the converter is generic
+//! over the LTX-2.3 family (base + eros) and both quantization bit-widths.
 //!
 //! ## The one load-bearing subtlety (validated by tensor count)
 //! The reference `sanitize_transformer_weights` sweeps in the connector keys too (they live under
@@ -43,7 +50,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::ops::quantize;
 use mlx_rs::transforms::eval;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 /// The reference `_quantize_ltx_predicate`: a transformer Linear is Q4-quantized iff its weight key
 /// (minus the `.weight` suffix) ends with one of these. Matches all attention `to_q/k/v/out` (self,
@@ -315,6 +322,22 @@ fn quantize_transformer(
     Ok(out)
 }
 
+/// Cast every float tensor (f32/f16/bf16) in `map` to bf16 in place, preserving non-float tensors
+/// (e.g. quantized u32 weights). Mirrors the reference's `--dtype bfloat16` (its production / CLI
+/// default): the base `Lightricks/LTX-2.3` distilled checkpoint ships some adaLN `scale_shift_table`
+/// tensors in f32, which the reference casts to bf16 alongside everything else. (Eros ships uniformly
+/// bf16, so this is a no-op there — which is why eros parity passed without it.)
+fn cast_floats_bf16(map: &mut HashMap<String, Array>) -> Result<()> {
+    for v in map.values_mut() {
+        if matches!(v.dtype(), Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16)
+            && v.dtype() != Dtype::Bfloat16
+        {
+            *v = v.as_dtype(Dtype::Bfloat16)?;
+        }
+    }
+    Ok(())
+}
+
 /// Materialize then write a component weight map to `dir/<name>.safetensors`.
 fn save_component(dir: &Path, name: &str, weights: &HashMap<String, Array>) -> Result<()> {
     let arrays: Vec<&Array> = weights.values().collect();
@@ -536,7 +559,10 @@ pub fn convert_and_assemble(
     // Build + save each component, recording the emitted names in the reference's order.
     let mut components: Vec<String> = Vec::new();
 
+    // Cast every component's float tensors to bf16 (the reference `--dtype bfloat16`), and for the
+    // transformer cast BEFORE quantize so the quant operates on bf16 weights.
     let mut transformer = sanitize_transformer(&raw);
+    cast_floats_bf16(&mut transformer)?;
     if opts.quantize {
         transformer = quantize_transformer(transformer, opts.bits, opts.group_size)?;
     }
@@ -544,31 +570,36 @@ pub fn convert_and_assemble(
     components.push("transformer".into());
     drop(transformer);
 
-    let connector = build_connector(&raw);
+    let mut connector = build_connector(&raw);
     if !connector.is_empty() {
+        cast_floats_bf16(&mut connector)?;
         save_component(out, "connector", &connector)?;
         components.push("connector".into());
     }
 
-    let vae_decoder = sanitize_vae_decoder(&raw)?;
+    let mut vae_decoder = sanitize_vae_decoder(&raw)?;
     if !vae_decoder.is_empty() {
+        cast_floats_bf16(&mut vae_decoder)?;
         save_component(out, "vae_decoder", &vae_decoder)?;
         components.push("vae_decoder".into());
     }
-    let vae_encoder = sanitize_vae_encoder(&raw)?;
+    let mut vae_encoder = sanitize_vae_encoder(&raw)?;
     if !vae_encoder.is_empty() {
+        cast_floats_bf16(&mut vae_encoder)?;
         save_component(out, "vae_encoder", &vae_encoder)?;
         components.push("vae_encoder".into());
     }
 
     if opts.include_audio {
-        let audio_vae = sanitize_audio_vae(&raw)?;
+        let mut audio_vae = sanitize_audio_vae(&raw)?;
         if !audio_vae.is_empty() {
+            cast_floats_bf16(&mut audio_vae)?;
             save_component(out, "audio_vae", &audio_vae)?;
             components.push("audio_vae".into());
         }
-        let vocoder = sanitize_vocoder(&raw)?;
+        let mut vocoder = sanitize_vocoder(&raw)?;
         if !vocoder.is_empty() {
+            cast_floats_bf16(&mut vocoder)?;
             save_component(out, "vocoder", &vocoder)?;
             components.push("vocoder".into());
         }
@@ -582,7 +613,7 @@ pub fn convert_and_assemble(
                 continue;
             }
             let up = Weights::from_file(&path)?;
-            let map: HashMap<String, Array> = up
+            let mut map: HashMap<String, Array> = up
                 .keys()
                 .map(|k| {
                     (
@@ -591,6 +622,7 @@ pub fn convert_and_assemble(
                     )
                 })
                 .collect();
+            cast_floats_bf16(&mut map)?;
             save_component(out, prefix, &map)?;
             components.push((*prefix).to_string());
         }

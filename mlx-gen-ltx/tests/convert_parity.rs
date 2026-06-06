@@ -201,3 +201,83 @@ fn eros_upscaler_roundtrip_matches_golden() {
         assert_component_parity(&golden, &out, name);
     }
 }
+
+/// The base `Lightricks/LTX-2.3` distilled checkpoint (`LTX_BASE_SRC` or the HF cache).
+fn base_source_file() -> PathBuf {
+    if let Ok(p) = std::env::var("LTX_BASE_SRC") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap();
+    let snapshots =
+        PathBuf::from(home).join(".cache/huggingface/hub/models--Lightricks--LTX-2.3/snapshots");
+    std::fs::read_dir(&snapshots)
+        .unwrap_or_else(|_| panic!("no HF snapshots at {}", snapshots.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.join("ltx-2.3-22b-distilled.safetensors").is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "ltx-2.3-22b-distilled.safetensors not found under {}",
+                snapshots.display()
+            )
+        })
+        .join("ltx-2.3-22b-distilled.safetensors")
+}
+
+/// Convert the base distilled checkpoint at `bits` and assert the six core components + configs match
+/// the golden `<id>` (the upsampler components are raw copies, exercised by the eros roundtrip test).
+fn run_base_parity(golden_id: &str, bits: i32) {
+    let home = std::env::var("HOME").unwrap();
+    let golden = PathBuf::from(&home).join(format!(
+        "Library/Application Support/SceneWorks/data/models/mlx/{golden_id}"
+    ));
+    let source = base_source_file();
+    assert!(golden.is_dir(), "golden dir missing: {}", golden.display());
+    assert!(source.is_file(), "source missing: {}", source.display());
+
+    let out = std::env::temp_dir().join(format!("mlx_gen_ltx_{golden_id}_out"));
+    let _ = std::fs::remove_dir_all(&out);
+    eprintln!(
+        "converting {} (Q{bits}) → {}",
+        source.display(),
+        out.display()
+    );
+
+    let opts = LtxConvertOpts {
+        include_audio: true,
+        quantize: true,
+        bits,
+        group_size: 64,
+    };
+    convert_and_assemble(&source, None::<&std::path::Path>, &out, &opts).unwrap();
+
+    for name in [
+        "transformer",
+        "connector",
+        "vae_decoder",
+        "vae_encoder",
+        "audio_vae",
+        "vocoder",
+    ] {
+        assert_component_parity(&golden, &out, name);
+    }
+    assert_json_eq(&golden, &out, "config.json");
+    assert_json_eq(&golden, &out, "embedded_config.json");
+    assert_json_eq(&golden, &out, "quantize_config.json");
+    eprintln!("\nALL base components byte-identical to golden {golden_id} ✓");
+}
+
+/// Base LTX-2.3 distilled, **Q4** — byte-parity vs golden `ltx_2_3_base_q4`. Confirms the converter is
+/// generic over the LTX-2.3 family (base + eros share the single-file format), not eros-specific.
+#[test]
+#[ignore = "needs ltx-2.3-22b-distilled.safetensors (~46 GB) + golden ltx_2_3_base_q4"]
+fn base_q4_convert_matches_golden() {
+    run_base_parity("ltx_2_3_base_q4", 4);
+}
+
+/// Base LTX-2.3 distilled, **Q8** — byte-parity vs golden `ltx_2_3_base_q8`. Also the first end-to-end
+/// validation of Q8 transformer quantization (eros is Q4-only).
+#[test]
+#[ignore = "needs ltx-2.3-22b-distilled.safetensors (~46 GB) + golden ltx_2_3_base_q8"]
+fn base_q8_convert_matches_golden() {
+    run_base_parity("ltx_2_3_base_q8", 8);
+}
