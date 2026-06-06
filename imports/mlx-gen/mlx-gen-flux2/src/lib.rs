@@ -19,6 +19,7 @@
 
 pub mod adapters;
 pub mod config;
+pub mod convert;
 pub mod kv_cache;
 pub mod loader;
 pub mod model;
@@ -33,6 +34,7 @@ pub use config::{
     Flux2Config, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_HEIGHT, DEFAULT_STEPS, DEFAULT_WIDTH,
     FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
 };
+pub use convert::{build_target_state_dict, convert_and_assemble};
 pub use kv_cache::{CacheMode, Flux2KvCache, Stream};
 pub use loader::{load_text_encoder, load_tokenizer, load_transformer, load_vae};
 pub use model::{
