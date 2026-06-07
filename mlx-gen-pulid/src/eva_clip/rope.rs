@@ -31,7 +31,7 @@ impl VisionRope {
     pub fn build(head_dim: i32, grid: i32, pt_seq_len: i32, theta: f64) -> Result<Self> {
         let half = (head_dim / 2) as usize; // rope dim = head_dim/2 = 32
         let nfreq = half / 2; // 16 base frequencies (arange(0,half,2))
-        // freqs[j] = 1 / theta^(2j / half)
+                              // freqs[j] = 1 / theta^(2j / half)
         let freqs: Vec<f64> = (0..nfreq)
             .map(|j| 1.0 / theta.powf((2 * j) as f64 / half as f64))
             .collect();
@@ -87,8 +87,12 @@ impl VisionRope {
         let orig = x.dtype();
         let xf = x.as_dtype(Dtype::Float32)?;
         // cos/sin [576,64] -> [1,1,576,64] for broadcast over (B, heads)
-        let cos = self.cos.reshape(&[1, 1, self.cos.shape()[0], self.cos.shape()[1]])?;
-        let sin = self.sin.reshape(&[1, 1, self.sin.shape()[0], self.sin.shape()[1]])?;
+        let cos = self
+            .cos
+            .reshape(&[1, 1, self.cos.shape()[0], self.cos.shape()[1]])?;
+        let sin = self
+            .sin
+            .reshape(&[1, 1, self.sin.shape()[0], self.sin.shape()[1]])?;
         let rot = rotate_half_interleaved(&xf)?;
         let out = add(&multiply(&xf, &cos)?, &multiply(&rot, &sin)?)?;
         Ok(out.as_dtype(orig)?)
