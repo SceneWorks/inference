@@ -61,11 +61,12 @@ pub mod scheduler;
 pub mod text_encoder;
 pub mod training;
 pub mod transformer;
+pub mod vace;
 pub mod vae;
 pub mod vae22;
 
 pub use adapters::{merge_wan_adapters, WanLoraReport};
-pub use config::{GuideScale, WanModelConfig, WanQuant, SAMPLE_NEG_PROMPT};
+pub use config::{GuideScale, WanModelConfig, WanQuant, WanVaceConfig, SAMPLE_NEG_PROMPT};
 pub use model::{
     descriptor, descriptor_i2v_14b, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID,
     MODEL_ID_I2V_14B, MODEL_ID_T2V_14B,
@@ -83,5 +84,6 @@ pub use scheduler::{
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};
 pub use training::{load_trainer, WanMoeTrainer};
 pub use transformer::WanTransformer;
+pub use vace::WanVaceTransformer;
 pub use vae::WanVae;
 pub use vae22::Wan22Vae;
