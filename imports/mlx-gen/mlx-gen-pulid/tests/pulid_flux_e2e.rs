@@ -213,6 +213,8 @@ fn pulid_flux_end_to_end() {
     let mut cfg_req = req_with(&face_img, prompt, 1.0, steps, size);
     cfg_req.true_cfg = Some(2.0);
     cfg_req.negative_prompt = Some("low quality, blurry, deformed, disfigured".into());
+    cfg_req.timestep_to_start_cfg = Some(4); // sc-3336: exercise the new core CFG-start knob
+
     let cfg = first_image(model.generate(&cfg_req, &mut |_| {}).unwrap());
     let cfg_changed = cfg
         .pixels
