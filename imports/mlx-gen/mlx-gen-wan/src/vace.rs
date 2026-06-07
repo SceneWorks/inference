@@ -37,6 +37,7 @@ use mlx_rs::{Array, Dtype};
 use crate::config::WanVaceConfig;
 use crate::patchify::{patchify, unpatchify};
 use crate::rope::{rope_apply, RopeTable};
+use crate::scheduler::{make_scheduler, SolverKind};
 use crate::text_encoder::gelu_tanh;
 use crate::vae::WanVae;
 
@@ -711,4 +712,53 @@ pub fn prepare_video_latents(
 /// (diffusers `__call__`'s `conditioning_latents = cat([conditioning_latents, mask], dim=1)`).
 pub fn build_vace_control(video_latents: &Array, mask_latents: &Array) -> Result<Array> {
     Ok(concatenate_axis(&[video_latents, mask_latents], 0)?)
+}
+
+/// VACE CFG denoise loop (sc-3436) — mirrors the validated base Wan [`crate::pipeline::denoise`]
+/// (same `make_scheduler` + per-step `eval`), but each step runs [`WanVaceTransformer::forward_vace`]
+/// with the constant 96-ch `control` + per-vace-layer `scales`, classifier-free-guided against the
+/// (optional) unconditional context. The control latent is constant across steps (built once by the
+/// caller from [`prepare_video_latents`] + [`prepare_masks`] + [`build_vace_control`]).
+///
+/// `init_noise`: `[out_dim, T, h, w]` (f32). `ctx_cond` / `ctx_uncond`: raw text embeddings
+/// `[1, L, text_dim]` (the transformer projects them via its `text_embedder`). CFG:
+/// `pred = uncond + guidance·(cond − uncond)` (diffusers `WanVACEPipeline`). Returns the denoised
+/// `[out_dim, T, h, w]`.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_vace(
+    transformer: &WanVaceTransformer,
+    control: &Array,
+    scales: &[f32],
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    guidance: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    init_noise: &Array,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<Array> {
+    let mut sched = make_scheduler(kind, num_train_timesteps);
+    sched.set_timesteps(steps, shift);
+    let timesteps: Vec<f32> = sched.timesteps().to_vec();
+
+    let mut latents = init_noise.clone();
+    for (i, &t) in timesteps.iter().enumerate() {
+        let cond = transformer.forward_vace(&latents, control, t, ctx_cond, scales)?;
+        let pred = match ctx_uncond {
+            Some(uncond_ctx) => {
+                let uncond = transformer.forward_vace(&latents, control, t, uncond_ctx, scales)?;
+                add(
+                    &uncond,
+                    &multiply(&subtract(&cond, &uncond)?, scalar(guidance))?,
+                )?
+            }
+            None => cond,
+        };
+        latents = sched.step(&pred, &latents)?;
+        mlx_rs::transforms::eval([&latents])?;
+        on_step(i + 1);
+    }
+    Ok(latents)
 }

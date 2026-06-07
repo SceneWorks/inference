@@ -53,6 +53,7 @@ pub mod adapters;
 pub mod config;
 pub mod convert;
 pub mod model;
+pub mod model_vace;
 pub mod patchify;
 pub mod pipeline;
 pub mod pth;
@@ -71,6 +72,7 @@ pub use model::{
     descriptor, descriptor_i2v_14b, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID,
     MODEL_ID_I2V_14B, MODEL_ID_T2V_14B,
 };
+pub use model_vace::{descriptor_vace, WanVace, MODEL_ID_VACE};
 pub use pipeline::{
     best_output_size, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask, build_ti2v_multi_mask,
     decode_to_frames, decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images,
