@@ -70,6 +70,50 @@ use crate::vocoder::LtxVocoder;
 /// Public registry id: `mlx_gen::load("ltx_2_3", spec)`.
 pub const MODEL_ID: &str = "ltx_2_3";
 
+/// Neutral gray the replace_person mask blends toward (reference `_apply_replacement_mask`).
+const REPLACE_NEUTRAL: u32 = 118;
+
+/// Port of the worker's `_apply_replacement_mask` (native-LTX replace_person): blend each frame's
+/// person region toward neutral gray 118 by `strength`, so the IC-LoRA keyframe-append regenerates it
+/// while the background is preserved. Byte-exact to Pillow: `gate = int(L(mask) · strength)`, then
+/// `out = composite(gray, frame, gate)` where `L` is PIL's RGB→L (`(R·19595 + G·38470 + B·7471 +
+/// 0x8000) >> 16`) and `composite` blends with a single rounded division
+/// `(gray·gate + frame·(255−gate) + 127) / 255` (verified vs Pillow). The mask must already match the
+/// frame size (the host delivers per-frame masks at the output resolution).
+pub fn apply_replacement_mask(frame: &Image, mask: &Image, strength: f32) -> Result<Image> {
+    let strength = strength.clamp(0.0, 1.0);
+    if (frame.width, frame.height) != (mask.width, mask.height) {
+        return Err(Error::Msg(format!(
+            "replace_person mask {}x{} must match frame {}x{}",
+            mask.width, mask.height, frame.width, frame.height
+        )));
+    }
+    let n = (frame.width * frame.height) as usize;
+    if frame.pixels.len() != n * 3 || mask.pixels.len() != n * 3 {
+        return Err(Error::Msg("replace_person frame/mask must be RGB8".into()));
+    }
+    let mut out = vec![0u8; n * 3];
+    for i in 0..n {
+        let (r, g, b) = (
+            mask.pixels[i * 3] as u32,
+            mask.pixels[i * 3 + 1] as u32,
+            mask.pixels[i * 3 + 2] as u32,
+        );
+        let l = (r * 19595 + g * 38470 + b * 7471 + 0x8000) >> 16; // PIL RGB→L
+        let gate = ((l as f32 * strength) as u32).min(255); // PIL .point(int(v·s))
+        for c in 0..3 {
+            let fpx = frame.pixels[i * 3 + c] as u32;
+            // PIL `Image.composite` blend: single rounded division (not two-term MULDIV255).
+            out[i * 3 + c] = ((REPLACE_NEUTRAL * gate + fpx * (255 - gate) + 127) / 255) as u8;
+        }
+    }
+    Ok(Image {
+        width: frame.width,
+        height: frame.height,
+        pixels: out,
+    })
+}
+
 /// Reference text-encoder token budget (`LTX2TextEncoder.encode` default `max_length=1024`).
 const MAX_PROMPT_TOKENS: usize = 1024;
 /// LTX-2 latent channels.
@@ -110,6 +154,7 @@ pub fn descriptor() -> ModelDescriptor {
                 ConditioningKind::Reference,
                 ConditioningKind::Keyframe,
                 ConditioningKind::VideoClip,
+                ConditioningKind::ControlClip,
             ],
             // LoRA (sc-2687) + LoKr (sc-2393) in generate: forward-time residuals + per-pass
             // strength over the full video+audio+cross-modal surface.
@@ -630,6 +675,43 @@ impl Ltx {
             }
             let video = preprocess_conditioning_clip(clip.frames, req.width / 2, req.height / 2)?;
             out.push((self.vae.encode(&video)?, idx, clip.strength));
+        }
+        // replace_person: the masked control clip rides the same keyframe-append path. Build the
+        // gray-neutralized control frames host-side (port of the worker's `_apply_replacement_mask`),
+        // then append at `start_frame` with strength = masking_strength (the reference passes
+        // `video_conditioning = [(masked_clip, masking_strength)]`). `mode` is carried on the contract
+        // but does not change the math here — the per-frame mask already encodes the region (the native
+        // LTX path is region-driven; `replacement_mode` only affects the diffusers WanVACE path).
+        if let Some(cc) = req.control_clip() {
+            if cc.frames.is_empty() {
+                return Err(Error::Msg("ltx_2_3: replace_person control clip is empty".into()));
+            }
+            if cc.frames.len() != cc.mask.len() {
+                return Err(Error::Msg(format!(
+                    "ltx_2_3: replace_person frame count {} != mask count {}",
+                    cc.frames.len(),
+                    cc.mask.len()
+                )));
+            }
+            let idx = if cc.start_frame < 0 {
+                lf + cc.start_frame
+            } else {
+                cc.start_frame
+            };
+            if idx < 0 || idx >= lf {
+                return Err(Error::Msg(format!(
+                    "ltx_2_3: replace_person start_frame {} out of bounds for {lf} latent frames",
+                    cc.start_frame
+                )));
+            }
+            let masked: Vec<Image> = cc
+                .frames
+                .iter()
+                .zip(cc.mask.iter())
+                .map(|(f, m)| apply_replacement_mask(f, m, cc.masking_strength))
+                .collect::<Result<_>>()?;
+            let video = preprocess_conditioning_clip(&masked, req.width / 2, req.height / 2)?;
+            out.push((self.vae.encode(&video)?, idx, cc.masking_strength));
         }
         Ok(out)
     }
