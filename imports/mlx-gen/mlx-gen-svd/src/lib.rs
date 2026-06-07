@@ -14,6 +14,7 @@
 pub mod config;
 pub mod embeddings;
 pub mod image_encoder;
+pub mod pipeline;
 pub mod scheduler;
 pub mod transformer;
 pub mod unet;
@@ -21,6 +22,7 @@ pub mod vae;
 
 pub use config::{ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig};
 pub use image_encoder::SvdImageEncoder;
+pub use pipeline::{SvdParams, SvdPipeline};
 pub use scheduler::{euler_step, scale_model_input, v_pred_denoised, EdmSchedule};
 pub use transformer::TransformerSpatioTemporal;
 pub use unet::SvdUnet;
