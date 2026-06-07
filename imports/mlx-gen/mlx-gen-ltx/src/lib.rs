@@ -54,16 +54,21 @@ pub mod vocoder;
 
 pub use adapters::{apply_ltx_adapters, LtxLoraReport};
 pub use audio_vae::AudioDecoder;
-pub use conditioning::{apply_conditioning, apply_denoise_mask, I2vConditioning};
+pub use conditioning::{
+    append_keyframe_clip, apply_conditioning, apply_denoise_mask, apply_keyframes,
+    keyframe_append_positions, patchify_grid, unpatchify_grid, I2vConditioning, Keyframe,
+    VideoTokenState,
+};
 pub use config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use convert::{convert_and_assemble, LtxConvertOpts};
 pub use enhance::{clean_response, EnhanceConfig, SampleParams};
 pub use model::{descriptor, load, Ltx, MODEL_ID};
 pub use pipeline::{
-    decode_audio_track, decode_to_frames, denoise, denoise_av, generate_av_latents,
-    generate_i2v_latents, generate_t2v, generate_t2v_latents, preprocess_conditioning_image,
-    renoise, to_uint8_frames, STAGE1_SIGMAS, STAGE2_SIGMAS,
+    decode_audio_track, decode_to_frames, denoise, denoise_av, denoise_av_tokens,
+    generate_av_latents, generate_av_latents_iclora, generate_i2v_latents, generate_t2v,
+    generate_t2v_latents, preprocess_conditioning_image, renoise, to_uint8_frames, StageClip,
+    StageKeyframe, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 pub use text_encoder::LtxTextEncoder;
 // Tiling moved to `mlx_gen` core (shared with the Wan VAE — sc-2808). Re-export the module + config

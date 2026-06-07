@@ -28,7 +28,11 @@ use mlx_gen::media::AudioTrack;
 use mlx_gen::{Error, Image, Result};
 
 use crate::audio_vae::AudioDecoder;
-use crate::conditioning::{apply_conditioning, apply_denoise_mask, I2vConditioning};
+use crate::conditioning::{
+    append_keyframe_clip, apply_conditioning, apply_denoise_mask, apply_keyframes, unpatchify_grid,
+    Keyframe, I2vConditioning, VideoTokenState,
+};
+use crate::positions::{DEFAULT_FPS, SPATIAL_SCALE, TEMPORAL_SCALE};
 use crate::transformer::{to_denoised, AvDiT, LtxDiT};
 use crate::upsampler::{upsample_latents, LatentUpsampler};
 use crate::vae::LtxVideoVae;
@@ -194,6 +198,31 @@ pub fn preprocess_conditioning_image(
     // NHWC → NCHW → insert the singleton temporal axis → (1, 3, 1, H, W).
     let nchw = nhwc.transpose_axes(&[0, 3, 1, 2])?; // (1, 3, H, W)
     Ok(nchw.reshape(&[1, 3, 1, th as i32, tw as i32])?)
+}
+
+/// Prepare a multi-frame conditioning **clip** for VAE encoding (the in-context extend/bridge source):
+/// each frame is PIL-LANCZOS resized to `(target_height, target_width)`, normalized `[0,255] → [-1,1]`,
+/// and stacked along the temporal axis as **NCFHW** `[1, 3, F, H, W]` f32 — the multi-frame analogue of
+/// [`preprocess_conditioning_image`] that [`LtxVideoVae::encode`](crate::vae::LtxVideoVae) compresses to
+/// `[1, 128, cf, H/32, W/32]`. `frames` must be non-empty and all the same source size.
+pub fn preprocess_conditioning_clip(
+    frames: &[Image],
+    target_width: u32,
+    target_height: u32,
+) -> Result<Array> {
+    if frames.is_empty() {
+        return Err(Error::Msg("conditioning clip must have ≥1 frame".into()));
+    }
+    let (tw, th) = (target_width as usize, target_height as usize);
+    // Each frame → NCFHW (1,3,1,th,tw); concat along the temporal axis (axis 2).
+    let per_frame: Vec<Array> = frames
+        .iter()
+        .map(|f| preprocess_conditioning_image(f, target_width, target_height))
+        .collect::<Result<_>>()?;
+    let refs: Vec<&Array> = per_frame.iter().collect();
+    let clip = mlx_rs::ops::concatenate_axis(&refs, 2)?;
+    debug_assert_eq!(clip.shape(), &[1, 3, frames.len() as i32, th as i32, tw as i32]);
+    Ok(clip)
 }
 
 /// The full 2-stage distilled T2V latent pipeline: stage-1 denoise → 2× upsample → re-noise →
@@ -413,14 +442,137 @@ pub fn denoise_av(
     Ok((vlat, alat))
 }
 
+/// A replace-latent keyframe at both pipeline stages: the conditioning latent VAE-encoded at stage-1
+/// (half-res) and stage-2 (full-res) resolution, the **latent** frame index it pins, and its strength
+/// (mask `1 − strength`). Single-image I2V = one keyframe at frame 0; **first_last_frame** = two
+/// (frame 0 and the last latent frame). The replace-latent mechanism rewrites grid frames in place, so
+/// it drives the existing [`denoise_av`] loop unchanged (no token-native loop).
+#[derive(Clone, Copy)]
+pub struct StageKeyframe<'a> {
+    pub stage1: &'a Array,
+    pub stage2: &'a Array,
+    pub frame_idx: i32,
+    pub strength: f32,
+}
+
+/// Build the per-stage [`I2vConditioning`] for a stage's `keyframes` over `base` (zeros for stage 1,
+/// the upscaled latent for stage 2), casting each conditioning latent to the base dtype. Empty → T2V.
+fn stage_keyframe_state<'k>(
+    base: &Array,
+    keyframes: &'k [StageKeyframe],
+    stage1: bool,
+) -> Result<Option<I2vConditioning>> {
+    if keyframes.is_empty() {
+        return Ok(None);
+    }
+    let dt = base.dtype();
+    let cast: Vec<Array> = keyframes
+        .iter()
+        .map(|k| Ok((if stage1 { k.stage1 } else { k.stage2 }).as_dtype(dt)?))
+        .collect::<Result<_>>()?;
+    let kfs: Vec<Keyframe> = keyframes
+        .iter()
+        .zip(&cast)
+        .map(|(k, l)| Keyframe {
+            latent: l,
+            frame_idx: k.frame_idx,
+            strength: k.strength,
+        })
+        .collect();
+    Ok(Some(apply_keyframes(base, &kfs)?))
+}
+
+/// Stage-1 **token-native** joint video+audio denoise for the keyframe-append (IC-LoRA) path. The
+/// video stream is a [`VideoTokenState`] whose token sequence already includes the appended
+/// conditioning clips (so it is **not** a grid); the audio stream is the usual `(B, 8, T, 16)` grid.
+/// Mirrors [`denoise_av`] but takes the video as tokens + per-token `positions`/`denoise_mask`/`clean`
+/// (so the appended tokens carry their own RoPE positions) and pins the conditioning tokens each step.
+/// Returns `(video_token_state_after, audio_grid)`; the caller reads back the generated grid via
+/// [`VideoTokenState::target_tokens`] + `unpatchify_grid`.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_tokens(
+    dit: &AvDiT,
+    video: &VideoTokenState,
+    audio: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    audio_pos: &Array,
+    sigmas: &[f32],
+    on_step: &mut dyn FnMut(usize),
+) -> Result<(VideoTokenState, Array)> {
+    let dt = video.latent.dtype();
+    let a = audio.shape();
+    let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
+
+    let mut vtok = video.latent.clone();
+    let mut alat = audio.clone();
+    for i in 0..sigmas.len() - 1 {
+        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+        // Video already token-native (B, Sv, C). Audio (B,C,T,F) → (B,T,C·F).
+        let aflat = alat
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[ab, at, ac * af])?;
+        // Video per-token σ = σ·mask (conditioning tokens get σ·(1−strength)); audio uniform σ.
+        let vts = {
+            let st = VideoTokenState {
+                latent: vtok.clone(),
+                clean_latent: video.clean_latent.clone(),
+                denoise_mask: video.denoise_mask.clone(),
+                positions: video.positions.clone(),
+                target_tokens: video.target_tokens,
+            };
+            st.token_timesteps(sigma)?
+        };
+        let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
+        let (vvel, avel) = dit.forward(
+            &vtok,
+            &vts,
+            video_ctx,
+            None,
+            &video.positions,
+            &aflat,
+            &ats,
+            audio_ctx,
+            None,
+            audio_pos,
+        )?;
+        let avel = avel
+            .reshape(&[ab, at, ac, af])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let sig = scalar(sigma).as_dtype(dt)?;
+        // Pin conditioning tokens to their clean latent (token-native apply_denoise_mask).
+        let vden = apply_denoise_mask(
+            &to_denoised(&vtok, &vvel, &sig)?,
+            &video.clean_latent,
+            &video.denoise_mask,
+        )?;
+        let aden = to_denoised(&alat, &avel, &sig)?;
+        vtok = euler_step(&vtok, &vden, sigma, sigma_next)?;
+        alat = euler_step(&alat, &aden, sigma, sigma_next)?;
+        mlx_rs::transforms::eval([&vtok, &alat])?;
+        on_step(i + 1);
+    }
+    Ok((
+        VideoTokenState {
+            latent: vtok,
+            clean_latent: video.clean_latent.clone(),
+            denoise_mask: video.denoise_mask.clone(),
+            positions: video.positions.clone(),
+            target_tokens: video.target_tokens,
+        },
+        alat,
+    ))
+}
+
 /// The full 2-stage **AudioVideo** latent pipeline: joint stage-1 denoise → 2× upsample the **video**
 /// (audio is not upsampled) → re-noise both → joint stage-2 denoise. Returns `(video_latents (B,128,
 /// F,H,W), audio_latents (B,8,T,16))`.
 ///
-/// `video_cond = Some((stage1_image_latent, stage2_image_latent, frame_idx, strength))` switches the
-/// **video** stream to **I2V** (the audio is always pure-noise, matching `generate_av.py`'s I2V+Audio):
-/// each stage injects the VAE-encoded image latent at `frame_idx` (clean latent + `1 − strength` mask),
-/// seeds the loop via the [`I2vConditioning::noised`] noiser, and runs the conditioned `denoise_av`.
+/// A non-empty `video_keyframes` switches the **video** stream to replace-latent conditioning (I2V /
+/// first_last_frame / multi-keyframe; the audio is always pure-noise, matching `generate_av.py`'s
+/// I2V+Audio): each stage injects the VAE-encoded keyframe latents at their frame indices (clean latent
+/// + `1 − strength` mask), seeds the loop via the [`I2vConditioning::noised`] noiser, and runs the
+/// conditioned `denoise_av`.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_av_latents(
     dit: &AvDiT,
@@ -436,24 +588,23 @@ pub fn generate_av_latents(
     audio_ctx: &Array,
     latent_mean: &Array,
     latent_std: &Array,
-    video_cond: Option<(&Array, &Array, i32, f32)>,
+    video_keyframes: &[StageKeyframe],
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
     // sc-2963 (rollout of sc-2957): compiled elementwise glue across the joint video/audio/cross-modal
     // AvDiT forward — see `generate_t2v_latents`. Bit-exact, dtype-preserving, enabled at the
     // production boundary (the shared `denoise_av` stays eager for the parity tests).
     crate::set_compile_glue(true);
-    // Stage 1: video init = conditioned+noised (I2V) or pure noise (T2V); audio = pure noise.
-    let (vlat1, vstate1): (Array, Option<I2vConditioning>) = match video_cond {
-        Some((img1, _, frame_idx, strength)) => {
-            let zeros =
-                Array::zeros::<f32>(video_s1_noise.shape())?.as_dtype(video_s1_noise.dtype())?;
-            let cond = img1.as_dtype(video_s1_noise.dtype())?;
-            let st = apply_conditioning(&zeros, &cond, frame_idx, strength)?
-                .noised(video_s1_noise, STAGE1_SIGMAS[0])?;
-            (st.latent.clone(), Some(st))
+    // Stage 1: video init = conditioned+noised (replace-latent) or pure noise (T2V); audio = noise.
+    let (vlat1, vstate1): (Array, Option<I2vConditioning>) = {
+        let zeros = Array::zeros::<f32>(video_s1_noise.shape())?.as_dtype(video_s1_noise.dtype())?;
+        match stage_keyframe_state(&zeros, video_keyframes, true)? {
+            Some(st) => {
+                let st = st.noised(video_s1_noise, STAGE1_SIGMAS[0])?;
+                (st.latent.clone(), Some(st))
+            }
+            None => (video_s1_noise.clone(), None),
         }
-        None => (video_s1_noise.clone(), None),
     };
     // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
     dit.set_lora_pass(0);
@@ -471,15 +622,14 @@ pub fn generate_av_latents(
     )?;
     let v = upsample_latents(&v, upsampler, latent_mean, latent_std)?;
     // Stage 2: re-noise / re-condition the upscaled video; re-noise audio (never upsampled).
-    let (vlat2, vstate2): (Array, Option<I2vConditioning>) = match video_cond {
-        Some((_, img2, frame_idx, strength)) => {
-            let cond = img2.as_dtype(v.dtype())?;
-            let st = apply_conditioning(&v, &cond, frame_idx, strength)?
-                .noised(video_s2_noise, STAGE2_SIGMAS[0])?;
-            (st.latent.clone(), Some(st))
-        }
-        None => (renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])?, None),
-    };
+    let (vlat2, vstate2): (Array, Option<I2vConditioning>) =
+        match stage_keyframe_state(&v, video_keyframes, false)? {
+            Some(st) => {
+                let st = st.noised(video_s2_noise, STAGE2_SIGMAS[0])?;
+                (st.latent.clone(), Some(st))
+            }
+            None => (renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])?, None),
+        };
     let a = renoise(&a, audio_s2_noise, STAGE2_SIGMAS[0])?;
     dit.set_lora_pass(1);
     denoise_av(
@@ -492,6 +642,98 @@ pub fn generate_av_latents(
         audio_pos,
         &STAGE2_SIGMAS,
         vstate2.as_ref(),
+        on_step,
+    )
+}
+
+/// A stage-1 in-context conditioning clip (extend_clip / video_bridge): the source clip VAE-encoded at
+/// **stage-1** (half-res) resolution `(B, 128, cf, h1, w1)`, the **latent** frame index it is appended
+/// at (extend = 0; bridge left = 0, right = tail), and its strength (mask `1 − strength`). Per the
+/// reference `ICLoraPipeline`, video conditioning is applied in **stage 1 only** (stage 2 re-applies
+/// only image/replace-latent conditioning).
+#[derive(Clone, Copy)]
+pub struct StageClip<'a> {
+    pub stage1: &'a Array,
+    pub frame_idx: i32,
+    pub strength: f32,
+}
+
+/// The full 2-stage **IC-LoRA** (keyframe-append) A/V pipeline for extend_clip / video_bridge: stage-1
+/// **token-native** denoise with the conditioning clips appended as in-context tokens → read back the
+/// generated grid → 2× upsample → stage-2 plain grid denoise (clips are stage-1 only). Audio is
+/// pure-noise both stages. `grid_dims = (channels, latent_frames, h1, w1)` describes the stage-1 grid
+/// for `unpatchify`. Requires an IC-LoRA adapter installed on `dit` (the appended tokens are inert
+/// without it); the mechanism + token layout are weight-independent. Returns `(video_latents (B,128,
+/// F,h2,w2), audio_latents)`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_av_latents_iclora(
+    dit: &AvDiT,
+    upsampler: &LatentUpsampler,
+    video_s1_noise: &Array,
+    video_pos1: &Array,
+    video_s2_noise: &Array,
+    video_pos2: &Array,
+    audio_s1_noise: &Array,
+    audio_s2_noise: &Array,
+    audio_pos: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    latent_mean: &Array,
+    latent_std: &Array,
+    clips: &[StageClip],
+    grid_dims: (i32, i32, i32, i32),
+    on_step: &mut dyn FnMut(usize),
+) -> Result<(Array, Array)> {
+    crate::set_compile_glue(true);
+    let (c, f, h1, w1) = grid_dims;
+
+    // Stage 1: build the base token state from the noise grid + main positions, append each clip as
+    // in-context conditioning tokens, then run the token-native joint denoise.
+    let mut vstate = VideoTokenState::base(video_s1_noise, video_pos1)?;
+    for clip in clips {
+        vstate = append_keyframe_clip(
+            &vstate,
+            clip.stage1,
+            clip.frame_idx,
+            clip.strength,
+            TEMPORAL_SCALE,
+            SPATIAL_SCALE,
+            DEFAULT_FPS,
+        )?;
+    }
+    dit.set_lora_pass(0);
+    let (vstate, a) = denoise_av_tokens(
+        dit,
+        &vstate,
+        audio_s1_noise,
+        video_ctx,
+        audio_ctx,
+        audio_pos,
+        &STAGE1_SIGMAS,
+        on_step,
+    )?;
+    // Read back the generated grid (the first `target_tokens` tokens) → (B, 128, f, h1, w1).
+    let tgt_idx: Vec<i32> = (0..vstate.target_tokens).collect();
+    let gen_tokens = vstate
+        .latent
+        .take_axis(Array::from_slice(&tgt_idx, &[vstate.target_tokens]), 1)?;
+    let v = unpatchify_grid(&gen_tokens, c, f, h1, w1)?;
+
+    // Stage 2: plain grid denoise (no clips; reference re-applies only image conditioning here).
+    let v = upsample_latents(&v, upsampler, latent_mean, latent_std)?;
+    let vlat2 = renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])?;
+    let a = renoise(&a, audio_s2_noise, STAGE2_SIGMAS[0])?;
+    dit.set_lora_pass(1);
+    denoise_av(
+        dit,
+        &vlat2,
+        &a,
+        video_ctx,
+        audio_ctx,
+        video_pos2,
+        audio_pos,
+        &STAGE2_SIGMAS,
+        None,
         on_step,
     )
 }

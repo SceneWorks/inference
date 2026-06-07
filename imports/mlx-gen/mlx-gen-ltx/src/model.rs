@@ -56,7 +56,8 @@ use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, Vocoder
 use crate::enhance::{self, EnhanceConfig, SampleParams};
 use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 use crate::pipeline::{
-    decode_audio_track, decode_to_frames, generate_av_latents, preprocess_conditioning_image,
+    decode_audio_track, decode_to_frames, generate_av_latents, generate_av_latents_iclora,
+    preprocess_conditioning_clip, preprocess_conditioning_image, StageClip, StageKeyframe,
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
@@ -102,7 +103,14 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
-            conditioning: vec![ConditioningKind::Reference],
+            // Reference = single-image I2V (sc-2685); Keyframe = first_last_frame / multi-keyframe
+            // (replace-latent, epic 3040); VideoClip = extend_clip / video_bridge (IC-LoRA
+            // keyframe-append — requires an IC-LoRA adapter via `spec.adapters`).
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::Keyframe,
+                ConditioningKind::VideoClip,
+            ],
             // LoRA (sc-2687) + LoKr (sc-2393) in generate: forward-time residuals + per-pass
             // strength over the full video+audio+cross-modal surface.
             supports_lora: true,
@@ -401,18 +409,29 @@ impl Ltx {
     ) -> Result<GenerationOutput> {
         let (ids, mask) = self.tokenizer.encode(&req.prompt, MAX_PROMPT_TOKENS)?;
         let (video_ctx, audio_ctx) = self.text_encoder.encode_av(&ids, &mask)?;
-        // I2V: VAE-encode the conditioning image at each stage's pixel resolution (half-res + full-res).
-        let cond = match self.resolve_reference(req)? {
-            Some((image, strength)) => Some((
-                self.encode_conditioning(image, req.height / 2, req.width / 2)?,
-                self.encode_conditioning(image, req.height, req.width)?,
-                strength,
-            )),
-            None => None,
-        };
-        let video_cond = cond
-            .as_ref()
-            .map(|(img1, img2, strength)| (img1, img2, IMAGE_FRAME_IDX, *strength));
+        // Replace-latent conditioning: VAE-encode each keyframe at both stage resolutions (half/full).
+        // I2V = a single `Reference` at frame 0; first_last_frame / multi-keyframe = `Keyframe`s.
+        let kf_owned = self.build_keyframes(req)?;
+        let keyframes: Vec<StageKeyframe> = kf_owned
+            .iter()
+            .map(|(s1, s2, idx, strength)| StageKeyframe {
+                stage1: s1,
+                stage2: s2,
+                frame_idx: *idx,
+                strength: *strength,
+            })
+            .collect();
+        // In-context clips (extend_clip / video_bridge) — VAE-encoded at stage-1 resolution, appended
+        // as IC-LoRA conditioning tokens in stage 1 only.
+        let clip_owned = self.build_clips(req)?;
+        let clips: Vec<StageClip> = clip_owned
+            .iter()
+            .map(|(s1, idx, strength)| StageClip {
+                stage1: s1,
+                frame_idx: *idx,
+                strength: *strength,
+            })
+            .collect();
         self.generate_av_from_embeddings(
             req,
             &video_ctx,
@@ -421,7 +440,8 @@ impl Ltx {
             video_s2,
             audio_s1,
             audio_s2,
-            video_cond,
+            &keyframes,
+            &clips,
             on_progress,
         )
     }
@@ -440,7 +460,8 @@ impl Ltx {
         video_s2: &Array,
         audio_s1: &Array,
         audio_s2: &Array,
-        video_cond: Option<(&Array, &Array, i32, f32)>,
+        video_keyframes: &[StageKeyframe],
+        video_clips: &[StageClip],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
@@ -449,29 +470,53 @@ impl Ltx {
         let audio_pos = create_audio_position_grid(1, Self::audio_frames(req));
 
         let mut step = 0usize;
-        let (video_latents, audio_latents) = generate_av_latents(
-            &self.transformer,
-            &self.upsampler,
-            video_s1,
-            &pos1,
-            video_s2,
-            &pos2,
-            audio_s1,
-            audio_s2,
-            &audio_pos,
-            video_ctx,
-            audio_ctx,
-            &self.latent_mean,
-            &self.latent_std,
-            video_cond,
-            &mut |_| {
-                step += 1;
-                on_progress(Progress::Step {
-                    current: step as u32,
-                    total: 11,
-                });
-            },
-        )?;
+        let mut on_step = |_: usize| {
+            step += 1;
+            on_progress(Progress::Step {
+                current: step as u32,
+                total: 11,
+            });
+        };
+        // extend_clip / video_bridge ride the IC-LoRA keyframe-append path (stage-1 in-context tokens);
+        // everything else (T2V / I2V / first_last_frame) is the replace-latent path.
+        let (video_latents, audio_latents) = if !video_clips.is_empty() {
+            generate_av_latents_iclora(
+                &self.transformer,
+                &self.upsampler,
+                video_s1,
+                &pos1,
+                video_s2,
+                &pos2,
+                audio_s1,
+                audio_s2,
+                &audio_pos,
+                video_ctx,
+                audio_ctx,
+                &self.latent_mean,
+                &self.latent_std,
+                video_clips,
+                (LATENT_CHANNELS, lf as i32, h1 as i32, w1 as i32),
+                &mut on_step,
+            )?
+        } else {
+            generate_av_latents(
+                &self.transformer,
+                &self.upsampler,
+                video_s1,
+                &pos1,
+                video_s2,
+                &pos2,
+                audio_s1,
+                audio_s2,
+                &audio_pos,
+                video_ctx,
+                audio_ctx,
+                &self.latent_mean,
+                &self.latent_std,
+                video_keyframes,
+                &mut on_step,
+            )?
+        };
 
         on_progress(Progress::Decoding);
         let frames = decode_to_frames(&self.vae, &video_latents)?;
@@ -519,6 +564,74 @@ impl Ltx {
             }
         }
         Ok(reference)
+    }
+
+    /// Build the replace-latent keyframes (single-image I2V `Reference` at frame 0 + explicit
+    /// `Keyframe`s) as owned `(stage1_latent, stage2_latent, latent_frame_idx, strength)` tuples, each
+    /// VAE-encoded at both stage resolutions. [`Conditioning::Keyframe`]'s `frame_idx` is a **latent**
+    /// frame index with Python-style negative indexing (`-1` = last latent frame), so first_last_frame
+    /// is `[@0, @-1]` without the caller knowing the latent-frame count. Out-of-range indices error.
+    fn build_keyframes(&self, req: &GenerationRequest) -> Result<Vec<(Array, Array, i32, f32)>> {
+        let lf = Self::latent_dims(req).0 as i32;
+        let mut out = Vec::new();
+        if let Some((image, strength)) = self.resolve_reference(req)? {
+            out.push((
+                self.encode_conditioning(image, req.height / 2, req.width / 2)?,
+                self.encode_conditioning(image, req.height, req.width)?,
+                IMAGE_FRAME_IDX,
+                strength,
+            ));
+        }
+        for kf in req.keyframes() {
+            let idx = if kf.frame_idx < 0 {
+                lf + kf.frame_idx
+            } else {
+                kf.frame_idx
+            };
+            if idx < 0 || idx >= lf {
+                return Err(Error::Msg(format!(
+                    "ltx_2_3: keyframe latent frame index {} out of bounds for {lf} latent frames",
+                    kf.frame_idx
+                )));
+            }
+            out.push((
+                self.encode_conditioning(kf.image, req.height / 2, req.width / 2)?,
+                self.encode_conditioning(kf.image, req.height, req.width)?,
+                idx,
+                kf.strength,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Build the in-context conditioning clips ([`Conditioning::VideoClip`] — extend_clip /
+    /// video_bridge) as owned `(stage1_clip_latent, latent_frame_idx, strength)` tuples, each
+    /// VAE-encoded at **stage-1** (half-res) resolution into `(1, 128, cf, h1, w1)`. `frame_idx` is a
+    /// latent frame index with negative-from-end indexing (`-1` = last latent frame), resolved against
+    /// the target latent-frame count `lf`. Video conditioning is stage-1 only (reference
+    /// `ICLoraPipeline`), so no stage-2 encode.
+    fn build_clips(&self, req: &GenerationRequest) -> Result<Vec<(Array, i32, f32)>> {
+        let lf = Self::latent_dims(req).0 as i32;
+        let mut out = Vec::new();
+        for clip in req.video_clips() {
+            if clip.frames.is_empty() {
+                return Err(Error::Msg("ltx_2_3: video conditioning clip is empty".into()));
+            }
+            let idx = if clip.frame_idx < 0 {
+                lf + clip.frame_idx
+            } else {
+                clip.frame_idx
+            };
+            if idx < 0 || idx >= lf {
+                return Err(Error::Msg(format!(
+                    "ltx_2_3: clip latent frame index {} out of bounds for {lf} latent frames",
+                    clip.frame_idx
+                )));
+            }
+            let video = preprocess_conditioning_clip(clip.frames, req.width / 2, req.height / 2)?;
+            out.push((self.vae.encode(&video)?, idx, clip.strength));
+        }
+        Ok(out)
     }
 
     /// VAE-encode the conditioning image at a stage's pixel resolution `(px_h, px_w)` → the f32 clean
