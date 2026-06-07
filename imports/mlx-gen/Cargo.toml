@@ -1,5 +1,5 @@
 [workspace]
-members = ["mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-face"]
+members = ["mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-face", "mlx-gen-instantid"]
 resolver = "2"
 
 [package]

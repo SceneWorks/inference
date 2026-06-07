@@ -152,6 +152,25 @@ impl ResamplerConfig {
             output_dim: 2048,
         }
     }
+
+    /// InstantID's face Resampler (`image_proj.*` of `InstantX/InstantID` `ip-adapter.bin`; sc-3110).
+    /// The vendored InstantID `Resampler` (`_vendor/instantid/ip_adapter/resampler.py`) is the *same*
+    /// Tencent layout as [`plus_sdxl_vit_h`](Self::plus_sdxl_vit_h); the only delta is the input
+    /// feature width — a single 512-d antelopev2 ArcFace embedding (fed `[B, 1, 512]`) instead of the
+    /// 257-token ViT-H penultimate. InstantID instantiates it with `apply_pos_emb=False` and
+    /// `num_latents_mean_pooled=0`, so the position-embedding and mean-pooled-latent branches are
+    /// absent — exactly the [`Resampler`] this module already implements.
+    pub fn instantid_face() -> Self {
+        Self {
+            dim: 1280,
+            depth: 4,
+            heads: 20,
+            dim_head: 64,
+            num_queries: 16,
+            embed_dim: 512,
+            output_dim: 2048,
+        }
+    }
 }
 
 /// PerceiverAttention block (`layers.{i}.0`): cross-attention from the learned `latents` (queries)

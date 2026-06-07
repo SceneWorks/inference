@@ -586,6 +586,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-instantid"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-ltx"
 version = "0.0.0"
 dependencies = [
