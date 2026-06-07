@@ -83,6 +83,20 @@ torch+diffusers venv (e.g. `/Users/michael/Repos/mflux/.venv` after `uv pip inst
 | `sdxl_accel_sched_golden.safetensors` | `dump_sdxl_accel_golden.py` (default) | `tests/accel_sampler_parity.rs` (core crate) | **Scheduler-math isolation:** per-step deterministic outputs of `LCMScheduler` / `EulerDiscreteScheduler(trailing)` / `TCDScheduler` on fixed synthetic tensors. Validates the Rust `mlx_gen::sampler` port to ~1e-6 (torch-f32 vs MLX-f32), no model needed. Small + fast. |
 | `sdxl_accel_render_{ancestral,lightning,hyper,lcm}.safetensors` (+ implied `.png` via the test) | `dump_sdxl_accel_golden.py render` | `mlx-gen-sdxl/tests/accel_real_weights.rs` (`lightning_hyper_match_torch_teacher_forced`) | **Deterministic e2e:** torch initial latent + final RGB8 per variant. The Rust test teacher-forces the init latent and reports px>8 vs the torch render (a *qualitative* torch↔MLX backend gap, NOT bit-exact). Needs the full fp16 SDXL pipeline + accel LoRAs. |
 
+### PuLID-FLUX face-identity (`mlx-gen-pulid`, epic 3069)
+
+The reference is the **vendored torch `pulid_flux`** (SceneWorks worker `_vendor/pulid_flux/`), so
+these dump from a torch venv, not `mflux`. Run from the vendored reference dir under `pulidenv`:
+
+```sh
+cd /Users/michael/Repos/SceneWorks/apps/worker/scene_worker/_vendor/pulid_flux
+HF_HUB_OFFLINE=1 PYTHONPATH=. /private/tmp/pulidenv/bin/python /path/to/mlx-gen/tools/dump_eva_clip_golden.py
+```
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `eva_clip_golden.safetensors` | `dump_eva_clip_golden.py` | `mlx-gen-pulid/tests/eva_clip_parity.rs` | **EVA02-CLIP-L-14-336 visual tower (sc-3070).** f32 reference weights + `enc_in` + 5 hidden states + `id_cond_vit`, plus the `rope.freqs_*` buffers (weight-free RoPE-construction gate) and a 512²→336² resize/normalize case (`ffi_512`/`tf_*`). Gate is cosine-primary: torch-CPU-f32 golden vs MLX-Metal-f32 has a depth-accumulating mean-rel floor (~1e-2 by block 20), but the final `id_cond_vit` re-normalizes to cos 0.999997 (bf16 0.999945). The float antialiased bicubic matches torchvision to ~1e-6. |
+
 ### Weight-independent
 
 | golden | dump script | consumed by | notes |
