@@ -31,13 +31,14 @@ use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, cos, multiply, sigmoid, sin, split};
+use mlx_rs::ops::{add, concatenate_axis, cos, gt, multiply, sigmoid, sin, split, subtract};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::WanVaceConfig;
 use crate::patchify::{patchify, unpatchify};
 use crate::rope::{rope_apply, RopeTable};
 use crate::text_encoder::gelu_tanh;
+use crate::vae::WanVae;
 
 fn cast(x: &Array, dt: Dtype) -> Result<Array> {
     Ok(x.as_dtype(dt)?)
@@ -589,4 +590,125 @@ impl WanVaceTransformer {
             ("output", output),
         ])
     }
+}
+
+// ============================================================================================
+// S2 (sc-3435) — VACE conditioning construction (the host / VAE side).
+//
+// Builds the 96-ch `control_hidden_states = cat([video_latents(32), mask_latents(64)], channels)`
+// the [`WanVaceTransformer::forward_vace`] consumes. Mirrors diffusers `WanVACEPipeline`'s
+// `prepare_video_latents` + `prepare_masks` + the `__call__` concat, in the crate's no-batch
+// `[C, F, H, W]` convention. The VAE-encode + `(x−mean)·std` normalization is the already-validated
+// [`WanVae::encode`] (it returns the mode/argmax latent normalized — exactly diffusers'
+// `retrieve_latents(sample_mode="argmax")` + normalize); the genuinely new pieces here are the
+// mask 8×8-unfold + nearest-exact temporal resample, the inactive/reactive masking, and the
+// reference-frame prepend — all byte-validated as pure host ops in `tests/wanvace_cond_parity.rs`.
+// ============================================================================================
+
+/// Binarize a soft control mask: `where(mask > 0.5, 1.0, 0.0)` (diffusers `prepare_video_latents`).
+pub fn binarize_mask(mask: &Array) -> Result<Array> {
+    Ok(gt(mask, scalar(0.5))?.as_dtype(Dtype::Float32)?)
+}
+
+/// Nearest-exact temporal resample along the frame axis (axis 1) of a `[C, F, H, W]` tensor →
+/// `[C, out_t, H, W]`. torch `mode="nearest-exact"`: `src = floor((i + 0.5)·F / out_t)`, clamped to
+/// `[0, F−1]`. Spatial dims are unchanged (the VACE mask interp resamples time only).
+fn nearest_exact_temporal(x: &Array, out_t: usize) -> Result<Array> {
+    let f = x.shape()[1] as usize;
+    let idx: Vec<i32> = (0..out_t)
+        .map(|i| {
+            let s = (((i as f64) + 0.5) * (f as f64) / (out_t as f64)).floor() as i64;
+            s.clamp(0, f as i64 - 1) as i32
+        })
+        .collect();
+    let idx = Array::from_slice(&idx, &[out_t as i32]);
+    Ok(x.take_axis(&idx, 1)?)
+}
+
+/// `prepare_masks`: a soft control mask `[C, F, H, W]` (`C≥1`; channel 0 is used) → the 64-ch mask
+/// latent `[64, new_t (+ num_ref), new_h, new_w]`, where `64 = vae_s²`, `new_t = ⌈F / vae_t⌉`,
+/// `new_h = H/(vae_s·patch)·patch`. The mask is unfolded `view(F, new_h, vae_s, new_w, vae_s)
+/// .permute(2,4,0,1,3).flatten(0,1)` → `[vae_s², F, new_h, new_w]`, nearest-exact resampled in time
+/// to `new_t`, then `num_ref` zero frames are prepended along the frame axis. Pure host op (diffusers
+/// `WanVACEPipeline.prepare_masks`, single batch).
+pub fn prepare_masks(
+    mask: &Array,
+    vae_t: usize,
+    vae_s: usize,
+    patch: usize,
+    num_ref: usize,
+) -> Result<Array> {
+    let sh = mask.shape();
+    let (f, h, w) = (sh[1], sh[2], sh[3]);
+    let new_t = (f as usize).div_ceil(vae_t);
+    let new_h = (h as usize / (vae_s * patch) * patch) as i32;
+    let new_w = (w as usize / (vae_s * patch) * patch) as i32;
+    let vs = vae_s as i32;
+
+    // Channel 0 → [F, H, W].
+    let ch0 = mask
+        .take_axis(Array::from_slice(&[0i32], &[1]), 0)?
+        .reshape(&[f, h, w])?;
+    // [F, new_h, vae_s, new_w, vae_s] → permute(2,4,0,1,3) → [vae_s, vae_s, F, new_h, new_w]
+    // → flatten(0,1) → [vae_s², F, new_h, new_w].
+    let m = ch0
+        .reshape(&[f, new_h, vs, new_w, vs])?
+        .transpose_axes(&[2, 4, 0, 1, 3])?
+        .reshape(&[vs * vs, f, new_h, new_w])?;
+    let m = nearest_exact_temporal(&m, new_t)?;
+    if num_ref > 0 {
+        let pad = Array::zeros::<f32>(&[vs * vs, num_ref as i32, new_h, new_w])?;
+        Ok(concatenate_axis(&[&pad, &m], 1)?)
+    } else {
+        Ok(m)
+    }
+}
+
+/// Encode one frame-batch `[C, F, H, W]` through the Wan z16 VAE → the normalized latent
+/// `[z, F_lat, h, w]` (drops the batch the VAE adds). [`WanVae::encode`] already applies the
+/// mode/argmax + `(x−mean)·std` normalization.
+fn encode_clip(vae: &WanVae, clip: &Array) -> Result<Array> {
+    let sh = clip.shape(); // [C, F, H, W]
+    let z = vae.encode(&clip.reshape(&[1, sh[0], sh[1], sh[2], sh[3]])?)?; // [1, z, F_lat, h, w]
+    let zs = z.shape();
+    Ok(z.reshape(&[zs[1], zs[2], zs[3], zs[4]])?)
+}
+
+/// `prepare_video_latents`: the control video `[3, F, H, W]` (+ optional binarized mask + reference
+/// images) → the 32-ch (or 16-ch, no mask) video-latent `[32, F_lat (+ num_ref), h, w]`. With a mask:
+/// `inactive = video·(1−mask)`, `reactive = video·mask`, each VAE-encoded + normalized, concatenated
+/// along channels. Each reference image `[3, H, W]` is encoded to one latent frame, `cat([ref,
+/// zeros])` to 32 ch, and prepended along the frame axis. Mirrors diffusers
+/// `WanVACEPipeline.prepare_video_latents` (single batch). Checkpoint-gated (needs the z16 VAE).
+pub fn prepare_video_latents(
+    vae: &WanVae,
+    video: &Array,
+    mask: Option<&Array>,
+    references: &[Array],
+) -> Result<Array> {
+    let mut latents = match mask {
+        None => encode_clip(vae, video)?, // 16 ch
+        Some(m) => {
+            let m = binarize_mask(m)?;
+            let inactive = encode_clip(vae, &multiply(video, &subtract(scalar(1.0), &m)?)?)?;
+            let reactive = encode_clip(vae, &multiply(video, &m)?)?;
+            concatenate_axis(&[&inactive, &reactive], 0)? // 32 ch
+        }
+    };
+    // Reference images: encode → [z,1,h,w] → cat([ref, zeros]) → 2z ch → prepend along frames.
+    for reference in references {
+        let rsh = reference.shape(); // [3, H, W]
+        let ref_clip = reference.reshape(&[rsh[0], 1, rsh[1], rsh[2]])?; // [3,1,H,W]
+        let ref_lat = encode_clip(vae, &ref_clip)?; // [z,1,h,w]
+        let zeros = Array::zeros::<f32>(ref_lat.shape())?;
+        let ref_lat = concatenate_axis(&[&ref_lat, &zeros], 0)?; // [2z,1,h,w]
+        latents = concatenate_axis(&[&ref_lat, &latents], 1)?; // prepend along frames
+    }
+    Ok(latents)
+}
+
+/// Assemble the 96-ch `control_hidden_states = cat([video_latents(32), mask_latents(64)], channels)`
+/// (diffusers `__call__`'s `conditioning_latents = cat([conditioning_latents, mask], dim=1)`).
+pub fn build_vace_control(video_latents: &Array, mask_latents: &Array) -> Result<Array> {
+    Ok(concatenate_axis(&[video_latents, mask_latents], 0)?)
 }

@@ -84,6 +84,8 @@ pub use scheduler::{
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};
 pub use training::{load_trainer, WanMoeTrainer};
 pub use transformer::WanTransformer;
-pub use vace::WanVaceTransformer;
+pub use vace::{
+    binarize_mask, build_vace_control, prepare_masks, prepare_video_latents, WanVaceTransformer,
+};
 pub use vae::WanVae;
 pub use vae22::Wan22Vae;
