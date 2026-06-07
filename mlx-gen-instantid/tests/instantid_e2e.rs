@@ -203,3 +203,62 @@ fn instantid_t2i_q4_preserves_identity() {
         "Q4 identity not preserved: ArcFace-cosine {cos:.4}"
     );
 }
+
+#[test]
+#[ignore = "needs SDXL base + InstantID + converted ip-adapter + face goldens + reference"]
+fn instantid_view_angle_preserves_identity() {
+    // sc-3117 (multi-view kps): rotate the reference identity to a named view from VIEW_ANGLE_KPS.
+    // Identity holds across the view (ArcFace is view-tolerant); sc-2009 measured 0.81-0.89 at the
+    // target angle. A moderate turn (three-quarter) is gated directionally.
+    let size = env_usize("INSTANTID_SIZE", 1024) as u32;
+    let view = "three_quarter_right";
+
+    let paths = InstantIdPaths {
+        sdxl_base: sdxl_base(),
+        identitynet: instantid_controlnet(),
+        ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
+    };
+    let model = InstantId::load(&paths)
+        .expect("load InstantID")
+        .with_face(
+            &golden("scrfd_10g.safetensors"),
+            &golden("arcface_iresnet100.safetensors"),
+        )
+        .expect("attach face stack");
+
+    let g = golden("instantid_e2e_ref.safetensors");
+    let wh = g.require("ref_wh").unwrap().as_slice::<i32>().to_vec();
+    let ref_img = Image {
+        width: wh[0] as u32,
+        height: wh[1] as u32,
+        pixels: g.require("ref_img").unwrap().as_slice::<u8>().to_vec(),
+    };
+
+    let req = InstantIdRequest {
+        prompt: "film still, a portrait photo of a man, cinematic lighting, sharp focus".into(),
+        negative: "lowres, blurry, deformed".into(),
+        width: size,
+        height: size,
+        ..Default::default()
+    };
+    let out = model
+        .generate_angle(&req, &ref_img, view)
+        .expect("generate view angle");
+    save_png("instantid_e2e_angle_out.png", &out);
+
+    // Identity vs the reference's (frontal) embedding.
+    let canvas = letterbox(&ref_img, size, size);
+    let ref_face = model
+        .largest_face(&canvas.pixels, size as usize, size as usize)
+        .expect("detect reference face");
+    let out_face = model
+        .largest_face(&out.pixels, size as usize, size as usize)
+        .expect("detect generated face");
+    let cos = cosine(&ref_face.embedding, &out_face.embedding);
+    println!("[instantid view={view}] {size}x{size} | ArcFace-cosine(ref, generated) = {cos:.4}");
+    assert!(
+        cos > 0.4,
+        "view-angle identity not preserved: ArcFace-cosine {cos:.4} (a turned view reduces cosine \
+         vs a frontal reference; expected a clear positive signal)"
+    );
+}
