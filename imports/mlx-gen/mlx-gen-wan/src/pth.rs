@@ -512,7 +512,9 @@ fn tensor_byte_range(
     elsize: usize,
 ) -> Result<(usize, usize, usize)> {
     if offset < 0 {
-        return Err(Error::Msg(format!("{name}: negative storage offset {offset}")));
+        return Err(Error::Msg(format!(
+            "{name}: negative storage offset {offset}"
+        )));
     }
     let mut numel: usize = 1;
     for &d in size {
@@ -538,9 +540,9 @@ fn tensor_byte_range(
             "{name}: storage byte length overflows usize (numel {numel}, elsize {elsize})"
         ))
     })?;
-    let end = start.checked_add(byte_len).ok_or_else(|| {
-        Error::Msg(format!("{name}: storage slice end overflows usize"))
-    })?;
+    let end = start
+        .checked_add(byte_len)
+        .ok_or_else(|| Error::Msg(format!("{name}: storage slice end overflows usize")))?;
     Ok((start, end, numel))
 }
 

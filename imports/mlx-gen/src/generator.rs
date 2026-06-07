@@ -613,18 +613,45 @@ mod tests {
         let c = caps();
         let cases: Vec<GenerationRequest> = vec![
             // count out of range
-            GenerationRequest { count: 0, ..base_req() },
-            GenerationRequest { count: 2, ..base_req() },
+            GenerationRequest {
+                count: 0,
+                ..base_req()
+            },
+            GenerationRequest {
+                count: 2,
+                ..base_req()
+            },
             // size out of range (below min, above max)
-            GenerationRequest { width: 128, ..base_req() },
-            GenerationRequest { height: 2048, ..base_req() },
+            GenerationRequest {
+                width: 128,
+                ..base_req()
+            },
+            GenerationRequest {
+                height: 2048,
+                ..base_req()
+            },
             // capability flags not advertised
-            GenerationRequest { negative_prompt: Some("n".into()), ..base_req() },
-            GenerationRequest { guidance: Some(3.5), ..base_req() },
-            GenerationRequest { true_cfg: Some(4.0), ..base_req() },
+            GenerationRequest {
+                negative_prompt: Some("n".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                guidance: Some(3.5),
+                ..base_req()
+            },
+            GenerationRequest {
+                true_cfg: Some(4.0),
+                ..base_req()
+            },
             // sampler / scheduler not advertised
-            GenerationRequest { sampler: Some("unipc".into()), ..base_req() },
-            GenerationRequest { scheduler: Some("linear".into()), ..base_req() },
+            GenerationRequest {
+                sampler: Some("unipc".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                scheduler: Some("linear".into()),
+                ..base_req()
+            },
             // conditioning kind not accepted
             GenerationRequest {
                 conditioning: vec![Conditioning::Depth { image: img(8, 8) }],

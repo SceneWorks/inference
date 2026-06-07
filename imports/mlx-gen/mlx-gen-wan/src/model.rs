@@ -191,7 +191,9 @@ impl Generator for Wan {
         // Shared capability floor: size range (the advertised `min_size` = patch×vae_stride = 32 is
         // the sub-tile lower bound; `max_size` caps the long edge), count, guidance/negative/true_cfg,
         // sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and conditioning (`Reference`/`Keyframe`).
-        self.descriptor.capabilities.validate_request(MODEL_ID, req)?;
+        self.descriptor
+            .capabilities
+            .validate_request(MODEL_ID, req)?;
         if let Some(frames) = req.frames {
             // num_frames must be 1 + 4·k (one VAE temporal chunk + 4× per chunk).
             if frames % 4 != 1 {
