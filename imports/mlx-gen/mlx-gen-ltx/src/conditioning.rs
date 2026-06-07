@@ -49,56 +49,95 @@ pub struct I2vConditioning {
     pub denoise_mask: Array,
 }
 
+/// One replace-latent keyframe: a clean `(B, C, cond_f, H, W)` latent pinned at output latent frame
+/// `frame_idx` with `strength` (mask `1 − strength`). For single-image I2V `cond_f = 1`.
+#[derive(Clone, Copy)]
+pub struct Keyframe<'a> {
+    pub latent: &'a Array,
+    pub frame_idx: i32,
+    pub strength: f32,
+}
+
 /// Build the conditioning state by injecting `cond_latent` (a clean `(B, C, cond_f, H, W)` latent —
-/// for single-image I2V `cond_f = 1`) at `frame_idx` over `base_latent` `(B, C, F, H, W)`. Mirrors the
-/// reference `apply_conditioning` over a fresh `LatentState(latent=base, clean=zeros, mask=ones)`:
-/// the conditioned frame(s) take the clean latent in both `latent` + `clean_latent` and mask
-/// `1 − strength`; every other frame keeps `base_latent` (latent), `0` (clean), `1` (mask).
+/// for single-image I2V `cond_f = 1`) at `frame_idx` over `base_latent` `(B, C, F, H, W)`. The
+/// single-keyframe form of [`apply_keyframes`] (strict-parity I2V; reference `apply_conditioning`).
 pub fn apply_conditioning(
     base_latent: &Array,
     cond_latent: &Array,
     frame_idx: i32,
     strength: f32,
 ) -> Result<I2vConditioning> {
+    apply_keyframes(
+        base_latent,
+        &[Keyframe {
+            latent: cond_latent,
+            frame_idx,
+            strength,
+        }],
+    )
+}
+
+/// Build the conditioning state by injecting **multiple** clean keyframe latents at their frame
+/// indices over `base_latent` `(B, C, F, H, W)` — the replace-latent mechanism (reference
+/// `VideoConditionByLatentIndex` applied per item; **first_last_frame** = two keyframes at `0` and the
+/// last latent frame). Mirrors the reference's per-item `apply_to`: each keyframe **overwrites** the
+/// `latent` + `clean_latent` and sets the `denoise_mask` to `1 − strength` over its covered frames;
+/// uncovered frames keep `base_latent` (latent), `0` (clean), `1` (mask). When two keyframes overlap,
+/// the **later** one in the list wins (sequential application, matching torch).
+///
+/// Because this only rewrites existing grid frames in place (no appended tokens), the resulting state
+/// drives the **existing grid** [`crate::pipeline::denoise`] / [`crate::pipeline::denoise_av`] loops
+/// unchanged — FLF needs no token-native loop.
+pub fn apply_keyframes(base_latent: &Array, keyframes: &[Keyframe]) -> Result<I2vConditioning> {
     let dt = base_latent.dtype();
     let sh = base_latent.shape(); // (B, C, F, H, W)
     let (b, c, f, h, w) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
-    let cs = cond_latent.shape();
-    let (cond_c, cond_f, cond_h, cond_w) = (cs[1], cs[2], cs[3], cs[4]);
 
-    if (cond_c, cond_h, cond_w) != (c, h, w) {
-        return Err(Error::Msg(format!(
-            "I2V conditioning latent spatial shape ({cond_c},{cond_h},{cond_w}) != target ({c},{h},{w})"
-        )));
-    }
-    if frame_idx >= f {
-        return Err(Error::Msg(format!(
-            "I2V frame index {frame_idx} out of bounds for {f} latent frames"
-        )));
-    }
+    let mask_gen = broadcast_to(&scalar(1.0, dt)?.reshape(&[1, 1, 1, 1, 1])?, &[b, 1, 1, 1, 1])?;
+    let zero_frame = broadcast_to(&scalar(0.0, dt)?.reshape(&[1, 1, 1, 1, 1])?, &[b, c, 1, h, w])?;
 
-    let end_idx = (frame_idx + cond_f).min(f);
-    let mask_keep = scalar(1.0 - strength, dt)?; // (1,) — broadcast to a (b,1,1,1,1) frame below.
-    let mask_keep = broadcast_to(&mask_keep.reshape(&[1, 1, 1, 1, 1])?, &[b, 1, 1, 1, 1])?;
-    let mask_gen = scalar(1.0, dt)?;
-    let mask_gen = broadcast_to(&mask_gen.reshape(&[1, 1, 1, 1, 1])?, &[b, 1, 1, 1, 1])?;
+    // Per-output-frame assignment: which keyframe (if any) owns this frame, and its source sub-index.
+    // Later keyframes override earlier ones (sequential `apply_to`).
+    let mut owner: Vec<Option<(usize, i32)>> = vec![None; f as usize];
+    for (ki, kf) in keyframes.iter().enumerate() {
+        let cs = kf.latent.shape();
+        let (cond_c, cond_f, cond_h, cond_w) = (cs[1], cs[2], cs[3], cs[4]);
+        if (cond_c, cond_h, cond_w) != (c, h, w) {
+            return Err(Error::Msg(format!(
+                "keyframe {ki} latent spatial shape ({cond_c},{cond_h},{cond_w}) != target ({c},{h},{w})"
+            )));
+        }
+        if kf.frame_idx < 0 || kf.frame_idx >= f {
+            return Err(Error::Msg(format!(
+                "keyframe {ki} frame index {} out of bounds for {f} latent frames",
+                kf.frame_idx
+            )));
+        }
+        let end_idx = (kf.frame_idx + cond_f).min(f);
+        for i in kf.frame_idx..end_idx {
+            owner[i as usize] = Some((ki, i - kf.frame_idx));
+        }
+    }
 
     let mut latent_frames = Vec::with_capacity(f as usize);
     let mut clean_frames = Vec::with_capacity(f as usize);
     let mut mask_frames = Vec::with_capacity(f as usize);
     for i in 0..f {
-        if frame_idx <= i && i < end_idx {
-            let cond = frame(cond_latent, i - frame_idx)?;
-            latent_frames.push(cond.clone());
-            clean_frames.push(cond);
-            mask_frames.push(mask_keep.clone());
-        } else {
-            latent_frames.push(frame(base_latent, i)?);
-            clean_frames.push(broadcast_to(
-                &scalar(0.0, dt)?.reshape(&[1, 1, 1, 1, 1])?,
-                &[b, c, 1, h, w],
-            )?);
-            mask_frames.push(mask_gen.clone());
+        match owner[i as usize] {
+            Some((ki, sub)) => {
+                let kf = &keyframes[ki];
+                let cond = frame(kf.latent, sub)?;
+                latent_frames.push(cond.clone());
+                clean_frames.push(cond);
+                let mask_keep =
+                    broadcast_to(&scalar(1.0 - kf.strength, dt)?.reshape(&[1, 1, 1, 1, 1])?, &[b, 1, 1, 1, 1])?;
+                mask_frames.push(mask_keep);
+            }
+            None => {
+                latent_frames.push(frame(base_latent, i)?);
+                clean_frames.push(zero_frame.clone());
+                mask_frames.push(mask_gen.clone());
+            }
         }
     }
 
@@ -183,6 +222,48 @@ mod tests {
         assert!((m[0] - 1.0).abs() < 1e-6);
         assert!((m[1] - 0.25).abs() < 1e-6);
         assert!((m[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_keyframes_pins_first_and_last_frame() {
+        // first_last_frame: base (1,1,4,1,1)=[10,20,30,40]; keyframe A=[99] @0 s=1.0,
+        // keyframe B=[88] @3 s=0.5. Frames 1,2 stay base.
+        let base = arr(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 4, 1, 1]);
+        let a = arr(&[99.0], &[1, 1, 1, 1, 1]);
+        let bb = arr(&[88.0], &[1, 1, 1, 1, 1]);
+        let st = apply_keyframes(
+            &base,
+            &[
+                Keyframe { latent: &a, frame_idx: 0, strength: 1.0 },
+                Keyframe { latent: &bb, frame_idx: 3, strength: 0.5 },
+            ],
+        )
+        .unwrap();
+        assert_eq!(st.latent.as_slice::<f32>(), &[99.0, 20.0, 30.0, 88.0]);
+        assert_eq!(st.clean_latent.as_slice::<f32>(), &[99.0, 0.0, 0.0, 88.0]);
+        // mask: 1-1.0=0 @0; 1 @1,2; 1-0.5=0.5 @3.
+        let m = st.denoise_mask.as_slice::<f32>();
+        assert!((m[0] - 0.0).abs() < 1e-6);
+        assert!((m[1] - 1.0).abs() < 1e-6);
+        assert!((m[2] - 1.0).abs() < 1e-6);
+        assert!((m[3] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_keyframes_later_overrides_on_overlap() {
+        // Two keyframes both at frame 0; the later (in list) wins.
+        let base = arr(&[1.0, 2.0], &[1, 1, 2, 1, 1]);
+        let a = arr(&[5.0], &[1, 1, 1, 1, 1]);
+        let bb = arr(&[7.0], &[1, 1, 1, 1, 1]);
+        let st = apply_keyframes(
+            &base,
+            &[
+                Keyframe { latent: &a, frame_idx: 0, strength: 1.0 },
+                Keyframe { latent: &bb, frame_idx: 0, strength: 1.0 },
+            ],
+        )
+        .unwrap();
+        assert_eq!(st.latent.as_slice::<f32>(), &[7.0, 2.0]);
     }
 
     #[test]

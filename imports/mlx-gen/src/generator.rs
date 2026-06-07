@@ -127,6 +127,96 @@ impl Default for GenerationRequest {
     }
 }
 
+/// A first_last_frame / multi-keyframe input — a borrowed, normalized view of a
+/// [`Conditioning::Keyframe`]. Returned by [`GenerationRequest::keyframes`].
+#[derive(Clone, Copy, Debug)]
+pub struct KeyframeRef<'a> {
+    pub image: &'a Image,
+    pub frame_idx: i32,
+    pub strength: f32,
+}
+
+/// An in-context conditioning clip — a borrowed view of a [`Conditioning::VideoClip`]. Returned by
+/// [`GenerationRequest::video_clips`].
+#[derive(Clone, Copy, Debug)]
+pub struct VideoClipRef<'a> {
+    pub frames: &'a [Image],
+    pub frame_idx: i32,
+    pub strength: f32,
+}
+
+/// A replace_person masked control clip — a borrowed view of a [`Conditioning::ControlClip`].
+/// Returned by [`GenerationRequest::control_clip`].
+#[derive(Clone, Copy, Debug)]
+pub struct ControlClipRef<'a> {
+    pub frames: &'a [Image],
+    pub mask: &'a [Image],
+    pub masking_strength: f32,
+    pub start_frame: i32,
+    pub mode: ReplacementMode,
+}
+
+impl GenerationRequest {
+    /// All [`Conditioning::Keyframe`] inputs (first_last_frame / multi-keyframe), in request order.
+    pub fn keyframes(&self) -> Vec<KeyframeRef<'_>> {
+        self.conditioning
+            .iter()
+            .filter_map(|c| match c {
+                Conditioning::Keyframe {
+                    image,
+                    frame_idx,
+                    strength,
+                } => Some(KeyframeRef {
+                    image,
+                    frame_idx: *frame_idx,
+                    strength: *strength,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// All [`Conditioning::VideoClip`] in-context clips (extend_clip / video_bridge), in request order.
+    pub fn video_clips(&self) -> Vec<VideoClipRef<'_>> {
+        self.conditioning
+            .iter()
+            .filter_map(|c| match c {
+                Conditioning::VideoClip {
+                    frames,
+                    frame_idx,
+                    strength,
+                } => Some(VideoClipRef {
+                    frames,
+                    frame_idx: *frame_idx,
+                    strength: *strength,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The replace_person masked control clip ([`Conditioning::ControlClip`]), if present. The first
+    /// one wins (a request carries at most one person edit per generation).
+    pub fn control_clip(&self) -> Option<ControlClipRef<'_>> {
+        self.conditioning.iter().find_map(|c| match c {
+            Conditioning::ControlClip {
+                frames,
+                mask,
+                masking_strength,
+                start_frame,
+                mode,
+            } => Some(ControlClipRef {
+                frames,
+                mask,
+                masking_strength: *masking_strength,
+                start_frame: *start_frame,
+                mode: *mode,
+            }),
+            _ => None,
+        })
+    }
+}
+
 /// Seed when a [`GenerationRequest`] omits one: nanos since the epoch (any nonzero value works —
 /// this only sets which sample is drawn; a caller wanting reproducibility passes `req.seed`).
 /// Shared by every generator (F-006).
@@ -139,8 +229,14 @@ pub fn default_seed() -> u64 {
 }
 
 /// Typed conditioning inputs. Each image family uses the subset its `Capabilities` advertises.
-/// (A `VideoClip { clips: Vec<(MediaRef, f32)> }` variant is a known additive extension for the
-/// video port — extend/bridge/replace-person — and does not exist yet.)
+///
+/// The video families ([`Conditioning::Keyframe`] / [`Conditioning::VideoClip`] /
+/// [`Conditioning::ControlClip`]) are the epic-3040 advanced-mode inputs and map onto the two LTX
+/// conditioning mechanisms (see `docs/SPIKE_ADVANCED_VIDEO_3040.md`): a [`Keyframe`](Conditioning::Keyframe)
+/// is **replace-latent** (overwrite the target latent at a frame index — first_last_frame); a
+/// [`VideoClip`](Conditioning::VideoClip) / [`ControlClip`](Conditioning::ControlClip) is
+/// **keyframe-append** (append the clip's VAE latents as extra in-context tokens — extend_clip /
+/// video_bridge / replace_person, the IC-LoRA path).
 #[derive(Clone, Debug)]
 pub enum Conditioning {
     /// img2img / IP-Adapter / identity reference.
@@ -159,6 +255,71 @@ pub enum Conditioning {
     Depth { image: Image },
     /// FIBO-Edit / inpaint mask.
     Mask { image: Image },
+    /// A keyframe pinned at a specific output **latent** frame index (first_last_frame / general
+    /// multi-keyframe). VAE-encoded and its tokens **overwrite** the target latent at `frame_idx`
+    /// with denoise mask `1 − strength` (the replace-latent mechanism — reference
+    /// `VideoConditionByLatentIndex`). `strength = 1.0` fully pins the frame. first_last_frame is two
+    /// of these (at `0` and the last latent frame).
+    Keyframe {
+        image: Image,
+        frame_idx: i32,
+        strength: f32,
+    },
+    /// An in-context conditioning **clip** (extend_clip / video_bridge — the LTX IC-LoRA path). The
+    /// frames are VAE-encoded and **appended** as extra tokens at `frame_idx` (RoPE-offset on the
+    /// frame axis) with denoise mask `1 − strength` (reference `VideoConditionByKeyframeIndex`).
+    /// extend_clip = one clip at `frame_idx 0`; video_bridge = a left clip at `0` and a right clip at
+    /// the tail.
+    VideoClip {
+        frames: Vec<Image>,
+        frame_idx: i32,
+        strength: f32,
+    },
+    /// A masked control clip for replace_person. `frames` is the (host-built, person-region
+    /// neutralized) control clip; `mask` is the per-frame binary person mask (white = regenerate).
+    /// Drives the keyframe-append in-context conditioning **plus** mask injection (force the masked
+    /// region toward the re-noised source for the first `ceil(steps · masking_strength)` steps —
+    /// reference `prepare_mask_injection`). Person detect/track stays in onnx and supplies these.
+    ControlClip {
+        frames: Vec<Image>,
+        mask: Vec<Image>,
+        masking_strength: f32,
+        /// Output latent-frame the control clip aligns to (reference `masking_source.start_frame`).
+        start_frame: i32,
+        /// Replacement granularity (reference `replacement_mode`); the LTX mask path is region-driven
+        /// so it is carried for the worker contract / WanVACE parity rather than changing the mask math.
+        mode: ReplacementMode,
+    },
+}
+
+impl Conditioning {
+    /// The [`ConditioningKind`] discriminant — for capability checks / `validate()`. Centralized here
+    /// so adding a [`Conditioning`] variant updates every model's validation in one place.
+    pub fn kind(&self) -> ConditioningKind {
+        match self {
+            Conditioning::Reference { .. } => ConditioningKind::Reference,
+            Conditioning::MultiReference { .. } => ConditioningKind::MultiReference,
+            Conditioning::ReduxRefs { .. } => ConditioningKind::ReduxRefs,
+            Conditioning::Control { .. } => ConditioningKind::Control,
+            Conditioning::Depth { .. } => ConditioningKind::Depth,
+            Conditioning::Mask { .. } => ConditioningKind::Mask,
+            Conditioning::Keyframe { .. } => ConditioningKind::Keyframe,
+            Conditioning::VideoClip { .. } => ConditioningKind::VideoClip,
+            Conditioning::ControlClip { .. } => ConditioningKind::ControlClip,
+        }
+    }
+}
+
+/// Granularity of a replace_person edit (reference `replacement_mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplacementMode {
+    /// Replace the face region only.
+    #[default]
+    FaceOnly,
+    /// Replace the full person but keep the original outfit.
+    FullPersonKeepOutfit,
+    /// Replace the full person including the outfit.
+    FullPersonReplaceOutfit,
 }
 
 /// The control signal carried by [`Conditioning::Control`].
@@ -179,6 +340,12 @@ pub enum ConditioningKind {
     Control,
     Depth,
     Mask,
+    /// first_last_frame / multi-keyframe ([`Conditioning::Keyframe`]).
+    Keyframe,
+    /// extend_clip / video_bridge ([`Conditioning::VideoClip`]).
+    VideoClip,
+    /// replace_person ([`Conditioning::ControlClip`]).
+    ControlClip,
 }
 
 /// What kind of media a model emits.
@@ -225,5 +392,101 @@ impl Capabilities {
     /// Whether this model accepts the given conditioning kind.
     pub fn accepts(&self, kind: ConditioningKind) -> bool {
         self.conditioning.contains(&kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(w: u32, h: u32) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        }
+    }
+
+    #[test]
+    fn keyframes_accessor_collects_in_order() {
+        // first_last_frame: two keyframes at 0 and the last latent frame.
+        let req = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Keyframe {
+                    image: img(2, 2),
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
+                Conditioning::Reference {
+                    image: img(2, 2),
+                    strength: None,
+                },
+                Conditioning::Keyframe {
+                    image: img(4, 4),
+                    frame_idx: 8,
+                    strength: 0.75,
+                },
+            ],
+            ..Default::default()
+        };
+        let kf = req.keyframes();
+        assert_eq!(kf.len(), 2);
+        assert_eq!((kf[0].frame_idx, kf[0].strength), (0, 1.0));
+        assert_eq!((kf[1].frame_idx, kf[1].strength), (8, 0.75));
+        assert_eq!((kf[1].image.width, kf[1].image.height), (4, 4));
+        // Reference is not a keyframe and is not a video clip / control clip.
+        assert!(req.video_clips().is_empty());
+        assert!(req.control_clip().is_none());
+    }
+
+    #[test]
+    fn video_clips_accessor_collects_clips() {
+        // video_bridge: left clip @0, right clip @tail.
+        let req = GenerationRequest {
+            conditioning: vec![
+                Conditioning::VideoClip {
+                    frames: vec![img(2, 2), img(2, 2)],
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
+                Conditioning::VideoClip {
+                    frames: vec![img(2, 2)],
+                    frame_idx: 24,
+                    strength: 0.9,
+                },
+            ],
+            ..Default::default()
+        };
+        let clips = req.video_clips();
+        assert_eq!(clips.len(), 2);
+        assert_eq!((clips[0].frames.len(), clips[0].frame_idx), (2, 0));
+        assert_eq!((clips[1].frames.len(), clips[1].frame_idx), (1, 24));
+        assert!(req.keyframes().is_empty());
+    }
+
+    #[test]
+    fn control_clip_accessor_returns_first() {
+        let req = GenerationRequest {
+            conditioning: vec![Conditioning::ControlClip {
+                frames: vec![img(2, 2), img(2, 2)],
+                mask: vec![img(2, 2), img(2, 2)],
+                masking_strength: 0.8,
+                start_frame: 0,
+                mode: ReplacementMode::FaceOnly,
+            }],
+            ..Default::default()
+        };
+        let cc = req.control_clip().expect("control clip present");
+        assert_eq!((cc.frames.len(), cc.mask.len()), (2, 2));
+        assert_eq!(cc.masking_strength, 0.8);
+        assert_eq!(cc.mode, ReplacementMode::FaceOnly);
+    }
+
+    #[test]
+    fn accessors_empty_by_default() {
+        let req = GenerationRequest::default();
+        assert!(req.keyframes().is_empty());
+        assert!(req.video_clips().is_empty());
+        assert!(req.control_clip().is_none());
     }
 }

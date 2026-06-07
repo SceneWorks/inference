@@ -564,15 +564,7 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
 }
 
 fn conditioning_kind(c: &mlx_gen::Conditioning) -> mlx_gen::ConditioningKind {
-    use mlx_gen::{Conditioning as C, ConditioningKind as K};
-    match c {
-        C::Reference { .. } => K::Reference,
-        C::MultiReference { .. } => K::MultiReference,
-        C::ReduxRefs { .. } => K::ReduxRefs,
-        C::Control { .. } => K::Control,
-        C::Depth { .. } => K::Depth,
-        C::Mask { .. } => K::Mask,
-    }
+    c.kind()
 }
 
 inventory::submit! {
