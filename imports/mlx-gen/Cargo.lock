@@ -586,6 +586,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-instantid"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-face",
+ "mlx-gen-sdxl",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-ltx"
 version = "0.0.0"
 dependencies = [
@@ -594,6 +605,17 @@ dependencies = [
  "mlx-gen",
  "pmetal-mlx-rs",
  "serde_json",
+]
+
+[[package]]
+name = "mlx-gen-pulid"
+version = "0.0.0"
+dependencies = [
+ "inventory",
+ "mlx-gen",
+ "mlx-gen-face",
+ "mlx-gen-flux",
+ "pmetal-mlx-rs",
 ]
 
 [[package]]
