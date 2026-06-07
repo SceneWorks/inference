@@ -6,6 +6,8 @@
 //!   2. **id injection changes the output** (id_weight=1 ≠ plain).
 //!   3. **identity preservation** — ArcFace cosine(generated face, reference face); the sc-2012 / sc-3074
 //!      baseline is ≈0.80 at full quality (printed; asserted softly to stay robust at low step counts).
+//!   4. **real-CFG (sc-3075)** — true_cfg>1 + a negative prompt engages the dual-forward branch and
+//!      changes the render vs fake-CFG.
 //!
 //! Inputs resolve from local caches (FLUX HF cache, guozinan/PuLID, tools/golden for EVA + face).
 //! Run:
@@ -204,5 +206,38 @@ fn pulid_flux_end_to_end() {
         assert!(cos > 0.3, "identity not transferred (cosine {cos:.4})");
     } else {
         println!("WARNING: no face detected in the generated image (low-step render?) — identity cosine skipped");
+    }
+
+    // (4) sc-3075: real-CFG (true_cfg>1) + negative prompt engages the dual-forward branch and
+    // changes the render vs the fake-CFG (true_cfg=1.0) id1 result.
+    let mut cfg_req = req_with(&face_img, prompt, 1.0, steps, size);
+    cfg_req.true_cfg = Some(2.0);
+    cfg_req.negative_prompt = Some("low quality, blurry, deformed, disfigured".into());
+    let cfg = first_image(model.generate(&cfg_req, &mut |_| {}).unwrap());
+    let cfg_changed = cfg
+        .pixels
+        .iter()
+        .zip(&id1.pixels)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!(
+        "true_cfg=2.0 changed {}/{} px vs fake-CFG ({:.1}%)",
+        cfg_changed,
+        cfg.pixels.len(),
+        cfg_changed as f32 / cfg.pixels.len() as f32 * 100.0
+    );
+    assert!(
+        cfg_changed > cfg.pixels.len() / 100,
+        "true_cfg>1 should change the render vs fake-CFG (real-CFG branch inactive?)"
+    );
+    if let Some(gf) = face
+        .analyze(&cfg.pixels, cfg.height as usize, cfg.width as usize)
+        .unwrap()
+        .first()
+    {
+        println!(
+            "true_cfg=2.0 IDENTITY ArcFace cosine = {:.4}",
+            cosine(&gf.embedding, &ref_emb)
+        );
     }
 }

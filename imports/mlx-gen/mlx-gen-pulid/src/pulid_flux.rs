@@ -38,6 +38,9 @@ use crate::idformer::{IdFormer, IdFormerConfig};
 /// FLUX.1-dev DiT block counts (the PuLID injection schedule is defined over these).
 const NUM_DOUBLE_BLOCKS: usize = 19;
 const NUM_SINGLE_BLOCKS: usize = 38;
+/// Step from which the real-CFG (and uncond-id) branch engages. Upstream default is 1 (photoreal
+/// uses 4); kept as the upstream default here — wire to a request knob once core grows one.
+const DEFAULT_TIMESTEP_TO_START_CFG: usize = 1;
 
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
@@ -119,6 +122,16 @@ impl PulidFlux {
         self.idformer.forward(&id_cond, &eva_out.hidden)
     }
 
+    /// The unconditional id_embedding — IDFormer over **zeroed** id_cond + zeroed hidden states (the
+    /// PuLID `get_id_embedding(cal_uncond=True)` path), injected on the negative real-CFG branch.
+    pub fn compute_uncond_id_embedding(&self) -> Result<Array> {
+        let id_cond = Array::from_slice(&vec![0f32; 1280], &[1, 1280]);
+        let hidden: Vec<Array> = (0..5)
+            .map(|_| Array::from_slice(&vec![0f32; 577 * 1024], &[1, 577, 1024]))
+            .collect();
+        self.idformer.forward(&id_cond, &hidden)
+    }
+
     fn eva_image_size(&self) -> i32 {
         EvaConfig::default().image_size
     }
@@ -163,20 +176,44 @@ impl Generator for PulidFlux {
         let (image, id_weight) = self.reference_face(req)?;
         let id_embedding =
             self.compute_id_embedding(&image.pixels, image.height as usize, image.width as usize)?;
-        let ca = PulidCa::from_weights(
-            &self.pulid,
-            "pulid_ca",
-            id_embedding,
-            id_weight,
-            NUM_DOUBLE_BLOCKS,
-            NUM_SINGLE_BLOCKS,
-        )?;
-        // The reference face is consumed into the injector; hand the FLUX backbone a plain txt2img
-        // request (it rejects conditioning variants it doesn't itself implement).
+        let mk_ca = |emb: Array| {
+            PulidCa::from_weights(
+                &self.pulid,
+                "pulid_ca",
+                emb,
+                id_weight,
+                NUM_DOUBLE_BLOCKS,
+                NUM_SINGLE_BLOCKS,
+            )
+        };
+        // The reference face is consumed into the injector; hand the FLUX backbone a plain request
+        // (it rejects conditioning + negative_prompt it doesn't itself implement — both are handled
+        // here / passed to the CFG denoise directly).
         let mut flux_req = req.clone();
         flux_req.conditioning = Vec::new();
-        self.flux
-            .generate_with_injector(&flux_req, Some(&ca), on_progress)
+        flux_req.negative_prompt = None;
+        flux_req.true_cfg = None; // PuLID drives real-CFG itself; the backbone forbids it
+
+        let true_cfg = req.true_cfg.unwrap_or(1.0);
+        if true_cfg > 1.0 + 1e-3 {
+            // Real-CFG (sc-3075): positive (id) + negative (uncond id) branches + a negative prompt.
+            let pos = mk_ca(id_embedding)?;
+            let neg = mk_ca(self.compute_uncond_id_embedding()?)?;
+            let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
+            self.flux.generate_with_injector_cfg(
+                &flux_req,
+                &pos,
+                &neg,
+                neg_prompt,
+                true_cfg,
+                DEFAULT_TIMESTEP_TO_START_CFG,
+                on_progress,
+            )
+        } else {
+            // Fake-CFG (true_cfg = 1.0): single forward (sc-3074), bit-identical to that path.
+            self.flux
+                .generate_with_injector(&flux_req, Some(&mk_ca(id_embedding)?), on_progress)
+        }
     }
 }
 
