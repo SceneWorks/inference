@@ -11,3 +11,4 @@
 //! (epic 3079) — no Python/onnx sidecar.
 
 pub mod eva_clip;
+pub mod idformer;
