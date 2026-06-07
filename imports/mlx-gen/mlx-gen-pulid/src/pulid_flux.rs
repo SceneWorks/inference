@@ -38,8 +38,9 @@ use crate::idformer::{IdFormer, IdFormerConfig};
 /// FLUX.1-dev DiT block counts (the PuLID injection schedule is defined over these).
 const NUM_DOUBLE_BLOCKS: usize = 19;
 const NUM_SINGLE_BLOCKS: usize = 38;
-/// Step from which the real-CFG (and uncond-id) branch engages. Upstream default is 1 (photoreal
-/// uses 4); kept as the upstream default here — wire to a request knob once core grows one.
+/// Default step from which the real-CFG (and uncond-id) branch engages when the request leaves
+/// `timestep_to_start_cfg` unset — the upstream PuLID default (the photoreal preset overrides to 4
+/// via `req.timestep_to_start_cfg`).
 const DEFAULT_TIMESTEP_TO_START_CFG: usize = 1;
 
 pub fn descriptor() -> ModelDescriptor {
@@ -200,13 +201,17 @@ impl Generator for PulidFlux {
             let pos = mk_ca(id_embedding)?;
             let neg = mk_ca(self.compute_uncond_id_embedding()?)?;
             let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
+            let start_cfg = req
+                .timestep_to_start_cfg
+                .map(|v| v as usize)
+                .unwrap_or(DEFAULT_TIMESTEP_TO_START_CFG);
             self.flux.generate_with_injector_cfg(
                 &flux_req,
                 &pos,
                 &neg,
                 neg_prompt,
                 true_cfg,
-                DEFAULT_TIMESTEP_TO_START_CFG,
+                start_cfg,
                 on_progress,
             )
         } else {
