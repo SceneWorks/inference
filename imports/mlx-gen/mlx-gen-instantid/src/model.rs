@@ -58,6 +58,7 @@ pub struct InstantIdPaths {
 }
 
 /// One InstantID generation request.
+#[derive(Clone)]
 pub struct InstantIdRequest {
     pub prompt: String,
     pub negative: String,
@@ -187,6 +188,36 @@ impl InstantId {
         let face = self.largest_face(&canvas.pixels, req.height as usize, req.width as usize)?;
         let kps: Vec<(f32, f32)> = face.kps.iter().map(|p| (p[0], p[1])).collect();
         self.generate_with(req, &face.embedding, &kps)
+    }
+
+    /// **Multi-view angle generation** (sc-3117): rotate the reference identity to a named view from
+    /// the canonical [`kps::VIEW_ANGLE_KPS`] pack. The reference supplies *identity* (its ArcFace
+    /// embedding); the pack supplies the IdentityNet *pose* (the view-angle landmarks). The canvas is
+    /// **square** (`req.width` is the side; the pack kps are normalized to a square — the sc-2009
+    /// kps-distortion rule). `req.height` is ignored (forced to the side). Requires
+    /// [`with_face`](Self::with_face); errors on an unknown `view_angle`.
+    pub fn generate_angle(
+        &self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        view_angle: &str,
+    ) -> Result<Image> {
+        let side = req.width;
+        let view = kps::view_angle_kps(view_angle, side).ok_or_else(|| {
+            Error::Msg(format!(
+                "instantid: unknown view angle {view_angle:?} (see VIEW_ANGLE_KPS)"
+            ))
+        })?;
+        // Identity from the reference (letterboxed to the square canvas).
+        let canvas = kps::letterbox(reference, side, side);
+        let face = self.largest_face(&canvas.pixels, side as usize, side as usize)?;
+        let kps: Vec<(f32, f32)> = view.to_vec();
+        let sq = InstantIdRequest {
+            width: side,
+            height: side,
+            ..req.clone()
+        };
+        self.generate_with(&sq, &face.embedding, &kps)
     }
 
     /// Core generate from a precomputed ArcFace `embedding` (512-d) and 5 `kps` (output-canvas pixel
