@@ -540,6 +540,7 @@ impl SvdUnet {
         let x = conv2d(&silu(&x)?, &self.conv_out.0, Some(&self.conv_out.1), 1, 1)?;
         let os = x.shape();
         // Back to f32 so the CFG combine + EDM step math in the pipeline run in full precision.
-        Ok(x.reshape(&[b, f, os[1], os[2], os[3]])?.as_dtype(Dtype::Float32)?)
+        Ok(x.reshape(&[b, f, os[1], os[2], os[3]])?
+            .as_dtype(Dtype::Float32)?)
     }
 }
