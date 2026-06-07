@@ -31,8 +31,9 @@ pub mod weights;
 
 pub use error::{Error, Result};
 pub use generator::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, ControlKind, GenerationOutput,
-    GenerationRequest, Generator, Modality, ModelDescriptor,
+    default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
+    GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
+    ReplacementMode, VideoClipRef,
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{load, load_transform, ModelRegistration, TransformRegistration};

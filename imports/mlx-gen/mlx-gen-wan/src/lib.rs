@@ -71,9 +71,9 @@ pub use model::{
     MODEL_ID_I2V_14B, MODEL_ID_T2V_14B,
 };
 pub use pipeline::{
-    best_output_size, build_i2v_y, build_ti2v_mask, decode_to_frames, decode_to_frames_22, denoise,
-    denoise_moe, denoise_ti2v, frames_to_images, preprocess_i2v_image, preprocess_ti2v_image,
-    ti2v_blend_init, Expert,
+    best_output_size, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask, build_ti2v_multi_mask,
+    decode_to_frames, decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images,
+    preprocess_i2v_image, preprocess_ti2v_image, ti2v_blend_init, Expert,
 };
 pub use rope::{rope_apply, RopeTable};
 pub use scheduler::{

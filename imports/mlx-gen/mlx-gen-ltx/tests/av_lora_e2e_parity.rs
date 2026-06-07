@@ -147,7 +147,7 @@ fn av_lora_e2e_matches_reference() {
         g.require("audio_ctx").unwrap(),
         mean,
         std,
-        None,
+        &[],
         &mut |_| steps += 1,
     )
     .expect("generate_av_latents");

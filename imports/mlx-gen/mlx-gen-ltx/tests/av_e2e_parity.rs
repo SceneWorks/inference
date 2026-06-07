@@ -114,7 +114,7 @@ fn av_e2e_matches_reference() {
         g.require("audio_ctx").unwrap(),
         mean,
         std,
-        None, // T2V+A (no I2V conditioning in this gate)
+        &[], // T2V+A (no replace-latent conditioning in this gate)
         &mut |_| steps += 1,
     )
     .expect("generate_av_latents");
