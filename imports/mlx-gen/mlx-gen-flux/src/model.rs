@@ -37,6 +37,13 @@ pub fn load_dev(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 fn load_variant(variant: FluxVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(load_flux1(variant, spec)?))
+}
+
+/// Load a fully-weighted [`Flux1`] (the concrete type, not boxed) — the entry point the PuLID-FLUX
+/// provider (`mlx-gen-pulid`, sc-3074) wraps so it can drive the denoise through
+/// [`Flux1::generate_with_injector`].
+pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{}: only dense bf16 is wired for the FLUX.1 port plan",
@@ -73,7 +80,7 @@ fn load_variant(variant: FluxVariant, spec: &LoadSpec) -> Result<Box<dyn Generat
     // non-empty spec list that matches nothing — or any unmatched target — errors loudly (sc-2534).
     crate::adapters::apply_flux_adapters(&mut transformer, &spec.adapters)?;
 
-    Ok(Box::new(Flux1 {
+    Ok(Flux1 {
         descriptor: descriptor_for(variant),
         variant,
         t5_tokenizer: Some(t5_tokenizer),
@@ -81,7 +88,7 @@ fn load_variant(variant: FluxVariant, spec: &LoadSpec) -> Result<Box<dyn Generat
         text_encoders: Some(text_encoders),
         transformer: Some(transformer),
         vae: Some(vae),
-    }))
+    })
 }
 
 pub struct Flux1 {
@@ -164,6 +171,20 @@ impl Generator for Flux1 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        self.generate_with_injector(req, None, on_progress)
+    }
+}
+
+impl Flux1 {
+    /// As [`Generator::generate`], but threading an optional per-block image-stream residual
+    /// injector (the PuLID id cross-attn, sc-3072/3074) into every denoise step's transformer
+    /// forward. `injector = None` is byte-identical to [`Generator::generate`] (it IS that path).
+    pub fn generate_with_injector(
+        &self,
+        req: &GenerationRequest,
+        injector: Option<&dyn crate::transformer::DitImageInjector>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let transformer = self.transformer()?;
         let vae = self.vae()?;
@@ -217,7 +238,7 @@ impl Generator for Flux1 {
                     return Err(Error::Msg("generation cancelled".into()));
                 }
                 let x_in = sampler.scale_model_input(&latents, t)?;
-                let velocity = transformer.forward(
+                let velocity = transformer.forward_injected(
                     &x_in,
                     &prompt_embeds,
                     &pooled_prompt_embeds,
@@ -225,6 +246,7 @@ impl Generator for Flux1 {
                     guidance,
                     req.width,
                     req.height,
+                    injector,
                 )?;
                 latents = sampler.step(&velocity, &latents, t)?;
                 on_progress(Progress::Step {
