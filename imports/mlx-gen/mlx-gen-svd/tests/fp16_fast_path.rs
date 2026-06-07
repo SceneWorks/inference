@@ -103,5 +103,8 @@ fn fp16_image_encoder_within_f32_floor() {
 
     let rel = rel_l2(&e16, &e32);
     println!("fp16 image-encoder vs f32: rel-L2 {rel}");
-    assert!(rel < 0.02, "fp16 encoder rel-L2 {rel} exceeds the fp16 floor");
+    assert!(
+        rel < 0.02,
+        "fp16 encoder rel-L2 {rel} exceeds the fp16 floor"
+    );
 }

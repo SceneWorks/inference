@@ -143,8 +143,7 @@ fn resize_horizontal(inp: &[f32], h: usize, in_w: usize, out_w: usize) -> Vec<f3
             for (o, (base, w)) in coeffs.iter().enumerate() {
                 let mut acc = 0.0f32;
                 for (m, &wm) in w.iter().enumerate() {
-                    let idx =
-                        (base - 1 + m as isize).clamp(0, in_w as isize - 1) as usize;
+                    let idx = (base - 1 + m as isize).clamp(0, in_w as isize - 1) as usize;
                     acc += wm * inp[in_row + idx];
                 }
                 out[out_row + o] = acc;
