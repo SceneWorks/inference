@@ -41,16 +41,16 @@ fn conv3d_weight(w: &Array) -> Result<Array> {
     Ok(w.transpose_axes(&[0, 2, 3, 4, 1])?)
 }
 
-/// Load a conv2d as `(NHWC weight, bias)`.
-fn load_conv2d(w: &Weights, name: &str) -> Result<(Array, Array)> {
+/// Load a conv2d as `(NHWC weight, bias)`. Shared with the UNet (sc-3374).
+pub(crate) fn load_conv2d(w: &Weights, name: &str) -> Result<(Array, Array)> {
     Ok((
         conv2d_weight(w.require(&format!("{name}.weight"))?)?,
         w.require(&format!("{name}.bias"))?.clone(),
     ))
 }
 
-/// Load a conv3d as `(NDHWC weight, bias)`.
-fn load_conv3d(w: &Weights, name: &str) -> Result<(Array, Array)> {
+/// Load a conv3d as `(NDHWC weight, bias)`. Shared with the UNet (sc-3374).
+pub(crate) fn load_conv3d(w: &Weights, name: &str) -> Result<(Array, Array)> {
     Ok((
         conv3d_weight(w.require(&format!("{name}.weight"))?)?,
         w.require(&format!("{name}.bias"))?.clone(),
