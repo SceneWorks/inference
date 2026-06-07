@@ -1,5 +1,6 @@
 //! FLUX.1 provider registration and txt2img generation path.
 
+use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
@@ -8,6 +9,7 @@ use mlx_gen::{
     WeightsSource,
 };
 use mlx_gen_z_image::vae::Vae;
+use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::Dtype;
 
 use crate::config::{FluxVariant, DEFAULT_SAMPLER, HYPER_SAMPLER};
@@ -255,6 +257,96 @@ impl Flux1 {
                 });
             }
 
+            on_progress(Progress::Decoding);
+            let unpacked = unpack_latents(&latents, req.width, req.height)?;
+            let decoded = vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+            images.push(decoded_to_image(&decoded)?);
+        }
+        Ok(GenerationOutput::Images(images))
+    }
+
+    /// Dual-branch real-CFG denoise — the seam PuLID-FLUX `true_cfg > 1.0` (sc-3075) uses. Each step
+    /// runs a positive forward (`req.prompt` + `pos_injector`) and, once `t >= timestep_to_start_cfg`,
+    /// a negative forward (`neg_prompt` + `neg_injector`), combined as `neg + true_cfg·(pos − neg)`.
+    /// The distilled `guidance` is still applied on both branches (the upstream PuLID recipe). The
+    /// injectors are generic, so this carries no PuLID-specific code; with two no-op injectors it
+    /// reduces to classifier-free guidance between two prompts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_injector_cfg(
+        &self,
+        req: &GenerationRequest,
+        pos_injector: &dyn crate::transformer::DitImageInjector,
+        neg_injector: &dyn crate::transformer::DitImageInjector,
+        neg_prompt: &str,
+        true_cfg: f32,
+        timestep_to_start_cfg: usize,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        let transformer = self.transformer()?;
+        let vae = self.vae()?;
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let sampler_name = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
+        let (def_steps, def_guidance) = profile_defaults(self.variant, sampler_name);
+        let steps = req.steps.unwrap_or(def_steps) as usize;
+        let guidance = if self.variant.supports_guidance() {
+            req.guidance.unwrap_or(def_guidance)
+        } else {
+            0.0
+        };
+        let (pos_embeds, pos_pooled) = self.encode_prompt(&req.prompt)?;
+        let (neg_embeds, neg_pooled) = self.encode_prompt(neg_prompt)?;
+        let sigmas = build_linear_sigmas(
+            steps,
+            req.width,
+            req.height,
+            self.variant.requires_sigma_shift(),
+        )?;
+        let sampler = FlowMatchSampler::new(sigmas);
+        let n_steps = sampler.num_steps();
+        crate::transformer::set_compile_glue(true);
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        for i in 0..req.count {
+            let seed = base_seed.wrapping_add(i as u64);
+            let mut latents = create_noise(seed, req.width, req.height)?;
+            for t in 0..n_steps {
+                if req.cancel.is_cancelled() {
+                    return Err(Error::Msg("generation cancelled".into()));
+                }
+                let x_in = sampler.scale_model_input(&latents, t)?;
+                let pos = transformer.forward_injected(
+                    &x_in,
+                    &pos_embeds,
+                    &pos_pooled,
+                    sampler.timestep(t),
+                    guidance,
+                    req.width,
+                    req.height,
+                    Some(pos_injector),
+                )?;
+                let velocity = if t >= timestep_to_start_cfg {
+                    let neg = transformer.forward_injected(
+                        &x_in,
+                        &neg_embeds,
+                        &neg_pooled,
+                        sampler.timestep(t),
+                        guidance,
+                        req.width,
+                        req.height,
+                        Some(neg_injector),
+                    )?;
+                    // neg + true_cfg · (pos − neg)
+                    add(&neg, &multiply(&subtract(&pos, &neg)?, scalar(true_cfg))?)?
+                } else {
+                    pos
+                };
+                latents = sampler.step(&velocity, &latents, t)?;
+                on_progress(Progress::Step {
+                    current: t as u32 + 1,
+                    total: n_steps as u32,
+                });
+            }
             on_progress(Progress::Decoding);
             let unpacked = unpack_latents(&latents, req.width, req.height)?;
             let decoded = vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
