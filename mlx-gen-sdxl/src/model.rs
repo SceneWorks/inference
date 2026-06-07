@@ -673,14 +673,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         }
     }
     for c in &req.conditioning {
-        let kind = match c {
-            Conditioning::Reference { .. } => ConditioningKind::Reference,
-            Conditioning::MultiReference { .. } => ConditioningKind::MultiReference,
-            Conditioning::ReduxRefs { .. } => ConditioningKind::ReduxRefs,
-            Conditioning::Control { .. } => ConditioningKind::Control,
-            Conditioning::Depth { .. } => ConditioningKind::Depth,
-            Conditioning::Mask { .. } => ConditioningKind::Mask,
-        };
+        let kind = c.kind();
         if !caps.accepts(kind) {
             return Err(Error::Msg(format!(
                 "sdxl does not accept {kind:?} conditioning"

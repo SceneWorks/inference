@@ -23,13 +23,14 @@ use mlx_gen::{
     MoeExpert, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::random;
+use mlx_rs::Array;
 
 use crate::adapters::merge_wan_adapters;
 use crate::config::{GuideScale, WanModelConfig};
 use crate::pipeline::{
-    align_dim, best_output_size, build_i2v_y, build_ti2v_mask, decode_to_frames,
-    decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images, latent_shape,
-    preprocess_ti2v_image, ti2v_blend_init, Expert,
+    align_dim, best_output_size, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
+    build_ti2v_multi_mask, decode_to_frames, decode_to_frames_22, denoise, denoise_moe,
+    denoise_ti2v, frames_to_images, latent_shape, preprocess_ti2v_image, ti2v_blend_init, Expert,
 };
 use crate::scheduler::SolverKind;
 use crate::text_encoder::{load_tokenizer, Umt5Encoder};
@@ -48,11 +49,13 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Video,
         capabilities: Capabilities {
             // 5B uses real CFG (guide 5.0) with the Chinese anti-artifact negative prompt, and
-            // accepts a single image as the TI2V mask-blend conditioning reference.
+            // accepts a single image as the TI2V mask-blend conditioning reference. Keyframe =
+            // Wan-native first_last_frame / multi-keyframe (epic 3040, sc-3357) via the same
+            // mask-blend, pinning the listed latent frames instead of only frame 0.
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            conditioning: vec![ConditioningKind::Reference],
+            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Keyframe],
             // Q4/Q8 (sc-2682) loads via `spec.quantize` (transformer-only); LoRA/LoKr merge onto the
             // single dense model at generate time (the reference `_loras_single` path — shared
             // untagged specs only, reusing the sc-2683/sc-2393 `merge_wan_adapters` seam).
@@ -277,24 +280,59 @@ impl Generator for Wan {
         // A `Reference` image → z48-VAE-encode to `z_img [z,1,h,w]`, build the first-frame mask
         // (`[z,T,h,w]`, 0 at frame 0) + per-token mask (`[1,L]`), and blend `(1−mask)·z_img +
         // mask·noise`. Without an image this is pure-noise T2V.
-        let (latents_init, ti2v) = match i2v_reference(req) {
-            Some(image) => {
-                let img_thwc = preprocess_ti2v_image(image, width, height)?; // [1,1,H,W,3]
-                let z_img = {
-                    let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-                    let vae = Wan22Vae::from_weights(&w)?;
-                    let z = vae.encode(&img_thwc)?; // [1,1,h,w,z]
-                                                    // [1,1,h,w,z] → [1,h,w,z] → [z,1,h,w] (channels-first, the latent convention).
-                    z.reshape(&z.shape()[1..])?.transpose_axes(&[3, 0, 1, 2])?
+        // Channels-first `[z,1,h,w]` latent for one preprocessed TI2V image (z48-VAE-encode → reshape).
+        let encode_kf = |vae: &Wan22Vae, image: &Image| -> Result<Array> {
+            let img_thwc = preprocess_ti2v_image(image, width, height)?; // [1,1,H,W,3]
+            let z = vae.encode(&img_thwc)?; // [1,1,h,w,z]
+            Ok(z.reshape(&z.shape()[1..])?.transpose_axes(&[3, 0, 1, 2])?) // [z,1,h,w]
+        };
+        let (t_lat, h_lat, w_lat) = (lat[1] as usize, lat[2] as usize, lat[3] as usize);
+        let keyframes = req.keyframes();
+        let (latents_init, ti2v) = if !keyframes.is_empty() {
+            // Wan-native first_last_frame / multi-keyframe (sc-3357): pin each Keyframe's latent frame
+            // via the mask-blend (frame_idx is a latent index, negative-from-end → `-1` = last frame).
+            let w = Weights::from_file(self.root.join("vae.safetensors"))?;
+            let vae = Wan22Vae::from_weights(&w)?;
+            let mut frames: Vec<(Array, usize)> = Vec::with_capacity(keyframes.len());
+            let mut indices: Vec<usize> = Vec::with_capacity(keyframes.len());
+            for kf in &keyframes {
+                let idx = if kf.frame_idx < 0 {
+                    t_lat as i32 + kf.frame_idx
+                } else {
+                    kf.frame_idx
                 };
-                let (t_lat, h_lat, w_lat) = (lat[1] as usize, lat[2] as usize, lat[3] as usize);
-                let (mask, mask_tokens) =
-                    build_ti2v_mask(cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
-                let latents = ti2v_blend_init(&z_img, &mask, &init_noise)?;
-                mlx_rs::transforms::eval([&latents, &z_img])?;
-                (latents, Some((z_img, mask, mask_tokens)))
+                if idx < 0 || idx as usize >= t_lat {
+                    return Err(Error::Msg(format!(
+                        "wan2_2_ti2v_5b: keyframe latent frame index {} out of bounds for {t_lat} \
+                         latent frames",
+                        kf.frame_idx
+                    )));
+                }
+                frames.push((encode_kf(&vae, kf.image)?, idx as usize));
+                indices.push(idx as usize);
             }
-            None => (init_noise.clone(), None),
+            let z = build_ti2v_keyframe_z(&frames, cfg.vae_z_dim, t_lat, h_lat, w_lat)?;
+            let (mask, mask_tokens) =
+                build_ti2v_multi_mask(&indices, cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
+            let latents = ti2v_blend_init(&z, &mask, &init_noise)?;
+            mlx_rs::transforms::eval([&latents, &z])?;
+            (latents, Some((z, mask, mask_tokens)))
+        } else {
+            match i2v_reference(req) {
+                Some(image) => {
+                    let z_img = {
+                        let w = Weights::from_file(self.root.join("vae.safetensors"))?;
+                        let vae = Wan22Vae::from_weights(&w)?;
+                        encode_kf(&vae, image)?
+                    };
+                    let (mask, mask_tokens) =
+                        build_ti2v_mask(cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
+                    let latents = ti2v_blend_init(&z_img, &mask, &init_noise)?;
+                    mlx_rs::transforms::eval([&latents, &z_img])?;
+                    (latents, Some((z_img, mask, mask_tokens)))
+                }
+                None => (init_noise.clone(), None),
+            }
         };
 
         // --- Stage 2: load the DiT, merge adapters + quantize, embed contexts, denoise (→ freed) ---
