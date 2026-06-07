@@ -613,6 +613,75 @@ pub fn build_ti2v_mask(
     (mask, mask_tokens)
 }
 
+/// Multi-keyframe generalization of [`build_ti2v_mask`] (epic 3040, Wan-native first_last_frame):
+/// pin the latent temporal frames in `indices` (mask `0.0` there, `1.0` elsewhere) instead of only
+/// frame 0. first_last_frame = `indices = [0, t_lat-1]`. `mask` `[z, T_lat, h, w]` + `mask_tokens`
+/// `[1, L]` (the `hg·wg` tokens of each pinned frame are `0`). Indices must be `< t_lat`; out-of-range
+/// indices are ignored (the caller validates). With `indices = [0]` this is exactly `build_ti2v_mask`.
+pub fn build_ti2v_multi_mask(
+    indices: &[usize],
+    z_dim: usize,
+    t_lat: usize,
+    h_lat: usize,
+    w_lat: usize,
+    patch_size: (usize, usize, usize),
+) -> (Array, Array) {
+    let plane = h_lat * w_lat;
+    let mut mask = vec![1f32; z_dim * t_lat * plane];
+    for c in 0..z_dim {
+        for &t in indices {
+            if t >= t_lat {
+                continue;
+            }
+            let base = (c * t_lat + t) * plane;
+            for p in 0..plane {
+                mask[base + p] = 0.0;
+            }
+        }
+    }
+    let mask = Array::from_slice(
+        &mask,
+        &[z_dim as i32, t_lat as i32, h_lat as i32, w_lat as i32],
+    );
+
+    let (pt, ph, pw) = patch_size;
+    let (tg, hg, wg) = (t_lat / pt, h_lat / ph, w_lat / pw);
+    let mut tok = vec![1f32; tg * hg * wg];
+    for &t in indices {
+        let tg_idx = t / pt;
+        if tg_idx >= tg {
+            continue;
+        }
+        for k in 0..(hg * wg) {
+            tok[tg_idx * hg * wg + k] = 0.0;
+        }
+    }
+    let mask_tokens = Array::from_slice(&tok, &[1, (tg * hg * wg) as i32]);
+    (mask, mask_tokens)
+}
+
+/// Scatter per-keyframe latents into a single `[z, T_lat, h, w]` clean latent for the multi-keyframe
+/// mask-blend (epic 3040): each `(z_k, idx)` (with `z_k` shaped `[z, 1, h, w]`) is placed at temporal
+/// frame `idx`; every other frame is zeros (those frames have mask `1`, so the zero is never read). The
+/// resulting latent feeds [`ti2v_blend_init`] + [`denoise_ti2v`] as the `z_img` per-frame conditioning.
+pub fn build_ti2v_keyframe_z(
+    frames: &[(Array, usize)],
+    z_dim: usize,
+    t_lat: usize,
+    h_lat: usize,
+    w_lat: usize,
+) -> Result<Array> {
+    let zero = Array::zeros::<f32>(&[z_dim as i32, 1, h_lat as i32, w_lat as i32])?;
+    let mut slices: Vec<Array> = (0..t_lat).map(|_| zero.clone()).collect();
+    for (z_k, idx) in frames {
+        if *idx < t_lat {
+            slices[*idx] = z_k.clone();
+        }
+    }
+    let refs: Vec<&Array> = slices.iter().collect();
+    Ok(concatenate_axis(&refs, 1)?)
+}
+
 /// Blend the encoded image latent with the initial noise for the TI2V start: `latents = (1−mask)·
 /// z_img + mask·noise` (port of `generate_wan.py`'s `is_i2v_mask_blend` init). `z_img` is `[z,1,h,w]`
 /// (broadcasts over the noise's `T_lat`), `mask`/`noise` are `[z,T_lat,h,w]`.
@@ -697,6 +766,36 @@ mod tests {
         // Token mask: first (t'=0) token frozen (0), second (t'=1) active (1).
         assert_eq!(tokens.shape(), &[1, 2]);
         assert_eq!(tokens.as_slice::<f32>(), &[0., 1.]);
+    }
+
+    #[test]
+    fn build_ti2v_multi_mask_freezes_first_and_last() {
+        // first_last_frame: z=1, T_lat=3, h=w=2, patch (1,2,2) → grid (3,1,1) → 3 tokens.
+        // Pin frames [0, 2] (first + last). With indices=[0] it must equal build_ti2v_mask.
+        let (mask, tokens) = build_ti2v_multi_mask(&[0, 2], 1, 3, 2, 2, (1, 2, 2));
+        assert_eq!(mask.shape(), &[1, 3, 2, 2]);
+        // temporal 0 → 0 (4), temporal 1 → 1 (4), temporal 2 → 0 (4).
+        assert_eq!(
+            mask.as_slice::<f32>(),
+            &[0., 0., 0., 0., 1., 1., 1., 1., 0., 0., 0., 0.]
+        );
+        // token mask: frame0 + frame2 tokens 0, frame1 token 1.
+        assert_eq!(tokens.as_slice::<f32>(), &[0., 1., 0.]);
+        // Single-index [0] reproduces build_ti2v_mask exactly.
+        let (m1, t1) = build_ti2v_multi_mask(&[0], 2, 2, 2, 2, (1, 2, 2));
+        let (m0, t0) = build_ti2v_mask(2, 2, 2, 2, (1, 2, 2));
+        assert_eq!(m1.as_slice::<f32>(), m0.as_slice::<f32>());
+        assert_eq!(t1.as_slice::<f32>(), t0.as_slice::<f32>());
+    }
+
+    #[test]
+    fn build_ti2v_keyframe_z_scatters_frames() {
+        // z=1, h=w=1, T_lat=3; place A=[7] @0 and B=[9] @2; frame1 = 0.
+        let a = Array::from_slice(&[7.0f32], &[1, 1, 1, 1]);
+        let b = Array::from_slice(&[9.0f32], &[1, 1, 1, 1]);
+        let z = build_ti2v_keyframe_z(&[(a, 0), (b, 2)], 1, 3, 1, 1).unwrap();
+        assert_eq!(z.shape(), &[1, 3, 1, 1]);
+        assert_eq!(z.as_slice::<f32>(), &[7.0, 0.0, 9.0]);
     }
 
     #[test]
