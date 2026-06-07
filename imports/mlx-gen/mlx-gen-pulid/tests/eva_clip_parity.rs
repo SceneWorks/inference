@@ -14,7 +14,10 @@ use mlx_gen::weights::Weights;
 use mlx_gen_pulid::eva_clip::{transform, EvaConfig, EvaVisionTransformer};
 use mlx_rs::Array;
 
-const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/eva_clip_golden.safetensors");
+const GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/eva_clip_golden.safetensors"
+);
 
 fn golden() -> Weights {
     Weights::from_file(GOLDEN).unwrap_or_else(|e| {
@@ -24,16 +27,30 @@ fn golden() -> Weights {
 
 fn slice(a: &Array) -> Vec<f32> {
     let n: i32 = a.shape().iter().product();
-    a.reshape(&[n]).unwrap().as_dtype(mlx_rs::Dtype::Float32).unwrap().as_slice::<f32>().to_vec()
+    a.reshape(&[n])
+        .unwrap()
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec()
 }
 
 /// (peak relative error, mean relative error) of `got` vs reference `want`.
 fn rel_errors(got: &Array, want: &Array) -> (f32, f32) {
     let a = slice(got);
     let b = slice(want);
-    assert_eq!(a.len(), b.len(), "shape mismatch {:?} vs {:?}", got.shape(), want.shape());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "shape mismatch {:?} vs {:?}",
+        got.shape(),
+        want.shape()
+    );
     let peak_ref = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_diff = a.iter().zip(&b).fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
+    let max_diff = a
+        .iter()
+        .zip(&b)
+        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
     let sum_ref: f64 = b.iter().map(|&v| v.abs() as f64).sum();
     let sum_diff: f64 = a.iter().zip(&b).map(|(&x, &y)| (x - y).abs() as f64).sum();
     (max_diff / peak_ref, (sum_diff / sum_ref) as f32)
@@ -56,19 +73,26 @@ fn cosine(got: &Array, want: &Array) -> f32 {
 fn rope_construction_matches_checkpoint() {
     let g = golden();
     let vt = EvaVisionTransformer::from_weights(&g, "w", EvaConfig::default()).unwrap();
-    let (cp, sp) = (rel_errors(vt.rope().cos(), g.require("rope.freqs_cos").unwrap()),
-                    rel_errors(vt.rope().sin(), g.require("rope.freqs_sin").unwrap()));
+    let (cp, sp) = (
+        rel_errors(vt.rope().cos(), g.require("rope.freqs_cos").unwrap()),
+        rel_errors(vt.rope().sin(), g.require("rope.freqs_sin").unwrap()),
+    );
     println!("rope cos peak-rel {:.2e} mean-rel {:.2e}", cp.0, cp.1);
     println!("rope sin peak-rel {:.2e} mean-rel {:.2e}", sp.0, sp.1);
     // absolute closeness (cos/sin in [-1,1]): the f64-host build vs torch f32 buffer differ <1 ULP
     let abs = |a: &Array, b: &Array| {
         let (x, y) = (slice(a), slice(b));
-        x.iter().zip(&y).fold(0f32, |m, (&p, &q)| m.max((p - q).abs()))
+        x.iter()
+            .zip(&y)
+            .fold(0f32, |m, (&p, &q)| m.max((p - q).abs()))
     };
     let ac = abs(vt.rope().cos(), g.require("rope.freqs_cos").unwrap());
     let as_ = abs(vt.rope().sin(), g.require("rope.freqs_sin").unwrap());
     println!("rope cos max|Δ| {ac:.2e}  sin max|Δ| {as_:.2e}");
-    assert!(ac < 1e-5 && as_ < 1e-5, "rope construction diverged: cos {ac:.2e} sin {as_:.2e}");
+    assert!(
+        ac < 1e-5 && as_ < 1e-5,
+        "rope construction diverged: cos {ac:.2e} sin {as_:.2e}"
+    );
 }
 
 #[test]
@@ -124,7 +148,11 @@ fn eva_transform_matches_torchvision() {
 
     // resize-only vs torchvision float bicubic
     let in_h = ffi.shape()[1] as usize;
-    let flat = ffi.as_dtype(mlx_rs::Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
+    let flat = ffi
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap()
+        .reshape(&[-1])
+        .unwrap();
     let src = flat.as_slice::<f32>().to_vec();
     let resized = transform::resize_bicubic_f32(&src, in_h, in_h, size as usize, size as usize);
     let resized = Array::from_slice(&resized, &[1, size, size, 3]);

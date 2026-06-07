@@ -17,8 +17,8 @@ mod patch_embed;
 pub mod rope;
 pub mod transform;
 
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis};
 use mlx_rs::fast::layer_norm;
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis};
 use mlx_rs::Array;
 
 use mlx_gen::nn::linear;
@@ -147,9 +147,12 @@ impl EvaVisionTransformer {
         x = layer_norm(&x, Some(&self.norm_w), Some(&self.norm_b), EPS)?;
         // CLS token → head projection.
         let cls_tok = x
-            .take_axis(&Array::from_slice(&[0i32], &[1]), 1)?
+            .take_axis(Array::from_slice(&[0i32], &[1]), 1)?
             .reshape(&[b, self.cfg.embed_dim])?;
         let id_cond_vit = linear(&cls_tok, &self.head_w, &self.head_b)?;
-        Ok(EvaOutput { id_cond_vit, hidden })
+        Ok(EvaOutput {
+            id_cond_vit,
+            hidden,
+        })
     }
 }

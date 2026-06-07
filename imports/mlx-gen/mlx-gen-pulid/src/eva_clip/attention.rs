@@ -58,7 +58,7 @@ impl Attention {
 
         // subln projections: q/v biased, k unbiased.
         let q = linear(x, &self.q_proj_w, &self.q_bias)?;
-        let k = matmul(x, &self.k_proj_w.t())?;
+        let k = matmul(x, self.k_proj_w.t())?;
         let v = linear(x, &self.v_proj_w, &self.v_bias)?;
 
         // [B, N, C] -> [B, heads, N, hd]
@@ -70,7 +70,9 @@ impl Attention {
         let v = to_heads(&v)?;
 
         let attn = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
-        let out = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, n, h * hd])?;
+        let out = attn
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, n, h * hd])?;
         let out = layer_norm(&out, Some(&self.inner_ln_w), Some(&self.inner_ln_b), EPS)?;
         linear(&out, &self.proj_w, &self.proj_b)
     }

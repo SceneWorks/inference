@@ -32,7 +32,13 @@ impl PatchEmbed {
     pub fn forward(&self, pixel_values: &Array) -> Result<Array> {
         let sh = pixel_values.shape();
         let b = sh[0];
-        let y = conv2d(pixel_values, &self.proj_w, Some(&self.proj_b), self.patch, 0)?; // [B, g, g, embed]
+        let y = conv2d(
+            pixel_values,
+            &self.proj_w,
+            Some(&self.proj_b),
+            self.patch,
+            0,
+        )?; // [B, g, g, embed]
         let g = y.shape()[1];
         Ok(y.reshape(&[b, g * g, self.embed_dim])?)
     }
