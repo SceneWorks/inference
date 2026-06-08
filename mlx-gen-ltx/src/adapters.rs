@@ -29,7 +29,9 @@ use std::collections::BTreeMap;
 
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::loader::{is_lokr, parse_lokr};
+use mlx_gen::adapters::loader::{
+    is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr, parse_lokr_thirdparty,
+};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -223,6 +225,36 @@ fn apply_one_lokr(
     Ok(())
 }
 
+/// Install one third-party LyCORIS file's residuals onto `host` (sc-3671). `reconstruct` produces a
+/// module's `[out,in]` delta (LoKr or LoHa, lycoris per-module scale baked in) from its parsed
+/// factors; keys resolve through the same [`normalize_ltx_key`] map as the peft path (a dotted
+/// diffusers third-party file shares it). The delta is installed as a forward residual at the raw
+/// per-pass strengths. A kohya-FLATTENED key (no dots) won't normalize to a module and is surfaced as
+/// skipped (LTX exposes no module table to un-flatten against — dotted is the real LTX surface).
+fn apply_one_thirdparty<G>(
+    host: &mut impl LtxAdaptable,
+    groups: &BTreeMap<String, G>,
+    delta_at: impl Fn(&G, &[i32]) -> Result<Array>,
+    spec: &AdapterSpec,
+    num_passes: usize,
+    report: &mut LtxLoraReport,
+) -> Result<()> {
+    let strengths = pass_strengths(spec, num_passes)?;
+    for (raw, g) in groups {
+        let path = normalize_ltx_key(raw);
+        let segs: Vec<&str> = path.split('.').collect();
+        match host.adaptable_mut(&segs) {
+            Some(lin) => {
+                let delta = delta_at(g, &lin.base_shape())?;
+                lin.push_lokr(delta, strengths.clone());
+                report.applied += 1;
+            }
+            None => report.skipped.push(path),
+        }
+    }
+    Ok(())
+}
+
 /// Install every adapter in `specs` onto the LTX transformer, stacking in order (sc-2687 LoRA /
 /// sc-2393 LoKr). `num_passes` is the distilled pipeline's denoise-pass count (for validating +
 /// expanding `pass_scales`). LoRA (PEFT/kohya) and LoKr (`networkType=lokr`) are dispatched by the
@@ -241,6 +273,27 @@ pub fn apply_ltx_adapters(
         // would find no `lora_A/B` and apply nothing) — route by the file so it is never mis-applied.
         if spec.kind == AdapterKind::Lokr || is_lokr(&w) {
             apply_one_lokr(host, &w, spec, num_passes, &mut report)?;
+        } else if is_lokr_keys(&w) {
+            // Third-party LyCORIS LoKr (sc-3671): lokr_* keys, no networkType stamp (is_lokr handled
+            // above). Reconstruct per-module (bf16 residual, PARITY-BF16) and install like peft LoKr.
+            apply_one_thirdparty(
+                host,
+                &parse_lokr_thirdparty(&w)?,
+                |g, bs| g.delta(bs, Dtype::Bfloat16),
+                spec,
+                num_passes,
+                &mut report,
+            )?;
+        } else if is_loha_keys(&w) {
+            // Third-party LyCORIS LoHa (sc-3671).
+            apply_one_thirdparty(
+                host,
+                &parse_loha_thirdparty(&w)?,
+                |g, bs| g.delta(bs, Dtype::Bfloat16),
+                spec,
+                num_passes,
+                &mut report,
+            )?;
         } else {
             apply_one(host, &w, spec, num_passes, &mut report)?;
         }
@@ -353,5 +406,51 @@ mod tests {
         // Wrong length errors.
         spec.pass_scales = Some(vec![0.5]);
         assert!(pass_scales(&spec, 16.0, 8.0, 2).is_err());
+    }
+
+    /// sc-3671: the LTX crate reconstructs third-party LoKr/LoHa deltas (via the shared core pub
+    /// helpers) against the lycoris reference fixtures (`<repo>/tests/fixtures`, generated through
+    /// `~/mlx-flux-venv`), and detects them by keys. The residual install (`push_lokr`) is the
+    /// existing peft-LoKr path; key resolution reuses `normalize_ltx_key`.
+    #[test]
+    fn thirdparty_lycoris_reconstructs_against_reference() {
+        use mlx_rs::ops::all_close;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for (dir, stem, is_loha) in [
+            ("sc3642_lokr", "linear_bothlr", false),
+            ("sc3643_loha", "linear", true),
+        ] {
+            let base = root.join("tests/fixtures").join(dir);
+            let w = Weights::from_file(base.join(format!("{stem}.safetensors"))).unwrap();
+            let exp =
+                Weights::from_file(base.join(format!("{stem}.expected.safetensors"))).unwrap();
+            let want = exp.require("proj").unwrap();
+            let got = if is_loha {
+                assert!(is_loha_keys(&w), "{stem}: not detected as LoHa");
+                let g = parse_loha_thirdparty(&w).unwrap();
+                g.values()
+                    .next()
+                    .unwrap()
+                    .delta(want.shape(), Dtype::Float32)
+                    .unwrap()
+            } else {
+                assert!(
+                    is_lokr_keys(&w) && !is_lokr(&w),
+                    "{stem}: not detected as 3rd-party LoKr"
+                );
+                let g = parse_lokr_thirdparty(&w).unwrap();
+                g.values()
+                    .next()
+                    .unwrap()
+                    .delta(want.shape(), Dtype::Float32)
+                    .unwrap()
+            };
+            assert!(
+                all_close(&got, want, 1e-4, 1e-5, false)
+                    .unwrap()
+                    .item::<bool>(),
+                "{stem}: LTX third-party reconstruction diverged from lycoris reference"
+            );
+        }
     }
 }

@@ -205,7 +205,7 @@ pub fn is_lokr_keys(w: &Weights) -> bool {
 /// from metadata), a third-party file carries **per-module** factor shapes + an optional per-module
 /// `.alpha` scalar, so rank/alpha/scale are derived per module here.
 #[derive(Default)]
-struct ThirdPartyLokr {
+pub struct ThirdPartyLokr {
     w1: Option<Array>,
     w1_a: Option<Array>,
     w1_b: Option<Array>,
@@ -241,7 +241,10 @@ impl ThirdPartyLokr {
         }
     }
 
-    fn delta(&self, base_shape: &[i32], out_dtype: Dtype) -> Result<Array> {
+    /// Reconstruct this module's `ΔW` (lycoris per-module scale baked in) at `out_dtype`. `pub` so the
+    /// merge-path providers (SDXL/Wan/LTX, sc-3671) reuse the exact derivation + reconstruction and
+    /// differ only in how they install it (in-place merge vs forward residual).
+    pub fn delta(&self, base_shape: &[i32], out_dtype: Dtype) -> Result<Array> {
         reconstruct_lokr_delta_scaled(
             self.scale(),
             base_shape,
@@ -259,8 +262,9 @@ impl ThirdPartyLokr {
 
 /// Group a third-party LoKr file's tensors by raw module key (the part before `.lokr_*`/`.alpha`).
 /// The raw key is whatever the trainer wrote — a `<PREFIX>_<flattened.path>` (kohya/lycoris) or, more
-/// rarely, a dotted path; resolution to the host's module map happens in [`apply_lokr_thirdparty`].
-fn parse_lokr_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyLokr>> {
+/// rarely, a dotted path; resolution to the host's module map happens in [`apply_lokr_thirdparty`]
+/// (or the merge-path providers' own tables, sc-3671).
+pub fn parse_lokr_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyLokr>> {
     let mut groups: BTreeMap<String, ThirdPartyLokr> = BTreeMap::new();
     for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
         if let Some(raw) = key.strip_suffix(".alpha") {
@@ -295,8 +299,9 @@ fn parse_lokr_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyLokr>
 /// trainer (`lora_unet`, `lycoris`, …). We match prefix-agnostically: the `stem` is a table entry
 /// (`flattened → dotted`) that equals `raw` or is an `_`-delimited suffix of it; the longest such
 /// stem wins (so a short module name can't match inside a longer one). Mirrors the worker's lycoris
-/// loader keying each module as `f"{PREFIX}_{module_name}"`.
-fn resolve_lokr_path<'a>(raw: &str, table: &'a BTreeMap<String, String>) -> Option<&'a str> {
+/// loader keying each module as `f"{PREFIX}_{module_name}"`. `pub` so the merge-path providers
+/// (sc-3671) resolve third-party keys against their own module tables.
+pub fn resolve_lokr_path<'a>(raw: &str, table: &'a BTreeMap<String, String>) -> Option<&'a str> {
     let mut best: Option<(&str, usize)> = None;
     for (stem, dotted) in table {
         let is_match = raw == stem
@@ -368,7 +373,7 @@ pub fn is_loha_keys(w: &Weights) -> bool {
 /// One module's third-party LoHa factors — two low-rank Hadamard pairs, optional tucker `t1`/`t2`,
 /// and an optional per-module `.alpha` (rank/scale derived per module, like [`ThirdPartyLokr`]).
 #[derive(Default)]
-struct ThirdPartyLoha {
+pub struct ThirdPartyLoha {
     w1_a: Option<Array>,
     w1_b: Option<Array>,
     w2_a: Option<Array>,
@@ -394,7 +399,9 @@ impl ThirdPartyLoha {
         }
     }
 
-    fn delta(&self, base_shape: &[i32], out_dtype: Dtype) -> Result<Array> {
+    /// Reconstruct this module's LoHa `ΔW` (lycoris per-module scale baked in) at `out_dtype`. `pub`
+    /// for the merge-path providers (sc-3671).
+    pub fn delta(&self, base_shape: &[i32], out_dtype: Dtype) -> Result<Array> {
         let (w1_a, w1_b, w2_a, w2_b) = match (&self.w1_a, &self.w1_b, &self.w2_a, &self.w2_b) {
             (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
             _ => return Err("LoHa: a hada_w1/w2 a/b factor is missing".into()),
@@ -414,7 +421,8 @@ impl ThirdPartyLoha {
 }
 
 /// Group a third-party LoHa file's tensors by raw module key (the part before `.hada_*`/`.alpha`).
-fn parse_loha_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyLoha>> {
+/// `pub` for the merge-path providers (sc-3671).
+pub fn parse_loha_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyLoha>> {
     let mut groups: BTreeMap<String, ThirdPartyLoha> = BTreeMap::new();
     for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
         if let Some(raw) = key.strip_suffix(".alpha") {
