@@ -121,9 +121,10 @@ impl FluxIpAdapter {
     }
 
     /// Decoupled cross-attention residual for double block `block_idx`:
-    /// `scale · SDPA(img_q, K·tokens, V·tokens)`, reshaped to `[B, img_seq, 3072]` — the term added
-    /// to the image attention output. `img_q` is the block's RMS-normed, **pre-RoPE** per-head image
-    /// query `[B, HEADS, img_seq, HEAD_DIM]` (diffusers' `ip_query`, captured before RoPE).
+    /// `scale · SDPA(img_q, K·tokens, V·tokens)`, reshaped to `[B, img_seq, 3072]` — the term the
+    /// block adds **raw (ungated), after the FF residual** to its output (diffusers'
+    /// `ip_attn_output`). `img_q` is the block's RMS-normed, **pre-RoPE** per-head image query
+    /// `[B, HEADS, img_seq, HEAD_DIM]` (diffusers' `ip_query`, captured before RoPE).
     fn block_residual(
         &self,
         block_idx: usize,
@@ -201,4 +202,3 @@ impl DitImageInjector for FluxIpInjector<'_> {
         )?))
     }
 }
-
