@@ -28,7 +28,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use super::{reconstruct_lokr_delta, reconstruct_lokr_delta_scaled, AdaptableHost, Adapter};
+use super::{
+    reconstruct_loha_delta, reconstruct_lokr_delta, reconstruct_lokr_delta_scaled, AdaptableHost,
+    Adapter,
+};
 use crate::runtime::{AdapterKind, AdapterSpec};
 use crate::weights::Weights;
 use crate::Result;
@@ -334,6 +337,131 @@ pub fn apply_lokr_thirdparty(
                 let base_shape = lin.base_shape();
                 // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609) — same as
                 // peft `apply_lokr`.
+                let delta = g.delta(&base_shape, Dtype::Bfloat16)?;
+                lin.push(Adapter::Lokr { delta, scale });
+                report.applied += 1;
+            }
+            None => report.unmatched_paths.push(raw.clone()),
+        }
+    }
+    Ok(report)
+}
+
+// ---- Third-party LyCORIS LoHa (sc-3643) ----------------------------------------------------------
+
+/// Third-party LoHa factor suffixes (the two Hadamard low-rank pairs + optional tucker factors).
+const LOHA_TP_SUFFIXES: [&str; 6] = [
+    ".hada_w1_a",
+    ".hada_w1_b",
+    ".hada_w2_a",
+    ".hada_w2_b",
+    ".hada_t1",
+    ".hada_t2",
+];
+
+/// `true` if any key is a LoHa factor (`*.hada_w…`) — how a third-party LyCORIS LoHa (kohya /
+/// ai-toolkit / lycoris-lib) is recognized. Mutually exclusive with [`is_lokr_keys`] (`lokr_*`).
+pub fn is_loha_keys(w: &Weights) -> bool {
+    w.keys().any(|k| k.contains(".hada_w"))
+}
+
+/// One module's third-party LoHa factors — two low-rank Hadamard pairs, optional tucker `t1`/`t2`,
+/// and an optional per-module `.alpha` (rank/scale derived per module, like [`ThirdPartyLokr`]).
+#[derive(Default)]
+struct ThirdPartyLoha {
+    w1_a: Option<Array>,
+    w1_b: Option<Array>,
+    w2_a: Option<Array>,
+    w2_b: Option<Array>,
+    t1: Option<Array>,
+    t2: Option<Array>,
+    alpha: Option<f32>,
+}
+
+impl ThirdPartyLoha {
+    /// rank (`lora_dim`) = `hada_w1_b.shape[0]` (lycoris stores `hada_w1_b` as `[lora_dim, …]` in
+    /// both the tucker and non-tucker layouts).
+    fn rank(&self) -> Option<f32> {
+        self.w1_b.as_ref().map(|b| b.shape()[0] as f32)
+    }
+
+    /// LyCORIS `scale = alpha / lora_dim` (alpha defaulting to `lora_dim`). LoHa is always decomposed
+    /// (no both-full case), so — unlike LoKr — there is no forced-1 branch.
+    fn scale(&self) -> f32 {
+        match self.rank() {
+            None => 1.0,
+            Some(r) => self.alpha.unwrap_or(r) / r,
+        }
+    }
+
+    fn delta(&self, base_shape: &[i32], out_dtype: Dtype) -> Result<Array> {
+        let (w1_a, w1_b, w2_a, w2_b) = match (&self.w1_a, &self.w1_b, &self.w2_a, &self.w2_b) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => return Err("LoHa: a hada_w1/w2 a/b factor is missing".into()),
+        };
+        reconstruct_loha_delta(
+            self.scale(),
+            base_shape,
+            w1_a,
+            w1_b,
+            w2_a,
+            w2_b,
+            self.t1.as_ref(),
+            self.t2.as_ref(),
+            out_dtype,
+        )
+    }
+}
+
+/// Group a third-party LoHa file's tensors by raw module key (the part before `.hada_*`/`.alpha`).
+fn parse_loha_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyLoha>> {
+    let mut groups: BTreeMap<String, ThirdPartyLoha> = BTreeMap::new();
+    for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
+        if let Some(raw) = key.strip_suffix(".alpha") {
+            if let Some(a) = scalar_alpha(w.require(&key)?)? {
+                groups.entry(raw.to_string()).or_default().alpha = Some(a);
+            }
+            continue;
+        }
+        for suffix in LOHA_TP_SUFFIXES {
+            if let Some(raw) = key.strip_suffix(suffix) {
+                let g = groups.entry(raw.to_string()).or_default();
+                let t = w.require(&key)?.clone();
+                match &suffix[1..] {
+                    "hada_w1_a" => g.w1_a = Some(t),
+                    "hada_w1_b" => g.w1_b = Some(t),
+                    "hada_w2_a" => g.w2_a = Some(t),
+                    "hada_w2_b" => g.w2_b = Some(t),
+                    "hada_t1" => g.t1 = Some(t),
+                    "hada_t2" => g.t2 = Some(t),
+                    _ => {}
+                }
+                break;
+            }
+        }
+    }
+    Ok(groups)
+}
+
+/// Install a third-party LyCORIS **LoHa** file onto `host`. Reconstructs each module's Hadamard delta
+/// and stacks it as an [`Adapter::Lokr`] residual (the reconstructed `ΔW` applies through the same
+/// `scale · x·ΔWᵀ` forward path — no distinct adapter variant needed). Module-key resolution
+/// (flattened-prefixed → dotted via [`kohya_table`]) and unmatched-path surfacing mirror
+/// [`apply_lokr_thirdparty`].
+pub fn apply_loha_thirdparty(
+    host: &mut impl AdaptableHost,
+    w: &Weights,
+    scale: f32,
+) -> Result<ApplyReport> {
+    let table = kohya_table(&host.adaptable_paths());
+    let groups = parse_loha_thirdparty(w)?;
+    let mut report = ApplyReport::default();
+    for (raw, g) in &groups {
+        let dotted = resolve_lokr_path(raw, &table).unwrap_or(raw.as_str());
+        let parts: Vec<&str> = dotted.split('.').collect();
+        match host.adaptable_mut(&parts) {
+            Some(lin) => {
+                let base_shape = lin.base_shape();
                 let delta = g.delta(&base_shape, Dtype::Bfloat16)?;
                 lin.push(Adapter::Lokr { delta, scale });
                 report.applied += 1;
@@ -753,10 +881,13 @@ pub fn apply_adapter_specs(
                     )
                     .into());
                 }
-                // A third-party LyCORIS LoKr (sc-3642) carries `lokr_*` keys but no `networkType`
-                // stamp, so a caller can't know to set `AdapterKind::Lokr` — detect + route by keys.
+                // A third-party LyCORIS LoKr (sc-3642) / LoHa (sc-3643) carries `lokr_*` / `hada_*`
+                // keys but no `networkType` stamp, so a caller can't know to set a non-Lora kind —
+                // detect + route by keys.
                 if is_lokr_keys(&w) {
                     apply_lokr_thirdparty(host, &w, spec.scale)?
+                } else if is_loha_keys(&w) {
+                    apply_loha_thirdparty(host, &w, spec.scale)?
                 } else {
                     apply_lora_peft(host, &w, spec.scale, lora_strip_prefix)?
                 }
@@ -815,6 +946,10 @@ pub fn apply_adapter_specs_autoprefix(
             // keys and route BEFORE is_bfl/is_kohya — a kohya-flattened LoKr also carries the
             // `lora_unet_` prefix, so is_kohya would otherwise claim it and apply nothing.
             apply_lokr_thirdparty(host, &w, spec.scale)?
+        } else if is_loha_keys(&w) {
+            // Third-party LyCORIS LoHa (sc-3643): `hada_*` keys. Same reasoning — route before
+            // is_bfl/is_kohya (a kohya-flattened LoHa also carries the `lora_unet_` prefix).
+            apply_loha_thirdparty(host, &w, spec.scale)?
         } else if is_bfl_file {
             apply_lora_bfl(host, &w, spec.scale, bfl.as_ref().unwrap())?
         } else if !is_lokr(&w) && is_kohya(&w) {
@@ -2031,6 +2166,70 @@ mod tests {
         let report =
             apply_adapter_specs_autoprefix(&mut host, std::slice::from_ref(&spec)).unwrap();
         assert_eq!(report.applied, 1, "third-party LoKr was not installed");
+        assert!(
+            report.unmatched_paths.is_empty(),
+            "unexpected unmatched: {:?}",
+            report.unmatched_paths
+        );
+    }
+
+    /// sc-3643: a third-party (non-peft / lycoris) LoHa reconstructs the SAME per-module delta the
+    /// `lycoris` library produces. Fixtures from `scripts/sc3643_loha_reference.py` via `~/mlx-flux-venv`.
+    /// Covers linear, conv (kernel folded into the factors), and conv `hada_t1/t2` tucker.
+    #[test]
+    fn thirdparty_loha_matches_lycoris_reference() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sc3643_loha");
+        for name in ["linear", "conv_notucker", "conv_tucker"] {
+            let w = Weights::from_file(dir.join(format!("{name}.safetensors"))).unwrap();
+            let exp = Weights::from_file(dir.join(format!("{name}.expected.safetensors"))).unwrap();
+            assert!(is_loha_keys(&w), "{name}: not detected as LoHa by keys");
+            assert!(!is_lokr_keys(&w), "{name}: must not look like LoKr");
+            assert!(
+                !is_lokr(&w),
+                "{name}: a third-party file has no networkType metadata"
+            );
+
+            let table: BTreeMap<String, String> = exp
+                .keys()
+                .map(|d| (d.replace('.', "_"), d.to_string()))
+                .collect();
+            let groups = parse_loha_thirdparty(&w).unwrap();
+            assert!(!groups.is_empty(), "{name}: parsed no LoHa modules");
+            for (raw, g) in &groups {
+                let dotted = resolve_lokr_path(raw, &table)
+                    .unwrap_or_else(|| panic!("{name}: cannot resolve raw key {raw:?}"));
+                let want = exp.require(dotted).unwrap();
+                let got = g.delta(want.shape(), Dtype::Float32).unwrap();
+                assert_eq!(
+                    got.shape(),
+                    want.shape(),
+                    "{name}/{dotted}: reconstructed delta shape mismatch"
+                );
+                assert!(
+                    all_close(&got, want, 1e-4, 1e-5, false)
+                        .unwrap()
+                        .item::<bool>(),
+                    "{name}/{dotted}: reconstructed LoHa delta diverged from the lycoris reference"
+                );
+            }
+        }
+    }
+
+    /// sc-3643: a third-party LoHa installs through the autoprefix dispatch even when the caller
+    /// labels the spec `AdapterKind::Lora` — detection-by-keys routes it to `apply_loha_thirdparty`.
+    #[test]
+    fn thirdparty_loha_routes_and_installs_via_autoprefix() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sc3643_loha");
+        let exp = Weights::from_file(dir.join("linear.expected.safetensors")).unwrap();
+        let delta_shape = exp.require("proj").unwrap().shape().to_vec();
+        let base = Array::zeros::<f32>(&delta_shape).unwrap();
+        let mut host = MultiHost::new(&[("proj", base)]);
+        let spec = AdapterSpec::new(dir.join("linear.safetensors"), 1.0, AdapterKind::Lora);
+        let report =
+            apply_adapter_specs_autoprefix(&mut host, std::slice::from_ref(&spec)).unwrap();
+        assert_eq!(report.applied, 1, "third-party LoHa was not installed");
         assert!(
             report.unmatched_paths.is_empty(),
             "unexpected unmatched: {:?}",

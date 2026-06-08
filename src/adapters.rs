@@ -125,6 +125,51 @@ fn rebuild_tucker(t2: &Array, wa: &Array, wb: &Array) -> Result<Array> {
     Ok(einsum("ijhw,ip,jr->prhw", [t2, wa, wb])?)
 }
 
+/// Reconstruct a **LoHa** (Hadamard-product) weight delta `ΔW = scale · ((w1_a·w1_b) ⊙ (w2_a·w2_b))`,
+/// reshaped to `base_shape` and cast to `out_dtype` (sc-3643). Third-party LyCORIS LoHa decomposes a
+/// delta as the elementwise product of TWO low-rank products (vs LoKr's Kronecker). With tucker
+/// factors (`t1`/`t2`, lycoris `use_cp` for conv) each side is a CP rebuild
+/// `einsum("ij…,jr,ip->pr…", t, w_b, w_a)`. `scale` is `alpha/rank` (the caller derives it per
+/// module). Mirrors LyCORIS `LohaModule.get_weight` / `loha_diff_weight` (`HadaWeight`/`HadaWeightTucker`):
+/// the saved factors map as `w1d=hada_w1_b, w1u=hada_w1_a, w2d=hada_w2_b, w2u=hada_w2_a`, so the
+/// non-tucker product is `(w1_a @ w1_b) ⊙ (w2_a @ w2_b)` (conv folds the kernel into the factors' dim 1,
+/// then `reshape(base_shape)` restores `[out,in,kH,kW]`).
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_loha_delta(
+    scale: f32,
+    base_shape: &[i32],
+    w1_a: &Array,
+    w1_b: &Array,
+    w2_a: &Array,
+    w2_b: &Array,
+    t1: Option<&Array>,
+    t2: Option<&Array>,
+    out_dtype: Dtype,
+) -> Result<Array> {
+    let (m1, m2) = match (t1, t2) {
+        (Some(t1), Some(t2)) => (
+            loha_rebuild_tucker(t1, w1_b, w1_a)?,
+            loha_rebuild_tucker(t2, w2_b, w2_a)?,
+        ),
+        _ => (matmul(w1_a, w1_b)?, matmul(w2_a, w2_b)?),
+    };
+    let delta = multiply(&multiply(&m1, &m2)?, scalar(scale))?;
+    Ok(delta.reshape(base_shape)?.as_dtype(out_dtype)?)
+}
+
+/// LoHa tucker rebuild: `einsum("i j …, j r, i p -> p r …", t, w_b, w_a)` (lycoris `HadaWeightTucker`).
+/// `t` is `[dim, dim, kH, kW]`, `w_b` is `[dim, in]`, `w_a` is `[dim, out]` → `[out, in, kH, kW]`.
+fn loha_rebuild_tucker(t: &Array, w_b: &Array, w_a: &Array) -> Result<Array> {
+    if t.shape().len() != 4 {
+        return Err(format!(
+            "LoHa tucker: expected a 4-D hada_t [dim,dim,kH,kW], got shape {:?}",
+            t.shape()
+        )
+        .into());
+    }
+    Ok(einsum("ijhw,jr,ip->prhw", [t, w_b, w_a])?)
+}
+
 /// Fuse a **conv-layer** LoRA pair into a single conv-weight delta, returned in the trained-file
 /// NCHW `[out, in, kH, kW]` layout (sc-2919). Conv LoRAs decompose a conv into a spatial `down`
 /// (`lora_down`, `[rank, in, kH, kW]`) followed by a 1×1 `up` (`lora_up`, `[out, rank, 1, 1]`); the
