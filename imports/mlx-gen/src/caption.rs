@@ -10,6 +10,8 @@ use crate::media::Image;
 use crate::runtime::{CancelFlag, Progress};
 use crate::{Error, Result};
 
+pub mod joycaption;
+
 /// An image captioning provider.
 pub trait Captioner {
     /// Stable identity + capability metadata, constructible without loading weights through the
