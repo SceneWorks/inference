@@ -13,6 +13,7 @@
 
 pub mod adapters;
 pub mod array;
+pub mod caption;
 pub mod error;
 pub mod generator;
 pub mod image;
@@ -29,6 +30,10 @@ pub mod train;
 pub mod transform;
 pub mod weights;
 
+pub use caption::{
+    CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
+    CaptionSampling, Captioner, CaptionerDescriptor,
+};
 pub use error::{Error, Result};
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
@@ -36,7 +41,10 @@ pub use generator::{
     ReplacementMode, VideoClipRef,
 };
 pub use media::{AudioTrack, Image};
-pub use registry::{load, load_transform, ModelRegistration, TransformRegistration};
+pub use registry::{
+    load, load_captioner, load_transform, CaptionerRegistration, ModelRegistration,
+    TransformRegistration,
+};
 pub use registry::{load_trainer, TrainerRegistration};
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, Precision, Progress, Quant,
