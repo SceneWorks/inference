@@ -252,7 +252,9 @@ fn public_generate_runs() {
         }],
         ..Default::default()
     };
-    let out = gen.generate(&req, &mut |_p: Progress| {}).expect("generate");
+    let out = gen
+        .generate(&req, &mut |_p: Progress| {})
+        .expect("generate");
     let GenerationOutput::Images(images) = out else {
         panic!("expected images")
     };
