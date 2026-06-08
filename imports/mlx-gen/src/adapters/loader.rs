@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use super::{reconstruct_lokr_delta, AdaptableHost, Adapter};
+use super::{reconstruct_lokr_delta, reconstruct_lokr_delta_scaled, AdaptableHost, Adapter};
 use crate::runtime::{AdapterKind, AdapterSpec};
 use crate::weights::Weights;
 use crate::Result;
@@ -171,6 +171,174 @@ pub fn apply_lokr(host: &mut impl AdaptableHost, w: &Weights, scale: f32) -> Res
                 report.applied += 1;
             }
             None => report.unmatched_paths.push(path.clone()),
+        }
+    }
+    Ok(report)
+}
+
+// ---- Third-party LyCORIS LoKr (sc-3642) ----------------------------------------------------------
+
+/// Third-party LoKr factor suffixes — the PEFT set plus `lokr_t2` (the lycoris tucker/CP factor).
+/// `.lokr_w1_a`/`_b` precede the bare `.lokr_w1` so exact-suffix matching never mis-binds.
+const LOKR_TP_SUFFIXES: [&str; 7] = [
+    ".lokr_w1_a",
+    ".lokr_w1_b",
+    ".lokr_w1",
+    ".lokr_w2_a",
+    ".lokr_w2_b",
+    ".lokr_w2",
+    ".lokr_t2",
+];
+
+/// `true` if any key is a LoKr factor (`*.lokr_w…`), regardless of `networkType` metadata. This is
+/// how a **third-party** LyCORIS LoKr (kohya / ai-toolkit / lycoris-lib) is recognized — those files
+/// ship the Kronecker factors but NOT SceneWorks' peft `networkType=lokr` stamp that [`is_lokr`]
+/// keys off. (A `lokr_t2` tucker factor always co-occurs with `lokr_w2_a`, so `.lokr_w` suffices.)
+pub fn is_lokr_keys(w: &Weights) -> bool {
+    w.keys().any(|k| k.contains(".lokr_w"))
+}
+
+/// One module's third-party LoKr factors. Unlike the peft [`LokrFile`] (one global `(alpha, rank)`
+/// from metadata), a third-party file carries **per-module** factor shapes + an optional per-module
+/// `.alpha` scalar, so rank/alpha/scale are derived per module here.
+#[derive(Default)]
+struct ThirdPartyLokr {
+    w1: Option<Array>,
+    w1_a: Option<Array>,
+    w1_b: Option<Array>,
+    w2: Option<Array>,
+    w2_a: Option<Array>,
+    w2_b: Option<Array>,
+    t2: Option<Array>,
+    alpha: Option<f32>,
+}
+
+impl ThirdPartyLokr {
+    /// The factorization rank (`lora_dim`). lycoris lays the factors out inconsistently, so derive in
+    /// a fixed order from whichever decomposed factor is present: `lokr_w1_a` is `[shape0, dim]`
+    /// (dim = `shape[1]`); the tucker `lokr_t2` is `[dim, dim, kH, kW]` (dim = `shape[0]`); the
+    /// non-tucker `lokr_w2_a` is `[shape0, dim]` (dim = `shape[1]`). `None` when **both** factors are
+    /// full — lycoris then forces `alpha = lora_dim` ⇒ scale 1, so rank is unused.
+    fn rank(&self) -> Option<f32> {
+        if let Some(a) = &self.w1_a {
+            return Some(a.shape()[1] as f32);
+        }
+        if let Some(t) = &self.t2 {
+            return Some(t.shape()[0] as f32);
+        }
+        self.w2_a.as_ref().map(|a| a.shape()[1] as f32)
+    }
+
+    /// LyCORIS `scale`: `alpha / lora_dim` (alpha defaulting to `lora_dim`), EXCEPT both-full forces
+    /// scale 1 (mirrors `LokrModule.__init__`: `if use_w1 and use_w2: alpha = lora_dim`).
+    fn scale(&self) -> f32 {
+        match self.rank() {
+            None => 1.0,
+            Some(r) => self.alpha.unwrap_or(r) / r,
+        }
+    }
+
+    fn delta(&self, base_shape: &[i32], out_dtype: Dtype) -> Result<Array> {
+        reconstruct_lokr_delta_scaled(
+            self.scale(),
+            base_shape,
+            self.w1.as_ref(),
+            self.w1_a.as_ref(),
+            self.w1_b.as_ref(),
+            self.w2.as_ref(),
+            self.t2.as_ref(),
+            self.w2_a.as_ref(),
+            self.w2_b.as_ref(),
+            out_dtype,
+        )
+    }
+}
+
+/// Group a third-party LoKr file's tensors by raw module key (the part before `.lokr_*`/`.alpha`).
+/// The raw key is whatever the trainer wrote — a `<PREFIX>_<flattened.path>` (kohya/lycoris) or, more
+/// rarely, a dotted path; resolution to the host's module map happens in [`apply_lokr_thirdparty`].
+fn parse_lokr_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyLokr>> {
+    let mut groups: BTreeMap<String, ThirdPartyLokr> = BTreeMap::new();
+    for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
+        if let Some(raw) = key.strip_suffix(".alpha") {
+            if let Some(a) = scalar_alpha(w.require(&key)?)? {
+                groups.entry(raw.to_string()).or_default().alpha = Some(a);
+            }
+            continue;
+        }
+        for suffix in LOKR_TP_SUFFIXES {
+            if let Some(raw) = key.strip_suffix(suffix) {
+                let g = groups.entry(raw.to_string()).or_default();
+                let t = w.require(&key)?.clone();
+                match &suffix[1..] {
+                    "lokr_w1" => g.w1 = Some(t),
+                    "lokr_w1_a" => g.w1_a = Some(t),
+                    "lokr_w1_b" => g.w1_b = Some(t),
+                    "lokr_w2" => g.w2 = Some(t),
+                    "lokr_w2_a" => g.w2_a = Some(t),
+                    "lokr_w2_b" => g.w2_b = Some(t),
+                    "lokr_t2" => g.t2 = Some(t),
+                    _ => {}
+                }
+                break;
+            }
+        }
+    }
+    Ok(groups)
+}
+
+/// Resolve a third-party LoKr raw module key to a host dotted path. The key is `<PREFIX>_<stem>`
+/// where `stem` is the diffusers path with dots flattened to underscores and `PREFIX` varies by
+/// trainer (`lora_unet`, `lycoris`, …). We match prefix-agnostically: the `stem` is a table entry
+/// (`flattened → dotted`) that equals `raw` or is an `_`-delimited suffix of it; the longest such
+/// stem wins (so a short module name can't match inside a longer one). Mirrors the worker's lycoris
+/// loader keying each module as `f"{PREFIX}_{module_name}"`.
+fn resolve_lokr_path<'a>(raw: &str, table: &'a BTreeMap<String, String>) -> Option<&'a str> {
+    let mut best: Option<(&str, usize)> = None;
+    for (stem, dotted) in table {
+        let is_match = raw == stem
+            || (raw.len() > stem.len()
+                && raw.ends_with(stem.as_str())
+                && raw.as_bytes()[raw.len() - stem.len() - 1] == b'_');
+        let longer = match best {
+            None => true,
+            Some((_, l)) => stem.len() > l,
+        };
+        if is_match && longer {
+            best = Some((dotted.as_str(), stem.len()));
+        }
+    }
+    best.map(|(d, _)| d)
+}
+
+/// Install a third-party LyCORIS **LoKr** file (LoHa is sc-3643) onto `host`. Reconstructs each
+/// module's Kronecker delta from its per-module factors (full / low-rank / tucker) at the lycoris
+/// scale and stacks it as an [`Adapter::Lokr`] residual at the user `scale` — the same install as
+/// peft [`apply_lokr`], differing only in (a) per-module rank/alpha derivation and (b) resolving the
+/// trainer's flattened key names to the host's dotted module map. Unresolved paths are surfaced in
+/// `unmatched_paths`, never silently dropped.
+pub fn apply_lokr_thirdparty(
+    host: &mut impl AdaptableHost,
+    w: &Weights,
+    scale: f32,
+) -> Result<ApplyReport> {
+    let table = kohya_table(&host.adaptable_paths());
+    let groups = parse_lokr_thirdparty(w)?;
+    let mut report = ApplyReport::default();
+    for (raw, g) in &groups {
+        // Flattened stem via the table (prefix-agnostic), else the raw key treated as already-dotted.
+        let dotted = resolve_lokr_path(raw, &table).unwrap_or(raw.as_str());
+        let parts: Vec<&str> = dotted.split('.').collect();
+        match host.adaptable_mut(&parts) {
+            Some(lin) => {
+                let base_shape = lin.base_shape();
+                // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609) — same as
+                // peft `apply_lokr`.
+                let delta = g.delta(&base_shape, Dtype::Bfloat16)?;
+                lin.push(Adapter::Lokr { delta, scale });
+                report.applied += 1;
+            }
+            None => report.unmatched_paths.push(raw.clone()),
         }
     }
     Ok(report)
@@ -585,7 +753,13 @@ pub fn apply_adapter_specs(
                     )
                     .into());
                 }
-                apply_lora_peft(host, &w, spec.scale, lora_strip_prefix)?
+                // A third-party LyCORIS LoKr (sc-3642) carries `lokr_*` keys but no `networkType`
+                // stamp, so a caller can't know to set `AdapterKind::Lokr` — detect + route by keys.
+                if is_lokr_keys(&w) {
+                    apply_lokr_thirdparty(host, &w, spec.scale)?
+                } else {
+                    apply_lora_peft(host, &w, spec.scale, lora_strip_prefix)?
+                }
             }
         };
         combined.applied += report.applied;
@@ -636,7 +810,12 @@ pub fn apply_adapter_specs_autoprefix(
             }
             is_bfl(&w, bfl.as_ref().unwrap())
         };
-        let report = if is_bfl_file {
+        let report = if !is_lokr(&w) && is_lokr_keys(&w) {
+            // Third-party LyCORIS LoKr (sc-3642): `lokr_*` keys, no `networkType` stamp. Detect by
+            // keys and route BEFORE is_bfl/is_kohya — a kohya-flattened LoKr also carries the
+            // `lora_unet_` prefix, so is_kohya would otherwise claim it and apply nothing.
+            apply_lokr_thirdparty(host, &w, spec.scale)?
+        } else if is_bfl_file {
             apply_lora_bfl(host, &w, spec.scale, bfl.as_ref().unwrap())?
         } else if !is_lokr(&w) && is_kohya(&w) {
             // kohya LoRA: dots are flattened to underscores, so keys resolve through the table
@@ -1777,6 +1956,85 @@ mod tests {
         assert!(
             array_eq(&out, &base, false).unwrap().item::<bool>(),
             "scale-0 BFL adapter must be a bit-exact no-op"
+        );
+    }
+
+    /// sc-3642: a third-party (non-peft / lycoris) LoKr reconstructs the SAME per-module delta the
+    /// `lycoris` library produces. Fixtures (real lycoris adapters + ground-truth deltas) come from
+    /// `scripts/sc3642_lokr_reference.py` via `~/mlx-flux-venv` — the on-device A/B. Covers the four
+    /// shapes: full-w1 + decomposed-w2, both-decomposed, both-full (scale forced to 1), and conv
+    /// `lokr_t2` tucker.
+    #[test]
+    fn thirdparty_lokr_matches_lycoris_reference() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sc3642_lokr");
+        for name in [
+            "linear_w1full_w2lr",
+            "linear_bothlr",
+            "linear_bothfull",
+            "conv_tucker",
+        ] {
+            let w = Weights::from_file(dir.join(format!("{name}.safetensors"))).unwrap();
+            let exp = Weights::from_file(dir.join(format!("{name}.expected.safetensors"))).unwrap();
+            assert!(is_lokr_keys(&w), "{name}: not detected as LoKr by keys");
+            assert!(
+                !is_lokr(&w),
+                "{name}: a third-party file has no networkType metadata"
+            );
+
+            // Reconstruct the flattened→dotted table from the expected (dotted) module paths.
+            let table: BTreeMap<String, String> = exp
+                .keys()
+                .map(|d| (d.replace('.', "_"), d.to_string()))
+                .collect();
+            let groups = parse_lokr_thirdparty(&w).unwrap();
+            assert!(!groups.is_empty(), "{name}: parsed no LoKr modules");
+            for (raw, g) in &groups {
+                let dotted = resolve_lokr_path(raw, &table)
+                    .unwrap_or_else(|| panic!("{name}: cannot resolve raw key {raw:?}"));
+                let want = exp.require(dotted).unwrap();
+                // Reconstruct in f32 (lycoris computes f32) and compare to the ground truth.
+                let got = g.delta(want.shape(), Dtype::Float32).unwrap();
+                assert_eq!(
+                    got.shape(),
+                    want.shape(),
+                    "{name}/{dotted}: reconstructed delta shape mismatch"
+                );
+                assert!(
+                    all_close(&got, want, 1e-4, 1e-5, false)
+                        .unwrap()
+                        .item::<bool>(),
+                    "{name}/{dotted}: reconstructed LoKr delta diverged from the lycoris reference"
+                );
+            }
+        }
+    }
+
+    /// sc-3642: the third-party LoKr installs through the autoprefix dispatch even when the caller
+    /// labels the spec `AdapterKind::Lora` (a third-party file carries no `networkType` to tell the
+    /// caller otherwise) — detection-by-keys routes it to `apply_lokr_thirdparty`, resolving the
+    /// `lycoris_`-prefixed flattened key to the host's dotted module.
+    #[test]
+    fn thirdparty_lokr_routes_and_installs_via_autoprefix() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sc3642_lokr");
+        let exp = Weights::from_file(dir.join("linear_w1full_w2lr.expected.safetensors")).unwrap();
+        // Host with the one Linear the fixture targets (dotted path "proj"), sized to the delta.
+        let delta_shape = exp.require("proj").unwrap().shape().to_vec();
+        let base = Array::zeros::<f32>(&delta_shape).unwrap();
+        let mut host = MultiHost::new(&[("proj", base)]);
+        let spec = AdapterSpec::new(
+            dir.join("linear_w1full_w2lr.safetensors"),
+            1.0,
+            AdapterKind::Lora, // deliberately mislabeled — detection must override
+        );
+        let report =
+            apply_adapter_specs_autoprefix(&mut host, std::slice::from_ref(&spec)).unwrap();
+        assert_eq!(report.applied, 1, "third-party LoKr was not installed");
+        assert!(
+            report.unmatched_paths.is_empty(),
+            "unexpected unmatched: {:?}",
+            report.unmatched_paths
         );
     }
 }
