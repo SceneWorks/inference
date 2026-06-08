@@ -47,7 +47,10 @@ use std::collections::BTreeMap;
 use mlx_rs::ops::{matmul, multiply};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::loader::is_lokr;
+use mlx_gen::adapters::loader::{
+    is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr_thirdparty,
+    resolve_lokr_path,
+};
 use mlx_gen::adapters::{conv_lora_delta, reconstruct_lokr_delta, AdaptableHost};
 use mlx_gen::array::scalar;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
@@ -436,6 +439,85 @@ fn merge_one_lokr(
     Ok(())
 }
 
+/// Merge one third-party-reconstructed `[out,in]` delta into `unet` at the dotted module `path`
+/// (sc-3671). Shared by the third-party LoKr + LoHa merge paths: resolve → gate complete-only/conv →
+/// `W += δ·scale`. An unresolved or non-Linear target is surfaced as skipped, never fatal.
+fn merge_thirdparty_delta(
+    unet: &mut UNet2DConditionModel,
+    path: Option<&str>,
+    delta_at: impl FnOnce(&[i32]) -> Result<Array>,
+    scale: f32,
+    report: &mut SdxlLoraReport,
+) -> Result<()> {
+    let Some(path) = path else {
+        report.skipped_keys += 1;
+        return Ok(());
+    };
+    // LoKr/LoHa stay at the vendored-equivalent Linear surface (like `merge_one_lokr`): mid_block / FF
+    // and conv targets resolve to no internal Linear, so gate them as skipped rather than mis-merge.
+    if is_complete_only(path) {
+        report.skipped_keys += 1;
+        return Ok(());
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    match unet.adaptable_mut(&parts) {
+        Some(lin) => {
+            let base_shape = lin.base_shape();
+            let delta = delta_at(&base_shape)?;
+            let delta = multiply(&delta, scalar(scale))?;
+            lin.merge_dense_delta(&delta)?;
+            report.merged += 1;
+        }
+        None => report.skipped_keys += 1,
+    }
+    Ok(())
+}
+
+/// Merge a third-party LyCORIS **LoKr** file (kohya/lycoris keys, per-module `.alpha`, no
+/// `networkType` stamp) into `unet` at `scale` (sc-3671). Reuses the core per-module reconstruction
+/// (`ThirdPartyLokr::delta`, f32 for the f32-everywhere SDXL path) and the same `W += δ·scale` merge
+/// as the peft `merge_one_lokr`. Linear-only (matches the peft LoKr coverage).
+fn merge_one_lokr_thirdparty(
+    unet: &mut UNet2DConditionModel,
+    w: &Weights,
+    scale: f32,
+    table: &BTreeMap<String, String>,
+    report: &mut SdxlLoraReport,
+) -> Result<()> {
+    for (raw, g) in &parse_lokr_thirdparty(w)? {
+        merge_thirdparty_delta(
+            unet,
+            resolve_lokr_path(raw, table),
+            |bs| g.delta(bs, Dtype::Float32),
+            scale,
+            report,
+        )?;
+    }
+    Ok(())
+}
+
+/// Merge a third-party LyCORIS **LoHa** file into `unet` at `scale` (sc-3671). As
+/// [`merge_one_lokr_thirdparty`] but the per-module delta is the Hadamard reconstruction
+/// (`ThirdPartyLoha::delta`).
+fn merge_one_loha_thirdparty(
+    unet: &mut UNet2DConditionModel,
+    w: &Weights,
+    scale: f32,
+    table: &BTreeMap<String, String>,
+    report: &mut SdxlLoraReport,
+) -> Result<()> {
+    for (raw, g) in &parse_loha_thirdparty(w)? {
+        merge_thirdparty_delta(
+            unet,
+            resolve_lokr_path(raw, table),
+            |bs| g.delta(bs, Dtype::Float32),
+            scale,
+            report,
+        )?;
+    }
+    Ok(())
+}
+
 /// Merge every adapter spec in `specs` into `unet` — LoRA (sc-2639) and LoKr (sc-2640) — at the
 /// **vendored-faithful** coverage (515 modules on LCM-LoRA; byte-parity with the retired Python
 /// path). The vendored SDXL path supports LoRA only (it *rejects* LoKr); Rust is strictly more
@@ -477,6 +559,17 @@ pub fn apply_sdxl_adapters_with(
     let mut report = SdxlLoraReport::default();
     for spec in specs {
         let w = Weights::from_file(&spec.path)?;
+        // Third-party LyCORIS (sc-3671): `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp,
+        // so the caller can't label the kind — detect + route by keys before the kind match. (A peft
+        // LoKr has the stamp and goes through the `Lokr` arm; `is_lokr_keys` excludes it via `is_lokr`.)
+        if !is_lokr(&w) && is_lokr_keys(&w) {
+            merge_one_lokr_thirdparty(unet, &w, spec.scale, &vendored_table, &mut report)?;
+            continue;
+        }
+        if is_loha_keys(&w) {
+            merge_one_loha_thirdparty(unet, &w, spec.scale, &vendored_table, &mut report)?;
+            continue;
+        }
         match spec.kind {
             AdapterKind::Lokr => {
                 merge_one_lokr(unet, &w, spec.scale, &vendored_table, &mut report)?
@@ -511,6 +604,7 @@ pub fn apply_sdxl_adapters_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::ops::all_close;
 
     fn table() -> BTreeMap<String, String> {
         // A tiny routable surface: one attention leaf + a proj.
@@ -521,6 +615,59 @@ mod tests {
         .into_iter()
         .map(|p| (p.replace('.', "_"), p.to_string()))
         .collect()
+    }
+
+    /// sc-3671: the SDXL crate reconstructs third-party LoKr/LoHa deltas (via the shared core pub
+    /// helpers) bit-for-bit against the lycoris reference fixtures (`<repo>/tests/fixtures`, generated
+    /// by `scripts/sc364{2,3}_*reference.py` through `~/mlx-flux-venv`), and detects + resolves the
+    /// trainer-flattened keys. The merge onto the UNet is the existing `merge_dense_delta` path.
+    #[test]
+    fn thirdparty_lycoris_reconstructs_against_reference_f32() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        // (fixture dir, file stem, is_loha)
+        let cases: [(&str, &str, bool); 4] = [
+            ("sc3642_lokr", "linear_w1full_w2lr", false),
+            ("sc3642_lokr", "linear_bothlr", false),
+            ("sc3642_lokr", "linear_bothfull", false),
+            ("sc3643_loha", "linear", true),
+        ];
+        for (dir, stem, is_loha) in cases {
+            let base = root.join("tests/fixtures").join(dir);
+            let w = Weights::from_file(base.join(format!("{stem}.safetensors"))).unwrap();
+            let exp =
+                Weights::from_file(base.join(format!("{stem}.expected.safetensors"))).unwrap();
+            if is_loha {
+                assert!(is_loha_keys(&w), "{stem}: not detected as LoHa");
+            } else {
+                assert!(
+                    is_lokr_keys(&w) && !is_lokr(&w),
+                    "{stem}: not detected as 3rd-party LoKr"
+                );
+            }
+            let table: BTreeMap<String, String> = exp
+                .keys()
+                .map(|d| (d.replace('.', "_"), d.to_string()))
+                .collect();
+            // Each fixture targets a single module ("proj").
+            let want = exp.require("proj").unwrap();
+            let got = if is_loha {
+                let g = parse_loha_thirdparty(&w).unwrap();
+                let (raw, m) = g.iter().next().unwrap();
+                assert_eq!(resolve_lokr_path(raw, &table), Some("proj"));
+                m.delta(want.shape(), Dtype::Float32).unwrap()
+            } else {
+                let g = parse_lokr_thirdparty(&w).unwrap();
+                let (raw, m) = g.iter().next().unwrap();
+                assert_eq!(resolve_lokr_path(raw, &table), Some("proj"));
+                m.delta(want.shape(), Dtype::Float32).unwrap()
+            };
+            assert!(
+                all_close(&got, want, 1e-4, 1e-5, false)
+                    .unwrap()
+                    .item::<bool>(),
+                "{stem}: SDXL third-party reconstruction diverged from lycoris reference"
+            );
+        }
     }
 
     #[test]

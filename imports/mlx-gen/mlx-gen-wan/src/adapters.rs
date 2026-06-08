@@ -40,7 +40,10 @@ use std::collections::BTreeMap;
 use mlx_rs::ops::{add, matmul, multiply};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::loader::{is_lokr, parse_lokr};
+use mlx_gen::adapters::loader::{
+    is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr, parse_lokr_thirdparty,
+    resolve_lokr_path,
+};
 use mlx_gen::array::scalar;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec, MoeExpert};
 use mlx_gen::weights::Weights;
@@ -171,6 +174,15 @@ fn merge_one(w: &mut Weights, spec: &AdapterSpec, report: &mut WanLoraReport) ->
         // in-place weight fold, with the delta reconstructed from Kronecker factors instead of B·A.
         return merge_one_lokr(w, &lw, spec.scale, report);
     }
+    // Third-party LyCORIS (sc-3671): `lokr_*` / `hada_*` keys WITHOUT a `networkType=lokr` stamp
+    // (kohya / ai-toolkit / lycoris-lib). `is_lokr` (peft) is handled above, so reaching here means
+    // third-party; reconstruct per-module and merge like the peft path.
+    if is_lokr_keys(&lw) {
+        return merge_one_lokr_thirdparty(w, &lw, spec.scale, report);
+    }
+    if is_loha_keys(&lw) {
+        return merge_one_loha_thirdparty(w, &lw, spec.scale, report);
+    }
 
     // Group factors by normalized module path.
     let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
@@ -241,6 +253,82 @@ fn merge_one_lokr(
         let merged = add(&base, &delta.as_dtype(base.dtype())?)?;
         w.insert(wkey, merged);
         report.applied += 1;
+    }
+    Ok(())
+}
+
+/// Build the `flattened-stem → checkpoint-module-path` table from the expert weight map `w` (every
+/// `‹path›.weight` key → `‹path›`), so a third-party LyCORIS file's kohya-flattened key resolves to a
+/// Wan module (sc-3671). Dotted third-party keys instead go through [`normalize_wan_key`].
+fn wan_module_table(w: &Weights) -> BTreeMap<String, String> {
+    w.keys()
+        .filter_map(|k| k.strip_suffix(".weight"))
+        .map(|p| (p.replace('.', "_"), p.to_string()))
+        .collect()
+}
+
+/// Resolve a third-party LoKr/LoHa raw module key to a Wan checkpoint module path: prefer the
+/// flattened-stem table (kohya `lora_unet_…`), else the dotted-path normalize (the reference rename
+/// map, which a dotted diffusers third-party file shares with the peft path).
+fn resolve_wan_thirdparty(raw: &str, table: &BTreeMap<String, String>) -> String {
+    resolve_lokr_path(raw, table)
+        .map(str::to_string)
+        .unwrap_or_else(|| normalize_wan_key(raw))
+}
+
+/// Merge one third-party-reconstructed `[out,in]` delta into `w` at the resolved module path
+/// (sc-3671): `W += δ·scale` cast to the weight dtype, the same fold as LoRA/peft-LoKr. A path with no
+/// weight in this expert is surfaced (skipped), never fatal.
+fn merge_wan_thirdparty_delta(
+    w: &mut Weights,
+    path: String,
+    delta_at: impl FnOnce(&[i32]) -> Result<Array>,
+    scale: f32,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let wkey = format!("{path}.weight");
+    let Some(base) = w.get(&wkey).cloned() else {
+        report.skipped.push(path);
+        return Ok(());
+    };
+    let delta = delta_at(base.shape())?;
+    let delta = multiply(&delta, &scalar(scale).as_dtype(delta.dtype())?)?;
+    let merged = add(&base, &delta.as_dtype(base.dtype())?)?;
+    w.insert(wkey, merged);
+    report.applied += 1;
+    Ok(())
+}
+
+/// Merge a third-party LyCORIS **LoKr** file (kohya/lycoris keys, per-module `.alpha`, no
+/// `networkType` stamp) into `w` at `scale` (sc-3671). Reconstruction reuses the core
+/// `ThirdPartyLokr::delta` (f32, lycoris per-module scale baked in); install is the same in-place
+/// weight fold as the peft `merge_one_lokr`.
+fn merge_one_lokr_thirdparty(
+    w: &mut Weights,
+    lw: &Weights,
+    scale: f32,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let table = wan_module_table(w);
+    for (raw, g) in &parse_lokr_thirdparty(lw)? {
+        let path = resolve_wan_thirdparty(raw, &table);
+        merge_wan_thirdparty_delta(w, path, |bs| g.delta(bs, Dtype::Float32), scale, report)?;
+    }
+    Ok(())
+}
+
+/// Merge a third-party LyCORIS **LoHa** file into `w` at `scale` (sc-3671). As
+/// [`merge_one_lokr_thirdparty`] with the Hadamard reconstruction (`ThirdPartyLoha::delta`).
+fn merge_one_loha_thirdparty(
+    w: &mut Weights,
+    lw: &Weights,
+    scale: f32,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let table = wan_module_table(w);
+    for (raw, g) in &parse_loha_thirdparty(lw)? {
+        let path = resolve_wan_thirdparty(raw, &table);
+        merge_wan_thirdparty_delta(w, path, |bs| g.delta(bs, Dtype::Float32), scale, report)?;
     }
     Ok(())
 }
@@ -668,5 +756,50 @@ mod tests {
             .item::<bool>(),
             "scale-0 LoKr merge must be a bit-exact no-op"
         );
+    }
+
+    /// sc-3671: a third-party (non-peft / lycoris) LoKr **and** LoHa file merges into the Wan weight
+    /// map via the same `merge_wan_adapters` path (detected by keys), reconstructing the lycoris
+    /// reference delta. Base weight = 0 so the merged weight equals `ΔW` exactly (the fixtures from
+    /// `<repo>/tests/fixtures`, generated through `~/mlx-flux-venv`). The fixture module "proj" stands
+    /// in for a Wan checkpoint module; `wan_module_table` resolves the `lycoris_proj` key to it.
+    #[test]
+    fn thirdparty_lycoris_merges_against_reference() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for (dir, stem) in [
+            ("sc3642_lokr", "linear_w1full_w2lr"),
+            ("sc3643_loha", "linear"),
+        ] {
+            let base = root.join("tests/fixtures").join(dir);
+            let exp =
+                Weights::from_file(base.join(format!("{stem}.expected.safetensors"))).unwrap();
+            let want = exp.require("proj").unwrap();
+            // Base weight map: a single f32 zero "proj.weight" of the delta's shape.
+            let zero = Array::zeros::<f32>(want.shape()).unwrap();
+            let base_path = tmp(&format!("wan_tp_base_{stem}.safetensors"));
+            Array::save_safetensors(vec![("proj.weight", &zero)], None, &base_path).unwrap();
+            let mut w = Weights::from_file(&base_path).unwrap();
+
+            let report = merge_wan_adapters(
+                &mut w,
+                &[spec(base.join(format!("{stem}.safetensors")), 1.0, None)],
+                MoeExpert::High,
+            )
+            .unwrap();
+            assert_eq!(report.applied, 1, "{stem}: third-party file did not merge");
+            assert!(
+                report.skipped.is_empty(),
+                "{stem}: unexpected skip {:?}",
+                report.skipped
+            );
+
+            let got = w.require("proj.weight").unwrap();
+            assert!(
+                all_close(got, want, 1e-4, 1e-5, false)
+                    .unwrap()
+                    .item::<bool>(),
+                "{stem}: Wan third-party merge diverged from the lycoris reference"
+            );
+        }
     }
 }
