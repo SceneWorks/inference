@@ -7,6 +7,7 @@
 
 pub mod adapters;
 pub mod config;
+pub mod image_encoder;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
@@ -18,6 +19,7 @@ pub use config::{
     FluxTokenizerKind, FluxVariant, DEFAULT_GUIDANCE, DEFAULT_HEIGHT, DEFAULT_WIDTH, FLUX1_DEV_ID,
     FLUX1_SCHNELL_ID,
 };
+pub use image_encoder::FluxIpImageEncoder;
 pub use loader::{
     load_clip_encoder, load_clip_tokenizer, load_t5_encoder, load_t5_tokenizer, load_transformer,
     load_vae,
