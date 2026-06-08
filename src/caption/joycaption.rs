@@ -3,7 +3,7 @@
 //! This module ports the request-facing text path before the model provider exists: SceneWorks'
 //! caption prompt map, the model's LLaVA/Llama chat wrapper, and tokenizer loading from a cached
 //! Hugging Face snapshot. Vision preprocessing, image-token embedding splice, and generation live
-//! in later epic slices.
+//! in sibling JoyCaption modules.
 
 use std::path::Path;
 
@@ -12,6 +12,7 @@ use crate::runtime::{LoadSpec, WeightsSource};
 use crate::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use crate::{Error, Result};
 
+pub mod language;
 pub mod vision;
 
 pub const JOY_CAPTION_MODEL_ID: &str = "fancyfeast/llama-joycaption-beta-one-hf-llava";
