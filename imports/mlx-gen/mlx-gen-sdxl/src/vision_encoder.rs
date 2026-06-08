@@ -52,6 +52,21 @@ impl VisionConfig {
         }
     }
 
+    /// OpenAI CLIP ViT-L/14 (`openai/clip-vit-large-patch14`, `vision_model.*`): 1024-wide, 24
+    /// layers, 16 heads (head_dim 64), patch 14, 224px → 257 tokens. The image tower the XLabs
+    /// FLUX IP-Adapter conditions on (a `CLIPVisionModelWithProjection`; the 1024→768 projection
+    /// head lives in the consumer, not here).
+    pub fn vit_l_14() -> Self {
+        Self {
+            hidden: 1024,
+            num_layers: 24,
+            num_heads: 16,
+            patch: 14,
+            image_size: 224,
+            num_channels: 3,
+        }
+    }
+
     /// Token count = 1 class token + (image_size / patch)² patches (= 257 for ViT-H/14).
     pub fn num_positions(&self) -> i32 {
         let grid = self.image_size / self.patch;
