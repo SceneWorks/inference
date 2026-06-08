@@ -14,7 +14,7 @@
 use mlx_rs::{
     module::Param,
     nn::{Linear, QuantizedLinear},
-    ops::{add, addmm, kron, matmul, multiply, quantized_matmul},
+    ops::{add, addmm, einsum, kron, matmul, multiply, quantized_matmul},
     Array, Dtype,
 };
 
@@ -43,18 +43,86 @@ pub fn reconstruct_lokr_delta(
     w2_b: Option<&Array>,
     out_dtype: Dtype,
 ) -> Result<Array> {
+    // The SceneWorks peft path bakes `alpha/rank` as the scale and is always linear (no tucker
+    // factor, equal-rank factors) — delegate to the general scaled form, which is then byte-identical.
+    reconstruct_lokr_delta_scaled(
+        alpha / rank,
+        base_shape,
+        w1,
+        w1_a,
+        w1_b,
+        w2,
+        None,
+        w2_a,
+        w2_b,
+        out_dtype,
+    )
+}
+
+/// Reconstruct a LoKr weight delta `ΔW = scale · kron(w1, w2)`, reshaped to `base_shape` and cast to
+/// `out_dtype`. Generalizes [`reconstruct_lokr_delta`] for **third-party LyCORIS** LoKr (sc-3642):
+/// the caller passes the final `scale` directly (lycoris derives it per module — `alpha/rank`, or a
+/// forced `1.0` when both factors are full), and `w2` may be a **tucker/CP** factor
+/// (`w2_t2` + `w2_a` + `w2_b`, lycoris `use_cp`). Each Kronecker factor is full (`w1`/`w2`), a
+/// low-rank product (`w1_a@w1_b` / `w2_a@w2_b`), or — for `w2` only — the tucker rebuild
+/// `einsum("ij…,ip,jr->pr…", t2, w2_a, w2_b)`. Mirrors LyCORIS `LokrModule.get_weight` + `make_kron`
+/// (w1's trailing dims are unsqueezed to w2's rank before the product — the conv case).
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_lokr_delta_scaled(
+    scale: f32,
+    base_shape: &[i32],
+    w1: Option<&Array>,
+    w1_a: Option<&Array>,
+    w1_b: Option<&Array>,
+    w2: Option<&Array>,
+    w2_t2: Option<&Array>,
+    w2_a: Option<&Array>,
+    w2_b: Option<&Array>,
+    out_dtype: Dtype,
+) -> Result<Array> {
     let factor1 = match (w1, w1_a, w1_b) {
         (Some(w), _, _) => w.clone(),
         (_, Some(a), Some(b)) => matmul(a, b)?,
         _ => return Err("LoKr: w1 missing (need full w1 or w1_a@w1_b)".into()),
     };
-    let factor2 = match (w2, w2_a, w2_b) {
-        (Some(w), _, _) => w.clone(),
-        (_, Some(a), Some(b)) => matmul(a, b)?,
-        _ => return Err("LoKr: w2 missing (need full w2 or w2_a@w2_b)".into()),
+    let factor2 = match (w2, w2_t2, w2_a, w2_b) {
+        (Some(w), _, _, _) => w.clone(),
+        (_, Some(t2), Some(a), Some(b)) => rebuild_tucker(t2, a, b)?,
+        (_, None, Some(a), Some(b)) => matmul(a, b)?,
+        _ => {
+            return Err("LoKr: w2 missing (need full w2, tucker t2+w2_a+w2_b, or w2_a@w2_b)".into())
+        }
     };
-    let delta = multiply(&kron(&factor1, &factor2)?, scalar(alpha / rank))?;
+    // LyCORIS `make_kron` unsqueezes w1's TRAILING dims to w2's rank before `torch.kron` (the conv
+    // case: w1 `[a,c]` → `[a,c,1,1]` against w2 `[b,d,kH,kW]`). Linear factors share rank → no-op.
+    let factor1 = match_trailing_rank(&factor1, factor2.shape().len())?;
+    let delta = multiply(&kron(&factor1, &factor2)?, scalar(scale))?;
     Ok(delta.reshape(base_shape)?.as_dtype(out_dtype)?)
+}
+
+/// Reshape `a` to append trailing length-1 dims until it has `ndim` dimensions (LyCORIS `make_kron`'s
+/// `w1.unsqueeze(-1)` loop). A no-op when `a` already has ≥ `ndim` dims.
+fn match_trailing_rank(a: &Array, ndim: usize) -> Result<Array> {
+    let mut shape = a.shape().to_vec();
+    if shape.len() >= ndim {
+        return Ok(a.clone());
+    }
+    shape.resize(ndim, 1);
+    Ok(a.reshape(&shape)?)
+}
+
+/// LyCORIS `rebuild_tucker(t, wa, wb) = einsum("i j …, i p, j r -> p r …", t, wa, wb)` — the CP/tucker
+/// rebuild for a conv `w2` (`use_cp`). `t2` is `[i, j, kH, kW]`, `wa` is `[i, p]`, `wb` is `[j, r]`,
+/// yielding `[p, r, kH, kW]`. Only the 4-D conv form lycoris emits is supported (others error loudly).
+fn rebuild_tucker(t2: &Array, wa: &Array, wb: &Array) -> Result<Array> {
+    if t2.shape().len() != 4 {
+        return Err(format!(
+            "LoKr tucker: expected a 4-D lokr_t2 [in,out,kH,kW], got shape {:?}",
+            t2.shape()
+        )
+        .into());
+    }
+    Ok(einsum("ijhw,ip,jr->prhw", [t2, wa, wb])?)
 }
 
 /// Fuse a **conv-layer** LoRA pair into a single conv-weight delta, returned in the trained-file
