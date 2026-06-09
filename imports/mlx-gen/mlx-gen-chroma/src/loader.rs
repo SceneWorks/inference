@@ -22,8 +22,14 @@ use crate::transformer::ChromaTransformer;
 const T5_TOKENIZER_JSON: &str = include_str!("../assets/t5_tokenizer.json");
 
 pub fn load_tokenizer() -> Result<TextTokenizer> {
+    load_tokenizer_with_max_len(MAX_SEQUENCE_LENGTH)
+}
+
+/// The vendored T5 tokenizer at a given padded length (production uses [`MAX_SEQUENCE_LENGTH`]; the
+/// parity tests use a smaller length — the mask logic is length-agnostic).
+pub fn load_tokenizer_with_max_len(max_length: usize) -> Result<TextTokenizer> {
     let config = TokenizerConfig {
-        max_length: MAX_SEQUENCE_LENGTH,
+        max_length,
         // T5 `<pad>`.
         pad_token_id: 0,
         chat_template: ChatTemplate::None,

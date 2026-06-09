@@ -11,6 +11,7 @@
 pub mod config;
 pub mod loader;
 pub mod model;
+pub mod text;
 pub mod transformer;
 
 pub use config::{
@@ -21,4 +22,5 @@ pub use model::{
     descriptor_base, descriptor_flash, descriptor_hd, load_base, load_chroma, load_flash, load_hd,
     Chroma,
 };
+pub use text::{encode_prompt, t5_key_mask, transformer_text_mask};
 pub use transformer::ChromaTransformer;
