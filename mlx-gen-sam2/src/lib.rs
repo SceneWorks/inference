@@ -12,7 +12,8 @@
 //!       encodings the mask decoder consumes.
 //!     - prompt encoder + two-way mask decoder + box→mask segmenter (sc-3706, follows).
 //!   * **Phase B — video layer**: the memory bank — memory encoder + memory attention ([`memory`],
-//!     sc-3713) — and the propagation predictor that drives it (sc-3714).
+//!     sc-3713) — and the [`video_predictor`] that drives it across a clip (init_state / propagate,
+//!     single-object box-prompted track, sc-3714).
 //!
 //! Reference: the MLX-native `avbiswas/sam2-mlx` (`mlx_sam`) and `eisneim/sam2.1_mlx`. SAM2 is a
 //! utility segmenter (not a generation provider), so the crate exposes a plain API rather than
@@ -24,9 +25,11 @@ pub mod image_encoder;
 pub mod memory;
 pub mod sam_heads;
 pub mod segmenter;
+pub mod video_predictor;
 
 pub use config::{Sam2ImageEncoderConfig, Sam2ModelSize};
 pub use image_encoder::{Sam2ImageEncoder, Sam2ImageEncoderOutput};
 pub use memory::{MemoryAttention, MemoryEncoder, MemoryEncoderOutput};
 pub use sam_heads::{MaskDecoder, PromptEncoder};
 pub use segmenter::Sam2Segmenter;
+pub use video_predictor::{Sam2VideoPredictor, VideoState};
