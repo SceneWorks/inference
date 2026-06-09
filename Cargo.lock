@@ -607,6 +607,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-kolors"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "mlx-gen-sdxl",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-ltx"
 version = "0.0.0"
 dependencies = [
