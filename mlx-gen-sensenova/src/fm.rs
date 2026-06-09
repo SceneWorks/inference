@@ -20,6 +20,8 @@ use mlx_gen::nn::{gelu_exact, linear, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
+use crate::distill::lora_delta;
+
 fn require(w: &Weights, key: &str) -> Result<Array> {
     Ok(w.require(key)?.clone())
 }
@@ -47,6 +49,23 @@ impl FmHead {
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let h = gelu_exact(&linear(x, &self.l0_w, &self.l0_b)?)?;
         linear(&h, &self.l2_w, &self.l2_b)
+    }
+
+    /// Merge the distill LoRA (sc-3192) into the two FM-head Linears (`{prefix}.0` and `{prefix}.2`;
+    /// `prefix` = `"fm_modules.fm_head"`). These are plain dense weights (the FM head is never
+    /// quantized), so the merge is a direct `W += Δ` with `Δ` cast to the weight dtype — the dense
+    /// analogue of [`mlx_gen::adapters::AdaptableLinear::merge_dense_delta`]. Biases are untouched
+    /// (the LoRA carries none). Returns the number of Linears merged (≤ 2).
+    pub fn merge_distill_lora(&mut self, lora: &Weights, prefix: &str) -> Result<usize> {
+        let mut n = 0;
+        for (idx, w) in [(0, &mut self.l0_w), (2, &mut self.l2_w)] {
+            if let Some(delta) = lora_delta(lora, &format!("{prefix}.{idx}"))? {
+                let dt = w.dtype();
+                *w = add(&*w, &delta.as_dtype(dt)?)?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 }
 

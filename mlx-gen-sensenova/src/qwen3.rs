@@ -30,6 +30,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::NeoChatConfig;
+use crate::distill::lora_delta;
 
 /// Which transformer path a forward runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +139,25 @@ impl AttnPath {
         self.v_proj.quantize(bits, None)?;
         self.o_proj.quantize(bits, None)
     }
+
+    /// Merge the distill LoRA (sc-3192) into the four projections. `attn_prefix` =
+    /// `…layers.{i}.self_attn`, `s` = the path suffix (`"_mot_gen"` — the LoRA touches only the
+    /// generation path). Returns the number of projections merged (≤ 4; absent targets are skipped).
+    fn merge_distill_lora(&mut self, lora: &Weights, attn_prefix: &str, s: &str) -> Result<usize> {
+        let mut n = 0;
+        for (proj, lin) in [
+            ("q", &mut self.q_proj),
+            ("k", &mut self.k_proj),
+            ("v", &mut self.v_proj),
+            ("o", &mut self.o_proj),
+        ] {
+            if let Some(delta) = lora_delta(lora, &format!("{attn_prefix}.{proj}_proj{s}"))? {
+                lin.merge_dense_delta(&delta)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
 }
 
 struct Mlp {
@@ -165,6 +185,24 @@ impl Mlp {
         self.gate.quantize(bits, None)?;
         self.up.quantize(bits, None)?;
         self.down.quantize(bits, None)
+    }
+
+    /// Merge the distill LoRA (sc-3192) into the SwiGLU's three linears. `prefix` =
+    /// `…layers.{i}.mlp_mot_gen` (the LoRA touches only the generation-path MLP). Returns the number
+    /// of linears merged (≤ 3).
+    fn merge_distill_lora(&mut self, lora: &Weights, prefix: &str) -> Result<usize> {
+        let mut n = 0;
+        for (proj, lin) in [
+            ("gate", &mut self.gate),
+            ("up", &mut self.up),
+            ("down", &mut self.down),
+        ] {
+            if let Some(delta) = lora_delta(lora, &format!("{prefix}.{proj}_proj"))? {
+                lin.merge_dense_delta(&delta)?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -308,6 +346,22 @@ impl Qwen3Backbone {
             layer.quantize(bits)?;
         }
         Ok(())
+    }
+
+    /// Merge the 8-step distill LoRA (sc-3192) into every layer's **generation-path** attention
+    /// projections + SwiGLU (`*_mot_gen`); the understanding path is untouched. `prefix` is the
+    /// `language_model` namespace (matching [`Qwen3Backbone::from_weights`]). Must run before
+    /// [`Qwen3Backbone::quantize`] (the merge seam errors on a quantized base). Returns the total
+    /// number of linears merged (`7 · layers` when the LoRA carries every target).
+    pub fn merge_distill_lora(&mut self, lora: &Weights, prefix: &str) -> Result<usize> {
+        let mut n = 0;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let attn = format!("{prefix}.model.layers.{i}.self_attn");
+            n += layer.attn_gen.merge_distill_lora(lora, &attn, "_mot_gen")?;
+            let mlp = format!("{prefix}.model.layers.{i}.mlp_mot_gen");
+            n += layer.mlp_gen.merge_distill_lora(lora, &mlp)?;
+        }
+        Ok(n)
     }
 
     /// Run the full stack on a single path. `embeds` `[B,S,hidden]`; `temporal`/`height`/`width`

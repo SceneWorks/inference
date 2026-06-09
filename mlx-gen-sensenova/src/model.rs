@@ -12,8 +12,16 @@
 //! ([`T2iModel::interleave_gen`], text + images) cannot be expressed by [`GenerationOutput`]
 //! (`Images`/`Video` only), so they are consumed by the SceneWorks worker through those public
 //! [`T2iModel`] methods directly — the registry path here covers exactly the image-generation
-//! surface. `spec.quantize` (Q4/Q8) quantizes the backbone decoder stack (sc-3193); the 8-step
-//! `sensenova_u1_8b_fast` distill variant (sc-3192) extends this loader in its own slice.
+//! surface. `spec.quantize` (Q4/Q8) quantizes the backbone decoder stack (sc-3193).
+//!
+//! A **second** id, `sensenova_u1_8b_fast` (sc-3192), shares this loader: its [`load_fast`] merges
+//! the 8-step distill LoRA into the dense generation path before any quantization, and its
+//! generator applies the distilled defaults (`cfg_scale=1.0`, `num_steps=8`). Registering it under
+//! a distinct id makes the merge part of the model cache key — the worker caches by id, so the
+//! merged variant can never be served for the base id (and vice versa) even though they share the
+//! same on-disk base weights. User-supplied LoRAs stay rejected for both ids (`supports_lora=false`,
+//! matching the torch adapter); the distill LoRA is a curated property of the fast variant, not a
+//! user adapter.
 
 use mlx_rs::ops::divide;
 use mlx_rs::Array;
@@ -26,14 +34,21 @@ use mlx_gen::{
 };
 
 use crate::config::NeoChatConfig;
+use crate::distill::resolve_distill_lora;
 use crate::loader::load_raw;
 use crate::t2i::{smart_resize, T2iModel, T2iOptions};
 use crate::text::load_tokenizer;
+use mlx_gen::weights::Weights;
 
 pub const MODEL_ID: &str = "sensenova_u1_8b";
+/// The 8-step distilled variant (sc-3192): same base weights with the distill LoRA merged in.
+pub const MODEL_ID_FAST: &str = "sensenova_u1_8b_fast";
 
 const DEFAULT_STEPS: u32 = 50;
 const DEFAULT_GUIDANCE: f32 = 4.0;
+/// Distilled defaults (`docs/base_vs_distill.md`): 8 NFE at CFG 1.0 (guidance off).
+const DEFAULT_STEPS_FAST: u32 = 8;
+const DEFAULT_GUIDANCE_FAST: f32 = 1.0;
 const DEFAULT_TIMESTEP_SHIFT: f32 = 3.0;
 /// Cell = patch·merge: every side must be a multiple of this (the patchify grid).
 const CELL: u32 = 32;
@@ -42,8 +57,18 @@ const REF_MIN_PIXELS: i64 = 512 * 512;
 const REF_MAX_PIXELS: i64 = 2048 * 2048;
 
 pub fn descriptor() -> ModelDescriptor {
+    descriptor_for(MODEL_ID)
+}
+
+/// The descriptor for the 8-step distilled variant. Identical capabilities to the base — only the
+/// id and the generation defaults (applied in [`SenseNova::options`]) differ.
+pub fn descriptor_fast() -> ModelDescriptor {
+    descriptor_for(MODEL_ID_FAST)
+}
+
+fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
-        id: MODEL_ID,
+        id,
         family: "sensenova-u1",
         modality: Modality::Image,
         capabilities: Capabilities {
@@ -77,6 +102,8 @@ pub struct SenseNova {
     descriptor: ModelDescriptor,
     tokenizer: mlx_gen::tokenizer::TextTokenizer,
     model: T2iModel,
+    /// The 8-step distilled variant — selects the distilled generation defaults (8 NFE, CFG 1.0).
+    fast: bool,
 }
 
 impl SenseNova {
@@ -92,43 +119,75 @@ impl SenseNova {
     }
 }
 
-/// Construct a [`SenseNova`] from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
-/// pointing at a `sensenova/SenseNova-U1-8B-MoT` snapshot. Weights load dense at their on-disk dtype
-/// (bf16); `spec.quantize` (Q4/Q8) then quantizes the backbone decoder stack (sc-3193). LoRA (the
-/// 8-step distill, sc-3192) is not yet wired and is rejected rather than silently ignored.
+/// Construct the base [`SenseNova`] (`sensenova_u1_8b`) from a [`LoadSpec`]. `spec.weights` must be a
+/// [`WeightsSource::Dir`] pointing at a `sensenova/SenseNova-U1-8B-MoT` snapshot. Weights load dense
+/// at their on-disk dtype (bf16); `spec.quantize` (Q4/Q8) then quantizes the backbone decoder stack
+/// (sc-3193).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_inner(spec, false)
+}
+
+/// Construct the 8-step distilled [`SenseNova`] (`sensenova_u1_8b_fast`, sc-3192): the same base
+/// snapshot with the distill LoRA merged into the dense generation path **before** any
+/// quantization, plus the distilled generation defaults. The LoRA is resolved by
+/// [`resolve_distill_lora`] (env override / co-located / HF cache).
+pub fn load_fast(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_inner(spec, true)
+}
+
+fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
+    let id = if fast { MODEL_ID_FAST } else { MODEL_ID };
     if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(
-            "sensenova_u1_8b: only dense bf16 is wired (drop the precision override)".into(),
-        ));
+        return Err(Error::Msg(format!(
+            "{id}: only dense bf16 is wired (drop the precision override)"
+        )));
     }
+    // User-supplied LoRAs are unsupported on both ids (the distill LoRA is merged internally by the
+    // fast loader, not stacked via `spec.adapters`).
     if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "sensenova_u1_8b: adapters (the 8-step distill LoRA) are not wired yet (sc-3192)"
-                .into(),
-        ));
+        return Err(Error::Msg(format!(
+            "{id}: user-supplied adapters are not supported (supports_lora=false)"
+        )));
     }
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
-            return Err(Error::Msg(
-                "sensenova_u1_8b expects a snapshot directory, not a single .safetensors file"
-                    .into(),
-            ))
+            return Err(Error::Msg(format!(
+                "{id} expects a snapshot directory, not a single .safetensors file"
+            )))
         }
     };
     let cfg = NeoChatConfig::from_dir(root)?;
     let weights = load_raw(root)?;
     let mut model = T2iModel::from_weights(&weights, &cfg)?;
-    // Q4/Q8 quantize the backbone decoder stack after the dense bf16 load (sc-3193).
+    // The fast variant merges the 8-step distill LoRA into the dense generation path. This MUST
+    // precede quantization (the merge seam errors on a quantized base). Assert full coverage —
+    // `7 · layers` gen-path projections + the 2 FM-head Linears — so a stale/mismatched LoRA fails
+    // loudly rather than silently merging a subset.
+    if fast {
+        let lora_path = resolve_distill_lora(root)?;
+        let lora = Weights::from_file(&lora_path)?;
+        let applied = model.merge_distill_lora(&lora)?;
+        let expected = cfg.llm.num_hidden_layers * 7 + 2;
+        if applied != expected {
+            return Err(Error::Msg(format!(
+                "{id}: distill LoRA merged {applied} targets, expected {expected} \
+                 (7·{} gen-path linears + 2 fm_head) — wrong LoRA file?",
+                cfg.llm.num_hidden_layers
+            )));
+        }
+    }
+    // Q4/Q8 quantize the backbone decoder stack after the dense load (sc-3193). For the fast variant
+    // the distill LoRA is already merged, so quantization sees the distilled weights.
     if let Some(q) = spec.quantize {
         model.quantize(q.bits())?;
     }
     let tokenizer = load_tokenizer(root)?;
     Ok(Box::new(SenseNova {
-        descriptor: descriptor(),
+        descriptor: descriptor_for(id),
         tokenizer,
         model,
+        fast,
     }))
 }
 
@@ -152,10 +211,17 @@ impl SenseNova {
     }
 
     fn options(&self, req: &GenerationRequest, seed: u64) -> T2iOptions {
+        // The distilled variant defaults to 8 NFE at CFG 1.0; the base to 50 NFE at CFG 4.0. An
+        // explicit request value always wins.
+        let (def_steps, def_guidance) = if self.fast {
+            (DEFAULT_STEPS_FAST, DEFAULT_GUIDANCE_FAST)
+        } else {
+            (DEFAULT_STEPS, DEFAULT_GUIDANCE)
+        };
         T2iOptions {
-            cfg_scale: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
+            cfg_scale: req.guidance.unwrap_or(def_guidance),
             img_cfg_scale: req.true_cfg.unwrap_or(1.0),
-            num_steps: req.steps.unwrap_or(DEFAULT_STEPS) as usize,
+            num_steps: req.steps.unwrap_or(def_steps) as usize,
             timestep_shift: req.scheduler_shift.unwrap_or(DEFAULT_TIMESTEP_SHIFT),
             seed,
             ..Default::default()
@@ -240,6 +306,10 @@ inventory::submit! {
     ModelRegistration { descriptor, load }
 }
 
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_fast, load: load_fast }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,12 +326,38 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_fast_differs_only_in_id() {
+        let base = descriptor();
+        let fast = descriptor_fast();
+        assert_eq!(fast.id, "sensenova_u1_8b_fast");
+        assert_ne!(fast.id, base.id);
+        // Same capability surface as the base — only the id (and the generation defaults) differ.
+        assert_eq!(fast.family, base.family);
+        assert_eq!(fast.modality, base.modality);
+        assert_eq!(
+            fast.capabilities.supports_guidance,
+            base.capabilities.supports_guidance
+        );
+        assert_eq!(
+            fast.capabilities.supports_true_cfg,
+            base.capabilities.supports_true_cfg
+        );
+        assert!(fast.capabilities.accepts(ConditioningKind::Reference));
+        assert!(fast.capabilities.accepts(ConditioningKind::MultiReference));
+        assert!(!fast.capabilities.supports_lora);
+        assert_eq!(fast.capabilities.max_size, base.capabilities.max_size);
+    }
+
+    #[test]
     fn registered_in_registry() {
-        // The `inventory::submit!` is linked into the test binary, so the registry finds the id.
-        let found = mlx_gen::registry::generators().any(|r| (r.descriptor)().id == MODEL_ID);
+        // The `inventory::submit!`s are linked into the test binary, so the registry finds both ids.
+        let ids: Vec<&str> = mlx_gen::registry::generators()
+            .map(|r| (r.descriptor)().id)
+            .collect();
+        assert!(ids.contains(&MODEL_ID), "{MODEL_ID} not registered");
         assert!(
-            found,
-            "sensenova_u1_8b not registered in the generator registry"
+            ids.contains(&MODEL_ID_FAST),
+            "{MODEL_ID_FAST} not registered"
         );
     }
 
@@ -269,6 +365,26 @@ mod tests {
     fn load_rejects_single_file() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         assert!(load(&spec).is_err());
+        // The fast loader rejects a single file the same way (before touching the LoRA).
+        assert!(load_fast(&spec).is_err());
+    }
+
+    #[test]
+    fn both_loaders_reject_user_adapters() {
+        // `supports_lora=false` on both ids; the distill LoRA is merged internally by `load_fast`,
+        // never supplied via `spec.adapters`.
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/tmp/does-not-exist".into()));
+        spec.adapters = vec![mlx_gen::AdapterSpec::new(
+            "/tmp/some.safetensors".into(),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        )];
+        let msg = |r: Result<Box<dyn Generator>>| match r {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error rejecting adapters"),
+        };
+        assert!(msg(load(&spec)).contains("adapters"));
+        assert!(msg(load_fast(&spec)).contains("adapters"));
     }
 
     #[test]
