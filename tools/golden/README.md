@@ -108,6 +108,20 @@ HF_HUB_OFFLINE=1 PYTHONPATH=. /private/tmp/pulidenv/bin/python /path/to/mlx-gen/
 | `instantid/ip-adapter.safetensors` | `convert_instantid.py` | `tests/instantid_convert_smoke.rs` | sc-3112 weight conversion. Re-serializes `ip-adapter.bin` (pickle → safetensors) bundling `image_proj.*` (Resampler) + `ip_adapter.*` (70 decoupled-cross-attn K/V pairs), mirroring the h94 IP-Adapter namespace. The IdentityNet `ControlNetModel/diffusion_pytorch_model.safetensors` needs **no conversion** (stock SDXL ControlNet, loads via `ControlNet::from_weights` + `UNetConfig::sdxl_base()`). Source dtype (f32) preserved; loader casts. |
 | `instantid_resampler_golden.safetensors` | `dump_instantid_resampler_golden.py` | `tests/instantid_resampler_real_weights.rs` | sc-3110 face Resampler. InstantID's `image_proj_model` is the *same* Tencent `Resampler` as the SDXL IP-Adapter (sc-3059), validated under `ResamplerConfig::instantid_face()` (embedding_dim=512) on a seeded `[1,1,512]` ArcFace embed → `[1,16,2048]` face tokens. **Bundles the f32 `image_proj.*` weights** (from `InstantX/InstantID` `ip-adapter.bin`) so the test needs no separate converted file — hence ~313 MB (larger than the other goldens). f32 vs torch CPU → peak_rel 5.3e-4 (the `norm_out` renormalizes, like the IP-Adapter Resampler's 4.9e-4). |
 
+### SAM2 segmenter (`mlx-gen-sam2`, epic 3704)
+
+Dumped from the **MLX-native reference** `avbiswas/sam2-mlx` (the impl this crate ports) — run from
+the MLX venv with the reference checkout on `PYTHONPATH`, e.g.
+`PYTHONPATH=/tmp/sam2-mlx/src ~/mlx-flux-venv/bin/python tools/dump_<name>.py --size large`. Both
+sides run MLX Metal, so parity is near-bit.
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `sam2_encoder_golden_large.safetensors` | `dump_sam2_encoder_golden.py` | `tests/encoder_parity.rs` | sc-3705 Hiera trunk + FPN neck — `enc_in` [1,3,1024,1024] → the 3 backbone-FPN maps + position encodings. |
+| `sam2_segmenter_golden_large.safetensors` | `dump_sam2_segmenter_golden.py` | `tests/segmenter_parity.rs` | sc-3706 box-prompt decoder — encode→prompt-encode→two-way-transformer→mask. Bundles the full `trunk/neck/sam_prompt_encoder/sam_mask_decoder` weights + `enc_in`/`box_1024` + ref low-res masks/IoUs. |
+| `sam2_photo_golden.safetensors` | `dump_sam2_photo_golden.py` | `tests/photo_parity.rs` | sc-3708 real-photo box→mask vs the spike baseline (zidane/bus). |
+| `sam2_memory_golden_large.safetensors` | `dump_sam2_memory_golden.py` | `tests/memory_parity.rs` | sc-3713 Phase-B video layer — `memory_encoder.*`/`memory_attention.*` weights + two fixtures: the memory encoder (`mem_pix_feat`/`mem_masks` → 64-ch feature map + pos enc) and the memory attention (a 3-frame bank + 2 object pointers: `ma_curr`/`ma_mem`/… + `ma_num_obj` → conditioned tokens). Exercises the depthwise-conv ConvNeXt fuser and the interleaved axial RoPE self/cross attention with key-repeat + object-pointer RoPE exclusion. cos 1.0 (encoder mean-rel 0; attention mean-rel ~3e-5). |
+
 ### Weight-independent
 
 | golden | dump script | consumed by | notes |
