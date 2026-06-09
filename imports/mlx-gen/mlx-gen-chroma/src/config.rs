@@ -67,6 +67,17 @@ impl ChromaVariant {
         }
     }
 
+    /// Static flow-match time `shift` (diffusers `FlowMatchEulerDiscreteScheduler`,
+    /// `use_dynamic_shifting=false`): `σ' = shift·σ / (1 + (shift-1)·σ)`. HD's `scheduler_config.json`
+    /// pins `shift=3.0`; Flash pins `1.0`. **Base** ships `use_beta_sigmas=true` (a beta-spaced
+    /// schedule, not linspace) — handled in sc-3840; this `1.0` is a placeholder for Base.
+    pub fn sigma_shift(self) -> f32 {
+        match self {
+            Self::Hd => 3.0,
+            Self::Base | Self::Flash => 1.0,
+        }
+    }
+
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
             id: self.id(),

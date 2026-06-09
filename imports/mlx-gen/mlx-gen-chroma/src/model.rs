@@ -1,20 +1,30 @@
-//! Chroma provider registration + (forthcoming) txt2img generation path.
+//! Chroma provider registration + txt2img generation (sc-3839).
 //!
-//! **Skeleton (sc-3835):** the three variants register and load (tokenizer + T5 + VAE + transformer
-//! weights), and `validate` enforces the advertised capability surface. The full generate path —
-//! T5 masked encode (sc-3838), the Chroma DiT forward (sc-3836/sc-3837), and the true-CFG flow-match
-//! denoise + VAE decode (sc-3839) — lands in its own slices.
+//! Reuses the flux flow-match machinery (`build_linear_sigmas` for the raw `linspace(1,1/N,N)`;
+//! `create_noise`/`unpack_latents`; the shared AutoencoderKL `Vae::decode`) and the core
+//! `FlowMatchSampler` (Euler `x + v·Δσ`, `timestep(t)=σ`). Chroma's scheduler is **static-shift**
+//! (`use_dynamic_shifting=false`, `σ' = shift·σ/(1+(shift-1)·σ)`), NOT FLUX's resolution-dependent
+//! exp-shift, so the shift is applied here (see [`denoise`](Chroma::denoise)).
+//! Chroma-specific: T5-only masked encode (sc-3838), the per-step **true CFG** (`neg + g·(pos−neg)`),
+//! and the full-sequence MMDiT mask (text mask ++ image ones). The transformer runs f32 activations
+//! over the bf16 weights (mlx promotes), matching a diffusers-bf16→f32 reference.
 
+use mlx_gen::array::scalar;
+use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Result, WeightsSource,
+    default_seed, DiffusionSampler, Error, FlowMatchSampler, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
+    WeightsSource,
 };
-use mlx_gen_flux::T5TextEncoder;
+use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
 use mlx_gen_z_image::vae::Vae;
+use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
+use mlx_rs::Array;
 
 use crate::config::{ChromaTransformerConfig, ChromaVariant};
 use crate::loader;
+use crate::text::encode_prompt;
 use crate::transformer::ChromaTransformer;
 
 pub fn descriptor_hd() -> ModelDescriptor {
@@ -77,16 +87,141 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
 
 pub struct Chroma {
     descriptor: ModelDescriptor,
-    #[allow(dead_code)]
     variant: ChromaVariant,
-    #[allow(dead_code)]
     tokenizer: Option<TextTokenizer>,
-    #[allow(dead_code)]
     t5: Option<T5TextEncoder>,
-    #[allow(dead_code)]
     transformer: Option<ChromaTransformer>,
-    #[allow(dead_code)]
     vae: Option<Vae>,
+}
+
+/// FluxPosEmbed image position ids `[h2·w2, 3]` (axis 1 = row, axis 2 = col), row-major over the
+/// packed `(height/16, width/16)` grid — diffusers `_prepare_latent_image_ids`.
+fn latent_image_ids(h2: usize, w2: usize) -> Array {
+    let mut data = vec![0f32; h2 * w2 * 3];
+    for i in 0..h2 {
+        for j in 0..w2 {
+            let o = (i * w2 + j) * 3;
+            data[o + 1] = i as f32;
+            data[o + 2] = j as f32;
+        }
+    }
+    Array::from_slice(&data, &[(h2 * w2) as i32, 3])
+}
+
+/// Text position ids `[L, 3]` — all zero (FluxPosEmbed places every text token at the origin).
+fn zero_text_ids(l: usize) -> Array {
+    Array::from_slice(&vec![0f32; l * 3], &[l as i32, 3])
+}
+
+impl Chroma {
+    fn parts(&self) -> Result<(&TextTokenizer, &T5TextEncoder, &ChromaTransformer, &Vae)> {
+        let err = |w: &str| Error::Msg(format!("{}: {w} not loaded", self.descriptor.id));
+        Ok((
+            self.tokenizer.as_ref().ok_or_else(|| err("tokenizer"))?,
+            self.t5.as_ref().ok_or_else(|| err("t5"))?,
+            self.transformer
+                .as_ref()
+                .ok_or_else(|| err("transformer"))?,
+            self.vae.as_ref().ok_or_else(|| err("vae"))?,
+        ))
+    }
+
+    /// The full-sequence MMDiT mask `[1, L + Si]` (0/1) = text mask ++ image ones.
+    fn full_mask(text_mask: &Array, image_seq: i32) -> Result<Array> {
+        let ones = Array::ones::<f32>(&[1, image_seq])?;
+        Ok(concatenate_axis(&[text_mask, &ones], 1)?)
+    }
+
+    /// Run the true-CFG flow-match denoise from a given **packed** initial latent `[1, Si, 64]` →
+    /// final packed latent. Public so the e2e parity test can inject the reference's initial latents
+    /// (mlx and torch RNG differ); [`generate`](Self::generate) seeds it via `create_noise`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise(
+        &self,
+        prompt: &str,
+        negative: &str,
+        width: u32,
+        height: u32,
+        steps: u32,
+        guidance: f32,
+        latents: Array,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let (tok, t5, tr, _) = self.parts()?;
+        let (pos_embeds, pos_mask) = encode_prompt(tok, t5, prompt)?;
+        let (neg_embeds, neg_mask) = encode_prompt(tok, t5, negative)?;
+
+        let h2 = (height / 16) as usize;
+        let w2 = (width / 16) as usize;
+        let si = (h2 * w2) as i32;
+        let img_ids = latent_image_ids(h2, w2);
+        let txt_ids_pos = zero_text_ids(pos_embeds.shape()[1] as usize);
+        let txt_ids_neg = zero_text_ids(neg_embeds.shape()[1] as usize);
+        let mask_pos = Self::full_mask(&pos_mask, si)?;
+        let mask_neg = Self::full_mask(&neg_mask, si)?;
+
+        // Chroma's scheduler is `use_dynamic_shifting=false` with a **static** `shift` — NOT FLUX's
+        // resolution-dependent exp-shift. Take the raw mlx `linspace(1, 1/N, N)` (shift=false) and
+        // apply `σ' = shift·σ/(1+(shift-1)·σ)` on top. (shift=1.0 ⇒ identity.)
+        let shift = self.variant.sigma_shift();
+        let mut sigmas = build_linear_sigmas(steps as usize, width, height, false)?;
+        for s in sigmas.iter_mut().take(steps as usize) {
+            *s = shift * *s / (1.0 + (shift - 1.0) * *s);
+        }
+        let sampler = FlowMatchSampler::new(sigmas);
+        let n = sampler.num_steps();
+
+        let mut latents = latents;
+        for t in 0..n {
+            let ts = Array::from_slice(&[sampler.timestep(t)], &[1]);
+            let pos = tr.forward(
+                &latents,
+                &pos_embeds,
+                &ts,
+                &img_ids,
+                &txt_ids_pos,
+                Some(&mask_pos),
+            )?;
+            let neg = tr.forward(
+                &latents,
+                &neg_embeds,
+                &ts,
+                &img_ids,
+                &txt_ids_neg,
+                Some(&mask_neg),
+            )?;
+            // true CFG: neg + g·(pos − neg).
+            let pred = add(&neg, &multiply(&subtract(&pos, &neg)?, scalar(guidance))?)?;
+            latents = sampler.step(&pred, &latents, t)?;
+            on_progress(Progress::Step {
+                current: t as u32 + 1,
+                total: n as u32,
+            });
+        }
+        Ok(latents)
+    }
+
+    /// Test accessors (real-weight e2e, sc-3839).
+    #[doc(hidden)]
+    pub fn transformer_ref(&self) -> &ChromaTransformer {
+        self.transformer.as_ref().expect("transformer loaded")
+    }
+    #[doc(hidden)]
+    pub fn tokenizer_ref(&self) -> &TextTokenizer {
+        self.tokenizer.as_ref().expect("tokenizer loaded")
+    }
+    #[doc(hidden)]
+    pub fn t5_ref(&self) -> &T5TextEncoder {
+        self.t5.as_ref().expect("t5 loaded")
+    }
+
+    /// Unpack + VAE-decode a packed latent `[1, Si, 64]` → an [`Image`].
+    pub fn decode(&self, latents: &Array, width: u32, height: u32) -> Result<Image> {
+        let (_, _, _, vae) = self.parts()?;
+        let unpacked = unpack_latents(latents, width, height)?;
+        let decoded = vae.decode(&unpacked)?.as_dtype(mlx_rs::Dtype::Float32)?;
+        decoded_to_image(&decoded)
+    }
 }
 
 impl Generator for Chroma {
@@ -104,19 +239,46 @@ impl Generator for Chroma {
                 self.descriptor.id
             )));
         }
+        if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
+            return Err(Error::Msg(format!(
+                "{}: width and height must be multiples of 16, got {}x{}",
+                self.descriptor.id, req.width, req.height
+            )));
+        }
         Ok(())
     }
 
     fn generate(
         &self,
-        _req: &GenerationRequest,
-        _on_progress: &mut dyn FnMut(Progress),
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        Err(Error::Msg(format!(
-            "{}: generate is not yet wired — Chroma DiT forward (sc-3836/sc-3837) + true-CFG \
-             flow-match denoise (sc-3839) are pending",
-            self.descriptor.id
-        )))
+        self.validate(req)?;
+        let steps = req.steps.unwrap_or_else(|| self.variant.default_steps());
+        let guidance = req
+            .true_cfg
+            .unwrap_or_else(|| self.variant.default_true_cfg());
+        let negative = req.negative_prompt.as_deref().unwrap_or("");
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        for i in 0..req.count {
+            let seed = base_seed.wrapping_add(i as u64);
+            let latents = create_noise(seed, req.width, req.height)?;
+            let final_latents = self.denoise(
+                &req.prompt,
+                negative,
+                req.width,
+                req.height,
+                steps,
+                guidance,
+                latents,
+                on_progress,
+            )?;
+            on_progress(Progress::Decoding);
+            images.push(self.decode(&final_latents, req.width, req.height)?);
+        }
+        Ok(GenerationOutput::Images(images))
     }
 }
 
