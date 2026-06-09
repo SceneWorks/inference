@@ -103,6 +103,12 @@ pub struct GenerationRequest {
     /// for chunked video VAE decode (smaller = less peak memory, changes temporal-boundary
     /// behavior). `None` ⇒ the model default. Only `svd_xt` reads it today.
     pub decode_chunk_size: Option<u32>,
+    /// SVD motion **conditioning** fps — the cadence the model was trained on, baked into the
+    /// `added_time_ids` micro-conditioning (`fps − 1`); lower ⇒ smoother/slower motion. This is
+    /// distinct from [`fps`](Self::fps), which is the output/playback cadence used when muxing the
+    /// clip: SVD decouples them (diffusers `StableVideoDiffusionPipeline(fps=…)` vs
+    /// `export_to_video(fps=…)`). `None` ⇒ the model default (7). Only `svd_xt` reads it (sc-3764).
+    pub conditioning_fps: Option<u32>,
 
     // --- Prompt enhancement (LTX-2.3, sc-2845; ignored by other models) ---
     /// Rewrite `prompt` with an autoregressive Gemma-3 LLM before encoding (the reference
@@ -148,6 +154,7 @@ impl Default for GenerationRequest {
             motion_bucket_id: None,
             noise_aug_strength: None,
             decode_chunk_size: None,
+            conditioning_fps: None,
             enhance_prompt: false,
             use_uncensored_enhancer: false,
             enhance_max_tokens: None,

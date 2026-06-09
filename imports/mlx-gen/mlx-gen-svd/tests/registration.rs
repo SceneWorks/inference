@@ -197,3 +197,49 @@ fn svd_request_knobs_drive_generation() {
         "decode_chunk_size override must keep all frames"
     );
 }
+
+/// sc-3764: the SVD output/playback fps (`req.fps`) is decoupled from the motion-conditioning fps
+/// (`conditioning_fps`, baked into `added_time_ids`). The reported `fps` follows `req.fps` regardless
+/// of `conditioning_fps`, while changing `conditioning_fps` (at a fixed `req.fps`) changes the
+/// generated motion — proving each fps drives its own thing.
+#[test]
+#[ignore = "needs the SVD checkpoint in the HF cache (loads the full f32 model)"]
+fn svd_output_fps_decoupled_from_conditioning_fps() {
+    let snap = svd_snapshot_dir();
+    let gen = registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap))).expect("load svd");
+
+    let run = |cond_fps: u32| {
+        let req = GenerationRequest {
+            width: 256,
+            height: 256,
+            frames: Some(3),
+            steps: Some(2),
+            fps: Some(12),                    // output/playback cadence
+            conditioning_fps: Some(cond_fps), // motion-conditioning cadence
+            seed: Some(7),
+            conditioning: vec![Conditioning::Reference {
+                image: gradient_image(48, 48),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        match gen.generate(&req, &mut |_| {}).expect("generate") {
+            GenerationOutput::Video { frames, fps, .. } => (frames, fps),
+            other => panic!("expected Video, got {other:?}"),
+        }
+    };
+
+    let (frames_a, fps_a) = run(7);
+    let (frames_b, fps_b) = run(20);
+    // Output fps follows req.fps (12) regardless of the conditioning fps.
+    assert_eq!(
+        fps_a, 12,
+        "output fps must follow req.fps, not conditioning_fps"
+    );
+    assert_eq!(fps_b, 12);
+    // The conditioning fps still drives the motion (different added_time_ids ⇒ different frames).
+    assert!(
+        frames_a[2].pixels != frames_b[2].pixels,
+        "conditioning_fps must change the generated motion"
+    );
+}
