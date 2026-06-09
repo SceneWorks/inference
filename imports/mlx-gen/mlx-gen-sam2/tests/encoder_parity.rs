@@ -10,7 +10,7 @@
 //!   cargo test -p mlx-gen-sam2 --release --test encoder_parity -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
-use mlx_gen_sam2::{Sam2ImageEncoderConfig, Sam2ImageEncoder};
+use mlx_gen_sam2::{Sam2ImageEncoder, Sam2ImageEncoderConfig};
 use mlx_rs::Array;
 
 const GOLDEN: &str = concat!(
@@ -38,9 +38,18 @@ fn flat(a: &Array) -> Vec<f32> {
 fn rel_errors(got: &Array, want: &Array) -> (f32, f32) {
     let a = flat(got);
     let b = flat(want);
-    assert_eq!(a.len(), b.len(), "shape {:?} vs {:?}", got.shape(), want.shape());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "shape {:?} vs {:?}",
+        got.shape(),
+        want.shape()
+    );
     let peak_ref = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_diff = a.iter().zip(&b).fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
+    let max_diff = a
+        .iter()
+        .zip(&b)
+        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
     let sum_ref: f64 = b.iter().map(|&v| v.abs() as f64).sum();
     let sum_diff: f64 = a.iter().zip(&b).map(|(&x, &y)| (x - y).abs() as f64).sum();
     (max_diff / peak_ref, (sum_diff / sum_ref) as f32)
@@ -59,10 +68,19 @@ fn cosine(got: &Array, want: &Array) -> f32 {
 }
 
 fn assert_parity(got: &Array, want: &Array, label: &str) {
-    assert_eq!(got.shape(), want.shape(), "{label} shape {:?} vs {:?}", got.shape(), want.shape());
+    assert_eq!(
+        got.shape(),
+        want.shape(),
+        "{label} shape {:?} vs {:?}",
+        got.shape(),
+        want.shape()
+    );
     let (peak, mean) = rel_errors(got, want);
     let cos = cosine(got, want);
-    println!("{label}: shape {:?} cos {cos:.7} peak-rel {peak:.3e} mean-rel {mean:.3e}", got.shape());
+    println!(
+        "{label}: shape {:?} cos {cos:.7} peak-rel {peak:.3e} mean-rel {mean:.3e}",
+        got.shape()
+    );
     assert!(cos > 0.9999, "{label} cosine {cos:.7}");
     assert!(mean < 1e-3, "{label} mean-rel {mean:.3e}");
 }
