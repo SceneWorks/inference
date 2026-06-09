@@ -15,3 +15,5 @@ mlx-gen = { path = ".." }
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
+# Link-time model registration (the `mlx_gen` registry; mirrors mlx-gen-sdxl). sc-3874.
+inventory = "0.3"
