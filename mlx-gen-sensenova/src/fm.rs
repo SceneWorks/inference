@@ -130,6 +130,20 @@ pub fn patchify(images: &Array, patch_size: i32) -> Result<Array> {
         .map_err(Error::from)
 }
 
+/// Channel-**first** patchify: `images` `[N,3,H,W]` → patches `[N, (H/ps)·(W/ps), 3·ps²]` with the
+/// patch flattened in `c,ph,pw` order (the reference `patchify(..., channel_first=True)`:
+/// `nchpwq → nhwcpq`). This is the layout the gen-path vision embedder expects — its
+/// `patch_embedding` Conv weight flattens to `[embed, ch·ps·ps]` in the same `c,ph,pw` order — so the
+/// current noisy image is fed through here before [`crate::vision::NeoVisionEmbedder::forward`].
+pub fn patchify_channel_first(images: &Array, patch_size: i32) -> Result<Array> {
+    let sh = images.shape();
+    let (n, h, w) = (sh[0], sh[2] / patch_size, sh[3] / patch_size);
+    let x = images.reshape(&[n, 3, h, patch_size, w, patch_size])?;
+    let x = x.transpose_axes(&[0, 2, 4, 1, 3, 5])?; // nchpwq -> nhwcpq
+    x.reshape(&[n, h * w, 3 * patch_size * patch_size])
+        .map_err(Error::from)
+}
+
 /// Inverse of [`patchify`]: patches `[N,L,ps²·3]` → `[N,3,H,W]` (`nhwpqc → nchpwq`). `h`/`w` are
 /// the token-grid dims; if `None`, a square grid is assumed.
 pub fn unpatchify(x: &Array, patch_size: i32, h: Option<i32>, w: Option<i32>) -> Result<Array> {
