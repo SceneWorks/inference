@@ -14,8 +14,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, DiffusionSampler, Image, Result};
 
 use mlx_gen_sdxl::{
-    decode_image, denoise, load_unet_kolors_dtype, load_vae, Autoencoder, Denoiser,
-    UNet2DConditionModel,
+    decode_image, denoise, encode_init_latents, load_unet_kolors_dtype, load_vae, Autoencoder,
+    Denoiser, UNet2DConditionModel,
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
@@ -24,6 +24,9 @@ use crate::tokenizer::KolorsTokenizer;
 
 /// VAE spatial downscale (latent is image/8 per side).
 pub const SPATIAL_SCALE: i32 = 8;
+
+/// diffusers `KolorsImg2ImgPipeline` default `strength` (how much of the schedule to re-noise/denoise).
+pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.3;
 
 /// A loaded Kolors model: ChatGLM3 text encoder + tokenizer + SDXL-family U-Net (with the ChatGLM
 /// context projection) + SDXL VAE.
@@ -139,6 +142,90 @@ impl Kolors {
         let neg = self.encode(negative)?;
         let latents =
             self.denoise_latents(&init_noise, &pos, &neg, num_steps, cfg, height, width)?;
+        self.decode(&latents)
+    }
+
+    /// Run the img2img CFG denoise loop from pre-encoded init latents + a supplied noise tensor —
+    /// split out (like [`denoise_latents`](Self::denoise_latents)) so the parity gate can feed
+    /// diffusers' exact VAE-encoded init + noise. `init_latents` is the scaled VAE mean
+    /// `[1, h, w, 4]`; the sampler is the strength-sliced schedule, the init is seeded via
+    /// [`KolorsEulerSampler::add_noise`] (raw `x₀ + noise·σ_start`, no `scale_initial_noise`), and the
+    /// loop runs the remaining `int(num_steps·strength)` steps. Returns the final latents.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_img2img_latents(
+        &self,
+        init_latents: &Array,
+        noise: &Array,
+        pos: &(Array, Array),
+        neg: &(Array, Array),
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        height: i32,
+        width: i32,
+    ) -> Result<Array> {
+        use mlx_rs::ops::concatenate_axis;
+        let sampler = KolorsEulerSampler::kolors_img2img(num_steps, strength, self.dtype)?;
+        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
+        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
+        let time_ids = kolors_time_ids(2, height, width);
+        // Seed the init: raw `x₀ + noise·σ_start` (diffusers EulerDiscrete add_noise at begin_index).
+        let latents = sampler.add_noise(init_latents, noise)?;
+
+        let d = Denoiser {
+            unet: &self.unet,
+            sampler: &sampler,
+        };
+        let cancel = CancelFlag::new();
+        denoise(
+            &d,
+            latents,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            cfg,
+            &cancel,
+            &mut |_p| {},
+        )
+    }
+
+    /// Full img2img: VAE-encode `image` (resized to `height`×`width`) → seed at the strength-derived
+    /// start → encode the prompts → denoise the remaining steps → VAE-decode. Mirrors diffusers
+    /// `KolorsImg2ImgPipeline` (using the VAE encoder **mean** as the init, consistent with the rest
+    /// of mlx-gen-sdxl's img2img — the production fork convention; the diffusers default samples the
+    /// latent dist, which is not reproducible cross-backend). `cfg` ≤ 1 disables guidance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn img2img(
+        &self,
+        image: &Image,
+        prompt: &str,
+        negative: &str,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+    ) -> Result<Image> {
+        // VAE-encode the init (no RNG: mean, not a sample) so the first global-RNG draw is the
+        // add_noise noise — matching the reference's `prepare_latents` order.
+        let init_latents = encode_init_latents(&self.vae, image, width as u32, height as u32)?;
+        random::seed(seed)?;
+        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+        let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+        let pos = self.encode(prompt)?;
+        let neg = self.encode(negative)?;
+        let latents = self.denoise_img2img_latents(
+            &init_latents,
+            &noise,
+            &pos,
+            &neg,
+            num_steps,
+            strength,
+            cfg,
+            height,
+            width,
+        )?;
         self.decode(&latents)
     }
 }
