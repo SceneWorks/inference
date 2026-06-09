@@ -68,6 +68,18 @@ impl Kolors {
         })
     }
 
+    /// Load every Kolors component, then **load-time quantize** the memory drivers to `bits` (4 or 8)
+    /// — the mlx-gen-sdxl sc-2641 path: the dense fp16 snapshot is loaded and packed in-memory (there
+    /// is no pre-quantized Kolors snapshot). Quantizes the 6B ChatGLM3 encoder (the dominant footprint)
+    /// **and** the SDXL-family U-Net (reusing its own `quantize`); the VAE stays f32 (it overflows in
+    /// low precision — the SDXL-family convention). `bits` ∈ {4, 8}.
+    pub fn load_quantized(snapshot: &std::path::Path, dtype: Dtype, bits: i32) -> Result<Self> {
+        let mut m = Self::load(snapshot, dtype)?;
+        m.chatglm.quantize(bits)?;
+        m.unet.quantize(bits)?;
+        Ok(m)
+    }
+
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])`, threading the tokenizer's
     /// left-padded `position_ids` into the ChatGLM3 RoPE (as `KolorsPipeline.encode_prompt` does).
     pub fn encode(&self, prompt: &str) -> Result<(Array, Array)> {
