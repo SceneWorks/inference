@@ -76,7 +76,7 @@ fn check_case(model: &ChatGlmModel, g: &Weights, prefix: &str, num_hidden: usize
 
     // The Kolors extraction: context = hidden_states[-2], pooled = hidden_states[-1] last token.
     let (context, pooled) = model
-        .encode_prompt(input_ids, attention_mask)
+        .encode_prompt(input_ids, attention_mask, None)
         .expect("encode_prompt");
     let ctx_pr = peak_rel(&context, g.require(&format!("{prefix}context")).unwrap());
     let pooled_pr = peak_rel(&pooled, g.require(&format!("{prefix}pooled")).unwrap());

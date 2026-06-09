@@ -217,18 +217,22 @@ impl ChatGlmModel {
         })
     }
 
-    /// Rotary `(cos, sin)`, each `[1, seq, 1, rotary_dim/2]`, computed in f32 then cast to the compute
-    /// dtype — the reference's `forward_impl` (idx_theta in f32, `cos`/`sin`, cast to the model dtype).
-    fn rope_tables(&self, seq: i32) -> Result<(Array, Array)> {
+    /// Rotary `(cos, sin)`, each `[1, seq, 1, rotary_dim/2]`, for the given absolute `positions` (one
+    /// per sequence slot). Computed in f32 then cast to the compute dtype — the reference's
+    /// `forward_impl` (idx_theta in f32, `cos`/`sin`, cast to the model dtype). Kolors left-pads, so
+    /// `positions` are the tokenizer's `position_ids` (pad slots → 0, real tokens → 0..L-1), NOT a
+    /// plain arange (see [`forward`](Self::forward)).
+    fn rope_tables(&self, positions: &[i32]) -> Result<(Array, Array)> {
+        let seq = positions.len() as i32;
         let half = (self.cfg.rotary_dim / 2) as usize;
         let rot = self.cfg.rotary_dim as f32;
         let inv_freq: Vec<f32> = (0..half)
             .map(|j| 1.0 / self.cfg.rope_base.powf((2 * j) as f32 / rot))
             .collect();
-        let mut freqs = Vec::with_capacity(seq as usize * half);
-        for s in 0..seq {
+        let mut freqs = Vec::with_capacity(positions.len() * half);
+        for &p in positions {
             for &f in &inv_freq {
-                freqs.push(s as f32 * f);
+                freqs.push(p as f32 * f);
             }
         }
         let freqs = Array::from_slice(&freqs, &[1, seq, 1, half as i32]);
@@ -327,8 +331,22 @@ impl ChatGlmModel {
     /// Run the encoder, returning the **`num_layers + 1` (29)** hidden states the reference
     /// `all_hidden_states` exposes: `[embedding, out(layer 0), …, out(layer 27)]`, each `[B,S,hidden]`,
     /// the last entry **pre**-`final_layernorm`. `input_ids` / `attention_mask` are `[B, S]` (i32);
-    /// `attention_mask` is 1 for valid tokens, 0 for padding.
+    /// `attention_mask` is 1 for valid tokens, 0 for padding. RoPE positions are a plain `0..S` arange
+    /// (the reference default when `position_ids=None`); use [`forward_with_positions`] for Kolors'
+    /// left-padded `position_ids`.
     pub fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<Vec<Array>> {
+        self.forward_with_positions(input_ids, attention_mask, None)
+    }
+
+    /// Like [`forward`](Self::forward) but with explicit RoPE `position_ids` `[B, S]` (i32). Kolors
+    /// passes the tokenizer's left-padded `position_ids` (pad slots 0, real tokens 0..L-1) for both
+    /// the positive and negative prompt; `None` falls back to a `0..S` arange.
+    pub fn forward_with_positions(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        position_ids: Option<&Array>,
+    ) -> Result<Vec<Array>> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
         let ids = input_ids.reshape(&[-1])?;
@@ -337,8 +355,16 @@ impl ChatGlmModel {
             .take_axis(&ids, 0)?
             .reshape(&[b, s, self.cfg.hidden_size])?;
 
+        let positions: Vec<i32> = match position_ids {
+            Some(p) => p
+                .reshape(&[-1])?
+                .as_dtype(Dtype::Int32)?
+                .as_slice::<i32>()
+                .to_vec(),
+            None => (0..s).collect(),
+        };
         let mask = self.causal_padding_mask(attention_mask, b, s)?;
-        let (cos, sin) = self.rope_tables(s)?;
+        let (cos, sin) = self.rope_tables(&positions)?;
 
         let mut hiddens = Vec::with_capacity(self.cfg.num_layers + 1);
         hiddens.push(h.clone()); // state 0 = embedding (input to layer 0)
@@ -351,12 +377,14 @@ impl ChatGlmModel {
 
     /// Extract Kolors conditioning: `(context, pooled)`. `context` = `hidden_states[-2]` `[B,S,hidden]`
     /// (penultimate layer); `pooled` = `hidden_states[-1]` at the **last sequence position** `[B,hidden]`.
+    /// `position_ids` is the tokenizer's left-padded RoPE positions (`None` ⇒ `0..S` arange).
     pub fn encode_prompt(
         &self,
         input_ids: &Array,
         attention_mask: &Array,
+        position_ids: Option<&Array>,
     ) -> Result<(Array, Array)> {
-        let hs = self.forward(input_ids, attention_mask)?;
+        let hs = self.forward_with_positions(input_ids, attention_mask, position_ids)?;
         let n = hs.len();
         let context = hs[n - 2].clone();
         let last = &hs[n - 1];

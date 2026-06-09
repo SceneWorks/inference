@@ -11,5 +11,9 @@
 //!    (sc-3097/98).
 
 pub mod chatglm3;
+pub mod model;
+pub mod sampler;
 pub mod tokenizer;
 pub mod unet;
+
+pub use model::Kolors;
