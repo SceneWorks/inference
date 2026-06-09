@@ -36,8 +36,11 @@ use mlx_gen_sdxl::{
     ControlContext, Denoiser,
 };
 
+use mlx_gen::image::resize_lanczos_u8;
+
 use crate::kps;
 use crate::openpose::{self, BodyPoint, STICKWIDTH};
+use crate::restore;
 
 /// The InstantID compute dtype — fp16, matching the production SDXL path (the VAE stays f32 inside
 /// the SDXL loader).
@@ -51,6 +54,13 @@ pub const DEFAULT_CONTROLNET_SCALE: f32 = 0.8;
 pub const DEFAULT_OPENPOSE_SCALE: f32 = 0.7;
 /// The no-face-visible OpenPose scale floor (`instantid_adapter.py:425` `max(openPoseScale, 0.85)`).
 const NO_FACE_OPENPOSE_FLOOR: f32 = 0.85;
+/// Default face-restoration prompt (sc-3380). **Gender-neutral by design** — the worker's
+/// `_FACE_RESTORE_PROMPT` is hardcoded "the woman's face" and applied to every character (a latent
+/// bug); the native port neutralizes it ("the face"). Callers may pass a character-specific prompt.
+pub const FACE_RESTORE_PROMPT: &str =
+    "close-up portrait of the face, soft natural light, photorealistic, sharp focus";
+/// The face-restore crop padding factor (`instantid_adapter.py:483` `* 1.9`).
+const FACE_RESTORE_CROP_PAD: f32 = 1.9;
 
 /// Paths to the InstantID checkpoints.
 pub struct InstantIdPaths {
@@ -492,5 +502,78 @@ impl InstantId {
             ip_scale,
         )?;
         decode_image(&self.vae, &latents)
+    }
+
+    /// **Face-restoration pass** (sc-3380): ADetailer-style identity recovery at full-body framing.
+    /// Detect the largest face in `base`, crop it with `1.9×` padding, re-render that crop through the
+    /// InstantID pipe (IdentityNet only — the OpenPose branch is a no-op at restore time, so this is
+    /// the single-control [`generate_with`] path) with the reference `embedding`, then paste it back
+    /// with a feathered elliptical mask. Recovers ArcFace identity from ~0.38 to ~0.88 at full-body
+    /// framing. A no-op (returns `base` unchanged) when no face is found or the crop is degenerate.
+    ///
+    /// `req.prompt` is the restore prompt — pass [`FACE_RESTORE_PROMPT`] (gender-neutral) or a
+    /// character-specific one; `req.width` is the (square) re-render side (1024 in production). The
+    /// other request fields (negative, steps, guidance, scales, seed) drive the crop re-render.
+    /// Requires [`with_face`](Self::with_face).
+    pub fn restore_face(
+        &self,
+        req: &InstantIdRequest,
+        base: &Image,
+        embedding: &[f32],
+    ) -> Result<Image> {
+        let face = self
+            .face
+            .as_ref()
+            .ok_or_else(|| Error::Msg("instantid: face stack not attached (with_face)".into()))?;
+        let (bw, bh) = (base.width as usize, base.height as usize);
+        let mut faces = face.analyze(&base.pixels, bh, bw)?;
+        if faces.is_empty() {
+            return Ok(base.clone()); // no face to restore — leave the base untouched
+        }
+        let f = faces.remove(0); // analyze() sorts largest-first
+
+        // Crop box: a square-ish window around the face center, padded ×1.9, clamped to the image.
+        let [x1, y1, x2, y2] = f.bbox;
+        let (cx, cy) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
+        let half = (x2 - x1).max(y2 - y1) * FACE_RESTORE_CROP_PAD / 2.0;
+        let a = (cx - half).max(0.0) as usize;
+        let b = (cy - half).max(0.0) as usize;
+        let c = (cx + half).min(base.width as f32) as usize;
+        let d = (cy + half).min(base.height as f32) as usize;
+        let (crop_w, crop_h) = (c.saturating_sub(a), d.saturating_sub(b));
+        if crop_w < 16 || crop_h < 16 {
+            return Ok(base.clone()); // degenerate crop — skip
+        }
+
+        // Re-place the detected face's 5 kps into the crop, scaled to the square re-render side.
+        let side = req.width;
+        let (sx, sy) = (side as f32 / crop_w as f32, side as f32 / crop_h as f32);
+        let kps: Vec<(f32, f32)> = f
+            .kps
+            .iter()
+            .map(|&[kx, ky]| ((kx - a as f32) * sx, (ky - b as f32) * sy))
+            .collect();
+
+        // Re-render the crop (IdentityNet only) imposing the reference identity, then downscale back.
+        let restore_req = InstantIdRequest {
+            width: side,
+            height: side,
+            ..req.clone()
+        };
+        let restored = self.generate_with(&restore_req, embedding, &kps)?;
+        let small_f = resize_lanczos_u8(
+            &restored.pixels,
+            side as usize,
+            side as usize,
+            crop_h,
+            crop_w,
+        );
+        let small: Vec<u8> = small_f.iter().map(|&v| v as u8).collect();
+
+        // Feathered elliptical paste-back onto a copy of the base.
+        let alpha = restore::feather_mask(crop_w, crop_h);
+        let mut out = base.clone();
+        restore::paste_alpha(&mut out, &small, crop_w, crop_h, a, b, &alpha);
+        Ok(out)
     }
 }

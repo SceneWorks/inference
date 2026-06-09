@@ -316,6 +316,92 @@ fn instantid_pose_mode_preserves_identity() {
 }
 
 #[test]
+#[ignore = "needs SDXL base + InstantID + xinsir OpenPose + ip-adapter + face goldens + reference"]
+fn instantid_face_restore_improves_identity() {
+    // sc-3380: the face-restoration pass recovers identity at full-body framing. Generate a pose
+    // (small full-body face), then run restore_face — the re-rendered + feathered-paste crop should
+    // measurably raise the ArcFace-cosine vs the un-restored base (the reference: ~0.38 → ~0.88).
+    let size = env_usize("INSTANTID_SIZE", 1024) as u32;
+
+    let paths = InstantIdPaths {
+        sdxl_base: sdxl_base(),
+        identitynet: instantid_controlnet(),
+        ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
+    };
+    let model = InstantId::load(&paths)
+        .expect("load InstantID")
+        .with_openpose(&openpose_controlnet())
+        .expect("attach OpenPose ControlNet")
+        .with_face(
+            &golden("scrfd_10g.safetensors"),
+            &golden("arcface_iresnet100.safetensors"),
+        )
+        .expect("attach face stack");
+
+    let g = golden("instantid_e2e_ref.safetensors");
+    let wh = g.require("ref_wh").unwrap().as_slice::<i32>().to_vec();
+    let ref_img = Image {
+        width: wh[0] as u32,
+        height: wh[1] as u32,
+        pixels: g.require("ref_img").unwrap().as_slice::<u8>().to_vec(),
+    };
+
+    // The reference embedding (identity target) from the letterboxed reference.
+    let canvas = letterbox(&ref_img, size, size);
+    let ref_face = model
+        .largest_face(&canvas.pixels, size as usize, size as usize)
+        .expect("detect reference face");
+
+    let req = InstantIdRequest {
+        prompt:
+            "full body photo of a person standing, cinematic lighting, sharp focus, high detail"
+                .into(),
+        negative: "lowres, blurry, deformed, disfigured, extra limbs".into(),
+        width: size,
+        height: size,
+        ..Default::default()
+    };
+    let base = model
+        .generate_pose(&req, &ref_img, &dance_01_keypoints())
+        .expect("generate pose");
+    let base_face = model
+        .largest_face(&base.pixels, size as usize, size as usize)
+        .expect("detect base face");
+    let base_cos = cosine(&ref_face.embedding, &base_face.embedding);
+
+    // Restore with the gender-neutral default prompt (sc-3380 bug fix).
+    let restore_req = InstantIdRequest {
+        prompt: mlx_gen_instantid::FACE_RESTORE_PROMPT.into(),
+        ..req.clone()
+    };
+    let restored = model
+        .restore_face(&restore_req, &base, &ref_face.embedding)
+        .expect("restore face");
+    assert_eq!(
+        (restored.width, restored.height),
+        (size, size),
+        "restore keeps the base dims"
+    );
+    save_png("instantid_e2e_restore_out.png", &restored);
+
+    let out_face = model
+        .largest_face(&restored.pixels, size as usize, size as usize)
+        .expect("detect restored face");
+    let restored_cos = cosine(&ref_face.embedding, &out_face.embedding);
+    println!(
+        "[instantid restore] {size}x{size} | ArcFace-cosine base={base_cos:.4} restored={restored_cos:.4}"
+    );
+    assert!(
+        restored_cos > base_cos,
+        "face-restore should improve identity: base {base_cos:.4} → restored {restored_cos:.4}"
+    );
+    assert!(
+        restored_cos > 0.55,
+        "restored identity weak: ArcFace-cosine {restored_cos:.4} (expected a strong recovery)"
+    );
+}
+
+#[test]
 #[ignore = "needs SDXL base + InstantID + converted ip-adapter + face goldens + reference"]
 fn instantid_view_angle_preserves_identity() {
     // sc-3117 (multi-view kps): rotate the reference identity to a named view from VIEW_ANGLE_KPS.
