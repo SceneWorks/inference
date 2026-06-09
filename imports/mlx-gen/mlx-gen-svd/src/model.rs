@@ -4,8 +4,10 @@
 //!
 //! image→video is wired via a single [`Conditioning::Reference`] image: it is CLIP-encoded for the
 //! UNet cross-attention conditioning and (noise-augmented) VAE-encoded into the per-frame image
-//! latent that is channel-concatenated into the UNet input. `motion_bucket_id` / `noise_aug_strength`
-//! use the reference defaults; `fps`, `frames`, `steps`, and the CFG ceiling come from the request.
+//! latent that is channel-concatenated into the UNet input. `motion_bucket_id` / `noise_aug_strength` /
+//! `conditioning_fps` (the motion cadence baked into `added_time_ids`) / `decode_chunk_size` /
+//! `frames` / `steps` / the CFG ceiling come from the request (each falling back to the reference
+//! default); `req.fps` is the decoupled output/playback cadence (sc-3764).
 //!
 //! Preprocessing (sc-3412): the CLIP image is resized with the faithful diffusers
 //! `_resize_with_antialiasing` (gaussian-blur + align-corners bicubic, in `[-1,1]` space — see
@@ -255,8 +257,12 @@ impl Generator for Svd {
         if let Some(s) = req.steps {
             params.num_inference_steps = s as usize;
         }
-        if let Some(fps) = req.fps {
-            params.fps = fps as i32;
+        // `params.fps` is the MOTION-conditioning cadence baked into `added_time_ids` (the value the
+        // model was trained on, ~7) — it comes from `conditioning_fps`, NOT `req.fps`. `req.fps` is the
+        // OUTPUT/playback cadence and is applied below at return time, so the two are decoupled
+        // (diffusers `StableVideoDiffusionPipeline(fps=…)` vs `export_to_video(fps=…)`; sc-3764).
+        if let Some(cfps) = req.conditioning_fps {
+            params.fps = cfps as i32;
         }
         if let Some(g) = req.guidance {
             params.max_guidance_scale = g;
@@ -321,6 +327,8 @@ impl Generator for Svd {
 
         Ok(GenerationOutput::Video {
             frames,
+            // Output/playback cadence = `req.fps` (decoupled from the motion-conditioning fps in
+            // `params.fps`); falls back to the conditioning fps when the caller left it unset.
             fps: req.fps.unwrap_or(params.fps as u32),
             audio: None,
         })
