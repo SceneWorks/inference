@@ -17,7 +17,7 @@ use mlx_gen::{CancelFlag, DiffusionSampler, Error, Image, Progress, Result};
 use crate::inpaint::InpaintBlend;
 use crate::sampler::EulerSampler;
 use crate::text_encoder::ClipTextEncoder;
-use crate::unet::{ControlNet, UNet2DConditionModel};
+use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 use crate::vae::Autoencoder;
 
 /// VAE spatial downscale (latent is image/8 per side).
@@ -95,7 +95,7 @@ pub fn denoise(
         cancel,
         on_progress,
         None,
-        None,
+        &[],
         None,
         None,
     )
@@ -126,7 +126,7 @@ pub fn denoise_inpaint(
         cancel,
         on_progress,
         Some(blend),
-        None,
+        &[],
         None,
         None,
     )
@@ -157,7 +157,7 @@ pub fn denoise_control(
         cancel,
         on_progress,
         None,
-        Some(control),
+        std::slice::from_ref(control),
         None,
         None,
     )
@@ -189,7 +189,7 @@ pub fn denoise_ip(
         cancel,
         on_progress,
         None,
-        None,
+        &[],
         Some((tokens, scale)),
         None,
     )
@@ -216,6 +216,44 @@ pub fn denoise_ip_control(
     tokens: &Array,
     scale: f32,
 ) -> Result<Array> {
+    denoise_ip_multi_control(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        std::slice::from_ref(control),
+        controlnet_encoder,
+        tokens,
+        scale,
+    )
+}
+
+/// Like [`denoise_ip_control`] but runs **multiple** ControlNet branches and sums their residuals
+/// before injection — the diffusers `MultiControlNetModel` rule (sc-3378). This is the engine for
+/// InstantID pose mode (sc-3117): `controls = [IdentityNet(kps), OpenPose(skeleton)]`, each with its
+/// own `conditioning_scale`, all sharing `controlnet_encoder` (the face tokens) as their
+/// cross-attention conditioning — exactly as the vendored InstantID pipeline passes the same
+/// `prompt_image_emb` to every sub-ControlNet. A single-element `controls` is bit-identical to
+/// [`denoise_ip_control`]; an empty `controls` reduces to [`denoise_ip`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_ip_multi_control(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    controls: &[ControlContext],
+    controlnet_encoder: &Array,
+    tokens: &Array,
+    scale: f32,
+) -> Result<Array> {
     denoise_core(
         d,
         latents,
@@ -226,7 +264,7 @@ pub fn denoise_ip_control(
         cancel,
         on_progress,
         None,
-        Some(control),
+        controls,
         Some((tokens, scale)),
         Some(controlnet_encoder),
     )
@@ -243,7 +281,7 @@ fn denoise_core(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     inpaint: Option<&InpaintBlend>,
-    control: Option<&ControlContext>,
+    controls: &[ControlContext],
     ip: Option<(&Array, f32)>,
     control_encoder: Option<&Array>,
 ) -> Result<Array> {
@@ -276,11 +314,15 @@ fn denoise_core(
         let timestep = d.sampler.timestep(i);
         // ControlNet cross-attn conditioning: `conditioning` (text) for tile-CN; the caller may
         // override it (InstantID feeds the face tokens as the IdentityNet's encoder_hidden_states).
+        // The override is shared across branches — matching the InstantID MultiControlNet path,
+        // where the vendored pipeline passes the same `prompt_image_emb` to every sub-ControlNet.
         let cn_enc = control_encoder.unwrap_or(conditioning);
-        let eps = match (ip, control) {
-            (Some((tokens, scale)), Some(cc)) => {
-                // InstantID (sc-3113/3114): the IdentityNet residuals (face-token conditioned) AND the
-                // face IP tokens injected into the UNet cross-attention, in one forward.
+        // MultiControlNet (sc-3378): run each branch and sum its (already conditioning_scale'd)
+        // residuals — the diffusers `MultiControlNetModel` rule. One branch ⇒ the single
+        // residual unchanged (bit-exact regression vs the pre-slice path); zero ⇒ `None`.
+        let combined: Option<ControlResiduals> = {
+            let mut acc: Option<ControlResiduals> = None;
+            for cc in controls {
                 let res = cc.controlnet.forward(
                     &x_unet,
                     &cc.control_image,
@@ -290,6 +332,17 @@ fn denoise_core(
                     time_ids,
                     cc.scale,
                 )?;
+                acc = Some(match acc {
+                    None => res,
+                    Some(prev) => prev.add(&res)?,
+                });
+            }
+            acc
+        };
+        let eps = match (ip, combined.as_ref()) {
+            (Some((tokens, scale)), Some(res)) => {
+                // InstantID (sc-3113/3114/3117): the (possibly multi-branch summed) ControlNet
+                // residuals AND the face IP tokens injected into the UNet cross-attention.
                 d.unet.forward_with_ip_control(
                     &x_unet,
                     timestep,
@@ -297,7 +350,7 @@ fn denoise_core(
                     pooled,
                     time_ids,
                     (tokens, scale),
-                    &res,
+                    res,
                 )?
             }
             (Some((tokens, scale)), None) => {
@@ -311,24 +364,15 @@ fn denoise_core(
                     (tokens, scale),
                 )?
             }
-            (None, Some(cc)) => {
-                // ControlNet (sc-3058): run the branch on the model input, inject its residuals.
-                let res = cc.controlnet.forward(
-                    &x_unet,
-                    &cc.control_image,
-                    timestep,
-                    cn_enc,
-                    pooled,
-                    time_ids,
-                    cc.scale,
-                )?;
+            (None, Some(res)) => {
+                // ControlNet (sc-3058 / MultiControlNet sc-3378): inject the (summed) residuals.
                 d.unet.forward_with_control(
                     &x_unet,
                     timestep,
                     conditioning,
                     pooled,
                     time_ids,
-                    &res,
+                    res,
                 )?
             }
             (None, None) => d
