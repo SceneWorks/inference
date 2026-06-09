@@ -141,6 +141,9 @@ pub struct NeoChatConfig {
     pub noise_scale_mode: String,
     pub noise_scale: f32,
     pub noise_scale_max_value: f32,
+    /// Reference sequence length the resolution-mode noise scale is normalised against
+    /// (`noise_scale = sqrt(image_seq_len / noise_scale_base_image_seq_len) · noise_scale`).
+    pub noise_scale_base_image_seq_len: usize,
     /// When `true` (the 8B-MoT case) the checkpoint carries a `fm_modules.noise_scale_embedder`.
     pub add_noise_scale_embedding: bool,
     pub fm_head_dim: usize,
@@ -183,6 +186,7 @@ impl NeoChatConfig {
             noise_scale_mode: get_str(v, "noise_scale_mode", "resolution"),
             noise_scale: get_f32(v, "noise_scale", 1.0),
             noise_scale_max_value: get_f32(v, "noise_scale_max_value", 8.0),
+            noise_scale_base_image_seq_len: get_usize(v, "noise_scale_base_image_seq_len", 64),
             add_noise_scale_embedding: get_bool(v, "add_noise_scale_embedding", true),
             fm_head_dim: get_usize(v, "fm_head_dim", 1536),
             fm_head_layers: get_usize(v, "fm_head_layers", 2),

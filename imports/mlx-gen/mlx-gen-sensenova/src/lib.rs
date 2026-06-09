@@ -42,6 +42,7 @@ pub mod fm;
 pub mod loader;
 pub mod qwen3;
 pub mod runtime;
+pub mod t2i;
 pub mod text;
 pub mod vision;
 
@@ -52,6 +53,7 @@ pub use fm::{
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
 pub use qwen3::{KvCache, Path, Qwen3Backbone};
 pub use runtime::{Sampler, ThinkRollout};
+pub use t2i::{smart_resize, CfgNorm, T2iModel, T2iOptions, T2iOutput};
 pub use text::{
     build_neo1_query, image_indexes, load_tokenizer, text_indexes, SYSTEM_MESSAGE_FOR_GEN,
 };
