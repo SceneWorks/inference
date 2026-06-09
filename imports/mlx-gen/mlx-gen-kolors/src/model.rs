@@ -41,7 +41,7 @@ pub struct Kolors {
 
 /// The SDXL-style micro-conditioning `time_ids` = `(H, W, 0, 0, H, W)` per row (the diffusers
 /// `_get_add_time_ids` for `original_size == target_size`, no crop).
-fn kolors_time_ids(batch: i32, height: i32, width: i32) -> Array {
+pub(crate) fn kolors_time_ids(batch: i32, height: i32, width: i32) -> Array {
     let (h, w) = (height as f32, width as f32);
     let row = [h, w, 0.0, 0.0, h, w];
     let mut v = Vec::with_capacity(batch as usize * 6);
@@ -93,6 +93,19 @@ impl Kolors {
     /// Decode latents `[1, h, w, 4]` → an RGB [`Image`] (`vae.decode(latents / 0.13025)`).
     pub fn decode(&self, latents: &Array) -> Result<Image> {
         decode_image(&self.vae, latents)
+    }
+
+    /// Crate-internal accessors for the registry [`Generator`](crate::registry) wrapper, which owns
+    /// the production count/cancel/progress denoise loop and needs the loaded U-Net / VAE / compute
+    /// dtype to drive the SDXL denoise primitives directly.
+    pub(crate) fn unet(&self) -> &UNet2DConditionModel {
+        &self.unet
+    }
+    pub(crate) fn vae(&self) -> &Autoencoder {
+        &self.vae
+    }
+    pub(crate) fn dtype(&self) -> Dtype {
+        self.dtype
     }
 
     /// Run the CFG denoise loop from a (raw, unit-normal) initial-noise tensor `init_noise`
