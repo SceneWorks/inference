@@ -30,12 +30,17 @@ use mlx_gen_sdxl::tokenizer::ClipBpeTokenizer;
 use mlx_gen_sdxl::unet::{ControlNet, UNet2DConditionModel};
 use mlx_gen_sdxl::vae::Autoencoder;
 use mlx_gen_sdxl::{
-    decode_image, denoise_ip_control, encode_conditioning, load_controlnet,
-    load_text_encoder_1_dtype, load_text_encoder_2_dtype, load_tokenizer, load_unet_dtype,
-    load_vae, preprocess_control_image, seeded_prior, text_time_ids, ControlContext, Denoiser,
+    decode_image, denoise_ip_control, denoise_ip_multi_control, encode_conditioning,
+    load_controlnet, load_text_encoder_1_dtype, load_text_encoder_2_dtype, load_tokenizer,
+    load_unet_dtype, load_vae, preprocess_control_image, seeded_prior, text_time_ids,
+    ControlContext, Denoiser,
 };
 
+use mlx_gen::image::resize_lanczos_u8;
+
 use crate::kps;
+use crate::openpose::{self, BodyPoint, STICKWIDTH};
+use crate::restore;
 
 /// The InstantID compute dtype — fp16, matching the production SDXL path (the VAE stays f32 inside
 /// the SDXL loader).
@@ -45,6 +50,17 @@ const DTYPE: Dtype = Dtype::Float16;
 pub const DEFAULT_IP_SCALE: f32 = 0.8;
 /// Default IdentityNet `controlnet_conditioning_scale` (the vendored default 0.8).
 pub const DEFAULT_CONTROLNET_SCALE: f32 = 0.8;
+/// Default OpenPose `controlnet_conditioning_scale` in pose mode (the worker's `openPoseScale` 0.7).
+pub const DEFAULT_OPENPOSE_SCALE: f32 = 0.7;
+/// The no-face-visible OpenPose scale floor (`instantid_adapter.py:425` `max(openPoseScale, 0.85)`).
+const NO_FACE_OPENPOSE_FLOOR: f32 = 0.85;
+/// Default face-restoration prompt (sc-3380). **Gender-neutral by design** — the worker's
+/// `_FACE_RESTORE_PROMPT` is hardcoded "the woman's face" and applied to every character (a latent
+/// bug); the native port neutralizes it ("the face"). Callers may pass a character-specific prompt.
+pub const FACE_RESTORE_PROMPT: &str =
+    "close-up portrait of the face, soft natural light, photorealistic, sharp focus";
+/// The face-restore crop padding factor (`instantid_adapter.py:483` `* 1.9`).
+const FACE_RESTORE_CROP_PAD: f32 = 1.9;
 
 /// Paths to the InstantID checkpoints.
 pub struct InstantIdPaths {
@@ -69,6 +85,8 @@ pub struct InstantIdRequest {
     pub guidance: f32,
     pub ip_adapter_scale: f32,
     pub controlnet_scale: f32,
+    /// OpenPose `controlnet_conditioning_scale` — used only by [`InstantId::generate_pose`].
+    pub openpose_scale: f32,
     pub seed: u64,
 }
 
@@ -83,6 +101,7 @@ impl Default for InstantIdRequest {
             guidance: 5.0,
             ip_adapter_scale: DEFAULT_IP_SCALE,
             controlnet_scale: DEFAULT_CONTROLNET_SCALE,
+            openpose_scale: DEFAULT_OPENPOSE_SCALE,
             seed: 0,
         }
     }
@@ -96,6 +115,8 @@ pub struct InstantId {
     te2: ClipTextEncoder,
     unet: UNet2DConditionModel,
     identitynet: ControlNet,
+    /// The OpenPose ControlNet for pose mode (sc-3117), attached via [`with_openpose`](Self::with_openpose).
+    openpose: Option<ControlNet>,
     resampler: Resampler,
     vae: Autoencoder,
     sampler: EulerSampler,
@@ -138,11 +159,21 @@ impl InstantId {
             te2,
             unet,
             identitynet,
+            openpose: None,
             resampler,
             vae,
             sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE),
             face: None,
         })
+    }
+
+    /// Attach the OpenPose ControlNet for pose mode (sc-3117) — a stock diffusers SDXL ControlNet
+    /// (`xinsir/controlnet-openpose-sdxl-1.0`), loaded via the same generic [`load_controlnet`] as
+    /// IdentityNet (no conversion). Required by [`generate_pose`](Self::generate_pose). Call after
+    /// [`load`](Self::load); call before [`quantize`](Self::quantize) so it quantizes with the stack.
+    pub fn with_openpose(mut self, openpose: &WeightsSource) -> Result<Self> {
+        self.openpose = Some(load_controlnet(openpose, DTYPE)?);
+        Ok(self)
     }
 
     /// Attach the native face-analysis stack (SCRFD detector + ArcFace embedder) so [`generate`] can
@@ -162,6 +193,9 @@ impl InstantId {
         self.te1.quantize(bits)?;
         self.te2.quantize(bits)?;
         self.identitynet.quantize(bits)?;
+        if let Some(op) = &mut self.openpose {
+            op.quantize(bits)?;
+        }
         Ok(self)
     }
 
@@ -245,31 +279,19 @@ impl InstantId {
         let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens)?;
         let time_ids = text_time_ids(pooled.shape()[0]);
 
-        // Face tokens via the Resampler. CFG positive-first: row 0 = Resampler(embed),
-        // row 1 = Resampler(zeros) (the reference's zero-embed-through-Resampler uncond).
-        let embed = Array::from_slice(embedding, &[1, 1, 512]).as_dtype(DTYPE)?;
-        let proj_in = if cfg_on {
-            let z = zeros::<f32>(&[1, 1, 512])?.as_dtype(DTYPE)?;
-            concatenate_axis(&[&embed, &z], 0)?
-        } else {
-            embed
-        };
-        let face_tokens = self.resampler.forward(&proj_in)?; // [B, 16, 2048]
+        // Face tokens via the Resampler (CFG positive-first; uncond = Resampler(zeros)).
+        let face_tokens = self.face_tokens(embedding, cfg_on)?; // [B, 16, 2048]
 
-        // kps control image (sc-3111) → [0,1] NHWC, cast to the compute dtype, CFG-batched.
+        // kps control image (sc-3111) → IdentityNet ControlContext.
         let kps_image = kps::draw_kps(req.width, req.height, kps);
-        let control =
-            preprocess_control_image(&kps_image, req.width, req.height)?.as_dtype(DTYPE)?;
-        let control = if cfg_on {
-            concatenate_axis(&[&control, &control], 0)?
-        } else {
-            control
-        };
-        let control_ctx = ControlContext {
-            controlnet: &self.identitynet,
-            control_image: control,
-            scale: req.controlnet_scale,
-        };
+        let control_ctx = self.control_ctx(
+            &self.identitynet,
+            &kps_image,
+            req.width,
+            req.height,
+            req.controlnet_scale,
+            cfg_on,
+        )?;
 
         // Ancestral Euler over the seeded prior (fp16).
         let prior = seeded_prior(&self.sampler, req.seed, req.width, req.height)?;
@@ -293,5 +315,265 @@ impl InstantId {
             req.ip_adapter_scale,
         )?;
         decode_image(&self.vae, &latents)
+    }
+
+    /// Build the CFG-batched face tokens from a 512-d ArcFace `embedding` (positive-first; the uncond
+    /// row is `Resampler(zeros)` — the reference's zero-embed-through-Resampler, not literal zeros).
+    fn face_tokens(&self, embedding: &[f32], cfg_on: bool) -> Result<Array> {
+        let embed = Array::from_slice(embedding, &[1, 1, 512]).as_dtype(DTYPE)?;
+        let proj_in = if cfg_on {
+            let z = zeros::<f32>(&[1, 1, 512])?.as_dtype(DTYPE)?;
+            concatenate_axis(&[&embed, &z], 0)?
+        } else {
+            embed
+        };
+        self.resampler.forward(&proj_in) // [B, 16, 2048]
+    }
+
+    /// Build a [`ControlContext`] for a control image: rasterized image → `[0,1]` NHWC, cast to the
+    /// compute dtype, CFG-batched (the negative pass sees the same control image, matching the
+    /// reference's duplicated control batch).
+    fn control_ctx<'a>(
+        &self,
+        controlnet: &'a ControlNet,
+        image: &Image,
+        width: u32,
+        height: u32,
+        scale: f32,
+        cfg_on: bool,
+    ) -> Result<ControlContext<'a>> {
+        let c = preprocess_control_image(image, width, height)?.as_dtype(DTYPE)?;
+        let control_image = if cfg_on {
+            concatenate_axis(&[&c, &c], 0)?
+        } else {
+            c
+        };
+        Ok(ControlContext {
+            controlnet,
+            control_image,
+            scale,
+        })
+    }
+
+    /// **Pose mode** (sc-3117): generate the character in one library pose on a square canvas. The
+    /// OpenPose skeleton (rendered from the pre-supplied `keypoints`) drives the body pose, while
+    /// IdentityNet and the face IP tokens anchor the face when the head is visible. The reference
+    /// supplies *identity* (its ArcFace embedding); the face landmarks are re-placed at the pose head.
+    ///
+    /// `req.width` is the square side (`req.height` ignored — the OpenPose/kps control images are
+    /// square-canonical, the kps-distortion rule). Requires [`with_face`](Self::with_face) +
+    /// [`with_openpose`](Self::with_openpose). The face-restoration pass (sc-3380) is a separate step.
+    pub fn generate_pose(
+        &self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        keypoints: &[BodyPoint],
+    ) -> Result<Image> {
+        let side = req.width;
+        // Identity from the reference (letterboxed to the square canvas).
+        let canvas = kps::letterbox(reference, side, side);
+        let face = self.largest_face(&canvas.pixels, side as usize, side as usize)?;
+        // Place the reference's 5 face landmarks at the pose's head position (when the head is
+        // visible). `None` ⇒ a back/occluded view: the no-face branch zeroes IdentityNet + IP.
+        let face_kps = openpose::face_box_from_keypoints(keypoints)
+            .map(|(cx, cy, face_h_frac)| self.place_face_kps(&face, cx, cy, face_h_frac, side));
+        let sq = InstantIdRequest {
+            width: side,
+            height: side,
+            ..req.clone()
+        };
+        self.generate_pose_with(&sq, &face.embedding, face_kps.as_deref(), keypoints)
+    }
+
+    /// Re-place the reference's 5-point face landmarks at a pose's head box. Mirrors
+    /// `instantid_adapter.py::_run_pose` + `_normalized_kps`: normalize the reference kps to its
+    /// detected bbox, then scale/translate to the head box `(cx, cy)` (normalized canvas coords) at
+    /// height `face_h_frac` of the canvas, preserving the face aspect. Returns canvas-pixel coords.
+    fn place_face_kps(
+        &self,
+        face: &Face,
+        cx: f64,
+        cy: f64,
+        face_h_frac: f64,
+        side: u32,
+    ) -> Vec<(f32, f32)> {
+        let [x1, y1, x2, y2] = face.bbox;
+        let (ox, oy) = (x1 as f64, y1 as f64);
+        let sw = (x2 - x1).max(1.0) as f64;
+        let sh = (y2 - y1).max(1.0) as f64;
+        let aspect = sw / sh;
+        let canvas = side as f64;
+        let face_h = canvas * face_h_frac;
+        let face_w = face_h * aspect;
+        face.kps
+            .iter()
+            .map(|&[kx, ky]| {
+                let nx = (kx as f64 - ox) / sw;
+                let ny = (ky as f64 - oy) / sh;
+                let px = cx * canvas + (nx - 0.5) * face_w;
+                let py = cy * canvas + (ny - 0.5) * face_h;
+                (px as f32, py as f32)
+            })
+            .collect()
+    }
+
+    /// Core pose-mode generate (face-stack-independent): MultiControlNet over `[IdentityNet(face_kps),
+    /// OpenPose(skeleton)]` with the face IP tokens. A `Some` `face_kps` (head visible) drives
+    /// IdentityNet and the IP tokens at the request scales; `None` (back/occluded) zeroes IdentityNet
+    /// and the IP tokens and boosts OpenPose to `max(openpose_scale, 0.85)`, matching
+    /// `instantid_adapter.py:424-426`. `req.width` is the square side; requires
+    /// [`with_openpose`](Self::with_openpose).
+    pub fn generate_pose_with(
+        &self,
+        req: &InstantIdRequest,
+        embedding: &[f32],
+        face_kps: Option<&[(f32, f32)]>,
+        keypoints: &[BodyPoint],
+    ) -> Result<Image> {
+        if embedding.len() != 512 {
+            return Err(Error::Msg(format!(
+                "instantid: ArcFace embedding must be 512-d, got {}",
+                embedding.len()
+            )));
+        }
+        let openpose = self.openpose.as_ref().ok_or_else(|| {
+            Error::Msg("instantid: pose mode needs the OpenPose ControlNet (with_openpose)".into())
+        })?;
+        let side = req.width;
+        let cfg_on = req.guidance > 1.0;
+
+        // Seed up front so the first RNG draw is the prior (conditioning draws no RNG).
+        mlx_rs::random::seed(req.seed)?;
+        let tokens = self
+            .tokenizer
+            .tokenize_batch(&req.prompt, if cfg_on { Some(&req.negative) } else { None })?;
+        let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens)?;
+        let time_ids = text_time_ids(pooled.shape()[0]);
+        let face_tokens = self.face_tokens(embedding, cfg_on)?;
+
+        // OpenPose skeleton control image (sc-3379), always at the requested pose scale.
+        let skeleton = openpose::draw_bodypose(side, side, keypoints, STICKWIDTH);
+
+        // Face landmark control image + per-branch scales. No visible face ⇒ blank kps, IdentityNet +
+        // IP zeroed, OpenPose boosted (the shared seed/prompt carry hair/wardrobe continuity).
+        let (face_image, id_scale, op_scale, ip_scale) = match face_kps {
+            Some(kps) => (
+                kps::draw_kps(side, side, kps),
+                req.controlnet_scale,
+                req.openpose_scale,
+                req.ip_adapter_scale,
+            ),
+            None => (
+                Image {
+                    width: side,
+                    height: side,
+                    pixels: vec![0u8; (side as usize) * (side as usize) * 3],
+                },
+                0.0,
+                req.openpose_scale.max(NO_FACE_OPENPOSE_FLOOR),
+                0.0,
+            ),
+        };
+        // MultiControlNet branch order matches the reference: [IdentityNet(kps), OpenPose(skeleton)].
+        let id_ctx =
+            self.control_ctx(&self.identitynet, &face_image, side, side, id_scale, cfg_on)?;
+        let op_ctx = self.control_ctx(openpose, &skeleton, side, side, op_scale, cfg_on)?;
+        let controls = [id_ctx, op_ctx];
+
+        // Ancestral Euler over the seeded prior (fp16).
+        let prior = seeded_prior(&self.sampler, req.seed, side, side)?;
+        let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time());
+        let d = Denoiser {
+            unet: &self.unet,
+            sampler: &ancestral,
+        };
+        let latents = denoise_ip_multi_control(
+            &d,
+            prior,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            req.guidance,
+            &Default::default(),
+            &mut |_| {},
+            &controls,
+            &face_tokens, // ControlNet cross-attn conditioning = face tokens (both branches)
+            &face_tokens, // UNet IP tokens = face tokens
+            ip_scale,
+        )?;
+        decode_image(&self.vae, &latents)
+    }
+
+    /// **Face-restoration pass** (sc-3380): ADetailer-style identity recovery at full-body framing.
+    /// Detect the largest face in `base`, crop it with `1.9×` padding, re-render that crop through the
+    /// InstantID pipe (IdentityNet only — the OpenPose branch is a no-op at restore time, so this is
+    /// the single-control [`generate_with`] path) with the reference `embedding`, then paste it back
+    /// with a feathered elliptical mask. Recovers ArcFace identity from ~0.38 to ~0.88 at full-body
+    /// framing. A no-op (returns `base` unchanged) when no face is found or the crop is degenerate.
+    ///
+    /// `req.prompt` is the restore prompt — pass [`FACE_RESTORE_PROMPT`] (gender-neutral) or a
+    /// character-specific one; `req.width` is the (square) re-render side (1024 in production). The
+    /// other request fields (negative, steps, guidance, scales, seed) drive the crop re-render.
+    /// Requires [`with_face`](Self::with_face).
+    pub fn restore_face(
+        &self,
+        req: &InstantIdRequest,
+        base: &Image,
+        embedding: &[f32],
+    ) -> Result<Image> {
+        let face = self
+            .face
+            .as_ref()
+            .ok_or_else(|| Error::Msg("instantid: face stack not attached (with_face)".into()))?;
+        let (bw, bh) = (base.width as usize, base.height as usize);
+        let mut faces = face.analyze(&base.pixels, bh, bw)?;
+        if faces.is_empty() {
+            return Ok(base.clone()); // no face to restore — leave the base untouched
+        }
+        let f = faces.remove(0); // analyze() sorts largest-first
+
+        // Crop box: a square-ish window around the face center, padded ×1.9, clamped to the image.
+        let [x1, y1, x2, y2] = f.bbox;
+        let (cx, cy) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
+        let half = (x2 - x1).max(y2 - y1) * FACE_RESTORE_CROP_PAD / 2.0;
+        let a = (cx - half).max(0.0) as usize;
+        let b = (cy - half).max(0.0) as usize;
+        let c = (cx + half).min(base.width as f32) as usize;
+        let d = (cy + half).min(base.height as f32) as usize;
+        let (crop_w, crop_h) = (c.saturating_sub(a), d.saturating_sub(b));
+        if crop_w < 16 || crop_h < 16 {
+            return Ok(base.clone()); // degenerate crop — skip
+        }
+
+        // Re-place the detected face's 5 kps into the crop, scaled to the square re-render side.
+        let side = req.width;
+        let (sx, sy) = (side as f32 / crop_w as f32, side as f32 / crop_h as f32);
+        let kps: Vec<(f32, f32)> = f
+            .kps
+            .iter()
+            .map(|&[kx, ky]| ((kx - a as f32) * sx, (ky - b as f32) * sy))
+            .collect();
+
+        // Re-render the crop (IdentityNet only) imposing the reference identity, then downscale back.
+        let restore_req = InstantIdRequest {
+            width: side,
+            height: side,
+            ..req.clone()
+        };
+        let restored = self.generate_with(&restore_req, embedding, &kps)?;
+        let small_f = resize_lanczos_u8(
+            &restored.pixels,
+            side as usize,
+            side as usize,
+            crop_h,
+            crop_w,
+        );
+        let small: Vec<u8> = small_f.iter().map(|&v| v as u8).collect();
+
+        // Feathered elliptical paste-back onto a copy of the base.
+        let alpha = restore::feather_mask(crop_w, crop_h);
+        let mut out = base.clone();
+        restore::paste_alpha(&mut out, &small, crop_w, crop_h, a, b, &alpha);
+        Ok(out)
     }
 }

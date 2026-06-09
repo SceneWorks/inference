@@ -98,6 +98,28 @@ pub struct ControlResiduals {
     pub mid: Array,
 }
 
+impl ControlResiduals {
+    /// Element-wise sum with another branch's residuals — the diffusers `MultiControlNetModel`
+    /// rule (sc-3378): each sub-ControlNet's down samples + mid sample are summed before injection
+    /// into the UNet. Both branches must produce the same number of down residuals (they share the
+    /// UNet's skip geometry). Used to combine e.g. InstantID's IdentityNet + an OpenPose ControlNet.
+    pub fn add(&self, other: &ControlResiduals) -> Result<ControlResiduals> {
+        if self.down.len() != other.down.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "controlnet residual sum: branch down counts differ ({} vs {})",
+                self.down.len(),
+                other.down.len()
+            )));
+        }
+        let mut down = Vec::with_capacity(self.down.len());
+        for (a, b) in self.down.iter().zip(&other.down) {
+            down.push(add(a, b)?);
+        }
+        let mid = add(&self.mid, &other.mid)?;
+        Ok(ControlResiduals { down, mid })
+    }
+}
+
 /// An SDXL ControlNet (UNet encoder copy + conditioning embedding + zero-conv heads).
 pub struct ControlNet {
     conv_in: Conv2dLayer,
@@ -268,5 +290,41 @@ impl ControlNet {
             proj.quantize(bits, None)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sc-3378: `ControlResiduals::add` sums the down + mid residuals element-wise (the diffusers
+    /// `MultiControlNetModel` rule) and rejects a down-count mismatch.
+    #[test]
+    fn residual_sum_is_elementwise() {
+        let a = ControlResiduals {
+            down: vec![
+                Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]),
+                Array::from_slice(&[4.0f32, 5.0], &[2]),
+            ],
+            mid: Array::from_slice(&[10.0f32, 20.0], &[2]),
+        };
+        let b = ControlResiduals {
+            down: vec![
+                Array::from_slice(&[0.5f32, 0.5, 0.5], &[3]),
+                Array::from_slice(&[-1.0f32, 1.0], &[2]),
+            ],
+            mid: Array::from_slice(&[1.0f32, -2.0], &[2]),
+        };
+        let s = a.add(&b).unwrap();
+        assert_eq!(s.down[0].as_slice::<f32>(), &[1.5, 2.5, 3.5]);
+        assert_eq!(s.down[1].as_slice::<f32>(), &[3.0, 6.0]);
+        assert_eq!(s.mid.as_slice::<f32>(), &[11.0, 18.0]);
+
+        // Mismatched down counts ⇒ error (the branches must share the UNet skip geometry).
+        let bad = ControlResiduals {
+            down: vec![Array::from_slice(&[0.0f32], &[1])],
+            mid: Array::from_slice(&[0.0f32, 0.0], &[2]),
+        };
+        assert!(a.add(&bad).is_err());
     }
 }
