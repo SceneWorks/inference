@@ -35,11 +35,13 @@
 //! `Generator` impl + `inventory` registration land in the following stories (sc-3182 … sc-3194).
 
 pub mod config;
+pub mod fm;
 pub mod loader;
 pub mod qwen3;
 pub mod vision;
 
 pub use config::{NeoChatConfig, NeoLlmConfig, NeoVisionConfig};
+pub use fm::{apply_time_schedule, euler_step, patchify, unpatchify, velocity, FmHead, TimestepEmbedder};
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
 pub use qwen3::{Path, Qwen3Backbone};
 pub use vision::NeoVisionEmbedder;
