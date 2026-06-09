@@ -38,6 +38,7 @@
 //! `Generator` impl + `inventory` registration land in the following stories (sc-3188 … sc-3194).
 
 pub mod config;
+pub mod distill;
 pub mod fm;
 pub mod loader;
 pub mod model;
@@ -48,11 +49,12 @@ pub mod text;
 pub mod vision;
 
 pub use config::{NeoChatConfig, NeoLlmConfig, NeoVisionConfig};
+pub use distill::{lora_delta, resolve_distill_lora, DISTILL_LORA_FILE, DISTILL_LORA_REPO};
 pub use fm::{
     apply_time_schedule, euler_step, patchify, unpatchify, velocity, FmHead, TimestepEmbedder,
 };
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
-pub use model::{descriptor, load, SenseNova, MODEL_ID};
+pub use model::{descriptor, descriptor_fast, load, load_fast, SenseNova, MODEL_ID, MODEL_ID_FAST};
 pub use qwen3::{KvCache, Path, Qwen3Backbone};
 pub use runtime::{Sampler, ThinkRollout};
 pub use t2i::{

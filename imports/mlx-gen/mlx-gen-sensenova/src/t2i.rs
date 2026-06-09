@@ -203,6 +203,19 @@ impl T2iModel {
         self.backbone.quantize(bits)
     }
 
+    /// Merge the 8-step distill LoRA (sc-3192) for the `sensenova_u1_8b_fast` variant: the backbone
+    /// generation-path projections (`7 · layers`) + the two FM-head Linears. The understanding path,
+    /// vision embedders, and timestep/noise embedders are untouched (the LoRA carries no targets for
+    /// them). Must run on the dense model **before** [`T2iModel::quantize`] — the merge seam errors
+    /// on a quantized base, matching the reference which merges into the dense weight pre-quant.
+    /// Returns the total number of Linears merged (so the loader can assert full coverage).
+    pub fn merge_distill_lora(&mut self, lora: &Weights) -> Result<usize> {
+        let n = self.backbone.merge_distill_lora(lora, "language_model")?;
+        Ok(n + self
+            .fm_head
+            .merge_distill_lora(lora, "fm_modules.fm_head")?)
+    }
+
     /// Override the `<IMG_CONTEXT>` / `<img>` / `</img>` token ids (for tiny test fixtures whose
     /// vocab cannot hold the real checkpoint ids). Production callers never need this.
     pub fn with_image_token_ids(
@@ -290,6 +303,43 @@ impl T2iModel {
         opts: &T2iOptions,
         init_noise: Option<&Array>,
     ) -> Result<T2iOutput> {
+        let (traj, think_text) =
+            self.t2i_run(tokenizer, prompt, width, height, opts, init_noise)?;
+        let image = traj.into_iter().last().expect("at least one step");
+        Ok(T2iOutput { image, think_text })
+    }
+
+    /// Diagnostic (sc-3192 parity): the full per-step denoise **trajectory** for a T2I run — every
+    /// step's decoded image, not just the final. Identical setup to [`generate`]; lets a test compare
+    /// the port's trajectory to the reference step by step (e.g. to show that a distilled few-step
+    /// run agrees early and diverges only on the big decisive final steps, i.e. compounding precision
+    /// chaos rather than a per-step bug).
+    pub fn t2i_trajectory(
+        &self,
+        tokenizer: &TextTokenizer,
+        prompt: &str,
+        width: i32,
+        height: i32,
+        opts: &T2iOptions,
+        init_noise: Option<&Array>,
+    ) -> Result<Vec<Array>> {
+        Ok(self
+            .t2i_run(tokenizer, prompt, width, height, opts, init_noise)?
+            .0)
+    }
+
+    /// Shared T2I body: condition/uncondition prefixes (+ optional think rollout) and the denoise
+    /// loop. Returns the per-step trajectory and any think text. [`generate`] keeps the last frame;
+    /// [`t2i_trajectory`](Self::t2i_trajectory) returns them all.
+    fn t2i_run(
+        &self,
+        tokenizer: &TextTokenizer,
+        prompt: &str,
+        width: i32,
+        height: i32,
+        opts: &T2iOptions,
+        init_noise: Option<&Array>,
+    ) -> Result<(Vec<Array>, Option<String>)> {
         let cell = self.patch_size * self.merge_size;
         if width % cell != 0 || height % cell != 0 {
             return Err(Error::Msg(format!(
@@ -354,8 +404,7 @@ impl T2iModel {
             &base_noise,
             opts,
         )?;
-        let image = traj.into_iter().last().expect("at least one step");
-        Ok(T2iOutput { image, think_text })
+        Ok((traj, think_text))
     }
 
     /// Prefill `ids` into a fresh understanding-path cache; returns the cache and prefix length.
