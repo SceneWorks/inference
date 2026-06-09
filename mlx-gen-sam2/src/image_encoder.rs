@@ -34,13 +34,14 @@ fn join(prefix: &str, leaf: &str) -> String {
 }
 
 /// Sinusoidal position encoding (`PositionEmbeddingSine`, `normalize=True`). `x`: NHWC `[b,h,w,c]`;
-/// returns NHWC `[b, h, w, POS_NUM_FEATS]`. The values depend only on `(h, w)`, so the per-axis
+/// returns NHWC `[b, h, w, num_pos_feats]`. The values depend only on `(h, w)`, so the per-axis
 /// tables are built on the host (f64) and broadcast — bit-faithful to the reference's normalized
-/// `sin(even)/cos(odd)` interleave.
-fn position_encoding(x: &Array) -> Result<Array> {
+/// `sin(even)/cos(odd)` interleave. `num_pos_feats` is the reference constructor arg (256 for the
+/// FPN neck; 64 for the memory encoder, [`crate::memory`]).
+pub(crate) fn position_encoding(x: &Array, num_pos_feats: i32) -> Result<Array> {
     let sh = x.shape();
     let (b, h, w) = (sh[0], sh[1], sh[2]);
-    let feats = (POS_NUM_FEATS / 2) as usize; // self.num_pos_feats = num_pos_feats // 2
+    let feats = (num_pos_feats / 2) as usize; // self.num_pos_feats = num_pos_feats // 2
     let scale = 2.0 * PI;
     let eps = 1e-6;
 
@@ -115,7 +116,7 @@ impl FpnNeck {
                 }
                 _ => lateral,
             };
-            pos[i] = Some(position_encoding(&cur)?);
+            pos[i] = Some(position_encoding(&cur, POS_NUM_FEATS)?);
             out[i] = Some(cur.clone());
             prev = Some(cur);
         }
@@ -195,7 +196,7 @@ mod tests {
     fn position_encoding_sin_cos_pairs_are_unit() {
         use mlx_rs::ops::{multiply, subtract};
         let x = Array::from_slice(&vec![0f32; 5 * 7 * 8], &[1, 5, 7, 8]);
-        let pe = position_encoding(&x).unwrap();
+        let pe = position_encoding(&x, POS_NUM_FEATS).unwrap();
         assert_eq!(pe.shape(), &[1, 5, 7, POS_NUM_FEATS]);
         // Pair the first (sin) and second (cos) channels of the pos_y block.
         let sin0 = pe.take_axis(Array::from_int(0), 3).unwrap();
