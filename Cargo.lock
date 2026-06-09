@@ -622,6 +622,7 @@ dependencies = [
 name = "mlx-gen-kolors"
 version = "0.0.0"
 dependencies = [
+ "inventory",
  "mlx-gen",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",

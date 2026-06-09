@@ -13,8 +13,10 @@
 pub mod chatglm3;
 pub mod ip_adapter;
 pub mod model;
+pub mod registry;
 pub mod sampler;
 pub mod tokenizer;
 pub mod unet;
 
 pub use model::Kolors;
+pub use registry::{descriptor, KolorsGenerator, MODEL_ID};
