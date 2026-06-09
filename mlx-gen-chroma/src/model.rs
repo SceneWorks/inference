@@ -80,6 +80,9 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
     if let Some(q) = spec.quantize {
         transformer.quantize(q.bits())?;
     }
+    // Install LoRA/LoKr adapters AFTER quantization (forward-time residual over the quantized base;
+    // sc-3842). No-op when empty; any unmatched target errors loudly (never silently dropped).
+    crate::adapters::apply_chroma_adapters(&mut transformer, &spec.adapters)?;
 
     Ok(Chroma {
         descriptor: variant.descriptor(),

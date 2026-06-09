@@ -14,7 +14,7 @@
 //! backend f32 floor is ~1e-3, see the parity tests). The masked T5 encode that *builds* the
 //! sequence mask is sc-3838; the generate path is sc-3839.
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -69,6 +69,10 @@ impl Lin {
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
         self.0.quantize(bits, None)
+    }
+
+    fn inner_mut(&mut self) -> &mut AdaptableLinear {
+        &mut self.0
     }
 }
 
@@ -258,6 +262,20 @@ impl Approximator {
         }
         self.out_proj.forward(&x)
     }
+
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        Some(match path {
+            ["in_proj"] => self.in_proj.inner_mut(),
+            ["out_proj"] => self.out_proj.inner_mut(),
+            ["layers", n, "linear_1"] => {
+                self.layers.get_mut(n.parse::<usize>().ok()?)?.0.inner_mut()
+            }
+            ["layers", n, "linear_2"] => {
+                self.layers.get_mut(n.parse::<usize>().ok()?)?.1.inner_mut()
+            }
+            _ => return None,
+        })
+    }
 }
 
 // ============================ blocks ============================
@@ -341,6 +359,21 @@ impl DoubleAttn {
             l.quantize(bits)?;
         }
         Ok(())
+    }
+
+    /// Resolve a diffusers adapter sub-path (within `…attn.`) to its linear (sc-3842).
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        Some(match path {
+            ["to_q"] => self.to_q.inner_mut(),
+            ["to_k"] => self.to_k.inner_mut(),
+            ["to_v"] => self.to_v.inner_mut(),
+            ["to_out", "0"] => self.to_out.inner_mut(),
+            ["add_q_proj"] => self.add_q.inner_mut(),
+            ["add_k_proj"] => self.add_k.inner_mut(),
+            ["add_v_proj"] => self.add_v.inner_mut(),
+            ["to_add_out"] => self.to_add_out.inner_mut(),
+            _ => return None,
+        })
     }
 }
 
@@ -435,6 +468,17 @@ impl DoubleBlock {
         self.ff.quantize(bits)?;
         self.ff_context.quantize(bits)
     }
+
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        Some(match path {
+            ["attn", rest @ ..] => return self.attn.adaptable_mut(rest),
+            ["ff", "net", "0", "proj"] => self.ff.lin1.inner_mut(),
+            ["ff", "net", "2"] => self.ff.lin2.inner_mut(),
+            ["ff_context", "net", "0", "proj"] => self.ff_context.lin1.inner_mut(),
+            ["ff_context", "net", "2"] => self.ff_context.lin2.inner_mut(),
+            _ => return None,
+        })
+    }
 }
 
 struct SingleAttn {
@@ -472,6 +516,15 @@ impl SingleAttn {
         self.to_q.quantize(bits)?;
         self.to_k.quantize(bits)?;
         self.to_v.quantize(bits)
+    }
+
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        Some(match path {
+            ["to_q"] => self.to_q.inner_mut(),
+            ["to_k"] => self.to_k.inner_mut(),
+            ["to_v"] => self.to_v.inner_mut(),
+            _ => return None,
+        })
     }
 }
 
@@ -517,6 +570,15 @@ impl SingleBlock {
         self.attn.quantize(bits)?;
         self.proj_mlp.quantize(bits)?;
         self.proj_out.quantize(bits)
+    }
+
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        Some(match path {
+            ["attn", rest @ ..] => return self.attn.adaptable_mut(rest),
+            ["proj_mlp"] => self.proj_mlp.inner_mut(),
+            ["proj_out"] => self.proj_out.inner_mut(),
+            _ => return None,
+        })
     }
 }
 
@@ -696,5 +758,68 @@ impl ChromaTransformer {
             mlx_gen::array::scalar(1000.0),
         )?;
         self.time_text_embed.forward(&scaled)
+    }
+}
+
+impl AdaptableHost for ChromaTransformer {
+    /// Resolve a trained-file (diffusers/peft) dotted adapter path to its [`AdaptableLinear`].
+    /// Covers the double/single block attention + FFN linears, the global embedders/`proj_out`, and
+    /// the distilled-guidance Approximator (some community Chroma LoRAs train it).
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .double_blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["single_transformer_blocks", n, rest @ ..] => self
+                .single_blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["x_embedder"] => Some(self.x_embedder.inner_mut()),
+            ["context_embedder"] => Some(self.context_embedder.inner_mut()),
+            ["proj_out"] => Some(self.proj_out.inner_mut()),
+            ["distilled_guidance_layer", rest @ ..] => self.approximator.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// kohya `lora_unet_`-reachable targets: the block-indexed attention + FFN linears in trained-file
+    /// naming. Globals (`x_embedder`/`context_embedder`/`proj_out`/`distilled_guidance_layer`) are
+    /// excluded — they stay reachable via the dotted peft form (every path here must resolve via
+    /// [`adaptable_mut`](Self::adaptable_mut); guarded by `tests/adapter_routing.rs`).
+    fn adaptable_paths(&self) -> Vec<String> {
+        const DOUBLE: [&str; 12] = [
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.add_q_proj",
+            "attn.add_k_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+            "attn.to_out.0",
+            "ff.net.0.proj",
+            "ff.net.2",
+            "ff_context.net.0.proj",
+            "ff_context.net.2",
+        ];
+        const SINGLE: [&str; 5] = [
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "proj_mlp",
+            "proj_out",
+        ];
+        let mut out = Vec::new();
+        for i in 0..self.double_blocks.len() {
+            for leaf in DOUBLE {
+                out.push(format!("transformer_blocks.{i}.{leaf}"));
+            }
+        }
+        for i in 0..self.single_blocks.len() {
+            for leaf in SINGLE {
+                out.push(format!("single_transformer_blocks.{i}.{leaf}"));
+            }
+        }
+        out
     }
 }
