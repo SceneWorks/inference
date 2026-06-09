@@ -67,14 +67,14 @@ fn layer_norm_2d(x: &Array, weight: &Array, bias: &Array) -> Result<Array> {
 }
 
 /// An N-layer MLP (`SamMLP`): linear · (relu|gelu) between layers, optional final sigmoid.
-struct SamMlp {
+pub(crate) struct SamMlp {
     layers: Vec<(Array, Array)>,
     gelu: bool,
     sigmoid_output: bool,
 }
 
 impl SamMlp {
-    fn from_weights(
+    pub(crate) fn from_weights(
         w: &Weights,
         prefix: &str,
         num_layers: usize,
@@ -98,7 +98,7 @@ impl SamMlp {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
         let mut x = x.clone();
         let n = self.layers.len();
         for (i, (w, b)) in self.layers.iter().enumerate() {
@@ -167,9 +167,21 @@ pub struct PromptEncoder {
     point_embeddings: Vec<Array>,
     not_a_point_embed: Array,
     no_mask_embed: Array,
+    /// Mask-prompt downscaling (`mask_downscaling_{0,1,3,4,6}`): conv k2/s2, LN2d, conv k2/s2,
+    /// LN2d, conv k1 — turns a `[b,1,256,256]` mask prompt into the dense `[b,256,64,64]` embedding.
+    mask_downscaling: MaskDownscaling,
     embed_dim: i32,
     image_embedding: i32,  // square grid side (64)
     input_image_size: i32, // 1024
+}
+
+/// The five mask-prompt downscaling layers (`PromptEncoder._embed_masks`).
+struct MaskDownscaling {
+    conv0: (Array, Array), // k2 s2: 1→4
+    norm1: (Array, Array), // LayerNorm2d(4)
+    conv3: (Array, Array), // k2 s2: 4→16
+    norm4: (Array, Array), // LayerNorm2d(16)
+    conv6: (Array, Array), // k1: 16→256
 }
 
 impl PromptEncoder {
@@ -181,11 +193,19 @@ impl PromptEncoder {
                     .clone())
             })
             .collect::<Result<Vec<_>>>()?;
+        let wb = |name: &str| ln(w, &p(name));
         Ok(Self {
             pe_layer: PositionEmbeddingRandom::from_weights(w, &p("pe_layer"))?,
             point_embeddings,
             not_a_point_embed: w.require(&p("not_a_point_embed.weight"))?.clone(),
             no_mask_embed: w.require(&p("no_mask_embed.weight"))?.clone(),
+            mask_downscaling: MaskDownscaling {
+                conv0: wb("mask_downscaling_0")?,
+                norm1: wb("mask_downscaling_1")?,
+                conv3: wb("mask_downscaling_3")?,
+                norm4: wb("mask_downscaling_4")?,
+                conv6: wb("mask_downscaling_6")?,
+            },
             embed_dim: 256,
             image_embedding: 64,
             input_image_size: 1024,
@@ -233,9 +253,42 @@ impl PromptEncoder {
         let [x1, y1, x2, y2] = box_xyxy;
         let points = Array::from_slice(&[x1, y1, x2, y2], &[1, 2, 2]);
         let labels = Array::from_slice(&[2i32, 3], &[1, 2]);
-        let sparse = self.embed_points(&points, &labels, true)?;
-        let dense = self.dense_embedding(1)?;
+        self.encode(Some(&points), Some(&labels), None)
+    }
+
+    /// General prompt encode (`PromptEncoder.__call__`): optional `points` `[b,n,2]` (1024-space)
+    /// with int `labels` `[b,n]`, and an optional dense `mask_input` `[b,1,256,256]`. Returns the
+    /// sparse tokens `[b, n(+1), embed_dim]` (one pad point appended when points are present) and the
+    /// dense embedding `[b, embed_dim, grid, grid]` (from the mask prompt, else the no-mask embed).
+    pub(crate) fn encode(
+        &self,
+        points: Option<&Array>,
+        labels: Option<&Array>,
+        masks: Option<&Array>,
+    ) -> Result<(Array, Array)> {
+        let bs = points
+            .map(|p| p.shape()[0])
+            .or_else(|| masks.map(|m| m.shape()[0]))
+            .unwrap_or(1);
+        let sparse = match (points, labels) {
+            (Some(p), Some(l)) => self.embed_points(p, l, true)?,
+            _ => ops::zeros::<f32>(&[bs, 0, self.embed_dim])?,
+        };
+        let dense = match masks {
+            Some(m) => self.embed_masks(m)?,
+            None => self.dense_embedding(bs)?,
+        };
         Ok((sparse, dense))
+    }
+
+    /// `_embed_masks`: a `[b,1,256,256]` mask prompt → dense `[b,256,64,64]` embedding.
+    fn embed_masks(&self, masks: &Array) -> Result<Array> {
+        let d = &self.mask_downscaling;
+        let x = conv2d_nchw(masks, &d.conv0.0, &d.conv0.1, 2, 0)?;
+        let x = gelu_exact(&layer_norm_2d(&x, &d.norm1.0, &d.norm1.1)?)?;
+        let x = conv2d_nchw(&x, &d.conv3.0, &d.conv3.1, 2, 0)?;
+        let x = gelu_exact(&layer_norm_2d(&x, &d.norm4.0, &d.norm4.1)?)?;
+        conv2d_nchw(&x, &d.conv6.0, &d.conv6.1, 1, 0)
     }
 
     /// The dense embedding when no mask prompt is given: `no_mask_embed` broadcast over the grid.
@@ -565,8 +618,48 @@ impl MaskDecoder {
         Ok((masks, iou_pred, mask_tokens_out, object_score_logits))
     }
 
-    /// Full decoder. `multimask_output` true ⇒ return the 3 multi-masks (tokens 1-3) + their IoUs;
-    /// false ⇒ the single mask (with dynamic stability fallback). Returns `(masks, ious)`.
+    /// Full decoder (`MaskDecoder.__call__`). `multimask_output` true ⇒ the 3 multi-masks
+    /// (tokens 1-3) + their IoUs + their SAM tokens; false ⇒ the single mask (dynamic stability
+    /// fallback) + token 0. Returns `(masks, ious, sam_tokens, object_score_logits)` — `sam_tokens`
+    /// and `object_score_logits` are what the video predictor needs to build the object pointer.
+    pub(crate) fn predict(
+        &self,
+        image_embeddings: &Array,
+        image_pe: &Array,
+        sparse: &Array,
+        dense: &Array,
+        multimask_output: bool,
+        high_res: &[Array],
+    ) -> Result<(Array, Array, Array, Array)> {
+        let (masks, iou_pred, tokens, obj_logits) =
+            self.predict_masks(image_embeddings, image_pe, sparse, dense, high_res)?;
+
+        // Zero-out (to -1024) the masks when the object score says "no object".
+        let is_obj = obj_logits.gt(Array::from_f32(0.0))?; // [b,1]
+        let is_obj4 = is_obj.reshape(&[is_obj.shape()[0], 1, 1, 1])?;
+        let neg = ops::full::<f32>(masks.shape(), &Array::from_f32(-1024.0))?;
+        let masks = ops::r#where(&is_obj4, &masks, &neg)?;
+
+        let (masks_out, iou_out, sam_tokens) = if multimask_output {
+            (
+                slice_masks(&masks, 1, 4)?,
+                slice_iou(&iou_pred, 1, 4)?,
+                slice_tokens(&tokens, 1, 4)?,
+            )
+        } else if self.dynamic_multimask_via_stability {
+            let (m, i) = self.dynamic_multimask(&masks, &iou_pred)?;
+            (m, i, slice_tokens(&tokens, 0, 1)?)
+        } else {
+            (
+                slice_masks(&masks, 0, 1)?,
+                slice_iou(&iou_pred, 0, 1)?,
+                slice_tokens(&tokens, 0, 1)?,
+            )
+        };
+        Ok((masks_out, iou_out, sam_tokens, obj_logits))
+    }
+
+    /// Image-path convenience: drop the SAM tokens / object score, return just `(masks, ious)`.
     pub fn forward(
         &self,
         image_embeddings: &Array,
@@ -576,22 +669,15 @@ impl MaskDecoder {
         multimask_output: bool,
         high_res: &[Array],
     ) -> Result<(Array, Array)> {
-        let (masks, iou_pred, _tokens, obj_logits) =
-            self.predict_masks(image_embeddings, image_pe, sparse, dense, high_res)?;
-
-        // Zero-out (to -1024) the masks when the object score says "no object".
-        let is_obj = obj_logits.gt(Array::from_f32(0.0))?; // [b,1]
-        let is_obj = is_obj.reshape(&[is_obj.shape()[0], 1, 1, 1])?;
-        let neg = ops::full::<f32>(masks.shape(), &Array::from_f32(-1024.0))?;
-        let masks = ops::r#where(&is_obj, &masks, &neg)?;
-
-        if multimask_output {
-            Ok((slice_masks(&masks, 1, 4)?, slice_iou(&iou_pred, 1, 4)?))
-        } else if self.dynamic_multimask_via_stability {
-            self.dynamic_multimask(&masks, &iou_pred)
-        } else {
-            Ok((slice_masks(&masks, 0, 1)?, slice_iou(&iou_pred, 0, 1)?))
-        }
+        let (masks, ious, _tokens, _obj) = self.predict(
+            image_embeddings,
+            image_pe,
+            sparse,
+            dense,
+            multimask_output,
+            high_res,
+        )?;
+        Ok((masks, ious))
     }
 
     fn stability_scores(&self, masks: &Array) -> Result<Array> {
