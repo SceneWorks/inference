@@ -8,6 +8,7 @@
 //! Reuses `mlx-gen-flux` for the T5-XXL encoder, the AutoencoderKL VAE loader, and the
 //! pack/unpack/sigma helpers; the Chroma DiT is ported fresh.
 
+pub mod adapters;
 pub mod beta;
 pub mod config;
 pub mod loader;
@@ -15,6 +16,7 @@ pub mod model;
 pub mod text;
 pub mod transformer;
 
+pub use adapters::apply_chroma_adapters;
 pub use config::{
     ChromaTransformerConfig, ChromaVariant, CHROMA1_BASE_ID, CHROMA1_FLASH_ID, CHROMA1_HD_ID,
     DEFAULT_SAMPLER, MAX_SEQUENCE_LENGTH,

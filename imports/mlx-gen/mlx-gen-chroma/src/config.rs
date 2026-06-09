@@ -97,10 +97,10 @@ impl ChromaVariant {
                 supports_true_cfg: true,
                 // v1 = T2I only. ControlNet / IP-Adapter / img2img are later ports.
                 conditioning: vec![],
-                // LoRA/LoKr are tracked follow-ons (sc-3842); not advertised until wired so the
-                // descriptor never promises an adapter path the loader would silently no-op.
-                supports_lora: false,
-                supports_lokr: false,
+                // LoRA/LoKr via the shared core adapter seam (sc-3842), over the diffusers/peft
+                // (and kohya) `transformer_blocks.*`/`single_transformer_blocks.*` paths.
+                supports_lora: true,
+                supports_lokr: true,
                 samplers: vec![DEFAULT_SAMPLER],
                 schedulers: vec!["linear"],
                 min_size: 256,
