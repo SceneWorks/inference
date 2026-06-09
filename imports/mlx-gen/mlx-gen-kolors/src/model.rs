@@ -14,9 +14,9 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, DiffusionSampler, Image, Result};
 
 use mlx_gen_sdxl::{
-    decode_image, denoise, denoise_control, encode_init_latents, load_unet_kolors_dtype, load_vae,
-    preprocess_control_image, Autoencoder, ControlContext, ControlNet, Denoiser,
-    UNet2DConditionModel,
+    decode_image, denoise, denoise_control, denoise_ip, encode_init_latents,
+    load_unet_kolors_dtype, load_vae, preprocess_control_image, Autoencoder, ControlContext,
+    ControlNet, Denoiser, IpImageEncoder, UNet2DConditionModel,
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
@@ -332,6 +332,100 @@ impl Kolors {
             num_steps,
             cfg,
             control_scale,
+            height,
+            width,
+        )?;
+        self.decode(&latents)
+    }
+
+    /// Install the IP-Adapter decoupled cross-attention K/V pairs (from
+    /// [`crate::ip_adapter::load_kolors_ip_adapter`]) into the U-Net's cross-attention layers
+    /// (sc-3098). One-time setup; non-destructive to plain T2I (the [`denoise`] path never reads the
+    /// IP projections — only [`denoise_ip`] does). 70 pairs for the SDXL-family U-Net.
+    pub fn install_ip_adapter(&mut self, pairs: Vec<(Array, Array)>) -> Result<()> {
+        self.unet.install_ip_adapter(pairs)
+    }
+
+    /// Run the CFG denoise loop with IP-Adapter image tokens injected into every cross-attention at
+    /// `ip_scale` (sc-3098) — split out (like [`denoise_latents`](Self::denoise_latents)) for the
+    /// parity gate. `ip_tokens` is `[1, N, 2048]` (from [`IpImageEncoder::tokens`]); it is CFG-batched
+    /// here with a zeros uncond row. The IP-Adapter pairs must already be installed
+    /// ([`install_ip_adapter`](Self::install_ip_adapter)). `ip_scale = 0` ⇒ identical to plain T2I.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_ip_latents(
+        &self,
+        ip_tokens: &Array,
+        init_noise: &Array,
+        pos: &(Array, Array),
+        neg: &(Array, Array),
+        num_steps: usize,
+        cfg: f32,
+        ip_scale: f32,
+        height: i32,
+        width: i32,
+    ) -> Result<Array> {
+        use mlx_rs::ops::{concatenate_axis, zeros};
+        let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
+        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
+        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
+        let time_ids = kolors_time_ids(2, height, width);
+        let latents = sampler.scale_initial_noise(init_noise)?;
+
+        // CFG batch: [image tokens, zeros] — the uncond row gets no image conditioning.
+        let sh = ip_tokens.shape();
+        let zero = zeros::<f32>(sh)?.as_dtype(ip_tokens.dtype())?;
+        let tokens = concatenate_axis(&[ip_tokens, &zero], 0)?;
+
+        let d = Denoiser {
+            unet: &self.unet,
+            sampler: &sampler,
+        };
+        let cancel = CancelFlag::new();
+        denoise_ip(
+            &d,
+            latents,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            cfg,
+            &cancel,
+            &mut |_p| {},
+            &tokens,
+            ip_scale,
+        )
+    }
+
+    /// Full IP-Adapter T2I: encode the `reference_image` → image tokens, seed the noise, encode the
+    /// prompts, denoise with the IP tokens injected at `ip_scale`, and VAE-decode. The IP-Adapter
+    /// pairs must already be installed via [`install_ip_adapter`](Self::install_ip_adapter).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_ip(
+        &self,
+        ip_encoder: &IpImageEncoder,
+        reference_image: &Image,
+        prompt: &str,
+        negative: &str,
+        num_steps: usize,
+        cfg: f32,
+        ip_scale: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+    ) -> Result<Image> {
+        let ip_tokens = ip_encoder.tokens(reference_image)?;
+        random::seed(seed)?;
+        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+        let pos = self.encode(prompt)?;
+        let neg = self.encode(negative)?;
+        let latents = self.denoise_ip_latents(
+            &ip_tokens,
+            &init_noise,
+            &pos,
+            &neg,
+            num_steps,
+            cfg,
+            ip_scale,
             height,
             width,
         )?;
