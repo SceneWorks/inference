@@ -160,6 +160,43 @@ fn chroma_hd_e2e_matches_diffusers() {
 }
 
 #[test]
+#[ignore = "needs the ~18GB Chroma1-HD snapshot"]
+fn chroma_hd_quant_bounded() {
+    // sc-3841: Q8/Q4 over the DiT block linears. Measure the quant perturbation on a single forward
+    // vs the dense golden noise_pred (the quant *effect*; there's no MLX quant reference for Chroma).
+    use mlx_gen::Quant;
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let g = Weights::from_file(format!("{dir}/chroma_e2e_hd.safetensors")).unwrap();
+    let golden_np = g.require("noise_pred").unwrap();
+    let golden_embeds = g.require("prompt_embeds").unwrap();
+    let l = golden_embeds.shape()[1];
+    let txt_ids = Array::from_slice(&vec![0f32; (l * 3) as usize], &[l, 3]);
+    let si = ((H / 16) * (W / 16)) as i32;
+    let ones = Array::ones::<f32>(&[1, si]).unwrap();
+    let full_mask = concatenate_axis(&[g.require("prompt_mask").unwrap(), &ones], 1).unwrap();
+
+    // Chroma's DiT quantizes cleanly: measured Q8 ≈0.3% / Q4 ≈1.7% rel-L2 on a single forward.
+    for (q, gate) in [(Quant::Q8, 0.015_f32), (Quant::Q4, 0.04_f32)] {
+        let spec = LoadSpec::new(WeightsSource::Dir(hf_snapshot("Chroma1-HD"))).with_quant(q);
+        let model = load_chroma(ChromaVariant::Hd, &spec).expect("load quantized Chroma1-HD");
+        let np = model
+            .transformer_ref()
+            .forward(
+                g.require("init_latents").unwrap(),
+                golden_embeds,
+                g.require("timestep").unwrap(),
+                g.require("img_ids").unwrap(),
+                &txt_ids,
+                Some(&full_mask),
+            )
+            .unwrap();
+        let rl = rel_l2(&np, golden_np);
+        eprintln!("{q:?} noise_pred rel-L2 vs dense = {rl:.4}");
+        assert!(rl < gate, "{q:?} quant perturbation too large: {rl}");
+    }
+}
+
+#[test]
 #[ignore = "needs the ~18GB Chroma1-Base snapshot"]
 fn chroma_base_e2e_matches_diffusers() {
     // Base uses the beta sigma schedule (use_beta_sigmas).

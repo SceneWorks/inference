@@ -14,7 +14,8 @@
 //! backend f32 floor is ~1e-3, see the parity tests). The masked T5 encode that *builds* the
 //! sequence mask is sc-3838; the generate path is sc-3839.
 
-use mlx_gen::nn::{gelu_tanh, linear, silu};
+use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
@@ -49,22 +50,25 @@ fn timestep_embedding(timesteps: &Array, dim: usize, downscale_freq_shift: f64) 
     Ok(concatenate_axis(&[cos(&emb)?, sin(&emb)?], -1)?) // flip ⇒ [cos, sin]
 }
 
-/// A dense `nn.Linear` (`[out, in]` weight + bias), PyTorch convention.
-struct Lin {
-    w: Array,
-    b: Array,
-}
+/// A dense `nn.Linear` (`[out, in]` weight + bias) wrapping the core [`AdaptableLinear`] — so it can
+/// be quantized (sc-3841) and carry LoRA/LoKr adapters (sc-3842). The forward runs f32 activations
+/// over the bf16 (or quantized) weight; mlx promotes.
+struct Lin(AdaptableLinear);
 
 impl Lin {
     fn load(w: &Weights, prefix: &str) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{prefix}.weight"))?.clone(),
-            b: w.require(&format!("{prefix}.bias"))?.clone(),
-        })
+        Ok(Self(AdaptableLinear::dense(
+            w.require(&format!("{prefix}.weight"))?.clone(),
+            Some(w.require(&format!("{prefix}.bias"))?.clone()),
+        )))
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        linear(x, &self.w, &self.b)
+        self.0.forward(x)
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.0.quantize(bits, None)
     }
 }
 
@@ -322,6 +326,22 @@ impl DoubleAttn {
         let img = seq_slice(&out, st, hidden.shape()[1])?;
         Ok((self.to_out.forward(&img)?, self.to_add_out.forward(&txt)?))
     }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        for l in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+            &mut self.add_q,
+            &mut self.add_k,
+            &mut self.add_v,
+            &mut self.to_add_out,
+        ] {
+            l.quantize(bits)?;
+        }
+        Ok(())
+    }
 }
 
 struct FeedForward {
@@ -339,6 +359,11 @@ impl FeedForward {
 
     fn forward(&self, x: &Array) -> Result<Array> {
         self.lin2.forward(&gelu_tanh(&self.lin1.forward(x)?)?)
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.lin1.quantize(bits)?;
+        self.lin2.quantize(bits)
     }
 }
 
@@ -404,6 +429,12 @@ impl DoubleBlock {
 
         Ok((encoder, hidden))
     }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize(bits)?;
+        self.ff.quantize(bits)?;
+        self.ff_context.quantize(bits)
+    }
 }
 
 struct SingleAttn {
@@ -435,6 +466,12 @@ impl SingleAttn {
         let k = apply_rope_one(&proj_heads(x, &self.to_k, h, hd, Some(&self.norm_k))?, rope)?;
         let v = proj_heads(x, &self.to_v, h, hd, None)?;
         sdpa(&q, &k, &v, hd, mask)
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.to_q.quantize(bits)?;
+        self.to_k.quantize(bits)?;
+        self.to_v.quantize(bits)
     }
 }
 
@@ -474,6 +511,12 @@ impl SingleBlock {
             .proj_out
             .forward(&concatenate_axis(&[&attn, &mlp], 2)?)?;
         Ok(add(hidden, &multiply(&row(temb, 2)?, &proj)?)?)
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize(bits)?;
+        self.proj_mlp.quantize(bits)?;
+        self.proj_out.quantize(bits)
     }
 }
 
@@ -542,6 +585,20 @@ impl ChromaTransformer {
             proj_out: Lin::load(&w, "proj_out")?,
             cfg,
         })
+    }
+
+    /// Quantize the matmul-heavy block linears (double/single attention + FFN) to Q4/Q8 (sc-3841).
+    /// The small/sensitive modules — `x_embedder`/`context_embedder`/`proj_out` and the
+    /// distilled-guidance Approximator (which drives all modulation) — stay dense, mirroring the
+    /// "quantize the big GEMMs" convention. T5/VAE are quantized separately by the loader (if at all).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for b in &mut self.double_blocks {
+            b.quantize(bits)?;
+        }
+        for b in &mut self.single_blocks {
+            b.quantize(bits)?;
+        }
+        Ok(())
     }
 
     /// `pooled_temb [B, mod_index_len, inner]` for a **raw** (unscaled) timestep `[B]`.

@@ -72,8 +72,14 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
     let cfg = ChromaTransformerConfig::default();
     let tokenizer = loader::load_tokenizer()?;
     let t5 = loader::load_t5_encoder(root)?;
-    let transformer = loader::load_transformer(root, cfg)?;
+    let mut transformer = loader::load_transformer(root, cfg)?;
     let vae = loader::load_vae(root)?;
+
+    // Load-time Q4/Q8 over the DiT's heavy block linears (sc-3841). T5/VAE stay f32 (their quant is a
+    // measurably-0% memory-only win and not wired here).
+    if let Some(q) = spec.quantize {
+        transformer.quantize(q.bits())?;
+    }
 
     Ok(Chroma {
         descriptor: variant.descriptor(),
