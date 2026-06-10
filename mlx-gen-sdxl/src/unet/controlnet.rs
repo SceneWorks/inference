@@ -279,7 +279,10 @@ impl ControlNet {
         x = self.mid_transformer.forward(&x, encoder_x)?;
         x = self.mid_resnet1.forward(&x, Some(&temb))?;
 
-        // Zero-conv heads + scale.
+        // Zero-conv heads + scale. Each collected skip residual must pair with exactly one zero-conv;
+        // assert the geometry before the `zip` so a count mismatch points at the real cause here,
+        // rather than being silently truncated and misattributed to the UNet skip-count check (F-072).
+        check_residual_zero_pairing(residuals.len(), self.down_zero.len())?;
         let s = scalar(scale).as_dtype(dtype)?;
         let mut down = Vec::with_capacity(residuals.len());
         for (r, z) in residuals.iter().zip(&self.down_zero) {
@@ -307,9 +310,38 @@ impl ControlNet {
     }
 }
 
+/// Guard the zero-conv pairing in [`ControlNet::forward`] (F-072): the down path must produce exactly
+/// one skip residual per zero-conv head. A `residuals.iter().zip(&self.down_zero)` would silently
+/// drop the longer side on a mismatch and let a misattributed UNet skip-count error surface later;
+/// this errors at the real cause instead. Can't fire with the fixed SDXL geometry, but a future
+/// config variant could change the down-block count without the heads.
+fn check_residual_zero_pairing(residuals: usize, zero_convs: usize) -> Result<()> {
+    if residuals != zero_convs {
+        return Err(mlx_gen::Error::Msg(format!(
+            "sdxl controlnet: {residuals} down residuals but {zero_convs} zero-conv heads — the \
+             control branch geometry does not match the loaded down_zero convs"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-072: the zero-conv pairing guard accepts a matched count and rejects a mismatch (either
+    /// direction) with a message naming both counts — so a geometry mismatch can't be silently
+    /// truncated by the downstream `zip`.
+    #[test]
+    fn residual_zero_pairing_rejects_mismatch() {
+        assert!(check_residual_zero_pairing(9, 9).is_ok());
+        let e = check_residual_zero_pairing(10, 9).unwrap_err().to_string();
+        assert!(
+            e.contains("10 down residuals but 9 zero-conv heads"),
+            "error should name both counts: {e}"
+        );
+        assert!(check_residual_zero_pairing(8, 9).is_err());
+    }
 
     /// sc-3378: `ControlResiduals::add` sums the down + mid residuals element-wise (the diffusers
     /// `MultiControlNetModel` rule) and rejects a down-count mismatch.
