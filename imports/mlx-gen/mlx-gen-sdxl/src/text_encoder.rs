@@ -244,13 +244,7 @@ impl ClipTextEncoder {
         let mut gather = Vec::with_capacity(b as usize);
         for row in 0..b as usize {
             let r = &ids_host[row * n as usize..(row + 1) * n as usize];
-            let eos = r
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, &v)| v)
-                .map(|(i, _)| i as i32)
-                .unwrap_or(0);
-            gather.push(row as i32 * n + eos);
+            gather.push(row as i32 * n + first_argmax(r));
         }
         let gather = Array::from_slice(&gather, &[b]);
         let pooled = last_hidden_state
@@ -292,9 +286,36 @@ fn causal_mask(n: i32, dtype: Dtype) -> Result<Array> {
     Ok(Array::from_slice(&m, &[1, 1, n, n]).as_dtype(dtype)?)
 }
 
+/// Index of the **first** maximal element — `np.argmax` / `mx.argmax` semantics, which the reference
+/// uses to locate the EOS token (the max token id) for the pooled output. Rust's `max_by_key` returns
+/// the *last* maximal element on ties, so it diverged for prompts whose text contains a literal
+/// `<|endoftext|>` (the CLIP regex matches it → multiple EOS ids) — a silent parity break (F-063).
+/// Empty input → `0`.
+fn first_argmax(ids: &[i32]) -> i32 {
+    ids.iter()
+        .enumerate()
+        .fold((0i32, i32::MIN), |(best_i, best_v), (i, &v)| {
+            if v > best_v {
+                (i as i32, v)
+            } else {
+                (best_i, best_v)
+            }
+        })
+        .0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_argmax_picks_first_max_on_ties() {
+        // F-063: EOS id appears twice; the *first* index wins (np.argmax), not max_by_key's last.
+        assert_eq!(first_argmax(&[1, 49407, 5, 49407]), 1);
+        assert_eq!(first_argmax(&[3, 3, 3]), 0); // all-equal → first
+        assert_eq!(first_argmax(&[1, 2, 3]), 2); // strictly increasing → last is the max
+        assert_eq!(first_argmax(&[]), 0); // empty → 0
+    }
 
     #[test]
     fn causal_mask_is_lower_triangular() {
