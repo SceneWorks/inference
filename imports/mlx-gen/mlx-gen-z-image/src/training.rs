@@ -1,7 +1,8 @@
-//! sc-3042 SPIKE — LoRA *training* on the Z-Image DiT, in pure Rust on mlx-rs.
+//! LoRA/LoKr *training* on the Z-Image DiT, in pure Rust on mlx-rs (epic 3039).
 //!
-//! This is the gate for epic 3039 (LoRA/LoKr training in Rust). It proves the mechanism the whole
-//! epic rests on, on the REAL 30-block Z-Image transformer:
+//! The production [`ZImageTurboTrainer`] (sc-3044) realizes the core [`Trainer`] contract on the
+//! REAL 30-block Z-Image transformer. The mechanism (the sc-3042 spike that first proved it has been
+//! retired — F-043):
 //!
 //!   * **Trainable LoRA injection** — the model crates do NOT use mlx-rs's `Module`/`ModuleParameters`
 //!     system (hand-rolled `&self` forwards over raw `Array`s, `src/adapters.rs:6`), so training uses
@@ -33,11 +34,11 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::checkpoint_filename;
 use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, clear_adapters,
-    install_training_lora, save_lora_peft, LoraParams, TrainAdapter,
+    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
+    TrainAdapter,
 };
-// Re-export the `LoraTarget` the spike returns so the crate's public surface is unchanged (the
-// host-generic factor machinery moved to `mlx_gen::train::lora` in sc-3045).
+// Re-export the `LoraTarget` that `build_lora_targets` returns so the crate's public surface is
+// unchanged (the host-generic factor machinery moved to `mlx_gen::train::lora` in sc-3045).
 pub use mlx_gen::train::lora::LoraTarget;
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::{
@@ -47,7 +48,7 @@ use mlx_gen::{
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{multiply, subtract};
-use mlx_rs::optimizers::{clip_grad_norm, AdamW, Optimizer};
+use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -60,184 +61,6 @@ use crate::vae::Vae;
 /// Z-Image reconstructs its LoKr delta at **bf16** (the bf16-residual inference path); training must
 /// match so the adapter round-trips bit-for-bit.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
-
-/// The default Z-Image attention LoRA targets across the main `layers` stack — the suffixes
-/// `to_q`/`to_k`/`to_v`/`to_out.0` the SceneWorks torch trainer uses
-/// (`DEFAULT_LORA_TARGET_MODULES`, `training_adapters.py:72`).
-pub fn attention_targets(n_layers: usize) -> Vec<String> {
-    let mut out = Vec::with_capacity(n_layers * 4);
-    for i in 0..n_layers {
-        for proj in [
-            "attention.to_q",
-            "attention.to_k",
-            "attention.to_v",
-            "attention.to_out.0",
-        ] {
-            out.push(format!("layers.{i}.{proj}"));
-        }
-    }
-    out
-}
-
-/// A minimal Z-Image LoRA trainer: a frozen base transformer + an external trainable factor map,
-/// stepped with `keyed_value_and_grad` + AdamW. Spike-scoped (single in-memory sample at a time);
-/// the dataset/scheduling glue is sc-3043.
-pub struct ZImageLoraTrainer {
-    transformer: ZImageTransformer,
-    targets: Vec<LoraTarget>,
-    params: LoraParams,
-    alpha: f32,
-    opt: AdamW,
-}
-
-impl ZImageLoraTrainer {
-    /// Build a trainer over `target_paths` (dotted module paths into the DiT). LoRA factors are
-    /// initialised the Python `_MlxLoRALinear` way — `A ~ N(0, 0.02)` `[rank, in]`, `B = 0`
-    /// `[out, rank]` — so the adapter starts as an exact no-op and only learns from the gradient.
-    pub fn new(
-        transformer: ZImageTransformer,
-        target_paths: &[String],
-        rank: i32,
-        alpha: f32,
-        lr: f32,
-        seed: u64,
-    ) -> Result<Self> {
-        let mut transformer = transformer;
-        let (targets, params) = build_lora_targets(&mut transformer, target_paths, rank, seed)?;
-        Ok(Self {
-            transformer,
-            targets,
-            params,
-            alpha,
-            opt: AdamW::new(lr),
-        })
-    }
-
-    pub fn num_targets(&self) -> usize {
-        self.targets.len()
-    }
-
-    /// Overwrite the optimizer learning rate (LR schedules mutate this between steps — mlx-rs has no
-    /// built-in scheduler).
-    pub fn set_lr(&mut self, lr: f32) {
-        self.opt.lr = Array::from_slice(&[lr], &[1]);
-    }
-
-    /// One optimizer step on a single `(clean_latent, cap_feats)` sample at flow-match `sigma`.
-    /// `x_t = (1-σ)·x0 + σ·noise`, target `= noise - x0`, `timestep = 1-σ`. Returns the scalar loss.
-    pub fn train_step(
-        &mut self,
-        x0: &Array,
-        cap_feats: &Array,
-        sigma: f32,
-        noise: &Array,
-    ) -> Result<f32> {
-        let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
-        let params_now = self.params.clone();
-
-        // Disjoint field borrows: the loss closure needs `&mut transformer` AND `&targets` at once.
-        let transformer = &mut self.transformer;
-        let targets: &[LoraTarget] = &self.targets;
-        let alpha = self.alpha;
-        let capf = cap_feats.clone();
-
-        let (grads, loss) = {
-            let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
-                install_training_lora(transformer, &p, targets, alpha)?;
-                let v = transformer
-                    .forward(&x_t, timestep, &capf)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                // MSE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-                Ok(vec![subtract(&v, &target)?.square()?.mean(None)?])
-            };
-            let mut vg = keyed_value_and_grad(loss_fn);
-            let (val, grads) = vg(params_now, 0)?;
-            (grads, val[0].item::<f32>())
-        };
-
-        // Global-norm clip then AdamW per parameter.
-        let (clipped, _norm) = clip_grad_norm(&grads, 1.0)?;
-        for (k, g) in clipped.iter() {
-            let mut param = self.params[k].clone();
-            self.opt.update_single(k, g.as_ref(), &mut param)?;
-            self.params.insert(k.clone(), param);
-        }
-        eval(self.params.values())?;
-        Ok(loss)
-    }
-
-    /// The flow-match loss at `sigma` for the CURRENT adapter state, with no gradient — the
-    /// verification probe (base-vs-trained, and round-trip). `with_adapter=false` evaluates the bare
-    /// frozen base (adapters cleared) to measure the LoRA's effect.
-    pub fn eval_loss(
-        &mut self,
-        x0: &Array,
-        cap_feats: &Array,
-        sigma: f32,
-        noise: &Array,
-        with_adapter: bool,
-    ) -> Result<f32> {
-        let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
-        if with_adapter {
-            let params = self.params.clone();
-            install_training_lora(&mut self.transformer, &params, &self.targets, self.alpha)?;
-        } else {
-            clear_adapters(&mut self.transformer, &target_paths(&self.targets));
-        }
-        let v = self.transformer.forward(&x_t, timestep, cap_feats)?;
-        let loss = subtract(&v, &target)?.square()?.mean(None)?;
-        Ok(loss.item::<f32>())
-    }
-
-    /// Round-trip proof: clear the trainable injection, reload `adapter_path` through the REAL
-    /// inference path ([`crate::apply_z_image_adapters`]) onto this same frozen base, and re-measure
-    /// the flow-match loss at `sigma`. Should reproduce [`eval_loss`](Self::eval_loss)`(…, true)`
-    /// bit-for-bit — the trainer injects the SAME `(transpose, alpha/rank fold, scale=1)` the loader
-    /// applies. Restores the cleared state afterwards (a bare base). Uses one transformer (no second
-    /// multi-GB load).
-    pub fn roundtrip_eval(
-        &mut self,
-        adapter_path: impl AsRef<Path>,
-        x0: &Array,
-        cap_feats: &Array,
-        sigma: f32,
-        noise: &Array,
-    ) -> Result<f32> {
-        clear_adapters(&mut self.transformer, &target_paths(&self.targets));
-        let spec = mlx_gen::AdapterSpec {
-            path: adapter_path.as_ref().to_path_buf(),
-            scale: 1.0,
-            kind: mlx_gen::AdapterKind::Lora,
-            pass_scales: None,
-            moe_expert: None,
-        };
-        crate::apply_z_image_adapters(&mut self.transformer, std::slice::from_ref(&spec))?;
-        let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
-        let v = self.transformer.forward(&x_t, timestep, cap_feats)?;
-        let loss = subtract(&v, &target)?.square()?.mean(None)?;
-        clear_adapters(&mut self.transformer, &target_paths(&self.targets));
-        Ok(loss.item::<f32>())
-    }
-
-    /// Write the trained adapter as PEFT-format safetensors — `{path}.lora_A.weight` `[r,in]`,
-    /// `{path}.lora_B.weight` `[out,r]`, scalar `{path}.alpha` — reloadable by
-    /// [`crate::apply_z_image_adapters`].
-    pub fn save_peft(&self, path: impl AsRef<Path>, rank: i32) -> Result<()> {
-        save_lora_peft(
-            &self.params,
-            &self.targets,
-            self.alpha,
-            rank as u32,
-            "",
-            path,
-        )
-    }
-}
-
-/// The dotted paths trained, for clearing the adapter stack back to the bare base.
-fn target_paths(targets: &[LoraTarget]) -> Vec<String> {
-    targets.iter().map(|t| t.path.clone()).collect()
-}
 
 /// `(x_t, target, timestep)` for a single sample at flow-match `sigma`:
 /// `x_t = (1-σ)·x0 + σ·noise`, `target = noise - x0`, `timestep = 1-σ`.
@@ -255,7 +78,7 @@ fn build_batch(x0: &Array, noise: &Array, sigma: f32) -> Result<(Array, Array, f
 
 /// LoRA trainer for Z-Image-Turbo, implementing the core [`Trainer`] surface: a frozen base model
 /// (transformer + VAE + text encoder + tokenizer) that caches a captioned image dataset to
-/// VAE-latents/prompt-embeds, then runs the spike's functional-autograd LoRA loop with the sc-3043
+/// VAE-latents/prompt-embeds, then runs the functional-autograd LoRA loop with the sc-3043
 /// runtime glue (LR schedule, gradient accumulation, checkpoint cadence, cancel, progress bands),
 /// and writes a PEFT adapter that round-trips through the inference loader.
 pub struct ZImageTurboTrainer {

@@ -7,8 +7,8 @@
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/text-encoded and cached, AdamW training drives the flow-match loss down, and a PEFT adapter
-//! is written that carries the inference-reload metadata (the spike already proved that adapter
-//! round-trips bit-for-bit, so here we assert the loop + the output contract).
+//! is written that reloads through the real inference path (`apply_z_image_adapters`) onto a fresh
+//! transformer — the round-trip contract, for both the LoRA and LoKr adapter kinds.
 
 use std::path::{Path, PathBuf};
 
@@ -110,10 +110,9 @@ fn z_image_trainer_trains_and_writes_adapter() {
         "no NaN/Inf losses (not diverging)"
     );
 
-    // Convergence itself is proven deterministically by the spike (lora_train_spike.rs); here each
-    // step samples a fresh sigma+noise from the sigmoid distribution, so per-step loss is dominated
-    // by sigma variance, not a monotonic curve. As a soft efficacy signal we compare the mean of
-    // the first vs last quarter of the run (sigma noise averages out).
+    // Each step samples a fresh sigma+noise from the sigmoid distribution, so per-step loss is
+    // dominated by sigma variance, not a monotonic curve. As an efficacy signal we compare the mean
+    // of the first vs last quarter of the run (sigma noise averages out).
     let q = losses.len() / 4;
     let mean = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
     let (first_q, last_q) = (mean(&losses[..q]), mean(&losses[losses.len() - q..]));
@@ -136,8 +135,61 @@ fn z_image_trainer_trains_and_writes_adapter() {
             .any(|k| k == "layers.0.attention.to_q.lora_A.weight"),
         "adapter should contain PEFT-keyed LoRA factors"
     );
+    // Suffix-match over the DiT covers attention in the main layers AND the refiner stacks (matching
+    // PEFT's target_modules suffix match) — 30 layers + 2 noise + 2 context refiners, ×4 projections.
+    let n_targets = w.keys().filter(|k| k.ends_with(".lora_A.weight")).count();
+    assert_eq!(
+        n_targets, 136,
+        "attention across layers + noise/context refiners"
+    );
+
+    // Round-trip contract (was the sc-3042 spike's job, now proven on the production adapter): free
+    // the trainer's model, then reload the adapter through the REAL inference path
+    // (`apply_z_image_adapters`) onto a fresh transformer. The loader applies the same
+    // `(transpose, alpha/rank fold, scale=1)` the trainer injected, so the reloaded delta matches
+    // what training used by construction; here we confirm every saved target resolves + forwards finite.
+    let adapter_path = out.adapter_path.clone();
+    drop(trainer);
+    let mut t = mlx_gen_z_image::load_transformer(&snapshot()).unwrap();
+    let report = mlx_gen_z_image::apply_z_image_adapters(
+        &mut t,
+        &[AdapterSpec {
+            path: adapter_path,
+            scale: 1.0,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }],
+    )
+    .expect("LoRA adapter should reload through the inference path");
+    assert_eq!(report.applied, n_targets, "every saved LoRA target reloads");
+    assert!(
+        report.unmatched_paths.is_empty(),
+        "every LoRA target should resolve"
+    );
+
+    // A forward with the reloaded LoRA installed produces a finite velocity.
+    let x = mlx_rs::random::normal::<f32>(
+        &[16, 1, 16, 16],
+        None,
+        None,
+        Some(&mlx_rs::random::key(1).unwrap()),
+    )
+    .unwrap();
+    let cap = mlx_rs::random::normal::<f32>(
+        &[8, 2560],
+        None,
+        None,
+        Some(&mlx_rs::random::key(2).unwrap()),
+    )
+    .unwrap();
+    let v = t.forward(&x, 0.5, &cap).unwrap();
+    assert!(
+        v.sum(None).unwrap().item::<f32>().is_finite(),
+        "reloaded LoRA forward should be finite"
+    );
     println!(
-        "[trainer] e2e OK — adapter written to {}",
+        "[trainer] e2e OK — adapter written to {}, reloaded onto {n_targets} targets, forward finite",
         out.adapter_path.display()
     );
 }
