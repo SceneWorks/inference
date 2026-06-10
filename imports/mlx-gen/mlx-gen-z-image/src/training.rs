@@ -302,27 +302,38 @@ inventory::submit! {
     TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer }
 }
 
+/// Capability-free training-request validation, factored out of [`Trainer::validate`] so it can be
+/// unit-tested without a loaded trainer (mirrors the inference-side `validate_request`). Rejects an
+/// empty dataset, zero rank, **zero steps** (F-040 — a 0-step run would otherwise fall straight
+/// through to the save and write a no-op `B = 0` identity adapter), and unsupported optimizers.
+fn validate_request(req: &TrainingRequest) -> Result<()> {
+    if req.items.is_empty() {
+        return Err("z_image_turbo trainer: dataset is empty".into());
+    }
+    if req.config.rank == 0 {
+        return Err("z_image_turbo trainer: rank must be > 0".into());
+    }
+    if req.config.steps == 0 {
+        return Err("z_image_turbo trainer: steps must be > 0".into());
+    }
+    if !TrainOptimizer::is_supported(&req.config.optimizer) {
+        return Err(format!(
+            "z_image_turbo trainer: optimizer '{}' is not available on MLX training (supported: \
+             adamw, adam, rose, prodigy)",
+            req.config.optimizer
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl Trainer for ZImageTurboTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> Result<()> {
-        if req.items.is_empty() {
-            return Err("z_image_turbo trainer: dataset is empty".into());
-        }
-        if req.config.rank == 0 {
-            return Err("z_image_turbo trainer: rank must be > 0".into());
-        }
-        if !TrainOptimizer::is_supported(&req.config.optimizer) {
-            return Err(format!(
-                "z_image_turbo trainer: optimizer '{}' is not available on MLX training (supported: \
-                 adamw, adam, rose, prodigy)",
-                req.config.optimizer
-            )
-            .into());
-        }
-        Ok(())
+        validate_request(req)
     }
 
     fn train(
@@ -481,6 +492,15 @@ impl Trainer for ZImageTurboTrainer {
             }
         }
 
+        // Cancelled before completing a single step (`steps == 0` is rejected upstream by
+        // `validate`): the LoRA factors are still freshly initialized with `B = 0`, a mathematically
+        // no-op adapter. Surface the cancellation as an error (as the inference denoise loop does)
+        // rather than writing a valid-looking `.safetensors` and returning `Ok` — downstream tooling
+        // would otherwise ship an identity LoRA as a trained artifact (F-040).
+        if steps_run == 0 {
+            return Err("z_image_turbo trainer: cancelled before any training step".into());
+        }
+
         // --- save final adapter ---
         on_progress(TrainingProgress::Saving);
         std::fs::create_dir_all(&req.output_dir)?;
@@ -606,4 +626,46 @@ fn compute_loss_grads(
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
     Ok((val[0].item::<f32>(), grads))
+}
+
+#[cfg(test)]
+mod validate_request_tests {
+    use super::validate_request;
+    use mlx_gen::{TrainingConfig, TrainingItem, TrainingRequest};
+    use std::path::PathBuf;
+
+    fn request(items: usize, steps: u32, rank: u32) -> TrainingRequest {
+        TrainingRequest {
+            items: (0..items)
+                .map(|i| TrainingItem {
+                    image_path: PathBuf::from(format!("img{i}.png")),
+                    caption: "a cat".into(),
+                })
+                .collect(),
+            config: TrainingConfig {
+                steps,
+                rank,
+                ..Default::default()
+            },
+            output_dir: PathBuf::from("/tmp/z-image-trainer-test"),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: Vec::new(),
+            cancel: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rejects_zero_steps() {
+        // F-040: a 0-step run must fail validation — otherwise the train loop runs no iterations and
+        // falls straight through to the save, writing a no-op `B = 0` identity adapter.
+        let err = validate_request(&request(1, 0, 16)).unwrap_err();
+        assert!(format!("{err}").contains("steps must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_valid_request_and_keeps_existing_guards() {
+        assert!(validate_request(&request(1, 100, 16)).is_ok());
+        assert!(validate_request(&request(0, 100, 16)).is_err()); // empty dataset
+        assert!(validate_request(&request(1, 100, 0)).is_err()); // zero rank
+    }
 }
