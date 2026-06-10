@@ -25,6 +25,7 @@
 //! additionally dequantizes the weights to dense f32 — the S3a block-math gate.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
@@ -425,10 +426,27 @@ impl LtxAdaptable for AvDiT {
     }
 }
 
-/// `mx.fast.rms_norm(x, ones, eps)` — the block's weightless pre-norm (feature RMS over the last axis).
+thread_local! {
+    /// Cache of the weightless-RMSNorm unit weight per `(dim, dtype)`. An all-ones `(dim,)` array is
+    /// a constant, so building it once and cloning the cheap handle avoids the ~400 alloc+fill
+    /// kernels a fresh `ones` per call cost every DiT forward, every denoise step (F-057; mirrors
+    /// `Connector`'s cached `ones`). Keyed by dtype since the block runs f32 or bf16 activations.
+    static ONES_CACHE: RefCell<HashMap<(i32, Dtype), Array>> = RefCell::new(HashMap::new());
+}
+
+/// `mx.fast.rms_norm(x, ones, eps)` — the block's weightless pre-norm (feature RMS over the last
+/// axis). The all-ones weight is cached per `(dim, dtype)` (F-057), bit-identical to a fresh `ones`.
 fn rms_norm_noweight(x: &Array, eps: f32) -> Result<Array> {
     let dim = *x.shape().last().unwrap();
-    let ones = Array::ones::<f32>(&[dim])?.as_dtype(x.dtype())?;
+    let dt = x.dtype();
+    let ones = ONES_CACHE.with(|c| -> Result<Array> {
+        if let Some(o) = c.borrow().get(&(dim, dt)) {
+            return Ok(o.clone());
+        }
+        let o = Array::ones::<f32>(&[dim])?.as_dtype(dt)?;
+        c.borrow_mut().insert((dim, dt), o.clone());
+        Ok(o)
+    })?;
     Ok(fast_rms_norm(x, &ones, eps)?)
 }
 
@@ -1640,6 +1658,32 @@ impl AvDiT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rms_norm_noweight_matches_fresh_ones_and_caches() {
+        // F-057: the cached `(dim, dtype)` ones must give bit-identical results to a freshly built
+        // ones, and a second call (cache hit) must match the first.
+        use mlx_rs::ops::array_eq;
+        use mlx_rs::random;
+        use mlx_rs::transforms::eval;
+
+        let x = random::normal::<f32>(&[2, 8], None, None, Some(&random::key(0).unwrap())).unwrap();
+        let eps = 1e-6;
+        let got = rms_norm_noweight(&x, eps).unwrap();
+        let ones = Array::ones::<f32>(&[8]).unwrap();
+        let want = fast_rms_norm(&x, &ones, eps).unwrap();
+        eval([&got, &want]).unwrap();
+        assert!(
+            array_eq(&got, &want, None).unwrap().item::<bool>(),
+            "cached ones == fresh ones"
+        );
+        let got2 = rms_norm_noweight(&x, eps).unwrap();
+        eval([&got2]).unwrap();
+        assert!(
+            array_eq(&got, &got2, None).unwrap().item::<bool>(),
+            "cache hit is identical"
+        );
+    }
 
     #[test]
     fn rope_memo_caches_on_positions_and_recomputes_on_change() {
