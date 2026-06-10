@@ -244,6 +244,12 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             req.count, caps.max_count
         )));
     }
+    // `steps == 0` builds a 1-element sigmas schedule; img2img then indexes `sigmas[init_time_step]`
+    // (>= 1) out of bounds → process abort, and txt2img silently decodes pure noise (F-032). `None`
+    // falls back to DEFAULT_STEPS, so only an explicit zero is rejected.
+    if req.steps == Some(0) {
+        return Err(mlx_gen::Error::Msg("steps must be >= 1".into()));
+    }
     if req.width < caps.min_size
         || req.height < caps.min_size
         || req.width > caps.max_size
@@ -336,6 +342,31 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&caps, &req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_steps() {
+        // F-032: an explicit `steps = 0` builds a degenerate 1-element schedule; img2img then indexes
+        // `sigmas[init_time_step]` (>= 1) out of bounds (process abort) and txt2img silently decodes
+        // pure noise. Reject it at the boundary; `None` (default) and any positive count still pass.
+        let caps = descriptor().capabilities;
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            steps: Some(0),
+            ..Default::default()
+        };
+        let err = validate_request(&caps, &req).unwrap_err().to_string();
+        assert!(err.contains("steps must be >= 1"), "got: {err}");
+
+        // `None` falls back to DEFAULT_STEPS and a positive count both pass.
+        for steps in [None, Some(1), Some(20)] {
+            let ok = GenerationRequest {
+                prompt: "a fox".into(),
+                steps,
+                ..Default::default()
+            };
+            assert!(validate_request(&caps, &ok).is_ok(), "steps={steps:?}");
+        }
     }
 
     #[test]
