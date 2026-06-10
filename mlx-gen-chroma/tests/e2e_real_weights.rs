@@ -206,7 +206,9 @@ fn chroma_base_e2e_matches_diffusers() {
 #[test]
 #[ignore = "needs the ~18GB Chroma1-Flash snapshot"]
 fn chroma_flash_e2e_matches_diffusers() {
-    // Flash is the few-step distilled model (static shift 1.0, CFG≈1).
+    // Flash is the few-step distilled model (static shift 1.0, CFG≈1). `guidance == 1.0` exercises the
+    // single-forward path (F-095): `denoise` skips the negative T5 encode + negative DiT forward and
+    // returns `pos` exactly, so matching the diffusers golden here guards that the skip is correct.
     run_image_parity(
         ChromaVariant::Flash,
         "Chroma1-Flash",

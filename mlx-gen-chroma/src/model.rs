@@ -158,16 +158,26 @@ impl Chroma {
     ) -> Result<Array> {
         let (tok, t5, tr, _) = self.parts()?;
         let (pos_embeds, pos_mask) = encode_prompt(tok, t5, prompt)?;
-        let (neg_embeds, neg_mask) = encode_prompt(tok, t5, negative)?;
 
         let h2 = (height / 16) as usize;
         let w2 = (width / 16) as usize;
         let si = (h2 * w2) as i32;
         let img_ids = latent_image_ids(h2, w2);
         let txt_ids_pos = zero_text_ids(pos_embeds.shape()[1] as usize);
-        let txt_ids_neg = zero_text_ids(neg_embeds.shape()[1] as usize);
         let mask_pos = Self::full_mask(&pos_mask, si)?;
-        let mask_neg = Self::full_mask(&neg_mask, si)?;
+
+        // True CFG only kicks in above 1.0; the diffusers reference gates `do_classifier_free_guidance`
+        // on `guidance_scale > 1` and returns `pos` exactly otherwise. `chroma1_flash` defaults
+        // `true_cfg = 1.0` (distilled, single-forward), so skip the negative T5 encode and the negative
+        // DiT forward entirely there — a 2× per-step saving and bit-exact `pred = pos` (F-095).
+        let cfg = if guidance > 1.0 {
+            let (neg_embeds, neg_mask) = encode_prompt(tok, t5, negative)?;
+            let txt_ids_neg = zero_text_ids(neg_embeds.shape()[1] as usize);
+            let mask_neg = Self::full_mask(&neg_mask, si)?;
+            Some((neg_embeds, txt_ids_neg, mask_neg))
+        } else {
+            None
+        };
 
         // Chroma's scheduler is `use_dynamic_shifting=false`. HD/Flash: static `shift` over the raw
         // mlx `linspace(1,1/N,N)` — `σ'=shift·σ/(1+(shift-1)·σ)` (shift=1.0 ⇒ identity). Base:
@@ -196,16 +206,22 @@ impl Chroma {
                 &txt_ids_pos,
                 Some(&mask_pos),
             )?;
-            let neg = tr.forward(
-                &latents,
-                &neg_embeds,
-                &ts,
-                &img_ids,
-                &txt_ids_neg,
-                Some(&mask_neg),
-            )?;
-            // true CFG: neg + g·(pos − neg).
-            let pred = add(&neg, &multiply(&subtract(&pos, &neg)?, scalar(guidance))?)?;
+            // true CFG: neg + g·(pos − neg). At guidance == 1.0 the negative branch is skipped and the
+            // prediction is `pos` exactly (no `neg + 1.0·(pos − neg)` f32 round-trip) — F-095.
+            let pred = match &cfg {
+                Some((neg_embeds, txt_ids_neg, mask_neg)) => {
+                    let neg = tr.forward(
+                        &latents,
+                        neg_embeds,
+                        &ts,
+                        &img_ids,
+                        txt_ids_neg,
+                        Some(mask_neg),
+                    )?;
+                    add(&neg, &multiply(&subtract(&pos, &neg)?, scalar(guidance))?)?
+                }
+                None => pos,
+            };
             latents = sampler.step(&pred, &latents, t)?;
             on_progress(Progress::Step {
                 current: t as u32 + 1,
