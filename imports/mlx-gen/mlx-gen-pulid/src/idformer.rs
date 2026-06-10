@@ -19,7 +19,7 @@ use mlx_rs::Array;
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_exact, linear};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// nn.LayerNorm default epsilon (the IDFormer/PuLID modules; NOT the EVA 1e-6).
 const EPS: f32 = 1e-5;
@@ -230,11 +230,15 @@ impl IdFormer {
     /// `id_vit_hidden`: 5 × `[B, 577, 1024]` (the EVA hidden states).
     /// Returns `id_embedding` `[B, num_queries, output_dim]` (32×2048).
     pub fn forward(&self, id_cond: &Array, id_vit_hidden: &[Array]) -> Result<Array> {
-        assert_eq!(
-            id_vit_hidden.len(),
-            5,
-            "IDFormer expects 5 EVA hidden states"
-        );
+        // `pub` runtime path: report the EVA-capture-count invariant via `Result`, not a panic that
+        // would cross the `Generator::generate` boundary for a future caller with a different EVA
+        // capture schedule (F-080).
+        if id_vit_hidden.len() != 5 {
+            return Err(Error::Msg(format!(
+                "IDFormer expects 5 EVA hidden states, got {}",
+                id_vit_hidden.len()
+            )));
+        }
         let b = id_cond.shape()[0];
         let dim = self.cfg.dim;
 
