@@ -484,6 +484,12 @@ impl T2iModel {
         )?;
 
         let steps = opts.num_steps;
+        // `steps == 0` yields an empty trajectory (and a 0/0 NaN schedule), so the callers' final
+        // `.last().expect("at least one step")` would panic. Surface a typed error instead (F-125);
+        // the registered `Generator` rejects this upstream, but `interleave_gen`/`vqa` reach here too.
+        if steps == 0 {
+            return Err(Error::Msg("sensenova: num_steps must be >= 1".into()));
+        }
         let lin: Vec<f32> = (0..=steps).map(|i| i as f32 / steps as f32).collect();
         let lin_arr = Array::from_slice(&lin, &[(steps + 1) as i32]);
         let ts_arr = if opts.enable_timestep_shift {
@@ -1273,6 +1279,12 @@ impl T2iModel {
         )?;
 
         let steps = opts.num_steps;
+        // `steps == 0` yields an empty trajectory (and a 0/0 NaN schedule), so the callers' final
+        // `.last().expect("at least one step")` would panic. Surface a typed error instead (F-125);
+        // the registered `Generator` rejects this upstream, but `interleave_gen`/`vqa` reach here too.
+        if steps == 0 {
+            return Err(Error::Msg("sensenova: num_steps must be >= 1".into()));
+        }
         let lin: Vec<f32> = (0..=steps).map(|i| i as f32 / steps as f32).collect();
         let lin_arr = Array::from_slice(&lin, &[(steps + 1) as i32]);
         let ts_arr = if opts.enable_timestep_shift {
