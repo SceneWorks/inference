@@ -65,6 +65,7 @@ pub mod transformer;
 pub mod vace;
 pub mod vae;
 pub mod vae22;
+mod vae_common;
 
 pub use adapters::{merge_vace_adapters, merge_wan_adapters, WanLoraReport};
 pub use config::{GuideScale, WanModelConfig, WanQuant, WanVaceConfig, SAMPLE_NEG_PROMPT};
