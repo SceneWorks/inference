@@ -331,8 +331,10 @@ pub(crate) fn row_indices(n: i32) -> Array {
     Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n])
 }
 
-/// Append `pad` zero rows to a 2-D `(N, D)` array (padded positions are zeroed post-embed
-/// anyway, so the pre-embed value is irrelevant — zeros match the fork's repeat-then-zero).
+/// Append `pad` zero rows to a 2-D `(N, D)` array. The pre-embed value of the padded rows is
+/// irrelevant: after patch-embed, `apply_pad` overwrites their embeddings with the **learned** pad
+/// token — NOT zero (see the module header) — so these appended rows are just placeholders. Zeros
+/// match the fork's repeat-then-pad-token construction.
 pub(crate) fn pad_rows(a: &Array, pad: i32) -> Result<Array> {
     if pad <= 0 {
         return Ok(a.clone());
