@@ -1,11 +1,12 @@
-//! `mlx-gen-wan` model entries: the Wan2.2 **TI2V-5B** (`wan2_2_ti2v_5b`, dense, z48 VAE — S0
-//! scaffold, denoise pending in sc-2680), the Wan2.2 **T2V-A14B** (`wan2_2_t2v_14b`, dual-expert MoE,
-//! z16 VAE — fully wired here on the S1–S5 core), and the Wan2.2 **I2V-A14B** (`wan2_2_i2v_14b`,
-//! dual-expert MoE, channel-concat image conditioning, in_dim 36 — sc-2681), plus their registry
-//! self-registration.
+//! `mlx-gen-wan` model entries: the Wan2.2 **TI2V-5B** (`wan2_2_ti2v_5b`, dense, z48 VAE — fully
+//! wired, sc-2680), the Wan2.2 **T2V-A14B** (`wan2_2_t2v_14b`, dual-expert MoE, z16 VAE — fully wired
+//! here on the S1–S5 core), and the Wan2.2 **I2V-A14B** (`wan2_2_i2v_14b`, dual-expert MoE,
+//! channel-concat image conditioning, in_dim 36 — sc-2681), plus their registry self-registration.
 //!
-//! The 5B `load` resolves `config.json` and stubs `generate` (its z48 VAE + dense denoise are
-//! sc-2680). The shared [`Wan14b`] struct serves both A14B variants — [`Wan14b::generate`] runs the
+//! The 5B [`Wan`] struct runs the complete dense pipeline (sc-2680) — [`Wan::generate`]: UMT5-XXL
+//! encode → the dense [`denoise`] (T2V) or the [`denoise_ti2v`] per-token mask-blend (TI2V, single- or
+//! multi-keyframe) → z48 VAE decode → RGB8 frames, with Q4/Q8 + LoRA. The shared [`Wan14b`] struct
+//! serves both A14B variants — [`Wan14b::generate`] runs the
 //! complete pipeline: UMT5-XXL encode → (I2V only) build the channel-concat conditioning `y` →
 //! per-step dual-expert MoE denoise (boundary-switched high/low experts, [`denoise_moe`]) → z16 VAE
 //! decode → RGB8 frames, **staging** each heavy component (T5, the two 27 GB experts, the VAE) in and
