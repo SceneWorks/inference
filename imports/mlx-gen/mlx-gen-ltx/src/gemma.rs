@@ -31,7 +31,7 @@
 //! ≤ sliding_window (1024) the sliding mask equals the full causal+padding mask, so a single
 //! additive causal+padding mask is used for all layers (only the RoPE base differs per layer).
 
-use mlx_rs::fast::{rms_norm, rope, scaled_dot_product_attention};
+use mlx_rs::fast::{rms_norm, rope, scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::nn::gelu_approximate;
 use mlx_rs::ops::{add, concatenate_axis, dequantize, matmul, multiply, quantized_matmul};
 use mlx_rs::{Array, Dtype};
@@ -370,16 +370,31 @@ impl GemmaModel {
             .reshape(&[b, l, self.cfg.hidden_size])?;
         h = multiply(&h, &self.embed_scale)?;
 
-        // Two additive masks over the cache `(1,1,L,offset+L)`: full-causal for the global layers,
-        // causal+window for the sliding layers.
+        // Additive masks over the cache `(1,1,L,offset+L)`: full-causal for the global layers,
+        // causal+window for the sliding layers. F-050: for single-token decode (`L == 1`) every
+        // cached key is at a position `≤` the new token, so the full-causal mask is *entirely*
+        // unmasked — passing SDPA `None` (no additive mask) is bit-identical and skips the per-token
+        // host build. The sliding mask is likewise all-zeros until the cache outgrows the window, so
+        // it too is `None` for the first `sliding_window` tokens; only past that is it rebuilt.
         let k_len = offset + l;
-        let full_mask = self.decode_mask(l, k_len, offset, None)?;
-        let sliding_mask = self.decode_mask(l, k_len, offset, Some(self.cfg.sliding_window))?;
+        let (full_mask, sliding_mask) = if l == 1 {
+            let sliding = if k_len > self.cfg.sliding_window {
+                Some(self.decode_mask(l, k_len, offset, Some(self.cfg.sliding_window))?)
+            } else {
+                None
+            };
+            (None, sliding)
+        } else {
+            (
+                Some(self.decode_mask(l, k_len, offset, None)?),
+                Some(self.decode_mask(l, k_len, offset, Some(self.cfg.sliding_window))?),
+            )
+        };
         for (i, layer) in self.layers.iter().enumerate() {
             let mask = if layer.is_sliding {
-                &sliding_mask
+                sliding_mask.as_ref()
             } else {
-                &full_mask
+                full_mask.as_ref()
             };
             h = self.layer_step(layer, &h, mask, cache, i, offset)?;
         }
@@ -398,7 +413,7 @@ impl GemmaModel {
         &self,
         layer: &GemmaLayer,
         x: &Array,
-        mask: &Array,
+        mask: Option<&Array>,
         cache: &mut GemmaKvCache,
         layer_idx: usize,
         offset: i32,
@@ -425,7 +440,7 @@ impl GemmaModel {
         &self,
         layer: &GemmaLayer,
         x: &Array,
-        mask: &Array,
+        mask: Option<&Array>,
         cache: &mut GemmaKvCache,
         layer_idx: usize,
         offset: i32,
@@ -454,7 +469,16 @@ impl GemmaModel {
         let k = rope(&k, d, false, Some(layer.rope_base), 1.0, offset, None)?;
         let (k_all, v_all) = cache.append(layer_idx, k, v)?;
         let scale = self.cfg.query_pre_attn_scalar.powf(-0.5);
-        let out = scaled_dot_product_attention(&q, &k_all, &v_all, scale, mask, None)?;
+        // `None` mask → SDPA's default (no additive mask) — bit-identical to an all-zeros mask, which
+        // is what the full-causal / pre-window decode case reduces to (F-050).
+        let out = scaled_dot_product_attention(
+            &q,
+            &k_all,
+            &v_all,
+            scale,
+            mask.map(ScaledDotProductAttentionMask::from),
+            None,
+        )?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, l, h * d])?;
         layer.o_proj.forward(&out)
     }
@@ -469,21 +493,78 @@ impl GemmaModel {
         q_offset: i32,
         window: Option<i32>,
     ) -> Result<Array> {
-        let neg = half_min_bf16();
-        let mut data = vec![0f32; (q_len * k_len) as usize];
-        for r in 0..q_len {
-            let pos = q_offset + r;
-            for j in 0..k_len {
-                let causal = j <= pos;
-                let in_window = window.is_none_or(|w| pos - j < w);
-                if !(causal && in_window) {
-                    data[(r * k_len + j) as usize] = neg;
-                }
-            }
-        }
+        let data = causal_window_mask_values(q_len, k_len, q_offset, window, half_min_bf16());
         Array::from_slice(&data, &[1, 1, q_len, k_len])
             .as_dtype(Dtype::Bfloat16)
             .map_err(Error::from)
+    }
+}
+
+/// Additive-mask values (row-major `(q_len, k_len)`): `0.0` where the query may attend, `neg` where
+/// it is blocked. Query row `r` is at absolute position `q_offset + r`; key column `j` at position
+/// `j`. Blocked unless causal (`j ≤ pos`) and — when `window` is set — within the sliding window
+/// (`pos − j < window`). Pure (no MLX), so the masking logic is unit-testable; in particular a
+/// single-query (`q_len == 1`) full-causal / within-window row is all-zeros, which is why the decode
+/// path passes SDPA `None` instead of building it (F-050).
+fn causal_window_mask_values(
+    q_len: i32,
+    k_len: i32,
+    q_offset: i32,
+    window: Option<i32>,
+    neg: f32,
+) -> Vec<f32> {
+    let mut data = vec![0f32; (q_len * k_len) as usize];
+    for r in 0..q_len {
+        let pos = q_offset + r;
+        for j in 0..k_len {
+            let causal = j <= pos;
+            let in_window = window.is_none_or(|w| pos - j < w);
+            if !(causal && in_window) {
+                data[(r * k_len + j) as usize] = neg;
+            }
+        }
+    }
+    data
+}
+
+#[cfg(test)]
+mod decode_mask_tests {
+    use super::causal_window_mask_values;
+    const NEG: f32 = -1.0; // a sentinel "blocked" value for readable assertions
+
+    #[test]
+    fn single_query_full_causal_row_is_all_zeros() {
+        // F-050: decode (q_len=1) at offset 5, k_len 6, no window → every cached key is causally
+        // valid → all zeros, which is why the full-attention decode passes SDPA `None`.
+        assert!(causal_window_mask_values(1, 6, 5, None, NEG)
+            .iter()
+            .all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn single_query_within_window_is_all_zeros() {
+        // k_len (6) ≤ window (8): every cached key is inside the window → all zeros → `None`.
+        assert!(causal_window_mask_values(1, 6, 5, Some(8), NEG)
+            .iter()
+            .all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn single_query_beyond_window_blocks_oldest_keys() {
+        // pos=5, k_len=6, window=3 → valid iff pos-j < 3 → j ∈ {3,4,5}; j ∈ {0,1,2} blocked.
+        assert_eq!(
+            causal_window_mask_values(1, 6, 5, Some(3), NEG),
+            vec![NEG, NEG, NEG, 0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn prefill_is_lower_triangular() {
+        // q_len=3, offset=0, k_len=3, no window → row r attends j ≤ r.
+        assert_eq!(
+            causal_window_mask_values(3, 3, 0, None, NEG),
+            vec![0.0, NEG, NEG, 0.0, 0.0, NEG, 0.0, 0.0, 0.0]
+        );
     }
 }
 
@@ -496,6 +577,14 @@ pub struct GemmaKvCache {
 impl GemmaKvCache {
     /// Append this step's `(k, v)` to layer `i`'s cache and return the full cached `(k, v)`. (mlx
     /// `Array` is a cheap handle, so the clone retained in the cache is a refcount bump, not a copy.)
+    ///
+    /// F-050 note: this grows the cache with `concatenate_axis` rather than a preallocate-and-slice
+    /// step-buffer (the reference `RotatingKVCache` pattern). In immutable-array mlx a `slice_update`
+    /// into a fixed buffer is itself a *functional* whole-buffer copy unless mlx donates the buffer
+    /// in place — which it cannot here, since the cache retains the buffer reference — so it would
+    /// copy the full capacity each step (worse than concat's `seq+1`), not amortize to O(1). Every
+    /// KV cache in this workspace (e.g. `mlx-gen-sensenova`) uses the same concat idiom for this
+    /// reason; revisit only if mlx-rs gains a guaranteed in-place buffer update.
     fn append(&mut self, i: usize, k: Array, v: Array) -> Result<(Array, Array)> {
         let merged = match self.layers[i].take() {
             Some((pk, pv)) => (
