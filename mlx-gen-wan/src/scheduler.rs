@@ -15,7 +15,7 @@
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// Which flow-match solver to use. `UniPC` is the Wan2.2 default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +49,22 @@ pub trait WanScheduler {
     fn step(&mut self, model_output: &Array, sample: &Array) -> Result<Array>;
     /// Reset to step 0 (clears multistep history).
     fn reset(&mut self);
+}
+
+/// Guard the per-step `sigmas_f64[step_index(+1)]` indexing every `step` impl performs (F-019).
+/// `WanScheduler` is public, so a caller that miscounts steps — over-steps past `num_steps`, or steps
+/// before `set_timesteps` builds the schedule — must get a typed `Error`, not an out-of-bounds panic
+/// (and, for UniPC, a `num_steps - i` underflow). A built schedule has `num_steps + 1` sigmas
+/// (trailing terminal `0.0`), so a valid step needs `step_index + 1 < sigmas.len()`.
+fn ensure_step_in_range(step_index: usize, sigmas_len: usize) -> Result<()> {
+    if step_index + 1 >= sigmas_len {
+        return Err(Error::Msg(format!(
+            "WanScheduler::step over-stepped: step_index {step_index} but the schedule has {} \
+             step(s) ({sigmas_len} sigmas) — call set_timesteps and run exactly that many steps",
+            sigmas_len.saturating_sub(1)
+        )));
+    }
+    Ok(())
 }
 
 /// Construct a boxed scheduler for `kind`.
@@ -141,6 +157,7 @@ impl WanScheduler for FlowMatchEuler {
     }
     fn step(&mut self, model_output: &Array, sample: &Array) -> Result<Array> {
         let i = self.step_index;
+        ensure_step_in_range(i, self.sigmas_f64.len())?;
         let dt = self.sigmas_f64[i + 1] - self.sigmas_f64[i];
         let x_next = add(sample, &fscale(model_output, dt)?)?;
         self.step_index += 1;
@@ -210,6 +227,7 @@ impl WanScheduler for FlowDpmpp2m {
     }
     fn step(&mut self, model_output: &Array, sample: &Array) -> Result<Array> {
         let i = self.step_index;
+        ensure_step_in_range(i, self.sigmas_f64.len())?;
         let s = &self.sigmas_f64;
         let sigma_cur = s[i];
         let sigma_next = s[i + 1];
@@ -466,6 +484,7 @@ impl WanScheduler for FlowUniPC {
     }
     fn step(&mut self, model_output: &Array, sample: &Array) -> Result<Array> {
         let i = self.step_index;
+        ensure_step_in_range(i, self.sigmas_f64.len())?;
         // x0 = sample − σ[i]·v
         let x0 = subtract(sample, &fscale(model_output, self.sigmas_f64[i])?)?;
 
@@ -583,6 +602,32 @@ fn solve_linear(r: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_step_in_range_guards_over_and_under_run() {
+        // F-019: a built schedule has num_steps+1 sigmas; a valid step needs step_index+1 < len.
+        assert!(ensure_step_in_range(0, 0).is_err()); // empty (set_timesteps not called)
+        assert!(ensure_step_in_range(0, 3).is_ok()); // 2-step schedule, first step
+        assert!(ensure_step_in_range(1, 3).is_ok()); // last valid step
+        assert!(ensure_step_in_range(2, 3).is_err()); // over-stepped
+    }
+
+    #[test]
+    fn step_errors_instead_of_panicking_when_over_stepped() {
+        // F-019: driving a scheduler past its step count returns a typed error, not an OOB panic.
+        let mut sched = make_scheduler(SolverKind::Euler, 1000);
+        sched.set_timesteps(2, 5.0);
+        let x = Array::from_slice(&[0.5f32, -0.5], &[1, 2]);
+        let v = Array::from_slice(&[0.1f32, 0.2], &[1, 2]);
+        assert!(sched.step(&v, &x).is_ok()); // step 0
+        assert!(sched.step(&v, &x).is_ok()); // step 1 (last)
+        let err = sched.step(&v, &x).unwrap_err().to_string(); // step 2 → over-stepped
+        assert!(err.contains("over-stepped"), "got: {err}");
+
+        // Stepping before set_timesteps (empty schedule) also errors rather than panicking.
+        let mut fresh = make_scheduler(SolverKind::Euler, 1000);
+        assert!(fresh.step(&v, &x).is_err());
+    }
 
     #[test]
     fn from_name_maps_advertised_samplers_and_defaults_to_unipc() {
