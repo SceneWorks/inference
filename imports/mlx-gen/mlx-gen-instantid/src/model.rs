@@ -295,6 +295,7 @@ impl InstantId {
         req: &InstantIdRequest,
         reference: &Image,
         kps_norm: &[(f32, f32)],
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_kps(kps_norm)?;
         let side = req.width;
@@ -311,7 +312,7 @@ impl InstantId {
             height: side,
             ..req.clone()
         };
-        self.generate_with(&sq, &face.embedding, &kps)
+        self.generate_with(&sq, &face.embedding, &kps, on_progress)
     }
 
     /// Core generate from a precomputed ArcFace `embedding` (512-d) and 5 `kps` (output-canvas pixel
