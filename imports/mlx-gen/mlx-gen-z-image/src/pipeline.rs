@@ -323,7 +323,17 @@ pub(crate) fn render_batch(
         let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
         let latents = match clean {
             // img2img: blend the pre-encoded clean latents with the noise at `sigma = sigmas[start]`.
-            Some(clean) => add_noise_by_interpolation(clean, &noise, scheduler.sigmas[start_step])?,
+            // `.get` defensively: a degenerate schedule (e.g. steps == 0, rejected upstream by
+            // `validate_request`) must surface as a typed error, not an out-of-bounds Vec panic (F-032).
+            Some(clean) => {
+                let sigma = scheduler.sigmas.get(start_step).ok_or_else(|| {
+                    mlx_gen::Error::Msg(format!(
+                        "img2img start step {start_step} out of range for {}-element schedule",
+                        scheduler.sigmas.len()
+                    ))
+                })?;
+                add_noise_by_interpolation(clean, &noise, *sigma)?
+            }
             None => noise,
         };
         // sc-2963 (rollout of sc-2957): run the DiT's fusable elementwise glue through `mx.compile` —
