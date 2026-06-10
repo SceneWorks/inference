@@ -37,6 +37,8 @@ use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
+use crate::vae_common::{contiguous, scalar, slice_axis, tile_decode_accumulate, FeatCache};
+
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
 const CACHE_T: i32 = 2;
 /// Channel-L2 norm floor (reference `mx.maximum(l2_sq, 1e-24)`).
@@ -65,18 +67,6 @@ const NUM_RES_BLOCKS: usize = 2;
 const TEMPORAL_UPSAMPLE: [bool; 3] = [true, true, false];
 /// Encoder temporal-downsample per stage (`downsample3d` vs `downsample2d`).
 const TEMPORAL_DOWNSAMPLE: [bool; 3] = [false, true, true];
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
-
-/// Force a logically-contiguous copy (host-read boundary): mlx `as_slice` returns the *physical*
-/// buffer, so an array left strided by a transpose must be re-materialized. Internal ops are
-/// stride-aware, so this is only needed at the public decode/encode output.
-fn contiguous(x: &Array) -> Result<Array> {
-    let shape = x.shape().to_vec();
-    Ok(x.reshape(&[-1])?.reshape(&shape)?)
-}
 
 /// `x / max(‖x‖₂ over last axis, 1e-24) · √C · γ` — channel-L2 norm over the **last** axis (vae22's
 /// `RMS_norm`). `gamma` carries `C` elements and broadcasts on the last axis.
@@ -119,21 +109,6 @@ fn last_t(x: &Array, n: i32) -> Result<Array> {
 fn slice_t(x: &Array, start: i32, end: i32) -> Result<Array> {
     let idx: Vec<i32> = (start..end).collect();
     Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
-}
-
-/// Per-conv last-frames cache threaded through the chunked encode. `idx` resets to 0 each chunk and
-/// advances once per cache-bearing conv (in the fixed traversal order).
-struct FeatCache {
-    slots: Vec<Option<Array>>,
-    idx: usize,
-}
-impl FeatCache {
-    fn new(n: usize) -> Self {
-        Self {
-            slots: vec![None; n],
-            idx: 0,
-        }
-    }
 }
 
 /// vae22 3-D causal conv (channels-last `[B,T,H,W,C]`). Causal time pad = `2·pt` on the LEFT
@@ -973,60 +948,14 @@ impl Wan22Vae {
         let denorm = add(&multiply(&z, &self.std)?, &self.mean)?;
         let plan = cfg.plan(VaeTiling::WAN22, f, h, w);
 
-        let mut output: Option<Array> = None; // [1, out_f, out_h, out_w, 3]
-        let mut weights: Option<Array> = None; // [1, out_f, out_h, out_w, 1]
-        for t in &plan.t {
-            for hh in &plan.h {
-                for ww in &plan.w {
-                    let tile = slice_axis_cl(&denorm, 1, t.start, t.end)?;
-                    let tile = slice_axis_cl(&tile, 2, hh.start, hh.end)?;
-                    let tile = slice_axis_cl(&tile, 3, ww.start, ww.end)?;
-                    let x = self.conv2.forward(&tile, None)?;
-                    let dec = self.decoder.forward(&x)?;
-                    let dec = unpatchify(&dec, 2)?;
-                    let dec = minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?;
-
-                    let ds = dec.shape();
-                    let at = ds[1].min(t.out_stop - t.out_start);
-                    let ah = ds[2].min(hh.out_stop - hh.out_start);
-                    let aw = ds[3].min(ww.out_stop - ww.out_start);
-
-                    // Channels-last blend masks [1, at, ah, aw, 1].
-                    let tm = Array::from_slice(&t.mask[..at as usize], &[1, at, 1, 1, 1]);
-                    let hm = Array::from_slice(&hh.mask[..ah as usize], &[1, 1, ah, 1, 1]);
-                    let wm = Array::from_slice(&ww.mask[..aw as usize], &[1, 1, 1, aw, 1]);
-                    let blend = multiply(&multiply(&tm, &hm)?, &wm)?;
-
-                    let dec = slice_axis_cl(&dec, 1, 0, at)?;
-                    let dec = slice_axis_cl(&dec, 2, 0, ah)?;
-                    let dec = slice_axis_cl(&dec, 3, 0, aw)?;
-                    let weighted = multiply(&dec, &blend)?;
-
-                    let pads = [
-                        (0, 0),
-                        (t.out_start, plan.out_f - (t.out_start + at)),
-                        (hh.out_start, plan.out_h - (hh.out_start + ah)),
-                        (ww.out_start, plan.out_w - (ww.out_start + aw)),
-                        (0, 0),
-                    ];
-                    let weighted_full = pad(&weighted, &pads[..], None, None)?;
-                    let blend_full = pad(&blend, &pads[..], None, None)?;
-                    output = Some(match output {
-                        None => weighted_full,
-                        Some(acc) => add(&acc, &weighted_full)?,
-                    });
-                    weights = Some(match weights {
-                        None => blend_full,
-                        Some(acc) => add(&acc, &blend_full)?,
-                    });
-                    eval(output.as_ref().unwrap())?;
-                    eval(weights.as_ref().unwrap())?;
-                }
-            }
-        }
-        let output = output.expect("at least one tile");
-        let weights = weights.expect("at least one tile");
-        contiguous(&divide(&output, &maximum(&weights, scalar(1e-8))?)?)
+        // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile decode adds the 2× spatial
+        // unpatchify (vae22 upsamples 16× via decoder×8 + patch×2) before the clamp.
+        tile_decode_accumulate(&denorm, &plan, [1, 2, 3], |tile| {
+            let x = self.conv2.forward(tile, None)?;
+            let dec = self.decoder.forward(&x)?;
+            let dec = unpatchify(&dec, 2)?;
+            Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
+        })
     }
 
     /// Encode an image/video `[1, T, H, W, 3]` (channels-last, `T = 1 + 4·k`, values in `[-1, 1]`) →
@@ -1059,16 +988,10 @@ impl Wan22Vae {
         }
         // Pointwise conv1 (z·2 → z·2) then split mu = first z channels; normalize.
         let out = top_conv1.forward(&out.unwrap(), None)?;
-        let mu = slice_axis_cl(&out, 4, 0, self.z_dim)?;
+        let mu = slice_axis(&out, 4, 0, self.z_dim)?;
         let normed = divide(&subtract(&mu, &self.mean)?, &self.std)?;
         contiguous(&normed)
     }
-}
-
-/// Gather the contiguous range `[start, end)` along `axis` (mlx-rs has no slice op).
-fn slice_axis_cl(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), axis)?)
 }
 
 #[cfg(test)]
