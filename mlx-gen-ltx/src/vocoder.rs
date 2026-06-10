@@ -581,6 +581,55 @@ struct MelStft {
     mel_basis: Array,     // (n_mels, n_freq)
 }
 
+/// Log-mel of a (left-padded) flattened waveform `(BC, T)` from the stored STFT/mel bases.
+/// `forward_basis` is the `(2·n_freq, 1, win)` STFT kernel (stacked real+imag rows), `mel_basis` the
+/// `(n_mels, n_freq)` filterbank. F-051: the per-frame slice+matmul+`stack_axis` loop is replaced by
+/// one gather of all `win`-length windows `(BC, n_frames, win)` + a single batched matmul against the
+/// basis, then a batched magnitude → mel → log. This keeps the same `matmul` reduction the reference
+/// uses (so it is bit-identical to the former loop — *not* a `conv1d`, whose Metal kernel differs
+/// from matmul by ~0.1%), while collapsing ~`n_frames` graph iterations into a handful of ops.
+/// Returns `(BC, n_frames, n_mels)`.
+fn stft_log_mel(
+    x: &Array,
+    forward_basis: &Array,
+    mel_basis: &Array,
+    hop: i32,
+    win: i32,
+) -> Result<Array> {
+    let (bc, total) = (x.shape()[0], x.shape()[1]);
+    let n_freq2 = forward_basis.shape()[0];
+    let n_freq = n_freq2 / 2;
+    let n_frames = ((total - win) / hop + 1).max(1);
+
+    // Gather every sliding window at once: `idx[i, k] = i·hop + k`, so `x[:, idx]` is
+    // `(BC, n_frames, win)` — the stacked frame segments without a per-frame slice.
+    let mut idx = Vec::with_capacity((n_frames * win) as usize);
+    for i in 0..n_frames {
+        for k in 0..win {
+            idx.push(i * hop + k);
+        }
+    }
+    let windows = x.take_axis(Array::from_slice(&idx, &[n_frames, win]), 1)?; // (BC, n_frames, win)
+
+    // STFT: `windows @ basisᵀ`, one batched matmul (frames folded into the batch). Same per-window
+    // length-`win` reduction as the old loop's `matmul(basis, segᵀ)`.
+    let basis_t = forward_basis
+        .take_axis(Array::from_int(0), 1)? // (2·n_freq, win)
+        .transpose_axes(&[1, 0])?; // (win, 2·n_freq)
+    let spec = matmul(&windows.reshape(&[bc * n_frames, win])?, &basis_t)?
+        .reshape(&[bc, n_frames, n_freq2])?;
+
+    let real = spec.take_axis(range_idx(0, n_freq), 2)?;
+    let imag = spec.take_axis(range_idx(n_freq, n_freq2), 2)?;
+    let magnitude = add(&multiply(&real, &real)?, &multiply(&imag, &imag)?)?.sqrt()?; // (BC, n_frames, n_freq)
+
+    let mel_basis_t = mel_basis.transpose_axes(&[1, 0])?; // (n_freq, n_mels)
+    let n_mels = mel_basis_t.shape()[1];
+    let mel = matmul(&magnitude.reshape(&[bc * n_frames, n_freq])?, &mel_basis_t)?
+        .reshape(&[bc, n_frames, n_mels])?;
+    Ok(maximum(&mel, scalar(1e-5))?.log()?)
+}
+
 /// BigVGAN core + bandwidth-extension (`VocoderWithBWE`). The shipped 2.3 vocoder (48 kHz).
 pub struct VocoderWithBwe {
     vocoder: Generator,
@@ -618,44 +667,19 @@ impl VocoderWithBwe {
         let mut x = audio.reshape(&[b * c, t])?;
         let left_pad = (self.win - self.hop).max(0);
         x = pad(&x, &[(0, 0), (left_pad, 0)][..], None, None)?;
-        let mut total = x.shape()[1];
-        if total < self.win {
-            x = pad(&x, &[(0, 0), (0, self.win - total)][..], None, None)?;
-            total = x.shape()[1];
+        if x.shape()[1] < self.win {
+            x = pad(&x, &[(0, 0), (0, self.win - x.shape()[1])][..], None, None)?;
         }
-        let n_frames = (((total - self.win) / self.hop) + 1).max(1);
 
-        // basis (2·n_freq, win) = forward_basis[:, 0, :]; n_freq = 257.
-        let basis = self
-            .mel_stft
-            .forward_basis
-            .take_axis(Array::from_int(0), 1)?;
-        let n_freq = basis.shape()[0] / 2;
-        let mel_basis_t = self.mel_stft.mel_basis.transpose_axes(&[1, 0])?; // (n_freq, n_mels)
-
-        let mut frames: Vec<Array> = Vec::with_capacity(n_frames as usize);
-        for i in 0..n_frames {
-            let start = i * self.hop;
-            let mut seg = x.take_axis(range_idx(start, start + self.win), 1)?; // (B*C, win)
-            if seg.shape()[1] < self.win {
-                seg = pad(
-                    &seg,
-                    &[(0, 0), (0, self.win - seg.shape()[1])][..],
-                    None,
-                    None,
-                )?;
-            }
-            let spec = matmul(&basis, &seg.transpose_axes(&[1, 0])?)?.transpose_axes(&[1, 0])?; // (B*C, 2·n_freq)
-            let real = spec.take_axis(range_idx(0, n_freq), 1)?;
-            let imag = spec.take_axis(range_idx(n_freq, 2 * n_freq), 1)?;
-            let magnitude = add(&multiply(&real, &real)?, &multiply(&imag, &imag)?)?.sqrt()?;
-            let mel = matmul(&magnitude, &mel_basis_t)?; // (B*C, n_mels)
-            let mel = maximum(&mel, scalar(1e-5))?.log()?;
-            frames.push(mel);
-        }
-        let refs: Vec<&Array> = frames.iter().collect();
-        let mel_bt = stack_axis(&refs, 1)?; // (B*C, T_frames, n_mels)
-        let n_mels = *mel_bt.shape().last().unwrap();
+        // Windowed STFT → magnitude → mel → log, as one strided conv1d + batched matmul (F-051).
+        let mel_bt = stft_log_mel(
+            &x,
+            &self.mel_stft.forward_basis,
+            &self.mel_stft.mel_basis,
+            self.hop,
+            self.win,
+        )?; // (B*C, T_frames, n_mels)
+        let (n_frames, n_mels) = (mel_bt.shape()[1], mel_bt.shape()[2]);
         let mel = mel_bt.reshape(&[b, c, n_frames, n_mels])?;
         Ok(mel.transpose_axes(&[0, 1, 3, 2])?) // (B, C, n_mels, T_frames)
     }
@@ -770,5 +794,69 @@ impl LtxVocoder {
             LtxVocoder::Plain(g) => g.forward(mel_spec),
             LtxVocoder::Bwe(v) => v.forward(mel_spec),
         }
+    }
+}
+
+#[cfg(test)]
+mod stft_log_mel_tests {
+    use super::*;
+    use mlx_rs::random;
+    use mlx_rs::transforms::eval;
+
+    /// The vectorized `stft_log_mel` (gather + batched matmul) must reproduce the former per-frame
+    /// slice+matmul+stack loop **bit-for-bit** on synthetic data — same `matmul` reductions, just
+    /// batched (F-051). (A `conv1d` would not: its Metal kernel differs from matmul by ~0.1%.)
+    #[test]
+    fn vectorized_stft_log_mel_matches_per_frame_loop() {
+        let (bc, total, win, hop, n_freq, n_mels) = (2i32, 40i32, 8i32, 4i32, 3i32, 4i32);
+        let key = |s| random::key(s).unwrap();
+        let x = random::normal::<f32>(&[bc, total], None, None, Some(&key(0))).unwrap();
+        let fb = random::normal::<f32>(&[2 * n_freq, 1, win], None, None, Some(&key(1))).unwrap();
+        let mb = random::normal::<f32>(&[n_mels, n_freq], None, None, Some(&key(2)))
+            .unwrap()
+            .abs()
+            .unwrap(); // mel filterbank is non-negative
+        eval([&x, &fb, &mb]).unwrap();
+
+        let got = stft_log_mel(&x, &fb, &mb, hop, win).unwrap(); // (bc, n_frames, n_mels)
+
+        // Reference: the prior per-frame loop.
+        let basis = fb.take_axis(Array::from_int(0), 1).unwrap(); // (2·n_freq, win)
+        let mbt = mb.transpose_axes(&[1, 0]).unwrap();
+        let n_frames = (total - win) / hop + 1;
+        let mut frames = Vec::new();
+        for i in 0..n_frames {
+            let start = i * hop;
+            let seg = x.take_axis(range_idx(start, start + win), 1).unwrap();
+            let spec = matmul(&basis, seg.transpose_axes(&[1, 0]).unwrap())
+                .unwrap()
+                .transpose_axes(&[1, 0])
+                .unwrap();
+            let real = spec.take_axis(range_idx(0, n_freq), 1).unwrap();
+            let imag = spec.take_axis(range_idx(n_freq, 2 * n_freq), 1).unwrap();
+            let magnitude = add(
+                multiply(&real, &real).unwrap(),
+                multiply(&imag, &imag).unwrap(),
+            )
+            .unwrap()
+            .sqrt()
+            .unwrap();
+            let mel = matmul(&magnitude, &mbt).unwrap();
+            frames.push(maximum(&mel, scalar(1e-5)).unwrap().log().unwrap());
+        }
+        let refs: Vec<&Array> = frames.iter().collect();
+        let want = stack_axis(&refs, 1).unwrap(); // (bc, n_frames, n_mels)
+
+        assert_eq!(got.shape(), want.shape());
+        let d = subtract(&got, &want).unwrap();
+        eval([&d]).unwrap();
+        let max_abs = d
+            .as_slice::<f32>()
+            .iter()
+            .fold(0f32, |m, &v| m.max(v.abs()));
+        assert_eq!(
+            max_abs, 0.0,
+            "vectorized vs per-frame loop max abs diff = {max_abs}"
+        );
     }
 }
