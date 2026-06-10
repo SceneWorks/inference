@@ -21,11 +21,8 @@ use mlx_rs::Array;
 
 use crate::bisenet::BiSeNet;
 use crate::iresnet::ArcFace;
-use crate::scrfd::Scrfd;
+use crate::scrfd::{Scrfd, DET_SIZE};
 use crate::{align, bisenet};
-
-/// Fixed SCRFD detector input (square, matches [`crate::scrfd`]).
-const DET_SIZE: i32 = 640;
 
 /// One detected face — mirrors insightface's `Face` fields the consumers use.
 #[derive(Clone, Debug)]
