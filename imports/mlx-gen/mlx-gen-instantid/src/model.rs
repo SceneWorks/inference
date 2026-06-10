@@ -271,6 +271,38 @@ impl InstantId {
         self.generate_with(&sq, &face.embedding, &kps)
     }
 
+    /// **Multi-view angle generation from caller-supplied landmarks** (sc-4425): the data-driven
+    /// sibling of [`generate_angle`]. Identical pipeline and square-canvas contract, but the 5-point
+    /// kps come from the caller (`kps_norm`, normalized to a square `0.0..=1.0`) instead of the
+    /// canonical [`kps::VIEW_ANGLE_KPS`] table. This lets SceneWorks own the angle/framing presets
+    /// (built-in plus user-defined) so the engine no longer needs a hardcoded angle table. The
+    /// reference supplies *identity* (its ArcFace embedding) while `kps_norm` supplies the IdentityNet
+    /// pose/framing. The canvas is **square** (`req.width` is the side; `req.height` is forced to the
+    /// side, per the sc-2009 kps-distortion rule). Requires [`with_face`](Self::with_face).
+    pub fn generate_with_kps(
+        &self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        kps_norm: &[(f32, f32)],
+    ) -> Result<Image> {
+        validate_kps(kps_norm)?;
+        let side = req.width;
+        // Scale the normalized landmarks to square-canvas pixels (mirrors `kps::view_angle_kps`).
+        let kps: Vec<(f32, f32)> = kps_norm
+            .iter()
+            .map(|(x, y)| (x * side as f32, y * side as f32))
+            .collect();
+        // Identity from the reference (letterboxed to the square canvas).
+        let canvas = kps::letterbox(reference, side, side);
+        let face = self.largest_face(&canvas.pixels, side as usize, side as usize)?;
+        let sq = InstantIdRequest {
+            width: side,
+            height: side,
+            ..req.clone()
+        };
+        self.generate_with(&sq, &face.embedding, &kps)
+    }
+
     /// Core generate from a precomputed ArcFace `embedding` (512-d) and 5 `kps` (output-canvas pixel
     /// coords) — the face-stack-independent path (also the engine seam: `ip_adapter_scale = 0` +
     /// `controlnet_scale = 0` reduces to plain SDXL txt2img).
