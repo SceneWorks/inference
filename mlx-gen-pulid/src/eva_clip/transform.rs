@@ -11,7 +11,7 @@
 use mlx_rs::ops::{divide, subtract};
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// OpenAI/EVA normalization constants (`eva_clip/constants.py`).
 pub const EVA_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
@@ -104,7 +104,13 @@ pub fn resize_bicubic_f32(
 pub fn eva_transform(ffi_nhwc: &Array, size: i32) -> Result<Array> {
     let sh = ffi_nhwc.shape();
     let (b, in_h, in_w) = (sh[0], sh[1] as usize, sh[2] as usize);
-    assert_eq!(b, 1, "eva_transform handles a single image");
+    // `pub` runtime path (per-generate): report the single-image invariant via `Result`, not a
+    // panic that would cross the `Generator::generate` boundary for a future batched caller (F-080).
+    if b != 1 {
+        return Err(Error::Msg(format!(
+            "eva_transform handles a single image, got batch {b}"
+        )));
+    }
     let flat = ffi_nhwc.as_dtype(mlx_rs::Dtype::Float32)?.reshape(&[-1])?;
     let src: Vec<f32> = flat.as_slice::<f32>().to_vec();
     let resized = resize_bicubic_f32(&src, in_h, in_w, size as usize, size as usize);
@@ -117,4 +123,22 @@ pub fn normalize(x: &Array) -> Result<Array> {
     let mean = Array::from_slice(&EVA_MEAN, &[1, 1, 1, 3]);
     let std = Array::from_slice(&EVA_STD, &[1, 1, 1, 3]);
     Ok(divide(&subtract(x, &mean)?, &std)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-080: a non-single-image batch is reported via `Result`, not a panic across the
+    /// `Generator::generate` boundary. A single image still resizes/normalizes to `[1, size, size, 3]`.
+    #[test]
+    fn eva_transform_rejects_batch_and_accepts_single() {
+        let single = Array::from_slice(&[0.5f32; 4 * 4 * 3], &[1, 4, 4, 3]);
+        let out = eva_transform(&single, 8).unwrap();
+        assert_eq!(out.shape(), &[1, 8, 8, 3]);
+
+        let batched = Array::from_slice(&[0.5f32; 2 * 4 * 4 * 3], &[2, 4, 4, 3]);
+        let err = eva_transform(&batched, 8).unwrap_err().to_string();
+        assert!(err.contains("single image"), "got: {err}");
+    }
 }
