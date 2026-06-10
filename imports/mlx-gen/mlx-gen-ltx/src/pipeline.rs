@@ -249,7 +249,9 @@ pub fn generate_t2v_latents(
     // residuals, tanh-GELU FFN, split-RoPE rotation) through `mx.compile` — bit-exact and the biggest
     // per-step win of the rollout at video sequence (the FFN GELU dominates). Enabled here at the
     // production boundary (not inside the shared `denoise`, which the parity tests reuse eager).
-    crate::set_compile_glue(true);
+    // sc-4045/F-049: an RAII guard restores the prior process-global on return, so the eager parity
+    // gates aren't left running compiled after a generate.
+    let _compile_glue = crate::CompileGlueGuard::enable();
     // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
     dit.set_lora_pass(0);
     let lat = denoise(
@@ -596,8 +598,9 @@ pub fn generate_av_latents(
 ) -> Result<(Array, Array)> {
     // sc-2963 (rollout of sc-2957): compiled elementwise glue across the joint video/audio/cross-modal
     // AvDiT forward — see `generate_t2v_latents`. Bit-exact, dtype-preserving, enabled at the
-    // production boundary (the shared `denoise_av` stays eager for the parity tests).
-    crate::set_compile_glue(true);
+    // production boundary (the shared `denoise_av` stays eager for the parity tests). sc-4045/F-049:
+    // an RAII guard restores the prior process-global on return.
+    let _compile_glue = crate::CompileGlueGuard::enable();
     // Stage 1: video init = conditioned+noised (replace-latent) or pure noise (T2V); audio = noise.
     let (vlat1, vstate1): (Array, Option<I2vConditioning>) = {
         let zeros =
@@ -688,7 +691,9 @@ pub fn generate_av_latents_iclora(
     grid_dims: (i32, i32, i32, i32),
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
-    crate::set_compile_glue(true);
+    // sc-2963 compiled elementwise glue at the production boundary; sc-4045/F-049 RAII guard restores
+    // the prior process-global on return (the shared joint denoise stays eager for the parity tests).
+    let _compile_glue = crate::CompileGlueGuard::enable();
     let (c, f, h1, w1) = grid_dims;
 
     // Stage 1: build the base token state from the noise grid + main positions, append each clip as
