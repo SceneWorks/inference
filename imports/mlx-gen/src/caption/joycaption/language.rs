@@ -38,6 +38,22 @@ pub const PROJECTOR_OUT_SIZE: i32 = 4096;
 
 pub const STOP_TOKENS: &[i32] = &[END_OF_TEXT_TOKEN_ID, EOM_TOKEN_ID, EOT_TOKEN_ID];
 
+/// Repetition-penalty strength used in [`sample_token`] — the classic CTRL / HF
+/// `RepetitionPenaltyLogitsProcessor` formulation (Keskar et al. 2019): a recently-emitted token's
+/// logit is **divided** by this when positive and **multiplied** by it when negative, mildly
+/// discouraging the model from repeating it. `1.05` is a gentle penalty.
+///
+/// NOTE: this is a deliberate, port-time deviation from the reference sampler — the HF JoyCaption
+/// demo (`fancyfeast/joy-caption-*`) generates with plain temperature/top-p and applies **no**
+/// repetition penalty. It was added here to curb JoyCaption's tendency to loop on long captions; it
+/// is documented (rather than removed or made configurable) to keep current outputs stable. If
+/// reference parity is ever the goal, set the penalty to `1.0` (a no-op) or lift it into
+/// [`CaptionSampling`](crate::caption::CaptionSampling).
+const REPETITION_PENALTY: f32 = 1.05;
+/// How many of the most-recently-emitted history tokens [`sample_token`]'s repetition penalty looks
+/// back over (the CTRL-style sliding window).
+const REPETITION_PENALTY_WINDOW: usize = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LlamaConfig {
     pub hidden_size: i32,
@@ -586,13 +602,15 @@ fn sample_token(
     let mut v: Vec<f32> = lf.as_slice::<f32>().to_vec();
     let vocab = v.len();
 
-    for &token in history.iter().rev().take(256) {
+    // CTRL/HF-style repetition penalty over the recent history (see REPETITION_PENALTY) — a
+    // documented, port-time deviation from the plain temperature/top-p reference sampler (F-012).
+    for &token in history.iter().rev().take(REPETITION_PENALTY_WINDOW) {
         let idx = token as usize;
         if idx < vocab {
             v[idx] = if v[idx] < 0.0 {
-                v[idx] * 1.05
+                v[idx] * REPETITION_PENALTY
             } else {
-                v[idx] / 1.05
+                v[idx] / REPETITION_PENALTY
             };
         }
     }
