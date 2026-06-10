@@ -54,7 +54,7 @@ pub use pipeline::{
 };
 pub use rope_embedder::RopeEmbedder;
 pub use timestep_embedder::TimestepEmbedder;
-pub use training::{attention_targets, LoraTarget, ZImageLoraTrainer, ZImageTurboTrainer};
+pub use training::{LoraTarget, ZImageTurboTrainer};
 pub use transformer::{ZImageTransformer, ZImageTransformerConfig};
 pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 
