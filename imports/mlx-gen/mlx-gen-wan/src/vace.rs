@@ -360,6 +360,19 @@ struct VaceStepCache {
     grid: (usize, usize, usize),
 }
 
+/// Validate the per-vace-layer `control_hidden_states_scale` slice: exactly one scale per
+/// `vace_layers` hint. Shared by `forward_vace_cached` and `forward_vace_capture` (both index
+/// `scales[j]` per layer) so a short slice errors instead of panicking, and the two can't drift apart
+/// (F-024).
+fn check_vace_scales_len(scales_len: usize, vace_layers_len: usize) -> Result<()> {
+    if scales_len != vace_layers_len {
+        return Err(mlx_gen::Error::Msg(format!(
+            "wan-vace: control_hidden_states_scale len {scales_len} != vace_layers len {vace_layers_len}"
+        )));
+    }
+    Ok(())
+}
+
 impl WanVaceTransformer {
     /// Load from a diffusers-layout VACE transformer weight map. `compute_dtype` selects the matmul
     /// precision (f32 for the structural golden; bf16 for the production checkpoint).
@@ -539,13 +552,7 @@ impl WanVaceTransformer {
         context_emb: &Array,
         scales: &[f32],
     ) -> Result<Array> {
-        if scales.len() != self.cfg.vace_layers.len() {
-            return Err(mlx_gen::Error::Msg(format!(
-                "wan-vace: control_hidden_states_scale len {} != vace_layers len {}",
-                scales.len(),
-                self.cfg.vace_layers.len()
-            )));
-        }
+        check_vace_scales_len(scales.len(), self.cfg.vace_layers.len())?;
         let dt = self.compute_dtype;
         let dim = self.cfg.base.dim as i32;
         let patch = self.cfg.base.patch_size;
@@ -606,6 +613,10 @@ impl WanVaceTransformer {
         context: &Array,
         scales: &[f32],
     ) -> Result<Vec<(&'static str, Array)>> {
+        // Same length guard as `forward_vace_cached` (F-024): this capture copy also indexes
+        // `scales[j]` per vace layer, so a short slice must error, not panic. Shared helper keeps the
+        // two in lockstep.
+        check_vace_scales_len(scales.len(), self.cfg.vace_layers.len())?;
         let dt = self.compute_dtype;
         let dim = self.cfg.base.dim as i32;
         let patch = self.cfg.base.patch_size;
@@ -869,4 +880,19 @@ pub fn denoise_vace(
         on_step(i + 1);
     }
     Ok(latents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vace_scales_len_check_rejects_mismatch() {
+        // F-024: both forward paths index `scales[j]` per vace layer, so the slice length must match
+        // the layer count exactly — a short (or long) slice errors rather than panicking.
+        assert!(check_vace_scales_len(8, 8).is_ok());
+        let err = check_vace_scales_len(3, 8).unwrap_err().to_string();
+        assert!(err.contains("len 3 != vace_layers len 8"), "got: {err}");
+        assert!(check_vace_scales_len(9, 8).is_err());
+    }
 }
