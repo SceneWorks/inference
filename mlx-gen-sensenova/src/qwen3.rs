@@ -63,6 +63,16 @@ impl KvCache {
 
     /// Persisting append (`update_cache=True`): concat the new K/V onto layer `i` and store the
     /// result back. Returns the full `[B,Hkv,S_all,D]` K/V for this forward.
+    ///
+    /// Cost (F-141): each append materializes a fresh `[B,Hkv,S+1,D]` tensor, so a decode of `n`
+    /// tokens copies `O(n²)` elements per layer — it dominates long think/VQA rollouts (e.g. a
+    /// 1024-token think block across 42 layers). This is deliberate: it mirrors the reference HF
+    /// `DynamicCache` exactly and the path is held bit-exact (`cache-equiv 0.0`). A pre-allocated
+    /// rolling buffer with `slice_update` is the textbook fix, but in MLX's immutable/lazy model it
+    /// only avoids the copy when the buffer is *donated* (refcount 1); here the cache retains the
+    /// buffer while attention reads a view of it each step, so donation rarely fires and the win is
+    /// uncertain. Left as-is until decode throughput is shown to be a bottleneck (owner decision,
+    /// sc-4141) rather than risk the bit-exact guarantee speculatively.
     fn append(&mut self, i: usize, k: Array, v: Array) -> Result<(Array, Array)> {
         let merged = match self.layers[i].take() {
             Some((pk, pv)) => (
