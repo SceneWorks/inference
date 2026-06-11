@@ -18,3 +18,6 @@ name = "gen_core"
 thiserror = { workspace = true }
 inventory = { workspace = true }
 tokenizers = { workspace = true }
+# Neutral safetensors header/byte-view reader for the weights-metadata layer (sc-3722). NOT a tensor
+# dep — exposes keys/dtypes/shapes/raw bytes only.
+safetensors = { workspace = true }

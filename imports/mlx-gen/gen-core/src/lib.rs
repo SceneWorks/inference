@@ -17,10 +17,12 @@ pub mod imageops;
 pub mod media;
 pub mod registry;
 pub mod runtime;
+pub mod sampling;
 pub mod tiling;
 pub mod tokenizer;
 pub mod train;
 pub mod transform;
+pub mod weightsmeta;
 
 pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
