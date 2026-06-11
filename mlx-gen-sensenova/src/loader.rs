@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::NeoChatConfig;
 
@@ -121,6 +121,25 @@ impl Coverage {
     pub fn is_complete(&self) -> bool {
         self.missing.is_empty() && self.unexpected.is_empty()
     }
+
+    /// Reject a checkpoint that carries tensors the architecture does not account for (F-137).
+    ///
+    /// Missing keys are intentionally left to the module loaders' [`Weights::require`], which name
+    /// the exact absent key; this closes the complementary *silent* gap where extra or renamed
+    /// tensors would otherwise load with whatever subset matches `expected_keys`. `model_id` tags
+    /// the error. Names a bounded sample so a wholesale layout mismatch can't flood the message.
+    pub fn require_no_unexpected(&self, model_id: &str) -> Result<()> {
+        if self.unexpected.is_empty() {
+            return Ok(());
+        }
+        let sample: Vec<&str> = self.unexpected.iter().take(8).map(String::as_str).collect();
+        Err(Error::Msg(format!(
+            "{model_id}: checkpoint has {} tensor(s) the NEO-Unify architecture does not account \
+             for (extra or renamed keys); first: {}",
+            self.unexpected.len(),
+            sample.join(", ")
+        )))
+    }
 }
 
 /// Diff a checkpoint's tensor keys against the canonical [`expected_keys`] for `cfg`.
@@ -192,6 +211,39 @@ mod tests {
             cov.unexpected,
             vec!["language_model.model.layers.0.bogus.weight".to_string()]
         );
+    }
+
+    #[test]
+    fn require_no_unexpected_rejects_extra_keys() {
+        let cfg = mot_8b();
+        let expected = expected_keys(&cfg);
+
+        // Exact set → loads.
+        let present: Vec<&str> = expected.iter().map(String::as_str).collect();
+        check_coverage(present.iter().copied(), &cfg)
+            .require_no_unexpected("sensenova_u1_8b")
+            .expect("exact coverage must load");
+
+        // A stray tensor → hard error naming the id and the offending key (F-137: this is the
+        // silent gap, since `require` only catches the *missing* direction).
+        let mut extra: Vec<String> = expected.iter().cloned().collect();
+        extra.push("language_model.model.layers.0.stray.weight".to_string());
+        let err = check_coverage(extra.iter().map(String::as_str), &cfg)
+            .require_no_unexpected("sensenova_u1_8b")
+            .expect_err("an unexpected tensor must error");
+        let msg = err.to_string();
+        assert!(msg.contains("sensenova_u1_8b"), "got: {msg}");
+        assert!(
+            msg.contains("language_model.model.layers.0.stray.weight"),
+            "got: {msg}"
+        );
+
+        // Missing-only (no extras) is left to `require` → require_no_unexpected stays Ok.
+        let mut trimmed: Vec<String> = expected.iter().cloned().collect();
+        trimmed.pop();
+        check_coverage(trimmed.iter().map(String::as_str), &cfg)
+            .require_no_unexpected("sensenova_u1_8b")
+            .expect("missing keys are require's job, not this gate's");
     }
 
     #[test]
