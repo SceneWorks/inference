@@ -84,6 +84,7 @@ fn accel_schedulers_match_diffusers() {
                 ORIGINAL_STEPS,
                 num_steps,
                 Dtype::Float32,
+                0,
             ))
         } else if cfg.starts_with("lightning_") {
             S::Light(LightningSampler::new(
@@ -100,6 +101,7 @@ fn accel_schedulers_match_diffusers() {
                 num_steps,
                 0.0,
                 Dtype::Float32,
+                0,
             ))
         } else if cfg.starts_with("tcd_eta03_") {
             S::Tcd(TcdSampler::new(
@@ -109,6 +111,7 @@ fn accel_schedulers_match_diffusers() {
                 num_steps,
                 0.3,
                 Dtype::Float32,
+                0,
             ))
         } else {
             panic!("unknown config {cfg}");

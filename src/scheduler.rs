@@ -18,6 +18,11 @@ use mlx_rs::Array;
 use crate::array::scalar;
 use crate::Result;
 
+// Schedule construction (sigma tables, empirical mu) is backend-neutral policy and lives in gen-core
+// (sc-3722); re-exported here at the historical `mlx_gen::scheduler::{image_seq_len, compute_mu}`
+// paths (used by `tests/scheduler.rs`). Only the Euler tensor application stays in this module.
+pub use gen_core::sampling::{compute_mu, image_seq_len};
+
 /// The flow-match (rectified-flow) forward-Euler update on the velocity field:
 /// `x_{i+1} = x + velocity·(σ_{i+1} − σ_i)`, with `dt = σ_{i+1} − σ_i` (negative; the schedule
 /// descends to 0). This is the single numerically load-bearing line of flow-match denoising — shared
@@ -44,7 +49,7 @@ impl FlowMatchEuler {
     /// Build the schedule for `num_steps` with an explicit time-shift `mu`.
     pub fn new(num_steps: usize, mu: f32) -> Self {
         Self {
-            sigmas: build_sigmas(num_steps, mu),
+            sigmas: gen_core::sampling::build_flow_sigmas(num_steps, mu),
         }
     }
 
@@ -82,55 +87,6 @@ impl FlowMatchEuler {
     pub fn step(&self, latents: &Array, velocity: &Array, t: usize) -> Result<Array> {
         flow_match_euler_step(&self.sigmas, latents, velocity, t)
     }
-}
-
-/// Latent sequence length used for the empirical `mu` fit: `(height/16) * (width/16)`.
-pub fn image_seq_len(width: u32, height: u32) -> usize {
-    ((height / 16) * (width / 16)) as usize
-}
-
-/// Port of the fork's `_compute_empirical_mu`: a piecewise-linear fit of the time-shift `mu`
-/// from the latent sequence length and step count.
-//  Constants mirror the fork's Python float64 literals verbatim (8.73809524e-05 / 1.89833333 /
-//  0.00016927 / 0.45666666) for parity auditing; f32 rounds the extra digits harmlessly.
-#[allow(clippy::excessive_precision)]
-pub fn compute_mu(image_seq_len: usize, num_steps: usize) -> f32 {
-    let (a1, b1) = (8.738_095_24e-5_f32, 1.898_333_33_f32);
-    let (a2, b2) = (0.000_169_27_f32, 0.456_666_66_f32);
-    let seq = image_seq_len as f32;
-    if image_seq_len > 4300 {
-        return a2 * seq + b2;
-    }
-    let m_200 = a2 * seq + b2;
-    let m_10 = a1 * seq + b1;
-    let a = (m_200 - m_10) / 190.0;
-    let b = m_200 - 200.0 * a;
-    a * num_steps as f32 + b
-}
-
-/// `exp(mu) / (exp(mu) + (1/t - 1))` — the fork's `_time_shift_exponential_array` at
-/// `sigma_power = 1`.
-fn time_shift_exponential(mu: f32, t: f32) -> f32 {
-    let e = mu.exp();
-    e / (e + (1.0 / t - 1.0))
-}
-
-fn build_sigmas(num_steps: usize, mu: f32) -> Vec<f32> {
-    let n = num_steps.max(1);
-    let (start, end) = (1.0_f32, 1.0_f32 / n as f32);
-    let mut sigmas: Vec<f32> = (0..n)
-        .map(|i| {
-            // linspace(1.0, 1.0/n, n)
-            let t = if n == 1 {
-                start
-            } else {
-                start + (end - start) * (i as f32) / ((n - 1) as f32)
-            };
-            time_shift_exponential(mu, t)
-        })
-        .collect();
-    sigmas.push(0.0);
-    sigmas
 }
 
 #[cfg(test)]
