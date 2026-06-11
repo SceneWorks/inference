@@ -15,7 +15,10 @@
 //! sequence mask is sc-3838; the generate path is sc-3839.
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
-use mlx_gen::nn::{gelu_tanh, silu};
+/// Re-exported so the model's denoise loop can enable the shared `mx.compile` fusion of the DiT's
+/// elementwise glue (adaLN modulate + gated residuals), matching FLUX.1/FLUX.2 (F-101/F-102).
+pub use mlx_gen::nn::set_compile_glue;
+use mlx_gen::nn::{gated, gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
@@ -77,9 +80,10 @@ impl Lin {
 }
 
 /// adaLN affine `normed·(1+scale) + shift`. `scale`/`shift` are `[B,1,inner]` (broadcast over seq).
+/// Delegates to the shared [`mlx_gen::nn::modulate`] with `one_matches_scale=false` (strong-f32 `1`,
+/// matching the previous hand-rolled affine bit-for-bit) so it fuses under `compile_glue` (F-102).
 fn modulate(normed: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    let one = mlx_gen::array::scalar(1.0);
-    Ok(add(&multiply(normed, &add(scale, &one)?)?, shift)?)
+    mlx_gen::nn::modulate(normed, scale, shift, false)
 }
 
 /// The `j`-th modulation row of a `[B,K,inner]` slice, as `[B,1,inner]` (broadcastable over seq).
@@ -101,7 +105,7 @@ fn seq_slice(t: &Array, start: i32, len: i32) -> Result<Array> {
 
 // ============================ RoPE ============================
 
-struct RopeTable {
+pub(crate) struct RopeTable {
     cos: Array,
     sin: Array,
 }
@@ -440,25 +444,22 @@ impl DoubleBlock {
         let (attn_img, attn_txt) = self.attn.forward(&norm_hidden, &norm_encoder, rope, mask)?;
 
         // image stream.
-        let hidden = add(hidden, &multiply(&row(temb, 2)?, &attn_img)?)?;
+        let hidden = gated(hidden, &row(temb, 2)?, &attn_img)?;
         let nh = modulate(
             &layer_norm(&hidden, None, None, LN_EPS)?,
             &row(temb, 4)?,
             &row(temb, 3)?,
         )?;
-        let hidden = add(&hidden, &multiply(&row(temb, 5)?, &self.ff.forward(&nh)?)?)?;
+        let hidden = gated(&hidden, &row(temb, 5)?, &self.ff.forward(&nh)?)?;
 
         // text stream.
-        let encoder = add(encoder, &multiply(&row(temb, 8)?, &attn_txt)?)?;
+        let encoder = gated(encoder, &row(temb, 8)?, &attn_txt)?;
         let ne = modulate(
             &layer_norm(&encoder, None, None, LN_EPS)?,
             &row(temb, 10)?,
             &row(temb, 9)?,
         )?;
-        let encoder = add(
-            &encoder,
-            &multiply(&row(temb, 11)?, &self.ff_context.forward(&ne)?)?,
-        )?;
+        let encoder = gated(&encoder, &row(temb, 11)?, &self.ff_context.forward(&ne)?)?;
 
         Ok((encoder, hidden))
     }
@@ -563,7 +564,7 @@ impl SingleBlock {
         let proj = self
             .proj_out
             .forward(&concatenate_axis(&[&attn, &mlp], 2)?)?;
-        Ok(add(hidden, &multiply(&row(temb, 2)?, &proj)?)?)
+        gated(hidden, &row(temb, 2)?, &proj)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -684,6 +685,10 @@ impl ChromaTransformer {
     ///   mask that *builds* this from the T5 padding is sc-3838.
     ///
     /// Returns the predicted velocity `[B, Si, out_channels]`.
+    ///
+    /// Convenience wrapper that builds the step-invariant tensors (`pooled_temb`, the RoPE table, the
+    /// `[B,1,S,S]` mask) and calls [`Self::forward_prepared`]. The denoise loop prefers the prepared
+    /// form so those tensors are computed once per step / per branch rather than per call (F-102).
     pub fn forward(
         &self,
         hidden: &Array,
@@ -693,26 +698,48 @@ impl ChromaTransformer {
         txt_ids: &Array,
         attention_mask: Option<&Array>,
     ) -> Result<Array> {
-        let hidden = self.x_embedder.forward(hidden)?;
         let pooled = self.pooled_temb(timestep)?;
-        let encoder = self.context_embedder.forward(encoder)?;
+        let rope = self.build_rope_table(txt_ids, img_ids)?;
+        let mask2d = Self::attention_mask2d(attention_mask)?;
+        self.forward_prepared(hidden, encoder, &pooled, &rope, mask2d.as_ref())
+    }
 
+    /// The RoPE table over `cat(txt_ids, img_ids)` — depends only on the token positions, so the
+    /// denoise loop builds it once per branch instead of every step (F-102).
+    pub(crate) fn build_rope_table(&self, txt_ids: &Array, img_ids: &Array) -> Result<RopeTable> {
         let ids = concatenate_axis(&[txt_ids, img_ids], 0)?;
-        let rope = build_rope(&ids, self.cfg.axes_dims_rope)?;
+        build_rope(&ids, self.cfg.axes_dims_rope)
+    }
 
-        // [B,S] 0/1 mask → additive [B,1,S,S] = m[:,None,None,:]·m[:,None,:,None].
-        let mask2d = match attention_mask {
+    /// `[B,S]` 0/1 mask → additive `[B,1,S,S] = m[:,None,None,:]·m[:,None,:,None]`. Depends only on the
+    /// per-request padding, so the denoise loop builds it once per branch (F-102).
+    pub(crate) fn attention_mask2d(attention_mask: Option<&Array>) -> Result<Option<Array>> {
+        match attention_mask {
             Some(m) => {
                 let m = m.as_dtype(Dtype::Float32)?;
                 let b = m.shape()[0];
                 let s = m.shape()[1];
                 let a = m.reshape(&[b, 1, 1, s])?;
                 let bt = m.reshape(&[b, 1, s, 1])?;
-                Some(multiply(&a, &bt)?)
+                Ok(Some(multiply(&a, &bt)?))
             }
-            None => None,
-        };
-        let mask_ref = mask2d.as_ref();
+            None => Ok(None),
+        }
+    }
+
+    /// Run the MMDiT given the pre-built step-invariant tensors: `pooled` (the Approximator modulation
+    /// table — shared by both CFG branches at a step), `rope`, and the additive `mask2d`. `hidden`
+    /// (latents) and `encoder` (text) are per-branch. Bit-identical to [`Self::forward`].
+    pub(crate) fn forward_prepared(
+        &self,
+        hidden: &Array,
+        encoder: &Array,
+        pooled: &Array,
+        rope: &RopeTable,
+        mask_ref: Option<&Array>,
+    ) -> Result<Array> {
+        let hidden = self.x_embedder.forward(hidden)?;
+        let encoder = self.context_embedder.forward(encoder)?;
 
         let st = encoder.shape()[1];
         let n_single = self.cfg.num_single_layers as i32;
@@ -723,24 +750,24 @@ impl ChromaTransformer {
         let mut encoder = encoder;
         for (i, block) in self.double_blocks.iter().enumerate() {
             let i = i as i32;
-            let img = rows(&pooled, img_offset + 6 * i, 6)?;
-            let txt = rows(&pooled, txt_offset + 6 * i, 6)?;
+            let img = rows(pooled, img_offset + 6 * i, 6)?;
+            let txt = rows(pooled, txt_offset + 6 * i, 6)?;
             let temb = concatenate_axis(&[&img, &txt], 1)?; // [B,12,inner]
-            let (e, h) = block.forward(&hidden, &encoder, &temb, &rope, mask_ref)?;
+            let (e, h) = block.forward(&hidden, &encoder, &temb, rope, mask_ref)?;
             encoder = e;
             hidden = h;
         }
 
         let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?; // [B, S, inner]
         for (i, block) in self.single_blocks.iter().enumerate() {
-            let temb = rows(&pooled, 3 * i as i32, 3)?;
-            joint = block.forward(&joint, &temb, &rope, mask_ref)?;
+            let temb = rows(pooled, 3 * i as i32, 3)?;
+            joint = block.forward(&joint, &temb, rope, mask_ref)?;
         }
 
         // Drop the text tokens; pruned `norm_out` (shift, scale = pooled[-2:]); proj_out.
         let hidden = seq_slice(&joint, st, joint.shape()[1] - st)?;
         let n = self.cfg.mod_index_len() as i32;
-        let no = rows(&pooled, n - 2, 2)?;
+        let no = rows(pooled, n - 2, 2)?;
         let hidden = modulate(
             &layer_norm(&hidden, None, None, LN_EPS)?,
             &row(&no, 1)?,
