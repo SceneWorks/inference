@@ -15,9 +15,7 @@ use std::sync::OnceLock;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::nn::relu;
-use mlx_rs::ops::{
-    self, broadcast_to, concatenate_axis, matmul, multiply, sigmoid, stack_axis,
-};
+use mlx_rs::ops::{self, broadcast_to, concatenate_axis, matmul, multiply, sigmoid, stack_axis};
 use mlx_rs::Array;
 
 use mlx_gen::nn::{conv2d, gelu_exact, linear};
