@@ -204,6 +204,18 @@ impl Generator for QwenImage {
             )?)
         };
 
+        // VAE-encode the init image to packed clean latents (f32) ONCE — it's seed-independent
+        // (LANCZOS resize + a full VAE encode), so doing it inside the per-image loop ran the encoder
+        // `count` times for identical output (F-118).
+        let clean = if is_img2img {
+            let (image, _) = reference.expect("is_img2img implies a reference");
+            Some(encode_init_latents(
+                &self.vae, image, req.width, req.height,
+            )?)
+        } else {
+            None
+        };
+
         let images = decode_and_collect(
             &self.vae,
             req.count,
@@ -215,15 +227,14 @@ impl Generator for QwenImage {
                 // Latents stay f32 through the loop: the fork keeps txt2img/img2img noise f32, and MLX
                 // promotes the bf16 transformer weights to f32 per-op (only `prompt_embeds` is bf16).
                 let noise = create_noise(seed, req.width, req.height)?;
-                let latents = if is_img2img {
-                    // VAE-encode the init image to packed clean latents (f32), then blend with the
-                    // noise at `sigma = sigmas[init_time_step]` (fork `create_for_txt2img_or_img2img`).
-                    let (image, _) = reference.expect("is_img2img implies a reference");
-                    let clean = encode_init_latents(&self.vae, image, req.width, req.height)?;
-                    let sigma = params.sampler.sigma(start_step);
-                    add_noise_by_interpolation(&clean, &noise, sigma)?
-                } else {
-                    noise
+                let latents = match &clean {
+                    // Blend the (hoisted) clean latents with this image's noise at
+                    // `sigma = sigmas[init_time_step]` (fork `create_for_txt2img_or_img2img`).
+                    Some(clean) => {
+                        let sigma = params.sampler.sigma(start_step);
+                        add_noise_by_interpolation(clean, &noise, sigma)?
+                    }
+                    None => noise,
                 };
                 denoise_with_progress(
                     &self.transformer,
