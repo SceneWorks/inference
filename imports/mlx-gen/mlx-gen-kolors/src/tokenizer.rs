@@ -20,7 +20,7 @@ use std::path::Path;
 use mlx_rs::Array;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// `[gMASK]` prefix token id (appended after the 64789-piece SP vocab).
 pub const GMASK_ID: i32 = 64790;
@@ -56,6 +56,18 @@ impl KolorsTokenizer {
 
     /// Load from an explicit `tokenizer.json` path with a chosen max length.
     pub fn from_file(tokenizer_json: impl AsRef<Path>, max_len: usize) -> Result<Self> {
+        // `encode` always prepends the `PREFIX` (GMASK/SOP) and left-pads to `max_len`, so `max_len`
+        // must leave room for the prefix plus at least one content token. Below that, `encode`'s
+        // `pad = max_len - len` underflows (panic in debug, huge-alloc abort in release). Reject at
+        // this public boundary rather than at use (F-142); `from_dir` uses the fixed `MAX_LEN`.
+        if max_len < PREFIX.len() + 1 {
+            return Err(Error::Msg(format!(
+                "kolors tokenizer: max_len must be >= {} (the {}-token GMASK/SOP prefix plus at \
+                 least one content token); got {max_len}",
+                PREFIX.len() + 1,
+                PREFIX.len()
+            )));
+        }
         // ChatTemplate::None: Kolors tokenizes the raw prompt (no chat wrapping); the SP content path
         // adds no special tokens (prefix/pad are applied here). pad_to_max_length stays false — this
         // wrapper owns the (left-)padding, not core's right-pad.
@@ -87,7 +99,9 @@ impl KolorsTokenizer {
         ids.extend_from_slice(&PREFIX);
         ids.extend_from_slice(&content);
         let len = ids.len();
-        let pad = self.max_len - len; // len <= max_len by construction
+        // `len <= max_len`: content is truncated to `max_len - PREFIX.len()` and `from_file`
+        // guarantees `max_len >= PREFIX.len() + 1`, so this never underflows (F-142).
+        let pad = self.max_len - len;
 
         let mut input_ids = vec![PAD_ID; pad];
         input_ids.extend_from_slice(&ids);
@@ -102,5 +116,36 @@ impl KolorsTokenizer {
             attention_mask: Array::from_slice(&attention_mask, &shape),
             position_ids: Array::from_slice(&position_ids, &shape),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_file_rejects_max_len_below_prefix_plus_one() {
+        // F-142: `max_len < PREFIX.len() + 1` would underflow `encode`'s `pad = max_len - len`. The
+        // guard fires before the file is even opened, so a bogus path still surfaces the max_len
+        // error (not an IO error) for the rejected values.
+        let err_string = |max_len: usize| match KolorsTokenizer::from_file(
+            "/nonexistent/tokenizer.json",
+            max_len,
+        ) {
+            Ok(_) => panic!("max_len={max_len} must not load from a bogus path"),
+            Err(e) => e.to_string(),
+        };
+        for bad in [0usize, 1, 2] {
+            assert!(
+                err_string(bad).contains("max_len"),
+                "max_len={bad} not rejected"
+            );
+        }
+        // `max_len == PREFIX.len() + 1` clears the guard (then fails to load the missing file — a
+        // different error), confirming the boundary is exactly `PREFIX.len() + 1`.
+        assert!(
+            !err_string(PREFIX.len() + 1).contains("max_len must be"),
+            "max_len = PREFIX.len()+1 should pass the guard"
+        );
     }
 }
