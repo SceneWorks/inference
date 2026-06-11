@@ -377,12 +377,7 @@ fn select_obj_ptr_token(tokens: &Array, ious: &Array, multimask_output: bool) ->
         .as_dtype(Dtype::Float32)?
         .as_slice::<f32>()
         .to_vec();
-    let best = iv
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .map(|(i, _)| i as i32)
-        .unwrap_or(0);
+    let best = crate::util::argmax_f32(&iv) as i32;
     Ok(tokens
         .take_axis(Array::from_int(best), 1)?
         .reshape(&[b, 256])?)
@@ -795,12 +790,7 @@ fn best_low_mask(low: &Array, ious: &Array) -> Result<Array> {
         .as_dtype(Dtype::Float32)?
         .as_slice::<f32>()
         .to_vec();
-    let best = iv
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .map(|(i, _)| i as i32)
-        .unwrap_or(0);
+    let best = crate::util::argmax_f32(&iv) as i32;
     Ok(low
         .take_axis(Array::from_int(best), 1)?
         .reshape(&[1, 1, 256, 256])?)
