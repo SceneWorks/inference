@@ -254,15 +254,16 @@ impl VideoTokenState {
             target_tokens: s,
         })
     }
+}
 
-    /// Per-token timesteps `σ · denoise_mask` shaped `(B, S)` for the DiT (conditioning tokens get
-    /// `σ·(1−strength)`, fully-pinned `strength=1` → `0`).
-    pub fn token_timesteps(&self, sigma: f32) -> Result<Array> {
-        let dt = self.latent.dtype();
-        let sh = self.denoise_mask.shape(); // (B, S, 1)
-        let flat = self.denoise_mask.reshape(&[sh[0], sh[1]])?;
-        Ok(multiply(&scalar(sigma, dt)?, &flat)?)
-    }
+/// Per-token timesteps `σ · denoise_mask` shaped `(B, S)` for the DiT (conditioning tokens carry
+/// `σ·(1−strength)`; a fully-pinned `strength=1` → `0`). Depends only on the fixed `denoise_mask` and
+/// the compute `dtype`, so the denoise loop calls it directly rather than rebuilding a
+/// `VideoTokenState` each step just to read it (F-060).
+pub fn token_timesteps(denoise_mask: &Array, dtype: Dtype, sigma: f32) -> Result<Array> {
+    let sh = denoise_mask.shape(); // (B, S, 1)
+    let flat = denoise_mask.reshape(&[sh[0], sh[1]])?;
+    Ok(multiply(&scalar(sigma, dtype)?, &flat)?)
 }
 
 /// Build the RoPE positions for an appended keyframe clip of latent shape `(cf, h, w)` placed at
@@ -464,6 +465,16 @@ mod tests {
         let ts = st.token_timesteps(0.9, 1, 1).unwrap();
         assert_eq!(ts.shape(), &[1, 2]);
         assert_eq!(ts.as_slice::<f32>(), &[0.0, 0.9]);
+    }
+
+    #[test]
+    fn free_token_timesteps_scales_mask_by_sigma() {
+        // F-060: the free fn computes `σ · denoise_mask` (B,S,1)→(B,S) — conditioning tokens (mask 0)
+        // get 0, generated tokens (mask 1) get σ — without rebuilding a VideoTokenState.
+        let mask = arr(&[1.0, 0.0], &[1, 2, 1]);
+        let ts = token_timesteps(&mask, Dtype::Float32, 0.9).unwrap();
+        assert_eq!(ts.shape(), &[1, 2]);
+        assert_eq!(ts.as_slice::<f32>(), &[0.9, 0.0]);
     }
 
     #[test]
