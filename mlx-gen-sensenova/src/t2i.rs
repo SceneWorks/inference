@@ -486,31 +486,9 @@ impl T2iModel {
         )?;
 
         let steps = opts.num_steps;
-        // `steps == 0` yields an empty trajectory (and a 0/0 NaN schedule), so the callers' final
-        // `.last().expect("at least one step")` would panic. Surface a typed error instead (F-125);
-        // the registered `Generator` rejects this upstream, but `interleave_gen`/`vqa` reach here too.
-        if steps == 0 {
-            return Err(Error::Msg("sensenova: num_steps must be >= 1".into()));
-        }
-        let lin: Vec<f32> = (0..=steps).map(|i| i as f32 / steps as f32).collect();
-        let lin_arr = Array::from_slice(&lin, &[(steps + 1) as i32]);
-        let ts_arr = if opts.enable_timestep_shift {
-            apply_time_schedule(&lin_arr, opts.timestep_shift)?
-        } else {
-            lin_arr
-        };
-        let timesteps = ts_arr.as_slice::<f32>().to_vec();
-
+        let timesteps = step_schedule(opts)?;
         // Constant noise-scale conditioning token (added to every step's timestep embedding).
-        let noise_embed = if let Some(emb) = &self.noise_scale_embedder {
-            let ns = vec![noise_scale / self.noise_scale_max_value; l as usize];
-            Some(
-                emb.forward(&Array::from_slice(&ns, &[l]))?
-                    .reshape(&[1, l, -1])?,
-            )
-        } else {
-            None
-        };
+        let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
         let needs_cfg = opts.cfg_scale > 1.0 && cache_uncond.is_some();
         let mut traj = Vec::with_capacity(steps);
@@ -586,6 +564,20 @@ impl T2iModel {
             cond = add(&cond, ne)?;
         }
         Ok((z, cond))
+    }
+
+    /// The constant noise-scale conditioning token `[1, L, hidden]` added to every step's timestep
+    /// embedding — present only when the model has a `noise_scale_embedder`. Shared by both denoise
+    /// loops (F-134).
+    fn noise_scale_embed(&self, noise_scale: f32, l: i32) -> Result<Option<Array>> {
+        let Some(emb) = &self.noise_scale_embedder else {
+            return Ok(None);
+        };
+        let ns = vec![noise_scale / self.noise_scale_max_value; l as usize];
+        Ok(Some(
+            emb.forward(&Array::from_slice(&ns, &[l]))?
+                .reshape(&[1, l, -1])?,
+        ))
     }
 
     // ===================== it2i (instruction edit + Character Studio) =====================
@@ -1294,30 +1286,8 @@ impl T2iModel {
         )?;
 
         let steps = opts.num_steps;
-        // `steps == 0` yields an empty trajectory (and a 0/0 NaN schedule), so the callers' final
-        // `.last().expect("at least one step")` would panic. Surface a typed error instead (F-125);
-        // the registered `Generator` rejects this upstream, but `interleave_gen`/`vqa` reach here too.
-        if steps == 0 {
-            return Err(Error::Msg("sensenova: num_steps must be >= 1".into()));
-        }
-        let lin: Vec<f32> = (0..=steps).map(|i| i as f32 / steps as f32).collect();
-        let lin_arr = Array::from_slice(&lin, &[(steps + 1) as i32]);
-        let ts_arr = if opts.enable_timestep_shift {
-            apply_time_schedule(&lin_arr, opts.timestep_shift)?
-        } else {
-            lin_arr
-        };
-        let timesteps = ts_arr.as_slice::<f32>().to_vec();
-
-        let noise_embed = if let Some(emb) = &self.noise_scale_embedder {
-            let ns = vec![noise_scale / self.noise_scale_max_value; l as usize];
-            Some(
-                emb.forward(&Array::from_slice(&ns, &[l]))?
-                    .reshape(&[1, l, -1])?,
-            )
-        } else {
-            None
-        };
+        let timesteps = step_schedule(opts)?;
+        let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
         let (cfg, img_cfg) = (opts.cfg_scale, opts.img_cfg_scale);
         let (i0, i1) = opts.cfg_interval;
@@ -1416,6 +1386,25 @@ fn uncond_cache_err() -> Error {
 }
 
 /// Blend condition/uncondition velocities under the chosen [`CfgNorm`].
+/// The flow-matching timestep schedule: linear `0..=1` over `opts.num_steps`, optionally exp-shifted
+/// by [`apply_time_schedule`]. Returns the `num_steps + 1` boundary timesteps. Errors on
+/// `num_steps == 0` (a 0/0 NaN schedule whose callers' `.last()` would panic; F-125). Shared by both
+/// denoise loops (F-134).
+fn step_schedule(opts: &T2iOptions) -> Result<Vec<f32>> {
+    let steps = opts.num_steps;
+    if steps == 0 {
+        return Err(Error::Msg("sensenova: num_steps must be >= 1".into()));
+    }
+    let lin: Vec<f32> = (0..=steps).map(|i| i as f32 / steps as f32).collect();
+    let lin_arr = Array::from_slice(&lin, &[(steps + 1) as i32]);
+    let ts_arr = if opts.enable_timestep_shift {
+        apply_time_schedule(&lin_arr, opts.timestep_shift)?
+    } else {
+        lin_arr
+    };
+    Ok(ts_arr.as_slice::<f32>().to_vec())
+}
+
 fn cfg_blend(
     v_cond: &Array,
     v_uncond: &Array,
@@ -1436,23 +1425,11 @@ fn cfg_blend(
 
     let diff = subtract(v_cond, v_uncond)?;
     let blended = add(v_uncond, &multiply(&diff, Array::from_f32(scale))?)?;
-    match norm {
-        CfgNorm::Global => {
-            let nc = frobenius(v_cond)?;
-            let nb = frobenius(&blended)?;
-            let s = (nc / (nb + 1e-8)).clamp(0.0, 1.0);
-            multiply(&blended, Array::from_f32(s)).map_err(Error::from)
-        }
-        CfgNorm::Channel => {
-            // Per-token (last-axis) norm rescale, clamped to ≤ 1 (norms are ≥ 0).
-            let nc = l2_last(v_cond)?;
-            let nb = l2_last(&blended)?;
-            let ratio = divide(&nc, &add(&nb, Array::from_f32(1e-8))?)?;
-            let s = minimum(&ratio, Array::from_f32(1.0))?;
-            multiply(&blended, &s).map_err(Error::from)
-        }
-        _ => Ok(blended),
-    }
+    // The Global/Channel norm-clamp (clamp the blended velocity's norm to the condition velocity's)
+    // is identical to the it2i post-blend rescale; delegate to the single implementation (F-134).
+    // `CfgZeroStar` returned above, so `norm` here is always None/Global/Channel and never reaches
+    // `apply_cfg_norm`'s `CfgZeroStar => Err` arm.
+    apply_cfg_norm(blended, v_cond, norm)
 }
 
 /// `cfg_norm=cfg_zero_star` is a T2I-only blend mode (optimized-scale projection + step-0 zeroing,
@@ -1696,6 +1673,43 @@ mod tests {
             on <= cn + 1e-4,
             "global-norm output {on} exceeds cond norm {cn}"
         );
+    }
+
+    #[test]
+    fn step_schedule_guards_zero_and_applies_shift() {
+        // The extracted F-134 helper shared by both denoise loops: `num_steps == 0` errors (F-125),
+        // the no-shift schedule is the plain linear `0..=1` boundary grid, and the shifted schedule
+        // matches `apply_time_schedule` while staying a descending `1 → 0` walk.
+        let base = T2iOptions::default();
+
+        let zero = T2iOptions {
+            num_steps: 0,
+            ..base
+        };
+        assert!(step_schedule(&zero).is_err());
+
+        let linear = T2iOptions {
+            num_steps: 4,
+            enable_timestep_shift: false,
+            ..base
+        };
+        assert_eq!(
+            step_schedule(&linear).unwrap(),
+            vec![0.0, 0.25, 0.5, 0.75, 1.0]
+        );
+
+        let shifted = T2iOptions {
+            num_steps: 4,
+            enable_timestep_shift: true,
+            timestep_shift: 3.0,
+            ..base
+        };
+        let ts = step_schedule(&shifted).unwrap();
+        let lin = Array::from_slice(&[0.0f32, 0.25, 0.5, 0.75, 1.0], &[5]);
+        let expected = slice(&apply_time_schedule(&lin, 3.0).unwrap());
+        assert_eq!(ts, expected);
+        assert_eq!(ts.first(), Some(&0.0));
+        assert_eq!(ts.last(), Some(&1.0));
     }
 
     #[test]
