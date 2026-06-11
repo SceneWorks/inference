@@ -29,8 +29,8 @@ use mlx_gen::{Error, Image, Result};
 
 use crate::audio_vae::AudioDecoder;
 use crate::conditioning::{
-    append_keyframe_clip, apply_conditioning, apply_denoise_mask, apply_keyframes, unpatchify_grid,
-    I2vConditioning, Keyframe, VideoTokenState,
+    append_keyframe_clip, apply_conditioning, apply_denoise_mask, apply_keyframes, token_timesteps,
+    unpatchify_grid, I2vConditioning, Keyframe, VideoTokenState,
 };
 use crate::positions::{DEFAULT_FPS, SPATIAL_SCALE, TEMPORAL_SCALE};
 use crate::transformer::{to_denoised, AvDiT, LtxDiT};
@@ -517,17 +517,10 @@ pub fn denoise_av_tokens(
         let aflat = alat
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[ab, at, ac * af])?;
-        // Video per-token σ = σ·mask (conditioning tokens get σ·(1−strength)); audio uniform σ.
-        let vts = {
-            let st = VideoTokenState {
-                latent: vtok.clone(),
-                clean_latent: video.clean_latent.clone(),
-                denoise_mask: video.denoise_mask.clone(),
-                positions: video.positions.clone(),
-                target_tokens: video.target_tokens,
-            };
-            st.token_timesteps(sigma)?
-        };
+        // Video per-token σ = σ·mask (conditioning tokens get σ·(1−strength)); audio uniform σ. The
+        // timesteps depend only on the fixed denoise_mask + dtype, so call the free fn directly
+        // instead of rebuilding a throwaway VideoTokenState each step (F-060).
+        let vts = token_timesteps(&video.denoise_mask, vtok.dtype(), sigma)?;
         let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
         let (vvel, avel) = dit.forward(
             &vtok,
