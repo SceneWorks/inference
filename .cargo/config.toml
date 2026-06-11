@@ -3,8 +3,11 @@
 # default, which SIGSEGVs once more than one test touches MLX at the same time.
 # Force the libtest harness to a single thread for the whole crate so `cargo test`
 # (and CI) just work. Individual ops are still fast; tests run sequentially.
+# `force = true` is load-bearing (F-160): a plain `[env]` entry is only applied when the
+# variable is UNSET, so without it anyone who already has `RUST_TEST_THREADS` exported would
+# silently run MLX tests in parallel and hit the exact SIGSEGV above. Forcing it overrides that.
 [env]
-RUST_TEST_THREADS = "1"
+RUST_TEST_THREADS = { value = "1", force = true }
 
 # Build MLX at the macOS 26.2 deployment target so the Apple matrix-unit ("NAX") Metal
 # kernels both compile in AND codegen correctly. mlx-sys's build.rs floors the target at
