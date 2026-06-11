@@ -233,6 +233,11 @@ impl QwenTransformer {
             self.rope.forward_multi(&shapes, txt_seq as usize)?;
         let mask = build_joint_mask(encoder_hidden_states_mask, b, img_seq)?;
 
+        // Treat an empty residual slice as "no control" — `forward_control` is `pub`, and a
+        // `Some(&[])` would underflow `res.len() - 1` (usize) and panic when picking the group index
+        // below. Internal callers always pass the 5 residuals (F-116).
+        let controlnet_residuals = controlnet_residuals.filter(|r| !r.is_empty());
+
         // ControlNet residual injection interval (epic 3401): `ceil(num_layers / num_residuals)`,
         // matching diffusers `int(np.ceil(len(transformer_blocks) / len(controlnet_block_samples)))`.
         let interval = controlnet_residuals.map(|r| {
