@@ -285,7 +285,7 @@ fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
 }
 
 /// The dense dual-path Qwen3 backbone: embeddings, the decoder stack, the dual final norm, and the
-/// untied `lm_head`.
+/// `lm_head` (its own tensor, or the tied `embed_tokens` weight when `tie_word_embeddings`).
 pub struct Qwen3Backbone {
     embed_tokens: Array,
     layers: Vec<Layer>,
@@ -307,12 +307,22 @@ impl Qwen3Backbone {
         let layers = (0..cfg.llm.num_hidden_layers)
             .map(|i| Layer::from_weights(w, &format!("{model}.layers.{i}")))
             .collect::<Result<Vec<_>>>()?;
+        let embed_tokens = require(w, &format!("{model}.embed_tokens.weight"))?;
+        // Tied embeddings share the token-embedding matrix as the output projection (`logits =
+        // hidden @ embed_tokens.T`), so no `lm_head` tensor exists in the checkpoint — matching what
+        // `config`/`expected_keys` already model (F-138). The 8B-MoT ships an untied `lm_head`; this
+        // branch keeps the backbone in sync with the other two layers for a tied NEO checkpoint.
+        let lm_head = if cfg.tie_word_embeddings {
+            embed_tokens.clone()
+        } else {
+            require(w, &format!("{prefix}.lm_head.weight"))?
+        };
         Ok(Self {
-            embed_tokens: require(w, &format!("{model}.embed_tokens.weight"))?,
+            embed_tokens,
             layers,
             norm: require(w, &format!("{model}.norm.weight"))?,
             norm_gen: require(w, &format!("{model}.norm_mot_gen.weight"))?,
-            lm_head: require(w, &format!("{prefix}.lm_head.weight"))?,
+            lm_head,
             num_heads: cfg.llm.num_attention_heads as i32,
             num_kv_heads: cfg.llm.num_key_value_heads as i32,
             head_dim: cfg.llm.head_dim() as i32,
