@@ -697,7 +697,6 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
- "serde_json",
 ]
 
 [[package]]
