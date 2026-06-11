@@ -23,18 +23,16 @@
 //! Parity: `tests/video_parity.rs` (`#[ignore]`, real weights) runs the reference predictor's golden
 //! clip and asserts the per-frame masks agree.
 //!
-//! **Direction — forward only (F-176).** The single public propagation entry point,
-//! [`Sam2VideoPredictor::propagate`], tracks strictly *forward* and records every frame as forward
-//! (`frames_tracked` ← `false`). The reverse-tracking plumbing it threads — the `track_in_reverse`
-//! flag, the `frames_tracked` bool, and the reverse arms in `maskmem_prev_frame` and the
-//! in-past / strided-frame arithmetic of [`Sam2VideoModel::condition_with_memories`] — mirrors the
-//! reference (`propagate_in_video(reverse=True)`) and is covered by unit tests, but is **currently
-//! unreachable from the public API**: nothing ever inserts `true`, and there is no
-//! `propagate_reverse` method. The arithmetic is kept (not deleted) because it is the faithful
-//! port and the seam a future reverse entry point plugs into — but exposing `propagate_reverse` as
-//! production API is gated on a reverse end-to-end golden (the forward path is only verified via the
-//! real-weights `video_parity.rs`; reverse needs the equivalent). Tracked on sc-4151; do not assume
-//! reverse propagation is callable today.
+//! **Direction — forward and reverse (F-176 / sc-4750).** Two public propagation entry points:
+//! [`Sam2VideoPredictor::propagate`] tracks strictly *forward* from the prompted frame and records
+//! every frame as forward (`frames_tracked` ← `false`), while [`Sam2VideoPredictor::propagate_reverse`]
+//! tracks *backward* toward frame 0 and records every frame as reverse (`frames_tracked` ← `true`).
+//! Both mirror the reference's single method, `propagate_in_video(reverse=…)`. The reverse path drives
+//! the same plumbing the `track_in_reverse` flag threads — the reverse arms in `maskmem_prev_frame`
+//! and the in-past / strided-frame arithmetic of [`Sam2VideoModel::condition_with_memories`] — so the
+//! `frames_tracked` reverse bool is genuinely reachable. Parity for both directions is verified by the
+//! real-weights `tests/video_parity.rs` (`#[ignore]`) against goldens dumped by
+//! `tools/dump_sam2_video_golden.py` (forward, and `--reverse`).
 
 use std::collections::BTreeMap;
 
@@ -417,6 +415,17 @@ fn maskmem_prev_frame(current: i32, t_pos: i32, track_in_reverse: bool) -> i32 {
     }
 }
 
+/// Reverse propagation frame order (`propagate_in_video(reverse=True)`): the prompted `start` frame
+/// down to 0 inclusive, or empty when `start <= 0` — the reference's `range(start, -1, -1) if start
+/// > 0 else []` (nothing behind frame 0 to track in reverse).
+fn reverse_propagation_order(start: i32) -> Vec<i32> {
+    if start <= 0 {
+        Vec::new()
+    } else {
+        (0..=start).rev().collect()
+    }
+}
+
 /// `_obj_ptr_pos` (pre-projection): per-pointer signed distance → a `[P, 256]` sinusoidal table
 /// (`sin‖cos` of `pos / dim_t`, `dim_t[j] = 10000^(2⌊j/2⌋/128)`). Host-built (deterministic).
 fn obj_ptr_pos_table(distances: &[i32], max_distance: i32) -> Array {
@@ -762,11 +771,11 @@ impl Sam2VideoPredictor {
     }
 
     /// `propagate_in_video` (forward, single object). Returns each frame's low-res mask logits
-    /// `[1,1,256,256]` in propagation order, starting from the prompted frame.
+    /// `[1,1,256,256]` in propagation order, starting from the prompted frame and running to the end
+    /// of the clip.
     ///
-    /// Forward only: every frame is recorded as forward (`frames_tracked` ← `false`). There is no
-    /// `propagate_reverse` yet — the reverse plumbing is wired and unit-tested but unreachable; see
-    /// the module-level "Direction" note (F-176 / sc-4151).
+    /// Every frame is recorded as forward (`frames_tracked` ← `false`). For backward tracking toward
+    /// frame 0, use [`Self::propagate_reverse`]; see the module-level "Direction" note (F-176).
     pub fn propagate(&self, state: &mut VideoState) -> Result<Vec<(i32, Array)>> {
         self.preflight(state)?;
         let start = *state.cond.keys().min().ok_or_else(|| {
@@ -789,6 +798,48 @@ impl Sam2VideoPredictor {
                 state.non_cond.insert(frame_idx, out);
             }
             state.frames_tracked.insert(frame_idx, false);
+        }
+        Ok(results)
+    }
+
+    /// `propagate_in_video(reverse=True)` (single object). Tracks *backward* from the prompted frame
+    /// toward frame 0, returning each frame's low-res mask logits `[1,1,256,256]` in reverse
+    /// propagation order (prompted frame first, then descending to 0).
+    ///
+    /// Reverse semantics mirror the reference precisely:
+    ///   * **Start frame** is the earliest prompted (cond) frame, `min(cond)` — same default as
+    ///     [`Self::propagate`]. For a meaningful reverse track, prompt a *later* frame so there are
+    ///     earlier frames behind it to propagate into.
+    ///   * **Order** is `start, start-1, …, 0` (inclusive of 0). The reference uses
+    ///     `range(start, -1, -1) if start > 0 else []`, so when the prompt is already on frame 0 the
+    ///     reverse order is **empty** — there is nothing behind frame 0 to track — and this returns an
+    ///     empty `Vec`.
+    ///   * Each tracked frame is conditioned with `track_in_reverse = true`, exercising the reverse
+    ///     arms of [`Sam2VideoModel::condition_with_memories`] / [`maskmem_prev_frame`] (the bank is
+    ///     pulled from the frames immediately *ahead*), and recorded `frames_tracked` ← `true`.
+    pub fn propagate_reverse(&self, state: &mut VideoState) -> Result<Vec<(i32, Array)>> {
+        self.preflight(state)?;
+        let start = *state.cond.keys().min().ok_or_else(|| {
+            Error::Msg(
+                "sam2 propagate_reverse: a prompt is required before propagation (no conditioning \
+                 frames — call add_box/add_correction_points first)"
+                    .into(),
+            )
+        })?;
+        let mut results = Vec::new();
+        for frame_idx in reverse_propagation_order(start) {
+            if let Some(out) = state.cond.get(&frame_idx) {
+                results.push((frame_idx, out.pred_masks.clone()));
+            } else {
+                // As in `propagate`, non-cond reverse frames are encoded once and never revisited, so
+                // their `Encoded` is dropped rather than cached (F-168). The `reverse = true` flag
+                // routes `condition_with_memories` through the ahead-of-current memory arithmetic.
+                let (out, _enc) =
+                    self.run_single_frame(state, frame_idx, false, None, true, None, true)?;
+                results.push((frame_idx, out.pred_masks.clone()));
+                state.non_cond.insert(frame_idx, out);
+            }
+            state.frames_tracked.insert(frame_idx, true);
         }
         Ok(results)
     }
@@ -848,6 +899,16 @@ mod tests {
             .map(|t_pos| maskmem_prev_frame(current, t_pos, true))
             .collect();
         assert_eq!(frames, vec![11, 10, 9, 8, 7, 6]);
+    }
+
+    /// Reverse propagation order runs from the prompted frame back down to 0 inclusive, and is empty
+    /// when the prompt is already on frame 0 (matching `range(start, -1, -1) if start > 0 else []`).
+    #[test]
+    fn reverse_propagation_order_descends_to_zero() {
+        assert_eq!(reverse_propagation_order(3), vec![3, 2, 1, 0]);
+        assert_eq!(reverse_propagation_order(1), vec![1, 0]);
+        // Prompt on frame 0 ⇒ nothing behind it ⇒ empty order.
+        assert!(reverse_propagation_order(0).is_empty());
     }
 
     /// The object-pointer temporal table is `[P, 256]`, and each `(sin, cos)` column pair for the
