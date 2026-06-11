@@ -346,3 +346,37 @@ fn build_joint_mask(txt_mask: Option<&Array>, b: i32, img_seq: i32) -> Result<Op
     }
     Ok(Some(Array::from_slice(&data, &[b, 1, 1, joint])))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-122: the shipped `generate` paths always pass `txt_mask = None`, so the padded-mask
+    /// construction was unreached. Exercise it directly so the additive-fill geometry can't drift
+    /// silently before Edit gains padded batched prompts.
+    #[test]
+    fn build_joint_mask_pads_text_keys() {
+        // b=1, txt_seq=3 with the last text token padded, img_seq=2 → joint=5.
+        let txt_mask = Array::from_slice(&[1i32, 1, 0], &[1, 3]);
+        let mask = build_joint_mask(Some(&txt_mask), 1, 2)
+            .unwrap()
+            .expect("a genuinely padded mask must produce Some");
+        assert_eq!(mask.shape(), &[1, 1, 1, 5]);
+        let vals = mask.as_slice::<f32>();
+        // Text key 2 is padded → MASK_FILL; every other text key and all image keys are attended.
+        assert_eq!(vals, &[0.0, 0.0, MASK_FILL, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn build_joint_mask_all_ones_short_circuits() {
+        // No padded token → the fork's all-ones short-circuit returns None (maskless attention).
+        let txt_mask = Array::from_slice(&[1i32, 1, 1], &[1, 3]);
+        assert!(build_joint_mask(Some(&txt_mask), 1, 2).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_joint_mask_none_is_none() {
+        // The shipped-path case: no text mask at all → None.
+        assert!(build_joint_mask(None, 1, 2).unwrap().is_none());
+    }
+}
