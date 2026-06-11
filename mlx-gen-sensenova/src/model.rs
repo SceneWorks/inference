@@ -35,7 +35,7 @@ use mlx_gen::{
 
 use crate::config::NeoChatConfig;
 use crate::distill::resolve_distill_lora;
-use crate::loader::load_raw;
+use crate::loader::{check_coverage, load_raw};
 use crate::t2i::{smart_resize, StepReporter, T2iModel, T2iOptions};
 use crate::text::load_tokenizer;
 use mlx_gen::weights::Weights;
@@ -159,6 +159,11 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
     };
     let cfg = NeoChatConfig::from_dir(root)?;
     let weights = load_raw(root)?;
+    // F-137: diff the checkpoint against the canonical key set before building modules (the loader
+    // module doc promised this validation). Missing keys still fail via `require` with the exact
+    // name during `from_weights`; this additionally rejects extra/renamed tensors that would
+    // otherwise load silently with whatever subset matches.
+    check_coverage(weights.keys(), &cfg).require_no_unexpected(id)?;
     let mut model = T2iModel::from_weights(&weights, &cfg)?;
     // The fast variant merges the 8-step distill LoRA into the dense generation path. This MUST
     // precede quantization (the merge seam errors on a quantized base). Assert full coverage —
