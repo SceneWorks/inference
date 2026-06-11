@@ -456,7 +456,7 @@ impl Sdxl {
                 Option<InpaintBlend>,
             ) = if is_accel {
                 // Few-step acceleration (txt2img): unit-noise prior scaled into the sampler's space.
-                let s = self.build_accel_sampler(sampler_name, steps, eta);
+                let s = self.build_accel_sampler(sampler_name, steps, eta, seed);
                 let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
                 let lat = s.scale_initial_noise(&noise)?;
                 (lat, s, None)
@@ -582,9 +582,16 @@ impl Sdxl {
 impl Sdxl {
     /// Build the per-run few-step acceleration sampler (sc-2769). `name` is one of
     /// [`ACCEL_SAMPLERS`]; `steps` is the inference step count (Lightning must match the loaded
-    /// LoRA's 2/4/8); `eta` is the TCD stochasticity (Hyper-SD). The samplers cast the U-Net input to
-    /// fp16 (the loaded compute dtype) and run their step math in f32.
-    fn build_accel_sampler(&self, name: &str, steps: usize, eta: f32) -> Box<dyn DiffusionSampler> {
+    /// LoRA's 2/4/8); `eta` is the TCD stochasticity (Hyper-SD); `seed` is the request seed driving
+    /// the deterministic between-step re-noise (D6). The samplers cast the U-Net input to fp16 (the
+    /// loaded compute dtype) and run their step math in f32.
+    fn build_accel_sampler(
+        &self,
+        name: &str,
+        steps: usize,
+        eta: f32,
+        seed: u64,
+    ) -> Box<dyn DiffusionSampler> {
         let n_train = self.alpha_schedule.alphas_cumprod.len();
         let sched = self.alpha_schedule.clone();
         match name {
@@ -594,6 +601,7 @@ impl Sdxl {
                 LCM_ORIGINAL_STEPS,
                 steps,
                 Dtype::Float16,
+                seed,
             )),
             "lightning" => Box::new(LightningSampler::new(
                 &sched,
@@ -608,6 +616,7 @@ impl Sdxl {
                 steps,
                 eta,
                 Dtype::Float16,
+                seed,
             )),
             // `generate` only calls this for `name ∈ ACCEL_SAMPLERS`.
             _ => unreachable!("build_accel_sampler: {name:?} is not an acceleration sampler"),
