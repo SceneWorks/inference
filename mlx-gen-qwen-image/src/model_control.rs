@@ -228,7 +228,6 @@ impl Generator for QwenImageControl {
                     control_scale,
                     req.width,
                     req.height,
-                    0,
                     &req.cancel,
                     progress,
                 )

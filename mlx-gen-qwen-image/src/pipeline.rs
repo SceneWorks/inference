@@ -392,15 +392,17 @@ pub fn denoise_control_with_progress(
     control_scale: f32,
     width: u32,
     height: u32,
-    start_step: usize,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     crate::transformer::set_compile_glue(true);
     let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
-    let total = (sampler.num_steps() - start_step) as u32;
-    for t in start_step..sampler.num_steps() {
+    // Control is pose-only T2I — there is no img2img-with-control path, so the loop always runs
+    // every step from 0 (the fork's `init_time_step` plumbing that `denoise_with_progress` carries
+    // for img2img has no caller here, so it is omitted; F-122).
+    let total = sampler.num_steps() as u32;
+    for t in 0..sampler.num_steps() {
         if cancel.is_cancelled() {
             return Err(Error::Msg("generation cancelled".into()));
         }
@@ -442,7 +444,7 @@ pub fn denoise_control_with_progress(
         // callbacks reflect real GPU completion rather than a lazily-queued graph. Bit-neutral.
         eval([&latents])?;
         on_progress(Progress::Step {
-            current: (t - start_step) as u32 + 1,
+            current: t as u32 + 1,
             total,
         });
     }
