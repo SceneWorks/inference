@@ -13,9 +13,64 @@ A from-scratch Rust reimplementation of the MLX image/video model stack (a diver
 - **Identity:** PuLID-FLUX and InstantID, over a native MLX face stack (SCRFD + ArcFace + BiSeNet)
 - **Understanding:** JoyCaption (captioning), SAM2 (segmentation)
 - **Adapters:** LoRA, LoKr (reconstruct + forward-time residual + stacking, quant-safe), ControlNet, IP-Adapter
+- **Training:** native MLX LoRA / LoKr fine-tuning for SDXL, Z-Image, Kolors, Wan2.2, and LTX-2.3 (adamw / adam / rose / prodigy optimizers, dataset + checkpoint plumbing)
 - **Quantization:** group-wise affine Q4 / Q8 (byte-identical to the reference packing)
+- **Weight converters:** native Rust weight-format converters for FLUX.2, Wan2.2 (T2V/I2V/TI2V + VAE), and LTX-2.3 — no Python conversion step
 
 Requires a Mac with full Xcode + the Metal Toolchain (MLX's Metal kernels compile from source).
+
+## Usage
+
+mlx-gen is a Rust library workspace consumed in-process. Each model family lives in its own
+provider crate that self-registers into the core `mlx-gen` registry at link time — so you depend
+on `mlx-gen` plus whichever provider crates you want, then resolve models by id:
+
+```toml
+# Cargo.toml
+[dependencies]
+mlx-gen = { git = "https://github.com/michaeltrefry/mlx-gen" }
+mlx-gen-z-image = { git = "https://github.com/michaeltrefry/mlx-gen" }
+```
+
+```rust
+use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
+
+// A provider crate registers itself only when it is actually linked. Reference it once
+// so the linker keeps its `inventory::submit!` registration.
+use mlx_gen_z_image as _;
+
+fn main() -> mlx_gen::Result<()> {
+    // Load a model by id from a Hugging Face snapshot directory.
+    let spec = LoadSpec::new(WeightsSource::Dir("/path/to/Z-Image-Turbo".into()));
+    let model = mlx_gen::load("z_image_turbo", &spec)?;
+
+    let req = GenerationRequest {
+        prompt: "a red fox in a snowy forest".into(),
+        width: 1024,
+        height: 1024,
+        seed: Some(42),
+        ..Default::default()
+    };
+
+    let out = model.generate(&req, &mut |p| {
+        if let Progress::Step { current, total } = p {
+            println!("step {current}/{total}");
+        }
+    })?;
+
+    if let GenerationOutput::Images(images) = out {
+        let img = &images[0];
+        // `img.pixels` is interleaved RGB (`img.width` × `img.height`); encode with any
+        // image crate (e.g. `image::save_buffer`) to write a PNG.
+        println!("generated {}×{}", img.width, img.height);
+    }
+    Ok(())
+}
+```
+
+Discover what is registered at runtime with `mlx_gen::registry::generators()`. The same pattern
+applies to the other entry points: `load_trainer` (LoRA/LoKr fine-tuning), `load_captioner`
+(JoyCaption), and `load_transform` (SAM2).
 
 ## License
 
