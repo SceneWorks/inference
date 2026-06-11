@@ -266,6 +266,7 @@ pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
         root.as_ref().join("tokenizer.json"),
         tokenizer_config(DEFAULT_MAX_CONTEXT_TOKENS),
     )
+    .map_err(Into::into)
 }
 
 pub fn load_tokenizer_from_spec(spec: &LoadSpec) -> Result<TextTokenizer> {
@@ -278,13 +279,16 @@ pub fn load_tokenizer_from_spec(spec: &LoadSpec) -> Result<TextTokenizer> {
 }
 
 pub fn encode_chat_prompt(tokenizer: &TextTokenizer, prompt: &str) -> Result<Vec<i32>> {
-    tokenizer.encode_ids(&build_chat_text(prompt), false)
+    tokenizer
+        .encode_ids(&build_chat_text(prompt), false)
+        .map_err(Into::into)
 }
 
 pub fn decode_generated(tokenizer: &TextTokenizer, ids: &[u32]) -> Result<String> {
     tokenizer
         .decode(ids, true)
         .map(|text| text.trim().to_owned())
+        .map_err(Into::into)
 }
 
 fn templates_for(caption_type: &str) -> &'static [&'static str; 3] {
