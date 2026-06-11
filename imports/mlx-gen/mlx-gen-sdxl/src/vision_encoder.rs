@@ -269,8 +269,16 @@ impl ClipVisionEncoder {
 
     /// The penultimate hidden state `[B, num_positions, hidden]` — the IP-Adapter "plus" image
     /// features fed to the Resampler.
+    ///
+    /// Runs only the first `num_layers - 1` encoder layers: that output *is* `hidden_states(..)[-2]`,
+    /// so forwarding the whole tower and discarding the last layer + every intermediate state was
+    /// wasted work (one ViT-H layer + the retained states; F-076).
     pub fn penultimate(&self, pixel_values: &Array) -> Result<Array> {
-        let states = self.hidden_states(pixel_values)?;
-        Ok(states[states.len() - 2].clone())
+        let mut x = self.embed(pixel_values)?;
+        let keep = self.layers.len().saturating_sub(1);
+        for layer in &self.layers[..keep] {
+            x = layer.forward(&x)?;
+        }
+        Ok(x)
     }
 }
