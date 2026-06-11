@@ -151,9 +151,18 @@ impl PulidFlux {
     }
 
     fn reference_face<'a>(&self, req: &'a GenerationRequest) -> Result<(&'a Image, f32)> {
-        let mut found = None;
-        for c in &req.conditioning {
-            if let Conditioning::Reference { image, strength } = c {
+        select_reference_face(&req.conditioning)
+    }
+}
+
+/// Pick the single reference-face conditioning, rejecting any other kind. PuLID-FLUX advertises only
+/// `ConditioningKind::Reference`, so a stray Control/Mask/etc. attached by a worker must **error**
+/// rather than be silently dropped when `generate` clears `flux_req.conditioning` (F-094).
+fn select_reference_face(conditioning: &[Conditioning]) -> Result<(&Image, f32)> {
+    let mut found = None;
+    for c in conditioning {
+        match c {
+            Conditioning::Reference { image, strength } => {
                 if found.is_some() {
                     return Err(Error::Msg(
                         "pulid_flux: exactly one reference face is supported".into(),
@@ -162,13 +171,20 @@ impl PulidFlux {
                 // The reference strength is the PuLID id_weight (0–3, default 1.0).
                 found = Some((image, strength.unwrap_or(1.0)));
             }
+            other => {
+                return Err(Error::Msg(format!(
+                    "pulid_flux: unsupported conditioning {:?} — only a reference face \
+                     (Conditioning::Reference) is accepted",
+                    other.kind()
+                )));
+            }
         }
-        found.ok_or_else(|| {
-            Error::Msg(
-                "pulid_flux: a reference face image (Conditioning::Reference) is required".into(),
-            )
-        })
     }
+    found.ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux: a reference face image (Conditioning::Reference) is required".into(),
+        )
+    })
 }
 
 impl Generator for PulidFlux {
@@ -317,4 +333,66 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 inventory::submit! {
     ModelRegistration { descriptor, load: load_pulid_flux }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img() -> Image {
+        Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0u8; 3],
+        }
+    }
+
+    /// F-094: a single reference face is accepted (its strength becomes the id_weight, default 1.0).
+    #[test]
+    fn select_reference_accepts_single_reference() {
+        let cond = vec![Conditioning::Reference {
+            image: img(),
+            strength: Some(2.0),
+        }];
+        let (_, weight) = select_reference_face(&cond).unwrap();
+        assert_eq!(weight, 2.0);
+    }
+
+    /// F-094: a non-Reference conditioning (e.g. a stray Mask/Control) is rejected rather than
+    /// silently dropped when `generate` clears the conditioning.
+    #[test]
+    fn select_reference_rejects_unsupported_conditioning() {
+        let cond = vec![
+            Conditioning::Reference {
+                image: img(),
+                strength: None,
+            },
+            Conditioning::Mask { image: img() },
+        ];
+        let err = select_reference_face(&cond).unwrap_err().to_string();
+        assert!(err.contains("unsupported"), "got: {err}");
+    }
+
+    /// Two reference faces are rejected, and an empty request is rejected as missing.
+    #[test]
+    fn select_reference_rejects_multiple_and_missing() {
+        let two = vec![
+            Conditioning::Reference {
+                image: img(),
+                strength: None,
+            },
+            Conditioning::Reference {
+                image: img(),
+                strength: None,
+            },
+        ];
+        assert!(select_reference_face(&two)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+        assert!(select_reference_face(&[])
+            .unwrap_err()
+            .to_string()
+            .contains("required"));
+    }
 }
