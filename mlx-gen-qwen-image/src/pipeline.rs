@@ -358,6 +358,11 @@ pub fn denoise_with_progress(
             None => pos,
         };
         latents = sampler.step(&velocity, &latents, t)?;
+        // Force this step to finish before the next extends the lazy MLX graph (F-119, matching
+        // denoise_edit_with_progress): bound the queued Metal work so the command-buffer watchdog
+        // can't trip on large (up to 2048²) / many-step requests, and so the cancel/progress
+        // callbacks reflect real GPU completion rather than a lazily-queued graph. Bit-neutral.
+        eval([&latents])?;
         on_progress(Progress::Step {
             current: (t - start_step) as u32 + 1,
             total,
@@ -431,6 +436,11 @@ pub fn denoise_control_with_progress(
             None => pos,
         };
         latents = sampler.step(&velocity, &latents, t)?;
+        // Force this step to finish before the next extends the lazy MLX graph (F-119, matching
+        // denoise_edit_with_progress): bound the queued Metal work so the command-buffer watchdog
+        // can't trip on large (up to 2048²) / many-step requests, and so the cancel/progress
+        // callbacks reflect real GPU completion rather than a lazily-queued graph. Bit-neutral.
+        eval([&latents])?;
         on_progress(Progress::Step {
             current: (t - start_step) as u32 + 1,
             total,
