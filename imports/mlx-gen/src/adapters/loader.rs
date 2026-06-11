@@ -36,22 +36,21 @@ use crate::runtime::{AdapterKind, AdapterSpec};
 use crate::weights::Weights;
 use crate::{Error, Result};
 
-/// PEFT LoKr per-module factor suffixes; each factor is full (`lokr_w1`/`lokr_w2`) or
-/// low-rank (`_a` @ `_b`). Exact-suffix matched, so order is for readability only.
-const LOKR_SUFFIXES: [&str; 6] = [
-    ".lokr_w1_a",
-    ".lokr_w1_b",
-    ".lokr_w1",
-    ".lokr_w2_a",
-    ".lokr_w2_b",
-    ".lokr_w2",
-];
+// The format predicates, factor-suffix tables, rank/alpha parsing, and key-alias resolution are
+// backend-neutral string/metadata logic and live in gen-core (sc-3722); this module supplies the
+// `Weights`/`Array` half (factor grouping + delta reconstruction). The historical
+// `mlx_gen::adapters::loader::{KOHYA_PREFIX, COMMON_LORA_PREFIXES, resolve_lokr_path}` paths stay
+// resolvable via these re-exports.
+use gen_core::weightsmeta as wmeta;
+pub use gen_core::weightsmeta::{resolve_lokr_path, COMMON_LORA_PREFIXES, KOHYA_PREFIX};
+
+/// PEFT LoKr per-module factor suffixes (gen-core's table) — each factor is full (`lokr_w1`/
+/// `lokr_w2`) or low-rank (`_a`/`_b`). Exact-suffix matched.
+use gen_core::weightsmeta::LOKR_SUFFIXES;
 
 /// `true` if the file's `networkType` metadata marks it a LoKr adapter.
 pub fn is_lokr(w: &Weights) -> bool {
-    w.metadata("networkType")
-        .map(|s| s.trim().eq_ignore_ascii_case("lokr"))
-        .unwrap_or(false)
+    wmeta::is_lokr_network_type(w.metadata("networkType"))
 }
 
 /// A parsed LoKr file: the global `(alpha, rank)` from metadata plus every module's Kronecker
@@ -107,28 +106,17 @@ impl LokrFile {
 /// Shared by [`apply_lokr`] (core `AdaptableHost` install) and the video providers' crate-local
 /// residual/merge installers.
 pub fn parse_lokr(w: &Weights) -> Result<LokrFile> {
-    let rank = w
-        .metadata("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    // alpha defaults to rank (scale 1.0) when absent, matching PEFT.
-    let alpha = w
-        .metadata("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    // rank/alpha (alpha defaults to rank ⇒ scale 1.0, matching PEFT) — parsed in gen-core.
+    let (rank, alpha) = wmeta::parse_rank_alpha(w.metadata("rank"), w.metadata("alpha"));
 
     let keys: Vec<String> = w.keys().map(str::to_string).collect();
     let mut groups: BTreeMap<String, BTreeMap<String, Array>> = BTreeMap::new();
     for key in &keys {
-        for suffix in LOKR_SUFFIXES {
-            if let Some(path) = key.strip_suffix(suffix) {
-                let factor = suffix[1..].to_string(); // drop the leading '.'
-                groups
-                    .entry(path.to_string())
-                    .or_default()
-                    .insert(factor, w.require(key)?.clone());
-                break;
-            }
+        if let Some((path, factor)) = wmeta::split_factor_key(key, &LOKR_SUFFIXES) {
+            groups
+                .entry(path.to_string())
+                .or_default()
+                .insert(factor.to_string(), w.require(key)?.clone());
         }
     }
     Ok(LokrFile {
@@ -191,23 +179,15 @@ pub fn apply_lokr(host: &mut impl AdaptableHost, w: &Weights, scale: f32) -> Res
 // ---- Third-party LyCORIS LoKr (sc-3642) ----------------------------------------------------------
 
 /// Third-party LoKr factor suffixes — the PEFT set plus `lokr_t2` (the lycoris tucker/CP factor).
-/// `.lokr_w1_a`/`_b` precede the bare `.lokr_w1` so exact-suffix matching never mis-binds.
-const LOKR_TP_SUFFIXES: [&str; 7] = [
-    ".lokr_w1_a",
-    ".lokr_w1_b",
-    ".lokr_w1",
-    ".lokr_w2_a",
-    ".lokr_w2_b",
-    ".lokr_w2",
-    ".lokr_t2",
-];
+/// `.lokr_w1_a`/`_b` precede the bare `.lokr_w1` so exact-suffix matching never mis-binds. (gen-core.)
+use gen_core::weightsmeta::LOKR_TP_SUFFIXES;
 
 /// `true` if any key is a LoKr factor (`*.lokr_w…`), regardless of `networkType` metadata. This is
 /// how a **third-party** LyCORIS LoKr (kohya / ai-toolkit / lycoris-lib) is recognized — those files
 /// ship the Kronecker factors but NOT SceneWorks' peft `networkType=lokr` stamp that [`is_lokr`]
 /// keys off. (A `lokr_t2` tucker factor always co-occurs with `lokr_w2_a`, so `.lokr_w` suffices.)
 pub fn is_lokr_keys(w: &Weights) -> bool {
-    w.keys().any(|k| k.contains(".lokr_w"))
+    wmeta::keys_contain_lokr(w.keys())
 }
 
 /// One module's third-party LoKr factors. Unlike the peft [`LokrFile`] (one global `(alpha, rank)`
@@ -303,30 +283,10 @@ pub fn parse_lokr_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyL
     Ok(groups)
 }
 
-/// Resolve a third-party LoKr raw module key to a host dotted path. The key is `<PREFIX>_<stem>`
-/// where `stem` is the diffusers path with dots flattened to underscores and `PREFIX` varies by
-/// trainer (`lora_unet`, `lycoris`, …). We match prefix-agnostically: the `stem` is a table entry
-/// (`flattened → dotted`) that equals `raw` or is an `_`-delimited suffix of it; the longest such
-/// stem wins (so a short module name can't match inside a longer one). Mirrors the worker's lycoris
-/// loader keying each module as `f"{PREFIX}_{module_name}"`. `pub` so the merge-path providers
-/// (sc-3671) resolve third-party keys against their own module tables.
-pub fn resolve_lokr_path<'a>(raw: &str, table: &'a BTreeMap<String, String>) -> Option<&'a str> {
-    let mut best: Option<(&str, usize)> = None;
-    for (stem, dotted) in table {
-        let is_match = raw == stem
-            || (raw.len() > stem.len()
-                && raw.ends_with(stem.as_str())
-                && raw.as_bytes()[raw.len() - stem.len() - 1] == b'_');
-        let longer = match best {
-            None => true,
-            Some((_, l)) => stem.len() > l,
-        };
-        if is_match && longer {
-            best = Some((dotted.as_str(), stem.len()));
-        }
-    }
-    best.map(|(d, _)| d)
-}
+// `resolve_lokr_path` — resolve a third-party LoKr raw module key (`<PREFIX>_<stem>`, the diffusers
+// path flattened with `.`→`_`) to a host dotted path, longest-stem-wins — is defined in gen-core
+// (`weightsmeta`) and re-exported at the top of this module so the merge-path providers (sc-3671)
+// resolve third-party keys against their own module tables.
 
 /// Install a third-party LyCORIS **LoKr** file (LoHa is sc-3643) onto `host`. Reconstructs each
 /// module's Kronecker delta from its per-module factors (full / low-rank / tucker) at the lycoris
@@ -364,19 +324,13 @@ pub fn apply_lokr_thirdparty(
 // ---- Third-party LyCORIS LoHa (sc-3643) ----------------------------------------------------------
 
 /// Third-party LoHa factor suffixes (the two Hadamard low-rank pairs + optional tucker factors).
-const LOHA_TP_SUFFIXES: [&str; 6] = [
-    ".hada_w1_a",
-    ".hada_w1_b",
-    ".hada_w2_a",
-    ".hada_w2_b",
-    ".hada_t1",
-    ".hada_t2",
-];
+/// (gen-core.)
+use gen_core::weightsmeta::LOHA_TP_SUFFIXES;
 
 /// `true` if any key is a LoHa factor (`*.hada_w…`) — how a third-party LyCORIS LoHa (kohya /
 /// ai-toolkit / lycoris-lib) is recognized. Mutually exclusive with [`is_lokr_keys`] (`lokr_*`).
 pub fn is_loha_keys(w: &Weights) -> bool {
-    w.keys().any(|k| k.contains(".hada_w"))
+    wmeta::keys_contain_loha(w.keys())
 }
 
 /// One module's third-party LoHa factors — two low-rank Hadamard pairs, optional tucker `t1`/`t2`,
@@ -600,9 +554,7 @@ struct LoraParts {
     alpha: Option<f32>,
 }
 
-/// kohya / sd-scripts key prefix: the trained diffusers module path with dots flattened to
-/// underscores, denominated under the denoiser as `lora_unet_…`.
-pub const KOHYA_PREFIX: &str = "lora_unet_";
+// `KOHYA_PREFIX` (`lora_unet_`) is defined in gen-core and re-exported at the top of this module.
 
 /// kohya factor suffixes mapped to a [`LoraParts`] role. `lora_down`==PEFT `lora_A`,
 /// `lora_up`==PEFT `lora_B`; the optional `.default` infix is the peft-export form some kohya
@@ -625,7 +577,7 @@ enum KohyaRole {
 /// `true` if `w` is a kohya-format LoRA — any key carries the `lora_unet_` prefix. (kohya files are
 /// the only convention that flattens the module path; PEFT/diffusers keep dots, LoKr is bare.)
 pub fn is_kohya(w: &Weights) -> bool {
-    w.keys().any(|k| k.starts_with(KOHYA_PREFIX))
+    wmeta::keys_are_kohya(w.keys())
 }
 
 /// Build the kohya `flattened-stem → dotted-path` lookup from a host's routable target paths
@@ -633,10 +585,7 @@ pub fn is_kohya(w: &Weights) -> bool {
 /// flattening), WITHOUT the `lora_unet_` prefix. Mirrors the SDXL matcher (sc-2639) and the fork's
 /// explicit `lora_unet_…` patterns, generalized over any [`AdaptableHost`].
 fn kohya_table(paths: &[String]) -> BTreeMap<String, String> {
-    paths
-        .iter()
-        .map(|p| (p.replace('.', "_"), p.clone()))
-        .collect()
+    wmeta::kohya_table(paths)
 }
 
 /// Install a kohya-format LoRA (`lora_unet_<flattened path>.lora_down/up.weight` + optional `.alpha`)
@@ -916,21 +865,16 @@ pub fn apply_adapter_specs(
     Ok(combined)
 }
 
-/// LoRA key namespace prefixes diffusers/peft adapter files use, tried in order; the first that any
-/// key begins with is stripped. LoKr files are bare (no prefix). kohya `lora_unet_…` files flatten
-/// the module dots to underscores and resolve through a separate flattened→dotted table
-/// ([`apply_lora_kohya`], sc-2618), not this prefix strip. SceneWorks' trained LoRAs use
-/// `transformer.` (peft `save_lora_weights`) or `diffusion_model.` (sd-scripts export) — both
-/// observed on real files.
-pub const COMMON_LORA_PREFIXES: [&str; 2] = ["transformer.", "diffusion_model."];
+// `COMMON_LORA_PREFIXES` — the LoRA key namespace prefixes diffusers/peft adapter files use, tried
+// in order; the first a key begins with is stripped. LoKr files are bare (no prefix); kohya
+// `lora_unet_…` files flatten the module dots to underscores and resolve through a separate
+// flattened→dotted table ([`apply_lora_kohya`], sc-2618), not this prefix strip. SceneWorks' trained
+// LoRAs use `transformer.` (peft `save_lora_weights`) or `diffusion_model.` (sd-scripts export) —
+// both observed on real files. Defined in gen-core (`weightsmeta`) and re-exported above.
 
 /// The LoRA namespace prefix present in `w`'s keys, if any (see [`COMMON_LORA_PREFIXES`]).
 pub fn detect_lora_prefix(w: &Weights) -> Option<&'static str> {
-    let keys: Vec<&str> = w.keys().collect();
-    COMMON_LORA_PREFIXES
-        .into_iter()
-        .find(|&p| keys.iter().any(|k| k.starts_with(p)))
-        .map(|v| v as _)
+    wmeta::detect_lora_prefix(w.keys())
 }
 
 /// [`apply_adapter_specs`] with per-file LoRA-prefix **auto-detection** ([`detect_lora_prefix`])

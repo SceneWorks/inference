@@ -33,6 +33,10 @@ inventory = "0.3"
 # HF tokenizers (same Rust core `transformers` wraps) — loads tokenizer.json directly.
 # onig only (no progressbar/http): byte-level BPE for Qwen/CLIP/T5 needs just the regex.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# Backend-neutral safetensors header/byte-view reader (gen-core weightsmeta, sc-3722) — keys, dtypes,
+# shapes, raw byte ranges WITHOUT a tensor library. Candle reads torch safetensors through this seam;
+# mlx-gen keeps its mlx-rs full-checkpoint loader and uses this for adapter/metadata inspection.
+safetensors = "0.4"
 
 [package]
 name = "mlx-gen"

@@ -308,6 +308,7 @@ fn lightning_hyper_match_torch_teacher_forced() {
                 steps,
                 0.0,
                 dt,
+                0,
             ))
         };
 
