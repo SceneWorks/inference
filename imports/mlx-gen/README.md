@@ -15,7 +15,7 @@ A from-scratch Rust reimplementation of the MLX image/video model stack (a diver
 - **Adapters:** LoRA, LoKr (reconstruct + forward-time residual + stacking, quant-safe), ControlNet, IP-Adapter
 - **Training:** native MLX LoRA / LoKr fine-tuning for SDXL, Z-Image, Kolors, Wan2.2, and LTX-2.3 (adamw / adam / rose / prodigy optimizers, dataset + checkpoint plumbing)
 - **Quantization:** group-wise affine Q4 / Q8 (byte-identical to the reference packing)
-- **Weight converters:** native Rust weight-format converters for FLUX.2, Wan2.2 (T2V/I2V/TI2V + VAE), and LTX-2.3 — no Python conversion step
+- **Weight loading:** most models load directly from their Hugging Face / diffusers snapshot — no conversion step. The families that ship in a non-loadable source format include a native Rust converter, so there is no Python step anywhere: FLUX.2 (single-file → diffusers), Wan2.2 (torch `.pth` reader, T2V/I2V/TI2V + VAE), LTX-2.3 (single-file → split MLX)
 
 Requires a Mac with full Xcode + the Metal Toolchain (MLX's Metal kernels compile from source).
 
