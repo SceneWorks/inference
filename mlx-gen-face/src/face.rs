@@ -220,18 +220,30 @@ impl FaceAnalysis {
             .scrfd
             .detect(&blob, det_scale, self.det_thresh, self.nms_thresh)?;
 
+        if dets.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Warp every detected face, then run ONE batched `[N,112,112,3]` ArcFace forward instead of N
+        // sequential iresnet100 GPU dispatches (F-089). iresnet100 inference has no cross-batch ops
+        // (its BatchNorms are folded into per-channel affines), so each `[N,512]` row is bit-identical
+        // to the per-face forward.
+        let crops: Vec<Vec<u8>> = dets
+            .iter()
+            .map(|d| align::norm_crop(img, h, w, &d.kps))
+            .collect();
+        let emb = self.arcface.forward(&align::to_arcface_input(&crops)?)?;
+        let emb = emb
+            .try_as_slice::<f32>()
+            .map_err(|e| format!("embedding readback: {e}"))?;
+        let dim = emb.len() / dets.len(); // [N, 512] → 512 per row
+
         let mut faces = Vec::with_capacity(dets.len());
-        for d in &dets {
-            let crop = align::norm_crop(img, h, w, &d.kps);
-            let emb = self.arcface.forward(&align::to_arcface_input(&[crop])?)?;
+        for (i, d) in dets.iter().enumerate() {
             faces.push(Face {
                 bbox: d.bbox,
                 kps: d.kps,
                 det_score: d.score,
-                embedding: emb
-                    .try_as_slice::<f32>()
-                    .map_err(|e| format!("embedding readback: {e}"))?
-                    .to_vec(),
+                embedding: emb[i * dim..(i + 1) * dim].to_vec(),
             });
         }
         faces.sort_by(|a, b| b.area().total_cmp(&a.area()));
