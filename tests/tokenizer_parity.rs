@@ -9,7 +9,7 @@
 //!   MLX_GEN_ZIMAGE_TOKENIZER=/path/to/Z-Image-Turbo/tokenizer/tokenizer.json \
 //!     cargo test --test tokenizer_parity -- --ignored
 //!
-//! Fixture `tests/fixtures/tokenizer_zimage.safetensors` ← `tools/dump_tokenizer.py`.
+//! Fixture `tests/fixtures/tokenizer_zimage.safetensors` ← `tools/dump_z_image_tokenizer.py`.
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
@@ -20,7 +20,7 @@ const FIXTURE: &str = concat!(
     "/tests/fixtures/tokenizer_zimage.safetensors"
 );
 
-// Must match tools/dump_tokenizer.py exactly.
+// Must match tools/dump_z_image_tokenizer.py exactly.
 const PROMPTS: [&str; 3] = [
     "a red fox",
     "A serene mountain lake at sunset, photorealistic",

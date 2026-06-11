@@ -1,6 +1,6 @@
 """Tiny end-to-end denoise-loop parity fixture (sc-2344).
 
-Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_denoise_loop.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_z_image_denoise_loop.py
 
 Reuses the tiny ZImageTransformer config from dump_z_transformer.py, then runs the flow-match
 Euler loop by hand (mirroring z_image.py): for each step, predict velocity with the DiT and take

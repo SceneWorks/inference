@@ -14,7 +14,7 @@ We dump the input as a uint8 HWC array (not a PNG) so the Rust test feeds identi
 with no image-decode dependency or decode-parity variable.
 
 Run from the mflux fork venv:
-    cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_image_processor.py
+    cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_qwen_image_processor.py
 """
 
 import mlx.core as mx

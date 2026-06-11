@@ -1,6 +1,6 @@
 """Dump a tiny full Z-Image TextEncoder forward parity fixture from the fork.
 
-Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_text_encoder.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_z_image_text_encoder.py
 
 Overrides ModelConfig.precision -> float32 so the encoder's final cast is a no-op (clean f32
 parity; the bf16 cast for the DiT is a downstream concern). attention_mask is all-ones (causal

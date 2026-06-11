@@ -1,6 +1,6 @@
 //! sc-2344: parity for the Z-Image VAE decoder sub-modules vs the fork — the convolutional
 //! op family (Conv2d + pytorch-compatible GroupNorm + nearest upsample + spatial attention).
-//! Fixture `tests/fixtures/vae_submodules.safetensors` ← `tools/dump_vae_submodules.py`.
+//! Fixture `tests/fixtures/vae_submodules.safetensors` ← `tools/dump_z_image_vae_submodules.py`.
 //! Tol 1e-2 (Metal fp32 convs).
 
 use mlx_gen::weights::Weights;
