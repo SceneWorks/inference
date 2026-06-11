@@ -276,14 +276,15 @@ pub(crate) fn encode_prompt(
     id: &str,
 ) -> Result<Array> {
     let t = tokenizer.tokenize(prompt)?;
-    if t.input_ids.shape()[1] == 0 {
+    let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&t);
+    if input_ids.shape()[1] == 0 {
         return Err(Error::Msg(format!("{id}: empty prompt")));
     }
-    let num_valid: i32 = host_i32(&t.attention_mask)?.iter().sum();
+    let num_valid: i32 = host_i32(&attention_mask)?.iter().sum();
     if num_valid == 0 {
         return Err(Error::Msg(format!("{id}: empty prompt")));
     }
-    let enc = text_encoder.forward(&t.input_ids, &t.attention_mask)?;
+    let enc = text_encoder.forward(&input_ids, &attention_mask)?;
     slice_valid(&enc, num_valid)
 }
 

@@ -14,11 +14,12 @@
 //! the base transformer at `control_context_scale = 0`, and the full control render matches the
 //! fork's control golden — see `tests/z_control_transformer.rs` and `tests/control_real_weights.rs`.
 
+use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Result, WeightsSource,
+    ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
@@ -42,8 +43,10 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "z-image",
+        backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
@@ -154,31 +157,11 @@ impl ZImageTurboControl {
             )
         })
     }
-}
 
-impl Generator for ZImageTurboControl {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        // Shared capability checks (size/count/guidance/negative/accepted conditioning), then the
-        // control-specific requirement that a Control conditioning is present.
-        validate_request(&self.descriptor.capabilities, req)?;
-        if !req
-            .conditioning
-            .iter()
-            .any(|c| matches!(c, Conditioning::Control { .. }))
-        {
-            return Err(Error::Msg(
-                "z_image_turbo_control requires a Control conditioning (the pose/union skeleton)"
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn generate(
+    /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
+    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
+    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -261,8 +244,45 @@ impl Generator for ZImageTurboControl {
     }
 }
 
+impl Generator for ZImageTurboControl {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        // Shared capability checks (size/count/guidance/negative/accepted conditioning), then the
+        // control-specific requirement that a Control conditioning is present.
+        validate_request(&self.descriptor.capabilities, req)?;
+        if !req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::Control { .. }))
+        {
+            return Err(gen_core::Error::Msg(
+                "z_image_turbo_control requires a Control conditioning (the pose/union skeleton)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
+/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
+fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    ModelRegistration { descriptor, load }
+    ModelRegistration { descriptor, load: load_registered }
 }
 
 #[cfg(test)]

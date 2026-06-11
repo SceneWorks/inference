@@ -29,6 +29,7 @@
 use std::path::Path;
 
 use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::gen_core;
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::checkpoint_filename;
@@ -121,8 +122,14 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }))
 }
 
+/// Registry adapter: the trainer registry's `load` slot is typed on [`gen_core::Result`] (epic
+/// 3720); bridge the crate's rich-`Result` [`load_trainer`] into it.
+fn load_trainer_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
+    load_trainer(spec).map_err(Into::into)
+}
+
 inventory::submit! {
-    TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer }
+    TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer_registered }
 }
 
 /// Recognized `timestep_type` values — the noise-schedule samplers [`sample_sigma`] branches on
@@ -209,7 +216,7 @@ impl Trainer for ZImageTurboTrainer {
         &self.descriptor
     }
 
-    fn validate(&self, req: &TrainingRequest) -> Result<()> {
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         validate_request(req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would resolve
         // to an empty target set — a full-length run that trains zero parameters yet "succeeds"
@@ -226,6 +233,18 @@ impl Trainer for ZImageTurboTrainer {
     }
 
     fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        self.train_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl ZImageTurboTrainer {
+    /// The rich-`Result` body behind [`Trainer::train`]; the trait wrapper bridges its tail into
+    /// [`gen_core::Error`] (epic 3720), keeping `?` on `mlx_rs`/family helpers transparent here.
+    fn train_impl(
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),

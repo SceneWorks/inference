@@ -1,6 +1,7 @@
 //! FLUX.1 provider registration and txt2img generation path.
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
@@ -163,9 +164,9 @@ impl Flux1 {
                 self.descriptor.id
             ))
         })?;
-        let t5 = t5_tokenizer.tokenize(prompt)?;
-        let clip = clip_tokenizer.tokenize(prompt)?;
-        text_encoders.encode(&t5.input_ids, &clip.input_ids)
+        let (t5_ids, _) = mlx_gen::tokenizer::to_arrays(&t5_tokenizer.tokenize(prompt)?);
+        let (clip_ids, _) = mlx_gen::tokenizer::to_arrays(&clip_tokenizer.tokenize(prompt)?);
+        text_encoders.encode(&t5_ids, &clip_ids)
     }
 
     fn transformer(&self) -> Result<&FluxTransformer> {
@@ -192,15 +193,15 @@ impl Generator for Flux1 {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        validate_request(&self.descriptor, req)
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
     }
 
     fn generate(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> gen_core::Result<GenerationOutput> {
         // Reference-image (XLabs IP-Adapter) path, epic 3621. `validate` (run inside the injector
         // generate methods) has already confirmed at most one `Reference`; extract it here.
         if let Some((image, strength)) = single_reference(req)? {
@@ -239,11 +240,15 @@ impl Generator for Flux1 {
                         0,
                         on_progress,
                     )
+                    .map_err(Into::into)
                 }
-                _ => self.generate_with_injector(req, Some(&pos), on_progress),
+                _ => self
+                    .generate_with_injector(req, Some(&pos), on_progress)
+                    .map_err(Into::into),
             };
         }
         self.generate_with_injector(req, None, on_progress)
+            .map_err(Into::into)
     }
 }
 
@@ -507,12 +512,20 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
     Ok(())
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_schnell, load: load_schnell }
+fn load_schnell_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_schnell(spec).map_err(Into::into)
+}
+
+fn load_dev_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_dev(spec).map_err(Into::into)
 }
 
 inventory::submit! {
-    ModelRegistration { descriptor: descriptor_dev, load: load_dev }
+    ModelRegistration { descriptor: descriptor_schnell, load: load_schnell_registered }
+}
+
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_dev, load: load_dev_registered }
 }
 
 #[cfg(test)]

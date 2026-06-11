@@ -41,5 +41,39 @@ impl From<&str> for Error {
     }
 }
 
+/// Bridge the rich mlx-gen error into the backend-neutral [`gen_core::Error`] (epic 3720, D3 /
+/// Option B). Legal under the orphan rule because the source type (`mlx_gen::Error`) is local. This
+/// is what lets a family crate's `Generator::generate` — whose signature is `gen_core::Result` —
+/// keep using `?` on the `mlx_gen::Result` helpers that do the actual tensor work: the device
+/// exceptions box into [`gen_core::Error::Backend`], while the typed variants map across 1:1.
+impl From<Error> for gen_core::Error {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Mlx(ex) => gen_core::Error::backend(ex),
+            Error::SafeTensors(io) => gen_core::Error::backend(io),
+            Error::MissingTensor(s) => gen_core::Error::MissingTensor(s),
+            Error::Io(io) => gen_core::Error::Io(io),
+            Error::Msg(s) => gen_core::Error::Msg(s),
+        }
+    }
+}
+
+/// The reverse bridge: gen-core contract calls (tokenizer, registry, imageops, capability
+/// validation) return `gen_core::Error`; mlx-gen and family code invoke them with `?` inside
+/// `mlx_gen::Result` fns, so down-convert here. `Backend`/`Unsupported`/`Canceled` have no rich
+/// mlx-gen analog and collapse to `Msg` (keeping the display text).
+impl From<gen_core::Error> for Error {
+    fn from(e: gen_core::Error) -> Self {
+        match e {
+            gen_core::Error::Backend(b) => Error::Msg(b.to_string()),
+            gen_core::Error::MissingTensor(s) => Error::MissingTensor(s),
+            gen_core::Error::Io(io) => Error::Io(io),
+            gen_core::Error::Unsupported(s) => Error::Msg(format!("unsupported: {s}")),
+            gen_core::Error::Canceled => Error::Msg("cancelled".to_string()),
+            gen_core::Error::Msg(s) => Error::Msg(s),
+        }
+    }
+}
+
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
