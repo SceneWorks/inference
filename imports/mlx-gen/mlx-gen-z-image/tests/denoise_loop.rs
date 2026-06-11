@@ -1,6 +1,6 @@
 //! sc-2344: tiny end-to-end denoise-loop parity vs the fork.
 //!
-//! Fixture `tests/fixtures/denoise_loop.safetensors` ← `tools/dump_denoise_loop.py` (the tiny
+//! Fixture `tests/fixtures/denoise_loop.safetensors` ← `tools/dump_z_image_denoise_loop.py` (the tiny
 //! ZImageTransformer config from the DiT parity test, run through N Euler steps). Validates the
 //! loop orchestration — timestep = 1 - sigma, scheduler stepping, velocity sign — composed over
 //! the independently parity-tested transformer + scheduler. 1e-2 (Metal fp32, N forwards).

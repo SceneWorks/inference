@@ -8,7 +8,7 @@ exercises the full assembly wiring (channel changes, block order, upsample) with
 committable fixture. The Rust `Decoder` is config-driven and runs the same small config.
 
 Run from the mflux fork venv:
-    cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_vae_decoder.py
+    cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_z_image_vae_decoder.py
 """
 
 import mlx.core as mx

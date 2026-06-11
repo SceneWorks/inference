@@ -1,6 +1,6 @@
 //! sc-2344: full Z-Image TextEncoder forward parity vs the fork (tiny random config).
 //!
-//! Fixture `tests/fixtures/text_encoder.safetensors` ← `tools/dump_text_encoder.py` (precision
+//! Fixture `tests/fixtures/text_encoder.safetensors` ← `tools/dump_z_image_text_encoder.py` (precision
 //! pinned to f32 for the dump). Exercises embed lookup → N pre-norm decoder layers → the
 //! second-to-last layer's hidden states. attention_mask is all-ones (causal path; the padding
 //! combination is unit-tested in `text_encoder::encoder`). 1e-2 tolerance (Metal fp32 matmul).

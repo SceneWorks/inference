@@ -1,6 +1,6 @@
 //! sc-2344: Z-Image text-encoder sub-module parity vs the fork (tiny random config).
 //!
-//! Fixture `tests/fixtures/text_encoder_layer.safetensors` ← `tools/dump_text_encoder_layer.py`.
+//! Fixture `tests/fixtures/text_encoder_layer.safetensors` ← `tools/dump_z_image_text_encoder_layer.py`.
 //! Covers (1) the HF half-split RoPE cos/sin and (2) a full `EncoderLayer` forward (GQA +
 //! q_norm/k_norm + RoPE + causal SDPA + SwiGLU MLP + pre-norm residuals). 1e-2 tolerance —
 //! Metal runs fp32 matmul in reduced precision.

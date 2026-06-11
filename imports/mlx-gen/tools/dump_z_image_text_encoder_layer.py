@@ -1,6 +1,6 @@
 """Dump a tiny Z-Image text-encoder EncoderLayer (+ RoPE cos/sin) parity fixture from the fork.
 
-Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_text_encoder_layer.py
+Run from the fork:  cd ~/repos/mflux && uv run python tools/dump_z_image_text_encoder_layer.py
 
 The layer exercises attention (GQA + q_norm/k_norm + HF half-split RoPE + causal SDPA) + SwiGLU
 MLP + pre-norm residuals together. cos/sin double as the RoPE golden. Tiny random config.

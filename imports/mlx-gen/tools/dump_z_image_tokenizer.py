@@ -10,7 +10,7 @@ single-user-message chat template (which collapses to
 `<|im_start|>user\\n{prompt}<|im_end|>\\n<|im_start|>assistant\\n`), encodes, then pads to 512.
 
 Run from the mflux fork venv:
-    cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_tokenizer.py
+    cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_z_image_tokenizer.py
 """
 
 import mlx.core as mx
