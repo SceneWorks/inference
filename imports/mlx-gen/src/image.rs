@@ -232,6 +232,32 @@ pub fn resize_lanczos_u8(
     resize_u8(src, in_h, in_w, out_h, out_w, 3.0, &lanczos3)
 }
 
+/// Nearest-neighbour resize of a uint8 HWC image (`C = len / (in_h·in_w)`), torch
+/// `F.interpolate(mode="nearest")`: each destination samples source index `floor(dst · in/out)`.
+/// Unlike the windowed filters above it introduces **no** intermediate values, so it's the right
+/// resampler for masks / label maps where interpolation would create spurious grays that flip a
+/// downstream binarize threshold. Returns f32 HWC, integer-valued `[0,255]`.
+pub fn resize_nearest_u8(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<f32> {
+    let c = src.len() / (in_h * in_w);
+    let mut out = vec![0f32; out_h * out_w * c];
+    for oy in 0..out_h {
+        let sy = ((oy * in_h) / out_h).min(in_h - 1);
+        for ox in 0..out_w {
+            let sx = ((ox * in_w) / out_w).min(in_w - 1);
+            for ch in 0..c {
+                out[(oy * out_w + ox) * c + ch] = src[(sy * in_w + sx) * c + ch] as f32;
+            }
+        }
+    }
+    out
+}
+
 /// Denormalize a VAE-decoded tensor to an RGB8 [`Image`]: `clip(x·0.5 + 0.5, 0, 1)` → drop the
 /// singleton temporal axis (5-D → 4-D) → NCHW→NHWC → `(x·255).round()` → `u8`, taking batch 0.
 /// Identical across the Z-Image and Qwen-Image pipelines (the decoded tensor must already be f32).
@@ -361,6 +387,21 @@ pub fn union_masks(a: &Image, b: &Image) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_nearest_introduces_no_intermediate_values() {
+        // F-075: nearest copies source samples (`floor(dst·in/out)`), never blends — so a mask can't
+        // gain grays that flip a binarize. 1×2 [0,255] → 1×4 replicates each pixel; 1×4 → 1×2 picks
+        // the floor-sampled source indices (0 and 2).
+        assert_eq!(
+            resize_nearest_u8(&[0u8, 255], 1, 2, 1, 4),
+            vec![0.0, 0.0, 255.0, 255.0]
+        );
+        assert_eq!(
+            resize_nearest_u8(&[10u8, 20, 30, 40], 1, 4, 1, 2),
+            vec![10.0, 30.0]
+        );
+    }
 
     #[test]
     fn resize_accepts_correctly_sized_buffer() {

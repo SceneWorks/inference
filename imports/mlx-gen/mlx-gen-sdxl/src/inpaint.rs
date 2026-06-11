@@ -15,7 +15,7 @@ use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
-use mlx_gen::image::resize_bicubic_u8;
+use mlx_gen::image::resize_nearest_u8;
 use mlx_gen::media::Image;
 use mlx_gen::Result;
 
@@ -32,7 +32,9 @@ pub fn preprocess_mask(mask: &Image, width: u32, height: u32) -> Result<Array> {
     let luma: Vec<u8> = if (mask.width as usize, mask.height as usize) == (w, h) {
         rgb_to_luma(&mask.pixels)
     } else {
-        let resized = resize_bicubic_u8(
+        // Nearest, not bicubic: a mask must not gain interpolated grays that flip the 0.5 binarize
+        // (F-075) — this matches the diffusers `F.interpolate(..., nearest)` the doc cites.
+        let resized = resize_nearest_u8(
             &mask.pixels,
             mask.height as usize,
             mask.width as usize,
