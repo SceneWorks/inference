@@ -18,7 +18,7 @@ use mlx_rs::Array;
 
 use mlx_gen::nn::{conv2d, gelu_exact, linear};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::HieraConfig;
 
@@ -243,6 +243,8 @@ impl MultiScaleBlock {
         // Residual: at a stage boundary, project (Linear) + pool to the new dim/resolution.
         let shortcut = match &self.proj {
             Some((pw, pb)) => {
+                // A projecting (stage-boundary) block always pools — enforced at load by
+                // `Hiera::from_weights` (q_pool covers every transition), so this can't fail (F-175).
                 let stride = self.q_stride.expect("stage-boundary block always pools");
                 max_pool(&linear(&normed, pw, pb)?, stride)?
             }
@@ -369,7 +371,26 @@ impl Hiera {
         let p = |leaf: &str| join(prefix, leaf);
 
         // Build per-block specs (window read *before* the stage increment — see `block_specs`).
-        let blocks = block_specs(cfg)
+        let specs = block_specs(cfg);
+        // A stage-boundary block projects its residual to the new width (`dim != dim_out`) and the
+        // forward then *requires* a `q_stride` to pool that projected residual
+        // (`q_stride.expect(...)`). That holds for the official sizes, but the public `HieraConfig`
+        // could set `q_pool` smaller than the number of stage transitions, leaving a projecting
+        // block with `q_stride = None` → a forward-time panic. Reject it at load instead (F-175).
+        if let Some(i) = specs
+            .iter()
+            .position(|s| s.dim != s.dim_out && s.q_stride.is_none())
+        {
+            return Err(Error::Msg(format!(
+                "hiera: block {i} projects to a new width (dim {}→{}) but has no q_stride — q_pool \
+                 ({}) must cover all {} stage transitions so every stage-boundary block also pools",
+                specs[i].dim,
+                specs[i].dim_out,
+                cfg.q_pool,
+                cfg.stages.len().saturating_sub(1),
+            )));
+        }
+        let blocks = specs
             .iter()
             .enumerate()
             .map(|(i, s)| {
@@ -423,7 +444,35 @@ impl Hiera {
 mod tests {
     use super::*;
     use crate::config::Sam2ImageEncoderConfig;
+    use mlx_gen::weights::Weights;
     use mlx_rs::ops::array_eq;
+
+    #[test]
+    fn from_weights_rejects_q_pool_below_stage_transitions() {
+        // F-175: a `q_pool` smaller than the number of stage transitions leaves a projecting
+        // stage-boundary block with `q_stride = None`, which the forward's `q_stride.expect(...)`
+        // would panic on. `from_weights` validates the config before touching weights, so a too-small
+        // `q_pool` is rejected at load with an empty `Weights`.
+        let mut bad = Sam2ImageEncoderConfig::small().hiera; // 4 stages → 3 transitions, q_pool = 3
+        bad.q_pool = 1;
+        let err = match Hiera::from_weights(&Weights::empty(), "", &bad) {
+            Ok(_) => panic!("too-small q_pool must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("q_pool"), "got: {err}");
+
+        // The valid config clears the guard (then fails later loading the missing weights — a
+        // different error), confirming the guard is specific to the invariant.
+        let ok = Sam2ImageEncoderConfig::small().hiera;
+        let err = match Hiera::from_weights(&Weights::empty(), "", &ok) {
+            Ok(_) => panic!("empty weights must fail to load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !err.contains("must cover all"),
+            "valid q_pool should pass the guard; got: {err}"
+        );
+    }
 
     /// The derived per-stage output channels (dim_out at each stage end) must equal the FPN's
     /// `backbone_channel_list` (reversed — list is coarse→fine, stage ends are fine→coarse).
