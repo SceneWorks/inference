@@ -1,6 +1,8 @@
-//! sc-2342: Q4/Q8 quantization parity vs the Python mflux fork (mlx 0.31), which quantizes
-//! via `nn.quantize(model, bits=bits)` at group_size=64. The crate links mlx-rs 0.25 (an
-//! OLDER bundled MLX), so this checks the epic's flagged version-drift risk at two levels:
+//! sc-2342: Q4/Q8 quantization parity vs the Python mflux fork (mlx 0.31.2), which quantizes
+//! via `nn.quantize(model, bits=bits)` at group_size=64. The crate's mlx-rs 0.25 *binding* now
+//! bundles the SAME MLX 0.31.2 C++ as the fork (sc-2782), so the version-drift this gate originally
+//! guarded is closed — it now stands as the packing-parity **tripwire for future MLX bumps**,
+//! checked at two levels:
 //!   * byte-level: the packed `wq` / `scales` / `biases` match exactly;
 //!   * semantic: `dequantize` and `quantized_matmul` agree within tolerance.
 //!
