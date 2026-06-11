@@ -18,7 +18,7 @@ jobs:
     # since MLX's default Metal device is not thread-safe).
     #
     # macos-15 is the newest hosted Apple-Silicon image (no hosted macos-26 exists).
-    # MLX 0.30.6's CPU SIMD does not compile against the SDK-14 headers on macos-14,
+    # MLX 0.31.2's CPU SIMD does not compile against the SDK-14 headers on macos-14,
     # so we build here against SDK 15. The shipping config (.cargo/config.toml) targets
     # macOS 26 / Metal 400 for the NAX fast kernels; that needs SDK >= 26.2, which no
     # hosted runner provides, so CI lowers the deployment target to 15.0 (Metal 320) to
@@ -26,7 +26,10 @@ jobs:
     # requires a macOS-26 self-hosted runner. See sc-2352.
     runs-on: macos-15
     env:
-      # Override the .cargo/config.toml default (26.0); non-forced there so this wins.
+      # Override the .cargo/config.toml default (26.2); non-forced there, so this env wins on the
+      # hosted SDK-15 runner. See .cargo/config.toml for the authoritative 26.2 rationale — do NOT
+      # "reconcile" this to a lower target there (sc-2772: the NAX 16-bit kernels miscompile to
+      # garbage below 26.2).
       MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
       - uses: actions/checkout@v5
