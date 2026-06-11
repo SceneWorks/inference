@@ -7,7 +7,7 @@ multiples of 32. GroupNorm weights/biases are randomized to exercise the affine 
 I/O (mirrors the fork's per-module transpose convention). fp32.
 
 Run from the mflux fork venv:
-    cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_vae_submodules.py
+    cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_z_image_vae_submodules.py
 """
 
 import mlx.core as mx

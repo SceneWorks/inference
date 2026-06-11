@@ -1,6 +1,6 @@
 //! sc-2341: Qwen2-VL image-processor parity vs the fork's `QwenImageProcessor`.
 //!
-//! Fixture `tests/fixtures/qwen_image_processor.safetensors` ← `tools/dump_image_processor.py`
+//! Fixture `tests/fixtures/qwen_image_processor.safetensors` ← `tools/dump_qwen_image_processor.py`
 //! (deterministic synthetic images; input dumped as uint8 HWC so the Rust side feeds identical
 //! pixels with no image-decode dependency). Three cases: no-resize (exact), downscale, upscale.
 //!

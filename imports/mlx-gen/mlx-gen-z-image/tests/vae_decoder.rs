@@ -1,5 +1,5 @@
 //! sc-2344: full VAE decoder-assembly parity vs the fork, plus the `Vae::decode` scale/shift
-//! wrapper. Fixture `tests/fixtures/vae_decoder.safetensors` ← `tools/dump_vae_decoder.py`
+//! wrapper. Fixture `tests/fixtures/vae_decoder.safetensors` ← `tools/dump_z_image_vae_decoder.py`
 //! (small decoder mirroring `Decoder.__call__`: conv_in → mid → 2 up-blocks → norm-out →
 //! SiLU → conv_out). Tol 1e-2 (Metal fp32 convs).
 
