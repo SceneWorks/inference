@@ -196,6 +196,25 @@ impl Chroma {
         let sampler = FlowMatchSampler::new(sigmas);
         let n = sampler.num_steps();
 
+        // Enable the shared `mx.compile` fusion of the DiT's elementwise glue (adaLN modulate + gated
+        // residuals) for the denoise loop, matching FLUX.1/FLUX.2 (F-101/F-102). Process-global +
+        // idempotent; the fused helpers stay bit-exact to the eager ops.
+        crate::transformer::set_compile_glue(true);
+
+        // The RoPE table and the additive `[B,1,S,S]` mask are step-invariant (they depend only on the
+        // token positions / padding, not the timestep), so build them once per branch instead of every
+        // step inside `forward` (F-102).
+        let rope_pos = tr.build_rope_table(&txt_ids_pos, &img_ids)?;
+        let mask_pos2d = ChromaTransformer::attention_mask2d(Some(&mask_pos))?;
+        let neg_prepared = match &cfg {
+            Some((neg_embeds, txt_ids_neg, mask_neg)) => Some((
+                neg_embeds,
+                tr.build_rope_table(txt_ids_neg, &img_ids)?,
+                ChromaTransformer::attention_mask2d(Some(mask_neg))?,
+            )),
+            None => None,
+        };
+
         let mut latents = latents;
         for t in 0..n {
             // Honor the engine cancellation contract every other image provider implements (F-096):
@@ -204,25 +223,27 @@ impl Chroma {
                 return Err(Error::Msg("generation cancelled".into()));
             }
             let ts = Array::from_slice(&[sampler.timestep(t)], &[1]);
-            let pos = tr.forward(
+            // `pooled_temb` (the 5-layer Approximator) depends only on the timestep, so compute it once
+            // per step and share it across both CFG branches instead of recomputing for the negative
+            // branch (F-102).
+            let pooled = tr.pooled_temb(&ts)?;
+            let pos = tr.forward_prepared(
                 &latents,
                 &pos_embeds,
-                &ts,
-                &img_ids,
-                &txt_ids_pos,
-                Some(&mask_pos),
+                &pooled,
+                &rope_pos,
+                mask_pos2d.as_ref(),
             )?;
             // true CFG: neg + g·(pos − neg). At guidance == 1.0 the negative branch is skipped and the
             // prediction is `pos` exactly (no `neg + 1.0·(pos − neg)` f32 round-trip) — F-095.
-            let pred = match &cfg {
-                Some((neg_embeds, txt_ids_neg, mask_neg)) => {
-                    let neg = tr.forward(
+            let pred = match &neg_prepared {
+                Some((neg_embeds, rope_neg, mask_neg2d)) => {
+                    let neg = tr.forward_prepared(
                         &latents,
                         neg_embeds,
-                        &ts,
-                        &img_ids,
-                        txt_ids_neg,
-                        Some(mask_neg),
+                        &pooled,
+                        rope_neg,
+                        mask_neg2d.as_ref(),
                     )?;
                     add(&neg, &multiply(&subtract(&pos, &neg)?, scalar(guidance))?)?
                 }
