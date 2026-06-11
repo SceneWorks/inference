@@ -3,10 +3,13 @@
 //! Rust-native inference for generative **image and video** models on Apple
 //! [MLX](https://github.com/ml-explore/mlx), built on top of `mlx-rs`.
 //!
-//! **Status: name reserved / work in progress — not yet usable.**
+//! **Status: active** — multiple merged, parity-validated provider crates spanning image,
+//! video, identity, and understanding models, consumed in-process as a Rust library.
 //!
-//! Planned families: FLUX / FLUX.2, Qwen-Image, Z-Image (image); Wan2.2, LTX
-//! (video). Adapters: LoRA, LoKr (with stacking), ControlNet.
+//! Families: FLUX.1 / FLUX.2, Chroma, Qwen-Image (+ Edit), SDXL, Kolors, Z-Image,
+//! SenseNova-U1 (image); Wan2.2, LTX-2.3, SVD (video); PuLID-FLUX, InstantID (identity);
+//! JoyCaption, SAM2 (understanding). Adapters: LoRA, LoKr (with stacking), ControlNet,
+//! IP-Adapter. Plus native MLX LoRA/LoKr training and group-wise Q4/Q8 quantization.
 //!
 //! Architecture: a *disciplined hybrid* of the frozen Python mflux fork — see
 //! [`ARCHITECTURE.md`](https://github.com/michaeltrefry/mlx-gen/blob/main/ARCHITECTURE.md).
