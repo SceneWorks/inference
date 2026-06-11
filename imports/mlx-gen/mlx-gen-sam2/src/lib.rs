@@ -25,6 +25,7 @@ pub mod image_encoder;
 pub mod memory;
 pub mod sam_heads;
 pub mod segmenter;
+mod util;
 pub mod video_predictor;
 
 pub use config::{Sam2ImageEncoderConfig, Sam2ModelSize};
