@@ -29,6 +29,7 @@
 use std::path::Path;
 
 use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::gen_core;
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::checkpoint_filename;
@@ -101,7 +102,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
 
 /// Construct the trainer from a snapshot directory (the diffusers multi-component tree). No
 /// quantization — training needs the dense base. Registered via [`TrainerRegistration`].
-pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+pub fn load_trainer(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
@@ -209,7 +210,7 @@ impl Trainer for ZImageTurboTrainer {
         &self.descriptor
     }
 
-    fn validate(&self, req: &TrainingRequest) -> Result<()> {
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         validate_request(req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would resolve
         // to an empty target set — a full-length run that trains zero parameters yet "succeeds"
@@ -229,7 +230,7 @@ impl Trainer for ZImageTurboTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<TrainingOutput> {
+    ) -> gen_core::Result<TrainingOutput> {
         self.validate(req)?;
         let cfg = &req.config;
         on_progress(TrainingProgress::Preparing);

@@ -8,6 +8,7 @@
 //! seeded noise → flow-match Euler denoise over the DiT → VAE decode → RGB8. The chain is
 //! parity-proven against the frozen Python fork on real bf16 weights (sc-2352).
 
+use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
@@ -56,8 +57,10 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "z-image",
+        backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
+            supported_quants: &[],
             // Turbo is guidance-distilled: no CFG, no negative prompt.
             supports_negative_prompt: false,
             supports_guidance: false,
@@ -98,7 +101,7 @@ pub struct ZImageTurbo {
 /// every quantizable Linear (plus the text encoder's token Embedding) so a Q4/Q8 consumer gets the
 /// full memory saving and fork-matching output (sc-2532). An fp32 precision override is not wired
 /// (the validated dense path is bf16) and is rejected rather than silently ignored.
-pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "z_image_turbo: only dense bf16 is wired in the Rust port; the text encoder already \
@@ -150,15 +153,15 @@ impl Generator for ZImageTurbo {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        validate_request(&self.descriptor.capabilities, req)
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
     }
 
     fn generate(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;

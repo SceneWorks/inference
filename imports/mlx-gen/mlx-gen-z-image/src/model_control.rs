@@ -14,6 +14,7 @@
 //! the base transformer at `control_context_scale = 0`, and the full control render matches the
 //! fork's control golden — see `tests/z_control_transformer.rs` and `tests/control_real_weights.rs`.
 
+use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler,
@@ -42,8 +43,10 @@ pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "z-image",
+        backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
+            supported_quants: &[],
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
@@ -80,7 +83,7 @@ pub struct ZImageTurboControl {
 /// or a `Dir` of them). Weights load dense (bf16); `spec.quantize` (Q4/Q8) then quantizes the whole
 /// transformer (base + control, group_size 64) plus the text encoder + VAE — the fork's whole-model
 /// quant, with the control patch embedder left dense (its in-features is not a multiple of 64).
-pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "z_image_turbo_control: only dense bf16 is wired (the text encoder runs f32 \
@@ -161,7 +164,7 @@ impl Generator for ZImageTurboControl {
         &self.descriptor
     }
 
-    fn validate(&self, req: &GenerationRequest) -> Result<()> {
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // Shared capability checks (size/count/guidance/negative/accepted conditioning), then the
         // control-specific requirement that a Control conditioning is present.
         validate_request(&self.descriptor.capabilities, req)?;
@@ -170,7 +173,7 @@ impl Generator for ZImageTurboControl {
             .iter()
             .any(|c| matches!(c, Conditioning::Control { .. }))
         {
-            return Err(Error::Msg(
+            return Err(gen_core::Error::Msg(
                 "z_image_turbo_control requires a Control conditioning (the pose/union skeleton)"
                     .into(),
             ));
@@ -182,7 +185,7 @@ impl Generator for ZImageTurboControl {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;

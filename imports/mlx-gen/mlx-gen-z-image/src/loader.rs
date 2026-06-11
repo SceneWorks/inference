@@ -39,6 +39,7 @@ pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
             pad_to_max_length: true,
         },
     )
+    .map_err(Into::into)
 }
 
 /// Load the Qwen3-style text encoder (prompt → `cap_feats`). The checkpoint keys are prefixed
