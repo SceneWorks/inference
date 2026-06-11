@@ -16,6 +16,10 @@
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::Image;
 
+// The openpose limb stick width — shared with the body-pose renderer rather than redefined here, so
+// there's a single `STICKWIDTH` in the crate (F-086).
+use crate::openpose::STICKWIDTH;
+
 const XY_SHIFT: i64 = 16;
 const XY_ONE: i64 = 1 << XY_SHIFT;
 
@@ -498,7 +502,6 @@ const COLORS: [[u8; 3]; 5] = [
     [255, 255, 0],
     [255, 0, 255],
 ];
-const STICKWIDTH: i32 = 4;
 
 /// Render the InstantID kps control image: a `width × height` RGB [`Image`] from 5 landmarks
 /// `[left_eye, right_eye, nose, mouth_left, mouth_right]` (canvas-space pixel coords). Bit-exact to
