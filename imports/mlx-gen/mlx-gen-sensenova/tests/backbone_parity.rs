@@ -71,6 +71,54 @@ fn check(name: &str, got: &Array, want: &Array) {
     assert!(rel < 5e-3, "{name} peak-rel {rel:.3e} exceeds 5e-3");
 }
 
+/// F-138: a tied-embedding NEO checkpoint has no `lm_head` tensor (config + `expected_keys` already
+/// model this). The backbone must reuse `embed_tokens` as the output projection rather than failing
+/// at construction. Mirror the fixture with its `lm_head` removed and check both branches.
+#[test]
+fn tied_embeddings_build_without_lm_head() {
+    const LM_HEAD: &str = "language_model.lm_head.weight";
+    let full = Weights::from_file(FIXTURE).expect("load fixture");
+
+    // A Weights identical to the fixture but with the `lm_head` tensor removed — a tied checkpoint.
+    let keys: Vec<String> = full.keys().map(|k| k.to_string()).collect();
+    assert!(
+        keys.iter().any(|k| k == LM_HEAD),
+        "fixture should ship an untied lm_head"
+    );
+    let mut tied_w = Weights::empty();
+    for k in &keys {
+        if k != LM_HEAD {
+            tied_w.insert(k.clone(), full.require(k).unwrap().clone());
+        }
+    }
+
+    // Untied (the fixture default) must still require the now-missing lm_head → construction fails.
+    let mut cfg = config_from_meta(&full);
+    assert!(!cfg.tie_word_embeddings);
+    assert!(
+        Qwen3Backbone::from_weights(&tied_w, &cfg, "language_model").is_err(),
+        "untied config must still require an lm_head tensor"
+    );
+
+    // Tied reuses embed_tokens as the output projection → constructs without an lm_head tensor.
+    cfg.tie_word_embeddings = true;
+    let model = Qwen3Backbone::from_weights(&tied_w, &cfg, "language_model")
+        .expect("tied backbone must build without an lm_head tensor");
+
+    // The tied lm_head is functional and projects to the vocab dimension.
+    let vocab = tied_w
+        .require("language_model.model.embed_tokens.weight")
+        .unwrap()
+        .shape()[0];
+    let embeds = full.require("input.embeds").expect("embeds").clone();
+    let (t, h, wid) = index_rows(full.require("und.indexes").unwrap());
+    let hidden = model
+        .forward_path(&embeds, &t, &h, &wid, Path::Und)
+        .unwrap();
+    let logits = model.lm_head(&hidden).unwrap();
+    assert_eq!(*logits.shape().last().unwrap(), vocab);
+}
+
 #[test]
 fn backbone_matches_reference_both_paths() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
