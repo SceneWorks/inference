@@ -379,6 +379,10 @@ impl UpBlock {
     ) -> Result<Array> {
         let mut x = x.clone();
         for (i, r) in self.resnets.iter().enumerate() {
+            // Internal invariant, not a request boundary: the down blocks push exactly one skip per
+            // up-block resnet (the U-Net is symmetric by construction), so for any validly-loaded
+            // model this never underflows. Kept as `expect` — a failure here is a port bug, not bad
+            // input (F-175).
             let skip = skips.pop().expect("up block: skip residual underflow");
             x = concatenate_axis(&[&x, &skip], -1)?;
             x = r.forward(&x, temb, num_frames)?;
