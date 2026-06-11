@@ -1,24 +1,31 @@
-"""sc-3714 — dump the SAM2 video propagation parity golden (init_state / propagate).
+"""sc-3714 / sc-4750 — dump the SAM2 video propagation parity golden (init_state / propagate).
 
 Runs the MLX-native reference video predictor (`avbiswas/sam2-mlx`, the impl `mlx-gen-sam2` ports)
-on a fixed synthetic clip with a first-frame box, and bundles, into one gitignored golden:
+on a fixed synthetic clip with a box prompt, and bundles, into one gitignored golden:
 
   * every weight the Rust port reads (full reference state dict — trunk./neck./sam_*./memory_*./
     obj_ptr_* + the no_* / maskmem_tpos_enc globals),
   * the preprocessed clip `images` [T,3,1024,1024] (so the Rust port consumes byte-identical pixels
     and the comparison isolates the model from any frame-decode/preprocess divergence),
-  * the first-frame box `box_xyxy` [4] (original pixel space), `video_hw` [2], `num_frames`,
+  * the prompt box `box_xyxy` [4] (original pixel space), the `prompt_frame_idx` [1] it sits on,
+    `video_hw` [2], `num_frames`,
   * the reference per-frame **low-res** mask logits `low_res_masks` [T,1,256,256] and the selected
     object-score logits `object_scores` [T,1] — low-res so the parity isolates the model from the
     cv2 video-resolution resize.
 
+Two directions (sc-4750):
+  * **forward** (default) — box on frame 0, `propagate_in_video()` runs 0 → T-1.
+  * **`--reverse`** — box on the *last* frame, `propagate_in_video(reverse=True)` runs T-1 → 0,
+    exercising the reverse memory arithmetic. Written to a `_reverse` golden so the forward golden
+    is untouched.
+
 Both run MLX Metal, so parity is near-bit. The Rust `tests/video_parity.rs` (`#[ignore]`, macOS)
-rebuilds the predictor, runs init_state + add box + propagate on the same clip, and asserts the
-per-frame masks agree (cosine + IoU).
+rebuilds the predictor, runs init_state + add box + propagate{,_reverse} on the same clip, and
+asserts the per-frame masks agree (cosine + IoU).
 
 Run (MLX venv + the reference checkout, both already present):
   PYTHONPATH=/tmp/sam2-mlx/src ~/mlx-flux-venv/bin/python \
-      tools/dump_sam2_video_golden.py --size large
+      tools/dump_sam2_video_golden.py --size large [--reverse]
 """
 
 from __future__ import annotations
@@ -71,8 +78,14 @@ def resolve_checkpoint(size: str) -> str:
     return files[0]
 
 
-def synth_frames() -> tuple[list[np.ndarray], tuple[float, float, float, float]]:
-    """N translating-rectangle RGB uint8 frames + the frame-0 box (x1,y1,x2,y2)."""
+def box_for_frame(t: int) -> tuple[float, float, float, float]:
+    """The tracked rectangle's box (x1,y1,x2,y2) at frame `t`, in original pixel space."""
+    x0 = 40 + t * STEP
+    return (float(x0), float(Y0), float(x0 + RECT_W), float(Y0 + RECT_H))
+
+
+def synth_frames() -> list[np.ndarray]:
+    """N translating-rectangle RGB uint8 frames."""
     frames: list[np.ndarray] = []
     for t in range(N_FRAMES):
         img = np.full((H, W, 3), 30, dtype=np.uint8)
@@ -81,13 +94,17 @@ def synth_frames() -> tuple[list[np.ndarray], tuple[float, float, float, float]]
         # a little texture so the encoder has gradients to latch onto
         img[Y0 + 20 : Y0 + 60, x0 + 20 : x0 + 70] = (90, 140, 220)
         frames.append(img)
-    box = (40.0, float(Y0), 40.0 + RECT_W, float(Y0 + RECT_H))
-    return frames, box
+    return frames
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--size", choices=list(SIZE_CFG), default="large")
+    ap.add_argument(
+        "--reverse",
+        action="store_true",
+        help="prompt the last frame and track backward (propagate_in_video(reverse=True)).",
+    )
     ap.add_argument("--out-dir", default=os.path.join(os.path.dirname(__file__), "golden"))
     args = ap.parse_args()
 
@@ -106,7 +123,7 @@ def main() -> None:
 
     from PIL import Image
 
-    frames, box = synth_frames()
+    frames = synth_frames()
     tmp = tempfile.mkdtemp(prefix="sam2_video_golden_")
     for i, fr in enumerate(frames):
         Image.fromarray(fr).save(os.path.join(tmp, f"{i:04d}.png"))
@@ -114,12 +131,15 @@ def main() -> None:
     state = predictor.init_state(tmp)
     print(f"[init_state] images={state['images'].shape} hw=({state['video_height']},{state['video_width']})")
 
-    predictor.add_new_points_or_box(state, frame_idx=0, obj_id=1, box=box)
+    # Forward: prompt frame 0 and track to the end. Reverse: prompt the last frame and track to 0.
+    prompt_frame_idx = (state["num_frames"] - 1) if args.reverse else 0
+    box = box_for_frame(prompt_frame_idx)
+    predictor.add_new_points_or_box(state, frame_idx=prompt_frame_idx, obj_id=1, box=box)
 
     frame_order: list[int] = []
-    for frame_idx, _obj_ids, _masks in predictor.propagate_in_video(state):
+    for frame_idx, _obj_ids, _masks in predictor.propagate_in_video(state, reverse=args.reverse):
         frame_order.append(int(frame_idx))
-    print(f"[propagate] frames={frame_order}")
+    print(f"[propagate{'_reverse' if args.reverse else ''}] prompt_frame={prompt_frame_idx} frames={frame_order}")
 
     # Pull each frame's stored low-res mask + object score from the per-object output dict.
     out_dict = state["output_dict_per_obj"][0]
@@ -141,6 +161,7 @@ def main() -> None:
     golden.update(
         images=mx.array(np.array(state["images"]).astype(np.float32)),
         box_xyxy=mx.array(np.asarray(box, dtype=np.float32)),
+        prompt_frame_idx=mx.array(np.asarray([prompt_frame_idx], dtype=np.int32)),
         video_hw=mx.array(np.asarray([state["video_height"], state["video_width"]], dtype=np.int32)),
         num_frames=mx.array(np.asarray([state["num_frames"]], dtype=np.int32)),
         low_res_masks=mx.array(low_res_masks),
@@ -149,7 +170,8 @@ def main() -> None:
     mx.eval(list(golden.values()))
 
     os.makedirs(args.out_dir, exist_ok=True)
-    out_path = os.path.join(args.out_dir, f"sam2_video_golden_{args.size}.safetensors")
+    suffix = "_reverse" if args.reverse else ""
+    out_path = os.path.join(args.out_dir, f"sam2_video_golden{suffix}_{args.size}.safetensors")
     mx.save_safetensors(out_path, golden, metadata={"format": "mlx", "size": args.size})
     print(f"[done] wrote {out_path} ({len(golden)} tensors)")
 

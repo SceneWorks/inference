@@ -23,9 +23,23 @@ const GOLDEN: &str = concat!(
     "/../tools/golden/sam2_video_golden_large.safetensors"
 );
 
+const GOLDEN_REVERSE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/sam2_video_golden_reverse_large.safetensors"
+);
+
 fn golden() -> Weights {
     Weights::from_file(GOLDEN).unwrap_or_else(|e| {
         panic!("missing {GOLDEN}: {e}\nRun tools/dump_sam2_video_golden.py --size large first.")
+    })
+}
+
+fn golden_reverse() -> Weights {
+    Weights::from_file(GOLDEN_REVERSE).unwrap_or_else(|e| {
+        panic!(
+            "missing {GOLDEN_REVERSE}: {e}\n\
+             Run tools/dump_sam2_video_golden.py --size large --reverse first."
+        )
     })
 }
 
@@ -110,6 +124,59 @@ fn video_propagation_matches_mlx_reference_large() {
     println!("worst-frame: cosine {worst_cos:.6} IoU {worst_iou:.6}");
 
     // Temporal-consistency GO gate: every frame's mask must closely match the reference track.
+    assert!(worst_cos > 0.99, "worst-frame cosine {worst_cos:.6}");
+    assert!(worst_iou > 0.97, "worst-frame IoU {worst_iou:.6}");
+}
+
+/// sc-4750 — SAM2 **reverse** video propagation parity vs the MLX-native reference predictor
+/// (`propagate_in_video(reverse=True)`). The reverse golden prompts the box on the last frame and
+/// tracks backward to frame 0, so the per-frame masks exercise the reverse memory arithmetic (the
+/// bank pulled from frames *ahead* of the current one). Same near-bit MLX-vs-MLX gate as forward.
+#[test]
+#[ignore = "needs local reverse golden from tools/dump_sam2_video_golden.py --size large --reverse"]
+fn video_reverse_propagation_matches_mlx_reference_large() {
+    let g = golden_reverse();
+
+    // Clip + prompt fixtures from the reverse golden.
+    let images = g.require("images").unwrap().clone(); // [T,3,1024,1024]
+    let hw = flat(g.require("video_hw").unwrap());
+    let (video_h, video_w) = (hw[0] as u32, hw[1] as u32);
+    let bx = flat(g.require("box_xyxy").unwrap());
+    let box_xyxy = [bx[0], bx[1], bx[2], bx[3]];
+    let prompt_frame_idx = flat(g.require("prompt_frame_idx").unwrap())[0] as i32;
+    let t = images.shape()[0];
+
+    let predictor = Sam2VideoPredictor::from_weights_for_size(&g, Sam2ModelSize::Large).unwrap();
+    let mut state = predictor.init_state_from_pixels(images, video_h, video_w);
+    predictor
+        .add_new_box(&mut state, prompt_frame_idx, box_xyxy)
+        .unwrap();
+    let results = predictor.propagate_reverse(&mut state).unwrap();
+    // Prompted on the last frame, reverse tracks every frame down to 0 ⇒ all T frames.
+    assert_eq!(results.len(), t as usize, "reverse-propagated frame count");
+
+    // Reference per-frame low-res logits, [T,1,256,256].
+    let want = g.require("low_res_masks").unwrap().clone();
+
+    let mut worst_cos = f32::INFINITY;
+    let mut worst_iou = f32::INFINITY;
+    for (frame_idx, low) in &results {
+        let got = flat(low);
+        let ref_frame = want
+            .take_axis(Array::from_int(*frame_idx), 0)
+            .unwrap()
+            .reshape(&[256 * 256])
+            .unwrap();
+        let want_v = flat(&ref_frame);
+        let c = cosine(&got, &want_v);
+        let i = iou(&got, &want_v);
+        println!("frame {frame_idx}: cosine {c:.6} IoU {i:.6}");
+        worst_cos = worst_cos.min(c);
+        worst_iou = worst_iou.min(i);
+    }
+    println!("worst-frame: cosine {worst_cos:.6} IoU {worst_iou:.6}");
+
+    // Temporal-consistency GO gate: every reverse-tracked frame must match the reference track.
     assert!(worst_cos > 0.99, "worst-frame cosine {worst_cos:.6}");
     assert!(worst_iou > 0.97, "worst-frame IoU {worst_iou:.6}");
 }
