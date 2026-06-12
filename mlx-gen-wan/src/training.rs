@@ -838,12 +838,17 @@ fn sample_band_timestep(
 /// resident across the MoE alternation) plus the active expert's working set:
 ///   `peak = n_experts · resident_per_expert + working_set(tokens)`.
 ///
-/// CALIBRATED from `first_step_repro::first_step_peak_sweep` on the converted **T2V-A14B bf16**
+/// CALIBRATED from `first_step_repro::first_step_peak_sweep_t2v` on the converted **T2V-A14B bf16**
 /// (dim 5120, 40 layers): one expert resident ≈ 27 GB; dense working set ≈ 10.3 + 0.0177·L GB
 /// (L=256/576/1024 → 14.8/20.6/28.4 GB). The resident scales ~ params (∝ dim²·layers) and the working
 /// set ∝ dim·layers, so the fit extrapolates to the I2V-A14B (same size) and the smaller dense
 /// TI2V-5B (the A14B is the exact anchor; the 5B/quantized scalings are estimates → the guard is
 /// conservative there, which is the safe direction). Refit the anchors if the sweep changes.
+///
+/// sc-4972 — CONFIRMED on the other two variants' real weights (`projection_matches_measured_curve` +
+/// `first_step_peak_sweep_{i2v,ti2v_5b}`): the I2V-A14B single-expert curve is bit-for-bit the T2V
+/// anchor (same dim/layers), and the TI2V-5B extrapolation lands within ~2 GB of the measured
+/// 13.66/14.56/15.88 GB (edge 256/384/512); the guard stays conservative for the 5B (see below).
 fn projected_dense_peak_gb(tokens: f64, dim: usize, n_layers: usize, n_experts: usize) -> f64 {
     let param_scale = (dim * dim * n_layers) as f64 / (5120.0 * 5120.0 * 40.0);
     let resident = n_experts as f64 * 27.0 * param_scale;
@@ -855,6 +860,12 @@ fn projected_dense_peak_gb(tokens: f64, dim: usize, n_layers: usize, n_experts: 
 /// The DiT token count for a still-image (single-frame) training latent at pixel `edge`: the VAE
 /// downscales ×8, then the patchifier divides by `(ph, pw)` (frames `F = 1` / `pt`). `L = (edge/8/ph)·
 /// (edge/8/pw)`.
+///
+/// NOTE (sc-4972): the ×8 is the z16 14B VAE (T2V/I2V). The z48 TI2V-5B VAE downscales ×16, so this
+/// OVERESTIMATES the 5B's true L by 4× — which only feeds the OOM `preflight_memory_guard`, where an
+/// overcount keeps the projection conservatively above the true peak (the safe direction; the measured
+/// 5B peaks confirm this — see `projected_dense_peak_gb`). Make it `cfg`-stride-aware before reusing
+/// it anywhere correctness (not just a safety bound) depends on the exact token count.
 fn training_tokens(cfg: &WanModelConfig, edge: u32) -> f64 {
     let (_pt, ph, pw) = cfg.patch_size;
     let le = (edge / 8).max(1) as usize;
@@ -927,14 +938,47 @@ mod first_step_repro {
     const RANK: i32 = 8;
     const ALPHA: f32 = 8.0;
 
-    /// The converted T2V-A14B bf16 MoE snapshot (the harness's reference variant — dual-expert, the
-    /// widest DiT; exercises every lever). `$WAN_A14B_MODEL_DIR` overrides.
-    fn snapshot() -> PathBuf {
-        if let Ok(p) = std::env::var("WAN_A14B_MODEL_DIR") {
-            return PathBuf::from(p);
+    /// Which converted bf16 Wan variant the harness drives. T2V-A14B is the reference (widest DiT,
+    /// dual-expert); sc-4972 adds I2V-A14B (channel-concat in_dim 36) and the dense TI2V-5B (z48
+    /// vae22, 30 layers) so grad parity + the first-step peak are confirmed on each variant's own
+    /// real weights, not just extrapolated from T2V.
+    #[derive(Clone, Copy)]
+    enum Variant {
+        T2v,
+        I2v,
+        Ti2v5b,
+    }
+
+    impl Variant {
+        fn descriptor(self) -> TrainerDescriptor {
+            match self {
+                Variant::T2v => descriptor_t2v_14b(),
+                Variant::I2v => descriptor_i2v_14b(),
+                Variant::Ti2v5b => descriptor_ti2v_5b(),
+            }
         }
-        PathBuf::from(std::env::var("HOME").unwrap())
-            .join(".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16")
+
+        /// The converted snapshot dir; `$<ENV>` overrides, else the mlx-gen model cache default.
+        fn snapshot(self) -> PathBuf {
+            let (env, default) = match self {
+                Variant::T2v => (
+                    "WAN_A14B_MODEL_DIR",
+                    ".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16",
+                ),
+                Variant::I2v => (
+                    "WAN_I2V_A14B_MODEL_DIR",
+                    ".cache/mlx-gen-models/wan2_2_i2v_a14b_mlx_bf16",
+                ),
+                Variant::Ti2v5b => (
+                    "WAN_TI2V_5B_MODEL_DIR",
+                    ".cache/mlx-gen-models/wan_2_2_ti2v_5b_mlx_bf16",
+                ),
+            };
+            if let Ok(p) = std::env::var(env) {
+                return PathBuf::from(p);
+            }
+            PathBuf::from(std::env::var("HOME").unwrap()).join(default)
+        }
     }
 
     fn swatch(edge: u32) -> Image {
@@ -957,16 +1001,18 @@ mod first_step_repro {
     /// expert), build its LoRA targets, encode one caption to a cached bf16 context, then free the UMT5
     /// TE + tokenizer — so the measured peaks reflect the post-free single-expert training working set.
     #[allow(clippy::type_complexity)]
-    fn build() -> (
+    fn build(
+        variant: Variant,
+    ) -> (
         WanMoeTrainer,
         TrainAdapter,
         LoraParams,
         Array,
         Vec<Vec<BlockLoraRef>>,
     ) {
-        let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-        let mut trainer = build_trainer_concrete(&spec, descriptor_t2v_14b())
-            .expect("converted Wan2.2-T2V-A14B bf16 snapshot ($WAN_A14B_MODEL_DIR or the cache)");
+        let spec = LoadSpec::new(WeightsSource::Dir(variant.snapshot()));
+        let mut trainer = build_trainer_concrete(&spec, variant.descriptor())
+            .expect("converted Wan2.2 bf16 snapshot ($WAN_*_MODEL_DIR or the cache)");
         // Encode one context with expert 0, then keep only expert 0 + free the TE.
         let ctx = {
             let te = trainer.text_encoder.as_ref().unwrap();
@@ -989,7 +1035,11 @@ mod first_step_repro {
             build_lora_targets(&mut trainer.experts[0], &target_paths, RANK, 7).unwrap();
         let block_targets = group_block_targets(&target_paths, trainer.experts[0].num_blocks());
         eprintln!(
-            "[sc-4942] loaded Wan T2V-A14B trainer (1 expert, TE freed); {} LoRA targets; ctx {:?}",
+            "[sc-4942] loaded Wan trainer ({}, 1 expert, TE freed); in_dim {} vae_z {} → y_channels {}; {} LoRA targets; ctx {:?}",
+            trainer.descriptor.id,
+            trainer.cfg.in_dim,
+            trainer.cfg.vae_z_dim,
+            (trainer.cfg.in_dim as i32 - trainer.cfg.vae_z_dim as i32).max(0),
             target_paths.len(),
             ctx.shape()
         );
@@ -1028,6 +1078,8 @@ mod first_step_repro {
             None
         };
 
+        // I2V-A14B concatenates a zero `y` (in_dim 36 = latent 16 + y 20); T2V/5B have in_dim == z.
+        let y_channels = (trainer.cfg.in_dim as i32 - trainer.cfg.vae_z_dim as i32).max(0);
         clear_cache();
         reset_peak_memory();
         let before = get_active_memory();
@@ -1043,7 +1095,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
-            0, // T2V: no channel-concat y
+            y_channels,
             ck,
         )?;
         eval(grads.values())?;
@@ -1081,6 +1133,7 @@ mod first_step_repro {
         } else {
             None
         };
+        let y_channels = (trainer.cfg.in_dim as i32 - trainer.cfg.vae_z_dim as i32).max(0);
         let (_l, g) = compute_loss_grads(
             &mut trainer.experts[0],
             adapter,
@@ -1092,7 +1145,7 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
-            0,
+            y_channels,
             ck,
         )
         .unwrap();
@@ -1111,53 +1164,82 @@ mod first_step_repro {
         max_rel
     }
 
-    /// sc-4942 — attention-segment checkpointing must not change the math: grads with the SDPA
-    /// checkpoint on must match the retained backward (flag off). Bit-identical recompute.
-    #[test]
-    #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process"]
-    fn attn_ckpt_grads_match_retained() {
-        let (mut t, adapter, params, ctx, bt) = build();
+    /// sc-4942/sc-4972 — attention-segment checkpointing must not change the math on `variant`'s real
+    /// weights: grads with the SDPA checkpoint on must match the retained backward (flag off).
+    /// Bit-identical recompute.
+    fn check_attn_ckpt(variant: Variant) {
+        let (mut t, adapter, params, ctx, bt) = build(variant);
         let edge = 256u32;
         t.experts[0].set_sdpa_checkpoint(false);
         let g_retained = grads_of(&mut t, &adapter, &params, &ctx, &bt, edge, false);
         t.experts[0].set_sdpa_checkpoint(true);
         let g_ckpt = grads_of(&mut t, &adapter, &params, &ctx, &bt, edge, false);
         let max_rel = max_rel_diff(&g_retained, &g_ckpt);
-        eprintln!("[sc-4942] attn-ckpt-vs-retained grad max relative diff: {max_rel:.2e}");
+        eprintln!("[sc-4972] attn-ckpt-vs-retained grad max relative diff: {max_rel:.2e}");
         assert!(
             max_rel < 1e-5,
             "attention-segment checkpointing must not change grads: max rel {max_rel:.2e}"
         );
     }
 
-    /// sc-4942 — block (gradient) checkpointing must match the dense path within fp tolerance (same
-    /// install + block forward, recompute-only). Also guards the multi-output-VJP duplicate-cotangent
-    /// trap (each checkpoint returns one distinct array).
     #[test]
     #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process"]
-    fn block_ckpt_grads_match_dense() {
-        let (mut t, adapter, params, ctx, bt) = build();
+    fn attn_ckpt_grads_match_retained_t2v() {
+        check_attn_ckpt(Variant::T2v);
+    }
+    #[test]
+    #[ignore = "needs the converted Wan2.2-I2V-A14B bf16 checkpoint; run as its own process"]
+    fn attn_ckpt_grads_match_retained_i2v() {
+        check_attn_ckpt(Variant::I2v);
+    }
+    #[test]
+    #[ignore = "needs the converted Wan2.2-TI2V-5B bf16 checkpoint; run as its own process"]
+    fn attn_ckpt_grads_match_retained_ti2v_5b() {
+        check_attn_ckpt(Variant::Ti2v5b);
+    }
+
+    /// sc-4942/sc-4972 — block (gradient) checkpointing must match the dense path within fp tolerance
+    /// on `variant`'s real weights (same install + block forward, recompute-only). Also guards the
+    /// multi-output-VJP duplicate-cotangent trap (each checkpoint returns one distinct array).
+    fn check_block_ckpt(variant: Variant) {
+        let (mut t, adapter, params, ctx, bt) = build(variant);
         let edge = 256u32;
         t.experts[0].set_sdpa_checkpoint(true);
         let g_dense = grads_of(&mut t, &adapter, &params, &ctx, &bt, edge, false);
         t.experts[0].set_sdpa_checkpoint(false);
         let g_ckpt = grads_of(&mut t, &adapter, &params, &ctx, &bt, edge, true);
         let max_rel = max_rel_diff(&g_dense, &g_ckpt);
-        eprintln!("[sc-4942] block-ckpt-vs-dense grad max relative diff: {max_rel:.2e}");
+        eprintln!("[sc-4972] block-ckpt-vs-dense grad max relative diff: {max_rel:.2e}");
         assert!(
             max_rel < 5e-3,
             "block checkpointing must match dense within tolerance: max rel {max_rel:.2e}"
         );
     }
 
-    /// sc-4942 — first-step peak sweep (attention-segment checkpointing on), plus a block-ckpt point.
-    /// Calibrates the `projected_dense_peak_gb` guard fit — refit if these print materially different.
     #[test]
-    #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process (may SIGKILL)"]
-    fn first_step_peak_sweep() {
-        let (mut t, adapter, params, ctx, bt) = build();
+    #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process"]
+    fn block_ckpt_grads_match_dense_t2v() {
+        check_block_ckpt(Variant::T2v);
+    }
+    #[test]
+    #[ignore = "needs the converted Wan2.2-I2V-A14B bf16 checkpoint; run as its own process"]
+    fn block_ckpt_grads_match_dense_i2v() {
+        check_block_ckpt(Variant::I2v);
+    }
+    #[test]
+    #[ignore = "needs the converted Wan2.2-TI2V-5B bf16 checkpoint; run as its own process"]
+    fn block_ckpt_grads_match_dense_ti2v_5b() {
+        check_block_ckpt(Variant::Ti2v5b);
+    }
+
+    /// sc-4942/sc-4972 — first-step peak sweep (attention-segment checkpointing on), plus block-ckpt
+    /// points. Calibrates the `projected_dense_peak_gb` guard fit per variant — refit the anchors if
+    /// these print materially different. The harness keeps ONE expert resident (build() truncates), so
+    /// the printed peak is the single-expert working set; the projection scales `n_experts` resident.
+    fn run_peak_sweep(variant: Variant) {
+        let (mut t, adapter, params, ctx, bt) = build(variant);
         t.experts[0].set_sdpa_checkpoint(true);
-        eprintln!("[sc-4942] attn-ckpt dense sweep (bf16-native):");
+        eprintln!("[sc-4972] attn-ckpt dense sweep (bf16-native):");
         for edge in [256u32, 384, 512] {
             let _ = one_step(
                 &mut t,
@@ -1171,7 +1253,7 @@ mod first_step_repro {
             )
             .map_err(|e| eprintln!("  edge {edge} CATCHABLE error: {e}"));
         }
-        eprintln!("[sc-4942] block-ckpt:");
+        eprintln!("[sc-4972] block-ckpt:");
         t.experts[0].set_sdpa_checkpoint(false);
         for edge in [384u32, 512] {
             let _ = one_step(&mut t, &adapter, &params, &ctx, &bt, edge, true, "blk-ckpt")
@@ -1179,9 +1261,36 @@ mod first_step_repro {
         }
     }
 
+    #[test]
+    #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process (may SIGKILL)"]
+    fn first_step_peak_sweep_t2v() {
+        run_peak_sweep(Variant::T2v);
+    }
+    #[test]
+    #[ignore = "needs the converted Wan2.2-I2V-A14B bf16 checkpoint; run as its own process (may SIGKILL)"]
+    fn first_step_peak_sweep_i2v() {
+        run_peak_sweep(Variant::I2v);
+    }
+    #[test]
+    #[ignore = "needs the converted Wan2.2-TI2V-5B bf16 checkpoint; run as its own process"]
+    fn first_step_peak_sweep_ti2v_5b() {
+        run_peak_sweep(Variant::Ti2v5b);
+    }
+
     /// sc-4942 — the empirical fit must reproduce the measured A14B peak (the basis of the pre-flight
     /// OOM guard) and stay monotonic / ordered across variants. Measured anchor (T2V-A14B, one expert,
     /// edge 512 → L=1024): 55.4 GB.
+    ///
+    /// sc-4972 — confirmed on the OTHER two variants' own real weights (first_step_peak_sweep_{i2v,
+    /// ti2v_5b}, one resident expert):
+    ///   * **I2V-A14B** (dim 5120, 40 layers) edge 256/384/512 → L 256/576/1024 → 41.80/47.58/55.41 GB,
+    ///     i.e. *bit-for-bit the T2V curve* (same DiT; the in_dim-36 zero-`y` concat is negligible) —
+    ///     the A14B anchor IS the I2V anchor.
+    ///   * **TI2V-5B** (dim 3072, 30 layers, z48 VAE ×16) edge 256/384/512 → L 64/144/256 →
+    ///     13.66/14.56/15.88 GB. The dim²·layers / dim·layers extrapolation lands within ~2 GB of each
+    ///     (slightly under at the true L). The guard reaches the fit through `training_tokens`, which
+    ///     treats every VAE as ×8 (true for the z16 14B, ×16-coarse for the z48 5B) → it feeds L 4×
+    ///     too large, so the guard projection sits *above* the true peak (the safe direction).
     #[test]
     fn projection_matches_measured_curve() {
         // A14B one-expert at L=1024 = the measured 55.4 GB anchor.
@@ -1193,6 +1302,21 @@ mod first_step_repro {
         // A14B sweep points (working set 14.8/20.6 GB at L=256/576 + 27 resident).
         assert!((projected_dense_peak_gb(256.0, 5120, 40, 1) - 41.8).abs() < 1.5);
         assert!((projected_dense_peak_gb(576.0, 5120, 40, 1) - 47.6).abs() < 1.5);
+        // sc-4972 — I2V-A14B: same dim/layers ⇒ the fit reproduces the measured 41.80/47.58/55.41 GB.
+        assert!((projected_dense_peak_gb(256.0, 5120, 40, 1) - 41.80).abs() < 1.0);
+        assert!((projected_dense_peak_gb(576.0, 5120, 40, 1) - 47.58).abs() < 1.0);
+        assert!((projected_dense_peak_gb(1024.0, 5120, 40, 1) - 55.41).abs() < 1.0);
+        // sc-4972 — TI2V-5B: the fit at the TRUE 5B token counts (L=64/144/256) is within ~2 GB of the
+        // measured 13.66/14.56/15.88 GB single-expert peaks.
+        assert!((projected_dense_peak_gb(64.0, 3072, 30, 1) - 13.66).abs() < 2.0);
+        assert!((projected_dense_peak_gb(144.0, 3072, 30, 1) - 14.56).abs() < 2.0);
+        assert!((projected_dense_peak_gb(256.0, 3072, 30, 1) - 15.88).abs() < 2.0);
+        // sc-4972 — and the guard's `training_tokens` path (5B fed L=1024 at edge 512, the ×8 overcount)
+        // stays conservatively ABOVE the true 15.88 GB peak — the safe direction for an OOM guard.
+        assert!(
+            projected_dense_peak_gb(1024.0, 3072, 30, 1) > 15.88,
+            "5B guard projection must bound the measured peak conservatively"
+        );
         // Monotonic in tokens; dual-expert adds a second resident; the dense 5B is much smaller.
         assert!(
             projected_dense_peak_gb(256.0, 5120, 40, 1)
@@ -1212,7 +1336,7 @@ mod first_step_repro {
     #[test]
     #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process"]
     fn block_ckpt_reduces_peak_vs_dense() {
-        let (mut t, adapter, params, ctx, bt) = build();
+        let (mut t, adapter, params, ctx, bt) = build(Variant::T2v);
         t.experts[0].set_sdpa_checkpoint(true);
         let (_, dense_peak) =
             one_step(&mut t, &adapter, &params, &ctx, &bt, 512, false, "dense").expect("dense");
