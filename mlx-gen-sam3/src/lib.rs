@@ -21,6 +21,7 @@ pub mod mask;
 pub mod model;
 pub mod text;
 pub mod tracker;
+pub mod video;
 pub mod vision;
 
 pub use config::{Sam3DetrConfig, Sam3TextConfig, Sam3VisionConfig};
@@ -29,4 +30,5 @@ pub use mask::{post_process_instances, Instance, Sam3MaskHead};
 pub use model::{Sam3ImageSegmenter, SegmentationOutput};
 pub use text::{Sam3TextEncoder, Sam3Tokenizer};
 pub use tracker::{MemoryFeatures, Sam3Tracker, TrackerFrameOutput, TrackerMask};
+pub use video::{Sam3VideoModel, VideoFrameOutput};
 pub use vision::Sam3VisionEncoder;
