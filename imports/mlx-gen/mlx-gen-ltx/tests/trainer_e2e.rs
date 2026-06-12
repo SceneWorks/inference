@@ -174,3 +174,71 @@ fn ltx_trainer_trains_and_writes_lora_that_reloads() {
     assert!(s.is_finite(), "reloaded-LoRA forward should be finite");
     println!("[ltx-lora] e2e OK — {n_targets} targets reload, forward finite");
 }
+
+/// sc-4942 — the gradient-checkpointing (block-recompute) training path drives the loss down and
+/// writes a reloadable LoRA, exactly like the dense path. The block-checkpoint forward is recompute-
+/// only (grads bit-identical to dense — proven by the `block_ckpt_grads_match_dense` first-step gate),
+/// so a converging run here confirms the whole optimizer loop is wired correctly through it.
+#[test]
+#[ignore = "needs real LTX-2.3 + Gemma weights"]
+fn ltx_trainer_trains_with_gradient_checkpointing() {
+    let tmp = std::env::temp_dir().join("ltx_trainer_e2e_ckpt");
+    let items = make_dataset(&tmp);
+
+    let mut trainer =
+        mlx_gen::load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+            .expect("ltx_2_3 trainer should be registered");
+
+    let config = TrainingConfig {
+        rank: 8,
+        alpha: 8.0,
+        learning_rate: 1e-4,
+        steps: 32,
+        resolution: 256,
+        save_every: 0,
+        seed: 7,
+        network_type: NetworkType::Lora,
+        gradient_checkpointing: true, // the lever under test
+        ..Default::default()
+    };
+    let req = TrainingRequest {
+        items,
+        config,
+        output_dir: tmp.join("out"),
+        file_name: "swatch_lora_ckpt.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut losses: Vec<f32> = Vec::new();
+    let mut cached = 0u32;
+    let out = trainer
+        .train(&req, &mut |p| match p {
+            TrainingProgress::Caching { current, .. } => cached = current,
+            TrainingProgress::Training { loss, .. } => losses.push(loss),
+            _ => {}
+        })
+        .expect("gradient-checkpointed training should succeed");
+
+    assert_eq!(cached, 2);
+    assert_eq!(out.steps, 32);
+    assert!(losses.iter().all(|l| l.is_finite()), "no NaN/Inf losses");
+    let q = losses.len() / 4;
+    let mean = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
+    let (first_q, last_q) = (mean(&losses[..q]), mean(&losses[losses.len() - q..]));
+    println!(
+        "[ltx-lora-ckpt] cached {cached}; steps {}; loss-mean first-quarter {first_q:.5} -> last-quarter {last_q:.5}",
+        out.steps
+    );
+    assert!(
+        last_q < first_q * 0.9,
+        "gradient-checkpointed loss-mean should fall on real data: {first_q:.5} -> {last_q:.5}"
+    );
+    assert!(out.adapter_path.exists(), "adapter file should be written");
+    let w = Weights::from_file(&out.adapter_path).unwrap();
+    assert!(
+        w.keys().any(|k| k.ends_with(".attn1.to_q.lora_A.weight")),
+        "checkpointed run should still write the attention LoRA keys"
+    );
+    println!("[ltx-lora-ckpt] e2e OK — gradient-checkpointed training converged + saved");
+}

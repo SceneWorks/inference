@@ -26,15 +26,17 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::array::scalar;
+use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
-use mlx_rs::error::Exception;
+use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
     add, broadcast_to, concatenate_axis, cos, multiply, power, sigmoid, sin, split, tanh,
 };
+use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
@@ -154,6 +156,7 @@ fn ln(x: &Array, eps: f32) -> Result<Array> {
     Ok(layer_norm(x, None, None, eps)?)
 }
 
+#[derive(Clone)]
 struct SelfAttention {
     q: AdaptableLinear,
     k: AdaptableLinear,
@@ -165,6 +168,10 @@ struct SelfAttention {
     head_dim: usize,
     scale: f32,
     eps: f32,
+    /// sc-4942 — run the SDPA segment inside an `mlx::checkpoint` so its backward recomputes the
+    /// decomposed attention (MLX has no fused SDPA backward) instead of retaining the per-layer seq²
+    /// probability matrix. Training-only; `false` on the inference path (byte-identical).
+    ckpt_sdpa: bool,
 }
 
 impl SelfAttention {
@@ -182,6 +189,7 @@ impl SelfAttention {
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
             eps: cfg.eps as f32,
+            ckpt_sdpa: false,
         })
     }
 
@@ -237,12 +245,38 @@ impl SelfAttention {
             .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let out = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+        let out = sdpa_maybe_checkpoint(&q, &k, &v, self.scale, self.ckpt_sdpa)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
+
+    /// Toggle SDPA-segment checkpointing (sc-4942). Training-only — see `ckpt_sdpa`.
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.ckpt_sdpa = on;
+    }
 }
 
+/// Run `scaled_dot_product_attention`, optionally inside an `mlx::checkpoint` segment (sc-4942). When
+/// `ckpt` is on, q/k/v are the threaded inputs (grads to the QKV projections — and their LoRA — flow
+/// through them) and only the f32 `scale` is captured; the backward recomputes the decomposed
+/// attention for this layer alone, so the seq² probability matrix is a per-layer transient rather than
+/// retained across all blocks. `ckpt = false` is byte-identical to the bare call (inference).
+fn sdpa_maybe_checkpoint(q: &Array, k: &Array, v: &Array, scale: f32, ckpt: bool) -> Result<Array> {
+    if !ckpt {
+        return Ok(scaled_dot_product_attention(q, k, v, scale, None, None)?);
+    }
+    let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+        Ok(vec![scaled_dot_product_attention(
+            &inp[0], &inp[1], &inp[2], scale, None, None,
+        )?])
+    });
+    Ok(seg(&[q.clone(), k.clone(), v.clone()])?
+        .into_iter()
+        .next()
+        .expect("one sdpa output"))
+}
+
+#[derive(Clone)]
 struct CrossAttention {
     q: AdaptableLinear,
     k: AdaptableLinear,
@@ -254,6 +288,8 @@ struct CrossAttention {
     head_dim: usize,
     scale: f32,
     eps: f32,
+    /// sc-4942 — SDPA-segment checkpointing (training-only). See [`SelfAttention::ckpt_sdpa`].
+    ckpt_sdpa: bool,
 }
 
 impl CrossAttention {
@@ -271,7 +307,13 @@ impl CrossAttention {
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
             eps: cfg.eps as f32,
+            ckpt_sdpa: false,
         })
+    }
+
+    /// Toggle SDPA-segment checkpointing (sc-4942). Training-only — see [`SelfAttention::ckpt_sdpa`].
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.ckpt_sdpa = on;
     }
 
     /// Quantize the four projections to Q4/Q8 in place (`_quantize_predicate`'s `.cross_attn.{q,k,v,o}`).
@@ -320,12 +362,13 @@ impl CrossAttention {
         let q = rms_norm(&self.q.forward(&bf16(x)?)?, &self.norm_q, self.eps)?
             .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let out = scaled_dot_product_attention(&q, &kv.0, &kv.1, self.scale, None, None)?;
+        let out = sdpa_maybe_checkpoint(&q, &kv.0, &kv.1, self.scale, self.ckpt_sdpa)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
 }
 
+#[derive(Clone)]
 struct Block {
     modulation: Array, // [1, 6, dim]
     self_attn: SelfAttention,
@@ -378,6 +421,12 @@ impl Block {
         self.cross_attn.prepare_kv(context)
     }
 
+    /// Toggle SDPA-segment checkpointing on both attentions (sc-4942).
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.self_attn.set_sdpa_checkpoint(on);
+        self.cross_attn.set_sdpa_checkpoint(on);
+    }
+
     /// `x`: `[B, L, dim]` (f32, `B` = CFG batch). `e`: `[1, L_e, 6, dim]` f32 time modulation —
     /// `L_e = 1` for the **scalar** timestep (T2V; broadcasts over both tokens and the CFG batch),
     /// `L_e = L` for the **per-token** timestep (TI2V mask-blend `t_tokens`, sc-2680; broadcasts over
@@ -416,6 +465,17 @@ impl Block {
         let y = self.ffn_fc2.forward(&y)?;
         gated(&x, &y, &e5)
     }
+}
+
+/// A per-block trainable LoRA target threaded into the gradient-checkpoint closure (sc-4942): the
+/// block-local resolution path (e.g. `["self_attn", "q"]` or `["ffn", "fc1"]`) and the factor-map keys
+/// for its A/B, so [`WanTransformer::forward_train_checkpointed`] can pull each block's live factors
+/// out of the traced `LoraParams` and re-install them inside the recompute segment. Built by the
+/// trainer from its resolved target paths.
+pub struct BlockLoraRef {
+    pub local: Vec<String>,
+    pub a_key: String,
+    pub b_key: String,
 }
 
 /// The Wan DiT (5B dense T2V). Holds the loaded weights + the precomputed RoPE table.
@@ -521,6 +581,126 @@ impl WanTransformer {
     /// Number of transformer blocks (for the trainer's target enumeration).
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing across the whole block stack (sc-4942) — both the
+    /// self- and cross-attention SDPA of every block. The trainer arms it for the dense training
+    /// forward (numerically identical to the retained backward; bounds the per-block seq² retention to
+    /// one layer's transient) and turns it OFF when whole-block checkpointing is on (the block recompute
+    /// already covers attention). Inference never calls this (the flag stays `false`).
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for b in &mut self.blocks {
+            b.set_sdpa_checkpoint(on);
+        }
+    }
+
+    /// The DiT's current compute dtype (sc-4942), probed from the patch-embedding weight. Wan is
+    /// **bf16-native** — the converted checkpoint loads bf16 and every matmul already runs bf16 (with an
+    /// f32 residual stream), so this reports `Bfloat16` and the worker's `train_dtype=bf16` is honored
+    /// by the load itself (no cast lever, unlike the f32-base families). Lets the trainer confirm the
+    /// base precision (`None` if the patch embedding were ever quantized, which it is not — it is one of
+    /// the precision-sensitive dense Linears the reference never packs).
+    pub fn compute_dtype(&self) -> Option<Dtype> {
+        self.patch_embedding.weight_dtype()
+    }
+
+    /// Training forward with **per-block gradient checkpointing** (sc-4942). Identical compute to
+    /// [`forward`](Self::forward) at `batch = 1`, but each block runs inside an `mlx::checkpoint`
+    /// segment whose explicit inputs are the block hidden state plus that block's trainable LoRA factors
+    /// — so the reverse pass recomputes the block (including its cross-attention K/V from the threaded
+    /// context constant) instead of retaining its activations, while gradients still flow to the LoRA
+    /// params. The patchify/embed, time embedding, RoPE, and output head run normally.
+    ///
+    /// `params` is the live (traced) factor map; `block_targets[i]` lists block `i`'s trainable targets
+    /// (block-local path + factor keys), in the order their factors are threaded as checkpoint inputs.
+    /// Factors install at their f32 master dtype (matching the dense `install_training_lora_as` path),
+    /// so the recompute is numerically identical. Returns the denoised `[out_dim, F, H, W]` (f32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_train_checkpointed(
+        &self,
+        latent: &Array,
+        t: f32,
+        context_embed: &Array,
+        params: &LoraParams,
+        block_targets: &[Vec<BlockLoraRef>],
+        alpha: f32,
+    ) -> Result<Array> {
+        let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
+        let l = (grid.0 * grid.1 * grid.2) as i32;
+        let dim = self.cfg.dim as i32;
+        let mut x = bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[1, l, dim])?;
+        let (e, e0) = self.time_embed(t)?;
+        let (cos_t, sin_t) = self.prepare_rope(grid)?;
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            // Cheap clone (Arrays are refcounted): the closure must OWN its state because the backward
+            // recompute runs after this frame is gone; a borrow of `self` would dangle.
+            let mut blk = block.clone();
+            let empty: Vec<BlockLoraRef> = Vec::new();
+            let refs = block_targets.get(i).unwrap_or(&empty);
+            let locals: Vec<Vec<String>> = refs.iter().map(|r| r.local.clone()).collect();
+            let context_c = context_embed.clone();
+            let e0_c = e0.clone();
+            let cos_c = cos_t.clone();
+            let sin_c = sin_t.clone();
+            let alpha_c = alpha;
+
+            // Threaded inputs: [hidden, a_0, b_0, a_1, b_1, ...] (raw `[r,in]`/`[out,r]` f32 factors).
+            let mut inputs: Vec<Array> = Vec::with_capacity(1 + 2 * refs.len());
+            inputs.push(x.clone());
+            for r in refs {
+                inputs.push(
+                    params
+                        .get(r.a_key.as_str())
+                        .ok_or_else(|| {
+                            mlx_gen::Error::Msg(format!("LoRA param missing: {}", r.a_key))
+                        })?
+                        .clone(),
+                );
+                inputs.push(
+                    params
+                        .get(r.b_key.as_str())
+                        .ok_or_else(|| {
+                            mlx_gen::Error::Msg(format!("LoRA param missing: {}", r.b_key))
+                        })?
+                        .clone(),
+                );
+            }
+
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                // Reinstall the explicit-input factors with the SAME `(transpose, alpha/rank fold)`
+                // `install_training_lora_as` applies (dtype=None → factors stay f32), so the
+                // checkpointed block forward is numerically identical to the installed-adapter path and
+                // grads route to `inp`.
+                for (j, local) in locals.iter().enumerate() {
+                    let a = inp[1 + 2 * j].t(); // [r,in] -> [in,r]
+                    let rank = a.shape()[1] as f32;
+                    let b = inp[2 + 2 * j].t().multiply(scalar(alpha_c / rank))?; // [out,r]->[r,out]·(α/r)
+                    let seg_refs: Vec<&str> = local.iter().map(String::as_str).collect();
+                    blk.adaptable_mut(&seg_refs)
+                        .ok_or_else(|| {
+                            Exception::custom(format!(
+                                "checkpoint LoRA target not found: {}",
+                                local.join(".")
+                            ))
+                        })?
+                        .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+                }
+                let kv = blk
+                    .prepare_kv(&context_c)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let out = blk
+                    .forward(&inp[0], &e0_c, &kv, &cos_c, &sin_c)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(vec![out])
+            });
+            x = seg(&inputs)?.into_iter().next().expect("one block output");
+        }
+
+        let x = self.apply_head(&x, &e)?; // [1, L, out_dim·∏patch] f32
+        let op = x.shape()[2];
+        let xb = x.reshape(&[l, op])?;
+        unpatchify(&xb, grid, self.cfg.out_dim, self.cfg.patch_size)
     }
 
     /// Embed a single T5 prompt embedding `[L_text, text_dim]` → `[1, text_len, dim]` (bf16),

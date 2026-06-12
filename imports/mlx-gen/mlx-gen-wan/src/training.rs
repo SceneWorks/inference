@@ -57,6 +57,7 @@ use mlx_gen::{
     WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
+use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
@@ -66,7 +67,7 @@ use crate::config::WanModelConfig;
 use crate::model::{MODEL_ID as MODEL_ID_TI2V_5B, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B};
 use crate::pipeline::{preprocess_i2v_image, preprocess_ti2v_image};
 use crate::text_encoder::{load_tokenizer, Umt5Encoder};
-use crate::transformer::WanTransformer;
+use crate::transformer::{BlockLoraRef, WanTransformer};
 use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;
 
@@ -121,6 +122,9 @@ struct ExpertState {
     band: (f32, f32),     // the timestep band this expert is sampled in
     adapter: TrainAdapter,
     params: LoraParams,
+    /// sc-4942 — this expert's per-block trainable targets, for the gradient-checkpointed forward
+    /// (`block_targets[i]` = block `i`'s targets). Empty when block checkpointing is off.
+    block_targets: Vec<Vec<BlockLoraRef>>,
     opt: TrainOptimizer,
     accumulated: Option<LoraParams>,
     micro: u32,      // micro-steps routed to this expert so far (drives accumulation)
@@ -173,6 +177,12 @@ fn descriptor_ti2v_5b() -> TrainerDescriptor {
 /// factors promote against the bf16 base — clean autograd, the base frozen). `descriptor.id` selects
 /// which Wan variant this registration serves, and is checked against the config.
 fn build_trainer(spec: &LoadSpec, descriptor: TrainerDescriptor) -> Result<Box<dyn Trainer>> {
+    Ok(Box::new(build_trainer_concrete(spec, descriptor)?))
+}
+
+/// The concrete-typed loader behind [`build_trainer`] (sc-4942 — the first-step memory harness needs
+/// the concrete [`WanMoeTrainer`] to reach `.experts` / `.vae`, which a `Box<dyn Trainer>` hides).
+fn build_trainer_concrete(spec: &LoadSpec, descriptor: TrainerDescriptor) -> Result<WanMoeTrainer> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
@@ -208,14 +218,14 @@ fn build_trainer(spec: &LoadSpec, descriptor: TrainerDescriptor) -> Result<Box<d
         vec![WanTransformer::from_weights(&w, &cfg)?]
     };
 
-    Ok(Box::new(WanMoeTrainer {
+    Ok(WanMoeTrainer {
         descriptor,
         tokenizer: Some(tokenizer),
         text_encoder: Some(text_encoder),
         vae,
         experts,
         cfg,
-    }))
+    })
 }
 
 /// Reject a snapshot whose `config.json` doesn't match the registration id (a dense 5B routed to the
@@ -328,6 +338,17 @@ impl WanMoeTrainer {
         on_progress(TrainingProgress::Preparing);
         let edge = bucket_resolution(cfg.resolution);
 
+        // sc-4942 — fail-fast pre-flight memory guard (the sc-4874 mechanism). The dense (non-block-
+        // checkpointed) first step materializes the whole forward graph in one MLX `eval`; at high
+        // resolution that working set, on top of the resident expert(s), can exceed unified memory and
+        // the OS hard-kills the worker with an UNCATCHABLE SIGKILL. Predict it and refuse up front —
+        // BEFORE the (~minutes-long) latent/UMT5 caching — when gradient checkpointing is off. (Block-
+        // checkpointed runs recompute per block, so they are not subject to the dense peak.)
+        let will_checkpoint = cfg.gradient_checkpointing && cfg.network_type == NetworkType::Lora;
+        if !will_checkpoint {
+            preflight_memory_guard(&self.cfg, edge, n_experts, id)?;
+        }
+
         // --- prepare → load → cache: normalized latents + per-expert UMT5 context (then free the TE) ---
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
@@ -398,6 +419,15 @@ impl WanMoeTrainer {
             cfg.weight_decay
         };
 
+        // sc-4942 — gradient checkpointing (opt-in via the SceneWorks toggle). Block-checkpoint only the
+        // LoRA path (LoKr reconstructs a Kronecker delta — the dense path handles it, matching the image
+        // families); attention-segment checkpointing is ON for the dense path and OFF under block-ckpt
+        // (the block recompute already covers attention, so nesting would recompute it twice). Wan is
+        // bf16-native (the base loads bf16, every matmul already runs bf16 with an f32 residual), so the
+        // `train_dtype=bf16` contract is honored by the load — there is no f32→bf16 cast lever here; the
+        // memory fix is the two checkpointing levers + the pre-flight guard.
+        let use_checkpoint = cfg.gradient_checkpointing && cfg.network_type == NetworkType::Lora;
+
         let mut states: Vec<ExpertState> = Vec::with_capacity(n_experts);
         for (idx, expert) in self.experts.iter_mut().enumerate() {
             let target_paths = resolve_target_paths(expert, &suffixes);
@@ -410,6 +440,14 @@ impl WanMoeTrainer {
             // Distinct seed per expert so the two experts' gaussian init differs.
             let seed = cfg.seed.wrapping_add(idx as u64 * 0x9E37_79B9);
             let (adapter, params) = build_adapter(expert, &target_paths, cfg, seed)?;
+            // sc-4942 — group this expert's targets by block for the checkpointed forward, and arm
+            // attention-segment checkpointing on the dense path (off under block-ckpt).
+            let block_targets = if use_checkpoint {
+                group_block_targets(&target_paths, expert.num_blocks())
+            } else {
+                Vec::new()
+            };
+            expert.set_sdpa_checkpoint(!use_checkpoint);
             let (band, suffix) = if dual {
                 if idx == 0 {
                     ((0.0, boundary), "low_noise")
@@ -429,6 +467,7 @@ impl WanMoeTrainer {
                 band,
                 adapter,
                 params,
+                block_targets,
                 opt,
                 accumulated: None,
                 micro: 0,
@@ -475,6 +514,11 @@ impl WanMoeTrainer {
                     cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
                 )?),
             )?;
+            let checkpoint_block = if use_checkpoint {
+                Some(states[ei].block_targets.as_slice())
+            } else {
+                None
+            };
             let (loss, grads) = compute_loss_grads(
                 &mut self.experts[ei],
                 &states[ei].adapter,
@@ -487,6 +531,7 @@ impl WanMoeTrainer {
                 &noise,
                 mae,
                 y_channels,
+                checkpoint_block,
             )?;
             last_loss = loss;
             steps_run = step;
@@ -660,6 +705,11 @@ fn build_adapter(
 /// `y_channels > 0` (I2V-A14B, = 20) appends a **zero** channel-concat conditioning block to the
 /// noisy latent so the in_dim-36 forward runs — the reference's no-conditioning T2V objective; the
 /// padded channels are a constant input (not differentiated), and the trained surface is attention.
+///
+/// `checkpoint_block`, when `Some`, lists each block's trainable targets and switches the forward to
+/// the per-block gradient-checkpointed path (sc-4942) — each block recomputes its activations (and its
+/// cross-attention K/V) in the backward instead of retaining them. `None` runs the dense
+/// (attention-segment-checkpointed) forward via the installed adapter.
 #[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     expert: &mut WanTransformer,
@@ -673,6 +723,7 @@ fn compute_loss_grads(
     noise: &Array,
     mae: bool,
     y_channels: i32,
+    checkpoint_block: Option<&[Vec<BlockLoraRef>]>,
 ) -> Result<(f32, LoraParams)> {
     // x_t = (1-t)·clean + t·noise; target = noise - clean (raw velocity); transformer timestep = t·1000.
     let one_minus = Array::from_slice(&[1.0 - t], &[1]);
@@ -691,10 +742,17 @@ fn compute_loss_grads(
     let timestep = t * 1000.0;
     let ctx = context.clone();
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
-        adapter.install(expert, &p, alpha, rank, LOKR_DTYPE)?;
-        let v = expert
-            .forward(&x_in, timestep, &ctx)
-            .map_err(|e| Exception::custom(e.to_string()))?;
+        let v = match checkpoint_block {
+            Some(bt) => expert
+                .forward_train_checkpointed(&x_in, timestep, &ctx, &p, bt, alpha)
+                .map_err(|e| Exception::custom(e.to_string()))?,
+            None => {
+                adapter.install(expert, &p, alpha, rank, LOKR_DTYPE)?;
+                expert
+                    .forward(&x_in, timestep, &ctx)
+                    .map_err(|e| Exception::custom(e.to_string()))?
+            }
+        };
         let diff = subtract(&v, &target)?;
         // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
         let loss = if mae {
@@ -707,6 +765,32 @@ fn compute_loss_grads(
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
     Ok((val[0].item::<f32>(), grads))
+}
+
+/// Group resolved target paths by their owning block (sc-4942) — `block_targets[i]` lists block `i`'s
+/// trainable LoRA targets as the block-local path (`blocks.{i}.` stripped) plus the factor-map keys
+/// (`{path}.lora_a`/`.lora_b`, the core `build_lora_targets` convention), for the gradient-checkpoint
+/// closure. Every target lives in a `blocks.{i}.…` leaf, so the grouping is exhaustive.
+fn group_block_targets(target_paths: &[String], n_blocks: usize) -> Vec<Vec<BlockLoraRef>> {
+    let mut out: Vec<Vec<BlockLoraRef>> = (0..n_blocks).map(|_| Vec::new()).collect();
+    for path in target_paths {
+        let segs: Vec<&str> = path.split('.').collect();
+        if segs.len() < 3 || segs[0] != "blocks" {
+            continue;
+        }
+        let Ok(i) = segs[1].parse::<usize>() else {
+            continue;
+        };
+        if i >= n_blocks {
+            continue;
+        }
+        out[i].push(BlockLoraRef {
+            local: segs[2..].iter().map(|s| s.to_string()).collect(),
+            a_key: format!("{path}.lora_a"),
+            b_key: format!("{path}.lora_b"),
+        });
+    }
+    out
 }
 
 /// Sample a flow-match timestep within `band = (lo, hi)`: a faithful port of the reference
@@ -747,6 +831,66 @@ fn sample_band_timestep(
     Ok(band.0 + t_unit * (band.1 - band.0))
 }
 
+/// Projected DENSE (non-block-checkpointed) first-step peak memory, in GB, for a Wan variant — an
+/// empirical fit used by the pre-flight OOM guard (sc-4942). With attention-segment checkpointing
+/// always on, the working set is essentially linear in the token count `tokens` (the seq² term is
+/// demoted to a per-layer transient). The peak is the **resident weights** (all `n_experts` stay
+/// resident across the MoE alternation) plus the active expert's working set:
+///   `peak = n_experts · resident_per_expert + working_set(tokens)`.
+///
+/// CALIBRATED from `first_step_repro::first_step_peak_sweep` on the converted **T2V-A14B bf16**
+/// (dim 5120, 40 layers): one expert resident ≈ 27 GB; dense working set ≈ 10.3 + 0.0177·L GB
+/// (L=256/576/1024 → 14.8/20.6/28.4 GB). The resident scales ~ params (∝ dim²·layers) and the working
+/// set ∝ dim·layers, so the fit extrapolates to the I2V-A14B (same size) and the smaller dense
+/// TI2V-5B (the A14B is the exact anchor; the 5B/quantized scalings are estimates → the guard is
+/// conservative there, which is the safe direction). Refit the anchors if the sweep changes.
+fn projected_dense_peak_gb(tokens: f64, dim: usize, n_layers: usize, n_experts: usize) -> f64 {
+    let param_scale = (dim * dim * n_layers) as f64 / (5120.0 * 5120.0 * 40.0);
+    let resident = n_experts as f64 * 27.0 * param_scale;
+    let act_scale = (dim * n_layers) as f64 / (5120.0 * 40.0);
+    let working = (10.3 + 0.0177 * tokens) * act_scale;
+    resident + working
+}
+
+/// The DiT token count for a still-image (single-frame) training latent at pixel `edge`: the VAE
+/// downscales ×8, then the patchifier divides by `(ph, pw)` (frames `F = 1` / `pt`). `L = (edge/8/ph)·
+/// (edge/8/pw)`.
+fn training_tokens(cfg: &WanModelConfig, edge: u32) -> f64 {
+    let (_pt, ph, pw) = cfg.patch_size;
+    let le = (edge / 8).max(1) as usize;
+    ((le / ph.max(1)) * (le / pw.max(1))) as f64
+}
+
+/// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
+/// SIGKILLed), returning a catchable, actionable error instead (sc-4942 — the sc-4874 mechanism, ported
+/// to Wan). The budget is MLX's reported memory limit × 0.85 for worker/host headroom. Only consulted
+/// when gradient checkpointing is OFF. `n_experts` resident is the MoE floor (both stay loaded across
+/// the alternation), which is itself most of the cost — so on a tier that can't hold the experts, the
+/// guard correctly recommends the dense TI2V-5B or a lower resolution.
+fn preflight_memory_guard(
+    cfg: &WanModelConfig,
+    edge: u32,
+    n_experts: usize,
+    id: &str,
+) -> Result<()> {
+    let tokens = training_tokens(cfg, edge);
+    let projected = projected_dense_peak_gb(tokens, cfg.dim, cfg.num_layers, n_experts);
+    let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
+    let safe = budget_gb * 0.85;
+    if projected > safe {
+        return Err(format!(
+            "{id} trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
+             ({n_experts} resident expert(s) + the forward working set, materialized in one allocation), \
+             exceeding this machine's ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). \
+             Without mitigation the OS would hard-kill the worker (SIGKILL) at the first step with no \
+             recoverable error (sc-4874/sc-4942). Enable Gradient Checkpointing (recomputes block \
+             activations in the backward) or reduce the training resolution."
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
     let dynimg = image::open(path)
@@ -758,4 +902,330 @@ fn decode_image(path: &Path) -> Result<Image> {
         height,
         pixels: rgb.into_raw(),
     })
+}
+
+// ===========================================================================================
+// sc-4942 — first-step memory + grad-parity harness (weight-gated, run as its own process).
+//
+// Ports the z-image/LTX first-step harness to Wan: drives the exact inner training step
+// (`compute_loss_grads` + the step-1 grad `eval`) on ONE expert, sweeping resolution with MLX
+// peak-memory probes, and asserts the checkpointing levers' invariants on REAL weights:
+//   * attention-segment checkpointing is bit-identical to the retained backward,
+//   * block (gradient) checkpointing matches the dense path within fp tolerance,
+//   * block checkpointing materially shrinks the first-step working set.
+// (Wan is bf16-native, so there is no bf16-vs-f32 grad gate — there is no f32 training path.)
+//
+//   cargo test -p mlx-gen-wan --release --lib first_step -- --ignored --nocapture
+// ===========================================================================================
+#[cfg(test)]
+mod first_step_repro {
+    use super::*;
+    use mlx_gen::train::lora::build_lora_targets;
+    use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
+    use std::path::PathBuf;
+
+    const RANK: i32 = 8;
+    const ALPHA: f32 = 8.0;
+
+    /// The converted T2V-A14B bf16 MoE snapshot (the harness's reference variant — dual-expert, the
+    /// widest DiT; exercises every lever). `$WAN_A14B_MODEL_DIR` overrides.
+    fn snapshot() -> PathBuf {
+        if let Ok(p) = std::env::var("WAN_A14B_MODEL_DIR") {
+            return PathBuf::from(p);
+        }
+        PathBuf::from(std::env::var("HOME").unwrap())
+            .join(".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16")
+    }
+
+    fn swatch(edge: u32) -> Image {
+        let mut img = image::RgbImage::new(edge, edge);
+        for px in img.pixels_mut() {
+            *px = image::Rgb([180u8, 60, 90]);
+        }
+        Image {
+            width: edge,
+            height: edge,
+            pixels: img.into_raw(),
+        }
+    }
+
+    fn gb(bytes: usize) -> f64 {
+        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Build a real Wan trainer, keep ONLY the low-noise expert (frees ~28 GB of the unused high
+    /// expert), build its LoRA targets, encode one caption to a cached bf16 context, then free the UMT5
+    /// TE + tokenizer — so the measured peaks reflect the post-free single-expert training working set.
+    #[allow(clippy::type_complexity)]
+    fn build() -> (
+        WanMoeTrainer,
+        TrainAdapter,
+        LoraParams,
+        Array,
+        Vec<Vec<BlockLoraRef>>,
+    ) {
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
+        let mut trainer = build_trainer_concrete(&spec, descriptor_t2v_14b())
+            .expect("converted Wan2.2-T2V-A14B bf16 snapshot ($WAN_A14B_MODEL_DIR or the cache)");
+        // Encode one context with expert 0, then keep only expert 0 + free the TE.
+        let ctx = {
+            let te = trainer.text_encoder.as_ref().unwrap();
+            let tok = trainer.tokenizer.as_ref().unwrap();
+            let t5 = te.encode(tok, "a solid colour swatch").unwrap();
+            trainer.experts[0].embed_text(&t5).unwrap()
+        };
+        eval([&ctx]).unwrap();
+        trainer.experts.truncate(1);
+        trainer.text_encoder = None;
+        trainer.tokenizer = None;
+        clear_cache();
+
+        let suffixes: Vec<String> = DEFAULT_TARGET_SUFFIXES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let target_paths = resolve_target_paths(&trainer.experts[0], &suffixes);
+        let (targets, params) =
+            build_lora_targets(&mut trainer.experts[0], &target_paths, RANK, 7).unwrap();
+        let block_targets = group_block_targets(&target_paths, trainer.experts[0].num_blocks());
+        eprintln!(
+            "[sc-4942] loaded Wan T2V-A14B trainer (1 expert, TE freed); {} LoRA targets; ctx {:?}",
+            target_paths.len(),
+            ctx.shape()
+        );
+        (
+            trainer,
+            TrainAdapter::Lora { targets },
+            params,
+            ctx,
+            block_targets,
+        )
+    }
+
+    /// Run a single first training step at `edge` and report peak GPU memory across forward+backward,
+    /// forcing the backward. `checkpoint` selects the block-checkpointed forward; the caller sets the
+    /// SDPA-checkpoint flag on the expert.
+    #[allow(clippy::too_many_arguments)]
+    fn one_step(
+        trainer: &mut WanMoeTrainer,
+        adapter: &TrainAdapter,
+        params: &LoraParams,
+        ctx: &Array,
+        block_targets: &[Vec<BlockLoraRef>],
+        edge: u32,
+        checkpoint: bool,
+        tag: &str,
+    ) -> Result<(f32, f64)> {
+        let clean = trainer
+            .vae
+            .encode_clean(&center_crop_square(&swatch(edge)), edge)?;
+        eval([&clean])?;
+        let noise = random::normal::<f32>(clean.shape(), None, None, Some(&random::key(1)?))?;
+        eval([&noise])?;
+        let ck = if checkpoint {
+            Some(block_targets)
+        } else {
+            None
+        };
+
+        clear_cache();
+        reset_peak_memory();
+        let before = get_active_memory();
+        let t0 = std::time::Instant::now();
+        let (loss, grads) = compute_loss_grads(
+            &mut trainer.experts[0],
+            adapter,
+            params,
+            ALPHA,
+            RANK as f32,
+            &clean,
+            ctx,
+            0.5,
+            &noise,
+            false,
+            0, // T2V: no channel-concat y
+            ck,
+        )?;
+        eval(grads.values())?;
+        let secs = t0.elapsed().as_secs_f64();
+        let peak = get_peak_memory();
+        eprintln!(
+            "  [edge {edge:>4} {tag}] latent {:?}  loss {loss:.5}  active-before {:.2} GB  peak {:.2} GB  step {secs:.2}s",
+            clean.shape(),
+            gb(before),
+            gb(peak)
+        );
+        Ok((loss, gb(peak)))
+    }
+
+    /// Grads for a given (checkpoint, sdpa) configuration at `edge`, backward forced.
+    fn grads_of(
+        trainer: &mut WanMoeTrainer,
+        adapter: &TrainAdapter,
+        params: &LoraParams,
+        ctx: &Array,
+        block_targets: &[Vec<BlockLoraRef>],
+        edge: u32,
+        checkpoint: bool,
+    ) -> LoraParams {
+        let clean = trainer
+            .vae
+            .encode_clean(&center_crop_square(&swatch(edge)), edge)
+            .unwrap();
+        let noise =
+            random::normal::<f32>(clean.shape(), None, None, Some(&random::key(1).unwrap()))
+                .unwrap();
+        eval([&clean, &noise]).unwrap();
+        let ck = if checkpoint {
+            Some(block_targets)
+        } else {
+            None
+        };
+        let (_l, g) = compute_loss_grads(
+            &mut trainer.experts[0],
+            adapter,
+            params,
+            ALPHA,
+            RANK as f32,
+            &clean,
+            ctx,
+            0.5,
+            &noise,
+            false,
+            0,
+            ck,
+        )
+        .unwrap();
+        eval(g.values()).unwrap();
+        g
+    }
+
+    fn max_rel_diff(ga: &LoraParams, gb_: &LoraParams) -> f32 {
+        let mut max_rel = 0f32;
+        for (k, a) in ga {
+            let b = gb_.get(k).expect("same keys");
+            let num = a.subtract(b).unwrap().abs().unwrap().max(None).unwrap();
+            let den = a.abs().unwrap().max(None).unwrap().item::<f32>().max(1e-6);
+            max_rel = max_rel.max(num.item::<f32>() / den);
+        }
+        max_rel
+    }
+
+    /// sc-4942 — attention-segment checkpointing must not change the math: grads with the SDPA
+    /// checkpoint on must match the retained backward (flag off). Bit-identical recompute.
+    #[test]
+    #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process"]
+    fn attn_ckpt_grads_match_retained() {
+        let (mut t, adapter, params, ctx, bt) = build();
+        let edge = 256u32;
+        t.experts[0].set_sdpa_checkpoint(false);
+        let g_retained = grads_of(&mut t, &adapter, &params, &ctx, &bt, edge, false);
+        t.experts[0].set_sdpa_checkpoint(true);
+        let g_ckpt = grads_of(&mut t, &adapter, &params, &ctx, &bt, edge, false);
+        let max_rel = max_rel_diff(&g_retained, &g_ckpt);
+        eprintln!("[sc-4942] attn-ckpt-vs-retained grad max relative diff: {max_rel:.2e}");
+        assert!(
+            max_rel < 1e-5,
+            "attention-segment checkpointing must not change grads: max rel {max_rel:.2e}"
+        );
+    }
+
+    /// sc-4942 — block (gradient) checkpointing must match the dense path within fp tolerance (same
+    /// install + block forward, recompute-only). Also guards the multi-output-VJP duplicate-cotangent
+    /// trap (each checkpoint returns one distinct array).
+    #[test]
+    #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process"]
+    fn block_ckpt_grads_match_dense() {
+        let (mut t, adapter, params, ctx, bt) = build();
+        let edge = 256u32;
+        t.experts[0].set_sdpa_checkpoint(true);
+        let g_dense = grads_of(&mut t, &adapter, &params, &ctx, &bt, edge, false);
+        t.experts[0].set_sdpa_checkpoint(false);
+        let g_ckpt = grads_of(&mut t, &adapter, &params, &ctx, &bt, edge, true);
+        let max_rel = max_rel_diff(&g_dense, &g_ckpt);
+        eprintln!("[sc-4942] block-ckpt-vs-dense grad max relative diff: {max_rel:.2e}");
+        assert!(
+            max_rel < 5e-3,
+            "block checkpointing must match dense within tolerance: max rel {max_rel:.2e}"
+        );
+    }
+
+    /// sc-4942 — first-step peak sweep (attention-segment checkpointing on), plus a block-ckpt point.
+    /// Calibrates the `projected_dense_peak_gb` guard fit — refit if these print materially different.
+    #[test]
+    #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process (may SIGKILL)"]
+    fn first_step_peak_sweep() {
+        let (mut t, adapter, params, ctx, bt) = build();
+        t.experts[0].set_sdpa_checkpoint(true);
+        eprintln!("[sc-4942] attn-ckpt dense sweep (bf16-native):");
+        for edge in [256u32, 384, 512] {
+            let _ = one_step(
+                &mut t,
+                &adapter,
+                &params,
+                &ctx,
+                &bt,
+                edge,
+                false,
+                "attn-ckpt",
+            )
+            .map_err(|e| eprintln!("  edge {edge} CATCHABLE error: {e}"));
+        }
+        eprintln!("[sc-4942] block-ckpt:");
+        t.experts[0].set_sdpa_checkpoint(false);
+        for edge in [384u32, 512] {
+            let _ = one_step(&mut t, &adapter, &params, &ctx, &bt, edge, true, "blk-ckpt")
+                .map_err(|e| eprintln!("  edge {edge} CATCHABLE error: {e}"));
+        }
+    }
+
+    /// sc-4942 — the empirical fit must reproduce the measured A14B peak (the basis of the pre-flight
+    /// OOM guard) and stay monotonic / ordered across variants. Measured anchor (T2V-A14B, one expert,
+    /// edge 512 → L=1024): 55.4 GB.
+    #[test]
+    fn projection_matches_measured_curve() {
+        // A14B one-expert at L=1024 = the measured 55.4 GB anchor.
+        let p = projected_dense_peak_gb(1024.0, 5120, 40, 1);
+        assert!(
+            (p - 55.4).abs() < 1.0,
+            "A14B L=1024 projection = {p:.1} GB, expected ≈55.4"
+        );
+        // A14B sweep points (working set 14.8/20.6 GB at L=256/576 + 27 resident).
+        assert!((projected_dense_peak_gb(256.0, 5120, 40, 1) - 41.8).abs() < 1.5);
+        assert!((projected_dense_peak_gb(576.0, 5120, 40, 1) - 47.6).abs() < 1.5);
+        // Monotonic in tokens; dual-expert adds a second resident; the dense 5B is much smaller.
+        assert!(
+            projected_dense_peak_gb(256.0, 5120, 40, 1)
+                < projected_dense_peak_gb(1024.0, 5120, 40, 1)
+        );
+        assert!(
+            projected_dense_peak_gb(1024.0, 5120, 40, 2)
+                > projected_dense_peak_gb(1024.0, 5120, 40, 1)
+        );
+        assert!(
+            projected_dense_peak_gb(1024.0, 3072, 30, 1)
+                < projected_dense_peak_gb(1024.0, 5120, 40, 1)
+        );
+    }
+
+    /// sc-4942 — block checkpointing must drop the first-step peak below the dense path.
+    #[test]
+    #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process"]
+    fn block_ckpt_reduces_peak_vs_dense() {
+        let (mut t, adapter, params, ctx, bt) = build();
+        t.experts[0].set_sdpa_checkpoint(true);
+        let (_, dense_peak) =
+            one_step(&mut t, &adapter, &params, &ctx, &bt, 512, false, "dense").expect("dense");
+        t.experts[0].set_sdpa_checkpoint(false);
+        let (_, ckpt_peak) =
+            one_step(&mut t, &adapter, &params, &ctx, &bt, 512, true, "blk-ckpt").expect("ckpt");
+        eprintln!(
+            "[sc-4942] edge 512  dense {dense_peak:.2} GB  ckpt {ckpt_peak:.2} GB  ({:.0}% reduction)",
+            100.0 * (1.0 - ckpt_peak / dense_peak)
+        );
+        assert!(
+            ckpt_peak < dense_peak,
+            "block checkpointing must reduce the first-step peak: dense {dense_peak:.2} vs ckpt {ckpt_peak:.2}"
+        );
+    }
 }

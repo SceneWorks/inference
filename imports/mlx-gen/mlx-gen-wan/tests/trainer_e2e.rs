@@ -94,7 +94,24 @@ fn assert_reloads(
 /// The shared lifecycle driver: load `model_id` from `snapshot`, train a tiny LoRA with `optimizer`,
 /// assert the windowed loss falls, then reload each written adapter through `merge_wan_adapters`.
 fn run_trainer_e2e(model_id: &str, snapshot: PathBuf, experts: &[ExpertFile], optimizer: &str) {
-    let tmp = std::env::temp_dir().join(format!("{model_id}_{optimizer}_trainer_e2e"));
+    run_trainer_e2e_cfg(model_id, snapshot, experts, optimizer, false)
+}
+
+/// As [`run_trainer_e2e`], with explicit control of `gradient_checkpointing` (sc-4942 — the block-
+/// recompute training path).
+fn run_trainer_e2e_cfg(
+    model_id: &str,
+    snapshot: PathBuf,
+    experts: &[ExpertFile],
+    optimizer: &str,
+    gradient_checkpointing: bool,
+) {
+    let tag = if gradient_checkpointing {
+        "ckpt"
+    } else {
+        optimizer
+    };
+    let tmp = std::env::temp_dir().join(format!("{model_id}_{tag}_trainer_e2e"));
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen::load_trainer(
@@ -113,6 +130,7 @@ fn run_trainer_e2e(model_id: &str, snapshot: PathBuf, experts: &[ExpertFile], op
         seed: 7,
         network_type: NetworkType::Lora,
         optimizer: optimizer.to_string(),
+        gradient_checkpointing,
         ..Default::default()
     };
     let req = TrainingRequest {
@@ -226,6 +244,20 @@ fn dense_expert() -> Vec<ExpertFile> {
         weights_file: "model.safetensors",
         expert: None,
     }]
+}
+
+/// sc-4942 — the gradient-checkpointing (block-recompute) path trains the dual-expert MoE end to end
+/// and writes reloadable adapters, exactly like the dense path. Block-ckpt is recompute-only (grads
+/// bit-identical to dense — proven by `block_ckpt_grads_match_dense`), so a converging run here
+/// confirms the whole MoE-alternation + optimizer loop is wired correctly through it.
+#[test]
+#[ignore = "needs the converted Wan2.2-T2V-A14B MoE bf16 checkpoint"]
+fn wan_t2v_a14b_trainer_gradient_checkpointing() {
+    let snap = snapshot(
+        "WAN_A14B_MODEL_DIR",
+        ".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16",
+    );
+    run_trainer_e2e_cfg("wan2_2_t2v_14b", snap, &moe_experts(), "adamw", true);
 }
 
 #[test]
