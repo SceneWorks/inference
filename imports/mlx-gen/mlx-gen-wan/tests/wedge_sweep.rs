@@ -132,8 +132,13 @@ fn wan_ti2v_5b_wedge_sweep() {
         let latents =
             random::normal::<f32>(&[z, t_lat, h_lat, w_lat], None, None, Some(&key)).unwrap();
         let gen_frames = frames as i32; // model.rs passes gen_frames (= frames + trim·4); trim=0 here
-        pin_limit_from_env(); // WAN_SWEEP_LIMIT_GB: simulate a smaller-RAM tier (sc-4998)
-        let tiling = mlx_gen_wan::pipeline::auto_tiling_budgeted(h, w, gen_frames)
+
+        // WAN_SWEEP_LIMIT_GB: simulate a smaller-RAM tier (sc-4998).
+        pin_limit_from_env();
+        // Plan the tiling for the dtype under test (sc-5039): bf16's lighter cost coefficient lets the
+        // budget fit bigger tiles. The f32 reference decode reuses this tiling for the cosine A/B.
+        let bf16 = env_usize("WAN_SWEEP_VAE_BF16", 0) == 1;
+        let tiling = mlx_gen_wan::pipeline::auto_tiling_budgeted(h, w, gen_frames, bf16)
             .expect("decode tiling within this machine's budget (sc-4998)");
         let notile = env_usize("WAN_SWEEP_NOTILE", 0) == 1;
         println!(
@@ -151,11 +156,46 @@ fn wan_ti2v_5b_wedge_sweep() {
         };
         mlx_rs::transforms::eval([&video]).unwrap();
         println!(
-            "[VAE decode] latents[z{z},T{t_lat},{h_lat},{w_lat}] -> {:?}  {:.1}s  peak={:.1} GB",
+            "[VAE decode f32] latents[z{z},T{t_lat},{h_lat},{w_lat}] -> {:?}  {:.1}s  peak={:.1} GB",
             video.shape(),
             t.elapsed().as_secs_f64(),
             gb(get_peak_memory())
         );
+
+        // WAN_SWEEP_VAE_BF16=1 (sc-5039): decode the SAME latents with a bf16-cast decoder, then
+        // report cosine(bf16, f32) + finiteness + the bf16 peak/time. Random latents (normal) proxy
+        // the real denoised z48 magnitude; this measures the bf16 decode's fidelity + memory/speed.
+        if bf16 {
+            let mut vae_wb =
+                Weights::from_file(model_dir.join("vae.safetensors")).expect("vae weights");
+            vae_wb
+                .cast_all(mlx_rs::Dtype::Bfloat16)
+                .expect("cast vae bf16");
+            let vae_bf16 = Wan22Vae::from_weights(&vae_wb).expect("vae22 bf16");
+            reset_peak_memory();
+            let t = Instant::now();
+            let video_bf16 = match (notile, tiling.as_ref()) {
+                (false, Some(cfg)) => vae_bf16.decode_tiled(&latents, cfg).unwrap(),
+                _ => vae_bf16.decode(&latents).unwrap(),
+            };
+            mlx_rs::transforms::eval([&video_bf16]).unwrap();
+            let bf16_secs = t.elapsed().as_secs_f64();
+            let bf16_peak = gb(get_peak_memory());
+            let (g, f) = (video_bf16.as_slice::<f32>(), video.as_slice::<f32>());
+            let finite = g.iter().all(|v| v.is_finite());
+            let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+            for (x, y) in g.iter().zip(f.iter()) {
+                dot += *x as f64 * *y as f64;
+                na += *x as f64 * *x as f64;
+                nb += *y as f64 * *y as f64;
+            }
+            let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+            println!(
+                "[VAE decode bf16] {:.1}s  peak={bf16_peak:.1} GB  finite={finite}  \
+                 cosine(bf16,f32)={cos:.6}",
+                bf16_secs
+            );
+        }
         return;
     }
 

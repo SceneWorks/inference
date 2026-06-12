@@ -15,6 +15,7 @@
 
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::Wan22Vae;
+use mlx_rs::Dtype;
 
 fn fixture() -> Weights {
     let path = concat!(
@@ -44,6 +45,17 @@ fn vae(w: &Weights) -> Wan22Vae {
     Wan22Vae::from_weights_dims(w, 8, 8, 48).expect("build Wan22Vae")
 }
 
+/// Cosine similarity of two equal-length f32 slices.
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += *x as f64 * *y as f64;
+        na += *x as f64 * *x as f64;
+        nb += *y as f64 * *y as f64;
+    }
+    dot / (na.sqrt() * nb.sqrt()).max(1e-12)
+}
+
 #[test]
 fn vae22_decode_matches_reference() {
     let w = fixture();
@@ -63,6 +75,32 @@ fn vae22_decode_matches_reference() {
         mean_rel < 1e-3,
         "decode diverged: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
+}
+
+#[test]
+fn vae22_bf16_decode_is_finite_and_close_to_f32() {
+    // sc-5039: a bf16 decode (weights + activations cast to bf16, keeping the f32 RMS_norm reduction
+    // and the latent denorm) must stay finite and close to the f32 decode. The tiny dec_dim=8
+    // fixture can't surface the 1024-channel dynamic range (that's the real-weight wedge check), but
+    // it gates NaNs and the structural bf16 path across every op (causal conv3d, RMS_norm, attention,
+    // DupUp3D, time_conv interleave, unpatchify).
+    let w = fixture();
+    let dec_in = w.require("dec_in").expect("dec_in"); // stays f32 — the latent isn't pre-cast
+    let f32_out = vae(&w).decode(dec_in).expect("f32 decode");
+
+    let mut wb = fixture();
+    wb.cast_all(Dtype::Bfloat16).expect("cast fixture to bf16");
+    let bf16_out = vae(&wb).decode(dec_in).expect("bf16 decode");
+    assert_eq!(bf16_out.shape(), f32_out.shape());
+
+    let (g, f) = (bf16_out.as_slice::<f32>(), f32_out.as_slice::<f32>());
+    assert!(
+        g.iter().all(|v| v.is_finite()),
+        "bf16 decode produced non-finite values (NaN/Inf)"
+    );
+    let cos = cosine(g, f);
+    println!("[vae22 bf16 decode] cosine(bf16, f32) = {cos:.6}");
+    assert!(cos > 0.99, "bf16 decode cosine {cos:.4} too low vs f32");
 }
 
 #[test]

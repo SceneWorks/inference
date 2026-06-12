@@ -182,12 +182,21 @@ fn estimated_denoise_peak_gib(
 /// over-estimates slightly — what a guard wants).
 const VAE22_ACCUM_BYTES_PER_VOXEL: f64 = 40.0;
 const VAE22_TILE_BYTES_PER_OUT_VOXEL: f64 = 3800.0;
+/// Per-tile coefficient for a **bf16** decode (sc-5039). Measured on the same real-weight rig at two
+/// tiles of the 1024×576×97 video (cosine 0.99995, no NaN both): 768 px / 64-frame → **79.7 GB**
+/// (vs 97.7 GB f32), 640 px / 48-frame → **55.1 GB**. The per-tile term only drops to ~85 % of f32
+/// — *not* 50 % — because the `RMS_norm` channel-L2 reduction stays f32 and materializes a full-size
+/// f32 temporary of each activation. Calibrated to the **higher** of the two implied coefficients
+/// (the 640/48 point) so the estimate never under-shoots a real peak — the 3100 first guess let the
+/// selector pick a tile that measured 55.1 GB, just over the 54.4 GB safe line at the 64 GB tier.
+/// The fixed accumulator term is unchanged (the blend buffers are f32 either way).
+const VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16: f64 = 3400.0;
 
 /// Estimated concurrent GPU peak (GiB) of a z48 `vae22` decode whose **largest tile** spans
-/// `tile_f·tile_h·tile_w` output voxels while assembling a `out_f·out_h·out_w` video. Pure (no
-/// global state) so it is unit-testable against the two `wedge_sweep.rs` anchors. A single-pass
-/// decode is the special case `tile_* == out_*`; passing a zero tile yields the accumulator-only
-/// floor (the unavoidable cost of holding the assembled output).
+/// `tile_f·tile_h·tile_w` output voxels while assembling a `out_f·out_h·out_w` video. `bf16` selects
+/// the lighter per-tile coefficient (sc-5039). Pure (no global state) so it is unit-testable against
+/// the `wedge_sweep.rs` anchors. A single-pass decode is the special case `tile_* == out_*`; passing
+/// a zero tile yields the accumulator-only floor (the unavoidable cost of holding the output).
 fn estimated_vae22_decode_peak_gib(
     out_f: i64,
     out_h: i64,
@@ -195,11 +204,17 @@ fn estimated_vae22_decode_peak_gib(
     tile_f: i64,
     tile_h: i64,
     tile_w: i64,
+    bf16: bool,
 ) -> f64 {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let tile_coeff = if bf16 {
+        VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16
+    } else {
+        VAE22_TILE_BYTES_PER_OUT_VOXEL
+    };
     let out_voxels = (out_f * out_h * out_w) as f64;
     let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (VAE22_ACCUM_BYTES_PER_VOXEL * out_voxels + VAE22_TILE_BYTES_PER_OUT_VOXEL * tile_voxels) / GIB
+    (VAE22_ACCUM_BYTES_PER_VOXEL * out_voxels + tile_coeff * tile_voxels) / GIB
 }
 
 /// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 spatial scale, overlap 64).
@@ -216,10 +231,11 @@ pub fn auto_tiling_budgeted(
     height: i32,
     width: i32,
     out_frames: i32,
+    bf16: bool,
 ) -> Result<Option<TilingConfig>> {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let budget_gib = get_memory_limit() as f64 / GIB;
-    plan_vae22_tiling(height, width, out_frames, budget_gib * 0.85)
+    plan_vae22_tiling(height, width, out_frames, budget_gib * 0.85, bf16)
 }
 
 /// Pure tile selector behind [`auto_tiling_budgeted`] (the `safe_gib` ceiling is injected so this is
@@ -237,17 +253,18 @@ fn plan_vae22_tiling(
     width: i32,
     out_frames: i32,
     safe_gib: f64,
+    bf16: bool,
 ) -> Result<Option<TilingConfig>> {
     let (h, w, f) = (height as i64, width as i64, out_frames as i64);
 
     // 1. Single-pass (the whole output as one tile) already fits → no tiling.
-    if estimated_vae22_decode_peak_gib(f, h, w, f, h, w) <= safe_gib {
+    if estimated_vae22_decode_peak_gib(f, h, w, f, h, w, bf16) <= safe_gib {
         return Ok(None);
     }
 
     // 2. The full-output accumulators are unavoidable (they hold the assembled video); if they alone
     //    blow the budget no tiling can help — fail catchably rather than OOM mid-decode.
-    let accum_gib = estimated_vae22_decode_peak_gib(f, h, w, 0, 0, 0);
+    let accum_gib = estimated_vae22_decode_peak_gib(f, h, w, 0, 0, 0, bf16);
     if accum_gib >= safe_gib {
         return Err(Error::Msg(format!(
             "wan z48 vae22 decode: assembling a {width}×{height}×{out_frames} video needs \
@@ -281,7 +298,7 @@ fn plan_vae22_tiling(
             if tile_h == h && tile_w == w && tile_f == f {
                 continue;
             }
-            let peak = estimated_vae22_decode_peak_gib(f, h, w, tile_f, tile_h, tile_w);
+            let peak = estimated_vae22_decode_peak_gib(f, h, w, tile_f, tile_h, tile_w, bf16);
             if peak > safe_gib {
                 continue;
             }
@@ -293,7 +310,8 @@ fn plan_vae22_tiling(
     }
 
     let Some((_, s, t, t_over)) = best else {
-        let min_peak = estimated_vae22_decode_peak_gib(f, h, w, 32.min(f), 192.min(h), 192.min(w));
+        let min_peak =
+            estimated_vae22_decode_peak_gib(f, h, w, 32.min(f), 192.min(h), 192.min(w), bf16);
         return Err(Error::Msg(format!(
             "wan z48 vae22 decode: a {width}×{height}×{out_frames} video peaks at ~{min_peak:.0} GB \
              even with the smallest tile, over this machine's ~{safe_gib:.0} GB safe budget. Reduce \
@@ -970,34 +988,49 @@ mod tests {
 
     /// The estimated peak of the chosen tiling, recomputed from a returned config + output dims (the
     /// largest tile spans `min(tile_px, dim)` on each spatial axis and `min(tile_frames, f)` frames).
-    fn chosen_peak_gib(cfg: &TilingConfig, h: i64, w: i64, f: i64) -> f64 {
+    fn chosen_peak_gib(cfg: &TilingConfig, h: i64, w: i64, f: i64, bf16: bool) -> f64 {
         let tile_h = cfg.spatial.map(|s| (s.tile_px as i64).min(h)).unwrap_or(h);
         let tile_w = cfg.spatial.map(|s| (s.tile_px as i64).min(w)).unwrap_or(w);
         let tile_f = cfg
             .temporal
             .map(|t| (t.tile_frames as i64).min(f))
             .unwrap_or(f);
-        estimated_vae22_decode_peak_gib(f, h, w, tile_f, tile_h, tile_w)
+        estimated_vae22_decode_peak_gib(f, h, w, tile_f, tile_h, tile_w, bf16)
     }
 
     #[test]
     fn vae22_decode_peak_matches_wedge_anchors() {
-        // sc-4998 anchors (real 5B z48 vae22, M5 Max): the model must reproduce both within ~10 %.
+        // sc-4998 f32 anchors (real 5B z48 vae22, M5 Max): the model must reproduce both within ~10 %.
         // A: 1024×576×97 video, 512 px / 64-frame tile → 60 GB.
-        let a = estimated_vae22_decode_peak_gib(97, 576, 1024, 64, 512, 512);
+        let a = estimated_vae22_decode_peak_gib(97, 576, 1024, 64, 512, 512, false);
         assert!((a - 60.0).abs() < 6.0, "anchor A estimate {a:.1} GiB vs 60");
         // B: 1280×704×145 video, 256 px / 32-frame tile → 12.6 GB.
-        let b = estimated_vae22_decode_peak_gib(145, 704, 1280, 32, 256, 256);
+        let b = estimated_vae22_decode_peak_gib(145, 704, 1280, 32, 256, 256, false);
         assert!(
             (b - 12.6).abs() < 2.0,
             "anchor B estimate {b:.1} GiB vs 12.6"
+        );
+        // sc-5039 bf16 anchors (real-weight, 1024×576×97): 768 px/64 f → 79.7 GB, 640 px/48 f →
+        // 55.1 GB. bf16 must estimate below f32 and stay **conservative** (never below the measured
+        // peak — the guard must not under-shoot). Tile dims use the selector's nominal frame count.
+        let bf16_768 = estimated_vae22_decode_peak_gib(97, 576, 1024, 64, 576, 768, true);
+        let f32_768 = estimated_vae22_decode_peak_gib(97, 576, 1024, 64, 576, 768, false);
+        assert!(bf16_768 < f32_768, "bf16 peak must be below f32");
+        assert!(
+            bf16_768 >= 79.7,
+            "bf16 768/64 estimate {bf16_768:.1} under-shoots 79.7"
+        );
+        let bf16_640 = estimated_vae22_decode_peak_gib(97, 576, 1024, 48, 576, 640, true);
+        assert!(
+            bf16_640 >= 55.1,
+            "bf16 640/48 estimate {bf16_640:.1} under-shoots 55.1"
         );
     }
 
     #[test]
     fn vae22_tiling_single_pass_when_small() {
         // A short, low-res clip fits a single-pass decode comfortably → no tiling.
-        let plan = plan_vae22_tiling(256, 256, 33, 40.0).unwrap();
+        let plan = plan_vae22_tiling(256, 256, 33, 40.0, false).unwrap();
         assert!(
             plan.is_none(),
             "small clip should not need tiling: {plan:?}"
@@ -1010,10 +1043,10 @@ mod tests {
         // → ~60 GB. The budgeted plan must tile, keep the peak under the safe budget, and crucially
         // below the 60 GB blow-up that OOMs a 64 GiB Mac.
         let safe = 64.0 * 0.85; // 54.4 GiB
-        let cfg = plan_vae22_tiling(576, 1024, 97, safe)
+        let cfg = plan_vae22_tiling(576, 1024, 97, safe, false)
             .unwrap()
             .expect("moderate res must tile");
-        let peak = chosen_peak_gib(&cfg, 576, 1024, 97);
+        let peak = chosen_peak_gib(&cfg, 576, 1024, 97, false);
         assert!(
             peak <= safe,
             "chosen peak {peak:.1} GiB over safe {safe:.1}"
@@ -1021,6 +1054,30 @@ mod tests {
         assert!(
             peak < 60.0,
             "chosen peak {peak:.1} GiB not below the 60 GB blow-up"
+        );
+    }
+
+    #[test]
+    fn vae22_bf16_tiling_stays_under_budget_and_below_f32_peak() {
+        // sc-5039: the bf16 plan must keep its chosen tile under the safe budget (the 3100→3400
+        // coefficient fix — 3100 let a tile measure 55.1 GB, over the 54.4 GB line), and the bf16
+        // peak of a *given* tile is strictly below the f32 peak of the same tile (the headroom that
+        // is bf16's only real win — no wall-clock benefit). No claim that it fits a *bigger* tile:
+        // at this resolution the candidate grid lands bf16 on the same 384/full-97 tile as f32.
+        let safe = 64.0 * 0.85; // 54.4 GiB
+        let bf16 = plan_vae22_tiling(576, 1024, 97, safe, true)
+            .unwrap()
+            .expect("bf16 still needs tiling at 64 GiB");
+        let bf16_peak = chosen_peak_gib(&bf16, 576, 1024, 97, true);
+        assert!(
+            bf16_peak <= safe,
+            "bf16 chosen peak {bf16_peak:.1} GiB over safe {safe:.1}"
+        );
+        // Same tile, bf16 vs f32: bf16 must be the lighter estimate.
+        let f32_same = chosen_peak_gib(&bf16, 576, 1024, 97, false);
+        assert!(
+            bf16_peak < f32_same,
+            "bf16 peak {bf16_peak:.1} not below f32 {f32_same:.1} for the same tile"
         );
     }
 
@@ -1038,9 +1095,9 @@ mod tests {
             (704, 1280, 145),
             (1088, 1920, 97),
         ] {
-            let peak = match plan_vae22_tiling(h as i32, w as i32, f as i32, safe).unwrap() {
-                Some(cfg) => chosen_peak_gib(&cfg, h, w, f),
-                None => estimated_vae22_decode_peak_gib(f, h, w, f, h, w), // single-pass fit
+            let peak = match plan_vae22_tiling(h as i32, w as i32, f as i32, safe, false).unwrap() {
+                Some(cfg) => chosen_peak_gib(&cfg, h, w, f, false),
+                None => estimated_vae22_decode_peak_gib(f, h, w, f, h, w, false), // single-pass fit
             };
             assert!(
                 peak <= safe && peak < 60.0,
@@ -1053,7 +1110,7 @@ mod tests {
     fn vae22_tiling_errors_when_unfittable() {
         // A huge video under a tiny budget: even the smallest tile (and the unavoidable output
         // accumulators) cannot fit → a catchable error, not an OOM/abort.
-        let err = plan_vae22_tiling(1088, 1920, 241, 8.0);
+        let err = plan_vae22_tiling(1088, 1920, 241, 8.0, false);
         assert!(err.is_err(), "over-budget decode must error, got {err:?}");
     }
 
@@ -1062,7 +1119,7 @@ mod tests {
         use mlx_rs::memory::set_memory_limit;
         // Exercise the public wrapper end-to-end on a pinned 64 GiB limit (restore after).
         let prev = set_memory_limit(64 << 30);
-        let plan = auto_tiling_budgeted(576, 1024, 97);
+        let plan = auto_tiling_budgeted(576, 1024, 97, false);
         set_memory_limit(prev);
         let cfg = plan.unwrap().expect("moderate res tiles at 64 GiB");
         assert!(cfg.spatial.is_some() || cfg.temporal.is_some());

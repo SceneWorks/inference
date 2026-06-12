@@ -30,7 +30,7 @@ use mlx_rs::ops::{
     add, broadcast_to, concatenate_axis, divide, maximum, mean_axis, minimum, multiply, pad, split,
     subtract, sum_axes,
 };
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
@@ -70,14 +70,24 @@ const TEMPORAL_DOWNSAMPLE: [bool; 3] = [false, true, true];
 
 /// `x / max(‖x‖₂ over last axis, 1e-24) · √C · γ` — channel-L2 norm over the **last** axis (vae22's
 /// `RMS_norm`). `gamma` carries `C` elements and broadcasts on the last axis.
+///
+/// **Dtype-preserving (sc-5039):** the channel-L2 reduction + divide always run in **f32** and the
+/// result is cast back to `x`'s dtype. For an f32 input every cast is a no-op, so the f32 path stays
+/// bit-for-bit identical to the reference (the [`vae22_parity`] gate). For a **bf16** decode this is
+/// the one mandatory f32 island: bf16's 8-bit exponent matches f32's range, but a sum-of-squares
+/// over 1024+ channels with the `1e-24` floor needs f32's mantissa, or the tiny denom makes the
+/// divide blow up (the "NaX kernel history" the f32-everywhere choice originally sidestepped).
 fn rms_norm_last(x: &Array, gamma: &Array) -> Result<Array> {
+    let in_dtype = x.dtype();
     let sh = x.shape();
     let c = sh[sh.len() - 1];
-    let sum_sq = sum_axes(&multiply(x, x)?, &[(sh.len() - 1) as i32], true)?;
+    let xf = x.as_dtype(Dtype::Float32)?;
+    let sum_sq = sum_axes(&multiply(&xf, &xf)?, &[(sh.len() - 1) as i32], true)?;
     let denom = maximum(&sum_sq, scalar(NORM_EPS))?.sqrt()?;
-    let normed = divide(x, &denom)?;
+    let normed = divide(&xf, &denom)?;
     let scaled = multiply(&normed, scalar((c as f32).sqrt()))?;
-    Ok(multiply(&scaled, gamma)?)
+    let out = multiply(&scaled, &gamma.as_dtype(Dtype::Float32)?)?;
+    Ok(out.as_dtype(in_dtype)?)
 }
 
 /// np.repeat over the last axis: `[…, C]` → `[…, C·repeats]` with each channel duplicated `repeats`
@@ -858,6 +868,11 @@ pub struct Wan22Vae {
     z_dim: i32,
     mean: Array, // [1,1,1,1,z]
     std: Array,  // [1,1,1,1,z]
+    /// Decoder compute dtype, **inferred from the loaded weights** (sc-5039): f32 by default, or
+    /// bf16 when the caller pre-casts the weight map (`Weights::cast_all(Bfloat16)`) to halve the
+    /// per-tile decoder-activation footprint. The latent denorm and the `RMS_norm` reduction always
+    /// run f32; this only governs the conv-heavy body. Decode-only — encode stays whatever loaded.
+    compute_dtype: Dtype,
 }
 
 impl Wan22Vae {
@@ -888,6 +903,8 @@ impl Wan22Vae {
             z_dim,
             mean,
             std,
+            // Infer the decode compute dtype from the loaded conv weights (bf16 when pre-cast).
+            compute_dtype: w.require("conv2.weight")?.dtype(),
         })
     }
 
@@ -928,6 +945,10 @@ impl Wan22Vae {
     /// Decode a channels-last normalized latent `[1, T, H, W, z]` → video `[1, T', 16H, 16W, 3]`.
     fn decode_cl(&self, z: &Array) -> Result<Array> {
         let denorm = add(&multiply(z, &self.std)?, &self.mean)?;
+        // Enter the (optional) bf16 decode island: denorm stays f32, the conv-heavy body runs in
+        // `compute_dtype` (no-op cast in f32 mode). The final clamp scalars are f32, so the output
+        // promotes back to f32 regardless.
+        let denorm = denorm.as_dtype(self.compute_dtype)?;
         let x = self.conv2.forward(&denorm, None)?;
         let out = self.decoder.forward(&x)?;
         let out = unpatchify(&out, 2)?;
@@ -949,9 +970,12 @@ impl Wan22Vae {
         let plan = cfg.plan(VaeTiling::WAN22, f, h, w);
 
         // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile decode adds the 2× spatial
-        // unpatchify (vae22 upsamples 16× via decoder×8 + patch×2) before the clamp.
+        // unpatchify (vae22 upsamples 16× via decoder×8 + patch×2) before the clamp. The per-tile
+        // body runs in `compute_dtype` (bf16 halves its activation peak, sc-5039); the f32 blend
+        // accumulators are unchanged (the clamp scalars promote each tile back to f32).
         tile_decode_accumulate(&denorm, &plan, [1, 2, 3], |tile| {
-            let x = self.conv2.forward(tile, None)?;
+            let tile = tile.as_dtype(self.compute_dtype)?;
+            let x = self.conv2.forward(&tile, None)?;
             let dec = self.decoder.forward(&x)?;
             let dec = unpatchify(&dec, 2)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)

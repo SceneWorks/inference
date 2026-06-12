@@ -279,7 +279,10 @@ impl Wan {
         // sc-4998 — pick the memory-budgeted z48 vae22 decode tiling now, so an over-budget decode
         // (the 60 GB / 4.3 min blowup the px-threshold `auto` produced at moderate res) fails
         // catchably *before* the heavy denoise rather than OOM-ing in the post-loop decode stage.
-        let decode_tiling = auto_tiling_budgeted(height as i32, width as i32, gen_frames as i32)?;
+        // sc-5039 — the decode runs **bf16** (visually lossless, cosine 0.999954 real-weight; lower
+        // peak ⇒ the budget fits bigger tiles), so the plan uses the bf16 cost coefficient.
+        let decode_tiling =
+            auto_tiling_budgeted(height as i32, width as i32, gen_frames as i32, true)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
@@ -420,9 +423,13 @@ impl Wan {
         // --- Stage 3: z48 vae22 decode → RGB8 frames ---
         on_progress(Progress::Decoding);
         // Causal temporal decode: t_lat → 1 + (t_lat−1)·4 output frames (= gen_frames). The tiling
-        // was chosen (and budget-checked) up front by `auto_tiling_budgeted` (sc-4998).
+        // was chosen (and budget-checked) up front by `auto_tiling_budgeted` (sc-4998). sc-5039 casts
+        // the decoder weights to bf16 (the conv-heavy body runs bf16, RMS_norm + denorm stay f32) —
+        // `Wan22Vae` infers its compute dtype from the loaded weights. Decode-only: the conditioning
+        // image was already encoded above through a separate f32 VAE load.
         let frames_u8 = {
-            let w = Weights::from_file(self.root.join("vae.safetensors"))?;
+            let mut w = Weights::from_file(self.root.join("vae.safetensors"))?;
+            w.cast_all(mlx_rs::Dtype::Bfloat16)?;
             let vae = Wan22Vae::from_weights(&w)?;
             decode_to_frames_22(&vae, &latents, decode_tiling.as_ref())?
         };
