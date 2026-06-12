@@ -57,10 +57,14 @@ impl Generator for SdxlGenerator {
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // The shared capability floor (count/size range/guidance/negative/sampler/conditioning):
         // since the descriptor advertises NO conditioning, any conditioning entry is rejected here.
-        self.descriptor.capabilities.validate_request(MODEL_ID, req)?;
+        self.descriptor
+            .capabilities
+            .validate_request(MODEL_ID, req)?;
         // Model-specific floor on top of the shared one (mirrors mlx-gen-sdxl::validate_request).
         if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg("sdxl: prompt must not be empty".into()));
+            return Err(gen_core::Error::Msg(
+                "sdxl: prompt must not be empty".into(),
+            ));
         }
         // An explicit `steps: Some(0)` would VAE-decode pure scaled noise — reject loudly (a derived
         // 0 from img2img strength would be a legitimate no-op, but this is txt2img-only).
@@ -149,7 +153,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     };
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(
-            "candle sdxl does not support LoRA/LoKr yet — refusing to silently drop the adapters".into(),
+            "candle sdxl does not support LoRA/LoKr yet — refusing to silently drop the adapters"
+                .into(),
         ));
     }
     // SDXL is fp16 (the production reference dtype) regardless of the CPU-default dtype; the device
@@ -259,8 +264,9 @@ mod tests {
     #[test]
     fn load_rejects_lora_adapters() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()))
-            .with_adapters(vec![AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora)]);
+        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
+        ]);
         let err = load(&spec).err().expect("expected an error");
         assert!(matches!(err, gen_core::Error::Unsupported(_)));
     }
