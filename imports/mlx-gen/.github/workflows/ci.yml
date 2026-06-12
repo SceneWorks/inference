@@ -11,6 +11,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The backend-neutral contract layer (gen-core) and its conformance testkit have ZERO tensor
+  # deps, so they build and test on Linux — fast, and the proof that the contract is genuinely
+  # backend-independent (a candle provider will satisfy the same testkit). This is the "gen-core CI
+  # (Linux, stub provider)" lane from epic 3720 / sc-4481: the testkit's in-crate stub exercises
+  # every conformance check (incl. the deliberately-broken stubs that prove each check fires).
+  contract:
+    name: gen-core + testkit (Linux, no tensor backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+          rustc --version
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Format (contract crates)
+        run: cargo fmt -p sceneworks-gen-core -p sceneworks-gen-core-testkit --check
+      - name: Clippy (contract crates)
+        run: cargo clippy -p sceneworks-gen-core -p sceneworks-gen-core-testkit --all-targets -- -D warnings
+      - name: Test (contract crates + testkit stub conformance)
+        run: cargo test -p sceneworks-gen-core -p sceneworks-gen-core-testkit
+
   test:
     name: fmt + clippy + test (macOS / Metal GPU)
     # Apple-Silicon runner: MLX is Apple-Silicon-only and the tests eval on the

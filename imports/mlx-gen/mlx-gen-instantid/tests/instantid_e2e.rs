@@ -499,7 +499,8 @@ fn instantid_honors_cancellation() {
         .generate(&req, &ref_img, &mut |_| {})
         .unwrap_err()
         .to_string();
-    assert!(err.contains("generation cancelled"), "got: {err}");
+    // The typed Error::Canceled displays as "cancelled" (epic 3720 / sc-4481).
+    assert!(err.contains("cancelled"), "got: {err}");
 
     // Mid-denoise: trip the flag from the first Step callback; the loop must stop early.
     let req = InstantIdRequest {
@@ -520,7 +521,8 @@ fn instantid_honors_cancellation() {
         })
         .unwrap_err()
         .to_string();
-    assert!(err.contains("generation cancelled"), "got: {err}");
+    // The typed Error::Canceled displays as "cancelled" (epic 3720 / sc-4481).
+    assert!(err.contains("cancelled"), "got: {err}");
     assert!(
         (1..=2).contains(&steps_seen),
         "denoise should stop right after the cancel trip (saw step {steps_seen})"

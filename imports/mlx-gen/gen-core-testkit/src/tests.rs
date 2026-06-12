@@ -1,0 +1,253 @@
+//! The testkit verifying itself: a configurable in-crate stub generator drives each conformance
+//! check, and one deliberately-broken variant per check proves the check actually fires (the
+//! sc-4481 AC). The stub is pure-host (no tensor library), so these run on the Linux gen-core lane.
+
+use super::*;
+use gen_core::registry::ModelRegistration;
+use gen_core::runtime::LoadSpec;
+use gen_core::{
+    Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    Modality, ModelDescriptor, Progress,
+};
+use std::cell::Cell;
+
+/// The registered stub id (round-trips through the registry, see the `inventory::submit!` below).
+const STUB_ID: &str = "testkit_stub";
+/// A stub id that is deliberately NOT registered — exercises the registry-check failure path.
+const UNREG_ID: &str = "testkit_unregistered_stub";
+
+/// Which contract guarantees the stub upholds. `good()` upholds all of them; each broken-stub test
+/// flips exactly one to false and asserts the matching check fails.
+#[derive(Clone, Copy)]
+struct Behavior {
+    /// `validate()` enforces the capability floor (vs. rubber-stamping every request).
+    honest_validate: bool,
+    /// Emits a `Progress::Step` per denoise iteration.
+    emit_progress: bool,
+    /// Checks `CancelFlag` at each step boundary and bails.
+    honor_cancel: bool,
+    /// On cancel, returns the typed `Error::Canceled` (vs. a stringified `Error::Msg`).
+    typed_cancel: bool,
+    /// Output pixels depend only on the seed (vs. drifting per call).
+    deterministic: bool,
+}
+
+impl Behavior {
+    fn good() -> Self {
+        Self {
+            honest_validate: true,
+            emit_progress: true,
+            honor_cancel: true,
+            typed_cancel: true,
+            deterministic: true,
+        }
+    }
+}
+
+struct Stub {
+    desc: ModelDescriptor,
+    behavior: Behavior,
+    /// Per-instance call counter — the nondeterministic variant fills pixels from this.
+    runs: Cell<u32>,
+}
+
+fn stub_caps() -> Capabilities {
+    Capabilities {
+        conditioning: vec![ConditioningKind::Reference],
+        min_size: 64,
+        max_size: 512,
+        max_count: 4,
+        ..Default::default()
+    }
+}
+
+fn stub_desc(id: &'static str) -> ModelDescriptor {
+    ModelDescriptor {
+        id,
+        family: "testkit",
+        backend: "stub",
+        modality: Modality::Image,
+        capabilities: stub_caps(),
+    }
+}
+
+impl Stub {
+    fn new(id: &'static str, behavior: Behavior) -> Self {
+        Self {
+            desc: stub_desc(id),
+            behavior,
+            runs: Cell::new(0),
+        }
+    }
+
+    fn boxed(id: &'static str, behavior: Behavior) -> Box<dyn Generator> {
+        Box::new(Self::new(id, behavior))
+    }
+}
+
+impl Generator for Stub {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.desc
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        if self.behavior.honest_validate {
+            self.desc.capabilities.validate_request(self.desc.id, req)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        if self.behavior.honest_validate {
+            self.validate(req)?;
+        }
+        let total = req.steps.unwrap_or(2);
+        let run = self.runs.get();
+        self.runs.set(run + 1);
+        for i in 1..=total {
+            if self.behavior.honor_cancel && req.cancel.is_cancelled() {
+                return Err(if self.behavior.typed_cancel {
+                    Error::Canceled
+                } else {
+                    Error::Msg("generation cancelled".into())
+                });
+            }
+            if self.behavior.emit_progress {
+                on_progress(Progress::Step { current: i, total });
+            }
+        }
+        let fill = if self.behavior.deterministic {
+            req.seed.unwrap_or(0) as u8
+        } else {
+            run as u8
+        };
+        let img = Image {
+            width: req.width,
+            height: req.height,
+            pixels: vec![fill; req.width as usize * req.height as usize * 3],
+        };
+        Ok(GenerationOutput::Images(vec![img]))
+    }
+}
+
+// Register the good stub so the registry round-trip resolves its id. This is the only
+// ModelRegistration in the testkit's test binary, so the registry contains exactly this one.
+fn stub_descriptor() -> ModelDescriptor {
+    stub_desc(STUB_ID)
+}
+fn stub_load(_spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Stub::boxed(STUB_ID, Behavior::good()))
+}
+inventory::submit! {
+    ModelRegistration { descriptor: stub_descriptor, load: stub_load }
+}
+
+fn cheap() -> Profile {
+    Profile::cheap()
+}
+
+#[test]
+fn good_stub_passes_full_conformance() {
+    conformance(|| Stub::boxed(STUB_ID, Behavior::good()), &cheap());
+}
+
+#[test]
+fn good_stub_passes_every_check_individually() {
+    let g = Stub::new(STUB_ID, Behavior::good());
+    check_validate_honesty(&g, &cheap()).unwrap();
+    check_progress(&g, &cheap()).unwrap();
+    check_cancellation(&g, &cheap()).unwrap();
+    check_seed_determinism(&g, &cheap()).unwrap();
+    check_registry_roundtrip(&g).unwrap();
+}
+
+#[test]
+fn dishonest_validate_fails_validate_check() {
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            honest_validate: false,
+            ..Behavior::good()
+        },
+    );
+    assert!(check_validate_honesty(&g, &cheap()).is_err());
+}
+
+#[test]
+fn missing_progress_fails_progress_check() {
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            emit_progress: false,
+            ..Behavior::good()
+        },
+    );
+    assert!(check_progress(&g, &cheap()).is_err());
+}
+
+#[test]
+fn ignoring_cancel_fails_cancellation_check() {
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            honor_cancel: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_cancellation(&g, &cheap()).unwrap_err();
+    assert!(err.contains("ran to completion"), "got: {err}");
+}
+
+#[test]
+fn stringified_cancel_fails_cancellation_check() {
+    // The exact pre-sc-4481 family behavior: stops early but returns Error::Msg, not Canceled.
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            typed_cancel: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_cancellation(&g, &cheap()).unwrap_err();
+    assert!(err.contains("typed Err(Error::Canceled)"), "got: {err}");
+}
+
+#[test]
+fn nondeterministic_fails_seed_check() {
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            deterministic: false,
+            ..Behavior::good()
+        },
+    );
+    assert!(check_seed_determinism(&g, &cheap()).is_err());
+}
+
+#[test]
+fn unregistered_id_fails_registry_check() {
+    let g = Stub::new(UNREG_ID, Behavior::good());
+    assert!(check_registry_roundtrip(&g).is_err());
+}
+
+#[test]
+#[should_panic(expected = "conformance FAILED")]
+fn conformance_panics_on_a_broken_stub() {
+    conformance(
+        || {
+            Stub::boxed(
+                STUB_ID,
+                Behavior {
+                    honor_cancel: false,
+                    ..Behavior::good()
+                },
+            )
+        },
+        &cheap(),
+    );
+}

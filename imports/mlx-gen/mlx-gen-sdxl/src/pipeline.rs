@@ -332,7 +332,7 @@ fn denoise_core(
     let total = steps as u32;
     for i in 0..steps {
         if cancel.is_cancelled() {
-            return Err(Error::Msg("generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         // Scale the latents into the model's input space: identity for the ancestral sampler (which
         // folds the renormalization into its step → bit-identical to the pre-trait loop), `x/√(σ²+1)`
