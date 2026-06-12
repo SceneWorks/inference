@@ -3,14 +3,15 @@
 //! and into the backend-neutral [`gen_core::Generator`] contract.
 //!
 //! What changed vs the spike, and what deliberately did **not**:
-//! - **Same numerics** (the GO-validated path): dual CLIP (CLIP-L + CLIP-bigG) loaded **f32** and
-//!   encoded, embeddings cast to **f16**; UNet **f16**; VAE **f16** with the
+//! - **Same component numerics** (the GO-validated path): dual CLIP (CLIP-L + CLIP-bigG) loaded
+//!   **f32** and encoded, embeddings cast to **f16**; UNet **f16**; VAE **f16** with the
 //!   `madebyollin/sdxl-vae-fp16-fix` (f16 SDXL VAE NaNs without it); VAE scale **0.13025** (the
-//!   diffusers SDXL value, not candle's hardcoded SD1.5 0.18215); euler-ancestral scheduler.
-//! - **Seeding is still the spike's `device.set_seed` + `Tensor::randn`** — the env-fragile path the
-//!   sc-3498 findings flagged. Replacing it with deterministic CPU-seeded noise + a non-ancestral
-//!   scheduler is **sc-3673** (the conformance suite's seed-determinism check, sc-4481, gates it);
-//!   it is intentionally NOT pre-empted here. See the `// sc-3673` seam in [`Pipeline::generate`].
+//!   diffusers SDXL value, not candle's hardcoded SD1.5 0.18215).
+//! - **Deterministic seeding + non-ancestral scheduler (sc-3673)**: initial noise is drawn from a
+//!   fixed-algorithm CPU RNG (`StdRng`) seeded by `seed` and moved to the device — NOT candle's CUDA
+//!   `device.set_seed`, whose seed→noise mapping was not portable across launch environments and
+//!   occasionally collapsed the sample (sc-3498). The sampler is **DDIM (eta=0)**, non-ancestral, so
+//!   there is no per-step stochastic noise. Net: generation is a pure function of `(seed, request)`.
 //! - **CLI/`emit_event`/PNG/sidecar removed**: progress is `on_progress(Progress::Step/Decoding)`,
 //!   cancellation is `req.cancel` → typed [`gen_core::Error::Canceled`], and each image is returned as a
 //!   `gen_core::Image` (RGB8) — the worker owns asset writes (no candle-specific worker code).
@@ -27,7 +28,11 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
+use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
+use candle_transformers::models::stable_diffusion::schedulers::SchedulerConfig;
 use candle_transformers::models::stable_diffusion::{self, StableDiffusionConfig};
+use rand::{rngs::StdRng, SeedableRng};
+use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
 /// diffusers SDXL VAE `scaling_factor` (candle's example hardcodes the SD1.5 value 0.18215 for `Xl`;
@@ -230,13 +235,27 @@ impl Pipeline {
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let seed = base_seed.wrapping_add(index as u64);
-            // sc-3673: env-fragile seeding (CUDA `set_seed` + on-device `randn`). To be replaced by a
-            // deterministic CPU-seeded noise draw + a non-ancestral scheduler.
-            self.device.set_seed(seed)?;
 
-            let mut scheduler = self.config.build_scheduler(steps)?;
+            // sc-3673 — deterministic, launch-portable initial noise: draw N(0,1) from a
+            // fixed-algorithm CPU RNG (`StdRng`, ChaCha-based) seeded by `seed`, build the latent on
+            // CPU, then move it to the compute device. This replaces candle's CUDA `device.set_seed`
+            // + on-device `randn`, whose seed→noise mapping was NOT portable across launch
+            // environments and occasionally collapsed the sample to garbage (sc-3498). Paired with the
+            // non-ancestral DDIM scheduler below (no per-step stochastic noise), the whole generation
+            // is now a pure function of `(seed, request)` — same seed ⇒ same image, any launch.
+            let n = 4 * lat_h * lat_w;
+            let mut rng = StdRng::seed_from_u64(seed);
+            let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+            let init = Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?
+                .to_device(&self.device)?;
+
+            // DDIM (eta=0): non-ancestral / deterministic, vs candle's default Euler-ancestral (which
+            // injects fresh noise every step). SceneWorks/diffusers SDXL defaults to EulerDiscrete —
+            // also non-ancestral, deterministic; DDIM is the closest deterministic solver candle ships
+            // and gives portable, collapse-free output. Its config defaults ARE the SDXL values
+            // (scaled_linear β 0.00085→0.012, epsilon prediction, 1000 train steps).
+            let mut scheduler = DDIMSchedulerConfig::default().build(steps)?;
             let timesteps = scheduler.timesteps().to_vec();
-            let init = Tensor::randn(0f32, 1f32, (1, 4, lat_h, lat_w), &self.device)?;
             let mut latents = (init * scheduler.init_noise_sigma())?.to_dtype(self.dtype)?;
 
             for (step_i, &timestep) in timesteps.iter().enumerate() {

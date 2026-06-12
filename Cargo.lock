@@ -223,6 +223,9 @@ dependencies = [
  "hf-hub",
  "image",
  "inventory",
+ "rand",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
  "tokenizers 0.22.2",
 ]
 
@@ -2322,6 +2325,14 @@ dependencies = [
  "safetensors 0.4.5",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
+]
+
+[[package]]
+name = "sceneworks-gen-core-testkit"
+version = "0.1.0"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=8355152a79d6d328d3798c19a2b5a37bb8468622#8355152a79d6d328d3798c19a2b5a37bb8468622"
+dependencies = [
+ "sceneworks-gen-core",
 ]
 
 [[package]]
