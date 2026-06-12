@@ -52,6 +52,7 @@ fn stub_desc(id: &'static str) -> TrainerDescriptor {
     TrainerDescriptor {
         id,
         family: "testkit",
+        backend: "stub",
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,

@@ -65,6 +65,7 @@ fn stub_desc(id: &'static str) -> CaptionerDescriptor {
     CaptionerDescriptor {
         id,
         family: "testkit",
+        backend: "stub",
         capabilities: stub_caps(),
     }
 }
