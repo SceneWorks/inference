@@ -22,8 +22,9 @@ candle-gen/                 # workspace root
   candle-gen-sdxl/          # SDXL provider crate: Generator impl + descriptor + inventory::submit!
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
+    check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)
     package-cuda.ps1        # bundle a CUDA build + redist DLLs into dist/ (sc-3676; see Packaging)
-  .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test; Windows/CUDA lane
+  .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test; manual Windows/CUDA lane
 ```
 
 A provider crate self-registers just by being linked (`inventory::submit!`), so adding a model is
@@ -88,8 +89,20 @@ set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
 cargo build --release -p candle-gen-sdxl --example txt2img --features cuda
 ```
 
-CI runs exactly this on a self-hosted `[self-hosted, windows, cuda]` runner (the `windows-cuda` lane
-in `.github/workflows/ci.yml`) — reproducible, no hand-set local toolchain.
+The scripted, reproducible form of this — sources vcvars, sets the env, runs `cargo build/test
+--workspace --features cuda` — is `scripts/check-cuda.ps1`. **Run it before pushing CUDA-touching
+changes**: the CPU/Metal CI lanes are blind to `#[cfg(feature = "cuda")]` code, so this is the real
+cuda gate.
+
+```powershell
+pwsh scripts/check-cuda.ps1            # build + test
+pwsh scripts/check-cuda.ps1 -SkipTests # build-only smoke check
+```
+
+The `windows-cuda` lane in `.github/workflows/ci.yml` runs the same recipe but is **manual-only**
+(`workflow_dispatch`) — it needs no standing runner. To run it in CI you must first register a
+self-hosted `[self-hosted, windows, cuda]` runner, then dispatch the workflow by hand. (GitHub's
+hosted GPU larger-runners are Tesla T4 / sm_75, below our sm_80 baseline, so they can't run it.)
 
 ### Bundle the runtime DLLs
 
