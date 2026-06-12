@@ -14,6 +14,7 @@
 //! **precomputed once per expert** before the loop (the reference's `prepare_cross_kv` / `prepare_rope`)
 //! and reused across all steps, instead of recomputed every forward.
 
+use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
@@ -92,6 +93,66 @@ pub fn best_output_size(width: u32, height: u32, dw: u32, dh: u32, max_area: usi
     } else {
         (ow2 as u32, oh2 as u32)
     }
+}
+
+/// sc-4986 — **pre-flight denoise memory guard.** Estimate the concurrent GPU peak of the
+/// DiT-denoise stage (the resident transformer weights + the per-token activation working set of one
+/// forward) and return a **catchable** error *before* the expensive text-encode / weight-load when it
+/// exceeds this machine's MLX memory budget — instead of letting the OS hard-kill the worker (SIGKILL)
+/// or the Metal command buffer abort it (uncaught `kIOGPUCommandBufferCallbackError…` → `terminate`),
+/// the two non-recoverable deaths seen in production. Mirrors the z-image sc-4874 `preflight_memory_guard`.
+///
+/// The staged generate (TE → DiT → VAE each loaded then dropped, see [`crate::model`]) means the DiT
+/// stage is the transformer peak; the **14B MoE keeps both experts resident**, so pass the summed
+/// expert bytes. `activation_bytes ≈ 72 · batch · tokens · dim` is fit from real Wan2.2 TI2V-5B
+/// measurements (peak − weights across L = 1 760 … 32 560, batched B=2; sc-4986). `batch` is 2 with CFG.
+///
+/// Scope: this guards **memory** (OOM / command-buffer abort). It deliberately does *not* encode a
+/// wall-time/step-count policy (a long-but-fitting run is the worker's call — sc-4997 / the
+/// forward-progress watchdog sc-4984), nor the z48 VAE-decode peak (that peak is tiling-plan-dependent
+/// until sc-4998 makes it memory-budgeted, at which point its term belongs here too).
+pub fn preflight_denoise_memory_guard(
+    model_id: &str,
+    dit_resident_bytes: u64,
+    tokens: usize,
+    dim: usize,
+    cfg_enabled: bool,
+) -> Result<()> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let weights_gb = dit_resident_bytes as f64 / GIB;
+    let peak_gb = estimated_denoise_peak_gib(dit_resident_bytes, tokens, dim, cfg_enabled);
+    let act_gb = peak_gb - weights_gb;
+    let budget_gb = get_memory_limit() as f64 / GIB;
+    let safe = budget_gb * 0.85;
+    if peak_gb > safe {
+        return Err(Error::Msg(format!(
+            "{model_id}: a denoise step at this resolution/frame-count needs ~{peak_gb:.0} GB \
+             (transformer ~{weights_gb:.0} GB resident + ~{act_gb:.0} GB activations for {tokens} \
+             attention tokens{}), exceeding this machine's ~{safe:.0} GB safe budget ({budget_gb:.0} \
+             GB MLX limit × 0.85). Unmitigated, the OS hard-kills the worker (SIGKILL) or the Metal \
+             command buffer aborts (sc-4986). Reduce the resolution or frame count, or load a Q8/Q4 \
+             snapshot.",
+            if cfg_enabled { ", ×2 for CFG" } else { "" }
+        )));
+    }
+    Ok(())
+}
+
+/// Estimated concurrent GPU peak (GiB) of one denoise stage: resident transformer weights + the
+/// activation working set of a single forward. `activation ≈ 72 B · batch · tokens · dim`, fit from
+/// real Wan2.2 TI2V-5B measurements (sc-4986: peak − weights tracked 0.7→14.4 GiB across
+/// L = 1 760…32 560 at batch 2). Pure (no global state) so it is unit-testable against those anchors.
+fn estimated_denoise_peak_gib(
+    dit_resident_bytes: u64,
+    tokens: usize,
+    dim: usize,
+    cfg_enabled: bool,
+) -> f64 {
+    const ACT_BYTES_PER_ELEM: f64 = 72.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let batch = if cfg_enabled { 2.0 } else { 1.0 };
+    let act = ACT_BYTES_PER_ELEM * batch * tokens as f64 * dim as f64;
+    (dit_resident_bytes as f64 + act) / GIB
 }
 
 /// Classifier-free guidance combine: `uncond + gs·(cond − uncond)`.
@@ -700,6 +761,52 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denoise_peak_estimate_matches_5b_measurements() {
+        // sc-4986 anchors (real 5B, dim 3072, batch 2 / CFG on). bf16 model.safetensors ≈ 11.5 GiB
+        // resident; measured total denoise peak at L tokens. The estimate must land within ~2 GiB.
+        let weights = (11.5 * 1024.0 * 1024.0 * 1024.0) as u64;
+        for (tokens, measured_peak) in [(1760usize, 11.2_f64), (16720, 17.5), (32560, 24.9)] {
+            let est = estimated_denoise_peak_gib(weights, tokens, 3072, true);
+            assert!(
+                (est - measured_peak).abs() < 2.0,
+                "L={tokens}: estimate {est:.1} GiB vs measured {measured_peak:.1} GiB"
+            );
+        }
+    }
+
+    #[test]
+    fn denoise_peak_scales_with_cfg_and_tokens() {
+        let w = 10u64 << 30; // 10 GiB
+                             // CFG doubles the activation term.
+        let on = estimated_denoise_peak_gib(w, 32560, 3072, true);
+        let off = estimated_denoise_peak_gib(w, 32560, 3072, false);
+        assert!(
+            on - 10.0 > 1.9 * (off - 10.0),
+            "CFG should ~2× the activation term"
+        );
+        // Monotonic in tokens.
+        assert!(estimated_denoise_peak_gib(w, 40000, 3072, true) > on);
+    }
+
+    #[test]
+    fn guard_rejects_over_budget_and_passes_under() {
+        use mlx_rs::memory::set_memory_limit;
+        // Pin a deterministic budget (32 GiB) so the threshold is exercised on any machine, then
+        // restore. set_memory_limit returns the previous value.
+        let prev = set_memory_limit(32 << 30);
+        // A 14B-class resident (two bf16 experts ≈ 56 GiB) blows the 32 GiB budget on weights alone.
+        let res = preflight_denoise_memory_guard("wan_test", 56 << 30, 1024, 5120, true);
+        // A tiny model + small request fits comfortably (10 GiB + ~1.5 GiB acts < 27 GiB safe).
+        let ok = preflight_denoise_memory_guard("wan_test", 10 << 30, 5280, 3072, true);
+        set_memory_limit(prev);
+        assert!(
+            res.is_err(),
+            "56 GiB resident must be rejected under a 32 GiB budget"
+        );
+        assert!(ok.is_ok(), "11.5 GiB peak must pass under a 32 GiB budget");
+    }
 
     #[test]
     fn align_dim_rounds_down_to_tile() {
