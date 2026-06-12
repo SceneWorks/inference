@@ -522,6 +522,91 @@ mod tests {
     use mlx_rs::ops::{all_close, array_eq};
     use std::path::PathBuf;
 
+    /// sc-4986 — retire the "does a lightx2v Lightning LoRA actually load through mlx-gen?" risk by
+    /// running the **real** distill-LoRA file's keys through the genuine [`normalize_wan_key`] and
+    /// asserting every module resolves to a valid Wan DiT target (`blocks.N.{self,cross}_attn.{q,k,v,o}`
+    /// or `blocks.N.ffn.{fc1,fc2}`). `#[ignore]` — needs the downloaded LoRA:
+    /// ```text
+    /// WAN_LIGHTNING_LORA="$HOME/.cache/huggingface/hub/models--lightx2v--Wan2.2-Lightning/snapshots/\
+    /// 18bccf8884ec0a078eed79785eb4ef13ea16ce1e/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/\
+    /// high_noise_model.safetensors" \
+    ///   cargo test -p mlx-gen-wan lightning_lora_keys_normalize -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a downloaded lightx2v Wan2.2 Lightning LoRA (WAN_LIGHTNING_LORA)"]
+    fn lightning_lora_keys_normalize_to_wan_dit_targets() {
+        let path = match std::env::var_os("WAN_LIGHTNING_LORA") {
+            Some(p) => PathBuf::from(p),
+            None => {
+                eprintln!("skip: set WAN_LIGHTNING_LORA to a downloaded lightx2v Lightning LoRA");
+                return;
+            }
+        };
+        let lw = Weights::from_file(&path).expect("read LoRA safetensors");
+
+        // Collapse factor keys (.lora_down/.lora_up/.alpha/.lora_A/.lora_B) to distinct module paths,
+        // exactly as the merge loop keys its parts, then normalize each through the real mapper.
+        let mut modules = std::collections::BTreeSet::new();
+        for key in lw.keys() {
+            if let Some((stem, _role)) = SUFFIXES
+                .iter()
+                .find_map(|(suf, r)| key.strip_suffix(suf).map(|s| (s, *r)))
+            {
+                modules.insert(normalize_wan_key(stem));
+            }
+        }
+        assert!(!modules.is_empty(), "no LoRA factor keys found in {path:?}");
+
+        // Every normalized module must hit the native converted-Wan DiT namespace. Anything else
+        // would fold onto nothing (silent no-op) — the exact failure we are de-risking.
+        let valid = |m: &str| -> bool {
+            let Some(rest) = m.strip_prefix("blocks.") else {
+                // a handful of non-block targets the distill LoRA may also touch
+                return matches!(m, "head.head" | "patch_embedding_proj")
+                    || m.starts_with("text_embedding_")
+                    || m.starts_with("time_embedding_")
+                    || m == "time_projection";
+            };
+            let Some((_n, tail)) = rest.split_once('.') else {
+                return false;
+            };
+            matches!(
+                tail,
+                "self_attn.q"
+                    | "self_attn.k"
+                    | "self_attn.v"
+                    | "self_attn.o"
+                    | "cross_attn.q"
+                    | "cross_attn.k"
+                    | "cross_attn.v"
+                    | "cross_attn.o"
+                    | "cross_attn.k_img"
+                    | "cross_attn.v_img"
+                    | "ffn.fc1"
+                    | "ffn.fc2"
+            )
+        };
+        let bad: Vec<&String> = modules.iter().filter(|m| !valid(m)).collect();
+        println!(
+            "[lightning lora] {} distinct modules; {} resolve to valid Wan DiT targets, {} unmatched",
+            modules.len(),
+            modules.len() - bad.len(),
+            bad.len()
+        );
+        if !bad.is_empty() {
+            println!("[lightning lora] UNMATCHED (would fold onto nothing): {bad:?}");
+        }
+        // Sample the resolved targets for the log.
+        for m in modules.iter().take(4) {
+            println!("[lightning lora]   e.g. {m}");
+        }
+        assert!(
+            bad.is_empty(),
+            "{} Lightning LoRA module(s) normalize to non-DiT targets and would silently no-op",
+            bad.len()
+        );
+    }
+
     #[test]
     fn normalize_strips_prefix_and_renames() {
         // attn q/k/v/o pass through (already checkpoint naming).
