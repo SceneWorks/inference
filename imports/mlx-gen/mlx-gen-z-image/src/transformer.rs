@@ -95,13 +95,29 @@ pub struct ZImageTransformer {
     pub(crate) final_layer: FinalLayer,
     pub(crate) x_pad_token: Array,
     pub(crate) cap_pad_token: Array,
+    /// sc-4887 — when `Some(dt)` (set only by [`cast_weights`](Self::cast_weights), i.e. only in
+    /// training), the caption stream joins the unified stack cast to `dt` after the context
+    /// refiners. The caption ENTRY (cap norm/linear + context refiners, 32 tokens) deliberately
+    /// stays f32: the Qwen embeddings carry outlier dims whose bf16 rounding measurably scrambles
+    /// the tiny context-refiner LoRA grads (per-param cosine vs f32 as low as 0.43), while costing
+    /// nothing to keep precise. `None` (every inference path) = zero behavior change.
+    pub(crate) train_unify_dtype: Option<mlx_rs::Dtype>,
 }
 
 /// `where(keep == 1, emb, pad)` for `emb` `[N, dim]`, `keep` `[N, 1]` (1 = real, 0 = padded),
 /// `pad` `[1, dim]` — set padded token positions to the learned pad-token embedding.
+/// Dtype-following on the PAD TOKEN (sc-4887), the weight-derived operand: the keep mask and the
+/// constant are built f32, which under the bf16 training cast (pad token bf16) would promote both
+/// token streams back to f32 right at entry. Keying off `pad` — NOT `emb` — keeps every inference
+/// config bit-identical: pad tokens are f32 in all of them (KEEP-F32; `quantize` never touches
+/// them), including the Q8/Q4 path whose `emb` arrives bf16 and must keep promoting to f32 exactly
+/// as the parity goldens were dumped. A 0/1 mask is exact in bf16.
 pub(crate) fn apply_pad(emb: &Array, keep: &Array, pad: &Array) -> Result<Array> {
-    let inv = subtract(Array::from_slice(&[1.0f32], &[1]), keep)?; // 1 - keep
-    Ok(add(&multiply(emb, keep)?, &multiply(pad, &inv)?)?)
+    let dt = pad.dtype();
+    let keep = keep.as_dtype(dt)?;
+    let one = Array::from_slice(&[1.0f32], &[1]).as_dtype(dt)?;
+    let inv = subtract(&one, &keep)?; // 1 - keep
+    Ok(add(&multiply(emb, &keep)?, &multiply(pad, &inv)?)?)
 }
 
 impl ZImageTransformer {
@@ -162,6 +178,7 @@ impl ZImageTransformer {
             final_layer: FinalLayer::from_weights(w, &p(&format!("all_final_layer.{key}")))?,
             x_pad_token: w.require(&p("x_pad_token"))?.reshape(&[1, cfg.dim])?,
             cap_pad_token: w.require(&p("cap_pad_token"))?.reshape(&[1, cfg.dim])?,
+            train_unify_dtype: None,
             cfg,
         })
     }
@@ -202,6 +219,56 @@ impl ZImageTransformer {
     /// byte-compare its loaded quantization and run its forward in isolation against the fork.
     pub fn x_embedder(&self) -> &AdaptableLinear {
         &self.x_embedder
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing (sc-4886) — `main` for the 30-block unified
+    /// stack, `refiners` for the noise/context refiners. Training-only knob: the trainer enables it
+    /// unconditionally (it is numerically identical to the dense backward and bounds the seq²
+    /// attention retention to one layer's transient); when whole-block checkpointing (sc-4874) is
+    /// on, the trainer turns the MAIN flag off — the block recompute already covers attention, and
+    /// nesting would recompute it twice for no memory win.
+    pub fn set_sdpa_checkpoint(&mut self, main: bool, refiners: bool) {
+        for b in &mut self.layers {
+            b.set_sdpa_checkpoint(main);
+        }
+        for b in &mut self.noise_refiner {
+            b.set_sdpa_checkpoint(refiners);
+        }
+        for b in &mut self.context_refiner {
+            b.set_sdpa_checkpoint(refiners);
+        }
+    }
+
+    /// Cast the DiT to the `dtype` training compute precision in place — the sc-4887 bf16 switch.
+    /// Covers the image/unified path (x embedder, t embedder, noise refiners, main stack, final
+    /// layer, x pad token); the caption ENTRY (cap norm/linear, context refiners, cap pad token)
+    /// deliberately stays f32 and the caption stream is cast to `dtype` only where it joins the
+    /// unified stack (see `train_unify_dtype`) — the Qwen embeddings' outlier dims make the tiny
+    /// context-refiner LoRA grads precision-sensitive, and 32 caption tokens cost nothing in f32.
+    /// Destructive for a narrowing cast (f32→bf16): reload for f32. Inference never calls this
+    /// (KEEP-F32, sc-2609 — the f32 render is the preferred output).
+    pub fn cast_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.x_embedder.cast_weights(dtype)?;
+        self.t_embedder.cast_weights(dtype)?;
+        self.final_layer.cast_weights(dtype)?;
+        for block in &mut self.noise_refiner {
+            block.cast_weights(dtype)?;
+        }
+        for block in &mut self.layers {
+            block.cast_weights(dtype)?;
+        }
+        if self.x_pad_token.dtype() != dtype {
+            self.x_pad_token = self.x_pad_token.as_dtype(dtype)?;
+        }
+        self.train_unify_dtype = (dtype != mlx_rs::Dtype::Float32).then_some(dtype);
+        Ok(())
+    }
+
+    /// The DiT's current compute dtype, probed from the image embedder's dense weight (`None` if
+    /// quantized). Lets the trainer detect a prior [`cast_weights`](Self::cast_weights) — the cast
+    /// is destructive, so a trainer asked for f32 after a bf16 cast must reload, not proceed.
+    pub fn compute_dtype(&self) -> Option<mlx_rs::Dtype> {
+        self.x_embedder.weight_dtype()
     }
 
     /// Build the [`Prepared`] step-invariant inputs (patchify metadata + RoPE freqs) for a latent of
@@ -254,7 +321,12 @@ impl ZImageTransformer {
             cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
         }
 
-        // Unify and run the main stack.
+        // Unify and run the main stack. In bf16 training the f32 caption stream joins cast to the
+        // training dtype here (see `train_unify_dtype`); inference: None, no-op.
+        let cap_emb = match self.train_unify_dtype {
+            Some(dt) => cap_emb.as_dtype(dt)?,
+            None => cap_emb,
+        };
         let x_len = x_emb.shape()[1];
         let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
         for layer in &self.layers {
@@ -312,6 +384,10 @@ impl ZImageTransformer {
             cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
         }
 
+        let cap_emb = match self.train_unify_dtype {
+            Some(dt) => cap_emb.as_dtype(dt)?,
+            None => cap_emb,
+        };
         let x_len = x_emb.shape()[1];
         let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
 
@@ -351,12 +427,17 @@ impl ZImageTransformer {
                 // Reinstall the explicit-input factors with the SAME `(transpose, alpha/rank fold,
                 // scale=1)` `install_training_lora` applies — so the checkpointed block forward is
                 // numerically identical to the installed-adapter path, and grads route to `inp`.
+                // Dtype-following on the hidden state (sc-4887): under the bf16 training cast the
+                // f32 factors must join the bf16 stream or every adapted Linear re-promotes the
+                // block to f32. No-op in f32 mode; grads flow back f32 through the astype VJP.
+                let dt = inp[0].dtype();
                 for (j, local) in locals.iter().enumerate() {
-                    let a = inp[1 + 2 * j].t(); // [r,in] -> [in,r]
+                    let a = inp[1 + 2 * j].t().as_dtype(dt)?; // [r,in] -> [in,r]
                     let rank = a.shape()[1] as f32;
                     let b = inp[2 + 2 * j]
                         .t() // [out,r] -> [r,out]
-                        .multiply(Array::from_slice(&[alpha_c / rank], &[1]))?;
+                        .multiply(Array::from_slice(&[alpha_c / rank], &[1]))?
+                        .as_dtype(dt)?;
                     let segs: Vec<&str> = local.split('.').collect();
                     blk.adaptable_mut(&segs)
                         .ok_or_else(|| {
@@ -490,6 +571,26 @@ pub(crate) struct Prepared {
     pub(crate) x_freqs: Array,
     pub(crate) cap_freqs: Array,
     pub(crate) unified_freqs: Array,
+}
+
+impl Prepared {
+    /// Cast the image/unified-side float inputs (x + unified RoPE freqs) to `dtype` — the sc-4887
+    /// bf16 training entry cast. The caption side (`cap_tokens`, `cap_freqs`) deliberately stays
+    /// f32 — the caption entry runs full precision and joins the unified stack cast (see
+    /// `ZImageTransformer::train_unify_dtype`). The keep masks are handled dtype-following inside
+    /// `apply_pad`. Inference never calls this (its `Prepared` stays f32, KEEP-F32 / sc-2609).
+    pub(crate) fn cast_floats(&self, dtype: mlx_rs::Dtype) -> Result<Prepared> {
+        Ok(Prepared {
+            cap_tokens: self.cap_tokens.clone(),
+            x_size: self.x_size,
+            x_keep: self.x_keep.clone(),
+            cap_keep: self.cap_keep.clone(),
+            img_pad: self.img_pad,
+            x_freqs: self.x_freqs.as_dtype(dtype)?,
+            cap_freqs: self.cap_freqs.clone(),
+            unified_freqs: self.unified_freqs.as_dtype(dtype)?,
+        })
+    }
 }
 
 /// Caption position-ids `[(1+i), 0, 0]` and keep-mask (1 for real tokens, 0 for padding), with the

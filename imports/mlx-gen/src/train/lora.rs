@@ -145,6 +145,21 @@ pub fn install_training_lora<H: AdaptableHost>(
     targets: &[LoraTarget],
     alpha: f32,
 ) -> MlxResult<()> {
+    install_training_lora_as(host, params, targets, alpha, None)
+}
+
+/// [`install_training_lora`] with an optional compute-dtype cast: when `dtype` is `Some`, the folded
+/// factors are cast to it inside the traced graph (sc-4887 bf16 mixed-precision training — the
+/// residual must match the bf16 activation stream or every adapted Linear silently re-promotes the
+/// whole chain to f32). The trainable leaves stay f32; the gradient flows back through the `astype`
+/// VJP, so the optimizer still sees f32 grads (master-weights pattern). `None` = factor dtype as-is.
+pub fn install_training_lora_as<H: AdaptableHost>(
+    host: &mut H,
+    params: &LoraParams,
+    targets: &[LoraTarget],
+    alpha: f32,
+    dtype: Option<Dtype>,
+) -> MlxResult<()> {
     for t in targets {
         // `.get().ok_or_else()?` rather than a direct index: a bookkeeping bug that drops a key from
         // the optimizer-stepped params map must surface as a typed error, not a panic (F-008).
@@ -158,6 +173,10 @@ pub fn install_training_lora<H: AdaptableHost>(
             .t(); // [out,r] -> [r,out]
         let rank = a.shape()[1] as f32;
         let b = b_t.multiply(Array::from_slice(&[alpha / rank], &[1]))?;
+        let (a, b) = match dtype {
+            Some(dt) => (a.as_dtype(dt)?, b.as_dtype(dt)?),
+            None => (a, b),
+        };
         let segs: Vec<&str> = t.path.split('.').collect();
         let lin = host
             .adaptable_mut(&segs)
@@ -438,8 +457,24 @@ impl TrainAdapter {
         rank: f32,
         lokr_dtype: Dtype,
     ) -> MlxResult<()> {
+        self.install_as(host, params, alpha, rank, None, lokr_dtype)
+    }
+
+    /// [`install`](Self::install) with an optional LoRA compute-dtype cast (sc-4887 bf16 training);
+    /// LoKr keeps its own `lokr_dtype` (the bf16-residual round-trip contract is independent).
+    pub fn install_as<H: AdaptableHost>(
+        &self,
+        host: &mut H,
+        params: &LoraParams,
+        alpha: f32,
+        rank: f32,
+        lora_dtype: Option<Dtype>,
+        lokr_dtype: Dtype,
+    ) -> MlxResult<()> {
         match self {
-            TrainAdapter::Lora { targets } => install_training_lora(host, params, targets, alpha),
+            TrainAdapter::Lora { targets } => {
+                install_training_lora_as(host, params, targets, alpha, lora_dtype)
+            }
             TrainAdapter::Lokr { targets } => {
                 install_training_lokr(host, params, targets, alpha, rank, lokr_dtype)
             }

@@ -63,9 +63,17 @@ pub struct TrainingConfig {
     /// the backward pass instead of retaining them, bounding the first-step working set (sc-4874 —
     /// without it a production-resolution run can exceed unified memory and the OS hard-kills the
     /// worker). This is the engine-side home of the SceneWorks "Gradient Checkpointing" toggle (which
-    /// was previously a no-op on the Rust path). The family trainer may additionally auto-enable it
-    /// when the projected working set would exceed the memory budget, regardless of this flag.
+    /// was previously a no-op on the Rust path). Strictly opt-in — never auto-enabled; a run that
+    /// would exceed the memory budget with it off is refused up front by the family trainer's
+    /// pre-flight guard (a catchable error recommending this flag). Numerically it changes nothing
+    /// (grads are bit-identical to the dense path); the cost is recompute time.
     pub gradient_checkpointing: bool,
+    /// Training compute dtype for the model forward/backward: `"bf16"` (default — halves the
+    /// activation working set; the ecosystem-standard mixed precision, sc-4887) or `"f32"` (full
+    /// precision, the pre-sc-4887 behavior). The trainable adapter factors, loss, gradients, and
+    /// optimizer state stay f32 either way (master-weights pattern); only the frozen base weights
+    /// and the activation stream are cast. Unrecognized values mean f32.
+    pub train_dtype: String,
     /// Square training resolution edge in pixels; bucketed down to a multiple of 32.
     pub resolution: u32,
     /// Adapter-checkpoint cadence, in micro-steps (`0` = no intermediate checkpoints).
@@ -104,6 +112,7 @@ impl Default for TrainingConfig {
             batch_size: 1,
             gradient_accumulation: 1,
             gradient_checkpointing: false,
+            train_dtype: "bf16".to_string(),
             resolution: 1024,
             save_every: 250,
             seed: 0,
