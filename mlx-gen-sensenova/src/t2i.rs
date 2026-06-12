@@ -58,7 +58,7 @@ impl<'a> StepReporter<'a> {
     /// Abort with a typed error if the request was cancelled (checked before each denoise step).
     fn check_cancel(&self) -> Result<()> {
         if self.cancel.is_cancelled() {
-            return Err(Error::Msg("sensenova: generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         Ok(())
     }

@@ -722,6 +722,7 @@ dependencies = [
  "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]
@@ -1130,6 +1131,14 @@ dependencies = [
  "safetensors",
  "thiserror",
  "tokenizers",
+]
+
+[[package]]
+name = "sceneworks-gen-core-testkit"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "sceneworks-gen-core",
 ]
 
 [[package]]

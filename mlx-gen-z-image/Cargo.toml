@@ -17,3 +17,8 @@ inventory = { workspace = true }
 # Decode training-dataset images (LoRA training, sc-3044). PNG + JPEG cover the SceneWorks dataset
 # formats; the trainer center-crops + hands the Image to the VAE preprocess.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+# Backend-neutral contract conformance suite (sc-4481): the macos-mlx lane runs z_image_turbo
+# through it as the "one real family" the testkit AC requires. Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }

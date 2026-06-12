@@ -474,7 +474,7 @@ impl Flux2 {
             // img2img skips the first `start_step` steps (the fork loops `range(init_time_step, n)`).
             for (t, &ts) in timesteps.iter().enumerate().skip(start_step) {
                 if req.cancel.is_cancelled() {
-                    return Err(Error::Msg("generation cancelled".into()));
+                    return Err(Error::Canceled);
                 }
                 // KV step role: the first executed step extracts the reference K/V (running the full
                 // `[txt, target, ref]` forward); later steps run `[txt, target]` only and splice the
