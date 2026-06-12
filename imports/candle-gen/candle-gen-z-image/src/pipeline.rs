@@ -18,10 +18,12 @@
 //!   parity-critical template is written once in gen-core, not re-derived here. The encoder output is
 //!   padded to the DiT's `SEQ_MULTI_OF` with an attention mask by the reference `prepare_inputs`.
 //! - **Distilled schedule (no CFG)**: Z-Image-Turbo is guidance-distilled — a fixed **4-step**
-//!   flow-match Euler schedule with **static shift 3.0** (the model's `scheduler_config.json`;
-//!   `use_dynamic_shifting=false`), no classifier-free guidance and no negative prompt. The DiT is
-//!   fed the **1−σ** timestep convention (the reference scheduler's `current_timestep_normalized`),
-//!   matching the mlx `FlowMatchEuler` (`timestep = 1−σ`).
+//!   flow-match Euler schedule, no classifier-free guidance and no negative prompt. The DiT is fed
+//!   the **1−σ** timestep convention and its predicted velocity is **negated** before the Euler step
+//!   (Z-Image sign convention). The scheduler is driven exactly as candle's own `z_image` example —
+//!   `set_timesteps(steps, Some(mu))` — which under the `z_image_turbo` config keeps the σ schedule
+//!   consistent with the DiT timestep (the `None`/static-shift path desyncs them and speckles; see
+//!   [`Pipeline::render`]).
 //! - **Deterministic seeding (sc-3673 parity)**: initial latent noise is drawn from a
 //!   fixed-algorithm CPU RNG (`StdRng`, ChaCha) seeded by `seed` and moved to the device — NOT
 //!   candle's CUDA `Tensor::randn`, whose seed→noise mapping is not launch-portable. The flow-match
@@ -49,7 +51,8 @@ use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::sampling::postprocess_image;
 use candle_transformers::models::z_image::scheduler::{
-    FlowMatchEulerDiscreteScheduler, SchedulerConfig,
+    calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
+    BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
 };
 use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
 use candle_transformers::models::z_image::transformer::{
@@ -63,17 +66,13 @@ use rand_distr::{Distribution, StandardNormal};
 /// `steps`. Matches `mlx-gen-z-image`'s `DEFAULT_STEPS`.
 pub(crate) const DEFAULT_STEPS: usize = 4;
 
-/// Flow-match time-shift for Z-Image-Turbo — the model's published static schedule
-/// (`scheduler_config.json`: `FlowMatchEulerDiscreteScheduler`, `shift=3.0`,
-/// `use_dynamic_shifting=false`), resolution-independent. Matches `mlx-gen-z-image`'s
-/// `SCHEDULE_SHIFT` (a deliberate, model-config-backed value — see that crate's note; do NOT
-/// "restore" a dynamic/linear shift). `SchedulerConfig::z_image_turbo()` already bakes in 3.0; this
-/// constant is the parity anchor the unit test pins.
-pub(crate) const SCHEDULE_SHIFT: f64 = 3.0;
-
 /// VAE spatial downscale — the latent is image/8 per side (the 4-stage `block_out_channels`
 /// `[128,256,512,512]` AutoencoderKL has 3 downsamplers). Matches `mlx-gen-z-image`'s `SPATIAL_SCALE`.
 const SPATIAL_SCALE: u32 = 8;
+
+/// DiT patch size on each spatial axis (`Config::z_image_turbo().all_patch_size[0]`). The flow-match
+/// `mu` shift is computed from the post-patchify image sequence length, so it is needed here.
+const PATCH_SIZE: u32 = 2;
 
 /// Z-Image latent channel count (the VAE's `latent_channels` and the DiT's `in_channels`).
 const LATENT_CHANNELS: usize = 16;
@@ -239,18 +238,27 @@ impl Pipeline {
                 .to_device(&self.device)?
                 .to_dtype(self.dtype)?;
 
-            // Static shift flow-match Euler schedule (the model's scheduler_config.json),
-            // resolution- and seed-independent. `SCHEDULE_SHIFT` is the parity authority (it equals
-            // `z_image_turbo()`'s built-in 3.0); set it explicitly so the constant drives behavior.
-            // `set_timesteps(.., None)` then applies the static shift.
-            let mut sched_cfg = SchedulerConfig::z_image_turbo();
-            sched_cfg.shift = SCHEDULE_SHIFT;
-            let mut scheduler = FlowMatchEulerDiscreteScheduler::new(sched_cfg);
-            scheduler.set_timesteps(steps, None);
-            // Scale the unit-normal noise by the max sigma (=1.0 after the shift) — the flow-match
-            // txt2img prior; faithful to the reference `scale_noise`, identity here.
-            let init_sigma = scheduler.sigmas[0];
-            let noise = (noise * init_sigma)?;
+            // Flow-match Euler schedule. Match the candle `z_image` reference: pass `Some(mu)` (the
+            // resolution-dependent shift parameter from `calculate_shift`). Under
+            // `use_dynamic_shifting=false` (the `z_image_turbo` config) the `Some(mu)` arm applies NO
+            // sigma shift, so the sigmas stay LINEAR and consistent with `current_timestep_normalized`
+            // (which is derived from the un-shifted `timesteps`). This is correctness-critical, NOT a
+            // style knob: passing `None` takes the scheduler's static-shift branch, which shifts
+            // `sigmas` WITHOUT updating `timesteps` — desyncing the t fed to the DiT from the σ used in
+            // the Euler step, which leaves residual high-frequency noise (visible speckle) in the
+            // decode. The unit-normal noise is the flow-match txt2img prior as-is (max σ = 1.0).
+            let image_seq_len =
+                ((lat_h as u32 / PATCH_SIZE) * (lat_w as u32 / PATCH_SIZE)) as usize;
+            let mu = calculate_shift(
+                image_seq_len,
+                BASE_IMAGE_SEQ_LEN,
+                MAX_IMAGE_SEQ_LEN,
+                BASE_SHIFT,
+                MAX_SHIFT,
+            );
+            let mut scheduler =
+                FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
+            scheduler.set_timesteps(steps, Some(mu));
 
             // `prepare_inputs` pads cap_feats to SEQ_MULTI_OF (+ attention mask) and adds the
             // singleton frame axis to the latents → (1, 16, 1, lat_h, lat_w).
@@ -316,14 +324,14 @@ impl Pipeline {
 mod tests {
     use super::*;
 
-    /// Parity anchors against `mlx-gen-z-image`: the distilled 4-step default, the static shift 3.0,
-    /// and the /8 16-channel latent geometry. GPU-free (asserts constants directly).
+    /// Parity anchors against `mlx-gen-z-image`: the distilled 4-step default and the /8 16-channel
+    /// latent geometry. GPU-free (asserts constants directly).
     #[test]
     fn parity_defaults_match_mlx_provider() {
         assert_eq!(DEFAULT_STEPS, 4);
-        assert!((SCHEDULE_SHIFT - 3.0).abs() < f64::EPSILON);
         assert_eq!(SPATIAL_SCALE, 8);
         assert_eq!(LATENT_CHANNELS, 16);
+        assert_eq!(PATCH_SIZE, 2);
     }
 
     /// Per-image seed in a `count`-batch is `base + index` (wrapping), so image *n* reproduces in
@@ -336,14 +344,27 @@ mod tests {
         assert_eq!(image_seed(u64::MAX, 1), 0);
     }
 
-    /// The flow-match Euler schedule the pipeline drives must, for the distilled 4-step config with
-    /// static shift 3.0: have `num_steps + 1` sigmas, start at max-sigma **1.0** (so the noise prior
-    /// scale is identity), be strictly decreasing, and terminate at 0. The DiT timestep at step 0 is
-    /// then `1 − σ₀ = 0`. This locks the scheduling math the denoise loop depends on, GPU-free.
+    /// The flow-match Euler schedule the pipeline drives (`set_timesteps(steps, Some(mu))`) must, for
+    /// the distilled 4-step config: have `num_steps + 1` sigmas, start at max-σ **1.0**, be strictly
+    /// decreasing, and terminate at 0.
+    ///
+    /// **Regression guard for the speckle bug:** at every step the timestep fed to the DiT
+    /// (`(1000 − timesteps[i]) / 1000`, i.e. `current_timestep_normalized`) must equal `1 − σᵢ` (the σ
+    /// the Euler step actually uses). The `Some(mu)` call keeps `timesteps` and `sigmas` consistent;
+    /// the `None` call would shift `sigmas` without updating `timesteps`, breaking this identity and
+    /// leaving residual high-frequency noise in the decode. GPU-free.
     #[test]
-    fn flow_match_schedule_is_static_shift_4_step() {
+    fn flow_match_schedule_keeps_timestep_and_sigma_consistent() {
+        // mu for a representative 1024² render: latent 128² → seq (128/2)² = 4096.
+        let mu = calculate_shift(
+            4096,
+            BASE_IMAGE_SEQ_LEN,
+            MAX_IMAGE_SEQ_LEN,
+            BASE_SHIFT,
+            MAX_SHIFT,
+        );
         let mut s = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
-        s.set_timesteps(DEFAULT_STEPS, None);
+        s.set_timesteps(DEFAULT_STEPS, Some(mu));
         assert_eq!(s.sigmas.len(), DEFAULT_STEPS + 1);
         assert!(
             (s.sigmas[0] - 1.0).abs() < 1e-6,
@@ -357,7 +378,14 @@ mod tests {
         for w in s.sigmas.windows(2) {
             assert!(w[0] > w[1], "sigmas must strictly decrease: {:?}", s.sigmas);
         }
-        // step 0 DiT timestep = 1 - sigma0 = 0.0.
-        assert!(s.current_timestep_normalized().abs() < 1e-6);
+        // The correctness-critical identity: t fed to the DiT == 1 − σ at every step.
+        for i in 0..DEFAULT_STEPS {
+            let t = (1000.0 - s.timesteps[i]) / 1000.0;
+            assert!(
+                (t - (1.0 - s.sigmas[i])).abs() < 1e-9,
+                "t/σ desync at step {i}: t={t}, 1-σ={}",
+                1.0 - s.sigmas[i]
+            );
+        }
     }
 }
