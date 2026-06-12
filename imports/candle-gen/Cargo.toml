@@ -11,7 +11,7 @@ resolver = "2"
 # Backend-neutral contract layer (epic 3720). lib name is `gen_core` (neutral import path). This is
 # pinned by git SHA to the SAME rev the SceneWorks worker pins — do NOT drift it, or the skew gate
 # fires. candle-gen is the Windows/CUDA sibling of mlx-gen; both satisfy this one contract.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "8355152a79d6d328d3798c19a2b5a37bb8468622" }
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "95cd5c692b974ecaafa57c0af437f085b052e260" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Latest crates.io release that builds cleanly on macOS (see README).
 candle-core = "0.10.2"
