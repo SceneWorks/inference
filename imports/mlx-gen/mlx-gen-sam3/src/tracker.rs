@@ -745,6 +745,276 @@ impl MemoryEncoder {
     }
 }
 
+// --- memory attention (Sam3TrackerVideoMemoryAttention, F2) --------------------------------------
+//
+// 4 RoPE-attention layers that fuse a frame's vision features (self-attn) with the temporal memory
+// bank (cross-attn). Mirrors `Sam3TrackerVideoMemoryAttention` (~965), `…MemoryAttentionLayer`
+// (~914), `…RoPEAttention` (~841), `…VisionRotaryEmbedding` (~733). hidden 256, 1 head, head_dim 256,
+// FFN 2048 (**relu**), axial 2-D RoPE θ1e4 over the 72² grid. Cross-attn keys/values come from the
+// 64-dim memory; object-pointer tokens (the trailing `num_k_exclude_rope`) skip RoPE.
+
+const MEM_ATTN_LAYERS: i32 = 4;
+const MEM_ATTN_HEADS: i32 = 1;
+const MEM_ATTN_HEAD_DIM: i32 = HIDDEN / MEM_ATTN_HEADS; // 256 (downsample_rate 1); FFN 2048 from weights
+const ROPE_THETA: f32 = 10000.0;
+
+/// `VisionRotaryEmbedding.create_inv_freq` → `(cos, sin)` tables `[g·g, 256]` for axial 2-D RoPE.
+/// `inv_freq[p] = repeat_interleave(cat(x_pos·freqs, y_pos·freqs), 2)` with
+/// `freqs[j] = θ^(−4j/256)`, `j∈0..64`. Host-computed (weight-free), validated vs the oracle tables.
+fn build_rope_tables(grid: i32) -> (Array, Array) {
+    let dim = MEM_ATTN_HEAD_DIM; // 256
+    let nf = (dim / 4) as usize; // 64 frequencies per axis
+    let freqs: Vec<f32> = (0..nf)
+        .map(|j| ROPE_THETA.powf(-(4.0 * j as f32) / dim as f32))
+        .collect();
+    let seq = (grid * grid) as usize;
+    let d = dim as usize;
+    let (mut cosd, mut sind) = (vec![0f32; seq * d], vec![0f32; seq * d]);
+    for p in 0..seq {
+        let x = (p as i32 % grid) as f32;
+        let y = (p as i32 / grid) as f32;
+        for (j, &f) in freqs.iter().enumerate() {
+            // x-half occupies base indices 0..64 → interleaved positions 2j, 2j+1.
+            let (fx, fy) = (x * f, y * f);
+            let bx = 2 * j;
+            let by = 2 * (nf + j);
+            for (pos, ang) in [(bx, fx), (by, fy)] {
+                let (c, s) = (ang.cos(), ang.sin());
+                cosd[p * d + pos] = c;
+                cosd[p * d + pos + 1] = c;
+                sind[p * d + pos] = s;
+                sind[p * d + pos + 1] = s;
+            }
+        }
+    }
+    let shape = [seq as i32, dim];
+    (
+        Array::from_slice(&cosd, &shape),
+        Array::from_slice(&sind, &shape),
+    )
+}
+
+/// `rotate_pairwise`: pairs `(a, b)` → `(−b, a)` along the last (head_dim) axis.
+fn rotate_pairwise(x: &Array) -> Result<Array> {
+    let sh = x.shape();
+    let d = sh[sh.len() - 1];
+    let mut paired: Vec<i32> = sh[..sh.len() - 1].to_vec();
+    paired.push(d / 2);
+    paired.push(2);
+    let xr = x.reshape(&paired)?;
+    let x1 = take1(&xr, 0, -1)?; // even lanes
+    let x2 = take1(&xr, 1, -1)?; // odd lanes
+    let stacked = stack_axis(&[&x2.multiply(Array::from_f32(-1.0))?, &x1], -1)?;
+    Ok(stacked.reshape(sh)?)
+}
+
+/// `apply_rotary_pos_emb_2d`: rotate all of `q`; rotate the leading `seq_k − num_k_exclude` keys
+/// (object-pointer tokens pass through). `q`/`k`: `[1, heads, seq, head_dim]`; `cos`/`sin`:
+/// `[seq, head_dim]`. `repeat_freqs_k` tiles the tables when the key length is a multiple of `q`.
+fn apply_rope_2d(
+    q: &Array,
+    k: &Array,
+    cos: &Array,
+    sin: &Array,
+    num_k_exclude: i32,
+    repeat_freqs_k: bool,
+) -> Result<(Array, Array)> {
+    let q_embed = add(&multiply(q, cos)?, &multiply(&rotate_pairwise(q)?, sin)?)?;
+    let seq_k = k.shape()[2];
+    let n_rot = seq_k - num_k_exclude;
+    let k_rot = slice_axis(k, 2, 0, n_rot)?;
+    let q_seq = q.shape()[2];
+    let (cos_k, sin_k) = if repeat_freqs_k && n_rot != q_seq {
+        let rf = (n_rot / q_seq) as usize;
+        (
+            concatenate_axis(&vec![cos; rf], 0)?,
+            concatenate_axis(&vec![sin; rf], 0)?,
+        )
+    } else {
+        (cos.clone(), sin.clone())
+    };
+    let k_embed = add(
+        &multiply(&k_rot, &cos_k)?,
+        &multiply(&rotate_pairwise(&k_rot)?, &sin_k)?,
+    )?;
+    let k_out = if num_k_exclude > 0 {
+        let k_pass = slice_axis(k, 2, n_rot, seq_k)?;
+        concatenate_axis(&[&k_embed, &k_pass], 2)?
+    } else {
+        k_embed
+    };
+    Ok((q_embed, k_out))
+}
+
+/// `RoPEAttention`: q/k/v project to `internal = 256` (downsample 1), split into `MEM_ATTN_HEADS`,
+/// axial RoPE on q + the rotated keys, SDPA, then `o_proj`. `kv_in_dim` is 256 (self-attn) or 64
+/// (cross-attn over the memory bank).
+struct RoPEAttention {
+    q: (Array, Array),
+    k: (Array, Array),
+    v: (Array, Array),
+    o: (Array, Array),
+    rope_k_repeat: bool,
+}
+
+impl RoPEAttention {
+    fn from_weights(w: &Weights, prefix: &str, rope_k_repeat: bool) -> Result<Self> {
+        Ok(Self {
+            q: weight_bias(w, &join(prefix, "q_proj"))?,
+            k: weight_bias(w, &join(prefix, "k_proj"))?,
+            v: weight_bias(w, &join(prefix, "v_proj"))?,
+            o: weight_bias(w, &join(prefix, "o_proj"))?,
+            rope_k_repeat,
+        })
+    }
+
+    /// `query`: `[1, seq, 256]`; `key`/`value`: `[1, seq_k, kv_in]`. Returns `[1, seq, 256]`.
+    fn forward(
+        &self,
+        query: &Array,
+        key: &Array,
+        value: &Array,
+        cos: &Array,
+        sin: &Array,
+        num_k_exclude: i32,
+    ) -> Result<Array> {
+        let to_heads = |x: &Array| -> Result<Array> {
+            let sh = x.shape();
+            Ok(
+                x.reshape(&[sh[0], sh[1], MEM_ATTN_HEADS, MEM_ATTN_HEAD_DIM])?
+                    .transpose_axes(&[0, 2, 1, 3])?,
+            ) // [1, heads, seq, head_dim]
+        };
+        let q = to_heads(&linear(query, &self.q.0, &self.q.1)?)?;
+        let k = to_heads(&linear(key, &self.k.0, &self.k.1)?)?;
+        let v = to_heads(&linear(value, &self.v.0, &self.v.1)?)?;
+        let (q, k) = apply_rope_2d(&q, &k, cos, sin, num_k_exclude, self.rope_k_repeat)?;
+        let scale = 1.0 / (MEM_ATTN_HEAD_DIM as f32).sqrt();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
+        let sh = out.shape();
+        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            sh[0],
+            sh[2],
+            MEM_ATTN_HEADS * MEM_ATTN_HEAD_DIM,
+        ])?;
+        linear(&out, &self.o.0, &self.o.1)
+    }
+}
+
+/// One memory-attention layer: pre-norm self-attn → pre-norm cross-attn over `keys + key_pos` →
+/// pre-norm FFN (linear1 → relu → linear2), each a residual add.
+struct MemAttnLayer {
+    self_attn: RoPEAttention,
+    cross_attn: RoPEAttention,
+    norm1: (Array, Array),
+    norm2: (Array, Array),
+    norm3: (Array, Array),
+    linear1: (Array, Array),
+    linear2: (Array, Array),
+}
+
+impl MemAttnLayer {
+    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            self_attn: RoPEAttention::from_weights(w, &join(prefix, "self_attn"), false)?,
+            cross_attn: RoPEAttention::from_weights(w, &join(prefix, "cross_attn_image"), true)?,
+            norm1: weight_bias(w, &join(prefix, "layer_norm1"))?,
+            norm2: weight_bias(w, &join(prefix, "layer_norm2"))?,
+            norm3: weight_bias(w, &join(prefix, "layer_norm3"))?,
+            linear1: weight_bias(w, &join(prefix, "linear1"))?,
+            linear2: weight_bias(w, &join(prefix, "linear2"))?,
+        })
+    }
+
+    /// `queries`: `[1, seq, 256]`; `keys`/`key_pos`: `[1, seq_k, 64]`. `num_k_exclude` = object-pointer
+    /// token count (skip RoPE on the cross-attn keys). `cos`/`sin` are the RoPE tables.
+    fn forward(
+        &self,
+        queries: &Array,
+        keys: &Array,
+        key_pos: &Array,
+        cos: &Array,
+        sin: &Array,
+        num_k_exclude: i32,
+    ) -> Result<Array> {
+        // self-attention (no excluded keys; RoPE on full q/k).
+        let q = ln(queries, &self.norm1)?;
+        let q = self.self_attn.forward(&q, &q, &q, cos, sin, 0)?;
+        let queries = add(queries, &q)?;
+        // cross-attention over the memory bank (keys offset by their positional embedding).
+        let q = ln(&queries, &self.norm2)?;
+        let key = add(keys, key_pos)?;
+        let q = self
+            .cross_attn
+            .forward(&q, &key, keys, cos, sin, num_k_exclude)?;
+        let queries = add(&queries, &q)?;
+        // FFN.
+        let q = ln(&queries, &self.norm3)?;
+        let q = linear(
+            &relu(&linear(&q, &self.linear1.0, &self.linear1.1)?)?,
+            &self.linear2.0,
+            &self.linear2.1,
+        )?;
+        Ok(add(&queries, &q)?)
+    }
+}
+
+/// `Sam3TrackerVideoMemoryAttention`: `no_memory`-frame conditioning is handled by the caller; this
+/// is the memory-conditioned path — 4 layers + a final LayerNorm, over precomputed RoPE tables.
+struct MemoryAttention {
+    layers: Vec<MemAttnLayer>,
+    norm: (Array, Array),
+    rope_cos: Array,
+    rope_sin: Array,
+}
+
+impl MemoryAttention {
+    fn from_weights(w: &Weights, prefix: &str, grid: i32) -> Result<Self> {
+        let layers = (0..MEM_ATTN_LAYERS)
+            .map(|i| MemAttnLayer::from_weights(w, &join(prefix, &format!("layers.{i}"))))
+            .collect::<Result<Vec<_>>>()?;
+        let (rope_cos, rope_sin) = build_rope_tables(grid);
+        Ok(Self {
+            layers,
+            norm: weight_bias(w, &join(prefix, "layer_norm"))?,
+            rope_cos,
+            rope_sin,
+        })
+    }
+
+    /// `current_vision_features`/`current_vision_pos`: seq-first `[seq, 1, 256]`; `memory`/`memory_pos`:
+    /// seq-first `[seq_k, 1, 64]`. `num_object_pointer_tokens` are the trailing memory tokens excluded
+    /// from RoPE. Returns the conditioned features batch-first `[1, seq, 256]`.
+    fn forward(
+        &self,
+        current_vision_features: &Array,
+        current_vision_pos: &Array,
+        memory: &Array,
+        memory_pos: &Array,
+        num_object_pointer_tokens: i32,
+    ) -> Result<Array> {
+        // output = vision + 0.1·pos, then to batch-first [1, seq, C].
+        let output = add(
+            current_vision_features,
+            &current_vision_pos.multiply(Array::from_f32(0.1))?,
+        )?;
+        let mut output = output.transpose_axes(&[1, 0, 2])?; // [1, seq, 256]
+        let mem = memory.transpose_axes(&[1, 0, 2])?; // [1, seq_k, 64]
+        let mem_pos = memory_pos.transpose_axes(&[1, 0, 2])?;
+        for layer in &self.layers {
+            output = layer.forward(
+                &output,
+                &mem,
+                &mem_pos,
+                &self.rope_cos,
+                &self.rope_sin,
+                num_object_pointer_tokens,
+            )?;
+        }
+        ln(&output, &self.norm)
+    }
+}
+
 // --- single-frame tracker -----------------------------------------------------------------------
 
 /// SAM3 single-frame box-prompt tracker (PVS path). Reuses the shared PE [`Backbone`]; loads the
@@ -768,6 +1038,9 @@ pub struct Sam3Tracker {
     /// `tracker_model.occlusion_spatial_embedding_parameter` `[1, 64]` — added to the spatial memory
     /// when the object is predicted absent (`object_score_logits ≤ 0`).
     occlusion: Array,
+    /// `tracker_model.memory_attention` — 4 RoPE layers fusing a frame's vision features with the
+    /// temporal memory bank (F2). The per-object memory-bank assembly that feeds this lands with F2.4.
+    memory_attention: MemoryAttention,
 }
 
 /// A frame's encoded memory: the 64-channel spatial feature map + its sine position encoding, both
@@ -808,7 +1081,43 @@ impl Sam3Tracker {
             occlusion: w
                 .require("tracker_model.occlusion_spatial_embedding_parameter")?
                 .clone(),
+            memory_attention: MemoryAttention::from_weights(
+                w,
+                "tracker_model.memory_attention",
+                (INPUT_SIZE as i32) / 14, // 72² RoPE grid
+            )?,
         })
+    }
+
+    /// The axial 2-D RoPE `(cos, sin)` tables `[72², 256]` the memory attention uses (exposed for
+    /// parity validation against the reference `VisionRotaryEmbedding`).
+    pub fn memory_attention_rope_tables(&self) -> (Array, Array) {
+        (
+            self.memory_attention.rope_cos.clone(),
+            self.memory_attention.rope_sin.clone(),
+        )
+    }
+
+    /// Memory-conditioned features (`_prepare_memory_conditioned_features` non-init branch): fuse a
+    /// frame's vision features with the assembled memory bank via memory attention. `current_vision_*`:
+    /// seq-first `[seq, 1, 256]`; `memory`/`memory_pos`: seq-first `[seq_k, 1, 64]` (spatial memory +
+    /// trailing `num_object_pointer_tokens` object-pointer tokens). Returns batch-first `[1, seq, 256]`.
+    /// The per-object bank assembly that produces `memory` lands with F2.4.
+    pub fn condition_with_memory(
+        &self,
+        current_vision_features: &Array,
+        current_vision_pos: &Array,
+        memory: &Array,
+        memory_pos: &Array,
+        num_object_pointer_tokens: i32,
+    ) -> Result<Array> {
+        self.memory_attention.forward(
+            current_vision_features,
+            current_vision_pos,
+            memory,
+            memory_pos,
+            num_object_pointer_tokens,
+        )
     }
 
     /// Mask prep for `_encode_new_memory`: resize the image-resolution mask logits to the 1152² mask
