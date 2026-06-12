@@ -102,7 +102,7 @@ pub struct JoyCaption {
 impl JoyCaption {
     fn prompt_embeds(&self, req: &CaptionRequest) -> Result<(Vec<i32>, Array)> {
         if req.cancel.is_cancelled() {
-            return Err(Error::Msg("caption generation cancelled".to_owned()));
+            return Err(Error::Canceled);
         }
 
         let pixels = self.image_processor.preprocess(&req.image)?;
@@ -111,7 +111,7 @@ impl JoyCaption {
         let projected = self.projector.forward(&vision_features)?;
 
         if req.cancel.is_cancelled() {
-            return Err(Error::Msg("caption generation cancelled".to_owned()));
+            return Err(Error::Canceled);
         }
 
         let ids = encode_chat_prompt(&self.tokenizer, &req.prompt)?;

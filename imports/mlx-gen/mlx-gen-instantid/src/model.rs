@@ -329,7 +329,7 @@ impl InstantId {
     ) -> Result<Image> {
         // Honor the engine cancellation contract (sc-4380 / F-096): bail before any tensor work.
         if req.cancel.is_cancelled() {
-            return Err(Error::Msg("generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         if embedding.len() != 512 {
             return Err(Error::Msg(format!(
@@ -511,7 +511,7 @@ impl InstantId {
     ) -> Result<Image> {
         // Honor the engine cancellation contract (sc-4380 / F-096): bail before any tensor work.
         if req.cancel.is_cancelled() {
-            return Err(Error::Msg("generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         if embedding.len() != 512 {
             return Err(Error::Msg(format!(
@@ -611,7 +611,7 @@ impl InstantId {
     ) -> Result<Image> {
         // Cancel between phases (sc-4380): the restore re-render is a full second denoise pass.
         if req.cancel.is_cancelled() {
-            return Err(Error::Msg("generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         let face = self
             .face

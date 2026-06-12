@@ -220,7 +220,7 @@ impl Chroma {
             // Honor the engine cancellation contract every other image provider implements (F-096):
             // an HD 28-step dual-forward 1024² render runs minutes, so check before each step.
             if cancel.is_cancelled() {
-                return Err(Error::Msg("generation cancelled".into()));
+                return Err(Error::Canceled);
             }
             let ts = Array::from_slice(&[sampler.timestep(t)], &[1]);
             // `pooled_temb` (the 5-layer Approximator) depends only on the timestep, so compute it once
@@ -336,7 +336,7 @@ impl Chroma {
         for i in 0..req.count {
             // Cancel between images too, so a multi-image batch stops promptly (F-096).
             if req.cancel.is_cancelled() {
-                return Err(Error::Msg("generation cancelled".into()));
+                return Err(Error::Canceled);
             }
             let seed = base_seed.wrapping_add(i as u64);
             let latents = create_noise(seed, req.width, req.height)?;
@@ -401,9 +401,9 @@ mod tests {
 
     #[test]
     fn generate_honors_pre_cancellation() {
-        // F-096: an already-cancelled request must abort before any forward, returning the same
-        // "generation cancelled" error the FLUX crates use. The per-image cancel check runs before
-        // `denoise`, so this needs no loaded weights.
+        // F-096: an already-cancelled request must abort before any forward, returning the typed
+        // `Error::Canceled` (displays as "cancelled") the cancellation contract mandates — epic 3720
+        // / sc-4481. The per-image cancel check runs before `denoise`, so this needs no loaded weights.
         let model = weightless(ChromaVariant::Hd);
         let req = GenerationRequest {
             prompt: "a fox".into(),
@@ -411,7 +411,7 @@ mod tests {
         };
         req.cancel.cancel();
         let mut nop = |_p: Progress| {};
-        let err = model.generate(&req, &mut nop).unwrap_err().to_string();
-        assert!(err.contains("generation cancelled"), "got: {err}");
+        let err = model.generate(&req, &mut nop).unwrap_err();
+        assert!(matches!(err, gen_core::Error::Canceled), "got: {err}");
     }
 }

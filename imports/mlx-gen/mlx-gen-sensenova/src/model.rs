@@ -278,7 +278,7 @@ impl SenseNova {
             // Check the worker's cancel flag between images too (a 50-step 8B run is multi-minute;
             // the per-step check lives in the denoise loop via the StepReporter). F-128.
             if req.cancel.is_cancelled() {
-                return Err(Error::Msg("sensenova: generation cancelled".into()));
+                return Err(Error::Canceled);
             }
             let opts = self.options(req, base_seed.wrapping_add(i as u64));
             // Thread cancellation + per-step progress into the denoise loop. Progress now reports the

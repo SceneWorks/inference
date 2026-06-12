@@ -352,7 +352,7 @@ pub fn denoise_with_progress(
     let total = (sampler.num_steps() - start_step) as u32;
     for t in start_step..sampler.num_steps() {
         if cancel.is_cancelled() {
-            return Err(Error::Msg("generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         let sigma = sampler.timestep(t);
         // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
@@ -412,7 +412,7 @@ pub fn denoise_control_with_progress(
     let total = sampler.num_steps() as u32;
     for t in 0..sampler.num_steps() {
         if cancel.is_cancelled() {
-            return Err(Error::Msg("generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         let sigma = sampler.timestep(t);
         let pos_res = controlnet.forward(&latents, control_cond, pos_embeds, sigma, lh, lw)?;
@@ -491,7 +491,7 @@ pub fn denoise_edit_with_progress(
     let total = sampler.num_steps() as u32;
     for t in 0..sampler.num_steps() {
         if cancel.is_cancelled() {
-            return Err(Error::Msg("generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         let noise_seq = latents.shape()[1];
         let sigma = sampler.timestep(t);

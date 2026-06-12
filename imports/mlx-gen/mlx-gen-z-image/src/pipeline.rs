@@ -89,7 +89,7 @@ pub fn denoise_with_progress(
     let prep = transformer.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
     for t in start_step..scheduler.num_steps() {
         if cancel.is_cancelled() {
-            return Err(Error::Msg("generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         let velocity = transformer.forward_with(&prep, &latents, scheduler.timestep(t))?;
         latents = scheduler.step(&latents, &velocity, t)?;
@@ -147,7 +147,7 @@ pub fn denoise_control_with_progress(
         transformer.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, control_context)?;
     for t in start_step..scheduler.num_steps() {
         if cancel.is_cancelled() {
-            return Err(Error::Msg("generation cancelled".into()));
+            return Err(Error::Canceled);
         }
         let velocity = transformer.forward_with_control(
             &prep,

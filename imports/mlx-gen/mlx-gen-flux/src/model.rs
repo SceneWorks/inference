@@ -397,7 +397,7 @@ impl Flux1 {
             let mut latents = create_noise(seed, req.width, req.height)?;
             for t in 0..n_steps {
                 if req.cancel.is_cancelled() {
-                    return Err(Error::Msg("generation cancelled".into()));
+                    return Err(Error::Canceled);
                 }
                 let x_in = sampler.scale_model_input(&latents, t)?;
                 let velocity = velocity_fn(&x_in, t, sampler.timestep(t), guidance)?;

@@ -24,6 +24,12 @@ pub enum Error {
     #[error("safetensors I/O failed: {0}")]
     SafeTensors(#[from] mlx_rs::error::IoError),
 
+    /// Generation was cancelled via `CancelFlag` (cooperative, checked at step boundaries). Typed
+    /// (not a stringified `Msg`) so it bridges to [`gen_core::Error::Canceled`] 1:1 and the
+    /// conformance suite can distinguish cancellation from failure (epic 3720, sc-4481).
+    #[error("cancelled")]
+    Canceled,
+
     /// A contextual message (config/validation/adapter-shape errors).
     #[error("{0}")]
     Msg(String),
@@ -53,6 +59,7 @@ impl From<Error> for gen_core::Error {
             Error::SafeTensors(io) => gen_core::Error::backend(io),
             Error::MissingTensor(s) => gen_core::Error::MissingTensor(s),
             Error::Io(io) => gen_core::Error::Io(io),
+            Error::Canceled => gen_core::Error::Canceled,
             Error::Msg(s) => gen_core::Error::Msg(s),
         }
     }
@@ -60,8 +67,9 @@ impl From<Error> for gen_core::Error {
 
 /// The reverse bridge: gen-core contract calls (tokenizer, registry, imageops, capability
 /// validation) return `gen_core::Error`; mlx-gen and family code invoke them with `?` inside
-/// `mlx_gen::Result` fns, so down-convert here. `Backend`/`Unsupported`/`Canceled` have no rich
-/// mlx-gen analog and collapse to `Msg` (keeping the display text).
+/// `mlx_gen::Result` fns, so down-convert here. `Backend`/`Unsupported` have no rich mlx-gen
+/// analog and collapse to `Msg` (keeping the display text); `Canceled` maps across 1:1 so a
+/// round-trip preserves the typed cancellation (sc-4481).
 impl From<gen_core::Error> for Error {
     fn from(e: gen_core::Error) -> Self {
         match e {
@@ -69,7 +77,7 @@ impl From<gen_core::Error> for Error {
             gen_core::Error::MissingTensor(s) => Error::MissingTensor(s),
             gen_core::Error::Io(io) => Error::Io(io),
             gen_core::Error::Unsupported(s) => Error::Msg(format!("unsupported: {s}")),
-            gen_core::Error::Canceled => Error::Msg("cancelled".to_string()),
+            gen_core::Error::Canceled => Error::Canceled,
             gen_core::Error::Msg(s) => Error::Msg(s),
         }
     }
