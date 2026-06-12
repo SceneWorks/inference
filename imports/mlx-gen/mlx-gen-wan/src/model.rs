@@ -31,7 +31,8 @@ use crate::config::{GuideScale, WanModelConfig};
 use crate::pipeline::{
     align_dim, best_output_size, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
     build_ti2v_multi_mask, decode_to_frames, decode_to_frames_22, denoise, denoise_moe,
-    denoise_ti2v, frames_to_images, latent_shape, preprocess_ti2v_image, ti2v_blend_init, Expert,
+    denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
+    preprocess_ti2v_image, seq_len, ti2v_blend_init, Expert,
 };
 use crate::scheduler::SolverKind;
 use crate::text_encoder::{load_tokenizer, Umt5Encoder};
@@ -265,6 +266,15 @@ impl Wan {
             .unwrap_or_else(|| cfg.sample_neg_prompt.clone());
 
         let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
+
+        // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
+        preflight_denoise_memory_guard(
+            self.descriptor.id,
+            dit_resident_bytes(&[self.root.join("model.safetensors")], self.quant),
+            seq_len(lat, cfg.patch_size),
+            cfg.dim,
+            !cfg_disabled,
+        )?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
@@ -724,6 +734,22 @@ impl Wan14b {
         // generation length.
         let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
 
+        // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
+        // The MoE keeps BOTH experts resident, and always runs cond+uncond (batch 2).
+        preflight_denoise_memory_guard(
+            self.descriptor.id,
+            dit_resident_bytes(
+                &[
+                    self.root.join("low_noise_model.safetensors"),
+                    self.root.join("high_noise_model.safetensors"),
+                ],
+                self.quant,
+            ),
+            seq_len(lat, cfg.patch_size),
+            cfg.dim,
+            true,
+        )?;
+
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
         let (context, context_null) = {
@@ -862,6 +888,25 @@ inventory::submit! {
 
 /// Public registry id for the channel-concat I2V model: `mlx_gen::load("wan2_2_i2v_14b", spec)`.
 pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
+
+/// Estimated resident transformer bytes for the sc-4986 [`preflight_denoise_memory_guard`]: the
+/// on-disk weight file size(s) scaled by the load-time quantization. A dense bf16 snapshot shrinks to
+/// ~Q8/Q4 when `spec.quantize` runs at load; a pre-quantized snapshot has `quant == None` and its
+/// files are already packed (ratio 1.0). The 14B MoE passes both expert files (both stay resident).
+/// A missing file → 0 bytes for that file, so the guard under-counts rather than spuriously firing —
+/// the real "snapshot incomplete" error then surfaces at the actual `Weights::from_file` load.
+fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64 {
+    let ratio = match quant.map(|q| q.bits()) {
+        Some(4) => 0.30, // 4-bit affine: ~0.5 B/param + scales vs bf16 2 B/param
+        Some(8) => 0.55, // 8-bit affine: ~1 B/param + scales
+        _ => 1.0,
+    };
+    let raw: u64 = files
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    (raw as f64 * ratio) as u64
+}
 
 /// The single conditioning reference image for I2V (the first video frame), if present.
 fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
