@@ -23,6 +23,11 @@ candle-transformers = "0.10.2"
 # HF tokenizers (CLIP-L + CLIP-bigG tokenizer.json) and snapshot/file resolution for SDXL weights.
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+# Fixed-algorithm CPU RNG for deterministic, launch-portable initial latent noise (sc-3673) — NOT
+# candle's CUDA `set_seed`. `StdRng` (ChaCha) is reproducible across launches for a given seed;
+# `rand_distr::StandardNormal` draws the N(0,1) latent. Versions match candle's own tree (no dup).
+rand = "0.9"
+rand_distr = "0.5"
 # Link-time model registration (the DI-container stand-in) — matches gen-core's `inventory`.
 inventory = "0.3"
 # Error bridge (CandleError -> gen_core::Error). Major matches mlx-gen (thiserror 2).
