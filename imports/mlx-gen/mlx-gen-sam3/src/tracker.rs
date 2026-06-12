@@ -50,6 +50,7 @@ const LN_EPS: f32 = 1e-6;
 const INPUT_SIZE: f32 = 1008.0; // image_size
 const STABILITY_DELTA: f32 = 0.05; // dynamic_multimask_stability_delta
 const STABILITY_THRESH: f32 = 0.98; // dynamic_multimask_stability_thresh
+const NO_OBJ_SCORE: f32 = -1024.0; // logit for "object absent" frames
 
 fn join(prefix: &str, leaf: &str) -> String {
     format!("{prefix}.{leaf}")
@@ -367,6 +368,20 @@ impl PromptEncoder {
         ];
         let sparse = concatenate_axis(&rows.iter().collect::<Vec<_>>(), 2)?; // [1,1,3,256]
 
+        let dense = broadcast_to(
+            &self.no_mask_embed.reshape(&[1, 1, 1, HIDDEN])?,
+            &[1, g, g, HIDDEN],
+        )?;
+        Ok((sparse, dense))
+    }
+
+    /// Empty-prompt encoding for a no-prompt (memory-conditioned) tracking frame: `_single_frame_forward`
+    /// pads a single empty point with label −1 then `_embed_points(pad=True)` pads one more, so both
+    /// resulting tokens collapse to `not_a_point_embed` (label −1 overwrites the point PE). Dense is the
+    /// broadcast `no_mask_embed`. Returns `(sparse [1, 1, 2, 256], dense [1, g, g, 256])`.
+    fn encode_empty_point(&self, g: i32) -> Result<(Array, Array)> {
+        let nap = self.not_a_point.reshape(&[1, 1, 1, HIDDEN])?;
+        let sparse = concatenate_axis(&[&nap, &nap], 2)?; // [1,1,2,256]
         let dense = broadcast_to(
             &self.no_mask_embed.reshape(&[1, 1, 1, HIDDEN])?,
             &[1, g, g, HIDDEN],
@@ -1104,6 +1119,20 @@ pub struct MemoryFeatures {
 
 const MASK_MEM_SIZE: i32 = 1152; // mask_input_size (4·72) · 4
 
+/// A no-prompt (memory-conditioned) tracking-frame prediction (`_run_single_frame_inference` output):
+/// the low-res (288²) and high-res (1008²) mask logits, the object pointer stored in the memory bank,
+/// and the object-score logit.
+pub struct TrackerFrameOutput {
+    /// Low-res mask logits `[1, 1, 288, 288]` (= `low_res_mask_size`).
+    pub low_res: Array,
+    /// High-res mask logits `[1, 1, 1008, 1008]` (bilinear-upsampled; fed to the memory encoder).
+    pub high_res: Array,
+    /// Object pointer `[1, 256]` (`object_pointer_proj` of the SAM mask token, occlusion-gated).
+    pub object_pointer: Array,
+    /// Object-score logit (`> 0` ⇒ object present).
+    pub object_score: f32,
+}
+
 /// A single-frame tracker prediction: the best (argmax-IoU) low-res mask logits + its IoU + the
 /// object-score logit.
 pub struct TrackerMask {
@@ -1393,6 +1422,70 @@ impl Sam3Tracker {
                 .reshape(&[-1])?
                 .as_dtype(Dtype::Float32)?
                 .as_slice::<f32>()[0],
+        })
+    }
+
+    /// Decode a no-prompt (memory-conditioned) tracking frame — `_run_single_frame_inference` with no
+    /// point/mask inputs (the video-propagation path). `conditioned_embedding`: NHWC `[1, 72, 72, 256]`
+    /// from [`Self::prepare_memory_conditioned_features`] (already memory-conditioned — **no**
+    /// `no_memory_embedding` add). `high_res`: the frame's `[feat_s0, feat_s1]`. Empty-point prompt;
+    /// **multimask decode** (`_use_multimask` is true for tracking frames — `multimask_min_pt_num ≤ 0`)
+    /// → the best-predicted-IoU candidate selects both the output mask AND the object-pointer token.
+    /// Absent objects (`object_score ≤ 0`) get `NO_OBJ_SCORE` masks. Returns the low-res/high-res masks
+    /// + object pointer + score.
+    pub fn decode_tracked_frame(
+        &self,
+        conditioned_embedding: &Array,
+        high_res: &[Array; 2],
+    ) -> Result<TrackerFrameOutput> {
+        let g = conditioned_embedding.shape()[1];
+        let (sparse, dense) = self.prompt.encode_empty_point(g)?;
+        let image_pe = self.image_pe_embed.dense_pe(g)?;
+        // multimask=true ⇒ the decoder returns the 3 multimask candidates (masks[1,3,mg,mg],
+        // ious[1,3]) + the full mask_tokens[1,4,256].
+        let (masks, ious, obj_score, mask_tokens) = self.decoder.forward(
+            conditioned_embedding,
+            &image_pe,
+            &sparse,
+            &dense,
+            high_res,
+            true,
+        )?;
+        let object_score = obj_score
+            .reshape(&[-1])?
+            .as_dtype(Dtype::Float32)?
+            .as_slice::<f32>()[0];
+        // best-IoU candidate over the 3 multimask outputs.
+        let iv = ious
+            .reshape(&[-1])?
+            .as_dtype(Dtype::Float32)?
+            .as_slice::<f32>()
+            .to_vec();
+        let best = argmax(&iv) as i32;
+        let mg = masks.shape()[2];
+        let best_mask = take1(&masks, best, 1)?.reshape(&[1, 1, mg, mg])?;
+        // is_obj_appearing: present keeps the mask, absent replaces it with NO_OBJ_SCORE everywhere.
+        let low_res = if object_score > 0.0 {
+            best_mask
+        } else {
+            broadcast_to(Array::from_f32(NO_OBJ_SCORE), &[1, 1, mg, mg])?
+        };
+        // high-res: separable bilinear 288→1008 (align_corners=False), for the memory encoder.
+        let m = low_res.reshape(&[mg, mg])?;
+        let up = bilinear_resize_matrix(mg, INPUT_SIZE as i32);
+        let high = up
+            .matmul(&m)?
+            .matmul(&up.transpose_axes(&[1, 0])?)?
+            .reshape(&[1, 1, INPUT_SIZE as i32, INPUT_SIZE as i32])?;
+        // object pointer: multimask ⇒ sam_output_token is the best-IoU candidate (token `best + 1` in
+        // the full set, since the multimask slice drops token 0).
+        let token = take1(&mask_tokens, best + 1, 1)?;
+        let object_pointer = self.compute_object_pointer(&token, object_score)?;
+        Ok(TrackerFrameOutput {
+            low_res,
+            high_res: high,
+            object_pointer,
+            object_score,
         })
     }
 
