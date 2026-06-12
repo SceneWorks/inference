@@ -86,7 +86,13 @@ fn build_batch(x0: &Array, noise: &Array, sigma: f32) -> Result<(Array, Array, f
 pub struct ZImageTurboTrainer {
     descriptor: TrainerDescriptor,
     tokenizer: TextTokenizer,
-    text_encoder: TextEncoder,
+    /// The Qwen text encoder, in an `Option` so it can be **dropped after the caching loop** (sc-4952,
+    /// 32 GB-Mac support): it is idle during training — every prompt is already encoded to the cached
+    /// `cap` embedding — yet it is a multi-GB resident. Freeing it before the train loop reclaims that
+    /// budget for the DiT working set. Kept at its loaded precision (the caption embedding is the
+    /// outlier-sensitive conditioning stream that needs the f32 carve-out under bf16 training, sc-4887,
+    /// so we do NOT downcast the encoder here — just free it once its embeddings are cached).
+    text_encoder: Option<TextEncoder>,
     vae: Vae,
     transformer: ZImageTransformer,
 }
@@ -118,7 +124,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     Ok(Box::new(ZImageTurboTrainer {
         descriptor: trainer_descriptor(),
         tokenizer: crate::loader::load_tokenizer(root)?,
-        text_encoder: crate::loader::load_text_encoder(root)?,
+        text_encoder: Some(crate::loader::load_text_encoder(root)?),
         vae: crate::loader::load_vae(root)?,
         transformer: crate::loader::load_transformer(root)?,
     }))
@@ -306,9 +312,15 @@ impl ZImageTurboTrainer {
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
             let x0 = encode_init_latents(&self.vae, &img, edge, edge)?; // clean latent [16,1,h,w]
+            let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
+                mlx_gen::Error::Msg(
+                    "z_image_turbo trainer: text encoder already freed (caching after train loop)"
+                        .into(),
+                )
+            })?;
             let cap = crate::pipeline::encode_prompt(
                 &self.tokenizer,
-                &self.text_encoder,
+                text_encoder,
                 &item.caption,
                 "z_image_turbo trainer",
             )?;
@@ -325,6 +337,12 @@ impl ZImageTurboTrainer {
             }
             return Err("z_image_turbo trainer: no usable dataset items".into());
         }
+
+        // sc-4952 (32 GB-Mac support) — every prompt is now encoded into `cache`, so the Qwen text
+        // encoder is dead weight for the rest of the run. Drop it and evict its buffers before the
+        // train loop, reclaiming that resident for the DiT working set.
+        self.text_encoder = None;
+        mlx_rs::memory::clear_cache();
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let target_paths = resolve_target_paths(&self.transformer, cfg);
@@ -528,17 +546,18 @@ impl ZImageTurboTrainer {
 /// the original sc-4874 explosion) to a single layer's backward transient (~1/30 of that).
 /// sc-4887 bf16 halves the weights + activation terms.
 ///
-/// Measured (`first_step_attn_ckpt_sweep`, 128 GB Mac17,6, rank 16 / 136 targets / batch 1):
-/// f32 edge 512/768/1024 → 42.1/56.9/79.2 GB (exact 3-point fit); bf16 → 32.2/43.3 GB at 768/1024
-/// (fit with the quadratic constrained to half the f32 coefficient; the 512 bf16 sample was
-/// contaminated by not-yet-freed f32 buffers right after the cast). Assumes micro-batch 1 — true
-/// of the trainer's loop (one cached item per step; `batch_size` shapes nothing here) — and f32
-/// retained activations; refit if either changes.
+/// Measured (`first_step_attn_ckpt_sweep`, 128 GB Mac17,6, rank 16 / 136 targets / batch 1) AFTER the
+/// Qwen text encoder is freed post-caching (sc-4952 — the resident base now excludes the ~6.6 GB
+/// encoder): f32 edge 768/1024 → 49.6/71.9 GB; bf16 → 25.6/36.7 GB. The activation/seq² shape is
+/// unchanged from the pre-sc-4952 fit (same forward); only the resident base shifts down (f32 −7.3,
+/// bf16 −6.6 GB). bf16 768 (~25.6 GB) now fits a 32 GB Mac at the default (attention-segment)
+/// checkpointing; 1024 (~36.7 GB) needs `gradient_checkpointing` (block-ckpt ≈ 23 GB). Assumes
+/// micro-batch 1; refit if the encoder lifecycle or activation shape changes.
 fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
     if bf16 {
-        19.1 + 0.00522 * s + 1.55e-7 * s * s
+        12.5 + 0.00522 * s + 1.55e-7 * s * s
     } else {
-        30.8 + 0.01045 * s + 3.09e-7 * s * s
+        23.46 + 0.01045 * s + 3.09e-7 * s * s
     }
 }
 
@@ -844,7 +863,7 @@ mod first_step_repro {
         let mut trainer = ZImageTurboTrainer {
             descriptor: trainer_descriptor(),
             tokenizer: crate::loader::load_tokenizer(&root).unwrap(),
-            text_encoder: crate::loader::load_text_encoder(&root).unwrap(),
+            text_encoder: Some(crate::loader::load_text_encoder(&root).unwrap()),
             vae: crate::loader::load_vae(&root).unwrap(),
             transformer: crate::loader::load_transformer(&root).unwrap(),
         };
@@ -857,14 +876,18 @@ mod first_step_repro {
             build_lora_targets(&mut trainer.transformer, &target_paths, 16, 7).unwrap();
         let cap = crate::pipeline::encode_prompt(
             &trainer.tokenizer,
-            &trainer.text_encoder,
+            trainer.text_encoder.as_ref().unwrap(),
             "a solid colour swatch",
             "sc-4874 repro",
         )
         .unwrap();
         eval([&cap]).unwrap();
+        // Drop the encoder exactly as `train_impl` does after caching, so the measured peaks reflect
+        // the post-free training working set (sc-4952).
+        trainer.text_encoder = None;
+        mlx_rs::memory::clear_cache();
         eprintln!(
-            "[sc-4874] loaded trainer; {} LoRA targets; cap {:?}",
+            "[sc-4874] loaded trainer (encoder freed); {} LoRA targets; cap {:?}",
             targets.len(),
             cap.shape()
         );
@@ -1348,17 +1371,18 @@ mod preflight_tests {
     // curve from sc-4874 no longer describes any reachable training path).
     #[test]
     fn projection_matches_measured_curve() {
-        // f32 attn-ckpt dense (measured by first_step_attn_ckpt_sweep, 128 GB Mac17,6):
-        // s = (edge/16)² + 32 → edge 512/768/1024.
-        for (s, measured) in [(1056.0, 42.1), (2336.0, 56.9), (4128.0, 79.2)] {
+        // Measured AFTER the encoder is freed post-caching (sc-4952), `first_step_attn_ckpt_sweep`,
+        // 128 GB Mac17,6. s = (edge/16)² + 32 → edge 768/1024. (The 512 samples are load/cast-transient
+        // polluted — the encoder-free leaves the DiT lazy until the first eval — so the fit is anchored
+        // on 768/1024, with the activation/seq² shape carried over from the pre-sc-4952 fit.)
+        for (s, measured) in [(2336.0, 49.6), (4128.0, 71.9)] {
             let p = projected_dense_peak_gb(s, false);
             assert!(
                 (p - measured).abs() < 3.0,
                 "f32 projection at s={s} = {p:.1} GB, expected ≈{measured} GB"
             );
         }
-        // bf16 attn-ckpt dense (measured at 768/1024; the 512 sample was cast-transient-polluted).
-        for (s, measured) in [(2336.0, 32.2), (4128.0, 43.3)] {
+        for (s, measured) in [(2336.0, 25.6), (4128.0, 36.7)] {
             let p = projected_dense_peak_gb(s, true);
             assert!(
                 (p - measured).abs() < 3.0,
@@ -1371,9 +1395,8 @@ mod preflight_tests {
             assert!(projected_dense_peak_gb(2336.0, bf16) < projected_dense_peak_gb(4128.0, bf16));
             assert!(projected_dense_peak_gb(2336.0, true) < projected_dense_peak_gb(2336.0, false));
         }
-        // With attention-segment checkpointing always on, the 1024 dense step fits the 128 GB
-        // target in BOTH dtypes (budget ≈ 121.6 × 0.85 ≈ 103 GB) — the sc-4874 kill regime is gone
-        // without the Gradient Checkpointing checkbox.
+        // Still fits the 128 GB target at 1024 in both dtypes (budget ≈ 103 GB); the encoder-free just
+        // lowers the resident base, extending the headroom (and bringing bf16 768 under a 32 GB box).
         assert!(projected_dense_peak_gb(4128.0, false) < 103.0);
         assert!(projected_dense_peak_gb(4128.0, true) < 103.0);
     }
