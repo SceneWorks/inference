@@ -115,3 +115,44 @@ fn ti2v_5b_convert_matches_golden() {
 
     eprintln!("\nALL Wan TI2V-5B components byte-identical to golden ✓");
 }
+
+/// sc-4972 — materialize the dense **TI2V-5B bf16** MLX snapshot into the mlx-gen model cache (only
+/// q4/q8 were cached), so the trainer e2e gates (`trainer_e2e.rs`) can run. Converts the native HF
+/// checkpoint via [`convert_ti2v_5b`] and copies the shared UMT5 `tokenizer.json` (the converter
+/// emits everything else: `model.safetensors` bf16, `t5_encoder.safetensors` bf16, `vae.safetensors`
+/// f32, `config.json`). Tokenizer source: the already-cached I2V-A14B bf16 snapshot (same UMT5).
+///
+///   cargo test -p mlx-gen-wan --release --test convert_5b_parity ti2v_5b_materialize -- --ignored --nocapture
+#[test]
+#[ignore = "one-shot: writes ~/.cache/mlx-gen-models/wan_2_2_ti2v_5b_mlx_bf16 (needs the native HF checkpoint)"]
+fn ti2v_5b_materialize_bf16_snapshot() {
+    let ckpt = checkpoint_dir();
+    assert!(ckpt.is_dir(), "checkpoint dir missing: {}", ckpt.display());
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    let out = home.join(".cache/mlx-gen-models/wan_2_2_ti2v_5b_mlx_bf16");
+    eprintln!("converting {} → {}", ckpt.display(), out.display());
+    convert_ti2v_5b(&ckpt, &out).unwrap();
+
+    // Copy the shared UMT5 tokenizer from the cached I2V-A14B bf16 snapshot (converter doesn't emit it).
+    let tok_src = home.join(".cache/mlx-gen-models/wan2_2_i2v_a14b_mlx_bf16/tokenizer.json");
+    assert!(
+        tok_src.is_file(),
+        "tokenizer source missing: {} (need a cached Wan bf16 snapshot)",
+        tok_src.display()
+    );
+    std::fs::copy(&tok_src, out.join("tokenizer.json")).unwrap();
+
+    for name in [
+        "model.safetensors",
+        "t5_encoder.safetensors",
+        "vae.safetensors",
+        "config.json",
+        "tokenizer.json",
+    ] {
+        assert!(out.join(name).is_file(), "missing emitted {name}");
+    }
+    eprintln!(
+        "\n✓ TI2V-5B bf16 snapshot materialized at {}",
+        out.display()
+    );
+}

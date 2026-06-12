@@ -229,11 +229,12 @@ fn moe_experts() -> Vec<ExpertFile> {
     ]
 }
 
-/// Resolve the dense TI2V-5B snapshot (env override else the SceneWorks model dir).
+/// Resolve the dense TI2V-5B bf16 snapshot (env override else the mlx-gen model cache, matching the
+/// A14B variants — `convert_ti2v_5b` writes here).
 fn ti2v_5b_snapshot() -> PathBuf {
     snapshot(
         "WAN_TI2V_5B_MODEL_DIR",
-        "Library/Application Support/SceneWorks/data/models/mlx/wan_2_2_ti2v_5b",
+        ".cache/mlx-gen-models/wan_2_2_ti2v_5b_mlx_bf16",
     )
 }
 
@@ -271,6 +272,19 @@ fn wan_i2v_a14b_trainer_trains_both_experts_and_reloads() {
     run_trainer_e2e("wan2_2_i2v_14b", snap, &moe_experts(), "adamw");
 }
 
+/// sc-4972 — the gradient-checkpointing path on the I2V-A14B MoE (dual-expert, channel-concat in_dim
+/// 36 / zero-`y` pad). Same recompute-only block-ckpt as T2V; a converging run confirms the lever is
+/// wired through the I2V code path.
+#[test]
+#[ignore = "needs the converted Wan2.2-I2V-A14B MoE bf16 checkpoint"]
+fn wan_i2v_a14b_trainer_gradient_checkpointing() {
+    let snap = snapshot(
+        "WAN_I2V_A14B_MODEL_DIR",
+        ".cache/mlx-gen-models/wan2_2_i2v_a14b_mlx_bf16",
+    );
+    run_trainer_e2e_cfg("wan2_2_i2v_14b", snap, &moe_experts(), "adamw", true);
+}
+
 #[test]
 #[ignore = "needs the converted Wan2.2-TI2V-5B dense bf16 checkpoint (with z48 vae)"]
 fn wan_ti2v_5b_trainer_trains_dense_and_reloads() {
@@ -280,6 +294,20 @@ fn wan_ti2v_5b_trainer_trains_dense_and_reloads() {
         ti2v_5b_snapshot(),
         &dense_expert(),
         "adamw",
+    );
+}
+
+/// sc-4972 — the gradient-checkpointing path on the dense TI2V-5B (single expert, z48 vae22). Mirrors
+/// the A14B ckpt gates on the smaller dense DiT.
+#[test]
+#[ignore = "needs the converted Wan2.2-TI2V-5B dense bf16 checkpoint (with z48 vae)"]
+fn wan_ti2v_5b_trainer_gradient_checkpointing() {
+    run_trainer_e2e_cfg(
+        "wan2_2_ti2v_5b",
+        ti2v_5b_snapshot(),
+        &dense_expert(),
+        "adamw",
+        true,
     );
 }
 
