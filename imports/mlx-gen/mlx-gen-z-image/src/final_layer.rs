@@ -40,12 +40,21 @@ impl FinalLayer {
         Ok(())
     }
 
+    /// Cast both Linears to `dtype` (sc-4887 bf16 training).
+    pub fn cast_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        for lin in [&mut self.linear, &mut self.ada] {
+            lin.cast_weights(dtype)?;
+        }
+        Ok(())
+    }
+
     /// `x`: `(B, S, H)`, `c` (timestep emb): `(B, min(H,256))` → `(B, S, out_channels)`.
     pub fn forward(&self, x: &Array, c: &Array) -> Result<Array> {
-        let scale = add(
-            &self.ada.forward(&silu(c)?)?,
-            Array::from_slice(&[1.0f32], &[1]),
-        )?;
+        let ada_out = self.ada.forward(&silu(c)?)?;
+        // Dtype-following `1` (sc-4887): a hard f32 scalar would promote the modulated final
+        // projection back to f32 under the bf16 training cast. No-op when the path is f32.
+        let one = Array::from_slice(&[1.0f32], &[1]).as_dtype(ada_out.dtype())?;
+        let scale = add(&ada_out, &one)?;
         let scale = scale.expand_dims(1)?; // (B, 1, H)
         let normed = layer_norm(x, None, None, LN_EPS)?; // affine=False
         self.linear.forward(&multiply(&normed, &scale)?)

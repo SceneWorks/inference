@@ -425,6 +425,33 @@ impl AdaptableLinear {
         }
     }
 
+    /// Cast the dense base weight (and bias) to `dtype` in place — the training-time compute-dtype
+    /// switch (sc-4887: bf16 mixed-precision training over an f32-on-disk checkpoint). Quantized
+    /// bases are left untouched (their compute dtype is fixed by the packed format). Destructive for
+    /// a narrowing cast (f32→bf16 drops mantissa bits): reload the model to get the f32 weights back.
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        if let LinearBase::Dense(l) = &mut self.base {
+            if l.weight.value.dtype() != dtype {
+                l.weight = Param::new(l.weight.value.as_dtype(dtype)?);
+            }
+            if let Some(b) = l.bias.value.as_ref() {
+                if b.dtype() != dtype {
+                    l.bias = Param::new(Some(b.as_dtype(dtype)?));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The dense base weight's dtype, or `None` for a quantized base. Lets a forward stay
+    /// dtype-following (cast its inputs to the weight's compute dtype) without assuming f32.
+    pub fn weight_dtype(&self) -> Option<Dtype> {
+        match &self.base {
+            LinearBase::Dense(l) => Some(l.weight.value.dtype()),
+            LinearBase::Quantized(_) => None,
+        }
+    }
+
     /// `true` once the base has been quantized (Q4/Q8).
     pub fn is_quantized(&self) -> bool {
         matches!(self.base, LinearBase::Quantized(_))

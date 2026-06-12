@@ -91,13 +91,40 @@ impl ZImageTransformerBlock {
         Ok(())
     }
 
+    /// Toggle SDPA-segment gradient checkpointing on the block's attention (sc-4886).
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.attention.set_sdpa_checkpoint(on);
+    }
+
+    /// Cast every weight in the block to `dtype` (sc-4887 bf16 training): attention, FFN, adaLN,
+    /// and the four RMSNorm scales.
+    pub fn cast_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.attention.cast_weights(dtype)?;
+        self.feed_forward.cast_weights(dtype)?;
+        self.ada_ln.cast_weights(dtype)?;
+        for norm in [
+            &mut self.attention_norm1,
+            &mut self.attention_norm2,
+            &mut self.ffn_norm1,
+            &mut self.ffn_norm2,
+        ] {
+            if norm.dtype() != dtype {
+                *norm = norm.as_dtype(dtype)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn forward(&self, x: &Array, freqs_cis: &Array, t_emb: &Array) -> Result<Array> {
         // adaLN modulation: (1, 4*dim) -> (1, 1, 4*dim) -> 4 × (1, 1, dim)
         let modulation = self.ada_ln.forward(t_emb)?.expand_dims(1)?;
+        // Dtype-following `1`: a hard f32 scalar would promote the whole modulated stream back to
+        // f32 under the bf16 training cast (sc-4887). No-op (bit-identical) when the path is f32.
+        let one = scalar(1.0).as_dtype(modulation.dtype())?;
         let p = split(&modulation, 4, 2)?;
-        let scale_msa = add(&p[0], scalar(1.0))?;
+        let scale_msa = add(&p[0], &one)?;
         let gate_msa = tanh(&p[1])?;
-        let scale_mlp = add(&p[2], scalar(1.0))?;
+        let scale_mlp = add(&p[2], &one)?;
         let gate_mlp = tanh(&p[3])?;
 
         // Modulated attention residual.

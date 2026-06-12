@@ -255,16 +255,40 @@ impl ZImageTurboTrainer {
         on_progress(TrainingProgress::Preparing);
         let edge = bucket_resolution(cfg.resolution);
 
-        // sc-4874 — fail-fast pre-flight memory guard. The dense (non-checkpointed) first step
+        // sc-4887 — training compute dtype. bf16 halves the activation working set (and the resident
+        // base) and is the ecosystem-standard mixed precision; the trainable factors / loss / grads /
+        // optimizer stay f32 (master-weights). The cast is destructive (f32→bf16), so a trainer that
+        // was already cast cannot honor a later f32 request — reload instead of silently training at
+        // the wrong precision.
+        let use_bf16 = cfg.train_dtype.trim().eq_ignore_ascii_case("bf16")
+            || cfg.train_dtype.trim().eq_ignore_ascii_case("bfloat16");
+        let compute_dtype = if use_bf16 {
+            Dtype::Bfloat16
+        } else {
+            Dtype::Float32
+        };
+        if !use_bf16 && self.transformer.compute_dtype() == Some(Dtype::Bfloat16) {
+            return Err(
+                "z_image_turbo trainer: this trainer instance was already cast to bf16 by a \
+                 previous run; reload the trainer for f32 training"
+                    .into(),
+            );
+        }
+
+        // sc-4874 — fail-fast pre-flight memory guard. The dense (non-block-checkpointed) first step
         // materializes the whole forward graph in one MLX `eval`; at high resolution that working set
-        // exceeds unified memory and the OS hard-kills the worker with an UNCATCHABLE SIGKILL (no
+        // can exceed unified memory and the OS hard-kills the worker with an UNCATCHABLE SIGKILL (no
         // in-process error, the run just appears to hang at the last cached latent). We cannot catch
         // that kill, so we predict it and refuse up front with an actionable, catchable error —
         // BEFORE the (~minutes-long) latent caching — when gradient checkpointing is not enabled.
         let will_checkpoint =
             matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
         if !will_checkpoint {
-            preflight_memory_guard(edge)?;
+            preflight_memory_guard(edge, use_bf16)?;
+        }
+
+        if use_bf16 {
+            self.transformer.cast_weights(Dtype::Bfloat16)?;
         }
 
         // --- prepare → load → cache: VAE-latents + prompt-embeds into memory before the loop ---
@@ -355,6 +379,14 @@ impl ZImageTurboTrainer {
         } else {
             None
         };
+        // sc-4886 — attention-segment checkpointing is ALWAYS on in training (LoRA and LoKr): it is
+        // numerically identical to the retained backward (same decomposed attention math, recomputed)
+        // and removes the dominant seq² per-block retention — the flash-backward surrogate every
+        // torch trainer gets from its fused SDPA kernel. When whole-block checkpointing is on, the
+        // main stack's flag goes OFF (the block recompute already covers attention; nesting would
+        // recompute it twice for no memory win) — the refiners are never block-checkpointed, so
+        // theirs stays on.
+        self.transformer.set_sdpa_checkpoint(!use_checkpoint, true);
         // AdamW with wd=0 is identical to Adam, so the one optimizer covers both choices.
         let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
             0.0
@@ -407,6 +439,7 @@ impl ZImageTurboTrainer {
                 &noise,
                 mae,
                 checkpoint_main,
+                compute_dtype,
             )?;
             last_loss = loss;
             steps_run = step;
@@ -475,12 +508,29 @@ impl ZImageTurboTrainer {
     }
 }
 
-/// Projected DENSE (non-checkpointed) first-step peak memory, in GB, as a function of the unified
-/// token count `s` — an empirical fit to measured peaks on the 128 GB target (sc-4874): edge
-/// 512/768/1024 → s≈1024/2304/4096 → 45/73.5/135 GB. The dominant cost is the forward `eval`
-/// materializing every block's retained activations at once (the LoRA backward adds only ~1 GB).
-fn projected_dense_peak_gb(s: f64) -> f64 {
-    31.5 + 0.0092 * s + 3.92e-6 * s * s
+/// Projected DENSE (non-block-checkpointed) first-step peak memory, in GB, as a function of the
+/// unified token count `s` — an empirical fit to peaks measured on the 128 GB target.
+///
+/// The structure follows the sc-4874 root-cause decomposition: `weights + linear·s + quad·s²`,
+/// where the constant is the resident base, the linear term is the per-token retained hidden-state
+/// activations across the 30 blocks, and the quadratic term is seq² attention. Since sc-4886 the
+/// training dense path always runs attention-segment checkpointing, which demotes the seq² term
+/// from "one retained `[30-heads,s,s]` probability matrix per block" (3.92e-6·s² ≈ 66 GB at 1024,
+/// the original sc-4874 explosion) to a single layer's backward transient (~1/30 of that).
+/// sc-4887 bf16 halves the weights + activation terms.
+///
+/// Measured (`first_step_attn_ckpt_sweep`, 128 GB Mac17,6, rank 16 / 136 targets / batch 1):
+/// f32 edge 512/768/1024 → 42.1/56.9/79.2 GB (exact 3-point fit); bf16 → 32.2/43.3 GB at 768/1024
+/// (fit with the quadratic constrained to half the f32 coefficient; the 512 bf16 sample was
+/// contaminated by not-yet-freed f32 buffers right after the cast). Assumes micro-batch 1 — true
+/// of the trainer's loop (one cached item per step; `batch_size` shapes nothing here) — and f32
+/// retained activations; refit if either changes.
+fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
+    if bf16 {
+        19.1 + 0.00522 * s + 1.55e-7 * s * s
+    } else {
+        30.8 + 0.01045 * s + 3.09e-7 * s * s
+    }
 }
 
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
@@ -489,10 +539,10 @@ fn projected_dense_peak_gb(s: f64) -> f64 {
 /// caption block. The budget is MLX's own reported memory limit (≈ the device's recommended working
 /// set), scaled by 0.85 to leave headroom for the worker/host — exceeding it is the regime where the
 /// dense run was observed to die. Only consulted when gradient checkpointing is OFF.
-fn preflight_memory_guard(edge: u32) -> Result<()> {
+fn preflight_memory_guard(edge: u32, bf16: bool) -> Result<()> {
     let tokens_per_side = (edge as f64 / 16.0).ceil();
     let s = tokens_per_side * tokens_per_side + 32.0; // + one padded caption block
-    let projected = projected_dense_peak_gb(s);
+    let projected = projected_dense_peak_gb(s, bf16);
     let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
     if projected > safe {
@@ -501,8 +551,7 @@ fn preflight_memory_guard(edge: u32) -> Result<()> {
              (the forward working set materializes in one allocation), exceeding this machine's ~{safe:.0} GB \
              safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS would hard-kill the \
              worker (SIGKILL) at the first step with no recoverable error (sc-4874). Enable Gradient \
-             Checkpointing (recomputes activations in the backward; ~2.4× smaller working set) or reduce the \
-             training resolution."
+             Checkpointing (recomputes block activations in the backward) or reduce the training resolution."
         )
         .into());
     }
@@ -585,6 +634,9 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
 /// `checkpoint_main`, when `Some`, lists per-main-block LOCAL LoRA target paths and switches the
 /// forward to the gradient-checkpointed path (sc-4874) — each main block recomputes its activations
 /// in the backward instead of retaining them. `None` runs the dense (activation-retaining) forward.
+/// `dtype` is the training compute dtype (sc-4887): for bf16 the latent / caption / RoPE inputs are
+/// cast at entry (the weights were cast once in `train_impl`) and the LoRA factors are cast inside
+/// the traced install, so the whole DiT graph runs bf16; the noising math, loss, and grads stay f32.
 #[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     transformer: &mut ZImageTransformer,
@@ -598,26 +650,34 @@ fn compute_loss_grads(
     noise: &Array,
     mae: bool,
     checkpoint_main: Option<&[Vec<String>]>,
+    dtype: Dtype,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
+    let x_t = x_t.as_dtype(dtype)?; // no-op in f32 mode
     let capf = cap.clone();
+    let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
         // Install ALL targets: refiners/embedders train through this on the (non-checkpointed)
         // pre-main forward; the main-block adapters installed here are simply replaced inside each
         // checkpoint segment by the explicit-input factors, so they cost nothing on the ckpt path.
-        adapter.install(transformer, &p, alpha, rank, LOKR_DTYPE)?;
+        adapter.install_as(transformer, &p, alpha, rank, lora_dtype, LOKR_DTYPE)?;
+        let sh = x_t.shape();
+        let prep = transformer
+            .prepare((sh[0], sh[1], sh[2], sh[3]), &capf)
+            .and_then(|prep| {
+                if dtype == Dtype::Float32 {
+                    Ok(prep)
+                } else {
+                    prep.cast_floats(dtype)
+                }
+            })
+            .map_err(|e| Exception::custom(e.to_string()))?;
         let v = match checkpoint_main {
-            Some(locals) => {
-                let sh = x_t.shape();
-                let prep = transformer
-                    .prepare((sh[0], sh[1], sh[2], sh[3]), &capf)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                transformer
-                    .forward_with_main_checkpointed(&prep, &x_t, timestep, &p, locals, alpha)
-                    .map_err(|e| Exception::custom(e.to_string()))?
-            }
+            Some(locals) => transformer
+                .forward_with_main_checkpointed(&prep, &x_t, timestep, &p, locals, alpha)
+                .map_err(|e| Exception::custom(e.to_string()))?,
             None => transformer
-                .forward(&x_t, timestep, &capf)
+                .forward_with(&prep, &x_t, timestep)
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
         let diff = subtract(&v, &target)?;
@@ -690,6 +750,10 @@ mod first_step_repro {
 
     /// Run a single first training step at `edge` and report peak GPU memory across the
     /// forward+backward. Forces the backward (grad eval) — the real step-1 kill point.
+    /// `dtype` is the compute dtype handed to `compute_loss_grads` (the caller is responsible for
+    /// having `cast_weights` the transformer to match); the SDPA-checkpoint flag is likewise set by
+    /// the caller on `trainer.transformer` (sc-4886 arms A/B against the retained backward).
+    #[allow(clippy::too_many_arguments)]
     fn one_step(
         trainer: &mut ZImageTurboTrainer,
         adapter: &TrainAdapter,
@@ -697,6 +761,8 @@ mod first_step_repro {
         cap: &Array,
         edge: u32,
         checkpoint_main: Option<&[Vec<String>]>,
+        dtype: Dtype,
+        tag: &str,
     ) -> Result<(f32, f64, [i32; 4])> {
         let img = center_crop_square(&swatch(edge));
         let x0 = encode_init_latents(&trainer.vae, &img, edge, edge)?;
@@ -708,8 +774,10 @@ mod first_step_repro {
         let noise = random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1)?))?;
         eval([&noise])?;
 
+        clear_cache();
         reset_peak_memory();
         let before = get_active_memory();
+        let t0 = std::time::Instant::now();
         let (loss, grads) = compute_loss_grads(
             &mut trainer.transformer,
             params,
@@ -722,18 +790,15 @@ mod first_step_repro {
             &noise,
             false,
             checkpoint_main,
+            dtype,
         )?;
         // `compute_loss_grads` only forces the loss (forward). The real trainer forces the backward
         // at the step-1 optimizer `eval`; do the same here so the peak reflects the true working set.
         eval(grads.values())?;
+        let secs = t0.elapsed().as_secs_f64();
         let peak = get_peak_memory();
-        let tag = if checkpoint_main.is_some() {
-            "ckpt"
-        } else {
-            "dense"
-        };
         eprintln!(
-            "  [edge {edge:>4} {tag}] latent {shape:?}  loss {loss:.5}  active-before {:.2} GB  peak {:.2} GB",
+            "  [edge {edge:>4} {tag}] latent {shape:?}  loss {loss:.5}  active-before {:.2} GB  peak {:.2} GB  step {secs:.2}s",
             gb(before),
             gb(peak)
         );
@@ -829,6 +894,7 @@ mod first_step_repro {
                 &noise,
                 false,
                 None,
+                Dtype::Float32,
             )
             .unwrap();
             // `loss.item()` inside `compute_loss_grads` already forced the FORWARD graph.
@@ -855,7 +921,16 @@ mod first_step_repro {
         eprintln!("[sc-4874] sweeping first-step peak memory by resolution:");
         for edge in [64u32, 256, 512, 768, 1024] {
             eprintln!("[sc-4874] === edge {edge} ===");
-            match one_step(&mut trainer, &adapter, &params, &cap, edge, None) {
+            match one_step(
+                &mut trainer,
+                &adapter,
+                &params,
+                &cap,
+                edge,
+                None,
+                Dtype::Float32,
+                "dense",
+            ) {
                 Ok((_, peak, shape)) => {
                     eprintln!("[sc-4874] edge {edge} SURVIVED  latent {shape:?}  peak {peak:.2} GB")
                 }
@@ -880,7 +955,16 @@ mod first_step_repro {
             "[sc-4874] set memory limit to {limit_gb:.1} GB (prev {:.2} GB); running edge 1024…",
             gb(prev)
         );
-        match one_step(&mut trainer, &adapter, &params, &cap, 1024, None) {
+        match one_step(
+            &mut trainer,
+            &adapter,
+            &params,
+            &cap,
+            1024,
+            None,
+            Dtype::Float32,
+            "dense",
+        ) {
             Ok((loss, peak, shape)) => eprintln!(
                 "[sc-4874] edge 1024 SURVIVED under {limit_gb:.1} GB limit  latent {shape:?}  loss {loss:.5}  peak {peak:.2} GB"
             ),
@@ -899,11 +983,28 @@ mod first_step_repro {
         let n_main: usize = locals.iter().map(|v| v.len()).sum();
         eprintln!("[sc-4874] checkpointing {n_main} LoRA targets across the main stack");
 
-        let (_, dense_peak, _) =
-            one_step(&mut trainer, &adapter, &params, &cap, 1024, None).expect("dense step");
-        let (_, ckpt_peak, _) =
-            one_step(&mut trainer, &adapter, &params, &cap, 1024, Some(&locals))
-                .expect("checkpointed step");
+        let (_, dense_peak, _) = one_step(
+            &mut trainer,
+            &adapter,
+            &params,
+            &cap,
+            1024,
+            None,
+            Dtype::Float32,
+            "dense",
+        )
+        .expect("dense step");
+        let (_, ckpt_peak, _) = one_step(
+            &mut trainer,
+            &adapter,
+            &params,
+            &cap,
+            1024,
+            Some(&locals),
+            Dtype::Float32,
+            "blk-ckpt",
+        )
+        .expect("checkpointed step");
         eprintln!(
             "[sc-4874] edge 1024  dense {dense_peak:.2} GB  ckpt {ckpt_peak:.2} GB  ({:.0}% reduction)",
             100.0 * (1.0 - ckpt_peak / dense_peak)
@@ -946,6 +1047,7 @@ mod first_step_repro {
                 &noise,
                 false,
                 ck,
+                Dtype::Float32,
             )
             .unwrap();
             eval(g.values()).unwrap();
@@ -967,30 +1069,304 @@ mod first_step_repro {
             "checkpointed grads must match dense within tolerance: max rel {max_rel:.2e}"
         );
     }
+
+    /// Max relative grad diff between two param maps (shared by the sc-4886/4887 parity tests).
+    fn max_rel_diff(ga: &LoraParams, gb_: &LoraParams) -> f32 {
+        let mut max_rel = 0f32;
+        for (k, a) in ga {
+            let b = gb_.get(k).expect("same keys");
+            let num = a.subtract(b).unwrap().abs().unwrap().max(None).unwrap();
+            let den = a.abs().unwrap().max(None).unwrap().item::<f32>().max(1e-6);
+            max_rel = max_rel.max(num.item::<f32>() / den);
+        }
+        max_rel
+    }
+
+    /// sc-4886 — the always-on attention-segment checkpointing must not change the math: grads with
+    /// the SDPA checkpoint on must match the retained backward (flag off). Same decomposed
+    /// attention, recomputed instead of retained → expect (near-)bit-identical.
+    #[test]
+    #[ignore = "needs real Z-Image weights; run as its own process"]
+    fn attn_ckpt_grads_match_retained() {
+        let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
+        let edge = 256u32;
+        let img = center_crop_square(&swatch(edge));
+        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+        let noise =
+            random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
+        eval([&x0, &noise]).unwrap();
+
+        let grads_of = |t: &mut ZImageTurboTrainer, on: bool| -> LoraParams {
+            t.transformer.set_sdpa_checkpoint(on, on);
+            let (_l, g) = compute_loss_grads(
+                &mut t.transformer,
+                &params,
+                &adapter,
+                16.0,
+                16.0,
+                &x0,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                None,
+                Dtype::Float32,
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            g
+        };
+        let g_retained = grads_of(&mut trainer, false);
+        let g_ckpt = grads_of(&mut trainer, true);
+        let max_rel = max_rel_diff(&g_retained, &g_ckpt);
+        eprintln!("[sc-4886] attn-ckpt-vs-retained grad max relative diff: {max_rel:.2e}");
+        assert!(
+            max_rel < 1e-5,
+            "attention-segment checkpointing must not change grads: max rel {max_rel:.2e}"
+        );
+    }
+
+    /// sc-4886/4887 — first-step peak sweep on the NEW training dense path (attention-segment
+    /// checkpointing always on), f32 then bf16. These measured points are the basis of the
+    /// `projected_dense_peak_gb` guard fit — refit the constants if this prints materially
+    /// different numbers.
+    #[test]
+    #[ignore = "needs real Z-Image weights; run as its own process"]
+    fn first_step_attn_ckpt_sweep() {
+        let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
+        trainer.transformer.set_sdpa_checkpoint(true, true);
+        eprintln!("[sc-4886] attn-ckpt dense sweep, f32:");
+        for edge in [512u32, 768, 1024] {
+            let _ = one_step(
+                &mut trainer,
+                &adapter,
+                &params,
+                &cap,
+                edge,
+                None,
+                Dtype::Float32,
+                "attn-ckpt f32",
+            )
+            .map_err(|e| eprintln!("  edge {edge} CATCHABLE error: {e}"));
+        }
+        eprintln!("[sc-4887] casting weights to bf16…");
+        trainer
+            .transformer
+            .cast_weights(Dtype::Bfloat16)
+            .expect("cast");
+        clear_cache();
+        eprintln!("[sc-4887] attn-ckpt dense sweep, bf16:");
+        for edge in [512u32, 768, 1024] {
+            let _ = one_step(
+                &mut trainer,
+                &adapter,
+                &params,
+                &cap,
+                edge,
+                None,
+                Dtype::Bfloat16,
+                "attn-ckpt bf16",
+            )
+            .map_err(|e| eprintln!("  edge {edge} CATCHABLE error: {e}"));
+        }
+        eprintln!("[sc-4887] block-ckpt + bf16 at 1024:");
+        let locals = main_block_local_targets(&trainer);
+        trainer.transformer.set_sdpa_checkpoint(false, true);
+        let _ = one_step(
+            &mut trainer,
+            &adapter,
+            &params,
+            &cap,
+            1024,
+            Some(&locals),
+            Dtype::Bfloat16,
+            "blk-ckpt bf16",
+        )
+        .map_err(|e| eprintln!("  blk-ckpt bf16 CATCHABLE error: {e}"));
+    }
+
+    /// sc-4887 — bf16 is mixed precision, NOT bit parity: assert the grads point the same way as
+    /// the f32 path (per-param cosine) and the loss is finite. Runs f32 first (the weight cast is
+    /// destructive), then casts the same trainer to bf16. Also asserts the bf16 working set is
+    /// genuinely smaller — a silent f32 re-promotion anywhere in the forward would pass the cosine
+    /// check while saving nothing, so the memory ratio IS the dtype assertion.
+    #[test]
+    #[ignore = "needs real Z-Image weights; run as its own process"]
+    fn bf16_grads_direction_and_memory_vs_f32() {
+        let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
+        trainer.transformer.set_sdpa_checkpoint(true, true);
+
+        // Memory A/B at 768 (big enough that activations dominate the peak).
+        let (_, f32_peak, _) = one_step(
+            &mut trainer,
+            &adapter,
+            &params,
+            &cap,
+            768,
+            None,
+            Dtype::Float32,
+            "attn-ckpt f32",
+        )
+        .expect("f32 step");
+
+        // Grad reference at 256 in f32.
+        let edge = 256u32;
+        let img = center_crop_square(&swatch(edge));
+        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+        let noise =
+            random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
+        eval([&x0, &noise]).unwrap();
+        let grads_of = |t: &mut ZImageTurboTrainer, dt: Dtype| -> (f32, LoraParams) {
+            let (l, g) = compute_loss_grads(
+                &mut t.transformer,
+                &params,
+                &adapter,
+                16.0,
+                16.0,
+                &x0,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                None,
+                dt,
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            (l, g)
+        };
+        let (f32_loss, g_f32) = grads_of(&mut trainer, Dtype::Float32);
+
+        trainer
+            .transformer
+            .cast_weights(Dtype::Bfloat16)
+            .expect("cast");
+        clear_cache();
+        let (bf16_loss, g_bf16) = grads_of(&mut trainer, Dtype::Bfloat16);
+        assert!(
+            bf16_loss.is_finite(),
+            "bf16 loss must be finite: {bf16_loss}"
+        );
+        eprintln!("[sc-4887] loss f32 {f32_loss:.5} vs bf16 {bf16_loss:.5}");
+
+        // Cosine between bf16 and f32 grads (both arrive f32 through the astype VJP). Gate on the
+        // GLOBAL cosine (the concatenated gradient — what the optimizer step actually follows) and
+        // the norm-weighted view; per-param minima are dominated by tiny-norm params whose direction
+        // bf16 rounding legitimately scrambles while contributing nothing to the update. Print the
+        // worst offenders with their norms so a real systematic bug (large-norm divergence) is
+        // distinguishable from precision noise on negligible grads.
+        let mut per: Vec<(String, f32, f32, f32)> = Vec::new(); // (key, cos, na, nb)
+        let (mut gdot, mut gna2, mut gnb2) = (0f64, 0f64, 0f64);
+        for (k, a) in &g_f32 {
+            let b = g_bf16.get(k).expect("same keys");
+            let dot = a.multiply(b).unwrap().sum(None).unwrap().item::<f32>();
+            let na2 = a.square().unwrap().sum(None).unwrap().item::<f32>();
+            let nb2 = b.square().unwrap().sum(None).unwrap().item::<f32>();
+            gdot += dot as f64;
+            gna2 += na2 as f64;
+            gnb2 += nb2 as f64;
+            let (na, nb) = (na2.sqrt(), nb2.sqrt());
+            if na > 1e-12 && nb > 1e-12 {
+                per.push((k.to_string(), dot / (na * nb), na, nb));
+            }
+        }
+        let global_cos = (gdot / (gna2.sqrt() * gnb2.sqrt())) as f32;
+        per.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+        let max_norm = per.iter().map(|p| p.2).fold(0f32, f32::max);
+        eprintln!(
+            "[sc-4887] bf16-vs-f32 grads: global cosine {global_cos:.5}; worst per-param (cos, |f32|, |bf16|, |f32|/max):"
+        );
+        for (k, c, na, nb) in per.iter().take(5) {
+            eprintln!(
+                "    {k}: cos {c:.4}  |g| {na:.3e} vs {nb:.3e}  rel-norm {:.2e}",
+                na / max_norm
+            );
+        }
+        // Any LARGE-norm param (≥1% of the biggest grad) must also agree directionally — that is
+        // the systematic-bug detector; small-norm direction noise is expected mixed-precision.
+        let min_large = per
+            .iter()
+            .filter(|p| p.2 >= 0.01 * max_norm)
+            .map(|p| p.1)
+            .fold(1f32, f32::min);
+        eprintln!("[sc-4887] min cosine among params with |g| >= 1% of max: {min_large:.4}");
+        assert!(
+            global_cos > 0.995,
+            "bf16 global grad must point the same way as f32: {global_cos:.5}"
+        );
+        // Measured on real weights: 0.966 (worst = main-stack to_k.lora_b — k-grads flow through
+        // the bf16 softmax backward, the most precision-sensitive chain; no norm shrink). The
+        // structural failure this gate exists for looked very different: a CLUSTER at cos 0.43-0.81
+        // with systematically smaller bf16 norms (the caption-entry sensitivity, fixed by keeping
+        // it f32 — see `train_unify_dtype`).
+        assert!(
+            min_large > 0.95,
+            "a large-norm param's bf16 grad diverged from f32 (systematic bug, not precision): {min_large:.4}"
+        );
+
+        let (_, bf16_peak, _) = one_step(
+            &mut trainer,
+            &adapter,
+            &params,
+            &cap,
+            768,
+            None,
+            Dtype::Bfloat16,
+            "attn-ckpt bf16",
+        )
+        .expect("bf16 step");
+        eprintln!(
+            "[sc-4887] 768 peak f32 {f32_peak:.2} GB vs bf16 {bf16_peak:.2} GB ({:.0}%)",
+            100.0 * bf16_peak / f32_peak
+        );
+        assert!(
+            bf16_peak < 0.70 * f32_peak,
+            "bf16 must materially shrink the working set (silent f32 re-promotion?): \
+             f32 {f32_peak:.2} GB vs bf16 {bf16_peak:.2} GB"
+        );
+    }
 }
 
 #[cfg(test)]
 mod preflight_tests {
     use super::projected_dense_peak_gb;
 
-    // The empirical fit must reproduce the measured peaks (sc-4874) within a few GB and stay
+    // The empirical fit must reproduce the measured first-step peaks within a few GB and stay
     // monotonic — it is the basis of the pre-flight OOM guard, so a regression here silently
     // mis-sizes the guard. s ≈ (edge/16)²: edge 512→1024, 768→2304, 1024→4096 tokens.
+    // The measured points come from `first_step_attn_ckpt_sweep` (the training dense path always
+    // runs attention-segment checkpointing since sc-4886; the original retained-attention 135 GB
+    // curve from sc-4874 no longer describes any reachable training path).
     #[test]
     fn projection_matches_measured_curve() {
-        for (s, measured) in [(1024.0, 45.0), (2304.0, 73.5), (4096.0, 135.0)] {
-            let p = projected_dense_peak_gb(s);
+        // f32 attn-ckpt dense (measured by first_step_attn_ckpt_sweep, 128 GB Mac17,6):
+        // s = (edge/16)² + 32 → edge 512/768/1024.
+        for (s, measured) in [(1056.0, 42.1), (2336.0, 56.9), (4128.0, 79.2)] {
+            let p = projected_dense_peak_gb(s, false);
             assert!(
-                (p - measured).abs() < 5.0,
-                "projection at s={s} = {p:.1} GB, expected ≈{measured} GB"
+                (p - measured).abs() < 3.0,
+                "f32 projection at s={s} = {p:.1} GB, expected ≈{measured} GB"
             );
         }
-        // Monotonic increasing in token count.
-        assert!(projected_dense_peak_gb(1024.0) < projected_dense_peak_gb(2304.0));
-        assert!(projected_dense_peak_gb(2304.0) < projected_dense_peak_gb(4096.0));
-        // The 1024-edge dense step (~135 GB) must project above any sane single-machine budget×0.85
-        // (e.g. 128 GB → 103 GB), i.e. the guard would fire.
-        assert!(projected_dense_peak_gb(4096.0) > 103.0);
+        // bf16 attn-ckpt dense (measured at 768/1024; the 512 sample was cast-transient-polluted).
+        for (s, measured) in [(2336.0, 32.2), (4128.0, 43.3)] {
+            let p = projected_dense_peak_gb(s, true);
+            assert!(
+                (p - measured).abs() < 3.0,
+                "bf16 projection at s={s} = {p:.1} GB, expected ≈{measured} GB"
+            );
+        }
+        for bf16 in [false, true] {
+            // Monotonic increasing in token count; bf16 strictly below f32.
+            assert!(projected_dense_peak_gb(1056.0, bf16) < projected_dense_peak_gb(2336.0, bf16));
+            assert!(projected_dense_peak_gb(2336.0, bf16) < projected_dense_peak_gb(4128.0, bf16));
+            assert!(projected_dense_peak_gb(2336.0, true) < projected_dense_peak_gb(2336.0, false));
+        }
+        // With attention-segment checkpointing always on, the 1024 dense step fits the 128 GB
+        // target in BOTH dtypes (budget ≈ 121.6 × 0.85 ≈ 103 GB) — the sc-4874 kill regime is gone
+        // without the Gradient Checkpointing checkbox.
+        assert!(projected_dense_peak_gb(4128.0, false) < 103.0);
+        assert!(projected_dense_peak_gb(4128.0, true) < 103.0);
     }
 }
 

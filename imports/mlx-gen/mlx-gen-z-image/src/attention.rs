@@ -12,8 +12,9 @@ use mlx_rs::{
     error::Exception,
     fast::{rms_norm, scaled_dot_product_attention},
     ops::{add, multiply, split, stack_axis, subtract},
+    transforms::checkpoint,
     transforms::compile::compile,
-    Array,
+    Array, Dtype,
 };
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
@@ -32,6 +33,13 @@ pub struct ZImageAttention {
     head_dim: i32,
     scale: f32,
     eps: f32,
+    /// sc-4886 — run the SDPA segment inside an `mlx::checkpoint` so its backward recomputes the
+    /// attention instead of retaining the `[heads, s, s]` probability matrix (the grad through
+    /// `fast::scaled_dot_product_attention` decomposes to naive attention — MLX has no fused SDPA
+    /// backward — and that one retained seq² array per block is ~half the dense training working
+    /// set). Numerically identical (same math, recomputed); inference never sets it (default off,
+    /// zero cost), the trainer enables it unconditionally.
+    ckpt_sdpa: bool,
 }
 
 impl ZImageAttention {
@@ -68,7 +76,32 @@ impl ZImageAttention {
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
             eps,
+            ckpt_sdpa: false,
         })
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing (sc-4886). Training-only knob — see `ckpt_sdpa`.
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.ckpt_sdpa = on;
+    }
+
+    /// Cast the projection weights + QK-norm scales to `dtype` (sc-4887 bf16 training). Quantized
+    /// projections are left untouched (see [`AdaptableLinear::cast_weights`]).
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for lin in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+        ] {
+            lin.cast_weights(dtype)?;
+        }
+        for norm in [&mut self.norm_q, &mut self.norm_k].into_iter().flatten() {
+            if norm.dtype() != dtype {
+                *norm = norm.as_dtype(dtype)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn forward(&self, x: &Array, freqs_cis: &Array) -> Result<Array> {
@@ -105,7 +138,24 @@ impl ZImageAttention {
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
         // 6th arg is `sinks` (MLX ≥0.30 attention-sinks); `None` = standard attention.
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+        let o = if self.ckpt_sdpa {
+            // sc-4886: checkpoint just the SDPA. q/k/v are the threaded inputs (grads to the
+            // QKV projections — and their LoRA — flow through them); only the f32 scale is
+            // captured. The backward recomputes the decomposed attention for THIS layer alone,
+            // so the seq² probability matrix is a per-layer transient, never 30× retained.
+            let scale = self.scale;
+            let mut seg = checkpoint(move |inp: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
+                Ok(vec![scaled_dot_product_attention(
+                    &inp[0], &inp[1], &inp[2], scale, None, None,
+                )?])
+            });
+            seg(&[q, k, v])?
+                .into_iter()
+                .next()
+                .expect("one sdpa output")
+        } else {
+            scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
+        };
         let o = o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, dim])?;
         self.to_out.forward(&o)
     }

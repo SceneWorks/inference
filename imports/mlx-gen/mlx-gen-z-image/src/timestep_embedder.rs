@@ -38,9 +38,27 @@ impl TimestepEmbedder {
         Ok(())
     }
 
+    /// Cast both projections to `dtype` (sc-4887 bf16 training). The sinusoidal embedding itself is
+    /// always computed in f32 (it is host-built trig of a scalar); `forward` casts it to the weight
+    /// dtype at the MLP boundary.
+    pub fn cast_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        for lin in [&mut self.linear1, &mut self.linear2] {
+            lin.cast_weights(dtype)?;
+        }
+        Ok(())
+    }
+
     /// `t`: `(B,)` → `(B, out)`.
     pub fn forward(&self, t: &Array) -> Result<Array> {
-        let t_freq = self.timestep_embedding(t)?;
+        let mut t_freq = self.timestep_embedding(t)?;
+        // Dtype-following: the embedding is f32; against a bf16-cast MLP (sc-4887) feeding it as-is
+        // would promote t_emb — and the whole adaLN modulation stream downstream — back to f32.
+        // No-op when the weights are f32 (inference) or quantized (`weight_dtype` = None).
+        if let Some(dt) = self.linear1.weight_dtype() {
+            if t_freq.dtype() != dt {
+                t_freq = t_freq.as_dtype(dt)?;
+            }
+        }
         let h = silu(&self.linear1.forward(&t_freq)?)?;
         self.linear2.forward(&h)
     }

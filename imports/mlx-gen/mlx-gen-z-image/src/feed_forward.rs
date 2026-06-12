@@ -43,6 +43,14 @@ impl FeedForward {
         }
         Ok(())
     }
+
+    /// Cast the three projections to `dtype` (sc-4887 bf16 training).
+    pub fn cast_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        for lin in [&mut self.w1, &mut self.w2, &mut self.w3] {
+            lin.cast_weights(dtype)?;
+        }
+        Ok(())
+    }
 }
 
 /// SwiGLU gate `silu(h1)·h3` = `(h1·sigmoid(h1))·h3`. The `w1`/`w3` GEMMs run eagerly; this fusable

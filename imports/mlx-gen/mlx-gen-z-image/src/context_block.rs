@@ -59,6 +59,28 @@ impl ZImageContextBlock {
         Ok(())
     }
 
+    /// Toggle SDPA-segment gradient checkpointing on the block's attention (sc-4886).
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.attention.set_sdpa_checkpoint(on);
+    }
+
+    /// Cast every weight in the block to `dtype` (sc-4887 bf16 training).
+    pub fn cast_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.attention.cast_weights(dtype)?;
+        self.feed_forward.cast_weights(dtype)?;
+        for norm in [
+            &mut self.attention_norm1,
+            &mut self.attention_norm2,
+            &mut self.ffn_norm1,
+            &mut self.ffn_norm2,
+        ] {
+            if norm.dtype() != dtype {
+                *norm = norm.as_dtype(dtype)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn forward(&self, x: &Array, freqs_cis: &Array) -> Result<Array> {
         let attn_out = self
             .attention
