@@ -20,9 +20,10 @@
 //! sub-block only (it consumes an already-RMSNorm'd hidden state, exactly like the reference
 //! `GptOssAttention.forward`).
 
+use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, cos as cos_op, divide, matmul, max_axes, maximum,
-    multiply, sin as sin_op, split, subtract, sum_axes,
+    add, broadcast_to, concatenate_axis, cos as cos_op, divide, matmul, max_axes, maximum, minimum,
+    multiply, sigmoid, sin as sin_op, split, subtract, sum_axes,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -30,6 +31,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::GptOssConfig;
+use crate::text_encoder::mxfp4::dequantize_mxfp4;
 
 /// A scalar `[1]` array for broadcasting multiplies.
 fn scalar(v: f32) -> Array {
@@ -224,4 +226,219 @@ pub fn attention_mask(l: i32, sliding_window: Option<i32>, dtype: Dtype) -> Resu
     Array::from_slice(&data, &[1, 1, l as i32, l as i32])
         .as_dtype(dtype)
         .map_err(Error::from)
+}
+
+// =====================================================================================================
+// MoE feed-forward + decoder-layer assembly (sc-3166)
+// =====================================================================================================
+
+/// One expert's dense weights (post-MXFP4-dequant), in the eager `GptOssExperts` layout
+/// (`x · gate_up`, `gated · down`).
+struct Expert {
+    gate_up: Array,   // [hidden, 2*inter]
+    gate_up_b: Array, // [2*inter]
+    down: Array,      // [inter, hidden]
+    down_b: Array,    // [hidden]
+}
+
+/// gpt-oss MoE feed-forward: a top-k linear router + 32 **clamped-SwiGLU** experts. Faithful port of
+/// `GptOssTopKRouter` + `GptOssExperts`: router → top-`k` softmax over the selected logits; each
+/// expert computes `(up+1)·(gate·σ(α·gate))` with `gate` clamped to `≤limit` and `up` clamped to
+/// `±limit`, weighted by its router score. Correctness-first: the experts are evaluated densely (all
+/// 32) and combined by a masked routing-weight matrix (the encoder runs short prompts; a gather/
+/// grouped-GEMM path can follow).
+pub struct GptOssMoe {
+    router_w: Array, // [E, hidden]
+    router_b: Array, // [E]
+    experts: Vec<Expert>,
+    num_experts: i32,
+    top_k: i32,
+    inter: i32,
+    alpha: f32,
+    limit: f32,
+}
+
+impl GptOssMoe {
+    /// Load `mlp` at `{prefix}` (e.g. `model.layers.0.mlp`). The router stays dense bf16; the experts
+    /// are MXFP4 (`*_blocks`/`*_scales`) and are dequantized to `dtype` via [`dequantize_mxfp4`].
+    pub fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: &GptOssConfig,
+        dtype: Dtype,
+    ) -> Result<Self> {
+        let e = cfg.num_experts;
+        let (hidden, inter) = (cfg.hidden_size, cfg.intermediate);
+        let req = |k: &str| -> Result<Array> { Ok(w.require(k)?.as_dtype(dtype)?) };
+
+        let gate_up = dequantize_mxfp4(
+            w.require(&format!("{prefix}.experts.gate_up_proj_blocks"))?,
+            w.require(&format!("{prefix}.experts.gate_up_proj_scales"))?,
+            dtype,
+        )?; // [E, hidden, 2*inter]
+        let down = dequantize_mxfp4(
+            w.require(&format!("{prefix}.experts.down_proj_blocks"))?,
+            w.require(&format!("{prefix}.experts.down_proj_scales"))?,
+            dtype,
+        )?; // [E, inter, hidden]
+        let gate_up_b = req(&format!("{prefix}.experts.gate_up_proj_bias"))?; // [E, 2*inter]
+        let down_b = req(&format!("{prefix}.experts.down_proj_bias"))?; // [E, hidden]
+
+        // Split the per-expert stacks into individual [.,.] weights (drops the leading E axis).
+        let gu = split(&gate_up, e, 0)?;
+        let gub = split(&gate_up_b, e, 0)?;
+        let dn = split(&down, e, 0)?;
+        let dnb = split(&down_b, e, 0)?;
+        let mut experts = Vec::with_capacity(e as usize);
+        for i in 0..e as usize {
+            experts.push(Expert {
+                gate_up: gu[i].reshape(&[hidden, 2 * inter])?,
+                gate_up_b: gub[i].reshape(&[2 * inter])?,
+                down: dn[i].reshape(&[inter, hidden])?,
+                down_b: dnb[i].reshape(&[hidden])?,
+            });
+        }
+
+        Ok(Self {
+            router_w: req(&format!("{prefix}.router.weight"))?,
+            router_b: req(&format!("{prefix}.router.bias"))?,
+            experts,
+            num_experts: e,
+            top_k: cfg.experts_per_tok,
+            inter,
+            alpha: cfg.swiglu_alpha,
+            limit: cfg.swiglu_limit,
+        })
+    }
+
+    /// `x`: `[B, L, hidden]`. Returns `[B, L, hidden]`.
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        let sh = x.shape();
+        let (b, l, hidden) = (sh[0], sh[1], sh[2]);
+        let n = b * l;
+        let xf = x.reshape(&[n, hidden])?;
+
+        // Router logits → dense top-k softmax routing-weight matrix [n, E] (zero off the top-k).
+        let logits = add(&matmul(&xf, self.router_w.t())?, &self.router_b)?; // [n, E]
+        let routing = self.routing_weights(&logits, n)?; // [n, E]
+        let routing_cols = split(&routing, self.num_experts, 1)?; // E × [n, 1]
+
+        let limit = scalar(self.limit);
+        let neg_limit = scalar(-self.limit);
+        let alpha = scalar(self.alpha);
+        let one = scalar(1.0);
+
+        let mut acc: Option<Array> = None;
+        for (e, expert) in self.experts.iter().enumerate() {
+            let gate_up = add(&matmul(&xf, &expert.gate_up)?, &expert.gate_up_b)?; // [n, 2*inter]
+                                                                                   // Interleaved gate/up: reshape [n, inter, 2] → split → gate = [..,0], up = [..,1].
+            let gu = gate_up.reshape(&[n, self.inter, 2])?;
+            let halves = split(&gu, 2, -1)?;
+            let gate = halves[0].reshape(&[n, self.inter])?;
+            let up = halves[1].reshape(&[n, self.inter])?;
+            // clamp: gate ≤ limit; up ∈ [−limit, limit].
+            let gate = minimum(&gate, &limit)?;
+            let up = maximum(&minimum(&up, &limit)?, &neg_limit)?;
+            // glu = gate · σ(α·gate); gated = (up + 1) · glu.
+            let glu = multiply(&gate, &sigmoid(&multiply(&gate, &alpha)?)?)?;
+            let gated = multiply(&add(&up, &one)?, &glu)?; // [n, inter]
+            let out_e = add(&matmul(&gated, &expert.down)?, &expert.down_b)?; // [n, hidden]
+            let weighted = multiply(&out_e, &routing_cols[e])?; // [n, hidden] · [n, 1]
+            acc = Some(match acc {
+                None => weighted,
+                Some(a) => add(&a, &weighted)?,
+            });
+        }
+        // No expert hit is impossible (top_k ≥ 1); unwrap is safe.
+        Ok(acc.expect("at least one expert").reshape(&[b, l, hidden])?)
+    }
+
+    /// Build the dense `[n, E]` routing-weight matrix: per row, softmax over the top-`k` logits and
+    /// scatter to the selected expert indices (zero elsewhere). Host-side (exact `torch.topk`
+    /// tie-by-index semantics); `n·E` is small for an encoder pass.
+    fn routing_weights(&self, logits: &Array, n: i32) -> Result<Array> {
+        let e = self.num_experts as usize;
+        let k = self.top_k as usize;
+        let l32 = logits.as_dtype(Dtype::Float32)?;
+        let data = l32.as_slice::<f32>(); // [n*E]
+        let mut out = vec![0f32; n as usize * e];
+        for row in 0..n as usize {
+            let s = &data[row * e..row * e + e];
+            let mut idx: Vec<usize> = (0..e).collect();
+            // descending value, ties broken by lower index (matches torch.topk).
+            idx.sort_by(|&a, &b| s[b].partial_cmp(&s[a]).unwrap().then(a.cmp(&b)));
+            let top = &idx[..k];
+            let maxv = top.iter().map(|&i| s[i]).fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0f32;
+            let exps: Vec<f32> = top
+                .iter()
+                .map(|&i| {
+                    let ev = (s[i] - maxv).exp();
+                    denom += ev;
+                    ev
+                })
+                .collect();
+            for (j, &i) in top.iter().enumerate() {
+                out[row * e + i] = exps[j] / denom;
+            }
+        }
+        Array::from_slice(&out, &[n, e as i32])
+            .as_dtype(logits.dtype())
+            .map_err(Error::from)
+    }
+}
+
+/// One full gpt-oss decoder layer: pre-norm sandwich `h + attn(rms(h))` then `h + moe(rms(h))`
+/// (`GptOssDecoderLayer.forward`).
+pub struct GptOssDecoderLayer {
+    input_ln: Array,
+    post_attn_ln: Array,
+    attn: GptOssAttention,
+    moe: GptOssMoe,
+    eps: f32,
+}
+
+impl GptOssDecoderLayer {
+    /// Load the layer at `{prefix}` (e.g. `model.layers.0`).
+    pub fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: &GptOssConfig,
+        dtype: Dtype,
+    ) -> Result<Self> {
+        Ok(Self {
+            input_ln: w
+                .require(&format!("{prefix}.input_layernorm.weight"))?
+                .as_dtype(dtype)?,
+            post_attn_ln: w
+                .require(&format!("{prefix}.post_attention_layernorm.weight"))?
+                .as_dtype(dtype)?,
+            attn: GptOssAttention::from_weights(w, &format!("{prefix}.self_attn"), cfg, dtype)?,
+            moe: GptOssMoe::from_weights(w, &format!("{prefix}.mlp"), cfg, dtype)?,
+            eps: cfg.rms_eps,
+        })
+    }
+
+    /// The MoE sub-block (exposed for isolated validation).
+    pub fn moe(&self) -> &GptOssMoe {
+        &self.moe
+    }
+
+    /// `x`: `[B, L, hidden]`. `inv_freq`/`attn_scaling`: YaRN constants. `mask`: additive attention
+    /// mask. Returns `[B, L, hidden]`.
+    pub fn forward(
+        &self,
+        x: &Array,
+        inv_freq: &Array,
+        attn_scaling: f32,
+        mask: &Array,
+    ) -> Result<Array> {
+        let normed = rms_norm(x, &self.input_ln, self.eps)?;
+        let h = add(
+            x,
+            &self.attn.forward(&normed, inv_freq, attn_scaling, mask)?,
+        )?;
+        let normed = rms_norm(&h, &self.post_attn_ln, self.eps)?;
+        Ok(add(&h, &self.moe.forward(&normed)?)?)
+    }
 }

@@ -19,13 +19,18 @@
 //!
 //! ## Status
 //!
-//! Under construction (epic 3164). This slice (**sc-3165**) ships the crate scaffold, the [`config`]
-//! parser for the gpt-oss text encoder, and the gpt-oss **attention core** ([`text_encoder::gpt_oss`])
-//! — GQA + learned attention sinks + alternating sliding/full causal masks + YaRN RoPE + RMSNorm,
-//! validated single-layer against the reference `transformers.models.gpt_oss` forward. The MoE
-//! feed-forward + full decoder-layer assembly (sc-3166), the multi-layer hidden capture (sc-3171),
-//! the weight conversion / quant (sc-3172), the DiT (sc-3168), VAE shim (sc-3169), scheduler
-//! (sc-3170), and the generate/e2e integration (sc-3173) land in the following stories.
+//! Under construction (epic 3164). Shipped so far:
+//! - **sc-3165** — crate scaffold, the [`config`] parser, and the gpt-oss **attention core**
+//!   ([`text_encoder::gpt_oss::GptOssAttention`]): GQA + learned attention sinks + alternating
+//!   sliding/full causal masks + YaRN RoPE.
+//! - **sc-3166** — the **MoE** feed-forward ([`text_encoder::gpt_oss::GptOssMoe`]: top-k router +
+//!   clamped-SwiGLU experts) + full **decoder-layer** assembly
+//!   ([`text_encoder::gpt_oss::GptOssDecoderLayer`]), with MXFP4 expert dequant
+//!   ([`text_encoder::mxfp4`]). Validated single-layer against `transformers.GptOssDecoderLayer`.
+//!
+//! Still to come: the multi-layer hidden capture (sc-3171), the memory-efficient weight conversion /
+//! Q4-Q8 re-quant (sc-3172), the DiT (sc-3168), VAE shim (sc-3169), scheduler (sc-3170), and the
+//! generate/e2e integration (sc-3173).
 
 pub mod config;
 pub mod text_encoder;
