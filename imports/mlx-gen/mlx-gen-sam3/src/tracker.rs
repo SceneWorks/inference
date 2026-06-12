@@ -458,8 +458,11 @@ impl MaskDecoder {
 
     /// `image_embedding`: NHWC `[1, g, g, 256]`; `image_pe`: NHWC `[1, g, g, 256]`; `sparse`:
     /// `[1, 1, n, 256]`; `dense`: NHWC `[1, g, g, 256]`; `high_res`: `[feat_s0 (NHWC, 4g², 32),
-    /// feat_s1 (NHWC, 2g², 64)]`. Returns `(masks [1, k, mg, mg], ious [1, k], obj_score [1, 1])`
-    /// with `multimask_output` selecting the 3 multimask candidates (slice 1..).
+    /// feat_s1 (NHWC, 2g², 64)]`. Returns `(masks [1, k, mg, mg], ious [1, k], obj_score [1, 1],
+    /// mask_tokens_out [1, 4, 256])` with `multimask_output` selecting the 3 multimask candidates
+    /// (slice 1..). The full (unsliced) `mask_tokens_out` is returned so the caller can extract the
+    /// object-pointer source token (`sam_output_token`): for a multimask request that is the
+    /// best-IoU candidate (`1 + argmax`); for the single/dynamic request it is always token 0.
     fn forward(
         &self,
         image_embedding: &Array,
@@ -468,7 +471,7 @@ impl MaskDecoder {
         dense: &Array,
         high_res: &[Array; 2],
         multimask_output: bool,
-    ) -> Result<(Array, Array, Array)> {
+    ) -> Result<(Array, Array, Array, Array)> {
         let g = image_embedding.shape()[1];
         // output tokens: [obj_score, iou, mask_tokens(4)] → [1, 6, 256]
         let out_tokens = concatenate_axis(
@@ -528,7 +531,7 @@ impl MaskDecoder {
             // mask 0 if stable, else falls back to the best-IoU multimask candidate.
             dynamic_multimask_via_stability(&masks, &ious)?
         };
-        Ok((masks, ious, obj_score))
+        Ok((masks, ious, obj_score, mask_tokens_out))
     }
 }
 
@@ -594,6 +597,7 @@ const SIGMOID_BIAS_FOR_MEM: f32 = -10.0;
 const MEM_OUT_CHANNELS: i32 = 64; // memory_encoder_output_channels
 const MEM_POS_FEATS: i32 = MEM_OUT_CHANNELS / 2; // PositionEmbeddingSine num_position_features (32)
 const MEM_SINE_TEMPERATURE: f32 = 10000.0;
+const NUM_MASKMEM: i32 = 7; // num_maskmem (memory bank depth)
 
 /// Grouped 2-D conv on an **NHWC** input with an OHWI weight (+ channel bias). `groups == channels`
 /// is the depthwise case (`memory_fuser` 7×7); everything else is `groups = 1`.
@@ -1071,8 +1075,23 @@ pub struct Sam3Tracker {
     /// when the object is predicted absent (`object_score_logits ≤ 0`).
     occlusion: Array,
     /// `tracker_model.memory_attention` — 4 RoPE layers fusing a frame's vision features with the
-    /// temporal memory bank (F2). The per-object memory-bank assembly that feeds this lands with F2.4.
+    /// temporal memory bank (F2). The per-object memory-bank assembly that feeds this is F2.4
+    /// ([`Sam3Tracker::prepare_memory_conditioned_features`]).
     memory_attention: MemoryAttention,
+    /// `tracker_model.object_pointer_proj` — 3-layer FeedForward (256→256) projecting the SAM mask
+    /// output token into the object pointer stored in the memory bank (F2.4).
+    object_pointer_proj: FeedForward,
+    /// `tracker_model.no_object_pointer` `[1, 256]` — the object pointer used when the object is
+    /// predicted absent (`object_score ≤ 0`).
+    no_object_pointer: Array,
+    /// `tracker_model.memory_temporal_positional_encoding` `[7, 1, 1, 64]` — per-temporal-offset
+    /// learned bias added to a memory frame's spatial position encoding (indexed `offset − 1`, where
+    /// a conditioning frame's `offset = 0` wraps to the last entry, mirroring Python negative
+    /// indexing).
+    mem_temporal_pos_enc: Array,
+    /// `tracker_model.temporal_positional_encoding_projection_layer` — Linear 256→64 projecting an
+    /// object pointer's 1-D sine temporal encoding down to the memory dimension (F2.4).
+    tpos_proj: (Array, Array),
 }
 
 /// A frame's encoded memory: the 64-channel spatial feature map + its sine position encoding, both
@@ -1118,6 +1137,20 @@ impl Sam3Tracker {
                 "tracker_model.memory_attention",
                 (INPUT_SIZE as i32) / 14, // 72² RoPE grid
             )?,
+            object_pointer_proj: FeedForward::from_weights(
+                w,
+                "tracker_model.object_pointer_proj",
+                3,
+                false,
+            )?,
+            no_object_pointer: w.require("tracker_model.no_object_pointer")?.clone(),
+            mem_temporal_pos_enc: w
+                .require("tracker_model.memory_temporal_positional_encoding")?
+                .clone(),
+            tpos_proj: weight_bias(
+                w,
+                "tracker_model.temporal_positional_encoding_projection_layer",
+            )?,
         })
     }
 
@@ -1150,6 +1183,98 @@ impl Sam3Tracker {
             memory_pos,
             num_object_pointer_tokens,
         )
+    }
+
+    /// `_single_frame_forward` object-pointer tail: project the SAM mask output token through
+    /// `object_pointer_proj`, gated by the object-appearing flag — present (`object_score > 0`) keeps
+    /// the projection, absent replaces it with the learned `no_object_pointer`. Returns `[1, 256]`.
+    pub fn compute_object_pointer(&self, mask_token: &Array, object_score: f32) -> Result<Array> {
+        let token = mask_token.reshape(&[1, HIDDEN])?;
+        if object_score > 0.0 {
+            self.object_pointer_proj.forward(&token)
+        } else {
+            Ok(self.no_object_pointer.reshape(&[1, HIDDEN])?)
+        }
+    }
+
+    /// `_prepare_memory_conditioned_features` (non-init branch) — assemble the per-object memory bank
+    /// and fuse it with the current frame's vision features via memory attention. This is the F2.4
+    /// bank-assembly that feeds [`Self::condition_with_memory`].
+    ///
+    /// - `current_vision_features` / `current_vision_pos`: seq-first `[seq, 1, 256]` (the 72² image
+    ///   embedding from [`Self::encode_frame`], flattened HW-first).
+    /// - `spatial_mem`: the gathered memory frames as `(relative_temporal_offset, features, pos)`,
+    ///   each `features`/`pos` seq-first `[seq, 1, 64]` (the stored `maskmem_features`/`maskmem_pos_enc`).
+    ///   `_build_memory_attention_inputs` adds `memory_temporal_positional_encoding[offset − 1]` to each
+    ///   frame's spatial pos (offset 0 → last entry, Python negative-index wrap).
+    /// - `object_pointers`: `(temporal_offset, pointer [1, 256])` — `_get_object_pointers` selection;
+    ///   `_process_object_pointers` adds a 1-D sine temporal PE (normalized by
+    ///   `max_object_pointers_to_use − 1`, projected 256→64), then splits each 256-d pointer into
+    ///   `256/64 = 4` consecutive 64-d memory tokens appended after the spatial memory.
+    ///
+    /// Returns the conditioned feature map NHWC `[1, g, g, 256]` for the SAM decoder.
+    pub fn prepare_memory_conditioned_features(
+        &self,
+        current_vision_features: &Array,
+        current_vision_pos: &Array,
+        spatial_mem: &[(i32, Array, Array)],
+        object_pointers: &[(i32, Array)],
+        max_object_pointers_to_use: i32,
+    ) -> Result<Array> {
+        let g = (current_vision_features.shape()[0] as f64).sqrt() as i32;
+
+        // Spatial memory: concat each gathered frame's features + (pos + temporal-pos[offset−1]).
+        let mut mem_feats: Vec<Array> = Vec::new();
+        let mut mem_pos: Vec<Array> = Vec::new();
+        for (offset, feat, pos) in spatial_mem {
+            let idx = (offset - 1).rem_euclid(NUM_MASKMEM); // offset 0 → 6 (negative-index wrap)
+            let tpos =
+                take1(&self.mem_temporal_pos_enc, idx, 0)?.reshape(&[1, 1, MEM_OUT_CHANNELS])?;
+            mem_feats.push(feat.clone());
+            mem_pos.push(add(pos, &tpos)?);
+        }
+
+        // Object pointers: sine temporal PE → project → split 256 into 4×64 memory tokens.
+        let mut num_object_pointer_tokens = 0;
+        if !object_pointers.is_empty() {
+            let num_splits = HIDDEN / MEM_OUT_CHANNELS; // 4
+            let max_temporal_diff = (max_object_pointers_to_use - 1).max(1) as f32;
+            let offsets: Vec<f32> = object_pointers
+                .iter()
+                .map(|(o, _)| *o as f32 / max_temporal_diff)
+                .collect();
+            let sine_pe = sine_pe_1d(&offsets, HIDDEN as usize, MEM_SINE_TEMPERATURE); // [P, 256]
+            let proj = linear(&sine_pe, &self.tpos_proj.0, &self.tpos_proj.1)?; // [P, 64]
+            let p = object_pointers.len() as i32;
+            // pointer tokens stacked [P, 256] → split each into 4×64 contiguous → [P·4, 1, 64].
+            let mut rows: Vec<Array> = Vec::with_capacity(object_pointers.len());
+            for (_, t) in object_pointers {
+                rows.push(t.reshape(&[1, HIDDEN])?);
+            }
+            let stacked = concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0)?; // [P, 256]
+            let split = stacked.reshape(&[p * num_splits, 1, MEM_OUT_CHANNELS])?; // [P·4, 1, 64]
+                                                                                  // pos embed [P, 64] → [P, 1, 64] → repeat_interleave(4) → [P·4, 1, 64].
+            let pe = proj.reshape(&[p, 1, 1, MEM_OUT_CHANNELS])?;
+            let pe = broadcast_to(&pe, &[p, num_splits, 1, MEM_OUT_CHANNELS])?.reshape(&[
+                p * num_splits,
+                1,
+                MEM_OUT_CHANNELS,
+            ])?;
+            mem_feats.push(split);
+            mem_pos.push(pe);
+            num_object_pointer_tokens = p * num_splits;
+        }
+
+        let combined_memory = concatenate_axis(&mem_feats.iter().collect::<Vec<_>>(), 0)?;
+        let combined_pos = concatenate_axis(&mem_pos.iter().collect::<Vec<_>>(), 0)?;
+        let conditioned = self.condition_with_memory(
+            current_vision_features,
+            current_vision_pos,
+            &combined_memory,
+            &combined_pos,
+            num_object_pointer_tokens,
+        )?; // [1, seq, 256] batch-first
+        Ok(conditioned.reshape(&[1, g, g, HIDDEN])?)
     }
 
     /// Mask prep for `_encode_new_memory`: resize the image-resolution mask logits to the 1152² mask
@@ -1242,7 +1367,7 @@ impl Sam3Tracker {
         )?;
         let (sparse, dense) = self.prompt.encode_box(box_xyxy_1008, g)?;
         let image_pe = self.image_pe_embed.dense_pe(g)?;
-        let (masks, ious, obj_score) = self.decoder.forward(
+        let (masks, ious, obj_score, _mask_tokens) = self.decoder.forward(
             &image_embedding,
             &image_pe,
             &sparse,
@@ -1286,4 +1411,22 @@ fn argmax(v: &[f32]) -> usize {
         }
     }
     best
+}
+
+/// `get_1d_sine_pe` (modeling_sam3_tracker_video.py ~1592): 1-D sinusoidal positional encoding for a
+/// set of (already-normalized) positions. `dim` must be even; the first `dim/2` outputs are the sines
+/// and the last `dim/2` the cosines, with paired frequencies `temperature^(2·(j//2)/(dim/2))`.
+/// Host-computed (the inputs are a handful of object-pointer temporal offsets). Returns `[P, dim]`.
+fn sine_pe_1d(positions: &[f32], dim: usize, temperature: f32) -> Array {
+    let pe_dim = dim / 2;
+    let mut out = vec![0f32; positions.len() * dim];
+    for (i, &p) in positions.iter().enumerate() {
+        for j in 0..pe_dim {
+            let dim_t = temperature.powf((2 * (j / 2)) as f32 / pe_dim as f32);
+            let v = p / dim_t;
+            out[i * dim + j] = v.sin();
+            out[i * dim + pe_dim + j] = v.cos();
+        }
+    }
+    Array::from_slice(&out, &[positions.len() as i32, dim as i32])
 }
