@@ -103,29 +103,29 @@ impl Pipeline {
     ) -> Result<Self> {
         // The config's only request-dependent fields are the latent dims; the component configs
         // (clip/clip2/unet/autoencoder) are fixed for SDXL.
-        let config =
-            StableDiffusionConfig::sdxl(None, Some(height as usize), Some(width as usize));
+        let config = StableDiffusionConfig::sdxl(None, Some(height as usize), Some(width as usize));
 
-        let load_clip = |which: Clip| -> Result<(Tokenizer, stable_diffusion::clip::ClipTextTransformer)> {
-            let (tok_repo, weights_sub) = which.sources();
-            let tokenizer = Tokenizer::from_file(hf_get(tok_repo, "tokenizer.json")?)
-                .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_repo}: {e}")))?;
-            let clip_cfg = match which {
-                Clip::L => &config.clip,
-                Clip::BigG => config
-                    .clip2
-                    .as_ref()
-                    .ok_or_else(|| CandleError::Msg("sdxl config missing clip2".into()))?,
+        let load_clip =
+            |which: Clip| -> Result<(Tokenizer, stable_diffusion::clip::ClipTextTransformer)> {
+                let (tok_repo, weights_sub) = which.sources();
+                let tokenizer = Tokenizer::from_file(hf_get(tok_repo, "tokenizer.json")?)
+                    .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_repo}: {e}")))?;
+                let clip_cfg = match which {
+                    Clip::L => &config.clip,
+                    Clip::BigG => config
+                        .clip2
+                        .as_ref()
+                        .ok_or_else(|| CandleError::Msg("sdxl config missing clip2".into()))?,
+                };
+                // CLIP loads f32 even though the weights file is fp16 (candle reference behavior).
+                let model = stable_diffusion::build_clip_transformer(
+                    clip_cfg,
+                    snapshot_file(root, weights_sub)?,
+                    device,
+                    DType::F32,
+                )?;
+                Ok((tokenizer, model))
             };
-            // CLIP loads f32 even though the weights file is fp16 (candle reference behavior).
-            let model = stable_diffusion::build_clip_transformer(
-                clip_cfg,
-                snapshot_file(root, weights_sub)?,
-                device,
-                DType::F32,
-            )?;
-            Ok((tokenizer, model))
-        };
 
         let (tokenizer_l, text_model_l) = load_clip(Clip::L)?;
         let (tokenizer_g, text_model_g) = load_clip(Clip::BigG)?;
@@ -176,7 +176,10 @@ impl Pipeline {
             ),
         };
         let vocab = tokenizer.get_vocab(true);
-        let pad_token = clip_cfg.pad_with.clone().unwrap_or_else(|| "<|endoftext|>".into());
+        let pad_token = clip_cfg
+            .pad_with
+            .clone()
+            .unwrap_or_else(|| "<|endoftext|>".into());
         let pad_id = *vocab
             .get(pad_token.as_str())
             .ok_or_else(|| CandleError::Msg(format!("pad token {pad_token:?} not in vocab")))?;
@@ -246,7 +249,9 @@ impl Pipeline {
                     latents.clone()
                 };
                 let model_in = scheduler.scale_model_input(model_in, timestep)?;
-                let noise_pred = self.unet.forward(&model_in, timestep as f64, &text_embeddings)?;
+                let noise_pred = self
+                    .unet
+                    .forward(&model_in, timestep as f64, &text_embeddings)?;
                 let noise_pred = if use_guide {
                     let chunks = noise_pred.chunk(2, 0)?;
                     let (uncond, cond) = (&chunks[0], &chunks[1]);
@@ -271,7 +276,10 @@ impl Pipeline {
     fn decode(&self, latents: &Tensor) -> Result<Image> {
         let img = self.vae.decode(&(latents / VAE_SCALE)?)?;
         let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
-        let img = (img * 255.)?.to_dtype(DType::U8)?.i(0)?.to_device(&Device::Cpu)?;
+        let img = (img * 255.)?
+            .to_dtype(DType::U8)?
+            .i(0)?
+            .to_device(&Device::Cpu)?;
         let (c, h, w) = img.dims3()?;
         if c != 3 {
             return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
