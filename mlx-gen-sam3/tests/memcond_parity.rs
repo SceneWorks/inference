@@ -54,6 +54,14 @@ fn memory_conditioning_matches_oracle() {
         .unwrap()
         .clone();
 
+    // The neck's sine position encoding (current_vision_pos) is weight-free — verify the host
+    // computation matches the captured fixture, so the pipeline can compute it instead of caching it.
+    let g = (cvf.shape()[0] as f64).sqrt() as i32;
+    let pos_computed = tracker.frame_position_encoding(g).unwrap();
+    let c_pos = cosine(&pos_computed, &cvp);
+    println!("frame_position_encoding: cosine={c_pos:.7}");
+    assert!(c_pos > 0.999999, "current_vision_pos cosine {c_pos}");
+
     // Spatial memory frames: [M,5184,1,64] features/pos + [M] offsets.
     let mem_feats = fx.require("memory_features").unwrap().clone();
     let mem_pos = fx.require("memory_pos_enc").unwrap().clone();
