@@ -5,17 +5,17 @@
 //! [`gen_core::Generator`] contract and self-registers via `inventory`, so linking this crate
 //! makes `gen_core::load("sdxl", …)` resolve the candle SDXL generator.
 //!
-//! **Slice sc-3675 — txt2img:** [`SdxlGenerator::generate`] runs the GO-validated epic-3494
-//! prototype ([`pipeline`]) through the contract: dual CLIP → UNet (real CFG, euler-ancestral) →
-//! f16 VAE, emitting `Progress` and honoring `req.cancel`. The descriptor advertises **only** the
-//! wired surface (txt2img + negative prompt + guidance, `euler_ancestral`) — NOT the full
-//! mlx-gen-sdxl conditioning/LoRA/accel-sampler surface — so the worker can route the rest to the
-//! Python fallback (sc-3678) rather than the candle backend silently dropping a control. The
-//! descriptor's `backend` is `"candle"` and `mac_only` is `false` (Windows/CUDA target).
+//! **txt2img (sc-3675 + sc-3673):** [`SdxlGenerator::generate`] runs the GO-validated epic-3494
+//! prototype ([`pipeline`]) through the contract: dual CLIP → UNet (real CFG) → f16 VAE, emitting
+//! `Progress` and honoring `req.cancel`, with **deterministic CPU-seeded noise + the non-ancestral
+//! DDIM sampler** (sc-3673) so output is launch-portable per seed. The descriptor advertises **only**
+//! the wired surface (txt2img + negative prompt + guidance, `ddim`) — NOT the full mlx-gen-sdxl
+//! conditioning/LoRA/accel-sampler surface — so the worker can route the rest to the Python fallback
+//! (sc-3678) rather than the candle backend silently dropping a control. The descriptor's `backend`
+//! is `"candle"` and `mac_only` is `false` (Windows/CUDA target).
 //!
-//! Carried forward as named follow-ups: deterministic seeding + a non-ancestral scheduler
-//! (sc-3673), flash-attn + f16-CLIP/VRAM work and component caching (sc-3674), RealVisXL + parity
-//! (sc-3677).
+//! Carried forward as named follow-ups: flash-attn + f16-CLIP/VRAM work and component caching
+//! (sc-3674), RealVisXL + parity (sc-3677).
 
 mod pipeline;
 
@@ -119,9 +119,12 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![],
             supports_lora: false,
             supports_lokr: false,
-            // Only the production euler-ancestral sampler is wired; the few-step accel samplers need
-            // their acceleration LoRAs (not yet supported), so they are not advertised.
-            samplers: vec!["euler_ancestral"],
+            // DDIM (eta=0) — the deterministic, launch-portable sampler wired in sc-3673 (replacing
+            // the spike's Euler-ancestral). The few-step accel samplers need their acceleration LoRAs
+            // (not yet supported), so they are not advertised. The worker sends no `sampler` for SDXL,
+            // so this list is capability introspection (`validate` only rejects a *named* sampler not
+            // in it).
+            samplers: vec!["ddim"],
             schedulers: vec!["discrete"],
             min_size: 512,
             max_size: 2048,
@@ -211,7 +214,8 @@ mod tests {
         assert!(d.capabilities.conditioning.is_empty());
         assert!(!d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.samplers, vec!["euler_ancestral"]);
+        // sc-3673: the wired sampler is the deterministic DDIM (not the spike's euler-ancestral).
+        assert_eq!(d.capabilities.samplers, vec!["ddim"]);
     }
 
     /// A txt2img request passes validation; unsupported shapes are rejected clearly (not silently
