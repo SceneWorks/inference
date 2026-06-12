@@ -678,12 +678,12 @@ fn bilinear_resize_matrix(in_size: i32, out_size: i32) -> Array {
     Array::from_slice(&data, &[out_size, in_size])
 }
 
-/// `Sam3TrackerVideoPositionEmbeddingSine(num_position_features=32, normalize=True)` over a `g×g`
-/// grid → NHWC `[1, g, g, 64]`. Channel layout is `cat(pos_y[32], pos_x[32])`; within each half the
-/// `2k`/`2k+1` pair is `(sin, cos)` at frequency `10000^(k/16)`. Host-computed (weight-free).
-fn position_embedding_sine(g: i32) -> Array {
-    let num_pos = MEM_POS_FEATS; // 32
-    let half = (num_pos / 2) as usize; // 16 frequencies
+/// `PositionEmbeddingSine(num_position_features=N, normalize=True)` over a `g×g` grid → NHWC
+/// `[1, g, g, 2N]`. Channel layout is `cat(pos_y[N], pos_x[N])`; within each half the `2k`/`2k+1` pair
+/// is `(sin, cos)` at frequency `10000^(k/(N/2))`. Host-computed (weight-free). `N=32` is the memory
+/// encoder's `maskmem_pos_enc`; `N=128` is the neck's `current_vision_pos` (`Sam3SinePositionEmbedding`).
+fn position_embedding_sine(g: i32, num_pos: i32) -> Array {
+    let half = (num_pos / 2) as usize;
     let scale = 2.0 * PI;
     let eps = 1e-6f32;
     let denom = g as f32 + eps;
@@ -823,7 +823,7 @@ impl MemoryEncoder {
             x = layer.forward(&x)?;
         }
         let features = conv2d_g(&x, &self.projection.0, &self.projection.1, 1, 0, 1)?; // [1,72,72,64]
-        let pos = position_embedding_sine(features.shape()[1]);
+        let pos = position_embedding_sine(features.shape()[1], MEM_POS_FEATS);
         Ok((features, pos))
     }
 }
@@ -1404,6 +1404,13 @@ impl Sam3Tracker {
     pub fn encode_frame(&self, pixel_values: &Array) -> Result<(Array, [Array; 2])> {
         let backbone = self.backbone.forward(pixel_values)?;
         self.neck.forward(&backbone)
+    }
+
+    /// The neck's 72² sine position encoding (`Sam3SinePositionEmbedding`, `num_position_features=128`,
+    /// `normalize=True`) flattened seq-first `[g², 1, 256]` — the `current_vision_pos` that memory
+    /// attention adds (`+0.1·pos`) to the conditioned features. Weight-free; depends only on the grid.
+    pub fn frame_position_encoding(&self, g: i32) -> Result<Array> {
+        Ok(position_embedding_sine(g, HIDDEN / 2).reshape(&[g * g, 1, HIDDEN])?)
     }
 
     /// Box-prompt a pre-encoded frame: `box_xyxy` in **1008-input** space → best low-res mask.
