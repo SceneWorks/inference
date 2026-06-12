@@ -48,6 +48,22 @@ fn gb(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
+/// `WAN_SWEEP_LIMIT_GB` pins the MLX memory limit before tile selection, so a 128 GB machine can
+/// simulate the smaller tier the budgeted plan must protect (`auto_tiling_budgeted` reads the
+/// limit). The limit is soft, so the decode still runs — but the chosen tile + peak reflect the
+/// smaller budget. No-op when the env var is unset.
+fn pin_limit_from_env() {
+    if let Ok(lim) = std::env::var("WAN_SWEEP_LIMIT_GB") {
+        if let Ok(gbs) = lim.parse::<usize>() {
+            let prev = mlx_rs::memory::set_memory_limit(gbs << 30);
+            println!(
+                "[limit] pinned MLX memory limit {gbs} GB (was {:.0} GB) for tile selection",
+                gb(prev)
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs the ~23 GB converted Wan2.2-TI2V-5B snapshot (WAN_5B_MODEL_DIR); GPU-heavy"]
 fn wan_ti2v_5b_wedge_sweep() {
@@ -111,19 +127,20 @@ fn wan_ti2v_5b_wedge_sweep() {
         );
 
         // DECODE: the full latent stack [z, T_lat, h_lat, w_lat] → video (heaviest post-loop op).
-        // Mirror the PRODUCTION path: TilingConfig::auto(...) gates single-pass vs tiled decode
-        // exactly as model.rs:408. WAN_SWEEP_NOTILE=1 forces single-pass to confirm it OOMs.
+        // Mirror the PRODUCTION path: auto_tiling_budgeted(...) picks the memory-budgeted tiling
+        // exactly as model.rs (sc-4998). WAN_SWEEP_NOTILE=1 forces single-pass to confirm it OOMs.
         let latents =
             random::normal::<f32>(&[z, t_lat, h_lat, w_lat], None, None, Some(&key)).unwrap();
         let gen_frames = frames as i32; // model.rs passes gen_frames (= frames + trim·4); trim=0 here
-        let tiling = mlx_gen::tiling::TilingConfig::auto(h, w, gen_frames);
+        pin_limit_from_env(); // WAN_SWEEP_LIMIT_GB: simulate a smaller-RAM tier (sc-4998)
+        let tiling = mlx_gen_wan::pipeline::auto_tiling_budgeted(h, w, gen_frames)
+            .expect("decode tiling within this machine's budget (sc-4998)");
         let notile = env_usize("WAN_SWEEP_NOTILE", 0) == 1;
         println!(
-            "[tiling] auto({h},{w},{gen_frames}) = {}  (notile_override={notile})",
-            if tiling.is_some() {
-                "Some(tiled)"
-            } else {
-                "None(single-pass)"
+            "[tiling] auto_budgeted({h},{w},{gen_frames}) = {}  (notile_override={notile})",
+            match &tiling {
+                Some(c) => format!("Some({c:?})"),
+                None => "None(single-pass)".to_string(),
             }
         );
         reset_peak_memory();

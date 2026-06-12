@@ -29,9 +29,9 @@ use mlx_rs::Array;
 use crate::adapters::{merge_wan_adapters, warn_skipped_adapters};
 use crate::config::{GuideScale, WanModelConfig};
 use crate::pipeline::{
-    align_dim, best_output_size, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
-    build_ti2v_multi_mask, decode_to_frames, decode_to_frames_22, denoise, denoise_moe,
-    denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
+    align_dim, auto_tiling_budgeted, best_output_size, build_i2v_y, build_ti2v_keyframe_z,
+    build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames, decode_to_frames_22, denoise,
+    denoise_moe, denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
     preprocess_ti2v_image, seq_len, ti2v_blend_init, Expert,
 };
 use crate::scheduler::SolverKind;
@@ -276,6 +276,11 @@ impl Wan {
             !cfg_disabled,
         )?;
 
+        // sc-4998 — pick the memory-budgeted z48 vae22 decode tiling now, so an over-budget decode
+        // (the 60 GB / 4.3 min blowup the px-threshold `auto` produced at moderate res) fails
+        // catchably *before* the heavy denoise rather than OOM-ing in the post-loop decode stage.
+        let decode_tiling = auto_tiling_budgeted(height as i32, width as i32, gen_frames as i32)?;
+
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
         let (context, context_null) = {
@@ -414,12 +419,12 @@ impl Wan {
 
         // --- Stage 3: z48 vae22 decode → RGB8 frames ---
         on_progress(Progress::Decoding);
-        // Causal temporal decode: t_lat → 1 + (t_lat−1)·4 output frames (= gen_frames).
-        let tiling = TilingConfig::auto(height as i32, width as i32, gen_frames as i32);
+        // Causal temporal decode: t_lat → 1 + (t_lat−1)·4 output frames (= gen_frames). The tiling
+        // was chosen (and budget-checked) up front by `auto_tiling_budgeted` (sc-4998).
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = Wan22Vae::from_weights(&w)?;
-            decode_to_frames_22(&vae, &latents, tiling.as_ref())?
+            decode_to_frames_22(&vae, &latents, decode_tiling.as_ref())?
         };
         let mut images = frames_to_images(&frames_u8)?;
         // Discard the extra leading frames generated for `trim_first_frames`.
