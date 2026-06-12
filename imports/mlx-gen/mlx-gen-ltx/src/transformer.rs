@@ -27,14 +27,17 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use mlx_rs::error::Exception;
+use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
     add, concatenate_axis, dequantize, divide, matmul, multiply, power, quantized_matmul, sigmoid,
     subtract, tanh,
 };
+use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
+
+use mlx_gen::train::lora::LoraParams;
 
 use mlx_gen::nn::{gelu_tanh, linear};
 use mlx_gen::weights::{to_dtype, Weights};
@@ -110,6 +113,19 @@ impl Precision {
     fn keep_quant(self) -> bool {
         matches!(self.mode, Mode::QuantF32 | Mode::QuantBf16)
     }
+
+    /// The same quant geometry re-targeted at a new compute/activation `dtype` (sc-4942 bf16 training
+    /// cast). bf16 → `QuantBf16`; f32 preserves whether the base was kept packed (`QuantF32`) or
+    /// dequantized to dense (`DenseF32`). Used by [`LtxDiT::cast_weights`] to flip the whole forward
+    /// to bf16 activations once the leaves are cast.
+    fn with_compute_dtype(self, dtype: Dtype) -> Self {
+        let mode = match dtype {
+            Dtype::Bfloat16 => Mode::QuantBf16,
+            _ if self.keep_quant() => Mode::QuantF32,
+            _ => Mode::DenseF32,
+        };
+        Self { mode, ..self }
+    }
 }
 
 fn scalar(v: f32) -> Array {
@@ -173,6 +189,7 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
 }
 
 /// A Linear's base weight — dense or Q8-quantized, selected by [`Precision`] at load.
+#[derive(Clone)]
 enum LinearKind {
     Dense {
         w: Array, // [out, in]
@@ -218,6 +235,36 @@ impl LinearKind {
             }
         }
     }
+
+    /// The base weight's current compute dtype (sc-4942) — the dense weight, or the quantized
+    /// scales (the packed `q` carries no float dtype). Lets the trainer detect a prior bf16 cast.
+    fn weight_dtype(&self) -> Dtype {
+        match self {
+            LinearKind::Dense { w, .. } => w.dtype(),
+            LinearKind::Quant { scales, .. } => scales.dtype(),
+        }
+    }
+
+    /// Cast the base to the training compute `dtype` in place (sc-4942 bf16 lever). A dense weight
+    /// casts whole; a quantized weight keeps its packed `q` (the quant geometry is dtype-free) and
+    /// casts only the float-bearing scales / biases / bias so `quantized_matmul` matches a bf16
+    /// activation. Bias casts in both arms.
+    fn cast(&mut self, dtype: Dtype) -> Result<()> {
+        match self {
+            LinearKind::Dense { w, b } => {
+                *w = to_dtype(w, dtype)?;
+                *b = to_dtype(b, dtype)?;
+            }
+            LinearKind::Quant {
+                scales, biases, b, ..
+            } => {
+                *scales = to_dtype(scales, dtype)?;
+                *biases = to_dtype(biases, dtype)?;
+                *b = to_dtype(b, dtype)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One adapter as a forward-time residual — the reference `lora/apply.py::LoRALinear`
@@ -232,6 +279,7 @@ impl LinearKind {
 /// reference `lora/` has no LoKr) carries a precomputed `[out,in]` delta (`alpha/rank` already folded
 /// in by `reconstruct_lokr_delta`); the residual is `x·ΔWᵀ` with `ΔW` cast to the activation dtype,
 /// mirroring the fork's `LoKrLinear` / the core `Adapter::Lokr`. Both variants apply a per-pass scale.
+#[derive(Clone)]
 enum LtxAdapter {
     /// `residual = pass_scale[pass] · (x·Aᵀ)·Bᵀ`. `pass_scale` already folds `(alpha/rank)·strength`.
     Lora {
@@ -269,6 +317,7 @@ impl LtxAdapter {
 /// set by [`LtxDiT::set_lora_pass`] before each stage. The pass lives in a `Cell` so a shared
 /// `&self` forward reads it and the pipeline switches passes without `&mut` (the crate runs
 /// single-device, one job per thread — see the runtime docs; `Cell<usize>` is `Send`).
+#[derive(Clone)]
 struct LoraStack {
     adapters: Vec<LtxAdapter>,
     pass: Cell<usize>,
@@ -276,6 +325,7 @@ struct LoraStack {
 
 /// A Linear: a base weight ([`LinearKind`]) plus an optional forward-time LoRA overlay. With no
 /// adapters the forward is byte-identical to the pre-sc-2687 path (the Q8/dense base only).
+#[derive(Clone)]
 pub struct Linear {
     kind: LinearKind,
     lora: Option<LoraStack>,
@@ -394,6 +444,18 @@ impl Linear {
     pub(crate) fn base_shape(&self) -> Vec<i32> {
         self.kind.base_shape()
     }
+
+    /// The base weight's current compute dtype (sc-4942) — used to detect a prior bf16 cast.
+    pub(crate) fn weight_dtype(&self) -> Dtype {
+        self.kind.weight_dtype()
+    }
+
+    /// Cast the base weight to the training compute `dtype` in place (sc-4942 bf16 lever). Only the
+    /// frozen base is touched; a LoRA overlay is installed AFTER the cast (at the compute dtype) by
+    /// the trainer, so `lora` is `None` here in practice.
+    pub(crate) fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.kind.cast(dtype)
+    }
 }
 
 /// A model tree that routes a LoRA target's dotted path (post LTX key normalization) to its
@@ -453,6 +515,7 @@ fn rms_norm_noweight(x: &Array, eps: f32) -> Result<Array> {
 /// Multi-head attention with q/k RMSNorm, optional SPLIT RoPE, optional per-head gating. Self-attn
 /// when `context` is `None`; cross-attn otherwise. RoPE `(cos, sin)` applies to q **and** k (self-attn
 /// only; cross-attn passes `pe = None`).
+#[derive(Clone)]
 struct Attention {
     to_q: Linear,
     to_k: Linear,
@@ -464,6 +527,11 @@ struct Attention {
     heads: i32,
     dim_head: i32,
     eps: f32,
+    /// sc-4942 — run the SDPA segment inside an `mlx::checkpoint` so its backward recomputes the
+    /// decomposed attention (MLX has no fused SDPA backward) instead of retaining the per-layer seq²
+    /// probability matrix. Training-only knob, set by [`set_sdpa_checkpoint`](Self::set_sdpa_checkpoint);
+    /// `false` on the inference path (byte-identical to the pre-sc-4942 forward).
+    ckpt_sdpa: bool,
 }
 
 impl Attention {
@@ -494,7 +562,28 @@ impl Attention {
             heads,
             dim_head,
             eps,
+            ckpt_sdpa: false,
         })
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing (sc-4942). Training-only — see `ckpt_sdpa`.
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.ckpt_sdpa = on;
+    }
+
+    /// Cast the attention's frozen weights (q/k/v/out projections, optional gate, q/k RMSNorm
+    /// scales) to the training compute `dtype` in place (sc-4942 bf16 lever).
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.to_q.cast_weights(dtype)?;
+        self.to_k.cast_weights(dtype)?;
+        self.to_v.cast_weights(dtype)?;
+        self.to_out.cast_weights(dtype)?;
+        if let Some(g) = &mut self.gate {
+            g.cast_weights(dtype)?;
+        }
+        self.q_norm = to_dtype(&self.q_norm, dtype)?;
+        self.k_norm = to_dtype(&self.k_norm, dtype)?;
+        Ok(())
     }
 
     /// `(B, S, inner)` → `(B, H, S, head_dim)`.
@@ -532,9 +621,33 @@ impl Attention {
 
         // Match the reference's Python `1.0 / math.sqrt(dim_head)` (f64 → f32), not `d^-0.5` in f32.
         let scale = (1.0f64 / (self.dim_head as f64).sqrt()) as f32;
-        let out = match mask {
-            Some(m) => scaled_dot_product_attention(&qh, &kh, &vh, scale, m, None)?,
-            None => scaled_dot_product_attention(&qh, &kh, &vh, scale, None, None)?,
+        let out = if self.ckpt_sdpa {
+            // sc-4942: checkpoint just the SDPA. q/k/v are the threaded inputs (grads to the QKV
+            // projections — and their LoRA — flow through them); the f32 scale and the (constant,
+            // non-differentiated) additive mask are captured. The backward recomputes the decomposed
+            // attention for THIS layer alone, so the seq² probability matrix is a per-layer transient,
+            // never 48× retained — the flash-backward surrogate every torch trainer gets free.
+            let m = mask.cloned();
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                let o = match &m {
+                    Some(m) => {
+                        scaled_dot_product_attention(&inp[0], &inp[1], &inp[2], scale, m, None)?
+                    }
+                    None => {
+                        scaled_dot_product_attention(&inp[0], &inp[1], &inp[2], scale, None, None)?
+                    }
+                };
+                Ok(vec![o])
+            });
+            seg(&[qh, kh, vh])?
+                .into_iter()
+                .next()
+                .expect("one sdpa output")
+        } else {
+            match mask {
+                Some(m) => scaled_dot_product_attention(&qh, &kh, &vh, scale, m, None)?,
+                None => scaled_dot_product_attention(&qh, &kh, &vh, scale, None, None)?,
+            }
         };
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -577,6 +690,7 @@ impl Attention {
 }
 
 /// `proj_in → gelu(tanh) → proj_out`.
+#[derive(Clone)]
 struct FeedForward {
     proj_in: Linear,
     proj_out: Linear,
@@ -588,6 +702,12 @@ impl FeedForward {
             proj_in: Linear::load(w, &format!("{prefix}.proj_in"), prec)?,
             proj_out: Linear::load(w, &format!("{prefix}.proj_out"), prec)?,
         })
+    }
+
+    /// Cast both projection weights to the training compute `dtype` (sc-4942 bf16 lever).
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.proj_in.cast_weights(dtype)?;
+        self.proj_out.cast_weights(dtype)
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
@@ -637,6 +757,7 @@ impl IndexAxis for Array {
 }
 
 /// One video transformer block (`BasicAVTransformerBlock`, video-only / gated 2.3 path).
+#[derive(Clone)]
 pub struct VideoBlock {
     attn1: Attention,
     attn2: Attention,
@@ -735,6 +856,23 @@ impl VideoBlock {
         self.attn2.set_lora_pass(pass);
         self.ff.set_lora_pass(pass);
     }
+
+    /// Toggle SDPA-segment checkpointing on both attentions (sc-4942). See [`Attention::ckpt_sdpa`].
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.attn1.set_sdpa_checkpoint(on);
+        self.attn2.set_sdpa_checkpoint(on);
+    }
+
+    /// Cast the block's frozen weights — both attentions, the FFN, and the adaLN scale-shift tables —
+    /// to the training compute `dtype` in place (sc-4942 bf16 lever).
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.attn1.cast_weights(dtype)?;
+        self.attn2.cast_weights(dtype)?;
+        self.ff.cast_weights(dtype)?;
+        self.scale_shift_table = to_dtype(&self.scale_shift_table, dtype)?;
+        self.prompt_scale_shift_table = to_dtype(&self.prompt_scale_shift_table, dtype)?;
+        Ok(())
+    }
 }
 
 /// PixArt sinusoidal timestep embedding (`flip_sin_to_cos`, `downscale_freq_shift = 0`, max_period
@@ -805,6 +943,13 @@ impl AdaLayerNormSingle {
         self.ts_lin2.set_lora_pass(pass);
         self.linear.set_lora_pass(pass);
     }
+
+    /// Cast the three projection weights to the training compute `dtype` (sc-4942 bf16 lever).
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.ts_lin1.cast_weights(dtype)?;
+        self.ts_lin2.cast_weights(dtype)?;
+        self.linear.cast_weights(dtype)
+    }
 }
 
 /// The LTX-2.3 video DiT: preprocessor + 48 blocks + output projection. Predicts velocity.
@@ -837,6 +982,17 @@ impl RopeMemo {
         *self.cached.borrow_mut() = Some((key, cos.clone(), sin.clone()));
         Ok((cos, sin))
     }
+}
+
+/// A per-block trainable LoRA target threaded into the gradient-checkpoint closure (sc-4942): the
+/// block-local resolution path (e.g. `["attn1", "to_q"]`) and the factor-map keys for its A/B, so
+/// [`LtxDiT::forward_with_main_checkpointed`] can pull each block's live factors out of the traced
+/// `LoraParams` and re-install them inside the recompute segment. Built by the trainer from its
+/// resolved targets.
+pub struct BlockLoraRef {
+    pub local: Vec<String>,
+    pub a_key: String,
+    pub b_key: String,
 }
 
 pub struct LtxDiT {
@@ -905,6 +1061,47 @@ impl LtxDiT {
         for b in &self.blocks {
             b.set_lora_pass(pass);
         }
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing across the whole block stack (sc-4942). The trainer
+    /// arms it for every training forward (numerically identical to the retained backward; bounds the
+    /// seq² attention retention to one layer's transient), and turns it OFF when whole-block
+    /// checkpointing is on — the block recompute already covers attention, so nesting would recompute
+    /// it twice for no memory win. Inference never calls this (the flag stays `false`).
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for b in &mut self.blocks {
+            b.set_sdpa_checkpoint(on);
+        }
+    }
+
+    /// Cast the DiT to the `dtype` training compute precision in place — the sc-4942 bf16 lever. Casts
+    /// every frozen leaf (patchify/adaLN/blocks/output) AND flips the activation mode via
+    /// [`Precision::with_compute_dtype`], so [`preprocess`](Self::preprocess) (which keys off
+    /// `self.prec.dtype()`) runs the whole forward at the new dtype: bf16 halves the retained-activation
+    /// working set (the dominant first-step cost on this Q-packed base) and matches the reference's own
+    /// `quant_bf16` production-speed path. The trainable factors / loss / grads / optimizer stay f32
+    /// (master-weights), installed at the compute dtype by the trainer after this cast. Destructive for
+    /// a narrowing cast (f32→bf16): reload for f32. Inference never calls this (KEEP-F32 production).
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.patchify_proj.cast_weights(dtype)?;
+        self.proj_out.cast_weights(dtype)?;
+        self.adaln.cast_weights(dtype)?;
+        if let Some(p) = &mut self.prompt_adaln {
+            p.cast_weights(dtype)?;
+        }
+        for b in &mut self.blocks {
+            b.cast_weights(dtype)?;
+        }
+        self.scale_shift_table = to_dtype(&self.scale_shift_table, dtype)?;
+        self.prec = self.prec.with_compute_dtype(dtype);
+        Ok(())
+    }
+
+    /// The DiT's current compute dtype (sc-4942), probed from the patchify projection. Lets the trainer
+    /// detect a prior [`cast_weights`](Self::cast_weights) — the cast is destructive, so an f32 request
+    /// after a bf16 cast must reload, not proceed.
+    pub fn compute_dtype(&self) -> Dtype {
+        self.patchify_proj.weight_dtype()
     }
 
     /// The preprocessor (mirrors the reference `TransformerArgsPreprocessor.prepare`): patchify_proj →
@@ -1002,6 +1199,112 @@ impl LtxDiT {
                 &p.cos,
                 &p.sin,
             )?;
+        }
+        self.output_head(&h, &p.emb_ts)
+    }
+
+    /// Training forward with **per-block gradient checkpointing** (sc-4942). Identical compute to
+    /// [`forward`](Self::forward), but each of the 48 `transformer_blocks` runs inside an
+    /// `mlx::checkpoint` segment whose explicit inputs are the block hidden state plus that block's
+    /// trainable LoRA factors — so the reverse pass recomputes the block instead of retaining its
+    /// activations (bounding the first-step working set), while gradients still flow to the LoRA params.
+    /// The preprocessor and the output head run normally. The whole adapter surface of this trainer is
+    /// in the blocks (`attn1`/`attn2`), so every trained target is threaded here.
+    ///
+    /// `params` is the live (traced) factor map; `block_targets[i]` lists block `i`'s trainable targets
+    /// (block-local path + factor keys), in the order their factors are threaded as checkpoint inputs.
+    /// Blocks with no trained targets still run checkpointed (hidden-only input) so the whole stack is
+    /// uniformly recompute-on-backward.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_main_checkpointed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        mask: Option<&Array>,
+        positions: &Array,
+        params: &LoraParams,
+        block_targets: &[Vec<BlockLoraRef>],
+        alpha: f32,
+    ) -> Result<Array> {
+        let p = self.preprocess(latent, timestep, context, positions)?;
+        let mut h = p.x;
+        for (i, block) in self.blocks.iter().enumerate() {
+            // Cheap clone (Arrays are refcounted): the closure must OWN its state because the backward
+            // recompute runs after this method's frame is gone; a borrow of `self`/`p` would dangle.
+            let mut blk = block.clone();
+            let empty: Vec<BlockLoraRef> = Vec::new();
+            let refs = block_targets.get(i).unwrap_or(&empty);
+            let locals: Vec<Vec<String>> = refs.iter().map(|r| r.local.clone()).collect();
+            let ts_emb = p.ts_emb.clone();
+            let prompt_ts = p.prompt_ts.clone();
+            let context_c = p.context.clone();
+            let mask_c = mask.cloned();
+            let cos = p.cos.clone();
+            let sin = p.sin.clone();
+            let alpha_c = alpha;
+
+            // Threaded inputs: [hidden, a_0, b_0, a_1, b_1, ...] (raw `[r,in]`/`[out,r]` f32 factors).
+            let mut inputs: Vec<Array> = Vec::with_capacity(1 + 2 * refs.len());
+            inputs.push(h.clone());
+            for r in refs {
+                inputs.push(
+                    params
+                        .get(r.a_key.as_str())
+                        .ok_or_else(|| {
+                            mlx_gen::Error::Msg(format!("LoRA param missing: {}", r.a_key))
+                        })?
+                        .clone(),
+                );
+                inputs.push(
+                    params
+                        .get(r.b_key.as_str())
+                        .ok_or_else(|| {
+                            mlx_gen::Error::Msg(format!("LoRA param missing: {}", r.b_key))
+                        })?
+                        .clone(),
+                );
+            }
+
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                // Reinstall the explicit-input factors with the SAME `(transpose, alpha/rank fold)`
+                // `install_train_lora` applies — so the checkpointed block forward is numerically
+                // identical to the installed-adapter path, and grads route to `inp`. Dtype-follow on the
+                // hidden state (bf16 lever): the f32 factors must join the bf16 stream or every adapted
+                // Linear re-promotes the block to f32. No-op in f32 mode; grads flow back f32 via the
+                // astype VJP.
+                let dt = inp[0].dtype();
+                for (j, local) in locals.iter().enumerate() {
+                    let a = inp[1 + 2 * j].t().as_dtype(dt)?; // [r,in] -> [in,r]
+                    let rank = a.shape()[1] as f32;
+                    let b = inp[2 + 2 * j]
+                        .t() // [out,r] -> [r,out]
+                        .multiply(scalar(alpha_c / rank))?
+                        .as_dtype(dt)?;
+                    let seg_refs: Vec<&str> = local.iter().map(String::as_str).collect();
+                    blk.adaptable_mut(&seg_refs)
+                        .ok_or_else(|| {
+                            Exception::custom(format!(
+                                "checkpoint LoRA target not found: {}",
+                                local.join(".")
+                            ))
+                        })?
+                        .set_train_lora(a, b);
+                }
+                let out = blk
+                    .forward(
+                        &inp[0],
+                        &ts_emb,
+                        prompt_ts.as_ref(),
+                        &context_c,
+                        mask_c.as_ref(),
+                        &cos,
+                        &sin,
+                    )
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(vec![out])
+            });
+            h = seg(&inputs)?.into_iter().next().expect("one block output");
         }
         self.output_head(&h, &p.emb_ts)
     }
