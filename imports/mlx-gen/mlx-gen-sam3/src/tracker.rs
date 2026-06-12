@@ -48,9 +48,8 @@ const NUM_MASK_TOKENS: i32 = 4; // num_multimask_outputs (3) + 1
 const ATTN_DOWNSAMPLE: i32 = 2;
 const LN_EPS: f32 = 1e-6;
 const INPUT_SIZE: f32 = 1008.0; // image_size
-                                // NB: `dynamic_multimask_via_stability` (stability_delta 0.05 / thresh 0.98) selects the best single
-                                // mask on *no-prompt* video frames (multimask_output=false). That branch is exercised only by the
-                                // memory/video layer (F2); the box-prompt PVS path here always requests multimask. Lands with F2.
+const STABILITY_DELTA: f32 = 0.05; // dynamic_multimask_stability_delta
+const STABILITY_THRESH: f32 = 0.98; // dynamic_multimask_stability_thresh
 
 fn join(prefix: &str, leaf: &str) -> String {
     format!("{prefix}.{leaf}")
@@ -376,6 +375,39 @@ impl PromptEncoder {
     }
 }
 
+/// `_dynamic_multimask_via_stability` (~1550): on a single-mask request, keep mask token 0 if its
+/// stability score — the IoU between the `±delta`-thresholded mask areas — is `≥ thresh`; otherwise
+/// fall back to the best-predicted-IoU multimask candidate (tokens 1..). `masks`:
+/// `[1, NUM_MASK_TOKENS, mg, mg]`; `ious`: `[1, NUM_MASK_TOKENS]`. Returns `(mask [1,1,mg,mg],
+/// iou [1,1])`. B=P=1, so the reference's `torch.where` is a scalar choice (evaluated host-side).
+fn dynamic_multimask_via_stability(masks: &Array, ious: &Array) -> Result<(Array, Array)> {
+    let iou_v = ious
+        .reshape(&[-1])?
+        .as_dtype(Dtype::Float32)?
+        .as_slice::<f32>()
+        .to_vec();
+    // best multimask candidate (tokens 1..) by predicted IoU.
+    let best = 1 + argmax(&iou_v[1..]) as i32;
+    // stability score of the single mask (token 0).
+    let single = slice_axis(masks, 1, 0, 1)?;
+    let sv = single
+        .reshape(&[-1])?
+        .as_dtype(Dtype::Float32)?
+        .as_slice::<f32>()
+        .to_vec();
+    let area_i = sv.iter().filter(|&&x| x > STABILITY_DELTA).count() as f32;
+    let area_u = sv.iter().filter(|&&x| x > -STABILITY_DELTA).count() as f32;
+    let stability = if area_u > 0.0 { area_i / area_u } else { 1.0 };
+    if stability >= STABILITY_THRESH {
+        Ok((single, slice_axis(ious, 1, 0, 1)?))
+    } else {
+        Ok((
+            slice_axis(masks, 1, best, best + 1)?,
+            slice_axis(ious, 1, best, best + 1)?,
+        ))
+    }
+}
+
 // --- Mask decoder (Sam3TrackerVideoMaskDecoder) --------------------------------------------------
 
 struct MaskDecoder {
@@ -492,9 +524,9 @@ impl MaskDecoder {
                 slice_axis(&ious, 1, 1, NUM_MASK_TOKENS)?,
             )
         } else {
-            // single-mask: dynamic multimask via stability is applied by the caller's policy; for the
-            // box-prompt PVS path we always request multimask, so the else-arm returns mask 0.
-            (slice_axis(&masks, 1, 0, 1)?, slice_axis(&ious, 1, 0, 1)?)
+            // single-mask request (no-prompt video frames): dynamic_multimask_via_stability keeps
+            // mask 0 if stable, else falls back to the best-IoU multimask candidate.
+            dynamic_multimask_via_stability(&masks, &ious)?
         };
         Ok((masks, ious, obj_score))
     }
@@ -1188,6 +1220,19 @@ impl Sam3Tracker {
         high_res: &[Array; 2],
         box_xyxy_1008: [f32; 4],
     ) -> Result<TrackerMask> {
+        self.segment_encoded_multimask(image_embedding, high_res, box_xyxy_1008, true)
+    }
+
+    /// Like [`Self::segment_encoded`] but choosing the mask-output policy: `true` requests the 3
+    /// multimask candidates (box-prompt PVS path), `false` requests a single mask via
+    /// `dynamic_multimask_via_stability` (the no-prompt video-frame decode path). Exposed for F2.
+    pub fn segment_encoded_multimask(
+        &self,
+        image_embedding: &Array,
+        high_res: &[Array; 2],
+        box_xyxy_1008: [f32; 4],
+        multimask: bool,
+    ) -> Result<TrackerMask> {
         let g = image_embedding.shape()[1];
         // No-memory single-frame path: add the learned no-memory bias to the image embedding
         // (broadcast over the spatial grid). A memory-conditioned video frame skips this (F2).
@@ -1197,10 +1242,15 @@ impl Sam3Tracker {
         )?;
         let (sparse, dense) = self.prompt.encode_box(box_xyxy_1008, g)?;
         let image_pe = self.image_pe_embed.dense_pe(g)?;
-        let (masks, ious, obj_score) =
-            self.decoder
-                .forward(&image_embedding, &image_pe, &sparse, &dense, high_res, true)?;
-        // argmax IoU over the 3 candidates (host).
+        let (masks, ious, obj_score) = self.decoder.forward(
+            &image_embedding,
+            &image_pe,
+            &sparse,
+            &dense,
+            high_res,
+            multimask,
+        )?;
+        // argmax IoU over the returned candidates (host).
         let iv = ious
             .reshape(&[-1])?
             .as_dtype(Dtype::Float32)?
