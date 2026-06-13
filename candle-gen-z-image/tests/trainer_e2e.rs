@@ -229,7 +229,13 @@ fn assert_reloads(adapter_path: &Path, kind: AdapterKind, n_targets: usize) {
 #[ignore = "needs real Z-Image weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn z_image_trainer_lora_trains_reloads_and_renders() {
     let tmp = std::env::temp_dir().join("candle_zimage_trainer_lora_e2e");
-    let out = run(&tmp, "swatch_lora.safetensors", NetworkType::Lora, 64, false);
+    let out = run(
+        &tmp,
+        "swatch_lora.safetensors",
+        NetworkType::Lora,
+        64,
+        false,
+    );
     assert_converged("zimage-lora", &out.losses);
 
     let meta = read_meta(&out.adapter_path);
@@ -274,7 +280,10 @@ fn z_image_trainer_gradient_checkpointing_trains_and_reloads() {
         .keys()
         .filter(|k| k.ends_with(".lora_A.weight"))
         .count();
-    assert!(n_targets > 0, "checkpointed adapter should contain LoRA factors");
+    assert!(
+        n_targets > 0,
+        "checkpointed adapter should contain LoRA factors"
+    );
     // The checkpointed backward must reach BOTH the retained pre-main refiners and the checkpointed
     // main layers — assert the adapter carries a refiner key AND a main-layer key.
     assert!(
@@ -302,7 +311,13 @@ fn z_image_trainer_lokr_trains_and_reloads() {
     let tmp = std::env::temp_dir().join("candle_zimage_trainer_lokr_e2e");
     // 128 steps: the LoKr Kronecker reparam descends slower than LoRA at the same lr/rank, so it needs
     // more steps to show a clear median fall on this tiny over-fit task.
-    let out = run(&tmp, "swatch_lokr.safetensors", NetworkType::Lokr, 128, false);
+    let out = run(
+        &tmp,
+        "swatch_lokr.safetensors",
+        NetworkType::Lokr,
+        128,
+        false,
+    );
     assert_converged("zimage-lokr", &out.losses);
 
     let meta = read_meta(&out.adapter_path);
