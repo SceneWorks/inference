@@ -511,6 +511,11 @@ impl DecoderLayer {
     }
 }
 
+/// The Lens default multi-layer capture indices (`selected_layer_index`): the *outputs* of decoder
+/// layers 5/11/17/23, which the DiT RMSNorms, concatenates (2880×4), and projects to its width
+/// (sc-5112), consuming only the `txt_offset..` slice.
+pub const DEFAULT_SELECTED_LAYERS: [usize; 4] = [5, 11, 17, 23];
+
 /// Output of an encoder forward pass.
 pub struct EncoderOutput {
     /// Per-layer hidden states in HF `output_hidden_states` order: index 0 = token embeddings
@@ -575,6 +580,28 @@ impl GptOssTextEncoder {
             hidden_states,
             last_hidden_state,
         })
+    }
+
+    /// Lens multi-layer capture (sc-5110): the **output** of each selected decoder layer, in selection
+    /// order. Lens captures `hidden_states` *after* running decoder layer `s` (the `LensGptOssEncoder`
+    /// feature path) — that is `self.forward(..).hidden_states[s + 1]`, since index 0 is the token
+    /// embeddings. (HF's stock `output_hidden_states[s]` is the embedding-offset output of layer
+    /// `s-1`, hence the `+1`.) No final `norm` is applied — the captures are the raw residual stream;
+    /// the DiT does the per-layer RMSNorm + concat + projection downstream (sc-5112).
+    pub fn capture(&self, input_ids: &Tensor, selected: &[usize]) -> Result<Vec<Tensor>> {
+        let n = self.layers.len();
+        for &s in selected {
+            if s >= n {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "lens: selected layer {s} out of range (encoder has {n} layers)"
+                )));
+            }
+        }
+        let out = self.forward(input_ids)?;
+        Ok(selected
+            .iter()
+            .map(|&s| out.hidden_states[s + 1].clone())
+            .collect())
     }
 }
 
