@@ -340,6 +340,37 @@ pub fn assemble_bernini_planner_snapshot(
     Ok(out_dir.to_path_buf())
 }
 
+/// Assemble a **full Bernini** snapshot (sc-5145): the planner components ([`assemble_bernini_planner_snapshot`])
+/// **and** the dual-expert renderer DiTs + MLX-converted UMT5/VAE/tokenizer
+/// ([`mlx_gen_wan::convert::assemble_bernini_renderer_snapshot`]) into a single directory, so the
+/// registered `bernini` [`Generator`](crate::bernini::Bernini) can load the whole planner→renderer
+/// stack from one `LoadSpec` dir.
+///
+/// The two converters read the same combined `bernini/` index and write disjoint file sets (planner:
+/// `qwen2_5_vl`/`connector`/`vit_decoder`/`mask_tokens` + `qwen2_5_vl_config.json` +
+/// `bernini_planner.json`; renderer: `low`/`high_noise_model` + `t5_encoder`/`vae` safetensors +
+/// `tokenizer.json` + `config.json` + `bernini_renderer.json`), so they compose without collision.
+/// `base_wan_snapshot` is a converted Wan2.2-T2V-A14B snapshot (the renderer's DiT layout source, per
+/// sc-4705). Q4/Q8 stays a load-time concern (sc-5146), so this emits bf16.
+pub fn assemble_bernini_snapshot(
+    out_dir: impl AsRef<Path>,
+    bernini_diffusers_dir: impl AsRef<Path>,
+    base_wan_snapshot: impl AsRef<Path>,
+    link: bool,
+) -> Result<PathBuf> {
+    let out_dir = out_dir.as_ref();
+    let pkg = bernini_diffusers_dir.as_ref();
+    assemble_bernini_planner_snapshot(out_dir, pkg, link)?;
+    mlx_gen_wan::convert::assemble_bernini_renderer_snapshot(
+        out_dir,
+        pkg,
+        base_wan_snapshot.as_ref(),
+        None,
+        link,
+    )?;
+    Ok(out_dir.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

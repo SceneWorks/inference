@@ -20,6 +20,7 @@
 //! snapshot plus a `bernini_renderer.json` knob sidecar that this crate consumes.
 
 pub mod assembly;
+pub mod bernini;
 pub mod clip_diff;
 pub mod config;
 pub mod connector;
