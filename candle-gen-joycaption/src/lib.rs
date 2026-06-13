@@ -292,15 +292,20 @@ pub fn force_link() {}
 mod tests {
     use super::*;
     use candle_gen::gen_core::registry;
-    use candle_gen::gen_core::CaptionRequest;
+    use candle_gen::gen_core::{CaptionOptions, CaptionRequest};
 
     #[test]
     fn normalize_builds_prompt_from_options_when_empty() {
         // sc-5189: the normal type/length flow sends no prompt; the provider must derive it (else
         // `caption` fails "prompt is required"), mirroring mlx-gen-joycaption.
-        let mut req = CaptionRequest::default();
-        req.options.caption_type = "Descriptive".to_owned();
-        req.options.caption_length = "long".to_owned();
+        let req = CaptionRequest {
+            options: CaptionOptions {
+                caption_type: "Descriptive".to_owned(),
+                caption_length: "long".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(req.prompt.trim().is_empty());
         let normalized = normalized_request(&req);
         assert!(
@@ -311,8 +316,10 @@ mod tests {
 
     #[test]
     fn normalize_preserves_an_explicit_prompt() {
-        let mut req = CaptionRequest::default();
-        req.prompt = "Describe the lighting only.".to_owned();
+        let req = CaptionRequest {
+            prompt: "Describe the lighting only.".to_owned(),
+            ..Default::default()
+        };
         assert_eq!(
             normalized_request(&req).prompt,
             "Describe the lighting only."
