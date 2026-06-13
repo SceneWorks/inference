@@ -311,16 +311,14 @@ impl Prodigy {
                 continue;
             };
             let p = v.as_tensor();
-            if !self.state.contains_key(&i) {
-                self.state.insert(
-                    i,
-                    ProdigyState {
-                        exp_avg: p.zeros_like()?,
-                        exp_avg_sq: p.zeros_like()?,
-                        s: p.zeros_like()?,
-                        p0: p.detach(),
-                    },
-                );
+            // `entry`/`?` rather than `or_insert_with` — the state init is fallible (allocation).
+            if let std::collections::hash_map::Entry::Vacant(e) = self.state.entry(i) {
+                e.insert(ProdigyState {
+                    exp_avg: p.zeros_like()?,
+                    exp_avg_sq: p.zeros_like()?,
+                    s: p.zeros_like()?,
+                    p0: p.detach(),
+                });
             }
             let st = self.state.get(&i).unwrap();
             // delta_numerator += (d/d0)·dlr·⟨g, p0 − p⟩
