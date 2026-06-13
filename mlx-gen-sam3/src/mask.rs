@@ -18,13 +18,10 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use crate::config::Sam3DetrConfig;
+use crate::util::join;
 
 const LN_EPS: f32 = 1e-5; // nn.LayerNorm / GroupNorm default eps in the mask decoder
 const NUM_GROUPS: i32 = 8;
-
-fn join(prefix: &str, leaf: &str) -> String {
-    format!("{prefix}.{leaf}")
-}
 
 /// Torch conv weight `[out, in, kH, kW]` (OIHW) → MLX `[out, kH, kW, in]` (OHWI).
 fn conv_w(w: &Array) -> Result<Array> {

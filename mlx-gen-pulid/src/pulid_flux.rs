@@ -79,7 +79,7 @@ fn l2_normalize_rows(x: &Array) -> Result<Array> {
                                                     // Clamp the norm to a tiny epsilon (torch `F.normalize`'s default eps) so a degenerate zero-norm
                                                     // row — e.g. a bad ArcFace crop — yields a zero vector instead of NaN-poisoning the entire
                                                     // identity-conditioned generation. Byte-identical for real embeddings (norm >> eps) (F-078).
-    let norm = maximum(&sqrt(&sumsq)?, &Array::from_f32(1e-12))?;
+    let norm = maximum(&sqrt(&sumsq)?, Array::from_f32(1e-12))?;
     Ok(divide(x, &norm)?)
 }
 

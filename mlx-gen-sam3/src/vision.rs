@@ -27,25 +27,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::Sam3VisionConfig;
-
-/// `"{prefix}.{leaf}"` (or just `leaf` when `prefix` is empty).
-fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_string()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
-
-/// Permute a torch conv weight `[out, in, kH, kW]` (OIHW) → MLX `[out, kH, kW, in]` (OHWI).
-fn conv_w_ohwi(w: &Array) -> Result<Array> {
-    Ok(w.transpose_axes(&[0, 2, 3, 1])?)
-}
-
-/// Permute a torch transposed-conv weight `[in, out, kH, kW]` (IOHW) → MLX `[out, kH, kW, in]`.
-fn conv_transpose_w(w: &Array) -> Result<Array> {
-    Ok(w.transpose_axes(&[1, 2, 3, 0])?)
-}
+use crate::util::{conv_transpose_w, conv_w_ohwi, join};
 
 /// Partition NHWC `x` into `window`×`window` windows (zero-padding to a multiple of `window`).
 /// Returns the `[-1, window, window, c]` windows + the padded `(hp, wp)`. (Port of SAM3

@@ -326,6 +326,21 @@ pub fn check_seed_determinism(g: &dyn Generator, profile: &Profile) -> Result<()
             ba[i], bb[i], ba.len()
         ));
     }
+    // A provider that *ignores* the seed would also pass the identical-twice check above, so verify a
+    // DIFFERENT seed actually changes the output (F-085).
+    let mut req_alt = base_request(profile);
+    req_alt.seed = Some(profile.seed.wrapping_add(0x9E37_79B9));
+    let c = g
+        .generate(&req_alt, &mut |_| {})
+        .map_err(|e| format!("seed[{id}]: alternate-seed generate() failed: {e}"))?;
+    let bc = output_bytes(&c);
+    if bc.len() == ba.len() && bc.iter().zip(&ba).all(|(x, y)| x == y) {
+        return Err(format!(
+            "seed[{id}]: a different seed produced byte-identical output ({} bytes) — the provider \
+             appears to ignore the seed",
+            ba.len()
+        ));
+    }
     Ok(())
 }
 

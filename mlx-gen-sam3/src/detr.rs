@@ -23,13 +23,10 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::Sam3DetrConfig;
+use crate::util::join;
 
 const SCALE_2PI: f32 = 2.0 * PI;
 const NUM_POS: i32 = 128; // sine position features per axis (hidden_size / 2)
-
-fn join(prefix: &str, leaf: &str) -> String {
-    format!("{prefix}.{leaf}")
-}
 
 /// `sin(even)/cos(odd)` interleave of a `[.., 128]` raw angle tensor → `[.., 128]`
 /// (`stack(sin(x[0::2]), cos(x[1::2])).flatten`), the SAM3 sine-embedding convention.

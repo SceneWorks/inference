@@ -111,6 +111,10 @@ impl Weights {
     /// whole checkpoint at load (e.g. the vendored SDXL `_load_safetensor_weights(..., float16=True)`
     /// applies `v.astype(mx.float16)` to every tensor). A no-op when `dtype` already matches.
     pub fn cast_all(&mut self, dtype: Dtype) -> Result<()> {
+        // Per tensor this transiently holds both the source and the cast copy until the reassignment
+        // drops the source (~2× that tensor's bytes at the moment of cast). Fine for the per-tensor
+        // granularity here; a chunked cast+eval would be the lever if a full-checkpoint downcast ever
+        // shows up as a peak-memory problem (F-089).
         for v in self.tensors.values_mut() {
             if v.dtype() != dtype {
                 *v = v.as_dtype(dtype)?;
@@ -120,7 +124,9 @@ impl Weights {
     }
 }
 
-/// Cast to a target compute dtype (e.g. bf16, mirroring mflux's torch_convert downcast).
+/// Cast to a target compute dtype (e.g. bf16, mirroring mflux's torch_convert downcast). A thin
+/// `as_dtype` passthrough — kept as a named helper so call sites read as an explicit downcast (and
+/// `as_dtype` itself no-ops when the dtype already matches) (F-089).
 pub fn to_dtype(a: &Array, dtype: Dtype) -> Result<Array> {
     Ok(a.as_dtype(dtype)?)
 }

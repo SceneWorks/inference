@@ -153,6 +153,8 @@ pub fn lcm_style_timesteps(
 }
 
 /// Latent sequence length used for the flow-match empirical `mu` fit: `(height/16) * (width/16)`.
+/// Each dim is floored to `/16` before the multiply (matching the fork); dims `< 16` collapse to 0
+/// here, but callers validate the resolution upstream so that case never reaches the `mu` fit (F-089).
 pub fn image_seq_len(width: u32, height: u32) -> usize {
     ((height / 16) * (width / 16)) as usize
 }
