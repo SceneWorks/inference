@@ -435,15 +435,20 @@ impl BerniniRenderer {
         let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
 
         // --- Stage 2: load both experts, APG denoise (→ experts freed) ---
-        let latents = {
-            let low_w = Weights::from_file(self.root.join("low_noise_model.safetensors"))?;
-            let high_w = Weights::from_file(self.root.join("high_noise_model.safetensors"))?;
-            let mut low_dit = WanTransformer::from_weights(&low_w, cfg)?;
-            let mut high_dit = WanTransformer::from_weights(&high_w, cfg)?;
+        // Load+quantize each expert before loading the next so only one bf16 transient is resident at
+        // a time (sc-5360 — `WanTransformer::quantize` eval-frees its bf16 dequant). Without quant this
+        // just loads both bf16.
+        let load_expert = |name: &str| -> Result<WanTransformer> {
+            let w = Weights::from_file(self.root.join(name))?;
+            let mut dit = WanTransformer::from_weights(&w, cfg)?;
             if let Some(q) = self.quant {
-                low_dit.quantize(q.bits(), None)?;
-                high_dit.quantize(q.bits(), None)?;
+                dit.quantize(q.bits(), None)?;
             }
+            Ok(dit)
+        };
+        let latents = {
+            let low_dit = load_expert("low_noise_model.safetensors")?;
+            let high_dit = load_expert("high_noise_model.safetensors")?;
             let low = BExpert::build(&low_dit, &context, &context_null)?;
             let high = BExpert::build(&high_dit, &context, &context_null)?;
             let pf = PackedForward::new(

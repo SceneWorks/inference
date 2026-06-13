@@ -90,14 +90,13 @@ fn quant_vs_bf16_t2i() {
 
     let c8 = cosine(&bf16, &q8);
     let c4 = cosine(&bf16, &q4);
-    // NOTE: these peaks are the *process-global* peak (`get_peak_memory`), reported informationally.
-    // They are NOT a clean per-tier steady-state footprint: the three tiers run in one process (so
-    // later tiers accumulate), and load-time quant materializes the bf16 source *and* the quantized
-    // output together (a transient spike), so a quantized tier can peak above bf16 even though its
-    // steady-state is smaller (Q8 experts 56→28GB, Q4→14GB). A clean per-tier footprint needs a fresh
-    // process per tier. The meaningful, deterministic gate here is the cosine.
+    // The peak is the process-global peak (`get_peak_memory`); the three tiers run in one process (so
+    // later tiers can carry some cache residual). With the sc-5360 streaming load (load+quantize each
+    // expert before the next, `WanTransformer::quantize` eval-freeing the bf16 dequant) only one bf16
+    // expert is resident at a time, so the quantized **load** peak now drops below bf16 rather than
+    // spiking above it. Reference run: bf16≈60.8GB, Q8≈58.0GB, Q4≈43.9GB.
     println!(
-        "process peak (incl. load-quant transient): bf16={p_bf16:.1}GB  Q8={p_q8:.1}GB  Q4={p_q4:.1}GB\n\
+        "load peak: bf16={p_bf16:.1}GB  Q8={p_q8:.1}GB  Q4={p_q4:.1}GB\n\
          t2i cosine vs bf16: Q8={c8:.5}  Q4={c4:.5}"
     );
 
@@ -113,4 +112,9 @@ fn quant_vs_bf16_t2i() {
     // Q4 is the aggressive footprint tier — 4-bit weight error shifts the image but stays the same
     // content (coherent, not pixel-close), matching the sensenova/lens quant bar.
     assert!(c4 > 0.80, "Q4 should stay coherent vs bf16 (got {c4:.5})");
+    // sc-5360: the streaming load must keep the quantized load peak at/under bf16 (regression guard).
+    assert!(
+        p_q8 <= p_bf16 && p_q4 < p_bf16,
+        "quantized load peak must be <= bf16 (bf16={p_bf16:.1} Q8={p_q8:.1} Q4={p_q4:.1})"
+    );
 }
