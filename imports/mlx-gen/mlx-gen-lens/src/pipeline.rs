@@ -27,7 +27,7 @@ use mlx_rs::ops::{concatenate_axis, split, split_sections};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Image, Result};
+use mlx_gen::{CancelFlag, Error, Image, Quant, Result};
 use mlx_gen_flux2::{load_vae, Flux2Vae};
 
 use crate::config::GptOssConfig;
@@ -78,12 +78,24 @@ impl LensPipeline {
     /// tree: `tokenizer/tokenizer.json`, `text_encoder/`, `transformer/`, `vae/`. The VAE always runs
     /// f32 internally (the shared Flux.2 decoder).
     pub fn load(snapshot_dir: impl AsRef<std::path::Path>, dtype: Dtype) -> Result<Self> {
+        Self::load_quant(snapshot_dir, dtype, None)
+    }
+
+    /// As [`load`](Self::load) but quantizes the gpt-oss encoder's MoE experts to Q4/Q8 (sc-3172) so
+    /// the encoder loads at `~12 GB` instead of `~40 GB` bf16 — the per-layer dequant is the only
+    /// transient. The DiT and VAE stay dense (DiT quant is sc-3175); the dominant footprint is the
+    /// 20 B-param encoder, so quantizing it is the memory win.
+    pub fn load_quant(
+        snapshot_dir: impl AsRef<std::path::Path>,
+        dtype: Dtype,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
         let root = snapshot_dir.as_ref();
         let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
 
         let enc_cfg = GptOssConfig::lens();
         let enc_w = Weights::from_dir(root.join("text_encoder"))?;
-        let encoder = LensTextEncoder::from_weights(&enc_w, &enc_cfg, dtype)?;
+        let encoder = LensTextEncoder::from_weights_quant(&enc_w, &enc_cfg, dtype, quant)?;
 
         let dit_cfg = LensDitConfig::lens();
         let dit_w = Weights::from_dir(root.join("transformer"))?;

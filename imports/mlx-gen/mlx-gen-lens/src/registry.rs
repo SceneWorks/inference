@@ -9,9 +9,9 @@
 //! arch). A request's explicit `steps` / `guidance` still override the per-id default.
 //!
 //! **Surface.** This is a pure **T2I** generator: no img2img / ControlNet / IP conditioning (none
-//! exists in the Lens port), no on-the-fly quantization (sc-3172, not yet landed — `load` rejects
-//! `quantize`), no LoRA/LoKr inference merge (training stays Python). The dense path is bf16; the
-//! `Fp32` precision override is honored (the tight-gate dtype).
+//! exists in the Lens port), no LoRA/LoKr inference merge (training stays Python). The dense path is
+//! bf16; the `Fp32` precision override is honored. **Q4/Q8** quantize the gpt-oss encoder's MoE
+//! experts at load (sc-3172 — the ~38 GB / 20 B-param bulk → ~12 GB); the DiT stays dense (sc-3175).
 //!
 //! **Registration mechanism:** the two `inventory::submit!`s below are collected by `mlx_gen`'s
 //! `inventory::collect!` at *link* time, so they activate whenever a consumer (the worker, or this
@@ -22,7 +22,7 @@ use mlx_rs::Dtype;
 
 use mlx_gen::{
     default_seed, gen_core, Capabilities, Error, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
+    LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result,
     WeightsSource,
 };
 
@@ -76,8 +76,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             max_size: 2080,
             max_count: 8,
             mac_only: true,
-            // sc-3172 (MXFP4 Q4/Q8) not yet landed — advertise none, and `load` rejects `quantize`.
-            supported_quants: &[],
+            // sc-3172: Q4/Q8 quantize the gpt-oss encoder's MoE experts (the ~38 GB / 20 B-param bulk)
+            // at load → ~12 GB. The DiT stays dense (its quant is sc-3175).
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
@@ -104,14 +105,9 @@ pub struct LensGenerator {
 ///
 /// `spec.weights` is a `microsoft/Lens-Turbo` (or `microsoft/Lens`) snapshot dir (the diffusers
 /// multi-component tree). Dense runs **bf16**; `Precision::Fp32` loads the tight-gate f32 path.
-/// `quantize` / `control` / `ip_adapter` / `adapters` are not supported by this port and are rejected.
+/// `spec.quantize` (Q4/Q8) quantizes the encoder's MoE experts at load (sc-3172). `control` /
+/// `ip_adapter` / `adapters` are not part of the Lens port and are rejected.
 fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> {
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(format!(
-            "{}: on-the-fly quantization is not yet wired (sc-3172); load the dense snapshot",
-            defaults.id
-        )));
-    }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(Error::Msg(format!(
             "{}: ControlNet / IP-Adapter conditioning is not part of the Lens port",
@@ -138,7 +134,7 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
         )))
         }
     };
-    let pipe = LensPipeline::load(&root, dtype)?;
+    let pipe = LensPipeline::load_quant(&root, dtype, spec.quantize)?;
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
@@ -278,7 +274,8 @@ mod tests {
             assert!(!d.capabilities.supports_true_cfg);
             assert!(d.capabilities.conditioning.is_empty());
             assert!(!d.capabilities.supports_lora);
-            assert!(d.capabilities.supported_quants.is_empty());
+            // sc-3172: encoder MoE experts quantize to Q4/Q8 at load.
+            assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
             // The defaults are exercised end-to-end in the e2e test; assert the constants here.
             let def = if id == MODEL_ID_TURBO {
                 TURBO_DEFAULTS
@@ -315,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_quant_and_adapters() {
+    fn load_rejects_unsupported_overlays_not_quant() {
         let base = LoadSpec {
             weights: WeightsSource::Dir("/nonexistent/lens".into()),
             quantize: None,
@@ -325,15 +322,32 @@ mod tests {
             adapters: Vec::new(),
             extra_controls: Vec::new(),
         };
+        // A ControlNet overlay is rejected (not part of the Lens port) — the message names it, before
+        // any weights load.
+        let with_control = LoadSpec {
+            control: Some(WeightsSource::Dir("/nonexistent/cn".into())),
+            ..base.clone()
+        };
+        let err = match load_with(&with_control, TURBO_DEFAULTS) {
+            Ok(_) => panic!("control must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("not part of the Lens port"), "got: {err}");
+
+        // Quantize is NOT rejected (sc-3172) — it proceeds to the load and fails only on the bogus
+        // weights dir, never with an "unsupported" message.
         let quant = LoadSpec {
-            quantize: Some(mlx_gen::Quant::Q8),
+            quantize: Some(Quant::Q8),
             ..base.clone()
         };
         let err = match load_with(&quant, TURBO_DEFAULTS) {
-            Ok(_) => panic!("quantize must be rejected"),
+            Ok(_) => panic!("bogus weights dir must fail to load"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("quantization"), "got: {err}");
+        assert!(
+            !err.contains("quantization") && !err.contains("not part of"),
+            "quantize must be accepted (sc-3172); got: {err}"
+        );
     }
 
     #[test]

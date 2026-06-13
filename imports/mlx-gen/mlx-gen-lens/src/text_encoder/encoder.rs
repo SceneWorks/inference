@@ -20,7 +20,7 @@
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Quant, Result};
 
 use crate::config::GptOssConfig;
 use crate::text_encoder::gpt_oss::{attention_mask, GptOssDecoderLayer};
@@ -53,16 +53,28 @@ impl LensTextEncoder {
     /// for the default selection that is all 24, but a smaller selection loads (and dequantizes the
     /// MXFP4 experts of) only the needed prefix.
     pub fn from_weights(w: &Weights, cfg: &GptOssConfig, dtype: Dtype) -> Result<Self> {
-        Self::with_selected_layers(w, cfg, dtype, DEFAULT_SELECTED_LAYERS.to_vec())
+        Self::with_selected_layers(w, cfg, dtype, DEFAULT_SELECTED_LAYERS.to_vec(), None)
+    }
+
+    /// As [`from_weights`](Self::from_weights) but quantizes the MoE experts to Q4/Q8 (sc-3172) so the
+    /// encoder loads at `~12 GB` instead of `~40 GB` bf16. Attention / router / embedding stay dense.
+    pub fn from_weights_quant(
+        w: &Weights,
+        cfg: &GptOssConfig,
+        dtype: Dtype,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
+        Self::with_selected_layers(w, cfg, dtype, DEFAULT_SELECTED_LAYERS.to_vec(), quant)
     }
 
     /// As [`from_weights`](Self::from_weights) but with an explicit (non-empty, unique, in-range)
-    /// capture-index list (`set_selected_layers`).
+    /// capture-index list (`set_selected_layers`) and optional MoE-expert quantization.
     pub fn with_selected_layers(
         w: &Weights,
         cfg: &GptOssConfig,
         dtype: Dtype,
         selected_layers: Vec<usize>,
+        quant: Option<Quant>,
     ) -> Result<Self> {
         assert!(
             !selected_layers.is_empty(),
@@ -83,6 +95,7 @@ impl LensTextEncoder {
                 &format!("model.layers.{i}"),
                 cfg,
                 dtype,
+                quant,
             )?);
         }
 

@@ -23,12 +23,12 @@
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{
     add, broadcast_to, concatenate_axis, cos as cos_op, divide, matmul, max_axes, maximum, minimum,
-    multiply, sigmoid, sin as sin_op, split, subtract, sum_axes,
+    multiply, quantize, quantized_matmul, sigmoid, sin as sin_op, split, subtract, sum_axes,
 };
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, Quant, Result};
 
 use crate::config::GptOssConfig;
 use crate::text_encoder::mxfp4::dequantize_mxfp4;
@@ -232,13 +232,82 @@ pub fn attention_mask(l: i32, sliding_window: Option<i32>, dtype: Dtype) -> Resu
 // MoE feed-forward + decoder-layer assembly (sc-3166)
 // =====================================================================================================
 
-/// One expert's dense weights (post-MXFP4-dequant), in the eager `GptOssExperts` layout
-/// (`x · gate_up`, `gated · down`).
+/// One expert projection — either the dense MXFP4-dequantized weight or an MLX-quantized (Q4/Q8)
+/// pack (sc-3172). The dense forward is `x · w + b` for a stored `[in, out]` weight (the eager
+/// `GptOssExperts` layout, where the expert matmul is `x · gate_up` / `gated · down`, **not** the
+/// `x · Wᵀ` of a `nn.Linear`). The quantized forward is the same product via `quantized_matmul` on
+/// the `[out, in]` pack (so `transpose = true` recovers `x · w`).
+enum Proj {
+    /// `w`: `[in, out]`; forward `x · w + b` (byte-identical to the sc-3166 dense MoE path).
+    Dense { w: Array, b: Array },
+    /// MLX group-wise affine pack of `wᵀ` (`[out, in]`); forward
+    /// `quantized_matmul(x, wq, scales, biases, transpose=true) + b`.
+    Quant {
+        wq: Array,
+        scales: Array,
+        biases: Array,
+        b: Array,
+        group_size: i32,
+        bits: i32,
+    },
+}
+
+impl Proj {
+    fn forward(&self, x: &Array) -> Result<Array> {
+        match self {
+            Proj::Dense { w, b } => Ok(add(&matmul(x, w)?, b)?),
+            Proj::Quant {
+                wq,
+                scales,
+                biases,
+                b,
+                group_size,
+                bits,
+            } => {
+                let y = quantized_matmul(x, wq, scales, biases, true, *group_size, *bits)?;
+                Ok(add(&y, b)?)
+            }
+        }
+    }
+
+    /// Quantize a dense proj to `bits`-bit MLX affine (group 64). The dense `w` is `[in, out]`; MLX
+    /// `quantize` expects `[out, in]` (it groups along the last/`in` axis), so transpose first. The
+    /// weight + bias are cast to bf16 before packing — the fork-parity convention shared with
+    /// [`AdaptableLinear::quantize`] (`quantized_matmul` accumulates in fp32 regardless). No-op if
+    /// already quantized.
+    fn into_quantized(self, bits: i32, group_size: i32) -> Result<Self> {
+        match self {
+            Proj::Dense { w, b } => {
+                let w_oi = w.t().as_dtype(Dtype::Bfloat16)?; // [out, in]
+                let (wq, scales, biases) = quantize(&w_oi, group_size, bits)?;
+                Ok(Proj::Quant {
+                    wq,
+                    scales,
+                    biases,
+                    b: b.as_dtype(Dtype::Bfloat16)?,
+                    group_size,
+                    bits,
+                })
+            }
+            q => Ok(q),
+        }
+    }
+
+    /// The arrays to `eval` so the dense bf16 dequant transient frees once the pack is materialized.
+    fn quant_arrays(&self) -> Option<[&Array; 3]> {
+        match self {
+            Proj::Quant {
+                wq, scales, biases, ..
+            } => Some([wq, scales, biases]),
+            Proj::Dense { .. } => None,
+        }
+    }
+}
+
+/// One expert's two projections (`gate_up`, `down`) — dense or quantized.
 struct Expert {
-    gate_up: Array,   // [hidden, 2*inter]
-    gate_up_b: Array, // [2*inter]
-    down: Array,      // [inter, hidden]
-    down_b: Array,    // [hidden]
+    gate_up: Proj,
+    down: Proj,
 }
 
 /// gpt-oss MoE feed-forward: a top-k linear router + 32 **clamped-SwiGLU** experts. Faithful port of
@@ -261,11 +330,17 @@ pub struct GptOssMoe {
 impl GptOssMoe {
     /// Load `mlp` at `{prefix}` (e.g. `model.layers.0.mlp`). The router stays dense bf16; the experts
     /// are MXFP4 (`*_blocks`/`*_scales`) and are dequantized to `dtype` via [`dequantize_mxfp4`].
+    ///
+    /// When `quant` is `Some`, each expert projection is immediately re-quantized to MLX Q4/Q8 (the
+    /// `~12 GB` path, sc-3172): the per-layer bf16 dequant is the only transient — it is `eval`'d into
+    /// the Q4/Q8 pack and freed before the next layer loads, so the full bf16 expert stack
+    /// (`~38 GB` across 24 layers) never co-resides. The router/attention/embedding stay dense.
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
         cfg: &GptOssConfig,
         dtype: Dtype,
+        quant: Option<Quant>,
     ) -> Result<Self> {
         let e = cfg.num_experts;
         let (hidden, inter) = (cfg.hidden_size, cfg.intermediate);
@@ -291,12 +366,37 @@ impl GptOssMoe {
         let dnb = split(&down_b, e, 0)?;
         let mut experts = Vec::with_capacity(e as usize);
         for i in 0..e as usize {
-            experts.push(Expert {
-                gate_up: gu[i].reshape(&[hidden, 2 * inter])?,
-                gate_up_b: gub[i].reshape(&[2 * inter])?,
-                down: dn[i].reshape(&[inter, hidden])?,
-                down_b: dnb[i].reshape(&[hidden])?,
-            });
+            let mut expert = Expert {
+                gate_up: Proj::Dense {
+                    w: gu[i].reshape(&[hidden, 2 * inter])?,
+                    b: gub[i].reshape(&[2 * inter])?,
+                },
+                down: Proj::Dense {
+                    w: dn[i].reshape(&[inter, hidden])?,
+                    b: dnb[i].reshape(&[hidden])?,
+                },
+            };
+            if let Some(q) = quant {
+                let (bits, gs) = (q.bits(), mlx_gen::quant::DEFAULT_GROUP_SIZE);
+                expert.gate_up = expert.gate_up.into_quantized(bits, gs)?;
+                expert.down = expert.down.into_quantized(bits, gs)?;
+            }
+            experts.push(expert);
+        }
+
+        // Force the packs so the layer's bf16 dequant transient frees before the next layer (the
+        // memory win is only realized if the bf16 stack does not stay alive in the lazy graph).
+        if quant.is_some() {
+            let mut to_eval: Vec<&Array> = Vec::with_capacity(e as usize * 6);
+            for expert in &experts {
+                if let Some(a) = expert.gate_up.quant_arrays() {
+                    to_eval.extend_from_slice(&a);
+                }
+                if let Some(a) = expert.down.quant_arrays() {
+                    to_eval.extend_from_slice(&a);
+                }
+            }
+            mlx_rs::transforms::eval(to_eval)?;
         }
 
         Ok(Self {
@@ -330,8 +430,8 @@ impl GptOssMoe {
 
         let mut acc: Option<Array> = None;
         for (e, expert) in self.experts.iter().enumerate() {
-            let gate_up = add(&matmul(&xf, &expert.gate_up)?, &expert.gate_up_b)?; // [n, 2*inter]
-                                                                                   // Interleaved gate/up: reshape [n, inter, 2] → split → gate = [..,0], up = [..,1].
+            let gate_up = expert.gate_up.forward(&xf)?; // [n, 2*inter]
+                                                        // Interleaved gate/up: reshape [n, inter, 2] → split → gate = [..,0], up = [..,1].
             let gu = gate_up.reshape(&[n, self.inter, 2])?;
             let halves = split(&gu, 2, -1)?;
             let gate = halves[0].reshape(&[n, self.inter])?;
@@ -342,7 +442,7 @@ impl GptOssMoe {
             // glu = gate · σ(α·gate); gated = (up + 1) · glu.
             let glu = multiply(&gate, &sigmoid(&multiply(&gate, &alpha)?)?)?;
             let gated = multiply(&add(&up, &one)?, &glu)?; // [n, inter]
-            let out_e = add(&matmul(&gated, &expert.down)?, &expert.down_b)?; // [n, hidden]
+            let out_e = expert.down.forward(&gated)?; // [n, hidden]
             let weighted = multiply(&out_e, &routing_cols[e])?; // [n, hidden] · [n, 1]
             acc = Some(match acc {
                 None => weighted,
@@ -399,12 +499,14 @@ pub struct GptOssDecoderLayer {
 }
 
 impl GptOssDecoderLayer {
-    /// Load the layer at `{prefix}` (e.g. `model.layers.0`).
+    /// Load the layer at `{prefix}` (e.g. `model.layers.0`). `quant` (when `Some`) quantizes only the
+    /// MoE experts to Q4/Q8 (sc-3172); attention/router/norms stay dense `dtype`.
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
         cfg: &GptOssConfig,
         dtype: Dtype,
+        quant: Option<Quant>,
     ) -> Result<Self> {
         Ok(Self {
             input_ln: w
@@ -414,7 +516,7 @@ impl GptOssDecoderLayer {
                 .require(&format!("{prefix}.post_attention_layernorm.weight"))?
                 .as_dtype(dtype)?,
             attn: GptOssAttention::from_weights(w, &format!("{prefix}.self_attn"), cfg, dtype)?,
-            moe: GptOssMoe::from_weights(w, &format!("{prefix}.mlp"), cfg, dtype)?,
+            moe: GptOssMoe::from_weights(w, &format!("{prefix}.mlp"), cfg, dtype, quant)?,
             eps: cfg.rms_eps,
         })
     }
