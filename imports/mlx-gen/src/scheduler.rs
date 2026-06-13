@@ -16,7 +16,7 @@ use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
 use crate::array::scalar;
-use crate::Result;
+use crate::{Error, Result};
 
 // Schedule construction (sigma tables, empirical mu) is backend-neutral policy and lives in gen-core
 // (sc-3722); re-exported here at the historical `mlx_gen::scheduler::{image_seq_len, compute_mu}`
@@ -35,6 +35,14 @@ pub(crate) fn flow_match_euler_step(
     velocity: &Array,
     i: usize,
 ) -> Result<Array> {
+    // Callers drive `i` in-contract, but an off-by-one in any consumer would index `sigmas[i+1]` out
+    // of bounds and panic the denoise loop. Surface it as a typed error instead (F-042).
+    if i + 1 >= sigmas.len() {
+        return Err(Error::Msg(format!(
+            "flow_match_euler_step: step index {i} out of range for {} sigmas",
+            sigmas.len()
+        )));
+    }
     let dt = sigmas[i + 1] - sigmas[i];
     Ok(add(x, &multiply(velocity, scalar(dt))?)?)
 }

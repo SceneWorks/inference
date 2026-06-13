@@ -4,7 +4,7 @@
 //! channel axis at different positions) stay with their respective modules.
 
 use mlx_gen::tiling::TilePlan;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_rs::ops::{add, divide, maximum, multiply, pad};
 use mlx_rs::Array;
 
@@ -117,8 +117,10 @@ pub(crate) fn tile_decode_accumulate(
         }
     }
 
-    let output = output.expect("at least one tile");
-    let weights = weights.expect("at least one tile");
+    let output =
+        output.ok_or_else(|| Error::Msg("wan vae: tile-decode plan had no tiles".into()))?;
+    let weights =
+        weights.ok_or_else(|| Error::Msg("wan vae: tile-decode plan had no tiles".into()))?;
     contiguous(&divide(&output, &maximum(&weights, scalar(1e-8))?)?)
 }
 

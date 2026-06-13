@@ -271,6 +271,13 @@ fn sanitize_vocoder(raw: &Weights) -> Result<HashMap<String, Array>> {
         };
         out.insert(new, v);
     }
+    // Extracting zero `vocoder.*` keys means the source file wasn't the vocoder checkpoint; the
+    // missing weights would otherwise only surface deep in inference (F-050).
+    if out.is_empty() {
+        return Err(Error::Msg(
+            "ltx: sanitize_vocoder found no `vocoder.*` keys in the source weights".into(),
+        ));
+    }
     Ok(out)
 }
 

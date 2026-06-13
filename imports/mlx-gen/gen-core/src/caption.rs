@@ -149,6 +149,16 @@ pub struct CaptionCapabilities {
 impl CaptionCapabilities {
     /// Reject request fields that exceed the advertised shared capability surface.
     pub fn validate_request(&self, id: &str, req: &CaptionRequest) -> Result<()> {
+        // Footgun guard (F-084): a captioner that enables a capability but leaves its bounds at the
+        // `Default` 0 would reject every request. Catch the descriptor mistake in debug/test builds.
+        debug_assert!(
+            self.max_image_size > 0 && self.max_new_tokens > 0 && self.max_prompt_chars > 0,
+            "{id}: CaptionCapabilities bounds left at Default 0 (max_image_size={}, max_new_tokens={}, \
+             max_prompt_chars={}) — descriptor forgot its bounds",
+            self.max_image_size,
+            self.max_new_tokens,
+            self.max_prompt_chars
+        );
         if req.image.width < self.min_image_size
             || req.image.height < self.min_image_size
             || req.image.width > self.max_image_size
