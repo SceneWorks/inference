@@ -35,7 +35,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn from_str(s: &str) -> Option<Mode> {
+    pub fn from_name(s: &str) -> Option<Mode> {
         Some(match s {
             "t2v" => Mode::T2v,
             "t2v_apg" => Mode::T2vApg,
@@ -95,6 +95,7 @@ impl PackedForward {
     /// Patch-embed one latent `[16, T, H8, W8]` to `(tokens [1,L,dim], cos, sin, grid)` with the
     /// source-id RoPE folded in. `cos`/`sin` are f32 here (concatenated + cast to bf16 once before the
     /// forward).
+    #[allow(clippy::type_complexity)]
     fn embed_segment(
         &self,
         dit: &WanTransformer,
