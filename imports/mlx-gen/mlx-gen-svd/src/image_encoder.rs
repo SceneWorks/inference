@@ -12,7 +12,7 @@ use mlx_rs::ops::matmul;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_gen_sdxl::{ClipVisionEncoder, VisionConfig};
 
 use crate::config::ImageEncoderConfig;
@@ -53,7 +53,9 @@ impl SvdImageEncoder {
         // f32-facing. The ViT body's LN/SDPA reductions upcast internally (fused MLX kernels).
         let pixel_values = pixel_values.as_dtype(self.dtype)?;
         let states = self.body.hidden_states(&pixel_values)?;
-        let last = states.last().expect("hidden_states non-empty"); // [B, 257, hidden]
+        let last = states
+            .last()
+            .ok_or_else(|| Error::Msg("svd image encoder produced no hidden states".into()))?; // [B, 257, hidden]
         let cls = last.take_axis(Array::from_int(0), 1)?; // [B, hidden] (CLS token, axis dropped)
         let pooled = layer_norm(&cls, Some(&self.post_ln_w), Some(&self.post_ln_b), LN_EPS)?;
         // visual_projection is a bias-free Linear with weight [proj, hidden] → embeds = pooled · Wᵀ.

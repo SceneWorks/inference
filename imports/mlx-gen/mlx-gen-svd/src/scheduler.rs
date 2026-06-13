@@ -83,6 +83,9 @@ pub fn v_pred_denoised(model_output: &Array, sample: &Array, sigma: f32) -> Resu
 
 /// Euler step (`s_churn=0` → `sigma_hat=σ`): `x' = x + (x − x̂0)/σ · (σ_next − σ)`.
 pub fn euler_step(sample: &Array, denoised: &Array, sigma: f32, sigma_next: f32) -> Result<Array> {
+    // `sigma` is the CURRENT (non-terminal) sigma, always > 0 in the denoise loop; a swapped call at
+    // the terminal sigma=0 would divide by zero → NaN through the rest of the pipeline (F-077).
+    debug_assert!(sigma > 0.0, "euler_step: sigma must be > 0, got {sigma}");
     let derivative = divide(subtract(sample, denoised)?, Array::from_f32(sigma))?;
     let dt = sigma_next - sigma;
     Ok(add(sample, multiply(derivative, Array::from_f32(dt))?)?)

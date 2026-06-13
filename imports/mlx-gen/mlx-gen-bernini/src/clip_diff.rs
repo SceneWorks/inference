@@ -304,6 +304,14 @@ impl DiffLossFm {
 
     /// Standard CFG over a 2-tiled batch: `uncond + cfg·(cond − uncond)`.
     fn forward_with_cfg(&self, x: &Array, t: &Array, c: &Array, cfg: f32) -> Result<Array> {
+        // `x` is the 2-tiled noisy sample; `c` (conditioning z) must already be tiled to the same
+        // batch, else `net.forward` fails with an opaque matmul shape error rather than a clear one
+        // (F-081).
+        debug_assert_eq!(
+            c.shape()[0],
+            x.shape()[0],
+            "bernini clip_diff CFG: conditioning z must be pre-tiled to the noisy sample's batch"
+        );
         let half = &split(x, 2, 0)?[0];
         let combined = concatenate_axis(&[half, half], 0)?;
         let out = self.net.forward(&combined, t, c)?;
@@ -325,6 +333,14 @@ impl DiffLossFm {
         txt_cfg: f32,
         img_cfg: f32,
     ) -> Result<Array> {
+        // `x` is the 3-tiled noisy sample; `c` (conditioning z) must already be tiled to the same
+        // batch, else `net.forward` fails with an opaque matmul shape error rather than a clear one
+        // (F-081).
+        debug_assert_eq!(
+            c.shape()[0],
+            x.shape()[0],
+            "bernini clip_diff triple-CFG: conditioning z must be pre-tiled to the noisy sample's batch"
+        );
         let part = &split(x, 3, 0)?[0];
         let combined = concatenate_axis(&[part, part, part], 0)?;
         let out = self.net.forward(&combined, t, c)?;

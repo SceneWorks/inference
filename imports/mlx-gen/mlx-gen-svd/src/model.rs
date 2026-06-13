@@ -398,10 +398,13 @@ impl Svd {
             random::normal::<f32>(&[1, params.num_frames, h, w, 4], None, None, Some(&key))?;
         let latents = multiply(&noise, mlx_gen::array::scalar(sched.init_noise_sigma()))?;
 
+        let total_steps = params.num_inference_steps as u32;
         on_progress(Progress::Step {
             current: 0,
-            total: params.num_inference_steps as u32,
+            total: total_steps,
         });
+        // Thread per-step progress through the 25-step Euler loop so progress UIs advance through the
+        // dominant denoise phase instead of sitting at 0% until decode (F-088).
         let final_latents = self.pipeline.denoise(
             &latents,
             &image_embeds,
@@ -411,6 +414,12 @@ impl Svd {
             params.num_inference_steps,
             params.min_guidance_scale,
             params.max_guidance_scale,
+            &mut |step| {
+                on_progress(Progress::Step {
+                    current: step as u32,
+                    total: total_steps,
+                })
+            },
         )?;
 
         on_progress(Progress::Decoding);
@@ -441,10 +450,11 @@ fn frames_to_images(decoded: &Array) -> Result<Vec<Image>> {
     let x = round(&multiply(&x, mlx_gen::array::scalar(255.0))?, 0)?;
     let sh = x.shape();
     let (f, h, w) = (sh[1], sh[2], sh[3]);
-    let total: i32 = sh.iter().product();
-    let flat = x.reshape(&[total])?;
+    // Flatten via -1 and size `per` in i64 — bounded by current caps, but a raw i32 dim product is a
+    // latent overflow footgun at large frame/resolution counts (F-076).
+    let flat = x.reshape(&[-1])?;
     let data = flat.as_slice::<f32>();
-    let per = (h * w * 3) as usize;
+    let per = (h as i64 * w as i64 * 3) as usize;
     let mut frames = Vec::with_capacity(f as usize);
     for fi in 0..f as usize {
         let start = fi * per;

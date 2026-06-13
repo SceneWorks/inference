@@ -20,7 +20,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d, conv3d, group_norm, linear, silu, upsample_nearest};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::UnetConfig;
 use crate::embeddings::{sinusoidal_timestep, TimestepEmbedding};
@@ -438,7 +438,10 @@ impl SvdUnet {
         let mid_block = MidBlock::from_weights(
             w,
             "mid_block",
-            *heads.last().unwrap() as i32,
+            *heads
+                .last()
+                .ok_or_else(|| Error::Msg("svd unet: empty num_attention_heads".into()))?
+                as i32,
             cfg.transformer_layers_per_block,
         )?;
 

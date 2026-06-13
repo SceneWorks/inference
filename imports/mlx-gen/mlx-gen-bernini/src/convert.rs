@@ -202,8 +202,12 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        // `metadata` follows symlinks, so a symlinked file/dir is classified by its target.
-        if std::fs::metadata(&from)?.is_dir() {
+        // Use `symlink_metadata` (the entry's OWN type) so only a REAL subdirectory is recursed into;
+        // a symlink — even one pointing at a directory — falls to `fs::copy` (which follows it to the
+        // target). This preserves HF-cache behavior (entries are file symlinks into `../../blobs`,
+        // copied via the target) while a circular *directory* symlink can no longer drive infinite
+        // recursion → stack overflow (F-080).
+        if std::fs::symlink_metadata(&from)?.is_dir() {
             copy_dir_all(&from, &to)?;
         } else {
             std::fs::copy(&from, &to)?;
