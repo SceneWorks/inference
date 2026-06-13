@@ -52,8 +52,15 @@
 //!   g1 turbo vs 20-step / CFG-5 base). Validated end-to-end against the vendor `LensPipeline` on real
 //!   bf16 weights with injected starting noise: decoded-image cosine **0.996**, final-latent cosine
 //!   **0.979** (cross-build structural gate), coherent render (std matches the reference exactly).
+//! - **sc-3172** — the **encoder Q4/Q8 quantization** (`~12 GB`, not `~40 GB` bf16): the gpt-oss MoE
+//!   experts (the 20 B-param bulk) are re-quantized to MLX group-wise affine Q4/Q8 **per layer** at
+//!   load ([`text_encoder::encoder::LensTextEncoder::from_weights_quant`] →
+//!   [`pipeline::LensPipeline::load_quant`] → the `lens`/`lens_turbo` `supported_quants`), so the
+//!   per-layer bf16 dequant is the only transient (it is `eval`'d into the pack and freed before the
+//!   next layer). Attention / router / embedding stay dense. The DiT stays dense (its quant is
+//!   sc-3175). Validated vs the bf16 reference captures (Q8 near-lossless, Q4 coherent).
 //!
-//! Still to come: the memory-efficient weight conversion / Q4-Q8 re-quant (sc-3172).
+//! The Lens-Turbo engine is complete; only the SceneWorks worker cutover (separate repo) remains.
 
 pub mod config;
 pub mod dit;

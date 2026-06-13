@@ -55,7 +55,7 @@ fn gptoss_decoder_layer_matches_reference() {
     let inv_freq = Array::from_slice(&inv_freq_vec, &[inv_freq_vec.len() as i32]);
 
     let layer =
-        GptOssDecoderLayer::from_weights(&g, "model.layers.0", &cfg, Dtype::Float32).unwrap();
+        GptOssDecoderLayer::from_weights(&g, "model.layers.0", &cfg, Dtype::Float32, None).unwrap();
 
     // --- Gate 1: MoE alone (router + clamped-SwiGLU experts + MXFP4 dequant) ---
     let moe_in = g.require("moe_in").unwrap();
