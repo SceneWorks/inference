@@ -19,7 +19,9 @@
 //! ([`mlx_gen_wan::convert::assemble_bernini_renderer_snapshot`], sc-4705) emits a `wan2_2_t2v_14b`
 //! snapshot plus a `bernini_renderer.json` knob sidecar that this crate consumes.
 
+pub mod clip_diff;
 pub mod config;
+pub mod connector;
 pub mod convert;
 pub mod forward;
 pub mod guidance;
