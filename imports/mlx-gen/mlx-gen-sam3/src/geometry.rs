@@ -27,12 +27,9 @@ use mlx_gen::Result;
 
 use crate::config::Sam3GeometryConfig;
 use crate::detr::{Attn, Ffn};
+use crate::util::join;
 
 const SCALE_2PI: f32 = 2.0 * PI;
-
-fn join(prefix: &str, leaf: &str) -> String {
-    format!("{prefix}.{leaf}")
-}
 
 fn ln(x: &Array, w: &Array, b: &Array, eps: f32) -> Result<Array> {
     Ok(layer_norm(x, Some(w), Some(b), eps)?)

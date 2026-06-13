@@ -18,13 +18,9 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::Sam3TextConfig;
+use crate::util::join;
 
 use std::path::Path;
-
-/// `"{prefix}.{leaf}"`.
-fn join(prefix: &str, leaf: &str) -> String {
-    format!("{prefix}.{leaf}")
-}
 
 /// One CLIP encoder layer: pre-norm self-attention + pre-norm GELU MLP, both residual.
 struct ClipLayer {

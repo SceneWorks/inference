@@ -31,6 +31,7 @@ pub mod mask;
 pub mod model;
 pub mod text;
 pub mod tracker;
+mod util;
 pub mod video;
 pub mod vision;
 

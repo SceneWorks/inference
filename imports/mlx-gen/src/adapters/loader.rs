@@ -1197,13 +1197,19 @@ mod tests {
     }
 
     #[test]
-    fn scalar_alpha_empty_tensor_returns_none_not_panic() {
-        // sc-3959 (F-001): a malformed third-party adapter with a zero-length `.alpha` tensor must
-        // fail gracefully. Before the guard, `as_slice::<f32>()` (== `try_as_slice().unwrap()`)
-        // panicked on the size-0 array, aborting the whole worker; now it reads as `None`.
+    fn scalar_alpha_empty_tensor_errors_not_panic() {
+        // sc-3959 added the no-panic guard for a malformed third-party adapter with a zero-length
+        // `.alpha` (before it, `as_slice::<f32>()` panicked on the size-0 array, aborting the worker).
+        // F-031 then tightened it from a silent `Ok(None)` to a typed error: the callers only reach
+        // `scalar_alpha` for a *present* alpha key, so present-but-empty is a malformed file — returning
+        // `None` would be indistinguishable from "no alpha" and silently mis-scale the adapter.
         let empty = Array::from_slice(&[] as &[f32], &[0]);
         assert_eq!(empty.size(), 0);
-        assert_eq!(scalar_alpha(&empty).unwrap(), None);
+        let err = scalar_alpha(&empty)
+            .err()
+            .expect("size-0 alpha must be a typed error, not Ok")
+            .to_string();
+        assert!(err.contains("empty"), "got: {err}");
     }
 
     #[test]
