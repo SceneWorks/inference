@@ -19,7 +19,7 @@ use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 use crate::array::scalar;
-use crate::Result;
+use crate::{Error, Result};
 
 /// sc-2963 (rollout of the Wan sc-2957 template): the shared compiled-elementwise-*glue* toggle and
 /// its fusable helpers, hoisted out of the per-family transformers (F-101) so a fix to the wrapper
@@ -217,9 +217,22 @@ pub fn group_norm(
     eps: f32,
 ) -> Result<Array> {
     let sh = x.shape();
+    // Shared pub primitive: all current callers satisfy the rank/group contract, but a malformed
+    // caller would panic on the `sh[1..sh.len()-1]` slice (rank<2) or divide-by-zero / mis-group on
+    // `dims / num_groups`. Reject those with a typed error instead (F-041).
+    if sh.len() < 2 {
+        return Err(Error::Msg(format!(
+            "group_norm: expected a rank>=2 tensor, got shape {sh:?}"
+        )));
+    }
     let batch = sh[0];
     let dims = sh[sh.len() - 1];
     let rest = &sh[1..sh.len() - 1];
+    if num_groups <= 0 || dims % num_groups != 0 {
+        return Err(Error::Msg(format!(
+            "group_norm: channel count {dims} not divisible by num_groups {num_groups}"
+        )));
+    }
     let group_size = dims / num_groups;
 
     let g = x
@@ -241,6 +254,11 @@ pub fn group_norm(
 /// Nearest-neighbor upsample of NHWC `x` by `scale` (broadcast + reshape).
 pub fn upsample_nearest(x: &Array, scale: i32) -> Result<Array> {
     let sh = x.shape();
+    if sh.len() != 4 {
+        return Err(Error::Msg(format!(
+            "upsample_nearest: expected an NHWC (rank 4) tensor, got shape {sh:?}"
+        )));
+    }
     let (b, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
     let x6 = x.reshape(&[b, h, 1, w, 1, c])?;
     let bc = broadcast_to(&x6, &[b, h, scale, w, scale, c])?;

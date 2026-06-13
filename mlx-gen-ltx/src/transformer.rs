@@ -41,7 +41,7 @@ use mlx_gen::train::lora::LoraParams;
 
 use mlx_gen::nn::{gelu_tanh, linear};
 use mlx_gen::weights::{to_dtype, Weights};
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::LtxConfig;
 use crate::rope::{apply_split_rotary_emb, precompute_split_freqs_cis};
@@ -499,7 +499,10 @@ thread_local! {
 /// `mx.fast.rms_norm(x, ones, eps)` — the block's weightless pre-norm (feature RMS over the last
 /// axis). The all-ones weight is cached per `(dim, dtype)` (F-057), bit-identical to a fresh `ones`.
 fn rms_norm_noweight(x: &Array, eps: f32) -> Result<Array> {
-    let dim = *x.shape().last().unwrap();
+    let dim = *x
+        .shape()
+        .last()
+        .ok_or_else(|| Error::Msg("ltx rms_norm: zero-rank input has no last axis".into()))?;
     let dt = x.dtype();
     let ones = ONES_CACHE.with(|c| -> Result<Array> {
         if let Some(o) = c.borrow().get(&(dim, dt)) {
@@ -1304,7 +1307,10 @@ impl LtxDiT {
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(vec![out])
             });
-            h = seg(&inputs)?.into_iter().next().expect("one block output");
+            h = seg(&inputs)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Msg("ltx: checkpoint segment produced no output".into()))?;
         }
         self.output_head(&h, &p.emb_ts)
     }

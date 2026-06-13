@@ -75,6 +75,14 @@ fn slice_t(x: &Array, start: i32, end: i32) -> Result<Array> {
 
 /// `x / sqrt(mean(x² over C, axis 1, keepdims) + eps)` — LTX PixelNorm (no √C scale, no γ).
 fn pixel_norm(x: &Array, eps: f32) -> Result<Array> {
+    // A zero-channel tensor (malformed checkpoint) would divide by `c = 0` and silently yield
+    // inf/nan; a rank<2 tensor would panic on `shape()[1]`. Reject both (F-049).
+    if x.ndim() < 2 || x.shape()[1] == 0 {
+        return Err(Error::Msg(format!(
+            "ltx vae pixel_norm: expected a non-empty channel axis (dim 1), got shape {:?}",
+            x.shape()
+        )));
+    }
     let sumsq = sum_axes(&multiply(x, x)?, &[1], true)?;
     let c = x.shape()[1] as f32;
     let mean = divide(&sumsq, scalar(c))?;
@@ -626,8 +634,10 @@ impl LtxVideoVae {
             }
         }
 
-        let output = output.expect("at least one tile");
-        let weights = weights.expect("at least one tile");
+        let output =
+            output.ok_or_else(|| Error::Msg("ltx vae: tile-decode plan had no tiles".into()))?;
+        let weights =
+            weights.ok_or_else(|| Error::Msg("ltx vae: tile-decode plan had no tiles".into()))?;
         let normed = divide(&output, &maximum(&weights, scalar(1e-8))?)?;
         contiguous(&normed)
     }

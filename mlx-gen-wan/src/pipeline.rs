@@ -408,10 +408,10 @@ fn predict(
         // preds[0] = cond (context row 0), preds[1] = uncond (row 1).
         cfg_combine(&preds[0], &preds[1], guidance)
     } else {
-        Ok(preds
+        preds
             .into_iter()
             .next()
-            .expect("B=1 forward yields one output"))
+            .ok_or_else(|| Error::Msg("wan: B=1 forward produced no output".into()))
     }
 }
 
@@ -479,10 +479,10 @@ fn predict_tokens(
     if cache.batch == 2 {
         cfg_combine(&preds[0], &preds[1], guidance)
     } else {
-        Ok(preds
+        preds
             .into_iter()
             .next()
-            .expect("B=1 forward yields one output"))
+            .ok_or_else(|| Error::Msg("wan: B=1 forward produced no output".into()))
     }
 }
 

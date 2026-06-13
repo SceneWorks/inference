@@ -91,8 +91,12 @@ pub fn sanitize_wan22_vae(
             new = new.replace(".proj.bias", ".proj_bias");
         }
 
-        // Conv-weight channels-last (keys ending `.weight` OR the renamed `_weight`).
-        let mut value = if new.ends_with(".weight") || new.ends_with("_weight") {
+        // Conv-weight channels-last (keys ending `.weight` OR the renamed `_weight`). Gate on rank-4
+        // so the predicate can only ever transpose an actual conv weight: today only conv weights
+        // match and `conv_channels_last` no-ops on rank<4, but a future 2-D `_weight` key would
+        // otherwise be silently transposed (F-045). The gate is byte-identical for current weights.
+        let mut value = if (new.ends_with(".weight") || new.ends_with("_weight")) && src.ndim() >= 4
+        {
             conv_channels_last(src)?
         } else {
             src.clone()

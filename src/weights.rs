@@ -48,7 +48,19 @@ impl Weights {
         let mut metadata = HashMap::new();
         for f in files {
             let (t, m) = Array::load_safetensors_with_metadata(&f)?;
-            tensors.extend(t);
+            // Shards are expected to be disjoint; a key collision means the shard set is wrong (e.g.
+            // a stray extra file in the dir) and a plain `extend` would silently let the later shard
+            // win, loading a partially-wrong tensor set. Surface it instead (F-032). Metadata is
+            // descriptive (per-shard `__metadata__`), so a later-wins merge there is benign.
+            for (k, v) in t {
+                if tensors.insert(k.clone(), v).is_some() {
+                    return Err(format!(
+                        "duplicate tensor key `{k}` across shards in {} (non-disjoint shard set)",
+                        dir.display()
+                    )
+                    .into());
+                }
+            }
             metadata.extend(m);
         }
         Ok(Self { tensors, metadata })

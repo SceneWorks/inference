@@ -176,7 +176,9 @@ impl Umt5Encoder {
         let cleaned = clean_text(prompt);
         let out = tok.tokenize_preformatted(&cleaned)?;
         let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&out);
-        let seq_len: i32 = attention_mask.sum(None)?.item();
+        // Cast the mask to Int32 before summing: a bf16/float mask (depending on the tokenizer's
+        // dtype) summed then cast to i32 could round at large seq lengths (F-046).
+        let seq_len: i32 = attention_mask.as_dtype(Dtype::Int32)?.sum(None)?.item();
         let embeds = self.forward(&input_ids, &attention_mask)?;
         let dim = embeds.shape()[2];
         let flat = embeds.reshape(&[embeds.shape()[1], dim])?;

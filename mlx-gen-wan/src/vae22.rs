@@ -1011,7 +1011,8 @@ impl Wan22Vae {
             eval(out.as_ref().unwrap())?;
         }
         // Pointwise conv1 (z·2 → z·2) then split mu = first z channels; normalize.
-        let out = top_conv1.forward(&out.unwrap(), None)?;
+        let out = out.ok_or_else(|| Error::Msg("wan vae22: encode produced no chunks".into()))?;
+        let out = top_conv1.forward(&out, None)?;
         let mu = slice_axis(&out, 4, 0, self.z_dim)?;
         let normed = divide(&subtract(&mu, &self.mean)?, &self.std)?;
         contiguous(&normed)

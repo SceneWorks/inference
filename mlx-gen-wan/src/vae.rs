@@ -612,7 +612,8 @@ impl WanVae {
                 Some(o) => concatenate_axis(&[&o, &chunk_out], 2)?,
             });
         }
-        let parts = split(&post_conv1.forward(&out.unwrap(), None)?, 2, 1)?; // [mean, logvar]
+        let out = out.ok_or_else(|| Error::Msg("wan vae: encode produced no chunks".into()))?;
+        let parts = split(&post_conv1.forward(&out, None)?, 2, 1)?; // [mean, logvar]
         Ok((parts[0].clone(), parts[1].clone()))
     }
 
