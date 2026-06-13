@@ -37,10 +37,17 @@ fn metrics(got: &[f32], exp: &[f32]) -> (f32, f32) {
 fn run(label: &str, got: &Array, exp: &Array) {
     assert_eq!(got.shape(), exp.shape(), "{label}: shape mismatch");
     // reshape to 1-D forces a contiguous logical-order copy (conv/transpose outputs are lazy views)
-    let g = got.as_dtype(mlx_rs::Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
+    let g = got
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap()
+        .reshape(&[-1])
+        .unwrap();
     let e = exp.reshape(&[-1]).unwrap();
     let (cos, pr) = metrics(g.as_slice::<f32>(), e.as_slice::<f32>());
-    eprintln!("[{label}] shape={:?} cosine={cos:.6} peak_rel={pr:.3e}", got.shape());
+    eprintln!(
+        "[{label}] shape={:?} cosine={cos:.6} peak_rel={pr:.3e}",
+        got.shape()
+    );
     // f32 same-backend: every conv / groupnorm / pixel-shuffle stage is bit-exact; the only
     // non-exact op is the mid-block SDPA (~3.5e-3), which amplifies mildly through decode (~2e-2).
     assert!(cos > 0.9990, "{label}: cosine {cos} too low");
@@ -53,7 +60,9 @@ fn seedvr2_vae_matches_reference() {
     let wpath = dir.join("vae_f32.safetensors");
     let iopath = dir.join("vae_io_f32.safetensors");
     if !wpath.exists() || !iopath.exists() {
-        eprintln!("SKIP: goldens absent at {dir:?} (run tools/dump_seedvr2_goldens.py --component vae)");
+        eprintln!(
+            "SKIP: goldens absent at {dir:?} (run tools/dump_seedvr2_goldens.py --component vae)"
+        );
         return;
     }
 
@@ -62,14 +71,22 @@ fn seedvr2_vae_matches_reference() {
     let vae = Seedvr2Vae::from_weights(&w).expect("build vae");
 
     // image mode (T=1)
-    let enc_img = vae.encode(io.require("x_img").unwrap()).expect("encode img");
+    let enc_img = vae
+        .encode(io.require("x_img").unwrap())
+        .expect("encode img");
     run("encode_img", &enc_img, io.require("enc_img").unwrap());
-    let dec_img = vae.decode(io.require("enc_img").unwrap()).expect("decode img");
+    let dec_img = vae
+        .decode(io.require("enc_img").unwrap())
+        .expect("decode img");
     run("decode_img", &dec_img, io.require("dec_img").unwrap());
 
     // video mode (T=5 -> latentT 2 -> decodedT 8)
-    let enc_vid = vae.encode(io.require("x_vid").unwrap()).expect("encode vid");
+    let enc_vid = vae
+        .encode(io.require("x_vid").unwrap())
+        .expect("encode vid");
     run("encode_vid", &enc_vid, io.require("enc_vid").unwrap());
-    let dec_vid = vae.decode(io.require("enc_vid").unwrap()).expect("decode vid");
+    let dec_vid = vae
+        .decode(io.require("enc_vid").unwrap())
+        .expect("decode vid");
     run("decode_vid", &dec_vid, io.require("dec_vid").unwrap());
 }

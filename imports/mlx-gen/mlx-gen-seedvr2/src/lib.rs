@@ -20,4 +20,5 @@
 //! Under construction (sc-4813). See the per-module docs as components land.
 
 pub mod config;
+pub mod dit;
 pub mod vae;

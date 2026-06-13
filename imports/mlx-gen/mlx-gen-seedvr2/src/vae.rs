@@ -34,7 +34,7 @@ impl Linear {
         })
     }
     fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(add(&matmul(x, &self.w.t())?, &self.b)?)
+        Ok(add(&matmul(x, self.w.t())?, &self.b)?)
     }
 }
 
@@ -46,8 +46,16 @@ fn first_t(x: &Array) -> Result<Array> {
 /// GroupNorm over an NCTHW tensor: transpose to channels-last, normalise in f32, transpose back.
 fn gn(x_ncthw: &Array, w: &Array, b: &Array, groups: i32, eps: f32) -> Result<Array> {
     let dt = x_ncthw.dtype();
-    let xl = x_ncthw.transpose_axes(&[0, 2, 3, 4, 1])?.as_dtype(Dtype::Float32)?;
-    let g = group_norm(&xl, &w.as_dtype(Dtype::Float32)?, &b.as_dtype(Dtype::Float32)?, groups, eps)?;
+    let xl = x_ncthw
+        .transpose_axes(&[0, 2, 3, 4, 1])?
+        .as_dtype(Dtype::Float32)?;
+    let g = group_norm(
+        &xl,
+        &w.as_dtype(Dtype::Float32)?,
+        &b.as_dtype(Dtype::Float32)?,
+        groups,
+        eps,
+    )?;
     Ok(g.as_dtype(dt)?.transpose_axes(&[0, 4, 1, 2, 3])?)
 }
 
@@ -88,7 +96,11 @@ impl CausalConv3d {
     fn forward(&self, x: &Array) -> Result<Array> {
         let kt = self.w.shape()[1];
         let (x, temporal_padding) = if kt > 1 {
-            let causal_pad = if self.use_padding_causal { 2 * self.pt } else { kt - 1 };
+            let causal_pad = if self.use_padding_causal {
+                2 * self.pt
+            } else {
+                kt - 1
+            };
             if causal_pad > 0 {
                 let first = first_t(x)?;
                 let mut parts: Vec<Array> = (0..causal_pad).map(|_| first.clone()).collect();
@@ -128,7 +140,13 @@ struct ResnetBlock3d {
 impl ResnetBlock3d {
     fn load(w: &Weights, prefix: &str, cfg: &VaeConfig) -> Result<Self> {
         let shortcut = if w.get(&format!("{prefix}.conv_shortcut.weight")).is_some() {
-            Some(CausalConv3d::load(w, &format!("{prefix}.conv_shortcut"), (1, 1, 1), (0, 0, 0), false)?)
+            Some(CausalConv3d::load(
+                w,
+                &format!("{prefix}.conv_shortcut"),
+                (1, 1, 1),
+                (0, 0, 0),
+                false,
+            )?)
         } else {
             None
         };
@@ -246,7 +264,13 @@ struct Upsample3d {
 impl Upsample3d {
     fn load(w: &Weights, prefix: &str, temporal: bool) -> Result<Self> {
         Ok(Self {
-            upscale_conv: CausalConv3d::load(w, &format!("{prefix}.upscale_conv"), (1, 1, 1), (0, 0, 0), false)?,
+            upscale_conv: CausalConv3d::load(
+                w,
+                &format!("{prefix}.upscale_conv"),
+                (1, 1, 1),
+                (0, 0, 0),
+                false,
+            )?,
             conv: CausalConv3d::load(w, &format!("{prefix}.conv"), (1, 1, 1), (1, 1, 1), true)?,
             sf: 2,
             tf: if temporal { 2 } else { 1 },
@@ -273,16 +297,30 @@ struct DownBlock3d {
     downsampler: Option<Downsample3d>,
 }
 impl DownBlock3d {
-    fn load(w: &Weights, prefix: &str, n: i32, temporal: bool, sample: bool, cfg: &VaeConfig) -> Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        n: i32,
+        temporal: bool,
+        sample: bool,
+        cfg: &VaeConfig,
+    ) -> Result<Self> {
         let resnets = (0..n)
             .map(|i| ResnetBlock3d::load(w, &format!("{prefix}.resnets.{i}"), cfg))
             .collect::<Result<Vec<_>>>()?;
         let downsampler = if sample {
-            Some(Downsample3d::load(w, &format!("{prefix}.downsamplers.0"), temporal)?)
+            Some(Downsample3d::load(
+                w,
+                &format!("{prefix}.downsamplers.0"),
+                temporal,
+            )?)
         } else {
             None
         };
-        Ok(Self { resnets, downsampler })
+        Ok(Self {
+            resnets,
+            downsampler,
+        })
     }
     fn forward(&self, x: &Array) -> Result<Array> {
         let mut h = x.clone();
@@ -301,12 +339,23 @@ struct UpBlock3d {
     upsampler: Option<Upsample3d>,
 }
 impl UpBlock3d {
-    fn load(w: &Weights, prefix: &str, n: i32, temporal: bool, sample: bool, cfg: &VaeConfig) -> Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        n: i32,
+        temporal: bool,
+        sample: bool,
+        cfg: &VaeConfig,
+    ) -> Result<Self> {
         let resnets = (0..n)
             .map(|i| ResnetBlock3d::load(w, &format!("{prefix}.resnets.{i}"), cfg))
             .collect::<Result<Vec<_>>>()?;
         let upsampler = if sample {
-            Some(Upsample3d::load(w, &format!("{prefix}.upsamplers.0"), temporal)?)
+            Some(Upsample3d::load(
+                w,
+                &format!("{prefix}.upsamplers.0"),
+                temporal,
+            )?)
         } else {
             None
         };
@@ -382,7 +431,13 @@ impl Encoder3d {
             h = d.forward(&h)?;
         }
         h = self.mid.forward(&h)?;
-        h = gn(&h, &self.norm_out_w, &self.norm_out_b, self.groups, self.eps)?;
+        h = gn(
+            &h,
+            &self.norm_out_w,
+            &self.norm_out_b,
+            self.groups,
+            self.eps,
+        )?;
         self.conv_out.forward(&silu(&h)?)
     }
 }
@@ -424,7 +479,13 @@ impl Decoder3d {
         for u in &self.up_blocks {
             h = u.forward(&h)?;
         }
-        h = gn(&h, &self.norm_out_w, &self.norm_out_b, self.groups, self.eps)?;
+        h = gn(
+            &h,
+            &self.norm_out_w,
+            &self.norm_out_b,
+            self.groups,
+            self.eps,
+        )?;
         self.conv_out.forward(&silu(&h)?)
     }
 }
@@ -450,16 +511,24 @@ impl Seedvr2Vae {
 
     /// `(B,3,T,H,W)` → scaled mean latent `(B,16,T',H',W')`. A 4-D `(B,3,H,W)` input gains `T=1`.
     pub fn encode(&self, x: &Array) -> Result<Array> {
-        let x = if x.ndim() == 4 { x.expand_dims(2)? } else { x.clone() };
+        let x = if x.ndim() == 4 {
+            x.expand_dims(2)?
+        } else {
+            x.clone()
+        };
         let h = self.encoder.forward(&x)?; // (B,32,T',H',W')
         let mean = &split(&h, 2, 1)?[0]; // first 16 channels
-        Ok(multiply(mean, &Array::from_f32(self.scaling_factor))?)
+        Ok(multiply(mean, Array::from_f32(self.scaling_factor))?)
     }
 
     /// `(B,16,T',H',W')` → `(B,3,T,H,W)`. A 4-D latent gains `T=1`.
     pub fn decode(&self, z: &Array) -> Result<Array> {
-        let z = if z.ndim() == 4 { z.expand_dims(2)? } else { z.clone() };
-        let z = multiply(&z, &Array::from_f32(1.0 / self.scaling_factor))?;
+        let z = if z.ndim() == 4 {
+            z.expand_dims(2)?
+        } else {
+            z.clone()
+        };
+        let z = multiply(&z, Array::from_f32(1.0 / self.scaling_factor))?;
         self.decoder.forward(&z)
     }
 }
@@ -472,14 +541,19 @@ mod stage_tests {
         std::env::var("SEEDVR2_GOLDEN_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
-                std::path::Path::new(&std::env::var("HOME").unwrap()).join(".cache/mlx-gen-seedvr2-golden")
+                std::path::Path::new(&std::env::var("HOME").unwrap())
+                    .join(".cache/mlx-gen-seedvr2-golden")
             })
     }
 
     fn cmp(label: &str, got: &Array, exp: &Array) {
         assert_eq!(got.shape(), exp.shape(), "{label} shape");
         // reshape to 1-D forces a contiguous logical-order copy (conv/gn outputs are transposed views)
-        let g = got.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
+        let g = got
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .reshape(&[-1])
+            .unwrap();
         let e = exp.reshape(&[-1]).unwrap();
         let (gs, es) = (g.as_slice::<f32>(), e.as_slice::<f32>());
         let mut dot = 0f64;
@@ -492,7 +566,11 @@ mod stage_tests {
             maxr = maxr.max(b.abs());
         }
         let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
-        eprintln!("[{label}] {:?} cosine={cos:.6} peak_rel={:.3e}", got.shape(), maxd / maxr.max(1e-12));
+        eprintln!(
+            "[{label}] {:?} cosine={cos:.6} peak_rel={:.3e}",
+            got.shape(),
+            maxd / maxr.max(1e-12)
+        );
     }
 
     #[test]
@@ -506,7 +584,11 @@ mod stage_tests {
         let io = Weights::from_file(dir.join("vae_io_f32.safetensors")).unwrap();
         let vae = Seedvr2Vae::from_weights(&w).unwrap();
         let dec = &vae.decoder;
-        let z = multiply(io.require("enc_img").unwrap(), &Array::from_f32(1.0 / vae.scaling_factor)).unwrap();
+        let z = multiply(
+            io.require("enc_img").unwrap(),
+            Array::from_f32(1.0 / vae.scaling_factor),
+        )
+        .unwrap();
         let h = dec.conv_in.forward(&z).unwrap();
         cmp("d_conv_in", &h, io.require("d_conv_in").unwrap());
         let h = dec.mid.forward(&h).unwrap();
@@ -514,7 +596,11 @@ mod stage_tests {
         let mut h = h;
         for (i, ub) in dec.up_blocks.iter().enumerate() {
             h = ub.forward(&h).unwrap();
-            cmp(&format!("d_up{i}"), &h, io.require(&format!("d_up{i}")).unwrap());
+            cmp(
+                &format!("d_up{i}"),
+                &h,
+                io.require(&format!("d_up{i}")).unwrap(),
+            );
         }
         // isolate the final tail on the GOLDEN up3 input
         let up3g = io.require("d_up3").unwrap();
