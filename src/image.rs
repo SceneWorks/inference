@@ -12,12 +12,12 @@ use mlx_rs::Array;
 
 use crate::array::scalar;
 use crate::media::Image;
-use crate::Result;
+use crate::{Error, Result};
 
 pub use gen_core::imageops::*;
 
 /// Denormalize a VAE-decoded tensor to an RGB8 [`Image`]: `clip(x·0.5 + 0.5, 0, 1)` → drop the
-/// singleton temporal axis (5-D → 4-D) → NCHW→NHWC → `(x·255).round()` → `u8`, taking batch 0.
+/// singleton temporal axis (5-D → 4-D) → NCHW→NHWC → `(x·255).round()` → `u8` (batch must be 1).
 /// Identical across the Z-Image and Qwen-Image pipelines (the decoded tensor must already be f32).
 pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
     let half = scalar(0.5);
@@ -36,19 +36,27 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
     let x = round(&multiply(&x, scalar(255.0))?, 0)?;
 
     let sh = x.shape();
-    let (h, w, c) = (sh[1] as u32, sh[2] as u32, sh[3] as u32);
-    let n = (h * w * c) as usize;
-    // `transpose_axes` yields a strided view; a raw `as_slice` would read physical (pre-transpose)
-    // order. `reshape` re-materializes in C-order, so the slice is logical NHWC. Take batch 0.
-    let total: i32 = sh.iter().product();
-    let flat = x.reshape(&[total])?;
+    // Batch-correct + overflow-safe (F-082): this path emits a single image, so reject B>1 (the
+    // per-image pipelines call with B==1) rather than silently keeping only batch 0, and size in
+    // usize / flatten via -1 to avoid the u32/i32 product overflow at large resolutions.
+    if sh[0] != 1 {
+        return Err(Error::Msg(format!(
+            "decoded_to_image: expected batch size 1, got {}",
+            sh[0]
+        )));
+    }
+    let (h, w, c) = (sh[1] as usize, sh[2] as usize, sh[3] as usize);
+    let n = h * w * c;
+    // `transpose_axes` yields a strided view; `reshape` re-materializes in C-order, so the slice is
+    // logical NHWC.
+    let flat = x.reshape(&[-1])?;
     let pixels: Vec<u8> = flat.as_slice::<f32>()[..n]
         .iter()
         .map(|&v| v as u8)
         .collect();
     Ok(Image {
-        width: w,
-        height: h,
+        width: w as u32,
+        height: h as u32,
         pixels,
     })
 }
