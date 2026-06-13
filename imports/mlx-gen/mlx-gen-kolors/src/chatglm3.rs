@@ -413,6 +413,10 @@ impl ChatGlmModel {
                 .as_dtype(Dtype::Int32)?
                 .as_slice::<i32>()
                 .to_vec(),
+            // `None` builds a single `0..s` table shared across all B rows. That is correct for B==1
+            // (production) and for uniform/right-padded batches, but a variable-length (left-padded)
+            // B>1 batch would need per-row positions — which then hits the B==1 guard above. So
+            // variable-length batched encode is unsupported, not silently mis-positioned (F-072).
             None => (0..s).collect(),
         };
         let mask = self.causal_padding_mask(attention_mask, b, s)?;

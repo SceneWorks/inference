@@ -153,7 +153,11 @@ pub fn remap_vae_encoder(w: &mut Weights) -> Result<()> {
         .map(String::from)
         .collect();
     for k in keys {
-        let rest = k.strip_prefix("encoder.").unwrap();
+        let rest = k.strip_prefix("encoder.").ok_or_else(|| {
+            Error::Msg(format!(
+                "flux vae remap: key `{k}` lost its encoder. prefix"
+            ))
+        })?;
         let (suffix, transpose): (String, bool) = match rest {
             "conv_in.weight" => ("conv_in.conv.weight".into(), true),
             "conv_in.bias" => ("conv_in.conv.bias".into(), false),

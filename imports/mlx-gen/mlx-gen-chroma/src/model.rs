@@ -316,6 +316,14 @@ impl Chroma {
                 self.descriptor.id, req.width, req.height
             )));
         }
+        // `base_sigmas`/`build_linear_sigmas` clamp `steps.max(1)`, so steps==0 would silently run one
+        // denoise step instead of erroring (sibling families like Kolors reject it). Match them (F-074).
+        if req.steps == Some(0) {
+            return Err(Error::Msg(format!(
+                "{}: steps must be >= 1",
+                self.descriptor.id
+            )));
+        }
         Ok(())
     }
 

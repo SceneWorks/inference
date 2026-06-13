@@ -532,11 +532,19 @@ impl LensTrainer {
                 let mult =
                     lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
                 opt.set_lr_scaled(mult);
+                // The final update can fire with fewer than `accum` grads when `steps` isn't a
+                // multiple of the accumulation; dividing by `accum` would down-scale that step. Divide
+                // by the actual in-window count instead (F-069).
+                let window = if step % accum == 0 {
+                    accum
+                } else {
+                    step % accum
+                };
                 let avg = average_grads(
                     accumulated
                         .take()
                         .expect("an update fires only after accumulation"),
-                    accum,
+                    window,
                 )?;
                 let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
                 let clipped: LoraParams = clipped

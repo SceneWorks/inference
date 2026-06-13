@@ -539,8 +539,12 @@ impl T2iModel {
             // there. At the default `(0.0, 1.0)` both are always-on, so the divergence only surfaces
             // for a custom `cfg_interval` (F-130).
             let v_pred = if needs_cfg && t >= opts.cfg_interval.0 && t <= opts.cfg_interval.1 {
-                let (cache_u, _tlu) = cache_uncond.as_mut().unwrap();
-                let rm_u = rm_uncond.as_ref().unwrap();
+                let (cache_u, _tlu) = cache_uncond.as_mut().ok_or_else(|| {
+                    Error::Msg("sensenova: CFG enabled but uncond cache is absent".into())
+                })?;
+                let rm_u = rm_uncond.as_ref().ok_or_else(|| {
+                    Error::Msg("sensenova: CFG enabled but uncond running-mean is absent".into())
+                })?;
                 let v_uncond = self.predict_v(&cond, rm_u, cache_u, &z, t, opts.t_eps)?;
                 cfg_blend(&v_cond, &v_uncond, opts.cfg_scale, opts.cfg_norm, i)?
             } else {
@@ -858,7 +862,6 @@ impl T2iModel {
     /// `patch·merge`); `prompt` may contain `<image>` markers (auto-prepended otherwise). Dual
     /// guidance: `opts.cfg_scale` (text) + `opts.img_cfg_scale` (image; edit ≈ 1.0, character ≈
     /// 1.5). `init_noise` (optional) is a standard-normal `[1,3,H,W]` for cross-build parity.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn it2i_generate(
         &self,

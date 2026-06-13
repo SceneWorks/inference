@@ -16,7 +16,7 @@
 
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
     add, broadcast_to, concatenate_axis, cos, matmul, multiply, quantize as quantize_affine,
@@ -783,9 +783,13 @@ impl MMAttention {
             .forward(&vid_unwin)?
             .reshape(&[1, l, vid_dim])?;
 
-        // txt: mean over windows
-        let txt_mean = multiply(txt_acc.unwrap(), Array::from_f32(1.0 / nwin as f32))?
-            .reshape(&[lt, h * hd])?;
+        // txt: mean over windows (an empty window list would make nwin==0 → divide-by-zero, and
+        // txt_acc would be None) (F-075).
+        let txt_acc = txt_acc.ok_or_else(|| {
+            Error::Msg("seedvr2 attention: no windows accumulated for the text stream".into())
+        })?;
+        let txt_mean =
+            multiply(&txt_acc, Array::from_f32(1.0 / nwin as f32))?.reshape(&[lt, h * hd])?;
         let txt_out = self
             .out_txt
             .forward(&txt_mean)?
@@ -878,33 +882,40 @@ impl Block {
         })
     }
 
-    fn ada_v(&self) -> &AdaParams {
+    // These resolve the shared vs per-stream (vid/txt) AdaParams/Mlp by the block's `shared` flag.
+    // The flag-to-field invariant is maintained at load, but return a typed error rather than panic
+    // if it is ever violated (F-075).
+    fn ada_v(&self) -> Result<&AdaParams> {
         if self.shared {
-            self.ada_all.as_ref().unwrap()
+            self.ada_all.as_ref()
         } else {
-            self.ada_vid.as_ref().unwrap()
+            self.ada_vid.as_ref()
         }
+        .ok_or_else(|| Error::Msg("seedvr2 block: ada_v params missing for this block kind".into()))
     }
-    fn ada_t(&self) -> &AdaParams {
+    fn ada_t(&self) -> Result<&AdaParams> {
         if self.shared {
-            self.ada_all.as_ref().unwrap()
+            self.ada_all.as_ref()
         } else {
-            self.ada_txt.as_ref().unwrap()
+            self.ada_txt.as_ref()
         }
+        .ok_or_else(|| Error::Msg("seedvr2 block: ada_t params missing for this block kind".into()))
     }
-    fn mlp_v(&self) -> &Mlp {
+    fn mlp_v(&self) -> Result<&Mlp> {
         if self.shared {
-            self.mlp_all.as_ref().unwrap()
+            self.mlp_all.as_ref()
         } else {
-            self.mlp_vid.as_ref().unwrap()
+            self.mlp_vid.as_ref()
         }
+        .ok_or_else(|| Error::Msg("seedvr2 block: mlp_v missing for this block kind".into()))
     }
-    fn mlp_t(&self) -> &Mlp {
+    fn mlp_t(&self) -> Result<&Mlp> {
         if self.shared {
-            self.mlp_all.as_ref().unwrap()
+            self.mlp_all.as_ref()
         } else {
-            self.mlp_txt.as_ref().unwrap()
+            self.mlp_txt.as_ref()
         }
+        .ok_or_else(|| Error::Msg("seedvr2 block: mlp_t missing for this block kind".into()))
     }
 
     fn forward(
@@ -915,7 +926,7 @@ impl Block {
         cache: &WindowCache,
     ) -> Result<(Array, Array)> {
         // attention
-        let av = self.ada_v();
+        let av = self.ada_v()?;
         let mut vid_attn = modulate_in(
             &rms_plain(vid, self.eps)?,
             emb,
@@ -925,7 +936,7 @@ impl Block {
         )?;
         let mut txt_attn = rms_plain(txt, self.eps)?;
         if !self.is_last {
-            let at = self.ada_t();
+            let at = self.ada_t()?;
             txt_attn = modulate_in(&txt_attn, emb, 0, &at.attn_shift, &at.attn_scale)?;
         }
         let (va, ta) = self.attn.forward(&vid_attn, &txt_attn, cache)?;
@@ -934,7 +945,7 @@ impl Block {
         let txt = if self.is_last {
             txt.clone()
         } else {
-            let ta = modulate_out(&ta, emb, 0, &self.ada_t().attn_gate)?;
+            let ta = modulate_out(&ta, emb, 0, &self.ada_t()?.attn_gate)?;
             add(txt, &ta)?
         };
 
@@ -949,7 +960,7 @@ impl Block {
         let txt_mlp_in = if self.is_last {
             txt.clone()
         } else {
-            let at = self.ada_t();
+            let at = self.ada_t()?;
             modulate_in(
                 &rms_plain(&txt, self.eps)?,
                 emb,
@@ -958,14 +969,14 @@ impl Block {
                 &at.mlp_scale,
             )?
         };
-        vid_mlp = self.mlp_v().forward(&vid_mlp)?;
+        vid_mlp = self.mlp_v()?.forward(&vid_mlp)?;
         vid_mlp = modulate_out(&vid_mlp, emb, 1, &av.mlp_gate)?;
         let vid = add(&vid, &vid_mlp)?;
         let txt = if self.is_last {
             txt
         } else {
-            let mut tm = self.mlp_t().forward(&txt_mlp_in)?;
-            tm = modulate_out(&tm, emb, 1, &self.ada_t().mlp_gate)?;
+            let mut tm = self.mlp_t()?.forward(&txt_mlp_in)?;
+            tm = modulate_out(&tm, emb, 1, &self.ada_t()?.mlp_gate)?;
             add(&txt, &tm)?
         };
         Ok((vid, txt))
