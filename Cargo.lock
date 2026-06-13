@@ -265,6 +265,9 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-flux2",
+ "inventory",
+ "rand",
+ "rand_distr",
 ]
 
 [[package]]

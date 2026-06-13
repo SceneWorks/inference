@@ -18,6 +18,11 @@ candle-gen = { path = "../candle-gen" }
 # The Lens VAE *is* the Flux.2 `AutoencoderKLFlux2` (32-ch latent, 2×2 patchify, bn-stats normalize),
 # already ported in candle-gen-flux2 — the Lens decode path reuses `Flux2Vae::decode_packed` (sc-5113).
 candle-gen-flux2 = { path = "../candle-gen-flux2" }
+# Link-time self-registration into gen-core's model registry (`inventory::submit!`, sc-5115).
+inventory = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 pattern) — NOT candle's CUDA `randn`.
+rand = { workspace = true }
+rand_distr = { workspace = true }
 
 [features]
 default = []
