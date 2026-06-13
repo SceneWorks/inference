@@ -21,6 +21,7 @@
 
 pub mod color;
 pub mod config;
+pub mod convert;
 pub mod dit;
 pub mod pipeline;
 pub mod vae;
