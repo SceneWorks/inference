@@ -876,15 +876,20 @@ impl Bernini {
             .map(|(j, im)| (im.clone(), sids[nv + j]))
             .collect();
 
-        let latents = {
-            let low_w = Weights::from_file(self.root.join("low_noise_model.safetensors"))?;
-            let high_w = Weights::from_file(self.root.join("high_noise_model.safetensors"))?;
-            let mut low_dit = WanTransformer::from_weights(&low_w, cfg)?;
-            let mut high_dit = WanTransformer::from_weights(&high_w, cfg)?;
+        // Load each expert and (if quantizing) quantize-then-free it before loading the next, so only
+        // one expert's bf16 transient is resident at a time (sc-5360 — `WanTransformer::quantize`
+        // eval-frees the bf16 dequant). Without quant this just loads both bf16.
+        let load_expert = |name: &str| -> Result<WanTransformer> {
+            let w = Weights::from_file(self.root.join(name))?;
+            let mut dit = WanTransformer::from_weights(&w, cfg)?;
             if let Some(q) = self.quant {
-                low_dit.quantize(q.bits(), None)?;
-                high_dit.quantize(q.bits(), None)?;
+                dit.quantize(q.bits(), None)?;
             }
+            Ok(dit)
+        };
+        let latents = {
+            let low_dit = load_expert("low_noise_model.safetensors")?;
+            let high_dit = load_expert("high_noise_model.safetensors")?;
             let streams4 = [
                 &pe_wtxt_wvit,
                 &pe_wtxt_wovit,

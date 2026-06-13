@@ -156,6 +156,19 @@ fn ln(x: &Array, eps: f32) -> Result<Array> {
     Ok(layer_norm(x, None, None, eps)?)
 }
 
+/// Push a linear's quantized packs (`wq`/`scales`/`biases` + optional bias) into `out` for the
+/// eval-to-free pass (sc-5360); a dense linear contributes nothing.
+fn push_quant_arrays<'a>(lin: &'a AdaptableLinear, out: &mut Vec<&'a Array>) {
+    if let Some((wq, scales, biases, bias, _, _)) = lin.quantized_params() {
+        out.push(wq);
+        out.push(scales);
+        out.push(biases);
+        if let Some(bias) = bias {
+            out.push(bias);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SelfAttention {
     q: AdaptableLinear,
@@ -200,6 +213,13 @@ impl SelfAttention {
         self.v.quantize(bits, group)?;
         self.o.quantize(bits, group)?;
         Ok(())
+    }
+
+    /// Collect this attention's quantized packs (sc-5360 eval-to-free).
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        for lin in [&self.q, &self.k, &self.v, &self.o] {
+            push_quant_arrays(lin, out);
+        }
     }
 
     /// Route a LoRA-training target (`q`/`k`/`v`/`o`) to its [`AdaptableLinear`] (sc-3046).
@@ -325,6 +345,13 @@ impl CrossAttention {
         Ok(())
     }
 
+    /// Collect this attention's quantized packs (sc-5360 eval-to-free).
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        for lin in [&self.q, &self.k, &self.v, &self.o] {
+            push_quant_arrays(lin, out);
+        }
+    }
+
     /// Route a LoRA-training target (`q`/`k`/`v`/`o`) to its [`AdaptableLinear`] (sc-3046).
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -403,6 +430,14 @@ impl Block {
         self.ffn_fc1.quantize(bits, group)?;
         self.ffn_fc2.quantize(bits, group)?;
         Ok(())
+    }
+
+    /// Collect this block's quantized packs (sc-5360 eval-to-free).
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        self.self_attn.push_quant_arrays(out);
+        self.cross_attn.push_quant_arrays(out);
+        push_quant_arrays(&self.ffn_fc1, out);
+        push_quant_arrays(&self.ffn_fc2, out);
     }
 
     /// Route a LoRA-training target into this block's `self_attn`/`cross_attn` projections or its
@@ -574,6 +609,18 @@ impl WanTransformer {
     pub fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
         for block in &mut self.blocks {
             block.quantize(bits, group)?;
+        }
+        // sc-5360: force-materialize the quantized packs now so the per-weight bf16 dequant transient
+        // frees here, instead of lazily at the first forward where (for the dual-expert renderer) both
+        // experts' transients would co-reside. The packed Q4/Q8 arrays are what stays resident; eval'ing
+        // them releases the bf16 source. Transparent to the result (it forces work the first forward
+        // would do anyway); the win is the load-time peak.
+        let mut arrays: Vec<&Array> = Vec::new();
+        for block in &self.blocks {
+            block.push_quant_arrays(&mut arrays);
+        }
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
         }
         Ok(())
     }
