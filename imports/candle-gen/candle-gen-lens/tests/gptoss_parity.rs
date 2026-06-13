@@ -14,7 +14,7 @@
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen_lens::text_encoder::{Config, GptOssTextEncoder};
+use candle_gen_lens::text_encoder::{Config, GptOssTextEncoder, DEFAULT_SELECTED_LAYERS};
 
 /// Cosine similarity over all elements (flattened), computed in f32 on CPU.
 fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
@@ -109,6 +109,25 @@ fn gptoss_encoder_matches_torch_reference() -> Result<()> {
     eprintln!("last_hidden_state: cosine={c:.6}  rel_l2={r:.4}");
     assert!(c > 0.99, "last_hidden_state cosine {c:.6} too low");
     assert!(r < 0.06, "last_hidden_state rel_l2 {r:.4} too high");
+
+    // sc-5110: multi-layer capture — the OUTPUT of decoder layers [5,11,17,23] (the LensGptOssEncoder
+    // feature path) vs the reference's raw layer-output captures. capture[k] == hidden_states[s+1].
+    let caps = encoder.capture(&input_ids, &DEFAULT_SELECTED_LAYERS)?;
+    for (cap, &layer) in caps.iter().zip(DEFAULT_SELECTED_LAYERS.iter()) {
+        let Some(golden) = goldens.get(&format!("cap_{layer:02}")) else {
+            continue;
+        };
+        let mine = cap.squeeze(0)?; // [seq, hidden]
+        let c = cosine(&mine, golden)?;
+        let r = rel_l2(&mine, golden)?;
+        eprintln!("capture[L{layer:>2}]: cosine={c:.6}  rel_l2={r:.4}");
+        assert!(
+            c > 0.99,
+            "capture L{layer} cosine {c:.6} too low (capture-index bug?)"
+        );
+        assert!(r < 0.06, "capture L{layer} rel_l2 {r:.4} too high");
+        worst_cos = worst_cos.min(c);
+    }
 
     eprintln!("PASS — worst layer cosine {worst_cos:.6}");
     Ok(())
