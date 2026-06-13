@@ -103,3 +103,22 @@ fn seedvr2_e2e_model_path_matches_reference() {
     let cos = report("decoded", &decoded, io.require("decoded").unwrap());
     assert!(cos > 0.999, "decoded cosine {cos} too low");
 }
+
+#[test]
+fn seedvr2_color_correction_matches_reference() {
+    let dir = golden_dir();
+    if !dir.join("e2e_io_f32.safetensors").exists() {
+        eprintln!("SKIP: e2e goldens absent");
+        return;
+    }
+    let io = Weights::from_file(dir.join("e2e_io_f32.safetensors")).expect("e2e io");
+    // isolate the post-process: feed the reference decoded + style, expect the reference final image
+    let out = mlx_gen_seedvr2::color::apply_color_correction(
+        io.require("decoded").unwrap(),
+        io.require("style").unwrap(),
+        0.8,
+    )
+    .expect("color correction");
+    let cos = report("final", &out, io.require("final").unwrap());
+    assert!(cos > 0.999, "color-corrected cosine {cos} too low");
+}

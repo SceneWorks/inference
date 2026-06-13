@@ -19,6 +19,7 @@
 //! ## Status
 //! Under construction (sc-4813). See the per-module docs as components land.
 
+pub mod color;
 pub mod config;
 pub mod dit;
 pub mod pipeline;
