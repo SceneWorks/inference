@@ -29,10 +29,13 @@
 //!   ([`text_encoder::mxfp4`]). Validated single-layer against `transformers.GptOssDecoderLayer`.
 //! - **sc-3167** — the **harmony tokenizer + Lens chat-template** ([`text::LensTokenizer`]):
 //!   byte-exact `input_ids` vs `LensPipeline._build_chat_inputs` (`txt_offset = 97`).
+//! - **sc-3171** — the **encoder-only stack + multi-layer hidden capture**
+//!   ([`text_encoder::encoder::LensTextEncoder`]): `embed_tokens` → 24 decoder layers with per-layer
+//!   sliding/full masks → capture the layer outputs at `[5, 11, 17, 23]` → early-exit at the last
+//!   selected layer. Validated end-to-end against the vendor `LensGptOssEncoder` on real bf16 weights.
 //!
-//! Still to come: the multi-layer hidden capture (sc-3171), the memory-efficient weight conversion /
-//! Q4-Q8 re-quant (sc-3172), the DiT (sc-3168), VAE shim (sc-3169), scheduler (sc-3170), and the
-//! generate/e2e integration (sc-3173).
+//! Still to come: the memory-efficient weight conversion / Q4-Q8 re-quant (sc-3172), the DiT
+//! (sc-3168), VAE shim (sc-3169), scheduler (sc-3170), and the generate/e2e integration (sc-3173).
 
 pub mod config;
 pub mod text;
