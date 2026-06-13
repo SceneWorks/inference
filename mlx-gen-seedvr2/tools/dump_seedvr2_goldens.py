@@ -43,9 +43,12 @@ def cast_f32(module):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--component", required=True, choices=["vae", "dit"])
+    ap.add_argument("--component", required=True, choices=["vae", "dit", "e2e"])
     ap.add_argument("--dir", default=os.path.expanduser("~/.cache/mlx-gen-seedvr2-golden"))
     ap.add_argument("--model", default="3b", choices=["3b", "7b"])
+    ap.add_argument("--image", default="/tmp/sc_seedvr2/candle_hr1024.png")
+    ap.add_argument("--resolution", type=int, default=256)
+    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
     os.makedirs(args.dir, exist_ok=True)
 
@@ -87,6 +90,46 @@ def main():
         for k, v in io.items():
             print(f"   vae io {k}: {list(v.shape)}")
         save(os.path.join(args.dir, "vae_io_f32.safetensors"), io)
+
+    elif args.component == "e2e":
+        # Full image-mode path at f32 with a fixed seed, capturing every stage so the Rust
+        # pipeline can be gated against the model path (pre color-correction) and the final image.
+        from mflux.models.common.config.config import Config
+        from mflux.models.common.vae.vae_util import VAEUtil
+        from mflux.models.seedvr2.latent_creator.seedvr2_latent_creator import SeedVR2LatentCreator
+        from mflux.models.seedvr2.variants.upscale.seedvr2_util import SeedVR2Util
+
+        cast_f32(model.vae)
+        cast_f32(model.transformer)
+
+        processed, th, tw = SeedVR2Util.preprocess_image(image_path=args.image, resolution=args.resolution, softness=0.0)
+        processed = processed.astype(mx.float32)
+        config = Config(width=tw, height=th, guidance=1.0, num_inference_steps=1,
+                        image_path=args.image, scheduler="seedvr2_euler", model_config=cfg)
+        initial_latent = VAEUtil.encode(vae=model.vae, image=processed, tiling_config=model.tiling_config)
+        static_condition = SeedVR2LatentCreator.create_condition(encoded_latent=initial_latent)
+        noise = SeedVR2LatentCreator.create_noise_latents(seed=args.seed, height=initial_latent.shape[-2], width=initial_latent.shape[-1])
+        txt_pos = SeedVR2TextEmbeddings.load_positive().astype(mx.float32)
+
+        timestep = config.scheduler.timesteps[0]
+        model_input = mx.concatenate([noise, static_condition], axis=1)
+        dit_out = model.transformer(txt=txt_pos, vid=model_input, timestep=timestep)
+        latents = config.scheduler.step(noise=dit_out, timestep=0, latents=noise)
+        decoded = VAEUtil.decode(vae=model.vae, latent=latents, tiling_config=model.tiling_config)
+        decoded = decoded[:, :, :th, :tw]
+        style = processed[:, :, :th, :tw]
+        final = SeedVR2Util.apply_color_correction(decoded, style)
+
+        io = {
+            "processed": processed, "initial_latent": initial_latent, "noise": noise,
+            "static_condition": static_condition, "dit_out": dit_out, "latents": latents,
+            "decoded": decoded, "style": style, "final": final,
+            "timestep": mx.array(float(timestep)), "neg_embed": txt_pos,
+        }
+        for k, v in io.items():
+            print(f"   e2e io {k}: {list(v.shape)}")
+        save(os.path.join(args.dir, "e2e_io_f32.safetensors"), io)
+        return
 
     else:  # dit
         tr = model.transformer
