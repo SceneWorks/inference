@@ -221,25 +221,28 @@ impl ClipAttention {
     }
 
     fn forward(&self, hidden: &Array, mask: &Array) -> Result<Array> {
+        let b = hidden.shape()[0];
         let s = hidden.shape()[1];
+        // Read the batch from the input instead of hardcoding 1, so a B>1 CLIP encode reshapes
+        // correctly rather than shape-erroring / mis-shaping (F-061).
         let q = self
             .q
             .forward(hidden)?
-            .reshape(&[1, s, 12, 64])?
+            .reshape(&[b, s, 12, 64])?
             .transpose_axes(&[0, 2, 1, 3])?;
         let k = self
             .k
             .forward(hidden)?
-            .reshape(&[1, s, 12, 64])?
+            .reshape(&[b, s, 12, 64])?
             .transpose_axes(&[0, 2, 1, 3])?;
         let v = self
             .v
             .forward(hidden)?
-            .reshape(&[1, s, 12, 64])?
+            .reshape(&[b, s, 12, 64])?
             .transpose_axes(&[0, 2, 1, 3])?;
         let mask = mask.as_dtype(q.dtype())?;
         let y = scaled_dot_product_attention(&q, &k, &v, (64.0_f32).powf(-0.5), &mask, None)?;
-        let y = y.transpose_axes(&[0, 2, 1, 3])?.reshape(&[1, s, 768])?;
+        let y = y.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, 768])?;
         self.out.forward(&y)
     }
 

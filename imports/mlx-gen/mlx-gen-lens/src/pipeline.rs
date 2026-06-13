@@ -382,17 +382,24 @@ fn decoded_to_image(decoded: &Array) -> Result<Image> {
     let x = mlx_rs::ops::clip(&x, (0.0, 1.0))?;
     let x = mlx_rs::ops::round(&mlx_rs::ops::multiply(&x, Array::from_f32(255.0))?, 0)?;
     let sh = x.shape();
-    let (h, w, c) = (sh[1] as u32, sh[2] as u32, sh[3] as u32);
-    let n = (h * w * c) as usize;
-    let total: i32 = sh.iter().product();
-    let flat = x.reshape(&[total])?;
+    // One image per call: reject B>1 instead of silently keeping only batch 0, and size in usize /
+    // flatten via -1 to avoid the u32/i32 product overflow at large resolutions (F-068).
+    if sh[0] != 1 {
+        return Err(Error::Msg(format!(
+            "lens decoded_to_image: expected batch size 1, got {}",
+            sh[0]
+        )));
+    }
+    let (h, w, c) = (sh[1] as usize, sh[2] as usize, sh[3] as usize);
+    let n = h * w * c;
+    let flat = x.reshape(&[-1])?;
     let pixels: Vec<u8> = flat.as_slice::<f32>()[..n]
         .iter()
         .map(|&v| v as u8)
         .collect();
     Ok(Image {
-        width: w,
-        height: h,
+        width: w as u32,
+        height: h as u32,
         pixels,
     })
 }

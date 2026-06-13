@@ -12,8 +12,7 @@
 //! order). De-normalize + unpatchify + decode are then the shared Flux.2 path verbatim
 //! (`x·std + mean` ≡ the reference's `x/scale − shift` with `scale = 1/std`, `shift = −mean`).
 
-use mlx_rs::ops::{clip, multiply};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use mlx_gen::Result;
 use mlx_gen_flux2::Flux2Vae;
@@ -27,15 +26,4 @@ pub fn decode(vae: &Flux2Vae, dit_out: &Array, latent_h: usize, latent_w: usize)
     let c = dit_out.shape()[2]; // 128 packed channels
     let packed = dit_out.reshape(&[b, latent_h as i32, latent_w as i32, c])?;
     vae.decode_packed_latents(&packed)
-}
-
-/// Convert a decoded image `[B, H, W, 3]` in `[−1, 1]` to `uint8` `[0, 255]` (`(x.clamp(−1,1)+1)·127.5`),
-/// matching the reference `_to_pil` quantization.
-pub fn to_uint8(image: &Array) -> Result<Array> {
-    let clamped = clip(&image.as_dtype(Dtype::Float32)?, (-1.0, 1.0))?;
-    let scaled = multiply(
-        &mlx_rs::ops::add(&clamped, Array::from_f32(1.0))?,
-        Array::from_f32(127.5),
-    )?;
-    Ok(scaled.as_dtype(Dtype::Uint8)?)
 }
