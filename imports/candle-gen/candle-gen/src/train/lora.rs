@@ -292,7 +292,7 @@ fn path_matches(path: &str, suffix: &str) -> bool {
 pub fn factorization(dimension: usize, factor: i32) -> (usize, usize) {
     if factor > 0 {
         let f = factor as usize;
-        if dimension % f == 0 {
+        if dimension.is_multiple_of(f) {
             let n = dimension / f;
             return if f > n { (n, f) } else { (f, n) };
         }
@@ -308,7 +308,7 @@ pub fn factorization(dimension: usize, factor: i32) -> (usize, usize) {
     let mut length = m + n;
     while m < n {
         let mut new_m = m + 1;
-        while dimension % new_m != 0 {
+        while !dimension.is_multiple_of(new_m) {
             new_m += 1;
         }
         let new_n = dimension / new_m;
@@ -441,8 +441,7 @@ pub fn build_lokr_targets(
         vars.push(w1.clone());
         let mut factors: Vec<(&'static str, Var)> = vec![("lokr_w1", w1.clone())];
 
-        let runtime_w2;
-        if r < out_b.min(in_b) {
+        let runtime_w2 = if r < out_b.min(in_b) {
             // Low-rank w2 = w2_a @ w2_b; w2_b zero-init ⇒ delta starts at 0.
             let w2a = gaussian_var(out_b, r, INIT_STD, &mut rng, device)?;
             let w2b = zero_var(r, in_b, device)?;
@@ -450,17 +449,17 @@ pub fn build_lokr_targets(
             vars.push(w2b.clone());
             factors.push(("lokr_w2_a", w2a.clone()));
             factors.push(("lokr_w2_b", w2b.clone()));
-            runtime_w2 = LokrW2::LowRank {
+            LokrW2::LowRank {
                 a: w2a.as_tensor().clone(),
                 b: w2b.as_tensor().clone(),
-            };
+            }
         } else {
             // Full w2, zero-init.
             let w2 = zero_var(out_b, in_b, device)?;
             vars.push(w2.clone());
             factors.push(("lokr_w2", w2.clone()));
-            runtime_w2 = LokrW2::Full(w2.as_tensor().clone());
-        }
+            LokrW2::Full(w2.as_tensor().clone())
+        };
         lin.install_lokr(w1.as_tensor().clone(), runtime_w2, scale);
         targets.push(AdapterTarget {
             path: lin.path().to_string(),
