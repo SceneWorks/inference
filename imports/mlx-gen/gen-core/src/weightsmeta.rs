@@ -95,6 +95,10 @@ impl CheckpointMeta {
     }
 
     fn add_file(&mut self, path: &Path) -> Result<()> {
+        // Reads the WHOLE file into `self.buffers` and keeps it — `TensorLoc` indexes into the buffer
+        // for lazy random-access tensor reads. This is intended for adapter-sized checkpoints; calling
+        // `from_dir` on a multi-GB *base-model* dir would hold every file resident (host RAM). An mmap
+        // backing (page on demand) is the efficiency follow-up if base-model use is ever needed (F-038).
         let buf = std::fs::read(path)?;
         // `read_metadata` returns (header_json_len, Metadata); the data region begins at 8 + n and
         // each tensor's data_offsets are relative to it.

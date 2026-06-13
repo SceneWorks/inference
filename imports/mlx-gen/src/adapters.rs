@@ -492,6 +492,9 @@ impl AdaptableLinear {
         match &self.base {
             LinearBase::Dense(l) => l.weight.value.shape().to_vec(),
             LinearBase::Quantized(q) => {
+                // Recover `in = scales_cols · group_size`. Exact only when `in % group_size == 0`,
+                // which always holds for the group-quantized linears here (in is a multiple of the
+                // group size by construction) (F-089).
                 let s = q.scales.value.shape();
                 vec![s[0], s[1] * q.group_size]
             }

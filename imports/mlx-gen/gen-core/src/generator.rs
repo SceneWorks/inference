@@ -271,7 +271,9 @@ pub fn default_seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+        // Fall back to a nonzero value: 0 is the "no seed" sentinel a caller would pass to mean
+        // "pick one", so the default must never itself be 0 (F-089).
+        .unwrap_or(1)
 }
 
 /// Typed conditioning inputs. Each image family uses the subset its `Capabilities` advertises.

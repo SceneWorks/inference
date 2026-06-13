@@ -382,10 +382,16 @@ pub struct FlowMatchSampler {
 }
 
 impl FlowMatchSampler {
-    /// Build from a precomputed sigma schedule (length `num_steps + 1`, trailing `0.0`). Panics if
-    /// fewer than two entries are supplied (a schedule needs at least one step + the terminal `0`).
+    /// Build from a precomputed sigma schedule (length `num_steps + 1`, trailing `0.0`). A schedule
+    /// needs at least one step + the terminal `0`; this is debug-asserted here (the downstream `step`
+    /// indexing requires it) — previously the doc promised a panic the code never enforced (F-086).
     /// FLUX/Qwen feed the raw sigma as the model timestep ([`TimestepConvention::Sigma`]).
     pub fn new(sigmas: Vec<f32>) -> Self {
+        debug_assert!(
+            sigmas.len() >= 2,
+            "FlowMatchSampler::new: schedule needs >= 2 entries (>=1 step + terminal 0), got {}",
+            sigmas.len()
+        );
         Self {
             policy: FlowMatchPolicy::new(sigmas, TimestepConvention::Sigma),
         }

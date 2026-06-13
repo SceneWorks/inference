@@ -69,8 +69,10 @@ fn validate_load_spec(spec: &LoadSpec) -> Result<()> {
         ));
     }
     if spec.quantize.is_some() {
+        // Quantized loading is genuinely unsupported here, not merely "not validated" — state that
+        // plainly so the message doesn't read as a pending/temporary gap (F-086).
         return Err(Error::Msg(
-            "joycaption: quantized loading is not validated".to_owned(),
+            "joycaption: quantized loading is not supported".to_owned(),
         ));
     }
     if spec.control.is_some() {
