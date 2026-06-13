@@ -60,6 +60,13 @@
 //!   next layer). Attention / router / embedding stay dense. The DiT stays dense (its quant is
 //!   sc-3175). Validated vs the bf16 reference captures (Q8 near-lossless, Q4 coherent).
 //!
+//! - **sc-3174** — **LoRA + LoKr** inference consumption on the DiT ([`adapters`] +
+//!   `AdaptableHost for LensTransformer`): the four joint-attention projections
+//!   (`img_qkv`/`txt_qkv`/`to_out.0`/`to_add_out`, the trainer's `DEFAULT_LORA_TARGET_MODULES`) are
+//!   [`AdaptableLinear`](mlx_gen::adapters::AdaptableLinear)s, fed by the shared core seam
+//!   ([`apply_lens_adapters`](adapters::apply_lens_adapters)). Stacked + mixed; the fused QKV merges
+//!   whole (no q/k/v split); a base-`Lens` LoRA applies to `Lens-Turbo` (identical arch). Validated
+//!   vs torch-PEFT (LoRA + LoKr cosine 0.99998, scale-0 bit-exact no-op).
 //! - **sc-3176** — the optional local **PromptReasoner** ([`reasoner`]): turns the encoder-only
 //!   gpt-oss into a *generating* model (full 24-layer stack + final norm + `lm_head`, an incremental
 //!   KV-cache decode [`text_encoder::gpt_oss::GptOssDecoderLayer::forward_cached`], greedy sampling,
@@ -70,6 +77,7 @@
 //!
 //! The Lens-Turbo engine is complete; only the SceneWorks worker cutover (separate repo) remains.
 
+pub mod adapters;
 pub mod config;
 pub mod dit;
 pub mod pipeline;
