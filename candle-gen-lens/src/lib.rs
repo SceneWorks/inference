@@ -18,4 +18,5 @@
 //! weights are dequantized to bf16 at load (sc-5108 bring-up). The eventual MXFP4 → GGUF Q4 `QMatMul`
 //! transcode that keeps the ~12 GB footprint is sc-5111.
 
+pub mod text;
 pub mod text_encoder;
