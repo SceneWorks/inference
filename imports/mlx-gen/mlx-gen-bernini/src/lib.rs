@@ -20,6 +20,7 @@
 //! snapshot plus a `bernini_renderer.json` knob sidecar that this crate consumes.
 
 pub mod config;
+pub mod convert;
 pub mod forward;
 pub mod guidance;
 pub mod pipeline;
