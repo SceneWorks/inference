@@ -21,4 +21,5 @@
 
 pub mod config;
 pub mod dit;
+pub mod pipeline;
 pub mod vae;
