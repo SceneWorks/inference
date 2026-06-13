@@ -185,14 +185,15 @@ impl BerniniPlanner {
 
         let qw = Weights::from_file(root.join("qwen2_5_vl.safetensors"))?;
         let mut backbone = Qwen25VlText::from_weights(&qw, qcfg, "model")?;
-        let mut vision = VisionTower::from_weights(&qw, vcfg, "visual")?;
+        let vision = VisionTower::from_weights(&qw, vcfg, "visual")?;
 
         let cw = Weights::from_file(root.join("connector.safetensors"))?;
-        let mut connector = MlpConnector::from_weights(&cw, "")?;
+        // Kept dense (see the quant policy below) — small + the clip_diff runs the MAR flow loop.
+        let connector = MlpConnector::from_weights(&cw, "")?;
 
         let knobs = PlannerKnobs::from_dir(root);
         let vw = Weights::from_file(root.join("vit_decoder.safetensors"))?;
-        let mut clip_diff = DiffLossFm::from_weights(
+        let clip_diff = DiffLossFm::from_weights(
             &vw,
             "net",
             knobs.clip_diff_depth,
@@ -206,11 +207,17 @@ impl BerniniPlanner {
             .require("mask_tokens")?
             .take_axis(Array::from_slice(&[0i32], &[1]), 1)?;
 
+        // sc-5146 conservative quant policy: quantize the Qwen2.5-VL **LLM** linears — the planner
+        // footprint that matters (~7B params, ~14GB bf16; all dims divisible by the group-64 quant
+        // size). Everything else on the planner side stays DENSE *where quant is unsafe or not worth
+        // it*: the **vision tower** (~0.6B) has group-64-misaligned linears (MLP intermediate 3420,
+        // folded patch-embed 1176) so it cannot be affine-quantized at group 64; the **connector**
+        // (~0.2GB) and **clip_diff** flow head (~1.6GB) are small and clip_diff runs ~75× through the
+        // MAR planning loop with triple-CFG where 4-bit error would compound. The two heavy renderer
+        // experts carry the dominant footprint (~56GB → ~28GB Q8 / ~14GB Q4) and are quantized
+        // separately. `quantize` eval-frees the bf16 transient at load (sensenova/lens pattern).
         if let Some(q) = quant {
             backbone.quantize(q.bits())?;
-            vision.quantize(q.bits())?;
-            connector.quantize(q.bits())?;
-            clip_diff.quantize(q.bits())?;
         }
 
         let template =
