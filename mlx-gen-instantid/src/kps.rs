@@ -126,7 +126,9 @@ pub(crate) fn ellipse2poly(center: (i32, i32), axes: (i32, i32), angle: i32) -> 
     while ang > 360 {
         ang -= 360;
     }
-    let a_idx = ang + if ang < 0 { 360 } else { 0 };
+    // `ang` is already normalized to [0, 360] by the loops above, so the old `if ang < 0` correction
+    // here was dead (F-089).
+    let a_idx = ang;
     let cos_rot = SIN_TABLE[(450 - a_idx) as usize]; // `cosval` from sincos
     let sin_rot = SIN_TABLE[a_idx as usize]; // `sinval`
     let (cx, cy) = (center.0 as f64, center.1 as f64);
