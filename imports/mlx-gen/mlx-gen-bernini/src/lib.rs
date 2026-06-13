@@ -29,3 +29,4 @@ pub mod pipeline;
 pub mod preprocess;
 pub mod qwen2_5_vl;
 pub mod rope;
+pub mod vision;
