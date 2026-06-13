@@ -1,0 +1,23 @@
+[package]
+name = "candle-gen-lens"
+version = "0.0.0"
+edition = "2021"
+description = "Lens / Lens-Turbo (gpt-oss-20b MoE encoder + dual-stream MMDiT + Flux.2 VAE) text-to-image provider crate for candle-gen — the Windows/CUDA sibling of the mlx-gen Lens port (epic 3164). Epic 5107."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "lens", "text-to-image", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# Lens is a from-scratch candle port. The gpt-oss-20b text encoder is built in-crate on `candle_nn`
+# primitives (sc-5108): candle-transformers ships no `gpt_oss` (Gate-0 spike, epic 5107 — upstream
+# PRs #3129/#3581/#3391 are all unmerged), and it is used encoder-only with multi-layer hidden
+# capture, which no upstream model exposes. The decoder is adapted from the verified-parity reference
+# in candle PR #3581 (attention sinks + YaRN + sliding/full + clamped-SwiGLU + MXFP4 expert dequant).
+
+[features]
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+flash-attn = ["candle-gen/flash-attn"]
