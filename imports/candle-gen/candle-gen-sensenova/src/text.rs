@@ -18,6 +18,25 @@ use std::path::Path;
 use candle_gen::{CandleError, Result};
 use tokenizers::Tokenizer;
 
+/// NEO-Unify special-token ids (from the snapshot's `added_tokens.json`). Used by the understanding
+/// surface (VQA / interleave) — the `<IMG_CONTEXT>` splice target, the `<img>`/`</img>` image
+/// boundary, and the ChatML / think stop ids the AR decode watches for. The full set is kept as the
+/// documented reference vocab (the candle slice consumes only a subset today).
+#[allow(dead_code)]
+pub mod tokens {
+    pub const ENDOFTEXT: i32 = 151643;
+    pub const IM_START: i32 = 151644;
+    pub const IM_END: i32 = 151645;
+    pub const THINK: i32 = 151667;
+    pub const THINK_END: i32 = 151668;
+    pub const IMG_CONTEXT: i32 = 151669;
+    /// `<img>` — the reference's `img_start_token_id`.
+    pub const IMG_START: i32 = 151670;
+    /// `</img>`.
+    pub const IMG_END: i32 = 151671;
+    pub const PAD: i32 = 151643;
+}
+
 /// The image-generation system message (verbatim from the reference `utils.SYSTEM_MESSAGE_FOR_GEN`).
 pub const SYSTEM_MESSAGE_FOR_GEN: &str = concat!(
     "You are an image generation and editing assistant that accurately understands and executes ",
@@ -37,6 +56,21 @@ pub const SYSTEM_MESSAGE_FOR_GEN: &str = concat!(
     "- For any visible text in the image, follow the language specified for the rendered text in ",
     "the user's description, not the language of the prompt. If no language is specified, use the ",
     "user's input language."
+);
+
+/// The interleaved text-image system message (verbatim from the reference
+/// `examples/interleave/inference.py::DEFAULT_SYSTEM_MESSAGE`) — required for Document Studio's
+/// think-mode interleave protocol or the model won't interleave correctly.
+pub const INTERLEAVE_SYSTEM_MESSAGE: &str = concat!(
+    "You are a multimodal assistant capable of reasoning with both text and images. You support ",
+    "two modes:\n\nThink Mode: When reasoning is needed, you MUST start with a <think></think> ",
+    "block and place all reasoning inside it. You MUST interleave text with generated images using ",
+    "tags like <image1>, <image2>. Images can ONLY be generated between <think> and </think>, and ",
+    "may be referenced in the final answer.\n\nNon-Think Mode: When no reasoning is needed, directly ",
+    "provide the answer without reasoning. Do not use tags like <image1>, <image2>; present any ",
+    "images naturally alongside the text.\n\nAfter the think block, always provide a concise, ",
+    "user-facing final answer. The answer may include text, images, or both. Match the user's ",
+    "language in both reasoning and the final answer."
 );
 
 /// Build the `neo1_0` ChatML prompt: optional system block + the user turn + the empty assistant
@@ -117,6 +151,14 @@ impl SenseNovaTokenizer {
             .encode(text, add_special)
             .map_err(|e| CandleError::Msg(format!("sensenova: tokenize: {e}")))?;
         Ok(enc.get_ids().iter().map(|&id| id as i32).collect())
+    }
+
+    /// Decode token `ids` back to text. `skip_special` drops the NEO-Unify / ChatML special tokens
+    /// (the understanding decode passes `true` so the answer text excludes `<|im_end|>` etc.).
+    pub fn decode(&self, ids: &[u32], skip_special: bool) -> Result<String> {
+        self.inner
+            .decode(ids, skip_special)
+            .map_err(|e| CandleError::Msg(format!("sensenova: detokenize: {e}")))
     }
 }
 
