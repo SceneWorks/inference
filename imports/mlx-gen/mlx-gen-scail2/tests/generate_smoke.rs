@@ -3,10 +3,11 @@
 //! Two tiers:
 //!   * `missing_reference_errors` (CI) — drives the registered provider with an empty request and
 //!     checks the conditioning-extraction wiring rejects it cleanly (no weights touched).
-//!   * `generate_e2e_smoke` (`#[ignore]`, real-weight) — runs the full preprocessing → plain-CFG
-//!     denoise → VAE-decode pipeline on synthetic inputs at a small resolution / few steps and
-//!     asserts a sane video comes out. This proves the loop *runs*; numeric parity vs. the upstream
-//!     `SCAIL2Pipeline.generate` is the sc-5446 gate.
+//!   * `generate_{animation,replacement}_smoke` (`#[ignore]`, real-weight) — run the full
+//!     preprocessing → plain-CFG denoise → VAE-decode pipeline per driving mode on synthetic inputs at
+//!     a small resolution / few steps and assert a sane video comes out. They prove the loop *runs*
+//!     end-to-end; per-step numeric parity vs. the upstream forward is the `dit_real_parity` gate
+//!     (sc-5446).
 //!
 //! Run the real-weight smoke on macOS against the assembled snapshot:
 //! `cargo test -p mlx-gen-scail2 --test generate_smoke -- --ignored --nocapture`
@@ -96,9 +97,9 @@ fn missing_reference_errors() {
     );
 }
 
-#[test]
-#[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
-fn generate_e2e_smoke() {
+/// Run the full pipeline once for one driving mode (`replace=false` → animation,
+/// `replace=true` → cross-identity replacement via `video_mode`) and assert a sane video.
+fn run_mode(label: &str, replace: bool) {
     let size = env_usize("SCAIL2_SMOKE_SIZE", 256);
     let n_frames = env_usize("SCAIL2_SMOKE_FRAMES", 13);
     let steps = env_usize("SCAIL2_SMOKE_STEPS", 8);
@@ -127,6 +128,7 @@ fn generate_e2e_smoke() {
         steps: Some(steps as u32),
         seed: Some(7),
         fps: Some(16),
+        video_mode: replace.then(|| "replacement".to_string()),
         conditioning: vec![
             Conditioning::Reference {
                 image: reference,
@@ -181,7 +183,19 @@ fn generate_e2e_smoke() {
     }
     assert!(hi > lo, "decoded video is a single flat value ({lo})");
     println!(
-        "generate_e2e_smoke: {} frames @ {size}x{size}, {steps} steps, byte range [{lo},{hi}]",
+        "{label}: {} frames @ {size}x{size}, {steps} steps, byte range [{lo},{hi}]",
         frames.len()
     );
+}
+
+#[test]
+#[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
+fn generate_animation_smoke() {
+    run_mode("animation", false);
+}
+
+#[test]
+#[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
+fn generate_replacement_smoke() {
+    run_mode("replacement", true);
 }
