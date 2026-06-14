@@ -250,6 +250,10 @@ impl LensPipeline {
             let noise_pred = cfg_rescale(&parts[0], &parts[1], guidance_scale)?;
 
             latents = schedule.step(&latents, &noise_pred, i)?;
+            // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399):
+            // MLX is lazy, so without it the whole denoise is one un-cancellable graph run at
+            // decode. Output-neutral; matches the qwen/sdxl per-step eval.
+            latents.eval()?;
             on_step(i + 1, num_steps);
         }
         Ok(latents)

@@ -93,6 +93,10 @@ pub fn denoise_with_progress(
         }
         let velocity = transformer.forward_with(&prep, &latents, scheduler.timestep(t))?;
         latents = scheduler.step(&latents, &velocity, t)?;
+        // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399): MLX is
+        // lazy, so without it the whole denoise is one un-cancellable graph run at decode.
+        // Output-neutral; matches the qwen/sdxl per-step eval.
+        latents.eval()?;
         on_progress(Progress::Step {
             current: (t - start_step) as u32 + 1,
             total,
@@ -157,6 +161,10 @@ pub fn denoise_control_with_progress(
             None,
         )?;
         latents = scheduler.step(&latents, &velocity, t)?;
+        // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399): MLX is
+        // lazy, so without it the whole denoise is one un-cancellable graph run at decode.
+        // Output-neutral; matches the qwen/sdxl per-step eval.
+        latents.eval()?;
         on_progress(Progress::Step {
             current: (t - start_step) as u32 + 1,
             total,
