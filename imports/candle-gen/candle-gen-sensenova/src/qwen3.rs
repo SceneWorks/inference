@@ -260,10 +260,14 @@ fn repeat_kv_bhsd(x: &Tensor, groups: usize) -> CResult<Tensor> {
         .reshape((b, hkv * groups, s, d))
 }
 
-/// The dense dual-path Qwen3 backbone: token embeddings, the decoder stack, and the dual final norm.
-/// (The `lm_head` is not loaded — the non-think T2I path needs no logits.)
+/// The dense dual-path Qwen3 backbone: token embeddings, the decoder stack, the dual final norm, and
+/// the `lm_head`. The T2I path needs no logits; the understanding path (VQA / interleave) projects
+/// the final-normed hidden states through [`lm_head`](Qwen3Backbone::lm_head) to decode text.
 pub struct Qwen3Backbone {
     embed_tokens: Tensor,
+    /// Output projection to vocab logits. The 8B-MoT ships an untied `lm_head`; a tied config reuses
+    /// `embed_tokens`. Stored as a bias-less `Linear` (`hidden @ W.T → [.., vocab]`).
+    lm_head: Linear,
     layers: Vec<Layer>,
     norm: Tensor,
     norm_gen: Tensor,
@@ -297,8 +301,17 @@ impl Qwen3Backbone {
         let layers = (0..cfg.llm.num_hidden_layers)
             .map(|i| Layer::from_weights(vb, &format!("{model}.layers.{i}")))
             .collect::<Result<Vec<_>>>()?;
+        let embed_tokens = vb.get_unchecked(&format!("{model}.embed_tokens.weight"))?;
+        // The 8B-MoT ships an untied `lm_head` (`{prefix}.lm_head.weight`); a tied config reuses the
+        // token-embedding matrix (`hidden @ embed_tokens.T`). Either way it is a bias-less Linear.
+        let lm_head = if cfg.tie_word_embeddings {
+            Linear::new(embed_tokens.clone(), None)
+        } else {
+            load_linear_no_bias(vb, &format!("{prefix}.lm_head"))?
+        };
         Ok(Self {
-            embed_tokens: vb.get_unchecked(&format!("{model}.embed_tokens.weight"))?,
+            embed_tokens,
+            lm_head,
             layers,
             norm: vb.get_unchecked(&format!("{model}.norm.weight"))?,
             norm_gen: vb.get_unchecked(&format!("{model}.norm_mot_gen.weight"))?,
@@ -320,6 +333,13 @@ impl Qwen3Backbone {
         let g = self.embed_tokens.index_select(&idx, 0)?; // [s, hidden]
         let h = self.embed_tokens.dim(1)?;
         g.reshape((1, s, h))
+    }
+
+    /// Project final-normed hidden states `[.., hidden]` to vocab logits `[.., vocab]`
+    /// (`hidden @ lm_head.T`). The understanding path slices the kept hidden row before calling this
+    /// so the projection materializes a `[.., 1, vocab]` row, not the whole prefix.
+    pub fn lm_head(&self, hidden: &Tensor) -> CResult<Tensor> {
+        self.lm_head.forward(hidden)
     }
 
     /// Merge the 8-step distill LoRA into every layer's **generation-path** attention projections +

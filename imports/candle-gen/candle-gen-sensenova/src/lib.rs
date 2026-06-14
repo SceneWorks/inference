@@ -14,15 +14,22 @@
 //!
 //! Two registered ids share the loader: **`sensenova_u1_8b`** (50 NFE, CFG 4.0) and
 //! **`sensenova_u1_8b_fast`** (8 NFE, CFG 1.0 — its loader merges the 8-step distill LoRA into the
-//! dense generation path). Both advertise **only** the wired T2I surface — image-edit / Character
-//! Studio (it2i), VQA, interleave, think-mode, user LoRAs, and quantization (all in the mlx provider)
-//! are NOT advertised and are rejected rather than silently dropped. `backend` is `"candle"` and
-//! `mac_only` is `false`.
+//! dense generation path). Both advertise **only** the wired T2I surface through the `Generator`
+//! contract — image-edit / Character Studio (it2i), user LoRAs, and quantization are NOT advertised
+//! and are rejected rather than silently dropped. `backend` is `"candle"` and `mac_only` is `false`.
+//!
+//! **Understanding surface (VQA + interleave, sc-5501):** SenseNova-U1's text / text+image modes
+//! ([`T2iModel::vqa`], [`T2iModel::interleave_gen`]) output what the neutral
+//! [`GenerationOutput`](gen_core::GenerationOutput) contract can't express, so they are exposed as
+//! direct methods on the concrete [`T2iModel`] (built via [`load_understanding`]) and driven by the
+//! worker off-registry — the candle sibling of `mlx-gen-sensenova`'s `T2iModel::{vqa, interleave_gen}`
+//! carve-outs. This retires the `sensenova_u1` VQA / interleave torch paths off-Mac.
 
 mod config;
 mod distill;
 mod fm;
 mod qwen3;
+mod runtime;
 mod t2i;
 mod text;
 mod vision;
@@ -39,10 +46,18 @@ use candle_gen::gen_core::{
 };
 use candle_gen::{CandleError, Result};
 
-use config::NeoChatConfig;
 use distill::{resolve_distill_lora, DistillLora, DISTILL_LORA_FILE};
-use t2i::{tensor_to_image, T2iModel, T2iOptions};
-use text::SenseNovaTokenizer;
+
+// The understanding surface (VQA + Document-Studio interleave) is driven by the worker **directly**
+// off the concrete `T2iModel` (its text / text+image output the neutral `Generator` contract can't
+// express), so re-export the types + a dense loader the worker assembles them from.
+pub use config::NeoChatConfig;
+pub use runtime::Sampler;
+pub use t2i::{
+    interleave_resolution_for, smart_resize, tensor_to_image, CfgNorm, InterleaveOutput, T2iModel,
+    T2iOptions, INTERLEAVE_RESOLUTIONS,
+};
+pub use text::{SenseNovaTokenizer, INTERLEAVE_SYSTEM_MESSAGE};
 
 /// Registry id — the base 8B-MoT variant.
 pub const MODEL_ID: &str = "sensenova_u1_8b";
@@ -266,6 +281,20 @@ fn f32_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
     }
     // SAFETY: mmap of read-only weight files; the standard candle loading path.
     Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F32, device)? })
+}
+
+/// Build the dense f32 understanding model ([`T2iModel`]) + tokenizer for a SenseNova-U1-8B-MoT
+/// snapshot — the VQA / interleave entry the worker drives directly (the modes the neutral
+/// `Generator` contract can't express). Loads **dense** (no distill LoRA, no quantization), exactly
+/// like the base registry path, so the understanding decode uses the full base model. The heavy mmap
+/// happens here, so the worker calls this once on its blocking thread per job.
+pub fn load_understanding(root: &Path) -> Result<(T2iModel, SenseNovaTokenizer)> {
+    let cfg = NeoChatConfig::from_dir(root)?;
+    let device = candle_gen::default_device()?;
+    let vb = f32_vb(root, &device)?;
+    let model = T2iModel::from_weights(&vb, &cfg)?;
+    let tokenizer = SenseNovaTokenizer::from_dir(root)?;
+    Ok((model, tokenizer))
 }
 
 /// Construct the (lazy) base candle SenseNova-U1 generator (`sensenova_u1_8b`).
