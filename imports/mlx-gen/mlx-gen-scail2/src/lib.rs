@@ -27,9 +27,11 @@ pub mod clip;
 pub mod config;
 pub mod model;
 pub mod pipeline;
+pub mod preprocess;
 pub mod rope;
 
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
 pub use model::{Scail2Dit, Scail2Inputs};
+pub use preprocess::extract_and_compress_mask_to_latent;
 pub use rope::ScailRope;
