@@ -7,7 +7,7 @@
 //! → **pack** to the transformer token sequence `[1, (height/16)·(width/16), 128]`. txt2img
 //! samples noise directly in the packed 128-channel space.
 
-use mlx_gen::image::resize_lanczos_u8;
+use mlx_gen::image::{resize_lanczos_u8, validate_multiple_of_16};
 use mlx_gen::media::Image;
 use mlx_gen::{Error, FlowMatchEuler, Result};
 use mlx_rs::ops::{add, multiply};
@@ -107,7 +107,7 @@ pub fn prepare_text_ids(seq: usize) -> Array {
 /// Mirrors `Flux2LatentCreator.prepare_packed_latents` — sample at `[1, in_channels, lat_h,
 /// lat_w]` then pack — so the seeded RNG and token order match the fork (verified e2e in S4).
 pub fn create_noise(seed: u64, width: u32, height: u32, in_channels: usize) -> Result<Array> {
-    validate_multiple_of_16(width, height)?;
+    validate_multiple_of_16(width, height, "flux2")?;
     let key = random::key(seed)?;
     let lat_h = (height / 16) as i32;
     let lat_w = (width / 16) as i32;
@@ -176,15 +176,6 @@ pub fn add_noise_by_interpolation(clean: &Array, noise: &Array, sigma: f32) -> R
     let one_minus = Array::from_slice(&[1.0 - sigma], &[1]);
     let s = Array::from_slice(&[sigma], &[1]);
     Ok(add(&multiply(clean, &one_minus)?, &multiply(noise, &s)?)?)
-}
-
-fn validate_multiple_of_16(width: u32, height: u32) -> Result<()> {
-    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
-        return Err(Error::Msg(format!(
-            "flux2: width and height must be multiples of 16, got {width}x{height}"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
