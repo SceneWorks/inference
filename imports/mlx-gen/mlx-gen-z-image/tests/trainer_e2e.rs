@@ -302,3 +302,100 @@ fn z_image_trainer_lokr_trains_and_reloads() {
         "[trainer-lokr] e2e OK — reloaded LoKr applied to {n_targets} targets, forward finite"
     );
 }
+
+/// sc-5637 — preview samples. A short run with `sample_every`/`sample_prompts` set must emit
+/// `TrainingProgress::Sample` events at the cadence, each carrying a real decoded RGB bitmap
+/// (`width·height·3` non-empty pixels) rendered from the in-progress adapter. Proves the engine
+/// render path (install in-progress adapter → txt2img denoise → VAE decode → `Image`) works on real
+/// weights — the part the worker persists as a project asset. Tiny resolution (64) keeps the
+/// per-cadence inference cheap. Run:
+///   cargo test -p mlx-gen-z-image --release --test trainer_e2e -- --ignored --nocapture z_image_trainer_emits_preview_samples
+#[test]
+#[ignore = "needs real Z-Image weights"]
+fn z_image_trainer_emits_preview_samples() {
+    let tmp = std::env::temp_dir().join("z_image_trainer_samples_e2e");
+    let items = make_dataset(&tmp);
+    assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
+
+    let mut trainer = mlx_gen::load_trainer(
+        "z_image_turbo",
+        &LoadSpec::new(WeightsSource::Dir(snapshot())),
+    )
+    .expect("z_image_turbo trainer should be registered");
+
+    let config = TrainingConfig {
+        rank: 8,
+        alpha: 8.0,
+        learning_rate: 1e-3,
+        steps: 8,
+        resolution: 64, // 8x8 latent — fast inference per preview
+        save_every: 0,
+        seed: 7,
+        // Sample at steps 4 and 8 (two cadences) over two prompts.
+        sample_every: 4,
+        sample_steps: 4,
+        sample_guidance_scale: 1.0,
+        sample_prompts: vec![
+            "a solid red colour swatch".to_string(),
+            "a solid blue colour swatch".to_string(),
+        ],
+        ..Default::default()
+    };
+    let req = TrainingRequest {
+        items,
+        config,
+        output_dir: tmp.join("out"),
+        file_name: "swatch_lora.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut samples: Vec<(u32, u32, u32, String, usize)> = Vec::new(); // (step, index, total, prompt, pixels)
+    trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Sample {
+                step,
+                index,
+                total,
+                prompt,
+                image,
+            } = p
+            {
+                samples.push((step, index, total, prompt, image.pixels.len()));
+                // Every preview must be a real, correctly-sized RGB bitmap.
+                assert!(
+                    image.width > 0 && image.height > 0,
+                    "preview has dimensions"
+                );
+                assert_eq!(
+                    image.pixels.len(),
+                    (image.width * image.height * 3) as usize,
+                    "preview is a packed RGB8 buffer"
+                );
+                assert!(
+                    image.pixels.iter().any(|&b| b != 0),
+                    "preview is not an all-black/empty frame"
+                );
+            }
+        })
+        .expect("training with sampling should succeed");
+
+    // Two cadences (steps 4 and 8) × two prompts = four previews.
+    assert_eq!(
+        samples.len(),
+        4,
+        "expected 4 preview samples, got {samples:?}"
+    );
+    assert!(
+        samples.iter().any(|(step, ..)| *step == 4) && samples.iter().any(|(step, ..)| *step == 8),
+        "previews fire at the configured cadence (steps 4 and 8): {samples:?}"
+    );
+    assert!(
+        samples.iter().all(|(_, _, total, ..)| *total == 2),
+        "each cadence reports 2 prompts"
+    );
+    println!(
+        "[trainer-samples] e2e OK — {} previews: {samples:?}",
+        samples.len()
+    );
+}
