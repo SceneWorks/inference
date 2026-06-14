@@ -350,6 +350,54 @@ impl LensPipeline {
     }
 }
 
+/// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed on
+/// `transformer`: seeded init latents → flow-match Euler norm-rescaled-CFG denoise → VAE decode →
+/// [`Image`]. A stripped [`LensPipeline::denoise`] + decode for the trainer (which holds the raw DiT +
+/// VAE, not a `LensPipeline` — the gpt-oss encoder is freed after caching). `encoder_features`/
+/// `encoder_mask` are the pre-encoded joint CFG batch (`[2, …]` = positive then empty-negative);
+/// `dtype` is the trainer compute dtype. No progress/cancel plumbing — the caller drives the cadence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_sample(
+    transformer: &LensTransformer,
+    vae: &Flux2Vae,
+    encoder_features: &[Array],
+    encoder_mask: &Array,
+    seed: u64,
+    edge: u32,
+    num_steps: usize,
+    guidance_scale: f32,
+    dtype: Dtype,
+) -> Result<Image> {
+    let latent = (edge / VAE_SCALE_FACTOR) as usize;
+    let seq_len = (latent * latent) as i32;
+    let schedule = lens_schedule(num_steps.max(1), latent, latent);
+    let timesteps = schedule::timesteps(&schedule);
+    mlx_rs::random::seed(seed)?;
+    let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
+    let mut latents = init.as_dtype(dtype)?;
+    for (i, &sigma) in timesteps.iter().enumerate() {
+        // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call (mirrors
+        // `LensPipeline::denoise`).
+        let hidden = concatenate_axis(&[&latents, &latents], 0)?;
+        let timestep = Array::from_slice(&[sigma, sigma], &[2]).as_dtype(dtype)?;
+        let noise = transformer.forward(
+            &hidden,
+            encoder_features,
+            Some(encoder_mask),
+            &timestep,
+            1,
+            latent,
+            latent,
+        )?;
+        let parts = split(&noise, 2, 0)?;
+        let noise_pred = cfg_rescale(&parts[0], &parts[1], guidance_scale)?;
+        latents = schedule.step(&latents, &noise_pred, i)?;
+        latents.eval()?;
+    }
+    let decoded = vae::decode(vae, &latents, latent, latent)?;
+    decoded_to_image(&decoded)
+}
+
 /// Zero-pad each `[B, cur, C]` feature layer along the sequence axis to length `target`.
 fn pad_features(features: &[Array], cur: i32, target: i32) -> Result<Vec<Array>> {
     if cur == target {

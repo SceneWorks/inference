@@ -43,9 +43,9 @@ use mlx_gen::train::lora::{
 pub use mlx_gen::train::lora::LoraTarget;
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::{
-    LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
-    TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    FlowMatchEuler, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
+    TrainerDescriptor, TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress,
+    TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -54,7 +54,7 @@ use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
-use crate::model::MODEL_ID;
+use crate::model::{MODEL_ID, SCHEDULE_SHIFT};
 use crate::pipeline::encode_init_latents;
 use crate::text_encoder::TextEncoder;
 use crate::transformer::ZImageTransformer;
@@ -63,6 +63,10 @@ use crate::vae::Vae;
 /// Z-Image reconstructs its LoKr delta at **bf16** (the bf16-residual inference path); training must
 /// match so the adapter round-trips bit-for-bit.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
+
+/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637); the
+/// SceneWorks UI sends four (`samplePromptsFromTrigger`). A hard cap bounds the per-cadence cost.
+const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// `(x_t, target, timestep)` for a single sample at flow-match `sigma`:
 /// `x_t = (1-σ)·x0 + σ·noise`, `target = noise - x0`, `timestep = 1-σ`.
@@ -338,11 +342,55 @@ impl ZImageTurboTrainer {
             return Err("z_image_turbo trainer: no usable dataset items".into());
         }
 
+        // sc-5637 — pre-encode the preview-sample prompts while the Qwen encoder is still resident
+        // (it is freed just below, sc-4952). Each `sample_every` cadence reuses these cached cap
+        // embeddings to render previews from the in-progress adapter, so the encoder need not stay
+        // loaded. Skipped entirely when sampling is off (the default) or the run is already cancelled.
+        let sample_caps: Vec<(String, Array)> = if cfg.sample_every > 0
+            && !cfg.sample_prompts.is_empty()
+            && !req.cancel.is_cancelled()
+        {
+            let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
+                mlx_gen::Error::Msg(
+                    "z_image_turbo trainer: text encoder already freed (sample pre-encode)".into(),
+                )
+            })?;
+            let mut caps = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
+            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                // Match the txt2img generate path: round caption embeddings to the DiT compute
+                // dtype (bf16) when training bf16 so the preview denoise runs the parity-proven
+                // single-dtype stream (f32 stays f32).
+                let cap = crate::pipeline::encode_prompt(
+                    &self.tokenizer,
+                    text_encoder,
+                    prompt,
+                    "z_image_turbo trainer (sample)",
+                )?;
+                let cap = if compute_dtype == Dtype::Float32 {
+                    cap
+                } else {
+                    cap.as_dtype(compute_dtype)?
+                };
+                eval([&cap])?;
+                caps.push((prompt.clone(), cap));
+            }
+            caps
+        } else {
+            Vec::new()
+        };
+
         // sc-4952 (32 GB-Mac support) — every prompt is now encoded into `cache`, so the Qwen text
         // encoder is dead weight for the rest of the run. Drop it and evict its buffers before the
         // train loop, reclaiming that resident for the DiT working set.
         self.text_encoder = None;
         mlx_rs::memory::clear_cache();
+
+        // sc-5637 — the preview-sample scheduler (constant; z-image is guidance-distilled so the
+        // configured sample guidance scale is inert, matching the txt2img generate path). Built once,
+        // only when sampling is enabled.
+        let sample_scheduler = (!sample_caps.is_empty()).then(|| {
+            FlowMatchEuler::for_static_shift(cfg.sample_steps.max(1) as usize, SCHEDULE_SHIFT)
+        });
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let target_paths = resolve_target_paths(&self.transformer, cfg);
@@ -510,6 +558,60 @@ impl ZImageTurboTrainer {
                 let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
                 adapter.save(&params, alpha, rank, cfg.decompose_factor, "", &ckpt)?;
                 on_progress(TrainingProgress::Checkpoint { step });
+            }
+
+            // sc-5637 — periodic preview samples from the in-progress adapter so the user can watch
+            // the LoRA learn (the Python trainer did this; the native port dropped it). Install the
+            // current factors as concrete adapters for the forward-only render; the next step's traced
+            // `loss_fn` re-installs them, so no teardown is needed. Inference is far cheaper than the
+            // training backward that already fits this machine, so no extra memory guard is warranted.
+            if let Some(scheduler) = &sample_scheduler {
+                if step % cfg.sample_every == 0 {
+                    let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
+                    adapter.install_as(
+                        &mut self.transformer,
+                        &params,
+                        alpha,
+                        rank,
+                        lora_dtype,
+                        LOKR_DTYPE,
+                    )?;
+                    let total = sample_caps.len() as u32;
+                    for (i, (prompt, cap)) in sample_caps.iter().enumerate() {
+                        if req.cancel.is_cancelled() {
+                            break;
+                        }
+                        let sample_seed = cfg
+                            .seed
+                            .wrapping_add(step as u64)
+                            .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
+                            .wrapping_add(i as u64);
+                        // Previews are best-effort: a render failure must NOT abort the (expensive,
+                        // long-running) training run — log it and keep training (sc-5637).
+                        match crate::pipeline::render_sample(
+                            &self.transformer,
+                            &self.vae,
+                            scheduler,
+                            cap,
+                            sample_seed,
+                            edge,
+                            compute_dtype,
+                        ) {
+                            Ok(image) => on_progress(TrainingProgress::Sample {
+                                step,
+                                index: i as u32 + 1,
+                                total,
+                                prompt: prompt.clone(),
+                                image,
+                            }),
+                            Err(e) => eprintln!(
+                                "[sc-5637] {MODEL_ID} preview sample failed at step {step} \
+                                 (prompt {}): {e} — skipping this preview, training continues",
+                                i + 1
+                            ),
+                        }
+                    }
+                }
             }
         }
 

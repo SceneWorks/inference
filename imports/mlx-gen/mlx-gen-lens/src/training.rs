@@ -76,7 +76,7 @@ use mlx_gen::{
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
-use mlx_rs::ops::{add, multiply, ones, split_sections, subtract};
+use mlx_rs::ops::{add, concatenate_axis, multiply, ones, split_sections, subtract, zeros_like};
 use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
@@ -93,6 +93,9 @@ use crate::text_encoder::encoder::LensTextEncoder;
 /// The lens adapter loader reconstructs LoKr deltas at bf16 (`src/adapters/loader.rs`); training must
 /// reconstruct at the same dtype so the trained LoKr round-trips through `apply_lens_adapters`.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
+
+/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
+const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// The gpt-oss encoder is loaded Q8 for the trainer (~12 GB vs ~40 GB dense bf16): it is frozen and
 /// used only to cache caption features once, then dropped. Q8 is the Lens inference default (sc-3172),
@@ -398,6 +401,38 @@ impl LensTrainer {
             return Err("lens trainer: no usable dataset items".into());
         }
 
+        // sc-5637 — pre-encode the preview-sample prompts into the joint CFG batch (`[2, …]` =
+        // positive then empty-negative) while the 20 B-param encoder is still resident (freed just
+        // below). Empty negative ⇒ zero features + zero mask (the `LensPipeline::encode_prompt`
+        // convention); Lens previews use norm-rescaled CFG, so both streams are needed.
+        let sample_caps: Vec<(String, Vec<Array>, Array)> = if cfg.sample_every > 0
+            && !cfg.sample_prompts.is_empty()
+            && !req.cancel.is_cancelled()
+        {
+            let encoder = self.encoder.as_ref().ok_or_else(|| {
+                Error::Msg("lens trainer: text encoder already freed (sample pre-encode)".into())
+            })?;
+            let mut caps = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
+            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                let (pos_feats, pos_mask) =
+                    encode_caption(&self.tokenizer, encoder, prompt, compute_dtype)?;
+                let features = pos_feats
+                    .iter()
+                    .map(|f| Ok(concatenate_axis(&[f, &zeros_like(f)?], 0)?))
+                    .collect::<Result<Vec<_>>>()?;
+                let mask = concatenate_axis(&[&pos_mask, &zeros_like(&pos_mask)?], 0)?;
+                let mut to_eval: Vec<&Array> = Vec::with_capacity(features.len() + 1);
+                to_eval.push(&mask);
+                to_eval.extend(features.iter());
+                eval(to_eval)?;
+                caps.push((prompt.clone(), features, mask));
+            }
+            caps
+        } else {
+            Vec::new()
+        };
+        let sampling_enabled = !sample_caps.is_empty();
+
         // Every caption is cached now — free the 20 B-param encoder and evict its buffers before the
         // train loop, reclaiming that resident for the DiT working set.
         self.encoder = None;
@@ -567,6 +602,56 @@ impl LensTrainer {
                 let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
                 adapter.save(&params, alpha, rank, cfg.decompose_factor, "", &ckpt)?;
                 on_progress(TrainingProgress::Checkpoint { step });
+            }
+
+            // sc-5637 — periodic best-effort previews from the in-progress adapter (mirrors z-image).
+            // Install the current factors as concrete adapters for the forward-only render; the next
+            // step's traced `loss_fn` re-installs them. A render failure must NOT abort the long
+            // training run — log and continue.
+            if sampling_enabled && step % cfg.sample_every == 0 {
+                adapter.install_as(
+                    &mut self.transformer,
+                    &params,
+                    alpha,
+                    rank,
+                    lora_dtype,
+                    LOKR_DTYPE,
+                )?;
+                let total = sample_caps.len() as u32;
+                for (i, (prompt, features, mask)) in sample_caps.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        break;
+                    }
+                    let sample_seed = cfg
+                        .seed
+                        .wrapping_add(step as u64)
+                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
+                        .wrapping_add(i as u64);
+                    match crate::pipeline::render_sample(
+                        &self.transformer,
+                        &self.vae,
+                        features,
+                        mask,
+                        sample_seed,
+                        edge,
+                        cfg.sample_steps.max(1) as usize,
+                        cfg.sample_guidance_scale,
+                        compute_dtype,
+                    ) {
+                        Ok(image) => on_progress(TrainingProgress::Sample {
+                            step,
+                            index: i as u32 + 1,
+                            total,
+                            prompt: prompt.clone(),
+                            image,
+                        }),
+                        Err(e) => eprintln!(
+                            "[sc-5637] {MODEL_ID_BASE} preview sample failed at step {step} \
+                             (prompt {}): {e} — skipping this preview, training continues",
+                            i + 1
+                        ),
+                    }
+                }
             }
         }
 
