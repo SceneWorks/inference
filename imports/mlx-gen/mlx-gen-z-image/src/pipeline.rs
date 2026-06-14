@@ -382,6 +382,32 @@ pub(crate) fn render_batch(
     Ok(images)
 }
 
+/// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed
+/// on `transformer`: seed → noise → flow-match denoise → VAE decode → [`Image`]. A stripped txt2img
+/// of [`render_batch`] (no count loop, no img2img blend, no `GenerationRequest`) for the trainer's
+/// periodic preview. `cap` is the (already dtype-matched) caption conditioning for the sample prompt;
+/// `dtype` is the trainer's compute dtype (bf16/f32) so the noise enters the loop at the same
+/// precision as the cast DiT weights. No progress/cancel plumbing — the caller drives the cadence.
+pub(crate) fn render_sample(
+    transformer: &ZImageTransformer,
+    vae: &Vae,
+    scheduler: &FlowMatchEuler,
+    cap: &Array,
+    seed: u64,
+    edge: u32,
+    dtype: Dtype,
+) -> Result<Image> {
+    let _compile_glue = crate::CompileGlueGuard::enable();
+    let noise = create_noise(seed, edge, edge)?.as_dtype(dtype)?;
+    let latents = denoise(transformer, scheduler, noise, cap)?;
+    // [16,1,H,W] -> [1,16,H,W] -> [1,16,1,H,W] for VAE decode (same as render_batch).
+    let unpacked = unpack_latents(&latents)?;
+    let sh = unpacked.shape();
+    let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]])?;
+    let decoded = vae.decode(&latent5)?.as_dtype(Dtype::Float32)?;
+    decoded_to_image(&decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

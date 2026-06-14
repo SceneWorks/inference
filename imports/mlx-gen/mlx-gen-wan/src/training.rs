@@ -52,9 +52,9 @@ use mlx_gen::train::lora::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    gen_core, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
-    TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    gen_core, CancelFlag, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
+    TrainerDescriptor, TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress,
+    TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -65,7 +65,11 @@ use mlx_rs::{random, Array, Dtype};
 
 use crate::config::WanModelConfig;
 use crate::model::{MODEL_ID as MODEL_ID_TI2V_5B, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B};
-use crate::pipeline::{preprocess_i2v_image, preprocess_ti2v_image};
+use crate::pipeline::{
+    decode_to_frames, decode_to_frames_22, denoise, denoise_moe, frames_to_images,
+    preprocess_i2v_image, preprocess_ti2v_image, Expert,
+};
+use crate::scheduler::SolverKind;
 use crate::text_encoder::{load_tokenizer, Umt5Encoder};
 use crate::transformer::{BlockLoraRef, WanTransformer};
 use crate::vae::WanVae;
@@ -75,9 +79,85 @@ use crate::vae22::Wan22Vae;
 /// so the adapter round-trips.
 const LOKR_DTYPE: Dtype = Dtype::Float32;
 
+/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
+const SAMPLE_PROMPT_CAP: usize = 4;
+
 /// The reference attention LoRA targets `to_q/to_k/to_v/to_out.0` in Wan's **native** naming: the
 /// self/cross-attention `q/k/v/o`. Suffix-matched against the per-block adaptable surface.
 const DEFAULT_TARGET_SUFFIXES: [&str; 4] = ["q", "k", "v", "o"];
+
+/// Render one preview frame (sc-5637) from the **in-progress training adapters** already installed on
+/// `experts`: a single-frame (`F=1`) seeded denoise reusing the family's own inference loop — the
+/// boundary-switched dual-expert [`denoise_moe`] for the A14B MoE, or the dense single-expert
+/// [`denoise`] for TI2V-5B — then VAE decode and the first frame as an [`Image`] (a video LoRA's
+/// preview is a still thumbnail). `ctxs` are this prompt's per-expert [`WanTransformer::embed_text`]
+/// outputs; `latent_shape` is a cached clean latent's `[z, 1, h, w]` (so the init noise matches the
+/// VAE's exact latent geometry without re-deriving the per-family stride). CFG is off (guidance 1.0).
+/// No progress/cancel plumbing — the caller drives the cadence.
+fn render_wan_sample(
+    experts: &[WanTransformer],
+    vae: &WanTrainVae,
+    cfg: &WanModelConfig,
+    ctxs: &[Array],
+    latent_shape: &[i32],
+    seed: u64,
+    steps: usize,
+) -> Result<Image> {
+    let init = random::normal::<f32>(latent_shape, None, None, Some(&random::key(seed)?))?;
+    let kind = SolverKind::from_name("unipc");
+    let ntt = cfg.num_train_timesteps;
+    let shift = cfg.sample_shift;
+    let latents = if experts.len() == 2 {
+        let boundary_ts = cfg.boundary * ntt as f32;
+        let low = Expert {
+            transformer: &experts[0],
+            ctx_cond: ctxs[0].clone(),
+            ctx_uncond: None,
+            guidance: 1.0,
+        };
+        let high = Expert {
+            transformer: &experts[1],
+            ctx_cond: ctxs[1].clone(),
+            ctx_uncond: None,
+            guidance: 1.0,
+        };
+        denoise_moe(
+            &low,
+            &high,
+            boundary_ts,
+            kind,
+            ntt,
+            steps.max(1),
+            shift,
+            &init,
+            None,
+            &CancelFlag::default(),
+            &mut |_| {},
+        )?
+    } else {
+        denoise(
+            &experts[0],
+            kind,
+            ntt,
+            steps.max(1),
+            shift,
+            1.0,
+            &ctxs[0],
+            None,
+            &init,
+            &CancelFlag::default(),
+            &mut |_| {},
+        )?
+    };
+    let frames = match vae {
+        WanTrainVae::Z16(v) => decode_to_frames(v, &latents, None)?,
+        WanTrainVae::Z48(v) => decode_to_frames_22(v, &latents, None)?,
+    };
+    frames_to_images(&frames)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| mlx_gen::Error::Msg("wan trainer: preview produced no frames".into()))
+}
 
 /// The VAE the trainer encodes its dataset through — the family-specific latent space the DiT
 /// regresses velocity in. **z16** 2.1 [`WanVae`] for the 14B T2V/I2V experts; **z48** [`Wan22Vae`]
@@ -353,6 +433,9 @@ impl WanMoeTrainer {
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
         let mut cache: Vec<(Array, Vec<Array>)> = Vec::with_capacity(req.items.len());
+        // sc-5637 — preview-sample prompts, embedded per expert inside the `te`/`tok` scope below
+        // (the UMT5 encoder is freed before the train loop).
+        let mut sample_ctxs: Vec<(String, Vec<Array>)> = Vec::new();
         {
             let te = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(format!("{id} trainer: text encoder missing"))
@@ -383,6 +466,21 @@ impl WanMoeTrainer {
                 eval(to_eval)?;
                 cache.push((clean, ctxs));
             }
+            // sc-5637 — pre-encode the preview-sample prompts (per expert) while the UMT5 encoder is
+            // still resident. Mirrors the per-item embed above: one ctx per expert per prompt.
+            if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !req.cancel.is_cancelled()
+            {
+                for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                    let t5_embed = te.encode(tok, prompt)?;
+                    let mut ctxs = Vec::with_capacity(n_experts);
+                    for e in &self.experts {
+                        ctxs.push(e.embed_text(&t5_embed)?);
+                    }
+                    let to_eval: Vec<&Array> = ctxs.iter().collect();
+                    eval(to_eval)?;
+                    sample_ctxs.push((prompt.clone(), ctxs));
+                }
+            }
         }
         if cache.is_empty() {
             // sc-4895 — a cancel tripped during caching is a genuine cancellation → typed
@@ -396,6 +494,12 @@ impl WanMoeTrainer {
         // Free the UMT5 encoder + tokenizer (~11 GB) before training (the reference frees it post-cache).
         self.text_encoder = None;
         self.tokenizer = None;
+
+        // sc-5637 — preview-sample geometry: a cached clean latent's exact `[z, 1, h, w]` shape (so the
+        // preview's init noise matches the VAE's latent geometry without re-deriving the per-family
+        // spatial stride). Cache is non-empty here (checked above).
+        let sampling_enabled = !sample_ctxs.is_empty();
+        let sample_latent_shape: Vec<i32> = cache[0].0.shape().to_vec();
 
         // --- per-expert adapter targets + factors + optimizer + schedule ---
         let suffixes: Vec<String> = if cfg.lora_target_modules.is_empty() {
@@ -582,6 +686,56 @@ impl WanMoeTrainer {
                     cfg,
                 )?;
                 on_progress(TrainingProgress::Checkpoint { step });
+            }
+
+            // sc-5637 — periodic best-effort preview frames from the in-progress adapters. Install
+            // EVERY expert's current adapter concretely (a render switches experts at the boundary), run
+            // the family inference denoise → decode → first frame. The next train step's traced
+            // `loss_fn` re-installs the active expert's factors, so no teardown is needed. A render
+            // failure logs and is skipped — it never aborts the (long) training run.
+            if sampling_enabled && step % cfg.sample_every == 0 {
+                for (ei2, st) in states.iter().enumerate() {
+                    st.adapter.install(
+                        &mut self.experts[ei2],
+                        &st.params,
+                        alpha,
+                        rank,
+                        LOKR_DTYPE,
+                    )?;
+                }
+                let total = sample_ctxs.len() as u32;
+                for (i, (prompt, ctxs)) in sample_ctxs.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        break;
+                    }
+                    let sample_seed = cfg
+                        .seed
+                        .wrapping_add(step as u64)
+                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
+                        .wrapping_add(i as u64);
+                    match render_wan_sample(
+                        &self.experts,
+                        &self.vae,
+                        &self.cfg,
+                        ctxs,
+                        &sample_latent_shape,
+                        sample_seed,
+                        cfg.sample_steps.max(1) as usize,
+                    ) {
+                        Ok(image) => on_progress(TrainingProgress::Sample {
+                            step,
+                            index: i as u32 + 1,
+                            total,
+                            prompt: prompt.clone(),
+                            image,
+                        }),
+                        Err(e) => eprintln!(
+                            "[sc-5637] {id} preview sample failed at step {step} (prompt {}): {e} \
+                             — skipping this preview, training continues",
+                            i + 1
+                        ),
+                    }
+                }
             }
         }
 

@@ -67,6 +67,9 @@ use crate::vae::LtxVideoVae;
 /// attended with `mask=None`, matching the reference `Modality(context_mask=None)`).
 const MAX_PROMPT_TOKENS: usize = 128;
 
+/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
+const SAMPLE_PROMPT_CAP: usize = 4;
+
 /// The reference `inject_video_attention_lora` default targets (`DEFAULT_LORA_TARGET_MODULES`,
 /// `training_adapters.py:72`), restricted to `attn1`/`attn2`. `to_out.0` is the diffusers spelling
 /// the inference loader normalizes to the checkpoint's `to_out`.
@@ -283,6 +286,9 @@ impl LtxTrainer {
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
         let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len());
+        // sc-5637 — preview-sample prompts, pre-encoded inside the `te`/`tok` scope below (the Gemma
+        // encoder is freed before the train loop). LTX is distilled (no CFG) → one ctx per prompt.
+        let mut sample_ctxs: Vec<(String, Array)> = Vec::new();
         {
             let te = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg("ltx_2_3 trainer: text encoder missing".into())
@@ -308,6 +314,16 @@ impl LtxTrainer {
                 eval([&clean, &ctx])?;
                 cache.push((clean, ctx));
             }
+            // sc-5637 — pre-encode the preview-sample prompts while the encoder is still resident.
+            if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !req.cancel.is_cancelled()
+            {
+                for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                    let (ids, mask) = tok.encode(prompt, MAX_PROMPT_TOKENS)?;
+                    let ctx = to_dtype(&te.encode(&ids, &mask)?, Dtype::Float32)?;
+                    eval([&ctx])?;
+                    sample_ctxs.push((prompt.clone(), ctx));
+                }
+            }
         }
         if cache.is_empty() {
             // sc-4895 — a cancel tripped during caching is a genuine cancellation → typed
@@ -323,8 +339,10 @@ impl LtxTrainer {
         self.text_encoder = None;
         self.tokenizer = None;
 
+        let sampling_enabled = !sample_ctxs.is_empty();
+
         // The RoPE position grid is identical across items at a fixed latent resolution (single
-        // frame) — build it once.
+        // frame) — build it once. Reused for preview-sample rendering (sc-5637).
         let positions = create_position_grid(1, 1, latent_edge, latent_edge);
 
         // --- adapter targets + trainable factors ---
@@ -467,6 +485,54 @@ impl LtxTrainer {
                 let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
                 save_lora(&params, &targets, alpha, cfg.rank, &ckpt)?;
                 on_progress(TrainingProgress::Checkpoint { step });
+            }
+
+            // sc-5637 — periodic best-effort preview frames from the in-progress adapter. Install the
+            // current factors concretely for the forward-only render (the next step's traced `loss_fn`
+            // re-installs them); a render failure logs and is skipped, never failing the training run.
+            if sampling_enabled && step % cfg.sample_every == 0 {
+                let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
+                install_train_lora(
+                    &mut self.transformer,
+                    &params,
+                    &targets,
+                    alpha,
+                    rank,
+                    lora_dtype,
+                )?;
+                let total = sample_ctxs.len() as u32;
+                for (i, (prompt, ctx)) in sample_ctxs.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        break;
+                    }
+                    let sample_seed = cfg
+                        .seed
+                        .wrapping_add(step as u64)
+                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
+                        .wrapping_add(i as u64);
+                    match crate::pipeline::render_sample(
+                        &self.transformer,
+                        &self.vae,
+                        ctx,
+                        &positions,
+                        sample_seed,
+                        latent_edge,
+                        compute_dtype,
+                    ) {
+                        Ok(image) => on_progress(TrainingProgress::Sample {
+                            step,
+                            index: i as u32 + 1,
+                            total,
+                            prompt: prompt.clone(),
+                            image,
+                        }),
+                        Err(e) => eprintln!(
+                            "[sc-5637] {MODEL_ID} preview sample failed at step {step} \
+                             (prompt {}): {e} — skipping this preview, training continues",
+                            i + 1
+                        ),
+                    }
+                }
             }
         }
 
