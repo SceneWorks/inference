@@ -61,6 +61,18 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
     })
 }
 
+/// Reject generation dimensions that aren't multiples of 16 — the latent-pack requirement shared by
+/// the FLUX-family pipelines (FLUX.1 / FLUX.2). `family` names the model in the error message so the
+/// single shared check reads like the per-crate copies it replaces (F-083).
+pub fn validate_multiple_of_16(width: u32, height: u32, family: &str) -> Result<()> {
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+        return Err(Error::Msg(format!(
+            "{family}: width and height must be multiples of 16, got {width}x{height}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

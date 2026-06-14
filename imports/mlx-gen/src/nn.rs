@@ -12,14 +12,75 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use mlx_rs::error::Exception;
 use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{
-    add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, divide, erf, multiply,
-    power, sigmoid, subtract, tanh,
+    add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, dequantize, divide, erf,
+    multiply, power, quantize, sigmoid, subtract, tanh,
 };
 use mlx_rs::transforms::compile::compile;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use crate::array::scalar;
 use crate::{Error, Result};
+
+/// A token-embedding table (`[vocab, hidden]`), dense or group-quantized (Q4/Q8) — the shared
+/// implementation behind the FLUX.2 and Z-Image text encoders' `embed_tokens` (F-083). `forward` is a
+/// row-gather (dequantizing the packed form on the fly), mirroring mlx's `QuantizedEmbedding`, and
+/// returns **f32** (both encoders run f32 internally). FLUX.1's CLIP/T5 embedding intentionally
+/// returns native bf16, so it keeps its own variant rather than using this.
+pub enum TokenEmbedding {
+    Dense(Array),
+    Quantized {
+        wq: Array,
+        scales: Array,
+        biases: Array,
+        group_size: i32,
+        bits: i32,
+    },
+}
+
+impl TokenEmbedding {
+    /// Gather rows for `ids` (`[b, s]`) → `[b, s, hidden]`, cast to f32.
+    pub fn forward(&self, ids: &Array) -> Result<Array> {
+        let out = match self {
+            Self::Dense(w) => w.take_axis(ids, 0)?,
+            Self::Quantized {
+                wq,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => {
+                let pw = wq.take_axis(ids, 0)?;
+                let sc = scales.take_axis(ids, 0)?;
+                let bi = biases.take_axis(ids, 0)?;
+                dequantize(&pw, &sc, &bi, *group_size, *bits)?
+            }
+        };
+        Ok(out.as_dtype(Dtype::Float32)?)
+    }
+
+    /// Quantize a dense table in place (group_size 64), the mlx-rs equivalent of
+    /// `nn.Embedding.to_quantized`. No-op if already quantized. `cast_to_bf16` packs the **bf16**
+    /// weight (FLUX.2's path, to byte-match the fork's bf16 `nn.quantize`); when false the weight is
+    /// packed as-is (Z-Image's path). The two are equivalent for a bf16-native checkpoint — the flag
+    /// preserves each caller's exact prior behaviour.
+    pub fn quantize(&mut self, bits: i32, cast_to_bf16: bool) -> Result<()> {
+        if let Self::Dense(w) = self {
+            let (wq, scales, biases) = if cast_to_bf16 {
+                quantize(&w.as_dtype(Dtype::Bfloat16)?, 64, bits)?
+            } else {
+                quantize(w, 64, bits)?
+            };
+            *self = Self::Quantized {
+                wq,
+                scales,
+                biases,
+                group_size: 64,
+                bits,
+            };
+        }
+        Ok(())
+    }
+}
 
 /// sc-2963 (rollout of the Wan sc-2957 template): the shared compiled-elementwise-*glue* toggle and
 /// its fusable helpers, hoisted out of the per-family transformers (F-101) so a fix to the wrapper
