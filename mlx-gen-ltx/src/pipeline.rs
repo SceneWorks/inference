@@ -182,6 +182,62 @@ pub fn to_uint8_frames(video: &Array) -> Result<Array> {
     contiguous(&scaled.as_dtype(Dtype::Uint8)?)
 }
 
+/// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed on
+/// `dit`: seeded single-frame noise → the distilled **stage-1** Euler denoise (the real
+/// [`STAGE1_SIGMAS`] schedule, no CFG) → VAE decode → the first frame as an [`Image`]. A single-stage
+/// stripped [`generate_t2v_latents`] for the trainer's periodic preview (the 2× upsample + stage-2 are
+/// a quality refinement skipped here to keep the per-cadence cost low). `context` is the pre-encoded
+/// prompt embedding `(1, L, 4096)`; `positions` is the `(1, 1, le, le)` grid; `dtype` is the trainer
+/// compute dtype. No progress/cancel plumbing — the caller drives the cadence.
+pub(crate) fn render_sample(
+    dit: &LtxDiT,
+    vae: &LtxVideoVae,
+    context: &Array,
+    positions: &Array,
+    seed: u64,
+    latent_edge: usize,
+    dtype: Dtype,
+) -> Result<Image> {
+    let le = latent_edge as i32;
+    let init = mlx_rs::random::normal::<f32>(
+        &[1, 128, 1, le, le],
+        None,
+        None,
+        Some(&mlx_rs::random::key(seed)?),
+    )?
+    .as_dtype(dtype)?;
+    let latents = denoise(
+        dit,
+        &init,
+        context,
+        positions,
+        &STAGE1_SIGMAS,
+        None,
+        &CancelFlag::default(),
+        &mut |_| {},
+    )?;
+    let frames = decode_to_frames(vae, &latents)?; // (F, H, W, 3) uint8
+    frame0_to_image(&frames)
+}
+
+/// First frame of a decoded `(F, H, W, 3)` uint8 tensor → an RGB8 [`Image`] (a video LoRA's preview
+/// is a still thumbnail, sc-5637).
+fn frame0_to_image(frames: &Array) -> Result<Image> {
+    let sh = frames.shape(); // (F, H, W, 3)
+    if sh[0] < 1 {
+        return Err(Error::Msg("ltx render_sample: no frames decoded".into()));
+    }
+    let (h, w, c) = (sh[1] as usize, sh[2] as usize, sh[3] as usize);
+    let n = h * w * c;
+    let flat = frames.reshape(&[-1])?;
+    let pixels = flat.as_slice::<u8>()[..n].to_vec();
+    Ok(Image {
+        width: w as u32,
+        height: h as u32,
+        pixels,
+    })
+}
+
 /// Prepare an I2V conditioning image for VAE encoding (reference `prepare_image_for_encoding` ∘
 /// `load_image`): PIL-LANCZOS scale the RGB8 image to the stage pixel resolution `(target_height,
 /// target_width)` (a no-op when already sized), normalize `[0,255] → [-1,1]`, and lay out as **NCFHW**

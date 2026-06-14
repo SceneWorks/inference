@@ -52,6 +52,48 @@ pub(crate) fn kolors_time_ids(batch: i32, height: i32, width: i32) -> Array {
     Array::from_slice(&v, &[batch, 6])
 }
 
+/// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed
+/// on `unet`: seeded prior → leading-Euler CFG denoise → VAE decode → [`Image`]. A stripped
+/// [`Kolors::denoise_latents`] + [`Kolors::decode`] for the trainer (which holds the raw components,
+/// not a `Kolors`). `context`/`pooled` are the pre-encoded **CFG batch** (`[2, …]` = positive then
+/// empty-negative); `dtype` is the trainer compute dtype (the sampler scales the initial noise in it).
+/// No progress/cancel plumbing — the caller drives the cadence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_sample(
+    unet: &UNet2DConditionModel,
+    vae: &Autoencoder,
+    context: &Array,
+    pooled: &Array,
+    guidance: f32,
+    seed: u64,
+    edge: u32,
+    steps: usize,
+    dtype: Dtype,
+) -> Result<Image> {
+    random::seed(seed)?;
+    let lh = (edge as i32) / SPATIAL_SCALE;
+    let lw = (edge as i32) / SPATIAL_SCALE;
+    let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+    let sampler = KolorsEulerSampler::kolors(steps.max(1), dtype)?;
+    let time_ids = kolors_time_ids(2, edge as i32, edge as i32);
+    let latents = sampler.scale_initial_noise(&init_noise)?;
+    let d = Denoiser {
+        unet,
+        sampler: &sampler,
+    };
+    let latents = denoise(
+        &d,
+        latents,
+        context,
+        pooled,
+        &time_ids,
+        guidance,
+        &CancelFlag::default(),
+        &mut |_| {},
+    )?;
+    decode_image(vae, &latents)
+}
+
 impl Kolors {
     /// Load every Kolors component from the `Kwai-Kolors/Kolors-diffusers` snapshot at `dtype`.
     /// `tokenizer/tokenizer.json` must already be materialized (`tools/build_kolors_tokenizer.py`).

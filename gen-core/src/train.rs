@@ -22,6 +22,7 @@ use std::path::PathBuf;
 pub use schedule::LrSchedule;
 
 use crate::generator::Modality;
+use crate::media::Image;
 use crate::runtime::CancelFlag;
 
 /// Adapter network parameterization (mirrors SceneWorks `network_type`).
@@ -100,6 +101,23 @@ pub struct TrainingConfig {
     pub loss_type: String,
     /// Trigger word baked into captions / surfaced on the output adapter.
     pub trigger_word: Option<String>,
+    /// Preview-sample cadence, in micro-steps (`0` = no preview samples). At each multiple the
+    /// trainer renders preview images from the **in-progress adapter** (installed exactly as a train
+    /// step installs it) so the user can watch the LoRA learn — the engine-side home of the
+    /// SceneWorks "Sample cadence" control. The Python trainer did this; the native port dropped it
+    /// (sc-5637). Samples are emitted via the [`TrainingProgress::Sample`] event on the existing
+    /// `on_progress` callback — no extra trainer method.
+    pub sample_every: u32,
+    /// The prompts rendered at each [`sample_every`](Self::sample_every) cadence (the family trainer
+    /// caps how many it renders per cadence — typically ≤4). Empty disables sampling regardless of
+    /// `sample_every`. Encoded once during the dataset-caching pass (before families that free their
+    /// text encoder post-cache do so), then reused for every cadence.
+    pub sample_prompts: Vec<String>,
+    /// Inference (denoise) steps per preview sample.
+    pub sample_steps: u32,
+    /// Guidance scale for preview samples. Guidance-distilled families (z-image-turbo,
+    /// lens-turbo, …) ignore it / render at their fixed schedule; CFG families (sdxl, kolors) honor it.
+    pub sample_guidance_scale: f32,
 }
 
 impl Default for TrainingConfig {
@@ -127,6 +145,13 @@ impl Default for TrainingConfig {
             timestep_bias: "balanced".to_string(),
             loss_type: "mse".to_string(),
             trigger_word: None,
+            // Preview sampling is OFF by default: a caller that does not opt in (every conformance
+            // profile, every existing test that builds via `..Default::default()`) trains exactly as
+            // before. The worker sets these explicitly from the plan's `advanced` bag (sc-5637).
+            sample_every: 0,
+            sample_prompts: Vec::new(),
+            sample_steps: 20,
+            sample_guidance_scale: 1.0,
         }
     }
 }
@@ -171,6 +196,20 @@ pub enum TrainingProgress {
     Training { step: u32, total: u32, loss: f32 },
     /// An intermediate adapter checkpoint was written at micro-step `step`.
     Checkpoint { step: u32 },
+    /// A preview sample image, rendered from the in-progress adapter at micro-step `step` (sc-5637).
+    /// `index`/`total` are the 1-based position within this cadence's prompt set; `prompt` is the
+    /// rendered prompt; `image` is the decoded 8-bit RGB bitmap the consumer persists/streams (e.g.
+    /// the worker writes it as a project asset and appends it to the job result the Training Studio
+    /// renders). Emitted only when `config.sample_every > 0` and `config.sample_prompts` is non-empty.
+    /// Consumers that don't care can ignore it — it is interleaved with `Training` and does not
+    /// affect step/loss accounting.
+    Sample {
+        step: u32,
+        index: u32,
+        total: u32,
+        prompt: String,
+        image: Image,
+    },
     /// Writing the final adapter.
     Saving,
 }

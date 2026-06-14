@@ -15,7 +15,7 @@ use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::{CancelFlag, DiffusionSampler, Error, Image, Progress, Result};
 
 use crate::inpaint::InpaintBlend;
-use crate::sampler::EulerSampler;
+use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
 use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 use crate::vae::Autoencoder;
@@ -556,6 +556,46 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
 pub fn decode_image(vae: &Autoencoder, latents: &Array) -> Result<Image> {
     let decoded = vae.decode(latents)?;
     decoded_to_image(&decoded)
+}
+
+/// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed
+/// on `unet`: seeded txt2img prior → Euler-Ancestral CFG denoise → VAE decode → [`Image`]. A stripped
+/// [`Sdxl::generate_impl`](crate::model) txt2img: builds the ancestral sampler + seeded prior exactly
+/// as inference does, runs the plain [`denoise`] with the configured `guidance`. `conditioning`/`pooled`
+/// are the pre-encoded **CFG batch** (`[2, …]` = positive then empty-negative), so the denoise loop's
+/// classifier-free guidance has both streams. No progress/cancel plumbing — the caller drives cadence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_sample(
+    unet: &UNet2DConditionModel,
+    vae: &Autoencoder,
+    base_sampler: &EulerSampler,
+    conditioning: &Array,
+    pooled: &Array,
+    guidance: f32,
+    seed: u64,
+    edge: u32,
+    steps: usize,
+) -> Result<Image> {
+    random::seed(seed)?;
+    let latent_shape = [1, (edge / 8) as i32, (edge / 8) as i32, 4];
+    let prior = base_sampler.sample_prior(&latent_shape)?;
+    let sampler = AncestralEuler::new(base_sampler, steps.max(1), base_sampler.max_time())?;
+    let time_ids = text_time_ids(pooled.shape()[0]);
+    let d = Denoiser {
+        unet,
+        sampler: &sampler,
+    };
+    let latents = denoise(
+        &d,
+        prior,
+        conditioning,
+        pooled,
+        &time_ids,
+        guidance,
+        &CancelFlag::default(),
+        &mut |_| {},
+    )?;
+    decode_image(vae, &latents)
 }
 
 #[cfg(test)]
