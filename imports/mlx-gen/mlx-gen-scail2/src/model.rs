@@ -98,6 +98,19 @@ fn req_f32(w: &Weights, name: &str) -> Result<Array> {
 
 // ---- attention ----------------------------------------------------------------------------------
 
+/// Push a linear's quantized packs (`wq`/`scales`/`biases` + optional `bias`) into `out` for the
+/// eval-to-free pass (mirrors the Wan DiT `push_quant_arrays`); a dense linear contributes nothing.
+fn push_quant_arrays<'a>(lin: &'a AdaptableLinear, out: &mut Vec<&'a Array>) {
+    if let Some((wq, scales, biases, bias, _, _)) = lin.quantized_params() {
+        out.push(wq);
+        out.push(scales);
+        out.push(biases);
+        if let Some(bias) = bias {
+            out.push(bias);
+        }
+    }
+}
+
 /// Wan self-attention with qk-RMSNorm and 3-axis RoPE, over the full packed sequence.
 struct SelfAttn {
     q: AdaptableLinear,
@@ -127,6 +140,24 @@ impl SelfAttn {
             scale: (head_dim as f32).powf(-0.5),
             eps: cfg.wan.eps as f32,
         })
+    }
+
+    /// Quantize the four projections (q/k/v/o) to Q4/Q8 in place (mirrors the Wan DiT). The
+    /// qk-RMSNorm weights stay dense (small + precision-sensitive).
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        self.q.quantize(bits, group)?;
+        self.k.quantize(bits, group)?;
+        self.v.quantize(bits, group)?;
+        self.o.quantize(bits, group)?;
+        Ok(())
+    }
+
+    /// Collect this attention's quantized packs for the eval-to-free pass.
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        push_quant_arrays(&self.q, out);
+        push_quant_arrays(&self.k, out);
+        push_quant_arrays(&self.v, out);
+        push_quant_arrays(&self.o, out);
     }
 
     /// `x`: `[1, L, dim]` (f32, already adaLN-modulated). `cos`/`sin`: `[L, 1, half_d]` (f32).
@@ -192,6 +223,28 @@ impl CrossAttnI2V {
         })
     }
 
+    /// Quantize all six projections (text q/k/v/o + I2V image k_img/v_img) to Q4/Q8 in place. The
+    /// three qk-RMSNorm weights stay dense.
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        self.q.quantize(bits, group)?;
+        self.k.quantize(bits, group)?;
+        self.v.quantize(bits, group)?;
+        self.o.quantize(bits, group)?;
+        self.k_img.quantize(bits, group)?;
+        self.v_img.quantize(bits, group)?;
+        Ok(())
+    }
+
+    /// Collect this cross-attention's quantized packs for the eval-to-free pass.
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        push_quant_arrays(&self.q, out);
+        push_quant_arrays(&self.k, out);
+        push_quant_arrays(&self.v, out);
+        push_quant_arrays(&self.o, out);
+        push_quant_arrays(&self.k_img, out);
+        push_quant_arrays(&self.v_img, out);
+    }
+
     /// `x`: `[1, L, dim]` (f32). `text_ctx`: `[1, L_text, dim]`. `img_ctx`: `[1, L_img, dim]`.
     fn forward(&self, x: &Array, text_ctx: &Array, img_ctx: &Array, cdt: Dtype) -> Result<Array> {
         let (b, s) = (x.shape()[0], x.shape()[1]);
@@ -253,6 +306,24 @@ impl Block {
             ffn2: load_lin(w, &format!("{p}.ffn.2"))?,
             eps: cfg.wan.eps as f32,
         })
+    }
+
+    /// Quantize this block's self/cross-attention projections + FFN (`ffn.0`/`ffn.2`) to Q4/Q8 in
+    /// place. The modulation table and the affine `norm3` LayerNorm stay dense.
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        self.self_attn.quantize(bits, group)?;
+        self.cross.quantize(bits, group)?;
+        self.ffn0.quantize(bits, group)?;
+        self.ffn2.quantize(bits, group)?;
+        Ok(())
+    }
+
+    /// Collect this block's quantized packs for the eval-to-free pass.
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        self.self_attn.push_quant_arrays(out);
+        self.cross.push_quant_arrays(out);
+        push_quant_arrays(&self.ffn0, out);
+        push_quant_arrays(&self.ffn2, out);
     }
 
     /// `x`: `[1, L, dim]` (f32). `e0`: `[1, 6, dim]` (f32, time modulation).
@@ -374,6 +445,30 @@ impl Scail2Dit {
     /// Set the matmul compute dtype (f32 for parity, bf16 for production).
     pub fn set_compute_dtype(&mut self, dt: Dtype) {
         self.compute_dtype = dt;
+    }
+
+    /// Quantize the transformer-only attention + FFN Linears to Q4/Q8 **in place** (sc-5445),
+    /// mirroring the Wan DiT's `_quantize_predicate` surface: every block's self/cross-attention
+    /// `q/k/v/o` (+ the I2V `k_img`/`v_img`) and `ffn.0`/`ffn.2`. The patch/text/time/image
+    /// embeddings, `time_projection`, modulation tables, qk/`norm3`/LayerNorm norms, and the output
+    /// head stay dense (small + precision-sensitive — the reference skips them). `group` is the
+    /// quantization group size (`None` ⇒ the mflux/reference default of 64). Compute then runs
+    /// `quantized_matmul` (fp32-accumulate) on the bf16 activations the blocks already feed.
+    pub fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        for block in &mut self.blocks {
+            block.quantize(bits, group)?;
+        }
+        // Force-materialize the quantized packs now so the per-weight bf16 dequant transient frees
+        // here instead of lazily at the first forward (matches the Wan DiT; the win is the load-time
+        // peak — the packed Q4/Q8 arrays are what stays resident, the bf16 source is released).
+        let mut arrays: Vec<&Array> = Vec::new();
+        for block in &self.blocks {
+            block.push_quant_arrays(&mut arrays);
+        }
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
+        Ok(())
     }
 
     /// Number of transformer blocks (40 for the 14B).

@@ -23,7 +23,7 @@ use std::path::Path;
 
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, GenerationOutput, Image, Progress, Result};
+use mlx_gen::{Error, GenerationOutput, Image, Progress, Quant, Result};
 use mlx_gen_wan::{
     frames_to_images, load_tokenizer, make_scheduler, SolverKind, Umt5Encoder, WanVae,
 };
@@ -203,6 +203,7 @@ pub fn generate(
     root: &Path,
     cfg: &Scail2Config,
     job: &Scail2Job,
+    quant: Option<Quant>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
     if job.driving_frames.is_empty() {
@@ -286,11 +287,16 @@ pub fn generate(
         f
     };
 
-    // --- DiT (bf16 production compute; Q4/Q8 load-time quant is sc-5445) ---
+    // --- DiT (bf16 production compute; optional Q4/Q8 load-time quant, sc-5445) ---
     let dit = {
         let w = Weights::from_file(root.join("dit.safetensors"))?;
         let mut d = Scail2Dit::from_weights(&w, cfg)?;
         d.set_compute_dtype(Dtype::Bfloat16);
+        // Quantize the attention + FFN Linears in place (Q4 default in the SceneWorks worker). The
+        // packed Q4/Q8 weights are what stays resident; the bf16 source is freed in `quantize`.
+        if let Some(q) = quant {
+            d.quantize(q.bits(), None)?;
+        }
         d
     };
 
