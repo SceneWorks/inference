@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use mlx_gen::{Error, Result};
-use mlx_gen_wan::config::WanModelConfig;
+use mlx_gen_wan::config::{WanModelConfig, WanQuant};
 use serde_json::Value;
 
 /// SCAIL-2 conditioning knobs (zai-org/SCAIL-2 `wan/modules/model_scail2.py`), layered on top of the
@@ -65,6 +65,16 @@ impl Scail2Config {
             set_usize(&v, "num_heads", &mut cfg.wan.num_heads);
             set_usize(&v, "num_layers", &mut cfg.wan.num_layers);
             set_usize(&v, "mask_dim", &mut cfg.mask_dim);
+            // Pre-quantized snapshot manifest (`config.json`'s `quantization` block, written by
+            // [`crate::convert::quantize_scail2_dit`]): populate `cfg.wan.quantization` so the DiT
+            // loader builds each predicate Linear from packed Q4/Q8 parts directly — no dense bf16
+            // transient at load (sc-5445). Absent ⇒ a dense bf16 snapshot.
+            if let Some(q) = v.get("quantization").filter(|q| q.is_object()) {
+                cfg.wan.quantization = Some(WanQuant {
+                    bits: q.get("bits").and_then(Value::as_i64).unwrap_or(4) as i32,
+                    group_size: q.get("group_size").and_then(Value::as_i64).unwrap_or(64) as i32,
+                });
+            }
         }
         Ok(cfg)
     }
