@@ -65,7 +65,7 @@ use mlx_gen::{
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
-use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
@@ -86,6 +86,9 @@ const BETA_END: f32 = 0.014;
 /// Kolors reconstructs its LoKr delta at **f32** (the SDXL-family f32-everywhere merge path the Kolors
 /// U-Net inherits); training must match so the adapter round-trips through the inference loader.
 const LOKR_DTYPE: Dtype = Dtype::Float32;
+
+/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
+const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// PEFT save-key prefix for the LoRA adapter. The Kolors U-Net is a diffusers `UNet2DConditionModel`
 /// (the SDXL U-Net), so this is the SDXL prefix `peft.save_pretrained()` / the SceneWorks Kolors
@@ -307,6 +310,38 @@ impl KolorsTrainer {
             return Err("kolors trainer: no usable dataset items".into());
         }
 
+        // sc-5637 — pre-encode the preview-sample prompts as a **CFG batch** (`[2, …]` = positive
+        // then empty-negative) while ChatGLM3 is still resident (freed just below). Kolors renders
+        // previews with real classifier-free guidance, so both streams are needed; the empty negative
+        // is encoded once and shared. Batch order [positive, negative] matches `Kolors::denoise_latents`.
+        let sample_caps: Vec<(String, Array, Array)> =
+            if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !req.cancel.is_cancelled()
+            {
+                let (neg_ctx, neg_pooled) = self.encode_prompt("")?;
+                let mut caps = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
+                for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                    let (pos_ctx, pos_pooled) = self.encode_prompt(prompt)?;
+                    let context = concatenate_axis(&[&pos_ctx, &neg_ctx], 0)?;
+                    let pooled = concatenate_axis(&[&pos_pooled, &neg_pooled], 0)?;
+                    let context = if compute_dtype == Dtype::Float32 {
+                        context
+                    } else {
+                        context.as_dtype(compute_dtype)?
+                    };
+                    let pooled = if compute_dtype == Dtype::Float32 {
+                        pooled
+                    } else {
+                        pooled.as_dtype(compute_dtype)?
+                    };
+                    eval([&context, &pooled])?;
+                    caps.push((prompt.clone(), context, pooled));
+                }
+                caps
+            } else {
+                Vec::new()
+            };
+        let sampling_enabled = !sample_caps.is_empty();
+
         // sc-4941 (32 GB-Mac support) — the prompts are now all encoded into `cache`, so the
         // ChatGLM3-6B encoder is dead weight for the rest of the run. Drop it and evict its buffers
         // before the train loop, reclaiming ~12 GB (bf16) so the working set fits a 32 GB unified
@@ -444,6 +479,50 @@ impl KolorsTrainer {
                     &ckpt,
                 )?;
                 on_progress(TrainingProgress::Checkpoint { step });
+            }
+
+            // sc-5637 — periodic best-effort previews from the in-progress adapter (mirrors z-image).
+            // Install the current factors as concrete adapters for the forward-only render; the next
+            // step's traced `loss_fn` re-installs them. A render failure must NOT abort the long
+            // training run — log and continue.
+            if sampling_enabled && step % cfg.sample_every == 0 {
+                let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
+                adapter.install_as(&mut self.unet, &params, alpha, rank, lora_dtype, LOKR_DTYPE)?;
+                let total = sample_caps.len() as u32;
+                for (i, (prompt, context, pooled)) in sample_caps.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        break;
+                    }
+                    let sample_seed = cfg
+                        .seed
+                        .wrapping_add(step as u64)
+                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
+                        .wrapping_add(i as u64);
+                    match crate::model::render_sample(
+                        &self.unet,
+                        &self.vae,
+                        context,
+                        pooled,
+                        cfg.sample_guidance_scale,
+                        sample_seed,
+                        edge,
+                        cfg.sample_steps.max(1) as usize,
+                        compute_dtype,
+                    ) {
+                        Ok(image) => on_progress(TrainingProgress::Sample {
+                            step,
+                            index: i as u32 + 1,
+                            total,
+                            prompt: prompt.clone(),
+                            image,
+                        }),
+                        Err(e) => eprintln!(
+                            "[sc-5637] {MODEL_ID} preview sample failed at step {step} \
+                             (prompt {}): {e} — skipping this preview, training continues",
+                            i + 1
+                        ),
+                    }
+                }
             }
         }
 

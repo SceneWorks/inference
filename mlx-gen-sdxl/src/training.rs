@@ -73,6 +73,9 @@ use crate::vae::Autoencoder;
 /// so the adapter round-trips through the inference loader.
 const LOKR_DTYPE: Dtype = Dtype::Float32;
 
+/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
+const SAMPLE_PROMPT_CAP: usize = 4;
+
 /// PEFT save-key prefix for the LoRA adapter — what `peft.save_pretrained()` / the SceneWorks
 /// `_SdxlLoraBackend` emit, and what the SDXL loader's PEFT key classifier
 /// (`adapters::classify_key`) expects.
@@ -282,6 +285,43 @@ impl SdxlTrainer {
             return Err("sdxl trainer: no usable dataset items".into());
         }
 
+        // sc-5637 — pre-encode the preview-sample prompts as a **CFG batch** (`[2, …]` = positive
+        // then empty-negative) while the dual CLIP encoders are still resident (freed just below).
+        // SDXL renders previews with real classifier-free guidance, so the denoise needs both streams.
+        let sample_caps: Vec<(String, Array, Array)> =
+            if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !req.cancel.is_cancelled()
+            {
+                let (te1, te2) = match (&self.te1, &self.te2) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => {
+                        return Err(mlx_gen::Error::Msg(
+                            "sdxl trainer: text encoders already freed (sample pre-encode)".into(),
+                        ))
+                    }
+                };
+                let mut caps = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
+                for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                    let tokens = self.tokenizer.tokenize_batch(prompt, Some(""))?;
+                    let (cond, pooled) = encode_conditioning(te1, te2, &tokens)?;
+                    let cond = if compute_dtype == Dtype::Float32 {
+                        cond
+                    } else {
+                        cond.as_dtype(compute_dtype)?
+                    };
+                    let pooled = if compute_dtype == Dtype::Float32 {
+                        pooled
+                    } else {
+                        pooled.as_dtype(compute_dtype)?
+                    };
+                    eval([&cond, &pooled])?;
+                    caps.push((prompt.clone(), cond, pooled));
+                }
+                caps
+            } else {
+                Vec::new()
+            };
+        let sampling_enabled = !sample_caps.is_empty();
+
         // sc-4941 (32 GB-Mac headroom) — the prompts are all encoded into `cache`, so the dual CLIP
         // encoders are dead weight for the rest of the run. Drop them and evict their buffers before
         // the train loop, reclaiming ~3.3 GB for the U-Net working set.
@@ -421,6 +461,50 @@ impl SdxlTrainer {
                     &ckpt,
                 )?;
                 on_progress(TrainingProgress::Checkpoint { step });
+            }
+
+            // sc-5637 — periodic best-effort previews from the in-progress adapter (mirrors z-image).
+            // Install the current factors as concrete adapters for the forward-only render; the next
+            // step's traced `loss_fn` re-installs them, so no teardown is needed. A render failure must
+            // NOT abort the long training run — log and continue.
+            if sampling_enabled && step % cfg.sample_every == 0 {
+                let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
+                adapter.install_as(&mut self.unet, &params, alpha, rank, lora_dtype, LOKR_DTYPE)?;
+                let total = sample_caps.len() as u32;
+                for (i, (prompt, cond, pooled)) in sample_caps.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        break;
+                    }
+                    let sample_seed = cfg
+                        .seed
+                        .wrapping_add(step as u64)
+                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
+                        .wrapping_add(i as u64);
+                    match crate::pipeline::render_sample(
+                        &self.unet,
+                        &self.vae,
+                        &self.sampler,
+                        cond,
+                        pooled,
+                        cfg.sample_guidance_scale,
+                        sample_seed,
+                        edge,
+                        cfg.sample_steps.max(1) as usize,
+                    ) {
+                        Ok(image) => on_progress(TrainingProgress::Sample {
+                            step,
+                            index: i as u32 + 1,
+                            total,
+                            prompt: prompt.clone(),
+                            image,
+                        }),
+                        Err(e) => eprintln!(
+                            "[sc-5637] {MODEL_ID} preview sample failed at step {step} \
+                             (prompt {}): {e} — skipping this preview, training continues",
+                            i + 1
+                        ),
+                    }
+                }
             }
         }
 
