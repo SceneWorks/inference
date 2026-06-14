@@ -150,6 +150,14 @@ pub fn decode_to_frames(vae: &LtxVideoVae, latents: &Array) -> Result<Array> {
 /// `[0, 1]` *before* scaling by 255, so the result saturates at 255 (truncating cast).
 pub fn to_uint8_frames(video: &Array) -> Result<Array> {
     let sh = video.shape(); // (1, 3, F, H, W)
+                            // The reshape below drops the batch axis; B>1 would interleave frames across batch items (or
+                            // shape-error). Production decode is B==1 — reject anything else with a clear message (F-051).
+    if sh[0] != 1 {
+        return Err(Error::Msg(format!(
+            "ltx to_uint8_frames: batch size must be 1, got {}",
+            sh[0]
+        )));
+    }
     let (c, f, h, w) = (sh[1], sh[2], sh[3], sh[4]);
     let dt = video.dtype();
     let chw = video

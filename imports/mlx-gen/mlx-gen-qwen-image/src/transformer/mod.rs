@@ -36,6 +36,11 @@ use mlx_gen::Result;
 /// the production denoise loops** (T2I + Edit, [`crate::pipeline`]); left **off by default** so the
 /// reference-parity gates run eager and `compile_parity` can A/B both. The dtype flow (bf16 weights,
 /// f32 latents) is preserved — the compiled closures cast nothing the eager form didn't.
+///
+/// **Concurrency (F-087):** correct under the single-threaded MLX-device model — one generate runs on
+/// the device at a time — so `Relaxed` suffices (no cross-thread ordering to establish). The flag is
+/// process-global and not auto-reset here; a future concurrent caller would need `SeqCst` + per-call
+/// scoping (or an RAII guard like z-image's) — revisit before adding one.
 static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.

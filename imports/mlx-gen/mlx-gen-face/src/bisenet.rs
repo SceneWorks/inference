@@ -21,7 +21,7 @@
 
 use mlx_gen::nn::upsample_nearest;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_rs::ops::indexing::{argmax_axis, IndexOp, IntoStrideBy};
 use mlx_rs::ops::{add, concatenate_axis, matmul, maximum, mean_axes, multiply, pad, sigmoid};
 use mlx_rs::Array;
@@ -61,7 +61,7 @@ fn maxpool_3x3_s2(x: &Array) -> Result<Array> {
             });
         }
     }
-    Ok(acc.unwrap())
+    acc.ok_or_else(|| Error::Msg("face bisenet maxpool: empty pooling window".into()))
 }
 
 /// Per-axis `align_corners=True` linear interpolation matrix `[out_n, in_n]`: row `i` maps output

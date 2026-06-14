@@ -142,6 +142,11 @@ pub fn velocity(x_pred: &Array, z: &Array, t: f32, t_eps: f32) -> Result<Array> 
 /// the reference `patchify(..., channel_first=False)`: `nchpwq → nhwpqc`).
 pub fn patchify(images: &Array, patch_size: i32) -> Result<Array> {
     let sh = images.shape();
+    if sh.len() != 4 {
+        return Err(Error::Msg(format!(
+            "sensenova patchify: expected a rank-4 [N,3,H,W] tensor, got shape {sh:?}"
+        )));
+    }
     let (n, h, w) = (sh[0], sh[2] / patch_size, sh[3] / patch_size);
     let x = images.reshape(&[n, 3, h, patch_size, w, patch_size])?;
     let x = x.transpose_axes(&[0, 2, 4, 3, 5, 1])?; // nchpwq -> nhwpqc
@@ -156,6 +161,11 @@ pub fn patchify(images: &Array, patch_size: i32) -> Result<Array> {
 /// current noisy image is fed through here before [`crate::vision::NeoVisionEmbedder::forward`].
 pub fn patchify_channel_first(images: &Array, patch_size: i32) -> Result<Array> {
     let sh = images.shape();
+    if sh.len() != 4 {
+        return Err(Error::Msg(format!(
+            "sensenova patchify_channel_first: expected a rank-4 [N,3,H,W] tensor, got shape {sh:?}"
+        )));
+    }
     let (n, h, w) = (sh[0], sh[2] / patch_size, sh[3] / patch_size);
     let x = images.reshape(&[n, 3, h, patch_size, w, patch_size])?;
     let x = x.transpose_axes(&[0, 2, 4, 1, 3, 5])?; // nchpwq -> nhwcpq

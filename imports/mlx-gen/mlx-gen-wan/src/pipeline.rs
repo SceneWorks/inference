@@ -56,8 +56,10 @@ pub fn latent_shape(
 /// Transformer sequence length: `ceil(h_lat · w_lat / (patch_h · patch_w) · t_lat)`.
 pub fn seq_len(latent: [i32; 4], patch_size: (usize, usize, usize)) -> usize {
     let (_z, t_lat, h_lat, w_lat) = (latent[0], latent[1], latent[2], latent[3]);
-    let per_frame = (h_lat as usize * w_lat as usize) as f64 / (patch_size.1 * patch_size.2) as f64;
-    (per_frame * t_lat as f64).ceil() as usize
+    // Exact integer `ceil(h_lat·w_lat·t_lat / (patch_h·patch_w))` — the old f64 ceil was exact only
+    // up to 2^24 and could go off-by-one beyond it (F-089).
+    let tokens = h_lat as usize * w_lat as usize * t_lat as usize;
+    tokens.div_ceil(patch_size.1 * patch_size.2)
 }
 
 /// The largest `(width, height)` that fits within `max_area` while preserving the input aspect ratio
@@ -408,10 +410,10 @@ fn predict(
         // preds[0] = cond (context row 0), preds[1] = uncond (row 1).
         cfg_combine(&preds[0], &preds[1], guidance)
     } else {
-        Ok(preds
+        preds
             .into_iter()
             .next()
-            .expect("B=1 forward yields one output"))
+            .ok_or_else(|| Error::Msg("wan: B=1 forward produced no output".into()))
     }
 }
 
@@ -479,10 +481,10 @@ fn predict_tokens(
     if cache.batch == 2 {
         cfg_combine(&preds[0], &preds[1], guidance)
     } else {
-        Ok(preds
+        preds
             .into_iter()
             .next()
-            .expect("B=1 forward yields one output"))
+            .ok_or_else(|| Error::Msg("wan: B=1 forward produced no output".into()))
     }
 }
 

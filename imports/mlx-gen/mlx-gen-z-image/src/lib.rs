@@ -69,6 +69,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// loops** (turbo + control, [`pipeline`]); left **off by default** so the reference-parity gates run
 /// eager. The **mixed-precision dtype flow is preserved** — base bf16, f32 `control_context` (sc-2720):
 /// the compiled closures cast nothing the eager form didn't, so dtype flows from inputs unchanged.
+///
+/// **Concurrency (F-087):** correct under the single-threaded MLX-device model — one generate runs on
+/// the device at a time — so `Relaxed` suffices (no cross-thread ordering to establish) and
+/// [`CompileGlueGuard`] restores the prior value on drop, so the flag IS reset between renders. A
+/// future concurrent caller would need `SeqCst` + strict per-call scoping; revisit before adding one.
 static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.

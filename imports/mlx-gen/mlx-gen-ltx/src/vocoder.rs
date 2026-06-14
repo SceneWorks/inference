@@ -149,7 +149,10 @@ impl SnakeCore {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let c = *x.shape().last().unwrap();
+        let c = *x
+            .shape()
+            .last()
+            .ok_or_else(|| Error::Msg("ltx vocoder snake: zero-rank input".into()))?;
         let alpha = self.alpha.exp()?.reshape(&[1, 1, c])?;
         let beta = self.beta.exp()?.reshape(&[1, 1, c])?;
         let s = multiply(&alpha, x)?.sin()?;
@@ -176,7 +179,11 @@ impl SnakeFilter {
 
     /// Depth-wise 1-D conv along the time axis. `x` `(B, L, C)` → `(B, L_out, C)`.
     fn apply_filter(&self, x: &Array, stride: i32) -> Result<Array> {
-        let taps = *self.filter.shape().last().unwrap();
+        let taps = *self
+            .filter
+            .shape()
+            .last()
+            .ok_or_else(|| Error::Msg("ltx vocoder filter: zero-rank kernel".into()))?;
         let even = taps % 2 == 0;
         let pad_left = taps / 2 - i32::from(even);
         let pad_right = taps / 2;
@@ -208,7 +215,11 @@ impl SnakeUpsample {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let taps = *self.filter.shape().last().unwrap();
+        let taps = *self
+            .filter
+            .shape()
+            .last()
+            .ok_or_else(|| Error::Msg("ltx vocoder filter: zero-rank kernel".into()))?;
         let ratio = 2;
         let pad = taps / ratio - 1;
         let pad_left = pad * ratio + (taps - ratio) / 2;

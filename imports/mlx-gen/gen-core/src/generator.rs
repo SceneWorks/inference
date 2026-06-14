@@ -271,7 +271,9 @@ pub fn default_seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+        // Fall back to a nonzero value: 0 is the "no seed" sentinel a caller would pass to mean
+        // "pick one", so the default must never itself be 0 (F-089).
+        .unwrap_or(1)
 }
 
 /// Typed conditioning inputs. Each image family uses the subset its `Capabilities` advertises.
@@ -462,6 +464,15 @@ impl Capabilities {
     /// sampler→solver mapping — are layered on top by each model's own `validate`; this is the shared
     /// floor, not a replacement for them.
     pub fn validate_request(&self, id: &str, req: &GenerationRequest) -> Result<()> {
+        // Footgun guard (F-084): a descriptor that enables a capability but leaves max_count/max_size
+        // at the `Default` 0 would reject EVERY request with a confusing "out of range 0..=0". A real
+        // model always sets non-zero bounds, so catch the descriptor mistake in debug/test builds.
+        debug_assert!(
+            self.max_count > 0 && self.max_size > 0,
+            "{id}: Capabilities max_count={} max_size={} left at Default 0 — descriptor forgot its bounds",
+            self.max_count,
+            self.max_size
+        );
         if req.count == 0 || req.count > self.max_count {
             return Err(Error::Msg(format!(
                 "{id}: count {} out of range 1..={}",

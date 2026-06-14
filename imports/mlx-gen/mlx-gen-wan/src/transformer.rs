@@ -30,7 +30,7 @@ use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::array::scalar;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
@@ -984,9 +984,9 @@ impl WanTransformer {
         let (cos_t, sin_t) = self.prepare_rope(grid)?;
         let cross_kv = self.prepare_cross_kv(context_embed)?;
         let mut preds = self.forward_cached(latent, t, &cross_kv, &cos_t, &sin_t, 1)?;
-        Ok(preds
+        preds
             .pop()
-            .expect("forward_cached yields one output for batch=1"))
+            .ok_or_else(|| Error::Msg("wan: forward_cached produced no output for batch=1".into()))
     }
 
     /// Patch-embed one latent `[C, F, H, W]` (f32) into the DiT token stream `[1, L, dim]` (bf16) +
@@ -1062,8 +1062,8 @@ impl WanTransformer {
         let cross_kv = self.prepare_cross_kv(context_embed)?;
         let mut preds =
             self.forward_tokens_cached(latent, t_tokens, &cross_kv, &cos_t, &sin_t, 1)?;
-        Ok(preds
-            .pop()
-            .expect("forward_tokens_cached yields one output for batch=1"))
+        preds.pop().ok_or_else(|| {
+            Error::Msg("wan: forward_tokens_cached produced no output for batch=1".into())
+        })
     }
 }

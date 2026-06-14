@@ -180,6 +180,13 @@ impl Connector {
         let (s, dim) = (sh[1], sh[2]);
         let nv = sum(mask01, None)?.item::<i32>();
         let num_reg = self.registers.shape()[0];
+        // A sequence shorter than the register block makes `num_tiles == 0`, so `tile` yields an
+        // empty register grid and the `[1, s, dim]` reshape shape-errors. Surface it clearly (F-050).
+        if num_reg == 0 || s < num_reg {
+            return Err(Error::Msg(format!(
+                "ltx connector: sequence length {s} is smaller than the register count {num_reg}"
+            )));
+        }
         let num_tiles = s / num_reg;
         let reg_full = tile(&self.registers, &[num_tiles, 1])? // (s, dim)
             .reshape(&[1, s, dim])?

@@ -46,6 +46,12 @@ pub struct Detection {
 fn pool2x2(x: &Array, avg: bool) -> Result<Array> {
     let s = x.shape();
     let (n, h, w, c) = (s[0], s[1], s[2], s[3]);
+    // The reshape-based 2×2 pool is only exact for even spatial dims; odd dims would shape-error on
+    // the reshape (the network's feature maps are even by construction) (F-078).
+    debug_assert!(
+        h % 2 == 0 && w % 2 == 0,
+        "pool2x2: expected even H/W, got {h}x{w}"
+    );
     let r = x.reshape(&[n, h / 2, 2, w / 2, 2, c])?;
     Ok(if avg {
         mean_axes(&r, &[2, 4], false)?

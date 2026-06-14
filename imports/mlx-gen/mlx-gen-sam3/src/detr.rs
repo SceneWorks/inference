@@ -23,13 +23,10 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::Sam3DetrConfig;
+use crate::util::join;
 
 const SCALE_2PI: f32 = 2.0 * PI;
 const NUM_POS: i32 = 128; // sine position features per axis (hidden_size / 2)
-
-fn join(prefix: &str, leaf: &str) -> String {
-    format!("{prefix}.{leaf}")
-}
 
 /// `sin(even)/cos(odd)` interleave of a `[.., 128]` raw angle tensor → `[.., 128]`
 /// (`stack(sin(x[0::2]), cos(x[1::2])).flatten`), the SAM3 sine-embedding convention.
@@ -555,6 +552,7 @@ impl Sam3Detector {
         let mut last_query_hidden = None;
         let mut last_ref_input = None;
         let mut last_presence = None;
+        let mut last_offsets = None;
 
         for layer in &self.dec_layers {
             // conditional query positions from the current reference boxes
@@ -599,8 +597,11 @@ impl Sam3Detector {
             last_ref_input = Some(reference_boxes.clone());
             last_query_hidden = Some(query_hidden.clone());
 
-            // iterative box refinement for the next layer
+            // iterative box refinement for the next layer. `delta` is box_head(query_hidden) for THIS
+            // layer; on the final layer it equals the post-loop `offsets`, so record it and reuse it
+            // instead of recomputing the identical box_head MLP after the loop (F-070).
             let delta = self.box_head.forward(&query_hidden)?;
+            last_offsets = Some(delta.clone());
             reference_boxes = sigmoid(&add(&delta, &inverse_sigmoid(&reference_boxes)?)?)?;
 
             // presence
@@ -619,8 +620,9 @@ impl Sam3Detector {
         let ref_input = last_ref_input.unwrap();
         let presence_logits = last_presence.unwrap();
 
-        // final boxes: sigmoid(inv_sigmoid(ref_input) + box_head(query_hidden)) → xyxy
-        let offsets = self.box_head.forward(&query_hidden)?;
+        // final boxes: sigmoid(inv_sigmoid(ref_input) + box_head(query_hidden)) → xyxy. Reuse the
+        // final layer's already-computed box_head output rather than recomputing it (F-070).
+        let offsets = last_offsets.unwrap();
         let boxes_cxcywh = sigmoid(&add(&inverse_sigmoid(&ref_input)?, &offsets)?)?;
         let pred_boxes = cxcywh_to_xyxy(&boxes_cxcywh)?;
         let pred_logits = self.scoring.forward(&query_hidden, text, text_mask)?;

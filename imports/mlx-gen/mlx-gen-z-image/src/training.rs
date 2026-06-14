@@ -475,11 +475,19 @@ impl ZImageTurboTrainer {
                 let mult =
                     lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
                 opt.set_lr_scaled(mult);
+                // The final update can fire with fewer than `accum` grads when `steps` isn't a
+                // multiple of the accumulation; dividing by `accum` would down-scale that step. Divide
+                // by the actual in-window count instead (F-069).
+                let window = if step % accum == 0 {
+                    accum
+                } else {
+                    step % accum
+                };
                 let avg = average_grads(
                     accumulated
                         .take()
                         .expect("an update fires only after accumulation"),
-                    accum,
+                    window,
                 )?;
                 let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
                 let clipped: LoraParams = clipped
@@ -569,7 +577,10 @@ fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
 /// dense run was observed to die. Only consulted when gradient checkpointing is OFF.
 fn preflight_memory_guard(edge: u32, bf16: bool) -> Result<()> {
     let tokens_per_side = (edge as f64 / 16.0).ceil();
-    let s = tokens_per_side * tokens_per_side + 32.0; // + one padded caption block
+    // The padded caption block can reach the model's max prompt length (~512 tokens), not just the
+    // 32-token padding granularity; under-counting it lets a near-threshold long-prompt dense run slip
+    // past this guard into a SIGKILL instead of the catchable error. Use a conservative cap (F-057).
+    let s = tokens_per_side * tokens_per_side + (512.0 + 32.0);
     let projected = projected_dense_peak_gb(s, bf16);
     let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
@@ -637,7 +648,9 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
             random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
         }
         "weighted" => {
-            let k2 = random::key(seed ^ 0x9E37_79B9)?;
+            // wrapping_add (Fibonacci-hash mixing) rather than an XOR-sibling seed, whose two draws
+            // can correlate depending on `key()`'s splat (F-058).
+            let k2 = random::key(seed.wrapping_add(0x9E37_79B9))?;
             let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
             let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
             (base + center) / 2.0

@@ -188,6 +188,12 @@ pub fn check_captioner_cancellation(
     }
 }
 
+// Note (F-085): a *mid-decode* cancel sub-check was considered but is intentionally NOT added — the
+// captioner cancellation contract (module docs above) is pre-inference only: "like a trainer, a
+// captioner that has already emitted tokens when cancel trips may return a valid result." A captioner
+// finishing its caption after a mid-decode cancel is conformant, so such a check would be a false
+// positive. The generator seed-differs sub-check (the other half of F-085) lives in `lib.rs`.
+
 /// **Registry round-trip.** The captioner's descriptor `id` is discoverable through
 /// `gen_core::registry::captioners()` — its `inventory::submit!` registration survived linking.
 pub fn check_captioner_registry(c: &dyn Captioner) -> Result<(), String> {

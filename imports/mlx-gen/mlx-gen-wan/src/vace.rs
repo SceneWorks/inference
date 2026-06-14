@@ -29,7 +29,7 @@
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, cos, gt, multiply, sigmoid, sin, split, subtract};
 use mlx_rs::{Array, Dtype};
@@ -527,6 +527,15 @@ impl WanVaceTransformer {
         let control_emb = if l_c < l {
             let pad = Array::zeros::<f32>(&[1, l - l_c, dim])?;
             concatenate_axis(&[&control_emb, &pad], 1)?
+        } else if l_c > l {
+            // A control clip larger than the noisy latent (mismatched control vs generation
+            // resolution) would shape-error at the downstream `[1, L, dim]` ops. Its tokens are not
+            // spatially aligned with the latent grid, so truncating would silently corrupt the
+            // conditioning — surface a clear error instead (F-044).
+            return Err(Error::Msg(format!(
+                "wan vace: control token count {l_c} exceeds latent token count {l}; the control \
+                 clip resolution must match the generation resolution"
+            )));
         } else {
             control_emb
         };

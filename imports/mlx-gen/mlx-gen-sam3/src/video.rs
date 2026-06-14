@@ -355,7 +355,7 @@ impl Sam3VideoModel {
             return a;
         }
         let det_bin: Vec<Vec<bool>> = det.dets.iter().map(|d| binarize(&d.mask)).collect();
-        let trk_bin: Vec<Vec<bool>> = trk_masks.iter().map(|t| binarize_gt0(t)).collect();
+        let trk_bin: Vec<Vec<bool>> = trk_masks.iter().map(|t| binarize(t)).collect();
         let trk_nonempty: Vec<bool> = trk_bin.iter().map(|t| t.iter().any(|&x| x)).collect();
         // IoU[n][m], zeroed across prompt groups.
         let mut iou = vec![vec![0f32; m]; n];
@@ -504,7 +504,7 @@ impl Sam3VideoModel {
         if n == 0 {
             return;
         }
-        let bin: Vec<Vec<bool>> = trk_masks.iter().map(|t| binarize_gt0(t)).collect();
+        let bin: Vec<Vec<bool>> = trk_masks.iter().map(|t| binarize(t)).collect();
         // last-occluded per object (NEVER if unseen, ALWAYS if removed this frame).
         let last_occ: Vec<i32> = (0..n)
             .map(|j| {
@@ -749,10 +749,10 @@ fn unique(v: &[i32]) -> Vec<i32> {
     s
 }
 
+/// Threshold a mask (logits or probabilities) at 0 → per-pixel bool. (Tracker masks are logits, det
+/// masks are already centered at 0, so the same `> 0` rule applies to both — previously duplicated as
+/// a separate `binarize_gt0`, F-071.)
 fn binarize(m: &[f32]) -> Vec<bool> {
-    m.iter().map(|&v| v > 0.0).collect()
-}
-fn binarize_gt0(m: &[f32]) -> Vec<bool> {
     m.iter().map(|&v| v > 0.0).collect()
 }
 

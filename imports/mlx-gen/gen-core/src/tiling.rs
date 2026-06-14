@@ -144,7 +144,7 @@ impl TilingConfig {
         }
         let est_gb = (3.0 * num_frames as f64 * height as f64 * width as f64 * 4.0)
             / (1024.0 * 1024.0 * 1024.0);
-        if est_gb > 2.0 || (height * width > 768 * 1024 && num_frames > 100) {
+        if est_gb > 2.0 || ((height as i64) * (width as i64) > 768 * 1024 && num_frames > 100) {
             return Some(Self::aggressive());
         }
         let spatial = needs_spatial.then(|| {

@@ -391,13 +391,16 @@ impl InstantId {
     /// row is `Resampler(zeros)` — the reference's zero-embed-through-Resampler, not literal zeros).
     fn face_tokens(&self, embedding: &[f32], cfg_on: bool) -> Result<Array> {
         let embed = Array::from_slice(embedding, &[1, 1, 512]).as_dtype(DTYPE)?;
-        let proj_in = if cfg_on {
+        // The Resampler input — positive embed, plus (under CFG) the zero-embed uncond row stacked
+        // along the batch — NOT a single positive projection, despite the historical `proj_in` name
+        // (F-079).
+        let resampler_input = if cfg_on {
             let z = zeros::<f32>(&[1, 1, 512])?.as_dtype(DTYPE)?;
             concatenate_axis(&[&embed, &z], 0)?
         } else {
             embed
         };
-        self.resampler.forward(&proj_in) // [B, 16, 2048]
+        self.resampler.forward(&resampler_input) // [B, 16, 2048]
     }
 
     /// Build a [`ControlContext`] for a control image: rasterized image → `[0,1]` NHWC, cast to the

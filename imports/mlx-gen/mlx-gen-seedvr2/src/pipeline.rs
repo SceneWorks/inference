@@ -368,19 +368,23 @@ impl Seedvr2Pipeline {
         if n == 0 {
             return Ok(Vec::new());
         }
-        let chunk = match chunk_override {
-            Some(c) => video::pad_to_valid_chunk(c),
-            None => match video::plan_chunk_size(self.weights_bytes, height, width) {
-                ChunkPlan::Chunked(c) => c,
-                ChunkPlan::PerFrame => {
-                    return self.generate_video_per_frame(frames, width, height, seed, softness)
-                }
-                // Even one full-resolution frame exceeds the budget → spatially tile each frame
-                // (per-frame T=1 + overlap feather blend). Bounds peak at any resolution (sc-5201).
-                ChunkPlan::OverBudget { .. } => {
-                    return self.generate_video_tiled(frames, width, height, seed, softness)
-                }
-            },
+        let chunk = match (
+            chunk_override,
+            video::plan_chunk_size(self.weights_bytes, height, width),
+        ) {
+            // Clamp an override DOWN to the budget-safe chunk so it can't bypass the planner and OOM
+            // (SIGKILL); a smaller-than-safe override is honored as-is. PerFrame/OverBudget route to
+            // the safe paths regardless of the override, since forcing a chunk there would OOM (F-075).
+            (Some(c), ChunkPlan::Chunked(safe)) => video::pad_to_valid_chunk(c).min(safe),
+            (_, ChunkPlan::Chunked(c)) => c,
+            (_, ChunkPlan::PerFrame) => {
+                return self.generate_video_per_frame(frames, width, height, seed, softness)
+            }
+            // Even one full-resolution frame exceeds the budget → spatially tile each frame
+            // (per-frame T=1 + overlap feather blend). Bounds peak at any resolution (sc-5201).
+            (_, ChunkPlan::OverBudget { .. }) => {
+                return self.generate_video_tiled(frames, width, height, seed, softness)
+            }
         };
 
         let plan = video::plan_chunks(n, chunk, video::DEFAULT_OVERLAP);

@@ -138,7 +138,14 @@ pub fn parse_lokr(w: &Weights) -> Result<LokrFile> {
 /// typed error instead of aborting the worker.
 fn scalar_alpha(a: &Array) -> Result<Option<f32>> {
     if a.size() == 0 {
-        return Ok(None);
+        // The callers only reach here for an `alpha` key that *exists* (`w.require(..)`), so a
+        // present-but-empty tensor is a malformed file — NOT an absent alpha. Returning `Ok(None)`
+        // here would be indistinguishable from "no alpha key", silently falling back to the
+        // `alpha == rank ⇒ scale 1.0` default and mis-scaling the adapter while reporting success.
+        // Fail this one job with a typed error instead (F-031, matching the contract documented above).
+        return Err(Error::Msg(
+            "scalar_alpha: alpha tensor present but empty (size 0) — malformed adapter file".into(),
+        ));
     }
     Ok(a.as_dtype(Dtype::Float32)?
         .try_as_slice::<f32>()
@@ -534,6 +541,15 @@ fn install_lora_groups(
             Some(lin) => {
                 let a = a_raw.t(); // [r, in] -> [in, r]
                 let mut b = b_raw.t(); // [out, r] -> [r, out]
+                                       // A Linear LoRA's factors are 2-D; a malformed 1-D/scalar factor would panic on the
+                                       // `a.shape()[1]` rank read below. Reject it with a typed error up front (F-034).
+                if a.shape().len() != 2 || b.shape().len() != 2 {
+                    return Err(Error::Msg(format!(
+                        "lora adapter at '{path}' has non-2-D factors (down {:?}, up {:?})",
+                        a_raw.shape(),
+                        b_raw.shape()
+                    )));
+                }
                 if let Some(alpha) = parts.alpha {
                     let rank = a.shape()[1] as f32; // r
                     if rank == 0.0 {
@@ -670,12 +686,25 @@ pub enum LoraRowSlice {
 impl LoraRowSlice {
     fn apply(&self, t: &Array) -> Result<Array> {
         let rows = t.shape()[0];
+        // `n`/`index`/`dims` come from a static `bfl_targets()` table built in code, not the file —
+        // but a miswritten entry (n<=0, index out of [0,n), or an out-of-range `dims` index) would
+        // divide-by-zero / index out of bounds and panic. Reject it with a typed error (F-033).
         let (start, end) = match self {
             LoraRowSlice::Chunk { n, index } => {
+                if *n <= 0 || *index < 0 || *index >= *n {
+                    return Err(Error::Msg(format!(
+                        "LoraRowSlice::Chunk: invalid chunk spec (n={n}, index={index})"
+                    )));
+                }
                 let chunk = rows / n;
                 (index * chunk, (index + 1) * chunk)
             }
             LoraRowSlice::ChunkIfDivisible { n, index } => {
+                if *n <= 0 || *index < 0 || *index >= *n {
+                    return Err(Error::Msg(format!(
+                        "LoraRowSlice::ChunkIfDivisible: invalid chunk spec (n={n}, index={index})"
+                    )));
+                }
                 if rows % n != 0 {
                     return Ok(t.clone());
                 }
@@ -684,6 +713,12 @@ impl LoraRowSlice {
             }
             LoraRowSlice::Dims { dims, index } => {
                 let i = *index as usize;
+                if *index < 0 || i >= dims.len() {
+                    return Err(Error::Msg(format!(
+                        "LoraRowSlice::Dims: index {index} out of range for {} dims",
+                        dims.len()
+                    )));
+                }
                 let start: i32 = dims[..i].iter().sum();
                 (start, start + dims[i])
             }
@@ -835,6 +870,13 @@ pub fn apply_lora_bfl(
 ///
 /// This is the load-time seam (sc-2534): a provider calls it inside `load()` with its model's
 /// [`AdaptableHost`] while the model is still mutable. Empty `specs` is a no-op (empty report).
+///
+/// **Scope (F-035):** this fixed-prefix variant routes PEFT/diffusers LoRA, metadata-stamped LoKr,
+/// and keyless third-party LyCORIS LoKr/LoHa. Unlike [`apply_adapter_specs_autoprefix`] it does NOT
+/// detect BFL/ComfyUI fused→split or kohya-flattened files — both require walking the host module
+/// tree (`bfl_targets()` / `kohya_table()`), which only the autoprefix path does. Callers that may
+/// receive BFL or kohya files must use the autoprefix variant; here such a file would resolve no
+/// targets and be reported as fully unmatched rather than applied.
 pub fn apply_adapter_specs(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
@@ -1155,13 +1197,18 @@ mod tests {
     }
 
     #[test]
-    fn scalar_alpha_empty_tensor_returns_none_not_panic() {
-        // sc-3959 (F-001): a malformed third-party adapter with a zero-length `.alpha` tensor must
-        // fail gracefully. Before the guard, `as_slice::<f32>()` (== `try_as_slice().unwrap()`)
-        // panicked on the size-0 array, aborting the whole worker; now it reads as `None`.
+    fn scalar_alpha_empty_tensor_errors_not_panic() {
+        // sc-3959 added the no-panic guard for a malformed third-party adapter with a zero-length
+        // `.alpha` (before it, `as_slice::<f32>()` panicked on the size-0 array, aborting the worker).
+        // F-031 then tightened it from a silent `Ok(None)` to a typed error: the callers only reach
+        // `scalar_alpha` for a *present* alpha key, so present-but-empty is a malformed file — returning
+        // `None` would be indistinguishable from "no alpha" and silently mis-scale the adapter.
         let empty = Array::from_slice(&[] as &[f32], &[0]);
         assert_eq!(empty.size(), 0);
-        assert_eq!(scalar_alpha(&empty).unwrap(), None);
+        let err = scalar_alpha(&empty)
+            .expect_err("size-0 alpha must be a typed error, not Ok")
+            .to_string();
+        assert!(err.contains("empty"), "got: {err}");
     }
 
     #[test]

@@ -18,7 +18,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{conv2d, silu};
 use mlx_gen::weights::{to_dtype, Weights};
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::AudioVaeConfig;
 
@@ -35,6 +35,17 @@ fn f32(w: &Weights, key: &str) -> Result<Array> {
 
 /// Per-location RMS over the channel (last) axis: `x / sqrt(mean(x², C) + eps)`. NHWC, no learned γ.
 fn pixel_norm(x: &Array) -> Result<Array> {
+    // A zero-rank or zero-channel tensor (malformed checkpoint) would mean over an empty axis and
+    // silently yield nan. Reject it (F-049).
+    match x.shape().last() {
+        Some(&c) if c > 0 => {}
+        _ => {
+            return Err(Error::Msg(format!(
+                "ltx audio_vae pixel_norm: expected a non-empty channel axis, got shape {:?}",
+                x.shape()
+            )))
+        }
+    }
     let sq = multiply(x, x)?;
     let mean = mlx_rs::ops::mean_axes(&sq, &[-1], true)?;
     let rms = add(&mean, scalar(PIXEL_EPS))?.sqrt()?;

@@ -8,7 +8,7 @@ use mlx_rs::Array;
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{linear, silu};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// diffusers `get_timestep_embedding(x, dim, flip_sin_to_cos=True, downscale_freq_shift=0,
 /// max_period=10000)`: `freq_i = 10000^(−i/half)` (`i∈[0,half)`), `emb = x[:,None]·freq`, output
@@ -16,6 +16,11 @@ use mlx_gen::Result;
 /// is taken in f64 (matching `math.log`) and the steps mirror diffusers (`(−ln·arange)/half`) so the
 /// f32 rounding matches.
 pub fn sinusoidal_timestep(x: &Array, dim: i32) -> Result<Array> {
+    if dim % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "svd sinusoidal_timestep: embedding dim must be even, got {dim}"
+        )));
+    }
     let half = dim / 2;
     let arange: Vec<f32> = (0..half).map(|i| i as f32).collect();
     let arange = Array::from_slice(&arange, &[half]);

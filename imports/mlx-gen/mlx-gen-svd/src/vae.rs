@@ -21,7 +21,7 @@ use mlx_rs::Array;
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d, conv3d, group_norm, linear, silu, upsample_nearest};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::VaeConfig;
 
@@ -474,6 +474,11 @@ impl SvdVae {
     pub fn from_weights(w: &Weights, cfg: &VaeConfig) -> Result<Self> {
         let qw = w.require("quant_conv.weight")?;
         let qsh = qw.shape();
+        if qsh.len() < 2 {
+            return Err(Error::Msg(format!(
+                "svd vae: quant_conv.weight must be at least rank 2, got shape {qsh:?}"
+            )));
+        }
         Ok(Self {
             encoder: Encoder::from_weights(w, cfg)?,
             quant: (

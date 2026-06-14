@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_rs::ops::{concatenate_axis, divide, sqrt, square, sum_axes};
+use mlx_rs::ops::{concatenate_axis, divide, maximum, sqrt, square, sum_axes};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::media::Image;
@@ -75,7 +75,11 @@ pub fn descriptor() -> ModelDescriptor {
 
 /// L2-normalize each row of `[B, D]` over the feature axis (the PuLID `id_cond_vit` normalization).
 fn l2_normalize_rows(x: &Array) -> Result<Array> {
-    let norm = sqrt(&sum_axes(&square(x)?, &[1], true)?)?; // [B, 1]
+    let sumsq = sum_axes(&square(x)?, &[1], true)?; // [B, 1]
+                                                    // Clamp the norm to a tiny epsilon (torch `F.normalize`'s default eps) so a degenerate zero-norm
+                                                    // row — e.g. a bad ArcFace crop — yields a zero vector instead of NaN-poisoning the entire
+                                                    // identity-conditioned generation. Byte-identical for real embeddings (norm >> eps) (F-078).
+    let norm = maximum(&sqrt(&sumsq)?, Array::from_f32(1e-12))?;
     Ok(divide(x, &norm)?)
 }
 

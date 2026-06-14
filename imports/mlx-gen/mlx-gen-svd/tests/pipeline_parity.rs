@@ -109,6 +109,7 @@ fn svd_pipeline_matches_diffusers() {
             steps,
             min_g,
             max_g,
+            &mut |_| {},
         )
         .unwrap();
     let want_latents = to_nhwc5("final_latents");

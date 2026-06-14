@@ -597,10 +597,10 @@ fn add_ddpm_noise(schedule: &AlphaSchedule, x0: &Array, noise: &Array, t: usize)
 }
 
 /// Projected dense first-step peak memory, in GB, vs the latent pixel count `p = (edge/8)²`. The
-/// Kolors U-Net IS the SDXL U-Net, so the activation terms match the SDXL fit; the resident base is
-/// larger because the ChatGLM3-6B encoder stays loaded through training (a trainer field, not freed
-/// after caching). Measured (`first_step_memory_sweep`, 128 GB target, rank 16 / batch 1) — refit the
-/// base constant if this changes.
+/// Kolors U-Net IS the SDXL U-Net, so the activation terms match the SDXL fit. The ChatGLM3-6B encoder
+/// is freed (`self.chatglm = None` + `clear_cache()`) after caption caching, so the resident base here
+/// is just the U-Net + VAE and these constants are measured after that free (F-073). Measured
+/// (`first_step_memory_sweep`, 128 GB target, rank 16 / batch 1) — refit the base constant if this changes.
 fn projected_dense_peak_gb(p: f64, bf16: bool) -> f64 {
     // Measured AFTER the ChatGLM3 encoder is freed (the train-loop working set — what must fit the
     // unified budget): `first_step_memory_sweep` on the 128 GB target, f32 512/768/1024 →
@@ -624,9 +624,10 @@ fn preflight_memory_guard(edge: u32, bf16: bool) -> Result<()> {
     if projected > safe {
         return Err(format!(
             "kolors trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
-             (the forward working set materializes in one allocation, atop the resident ChatGLM3-6B \
-             encoder), exceeding this machine's ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × \
-             0.85). Enable Gradient Checkpointing or reduce the training resolution."
+             (the forward working set materializes in one allocation; the ChatGLM3-6B encoder is already \
+             freed, so this is the U-Net + VAE), exceeding this machine's ~{safe:.0} GB safe budget \
+             ({budget_gb:.0} GB MLX limit × 0.85). Enable Gradient Checkpointing or reduce the training \
+             resolution."
         )
         .into());
     }

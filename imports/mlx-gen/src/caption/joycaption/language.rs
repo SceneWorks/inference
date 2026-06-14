@@ -647,7 +647,7 @@ fn sample_token(
 
 /// Top-p (nucleus) selection: the highest-probability `(token, weight)` pairs in descending order
 /// whose cumulative weight first reaches `top_p · total`. Found with a partial **max-heap** selection
-/// — popped only until the threshold — instead of sorting all `vocab` entries every token (F-011); the
+/// — popped only until the threshold — instead of sorting all `vocab` entries every token (F-039); the
 /// finding's "partial-select before the host sort". For distinct weights (the universal case for a
 /// real softmax) the kept set and its order are identical to a full descending `sort_unstable_by`.
 /// At least one token is always kept.

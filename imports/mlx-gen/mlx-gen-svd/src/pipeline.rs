@@ -114,6 +114,7 @@ impl SvdPipeline {
         steps: usize,
         min_g: f32,
         max_g: f32,
+        on_step: &mut dyn FnMut(usize),
     ) -> Result<Array> {
         let sched = EdmSchedule::karras(steps, &self.scheduler);
 
@@ -141,6 +142,7 @@ impl SvdPipeline {
 
             let denoised = v_pred_denoised(&noise_pred, &latents, sigma)?;
             latents = euler_step(&latents, &denoised, sigma, sigma_next)?;
+            on_step(i + 1);
         }
         Ok(latents)
     }

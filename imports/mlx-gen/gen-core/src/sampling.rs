@@ -131,6 +131,11 @@ pub fn lcm_style_timesteps(
     original_steps: usize,
     num_steps: usize,
 ) -> Vec<usize> {
+    // Clamp caller-supplied counts so a 0 can't divide-by-zero (`num_train/original_steps`) or
+    // underflow `reversed.len()-1` on an empty table. Mirrors `build_flow_sigmas`'s clamp; the real
+    // floor is `validate_request` enforcing steps>=1 upstream (F-037).
+    let original_steps = original_steps.max(1);
+    let num_steps = num_steps.max(1);
     let k = num_train_timesteps / original_steps;
     // lcm_origin_timesteps = arange(1, original_steps+1)·k − 1, then reversed (descending).
     let origin: Vec<i64> = (1..=original_steps as i64)
@@ -148,6 +153,8 @@ pub fn lcm_style_timesteps(
 }
 
 /// Latent sequence length used for the flow-match empirical `mu` fit: `(height/16) * (width/16)`.
+/// Each dim is floored to `/16` before the multiply (matching the fork); dims `< 16` collapse to 0
+/// here, but callers validate the resolution upstream so that case never reaches the `mu` fit (F-089).
 pub fn image_seq_len(width: u32, height: u32) -> usize {
     ((height / 16) * (width / 16)) as usize
 }
@@ -287,6 +294,8 @@ impl LightningPolicy {
     /// `round(arange(N, 0, −N/num_steps)) − 1`; sigmas are `√((1-ᾱ)/ᾱ)` linearly interpolated at
     /// those (float) timesteps, with a trailing `0` (`final_sigmas_type="zero"`).
     pub fn new(sched: &AlphaSchedule, num_train_timesteps: usize, num_steps: usize) -> Self {
+        // Guard /0 (F-037); the real floor is `validate_request` enforcing steps>=1 upstream.
+        let num_steps = num_steps.max(1);
         let step_ratio = num_train_timesteps as f64 / num_steps as f64;
         // arange(N, 0, -step_ratio): N, N-step_ratio, … (num_steps entries), round, then −1.
         let timesteps: Vec<f32> = (0..num_steps)

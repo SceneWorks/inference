@@ -54,7 +54,10 @@ impl BerniniKnobs {
             use_src_id_rotary_emb: b("use_src_id_rotary_emb", d.use_src_id_rotary_emb),
             interpolate_src_id: b("interpolate_src_id", d.interpolate_src_id),
             max_trained_src_id: f("max_trained_src_id", d.max_trained_src_id as f32) as f64,
-            max_sequence_length: i("max_sequence_length", d.max_sequence_length as i64) as usize,
+            // Clamp to >=0 before the usize cast: a negative `max_sequence_length` in JSON would wrap
+            // to a huge usize and drive an unbounded allocation downstream (F-080).
+            max_sequence_length: i("max_sequence_length", d.max_sequence_length as i64).max(0)
+                as usize,
         }
     }
 }
