@@ -342,11 +342,11 @@ fn lens_trainer_trains_and_reloads_lokr() {
     let config = TrainingConfig {
         rank: 8,
         alpha: 8.0,
-        // LoKr's delta is `kron(w1, w2)` with both factors initialised small, so the effective
-        // gradient magnitude is far smaller than LoRA's `B·A` — it needs a higher lr to learn at a
-        // comparable rate in a bounded run (standard LyCORIS guidance; lr 1e-4 barely moves it,
-        // whereas it converges stably at 1e-3 — the inverse of LoRA, which 1e-3 overshoots).
-        learning_rate: 1e-3,
+        // sc-5179 — with the PEFT-matching LoKr init (`w1` zero-init, `w2` kaiming-uniform `1/√fan_in`,
+        // not the former fixed `N(0,0.02)`), the LoKr lr now tracks PEFT's, so a Python LoKr lr
+        // transfers: it converges at the same 1e-4 as the LoRA e2e — no longer the ~10× higher 1e-3 the
+        // old undersized init forced (whose tiny nonzero factor made the effective gradient ~10× weak).
+        learning_rate: 1e-4,
         steps: 80,
         resolution: 64,
         save_every: 0,

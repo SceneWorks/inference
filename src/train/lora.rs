@@ -242,11 +242,26 @@ pub fn save_lora_peft(
     Ok(())
 }
 
-/// Initialise trainable LoKr factors per target. The weight `[out,in]` factors as
-/// `kron(w1[out_a,in_a], w2[out_b,in_b])`; `w2` is low-ranked to `rank` when `rank < min(out_b,in_b)`.
-/// `w1 ~ N(0,0.02)`; the SECOND factor is zero-initialised (`w2` full, or `w2_b` low-rank) so the
-/// initial delta is exactly 0 (the LoKr analog of LoRA's `B = 0`). `factor` is the decompose knob
-/// (`-1` = balanced/auto).
+/// Initialise trainable LoKr factors per target, matching **PEFT `LoKrConfig(init_weights=True)`'s
+/// `reset_adapter_parameters`** (sc-5179) — the init the Python LoRA/LoKr trainers
+/// (`lens_train_runner.py` and the SDXL/Wan/etc. backends) use, so a *Python LoKr learning rate
+/// transfers* to this native path.
+///
+/// The weight `[out,in]` factors as `kron(w1[out_a,in_a], w2[out_b,in_b])` (`decompose_both` is off,
+/// PEFT's default — `w1` is never further low-ranked). `w2` is low-ranked to `rank` when
+/// `rank < max(out_b,in_b)/2` (PEFT's `use_w2` predicate). The **first** factor `w1` is
+/// **zero-initialised**; the **second** factor `w2` (full, or both `w2_a`/`w2_b` low-rank) is
+/// **kaiming-uniform `a=√5`** ⇒ `U(±1/√fan_in)`, `fan_in` = the factor's input dim. Because the zeroed
+/// factor is `w1`, the initial delta `kron(0, w2)·(alpha/rank) = 0` (the LoKr analog of LoRA's
+/// `B = 0`), while the *non*-zero factor's **fan-in-scaled** magnitude is what makes the LoKr
+/// lr-sensitivity track PEFT. `factor` is the decompose knob (`-1` = balanced/auto).
+///
+/// NOTE (sc-5179): this *replaced* the prior `w1 ~ N(0,0.02)` / zeroed-`w2` init — the **opposite**
+/// zeroed factor and a **fixed** 0.02 scale (~4–5× below PEFT's fan-in-scaled kaiming), which is why
+/// LoKr formerly needed a ~10× higher, non-transferable lr than LoRA. The save/round-trip format
+/// (`lokr_w1` + `lokr_w2`|`lokr_w2_a`/`lokr_w2_b`) and `reconstruct_lokr_delta` are unchanged, so prior
+/// adapters still load; only newly-*trained* LoKr dynamics change. (The `factor > 0` factorization
+/// sort still differs from PEFT — a separate pre-existing divergence; the default `factor = -1` matches.)
 pub fn build_lokr_targets<H: AdaptableHost>(
     host: &mut H,
     target_paths: &[String],
@@ -256,7 +271,17 @@ pub fn build_lokr_targets<H: AdaptableHost>(
 ) -> Result<(Vec<LokrTarget>, LoraParams)> {
     let mut targets = Vec::with_capacity(target_paths.len());
     let mut params = LoraParams::new();
-    let small = Array::from_slice(&[0.02f32], &[1]);
+    // `torch.nn.init.kaiming_uniform_(a=√5)` on a 2-D `[d0, d1]` factor ⇒ `U(±1/√fan_in)` with
+    // `fan_in = d1` (gain `√(2/(1+5)) = 1/√3`, bound `√3·gain/√fan_in = 1/√fan_in`).
+    let kaiming = |shape: [i32; 2], key: &Array| -> Result<Array> {
+        let bound = 1.0f32 / (shape[1] as f32).sqrt();
+        Ok(random::uniform::<_, f32>(
+            -bound,
+            bound,
+            &shape[..],
+            Some(key),
+        )?)
+    };
     for (i, path) in target_paths.iter().enumerate() {
         let segs: Vec<&str> = path.split('.').collect();
         let lin = host.adaptable_mut(&segs).ok_or_else(|| -> crate::Error {
@@ -266,24 +291,21 @@ pub fn build_lokr_targets<H: AdaptableHost>(
         let (out_a, out_b) = factorization(shape[0], factor);
         let (in_a, in_b) = factorization(shape[1], factor);
 
-        let k1 = random::key(seed.wrapping_add(7 * i as u64 + 1))?;
-        let w1 = multiply(
-            &random::normal::<f32>(&[out_a, in_a], None, None, Some(&k1))?,
-            &small,
-        )?;
+        // w1 = zeros [out_a, in_a] — the zeroed factor, so the initial delta is exactly 0.
+        let w1 = Array::zeros::<f32>(&[out_a, in_a])?;
         let w1_key: Rc<str> = Rc::from(format!("{path}.lokr_w1"));
         mlx_rs::transforms::eval([&w1])?;
         params.insert(w1_key.clone(), w1);
 
         let (mut w2_key, mut w2a_key, mut w2b_key) = (None, None, None);
-        if rank > 0 && rank < out_b.min(in_b) {
-            // Low-rank w2 = w2_a @ w2_b; w2_b zero-init → factor2 starts at 0.
-            let k2 = random::key(seed.wrapping_add(7 * i as u64 + 3))?;
-            let w2a = multiply(
-                &random::normal::<f32>(&[out_b, rank], None, None, Some(&k2))?,
-                &small,
-            )?;
-            let w2b = Array::zeros::<f32>(&[rank, in_b])?;
+        // PEFT `use_w2 = not(r < max(out_b,in_b)/2)`: a low-rank w2 = w2_a @ w2_b only when r is below
+        // half the larger factor dim, else a full w2. Both factors are kaiming-init (the delta is held
+        // at 0 by the zeroed w1, not by zeroing the second factor).
+        if rank > 0 && (rank as f32) < (out_b.max(in_b) as f32) / 2.0 {
+            let ka = random::key(seed.wrapping_add(7 * i as u64 + 3))?;
+            let kb = random::key(seed.wrapping_add(7 * i as u64 + 5))?;
+            let w2a = kaiming([out_b, rank], &ka)?; // fan_in = rank
+            let w2b = kaiming([rank, in_b], &kb)?; // fan_in = in_b
             let ak: Rc<str> = Rc::from(format!("{path}.lokr_w2_a"));
             let bk: Rc<str> = Rc::from(format!("{path}.lokr_w2_b"));
             mlx_rs::transforms::eval([&w2a, &w2b])?;
@@ -292,8 +314,8 @@ pub fn build_lokr_targets<H: AdaptableHost>(
             w2a_key = Some(ak);
             w2b_key = Some(bk);
         } else {
-            // Full w2, zero-init.
-            let w2 = Array::zeros::<f32>(&[out_b, in_b])?;
+            let k2 = random::key(seed.wrapping_add(7 * i as u64 + 3))?;
+            let w2 = kaiming([out_b, in_b], &k2)?; // fan_in = in_b
             let wk: Rc<str> = Rc::from(format!("{path}.lokr_w2"));
             mlx_rs::transforms::eval([&w2])?;
             params.insert(wk.clone(), w2);
@@ -542,6 +564,87 @@ mod tests {
         let (a, b) = factorization(2048, 16);
         assert_eq!(a * b, 2048);
         assert!(a <= b);
+    }
+
+    #[test]
+    fn build_lokr_init_matches_peft_reset_adapter_parameters() {
+        // sc-5179 — the native LoKr init must match PEFT `LoKrConfig(init_weights=True)`'s
+        // `reset_adapter_parameters` (w1 zero-init, w2 kaiming-uniform a=√5), so a Python LoKr lr
+        // transfers. A minimal one-Linear host stands in for a model.
+        use crate::adapters::AdaptableLinear;
+        struct OneLin(AdaptableLinear);
+        impl AdaptableHost for OneLin {
+            fn adaptable_mut(&mut self, p: &[&str]) -> Option<&mut AdaptableLinear> {
+                if p == ["w"] {
+                    Some(&mut self.0)
+                } else {
+                    None
+                }
+            }
+            fn adaptable_paths(&self) -> Vec<String> {
+                vec!["w".into()]
+            }
+        }
+        // out=64 → fac(-1)=(8,8); in=48 → (6,8). out_b = in_b = 8. rank 3 < max(8,8)/2 = 4 → low-rank.
+        let host_w = Array::zeros::<f32>(&[64, 48]).unwrap();
+        let mut host = OneLin(AdaptableLinear::dense(host_w, None));
+        let rank = 3;
+        let (targets, params) =
+            build_lokr_targets(&mut host, &["w".to_string()], rank, -1, 7).unwrap();
+        assert_eq!(targets.len(), 1);
+        let t = &targets[0];
+
+        // w1 is the ZEROED factor (PEFT), shape [out_a=8, in_a=6].
+        let w1 = &params[&t.w1_key];
+        assert_eq!(w1.shape(), &[8, 6]);
+        assert_eq!(
+            w1.abs().unwrap().sum(None).unwrap().item::<f32>(),
+            0.0,
+            "w1 must be zero-init (PEFT reset_adapter_parameters), not N(0,0.02)"
+        );
+
+        // w2 is low-rank kaiming: no full w2; w2_a [8,3] bound 1/√3, w2_b [3,8] bound 1/√8.
+        assert!(
+            t.w2_key.is_none() && t.w2a_key.is_some() && t.w2b_key.is_some(),
+            "rank 3 < max(8,8)/2 must take the low-rank w2 path"
+        );
+        let w2a = &params[t.w2a_key.as_ref().unwrap()];
+        let w2b = &params[t.w2b_key.as_ref().unwrap()];
+        let maxabs = |a: &Array| a.abs().unwrap().max(None).unwrap().item::<f32>();
+        let bound_a = 1.0f32 / (rank as f32).sqrt(); // ≈ 0.577
+        let bound_b = 1.0f32 / 8f32.sqrt(); // ≈ 0.354
+                                            // Within the kaiming bound, and clearly spread (NOT the old fixed-0.02 scale, whose max would
+                                            // be ~0.06 — well under bound·0.3 here).
+        assert!(
+            maxabs(w2a) <= bound_a + 1e-6 && maxabs(w2a) > bound_a * 0.3,
+            "w2_a must be kaiming U(±1/√rank): max {} vs bound {bound_a}",
+            maxabs(w2a)
+        );
+        assert!(
+            maxabs(w2b) <= bound_b + 1e-6 && maxabs(w2b) > bound_b * 0.3,
+            "w2_b must be kaiming U(±1/√in_b): max {} vs bound {bound_b}",
+            maxabs(w2b)
+        );
+
+        // Initial delta is exactly 0 (w1 = 0) — the adapter starts as a no-op, like LoRA's B = 0.
+        let delta = reconstruct_lokr_delta(
+            1.0,
+            rank as f32,
+            &[64, 48],
+            Some(w1),
+            None,
+            None,
+            None,
+            Some(w2a),
+            Some(w2b),
+            Dtype::Float32,
+        )
+        .unwrap();
+        assert_eq!(
+            delta.abs().unwrap().max(None).unwrap().item::<f32>(),
+            0.0,
+            "initial LoKr delta must be exactly 0"
+        );
     }
 
     #[test]
