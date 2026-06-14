@@ -231,3 +231,70 @@ fn forward_finite(unet: &mlx_gen_sdxl::UNet2DConditionModel) {
     let s = eps.sum(None).unwrap().item::<f32>();
     assert!(s.is_finite(), "reloaded-adapter forward should be finite");
 }
+
+/// sc-5637 — preview samples. Proves the Kolors render path (install in-progress adapter → ChatGLM
+/// CFG denoise → VAE decode → `Image`) on real weights. Run:
+///   cargo test -p mlx-gen-kolors --release --test trainer_e2e -- --ignored --nocapture kolors_trainer_emits_preview_samples
+#[test]
+#[ignore = "needs real Kolors weights (+ tokenizer.json overlay)"]
+fn kolors_trainer_emits_preview_samples() {
+    let tmp = std::env::temp_dir().join("kolors_trainer_samples_e2e");
+    let items = make_dataset(&tmp);
+    assert_eq!(mlx_gen_kolors::MODEL_ID, "kolors");
+    let mut trainer =
+        mlx_gen::load_trainer("kolors", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+            .expect("kolors trainer should be registered");
+
+    let mut cfg = config(NetworkType::Lora);
+    cfg.steps = 8;
+    cfg.sample_every = 4;
+    cfg.sample_steps = 6;
+    cfg.sample_guidance_scale = 5.0;
+    cfg.sample_prompts = vec![
+        "a solid red colour swatch".to_string(),
+        "a solid blue colour swatch".to_string(),
+    ];
+    let req = TrainingRequest {
+        items,
+        config: cfg,
+        output_dir: tmp.join("out"),
+        file_name: "swatch_lora.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut samples: Vec<(u32, u32, u32, String)> = Vec::new();
+    trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Sample {
+                step,
+                index,
+                total,
+                prompt,
+                image,
+            } = p
+            {
+                assert!(
+                    image.width > 0 && image.height > 0,
+                    "preview has dimensions"
+                );
+                assert_eq!(
+                    image.pixels.len(),
+                    (image.width * image.height * 3) as usize,
+                    "preview is a packed RGB8 buffer"
+                );
+                assert!(
+                    image.pixels.iter().any(|&b| b != 0),
+                    "preview is not an all-black frame"
+                );
+                samples.push((step, index, total, prompt));
+            }
+        })
+        .expect("training with sampling should succeed");
+
+    assert_eq!(samples.len(), 4, "expected 4 previews, got {samples:?}");
+    println!(
+        "[kolors-samples] e2e OK — {} previews: {samples:?}",
+        samples.len()
+    );
+}

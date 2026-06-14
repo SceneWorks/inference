@@ -335,3 +335,98 @@ fn wan_ti2v_5b_trainer_prodigy_optimizer() {
         "prodigy",
     );
 }
+
+/// sc-5637 — preview samples (one still frame). A short run with `sample_every`/`sample_prompts` set
+/// must emit `TrainingProgress::Sample` events at the cadence, each a real decoded RGB frame rendered
+/// from the in-progress adapter(s). Proves the Wan render path (install every expert's adapter → the
+/// family's own inference denoise [boundary-switched `denoise_moe` for the MoE / dense `denoise` for
+/// TI2V-5B] → VAE decode → first frame as `Image`) on real weights. Single frame (F=1) + one prompt
+/// keeps the per-cadence cost down on the heavy 14B/5B loads.
+fn run_sample_smoke(model_id: &str, snapshot: PathBuf) {
+    let tmp = std::env::temp_dir().join(format!("{model_id}_samples_e2e"));
+    let items = make_dataset(&tmp);
+    let mut trainer = mlx_gen::load_trainer(model_id, &LoadSpec::new(WeightsSource::Dir(snapshot)))
+        .unwrap_or_else(|e| panic!("{model_id} trainer should load: {e}"));
+
+    let config = TrainingConfig {
+        rank: 8,
+        alpha: 8.0,
+        learning_rate: 1e-4,
+        steps: 4, // dual: 2/expert (alternating); dense: 4 on the single expert
+        resolution: 256,
+        save_every: 0,
+        seed: 7,
+        network_type: NetworkType::Lora,
+        sample_every: 4,
+        sample_steps: 4,
+        sample_guidance_scale: 1.0, // CFG off for previews (ctx_uncond None)
+        sample_prompts: vec!["a solid red colour swatch".to_string()],
+        ..Default::default()
+    };
+    let req = TrainingRequest {
+        items,
+        config,
+        output_dir: tmp.join("out"),
+        file_name: "swatch.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut samples: Vec<(u32, u32, u32, String)> = Vec::new();
+    trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Sample {
+                step,
+                index,
+                total,
+                prompt,
+                image,
+            } = p
+            {
+                assert!(
+                    image.width > 0 && image.height > 0,
+                    "preview frame has dimensions"
+                );
+                assert_eq!(
+                    image.pixels.len(),
+                    (image.width * image.height * 3) as usize,
+                    "preview frame is a packed RGB8 buffer"
+                );
+                assert!(
+                    image.pixels.iter().any(|&b| b != 0),
+                    "preview frame is not all-black"
+                );
+                samples.push((step, index, total, prompt));
+            }
+        })
+        .expect("training with sampling should succeed");
+
+    assert!(
+        !samples.is_empty(),
+        "expected at least one preview frame, got {samples:?}"
+    );
+    println!(
+        "[{model_id}-samples] e2e OK — {} preview frame(s): {samples:?}",
+        samples.len()
+    );
+}
+
+#[test]
+#[ignore = "needs the converted Wan2.2-T2V-A14B MoE bf16 checkpoint"]
+fn wan_t2v_a14b_trainer_emits_preview_samples() {
+    assert_eq!(mlx_gen_wan::MODEL_ID_T2V_14B, "wan2_2_t2v_14b");
+    run_sample_smoke(
+        "wan2_2_t2v_14b",
+        snapshot(
+            "WAN_A14B_MODEL_DIR",
+            ".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16",
+        ),
+    );
+}
+
+#[test]
+#[ignore = "needs the converted Wan2.2-TI2V-5B bf16 checkpoint"]
+fn wan_ti2v_5b_trainer_emits_preview_samples() {
+    assert_eq!(mlx_gen_wan::MODEL_ID, "wan2_2_ti2v_5b");
+    run_sample_smoke("wan2_2_ti2v_5b", ti2v_5b_snapshot());
+}
