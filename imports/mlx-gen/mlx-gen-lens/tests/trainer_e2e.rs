@@ -431,3 +431,79 @@ fn lens_trainer_trains_and_reloads_lokr() {
         "the trained LoKr must shift the DiT output beyond fp noise (rel-L2 {shift:.5})"
     );
 }
+
+/// sc-5637 — preview samples. Proves the Lens render path (install in-progress adapter → norm-rescaled
+/// CFG flow-match denoise → Flux.2 VAE decode → `Image`) on real weights. Run:
+///   cargo test -p mlx-gen-lens --release --test trainer_e2e -- --ignored --nocapture lens_trainer_emits_preview_samples
+#[test]
+#[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
+fn lens_trainer_emits_preview_samples() {
+    let root = snapshot();
+    let tmp = std::env::temp_dir().join("lens_trainer_samples_e2e");
+    let items = make_dataset(&tmp);
+    assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
+    let mut trainer =
+        mlx_gen::load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
+            .expect("lens trainer should be registered");
+
+    let config = TrainingConfig {
+        rank: 8,
+        alpha: 8.0,
+        learning_rate: 1e-4,
+        steps: 8,
+        resolution: 64,
+        save_every: 0,
+        seed: 7,
+        sample_every: 4,
+        sample_steps: 6,
+        sample_guidance_scale: 4.0,
+        sample_prompts: vec![
+            "a solid red colour swatch".to_string(),
+            "a solid blue colour swatch".to_string(),
+        ],
+        ..Default::default()
+    };
+    let req = TrainingRequest {
+        items,
+        config,
+        output_dir: tmp.join("out"),
+        file_name: "swatch_lora.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut samples: Vec<(u32, u32, u32, String)> = Vec::new();
+    trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Sample {
+                step,
+                index,
+                total,
+                prompt,
+                image,
+            } = p
+            {
+                assert!(
+                    image.width > 0 && image.height > 0,
+                    "preview has dimensions"
+                );
+                assert_eq!(
+                    image.pixels.len(),
+                    (image.width * image.height * 3) as usize,
+                    "preview is a packed RGB8 buffer"
+                );
+                assert!(
+                    image.pixels.iter().any(|&b| b != 0),
+                    "preview is not an all-black frame"
+                );
+                samples.push((step, index, total, prompt));
+            }
+        })
+        .expect("training with sampling should succeed");
+
+    assert_eq!(samples.len(), 4, "expected 4 previews, got {samples:?}");
+    println!(
+        "[lens-samples] e2e OK — {} previews: {samples:?}",
+        samples.len()
+    );
+}
