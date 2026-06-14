@@ -79,9 +79,11 @@ impl AdaLayerNormContinuous {
     }
 
     fn forward(&self, x: &Array, temb: &Array) -> Result<Array> {
+        // dtype-follow the modulation operand (sc-5188): a strong-f32 `1` in the `1 + scale` step
+        // would re-promote a bf16 stream to f32 at `norm_out`. No-op in f32 mode (the cast is identity).
         let mod_params = self.linear.forward(&silu(temb)?)?; // [B, 2·H]
         let parts = split(&mod_params, 2, 1)?; // scale, shift
-        let one = Array::from_slice(&[1.0f32], &[1]);
+        let one = Array::from_slice(&[1.0f32], &[1]).as_dtype(mod_params.dtype())?;
         let scale = add(&parts[0], &one)?.expand_dims(1)?; // [B, 1, H]
         let shift = parts[1].expand_dims(1)?;
         let normed = layer_norm(x, None, None, 1e-6)?;

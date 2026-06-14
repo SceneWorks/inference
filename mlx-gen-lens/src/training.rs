@@ -614,15 +614,16 @@ const PREFLIGHT_TXT_TOKENS: f64 = 64.0;
 ///
 /// MEASURED (`first_step_ckpt_sweep`, 128 GB Mac17,6, rank 16 / 192 targets / batch 1, caption
 /// `txt_len = 64`) with SDPA-segment checkpointing on and only the DiT resident (the gpt-oss encoder
-/// is freed before the train loop, the VAE is idle):
+/// is freed before the train loop, the VAE is idle), AFTER the sc-5188 bf16 re-promotion fix:
 ///   f32  edge 512/768/1024 (s = 1088/2368/4160) → 22.78 / 31.83 / 45.22 GB
-///   bf16 edge 512/768/1024                       → 25.14 / 34.18 / 47.57 GB
-/// The exact 3-point fit reproduces all three per dtype. NOTE the Lens bf16 dense path is ~2-2.4 GB
-/// ABOVE f32 (a near-constant ~10 GB activation offset) — the OPPOSITE of z-image, where bf16 halves
-/// the working set; on the Lens DiT bf16 is the load-time precision/ecosystem default (sc-5148), not a
-/// memory win. The DiT is smaller per-layer than z-image's, so this curve is measured fresh (not
-/// reused). Assumes micro-batch 1; refit (via `first_step_ckpt_sweep`) if the activation shape or
-/// resident set changes. `projection_matches_measured_curve` pins it to the measured points.
+///   bf16 edge 512/768/1024                       → 11.52 / 16.04 / 22.79 GB
+/// The exact 3-point fit reproduces all three per dtype. bf16 is now ~half f32 (the expected halving,
+/// like z-image). Until sc-5188 a strong-f32 `1 + scale` AdaLN modulation constant silently re-promoted
+/// the bf16 DiT stream to f32 at block 0, so the whole DiT ran f32 in "bf16" mode and peaked ~2-2.4 GB
+/// ABOVE f32 (the f32 weight up-casts piled on top of f32 activations). The DiT is smaller per-layer
+/// than z-image's, so this curve is measured fresh (not reused). Assumes micro-batch 1; refit (via
+/// `first_step_ckpt_sweep`) if the activation shape or resident set changes.
+/// `projection_matches_measured_curve` pins it to the measured points.
 fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
     if bf16 {
         PREFLIGHT_BF16.0 + PREFLIGHT_BF16.1 * s + PREFLIGHT_BF16.2 * s * s
@@ -635,7 +636,7 @@ fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
 /// the measured `first_step_ckpt_sweep` peaks (see its docs). `projection_matches_measured_curve`
 /// enforces the measured anchors; refit both tuples if the sweep prints materially different numbers.
 const PREFLIGHT_F32: (f64, f64, f64) = (15.43, 6.618e-3, 1.308e-7);
-const PREFLIGHT_BF16: (f64, f64, f64) = (17.80, 6.602e-3, 1.333e-7);
+const PREFLIGHT_BF16: (f64, f64, f64) = (7.875, 3.266e-3, 7.666e-8);
 
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
 /// SIGKILLed), returning a catchable, actionable error instead. The budget is MLX's own reported
@@ -1206,6 +1207,125 @@ mod first_step_repro {
             "checkpointed peak must fit unified memory: {ckpt_peak:.2} GB"
         );
     }
+
+    /// sc-5188 — the silent-re-promotion detector. bf16 training must use materially LESS memory than
+    /// f32, because bf16 activations are half-size and bf16 matmuls don't up-cast the weights. A
+    /// strong-f32 constant anywhere in the DiT forward (the `1 + scale` AdaLN modulation was the
+    /// culprit — block.rs `modulate` / transformer.rs `AdaLayerNormContinuous`) re-promotes the bf16
+    /// stream to f32 at block 0 and cascades f32 through the whole net, erasing the bf16 win and adding
+    /// the f32 weight up-casts ON TOP (so bf16 peaked ABOVE f32). This asserts the bf16 first-step peak
+    /// is well below f32 at a mid bucket — a future re-promotion regression would lift the ratio back
+    /// toward (or above) 1.0 and trip this. Measured ratio ≈ 0.50 (16.04 vs 31.83 GB at edge 768).
+    #[test]
+    #[ignore = "needs real microsoft/Lens weights; run as its own process"]
+    fn bf16_peak_below_f32_no_silent_repromotion() {
+        let edge = 768u32; // mid bucket — big enough to expose a re-promotion, cheap enough to run
+        let f32_peak = {
+            let mut dit = build_dit(Dtype::Float32);
+            let (adapter, params) = build_targets(&mut dit);
+            let (_, p) = one_step(
+                &mut dit,
+                &adapter,
+                &params,
+                edge,
+                Dtype::Float32,
+                None,
+                true,
+                "f32",
+            );
+            drop(dit);
+            clear_cache();
+            p
+        };
+        let bf16_peak = {
+            let mut dit = build_dit(Dtype::Bfloat16);
+            let (adapter, params) = build_targets(&mut dit);
+            let (_, p) = one_step(
+                &mut dit,
+                &adapter,
+                &params,
+                edge,
+                Dtype::Bfloat16,
+                None,
+                true,
+                "bf16",
+            );
+            drop(dit);
+            clear_cache();
+            p
+        };
+        eprintln!(
+            "[sc-5188] edge {edge}  f32 {f32_peak:.2} GB  bf16 {bf16_peak:.2} GB  (ratio {:.2})",
+            bf16_peak / f32_peak
+        );
+        assert!(
+            bf16_peak < f32_peak * 0.85,
+            "bf16 first-step peak {bf16_peak:.2} GB must be well below f32 {f32_peak:.2} GB — a \
+             strong-f32 constant is re-promoting the bf16 DiT stream to f32 (sc-5188)"
+        );
+    }
+
+    /// Flattened cosine over all elements (f32).
+    fn forward_cosine(a: &Array, b: &Array) -> f32 {
+        let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
+        let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
+        let dot = a.multiply(&b).unwrap().sum(None).unwrap().item::<f32>();
+        let na = a
+            .multiply(&a)
+            .unwrap()
+            .sum(None)
+            .unwrap()
+            .item::<f32>()
+            .sqrt();
+        let nb = b
+            .multiply(&b)
+            .unwrap()
+            .sum(None)
+            .unwrap()
+            .item::<f32>()
+            .sqrt();
+        dot / (na * nb)
+    }
+
+    /// sc-5188 — bf16 inference FIDELITY (the inference-side complement to the memory guard, and the
+    /// guard the bf16 path never had — which is exactly why the re-promotion hid). With the fix the
+    /// bf16 DiT forward genuinely runs bf16 (fed bf16 inputs, as the pipeline does); this asserts that
+    /// true-bf16 output stays close to the f32 output on real weights. A cosine well below 1 would mean
+    /// the bf16 path is lossy/broken — not merely lower precision. (Pre-fix this was a vacuous ~1.0
+    /// because the bf16 stream WAS silently f32.) Inputs are fed at the run dtype, mirroring inference:
+    /// the pipeline casts latents + caption features to the DiT dtype before the forward.
+    #[test]
+    #[ignore = "needs real microsoft/Lens weights; run as its own process"]
+    fn bf16_forward_matches_f32() {
+        let edge = 256u32; // small — the dtype fidelity is resolution-agnostic
+        let (x0, _noise, feats, mask, latent) = synth(edge);
+        let timestep = Array::from_slice(&[0.5f32], &[1]);
+
+        let out_f32 = {
+            let dit = build_dit(Dtype::Float32);
+            dit.forward(&x0, &feats, Some(&mask), &timestep, 1, latent, latent)
+                .unwrap()
+        };
+        // Feed bf16 inputs (the inference convention: the pipeline casts latents + features to the DiT
+        // dtype). Without the sc-5188 fix the AdaLN `1 + scale` would re-promote this straight back to
+        // f32 at block 0, making the test vacuous; with the fix the stream stays bf16 end to end.
+        let x0_b = x0.as_dtype(Dtype::Bfloat16).unwrap();
+        let feats_b: Vec<Array> = feats
+            .iter()
+            .map(|f| f.as_dtype(Dtype::Bfloat16).unwrap())
+            .collect();
+        let out_bf16 = {
+            let dit = build_dit(Dtype::Bfloat16);
+            dit.forward(&x0_b, &feats_b, Some(&mask), &timestep, 1, latent, latent)
+                .unwrap()
+        };
+        let cos = forward_cosine(&out_f32, &out_bf16);
+        eprintln!("[sc-5188] bf16-vs-f32 DiT forward cosine {cos:.6}");
+        assert!(
+            cos > 0.99,
+            "bf16 DiT forward must stay close to f32 (sound bf16, not broken): cosine {cos:.6}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1225,7 +1345,7 @@ mod preflight_tests {
                 "f32 projection at s={s} = {p:.2} GB, expected ≈{measured} GB"
             );
         }
-        for (s, measured) in [(1088.0, 25.14), (2368.0, 34.18), (4160.0, 47.57)] {
+        for (s, measured) in [(1088.0, 11.52), (2368.0, 16.04), (4160.0, 22.79)] {
             let p = projected_dense_peak_gb(s, true);
             assert!(
                 (p - measured).abs() < 1.0,
@@ -1237,9 +1357,10 @@ mod preflight_tests {
             assert!(projected_dense_peak_gb(1088.0, bf16) < projected_dense_peak_gb(2368.0, bf16));
             assert!(projected_dense_peak_gb(2368.0, bf16) < projected_dense_peak_gb(4160.0, bf16));
         }
-        // Lens bf16 sits ABOVE f32 (the ~10 GB activation offset) — the opposite of z-image; this
-        // pins that the curves were not accidentally swapped.
-        assert!(projected_dense_peak_gb(4160.0, true) > projected_dense_peak_gb(4160.0, false));
+        // Post sc-5188 (bf16 re-promotion fix) the Lens bf16 dense path is ~half f32 (like z-image). A
+        // regression that re-promotes the bf16 stream to f32 would lift bf16 back to/above f32, so pin
+        // bf16 < f32 — the projected-curve analog of the real-weight `bf16_peak_below_f32` guard.
+        assert!(projected_dense_peak_gb(4160.0, true) < projected_dense_peak_gb(4160.0, false));
     }
 
     /// The guard must FIRE (catchable error, not SIGKILL) when the dense first-step peak exceeds the
@@ -1259,10 +1380,14 @@ mod preflight_tests {
         // A 128 GB-class budget (safe ≈ 108 GB) comfortably fits dense 1024 in both dtypes.
         assert!(check_preflight_budget(1024, true, 128.0).is_ok());
         assert!(check_preflight_budget(1024, false, 128.0).is_ok());
-        // A 64 GB-class budget (safe ≈ 54 GB) still fits 1024 dense (~45-48 GB) but not a much larger
-        // resolution — the guard is machine-aware, not a fixed threshold.
+        // A 64 GB-class budget (safe ≈ 54 GB) fits 1024 dense in both dtypes (f32 ~45 GB, bf16 ~23 GB
+        // post sc-5188) but a much larger resolution still overflows — the guard is machine-aware, not
+        // a fixed threshold. f32 1440 (~78 GB) exceeds the 64 GB safe budget; bf16 1440 (~40 GB) fits
+        // 64 GB but not a 32 GB machine.
         assert!(check_preflight_budget(1024, true, 64.0).is_ok());
-        assert!(check_preflight_budget(1440, true, 64.0).is_err());
+        assert!(check_preflight_budget(1024, false, 64.0).is_ok());
+        assert!(check_preflight_budget(1440, false, 64.0).is_err());
+        assert!(check_preflight_budget(1440, true, 32.0).is_err());
     }
 }
 
