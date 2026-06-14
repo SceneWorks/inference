@@ -40,7 +40,8 @@
 //! stage resolutions and injected into the **video** stream as a clean latent at frame 0 (per-frame
 //! denoise mask, `image_strength` → `1 − strength`), threaded through the joint A/V denoise via
 //! `generate_av_latents`' `video_cond` — the audio stays pure-noise, matching `generate_av.py`'s
-//! I2V+Audio. The VAE **encoder** is loaded for this. LoRA/LoKr are sibling slices.
+//! I2V+Audio. The VAE **encoder** is loaded **lazily** on first encode, so pure-T2V runs never pay
+//! its resident cost (F-048). LoRA/LoKr are sibling slices.
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -356,10 +357,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let vae_w = Weights::from_file(root.join("vae_decoder.safetensors"))?;
     let audio_vae_w = Weights::from_file(root.join("audio_vae.safetensors"))?;
     let vocoder_w = Weights::from_file(root.join("vocoder.safetensors"))?;
-    // The VAE **encoder** is loaded so the model can serve I2V (sc-2685): it VAE-encodes the
-    // conditioning image at both stage resolutions (pure-T2V+A requests never touch it). The reference
-    // `generate_av.py` supports I2V+Audio — the video is image-conditioned, the audio stays pure-noise.
-    let vae_enc_w = Weights::from_file(root.join("vae_encoder.safetensors"))?;
 
     // The AudioVideo text encoder runs **bf16** activations (the reference TE dtype; S1-validated) —
     // dense for the default `…-bf16` Gemma or selectively quantized per the snapshot — producing both
@@ -387,8 +384,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }
 
     let upsampler = LatentUpsampler::from_weights(&upsampler_w)?;
-    // The VAE carries its encoder (Some) so the model can serve I2V conditioning.
-    let vae = LtxVideoVae::from_weights(&vae_w, Some(&vae_enc_w), &vae_config)?;
+    // The VAE encoder serves I2V conditioning (sc-2685) but pure-T2V+A requests never touch it, so it
+    // is loaded **lazily** on first encode — `vae_encoder.safetensors` (hundreds of MB) stays off the
+    // resident set for T2V (F-048). `generate_av.py` supports I2V+Audio (image-conditioned video).
+    let vae = LtxVideoVae::from_weights_lazy_encoder(
+        &vae_w,
+        root.join("vae_encoder.safetensors"),
+        &vae_config,
+    )?;
     // The audio VAE decoder + vocoder run f32 (post-sampling quality islands, gated bit-exact).
     let audio_decoder = AudioDecoder::from_weights(&audio_vae_w, &audio_vae_config)?;
     let vocoder = LtxVocoder::from_weights(&vocoder_w, &vocoder_config)?;

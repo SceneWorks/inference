@@ -80,6 +80,39 @@ fn encode_matches_reference() {
 }
 
 #[test]
+#[ignore = "needs ltx_2_3_base_q8 vae_encoder.safetensors (~640 MB)"]
+fn lazy_encoder_matches_eager() {
+    // F-048: the lazily-loaded encoder (built from the file on first encode) must be byte-identical
+    // to the eager encoder (built from pre-loaded weights) — same weights, only the load timing
+    // differs. This is the parity gate for deferring the encoder load off the T2V resident set.
+    let dir = base_dir();
+    let cfg = LtxVaeConfig::from_model_dir(&dir).expect("embedded_config.json vae block");
+    let dec = Weights::from_file(dir.join("vae_decoder.safetensors")).expect("vae_decoder");
+    let enc = Weights::from_file(dir.join("vae_encoder.safetensors")).expect("vae_encoder");
+    let g = Weights::from_file(GOLDEN).expect("golden");
+    let enc_in = g.require("enc_in").unwrap();
+
+    let eager = LtxVideoVae::from_weights(&dec, Some(&enc), &cfg).expect("eager VAE");
+    let lazy =
+        LtxVideoVae::from_weights_lazy_encoder(&dec, dir.join("vae_encoder.safetensors"), &cfg)
+            .expect("lazy VAE");
+    assert!(
+        lazy.has_encoder(),
+        "lazy VAE advertises an encoder before the first encode"
+    );
+
+    let got_eager = eager.encode(enc_in).expect("eager encode");
+    let got_lazy = lazy.encode(enc_in).expect("lazy encode");
+    assert_eq!(got_lazy.shape(), got_eager.shape(), "lazy vs eager shape");
+    let pr = peak_rel(&got_lazy, &got_eager);
+    eprintln!("lazy-vs-eager encode peak_rel = {pr:.3e}");
+    assert_eq!(
+        pr, 0.0,
+        "lazy encoder must be byte-identical to the eager encoder"
+    );
+}
+
+#[test]
 #[ignore = "needs ltx_2_3_base_q8 vae_decoder.safetensors (~800 MB)"]
 fn decode_tiled_matches_reference() {
     let (vae, _) = build();

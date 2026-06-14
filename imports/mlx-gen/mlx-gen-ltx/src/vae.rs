@@ -27,6 +27,9 @@
 //! Everything runs **f32** (quality target; the reference VAE is gated in f32). The parity gate
 //! honors "divergence is not rounding" — any >1% gap gets root-caused, not written off.
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 use mlx_rs::ops::{
     add, concatenate_axis, divide, maximum, mean_axes, multiply, pad, subtract, sum_axes,
 };
@@ -532,22 +535,67 @@ fn unpatchify(x: &Array, p: i32) -> Result<Array> {
 /// are present — the I2V sibling needs it; pure T2V uses only `decode`).
 pub struct LtxVideoVae {
     decoder: VideoDecoder,
-    encoder: Option<VideoEncoder>,
+    /// The encoder — populated eagerly by [`from_weights`], or lazily on first [`encode`] from
+    /// [`lazy`](Self::lazy). `OnceLock` (not `OnceCell`) so the VAE keeps its prior `Send`/`Sync`.
+    encoder: OnceLock<VideoEncoder>,
+    /// Deferred encoder source (`vae_encoder.safetensors` path + cfg). `Some` ⇒ build on first
+    /// `encode`; `None` ⇒ the encoder was supplied eagerly (or is absent). F-048.
+    lazy: Option<(PathBuf, LtxVaeConfig)>,
 }
 
 impl LtxVideoVae {
-    /// Build the decoder from `decoder_w` and (optionally) the encoder from `encoder_w`.
+    /// Build the decoder from `decoder_w` and (optionally) the encoder from `encoder_w` — both eager.
     pub fn from_weights(
         decoder_w: &Weights,
         encoder_w: Option<&Weights>,
         cfg: &LtxVaeConfig,
     ) -> Result<Self> {
         let decoder = VideoDecoder::from_weights(decoder_w, cfg)?;
-        let encoder = match encoder_w {
-            Some(w) => Some(VideoEncoder::from_weights(w, cfg)?),
-            None => None,
-        };
-        Ok(Self { decoder, encoder })
+        let encoder = OnceLock::new();
+        if let Some(w) = encoder_w {
+            // A fresh cell is empty, so `set` always succeeds.
+            let _ = encoder.set(VideoEncoder::from_weights(w, cfg)?);
+        }
+        Ok(Self {
+            decoder,
+            encoder,
+            lazy: None,
+        })
+    }
+
+    /// Like [`from_weights`] but **defers** loading the encoder until the first [`encode`]:
+    /// `vae_encoder.safetensors` (hundreds of MB) is never read for pure-T2V runs, which never encode
+    /// (F-048). The decoder is built eagerly (every mode decodes). A missing encoder file surfaces as
+    /// a clear error on the first `encode`, not at load.
+    pub fn from_weights_lazy_encoder(
+        decoder_w: &Weights,
+        encoder_path: PathBuf,
+        cfg: &LtxVaeConfig,
+    ) -> Result<Self> {
+        let decoder = VideoDecoder::from_weights(decoder_w, cfg)?;
+        Ok(Self {
+            decoder,
+            encoder: OnceLock::new(),
+            lazy: Some((encoder_path, cfg.clone())),
+        })
+    }
+
+    /// The encoder, building it from the deferred source on first use (F-048). Errors when neither an
+    /// eager encoder nor a lazy source is present.
+    fn encoder(&self) -> Result<&VideoEncoder> {
+        if let Some(e) = self.encoder.get() {
+            return Ok(e);
+        }
+        let (path, cfg) = self
+            .lazy
+            .as_ref()
+            .ok_or_else(|| Error::Msg("LtxVideoVae: encode requires encoder weights".into()))?;
+        let w = Weights::from_file(path)?;
+        let enc = VideoEncoder::from_weights(&w, cfg)?;
+        // Single producer here; `set` on the (still-empty) cell succeeds, and even under a race the
+        // winner's value is returned by the `get` below.
+        let _ = self.encoder.set(enc);
+        Ok(self.encoder.get().expect("encoder just set"))
     }
 
     /// Decode a normalized latent `(B, 128, F', H', W')` → video `(B, 3, F, 32·H', 32·W')` in
@@ -559,11 +607,7 @@ impl LtxVideoVae {
     /// Encode a video `(B, 3, F, H, W)` (F = 1 + 8·k, [-1, 1]) → normalized latent
     /// `(B, 128, F', H/32, W/32)`. Causal. Requires encoder weights.
     pub fn encode(&self, video: &Array) -> Result<Array> {
-        let enc = self
-            .encoder
-            .as_ref()
-            .ok_or_else(|| Error::Msg("LtxVideoVae: encode requires encoder weights".into()))?;
-        contiguous(&enc.encode(video)?)
+        contiguous(&self.encoder()?.encode(video)?)
     }
 
     /// Decode with **tiling** for memory-bounded large/long-video decode (`cfg`). Splits the latent
@@ -642,9 +686,9 @@ impl LtxVideoVae {
         contiguous(&normed)
     }
 
-    /// Whether the encoder is loaded.
+    /// Whether the VAE can encode — either the encoder is already built or a lazy source is set.
     pub fn has_encoder(&self) -> bool {
-        self.encoder.is_some()
+        self.encoder.get().is_some() || self.lazy.is_some()
     }
 }
 
