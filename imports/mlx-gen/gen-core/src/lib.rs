@@ -12,6 +12,7 @@
 
 pub mod caption;
 pub mod error;
+pub mod face;
 pub mod generator;
 pub mod imageops;
 pub mod media;
@@ -30,6 +31,7 @@ pub use caption::{
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
 pub use error::{Error, Result};
+pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
     GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
