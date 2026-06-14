@@ -846,7 +846,7 @@ impl Bernini {
 
         // --- Stage 3: load both experts, ViT-conditioned APG denoise ---
         let key = random::key(seed)?;
-        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
+        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
         let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
 
         let base_g = VitGuidanceParams {

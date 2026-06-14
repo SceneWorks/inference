@@ -385,7 +385,7 @@ impl BerniniRenderer {
             norm_threshold: [Defaults::NORM_THRESHOLD, Defaults::NORM_THRESHOLD],
         };
 
-        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
+        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
