@@ -190,7 +190,13 @@ fn modulate(x: &Array, mod_params: &Array) -> Result<(Array, Array)> {
     let shift = p[0].expand_dims(1)?; // [B, 1, dim]
     let scale = p[1].expand_dims(1)?;
     let gate = p[2].expand_dims(1)?;
-    let one = Array::from_slice(&[1.0f32], &[1]);
+    // dtype-follow the modulation operand (sc-5188). A strong-f32 `1` here promotes `scale + one` to
+    // f32, and `multiply(x, …)` then re-promotes the modulated stream to f32 at block 0 — which, since
+    // every later Linear feeds its activations through as-is, cascades f32 through the whole 48-block
+    // DiT, silently defeating bf16 (no compute win, and a training peak ABOVE f32 from the f32 weight
+    // up-casts). Casting `one` to the modulation dtype keeps the bf16 stream bf16. No-op in f32 mode
+    // (the cast is identity), so the f32 grad-parity gates and f32 inference stay bit-identical.
+    let one = Array::from_slice(&[1.0f32], &[1]).as_dtype(mod_params.dtype())?;
     let out = add(&multiply(x, &add(&scale, &one)?)?, &shift)?;
     Ok((out, gate))
 }
