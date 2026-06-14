@@ -26,6 +26,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_exact, gelu_tanh};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+use mlx_gen_wan::config::WanQuant;
 use mlx_gen_wan::patchify::{patchify, unpatchify};
 use mlx_gen_wan::rope::rope_apply;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
@@ -72,6 +73,28 @@ fn load_lin(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
         w.require(&format!("{prefix}.weight"))?.clone(),
         Some(w.require(&format!("{prefix}.bias"))?.clone()),
     ))
+}
+
+/// Like [`load_lin`] but **pre-quantized-snapshot aware** (sc-5445), mirroring the Wan DiT
+/// `load_linear`. When the snapshot carries a `quantization` manifest (`quant` is `Some`) *and* this
+/// Linear's packed `{prefix}.scales` is present on disk, build a quantized base **directly** from the
+/// packed `weight` (u32) / `scales` / `biases` (+ the unpacked dense `bias`) — no dense bf16 weight is
+/// ever materialized, which is what keeps the load-time memory floor low (the whole point of shipping
+/// a pre-quantized snapshot vs. quantizing at load). Otherwise (dense snapshot, or a Linear the
+/// `convert::quantize_scail2_transformer` predicate left dense) fall back to the dense path. `.scales`
+/// presence is the per-Linear signal — only the predicate Linears are packed.
+fn load_lin_q(w: &Weights, prefix: &str, quant: Option<WanQuant>) -> Result<AdaptableLinear> {
+    if let (Some(q), Some(scales)) = (quant, w.get(&format!("{prefix}.scales"))) {
+        return Ok(AdaptableLinear::from_quantized_parts(
+            w.require(&format!("{prefix}.weight"))?.clone(),
+            scales.clone(),
+            w.require(&format!("{prefix}.biases"))?.clone(),
+            w.get(&format!("{prefix}.bias")).cloned(),
+            q.group_size,
+            q.bits,
+        ));
+    }
+    load_lin(w, prefix)
 }
 
 /// A `nn.Conv3d(in, out, kernel=stride=patch)` patch embed → a `[out, in·∏patch]` dense Linear (the
@@ -128,11 +151,12 @@ struct SelfAttn {
 impl SelfAttn {
     fn load(w: &Weights, prefix: &str, cfg: &Scail2Config) -> Result<Self> {
         let head_dim = cfg.wan.head_dim();
+        let q = cfg.wan.quantization;
         Ok(Self {
-            q: load_lin(w, &format!("{prefix}.q"))?,
-            k: load_lin(w, &format!("{prefix}.k"))?,
-            v: load_lin(w, &format!("{prefix}.v"))?,
-            o: load_lin(w, &format!("{prefix}.o"))?,
+            q: load_lin_q(w, &format!("{prefix}.q"), q)?,
+            k: load_lin_q(w, &format!("{prefix}.k"), q)?,
+            v: load_lin_q(w, &format!("{prefix}.v"), q)?,
+            o: load_lin_q(w, &format!("{prefix}.o"), q)?,
             norm_q: req(w, &format!("{prefix}.norm_q.weight"))?,
             norm_k: req(w, &format!("{prefix}.norm_k.weight"))?,
             n: cfg.wan.num_heads as i32,
@@ -206,13 +230,14 @@ struct CrossAttnI2V {
 impl CrossAttnI2V {
     fn load(w: &Weights, prefix: &str, cfg: &Scail2Config) -> Result<Self> {
         let head_dim = cfg.wan.head_dim();
+        let q = cfg.wan.quantization;
         Ok(Self {
-            q: load_lin(w, &format!("{prefix}.q"))?,
-            k: load_lin(w, &format!("{prefix}.k"))?,
-            v: load_lin(w, &format!("{prefix}.v"))?,
-            o: load_lin(w, &format!("{prefix}.o"))?,
-            k_img: load_lin(w, &format!("{prefix}.k_img"))?,
-            v_img: load_lin(w, &format!("{prefix}.v_img"))?,
+            q: load_lin_q(w, &format!("{prefix}.q"), q)?,
+            k: load_lin_q(w, &format!("{prefix}.k"), q)?,
+            v: load_lin_q(w, &format!("{prefix}.v"), q)?,
+            o: load_lin_q(w, &format!("{prefix}.o"), q)?,
+            k_img: load_lin_q(w, &format!("{prefix}.k_img"), q)?,
+            v_img: load_lin_q(w, &format!("{prefix}.v_img"), q)?,
             norm_q: req(w, &format!("{prefix}.norm_q.weight"))?,
             norm_k: req(w, &format!("{prefix}.norm_k.weight"))?,
             norm_k_img: req(w, &format!("{prefix}.norm_k_img.weight"))?,
@@ -302,8 +327,8 @@ impl Block {
             cross: CrossAttnI2V::load(w, &format!("{p}.cross_attn"), cfg)?,
             norm3_w: req_f32(w, &format!("{p}.norm3.weight"))?,
             norm3_b: req_f32(w, &format!("{p}.norm3.bias"))?,
-            ffn0: load_lin(w, &format!("{p}.ffn.0"))?,
-            ffn2: load_lin(w, &format!("{p}.ffn.2"))?,
+            ffn0: load_lin_q(w, &format!("{p}.ffn.0"), cfg.wan.quantization)?,
+            ffn2: load_lin_q(w, &format!("{p}.ffn.2"), cfg.wan.quantization)?,
             eps: cfg.wan.eps as f32,
         })
     }
