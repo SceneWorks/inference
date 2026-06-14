@@ -242,3 +242,80 @@ fn ltx_trainer_trains_with_gradient_checkpointing() {
     );
     println!("[ltx-lora-ckpt] e2e OK — gradient-checkpointed training converged + saved");
 }
+
+/// sc-5637 — preview samples (one still frame). Proves the LTX render path (install in-progress
+/// adapter → distilled single-stage Euler over the real `STAGE1_SIGMAS` → VAE decode → first frame as
+/// `Image`) on real weights. Run:
+///   cargo test -p mlx-gen-ltx --release --test trainer_e2e -- --ignored --nocapture ltx_trainer_emits_preview_samples
+#[test]
+#[ignore = "needs real ltx_2_3_base_q8 weights (~20 GB) + the Gemma encoder"]
+fn ltx_trainer_emits_preview_samples() {
+    let tmp = std::env::temp_dir().join("ltx_trainer_samples_e2e");
+    let items = make_dataset(&tmp);
+    assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
+    let mut trainer =
+        mlx_gen::load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+            .expect("ltx_2_3 trainer should be registered");
+
+    let config = TrainingConfig {
+        rank: 8,
+        alpha: 8.0,
+        learning_rate: 1e-4,
+        steps: 4,
+        resolution: 256,
+        save_every: 0,
+        seed: 7,
+        network_type: NetworkType::Lora,
+        sample_every: 4,
+        sample_steps: 4,
+        sample_guidance_scale: 1.0,
+        sample_prompts: vec!["a solid red colour swatch".to_string()],
+        ..Default::default()
+    };
+    let req = TrainingRequest {
+        items,
+        config,
+        output_dir: tmp.join("out"),
+        file_name: "swatch_lora.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+
+    let mut samples: Vec<(u32, u32, u32, String)> = Vec::new();
+    trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Sample {
+                step,
+                index,
+                total,
+                prompt,
+                image,
+            } = p
+            {
+                assert!(
+                    image.width > 0 && image.height > 0,
+                    "preview frame has dimensions"
+                );
+                assert_eq!(
+                    image.pixels.len(),
+                    (image.width * image.height * 3) as usize,
+                    "preview frame is a packed RGB8 buffer"
+                );
+                assert!(
+                    image.pixels.iter().any(|&b| b != 0),
+                    "preview frame is not all-black"
+                );
+                samples.push((step, index, total, prompt));
+            }
+        })
+        .expect("training with sampling should succeed");
+
+    assert!(
+        !samples.is_empty(),
+        "expected at least one preview frame, got {samples:?}"
+    );
+    println!(
+        "[ltx-samples] e2e OK — {} preview frame(s): {samples:?}",
+        samples.len()
+    );
+}
