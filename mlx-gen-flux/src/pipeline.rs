@@ -1,7 +1,8 @@
 //! FLUX.1 sampling-pipeline primitives whose math is stable before the model blocks land.
 //! These mirror `FluxLatentCreator` and the fork's default `LinearScheduler`.
 
-use mlx_gen::{Error, Result};
+use mlx_gen::image::validate_multiple_of_16;
+use mlx_gen::Result;
 use mlx_rs::ops::{add, divide, linspace, subtract};
 use mlx_rs::{random, Array};
 
@@ -11,7 +12,7 @@ pub fn image_seq_len(width: u32, height: u32) -> usize {
 
 /// Seeded FLUX txt2img latent noise: `[1, (height/16) * (width/16), 64]`.
 pub fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
-    validate_multiple_of_16(width, height)?;
+    validate_multiple_of_16(width, height, "flux1")?;
     let key = random::key(seed)?;
     let shape = [1, image_seq_len(width, height) as i32, 64];
     Ok(random::normal::<f32>(&shape[..], None, None, Some(&key))?)
@@ -20,7 +21,7 @@ pub fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
 /// Pack VAE latents `[1, 16, height/8, width/8]` into FLUX DiT tokens
 /// `[1, (height/16) * (width/16), 64]`.
 pub fn pack_latents(latents: &Array, width: u32, height: u32) -> Result<Array> {
-    validate_multiple_of_16(width, height)?;
+    validate_multiple_of_16(width, height, "flux1")?;
     let h = (height / 16) as i32;
     let w = (width / 16) as i32;
     let latents = latents.reshape(&[1, 16, h, 2, w, 2])?;
@@ -31,7 +32,7 @@ pub fn pack_latents(latents: &Array, width: u32, height: u32) -> Result<Array> {
 /// Unpack FLUX DiT tokens `[1, (height/16) * (width/16), 64]` back to VAE latents
 /// `[1, 16, height/8, width/8]`.
 pub fn unpack_latents(latents: &Array, width: u32, height: u32) -> Result<Array> {
-    validate_multiple_of_16(width, height)?;
+    validate_multiple_of_16(width, height, "flux1")?;
     let h = (height / 16) as i32;
     let w = (width / 16) as i32;
     let latents = latents.reshape(&[1, h, w, 16, 2, 2])?;
@@ -76,13 +77,4 @@ pub fn build_linear_sigmas(
     let mut out = sigmas.as_slice::<f32>().to_vec();
     out.push(0.0);
     Ok(out)
-}
-
-fn validate_multiple_of_16(width: u32, height: u32) -> Result<()> {
-    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
-        return Err(Error::Msg(format!(
-            "flux1: width and height must be multiples of 16, got {width}x{height}"
-        )));
-    }
-    Ok(())
 }
