@@ -557,6 +557,10 @@ impl T2iModel {
                 Some(token_h),
                 Some(token_w),
             )?;
+            // Per-step eval so the cancel check (r.check_cancel) interrupts mid-render (sc-5522 /
+            // sc-5399): MLX is lazy, so without it the whole denoise is one un-cancellable graph run
+            // at decode. `image` is the carried latent each step. Output-neutral.
+            image.eval()?;
             traj.push(image.clone());
             if let Some(r) = reporter.as_mut() {
                 r.step(i + 1, steps);
@@ -1389,6 +1393,10 @@ impl T2iModel {
                 Some(token_h),
                 Some(token_w),
             )?;
+            // Per-step eval so the cancel check (r.check_cancel) interrupts mid-render (sc-5522 /
+            // sc-5399): MLX is lazy, so without it the whole denoise is one un-cancellable graph run
+            // at decode. `image` is the carried latent each step. Output-neutral.
+            image.eval()?;
             traj.push(image.clone());
             if let Some(r) = reporter.as_mut() {
                 r.step(i + 1, steps);

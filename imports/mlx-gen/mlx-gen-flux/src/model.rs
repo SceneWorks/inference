@@ -402,6 +402,10 @@ impl Flux1 {
                 let x_in = sampler.scale_model_input(&latents, t)?;
                 let velocity = velocity_fn(&x_in, t, sampler.timestep(t), guidance)?;
                 latents = sampler.step(&velocity, &latents, t)?;
+                // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399):
+                // MLX is lazy, so without it the whole denoise is one un-cancellable graph run at
+                // decode. Output-neutral; matches the qwen/sdxl per-step eval.
+                latents.eval()?;
                 on_progress(Progress::Step {
                     current: t as u32 + 1,
                     total: n_steps as u32,

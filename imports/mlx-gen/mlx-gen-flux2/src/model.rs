@@ -511,6 +511,10 @@ impl Flux2 {
                     None => v,
                 };
                 latents = sched.step(&latents, &v, t)?;
+                // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399):
+                // MLX is lazy, so without it the whole denoise is one un-cancellable graph run at
+                // decode. Output-neutral; matches the qwen/sdxl per-step eval.
+                latents.eval()?;
                 on_progress(Progress::Step {
                     current: t as u32 + 1,
                     total: steps as u32,
