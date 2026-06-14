@@ -23,11 +23,13 @@
 //! against the upstream `SCAIL2Model.forward` on a tiny seeded model). The CLIP/VAE/mask preprocessing
 //! (sc-5443), real-weight parity (sc-5446), and the live `generate` denoise loop are the next slices.
 
+pub mod clip;
 pub mod config;
 pub mod model;
 pub mod pipeline;
 pub mod rope;
 
+pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
 pub use model::{Scail2Dit, Scail2Inputs};
 pub use rope::ScailRope;
