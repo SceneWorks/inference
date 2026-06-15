@@ -26,6 +26,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_exact, gelu_tanh};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+use mlx_gen_wan::chunk::{map_seq_chunks, slice_axis0, DitMemoryConfig};
 use mlx_gen_wan::config::WanQuant;
 use mlx_gen_wan::patchify::{patchify, unpatchify};
 use mlx_gen_wan::rope::rope_apply;
@@ -196,16 +197,22 @@ impl SelfAttn {
     }
 
     /// `x`: `[1, L, dim]` (f32, already adaLN-modulated). `cos`/`sin`: `[L, 1, half_d]` (f32).
-    fn forward(&self, x: &Array, cos: &Array, sin: &Array, cdt: Dtype) -> Result<Array> {
+    /// `q_chunk` (sc-5681) optionally runs the query path in row-blocks: K/V are projected/RoPE'd over
+    /// the **full** sequence once (every query block attends to all of them, so the softmax is
+    /// unchanged), and only the query projection + RoPE + SDPA are chunked — bit-identical.
+    fn forward(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        cdt: Dtype,
+        q_chunk: Option<usize>,
+    ) -> Result<Array> {
         let (b, s) = (x.shape()[0], x.shape()[1]);
         let (n, d) = (self.n, self.d);
         let xw = x.as_dtype(cdt)?;
-        let q = rms_norm(&self.q.forward(&xw)?, &self.norm_q, self.eps)?;
+        // K and V over the full sequence (shared by every query block); RoPE in f32 → compute dtype.
         let k = rms_norm(&self.k.forward(&xw)?, &self.norm_k, self.eps)?;
-        // RoPE in f32, then back to compute dtype; transpose to [b, n, s, d] for SDPA.
-        let q = rope_apply(&to_f32(&q)?.reshape(&[b, s, n, d])?, cos, sin)?
-            .as_dtype(cdt)?
-            .transpose_axes(&[0, 2, 1, 3])?;
         let k = rope_apply(&to_f32(&k)?.reshape(&[b, s, n, d])?, cos, sin)?
             .as_dtype(cdt)?
             .transpose_axes(&[0, 2, 1, 3])?;
@@ -214,9 +221,21 @@ impl SelfAttn {
             .forward(&xw)?
             .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let out = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
-        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
-        self.o.forward(&out)
+        // Query path (optionally chunked over query rows; `None` ⇒ the whole sequence at once).
+        let attn = map_seq_chunks(&xw, q_chunk, |xq, start| {
+            let len = xq.shape()[1];
+            let q = rms_norm(&self.q.forward(xq)?, &self.norm_q, self.eps)?;
+            let cos_c = slice_axis0(cos, start, len)?;
+            let sin_c = slice_axis0(sin, start, len)?;
+            let q = rope_apply(&to_f32(&q)?.reshape(&[b, len, n, d])?, &cos_c, &sin_c)?
+                .as_dtype(cdt)?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let out = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+            Ok(out
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, len, n * d])?)
+        })?;
+        self.o.forward(&attn)
     }
 }
 
@@ -296,17 +315,22 @@ impl CrossAttnI2V {
     }
 
     /// `x`: `[1, L, dim]` (f32). `text_ctx`: `[1, L_text, dim]`. `img_ctx`: `[1, L_img, dim]`.
-    fn forward(&self, x: &Array, text_ctx: &Array, img_ctx: &Array, cdt: Dtype) -> Result<Array> {
-        let (b, s) = (x.shape()[0], x.shape()[1]);
+    /// `q_chunk` (sc-5681) optionally runs the query path in row-blocks — the text/image K/V are
+    /// small and projected once; only the query projection + the two SDPAs are chunked
+    /// (bit-identical; no RoPE on the cross-attention query).
+    fn forward(
+        &self,
+        x: &Array,
+        text_ctx: &Array,
+        img_ctx: &Array,
+        cdt: Dtype,
+        q_chunk: Option<usize>,
+    ) -> Result<Array> {
+        let (b, _s) = (x.shape()[0], x.shape()[1]);
         let (n, d) = (self.n, self.d);
         let heads = |t: &Array| -> Result<Array> {
             Ok(t.reshape(&[b, -1, n, d])?.transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = heads(&rms_norm(
-            &self.q.forward(&x.as_dtype(cdt)?)?,
-            &self.norm_q,
-            self.eps,
-        )?)?;
         let tc = text_ctx.as_dtype(cdt)?;
         let ic = img_ctx.as_dtype(cdt)?;
         let k = heads(&rms_norm(&self.k.forward(&tc)?, &self.norm_k, self.eps)?)?;
@@ -317,16 +341,21 @@ impl CrossAttnI2V {
             self.eps,
         )?)?;
         let v_img = heads(&self.v_img.forward(&ic)?)?;
-        let flat = |o: Array| -> Result<Array> {
-            Ok(o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?)
-        };
-        let x_txt = flat(scaled_dot_product_attention(
-            &q, &k, &v, self.scale, None, None,
-        )?)?;
-        let x_img = flat(scaled_dot_product_attention(
-            &q, &k_img, &v_img, self.scale, None, None,
-        )?)?;
-        self.o.forward(&add(&x_txt, &x_img)?)
+        let attn = map_seq_chunks(&x.as_dtype(cdt)?, q_chunk, |xq, _start| {
+            let len = xq.shape()[1];
+            let q = heads(&rms_norm(&self.q.forward(xq)?, &self.norm_q, self.eps)?)?;
+            let flat = |o: Array| -> Result<Array> {
+                Ok(o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, len, n * d])?)
+            };
+            let x_txt = flat(scaled_dot_product_attention(
+                &q, &k, &v, self.scale, None, None,
+            )?)?;
+            let x_img = flat(scaled_dot_product_attention(
+                &q, &k_img, &v_img, self.scale, None, None,
+            )?)?;
+            Ok(add(&x_txt, &x_img)?)
+        })?;
+        self.o.forward(&attn)
     }
 }
 
@@ -388,7 +417,9 @@ impl Block {
         }
     }
 
-    /// `x`: `[1, L, dim]` (f32). `e0`: `[1, 6, dim]` (f32, time modulation).
+    /// `x`: `[1, L, dim]` (f32). `e0`: `[1, 6, dim]` (f32, time modulation). `mem` (sc-5681) bounds the
+    /// per-block activation peak — chunk the FFN's `[L, ffn_dim]` intermediate (the largest transient)
+    /// and the attention query path over sequence row-blocks; all bit-identical to the un-chunked path.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -399,21 +430,28 @@ impl Block {
         cos: &Array,
         sin: &Array,
         cdt: Dtype,
+        mem: &DitMemoryConfig,
     ) -> Result<Array> {
         let m = add(&self.modulation, e0)?; // [1, 6, dim]
         let p = split(&m, 6, 1)?; // 6 × [1, 1, dim]
                                   // self-attention
         let x_mod = modulate(&ln(x, self.eps)?, &p[1], &p[0])?;
-        let y = self.self_attn.forward(&x_mod, cos, sin, cdt)?;
+        let y = self
+            .self_attn
+            .forward(&x_mod, cos, sin, cdt, mem.attn_query_chunk)?;
         let x = gated(x, &to_f32(&y)?, &p[2])?;
         // cross-attention (affine LN, no modulation)
         let x_cross = layer_norm(&x, Some(&self.norm3_w), Some(&self.norm3_b), self.eps)?;
-        let cx = self.cross.forward(&x_cross, text_ctx, img_ctx, cdt)?;
+        let cx = self
+            .cross
+            .forward(&x_cross, text_ctx, img_ctx, cdt, mem.attn_query_chunk)?;
         let x = add(&x, &to_f32(&cx)?)?;
-        // feed-forward
-        let x_mod = modulate(&ln(&x, self.eps)?, &p[4], &p[3])?;
-        let y = self.ffn0.forward(&x_mod.as_dtype(cdt)?)?;
-        let y = self.ffn2.forward(&gelu_tanh(&y)?)?;
+        // feed-forward (the `[L, ffn_dim]` intermediate is the single biggest transient → chunk it).
+        let x_mod = modulate(&ln(&x, self.eps)?, &p[4], &p[3])?.as_dtype(cdt)?;
+        let y = map_seq_chunks(&x_mod, mem.ffn_seq_chunk, |c, _start| {
+            let h = gelu_tanh(&self.ffn0.forward(c)?)?;
+            self.ffn2.forward(&h)
+        })?;
         gated(&x, &to_f32(&y)?, &p[5])
     }
 }
@@ -440,6 +478,7 @@ pub struct Scail2Dit {
     rope: ScailRope,
     cfg: Scail2Config,
     compute_dtype: Dtype,
+    mem: DitMemoryConfig,
 }
 
 /// All conditioning tensors for one denoise-step forward. Spatial dims are latent (`vae_stride`-down)
@@ -501,12 +540,22 @@ impl Scail2Dit {
             rope: ScailRope::new(cfg.wan.head_dim()),
             cfg: cfg.clone(),
             compute_dtype: Dtype::Float32,
+            mem: DitMemoryConfig::OFF,
         })
     }
 
     /// Set the matmul compute dtype (f32 for parity, bf16 for production).
     pub fn set_compute_dtype(&mut self, dt: Dtype) {
         self.compute_dtype = dt;
+    }
+
+    /// Set the activation-memory config (sc-5681): FFN/attention sequence-chunking + per-block
+    /// eval-to-free that bound the per-step activation peak so the high-resolution buckets run
+    /// without OOM. Every lever is bit-identical to the default ([`DitMemoryConfig::OFF`]) output —
+    /// the parity gates load with `OFF`; the production `generate()` path opts in. `tests/`
+    /// `dit_chunk_equiv` asserts the equivalence.
+    pub fn set_memory_config(&mut self, mem: DitMemoryConfig) {
+        self.mem = mem;
     }
 
     /// Quantize the transformer-only attention + FFN Linears to Q4/Q8 **in place** (sc-5445),
@@ -740,9 +789,15 @@ impl Scail2Dit {
         let img_ctx = self.embed_img(inp.clip_fea)?;
 
         // --- transformer blocks (f32 activations) ---
+        // sc-5681: with `mem.eval_per_block`, force-evaluate each block's output before the next so
+        // the peak is ~one block's activations rather than the whole 40-block lazy graph (the
+        // dominant memory lever; bit-identical — `eval` only schedules materialization).
         let mut x = to_f32(&tokens)?;
         for block in &self.blocks {
-            x = block.forward(&x, &e0, &text_ctx, &img_ctx, &cos, &sin, cdt)?;
+            x = block.forward(&x, &e0, &text_ctx, &img_ctx, &cos, &sin, cdt, &self.mem)?;
+            if self.mem.eval_per_block {
+                mlx_rs::transforms::eval([&x])?;
+            }
         }
         let xh = self.apply_head(&x, &e)?; // [1, L_total, out_dim·∏patch]
 

@@ -22,10 +22,12 @@
 use std::path::Path;
 
 use mlx_gen::array::scalar;
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, Error, GenerationOutput, Image, Progress, Quant, Result};
 use mlx_gen_wan::{
-    frames_to_images, load_tokenizer, make_scheduler, SolverKind, Umt5Encoder, WanVae,
+    frames_to_images, load_tokenizer, make_scheduler, DitMemoryConfig, SolverKind, Umt5Encoder,
+    WanVae,
 };
 use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -38,6 +40,33 @@ use crate::resize::{clip_preprocess, downsample_half, interpolate, Interp};
 
 /// Wan2.1 flow-matching training horizon (upstream `config.num_train_timesteps`).
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
+/// VAE-decode temporal-window budget (sc-5681): max output pixel·frames per `decode_tiled` window,
+/// so the decode peak stays bounded at every resolution bucket (fewer frames/window as resolution
+/// grows). At 832×480/5s a 3.5M budget → 8-frame windows → ~33 GB MLX-active / ~76 GB process
+/// footprint (the Metal conv scratch is ~2× the MLX-active), vs. ~139 GB for an un-tiled segment
+/// decode. See the per-segment decode for why this is temporal-only rather than `TilingConfig::auto`.
+const DECODE_TILE_BUDGET_PXFRAMES: i64 = 3_500_000;
+/// SCAIL-2 DiT-denoise activation-memory defaults (sc-5681). NOTE: measurement showed the 832×480/5s
+/// high-resolution OOM is the **VAE decode** (see the per-segment decode), not the DiT denoise — MLX's
+/// `scaled_dot_product_attention` is flash here, so the 40-layer denoise fits even un-chunked. These
+/// levers therefore bound the *denoise* peak for headroom + the larger buckets (1280×704) and are the
+/// shared-layer "practice" the story carries to Wan/Bernini; they are not what unblocks 832×480.
+///
+/// - `eval_per_block` — caps the peak at ~one block's activations instead of the whole 40-block lazy
+///   graph. Bit-exact, near-zero cost.
+/// - `ffn_seq_chunk` — bounds the `[L, ffn_dim]` FFN intermediate (the largest denoise transient).
+/// - `attn_query_chunk` — OFF by default (SDPA is flash here, so chunking the query path only adds
+///   overhead); available via env for any bucket/model where SDPA falls back to a materialized
+///   `[heads, L, L]` score matrix.
+///
+/// Numerically equivalent to the un-chunked forward (eval is bit-exact; the chunked GEMM differs only
+/// by Metal tile-rounding, cosine ≈ 1). Overridable via `MLX_GEN_WAN_*` env
+/// (see [`DitMemoryConfig::from_env`]).
+const SCAIL2_MEM_DEFAULT: DitMemoryConfig = DitMemoryConfig {
+    ffn_seq_chunk: Some(8192),
+    attn_query_chunk: None,
+    eval_per_block: true,
+};
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride,
 /// and the 28-channel mask pools 8×, so both the full and half grids must stay integer + even.
 const DIM_ALIGN: u32 = 32;
@@ -328,7 +357,21 @@ pub fn generate(
     let dit = {
         let w = Weights::from_file(root.join("dit.safetensors"))?;
         let mut d = Scail2Dit::from_weights(&w, cfg)?;
-        d.set_compute_dtype(Dtype::Bfloat16);
+        // f32 matmul compute (sc-5681). The bf16 path overflows to NaN at long sequences: traced to a
+        // bf16 quantized-matmul (the self-attention `o` projection is the first to blow up — its
+        // SDPA input is clean at max ~15 — but f32-ing only `o` just moves the overflow to the next
+        // projection), reproduced at L≈42k (832×480·5s) and clean in f32. bf16 was never parity-gated
+        // (the gates run f32); f32 is the validated-correct path and the Q4 weights still bound the
+        // weight memory. `SCAIL2_COMPUTE_BF16=1` opts back into the (fast, but high-res-unsafe) bf16
+        // path for experiments. A mixed-precision pass to recover bf16 speed at high res is a follow-up.
+        let bf16 = std::env::var("SCAIL2_COMPUTE_BF16").is_ok_and(|v| v == "1");
+        d.set_compute_dtype(if bf16 {
+            Dtype::Bfloat16
+        } else {
+            Dtype::Float32
+        });
+        // sc-5681: bound the per-step activation peak so the high-resolution buckets don't OOM.
+        d.set_memory_config(DitMemoryConfig::from_env(SCAIL2_MEM_DEFAULT));
         // Quantize the attention + FFN Linears in place (Q4 default in the SceneWorks worker). The
         // packed Q4/Q8 weights are what stays resident; the bf16 source is freed in `quantize`.
         if let Some(q) = quant {
@@ -447,11 +490,40 @@ pub fn generate(
                 total,
             });
         }
+        // sc-5681: release the MLX buffer cache before the VAE decode. The decode is the heaviest
+        // phase (Metal conv scratch ~2× its MLX-active), so the cache retained from preprocessing +
+        // denoise (~35 GB) would otherwise stack under it — measured 832×480/5s footprint 111 → 76 GB.
+        mlx_rs::memory::clear_cache();
 
         // --- decode this segment → pixels; stitch + carry history ---
+        // sc-5681: tile the VAE decode. Decoding the whole `[3, 4·T_lat, 480, 832]` segment in one
+        // pass is the high-res activation peak (≈139 GB → OOMs a 128 GB Mac), NOT the DiT denoise
+        // (which fits — MLX SDPA is flash). SCAIL-2's hand-rolled loop used the plain `decode` and
+        // omitted the tiling the shared wan path already does.
+        //
+        // We tile **temporally only**, sizing each window so its output pixel-volume stays under a
+        // budget — so the peak is bounded at every bucket (fewer frames/window as resolution grows).
+        // Deliberately NOT `TilingConfig::auto`: at buckets that trip both its spatial (>512 px) and
+        // temporal (>65 frame) thresholds it emits a combined spatial+temporal plan, and the shared
+        // `tile_decode_accumulate` mis-blends that combined plan to a flat frame (reproduced at
+        // 832×480/81f; spatial-only and temporal-only each decode correctly — flagged for a shared-VAE
+        // fix). Temporal-only also bounds memory better here (the spatial tiles `auto` picks are coarse
+        // → ~111 GB). `decode_tiled` falls back to a single pass when the window covers the whole clip.
         on_progress(Progress::Decoding);
         let zs = latent.shape();
-        let video = vae.decode(&latent.reshape(&[1, zs[0], zs[1], zs[2], zs[3]])?)?; // [1,3,T_out,H,W]
+        let z = latent.reshape(&[1, zs[0], zs[1], zs[2], zs[3]])?;
+        let out_frames = (seg_end - seg_start) as i32;
+        let video = {
+            // [`DECODE_TILE_BUDGET_PXFRAMES`] output px·frames/window ≈ a bounded decode peak across
+            // buckets; ≥8 output frames (2 latent frames for temporal-conv context), snapped to the
+            // z16 ×4 temporal stride.
+            let px_per_frame = (th as i64) * (tw as i64);
+            let budget_frames = (DECODE_TILE_BUDGET_PXFRAMES / px_per_frame.max(1)) as i32;
+            let tile_frames = (budget_frames / 4 * 4).clamp(8, out_frames.max(8));
+            let overlap = (tile_frames / 4).max(1);
+            let cfg = TilingConfig::temporal_only(tile_frames, overlap);
+            vae.decode_tiled(&z, &cfg)? // [1,3,T_out,H,W]; single-pass fallback if it doesn't tile
+        };
         let vs = video.shape();
         let seg_video = video.reshape(&[vs[1], vs[2], vs[3], vs[4]])?; // [3,T_out,H,W]
         let t_out = seg_video.shape()[1];
