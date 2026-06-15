@@ -70,8 +70,18 @@ impl Components {
     /// UNet + image encoder run **fp16** on CUDA (SVD's production dtype) / **f32** on CPU; the VAE
     /// always stays f32 (`force_upcast=True`).
     fn load(root: &Path, device: &Device) -> CResult<Self> {
-        let dense = if device.is_cuda() {
+        // The UNet + image encoder run **f32** (the VAE always does). SVD ships an fp16 checkpoint, but
+        // the candle GPU dtype story is a tradeoff this provider can't yet square at fp16: fp16's narrow
+        // exponent range overflows to NaN in the deep spatio-temporal UNet (max-abs climbs to Inf at the
+        // last up-block — candle accumulates fp16 conv/matmul in fp16 where torch's cudnn/cublas use
+        // f32), while bf16's 8-bit mantissa is too coarse for the wide-σ (700→0.002) EDM denoise and
+        // collapses to noise. f32 is the only dtype that produces correct video today. The fp16 path with
+        // targeted f32-upcast of the overflowing ops (so native-res clips fit in VRAM) is the sc-5493
+        // GPU follow-up. `SVD_FORCE_F16` / `SVD_FORCE_BF16` reach those paths for that work.
+        let dense = if std::env::var("SVD_FORCE_F16").is_ok() {
             DType::F16
+        } else if std::env::var("SVD_FORCE_BF16").is_ok() {
+            DType::BF16
         } else {
             DType::F32
         };
@@ -382,8 +392,40 @@ impl Generator for SvdGenerator {
         }
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
+        // Opt-in tensor diagnostics (`SVD_DEBUG=1`) — localizes any degeneracy (NaN / all-constant)
+        // across the conditioning / denoise / decode boundaries during GPU bring-up.
+        let dbg = |name: &str, t: &Tensor| {
+            if std::env::var("SVD_DEBUG").is_err() {
+                return;
+            }
+            match t
+                .to_dtype(DType::F32)
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                Ok(v) => {
+                    let n = v.len();
+                    let nan = v.iter().filter(|x| x.is_nan()).count();
+                    let (mut mn, mut mx, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0f64);
+                    for &x in &v {
+                        if x.is_finite() {
+                            mn = mn.min(x);
+                            mx = mx.max(x);
+                            sum += x as f64;
+                        }
+                    }
+                    eprintln!(
+                        "[svd_dbg] {name}: n={n} nan={nan} min={mn:.5} max={mx:.5} mean={:.5}",
+                        sum / n as f64
+                    );
+                }
+                Err(e) => eprintln!("[svd_dbg] {name}: stats err {e}"),
+            }
+        };
+
         // Conditioning.
         let image_embeds = self.clip_embeds(&comps, img)?;
+        dbg("image_embeds", &image_embeds);
         let image_latents = self.image_latents(
             &comps,
             img,
@@ -393,6 +435,7 @@ impl Generator for SvdGenerator {
             params.noise_aug_strength,
             seed,
         )?;
+        dbg("image_latents", &image_latents);
         let atid = pipeline::added_time_ids(&params, &self.device)?;
 
         // Seeded init noise scaled by `init_noise_sigma`.
@@ -404,6 +447,7 @@ impl Generator for SvdGenerator {
         let latents = noise
             .affine(sched.init_noise_sigma() as f64, 0.0)
             .map_err(CandleError::from)?;
+        dbg("init_latents", &latents);
 
         let total = params.num_inference_steps as u32;
         on_progress(Progress::Step { current: 0, total });
@@ -426,6 +470,7 @@ impl Generator for SvdGenerator {
                 })
             },
         )?;
+        dbg("final_latents", &final_latents);
 
         on_progress(Progress::Decoding);
         let decoded = pipeline::decode(
@@ -434,6 +479,7 @@ impl Generator for SvdGenerator {
             params.num_frames,
             params.decode_chunk_size,
         )?;
+        dbg("decoded", &decoded);
         let frames = pipeline::frames_to_images(&decoded)?;
 
         Ok(GenerationOutput::Video {

@@ -9,7 +9,7 @@
 //! (temporal). Mirrors `mlx-gen-svd`'s `vae.rs` (which runs NHWC); validated against the same f32
 //! reference.
 
-use candle_gen::candle_core::{Result, Tensor, D};
+use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::{linear, Linear, Module, VarBuilder};
 
@@ -44,15 +44,22 @@ impl GroupNormW {
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let in_dtype = x.dtype();
         let dims = x.dims().to_vec();
         let (b, c) = (dims[0], dims[1]);
         let spatial: usize = dims[2..].iter().product();
-        let xr = x.reshape((b, self.groups, (c / self.groups) * spatial))?;
+        // Normalize in f32 even when the module runs fp16 (the UNet's dtype on CUDA): an fp16 variance
+        // over `(C/G)·H·W` elements loses precision (catastrophic cancellation), matching how torch /
+        // diffusers GroupNorm upcasts its statistics. The affine (weight/bias) then runs in the input
+        // dtype.
+        let xr = x
+            .reshape((b, self.groups, (c / self.groups) * spatial))?
+            .to_dtype(DType::F32)?;
         let mean = xr.mean_keepdim(2)?;
         let xc = xr.broadcast_sub(&mean)?;
         let var = xc.sqr()?.mean_keepdim(2)?;
         let xn = xc.broadcast_div(&(var + self.eps)?.sqrt()?)?;
-        let xn = xn.reshape(dims.clone())?;
+        let xn = xn.reshape(dims.clone())?.to_dtype(in_dtype)?;
         let mut wshape = vec![1usize; dims.len()];
         wshape[1] = c;
         xn.broadcast_mul(&self.weight.reshape(wshape.clone())?)?
