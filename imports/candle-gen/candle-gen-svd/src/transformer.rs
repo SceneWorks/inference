@@ -72,6 +72,8 @@ impl Attention {
         let q = split(self.q.forward(x)?, lq)?;
         let k = split(self.k.forward(context)?, lk)?;
         let v = split(self.v.forward(context)?, lk)?;
+        // The UNet runs bf16 on CUDA (f32 exponent range), so `q·kᵀ` does not overflow as it would in
+        // fp16 — the scores + softmax stay in the module dtype.
         let attn = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * self.scale)?;
         let attn = softmax_last_dim(&attn)?;
         let o = attn
@@ -262,16 +264,16 @@ impl TransformerSpatioTemporal {
         let tokens = n.reshape((bf, c, seq))?.transpose(1, 2)?.contiguous()?;
         let mut tokens = self.proj_in.forward(&tokens)?;
 
-        // Per-frame position embedding: arange(F) tiled over the batch.
+        // Per-frame position embedding: arange(F) tiled over the batch. The sinusoidal is built in f32
+        // and cast to the running dtype (the UNet runs fp16 on CUDA) before the fp16 `time_pos_embed`
+        // MLP — otherwise the matmul sees an f32 input against fp16 weights.
         let nframes: Vec<f32> = (0..b)
             .flat_map(|_| (0..num_frames).map(|f| f as f32))
             .collect();
         let nframes = Tensor::from_vec(nframes, bf, x.device())?;
-        let emb = self.time_pos_embed.forward(&sinusoidal_timestep(
-            &nframes,
-            self.in_channels,
-            x.device(),
-        )?)?;
+        let pos =
+            sinusoidal_timestep(&nframes, self.in_channels, x.device())?.to_dtype(x.dtype())?;
+        let emb = self.time_pos_embed.forward(&pos)?;
         let emb = emb.reshape((bf, 1, c))?; // [B·F, 1, C]
 
         let alpha = sigmoid(&self.mix_factor)?; // [1]
