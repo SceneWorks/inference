@@ -127,7 +127,9 @@ pub(crate) fn tile_decode_accumulate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::tiling::{AxisTile, TilePlan};
+    use mlx_gen::tiling::{
+        AxisTile, SpatialTiling, TemporalTiling, TilePlan, TilingConfig, VaeTiling,
+    };
 
     /// Two non-overlapping tiles along the temporal axis with all-ones masks and an identity decode
     /// must exactly reconstruct the input — exercising slice/mask/pad placement and accumulation for
@@ -175,5 +177,118 @@ mod tests {
         let vals: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let denorm = Array::from_slice(&vals, &[1, 4, 2, 2, 1]);
         assert_eq!(roundtrip(&denorm, [1, 2, 3], 4), vals);
+    }
+
+    /// Block (nearest-neighbour) upsample by `scales` along `axes` — `repeat_axis` along each. This is
+    /// **tile-consistent**: upsampling a contiguous latent slice `[begin, end)` yields exactly the
+    /// `[begin·s, end·s)` slab of the full upsample, with no seam, so overlapping tiles agree wherever
+    /// they overlap. A correct partition-of-unity blend must therefore reconstruct the full upsample
+    /// exactly — which isolates the slice/mask/pad/accumulate/normalize machinery from any real-decoder
+    /// seam residual.
+    fn upsample(x: &Array, axes: [i32; 3], scales: [i32; 3]) -> Array {
+        let mut y = x.clone();
+        for (&ax, &s) in axes.iter().zip(scales.iter()) {
+            if s > 1 {
+                y = Array::repeat_axis::<f32>(y, s, ax).unwrap();
+            }
+        }
+        y
+    }
+
+    /// sc-5690 regression: when a plan tiles **two or three axes at once** (the case the production
+    /// `auto` path emits for high-res long video), `tile_decode_accumulate` must still reconstruct a
+    /// tile-consistent decode **exactly**. Drives the real [`TilingConfig::plan`] geometry (scaled
+    /// trapezoidal masks, overlap, ragged last tiles, `out_start` placement) with a tile-consistent
+    /// `upsample` decode and asserts the blended output equals the single full upsample. Covers the
+    /// asymmetric shape from the bug report (temporal + one spatial axis, the other a single tile) for
+    /// which the symmetric `tiling_parity` golden had no coverage.
+    fn assert_combined_reconstructs(
+        shape: [i32; 5],
+        axes: [i32; 3],
+        cfg: &TilingConfig,
+        label: &str,
+    ) {
+        // Wan z16 (non-causal): temporal ×4, spatial ×8 — these match `upsample`'s block factors so a
+        // tiled decode reconstructs the full upsample. (`axes` selects the channel-position layout;
+        // the per-axis geometry is layout-independent.)
+        let vae = VaeTiling::WAN;
+        let scales = [vae.temporal_scale, vae.spatial_scale, vae.spatial_scale];
+        let (f, h, w) = (
+            shape[axes[0] as usize],
+            shape[axes[1] as usize],
+            shape[axes[2] as usize],
+        );
+        assert!(
+            cfg.needs_tiling(vae, f, h, w),
+            "{label}: config must actually tile [{f},{h},{w}]"
+        );
+        let plan = cfg.plan(vae, f, h, w);
+        let n: i32 = shape.iter().product();
+        let vals: Vec<f32> = (0..n).map(|i| (i as f32 * 0.137).sin()).collect();
+        let denorm = Array::from_slice(&vals, &shape);
+
+        let expected = upsample(&denorm, axes, scales);
+        let got = tile_decode_accumulate(&denorm, &plan, axes, |t| Ok(upsample(t, axes, scales)))
+            .unwrap();
+        got.eval().unwrap();
+        assert_eq!(
+            got.shape(),
+            expected.shape(),
+            "{label}: tiled output shape (t={} h={} w={} tiles)",
+            plan.t.len(),
+            plan.h.len(),
+            plan.w.len()
+        );
+        let (g, e) = (got.as_slice::<f32>(), expected.as_slice::<f32>());
+        let max = g
+            .iter()
+            .zip(e)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max < 1e-4,
+            "{label}: combined-axis blend did not reconstruct (t={} h={} w={} tiles) max|Δ|={max:.3e}",
+            plan.t.len(),
+            plan.h.len(),
+            plan.w.len()
+        );
+    }
+
+    /// Small config that tiles a z16 latent: spatial 64 px → 8 latent / 32 px → 4 overlap; temporal
+    /// 16 f → 4 latent / 8 f → 2 overlap.
+    fn small_cfg() -> TilingConfig {
+        TilingConfig {
+            spatial: Some(SpatialTiling {
+                tile_px: 64,
+                overlap_px: 32,
+            }),
+            temporal: Some(TemporalTiling {
+                tile_frames: 16,
+                overlap_frames: 8,
+            }),
+        }
+    }
+
+    #[test]
+    fn combined_axes_reconstruct_ncthw() {
+        // NCTHW (z16 layout), channel axis at 1, tiled axes [2, 3, 4].
+        let cfg = small_cfg();
+        // The bug-report shape class: temporal tiles + ONE spatial axis tiles, the other is a single
+        // tile (h = 8 latent ≤ the 8-latent tile). This asymmetric combined plan was untested.
+        assert_combined_reconstructs([1, 2, 6, 8, 12], [2, 3, 4], &cfg, "asym t+w (h single)");
+        assert_combined_reconstructs([1, 2, 6, 12, 8], [2, 3, 4], &cfg, "asym t+h (w single)");
+        // Fully symmetric (all three axes tile).
+        assert_combined_reconstructs([1, 2, 6, 12, 12], [2, 3, 4], &cfg, "symmetric t+h+w");
+        // Ragged last tile on every axis (3 tiles each, last shorter).
+        assert_combined_reconstructs([1, 2, 7, 13, 13], [2, 3, 4], &cfg, "ragged 3×3×3");
+    }
+
+    #[test]
+    fn combined_axes_reconstruct_channels_last() {
+        // Channels-last (z48 vae22 layout), channel axis last, tiled axes [1, 2, 3].
+        let cfg = small_cfg();
+        assert_combined_reconstructs([1, 6, 8, 12, 2], [1, 2, 3], &cfg, "cl asym t+w (h single)");
+        assert_combined_reconstructs([1, 6, 12, 12, 2], [1, 2, 3], &cfg, "cl symmetric t+h+w");
+        assert_combined_reconstructs([1, 7, 13, 13, 2], [1, 2, 3], &cfg, "cl ragged 3×3×3");
     }
 }
