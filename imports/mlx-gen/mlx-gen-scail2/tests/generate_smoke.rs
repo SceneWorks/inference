@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, ReplacementMode,
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, ReplacementMode,
     WeightsSource,
 };
 // Referencing the crate forces the linker to include its `inventory::submit!` registration.
@@ -98,9 +98,14 @@ fn missing_reference_errors() {
 }
 
 /// Run the full pipeline once for one driving mode (`replace=false` → animation,
-/// `replace=true` → cross-identity replacement via `video_mode`) and assert a sane video.
-fn run_mode(label: &str, replace: bool) {
+/// `replace=true` → cross-identity replacement via `video_mode`) at an optional load-time quant
+/// (`None` = bf16, `Some(Q4/Q8)` = the sc-5445 load-time DiT quantization) and assert a sane video.
+fn run_mode(label: &str, replace: bool, quant: Option<Quant>) {
+    // `SCAIL2_SMOKE_SIZE` sets a square default; `SCAIL2_SMOKE_W` / `_H` override per-axis so the
+    // real (non-square) production buckets like 832x480 can be measured for the sc-5445 minMemoryGb.
     let size = env_usize("SCAIL2_SMOKE_SIZE", 256);
+    let w = env_usize("SCAIL2_SMOKE_W", size);
+    let h = env_usize("SCAIL2_SMOKE_H", size);
     let n_frames = env_usize("SCAIL2_SMOKE_FRAMES", 13);
     let steps = env_usize("SCAIL2_SMOKE_STEPS", 8);
 
@@ -113,18 +118,18 @@ fn run_mode(label: &str, replace: bool) {
 
     // Synthetic single-character job: gradient reference, a 2-color ref mask, a short driving clip
     // with per-frame color masks.
-    let reference = gradient(size, size, 0);
-    let ref_mask = color_mask(size, size, size / 2);
-    let driving: Vec<Image> = (0..n_frames).map(|i| gradient(size, size, i * 7)).collect();
+    let reference = gradient(w, h, 0);
+    let ref_mask = color_mask(w, h, w / 2);
+    let driving: Vec<Image> = (0..n_frames).map(|i| gradient(w, h, i * 7)).collect();
     let masks: Vec<Image> = (0..n_frames)
-        .map(|i| color_mask(size, size, size / 4 + (i % (size / 2))))
+        .map(|i| color_mask(w, h, w / 4 + (i % (w / 2))))
         .collect();
 
     let req = GenerationRequest {
         prompt: "a person dancing, cinematic".into(),
         negative_prompt: Some("blurry, low quality".into()),
-        width: size as u32,
-        height: size as u32,
+        width: w as u32,
+        height: h as u32,
         steps: Some(steps as u32),
         seed: Some(7),
         fps: Some(16),
@@ -146,7 +151,10 @@ fn run_mode(label: &str, replace: bool) {
         ..Default::default()
     };
 
-    let spec = LoadSpec::new(WeightsSource::Dir(root));
+    let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+    if let Some(q) = quant {
+        spec = spec.with_quant(q);
+    }
     let gen = mlx_gen::registry::load(MODEL_ID, &spec).expect("load scail2 provider");
 
     let mut last_step = 0u32;
@@ -165,13 +173,9 @@ fn run_mode(label: &str, replace: bool) {
     assert!(!frames.is_empty(), "no frames produced");
     assert_eq!(last_step as usize, steps, "all denoise steps ran");
     for (i, f) in frames.iter().enumerate() {
-        assert_eq!(f.width as usize, size, "frame {i} width");
-        assert_eq!(f.height as usize, size, "frame {i} height");
-        assert_eq!(
-            f.pixels.len(),
-            size * size * 3,
-            "frame {i} pixel buffer size"
-        );
+        assert_eq!(f.width as usize, w, "frame {i} width");
+        assert_eq!(f.height as usize, h, "frame {i} height");
+        assert_eq!(f.pixels.len(), w * h * 3, "frame {i} pixel buffer size");
     }
     // Sanity: the decoded video is not a single flat color (would signal a dead pipeline).
     let (mut lo, mut hi) = (255u8, 0u8);
@@ -183,7 +187,7 @@ fn run_mode(label: &str, replace: bool) {
     }
     assert!(hi > lo, "decoded video is a single flat value ({lo})");
     println!(
-        "{label}: {} frames @ {size}x{size}, {steps} steps, byte range [{lo},{hi}]",
+        "{label}: {} frames @ {w}x{h}, {steps} steps, byte range [{lo},{hi}]",
         frames.len()
     );
 }
@@ -191,11 +195,32 @@ fn run_mode(label: &str, replace: bool) {
 #[test]
 #[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
 fn generate_animation_smoke() {
-    run_mode("animation", false);
+    run_mode("animation/bf16", false, None);
 }
 
 #[test]
 #[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
 fn generate_replacement_smoke() {
-    run_mode("replacement", true);
+    run_mode("replacement/bf16", true, None);
+}
+
+// Load-time DiT quantization (sc-5445): the same e2e path with Q4 (the SceneWorks worker default)
+// and Q8 applied to the DiT's attention + FFN Linears. Proves the quantize wiring runs end-to-end
+// and the quantized forward still produces a sane (non-flat) video. Q4 is the validated default.
+#[test]
+#[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
+fn generate_animation_q4_smoke() {
+    run_mode("animation/Q4", false, Some(Quant::Q4));
+}
+
+#[test]
+#[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
+fn generate_replacement_q4_smoke() {
+    run_mode("replacement/Q4", true, Some(Quant::Q4));
+}
+
+#[test]
+#[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
+fn generate_animation_q8_smoke() {
+    run_mode("animation/Q8", false, Some(Quant::Q8));
 }

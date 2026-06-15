@@ -25,6 +25,7 @@
 
 pub mod clip;
 pub mod config;
+pub mod convert;
 pub mod generate;
 pub mod model;
 pub mod pipeline;
@@ -34,6 +35,7 @@ pub mod rope;
 
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
+pub use convert::{quantize_scail2_dit, quantize_scail2_transformer};
 pub use generate::{generate, CharacterRef, Scail2Job};
 pub use model::{Scail2Dit, Scail2Inputs};
 pub use preprocess::extract_and_compress_mask_to_latent;
