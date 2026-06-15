@@ -79,8 +79,7 @@ pub struct Scail2 {
     descriptor: ModelDescriptor,
     config: Scail2Config,
     root: PathBuf,
-    /// Q4/Q8 load-time quant (sc-5445) — threaded through but not yet applied (generate uses bf16).
-    #[allow(dead_code)]
+    /// Q4/Q8 load-time quant (sc-5445) — applied to the DiT in [`crate::generate::generate`].
     quant: Option<Quant>,
 }
 
@@ -216,6 +215,6 @@ impl Scail2 {
             segment_len: SEGMENT_LEN,
             segment_overlap: SEGMENT_OVERLAP,
         };
-        crate::generate::generate(&self.root, &self.config, &job, on_progress)
+        crate::generate::generate(&self.root, &self.config, &job, self.quant, on_progress)
     }
 }
