@@ -44,7 +44,8 @@ const NUM_TRAIN_TIMESTEPS: usize = 1000;
 /// so the decode peak stays bounded at every resolution bucket (fewer frames/window as resolution
 /// grows). At 832×480/5s a 3.5M budget → 8-frame windows → ~33 GB MLX-active / ~76 GB process
 /// footprint (the Metal conv scratch is ~2× the MLX-active), vs. ~139 GB for an un-tiled segment
-/// decode. See the per-segment decode for why this is temporal-only rather than `TilingConfig::auto`.
+/// decode. See the per-segment decode for why this is temporal-only rather than `TilingConfig::auto`
+/// (a memory bound — `auto`'s combined-plan blend is itself correct, per sc-5690).
 const DECODE_TILE_BUDGET_PXFRAMES: i64 = 3_500_000;
 /// SCAIL-2 DiT-denoise activation-memory defaults (sc-5681). NOTE: measurement showed the 832×480/5s
 /// high-resolution OOM is the **VAE decode** (see the per-segment decode), not the DiT denoise — MLX's
@@ -503,12 +504,15 @@ pub fn generate(
         //
         // We tile **temporally only**, sizing each window so its output pixel-volume stays under a
         // budget — so the peak is bounded at every bucket (fewer frames/window as resolution grows).
-        // Deliberately NOT `TilingConfig::auto`: at buckets that trip both its spatial (>512 px) and
-        // temporal (>65 frame) thresholds it emits a combined spatial+temporal plan, and the shared
-        // `tile_decode_accumulate` mis-blends that combined plan to a flat frame (reproduced at
-        // 832×480/81f; spatial-only and temporal-only each decode correctly — flagged for a shared-VAE
-        // fix). Temporal-only also bounds memory better here (the spatial tiles `auto` picks are coarse
-        // → ~111 GB). `decode_tiled` falls back to a single pass when the window covers the whole clip.
+        // Deliberately NOT `TilingConfig::auto`: at the buckets that trip both its spatial (>512 px)
+        // and temporal (>65 frame) thresholds, `auto` emits a combined plan whose spatial tiles are
+        // coarse (512 px / 64 latent), and because they don't shrink with frame count the decode peak
+        // stays high (~111 GB at 832×480). The budgeted temporal-only window bounds it much tighter
+        // (~33 GB) — this is purely a memory choice. (The combined-plan *blend* itself is correct:
+        // sc-5690 verified `tile_decode_accumulate` reconstructs a combined spatial+temporal plan
+        // exactly on the real z16 VAE at this exact geometry — an earlier flat-frame symptom was not
+        // the decode, most likely the bf16→NaN DiT overflow fixed in the same sc-5681 work.)
+        // `decode_tiled` falls back to a single pass when the window covers the whole clip.
         on_progress(Progress::Decoding);
         let zs = latent.shape();
         let z = latent.reshape(&[1, zs[0], zs[1], zs[2], zs[3]])?;
