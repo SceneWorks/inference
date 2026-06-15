@@ -484,7 +484,14 @@ mod tests {
     /// on each axis (no zero-weight gaps → the final divide is well-defined). Checked for both VAEs.
     #[test]
     fn plan_covers_every_output_position() {
-        for (vae, f, h, w) in [(VaeTiling::WAN, 9, 9, 13), (VaeTiling::LTX, 5, 5, 5)] {
+        // Includes the causal z48 vae22 (WAN22): its temporal `out_stop = 1+(end−1)·scale` mapping
+        // and per-tile left-ramp adjustment must still cover every output frame with no zero-weight
+        // gap when combined with spatial tiling (sc-5690 — the combined-plan blend relies on this).
+        for (vae, f, h, w) in [
+            (VaeTiling::WAN, 9, 9, 13),
+            (VaeTiling::WAN22, 9, 9, 13),
+            (VaeTiling::LTX, 5, 5, 5),
+        ] {
             let cfg = TilingConfig {
                 spatial: Some(SpatialTiling {
                     tile_px: 4 * vae.spatial_scale,
