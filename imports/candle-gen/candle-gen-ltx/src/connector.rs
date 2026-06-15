@@ -46,8 +46,14 @@ pub struct Connector {
 impl Connector {
     /// Build from a VarBuilder rooted at the DiT prefix, under `video_embeddings_connector`.
     pub fn new(vb: VarBuilder, cfg: &ConnectorConfig) -> Result<Self> {
+        Self::new_with_prefix(vb, cfg, "video_embeddings_connector")
+    }
+
+    /// Build under an explicit sub-prefix (`video_embeddings_connector` /
+    /// `audio_embeddings_connector`) so the audio text head can reuse the same connector.
+    pub fn new_with_prefix(vb: VarBuilder, cfg: &ConnectorConfig, prefix: &str) -> Result<Self> {
         let device = vb.device().clone();
-        let cvb = vb.pp("video_embeddings_connector");
+        let cvb = vb.pp(prefix);
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             let b = cvb.pp(format!("transformer_1d_blocks.{i}"));

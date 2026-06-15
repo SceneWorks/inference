@@ -137,6 +137,20 @@ impl ConnectorConfig {
     pub fn inner_dim(&self) -> usize {
         self.num_heads * self.head_dim
     }
+
+    /// The audio text connector (`audio_embeddings_connector`): 8 layers, heads 32 × head_dim 64 =
+    /// 2048, 128 registers, max_pos 4096. Same structure as the video connector at the audio dim.
+    pub fn ltx_2_3_audio() -> Self {
+        Self {
+            num_layers: 8,
+            num_heads: 32,
+            head_dim: 64,
+            num_registers: 128,
+            max_pos: 4096,
+            norm_eps: 1e-6,
+            rope_theta: 10000.0,
+        }
+    }
 }
 
 /// Gemma-3-12B (used as a text encoder — all hidden states extracted).
