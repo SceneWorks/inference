@@ -50,6 +50,7 @@
 //! `tests/ti2v_real_parity.rs` (`#[ignore]` — heavy weights outside CI).
 
 pub mod adapters;
+pub mod chunk;
 pub mod config;
 pub mod convert;
 pub mod model;
@@ -68,6 +69,7 @@ pub mod vae22;
 mod vae_common;
 
 pub use adapters::{merge_vace_adapters, merge_wan_adapters, WanLoraReport};
+pub use chunk::{map_seq_chunks, slice_axis0, DitMemoryConfig};
 pub use config::{GuideScale, WanModelConfig, WanQuant, WanVaceConfig, SAMPLE_NEG_PROMPT};
 pub use model::{
     descriptor, descriptor_i2v_14b, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID,
