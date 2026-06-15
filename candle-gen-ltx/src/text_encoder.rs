@@ -16,11 +16,20 @@ use crate::gemma::GemmaEncoder;
 
 const RMS_EPS: f64 = 1e-6;
 
+/// The audio text head (sc-5495): a separate aggregate projection (188160 → 2048) + rescale +
+/// `audio_embeddings_connector`, sharing the same Gemma hidden states as the video head.
+struct AudioHead {
+    aggregate: Linear, // [2048, 188160] + bias
+    rescale: f64,      // √(2048 / 3840)
+    connector: Connector,
+}
+
 pub struct LtxTextEncoder {
     gemma: GemmaEncoder,
     aggregate: Linear, // [4096, 188160] + bias
     rescale: f64,      // √(4096 / 3840)
     connector: Connector,
+    audio: Option<AudioHead>,
     hidden_size: usize,
     device: Device,
 }
@@ -50,9 +59,45 @@ impl LtxTextEncoder {
             aggregate,
             rescale,
             connector,
+            audio: None,
             hidden_size: gemma_cfg.hidden_size,
             device,
         })
+    }
+
+    /// As [`Self::new`] but also loads the **audio** text head (sc-5495): the
+    /// `audio_aggregate_embed` projection (188160 → 2048) + the `audio_embeddings_connector`. Enables
+    /// [`Self::encode_both`] for the AudioVideo path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_av(
+        gemma_vb: VarBuilder,
+        proj_vb: VarBuilder,
+        dit_vb: VarBuilder,
+        gemma_cfg: &GemmaConfig,
+        conn_cfg: &ConnectorConfig,
+        audio_conn_cfg: &ConnectorConfig,
+    ) -> Result<Self> {
+        let mut me = Self::new(
+            gemma_vb,
+            proj_vb.clone(),
+            dit_vb.clone(),
+            gemma_cfg,
+            conn_cfg,
+        )?;
+        let agg = proj_vb.pp("text_embedding_projection.audio_aggregate_embed");
+        let w = agg.get_unchecked("weight")?.to_dtype(DType::BF16)?;
+        let out_dim = w.dim(0)?;
+        let b = agg.get_unchecked("bias")?.to_dtype(DType::BF16)?;
+        let aggregate = Linear::new(w, Some(b));
+        let rescale = (out_dim as f64 / gemma_cfg.hidden_size as f64).sqrt();
+        let connector =
+            Connector::new_with_prefix(dit_vb, audio_conn_cfg, "audio_embeddings_connector")?;
+        me.audio = Some(AudioHead {
+            aggregate,
+            rescale,
+            connector,
+        });
+        Ok(me)
     }
 
     /// `norm_and_concat_per_token_rms`: stack the 49 hidden states `[1,L,3840,49]`, RMS-normalize each
@@ -81,5 +126,24 @@ impl LtxTextEncoder {
         let features = self.aggregate.forward(&scaled)?; // (1,L,4096)
         let nv = mask01.iter().filter(|&&m| m != 0).count();
         self.connector.forward(&features, nv)
+    }
+
+    /// Encode once and project BOTH the video (4096) and audio (2048) contexts, sharing the Gemma
+    /// hidden states + per-token-RMS concat (sc-5495). Requires [`Self::new_av`]. Returns
+    /// `(video_embeddings [1,L,4096], audio_embeddings [1,L,2048])` (bf16).
+    pub fn encode_both(&self, input_ids: &Tensor, mask01: &[u32]) -> Result<(Tensor, Tensor)> {
+        let audio = self.audio.as_ref().ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "ltx: audio text head not loaded (use new_av)".into(),
+            )
+        })?;
+        let hiddens = self.gemma.forward(input_ids, mask01)?;
+        let normed = self.normed_hidden(&hiddens, mask01)?;
+        let nv = mask01.iter().filter(|&&m| m != 0).count();
+        let v_feat = self.aggregate.forward(&(normed.clone() * self.rescale)?)?;
+        let video = self.connector.forward(&v_feat, nv)?;
+        let a_feat = audio.aggregate.forward(&(normed * audio.rescale)?)?;
+        let audio_ctx = audio.connector.forward(&a_feat, nv)?;
+        Ok((video, audio_ctx))
     }
 }
