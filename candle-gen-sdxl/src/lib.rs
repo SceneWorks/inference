@@ -81,7 +81,9 @@ pub use conditioning::SdxlConditioner;
 // VAE, and a diffusers ControlNet, built from an SDXL snapshot. The candle twins of mlx-gen-sdxl's
 // load_unet_dtype/load_vae/load_controlnet.
 pub mod loaders;
-pub use loaders::{load_instantid_unet, load_sdxl_controlnet, load_sdxl_vae};
+pub use loaders::{
+    load_instantid_unet, load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae,
+};
 
 // The SDXL VAE type the loader returns, re-exported so the `candle-gen-instantid` glue can hold one as
 // a field + pass it to `decode_image` without depending on candle-transformers directly.

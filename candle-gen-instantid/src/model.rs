@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{DetectedFace, FaceEmbedder, Image, Progress, WeightsSource};
+use candle_gen::gen_core::{
+    AdapterSpec, DetectedFace, FaceEmbedder, Image, Progress, WeightsSource,
+};
 use candle_gen::{CandleError, Result};
 
 use candle_gen_face::CandleFaceAnalysis;
@@ -28,9 +30,9 @@ use candle_gen_sdxl::ip_adapter::{load_ip_kv_pairs, Resampler, ResamplerConfig};
 use candle_gen_sdxl::weights::Weights;
 use candle_gen_sdxl::{
     decode_image, denoise_ip_control, denoise_ip_multi_control, load_instantid_unet,
-    load_sdxl_controlnet, load_sdxl_vae, preprocess_control_image, seeded_prior, text_time_ids,
-    AutoEncoderKL, ControlContext, ControlNet, Denoiser, EulerAncestralSampler, SdxlConditioner,
-    UNet2DConditionModel,
+    load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae,
+    preprocess_control_image, seeded_prior, text_time_ids, AutoEncoderKL, ControlContext,
+    ControlNet, Denoiser, EulerAncestralSampler, SdxlConditioner, UNet2DConditionModel,
 };
 
 use rand::rngs::StdRng;
@@ -96,6 +98,11 @@ pub struct InstantIdPaths {
     pub identitynet: WeightsSource,
     /// Converted `ip-adapter.safetensors` (`image_proj.*` Resampler + `ip_adapter.*` K/V pairs).
     pub ip_adapter: PathBuf,
+    /// User LoRA/LoKr style/character adapters to merge onto the SDXL UNet at load (sc-6038).
+    /// InstantID runs on a stock SDXL (RealVisXL) UNet, so SDXL-family LoRAs apply on top of the
+    /// IdentityNet + face IP-Adapter. Empty (the common case) is a no-op. Distinct from
+    /// [`ip_adapter`](Self::ip_adapter), which is the InstantID identity IP-Adapter.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One InstantID generation request.
@@ -161,7 +168,14 @@ impl InstantId {
         let root = paths.sdxl_base.as_path();
 
         let conditioner = SdxlConditioner::load(root, &device, DTYPE)?;
-        let mut unet = load_instantid_unet(root, &device, DTYPE)?;
+        // User LoRA/LoKr (sc-6038) folds into the dense UNet weights before the IP-Adapter K/V pairs
+        // install below — SDXL-family LoRAs apply to the InstantID RealVisXL backbone just like the
+        // registry SDXL path. Empty is the mmap fast path.
+        let mut unet = if paths.adapters.is_empty() {
+            load_instantid_unet(root, &device, DTYPE)?
+        } else {
+            load_instantid_unet_with_adapters(root, &device, DTYPE, &paths.adapters)?
+        };
         let identitynet = load_sdxl_controlnet(&paths.identitynet, &device, DTYPE)?;
 
         // Face IP-Adapter: the Resampler (`image_proj.*`) + the decoupled K/V pairs (`ip_adapter.*`),
