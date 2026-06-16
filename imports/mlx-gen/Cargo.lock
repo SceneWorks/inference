@@ -612,6 +612,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-ideogram"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "inventory",
+ "mlx-gen",
+ "mlx-gen-flux2",
+ "pmetal-mlx-rs",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-gen-instantid"
 version = "0.0.0"
 dependencies = [
