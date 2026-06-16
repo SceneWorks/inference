@@ -6,9 +6,12 @@
 //! tracklets, seed new identities from unmatched detections
 //! ([`Sam3Tracker::decode_mask_conditioning_frame`]), and encode each frame's masks into memory.
 //!
-//! Mirrors `transformers` `sam3_video/modeling_sam3_video.py` `_det_track_one_frame`. Matches the
-//! reference's **no-`kernels`** configuration: NMS (`det_nms_thresh`) and hole-filling are no-ops.
-//! Masks flow as raw 288² logits (the processor sigmoids for display).
+//! Mirrors `transformers` `sam3_video/modeling_sam3_video.py` `_det_track_one_frame`. Detection
+//! mask-NMS dedup (`det_nms_thresh`) is ported natively (sc-4995) — it replicates the reference's
+//! `kernels`-enabled `generic_nms` (the CUDA/triton `cv-utils` kernel) with a host-side greedy
+//! mask-IoU pass, since that kernel is GPU-only and unavailable on this Mac. Hole-filling
+//! (`fill_holes_in_mask_scores`) is still a no-op (the no-`kernels` behavior) pending sc-4995's
+//! second half. Masks flow as raw 288² logits (the processor sigmoids for display).
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -26,6 +29,7 @@ use crate::{Sam3ImageSegmenter, Sam3Tracker};
 // --- config (Sam3VideoConfig defaults) -----------------------------------------------------------
 const LOW_RES: i32 = 288; // low_res_mask_size
 const SCORE_THRESH_DET: f32 = 0.5; // score_threshold_detection
+const DET_NMS_THRESH: f32 = 0.1; // det_nms_thresh (mask-IoU NMS dedup; sc-4995)
 const NEW_DET_THRESH: f32 = 0.7;
 const ASSOC_IOU_THRESH: f32 = 0.1;
 const TRK_ASSOC_IOU_THRESH: f32 = 0.5;
@@ -283,9 +287,10 @@ impl Sam3VideoModel {
         )
     }
 
-    // ----- detection (run_detection, single prompt, NMS off) -----
+    // ----- detection (run_detection, single prompt) -----
     // Takes the shared backbone features (sc-5409) so the detector FPN reuses the same ViT pass as
-    // the tracker neck instead of re-running the backbone.
+    // the tracker neck instead of re-running the backbone. Above-threshold detections are then
+    // de-duplicated by greedy mask-IoU NMS (`det_nms_thresh`, sc-4995).
     fn run_detection(
         &self,
         features: &Array,
@@ -318,6 +323,7 @@ impl Sam3VideoModel {
                 prompt_id: 0,
             });
         }
+        let dets = nms_dedup(dets, DET_NMS_THRESH);
         Ok(DetFrame { dets })
     }
 
@@ -796,6 +802,53 @@ fn mask_iou(a: &[bool], b: &[bool]) -> f32 {
     inter as f32 / (uni.max(1) as f32)
 }
 
+/// Greedy mask-IoU NMS over above-threshold detections (`det_nms_thresh`, sc-4995). Mirrors the
+/// `kernels`-enabled reference `nms_masks` → `generic_nms` (cv-utils, GPU-only) with a host pass:
+/// process detections by **descending score**, keep each not-yet-suppressed one, and suppress any
+/// lower-scored detection whose binarized mask-IoU with it is **strictly greater** than
+/// `iou_threshold` (IoU == threshold is kept, matching `generic_nms_cpu`'s `<= threshold` keep rule).
+/// Survivors are returned in their original (query) order, mirroring the reference's
+/// `where(pred_probs > threshold)` index-order re-selection after zeroing the suppressed scores.
+/// Suppression is confined to detections of the same `prompt_id` (the reference runs NMS per prompt).
+/// Ties in score break by ascending original index (stable sort), matching the CPU oracle.
+fn nms_dedup(dets: Vec<Detection>, iou_threshold: f32) -> Vec<Detection> {
+    let n = dets.len();
+    if iou_threshold <= 0.0 || n <= 1 {
+        return dets;
+    }
+    let bins: Vec<Vec<bool>> = dets.iter().map(|d| binarize(&d.mask)).collect();
+    // descending score; stable so ties keep ascending original index (matches np stable argsort)
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        dets[b]
+            .score
+            .partial_cmp(&dets[a].score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut suppressed = vec![false; n];
+    let mut keep = vec![false; n];
+    for pos in 0..n {
+        let i = order[pos];
+        if suppressed[i] {
+            continue;
+        }
+        keep[i] = true;
+        for &j in &order[pos + 1..] {
+            if suppressed[j] || dets[j].prompt_id != dets[i].prompt_id {
+                continue;
+            }
+            if mask_iou(&bins[i], &bins[j]) > iou_threshold {
+                suppressed[j] = true;
+            }
+        }
+    }
+    dets.into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, d)| d)
+        .collect()
+}
+
 fn to_vec(a: &Array) -> Result<Vec<f32>> {
     Ok(a.reshape(&[-1])?
         .as_dtype(Dtype::Float32)?
@@ -821,6 +874,106 @@ fn seq_first(a: &Array, bf16: bool) -> Result<Array> {
 mod tests {
     use super::*;
     use mlx_gen::weights::Weights;
+
+    /// Build a detection whose 288² mask is a `+1.0` rectangle (rows `r0..r1`, cols `c0..c1`) on a
+    /// `-1.0` background, so `binarize` (`> 0`) recovers exactly that rectangle.
+    fn rect_det(
+        score: f32,
+        prompt_id: i32,
+        r0: usize,
+        r1: usize,
+        c0: usize,
+        c1: usize,
+    ) -> Detection {
+        let w = LOW_RES as usize;
+        let mut mask = vec![-1.0f32; w * w];
+        for r in r0..r1 {
+            for c in c0..c1 {
+                mask[r * w + c] = 1.0;
+            }
+        }
+        Detection {
+            mask,
+            score,
+            prompt_id,
+        }
+    }
+
+    fn scores(dets: &[Detection]) -> Vec<f32> {
+        dets.iter().map(|d| d.score).collect()
+    }
+
+    /// sc-4995: among heavily-overlapping detections, NMS keeps the highest-scored and drops the rest.
+    #[test]
+    fn nms_dedup_suppresses_overlapping_lower_score() {
+        // two identical full-frame rectangles (IoU 1.0) → only the 0.9 survives.
+        let dets = vec![
+            rect_det(0.6, 0, 0, 100, 0, 100),
+            rect_det(0.9, 0, 0, 100, 0, 100),
+        ];
+        let kept = nms_dedup(dets, DET_NMS_THRESH);
+        assert_eq!(scores(&kept), vec![0.9]);
+    }
+
+    /// Disjoint detections (IoU 0) are all kept, in original (query) order.
+    #[test]
+    fn nms_dedup_keeps_disjoint() {
+        let dets = vec![
+            rect_det(0.8, 0, 0, 10, 0, 10),
+            rect_det(0.7, 0, 50, 60, 50, 60),
+        ];
+        let kept = nms_dedup(dets, DET_NMS_THRESH);
+        assert_eq!(scores(&kept), vec![0.8, 0.7]);
+    }
+
+    /// Suppression is **strictly** `IoU > threshold`: IoU exactly at the threshold is kept (matches
+    /// `generic_nms_cpu`'s `<= threshold` keep rule). A=rows 0..3, B=rows 1..4 (full width) → IoU 0.5.
+    #[test]
+    fn nms_dedup_threshold_is_strict() {
+        let pair = || {
+            vec![
+                rect_det(0.9, 0, 0, 3, 0, 100),
+                rect_det(0.8, 0, 1, 4, 0, 100),
+            ]
+        };
+        // IoU == 0.5 is NOT > 0.5 → both kept.
+        assert_eq!(scores(&nms_dedup(pair(), 0.5)), vec![0.9, 0.8]);
+        // IoU 0.5 > 0.4 → lower-scored suppressed.
+        assert_eq!(scores(&nms_dedup(pair(), 0.4)), vec![0.9]);
+    }
+
+    /// Survivors come back in original query order, not score order (mirrors the reference's
+    /// `where(pred_probs > threshold)` index-order re-selection after zeroing suppressed scores).
+    #[test]
+    fn nms_dedup_preserves_query_order() {
+        let dets = vec![
+            rect_det(0.7, 0, 0, 10, 0, 10),    // disjoint, kept
+            rect_det(0.95, 0, 50, 60, 50, 60), // overlaps det2, higher score → kept
+            rect_det(0.6, 0, 50, 60, 50, 60),  // suppressed by det1
+        ];
+        let kept = nms_dedup(dets, DET_NMS_THRESH);
+        // query order [0.7, 0.95], NOT score order [0.95, 0.7].
+        assert_eq!(scores(&kept), vec![0.7, 0.95]);
+    }
+
+    /// NMS is confined to a single prompt group: overlapping detections from different prompts coexist.
+    #[test]
+    fn nms_dedup_respects_prompt_groups() {
+        let dets = vec![
+            rect_det(0.9, 0, 0, 100, 0, 100),
+            rect_det(0.8, 1, 0, 100, 0, 100), // same mask, different prompt → not suppressed
+        ];
+        let kept = nms_dedup(dets, DET_NMS_THRESH);
+        assert_eq!(kept.len(), 2);
+    }
+
+    /// Degenerate inputs pass through unchanged.
+    #[test]
+    fn nms_dedup_empty_and_single() {
+        assert!(nms_dedup(Vec::new(), DET_NMS_THRESH).is_empty());
+        let one = nms_dedup(vec![rect_det(0.55, 0, 0, 10, 0, 10)], DET_NMS_THRESH);
+        assert_eq!(scores(&one), vec![0.55]);
+    }
 
     /// F-028: the detector segmenter and the tracker must share **one** PE backbone instance — both
     /// at load and after quantization — rather than each holding its own ~445M-param copy. Checks

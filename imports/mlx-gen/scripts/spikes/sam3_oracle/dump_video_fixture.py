@@ -10,6 +10,13 @@ The Rust test feeds the captured frames + input_ids into the port and compares p
 per-`obj_id` masks (cosine) and the object-id sets.
 
 Run:  /tmp/sam3ref/.venv/bin/python dump_video_fixture.py
+
+sc-4995: the `kernels` cv-utils ops (`generic_nms` / `cc_2d`) are GPU-only and unavailable on this
+Mac, so the stock reference runs in its no-`kernels` fallback (detection NMS off, hole-fill off). To
+produce a fixture that reflects the *kernels-enabled* mask quality the Rust port replicates, set
+`SAM3_EMULATE_NMS=1` to install a CPU emulation of `generic_nms` before the run. Keep it set whenever
+the Rust port has NMS enabled, otherwise `video_parity` will diff the NMS-on port against an NMS-off
+fixture.
 """
 
 import hashlib
@@ -42,10 +49,51 @@ def stats(t):
     }
 
 
+def install_kernel_emulation():
+    """sc-4995: install CPU emulations of the GPU-only `kernels` cv-utils ops, gated by env, so the
+    fixture reflects the kernels-enabled behavior the Rust port replicates.
+
+    SAM3_EMULATE_NMS=1 → emulate `generic_nms` with Meta's reference `generic_nms_cpu` greedy pass
+    (descending score; suppress IoU **>** threshold; ties → ascending index via a stable sort, which
+    the Rust `nms_dedup` matches). The detector's `det_nms_thresh` gate (> 0) is already satisfied by
+    the default config, so patching the module-global `nms_masks` is enough to turn dedup on.
+    """
+    import transformers.models.sam3_video.modeling_sam3_video as m
+
+    if os.environ.get("SAM3_EMULATE_NMS") == "1":
+
+        def _generic_nms_cpu(ious, scores, iou_threshold):
+            ious_np = ious.float().cpu().numpy()
+            scores_np = scores.float().cpu().numpy()
+            order = np.argsort(-scores_np, kind="stable")  # descending; ties → ascending index
+            kept = []
+            while order.size > 0:
+                i = int(order[0])
+                kept.append(i)
+                rest = order[1:]
+                order = rest[ious_np[i, rest] <= iou_threshold]
+            return torch.tensor(kept, dtype=torch.int64)
+
+        def _nms_masks(pred_probs, pred_masks, prob_threshold, iou_threshold):
+            is_valid = pred_probs > prob_threshold
+            probs = pred_probs[is_valid]
+            masks_binary = pred_masks[is_valid] > 0
+            if probs.numel() == 0:
+                return is_valid
+            ious = m.mask_iou(masks_binary, masks_binary)
+            kept_inds = _generic_nms_cpu(ious, probs, iou_threshold)
+            valid_inds = torch.where(is_valid, is_valid.cumsum(dim=0) - 1, -1)
+            return torch.isin(valid_inds, kept_inds)
+
+        m.nms_masks = _nms_masks
+        print("  [emulation] NMS = generic_nms_cpu (SAM3_EMULATE_NMS=1)")
+
+
 def main():
     print("loading", MODEL)
     model = Sam3VideoModel.from_pretrained(MODEL, dtype=torch.float32).eval()
     processor = Sam3VideoProcessor.from_pretrained(MODEL)
+    install_kernel_emulation()
 
     req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=30) as r:
