@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::media::Image;
-use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_flux2::{quantize_flux2_dit, quantize_flux2_text_encoder_dir};
 
 const BITS: i32 = 4;
@@ -155,5 +155,124 @@ fn dev_txt2img_renders_coherent_image() {
     assert!(
         mean > 2.0 && mean < 253.0,
         "render pinned to an extreme: mean={mean:.2}"
+    );
+}
+
+// ---- sc-5919: FLUX.2-dev EDIT (single + multi reference) --------------------------------------
+//
+// dev has no mflux fork reference (mflux is klein-only), so — like the dev T2I e2e above — these are
+// **coherence floors**, not bit-parity. They prove the dev *edit* vertical runs end to end: the
+// `flux2_dev_edit` variant loads the dev snapshot, the (klein-shared) edit chain VAE-encodes the
+// reference(s) and concatenates them to the DiT image stream at t=10+10·i, the embedded-guidance dev
+// DiT denoises the joint sequence, and the VAE decodes a non-degenerate image. A wiring bug (edit
+// tokens dropped, guidance lost, wrong variant routing) collapses the render to a flat field.
+
+/// A deterministic, non-degenerate synthetic reference: a 2-axis gradient with a per-index tint.
+/// (No fork golden to load — the smoke only needs a real, structured image to condition on.)
+fn synthetic_reference(size: u32, idx: u8) -> Image {
+    let mut pixels = Vec::with_capacity((size * size * 3) as usize);
+    let denom = size.max(1);
+    for y in 0..size {
+        for x in 0..size {
+            pixels.push(((x * 255) / denom) as u8);
+            pixels.push(((y * 255) / denom) as u8);
+            pixels.push(idx.wrapping_mul(83).wrapping_add(40));
+        }
+    }
+    Image {
+        width: size,
+        height: size,
+        pixels,
+    }
+}
+
+/// Render through the public `flux2_dev_edit` path with `n_refs` synthetic references (1 ⇒
+/// `Reference`, ≥2 ⇒ `MultiReference`). Returns the decoded image.
+fn render_dev_edit(size: u32, steps: Option<u32>, n_refs: usize, prompt: &str) -> Image {
+    let dst = prequantized_dev_snapshot();
+    let gen = mlx_gen::load("flux2_dev_edit", &LoadSpec::new(WeightsSource::Dir(dst)))
+        .expect("dev-edit loads through the registry");
+
+    let refs: Vec<Image> = (0..n_refs)
+        .map(|i| synthetic_reference(size, i as u8))
+        .collect();
+    let conditioning = if n_refs == 1 {
+        vec![Conditioning::Reference {
+            image: refs.into_iter().next().unwrap(),
+            strength: None,
+        }]
+    } else {
+        vec![Conditioning::MultiReference { images: refs }]
+    };
+
+    let req = GenerationRequest {
+        prompt: prompt.into(),
+        width: size,
+        height: size,
+        count: 1,
+        seed: Some(0),
+        steps,
+        conditioning,
+        ..Default::default()
+    };
+    let GenerationOutput::Images(mut images) = gen
+        .generate(&req, &mut |p| {
+            if let mlx_gen::Progress::Step { current, total } = p {
+                if current == 1 || current == total || current % 8 == 0 {
+                    println!("  step {current}/{total}");
+                }
+            }
+        })
+        .expect("dev-edit generate")
+    else {
+        panic!("expected images");
+    };
+    images.pop().unwrap()
+}
+
+/// Env-tunable for a fast local run: `MLX_GEN_FLUX2_DEV_EDIT_SIZE` (default 512 — edit is heavier
+/// than T2I since references add sequence tokens), `MLX_GEN_FLUX2_DEV_EDIT_STEPS` (default 8),
+/// `MLX_GEN_FLUX2_DEV_EDIT_REFS` (default 1; ≥2 exercises `MultiReference`).
+#[test]
+#[ignore = "needs real FLUX.2-dev snapshot (~105 GB); assembles a Q4 snapshot in TMPDIR"]
+fn dev_edit_renders_coherent_image() {
+    let size: u32 = std::env::var("MLX_GEN_FLUX2_DEV_EDIT_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    let steps: Option<u32> = Some(
+        std::env::var("MLX_GEN_FLUX2_DEV_EDIT_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8),
+    );
+    let n_refs: usize = std::env::var("MLX_GEN_FLUX2_DEV_EDIT_REFS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let img = render_dev_edit(
+        size,
+        steps,
+        n_refs,
+        "make it a vivid impressionist oil painting",
+    );
+    assert_eq!((img.width, img.height), (size, size), "output dimensions");
+    assert_eq!(
+        img.pixels.len(),
+        (size * size * 3) as usize,
+        "RGB8 pixel count"
+    );
+    let (mean, std) = mean_std(&img);
+    println!(
+        "flux2-dev EDIT OK: {size}² refs={n_refs} steps={steps:?} → mean={mean:.1} std={std:.1}"
+    );
+    assert!(
+        std > 10.0,
+        "edit render looks degenerate (flat): std={std:.2}"
+    );
+    assert!(
+        mean > 2.0 && mean < 253.0,
+        "edit render pinned to an extreme: mean={mean:.2}"
     );
 }
