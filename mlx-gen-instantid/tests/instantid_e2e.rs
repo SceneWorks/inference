@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
-use mlx_gen::WeightsSource;
+use mlx_gen::{AdapterKind, AdapterSpec, WeightsSource};
 use mlx_gen_instantid::{letterbox, InstantId, InstantIdPaths, InstantIdRequest};
 
 fn golden_path(name: &str) -> PathBuf {
@@ -133,6 +133,7 @@ fn run_identity(quant_bits: Option<i32>, size_override: Option<u32>, out_png: &s
         sdxl_base: sdxl_base(),
         identitynet: instantid_controlnet(),
         ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
+        adapters: Vec::new(),
     };
     let scrfd = golden("scrfd_10g.safetensors");
     let arcface = golden("arcface_iresnet100.safetensors");
@@ -259,6 +260,7 @@ fn instantid_pose_mode_preserves_identity() {
         sdxl_base: sdxl_base(),
         identitynet: instantid_controlnet(),
         ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
+        adapters: Vec::new(),
     };
     let model = InstantId::load(&paths)
         .expect("load InstantID")
@@ -327,6 +329,7 @@ fn instantid_face_restore_improves_identity() {
         sdxl_base: sdxl_base(),
         identitynet: instantid_controlnet(),
         ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
+        adapters: Vec::new(),
     };
     let model = InstantId::load(&paths)
         .expect("load InstantID")
@@ -414,6 +417,7 @@ fn instantid_view_angle_preserves_identity() {
         sdxl_base: sdxl_base(),
         identitynet: instantid_controlnet(),
         ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
+        adapters: Vec::new(),
     };
     let model = InstantId::load(&paths)
         .expect("load InstantID")
@@ -461,6 +465,102 @@ fn instantid_view_angle_preserves_identity() {
 }
 
 #[test]
+#[ignore = "needs SDXL base + InstantID + face goldens + reference + INSTANTID_TEST_LORA"]
+fn instantid_user_lora_changes_output() {
+    // sc-6038: prove a user SDXL LoRA actually perturbs the InstantID UNet (it was silently dropped).
+    // Env-gated on a real SDXL LoRA `.safetensors` (`INSTANTID_TEST_LORA`) — generate the same
+    // seed/prompt/size with and without the LoRA and assert the outputs diverge. A silently-ignored
+    // LoRA would yield byte-identical pixels (the regression this guards). Optional
+    // `INSTANTID_TEST_LORA_SCALE` (default 1.0).
+    let lora = match std::env::var("INSTANTID_TEST_LORA") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => {
+            eprintln!("skipping: set INSTANTID_TEST_LORA to a real SDXL LoRA .safetensors path");
+            return;
+        }
+    };
+    let size = env_usize("INSTANTID_SIZE", 512) as u32;
+    let steps = env_usize("INSTANTID_STEPS", 6);
+    let scale = std::env::var("INSTANTID_TEST_LORA_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0f32);
+
+    // Reference face image (shared across both runs).
+    let g = golden("instantid_e2e_ref.safetensors");
+    let wh = g.require("ref_wh").unwrap().as_slice::<i32>().to_vec();
+    let ref_img = Image {
+        width: wh[0] as u32,
+        height: wh[1] as u32,
+        pixels: g.require("ref_img").unwrap().as_slice::<u8>().to_vec(),
+    };
+
+    let render = |adapters: Vec<AdapterSpec>| -> Image {
+        let paths = InstantIdPaths {
+            sdxl_base: sdxl_base(),
+            identitynet: instantid_controlnet(),
+            ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
+            adapters,
+        };
+        let model = InstantId::load(&paths)
+            .expect("load InstantID")
+            .with_face(
+                &golden("scrfd_10g.safetensors"),
+                &golden("arcface_iresnet100.safetensors"),
+            )
+            .expect("attach face stack");
+        let canvas = letterbox(&ref_img, size, size);
+        let face = model
+            .largest_face(&canvas.pixels, size as usize, size as usize)
+            .expect("detect reference face");
+        let kps: Vec<(f32, f32)> = face.kps.iter().map(|p| (p[0], p[1])).collect();
+        let req = InstantIdRequest {
+            prompt: "film still, a portrait photo of a man, cinematic lighting, sharp focus".into(),
+            negative: "lowres, blurry, deformed".into(),
+            width: size,
+            height: size,
+            steps,
+            guidance: 5.0,
+            ip_adapter_scale: 0.8,
+            controlnet_scale: 0.8,
+            seed: 0,
+            ..Default::default()
+        };
+        model
+            .generate_with(&req, &face.embedding, &kps, &mut |_| {})
+            .expect("generate")
+    };
+
+    let base = render(Vec::new());
+    let with_lora = render(vec![AdapterSpec::new(lora, scale, AdapterKind::Lora)]);
+    assert_eq!(
+        (base.width, base.height),
+        (with_lora.width, with_lora.height),
+        "same output dims"
+    );
+
+    // Same seed/prompt/size — the merged LoRA is the ONLY difference, so the pixels must diverge.
+    let changed = base
+        .pixels
+        .iter()
+        .zip(&with_lora.pixels)
+        .filter(|(a, b)| a != b)
+        .count();
+    let frac = changed as f64 / base.pixels.len().max(1) as f64;
+    println!(
+        "[instantid lora] {size}x{size} steps={steps} scale={scale} | changed {changed} bytes \
+         ({:.2}%)",
+        frac * 100.0
+    );
+    assert!(
+        frac > 0.01,
+        "user LoRA did not change the output ({:.3}% bytes differ) — adapters not applied to the \
+         InstantID UNet",
+        frac * 100.0
+    );
+}
+
+#[test]
 #[ignore = "needs SDXL base + InstantID + converted ip-adapter + face goldens + reference"]
 fn instantid_honors_cancellation() {
     // sc-4380 (F-096 sibling): InstantID must honor the engine cancellation contract.
@@ -470,6 +570,7 @@ fn instantid_honors_cancellation() {
         sdxl_base: sdxl_base(),
         identitynet: instantid_controlnet(),
         ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
+        adapters: Vec::new(),
     };
     let scrfd = golden("scrfd_10g.safetensors");
     let arcface = golden("arcface_iresnet100.safetensors");
