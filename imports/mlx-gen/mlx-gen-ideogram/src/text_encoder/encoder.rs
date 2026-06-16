@@ -52,6 +52,17 @@ impl Ideogram4TextEncoder {
         })
     }
 
+    /// Quantize the token-embedding table + every decoder-layer projection in place (group-wise
+    /// affine Q4/Q8). `cast_to_bf16=true` for the embedding matches the FLUX.2 Qwen3 TE path; the
+    /// per-layer norms stay dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.embed_tokens.quantize(bits, true)?;
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        Ok(())
+    }
+
     /// `input_ids` / `attention_mask`: `[b, s]` int32. Returns the concatenated hidden states
     /// `[b, s, 13·hidden]` (f32) — Ideogram's `llm` features. The final norm is never applied; only
     /// layers up to `max(out_layers)` are run (later layers cannot influence the result).

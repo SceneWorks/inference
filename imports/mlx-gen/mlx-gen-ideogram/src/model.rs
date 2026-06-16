@@ -7,14 +7,14 @@
 //! snapshot directory ([`crate::pipeline::Ideogram4Pipeline`]); [`Ideogram4::generate`] runs the
 //! full prompt→image flow per requested image — tokenize the (JSON-caption) prompt natively,
 //! asymmetric-CFG flow-match denoise, VAE decode → RGB8 — honoring `req.cancel` and streaming
-//! `Progress`. Quantization (Q4/Q8) is a follow-on slice (sc-5989) and is rejected here, not
-//! silently ignored.
+//! `Progress`. `spec.quantize` (Q4/Q8) quantizes the whole model in place after the dense load
+//! (sc-5989); a precision override and LoRA adapters are rejected rather than silently ignored.
 
 use mlx_gen::array::host_i32;
 use mlx_gen::gen_core;
 use mlx_gen::{
     default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
+    LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result,
     WeightsSource,
 };
 use mlx_rs::{Array, Dtype};
@@ -58,9 +58,9 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: RES_MAX,
             max_count: MAX_COUNT,
             mac_only: true,
-            // Q4/Q8 is not yet wired (sc-5989) — advertise none so the worker does not offer a
-            // quant `load` would reject.
-            supported_quants: &[],
+            // Load-time Q4/Q8 over the whole model (both DiTs + TE + VAE), sc-5989. Q8 default is
+            // the worker's call; Q4 roughly halves the ~27 GB Q8 weights for smaller Macs.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -75,17 +75,13 @@ pub struct Ideogram4 {
 
 /// Construct an [`Ideogram4`] from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
 /// pointing at a converted snapshot (`transformer/ unconditional_transformer/ text_encoder/ vae/
-/// tokenizer/`). Dense bf16 only: a precision override, on-the-fly quantization (sc-5989), and
-/// LoRA/LoKr adapters are not wired and are rejected rather than silently ignored.
+/// tokenizer/`). Dense bf16 by default; `spec.quantize` (Q4/Q8) quantizes the whole model in place
+/// after the dense load. A precision override and LoRA/LoKr adapters are not wired and are rejected
+/// rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "ideogram_4: only dense bf16 is wired (drop the precision override)".into(),
-        ));
-    }
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(
-            "ideogram_4: Q4/Q8 quantization is not yet wired (sc-5989)".into(),
         ));
     }
     if !spec.adapters.is_empty() {
@@ -102,9 +98,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
+    // Q4/Q8 quantizes the whole model (both DiTs + TE + VAE) in place after the dense bf16 load.
+    // NOTE: peak footprint is the *dense* bf16 transient (~53 GB) — pre-quantized-on-disk weights
+    // avoid it for smaller Macs (the SCAIL-2 lesson; tracked in this story).
+    let mut pipeline = Ideogram4Pipeline::load(root)?;
+    if let Some(q) = spec.quantize {
+        pipeline.quantize(q.bits())?;
+    }
     Ok(Box::new(Ideogram4 {
         descriptor: descriptor(),
-        pipeline: Ideogram4Pipeline::load(root)?,
+        pipeline,
     }))
 }
 
@@ -247,7 +250,7 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.conditioning.is_empty());
-        assert!(d.capabilities.supported_quants.is_empty()); // sc-5989 not yet wired
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert_eq!(
             (d.capabilities.min_size, d.capabilities.max_size),
             (256, 2048)
@@ -344,11 +347,17 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_quant_until_sc5989() {
-        let spec =
-            LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(mlx_gen::Quant::Q8);
-        let e = load(&spec).err().expect("expected an error").to_string();
-        assert!(e.contains("quantization"), "got: {e}");
+    fn load_accepts_quant_spec() {
+        // Q4/Q8 is wired (whole model) — a quant spec must get past the entry point and fail later
+        // on the missing snapshot, not be rejected as unsupported.
+        for q in [Quant::Q4, Quant::Q8] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(q);
+            let e = load(&spec).err().expect("expected an error").to_string();
+            assert!(
+                !e.contains("not yet wired"),
+                "quant should be accepted: {e}"
+            );
+        }
     }
 
     #[test]

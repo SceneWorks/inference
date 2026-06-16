@@ -78,6 +78,24 @@ impl Ideogram4Transformer {
         })
     }
 
+    /// Quantize every projection in place (group-wise affine Q4/Q8). The norms, the sinusoidal
+    /// `t` table, and the tiny `embed_image_indicator` lookup stay dense (negligible memory,
+    /// quality-sensitive); `AdaptableLinear::quantize`'s shape guard leaves any group-size-indivisible
+    /// weight dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.input_proj.quantize(bits, None)?;
+        self.llm_cond_proj.quantize(bits, None)?;
+        self.t_mlp_in.quantize(bits, None)?;
+        self.t_mlp_out.quantize(bits, None)?;
+        self.adaln_proj.quantize(bits, None)?;
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        self.final_adaln.quantize(bits, None)?;
+        self.final_linear.quantize(bits, None)?;
+        Ok(())
+    }
+
     /// Sinusoidal scalar-`t` embedding → MLP. `t`: `[B]` in `[0,1]` → `[B, emb_dim]`.
     fn t_embedding(&self, t: &Array) -> Result<Array> {
         let scaled = multiply(&t.as_dtype(mlx_rs::Dtype::Float32)?, Array::from_f32(1e4))?;

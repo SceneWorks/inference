@@ -79,6 +79,12 @@ impl Ideogram4Attention {
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;
         self.o.forward(&o)
     }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.qkv.quantize(bits, None)?;
+        self.o.quantize(bits, None)?;
+        Ok(())
+    }
 }
 
 /// HF half-split RoPE in `[B, H, L, hd]` layout: `cos`/`sin` `[B, L, hd]` → broadcast over heads.
@@ -109,6 +115,13 @@ impl Ideogram4Mlp {
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let gated = multiply(&silu(&self.w1.forward(x)?)?, &self.w3.forward(x)?)?;
         self.w2.forward(&gated)
+    }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.w1.quantize(bits, None)?;
+        self.w2.quantize(bits, None)?;
+        self.w3.quantize(bits, None)?;
+        Ok(())
     }
 }
 
@@ -185,5 +198,12 @@ impl Ideogram4Block {
             &multiply(&gate_mlp, &rms_norm(&ff, &self.ffn_norm2, self.eps)?)?,
         )?;
         Ok(x)
+    }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attention.quantize(bits)?;
+        self.feed_forward.quantize(bits)?;
+        self.adaln_modulation.quantize(bits, None)?;
+        Ok(())
     }
 }
