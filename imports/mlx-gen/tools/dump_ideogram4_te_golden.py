@@ -56,20 +56,45 @@ def main() -> None:
         str(te_dir), torch_dtype=torch.bfloat16, config=cfg
     ).eval()
 
-    with torch.no_grad():
-        out = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-    hs = out.hidden_states  # tuple len = num_layers + 1 (embeddings + each layer output)
-    print(f"hidden_states: {len(hs)} entries, each {tuple(hs[0].shape)} {hs[0].dtype}")
-    if max(EXTRACTED_LAYERS) >= len(hs):
-        sys.exit(f"need index {max(EXTRACTED_LAYERS)} but only {len(hs)} hidden states")
+    # Replicate the pipeline's `_get_qwen3_vl_embeddings` exactly: capture the RAW output of each
+    # decoder layer (`captured[layer_idx] = decoder_layer(...)`), NOT `output_hidden_states` (whose
+    # last entry is final-norm'd). Single unpadded prompt → positions 0..s, full attention.
+    from transformers.masking_utils import create_causal_mask
 
-    picked = [hs[i].to(torch.float32) for i in EXTRACTED_LAYERS]
-    golden = torch.cat(picked, dim=-1)  # [1, seq, 13*4096]
+    lm = model.language_model
+    with torch.no_grad():
+        inputs_embeds = lm.embed_tokens(input_ids)
+        pos_2d = torch.arange(input_ids.shape[1])[None, :]  # [1, s]
+        position_ids_4d = pos_2d[None, ...].expand(4, pos_2d.shape[0], -1)  # [4, 1, s]
+        text_position_ids = position_ids_4d[0]
+        mrope_position_ids = position_ids_4d[1:]
+        causal_mask = create_causal_mask(
+            config=lm.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            position_ids=text_position_ids,
+        )
+        position_embeddings = lm.rotary_emb(inputs_embeds, mrope_position_ids)
+        tap = set(EXTRACTED_LAYERS)
+        captured: dict[int, torch.Tensor] = {}
+        hidden = inputs_embeds
+        for li, layer in enumerate(lm.layers):
+            out = layer(
+                hidden,
+                attention_mask=causal_mask,
+                position_ids=text_position_ids,
+                past_key_values=None,
+                position_embeddings=position_embeddings,
+            )
+            hidden = out[0] if isinstance(out, tuple) else out
+            if li in tap:
+                captured[li] = hidden
+    selected = [captured[i].to(torch.float32) for i in EXTRACTED_LAYERS]
+    # Interleave (matches `_encode_text`: stack → permute → reshape, feature = h*n + layer).
+    stacked = torch.stack(selected, dim=0)  # [n, B, L, H]
+    stacked = torch.permute(stacked, (1, 2, 3, 0))  # [B, L, H, n]
+    golden = stacked.reshape(stacked.shape[0], stacked.shape[1], -1)  # [B, L, H*n]
     print(f"golden: {tuple(golden.shape)} (expect [..,..,53248])")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
