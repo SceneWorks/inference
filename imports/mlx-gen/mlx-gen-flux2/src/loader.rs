@@ -15,10 +15,35 @@ use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use crate::config::Flux2Config;
+use crate::config::{Flux2Config, Flux2Quant};
 use crate::text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
 use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
+
+/// Read a component's pre-quantized-snapshot manifest (sc-5917): the `quantization` block
+/// (`{ "bits", "group_size" }`) [`crate::convert`] writes into `{dir}/config.json`. `None` for a
+/// dense snapshot (block absent / no config) ⇒ the dense load path. Defaults mirror the convert's
+/// (`bits 4`, `group_size 64`) if a field is somehow missing from an otherwise-present block.
+fn read_component_quant(dir: &Path) -> Result<Option<Flux2Quant>> {
+    let path = dir.join("config.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)
+        .map_err(|e| mlx_gen::Error::Msg(format!("flux2: parse {}: {e}", path.display())))?;
+    Ok(v.get("quantization")
+        .filter(|q| q.is_object())
+        .map(|q| Flux2Quant {
+            bits: q
+                .get("bits")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(4) as i32,
+            group_size: q
+                .get("group_size")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(64) as i32,
+        }))
+}
 
 /// Qwen2 pad token id (`<|endoftext|>`).
 pub const PAD_TOKEN_ID: i32 = 151643;
@@ -42,10 +67,13 @@ pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
 }
 
 /// Load the Qwen3 text encoder. The on-disk `model.*` keys map directly onto the encoder tree
-/// under the `"model"` prefix — no remap needed.
+/// under the `"model"` prefix — no remap needed. Manifest-aware: a pre-quantized klein snapshot
+/// (sc-5917 convert) loads packed; a stock dense snapshot loads dense (no `quantization` block).
 pub fn load_text_encoder(root: &Path) -> Result<Qwen3TextEncoder> {
-    let w = Weights::from_dir(root.join("text_encoder"))?;
-    Qwen3TextEncoder::from_weights(&w, "model", &Qwen3TextEncoderConfig::klein_9b())
+    let dir = root.join("text_encoder");
+    let quant = read_component_quant(&dir)?;
+    let w = Weights::from_dir(dir)?;
+    Qwen3TextEncoder::from_weights_quant(&w, "model", &Qwen3TextEncoderConfig::klein_9b(), quant)
 }
 
 /// `<pad>` token id for the FLUX.2-dev Mistral tokenizer (vs klein's Qwen2 `<|endoftext|>` 151643).
@@ -74,11 +102,14 @@ pub fn load_tokenizer_dev(root: &Path) -> Result<TextTokenizer> {
 /// live under the `language_model.model.*` prefix (the vision tower + projector are unused here,
 /// sc-5918). Same decoder-LM graph as klein's Qwen3 minus the per-head q/k-norm (`qk_norm: false`).
 pub fn load_text_encoder_dev(root: &Path) -> Result<Qwen3TextEncoder> {
-    let w = Weights::from_dir(root.join("text_encoder"))?;
-    Qwen3TextEncoder::from_weights(
+    let dir = root.join("text_encoder");
+    let quant = read_component_quant(&dir)?;
+    let w = Weights::from_dir(dir)?;
+    Qwen3TextEncoder::from_weights_quant(
         &w,
         "language_model.model",
         &Qwen3TextEncoderConfig::mistral_dev(),
+        quant,
     )
 }
 
@@ -96,20 +127,33 @@ pub fn load_vae(root: &Path) -> Result<Flux2Vae> {
 /// `transformer_blocks.{i}.attn.to_out.0` → `to_out`. Everything else matches 1:1. The renames are
 /// arch-general (klein and dev are the same `Flux2Transformer2DModel`); only `cfg` differs.
 fn load_transformer_with(root: &Path, cfg: &Flux2Config) -> Result<Flux2Transformer> {
-    let mut w = Weights::from_dir(root.join("transformer"))?;
+    let dir = root.join("transformer");
+    let quant = read_component_quant(&dir)?;
+    let mut w = Weights::from_dir(dir)?;
+    // Rename the diffusers→internal keys. For a pre-quantized snapshot (sc-5917) the renamed
+    // Linear's value lives in the packed triple `{weight (u32 codes), scales, biases}`, so alias
+    // all three (each `alias` is a no-op when its source is absent — a dense snapshot just renames
+    // `.weight`).
+    let alias_lin = |w: &mut Weights, from: &str, to: &str| {
+        for suffix in ["weight", "scales", "biases"] {
+            w.alias(&format!("{from}.{suffix}"), &format!("{to}.{suffix}"));
+        }
+    };
     for n in ["linear_1", "linear_2"] {
-        w.alias(
-            &format!("time_guidance_embed.timestep_embedder.{n}.weight"),
-            &format!("time_guidance_embed.{n}.weight"),
+        alias_lin(
+            &mut w,
+            &format!("time_guidance_embed.timestep_embedder.{n}"),
+            &format!("time_guidance_embed.{n}"),
         );
     }
     for i in 0..cfg.num_double_layers {
-        w.alias(
-            &format!("transformer_blocks.{i}.attn.to_out.0.weight"),
-            &format!("transformer_blocks.{i}.attn.to_out.weight"),
+        alias_lin(
+            &mut w,
+            &format!("transformer_blocks.{i}.attn.to_out.0"),
+            &format!("transformer_blocks.{i}.attn.to_out"),
         );
     }
-    Flux2Transformer::from_weights(&w, cfg)
+    Flux2Transformer::from_weights_quant(&w, cfg, quant)
 }
 
 /// Load the FLUX.2-klein MMDiT transformer.

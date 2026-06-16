@@ -9,6 +9,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::{join, Qwen3Attention, Qwen3Mlp};
+use crate::config::Flux2Quant;
 
 pub struct Qwen3DecoderLayer {
     input_ln: Array,
@@ -19,6 +20,7 @@ pub struct Qwen3DecoderLayer {
 }
 
 impl Qwen3DecoderLayer {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
@@ -27,6 +29,7 @@ impl Qwen3DecoderLayer {
         head_dim: i32,
         eps: f32,
         qk_norm: bool,
+        quant: Option<Flux2Quant>,
     ) -> Result<Self> {
         Ok(Self {
             input_ln: w.require(&join(prefix, "input_layernorm.weight"))?.clone(),
@@ -41,8 +44,9 @@ impl Qwen3DecoderLayer {
                 head_dim,
                 eps,
                 qk_norm,
+                quant,
             )?,
-            mlp: Qwen3Mlp::from_weights(w, &join(prefix, "mlp"))?,
+            mlp: Qwen3Mlp::from_weights(w, &join(prefix, "mlp"), quant)?,
             eps,
         })
     }

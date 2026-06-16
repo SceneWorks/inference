@@ -11,6 +11,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use super::{join, Qwen3DecoderLayer, TextRope};
+use crate::config::Flux2Quant;
 
 /// Decoder-LM text-encoder dimensions. Covers both FLUX.2 text encoders: klein's **Qwen3**
 /// (`klein_9b`) and dev's **Mistral** (`mistral_dev`) — they share the GQA + SwiGLU + HF-RoPE
@@ -77,7 +78,22 @@ impl Qwen3TextEncoder {
     /// `{prefix}.embed_tokens.weight`, `{prefix}.layers.{i}.…`. The final `{prefix}.norm.weight`
     /// is intentionally **not** loaded — the fork computes the final norm but `get_prompt_embeds`
     /// discards it, using only the raw (pre-final-norm) intermediate layer outputs.
+    /// Load from a **dense** weight map (the parity-test + dense-snapshot path).
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &Qwen3TextEncoderConfig) -> Result<Self> {
+        Self::from_weights_quant(w, prefix, cfg, None)
+    }
+
+    /// Load the encoder, building each Linear and the token embedding from packed Q4/Q8 parts when
+    /// `quant` is `Some` AND the on-disk weights carry the packed `.scales`/`.biases` (a
+    /// pre-quantized snapshot, sc-5917). `quant == None` ⇒ the dense path. The packed path never
+    /// materializes a dense bf16 weight, so the dev Mistral TE loads at its Q4 footprint (~13 GB)
+    /// rather than the ~45 GB bf16 load transient.
+    pub fn from_weights_quant(
+        w: &Weights,
+        prefix: &str,
+        cfg: &Qwen3TextEncoderConfig,
+        quant: Option<Flux2Quant>,
+    ) -> Result<Self> {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             layers.push(Qwen3DecoderLayer::from_weights(
@@ -88,12 +104,11 @@ impl Qwen3TextEncoder {
                 cfg.head_dim,
                 cfg.rms_norm_eps,
                 cfg.qk_norm,
+                quant,
             )?);
         }
         Ok(Self {
-            embed_tokens: TokenEmbedding::Dense(
-                w.require(&join(prefix, "embed_tokens.weight"))?.clone(),
-            ),
+            embed_tokens: load_embed(w, &join(prefix, "embed_tokens"), quant)?,
             layers,
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             out_layers: cfg.out_layers,
@@ -175,6 +190,27 @@ impl Qwen3TextEncoder {
         };
         Ok(concatenate_axis(&[pick(a)?, pick(b_)?, pick(c)?], 2)?)
     }
+}
+
+/// Load the `embed_tokens` table dense, or — with `quant == Some` and packed `.scales` on disk
+/// (pre-quantized snapshot, sc-5917) — directly from the packed `{base}.weight` (u32 codes) /
+/// `.scales` / `.biases`, mirroring [`lin`](super::lin) for the embedding case. `base` is the
+/// embedding's prefix (`….embed_tokens`).
+fn load_embed(w: &Weights, base: &str, quant: Option<Flux2Quant>) -> Result<TokenEmbedding> {
+    if let Some(q) = quant {
+        if let Some(scales) = w.get(&format!("{base}.scales")) {
+            return Ok(TokenEmbedding::from_quantized_parts(
+                w.require(&format!("{base}.weight"))?.clone(),
+                scales.clone(),
+                w.require(&format!("{base}.biases"))?.clone(),
+                q.group_size,
+                q.bits,
+            ));
+        }
+    }
+    Ok(TokenEmbedding::Dense(
+        w.require(&format!("{base}.weight"))?.clone(),
+    ))
 }
 
 /// Additive attention mask `[b, 1, s, s]`: `0` where a query may attend (key is causal **and**
