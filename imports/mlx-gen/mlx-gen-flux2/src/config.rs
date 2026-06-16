@@ -22,6 +22,10 @@ pub const FLUX2_DEV_ID: &str = "flux2_dev";
 /// per the diffusers `Flux2Pipeline`), NOT the Pixtral vision tower (that feeds caption upsampling,
 /// a separate feature).
 pub const FLUX2_DEV_EDIT_ID: &str = "flux2_dev_edit";
+/// FLUX.2-dev strict-pose ControlNet (sc-2292): the `alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union`
+/// VACE-style control branch overlaid on the dev base. Loads the dev snapshot (`weights`) + the
+/// control checkpoint (`control`); a required `Control` conditioning (pose/union skeleton) drives it.
+pub const FLUX2_DEV_CONTROL_ID: &str = "flux2_dev_control";
 
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
