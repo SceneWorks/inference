@@ -23,6 +23,7 @@
 
 pub mod config;
 pub mod loader;
+pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer;
 
@@ -31,5 +32,6 @@ pub use config::{
     DEFAULT_STEPS, DEFAULT_WIDTH, EXTRACTED_LAYERS, IDEOGRAM_4_FP8_REPO, IDEOGRAM_4_ID,
 };
 pub use loader::{load_text_encoder, load_transformer, load_unconditional_transformer, load_vae};
+pub use scheduler::{make_step_intervals, LogitNormalSchedule};
 pub use text_encoder::Ideogram4TextEncoder;
 pub use transformer::Ideogram4Transformer;
