@@ -58,6 +58,28 @@ impl TokenEmbedding {
         Ok(out.as_dtype(Dtype::Float32)?)
     }
 
+    /// Build a quantized table directly from **already-packed** parts read off disk — the
+    /// consume-side counterpart to [`quantize`](Self::quantize), for a *pre-quantized* checkpoint
+    /// (the FLUX.2-dev path, sc-5917). No re-quantization happens; the on-disk `scales`/`biases`
+    /// are used as-is. Mirrors [`AdaptableLinear::from_quantized_parts`] for the embedding case.
+    ///
+    /// [`AdaptableLinear::from_quantized_parts`]: crate::adapters::AdaptableLinear::from_quantized_parts
+    pub fn from_quantized_parts(
+        wq: Array,
+        scales: Array,
+        biases: Array,
+        group_size: i32,
+        bits: i32,
+    ) -> Self {
+        Self::Quantized {
+            wq,
+            scales,
+            biases,
+            group_size,
+            bits,
+        }
+    }
+
     /// Quantize a dense table in place (group_size 64), the mlx-rs equivalent of
     /// `nn.Embedding.to_quantized`. No-op if already quantized. `cast_to_bf16` packs the **bf16**
     /// weight (FLUX.2's path, to byte-match the fork's bf16 `nn.quantize`); when false the weight is

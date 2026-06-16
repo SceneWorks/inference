@@ -9,6 +9,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::{join, lin};
+use crate::config::Flux2Quant;
 
 pub struct Qwen3Mlp {
     gate: AdaptableLinear,
@@ -17,11 +18,11 @@ pub struct Qwen3Mlp {
 }
 
 impl Qwen3Mlp {
-    pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    pub fn from_weights(w: &Weights, prefix: &str, quant: Option<Flux2Quant>) -> Result<Self> {
         Ok(Self {
-            gate: lin(w, &join(prefix, "gate_proj.weight"))?,
-            up: lin(w, &join(prefix, "up_proj.weight"))?,
-            down: lin(w, &join(prefix, "down_proj.weight"))?,
+            gate: lin(w, &join(prefix, "gate_proj.weight"), quant)?,
+            up: lin(w, &join(prefix, "up_proj.weight"), quant)?,
+            down: lin(w, &join(prefix, "down_proj.weight"), quant)?,
         })
     }
 

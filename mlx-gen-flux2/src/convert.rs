@@ -30,9 +30,9 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
-use mlx_rs::ops::{concatenate_axis, split};
+use mlx_rs::ops::{concatenate_axis, quantize, split};
 use mlx_rs::transforms::eval;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 /// Borrowed-from-base subdirs: a transformer-only fine-tune does not touch these, so taking them
 /// from the installed base klein-9B is correct. Symlinked (absolute) to avoid duplicating the
@@ -418,6 +418,202 @@ pub fn convert_and_assemble(
     Ok(out.to_path_buf())
 }
 
+// ============================================================================================
+// FLUX.2-dev pre-quantization (sc-5917)
+// ============================================================================================
+//
+// Offline one-shot: pack the dense bf16 dev DiT (~60 GB) and Mistral text encoder (~45 GB) into
+// group-wise-affine Q4/Q8 weights *on disk*, plus a `quantization` manifest per component, so the
+// published snapshot loads straight into packed quantized Linears.
+//
+// This is the low-memory-floor path. The dev `load_variant` loads all three components dense
+// THEN quantizes in place, so an *in-app* quantize peaks at ~105 GB resident (DiT + TE bf16)
+// before any packing — over the 128 GB ceiling and impossible on smaller Macs. Quantizing on disk
+// here moves that bf16 transient to a one-off offline convert; the shipped snapshot is already
+// packed, so the consume side ([`crate::loader`] → `from_weights_quant`) never builds a dense
+// weight — the resident set is the Q4 packs (~17 GB DiT + ~13 GB TE).
+//
+// Mirrors `mlx_gen_scail2::convert::quantize_scail2_dit` (same `mlx_rs::ops::quantize`, byte-equal
+// to the load-time `AdaptableLinear::quantize` / `nn.quantize(bf16)`), differing only in the
+// FLUX.2 key layout and the two predicates below. Run it on a 128 GB Mac against the real dense
+// snapshot — see `tests/quant_prequantize_real_weights.rs` (`#[ignore]`).
+
+/// The four DiT tensor suffixes that are **not** Linears and so stay dense — every block's
+/// self/cross qk-RMSNorm. Everything else `…​.weight` in the transformer is a bias-less Linear the
+/// fork's `nn.quantize` packs (matching [`crate::transformer::Flux2Transformer::quantize`]): the
+/// q/k/v/o + add_{q,k,v}_proj + to_add_out + to_out(.0) + to_qkv_mlp_proj projections, the
+/// ff/ff_context linears, x/context embedders, the modulations, time + guidance embedders,
+/// `norm_out.linear`, and `proj_out`. The shape guard in [`quantize_map`] is the backstop (a 1-D
+/// norm is never group-quantizable), so this list is faithfulness, not safety.
+const DIT_DENSE_NORM_SUFFIXES: &[&str] = &[".norm_q", ".norm_k", ".norm_added_q", ".norm_added_k"];
+
+/// `true` iff the DiT base key (an `…​.weight` name minus `.weight`) names a quantizable Linear —
+/// i.e. it is **not** one of the [`DIT_DENSE_NORM_SUFFIXES`] qk-RMSNorms.
+fn is_dit_quant_target(base: &str) -> bool {
+    !DIT_DENSE_NORM_SUFFIXES.iter().any(|s| base.ends_with(s))
+}
+
+/// The Mistral language-tower Linear suffixes the TE consumer
+/// ([`crate::text_encoder::Qwen3TextEncoder::quantize`]) packs: the GQA q/k/v/o projections and the
+/// SwiGLU gate/up/down. The token `embed_tokens` table is handled separately (it is an Embedding,
+/// not suffix-matched). RMSNorms (`input_layernorm`, `post_attention_layernorm`, `model.norm`) and
+/// the unused Pixtral vision tower / multimodal projector pass through dense.
+const TE_LINEAR_SUFFIXES: &[&str] = &[
+    ".q_proj",
+    ".k_proj",
+    ".v_proj",
+    ".o_proj",
+    ".gate_proj",
+    ".up_proj",
+    ".down_proj",
+];
+
+/// `true` iff the TE base key names a quantizable language-tower tensor: a [`TE_LINEAR_SUFFIXES`]
+/// projection **or** the `…​.embed_tokens` table, under the `language_model.model.` prefix only.
+/// A *positive* predicate (unlike the DiT's negative one) so the vision tower is left untouched.
+fn is_te_quant_target(base: &str) -> bool {
+    if !base.contains("language_model.model.") {
+        return false;
+    }
+    base.ends_with(".embed_tokens") || TE_LINEAR_SUFFIXES.iter().any(|s| base.ends_with(s))
+}
+
+/// Selectively Q4/Q8-quantize a weight map in place per `is_target`: each matched, group-quantizable
+/// `{base}.weight` (cast to bf16 for fork parity, matching [`AdaptableLinear::quantize`]) becomes the
+/// packed triple `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases` via MLX `quantize`;
+/// every other tensor (norms, non-2-D, non-divisible, or non-target) passes through unchanged. The
+/// result is the exact packed layout the [`crate::loader`] reads back. `group_size` is the
+/// mflux/reference default of 64.
+///
+/// [`AdaptableLinear::quantize`]: mlx_gen::adapters::AdaptableLinear::quantize
+fn quantize_map(
+    map: HashMap<String, Array>,
+    bits: i32,
+    group_size: i32,
+    is_target: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, Array>> {
+    let mut out = HashMap::with_capacity(map.len());
+    for (k, v) in map {
+        let base = k.strip_suffix(".weight").filter(|b| is_target(b));
+        // Only group-quantizable 2-D weights whose `in` divides the group size are packable; a 1-D
+        // norm or an odd shape that slips the predicate stays dense rather than crashing `quantize`.
+        let packable = base.is_some()
+            && v.shape().len() == 2
+            && v.shape()[1] % group_size == 0
+            && v.shape()[1] >= group_size;
+        if let (Some(base), true) = (base, packable) {
+            // PARITY-BF16 (sc-2604/2609): quantize the bf16 weight so the packing is byte-identical
+            // to the load-time `AdaptableLinear::quantize` (and to the fork's `nn.quantize(bf16)`).
+            // No-op when already bf16 (the dev checkpoint is bf16-native).
+            let wbf16 = v.as_dtype(Dtype::Bfloat16)?;
+            let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
+            out.insert(format!("{base}.weight"), wq);
+            out.insert(format!("{base}.scales"), scales);
+            out.insert(format!("{base}.biases"), biases);
+        } else {
+            out.insert(k, v);
+        }
+    }
+    Ok(out)
+}
+
+/// Pre-quantize a FLUX.2-dev **transformer** weight map (the on-disk diffusers key layout, before
+/// the loader's `to_out.0`/`timestep_embedder` renames). Packs every Linear, leaves the qk-RMSNorms
+/// dense. See [`quantize_map`].
+pub fn quantize_flux2_transformer(
+    map: HashMap<String, Array>,
+    bits: i32,
+    group_size: i32,
+) -> Result<HashMap<String, Array>> {
+    quantize_map(map, bits, group_size, is_dit_quant_target)
+}
+
+/// Pre-quantize a FLUX.2-dev **text-encoder** weight map (a `Mistral3ForConditionalGeneration`
+/// tree). Packs the language tower's q/k/v/o + gate/up/down Linears and the token embedding; the
+/// vision tower / projector / norms pass through dense. See [`quantize_map`].
+pub fn quantize_flux2_text_encoder(
+    map: HashMap<String, Array>,
+    bits: i32,
+    group_size: i32,
+) -> Result<HashMap<String, Array>> {
+    quantize_map(map, bits, group_size, is_te_quant_target)
+}
+
+/// Read every tensor of `dir` (sharded safetensors) into an owned key→`Array` map (MLX arrays are
+/// ref-counted, so the clone is a handle copy, not a buffer copy).
+fn load_dir_map(dir: &Path) -> Result<HashMap<String, Array>> {
+    let w = Weights::from_dir(dir)?;
+    Ok(w.keys()
+        .map(|k| (k.to_string(), w.get(k).expect("listed key").clone()))
+        .collect())
+}
+
+/// Materialize + write a key→`Array` map to a single `path.safetensors` (mirrors scail2's
+/// `save_map`). One file, not sharded — the packed component is small enough (Q4 DiT ~17 GB).
+fn save_map(path: &Path, map: &HashMap<String, Array>) -> Result<()> {
+    eval(map.values().collect::<Vec<_>>())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Array::save_safetensors(
+        map.iter().map(|(k, v)| (k.as_str(), v)),
+        None::<&HashMap<String, String>>,
+        path,
+    )?;
+    Ok(())
+}
+
+/// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}`
+/// block added (the manifest [`crate::loader`] reads to enable the packed loader). A missing source
+/// config starts from an empty object.
+fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
+    let src_cfg = src.join("config.json");
+    let mut v: serde_json::Value = if src_cfg.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&src_cfg)?)
+            .map_err(|e| Error::Msg(format!("flux2: parse {}: {e}", src_cfg.display())))?
+    } else {
+        serde_json::json!({})
+    };
+    v["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
+    let text = serde_json::to_string_pretty(&v)
+        .map_err(|e| Error::Msg(format!("flux2: serialize config.json: {e}")))?;
+    std::fs::create_dir_all(dst)?;
+    std::fs::write(dst.join("config.json"), text)?;
+    Ok(())
+}
+
+/// Offline one-shot: read the dense bf16 `src` **transformer** dir (sharded `*.safetensors` +
+/// `config.json`) and write a pre-quantized `dst` transformer dir — a single packed Q4/Q8
+/// `diffusion_pytorch_model.safetensors` + `config.json` (with the `quantization` manifest). The
+/// VAE / tokenizer / scheduler are unchanged; the caller copies or symlinks them alongside to
+/// complete the turnkey snapshot. `group_size` is the mflux/reference default of 64.
+pub fn quantize_flux2_dit(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    let map = load_dir_map(src)?;
+    let quantized = quantize_flux2_transformer(map, bits, group_size)?;
+    save_map(&dst.join("diffusion_pytorch_model.safetensors"), &quantized)?;
+    write_quantized_config(src, dst, bits, group_size)?;
+    Ok(())
+}
+
+/// Offline one-shot: read the dense bf16 `src` **text_encoder** dir and write a pre-quantized `dst`
+/// text_encoder dir — a single packed `model.safetensors` + `config.json` (with the `quantization`
+/// manifest). The unused Pixtral vision tower / projector tensors pass through dense (they are
+/// small relative to the language tower and reserved for the edit path, sc-5919).
+pub fn quantize_flux2_text_encoder_dir(
+    src: &Path,
+    dst: &Path,
+    bits: i32,
+    group_size: i32,
+) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    let map = load_dir_map(src)?;
+    let quantized = quantize_flux2_text_encoder(map, bits, group_size)?;
+    save_map(&dst.join("model.safetensors"), &quantized)?;
+    write_quantized_config(src, dst, bits, group_size)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +803,132 @@ mod tests {
             out["transformer_blocks.0.attn.to_q.weight"].shape(),
             &[d, d]
         );
+    }
+
+    // ---- sc-5917 pre-quantization: predicates + packing byte-parity --------------------------
+
+    #[test]
+    fn dit_predicate_packs_every_linear_not_the_qk_norms() {
+        for base in [
+            "transformer_blocks.0.attn.to_q",
+            "transformer_blocks.7.attn.add_k_proj",
+            "transformer_blocks.7.attn.to_add_out",
+            "transformer_blocks.3.attn.to_out.0", // the diffusers Sequential output proj
+            "single_transformer_blocks.0.attn.to_qkv_mlp_proj",
+            "single_transformer_blocks.47.attn.to_out",
+            "transformer_blocks.0.ff.linear_in",
+            "transformer_blocks.0.ff_context.linear_out",
+            "x_embedder",
+            "context_embedder",
+            "proj_out",
+            "norm_out.linear",
+            "double_stream_modulation_img.linear",
+            "single_stream_modulation.linear",
+            "time_guidance_embed.timestep_embedder.linear_1",
+            "time_guidance_embed.guidance_embedder.linear_2", // dev-only, packed for sc-2365
+        ] {
+            assert!(is_dit_quant_target(base), "{base} should be packed");
+        }
+        for base in [
+            "transformer_blocks.0.attn.norm_q",
+            "transformer_blocks.0.attn.norm_k",
+            "transformer_blocks.0.attn.norm_added_q",
+            "transformer_blocks.0.attn.norm_added_k",
+            "single_transformer_blocks.0.attn.norm_q",
+        ] {
+            assert!(!is_dit_quant_target(base), "{base} should stay dense");
+        }
+    }
+
+    #[test]
+    fn te_predicate_packs_language_tower_only() {
+        for base in [
+            "language_model.model.layers.0.self_attn.q_proj",
+            "language_model.model.layers.39.self_attn.o_proj",
+            "language_model.model.layers.7.mlp.gate_proj",
+            "language_model.model.layers.7.mlp.down_proj",
+            "language_model.model.embed_tokens",
+        ] {
+            assert!(is_te_quant_target(base), "{base} should be packed");
+        }
+        for base in [
+            "language_model.model.layers.0.input_layernorm",
+            "language_model.model.layers.0.post_attention_layernorm",
+            "language_model.model.norm",
+            // The unused Pixtral vision tower / projector pass through dense (not language_model.model).
+            "vision_tower.transformer.layers.0.attention.q_proj",
+            "multi_modal_projector.linear_1",
+        ] {
+            assert!(!is_te_quant_target(base), "{base} should stay dense");
+        }
+    }
+
+    fn byte_equal(a: &Array, b: &Array) -> bool {
+        a.shape() == b.shape()
+            && a.dtype() == b.dtype()
+            && mlx_rs::ops::eq(a, b)
+                .unwrap()
+                .all(None)
+                .unwrap()
+                .item::<bool>()
+    }
+
+    #[test]
+    fn quantize_map_packs_targets_byte_identical_to_load_time_quantize() {
+        // A predicate Linear (`in` divisible by the group size) + its 1-D qk-norm + an off-target
+        // 2-D weight that fails the predicate.
+        let w = Array::from_slice(
+            &(0..64 * 128).map(|i| (i as f32).sin()).collect::<Vec<_>>(),
+            &[64, 128],
+        );
+        let mut map: HashMap<String, Array> = HashMap::new();
+        map.insert("transformer_blocks.0.attn.to_q.weight".into(), w.clone());
+        map.insert(
+            "transformer_blocks.0.attn.norm_q.weight".into(),
+            Array::ones::<f32>(&[128]).unwrap(),
+        );
+
+        let out = quantize_flux2_transformer(map, 4, 64).unwrap();
+
+        // The predicate weight became the packed triple…
+        let wq = out
+            .get("transformer_blocks.0.attn.to_q.weight")
+            .expect("packed weight");
+        assert_eq!(wq.dtype(), Dtype::Uint32, "Q4 codes are u32-packed");
+        let scales = out.get("transformer_blocks.0.attn.to_q.scales").unwrap();
+        let biases = out.get("transformer_blocks.0.attn.to_q.biases").unwrap();
+        // …byte-identical to the op the load-time `AdaptableLinear::quantize` runs (bf16, group 64)
+        // — this is the sc-5917 round-trip guarantee: pre-quantize-on-disk == quantize-at-load.
+        let (ewq, esc, ebi) = quantize(w.as_dtype(Dtype::Bfloat16).unwrap(), 64, 4).unwrap();
+        assert!(byte_equal(wq, &ewq), "packed wq != load-time quantize");
+        assert!(byte_equal(scales, &esc), "scales != load-time quantize");
+        assert!(byte_equal(biases, &ebi), "biases != load-time quantize");
+
+        // The 1-D norm stayed dense (predicate-excluded *and* shape-guarded).
+        let n = out
+            .get("transformer_blocks.0.attn.norm_q.weight")
+            .expect("dense norm");
+        assert_eq!(n.dtype(), Dtype::Float32, "norm unchanged");
+        assert!(!out.contains_key("transformer_blocks.0.attn.norm_q.scales"));
+    }
+
+    #[test]
+    fn quantize_map_shape_guard_leaves_indivisible_weights_dense() {
+        // A predicate-matching weight whose `in` (100) is not a multiple of the group size (64):
+        // not group-quantizable, so it must pass through dense rather than crash `quantize`.
+        let mut map: HashMap<String, Array> = HashMap::new();
+        map.insert(
+            "transformer_blocks.0.attn.to_q.weight".into(),
+            Array::ones::<f32>(&[64, 100]).unwrap(),
+        );
+        let out = quantize_flux2_transformer(map, 4, 64).unwrap();
+        assert_eq!(
+            out.get("transformer_blocks.0.attn.to_q.weight")
+                .unwrap()
+                .dtype(),
+            Dtype::Float32
+        );
+        assert!(!out.contains_key("transformer_blocks.0.attn.to_q.scales"));
     }
 
     /// Write tensors to a unique temp safetensors file and return its path (the test loads it back
