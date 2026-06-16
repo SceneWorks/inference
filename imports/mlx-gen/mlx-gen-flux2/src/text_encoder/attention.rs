@@ -15,6 +15,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::{join, lin};
+use crate::config::Flux2Quant;
 
 pub struct Qwen3Attention {
     q_w: AdaptableLinear,
@@ -32,6 +33,7 @@ pub struct Qwen3Attention {
 }
 
 impl Qwen3Attention {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
@@ -40,6 +42,7 @@ impl Qwen3Attention {
         head_dim: i32,
         eps: f32,
         qk_norm: bool,
+        quant: Option<Flux2Quant>,
     ) -> Result<Self> {
         let (q_norm, k_norm) = if qk_norm {
             (
@@ -50,10 +53,10 @@ impl Qwen3Attention {
             (None, None)
         };
         Ok(Self {
-            q_w: lin(w, &join(prefix, "q_proj.weight"))?,
-            k_w: lin(w, &join(prefix, "k_proj.weight"))?,
-            v_w: lin(w, &join(prefix, "v_proj.weight"))?,
-            o_w: lin(w, &join(prefix, "o_proj.weight"))?,
+            q_w: lin(w, &join(prefix, "q_proj.weight"), quant)?,
+            k_w: lin(w, &join(prefix, "k_proj.weight"), quant)?,
+            v_w: lin(w, &join(prefix, "v_proj.weight"), quant)?,
+            o_w: lin(w, &join(prefix, "o_proj.weight"), quant)?,
             q_norm,
             k_norm,
             num_heads,

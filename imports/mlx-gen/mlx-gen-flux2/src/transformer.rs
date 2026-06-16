@@ -23,7 +23,7 @@ use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
-use crate::config::Flux2Config;
+use crate::config::{Flux2Config, Flux2Quant};
 use crate::kv_cache::{Flux2KvCache, Stream};
 use crate::pos_embed::Flux2PosEmbed;
 
@@ -40,10 +40,30 @@ const RMS_EPS: f32 = 1e-5;
 use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::set_compile_glue;
 
-/// Wrap a stored `[out, in]` weight as a bias-less dense [`AdaptableLinear`] (every FLUX.2
-/// transformer projection). Dense forward = `matmul(x, wᵀ)`, bit-identical to the prior raw
-/// `matmul_t`; `quantize` swaps the base to a Q4/Q8 `quantized_matmul`.
-fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
+/// Wrap a stored `[out, in]` weight as a bias-less [`AdaptableLinear`] (every FLUX.2 transformer
+/// projection is bias-less). With `quant == None` this is the dense path (`matmul(x, wᵀ)`,
+/// bit-identical to the prior raw `matmul_t`); `quantize` later swaps the base to a Q4/Q8
+/// `quantized_matmul`.
+///
+/// With `quant == Some` AND this Linear's packed `{base}.scales` present on disk — a
+/// **pre-quantized snapshot** (sc-5917) — build the quantized base directly from the packed
+/// `{base}.weight` (u32 codes) / `.scales` / `.biases`, with no dense bf16 weight ever
+/// materialized. A `Some(quant)` where `.scales` is absent (a dense snapshot, or a Linear the
+/// convert predicate left dense) falls back to the dense path. `key` is the `….weight` tensor name.
+fn lin(w: &Weights, key: &str, quant: Option<Flux2Quant>) -> Result<AdaptableLinear> {
+    if let Some(q) = quant {
+        let base = key.strip_suffix(".weight").unwrap_or(key);
+        if let Some(scales) = w.get(&format!("{base}.scales")) {
+            return Ok(AdaptableLinear::from_quantized_parts(
+                w.require(key)?.clone(),
+                scales.clone(),
+                w.require(&format!("{base}.biases"))?.clone(),
+                None,
+                q.group_size,
+                q.bits,
+            ));
+        }
+    }
     Ok(AdaptableLinear::dense(w.require(key)?.clone(), None))
 }
 
@@ -162,10 +182,10 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, quant: Option<Flux2Quant>) -> Result<Self> {
         Ok(Self {
-            linear_in: lin(w, &format!("{prefix}.linear_in.weight"))?,
-            linear_out: lin(w, &format!("{prefix}.linear_out.weight"))?,
+            linear_in: lin(w, &format!("{prefix}.linear_in.weight"), quant)?,
+            linear_out: lin(w, &format!("{prefix}.linear_out.weight"), quant)?,
         })
     }
 
@@ -206,9 +226,15 @@ struct DoubleAttention {
 }
 
 impl DoubleAttention {
-    fn from_weights(w: &Weights, prefix: &str, heads: i32, head_dim: i32) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        heads: i32,
+        head_dim: i32,
+        quant: Option<Flux2Quant>,
+    ) -> Result<Self> {
         let g = |n: &str| w.require(&format!("{prefix}.{n}.weight")).cloned();
-        let l = |n: &str| lin(w, &format!("{prefix}.{n}.weight"));
+        let l = |n: &str| lin(w, &format!("{prefix}.{n}.weight"), quant);
         Ok(Self {
             to_q: l("to_q")?,
             to_k: l("to_k")?,
@@ -298,11 +324,23 @@ impl DoubleAttention {
 }
 
 impl DoubleBlock {
-    fn from_weights(w: &Weights, prefix: &str, heads: i32, head_dim: i32) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        heads: i32,
+        head_dim: i32,
+        quant: Option<Flux2Quant>,
+    ) -> Result<Self> {
         Ok(Self {
-            attn: DoubleAttention::from_weights(w, &format!("{prefix}.attn"), heads, head_dim)?,
-            ff: FeedForward::from_weights(w, &format!("{prefix}.ff"))?,
-            ff_context: FeedForward::from_weights(w, &format!("{prefix}.ff_context"))?,
+            attn: DoubleAttention::from_weights(
+                w,
+                &format!("{prefix}.attn"),
+                heads,
+                head_dim,
+                quant,
+            )?,
+            ff: FeedForward::from_weights(w, &format!("{prefix}.ff"), quant)?,
+            ff_context: FeedForward::from_weights(w, &format!("{prefix}.ff_context"), quant)?,
         })
     }
 
@@ -368,10 +406,16 @@ struct SingleBlock {
 }
 
 impl SingleBlock {
-    fn from_weights(w: &Weights, prefix: &str, heads: i32, head_dim: i32) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        heads: i32,
+        head_dim: i32,
+        quant: Option<Flux2Quant>,
+    ) -> Result<Self> {
         Ok(Self {
-            to_qkv_mlp: lin(w, &format!("{prefix}.attn.to_qkv_mlp_proj.weight"))?,
-            to_out: lin(w, &format!("{prefix}.attn.to_out.weight"))?,
+            to_qkv_mlp: lin(w, &format!("{prefix}.attn.to_qkv_mlp_proj.weight"), quant)?,
+            to_out: lin(w, &format!("{prefix}.attn.to_out.weight"), quant)?,
             norm_q: w.require(&format!("{prefix}.attn.norm_q.weight"))?.clone(),
             norm_k: w.require(&format!("{prefix}.attn.norm_k.weight"))?.clone(),
             heads,
@@ -439,9 +483,14 @@ struct Modulation {
 }
 
 impl Modulation {
-    fn from_weights(w: &Weights, prefix: &str, sets: usize) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        sets: usize,
+        quant: Option<Flux2Quant>,
+    ) -> Result<Self> {
         Ok(Self {
-            linear: lin(w, &format!("{prefix}.linear.weight"))?,
+            linear: lin(w, &format!("{prefix}.linear.weight"), quant)?,
             sets,
         })
     }
@@ -492,12 +541,32 @@ pub struct Flux2Transformer {
 }
 
 impl Flux2Transformer {
+    /// Load the transformer from a **dense** weight map (the parity-test + dense-snapshot path).
     pub fn from_weights(w: &Weights, cfg: &Flux2Config) -> Result<Self> {
+        Self::from_weights_quant(w, cfg, None)
+    }
+
+    /// Load the transformer, building each Linear from packed Q4/Q8 parts when `quant` is `Some`
+    /// AND the on-disk weights carry the packed `.scales`/`.biases` (a pre-quantized snapshot,
+    /// sc-5917). `quant == None` ⇒ the dense path, identical to [`from_weights`](Self::from_weights).
+    /// The packed path never materializes a dense bf16 weight, so the dev 32B DiT loads at its Q4
+    /// resident footprint (~17 GB) rather than the 60 GB bf16 load transient.
+    pub fn from_weights_quant(
+        w: &Weights,
+        cfg: &Flux2Config,
+        quant: Option<Flux2Quant>,
+    ) -> Result<Self> {
         let heads = cfg.num_heads as i32;
         let head_dim = cfg.head_dim as i32;
         let double_blocks = (0..cfg.num_double_layers)
             .map(|i| {
-                DoubleBlock::from_weights(w, &format!("transformer_blocks.{i}"), heads, head_dim)
+                DoubleBlock::from_weights(
+                    w,
+                    &format!("transformer_blocks.{i}"),
+                    heads,
+                    head_dim,
+                    quant,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let single_blocks = (0..cfg.num_single_layers)
@@ -507,22 +576,23 @@ impl Flux2Transformer {
                     &format!("single_transformer_blocks.{i}"),
                     heads,
                     head_dim,
+                    quant,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             pos_embed: Flux2PosEmbed::new(cfg.rope_theta, cfg.axes_dim),
-            time_linear1: lin(w, "time_guidance_embed.linear_1.weight")?,
-            time_linear2: lin(w, "time_guidance_embed.linear_2.weight")?,
-            mod_img: Modulation::from_weights(w, "double_stream_modulation_img", 2)?,
-            mod_txt: Modulation::from_weights(w, "double_stream_modulation_txt", 2)?,
-            mod_single: Modulation::from_weights(w, "single_stream_modulation", 1)?,
-            x_embedder: lin(w, "x_embedder.weight")?,
-            context_embedder: lin(w, "context_embedder.weight")?,
+            time_linear1: lin(w, "time_guidance_embed.linear_1.weight", quant)?,
+            time_linear2: lin(w, "time_guidance_embed.linear_2.weight", quant)?,
+            mod_img: Modulation::from_weights(w, "double_stream_modulation_img", 2, quant)?,
+            mod_txt: Modulation::from_weights(w, "double_stream_modulation_txt", 2, quant)?,
+            mod_single: Modulation::from_weights(w, "single_stream_modulation", 1, quant)?,
+            x_embedder: lin(w, "x_embedder.weight", quant)?,
+            context_embedder: lin(w, "context_embedder.weight", quant)?,
             double_blocks,
             single_blocks,
-            norm_out_linear: lin(w, "norm_out.linear.weight")?,
-            proj_out: lin(w, "proj_out.weight")?,
+            norm_out_linear: lin(w, "norm_out.linear.weight", quant)?,
+            proj_out: lin(w, "proj_out.weight", quant)?,
             time_channels: cfg.timestep_channels,
         })
     }

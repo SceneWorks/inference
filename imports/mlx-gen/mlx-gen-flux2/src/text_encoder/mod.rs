@@ -26,10 +26,32 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-/// Wrap a stored `[out, in]` weight as a bias-less dense [`AdaptableLinear`] — every Qwen3
-/// projection is a bias-less Linear. Dense forward = `matmul(x, wᵀ)`; `quantize` swaps the base to
-/// a Q4/Q8 `quantized_matmul`, the mlx-rs equivalent of the fork's `nn.quantize` over the TE.
-pub(crate) fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
+use crate::config::Flux2Quant;
+
+/// Wrap a stored `[out, in]` weight as a bias-less [`AdaptableLinear`] — every Qwen3/Mistral
+/// projection is a bias-less Linear. With `quant == None` this is the dense path (`matmul(x, wᵀ)`);
+/// `quantize` later swaps the base to a Q4/Q8 `quantized_matmul`, the mlx-rs equivalent of the
+/// fork's `nn.quantize` over the TE.
+///
+/// With `quant == Some` AND this Linear's packed `{base}.scales` present on disk — a
+/// **pre-quantized snapshot** (sc-5917) — build the quantized base directly from the packed
+/// `{base}.weight` (u32 codes) / `.scales` / `.biases`, materializing no dense bf16 weight (the
+/// dev Mistral TE is ~45 GB bf16; this is what keeps it off the load-time memory floor). `key` is
+/// the `….weight` tensor name.
+pub(crate) fn lin(w: &Weights, key: &str, quant: Option<Flux2Quant>) -> Result<AdaptableLinear> {
+    if let Some(q) = quant {
+        let base = key.strip_suffix(".weight").unwrap_or(key);
+        if let Some(scales) = w.get(&format!("{base}.scales")) {
+            return Ok(AdaptableLinear::from_quantized_parts(
+                w.require(key)?.clone(),
+                scales.clone(),
+                w.require(&format!("{base}.biases"))?.clone(),
+                None,
+                q.group_size,
+                q.bits,
+            ));
+        }
+    }
     Ok(AdaptableLinear::dense(w.require(key)?.clone(), None))
 }
 

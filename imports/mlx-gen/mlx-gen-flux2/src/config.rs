@@ -31,6 +31,19 @@ pub const DEFAULT_GUIDANCE: f32 = 1.0;
 pub const DEFAULT_STEPS_DEV: u32 = 28;
 pub const DEFAULT_GUIDANCE_DEV: f32 = 4.0;
 
+/// A pre-quantized-snapshot manifest (sc-5917): the `quantization` block written into a
+/// component's `config.json` by [`crate::convert`]. Its presence on disk flips the matching
+/// loader from the dense path to building each predicate Linear (and the TE token embedding)
+/// directly from packed Q4/Q8 parts — so no dense bf16 weight is ever materialized, which is
+/// what keeps the dev load-time memory floor under the 128 GB ceiling (60 GB DiT + 45 GB TE bf16
+/// would peak ~105 GB dense *before* any in-place quantization). The consume-side mirror of
+/// [`mlx_gen_wan::config::WanQuant`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Flux2Quant {
+    pub bits: i32,
+    pub group_size: i32,
+}
+
 /// The FLUX.2-klein variants this crate targets. 9b is the story target; the enum keeps the
 /// door open for 4b (a near-free addition — only the dims in [`Flux2Config`] change).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
