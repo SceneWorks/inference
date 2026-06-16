@@ -13,10 +13,10 @@ Run:  /tmp/sam3ref/.venv/bin/python dump_video_fixture.py
 
 sc-4995: the `kernels` cv-utils ops (`generic_nms` / `cc_2d`) are GPU-only and unavailable on this
 Mac, so the stock reference runs in its no-`kernels` fallback (detection NMS off, hole-fill off). To
-produce a fixture that reflects the *kernels-enabled* mask quality the Rust port replicates, set
-`SAM3_EMULATE_NMS=1` to install a CPU emulation of `generic_nms` before the run. Keep it set whenever
-the Rust port has NMS enabled, otherwise `video_parity` will diff the NMS-on port against an NMS-off
-fixture.
+produce a fixture that reflects the *kernels-enabled* mask quality the Rust port replicates, set both
+`SAM3_EMULATE_NMS=1` and `SAM3_EMULATE_HOLEFILL=1` to install CPU emulations of `generic_nms` and the
+`cc_2d` connected-components before the run. Keep them set to match the Rust port's enabled
+post-processing, otherwise `video_parity` will diff the port against a fixture that skipped it.
 """
 
 import hashlib
@@ -57,6 +57,11 @@ def install_kernel_emulation():
     (descending score; suppress IoU **>** threshold; ties → ascending index via a stable sort, which
     the Rust `nms_dedup` matches). The detector's `det_nms_thresh` gate (> 0) is already satisfied by
     the default config, so patching the module-global `nms_masks` is enough to turn dedup on.
+
+    SAM3_EMULATE_HOLEFILL=1 → emulate the GPU-only `cc_2d` connected-components with Meta's reference
+    CPU path (`skimage.measure.label`, 8-connectivity) by patching `_get_connected_components_with_padding`.
+    The stock `fill_holes_in_mask_scores` logic is left intact — only the kernel-dependent CC primitive
+    is replaced — so hole-fill (`fill_hole_area`) turns on exactly as the Rust `fill_holes_in_mask`.
     """
     import transformers.models.sam3_video.modeling_sam3_video as m
 
@@ -87,6 +92,32 @@ def install_kernel_emulation():
 
         m.nms_masks = _nms_masks
         print("  [emulation] NMS = generic_nms_cpu (SAM3_EMULATE_NMS=1)")
+
+    if os.environ.get("SAM3_EMULATE_HOLEFILL") == "1":
+        from skimage.measure import label as sk_label
+
+        def _ccwp(mask):
+            # mirror Meta's connected_components_cpu_single: skimage 8-connected labels + per-pixel
+            # component size (foreground only; background pixels get count 0). mask is (B,1,H,W).
+            mu = mask.to(torch.uint8)
+            b, _, h, w = mu.shape
+            arr = mu[:, 0].cpu().numpy()
+            labels = np.zeros((b, h, w), dtype=np.int32)
+            counts = np.zeros((b, h, w), dtype=np.int32)
+            for i in range(b):
+                lab, num = sk_label(arr[i], return_num=True)  # connectivity=2 (8-conn) by default
+                labels[i] = lab.astype(np.int32)
+                if num > 0:
+                    sizes = np.bincount(lab.ravel())  # sizes[0] = background; sizes[k] = comp k area
+                    cnt = sizes[lab].astype(np.int32)
+                    cnt[lab == 0] = 0  # background pixels keep count 0 (reference fills fg only)
+                    counts[i] = cnt
+            labels_t = torch.from_numpy(labels).unsqueeze(1).to(mask.device)
+            counts_t = torch.from_numpy(counts).unsqueeze(1).to(mask.device)
+            return labels_t, counts_t
+
+        m._get_connected_components_with_padding = _ccwp
+        print("  [emulation] hole-fill CC = skimage 8-conn (SAM3_EMULATE_HOLEFILL=1)")
 
 
 def main():
