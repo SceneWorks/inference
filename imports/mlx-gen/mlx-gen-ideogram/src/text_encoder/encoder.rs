@@ -1,7 +1,6 @@
 //! Full Qwen3-VL text encoder: token embedding → up to 36 pre-norm decoder layers, collecting the
-//! intermediate hidden states. Ideogram concatenates the hidden states at
-//! [`crate::config::EXTRACTED_LAYERS`] (`0,3,…,33,35`, where index 0 = the token embedding and
-//! index `k` = the output of the `k`-th layer, the HF `output_hidden_states` convention) into the
+//! OUTPUTS of the layers at [`crate::config::EXTRACTED_LAYERS`] (`0,3,…,33,35` — layer indices,
+//! the upstream `_get_qwen3_vl_embeddings` `captured[layer_idx]`), interleaved into the
 //! `13·4096 = 53248`-wide features the DiT's `llm_cond_proj` consumes.
 
 use mlx_rs::ops::concatenate_axis;
@@ -62,18 +61,19 @@ impl Ideogram4TextEncoder {
         let (cos, sin) = self.rope.forward(s)?;
         let mask = build_mask(attention_mask, b, s)?;
 
-        let max_idx = *self.out_layers.iter().max().unwrap_or(&0);
+        // `out_layers` are the indices of the LAYERS whose OUTPUTS Ideogram concatenates (upstream
+        // `_get_qwen3_vl_embeddings`: `captured[layer_idx] = decoder_layer(hidden)`), i.e. the
+        // hidden state right *after* running layer `i` — NOT HF `output_hidden_states` indexing
+        // (which would offset by one and put raw embeddings at index 0). Run up to the last needed
+        // layer (`max + 1` layers) since later layers can't influence the captured set.
+        let max_layer = *self.out_layers.iter().max().unwrap_or(&0);
 
         let mut hidden = self.embed_tokens.forward(input_ids)?;
         let mut saved: Vec<(usize, Array)> = Vec::with_capacity(self.out_layers.len());
-        if self.out_layers.contains(&0) {
-            saved.push((0, hidden.clone()));
-        }
-        for (i, layer) in self.layers.iter().take(max_idx).enumerate() {
+        for (i, layer) in self.layers.iter().take(max_layer + 1).enumerate() {
             hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
-            let idx = i + 1;
-            if self.out_layers.contains(&idx) {
-                saved.push((idx, hidden.clone()));
+            if self.out_layers.contains(&i) {
+                saved.push((i, hidden.clone()));
             }
         }
 
@@ -84,13 +84,20 @@ impl Ideogram4TextEncoder {
                 .map(|(_, v)| v)
                 .ok_or_else(|| Error::Msg(format!("ideogram te: hidden state {idx} not captured")))
         };
-        // Concatenate in the order the model expects (= `out_layers` order).
-        let picked: Vec<&Array> = self
+        // INTERLEAVE the layers into the feature axis: stack to `[B, L, H, n]` then reshape to
+        // `[B, L, H·n]`, so feature `f = h·n + layer` — the pipeline's
+        // `stack(dim=0).permute(1,2,3,0).reshape`, NOT a plain per-layer concat (which would be
+        // block order `layer·H + h`). The DiT's `llm_cond_proj` was trained on the interleaved
+        // layout; getting it wrong yields a coherent but prompt-agnostic image.
+        let expanded: Vec<Array> = self
             .out_layers
             .iter()
-            .map(|&idx| pick(idx))
+            .map(|&idx| Ok(pick(idx)?.expand_dims(3)?))
             .collect::<Result<_>>()?;
-        Ok(concatenate_axis(&picked, 2)?)
+        let refs: Vec<&Array> = expanded.iter().collect();
+        let stacked = concatenate_axis(&refs, 3)?; // [B, L, H, n]
+        let sh = stacked.shape();
+        Ok(stacked.reshape(&[sh[0], sh[1], sh[2] * sh[3]])?)
     }
 }
 
