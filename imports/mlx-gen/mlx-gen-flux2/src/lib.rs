@@ -23,6 +23,7 @@ pub mod convert;
 pub mod kv_cache;
 pub mod loader;
 pub mod model;
+pub mod model_control;
 pub mod pipeline;
 pub mod pos_embed;
 pub mod text_encoder;
@@ -33,8 +34,8 @@ pub mod vision;
 pub use adapters::apply_flux2_adapters;
 pub use config::{
     Flux2Config, Flux2Quant, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_GUIDANCE_DEV, DEFAULT_HEIGHT,
-    DEFAULT_STEPS, DEFAULT_STEPS_DEV, DEFAULT_WIDTH, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID,
-    FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
+    DEFAULT_STEPS, DEFAULT_STEPS_DEV, DEFAULT_WIDTH, FLUX2_DEV_CONTROL_ID, FLUX2_DEV_EDIT_ID,
+    FLUX2_DEV_ID, FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
 };
 pub use convert::{
     build_target_state_dict, convert_and_assemble, quantize_flux2_dit, quantize_flux2_text_encoder,
@@ -42,14 +43,16 @@ pub use convert::{
 };
 pub use kv_cache::{CacheMode, Flux2KvCache, Stream};
 pub use loader::{
-    load_multimodal_projector_dev, load_text_encoder, load_text_encoder_dev, load_tokenizer,
-    load_tokenizer_dev, load_transformer, load_transformer_dev, load_vae, load_vision_tower_dev,
+    load_control_transformer_dev, load_multimodal_projector_dev, load_text_encoder,
+    load_text_encoder_dev, load_tokenizer, load_tokenizer_dev, load_transformer,
+    load_transformer_dev, load_vae, load_vision_tower_dev,
 };
 pub use model::{
     descriptor_dev, descriptor_dev_edit, descriptor_klein_9b, descriptor_klein_9b_edit,
     descriptor_klein_9b_kv_edit, load_dev, load_dev_edit, load_klein_9b, load_klein_9b_edit,
     load_klein_9b_kv_edit,
 };
+pub use model_control::{descriptor_dev_control, load_dev_control, Flux2DevControl};
 pub use pipeline::{
     add_noise_by_interpolation, create_noise, image_seq_len, init_time_step, pack_latents,
     patchify_latents, prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule,
@@ -57,6 +60,9 @@ pub use pipeline::{
 };
 pub use pos_embed::Flux2PosEmbed;
 pub use text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
-pub use transformer::{Flux2Transformer, Flux2TransformerConfig};
+pub use transformer::{
+    Flux2ControlBranch, Flux2ControlTransformer, Flux2Transformer, Flux2TransformerConfig,
+    CONTROL_IN_DIM,
+};
 pub use vae::Flux2Vae;
 pub use vision::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};

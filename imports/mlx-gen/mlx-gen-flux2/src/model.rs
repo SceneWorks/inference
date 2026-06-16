@@ -330,7 +330,7 @@ impl Flux2 {
 
 /// Crop a NCHW latent's spatial dims down to even (the fork's `crop_to_even_spatial`), so the 2×2
 /// patchify divides cleanly. A no-op at the standard multiple-of-16 sizes.
-fn crop_to_even(x: &Array) -> Result<Array> {
+pub(crate) fn crop_to_even(x: &Array) -> Result<Array> {
     let sh = x.shape();
     let mut x = x.clone();
     if sh[2] % 2 != 0 {
@@ -347,7 +347,7 @@ fn crop_to_even(x: &Array) -> Result<Array> {
 /// Center-crop or symmetric-pad a NCHW latent's spatial dims to `(target_h, target_w)` — the fork's
 /// `_match_latent_spatial_size`. A no-op at the standard multiple-of-16 sizes (the VAE-encoded H/8
 /// already equals the `latent_h·2` target); guards odd / mismatched user images.
-fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32) -> Result<Array> {
+pub(crate) fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32) -> Result<Array> {
     let mut x = x.clone();
     let (h, w) = (x.shape()[2], x.shape()[3]);
     if h != target_h {
@@ -589,7 +589,7 @@ impl Flux2 {
     }
 }
 
-fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
+pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
     // Empty-prompt first so it wins over the shared floor for a bare default request.
     if req.prompt.trim().is_empty() {
         return Err(Error::Msg(format!("{}: prompt is required", desc.id)));
