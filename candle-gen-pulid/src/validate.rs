@@ -110,7 +110,10 @@ fn output_cosine(face: &dyn FaceEmbedder, ref_emb: &[f32], img: &Image, tag: &st
     match face.largest_face(img) {
         Ok(f) => {
             let c = cosine(ref_emb, &f.embedding);
-            eprintln!("[{tag}] face detected (det={:.3}) cosine={c:.4}", f.det_score);
+            eprintln!(
+                "[{tag}] face detected (det={:.3}) cosine={c:.4}",
+                f.det_score
+            );
             c
         }
         Err(e) => {
@@ -148,8 +151,11 @@ fn real_weight_pulid() {
     let t0 = Instant::now();
     let model = PulidFlux::load(&paths).expect("PulidFlux::load");
     // A separate face stack for re-embedding the outputs (same weights; the model's is private).
-    let face = candle_gen_face::load_on(&env_path("PULID_FACE_DIR"), &candle_gen::default_device().unwrap())
-        .expect("load face stack for re-embedding");
+    let face = candle_gen_face::load_on(
+        &env_path("PULID_FACE_DIR"),
+        &candle_gen::default_device().unwrap(),
+    )
+    .expect("load face stack for re-embedding");
     eprintln!("loaded in {:?}", t0.elapsed());
 
     let reference = read_ppm(&env_path("PULID_REF"));
@@ -265,6 +271,9 @@ fn real_weight_pulid() {
         id_cos > no_id_cos + 0.1,
         "id cosine ({id_cos}) not clearly above the no-id ablation ({no_id_cos}) — id conditioning weak"
     );
-    assert!(diff > 5.0, "id vs no-id pixel diff too small ({diff}) — injection had no effect");
+    assert!(
+        diff > 5.0,
+        "id vs no-id pixel diff too small ({diff}) — injection had no effect"
+    );
     eprintln!("PuLID-FLUX validation PASS ✅ (eyeball pulid_id.ppm vs pulid_no_id.ppm)");
 }
