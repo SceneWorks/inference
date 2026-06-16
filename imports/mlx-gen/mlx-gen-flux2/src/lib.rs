@@ -33,8 +33,8 @@ pub mod vision;
 pub use adapters::apply_flux2_adapters;
 pub use config::{
     Flux2Config, Flux2Quant, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_GUIDANCE_DEV, DEFAULT_HEIGHT,
-    DEFAULT_STEPS, DEFAULT_STEPS_DEV, DEFAULT_WIDTH, FLUX2_DEV_ID, FLUX2_KLEIN_9B_EDIT_ID,
-    FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
+    DEFAULT_STEPS, DEFAULT_STEPS_DEV, DEFAULT_WIDTH, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID,
+    FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
 };
 pub use convert::{
     build_target_state_dict, convert_and_assemble, quantize_flux2_dit, quantize_flux2_text_encoder,
@@ -46,8 +46,9 @@ pub use loader::{
     load_tokenizer_dev, load_transformer, load_transformer_dev, load_vae, load_vision_tower_dev,
 };
 pub use model::{
-    descriptor_dev, descriptor_klein_9b, descriptor_klein_9b_edit, descriptor_klein_9b_kv_edit,
-    load_dev, load_klein_9b, load_klein_9b_edit, load_klein_9b_kv_edit,
+    descriptor_dev, descriptor_dev_edit, descriptor_klein_9b, descriptor_klein_9b_edit,
+    descriptor_klein_9b_kv_edit, load_dev, load_dev_edit, load_klein_9b, load_klein_9b_edit,
+    load_klein_9b_kv_edit,
 };
 pub use pipeline::{
     add_noise_by_interpolation, create_noise, image_seq_len, init_time_step, pack_latents,

@@ -64,11 +64,23 @@ pub fn descriptor_dev() -> ModelDescriptor {
     Flux2Variant::Dev.descriptor()
 }
 
+pub fn descriptor_dev_edit() -> ModelDescriptor {
+    Flux2Variant::DevEdit.descriptor()
+}
+
 /// FLUX.2-dev txt2img (sc-2365): the guidance-distilled 32B flagship. Loads the dev snapshot
 /// (Mistral3 TE + dev DiT, pre-quantized Q4 per sc-5917) and runs the embedded-guidance denoise
 /// (single forward, default guidance ~4.0 over ~28 steps — NOT true-CFG).
 pub fn load_dev(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(Flux2Variant::Dev, spec)
+}
+
+/// FLUX.2-dev image-conditioned edit (sc-5919): single + multi reference. Loads the same dev
+/// snapshot as [`load_dev`] and runs the shared edit conditioning path — reference images are
+/// VAE-encoded, packed, and concatenated to the DiT image stream (the klein edit mechanism, faithful
+/// to the diffusers `Flux2Pipeline`; the prompt embeds stay text-only). Embedded-guidance denoise.
+pub fn load_dev_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(Flux2Variant::DevEdit, spec)
 }
 
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
@@ -94,7 +106,8 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     // The dev checkpoint has a different text encoder (Mistral3, not Qwen3) + tokenizer + DiT dims,
     // so it loads through the `*_dev` loaders; a pre-quantized dev snapshot loads packed directly
     // (the loaders read the per-component `quantization` manifest, sc-5917). The VAE is identical.
-    let dev = variant == Flux2Variant::Dev;
+    // Both dev variants (txt2img + edit) load the same snapshot through these loaders.
+    let dev = variant.is_dev();
     let (mut text_encoder, mut transformer) = if dev {
         (
             loader::load_text_encoder_dev(root)?,
@@ -613,6 +626,10 @@ fn load_dev_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> 
     load_dev(spec).map_err(Into::into)
 }
 
+fn load_dev_edit_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_dev_edit(spec).map_err(Into::into)
+}
+
 inventory::submit! {
     ModelRegistration { descriptor: descriptor_klein_9b, load: load_klein_9b_registered }
 }
@@ -629,12 +646,16 @@ inventory::submit! {
     ModelRegistration { descriptor: descriptor_dev, load: load_dev_registered }
 }
 
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_dev_edit, load: load_dev_edit_registered }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, FLUX2_DEV_ID, FLUX2_KLEIN_9B_EDIT_ID,
-        FLUX2_KLEIN_9B_ID,
+        DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID,
+        FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID,
     };
     use mlx_gen::media::Image;
     use mlx_gen::Conditioning;
@@ -800,6 +821,64 @@ mod tests {
     #[test]
     fn edit_without_reference_errors() {
         let model = Flux2::new_for_tests(Flux2Variant::Klein9bEdit);
+        let req = GenerationRequest {
+            prompt: "make it night".into(),
+            ..Default::default()
+        };
+        let err = model.collect_edit_references(&req).unwrap_err().to_string();
+        assert!(err.contains("at least one reference image"));
+    }
+
+    // ---- sc-5919 FLUX.2-dev edit (DiT-concat reference conditioning) ---------------------------
+
+    #[test]
+    fn dev_edit_registered_with_edit_caps() {
+        // Registered (loadable by id) with the dev-edit id + the klein edit conditioning surface.
+        assert_eq!(descriptor_dev_edit().id, FLUX2_DEV_EDIT_ID);
+        let caps = descriptor_dev_edit().capabilities;
+        assert_eq!(
+            caps.conditioning,
+            vec![
+                mlx_gen::ConditioningKind::Reference,
+                mlx_gen::ConditioningKind::MultiReference,
+            ]
+        );
+        // Embedded guidance (no negative/true-CFG), no KV cache, mac-only.
+        assert!(
+            caps.supports_guidance && !caps.supports_negative_prompt && !caps.supports_true_cfg
+        );
+        assert!(!caps.supports_kv_cache && caps.mac_only);
+    }
+
+    #[test]
+    fn dev_edit_accepts_single_and_multi_reference() {
+        let model = Flux2::new_for_tests(Flux2Variant::DevEdit);
+        // Single `Reference`.
+        let single = GenerationRequest {
+            prompt: "make it a watercolor".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        model.validate(&single).unwrap();
+        assert_eq!(model.collect_edit_references(&single).unwrap().len(), 1);
+        // `MultiReference` (N images).
+        let multi = GenerationRequest {
+            prompt: "combine these".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![Image::default(), Image::default()],
+            }],
+            ..Default::default()
+        };
+        model.validate(&multi).unwrap();
+        assert_eq!(model.collect_edit_references(&multi).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn dev_edit_without_reference_errors() {
+        let model = Flux2::new_for_tests(Flux2Variant::DevEdit);
         let req = GenerationRequest {
             prompt: "make it night".into(),
             ..Default::default()
