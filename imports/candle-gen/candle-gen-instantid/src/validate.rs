@@ -165,6 +165,7 @@ fn real_weight_instantid() {
         sdxl_base: env_path("IID_SDXL_BASE"),
         identitynet: WeightsSource::Dir(env_path("IID_IDENTITYNET")),
         ip_adapter: env_path("IID_IP_ADAPTER"),
+        adapters: Vec::new(),
     };
 
     eprintln!("loading InstantId (RealVisXL + IdentityNet + IP-Adapter + VAE) ...");

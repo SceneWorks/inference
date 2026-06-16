@@ -15,7 +15,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use candle_transformers::models::stable_diffusion::StableDiffusionConfig;
 
-use candle_gen::gen_core::WeightsSource;
+use candle_gen::gen_core::{AdapterSpec, WeightsSource};
 use candle_gen::{CandleError, Result};
 
 use crate::pipeline::{hf_get, snapshot_file, VAE_FIX_FILE, VAE_FIX_REPO};
@@ -40,6 +40,32 @@ pub fn load_instantid_unet(
     // One mmap'd VarBuilder feeds both the UNet body and the `add_embedding` head (both live in the
     // same `unet/` checkpoint). `VarBuilder` is Arc-backed, so the clone is cheap.
     let vs = unsafe { VarBuilder::from_mmaped_safetensors(&[unet_file], dtype, device)? };
+    let unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
+        .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+    Ok(unet)
+}
+
+/// As [`load_instantid_unet`], but fold user LoRA/LoKr `adapters` into the UNet weights at load
+/// (sc-6038). InstantID runs on a stock SDXL (RealVisXL) UNet, so SDXL-family LoRAs apply on top of
+/// the IdentityNet + face IP-Adapter. Mirrors the SDXL generator's adapter path
+/// ([`crate::pipeline`]'s `build_unet_with_adapters`): load the `unet/` tensors onto CPU at their
+/// native dtype, fold the deltas in ([`crate::adapters::merge_adapters`], f32 math), then build the
+/// stock UNet + `add_embedding` head from the merged map — each tensor moved to `device` and cast to
+/// `dtype` as the VarBuilder serves it, so peak GPU is unchanged vs the mmap path. An empty
+/// `adapters` slice merges nothing; a non-empty slice that matches no target errors (it never renders
+/// an unadapted image silently). The caller installs the IP-Adapter K/V pairs on the returned UNet.
+pub fn load_instantid_unet_with_adapters(
+    root: &Path,
+    device: &Device,
+    dtype: DType,
+    adapters: &[AdapterSpec],
+) -> Result<UNet2DConditionModel> {
+    let unet_file = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+    let mut tensors = candle_core::safetensors::load(&unet_file, &Device::Cpu)?;
+    crate::adapters::merge_adapters(&mut tensors, adapters)?;
+    // `VarBuilder::from_tensors` owns the merged map and is Arc-backed (clone is cheap), feeding both
+    // the UNet body and the `add_embedding` head — exactly as the mmap path clones its VarBuilder.
+    let vs = VarBuilder::from_tensors(tensors, dtype, device);
     let unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
         .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
     Ok(unet)
