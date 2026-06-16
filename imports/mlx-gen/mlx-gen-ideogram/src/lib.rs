@@ -22,8 +22,12 @@
 //! (sc-5988) land next.
 
 pub mod config;
+pub mod loader;
+pub mod text_encoder;
 
 pub use config::{
     Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_HEIGHT,
     DEFAULT_STEPS, DEFAULT_WIDTH, EXTRACTED_LAYERS, IDEOGRAM_4_FP8_REPO, IDEOGRAM_4_ID,
 };
+pub use loader::load_text_encoder;
+pub use text_encoder::Ideogram4TextEncoder;
