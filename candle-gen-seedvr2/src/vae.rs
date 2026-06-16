@@ -445,3 +445,61 @@ impl Seedvr2Vae {
         self.decoder.forward(&z)
     }
 }
+
+#[cfg(test)]
+mod shuffle_tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+
+    /// The exact reshape/permute the temporal [`Upsample3d`] uses, in isolation.
+    fn pixel_shuffle(x: &Tensor, sf: usize, tf: usize) -> candle_gen::Result<Tensor> {
+        let (b, cc, t, h, wd) = x.dims5()?;
+        let c = cc / (sf * sf * tf);
+        Ok(x.reshape(&[b, sf, sf, tf, c, t, h, wd][..])?
+            .permute([0usize, 4, 5, 3, 6, 1, 7, 2])?
+            .contiguous()?
+            .reshape((b, c, t * tf, h * sf, wd * sf))?)
+    }
+
+    /// Verify the candle reshape/permute realises the intended depth→(space,time) mapping for
+    /// **distinct** per-(channel,frame) values: out[cc, ti·tf+ft, hi·sf+s1, wi·sf+s2] ==
+    /// x[((s1·sf+s2)·tf+ft)·c+cc, ti, hi, wi]. Identical frames can't catch a temporal-mix bug here.
+    #[test]
+    fn pixel_shuffle_index_mapping() -> candle_gen::Result<()> {
+        let dev = Device::Cpu;
+        let (sf, tf, c, t, h, wd) = (2usize, 2usize, 2usize, 3usize, 2usize, 2usize);
+        let cc = c * sf * sf * tf;
+        // unique value per (channel, t, h, w)
+        let n = cc * t * h * wd;
+        let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let x = Tensor::from_vec(data.clone(), (1, cc, t, h, wd), &dev)?;
+        let y = pixel_shuffle(&x, sf, tf)?;
+        let yv = y.flatten_all()?.to_vec1::<f32>()?;
+        let (ot, oh, ow) = (t * tf, h * sf, wd * sf);
+        let xat = |ch: usize, ti: usize, hi: usize, wi: usize| -> f32 {
+            data[((ch * t + ti) * h + hi) * wd + wi]
+        };
+        let yat = |co: usize, to: usize, ho: usize, wo: usize| -> f32 {
+            yv[((co * ot + to) * oh + ho) * ow + wo]
+        };
+        for s1 in 0..sf {
+            for s2 in 0..sf {
+                for ft in 0..tf {
+                    for cci in 0..c {
+                        let ch = ((s1 * sf + s2) * tf + ft) * c + cci;
+                        for ti in 0..t {
+                            for hi in 0..h {
+                                for wi in 0..wd {
+                                    let got = yat(cci, ti * tf + ft, hi * sf + s1, wi * sf + s2);
+                                    let exp = xat(ch, ti, hi, wi);
+                                    assert_eq!(got, exp, "shuffle mismatch ch={ch}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

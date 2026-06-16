@@ -16,6 +16,38 @@ use candle_gen::candle_core::{Result, Tensor};
 
 use crate::weights::Weights;
 
+/// Max im2col elements (`batch · H_out · W_out · C · kH · kW`) per `conv2d` call. candle's CUDA conv2d
+/// builds an im2col buffer of this size; above a few hundred million it silently corrupts/zeros part
+/// of the output (an 8·64²·512·9 ≈ 151M call is fine, a 16·128²·512·9 ≈ 1.2B call drops frames). We
+/// chunk the merged `B·T_out` batch so every conv2d stays in the proven-safe band. The image path
+/// (`T_out==1`) never tripped this; it only bites multi-frame (video) clips at high resolution.
+const IM2COL_BUDGET: usize = 128 * 1024 * 1024;
+
+/// `x.conv2d`, but with the batch axis split into chunks small enough that each call's im2col stays
+/// under [`IM2COL_BUDGET`]; results are concatenated back along the batch axis. Identical math to a
+/// single `conv2d`, just split to dodge the large-buffer corruption.
+fn chunked_conv2d(x: &Tensor, w: &Tensor, padding: usize, stride: usize) -> Result<Tensor> {
+    let n = x.dim(0)?;
+    let (c, h, wd) = (x.dim(1)?, x.dim(2)?, x.dim(3)?);
+    let (_o, _i, kh, kw) = w.dims4()?;
+    let h_out = (h + 2 * padding).saturating_sub(kh) / stride + 1;
+    let w_out = (wd + 2 * padding).saturating_sub(kw) / stride + 1;
+    let cols_per_frame = (h_out * w_out * c * kh * kw).max(1);
+    let max_batch = (IM2COL_BUDGET / cols_per_frame).clamp(1, n);
+    if n <= max_batch {
+        return x.conv2d(w, padding, stride, 1, 1);
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < n {
+        let len = (n - start).min(max_batch);
+        parts.push(x.narrow(0, start, len)?.conv2d(w, padding, stride, 1, 1)?);
+        start += len;
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 0)
+}
+
 pub struct CausalConv3d {
     weight: Tensor, // [O, I, kT, kH, kW]
     bias: Tensor,   // [1, O, 1, 1, 1]
@@ -102,11 +134,13 @@ impl CausalConv3d {
                 xpad.index_select(&idx, 2)?
             };
             // Merge (B, T_out) into the conv2d batch axis: [B, C, T_out, H, W] → [B·T_out, C, H, W].
-            let merged = frames
-                .permute((0, 2, 1, 3, 4))?
-                .reshape((b * t_out, c, h, w))?
-                .contiguous()?;
-            let y = merged.conv2d(&wk, self.ph, self.sh, 1, 1)?; // [B·T_out, O, H_out, W_out]
+            let merged =
+                frames
+                    .permute((0, 2, 1, 3, 4))?
+                    .contiguous()?
+                    .reshape((b * t_out, c, h, w))?;
+            // Batch-chunked so each conv2d's im2col stays under candle's CUDA limit (see [`chunked_conv2d`]).
+            let y = chunked_conv2d(&merged, &wk, self.ph, self.sh)?; // [B·T_out, O, H_out, W_out]
             acc = Some(match acc {
                 Some(a) => (a + y)?,
                 None => y,
@@ -188,6 +222,83 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (1, i, 9, 4, 4), &dev)?;
         let y = c.forward(&x)?; // T_out = (9+2-3)/2 + 1 = 5
         assert_eq!(y.dims(), &[1, o, 5, 4, 4]);
+        Ok(())
+    }
+
+    /// Brute-force causal conv3d reference (NCTHW, cross-correlation, first-frame causal pad, symmetric
+    /// spatial zero-pad, stride). Compares the conv2d-temporal-sum decomposition against it for a
+    /// **T>1, distinct-frame** input — the case the image (T=1) path never exercised. Covers temporal
+    /// stride 1 (resnet/conv_in convs) AND stride 2 (the encoder temporal downsamplers).
+    #[test]
+    fn matches_bruteforce_conv3d_t_gt_1() -> Result<()> {
+        for st in [1usize, 2usize] {
+            bruteforce_conv3d_case(st)?;
+        }
+        Ok(())
+    }
+
+    fn bruteforce_conv3d_case(st: usize) -> Result<()> {
+        let dev = Device::Cpu;
+        let (o, i, kt, kh, kw) = (3usize, 2usize, 3usize, 3usize, 3usize);
+        let (t, h, w) = (18usize, 5usize, 5usize); // T large enough to exercise t_out=16+
+        let ph = 1usize;
+        let wt = Tensor::randn(0f32, 1.0, (o, i, kt, kh, kw), &dev)?;
+        let bias = Tensor::randn(0f32, 1.0, o, &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (1, i, t, h, w), &dev)?;
+        let c = conv(wt.clone(), bias.clone(), st, ph, 1, false);
+        let got = c.forward(&x)?;
+
+        // brute force
+        let causal_pad = kt - 1;
+        let wv = wt.flatten_all()?.to_vec1::<f32>()?; // [o,i,kt,kh,kw] row-major
+        let bv = bias.to_vec1::<f32>()?;
+        let xv = x.flatten_all()?.to_vec1::<f32>()?; // [1,i,t,h,w]
+        let xat = |ci: usize, ti: usize, hi: i64, wi: i64| -> f32 {
+            if hi < 0 || wi < 0 || hi as usize >= h || wi as usize >= w {
+                return 0.0;
+            }
+            // causal pad: padded indices [0..causal_pad) clamp to real frame 0.
+            let real_t = ti.saturating_sub(causal_pad);
+            xv[((ci * t + real_t) * h + hi as usize) * w + wi as usize]
+        };
+        let t_out = (t + causal_pad - kt) / st + 1;
+        let wat = |oi: usize, ci: usize, a: usize, b2: usize, c2: usize| -> f32 {
+            wv[(((oi * i + ci) * kt + a) * kh + b2) * kw + c2]
+        };
+        let mut exp = vec![0f32; o * t_out * h * w];
+        for oi in 0..o {
+            for to in 0..t_out {
+                for ho in 0..h {
+                    for wo in 0..w {
+                        let mut acc = bv[oi];
+                        for ci in 0..i {
+                            for a in 0..kt {
+                                for b2 in 0..kh {
+                                    for c2 in 0..kw {
+                                        let ti = to * st + a;
+                                        let hi = (ho + b2) as i64 - ph as i64;
+                                        let wi = (wo + c2) as i64 - ph as i64;
+                                        acc += xat(ci, ti, hi, wi) * wat(oi, ci, a, b2, c2);
+                                    }
+                                }
+                            }
+                        }
+                        exp[((oi * t_out + to) * h + ho) * w + wo] = acc;
+                    }
+                }
+            }
+        }
+        let gv = got.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(gv.len(), exp.len());
+        let max_err = gv
+            .iter()
+            .zip(exp.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_err < 1e-3,
+            "conv3d decomposition wrong at T>1 (st={st}): max_err={max_err}"
+        );
         Ok(())
     }
 

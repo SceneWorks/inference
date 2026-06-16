@@ -79,7 +79,10 @@ impl TimeEmbedding {
         let freqs: Vec<f32> = (0..half).map(|i| (i as f64 * scale).exp() as f32).collect();
         let freqs = Tensor::from_vec(freqs, (1, half), dev)?;
         let args = (freqs * timestep)?; // (1, half)
-        let emb = Tensor::cat(&[&args.sin()?, &args.cos()?], 1)?; // (1, 256)
+                                        // Sinusoids are built in f32 for precision; cast to the model dtype before the proj Linears
+                                        // so the GEMM dtypes match (bf16 weights would otherwise reject the f32 activation).
+        let emb =
+            Tensor::cat(&[&args.sin()?, &args.cos()?], 1)?.to_dtype(self.proj_in.w.dtype())?; // (1, 256)
         let emb = nn::silu(&self.proj_in.forward(&emb)?)?;
         let emb = nn::silu(&self.proj_hid.forward(&emb)?)?;
         self.proj_out.forward(&emb)
@@ -288,10 +291,13 @@ fn window_plan(
 // ---------------------------------------------------------------------------
 
 /// `axial_1d(freqs, pos)`: positions `pos` (len,), base freqs `freqs` (nf,) → `(len, 2*nf)` =
-/// `[p·f0, p·f0, p·f1, p·f1, …]` (each base freq duplicated).
+/// `[p·f0, p·f0, p·f1, p·f1, …]` (each base freq duplicated). The frequency table is built in f32
+/// (the `freqs` weight may be bf16, but the positions are f32 and `apply_rope` consumes this in f32) —
+/// so cast `freqs` to f32 to match `pos` and keep the RoPE angles full-precision.
 fn axial_1d(freqs: &Tensor, pos: &Tensor) -> Result<Tensor> {
     let len = pos.dim(0)?;
     let nf = freqs.dim(0)?;
+    let freqs = freqs.to_dtype(DType::F32)?;
     let outer = pos
         .reshape((len, 1))?
         .broadcast_mul(&freqs.reshape((1, nf))?)?; // (len, nf)
