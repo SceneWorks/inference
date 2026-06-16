@@ -74,3 +74,58 @@ pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
     let attn = softmax_last_dim(&scores)?;
     attn.matmul(&v.contiguous()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+
+    /// Brute-force GroupNorm over NCTHW (joint over c/g, T, H, W) — confirms the reshape groups
+    /// channels correctly and fully normalizes at T>1 (a mis-grouped reshape would under-normalize
+    /// and explode downstream — the candle SeedVR2 video failure mode).
+    #[test]
+    fn group_norm_matches_bruteforce_t_gt_1() -> Result<()> {
+        let dev = Device::Cpu;
+        let (n, c, t, h, wd, groups) = (1usize, 8usize, 3usize, 2usize, 2usize, 4usize);
+        let x = Tensor::randn(0f32, 2.0, (n, c, t, h, wd), &dev)?;
+        let w = Tensor::randn(0f32, 1.0, c, &dev)?;
+        let b = Tensor::randn(0f32, 1.0, c, &dev)?;
+        let eps = 1e-6;
+        let got = group_norm(&x, &w, &b, groups, eps)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        let xv = x.flatten_all()?.to_vec1::<f32>()?; // [n,c,t,h,w] row-major
+        let wv = w.to_vec1::<f32>()?;
+        let bv = b.to_vec1::<f32>()?;
+        let rest = t * h * wd;
+        let cpg = c / groups;
+        let idx = |ci: usize, k: usize| ci * rest + k; // n=1
+        let mut exp = vec![0f32; c * rest];
+        for gr in 0..groups {
+            // collect group elements (cpg channels × rest)
+            let mut vals = Vec::with_capacity(cpg * rest);
+            for ci in gr * cpg..(gr + 1) * cpg {
+                for k in 0..rest {
+                    vals.push(xv[idx(ci, k)]);
+                }
+            }
+            let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+            let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / vals.len() as f32;
+            let std = (var + eps as f32).sqrt();
+            for ci in gr * cpg..(gr + 1) * cpg {
+                for k in 0..rest {
+                    let norm = (xv[idx(ci, k)] - mean) / std;
+                    exp[idx(ci, k)] = norm * wv[ci] + bv[ci];
+                }
+            }
+        }
+        let max_err = got
+            .iter()
+            .zip(exp.iter())
+            .map(|(a, e)| (a - e).abs())
+            .fold(0f32, f32::max);
+        assert!(max_err < 1e-3, "group_norm wrong at T>1: max_err={max_err}");
+        Ok(())
+    }
+}
