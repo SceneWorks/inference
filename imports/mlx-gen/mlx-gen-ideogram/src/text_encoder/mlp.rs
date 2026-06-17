@@ -30,4 +30,11 @@ impl Qwen3Mlp {
         let gated = multiply(&silu(&self.gate.forward(x)?)?, &self.up.forward(x)?)?;
         self.down.forward(&gated)
     }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.gate.quantize(bits, None)?;
+        self.up.quantize(bits, None)?;
+        self.down.quantize(bits, None)?;
+        Ok(())
+    }
 }

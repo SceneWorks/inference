@@ -51,4 +51,10 @@ impl Qwen3DecoderLayer {
         let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
         Ok(add(&h, &self.mlp.forward(&normed2)?)?)
     }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize(bits)?;
+        self.mlp.quantize(bits)?;
+        Ok(())
+    }
 }

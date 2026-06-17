@@ -23,6 +23,7 @@
 //! [`model`]). Follow-ons: Q4/Q8 quantization (sc-5989) and the gated turnkey publish (sc-5990).
 
 pub mod config;
+pub mod convert;
 pub mod latent_norm;
 pub mod loader;
 pub mod model;
@@ -30,6 +31,9 @@ pub mod pipeline;
 pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer;
+
+/// Packed (pre-quantized) weight loading — internal; the [`convert`] consume side.
+mod quant;
 
 pub use config::{
     Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_HEIGHT,

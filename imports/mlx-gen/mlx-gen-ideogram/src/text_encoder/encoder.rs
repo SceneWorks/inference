@@ -43,13 +43,22 @@ impl Ideogram4TextEncoder {
             )?);
         }
         Ok(Self {
-            embed_tokens: TokenEmbedding::Dense(
-                w.require(&join(prefix, "embed_tokens.weight"))?.clone(),
-            ),
+            embed_tokens: crate::quant::embedding(w, &join(prefix, "embed_tokens"))?,
             layers,
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             out_layers: EXTRACTED_LAYERS.to_vec(),
         })
+    }
+
+    /// Quantize the token-embedding table + every decoder-layer projection in place (group-wise
+    /// affine Q4/Q8). `cast_to_bf16=true` for the embedding matches the FLUX.2 Qwen3 TE path; the
+    /// per-layer norms stay dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.embed_tokens.quantize(bits, true)?;
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        Ok(())
     }
 
     /// `input_ids` / `attention_mask`: `[b, s]` int32. Returns the concatenated hidden states

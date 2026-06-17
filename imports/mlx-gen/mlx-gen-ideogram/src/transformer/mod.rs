@@ -19,17 +19,12 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-/// Build a Linear from `{base}.weight` (+ optional `{base}.bias`). Ideogram's DiT projections are
-/// biased (input_proj / llm_cond_proj / adaln_* / t_embedding / final_layer) except the per-block
-/// attention `qkv`/`o` and the SwiGLU `w1`/`w2`/`w3`, which are bias-less.
+/// Build a Linear from `{base}` (`{base}.weight` + optional `{base}.bias`), auto-detecting a
+/// pre-quantized packed snapshot (see [`crate::quant::lin`]). Ideogram's DiT projections are biased
+/// (input_proj / llm_cond_proj / adaln_* / t_embedding / final_layer) except the per-block attention
+/// `qkv`/`o` and the SwiGLU `w1`/`w2`/`w3`, which are bias-less.
 pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear> {
-    let weight = w.require(&format!("{base}.weight"))?.clone();
-    let b = if bias {
-        Some(w.require(&format!("{base}.bias"))?.clone())
-    } else {
-        None
-    };
-    Ok(AdaptableLinear::dense(weight, b))
+    crate::quant::lin(w, base, bias)
 }
 
 /// Join a module prefix with a leaf name, tolerating an empty prefix (the DiT keys are top-level).

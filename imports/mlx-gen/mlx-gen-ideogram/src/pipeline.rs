@@ -57,6 +57,18 @@ impl Ideogram4Pipeline {
         })
     }
 
+    /// Quantize the whole model in place (group-wise affine Q4/Q8) after the dense load — both DiTs
+    /// (conditional + unconditional), the Qwen3-VL text encoder, and the VAE — matching the flux2
+    /// family's `spec.quantize` semantics. Norms / tiny embeddings stay dense (each module's
+    /// `quantize` decides). Done once at load; runtime is unchanged.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.cond.quantize(bits)?;
+        self.uncond.quantize(bits)?;
+        self.te.quantize(bits)?;
+        self.vae.quantize(bits)?;
+        Ok(())
+    }
+
     /// Tokenize a prompt to `input_ids` exactly as the reference `_tokenize`: wrap it in the
     /// Qwen3-VL single-user chat template ([`ChatTemplate::QwenInstruct`](mlx_gen::tokenizer::ChatTemplate::QwenInstruct))
     /// and encode with `add_special_tokens=false`. Rejects a prompt longer than `MAX_TEXT_TOKENS`.

@@ -51,6 +51,14 @@ impl Qwen3Attention {
         })
     }
 
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.q_w.quantize(bits, None)?;
+        self.k_w.quantize(bits, None)?;
+        self.v_w.quantize(bits, None)?;
+        self.o_w.quantize(bits, None)?;
+        Ok(())
+    }
+
     /// `x`: `[b, s, hidden]`; `cos`/`sin`: `[1, s, head_dim]`; `mask`: additive `[b,1,s,s]`.
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
         let sh = x.shape();
