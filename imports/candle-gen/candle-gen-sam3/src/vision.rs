@@ -310,7 +310,7 @@ impl Backbone {
     fn tiled_pos(&self) -> Result<Tensor> {
         let pg = self.pretrain_grid;
         let c = self.pos_embed.dim(2)?;
-        if self.grid % pg != 0 {
+        if !self.grid.is_multiple_of(pg) {
             return Err(CandleError::Msg(format!(
                 "sam3 vision: token grid {} is not a multiple of the position-embedding grid {} \
                  (non-exact tiling not implemented)",
