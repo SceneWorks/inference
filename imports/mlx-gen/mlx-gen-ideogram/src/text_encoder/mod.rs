@@ -31,10 +31,12 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-/// Wrap a stored `[out, in]` weight as a bias-less dense [`AdaptableLinear`] — every Qwen3
-/// projection is a bias-less Linear (`attention_bias = false`).
+/// Load a bias-less Qwen3 projection from its `{base}.weight` `key`, auto-detecting a pre-quantized
+/// packed snapshot (see [`crate::quant::lin`]). Every Qwen3 projection is a bias-less Linear
+/// (`attention_bias = false`).
 pub(crate) fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
-    Ok(AdaptableLinear::dense(w.require(key)?.clone(), None))
+    let base = key.strip_suffix(".weight").unwrap_or(key);
+    crate::quant::lin(w, base, false)
 }
 
 /// Join a module prefix with a leaf name, tolerating an empty prefix.

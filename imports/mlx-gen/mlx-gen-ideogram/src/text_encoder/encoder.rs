@@ -43,9 +43,7 @@ impl Ideogram4TextEncoder {
             )?);
         }
         Ok(Self {
-            embed_tokens: TokenEmbedding::Dense(
-                w.require(&join(prefix, "embed_tokens.weight"))?.clone(),
-            ),
+            embed_tokens: crate::quant::embedding(w, &join(prefix, "embed_tokens"))?,
             layers,
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             out_layers: EXTRACTED_LAYERS.to_vec(),
