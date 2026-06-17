@@ -19,11 +19,14 @@
 //! `mac_only = false`.
 
 pub mod config;
+pub mod edit_provider;
 pub mod pipeline;
 pub mod pos_embed;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
+
+pub use edit_provider::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -54,16 +57,17 @@ struct Components {
     vae: Arc<Flux2Vae>,
 }
 
-/// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype.
-struct Pipeline {
-    cfg: Flux2Config,
-    root: PathBuf,
-    device: Device,
-    dtype: DType,
+/// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype. `pub(crate)` so the
+/// edit provider ([`edit_provider`]) reuses the snapshot mmap + prompt-encode scaffolding.
+pub(crate) struct Pipeline {
+    pub(crate) cfg: Flux2Config,
+    pub(crate) root: PathBuf,
+    pub(crate) device: Device,
+    pub(crate) dtype: DType,
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device) -> Self {
+    pub(crate) fn load(root: &Path, device: &Device) -> Self {
         Self {
             cfg: Flux2Config::klein_9b(),
             root: root.to_path_buf(),
@@ -75,7 +79,7 @@ impl Pipeline {
     }
 
     /// mmap a VarBuilder over every `.safetensors` in the snapshot subdir `sub`.
-    fn component_vb(&self, sub: &str) -> CResult<VarBuilder<'static>> {
+    pub(crate) fn component_vb(&self, sub: &str) -> CResult<VarBuilder<'static>> {
         let dir = self.root.join(sub);
         if !dir.is_dir() {
             return Err(CandleError::Msg(format!(
@@ -113,7 +117,7 @@ impl Pipeline {
     }
 
     /// Tokenize + encode the prompt to `prompt_embeds` `[1, 512, 12288]` (f32).
-    fn encode(&self, te: &Qwen3TextEncoder, prompt: &str) -> CResult<Tensor> {
+    pub(crate) fn encode(&self, te: &Qwen3TextEncoder, prompt: &str) -> CResult<Tensor> {
         let tok = TextTokenizer::from_file(
             self.root.join("tokenizer/tokenizer.json"),
             TokenizerConfig {
@@ -205,7 +209,7 @@ impl Pipeline {
 }
 
 /// Map a decoded `[1, 3, H, W]` tensor in `[-1, 1]` to an RGB8 [`Image`].
-fn to_image(decoded: &Tensor) -> CResult<Image> {
+pub(crate) fn to_image(decoded: &Tensor) -> CResult<Image> {
     let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
