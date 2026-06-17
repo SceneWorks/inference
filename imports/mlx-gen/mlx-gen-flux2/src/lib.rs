@@ -19,6 +19,7 @@
 
 pub mod adapters;
 pub mod caption_upsample;
+pub mod chunk;
 pub mod config;
 pub mod convert;
 pub mod kv_cache;
@@ -37,6 +38,7 @@ pub use caption_upsample::{
     build_upsample_input_ids, expand_pixtral_image_tokens, upsample_prompt,
     SYSTEM_MESSAGE_UPSAMPLING_I2I, SYSTEM_MESSAGE_UPSAMPLING_T2I,
 };
+pub use chunk::{map_seq_chunks, MemoryConfig};
 pub use config::{
     Flux2Config, Flux2Quant, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_GUIDANCE_DEV, DEFAULT_HEIGHT,
     DEFAULT_STEPS, DEFAULT_STEPS_DEV, DEFAULT_WIDTH, FLUX2_DEV_CONTROL_ID, FLUX2_DEV_EDIT_ID,

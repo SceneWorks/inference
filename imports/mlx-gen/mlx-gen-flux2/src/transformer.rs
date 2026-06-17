@@ -23,6 +23,7 @@ use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
+use crate::chunk::{map_seq_chunks, MemoryConfig};
 use crate::config::{Flux2Config, Flux2Quant};
 use crate::kv_cache::{Flux2KvCache, Stream};
 use crate::pos_embed::Flux2PosEmbed;
@@ -352,6 +353,8 @@ impl DoubleBlock {
     }
 
     /// `img_mod` / `txt_mod`: `[(shift_msa,scale_msa,gate_msa),(shift_mlp,scale_mlp,gate_mlp)]`.
+    /// `ffn_chunk` (sc-6266) bounds the image FFN's SwiGLU intermediate over sequence row-blocks;
+    /// `None` ⇒ the whole sequence at once, byte-identical to the shipped path.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -362,6 +365,7 @@ impl DoubleBlock {
         cos: &Array,
         sin: &Array,
         cache: CacheSlot<'_>,
+        ffn_chunk: Option<usize>,
     ) -> Result<(Array, Array)> {
         let (shift_msa, scale_msa, gate_msa) = &img_mod[0];
         let (shift_mlp, scale_mlp, gate_mlp) = &img_mod[1];
@@ -380,7 +384,10 @@ impl DoubleBlock {
         txt = gated(&txt, c_gate_msa, &txt_attn)?;
 
         let norm_img2 = modulate(&layer_norm(&img, None, None, LN_EPS)?, scale_mlp, shift_mlp)?;
-        let img_ff = self.ff.forward(&norm_img2)?;
+        // sc-6266: chunk the (largest) image FFN intermediate over sequence row-blocks on the gated
+        // long-sequence multi-reference edit path. `ffn_chunk == None` ⇒ a single `ff.forward` call,
+        // byte-identical to the shipped forward.
+        let img_ff = map_seq_chunks(&norm_img2, ffn_chunk, |c| self.ff.forward(c))?;
         img = gated(&img, gate_mlp, &img_ff)?;
 
         let norm_txt2 = modulate(
@@ -736,6 +743,37 @@ impl Flux2Transformer {
             guidance,
             cache,
             None,
+            &MemoryConfig::OFF,
+        )
+    }
+
+    /// As [`forward_with_cache`](Self::forward_with_cache), with an explicit [`MemoryConfig`] that
+    /// bounds the per-step activation high-water (sc-6266). The generate loop passes
+    /// [`MemoryConfig::LONG_SEQ`] only on the gated long-sequence multi-reference edit path; every
+    /// other path uses [`MemoryConfig::OFF`] (this method with `OFF` is byte-identical to
+    /// [`forward_with_cache`](Self::forward_with_cache)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_mem(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        timestep: f32,
+        guidance: Option<f32>,
+        cache: Option<&Flux2KvCache>,
+        mem: &MemoryConfig,
+    ) -> Result<Array> {
+        self.forward_inner(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            cache,
+            None,
+            mem,
         )
     }
 
@@ -765,6 +803,7 @@ impl Flux2Transformer {
             guidance,
             None,
             Some(control),
+            &MemoryConfig::OFF,
         )
     }
 
@@ -783,6 +822,7 @@ impl Flux2Transformer {
         guidance: Option<f32>,
         cache: Option<&Flux2KvCache>,
         control: Option<(&Flux2ControlBranch, &Array, f32)>,
+        mem: &MemoryConfig,
     ) -> Result<Array> {
         let temb = self.temb(timestep, guidance)?;
         let mut img = self
@@ -835,6 +875,7 @@ impl Flux2Transformer {
                 &cos,
                 &sin,
                 cache.map(|c| (c, idx)),
+                mem.ffn_seq_chunk,
             )?;
             // Add the control hint into the base image stream (`img + hints[n]·scale`) at the mapped
             // base double blocks. `scale = 0` → `+0` → byte-identical to the base forward.
@@ -843,6 +884,11 @@ impl Flux2Transformer {
                     img = add(&img, &multiply(&hints[n], scalar(*scale))?)?;
                 }
             }
+            // sc-6266: cap the per-step lazy-graph peak at ~one block's transients (bit-exact). Gated
+            // off (`mem.eval_per_block == false`) for every shipped path → no extra evals there.
+            if mem.eval_per_block {
+                mlx_rs::transforms::eval([&img, &txt])?;
+            }
         }
 
         let txt_seq = txt.shape()[1];
@@ -850,6 +896,10 @@ impl Flux2Transformer {
         let ms = self.mod_single.forward(&temb)?;
         for (idx, block) in self.single_blocks.iter().enumerate() {
             hidden = block.forward(&hidden, &ms[0], &cos, &sin, cache.map(|c| (c, idx)))?;
+            // sc-6266: per-block eval-to-free (bit-exact), gated off for shipped paths.
+            if mem.eval_per_block {
+                mlx_rs::transforms::eval([&hidden])?;
+            }
         }
 
         // Keep only the image tokens.
@@ -1035,7 +1085,7 @@ impl Flux2ControlBranch {
             }
             let (new_txt, new_c) = block
                 .base
-                .forward(c, txt, img_mod, txt_mod, cos, sin, None)?;
+                .forward(c, txt, img_mod, txt_mod, cos, sin, None, None)?;
             hints.push(block.after_proj.forward(&new_c)?);
             c = new_c;
             txt = new_txt;
