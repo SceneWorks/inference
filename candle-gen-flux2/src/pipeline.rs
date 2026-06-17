@@ -44,6 +44,14 @@ pub fn create_noise(
     packed.contiguous()?.to_device(device)
 }
 
+/// Pack a spatial latent `[1, C, h, w]` (NCHW) into the transformer token sequence `[1, h·w, C]` —
+/// the same `reshape → transpose` fold [`create_noise`] applies inline, exposed for the edit path's
+/// VAE-encoded reference latents.
+pub fn pack_nchw(x: &Tensor) -> Result<Tensor> {
+    let (b, c, h, w) = x.dims4()?;
+    x.reshape((b, c, h * w))?.transpose(1, 2)?.contiguous()
+}
+
 /// Unpack packed latents `[1, seq, C]` back to `[1, C, lat_h, lat_w]` (NCHW) for the VAE.
 pub fn unpack_latents(packed: &Tensor, width: u32, height: u32) -> Result<Tensor> {
     let (lat_h, lat_w) = latent_dims(width, height);
@@ -54,16 +62,24 @@ pub fn unpack_latents(packed: &Tensor, width: u32, height: u32) -> Result<Tensor
         .contiguous()
 }
 
-/// Image position ids `[t, h, w, layer]`, row-major over the `(lat_h, lat_w)` grid. txt2img uses
-/// `t = 0` and `layer = 0`. Returned host-side (the RoPE table is built from these).
-pub fn prepare_grid_ids(lat_h: usize, lat_w: usize) -> Vec<[i64; 4]> {
+/// Image position ids `[t, h, w, layer]`, row-major over the `(lat_h, lat_w)` grid at temporal
+/// coordinate `t_coord` (`layer = 0`). The edit path offsets each reference at `t = 10 + 10·i` so the
+/// RoPE separates the reference tokens from the `t = 0` target grid. Returned host-side (the RoPE
+/// table is built from these).
+pub fn prepare_grid_ids_t(lat_h: usize, lat_w: usize, t_coord: i64) -> Vec<[i64; 4]> {
     let mut ids = Vec::with_capacity(lat_h * lat_w);
     for h in 0..lat_h {
         for w in 0..lat_w {
-            ids.push([0, h as i64, w as i64, 0]);
+            ids.push([t_coord, h as i64, w as i64, 0]);
         }
     }
     ids
+}
+
+/// Image position ids `[t, h, w, layer]`, row-major over the `(lat_h, lat_w)` grid. txt2img uses
+/// `t = 0` and `layer = 0`. Returned host-side (the RoPE table is built from these).
+pub fn prepare_grid_ids(lat_h: usize, lat_w: usize) -> Vec<[i64; 4]> {
+    prepare_grid_ids_t(lat_h, lat_w, 0)
 }
 
 /// Text position ids `[0, 0, 0, token_index]` for a `seq`-length prompt.
@@ -152,6 +168,33 @@ mod tests {
         assert_eq!(ids[1], [0, 0, 1, 0]);
         assert_eq!(ids[3], [0, 1, 0, 0]);
         assert_eq!(ids[5], [0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn grid_ids_t_offsets_the_temporal_axis() {
+        // The edit path tags reference grids at t = 10 + 10·i; the t=0 wrapper is unchanged.
+        let ids = prepare_grid_ids_t(2, 2, 10);
+        assert_eq!(ids.len(), 4);
+        assert_eq!(ids[0], [10, 0, 0, 0]);
+        assert_eq!(ids[1], [10, 0, 1, 0]);
+        assert_eq!(ids[2], [10, 1, 0, 0]);
+        assert_eq!(ids[3], [10, 1, 1, 0]);
+        assert_eq!(prepare_grid_ids(2, 2), prepare_grid_ids_t(2, 2, 0));
+    }
+
+    #[test]
+    fn pack_nchw_folds_spatial_into_sequence() {
+        // [1, C=2, h=2, w=2] -> [1, h·w=4, C=2]: token s (row-major over h,w) carries both channels.
+        let data: Vec<f32> = vec![
+            0., 1., 2., 3., // channel 0 over the 2×2 grid
+            10., 11., 12., 13., // channel 1
+        ];
+        let x = Tensor::from_vec(data, (1, 2, 2, 2), &Device::Cpu).unwrap();
+        let packed = pack_nchw(&x).unwrap();
+        assert_eq!(packed.dims(), &[1, 4, 2]);
+        let v = packed.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // token0 = [c0@(0,0), c1@(0,0)] = [0,10]; then [1,11], [2,12], [3,13].
+        assert_eq!(v, vec![0., 10., 1., 11., 2., 12., 3., 13.]);
     }
 
     #[test]
