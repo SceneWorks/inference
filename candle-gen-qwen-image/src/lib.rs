@@ -25,9 +25,10 @@ pub mod config;
 // `qwen_image` descriptor stays txt2img-only).
 pub mod control;
 // Qwen-Image-Edit (img2img / reference) — the candle edit lane (sc-5487, epic 5480). The Qwen2.5-VL
-// vision tower + image processor + VL splice that turn a reference image + edit prompt into vision-
-// conditioned prompt embeds. Slice A: the conditioning encoder; the dual-latent edit provider rides
-// on top (Slice B).
+// vision tower + image processor + VL splice turn a reference image + edit prompt into vision-
+// conditioned prompt embeds (Slice A); the dual-latent `QwenEdit` provider (Slice B) VAE-encodes each
+// reference, concatenates it after the noise, and denoises with the reference grids in the RoPE.
+pub mod edit;
 pub mod image_processor;
 pub mod pipeline;
 pub mod rope;
@@ -39,6 +40,7 @@ pub mod vision_language;
 pub mod vl_tokenizer;
 
 pub use control::{QwenControl, QwenControlPaths, QwenControlRequest, DEFAULT_CONTROL_SCALE};
+pub use edit::{QwenEdit, QwenEditPaths, QwenEditRequest};
 pub use vision_language::{load_vision_language_encoder, QwenVisionLanguageEncoder};
 
 /// Qwen-Image ControlNet (strict-pose) real-weight GPU validation (sc-5489) — env-driven, `#[ignore]`d.
@@ -48,6 +50,10 @@ mod control_validate;
 /// Qwen-Image-Edit vision-language encoder real-weight GPU validation (sc-5487) — env-driven, `#[ignore]`d.
 #[cfg(test)]
 mod vision_validate;
+
+/// Qwen-Image-Edit full provider real-weight GPU validation (sc-5487) — env-driven, `#[ignore]`d.
+#[cfg(test)]
+mod edit_validate;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
