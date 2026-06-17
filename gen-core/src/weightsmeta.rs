@@ -352,7 +352,20 @@ pub fn split_factor_key<'a>(key: &'a str, suffixes: &[&str]) -> Option<(&'a str,
 /// where `stem` is the diffusers path with dots flattened to underscores and `PREFIX` varies by
 /// trainer (`lora_unet`, `lycoris`, …). Matched prefix-agnostically: `stem` (a `flattened → dotted`
 /// table entry) must equal `raw` or be an `_`-delimited suffix of it; the longest such stem wins.
+/// An **original-SD / A1111** key (`…_input_blocks_*` / `middle_block` / `output_blocks`) is retried
+/// after translating the block marker onward to diffusers naming (sc-6051).
 pub fn resolve_lokr_path<'a>(raw: &str, table: &'a BTreeMap<String, String>) -> Option<&'a str> {
+    if let Some(dotted) = match_stem_suffix(raw, table) {
+        return Some(dotted);
+    }
+    let translated = translate_original_sd_marker(raw)?;
+    match_stem_suffix(&translated, table)
+}
+
+/// The longest `_`-delimited `table` stem that is a suffix of (or equal to) `raw`, mapped to its
+/// dotted path. The matching half of [`resolve_lokr_path`], split out so the original-SD retry can
+/// reuse it on a translated key.
+fn match_stem_suffix<'a>(raw: &str, table: &'a BTreeMap<String, String>) -> Option<&'a str> {
     let mut best: Option<(&str, usize)> = None;
     for (stem, dotted) in table {
         let is_match = raw == stem
@@ -377,6 +390,126 @@ pub fn kohya_table(paths: &[String]) -> BTreeMap<String, String> {
         .iter()
         .map(|p| (p.replace('.', "_"), p.clone()))
         .collect()
+}
+
+/// SDXL **original-SD / A1111 → diffusers** UNet block-prefix map (flattened, `.`→`_`). kohya LoRAs
+/// trained against the LDM/original-SD SDXL UNet name modules `lora_unet_input_blocks_*` /
+/// `middle_block_*` / `output_blocks_*`, while diffusers (`pipe.save_lora_weights()`) names the *same*
+/// modules `down_blocks_*` / `mid_block_*` / `up_blocks_*`. It is one network: the attention sub-path
+/// (`transformer_blocks_*`, `attn1/2_to_*`, `proj_in/out`, `ff_net_*`) is byte-identical, so only the
+/// block prefix (plus the resnet/sampler conv leaves — see [`SDXL_LEAF_MAP`]) differs. Entries follow
+/// the stock SDXL structure: down = (DownBlock2D, CrossAttnDownBlock2D×2), mid = resnet/attn/resnet,
+/// up = (CrossAttnUpBlock2D×2, UpBlock2D), 2 layers/block. The subset of diffusers'
+/// `convert_ldm_unet_checkpoint` map an SDXL UNet actually exercises.
+const SDXL_ORIGINAL_TO_DIFFUSERS_BLOCK: [(&str, &str); 35] = [
+    // input_blocks (down path); input_blocks.0.0 is conv_in.
+    ("input_blocks_0_0", "conv_in"),
+    ("input_blocks_1_0", "down_blocks_0_resnets_0"),
+    ("input_blocks_2_0", "down_blocks_0_resnets_1"),
+    ("input_blocks_3_0", "down_blocks_0_downsamplers_0"),
+    ("input_blocks_4_0", "down_blocks_1_resnets_0"),
+    ("input_blocks_4_1", "down_blocks_1_attentions_0"),
+    ("input_blocks_5_0", "down_blocks_1_resnets_1"),
+    ("input_blocks_5_1", "down_blocks_1_attentions_1"),
+    ("input_blocks_6_0", "down_blocks_1_downsamplers_0"),
+    ("input_blocks_7_0", "down_blocks_2_resnets_0"),
+    ("input_blocks_7_1", "down_blocks_2_attentions_0"),
+    ("input_blocks_8_0", "down_blocks_2_resnets_1"),
+    ("input_blocks_8_1", "down_blocks_2_attentions_1"),
+    // middle_block (mid path).
+    ("middle_block_0", "mid_block_resnets_0"),
+    ("middle_block_1", "mid_block_attentions_0"),
+    ("middle_block_2", "mid_block_resnets_1"),
+    // output_blocks (up path); the upsample conv is the last sub-module of each attention up block.
+    ("output_blocks_0_0", "up_blocks_0_resnets_0"),
+    ("output_blocks_0_1", "up_blocks_0_attentions_0"),
+    ("output_blocks_1_0", "up_blocks_0_resnets_1"),
+    ("output_blocks_1_1", "up_blocks_0_attentions_1"),
+    ("output_blocks_2_0", "up_blocks_0_resnets_2"),
+    ("output_blocks_2_1", "up_blocks_0_attentions_2"),
+    ("output_blocks_2_2", "up_blocks_0_upsamplers_0"),
+    ("output_blocks_3_0", "up_blocks_1_resnets_0"),
+    ("output_blocks_3_1", "up_blocks_1_attentions_0"),
+    ("output_blocks_4_0", "up_blocks_1_resnets_1"),
+    ("output_blocks_4_1", "up_blocks_1_attentions_1"),
+    ("output_blocks_5_0", "up_blocks_1_resnets_2"),
+    ("output_blocks_5_1", "up_blocks_1_attentions_2"),
+    ("output_blocks_5_2", "up_blocks_1_upsamplers_0"),
+    ("output_blocks_6_0", "up_blocks_2_resnets_0"),
+    ("output_blocks_7_0", "up_blocks_2_resnets_1"),
+    ("output_blocks_8_0", "up_blocks_2_resnets_2"),
+    // final out.0/out.2 (group-norm / conv_out).
+    ("out_0", "conv_norm_out"),
+    ("out_2", "conv_out"),
+];
+
+/// SDXL resnet / sampler leaf-name remap (original-SD → diffusers), applied *after* the block prefix
+/// (see [`SDXL_ORIGINAL_TO_DIFFUSERS_BLOCK`]). A ResBlock's `in_layers.2` / `emb_layers.1` /
+/// `out_layers.3` / `skip_connection` are diffusers' `conv1` / `time_emb_proj` / `conv2` /
+/// `conv_shortcut`; a Downsample's `op` conv is diffusers' `conv`. The norm leaves (`in_layers.0` /
+/// `out_layers.0`) are not LoRA targets but remap for completeness. None of these substrings occur in
+/// the attention sub-path, so a plain substring replace on the post-prefix stem is unambiguous.
+const SDXL_LEAF_MAP: [(&str, &str); 7] = [
+    ("_in_layers_0", "_norm1"),
+    ("_in_layers_2", "_conv1"),
+    ("_emb_layers_1", "_time_emb_proj"),
+    ("_out_layers_0", "_norm2"),
+    ("_out_layers_3", "_conv2"),
+    ("_skip_connection", "_conv_shortcut"),
+    ("_downsamplers_0_op", "_downsamplers_0_conv"),
+];
+
+/// Translate a flattened **original-SD / A1111** SDXL UNet stem (the kohya `lora_unet_` prefix already
+/// stripped) to its **diffusers-block** equivalent, or `None` if `stem` is not original-SD naming
+/// (already diffusers, a text-encoder key, or unknown). Block prefix via
+/// [`SDXL_ORIGINAL_TO_DIFFUSERS_BLOCK`] (longest match — `input_blocks_4_1` over any shorter prefix),
+/// then the resnet/sampler leaf remap ([`SDXL_LEAF_MAP`]). The attention sub-path is carried through
+/// unchanged (identical in both layouts), so the result resolves against the same diffusers
+/// `flattened → dotted` table the diffusers-named LoRAs use (sc-6051).
+pub fn original_sd_to_diffusers_stem(stem: &str) -> Option<String> {
+    // The map keys are disjoint `_`-delimited block paths, so at most one matches at the boundary;
+    // `max_by_key` is defensive (longest wins) — e.g. `out_2` never matches an `output_blocks_*` stem.
+    let (orig, diff) = SDXL_ORIGINAL_TO_DIFFUSERS_BLOCK
+        .iter()
+        .filter(|(orig, _)| {
+            stem == *orig
+                || stem
+                    .strip_prefix(orig)
+                    .is_some_and(|rest| rest.starts_with('_'))
+        })
+        .max_by_key(|(orig, _)| orig.len())?;
+    let mut out = format!("{diff}{}", &stem[orig.len()..]);
+    for (from, to) in SDXL_LEAF_MAP {
+        if out.contains(from) {
+            out = out.replace(from, to);
+        }
+    }
+    Some(out)
+}
+
+/// Resolve a flattened kohya stem (`lora_unet_` prefix already stripped) to a host dotted path: a
+/// direct `table` hit, else translate an **original-SD / A1111** stem to diffusers naming
+/// ([`original_sd_to_diffusers_stem`]) and retry. Returns the owned dotted path. This is what lets a
+/// civitai/A1111 SDXL LoRA (`lora_unet_input_blocks_*`) merge onto the same UNet as a diffusers-named
+/// one (sc-6051).
+pub fn resolve_kohya_stem(stem: &str, table: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(dotted) = table.get(stem) {
+        return Some(dotted.clone());
+    }
+    let diffusers = original_sd_to_diffusers_stem(stem)?;
+    table.get(&diffusers).cloned()
+}
+
+/// If `raw` (a third-party flattened key with an arbitrary trainer prefix) contains an original-SD
+/// SDXL block marker, return `raw` with the marker-onward substring translated to diffusers naming.
+fn translate_original_sd_marker(raw: &str) -> Option<String> {
+    for marker in ["input_blocks_", "middle_block_", "output_blocks_"] {
+        if let Some(idx) = raw.find(marker) {
+            let translated = original_sd_to_diffusers_stem(&raw[idx..])?;
+            return Some(format!("{}{translated}", &raw[..idx]));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -509,6 +642,116 @@ mod tests {
         );
         assert_eq!(resolve_lokr_path("lycoris_attn", &table), Some("attn"));
         assert_eq!(resolve_lokr_path("lora_unet_unknown", &table), None);
+    }
+
+    /// sc-6051: an original-SD / A1111 SDXL stem translates to its diffusers-block equivalent. The
+    /// attention sub-path rides through unchanged; only the block prefix changes.
+    #[test]
+    fn original_sd_stem_translates_attention_blocks() {
+        // input_blocks.4.1 → down_blocks.1.attentions.0 (the canonical InstantID/civitai case).
+        assert_eq!(
+            original_sd_to_diffusers_stem("input_blocks_4_1_transformer_blocks_0_attn1_to_q")
+                .as_deref(),
+            Some("down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_q")
+        );
+        // middle_block.1 → mid_block.attentions.0; output_blocks.5.1 → up_blocks.1.attentions.2.
+        assert_eq!(
+            original_sd_to_diffusers_stem("middle_block_1_proj_in").as_deref(),
+            Some("mid_block_attentions_0_proj_in")
+        );
+        assert_eq!(
+            original_sd_to_diffusers_stem("output_blocks_5_1_transformer_blocks_0_ff_net_0_proj")
+                .as_deref(),
+            Some("up_blocks_1_attentions_2_transformer_blocks_0_ff_net_0_proj")
+        );
+        // to_out.0 flattening (`to_out_0`) survives the prefix swap intact.
+        assert_eq!(
+            original_sd_to_diffusers_stem("output_blocks_2_1_transformer_blocks_0_attn2_to_out_0")
+                .as_deref(),
+            Some("up_blocks_0_attentions_2_transformer_blocks_0_attn2_to_out_0")
+        );
+        // An already-diffusers stem (or a text-encoder / unknown key) is not translated.
+        assert!(original_sd_to_diffusers_stem(
+            "down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_q"
+        )
+        .is_none());
+        assert!(
+            original_sd_to_diffusers_stem("text_model_encoder_layers_0_self_attn_q_proj").is_none()
+        );
+    }
+
+    /// sc-6051: the resnet / sampler leaf remap (the convs an A1111 LoRA may also train), applied
+    /// after the block prefix.
+    #[test]
+    fn original_sd_stem_translates_resnet_and_sampler_leaves() {
+        // ResBlock conv1/time_emb_proj/conv2/conv_shortcut.
+        assert_eq!(
+            original_sd_to_diffusers_stem("input_blocks_4_0_in_layers_2").as_deref(),
+            Some("down_blocks_1_resnets_0_conv1")
+        );
+        assert_eq!(
+            original_sd_to_diffusers_stem("input_blocks_4_0_emb_layers_1").as_deref(),
+            Some("down_blocks_1_resnets_0_time_emb_proj")
+        );
+        assert_eq!(
+            original_sd_to_diffusers_stem("output_blocks_0_0_out_layers_3").as_deref(),
+            Some("up_blocks_0_resnets_0_conv2")
+        );
+        assert_eq!(
+            original_sd_to_diffusers_stem("input_blocks_4_0_skip_connection").as_deref(),
+            Some("down_blocks_1_resnets_0_conv_shortcut")
+        );
+        // Downsample `op` conv → diffusers `conv`; Upsample conv already matches.
+        assert_eq!(
+            original_sd_to_diffusers_stem("input_blocks_3_0_op").as_deref(),
+            Some("down_blocks_0_downsamplers_0_conv")
+        );
+        assert_eq!(
+            original_sd_to_diffusers_stem("output_blocks_2_2_conv").as_deref(),
+            Some("up_blocks_0_upsamplers_0_conv")
+        );
+        // Top-level conv_in / conv_out.
+        assert_eq!(
+            original_sd_to_diffusers_stem("input_blocks_0_0").as_deref(),
+            Some("conv_in")
+        );
+        assert_eq!(
+            original_sd_to_diffusers_stem("out_2").as_deref(),
+            Some("conv_out")
+        );
+    }
+
+    /// sc-6051: `resolve_kohya_stem` hits the table directly for a diffusers stem, and via translation
+    /// for an original-SD one — both landing on the same dotted path. `resolve_lokr_path` likewise
+    /// resolves an original-SD-named third-party key.
+    #[test]
+    fn resolve_kohya_and_lokr_accept_original_sd_naming() {
+        let dotted = "down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q";
+        let table = kohya_table(&[dotted.to_string()]);
+        // diffusers stem → direct hit.
+        assert_eq!(
+            resolve_kohya_stem(
+                "down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_q",
+                &table
+            )
+            .as_deref(),
+            Some(dotted)
+        );
+        // original-SD stem → translated hit on the SAME dotted path.
+        assert_eq!(
+            resolve_kohya_stem("input_blocks_4_1_transformer_blocks_0_attn1_to_q", &table)
+                .as_deref(),
+            Some(dotted)
+        );
+        assert!(resolve_kohya_stem("lora_te1_unknown", &table).is_none());
+        // third-party LoKr/LoHa path: a prefixed original-SD key resolves through resolve_lokr_path.
+        assert_eq!(
+            resolve_lokr_path(
+                "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q",
+                &table
+            ),
+            Some(dotted)
+        );
     }
 
     #[test]
