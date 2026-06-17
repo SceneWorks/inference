@@ -42,22 +42,27 @@ fn dir_size_gb(p: &Path) -> f64 {
 }
 
 #[test]
-#[ignore = "needs the bf16 snapshot (~53 GB) + writes ~14 GB"]
-fn prequantize_q4_loads_and_generates() {
+#[ignore = "needs the bf16 snapshot (~53 GB) + writes the packed snapshot"]
+fn prequantize_loads_and_generates() {
     let src = env_dir("IDEOGRAM4_MLX", ".cache/ideogram4-mlx-convert");
-    let dst = env_dir("IDEOGRAM4_Q4", ".cache/ideogram4-mlx-q4");
+    // `IDEOGRAM4_BITS` (4 = Q4 default, 8 = Q8); dst defaults to `~/.cache/ideogram4-mlx-q{bits}`.
+    let bits: i32 = std::env::var("IDEOGRAM4_BITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let dst = env_dir("IDEOGRAM4_QDIR", &format!(".cache/ideogram4-mlx-q{bits}"));
 
-    // 1. Convert bf16 → packed Q4 (idempotent: skip if the packed transformer is already present).
+    // 1. Convert bf16 → packed Q{bits} (idempotent: skip if the packed transformer is already there).
     if !dst.join("transformer/model.safetensors").exists() {
         println!(
-            "converting {} → packed Q4 at {} …",
+            "converting {} → packed Q{bits} at {} …",
             src.display(),
             dst.display()
         );
-        convert::prequantize_turnkey(&src, &dst, 4).expect("prequantize_turnkey");
+        convert::prequantize_turnkey(&src, &dst, bits).expect("prequantize_turnkey");
     }
     println!(
-        "Q4 turnkey: {:.2} GB on disk (vs ~53 GB bf16 source) at {}",
+        "Q{bits} turnkey: {:.2} GB on disk (vs ~50 GB bf16 source) at {}",
         dir_size_gb(&dst),
         dst.display()
     );
@@ -89,9 +94,9 @@ fn prequantize_q4_loads_and_generates() {
     };
     let out = g
         .generate(&req, &mut |_| {})
-        .expect("generate from packed Q4");
+        .expect("generate from packed snapshot");
     let peak = get_peak_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-    println!("packed Q4 generate @{res}²/{steps}step: peak {peak:.2} GB");
+    println!("packed Q{bits} generate @{res}²/{steps}step: peak {peak:.2} GB");
 
     let imgs = match out {
         GenerationOutput::Images(v) => v,
@@ -105,10 +110,10 @@ fn prequantize_q4_loads_and_generates() {
     );
     assert!(
         mx > mn,
-        "degenerate image — packed Q4 load broke the forward"
+        "degenerate image — packed Q{bits} load broke the forward"
     );
 
-    let out_path = std::env::temp_dir().join("ideogram4_q4_turnkey.png");
+    let out_path = std::env::temp_dir().join(format!("ideogram4_q{bits}_turnkey.png"));
     image::RgbImage::from_raw(res, res, im.pixels.clone())
         .unwrap()
         .save(&out_path)
