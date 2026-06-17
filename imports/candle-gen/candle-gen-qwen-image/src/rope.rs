@@ -42,47 +42,65 @@ impl QwenRope {
         all
     }
 
-    /// Image-token `(cos, sin)` `[lat_h·lat_w, 64]` (row-major over the grid).
+    /// Image-token `(cos, sin)` `[lat_h·lat_w, 64]` (row-major over the grid). The single-grid (T2I)
+    /// case of [`img_cos_sin_multi`](Self::img_cos_sin_multi) — grid index 0 → frame position 0.
     pub fn img_cos_sin(
         &self,
         lat_h: usize,
         lat_w: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
+        self.img_cos_sin_multi(&[(lat_h, lat_w)], device)
+    }
+
+    /// Image-token `(cos, sin)` over one-or-more grids (the Qwen-Image-Edit dual-latent path): the
+    /// noise grid (index 0) followed by each reference grid (index 1, 2, …) in sequence order. The
+    /// grid **index** drives the frame-axis position (so a reference's frame freqs differ from the
+    /// noise's), while height/width stay per-grid **centered**. Concatenated `[Σ h_i·w_i, 64]`.
+    pub fn img_cos_sin_multi(
+        &self,
+        grids: &[(usize, usize)],
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
         let omega = self.omega();
         let (n_f, n_h) = (self.axes_dim[0] / 2, self.axes_dim[1] / 2); // 8, 28
-        let h_center = (lat_h - lat_h / 2) as i64;
-        let w_center = (lat_w - lat_w / 2) as i64;
-        let seq = lat_h * lat_w;
-        let mut cos = vec![0f32; seq * self.half];
-        let mut sin = vec![0f32; seq * self.half];
-        for h in 0..lat_h {
-            for w in 0..lat_w {
-                let row = h * lat_w + w;
-                let hp = h as i64 - h_center;
-                let wp = w as i64 - w_center;
-                for (j, &om) in omega.iter().enumerate() {
-                    // axis position by frequency band: frame [0,8) → 0, height [8,36) → hp, width [36,64) → wp.
-                    let pos = if j < n_f {
-                        0i64
-                    } else if j < n_f + n_h {
-                        hp
-                    } else {
-                        wp
-                    } as f32;
-                    let a = pos * om;
-                    cos[row * self.half + j] = a.cos();
-                    sin[row * self.half + j] = a.sin();
+        let total: usize = grids.iter().map(|(h, w)| h * w).sum();
+        let mut cos = vec![0f32; total * self.half];
+        let mut sin = vec![0f32; total * self.half];
+        let mut off = 0usize;
+        for (idx, &(lat_h, lat_w)) in grids.iter().enumerate() {
+            let h_center = (lat_h - lat_h / 2) as i64;
+            let w_center = (lat_w - lat_w / 2) as i64;
+            for h in 0..lat_h {
+                for w in 0..lat_w {
+                    let row = off + h * lat_w + w;
+                    let hp = h as i64 - h_center;
+                    let wp = w as i64 - w_center;
+                    for (j, &om) in omega.iter().enumerate() {
+                        // frame band → grid index, height band → hp, width band → wp.
+                        let pos = if j < n_f {
+                            idx as i64
+                        } else if j < n_f + n_h {
+                            hp
+                        } else {
+                            wp
+                        } as f32;
+                        let a = pos * om;
+                        cos[row * self.half + j] = a.cos();
+                        sin[row * self.half + j] = a.sin();
+                    }
                 }
             }
+            off += lat_h * lat_w;
         }
         Ok((
-            Tensor::from_vec(cos, (seq, self.half), device)?,
-            Tensor::from_vec(sin, (seq, self.half), device)?,
+            Tensor::from_vec(cos, (total, self.half), device)?,
+            Tensor::from_vec(sin, (total, self.half), device)?,
         ))
     }
 
-    /// Text-token `(cos, sin)` `[txt_seq, 64]`: scalar position `txt_base + t` across all freqs.
+    /// Text-token `(cos, sin)` `[txt_seq, 64]`: scalar position `txt_base + t` across all freqs. The
+    /// single-grid case of [`txt_cos_sin_multi`](Self::txt_cos_sin_multi).
     pub fn txt_cos_sin(
         &self,
         txt_seq: usize,
@@ -90,8 +108,23 @@ impl QwenRope {
         lat_w: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
+        self.txt_cos_sin_multi(txt_seq, &[(lat_h, lat_w)], device)
+    }
+
+    /// Text-token `(cos, sin)` for the dual-latent path: `txt_base = max_i(max(h_i/2, w_i/2))` over
+    /// every grid, then position `txt_base + t` across all freqs.
+    pub fn txt_cos_sin_multi(
+        &self,
+        txt_seq: usize,
+        grids: &[(usize, usize)],
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
         let omega = self.omega();
-        let txt_base = (lat_h / 2).max(lat_w / 2) as i64;
+        let txt_base = grids
+            .iter()
+            .map(|(h, w)| (h / 2).max(w / 2))
+            .max()
+            .unwrap_or(0) as i64;
         let mut cos = vec![0f32; txt_seq * self.half];
         let mut sin = vec![0f32; txt_seq * self.half];
         for t in 0..txt_seq {
