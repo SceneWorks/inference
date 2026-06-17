@@ -26,6 +26,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
 
 use crate::caption_upsample;
+use crate::chunk::MemoryConfig;
 use crate::config::Flux2Variant;
 use crate::kv_cache::{CacheMode, Flux2KvCache};
 use crate::pipeline::{
@@ -37,6 +38,13 @@ use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
 use crate::vision::{Mistral3Projector, PixtralVisionTower};
 use crate::{loader, Flux2Config};
+
+/// Joint DiT sequence length (txt + target + reference tokens) above which the gated activation
+/// levers (sc-6266) engage. Sits between a single-reference 1024² edit (~8.7K tokens, fits the 96 GB
+/// budget) and a 2-reference one (~12.8K tokens, ~104 GB un-bounded, sc-6124) so only the over-budget
+/// multi-reference / high-resolution edits take the bounded-memory path; every shipped path (T2I,
+/// single-reference edit, strict pose, LoRA) stays on the byte-identical [`MemoryConfig::OFF`].
+const LONG_SEQ_TOKEN_THRESHOLD: usize = 10_000;
 
 pub fn descriptor_klein_9b() -> ModelDescriptor {
     Flux2Variant::Klein9b.descriptor()
@@ -591,6 +599,25 @@ impl Flux2 {
             _ => None,
         };
 
+        // sc-6266: a multi-reference edit concatenates each reference's latent tokens onto the joint
+        // `[txt, target, ref…]` DiT sequence, making the denoise activation-bound — a 2-reference
+        // 1024² edit peaks ~104 GB, over the 96 GB budget (sc-6124). Above the single-reference
+        // ceiling, bound the per-step activation high-water with `eval_per_block` (bit-exact, so the
+        // edit's pixels are unchanged). Shorter sequences (T2I, single-reference edit, pose) stay on
+        // `MemoryConfig::OFF` → the shipped forward is byte-identical. Env-overridable (the doc on
+        // `MemoryConfig::from_env`) so a deployment can tune chunking without a recompile.
+        let total_seq = prompt_embeds.shape()[1] as usize
+            + lat_h * lat_w
+            + reference
+                .as_ref()
+                .map(|(r, _)| r.shape()[1] as usize)
+                .unwrap_or(0);
+        let mem = MemoryConfig::from_env(if total_seq > LONG_SEQ_TOKEN_THRESHOLD {
+            MemoryConfig::LONG_SEQ
+        } else {
+            MemoryConfig::OFF
+        });
+
         // For an edit, the transformer's image input/ids are `[target, ref]` (or `[target]` only on
         // a cached KV step); its output keeps the image stream, of which we take the leading
         // `target_seq` tokens. txt2img has no ref, so the concat + slice are no-ops.
@@ -611,7 +638,7 @@ impl Flux2 {
                 ),
                 _ => (latents.clone(), latent_ids.clone()),
             };
-            let out = transformer.forward_with_cache(
+            let out = transformer.forward_with_mem(
                 &hidden,
                 embeds,
                 &img_ids,
@@ -619,6 +646,7 @@ impl Flux2 {
                 ts,
                 embedded_guidance,
                 cache,
+                &mem,
             )?;
             let idx = Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
             Ok(out.take_axis(&idx, 1)?)
