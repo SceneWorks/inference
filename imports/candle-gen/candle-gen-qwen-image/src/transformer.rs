@@ -48,6 +48,35 @@ fn modulate(x: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor)> {
     Ok((out, gate))
 }
 
+/// `modulate` with optional per-token timestep selection (`zero_cond_t`, Qwen-Image-Edit-2511). With
+/// `index = None` this is exactly [`modulate`]. With `index = Some` the `m` chunk carries a doubled
+/// batch `[real_t ; zero_t]` (`[2, 3·inner]`); each image token picks the real-`t` half where
+/// `index == 0` (noise) and the `t 0` half where `index == 1` (conditioning) — the diffusers
+/// `_modulate(index)`. Blended via `real + (zero − real)·index` (bit-equivalent for a 0/1 index).
+fn modulate_sel(x: &Tensor, m: &Tensor, index: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+    let Some(index) = index else {
+        return modulate(x, m);
+    };
+    let inner = m.dim(D::Minus1)? / 3;
+    let blend = index.unsqueeze(2)?.to_dtype(m.dtype())?; // [1, seq, 1]
+    let pick = |slot: usize| -> Result<Tensor> {
+        let real = m
+            .narrow(0, 0, 1)?
+            .narrow(D::Minus1, slot * inner, inner)?
+            .unsqueeze(1)?; // [1,1,inner]
+        let zero = m
+            .narrow(0, 1, 1)?
+            .narrow(D::Minus1, slot * inner, inner)?
+            .unsqueeze(1)?; // [1,1,inner]
+        real.broadcast_add(&zero.broadcast_sub(&real)?.broadcast_mul(&blend)?) // [1, seq, inner]
+    };
+    let shift = pick(0)?;
+    let scale = pick(1)?;
+    let gate = pick(2)?;
+    let out = x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(&shift)?;
+    Ok((out, gate))
+}
+
 /// `x + gate·y`.
 fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
     x + y.broadcast_mul(gate)?
@@ -250,22 +279,30 @@ impl Block {
         img_sin: &Tensor,
         txt_cos: &Tensor,
         txt_sin: &Tensor,
+        // `Some` only on the Qwen-Image-Edit-2511 `zero_cond_t` path: then `temb` is the doubled
+        // `[real_t ; zero_t]` and the image stream selects modulation per token (0 = noise, 1 = cond).
+        modulate_index: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        let act = temb.silu()?;
-        let img_mod = self.img_mod.forward(&act)?;
-        let txt_mod = self.txt_mod.forward(&act)?;
-        let inner = img_mod.dim(D::Minus1)? / 2;
+        let act = temb.silu()?; // [1, inner] (or [2, inner] under zero_cond_t)
+        let img_mod = self.img_mod.forward(&act)?; // [1 or 2, 6·inner]
+                                                   // The text stream always uses the real-timestep modulation (row 0 under zero_cond_t).
+        let txt_act = match modulate_index {
+            Some(_) => act.narrow(0, 0, 1)?,
+            None => act.clone(),
+        };
+        let txt_mod = self.txt_mod.forward(&txt_act)?; // [1, 6·inner]
+        let half = img_mod.dim(D::Minus1)? / 2;
         let (im0, im1) = (
-            img_mod.narrow(D::Minus1, 0, inner)?,
-            img_mod.narrow(D::Minus1, inner, inner)?,
+            img_mod.narrow(D::Minus1, 0, half)?,
+            img_mod.narrow(D::Minus1, half, half)?,
         );
         let (tm0, tm1) = (
-            txt_mod.narrow(D::Minus1, 0, inner)?,
-            txt_mod.narrow(D::Minus1, inner, inner)?,
+            txt_mod.narrow(D::Minus1, 0, half)?,
+            txt_mod.narrow(D::Minus1, half, half)?,
         );
 
         // attention path
-        let (img_n, img_g1) = modulate(&layer_norm(hidden)?, &im0)?;
+        let (img_n, img_g1) = modulate_sel(&layer_norm(hidden)?, &im0, modulate_index)?;
         let (txt_n, txt_g1) = modulate(&layer_norm(encoder)?, &tm0)?;
         let (img_attn, txt_attn) = self
             .attn
@@ -274,7 +311,7 @@ impl Block {
         let encoder = gated(encoder, &txt_g1, &txt_attn)?;
 
         // feed-forward path
-        let (img_n2, img_g2) = modulate(&layer_norm(&hidden)?, &im1)?;
+        let (img_n2, img_g2) = modulate_sel(&layer_norm(&hidden)?, &im1, modulate_index)?;
         let hidden = gated(&hidden, &img_g2, &self.img_ff.forward(&img_n2)?)?;
         let (txt_n2, txt_g2) = modulate(&layer_norm(&encoder)?, &tm1)?;
         let encoder = gated(&encoder, &txt_g2, &self.txt_ff.forward(&txt_n2)?)?;
@@ -410,7 +447,7 @@ impl QwenTransformer {
 
         for (i, block) in self.blocks.iter().enumerate() {
             let (e, h) = block.forward(
-                &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin,
+                &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin, None,
             )?;
             encoder = e;
             // After each base block, add the pre-scaled control residual for this block's group:
@@ -427,6 +464,92 @@ impl QwenTransformer {
         let hidden = self.norm_out.forward(&hidden, &temb)?;
         self.proj_out.forward(&hidden)
     }
+
+    /// Qwen-Image-**Edit** dual-latent forward (sc-5487). `hidden_states` `[1, noise_seq + ref_seq, 64]`
+    /// is the noise latents concatenated with the packed reference latents (the caller concatenates and
+    /// slices back the noise prefix from the returned velocity); `cond_grids` lists each reference's
+    /// `(latent_h, latent_w)` so the 3-axis RoPE spans `[noise] + references` (the grid index drives the
+    /// frame axis). `zero_cond_t` (Edit-2511): double the timestep to `[t, 0]` and modulate the
+    /// conditioning tokens as clean (t = 0) via the per-token `modulate_index`; `false` (the original
+    /// Edit / 2509) runs a single timestep over the whole sequence. Returns the velocity over the
+    /// **full** sequence `[1, noise_seq + ref_seq, 64]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_edit(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        lat_h: usize,
+        lat_w: usize,
+        cond_grids: &[(usize, usize)],
+        zero_cond_t: bool,
+    ) -> Result<Tensor> {
+        let img_seq = hidden_states.dim(1)?;
+        let mut hidden = self.img_in.forward(hidden_states)?;
+        let encoder = self.txt_norm.forward(encoder_hidden_states)?;
+        let mut encoder = self.txt_in.forward(&encoder)?;
+        let txt_seq = encoder.dim(1)?;
+
+        // 3-axis RoPE over the noise grid then each reference grid.
+        let mut grids = Vec::with_capacity(1 + cond_grids.len());
+        grids.push((lat_h, lat_w));
+        grids.extend_from_slice(cond_grids);
+        let (img_cos, img_sin) = self.rope.img_cos_sin_multi(&grids, &self.device)?;
+        let (txt_cos, txt_sin) = self.rope.txt_cos_sin_multi(txt_seq, &grids, &self.device)?;
+
+        // zero_cond_t: double the temb to [real_t ; zero_t] and build the per-token select index.
+        let zc = zero_cond_t && !cond_grids.is_empty();
+        let temb_real = self
+            .time_embed
+            .forward(timestep, &self.device, self.dtype)?;
+        let (temb, modulate_index) = if zc {
+            let temb_zero = self.time_embed.forward(0.0, &self.device, self.dtype)?;
+            let temb2 = Tensor::cat(&[&temb_real, &temb_zero], 0)?;
+            let idx = build_modulate_index(lat_h * lat_w, cond_grids, img_seq, &self.device)?;
+            (temb2, Some(idx))
+        } else {
+            (temb_real.clone(), None)
+        };
+
+        for block in &self.blocks {
+            let (e, h) = block.forward(
+                &hidden,
+                &encoder,
+                &temb,
+                &img_cos,
+                &img_sin,
+                &txt_cos,
+                &txt_sin,
+                modulate_index.as_ref(),
+            )?;
+            encoder = e;
+            hidden = h;
+        }
+
+        // norm_out uses only the real-timestep embedding (the fork's temb[:B]).
+        let hidden = self.norm_out.forward(&hidden, &temb_real)?;
+        self.proj_out.forward(&hidden)
+    }
+}
+
+/// The per-token timestep selector for `zero_cond_t` (Qwen-Image-Edit-2511): `0` for the noise latent
+/// tokens (`latent_h·latent_w`), `1` for every conditioning-image token (`Σ h·w` over the reference
+/// grids). Shape `[1, img_seq]` f32 — diffusers `[[0]*prod(shapes[0]) + [1]*Σ prod(shapes[1:])]`.
+fn build_modulate_index(
+    noise_len: usize,
+    cond_grids: &[(usize, usize)],
+    img_seq: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let cond_len: usize = cond_grids.iter().map(|(h, w)| h * w).sum();
+    debug_assert_eq!(
+        noise_len + cond_len,
+        img_seq,
+        "modulate index spans the full image sequence"
+    );
+    let mut row = vec![0f32; noise_len];
+    row.extend(std::iter::repeat_n(1f32, cond_len));
+    Tensor::from_vec(row, (1, img_seq), device)
 }
 
 /// The Qwen-Image **ControlNet-Union** control transformer (sc-5489) — the candle port of the InstantX
@@ -510,7 +633,7 @@ impl QwenControlNet {
         let mut residuals = Vec::with_capacity(self.blocks.len());
         for (block, cn) in self.blocks.iter().zip(&self.controlnet_blocks) {
             let (e, h) = block.forward(
-                &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin,
+                &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin, None,
             )?;
             encoder = e;
             hidden = h;
