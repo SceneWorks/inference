@@ -24,7 +24,6 @@
 
 pub mod config;
 pub mod convert;
-pub mod latent_norm;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
