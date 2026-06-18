@@ -83,6 +83,29 @@ fn load_resolves_then_fails_on_missing_snapshot() {
 }
 
 #[test]
+fn dev_control_self_registers_and_requires_control_weights() {
+    // sc-2292: the strict-pose control variant resolves through the core registry…
+    let d = mlx_gen::registry::generators()
+        .find(|r| (r.descriptor)().id == "flux2_dev_control")
+        .map(|r| (r.descriptor)())
+        .expect("flux2_dev_control self-registers (sc-2292)");
+    assert_eq!(d.family, "flux2");
+    assert!(d.capabilities.accepts(ConditioningKind::Control));
+    assert!(d.capabilities.accepts(ConditioningKind::Reference));
+    assert!(d.capabilities.mac_only && !d.capabilities.supports_kv_cache);
+
+    // …and a load through the registry reaches the loader, which requires the control checkpoint
+    // (proving the overlay is a hard requirement, not a "no generator registered" miss).
+    let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+    let err = mlx_gen::load("flux2_dev_control", &spec)
+        .err()
+        .expect("missing control weights must error")
+        .to_string();
+    assert!(!err.contains("no generator registered"), "got: {err}");
+    assert!(err.contains("Fun-Controlnet-Union"), "got: {err}");
+}
+
+#[test]
 fn single_file_spec_is_rejected() {
     let spec = LoadSpec::new(WeightsSource::File("/unused.safetensors".into()));
     let err = mlx_gen::load("flux2_klein_9b", &spec)

@@ -55,7 +55,9 @@ use mlx_gen::adapters::loader::{
 };
 use mlx_gen::adapters::{conv_lora_delta, reconstruct_lokr_delta, AdaptableHost};
 use mlx_gen::array::scalar;
-use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
+use mlx_gen::gen_core::weightsmeta::{
+    resolve_kohya_stem, LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY,
+};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -238,14 +240,15 @@ fn classify_key(key: &str, kohya_to_dotted: &BTreeMap<String, String>) -> Option
         return None;
     }
     if let Some(rem) = key.strip_prefix(KOHYA_PREFIX) {
-        // kohya: resolve the flattened stem against the routable-path table.
+        // kohya: resolve the flattened stem against the routable-path table — directly for a
+        // diffusers-named stem, or via an original-SD/A1111 → diffusers translation (sc-6051).
         for (suf, role) in [
             (".lora_down.weight", Role::Down),
             (".lora_up.weight", Role::Up),
             (".alpha", Role::Alpha),
         ] {
             if let Some(stem) = rem.strip_suffix(suf) {
-                return kohya_to_dotted.get(stem).map(|d| (d.clone(), role));
+                return resolve_kohya_stem(stem, kohya_to_dotted).map(|d| (d, role));
             }
         }
         return None;
@@ -378,7 +381,7 @@ fn classify_lokr_key(
         if let Some(stem) = key.strip_suffix(suf) {
             let factor = &suf[1..]; // drop the leading '.'
             return if let Some(flat) = stem.strip_prefix(KOHYA_PREFIX) {
-                kohya_to_dotted.get(flat).map(|d| (d.clone(), factor))
+                resolve_kohya_stem(flat, kohya_to_dotted).map(|d| (d, factor))
             } else {
                 Some((
                     stem.strip_prefix(PEFT_PREFIX).unwrap_or(stem).to_string(),
@@ -611,10 +614,10 @@ pub fn apply_sdxl_adapters_with(
     if report.merged == 0 {
         return Err(Error::Msg(format!(
             "sdxl: no adapter target modules matched across {} file(s) — check the format \
-             (expected kohya `lora_unet_` with diffusers block naming, PEFT \
-             `base_model.model.unet.`, or LoKr `<module>.lokr_w1/w2` + networkType=lokr; \
-             original-SD `lora_unet_input_blocks_*` is not supported, and conv-layer LoRAs merge \
-             only under Complete coverage — i.e. not when `SDXL_LORA_VENDORED` is set)",
+             (expected kohya `lora_unet_` with diffusers `down_blocks_*` or original-SD \
+             `input_blocks_*` block naming, PEFT `base_model.model.unet.`, or LoKr \
+             `<module>.lokr_w1/w2` + networkType=lokr; conv-layer LoRAs merge only under Complete \
+             coverage — i.e. not when `SDXL_LORA_VENDORED` is set)",
             specs.len()
         )));
     }
@@ -720,6 +723,31 @@ mod tests {
                 .1,
             Role::Alpha
         ));
+    }
+
+    /// sc-6051: an original-SD / A1111 kohya key (`lora_unet_input_blocks_4_1_…`) classifies onto the
+    /// SAME diffusers dotted path as its `down_blocks` twin, so civitai SDXL LoRAs merge. The
+    /// `table()` helper holds the diffusers paths; the translation runs inside `classify_key`.
+    #[test]
+    fn classify_kohya_translates_original_sd_naming() {
+        let t = table();
+        let (path, role) = classify_key(
+            "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lora_down.weight",
+            &t,
+        )
+        .expect("original-SD input_blocks key should translate + resolve");
+        assert_eq!(
+            path,
+            "down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q"
+        );
+        assert!(matches!(role, Role::Down));
+        // output_blocks.0.* → up_blocks.0.* (proj_in lives on the attention module at index .1).
+        assert_eq!(
+            classify_key("lora_unet_output_blocks_0_1_proj_in.lora_up.weight", &t)
+                .unwrap()
+                .0,
+            "up_blocks.0.attentions.0.proj_in"
+        );
     }
 
     #[test]

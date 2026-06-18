@@ -17,6 +17,15 @@ pub const FLUX2_KLEIN_9B_EDIT_ID: &str = "flux2_klein_9b_edit";
 pub const FLUX2_KLEIN_9B_KV_EDIT_ID: &str = "flux2_klein_9b_kv_edit";
 /// FLUX.2-dev txt2img (sc-5916). Undistilled 32B flagship: embedded guidance + more steps.
 pub const FLUX2_DEV_ID: &str = "flux2_dev";
+/// FLUX.2-dev image-conditioned edit (sc-5919): single + multi reference. Same dev snapshot as
+/// [`FLUX2_DEV_ID`] — references condition via the **DiT token concat** (the klein edit mechanism,
+/// per the diffusers `Flux2Pipeline`), NOT the Pixtral vision tower (that feeds caption upsampling,
+/// a separate feature).
+pub const FLUX2_DEV_EDIT_ID: &str = "flux2_dev_edit";
+/// FLUX.2-dev strict-pose ControlNet (sc-2292): the `alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union`
+/// VACE-style control branch overlaid on the dev base. Loads the dev snapshot (`weights`) + the
+/// control checkpoint (`control`); a required `Control` conditioning (pose/union skeleton) drives it.
+pub const FLUX2_DEV_CONTROL_ID: &str = "flux2_dev_control";
 
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
@@ -55,9 +64,14 @@ pub enum Flux2Variant {
     /// FLUX.2-klein-9b-kv, distilled, edit with the reference-K/V cache (sc-2347).
     Klein9bKvEdit,
     /// FLUX.2-dev, guidance-distilled txt2img (sc-5916). Larger MMDiT (48 single blocks, 48 heads,
-    /// joint 15360) + the Mistral text encoder; embedded guidance ~4 over ~28 steps. Image edit is
-    /// a follow-on (sc-5919 — needs the Pixtral vision tower).
+    /// joint 15360) + the Mistral text encoder; embedded guidance ~4 over ~28 steps.
     Dev,
+    /// FLUX.2-dev, image-conditioned edit (sc-5919): single + multi reference, loading the same dev
+    /// snapshot as [`Dev`](Self::Dev). Per the diffusers `Flux2Pipeline`, dev references condition
+    /// via the **DiT token concat** (VAE-encode → pack → concat to the image stream at t=10+10·i,
+    /// the klein edit mechanism), with a **text-only** Mistral prompt — the Pixtral vision tower is
+    /// not on this path (it feeds caption upsampling). Embedded guidance, same as `Dev`.
+    DevEdit,
 }
 
 impl Flux2Variant {
@@ -67,6 +81,7 @@ impl Flux2Variant {
             Self::Klein9bEdit => FLUX2_KLEIN_9B_EDIT_ID,
             Self::Klein9bKvEdit => FLUX2_KLEIN_9B_KV_EDIT_ID,
             Self::Dev => FLUX2_DEV_ID,
+            Self::DevEdit => FLUX2_DEV_EDIT_ID,
         }
     }
 
@@ -77,12 +92,22 @@ impl Flux2Variant {
             Self::Klein9b | Self::Klein9bEdit => "black-forest-labs/FLUX.2-klein-9B",
             // The KV-cache variant is a separately distilled checkpoint (same architecture).
             Self::Klein9bKvEdit => "black-forest-labs/FLUX.2-klein-9b-kv",
-            Self::Dev => "black-forest-labs/FLUX.2-dev",
+            // dev txt2img and dev edit share the one dev snapshot (no separate -edit checkpoint).
+            Self::Dev | Self::DevEdit => "black-forest-labs/FLUX.2-dev",
         }
     }
 
     pub fn is_edit(self) -> bool {
-        matches!(self, Self::Klein9bEdit | Self::Klein9bKvEdit)
+        matches!(
+            self,
+            Self::Klein9bEdit | Self::Klein9bKvEdit | Self::DevEdit
+        )
+    }
+
+    /// dev variants (txt2img + edit) — the ones loading the Mistral3 snapshot through the `*_dev`
+    /// loaders and using the embedded-guidance forward.
+    pub fn is_dev(self) -> bool {
+        matches!(self, Self::Dev | Self::DevEdit)
     }
 
     /// The 9b-kv variant, which caches reference K/V across denoise steps.
@@ -92,34 +117,38 @@ impl Flux2Variant {
 
     /// The dimension-parametric model config for this variant.
     pub fn config(self) -> Flux2Config {
-        match self {
-            Self::Dev => Flux2Config::dev(),
-            _ => Flux2Config::klein_9b(),
+        if self.is_dev() {
+            Flux2Config::dev()
+        } else {
+            Flux2Config::klein_9b()
         }
     }
 
     /// Default denoise steps. Distilled klein = 4; guidance-distilled dev ≈ 28 (range 24–50).
     pub fn default_steps(self) -> u32 {
-        match self {
-            Self::Dev => DEFAULT_STEPS_DEV,
-            _ => DEFAULT_STEPS,
+        if self.is_dev() {
+            DEFAULT_STEPS_DEV
+        } else {
+            DEFAULT_STEPS
         }
     }
 
     /// Default guidance. klein runs CFG-free (1.0); dev uses embedded guidance ~4.0.
     pub fn default_guidance(self) -> f32 {
-        match self {
-            Self::Dev => DEFAULT_GUIDANCE_DEV,
-            _ => DEFAULT_GUIDANCE,
+        if self.is_dev() {
+            DEFAULT_GUIDANCE_DEV
+        } else {
+            DEFAULT_GUIDANCE
         }
     }
 
     /// Whether the guidance scale is consumed as an **embedded scalar** fed into the transformer's
     /// guidance embedder (the guidance-distilled dev, FLUX.1-dev pattern) rather than as a true-CFG
-    /// dual-forward over a negative prompt. dev = `true` (single forward, no negative pass); klein =
-    /// `false` (distilled, CFG-free at guidance 1.0; a base variant would do true-CFG when >1).
+    /// dual-forward over a negative prompt. dev (txt2img + edit) = `true` (single forward, no
+    /// negative pass); klein = `false` (distilled, CFG-free at guidance 1.0; a base variant would do
+    /// true-CFG when >1).
     pub fn uses_embedded_guidance(self) -> bool {
-        matches!(self, Self::Dev)
+        self.is_dev()
     }
 
     pub fn descriptor(self) -> ModelDescriptor {
@@ -323,6 +352,31 @@ mod tests {
         assert!(caps.accepts(ConditioningKind::Reference));
         // config() now returns the dev dims, not klein's (the previous hardcode was a latent bug).
         assert_eq!(v.config().num_single_layers, 48);
+    }
+
+    #[test]
+    fn dev_edit_variant_is_edit_with_dev_dims_and_embedded_guidance() {
+        let e = Flux2Variant::DevEdit;
+        assert_eq!(e.id(), FLUX2_DEV_EDIT_ID);
+        // Same dev snapshot as txt2img dev (no separate -edit checkpoint).
+        assert_eq!(e.hf_model(), "black-forest-labs/FLUX.2-dev");
+        assert!(e.is_dev() && Flux2Variant::Dev.is_dev());
+        assert!(e.is_edit() && !e.is_kv());
+        // Embedded guidance + dev dims, like Dev.
+        assert!(e.uses_embedded_guidance());
+        assert_eq!(e.default_steps(), 28);
+        assert_eq!(e.default_guidance(), 4.0);
+        assert_eq!(e.config().num_single_layers, 48);
+        // Edit conditioning surface = single + multi reference, like the klein edit variant; no
+        // negative/true-CFG (embedded guidance), no KV cache (dev has no -kv checkpoint).
+        let caps = e.descriptor().capabilities;
+        assert!(caps.accepts(ConditioningKind::Reference));
+        assert!(caps.accepts(ConditioningKind::MultiReference));
+        assert!(
+            caps.supports_guidance && !caps.supports_negative_prompt && !caps.supports_true_cfg
+        );
+        assert!(!caps.supports_kv_cache);
+        assert!(caps.mac_only);
     }
 
     #[test]

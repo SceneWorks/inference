@@ -25,6 +25,8 @@ use mlx_gen::{
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
 
+use crate::caption_upsample;
+use crate::chunk::MemoryConfig;
 use crate::config::Flux2Variant;
 use crate::kv_cache::{CacheMode, Flux2KvCache};
 use crate::pipeline::{
@@ -34,7 +36,15 @@ use crate::pipeline::{
 use crate::text_encoder::Qwen3TextEncoder;
 use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
+use crate::vision::{Mistral3Projector, PixtralVisionTower};
 use crate::{loader, Flux2Config};
+
+/// Joint DiT sequence length (txt + target + reference tokens) above which the gated activation
+/// levers (sc-6266) engage. Sits between a single-reference 1024² edit (~8.7K tokens, fits the 96 GB
+/// budget) and a 2-reference one (~12.8K tokens, ~104 GB un-bounded, sc-6124) so only the over-budget
+/// multi-reference / high-resolution edits take the bounded-memory path; every shipped path (T2I,
+/// single-reference edit, strict pose, LoRA) stays on the byte-identical [`MemoryConfig::OFF`].
+const LONG_SEQ_TOKEN_THRESHOLD: usize = 10_000;
 
 pub fn descriptor_klein_9b() -> ModelDescriptor {
     Flux2Variant::Klein9b.descriptor()
@@ -64,11 +74,23 @@ pub fn descriptor_dev() -> ModelDescriptor {
     Flux2Variant::Dev.descriptor()
 }
 
+pub fn descriptor_dev_edit() -> ModelDescriptor {
+    Flux2Variant::DevEdit.descriptor()
+}
+
 /// FLUX.2-dev txt2img (sc-2365): the guidance-distilled 32B flagship. Loads the dev snapshot
 /// (Mistral3 TE + dev DiT, pre-quantized Q4 per sc-5917) and runs the embedded-guidance denoise
 /// (single forward, default guidance ~4.0 over ~28 steps — NOT true-CFG).
 pub fn load_dev(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(Flux2Variant::Dev, spec)
+}
+
+/// FLUX.2-dev image-conditioned edit (sc-5919): single + multi reference. Loads the same dev
+/// snapshot as [`load_dev`] and runs the shared edit conditioning path — reference images are
+/// VAE-encoded, packed, and concatenated to the DiT image stream (the klein edit mechanism, faithful
+/// to the diffusers `Flux2Pipeline`; the prompt embeds stay text-only). Embedded-guidance denoise.
+pub fn load_dev_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(Flux2Variant::DevEdit, spec)
 }
 
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
@@ -94,7 +116,8 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     // The dev checkpoint has a different text encoder (Mistral3, not Qwen3) + tokenizer + DiT dims,
     // so it loads through the `*_dev` loaders; a pre-quantized dev snapshot loads packed directly
     // (the loaders read the per-component `quantization` manifest, sc-5917). The VAE is identical.
-    let dev = variant == Flux2Variant::Dev;
+    // Both dev variants (txt2img + edit) load the same snapshot through these loaders.
+    let dev = variant.is_dev();
     let (mut text_encoder, mut transformer) = if dev {
         (
             loader::load_text_encoder_dev(root)?,
@@ -132,6 +155,18 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     } else {
         loader::load_tokenizer(root)?
     };
+    // Caption upsampling (sc-6030) is dev-only: load the Pixtral vision tower + Mistral3 projector
+    // (the `text_encoder/` snapshot's `vision_tower.*` / `multi_modal_projector.*`, full precision).
+    // The Mistral generation head (final norm + LM head) was loaded into `text_encoder` by
+    // `load_text_encoder_dev`. klein has no vision tower → `None` (caption upsampling is unavailable).
+    let (vision_tower, projector) = if dev {
+        (
+            Some(loader::load_vision_tower_dev(root)?),
+            Some(loader::load_multimodal_projector_dev(root)?),
+        )
+    } else {
+        (None, None)
+    };
     Ok(Box::new(Flux2 {
         descriptor: variant.descriptor(),
         variant,
@@ -140,6 +175,8 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         text_encoder: Some(text_encoder),
         transformer: Some(transformer),
         vae: Some(vae),
+        vision_tower,
+        projector,
     }))
 }
 
@@ -152,6 +189,11 @@ pub struct Flux2 {
     text_encoder: Option<Qwen3TextEncoder>,
     transformer: Option<Flux2Transformer>,
     vae: Option<Flux2Vae>,
+    /// FLUX.2-dev caption upsampling (sc-6030): the Pixtral vision tower + Mistral3 projector that
+    /// encode reference images for the image-conditioned (I2I) prompt rewrite. `None` for klein and
+    /// the weightless test instances — caption upsampling is dev-only and gated on `enhance_prompt`.
+    vision_tower: Option<PixtralVisionTower>,
+    projector: Option<Mistral3Projector>,
 }
 
 impl Flux2 {
@@ -165,6 +207,8 @@ impl Flux2 {
             text_encoder: None,
             transformer: None,
             vae: None,
+            vision_tower: None,
+            projector: None,
         }
     }
 
@@ -267,6 +311,96 @@ impl Flux2 {
         Ok(refs)
     }
 
+    /// Collect the reference images for caption upsampling (sc-6030): any `Reference` /
+    /// `MultiReference` images in the request, flattened in order. Empty ⇒ the text-only T2I rewrite.
+    /// Unlike [`collect_edit_references`](Self::collect_edit_references) this never errors on empty
+    /// (a T2I prompt rewrite is valid).
+    fn collect_upsample_references<'a>(
+        &self,
+        req: &'a GenerationRequest,
+    ) -> Vec<&'a mlx_gen::media::Image> {
+        let mut refs: Vec<&mlx_gen::media::Image> = Vec::new();
+        for c in &req.conditioning {
+            match c {
+                mlx_gen::Conditioning::Reference { image, .. } => refs.push(image),
+                mlx_gen::Conditioning::MultiReference { images } => refs.extend(images.iter()),
+                _ => {}
+            }
+        }
+        refs
+    }
+
+    /// FLUX.2-dev caption upsampling (sc-6030): rewrite the prompt with the Mistral3 multimodal LLM
+    /// before encoding (the diffusers `upsample_prompt`), gated on `req.enhance_prompt` — the
+    /// LTX-2.3 prompt-enhancement contract field (sc-2845), reused here for the image-aware analog.
+    /// Returns the rewritten prompt, or the original `req.prompt` when the gate is off, the variant
+    /// isn't dev, or on **any** upsampler failure / empty output (reference-faithful fallback, like
+    /// `generate_av.py`'s try/except). Logs the LTX `ENHANCED_PROMPT:` / `ENHANCER_FALLBACK:` tokens.
+    fn maybe_upsample(&self, req: &GenerationRequest) -> String {
+        if !req.enhance_prompt || !self.variant.is_dev() {
+            return req.prompt.clone();
+        }
+        match self.run_upsample(req) {
+            Ok(p) if !p.trim().is_empty() => {
+                eprintln!("ENHANCED_PROMPT:{p}");
+                p
+            }
+            Ok(_) => {
+                eprintln!("ENHANCER_FALLBACK:EmptyOutput:caption upsampler returned empty output");
+                req.prompt.clone()
+            }
+            Err(e) => {
+                eprintln!("ENHANCER_FALLBACK:{e}");
+                req.prompt.clone()
+            }
+        }
+    }
+
+    /// Run the dev caption upsampler: the Mistral3 multimodal `generate()` over the prompt plus any
+    /// reference images (through the Pixtral tower). Errors surface to
+    /// [`maybe_upsample`](Self::maybe_upsample)'s fallback.
+    fn run_upsample(&self, req: &GenerationRequest) -> Result<String> {
+        let id = self.descriptor.id;
+        let not_loaded = |what: &str| Error::Msg(format!("{id}: {what} is not loaded"));
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| not_loaded("tokenizer"))?;
+        let te = self
+            .text_encoder
+            .as_ref()
+            .ok_or_else(|| not_loaded("text encoder"))?;
+        let vision = self
+            .vision_tower
+            .as_ref()
+            .ok_or_else(|| not_loaded("vision tower"))?;
+        let projector = self
+            .projector
+            .as_ref()
+            .ok_or_else(|| not_loaded("projector"))?;
+        let refs = self.collect_upsample_references(req);
+        let temperature = req
+            .enhance_temperature
+            .unwrap_or(caption_upsample::DEFAULT_TEMPERATURE);
+        let max_new_tokens = req
+            .enhance_max_tokens
+            .map(|m| m as usize)
+            .unwrap_or(caption_upsample::DEFAULT_MAX_NEW_TOKENS);
+        let seed = req.seed.unwrap_or_else(default_seed);
+        caption_upsample::upsample_prompt(
+            tokenizer,
+            te,
+            vision,
+            projector,
+            &req.prompt,
+            &refs,
+            temperature,
+            max_new_tokens,
+            seed,
+            &req.cancel,
+        )
+    }
+
     /// Extract the single img2img init image + its strength from the txt2img request. The
     /// per-reference strength wins over `req.strength`. txt2img img2img conditions on exactly one
     /// init image, so more than one `Reference` is an error (multi-reference is the edit variant +
@@ -317,7 +451,7 @@ impl Flux2 {
 
 /// Crop a NCHW latent's spatial dims down to even (the fork's `crop_to_even_spatial`), so the 2×2
 /// patchify divides cleanly. A no-op at the standard multiple-of-16 sizes.
-fn crop_to_even(x: &Array) -> Result<Array> {
+pub(crate) fn crop_to_even(x: &Array) -> Result<Array> {
     let sh = x.shape();
     let mut x = x.clone();
     if sh[2] % 2 != 0 {
@@ -334,7 +468,7 @@ fn crop_to_even(x: &Array) -> Result<Array> {
 /// Center-crop or symmetric-pad a NCHW latent's spatial dims to `(target_h, target_w)` — the fork's
 /// `_match_latent_spatial_size`. A no-op at the standard multiple-of-16 sizes (the VAE-encoded H/8
 /// already equals the `latent_h·2` target); guards odd / mismatched user images.
-fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32) -> Result<Array> {
+pub(crate) fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32) -> Result<Array> {
     let mut x = x.clone();
     let (h, w) = (x.shape()[2], x.shape()[3]);
     if h != target_h {
@@ -432,7 +566,14 @@ impl Flux2 {
             None => 0,
         };
 
-        let (prompt_embeds, text_ids) = self.encode(tokenizer, te, &req.prompt)?;
+        // FLUX.2-dev caption upsampling (sc-6030): optionally rewrite the prompt with the Mistral3
+        // multimodal LLM (using any reference images) before encoding, gated on `enhance_prompt`.
+        // A no-op (returns `req.prompt`) for klein, when the gate is off, or on any upsampler failure.
+        let prompt = self.maybe_upsample(req);
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let (prompt_embeds, text_ids) = self.encode(tokenizer, te, &prompt)?;
         // True-CFG dual-forward only for the (non-embedded-guidance) base path at guidance >1; dev
         // routes its scale through the embedded guidance embedder instead, so it never takes a
         // negative pass, and distilled klein runs at guidance 1.0 (also no negative).
@@ -458,6 +599,25 @@ impl Flux2 {
             _ => None,
         };
 
+        // sc-6266: a multi-reference edit concatenates each reference's latent tokens onto the joint
+        // `[txt, target, ref…]` DiT sequence, making the denoise activation-bound — a 2-reference
+        // 1024² edit peaks ~104 GB, over the 96 GB budget (sc-6124). Above the single-reference
+        // ceiling, bound the per-step activation high-water with `eval_per_block` (bit-exact, so the
+        // edit's pixels are unchanged). Shorter sequences (T2I, single-reference edit, pose) stay on
+        // `MemoryConfig::OFF` → the shipped forward is byte-identical. Env-overridable (the doc on
+        // `MemoryConfig::from_env`) so a deployment can tune chunking without a recompile.
+        let total_seq = prompt_embeds.shape()[1] as usize
+            + lat_h * lat_w
+            + reference
+                .as_ref()
+                .map(|(r, _)| r.shape()[1] as usize)
+                .unwrap_or(0);
+        let mem = MemoryConfig::from_env(if total_seq > LONG_SEQ_TOKEN_THRESHOLD {
+            MemoryConfig::LONG_SEQ
+        } else {
+            MemoryConfig::OFF
+        });
+
         // For an edit, the transformer's image input/ids are `[target, ref]` (or `[target]` only on
         // a cached KV step); its output keeps the image stream, of which we take the leading
         // `target_seq` tokens. txt2img has no ref, so the concat + slice are no-ops.
@@ -478,7 +638,7 @@ impl Flux2 {
                 ),
                 _ => (latents.clone(), latent_ids.clone()),
             };
-            let out = transformer.forward_with_cache(
+            let out = transformer.forward_with_mem(
                 &hidden,
                 embeds,
                 &img_ids,
@@ -486,6 +646,7 @@ impl Flux2 {
                 ts,
                 embedded_guidance,
                 cache,
+                &mem,
             )?;
             let idx = Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
             Ok(out.take_axis(&idx, 1)?)
@@ -576,7 +737,7 @@ impl Flux2 {
     }
 }
 
-fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
+pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
     // Empty-prompt first so it wins over the shared floor for a bare default request.
     if req.prompt.trim().is_empty() {
         return Err(Error::Msg(format!("{}: prompt is required", desc.id)));
@@ -613,6 +774,10 @@ fn load_dev_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> 
     load_dev(spec).map_err(Into::into)
 }
 
+fn load_dev_edit_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_dev_edit(spec).map_err(Into::into)
+}
+
 inventory::submit! {
     ModelRegistration { descriptor: descriptor_klein_9b, load: load_klein_9b_registered }
 }
@@ -629,12 +794,16 @@ inventory::submit! {
     ModelRegistration { descriptor: descriptor_dev, load: load_dev_registered }
 }
 
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_dev_edit, load: load_dev_edit_registered }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, FLUX2_DEV_ID, FLUX2_KLEIN_9B_EDIT_ID,
-        FLUX2_KLEIN_9B_ID,
+        DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID,
+        FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID,
     };
     use mlx_gen::media::Image;
     use mlx_gen::Conditioning;
@@ -800,6 +969,64 @@ mod tests {
     #[test]
     fn edit_without_reference_errors() {
         let model = Flux2::new_for_tests(Flux2Variant::Klein9bEdit);
+        let req = GenerationRequest {
+            prompt: "make it night".into(),
+            ..Default::default()
+        };
+        let err = model.collect_edit_references(&req).unwrap_err().to_string();
+        assert!(err.contains("at least one reference image"));
+    }
+
+    // ---- sc-5919 FLUX.2-dev edit (DiT-concat reference conditioning) ---------------------------
+
+    #[test]
+    fn dev_edit_registered_with_edit_caps() {
+        // Registered (loadable by id) with the dev-edit id + the klein edit conditioning surface.
+        assert_eq!(descriptor_dev_edit().id, FLUX2_DEV_EDIT_ID);
+        let caps = descriptor_dev_edit().capabilities;
+        assert_eq!(
+            caps.conditioning,
+            vec![
+                mlx_gen::ConditioningKind::Reference,
+                mlx_gen::ConditioningKind::MultiReference,
+            ]
+        );
+        // Embedded guidance (no negative/true-CFG), no KV cache, mac-only.
+        assert!(
+            caps.supports_guidance && !caps.supports_negative_prompt && !caps.supports_true_cfg
+        );
+        assert!(!caps.supports_kv_cache && caps.mac_only);
+    }
+
+    #[test]
+    fn dev_edit_accepts_single_and_multi_reference() {
+        let model = Flux2::new_for_tests(Flux2Variant::DevEdit);
+        // Single `Reference`.
+        let single = GenerationRequest {
+            prompt: "make it a watercolor".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        model.validate(&single).unwrap();
+        assert_eq!(model.collect_edit_references(&single).unwrap().len(), 1);
+        // `MultiReference` (N images).
+        let multi = GenerationRequest {
+            prompt: "combine these".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![Image::default(), Image::default()],
+            }],
+            ..Default::default()
+        };
+        model.validate(&multi).unwrap();
+        assert_eq!(model.collect_edit_references(&multi).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn dev_edit_without_reference_errors() {
+        let model = Flux2::new_for_tests(Flux2Variant::DevEdit);
         let req = GenerationRequest {
             prompt: "make it night".into(),
             ..Default::default()
