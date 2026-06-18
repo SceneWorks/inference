@@ -11,8 +11,25 @@
 
 pub const IDEOGRAM_4_ID: &str = "ideogram_4";
 
+/// Registry id for the few-step **turbo** variant — the CFG-free single-DiT path driven by the
+/// ostris TurboTime LoRA (issue #488). Same base weights as [`IDEOGRAM_4_ID`]; the snapshot adds the
+/// bundled LoRA ([`TURBO_LORA_FILE`]) and needs no unconditional DiT.
+pub const IDEOGRAM_4_TURBO_ID: &str = "ideogram_4_turbo";
+
 /// HF repo for the gated source weights (fp8 reference release).
 pub const IDEOGRAM_4_FP8_REPO: &str = "ideogram-ai/ideogram-4-fp8";
+
+/// Filename of the bundled TurboTime LoRA inside a turbo snapshot directory (sibling of
+/// `transformer/`). The turbo loader installs it onto the conditional DiT at load.
+pub const TURBO_LORA_FILE: &str = "turbo_lora.safetensors";
+
+/// TurboTime ships **no** alpha/config tensor → the ai-toolkit default scale of 1.0 (verified from
+/// the safetensors header, issue #488; the spike confirmed scale 1.0 renders cleanly with no tuning).
+pub const TURBO_LORA_SCALE: f32 = 1.0;
+
+/// Turbo default step count — the TurboTime "continuous turbo" LoRA targets ~2–8 few-step renders;
+/// 8 is the validated default (issue #488 spike: 1024²/8-step quality ≥ the 128-step 2-DiT render).
+pub const DEFAULT_TURBO_STEPS: u32 = 8;
 
 // ── Defaults / limits ────────────────────────────────────────────────────────────────────
 pub const DEFAULT_WIDTH: u32 = 1024;

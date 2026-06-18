@@ -7,7 +7,7 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, tanh};
 use mlx_rs::Array;
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -87,6 +87,20 @@ impl Ideogram4Attention {
     }
 }
 
+impl AdaptableHost for Ideogram4Attention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["qkv"] => Some(&mut self.qkv),
+            ["o"] => Some(&mut self.o),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["qkv", "o"].into_iter().map(String::from).collect()
+    }
+}
+
 /// HF half-split RoPE in `[B, H, L, hd]` layout: `cos`/`sin` `[B, L, hd]` → broadcast over heads.
 fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     let cos = cos.expand_dims(1)?; // [B,1,L,hd]
@@ -122,6 +136,21 @@ impl Ideogram4Mlp {
         self.w2.quantize(bits, None)?;
         self.w3.quantize(bits, None)?;
         Ok(())
+    }
+}
+
+impl AdaptableHost for Ideogram4Mlp {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["w1"] => Some(&mut self.w1),
+            ["w2"] => Some(&mut self.w2),
+            ["w3"] => Some(&mut self.w3),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["w1", "w2", "w3"].into_iter().map(String::from).collect()
     }
 }
 
@@ -205,5 +234,23 @@ impl Ideogram4Block {
         self.feed_forward.quantize(bits)?;
         self.adaln_modulation.quantize(bits, None)?;
         Ok(())
+    }
+}
+
+impl AdaptableHost for Ideogram4Block {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attention", rest @ ..] => self.attention.adaptable_mut(rest),
+            ["feed_forward", rest @ ..] => self.feed_forward.adaptable_mut(rest),
+            ["adaln_modulation"] => Some(&mut self.adaln_modulation),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("attention", &self.attention);
+        out.extend(prefixed_paths("feed_forward", &self.feed_forward));
+        out.push("adaln_modulation".to_string());
+        out
     }
 }

@@ -10,6 +10,7 @@ use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::ops::{add, concatenate_axis, cos as mcos, multiply, sin as msin};
 use mlx_rs::Array;
 
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::host_i32;
 use mlx_gen::nn::{silu, TokenEmbedding};
 use mlx_gen::weights::Weights;
@@ -150,6 +151,54 @@ impl Ideogram4Transformer {
         let normed = layer_norm(&h, None, None, self.final_norm_eps)?;
         let out = self.final_linear.forward(&multiply(&normed, &scale)?)?;
         Ok(out.as_dtype(mlx_rs::Dtype::Float32)?)
+    }
+}
+
+/// Adapter (LoRA) host map for the Ideogram 4 DiT — the key→`AdaptableLinear` resolution the shared
+/// loader ([`mlx_gen::adapters::loader::apply_adapters_strict`]) walks after stripping the file's
+/// namespace prefix (`diffusion_model.` for the ostris TurboTime LoRA / sd-scripts exports). The
+/// per-layer modules (`layers.{i}.{attention.qkv, attention.o, feed_forward.w{1,2,3},
+/// adaln_modulation}`) are the TurboTime targets; the globals are exposed for symmetry so a
+/// full-surface Ideogram LoRA also resolves rather than failing the strict no-silent-drop apply.
+impl AdaptableHost for Ideogram4Transformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            // Per-block targets: `layers.{i}.…` → delegate to the indexed block's host map.
+            ["layers", idx, rest @ ..] => self
+                .layers
+                .get_mut(idx.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            // Globals (not TurboTime targets; covered for a full-surface Ideogram LoRA).
+            ["input_proj"] => Some(&mut self.input_proj),
+            ["llm_cond_proj"] => Some(&mut self.llm_cond_proj),
+            ["t_embedding", "mlp_in"] => Some(&mut self.t_mlp_in),
+            ["t_embedding", "mlp_out"] => Some(&mut self.t_mlp_out),
+            ["adaln_proj"] => Some(&mut self.adaln_proj),
+            ["final_layer", "adaln_modulation"] => Some(&mut self.final_adaln),
+            ["final_layer", "linear"] => Some(&mut self.final_linear),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("layers.{i}"), layer));
+        }
+        out.extend(
+            [
+                "input_proj",
+                "llm_cond_proj",
+                "t_embedding.mlp_in",
+                "t_embedding.mlp_out",
+                "adaln_proj",
+                "final_layer.adaln_modulation",
+                "final_layer.linear",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        out
     }
 }
 

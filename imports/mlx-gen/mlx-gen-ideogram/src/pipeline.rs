@@ -1,10 +1,16 @@
-//! Ideogram 4 text-to-image pipeline: Qwen3-VL text encode → two-DiT asymmetric-CFG flow-matching
-//! denoise → latent de-normalize + unpatchify + VAE decode. Port of `Ideogram4Pipeline.__call__`.
+//! Ideogram 4 text-to-image pipeline: Qwen3-VL text encode → flow-matching denoise → latent
+//! de-normalize + unpatchify + VAE decode. Port of `Ideogram4Pipeline.__call__`.
 //!
-//! The conditional DiT runs over the full `[text ; image]` sequence; the unconditional DiT runs
-//! over the **image-only** slice with zeroed conditioning (asymmetric CFG). Per step the velocities
-//! combine `v = g·pos_v + (1−g)·neg_v` and Euler-step `z += v·(s−t)`. Tokenization (the Qwen3-VL
-//! chat template) is the caller's job — `generate` takes `input_ids`.
+//! Two denoise modes share this pipeline, selected by whether the **unconditional** DiT is present:
+//! * **Quality (asymmetric CFG, default)** — the conditional DiT runs over the full `[text ; image]`
+//!   sequence; the unconditional DiT runs over the **image-only** slice with zeroed conditioning.
+//!   Per step the velocities combine `v = g·pos_v + (1−g)·neg_v`.
+//! * **Turbo (CFG-free single DiT, issue #488)** — `uncond` is `None` and the conditional DiT
+//!   carries the ostris **TurboTime** LoRA; per step `v = pos_v` (no negative branch, guidance off),
+//!   so a render costs one DiT forward over ~8 steps instead of two over ~48.
+//!
+//! Both Euler-step `z += v·(s−t)`. Tokenization (the Qwen3-VL chat template) is the caller's job —
+//! `generate` takes `input_ids`.
 
 use std::path::Path;
 
@@ -12,10 +18,12 @@ use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, Progress, Result};
 use mlx_gen_flux2::Flux2Vae;
 
+use crate::adapters::apply_ideogram_adapters;
 use crate::config::Ideogram4DitConfig;
 use crate::loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_unconditional_transformer, load_vae,
@@ -50,7 +58,10 @@ fn preset_mu_std(num_steps: usize) -> (f64, f64) {
 
 pub struct Ideogram4Pipeline {
     cond: Ideogram4Transformer,
-    uncond: Ideogram4Transformer,
+    /// The unconditional DiT (asymmetric-CFG negative branch). `None` in the **turbo** mode
+    /// ([`load_turbo`](Self::load_turbo)) — the CFG-free single-DiT path runs the conditional DiT
+    /// alone, halving resident memory.
+    uncond: Option<Ideogram4Transformer>,
     te: Ideogram4TextEncoder,
     vae: Flux2Vae,
     tok: TextTokenizer,
@@ -59,11 +70,11 @@ pub struct Ideogram4Pipeline {
 
 impl Ideogram4Pipeline {
     /// Load all components (2 DiTs + Qwen3-VL text encoder + VAE + tokenizer) from a converted
-    /// snapshot dir.
+    /// snapshot dir — the quality (asymmetric-CFG) mode.
     pub fn load(root: &Path) -> Result<Self> {
         Ok(Self {
             cond: load_transformer(root)?,
-            uncond: load_unconditional_transformer(root)?,
+            uncond: Some(load_unconditional_transformer(root)?),
             te: load_text_encoder(root)?,
             vae: load_vae(root)?,
             tok: load_tokenizer(root)?,
@@ -71,13 +82,46 @@ impl Ideogram4Pipeline {
         })
     }
 
-    /// Quantize the whole model in place (group-wise affine Q4/Q8) after the dense load — both DiTs
-    /// (conditional + unconditional), the Qwen3-VL text encoder, and the VAE — matching the flux2
-    /// family's `spec.quantize` semantics. Norms / tiny embeddings stay dense (each module's
-    /// `quantize` decides). Done once at load; runtime is unchanged.
+    /// Load the **turbo** pipeline (issue #488): the conditional DiT + Qwen3-VL TE + VAE + tokenizer,
+    /// **without** the unconditional DiT. The caller applies the TurboTime LoRA via
+    /// [`apply_adapters`](Self::apply_adapters) and runs the CFG-free [`generate`](Self::generate)
+    /// path (single forward per step, guidance off). Skips loading the ~half-of-weights uncond DiT.
+    pub fn load_turbo(root: &Path) -> Result<Self> {
+        Ok(Self {
+            cond: load_transformer(root)?,
+            uncond: None,
+            te: load_text_encoder(root)?,
+            vae: load_vae(root)?,
+            tok: load_tokenizer(root)?,
+            dit: Ideogram4DitConfig::v4(),
+        })
+    }
+
+    /// `true` when this pipeline runs the CFG-free single-DiT turbo path (no unconditional DiT).
+    pub fn is_turbo(&self) -> bool {
+        self.uncond.is_none()
+    }
+
+    /// Install adapters (the TurboTime LoRA, or a user Ideogram LoRA) onto the **conditional** DiT
+    /// via the shared strict loader — errors on any unmatched target. Apply **after**
+    /// [`quantize`](Self::quantize) (the residual is computed and added on top of the possibly
+    /// quantized base, fork-faithfully). No-op for an empty spec list.
+    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
+        if !specs.is_empty() {
+            apply_ideogram_adapters(&mut self.cond, specs)?;
+        }
+        Ok(())
+    }
+
+    /// Quantize the whole model in place (group-wise affine Q4/Q8) after the dense load — the
+    /// conditional DiT, the unconditional DiT (quality mode only), the Qwen3-VL text encoder, and the
+    /// VAE — matching the flux2 family's `spec.quantize` semantics. Norms / tiny embeddings stay
+    /// dense (each module's `quantize` decides). Done once at load; runtime is unchanged.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.cond.quantize(bits)?;
-        self.uncond.quantize(bits)?;
+        if let Some(uncond) = &mut self.uncond {
+            uncond.quantize(bits)?;
+        }
         self.te.quantize(bits)?;
         self.vae.quantize(bits)?;
         Ok(())
@@ -185,11 +229,18 @@ impl Ideogram4Pipeline {
         let position_ids = Array::from_slice(&pack.position_ids, &[1, seq, 3]);
         let segment_ids = Array::from_slice(&pack.segment_ids, &[1, seq]);
         let indicator = Array::from_slice(&pack.indicator, &[1, seq]);
-        // Negative branch = image-only slice.
-        let neg_position_ids = Array::from_slice(&pack.neg_position_ids, &[1, num_img, 3]);
-        let neg_segment_ids = Array::from_slice(&pack.neg_segment_ids, &[1, num_img]);
-        let neg_indicator = Array::from_slice(&pack.neg_indicator, &[1, num_img]);
-        let neg_llm = zeros(&[1, num_img, llm_dim]);
+        // The unconditional (negative) branch runs over the image-only slice. Built only in quality
+        // mode — turbo (`uncond=None`) skips it entirely, avoiding both the second DiT forward and
+        // the large `neg_llm` zero tensor (num_img × 53248 f32, ~0.9 GB at 1024²).
+        let neg = self.uncond.as_ref().map(|uncond| {
+            (
+                uncond,
+                Array::from_slice(&pack.neg_position_ids, &[1, num_img, 3]),
+                Array::from_slice(&pack.neg_segment_ids, &[1, num_img]),
+                Array::from_slice(&pack.neg_indicator, &[1, num_img]),
+                zeros(&[1, num_img, llm_dim]),
+            )
+        });
 
         // ── Init noise + the text-position latent padding ──
         let key = random::key(seed)?;
@@ -223,29 +274,37 @@ impl Ideogram4Pipeline {
             )?;
             let pos_v = pos_out.take_axis(&img_range, 1)?; // image-token velocities
 
-            let neg_v = self.uncond.forward(
-                &neg_llm,
-                &z,
-                &t,
-                &neg_position_ids,
-                &neg_segment_ids,
-                &neg_indicator,
-            )?;
-
-            // Per-step asymmetric CFG: `v = gw·pos_v + (1−gw)·neg_v`. The reference uses a per-step
-            // guidance schedule (DEFAULT_GUIDANCE_SCHEDULE = 7.0 for the main steps, dropping to 3.0
-            // for the final 3 "polish" steps) — a CONSTANT high guidance over-cooks the low-noise
-            // detail steps and "splatters" the image. The loop runs i = num_steps-1 → 0, so the
-            // final 3 polish steps are i ∈ {0,1,2}. Base guidance (`guidance`) drives the main steps.
-            let gw_i = if i < POLISH_STEPS {
-                POLISH_GUIDANCE
-            } else {
-                guidance
+            let v = match &neg {
+                Some((uncond, neg_position_ids, neg_segment_ids, neg_indicator, neg_llm)) => {
+                    let neg_v = uncond.forward(
+                        neg_llm,
+                        &z,
+                        &t,
+                        neg_position_ids,
+                        neg_segment_ids,
+                        neg_indicator,
+                    )?;
+                    // Per-step asymmetric CFG: `v = gw·pos_v + (1−gw)·neg_v`. The reference uses a
+                    // per-step guidance schedule (DEFAULT_GUIDANCE_SCHEDULE = 7.0 for the main steps,
+                    // dropping to 3.0 for the final 3 "polish" steps) — a CONSTANT high guidance
+                    // over-cooks the low-noise detail steps and "splatters" the image. The loop runs
+                    // i = num_steps-1 → 0, so the final 3 polish steps are i ∈ {0,1,2}. Base guidance
+                    // (`guidance`) drives the main steps.
+                    let gw_i = if i < POLISH_STEPS {
+                        POLISH_GUIDANCE
+                    } else {
+                        guidance
+                    };
+                    add(
+                        &multiply(&pos_v, Array::from_f32(gw_i))?,
+                        &multiply(&neg_v, Array::from_f32(1.0 - gw_i))?,
+                    )?
+                }
+                // Turbo (issue #488): CFG-free single DiT. The TurboTime LoRA distilled the guided
+                // velocity into the conditional DiT, so the velocity is `pos_v` directly — no
+                // negative branch, `guidance` unused.
+                None => pos_v,
             };
-            let v = add(
-                &multiply(&pos_v, Array::from_f32(gw_i))?,
-                &multiply(&neg_v, Array::from_f32(1.0 - gw_i))?,
-            )?;
             z = add(&z, &multiply(&v, Array::from_f32((s_val - t_val) as f32))?)?;
             eval([&z])?;
             on_progress(Progress::Step {
