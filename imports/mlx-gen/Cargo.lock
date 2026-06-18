@@ -569,6 +569,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-boogu"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-gen-chroma"
 version = "0.0.0"
 dependencies = [
