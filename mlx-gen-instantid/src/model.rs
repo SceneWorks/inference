@@ -19,7 +19,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Progress, Result, WeightsSource};
+use mlx_gen::{AdapterSpec, CancelFlag, Error, Progress, Result, WeightsSource};
 
 use mlx_gen_face::{Face, FaceAnalysis};
 use mlx_gen_sdxl::config::DiffusionConfig;
@@ -30,10 +30,10 @@ use mlx_gen_sdxl::tokenizer::ClipBpeTokenizer;
 use mlx_gen_sdxl::unet::{ControlNet, UNet2DConditionModel};
 use mlx_gen_sdxl::vae::Autoencoder;
 use mlx_gen_sdxl::{
-    decode_image, denoise_ip_control, denoise_ip_multi_control, encode_conditioning,
-    load_controlnet, load_text_encoder_1_dtype, load_text_encoder_2_dtype, load_tokenizer,
-    load_unet_dtype, load_vae, preprocess_control_image, seeded_prior, text_time_ids,
-    ControlContext, Denoiser,
+    apply_sdxl_adapters_with, decode_image, denoise_ip_control, denoise_ip_multi_control,
+    encode_conditioning, load_controlnet, load_text_encoder_1_dtype, load_text_encoder_2_dtype,
+    load_tokenizer, load_unet_dtype, load_vae, preprocess_control_image, seeded_prior,
+    text_time_ids, ControlContext, Denoiser, LoraCoverage,
 };
 
 use mlx_gen::image::resize_lanczos_u8;
@@ -88,6 +88,12 @@ pub struct InstantIdPaths {
     /// Converted `ip-adapter.safetensors` (`image_proj.*` + `ip_adapter.*`; see
     /// `tools/convert_instantid.py`).
     pub ip_adapter: PathBuf,
+    /// User LoRA/LoKr style/character adapters to merge onto the SDXL UNet at load (sc-6038).
+    /// InstantID runs on a stock SDXL (RealVisXL) UNet, so SDXL-family LoRAs apply on top of the
+    /// IdentityNet + face IP-Adapter — exactly as `mlx_gen_sdxl::model::load` merges `spec.adapters`.
+    /// Empty (the common case) is a no-op. Distinct from [`ip_adapter`](Self::ip_adapter), which is
+    /// the InstantID identity IP-Adapter (not a user style/character LoRA).
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One InstantID generation request.
@@ -156,6 +162,24 @@ impl InstantId {
         let te2 = load_text_encoder_2_dtype(root, DTYPE)?;
         let vae = load_vae(root)?; // f32
         let mut unet = load_unet_dtype(root, DTYPE)?;
+
+        // User LoRA/LoKr (sc-6038) — merge into the dense fp16 UNet here, BEFORE `install_ip_adapter`
+        // and before the worker's later `.quantize()`, exactly as `mlx_gen_sdxl::model::load` does
+        // (LoRA folds into the float16 weights ahead of the IP K/V pairs + quant). The IdentityNet +
+        // face IP-Adapter ride on top — they target separate modules, so the merge order is immaterial
+        // to them, but keeping it pre-IP/pre-quant mirrors the SDXL path 1:1. COMPLETE coverage
+        // (mid_block + GEGLU FF) with the `SDXL_LORA_VENDORED` escape hatch — identical policy to the
+        // registry SDXL provider so an SDXL LoRA behaves the same whether the backbone is plain SDXL or
+        // InstantID. A non-empty spec that matches nothing errors (it never renders an unadapted image
+        // silently); the empty common case is a no-op.
+        if !paths.adapters.is_empty() {
+            let coverage = if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
+                LoraCoverage::Vendored
+            } else {
+                LoraCoverage::Complete
+            };
+            apply_sdxl_adapters_with(&mut unet, &paths.adapters, coverage)?;
+        }
 
         // IdentityNet — a stock diffusers SDXL ControlNet (sc-3112), no conversion.
         let identitynet = load_controlnet(&paths.identitynet, DTYPE)?;

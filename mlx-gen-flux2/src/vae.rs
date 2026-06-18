@@ -377,6 +377,14 @@ impl Flux2Vae {
         self.decode(&latents)
     }
 
+    /// The packed-space BatchNorm de-normalization stats `(bn_std, bn_mean)` (each `[128]`, in the
+    /// packed-channel order). For engines that reuse this VAE but unpatchify the packed latent
+    /// themselves (e.g. Ideogram 4, whose reference does `z * bn_std + bn_mean` before its own
+    /// unpatchify) rather than going through [`decode_packed_latents`].
+    pub fn bn_stats(&self) -> (&Array, &Array) {
+        (&self.bn_std, &self.bn_mean)
+    }
+
     /// Encode an image `[B, H, W, 3]` (NHWC, ~`[-1, 1]`) → latent **mean** `[B, H/8, W/8, 32]`.
     /// Mirrors the fork's `encode` (returns the mean; `scaling_factor=1.0, shift_factor=0.0`).
     pub fn encode_mean(&self, x: &Array) -> Result<Array> {

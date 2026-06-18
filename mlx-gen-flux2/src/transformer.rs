@@ -23,6 +23,7 @@ use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
+use crate::chunk::{map_seq_chunks, MemoryConfig};
 use crate::config::{Flux2Config, Flux2Quant};
 use crate::kv_cache::{Flux2KvCache, Stream};
 use crate::pos_embed::Flux2PosEmbed;
@@ -352,6 +353,8 @@ impl DoubleBlock {
     }
 
     /// `img_mod` / `txt_mod`: `[(shift_msa,scale_msa,gate_msa),(shift_mlp,scale_mlp,gate_mlp)]`.
+    /// `ffn_chunk` (sc-6266) bounds the image FFN's SwiGLU intermediate over sequence row-blocks;
+    /// `None` ⇒ the whole sequence at once, byte-identical to the shipped path.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -362,6 +365,7 @@ impl DoubleBlock {
         cos: &Array,
         sin: &Array,
         cache: CacheSlot<'_>,
+        ffn_chunk: Option<usize>,
     ) -> Result<(Array, Array)> {
         let (shift_msa, scale_msa, gate_msa) = &img_mod[0];
         let (shift_mlp, scale_mlp, gate_mlp) = &img_mod[1];
@@ -380,7 +384,10 @@ impl DoubleBlock {
         txt = gated(&txt, c_gate_msa, &txt_attn)?;
 
         let norm_img2 = modulate(&layer_norm(&img, None, None, LN_EPS)?, scale_mlp, shift_mlp)?;
-        let img_ff = self.ff.forward(&norm_img2)?;
+        // sc-6266: chunk the (largest) image FFN intermediate over sequence row-blocks on the gated
+        // long-sequence multi-reference edit path. `ffn_chunk == None` ⇒ a single `ff.forward` call,
+        // byte-identical to the shipped forward.
+        let img_ff = map_seq_chunks(&norm_img2, ffn_chunk, |c| self.ff.forward(c))?;
         img = gated(&img, gate_mlp, &img_ff)?;
 
         let norm_txt2 = modulate(
@@ -727,6 +734,96 @@ impl Flux2Transformer {
         guidance: Option<f32>,
         cache: Option<&Flux2KvCache>,
     ) -> Result<Array> {
+        self.forward_inner(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            cache,
+            None,
+            &MemoryConfig::OFF,
+        )
+    }
+
+    /// As [`forward_with_cache`](Self::forward_with_cache), with an explicit [`MemoryConfig`] that
+    /// bounds the per-step activation high-water (sc-6266). The generate loop passes
+    /// [`MemoryConfig::LONG_SEQ`] only on the gated long-sequence multi-reference edit path; every
+    /// other path uses [`MemoryConfig::OFF`] (this method with `OFF` is byte-identical to
+    /// [`forward_with_cache`](Self::forward_with_cache)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_mem(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        timestep: f32,
+        guidance: Option<f32>,
+        cache: Option<&Flux2KvCache>,
+        mem: &MemoryConfig,
+    ) -> Result<Array> {
+        self.forward_inner(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            cache,
+            None,
+            mem,
+        )
+    }
+
+    /// FLUX.2-dev Fun-Controlnet-Union forward (sc-2292): [`forward_with_cache`](Self::forward_with_cache)
+    /// plus a VACE control branch. `control = (branch, control_context, scale)` — the branch's
+    /// per-block hints are computed once from the post-embedder image+caption streams and added to the
+    /// base image stream after each base double block in `branch.places`, scaled by `scale`. At
+    /// `scale = 0` the result is byte-identical to the base forward (the parity self-check). The
+    /// control path takes no KV cache (dev control is a single embedded-guidance forward).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_control(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        timestep: f32,
+        guidance: Option<f32>,
+        control: (&Flux2ControlBranch, &Array, f32),
+    ) -> Result<Array> {
+        self.forward_inner(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            None,
+            Some(control),
+            &MemoryConfig::OFF,
+        )
+    }
+
+    /// Shared body behind [`forward_with_cache`](Self::forward_with_cache) and
+    /// [`forward_with_control`](Self::forward_with_control). `cache` threads the 9b-kv reference K/V
+    /// (klein edit); `control` injects VACE control hints (dev pose). The two are mutually exclusive
+    /// in practice (kv = klein edit; control = dev pose).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_inner(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        timestep: f32,
+        guidance: Option<f32>,
+        cache: Option<&Flux2KvCache>,
+        control: Option<(&Flux2ControlBranch, &Array, f32)>,
+        mem: &MemoryConfig,
+    ) -> Result<Array> {
         let temb = self.temb(timestep, guidance)?;
         let mut img = self
             .x_embedder
@@ -760,6 +857,15 @@ impl Flux2Transformer {
         let img_mod = [mi[0].clone(), mi[1].clone()];
         let txt_mod = [mt[0].clone(), mt[1].clone()];
 
+        // VACE control hints (sc-2292): computed once from the post-embedder image+caption streams,
+        // before the base double-block loop (the fork's `forward_control`), then injected per block.
+        let hints = match control {
+            Some((branch, cc, _)) => {
+                Some(branch.forward_control(&img, &txt, cc, &img_mod, &txt_mod, &cos, &sin)?)
+            }
+            None => None,
+        };
+
         for (idx, block) in self.double_blocks.iter().enumerate() {
             (txt, img) = block.forward(
                 img,
@@ -769,7 +875,20 @@ impl Flux2Transformer {
                 &cos,
                 &sin,
                 cache.map(|c| (c, idx)),
+                mem.ffn_seq_chunk,
             )?;
+            // Add the control hint into the base image stream (`img + hints[n]·scale`) at the mapped
+            // base double blocks. `scale = 0` → `+0` → byte-identical to the base forward.
+            if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
+                if let Some(n) = branch.hint_index(idx) {
+                    img = add(&img, &multiply(&hints[n], scalar(*scale))?)?;
+                }
+            }
+            // sc-6266: cap the per-step lazy-graph peak at ~one block's transients (bit-exact). Gated
+            // off (`mem.eval_per_block == false`) for every shipped path → no extra evals there.
+            if mem.eval_per_block {
+                mlx_rs::transforms::eval([&img, &txt])?;
+            }
         }
 
         let txt_seq = txt.shape()[1];
@@ -777,6 +896,10 @@ impl Flux2Transformer {
         let ms = self.mod_single.forward(&temb)?;
         for (idx, block) in self.single_blocks.iter().enumerate() {
             hidden = block.forward(&hidden, &ms[0], &cos, &sin, cache.map(|c| (c, idx)))?;
+            // sc-6266: per-block eval-to-free (bit-exact), gated off for shipped paths.
+            if mem.eval_per_block {
+                mlx_rs::transforms::eval([&hidden])?;
+            }
         }
 
         // Keep only the image tokens.
@@ -794,6 +917,235 @@ impl Flux2Transformer {
         let hidden = hidden.take_axis(&img_idx, 1)?;
         let hidden = self.norm_out(&hidden, &temb)?;
         self.proj_out.forward(&hidden)
+    }
+}
+
+// ---- sc-2292: FLUX.2-dev Fun-Controlnet-Union (VACE-style strict pose) -------------------------
+//
+// Port of `alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union` (`videox_fun/models/flux2_transformer2d_control.py`):
+// a VACE-style ControlNet (modified from `vace/models/wan/wan_vace.py`) added on the FIRST 4 of dev's
+// 8 base double blocks (`control_layers = range(0, num_double_layers, 2) = [0, 2, 4, 6]`). A
+// `control_img_in` patch embedder maps the packed control context (control latent 128 + mask 4 +
+// inpaint latent 128 = 260) into the inner dim; N control double blocks thread an internal
+// `(c_image, txt)` pair — block 0 seeds `c = before_proj(c) + img_embed`, each runs a full base
+// double-block forward and emits `after_proj(c)` as its hint — and the hints are added into the base
+// image stream after the matching base double blocks, scaled by `control_context_scale`. The control
+// blocks reuse the base `double_stream_modulation_{img,txt}` + RoPE (the fork passes them through);
+// the threaded `txt` is local to the control stack (the base caption stream is untouched).
+
+/// In-features of `control_img_in`: the packed control context = control latent (128) + mask (4) +
+/// inpaint latent (128) = 260, per `pipeline_flux2_control.py`
+/// (`torch.concat([control_latents, mask_condition, inpaint_latent], dim=2)`).
+pub const CONTROL_IN_DIM: i32 = 260;
+
+/// One VACE control block: a full FLUX.2 double block (its own attn / ff / ff_context weights) plus
+/// the `after_proj` hint projection (every block) and `before_proj` (block 0 only) seeding the
+/// control branch from the base image embedding. Port of `Flux2ControlTransformerBlock`.
+struct Flux2ControlBlock {
+    base: DoubleBlock,
+    /// `before_proj(c) + img_embed` seeds block 0 (`None` for the rest). Bias-carrying.
+    before_proj: Option<AdaptableLinear>,
+    /// `after_proj(c)` — the per-block hint added into the base image stream. Bias-carrying.
+    after_proj: AdaptableLinear,
+}
+
+impl Flux2ControlBlock {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        heads: i32,
+        head_dim: i32,
+        has_before_proj: bool,
+    ) -> Result<Self> {
+        // The control block's attn/ff/ff_context keys match a base double block 1:1; load dense
+        // (the bf16 control overlay is small enough to quantize in place after load).
+        let base = DoubleBlock::from_weights(w, prefix, heads, head_dim, None)?;
+        let after_proj = AdaptableLinear::dense(
+            w.require(&format!("{prefix}.after_proj.weight"))?.clone(),
+            Some(w.require(&format!("{prefix}.after_proj.bias"))?.clone()),
+        );
+        let before_proj = if has_before_proj {
+            Some(AdaptableLinear::dense(
+                w.require(&format!("{prefix}.before_proj.weight"))?.clone(),
+                Some(w.require(&format!("{prefix}.before_proj.bias"))?.clone()),
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            base,
+            before_proj,
+            after_proj,
+        })
+    }
+
+    /// Quantize the block's base double block + the `after_proj`/`before_proj` projections (all
+    /// `% 64 == 0`). The only control Linear left dense is `control_img_in` (260 in-features), handled
+    /// in [`Flux2ControlBranch::quantize`].
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.base.quantize(bits)?;
+        self.after_proj.quantize(bits, None)?;
+        if let Some(bp) = &mut self.before_proj {
+            bp.quantize(bits, None)?;
+        }
+        Ok(())
+    }
+}
+
+/// The FLUX.2-dev Fun-Controlnet-Union control branch (sc-2292): the `control_img_in` patch embedder
+/// plus the N control blocks injecting hints into the base double blocks at `control_layers`. Built
+/// from the Fun-Controlnet-Union checkpoint and driven by [`Flux2Transformer::forward_with_control`].
+pub struct Flux2ControlBranch {
+    /// `control_img_in`: 260 → inner. Kept **dense** (its 260 in-features is not a multiple of the
+    /// quant group size 64), matching the fork's `nn.quantize` predicate. Bias-carrying.
+    control_img_in: AdaptableLinear,
+    blocks: Vec<Flux2ControlBlock>,
+    /// Base double-block indices each control block injects into (`control_layers`); `places[n]` is
+    /// the base index for hint `n` (`[0, 2, 4, 6]` for dev's 8 double blocks).
+    places: Vec<usize>,
+}
+
+impl Flux2ControlBranch {
+    /// Build from the Fun-Controlnet-Union checkpoint (`control` Weights). Keys are un-prefixed for a
+    /// real checkpoint (`control_img_in.*`, `control_transformer_blocks.{i}.*`); `prefix` is e.g.
+    /// `"w"` for a synthetic fixture. `control_layers = range(0, num_double_layers, 2)`.
+    pub fn from_weights(w: &Weights, prefix: &str, cfg: &Flux2Config) -> Result<Self> {
+        let p = |s: &str| {
+            if prefix.is_empty() {
+                s.to_string()
+            } else {
+                format!("{prefix}.{s}")
+            }
+        };
+        let heads = cfg.num_heads as i32;
+        let head_dim = cfg.head_dim as i32;
+        let places: Vec<usize> = (0..cfg.num_double_layers).step_by(2).collect();
+        let control_img_in = AdaptableLinear::dense(
+            w.require(&p("control_img_in.weight"))?.clone(),
+            Some(w.require(&p("control_img_in.bias"))?.clone()),
+        );
+        let blocks = (0..places.len())
+            .map(|i| {
+                Flux2ControlBlock::from_weights(
+                    w,
+                    &p(&format!("control_transformer_blocks.{i}")),
+                    heads,
+                    head_dim,
+                    i == 0,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            control_img_in,
+            blocks,
+            places,
+        })
+    }
+
+    /// Quantize the control blocks (+ their `after_proj`/`before_proj`); `control_img_in` stays dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for b in &mut self.blocks {
+            b.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    /// The hint index injected at base double-block `idx`, or `None`.
+    fn hint_index(&self, idx: usize) -> Option<usize> {
+        self.places.iter().position(|&p| p == idx)
+    }
+
+    /// Run the control stack → per-block hints (the fork's `forward_control`). `img_embed`/`txt_embed`
+    /// are the post-embedder base streams; `control_context` is the packed 260-ch control context;
+    /// `img_mod`/`txt_mod`/`cos`/`sin` are the shared base double-stream modulation + RoPE (the control
+    /// blocks reuse the base modulation, per the fork). The threaded `txt` is local to the control
+    /// stack — only the image-stream hints leave.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_control(
+        &self,
+        img_embed: &Array,
+        txt_embed: &Array,
+        control_context: &Array,
+        img_mod: &[(Array, Array, Array); 2],
+        txt_mod: &[(Array, Array, Array); 2],
+        cos: &Array,
+        sin: &Array,
+    ) -> Result<Vec<Array>> {
+        let mut c = self
+            .control_img_in
+            .forward(&require_f32_input(control_context)?)?;
+        let mut txt = txt_embed.clone();
+        let mut hints = Vec::with_capacity(self.blocks.len());
+        for (i, block) in self.blocks.iter().enumerate() {
+            if i == 0 {
+                let bp = block.before_proj.as_ref().ok_or_else(|| {
+                    Error::Msg("flux2 control block 0 is missing before_proj".into())
+                })?;
+                c = add(&bp.forward(&c)?, img_embed)?;
+            }
+            let (new_txt, new_c) = block
+                .base
+                .forward(c, txt, img_mod, txt_mod, cos, sin, None, None)?;
+            hints.push(block.after_proj.forward(&new_c)?);
+            c = new_c;
+            txt = new_txt;
+        }
+        Ok(hints)
+    }
+}
+
+/// The FLUX.2-dev base MMDiT + its Fun-Controlnet-Union control branch (sc-2292). Composes the
+/// parity-proven [`Flux2Transformer`] with a [`Flux2ControlBranch`]; [`forward`](Self::forward)
+/// threads the control context + scale, and [`quantize`](Self::quantize) packs both (the base
+/// no-ops if it was loaded pre-quantized; the dense control overlay packs here).
+pub struct Flux2ControlTransformer {
+    base: Flux2Transformer,
+    branch: Flux2ControlBranch,
+}
+
+impl Flux2ControlTransformer {
+    pub fn new(base: Flux2Transformer, branch: Flux2ControlBranch) -> Self {
+        Self { base, branch }
+    }
+
+    /// Quantize the base + the control branch. On a dev pre-quantized snapshot (sc-5917) the base is
+    /// already packed, so `base.quantize` is a no-op; the bf16 control overlay packs here.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.base.quantize(bits)?;
+        self.branch.quantize(bits)?;
+        Ok(())
+    }
+
+    /// Adapter host = the base DiT (LoRA/LoKr target; the control branch is never an adapter target,
+    /// mirroring the Z-Image control port).
+    pub fn base_mut(&mut self) -> &mut Flux2Transformer {
+        &mut self.base
+    }
+
+    /// Control forward: latent `[B, seq, in]` + text embeds + ids + timestep + embedded `guidance` +
+    /// packed `control_context` (260ch, same image seq as the latent) + `control_context_scale`.
+    /// Returns the velocity `[B, seq_img, out]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        timestep: f32,
+        guidance: Option<f32>,
+        control_context: &Array,
+        control_context_scale: f32,
+    ) -> Result<Array> {
+        self.base.forward_with_control(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            (&self.branch, control_context, control_context_scale),
+        )
     }
 }
 
@@ -922,8 +1274,17 @@ impl AdaptableHost for Flux2Transformer {
             ["single_stream_modulation", rest @ ..] => self.mod_single.adaptable_mut(rest),
             ["time_guidance_embed", "linear_1"] => Some(&mut self.time_linear1),
             ["time_guidance_embed", "linear_2"] => Some(&mut self.time_linear2),
-            // klein is distilled (no guidance embedding), so `guidance_linear_{1,2}` don't exist
-            // here — a LoRA targeting them is correctly surfaced as unmatched.
+            // The embedded-guidance branch (`time_guidance_embed.guidance_embedder.linear_{1,2}`)
+            // exists only on FLUX.2-**dev** (sc-5920); klein is guidance-distilled so these fields
+            // are `None` → `as_mut()` yields `None` → unmatched, exactly as before. Routed for
+            // symmetry with the timestep branch above so a dev "all-linear" LoRA that includes the
+            // guidance embedder resolves instead of failing the strict no-silent-drop apply.
+            ["time_guidance_embed", "guidance_embedder", "linear_1"] => {
+                self.guidance_linear1.as_mut()
+            }
+            ["time_guidance_embed", "guidance_embedder", "linear_2"] => {
+                self.guidance_linear2.as_mut()
+            }
             ["transformer_blocks", n, rest @ ..] => self
                 .double_blocks
                 .get_mut(n.parse::<usize>().ok()?)?
@@ -1439,6 +1800,204 @@ mod tests {
             "every diffusers-named kohya stem should resolve"
         );
         assert!(report.unmatched_paths.is_empty());
+    }
+
+    // ---- sc-5920 FLUX.2-dev adapters (wider/deeper graph + the dev guidance embedder) ----------
+    //
+    // dev shares the `Flux2Transformer` (so the klein adapter engine + key→module map serve it), but
+    // its DiT is wider/deeper — 8 double + **48** single blocks (vs klein's 24) — and it carries the
+    // embedded-guidance embedder klein lacks. These no-real-weight tests pin that the path-addressed
+    // install covers the full dev graph; `dev_adapter_real_weights.rs` is the on-Mac render check.
+
+    /// A dev-shaped transformer: 8 double + 48 single blocks and the embedded-guidance embedder
+    /// present (`Some`) — the structural deltas from `tiny_transformer` (klein) that this story pins.
+    fn dev_transformer() -> Flux2Transformer {
+        Flux2Transformer {
+            pos_embed: Flux2PosEmbed::new(2000.0, [32, 32, 32, 32]),
+            time_linear1: dummy_lin(),
+            time_linear2: dummy_lin(),
+            // dev's embedded distilled-guidance branch (klein is `None` here).
+            guidance_linear1: Some(dummy_lin()),
+            guidance_linear2: Some(dummy_lin()),
+            mod_img: modulation(2),
+            mod_txt: modulation(2),
+            mod_single: modulation(1),
+            x_embedder: dummy_lin(),
+            context_embedder: dummy_lin(),
+            double_blocks: (0..8)
+                .map(|_| DoubleBlock {
+                    attn: double_attn(),
+                    ff: ff(),
+                    ff_context: ff(),
+                })
+                .collect(),
+            single_blocks: (0..48)
+                .map(|_| SingleBlock {
+                    to_qkv_mlp: dummy_lin(),
+                    to_out: dummy_lin(),
+                    norm_q: dummy_arr(),
+                    norm_k: dummy_arr(),
+                    heads: 1,
+                    head_dim: 1,
+                    inner: 1,
+                })
+                .collect(),
+            norm_out_linear: dummy_lin(),
+            proj_out: dummy_lin(),
+            time_channels: 256,
+        }
+    }
+
+    /// The dev key→module map resolves the WIDER/DEEPER graph (every one of the 8 double + 48 single
+    /// blocks, incl. the last) plus the dev-only embedded-guidance embedder, and still rejects
+    /// out-of-range indices.
+    #[test]
+    fn dev_routes_wider_graph_and_guidance_embedder() {
+        let mut t = dev_transformer();
+
+        // The dev embedded-guidance embedder resolves (on klein, `guidance_linear*` is `None` →
+        // `as_mut()` is `None` → these would NOT resolve — the structural delta this story pins).
+        for p in [
+            "time_guidance_embed.guidance_embedder.linear_1",
+            "time_guidance_embed.guidance_embedder.linear_2",
+        ] {
+            assert!(
+                resolves(&mut t, p),
+                "dev guidance embedder {p} should resolve"
+            );
+        }
+
+        // Every double block (0..8) and EVERY single block (0..48), including the deepest indices that
+        // klein's 24-block graph never reaches — the path-addressed install scales with the config.
+        for i in 0..8 {
+            for tgt in [
+                "attn.to_q",
+                "attn.to_add_out",
+                "ff.linear_out",
+                "ff_context.linear_in",
+            ] {
+                let p = format!("transformer_blocks.{i}.{tgt}");
+                assert!(resolves(&mut t, &p), "{p} should resolve");
+            }
+        }
+        for i in 0..48 {
+            for tgt in ["attn.to_qkv_mlp_proj", "attn.to_out"] {
+                let p = format!("single_transformer_blocks.{i}.{tgt}");
+                assert!(resolves(&mut t, &p), "{p} should resolve");
+            }
+        }
+
+        // Out of range for dev (8 double: 0..7; 48 single: 0..47) and the klein-spelled guidance
+        // linears (not the dev `guidance_embedder.*` path) must NOT resolve.
+        for p in [
+            "transformer_blocks.8.attn.to_q",
+            "single_transformer_blocks.48.attn.to_out",
+            "time_guidance_embed.guidance_linear_1",
+        ] {
+            assert!(!resolves(&mut t, p), "{p} must not resolve");
+        }
+    }
+
+    /// The full dev kohya surface applies through the strict provider: one `lora_unet_` key-pair per
+    /// enumerated stem resolves, none unmatched. Pins the dev surface count = 8 double × 13 + 48
+    /// single × 2 = 200 (klein's is 8×13 + 24×2 = 152), proving the wider/deeper graph is covered.
+    #[test]
+    fn dev_kohya_full_surface_applies() {
+        use crate::adapters::apply_flux2_adapters;
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+
+        let small = Array::from_slice(&[0.01f32], &[1, 1]);
+        let meta = None as Option<&std::collections::HashMap<String, String>>;
+
+        let mut t = dev_transformer();
+        let n = t.adaptable_paths().len();
+        assert_eq!(n, 200, "dev kohya surface (8×13 double + 48×2 single)");
+
+        let mut arrays: Vec<(String, &Array)> = Vec::new();
+        for stem in t.adaptable_paths().iter().map(|p| p.replace('.', "_")) {
+            arrays.push((format!("lora_unet_{stem}.lora_down.weight"), &small));
+            arrays.push((format!("lora_unet_{stem}.lora_up.weight"), &small));
+        }
+        let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let path = tmp("flux2_dev_kohya_full.safetensors");
+        Array::save_safetensors(refs, meta, &path).unwrap();
+        let report = apply_flux2_adapters(
+            &mut t,
+            &[AdapterSpec {
+                path,
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+                pass_scales: None,
+                moe_expert: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.applied, n, "every dev kohya stem should resolve");
+        assert!(report.unmatched_paths.is_empty());
+    }
+
+    /// A peft LoKr file (bare module paths, `networkType=lokr`) resolves + installs across a span of
+    /// the dev graph (first/last single block, a deep double block) — LoKr falls out of the same
+    /// family-agnostic engine as LoRA, on the wider graph.
+    #[test]
+    fn dev_lokr_resolves_on_wider_graph() {
+        use crate::adapters::apply_flux2_adapters;
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+
+        // Minimal valid peft LoKr for a [1,1] base: w1=[1,1], low-rank w2 = w2_a@w2_b = [1,1] →
+        // kron(w1, w2) reshapes to [1,1]. (The real-weight test exercises true block shapes.)
+        let w1 = Array::from_slice(&[1.0f32], &[1, 1]);
+        let w2a = Array::from_slice(&[0.5f32], &[1, 1]);
+        let w2b = Array::from_slice(&[0.5f32], &[1, 1]);
+        let targets = [
+            "single_transformer_blocks.0.attn.to_qkv_mlp_proj",
+            "single_transformer_blocks.47.attn.to_out",
+            "transformer_blocks.7.attn.to_q",
+            "transformer_blocks.7.ff.linear_in",
+        ];
+        let mut arrays: Vec<(String, &Array)> = Vec::new();
+        for tgt in targets {
+            arrays.push((format!("{tgt}.lokr_w1"), &w1));
+            arrays.push((format!("{tgt}.lokr_w2_a"), &w2a));
+            arrays.push((format!("{tgt}.lokr_w2_b"), &w2b));
+        }
+        let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let mut md = std::collections::HashMap::new();
+        md.insert("networkType".to_string(), "lokr".to_string());
+        md.insert("rank".to_string(), "1".to_string());
+        md.insert("alpha".to_string(), "1".to_string());
+        let path = tmp("flux2_dev_lokr.safetensors");
+        Array::save_safetensors(refs, Some(&md), &path).unwrap();
+
+        let mut t = dev_transformer();
+        let report = apply_flux2_adapters(
+            &mut t,
+            &[AdapterSpec {
+                path,
+                scale: 1.0,
+                kind: AdapterKind::Lokr,
+                pass_scales: None,
+                moe_expert: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            report.applied,
+            targets.len(),
+            "every dev LoKr target should resolve"
+        );
+        assert!(report.unmatched_paths.is_empty());
+        // Each target carries one real LoKr delta (not silently dropped / turned into a no-op).
+        for tgt in targets {
+            let segs: Vec<&str> = tgt.split('.').collect();
+            let installed = AdaptableHost::adaptable_mut(&mut t, &segs)
+                .unwrap()
+                .adapters();
+            assert!(
+                matches!(installed, [Adapter::Lokr { .. }]),
+                "expected exactly one LoKr adapter at {tgt}"
+            );
+        }
     }
 
     // ---- sc-2743 BFL / ComfyUI fused→split routing (no real weights) --------------------------

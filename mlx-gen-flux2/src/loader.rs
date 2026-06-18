@@ -13,12 +13,13 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Result, WeightsSource};
 
 use crate::config::{Flux2Config, Flux2Quant};
 use crate::text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
-use crate::transformer::Flux2Transformer;
+use crate::transformer::{Flux2ControlBranch, Flux2ControlTransformer, Flux2Transformer};
 use crate::vae::Flux2Vae;
+use crate::vision::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};
 
 /// Read a component's pre-quantized-snapshot manifest (sc-5917): the `quantization` block
 /// (`{ "bits", "group_size" }`) [`crate::convert`] writes into `{dir}/config.json`. `None` for a
@@ -105,12 +106,18 @@ pub fn load_text_encoder_dev(root: &Path) -> Result<Qwen3TextEncoder> {
     let dir = root.join("text_encoder");
     let quant = read_component_quant(&dir)?;
     let w = Weights::from_dir(dir)?;
-    Qwen3TextEncoder::from_weights_quant(
+    let mut encoder = Qwen3TextEncoder::from_weights_quant(
         &w,
         "language_model.model",
         &Qwen3TextEncoderConfig::mistral_dev(),
         quant,
-    )
+    )?;
+    // Also load the final norm + LM head so this encoder can drive the caption-upsampling
+    // `generate()` loop (sc-6030) — the dev `Mistral3ForConditionalGeneration` snapshot carries
+    // `language_model.lm_head.weight` (dense bf16) + `language_model.model.norm.weight`, both
+    // retained by the pre-quant convert. The T2I/edit prompt-embeds path never touches them.
+    encoder.load_generation_head(&w, "language_model", quant)?;
+    Ok(encoder)
 }
 
 /// Load the FLUX.2 VAE. The on-disk diffusers keys (`encoder.*`/`decoder.*`/`quant_conv.*`/
@@ -165,4 +172,57 @@ pub fn load_transformer(root: &Path) -> Result<Flux2Transformer> {
 /// dev dims (48 single blocks / 48 heads / joint 15360), via `Flux2Config::dev()`.
 pub fn load_transformer_dev(root: &Path) -> Result<Flux2Transformer> {
     load_transformer_with(root, &Flux2Config::dev())
+}
+
+/// Load the FLUX.2-dev base MMDiT **plus** the Fun-Controlnet-Union control branch (sc-2292) from
+/// the dev `transformer/` snapshot (`root`) and the control checkpoint (`control` — a single
+/// `.safetensors` `File`, or a `Dir` of them; the HF cache stores it as one file in a snapshot dir).
+/// The base loads manifest-aware (a pre-quantized dev snapshot loads packed, sc-5917); the control
+/// keys (`control_img_in.*`, `control_transformer_blocks.{i}.*`) map 1:1 onto the branch and load
+/// dense (un-prefixed). `load_dev_control` then quantizes the whole [`Flux2ControlTransformer`] —
+/// a no-op on the already-packed base, packing the dense control overlay.
+pub fn load_control_transformer_dev(
+    root: &Path,
+    control: &WeightsSource,
+) -> Result<Flux2ControlTransformer> {
+    let cfg = Flux2Config::dev();
+    let base = load_transformer_dev(root)?;
+    let mut control_weights = match control {
+        WeightsSource::File(p) => Weights::from_file(p)?,
+        WeightsSource::Dir(p) => Weights::from_dir(p)?,
+    };
+    // Each control block's attention output projection ships as the diffusers Sequential
+    // `attn.to_out.0` (`[Linear, Dropout]`), exactly like the base `transformer_blocks.{i}.attn.to_out.0`
+    // — rename it to the internal `attn.to_out` the shared `DoubleBlock` loader reads. (`alias` of
+    // `.scales`/`.biases` is a no-op for the dense bf16 control checkpoint.)
+    let n_control = (0..cfg.num_double_layers).step_by(2).count();
+    for i in 0..n_control {
+        for suffix in ["weight", "scales", "biases"] {
+            control_weights.alias(
+                &format!("control_transformer_blocks.{i}.attn.to_out.0.{suffix}"),
+                &format!("control_transformer_blocks.{i}.attn.to_out.{suffix}"),
+            );
+        }
+    }
+    let branch = Flux2ControlBranch::from_weights(&control_weights, "", &cfg)?;
+    Ok(Flux2ControlTransformer::new(base, branch))
+}
+
+/// Load the FLUX.2-dev **Pixtral vision tower** (sc-5918) from the `text_encoder/` snapshot — the
+/// `vision_tower.*` keys of the `Mistral3ForConditionalGeneration` checkpoint. Used for
+/// edit/reference image conditioning (sc-5919), not the T2I path. The tower stays full precision
+/// (only the MMDiT + Mistral language tower quantize), so it loads dense regardless of the
+/// pre-quantized-snapshot manifest.
+pub fn load_vision_tower_dev(root: &Path) -> Result<PixtralVisionTower> {
+    let w = Weights::from_dir(root.join("text_encoder"))?;
+    PixtralVisionTower::from_weights(&w, "vision_tower", PixtralVisionConfig::dev())
+}
+
+/// Load the FLUX.2-dev **Mistral3 multimodal projector** (sc-5918) from the `text_encoder/`
+/// snapshot (`multi_modal_projector.*` keys). `spatial_merge_size = 2`; the projector's RMSNorm
+/// uses the Mistral **text** `rms_norm_eps` (1e-5), per the reference. Full precision, like the
+/// vision tower.
+pub fn load_multimodal_projector_dev(root: &Path) -> Result<Mistral3Projector> {
+    let w = Weights::from_dir(root.join("text_encoder"))?;
+    Mistral3Projector::from_weights(&w, "multi_modal_projector", 2, 1e-5)
 }
