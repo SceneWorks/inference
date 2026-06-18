@@ -1,0 +1,20 @@
+[package]
+name = "mlx-gen-boogu"
+version = "0.0.0"
+edition = "2021"
+description = "Boogu-Image-0.1 (Lumina-Image-2.0 / OmniGen2 lineage) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "boogu-image", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Parse the diffusers `transformer/config.json` (architecture + pre-quant manifest).
+serde_json = "1"
+
+[dev-dependencies]
+# Backend-neutral contract conformance suite — Boogu runs through it on the macos-mlx lane.
+sceneworks-gen-core-testkit = { workspace = true }
