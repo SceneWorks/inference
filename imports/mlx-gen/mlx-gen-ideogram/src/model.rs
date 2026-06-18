@@ -13,19 +13,23 @@
 use mlx_gen::array::host_i32;
 use mlx_gen::gen_core;
 use mlx_gen::{
-    default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result,
-    WeightsSource,
+    default_seed, AdapterKind, AdapterSpec, Capabilities, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{
-    DEFAULT_GUIDANCE, DEFAULT_MU, DEFAULT_STEPS, IDEOGRAM_4_ID, RES_MAX, RES_MIN, RES_MULTIPLE,
+    DEFAULT_GUIDANCE, DEFAULT_MU, DEFAULT_STEPS, DEFAULT_TURBO_STEPS, IDEOGRAM_4_ID,
+    IDEOGRAM_4_TURBO_ID, RES_MAX, RES_MIN, RES_MULTIPLE, TURBO_LORA_FILE, TURBO_LORA_SCALE,
 };
 use crate::pipeline::Ideogram4Pipeline;
 
 /// Registry id (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = IDEOGRAM_4_ID;
+
+/// Registry id for the few-step CFG-free turbo variant (issue #488).
+pub const MODEL_ID_TURBO: &str = IDEOGRAM_4_TURBO_ID;
 
 /// Max images per request (the image-model standard, shared with the other MLX families).
 const MAX_COUNT: u32 = 8;
@@ -65,6 +69,18 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
         },
     }
+}
+
+/// Ideogram 4 **turbo** identity + capabilities (issue #488). Same surface as [`descriptor`] except
+/// it is **CFG-free** — the TurboTime LoRA distilled the guided velocity into a single DiT, so
+/// `guidance` is not offered (no unconditional branch). Few-step (`DEFAULT_TURBO_STEPS`), single DiT.
+pub fn descriptor_turbo() -> ModelDescriptor {
+    let mut d = descriptor();
+    d.id = MODEL_ID_TURBO;
+    // CFG-free: there is no unconditional DiT to mix against, so guidance is inert. (negative-prompt
+    // and true_cfg were already off.)
+    d.capabilities.supports_guidance = false;
+    d
 }
 
 /// A loaded Ideogram 4 generator: the assembled pipeline plus the cached descriptor.
@@ -111,6 +127,62 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
+/// Construct an [`Ideogram4`] **turbo** generator (issue #488) from a [`LoadSpec`]. `spec.weights`
+/// must be a [`WeightsSource::Dir`] pointing at a turbo snapshot — the conditional `transformer/`,
+/// `text_encoder/`, `vae/`, `tokenizer/`, plus the bundled [`TURBO_LORA_FILE`]; the unconditional
+/// DiT is not loaded. Loads the single DiT, quantizes (Q4/Q8) if requested, then installs the
+/// TurboTime LoRA at scale 1.0 — the CFG-free few-step path. A precision override or **user**
+/// LoRA/LoKr adapters are rejected (the TurboTime LoRA is part of the snapshot, not user-supplied).
+pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(
+            "ideogram_4_turbo: only dense bf16 is wired (drop the precision override)".into(),
+        ));
+    }
+    if !spec.adapters.is_empty() {
+        return Err(Error::Msg(
+            "ideogram_4_turbo: user LoRA/LoKr adapters are not supported (the TurboTime LoRA is \
+             bundled in the snapshot)"
+                .into(),
+        ));
+    }
+    let root =
+        match &spec.weights {
+            WeightsSource::Dir(p) => p,
+            WeightsSource::File(_) => return Err(Error::Msg(
+                "ideogram_4_turbo expects a snapshot directory (transformer/ text_encoder/ vae/ \
+                 tokenizer/ + turbo_lora.safetensors), not a single .safetensors file"
+                    .into(),
+            )),
+        };
+    let lora_path = root.join(TURBO_LORA_FILE);
+    if !lora_path.exists() {
+        return Err(Error::Msg(format!(
+            "ideogram_4_turbo: bundled TurboTime LoRA not found at {} (a turbo snapshot must \
+             include {TURBO_LORA_FILE})",
+            lora_path.display()
+        )));
+    }
+    // Single conditional DiT (no unconditional branch) + TE + VAE + tokenizer.
+    let mut pipeline = Ideogram4Pipeline::load_turbo(root)?;
+    // Quantize the base first (Q4/Q8), then install the LoRA residual on top — fork-faithful order
+    // (matches the flux2 family): the residual is computed and added over the possibly quantized base.
+    if let Some(q) = spec.quantize {
+        pipeline.quantize(q.bits())?;
+    }
+    pipeline.apply_adapters(&[AdapterSpec {
+        path: lora_path,
+        scale: TURBO_LORA_SCALE,
+        kind: AdapterKind::Lora,
+        pass_scales: None,
+        moe_expert: None,
+    }])?;
+    Ok(Box::new(Ideogram4 {
+        descriptor: descriptor_turbo(),
+        pipeline,
+    }))
+}
+
 impl Generator for Ideogram4 {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -140,7 +212,14 @@ impl Ideogram4 {
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor.capabilities, req)?;
 
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        // Turbo defaults to the few-step count; quality mode to the 48-step preset. `guidance` is
+        // inert in turbo (the pipeline runs CFG-free when the unconditional DiT is absent).
+        let default_steps = if self.pipeline.is_turbo() {
+            DEFAULT_TURBO_STEPS
+        } else {
+            DEFAULT_STEPS
+        };
+        let steps = req.steps.unwrap_or(default_steps) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let base_seed = req.seed.unwrap_or_else(default_seed);
 
@@ -220,6 +299,15 @@ fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 inventory::submit! {
     ModelRegistration { descriptor, load: load_registered }
+}
+
+/// Registry adapter for the turbo variant (issue #488) — registered under `ideogram_4_turbo`.
+fn load_turbo_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_turbo(spec).map_err(Into::into)
+}
+
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_turbo, load: load_turbo_registered }
 }
 
 #[cfg(test)]
@@ -373,6 +461,94 @@ mod tests {
         assert!(
             !e.contains("no generator registered"),
             "id not resolved: {e}"
+        );
+    }
+
+    // ── Turbo variant (issue #488) ────────────────────────────────────────────────────────
+
+    #[test]
+    fn descriptor_turbo_is_cfg_free_else_matches_base() {
+        let (b, t) = (descriptor(), descriptor_turbo());
+        assert_eq!(t.id, "ideogram_4_turbo");
+        assert_eq!(t.family, b.family);
+        assert_eq!(t.backend, b.backend);
+        assert_eq!(t.modality, b.modality);
+        // The one capability that differs: turbo is CFG-free (no unconditional DiT to mix against).
+        assert!(b.capabilities.supports_guidance);
+        assert!(!t.capabilities.supports_guidance);
+        // Everything else is identical to the base surface.
+        assert_eq!(
+            t.capabilities.supports_negative_prompt,
+            b.capabilities.supports_negative_prompt
+        );
+        assert_eq!(
+            t.capabilities.supported_quants,
+            b.capabilities.supported_quants
+        );
+        assert_eq!(
+            (t.capabilities.min_size, t.capabilities.max_size),
+            (b.capabilities.min_size, b.capabilities.max_size)
+        );
+        assert!(t.capabilities.mac_only);
+    }
+
+    #[test]
+    fn load_turbo_rejects_single_file_source() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        let e = load_turbo(&spec)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(e.contains("snapshot directory"), "got: {e}");
+    }
+
+    #[test]
+    fn load_turbo_rejects_user_adapters() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_adapters(vec![
+            AdapterSpec {
+                path: "/tmp/user.safetensors".into(),
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+                pass_scales: None,
+                moe_expert: None,
+            },
+        ]);
+        let e = load_turbo(&spec)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(e.contains("not supported"), "got: {e}");
+    }
+
+    #[test]
+    fn load_turbo_errors_when_bundled_lora_missing() {
+        // A dir with no turbo_lora.safetensors must fail loudly on the missing bundled LoRA (the
+        // model-defining component), not silently fall back to a CFG render.
+        let dir = std::env::temp_dir().join("ideogram4_turbo_no_lora_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
+        let e = load_turbo(&spec)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(
+            e.contains("turbo_lora.safetensors") || e.contains("TurboTime LoRA not found"),
+            "got: {e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turbo_reachable_via_registry_by_id() {
+        assert!(gen_core::registry::generators().any(|r| (r.descriptor)().id == MODEL_ID_TURBO));
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ideogram-turbo".into()));
+        let e = gen_core::registry::load(MODEL_ID_TURBO, &spec)
+            .err()
+            .expect("missing weights → err")
+            .to_string();
+        assert!(
+            !e.contains("no generator registered"),
+            "turbo id not resolved: {e}"
         );
     }
 }
