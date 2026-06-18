@@ -17,7 +17,6 @@ use mlx_gen::{CancelFlag, Error, Progress, Result};
 use mlx_gen_flux2::Flux2Vae;
 
 use crate::config::Ideogram4DitConfig;
-use crate::latent_norm::{LATENT_SCALE, LATENT_SHIFT};
 use crate::loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_unconditional_transformer, load_vae,
 };
@@ -33,6 +32,21 @@ const LLM_TOKEN_INDICATOR: i32 = 3;
 const OUTPUT_IMAGE_INDICATOR: i32 = 2;
 /// Reference `Ideogram4PipelineConfig.max_text_tokens` — a longer prompt is rejected by `_tokenize`.
 const MAX_TEXT_TOKENS: usize = 2048;
+/// Per-step guidance schedule tail: the reference `DEFAULT_GUIDANCE_SCHEDULE` drops to 3.0 for the
+/// final `POLISH_STEPS` low-noise steps (the rest use the base guidance, typically 7.0).
+const POLISH_STEPS: usize = 3;
+const POLISH_GUIDANCE: f32 = 3.0;
+/// Ideogram 4 reference scheduler presets — `(mu, std)` are tuned PER step-count (the V4 presets),
+/// not constants: TURBO_12 `(0.5, 1.75)`, DEFAULT_20 `(0.0, 1.75)`, QUALITY_48 `(0.0, 1.5)`. An
+/// arbitrary step count picks the nearest preset. The earlier hardcoded `std=1.0` starved the
+/// low-noise detail steps and smeared every render.
+fn preset_mu_std(num_steps: usize) -> (f64, f64) {
+    match num_steps {
+        s if s <= 15 => (0.5, 1.75), // V4_TURBO_12
+        s if s <= 33 => (0.0, 1.75), // V4_DEFAULT_20
+        _ => (0.0, 1.5),             // V4_QUALITY_48
+    }
+}
 
 pub struct Ideogram4Pipeline {
     cond: Ideogram4Transformer,
@@ -184,7 +198,11 @@ impl Ideogram4Pipeline {
         let img_range = Array::from_slice(&(num_text..seq).collect::<Vec<i32>>(), &[num_img]);
 
         // ── Flow-matching Euler denoise (high → low noise) ──
-        let schedule = LogitNormalSchedule::for_resolution(height, width, mu, 1.0);
+        // (mu, std) come from the reference V4 preset for this step count (NOT constants); the
+        // passed-in `mu` is superseded by the preset.
+        let _ = mu;
+        let (mu_eff, std_eff) = preset_mu_std(num_steps);
+        let schedule = LogitNormalSchedule::for_resolution(height, width, mu_eff, std_eff);
         let si = make_step_intervals(num_steps);
         for i in (0..num_steps).rev() {
             if cancel.is_cancelled() {
@@ -214,10 +232,19 @@ impl Ideogram4Pipeline {
                 &neg_indicator,
             )?;
 
-            // v = g·pos_v + (1−g)·neg_v ; z += v·(s−t)
+            // Per-step asymmetric CFG: `v = gw·pos_v + (1−gw)·neg_v`. The reference uses a per-step
+            // guidance schedule (DEFAULT_GUIDANCE_SCHEDULE = 7.0 for the main steps, dropping to 3.0
+            // for the final 3 "polish" steps) — a CONSTANT high guidance over-cooks the low-noise
+            // detail steps and "splatters" the image. The loop runs i = num_steps-1 → 0, so the
+            // final 3 polish steps are i ∈ {0,1,2}. Base guidance (`guidance`) drives the main steps.
+            let gw_i = if i < POLISH_STEPS {
+                POLISH_GUIDANCE
+            } else {
+                guidance
+            };
             let v = add(
-                &multiply(&pos_v, Array::from_f32(guidance))?,
-                &multiply(&neg_v, Array::from_f32(1.0 - guidance))?,
+                &multiply(&pos_v, Array::from_f32(gw_i))?,
+                &multiply(&neg_v, Array::from_f32(1.0 - gw_i))?,
             )?;
             z = add(&z, &multiply(&v, Array::from_f32((s_val - t_val) as f32))?)?;
             eval([&z])?;
@@ -233,11 +260,18 @@ impl Ideogram4Pipeline {
 
     /// De-normalize → unpatchify → VAE decode → RGB u8 `[H, W, 3]`.
     fn decode(&self, z: &Array, grid_h: i32, grid_w: i32) -> Result<Array> {
-        let scale = Array::from_slice(&LATENT_SCALE, &[1, 1, 128]);
-        let shift = Array::from_slice(&LATENT_SHIFT, &[1, 1, 128]);
-        let denorm = add(&multiply(z, &scale)?, &shift)?; // [1, L, 128]
+        // De-normalize the packed latent with the VAE's BatchNorm stats — `z * bn_std + bn_mean`,
+        // exactly the reference (`pipeline_ideogram4`), NOT a separate latent_norm. The earlier
+        // hardcoded LATENT_SCALE/LATENT_SHIFT did not match the bn stats and distorted the decode.
+        let (bn_std, bn_mean) = self.vae.bn_stats();
+        let denorm = add(
+            &multiply(z, &bn_std.reshape(&[1, 1, 128])?)?,
+            &bn_mean.reshape(&[1, 1, 128])?,
+        )?; // [1, L, 128]
 
-        // Unpatchify to NHWC: [1,gh,gw,2,2,32] → [1,gh,2,gw,2,32] → [1, gh·2, gw·2, 32].
+        // Unpatchify to NHWC: [1,gh,gw,2,2,32] → [1,gh,2,gw,2,32] → [1, gh·2, gw·2, 32]. The 128
+        // packed channels are ordered (ph, pw, c) — c innermost — for this DiT (verified: the
+        // FLUX-family (c, ph, pw) split produces a 2px grid).
         let latent = denorm
             .reshape(&[1, grid_h, grid_w, 2, 2, 32])?
             .transpose_axes(&[0, 1, 3, 2, 4, 5])?
@@ -284,7 +318,15 @@ impl Packing {
         let mut neg_position_ids = Vec::new();
         for j in 0..num_img {
             let (h, w) = (j / grid_w, j % grid_w);
-            let p = [0, h + IMAGE_POSITION_OFFSET, w + IMAGE_POSITION_OFFSET];
+            // Reference `_prepare_ids`: image positions are `[t, h, w] + IMAGE_POSITION_OFFSET` on
+            // ALL THREE axes (`t_idx` is 0, so t = OFFSET). The offset keeps image positions disjoint
+            // from the text positions (0..num_text) — leaving t=0 collides with the text t-axis and
+            // corrupts the text→image MRoPE cross-attention (first 24 dims).
+            let p = [
+                IMAGE_POSITION_OFFSET,
+                h + IMAGE_POSITION_OFFSET,
+                w + IMAGE_POSITION_OFFSET,
+            ];
             position_ids.extend_from_slice(&p);
             neg_position_ids.extend_from_slice(&p);
             indicator.push(OUTPUT_IMAGE_INDICATOR);

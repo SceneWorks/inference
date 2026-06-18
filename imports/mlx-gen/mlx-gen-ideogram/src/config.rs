@@ -28,9 +28,11 @@ pub const RES_MULTIPLE: u32 = 16;
 pub const DEFAULT_STEPS: u32 = 48;
 /// Reference `__call__` default `guidance_scale=7.0` (asymmetric CFG: `v = g·cond + (1−g)·uncond`).
 pub const DEFAULT_GUIDANCE: f32 = 7.0;
-/// Reference `__call__` default `mu=0.5` — the logit-normal schedule's `known_mean`
-/// (`LogitNormalSchedule::for_resolution(h, w, mu, std)`, `std=1.0`).
-pub const DEFAULT_MU: f64 = 0.5;
+/// Ideogram 4 reference scheduler mean (`mu`) — the logit-normal schedule's `known_mean`
+/// (`LogitNormalSchedule::for_resolution(h, w, mu, std)`, `std=1.75`). The ComfyUI "Ideogram 4
+/// Scheduler" node defaults to `mu=0.0, std=1.75`; the earlier `mu=0.5, std=1.0` port smeared
+/// every render (low-frequency structure formed, detail never resolved).
+pub const DEFAULT_MU: f64 = 0.0;
 /// Max text tokens the model accepts (Qwen3-VL context budget used by Ideogram).
 pub const MAX_TEXT_TOKENS: usize = 2048;
 
