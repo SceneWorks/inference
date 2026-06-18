@@ -46,7 +46,9 @@ fn double_block_keys(prefix: &str) -> Vec<String> {
     k.push(format!("{prefix}.img_instruct_attn.norm_k.weight"));
     for side in ["img", "instruct"] {
         for p in ["to_q", "to_k", "to_v", "out"] {
-            k.push(format!("{prefix}.img_instruct_attn.processor.{side}_{p}.weight"));
+            k.push(format!(
+                "{prefix}.img_instruct_attn.processor.{side}_{p}.weight"
+            ));
         }
     }
     k.push(format!("{prefix}.img_instruct_attn.to_out.0.weight"));
@@ -56,7 +58,13 @@ fn double_block_keys(prefix: &str) -> Vec<String> {
     k.extend(ffn_keys(&format!("{prefix}.img_feed_forward")));
     k.extend(ffn_keys(&format!("{prefix}.instruct_feed_forward")));
     // Modulations.
-    for n in ["img_norm1", "img_norm2", "img_norm3", "instruct_norm1", "instruct_norm2"] {
+    for n in [
+        "img_norm1",
+        "img_norm2",
+        "img_norm3",
+        "instruct_norm1",
+        "instruct_norm2",
+    ] {
         k.extend(lumina_rms_zero_keys(&format!("{prefix}.{n}")));
     }
     // Output RMSNorms.
@@ -156,7 +164,11 @@ pub fn validate_transformer(w: &Weights, cfg: &BooguConfig) -> Result<()> {
     let extra: Vec<&String> = actual.difference(&expected).collect();
     if !missing.is_empty() || !extra.is_empty() {
         let head = |v: &[&String]| {
-            v.iter().take(8).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            v.iter()
+                .take(8)
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         return Err(Error::Msg(format!(
             "boogu transformer key mismatch vs config: {} missing [{}], {} extra [{}]",
@@ -170,7 +182,11 @@ pub fn validate_transformer(w: &Weights, cfg: &BooguConfig) -> Result<()> {
     // Shape checks on the dimension-bearing tensors (Linear weight = [out, in]).
     let h = cfg.hidden_size as i32;
     check_shape(w, "x_embedder.weight", &[h, cfg.patch_in_dim() as i32])?;
-    check_shape(w, "norm_out.linear_2.weight", &[cfg.patch_out_dim() as i32, h])?;
+    check_shape(
+        w,
+        "norm_out.linear_2.weight",
+        &[cfg.patch_out_dim() as i32, h],
+    )?;
     check_shape(
         w,
         "time_caption_embed.caption_embedder.1.weight",
@@ -189,8 +205,16 @@ pub fn validate_transformer(w: &Weights, cfg: &BooguConfig) -> Result<()> {
     )?;
     // GQA: q projects to all heads, k/v to kv heads.
     let head_dim = cfg.head_dim() as i32;
-    check_shape(w, "single_stream_layers.0.attn.to_q.weight", &[cfg.num_attention_heads as i32 * head_dim, h])?;
-    check_shape(w, "single_stream_layers.0.attn.to_k.weight", &[cfg.num_kv_heads as i32 * head_dim, h])?;
+    check_shape(
+        w,
+        "single_stream_layers.0.attn.to_q.weight",
+        &[cfg.num_attention_heads as i32 * head_dim, h],
+    )?;
+    check_shape(
+        w,
+        "single_stream_layers.0.attn.to_k.weight",
+        &[cfg.num_kv_heads as i32 * head_dim, h],
+    )?;
     Ok(())
 }
 

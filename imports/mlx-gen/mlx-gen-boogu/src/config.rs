@@ -79,8 +79,18 @@ impl BooguConfig {
     /// Build from an already-parsed `config.json` value.
     pub fn from_json(v: &serde_json::Value) -> Result<Self> {
         let d = BooguConfig::base();
-        let u = |k: &str, dflt: usize| v.get(k).and_then(serde_json::Value::as_u64).map(|n| n as usize).unwrap_or(dflt);
-        let f = |k: &str, dflt: f32| v.get(k).and_then(serde_json::Value::as_f64).map(|n| n as f32).unwrap_or(dflt);
+        let u = |k: &str, dflt: usize| {
+            v.get(k)
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(dflt)
+        };
+        let f = |k: &str, dflt: f32| {
+            v.get(k)
+                .and_then(serde_json::Value::as_f64)
+                .map(|n| n as f32)
+                .unwrap_or(dflt)
+        };
 
         let axes_dim = read_triple(v.get("axes_dim_rope"), d.axes_dim_rope);
         let axes_lens = read_triple(v.get("axes_lens"), d.axes_lens);
@@ -124,7 +134,9 @@ impl BooguConfig {
             num_attention_heads: u("num_attention_heads", d.num_attention_heads),
             num_kv_heads: u("num_kv_heads", d.num_kv_heads),
             multiple_of: u("multiple_of", d.multiple_of),
-            ffn_dim_multiplier: v.get("ffn_dim_multiplier").and_then(serde_json::Value::as_f64),
+            ffn_dim_multiplier: v
+                .get("ffn_dim_multiplier")
+                .and_then(serde_json::Value::as_f64),
             norm_eps: f("norm_eps", d.norm_eps),
             axes_dim_rope: axes_dim,
             axes_lens,
@@ -153,7 +165,7 @@ impl BooguConfig {
                 self.num_double_stream_layers, self.num_layers
             )));
         }
-        if self.num_attention_heads % self.num_kv_heads != 0 {
+        if !self.num_attention_heads.is_multiple_of(self.num_kv_heads) {
             return Err(Error::Msg(format!(
                 "boogu: num_attention_heads ({}) not divisible by num_kv_heads ({})",
                 self.num_attention_heads, self.num_kv_heads

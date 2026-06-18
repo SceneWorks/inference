@@ -28,10 +28,12 @@ fn snapshot_dir() -> PathBuf {
 }
 
 fn golden_path() -> PathBuf {
-    std::env::var("BOOGU_GOLDEN").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").expect("HOME"))
-            .join("Repos/mlx-gen-wt-boogu/reference/goldens/boogu_golden.safetensors")
-    })
+    std::env::var("BOOGU_GOLDEN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME"))
+                .join("Repos/mlx-gen-wt-boogu/reference/goldens/boogu_golden.safetensors")
+        })
 }
 
 #[test]
@@ -50,5 +52,8 @@ fn te_matches_reference_last_hidden() {
 
     let c = cosine(&out, want);
     println!("Boogu Qwen3-VL TE parity cosine = {c:.7}");
-    assert!(c > 0.999, "TE parity cosine {c} too low — structural mismatch");
+    assert!(
+        c > 0.999,
+        "TE parity cosine {c} too low — structural mismatch"
+    );
 }
