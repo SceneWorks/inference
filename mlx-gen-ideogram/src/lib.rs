@@ -10,7 +10,8 @@
 //!   Qwen3 blocks + a multi-layer capture hook.
 //! * **Transformer** — single-stream 34-layer `Ideogram4Transformer2DModel` (AdaLN-modulated
 //!   SwiGLU, fused QKV + per-head QK-norm, 3D MRoPE), instantiated **twice**
-//!   (conditional + unconditional) for asymmetric CFG.
+//!   (conditional + unconditional) for asymmetric CFG — or **once** with the ostris TurboTime LoRA
+//!   for the CFG-free few-step `ideogram_4_turbo` variant ([`model::load_turbo`], issue #488).
 //! * **VAE** — `AutoencoderKLFlux2` (the FLUX.2 VAE) → reuse `mlx-gen-flux2::Flux2Vae`.
 //! * **Scheduler** — `FlowMatchEulerDiscreteScheduler` → reuse the core flow-match schedule.
 //!
@@ -22,6 +23,7 @@
 //! [`Generator`](mlx_gen::Generator) registry registration under id `"ideogram_4"` (sc-5988, see
 //! [`model`]). Follow-ons: Q4/Q8 quantization (sc-5989) and the gated turnkey publish (sc-5990).
 
+pub mod adapters;
 pub mod config;
 pub mod convert;
 pub mod loader;
@@ -34,14 +36,18 @@ pub mod transformer;
 /// Packed (pre-quantized) weight loading — internal; the [`convert`] consume side.
 mod quant;
 
+pub use adapters::apply_ideogram_adapters;
 pub use config::{
     Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_HEIGHT,
-    DEFAULT_STEPS, DEFAULT_WIDTH, EXTRACTED_LAYERS, IDEOGRAM_4_FP8_REPO, IDEOGRAM_4_ID,
+    DEFAULT_STEPS, DEFAULT_TURBO_STEPS, DEFAULT_WIDTH, EXTRACTED_LAYERS, IDEOGRAM_4_FP8_REPO,
+    IDEOGRAM_4_ID, IDEOGRAM_4_TURBO_ID, TURBO_LORA_FILE, TURBO_LORA_SCALE,
 };
 pub use loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_unconditional_transformer, load_vae,
 };
-pub use model::{descriptor, load, Ideogram4, MODEL_ID};
+pub use model::{
+    descriptor, descriptor_turbo, load, load_turbo, Ideogram4, MODEL_ID, MODEL_ID_TURBO,
+};
 pub use pipeline::Ideogram4Pipeline;
 pub use scheduler::{make_step_intervals, LogitNormalSchedule};
 pub use text_encoder::Ideogram4TextEncoder;
