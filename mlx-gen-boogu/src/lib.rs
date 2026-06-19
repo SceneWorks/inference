@@ -26,6 +26,9 @@ pub mod text_encoder;
 pub mod transformer;
 
 pub use config::BooguConfig;
-pub use loader::{load_text_encoder, load_transformer};
+pub use loader::{load_text_encoder, load_transformer, load_vae};
 pub use text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
 pub use transformer::BooguTransformer;
+
+/// Boogu's VAE is the FLUX.1 16-ch `AutoencoderKL`, reused from `mlx-gen-z-image`.
+pub use mlx_gen_z_image::vae::Vae;
