@@ -14,6 +14,9 @@ mlx-gen = { path = ".." }
 mlx-rs = { workspace = true }
 # Parse the diffusers `transformer/config.json` (architecture + pre-quant manifest).
 serde_json = "1"
+# Boogu's VAE is the FLUX.1 16-ch `AutoencoderKL`, byte-identical to the VAE `mlx-gen-flux` reuses
+# from here — so we reuse the same `Vae`/`VaeDecoderConfig::default_z_image` rather than re-port it.
+mlx-gen-z-image = { path = "../mlx-gen-z-image" }
 
 [dev-dependencies]
 # Backend-neutral contract conformance suite — Boogu runs through it on the macos-mlx lane.
