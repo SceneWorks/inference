@@ -10,10 +10,16 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::tokenizer::BooguTokenizer;
-use mlx_gen_boogu::{BooguPipeline, GenerateOptions};
+use mlx_gen_boogu::{BooguPipeline, GenerateOptions, TurboOptions};
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(std::env::var("BOOGU_BASE_DIR").expect("set BOOGU_BASE_DIR to the snapshot root"))
+}
+
+fn turbo_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("BOOGU_TURBO_DIR").expect("set BOOGU_TURBO_DIR to the Turbo snapshot root"),
+    )
 }
 
 fn golden_path() -> PathBuf {
@@ -81,6 +87,49 @@ fn t2i_smoke() {
 
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../reference/outputs/boogu_mlx_t2i_apple_512_s28.png");
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    image::save_buffer(
+        &out,
+        &img.pixels,
+        img.width,
+        img.height,
+        image::ExtendedColorType::Rgb8,
+    )
+    .unwrap();
+    println!("wrote {}", out.display());
+}
+
+/// Real-weight Turbo (DMD few-step) smoke: render with the Turbo checkpoint + DMD sampler (no CFG)
+/// and assert a non-degenerate image, saving a PNG. Needs the Turbo snapshot (`BOOGU_TURBO_DIR`).
+#[test]
+#[ignore = "needs real Turbo weights (128 GB Mac): set BOOGU_TURBO_DIR"]
+fn turbo_smoke() {
+    let pipe = BooguPipeline::from_snapshot(turbo_dir()).expect("load Boogu Turbo pipeline");
+    let opts = TurboOptions {
+        height: 768,
+        width: 768,
+        steps: 4,
+        seed: 0,
+        conditioning_sigma: 0.001,
+    };
+    let img = pipe
+        .generate_turbo("a red apple on a wooden table", &opts)
+        .expect("generate_turbo");
+
+    assert_eq!((img.width, img.height), (768, 768));
+    let (mn, mx) = img
+        .pixels
+        .iter()
+        .fold((255u8, 0u8), |(mn, mx), &p| (mn.min(p), mx.max(p)));
+    let mean = img.pixels.iter().map(|&p| p as u64).sum::<u64>() / img.pixels.len() as u64;
+    println!("turbo render stats: min={mn} max={mx} mean={mean}");
+    assert!(
+        mx - mn > 32,
+        "turbo render looks degenerate (min={mn} max={mx})"
+    );
+
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../reference/outputs/boogu_mlx_turbo_apple_768_s4.png");
     std::fs::create_dir_all(out.parent().unwrap()).unwrap();
     image::save_buffer(
         &out,
