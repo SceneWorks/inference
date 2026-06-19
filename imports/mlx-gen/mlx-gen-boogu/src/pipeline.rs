@@ -53,6 +53,29 @@ impl Default for GenerateOptions {
     }
 }
 
+/// Turbo (DMD few-step) generation knobs. Defaults mirror the standalone turbo pipeline.
+#[derive(Debug, Clone)]
+pub struct TurboOptions {
+    pub height: u32,
+    pub width: u32,
+    pub steps: usize,
+    pub seed: u64,
+    /// DMD conditioning sigma — the first (lowest) sigma in the schedule.
+    pub conditioning_sigma: f32,
+}
+
+impl Default for TurboOptions {
+    fn default() -> Self {
+        Self {
+            height: 1024,
+            width: 1024,
+            steps: 4,
+            seed: 0,
+            conditioning_sigma: 0.001,
+        }
+    }
+}
+
 /// The assembled Boogu Base pipeline: tokenizer + Qwen3-VL condition encoder + DiT + FLUX.1 VAE.
 pub struct BooguPipeline {
     tok: BooguTokenizer,
@@ -89,9 +112,7 @@ impl BooguPipeline {
         };
 
         // Initial latent noise [1, 16, H/8, W/8] (f32; the DiT casts to its compute dtype).
-        let (hl, wl) = ((opts.height / 8) as i32, (opts.width / 8) as i32);
-        let key = random::key(opts.seed)?;
-        let mut lat = random::normal::<f32>(&[1, 16, hl, wl], None, None, Some(&key))?;
+        let mut lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
 
         // Static-v1 timesteps + the trailing 1.0 the Euler step reads as `t_next` at the last step.
         let ts = build_timesteps_v1(opts.steps);
@@ -120,8 +141,55 @@ impl BooguPipeline {
             )?;
         }
 
-        // VAE decode (z-image `Vae::decode` de-normalizes z/scaling+shift internally) → RGB8.
-        let decoded = self.vae.decode(&lat)?.as_dtype(Dtype::Float32)?; // [1,3,1,H,W]
+        self.decode_latents(&lat)
+    }
+
+    /// Generate one RGB image via the **Turbo** DMD student few-step sampler (Boogu-Image-0.1-Turbo).
+    ///
+    /// Pure T2I, **no CFG** (the distilled student needs `text_guidance_scale == 1`). The sigma grid
+    /// is `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` (ascending; `sigma` is the clean-fraction,
+    /// so the latent starts as noise). Each step: predict → `x += (1 − sigma)·v`, then (except the
+    /// last) renoise to the next level `x = (1 − sigma_next)·noise + sigma_next·x` with fresh noise.
+    /// Same DiT/TE/VAE as Base — only the sampler differs — so load this from a Turbo snapshot.
+    pub fn generate_turbo(&self, prompt: &str, opts: &TurboOptions) -> Result<Image> {
+        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+
+        let (ids, mask) = self.tok.encode_t2i(prompt)?;
+        let cond = self.te.last_hidden(&ids, &mask)?;
+
+        let mut lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
+        let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
+
+        for i in 0..opts.steps {
+            let sigma = sigmas[i];
+            let t = Array::from_slice(&[sigma], &[1]);
+            let pred = self.dit.forward(&lat, &t, &cond, &mask)?;
+            // Predict (clean estimate): x += (1 − sigma)·v, in f32.
+            lat = add(
+                &lat.as_dtype(Dtype::Float32)?,
+                &multiply(
+                    &pred.as_dtype(Dtype::Float32)?,
+                    Array::from_f32(1.0 - sigma),
+                )?,
+            )?;
+            // Renoise to the next sigma level with fresh noise (all but the final step).
+            if i + 1 < opts.steps {
+                let sigma_next = sigmas[i + 1];
+                let noise = init_noise(opts.height, opts.width, opts.seed, (i + 1) as u64)?;
+                lat = add(
+                    &multiply(&noise, Array::from_f32(1.0 - sigma_next))?,
+                    &multiply(&lat, Array::from_f32(sigma_next))?,
+                )?;
+            }
+        }
+
+        self.decode_latents(&lat)
+    }
+
+    /// VAE-decode a final latent `[1, 16, H/8, W/8]` → RGB8 image. z-image `Vae::decode`
+    /// de-normalizes (`z/scaling + shift`) internally, so the raw post-denoise latent is passed.
+    fn decode_latents(&self, lat: &Array) -> Result<Image> {
+        let decoded = self.vae.decode(lat)?.as_dtype(Dtype::Float32)?; // [1,3,1,H,W]
         decoded_to_image(&decoded)
     }
 
@@ -131,6 +199,28 @@ impl BooguPipeline {
         self.vae.quantize(bits)?;
         Ok(())
     }
+}
+
+/// Seeded initial/renoise latent noise `[1, 16, H/8, W/8]` (f32). `step` derives a distinct RNG key
+/// per renoise so successive renoise draws differ (mirroring the reference's advancing generator).
+fn init_noise(height: u32, width: u32, seed: u64, step: u64) -> Result<Array> {
+    let (hl, wl) = ((height / 8) as i32, (width / 8) as i32);
+    let key = random::key(seed.wrapping_add(step))?;
+    Ok(random::normal::<f32>(
+        &[1, 16, hl, wl],
+        None,
+        None,
+        Some(&key),
+    )?)
+}
+
+/// DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps` ascending values
+/// from `conditioning_sigma` toward (but excluding) `1.0`.
+fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
+    let span = 1.0 - conditioning_sigma;
+    (0..steps)
+        .map(|k| conditioning_sigma + span * (k as f32) / (steps as f32))
+        .collect()
 }
 
 /// Build the static-v1 shifted timestep schedule plus the trailing `1.0`.
