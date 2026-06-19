@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
-use mlx_gen_boogu::load_text_encoder;
+use mlx_gen_boogu::{load_text_encoder, load_transformer};
 use mlx_rs::ops::{multiply, sqrt, sum};
 use mlx_rs::{Array, Dtype};
 
@@ -55,5 +55,38 @@ fn te_matches_reference_last_hidden() {
     assert!(
         c > 0.999,
         "TE parity cosine {c} too low — structural mismatch"
+    );
+}
+
+/// E3 — real-weight parity for the DiT velocity. Feeds the golden's `dit_in_latent_chw`, `timestep`,
+/// raw `instruction_hidden_states`, and `instruction_attention_mask` through the full mixed-stream
+/// forward and compares to the reference `dit_out_velocity_chw`. Run:
+///   BOOGU_BASE_DIR=<snapshot> BOOGU_GOLDEN=<...>/boogu_golden.safetensors \
+///     CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
+///     cargo test -p mlx-gen-boogu --test te_parity dit_matches -- --ignored --nocapture
+#[test]
+#[ignore = "needs real weights + golden (tools/golden_dump.py)"]
+fn dit_matches_reference_velocity() {
+    let g = Weights::from_file(golden_path()).expect("golden — run tools/golden_dump.py");
+    let dit = load_transformer(snapshot_dir()).expect("load Boogu DiT");
+
+    // The golden saves the latent / velocity already batched as [1, C, H, W].
+    let out = dit
+        .forward(
+            g.require("dit_in_latent_chw").unwrap(),
+            g.require("timestep").unwrap(),
+            g.require("instruction_hidden_states").unwrap(),
+            g.require("instruction_attention_mask").unwrap(),
+        )
+        .unwrap();
+
+    let want = g.require("dit_out_velocity_chw").unwrap();
+    assert_eq!(out.shape(), want.shape(), "velocity shape");
+
+    let c = cosine(&out, want);
+    println!("Boogu DiT velocity parity cosine = {c:.7}");
+    assert!(
+        c > 0.999,
+        "DiT velocity parity cosine {c} too low — structural mismatch"
     );
 }
