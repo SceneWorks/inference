@@ -23,7 +23,9 @@ pub mod convert;
 pub mod loader;
 pub mod quant;
 pub mod text_encoder;
+pub mod transformer;
 
 pub use config::BooguConfig;
-pub use loader::load_text_encoder;
+pub use loader::{load_text_encoder, load_transformer};
 pub use text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
+pub use transformer::BooguTransformer;
