@@ -249,17 +249,36 @@ fn concatenate_horizontal(images: &[&Image]) -> Result<Image> {
     if images.len() == 1 {
         return Ok((*images[0]).clone());
     }
-    let total_w: u32 = images.iter().map(|im| im.width).sum();
+    // Sum widths in u64 (the sum itself can overflow u32 on adversarial inputs) and require the total
+    // to fit the output `Image`'s u32 width. Then size the canvas with checked usize arithmetic so a
+    // wrapped (too-small) allocation can't later trigger an OOB `copy_from_slice` (L-E): `total_w *
+    // max_h * 3` can overflow u32 — and even usize on 64-bit for huge dims.
+    let total_w_u64: u64 = images.iter().map(|im| im.width as u64).sum();
     let max_h: u32 = images.iter().map(|im| im.height).max().unwrap_or(0);
-    let mut canvas = vec![255u8; (total_w * max_h * 3) as usize];
+    let total_w = u32::try_from(total_w_u64).map_err(|_| {
+        Error::Msg(format!(
+            "flux2 caption-upsample: concatenated width {total_w_u64} exceeds u32"
+        ))
+    })?;
+    let canvas_len = (total_w as usize)
+        .checked_mul(max_h as usize)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "flux2 caption-upsample: canvas {total_w}×{max_h}×3 overflows usize"
+            ))
+        })?;
+    let mut canvas = vec![255u8; canvas_len];
     let mut x_off: u32 = 0;
     for im in images {
         let y_off = (max_h - im.height) / 2;
         for row in 0..im.height {
-            let dst_row = y_off + row;
-            let dst_start = ((dst_row * total_w + x_off) * 3) as usize;
-            let src_start = (row * im.width * 3) as usize;
-            let len = (im.width * 3) as usize;
+            // Index in usize, not u32: `(dst_row * total_w + x_off) * 3` can wrap u32 even when the
+            // (checked) canvas length fits, which would corrupt the copy bounds.
+            let dst_row = (y_off + row) as usize;
+            let dst_start = (dst_row * total_w as usize + x_off as usize) * 3;
+            let src_start = (row as usize * im.width as usize) * 3;
+            let len = im.width as usize * 3;
             canvas[dst_start..dst_start + len]
                 .copy_from_slice(&im.pixels[src_start..src_start + len]);
         }

@@ -153,10 +153,13 @@ pub fn lcm_style_timesteps(
 }
 
 /// Latent sequence length used for the flow-match empirical `mu` fit: `(height/16) * (width/16)`.
-/// Each dim is floored to `/16` before the multiply (matching the fork); dims `< 16` collapse to 0
-/// here, but callers validate the resolution upstream so that case never reaches the `mu` fit (F-089).
+/// Each dim is floored to `/16` before the multiply (matching the fork). Callers validate the
+/// resolution upstream so a sub-16 dim never reaches the `mu` fit (F-089), but the `.max(1)` per
+/// floored dim guards a direct caller from a degenerate 0-length sequence (which would make
+/// [`compute_mu`] fit on `seq_len = 0`). For any valid (`>= 16`) dim the floor is `>= 1`, so the
+/// `.max(1)` is a no-op and the result is byte-identical (L-E).
 pub fn image_seq_len(width: u32, height: u32) -> usize {
-    ((height / 16) * (width / 16)) as usize
+    ((height / 16).max(1) * (width / 16).max(1)) as usize
 }
 
 /// Port of the fork's `_compute_empirical_mu`: a piecewise-linear fit of the time-shift `mu`
@@ -598,6 +601,18 @@ mod tests {
             TcdPolicy::new(sdxl_sched(), 1000, 50, 8, 0.0).num_steps(),
             8
         );
+    }
+
+    #[test]
+    fn image_seq_len_floors_to_16_and_guards_sub16() {
+        // Valid (≥16) dims: floor-to-/16 then multiply, unchanged by the `.max(1)` guard.
+        assert_eq!(image_seq_len(1024, 1024), (1024 / 16) * (1024 / 16));
+        assert_eq!(image_seq_len(48, 32), 3 * 2);
+        // L-E: a sub-16 dim floors to 0 without the guard, collapsing the sequence to length 0; the
+        // `.max(1)` keeps it at ≥1 so a direct caller never fits `compute_mu` on an empty sequence.
+        // width 8 → max(8/16, 1) = 1, so the result is height/16 = 64 (not 0).
+        assert_eq!(image_seq_len(8, 1024), 1024 / 16);
+        assert_eq!(image_seq_len(8, 8), 1);
     }
 
     // Coefficient goldens (epic 3720 §3.5): the same scalar references the original inline

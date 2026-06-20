@@ -419,6 +419,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 impl Ltx {
     /// Latent dims `(frames, stage1_h, stage1_w, stage2_h, stage2_w)` for a request.
     pub(crate) fn latent_dims(req: &GenerationRequest) -> (usize, usize, usize, usize, usize) {
+        // Precondition: `validate_request`'s 64-divisibility check runs before any generate, so the
+        // integer divisions below (`h/2/SPATIAL_SCALE`, `h/SPATIAL_SCALE`) are exact and lose no rows.
+        // Make that implicit dependency explicit so a future direct caller that skips validation trips
+        // here in debug/test instead of silently truncating the latent grid (Info/L-E).
+        debug_assert!(
+            req.height.is_multiple_of(64) && req.width.is_multiple_of(64),
+            "ltx latent_dims: {}×{} is not 64-aligned — validate_request must run first",
+            req.width,
+            req.height
+        );
         let frames = req.frames.unwrap_or(1).max(1);
         let latent_frames = 1 + (frames as usize - 1) / TEMPORAL_SCALE as usize;
         let (h, w) = (req.height, req.width);
