@@ -15,6 +15,7 @@ pub mod error;
 pub mod face;
 pub mod generator;
 pub mod imageops;
+pub mod json_constraint;
 pub mod media;
 pub mod registry;
 pub mod runtime;
@@ -37,6 +38,7 @@ pub use generator::{
     GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
     ReplacementMode, VideoClipRef,
 };
+pub use json_constraint::JsonState;
 pub use media::{AudioTrack, Image};
 pub use registry::{
     load, load_captioner, load_transform, CaptionerRegistration, ModelRegistration,
@@ -49,8 +51,8 @@ pub use runtime::{
     WeightsSource,
 };
 pub use textllm::{
-    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmFinishReason, TextLlmOutput,
-    TextLlmRequest, TextLlmSampling,
+    TextLlm, TextLlmCapabilities, TextLlmConstraint, TextLlmDescriptor, TextLlmFinishReason,
+    TextLlmOutput, TextLlmRequest, TextLlmSampling,
 };
 pub use tiling::{TilingConfig, VaeTiling};
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and

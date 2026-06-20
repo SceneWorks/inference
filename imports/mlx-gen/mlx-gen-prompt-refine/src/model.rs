@@ -6,10 +6,11 @@ use std::sync::Mutex;
 use mlx_rs::Array;
 
 use mlx_gen::gen_core::{
-    self, TextLlm, TextLlmDescriptor, TextLlmFinishReason, TextLlmOutput, TextLlmRequest,
+    self, JsonState, TextLlm, TextLlmConstraint, TextLlmDescriptor, TextLlmFinishReason,
+    TextLlmOutput, TextLlmRequest,
 };
 use mlx_gen::registry::TextLlmRegistration;
-use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use mlx_gen::tokenizer::{ChatTemplate, ConstraintDecodeTable, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{default_seed, Error, LoadSpec, Progress, Result, WeightsSource};
 
@@ -24,6 +25,19 @@ struct Engine {
     model: LlamaModel,
     tokenizer: TextTokenizer,
     stop_ids: Vec<i32>,
+    /// Per-token decode table for grammar-constrained decoding (sc-6585), built lazily on the first
+    /// constrained request and cached — decoding the whole vocab is one-time work a plain free-text
+    /// refine never pays.
+    constraint_table: Option<ConstraintDecodeTable>,
+}
+
+/// How a token id behaves under a JSON constraint: never-content special/added tokens and the
+/// end-of-text stop token are handled outside the grammar; ordinary tokens are masked by it.
+#[derive(Clone, Copy, PartialEq)]
+enum TokenKind {
+    Ordinary,
+    Special,
+    Stop,
 }
 
 impl Engine {
@@ -49,6 +63,7 @@ impl Engine {
             stop_ids: stop_ids_from_config(&cfg_path)?,
             model,
             tokenizer,
+            constraint_table: None,
         })
     }
 }
@@ -111,6 +126,27 @@ impl PromptRefiner {
         if guard.is_none() {
             *guard = Some(Engine::load(&self.root)?);
         }
+        // Grammar-constrained decoding (sc-6585): build + cache the per-token decode table on the
+        // first constrained request (decoding the whole vocab is one-time work; a free-text refine
+        // never builds it).
+        let constrained = req.constraint == Some(TextLlmConstraint::Json);
+        if constrained
+            && guard
+                .as_ref()
+                .expect("engine loaded above")
+                .constraint_table
+                .is_none()
+        {
+            let table = guard
+                .as_ref()
+                .expect("engine loaded above")
+                .tokenizer
+                .constraint_decode_table();
+            guard
+                .as_mut()
+                .expect("engine loaded above")
+                .constraint_table = Some(table);
+        }
         let engine = guard.as_ref().expect("engine loaded above");
 
         // Build the Llama-3 chat text (system + user → assistant prompt), map to ids without
@@ -130,6 +166,31 @@ impl PromptRefiner {
         let mut rng = SplitMix64::new(req.sampling.seed.unwrap_or_else(default_seed));
         let temperature = req.sampling.temperature;
         let top_p = req.sampling.top_p;
+
+        // Constraint setup (sc-6585): classify each token id (stop / never-content special /
+        // grammar-masked ordinary) once, start the JSON grammar, and reuse one allow-mask buffer
+        // across steps. The classification + per-step masking only run when a constraint is set.
+        let constraint = engine.constraint_table.as_ref().filter(|_| constrained);
+        let kinds: Vec<TokenKind> = match constraint {
+            Some(table) => {
+                let vocab = table.pieces.len();
+                let mut kinds = vec![TokenKind::Ordinary; vocab];
+                for &id in &table.special {
+                    if (id as usize) < vocab {
+                        kinds[id as usize] = TokenKind::Special;
+                    }
+                }
+                for &id in &engine.stop_ids {
+                    if id >= 0 && (id as usize) < vocab {
+                        kinds[id as usize] = TokenKind::Stop;
+                    }
+                }
+                kinds
+            }
+            None => Vec::new(),
+        };
+        let mut json_state = JsonState::start();
+        let mut allow_buf: Vec<bool> = vec![false; constraint.map_or(0, |t| t.pieces.len())];
 
         let mut cache = engine.model.new_cache();
         let total = req.sampling.max_new_tokens;
@@ -158,11 +219,35 @@ impl PromptRefiner {
                 .decode_logits(&input, &mut cache, context_index as i32)?;
             index_pos += ctxt.len();
 
-            let next = sample_token(&logits, temperature, top_p, &mut rng)?;
+            let next = if let Some(table) = constraint {
+                // Mask the logits to grammar-valid tokens: the stop token only when the JSON value is
+                // already complete, never a non-stop special, otherwise gated by feeding the token's
+                // decoded text to the JSON grammar.
+                let can_stop = json_state.can_stop();
+                for (id, slot) in allow_buf.iter_mut().enumerate() {
+                    *slot = match kinds[id] {
+                        TokenKind::Stop => can_stop,
+                        TokenKind::Special => false,
+                        TokenKind::Ordinary => json_state.advance(&table.pieces[id]).is_some(),
+                    };
+                }
+                sample_token(&logits, temperature, top_p, &mut rng, Some(&allow_buf))?
+            } else {
+                sample_token(&logits, temperature, top_p, &mut rng, None)?
+            };
             all_tokens.push(next);
             if engine.stop_ids.contains(&next) {
                 finish = TextLlmFinishReason::StopToken;
                 break;
+            }
+            // Advance the JSON grammar by the accepted (non-stop) token's text — it was in the allowed
+            // set, so this never rejects.
+            if let Some(table) = constraint {
+                if let Some(piece) = table.pieces.get(next as usize) {
+                    if let Some(advanced) = json_state.advance(piece) {
+                        json_state = advanced;
+                    }
+                }
             }
             generated.push(next);
             // 1-based step count = tokens emitted so far (monotone, ≤ total).

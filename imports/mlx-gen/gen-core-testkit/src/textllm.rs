@@ -46,6 +46,7 @@ fn base_request(profile: &TextLlmProfile) -> TextLlmRequest {
         system: profile.system.clone(),
         prompt: profile.prompt.clone(),
         sampling: profile.sampling,
+        constraint: None,
         cancel: Default::default(),
     }
 }
