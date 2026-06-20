@@ -127,7 +127,15 @@ fn seedvr2_generate_video_runs_end_to_end() {
     let n = 10usize;
     let frames: Vec<Image> = (0..n as u32).map(|t| lr_frame(48, 48, t)).collect();
     let out = pipe
-        .generate_video(&frames, 96, 96, 7, 0.0, Some(8))
+        .generate_video(
+            &frames,
+            96,
+            96,
+            7,
+            0.0,
+            Some(8),
+            &mlx_gen::CancelFlag::new(),
+        )
         .expect("generate_video");
     assert_eq!(out.len(), n, "frame count preserved");
     for (i, f) in out.iter().enumerate() {

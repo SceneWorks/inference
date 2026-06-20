@@ -9,7 +9,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, subtract, zeros_like};
 use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::SchedulerConfig;
 use crate::scheduler::{euler_step, scale_model_input, v_pred_denoised, EdmSchedule};
@@ -114,6 +114,7 @@ impl SvdPipeline {
         steps: usize,
         min_g: f32,
         max_g: f32,
+        cancel: &CancelFlag,
         on_step: &mut dyn FnMut(usize),
     ) -> Result<Array> {
         let sched = EdmSchedule::karras(steps, &self.scheduler);
@@ -126,6 +127,14 @@ impl SvdPipeline {
 
         let mut latents = latents.clone();
         for i in 0..steps {
+            // Honor the engine cancellation contract (F-001): an SVD render is up to MAX_STEPS=200
+            // UNet forwards over many frames, so check before each (seconds-long) step and return the
+            // typed `Error::Canceled`. The per-step `eval` below makes this effective — without it
+            // MLX's lazy graph defers all compute to VAE decode and this check would pass for every
+            // step (mirrors mlx-gen-wan's denoise, sc-5551).
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let sigma = sched.sigmas[i];
             let sigma_next = sched.sigmas[i + 1];
             let t = sched.timesteps[i];
@@ -142,6 +151,9 @@ impl SvdPipeline {
 
             let denoised = v_pred_denoised(&noise_pred, &latents, sigma)?;
             latents = euler_step(&latents, &denoised, sigma, sigma_next)?;
+            // Force evaluation each step to bound the lazy graph's peak memory and make the
+            // cancellation check above effective (the diffusers reference is eager — per-step state).
+            mlx_rs::transforms::eval([&latents])?;
             on_step(i + 1);
         }
         Ok(latents)
@@ -150,7 +162,14 @@ impl SvdPipeline {
     /// Chunked temporal VAE decode (diffusers `decode_latents`): divide by `scaling_factor`, decode in
     /// `chunk`-frame windows, concat. `latents` `[1, F, H/8, W/8, 4]` → frames `[1, F, H, W, 3]`
     /// (roughly `[-1, 1]`; the caller maps to `[0, 1]` for display).
-    pub fn decode(&self, latents: &Array, num_frames: i32, chunk: i32) -> Result<Array> {
+    pub fn decode(
+        &self,
+        latents: &Array,
+        num_frames: i32,
+        chunk: i32,
+        cancel: &CancelFlag,
+        on_chunk: &mut dyn FnMut(),
+    ) -> Result<Array> {
         let sh = latents.shape();
         // The reshape below collapses `[B, F, h, w, 4] → [num_frames, h, w, 4]`, which only preserves
         // frame identity when `B == 1`; a `B > 1` caller would silently interleave `B·F` frames as
@@ -169,11 +188,21 @@ impl SvdPipeline {
         let mut start = 0;
         let mut chunks: Vec<Array> = Vec::new();
         while start < num_frames {
+            // Honor the cancellation contract during the (silent, multi-second) chunked temporal
+            // decode too (F-001 / L-H): a cancel arriving after denoise must still stop the job.
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let n = chunk.min(num_frames - start);
             let idx = Array::from_slice(&(start..start + n).collect::<Vec<i32>>(), &[n]);
             let zc = z.take_axis(&idx, 0)?; // [n,h,w,4]
-            chunks.push(self.vae.decode(&zc, n)?); // [n,H,W,3]
+            let frames_chunk = self.vae.decode(&zc, n)?; // [n,H,W,3]
+                                                         // Bound peak memory and surface liveness: materialize each decoded chunk and emit a
+                                                         // per-chunk progress heartbeat (the decode no longer runs silently after one `Decoding`).
+            mlx_rs::transforms::eval([&frames_chunk])?;
+            chunks.push(frames_chunk);
             start += n;
+            on_chunk();
         }
         let refs: Vec<&Array> = chunks.iter().collect();
         let frames = concatenate_axis(&refs, 0)?; // [F,H,W,3]

@@ -301,6 +301,7 @@ impl LensPipeline {
                 opts.prompt,
                 crate::reasoner::DEFAULT_MAX_NEW_TOKENS,
                 opts.date,
+                Some(cancel),
             )?;
             &refined
         } else {

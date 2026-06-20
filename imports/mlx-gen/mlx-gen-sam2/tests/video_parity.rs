@@ -99,7 +99,7 @@ fn video_propagation_matches_mlx_reference_large() {
     let predictor = Sam2VideoPredictor::from_weights_for_size(&g, Sam2ModelSize::Large).unwrap();
     let mut state = predictor.init_state_from_pixels(images, video_h, video_w);
     predictor.add_new_box(&mut state, 0, box_xyxy).unwrap();
-    let results = predictor.propagate(&mut state).unwrap();
+    let results = predictor.propagate(&mut state, None, None).unwrap();
     assert_eq!(results.len(), t as usize, "propagated frame count");
 
     // Reference per-frame low-res logits, [T,1,256,256].
@@ -151,7 +151,7 @@ fn video_reverse_propagation_matches_mlx_reference_large() {
     predictor
         .add_new_box(&mut state, prompt_frame_idx, box_xyxy)
         .unwrap();
-    let results = predictor.propagate_reverse(&mut state).unwrap();
+    let results = predictor.propagate_reverse(&mut state, None, None).unwrap();
     // Prompted on the last frame, reverse tracks every frame down to 0 ⇒ all T frames.
     assert_eq!(results.len(), t as usize, "reverse-propagated frame count");
 

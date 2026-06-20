@@ -183,6 +183,9 @@ impl Seedvr2Generator {
                 current: 1,
                 total: 1,
             });
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let frames = self.pipe.generate_video(
                 clip.frames,
                 req.width as i32,
@@ -190,6 +193,7 @@ impl Seedvr2Generator {
                 base_seed,
                 softness,
                 None,
+                &req.cancel,
             )?;
             on_progress(Progress::Decoding);
             return Ok(GenerationOutput::Video {
@@ -202,17 +206,26 @@ impl Seedvr2Generator {
         let image = reference_image(req).expect("validated");
         let mut out = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
-            if req.cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
             on_progress(Progress::Step {
                 current: 1,
                 total: 1,
             });
+            // Honor cancellation at the step boundary — AFTER the progress emit — so a cancel tripped
+            // during this (1-step) upscale returns the typed error before the one-pass `generate`,
+            // which has no inner loop to check (unlike the tiled/video paths). The post-emit position
+            // also catches a cancel that arrives between output images for count > 1 (sc-5551).
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let seed = base_seed.wrapping_add(i as u64);
-            let img =
-                self.pipe
-                    .generate(image, req.width as i32, req.height as i32, seed, softness)?;
+            let img = self.pipe.generate(
+                image,
+                req.width as i32,
+                req.height as i32,
+                seed,
+                softness,
+                &req.cancel,
+            )?;
             on_progress(Progress::Decoding);
             out.push(img);
         }

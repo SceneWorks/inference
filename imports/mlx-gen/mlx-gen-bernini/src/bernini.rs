@@ -795,6 +795,7 @@ impl Bernini {
             &vit_cfg,
             &order,
             &step_noise,
+            &req.cancel,
             &planner.mask_token,
         )?;
         eval([
@@ -927,6 +928,7 @@ impl Bernini {
                 &video_srcs,
                 &base_g,
                 FullDefaults::OMEGA_SCALE,
+                &req.cancel,
                 &mut on_step,
             )?
         };

@@ -16,3 +16,8 @@ mlx-rs = { workspace = true }
 inventory = { workspace = true }
 # config parsing (matches the sdxl/wan/ltx/flux2/lens provider convention).
 serde_json = "1"
+
+[dev-dependencies]
+# Real-weight typed-cancellation conformance gate (story 6883): drives the registered seedvr2
+# Generator through the testkit cancellation check. Snapshot-gated (skips when absent).
+sceneworks-gen-core-testkit = { workspace = true }

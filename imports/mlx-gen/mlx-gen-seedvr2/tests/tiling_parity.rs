@@ -82,10 +82,11 @@ fn seedvr2_spatial_tiling_tracks_untiled() {
             /*tile=*/ w.max(h),
             /*overlap=*/ 0,
             &neg,
+            &mlx_gen::CancelFlag::new(),
         )
         .expect("single-tile (untiled) path");
     let tiled = pipe
-        .run_frame_tiled(&processed, 7, 160, 64, &neg)
+        .run_frame_tiled(&processed, 7, 160, 64, &neg, &mlx_gen::CancelFlag::new())
         .expect("tiled path");
     assert_eq!(tiled.shape(), untiled.shape(), "decoded shape");
     let cos = cosine(&tiled, &untiled);
@@ -151,10 +152,10 @@ fn seedvr2_image_path_tiles_when_over_budget() {
 
     // Huge ceiling → one-pass still path; tiny ceiling → OverBudget → spatial-tiled path.
     let single = pipe
-        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e9)
+        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e9, &mlx_gen::CancelFlag::new())
         .expect("single-pass still path");
     let tiled = pipe
-        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e-6)
+        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e-6, &mlx_gen::CancelFlag::new())
         .expect("spatial-tiled path");
 
     assert_eq!(
