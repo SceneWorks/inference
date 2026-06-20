@@ -149,6 +149,14 @@ fn resize_u8(
     filter: &dyn Fn(f64) -> f64,
 ) -> Vec<f32> {
     let c = 3usize;
+    // Reject zero/degenerate dims up front (F-008/L-E): a 0 source edge makes the buffer guard below
+    // vacuous (`in_h*in_w*c == 0`) and yields a silent uniform-black output instead of a rejection,
+    // and a 0 target edge later divides by zero in `precompute_coeffs`. The shipped envelope never
+    // hits this (validate_request bounds size), but a request-supplied mask/conditioning image can.
+    assert!(
+        in_h > 0 && in_w > 0 && out_h > 0 && out_w > 0,
+        "resize_u8: zero dimension — {in_w}×{in_h} → {out_w}×{out_h} (all edges must be > 0)"
+    );
     // The inner loops index `src[(y*in_w + xmin + k)*c + ch]` trusting the caller's `in_h`/`in_w`. A
     // buffer inconsistent with those dims (e.g. a request-supplied conditioning image whose
     // `pixels.len()` doesn't match `width*height*3`) would otherwise panic deep in the loop with an
@@ -241,6 +249,15 @@ pub fn resize_nearest_u8(
     out_h: usize,
     out_w: usize,
 ) -> Vec<f32> {
+    // Fail fast on a zero/degenerate dimension (F-008): `c = src.len() / (in_h*in_w)` divides by zero
+    // when a source edge is 0, `(in_h - 1)` / `(in_w - 1)` underflow `usize`, and a 0 target edge
+    // divides by zero in the index map. Reachable from a request-supplied mask/conditioning image
+    // (e.g. inpaint mask) — `validate_request`'s min-size does not cover conditioning images — so turn
+    // the opaque arithmetic panic into a clear one, matching the windowed `resize_u8` guard.
+    assert!(
+        in_h > 0 && in_w > 0 && out_h > 0 && out_w > 0,
+        "resize_nearest_u8: zero dimension — {in_w}×{in_h} → {out_w}×{out_h} (all edges must be > 0)"
+    );
     let c = src.len() / (in_h * in_w);
     let mut out = vec![0f32; out_h * out_w * c];
     for oy in 0..out_h {
@@ -278,6 +295,19 @@ fn round_half_even(x: f64) -> i64 {
 /// `width`×`height` box: `(new_w, new_h, left, top)`. Mirrors the worker's `_contain_box` (Python
 /// `round` = half-to-even) so the kept rect and a padded source line up exactly.
 pub fn contain_box(src_w: u32, src_h: u32, width: u32, height: u32) -> (u32, u32, i32, i32) {
+    // Preconditions (the caller's `validate_request` enforces both; dims come from the bounded request
+    // size, L-E): the source edges are non-zero — else the `width/src_w` ratio divides by zero — and
+    // every edge is `<= i32::MAX`, since the `as i32` casts below wrap on a larger value. These are
+    // `debug_assert`s rather than a hard error because this is pure host geometry on already-validated
+    // sizes; making the precondition explicit catches an out-of-envelope caller in debug/test.
+    debug_assert!(
+        src_w > 0 && src_h > 0,
+        "contain_box: zero source dimension {src_w}×{src_h}"
+    );
+    debug_assert!(
+        width <= i32::MAX as u32 && height <= i32::MAX as u32,
+        "contain_box: target {width}×{height} exceeds i32::MAX (the `as i32` casts would wrap)"
+    );
     let ratio = (width as f64 / src_w as f64).min(height as f64 / src_h as f64);
     let new_w = round_half_even(src_w as f64 * ratio).max(1) as u32;
     let new_h = round_half_even(src_h as f64 * ratio).max(1) as u32;
@@ -379,6 +409,37 @@ mod tests {
         // not an opaque out-of-bounds index deep in the resample loop.
         let src = vec![0u8; 8];
         let _ = resize_bilinear_u8(&src, 4, 4, 2, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "zero dimension")]
+    fn resize_nearest_rejects_zero_source_dim() {
+        // F-008: a 0-width source would make `c = len / (in_h*in_w)` divide by zero. Fail fast.
+        let _ = resize_nearest_u8(&[], 4, 0, 4, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "zero dimension")]
+    fn resize_nearest_rejects_zero_target_dim() {
+        // F-008: a 0 target edge divides by zero in the index map.
+        let src = vec![0u8; 4 * 4 * 3];
+        let _ = resize_nearest_u8(&src, 4, 4, 0, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "zero dimension")]
+    fn resize_windowed_rejects_zero_source_dim() {
+        // L-E: the windowed path's buffer guard is vacuous when a source edge is 0 (`in_h*in_w*c ==
+        // 0`); the new dims guard rejects it instead of yielding silent uniform-black.
+        let _ = resize_bicubic_u8(&[], 0, 4, 4, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds i32::MAX")]
+    fn contain_box_rejects_oversized_target_in_debug() {
+        // L-E: a target edge above i32::MAX would wrap the `as i32` centering math. The debug_assert
+        // makes the precondition explicit (this test runs in debug, like all `cargo test`).
+        let _ = contain_box(100, 100, i32::MAX as u32 + 1, 200);
     }
 
     #[test]
