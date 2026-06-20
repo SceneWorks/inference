@@ -185,6 +185,16 @@ fn validate_output_params(req: &GenerationRequest) -> Result<()> {
             )));
         }
     }
+    // The motion-conditioning fps is baked into `added_time_ids` as `fps − 1`; a 0 would feed −1.0 to
+    // the model (a silently degenerate micro-conditioning) rather than erroring. Reject it here at the
+    // request boundary (L-E).
+    if let Some(fps) = req.conditioning_fps {
+        if fps == 0 {
+            return Err(Error::Msg(
+                "svd_xt: conditioning_fps must be >= 1 (added_time_ids encodes fps − 1)".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
