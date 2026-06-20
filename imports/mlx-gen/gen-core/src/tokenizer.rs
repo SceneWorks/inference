@@ -244,6 +244,43 @@ impl TextTokenizer {
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         self.inner.decode(ids, skip_special_tokens).map_err(tok_err)
     }
+
+    /// Build the per-token-id decode table grammar-constrained decoding needs (sc-6585): for every
+    /// id in `0..vocab_size`, the literal text the token contributes, plus the set of special/added
+    /// token ids. Decodes every vocab entry, so a caller runs this once and caches it.
+    ///
+    /// `pieces[id]` is empty for special/added tokens (BOS/EOS/turn markers) — they carry no JSON
+    /// content and the listed `special` set lets the sampler forbid them outright (except the stop
+    /// token when the grammar permits stopping). Ordinary byte-level tokens that are a partial UTF-8
+    /// sequence decode to U+FFFD, which the JSON grammar accepts only inside string content — exactly
+    /// where such bytes occur — so the final whole-sequence detokenize still reconstructs them.
+    pub fn constraint_decode_table(&self) -> ConstraintDecodeTable {
+        let vocab = self.inner.get_vocab_size(true) as u32;
+        let special: std::collections::HashSet<u32> = self
+            .inner
+            .get_added_tokens_decoder()
+            .keys()
+            .copied()
+            .collect();
+        let mut pieces: Vec<String> = Vec::with_capacity(vocab as usize);
+        for id in 0..vocab {
+            if special.contains(&id) {
+                pieces.push(String::new());
+            } else {
+                pieces.push(self.inner.decode(&[id], false).unwrap_or_default());
+            }
+        }
+        ConstraintDecodeTable { pieces, special }
+    }
+}
+
+/// A per-token-id decode table for grammar-constrained decoding (sc-6585); see
+/// [`TextTokenizer::constraint_decode_table`].
+pub struct ConstraintDecodeTable {
+    /// `pieces[id]` = the literal text token `id` contributes (empty for special/added tokens).
+    pub pieces: Vec<String>,
+    /// Special/added token ids (BOS/EOS/turn markers) — never valid as literal JSON content.
+    pub special: std::collections::HashSet<u32>,
 }
 
 #[cfg(test)]
