@@ -229,6 +229,7 @@ impl Scail2 {
             &job,
             self.quant,
             &self.adapters,
+            &req.cancel,
             on_progress,
         )
     }

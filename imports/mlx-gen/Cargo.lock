@@ -564,6 +564,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "tokenizers",
 ]
@@ -746,6 +747,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
 ]
 
@@ -768,6 +770,7 @@ dependencies = [
  "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
 ]
 
@@ -790,6 +793,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]

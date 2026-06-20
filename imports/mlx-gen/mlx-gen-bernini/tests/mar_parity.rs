@@ -12,6 +12,7 @@
 //! Run: `cargo test -p mlx-gen-bernini --test mar_parity -- --nocapture`
 
 use mlx_gen::weights::Weights;
+use mlx_gen::CancelFlag;
 use mlx_gen_bernini::clip_diff::DiffLossFm;
 use mlx_gen_bernini::connector::MlpConnector;
 use mlx_gen_bernini::mar::{sample_vit_embed, StreamState, VitCfg};
@@ -107,6 +108,7 @@ fn mar_loop_matches_reference_f32() {
         &vit,
         &order,
         &step_noise,
+        &CancelFlag::default(),
         &mask_token,
     )
     .expect("sample_vit_embed");

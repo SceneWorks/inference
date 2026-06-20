@@ -26,7 +26,7 @@
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::clip_diff::DiffLossFm;
 use crate::connector::MlpConnector;
@@ -269,6 +269,7 @@ pub fn sample_vit_embed(
     cfg: &VitCfg,
     order: &[i32],
     step_noise: &[Array],
+    cancel: &CancelFlag,
     mask_token: &Array,
 ) -> Result<SampledStreams> {
     let n_query = order.len() as i32;
@@ -279,6 +280,11 @@ pub fn sample_vit_embed(
     let mut target = mlx_rs::ops::broadcast_to(mask_token, &[1, n_query, h])?;
 
     for (step, revealed) in schedule.iter().enumerate() {
+        // Honor the engine cancellation contract (F-003): the MAR planning loop runs 3 backbone
+        // passes per step over `planning_step` (default 25) steps — check before each.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         // Every step runs all 3 backbones over the current (partially-filled) embeds.
         let cond_vit = stream_for_vit(backbone, connector, cond, &target)?;
         let uncond_vit = stream_for_vit(backbone, connector, uncond, &target)?;
@@ -308,6 +314,9 @@ pub fn sample_vit_embed(
         let cur = take_first_rows(&sampled, np)?.reshape(&[1, np, h])?;
 
         target = scatter_rows(&target, revealed, &cur)?;
+        // Bound the planner graph per step (the MAR loop has no other per-step eval) so the next
+        // iteration's cancel check sees realized compute and in-flight work is freed (F-003).
+        mlx_rs::transforms::eval([&target])?;
     }
 
     // ---- handoff: final cond + uncond forwards → feat_from_planner_to_renderer → 4 streams ----

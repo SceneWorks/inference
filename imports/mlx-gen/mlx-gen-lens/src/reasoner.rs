@@ -17,6 +17,7 @@ use mlx_rs::ops::{matmul, split_sections};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
+use mlx_gen::CancelFlag;
 use mlx_gen::{Error, Quant, Result};
 
 use crate::config::GptOssConfig;
@@ -144,7 +145,12 @@ impl LensReasonerModel {
     /// the harmony `<|return|>` stop or `max_new_tokens`. Returns the **new** tokens (including the
     /// trailing stop, which [`clean_reasoner_output`](crate::text::clean_reasoner_output) strips) —
     /// mirroring the vendor `out_ids[0, input_len:]`.
-    pub fn generate_greedy(&self, input_ids: &[i32], max_new_tokens: usize) -> Result<Vec<i32>> {
+    pub fn generate_greedy(
+        &self,
+        input_ids: &[i32],
+        max_new_tokens: usize,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Vec<i32>> {
         let mut caches: Vec<KvCache> = (0..self.cfg.num_layers).map(|_| KvCache::new()).collect();
 
         // Prefill (positions 0..input_len).
@@ -158,6 +164,14 @@ impl LensReasonerModel {
         let mut position = input_ids.len() as i32;
         let mut out = vec![next];
         while out.len() < max_new_tokens && next != HARMONY_RETURN {
+            // Cooperative cancel between decode steps (the reasoner can run up to ~4096 tokens).
+            // argmax_token pulls the next id to the host each step (forcing eval), so this is
+            // effective despite MLX's lazy graph (cancel-lifecycle gotcha).
+            if let Some(c) = cancel {
+                if c.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+            }
             let tok = Array::from_slice(&[next], &[1, 1]);
             let h = self.embed_tokens.take_axis(&tok, 0)?; // [1, 1, hidden]
             let h = self.run_layers(h, &mut caches, position, false)?;
@@ -195,12 +209,20 @@ impl LensReasoner {
     /// Refine one prompt via the local gpt-oss (greedy decode). `date` fills the harmony preamble
     /// (`Current date:`). Returns the cleaned final-channel rewrite, or the original `prompt` when the
     /// reasoner produced no usable final text (the vendor `clean_text_out or prompt`).
-    pub fn refine(&self, prompt: &str, max_new_tokens: usize, date: &str) -> Result<String> {
+    pub fn refine(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        date: &str,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<String> {
         let input_ids = self.tokenizer.encode_reasoner(prompt, date)?;
         if input_ids.is_empty() {
             return Err(Error::Msg("lens reasoner: empty tokenization".into()));
         }
-        let new_tokens = self.model.generate_greedy(&input_ids, max_new_tokens)?;
+        let new_tokens = self
+            .model
+            .generate_greedy(&input_ids, max_new_tokens, cancel)?;
         let raw = self.tokenizer.decode(&new_tokens)?;
         let cleaned = crate::text::clean_reasoner_output(&raw);
         Ok(if cleaned.is_empty() {

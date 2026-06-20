@@ -44,7 +44,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::{Sam2ImageEncoderConfig, Sam2ModelSize};
 use crate::image_encoder::Sam2ImageEncoder;
@@ -776,7 +776,12 @@ impl Sam2VideoPredictor {
     ///
     /// Every frame is recorded as forward (`frames_tracked` ← `false`). For backward tracking toward
     /// frame 0, use [`Self::propagate_reverse`]; see the module-level "Direction" note (F-176).
-    pub fn propagate(&self, state: &mut VideoState) -> Result<Vec<(i32, Array)>> {
+    pub fn propagate(
+        &self,
+        state: &mut VideoState,
+        cancel: Option<&CancelFlag>,
+        mut progress: Option<&mut dyn FnMut(usize, usize)>,
+    ) -> Result<Vec<(i32, Array)>> {
         self.preflight(state)?;
         let start = *state.cond.keys().min().ok_or_else(|| {
             Error::Msg(
@@ -786,7 +791,14 @@ impl Sam2VideoPredictor {
             )
         })?;
         let mut results = Vec::new();
-        for frame_idx in start..state.num_frames {
+        let total = (state.num_frames - start).max(0) as usize;
+        for (i, frame_idx) in (start..state.num_frames).enumerate() {
+            // Honor the engine cancellation contract — check before each (heavy) frame.
+            if let Some(c) = cancel {
+                if c.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+            }
             if let Some(out) = state.cond.get(&frame_idx) {
                 results.push((frame_idx, out.pred_masks.clone()));
             } else {
@@ -798,6 +810,9 @@ impl Sam2VideoPredictor {
                 state.non_cond.insert(frame_idx, out);
             }
             state.frames_tracked.insert(frame_idx, false);
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(i, total);
+            }
         }
         Ok(results)
     }
@@ -817,7 +832,12 @@ impl Sam2VideoPredictor {
     ///   * Each tracked frame is conditioned with `track_in_reverse = true`, exercising the reverse
     ///     arms of [`Sam2VideoModel::condition_with_memories`] / [`maskmem_prev_frame`] (the bank is
     ///     pulled from the frames immediately *ahead*), and recorded `frames_tracked` ← `true`.
-    pub fn propagate_reverse(&self, state: &mut VideoState) -> Result<Vec<(i32, Array)>> {
+    pub fn propagate_reverse(
+        &self,
+        state: &mut VideoState,
+        cancel: Option<&CancelFlag>,
+        mut progress: Option<&mut dyn FnMut(usize, usize)>,
+    ) -> Result<Vec<(i32, Array)>> {
         self.preflight(state)?;
         let start = *state.cond.keys().min().ok_or_else(|| {
             Error::Msg(
@@ -826,8 +846,16 @@ impl Sam2VideoPredictor {
                     .into(),
             )
         })?;
+        let order = reverse_propagation_order(start);
+        let total = order.len();
         let mut results = Vec::new();
-        for frame_idx in reverse_propagation_order(start) {
+        for (i, frame_idx) in order.into_iter().enumerate() {
+            // Honor the engine cancellation contract — check before each (heavy) frame.
+            if let Some(c) = cancel {
+                if c.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+            }
             if let Some(out) = state.cond.get(&frame_idx) {
                 results.push((frame_idx, out.pred_masks.clone()));
             } else {
@@ -840,6 +868,9 @@ impl Sam2VideoPredictor {
                 state.non_cond.insert(frame_idx, out);
             }
             state.frames_tracked.insert(frame_idx, true);
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(i, total);
+            }
         }
         Ok(results)
     }

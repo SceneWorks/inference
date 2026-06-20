@@ -20,3 +20,8 @@ mlx-rs = { workspace = true }
 inventory = { workspace = true }
 # config.json (mask_dim / dims) sidecar reading.
 serde_json = "1"
+
+[dev-dependencies]
+# Real-weight typed-cancellation conformance gate (story 6883): drives the registered scail2_14b
+# Generator through the testkit cancellation check. Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }

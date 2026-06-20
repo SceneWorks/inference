@@ -414,6 +414,7 @@ impl Svd {
             params.num_inference_steps,
             params.min_guidance_scale,
             params.max_guidance_scale,
+            &req.cancel,
             &mut |step| {
                 on_progress(Progress::Step {
                     current: step as u32,
@@ -423,9 +424,13 @@ impl Svd {
         )?;
 
         on_progress(Progress::Decoding);
-        let decoded =
-            self.pipeline
-                .decode(&final_latents, params.num_frames, params.decode_chunk_size)?; // [1,F,H,W,3]
+        let decoded = self.pipeline.decode(
+            &final_latents,
+            params.num_frames,
+            params.decode_chunk_size,
+            &req.cancel,
+            &mut || on_progress(Progress::Decoding),
+        )?; // [1,F,H,W,3]
         let frames = frames_to_images(&decoded)?;
 
         Ok(GenerationOutput::Video {

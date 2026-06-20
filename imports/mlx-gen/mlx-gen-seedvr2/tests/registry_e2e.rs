@@ -98,7 +98,9 @@ fn seedvr2_loads_and_runs_from_real_checkpoint() {
         height: 96,
         pixels: (0..96 * 96 * 3).map(|i| (i % 256) as u8).collect(),
     };
-    let out = pipe.generate(&lr, 256, 256, 42, 0.0).expect("generate");
+    let out = pipe
+        .generate(&lr, 256, 256, 42, 0.0, &mlx_gen::CancelFlag::new())
+        .expect("generate");
     assert_eq!((out.width, out.height), (256, 256));
     assert_eq!(out.pixels.len(), 256 * 256 * 3);
     eprintln!(
@@ -135,7 +137,9 @@ fn seedvr2_7b_loads_and_generates() {
         height: 96,
         pixels: (0..96 * 96 * 3).map(|i| (i % 256) as u8).collect(),
     };
-    let out = pipe.generate(&lr, 128, 128, 7, 0.0).expect("7B generate");
+    let out = pipe
+        .generate(&lr, 128, 128, 7, 0.0, &mlx_gen::CancelFlag::new())
+        .expect("7B generate");
     assert_eq!((out.width, out.height), (128, 128));
     assert_eq!(out.pixels.len(), 128 * 128 * 3);
     eprintln!("7B generate ok: {}x{}", out.width, out.height);
@@ -164,7 +168,9 @@ fn seedvr2_q8_loads_and_generates() {
         height: 96,
         pixels: (0..96 * 96 * 3).map(|i| (i % 256) as u8).collect(),
     };
-    let out = pipe.generate(&lr, 128, 128, 7, 0.0).expect("Q8 generate");
+    let out = pipe
+        .generate(&lr, 128, 128, 7, 0.0, &mlx_gen::CancelFlag::new())
+        .expect("Q8 generate");
     assert_eq!((out.width, out.height), (128, 128));
     assert_eq!(out.pixels.len(), 128 * 128 * 3);
     eprintln!("Q8 generate ok: {}x{}", out.width, out.height);

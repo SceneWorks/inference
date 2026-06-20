@@ -24,7 +24,7 @@ use std::path::Path;
 use mlx_gen::array::scalar;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
-use mlx_gen::{AdapterSpec, Error, GenerationOutput, Image, Progress, Quant, Result};
+use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
 use mlx_gen_wan::{
     frames_to_images, load_tokenizer, make_scheduler, DitMemoryConfig, SolverKind, Umt5Encoder,
     WanVae,
@@ -235,6 +235,7 @@ pub fn generate(
     job: &Scail2Job,
     quant: Option<Quant>,
     adapters: &[AdapterSpec],
+    cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
     if job.driving_frames.is_empty() {
@@ -407,6 +408,13 @@ pub fn generate(
     let mut prev_history_pixel: Option<Array> = None;
 
     for (seg_idx, &(seg_start, seg_end)) in segments.iter().enumerate() {
+        // Per-segment cancellation checkpoint (F-003): the inter-segment VAE pose-encode +
+        // full segment decode are minutes of work outside the inner step loop, so also bail
+        // here at each segment boundary.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+
         // Pose latent (half spatial res) + driving mask for this segment.
         let pose_seg = driving.take_axis(
             Array::from_slice(
@@ -463,6 +471,13 @@ pub fn generate(
 
         let mut latent = apply_clean_history(&noise, history_latent.as_ref())?;
         for (i, &t) in timesteps.iter().enumerate() {
+            // Honor the engine cancellation contract (F-003): a SCAIL-2 segment render runs
+            // minutes, so check before each (forward + step) iteration. The per-step `eval` below
+            // makes this effective — without it MLX's lazy graph defers all compute to the VAE
+            // decode and this check would pass for every step (mirrors mlx-gen-wan denoise).
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let x = apply_clean_history(&latent, history_latent.as_ref())?;
             let mut inp = Scail2Inputs {
                 x: &x,

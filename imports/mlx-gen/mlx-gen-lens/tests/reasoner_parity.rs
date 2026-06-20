@@ -84,7 +84,7 @@ fn lens_reasoner_matches_reference() {
     //    (the same effect as the encoder e2e's 0.997 cosine) — bit-identical greedy is not expected
     //    cross-build, so the deterministic correctness proof is the cache-equivalence gate (#3).
     let got_new = model
-        .generate_greedy(&input_ids, max_new)
+        .generate_greedy(&input_ids, max_new, None)
         .expect("generate");
     let match_len = got_new
         .iter()
