@@ -19,7 +19,7 @@ use std::rc::Rc;
 use mlx_rs::ops::sigmoid;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::Sam3VisionConfig;
 use crate::tracker::TrackerFrameOutput;
@@ -157,11 +157,23 @@ impl Sam3VideoModel {
         frames: &[Array],
         input_ids: &Array,
         text_mask: &[i32],
+        cancel: Option<&CancelFlag>,
+        mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> Result<Vec<VideoFrameOutput>> {
         self.num_frames = frames.len() as i32;
+        let total = frames.len();
         let mut outputs = Vec::new();
         for (f, px) in frames.iter().enumerate() {
+            // Honor the engine cancellation contract — check before each (seconds-to-minutes) frame.
+            if let Some(c) = cancel {
+                if c.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+            }
             outputs.push(self.process_frame(f as i32, px, input_ids, text_mask)?);
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(f, total);
+            }
         }
         Ok(outputs)
     }

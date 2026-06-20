@@ -49,7 +49,7 @@ fn video_pcs_matches_oracle() {
     let text_mask = ints(fx.require("attention_mask").unwrap());
 
     let outputs = model
-        .propagate(&frames, &input_ids, &text_mask)
+        .propagate(&frames, &input_ids, &text_mask, None, None)
         .expect("propagate");
 
     let mut worst = 1.0f32;

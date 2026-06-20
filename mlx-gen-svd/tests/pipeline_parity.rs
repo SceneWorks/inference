@@ -109,6 +109,7 @@ fn svd_pipeline_matches_diffusers() {
             steps,
             min_g,
             max_g,
+            &mlx_gen::CancelFlag::default(),
             &mut |_| {},
         )
         .unwrap();
@@ -119,7 +120,15 @@ fn svd_pipeline_matches_diffusers() {
 
     // --- decode --- isolated: decode the *golden* final latents so this measures the temporal VAE
     // decode alone (not the propagated denoise gap). golden frames [1,3,F,64,64] → NHWC [1,F,64,64,3].
-    let frames = pipe.decode(&want_latents, num_frames, num_frames).unwrap();
+    let frames = pipe
+        .decode(
+            &want_latents,
+            num_frames,
+            num_frames,
+            &mlx_gen::CancelFlag::default(),
+            &mut || {},
+        )
+        .unwrap();
     let want_frames = g
         .require("frames")
         .unwrap()

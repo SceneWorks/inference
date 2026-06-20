@@ -126,6 +126,12 @@ impl PromptRefiner {
         if guard.is_none() {
             *guard = Some(Engine::load(&self.root)?);
         }
+        // Re-check after the (potentially multi-second) cold load of the 3B snapshot: the
+        // pre-inference check in `generate` runs BEFORE this lazy load, so a cancel arriving during
+        // the load window must be honored here, before the constraint-table build and decode loop.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         // Grammar-constrained decoding (sc-6585): build + cache the per-token decode table on the
         // first constrained request (decoding the whole vocab is one-time work; a free-text refine
         // never builds it).

@@ -262,15 +262,26 @@ pub fn check_progress(g: &dyn Generator, profile: &Profile) -> Result<(), String
 /// **typed** `Err(Error::Canceled)` (not a stringified `Msg`) within a bounded number of further
 /// steps (≤ 2), and produces no partial output.
 pub fn check_cancellation(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
-    let id = g.descriptor().id;
     let mut req = base_request(profile);
     req.steps = Some(profile.cancel_steps);
+    check_cancellation_with(g, &req)
+}
+
+/// **Cancellation (request-supplied).** The general form of [`check_cancellation`] for providers
+/// whose `generate` needs conditioning the text-only [`base_request`] cannot supply — image→video
+/// (SVD), super-resolution (SeedVR2), and the renderer families (Bernini, scail2). The caller builds
+/// a model-appropriate request (its own conditioning + a step count with headroom, ≥ 3, so a
+/// honoring provider visibly stops before completion); this helper trips `req.cancel` at the first
+/// emitted `Progress::Step` and asserts `generate` returns the **typed** `Err(Error::Canceled)`
+/// within a bounded number of further steps (≤ 2), with no partial output.
+pub fn check_cancellation_with(g: &dyn Generator, req: &GenerationRequest) -> Result<(), String> {
+    let id = g.descriptor().id;
     let cancel = req.cancel.clone();
 
     let mut tripped = false;
     let mut steps_after_trip = 0u32;
     let mut last_current = 0u32;
-    let result = g.generate(&req, &mut |p| {
+    let result = g.generate(req, &mut |p| {
         if let Progress::Step { current, .. } = p {
             last_current = current;
             if tripped {

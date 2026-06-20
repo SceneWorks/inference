@@ -23,3 +23,8 @@ serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Qwen2.5-VL ChatML tokenizer (planner templating, sc-5136).
 tokenizers = { workspace = true }
+
+[dev-dependencies]
+# Real-weight typed-cancellation conformance gate (story 6883): drives the registered
+# bernini_renderer Generator through the testkit cancellation check. Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }

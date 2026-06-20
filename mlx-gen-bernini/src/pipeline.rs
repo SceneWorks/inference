@@ -15,8 +15,9 @@ use mlx_gen::gen_core;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result,
+    WeightsSource,
 };
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
@@ -159,6 +160,7 @@ fn denoise_bernini(
     base_g: &GuidanceParams,
     omega_scale: f32,
     momentum: f32,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let mut sched = make_scheduler(SolverKind::UniPC, num_train);
@@ -174,6 +176,12 @@ fn denoise_bernini(
         .collect();
 
     for (i, &t) in timesteps.iter().enumerate() {
+        // Honor the engine cancellation contract (F-003): a render runs minutes, so check before
+        // each step. The per-step `eval` below makes this effective (lazy MLX graph otherwise defers
+        // all compute past every check).
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         on_step(i);
         let expert = if t >= boundary {
             high
@@ -266,6 +274,7 @@ pub fn denoise_bernini_wvitcfg(
     videos: &[(Array, f64)],
     base_g: &VitGuidanceParams,
     omega_scale: f32,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let mut sched = make_scheduler(SolverKind::UniPC, num_train);
@@ -278,6 +287,10 @@ pub fn denoise_bernini_wvitcfg(
     let mut g = base_g.clone();
 
     for (i, &t) in timesteps.iter().enumerate() {
+        // Honor the engine cancellation contract (F-003): check before each (minutes-long) step.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         on_step(i);
         let expert = if t >= boundary {
             high
@@ -481,6 +494,7 @@ impl BerniniRenderer {
                 &base_g,
                 Defaults::OMEGA_SCALE,
                 Defaults::MOMENTUM,
+                &req.cancel,
                 &mut on_step,
             )?
         };
@@ -598,6 +612,7 @@ mod tests {
             &[],
             &g,
             0.8,
+            &CancelFlag::default(),
             &mut on_step,
         )
         .expect("denoise");

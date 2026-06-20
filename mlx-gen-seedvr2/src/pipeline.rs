@@ -11,7 +11,7 @@
 
 use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Image, Result};
+use mlx_gen::{CancelFlag, Error, Image, Result};
 use mlx_rs::ops::{add, concatenate_axis, divide, multiply, pad, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
@@ -195,6 +195,7 @@ impl Seedvr2Pipeline {
         height: i32,
         seed: u64,
         softness: f32,
+        cancel: &CancelFlag,
     ) -> Result<Image> {
         self.generate_budgeted(
             image,
@@ -203,6 +204,7 @@ impl Seedvr2Pipeline {
             seed,
             softness,
             video::safe_budget_gib(),
+            cancel,
         )
     }
 
@@ -212,6 +214,7 @@ impl Seedvr2Pipeline {
     /// feather-blended spatial tiling ([`Self::run_frame_tiled`], the parity-gated sc-5201 tiler)
     /// rather than one allocation that would blow past Metal's max single-buffer size and panic the
     /// worker (sc-6067); otherwise the one-pass still path runs (numerically unchanged from before).
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_budgeted(
         &self,
         image: &Image,
@@ -220,12 +223,13 @@ impl Seedvr2Pipeline {
         seed: u64,
         softness: f32,
         safe_gib: f64,
+        cancel: &CancelFlag,
     ) -> Result<Image> {
         if matches!(
             video::plan_chunk_size_with(self.weights_bytes, height, width, safe_gib),
             ChunkPlan::OverBudget { .. }
         ) {
-            return self.generate_tiled(image, width, height, seed, softness, safe_gib);
+            return self.generate_tiled(image, width, height, seed, softness, safe_gib, cancel);
         }
 
         let neg = self
@@ -266,6 +270,7 @@ impl Seedvr2Pipeline {
     /// budget tile sizer + parity-gated [`Self::run_frame_tiled`] + per-frame color correction, so peak
     /// stays bounded at any resolution (no single allocation exceeds the budget-sized tile). `safe_gib`
     /// sizes the tile.
+    #[allow(clippy::too_many_arguments)]
     fn generate_tiled(
         &self,
         image: &Image,
@@ -274,6 +279,7 @@ impl Seedvr2Pipeline {
         seed: u64,
         softness: f32,
         safe_gib: f64,
+        cancel: &CancelFlag,
     ) -> Result<Image> {
         let neg = self
             .neg_embed
@@ -283,7 +289,7 @@ impl Seedvr2Pipeline {
         let tile = video::plan_spatial_tile_px(self.weights_bytes, safe_gib);
         let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
         let processed = self.preprocess_frame(image, width, height, softness)?; // (1,3,1,H,W)
-        let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg)?;
+        let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg, cancel)?;
         Ok(self
             .frames_from_decoded(&decoded, &processed, 1)?
             .into_iter()
@@ -420,6 +426,7 @@ impl Seedvr2Pipeline {
     /// and cross-fades chunk overlaps to close the causal-VAE seam ([`crate::video`]). Falls back to
     /// the per-frame (`T=1`) path under tight memory, and to per-frame **spatial tiling** when even one
     /// full-resolution frame exceeds the budget (HD — sc-5201), so peak stays bounded at any resolution.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_video(
         &self,
         frames: &[Image],
@@ -428,6 +435,7 @@ impl Seedvr2Pipeline {
         seed: u64,
         softness: f32,
         chunk_override: Option<i32>,
+        cancel: &CancelFlag,
     ) -> Result<Vec<Image>> {
         let n = frames.len() as i32;
         if n == 0 {
@@ -443,12 +451,12 @@ impl Seedvr2Pipeline {
             (Some(c), ChunkPlan::Chunked(safe)) => video::pad_to_valid_chunk(c).min(safe),
             (_, ChunkPlan::Chunked(c)) => c,
             (_, ChunkPlan::PerFrame) => {
-                return self.generate_video_per_frame(frames, width, height, seed, softness)
+                return self.generate_video_per_frame(frames, width, height, seed, softness, cancel)
             }
             // Even one full-resolution frame exceeds the budget → spatially tile each frame
             // (per-frame T=1 + overlap feather blend). Bounds peak at any resolution (sc-5201).
             (_, ChunkPlan::OverBudget { .. }) => {
-                return self.generate_video_tiled(frames, width, height, seed, softness)
+                return self.generate_video_tiled(frames, width, height, seed, softness, cancel)
             }
         };
 
@@ -461,6 +469,11 @@ impl Seedvr2Pipeline {
         let ts = Array::from_f32(TIMESTEP);
         let mut chunk_frames: Vec<Vec<Image>> = Vec::with_capacity(plan.len());
         for Chunk { start, len } in &plan {
+            // sc-5551 video-cancel: each chunk materializes via decoded_to_image→as_slice, so
+            // this check observes the prior chunk's completed compute and bails before the next.
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let clip = self.preprocess_chunk(frames, *start, *len, width, height, softness)?;
             let latent = self.encode(&clip)?;
             let sh = latent.shape();
@@ -492,11 +505,16 @@ impl Seedvr2Pipeline {
         height: i32,
         seed: u64,
         softness: f32,
+        cancel: &CancelFlag,
     ) -> Result<Vec<Image>> {
-        frames
-            .iter()
-            .map(|f| self.generate(f, width, height, seed, softness))
-            .collect()
+        let mut out = Vec::with_capacity(frames.len());
+        for f in frames {
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            out.push(self.generate(f, width, height, seed, softness, cancel)?);
+        }
+        Ok(out)
     }
 
     /// HD spatial-tiling video path (sc-5201): each frame is upscaled per-frame (`T=1`) but **spatially
@@ -510,6 +528,7 @@ impl Seedvr2Pipeline {
         height: i32,
         seed: u64,
         softness: f32,
+        cancel: &CancelFlag,
     ) -> Result<Vec<Image>> {
         let tile = video::plan_spatial_tile_px(self.weights_bytes, video::safe_budget_gib());
         let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
@@ -520,10 +539,13 @@ impl Seedvr2Pipeline {
             .clone();
         let mut out = Vec::with_capacity(frames.len());
         for f in frames {
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let processed = self
                 .preprocess(f, width, height, softness)?
                 .expand_dims(2)?; // (1,3,1,H,W)
-            let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg)?;
+            let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg, cancel)?;
             let imgs = self.frames_from_decoded(&decoded, &processed, 1)?;
             out.push(imgs.into_iter().next().expect("one frame"));
         }
@@ -541,6 +563,7 @@ impl Seedvr2Pipeline {
         tile: i32,
         overlap: i32,
         neg: &Array,
+        cancel: &CancelFlag,
     ) -> Result<Array> {
         let sh = processed.shape(); // (1,3,1,H,W)
         let (height, width) = (sh[3], sh[4]);
@@ -549,6 +572,11 @@ impl Seedvr2Pipeline {
         let mut acc: Option<Array> = None; // (1,3,1,H,W)
         let mut wsum: Option<Array> = None; // (1,1,1,H,W)
         for t in &plan {
+            // Per-tile cancel — the per-tile `eval` at the end of each iter (below) makes the
+            // prior tile's compute materialized, so this check is effective (sc-5551).
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
             let y_idx = Array::from_slice(&(t.y0..t.y1).collect::<Vec<i32>>(), &[th]);
             let x_idx = Array::from_slice(&(t.x0..t.x1).collect::<Vec<i32>>(), &[tw]);
