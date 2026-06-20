@@ -2,20 +2,21 @@
 
 Rust-native inference for generative **image and video** models on Apple [MLX](https://github.com/ml-explore/mlx), built on [`mlx-rs`](https://crates.io/crates/mlx-rs).
 
-> **Status:** active — 16 model provider crates with merged, parity-validated engines (image, video, identity, and understanding models). Built as a Rust library workspace consumed in-process; not yet published to crates.io. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
+> **Status:** active — two dozen model provider crates with merged, parity-validated engines spanning image, video, upscaling, identity, and understanding models. Built as a Rust library workspace consumed in-process; not yet published to crates.io. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
 
 A from-scratch Rust reimplementation of the MLX image/video model stack (a divergence from the Python `mflux` / `mlx-video` lineage), collapsing on-device inference into a single statically-linked component with no Python sidecar. Each model family is its own provider crate registered through the core `mlx-gen` `Generator` contract.
 
 **Supported models**
 
-- **Image:** FLUX.1 (schnell/dev, incl. Hyper few-step), FLUX.2-klein (Qwen3 text encoder + KV-cache), Chroma (`chroma1_hd`/`base`/`flash`), Qwen-Image (+ Qwen-Image-Edit), Stable Diffusion XL (+ inpaint/outpaint, IP-Adapter, tile-ControlNet, LCM/Lightning/Hyper), Kolors (bilingual, ChatGLM3 text encoder), Z-Image (incl. ControlNet), SenseNova-U1 (unified understanding + generation: T2I, image-edit, VQA, interleaved document)
-- **Video:** Wan2.2 (text/image-to-video, incl. VACE), LTX-2.3 (text-to-video), Stable Video Diffusion (image-to-video)
+- **Image:** FLUX.1 (schnell/dev, incl. Hyper few-step), FLUX.2 (klein-9b and dev — txt2img, edit, ControlNet, KV-cache edit; Qwen3 text encoder + 32-ch VAE), Chroma (`chroma1_hd`/`base`/`flash`), Qwen-Image (+ Edit, + ControlNet), Stable Diffusion XL (+ inpaint/outpaint, IP-Adapter, tile-ControlNet, LCM/Lightning/Hyper), Kolors (bilingual, ChatGLM3 text encoder), Z-Image (incl. ControlNet), SenseNova-U1 (unified understanding + generation: T2I, image-edit, VQA, interleaved document), Boogu-Image (Lumina-Image-2.0 / OmniGen2 lineage; base/turbo/edit, Qwen3-VL encoder), Ideogram 4.0 (+ Turbo), Lens / Lens-Turbo (Microsoft; gpt-oss-20b MoE encoder + dual-stream MMDiT)
+- **Video:** Wan2.2 (text/image/TI2V, incl. VACE and VACE-Fun), Bernini renderer (ByteDance; Wan2.2-A14B dual-expert MoE + source-id rotary + APG guidance), SCAIL-2 (controlled character animation / motion transfer; Wan2.1-14B I2V backbone), LTX-2.3 (text-to-video + audio), Stable Video Diffusion (image-to-video)
+- **Upscaling / restoration:** SeedVR2 (one-step diffusion super-resolution, image and video; 3B/7B)
 - **Identity:** PuLID-FLUX and InstantID, over a native MLX face stack (SCRFD + ArcFace + BiSeNet)
-- **Understanding:** JoyCaption (captioning), SAM2 (segmentation)
+- **Understanding & utility:** JoyCaption (captioning), SAM2 / SAM3 (segmentation; SAM3 adds open-vocabulary concept segmentation + video tracking), prompt-refine (Llama-3.2-3B-Instruct prompt rewriting, with JSON grammar-constrained decoding)
 - **Adapters:** LoRA, LoKr (reconstruct + forward-time residual + stacking, quant-safe), ControlNet, IP-Adapter
-- **Training:** native MLX LoRA / LoKr fine-tuning for SDXL, Z-Image, Kolors, Wan2.2, and LTX-2.3 (adamw / adam / rose / prodigy optimizers, dataset + checkpoint plumbing)
+- **Training:** native MLX LoRA / LoKr fine-tuning for SDXL, Z-Image, Kolors, Wan2.2, LTX-2.3, and Lens (adamw / adam / rose / prodigy optimizers, dataset + checkpoint plumbing)
 - **Quantization:** group-wise affine Q4 / Q8 (byte-identical to the reference packing)
-- **Weight loading:** most models load directly from their Hugging Face / diffusers snapshot — no conversion step. The families that ship in a non-loadable source format include a native Rust converter, so there is no Python step anywhere: FLUX.2 (single-file → diffusers), Wan2.2 (torch `.pth` reader, T2V/I2V/TI2V + VAE), LTX-2.3 (single-file → split MLX)
+- **Weight loading:** most models load directly from their Hugging Face / diffusers snapshot — no conversion step. Families that ship in a non-loadable source format include a native Rust converter (FLUX.2 single-file → diffusers; Wan2.2 torch `.pth` reader, T2V/I2V/TI2V + VAE; LTX-2.3 single-file → split MLX). A few models that ship as fp8 or scattered torch checkpoints are provisioned by an offline Python converter under `tools/` (Ideogram 4 fp8, InstantID, and the face-stack sub-models)
 
 Requires a Mac with full Xcode + the Metal Toolchain (MLX's Metal kernels compile from source).
 
@@ -68,9 +69,11 @@ fn main() -> mlx_gen::Result<()> {
 }
 ```
 
-Discover what is registered at runtime with `mlx_gen::registry::generators()`. The same pattern
-applies to the other entry points: `load_trainer` (LoRA/LoKr fine-tuning), `load_captioner`
-(JoyCaption), and `load_transform` (SAM2).
+Discover what is registered at runtime with `mlx_gen::registry::generators()` (SeedVR2 is
+registered here as a `Generator`). The same link-time pattern backs the other entry points:
+`load_trainer` (LoRA/LoKr fine-tuning), `load_captioner` (JoyCaption), and `load_textllm`
+(prompt-refine). The SAM2 / SAM3 segmenters are plain utility APIs used directly, not through the
+registry.
 
 ## License
 
