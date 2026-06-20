@@ -438,10 +438,21 @@ pub fn sample_token(
     temperature: f32,
     top_p: f32,
     rng: &mut SplitMix64,
+    allowed: Option<&[bool]>,
 ) -> Result<i32> {
     let lf = logits.as_dtype(Dtype::Float32)?;
-    let v: Vec<f32> = lf.as_slice::<f32>().to_vec();
+    let mut v: Vec<f32> = lf.as_slice::<f32>().to_vec();
     let vocab = v.len();
+
+    // Grammar-constrained decoding (sc-6585): forbid every token the constraint rejects by driving
+    // its logit to -inf before greedy/softmax so it can never be sampled.
+    if let Some(mask) = allowed {
+        for (i, slot) in v.iter_mut().enumerate() {
+            if !mask.get(i).copied().unwrap_or(false) {
+                *slot = f32::NEG_INFINITY;
+            }
+        }
+    }
 
     if temperature <= 0.0 {
         return Ok(argmax_f32(&v));
@@ -552,7 +563,28 @@ mod tests {
     fn greedy_picks_argmax_at_temperature_zero() {
         let logits = Array::from_slice(&[0.1f32, 4.0, 2.0], &[1, 3]);
         let mut rng = SplitMix64::new(0);
-        assert_eq!(sample_token(&logits, 0.0, 1.0, &mut rng).unwrap(), 1);
+        assert_eq!(sample_token(&logits, 0.0, 1.0, &mut rng, None).unwrap(), 1);
+    }
+
+    #[test]
+    fn allow_mask_forbids_disallowed_tokens() {
+        // The argmax token (index 1) is masked out, so the next-best ALLOWED token (index 2) wins
+        // even under greedy decoding.
+        let logits = Array::from_slice(&[0.1f32, 4.0, 2.0], &[1, 3]);
+        let mut rng = SplitMix64::new(0);
+        let mask = [true, false, true];
+        assert_eq!(
+            sample_token(&logits, 0.0, 1.0, &mut rng, Some(&mask)).unwrap(),
+            2
+        );
+        // Under sampling the masked token is never drawn across many draws.
+        let only_zero = [true, false, false];
+        for _ in 0..50 {
+            assert_eq!(
+                sample_token(&logits, 1.0, 1.0, &mut rng, Some(&only_zero)).unwrap(),
+                0
+            );
+        }
     }
 
     #[test]
@@ -560,7 +592,7 @@ mod tests {
         let logits = Array::from_slice(&[5.0f32, 4.0, 1.0], &[1, 3]);
         let mut rng = SplitMix64::new(0);
         // top_p 0 still keeps the single most-probable token.
-        assert_eq!(sample_token(&logits, 0.7, 0.0, &mut rng).unwrap(), 0);
+        assert_eq!(sample_token(&logits, 0.7, 0.0, &mut rng, None).unwrap(), 0);
     }
 
     #[test]
@@ -569,7 +601,7 @@ mod tests {
         let draw = |seed: u64| -> Vec<i32> {
             let mut rng = SplitMix64::new(seed);
             (0..32)
-                .map(|_| sample_token(&logits, 1.0, 1.0, &mut rng).unwrap())
+                .map(|_| sample_token(&logits, 1.0, 1.0, &mut rng, None).unwrap())
                 .collect()
         };
         assert_eq!(draw(7), draw(7), "same seed reproduces the same samples");

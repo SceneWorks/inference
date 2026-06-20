@@ -44,7 +44,22 @@ pub struct TextLlmRequest {
     pub prompt: String,
     /// Sampling controls for the autoregressive decoder.
     pub sampling: TextLlmSampling,
+    /// Optional structural constraint on the output (sc-6585). `None` = free text. A provider that
+    /// supports the constraint masks its per-step logits to the grammar-valid token set so the
+    /// emitted text is guaranteed to satisfy it (e.g. parse as JSON); one that does not should reject
+    /// a constrained request in `validate` rather than silently ignore it.
+    pub constraint: Option<TextLlmConstraint>,
     pub cancel: CancelFlag,
+}
+
+/// An optional structural constraint on a [`TextLlmRequest`]'s output (sc-6585), applied by
+/// grammar-constrained decoding in the provider's sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextLlmConstraint {
+    /// The output must be a single well-formed JSON value, enforced by the generic JSON grammar in
+    /// [`crate::json_constraint`]. Object SHAPE is not enforced here — the caller validates or
+    /// normalizes the parsed value (e.g. the worker's canonical caption serializer).
+    Json,
 }
 
 /// Autoregressive sampling knobs for text generation.
