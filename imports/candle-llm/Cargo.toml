@@ -1,0 +1,10 @@
+[package]
+name = "candle-llm"
+version = "0.0.0"
+edition = "2021"
+description = "Reserved — on-device LLM serving engine, Candle backend (placeholder; work in progress)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/candle-llm"
+readme = "README.md"
+
+[dependencies]
