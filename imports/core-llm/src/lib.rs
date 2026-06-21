@@ -40,7 +40,7 @@ pub use message::{Content, ImageRef, Message, Role};
 pub use output::{FinishReason, StreamEvent, TextLlmOutput, Usage};
 pub use registry::{load_textllm, textllms, TextLlmRegistration};
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest};
-pub use template::{ChatMlTemplate, ChatTemplate, Llama3Template};
+pub use template::{ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template};
 pub use text_llm::TextLlm;
 pub use tokenizer::Tokenizer;
 
