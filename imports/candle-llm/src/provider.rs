@@ -1,0 +1,313 @@
+//! The `core-llm` provider: a generic Llama model exposed through the backend-neutral contract.
+//!
+//! This is the candle-llm half of story 7237 — it implements [`core_llm::TextLlm`] by wrapping the
+//! [`LlamaModel`] decoder, a [`core_llm::Tokenizer`], and a chat template, driving the internal
+//! streaming decode loop and translating its token events into contract [`StreamEvent`]s (with
+//! incremental detokenization). It registers into [`core_llm::registry`] under the id `candle-llama`.
+//! Passing the `core-llm-testkit` conformance suite as a *second, independent* backend is what
+//! de-provisionalizes the contract.
+
+use std::cell::OnceCell;
+use std::path::Path;
+
+use core_llm::{
+    ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError,
+    FinishReason as CoreFinish, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
+    Quantize, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
+};
+
+use crate::config::LlamaConfig;
+use crate::decode::{generate_with, ConstraintMask, FinishReason, GenerationConfig, StreamEvent};
+use crate::device::select_device;
+use crate::models::LlamaModel;
+use crate::primitives::projection::QuantSpec;
+use crate::primitives::sampler::SamplingParams;
+use crate::primitives::Weights;
+
+/// The registry id of this provider.
+pub const PROVIDER_ID: &str = "candle-llama";
+
+/// A generic Llama provider implementing [`core_llm::TextLlm`].
+pub struct LlamaProvider {
+    descriptor: TextLlmDescriptor,
+    model: LlamaModel,
+    tokenizer: Tokenizer,
+    template: Box<dyn ChatTemplate>,
+    stop_tokens: Vec<i32>,
+    /// Cached per-vocab decode table for constrained decoding — built once (it decodes the whole
+    /// vocabulary) on the first JSON-constrained request, then reused.
+    constraint_table: OnceCell<ConstraintDecodeTable>,
+}
+
+impl LlamaProvider {
+    /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
+    /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
+    /// quantizes the projections on load per `spec.quantize`.
+    pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
+        let dir = Path::new(&spec.source);
+        let cfg = LlamaConfig::from_dir(dir).map_err(to_core)?;
+        let quant = spec.quantize.map(|q| match q {
+            Quantize::Q4 => QuantSpec::q4(),
+            Quantize::Q8 => QuantSpec::q8(),
+        });
+        let descriptor = descriptor_for(&cfg);
+        let device = select_device().map_err(to_core)?;
+        let weights = Weights::from_dir(dir, &device).map_err(to_core)?;
+        let model = LlamaModel::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+        let stop_tokens = eos_token_ids(dir);
+        Ok(Self {
+            descriptor,
+            model,
+            tokenizer,
+            template: load_chat_template(dir),
+            stop_tokens,
+            constraint_table: OnceCell::new(),
+        })
+    }
+
+    /// Whether the loaded model's projections are quantized.
+    pub fn is_quantized(&self) -> bool {
+        self.model.is_quantized()
+    }
+
+    /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
+    /// and converters that don't have a `tokenizer_config.json`).
+    pub fn from_parts(model: LlamaModel, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
+        Self {
+            descriptor: provider_descriptor(),
+            model,
+            tokenizer,
+            template: Box::new(Llama3Template),
+            stop_tokens,
+            constraint_table: OnceCell::new(),
+        }
+    }
+}
+
+/// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
+struct JsonMask<'a>(JsonConstraint<'a>);
+
+impl ConstraintMask for JsonMask<'_> {
+    fn allowed(&mut self) -> &[bool] {
+        self.0.allowed()
+    }
+    fn accept(&mut self, token: i32) {
+        self.0.accept(token as u32);
+    }
+}
+
+/// Use the model's own Jinja `chat_template` (from `tokenizer_config.json`) when present; otherwise
+/// fall back to the typed Llama-3 template.
+fn load_chat_template(dir: &Path) -> Box<dyn ChatTemplate> {
+    match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
+        Ok(t) => Box::new(t),
+        Err(_) => Box::new(Llama3Template),
+    }
+}
+
+impl TextLlm for LlamaProvider {
+    fn descriptor(&self) -> &TextLlmDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
+        self.descriptor
+            .capabilities
+            .validate_request(&self.descriptor.id, req)
+    }
+
+    fn generate(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+    ) -> CoreResult<TextLlmOutput> {
+        self.validate(req)?;
+        if req.cancel.is_cancelled() {
+            return Err(CoreError::Canceled); // typed pre-inference cancel
+        }
+
+        // Render the conversation and tokenize. The template already includes BOS, so encode without
+        // auto special tokens.
+        let prompt = self.template.render(&req.messages, true)?;
+        let prompt_ids: Vec<i32> = self
+            .tokenizer
+            .encode(&prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect();
+        let prompt_len = prompt_ids.len();
+
+        let config = GenerationConfig {
+            max_new_tokens: req.max_new_tokens as usize,
+            sampling: map_sampling(&req.sampling),
+            seed: req.seed,
+            stop_tokens: self.stop_tokens.clone(),
+        };
+
+        // Structured-output constraint: build a JSON mask over the cached decode table.
+        let mut json_mask = match req.constraint {
+            Some(Constraint::Json) => {
+                let table = self
+                    .constraint_table
+                    .get_or_init(|| self.tokenizer.constraint_decode_table());
+                Some(JsonMask(JsonConstraint::new(
+                    table,
+                    self.stop_tokens.iter().map(|&i| i as u32),
+                )))
+            }
+            None => None,
+        };
+
+        // Drive the internal loop; translate token-id events to contract text-delta events via
+        // incremental detokenization (re-decode the running sequence, emit the new suffix).
+        let tokenizer = &self.tokenizer;
+        let out = {
+            let mut acc: Vec<u32> = Vec::new();
+            let mut shown = 0usize;
+            let mut sink = |ev: StreamEvent| {
+                if let StreamEvent::Token { id, step } = ev {
+                    acc.push(id as u32);
+                    if let Ok(text) = tokenizer.decode(&acc, true) {
+                        if text.len() > shown {
+                            let delta = text[shown..].to_string();
+                            shown = text.len();
+                            on_event(CoreEvent::Token {
+                                id: id as u32,
+                                text: delta,
+                                index: step,
+                            });
+                        }
+                    }
+                }
+            };
+            let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
+            generate_with(
+                &self.model,
+                &prompt_ids,
+                &config,
+                &req.cancel,
+                &mut sink,
+                constraint,
+            )
+            .map_err(to_core)?
+        };
+
+        let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
+        let text = tokenizer.decode(&gen_u32, true)?;
+        let finish = map_finish(out.finish_reason);
+        let usage = Usage {
+            prompt_tokens: prompt_len as u32,
+            generated_tokens: out.tokens.len() as u32,
+        };
+        on_event(CoreEvent::Done {
+            finish_reason: finish,
+            usage,
+        });
+        Ok(TextLlmOutput {
+            text,
+            usage,
+            finish_reason: Some(finish),
+        })
+    }
+}
+
+/// The descriptor for the `candle-llama` provider (constructible without loading weights; used for
+/// link-time registration and registry discovery).
+pub fn provider_descriptor() -> TextLlmDescriptor {
+    TextLlmDescriptor {
+        id: PROVIDER_ID.to_string(),
+        family: "llama".to_string(),
+        backend: "candle".to_string(),
+        capabilities: TextLlmCapabilities {
+            max_context_tokens: 0,
+            max_new_tokens: 0,
+            supports_system_prompt: true,
+            // Text-only today; the VLM path flips this on for a vision provider.
+            supports_vision: false,
+            // JSON-constrained decoding.
+            supported_constraints: vec![Constraint::Json],
+        },
+    }
+}
+
+/// A descriptor reflecting a *loaded* model: family from the dispatched architecture and the context
+/// length from `config.json`. (Quantization state is reported via [`LlamaProvider::is_quantized`].)
+fn descriptor_for(cfg: &LlamaConfig) -> TextLlmDescriptor {
+    let mut d = provider_descriptor();
+    d.family = cfg.architecture.family().to_string();
+    d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
+    d
+}
+
+/// Read `eos_token_id` (int or array) from `config.json`; falls back to the Llama-3 stop ids.
+pub fn eos_token_ids(dir: &Path) -> Vec<i32> {
+    let fallback = vec![128001, 128008, 128009]; // <|end_of_text|>, <|eom_id|>, <|eot_id|>
+    let Ok(text) = std::fs::read_to_string(dir.join("config.json")) else {
+        return fallback;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return fallback;
+    };
+    match v.get("eos_token_id") {
+        Some(serde_json::Value::Number(n)) => {
+            n.as_i64().map(|x| vec![x as i32]).unwrap_or(fallback)
+        }
+        Some(serde_json::Value::Array(a)) => {
+            let ids: Vec<i32> = a
+                .iter()
+                .filter_map(|x| x.as_i64().map(|x| x as i32))
+                .collect();
+            if ids.is_empty() {
+                fallback
+            } else {
+                ids
+            }
+        }
+        _ => fallback,
+    }
+}
+
+fn map_sampling(s: &Sampling) -> SamplingParams {
+    SamplingParams {
+        temperature: s.temperature,
+        top_p: s.top_p,
+        top_k: s.top_k,
+        repetition_penalty: s.repetition_penalty,
+        repetition_context: s.repetition_context,
+    }
+}
+
+fn map_finish(f: FinishReason) -> CoreFinish {
+    match f {
+        FinishReason::StopToken => CoreFinish::Stop,
+        FinishReason::MaxTokens => CoreFinish::Length,
+        FinishReason::Cancelled => CoreFinish::Cancelled,
+    }
+}
+
+/// Bridge an engine error into the contract error, preserving the typed cancellation / capability /
+/// load variants (do not stringify those).
+fn to_core(e: crate::Error) -> CoreError {
+    match e {
+        crate::Error::Canceled => CoreError::Canceled,
+        crate::Error::Unsupported(m) => CoreError::Unsupported(m),
+        crate::Error::MissingTensor(m) => CoreError::Load(format!("missing tensor: {m}")),
+        crate::Error::Config(m) => CoreError::Load(m),
+        crate::Error::Io(e) => CoreError::Io(e),
+        other => CoreError::backend(other),
+    }
+}
+
+// Register `candle-llama` into core-llm's provider registry at link time.
+inventory::submit! {
+    core_llm::TextLlmRegistration {
+        descriptor: provider_descriptor,
+        load: load_registered,
+    }
+}
+
+fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
+    Ok(Box::new(LlamaProvider::load(spec)?))
+}
