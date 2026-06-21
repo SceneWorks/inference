@@ -58,3 +58,10 @@ fn assert_streams_coherent(env: &str, family: &str) {
 fn phi3_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_PHI3_MODEL", "phi3");
 }
+
+/// Qwen2-MoE: Qwen2 attention (q/k/v bias) + a sparse MoE FFN (router + top-k experts + shared).
+#[test]
+#[ignore = "needs a Qwen2-MoE snapshot via CANDLE_LLM_QWEN2MOE_MODEL"]
+fn qwen2_moe_streams_coherent_text() {
+    assert_streams_coherent("CANDLE_LLM_QWEN2MOE_MODEL", "qwen2_moe");
+}
