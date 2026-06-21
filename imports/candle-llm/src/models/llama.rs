@@ -15,7 +15,7 @@ use candle_nn::{Linear, Module};
 use crate::config::LlamaConfig;
 use crate::device::compute_dtype;
 use crate::error::Result;
-use crate::primitives::attention::sdpa_causal;
+use crate::primitives::attention::{sdpa, AttnMask};
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::{embed, rms_norm, silu};
 use crate::primitives::projection::{Projection, QuantSpec};
@@ -143,6 +143,25 @@ impl LlamaModel {
         ContiguousKvCache::new(self.cfg.num_layers)
     }
 
+    /// The engine's compute dtype for this model (bf16 on GPU, f32 on CPU) — the batched decode reads
+    /// it to match its additive attention mask to the score dtype.
+    pub fn compute_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Build per-row RoPE `(cos, sin)` tables for a `[rows, cols]` grid of absolute positions
+    /// (row-major flat `positions`, length `rows * cols`) — the **per-sequence** position tables the
+    /// batched decode (story 7255) feeds [`LlamaModel::decode_logits_masked`]. Each is
+    /// `[rows, cols, head_dim]` in the compute dtype.
+    pub fn rope_tables(&self, positions: &[i32], rows: i32, cols: i32) -> Result<(Tensor, Tensor)> {
+        let (cos, sin) = self.rope.cos_sin_at(positions, self.dtype, &self.device)?; // [1, rows*cols, hd]
+        let hd = self.rope.dim();
+        Ok((
+            cos.reshape((rows as usize, cols as usize, hd))?,
+            sin.reshape((rows as usize, cols as usize, hd))?,
+        ))
+    }
+
     /// Embed token ids `[batch, seq]` (u32) → `[batch, seq, hidden]`.
     pub fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
         embed(&self.embed_tokens, input_ids)
@@ -169,14 +188,50 @@ impl LlamaModel {
         cache: &mut dyn KvCache,
         offset: i32,
     ) -> Result<Tensor> {
+        let s = input_embeds.dim(1)? as i32;
+        // Single-sequence / uniform batch: positions [offset, offset+s) shared across the batch, with
+        // an implicit bottom-right causal mask; cos/sin `[1, s, head_dim]` broadcast over the batch.
+        let (cos, sin) = self.rope.cos_sin(s, offset, self.dtype, &self.device)?;
+        self.forward_to_last_logits(input_embeds, cache, &cos, &sin, AttnMask::Causal)
+    }
+
+    /// Batched forward over a **left-padded** `[batch, seq]` step with **per-sequence** RoPE positions
+    /// and an explicit additive attention mask — the decode primitive the dynamic-batch scheduler
+    /// (story 7255) runs each step.
+    ///
+    /// `input_ids` is `[batch, seq]` (u32); `cos`/`sin` are `[batch, seq, head_dim]` (per-row
+    /// positions, e.g. from [`LlamaModel::rope_tables`]); `mask` is an additive
+    /// `[batch, 1, seq, k_total]` score mask (`0` keep, large-negative block) covering left-padding +
+    /// causality. Returns logits for the **last column** `[batch, vocab]` — left-padding right-aligns
+    /// every row's last real token to that column, so one slice serves the whole batch.
+    pub fn decode_logits_masked(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut dyn KvCache,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let embeds = self.embed(input_ids)?;
+        self.forward_to_last_logits(&embeds, cache, cos, sin, AttnMask::Additive(mask))
+    }
+
+    /// Run the decoder stack over `input_embeds` with the given RoPE tables and attention mask, and
+    /// project the **last column** to logits `[batch, vocab]`. The shared core of the single and
+    /// batched forwards: they differ only in how `cos`/`sin` and `mask` are built.
+    fn forward_to_last_logits(
+        &self,
+        input_embeds: &Tensor,
+        cache: &mut dyn KvCache,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: AttnMask<'_>,
+    ) -> Result<Tensor> {
         let (b, s, _) = input_embeds.dims3()?;
-        let (cos, sin) = self
-            .rope
-            .cos_sin(s as i32, offset, self.dtype, &self.device)?;
 
         let mut h = input_embeds.clone();
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &cos, &sin, cache, i)?;
+            h = layer.forward(&h, cos, sin, mask, cache, i)?;
         }
 
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?; // [b, 1, hidden]
@@ -215,11 +270,14 @@ impl LlamaLayer {
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        mask: AttnMask<'_>,
         cache: &mut dyn KvCache,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
-        let attn = self.attn.forward(&normed, cos, sin, cache, layer_idx)?;
+        let attn = self
+            .attn
+            .forward(&normed, cos, sin, mask, cache, layer_idx)?;
         let h = x.broadcast_add(&attn)?;
         let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
         let mlp = self.mlp.forward(&normed2)?;
@@ -249,6 +307,7 @@ impl LlamaAttention {
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        mask: AttnMask<'_>,
         cache: &mut dyn KvCache,
         layer_idx: usize,
     ) -> Result<Tensor> {
@@ -277,7 +336,7 @@ impl LlamaAttention {
         let k_all = repeat_kv(&k_all, self.groups)?;
         let v_all = repeat_kv(&v_all, self.groups)?;
 
-        let out = sdpa_causal(&q, &k_all, &v_all, self.scale)?; // [b, heads, s, head_dim]
+        let out = sdpa(&q, &k_all, &v_all, self.scale, mask)?; // [b, heads, s, head_dim]
         let out = out
             .transpose(1, 2)?
             .contiguous()?
