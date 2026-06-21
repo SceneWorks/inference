@@ -293,12 +293,19 @@ pub fn post_process_instances(
     mask_threshold: f32,
 ) -> Result<Vec<Instance>> {
     let presence = sigmoid(presence_logits)?.item::<f32>();
+    // Cast to f32 before the host readback: `as_slice::<f32>()` is `try_as_slice().unwrap()` and
+    // sigmoid/clamp/cxcywh preserve dtype, so a bf16 detector head would panic here. The sibling
+    // `pred_masks` path (below) and tracker.rs already cast every readback — match them (F-023).
     let scores: Vec<f32> = sigmoid(pred_logits)?
+        .as_dtype(mlx_rs::Dtype::Float32)?
         .as_slice::<f32>()
         .iter()
         .map(|&s| s * presence)
         .collect();
-    let boxes: Vec<f32> = pred_boxes.as_slice::<f32>().to_vec();
+    let boxes: Vec<f32> = pred_boxes
+        .as_dtype(mlx_rs::Dtype::Float32)?
+        .as_slice::<f32>()
+        .to_vec();
     let (tw, th) = target_wh;
 
     let mut out = Vec::new();
@@ -348,5 +355,38 @@ mod tests {
         // mask binarized to all-1 (4 px)
         let s = inst[0].mask.as_dtype(mlx_rs::Dtype::Float32).unwrap();
         assert_eq!(mlx_rs::ops::sum(&s, None).unwrap().item::<f32>(), 4.0);
+    }
+
+    /// F-023: a bf16 detector head (bf16 `pred_logits` / `pred_boxes`) must not panic in the host
+    /// readback. Same scenario as above with those two tensors cast to bf16 — before the `as_dtype`
+    /// guard, `as_slice::<f32>()` (= `try_as_slice().unwrap()`) panicked on the bf16 dtype.
+    #[test]
+    fn post_process_handles_bf16_logits_and_boxes() {
+        let presence = Array::from_slice(&[10.0f32], &[1, 1]);
+        let logits = Array::from_slice(&[8.0f32, -8.0], &[1, 2])
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap();
+        let boxes = Array::from_slice(&[0.0f32, 0.0, 0.5, 0.5, 0.0, 0.0, 1.0, 1.0], &[1, 2, 4])
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap();
+        let masks = Array::from_slice(
+            &[5.0f32, 5.0, 5.0, 5.0, -5.0, -5.0, -5.0, -5.0],
+            &[1, 2, 2, 2],
+        );
+        let inst =
+            post_process_instances(&logits, &boxes, &presence, &masks, (100.0, 200.0), 0.5, 0.5)
+                .unwrap();
+        assert_eq!(
+            inst.len(),
+            1,
+            "bf16 logits/boxes must not panic and still keep query 0"
+        );
+        assert_eq!(inst[0].query, 0);
+        // box scaled by (100,200): [0,0,0.5,0.5] → [0,0,50,100], within bf16 rounding (0.5/1.0 exact).
+        let b = inst[0].box_xyxy;
+        assert!(
+            (b[0]).abs() < 0.5 && (b[2] - 50.0).abs() < 0.5 && (b[3] - 100.0).abs() < 0.5,
+            "box ~[0,0,50,100] within bf16 rounding, got {b:?}"
+        );
     }
 }
