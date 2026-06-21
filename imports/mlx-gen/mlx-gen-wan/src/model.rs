@@ -30,14 +30,35 @@ use crate::config::WanModelConfig;
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, best_output_size, build_i2v_y,
     build_ti2v_keyframe_z, build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames,
-    decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images, latent_shape,
-    preflight_denoise_memory_guard, preprocess_ti2v_image, resolve_sampler_knobs, seq_len,
-    ti2v_blend_init, Expert,
+    decode_to_frames_22, denoise, denoise_curated, denoise_moe, denoise_moe_curated, denoise_ti2v,
+    frames_to_images, latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image,
+    resolve_sampler_knobs, seq_len, ti2v_blend_init, Expert,
 };
 use crate::text_encoder::encode_text_staged;
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;
+
+/// The curated unified solvers (epic 7114, sc-7121) every Wan generator exposes ADDITIVELY beyond its
+/// native `unipc`/`euler`/`dpmpp2m` — the gen-core-only solvers, routed through `run_flow_sampler` over
+/// Wan's own flow-σ schedule ([`crate::pipeline::denoise_curated`] / [`denoise_moe_curated`]). Wan's
+/// native `unipc`/`dpmpp2m` are flow-SNR multistep solvers (`λ = log((1−σ)/σ)`) the gen-core VE-space
+/// `uni_pc`/`dpmpp_2m` (`λ = −ln σ`) do NOT reproduce, so those names are deliberately NOT duplicated
+/// (the native default stays byte-exact — the N1 default-parity gate).
+const WAN_CURATED_SAMPLERS: [&str; 4] = ["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
+
+/// Wan's full per-generation sampler menu: the native `scheduler.rs` solvers + the curated additions.
+fn wan_samplers() -> Vec<&'static str> {
+    let mut s = vec!["unipc", "euler", "dpmpp2m"];
+    s.extend(WAN_CURATED_SAMPLERS);
+    s
+}
+
+/// Whether `req.sampler` selects a curated gen-core solver (routed through `run_flow_sampler`) rather
+/// than a native Wan solver (handled by `scheduler.rs`). Used to branch the denoise dispatch.
+fn is_wan_curated(name: Option<&str>) -> bool {
+    matches!(name, Some(n) if WAN_CURATED_SAMPLERS.contains(&n))
+}
 
 /// Public registry id: `mlx_gen::load("wan2_2_ti2v_5b", spec)`.
 pub const MODEL_ID: &str = "wan2_2_ti2v_5b";
@@ -63,7 +84,7 @@ pub fn descriptor() -> ModelDescriptor {
             // untagged specs only, reusing the sc-2683/sc-2393 `merge_wan_adapters` seam).
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec!["unipc", "euler", "dpmpp2m"],
+            samplers: wan_samplers(),
             schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 32; cap the long edge at 1280 (max_area 704×1280).
             min_size: 32,
@@ -354,16 +375,45 @@ impl Wan {
                 None => None,
             };
             let total = steps as u32;
-            let mut on_step = |i: usize| {
-                on_progress(Progress::Step {
-                    current: i as u32,
-                    total,
-                })
-            };
-            match &ti2v {
-                Some((z_img, mask, mask_tokens)) => denoise_ti2v(
+            // Curated unified solver (epic 7114, sc-7121): the gen-core-only solvers route through the
+            // shared `denoise_curated`; the native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). The
+            // image-conditioned TI2V mask-blend (per-token timesteps + a post-step re-blend) has no
+            // single-eval curated-sampler hook, so it stays native-only.
+            match (&ti2v, is_wan_curated(req.sampler.as_deref())) {
+                (Some(_), true) => {
+                    return Err(Error::Msg(
+                        "wan: curated samplers (euler_ancestral/heun/dpmpp_sde/ddim) are not \
+                         supported with image-conditioned TI2V mask-blend — use unipc/euler/dpmpp2m"
+                            .into(),
+                    ));
+                }
+                (Some((z_img, mask, mask_tokens)), false) => {
+                    let mut on_step = |i: usize| {
+                        on_progress(Progress::Step {
+                            current: i as u32,
+                            total,
+                        })
+                    };
+                    denoise_ti2v(
+                        &dit,
+                        kind,
+                        cfg.num_train_timesteps,
+                        steps,
+                        shift,
+                        guidance,
+                        &ctx_cond,
+                        ctx_uncond.as_ref(),
+                        &latents_init,
+                        z_img,
+                        mask,
+                        mask_tokens,
+                        &req.cancel,
+                        &mut on_step,
+                    )?
+                }
+                (None, true) => denoise_curated(
                     &dit,
-                    kind,
+                    req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
                     cfg.num_train_timesteps,
                     steps,
                     shift,
@@ -371,25 +421,31 @@ impl Wan {
                     &ctx_cond,
                     ctx_uncond.as_ref(),
                     &latents_init,
-                    z_img,
-                    mask,
-                    mask_tokens,
+                    seed,
                     &req.cancel,
-                    &mut on_step,
+                    on_progress,
                 )?,
-                None => denoise(
-                    &dit,
-                    kind,
-                    cfg.num_train_timesteps,
-                    steps,
-                    shift,
-                    guidance,
-                    &ctx_cond,
-                    ctx_uncond.as_ref(),
-                    &latents_init,
-                    &req.cancel,
-                    &mut on_step,
-                )?,
+                (None, false) => {
+                    let mut on_step = |i: usize| {
+                        on_progress(Progress::Step {
+                            current: i as u32,
+                            total,
+                        })
+                    };
+                    denoise(
+                        &dit,
+                        kind,
+                        cfg.num_train_timesteps,
+                        steps,
+                        shift,
+                        guidance,
+                        &ctx_cond,
+                        ctx_uncond.as_ref(),
+                        &latents_init,
+                        &req.cancel,
+                        &mut on_step,
+                    )?
+                }
             }
         };
 
@@ -456,7 +512,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // MoE high/low); Q4/Q8 (sc-2682) loads via `spec.quantize` or a pre-quantized snapshot.
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec!["unipc", "euler", "dpmpp2m"],
+            samplers: wan_samplers(),
             schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
             min_size: 16,
@@ -792,25 +848,46 @@ impl Wan14b {
             };
             let boundary_timestep = cfg.boundary * cfg.num_train_timesteps as f32;
             let total = steps as u32;
-            let mut on_step = |i: usize| {
-                on_progress(Progress::Step {
-                    current: i as u32,
-                    total,
-                })
-            };
-            denoise_moe(
-                &low,
-                &high,
-                boundary_timestep,
-                kind,
-                cfg.num_train_timesteps,
-                steps,
-                shift,
-                &init_noise,
-                y.as_ref(),
-                &req.cancel,
-                &mut on_step,
-            )?
+            // Curated unified solver (epic 7114, sc-7121): the gen-core-only solvers route through
+            // `denoise_moe_curated` (the boundary expert swap happens inside its predict closure); the
+            // native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). Works for both T2V (`y = None`)
+            // and I2V (`y = Some` channel-concat conditioning).
+            if is_wan_curated(req.sampler.as_deref()) {
+                denoise_moe_curated(
+                    &low,
+                    &high,
+                    boundary_timestep,
+                    req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
+                    cfg.num_train_timesteps,
+                    steps,
+                    shift,
+                    &init_noise,
+                    y.as_ref(),
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                )?
+            } else {
+                let mut on_step = |i: usize| {
+                    on_progress(Progress::Step {
+                        current: i as u32,
+                        total,
+                    })
+                };
+                denoise_moe(
+                    &low,
+                    &high,
+                    boundary_timestep,
+                    kind,
+                    cfg.num_train_timesteps,
+                    steps,
+                    shift,
+                    &init_noise,
+                    y.as_ref(),
+                    &req.cancel,
+                    &mut on_step,
+                )?
+            }
         };
 
         // --- Stage 3: z16 VAE decode → RGB8 frames ---
@@ -926,7 +1003,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             // MoE high/low); Q4/Q8 (sc-2682) loads via `spec.quantize` or a pre-quantized snapshot.
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec!["unipc", "euler", "dpmpp2m"],
+            samplers: wan_samplers(),
             schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
             min_size: 16,

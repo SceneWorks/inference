@@ -447,6 +447,128 @@ fn denoise_core(
     Ok(latents)
 }
 
+/// Curated unified-sampler denoise (epic 7114, sc-7121) — the **additive** k-diffusion alternative to
+/// SDXL's bespoke ancestral default. Drives any [`mlx_gen::Solver`] over a `DiscreteModelSampling`
+/// (ε-prediction) and an [`mlx_gen::Scheduler`]-built σ schedule, through the shared
+/// [`mlx_gen::run_curated_sampler`]. The ancestral default path ([`denoise_core`]) is left untouched —
+/// this is selected only when the request names a curated sampler/scheduler, so the N1 default-parity
+/// gate is byte-exact (the legacy loop is not entered).
+///
+/// Supports txt2img / img2img / ControlNet / IP-Adapter (the `controls` / `ip` dispatch mirrors
+/// [`denoise_core`]). Inpaint is **not** offered here: its per-step mask blend has no post-step hook in
+/// the callback-form `Sampler`, so it stays on the ancestral path (the same architectural boundary that
+/// keeps Ideogram's interleaved inpaint bespoke).
+///
+/// The latents live in RAW k-diffusion σ-space (`x = ε·σ_max` at the start, `x₀ + ε·σ_start` for
+/// img2img — built by the caller), and the U-Net input is `x/√(σ²+1)` ([`DiscreteModelSampling`]'s
+/// `input_scale`), cast to the fp16 compute dtype inside the predict closure. The conditioning timestep
+/// is the nearest training index ([`DiscreteModelSampling::timestep`]) — ComfyUI's behaviour for a
+/// discrete model under a curated solver.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_curated(
+    unet: &UNet2DConditionModel,
+    sampler_name: Option<&str>,
+    ms: &mlx_gen::DiscreteModelSampling,
+    sigmas: &[f32],
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    controls: &[ControlContext],
+    ip: Option<(&Array, f32)>,
+    control_encoder: Option<&Array>,
+) -> Result<Array> {
+    // Same SiLU-fusion compile scope as the ancestral loop (sc-2963) — bit-exact in fp16.
+    let _compile_glue = crate::CompileGlueGuard::enable();
+    let cfg_on = cfg > 1.0;
+    let cn_enc = control_encoder.unwrap_or(conditioning);
+    mlx_gen::run_curated_sampler(
+        sampler_name,
+        ms,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |x_in, timestep| {
+            // `x_in` is the c_in-scaled latent (f32); cast to the U-Net compute dtype, then CFG-batch.
+            let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
+            let x_unet = if cfg_on {
+                concatenate_axis(&[&x16, &x16], 0)?
+            } else {
+                x16
+            };
+            // ControlNet residuals (summed across branches — the MultiControlNet rule), mirroring
+            // `denoise_core`.
+            let combined: Option<ControlResiduals> = {
+                let mut acc: Option<ControlResiduals> = None;
+                for cc in controls {
+                    let res = cc.controlnet.forward(
+                        &x_unet,
+                        &cc.cond_embed,
+                        timestep,
+                        cn_enc,
+                        pooled,
+                        time_ids,
+                        cc.scale,
+                    )?;
+                    acc = Some(match acc {
+                        None => res,
+                        Some(prev) => prev.add(&res)?,
+                    });
+                }
+                acc
+            };
+            let eps = match (ip, combined.as_ref()) {
+                (Some((tokens, scale)), Some(res)) => unet.forward_with_ip_control(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    (tokens, scale),
+                    res,
+                )?,
+                (Some((tokens, scale)), None) => unet.forward_with_ip(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    (tokens, scale),
+                )?,
+                (None, Some(res)) => unet.forward_with_control(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    res,
+                )?,
+                (None, None) => unet.forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
+            };
+            // CFG combine (identical to `denoise_core`): `eps_neg + cfg·(eps_text − eps_neg)`, the
+            // scalar cast to the eps dtype so the blend runs in the compute dtype.
+            if cfg_on {
+                let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
+                let eps_text = row(0)?;
+                let eps_neg = row(1)?;
+                let cfg_s = scalar(cfg).as_dtype(eps_text.dtype())?;
+                Ok(add(
+                    &eps_neg,
+                    &multiply(&subtract(&eps_text, &eps_neg)?, &cfg_s)?,
+                )?)
+            } else {
+                Ok(eps)
+            }
+        },
+    )
+}
+
 /// Seed the global RNG and sample the prior latents `[1, height/8, width/8, 4]` (NHWC, f32).
 pub fn seeded_prior(sampler: &EulerSampler, seed: u64, width: u32, height: u32) -> Result<Array> {
     random::seed(seed)?;
