@@ -18,6 +18,7 @@
 //! - [`Sampling`] — backend-neutral sampling policy.
 //! - [`Constraint`] + [`JsonState`] — constrained-decoding policy (generic JSON grammar).
 //! - [`Tokenizer`] + [`ChatTemplate`] — host-side text policy.
+//! - [`Scheduler`] — backend-neutral continuous-batching policy (admission + per-sequence retire).
 //! - [`registry`] — link-time provider registration and id-based routing.
 
 pub mod cancel;
@@ -28,6 +29,7 @@ pub mod message;
 pub mod output;
 pub mod registry;
 pub mod request;
+pub mod schedule;
 pub mod template;
 pub mod text_llm;
 pub mod tokenizer;
@@ -40,6 +42,7 @@ pub use message::{Content, ImageRef, Message, Role};
 pub use output::{FinishReason, StreamEvent, TextLlmOutput, Usage};
 pub use registry::{load_textllm, textllms, TextLlmRegistration};
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest};
+pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use template::{ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template};
 pub use text_llm::TextLlm;
 pub use tokenizer::Tokenizer;
