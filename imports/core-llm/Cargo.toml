@@ -2,9 +2,22 @@
 name = "core-llm"
 version = "0.0.0"
 edition = "2021"
-description = "Reserved — backend-neutral contract + host policy for an on-device LLM serving engine (placeholder; work in progress)."
+description = "Backend-neutral contract + host policy + provider registry for an on-device LLM serving engine (no tensors)."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/core-llm"
 readme = "README.md"
+keywords = ["llm", "inference", "serving", "contract", "multimodal"]
+categories = ["science"]
 
 [dependencies]
+# Error plumbing.
+thiserror = "2"
+# Link-time provider registration (the DI-container stand-in), matching the mlx-gen convention.
+inventory = "0.3"
+# HF tokenizers (the same Rust core `transformers` wraps) — host-side text<->ids. `onig` only (no
+# http/progressbar): byte-level BPE needs just the regex. Builds tensor-free on Linux/Windows/Mac.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# config.json / tokenizer.json parsing and the JSON-constraint cross-check.
+serde_json = "1"
+
+# NO tensor dependency and NO gen-ai dependency — this crate must build standalone on any platform.
