@@ -34,7 +34,7 @@ pub mod tokenizer;
 
 pub use cancel::CancelFlag;
 pub use capabilities::{TextLlmCapabilities, TextLlmDescriptor};
-pub use constraint::{Constraint, ConstraintDecodeTable, JsonState};
+pub use constraint::{Constraint, ConstraintDecodeTable, JsonConstraint, JsonState};
 pub use error::{Error, Result};
 pub use message::{Content, ImageRef, Message, Role};
 pub use output::{FinishReason, StreamEvent, TextLlmOutput, Usage};

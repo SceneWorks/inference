@@ -31,6 +31,64 @@ pub struct ConstraintDecodeTable {
     pub special: HashSet<u32>,
 }
 
+/// Drives per-step logit masking for JSON-constrained decoding (story 7166).
+///
+/// Holds the [`ConstraintDecodeTable`] (borrowed — it is large, build once and reuse) plus the live
+/// [`JsonState`]. Each step, [`JsonConstraint::allowed`] returns a per-vocab mask of which token ids
+/// keep the output a valid JSON prefix; after the sampler picks one, [`JsonConstraint::accept`]
+/// advances the grammar. The backend's sampler consumes the mask (it owns no JSON policy).
+pub struct JsonConstraint<'a> {
+    table: &'a ConstraintDecodeTable,
+    state: JsonState,
+    stop_ids: HashSet<u32>,
+    allow: Vec<bool>,
+}
+
+impl<'a> JsonConstraint<'a> {
+    /// Start a JSON constraint over `table`. `stop_ids` (EOS/stop tokens) are allowed only once the
+    /// JSON value is complete ([`JsonState::can_stop`]).
+    pub fn new(table: &'a ConstraintDecodeTable, stop_ids: impl IntoIterator<Item = u32>) -> Self {
+        let allow = vec![false; table.pieces.len()];
+        Self {
+            table,
+            state: JsonState::start(),
+            stop_ids: stop_ids.into_iter().collect(),
+            allow,
+        }
+    }
+
+    /// The allow mask for the current step: `allow[id]` is true iff token `id` is permitted next.
+    /// Stop tokens are gated on [`JsonState::can_stop`]; special/added tokens are never JSON content.
+    pub fn allowed(&mut self) -> &[bool] {
+        let can_stop = self.state.can_stop();
+        for (id, slot) in self.allow.iter_mut().enumerate() {
+            let id_u = id as u32;
+            *slot = if self.stop_ids.contains(&id_u) {
+                can_stop
+            } else if self.table.special.contains(&id_u) {
+                false
+            } else {
+                self.state.advance(&self.table.pieces[id]).is_some()
+            };
+        }
+        &self.allow
+    }
+
+    /// Advance the grammar after the sampler chooses `token_id`.
+    pub fn accept(&mut self, token_id: u32) {
+        if let Some(piece) = self.table.pieces.get(token_id as usize) {
+            if let Some(next) = self.state.advance(piece) {
+                self.state = next;
+            }
+        }
+    }
+
+    /// Whether the JSON value is currently complete (a stop token would be valid here).
+    pub fn can_stop(&self) -> bool {
+        self.state.can_stop()
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Incremental JSON-validity state machine (ported from gen-core json_constraint.rs, sc-6585).
 // ---------------------------------------------------------------------------------------------
@@ -506,5 +564,46 @@ mod tests {
         }
         assert!(st.can_stop());
         assert!(JsonState::start().advance("{}trailing").is_none());
+    }
+
+    fn table(pieces: &[&str]) -> ConstraintDecodeTable {
+        ConstraintDecodeTable {
+            pieces: pieces.iter().map(|s| s.to_string()).collect(),
+            special: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn json_constraint_masks_to_valid_prefixes() {
+        // ids: 0="{" 1="}" 2="\"" 3="a" 4=":" 5="1" 6="x" 7=eos
+        let t = table(&["{", "}", "\"", "a", ":", "1", "x", ""]);
+        let mut c = JsonConstraint::new(&t, [7u32]);
+
+        let m = c.allowed().to_vec();
+        assert!(m[0], "'{{' starts a value");
+        assert!(!m[1], "'}}' cannot start the document");
+        assert!(m[2], "'\"' starts a string value");
+        assert!(!m[3], "'a' is not a value start");
+        assert!(!m[4], "':' is not a value start");
+        assert!(m[5], "'1' starts a number");
+        assert!(!m[6], "'x' is not a value start");
+        assert!(!m[7], "stop not allowed before any value");
+
+        c.accept(0); // "{"
+        let m = c.allowed().to_vec();
+        assert!(m[2], "after '{{' a key string is allowed");
+        assert!(m[1], "after '{{' an empty object close is allowed");
+        assert!(!m[5], "a bare number is not a valid object key");
+        assert!(!m[7], "stop not allowed mid-object");
+    }
+
+    #[test]
+    fn json_constraint_allows_stop_only_when_complete() {
+        let t = table(&["true", ""]); // id 1 = eos
+        let mut c = JsonConstraint::new(&t, [1u32]);
+        assert!(!c.allowed()[1], "stop not allowed before a value");
+        c.accept(0); // "true" -> complete top-level value
+        assert!(c.can_stop());
+        assert!(c.allowed()[1], "stop allowed once the value is complete");
     }
 }
