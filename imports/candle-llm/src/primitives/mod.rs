@@ -20,7 +20,7 @@ pub mod weights;
 
 pub use attention::{repeat_kv, sdpa, sdpa_causal, AttnMask};
 pub use kv_cache::{ContiguousKvCache, KvCache};
-pub use nn::{embed, input_ids, input_ids_batch, linear, rms_norm, silu};
+pub use nn::{embed, gelu, input_ids, input_ids_batch, linear, rms_norm, silu, soft_cap};
 pub use projection::{Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};

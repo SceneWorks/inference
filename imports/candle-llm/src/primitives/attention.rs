@@ -62,20 +62,26 @@ fn causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device) -> Res
 
 /// Eager scaled-dot-product attention over `[batch, heads, seq, head_dim]` tensors.
 ///
-/// `scale` is the usual `head_dim^(-0.5)`. K/V must already be GQA-expanded (see [`repeat_kv`]).
+/// `scale` is the usual `head_dim^(-0.5)`. `softcap`, when set, applies Gemma-2's score soft-cap
+/// (`c·tanh(scores/c)`) after scaling and before masking. K/V must already be GQA-expanded (see
+/// [`repeat_kv`]).
 pub fn sdpa(
     queries: &Tensor,
     keys: &Tensor,
     values: &Tensor,
     scale: f32,
+    softcap: Option<f32>,
     mask: AttnMask<'_>,
 ) -> Result<Tensor> {
     let (_b, _h, q_len, _d) = queries.dims4()?;
     let k_len = keys.dim(2)?;
-    let scores = (queries
+    let mut scores = (queries
         .contiguous()?
         .matmul(&keys.transpose(2, 3)?.contiguous()?)?
         * scale as f64)?;
+    if let Some(c) = softcap {
+        scores = crate::primitives::nn::soft_cap(&scores, c)?;
+    }
     let scores = match mask {
         AttnMask::None => scores,
         AttnMask::Causal => {
@@ -88,9 +94,9 @@ pub fn sdpa(
     Ok(weights.matmul(&values.contiguous()?)?)
 }
 
-/// Convenience: causal attention (the decode default).
+/// Convenience: causal attention with no soft-cap (the decode default).
 pub fn sdpa_causal(queries: &Tensor, keys: &Tensor, values: &Tensor, scale: f32) -> Result<Tensor> {
-    sdpa(queries, keys, values, scale, AttnMask::Causal)
+    sdpa(queries, keys, values, scale, None, AttnMask::Causal)
 }
 
 #[cfg(test)]

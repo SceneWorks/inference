@@ -35,6 +35,18 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
     Ok(candle_nn::ops::silu(x)?)
 }
 
+/// GeLU, tanh approximation (`gelu_pytorch_tanh` — the Gemma GeGLU activation).
+pub fn gelu(x: &Tensor) -> Result<Tensor> {
+    Ok(x.gelu()?)
+}
+
+/// Logit soft-cap `cap · tanh(x / cap)` (Gemma-2 caps attention scores and final logits). A no-op as
+/// `cap → ∞`; it squashes extremes toward `±cap` while staying ~linear near 0.
+pub fn soft_cap(x: &Tensor, cap: f32) -> Result<Tensor> {
+    let c = cap as f64;
+    Ok(x.affine(1.0 / c, 0.0)?.tanh()?.affine(c, 0.0)?)
+}
+
 /// Embedding gather: rows of `weight` (`[vocab, hidden]`) selected by `ids` (`[batch, seq]`, u32),
 /// returning `[batch, seq, hidden]`. The result keeps `weight`'s dtype.
 pub fn embed(weight: &Tensor, ids: &Tensor) -> Result<Tensor> {

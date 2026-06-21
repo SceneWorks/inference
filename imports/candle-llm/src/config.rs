@@ -23,6 +23,9 @@ pub enum Architecture {
     /// Qwen2-MoE family: Qwen2 attention (GQA **with q/k/v bias**, no q/k norm) + a sparse
     /// mixture-of-experts FFN (router + top-k experts + a shared expert).
     Qwen2Moe,
+    /// Gemma-2 family: `(1 + weight)` RMSNorm, embedding ×√hidden, GeGLU, a `query_pre_attn_scalar`
+    /// attention scale, attention- and final-logit soft-capping, and a 4-norm "sandwich" block.
+    Gemma2,
 }
 
 impl Architecture {
@@ -45,6 +48,8 @@ impl Architecture {
             Ok(Architecture::Qwen3)
         } else if hay.contains("qwen2_moe") || hay.contains("qwen2moe") {
             Ok(Architecture::Qwen2Moe)
+        } else if hay.contains("gemma2") {
+            Ok(Architecture::Gemma2)
         } else if hay.contains("phi3") {
             Ok(Architecture::Phi3)
         } else if hay.contains("llama")
@@ -60,14 +65,21 @@ impl Architecture {
         }
     }
 
-    /// The model-family tag (`"llama"` / `"qwen3"` / `"phi3"` / `"qwen2_moe"`).
+    /// The model-family tag (`"llama"` / `"qwen3"` / `"phi3"` / `"qwen2_moe"` / `"gemma2"`).
     pub fn family(self) -> &'static str {
         match self {
             Architecture::Llama => "llama",
             Architecture::Qwen3 => "qwen3",
             Architecture::Phi3 => "phi3",
             Architecture::Qwen2Moe => "qwen2_moe",
+            Architecture::Gemma2 => "gemma2",
         }
+    }
+
+    /// Whether this is a Gemma-2 decoder (drives `(1+weight)` norms, embedding scaling, GeGLU, the
+    /// sandwich-norm block, and logit soft-capping).
+    pub fn is_gemma2(self) -> bool {
+        matches!(self, Architecture::Gemma2)
     }
 
     /// Whether attention applies per-head q/k RMSNorm (Qwen3).
@@ -136,6 +148,12 @@ pub struct LlamaConfig {
     pub max_position_embeddings: i32,
     /// Mixture-of-Experts parameters, present for an MoE decoder (Qwen2-MoE); `None` ⇒ dense MLP.
     pub moe: Option<MoeConfig>,
+    /// Gemma-2 attention-score soft-cap (`attn_logit_softcapping`); `None` ⇒ no cap.
+    pub attn_logit_softcap: Option<f32>,
+    /// Gemma-2 final-logit soft-cap (`final_logit_softcapping`); `None` ⇒ no cap.
+    pub final_logit_softcap: Option<f32>,
+    /// Gemma-2 attention scale denominator (`query_pre_attn_scalar`); `None` ⇒ `head_dim`.
+    pub query_pre_attn_scalar: Option<i32>,
 }
 
 impl LlamaConfig {
@@ -164,12 +182,19 @@ impl LlamaConfig {
             .and_then(|x| x.as_f64())
             .map(|x| x as f32)
             .unwrap_or(500_000.0);
+        let architecture = Architecture::from_config(v)?;
         let tie_word_embeddings = v
             .get("tie_word_embeddings")
             .and_then(|x| x.as_bool())
-            .unwrap_or(false);
-        let architecture = Architecture::from_config(v)?;
+            // Gemma always ties its (huge) embedding to the LM head; the config often omits the key.
+            .unwrap_or(architecture.is_gemma2());
         let max_position_embeddings = int("max_position_embeddings").unwrap_or(0);
+
+        let f32_opt =
+            |key: &str| -> Option<f32> { v.get(key).and_then(|x| x.as_f64()).map(|x| x as f32) };
+        let attn_logit_softcap = f32_opt("attn_logit_softcapping");
+        let final_logit_softcap = f32_opt("final_logit_softcapping");
+        let query_pre_attn_scalar = int("query_pre_attn_scalar");
 
         // Mixture-of-Experts FFN params (Qwen2-MoE): present iff `num_experts` is in the config.
         let moe = int("num_experts").map(|num_experts| MoeConfig {
@@ -224,6 +249,9 @@ impl LlamaConfig {
             architecture,
             max_position_embeddings,
             moe,
+            attn_logit_softcap,
+            final_logit_softcap,
+            query_pre_attn_scalar,
         })
     }
 
@@ -271,9 +299,11 @@ impl LlamaConfig {
         self.num_heads / self.num_kv_heads
     }
 
-    /// Attention scale, `head_dim^(-0.5)`.
+    /// Attention scale: `query_pre_attn_scalar^(-0.5)` when set (Gemma-2 scales by a configured
+    /// denominator that may differ from `head_dim`), else the usual `head_dim^(-0.5)`.
     pub fn attn_scale(&self) -> f32 {
-        (self.head_dim as f32).powf(-0.5)
+        let denom = self.query_pre_attn_scalar.unwrap_or(self.head_dim) as f32;
+        denom.powf(-0.5)
     }
 }
 
@@ -378,6 +408,36 @@ mod tests {
         assert_eq!(a, Architecture::Qwen2Moe);
         assert_eq!(a.family(), "qwen2_moe");
         assert!(!a.has_qk_norm());
+
+        // Gemma-2 (soft-caps, sandwich norms; ties embeddings by default).
+        let gemma2 = json!({ "architectures": ["Gemma2ForCausalLM"], "model_type": "gemma2" });
+        let a = Architecture::from_config(&gemma2).unwrap();
+        assert_eq!(a, Architecture::Gemma2);
+        assert_eq!(a.family(), "gemma2");
+        assert!(a.is_gemma2());
+        assert!(!a.has_qk_norm());
+    }
+
+    #[test]
+    fn parses_gemma2_config() {
+        let v = json!({
+            "architectures": ["Gemma2ForCausalLM"], "model_type": "gemma2",
+            "hidden_size": 2304, "intermediate_size": 9216, "num_hidden_layers": 26,
+            "num_attention_heads": 8, "num_key_value_heads": 4, "head_dim": 256, "vocab_size": 256000,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "query_pre_attn_scalar": 256,
+            "attn_logit_softcapping": 50.0, "final_logit_softcapping": 30.0
+            // tie_word_embeddings intentionally omitted — Gemma ties by default.
+        });
+        let cfg = LlamaConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.architecture, Architecture::Gemma2);
+        assert_eq!(cfg.head_dim, 256); // explicit, != 2304/8
+        assert!(cfg.tie_word_embeddings, "Gemma ties by default");
+        assert_eq!(cfg.attn_logit_softcap, Some(50.0));
+        assert_eq!(cfg.final_logit_softcap, Some(30.0));
+        assert_eq!(cfg.query_pre_attn_scalar, Some(256));
+        // Attention scale uses query_pre_attn_scalar (256), not head_dim — equal here, but the path
+        // is exercised.
+        assert!((cfg.attn_scale() - (256f32).powf(-0.5)).abs() < 1e-9);
     }
 
     #[test]
