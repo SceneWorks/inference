@@ -8,6 +8,7 @@
 //! is biased by a **BoxRPB** relative-position bias (log-scale-encoded box↔grid deltas), and boxes
 //! are refined iteratively across the 6 layers. Token layout `[B, seq, C]`.
 
+use std::cell::RefCell;
 use std::f32::consts::PI;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
@@ -427,6 +428,9 @@ impl DecoderLayer {
 
 /// The DETR detector head: encoder + decoder + presence + scoring. Produces concept logits, boxes,
 /// and presence from the 72² FPN feature + projected text features.
+/// `((h, w, hidden), trig_table)` memo for the grid-only sine position embedding (sc-6954).
+type VisPosCache = RefCell<Option<((i32, i32, i32), Array)>>;
+
 pub struct Sam3Detector {
     enc_layers: Vec<EncoderLayer>,
     dec_layers: Vec<DecoderLayer>,
@@ -445,6 +449,12 @@ pub struct Sam3Detector {
     box_rpb_y: DecoderMlp,
     scoring: DotScoring,
     cfg: Sam3DetrConfig,
+    /// Cache for the grid-only sine position embedding (`sine_position_embedding_flat`, a ~5 MB trig
+    /// table that is a pure function of `(h, w, hidden)`). The video tracker calls `forward` once per
+    /// frame at a constant grid, so building it every frame is redundant per-frame compute (sc-6954,
+    /// the SAM2 OnceLock analog F-167). Keyed on `(h, w, hidden)` and rebuilt only if the grid changes;
+    /// byte-identical to the per-call build.
+    vis_pos_cache: VisPosCache,
 }
 
 /// The detector outputs needed downstream (SAM3-D adds masks).
@@ -490,6 +500,7 @@ impl Sam3Detector {
             box_rpb_y: DecoderMlp::from_weights(w, &join(&dec_prefix, "box_rpb_embed_y"), 2)?,
             scoring: DotScoring::from_weights(w, &join(prefix, "dot_product_scoring"), cfg)?,
             cfg: cfg.clone(),
+            vis_pos_cache: RefCell::new(None),
         })
     }
 
@@ -524,7 +535,20 @@ impl Sam3Detector {
         let (h, w) = (sh[1], sh[2]);
         let hw = h * w;
         let vision = vision_feature.reshape(&[1, hw, self.cfg.hidden_size])?;
-        let vis_pos = sine_position_embedding_flat(h, w, self.cfg.hidden_size)?; // [1, HW, D]
+        // Grid-only trig table — reuse across frames (sc-6954); rebuilt only if the grid changes.
+        let key = (h, w, self.cfg.hidden_size);
+        let vis_pos = {
+            let cached = self.vis_pos_cache.borrow();
+            match cached.as_ref() {
+                Some((k, p)) if *k == key => p.clone(),
+                _ => {
+                    drop(cached);
+                    let p = sine_position_embedding_flat(h, w, self.cfg.hidden_size)?; // [1, HW, D]
+                    *self.vis_pos_cache.borrow_mut() = Some((key, p.clone()));
+                    p
+                }
+            }
+        };
         let text_key_mask = text_key_mask(text_mask);
 
         // --- encoder ---

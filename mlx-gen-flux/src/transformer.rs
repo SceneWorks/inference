@@ -253,6 +253,10 @@ impl FluxTransformer {
             &(txt_seq..txt_seq + img_seq).collect::<Vec<i32>>(),
             &[img_seq],
         );
+        // Both gather indices are loop-invariant (txt_seq/img_seq are fixed), so hoist `txt_idx`
+        // out of the single-block loop alongside `img_idx` (F-017) instead of rebuilding it per
+        // injected block.
+        let txt_idx = Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
         let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?;
         for (i, block) in self.single_blocks.iter().enumerate() {
             joint = block.forward(&joint, &text_embeddings, &rope)?;
@@ -260,8 +264,6 @@ impl FluxTransformer {
                 if inj.injects_after_single(i) {
                     let img = joint.take_axis(&img_idx, 1)?;
                     if let Some(r) = inj.after_single(i, &img)? {
-                        let txt_idx =
-                            Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
                         let txt = joint.take_axis(&txt_idx, 1)?;
                         joint = concatenate_axis(&[&txt, &add(&img, &r)?], 1)?;
                     }
