@@ -66,8 +66,8 @@ struct Detection {
 /// One stored per-frame output for an object (the memory-bank entry).
 #[derive(Clone)]
 struct FrameMem {
-    maskmem_features: Option<Array>, // [5184,1,64] seq-first (bf16-cast); None until memory-encoded
-    maskmem_pos_enc: Option<Array>,  // [5184,1,64]
+    maskmem_features: Option<Array>, // [5184,1,64] seq-first, stored bf16 (sc-7141); None until encoded
+    maskmem_pos_enc: Option<Array>,  // [5184,1,64] f32
     object_pointer: Array,           // [1,256]
     object_score: f32,
 }
@@ -1047,13 +1047,22 @@ fn to_vec(a: &Array) -> Result<Vec<f32>> {
 
 /// Flatten the memory encoder's NHWC `[1,72,72,64]` output to seq-first `[5184,1,64]`. The reference
 /// stores `maskmem_features` as **bfloat16** (`bf16 = true`) but `maskmem_pos_enc` stays f32
-/// (`to(pred_masks.dtype)`), so the two must round-trip differently.
+/// (`to(pred_masks.dtype)`), so the two store at different precisions.
+///
+/// `maskmem_features` are held **bf16 in the memory bank** (sc-7141). The reference itself truncates
+/// them to bf16 here, so the only choice is whether the bank holds that bf16 value *as* bf16 or
+/// re-widened to f32. We keep it bf16 — half the resident `maskmem_features` footprint (complementing
+/// the sc-7060 heavy-tensor stores) — and widen back to f32 at the attention concat boundary in
+/// [`Tracker::prepare_memory_conditioned_features`]. That widen reproduces exactly the f32 value the
+/// old `bf16 → f32` round-trip produced, so downstream attention is **byte-identical**.
 fn seq_first(a: &Array, bf16: bool) -> Result<Array> {
     let sh = a.shape();
     let (g, c) = (sh[1], sh[3]);
     let flat = a.reshape(&[g * g, 1, c])?;
     if bf16 {
-        Ok(flat.as_dtype(Dtype::Bfloat16)?.as_dtype(Dtype::Float32)?)
+        // Truncate to bf16 and STORE bf16 (not re-widened): half the bank bytes. Widened to f32 at
+        // the attention boundary, so the math is unchanged vs the old bf16→f32 store (sc-7141).
+        Ok(flat.as_dtype(Dtype::Bfloat16)?)
     } else {
         Ok(flat)
     }
@@ -1063,6 +1072,46 @@ fn seq_first(a: &Array, bf16: bool) -> Result<Array> {
 mod tests {
     use super::*;
     use mlx_gen::weights::Weights;
+
+    /// sc-7141: `maskmem_features` are stored bf16 in the bank (half the footprint) and widened to f32
+    /// at the attention concat boundary. That widened f32 must be **byte-identical** to the old in-bank
+    /// `bf16 → f32` round-trip (bf16→f32 widening is lossless), so downstream attention is unchanged.
+    #[test]
+    fn seq_first_bf16_stores_bf16_and_widens_byte_identical() {
+        let n = 4 * 4 * 8; // B=1 × g=4 × g=4 × c=8
+        let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.013 - 1.7).collect();
+        let nhwc = Array::from_slice(&data, &[1, 4, 4, 8]); // [B, g, g, c]
+
+        // New path: seq_first now returns bf16, widened at the boundary (as Tracker does).
+        let stored = seq_first(&nhwc, true).unwrap();
+        assert_eq!(
+            stored.dtype(),
+            Dtype::Bfloat16,
+            "maskmem_features must be stored bf16"
+        );
+        let widened = stored.as_dtype(Dtype::Float32).unwrap();
+
+        // Old path: bf16 round-trip held as f32 in the bank.
+        let old = nhwc
+            .reshape(&[16, 1, 8])
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+
+        mlx_rs::transforms::eval([&widened, &old]).unwrap();
+        assert_eq!(widened.shape(), &[16, 1, 8]);
+        assert_eq!(
+            widened.as_slice::<f32>(),
+            old.as_slice::<f32>(),
+            "widened bf16 store must equal the old bf16→f32 round-trip byte-for-byte"
+        );
+
+        // The pos path (bf16 = false) stays f32 (reference keeps maskmem_pos_enc f32).
+        let pos = seq_first(&nhwc, false).unwrap();
+        assert_eq!(pos.dtype(), Dtype::Float32, "maskmem_pos_enc stays f32");
+    }
 
     /// Build a detection whose 288² mask is a `+1.0` rectangle (rows `r0..r1`, cols `c0..c1`) on a
     /// `-1.0` background, so `binarize` (`> 0`) recovers exactly that rectangle.
