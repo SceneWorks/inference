@@ -55,6 +55,18 @@ impl LlamaModel {
         let p = |suffix: &str| join(prefix, suffix);
         let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
         let proj = |key: String| -> Result<Projection> { Projection::load(req(key)?, quant) };
+        // Like `proj`, but also loads a sibling `.bias` when present (Qwen2 attention carries q/k/v
+        // bias; Llama / Qwen3 / Phi-3 do not).
+        let proj_b = |wkey: String| -> Result<Projection> {
+            let stem = wkey.strip_suffix(".weight").unwrap_or(&wkey);
+            let bkey = format!("{stem}.bias");
+            let bias = if w.contains(&bkey) {
+                Some(req(bkey)?)
+            } else {
+                None
+            };
+            Projection::load_with_bias(req(wkey)?, bias, quant)
+        };
 
         let embed_tokens = req(p("model.embed_tokens.weight"))?;
         let norm = req(p("model.norm.weight"))?;
@@ -88,8 +100,8 @@ impl LlamaModel {
             } else {
                 (None, None)
             };
-            // Attention projections: a packed `qkv_proj` (Phi-3) is split into q/k/v, else the
-            // separate `q_proj`/`k_proj`/`v_proj` are loaded directly.
+            // Attention projections: a packed `qkv_proj` (Phi-3, no bias) is split into q/k/v, else
+            // the separate `q_proj`/`k_proj`/`v_proj` are loaded directly (with q/k/v bias for Qwen2).
             let (q, k, v) = {
                 let packed = lp("self_attn.qkv_proj.weight");
                 if w.contains(&packed) {
@@ -101,28 +113,60 @@ impl LlamaModel {
                     )
                 } else {
                     (
-                        proj(lp("self_attn.q_proj.weight"))?,
-                        proj(lp("self_attn.k_proj.weight"))?,
-                        proj(lp("self_attn.v_proj.weight"))?,
+                        proj_b(lp("self_attn.q_proj.weight"))?,
+                        proj_b(lp("self_attn.k_proj.weight"))?,
+                        proj_b(lp("self_attn.v_proj.weight"))?,
                     )
                 }
             };
-            // MLP gate/up: a packed `gate_up_proj` (Phi-3) is split, else separate projections.
-            let (gate, up) = {
-                let packed = lp("mlp.gate_up_proj.weight");
-                if w.contains(&packed) {
-                    let gu = req(packed)?; // [2*inter, hidden]
-                    (
-                        Projection::load(gu.narrow(0, 0, inter)?.contiguous()?, quant)?,
-                        Projection::load(gu.narrow(0, inter, inter)?.contiguous()?, quant)?,
-                    )
-                } else {
-                    (
-                        proj(lp("mlp.gate_proj.weight"))?,
-                        proj(lp("mlp.up_proj.weight"))?,
-                    )
+
+            // Feed-forward: a sparse Mixture-of-Experts bank (Qwen2-MoE) or a dense SwiGLU MLP.
+            let ffn = if let Some(moe) = cfg.moe {
+                let mut experts = Vec::with_capacity(moe.num_experts);
+                for e in 0..moe.num_experts {
+                    let ep = |s: &str| lp(&format!("mlp.experts.{e}.{s}"));
+                    experts.push(LlamaMlp {
+                        gate: proj(ep("gate_proj.weight"))?,
+                        up: proj(ep("up_proj.weight"))?,
+                        down: proj(ep("down_proj.weight"))?,
+                    });
                 }
+                Ffn::Moe(MoeMlp {
+                    router: req(lp("mlp.gate.weight"))?, // [num_experts, hidden]
+                    experts,
+                    shared: LlamaMlp {
+                        gate: proj(lp("mlp.shared_expert.gate_proj.weight"))?,
+                        up: proj(lp("mlp.shared_expert.up_proj.weight"))?,
+                        down: proj(lp("mlp.shared_expert.down_proj.weight"))?,
+                    },
+                    shared_gate: req(lp("mlp.shared_expert_gate.weight"))?, // [1, hidden]
+                    experts_per_tok: moe.num_experts_per_tok,
+                    norm_topk_prob: moe.norm_topk_prob,
+                })
+            } else {
+                // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
+                let (gate, up) = {
+                    let packed = lp("mlp.gate_up_proj.weight");
+                    if w.contains(&packed) {
+                        let gu = req(packed)?; // [2*inter, hidden]
+                        (
+                            Projection::load(gu.narrow(0, 0, inter)?.contiguous()?, quant)?,
+                            Projection::load(gu.narrow(0, inter, inter)?.contiguous()?, quant)?,
+                        )
+                    } else {
+                        (
+                            proj(lp("mlp.gate_proj.weight"))?,
+                            proj(lp("mlp.up_proj.weight"))?,
+                        )
+                    }
+                };
+                Ffn::Dense(LlamaMlp {
+                    gate,
+                    up,
+                    down: proj(lp("mlp.down_proj.weight"))?,
+                })
             };
+
             layers.push(LlamaLayer {
                 input_ln: req(lp("input_layernorm.weight"))?,
                 post_ln: req(lp("post_attention_layernorm.weight"))?,
@@ -130,7 +174,7 @@ impl LlamaModel {
                     q,
                     k,
                     v,
-                    o: proj(lp("self_attn.o_proj.weight"))?,
+                    o: proj_b(lp("self_attn.o_proj.weight"))?,
                     q_norm,
                     k_norm,
                     num_heads,
@@ -140,11 +184,7 @@ impl LlamaModel {
                     groups,
                     eps,
                 },
-                mlp: LlamaMlp {
-                    gate,
-                    up,
-                    down: proj(lp("mlp.down_proj.weight"))?,
-                },
+                ffn,
                 eps,
             });
         }
@@ -300,7 +340,7 @@ struct LlamaLayer {
     input_ln: Tensor,
     post_ln: Tensor,
     attn: LlamaAttention,
-    mlp: LlamaMlp,
+    ffn: Ffn,
     eps: f64,
 }
 
@@ -320,8 +360,23 @@ impl LlamaLayer {
             .forward(&normed, cos, sin, mask, cache, layer_idx)?;
         let h = x.broadcast_add(&attn)?;
         let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
-        let mlp = self.mlp.forward(&normed2)?;
-        Ok(h.broadcast_add(&mlp)?)
+        let ffn = self.ffn.forward(&normed2)?;
+        Ok(h.broadcast_add(&ffn)?)
+    }
+}
+
+/// A layer's feed-forward network: a dense SwiGLU MLP, or a sparse Mixture-of-Experts bank.
+enum Ffn {
+    Dense(LlamaMlp),
+    Moe(MoeMlp),
+}
+
+impl Ffn {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Ffn::Dense(m) => m.forward(x),
+            Ffn::Moe(m) => m.forward(x),
+        }
     }
 }
 
@@ -398,6 +453,85 @@ impl LlamaMlp {
         let up = self.up.forward(x)?;
         let gated = (gate * up)?;
         self.down.forward(&gated)
+    }
+}
+
+/// A Qwen2-MoE feed-forward: a softmax router over `experts` (top-k per token), plus an always-on
+/// `shared` expert gated by a sigmoid. Correctness-first — each expert runs **only on its routed
+/// tokens** (gathered, then scatter-added back), so the active compute scales with `experts_per_tok`,
+/// not the full bank. Top-k selection is done on the host (Candle has no fused top-k).
+struct MoeMlp {
+    /// Router weight `[num_experts, hidden]`.
+    router: Tensor,
+    experts: Vec<LlamaMlp>,
+    shared: LlamaMlp,
+    /// Shared-expert sigmoid gate `[1, hidden]`.
+    shared_gate: Tensor,
+    experts_per_tok: usize,
+    norm_topk_prob: bool,
+}
+
+impl MoeMlp {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, s, h) = x.dims3()?;
+        let t = b * s;
+        let dtype = x.dtype();
+        let device = x.device();
+        let xf = x.reshape((t, h))?;
+
+        // Router probabilities (computed in f32 for a stable top-k), pulled to host.
+        let logits = xf.matmul(&self.router.t()?)?; // [t, E]
+        let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
+        let probs = probs.to_vec2::<f32>()?; // [t][E]
+        let num_experts = self.experts.len();
+        let k = self.experts_per_tok.min(num_experts).max(1);
+
+        // Invert the per-token top-k into per-expert (token, weight) lists.
+        let mut routed: Vec<Vec<(u32, f32)>> = vec![Vec::new(); num_experts];
+        for (ti, row) in probs.iter().enumerate() {
+            let mut idx: Vec<usize> = (0..num_experts).collect();
+            idx.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
+            let top = &idx[..k];
+            let denom: f32 = if self.norm_topk_prob {
+                top.iter()
+                    .map(|&e| row[e])
+                    .sum::<f32>()
+                    .max(f32::MIN_POSITIVE)
+            } else {
+                1.0
+            };
+            for &e in top {
+                routed[e].push((ti as u32, row[e] / denom));
+            }
+        }
+
+        // Each expert runs on just its tokens; scatter the weighted outputs back.
+        let mut out = Tensor::zeros((t, h), dtype, device)?;
+        for (e, toks) in routed.iter().enumerate() {
+            if toks.is_empty() {
+                continue;
+            }
+            let n = toks.len();
+            let idx = Tensor::from_vec(
+                toks.iter().map(|&(ti, _)| ti).collect::<Vec<u32>>(),
+                (n,),
+                device,
+            )?;
+            let wts = Tensor::from_vec(
+                toks.iter().map(|&(_, w)| w).collect::<Vec<f32>>(),
+                (n, 1),
+                device,
+            )?
+            .to_dtype(dtype)?;
+            let xe = xf.index_select(&idx, 0)?; // [n, h]
+            let ye = self.experts[e].forward(&xe)?.broadcast_mul(&wts)?; // [n, h]
+            out = out.index_add(&idx, &ye, 0)?;
+        }
+
+        // Always-on shared expert, gated by sigmoid(x · shared_gateᵀ).
+        let sg = candle_nn::ops::sigmoid(&xf.matmul(&self.shared_gate.t()?)?)?; // [t, 1]
+        let shared = self.shared.forward(&xf)?.broadcast_mul(&sg)?;
+        Ok((out + shared)?.reshape((b, s, h))?)
     }
 }
 

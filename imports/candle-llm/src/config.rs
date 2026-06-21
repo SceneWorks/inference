@@ -20,6 +20,9 @@ pub enum Architecture {
     /// Phi-3 family: the Llama decoder shape, but with a **packed** `qkv_proj` (q‖k‖v) and a packed
     /// `gate_up_proj` (gate‖up) — split at load into the standard projections.
     Phi3,
+    /// Qwen2-MoE family: Qwen2 attention (GQA **with q/k/v bias**, no q/k norm) + a sparse
+    /// mixture-of-experts FFN (router + top-k experts + a shared expert).
+    Qwen2Moe,
 }
 
 impl Architecture {
@@ -40,6 +43,8 @@ impl Architecture {
         );
         if hay.contains("qwen3") {
             Ok(Architecture::Qwen3)
+        } else if hay.contains("qwen2_moe") || hay.contains("qwen2moe") {
+            Ok(Architecture::Qwen2Moe)
         } else if hay.contains("phi3") {
             Ok(Architecture::Phi3)
         } else if hay.contains("llama")
@@ -55,12 +60,13 @@ impl Architecture {
         }
     }
 
-    /// The model-family tag (`"llama"` / `"qwen3"` / `"phi3"`).
+    /// The model-family tag (`"llama"` / `"qwen3"` / `"phi3"` / `"qwen2_moe"`).
     pub fn family(self) -> &'static str {
         match self {
             Architecture::Llama => "llama",
             Architecture::Qwen3 => "qwen3",
             Architecture::Phi3 => "phi3",
+            Architecture::Qwen2Moe => "qwen2_moe",
         }
     }
 
@@ -81,6 +87,22 @@ pub struct RopeScaling {
     pub high_freq_factor: f32,
     /// Original (pre-scaling) max context.
     pub original_context: f32,
+}
+
+/// Mixture-of-Experts FFN parameters (Qwen2-MoE family). Present when a layer's dense MLP is replaced
+/// by a router + expert bank + a shared expert.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoeConfig {
+    /// Total number of routed experts.
+    pub num_experts: usize,
+    /// Experts activated per token (top-k routing).
+    pub num_experts_per_tok: usize,
+    /// Inner width of each routed expert's SwiGLU.
+    pub moe_intermediate_size: i32,
+    /// Inner width of the always-on shared expert's SwiGLU.
+    pub shared_expert_intermediate_size: i32,
+    /// Whether the top-k routing weights are renormalized to sum to 1.
+    pub norm_topk_prob: bool,
 }
 
 /// Configuration for a Llama-family decoder.
@@ -112,6 +134,8 @@ pub struct LlamaConfig {
     pub architecture: Architecture,
     /// Max context length (`max_position_embeddings`); `0` if unspecified.
     pub max_position_embeddings: i32,
+    /// Mixture-of-Experts parameters, present for an MoE decoder (Qwen2-MoE); `None` ⇒ dense MLP.
+    pub moe: Option<MoeConfig>,
 }
 
 impl LlamaConfig {
@@ -146,6 +170,19 @@ impl LlamaConfig {
             .unwrap_or(false);
         let architecture = Architecture::from_config(v)?;
         let max_position_embeddings = int("max_position_embeddings").unwrap_or(0);
+
+        // Mixture-of-Experts FFN params (Qwen2-MoE): present iff `num_experts` is in the config.
+        let moe = int("num_experts").map(|num_experts| MoeConfig {
+            num_experts: num_experts as usize,
+            num_experts_per_tok: int("num_experts_per_tok").unwrap_or(num_experts).max(1) as usize,
+            moe_intermediate_size: int("moe_intermediate_size").unwrap_or(intermediate_size),
+            shared_expert_intermediate_size: int("shared_expert_intermediate_size")
+                .unwrap_or(intermediate_size),
+            norm_topk_prob: v
+                .get("norm_topk_prob")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+        });
 
         let rope_scaling = v.get("rope_scaling").and_then(|rs| {
             // Only the "llama3" schedule is parsed; absent / other types fall back to standard RoPE.
@@ -186,7 +223,13 @@ impl LlamaConfig {
             tie_word_embeddings,
             architecture,
             max_position_embeddings,
+            moe,
         })
+    }
+
+    /// Whether the decoder uses a Mixture-of-Experts FFN (Qwen2-MoE).
+    pub fn is_moe(&self) -> bool {
+        self.moe.is_some()
     }
 
     /// Whether attention applies per-head q/k RMSNorm (Qwen3).
@@ -327,6 +370,42 @@ mod tests {
         assert_eq!(a, Architecture::Phi3);
         assert_eq!(a.family(), "phi3");
         assert!(!a.has_qk_norm());
+
+        // Qwen2-MoE (sparse FFN + q/k/v bias; no q/k norm).
+        let qwen2_moe =
+            json!({ "architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe" });
+        let a = Architecture::from_config(&qwen2_moe).unwrap();
+        assert_eq!(a, Architecture::Qwen2Moe);
+        assert_eq!(a.family(), "qwen2_moe");
+        assert!(!a.has_qk_norm());
+    }
+
+    #[test]
+    fn parses_qwen2_moe_config() {
+        let v = json!({
+            "architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe",
+            "hidden_size": 2048, "intermediate_size": 5632, "num_hidden_layers": 24,
+            "num_attention_heads": 16, "num_key_value_heads": 16, "vocab_size": 151936,
+            "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "num_experts": 60, "num_experts_per_tok": 4, "norm_topk_prob": false,
+            "moe_intermediate_size": 1408, "shared_expert_intermediate_size": 5632
+        });
+        let cfg = LlamaConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.architecture, Architecture::Qwen2Moe);
+        assert!(cfg.is_moe());
+        let moe = cfg.moe.unwrap();
+        assert_eq!(moe.num_experts, 60);
+        assert_eq!(moe.num_experts_per_tok, 4);
+        assert_eq!(moe.moe_intermediate_size, 1408);
+        assert_eq!(moe.shared_expert_intermediate_size, 5632);
+        assert!(!moe.norm_topk_prob);
+        // A dense (non-MoE) config has no MoE block.
+        assert!(!LlamaConfig::from_json(&json!({
+            "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
+            "num_attention_heads": 2, "vocab_size": 32
+        }))
+        .unwrap()
+        .is_moe());
     }
 
     #[test]

@@ -45,10 +45,20 @@ pub enum Projection {
 impl Projection {
     /// Load from a dense `[out, in]` weight, quantizing it if `quant` is set.
     pub fn load(weight: Tensor, quant: Option<QuantSpec>) -> Result<Self> {
+        Self::load_with_bias(weight, None, quant)
+    }
+
+    /// Load from a dense `[out, in]` weight plus an optional `[out]` bias (Qwen2 attention carries
+    /// q/k/v bias), quantizing the weight if `quant` is set. The bias is always applied dense.
+    pub fn load_with_bias(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
         match quant {
-            None => Ok(Projection::Dense(Linear::new(weight, None))),
+            None => Ok(Projection::Dense(Linear::new(weight, bias))),
             Some(q) => Ok(Projection::Quantized(QuantizedLinear::quantize(
-                &weight, q.dtype, None,
+                &weight, q.dtype, bias,
             )?)),
         }
     }
