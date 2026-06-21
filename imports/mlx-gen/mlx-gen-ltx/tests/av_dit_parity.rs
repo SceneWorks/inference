@@ -79,6 +79,7 @@ fn run(bf16: bool, golden: &str) {
             g.require("audio_context").unwrap(),
             None,
             g.require("audio_positions").unwrap(),
+            None,
         )
         .expect("av dit forward");
 
@@ -89,6 +90,37 @@ fn run(bf16: bool, golden: &str) {
     let (pvr, mvr) = (peak_rel(&v_vel, want_v), mean_rel(&v_vel, want_v));
     let (par, mar) = (peak_rel(&a_vel, want_a), mean_rel(&a_vel, want_a));
     eprintln!("av dit ({prec:?}): video peak_rel {pvr:.3e} mean_rel {mvr:.3e} | audio peak_rel {par:.3e} mean_rel {mar:.3e}");
+
+    // sc-7141: the per-stage RoPE epoch fast path keys all FOUR stream memos (video/audio × self/cross).
+    // Re-run with `Some(epoch)` on the SAME inputs and assert both velocities are byte-identical to the
+    // content path — transitively gating the epoch path against the reference golden on real weights.
+    let (v_epoch, a_epoch) = dit
+        .forward(
+            g.require("video_latent").unwrap(),
+            g.require("video_timestep").unwrap(),
+            g.require("video_context").unwrap(),
+            None,
+            g.require("video_positions").unwrap(),
+            g.require("audio_latent").unwrap(),
+            g.require("audio_timestep").unwrap(),
+            g.require("audio_context").unwrap(),
+            None,
+            g.require("audio_positions").unwrap(),
+            Some(dit.next_rope_epoch()),
+        )
+        .expect("av dit forward (epoch path)");
+    mlx_rs::transforms::eval([&v_vel, &a_vel, &v_epoch, &a_epoch]).unwrap();
+    assert_eq!(
+        f32(&v_epoch).as_slice::<f32>(),
+        f32(&v_vel).as_slice::<f32>(),
+        "sc-7141: epoch-path video velocity must be byte-identical to the content path"
+    );
+    assert_eq!(
+        f32(&a_epoch).as_slice::<f32>(),
+        f32(&a_vel).as_slice::<f32>(),
+        "sc-7141: epoch-path audio velocity must be byte-identical to the content path"
+    );
+
     // Bit-exact, matching the video-only sc-2842 gate.
     assert!(
         pvr == 0.0 && mvr == 0.0,

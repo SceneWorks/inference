@@ -1449,7 +1449,11 @@ impl Sam3Tracker {
             let idx = (offset - 1).rem_euclid(NUM_MASKMEM); // offset 0 → 6 (negative-index wrap)
             let tpos =
                 take1(&self.mem_temporal_pos_enc, idx, 0)?.reshape(&[1, 1, MEM_OUT_CHANNELS])?;
-            mem_feats.push(feat.clone());
+            // `maskmem_features` are stored bf16 in the bank (sc-7141); widen to f32 here at the
+            // attention concat boundary so they match the f32 object-pointer tokens and the value is
+            // exactly what the old in-bank bf16→f32 store produced (byte-identical). A no-op when
+            // `feat` is already f32 (e.g. a non-video caller).
+            mem_feats.push(feat.as_dtype(Dtype::Float32)?);
             mem_pos.push(add(pos, &tpos)?);
         }
 

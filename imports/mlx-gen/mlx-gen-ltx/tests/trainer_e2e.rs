@@ -168,7 +168,7 @@ fn ltx_trainer_trains_and_writes_lora_that_reloads() {
     let context = mk(&[1, 16, 4096], 2);
     let positions = create_position_grid(1, 1, 8, 8);
     let v = dit
-        .forward(&latent, &timestep, &context, None, &positions)
+        .forward(&latent, &timestep, &context, None, &positions, None)
         .unwrap();
     let s = v.sum(None).unwrap().item::<f32>();
     assert!(s.is_finite(), "reloaded-LoRA forward should be finite");

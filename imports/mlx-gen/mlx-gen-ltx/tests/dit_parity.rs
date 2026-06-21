@@ -93,6 +93,7 @@ fn dit_velocity_matches_reference() {
             g.require("context").unwrap(),
             None,
             g.require("positions").unwrap(),
+            None,
         )
         .expect("dit forward");
     let want = g.require("velocity").unwrap();
@@ -101,6 +102,26 @@ fn dit_velocity_matches_reference() {
     eprintln!("dit velocity peak_rel = {pr:.3e} mean_rel = {mr:.3e}");
     // The per-forward DiT is bit-exact at matched mlx 0.31.2 (sc-2842 fixed the last seed, the
     // host-f64 timestep table). A non-zero residual here means a per-op divergence has crept back.
+    // sc-7141: the per-stage RoPE epoch fast path must produce velocity byte-identical to the content
+    // path (the memo's computed tables don't depend on the cache key). Re-run with `Some(epoch)` on the
+    // SAME inputs and assert exact equality with `got` — transitively gating the epoch path against the
+    // reference golden on real weights.
+    let got_epoch = dit
+        .forward(
+            g.require("latent").unwrap(),
+            g.require("timestep").unwrap(),
+            g.require("context").unwrap(),
+            None,
+            g.require("positions").unwrap(),
+            Some(dit.next_rope_epoch()),
+        )
+        .expect("dit forward (epoch path)");
+    mlx_rs::transforms::eval([&got, &got_epoch]).unwrap();
+    assert_eq!(
+        f32(&got_epoch).as_slice::<f32>(),
+        f32(&got).as_slice::<f32>(),
+        "sc-7141: epoch-path velocity must be byte-identical to the content path"
+    );
     assert!(
         pr == 0.0,
         "dit velocity peak_rel {pr:.3e} must be bit-exact"
@@ -127,6 +148,7 @@ fn dit_velocity_matches_reference_bf16() {
             g.require("context").unwrap(),
             None,
             g.require("positions").unwrap(),
+            None,
         )
         .expect("dit forward");
     let want = g.require("velocity").unwrap();
