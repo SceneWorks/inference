@@ -10,6 +10,7 @@
 use std::cell::OnceCell;
 use std::path::Path;
 
+use candle_core::Device;
 use core_llm::{
     ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError,
     FinishReason as CoreFinish, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
@@ -20,6 +21,7 @@ use core_llm::{
 use crate::config::LlamaConfig;
 use crate::decode::{generate_with, ConstraintMask, FinishReason, GenerationConfig, StreamEvent};
 use crate::device::select_device;
+use crate::gguf::GgufCheckpoint;
 use crate::models::LlamaModel;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
@@ -41,19 +43,28 @@ pub struct LlamaProvider {
 }
 
 impl LlamaProvider {
-    /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
-    /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
-    /// quantizes the projections on load per `spec.quantize`.
+    /// Load a provider from `spec.source`: either a `*.gguf` file (loaded directly via Candle's
+    /// native GGUF reader, story 7254) or an HF snapshot directory (config.json + tokenizer.json +
+    /// shards). Either way the decoder architecture is dispatched (Llama / Mistral / Qwen3) and the
+    /// projections are optionally quantized on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        let dir = Path::new(&spec.source);
-        let cfg = LlamaConfig::from_dir(dir).map_err(to_core)?;
         let quant = spec.quantize.map(|q| match q {
             Quantize::Q4 => QuantSpec::q4(),
             Quantize::Q8 => QuantSpec::q8(),
         });
-        let descriptor = descriptor_for(&cfg);
         let device = select_device().map_err(to_core)?;
-        let weights = Weights::from_dir(dir, &device).map_err(to_core)?;
+        if crate::gguf::is_gguf_path(&spec.source) {
+            Self::load_gguf(Path::new(&spec.source), &device, quant)
+        } else {
+            Self::load_dir(Path::new(&spec.source), &device, quant)
+        }
+    }
+
+    /// Load from an HF snapshot directory (config.json + tokenizer.json + safetensors shards).
+    fn load_dir(dir: &Path, device: &Device, quant: Option<QuantSpec>) -> CoreResult<Self> {
+        let cfg = LlamaConfig::from_dir(dir).map_err(to_core)?;
+        let descriptor = descriptor_for(&cfg);
+        let weights = Weights::from_dir(dir, device).map_err(to_core)?;
         let model = LlamaModel::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
@@ -62,6 +73,40 @@ impl LlamaProvider {
             model,
             tokenizer,
             template: load_chat_template(dir),
+            stop_tokens,
+            constraint_table: OnceCell::new(),
+        })
+    }
+
+    /// Load a single `*.gguf` checkpoint directly into the decoder. The tokenizer prefers a sibling
+    /// `tokenizer.json`, falling back to a reconstruction from the GGUF's embedded tokenizer
+    /// metadata; the chat template prefers a sibling `tokenizer_config.json`, then the GGUF's own
+    /// `chat_template`, then the typed Llama-3 default.
+    fn load_gguf(path: &Path, device: &Device, quant: Option<QuantSpec>) -> CoreResult<Self> {
+        let ck = GgufCheckpoint::open(path, device).map_err(to_core)?;
+        let descriptor = descriptor_for(&ck.config);
+        let model = LlamaModel::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
+            .map_err(to_core)?;
+
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let sibling_tokenizer = dir.join("tokenizer.json");
+        let tokenizer = if sibling_tokenizer.is_file() {
+            Tokenizer::from_file(sibling_tokenizer)?
+        } else {
+            ck.tokenizer_from_metadata().map_err(to_core)?
+        };
+
+        let stop_tokens = if ck.stop_tokens.is_empty() {
+            eos_token_ids(dir)
+        } else {
+            ck.stop_tokens.clone()
+        };
+
+        Ok(Self {
+            descriptor,
+            model,
+            tokenizer,
+            template: gguf_chat_template(dir, &ck),
             stop_tokens,
             constraint_table: OnceCell::new(),
         })
@@ -105,6 +150,21 @@ fn load_chat_template(dir: &Path) -> Box<dyn ChatTemplate> {
         Ok(t) => Box::new(t),
         Err(_) => Box::new(Llama3Template),
     }
+}
+
+/// Pick a chat template for a GGUF load: a sibling `tokenizer_config.json` first, then the GGUF's
+/// own embedded `chat_template` metadata, then the typed Llama-3 default.
+fn gguf_chat_template(dir: &Path, ck: &GgufCheckpoint) -> Box<dyn ChatTemplate> {
+    if let Ok(t) = JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json"))
+    {
+        return Box::new(t);
+    }
+    if let Some(src) = &ck.chat_template {
+        let bos = ck.bos_token.clone().unwrap_or_default();
+        let eos = ck.eos_token.clone().unwrap_or_default();
+        return Box::new(JinjaChatTemplate::with_tokens(src.clone(), bos, eos));
+    }
+    Box::new(Llama3Template)
 }
 
 impl TextLlm for LlamaProvider {
