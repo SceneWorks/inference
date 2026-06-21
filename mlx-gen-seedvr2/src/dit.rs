@@ -14,6 +14,8 @@
 //! Each window jointly attends over its video tokens + all text tokens; video is scattered back,
 //! text is averaged across the windows it appeared in.
 
+use std::cell::RefCell;
+
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -586,6 +588,11 @@ impl Mlp {
 // rebuilt in every one of the 32/36 layers. Output is bit-identical (the parity gates verify).
 // ---------------------------------------------------------------------------
 
+/// `((vid_shape), lt, even_cache, odd_cache)` cross-chunk memo for the window partition + RoPE freqs
+/// (sc-6954).
+type WindowCacheMemo = RefCell<Option<((i32, i32, i32), i32, WindowCache, WindowCache)>>;
+
+#[derive(Clone)]
 struct WindowCache {
     fwd: Array,                          // (L,) windowed-order permutation
     rev: Array,                          // (L,) inverse permutation
@@ -1013,6 +1020,11 @@ pub struct Seedvr2Transformer {
     vid_dim: i32,
     eps: f32,
     use_output_ada: bool,
+    /// Cross-chunk cache for the (shift-even, shift-odd) window partition + RoPE freqs. These depend
+    /// only on `(vid_shape, lt)` (the per-block RoPE buffer/window/flags are model constants), so for
+    /// equal-T chunks the per-chunk rebuild is redundant (sc-6954). Keyed on `(vid_shape, lt)` and
+    /// rebuilt only when the chunk shape changes (e.g. a final partial chunk); byte-identical.
+    window_cache: WindowCacheMemo,
 }
 
 impl Seedvr2Transformer {
@@ -1041,6 +1053,7 @@ impl Seedvr2Transformer {
             vid_dim: cfg.vid_dim,
             eps: cfg.norm_eps,
             use_output_ada: cfg.use_output_ada,
+            window_cache: RefCell::new(None),
         })
     }
 
@@ -1056,27 +1069,40 @@ impl Seedvr2Transformer {
 
         // Build the window partition + RoPE freqs once per shift parity (shared across blocks). The
         // RoPE `freqs` buffer is identical across blocks (a fixed base-frequency vector), so block 0's
-        // is representative; the grid is constant through the stack.
+        // is representative; the grid is constant through the stack. Both depend only on
+        // `(vid_shape, lt)`, so cache them across chunks (sc-6954) — equal-T chunks reuse, a partial
+        // chunk rebuilds.
         let lt = txt.shape()[1];
-        let a0 = &self.blocks[0].attn;
-        let cache_even = build_window_cache(
-            &a0.freqs,
-            vid_shape,
-            a0.window,
-            false,
-            a0.rope_pixel,
-            a0.rope_on_text,
-            lt,
-        )?;
-        let cache_odd = build_window_cache(
-            &a0.freqs,
-            vid_shape,
-            a0.window,
-            true,
-            a0.rope_pixel,
-            a0.rope_on_text,
-            lt,
-        )?;
+        let (cache_even, cache_odd) = {
+            let cached = self.window_cache.borrow();
+            match cached.as_ref() {
+                Some((s, l, e, o)) if *s == vid_shape && *l == lt => (e.clone(), o.clone()),
+                _ => {
+                    drop(cached);
+                    let a0 = &self.blocks[0].attn;
+                    let e = build_window_cache(
+                        &a0.freqs,
+                        vid_shape,
+                        a0.window,
+                        false,
+                        a0.rope_pixel,
+                        a0.rope_on_text,
+                        lt,
+                    )?;
+                    let o = build_window_cache(
+                        &a0.freqs,
+                        vid_shape,
+                        a0.window,
+                        true,
+                        a0.rope_pixel,
+                        a0.rope_on_text,
+                        lt,
+                    )?;
+                    *self.window_cache.borrow_mut() = Some((vid_shape, lt, e.clone(), o.clone()));
+                    (e, o)
+                }
+            }
+        };
         for (i, block) in self.blocks.iter().enumerate() {
             let cache = if i % 2 == 1 { &cache_odd } else { &cache_even };
             let (v, t) = block.forward(&vid, &txt, &emb, cache)?;

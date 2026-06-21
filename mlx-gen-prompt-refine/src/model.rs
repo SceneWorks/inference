@@ -229,6 +229,15 @@ impl PromptRefiner {
                 // Mask the logits to grammar-valid tokens: the stop token only when the JSON value is
                 // already complete, never a non-stop special, otherwise gated by feeding the token's
                 // decoded text to the JSON grammar.
+                //
+                // PERF NOTE (F-025, sc-6954): this is an **intentional** O(vocab) `json_state.advance`
+                // per generated token. A first-byte pre-filter (group pieces by first byte, skip
+                // `advance` for pieces whose first byte the current `JsonState` can't accept) would cut
+                // it to O(valid-prefixes), and is byte-identical *iff* "first byte invalid ⇒ advance
+                // returns None" holds for the grammar — but that requires grammar-introspection on
+                // `JsonState` and there is no real-weight constrained-decode oracle here to gate the
+                // equivalence, so the simple exact loop is kept. (~128k ids × output_len `advance`
+                // calls; the bound is `enhance_max_tokens`, already clamped, so it cannot run away.)
                 let can_stop = json_state.can_stop();
                 for (id, slot) in allow_buf.iter_mut().enumerate() {
                     *slot = match kinds[id] {
