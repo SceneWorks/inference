@@ -1,3 +1,9 @@
+# 2-member workspace (story 7201): the lean, tensor-free contract crate `core-llm` (this root
+# package) plus the conformance suite `core-llm-testkit` (a separate crate so its harness deps stay
+# out of core-llm's graph). Both are published and co-versioned.
+[workspace]
+members = ["core-llm-testkit"]
+
 [package]
 name = "core-llm"
 version = "0.0.0"
