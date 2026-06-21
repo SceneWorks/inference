@@ -5,9 +5,10 @@
 //! [`crate::clip::ScailClip`].
 
 use mlx_gen::array::scalar;
+use mlx_gen::weights::to_f32;
 use mlx_gen::Result;
 use mlx_rs::ops::{concatenate_axis, multiply, split, subtract};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 /// A normalized pixel is "on" when the original `[0,255]` value is ≥ 225, i.e. `(225-127.5)/127.5` in
 /// the `[-1,1]` mask space (upstream `_ON_THRESH`).
@@ -16,10 +17,6 @@ const ON_THRESH: f32 = (225.0 - 127.5) / 127.5;
 /// Default temporal-compression stride (the z16 VAE temporal stride): 4 frames → 1 latent frame,
 /// packed into the channel axis (×7 colors = 28).
 pub const TEMPORAL_STRIDE: usize = 4;
-
-fn f32(x: &Array) -> Result<Array> {
-    Ok(x.as_dtype(Dtype::Float32)?)
-}
 
 /// `1 - x`.
 fn one_minus(x: &Array) -> Result<Array> {
@@ -52,11 +49,11 @@ pub fn extract_and_compress_mask_to_latent(mask: &Array, temporal_stride: usize)
     }
 
     // (3, T, H, W) → (T, 3, H, W), threshold each channel to {0,1}.
-    let m = f32(&mask.transpose_axes(&[1, 0, 2, 3])?)?;
+    let m = to_f32(&mask.transpose_axes(&[1, 0, 2, 3])?)?;
     let chans = split(&m, 3, 1)?; // 3 × (T, 1, H, W)
-    let r = f32(&chans[0].gt(scalar(ON_THRESH))?)?;
-    let g = f32(&chans[1].gt(scalar(ON_THRESH))?)?;
-    let b = f32(&chans[2].gt(scalar(ON_THRESH))?)?;
+    let r = to_f32(&chans[0].gt(scalar(ON_THRESH))?)?;
+    let g = to_f32(&chans[1].gt(scalar(ON_THRESH))?)?;
+    let b = to_f32(&chans[2].gt(scalar(ON_THRESH))?)?;
     let (nr, ng, nb) = (one_minus(&r)?, one_minus(&g)?, one_minus(&b)?);
 
     // 7 exclusive color classes (T, 7, H, W).

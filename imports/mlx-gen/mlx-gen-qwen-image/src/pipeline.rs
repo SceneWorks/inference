@@ -11,7 +11,9 @@ use mlx_rs::ops::{add, concatenate_axis, divide, multiply, split_sections, subtr
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::array::scalar;
-use mlx_gen::image::resize_lanczos_u8;
+// The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
+// re-export so the crate's public surface and internal callers are unchanged.
+pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, run_flow_sampler, CancelFlag, Error, FlowMatchEuler, GenerationRequest, Image,
@@ -205,49 +207,6 @@ pub fn pack_latents(latents: &Array, width: u32, height: u32) -> Result<Array> {
     Ok(x.reshape(&[1, lh * lw, c * p * p])?)
 }
 
-/// Resolve the img2img start step (the fork's `Config.init_time_step`): for a reference image with
-/// `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`; otherwise `0` (pure txt2img).
-/// Higher strength → later start → fewer denoise steps → output stays closer to the init image
-/// (the fork's convention). Shared shape with the Z-Image port (sc-2533).
-pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => {
-            let s = s.clamp(0.0, 1.0);
-            // Python `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
-            ((num_steps as f32 * s) as usize).max(1)
-        }
-        _ => 0,
-    }
-}
-
-/// Scale an RGB8 init image to `target` dims with PIL LANCZOS (the fork's `scale_to_dimensions`,
-/// a no-op when already sized), normalize `[0,255] → [-1,1]`, and lay out as NCHW `[1, 3, H, W]`
-/// f32 — the input the VAE encoder expects. Port of `ImageUtil.to_array(scale_to_dimensions(...))`.
-pub fn preprocess_init_image(
-    image: &Image,
-    target_width: u32,
-    target_height: u32,
-) -> Result<Array> {
-    let (iw, ih) = (image.width as usize, image.height as usize);
-    let (tw, th) = (target_width as usize, target_height as usize);
-    if image.pixels.len() != iw * ih * 3 {
-        return Err(Error::Msg(format!(
-            "init image pixel buffer {} != {iw}x{ih}x3",
-            image.pixels.len()
-        )));
-    }
-    // PIL LANCZOS on the uint8 image (no-op when already at target size), matching the fork.
-    let resized: Vec<f32> = if (ih, iw) == (th, tw) {
-        image.pixels.iter().map(|&p| p as f32).collect()
-    } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
-    };
-    // /255 then [-1,1], as NHWC, then transpose to NCHW (the fork's `to_array` convention).
-    let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
-    let nhwc = Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]);
-    Ok(nhwc.transpose_axes(&[0, 3, 1, 2])?)
-}
-
 /// img2img init image → packed clean latents `[1, (h/16)·(w/16), 64]` (f32). Port of the fork's
 /// `LatentCreator.encode_image` ∘ `QwenLatentCreator.pack_latents`: PIL-LANCZOS scale to the target
 /// dims, normalize `[0,255] → [-1,1]` NCHW, VAE-encode (causal-Conv3d → scaled 16-ch latent), drop
@@ -257,14 +216,6 @@ pub fn encode_init_latents(vae: &QwenVae, image: &Image, width: u32, height: u32
     let image_nchw = preprocess_init_image(image, width, height)?; // [1, 3, H, W]
     let latent = vae.encode(&image_nchw)?.squeeze_axes(&[2])?; // [1, 16, 1, H/8, W/8] → [1, 16, H/8, W/8]
     pack_latents(&latent, width, height) // [1, (h/16)·(w/16), 64]
-}
-
-/// Port of `LatentCreator.add_noise_by_interpolation`: `(1 - sigma) * clean + sigma * noise`. The
-/// img2img blend that seeds the denoise loop at `sigma = sigmas[init_time_step]`.
-pub fn add_noise_by_interpolation(clean: &Array, noise: &Array, sigma: f32) -> Result<Array> {
-    let one_minus = Array::from_slice(&[1.0 - sigma], &[1]);
-    let s = Array::from_slice(&[sigma], &[1]);
-    Ok(add(&multiply(clean, one_minus)?, &multiply(noise, s)?)?)
 }
 
 /// Qwen-Image's flow-match sigma schedule: `linspace(1, 1/n, n)` run through the exponential

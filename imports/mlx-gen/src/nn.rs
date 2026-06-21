@@ -13,7 +13,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{
     add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, dequantize, divide, erf,
-    multiply, power, quantize, sigmoid, subtract, tanh,
+    multiply, pad, power, quantize, sigmoid, subtract, tanh,
 };
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
@@ -501,6 +501,73 @@ impl TextRope {
         let cos = mlx_rs::ops::cos(&emb)?.reshape(&[1, q_len, self.dim])?;
         let sin = mlx_rs::ops::sin(&emb)?.reshape(&[1, q_len, self.dim])?;
         Ok((cos, sin))
+    }
+}
+
+/// Additive attention mask `[b, 1, s, s]` for a **causal** LM: `0` where a query may attend (the key
+/// is at or before the query position **and** is not padding per `attention_mask` `[b, s]` of 0/1),
+/// `-inf` otherwise. Built on the host from the i32 attention mask, mirroring the fork's
+/// `causal & key_padding` mask assembly. Shared by the Qwen3-VL text encoders (boogu/ideogram).
+pub fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
+    let am = crate::array::host_i32(attention_mask)?;
+    let (b, s) = (b as usize, s as usize);
+    let mut data = vec![0f32; b * s * s];
+    for bi in 0..b {
+        for i in 0..s {
+            for j in 0..s {
+                let allowed = j <= i && am[bi * s + j] == 1;
+                if !allowed {
+                    data[(bi * s + i) * s + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+    Ok(Array::from_slice(&data, &[b as i32, 1, s as i32, s as i32]))
+}
+
+/// Partition NHWC `x` into `window`×`window` windows along H/W, zero-padding to a multiple of
+/// `window`. Returns the `[-1, window, window, c]` windows plus the padded `(hp, wp)`; the inverse is
+/// [`window_unpartition`]. Shared by the SAM2/SAM3 vision trunks' windowed-attention blocks (6940).
+pub fn window_partition(x: &Array, window: i32) -> Result<(Array, (i32, i32))> {
+    let sh = x.shape();
+    let (b, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
+    let pad_h = (window - h % window) % window;
+    let pad_w = (window - w % window) % window;
+    let x = if pad_h > 0 || pad_w > 0 {
+        pad(x, &[(0, 0), (0, pad_h), (0, pad_w), (0, 0)][..], None, None)?
+    } else {
+        x.clone()
+    };
+    let (hp, wp) = (h + pad_h, w + pad_w);
+    let windows = x
+        .reshape(&[b, hp / window, window, wp / window, window, c])?
+        .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+        .reshape(&[-1, window, window, c])?;
+    Ok((windows, (hp, wp)))
+}
+
+/// Inverse of [`window_partition`]: stitch the `[-1, window, window, c]` windows back to
+/// `[b, h, w, c]`, cropping the window padding `(hp, wp)` back to the unpadded `hw = (h, w)`.
+pub fn window_unpartition(
+    windows: &Array,
+    window: i32,
+    pad_hw: (i32, i32),
+    hw: (i32, i32),
+) -> Result<Array> {
+    let (hp, wp) = pad_hw;
+    let (h, w) = hw;
+    let num_per_image = (hp * wp) / window / window;
+    let b = windows.shape()[0] / num_per_image;
+    let x = windows
+        .reshape(&[b, hp / window, wp / window, window, window, -1])?
+        .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+        .reshape(&[b, hp, wp, -1])?;
+    if hp > h || wp > w {
+        let rows = Array::from_slice(&(0..h).collect::<Vec<i32>>(), &[h]);
+        let cols = Array::from_slice(&(0..w).collect::<Vec<i32>>(), &[w]);
+        Ok(x.take_axis(&rows, 1)?.take_axis(&cols, 2)?)
+    } else {
+        Ok(x)
     }
 }
 

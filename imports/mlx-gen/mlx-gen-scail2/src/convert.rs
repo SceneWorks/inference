@@ -18,11 +18,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use mlx_gen::quant::{quantize_map, save_map};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
-use mlx_rs::ops::quantize;
-use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 /// The SCAIL-2 DiT `_quantize_predicate`: a Linear is quantized iff its weight key (minus `.weight`)
 /// ends with one of these — every block's self/cross-attention `q/k/v/o`, the I2V cross-attention
@@ -64,24 +63,11 @@ pub fn quantize_scail2_transformer(
     bits: i32,
     group_size: i32,
 ) -> Result<HashMap<String, Array>> {
-    let mut out = HashMap::with_capacity(map.len());
-    for (k, v) in map {
-        if is_quant_target(&k) {
-            let base = k
-                .strip_suffix(".weight")
-                .expect("is_quant_target ⇒ .weight suffix");
-            // PARITY-BF16 (sc-2609): quantize the bf16 weight so the packing is byte-identical to the
-            // load-time `AdaptableLinear::quantize` (and to mflux). No-op when already bf16.
-            let wbf16 = v.as_dtype(Dtype::Bfloat16)?;
-            let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
-            out.insert(format!("{base}.weight"), wq);
-            out.insert(format!("{base}.scales"), scales);
-            out.insert(format!("{base}.biases"), biases);
-        } else {
-            out.insert(k, v);
-        }
-    }
-    Ok(out)
+    // The shared packer (bf16-cast → `quantize`, byte-identical to the load-time
+    // `AdaptableLinear::quantize`); `is_quant_target` receives the full `.weight` key.
+    quantize_map(map, bits, group_size, |base| {
+        is_quant_target(&format!("{base}.weight"))
+    })
 }
 
 /// Read every tensor of `path` into an owned key→`Array` map (MLX arrays are ref-counted, so the
@@ -91,20 +77,6 @@ fn load_map(path: &Path) -> Result<HashMap<String, Array>> {
     Ok(w.keys()
         .map(|k| (k.to_string(), w.get(k).expect("listed key").clone()))
         .collect())
-}
-
-/// Materialize + write a key→`Array` map to `path` as safetensors (mirrors `wan::convert::save_map`).
-fn save_map(path: &Path, map: &HashMap<String, Array>) -> Result<()> {
-    eval(map.values().collect::<Vec<_>>())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Array::save_safetensors(
-        map.iter().map(|(k, v)| (k.as_str(), v)),
-        None::<&HashMap<String, String>>,
-        path,
-    )?;
-    Ok(())
 }
 
 /// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}` block
@@ -141,6 +113,7 @@ pub fn quantize_scail2_dit(src: &Path, dst: &Path, bits: i32, group_size: i32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::Dtype;
 
     #[test]
     fn predicate_matches_attn_ffn_only() {

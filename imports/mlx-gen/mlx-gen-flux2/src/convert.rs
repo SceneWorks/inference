@@ -28,11 +28,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use mlx_gen::quant::{load_dir_map, quantize_map, save_map};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
-use mlx_rs::ops::{concatenate_axis, quantize, split};
+use mlx_rs::ops::{concatenate_axis, split};
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 /// Borrowed-from-base subdirs: a transformer-only fine-tune does not touch these, so taking them
 /// from the installed base klein-9B is correct. Symlinked (absolute) to avoid duplicating the
@@ -486,37 +487,6 @@ fn is_te_quant_target(base: &str) -> bool {
 /// mflux/reference default of 64.
 ///
 /// [`AdaptableLinear::quantize`]: mlx_gen::adapters::AdaptableLinear::quantize
-fn quantize_map(
-    map: HashMap<String, Array>,
-    bits: i32,
-    group_size: i32,
-    is_target: impl Fn(&str) -> bool,
-) -> Result<HashMap<String, Array>> {
-    let mut out = HashMap::with_capacity(map.len());
-    for (k, v) in map {
-        let base = k.strip_suffix(".weight").filter(|b| is_target(b));
-        // Only group-quantizable 2-D weights whose `in` divides the group size are packable; a 1-D
-        // norm or an odd shape that slips the predicate stays dense rather than crashing `quantize`.
-        let packable = base.is_some()
-            && v.shape().len() == 2
-            && v.shape()[1] % group_size == 0
-            && v.shape()[1] >= group_size;
-        if let (Some(base), true) = (base, packable) {
-            // PARITY-BF16 (sc-2604/2609): quantize the bf16 weight so the packing is byte-identical
-            // to the load-time `AdaptableLinear::quantize` (and to the fork's `nn.quantize(bf16)`).
-            // No-op when already bf16 (the dev checkpoint is bf16-native).
-            let wbf16 = v.as_dtype(Dtype::Bfloat16)?;
-            let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
-            out.insert(format!("{base}.weight"), wq);
-            out.insert(format!("{base}.scales"), scales);
-            out.insert(format!("{base}.biases"), biases);
-        } else {
-            out.insert(k, v);
-        }
-    }
-    Ok(out)
-}
-
 /// Pre-quantize a FLUX.2-dev **transformer** weight map (the on-disk diffusers key layout, before
 /// the loader's `to_out.0`/`timestep_embedder` renames). Packs every Linear, leaves the qk-RMSNorms
 /// dense. See [`quantize_map`].
@@ -537,30 +507,6 @@ pub fn quantize_flux2_text_encoder(
     group_size: i32,
 ) -> Result<HashMap<String, Array>> {
     quantize_map(map, bits, group_size, is_te_quant_target)
-}
-
-/// Read every tensor of `dir` (sharded safetensors) into an owned key→`Array` map (MLX arrays are
-/// ref-counted, so the clone is a handle copy, not a buffer copy).
-fn load_dir_map(dir: &Path) -> Result<HashMap<String, Array>> {
-    let w = Weights::from_dir(dir)?;
-    Ok(w.keys()
-        .map(|k| (k.to_string(), w.get(k).expect("listed key").clone()))
-        .collect())
-}
-
-/// Materialize + write a key→`Array` map to a single `path.safetensors` (mirrors scail2's
-/// `save_map`). One file, not sharded — the packed component is small enough (Q4 DiT ~17 GB).
-fn save_map(path: &Path, map: &HashMap<String, Array>) -> Result<()> {
-    eval(map.values().collect::<Vec<_>>())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Array::save_safetensors(
-        map.iter().map(|(k, v)| (k.as_str(), v)),
-        None::<&HashMap<String, String>>,
-        path,
-    )?;
-    Ok(())
 }
 
 /// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}`
@@ -617,7 +563,8 @@ pub fn quantize_flux2_text_encoder_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::all_close;
+    use mlx_rs::ops::{all_close, quantize};
+    use mlx_rs::Dtype;
 
     /// Exact (bit-equal) array comparison via `all_close` with zero tolerance.
     fn exact_eq(a: &Array, b: &Array) -> bool {

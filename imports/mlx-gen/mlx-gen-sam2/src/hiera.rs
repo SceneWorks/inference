@@ -13,10 +13,10 @@
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::module::Module;
 use mlx_rs::nn::MaxPool2d;
-use mlx_rs::ops::{add, pad};
+use mlx_rs::ops::add;
 use mlx_rs::Array;
 
-use mlx_gen::nn::{conv2d, gelu_exact, linear};
+use mlx_gen::nn::{conv2d, gelu_exact, linear, window_partition, window_unpartition};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -39,48 +39,6 @@ fn crop_hw(x: &Array, h: i32, w: i32) -> Result<Array> {
     let rows = Array::from_slice(&(0..h).collect::<Vec<i32>>(), &[h]);
     let cols = Array::from_slice(&(0..w).collect::<Vec<i32>>(), &[w]);
     Ok(x.take_axis(&rows, 1)?.take_axis(&cols, 2)?)
-}
-
-/// Partition NHWC `x` into `window`×`window` windows along H/W, zero-padding to a multiple of
-/// `window`. Returns the `[-1, window, window, c]` windows plus the padded `(hp, wp)`.
-fn window_partition(x: &Array, window: i32) -> Result<(Array, (i32, i32))> {
-    let sh = x.shape();
-    let (b, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
-    let pad_h = (window - h % window) % window;
-    let pad_w = (window - w % window) % window;
-    let x = if pad_h > 0 || pad_w > 0 {
-        pad(x, &[(0, 0), (0, pad_h), (0, pad_w), (0, 0)][..], None, None)?
-    } else {
-        x.clone()
-    };
-    let (hp, wp) = (h + pad_h, w + pad_w);
-    let windows = x
-        .reshape(&[b, hp / window, window, wp / window, window, c])?
-        .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-        .reshape(&[-1, window, window, c])?;
-    Ok((windows, (hp, wp)))
-}
-
-/// Inverse of [`window_partition`]: stitch windows back to `[b, h, w, c]`, cropping padding.
-fn window_unpartition(
-    windows: &Array,
-    window: i32,
-    pad_hw: (i32, i32),
-    hw: (i32, i32),
-) -> Result<Array> {
-    let (hp, wp) = pad_hw;
-    let (h, w) = hw;
-    let num_per_image = (hp * wp) / window / window;
-    let b = windows.shape()[0] / num_per_image;
-    let x = windows
-        .reshape(&[b, hp / window, wp / window, window, window, -1])?
-        .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-        .reshape(&[b, hp, wp, -1])?;
-    if hp > h || wp > w {
-        crop_hw(&x, h, w)
-    } else {
-        Ok(x)
-    }
 }
 
 /// Two-layer GELU MLP (`mlp.layers.0` → gelu → `mlp.layers.1`).

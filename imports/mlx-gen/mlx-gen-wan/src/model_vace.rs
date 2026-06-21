@@ -40,7 +40,7 @@ use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, preprocess_i2v_image,
 };
 use crate::scheduler::SolverKind;
-use crate::text_encoder::{load_tokenizer, Umt5Encoder};
+use crate::text_encoder::encode_text_staged;
 use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, prepare_masks, prepare_video_latents,
     WanVaceTransformer,
@@ -53,6 +53,21 @@ pub const MODEL_ID_VACE: &str = "wan_vace";
 /// The Wan z16 VAE strides (the VACE checkpoints are Wan2.1-based): temporal 4, spatial 8, patch 2.
 const VAE_T: usize = 4;
 const VAE_S: usize = 8;
+
+/// Drop the leading `num_ref` reference latent frames along the temporal axis (axis 1) — the diffusers
+/// `latents[:, :, num_reference_images:]` slice both VACE variants apply after denoise, before the VAE
+/// decode. `t_total` is the latent's temporal length; a no-op when `num_ref == 0` (F-010).
+fn drop_reference_frames(latents: Array, num_ref: usize, t_total: i32) -> Result<Array> {
+    if num_ref > 0 {
+        let keep = Array::from_slice(
+            &((num_ref as i32)..t_total).collect::<Vec<i32>>(),
+            &[t_total - num_ref as i32],
+        );
+        Ok(latents.take_axis(&keep, 1)?)
+    } else {
+        Ok(latents)
+    }
+}
 
 /// Stable identity + advertised capabilities for `wan_vace`.
 pub fn descriptor_vace() -> ModelDescriptor {
@@ -285,22 +300,8 @@ impl WanVace {
         let num_ref = references.len();
 
         // --- Stage 1: UMT5 text encode ---
-        let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), base.text_len)?;
-        let (context, context_null) = {
-            let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
-            let enc = Umt5Encoder::from_weights(&w, base)?;
-            let context = enc.encode(&tokenizer, &req.prompt)?;
-            let context_null = if cfg_disabled {
-                None
-            } else {
-                Some(enc.encode(&tokenizer, &neg_prompt)?)
-            };
-            match &context_null {
-                Some(cn) => mlx_rs::transforms::eval([&context, cn])?,
-                None => mlx_rs::transforms::eval([&context])?,
-            }
-            (context, context_null)
-        };
+        let (context, context_null) =
+            encode_text_staged(&self.root, base, &req.prompt, &neg_prompt, cfg_disabled)?;
 
         // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
         let control = {
@@ -368,15 +369,7 @@ impl WanVace {
         };
 
         // Drop the leading reference latent frames (diffusers `latents[:, :, num_reference_images:]`).
-        let latents = if num_ref > 0 {
-            let keep = Array::from_slice(
-                &((num_ref as i32)..t_total).collect::<Vec<i32>>(),
-                &[t_total - num_ref as i32],
-            );
-            latents.take_axis(&keep, 1)?
-        } else {
-            latents
-        };
+        let latents = drop_reference_frames(latents, num_ref, t_total)?;
 
         // --- Stage 4: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
@@ -580,22 +573,8 @@ impl WanVaceFun {
         let num_ref = references.len();
 
         // --- Stage 1: UMT5 text encode (shared z16/UMT5 components, same as wan_vace) ---
-        let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), base.text_len)?;
-        let (context, context_null) = {
-            let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
-            let enc = Umt5Encoder::from_weights(&w, base)?;
-            let context = enc.encode(&tokenizer, &req.prompt)?;
-            let context_null = if cfg_disabled {
-                None
-            } else {
-                Some(enc.encode(&tokenizer, &neg_prompt)?)
-            };
-            match &context_null {
-                Some(cn) => mlx_rs::transforms::eval([&context, cn])?,
-                None => mlx_rs::transforms::eval([&context])?,
-            }
-            (context, context_null)
-        };
+        let (context, context_null) =
+            encode_text_staged(&self.root, base, &req.prompt, &neg_prompt, cfg_disabled)?;
 
         // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
         let control = {
@@ -675,15 +654,7 @@ impl WanVaceFun {
         };
 
         // Drop the leading reference latent frames (diffusers `latents[:, :, num_reference_images:]`).
-        let latents = if num_ref > 0 {
-            let keep = Array::from_slice(
-                &((num_ref as i32)..t_total).collect::<Vec<i32>>(),
-                &[t_total - num_ref as i32],
-            );
-            latents.take_axis(&keep, 1)?
-        } else {
-            latents
-        };
+        let latents = drop_reference_frames(latents, num_ref, t_total)?;
 
         // --- Stage 4: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);

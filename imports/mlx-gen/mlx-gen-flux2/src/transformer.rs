@@ -27,6 +27,8 @@ use crate::chunk::{map_seq_chunks, MemoryConfig};
 use crate::config::{Flux2Config, Flux2Quant};
 use crate::kv_cache::{Flux2KvCache, Stream};
 use crate::pos_embed::Flux2PosEmbed;
+// The quant-aware bias-less Linear loader is shared with the text encoder (its canonical home, 6937).
+use crate::text_encoder::lin;
 
 /// Per-call KV-cache binding handed to an attention layer: `(cache, layer_idx_within_stream)`.
 /// `None` on the dense path (txt2img, plain edit) and inside parity tests.
@@ -40,33 +42,6 @@ const RMS_EPS: f32 = 1e-5;
 // FLUX.2's modulate keeps a strong f32 `1` via `one_matches_scale = false`. SwiGLU stays crate-specific.
 use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
-
-/// Wrap a stored `[out, in]` weight as a bias-less [`AdaptableLinear`] (every FLUX.2 transformer
-/// projection is bias-less). With `quant == None` this is the dense path (`matmul(x, wᵀ)`,
-/// bit-identical to the prior raw `matmul_t`); `quantize` later swaps the base to a Q4/Q8
-/// `quantized_matmul`.
-///
-/// With `quant == Some` AND this Linear's packed `{base}.scales` present on disk — a
-/// **pre-quantized snapshot** (sc-5917) — build the quantized base directly from the packed
-/// `{base}.weight` (u32 codes) / `.scales` / `.biases`, with no dense bf16 weight ever
-/// materialized. A `Some(quant)` where `.scales` is absent (a dense snapshot, or a Linear the
-/// convert predicate left dense) falls back to the dense path. `key` is the `….weight` tensor name.
-fn lin(w: &Weights, key: &str, quant: Option<Flux2Quant>) -> Result<AdaptableLinear> {
-    if let Some(q) = quant {
-        let base = key.strip_suffix(".weight").unwrap_or(key);
-        if let Some(scales) = w.get(&format!("{base}.scales")) {
-            return Ok(AdaptableLinear::from_quantized_parts(
-                w.require(key)?.clone(),
-                scales.clone(),
-                w.require(&format!("{base}.biases"))?.clone(),
-                None,
-                q.group_size,
-                q.bits,
-            ));
-        }
-    }
-    Ok(AdaptableLinear::dense(w.require(key)?.clone(), None))
-}
 
 fn require_f32_input(x: &Array) -> Result<Array> {
     Ok(x.as_dtype(Dtype::Float32)?)
@@ -1022,7 +997,7 @@ impl Flux2ControlBranch {
         };
         let heads = cfg.num_heads as i32;
         let head_dim = cfg.head_dim as i32;
-        let places: Vec<usize> = (0..cfg.num_double_layers).step_by(2).collect();
+        let places = cfg.control_layer_places();
         let control_img_in = AdaptableLinear::dense(
             w.require(&p("control_img_in.weight"))?.clone(),
             Some(w.require(&p("control_img_in.bias"))?.clone()),
