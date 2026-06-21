@@ -24,6 +24,25 @@
 
 use crate::Result;
 
+// =================================================================================================
+// Unified sampler/scheduler framework (epic 7114, P1). ADDITIVE alongside the legacy `SamplerPolicy`
+// layer below: the callback `Sampler` + `ModelSampling` + `LatentOps` decouple the integration
+// method from the prediction type and can host the multi-eval / multistep solvers the precomputed-
+// `StepCoeffs` design structurally cannot (heun, dpmpp_2m, uni_pc). Engines stay on `SamplerPolicy`
+// until P3/P4 migrate them per-engine, so the legacy layer is shimmed here, not removed.
+// =================================================================================================
+
+pub mod latent_ops;
+pub mod model_sampling;
+pub mod unified;
+
+pub use latent_ops::{CpuLatentOps, LatentOps};
+pub use model_sampling::{
+    denoise, DiscreteModelSampling, EdmModelSampling, FlowModelSampling, ModelSampling,
+    PredictionType,
+};
+pub use unified::{apply_coeffs, DenoiseFn, Euler, Sampler};
+
 /// The scalar coefficients of one denoise step. The backend applies
 /// `x_next = a_x·x + a_out·model_output + a_noise·ε`, scaling the model input by `c_in` first.
 #[derive(Clone, Copy, Debug, PartialEq)]
