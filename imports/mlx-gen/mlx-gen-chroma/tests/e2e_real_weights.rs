@@ -285,10 +285,88 @@ fn chroma_flash_e2e_matches_diffusers() {
     // Flash is the few-step distilled model (static shift 1.0, CFG≈1). `guidance == 1.0` exercises the
     // single-forward path (F-095): `denoise` skips the negative T5 encode + negative DiT forward and
     // returns `pos` exactly, so matching the diffusers golden here guards that the skip is correct.
+    // NB: this (and every golden) steps with flow-match **Euler**; the production Flash **Heun**
+    // default (sc-5392) is gated same-backend by `chroma_flash_heun_path_gated` below.
     run_image_parity(
         ChromaVariant::Flash,
         "Chroma1-Flash",
         "chroma_e2e_flash",
         1.0,
+    );
+}
+
+/// sc-6903 (F-005): production Chroma1-Flash defaults to the **Heun** sampler (sc-5392), but the
+/// diffusers reference — and therefore every committed golden — steps with flow-match **Euler**
+/// (`ChromaPipeline` has no Heun scheduler), so the Euler-forced `denoise` goldens never exercise the
+/// Heun second-forward+average arm that production actually runs. No torch Heun reference can be
+/// produced, so gate it **same-backend**: from the identical golden init, compare the production Heun
+/// path against the (golden-validated) Euler path. The shared encode/sigma/RoPE/mask/CFG body is one
+/// method post-dedup, so the Euler golden already covers it; this isolates the Heun-only step logic.
+#[test]
+#[ignore = "needs the ~18GB Chroma1-Flash snapshot"]
+fn chroma_flash_heun_path_gated() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let g = Weights::from_file(format!("{dir}/chroma_e2e_flash.safetensors")).unwrap();
+    let init = g.require("init_latents").unwrap().clone();
+    let model = load_chroma(
+        ChromaVariant::Flash,
+        &LoadSpec::new(WeightsSource::Dir(hf_snapshot("Chroma1-Flash"))),
+    )
+    .expect("load Chroma1-Flash");
+
+    let mut nop = |_p: Progress| {};
+    let cancel = CancelFlag::default();
+    // Euler == the validated golden trajectory (gated by chroma_flash_e2e_matches_diffusers); compute
+    // it same-backend here so the Heun comparison cancels any port-vs-torch baseline offset.
+    let euler = model
+        .denoise(
+            PROMPT,
+            NEG,
+            W,
+            H,
+            STEPS,
+            1.0,
+            init.clone(),
+            &cancel,
+            &mut nop,
+        )
+        .unwrap();
+    // The production default for Flash: Some("heun") routes through ChromaSamplerKind::from_request.
+    let heun = model
+        .denoise_with_sampler_name(
+            PROMPT,
+            NEG,
+            W,
+            H,
+            STEPS,
+            1.0,
+            init.clone(),
+            Some("heun"),
+            &cancel,
+            &mut nop,
+        )
+        .unwrap();
+
+    let d = rel_l2(&heun, &euler);
+    eprintln!("[Chroma1-Flash] Heun-vs-Euler rel-L2 = {d:.5}");
+    // Distinctness (load-bearing regression guard): Heun runs an extra forward + averages, so it MUST
+    // differ from Euler. A future edit that silently collapses the Heun arm back to Euler trips this.
+    assert!(
+        d.is_finite() && d > 1e-4,
+        "Heun must differ from Euler (second-forward arm not exercised); rel-L2 {d}"
+    );
+    // Coherence envelope: Heun is a higher-order refinement of the *same* velocity field, so it stays
+    // in Euler's neighborhood — garbage/divergence (NaN, broken shared body) escapes this bound. 0.5
+    // is a generous envelope; tighten to the observed magnitude on the first real-weight run.
+    assert!(
+        d < 0.5,
+        "Heun diverged from Euler — not a coherent refinement; rel-L2 {d}"
+    );
+    // And it must still decode to a real image (catches a non-finite Heun latent at the VAE boundary).
+    let img = model.decode(&heun, W, H).unwrap();
+    assert_eq!(img.pixels.len(), (W * H * 3) as usize);
+    assert!(
+        img.pixels.iter().any(|&p| p != img.pixels[0]),
+        "Heun decode produced a degenerate flat image"
     );
 }
