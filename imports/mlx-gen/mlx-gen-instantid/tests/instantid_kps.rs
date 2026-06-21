@@ -153,7 +153,10 @@ fn view_angle_kps_scaling_matches() {
 fn draw_kps_rejects_fewer_than_5_keypoints() {
     let four = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0)];
     let err = draw_kps(64, 64, &four).unwrap_err().to_string();
-    assert!(err.contains("5 keypoints") && err.contains("got 4"), "got: {err}");
+    assert!(
+        err.contains("5 keypoints") && err.contains("got 4"),
+        "got: {err}"
+    );
     let five = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0), (4.0, 4.0)];
     assert!(draw_kps(64, 64, &five).is_ok());
 }
