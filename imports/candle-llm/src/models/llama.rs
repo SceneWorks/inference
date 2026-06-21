@@ -71,6 +71,11 @@ impl LlamaModel {
         let head_dim = cfg.head_dim as usize;
         let scale = cfg.attn_scale();
         let eps = cfg.rms_norm_eps as f64;
+        // Phi-3 fuses q‖k‖v into one `qkv_proj` and gate‖up into one `gate_up_proj`; the row spans the
+        // split slices below carve out (each `[out, hidden]`, so the split is along axis 0).
+        let qd = num_heads * head_dim;
+        let kvd = num_kv_heads * head_dim;
+        let inter = cfg.intermediate_size as usize;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -83,13 +88,48 @@ impl LlamaModel {
             } else {
                 (None, None)
             };
+            // Attention projections: a packed `qkv_proj` (Phi-3) is split into q/k/v, else the
+            // separate `q_proj`/`k_proj`/`v_proj` are loaded directly.
+            let (q, k, v) = {
+                let packed = lp("self_attn.qkv_proj.weight");
+                if w.contains(&packed) {
+                    let qkv = req(packed)?; // [qd + 2*kvd, hidden]
+                    (
+                        Projection::load(qkv.narrow(0, 0, qd)?.contiguous()?, quant)?,
+                        Projection::load(qkv.narrow(0, qd, kvd)?.contiguous()?, quant)?,
+                        Projection::load(qkv.narrow(0, qd + kvd, kvd)?.contiguous()?, quant)?,
+                    )
+                } else {
+                    (
+                        proj(lp("self_attn.q_proj.weight"))?,
+                        proj(lp("self_attn.k_proj.weight"))?,
+                        proj(lp("self_attn.v_proj.weight"))?,
+                    )
+                }
+            };
+            // MLP gate/up: a packed `gate_up_proj` (Phi-3) is split, else separate projections.
+            let (gate, up) = {
+                let packed = lp("mlp.gate_up_proj.weight");
+                if w.contains(&packed) {
+                    let gu = req(packed)?; // [2*inter, hidden]
+                    (
+                        Projection::load(gu.narrow(0, 0, inter)?.contiguous()?, quant)?,
+                        Projection::load(gu.narrow(0, inter, inter)?.contiguous()?, quant)?,
+                    )
+                } else {
+                    (
+                        proj(lp("mlp.gate_proj.weight"))?,
+                        proj(lp("mlp.up_proj.weight"))?,
+                    )
+                }
+            };
             layers.push(LlamaLayer {
                 input_ln: req(lp("input_layernorm.weight"))?,
                 post_ln: req(lp("post_attention_layernorm.weight"))?,
                 attn: LlamaAttention {
-                    q: proj(lp("self_attn.q_proj.weight"))?,
-                    k: proj(lp("self_attn.k_proj.weight"))?,
-                    v: proj(lp("self_attn.v_proj.weight"))?,
+                    q,
+                    k,
+                    v,
                     o: proj(lp("self_attn.o_proj.weight"))?,
                     q_norm,
                     k_norm,
@@ -101,8 +141,8 @@ impl LlamaModel {
                     eps,
                 },
                 mlp: LlamaMlp {
-                    gate: proj(lp("mlp.gate_proj.weight"))?,
-                    up: proj(lp("mlp.up_proj.weight"))?,
+                    gate,
+                    up,
                     down: proj(lp("mlp.down_proj.weight"))?,
                 },
                 eps,
