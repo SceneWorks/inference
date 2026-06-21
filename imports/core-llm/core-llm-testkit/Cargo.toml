@@ -6,8 +6,10 @@ description = "Conformance suite for the core-llm TextLlm contract — drives an
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/core-llm"
 readme = "README.md"
-keywords = ["llm", "conformance", "testing", "contract"]
-categories = ["development-tools::testing"]
+# Internal dev-harness, not a standalone published crate: backends dev-depend on it through the
+# workspace / a git dependency, never from crates.io (sc-7201 decision). `publish = false` documents
+# that and guards against an accidental `cargo publish`.
+publish = false
 
 # Neutral import path, decoupled from the package name (matches the gen-core-testkit convention).
 [lib]
