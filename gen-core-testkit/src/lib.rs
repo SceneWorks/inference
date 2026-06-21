@@ -55,6 +55,42 @@ use gen_core::{
     Progress,
 };
 
+/// The lax `Progress::Step` monotonicity contract shared by the captioner and text-LLM conformance
+/// checks (6942): at least one step; a constant non-zero `total`; a strictly-increasing `current` in
+/// `1..=total`. `id` labels the model, `op` the emitting method (e.g. `"caption()"`) for the
+/// no-events error. Token/phase-based decoders use this rather than the generator's exact-step check.
+pub(crate) fn check_progress_steps(id: &str, op: &str, steps: &[(u32, u32)]) -> Result<(), String> {
+    if steps.is_empty() {
+        return Err(format!(
+            "progress[{id}]: {op} emitted no Progress::Step events"
+        ));
+    }
+    let total = steps[0].1;
+    if total == 0 {
+        return Err(format!("progress[{id}]: Progress::Step.total was 0"));
+    }
+    let mut prev = 0u32;
+    for &(current, t) in steps {
+        if t != total {
+            return Err(format!(
+                "progress[{id}]: Step.total changed mid-run ({total} then {t})"
+            ));
+        }
+        if current < 1 || current > total {
+            return Err(format!(
+                "progress[{id}]: Step.current {current} out of range 1..={total}"
+            ));
+        }
+        if current <= prev {
+            return Err(format!(
+                "progress[{id}]: Step.current must strictly increase; saw {prev} then {current}"
+            ));
+        }
+        prev = current;
+    }
+    Ok(())
+}
+
 /// Cheap-request parameters for the conformance run. Keep these at the model's *minimum* valid
 /// size and a tiny step count — the suite runs `generate` several times, so the macOS-lane cost is
 /// `~4 ×` one cheap render.

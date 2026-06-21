@@ -433,6 +433,36 @@ pub fn load_tokenizer(path: impl AsRef<std::path::Path>, text_len: usize) -> Res
         .map_err(|e| Error::Msg(format!("wan umt5 tokenizer: {e}")))
 }
 
+/// Stage-1 UMT5 text encode shared by every Wan `generate_impl` (dense TI2V-5B, MoE A14B, VACE,
+/// VACE-Fun): load the tokenizer + `t5_encoder.safetensors` from the snapshot `root`, build the
+/// [`Umt5Encoder`], encode `prompt` (and, unless `skip_neg`, `neg_prompt`), then `eval` so the
+/// encoder loads → is used → frees before the DiT loads. Returns `(context, context_null)`, with
+/// `context_null = None` when `skip_neg` (CFG disabled). This was copied verbatim into all four
+/// bodies (and the A14B copy had drifted to always-encode-both); centralizing it removes the drift —
+/// the A14B caller passes `skip_neg = false` to keep its always-both behavior (F-010).
+pub(crate) fn encode_text_staged(
+    root: &std::path::Path,
+    cfg: &WanModelConfig,
+    prompt: &str,
+    neg_prompt: &str,
+    skip_neg: bool,
+) -> Result<(Array, Option<Array>)> {
+    let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.text_len)?;
+    let w = Weights::from_file(root.join("t5_encoder.safetensors"))?;
+    let enc = Umt5Encoder::from_weights(&w, cfg)?;
+    let context = enc.encode(&tokenizer, prompt)?;
+    let context_null = if skip_neg {
+        None
+    } else {
+        Some(enc.encode(&tokenizer, neg_prompt)?)
+    };
+    match &context_null {
+        Some(cn) => mlx_rs::transforms::eval([&context, cn])?,
+        None => mlx_rs::transforms::eval([&context])?,
+    }
+    Ok((context, context_null))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

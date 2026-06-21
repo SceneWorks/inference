@@ -193,8 +193,15 @@ pub fn pack_patches(
 }
 
 /// Build `[1, 3, h, w]` f32 from channels-last RGB8 bytes, rescaled (1/255) + normalized
-/// `(x - mean)/std` per channel.
-fn normalized_frame(pixels_hwc: &[u8], h: i64, w: i64, mean: [f32; 3], std: [f32; 3]) -> Array {
+/// `(x - mean)/std` per channel. Shared by ViT preprocessing and the renderer's per-frame ViT
+/// conditioning (6938) — the latter passes the CLIP [`IMAGE_MEAN`] / [`IMAGE_STD`].
+pub(crate) fn normalized_frame(
+    pixels_hwc: &[u8],
+    h: i64,
+    w: i64,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> Array {
     let (hu, wu) = (h as usize, w as usize);
     let mut data = vec![0f32; 3 * hu * wu];
     for c in 0..3usize {

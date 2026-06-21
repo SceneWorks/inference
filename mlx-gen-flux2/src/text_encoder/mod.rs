@@ -23,6 +23,9 @@ pub use mlp::Qwen3Mlp;
 
 // The HF half-split text RoPE is identical across families and lives in core (F-006).
 pub use mlx_gen::nn::TextRope;
+// Dotted-key assembly is the shared `mlx_gen::weights::join` (re-exported so submodules keep
+// addressing it as `super::join`).
+pub(crate) use mlx_gen::weights::join;
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
@@ -55,13 +58,4 @@ pub(crate) fn lin(w: &Weights, key: &str, quant: Option<Flux2Quant>) -> Result<A
         }
     }
     Ok(AdaptableLinear::dense(w.require(key)?.clone(), None))
-}
-
-/// Join a module prefix with a leaf name, tolerating an empty prefix.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
 }

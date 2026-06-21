@@ -131,6 +131,24 @@ pub fn to_dtype(a: &Array, dtype: Dtype) -> Result<Array> {
     Ok(a.as_dtype(dtype)?)
 }
 
+/// Upcast to `f32`. The common case of [`to_dtype`] — providers that pin reductions/preprocessing
+/// to f32 (e.g. scail2's CLIP/preprocess islands) call this so the intent reads at the use site.
+pub fn to_f32(a: &Array) -> Result<Array> {
+    Ok(a.as_dtype(Dtype::Float32)?)
+}
+
+/// Build a dotted tensor key from a `prefix` and a leaf `name`, collapsing the empty-prefix case
+/// (so a root module addresses `"weight"`, a nested one `"blocks.0.weight"`). The Rust analogue of
+/// the fork's `f"{prefix}.{name}"` key assembly — shared so provider loaders/text-encoders that
+/// walk `tree_flatten`-style names don't each re-spell it.
+pub fn join(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
