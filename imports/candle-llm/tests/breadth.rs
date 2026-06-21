@@ -65,3 +65,11 @@ fn phi3_streams_coherent_text() {
 fn qwen2_moe_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_QWEN2MOE_MODEL", "qwen2_moe");
 }
+
+/// Gemma-2: `(1+weight)` norms, embedding ×√hidden, GeGLU, soft-capped attention + final logits,
+/// 4-norm sandwich block.
+#[test]
+#[ignore = "needs a Gemma-2 snapshot via CANDLE_LLM_GEMMA2_MODEL"]
+fn gemma2_streams_coherent_text() {
+    assert_streams_coherent("CANDLE_LLM_GEMMA2_MODEL", "gemma2");
+}

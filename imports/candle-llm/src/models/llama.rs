@@ -17,7 +17,7 @@ use crate::device::compute_dtype;
 use crate::error::Result;
 use crate::primitives::attention::{sdpa, AttnMask};
 use crate::primitives::kv_cache::KvCache;
-use crate::primitives::nn::{embed, rms_norm, silu};
+use crate::primitives::nn::{embed, gelu, rms_norm, silu, soft_cap};
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{repeat_kv, ContiguousKvCache, Weights};
@@ -33,6 +33,10 @@ pub struct LlamaModel {
     dtype: DType,
     device: Device,
     quantized: bool,
+    /// Gemma scales token embeddings by √hidden; `None` ⇒ no scaling.
+    embed_scale: Option<f64>,
+    /// Gemma-2 final-logit soft-cap; `None` ⇒ no cap.
+    final_softcap: Option<f32>,
 }
 
 impl LlamaModel {
@@ -67,9 +71,20 @@ impl LlamaModel {
             };
             Projection::load_with_bias(req(wkey)?, bias, quant)
         };
+        // Gemma's norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
+        // `rms_norm` applies it. (Llama / Qwen3 norm weights are used verbatim.)
+        let gemma = cfg.architecture.is_gemma2();
+        let norm_w = |key: String| -> Result<Tensor> {
+            let t = req(key)?;
+            if gemma {
+                Ok(t.affine(1.0, 1.0)?)
+            } else {
+                Ok(t)
+            }
+        };
 
         let embed_tokens = req(p("model.embed_tokens.weight"))?;
-        let norm = req(p("model.norm.weight"))?;
+        let norm = norm_w(p("model.norm.weight"))?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::new(embed_tokens.clone(), None)
         } else {
@@ -120,7 +135,8 @@ impl LlamaModel {
                 }
             };
 
-            // Feed-forward: a sparse Mixture-of-Experts bank (Qwen2-MoE) or a dense SwiGLU MLP.
+            // Feed-forward: a sparse Mixture-of-Experts bank (Qwen2-MoE) or a dense MLP. Gemma uses
+            // GeGLU (gelu), everything else SwiGLU (silu).
             let ffn = if let Some(moe) = cfg.moe {
                 let mut experts = Vec::with_capacity(moe.num_experts);
                 for e in 0..moe.num_experts {
@@ -129,6 +145,7 @@ impl LlamaModel {
                         gate: proj(ep("gate_proj.weight"))?,
                         up: proj(ep("up_proj.weight"))?,
                         down: proj(ep("down_proj.weight"))?,
+                        gelu: false,
                     });
                 }
                 Ffn::Moe(MoeMlp {
@@ -138,6 +155,7 @@ impl LlamaModel {
                         gate: proj(lp("mlp.shared_expert.gate_proj.weight"))?,
                         up: proj(lp("mlp.shared_expert.up_proj.weight"))?,
                         down: proj(lp("mlp.shared_expert.down_proj.weight"))?,
+                        gelu: false,
                     },
                     shared_gate: req(lp("mlp.shared_expert_gate.weight"))?, // [1, hidden]
                     experts_per_tok: moe.num_experts_per_tok,
@@ -164,12 +182,26 @@ impl LlamaModel {
                     gate,
                     up,
                     down: proj(lp("mlp.down_proj.weight"))?,
+                    gelu: gemma,
                 })
             };
 
+            // Gemma-2 wraps the block in a 4-norm "sandwich" (pre+post for both attn and MLP); the
+            // Llama shape has only the two pre-norms.
+            let (pre_ff_ln, post_ff_ln) = if gemma {
+                (
+                    Some(norm_w(lp("pre_feedforward_layernorm.weight"))?),
+                    Some(norm_w(lp("post_feedforward_layernorm.weight"))?),
+                )
+            } else {
+                (None, None)
+            };
+
             layers.push(LlamaLayer {
-                input_ln: req(lp("input_layernorm.weight"))?,
-                post_ln: req(lp("post_attention_layernorm.weight"))?,
+                input_ln: norm_w(lp("input_layernorm.weight"))?,
+                post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
+                pre_ff_ln,
+                post_ff_ln,
                 attn: LlamaAttention {
                     q,
                     k,
@@ -183,6 +215,7 @@ impl LlamaModel {
                     scale,
                     groups,
                     eps,
+                    softcap: cfg.attn_logit_softcap,
                 },
                 ffn,
                 eps,
@@ -196,10 +229,12 @@ impl LlamaModel {
             norm,
             lm_head,
             rope,
-            cfg,
             dtype,
             device,
             quantized: quant.is_some(),
+            embed_scale: gemma.then(|| (cfg.hidden_size as f64).sqrt()),
+            final_softcap: cfg.final_logit_softcap,
+            cfg,
         })
     }
 
@@ -242,9 +277,14 @@ impl LlamaModel {
         ))
     }
 
-    /// Embed token ids `[batch, seq]` (u32) → `[batch, seq, hidden]`.
+    /// Embed token ids `[batch, seq]` (u32) → `[batch, seq, hidden]`. Gemma scales the embeddings by
+    /// √hidden.
     pub fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
-        embed(&self.embed_tokens, input_ids)
+        let e = embed(&self.embed_tokens, input_ids)?;
+        match self.embed_scale {
+            Some(s) => Ok(e.affine(s, 0.0)?),
+            None => Ok(e),
+        }
     }
 
     /// Run a forward step over token ids and return logits for the **last** position only,
@@ -317,7 +357,12 @@ impl LlamaModel {
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?; // [b, 1, hidden]
         let normed = rms_norm(&last_h, &self.norm, self.cfg.rms_norm_eps as f64)?;
         let logits = self.lm_head.forward(&normed)?; // [b, 1, vocab]
-        Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
+        let logits = logits.reshape((b, self.cfg.vocab_size as usize))?;
+        // Gemma-2 soft-caps the final logits.
+        match self.final_softcap {
+            Some(c) => Ok(soft_cap(&logits, c)?),
+            None => Ok(logits),
+        }
     }
 }
 
@@ -335,10 +380,18 @@ impl crate::decode::Decode for LlamaModel {
     }
 }
 
-/// One pre-norm transformer block.
+/// One transformer block. Pre-norm by default (Llama / Qwen / Phi); Gemma-2 adds the post-attention
+/// and post-feedforward norms ([`LlamaLayer::pre_ff_ln`] / [`LlamaLayer::post_ff_ln`] are `Some`) for
+/// its 4-norm "sandwich" residual.
 struct LlamaLayer {
+    /// Pre-attention norm.
     input_ln: Tensor,
+    /// Llama: the MLP pre-norm. Gemma-2: the post-attention norm.
     post_ln: Tensor,
+    /// Gemma-2 only: the MLP pre-norm (the post-attention residual is normed by `input`/`post_ln`).
+    pre_ff_ln: Option<Tensor>,
+    /// Gemma-2 only: the post-feedforward norm applied to the MLP output before the residual add.
+    post_ff_ln: Option<Tensor>,
     attn: LlamaAttention,
     ffn: Ffn,
     eps: f64,
@@ -354,14 +407,30 @@ impl LlamaLayer {
         cache: &mut dyn KvCache,
         layer_idx: usize,
     ) -> Result<Tensor> {
-        let normed = rms_norm(x, &self.input_ln, self.eps)?;
-        let attn = self
-            .attn
-            .forward(&normed, cos, sin, mask, cache, layer_idx)?;
-        let h = x.broadcast_add(&attn)?;
-        let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
-        let ffn = self.ffn.forward(&normed2)?;
-        Ok(h.broadcast_add(&ffn)?)
+        let attn = self.attn.forward(
+            &rms_norm(x, &self.input_ln, self.eps)?,
+            cos,
+            sin,
+            mask,
+            cache,
+            layer_idx,
+        )?;
+        match (&self.pre_ff_ln, &self.post_ff_ln) {
+            // Gemma-2 sandwich: post-norm the attention output and the MLP output before each add.
+            (Some(pre_ff), Some(post_ff)) => {
+                let attn = rms_norm(&attn, &self.post_ln, self.eps)?;
+                let h = x.broadcast_add(&attn)?;
+                let ffn = self.ffn.forward(&rms_norm(&h, pre_ff, self.eps)?)?;
+                let ffn = rms_norm(&ffn, post_ff, self.eps)?;
+                Ok(h.broadcast_add(&ffn)?)
+            }
+            // Llama pre-norm: `post_ln` is the MLP pre-norm.
+            _ => {
+                let h = x.broadcast_add(&attn)?;
+                let ffn = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
+                Ok(h.broadcast_add(&ffn)?)
+            }
+        }
     }
 }
 
@@ -394,6 +463,8 @@ struct LlamaAttention {
     scale: f32,
     groups: usize,
     eps: f64,
+    /// Gemma-2 attention-score soft-cap; `None` ⇒ no cap.
+    softcap: Option<f32>,
 }
 
 impl LlamaAttention {
@@ -431,7 +502,7 @@ impl LlamaAttention {
         let k_all = repeat_kv(&k_all, self.groups)?;
         let v_all = repeat_kv(&v_all, self.groups)?;
 
-        let out = sdpa(&q, &k_all, &v_all, self.scale, mask)?; // [b, heads, s, head_dim]
+        let out = sdpa(&q, &k_all, &v_all, self.scale, self.softcap, mask)?; // [b, heads, s, head_dim]
         let out = out
             .transpose(1, 2)?
             .contiguous()?
@@ -440,19 +511,20 @@ impl LlamaAttention {
     }
 }
 
-/// SwiGLU feed-forward.
+/// A gated MLP: SwiGLU (`silu`) by default, or GeGLU (`gelu`, the Gemma activation) when `gelu`.
 struct LlamaMlp {
     gate: Projection,
     up: Projection,
     down: Projection,
+    gelu: bool,
 }
 
 impl LlamaMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = silu(&self.gate.forward(x)?)?;
+        let g = self.gate.forward(x)?;
+        let g = if self.gelu { gelu(&g)? } else { silu(&g)? };
         let up = self.up.forward(x)?;
-        let gated = (gate * up)?;
-        self.down.forward(&gated)
+        self.down.forward(&(g * up)?)
     }
 }
 
