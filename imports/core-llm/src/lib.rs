@@ -21,6 +21,8 @@
 //! - [`Scheduler`] — backend-neutral continuous-batching policy (admission + per-sequence retire).
 //! - [`PrefixIndex`] — backend-neutral shared-prefix KV-reuse policy (longest-match + LRU).
 //! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
+//! - [`speculative`] — backend-neutral speculative-decoding policy (n-gram proposer + distribution-
+//!   preserving acceptance sampler).
 //! - [`registry`] — link-time provider registration and id-based routing.
 
 pub mod cancel;
@@ -34,6 +36,7 @@ pub mod prefix;
 pub mod registry;
 pub mod request;
 pub mod schedule;
+pub mod speculative;
 pub mod template;
 pub mod text_llm;
 pub mod tokenizer;
@@ -49,6 +52,7 @@ pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use registry::{load_textllm, textllms, TextLlmRegistration};
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
+pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
 pub use template::{ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template};
 pub use text_llm::TextLlm;
 pub use tokenizer::Tokenizer;
