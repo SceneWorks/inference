@@ -21,9 +21,9 @@ use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Result, WeightsSource,
+    curated_sampler_names, default_seed, gen_core, Capabilities, Conditioning, ConditioningKind,
+    Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Result, WeightsSource,
 };
 
 use crate::config::{ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig};
@@ -79,7 +79,11 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
-            samplers: Vec::new(),
+            // Curated unified solvers (epic 7114, sc-7122): SVD exposes the SAMPLER axis but NO scheduler
+            // (matching ComfyUI) — it keeps its native Karras EDM σ schedule and only swaps the
+            // integrator (over `EdmModelSampling`, v-prediction). An unset sampler → the native EDM Euler
+            // (the byte-exact default); a named curated solver → `SvdPipeline::denoise_curated`.
+            samplers: curated_sampler_names(),
             schedulers: Vec::new(),
             min_size: 256,
             max_size: 1024,
@@ -413,25 +417,45 @@ impl Svd {
             current: 0,
             total: total_steps,
         });
-        // Thread per-step progress through the 25-step Euler loop so progress UIs advance through the
+        // Thread per-step progress through the 25-step denoise loop so progress UIs advance through the
         // dominant denoise phase instead of sitting at 0% until decode (F-088).
-        let final_latents = self.pipeline.denoise(
-            &latents,
-            &image_embeds,
-            &image_latents,
-            &added_time_ids,
-            params.num_frames,
-            params.num_inference_steps,
-            params.min_guidance_scale,
-            params.max_guidance_scale,
-            &req.cancel,
-            &mut |step| {
-                on_progress(Progress::Step {
-                    current: step as u32,
-                    total: total_steps,
-                })
-            },
-        )?;
+        let final_latents = if let Some(name) = req.sampler.as_deref() {
+            // Curated unified solver (epic 7114, sc-7122): swap the integrator, keep the native Karras
+            // EDM σ schedule (SVD is sampler-only). The native EDM Euler default (no `req.sampler`) stays
+            // on `denoise` below — byte-exact (N1).
+            self.pipeline.denoise_curated(
+                name,
+                &latents,
+                &image_embeds,
+                &image_latents,
+                &added_time_ids,
+                params.num_frames,
+                params.num_inference_steps,
+                params.min_guidance_scale,
+                params.max_guidance_scale,
+                seed,
+                &req.cancel,
+                on_progress,
+            )?
+        } else {
+            self.pipeline.denoise(
+                &latents,
+                &image_embeds,
+                &image_latents,
+                &added_time_ids,
+                params.num_frames,
+                params.num_inference_steps,
+                params.min_guidance_scale,
+                params.max_guidance_scale,
+                &req.cancel,
+                &mut |step| {
+                    on_progress(Progress::Step {
+                        current: step as u32,
+                        total: total_steps,
+                    })
+                },
+            )?
+        };
 
         on_progress(Progress::Decoding);
         let decoded = self.pipeline.decode(
@@ -496,6 +520,26 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_advertises_curated_samplers_no_scheduler() {
+        // epic 7114 (sc-7122): SVD exposes the curated SAMPLER axis (over EDM v-prediction) but NO
+        // scheduler (it keeps its native Karras EDM schedule). A non-empty scheduler list would be a
+        // false capability (there is no scheduler-selection path).
+        let caps = descriptor().capabilities;
+        for s in ["euler", "heun", "dpmpp_2m", "dpmpp_sde", "uni_pc", "ddim"] {
+            assert!(
+                caps.samplers.contains(&s),
+                "curated sampler {s:?} should be advertised"
+            );
+        }
+        assert!(
+            caps.schedulers.is_empty(),
+            "SVD is sampler-only (no scheduler axis)"
+        );
+        // The default (no sampler) is the native EDM Euler — `euler` is in the menu and reproduces it.
+        assert!(caps.samplers.contains(&"euler"));
+    }
 
     fn img(w: u32, h: u32, len: usize) -> Image {
         Image {

@@ -10,18 +10,22 @@
 
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
-use mlx_gen::{AdapterSpec, CancelFlag, DiffusionSampler, Error, Image, Progress, Result};
+use mlx_gen::{
+    schedule_sigmas, AdapterSpec, AlphaSchedule, CancelFlag, DiffusionSampler,
+    DiscreteModelSampling, Error, Image, Progress, Result, Scheduler,
+};
 
 use mlx_gen_sdxl::{
-    apply_sdxl_adapters_with, decode_image, denoise, denoise_control, denoise_ip,
+    apply_sdxl_adapters_with, decode_image, denoise, denoise_control, denoise_curated, denoise_ip,
     denoise_ip_control, encode_init_latents, load_unet_kolors_dtype, load_vae,
     preprocess_control_image, Autoencoder, ControlContext, ControlNet, Denoiser, IpImageEncoder,
     LoraCoverage, SdxlLoraReport, UNet2DConditionModel,
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
-use crate::sampler::KolorsEulerSampler;
+use crate::sampler::{KolorsEulerSampler, NUM_TRAIN_TIMESTEPS};
 use crate::tokenizer::KolorsTokenizer;
 
 /// VAE spatial downscale (latent is image/8 per side).
@@ -299,6 +303,83 @@ impl Kolors {
             cfg,
             cancel,
             on_progress,
+        )
+    }
+
+    /// Curated unified-sampler denoise (epic 7114, sc-7121) — the **additive** k-diffusion alternative
+    /// to the native leading-Euler default, for txt2img + img2img. Drives any curated solver over a
+    /// `DiscreteModelSampling` (the Kolors ε/DDPM schedule: `scaled_linear` betas over
+    /// `NUM_TRAIN_TIMESTEPS=1100`) and an [`mlx_gen::Scheduler`]-built σ schedule, through the shared
+    /// `mlx_gen_sdxl::denoise_curated`. The native `euler_discrete` default is left untouched (N1).
+    ///
+    /// `init_latents` is `Some` for img2img (the scaled VAE mean), `None` for txt2img. The latents live
+    /// in raw k-diffusion σ-space: txt2img seeds `ε·σ_max`; img2img runs the strength-tail of the
+    /// schedule, seeded `x₀ + ε·σ_start`. The ControlNet / IP-Adapter combined-pose tier (sc-5012) is
+    /// NOT routed here — it stays on the tuned native euler_discrete (the registry guards it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_curated_latents(
+        &self,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        init_latents: Option<&Array>,
+        noise: &Array,
+        pos: &(Array, Array),
+        neg: &(Array, Array),
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        use mlx_rs::ops::{add, concatenate_axis, multiply};
+        // Kolors DDPM schedule: `scaled_linear` betas (β₀=0.00085, β₁=0.014) over 1100 train timesteps
+        // — the same `EulerDiscreteScheduler` config the native sampler interpolates, here as the
+        // discrete `ModelSampling` the curated solvers integrate over (ε-prediction, σ_data = 1).
+        let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, 0.00085, 0.014)?;
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let scheduler = scheduler_name
+            .and_then(Scheduler::from_name)
+            .unwrap_or(Scheduler::Normal);
+        let full_sigmas = schedule_sigmas(scheduler, &ms, num_steps);
+        let noise = noise.as_dtype(Dtype::Float32)?;
+        let (run_sigmas, init) = if let Some(x0) = init_latents {
+            let strength = strength.clamp(0.0, 1.0);
+            let eff = (num_steps as f32 * strength) as usize;
+            let run_start = full_sigmas.len().saturating_sub(1).saturating_sub(eff);
+            let rs = full_sigmas[run_start..].to_vec();
+            let init = add(
+                &x0.as_dtype(Dtype::Float32)?,
+                &multiply(&noise, scalar(rs[0]))?,
+            )?;
+            (rs, init)
+        } else {
+            (
+                full_sigmas.clone(),
+                multiply(&noise, scalar(full_sigmas[0]))?,
+            )
+        };
+        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
+        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
+        let time_ids = kolors_time_ids(2, height, width);
+        denoise_curated(
+            &self.unet,
+            sampler_name,
+            &ms,
+            &run_sigmas,
+            init,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            cfg,
+            seed,
+            cancel,
+            on_progress,
+            &[],
+            None,
+            None,
         )
     }
 
