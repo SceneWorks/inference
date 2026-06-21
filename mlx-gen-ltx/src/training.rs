@@ -729,7 +729,9 @@ fn compute_loss_grads(
                 .map_err(|e| Exception::custom(e.to_string()))?,
             None => {
                 install_train_lora(dit, &p, targets, alpha, rank, lora_dtype)?;
-                dit.forward(&x_t, &timestep, &ctx, None, &pos)
+                // `None`: content-keyed RoPE memo (the per-stage epoch fast path is inference-only;
+                // training positions are constant within a step, so the content compare hits — sc-7141).
+                dit.forward(&x_t, &timestep, &ctx, None, &pos, None)
                     .map_err(|e| Exception::custom(e.to_string()))?
             }
         };

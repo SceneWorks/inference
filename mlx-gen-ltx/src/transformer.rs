@@ -965,27 +965,46 @@ impl AdaLayerNormSingle {
     }
 }
 
-/// The LTX-2.3 video DiT: preprocessor + 48 blocks + output projection. Predicts velocity.
-/// Memoizes a SPLIT-RoPE `(cos, sin)` table pair keyed on the `positions` content (F-048). The tables
-/// depend only on `positions` (+ the model's fixed dims), which are **constant across every denoise
-/// step of a stage**, so the expensive single-threaded f64 host trig in [`precompute_split_freqs_cis`]
-/// runs once per stage instead of once per step. Bit-identical: the recomputed tables are byte-equal,
-/// so a cache hit returns exactly what a recompute would. Inference is one job per thread (like the
-/// LoRA-pass [`Cell`]), so a [`RefCell`] is sufficient.
+/// Per-stage cache for a SPLIT-RoPE `(cos, sin)` table pair (F-048). The tables depend only on
+/// `positions` (+ the model's fixed dims), which are **constant across every denoise step of a
+/// stage**, so the expensive single-threaded f64 host trig in [`precompute_split_freqs_cis`] runs
+/// once per stage instead of once per step. A cache hit returns byte-equal tables (exactly what a
+/// recompute would produce), so the memo stays bit-identical.
+///
+/// Cache key (sc-7141): the caller's per-stage **epoch** token when supplied
+/// ([`LtxDiT::next_rope_epoch`] / [`AvDiT::next_rope_epoch`], bumped once per denoise loop) — an O(1),
+/// collision-free identity that replaces the old per-step `positions.as_slice().to_vec()` (a ~1.4 MB
+/// host copy + element compare *every* step, ×4 on the AV path). A fresh epoch is never reused for a
+/// different `positions`, so a stale hit is impossible — no lossy hash. With no epoch (`None`: the
+/// trainer / direct callers) it falls back to the old positions-content compare, byte-for-byte
+/// unchanged. Inference is one job per thread (like the LoRA-pass [`Cell`]), so a [`RefCell`] suffices.
 #[derive(Default)]
 struct RopeMemo {
-    cached: RefCell<Option<(Vec<f32>, Array, Array)>>,
+    cached: RefCell<Option<(RopeKey, Array, Array)>>,
+}
+
+/// [`RopeMemo`] cache key: the per-stage epoch (fast path) or the `positions` content (fallback). The
+/// two variants never compare equal, so a memo shared between keyed and fallback callers stays correct.
+#[derive(PartialEq)]
+enum RopeKey {
+    Epoch(u64),
+    Content(Vec<f32>),
 }
 
 impl RopeMemo {
-    /// Return the cached `(cos, sin)` if `positions` is unchanged since the last call, else run
-    /// `compute`, cache, and return it. The key is the positions content (small relative to the trig).
+    /// Return the cached `(cos, sin)` if the key is unchanged since the last call, else run `compute`,
+    /// cache, and return it. `epoch` is the caller's per-stage token: `Some(e)` keys on the epoch (the
+    /// O(1) fast path, no host copy); `None` keys on the `positions` content (the unchanged fallback).
     fn get_or_compute(
         &self,
         positions: &Array,
+        epoch: Option<u64>,
         compute: impl FnOnce() -> Result<(Array, Array)>,
     ) -> Result<(Array, Array)> {
-        let key: Vec<f32> = positions.as_slice::<f32>().to_vec();
+        let key = match epoch {
+            Some(e) => RopeKey::Epoch(e),
+            None => RopeKey::Content(positions.as_slice::<f32>().to_vec()),
+        };
         if let Some((k, cos, sin)) = self.cached.borrow().as_ref() {
             if *k == key {
                 return Ok((cos.clone(), sin.clone()));
@@ -1019,6 +1038,8 @@ pub struct LtxDiT {
     prec: Precision,
     /// Per-stage SPLIT-RoPE table cache (F-048): the tables are constant across denoise steps.
     rope_memo: RopeMemo,
+    /// Monotonic source of per-stage RoPE epoch tokens (sc-7141); see [`Self::next_rope_epoch`].
+    rope_epoch: Cell<u64>,
 }
 
 impl LtxDiT {
@@ -1040,7 +1061,19 @@ impl LtxDiT {
             cfg: cfg.clone(),
             prec,
             rope_memo: RopeMemo::default(),
+            rope_epoch: Cell::new(0),
         })
+    }
+
+    /// Issue a fresh per-stage RoPE epoch token (sc-7141). Call once at the top of a denoise loop and
+    /// pass the returned token as `Some(epoch)` to every [`Self::forward`] in that loop: the per-stage
+    /// SPLIT-RoPE tables then compute on the first step and hit the [`RopeMemo`] for the rest. The
+    /// counter is monotonic and never reused, so a later stage's token can't collide with an earlier
+    /// stage's cached tables (which would silently corrupt RoPE).
+    pub fn next_rope_epoch(&self) -> u64 {
+        let e = self.rope_epoch.get();
+        self.rope_epoch.set(e.wrapping_add(1));
+        e
     }
 
     /// Resolve a LoRA target (diffusers/peft dotted path, post LTX key normalization) to its
@@ -1126,6 +1159,7 @@ impl LtxDiT {
         timestep: &Array,
         context: &Array,
         positions: &Array,
+        rope_epoch: Option<u64>,
     ) -> Result<Preprocessed> {
         let dt = self.prec.dtype();
         let b = latent.shape()[0];
@@ -1164,8 +1198,9 @@ impl LtxDiT {
         let context = context.as_dtype(dt)?;
 
         // SPLIT RoPE from the position grid (f32 tables; the block casts per input dtype). Cached on
-        // `positions` — constant across the stage's denoise steps, so computed once not per step (F-048).
-        let (cos, sin) = self.rope_memo.get_or_compute(positions, || {
+        // the per-stage `rope_epoch` (or `positions` content when `None`) — constant across the stage's
+        // denoise steps, so computed once not per step (F-048 / sc-7141).
+        let (cos, sin) = self.rope_memo.get_or_compute(positions, rope_epoch, || {
             precompute_split_freqs_cis(
                 positions,
                 inner,
@@ -1192,6 +1227,10 @@ impl LtxDiT {
     /// * `timestep` — `(B, 1)` (or `(B,)`) per-sample sigma (T2V; broadcast over tokens).
     /// * `context` — `(B, ctx, inner)` text embeddings (connector output); `mask` its additive mask.
     /// * `positions` — `(B, 3, S, 2)` position grid (from [`crate::positions`]).
+    /// * `rope_epoch` — per-stage RoPE cache token (sc-7141): `Some(epoch)` from a denoise loop (see
+    ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path; `None` falls back to the
+    ///   `positions`-content compare (trainer / direct callers, behavior unchanged).
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         latent: &Array,
@@ -1199,8 +1238,9 @@ impl LtxDiT {
         context: &Array,
         mask: Option<&Array>,
         positions: &Array,
+        rope_epoch: Option<u64>,
     ) -> Result<Array> {
-        let p = self.preprocess(latent, timestep, context, positions)?;
+        let p = self.preprocess(latent, timestep, context, positions, rope_epoch)?;
         let mut h = p.x;
         for block in &self.blocks {
             h = block.forward(
@@ -1240,7 +1280,10 @@ impl LtxDiT {
         block_targets: &[Vec<BlockLoraRef>],
         alpha: f32,
     ) -> Result<Array> {
-        let p = self.preprocess(latent, timestep, context, positions)?;
+        // `None`: content-keyed memo. Training positions are constant within a step (incl. the
+        // checkpoint recompute), so the content compare hits; a per-step epoch would need threading
+        // through the checkpoint closure for no inference benefit (sc-7141).
+        let p = self.preprocess(latent, timestep, context, positions, None)?;
         let mut h = p.x;
         for (i, block) in self.blocks.iter().enumerate() {
             // Cheap clone (Arrays are refcounted): the closure must OWN its state because the backward
@@ -1337,7 +1380,7 @@ impl LtxDiT {
         positions: &Array,
         n: usize,
     ) -> Result<Array> {
-        let p = self.preprocess(latent, timestep, context, positions)?;
+        let p = self.preprocess(latent, timestep, context, positions, None)?; // diagnostic: content-keyed
         let mut h = p.x;
         for block in self.blocks.iter().take(n) {
             h = block.forward(
@@ -1484,6 +1527,7 @@ impl Stream {
         timestep: &Array,
         context: &Array,
         positions: &Array,
+        rope_epoch: Option<u64>,
     ) -> Result<StreamPrep> {
         let dt = self.prec.dtype();
         let b = latent.shape()[0];
@@ -1523,21 +1567,32 @@ impl Stream {
         let context = context.as_dtype(dt)?;
 
         // Self-attention SPLIT RoPE (modality inner dim, modality max_pos). Both tables are constant
-        // across the stage's denoise steps, so cache them on `positions` (computed once, not per
-        // step — F-048; the cross table's `time_axis(positions)` is derived from the same key).
-        let (cos, sin) = self.self_rope_memo.get_or_compute(positions, || {
-            precompute_split_freqs_cis(positions, inner, self.theta, &self.self_max_pos, self.heads)
-        })?;
+        // across the stage's denoise steps, so cache them on the per-stage `rope_epoch` (or `positions`
+        // content when `None`) — computed once, not per step (F-048 / sc-7141; the cross table's
+        // `time_axis(positions)` is derived from the same key).
+        let (cos, sin) = self
+            .self_rope_memo
+            .get_or_compute(positions, rope_epoch, || {
+                precompute_split_freqs_cis(
+                    positions,
+                    inner,
+                    self.theta,
+                    &self.self_max_pos,
+                    self.heads,
+                )
+            })?;
         // Cross-modal SPLIT RoPE: the time axis only, at the cross inner dim (2048) / cross max_pos.
-        let (cross_cos, cross_sin) = self.cross_rope_memo.get_or_compute(positions, || {
-            precompute_split_freqs_cis(
-                &time_axis(positions)?,
-                self.cross_inner,
-                self.theta,
-                &[self.cross_max_pos],
-                self.heads,
-            )
-        })?;
+        let (cross_cos, cross_sin) =
+            self.cross_rope_memo
+                .get_or_compute(positions, rope_epoch, || {
+                    precompute_split_freqs_cis(
+                        &time_axis(positions)?,
+                        self.cross_inner,
+                        self.theta,
+                        &[self.cross_max_pos],
+                        self.heads,
+                    )
+                })?;
 
         Ok(StreamPrep {
             x,
@@ -1817,6 +1872,10 @@ pub struct AvDiT {
     video: Stream,
     audio: Stream,
     blocks: Vec<AvBlock>,
+    /// Monotonic source of per-stage RoPE epoch tokens (sc-7141); see [`Self::next_rope_epoch`]. One
+    /// counter for the whole joint DiT — the same token keys all four stream memos (video/audio ×
+    /// self/cross), which are each constant across a stage's denoise steps.
+    rope_epoch: Cell<u64>,
 }
 
 impl AvDiT {
@@ -1880,7 +1939,18 @@ impl AvDiT {
             video,
             audio,
             blocks,
+            rope_epoch: Cell::new(0),
         })
+    }
+
+    /// Issue a fresh per-stage RoPE epoch token (sc-7141). Call once at the top of a joint denoise loop
+    /// and pass the returned token as `Some(epoch)` to every [`Self::forward`] in that loop, so all four
+    /// stream RoPE tables compute on the first step and hit the [`RopeMemo`]s for the rest. Monotonic
+    /// and never reused, so a later stage can't collide with an earlier stage's cached tables.
+    pub fn next_rope_epoch(&self) -> u64 {
+        let e = self.rope_epoch.get();
+        self.rope_epoch.set(e.wrapping_add(1));
+        e
     }
 
     /// Resolve a LoRA target (diffusers/peft dotted path, post LTX key normalization) to its
@@ -1941,6 +2011,10 @@ impl AvDiT {
     /// * `*_positions` — the position grids (video `(B,3,T,2)`, audio `(B,1,T,2)`).
     ///
     /// Returns `(video_velocity (B, S_v, 128), audio_velocity (B, S_a, 128))`.
+    ///
+    /// * `rope_epoch` — per-stage RoPE cache token (sc-7141): `Some(epoch)` from a denoise loop (see
+    ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path for all four stream tables; `None`
+    ///   falls back to the `positions`-content compare (behavior unchanged).
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -1954,13 +2028,22 @@ impl AvDiT {
         audio_context: &Array,
         audio_mask: Option<&Array>,
         audio_positions: &Array,
+        rope_epoch: Option<u64>,
     ) -> Result<(Array, Array)> {
-        let vp =
-            self.video
-                .prepare(video_latent, video_timestep, video_context, video_positions)?;
-        let ap =
-            self.audio
-                .prepare(audio_latent, audio_timestep, audio_context, audio_positions)?;
+        let vp = self.video.prepare(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_positions,
+            rope_epoch,
+        )?;
+        let ap = self.audio.prepare(
+            audio_latent,
+            audio_timestep,
+            audio_context,
+            audio_positions,
+            rope_epoch,
+        )?;
         let (mut vx, mut ax) = (vp.x.clone(), ap.x.clone());
         let (va, aa) = (vp.args(video_mask), ap.args(audio_mask));
         for block in &self.blocks {
@@ -2005,9 +2088,9 @@ mod tests {
     }
 
     #[test]
-    fn rope_memo_caches_on_positions_and_recomputes_on_change() {
-        // F-048: the per-stage RoPE tables are recomputed only when `positions` changes. A constant
-        // positions (every denoise step) hits the cache; a new positions (next stage) recomputes.
+    fn rope_memo_content_path_caches_and_recomputes_on_change() {
+        // F-048: the `None` (content) path recomputes the per-stage RoPE tables only when `positions`
+        // changes. A constant positions (every denoise step) hits the cache; a new positions recomputes.
         let memo = RopeMemo::default();
         let calls = std::cell::Cell::new(0);
         let compute = |tag: f32| {
@@ -2023,14 +2106,14 @@ mod tests {
         let pos_b = Array::from_slice(&[9.0f32, 1.0, 2.0, 3.0], &[1, 1, 2, 2]); // different
 
         let (c0, _) = memo
-            .get_or_compute(&pos_a, || {
+            .get_or_compute(&pos_a, None, || {
                 calls.set(calls.get() + 1);
                 Ok(compute(10.0))
             })
             .unwrap();
         // Same positions content → cache hit, compute not re-run, identical table returned.
         let (c1, _) = memo
-            .get_or_compute(&pos_a2, || {
+            .get_or_compute(&pos_a2, None, || {
                 calls.set(calls.get() + 1);
                 Ok(compute(99.0)) // would differ if (wrongly) recomputed
             })
@@ -2040,13 +2123,71 @@ mod tests {
 
         // Different positions → recompute.
         let (c2, _) = memo
-            .get_or_compute(&pos_b, || {
+            .get_or_compute(&pos_b, None, || {
                 calls.set(calls.get() + 1);
                 Ok(compute(20.0))
             })
             .unwrap();
         assert_eq!(calls.get(), 2, "changed positions must recompute");
         assert_eq!(c2.as_slice::<f32>(), &[20.0, 21.0]);
+    }
+
+    #[test]
+    fn rope_memo_epoch_path_keys_on_epoch_not_positions() {
+        // sc-7141: with `Some(epoch)` the memo keys on the epoch token, NOT the positions content. The
+        // same epoch hits even if positions content differs (the caller guarantees epoch↔positions is
+        // 1:1, so this can't happen in practice — it proves the key is the epoch); a new epoch recomputes.
+        let memo = RopeMemo::default();
+        let calls = std::cell::Cell::new(0);
+        let compute = |tag: f32| {
+            (
+                Array::from_slice(&[tag, tag + 1.0], &[2]),
+                Array::from_slice(&[tag + 2.0, tag + 3.0], &[2]),
+            )
+        };
+        let pos_a = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0], &[1, 1, 2, 2]);
+        let pos_b = Array::from_slice(&[9.0f32, 1.0, 2.0, 3.0], &[1, 1, 2, 2]); // different content
+
+        // Epoch 0 computes and caches.
+        let (c0, _) = memo
+            .get_or_compute(&pos_a, Some(0), || {
+                calls.set(calls.get() + 1);
+                Ok(compute(10.0))
+            })
+            .unwrap();
+        // Same epoch → hit, even though positions content differs (proves the key is the epoch, O(1),
+        // no positions copy). Returns the epoch-0 table.
+        let (c1, _) = memo
+            .get_or_compute(&pos_b, Some(0), || {
+                calls.set(calls.get() + 1);
+                Ok(compute(99.0))
+            })
+            .unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "same epoch must hit regardless of positions"
+        );
+        assert_eq!(c0.as_slice::<f32>(), c1.as_slice::<f32>());
+
+        // New epoch (next stage) → recompute, even with the same positions as epoch 0.
+        let (c2, _) = memo
+            .get_or_compute(&pos_a, Some(1), || {
+                calls.set(calls.get() + 1);
+                Ok(compute(20.0))
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 2, "changed epoch must recompute");
+        assert_eq!(c2.as_slice::<f32>(), &[20.0, 21.0]);
+
+        // Switching from `Some` to `None` is a key-variant change → recompute (never a false hit).
+        let (_c3, _) = memo
+            .get_or_compute(&pos_a, None, || {
+                calls.set(calls.get() + 1);
+                Ok(compute(30.0))
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 3, "epoch→content key change must recompute");
     }
 
     #[test]

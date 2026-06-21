@@ -119,7 +119,7 @@ fn ltx_video_per_step_compiled_vs_eager() {
             mlx_rs::transforms::eval([&latent, &ts, &context, &positions]).unwrap();
 
             let run = || {
-                dit.forward(&latent, &ts, &context, None, &positions)
+                dit.forward(&latent, &ts, &context, None, &positions, None)
                     .unwrap()
             };
 
@@ -203,6 +203,7 @@ fn ltx_av_compiled_vs_eager() {
             g.require("audio_context").unwrap(),
             None,
             g.require("audio_positions").unwrap(),
+            None,
         )
         .expect("av dit forward")
     };
