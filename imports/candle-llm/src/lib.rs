@@ -24,6 +24,7 @@ pub mod config;
 pub mod decode;
 pub mod device;
 pub mod error;
+pub mod gguf;
 pub mod models;
 pub mod primitives;
 pub mod provider;
