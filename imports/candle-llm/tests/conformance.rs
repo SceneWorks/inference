@@ -3,7 +3,19 @@
 //!
 //! Builds a tiny synthetic snapshot (no model weights needed, runs in CI) whose vocabulary is fully
 //! covered by the tokenizer, so the suite's seed-determinism check sees genuinely distinct text for
-//! distinct seeds. A separate gated test runs the suite against a real model.
+//! distinct seeds. Separate gated tests run the same suite against real models — a Llama snapshot
+//! (`CANDLE_LLM_TEST_MODEL`), a **Qwen3** snapshot (`CANDLE_LLM_QWEN3_MODEL`, exercising per-head q/k
+//! RMSNorm + head_dim 128), **quantize-on-load** (Q8_0 on the Llama snapshot; Q4_K on Qwen3, whose
+//! dims are 256-aligned for the Q4_K block size), and a **GGUF** checkpoint (`CANDLE_LLM_GGUF`). Story
+//! 7264 broadens this coverage beyond the SmolLM2/Llama baseline validated in 7237.
+//!
+//! ```text
+//! # On CUDA (the Windows target); drop `--features cuda` for the CPU path.
+//! CANDLE_LLM_TEST_MODEL=/path/Llama-snapshot \
+//! CANDLE_LLM_QWEN3_MODEL=/path/Qwen3-0.6B \
+//! CANDLE_LLM_GGUF=/path/Model-Q4_K_M.gguf \
+//!   cargo test --features cuda --test conformance -- --ignored --nocapture
+//! ```
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,7 +25,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_llm::primitives::sampler::{SplitMix64, TokenRng};
 use candle_llm::provider::PROVIDER_ID;
 use candle_llm::LlamaProvider;
-use core_llm::LoadSpec;
+use core_llm::{LoadSpec, Quantize};
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 
 const VOCAB: usize = 32;
@@ -107,6 +119,74 @@ fn real_model_passes_core_llm_conformance() {
     let spec = LoadSpec::dense(dir);
     textllm_conformance(
         || Box::new(LlamaProvider::load(&spec).expect("load real provider")),
+        &TextLlmProfile::cheap(),
+    );
+}
+
+/// The full conformance suite on a **Qwen3** snapshot (per-head q/k RMSNorm, head_dim 128, tied
+/// embeddings) — proves the BYO architecture dispatch holds up under the contract, not just Llama.
+#[test]
+#[ignore = "needs a Qwen3 snapshot via CANDLE_LLM_QWEN3_MODEL"]
+fn qwen3_passes_core_llm_conformance() {
+    let dir = std::env::var("CANDLE_LLM_QWEN3_MODEL").expect("set CANDLE_LLM_QWEN3_MODEL");
+    let spec = LoadSpec::dense(dir);
+    textllm_conformance(
+        || Box::new(LlamaProvider::load(&spec).expect("load qwen3 provider")),
+        &TextLlmProfile::cheap(),
+    );
+}
+
+/// Run the full conformance suite against a quantize-on-load model. Quantized providers must satisfy
+/// every contract guarantee (streaming, cancel, seed-determinism, …), not merely load.
+fn run_quantized_conformance(env_var: &str, quant: Quantize) {
+    let Ok(dir) = std::env::var(env_var) else {
+        eprintln!("skip: set {env_var}");
+        return;
+    };
+    let spec = LoadSpec {
+        source: dir,
+        quantize: Some(quant),
+    };
+    textllm_conformance(
+        || {
+            let p = LlamaProvider::load(&spec).expect("load quantized provider");
+            assert!(
+                p.is_quantized(),
+                "{quant:?}: provider must report quantized"
+            );
+            Box::new(p)
+        },
+        &TextLlmProfile::cheap(),
+    );
+}
+
+/// Conformance on a **Q8_0 quantize-on-load** (block size 32 — broadly applicable; the Llama snapshot
+/// suffices). Run against `CANDLE_LLM_TEST_MODEL`.
+#[test]
+#[ignore = "needs a Llama snapshot via CANDLE_LLM_TEST_MODEL (Q8 quantize-on-load)"]
+fn quantized_q8_passes_core_llm_conformance() {
+    run_quantized_conformance("CANDLE_LLM_TEST_MODEL", Quantize::Q8);
+}
+
+/// Conformance on a **Q4_K quantize-on-load**. Q4_K's block size is 256, so the projection `in`-dims
+/// must be multiples of 256 — true of Qwen3 (hidden 1024) but not of SmolLM2 (hidden 576). Run
+/// against `CANDLE_LLM_QWEN3_MODEL`, whose dims are 256-aligned.
+#[test]
+#[ignore = "needs a Qwen3 snapshot via CANDLE_LLM_QWEN3_MODEL (Q4 quantize-on-load; dims must be 256-aligned)"]
+fn quantized_q4_passes_core_llm_conformance() {
+    run_quantized_conformance("CANDLE_LLM_QWEN3_MODEL", Quantize::Q4);
+}
+
+/// The full conformance suite on a **GGUF** checkpoint loaded directly (story 7254) — proves the GGUF
+/// load path produces a contract-conformant provider end-to-end (tokenizer from sibling/metadata,
+/// stop tokens, chat template, streaming, …).
+#[test]
+#[ignore = "needs a GGUF via CANDLE_LLM_GGUF"]
+fn gguf_passes_core_llm_conformance() {
+    let gguf = std::env::var("CANDLE_LLM_GGUF").expect("set CANDLE_LLM_GGUF");
+    let spec = LoadSpec::dense(gguf);
+    textllm_conformance(
+        || Box::new(LlamaProvider::load(&spec).expect("load gguf provider")),
         &TextLlmProfile::cheap(),
     );
 }

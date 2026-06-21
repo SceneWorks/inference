@@ -27,6 +27,40 @@ Built bottom-up, mirroring `mlx-llm`'s structure on Candle tensors:
 
 Compute runs in `bf16` on the GPU backends and `f32` on CPU.
 
+## Testing
+
+Unit tests + the synthetic conformance run need no models and no GPU:
+
+```sh
+cargo test                       # CPU, no weights
+cargo clippy --all-targets -- -D warnings
+```
+
+The real-weights checks are `#[ignore]`d and gated on environment variables pointing at on-disk
+snapshots; run them with `-- --ignored` (add `--features cuda` for the GPU path). They cover the
+full `core-llm-testkit` conformance suite across architectures and load formats, plus per-feature
+parity tests:
+
+| env var | points at | exercised by |
+|---|---|---|
+| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode |
+| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128) |
+| `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load |
+
+> Q4_K's block size is 256, so Q4 quantize-on-load needs projection `in`-dims that are multiples of
+> 256 (true of Qwen3's hidden 1024, not of SmolLM2's 576); Q8_0's block is 32 and applies broadly.
+
+```sh
+# Whole real-weights suite on CUDA:
+CANDLE_LLM_TEST_MODEL=/path/SmolLM2-135M-Instruct \
+CANDLE_LLM_QWEN3_MODEL=/path/Qwen3-0.6B \
+CANDLE_LLM_GGUF=/path/Model-Q4_K_M.gguf \
+  cargo test --features cuda -- --ignored --nocapture
+```
+
+On Windows/CUDA the build needs the VS dev environment (`vcvars64` + `CUDA_COMPUTE_CAP`); see the
+helper `.bat` scripts under the workspace root.
+
 ## Status
 
 Work in progress (epic 7153, story 7237). Not yet published.
