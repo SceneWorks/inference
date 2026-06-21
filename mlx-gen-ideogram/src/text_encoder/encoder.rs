@@ -6,8 +6,7 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
-use mlx_gen::array::host_i32;
-use mlx_gen::nn::{TextRope, TokenEmbedding};
+use mlx_gen::nn::{build_mask, TextRope, TokenEmbedding};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -108,23 +107,4 @@ impl Ideogram4TextEncoder {
         let sh = stacked.shape();
         Ok(stacked.reshape(&[sh[0], sh[1], sh[2] * sh[3]])?)
     }
-}
-
-/// Additive attention mask `[b, 1, s, s]`: `0` where a query may attend (key is causal **and**
-/// not padding), `-inf` otherwise. Built host-side (one-time `O(b·s²)` fill per encode).
-fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
-    let am = host_i32(attention_mask)?;
-    let (b, s) = (b as usize, s as usize);
-    let mut data = vec![0f32; b * s * s];
-    for bi in 0..b {
-        for i in 0..s {
-            for j in 0..s {
-                let allowed = j <= i && am[bi * s + j] == 1;
-                if !allowed {
-                    data[(bi * s + i) * s + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-    }
-    Ok(Array::from_slice(&data, &[b as i32, 1, s as i32, s as i32]))
 }

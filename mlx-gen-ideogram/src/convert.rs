@@ -7,46 +7,12 @@
 //! source. The two DiTs + the Qwen3-VL text encoder are packed; the small VAE / tokenizer /
 //! scheduler pass through dense.
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_gen::weights::Weights;
+use mlx_gen::quant::{load_dir_map, quantize_map, save_map};
 use mlx_gen::Result;
-use mlx_rs::ops::quantize;
-use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
 
 use crate::quant::GROUP_SIZE;
-
-/// Pack every `is_target` `{base}.weight` (group-quantizable 2-D, `in % gs == 0`) into the triple
-/// `{base}.weight` (u32 codes) + `.scales` + `.biases` — the weight cast to bf16 first so the pack
-/// is byte-identical to the load-time quantize (and the fork's `nn.quantize(bf16)`). Every other
-/// tensor (norms, 1-D, non-divisible, non-target) passes through unchanged.
-fn quantize_map(
-    map: HashMap<String, Array>,
-    bits: i32,
-    group_size: i32,
-    is_target: impl Fn(&str) -> bool,
-) -> Result<HashMap<String, Array>> {
-    let mut out = HashMap::with_capacity(map.len());
-    for (k, v) in map {
-        let base = k.strip_suffix(".weight").filter(|b| is_target(b));
-        let packable = base.is_some()
-            && v.shape().len() == 2
-            && v.shape()[1] % group_size == 0
-            && v.shape()[1] >= group_size;
-        if let (Some(base), true) = (base, packable) {
-            let wbf16 = v.as_dtype(Dtype::Bfloat16)?;
-            let (wq, scales, biases) = quantize(&wbf16, group_size, bits)?;
-            out.insert(format!("{base}.weight"), wq);
-            out.insert(format!("{base}.scales"), scales);
-            out.insert(format!("{base}.biases"), biases);
-        } else {
-            out.insert(k, v);
-        }
-    }
-    Ok(out)
-}
 
 /// DiT pack target: every Linear. The tiny `embed_image_indicator` table (2-D) is name-excluded so
 /// it stays a dense [`TokenEmbedding`](mlx_gen::nn::TokenEmbedding); the norms are 1-D and auto-skip.
@@ -59,30 +25,6 @@ fn is_dit_target(base: &str) -> bool {
 /// clarity.
 fn is_te_target(base: &str) -> bool {
     !base.contains("norm")
-}
-
-/// Read every tensor of `dir` (possibly sharded safetensors) into an owned key→`Array` map (MLX
-/// arrays are ref-counted, so the clone is a handle copy, not a buffer copy).
-fn load_dir_map(dir: &Path) -> Result<HashMap<String, Array>> {
-    let w = Weights::from_dir(dir)?;
-    Ok(w.keys()
-        .map(|k| (k.to_string(), w.get(k).expect("listed key").clone()))
-        .collect())
-}
-
-/// Materialize + write a key→`Array` map to a single `path` safetensors (one file — a packed Q4
-/// component is small enough not to need sharding).
-fn save_map(path: &Path, map: &HashMap<String, Array>) -> Result<()> {
-    eval(map.values().collect::<Vec<_>>())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Array::save_safetensors(
-        map.iter().map(|(k, v)| (k.as_str(), v)),
-        None::<&HashMap<String, String>>,
-        path,
-    )?;
-    Ok(())
 }
 
 /// Pre-quantize one DiT component dir (`transformer` or `unconditional_transformer`) → a packed

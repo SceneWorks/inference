@@ -133,35 +133,7 @@ pub fn check_captioner_progress(
     })
     .map_err(|e| format!("progress[{id}]: caption() failed on the cheap request: {e}"))?;
 
-    if steps.is_empty() {
-        return Err(format!(
-            "progress[{id}]: caption() emitted no Progress::Step events"
-        ));
-    }
-    let total = steps[0].1;
-    if total == 0 {
-        return Err(format!("progress[{id}]: Progress::Step.total was 0"));
-    }
-    let mut prev = 0u32;
-    for &(current, t) in &steps {
-        if t != total {
-            return Err(format!(
-                "progress[{id}]: Step.total changed mid-run ({total} then {t})"
-            ));
-        }
-        if current < 1 || current > total {
-            return Err(format!(
-                "progress[{id}]: Step.current {current} out of range 1..={total}"
-            ));
-        }
-        if current <= prev {
-            return Err(format!(
-                "progress[{id}]: Step.current must strictly increase; saw {prev} then {current}"
-            ));
-        }
-        prev = current;
-    }
-    Ok(())
+    crate::check_progress_steps(id, "caption()", &steps)
 }
 
 /// **Cancellation.** A captioner handed an already-cancelled request must return the **typed**

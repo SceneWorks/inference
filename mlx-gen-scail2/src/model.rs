@@ -23,15 +23,15 @@
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
-use mlx_gen::nn::{gelu_exact, gelu_tanh};
-use mlx_gen::weights::Weights;
+use mlx_gen::nn::{gelu_exact, gelu_tanh, silu};
+use mlx_gen::weights::{to_f32, Weights};
 use mlx_gen::{Error, Result};
 use mlx_gen_wan::chunk::{map_seq_chunks, slice_axis0, DitMemoryConfig};
 use mlx_gen_wan::config::WanQuant;
 use mlx_gen_wan::patchify::{patchify, unpatchify};
 use mlx_gen_wan::rope::rope_apply;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, split};
+use mlx_rs::ops::{add, concatenate_axis, multiply, split};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::Scail2Config;
@@ -42,14 +42,7 @@ use crate::rope::ScailRope;
 const IMG_LN_EPS: f32 = 1e-5;
 
 // ---- small dtype/elementwise helpers (f32 islands) ----------------------------------------------
-
-fn to_f32(x: &Array) -> Result<Array> {
-    Ok(x.as_dtype(Dtype::Float32)?)
-}
-
-fn silu(x: &Array) -> Result<Array> {
-    Ok(multiply(x, &sigmoid(x)?)?)
-}
+// `to_f32` (dtype upcast) and `silu` are the shared `mlx_gen::weights::to_f32` / `mlx_gen::nn::silu`.
 
 /// Non-affine LayerNorm — `WanLayerNorm(elementwise_affine=False)`.
 fn ln(x: &Array, eps: f32) -> Result<Array> {

@@ -258,9 +258,8 @@ fn check_shape(w: &Weights, key: &str, expected: &[i32]) -> Result<()> {
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_rs::ops::quantize as mlx_quantize;
-use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_gen::quant::{load_dir_map, quantize_map, save_map};
+use mlx_rs::Array;
 
 use crate::text_encoder::BooguTextEncoderConfig;
 
@@ -383,46 +382,11 @@ fn quantize_targets(
     bits: i32,
     group_size: i32,
 ) -> Result<HashMap<String, Array>> {
-    let mut out = HashMap::with_capacity(map.len());
-    for (k, v) in map {
-        if targets.contains(&k) {
-            let base = k
-                .strip_suffix(".weight")
-                .expect("quant target ends with .weight");
-            let wbf16 = v.as_dtype(Dtype::Bfloat16)?;
-            let (wq, scales, biases) = mlx_quantize(&wbf16, group_size, bits)?;
-            out.insert(format!("{base}.weight"), wq);
-            out.insert(format!("{base}.scales"), scales);
-            out.insert(format!("{base}.biases"), biases);
-        } else {
-            out.insert(k, v);
-        }
-    }
-    Ok(out)
-}
-
-/// Read every tensor of a component dir (all shards) into an owned key→`Array` map (MLX arrays are
-/// ref-counted, so the clone is a handle copy).
-fn load_dir_map(dir: &Path) -> Result<HashMap<String, Array>> {
-    let w = Weights::from_dir(dir)?;
-    Ok(w.keys()
-        .map(|k| (k.to_string(), w.get(k).expect("listed key").clone()))
-        .collect())
-}
-
-/// Materialize + write a key→`Array` map to a single consolidated `.safetensors` (the loader globs
-/// all `*.safetensors` in the dir, so one file replaces the source's shards).
-fn save_map(path: &Path, map: &HashMap<String, Array>) -> Result<()> {
-    eval(map.values().collect::<Vec<_>>())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Array::save_safetensors(
-        map.iter().map(|(k, v)| (k.as_str(), v)),
-        None::<&HashMap<String, String>>,
-        path,
-    )?;
-    Ok(())
+    // The shared packer keyed on the curated target set (its base is the key minus `.weight`); the
+    // packability guard is a no-op for these all-divisible DiT/TE Linears.
+    quantize_map(map, bits, group_size, |base| {
+        targets.contains(&format!("{base}.weight"))
+    })
 }
 
 /// Copy `src_dir/config.json` to `dst_dir/config.json` with a `"quantization": {bits, group_size}`
@@ -536,6 +500,7 @@ pub fn assemble_quantized_snapshot(src_root: &Path, dst_root: &Path, bits: i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::Dtype;
 
     #[test]
     fn expected_key_count_matches_published_base() {

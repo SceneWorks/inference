@@ -34,7 +34,7 @@ use crate::pipeline::{
     preflight_denoise_memory_guard, preprocess_ti2v_image, seq_len, ti2v_blend_init, Expert,
 };
 use crate::scheduler::SolverKind;
-use crate::text_encoder::{load_tokenizer, Umt5Encoder};
+use crate::text_encoder::encode_text_staged;
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;
@@ -284,22 +284,8 @@ impl Wan {
             auto_tiling_budgeted(height as i32, width as i32, gen_frames as i32, true)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
-        let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
-        let (context, context_null) = {
-            let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
-            let enc = Umt5Encoder::from_weights(&w, cfg)?;
-            let context = enc.encode(&tokenizer, &req.prompt)?;
-            let context_null = if cfg_disabled {
-                None
-            } else {
-                Some(enc.encode(&tokenizer, &neg_prompt)?)
-            };
-            match &context_null {
-                Some(cn) => mlx_rs::transforms::eval([&context, cn])?,
-                None => mlx_rs::transforms::eval([&context])?,
-            }
-            (context, context_null)
-        };
+        let (context, context_null) =
+            encode_text_staged(&self.root, cfg, &req.prompt, &neg_prompt, cfg_disabled)?;
 
         // Seeded init noise (f32) — shape matches the reference; exact RNG values differ across the
         // mlx-python/mlx-rs split (expected).
@@ -764,15 +750,11 @@ impl Wan14b {
         )?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
-        let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
-        let (context, context_null) = {
-            let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
-            let enc = Umt5Encoder::from_weights(&w, cfg)?;
-            let context = enc.encode(&tokenizer, &req.prompt)?;
-            let context_null = enc.encode(&tokenizer, &neg_prompt)?;
-            mlx_rs::transforms::eval([&context, &context_null])?;
-            (context, context_null)
-        };
+        // A14B always encodes both prompts (the dual-expert default), so `skip_neg = false`; unwrap
+        // the always-present negative context back to the `Array` the MoE denoise expects.
+        let (context, context_null) =
+            encode_text_staged(&self.root, cfg, &req.prompt, &neg_prompt, false)?;
+        let context_null = context_null.expect("a14b always encodes the negative context");
 
         // Seeded init noise (f32, no batch dim) — matches the reference's `mx.random.normal(shape)`
         // shape; exact seeded-RNG values differ across the mlx-python/mlx-rs split (expected). I2V

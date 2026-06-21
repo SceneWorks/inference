@@ -5,7 +5,7 @@
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{gelu_tanh, silu};
-use mlx_gen::weights::Weights;
+use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
@@ -1030,14 +1030,6 @@ fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLin
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
-}
-
-fn join(prefix: &str, suffix: &str) -> String {
-    if prefix.is_empty() {
-        suffix.to_string()
-    } else {
-        format!("{prefix}.{suffix}")
-    }
 }
 
 // ---- LoRA/LoKr adapter routing (sc-2657) ------------------------------------------------------

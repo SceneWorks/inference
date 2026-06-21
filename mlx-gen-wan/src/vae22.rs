@@ -37,7 +37,9 @@ use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
-use crate::vae_common::{contiguous, scalar, slice_axis, tile_decode_accumulate, FeatCache};
+use crate::vae_common::{
+    contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate, FeatCache,
+};
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
 const CACHE_T: i32 = 2;
@@ -110,15 +112,12 @@ fn repeat_last(x: &Array, repeats: i32) -> Result<Array> {
 
 /// Last `n` frames along the temporal axis (axis 1, channels-last): the reference `x[:, -n:]`.
 fn last_t(x: &Array, n: i32) -> Result<Array> {
-    let t = x.shape()[1];
-    let idx: Vec<i32> = (t - n..t).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[n]), 1)?)
+    last_t_axis(x, n, 1)
 }
 
 /// Temporal slice `x[:, start:end]` (axis 1).
 fn slice_t(x: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
+    slice_axis(x, 1, start, end)
 }
 
 /// vae22 3-D causal conv (channels-last `[B,T,H,W,C]`). Causal time pad = `2·pt` on the LEFT
@@ -199,11 +198,6 @@ fn cached_conv(conv: &CausalConv3d22, x: &Array, cache: &mut FeatCache) -> Resul
     cache.slots[idx] = Some(cache_x);
     cache.idx += 1;
     Ok(y)
-}
-
-fn eval(x: &Array) -> Result<()> {
-    mlx_rs::transforms::eval([x])?;
-    Ok(())
 }
 
 /// `RMS → SiLU → conv(3³) → RMS → SiLU → conv(3³)` + residual (1³ shortcut when channels differ).

@@ -195,7 +195,7 @@ pub fn load_control_transformer_dev(
     // `attn.to_out.0` (`[Linear, Dropout]`), exactly like the base `transformer_blocks.{i}.attn.to_out.0`
     // — rename it to the internal `attn.to_out` the shared `DoubleBlock` loader reads. (`alias` of
     // `.scales`/`.biases` is a no-op for the dense bf16 control checkpoint.)
-    let n_control = (0..cfg.num_double_layers).step_by(2).count();
+    let n_control = cfg.control_layer_places().len();
     for i in 0..n_control {
         for suffix in ["weight", "scales", "biases"] {
             control_weights.alias(
