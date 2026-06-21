@@ -208,35 +208,33 @@ impl LatentOps for MlxLatentOps {
     }
 }
 
-/// Drive a curated gen-core unified [`gen_core::sampling::Sampler`] over a flow-match sigma schedule,
-/// applying the per-step cancel / `eval` / progress contract every mlx-gen image engine needs (epic
-/// 7114 P3, the flow-match cohort adoption seam).
+/// Drive a curated gen-core unified [`gen_core::sampling::Sampler`] over ANY prediction type — the
+/// generalized core behind [`run_flow_sampler`] (epic 7114 P3, the per-engine adoption seam).
 ///
-/// This is the engine-side counterpart to [`MlxLatentOps`]: a flow-match (rectified-flow) engine
-/// hands its DiT forward (as `predict`) plus its native sigma schedule, and any curated solver
-/// (Euler / Heun / DPM++ 2M·SDE / UniPC / ancestral / LCM / DDIM) integrates the latents — replacing
-/// the legacy per-engine [`FlowMatchSampler`] loop with one that can host the multi-eval / multistep
-/// solvers the precomputed-`StepCoeffs` design structurally cannot.
+/// An engine supplies its [`gen_core::sampling::ModelSampling`] (`FlowModelSampling` for the
+/// rectified-flow cohort, `DiscreteModelSampling` for the ε/DDPM cohort — SDXL/Kolors,
+/// `EdmModelSampling` for the v-prediction outliers — SVD), its σ schedule, and its model forward (as
+/// `predict`). The `ModelSampling` recombines the raw model output into a denoised `x0` estimate and
+/// supplies the `c_in` input scaling, so the curated solver (Euler / Heun / DPM++ 2M·SDE / UniPC /
+/// ancestral / LCM / DDIM) never sees the prediction type — it integrates `x0` in k-diffusion sigma
+/// space regardless. This is what lets one solver library serve flow, EPS, and EDM engines alike.
 ///
-/// - `sampler_name`: the canonical curated solver name. Unknown / `None` / a non-solver alias (the
-///   acceleration *profiles* `flow_match` / `hyper` / `lightning`, which change the schedule, not the
-///   integrator) falls back to plain Euler (N3 — never hard-fail a generation over a sampling knob,
-///   and `euler` over FLOW reproduces the legacy [`FlowMatchSampler`] within the N1 parity tolerance).
-/// - `conv`: the engine's timestep convention (FLUX / Qwen / Chroma feed the raw sigma →
-///   [`TimestepConvention::Sigma`]; the Z-Image-style DiTs feed `1 − σ` →
-///   [`TimestepConvention::OneMinusSigma`]).
+/// - `sampler_name`: the canonical curated solver name. Unknown / `None` / a non-solver alias falls
+///   back to plain Euler (N3 — never hard-fail a generation over a sampling knob).
+/// - `ms`: the engine's prediction-type + noise-schedule contract.
 /// - `sigmas`: the descending schedule, length `num_steps + 1`, trailing `0.0`.
-/// - `predict(x_in, timestep)`: the engine's DiT forward returning the RAW (already CFG-combined)
-///   velocity. `x_in` is the model-input-scaled latent (identity for FLOW) and `timestep` is the
-///   conditioning value the model embeds.
+/// - `predict(x_in, timestep)`: the engine's model forward returning the RAW (already CFG-combined)
+///   output the prediction type expects — velocity for FLOW, ε for EPS, v for V. `x_in` is the
+///   `c_in`-scaled latent ([`ModelSampling::input_scale`]; identity for FLOW) and `timestep` is the
+///   conditioning value the model embeds at this σ ([`ModelSampling::timestep`]).
 ///
 /// Cancellation, the per-step `eval` (so a mid-render cancel lands within ~1 model eval instead of at
 /// VAE decode, and peak graph memory stays bounded — the sc-5399 rationale), and progress all route
 /// through the `denoise` callback, the sole per-eval hook the callback-form `Sampler` exposes.
 #[allow(clippy::too_many_arguments)]
-pub fn run_flow_sampler(
+pub fn run_curated_sampler(
     sampler_name: Option<&str>,
-    conv: TimestepConvention,
+    ms: &dyn gen_core::sampling::ModelSampling,
     sigmas: &[f32],
     latents: Array,
     seed: u64,
@@ -244,12 +242,9 @@ pub fn run_flow_sampler(
     on_progress: &mut dyn FnMut(Progress),
     mut predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
-    use gen_core::sampling::{
-        denoise as gc_denoise, sampler_by_name, Euler, FlowModelSampling, Sampler,
-    };
+    use gen_core::sampling::{denoise as gc_denoise, sampler_by_name, Euler, Sampler};
 
     let ops = MlxLatentOps;
-    let ms = FlowModelSampling::new(conv);
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     // N3: a curated name routes to its solver; an unknown name / non-solver alias falls back to Euler.
     let sampler: Box<dyn Sampler<MlxLatentOps>> = sampler_name
@@ -269,7 +264,7 @@ pub fn run_flow_sampler(
         // solvers (Heun / DPM++ SDE call this twice per step; the count stays monotone and ≤ total).
         let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
         on_progress(Progress::Step { current, total });
-        gc_denoise(&ops, &ms, x, sigma, |xin, t| {
+        gc_denoise(&ops, ms, x, sigma, |xin, t| {
             predict(xin, t).map_err(Into::into)
         })
     };
@@ -279,6 +274,147 @@ pub fn run_flow_sampler(
         .map_err(crate::Error::from)?;
     // Force the final step's advancement (never seen by the callback, which evals only inputs).
     mlx_rs::transforms::eval([&out])?;
+    Ok(out)
+}
+
+/// Drive a curated solver over a flow-match (rectified-flow) sigma schedule — the thin
+/// [`run_curated_sampler`] wrapper for the FLOW cohort (FLUX / Qwen / Chroma / Z-Image / Boogu / LTX /
+/// Wan). `conv` selects whether the model is fed the raw sigma ([`TimestepConvention::Sigma`]) or
+/// `1 − σ` ([`TimestepConvention::OneMinusSigma`]); `predict` returns the RAW (already CFG-combined)
+/// velocity. `euler` over FLOW reproduces the legacy [`FlowMatchSampler`] loop within the N1 tolerance.
+///
+/// The time-shift lives entirely in `sigmas` (resolved by [`resolve_flow_schedule`]), so
+/// `FlowModelSampling::new(conv)` (mu = 0) is the correct integration contract here — its `timestep` /
+/// `denoised_coeffs` are mu-independent.
+#[allow(clippy::too_many_arguments)]
+pub fn run_flow_sampler(
+    sampler_name: Option<&str>,
+    conv: TimestepConvention,
+    sigmas: &[f32],
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    predict: impl FnMut(&Array, f32) -> Result<Array>,
+) -> Result<Array> {
+    let ms = gen_core::sampling::FlowModelSampling::new(conv);
+    run_curated_sampler(
+        sampler_name,
+        &ms,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
+}
+
+// =================================================================================================
+// Joint two-stream (video+audio) curated sampling — LTX's cross-modal denoise (epic 7114, sc-7122).
+// =================================================================================================
+
+/// A joint video+audio latent pair — the [`gen_core::sampling::LatentOps::Latent`] for LTX's
+/// cross-modal denoise, whose two streams (`[B,128,F,H,W]` video + `[B,8,T,16]` audio) are integrated
+/// **together** by one curated solver each step (the AvDiT couples them via cross-modal attention). The
+/// single-`Array` [`MlxLatentOps`] cannot represent this, so the two-stream variant exists.
+#[derive(Clone)]
+pub struct AvLatents {
+    pub video: Array,
+    pub audio: Array,
+}
+
+/// [`gen_core::sampling::LatentOps`] over [`AvLatents`] — applies each solver op to BOTH streams, so the
+/// gen-core curated solvers (Euler / Heun / DPM++ 2M·SDE / UniPC / ancestral / DDIM) drive LTX's joint
+/// video+audio denoise. Each per-stream op reuses [`MlxLatentOps`], so the byte-parity rules
+/// (`scale(x,1)`/`axpy(1,…)` elide the multiply) hold per stream.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MlxAvLatentOps;
+
+impl LatentOps for MlxAvLatentOps {
+    type Latent = AvLatents;
+
+    fn scale(&self, x: &AvLatents, scale: f32) -> gen_core::Result<AvLatents> {
+        Ok(AvLatents {
+            video: MlxLatentOps.scale(&x.video, scale)?,
+            audio: MlxLatentOps.scale(&x.audio, scale)?,
+        })
+    }
+
+    fn add(&self, a: &AvLatents, b: &AvLatents) -> gen_core::Result<AvLatents> {
+        Ok(AvLatents {
+            video: MlxLatentOps.add(&a.video, &b.video)?,
+            audio: MlxLatentOps.add(&a.audio, &b.audio)?,
+        })
+    }
+
+    fn sub(&self, a: &AvLatents, b: &AvLatents) -> gen_core::Result<AvLatents> {
+        Ok(AvLatents {
+            video: MlxLatentOps.sub(&a.video, &b.video)?,
+            audio: MlxLatentOps.sub(&a.audio, &b.audio)?,
+        })
+    }
+
+    fn axpy(&self, a: f32, x: &AvLatents, b: f32, y: &AvLatents) -> gen_core::Result<AvLatents> {
+        Ok(AvLatents {
+            video: MlxLatentOps.axpy(a, &x.video, b, &y.video)?,
+            audio: MlxLatentOps.axpy(a, &x.audio, b, &y.audio)?,
+        })
+    }
+
+    fn randn_like(&self, x: &AvLatents, seed: u64, step: usize) -> gen_core::Result<AvLatents> {
+        // Distinct subkeys per stream (the audio seed is XOR-shifted) so the two streams' stochastic
+        // noise is decorrelated; each reuses the per-step `StepRng` derivation.
+        Ok(AvLatents {
+            video: MlxLatentOps.randn_like(&x.video, seed, step)?,
+            audio: MlxLatentOps.randn_like(&x.audio, seed ^ 0xA5A5_5A5A_C3C3_3C3C, step)?,
+        })
+    }
+}
+
+/// Drive a curated unified solver over LTX's **joint video+audio** flow-match schedule — the two-stream
+/// sibling of [`run_flow_sampler`] (epic 7114, sc-7122). The model is velocity-prediction over the FLOW
+/// [`TimestepConvention::Sigma`] convention for BOTH streams; `predict(av_in, sigma)` returns the raw
+/// `(video_velocity, audio_velocity)`. The per-step `eval`/cancel/progress contract matches
+/// [`run_curated_sampler`], evaluating both streams each step. Used for LTX's distilled T2V+A path
+/// (the per-token-σ I2V path with its post-step `apply_denoise_mask` blend stays native).
+#[allow(clippy::too_many_arguments)]
+pub fn run_av_curated_sampler(
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    latents: AvLatents,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: impl FnMut(&AvLatents, f32) -> Result<AvLatents>,
+) -> Result<AvLatents> {
+    use gen_core::sampling::{
+        denoise as gc_denoise, sampler_by_name, Euler, FlowModelSampling, Sampler,
+    };
+
+    let ops = MlxAvLatentOps;
+    let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    let sampler: Box<dyn Sampler<MlxAvLatentOps>> = sampler_name
+        .and_then(sampler_by_name::<MlxAvLatentOps>)
+        .unwrap_or_else(|| Box::new(Euler));
+
+    let mut denoise_fn = |x: &AvLatents, sigma: f32| -> gen_core::Result<AvLatents> {
+        if cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        ge(mlx_rs::transforms::eval([&x.video, &x.audio]))?;
+        let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+        on_progress(Progress::Step { current, total });
+        gc_denoise(&ops, &ms, x, sigma, |xin, t| {
+            predict(xin, t).map_err(Into::into)
+        })
+    };
+
+    let out = sampler
+        .sample(&ops, &mut denoise_fn, latents, sigmas, seed)
+        .map_err(crate::Error::from)?;
+    mlx_rs::transforms::eval([&out.video, &out.audio])?;
     Ok(out)
 }
 
@@ -311,12 +447,28 @@ pub fn resolve_flow_schedule(
     steps: usize,
     native: &[f32],
 ) -> Vec<f32> {
-    use gen_core::sampling::{schedule_sigmas, FlowModelSampling, Scheduler};
+    let ms = gen_core::sampling::FlowModelSampling::with_shift(TimestepConvention::Sigma, mu);
+    resolve_schedule(scheduler_name, &ms, steps, native)
+}
+
+/// Resolve a descending σ schedule honoring a per-generation curated `scheduler`, over ANY
+/// [`gen_core::sampling::ModelSampling`] — the generalized core behind [`resolve_flow_schedule`] (epic
+/// 7114 scheduler axis). An unset / unknown / native-aliased name returns `native` verbatim (the N1
+/// byte-exact default); a curated name builds the schedule via [`gen_core::sampling::schedule_sigmas`]
+/// over `ms`, which reads its σ-table / timestep↔sigma map — so `normal` / `karras` / `sgm_uniform` /
+/// `simple` / `beta` / `ddim_uniform` / `exponential` land correctly for the ε/DDPM (`DiscreteModelSampling`),
+/// EDM (`EdmModelSampling`), and flow (`FlowModelSampling`) contracts alike. A curated scheduler may
+/// return a length other than `steps + 1` (`ddim_uniform` / `beta` re-stride), changing the effective
+/// step count — the same behaviour ComfyUI / diffusers have.
+pub fn resolve_schedule(
+    scheduler_name: Option<&str>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    steps: usize,
+    native: &[f32],
+) -> Vec<f32> {
+    use gen_core::sampling::{schedule_sigmas, Scheduler};
     match scheduler_name.and_then(Scheduler::from_name) {
-        Some(sched) => {
-            let ms = FlowModelSampling::with_shift(TimestepConvention::Sigma, mu);
-            schedule_sigmas(sched, &ms, steps)
-        }
+        Some(sched) => schedule_sigmas(sched, ms, steps),
         None => native.to_vec(),
     }
 }
@@ -856,6 +1008,165 @@ mod tests {
             assert!(
                 out.as_slice::<f32>().iter().all(|v| v.is_finite()),
                 "{name} produced non-finite output"
+            );
+        }
+    }
+
+    // --- Keystone: run_curated_sampler drives ε/DDPM (Discrete) + v-pred (EDM), not just FLOW --------
+
+    use gen_core::sampling::{DiscreteModelSampling, EdmModelSampling};
+
+    /// `run_curated_sampler` over a `DiscreteModelSampling` (ε prediction) with `euler` reproduces the
+    /// legacy Kolors/diffusers Euler step `x + ε·(σ_{i+1} − σ_i)` EXACTLY: for a constant ε field the
+    /// rectified integral is `x_init − ε·σ_0`. This is the keystone equivalence the DDPM cohort's curated
+    /// path relies on (the `to_d` round-trip cancels: `d = (x − (x − σ·ε))/σ = ε`).
+    #[test]
+    fn run_curated_sampler_eps_euler_matches_legacy_discrete_step() {
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap();
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        // A descending σ schedule (length steps+1, trailing 0) — not the native table, any valid ramp.
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.5, 0.0];
+        let x_init = arr(&[0.3, -1.1, 2.0]);
+        // A constant-ε "model" (ignores the scaled input) — the linear field a consistent solver hits
+        // exactly. eps must be returned in the EPS sense (the closure yields the raw model output).
+        let eps = [0.7_f32, -0.2, 0.4];
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let out = run_curated_sampler(
+            Some("euler"),
+            &ms,
+            &sigmas,
+            x_init.clone(),
+            0,
+            &cancel,
+            &mut progress,
+            |_xin, _t| Ok(arr(&eps)),
+        )
+        .unwrap();
+        let got = out.as_slice::<f32>();
+        let xi = x_init.as_slice::<f32>();
+        for ((g, &x0), &e) in got.iter().zip(xi).zip(&eps) {
+            let want = x0 - e * sigmas[0]; // x_init − ε·σ_0
+            assert!((g - want).abs() < 2e-3, "eps euler: got {g} want {want}");
+        }
+    }
+
+    /// `run_av_curated_sampler` drives LTX's joint two-stream (video+audio) FLOW denoise: the curated
+    /// Euler over `MlxAvLatentOps` integrates BOTH streams, and for a constant per-stream velocity it
+    /// lands exactly on `x_init − v·σ_0` per stream (the rectified-flow integral) — proving the
+    /// two-stream `LatentOps` + driver reproduce the legacy per-stream `euler_step`.
+    #[test]
+    fn run_av_curated_sampler_euler_matches_legacy_per_stream() {
+        let sigmas = vec![1.0_f32, 0.75, 0.5, 0.25, 0.0];
+        let v_video = [0.7_f32, -0.2, 0.4];
+        let v_audio = [0.1_f32, 0.5];
+        let init = AvLatents {
+            video: arr(&[0.3, -1.1, 2.0]),
+            audio: arr(&[0.05, -0.4]),
+        };
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let out = run_av_curated_sampler(
+            Some("euler"),
+            &sigmas,
+            init,
+            0,
+            &cancel,
+            &mut progress,
+            |_x, _sigma| {
+                Ok(AvLatents {
+                    video: arr(&v_video),
+                    audio: arr(&v_audio),
+                })
+            },
+        )
+        .unwrap();
+        let (gv, ga) = (out.video.as_slice::<f32>(), out.audio.as_slice::<f32>());
+        for ((g, &x0), &v) in gv.iter().zip(&[0.3_f32, -1.1, 2.0]).zip(&v_video) {
+            assert!((g - (x0 - v * sigmas[0])).abs() < 2e-3, "video: got {g}");
+        }
+        for ((g, &x0), &v) in ga.iter().zip(&[0.05_f32, -0.4]).zip(&v_audio) {
+            assert!((g - (x0 - v * sigmas[0])).abs() < 2e-3, "audio: got {g}");
+        }
+    }
+
+    /// Every curated solver drives the two-stream AV latents to finite output (the stochastic ones too).
+    #[test]
+    fn run_av_curated_sampler_every_solver_is_finite() {
+        let sigmas = build_flow_sigmas(6, compute_mu(image_seq_len(512, 512), 6));
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        for name in [
+            "euler",
+            "euler_ancestral",
+            "heun",
+            "dpmpp_2m",
+            "dpmpp_sde",
+            "uni_pc",
+            "ddim",
+        ] {
+            let init = AvLatents {
+                video: arr(&[0.2, -0.5, 1.0, 0.3]),
+                audio: arr(&[0.1, -0.2]),
+            };
+            let out = run_av_curated_sampler(
+                Some(name),
+                &sigmas,
+                init,
+                7,
+                &cancel,
+                &mut progress,
+                |x, _s| {
+                    Ok(AvLatents {
+                        video: multiply(&x.video, scalar(0.2))?,
+                        audio: multiply(&x.audio, scalar(0.2))?,
+                    })
+                },
+            )
+            .unwrap();
+            assert!(
+                out.video.as_slice::<f32>().iter().all(|v| v.is_finite())
+                    && out.audio.as_slice::<f32>().iter().all(|v| v.is_finite()),
+                "{name} (AV two-stream) produced non-finite output"
+            );
+        }
+    }
+
+    /// `run_curated_sampler` drives a v-prediction `EdmModelSampling` (SVD's contract) to finite output
+    /// over every curated solver — proving the keystone is prediction-type-agnostic (the V `x0`
+    /// recombination flows through `MlxLatentOps`).
+    #[test]
+    fn run_curated_sampler_v_prediction_edm_is_finite_every_solver() {
+        let ms = EdmModelSampling::svd();
+        // A short EDM-range descending schedule (σ_max≈700 down to 0), any valid ramp.
+        let sigmas = vec![80.0_f32, 20.0, 5.0, 1.0, 0.2, 0.0];
+        let x_init = arr(&[0.2, -0.5, 1.0, 0.3]);
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        for name in [
+            "euler",
+            "euler_ancestral",
+            "heun",
+            "dpmpp_2m",
+            "dpmpp_sde",
+            "uni_pc",
+            "ddim",
+        ] {
+            let out = run_curated_sampler(
+                Some(name),
+                &ms,
+                &sigmas,
+                x_init.clone(),
+                7,
+                &cancel,
+                &mut progress,
+                // A mild v "model": v = 0.1·x_in (the input is c_in-scaled, keeping it bounded).
+                |xin, _t| Ok(multiply(xin, scalar(0.1))?),
+            )
+            .unwrap();
+            assert!(
+                out.as_slice::<f32>().iter().all(|v| v.is_finite()),
+                "{name} (v-pred/EDM) produced non-finite output"
             );
         }
     }

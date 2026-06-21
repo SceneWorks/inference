@@ -114,7 +114,9 @@ fn av_e2e_matches_reference() {
         g.require("audio_ctx").unwrap(),
         mean,
         std,
-        &[], // T2V+A (no replace-latent conditioning in this gate)
+        &[],  // T2V+A (no replace-latent conditioning in this gate)
+        None, // native distilled Euler (epic 7114 default path)
+        0,
         &mlx_gen::CancelFlag::default(),
         &mut |_| steps += 1,
     )
@@ -217,6 +219,8 @@ fn av_generate_honors_midloop_cancel() {
         mean,
         std,
         &[],
+        None, // native distilled Euler (epic 7114 default path)
+        0,
         &cancel,
         &mut |_| {
             steps += 1;

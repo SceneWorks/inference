@@ -63,7 +63,10 @@ pub use caption::{
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
 pub use error::{Error, Result};
-pub use gen_core::sampling::TimestepConvention;
+pub use gen_core::sampling::{
+    schedule_sigmas, DiscreteModelSampling, EdmModelSampling, ModelSampling, PredictionType,
+    Scheduler, Solver, TimestepConvention,
+};
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
     GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
@@ -80,8 +83,9 @@ pub use runtime::{
     WeightsSource,
 };
 pub use sampler::{
-    curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, run_flow_sampler,
-    AlphaSchedule, DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler, MlxLatentOps,
+    curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,
+    run_av_curated_sampler, run_curated_sampler, run_flow_sampler, AlphaSchedule, AvLatents,
+    DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps, MlxLatentOps,
     TcdSampler,
 };
 pub use scheduler::FlowMatchEuler;

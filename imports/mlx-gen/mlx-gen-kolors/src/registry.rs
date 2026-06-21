@@ -16,9 +16,9 @@
 use mlx_rs::{random, Dtype};
 
 use mlx_gen::{
-    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, ControlKind, Error,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    ModelRegistration, Progress, Quant, Result, WeightsSource,
+    curated_scheduler_names, default_seed, gen_core, Capabilities, Conditioning, ConditioningKind,
+    ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
+    ModelDescriptor, ModelRegistration, Progress, Quant, Result, Scheduler, Solver, WeightsSource,
 };
 
 use mlx_gen_sdxl::{
@@ -68,8 +68,31 @@ pub fn descriptor() -> ModelDescriptor {
             // LoRA/LoKr merge into the SDXL-family U-Net at load (sc-4733).
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec![SAMPLER],
-            schedulers: vec!["discrete"],
+            // `euler_discrete` is the native leading-Euler default; the rest are the unified curated
+            // solvers (epic 7114, sc-7121) — the additive k-diffusion path over `DiscreteModelSampling`
+            // for txt2img + img2img. Selecting one (or a non-`discrete` scheduler) routes to
+            // `Kolors::denoise_curated_latents`; the native default stays byte-exact. (The ControlNet /
+            // IP-Adapter combined-pose tier stays sampler-locked to `euler_discrete` — guarded below.)
+            samplers: {
+                let mut s = vec![SAMPLER];
+                s.extend([
+                    "euler",
+                    "euler_ancestral",
+                    "heun",
+                    "dpmpp_2m",
+                    "dpmpp_sde",
+                    "uni_pc",
+                    "lcm",
+                    "ddim",
+                ]);
+                s
+            },
+            // `discrete` is the native schedule; the rest are the curated σ schedulers (epic 7114).
+            schedulers: {
+                let mut s = vec!["discrete"];
+                s.extend(curated_scheduler_names());
+                s
+            },
             min_size: 512,
             max_size: 2048,
             max_count: 8,
@@ -251,6 +274,30 @@ impl KolorsGenerator {
             ));
         }
 
+        // Curated unified-sampler path (epic 7114, sc-7121): a curated solver name (≠ the native
+        // `euler_discrete`) OR a non-`discrete` scheduler routes txt2img/img2img through the additive
+        // k-diffusion `Kolors::denoise_curated_latents`. The ControlNet / IP-Adapter combined-pose tier
+        // (sc-5012) is a tuned SceneWorks composite whose CFG-batched image tokens would desync under a
+        // multi-eval solver, so it stays sampler-locked to the native euler_discrete.
+        let scheduler_curated = req
+            .scheduler
+            .as_deref()
+            .and_then(Scheduler::from_name)
+            .is_some();
+        let sampler_curated = req
+            .sampler
+            .as_deref()
+            .map(|s| Solver::from_name(s).is_some() && s != SAMPLER)
+            .unwrap_or(false);
+        let use_curated = scheduler_curated || sampler_curated;
+        if use_curated && (ip_mode || control.is_some()) {
+            return Err(Error::Msg(
+                "kolors: curated samplers/schedulers apply to txt2img + img2img only; the ControlNet \
+                 / IP-Adapter combined-pose tier stays on the native euler_discrete"
+                    .into(),
+            ));
+        }
+
         // Conditioning is seed-independent — encode the prompts once and hand the (context, pooled)
         // tuples to the per-mode `Kolors::denoise_*_latents` methods, which assemble the CFG batch +
         // time_ids. Routing every mode through those methods keeps a single denoise assembly shared
@@ -288,6 +335,43 @@ impl KolorsGenerator {
             // one global-RNG draw happens per image (the noise); the img2img VAE-encode below draws
             // none, so the per-image output stays byte-identical to the struct API's RNG order.
             let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+
+            // Curated unified path (txt2img / img2img): k-diffusion VE-σ sampling over the Kolors
+            // `DiscreteModelSampling`, additive alongside the native leading-Euler default.
+            if use_curated {
+                let (init_opt, strength) = match img2img {
+                    Some((image, strength)) => (
+                        Some(encode_init_latents(
+                            self.kolors.vae(),
+                            image,
+                            w as u32,
+                            h as u32,
+                        )?),
+                        strength,
+                    ),
+                    None => (None, 0.0),
+                };
+                let latents = self.kolors.denoise_curated_latents(
+                    req.sampler.as_deref(),
+                    req.scheduler.as_deref(),
+                    init_opt.as_ref(),
+                    &noise,
+                    &pos,
+                    &neg,
+                    steps,
+                    strength,
+                    cfg,
+                    seed,
+                    h,
+                    w,
+                    &req.cancel,
+                    on_progress,
+                )?;
+                on_progress(Progress::Decoding);
+                images.push(decode_image(self.kolors.vae(), &latents)?);
+                continue;
+            }
+
             let latents = if let (Some((skeleton, control_scale)), Some((tokens, ip_scale))) =
                 (control, &ip)
             {
@@ -590,6 +674,79 @@ mod tests {
             ..base
         };
         assert!(validate_request(&caps, &good).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_curated_samplers_and_schedulers() {
+        // epic 7114 (sc-7121): the unified curated solver + scheduler menu is advertised additively
+        // alongside the native `euler_discrete`/`discrete` and accepted by the shared capability check.
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+        for s in [
+            "euler_discrete",
+            "euler",
+            "euler_ancestral",
+            "heun",
+            "dpmpp_2m",
+            "dpmpp_sde",
+            "uni_pc",
+            "lcm",
+            "ddim",
+        ] {
+            assert!(
+                validate_request(
+                    &caps,
+                    &GenerationRequest {
+                        sampler: Some(s.into()),
+                        ..base.clone()
+                    }
+                )
+                .is_ok(),
+                "sampler {s:?} should be accepted"
+            );
+        }
+        for s in [
+            "discrete",
+            "normal",
+            "karras",
+            "sgm_uniform",
+            "beta",
+            "ddim_uniform",
+        ] {
+            assert!(
+                validate_request(
+                    &caps,
+                    &GenerationRequest {
+                        scheduler: Some(s.into()),
+                        ..base.clone()
+                    }
+                )
+                .is_ok(),
+                "scheduler {s:?} should be accepted"
+            );
+        }
+        // Unknown names are still rejected (delegated to the shared contract).
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                sampler: Some("nonsense".into()),
+                ..base.clone()
+            }
+        )
+        .is_err());
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                scheduler: Some("leading".into()),
+                ..base
+            }
+        )
+        .is_err());
     }
 
     #[test]

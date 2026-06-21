@@ -13,21 +13,25 @@
 //! is wired and parity-proven.
 
 use mlx_gen::{
-    default_seed, gen_core, AlphaSchedule, Capabilities, Conditioning, ConditioningKind,
-    DiffusionSampler, Error, GenerationOutput, GenerationRequest, Generator, Image, LcmSampler,
-    LightningSampler, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
-    TcdSampler, WeightsSource,
+    curated_scheduler_names, default_seed, gen_core, schedule_sigmas, AlphaSchedule, Capabilities,
+    Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LcmSampler, LightningSampler, LoadSpec,
+    Modality, ModelDescriptor, Precision, Progress, Quant, Result, Scheduler, Solver, TcdSampler,
+    WeightsSource,
 };
-use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::Dtype;
+
+use mlx_gen::array::scalar;
 
 use crate::config::DiffusionConfig;
 use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
 use crate::pipeline::{
-    decode_image, denoise, denoise_inpaint, denoise_ip, denoise_multi_control, encode_conditioning,
-    encode_init_latents, preprocess_control_image, text_time_ids, ControlContext, Denoiser,
+    decode_image, denoise, denoise_curated, denoise_inpaint, denoise_ip, denoise_multi_control,
+    encode_conditioning, encode_init_latents, preprocess_control_image, text_time_ids,
+    ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
@@ -106,12 +110,33 @@ pub fn descriptor() -> ModelDescriptor {
             ],
             supports_lora: true,
             supports_lokr: true,
-            // `euler_ancestral` is the production default (full-CFG, 30-step); `lcm`/`lightning`/
-            // `hyper` are the few-step acceleration samplers (sc-2769), each driven by its diffusers-
-            // faithful schedule and paired with an acceleration LoRA at load. A request naming any
-            // other sampler is rejected in `validate_request` rather than silently downgraded.
-            samplers: vec!["euler_ancestral", "lcm", "lightning", "hyper"],
-            schedulers: vec!["discrete"],
+            // `euler_ancestral` is the production default (full-CFG, 30-step, the bespoke vendored
+            // ancestral loop); `lcm`/`lightning`/`hyper` are the few-step acceleration samplers
+            // (sc-2769), each driven by its diffusers-faithful schedule and paired with an acceleration
+            // LoRA at load. The remaining names (`euler`/`heun`/`dpmpp_2m`/`dpmpp_sde`/`uni_pc`/`ddim`)
+            // are the unified curated solvers (epic 7114, sc-7121) — the additive k-diffusion path over
+            // `DiscreteModelSampling`; selecting one (or a non-`discrete` scheduler) routes to
+            // `denoise_curated` while the default stays byte-exact. A request naming any other sampler
+            // is rejected in `validate_request` rather than silently downgraded.
+            samplers: vec![
+                "euler_ancestral",
+                "lcm",
+                "lightning",
+                "hyper",
+                "euler",
+                "heun",
+                "dpmpp_2m",
+                "dpmpp_sde",
+                "uni_pc",
+                "ddim",
+            ],
+            // `discrete` is the native ancestral schedule; the rest are the curated σ schedulers
+            // (epic 7114 scheduler axis) usable with any curated sampler.
+            schedulers: {
+                let mut s = vec!["discrete"];
+                s.extend(curated_scheduler_names());
+                s
+            },
             min_size: 512,
             max_size: 2048,
             max_count: 8,
@@ -305,6 +330,19 @@ impl Sdxl {
 
         let sampler_name = req.sampler.as_deref().unwrap_or("euler_ancestral");
         let is_accel = ACCEL_SAMPLERS.contains(&sampler_name);
+        // Curated unified path (epic 7114, sc-7121): a curated solver name (other than the bespoke
+        // `euler_ancestral` default + the accel profiles) OR a non-`discrete` scheduler routes to the
+        // additive k-diffusion `denoise_curated` over `DiscreteModelSampling`. The ancestral default
+        // with no curated knob stays on the bespoke vendored loop, byte-exact (the N1 default gate).
+        let scheduler_curated = req
+            .scheduler
+            .as_deref()
+            .and_then(Scheduler::from_name)
+            .is_some();
+        let sampler_curated = Solver::from_name(sampler_name).is_some()
+            && !is_accel
+            && sampler_name != "euler_ancestral";
+        let use_curated = !is_accel && (sampler_curated || scheduler_curated);
         // Per-variant defaults for the few-step samplers; the production defaults otherwise.
         let (def_steps, def_cfg, eta) = if is_accel {
             accel_defaults(sampler_name)
@@ -333,6 +371,14 @@ impl Sdxl {
             if is_accel {
                 return Err(Error::Msg(
                     "sdxl: inpaint masks are not supported with the acceleration samplers".into(),
+                ));
+            }
+            if use_curated {
+                return Err(Error::Msg(
+                    "sdxl: curated samplers/schedulers are not supported with an inpaint Mask (its \
+                     per-step blend has no post-step hook in the callback Sampler) — use the default \
+                     euler_ancestral"
+                        .into(),
                 ));
             }
             if reference.is_none() {
@@ -446,6 +492,59 @@ impl Sdxl {
             // first draw here is the init noise (the prior / img2img add_noise) — matching the
             // reference stream.
             mlx_rs::random::seed(seed)?;
+
+            // Curated unified-sampler path (epic 7114, sc-7121): k-diffusion VE-σ sampling over a
+            // `DiscreteModelSampling`, additive alongside the bespoke ancestral default. The latents
+            // live in raw σ-space; the curated solver + scheduler are selected per request. Supports
+            // txt2img / img2img / ControlNet / IP-Adapter (inpaint is guarded out above).
+            if use_curated {
+                let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
+                let sched = req
+                    .scheduler
+                    .as_deref()
+                    .and_then(Scheduler::from_name)
+                    .unwrap_or(Scheduler::Normal);
+                let full_sigmas = schedule_sigmas(sched, &ms, steps);
+                let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
+                // Raw k-diffusion σ-space init: txt2img `ε·σ_max`; img2img runs the strength-tail of the
+                // schedule, seeded `x₀ + ε·σ_start` (diffusers EulerDiscrete add_noise). A strength that
+                // rounds to 0 effective steps leaves the schedule at `[0.0]` → the init is returned.
+                let (run_sigmas, init) = if let Some(x_0) = &init_latents {
+                    let strength = reference
+                        .and_then(|(_, s)| s)
+                        .unwrap_or(DEFAULT_STRENGTH)
+                        .clamp(0.0, 1.0);
+                    let eff = (steps as f32 * strength) as usize;
+                    let run_start = full_sigmas.len().saturating_sub(1).saturating_sub(eff);
+                    let rs = full_sigmas[run_start..].to_vec();
+                    let init = add(x_0, &multiply(&noise, scalar(rs[0]))?)?;
+                    (rs, init)
+                } else {
+                    let init = multiply(&noise, scalar(full_sigmas[0]))?;
+                    (full_sigmas, init)
+                };
+                let ip = ip_tokens.as_ref().map(|t| (t, ip_scale));
+                let latents = denoise_curated(
+                    &self.unet,
+                    Some(sampler_name),
+                    &ms,
+                    &run_sigmas,
+                    init,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    cfg,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    &control_ctxs,
+                    ip,
+                    None,
+                )?;
+                on_progress(Progress::Decoding);
+                images.push(decode_image(&self.vae, &latents)?);
+                continue;
+            }
 
             // Build the run's sampler + its seeded init latents. The denoise loop is driven entirely
             // by the sampler's own schedule (`sampler.num_steps()`), so the trait owns the per-step
@@ -733,6 +832,15 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
+    // Likewise the scheduler (epic 7114 axis) — `discrete` (native) + the curated σ schedulers.
+    if let Some(s) = &req.scheduler {
+        if !caps.schedulers.contains(&s.as_str()) {
+            return Err(Error::Msg(format!(
+                "sdxl: unsupported scheduler {s:?} (supported: {:?})",
+                caps.schedulers
+            )));
+        }
+    }
     for c in &req.conditioning {
         let kind = c.kind();
         if !caps.accepts(kind) {
@@ -848,9 +956,21 @@ mod tests {
             prompt: "a fox".into(),
             ..Default::default()
         };
-        // The default + every wired sampler is accepted (an unset sampler defaults to ancestral).
+        // The default + every wired sampler is accepted (an unset sampler defaults to ancestral): the
+        // accel profiles AND the unified curated solvers (epic 7114, sc-7121).
         assert!(validate_request(&caps, &base).is_ok());
-        for ok in ["euler_ancestral", "lcm", "lightning", "hyper"] {
+        for ok in [
+            "euler_ancestral",
+            "lcm",
+            "lightning",
+            "hyper",
+            "euler",
+            "heun",
+            "dpmpp_2m",
+            "dpmpp_sde",
+            "uni_pc",
+            "ddim",
+        ] {
             assert!(
                 validate_request(
                     &caps,
@@ -863,8 +983,8 @@ mod tests {
                 "sampler {ok:?} should be accepted"
             );
         }
-        // `euler` (and any unknown sampler) is rejected, not silently downgraded.
-        for bad in ["euler", "ddim", "nonsense"] {
+        // An unknown sampler is rejected, not silently downgraded.
+        for bad in ["plms", "dpm_fast", "nonsense"] {
             let err = validate_request(
                 &caps,
                 &GenerationRequest {
@@ -875,6 +995,51 @@ mod tests {
             .unwrap_err()
             .to_string();
             assert!(err.contains("unsupported sampler"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_scheduler_selection() {
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a fox".into(),
+            ..Default::default()
+        };
+        // `discrete` (the native ancestral schedule) + every curated σ scheduler is accepted (sc-7121).
+        for ok in [
+            "discrete",
+            "normal",
+            "simple",
+            "karras",
+            "exponential",
+            "sgm_uniform",
+            "beta",
+            "ddim_uniform",
+        ] {
+            assert!(
+                validate_request(
+                    &caps,
+                    &GenerationRequest {
+                        scheduler: Some(ok.into()),
+                        ..base.clone()
+                    }
+                )
+                .is_ok(),
+                "scheduler {ok:?} should be accepted"
+            );
+        }
+        // diffusers timestep-spacing names are NOT curated scheduler names → rejected.
+        for bad in ["leading", "trailing", "nonsense"] {
+            let err = validate_request(
+                &caps,
+                &GenerationRequest {
+                    scheduler: Some(bad.into()),
+                    ..base.clone()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("unsupported scheduler"), "got: {err}");
         }
     }
 

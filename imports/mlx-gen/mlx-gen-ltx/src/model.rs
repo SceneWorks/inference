@@ -47,9 +47,9 @@ use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
-    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision as LoadPrecision, Progress, Result, WeightsSource,
+    curated_sampler_names, default_seed, gen_core, Capabilities, Conditioning, ConditioningKind,
+    Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
+    ModelDescriptor, Precision as LoadPrecision, Progress, Result, WeightsSource,
 };
 
 use crate::audio_vae::AudioDecoder;
@@ -170,7 +170,13 @@ pub fn descriptor() -> ModelDescriptor {
             // Quantization is checkpoint-driven (split_model.json); load() rejects on-the-fly
             // spec.quantize that disagrees with the manifest. No on-the-fly re-quant available.
             supported_quants: &[],
-            samplers: Vec::new(),
+            // Curated unified solvers (epic 7114, sc-7122): LTX exposes the SAMPLER axis but NO scheduler
+            // (matching ComfyUI) — it keeps its baked distilled σ schedule (8+3 steps) and only swaps the
+            // integrator (over the two-stream `MlxAvLatentOps`, joint video+audio). LTX is distilled, so
+            // `euler` is the recommended integrator and stays the byte-exact default (unset sampler); the
+            // others are exposed for parity with ComfyUI's menu. T2V only — the I2V/keyframe/clip paths
+            // (per-token σ + post-step blend) stay native.
+            samplers: curated_sampler_names(),
             schedulers: Vec::new(),
             // height/width must be divisible by 64 (stage-1 runs at //2//32).
             min_size: 64,
@@ -536,6 +542,27 @@ impl Ltx {
         let pos2 = create_position_grid(1, lf, h2, w2);
         let audio_pos = create_audio_position_grid(1, Self::audio_frames(req));
 
+        // Curated unified solver (epic 7114, sc-7122): a curated solver name routes the joint two-stream
+        // T2V+A denoise through `generate_av_latents`' `denoise_av_curated` branch (LTX keeps its baked
+        // distilled σ schedule — sampler-only, no scheduler). `validate` already rejected any name not in
+        // the advertised menu; an unset sampler → the native distilled Euler (the byte-exact default).
+        let seed = req.seed.unwrap_or_else(default_seed);
+        let curated = req
+            .sampler
+            .as_deref()
+            .filter(|s| mlx_gen::Solver::from_name(s).is_some());
+        // The image/keyframe (I2V) + in-context-clip paths condition with per-token `σ·mask` and a
+        // post-step `apply_denoise_mask` blend, which have no single-eval curated-sampler hook — they
+        // stay on the native distilled Euler. Reject a curated request there rather than silently ignore.
+        if curated.is_some() && (!video_clips.is_empty() || !video_keyframes.is_empty()) {
+            return Err(Error::Msg(
+                "ltx: curated samplers apply to text-to-video only; the image/keyframe (I2V) and \
+                 in-context-clip paths use per-token-σ conditioning that stays on the native distilled \
+                 Euler"
+                    .into(),
+            ));
+        }
+
         let mut step = 0usize;
         let mut on_step = |_: usize| {
             step += 1;
@@ -582,6 +609,8 @@ impl Ltx {
                 &self.latent_mean,
                 &self.latent_std,
                 video_keyframes,
+                curated,
+                seed,
                 &req.cancel,
                 &mut on_step,
             )?
@@ -967,6 +996,32 @@ use mlx_gen::ModelRegistration;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_advertises_curated_samplers_no_scheduler() {
+        // epic 7114 (sc-7122): LTX exposes the curated SAMPLER axis (the joint two-stream T2V+A denoise)
+        // but NO scheduler — it keeps its baked distilled σ schedule. A non-empty scheduler list would be
+        // a false capability.
+        let caps = descriptor().capabilities;
+        for s in [
+            "euler",
+            "euler_ancestral",
+            "heun",
+            "dpmpp_2m",
+            "dpmpp_sde",
+            "uni_pc",
+            "ddim",
+        ] {
+            assert!(
+                caps.samplers.contains(&s),
+                "curated sampler {s:?} should be advertised"
+            );
+        }
+        assert!(
+            caps.schedulers.is_empty(),
+            "LTX is sampler-only (no scheduler axis — the distilled schedule is baked)"
+        );
+    }
 
     #[test]
     fn latent_dims_matches_reference_formula() {

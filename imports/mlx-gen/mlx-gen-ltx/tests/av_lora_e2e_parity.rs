@@ -148,6 +148,8 @@ fn av_lora_e2e_matches_reference() {
         mean,
         std,
         &[],
+        None, // native distilled Euler (epic 7114 default path)
+        0,
         &mlx_gen::CancelFlag::default(),
         &mut |_| steps += 1,
     )

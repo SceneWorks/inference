@@ -27,7 +27,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
 use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
-use mlx_gen::{CancelFlag, Error, Image, Result};
+use mlx_gen::{AvLatents, CancelFlag, Error, Image, Progress, Result};
 
 use crate::audio_vae::AudioDecoder;
 use crate::conditioning::{
@@ -673,6 +673,80 @@ pub fn denoise_av(
     Ok((vlat, alat))
 }
 
+/// One stage's joint video+audio denoise driven by a **curated unified solver** (epic 7114, sc-7122) —
+/// the additive alternative to the native [`denoise_av`] EDM-free legacy Euler, for the **T2V+A** path
+/// (uniform per-token σ). Routes any curated [`mlx_gen::Solver`] through
+/// [`mlx_gen::run_av_curated_sampler`], whose two-stream [`mlx_gen::MlxAvLatentOps`] integrates the
+/// video + audio latents together over LTX's baked distilled σ schedule (no scheduler axis).
+///
+/// LTX is **distilled** (the baked 8+3-step schedule) — `euler` is the trained/recommended integrator
+/// and stays the byte-exact default (N1, via [`denoise_av`]); the other curated solvers are exposed for
+/// parity with ComfyUI's sampler menu. The **I2V** path (per-token `σ·mask` + the post-step
+/// `apply_denoise_mask` blend) has no single-eval curated-sampler hook, so it stays on [`denoise_av`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_curated(
+    dit: &AvDiT,
+    sampler_name: &str,
+    video: &Array,
+    audio: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    video_pos: &Array,
+    audio_pos: &Array,
+    sigmas: &[f32],
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(Array, Array)> {
+    let dt = video.dtype();
+    let v = video.shape();
+    let (vb, vc, vf, vh, vw) = (v[0], v[1], v[2], v[3], v[4]);
+    let v_tokens = vf * vh * vw;
+    let a = audio.shape();
+    let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
+    // One fresh RoPE epoch for this stage (both position grids are constant across the loop, sc-7141).
+    let rope_epoch = Some(dit.next_rope_epoch());
+    let init = AvLatents {
+        video: video.clone(),
+        audio: audio.clone(),
+    };
+    let out = mlx_gen::run_av_curated_sampler(
+        Some(sampler_name),
+        sigmas,
+        init,
+        seed,
+        cancel,
+        on_progress,
+        |x, sigma| {
+            // Flatten: video (B,C,F,H,W)→(B,Sv,C); audio (B,C,T,F)→(B,T,C·F). Uniform per-token σ.
+            let vflat = x.video.reshape(&[vb, vc, -1])?.transpose_axes(&[0, 2, 1])?;
+            let aflat = x
+                .audio
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[ab, at, ac * af])?;
+            let vts = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[vb, v_tokens])?;
+            let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
+            let (vvel, avel) = dit.forward(
+                &vflat, &vts, video_ctx, None, video_pos, &aflat, &ats, audio_ctx, None, audio_pos,
+                rope_epoch,
+            )?;
+            let vvel = vvel
+                .transpose_axes(&[0, 2, 1])?
+                .reshape(&[vb, vc, vf, vh, vw])?;
+            let avel = avel
+                .reshape(&[ab, at, ac, af])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            // run_av_curated_sampler integrates the velocity over the FLOW convention (x0 = x − σ·v per
+            // stream), reproducing the native `to_denoised` + `euler_step` at first order.
+            Ok(AvLatents {
+                video: vvel,
+                audio: avel,
+            })
+        },
+    )?;
+    Ok((out.video, out.audio))
+}
+
 /// A replace-latent keyframe at both pipeline stages: the conditioning latent VAE-encoded at stage-1
 /// (half-res) and stage-2 (full-res) resolution, the **latent** frame index it pins, and its strength
 /// (mask `1 − strength`). Single-image I2V = one keyframe at frame 0; **first_last_frame** = two
@@ -823,6 +897,8 @@ pub fn generate_av_latents(
     latent_mean: &Array,
     latent_std: &Array,
     video_keyframes: &[StageKeyframe],
+    sampler: Option<&str>,
+    seed: u64,
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
@@ -845,19 +921,43 @@ pub fn generate_av_latents(
     };
     // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
     dit.set_lora_pass(0);
-    let (v, a) = denoise_av(
-        dit,
-        &vlat1,
-        audio_s1_noise,
-        video_ctx,
-        audio_ctx,
-        video_pos1,
-        audio_pos,
-        &STAGE1_SIGMAS,
-        vstate1.as_ref(),
-        cancel,
-        on_step,
-    )?;
+    // Curated unified solver (epic 7114, sc-7122): the gen-core-only solvers route through the
+    // two-stream `denoise_av_curated`; the native distilled Euler default stays on `denoise_av` (N1).
+    // Curated only reaches here for pure T2V (`vstate = None`) — the keyframe/I2V per-token-σ path is
+    // rejected upstream and falls to the native arm here too as a belt-and-suspenders.
+    let (v, a) = match (sampler, vstate1.as_ref()) {
+        (Some(name), None) => denoise_av_curated(
+            dit,
+            name,
+            &vlat1,
+            audio_s1_noise,
+            video_ctx,
+            audio_ctx,
+            video_pos1,
+            audio_pos,
+            &STAGE1_SIGMAS,
+            seed,
+            cancel,
+            &mut |p| {
+                if let Progress::Step { current, .. } = p {
+                    on_step(current as usize)
+                }
+            },
+        )?,
+        _ => denoise_av(
+            dit,
+            &vlat1,
+            audio_s1_noise,
+            video_ctx,
+            audio_ctx,
+            video_pos1,
+            audio_pos,
+            &STAGE1_SIGMAS,
+            vstate1.as_ref(),
+            cancel,
+            on_step,
+        )?,
+    };
     let v = upsample_latents(&v, upsampler, latent_mean, latent_std)?;
     // Stage 2: re-noise / re-condition the upscaled video; re-noise audio (never upsampled).
     let (vlat2, vstate2): (Array, Option<I2vConditioning>) =
@@ -870,19 +970,41 @@ pub fn generate_av_latents(
         };
     let a = renoise(&a, audio_s2_noise, STAGE2_SIGMAS[0])?;
     dit.set_lora_pass(1);
-    denoise_av(
-        dit,
-        &vlat2,
-        &a,
-        video_ctx,
-        audio_ctx,
-        video_pos2,
-        audio_pos,
-        &STAGE2_SIGMAS,
-        vstate2.as_ref(),
-        cancel,
-        on_step,
-    )
+    match (sampler, vstate2.as_ref()) {
+        (Some(name), None) => denoise_av_curated(
+            dit,
+            name,
+            &vlat2,
+            &a,
+            video_ctx,
+            audio_ctx,
+            video_pos2,
+            audio_pos,
+            &STAGE2_SIGMAS,
+            // Distinct subkey from stage 1 so a stochastic curated solver's per-step noise is
+            // decorrelated across stages (a no-op for the deterministic distilled-Euler default).
+            seed.wrapping_add(0x5DEE_CE66),
+            cancel,
+            &mut |p| {
+                if let Progress::Step { current, .. } = p {
+                    on_step(current as usize)
+                }
+            },
+        ),
+        _ => denoise_av(
+            dit,
+            &vlat2,
+            &a,
+            video_ctx,
+            audio_ctx,
+            video_pos2,
+            audio_pos,
+            &STAGE2_SIGMAS,
+            vstate2.as_ref(),
+            cancel,
+            on_step,
+        ),
+    }
 }
 
 /// A stage-1 in-context conditioning clip (extend_clip / video_bridge): the source clip VAE-encoded at
