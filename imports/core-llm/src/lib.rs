@@ -20,6 +20,7 @@
 //! - [`Tokenizer`] + [`ChatTemplate`] — host-side text policy.
 //! - [`Scheduler`] — backend-neutral continuous-batching policy (admission + per-sequence retire).
 //! - [`PrefixIndex`] — backend-neutral shared-prefix KV-reuse policy (longest-match + LRU).
+//! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
 //! - [`registry`] — link-time provider registration and id-based routing.
 
 pub mod cancel;
@@ -28,6 +29,7 @@ pub mod constraint;
 pub mod error;
 pub mod message;
 pub mod output;
+pub mod paging;
 pub mod prefix;
 pub mod registry;
 pub mod request;
@@ -42,6 +44,7 @@ pub use constraint::{Constraint, ConstraintDecodeTable, JsonConstraint, JsonStat
 pub use error::{Error, Result};
 pub use message::{Content, ImageRef, Message, Role};
 pub use output::{FinishReason, StreamEvent, TextLlmOutput, Usage};
+pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use registry::{load_textllm, textllms, TextLlmRegistration};
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest};
