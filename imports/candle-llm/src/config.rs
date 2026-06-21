@@ -17,6 +17,9 @@ pub enum Architecture {
     Llama,
     /// Qwen3 family: adds per-head q/k RMSNorm in attention.
     Qwen3,
+    /// Phi-3 family: the Llama decoder shape, but with a **packed** `qkv_proj` (q‖k‖v) and a packed
+    /// `gate_up_proj` (gate‖up) — split at load into the standard projections.
+    Phi3,
 }
 
 impl Architecture {
@@ -37,6 +40,8 @@ impl Architecture {
         );
         if hay.contains("qwen3") {
             Ok(Architecture::Qwen3)
+        } else if hay.contains("phi3") {
+            Ok(Architecture::Phi3)
         } else if hay.contains("llama")
             || hay.contains("mistral")
             || (arch.is_none() && model_type.is_none())
@@ -50,11 +55,12 @@ impl Architecture {
         }
     }
 
-    /// The model-family tag (`"llama"` / `"qwen3"`).
+    /// The model-family tag (`"llama"` / `"qwen3"` / `"phi3"`).
     pub fn family(self) -> &'static str {
         match self {
             Architecture::Llama => "llama",
             Architecture::Qwen3 => "qwen3",
+            Architecture::Phi3 => "phi3",
         }
     }
 
@@ -314,6 +320,13 @@ mod tests {
             Architecture::from_config(&unknown),
             Err(Error::Unsupported(_))
         ));
+
+        // Phi-3 (packed qkv / gate_up; otherwise the Llama shape).
+        let phi3 = json!({ "architectures": ["Phi3ForCausalLM"], "model_type": "phi3" });
+        let a = Architecture::from_config(&phi3).unwrap();
+        assert_eq!(a, Architecture::Phi3);
+        assert_eq!(a.family(), "phi3");
+        assert!(!a.has_qk_norm());
     }
 
     #[test]

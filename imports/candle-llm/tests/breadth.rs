@@ -1,0 +1,60 @@
+//! Real-weights model-breadth tests (`#[ignore]` — need models on disk), story 7261.
+//!
+//! Each non-Llama architecture added to the `config.json` dispatch must stream coherent text through
+//! the backend-neutral `core_llm::TextLlm` from a real HF snapshot. Point the per-family env var at a
+//! snapshot dir and run (add `--features cuda` for the GPU path):
+//!
+//! ```text
+//! CANDLE_LLM_PHI3_MODEL=/path/Phi-3-mini-4k-instruct \
+//!   cargo test --features cuda --test breadth -- --ignored --nocapture
+//! ```
+
+use core_llm::{LoadSpec, Message, Sampling, StreamEvent, TextLlm, TextLlmRequest};
+
+use candle_llm::LlamaProvider;
+
+/// Load the snapshot at `$env`, check its reported family tag, and assert it streams coherent,
+/// word-bearing text (the streamed deltas reconstructing the final output).
+fn assert_streams_coherent(env: &str, family: &str) {
+    let Some(dir) = std::env::var(env).ok().filter(|v| !v.is_empty()) else {
+        eprintln!("skip: set {env}");
+        return;
+    };
+    let provider = LlamaProvider::load(&LoadSpec::dense(dir)).expect("load provider");
+    assert_eq!(provider.descriptor().family, family, "reported family tag");
+
+    let req = TextLlmRequest {
+        messages: vec![Message::user("The capital of France is")],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 24,
+        seed: Some(0),
+        ..Default::default()
+    };
+
+    let mut streamed = String::new();
+    let out = provider
+        .generate(&req, &mut |ev| {
+            if let StreamEvent::Token { text, .. } = ev {
+                streamed.push_str(&text);
+            }
+        })
+        .expect("generate");
+
+    println!("[{family}] {}", out.text.replace('\n', " "));
+    assert!(!out.text.trim().is_empty(), "{family}: produced no text");
+    assert_eq!(
+        streamed, out.text,
+        "{family}: streamed deltas must reconstruct the final text"
+    );
+    assert!(
+        out.text.chars().any(|c| c.is_alphabetic()),
+        "{family}: output should contain words, not just punctuation"
+    );
+}
+
+/// Phi-3: the Llama decoder shape with a packed `qkv_proj` + `gate_up_proj` (split at load).
+#[test]
+#[ignore = "needs a Phi-3 snapshot via CANDLE_LLM_PHI3_MODEL"]
+fn phi3_streams_coherent_text() {
+    assert_streams_coherent("CANDLE_LLM_PHI3_MODEL", "phi3");
+}
