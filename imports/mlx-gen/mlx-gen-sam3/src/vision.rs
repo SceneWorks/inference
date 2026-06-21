@@ -20,61 +20,16 @@ use std::rc::Rc;
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::module::Module;
 use mlx_rs::nn::MaxPool2d;
-use mlx_rs::ops::{add, concatenate_axis, conv_transpose2d, negative, pad, stack_axis};
+use mlx_rs::ops::{add, concatenate_axis, conv_transpose2d, negative, stack_axis};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::{conv2d, gelu_exact};
+use mlx_gen::nn::{conv2d, gelu_exact, window_partition, window_unpartition};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::Sam3VisionConfig;
 use crate::util::{conv_transpose_w, conv_w_ohwi, join};
-
-/// Partition NHWC `x` into `window`×`window` windows (zero-padding to a multiple of `window`).
-/// Returns the `[-1, window, window, c]` windows + the padded `(hp, wp)`. (Port of SAM3
-/// `window_partition`; identical to the SAM2 trunk's.)
-fn window_partition(x: &Array, window: i32) -> Result<(Array, (i32, i32))> {
-    let sh = x.shape();
-    let (b, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
-    let pad_h = (window - h % window) % window;
-    let pad_w = (window - w % window) % window;
-    let x = if pad_h > 0 || pad_w > 0 {
-        pad(x, &[(0, 0), (0, pad_h), (0, pad_w), (0, 0)][..], None, None)?
-    } else {
-        x.clone()
-    };
-    let (hp, wp) = (h + pad_h, w + pad_w);
-    let windows = x
-        .reshape(&[b, hp / window, window, wp / window, window, c])?
-        .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-        .reshape(&[-1, window, window, c])?;
-    Ok((windows, (hp, wp)))
-}
-
-/// Inverse of [`window_partition`]: stitch windows back to `[b, h, w, c]`, cropping padding.
-fn window_unpartition(
-    windows: &Array,
-    window: i32,
-    pad_hw: (i32, i32),
-    hw: (i32, i32),
-) -> Result<Array> {
-    let (hp, wp) = pad_hw;
-    let (h, w) = hw;
-    let num_per_image = (hp * wp) / window / window;
-    let b = windows.shape()[0] / num_per_image;
-    let x = windows
-        .reshape(&[b, hp / window, wp / window, window, window, -1])?
-        .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-        .reshape(&[b, hp, wp, -1])?;
-    if hp > h || wp > w {
-        let rows = Array::from_slice(&(0..h).collect::<Vec<i32>>(), &[h]);
-        let cols = Array::from_slice(&(0..w).collect::<Vec<i32>>(), &[w]);
-        Ok(x.take_axis(&rows, 1)?.take_axis(&cols, 2)?)
-    } else {
-        Ok(x)
-    }
-}
 
 /// Precomputed 2D-axial RoPE `(cos, sin)`, each `[end·end, head_dim]`, for a fixed feature grid.
 /// `freqs[j] = θ^(-(4j)/head_dim)` over `j∈[0, head_dim/4)`; per position `i` the row is

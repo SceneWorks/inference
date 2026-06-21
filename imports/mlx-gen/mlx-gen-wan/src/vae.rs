@@ -26,7 +26,9 @@ use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
-use crate::vae_common::{contiguous, scalar, slice_axis, tile_decode_accumulate, FeatCache};
+use crate::vae_common::{
+    contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, FeatCache,
+};
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
 const CACHE_T: i32 = 2;
@@ -66,11 +68,9 @@ fn rms_norm_channels(x: &Array, gamma: &Array) -> Result<Array> {
     Ok(multiply(&scaled, &gamma.reshape(&wshape)?)?)
 }
 
-/// Last `n` frames along the temporal axis (axis 2): the reference `x[:, :, -n:]`.
+/// Last `n` frames along the temporal axis (axis 2, NCTHW): the reference `x[:, :, -n:]`.
 fn last_t(x: &Array, n: i32) -> Result<Array> {
-    let t = x.shape()[2];
-    let idx: Vec<i32> = (t - n..t).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[n]), 2)?)
+    last_t_axis(x, n, 2)
 }
 
 /// Temporal slice `x[:, :, start:end]` (axis 2).

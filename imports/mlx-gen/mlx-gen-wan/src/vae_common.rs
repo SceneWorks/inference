@@ -29,6 +29,22 @@ pub(crate) fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<A
     Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), axis)?)
 }
 
+/// Last `n` frames along the temporal axis `t_axis`: the reference `x[…, -n:, …]`. The temporal axis
+/// differs by layout — z16 (NCTHW) at 2, z48 (channels-last NTHWC) at 1 — so each VAE binds its axis.
+pub(crate) fn last_t_axis(x: &Array, n: i32, t_axis: i32) -> Result<Array> {
+    let t = x.shape()[t_axis as usize];
+    let idx: Vec<i32> = (t - n..t).collect();
+    Ok(x.take_axis(Array::from_slice(&idx, &[n]), t_axis)?)
+}
+
+/// Bound the lazy computation graph + peak memory by forcing materialization here (the reference's
+/// per-chunk / per-tile `mx.eval`). Used by the z48 VAE's chunked encode/decode to keep the wider
+/// feature maps from accumulating into one unbounded graph.
+pub(crate) fn eval(x: &Array) -> Result<()> {
+    mlx_rs::transforms::eval([x])?;
+    Ok(())
+}
+
 /// Per-conv last-frames cache threaded through the chunked encode. `idx` resets to 0 each chunk and
 /// advances once per cache-bearing conv (in the fixed traversal order), so slots stay aligned.
 pub(crate) struct FeatCache {

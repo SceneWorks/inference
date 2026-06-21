@@ -298,6 +298,14 @@ impl Flux2Config {
     pub fn inner_dim(&self) -> usize {
         self.num_heads * self.head_dim
     }
+
+    /// The double-block indices that carry a ControlNet branch: every other double block (the
+    /// diffusers FLUX.2 ControlNet ships one control block per two base double blocks). Shared by the
+    /// loader (it needs the count) and the transformer (it needs the indices) so the `step_by(2)`
+    /// stride lives in one place (6937).
+    pub fn control_layer_places(&self) -> Vec<usize> {
+        (0..self.num_double_layers).step_by(2).collect()
+    }
 }
 
 #[cfg(test)]

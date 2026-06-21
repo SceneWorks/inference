@@ -73,8 +73,8 @@ use crate::vae_features::{image_vae_latent, video_vae_latent};
 use crate::vae_preprocess::{vae_transform_image, VAE_MAX_SIZE, VAE_MIN_SIZE, VAE_STRIDE};
 use crate::vision::{VisionConfig, VisionTower};
 use crate::vit_preprocess::{
-    pack_patches, preprocess_image, smart_resize, smart_video_nframes, FACTOR, IMAGE_MEAN,
-    IMAGE_STD, MERGE_SIZE, PATCH_SIZE, TEMPORAL_PATCH_SIZE,
+    normalized_frame, pack_patches, preprocess_image, smart_resize, smart_video_nframes, FACTOR,
+    IMAGE_MEAN, IMAGE_STD, MERGE_SIZE, PATCH_SIZE, TEMPORAL_PATCH_SIZE,
 };
 
 pub const MODEL_ID: &str = "bernini";
@@ -287,29 +287,19 @@ fn vit_encode_video(planner: &BerniniPlanner, frames: &[RgbImage]) -> Result<(Ar
             rh as u32,
             image::imageops::FilterType::CatmullRom,
         );
-        chw_t.push(normalized_chw_frame(resized.as_raw(), rh, rw)?);
+        chw_t.push(normalized_frame(
+            resized.as_raw(),
+            rh,
+            rw,
+            IMAGE_MEAN,
+            IMAGE_STD,
+        ));
     }
     let refs: Vec<&Array> = chw_t.iter().collect();
     let frames_t = concatenate_axis(&refs, 0)?; // [F, 3, H, W]
     let (pixels, grid) = pack_patches(&frames_t, PATCH_SIZE, TEMPORAL_PATCH_SIZE, MERGE_SIZE)?;
     let feat = planner.vision.forward(&pixels, &[grid])?;
     Ok((feat, grid))
-}
-
-/// One normalized ViT frame `[1, 3, H, W]` (rescale 1/255 + CLIP mean/std), channels-first.
-fn normalized_chw_frame(pixels_hwc: &[u8], h: i64, w: i64) -> Result<Array> {
-    let (hu, wu) = (h as usize, w as usize);
-    let mut data = vec![0f32; 3 * hu * wu];
-    for c in 0..3usize {
-        let (m, sd) = (IMAGE_MEAN[c], IMAGE_STD[c]);
-        for y in 0..hu {
-            for x in 0..wu {
-                let u = pixels_hwc[(y * wu + x) * 3 + c] as f32;
-                data[(c * hu + y) * wu + x] = (u / 255.0 - m) / sd;
-            }
-        }
-    }
-    Ok(Array::from_slice(&data, &[1, 3, h as i32, w as i32]))
 }
 
 /// VAE-encode one image (`.mode()`, the Gaussian mean) → normalized `[16, T, H8, W8]`.

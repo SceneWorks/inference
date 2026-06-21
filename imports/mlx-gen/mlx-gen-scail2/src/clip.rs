@@ -19,7 +19,7 @@
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::gelu_exact;
-use mlx_gen::weights::Weights;
+use mlx_gen::weights::{to_f32, Weights};
 use mlx_gen::Result;
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, split};
@@ -54,10 +54,6 @@ impl ClipVisionConfig {
     pub fn run_layers(&self) -> usize {
         self.num_layers - 1
     }
-}
-
-fn to_f32(x: &Array) -> Result<Array> {
-    Ok(x.as_dtype(Dtype::Float32)?)
 }
 
 fn load_lin(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
