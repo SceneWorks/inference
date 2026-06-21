@@ -2,9 +2,45 @@
 name = "candle-llm"
 version = "0.0.0"
 edition = "2021"
-description = "Reserved — on-device LLM serving engine, Candle backend (placeholder; work in progress)."
+description = "On-device text LLM serving engine for the Candle backend (cross-platform incl. Windows/CUDA); validates the core-llm contract. Work in progress."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/candle-llm"
 readme = "README.md"
+keywords = ["candle", "cuda", "llm", "inference", "serving"]
+categories = ["science"]
 
 [dependencies]
+# The Candle tensor backend. Pinned to the SAME git rev the `candle-gen` sibling family pins
+# (huggingface/candle post-0.10.2) so the whole on-device stack resolves ONE candle build — and
+# because that rev clears `CUDA_ERROR_INVALID_PTX` on Blackwell (sm_120). CPU by default; the
+# `cuda` / `metal` features select a GPU backend. Re-pin in lockstep with candle-gen.
+candle-core = { git = "https://github.com/huggingface/candle", rev = "65ecb58c11d2244a7e60c71bdcdb19b15b0a4343" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "65ecb58c11d2244a7e60c71bdcdb19b15b0a4343" }
+# The backend-neutral contract this crate implements (epic 7153, story 7154). Git dep on the
+# published repo during development (crates.io publish coordination is a later story); shares its
+# `CancelFlag`, `Tokenizer`, chat templates, and the `TextLlm` trait so there is one contract, not
+# two. candle-llm is the second backend, whose passing the conformance suite de-provisionalizes it.
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+# Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
+# inventory so the distributed slice links.
+inventory = "0.3"
+# Error plumbing for the engine surface.
+thiserror = "2"
+# config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-llm convention.
+serde_json = "1"
+
+[dev-dependencies]
+# The contract conformance suite (story 7201): run the registered LlamaProvider through the
+# backend-neutral checks. Same git source as the core-llm dep so cargo unifies on one core-llm.
+core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+
+[features]
+# Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).
+default = []
+# NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# Apple Metal GPU backend.
+metal = ["candle-core/metal", "candle-nn/metal"]
+# Flash-Attention (Windows/CUDA). For now this just implies `cuda`; the fused kernels need the
+# separate `candle-flash-attn` crate, wired in a later slice — mirrors candle-gen's placeholder.
+flash-attn = ["cuda"]
