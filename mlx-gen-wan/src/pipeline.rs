@@ -20,9 +20,9 @@ use mlx_rs::Array;
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
-use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Result};
+use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Progress, Result};
 
-use crate::scheduler::{make_scheduler, SolverKind};
+use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind};
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;
@@ -554,6 +554,54 @@ pub fn denoise(
     Ok(latents)
 }
 
+/// The dense denoise loop driven by a **curated unified solver** (epic 7114, sc-7121) — the additive
+/// fold onto the shared gen-core solver library, alongside the native [`denoise`]. Routes any curated
+/// [`mlx_gen::Solver`] (`euler` / `euler_ancestral` / `heun` / `dpmpp_sde` / `ddim` / …) through
+/// `mlx_gen::run_flow_sampler` over Wan's own shifted flow-σ schedule ([`compute_sigmas`]).
+///
+/// Wan's native `unipc`/`dpmpp2m` are a diffusers `FlowDPMSolver`/`FlowUniPC` in flow-SNR space
+/// (`λ = log((1−σ)/σ)`), which the gen-core VE-space solvers (`λ = −ln σ`) do NOT reproduce — so the
+/// native default stays on [`denoise`] (the N1 default-parity gate), and this path is selected only for
+/// the gen-core-only curated solvers. The model is velocity-prediction over the FLOW
+/// [`mlx_gen::TimestepConvention::Sigma`] convention, and Wan feeds the DiT the integer-valued timestep
+/// `(σ·num_train).trunc()` (the predict closure maps σ → that timestep). `seed` drives the stochastic
+/// solvers' per-step noise. Progress / cancel route through `run_flow_sampler`'s per-eval hook.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_curated(
+    transformer: &WanTransformer,
+    sampler_name: &str,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    guidance: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    init_noise: &Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+    let grid = transformer.patch_grid(init_noise);
+    let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
+    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+    let nt = num_train_timesteps as f32;
+    mlx_gen::run_flow_sampler(
+        Some(sampler_name),
+        mlx_gen::TimestepConvention::Sigma,
+        &sigmas,
+        init_noise.clone(),
+        seed,
+        cancel,
+        on_progress,
+        |x, sigma| {
+            // Wan feeds the DiT the integer-valued timestep `(σ·num_train).trunc()`, not raw σ.
+            let t = (sigma * nt).trunc();
+            predict(transformer, x, t, &cache, guidance, None)
+        },
+    )
+}
+
 /// One TI2V prediction with **per-token timesteps**, reusing the precomputed [`StepCache`]: a single
 /// batched forward over the per-token timestep vector `t_tokens` `[1, L]` (mask-blend, sc-2680),
 /// combined as `uncond + gs·(cond − uncond)` when CFG is on, else the B=1 cond-only forward. Mirrors
@@ -729,6 +777,63 @@ pub fn denoise_moe(
         on_step(i + 1);
     }
     Ok(latents)
+}
+
+/// The dual-expert MoE denoise loop driven by a **curated unified solver** (epic 7114, sc-7121) — the
+/// additive fold onto the shared gen-core solver library, alongside the native [`denoise_moe`]. Same
+/// rationale as [`denoise_curated`]: the native `unipc`/`dpmpp2m` (flow-SNR) stay native (N1), and this
+/// path serves the gen-core-only curated solvers. The boundary expert swap is applied inside the
+/// predict closure (the integer timestep `(σ·num_train).trunc()` is compared to `boundary_timestep`),
+/// so a multi-eval solver re-evaluates the correct expert at its intermediate σ.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_moe_curated(
+    low: &Expert,
+    high: &Expert,
+    boundary_timestep: f32,
+    sampler_name: &str,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    init_noise: &Array,
+    y: Option<&Array>,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+    let grid = low.transformer.patch_grid(init_noise);
+    let low_cache = build_cache(
+        low.transformer,
+        &low.ctx_cond,
+        low.ctx_uncond.as_ref(),
+        grid,
+    )?;
+    let high_cache = build_cache(
+        high.transformer,
+        &high.ctx_cond,
+        high.ctx_uncond.as_ref(),
+        grid,
+    )?;
+    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+    let nt = num_train_timesteps as f32;
+    mlx_gen::run_flow_sampler(
+        Some(sampler_name),
+        mlx_gen::TimestepConvention::Sigma,
+        &sigmas,
+        init_noise.clone(),
+        seed,
+        cancel,
+        on_progress,
+        |x, sigma| {
+            let t = (sigma * nt).trunc();
+            let (e, cache) = if t >= boundary_timestep {
+                (high, &high_cache)
+            } else {
+                (low, &low_cache)
+            };
+            predict(e.transformer, x, t, cache, e.guidance, y)
+        },
+    )
 }
 
 /// Decode denoised latents `[C, F, H, W]` → an RGB video tensor `[F_out, H_out, W_out, 3]` of

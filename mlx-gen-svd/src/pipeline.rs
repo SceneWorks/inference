@@ -9,7 +9,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, subtract, zeros_like};
 use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
-use mlx_gen::{CancelFlag, Error, Result};
+use mlx_gen::{CancelFlag, EdmModelSampling, Error, Progress, Result};
 
 use crate::config::SchedulerConfig;
 use crate::scheduler::{euler_step, scale_model_input, v_pred_denoised, EdmSchedule};
@@ -157,6 +157,63 @@ impl SvdPipeline {
             on_step(i + 1);
         }
         Ok(latents)
+    }
+
+    /// The curated unified-sampler denoise (epic 7114, sc-7122) — the additive alternative to the native
+    /// EDM Euler [`Self::denoise`], routing any curated [`mlx_gen::Solver`] through
+    /// [`mlx_gen::run_curated_sampler`] over an `EdmModelSampling` (v-prediction). SVD is **sampler-only**
+    /// (no scheduler axis, matching ComfyUI): it keeps its native Karras EDM σ schedule and only swaps
+    /// the integrator. The native Euler default is preserved (the N1 gate) — `mlx_gen::Solver::Euler`
+    /// over `EdmModelSampling` reproduces it exactly (the `to_d` round-trip cancels: `c_skip`/`c_out`
+    /// equal the V `denoised_coeffs` and `c_noise = 0.25·ln σ` equals `timestep`).
+    ///
+    /// The per-frame CFG (`uncond + linspace(min,max,F)·(cond − uncond)`) lives in the predict closure,
+    /// so a multi-eval solver re-applies it at each intermediate σ. `x_in` is the `c_in`-scaled latent
+    /// (`gc_denoise` applied `input_scale = 1/√(σ²+1)`); `t` is the EDM `c_noise`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_curated(
+        &self,
+        sampler_name: &str,
+        latents: &Array,
+        image_embeds: &Array,
+        image_latents: &Array,
+        added_time_ids: &Array,
+        num_frames: i32,
+        steps: usize,
+        min_g: f32,
+        max_g: f32,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let sched = EdmSchedule::karras(steps, &self.scheduler);
+        let ms = EdmModelSampling::svd();
+        // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond.
+        let embeds2 = concatenate_axis(&[&zeros_like(image_embeds)?, image_embeds], 0)?;
+        let img_lat2 = concatenate_axis(&[&zeros_like(image_latents)?, image_latents], 0)?;
+        let atid2 = concatenate_axis(&[added_time_ids, added_time_ids], 0)?;
+        let guidance = Self::guidance_schedule(num_frames, min_g, max_g);
+        mlx_gen::run_curated_sampler(
+            Some(sampler_name),
+            &ms,
+            &sched.sigmas,
+            latents.clone(),
+            seed,
+            cancel,
+            on_progress,
+            |x_in, t| {
+                let lat2 = concatenate_axis(&[x_in, x_in], 0)?; // [2,F,h,w,4]
+                let inp = concatenate_axis(&[&lat2, &img_lat2], -1)?; // [2,F,h,w,8]
+                let pred = self.unet.forward(&inp, t, &embeds2, &atid2, num_frames)?;
+                let uncond = pred.take_axis(Array::from_int(0), 0)?.expand_dims(0)?;
+                let cond = pred.take_axis(Array::from_int(1), 0)?.expand_dims(0)?;
+                // noise_pred = uncond + guidance · (cond − uncond), frame-wise — the v-prediction.
+                Ok(add(
+                    &uncond,
+                    &multiply(&guidance, &subtract(&cond, &uncond)?)?,
+                )?)
+            },
+        )
     }
 
     /// Chunked temporal VAE decode (diffusers `decode_latents`): divide by `scaling_factor`, decode in

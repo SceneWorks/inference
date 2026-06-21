@@ -141,6 +141,13 @@ fn wan_is_registered() {
     assert!(d.capabilities.supports_lora);
     assert!(d.capabilities.supports_lokr);
     assert!(d.capabilities.samplers.contains(&"unipc"));
+    // epic 7114 (sc-7121): the curated unified solvers are advertised additively beside the native set.
+    for s in ["euler_ancestral", "heun", "dpmpp_sde", "ddim"] {
+        assert!(
+            d.capabilities.samplers.contains(&s),
+            "curated sampler {s:?} should be advertised"
+        );
+    }
     // H/W align to patch×vae_stride = 32 for the z48 vae22 (spatial stride 16).
     assert_eq!(d.capabilities.min_size, 32);
 }
