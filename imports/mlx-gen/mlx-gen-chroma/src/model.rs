@@ -160,8 +160,15 @@ impl Chroma {
     }
 
     /// Run the true-CFG flow-match denoise from a given **packed** initial latent `[1, Si, 64]` →
-    /// final packed latent. Public so the e2e parity test can inject the reference's initial latents
-    /// (mlx and torch RNG differ); [`generate`](Self::generate) seeds it via `create_noise`.
+    /// final packed latent with the **Euler** sampler. Public so the e2e parity test can inject the
+    /// reference's initial latents (mlx and torch RNG differ); [`generate`](Self::generate) seeds it
+    /// via `create_noise` and selects the sampler per [`ChromaSamplerKind::from_request`].
+    ///
+    /// Thin wrapper over [`Self::denoise_with_sampler`] (the single source of truth for the
+    /// encode/sigma/RoPE/mask/CFG setup) forcing Euler — the diffusers reference and every committed
+    /// parity golden step with flow-match Euler. The production Flash **Heun** default (sc-5392) is
+    /// gated same-backend via [`Self::denoise_with_sampler_name`] (no torch Heun reference exists;
+    /// `ChromaPipeline` has no Heun scheduler).
     #[allow(clippy::too_many_arguments)]
     pub fn denoise(
         &self,
@@ -175,73 +182,15 @@ impl Chroma {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        let (tok, t5, tr, _) = self.parts()?;
-        let (pos_embeds, pos_mask) = encode_prompt(tok, t5, prompt)?;
-
-        let h2 = (height / 16) as usize;
-        let w2 = (width / 16) as usize;
-        let si = (h2 * w2) as i32;
-        let img_ids = latent_image_ids(h2, w2);
-        let txt_ids_pos = zero_text_ids(pos_embeds.shape()[1] as usize);
-        let mask_pos = Self::full_mask(&pos_mask, si)?;
-
-        // True CFG only kicks in above 1.0; the diffusers reference gates `do_classifier_free_guidance`
-        // on `guidance_scale > 1` and returns `pos` exactly otherwise. `chroma1_flash` defaults
-        // `true_cfg = 1.0` (distilled, single-forward), so skip the negative T5 encode and the negative
-        // DiT forward entirely there — a 2× per-step saving and bit-exact `pred = pos` (F-095).
-        let cfg = if guidance > 1.0 {
-            let (neg_embeds, neg_mask) = encode_prompt(tok, t5, negative)?;
-            let txt_ids_neg = zero_text_ids(neg_embeds.shape()[1] as usize);
-            let mask_neg = Self::full_mask(&neg_mask, si)?;
-            Some((neg_embeds, txt_ids_neg, mask_neg))
-        } else {
-            None
-        };
-
-        // Chroma's scheduler is `use_dynamic_shifting=false`. HD/Flash: static `shift` over the raw
-        // mlx `linspace(1,1/N,N)` — `σ'=shift·σ/(1+(shift-1)·σ)` (shift=1.0 ⇒ identity). Base:
-        // `use_beta_sigmas=true` — a beta-spaced schedule (sc-3840). NOT FLUX's resolution exp-shift.
-        let sigmas = if self.variant.use_beta_sigmas() {
-            crate::beta::base_sigmas(steps as usize)
-        } else {
-            let shift = self.variant.sigma_shift();
-            let mut s = build_linear_sigmas(steps as usize, width, height, false)?;
-            for v in s.iter_mut().take(steps as usize) {
-                *v = shift * *v / (1.0 + (shift - 1.0) * *v);
-            }
-            s
-        };
-        let sampler = FlowMatchSampler::new(sigmas);
-        let sampler_kind = ChromaSamplerKind::Euler;
-
-        // Enable the shared `mx.compile` fusion of the DiT's elementwise glue (adaLN modulate + gated
-        // residuals) for the denoise loop, matching FLUX.1/FLUX.2 (F-101/F-102). Scoped + restored on
-        // drop by the RAII guard (F-007); the fused helpers stay bit-exact to the eager ops.
-        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
-
-        // The RoPE table and the additive `[B,1,S,S]` mask are step-invariant (they depend only on the
-        // token positions / padding, not the timestep), so build them once per branch instead of every
-        // step inside `forward` (F-102).
-        let rope_pos = tr.build_rope_table(&txt_ids_pos, &img_ids)?;
-        let mask_pos2d = ChromaTransformer::attention_mask2d(Some(&mask_pos))?;
-        let neg_prepared = match &cfg {
-            Some((neg_embeds, txt_ids_neg, mask_neg)) => Some((
-                neg_embeds,
-                tr.build_rope_table(txt_ids_neg, &img_ids)?,
-                ChromaTransformer::attention_mask2d(Some(mask_neg))?,
-            )),
-            None => None,
-        };
-
-        self.denoise_loop(
-            latents,
-            sampler,
-            sampler_kind,
+        self.denoise_with_sampler(
+            prompt,
+            negative,
+            width,
+            height,
+            steps,
             guidance,
-            &pos_embeds,
-            &rope_pos,
-            mask_pos2d.as_ref(),
-            neg_prepared.as_ref(),
+            latents,
+            ChromaSamplerKind::Euler,
             cancel,
             on_progress,
         )
@@ -409,6 +358,41 @@ impl Chroma {
     #[doc(hidden)]
     pub fn t5_ref(&self) -> &T5TextEncoder {
         self.t5.as_ref().expect("t5 loaded")
+    }
+
+    /// Test accessor (real-weight e2e, sc-6903): run the denoise with an explicit sampler **name**,
+    /// routed through the production [`ChromaSamplerKind::from_request`] selection. Lets the e2e gate
+    /// drive the Flash **Heun** path that `generate` runs by default (sc-5392) but the Euler-forced
+    /// [`Self::denoise`] goldens never exercise. `sampler = None` reproduces the variant default
+    /// (Heun for Flash, Euler otherwise).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_with_sampler_name(
+        &self,
+        prompt: &str,
+        negative: &str,
+        width: u32,
+        height: u32,
+        steps: u32,
+        guidance: f32,
+        latents: Array,
+        sampler: Option<&str>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let kind = ChromaSamplerKind::from_request(self.variant, sampler);
+        self.denoise_with_sampler(
+            prompt,
+            negative,
+            width,
+            height,
+            steps,
+            guidance,
+            latents,
+            kind,
+            cancel,
+            on_progress,
+        )
     }
 
     /// Unpack + VAE-decode a packed latent `[1, Si, 64]` → an [`Image`].
