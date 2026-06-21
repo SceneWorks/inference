@@ -293,6 +293,13 @@ impl Sam3VideoModel {
             self.remove_object(*oid);
         }
 
+        // Bound the per-object memory bank: drop / null `non_cond` entries this frame's writes have
+        // pushed out of every future `gather_memory` read window, so a long clip's resident memory
+        // stops climbing ~2.65 MB · frames · objects without a ceiling (F-024). Runs after all per-frame
+        // writes (the non_cond inserts/fills + the recondition non_cond→cond move) so it never races
+        // the current frame's state.
+        self.evict_stale_memory(frame_idx);
+
         // --- build outputs ---
         self.build_outputs(
             &det,
@@ -317,7 +324,10 @@ impl Sam3VideoModel {
             .segmenter
             .forward_from_backbone(features, input_ids, text_mask)?;
         let presence = sigmoid(&seg.presence_logits)?.item::<f32>();
+        // Cast to f32 before the host readback (a bf16 detector head would panic in as_slice::<f32>),
+        // mirroring the `masks` readback two lines below and tracker.rs's casts (F-023).
         let probs: Vec<f32> = sigmoid(&seg.pred_logits)?
+            .as_dtype(Dtype::Float32)?
             .as_slice::<f32>()
             .iter()
             .map(|&s| s * presence)
@@ -346,7 +356,10 @@ impl Sam3VideoModel {
     // ----- memory bank gather (F2.4 selection logic) -----
     fn gather_memory(&self, obj_idx: usize, frame_idx: i32) -> (SpatialMem, ObjPointers, i32) {
         let bank = &self.banks[obj_idx];
-        // spatial memory: closest cond frames (offset 0) + non-cond at offsets [num_maskmem-1..1].
+        // Spatial memory = two reference windows: up to `MAX_COND_FRAME_NUM` closest conditioning
+        // frames (reference `max_cond_frames_in_attn`, offset 0) ++ the `NUM_MASKMEM-1` recent non-cond
+        // frames at offsets `[NUM_MASKMEM-1 .. 1]` (reference `num_maskmem`, falling back to an
+        // unselected cond frame at that offset). So the assembled spatial count is bounded by their sum.
         let (selected_cond, unselected_cond) =
             select_closest_cond_frames(frame_idx, &bank.cond, MAX_COND_FRAME_NUM);
         let mut spatial: Vec<(i32, Array, Array)> = Vec::new();
@@ -372,7 +385,18 @@ impl Sam3VideoModel {
                 }
             }
         }
-        // object pointers: eligible cond frames (t <= frame_idx) + non-cond up to max_optr-1.
+        debug_assert!(
+            spatial.len() <= (MAX_COND_FRAME_NUM + NUM_MASKMEM - 1) as usize,
+            "spatial memory exceeds its two reference windows (cond {MAX_COND_FRAME_NUM} + non-cond \
+             {})",
+            NUM_MASKMEM - 1
+        );
+        // Object pointers: every eligible conditioning-frame pointer (t <= frame_idx) ++ the recent
+        // non-cond pointers within the `max_optr = min(num_frames, MAX_OBJ_PTRS)` window (reference
+        // `max_object_pointers_in_encoder`). The non-cond contribution is bounded by `max_optr-1`; the
+        // cond contribution tracks the cond-map size (bounded by the recondition cadence, not a fixed
+        // cap), so the total is intentionally not hard-asserted here — capping cond growth is the
+        // separate `bank.cond` follow-up (the F-024 sibling).
         let max_optr = self.num_frames.min(MAX_OBJ_PTRS);
         let mut pointers: Vec<(i32, Array)> = Vec::new();
         for (&t, m) in &bank.cond {
@@ -390,6 +414,21 @@ impl Sam3VideoModel {
             }
         }
         (spatial, pointers, max_optr)
+    }
+
+    /// Evict `non_cond` bank entries that no future `gather_memory` can read, derived from the same
+    /// `NUM_MASKMEM` / `MAX_OBJ_PTRS` windows `gather_memory` uses (single source of truth). After
+    /// processing `frame_idx` the next gather is at frame ≥ `frame_idx + 1`; heavy tensors are read
+    /// back to `(frame_idx+1) − (NUM_MASKMEM−1)` and object pointers back to
+    /// `(frame_idx+1) − (MAX_OBJ_PTRS−1)`, and both windows only slide forward — so any entry older
+    /// than that is dead for the rest of the session (F-024). `cond` is left intact (gather's spatial
+    /// fallback + the pointer loop read it at arbitrary keys).
+    fn evict_stale_memory(&mut self, frame_idx: i32) {
+        let heavy_keep = frame_idx + 1 - (NUM_MASKMEM - 1);
+        let ptr_keep = frame_idx + 1 - (MAX_OBJ_PTRS - 1);
+        for bank in &mut self.banks {
+            evict_stale_bank(bank, heavy_keep, ptr_keep);
+        }
     }
 
     // ----- association (_associate_det_trk; mask-IoU, no Hungarian) -----
@@ -753,6 +792,21 @@ fn select_closest_cond_frames(
     (selected.into_iter().collect(), unselected)
 }
 
+/// Prune one object's `non_cond` bank to the future-readable window (F-024 eviction core, factored
+/// out as a free fn so the bound is unit-testable without a loaded model): entries older than
+/// `heavy_keep` have their heavy tensors nulled (gather short-circuits on `None`), and entries older
+/// than `ptr_keep` are dropped entirely (the object-pointer window has passed). `heavy_keep` and
+/// `ptr_keep` are the next gather's read floors; callers derive them from `NUM_MASKMEM`/`MAX_OBJ_PTRS`.
+fn evict_stale_bank(bank: &mut ObjectBank, heavy_keep: i32, ptr_keep: i32) {
+    for (&k, m) in bank.non_cond.iter_mut() {
+        if k < heavy_keep {
+            m.maskmem_features = None;
+            m.maskmem_pos_enc = None;
+        }
+    }
+    bank.non_cond.retain(|&k, _| k >= ptr_keep);
+}
+
 /// `_apply_non_overlapping_constraints` + `_suppress_shrinked_masks` per prompt group.
 #[allow(clippy::needless_range_loop)] // pixel-wise argmax over parallel grouped masks
 fn suppress_pw_area_shrinkage(masks: &[Vec<f32>], prompts: &[i32]) -> Vec<Vec<f32>> {
@@ -997,6 +1051,63 @@ mod tests {
 
     fn scores(dets: &[Detection]) -> Vec<f32> {
         dets.iter().map(|d| d.score).collect()
+    }
+
+    fn dummy_fm() -> FrameMem {
+        FrameMem {
+            maskmem_features: Some(Array::from_slice(&[0.0f32], &[1, 1])),
+            maskmem_pos_enc: Some(Array::from_slice(&[0.0f32], &[1, 1])),
+            object_pointer: Array::from_slice(&[0.0f32], &[1, 1]),
+            object_score: 0.0,
+        }
+    }
+
+    /// F-024: `evict_stale_bank` drops exactly the `non_cond` entries no future `gather_memory` can
+    /// read (older than the pointer window) and nulls the heavy tensors of those past the (tighter)
+    /// spatial window, while keeping the rest and never touching `cond`. Derived from frame_idx=20.
+    #[test]
+    fn evict_stale_bank_prunes_only_unreadable_entries() {
+        let mut bank = ObjectBank::default();
+        for k in 0..=20 {
+            bank.non_cond.insert(k, dummy_fm());
+        }
+        bank.cond.insert(3, dummy_fm()); // cond must be left intact
+
+        let frame_idx = 20;
+        let heavy_keep = frame_idx + 1 - (NUM_MASKMEM - 1);
+        let ptr_keep = frame_idx + 1 - (MAX_OBJ_PTRS - 1);
+        assert_eq!(
+            (heavy_keep, ptr_keep),
+            (15, 6),
+            "window floors for frame 20"
+        );
+        evict_stale_bank(&mut bank, heavy_keep, ptr_keep);
+
+        // keys < ptr_keep (0..=5): pointer window passed → entry dropped entirely.
+        for k in 0..ptr_keep {
+            assert!(!bank.non_cond.contains_key(&k), "key {k} must be evicted");
+        }
+        // keys in [ptr_keep, heavy_keep) (6..=14): kept, but heavy tensors nulled (object_pointer stays).
+        for k in ptr_keep..heavy_keep {
+            let m = bank
+                .non_cond
+                .get(&k)
+                .unwrap_or_else(|| panic!("key {k} must be kept"));
+            assert!(
+                m.maskmem_features.is_none() && m.maskmem_pos_enc.is_none(),
+                "heavy tensors must be nulled at key {k}"
+            );
+        }
+        // keys >= heavy_keep (15..=20): still spatially readable → heavy tensors retained.
+        for k in heavy_keep..=20 {
+            let m = bank.non_cond.get(&k).unwrap();
+            assert!(
+                m.maskmem_features.is_some() && m.maskmem_pos_enc.is_some(),
+                "heavy tensors must be kept at key {k}"
+            );
+        }
+        // cond is never touched by eviction.
+        assert!(bank.cond.contains_key(&3), "cond must be left intact");
     }
 
     /// sc-4995: among heavily-overlapping detections, NMS keeps the highest-scored and drops the rest.
