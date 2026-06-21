@@ -1,0 +1,23 @@
+[package]
+name = "core-llm-testkit"
+version = "0.0.0"
+edition = "2021"
+description = "Conformance suite for the core-llm TextLlm contract — drives any provider through streaming, cancellation, seed-determinism, capability, and multimodal checks. Tensor-free."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/core-llm"
+readme = "README.md"
+keywords = ["llm", "conformance", "testing", "contract"]
+categories = ["development-tools::testing"]
+
+# Neutral import path, decoupled from the package name (matches the gen-core-testkit convention).
+[lib]
+name = "core_llm_testkit"
+
+[dependencies]
+# The only runtime dependency: the contract crate. The suite drives providers purely through the
+# public trait, so it links no tensor library — it runs on any platform, like core-llm itself.
+core-llm = { path = ".." }
+
+[dev-dependencies]
+# The self-tests register an in-crate stub provider to exercise the registry round-trip check.
+inventory = "0.3"
