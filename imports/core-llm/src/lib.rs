@@ -19,6 +19,7 @@
 //! - [`Constraint`] + [`JsonState`] — constrained-decoding policy (generic JSON grammar).
 //! - [`Tokenizer`] + [`ChatTemplate`] — host-side text policy.
 //! - [`Scheduler`] — backend-neutral continuous-batching policy (admission + per-sequence retire).
+//! - [`PrefixIndex`] — backend-neutral shared-prefix KV-reuse policy (longest-match + LRU).
 //! - [`registry`] — link-time provider registration and id-based routing.
 
 pub mod cancel;
@@ -27,6 +28,7 @@ pub mod constraint;
 pub mod error;
 pub mod message;
 pub mod output;
+pub mod prefix;
 pub mod registry;
 pub mod request;
 pub mod schedule;
@@ -40,6 +42,7 @@ pub use constraint::{Constraint, ConstraintDecodeTable, JsonConstraint, JsonStat
 pub use error::{Error, Result};
 pub use message::{Content, ImageRef, Message, Role};
 pub use output::{FinishReason, StreamEvent, TextLlmOutput, Usage};
+pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use registry::{load_textllm, textllms, TextLlmRegistration};
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
