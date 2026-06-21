@@ -641,6 +641,7 @@ impl Bernini {
                 )));
             }
         }
+        validate_conditioning_video_clips(req)?;
         Ok(())
     }
 
@@ -961,6 +962,29 @@ impl Bernini {
     }
 }
 
+/// Reject empty / non-`1+4k` conditioning video clips before the full pipeline dereferences
+/// `frames[0]` (F-022). The full path does `rgb[0].height()` (generate_impl) and the MAR sampler
+/// reads `frames[0]`, and the WanVae temporally packs the clip (`T = 1 + 4·k`), so an empty or
+/// mis-counted clip from a malformed worker payload would panic / shape-mismatch deep inside
+/// generate_impl instead of erroring cleanly. Mirrors the renderer's `encode_videoclip` guard
+/// (preprocess.rs:35-47). Free fn so it is unit-testable without loading the full Bernini weights.
+fn validate_conditioning_video_clips(req: &GenerationRequest) -> Result<()> {
+    for c in &req.conditioning {
+        if let Conditioning::VideoClip { frames, .. } = c {
+            if frames.is_empty() {
+                return Err(Error::Msg("bernini: empty conditioning video clip".into()));
+            }
+            if frames.len() % 4 != 1 {
+                return Err(Error::Msg(format!(
+                    "bernini: conditioning video-clip frame count must be 1 + 4·k (got {})",
+                    frames.len()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Collect the conditioning into video clips + reference images, preserving order (videos then images).
 fn collect_conditioning(req: &GenerationRequest) -> (Vec<Vec<Image>>, Vec<Image>) {
     let mut videos: Vec<Vec<Image>> = Vec::new();
@@ -1072,6 +1096,39 @@ mod tests {
             resolve_vit_mode(None, false, true, false),
             VitMode::VaeTxtVitWapg
         ); // i2i
+    }
+
+    /// F-022: empty / non-`1+4k` conditioning video clips must be rejected up front with a clean
+    /// `Error`, not dereferenced as `frames[0]` deep in the full pipeline on a malformed worker payload.
+    #[test]
+    fn rejects_empty_and_miscounted_conditioning_video_clips() {
+        let clip = |n: usize| Conditioning::VideoClip {
+            frames: vec![
+                Image {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![0u8; 2 * 2 * 3],
+                };
+                n
+            ],
+            frame_idx: 0,
+            strength: 1.0,
+        };
+        let req = |conds: Vec<Conditioning>| GenerationRequest {
+            conditioning: conds,
+            ..Default::default()
+        };
+        // empty clip → clean error (the panic this guards), not a frames[0] index.
+        assert!(validate_conditioning_video_clips(&req(vec![clip(0)])).is_err());
+        // 3 frames (not 1 + 4·k) → error.
+        assert!(validate_conditioning_video_clips(&req(vec![clip(3)])).is_err());
+        // valid temporal counts (1 + 4·k) → ok.
+        assert!(validate_conditioning_video_clips(&req(vec![clip(1)])).is_ok());
+        assert!(validate_conditioning_video_clips(&req(vec![clip(5)])).is_ok());
+        // no conditioning → ok.
+        assert!(validate_conditioning_video_clips(&req(vec![])).is_ok());
+        // a bad clip among several valid ones is still caught.
+        assert!(validate_conditioning_video_clips(&req(vec![clip(5), clip(0)])).is_err());
     }
 
     /// `grid_tokens` = t·h·w / merge².

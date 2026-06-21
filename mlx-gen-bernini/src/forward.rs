@@ -155,11 +155,15 @@ impl PackedForward {
         let (nv, ni) = (videos.len(), images.len());
         let vi_sids = assign_source_ids(nv + ni, self.max_trained_src_id, self.interpolate_src_id);
         let i_sids = assign_source_ids(ni, self.max_trained_src_id, self.interpolate_src_id);
-        let v = if nv > 0 {
-            vec![(videos[0].clone(), vi_sids[0])]
-        } else {
-            vec![]
-        };
+        // The video-only guidance term must condition on EVERY conditioning video, exactly as the `vi`
+        // combo below (and the full-Bernini reference's video-only `eps_v`) do — hardcoding `videos[0]`
+        // silently dropped clips 2..n from the V2vChain/Rv2v video-only delta with no error (F-021).
+        // Reuse `vi_sids[..nv]` so a video carries the same source-id it gets in the `vi` combo.
+        let v = videos
+            .iter()
+            .enumerate()
+            .map(|(k, vid)| (vid.clone(), vi_sids[k]))
+            .collect();
         let i = images
             .iter()
             .enumerate()
@@ -588,6 +592,35 @@ mod tests {
         .unwrap();
         assert_eq!(got.shape(), noisy.shape());
         assert_eq!(max_abs(&got, &want), 0.0, "t2v must equal manual CFG");
+    }
+
+    /// F-021: the video-only guidance combo (`Combos::v`) must carry EVERY conditioning video,
+    /// mirroring the `vi` combo, not hardcode `videos[0]` — otherwise clips 2..n are silently dropped
+    /// from the V2vChain/Rv2v video-only delta. Pure host-side combo assembly: no DiT / weights.
+    #[test]
+    fn build_combos_includes_every_conditioning_video() {
+        let pf = PackedForward::new(128, 16, (1, 2, 2), 5.0, true);
+        let v0 = Array::zeros::<f32>(&[16, 1, 2, 2]).unwrap();
+        let v1 = Array::ones::<f32>(&[16, 1, 2, 2]).unwrap();
+        let c = pf.build_combos(&[v0.clone(), v1.clone()], &[]);
+        assert_eq!(
+            c.v.len(),
+            2,
+            "video-only combo must carry both conditioning videos, not just videos[0]"
+        );
+        // the 2nd entry is the 2nd clip (ones), not a duplicate of videos[0] (zeros).
+        assert!(
+            max_abs(&c.v[1].0, &v0) > 0.0,
+            "v[1] must be the 2nd clip, not a copy of videos[0]"
+        );
+        // source-ids mirror the `vi` combo's video portion (videos-first ordering).
+        assert_eq!(c.v[0].1, c.vi[0].1);
+        assert_eq!(c.v[1].1, c.vi[1].1);
+        // nv == 1 stays equivalent to the prior single-video build (no regression); nv == 0 → empty.
+        let one = pf.build_combos(&[v0.clone()], &[]);
+        assert_eq!(one.v.len(), 1);
+        assert_eq!(one.v[0].1, one.vi[0].1);
+        assert!(pf.build_combos(&[], &[]).v.is_empty());
     }
 
     /// `vae_txt_vit` dispatch: [`vit_one_step`] must equal the manual 4-forward combine via
