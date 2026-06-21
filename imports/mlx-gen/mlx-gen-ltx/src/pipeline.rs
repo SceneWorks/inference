@@ -106,6 +106,9 @@ pub fn denoise(
     let (b, c, f, h, w) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
     let num_tokens = f * h * w;
     let mut lat = latents.clone();
+    // One fresh RoPE epoch for this stage: `positions` is constant across the loop, so the SPLIT-RoPE
+    // tables compute on step 0 and hit the memo for the rest — no per-step positions host copy (sc-7141).
+    let rope_epoch = Some(dit.next_rope_epoch());
 
     for i in 0..sigmas.len() - 1 {
         // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551,
@@ -122,7 +125,7 @@ pub fn denoise(
             Some(st) => st.token_timesteps(sigma, h, w)?,
             None => broadcast_to(&scalar(sigma).as_dtype(dt)?, &[b, num_tokens])?,
         };
-        let velocity = dit.forward(&flat, &ts, context, None, positions)?;
+        let velocity = dit.forward(&flat, &ts, context, None, positions, rope_epoch)?;
         // (B, S, C) → (B, C, S) → (B, C, F, H, W).
         let velocity = velocity
             .transpose_axes(&[0, 2, 1])?
@@ -626,6 +629,8 @@ pub fn denoise_av(
 
     let mut vlat = video.clone();
     let mut alat = audio.clone();
+    // One fresh RoPE epoch for this stage: both position grids are constant across the loop (sc-7141).
+    let rope_epoch = Some(dit.next_rope_epoch());
     for i in 0..sigmas.len() - 1 {
         // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
         if cancel.is_cancelled() {
@@ -645,6 +650,7 @@ pub fn denoise_av(
         let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
         let (vvel, avel) = dit.forward(
             &vflat, &vts, video_ctx, None, video_pos, &aflat, &ats, audio_ctx, None, audio_pos,
+            rope_epoch,
         )?;
         let vvel = vvel
             .transpose_axes(&[0, 2, 1])?
@@ -732,6 +738,10 @@ pub fn denoise_av_tokens(
 
     let mut vtok = video.latent.clone();
     let mut alat = audio.clone();
+    // One fresh RoPE epoch for this stage: `video.positions` / `audio_pos` are constant across the loop
+    // (the input `video` is borrowed read-only; its `positions` is only mutated to build the return
+    // state *after* the loop), so the per-stage tables hit the memo for steps 1.. (sc-7141).
+    let rope_epoch = Some(dit.next_rope_epoch());
     for i in 0..sigmas.len() - 1 {
         // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
         if cancel.is_cancelled() {
@@ -758,6 +768,7 @@ pub fn denoise_av_tokens(
             audio_ctx,
             None,
             audio_pos,
+            rope_epoch,
         )?;
         let avel = avel
             .reshape(&[ab, at, ac, af])?
