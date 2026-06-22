@@ -142,6 +142,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-flash-attn"
+version = "0.10.2"
+source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "cudaforge",
+ "half",
+]
+
+[[package]]
 name = "candle-kernels"
 version = "0.10.2"
 source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
@@ -154,6 +165,7 @@ name = "candle-llm"
 version = "0.0.0"
 dependencies = [
  "candle-core",
+ "candle-flash-attn",
  "candle-nn",
  "core-llm",
  "core-llm-testkit",
