@@ -60,6 +60,55 @@ impl Rope {
         }
     }
 
+    /// YaRN-scaled RoPE (DeepSeek-V2's `rope_scaling` "yarn" schedule), over `rope_dim` dimensions.
+    ///
+    /// Each inverse frequency is a wavelength-ramped blend of the **extrapolated** frequency (the
+    /// plain `theta^(-2i/rope_dim)`, kept for short-wavelength / high-frequency dims) and the
+    /// **interpolated** frequency (divided by `factor`, for long-wavelength / low-frequency dims).
+    /// The ramp boundaries are the dimensions whose rotation count crosses `beta_fast` / `beta_slow`
+    /// over the `original_context`. Always interleaved (the DeepSeek pairing). The cos/sin magnitude
+    /// scale (`mscale`) is `1.0` in the symmetric `mscale == mscale_all_dim` case the released models
+    /// use, and is therefore not applied here; the attention-softmax `mscale²` lives in the scale.
+    pub fn yarn(
+        rope_dim: i32,
+        theta: f32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original_context: f32,
+    ) -> Self {
+        let dim = rope_dim as usize;
+        let half = dim / 2;
+        // The (fractional) dimension index whose wavelength completes `num_rotations` cycles over the
+        // original context — the YaRN correction-range endpoints.
+        let correction_dim = |num_rotations: f32| -> f32 {
+            (dim as f32 * (original_context / (num_rotations * 2.0 * std::f32::consts::PI)).ln())
+                / (2.0 * theta.ln())
+        };
+        let low = correction_dim(beta_fast).floor().max(0.0);
+        let high = correction_dim(beta_slow).ceil().min((dim - 1) as f32);
+        // Guard a degenerate (zero-width) ramp, matching the reference's `min == max` nudge.
+        let span = if (high - low).abs() < 1e-3 {
+            1e-3
+        } else {
+            high - low
+        };
+        let inv_freq = (0..half)
+            .map(|i| {
+                let freq_extra = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+                let freq_inter = freq_extra / factor;
+                // ramp 0 → extrapolate (high freq), 1 → interpolate (low freq).
+                let ramp = ((i as f32 - low) / span).clamp(0.0, 1.0);
+                freq_inter * ramp + freq_extra * (1.0 - ramp)
+            })
+            .collect();
+        Self {
+            inv_freq,
+            dim,
+            interleaved: true,
+        }
+    }
+
     /// Llama-3 scaled RoPE (the `rope_scaling` "llama3" NTK-by-parts schedule).
     ///
     /// Low-frequency components (long wavelength) are divided by `factor`; high-frequency components
@@ -234,6 +283,32 @@ mod tests {
         let last = std_rope.inv_freq().len() - 1;
         assert!(l3.inv_freq()[last] < std_rope.inv_freq()[last]);
         assert!((l3.inv_freq()[last] - std_rope.inv_freq()[last] / 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn yarn_blends_extrapolated_and_interpolated_frequencies() {
+        // DeepSeek-V2-Lite params: rope_dim 64, theta 1e4, factor 40, beta 32/1, orig ctx 4096.
+        // Correction range is dims [10, 23]: below it the frequency is extrapolated (plain), above it
+        // interpolated (plain / factor), with a linear ramp between.
+        let rope = Rope::yarn(64, 10000.0, 40.0, 32.0, 1.0, 4096.0);
+        assert!(rope.interleaved());
+        assert_eq!(rope.dim(), 64);
+        assert_eq!(rope.inv_freq().len(), 32);
+
+        let extra = |i: usize| 1.0f32 / 10000f32.powf((2 * i) as f32 / 64.0);
+        // High-frequency dims (i ≤ low=10) are extrapolated unchanged.
+        assert!((rope.inv_freq()[0] - extra(0)).abs() < 1e-9); // == 1.0
+        assert!((rope.inv_freq()[10] - extra(10)).abs() < 1e-6);
+        // Low-frequency dims (i ≥ high=23) are interpolated: plain / factor.
+        assert!((rope.inv_freq()[31] - extra(31) / 40.0).abs() < 1e-9);
+        assert!((rope.inv_freq()[23] - extra(23) / 40.0).abs() < 1e-6);
+        // A mid-band dim is a strict blend, between the two endpoints.
+        let mid = rope.inv_freq()[16];
+        assert!(mid < extra(16) && mid > extra(16) / 40.0, "{mid}");
+        // Frequencies are monotonically decreasing across the head.
+        for w in rope.inv_freq().windows(2) {
+            assert!(w[0] > w[1], "not decreasing: {} !> {}", w[0], w[1]);
+        }
     }
 
     #[test]

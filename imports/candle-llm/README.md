@@ -46,6 +46,12 @@ parity tests:
 | `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode |
 | `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128) |
 | `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load |
+| `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
+
+The `breadth` test streams a prompt through each non-Llama architecture: **Phi-3** (packed qkv/gate_up),
+**Qwen2-MoE** (router + experts + shared, q/k/v bias), **Gemma-2** (sandwich norms + soft-caps + GeGLU),
+**GLM-4** (sandwich + partial/interleaved RoPE), and **DeepSeek-V2** (Multi-head Latent Attention +
+fine-grained MoE; verified on `deepseek-ai/DeepSeek-V2-Lite-Chat`, which fits in 96GB).
 
 > Q4_K's block size is 256, so Q4 quantize-on-load needs projection `in`-dims that are multiples of
 > 256 (true of Qwen3's hidden 1024, not of SmolLM2's 576); Q8_0's block is 32 and applies broadly.

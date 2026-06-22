@@ -1,9 +1,13 @@
-//! Generic Llama-family causal decoder (Llama / Mistral / Qwen3).
+//! Generic Llama-family causal decoder, config-dispatched across architectures (Llama / Mistral,
+//! Qwen3, Phi-3, Qwen2-MoE, Gemma-2, GLM-4, DeepSeek-V2).
 //!
 //! The Candle port of `mlx-llm`'s `LlamaModel`, modelled alongside `candle-gen-sensenova`'s
-//! hand-rolled Qwen3 stack. Attention optionally applies per-head q/k RMSNorm (Qwen3); projections
-//! are held behind [`Projection`] so a model can be quantized on load. The forward is `&self`; the
-//! KV cache is the only mutable state, threaded in as `&mut dyn KvCache`.
+//! hand-rolled Qwen3 stack. One block shape covers the family: self-attention is either grouped-query
+//! attention (with optional per-head q/k RMSNorm for Qwen3) or Multi-head Latent Attention (DeepSeek's
+//! low-rank KV path); the FFN is a dense gated MLP or a sparse Mixture-of-Experts bank; norms are the
+//! Llama pre-norm or the Gemma-2/GLM-4 4-norm sandwich. Projections are held behind [`Projection`] so
+//! a model can be quantized on load. The forward is `&self`; the KV cache is the only mutable state,
+//! threaded in as `&mut dyn KvCache`.
 //!
 //! Shapes are batch-capable (`[batch, seq, …]`). `head_dim` is taken from config and may differ from
 //! `hidden_size / num_heads` (e.g. Qwen3-0.6B: hidden 1024, 16 heads, head_dim 128). Compute runs in
@@ -107,37 +111,62 @@ impl LlamaModel {
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             let lp = |suffix: &str| join(prefix, &format!("model.layers.{i}.{suffix}"));
-            let (q_norm, k_norm) = if qk_norm {
-                (
-                    Some(req(lp("self_attn.q_norm.weight"))?),
-                    Some(req(lp("self_attn.k_norm.weight"))?),
-                )
+
+            // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention. MLA's
+            // low-rank q/kv projections are wholly distinct from GQA's q/k/v, so it is its own path.
+            let attn = if cfg.architecture.is_mla() {
+                Attention::Mla(MlaAttention::load(w, lp, &cfg, dtype, quant)?)
             } else {
-                (None, None)
-            };
-            // Attention projections: a packed `qkv_proj` (Phi-3, no bias) is split into q/k/v, else
-            // the separate `q_proj`/`k_proj`/`v_proj` are loaded directly (with q/k/v bias for Qwen2).
-            let (q, k, v) = {
-                let packed = lp("self_attn.qkv_proj.weight");
-                if w.contains(&packed) {
-                    let qkv = req(packed)?; // [qd + 2*kvd, hidden]
+                let (q_norm, k_norm) = if qk_norm {
                     (
-                        Projection::load(qkv.narrow(0, 0, qd)?.contiguous()?, quant)?,
-                        Projection::load(qkv.narrow(0, qd, kvd)?.contiguous()?, quant)?,
-                        Projection::load(qkv.narrow(0, qd + kvd, kvd)?.contiguous()?, quant)?,
+                        Some(req(lp("self_attn.q_norm.weight"))?),
+                        Some(req(lp("self_attn.k_norm.weight"))?),
                     )
                 } else {
-                    (
-                        proj_b(lp("self_attn.q_proj.weight"))?,
-                        proj_b(lp("self_attn.k_proj.weight"))?,
-                        proj_b(lp("self_attn.v_proj.weight"))?,
-                    )
-                }
+                    (None, None)
+                };
+                // A packed `qkv_proj` (Phi-3, no bias) is split into q/k/v, else the separate
+                // `q_proj`/`k_proj`/`v_proj` are loaded directly (with q/k/v bias for Qwen2).
+                let (q, k, v) = {
+                    let packed = lp("self_attn.qkv_proj.weight");
+                    if w.contains(&packed) {
+                        let qkv = req(packed)?; // [qd + 2*kvd, hidden]
+                        (
+                            Projection::load(qkv.narrow(0, 0, qd)?.contiguous()?, quant)?,
+                            Projection::load(qkv.narrow(0, qd, kvd)?.contiguous()?, quant)?,
+                            Projection::load(qkv.narrow(0, qd + kvd, kvd)?.contiguous()?, quant)?,
+                        )
+                    } else {
+                        (
+                            proj_b(lp("self_attn.q_proj.weight"))?,
+                            proj_b(lp("self_attn.k_proj.weight"))?,
+                            proj_b(lp("self_attn.v_proj.weight"))?,
+                        )
+                    }
+                };
+                Attention::Gqa(LlamaAttention {
+                    q,
+                    k,
+                    v,
+                    o: proj_b(lp("self_attn.o_proj.weight"))?,
+                    q_norm,
+                    k_norm,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    scale,
+                    groups,
+                    eps,
+                    softcap: cfg.attn_logit_softcap,
+                    rope_interleaved: cfg.architecture.rope_interleaved(),
+                })
             };
 
-            // Feed-forward: a sparse Mixture-of-Experts bank (Qwen2-MoE) or a dense MLP. Gemma uses
-            // GeGLU (gelu), everything else SwiGLU (silu).
-            let ffn = if let Some(moe) = cfg.moe {
+            // Feed-forward: a sparse Mixture-of-Experts bank or a dense MLP. DeepSeek keeps its leading
+            // `first_k_dense_replace` layers dense even though the model is MoE. Gemma uses GeGLU
+            // (gelu); everything else SwiGLU (silu).
+            let moe_layer = cfg.moe.filter(|m| i >= m.first_k_dense_replace);
+            let ffn = if let Some(moe) = moe_layer {
                 let mut experts = Vec::with_capacity(moe.num_experts);
                 for e in 0..moe.num_experts {
                     let ep = |s: &str| lp(&format!("mlp.experts.{e}.{s}"));
@@ -148,18 +177,31 @@ impl LlamaModel {
                         gelu: false,
                     });
                 }
+                // Shared expert key stem: DeepSeek packs `n_shared_experts` into `mlp.shared_experts`
+                // (plural, ungated); Qwen2-MoE has a single `mlp.shared_expert` gated by a sigmoid.
+                let shared_stem = if w.contains(&lp("mlp.shared_experts.gate_proj.weight")) {
+                    "mlp.shared_experts"
+                } else {
+                    "mlp.shared_expert"
+                };
+                let shared_gate_key = lp("mlp.shared_expert_gate.weight");
                 Ffn::Moe(MoeMlp {
                     router: req(lp("mlp.gate.weight"))?, // [num_experts, hidden]
                     experts,
                     shared: LlamaMlp {
-                        gate: proj(lp("mlp.shared_expert.gate_proj.weight"))?,
-                        up: proj(lp("mlp.shared_expert.up_proj.weight"))?,
-                        down: proj(lp("mlp.shared_expert.down_proj.weight"))?,
+                        gate: proj(lp(&format!("{shared_stem}.gate_proj.weight")))?,
+                        up: proj(lp(&format!("{shared_stem}.up_proj.weight")))?,
+                        down: proj(lp(&format!("{shared_stem}.down_proj.weight")))?,
                         gelu: false,
                     },
-                    shared_gate: req(lp("mlp.shared_expert_gate.weight"))?, // [1, hidden]
+                    shared_gate: if w.contains(&shared_gate_key) {
+                        Some(req(shared_gate_key)?) // [1, hidden]
+                    } else {
+                        None
+                    },
                     experts_per_tok: moe.num_experts_per_tok,
                     norm_topk_prob: moe.norm_topk_prob,
+                    routed_scaling_factor: moe.routed_scaling_factor,
                 })
             } else {
                 // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
@@ -215,22 +257,7 @@ impl LlamaModel {
                 post_ln: norm_w(lp(&format!("{post_attn_key}.weight")))?,
                 pre_ff_ln,
                 post_ff_ln,
-                attn: LlamaAttention {
-                    q,
-                    k,
-                    v,
-                    o: proj_b(lp("self_attn.o_proj.weight"))?,
-                    q_norm,
-                    k_norm,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    scale,
-                    groups,
-                    eps,
-                    softcap: cfg.attn_logit_softcap,
-                    rope_interleaved: cfg.architecture.rope_interleaved(),
-                },
+                attn,
                 ffn,
                 eps,
             });
@@ -406,7 +433,7 @@ struct LlamaLayer {
     pre_ff_ln: Option<Tensor>,
     /// Gemma-2 only: the post-feedforward norm applied to the MLP output before the residual add.
     post_ff_ln: Option<Tensor>,
-    attn: LlamaAttention,
+    attn: Attention,
     ffn: Ffn,
     eps: f64,
 }
@@ -459,6 +486,31 @@ impl Ffn {
         match self {
             Ffn::Dense(m) => m.forward(x),
             Ffn::Moe(m) => m.forward(x),
+        }
+    }
+}
+
+/// A layer's self-attention: grouped-query attention (Llama family) or Multi-head Latent Attention
+/// (DeepSeek-V2). Both consume the same RoPE tables and additive mask and write into the same
+/// [`KvCache`] seam, so the surrounding block is identical.
+enum Attention {
+    Gqa(LlamaAttention),
+    Mla(MlaAttention),
+}
+
+impl Attention {
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: AttnMask<'_>,
+        cache: &mut dyn KvCache,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Attention::Gqa(a) => a.forward(x, cos, sin, mask, cache, layer_idx),
+            Attention::Mla(a) => a.forward(x, cos, sin, mask, cache, layer_idx),
         }
     }
 }
@@ -531,6 +583,165 @@ impl LlamaAttention {
     }
 }
 
+/// Multi-head Latent Attention (DeepSeek-V2).
+///
+/// Instead of projecting full per-head keys/values, MLA down-projects the input to a small shared
+/// latent (`kv_a_proj_with_mqa` → `kv_a_layernorm`, width `kv_lora_rank`) plus a single shared rotary
+/// key sub-vector (`k_pe`, MQA-style). The latent is up-projected (`kv_b_proj`) to per-head content
+/// keys (`k_nope`) and values. Queries split the same way: a content part (`q_nope`) and a rotary
+/// part (`q_pe`) — from a full `q_proj`, or a low-rank `q_a_proj` → norm → `q_b_proj` when the model
+/// has a query LoRA. RoPE rotates only the `qk_rope_head_dim` sub-vectors; the per-head key is
+/// `[k_nope ‖ k_pe]` and the query `[q_nope ‖ q_pe]`, attended at `q_head_dim = qk_nope + qk_rope`.
+///
+/// This is the **correctness-first** materialized form: it reconstructs full per-head K (`q_head_dim`)
+/// and V (`v_head_dim`) and caches them like ordinary attention, so the existing [`KvCache`] and
+/// [`sdpa`] are reused unchanged (the latent-caching "absorbed" optimization is a later throughput
+/// concern). Heads are full MHA here (no GQA expansion).
+struct MlaAttention {
+    /// Full query projection (when there is no query LoRA — DeepSeek-V2-Lite).
+    q_proj: Option<Projection>,
+    /// Query LoRA down-projection (`q_a_proj`), present iff `q_lora_rank` is set.
+    q_a_proj: Option<Projection>,
+    /// RMSNorm over the query latent (`q_a_layernorm`).
+    q_a_layernorm: Option<Tensor>,
+    /// Query LoRA up-projection (`q_b_proj`).
+    q_b_proj: Option<Projection>,
+    /// Shared KV down-projection with the MQA rotary key (`kv_a_proj_with_mqa`) →
+    /// `[kv_lora_rank ‖ qk_rope_head_dim]`.
+    kv_a_proj: Projection,
+    /// RMSNorm over the KV latent (`kv_a_layernorm`).
+    kv_a_layernorm: Tensor,
+    /// KV up-projection (`kv_b_proj`) → per-head `[qk_nope_head_dim ‖ v_head_dim]`.
+    kv_b_proj: Projection,
+    /// Output projection over the concatenated per-head values.
+    o_proj: Projection,
+    num_heads: usize,
+    qk_nope_head_dim: usize,
+    qk_rope_head_dim: usize,
+    v_head_dim: usize,
+    kv_lora_rank: usize,
+    scale: f32,
+    eps: f64,
+}
+
+impl MlaAttention {
+    fn load(
+        w: &Weights,
+        lp: impl Fn(&str) -> String,
+        cfg: &LlamaConfig,
+        dtype: DType,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
+        let mla = cfg
+            .mla
+            .expect("MLA config present for a DeepSeek-V2 decoder");
+        let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
+        let proj = |key: String| -> Result<Projection> { Projection::load(req(key)?, quant) };
+
+        // Query: a low-rank `q_a → norm → q_b` when the model has a query LoRA, else a full `q_proj`.
+        let (q_proj, q_a_proj, q_a_layernorm, q_b_proj) =
+            if w.contains(&lp("self_attn.q_a_proj.weight")) {
+                (
+                    None,
+                    Some(proj(lp("self_attn.q_a_proj.weight"))?),
+                    Some(req(lp("self_attn.q_a_layernorm.weight"))?),
+                    Some(proj(lp("self_attn.q_b_proj.weight"))?),
+                )
+            } else {
+                (Some(proj(lp("self_attn.q_proj.weight"))?), None, None, None)
+            };
+
+        Ok(Self {
+            q_proj,
+            q_a_proj,
+            q_a_layernorm,
+            q_b_proj,
+            kv_a_proj: proj(lp("self_attn.kv_a_proj_with_mqa.weight"))?,
+            kv_a_layernorm: req(lp("self_attn.kv_a_layernorm.weight"))?,
+            kv_b_proj: proj(lp("self_attn.kv_b_proj.weight"))?,
+            o_proj: proj(lp("self_attn.o_proj.weight"))?,
+            num_heads: cfg.num_heads as usize,
+            qk_nope_head_dim: mla.qk_nope_head_dim as usize,
+            qk_rope_head_dim: mla.qk_rope_head_dim as usize,
+            v_head_dim: mla.v_head_dim as usize,
+            kv_lora_rank: mla.kv_lora_rank as usize,
+            scale: cfg.attn_scale(),
+            eps: cfg.rms_norm_eps as f64,
+        })
+    }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: AttnMask<'_>,
+        cache: &mut dyn KvCache,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (b, s, _) = x.dims3()?;
+        let nh = self.num_heads;
+        let (nope, rope, vhd) = (
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+        );
+        let qhd = nope + rope; // per-head q/k dim attended over
+
+        // Query → [b, s, nh, qhd], split into content (nope) and rotary (rope) parts.
+        let q = match (&self.q_proj, &self.q_a_proj) {
+            (Some(qp), _) => qp.forward(x)?,
+            (None, Some(qa)) => {
+                let c = qa.forward(x)?;
+                let c = rms_norm(&c, self.q_a_layernorm.as_ref().unwrap(), self.eps)?;
+                self.q_b_proj.as_ref().unwrap().forward(&c)?
+            }
+            _ => unreachable!("MLA query has either q_proj or q_a/q_b"),
+        };
+        let q = q.reshape((b, s, nh, qhd))?;
+        let q_nope = q.narrow(3, 0, nope)?.contiguous()?;
+        let q_pe = q.narrow(3, nope, rope)?.contiguous()?;
+
+        // Shared KV latent + the single MQA rotary key.
+        let kv = self.kv_a_proj.forward(x)?; // [b, s, kv_lora_rank + rope]
+        let compressed = kv.narrow(2, 0, self.kv_lora_rank)?.contiguous()?;
+        let k_pe = kv
+            .narrow(2, self.kv_lora_rank, rope)?
+            .reshape((b, s, 1, rope))?
+            .contiguous()?; // shared across heads
+        let compressed = rms_norm(&compressed, &self.kv_a_layernorm, self.eps)?;
+        // Up-project to per-head content keys and values: [b, s, nh, nope + vhd].
+        let kv = self
+            .kv_b_proj
+            .forward(&compressed)?
+            .reshape((b, s, nh, nope + vhd))?;
+        let k_nope = kv.narrow(3, 0, nope)?.contiguous()?;
+        let value = kv.narrow(3, nope, vhd)?.contiguous()?;
+
+        // RoPE the rotary sub-vectors (interleaved); broadcast the shared key over heads.
+        let q_pe = apply_rope(&q_pe, cos, sin, true)?;
+        let k_pe = apply_rope(&k_pe, cos, sin, true)?;
+        let k_pe = k_pe.broadcast_as((b, s, nh, rope))?.contiguous()?;
+
+        // Assemble full per-head q/k, then [b, nh, s, *] for attention.
+        let q = Tensor::cat(&[&q_nope, &q_pe], 3)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = Tensor::cat(&[&k_nope, &k_pe], 3)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = value.transpose(1, 2)?.contiguous()?;
+
+        let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
+        let out = sdpa(&q, &k_all, &v_all, self.scale, None, mask)?; // [b, nh, s, v_head_dim]
+        let out = out
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, s, nh * vhd))?;
+        self.o_proj.forward(&out)
+    }
+}
+
 /// A gated MLP: SwiGLU (`silu`) by default, or GeGLU (`gelu`, the Gemma activation) when `gelu`.
 struct LlamaMlp {
     gate: Projection,
@@ -548,19 +759,25 @@ impl LlamaMlp {
     }
 }
 
-/// A Qwen2-MoE feed-forward: a softmax router over `experts` (top-k per token), plus an always-on
-/// `shared` expert gated by a sigmoid. Correctness-first — each expert runs **only on its routed
-/// tokens** (gathered, then scatter-added back), so the active compute scales with `experts_per_tok`,
-/// not the full bank. Top-k selection is done on the host (Candle has no fused top-k).
+/// A sparse Mixture-of-Experts feed-forward (Qwen2-MoE, DeepSeek-V2): a softmax router over `experts`
+/// (top-k per token) plus an always-on `shared` expert. Correctness-first — each expert runs **only
+/// on its routed tokens** (gathered, then scatter-added back), so the active compute scales with
+/// `experts_per_tok`, not the full bank. Top-k selection is done on the host (Candle has no fused
+/// top-k); `n_group`/`topk_group` group-limited routing (DeepSeek-V2-236B / V3) is not modelled —
+/// the verification model (V2-Lite) uses plain greedy top-k.
 struct MoeMlp {
     /// Router weight `[num_experts, hidden]`.
     router: Tensor,
     experts: Vec<LlamaMlp>,
     shared: LlamaMlp,
-    /// Shared-expert sigmoid gate `[1, hidden]`.
-    shared_gate: Tensor,
+    /// Shared-expert sigmoid gate `[1, hidden]` (Qwen2-MoE); `None` ⇒ the shared expert is added
+    /// ungated (DeepSeek-V2).
+    shared_gate: Option<Tensor>,
     experts_per_tok: usize,
     norm_topk_prob: bool,
+    /// Multiplier on the (un-normalized) routed weights — DeepSeek's `routed_scaling_factor`; `1.0`
+    /// for Qwen2-MoE. Ignored when `norm_topk_prob` (the weights are renormalized instead).
+    routed_scaling_factor: f32,
 }
 
 impl MoeMlp {
@@ -584,16 +801,20 @@ impl MoeMlp {
             let mut idx: Vec<usize> = (0..num_experts).collect();
             idx.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
             let top = &idx[..k];
-            let denom: f32 = if self.norm_topk_prob {
-                top.iter()
+            // Renormalize the top-k weights to sum to 1, or (when not normalizing) apply the routed
+            // scaling factor — matching the reference gate's two branches.
+            let (denom, post_scale) = if self.norm_topk_prob {
+                let sum = top
+                    .iter()
                     .map(|&e| row[e])
                     .sum::<f32>()
-                    .max(f32::MIN_POSITIVE)
+                    .max(f32::MIN_POSITIVE);
+                (sum, 1.0)
             } else {
-                1.0
+                (1.0, self.routed_scaling_factor)
             };
             for &e in top {
-                routed[e].push((ti as u32, row[e] / denom));
+                routed[e].push((ti as u32, row[e] / denom * post_scale));
             }
         }
 
@@ -620,9 +841,16 @@ impl MoeMlp {
             out = out.index_add(&idx, &ye, 0)?;
         }
 
-        // Always-on shared expert, gated by sigmoid(x · shared_gateᵀ).
-        let sg = candle_nn::ops::sigmoid(&xf.matmul(&self.shared_gate.t()?)?)?; // [t, 1]
-        let shared = self.shared.forward(&xf)?.broadcast_mul(&sg)?;
+        // Always-on shared expert: Qwen2 gates it by sigmoid(x · shared_gateᵀ); DeepSeek packs several
+        // shared experts into one MLP and adds them ungated.
+        let shared = self.shared.forward(&xf)?;
+        let shared = match &self.shared_gate {
+            Some(g) => {
+                let sg = candle_nn::ops::sigmoid(&xf.matmul(&g.t()?)?)?; // [t, 1]
+                shared.broadcast_mul(&sg)?
+            }
+            None => shared,
+        };
         Ok((out + shared)?.reshape((b, s, h))?)
     }
 }
