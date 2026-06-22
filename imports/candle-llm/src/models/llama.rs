@@ -36,6 +36,11 @@ pub struct LlamaModel {
     cfg: LlamaConfig,
     dtype: DType,
     device: Device,
+    /// Per-layer compute device — every entry equals `device` for a single-device model, and differs
+    /// when the model is **pipeline-sharded** across GPUs (contiguous layer blocks per device). Drives
+    /// the cross-device hidden-state hand-off in the decoder loop; `Tensor::to_device` is a no-op clone
+    /// when a layer already sits on the running device, so the single-device path stays zero-cost.
+    layer_devices: Vec<Device>,
     quantized: bool,
     /// Gemma scales token embeddings by √hidden; `None` ⇒ no scaling.
     embed_scale: Option<f64>,
@@ -277,6 +282,10 @@ impl LlamaModel {
         }
 
         let rope = cfg.build_rope();
+        // The per-layer device is wherever that layer's weights landed — equal to `device` for a
+        // normal load, distinct blocks when the `Weights` were placed by a sharded loader.
+        let layer_devices: Vec<Device> =
+            layers.iter().map(|l| l.input_ln.device().clone()).collect();
         Ok(Self {
             embed_tokens,
             layers,
@@ -285,11 +294,41 @@ impl LlamaModel {
             rope,
             dtype,
             device,
+            layer_devices,
             quantized: quant.is_some(),
             embed_scale: gemma.then(|| (cfg.hidden_size as f64).sqrt()),
             final_softcap: cfg.final_logit_softcap,
             cfg,
         })
+    }
+
+    /// Load a plain (`*ForCausalLM`) decoder from `dir`, **pipeline-sharded** across `devices` in
+    /// contiguous layer blocks, computing in `dtype` — for a model too large to fit on any single GPU
+    /// (e.g. splitting across 2×24GB cards). Layer block `b` of `L` layers goes on `devices[b]`, the
+    /// token embeddings + first input on `devices[0]`, the final norm + LM head on the last device, and
+    /// the decoder hands the hidden state across each boundary. The sharded [`Weights`] loader streams
+    /// each file through host memory, so no single GPU ever holds more than its own shard. Dense only —
+    /// quantize-on-load is not combined with sharding (use one *or* the other to fit). `devices` must be
+    /// non-empty; a single-element slice is an ordinary single-GPU load.
+    pub fn from_dir_sharded(
+        dir: impl AsRef<std::path::Path>,
+        cfg: LlamaConfig,
+        dtype: DType,
+        devices: &[Device],
+    ) -> Result<Self> {
+        if devices.is_empty() {
+            return Err(crate::error::Error::Msg(
+                "from_dir_sharded: needs at least one device".into(),
+            ));
+        }
+        let plan = shard_plan(devices, cfg.num_layers);
+        let w = Weights::from_dir_sharded(dir, devices[0].clone(), plan)?;
+        Self::from_weights_dtype(&w, "", cfg, None, dtype)
+    }
+
+    /// The devices this model's layers live on, in layer order (all equal unless pipeline-sharded).
+    pub fn layer_devices(&self) -> &[Device] {
+        &self.layer_devices
     }
 
     /// The model config.
@@ -445,8 +484,33 @@ impl LlamaModel {
         mask: AttnMask<'_>,
     ) -> Result<Tensor> {
         let mut h = input_embeds.clone();
+        // The hidden state and the RoPE tables follow each layer onto its device; an explicit additive
+        // mask (batched decode) is carried across too. All `to_device`s are no-op clones for a model
+        // whose layers share one device, so the common path pays nothing.
+        let mut cur = h.device().clone();
+        let mut cos_d = cos.clone();
+        let mut sin_d = sin.clone();
+        let mut mask_d: Option<Tensor> = match mask {
+            AttnMask::Additive(m) => Some(m.clone()),
+            _ => None,
+        };
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, cos, sin, mask, cache, i)?;
+            let dev = &self.layer_devices[i];
+            if !cur.same_device(dev) {
+                h = h.to_device(dev)?;
+                cos_d = cos.to_device(dev)?;
+                sin_d = sin.to_device(dev)?;
+                if let Some(m) = &mask_d {
+                    mask_d = Some(m.to_device(dev)?);
+                }
+                cur = dev.clone();
+            }
+            let layer_mask = match mask {
+                AttnMask::Causal => AttnMask::Causal,
+                AttnMask::None => AttnMask::None,
+                AttnMask::Additive(_) => AttnMask::Additive(mask_d.as_ref().unwrap()),
+            };
+            h = layer.forward(&h, &cos_d, &sin_d, layer_mask, cache, i)?;
         }
         Ok(h)
     }
@@ -456,12 +520,42 @@ impl LlamaModel {
     /// all-positions one.
     fn project_logits(&self, h: &Tensor) -> Result<Tensor> {
         let normed = rms_norm(h, &self.norm, self.cfg.rms_norm_eps as f64)?;
+        // When sharded, the final norm sits on the last shard but the LM head may live elsewhere
+        // (tied embeddings stay on the first shard); move the small hidden state to the head's device.
+        let normed = normed.to_device(self.lm_head.weight().device())?;
         let logits = self.lm_head.forward(&normed)?;
         // Gemma-2 soft-caps the final logits.
         match self.final_softcap {
             Some(c) => Ok(soft_cap(&logits, c)?),
             None => Ok(logits),
         }
+    }
+}
+
+/// Which shard a given layer index belongs to when `num_layers` are split into `num_shards`
+/// **contiguous** blocks: layer `i` → `min(i·num_shards/num_layers, num_shards-1)`. Pure integer math
+/// (no devices) so the split is unit-testable; [`shard_plan`] uses it to place layer weights.
+fn shard_for_layer(layer: usize, num_shards: usize, num_layers: usize) -> usize {
+    (layer * num_shards / num_layers.max(1)).min(num_shards.saturating_sub(1))
+}
+
+/// A key→device placement that splits a plain decoder's `num_layers` transformer blocks contiguously
+/// across `devices` (see [`shard_for_layer`]), with the token embeddings (and any other non-layer
+/// weight) on `devices[0]` and the final norm + LM head on the last device. This is the layout
+/// [`LlamaModel::from_dir_sharded`] feeds to [`Weights::from_dir_sharded`]. `devices` must be non-empty.
+pub fn shard_plan(devices: &[Device], num_layers: usize) -> impl Fn(&str) -> Device + '_ {
+    let last = devices.len() - 1;
+    move |key: &str| -> Device {
+        if let Some(rest) = key.strip_prefix("model.layers.") {
+            if let Some(idx) = rest.split('.').next().and_then(|s| s.parse::<usize>().ok()) {
+                return devices[shard_for_layer(idx, devices.len(), num_layers)].clone();
+            }
+        }
+        if key.starts_with("model.norm") || key.starts_with("lm_head") {
+            return devices[last].clone();
+        }
+        // Token embeddings and anything else start on the home device.
+        devices[0].clone()
     }
 }
 
@@ -933,5 +1027,41 @@ mod tests {
             join("language_model", "model.norm.weight"),
             "language_model.model.norm.weight"
         );
+    }
+
+    #[test]
+    fn shard_split_is_contiguous_and_balanced() {
+        // 28 layers across 2 shards: a clean 14 / 14 split, monotonic, last layer on the last shard.
+        let s = |i| shard_for_layer(i, 2, 28);
+        assert_eq!(
+            (0..28)
+                .map(s)
+                .collect::<Vec<_>>()
+                .iter()
+                .filter(|&&x| x == 0)
+                .count(),
+            14
+        );
+        assert_eq!(s(0), 0);
+        assert_eq!(s(13), 0);
+        assert_eq!(s(14), 1);
+        assert_eq!(s(27), 1);
+        // Monotonic non-decreasing (contiguous blocks, never interleaved).
+        assert!((1..28).all(|i| s(i) >= s(i - 1)));
+        // Uneven split (3 shards, 10 layers) still lands every layer in range and the last on shard 2.
+        assert!((0..10).all(|i| shard_for_layer(i, 3, 10) < 3));
+        assert_eq!(shard_for_layer(9, 3, 10), 2);
+    }
+
+    #[test]
+    fn shard_plan_places_embeddings_layers_and_head() {
+        let devs = [Device::Cpu, Device::Cpu];
+        let plan = shard_plan(&devs, 28);
+        // Pure routing check: every key resolves without panicking, layer keys parse the index.
+        assert!(plan("model.embed_tokens.weight").is_cpu());
+        assert!(plan("model.layers.0.self_attn.q_proj.weight").is_cpu());
+        assert!(plan("model.layers.27.mlp.gate_proj.weight").is_cpu());
+        assert!(plan("model.norm.weight").is_cpu());
+        assert!(plan("lm_head.weight").is_cpu());
     }
 }

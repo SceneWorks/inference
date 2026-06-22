@@ -8,7 +8,7 @@
 pub mod llama;
 pub mod siglip;
 
-pub use llama::LlamaModel;
+pub use llama::{shard_plan, LlamaModel};
 pub use siglip::{
     select_vision_feature, SiglipVisionConfig, SiglipVisionOutput, SiglipVisionTower,
 };

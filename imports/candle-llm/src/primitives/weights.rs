@@ -62,6 +62,45 @@ impl Weights {
         })
     }
 
+    /// Load a snapshot directory **pipeline-sharded**: each tensor is placed on the device chosen by
+    /// `place` (keyed by its HF name), so a model too large for one GPU can be split across several
+    /// without ever staging the whole thing on a single card. Each shard file is read to host memory,
+    /// its tensors are moved to their target devices, and the host copy is dropped — so peak *device*
+    /// memory is per-GPU-shard and peak *host* memory is one shard file. `device` records the model's
+    /// home device (where embeddings / the first layer live); it is the value [`Weights::device`]
+    /// reports and the decoder treats as its input device.
+    pub fn from_dir_sharded(
+        dir: impl AsRef<Path>,
+        device: Device,
+        place: impl Fn(&str) -> Device,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        let mut shards: Vec<_> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+            .collect();
+        if shards.is_empty() {
+            return Err(Error::Msg(format!(
+                "no .safetensors files in {}",
+                dir.display()
+            )));
+        }
+        shards.sort(); // deterministic merge order
+        let mut tensors = HashMap::new();
+        for shard in shards {
+            // Read the shard onto the host, then hand each tensor to its target device. The host map
+            // is dropped at the end of the iteration, so only one shard is resident on the host at once.
+            let part = candle_core::safetensors::load(&shard, &Device::Cpu)
+                .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", shard.display())))?;
+            for (key, t) in part {
+                let target = place(&key);
+                let t = t.to_device(&target)?;
+                tensors.insert(key, t);
+            }
+        }
+        Ok(Self { tensors, device })
+    }
+
     /// Fetch a tensor by key, erroring if absent.
     pub fn require(&self, key: &str) -> Result<&Tensor> {
         self.tensors

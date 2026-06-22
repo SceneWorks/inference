@@ -38,6 +38,18 @@ aligned, matching the eager convention, so cached decode stays correct; the two 
 few half-precision ULPs (proven by a gated parity test). `candle-flash-attn` ships sm80 kernels that
 **do compile and run on sm_120** (Blackwell) under the project's `CUDA_COMPUTE_CAP=120` build.
 
+### Multi-GPU (pipeline sharding)
+
+`LlamaModel::from_dir_sharded(dir, cfg, dtype, &[dev0, dev1, …])` splits a decoder's layers into
+**contiguous blocks across multiple GPUs** — for a model too large to fit on one card (e.g. across
+2×24GB consumer GPUs). Layer block `b` lives on `devices[b]`, the embeddings + first input on the
+first device, the final norm + LM head on the last, and the decoder hands the hidden state across each
+boundary (a no-op for a single-device load). The sharded `Weights` loader streams each file through
+host memory, so **no single GPU ever holds more than its own shard** — the whole point, for cards that
+can't stage the full model. This is a *capacity* feature, not a throughput one (a single sequence
+gains nothing from being split). Dense only; combine with quantize-on-load by choosing one or the
+other to fit, not both.
+
 ## Testing
 
 Unit tests + the synthetic conformance run need no models and no GPU:
