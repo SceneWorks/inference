@@ -437,6 +437,48 @@ impl LlamaModel {
         self.forward_to_last_logits(&embeds, cache, cos, sin, AttnMask::Additive(mask))
     }
 
+    /// **Per-sequence** batched decode step for iteration-level continuous batching (story 7347,
+    /// `Throughput` mode): the embeddings / projections / MLP / lm_head are **batched** over the active
+    /// sequences, but attention runs **per-sequence** — each row attends only its own sequence's real
+    /// KV in `caches[i]` (its own paged cache, gathered to true length), with no padding mask. Returns
+    /// the **last column** logits `[batch, vocab]`.
+    ///
+    /// `input_ids` is `[batch, seq]` (u32); `positions` are the per-row absolute RoPE positions (length
+    /// `batch * seq`, row-major — for a decode step `seq == 1`, one position per sequence at its own
+    /// offset). `caches.len()` must equal the batch. Unlike [`LlamaModel::decode_logits`] run per row,
+    /// the batched projections here are **not** bit-identical to the batch-1 logits — the batched matmul
+    /// is not M-invariant on a GPU, so a row *tracks* its batch-1 run only to sub-ULP (the documented
+    /// Throughput tradeoff that buys the weight-read amortization). The bit-exact continuous path runs
+    /// each sequence through [`LlamaModel::decode_logits`] on its own cache instead.
+    pub fn decode_logits_per_seq(
+        &self,
+        input_ids: &Tensor,
+        caches: &mut [&mut PagedKvCache],
+        positions: &[i32],
+    ) -> Result<Tensor> {
+        let (b, s) = input_ids.dims2()?;
+        if caches.len() != b {
+            return Err(crate::error::Error::Msg(format!(
+                "decode_logits_per_seq: {} caches for a batch of {b}",
+                caches.len()
+            )));
+        }
+        if positions.len() != b * s {
+            return Err(crate::error::Error::Msg(format!(
+                "decode_logits_per_seq: {} positions for a {b}x{s} step",
+                positions.len()
+            )));
+        }
+        let (cos, sin) = self.rope_tables(positions, b as i32, s as i32)?;
+        let mut h = self.embed(input_ids)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward_per_seq(&h, &cos, &sin, caches, i)?;
+        }
+        let last_h = h.narrow(1, s - 1, 1)?.contiguous()?; // [b, 1, hidden]
+        let logits = self.project_logits(&last_h)?; // [b, 1, vocab]
+        Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
+    }
+
     /// Run a forward step over token ids and return logits for **every** position, `[batch, seq,
     /// vocab]`. The all-positions forward speculative decoding (stories 7259 / 7260) runs to verify
     /// `[cur, draft₁ … draftₖ]` in one pass — `logits[.., i, ..]` predicts the token after position
@@ -608,10 +650,36 @@ impl LlamaLayer {
             cache,
             layer_idx,
         )?;
+        self.combine_ffn(x, &attn)
+    }
+
+    /// Per-sequence attention variant of [`LlamaLayer::forward`] (story 7347): the norms and MLP are
+    /// batched as usual, but attention runs row-by-row over each sequence's own paged cache.
+    fn forward_per_seq(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        caches: &mut [&mut PagedKvCache],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let attn = self.attn.forward_per_seq(
+            &rms_norm(x, &self.input_ln, self.eps)?,
+            cos,
+            sin,
+            caches,
+            layer_idx,
+        )?;
+        self.combine_ffn(x, &attn)
+    }
+
+    /// The residual + MLP half shared by both forwards: the Llama pre-norm, or the Gemma-2 4-norm
+    /// sandwich when `pre_ff_ln`/`post_ff_ln` are set. `x` is the block input, `attn` the attention out.
+    fn combine_ffn(&self, x: &Tensor, attn: &Tensor) -> Result<Tensor> {
         match (&self.pre_ff_ln, &self.post_ff_ln) {
             // Gemma-2 sandwich: post-norm the attention output and the MLP output before each add.
             (Some(pre_ff), Some(post_ff)) => {
-                let attn = rms_norm(&attn, &self.post_ln, self.eps)?;
+                let attn = rms_norm(attn, &self.post_ln, self.eps)?;
                 let h = x.broadcast_add(&attn)?;
                 let ffn = self.ffn.forward(&rms_norm(&h, pre_ff, self.eps)?)?;
                 let ffn = rms_norm(&ffn, post_ff, self.eps)?;
@@ -619,7 +687,7 @@ impl LlamaLayer {
             }
             // Llama pre-norm: `post_ln` is the MLP pre-norm.
             _ => {
-                let h = x.broadcast_add(&attn)?;
+                let h = x.broadcast_add(attn)?;
                 let ffn = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
                 Ok(h.broadcast_add(&ffn)?)
             }
@@ -665,6 +733,28 @@ impl Attention {
             Attention::Mla(a) => a.forward(x, cos, sin, mask, cache, layer_idx),
         }
     }
+
+    /// Per-sequence (paged) attention for the continuous-batching Throughput path (story 7347).
+    /// Implemented for grouped-query attention; MLA (DeepSeek-V2) has no per-sequence variant yet, so
+    /// the Throughput mode is unavailable for it — the bit-exact `Exact` mode covers MLA (it runs each
+    /// sequence through the ordinary `forward`).
+    fn forward_per_seq(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        caches: &mut [&mut PagedKvCache],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Attention::Gqa(a) => a.forward_per_seq(x, cos, sin, caches, layer_idx),
+            Attention::Mla(_) => Err(crate::error::Error::Msg(
+                "continuous-batching Throughput mode is not supported for MLA (DeepSeek-V2); use the \
+                 Exact mode"
+                    .into(),
+            )),
+        }
+    }
 }
 
 /// Grouped-query attention with RoPE and optional per-head q/k RMSNorm (Qwen3).
@@ -688,15 +778,11 @@ struct LlamaAttention {
 }
 
 impl LlamaAttention {
-    fn forward(
-        &self,
-        x: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
-    ) -> Result<Tensor> {
+    /// Project `x` `[b, s, hidden]` into attention-layout `(q, k, v)` — `q` `[b, heads, s, head_dim]`,
+    /// `k`/`v` `[b, kv_heads, s, head_dim]` — applying the qkv projections, optional Qwen3 per-head
+    /// q/k RMSNorm, RoPE, and the transpose into head-major layout. The shared front half of both the
+    /// masked (batched) and per-sequence attention paths; nothing here touches the cache or attends.
+    fn project(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
 
@@ -721,17 +807,72 @@ impl LlamaAttention {
             .transpose(1, 2)?
             .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
+        Ok((q, k, v))
+    }
 
+    /// Project the attended output `[b, heads, s, head_dim]` back to `[b, s, hidden]` through `o`. The
+    /// shared back half of both attention paths.
+    fn output(&self, attn: &Tensor) -> Result<Tensor> {
+        let (b, _nh, s, _hd) = attn.dims4()?;
+        let out =
+            attn.transpose(1, 2)?
+                .contiguous()?
+                .reshape((b, s, self.num_heads * self.head_dim))?;
+        self.o.forward(&out)
+    }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: AttnMask<'_>,
+        cache: &mut dyn KvCache,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (q, k, v) = self.project(x, cos, sin)?;
         let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
         let k_all = repeat_kv(&k_all, self.groups)?;
         let v_all = repeat_kv(&v_all, self.groups)?;
-
         let out = sdpa(&q, &k_all, &v_all, self.scale, self.softcap, mask)?; // [b, heads, s, head_dim]
-        let out = out
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, s, nh * hd))?;
-        self.o.forward(&out)
+        self.output(&out)
+    }
+
+    /// Per-sequence attention (story 7347): the projection is **batched** over all rows, but each row
+    /// then attends only its own sequence's real KV in `caches[i]`, gathered to its true length and run
+    /// through a stock causal SDPA — i.e. byte-identically to that sequence's batch-1 attention, with
+    /// no padding mask and no cross-row mixing. `caches.len()` must equal the batch. The projections /
+    /// MLP / lm_head around this stay batched, which is where the throughput comes from (and why the
+    /// surrounding logits only *track* batch-1 to sub-ULP — the batched matmul isn't M-invariant).
+    fn forward_per_seq(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        caches: &mut [&mut PagedKvCache],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (q, k, v) = self.project(x, cos, sin)?; // [b,H,s,hd], [b,kvh,s,hd], [b,kvh,s,hd]
+        let mut outs = Vec::with_capacity(caches.len());
+        for (i, cache) in caches.iter_mut().enumerate() {
+            let qi = q.narrow(0, i, 1)?; // [1, H, s, hd]
+            let ki = k.narrow(0, i, 1)?.contiguous()?;
+            let vi = v.narrow(0, i, 1)?.contiguous()?;
+            let (k_all, v_all) = cache.update(layer_idx, &ki, &vi)?; // gather this seq's real KV
+            let k_all = repeat_kv(&k_all, self.groups)?;
+            let v_all = repeat_kv(&v_all, self.groups)?;
+            outs.push(sdpa(
+                &qi,
+                &k_all,
+                &v_all,
+                self.scale,
+                self.softcap,
+                AttnMask::Causal,
+            )?);
+        }
+        let refs: Vec<&Tensor> = outs.iter().collect();
+        let out = Tensor::cat(&refs, 0)?; // [b, heads, s, head_dim]
+        self.output(&out)
     }
 }
 
