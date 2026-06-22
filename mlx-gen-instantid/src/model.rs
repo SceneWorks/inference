@@ -14,12 +14,16 @@
 
 use std::path::PathBuf;
 
-use mlx_rs::ops::{concatenate_axis, zeros};
+use mlx_rs::ops::{concatenate_axis, multiply, zeros};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
-use mlx_gen::{AdapterSpec, CancelFlag, Error, Progress, Result, WeightsSource};
+use mlx_gen::{
+    schedule_sigmas, AdapterSpec, AlphaSchedule, CancelFlag, DiscreteModelSampling, Error,
+    Progress, Result, Scheduler, Solver, WeightsSource,
+};
 
 use mlx_gen_face::{Face, FaceAnalysis};
 use mlx_gen_sdxl::config::DiffusionConfig;
@@ -30,7 +34,7 @@ use mlx_gen_sdxl::tokenizer::ClipBpeTokenizer;
 use mlx_gen_sdxl::unet::{ControlNet, UNet2DConditionModel};
 use mlx_gen_sdxl::vae::Autoencoder;
 use mlx_gen_sdxl::{
-    apply_sdxl_adapters_with, decode_image, denoise_ip_control, denoise_ip_multi_control,
+    apply_sdxl_adapters_with, decode_image, denoise_curated, denoise_ip_multi_control,
     encode_conditioning, load_controlnet, load_text_encoder_1_dtype, load_text_encoder_2_dtype,
     load_tokenizer, load_unet_dtype, load_vae, preprocess_control_image, seeded_prior,
     text_time_ids, ControlContext, Denoiser, LoraCoverage,
@@ -110,6 +114,13 @@ pub struct InstantIdRequest {
     pub controlnet_scale: f32,
     /// OpenPose `controlnet_conditioning_scale` — used only by [`InstantId::generate_pose`].
     pub openpose_scale: f32,
+    /// Curated unified-sampler selection (epic 7114, sc-7297). `None` (or `euler_ancestral`) keeps
+    /// InstantID's bespoke ancestral default byte-exact; a curated `Solver` name routes the dual-
+    /// conditioning denoise through `denoise_curated` over the SDXL `DiscreteModelSampling`.
+    pub sampler: Option<String>,
+    /// Curated σ-schedule selection (epic 7114). `None` ⇒ the discrete default; a [`Scheduler`] name
+    /// re-shapes σ over the schedule. A non-default scheduler alone also engages the curated path.
+    pub scheduler: Option<String>,
     pub seed: u64,
     /// Cooperative cancellation, checked before each denoise step and between phases (sc-4380;
     /// the engine contract every registry provider honors — see F-096). `Clone` shares the flag,
@@ -129,6 +140,8 @@ impl Default for InstantIdRequest {
             ip_adapter_scale: DEFAULT_IP_SCALE,
             controlnet_scale: DEFAULT_CONTROLNET_SCALE,
             openpose_scale: DEFAULT_OPENPOSE_SCALE,
+            sampler: None,
+            scheduler: None,
             seed: 0,
             cancel: CancelFlag::default(),
         }
@@ -148,6 +161,9 @@ pub struct InstantId {
     resampler: Resampler,
     vae: Autoencoder,
     sampler: EulerSampler,
+    /// SDXL ε-prediction α-cumprod schedule (`scaled_linear`), built once at load — the
+    /// `DiscreteModelSampling` source for the curated unified-sampler path (epic 7114, sc-7297).
+    alpha_schedule: AlphaSchedule,
     face: Option<FaceAnalysis>,
 }
 
@@ -209,6 +225,11 @@ impl InstantId {
             resampler,
             vae,
             sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
+            alpha_schedule: AlphaSchedule::scaled_linear(
+                cfg.num_train_steps,
+                cfg.beta_start,
+                cfg.beta_end,
+            )?,
             face: None,
         })
     }
@@ -386,29 +407,113 @@ impl InstantId {
             cfg_on,
         )?;
 
-        // Ancestral Euler over the seeded prior (fp16).
-        let prior = seeded_prior(&self.sampler, req.seed, req.width, req.height)?;
-        let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
-        let d = Denoiser {
-            unet: &self.unet,
-            sampler: &ancestral,
-        };
-        let latents = denoise_ip_control(
-            &d,
-            prior,
+        let latents = self.run_identity_denoise(
+            req,
+            req.width,
+            req.height,
+            std::slice::from_ref(&control_ctx),
             &conditioning,
             &pooled,
             &time_ids,
-            req.guidance,
-            &req.cancel,
-            on_progress,
-            &control_ctx,
-            &face_tokens, // IdentityNet cross-attn conditioning = face tokens
-            &face_tokens, // UNet IP tokens = face tokens
+            &face_tokens,
             req.ip_adapter_scale,
+            on_progress,
         )?;
         on_progress(Progress::Decoding);
         decode_image(&self.vae, &latents)
+    }
+
+    /// Run the InstantID dual-conditioning denoise — the bespoke ancestral default (byte-exact N1) or,
+    /// when the request names a curated sampler/scheduler (epic 7114, sc-7297), the additive
+    /// k-diffusion [`denoise_curated`] over the SDXL [`DiscreteModelSampling`]. BOTH carry the SAME dual
+    /// conditioning (IdentityNet residuals via `controls` + the face IP `face_tokens`), so a curated
+    /// name only swaps the integrator; `euler_ancestral` (the default) and no curated knob stay on the
+    /// vendored ancestral loop. `controls` is one branch for [`Self::generate_with`], two (IdentityNet +
+    /// OpenPose) for pose mode — `denoise_ip_multi_control` with a single branch is bit-identical to the
+    /// historical `denoise_ip_control`, so the default path is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn run_identity_denoise(
+        &self,
+        req: &InstantIdRequest,
+        width: u32,
+        height: u32,
+        controls: &[ControlContext],
+        conditioning: &Array,
+        pooled: &Array,
+        time_ids: &Array,
+        face_tokens: &Array,
+        ip_scale: f32,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let sampler_name = req.sampler.as_deref().unwrap_or("euler_ancestral");
+        let scheduler_curated = req
+            .scheduler
+            .as_deref()
+            .and_then(Scheduler::from_name)
+            .is_some();
+        // A curated solver name (other than the bespoke `euler_ancestral` default) OR a non-`discrete`
+        // scheduler routes to the additive k-diffusion path; everything else stays byte-exact ancestral
+        // (the N1 default gate). Mirrors `mlx_gen_sdxl::Sdxl::generate`'s `use_curated` decision.
+        let sampler_curated =
+            Solver::from_name(sampler_name).is_some() && sampler_name != "euler_ancestral";
+        if sampler_curated || scheduler_curated {
+            // Curated unified-sampler path (epic 7114, sc-7297): k-diffusion VE-σ sampling over the SDXL
+            // `DiscreteModelSampling`. The latents live in raw σ-space (`ε·σ_max`); `denoise_curated`
+            // applies the IdentityNet residuals (`controls`) + face IP tokens (`ip`/`control_encoder`)
+            // each step, exactly as the ancestral loop does — so identity conditioning is unchanged, only
+            // the integrator differs. Seeded so the first draw is the init noise (mirrors the SDXL crate).
+            let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
+            let sched = req
+                .scheduler
+                .as_deref()
+                .and_then(Scheduler::from_name)
+                .unwrap_or(Scheduler::Normal);
+            let sigmas = schedule_sigmas(sched, &ms, req.steps);
+            let latent_shape = [1, (height / 8) as i32, (width / 8) as i32, 4];
+            mlx_rs::random::seed(req.seed)?;
+            let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
+            let init = multiply(&noise, scalar(sigmas[0]))?;
+            denoise_curated(
+                &self.unet,
+                Some(sampler_name),
+                &ms,
+                &sigmas,
+                init,
+                conditioning,
+                pooled,
+                time_ids,
+                req.guidance,
+                req.seed,
+                &req.cancel,
+                on_progress,
+                controls,
+                Some((face_tokens, ip_scale)),
+                Some(face_tokens),
+            )
+        } else {
+            // Bespoke ancestral default (byte-exact N1): InstantID's production EulerAncestral over the
+            // seeded prior, dual conditioning via `denoise_ip_multi_control`.
+            let prior = seeded_prior(&self.sampler, req.seed, width, height)?;
+            let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
+            let d = Denoiser {
+                unet: &self.unet,
+                sampler: &ancestral,
+            };
+            denoise_ip_multi_control(
+                &d,
+                prior,
+                conditioning,
+                pooled,
+                time_ids,
+                req.guidance,
+                &req.cancel,
+                on_progress,
+                controls,
+                face_tokens,
+                face_tokens,
+                ip_scale,
+            )
+        }
     }
 
     /// Build the CFG-batched face tokens from a 512-d ArcFace `embedding` (positive-first; the uncond
@@ -593,26 +698,17 @@ impl InstantId {
         let op_ctx = self.control_ctx(openpose, &skeleton, side, side, op_scale, cfg_on)?;
         let controls = [id_ctx, op_ctx];
 
-        // Ancestral Euler over the seeded prior (fp16).
-        let prior = seeded_prior(&self.sampler, req.seed, side, side)?;
-        let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
-        let d = Denoiser {
-            unet: &self.unet,
-            sampler: &ancestral,
-        };
-        let latents = denoise_ip_multi_control(
-            &d,
-            prior,
+        let latents = self.run_identity_denoise(
+            req,
+            side,
+            side,
+            &controls,
             &conditioning,
             &pooled,
             &time_ids,
-            req.guidance,
-            &req.cancel,
-            on_progress,
-            &controls,
-            &face_tokens, // ControlNet cross-attn conditioning = face tokens (both branches)
-            &face_tokens, // UNet IP tokens = face tokens
+            &face_tokens,
             ip_scale,
+            on_progress,
         )?;
         on_progress(Progress::Decoding);
         decode_image(&self.vae, &latents)
