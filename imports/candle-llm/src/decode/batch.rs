@@ -35,7 +35,7 @@ use core_llm::FinishReason as CoreFinish;
 use crate::decode::stream::{default_seed, FinishReason, GenerationOutput, StreamEvent};
 use crate::decode::CancelFlag;
 use crate::error::{Error, Result};
-use crate::models::LlamaModel;
+use crate::models::CausalLm;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 
@@ -91,7 +91,7 @@ enum LaneStep {
 /// stops promptly, and any still-running rows finish [`FinishReason::Cancelled`] with their partial
 /// output.
 pub fn generate_batch(
-    model: &LlamaModel,
+    model: &CausalLm,
     requests: &[BatchRequest],
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(usize, StreamEvent),

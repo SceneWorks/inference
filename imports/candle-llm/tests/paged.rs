@@ -23,10 +23,10 @@ use std::collections::HashMap;
 use candle_core::{Device, Tensor};
 use core_llm::Tokenizer;
 
-use candle_llm::config::LlamaConfig;
+use candle_llm::config::ModelConfig;
 use candle_llm::decode::{generate, generate_with_cache, CancelFlag, GenerationConfig};
 use candle_llm::device::select_device;
-use candle_llm::models::LlamaModel;
+use candle_llm::models::CausalLm;
 use candle_llm::primitives::sampler::SamplingParams;
 use candle_llm::primitives::{BlockPool, KvCache, PagedKvCache, SplitMix64, TokenRng, Weights};
 
@@ -46,7 +46,7 @@ fn config(max_new: usize) -> GenerationConfig {
 }
 
 /// Cold single-sequence run through the default (contiguous) cache.
-fn cold(model: &LlamaModel, prompt: &[i32], max_new: usize) -> Vec<i32> {
+fn cold(model: &CausalLm, prompt: &[i32], max_new: usize) -> Vec<i32> {
     generate(
         model,
         prompt,
@@ -59,7 +59,7 @@ fn cold(model: &LlamaModel, prompt: &[i32], max_new: usize) -> Vec<i32> {
 }
 
 /// Run through a caller-provided (paged) cache.
-fn paged(model: &LlamaModel, prompt: &[i32], max_new: usize, cache: &mut PagedKvCache) -> Vec<i32> {
+fn paged(model: &CausalLm, prompt: &[i32], max_new: usize, cache: &mut PagedKvCache) -> Vec<i32> {
     generate_with_cache(
         model,
         prompt,
@@ -95,7 +95,7 @@ fn ones(d: usize) -> Tensor {
 ///
 /// A per-call atomic sequence keeps the temp dir unique so the concurrently-running synthetic tests
 /// never share (and delete) one another's snapshot.
-fn build_tiny_llama() -> LlamaModel {
+fn build_tiny_llama() -> CausalLm {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -150,9 +150,9 @@ fn build_tiny_llama() -> LlamaModel {
     }
 
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let weights = Weights::from_dir(&dir, &Device::Cpu).unwrap();
-    let model = LlamaModel::from_weights(&weights, "", cfg).unwrap();
+    let model = CausalLm::from_weights(&weights, "", cfg).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     model
 }
@@ -281,7 +281,7 @@ fn shared_prefix_cow_is_bitexact_cpu() {
 // ---- Real-weights variants (#[ignore]) -----------------------------------------------------------
 
 struct Fixture {
-    model: LlamaModel,
+    model: CausalLm,
     tok: Tokenizer,
     max_ctx: i32,
 }
@@ -289,10 +289,10 @@ struct Fixture {
 fn load_from(env: &str) -> Option<Fixture> {
     let dir = std::env::var(env).ok().filter(|p| !p.is_empty())?;
     let device = select_device().unwrap();
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let max_ctx = cfg.max_position_embeddings;
     let model =
-        LlamaModel::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
+        CausalLm::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     Some(Fixture {
         model,

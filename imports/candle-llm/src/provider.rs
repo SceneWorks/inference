@@ -1,7 +1,7 @@
 //! The `core-llm` provider: a generic Llama model exposed through the backend-neutral contract.
 //!
 //! This is the candle-llm half of story 7237 — it implements [`core_llm::TextLlm`] by wrapping the
-//! [`LlamaModel`] decoder, a [`core_llm::Tokenizer`], and a chat template, driving the internal
+//! [`CausalLm`] decoder, a [`core_llm::Tokenizer`], and a chat template, driving the internal
 //! streaming decode loop and translating its token events into contract [`StreamEvent`]s (with
 //! incremental detokenization). It registers into [`core_llm::registry`] under the id `candle-llama`.
 //! Passing the `core-llm-testkit` conformance suite as a *second, independent* backend is what
@@ -18,11 +18,11 @@ use core_llm::{
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
-use crate::config::LlamaConfig;
+use crate::config::ModelConfig;
 use crate::decode::{generate_with, ConstraintMask, FinishReason, GenerationConfig, StreamEvent};
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
-use crate::models::LlamaModel;
+use crate::models::CausalLm;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::Weights;
@@ -33,7 +33,7 @@ pub const PROVIDER_ID: &str = "candle-llama";
 /// A generic Llama provider implementing [`core_llm::TextLlm`].
 pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
-    model: LlamaModel,
+    model: CausalLm,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
     stop_tokens: Vec<i32>,
@@ -62,10 +62,10 @@ impl LlamaProvider {
 
     /// Load from an HF snapshot directory (config.json + tokenizer.json + safetensors shards).
     fn load_dir(dir: &Path, device: &Device, quant: Option<QuantSpec>) -> CoreResult<Self> {
-        let cfg = LlamaConfig::from_dir(dir).map_err(to_core)?;
+        let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
         let descriptor = descriptor_for(&cfg);
         let weights = Weights::from_dir(dir, device).map_err(to_core)?;
-        let model = LlamaModel::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+        let model = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
         Ok(Self {
@@ -85,7 +85,7 @@ impl LlamaProvider {
     fn load_gguf(path: &Path, device: &Device, quant: Option<QuantSpec>) -> CoreResult<Self> {
         let ck = GgufCheckpoint::open(path, device).map_err(to_core)?;
         let descriptor = descriptor_for(&ck.config);
-        let model = LlamaModel::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
+        let model = CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
             .map_err(to_core)?;
 
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -119,7 +119,7 @@ impl LlamaProvider {
 
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
     /// and converters that don't have a `tokenizer_config.json`).
-    pub fn from_parts(model: LlamaModel, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
+    pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
         Self {
             descriptor: provider_descriptor(),
             model,
@@ -294,7 +294,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
 
 /// A descriptor reflecting a *loaded* model: family from the dispatched architecture and the context
 /// length from `config.json`. (Quantization state is reported via [`LlamaProvider::is_quantized`].)
-fn descriptor_for(cfg: &LlamaConfig) -> TextLlmDescriptor {
+fn descriptor_for(cfg: &ModelConfig) -> TextLlmDescriptor {
     let mut d = provider_descriptor();
     d.family = cfg.architecture.family().to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;

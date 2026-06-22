@@ -22,12 +22,12 @@ use std::collections::HashMap;
 use candle_core::{Device, Tensor};
 use core_llm::Tokenizer;
 
-use candle_llm::config::LlamaConfig;
+use candle_llm::config::ModelConfig;
 use candle_llm::decode::{
     generate, generate_batch, generate_continuous, BatchExactness, BatchRequest, CancelFlag,
     ContinuousConfig, GenerationConfig, StreamEvent,
 };
-use candle_llm::models::LlamaModel;
+use candle_llm::models::CausalLm;
 use candle_llm::primitives::sampler::SamplingParams;
 use candle_llm::primitives::{SplitMix64, TokenRng, Weights};
 
@@ -50,7 +50,7 @@ fn ones(d: usize) -> Tensor {
     Tensor::from_vec(vec![1.0f32; d], (d,), &Device::Cpu).unwrap()
 }
 
-fn build_tiny_llama() -> LlamaModel {
+fn build_tiny_llama() -> CausalLm {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -105,9 +105,9 @@ fn build_tiny_llama() -> LlamaModel {
     }
 
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let model =
-        LlamaModel::from_weights(&Weights::from_dir(&dir, &Device::Cpu).unwrap(), "", cfg).unwrap();
+        CausalLm::from_weights(&Weights::from_dir(&dir, &Device::Cpu).unwrap(), "", cfg).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     model
 }
@@ -125,7 +125,7 @@ fn req(prompt: Vec<i32>, max_new: usize) -> BatchRequest {
 }
 
 /// The batch-1 reference: run a single request alone through the streaming `generate`.
-fn batch1(model: &LlamaModel, r: &BatchRequest) -> Vec<i32> {
+fn batch1(model: &CausalLm, r: &BatchRequest) -> Vec<i32> {
     generate(
         model,
         &r.prompt_ids,
@@ -143,7 +143,7 @@ fn batch1(model: &LlamaModel, r: &BatchRequest) -> Vec<i32> {
 }
 
 fn run(
-    model: &LlamaModel,
+    model: &CausalLm,
     reqs: &[BatchRequest],
     cfg: &ContinuousConfig,
 ) -> Vec<candle_llm::decode::GenerationOutput> {
@@ -309,12 +309,12 @@ mod real {
             .collect()
     }
 
-    fn load(env: &str) -> Option<(LlamaModel, Tokenizer)> {
+    fn load(env: &str) -> Option<(CausalLm, Tokenizer)> {
         let dir = std::env::var(env).ok().filter(|v| !v.is_empty())?;
         let device = candle_llm::device::select_device().unwrap();
-        let cfg = LlamaConfig::from_dir(&dir).unwrap();
+        let cfg = ModelConfig::from_dir(&dir).unwrap();
         let model =
-            LlamaModel::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
+            CausalLm::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
         let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
         Some((model, tok))
     }

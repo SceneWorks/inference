@@ -13,8 +13,8 @@ Built bottom-up, mirroring `mlx-llm`'s structure on Candle tensors:
 1. **`primitives`** — backend-owned tensor leaves: a batch-capable `KvCache`, a pluggable sampler,
    the `Rope` family (standard / Llama-3 scaled), GQA attention helpers, group-wise quantization
    (via Candle's `QTensor`/`QMatMul`), the `nn` leaves, and a safetensors `Weights` loader.
-2. **`config` + `models`** — `LlamaConfig` parsed from `config.json` and the generic causal decoder
-   (`LlamaModel`), `&self` forward + `from_weights`, with architecture dispatch (Llama / Mistral /
+2. **`config` + `models`** — `ModelConfig` parsed from `config.json` and the generic causal decoder
+   (`CausalLm`), `&self` forward + `from_weights`, with architecture dispatch (Llama / Mistral /
    Qwen3).
 3. **`decode`** — the streaming, cancellable decode loop driving any `Decode` model.
 4. **`provider`** — implements `core_llm::TextLlm` over the engine and registers it (`candle-llama`).
@@ -28,7 +28,7 @@ Built bottom-up, mirroring `mlx-llm`'s structure on Candle tensors:
   attention seam, with an eager fallback for the cases the kernel can't serve
 
 Compute runs in `bf16` on the GPU backends and `f32` on CPU. The dense compute dtype is also
-selectable per load (`LlamaModel::from_weights_dtype` — e.g. **f16** vs the default bf16) for dtype
+selectable per load (`CausalLm::from_weights_dtype` — e.g. **f16** vs the default bf16) for dtype
 perf tuning.
 
 With `flash-attn`, `primitives::attention::sdpa` dispatches the dense causal/bidirectional path to the
@@ -40,7 +40,7 @@ few half-precision ULPs (proven by a gated parity test). `candle-flash-attn` shi
 
 ### Multi-GPU (pipeline sharding)
 
-`LlamaModel::from_dir_sharded(dir, cfg, dtype, &[dev0, dev1, …])` splits a decoder's layers into
+`CausalLm::from_dir_sharded(dir, cfg, dtype, &[dev0, dev1, …])` splits a decoder's layers into
 **contiguous blocks across multiple GPUs** — for a model too large to fit on one card (e.g. across
 2×24GB consumer GPUs). Layer block `b` lives on `devices[b]`, the embeddings + first input on the
 first device, the final norm + LM head on the last, and the decoder hands the hidden state across each

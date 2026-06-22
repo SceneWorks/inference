@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use candle_core::{Device, Tensor};
 
 use candle_llm::primitives::{input_ids, SplitMix64, TokenRng, Weights};
-use candle_llm::{LlamaConfig, LlamaModel};
+use candle_llm::{CausalLm, ModelConfig};
 
 const VOCAB: usize = 32;
 const HIDDEN: usize = 32;
@@ -38,7 +38,7 @@ fn ones(d: usize) -> Tensor {
 
 /// Write a tiny `deepseek_v2` snapshot to a temp dir and load it. `q_lora_rank` selects the query
 /// path: `None` ⇒ a full `q_proj` (DeepSeek-V2-Lite); `Some(r)` ⇒ the low-rank `q_a → norm → q_b`.
-fn load_tiny_deepseek(tag: &str, q_lora_rank: Option<usize>) -> LlamaModel {
+fn load_tiny_deepseek(tag: &str, q_lora_rank: Option<usize>) -> CausalLm {
     let q_head = QK_NOPE + QK_ROPE;
     let dir = std::env::temp_dir().join(format!("candle-llm-mla-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -150,9 +150,9 @@ fn load_tiny_deepseek(tag: &str, q_lora_rank: Option<usize>) -> LlamaModel {
     }
 
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let weights = Weights::from_dir(&dir, &Device::Cpu).unwrap();
-    let model = LlamaModel::from_weights(&weights, "", cfg).unwrap();
+    let model = CausalLm::from_weights(&weights, "", cfg).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     model
 }
@@ -177,7 +177,7 @@ fn argmax(logits: &Tensor) -> i32 {
 
 /// Drive a prefill + several cached decode steps through the MLA path and check every step yields
 /// finite `[1, vocab]` logits and that the KV cache grows one position per step.
-fn run_decode(model: &LlamaModel) {
+fn run_decode(model: &CausalLm) {
     assert!(model.config().is_mla(), "model should report MLA");
     assert_eq!(model.config().architecture.family(), "deepseek_v2");
 

@@ -23,12 +23,12 @@
 
 use std::time::Instant;
 
-use candle_llm::config::LlamaConfig;
+use candle_llm::config::ModelConfig;
 use candle_llm::decode::{
     generate, generate_batch, BatchRequest, CancelFlag, FinishReason, GenerationConfig,
 };
 use candle_llm::device::select_device;
-use candle_llm::models::LlamaModel;
+use candle_llm::models::CausalLm;
 use candle_llm::primitives::sampler::SamplingParams;
 use candle_llm::primitives::Weights;
 use candle_llm::provider::eos_token_ids;
@@ -36,7 +36,7 @@ use candle_llm::StreamEvent;
 use core_llm::Tokenizer;
 
 struct Fixture {
-    model: LlamaModel,
+    model: CausalLm,
     tok: Tokenizer,
     stop: Vec<i32>,
 }
@@ -46,9 +46,9 @@ fn load() -> Option<Fixture> {
         .ok()
         .filter(|p| !p.is_empty())?;
     let device = select_device().unwrap();
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let model =
-        LlamaModel::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
+        CausalLm::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     let stop = eos_token_ids(std::path::Path::new(&dir));
     Some(Fixture { model, tok, stop })

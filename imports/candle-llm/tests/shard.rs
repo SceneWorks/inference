@@ -1,7 +1,7 @@
 //! Pipeline (layer-split) multi-GPU sharding tests (story 7263, part b).
 //!
 //! ## What these prove
-//! - **Drop-in parity**: a model loaded *sharded* (`LlamaModel::from_dir_sharded`) onto a single
+//! - **Drop-in parity**: a model loaded *sharded* (`CausalLm::from_dir_sharded`) onto a single
 //!   device is **token-for-token identical** to an ordinary load — the sharded `Weights` loader,
 //!   per-layer device inference, and the cross-device hand-off in the decoder loop change nothing
 //!   when every layer happens to share one device. This runs on CPU, no GPU, no download.
@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, Tensor};
 use core_llm::Tokenizer;
 
-use candle_llm::config::LlamaConfig;
+use candle_llm::config::ModelConfig;
 use candle_llm::decode::{generate, CancelFlag, GenerationConfig};
-use candle_llm::models::LlamaModel;
+use candle_llm::models::CausalLm;
 use candle_llm::primitives::sampler::SamplingParams;
 use candle_llm::primitives::{SplitMix64, TokenRng, Weights};
 
@@ -35,7 +35,7 @@ fn gen_config(max_new: usize) -> GenerationConfig {
     }
 }
 
-fn greedy(model: &LlamaModel, prompt: &[i32], max_new: usize) -> Vec<i32> {
+fn greedy(model: &CausalLm, prompt: &[i32], max_new: usize) -> Vec<i32> {
     generate(
         model,
         prompt,
@@ -133,16 +133,16 @@ fn build_tiny_dir() -> std::path::PathBuf {
 fn sharded_single_device_matches_plain_cpu() {
     let dir = build_tiny_dir();
 
-    let plain = LlamaModel::from_weights(
+    let plain = CausalLm::from_weights(
         &Weights::from_dir(&dir, &Device::Cpu).unwrap(),
         "",
-        LlamaConfig::from_dir(&dir).unwrap(),
+        ModelConfig::from_dir(&dir).unwrap(),
     )
     .unwrap();
 
-    let sharded = LlamaModel::from_dir_sharded(
+    let sharded = CausalLm::from_dir_sharded(
         &dir,
-        LlamaConfig::from_dir(&dir).unwrap(),
+        ModelConfig::from_dir(&dir).unwrap(),
         DType::F32,
         &[Device::Cpu],
     )
@@ -197,9 +197,9 @@ mod real {
             return;
         };
 
-        let sharded = LlamaModel::from_dir_sharded(
+        let sharded = CausalLm::from_dir_sharded(
             &dir,
-            LlamaConfig::from_dir(&dir).unwrap(),
+            ModelConfig::from_dir(&dir).unwrap(),
             DType::BF16,
             &[d0.clone(), d1.clone()],
         )
@@ -213,9 +213,9 @@ mod real {
         );
 
         // Single-GPU baseline (sharded onto one device == ordinary load), same dtype path.
-        let single = LlamaModel::from_dir_sharded(
+        let single = CausalLm::from_dir_sharded(
             &dir,
-            LlamaConfig::from_dir(&dir).unwrap(),
+            ModelConfig::from_dir(&dir).unwrap(),
             DType::BF16,
             std::slice::from_ref(&d0),
         )

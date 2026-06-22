@@ -4,9 +4,9 @@
 //! A `LlavaForConditionalGeneration` checkpoint is a SigLIP vision tower
 //! ([`crate::models::SiglipVisionTower`]) that encodes the image, a two-layer GELU MLP projector
 //! that lifts a chosen penultimate-layer hidden state into the language hidden size, and a generic
-//! causal decoder ([`LlamaModel`], reused as-is — any architecture the config dispatches). The
+//! causal decoder ([`CausalLm`], reused as-is — any architecture the config dispatches). The
 //! projected patch rows replace the expanded image-token placeholders in the prompt embeddings (the
-//! [`LlamaModel::decode_logits_from_embeds`] splice hook), then the decoder generates the caption.
+//! [`CausalLm::decode_logits_from_embeds`] splice hook), then the decoder generates the caption.
 //!
 //! Geometry is read from the checkpoint's `config.json` (`vision_config`, `text_config`,
 //! `image_token_index`, `vision_feature_layer`, `vision_feature_select_strategy`), so the same code
@@ -29,14 +29,14 @@ use core_llm::{
     Usage,
 };
 
-use crate::config::LlamaConfig;
+use crate::config::ModelConfig;
 use crate::decode::stream::default_seed;
 use crate::decode::{CancelFlag, FinishReason};
 use crate::device::select_device;
 use crate::error::{Error, Result};
 use crate::image::SiglipImageProcessor;
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
-use crate::models::LlamaModel;
+use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, gelu_erf, linear};
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 use crate::primitives::{input_ids, Weights};
@@ -61,7 +61,7 @@ pub enum SelectStrategy {
 #[derive(Clone, Debug)]
 pub struct LlavaConfig {
     /// The language decoder config (from `text_config`).
-    pub text: LlamaConfig,
+    pub text: ModelConfig,
     /// The vision tower geometry (from `vision_config`).
     pub vision: SiglipVisionConfig,
     /// The placeholder token id expanded to the image rows (`image_token_index`).
@@ -83,7 +83,7 @@ impl LlavaConfig {
         let tc = v
             .get("text_config")
             .ok_or_else(|| Error::Config("llava: config.json has no text_config".into()))?;
-        let text = LlamaConfig::from_json(tc)?;
+        let text = ModelConfig::from_json(tc)?;
         let vision = v
             .get("vision_config")
             .map(SiglipVisionConfig::from_json)
@@ -249,7 +249,7 @@ pub struct LlavaGeneration {
 pub struct LlavaModel {
     vision: SiglipVisionTower,
     projector: LlavaProjector,
-    language: LlamaModel,
+    language: CausalLm,
     processor: SiglipImageProcessor,
     cfg: LlavaConfig,
     device: Device,
@@ -267,7 +267,7 @@ impl LlavaModel {
         let cfg = LlavaConfig::from_json(&v)?;
 
         let w = Weights::from_dir(dir, device)?;
-        let language = LlamaModel::from_weights(&w, "language_model", cfg.text.clone())?;
+        let language = CausalLm::from_weights(&w, "language_model", cfg.text.clone())?;
         let vision = SiglipVisionTower::from_weights(&w, "vision_tower.vision_model", cfg.vision)?;
         let projector =
             LlavaProjector::from_weights(&w, "multi_modal_projector", cfg.projector_gelu_tanh)?;
@@ -292,7 +292,7 @@ impl LlavaModel {
 
     /// The underlying language decoder (shared with the text path), for callers that drive their own
     /// embed/splice/decode loop.
-    pub fn language(&self) -> &LlamaModel {
+    pub fn language(&self) -> &CausalLm {
         &self.language
     }
 

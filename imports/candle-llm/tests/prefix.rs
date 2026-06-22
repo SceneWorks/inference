@@ -23,10 +23,10 @@ use std::collections::HashMap;
 use candle_core::{Device, Tensor};
 use core_llm::Tokenizer;
 
-use candle_llm::config::LlamaConfig;
+use candle_llm::config::ModelConfig;
 use candle_llm::decode::{generate, generate_cached, CancelFlag, GenerationConfig, PrefixCache};
 use candle_llm::device::select_device;
-use candle_llm::models::LlamaModel;
+use candle_llm::models::CausalLm;
 use candle_llm::primitives::sampler::SamplingParams;
 use candle_llm::primitives::{SplitMix64, TokenRng, Weights};
 
@@ -43,7 +43,7 @@ fn config(max_new: usize) -> GenerationConfig {
     }
 }
 
-fn cold(model: &LlamaModel, prompt: &[i32], max_new: usize) -> Vec<i32> {
+fn cold(model: &CausalLm, prompt: &[i32], max_new: usize) -> Vec<i32> {
     generate(
         model,
         prompt,
@@ -55,7 +55,7 @@ fn cold(model: &LlamaModel, prompt: &[i32], max_new: usize) -> Vec<i32> {
     .tokens
 }
 
-fn cached(model: &LlamaModel, prompt: &[i32], max_new: usize, pc: &mut PrefixCache) -> Vec<i32> {
+fn cached(model: &CausalLm, prompt: &[i32], max_new: usize, pc: &mut PrefixCache) -> Vec<i32> {
     generate_cached(
         model,
         prompt,
@@ -78,7 +78,7 @@ fn prompt(sys: &[i32], suffix: &[i32]) -> Vec<i32> {
 /// The body shared by the synthetic and real-weights runs: cold baselines, then three cached calls
 /// exercising a cold miss, a shared-prefix hit, and a whole-prompt (clamped) hit — each bit-exact vs
 /// its baseline, with [`PrefixStats`] asserting exactly which spans were reused.
-fn run_suite(model: &LlamaModel, sys: &[i32], q1: &[i32], q2: &[i32], max_new: usize) {
+fn run_suite(model: &CausalLm, sys: &[i32], q1: &[i32], q2: &[i32], max_new: usize) {
     assert_ne!(
         q1.first(),
         q2.first(),
@@ -160,7 +160,7 @@ fn ones(d: usize) -> Tensor {
 }
 
 /// Write a tiny 2-layer `llama` snapshot from deterministic random weights and load it on CPU.
-fn build_tiny_llama() -> LlamaModel {
+fn build_tiny_llama() -> CausalLm {
     let dir = std::env::temp_dir().join(format!("candle-llm-prefix-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -212,9 +212,9 @@ fn build_tiny_llama() -> LlamaModel {
     }
 
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let weights = Weights::from_dir(&dir, &Device::Cpu).unwrap();
-    let model = LlamaModel::from_weights(&weights, "", cfg).unwrap();
+    let model = CausalLm::from_weights(&weights, "", cfg).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     model
 }
@@ -245,16 +245,16 @@ use candle_core::DType;
 use candle_llm::primitives::{input_ids, KvCache};
 
 struct Fixture {
-    model: LlamaModel,
+    model: CausalLm,
     tok: Tokenizer,
 }
 
 fn load_from(env: &str) -> Option<Fixture> {
     let dir = std::env::var(env).ok().filter(|p| !p.is_empty())?;
     let device = select_device().unwrap();
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let model =
-        LlamaModel::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
+        CausalLm::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     Some(Fixture { model, tok })
 }
@@ -268,7 +268,7 @@ fn encode(tok: &Tokenizer, text: &str, bos: bool) -> Vec<i32> {
 }
 
 /// First-position logits `[1, vocab]` (f32) for a cold prefill of `prompt`.
-fn cold_logits(model: &LlamaModel, prompt: &[i32]) -> Tensor {
+fn cold_logits(model: &CausalLm, prompt: &[i32]) -> Tensor {
     let mut cache = model.new_cache();
     let ids = input_ids(prompt, model.device()).unwrap();
     model
@@ -281,7 +281,7 @@ fn cold_logits(model: &LlamaModel, prompt: &[i32]) -> Tensor {
 /// First-position logits `[1, vocab]` (f32) for the reuse path: prefill `sys`, then prefill `suffix`
 /// at offset `sys.len()` over the cached `sys` KV — the exact mechanic [`generate_cached`] runs on a
 /// shared-prefix hit.
-fn reused_logits(model: &LlamaModel, sys: &[i32], suffix: &[i32]) -> Tensor {
+fn reused_logits(model: &CausalLm, sys: &[i32], suffix: &[i32]) -> Tensor {
     let mut cache = model.new_cache();
     let sys_ids = input_ids(sys, model.device()).unwrap();
     model.decode_logits(&sys_ids, &mut cache, 0).unwrap();

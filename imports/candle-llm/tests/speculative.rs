@@ -18,13 +18,13 @@ use std::collections::HashMap;
 use candle_core::{Device, Tensor};
 use core_llm::Tokenizer;
 
-use candle_llm::config::LlamaConfig;
+use candle_llm::config::ModelConfig;
 use candle_llm::decode::{
     generate, generate_draft_speculative, generate_prompt_lookup, CancelFlag, GenerationConfig,
     SpeculativeConfig,
 };
 use candle_llm::device::select_device;
-use candle_llm::models::LlamaModel;
+use candle_llm::models::CausalLm;
 use candle_llm::primitives::projection::QuantSpec;
 use candle_llm::primitives::sampler::SamplingParams;
 use candle_llm::primitives::{SplitMix64, TokenRng, Weights};
@@ -40,7 +40,7 @@ fn greedy_config(max_new: usize) -> GenerationConfig {
     }
 }
 
-fn base_greedy(model: &LlamaModel, prompt: &[i32], max_new: usize) -> Vec<i32> {
+fn base_greedy(model: &CausalLm, prompt: &[i32], max_new: usize) -> Vec<i32> {
     generate(
         model,
         prompt,
@@ -75,13 +75,13 @@ fn ones(d: usize) -> Tensor {
     Tensor::from_vec(vec![1.0f32; d], (d,), &Device::Cpu).unwrap()
 }
 
-fn build_tiny_llama() -> LlamaModel {
+fn build_tiny_llama() -> CausalLm {
     build_tiny(VOCAB, "main")
 }
 
 /// Build a tiny 2-layer `llama` of the given `vocab` size. A per-call atomic sequence keeps the temp
 /// dir unique so concurrently-running tests never share (and delete) one another's snapshot.
-fn build_tiny(vocab: usize, tag: &str) -> LlamaModel {
+fn build_tiny(vocab: usize, tag: &str) -> CausalLm {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -136,9 +136,9 @@ fn build_tiny(vocab: usize, tag: &str) -> LlamaModel {
         w.insert(p("mlp.down_proj.weight"), randn((HIDDEN, INTER), &mut rng));
     }
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let weights = Weights::from_dir(&dir, &Device::Cpu).unwrap();
-    let model = LlamaModel::from_weights(&weights, "", cfg).unwrap();
+    let model = CausalLm::from_weights(&weights, "", cfg).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     model
 }
@@ -386,16 +386,16 @@ fn draft_spec_stochastic_deterministic_cpu() {
 // ---- Real-weights variants (#[ignore]) -----------------------------------------------------------
 
 struct Fixture {
-    model: LlamaModel,
+    model: CausalLm,
     tok: Tokenizer,
 }
 
 fn load_from(env: &str) -> Option<Fixture> {
     let dir = std::env::var(env).ok().filter(|p| !p.is_empty())?;
     let device = select_device().unwrap();
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let model =
-        LlamaModel::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
+        CausalLm::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     Some(Fixture { model, tok })
 }
@@ -526,22 +526,22 @@ fn prompt_lookup_qwen3() {
 /// acceptance. Prefers a **Q4** draft (more lossy ⇒ more interesting acceptance), falling back to
 /// **Q8** when the model's projection `in`-dims aren't 256-aligned (Q4_K's block size — e.g. SmolLM2's
 /// hidden 576; Qwen3's 1024 is fine).
-fn load_draft_target(env: &str) -> Option<(LlamaModel, LlamaModel, Tokenizer)> {
+fn load_draft_target(env: &str) -> Option<(CausalLm, CausalLm, Tokenizer)> {
     let dir = std::env::var(env).ok().filter(|p| !p.is_empty())?;
     let device = select_device().unwrap();
     let w = Weights::from_dir(&dir, &device).unwrap();
-    let target = LlamaModel::from_weights(&w, "", LlamaConfig::from_dir(&dir).unwrap()).unwrap();
-    let draft = LlamaModel::from_weights_with(
+    let target = CausalLm::from_weights(&w, "", ModelConfig::from_dir(&dir).unwrap()).unwrap();
+    let draft = CausalLm::from_weights_with(
         &w,
         "",
-        LlamaConfig::from_dir(&dir).unwrap(),
+        ModelConfig::from_dir(&dir).unwrap(),
         Some(QuantSpec::q4()),
     )
     .or_else(|_| {
-        LlamaModel::from_weights_with(
+        CausalLm::from_weights_with(
             &w,
             "",
-            LlamaConfig::from_dir(&dir).unwrap(),
+            ModelConfig::from_dir(&dir).unwrap(),
             Some(QuantSpec::q8()),
         )
     })
@@ -550,7 +550,7 @@ fn load_draft_target(env: &str) -> Option<(LlamaModel, LlamaModel, Tokenizer)> {
     Some((target, draft, tok))
 }
 
-fn run_draft_suite(target: LlamaModel, draft: LlamaModel, tok: Tokenizer) {
+fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
     // ---- Exactness gate: num_draft = 0 ⇒ identical to non-speculative target decoding. ----
     let no_draft = SpeculativeConfig {
         max_ngram: 3,
