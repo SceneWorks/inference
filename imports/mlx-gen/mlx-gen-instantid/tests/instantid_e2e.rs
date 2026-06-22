@@ -179,6 +179,12 @@ fn run_identity(quant_bits: Option<i32>, size_override: Option<u32>, out_png: &s
         ip_adapter_scale: 0.8,
         controlnet_scale: 0.8,
         seed: 0,
+        // Curated-sampler smoke hook (epic 7114, sc-7297): `INSTANTID_SAMPLER=euler` (or any curated
+        // Solver / `INSTANTID_SCHEDULER`) routes the dual-conditioning denoise through the curated path
+        // instead of the ancestral default — the identity-cosine gate below then validates that the
+        // curated integrator preserves identity. Unset ⇒ today's `euler_ancestral` (byte-exact default).
+        sampler: std::env::var("INSTANTID_SAMPLER").ok(),
+        scheduler: std::env::var("INSTANTID_SCHEDULER").ok(),
         ..Default::default()
     };
     let out = model
@@ -199,8 +205,9 @@ fn run_identity(quant_bits: Option<i32>, size_override: Option<u32>, out_png: &s
         .expect("detect generated face");
     let cos = cosine(&ref_face.embedding, &out_face.embedding);
     println!(
-        "[instantid {label}] {size}x{size} steps={steps} | generated face det_score={:.3} | \
-         ArcFace-cosine(ref, generated) = {cos:.4}",
+        "[instantid {label}] {size}x{size} steps={steps} sampler={} | generated face \
+         det_score={:.3} | ArcFace-cosine(ref, generated) = {cos:.4}",
+        req.sampler.as_deref().unwrap_or("euler_ancestral"),
         out_face.det_score
     );
     cos
