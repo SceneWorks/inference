@@ -43,8 +43,8 @@ parity tests:
 
 | env var | points at | exercised by |
 |---|---|---|
-| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse |
-| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse |
+| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache |
+| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache |
 | `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load |
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
 
@@ -59,6 +59,15 @@ chat) reuses that span's keys/values instead of recomputing prefill. A tiny synt
 it is **bit-exact** — `generate_cached` is token-for-token identical to a cold `generate` — and the
 `#[ignore]`d real-weights variants confirm the mechanic on a GPU snapshot (first-token logits match
 within a small bf16 tolerance; reuse accounting is exact) and report the reused-token count.
+
+The `paged` test covers the **paged KV cache** (`PagedKvCache` + `BlockPool`, gather-then-SDPA behind
+the `KvCache` trait): per-sequence block tables drawn from a shared pool, so a **ragged** batch
+(sequences of differing lengths) decodes bit-exactly — each attends only its own keys, no left-pad —
+and divergent requests sharing a system prefix point at the *same physical blocks* (copy-on-write,
+refcounted). A synthetic CPU model proves drop-in parity (paged is token-for-token identical to the
+contiguous cache), ragged correctness, and bit-exact prefix sharing; the `#[ignore]`d real-weights
+variants confirm the drop-in is bit-exact on a GPU snapshot and report the reservation saving vs a
+naive max-context slab.
 
 > Q4_K's block size is 256, so Q4 quantize-on-load needs projection `in`-dims that are multiples of
 > 256 (true of Qwen3's hidden 1024, not of SmolLM2's 576); Q8_0's block is 32 and applies broadly.

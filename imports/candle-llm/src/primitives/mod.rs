@@ -12,6 +12,7 @@
 pub mod attention;
 pub mod kv_cache;
 pub mod nn;
+pub mod paged_kv_cache;
 pub mod projection;
 pub mod quant;
 pub mod rope;
@@ -21,6 +22,7 @@ pub mod weights;
 pub use attention::{repeat_kv, sdpa, sdpa_causal, AttnMask};
 pub use kv_cache::{ContiguousKvCache, KvCache};
 pub use nn::{embed, gelu, input_ids, input_ids_batch, linear, rms_norm, silu, soft_cap};
+pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};

@@ -24,7 +24,7 @@ use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::{embed, gelu, rms_norm, silu, soft_cap};
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
-use crate::primitives::{repeat_kv, ContiguousKvCache, Weights};
+use crate::primitives::{repeat_kv, ContiguousKvCache, PagedKvCache, Weights};
 
 /// A loaded causal decoder.
 pub struct LlamaModel {
@@ -297,6 +297,14 @@ impl LlamaModel {
     /// A fresh contiguous KV cache sized for this model.
     pub fn new_cache(&self) -> ContiguousKvCache {
         ContiguousKvCache::new(self.cfg.num_layers)
+    }
+
+    /// A fresh single-sequence [`PagedKvCache`] sized for this model, backed by its own
+    /// `block_size`-token block pool — the ragged-batch / prefix-sharing cache (story 7257). Drive it
+    /// through [`generate_with_cache`](crate::decode::generate_with_cache); pack concurrent sequences
+    /// as separate caches over a shared [`BlockPool`](crate::primitives::BlockPool).
+    pub fn new_paged_cache(&self, block_size: usize) -> PagedKvCache {
+        PagedKvCache::new(self.cfg.num_layers, block_size)
     }
 
     /// The engine's compute dtype for this model (bf16 on GPU, f32 on CPU) — the batched decode reads
