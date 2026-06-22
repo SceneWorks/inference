@@ -18,6 +18,7 @@
 //! - [`Sampling`] — backend-neutral sampling policy.
 //! - [`Constraint`] + [`JsonState`] — constrained-decoding policy (generic JSON grammar).
 //! - [`Tokenizer`] + [`ChatTemplate`] — host-side text policy.
+//! - [`StopMatcher`] — backend-neutral request stop-string matching over decoded text.
 //! - [`Scheduler`] — backend-neutral continuous-batching policy (admission + per-sequence retire).
 //! - [`PrefixIndex`] — backend-neutral shared-prefix KV-reuse policy (longest-match + LRU).
 //! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
@@ -37,6 +38,7 @@ pub mod registry;
 pub mod request;
 pub mod schedule;
 pub mod speculative;
+pub mod stop;
 pub mod template;
 pub mod text_llm;
 pub mod tokenizer;
@@ -53,6 +55,7 @@ pub use registry::{load_textllm, textllms, TextLlmRegistration};
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
+pub use stop::{StopChunk, StopMatcher};
 pub use template::{ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template};
 pub use text_llm::TextLlm;
 pub use tokenizer::Tokenizer;
