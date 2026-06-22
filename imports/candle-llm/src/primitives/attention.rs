@@ -17,6 +17,15 @@
 //! masking is bottom-right aligned (`window_size_right = 0`), matching [`causal_mask`]'s convention,
 //! so cached decode stays correct. Numerics differ by a few half-precision ULPs from the eager path
 //! (different reduction order), the same tolerance the batched / prefix-reuse GPU paths carry.
+//!
+//! The continuous-batching `Throughput` path (story 7347) decodes many sequences at once over
+//! per-sequence paged caches; its attention used to be an N-call per-sequence SDPA loop, which
+//! flatlined throughput at occupancy (the cost is N kernel launches + N gathers, not per-kernel
+//! speed). [`try_flash_attn_varlen`] (story 7351) folds that loop into **one**
+//! [`candle_flash_attn::flash_attn_varlen`] call over the ragged (gathered) KV of all active
+//! sequences — no padding mask, no per-sequence launch — packed via cumulative `cu_seqlens` offsets.
+//! It is grouped-query-native (K/V passed un-expanded) and bottom-right causal; the eager per-sequence
+//! loop stays the fallback for the cases varlen cannot serve (soft-cap, f32/CPU, no `flash-attn`).
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::softmax_last_dim;
@@ -170,6 +179,94 @@ fn try_flash_attn(
     Ok(Some(out.transpose(1, 2)?.contiguous()?))
 }
 
+/// Batched per-sequence ("ragged") attention through a **single** [`candle_flash_attn::flash_attn_varlen`]
+/// call (story 7351) — the continuous-batching `Throughput` decode's attention without the
+/// per-sequence loop.
+///
+/// `q` is the batched projection `[batch, heads, s, head_dim]` (every row the same query length `s`,
+/// as the decode step produces). `kv` is one `(k_all, v_all)` per sequence **in batch order**, each
+/// the paged gather `[1, n_kv_heads, lₖ, head_dim]` at that sequence's own cached length `lₖ`. The
+/// kernel handles grouped-query natively (`n_kv_heads` divides `heads`), so K/V are passed
+/// **un-expanded** — no [`repeat_kv`]. Sequences are packed into the kernel's flat layout
+/// (`q`: `[Σ s, heads, head_dim]`, `k`/`v`: `[Σ lₖ, n_kv_heads, head_dim]`) via cumulative `cu_seqlens`
+/// offsets, with no padding mask. Attention is bottom-right causal (`window_size_right = 0`), the
+/// decode convention (query row `r` of a sequence attends its keys `0..=(lₖ - s) + r`).
+///
+/// Returns `Some([batch, heads, s, head_dim])` when varlen is eligible — mirroring [`try_flash_attn`]:
+/// CUDA, f16/bf16, `head_dim` a multiple of 8 and `≤ 512`, no soft-cap — else `Ok(None)` so the caller
+/// runs the eager per-sequence fallback. Numerics differ from the eager loop by a few half-precision
+/// ULPs (different reduction order), the tolerance the `Throughput` path already carries.
+#[cfg(feature = "flash-attn")]
+pub(crate) fn try_flash_attn_varlen(
+    q: &Tensor,
+    kv: &[(Tensor, Tensor)],
+    scale: f32,
+    softcap: Option<f32>,
+) -> Result<Option<Tensor>> {
+    // Soft-cap (Gemma-2) is not on the fused path; nor is CPU / non-half-precision.
+    if softcap.is_some() || !q.device().is_cuda() {
+        return Ok(None);
+    }
+    match q.dtype() {
+        DType::F16 | DType::BF16 => {}
+        _ => return Ok(None),
+    }
+    let (b, h, s, d) = q.dims4()?;
+    if d % 8 != 0 || d > 512 {
+        return Ok(None);
+    }
+    debug_assert_eq!(b, kv.len(), "one (k, v) gather per sequence");
+    let device = q.device();
+
+    // Ragged queries: [b, heads, s, d] -> [b, s, heads, d] -> [b*s, heads, d] (sequence-major rows,
+    // so sequence i owns rows `i*s .. (i+1)*s`).
+    let q_ragged = q.transpose(1, 2)?.contiguous()?.reshape((b * s, h, d))?;
+
+    // Ragged keys/values: each gather [1, kvh, lₖ, d] -> [lₖ, kvh, d]; concatenate along the token
+    // axis into [Σ lₖ, kvh, d], accumulating the cumulative key offsets as we go.
+    let mut ks = Vec::with_capacity(kv.len());
+    let mut vs = Vec::with_capacity(kv.len());
+    let mut cu_k = Vec::with_capacity(kv.len() + 1);
+    cu_k.push(0u32);
+    let mut acc = 0u32;
+    let mut max_k = 0usize;
+    for (k_all, v_all) in kv {
+        let lk = k_all.dim(2)?;
+        max_k = max_k.max(lk);
+        acc += lk as u32;
+        cu_k.push(acc);
+        ks.push(k_all.squeeze(0)?.transpose(0, 1)?.contiguous()?); // [lₖ, kvh, d]
+        vs.push(v_all.squeeze(0)?.transpose(0, 1)?.contiguous()?);
+    }
+    let k_ragged = cat_rows(ks)?;
+    let v_ragged = cat_rows(vs)?;
+
+    // Cumulative query offsets: every sequence contributes the same `s` queries (uniform decode step).
+    let cu_q: Vec<u32> = (0..=b).map(|i| (i * s) as u32).collect();
+    let cu_q = Tensor::from_vec(cu_q, (b + 1,), device)?;
+    let cu_k = Tensor::from_vec(cu_k, (kv.len() + 1,), device)?;
+
+    // One kernel over all sequences; bottom-right causal (window_size_right = 0). Output: [b*s, h, d].
+    let out = candle_flash_attn::flash_attn_varlen(
+        &q_ragged, &k_ragged, &v_ragged, &cu_q, &cu_k, s, max_k, scale, true,
+    )?;
+    // Back to [b, heads, s, d] for the shared output projection.
+    Ok(Some(
+        out.reshape((b, s, h, d))?.transpose(1, 2)?.contiguous()?,
+    ))
+}
+
+/// Concatenate tensors along axis 0; a single part is returned as-is (no copy). Used to pack the
+/// per-sequence ragged K/V rows for [`try_flash_attn_varlen`].
+#[cfg(feature = "flash-attn")]
+fn cat_rows(parts: Vec<Tensor>) -> Result<Tensor> {
+    if parts.len() == 1 {
+        return Ok(parts.into_iter().next().unwrap());
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Ok(Tensor::cat(&refs, 0)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +385,70 @@ mod tests {
             &sdpa_eager(&q1, &k, &v, scale, None, AttnMask::Causal).unwrap(),
         );
         assert!(diff < 3e-2, "decode-shape flash vs eager max|Δ| = {diff}");
+    }
+
+    /// On CUDA, the batched `flash_attn_varlen` ragged path (story 7351) must agree with the eager
+    /// per-sequence SDPA loop it replaces — over **differing-length** sequences (the continuous
+    /// `Throughput` decode), grouped-query (`n_kv_heads < heads`), one decode query per sequence.
+    /// Needs `--features flash-attn`; otherwise `try_flash_attn_varlen` is not compiled and there is
+    /// nothing to compare, so it is gated off.
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    fn flash_attn_varlen_matches_eager_per_seq_on_cuda() {
+        let device = Device::new_cuda(0).expect("cuda device");
+        let (h, kvh, d) = (4usize, 2usize, 64usize); // GQA: groups = 2
+        let groups = h / kvh;
+        let scale = (d as f32).powf(-0.5);
+        let lens = [3usize, 7, 1, 16]; // ragged per-sequence cached lengths
+        let b = lens.len();
+
+        // Bounded, varied bf16 `[1, heads, rows, d]` (cos keeps the softmax off saturation).
+        let mk = |rows: usize, heads: usize, phase: f64| {
+            let n = (rows * heads * d) as f32;
+            Tensor::arange(0f32, n, &device)
+                .unwrap()
+                .reshape((1, heads, rows, d))
+                .unwrap()
+                .affine(0.011, phase)
+                .unwrap()
+                .cos()
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+
+        // One decode query per sequence: q [b, heads, 1, d].
+        let qs: Vec<Tensor> = (0..b).map(|i| mk(1, h, i as f64 * 0.3)).collect();
+        let q = Tensor::cat(&qs.iter().collect::<Vec<_>>(), 0).unwrap();
+        // Per-sequence gathered KV at the ragged lengths (kv-head count, un-expanded).
+        let kv: Vec<(Tensor, Tensor)> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (mk(l, kvh, 1.0 + i as f64), mk(l, kvh, 5.0 + i as f64)))
+            .collect();
+
+        let got = try_flash_attn_varlen(&q, &kv, scale, None)
+            .unwrap()
+            .expect("ragged inputs must be varlen-eligible, else this proves nothing");
+
+        // Eager per-sequence reference: expand GQA and run a stock causal SDPA per sequence.
+        let mut outs = Vec::with_capacity(b);
+        for (i, (k, v)) in kv.iter().enumerate() {
+            let qi = q.narrow(0, i, 1).unwrap();
+            let k = repeat_kv(k, groups).unwrap();
+            let v = repeat_kv(v, groups).unwrap();
+            outs.push(sdpa_eager(&qi, &k, &v, scale, None, AttnMask::Causal).unwrap());
+        }
+        let want = Tensor::cat(&outs.iter().collect::<Vec<_>>(), 0).unwrap();
+
+        let diff = (got.to_dtype(DType::F32).unwrap() - want.to_dtype(DType::F32).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 3e-2, "varlen vs eager per-seq max|Δ| = {diff}");
     }
 }
