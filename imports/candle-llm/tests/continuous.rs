@@ -24,8 +24,8 @@ use core_llm::Tokenizer;
 
 use candle_llm::config::LlamaConfig;
 use candle_llm::decode::{
-    generate, generate_continuous, BatchExactness, BatchRequest, CancelFlag, ContinuousConfig,
-    GenerationConfig, StreamEvent,
+    generate, generate_batch, generate_continuous, BatchExactness, BatchRequest, CancelFlag,
+    ContinuousConfig, GenerationConfig, StreamEvent,
 };
 use candle_llm::models::LlamaModel;
 use candle_llm::primitives::sampler::SamplingParams;
@@ -375,6 +375,63 @@ mod real {
                 println!(
                     "[{env}] Throughput N={n}: {:.1} tok/s ({toks} tokens)",
                     toks as f64 / secs
+                );
+                assert!(outs.iter().all(|o| !o.tokens.is_empty()));
+            }
+        }
+    }
+
+    /// The measurement harness behind the sc-7258 split into sc-7351 (varlen) + sc-7258 (custom
+    /// kernel). Over **uniform-length** sequences it pits `generate_batch` (which already batches
+    /// attention into one masked SDPA — the throughput ceiling) against continuous `Throughput` (the
+    /// per-sequence attention path this story optimizes), reporting tok/s and the gap by occupancy.
+    ///
+    /// Before sc-7351 the per-sequence loop flatlined (~50 tok/s on the RTX PRO 6000) while
+    /// `generate_batch` scaled to 263–453 at N=16 — a 5–9× gap. With `--features flash-attn` the
+    /// per-sequence loop is now one `flash_attn_varlen` call, which should close most of that gap; run
+    /// the same build with and without `flash-attn` to see the before/after. Ratios are the signal, so
+    /// a debug build is fine. Set `CANDLE_LLM_TEST_MODEL` (SmolLM2) and/or `CANDLE_LLM_QWEN3_MODEL`.
+    #[test]
+    #[ignore = "needs CANDLE_LLM_TEST_MODEL / CANDLE_LLM_QWEN3_MODEL (CUDA bench)"]
+    fn attention_bottleneck_bound() {
+        // ~11 tokens; short prompt so decode (not prefill) dominates the timing.
+        const PROMPT: &str = "The quick brown fox jumps over the lazy dog near the";
+        const NEW: usize = 64;
+        for env in ["CANDLE_LLM_TEST_MODEL", "CANDLE_LLM_QWEN3_MODEL"] {
+            let Some((model, tok)) = load(env) else {
+                eprintln!("skip: set {env}");
+                continue;
+            };
+            let prompt = encode(&tok, PROMPT);
+            println!(
+                "[{env}] attention_bottleneck_bound (prompt {} tok, {NEW} new):",
+                prompt.len()
+            );
+            for n in [1usize, 2, 4, 8, 16] {
+                let reqs: Vec<BatchRequest> = (0..n).map(|_| req(prompt.clone(), NEW)).collect();
+
+                // generate_batch: attention batched into one masked SDPA (no gather, no per-seq loop).
+                let t = Instant::now();
+                let outs =
+                    generate_batch(&model, &reqs, &CancelFlag::new(), &mut |_, _| {}).unwrap();
+                let batch_toks: usize = outs.iter().map(|o| o.tokens.len()).sum();
+                let batch_tps = batch_toks as f64 / t.elapsed().as_secs_f64();
+
+                // continuous Throughput: the per-sequence (now varlen) attention path.
+                let cfg = ContinuousConfig {
+                    max_batch: n,
+                    block_size: 16,
+                    exactness: BatchExactness::Throughput,
+                };
+                let t = Instant::now();
+                let outs = run(&model, &reqs, &cfg);
+                let cont_toks: usize = outs.iter().map(|o| o.tokens.len()).sum();
+                let cont_tps = cont_toks as f64 / t.elapsed().as_secs_f64();
+
+                let gap = 100.0 * (1.0 - cont_tps / batch_tps);
+                println!(
+                    "  N={n:<2} generate_batch {batch_tps:7.1} tok/s | continuous Throughput \
+                     {cont_tps:7.1} tok/s | gap {gap:4.0}%"
                 );
                 assert!(outs.iter().all(|o| !o.tokens.is_empty()));
             }

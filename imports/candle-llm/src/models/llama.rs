@@ -838,12 +838,17 @@ impl LlamaAttention {
         self.output(&out)
     }
 
-    /// Per-sequence attention (story 7347): the projection is **batched** over all rows, but each row
-    /// then attends only its own sequence's real KV in `caches[i]`, gathered to its true length and run
-    /// through a stock causal SDPA — i.e. byte-identically to that sequence's batch-1 attention, with
-    /// no padding mask and no cross-row mixing. `caches.len()` must equal the batch. The projections /
-    /// MLP / lm_head around this stay batched, which is where the throughput comes from (and why the
+    /// Per-sequence attention (stories 7347 + 7351): the projection is **batched** over all rows, then
+    /// each row attends only its own sequence's real KV in `caches[i]`, gathered to its true length —
+    /// no padding mask, no cross-row mixing. `caches.len()` must equal the batch. The projections / MLP
+    /// / lm_head around this stay batched, which is where the throughput comes from (and why the
     /// surrounding logits only *track* batch-1 to sub-ULP — the batched matmul isn't M-invariant).
+    ///
+    /// With `--features flash-attn` the per-sequence gathers feed **one**
+    /// [`try_flash_attn_varlen`](crate::primitives::attention::try_flash_attn_varlen) call over the
+    /// ragged KV of all sequences (story 7351) — one kernel launch instead of N. The eager
+    /// per-sequence SDPA loop is the fallback for everything varlen cannot serve (CPU/f32, Gemma-2
+    /// soft-cap, or the feature off), and is byte-identical to each sequence's batch-1 attention.
     fn forward_per_seq(
         &self,
         x: &Tensor,
@@ -853,14 +858,34 @@ impl LlamaAttention {
         layer_idx: usize,
     ) -> Result<Tensor> {
         let (q, k, v) = self.project(x, cos, sin)?; // [b,H,s,hd], [b,kvh,s,hd], [b,kvh,s,hd]
-        let mut outs = Vec::with_capacity(caches.len());
+
+        // Gather each sequence's real KV (appends this step's tokens to its own paged cache). The
+        // gathers are independent clones of pool storage, so collecting them all before attending is
+        // safe (a later sequence's freeze never mutates an earlier sequence's returned tensor).
+        let mut gathered = Vec::with_capacity(caches.len());
         for (i, cache) in caches.iter_mut().enumerate() {
-            let qi = q.narrow(0, i, 1)?; // [1, H, s, hd]
             let ki = k.narrow(0, i, 1)?.contiguous()?;
             let vi = v.narrow(0, i, 1)?.contiguous()?;
-            let (k_all, v_all) = cache.update(layer_idx, &ki, &vi)?; // gather this seq's real KV
-            let k_all = repeat_kv(&k_all, self.groups)?;
-            let v_all = repeat_kv(&v_all, self.groups)?;
+            gathered.push(cache.update(layer_idx, &ki, &vi)?); // [1, kvh, lₖ, hd]
+        }
+
+        // Batched attention over all sequences in one ragged varlen kernel when eligible; otherwise
+        // the eager per-sequence SDPA loop (CPU/f32, soft-cap, or no `flash-attn` feature).
+        #[cfg(feature = "flash-attn")]
+        if let Some(out) = crate::primitives::attention::try_flash_attn_varlen(
+            &q,
+            &gathered,
+            self.scale,
+            self.softcap,
+        )? {
+            return self.output(&out);
+        }
+
+        let mut outs = Vec::with_capacity(gathered.len());
+        for (i, (k_all, v_all)) in gathered.iter().enumerate() {
+            let qi = q.narrow(0, i, 1)?; // [1, H, s, hd]
+            let k_all = repeat_kv(k_all, self.groups)?;
+            let v_all = repeat_kv(v_all, self.groups)?;
             outs.push(sdpa(
                 &qi,
                 &k_all,
