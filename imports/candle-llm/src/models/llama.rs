@@ -51,15 +51,28 @@ impl LlamaModel {
     }
 
     /// Build from a loaded checkpoint, optionally quantizing the attention/MLP projections on load.
-    /// Embeddings, the LM head, and norms always stay dense.
+    /// Embeddings, the LM head, and norms always stay dense. The compute dtype is the device default
+    /// ([`compute_dtype`] — bf16 on GPU, f32 on CPU); use [`LlamaModel::from_weights_dtype`] to pick it.
     pub fn from_weights_with(
         w: &Weights,
         prefix: &str,
         cfg: LlamaConfig,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
+        Self::from_weights_dtype(w, prefix, cfg, quant, compute_dtype(w.device()))
+    }
+
+    /// Like [`LlamaModel::from_weights_with`] but with an explicit dense compute `dtype` — the
+    /// f16-vs-bf16 knob for CUDA dtype perf tuning (story 7263). Dequantized projections accumulate in
+    /// this dtype too. Passing a dtype the backend can't run (e.g. f16 on CPU) surfaces at forward time.
+    pub fn from_weights_dtype(
+        w: &Weights,
+        prefix: &str,
+        cfg: LlamaConfig,
+        quant: Option<QuantSpec>,
+        dtype: DType,
+    ) -> Result<Self> {
         let device = w.device().clone();
-        let dtype = compute_dtype(&device);
         let p = |suffix: &str| join(prefix, suffix);
         let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
         let proj = |key: String| -> Result<Projection> { Projection::load(req(key)?, quant) };

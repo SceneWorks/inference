@@ -24,8 +24,19 @@ Built bottom-up, mirroring `mlx-llm`'s structure on Candle tensors:
 - default → CPU (builds anywhere)
 - `--features cuda` → NVIDIA CUDA (the Windows target)
 - `--features metal` → Apple Metal
+- `--features flash-attn` → CUDA + fused **FlashAttention-2** kernels (`candle-flash-attn`) at the
+  attention seam, with an eager fallback for the cases the kernel can't serve
 
-Compute runs in `bf16` on the GPU backends and `f32` on CPU.
+Compute runs in `bf16` on the GPU backends and `f32` on CPU. The dense compute dtype is also
+selectable per load (`LlamaModel::from_weights_dtype` — e.g. **f16** vs the default bf16) for dtype
+perf tuning.
+
+With `flash-attn`, `primitives::attention::sdpa` dispatches the dense causal/bidirectional path to the
+fused kernel and falls back to the eager softmax SDPA for soft-cap (Gemma-2), MLA's mismatched q/v
+head dims, padded-batch additive masks, or f32/CPU. The kernel's causal masking is bottom-right
+aligned, matching the eager convention, so cached decode stays correct; the two paths agree within a
+few half-precision ULPs (proven by a gated parity test). `candle-flash-attn` ships sm80 kernels that
+**do compile and run on sm_120** (Blackwell) under the project's `CUDA_COMPUTE_CAP=120` build.
 
 ## Testing
 
@@ -43,7 +54,7 @@ parity tests:
 
 | env var | points at | exercised by |
 |---|---|---|
-| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache, **speculative** (prompt-lookup + draft-model) |
+| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache, **speculative** (prompt-lookup + draft-model), `bench` (tokens/s) |
 | `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache, **speculative** (prompt-lookup + draft-model) |
 | `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load |
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
@@ -98,6 +109,22 @@ the selected device (CUDA with `--features cuda`), and confirms the `core-llm-te
 The vision tower + projector run in **f32** (the bf16 weights promoted on load) for numeric fidelity,
 then the features are cast to the decoder's compute dtype before the splice.
 
+The `bench` test (`CANDLE_LLM_TEST_MODEL`) reports prefill + decode tokens/s for the reference decoder
+across compute dtypes (bf16 / **f16**) and a Q8 quantized load — dtype perf is *measured*, not assumed.
+Built with `--features flash-attn` the same bench drives the fused kernel, so running it both ways
+reads the flash-vs-eager speedup. On an **RTX PRO 6000 (sm_120)**, prefill 256 / decode 128 tokens:
+
+| model (head_dim) | dtype | prefill eager → flash | decode eager → flash |
+|---|---|---|---|
+| Qwen3-0.6B (128) | bf16 | 5118 → 6534 tok/s (**+28%**) | 24.1 → 27.4 tok/s (**+14%**) |
+| Qwen3-0.6B (128) | f16  | 3300 → 6638 tok/s (**+101%**) | 25.0 → 26.7 tok/s |
+| SmolLM2-135M (64) | f16 | 6371 → 8211 tok/s (**+29%**) | 26.3 → 30.0 tok/s (**+14%**) |
+
+(Small models are launch-overhead-bound at decode, so the prefill gain is the clearer signal; the
+fused path wins on every row.) The flash kernel's numerical agreement with the eager path is asserted
+by a gated CUDA unit test (`flash_attn_matches_eager_on_cuda`, full-prompt + decode shapes), and the
+whole `core-llm-testkit` conformance suite passes built `--features flash-attn`.
+
 > Q4_K's block size is 256, so Q4 quantize-on-load needs projection `in`-dims that are multiples of
 > 256 (true of Qwen3's hidden 1024, not of SmolLM2's 576); Q8_0's block is 32 and applies broadly.
 
@@ -107,6 +134,10 @@ CANDLE_LLM_TEST_MODEL=/path/SmolLM2-135M-Instruct \
 CANDLE_LLM_QWEN3_MODEL=/path/Qwen3-0.6B \
 CANDLE_LLM_GGUF=/path/Model-Q4_K_M.gguf \
   cargo test --features cuda -- --ignored --nocapture
+
+# Tokens/s, eager vs the fused FlashAttention-2 path (run both, compare):
+CANDLE_LLM_TEST_MODEL=/path/Qwen3-0.6B cargo test --features cuda       --test bench -- --ignored --nocapture
+CANDLE_LLM_TEST_MODEL=/path/Qwen3-0.6B cargo test --features flash-attn --test bench -- --ignored --nocapture
 ```
 
 On Windows/CUDA the build needs the VS dev environment (`vcvars64` + `CUDA_COMPUTE_CAP`); see the
