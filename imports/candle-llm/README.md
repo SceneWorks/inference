@@ -66,8 +66,8 @@ parity tests:
 
 | env var | points at | exercised by |
 |---|---|---|
-| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache, **speculative** (prompt-lookup + draft-model), `bench` (tokens/s) |
-| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache, **speculative** (prompt-lookup + draft-model) |
+| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache, **continuous** batching, **speculative** (prompt-lookup + draft-model), `bench` (tokens/s) |
+| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache, **continuous** batching, **speculative** (prompt-lookup + draft-model) |
 | `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load |
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
 | `CANDLE_LLM_VLM_MODEL` | a SigLIP-based `LlavaForConditionalGeneration` snapshot dir (small: `llava-hf/llava-interleave-qwen-0.5b-hf`; faithful: JoyCaption) | `vlm` — image captioning + the multimodal conformance check |
@@ -92,6 +92,23 @@ refcounted). A synthetic CPU model proves drop-in parity (paged is token-for-tok
 contiguous cache), ragged correctness, and bit-exact prefix sharing; the `#[ignore]`d real-weights
 variants confirm the drop-in is bit-exact on a GPU snapshot and report the reservation saving vs a
 naive max-context slab.
+
+The `continuous` test covers **iteration-level continuous batching** (`generate_continuous`): up to
+`max_batch` sequences decode at once over **per-sequence** `PagedKvCache`s on one shared `BlockPool`,
+and the moment a sequence retires a waiting request is prefilled into the freed slot (admit-on-retire,
+driven by the same `core_llm::Scheduler`) — the batch never drains, with no left-padding. It ships two
+modes (`BatchExactness`): **`Exact`** runs each sequence as its own batch-1 forward (`decode_logits` on
+its own cache) — byte-identical to running the request alone; **`Throughput`** batches the
+projections / MLP / lm_head and runs only attention per-sequence (`decode_logits_per_seq`, an
+`LlamaAttention` `project → per-seq attention → output` refactor) — throughput scales with occupancy at
+the cost of a row only *tracking* its batch-1 run (the batched matmul isn't M-invariant on a GPU, the
+same caveat the synchronous `generate_batch` carries). A synthetic CPU model proves `Exact` (and, since
+CPU f32 reduces in a batch-invariant order, `Throughput` too) is **token-for-token identical** to each
+request's batch-1 run — across differing prompt lengths and across admit-on-retire — plus exactly-one
+terminal `Done` per request under mid-stream cancel and zero-budget requests. The `#[ignore]`d
+real-weights variant confirms the `Exact` equality on a GPU snapshot and reports `Throughput` decode
+tokens/s by occupancy. (The custom paged attention kernel that would batch the per-sequence attention
+loop — the next bottleneck as occupancy grows — is the deferred story 7258 / mlx sc-7325.)
 
 The `speculative` test covers **speculative decoding** — proposing several tokens per target forward
 and verifying them in one batched pass (`decode_logits_all`), accepting the longest agreeing prefix +
