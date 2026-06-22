@@ -24,9 +24,9 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Progress,
-    Quant, Result,
+    curated_sampler_names, curated_scheduler_names, gen_core, Capabilities, Conditioning,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, ModelRegistration, Progress, Quant, Result,
 };
 use mlx_gen_face::FaceAnalysis;
 use mlx_gen_flux::config::FluxVariant;
@@ -60,8 +60,26 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference], // the reference face
             supports_lora: false,
             supports_lokr: false,
-            samplers: vec!["flow_match"],
-            schedulers: vec!["linear"],
+            // Epic 7114 (sc-7297): PuLID delegates its denoise to the FLUX.1-dev backbone
+            // (`generate_with_injector_cfg` → `run_denoise` → `run_flow_sampler`), which already
+            // honors the full curated integrator menu over the flow-match σ schedule AND the curated
+            // scheduler axis (it threads `req.sampler` / `req.scheduler`). The descriptor previously
+            // advertised only `flow_match`, silently N3-dropping every curated name; mirror the
+            // backbone's menu so the curated samplers are selectable. `hyper` is intentionally NOT
+            // advertised — it needs the dev Hyper-FLUX LoRA loaded at scale, which PuLID does not load.
+            // Pure advertised-name change: the curated names route through the SAME, already-tested
+            // FLUX flow denoise (no new code path, parity by construction). `flow_match` kept as the
+            // legacy default alias (== Euler); `linear` kept as the native default scheduler.
+            samplers: {
+                let mut s = curated_sampler_names();
+                s.push("flow_match");
+                s
+            },
+            schedulers: {
+                let mut s = curated_scheduler_names();
+                s.push("linear");
+                s
+            },
             min_size: 256,
             max_size: 2048,
             max_count: 8,
