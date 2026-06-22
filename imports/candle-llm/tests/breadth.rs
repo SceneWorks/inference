@@ -81,3 +81,12 @@ fn gemma2_streams_coherent_text() {
 fn glm4_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_GLM4_MODEL", "glm4");
 }
+
+/// DeepSeek-V2: Multi-head Latent Attention (low-rank KV path + decoupled YaRN RoPE) and a fine-
+/// grained MoE FFN (many routed experts + shared experts, a leading dense layer). Verified on
+/// `deepseek-ai/DeepSeek-V2-Lite-Chat` (15.7B, fits 96GB).
+#[test]
+#[ignore = "needs a DeepSeek-V2 snapshot via CANDLE_LLM_DEEPSEEK_MODEL"]
+fn deepseek_v2_streams_coherent_text() {
+    assert_streams_coherent("CANDLE_LLM_DEEPSEEK_MODEL", "deepseek_v2");
+}
