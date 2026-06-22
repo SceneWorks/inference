@@ -12,7 +12,7 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module};
 
-use crate::config::LlamaConfig;
+use crate::config::{Architecture, LlamaConfig};
 use crate::device::compute_dtype;
 use crate::error::Result;
 use crate::primitives::attention::{sdpa, AttnMask};
@@ -186,12 +186,25 @@ impl LlamaModel {
                 })
             };
 
-            // Gemma-2 wraps the block in a 4-norm "sandwich" (pre+post for both attn and MLP); the
-            // Llama shape has only the two pre-norms.
-            let (pre_ff_ln, post_ff_ln) = if gemma {
+            // Gemma-2 / GLM-4 wrap the block in a 4-norm "sandwich" (pre+post for both attn and MLP);
+            // the Llama shape has only the two pre-norms. The norm key names differ per family.
+            let (post_attn_key, pre_ff_key, post_ff_key) = match cfg.architecture {
+                Architecture::Glm4 => (
+                    "post_self_attn_layernorm",
+                    "post_attention_layernorm",
+                    "post_mlp_layernorm",
+                ),
+                // Gemma-2 (and the default fallback for the post-attention norm name).
+                _ => (
+                    "post_attention_layernorm",
+                    "pre_feedforward_layernorm",
+                    "post_feedforward_layernorm",
+                ),
+            };
+            let (pre_ff_ln, post_ff_ln) = if cfg.architecture.is_sandwich() {
                 (
-                    Some(norm_w(lp("pre_feedforward_layernorm.weight"))?),
-                    Some(norm_w(lp("post_feedforward_layernorm.weight"))?),
+                    Some(norm_w(lp(&format!("{pre_ff_key}.weight")))?),
+                    Some(norm_w(lp(&format!("{post_ff_key}.weight")))?),
                 )
             } else {
                 (None, None)
@@ -199,7 +212,7 @@ impl LlamaModel {
 
             layers.push(LlamaLayer {
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
-                post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
+                post_ln: norm_w(lp(&format!("{post_attn_key}.weight")))?,
                 pre_ff_ln,
                 post_ff_ln,
                 attn: LlamaAttention {
@@ -216,6 +229,7 @@ impl LlamaModel {
                     groups,
                     eps,
                     softcap: cfg.attn_logit_softcap,
+                    rope_interleaved: cfg.architecture.rope_interleaved(),
                 },
                 ffn,
                 eps,
@@ -465,6 +479,8 @@ struct LlamaAttention {
     eps: f64,
     /// Gemma-2 attention-score soft-cap; `None` ⇒ no cap.
     softcap: Option<f32>,
+    /// Whether RoPE uses the interleaved (GPT-J) pairing (GLM-4).
+    rope_interleaved: bool,
 }
 
 impl LlamaAttention {
@@ -494,8 +510,12 @@ impl LlamaAttention {
         }
 
         // RoPE on q,k (cos/sin broadcast over the head axis), then -> [b, heads, s, head_dim].
-        let q = apply_rope(&q, cos, sin)?.transpose(1, 2)?.contiguous()?;
-        let k = apply_rope(&k, cos, sin)?.transpose(1, 2)?.contiguous()?;
+        let q = apply_rope(&q, cos, sin, self.rope_interleaved)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = apply_rope(&k, cos, sin, self.rope_interleaved)?
+            .transpose(1, 2)?
+            .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
         let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;

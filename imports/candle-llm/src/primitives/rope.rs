@@ -13,13 +13,17 @@ use candle_core::{DType, Device, Tensor};
 
 use crate::error::Result;
 
-/// A rotary embedding: the host-side inverse-frequency table plus the head dimension it rotates.
+/// A rotary embedding: the host-side inverse-frequency table plus the dimension it rotates.
 #[derive(Clone, Debug)]
 pub struct Rope {
-    /// `inv_freq[i]`, length `head_dim / 2`.
+    /// `inv_freq[i]`, length `rotary_dim / 2`.
     inv_freq: Vec<f32>,
-    /// Head dimension (the size of the last axis RoPE rotates).
+    /// The number of (last-axis) dimensions RoPE rotates — `head_dim` for full rotary, less for a
+    /// partial schedule (GLM-4). Equals `inv_freq.len() * 2`.
     dim: usize,
+    /// Pairing convention: `false` ⇒ NeoX half-split (the default); `true` ⇒ GPT-J interleaved
+    /// (adjacent even/odd dims form a pair) — GLM-4.
+    interleaved: bool,
 }
 
 impl Rope {
@@ -33,7 +37,27 @@ impl Rope {
         let inv_freq = (0..half)
             .map(|i| 1.0 / theta.powf((2 * i) as f32 / dim as f32))
             .collect();
-        Self { inv_freq, dim }
+        Self {
+            inv_freq,
+            dim,
+            interleaved: false,
+        }
+    }
+
+    /// Partial RoPE over the first `rotary_dim` dimensions (`inv_freq[i] = theta^(-2i / rotary_dim)`),
+    /// leaving the remaining `head_dim − rotary_dim` dims unrotated. `interleaved` selects the GPT-J
+    /// pairing (GLM-4) instead of NeoX half-split.
+    pub fn partial(rotary_dim: i32, theta: f32, interleaved: bool) -> Self {
+        let dim = rotary_dim as usize;
+        let half = dim / 2;
+        let inv_freq = (0..half)
+            .map(|i| 1.0 / theta.powf((2 * i) as f32 / dim as f32))
+            .collect();
+        Self {
+            inv_freq,
+            dim,
+            interleaved,
+        }
     }
 
     /// Llama-3 scaled RoPE (the `rope_scaling` "llama3" NTK-by-parts schedule).
@@ -68,7 +92,11 @@ impl Rope {
                 }
             })
             .collect();
-        Self { inv_freq, dim }
+        Self {
+            inv_freq,
+            dim,
+            interleaved: false,
+        }
     }
 
     /// The head dimension this RoPE rotates.
@@ -104,14 +132,23 @@ impl Rope {
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
         let n = positions.len();
-        // emb = cat(freqs, freqs): the half-table duplicated to the full head dim.
+        // The per-position angle table, laid out to match the rotation convention:
+        //   NeoX       → cat(freqs, freqs)            (`apply_rope` pairs dim i with i + dim/2)
+        //   interleaved → each freq repeated twice    (`apply_rope` pairs dim 2i with 2i+1)
         let mut emb = Vec::with_capacity(n * self.dim);
         for &pos in positions {
-            for &f in &self.inv_freq {
-                emb.push(pos as f32 * f);
-            }
-            for &f in &self.inv_freq {
-                emb.push(pos as f32 * f);
+            if self.interleaved {
+                for &f in &self.inv_freq {
+                    emb.push(pos as f32 * f);
+                    emb.push(pos as f32 * f);
+                }
+            } else {
+                for &f in &self.inv_freq {
+                    emb.push(pos as f32 * f);
+                }
+                for &f in &self.inv_freq {
+                    emb.push(pos as f32 * f);
+                }
             }
         }
         let emb = Tensor::from_vec(emb, (1, n, self.dim), device)?;
@@ -119,21 +156,53 @@ impl Rope {
         let sin_t = emb.sin()?.to_dtype(dtype)?;
         Ok((cos_t, sin_t))
     }
+
+    /// Whether this RoPE uses the interleaved (GPT-J) pairing.
+    pub fn interleaved(&self) -> bool {
+        self.interleaved
+    }
 }
 
-/// Apply rotary embeddings to `x` (rotate-half / GPT-NeoX convention).
+/// Apply rotary embeddings to `x`.
 ///
 /// `x` is `[batch, seq, heads, head_dim]` (RoPE is applied before the transpose into
-/// `[batch, heads, seq, head_dim]`); `cos`/`sin` are `[1, seq, head_dim]` and broadcast over heads.
-pub fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let d = x.dim(3)?;
-    let half = d / 2;
-    let x1 = x.narrow(3, 0, half)?;
-    let x2 = x.narrow(3, half, half)?;
-    let rot = Tensor::cat(&[&x2.neg()?, &x1], 3)?; // rotate_half = cat(-x2, x1)
-    let cos = cos.unsqueeze(2)?; // [1, seq, 1, head_dim]
+/// `[batch, heads, seq, head_dim]`); `cos`/`sin` are `[*, seq, rotary_dim]` and broadcast over heads.
+/// Only the first `rotary_dim = cos.last_dim` dims are rotated (the rest pass through — partial RoPE,
+/// GLM-4); `interleaved` selects the GPT-J even/odd pairing instead of NeoX half-split.
+pub fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, interleaved: bool) -> Result<Tensor> {
+    let head_dim = x.dim(3)?;
+    let rd = cos.dim(cos.rank() - 1)?; // rotary_dim
+    let cos = cos.unsqueeze(2)?; // [*, seq, 1, rotary_dim]
     let sin = sin.unsqueeze(2)?;
-    Ok((x.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?)?)
+
+    let x_rot = x.narrow(3, 0, rd)?;
+    let rotated = if interleaved {
+        // Pairs (x[2i], x[2i+1]); rotate_half = interleave(-x_odd, x_even).
+        let mut pair_shape = x_rot.dims().to_vec();
+        let last = pair_shape.len() - 1;
+        pair_shape[last] = rd / 2;
+        pair_shape.push(2);
+        let xr = x_rot.reshape(pair_shape)?; // [.., rd/2, 2]
+        let ax = xr.rank() - 1;
+        let even = xr.narrow(ax, 0, 1)?;
+        let odd = xr.narrow(ax, 1, 1)?;
+        let rot = Tensor::cat(&[&odd.neg()?, &even], ax)?.reshape(x_rot.shape())?;
+        (x_rot.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?)?
+    } else {
+        // NeoX half-split: pairs (x[i], x[i + rd/2]); rotate_half = cat(-x2, x1).
+        let half = rd / 2;
+        let x1 = x_rot.narrow(3, 0, half)?;
+        let x2 = x_rot.narrow(3, half, half)?;
+        let rot = Tensor::cat(&[&x2.neg()?, &x1], 3)?;
+        (x_rot.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?)?
+    };
+
+    if rd < head_dim {
+        let x_pass = x.narrow(3, rd, head_dim - rd)?;
+        Ok(Tensor::cat(&[&rotated, &x_pass], 3)?)
+    } else {
+        Ok(rotated)
+    }
 }
 
 #[cfg(test)]
@@ -186,12 +255,49 @@ mod tests {
             &Device::Cpu,
         )
         .unwrap();
-        let y = apply_rope(&x, &c, &s).unwrap();
+        let y = apply_rope(&x, &c, &s, false).unwrap();
         let yh = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let xh = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         for (a, b) in xh.iter().zip(&yh) {
             assert!((a - b).abs() < 1e-5, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn partial_rope_passes_through_unrotated_tail() {
+        // rotary_dim 2 over a head_dim of 4: dims [2,4) must pass through unchanged at any position.
+        let rope = Rope::partial(2, 10000.0, false);
+        let (c, s) = rope.cos_sin(1, 3, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(c.dims(), &[1, 1, 2]); // table width == rotary_dim
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 1, 1, 4), &Device::Cpu).unwrap();
+        let y = apply_rope(&x, &c, &s, false)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Tail (indices 2,3) untouched.
+        assert!((y[2] - 3.0).abs() < 1e-5 && (y[3] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn interleaved_rope_rotates_even_odd_pairs() {
+        // One pair (a, b) at the base frequency (inv_freq[0] = 1), position p: the interleaved
+        // convention rotates (a, b) -> (a·cosp − b·sinp, a·sinp + b·cosp).
+        let rope = Rope::partial(2, 10000.0, true);
+        let p = 1.0f32;
+        let (c, s) = rope.cos_sin(1, 1, DType::F32, &Device::Cpu).unwrap();
+        let (a, b) = (0.7f32, -0.3f32);
+        let x = Tensor::from_vec(vec![a, b], (1, 1, 1, 2), &Device::Cpu).unwrap();
+        let y = apply_rope(&x, &c, &s, true)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let (cp, sp) = (p.cos(), p.sin());
+        assert!((y[0] - (a * cp - b * sp)).abs() < 1e-5, "{y:?}");
+        assert!((y[1] - (a * sp + b * cp)).abs() < 1e-5, "{y:?}");
     }
 
     #[test]
@@ -206,7 +312,7 @@ mod tests {
             &Device::Cpu,
         )
         .unwrap();
-        let y = apply_rope(&x, &c, &s).unwrap();
+        let y = apply_rope(&x, &c, &s, false).unwrap();
         let xh = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let yh = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let norm = |v: &[f32]| -> f32 { v.iter().map(|a| a * a).sum::<f32>().sqrt() };

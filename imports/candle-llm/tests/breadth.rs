@@ -73,3 +73,11 @@ fn qwen2_moe_streams_coherent_text() {
 fn gemma2_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_GEMMA2_MODEL", "gemma2");
 }
+
+/// GLM-4: 4-norm sandwich (standard RMSNorm), q/k/v bias, packed gate_up, and partial + interleaved
+/// RoPE.
+#[test]
+#[ignore = "needs a GLM-4 snapshot via CANDLE_LLM_GLM4_MODEL"]
+fn glm4_streams_coherent_text() {
+    assert_streams_coherent("CANDLE_LLM_GLM4_MODEL", "glm4");
+}
