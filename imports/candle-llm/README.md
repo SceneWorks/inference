@@ -43,8 +43,8 @@ parity tests:
 
 | env var | points at | exercised by |
 |---|---|---|
-| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode |
-| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128) |
+| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse |
+| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse |
 | `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load |
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
 
@@ -52,6 +52,13 @@ The `breadth` test streams a prompt through each non-Llama architecture: **Phi-3
 **Qwen2-MoE** (router + experts + shared, q/k/v bias), **Gemma-2** (sandwich norms + soft-caps + GeGLU),
 **GLM-4** (sandwich + partial/interleaved RoPE), and **DeepSeek-V2** (Multi-head Latent Attention +
 fine-grained MoE; verified on `deepseek-ai/DeepSeek-V2-Lite-Chat`, which fits in 96GB).
+
+The `prefix` test covers **shared-prefix KV reuse** (`generate_cached` over a `PrefixCache`): a request
+sharing a leading run of tokens with a stored one (a system prompt, a few-shot preamble, a growing
+chat) reuses that span's keys/values instead of recomputing prefill. A tiny synthetic CPU model proves
+it is **bit-exact** — `generate_cached` is token-for-token identical to a cold `generate` — and the
+`#[ignore]`d real-weights variants confirm the mechanic on a GPU snapshot (first-token logits match
+within a small bf16 tolerance; reuse accounting is exact) and report the reused-token count.
 
 > Q4_K's block size is 256, so Q4 quantize-on-load needs projection `in`-dims that are multiples of
 > 256 (true of Qwen3's hidden 1024, not of SmolLM2's 576); Q8_0's block is 32 and applies broadly.
