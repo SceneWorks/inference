@@ -25,6 +25,8 @@ pub mod decode;
 pub mod device;
 pub mod error;
 pub mod gguf;
+pub mod image;
+pub mod llava;
 pub mod models;
 pub mod primitives;
 pub mod provider;
@@ -40,5 +42,6 @@ pub use decode::{
 };
 pub use device::{compute_dtype, select_device};
 pub use error::{Error, Result};
+pub use llava::{LlavaConfig, LlavaModel, LlavaProvider};
 pub use models::LlamaModel;
 pub use provider::LlamaProvider;

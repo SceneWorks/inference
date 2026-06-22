@@ -66,9 +66,12 @@ impl Architecture {
             Ok(Architecture::Phi3)
         } else if hay.contains("llama")
             || hay.contains("mistral")
+            || hay.contains("qwen2")
             || (arch.is_none() && model_type.is_none())
         {
-            // Llama/Mistral share the decoder shape; a minimal config (no arch fields) defaults here.
+            // Llama / Mistral / dense Qwen2 share the decoder shape — Qwen2 only adds q/k/v bias,
+            // which the projection loader auto-detects by weight-key presence (no q/k norm, standard
+            // RoPE, SwiGLU). A minimal config (no arch fields) also defaults here.
             Ok(Architecture::Llama)
         } else {
             Err(Error::Unsupported(format!(
@@ -574,6 +577,12 @@ mod tests {
             Architecture::from_config(&mistral).unwrap(),
             Architecture::Llama
         );
+
+        // Dense Qwen2 shares the Llama decoder shape (q/k/v bias auto-detected); routed to Llama.
+        let qwen2 = json!({ "architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2" });
+        let a = Architecture::from_config(&qwen2).unwrap();
+        assert_eq!(a, Architecture::Llama);
+        assert!(!a.has_qk_norm());
 
         // Minimal config (no arch fields) defaults to Llama.
         let minimal = json!({ "hidden_size": 8 });
