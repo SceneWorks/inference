@@ -43,8 +43,8 @@ parity tests:
 
 | env var | points at | exercised by |
 |---|---|---|
-| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache |
-| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache |
+| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache, **prompt-lookup speculative** |
+| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache, **prompt-lookup speculative** |
 | `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load |
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
 
@@ -68,6 +68,16 @@ refcounted). A synthetic CPU model proves drop-in parity (paged is token-for-tok
 contiguous cache), ragged correctness, and bit-exact prefix sharing; the `#[ignore]`d real-weights
 variants confirm the drop-in is bit-exact on a GPU snapshot and report the reservation saving vs a
 naive max-context slab.
+
+The `speculative` test covers **prompt-lookup (n-gram) speculative decoding** (`generate_prompt_lookup`):
+propose draft tokens by matching the trailing n-gram against the context, verify them in one batched
+forward (`decode_logits_all`), accept the longest agreeing prefix + a bonus, and roll back rejected
+drafts via the `KvCache::truncate` seam. With `num_draft = 0` the verify is a single-token forward, so
+it is **bit-identical** to non-speculative `generate` — the exactness gate. A synthetic CPU model also
+shows draft acceptance (`forwards < tokens`) at identical greedy output; the `#[ignore]`d real-weights
+variants confirm the n-gram speedup on a GPU snapshot, where the greedy run *tracks* (rather than
+bit-matches) non-speculative because the multi-token verify kernel rounds a few bf16 ULP differently
+from the single-token decode kernel.
 
 > Q4_K's block size is 256, so Q4 quantize-on-load needs projection `in`-dims that are multiples of
 > 256 (true of Qwen3's hidden 1024, not of SmolLM2's 576); Q8_0's block is 32 and applies broadly.

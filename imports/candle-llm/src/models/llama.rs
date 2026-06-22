@@ -385,6 +385,24 @@ impl LlamaModel {
         self.forward_to_last_logits(&embeds, cache, cos, sin, AttnMask::Additive(mask))
     }
 
+    /// Run a forward step over token ids and return logits for **every** position, `[batch, seq,
+    /// vocab]`. The all-positions forward speculative decoding (stories 7259 / 7260) runs to verify
+    /// `[cur, draft₁ … draftₖ]` in one pass — `logits[.., i, ..]` predicts the token after position
+    /// `i`. `offset` is the position of the first input token (number of cached positions); the mask
+    /// is the implicit bottom-right causal one.
+    pub fn decode_logits_all(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Tensor> {
+        let embeds = self.embed(input_ids)?;
+        let s = embeds.dim(1)? as i32;
+        let (cos, sin) = self.rope.cos_sin(s, offset, self.dtype, &self.device)?;
+        let h = self.run_decoder_stack(&embeds, cache, &cos, &sin, AttnMask::Causal)?;
+        self.project_logits(&h) // [b, s, vocab]
+    }
+
     /// Run the decoder stack over `input_embeds` with the given RoPE tables and attention mask, and
     /// project the **last column** to logits `[batch, vocab]`. The shared core of the single and
     /// batched forwards: they differ only in how `cos`/`sin` and `mask` are built.
@@ -397,16 +415,35 @@ impl LlamaModel {
         mask: AttnMask<'_>,
     ) -> Result<Tensor> {
         let (b, s, _) = input_embeds.dims3()?;
+        let h = self.run_decoder_stack(input_embeds, cache, cos, sin, mask)?;
+        let last_h = h.narrow(1, s - 1, 1)?.contiguous()?; // [b, 1, hidden]
+        let logits = self.project_logits(&last_h)?; // [b, 1, vocab]
+        Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
+    }
 
+    /// Run the decoder stack, returning the final hidden states `[batch, seq, hidden]` (pre-norm /
+    /// pre-`lm_head`). Shared by the last-position and all-position projections.
+    fn run_decoder_stack(
+        &self,
+        input_embeds: &Tensor,
+        cache: &mut dyn KvCache,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: AttnMask<'_>,
+    ) -> Result<Tensor> {
         let mut h = input_embeds.clone();
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, cos, sin, mask, cache, i)?;
         }
+        Ok(h)
+    }
 
-        let last_h = h.narrow(1, s - 1, 1)?.contiguous()?; // [b, 1, hidden]
-        let normed = rms_norm(&last_h, &self.norm, self.cfg.rms_norm_eps as f64)?;
-        let logits = self.lm_head.forward(&normed)?; // [b, 1, vocab]
-        let logits = logits.reshape((b, self.cfg.vocab_size as usize))?;
+    /// Final RMSNorm + `lm_head` (+ Gemma-2 logit soft-cap) over hidden states `[batch, n, hidden]`,
+    /// giving logits `[batch, n, vocab]`. `n` is `1` for the last-position forward, `seq` for the
+    /// all-positions one.
+    fn project_logits(&self, h: &Tensor) -> Result<Tensor> {
+        let normed = rms_norm(h, &self.norm, self.cfg.rms_norm_eps as f64)?;
+        let logits = self.lm_head.forward(&normed)?;
         // Gemma-2 soft-caps the final logits.
         match self.final_softcap {
             Some(c) => Ok(soft_cap(&logits, c)?),

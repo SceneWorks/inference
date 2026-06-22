@@ -330,6 +330,69 @@ impl KvCache for PagedKvCache {
         Ok(())
     }
 
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        if len < 0 {
+            return Err(Error::Msg(format!("truncate: negative len {len}")));
+        }
+        let len = len as usize;
+        if len >= self.len() {
+            return Ok(()); // already at/under the target length
+        }
+        let full = self.block_ids.len() * self.block_size;
+        if len >= full {
+            // Truncation falls within the partial tail: slice every layer's tail to the remainder
+            // (tail is present here, since len < total ⇒ tail_len > 0).
+            let new_tail = len - full;
+            for l in 0..self.num_layers {
+                if new_tail == 0 {
+                    self.tail_k[l] = None;
+                    self.tail_v[l] = None;
+                } else {
+                    let k = slice_prefix(self.tail_k[l].as_ref().expect("tail present"), new_tail)?;
+                    let v = slice_prefix(self.tail_v[l].as_ref().expect("tail present"), new_tail)?;
+                    self.tail_k[l] = Some(k);
+                    self.tail_v[l] = Some(v);
+                }
+            }
+            self.tail_len = new_tail;
+            return Ok(());
+        }
+        // Truncation drops whole blocks (and may unfreeze part of one into a fresh private tail).
+        let keep_full = len / self.block_size;
+        let rem = len % self.block_size;
+        if rem > 0 {
+            // Unfreeze the remainder of the boundary block into the tail *before* releasing anything.
+            let mut nk = Vec::with_capacity(self.num_layers);
+            let mut nv = Vec::with_capacity(self.num_layers);
+            {
+                let pool = self.pool.borrow();
+                let block = pool.block(self.block_ids[keep_full]);
+                for l in 0..self.num_layers {
+                    nk.push(slice_prefix(&block.k[l], rem)?);
+                    nv.push(slice_prefix(&block.v[l], rem)?);
+                }
+            }
+            for l in 0..self.num_layers {
+                self.tail_k[l] = Some(nk[l].clone());
+                self.tail_v[l] = Some(nv[l].clone());
+            }
+            self.tail_len = rem;
+        } else {
+            self.tail_k = vec![None; self.num_layers];
+            self.tail_v = vec![None; self.num_layers];
+            self.tail_len = 0;
+        }
+        // Release the dropped blocks (everything from keep_full on) and shrink the table.
+        {
+            let mut pool = self.pool.borrow_mut();
+            for &id in &self.block_ids[keep_full..] {
+                pool.release(id);
+            }
+        }
+        self.block_ids.truncate(keep_full);
+        Ok(())
+    }
+
     fn reset(&mut self) {
         {
             let mut pool = self.pool.borrow_mut();
@@ -367,6 +430,11 @@ fn split_block(a: &Tensor, block_size: usize) -> Result<(Tensor, Option<Tensor>)
         None
     };
     Ok((head, tail))
+}
+
+/// The first `n` positions of `a` along the sequence axis (contiguous so it owns its storage).
+fn slice_prefix(a: &Tensor, n: usize) -> Result<Tensor> {
+    Ok(a.narrow(SEQ_AXIS, 0, n)?.contiguous()?)
 }
 
 /// Concatenate the parts along the sequence axis; a single part is returned as-is (no copy).
@@ -507,6 +575,47 @@ mod tests {
         drop(b);
         assert_eq!(pool.borrow().shared_blocks(), 0);
         assert_eq!(pool.borrow().live_blocks(), 2);
+    }
+
+    #[test]
+    fn truncate_within_tail_and_across_blocks() {
+        let mut c = PagedKvCache::new(1, 4);
+        let k = seq(1, 10, 1, 0.0); // values 0..9 -> blocks [0..3][4..7] + tail [8,9]
+        c.update(0, &k, &k).unwrap();
+        assert_eq!(c.offset(), 10);
+
+        // Case A: within the tail.
+        c.truncate(9).unwrap();
+        assert_eq!(c.offset(), 9);
+        assert_eq!(
+            host(&c.gather(0).unwrap().0),
+            (0..9).map(|x| x as f32).collect::<Vec<_>>()
+        );
+
+        // Case B: drop into a block, unfreezing its remainder into a fresh tail.
+        c.truncate(5).unwrap();
+        assert_eq!(c.offset(), 5);
+        assert_eq!(
+            host(&c.gather(0).unwrap().0),
+            (0..5).map(|x| x as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            c.pool().borrow().live_blocks(),
+            1,
+            "the dropped block is freed"
+        );
+
+        // Case C: land exactly on a block boundary (empty tail).
+        c.truncate(4).unwrap();
+        assert_eq!(c.offset(), 4);
+        assert_eq!(
+            host(&c.gather(0).unwrap().0),
+            (0..4).map(|x| x as f32).collect::<Vec<_>>()
+        );
+
+        // No-op for len >= current length.
+        c.truncate(100).unwrap();
+        assert_eq!(c.offset(), 4);
     }
 
     #[test]

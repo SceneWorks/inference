@@ -10,7 +10,7 @@
 
 use candle_core::Tensor;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Layout, per layer, of the cached keys/values: `[batch, n_kv_heads, seq, head_dim]`. Keys are
 /// stored already-RoPE'd; values raw. The sequence axis (2) is the one that grows each step.
@@ -43,6 +43,11 @@ pub trait KvCache {
     /// rows along the batch axis; a paged cache (P4) would free the dropped sequences' pages. `keep`
     /// must be a subset of `0..batch_size`; an empty cache is a no-op.
     fn retain_sequences(&mut self, keep: &[i32]) -> Result<()>;
+
+    /// Drop cached positions past `len`, keeping positions `0..len` along the sequence axis — the
+    /// seam speculative decoding (stories 7259/7260) rolls back rejected draft tokens through. `len`
+    /// must be `>= 0` and `<= offset()`; `len == offset()` is a no-op and an empty cache ignores it.
+    fn truncate(&mut self, len: i32) -> Result<()>;
 
     /// Drop all cached state, returning the cache to its freshly-constructed (empty) condition.
     fn reset(&mut self);
@@ -128,6 +133,25 @@ impl KvCache for ContiguousKvCache {
                 let idx: Vec<u32> = keep.iter().map(|&i| i as u32).collect();
                 let idx = Tensor::from_vec(idx, (keep.len(),), k.device())?;
                 *slot = Some((k.index_select(&idx, 0)?, v.index_select(&idx, 0)?));
+            }
+        }
+        Ok(())
+    }
+
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        if len < 0 {
+            return Err(Error::Msg(format!("truncate: negative len {len}")));
+        }
+        let len = len as usize;
+        for slot in &mut self.layers {
+            if let Some((k, v)) = slot.take() {
+                if len == 0 {
+                    *slot = None; // drop everything
+                } else if k.dims()[SEQ_AXIS] <= len {
+                    *slot = Some((k, v)); // already at/under the target length
+                } else {
+                    *slot = Some((k.narrow(SEQ_AXIS, 0, len)?, v.narrow(SEQ_AXIS, 0, len)?));
+                }
             }
         }
         Ok(())
@@ -259,6 +283,28 @@ mod tests {
         let k = arange4(1, 2, 3, 4);
         cache.update(0, &k, &k).unwrap(); // layer 1 left empty
         assert!(cache.export().is_none());
+    }
+
+    #[test]
+    fn truncate_slices_sequence_axis() {
+        let mut cache = ContiguousKvCache::new(1);
+        // [1,1,5,1] = values 0..4 along the seq axis.
+        let a =
+            Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0, 4.0], (1, 1, 5, 1), &Device::Cpu).unwrap();
+        cache.update(0, &a, &a).unwrap();
+        assert_eq!(cache.offset(), 5);
+        cache.truncate(3).unwrap();
+        assert_eq!(cache.offset(), 3);
+        let (k, _) = cache.peek(0).unwrap();
+        assert_eq!(
+            k.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![0.0, 1.0, 2.0]
+        );
+        cache.truncate(10).unwrap(); // no-op past the end
+        assert_eq!(cache.offset(), 3);
+        cache.truncate(0).unwrap(); // drop everything
+        assert_eq!(cache.offset(), 0);
+        assert!(cache.peek(0).is_none());
     }
 
     #[test]
