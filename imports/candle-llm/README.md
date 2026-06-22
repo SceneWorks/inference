@@ -47,6 +47,7 @@ parity tests:
 | `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache, **speculative** (prompt-lookup + draft-model) |
 | `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load |
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
+| `CANDLE_LLM_VLM_MODEL` | a SigLIP-based `LlavaForConditionalGeneration` snapshot dir (small: `llava-hf/llava-interleave-qwen-0.5b-hf`; faithful: JoyCaption) | `vlm` — image captioning + the multimodal conformance check |
 
 The `breadth` test streams a prompt through each non-Llama architecture: **Phi-3** (packed qkv/gate_up),
 **Qwen2-MoE** (router + experts + shared, q/k/v bias), **Gemma-2** (sandwich norms + soft-caps + GeGLU),
@@ -81,6 +82,21 @@ draft accepts every token); the `#[ignore]`d real-weights variants confirm the s
 snapshot (a dense target + **Q4** draft from the same weights), where the greedy run *tracks* (rather
 than bit-matches) non-speculative because the multi-token verify kernel rounds a few bf16 ULP
 differently from the single-token decode kernel.
+
+The `vlm` test covers the **vision-language path** (`LlavaModel` + `LlavaProvider`): a SigLIP vision
+tower ([`SiglipVisionTower`]) encodes the image, a two-layer GELU MLP projector lifts a chosen
+penultimate hidden state into the language hidden size, and those patch rows replace the expanded
+image-token placeholders in the prompt embeddings (the `decode_logits_from_embeds` splice hook) before
+the reused Llama decoder generates a caption. A tiny synthetic CPU model (SigLIP tower + projector +
+Llama, random weights) proves the mechanic end-to-end with no weights and no GPU: the tower is
+image-sensitive, its features splice into the right rows, and the change is visible in the decoder's
+first-token logits (the image actually drives the decode), with greedily deterministic generation. The
+`#[ignore]`d real-weights variant loads an actual SigLIP-based LLaVA snapshot
+(`CANDLE_LLM_VLM_MODEL` — e.g. `fancyfeast/llama-joycaption-beta-one-hf-llava`), captions an image on
+the selected device (CUDA with `--features cuda`), and confirms the `core-llm-testkit`
+`check_multimodal` check passes via the **generate** branch (and that a text-only request is rejected).
+The vision tower + projector run in **f32** (the bf16 weights promoted on load) for numeric fidelity,
+then the features are cast to the decoder's compute dtype before the splice.
 
 > Q4_K's block size is 256, so Q4 quantize-on-load needs projection `in`-dims that are multiples of
 > 256 (true of Qwen3's hidden 1024, not of SmolLM2's 576); Q8_0's block is 32 and applies broadly.

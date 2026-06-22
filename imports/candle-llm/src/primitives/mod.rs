@@ -21,7 +21,10 @@ pub mod weights;
 
 pub use attention::{repeat_kv, sdpa, sdpa_causal, AttnMask};
 pub use kv_cache::{ContiguousKvCache, KvCache};
-pub use nn::{embed, gelu, input_ids, input_ids_batch, linear, rms_norm, silu, soft_cap};
+pub use nn::{
+    conv2d, embed, gelu, gelu_erf, input_ids, input_ids_batch, layer_norm, linear, rms_norm, silu,
+    soft_cap,
+};
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{Projection, QuantSpec};
 pub use quant::QuantizedLinear;
