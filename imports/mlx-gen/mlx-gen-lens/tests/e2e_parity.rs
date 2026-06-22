@@ -260,7 +260,7 @@ fn lens_curated_samplers_drive_the_real_dit() {
     let std_of = |x: &Array| -> f32 {
         let m = mlx_rs::ops::mean(x, None).unwrap();
         mlx_rs::ops::mean(
-            multiply(&subtract(x, &m).unwrap(), &subtract(x, &m).unwrap()).unwrap(),
+            multiply(subtract(x, &m).unwrap(), subtract(x, &m).unwrap()).unwrap(),
             None,
         )
         .unwrap()
