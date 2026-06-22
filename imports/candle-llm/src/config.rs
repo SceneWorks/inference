@@ -26,6 +26,9 @@ pub enum Architecture {
     /// Gemma-2 family: `(1 + weight)` RMSNorm, embedding ×√hidden, GeGLU, a `query_pre_attn_scalar`
     /// attention scale, attention- and final-logit soft-capping, and a 4-norm "sandwich" block.
     Gemma2,
+    /// GLM-4 family: a 4-norm sandwich block (standard RMSNorm), q/k/v bias, a packed `gate_up_proj`,
+    /// and **partial, interleaved** RoPE (only `head_dim · partial_rotary_factor` dims are rotated).
+    Glm4,
 }
 
 impl Architecture {
@@ -50,6 +53,8 @@ impl Architecture {
             Ok(Architecture::Qwen2Moe)
         } else if hay.contains("gemma2") {
             Ok(Architecture::Gemma2)
+        } else if hay.contains("glm4") {
+            Ok(Architecture::Glm4)
         } else if hay.contains("phi3") {
             Ok(Architecture::Phi3)
         } else if hay.contains("llama")
@@ -65,7 +70,7 @@ impl Architecture {
         }
     }
 
-    /// The model-family tag (`"llama"` / `"qwen3"` / `"phi3"` / `"qwen2_moe"` / `"gemma2"`).
+    /// The model-family tag.
     pub fn family(self) -> &'static str {
         match self {
             Architecture::Llama => "llama",
@@ -73,6 +78,7 @@ impl Architecture {
             Architecture::Phi3 => "phi3",
             Architecture::Qwen2Moe => "qwen2_moe",
             Architecture::Gemma2 => "gemma2",
+            Architecture::Glm4 => "glm4",
         }
     }
 
@@ -80,6 +86,17 @@ impl Architecture {
     /// sandwich-norm block, and logit soft-capping).
     pub fn is_gemma2(self) -> bool {
         matches!(self, Architecture::Gemma2)
+    }
+
+    /// Whether the block uses the 4-norm "sandwich" residual (Gemma-2, GLM-4) rather than the plain
+    /// Llama pre-norm.
+    pub fn is_sandwich(self) -> bool {
+        matches!(self, Architecture::Gemma2 | Architecture::Glm4)
+    }
+
+    /// Whether RoPE uses the interleaved (GPT-J-style) pairing rather than NeoX half-split (GLM-4).
+    pub fn rope_interleaved(self) -> bool {
+        matches!(self, Architecture::Glm4)
     }
 
     /// Whether attention applies per-head q/k RMSNorm (Qwen3).
@@ -154,6 +171,8 @@ pub struct LlamaConfig {
     pub final_logit_softcap: Option<f32>,
     /// Gemma-2 attention scale denominator (`query_pre_attn_scalar`); `None` ⇒ `head_dim`.
     pub query_pre_attn_scalar: Option<i32>,
+    /// Fraction of `head_dim` that RoPE rotates (`partial_rotary_factor`); `1.0` ⇒ full rotary.
+    pub partial_rotary_factor: f32,
 }
 
 impl LlamaConfig {
@@ -195,6 +214,7 @@ impl LlamaConfig {
         let attn_logit_softcap = f32_opt("attn_logit_softcapping");
         let final_logit_softcap = f32_opt("final_logit_softcapping");
         let query_pre_attn_scalar = int("query_pre_attn_scalar");
+        let partial_rotary_factor = f32_opt("partial_rotary_factor").unwrap_or(1.0);
 
         // Mixture-of-Experts FFN params (Qwen2-MoE): present iff `num_experts` is in the config.
         let moe = int("num_experts").map(|num_experts| MoeConfig {
@@ -252,7 +272,14 @@ impl LlamaConfig {
             attn_logit_softcap,
             final_logit_softcap,
             query_pre_attn_scalar,
+            partial_rotary_factor,
         })
+    }
+
+    /// Number of head dimensions RoPE rotates (`round(head_dim · partial_rotary_factor)`, even).
+    pub fn rotary_dim(&self) -> i32 {
+        let rd = (self.head_dim as f32 * self.partial_rotary_factor).round() as i32;
+        rd & !1 // force even (RoPE rotates in pairs)
     }
 
     /// Whether the decoder uses a Mixture-of-Experts FFN (Qwen2-MoE).
@@ -279,8 +306,17 @@ impl LlamaConfig {
         Self::from_json(&v)
     }
 
-    /// Build the RoPE for this config (Llama-3 scaled when `rope_scaling` is present, else standard).
+    /// Build the RoPE for this config: partial/interleaved when the architecture asks for it (GLM-4),
+    /// Llama-3 scaled when `rope_scaling` is present, else standard full-width NeoX RoPE.
     pub fn build_rope(&self) -> Rope {
+        let rotary_dim = self.rotary_dim();
+        if rotary_dim < self.head_dim || self.architecture.rope_interleaved() {
+            return Rope::partial(
+                rotary_dim,
+                self.rope_theta,
+                self.architecture.rope_interleaved(),
+            );
+        }
         match self.rope_scaling {
             Some(rs) => Rope::llama3(
                 self.head_dim,
@@ -415,7 +451,40 @@ mod tests {
         assert_eq!(a, Architecture::Gemma2);
         assert_eq!(a.family(), "gemma2");
         assert!(a.is_gemma2());
+        assert!(a.is_sandwich());
         assert!(!a.has_qk_norm());
+
+        // GLM-4 (sandwich norms, partial+interleaved RoPE; standard RMSNorm).
+        let glm4 = json!({ "architectures": ["Glm4ForCausalLM"], "model_type": "glm4" });
+        let a = Architecture::from_config(&glm4).unwrap();
+        assert_eq!(a, Architecture::Glm4);
+        assert_eq!(a.family(), "glm4");
+        assert!(a.is_sandwich());
+        assert!(a.rope_interleaved());
+        assert!(!a.is_gemma2());
+    }
+
+    #[test]
+    fn parses_glm4_config_partial_rotary() {
+        let v = json!({
+            "architectures": ["Glm4ForCausalLM"], "model_type": "glm4",
+            "hidden_size": 4096, "intermediate_size": 13696, "num_hidden_layers": 40,
+            "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+            "vocab_size": 151552, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5
+        });
+        let cfg = LlamaConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.architecture, Architecture::Glm4);
+        assert_eq!(cfg.partial_rotary_factor, 0.5);
+        assert_eq!(cfg.rotary_dim(), 64); // 128 * 0.5
+                                          // A model with no partial_rotary_factor rotates the full head_dim.
+        let full = LlamaConfig::from_json(&json!({
+            "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "vocab_size": 32
+        }))
+        .unwrap();
+        assert_eq!(full.partial_rotary_factor, 1.0);
+        assert_eq!(full.rotary_dim(), full.head_dim);
     }
 
     #[test]
