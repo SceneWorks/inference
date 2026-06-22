@@ -1,7 +1,7 @@
 //! Generic Llama-family causal decoder, config-dispatched across architectures (Llama / Mistral,
 //! Qwen3, Phi-3, Qwen2-MoE, Gemma-2, GLM-4, DeepSeek-V2).
 //!
-//! The Candle port of `mlx-llm`'s `LlamaModel`, modelled alongside `candle-gen-sensenova`'s
+//! The Candle port of `mlx-llm`'s `CausalLm`, modelled alongside `candle-gen-sensenova`'s
 //! hand-rolled Qwen3 stack. One block shape covers the family: self-attention is either grouped-query
 //! attention (with optional per-head q/k RMSNorm for Qwen3) or Multi-head Latent Attention (DeepSeek's
 //! low-rank KV path); the FFN is a dense gated MLP or a sparse Mixture-of-Experts bank; norms are the
@@ -16,7 +16,7 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module};
 
-use crate::config::{Architecture, LlamaConfig};
+use crate::config::{Architecture, ModelConfig};
 use crate::device::compute_dtype;
 use crate::error::Result;
 use crate::primitives::attention::{sdpa, AttnMask};
@@ -27,13 +27,13 @@ use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{repeat_kv, ContiguousKvCache, PagedKvCache, Weights};
 
 /// A loaded causal decoder.
-pub struct LlamaModel {
+pub struct CausalLm {
     embed_tokens: Tensor,
     layers: Vec<LlamaLayer>,
     norm: Tensor,
     lm_head: Linear,
     rope: Rope,
-    cfg: LlamaConfig,
+    cfg: ModelConfig,
     dtype: DType,
     device: Device,
     /// Per-layer compute device — every entry equals `device` for a single-device model, and differs
@@ -48,32 +48,32 @@ pub struct LlamaModel {
     final_softcap: Option<f32>,
 }
 
-impl LlamaModel {
+impl CausalLm {
     /// Build from a loaded checkpoint (dense). `prefix` is the weight-key prefix (`""` for a plain
     /// `*ForCausalLM`, e.g. `"language_model"` for a VLM-nested decoder).
-    pub fn from_weights(w: &Weights, prefix: &str, cfg: LlamaConfig) -> Result<Self> {
+    pub fn from_weights(w: &Weights, prefix: &str, cfg: ModelConfig) -> Result<Self> {
         Self::from_weights_with(w, prefix, cfg, None)
     }
 
     /// Build from a loaded checkpoint, optionally quantizing the attention/MLP projections on load.
     /// Embeddings, the LM head, and norms always stay dense. The compute dtype is the device default
-    /// ([`compute_dtype`] — bf16 on GPU, f32 on CPU); use [`LlamaModel::from_weights_dtype`] to pick it.
+    /// ([`compute_dtype`] — bf16 on GPU, f32 on CPU); use [`CausalLm::from_weights_dtype`] to pick it.
     pub fn from_weights_with(
         w: &Weights,
         prefix: &str,
-        cfg: LlamaConfig,
+        cfg: ModelConfig,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
         Self::from_weights_dtype(w, prefix, cfg, quant, compute_dtype(w.device()))
     }
 
-    /// Like [`LlamaModel::from_weights_with`] but with an explicit dense compute `dtype` — the
+    /// Like [`CausalLm::from_weights_with`] but with an explicit dense compute `dtype` — the
     /// f16-vs-bf16 knob for CUDA dtype perf tuning (story 7263). Dequantized projections accumulate in
     /// this dtype too. Passing a dtype the backend can't run (e.g. f16 on CPU) surfaces at forward time.
     pub fn from_weights_dtype(
         w: &Weights,
         prefix: &str,
-        cfg: LlamaConfig,
+        cfg: ModelConfig,
         quant: Option<QuantSpec>,
         dtype: DType,
     ) -> Result<Self> {
@@ -312,7 +312,7 @@ impl LlamaModel {
     /// non-empty; a single-element slice is an ordinary single-GPU load.
     pub fn from_dir_sharded(
         dir: impl AsRef<std::path::Path>,
-        cfg: LlamaConfig,
+        cfg: ModelConfig,
         dtype: DType,
         devices: &[Device],
     ) -> Result<Self> {
@@ -332,7 +332,7 @@ impl LlamaModel {
     }
 
     /// The model config.
-    pub fn config(&self) -> &LlamaConfig {
+    pub fn config(&self) -> &ModelConfig {
         &self.cfg
     }
 
@@ -367,7 +367,7 @@ impl LlamaModel {
 
     /// Build per-row RoPE `(cos, sin)` tables for a `[rows, cols]` grid of absolute positions
     /// (row-major flat `positions`, length `rows * cols`) — the **per-sequence** position tables the
-    /// batched decode (story 7255) feeds [`LlamaModel::decode_logits_masked`]. Each is
+    /// batched decode (story 7255) feeds [`CausalLm::decode_logits_masked`]. Each is
     /// `[rows, cols, head_dim]` in the compute dtype.
     pub fn rope_tables(&self, positions: &[i32], rows: i32, cols: i32) -> Result<(Tensor, Tensor)> {
         let (cos, sin) = self.rope.cos_sin_at(positions, self.dtype, &self.device)?; // [1, rows*cols, hd]
@@ -401,7 +401,7 @@ impl LlamaModel {
         self.decode_logits_from_embeds(&embeds, cache, offset)
     }
 
-    /// Like [`LlamaModel::decode_logits`] but from pre-computed input embeddings — the hook the VLM
+    /// Like [`CausalLm::decode_logits`] but from pre-computed input embeddings — the hook the VLM
     /// path uses to splice image features before the decoder.
     pub fn decode_logits_from_embeds(
         &self,
@@ -421,7 +421,7 @@ impl LlamaModel {
     /// (story 7255) runs each step.
     ///
     /// `input_ids` is `[batch, seq]` (u32); `cos`/`sin` are `[batch, seq, head_dim]` (per-row
-    /// positions, e.g. from [`LlamaModel::rope_tables`]); `mask` is an additive
+    /// positions, e.g. from [`CausalLm::rope_tables`]); `mask` is an additive
     /// `[batch, 1, seq, k_total]` score mask (`0` keep, large-negative block) covering left-padding +
     /// causality. Returns logits for the **last column** `[batch, vocab]` — left-padding right-aligns
     /// every row's last real token to that column, so one slice serves the whole batch.
@@ -445,11 +445,11 @@ impl LlamaModel {
     ///
     /// `input_ids` is `[batch, seq]` (u32); `positions` are the per-row absolute RoPE positions (length
     /// `batch * seq`, row-major — for a decode step `seq == 1`, one position per sequence at its own
-    /// offset). `caches.len()` must equal the batch. Unlike [`LlamaModel::decode_logits`] run per row,
+    /// offset). `caches.len()` must equal the batch. Unlike [`CausalLm::decode_logits`] run per row,
     /// the batched projections here are **not** bit-identical to the batch-1 logits — the batched matmul
     /// is not M-invariant on a GPU, so a row *tracks* its batch-1 run only to sub-ULP (the documented
     /// Throughput tradeoff that buys the weight-read amortization). The bit-exact continuous path runs
-    /// each sequence through [`LlamaModel::decode_logits`] on its own cache instead.
+    /// each sequence through [`CausalLm::decode_logits`] on its own cache instead.
     pub fn decode_logits_per_seq(
         &self,
         input_ids: &Tensor,
@@ -584,7 +584,7 @@ fn shard_for_layer(layer: usize, num_shards: usize, num_layers: usize) -> usize 
 /// A key→device placement that splits a plain decoder's `num_layers` transformer blocks contiguously
 /// across `devices` (see [`shard_for_layer`]), with the token embeddings (and any other non-layer
 /// weight) on `devices[0]` and the final norm + LM head on the last device. This is the layout
-/// [`LlamaModel::from_dir_sharded`] feeds to [`Weights::from_dir_sharded`]. `devices` must be non-empty.
+/// [`CausalLm::from_dir_sharded`] feeds to [`Weights::from_dir_sharded`]. `devices` must be non-empty.
 pub fn shard_plan(devices: &[Device], num_layers: usize) -> impl Fn(&str) -> Device + '_ {
     let last = devices.len() - 1;
     move |key: &str| -> Device {
@@ -601,7 +601,7 @@ pub fn shard_plan(devices: &[Device], num_layers: usize) -> impl Fn(&str) -> Dev
     }
 }
 
-impl crate::decode::Decode for LlamaModel {
+impl crate::decode::Decode for CausalLm {
     fn make_cache(&self) -> Box<dyn KvCache> {
         Box::new(self.new_cache())
     }
@@ -946,7 +946,7 @@ impl MlaAttention {
     fn load(
         w: &Weights,
         lp: impl Fn(&str) -> String,
-        cfg: &LlamaConfig,
+        cfg: &ModelConfig,
         dtype: DType,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {

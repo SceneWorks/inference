@@ -216,7 +216,7 @@ impl YarnConfig {
 
 /// Configuration for a Llama-family decoder.
 #[derive(Clone, Debug, PartialEq)]
-pub struct LlamaConfig {
+pub struct ModelConfig {
     /// Model/residual width.
     pub hidden_size: i32,
     /// MLP inner width.
@@ -259,7 +259,7 @@ pub struct LlamaConfig {
     pub yarn: Option<YarnConfig>,
 }
 
-impl LlamaConfig {
+impl ModelConfig {
     /// Parse from an already-decoded `config.json` value.
     pub fn from_json(v: &Value) -> Result<Self> {
         let int =
@@ -529,7 +529,7 @@ mod tests {
                 "original_max_position_embeddings": 8192
             }
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.hidden_size, 4096);
         assert_eq!(cfg.head_dim, 128); // 4096/32
         assert_eq!(cfg.num_kv_heads, 8);
@@ -546,7 +546,7 @@ mod tests {
             "num_attention_heads": 4,
             "vocab_size": 32
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.head_dim, 16); // 64/4
         assert_eq!(cfg.num_kv_heads, 4); // defaults to num_heads (MHA)
         assert!(cfg.rope_scaling.is_none());
@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn missing_required_field_errors() {
         let v = json!({ "hidden_size": 64 });
-        assert!(matches!(LlamaConfig::from_json(&v), Err(Error::Config(_))));
+        assert!(matches!(ModelConfig::from_json(&v), Err(Error::Config(_))));
     }
 
     #[test]
@@ -641,12 +641,12 @@ mod tests {
             "vocab_size": 151552, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
             "partial_rotary_factor": 0.5
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.architecture, Architecture::Glm4);
         assert_eq!(cfg.partial_rotary_factor, 0.5);
         assert_eq!(cfg.rotary_dim(), 64); // 128 * 0.5
                                           // A model with no partial_rotary_factor rotates the full head_dim.
-        let full = LlamaConfig::from_json(&json!({
+        let full = ModelConfig::from_json(&json!({
             "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
             "num_attention_heads": 4, "vocab_size": 32
         }))
@@ -665,7 +665,7 @@ mod tests {
             "attn_logit_softcapping": 50.0, "final_logit_softcapping": 30.0
             // tie_word_embeddings intentionally omitted — Gemma ties by default.
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.architecture, Architecture::Gemma2);
         assert_eq!(cfg.head_dim, 256); // explicit, != 2304/8
         assert!(cfg.tie_word_embeddings, "Gemma ties by default");
@@ -687,7 +687,7 @@ mod tests {
             "num_experts": 60, "num_experts_per_tok": 4, "norm_topk_prob": false,
             "moe_intermediate_size": 1408, "shared_expert_intermediate_size": 5632
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.architecture, Architecture::Qwen2Moe);
         assert!(cfg.is_moe());
         let moe = cfg.moe.unwrap();
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(moe.shared_expert_intermediate_size, 5632);
         assert!(!moe.norm_topk_prob);
         // A dense (non-MoE) config has no MoE block.
-        assert!(!LlamaConfig::from_json(&json!({
+        assert!(!ModelConfig::from_json(&json!({
             "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
             "num_attention_heads": 2, "vocab_size": 32
         }))
@@ -726,7 +726,7 @@ mod tests {
                 "original_max_position_embeddings": 4096
             }
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.architecture, Architecture::DeepseekV2);
         assert!(cfg.is_mla());
         assert!(cfg.architecture.rope_interleaved());
@@ -780,7 +780,7 @@ mod tests {
             "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
             "tie_word_embeddings": true, "max_position_embeddings": 40960
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.architecture, Architecture::Qwen3);
         assert!(cfg.has_qk_norm());
         assert_eq!(cfg.head_dim, 128); // explicit, != 1024/16

@@ -15,10 +15,10 @@
 //! bf16 matmul is not M-invariant — the same caveat the batched and prefix-reuse paths already carry).
 //! So:
 //! - [`BatchExactness::Exact`] runs each sequence as its own batch-1 forward
-//!   ([`LlamaModel::decode_logits`] on that sequence's cache): **byte-identical** to running the
+//!   ([`CausalLm::decode_logits`] on that sequence's cache): **byte-identical** to running the
 //!   request alone. The bit-exact equality assertions run against this mode.
 //! - [`BatchExactness::Throughput`] batches the projections / MLP / lm_head and runs only attention
-//!   per-sequence ([`LlamaModel::decode_logits_per_seq`]): throughput scales with occupancy, at the
+//!   per-sequence ([`CausalLm::decode_logits_per_seq`]): throughput scales with occupancy, at the
 //!   cost of a row *tracking* (not matching) its batch-1 run — like `generate_batch`.
 //!
 //! Both modes get iteration-level admission (admit-on-retire) and per-sequence paged attention (no
@@ -33,7 +33,7 @@ use crate::decode::batch::BatchRequest;
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{default_seed, FinishReason, GenerationOutput, StreamEvent};
 use crate::error::{Error, Result};
-use crate::models::LlamaModel;
+use crate::models::CausalLm;
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
@@ -107,7 +107,7 @@ enum LaneStep {
 /// [`FinishReason::Cancelled`] with whatever partial output it had, and each request emits exactly one
 /// terminal [`StreamEvent::Done`].
 pub fn generate_continuous(
-    model: &LlamaModel,
+    model: &CausalLm,
     requests: &[BatchRequest],
     config: &ContinuousConfig,
     cancel: &CancelFlag,
@@ -251,7 +251,7 @@ pub fn generate_continuous(
 /// already holds its final state.
 #[allow(clippy::too_many_arguments)]
 fn admit_lane(
-    model: &LlamaModel,
+    model: &CausalLm,
     pool: &std::rc::Rc<std::cell::RefCell<BlockPool>>,
     num_layers: usize,
     requests: &[BatchRequest],
@@ -298,7 +298,7 @@ fn admit_lane(
 /// sequence's own batch-1 forward; `Throughput` runs one batched forward with per-sequence attention
 /// and splits the rows.
 fn step_logits(
-    model: &LlamaModel,
+    model: &CausalLm,
     lanes: &mut [Lane],
     exactness: BatchExactness,
     device: &Device,

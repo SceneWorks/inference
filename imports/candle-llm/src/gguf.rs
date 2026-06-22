@@ -10,11 +10,11 @@
 //!    the transformer key the decoder loads (`model.layers.0.self_attn.q_proj.weight`),
 //! 3. **un-permutes** the Llama/Mistral q/k projections (llama.cpp interleaves their rows for its
 //!    `NORM` RoPE; the engine uses HF's half-split RoPE — without this the model emits garbage),
-//! 4. reconstructs a [`LlamaConfig`] from the GGUF metadata table, and
+//! 4. reconstructs a [`ModelConfig`] from the GGUF metadata table, and
 //! 5. optionally re-quantizes the projections on load (the same quantize-on-load path as a
 //!    safetensors load, story 7163).
 //!
-//! The result is a [`Weights`] map + [`LlamaConfig`] the existing [`LlamaModel::from_weights_with`]
+//! The result is a [`Weights`] map + [`ModelConfig`] the existing [`CausalLm::from_weights_with`]
 //! consumes unchanged, so a GGUF load and a safetensors load converge on one decoder. The tokenizer
 //! is taken from a sibling `tokenizer.json` when present, else reconstructed from the GGUF's embedded
 //! tokenizer metadata ([`GgufCheckpoint::tokenizer_from_metadata`]).
@@ -26,15 +26,15 @@ use candle_core::quantized::gguf_file::{Content, Value};
 use candle_core::{Device, Tensor};
 use serde_json::{json, Map, Value as Json};
 
-use crate::config::LlamaConfig;
+use crate::config::ModelConfig;
 use crate::error::{Error, Result};
 use crate::primitives::Weights;
 
 /// A GGUF checkpoint parsed into the engine's native shapes: a dense [`Weights`] map + a
-/// [`LlamaConfig`], plus the tokenizer/template/stop metadata the provider needs to run it.
+/// [`ModelConfig`], plus the tokenizer/template/stop metadata the provider needs to run it.
 pub struct GgufCheckpoint {
     /// Model config reconstructed from the GGUF metadata table.
-    pub config: LlamaConfig,
+    pub config: ModelConfig,
     /// Dense, transformer-keyed weights (q/k already un-permuted to the HF layout).
     pub weights: Weights,
     /// Stop token ids from `tokenizer.ggml.eos_token_id` (+ EOT when distinct); empty if absent.
@@ -55,7 +55,7 @@ pub struct GgufCheckpoint {
 impl GgufCheckpoint {
     /// Open and load a `.gguf` file onto `device`: dequantize every tensor to dense, remap keys, and
     /// un-permute the Llama/Mistral q/k projections. Load-time re-quantization (`spec.quantize`) is
-    /// applied by the caller via [`LlamaModel::from_weights_with`], exactly as for a safetensors load.
+    /// applied by the caller via [`CausalLm::from_weights_with`], exactly as for a safetensors load.
     pub fn open(path: impl AsRef<Path>, device: &Device) -> Result<Self> {
         let path = path.as_ref();
         let mut file = std::fs::File::open(path)
@@ -308,8 +308,8 @@ fn unpermute_qk(weight: &Tensor, n_head: usize) -> Result<Tensor> {
     Ok(weight.index_select(&idx, 0)?)
 }
 
-/// Rebuild a [`LlamaConfig`] from the GGUF metadata table by assembling the HF `config.json` fields
-/// it implies and reusing [`LlamaConfig::from_json`] (so arch dispatch / RoPE scaling parsing match a
+/// Rebuild a [`ModelConfig`] from the GGUF metadata table by assembling the HF `config.json` fields
+/// it implies and reusing [`ModelConfig::from_json`] (so arch dispatch / RoPE scaling parsing match a
 /// safetensors load exactly).
 fn reconstruct_config(
     meta: &HashMap<String, Value>,
@@ -318,7 +318,7 @@ fn reconstruct_config(
     num_kv_heads: usize,
     vocab: i64,
     tied: bool,
-) -> Result<LlamaConfig> {
+) -> Result<ModelConfig> {
     let key = |s: &str| format!("{arch}.{s}");
     let req_u64 = |s: &str| -> Result<u64> {
         meta_u64(meta, &key(s))
@@ -364,7 +364,7 @@ fn reconstruct_config(
     if let Some(scaling) = reconstruct_rope_scaling(meta, arch) {
         cfg.insert("rope_scaling".into(), scaling);
     }
-    LlamaConfig::from_json(&Json::Object(cfg))
+    ModelConfig::from_json(&Json::Object(cfg))
 }
 
 /// Best-effort llama3 RoPE-scaling reconstruction from GGUF metadata; absent keys ⇒ standard RoPE.

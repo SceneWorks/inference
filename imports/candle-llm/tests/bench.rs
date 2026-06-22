@@ -22,9 +22,9 @@ use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 
-use candle_llm::config::LlamaConfig;
+use candle_llm::config::ModelConfig;
 use candle_llm::device::{compute_dtype, select_device};
-use candle_llm::models::LlamaModel;
+use candle_llm::models::CausalLm;
 use candle_llm::primitives::{input_ids, QuantSpec, Weights};
 
 const PREFILL_TOKENS: usize = 256;
@@ -62,10 +62,10 @@ fn assert_finite(logits: &Tensor) {
 /// Time prefill (one P-token forward) and decode (single-token steps from the prefilled cache) for a
 /// freshly loaded variant, and print tokens/s.
 fn bench_variant(dir: &str, device: &Device, v: &Variant) {
-    let cfg = LlamaConfig::from_dir(dir).unwrap();
+    let cfg = ModelConfig::from_dir(dir).unwrap();
     let vocab = cfg.vocab_size as usize;
     let weights = Weights::from_dir(dir, device).unwrap();
-    let model = LlamaModel::from_weights_dtype(&weights, "", cfg, v.quant, v.dtype).unwrap();
+    let model = CausalLm::from_weights_dtype(&weights, "", cfg, v.quant, v.dtype).unwrap();
 
     // ---- Prefill: a single forward over PREFILL_TOKENS, after a warmup pass. ----
     {

@@ -7,8 +7,8 @@
 //!    [`Rope`](primitives::Rope) family, GQA attention helpers, group-wise quantization (via
 //!    Candle's `QTensor`/`QMatMul`), the `nn` leaves, and a safetensors
 //!    [`Weights`](primitives::Weights) loader. These own Candle `Tensor`s directly.
-//! 2. [`config`] + [`models`] — model configuration ([`LlamaConfig`]) and the generic Llama-family
-//!    decoder ([`LlamaModel`]), `&self` forward + `from_weights`, with architecture dispatch
+//! 2. [`config`] + [`models`] — model configuration ([`ModelConfig`]) and the generic Llama-family
+//!    decoder ([`CausalLm`]), `&self` forward + `from_weights`, with architecture dispatch
 //!    (Llama / Mistral / Qwen3).
 //! 3. [`decode`] — the streaming, cancellable decode loop ([`generate`]) that drives any
 //!    [`Decode`](decode::Decode) model, emitting a [`StreamEvent`] per token.
@@ -34,7 +34,7 @@ pub mod provider;
 // Re-export the contract crate so consumers can reach it as `candle_llm::core_llm::…`.
 pub use core_llm;
 
-pub use config::{Architecture, LlamaConfig, RopeScaling};
+pub use config::{Architecture, ModelConfig, RopeScaling};
 pub use decode::{
     generate, generate_batch, generate_cached, generate_draft_speculative, generate_prompt_lookup,
     generate_with, generate_with_cache, BatchRequest, CancelFlag, FinishReason, GenerationConfig,
@@ -43,5 +43,5 @@ pub use decode::{
 pub use device::{compute_dtype, select_device};
 pub use error::{Error, Result};
 pub use llava::{LlavaConfig, LlavaModel, LlavaProvider};
-pub use models::LlamaModel;
+pub use models::CausalLm;
 pub use provider::LlamaProvider;

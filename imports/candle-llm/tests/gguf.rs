@@ -19,11 +19,11 @@
 
 use candle_core::DType;
 
-use candle_llm::config::LlamaConfig;
+use candle_llm::config::ModelConfig;
 use candle_llm::decode::{generate, CancelFlag, GenerationConfig};
 use candle_llm::device::select_device;
 use candle_llm::gguf::GgufCheckpoint;
-use candle_llm::models::LlamaModel;
+use candle_llm::models::CausalLm;
 use candle_llm::primitives::sampler::SamplingParams;
 use candle_llm::primitives::{input_ids, Weights};
 use candle_llm::provider::{eos_token_ids, LlamaProvider};
@@ -52,7 +52,7 @@ fn encode(tok: &Tokenizer, text: &str) -> Vec<i32> {
 }
 
 /// Last-position prefill logits as host `f32`.
-fn prefill_logits(model: &LlamaModel, ids: &[i32]) -> Vec<f32> {
+fn prefill_logits(model: &CausalLm, ids: &[i32]) -> Vec<f32> {
     let mut cache = model.new_cache();
     let arr = input_ids(ids, model.device()).unwrap();
     let logits = model.decode_logits(&arr, &mut cache, 0).unwrap();
@@ -91,7 +91,7 @@ fn common_prefix(a: &[i32], b: &[i32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-fn greedy_tokens(model: &LlamaModel, ids: &[i32], stop: &[i32], n: usize) -> Vec<i32> {
+fn greedy_tokens(model: &CausalLm, ids: &[i32], stop: &[i32], n: usize) -> Vec<i32> {
     let cfg = GenerationConfig {
         max_new_tokens: n,
         sampling: SamplingParams::default(), // greedy
@@ -116,9 +116,9 @@ fn gguf_load_tracks_hf() {
     let device = select_device().unwrap();
 
     // HF reference.
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let hf_model =
-        LlamaModel::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg.clone())
+        CausalLm::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg.clone())
             .unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     let stop = eos_token_ids(std::path::Path::new(&dir));
@@ -143,7 +143,7 @@ fn gguf_load_tracks_hf() {
         "tie"
     );
 
-    let g_model = LlamaModel::from_weights(&ck.weights, "", ck.config.clone()).unwrap();
+    let g_model = CausalLm::from_weights(&ck.weights, "", ck.config.clone()).unwrap();
     let g_logits = prefill_logits(&g_model, &ids);
     let probcos = cosine(&softmax(&g_logits), &hf_probs);
     let g_top1 = argmax(&g_logits);
