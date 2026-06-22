@@ -34,8 +34,8 @@ pub use core_llm;
 
 pub use config::{Architecture, LlamaConfig, RopeScaling};
 pub use decode::{
-    generate, generate_batch, generate_with, BatchRequest, CancelFlag, FinishReason,
-    GenerationConfig, GenerationOutput, StreamEvent,
+    generate, generate_batch, generate_cached, generate_with, BatchRequest, CancelFlag,
+    FinishReason, GenerationConfig, GenerationOutput, PrefixCache, PrefixStats, StreamEvent,
 };
 pub use device::{compute_dtype, select_device};
 pub use error::{Error, Result};

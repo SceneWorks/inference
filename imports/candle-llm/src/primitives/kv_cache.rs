@@ -4,7 +4,9 @@
 //! sequence axis (the Candle port of `mlx-llm`'s `ContiguousKvCache`). It is **batch-capable** — the
 //! batch axis is real, not hardcoded to 1. The [`KvCache`] trait is the seam a paged cache (P4)
 //! slots in behind so the decoder, which only ever talks to the trait, never changes. The
-//! dynamic-batch scheduler (story 7255) retires finished sequences through [`KvCache::retain_sequences`].
+//! dynamic-batch scheduler (story 7255) retires finished sequences through [`KvCache::retain_sequences`];
+//! the prefix cache (story 7256) seeds a fresh cache from a shared prefix's stored KV via
+//! [`ContiguousKvCache::seeded`] / [`ContiguousKvCache::export`].
 
 use candle_core::Tensor;
 
@@ -64,6 +66,26 @@ impl ContiguousKvCache {
     /// Borrow the currently-cached `(keys, values)` for `layer`, if any.
     pub fn peek(&self, layer: usize) -> Option<&(Tensor, Tensor)> {
         self.layers.get(layer).and_then(|s| s.as_ref())
+    }
+
+    /// Construct a cache pre-populated with per-layer `(keys, values)` — the seam the prefix cache
+    /// (story 7256) reuses a shared prefix's KV through. Each entry is `[batch, n_kv_heads, seq,
+    /// head_dim]` (keys already-RoPE'd); the cache then reports [`KvCache::offset`] equal to that
+    /// seq length, so a decoder prefills only the suffix at that offset and attends over the seeded
+    /// keys. Layout/length consistency across layers is the caller's responsibility.
+    pub fn seeded(layers: Vec<(Tensor, Tensor)>) -> Self {
+        Self {
+            layers: layers.into_iter().map(Some).collect(),
+        }
+    }
+
+    /// Snapshot every layer's cached `(keys, values)` as clones (Candle tensors are reference-counted,
+    /// so this shares buffers rather than copying), or `None` if any layer is still empty. The prefix
+    /// cache stores this after a generation so a later shared-prefix request can be [`seeded`] from it.
+    ///
+    /// [`seeded`]: ContiguousKvCache::seeded
+    pub fn export(&self) -> Option<Vec<(Tensor, Tensor)>> {
+        self.layers.iter().cloned().collect()
     }
 }
 
@@ -205,5 +227,46 @@ mod tests {
         cache.reset();
         assert_eq!(cache.offset(), 0);
         assert!(cache.peek(0).is_none());
+    }
+
+    #[test]
+    fn export_then_seeded_round_trips() {
+        // Fill a 2-layer cache, snapshot it, and rebuild from the snapshot: offset/batch and the
+        // actual values survive (the prefix cache's store → seed path).
+        let mut cache = ContiguousKvCache::new(2);
+        let k0 = arange4(1, 2, 3, 4);
+        let k1 = arange4(1, 2, 3, 4).affine(1.0, 100.0).unwrap();
+        cache.update(0, &k0, &k0).unwrap();
+        cache.update(1, &k1, &k1).unwrap();
+
+        let snapshot = cache.export().expect("all layers populated");
+        assert_eq!(snapshot.len(), 2);
+
+        let seeded = ContiguousKvCache::seeded(snapshot);
+        assert_eq!(seeded.offset(), 3);
+        assert_eq!(seeded.batch_size(), 1);
+        assert_eq!(seeded.num_layers(), 2);
+        let (sk1, _) = seeded.peek(1).unwrap();
+        assert_eq!(
+            sk1.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            k1.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn export_is_none_when_any_layer_empty() {
+        let mut cache = ContiguousKvCache::new(2);
+        let k = arange4(1, 2, 3, 4);
+        cache.update(0, &k, &k).unwrap(); // layer 1 left empty
+        assert!(cache.export().is_none());
+    }
+
+    #[test]
+    fn seeded_offset_reflects_seq_length() {
+        // A cache seeded to N positions prefills the suffix at offset N.
+        let k = arange4(1, 2, 5, 4);
+        let seeded = ContiguousKvCache::seeded(vec![(k.clone(), k)]);
+        assert_eq!(seeded.offset(), 5);
+        assert_eq!(seeded.num_layers(), 1);
     }
 }
