@@ -92,8 +92,14 @@ fn ones(d: usize) -> Tensor {
 }
 
 /// Write a tiny 2-layer `llama` snapshot from deterministic random weights and load it on CPU.
+///
+/// A per-call atomic sequence keeps the temp dir unique so the concurrently-running synthetic tests
+/// never share (and delete) one another's snapshot.
 fn build_tiny_llama() -> LlamaModel {
-    let dir = std::env::temp_dir().join(format!("candle-llm-paged-{}", std::process::id()));
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("candle-llm-paged-{}-{uniq}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let cfg = format!(
