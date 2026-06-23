@@ -18,7 +18,7 @@ use core_llm::{
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
-use crate::config::ModelConfig;
+use crate::config::{Architecture, ModelConfig};
 use crate::decode::{generate_with, ConstraintMask, FinishReason, GenerationConfig, StreamEvent};
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
@@ -365,9 +365,36 @@ inventory::submit! {
     core_llm::TextLlmRegistration {
         descriptor: provider_descriptor,
         load: load_registered,
+        can_load,
     }
 }
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(LlamaProvider::load(spec)?))
+}
+
+/// Weightless model-first probe (story 7406): can the `candle-llama` provider serve the model at
+/// `spec.source`? A `*.gguf` file is a text-model container this provider loads directly, so it is
+/// accepted by extension. Otherwise this reads **only** `config.json` and runs the same
+/// [`Architecture::from_config`] dispatch the loader uses (Llama / Mistral / Qwen2 / Qwen3 /
+/// Qwen2-MoE / Gemma2 / GLM-4 / DeepSeek-V2 / Phi-3) — it never opens a safetensors shard, so
+/// `core-llm`'s `load_for_model` can resolve a provider by model without loading weights. A
+/// multimodal snapshot (a `vision_config` block — including a VLM whose `model_type` substring-
+/// matches a text family, e.g. `mllama`) is declined so the vision provider claims it instead.
+pub fn can_load(spec: &LoadSpec) -> bool {
+    if crate::gguf::is_gguf_path(&spec.source) {
+        return true;
+    }
+    let dir = Path::new(&spec.source);
+    let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    if v.get("vision_config").is_some() {
+        return false;
+    }
+    Architecture::from_config(&v).is_ok()
 }

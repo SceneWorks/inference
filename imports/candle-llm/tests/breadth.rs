@@ -9,18 +9,27 @@
 //!   cargo test --features cuda --test breadth -- --ignored --nocapture
 //! ```
 
-use core_llm::{LoadSpec, Message, Sampling, StreamEvent, TextLlm, TextLlmRequest};
+use core_llm::{load_for_model, LoadSpec, Message, Sampling, StreamEvent, TextLlmRequest};
 
-use candle_llm::LlamaProvider;
-
-/// Load the snapshot at `$env`, check its reported family tag, and assert it streams coherent,
-/// word-bearing text (the streamed deltas reconstructing the final output).
+/// Load the snapshot at `$env` **by model** (story 7406: `load_for_model`, naming no provider id /
+/// family / backend), check its reported family tag, and assert it streams coherent, word-bearing
+/// text (the streamed deltas reconstructing the final output).
 fn assert_streams_coherent(env: &str, family: &str) {
     let Some(dir) = std::env::var(env).ok().filter(|v| !v.is_empty()) else {
         eprintln!("skip: set {env}");
         return;
     };
-    let provider = LlamaProvider::load(&LoadSpec::dense(dir)).expect("load provider");
+    let spec = LoadSpec::dense(dir);
+    // The weightless probe must accept the snapshot, and model-first resolution must route it to the
+    // single generic candle text provider purely by architecture — the family is only known
+    // post-load, so this exercises the `can_load`-not-`descriptor.family` resolution the story exists
+    // for (e.g. Gemma2/GLM4/DeepSeek behind `candle-llama`).
+    assert!(
+        candle_llm::provider::can_load(&spec),
+        "{family}: can_load must accept the snapshot"
+    );
+    let provider = load_for_model(&spec).expect("resolve + load provider by model");
+    assert_eq!(provider.descriptor().id, "candle-llama", "resolved provider id");
     assert_eq!(provider.descriptor().family, family, "reported family tag");
 
     let req = TextLlmRequest {
