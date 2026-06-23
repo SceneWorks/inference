@@ -226,10 +226,19 @@ pub fn check_streaming(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), 
             out.finish_reason
         ));
     }
-    if out.usage.generated_tokens != gen || gen as usize != indices.len() {
+    if out.usage.generated_tokens != gen {
         return Err(format!(
-            "check_streaming[{id}]: usage.generated_tokens ({}) disagrees with {} streamed tokens / Done {gen}",
-            out.usage.generated_tokens,
+            "check_streaming[{id}]: output.usage.generated_tokens ({}) disagrees with Done usage ({gen})",
+            out.usage.generated_tokens
+        ));
+    }
+    // A provider may legitimately emit *fewer* Token events than it generated: a token that only
+    // completes a multibyte char yields no delta, a stripped reasoning marker (`<think>`) yields no
+    // text, and a request stop-string trims trailing tokens. So the invariant is "no more events
+    // than generated tokens" — the deltas reconstructing (text, thinking) below is the real guarantee.
+    if indices.len() > gen as usize {
+        return Err(format!(
+            "check_streaming[{id}]: emitted {} Token events but only {gen} tokens were generated",
             indices.len()
         ));
     }
@@ -320,6 +329,10 @@ pub fn check_mid_stream_cancel(p: &dyn TextLlm, profile: &TextLlmProfile) -> Res
 /// (the anti-cheat — a provider that ignores the seed fails the second leg).
 pub fn check_seed_determinism(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), String> {
     let id = p.descriptor().id.clone();
+    // Compare the answer *and* the reasoning: a thinking model on a short budget may produce only a
+    // `<think>` block (empty answer), so comparing `text` alone would see two empty strings and
+    // falsely flag the seed as ignored.
+    let key = |o: &core_llm::TextLlmOutput| format!("{}\u{1}{}", o.text, o.thinking.clone().unwrap_or_default());
     let req = profile.request(profile.determinism_sampling, Some(profile.determinism_seed));
     let a = p
         .generate(&req, &mut |_| {})
@@ -327,7 +340,7 @@ pub fn check_seed_determinism(p: &dyn TextLlm, profile: &TextLlmProfile) -> Resu
     let b = p
         .generate(&req, &mut |_| {})
         .map_err(|e| format!("check_seed_determinism[{id}]: generate() failed: {e}"))?;
-    if a.text != b.text {
+    if key(&a) != key(&b) {
         return Err(format!(
             "check_seed_determinism[{id}]: the same seed produced different output across two runs"
         ));
@@ -337,7 +350,7 @@ pub fn check_seed_determinism(p: &dyn TextLlm, profile: &TextLlmProfile) -> Resu
     let c = p
         .generate(&req2, &mut |_| {})
         .map_err(|e| format!("check_seed_determinism[{id}]: generate() failed: {e}"))?;
-    if a.text == c.text {
+    if key(&a) == key(&c) {
         return Err(format!(
             "check_seed_determinism[{id}]: a different seed produced identical output — the provider \
              appears to ignore the seed"
