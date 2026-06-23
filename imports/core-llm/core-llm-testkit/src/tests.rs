@@ -163,8 +163,11 @@ fn stub_descriptor() -> TextLlmDescriptor {
 fn load_stub(_spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(good()))
 }
+fn can_load_stub(_spec: &LoadSpec) -> bool {
+    true
+}
 inventory::submit! {
-    TextLlmRegistration { descriptor: stub_descriptor, load: load_stub }
+    TextLlmRegistration { descriptor: stub_descriptor, load: load_stub, can_load: can_load_stub }
 }
 
 #[test]

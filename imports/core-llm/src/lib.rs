@@ -24,7 +24,8 @@
 //! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
 //! - [`speculative`] — backend-neutral speculative-decoding policy (n-gram proposer + distribution-
 //!   preserving acceptance sampler).
-//! - [`registry`] — link-time provider registration and id-based routing.
+//! - [`registry`] — link-time provider registration, id-based routing, and **model-first**
+//!   resolution ([`load_for_model`] / [`ModelRequirements`] over a weightless `can_load` probe).
 
 pub mod cancel;
 pub mod capabilities;
@@ -51,7 +52,10 @@ pub use message::{Content, ImageRef, Message, Role};
 pub use output::{FinishReason, StreamEvent, TextLlmOutput, Usage};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
-pub use registry::{load_textllm, textllms, TextLlmRegistration};
+pub use registry::{
+    load_for_model, load_for_model_with, load_textllm, textllms, ModelRequirements,
+    TextLlmRegistration,
+};
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
