@@ -50,6 +50,15 @@ const KOLORS_BETA_START: f32 = 0.00085;
 const KOLORS_BETA_END: f32 = 0.014;
 const KOLORS_TRAIN_STEPS: usize = crate::sampler::NUM_TRAIN_TIMESTEPS;
 
+/// Build Kolors' ε-prediction α-cumprod schedule (`scaled_linear` β over the 1100 train steps) — the
+/// [`DiscreteModelSampling`] source the curated unified-sampler path integrates over. Shared by the
+/// txt2img [`Pipeline::denoise_curated`] (sc-7124) and the conditioned [`crate::control`] /
+/// [`crate::ip_provider`] curated denoises (sc-7297), so all three speak one Kolors noise schedule.
+pub(crate) fn kolors_alpha_schedule() -> Result<AlphaSchedule> {
+    AlphaSchedule::scaled_linear(KOLORS_TRAIN_STEPS, KOLORS_BETA_START, KOLORS_BETA_END)
+        .map_err(|e| CandleError::Msg(format!("kolors curated schedule: {e}")))
+}
+
 /// A light pipeline handle: the snapshot `root` and compute device. Heavy components load via
 /// [`load_components`](Self::load_components) and are owned/cached by the generator.
 pub(crate) struct Pipeline {
@@ -252,9 +261,7 @@ impl Pipeline {
         seed: u64,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
-        let sched =
-            AlphaSchedule::scaled_linear(KOLORS_TRAIN_STEPS, KOLORS_BETA_START, KOLORS_BETA_END)
-                .map_err(|e| CandleError::Msg(format!("kolors curated schedule: {e}")))?;
+        let sched = kolors_alpha_schedule()?;
         let ms = DiscreteModelSampling::sdxl(&sched);
         // Native curated schedule = ComfyUI's default (`normal`); the scheduler axis overrides it.
         let native = schedule_sigmas(Scheduler::Normal, &ms, steps);
