@@ -475,7 +475,12 @@ impl CausalLm {
         for c in caches.iter_mut() {
             c.reserve_step(s)?;
         }
-        let plan = ThroughputGather::build(caches, &self.device)?;
+        let plan = ThroughputGather::build(
+            caches,
+            self.cfg.num_kv_heads as usize,
+            self.cfg.head_dim as usize,
+            &self.device,
+        )?;
         let (cos, sin) = self.rope_tables(positions, b as i32, s as i32)?;
         let mut h = self.embed(input_ids)?;
         for (i, layer) in self.layers.iter().enumerate() {
@@ -622,14 +627,20 @@ impl crate::decode::Decode for CausalLm {
     }
 }
 
-/// The per-step plan for the continuous `Throughput` decode's **batched** paged attention (story
-/// 7453): the single gather index over every active sequence's pooled token slots, plus the cumulative
-/// key offsets the varlen kernel (and the eager fallback's per-sequence split) read. Built once per
-/// step — block tables do not change across layers — and reused by every layer's `forward_per_seq`.
+/// The per-step plan for the continuous `Throughput` decode's **batched** paged attention (stories
+/// 7453 + 7467): the single gather index over every active sequence's pooled token slots, the matching
+/// fused-write slot index, and the cumulative key offsets the varlen kernel (and the eager fallback's
+/// per-sequence split) read. Built once per step — block tables do not change across layers — and
+/// reused by every layer's `forward_per_seq`.
 struct ThroughputGather {
     /// Concatenated per-sequence token slots `[Σ lₖ]` (u32) — the one `index_select` index over the
     /// shared pool's per-layer KV tensor.
     index: Tensor,
+    /// The fused-write target-slot index `[Σ s, n_kv_heads, head_dim]` (story 7467): each sequence's
+    /// newly-reserved slots (in batch order) broadcast across the head/dim columns, so one
+    /// [`BlockPool::scatter_write`](crate::primitives::BlockPool::scatter_write) lands this step's whole
+    /// batch of new K/V in place — the write-side analogue of `index`.
+    write_index: Tensor,
     /// Cumulative key offsets `[b + 1]`: sequence `i` owns gathered rows `cu_k[i] .. cu_k[i+1]`.
     cu_k: Vec<u32>,
     /// Longest cached key run (the varlen kernel's `max_k`). Only the `flash-attn` varlen path reads
@@ -639,10 +650,21 @@ struct ThroughputGather {
 }
 
 impl ThroughputGather {
-    /// Concatenate every sequence's pooled token slots (in batch order) into the one gather index, with
-    /// the cumulative key offsets. The caches must already have reserved this step's positions.
-    fn build(caches: &[&mut PagedKvCache], device: &Device) -> Result<Self> {
+    /// Concatenate every sequence's pooled token slots (in batch order) into the one gather index and
+    /// the matching fused-write index, with the cumulative key offsets. `n_kv_heads`/`head_dim` size the
+    /// write index's broadcast columns (the GQA values, uniform across the Throughput-eligible layers).
+    /// The caches must already have reserved this step's positions.
+    fn build(
+        caches: &[&mut PagedKvCache],
+        n_kv_heads: usize,
+        head_dim: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let cols = n_kv_heads * head_dim;
         let mut index: Vec<u32> = Vec::new();
+        // The write index repeats each new-token slot across the `cols` head/dim columns the scatter
+        // preserves (`scatter_set` needs the index shaped exactly like its source).
+        let mut wslots: Vec<u32> = Vec::new();
         let mut cu_k = Vec::with_capacity(caches.len() + 1);
         cu_k.push(0u32);
         let mut acc = 0u32;
@@ -653,9 +675,21 @@ impl ThroughputGather {
             acc += ts.len() as u32;
             cu_k.push(acc);
             max_k = max_k.max(ts.len());
+            for &slot in c.new_token_slots() {
+                for _ in 0..cols {
+                    wslots.push(slot);
+                }
+            }
         }
+        let total_new = wslots.len() / cols;
         let index = Tensor::from_vec(index, (acc as usize,), device)?;
-        Ok(Self { index, cu_k, max_k })
+        let write_index = Tensor::from_vec(wslots, (total_new, n_kv_heads, head_dim), device)?;
+        Ok(Self {
+            index,
+            write_index,
+            cu_k,
+            max_k,
+        })
     }
 }
 
@@ -892,11 +926,12 @@ impl LlamaAttention {
     /// this stay batched, which is where the throughput comes from (and why the surrounding logits only
     /// *track* batch-1 to sub-ULP — the batched matmul isn't M-invariant).
     ///
-    /// Story 7453 makes the gather batched: this step's new keys/values are written into the shared
-    /// pool in place (one `slice_set` per sequence, no per-block tensor churn), then **every** active
-    /// sequence's KV is gathered in **one** `index_select` over the pool's per-layer tensor (the
-    /// `gather` plan's index), already in the varlen kernel's `[Σ lₖ, kvh, hd]` layout — no per-sequence
-    /// `squeeze`/`transpose`/`cat`. With `--features flash-attn` that ragged KV feeds **one**
+    /// Stories 7453 + 7467 make both the write and the gather batched: this step's new keys/values are
+    /// scattered into the shared pool with **one** in-place `scatter_set` per side (the `gather` plan's
+    /// `write_index`, no per-sequence loop), then **every** active sequence's KV is gathered in **one**
+    /// `index_select` over the pool's per-layer tensor (the `gather` plan's index), already in the varlen
+    /// kernel's `[Σ lₖ, kvh, hd]` layout — no per-sequence `squeeze`/`transpose`/`cat`. With
+    /// `--features flash-attn` that ragged KV feeds **one**
     /// [`try_flash_attn_varlen`](crate::primitives::attention::try_flash_attn_varlen) call (one kernel
     /// launch instead of N). The eager per-sequence SDPA loop is the fallback for everything varlen
     /// cannot serve (CPU/f32, Gemma-2 soft-cap, or the feature off), splitting the same ragged gather
@@ -914,15 +949,24 @@ impl LlamaAttention {
         let (b, _h, s, _hd) = q.dims4()?;
         let (kvh, hd) = (self.num_kv_heads, self.head_dim);
 
-        // Transpose this step's new K/V to the pool's token-major row layout **once** for the whole
-        // batch, then write each sequence's rows into its reserved pooled slots in place.
-        let k_tm = k.transpose(1, 2)?.contiguous()?; // [b, s, kvh, hd]
-        let v_tm = v.transpose(1, 2)?.contiguous()?;
-        for (i, cache) in caches.iter().enumerate() {
-            let ki = k_tm.narrow(0, i, 1)?.reshape((s, kvh, hd))?;
-            let vi = v_tm.narrow(0, i, 1)?.reshape((s, kvh, hd))?;
-            cache.write_step_rows(layer_idx, &ki, &vi)?;
-        }
+        // Story 7467: reshape this step's new K/V to token-major `[Σ s, kvh, hd]` (batch order) and
+        // scatter every sequence's tokens into their pooled slots with **one** in-place `scatter_set`
+        // per side — replacing the `O(N)` per-sequence `slice_set` loop (the residual launch-latency
+        // cost sc-7453 left). The `write_index` (built once per step) maps each token-major row to its
+        // physical pool slot.
+        let total_new = b * s;
+        let k_tm = k
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((total_new, kvh, hd))?;
+        let v_tm = v
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((total_new, kvh, hd))?;
+        caches[0]
+            .pool()
+            .borrow()
+            .scatter_write(layer_idx, &gather.write_index, &k_tm, &v_tm)?;
 
         // One gather over every sequence's pooled token slots → ragged [Σ lₖ, kvh, hd] for K and V.
         let (k_rag, v_rag) = caches[0].pool().borrow().gather(layer_idx, &gather.index)?;
