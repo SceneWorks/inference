@@ -469,10 +469,17 @@ impl CausalLm {
                 positions.len()
             )));
         }
+        // Story 7453: reserve this step's positions for every sequence (advance the block tables), then
+        // build the **one** gather index spanning all sequences' pooled token slots — the per-layer
+        // attention does a single `index_select`, not an O(N) per-sequence gather.
+        for c in caches.iter_mut() {
+            c.reserve_step(s)?;
+        }
+        let plan = ThroughputGather::build(caches, &self.device)?;
         let (cos, sin) = self.rope_tables(positions, b as i32, s as i32)?;
         let mut h = self.embed(input_ids)?;
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward_per_seq(&h, &cos, &sin, caches, i)?;
+            h = layer.forward_per_seq(&h, &cos, &sin, caches, &plan, i)?;
         }
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?; // [b, 1, hidden]
         let logits = self.project_logits(&last_h)?; // [b, 1, vocab]
@@ -615,6 +622,43 @@ impl crate::decode::Decode for CausalLm {
     }
 }
 
+/// The per-step plan for the continuous `Throughput` decode's **batched** paged attention (story
+/// 7453): the single gather index over every active sequence's pooled token slots, plus the cumulative
+/// key offsets the varlen kernel (and the eager fallback's per-sequence split) read. Built once per
+/// step — block tables do not change across layers — and reused by every layer's `forward_per_seq`.
+struct ThroughputGather {
+    /// Concatenated per-sequence token slots `[Σ lₖ]` (u32) — the one `index_select` index over the
+    /// shared pool's per-layer KV tensor.
+    index: Tensor,
+    /// Cumulative key offsets `[b + 1]`: sequence `i` owns gathered rows `cu_k[i] .. cu_k[i+1]`.
+    cu_k: Vec<u32>,
+    /// Longest cached key run (the varlen kernel's `max_k`). Only the `flash-attn` varlen path reads
+    /// it; the eager fallback splits by `cu_k` and never needs it.
+    #[cfg_attr(not(feature = "flash-attn"), allow(dead_code))]
+    max_k: usize,
+}
+
+impl ThroughputGather {
+    /// Concatenate every sequence's pooled token slots (in batch order) into the one gather index, with
+    /// the cumulative key offsets. The caches must already have reserved this step's positions.
+    fn build(caches: &[&mut PagedKvCache], device: &Device) -> Result<Self> {
+        let mut index: Vec<u32> = Vec::new();
+        let mut cu_k = Vec::with_capacity(caches.len() + 1);
+        cu_k.push(0u32);
+        let mut acc = 0u32;
+        let mut max_k = 0usize;
+        for c in caches.iter() {
+            let ts = c.token_slots();
+            index.extend_from_slice(ts);
+            acc += ts.len() as u32;
+            cu_k.push(acc);
+            max_k = max_k.max(ts.len());
+        }
+        let index = Tensor::from_vec(index, (acc as usize,), device)?;
+        Ok(Self { index, cu_k, max_k })
+    }
+}
+
 /// One transformer block. Pre-norm by default (Llama / Qwen / Phi); Gemma-2 adds the post-attention
 /// and post-feedforward norms ([`LlamaLayer::pre_ff_ln`] / [`LlamaLayer::post_ff_ln`] are `Some`) for
 /// its 4-norm "sandwich" residual.
@@ -653,14 +697,16 @@ impl LlamaLayer {
         self.combine_ffn(x, &attn)
     }
 
-    /// Per-sequence attention variant of [`LlamaLayer::forward`] (story 7347): the norms and MLP are
-    /// batched as usual, but attention runs row-by-row over each sequence's own paged cache.
+    /// Per-sequence attention variant of [`LlamaLayer::forward`] (stories 7347 + 7453): the norms and
+    /// MLP are batched as usual, but attention runs over each sequence's own paged cache — gathered for
+    /// the whole batch in one `index_select` per the `gather` plan.
     fn forward_per_seq(
         &self,
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        caches: &mut [&mut PagedKvCache],
+        caches: &[&mut PagedKvCache],
+        gather: &ThroughputGather,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let attn = self.attn.forward_per_seq(
@@ -668,6 +714,7 @@ impl LlamaLayer {
             cos,
             sin,
             caches,
+            gather,
             layer_idx,
         )?;
         self.combine_ffn(x, &attn)
@@ -743,11 +790,12 @@ impl Attention {
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        caches: &mut [&mut PagedKvCache],
+        caches: &[&mut PagedKvCache],
+        gather: &ThroughputGather,
         layer_idx: usize,
     ) -> Result<Tensor> {
         match self {
-            Attention::Gqa(a) => a.forward_per_seq(x, cos, sin, caches, layer_idx),
+            Attention::Gqa(a) => a.forward_per_seq(x, cos, sin, caches, gather, layer_idx),
             Attention::Mla(_) => Err(crate::error::Error::Msg(
                 "continuous-batching Throughput mode is not supported for MLA (DeepSeek-V2); use the \
                  Exact mode"
@@ -838,54 +886,77 @@ impl LlamaAttention {
         self.output(&out)
     }
 
-    /// Per-sequence attention (stories 7347 + 7351): the projection is **batched** over all rows, then
-    /// each row attends only its own sequence's real KV in `caches[i]`, gathered to its true length —
-    /// no padding mask, no cross-row mixing. `caches.len()` must equal the batch. The projections / MLP
-    /// / lm_head around this stay batched, which is where the throughput comes from (and why the
-    /// surrounding logits only *track* batch-1 to sub-ULP — the batched matmul isn't M-invariant).
+    /// Per-sequence attention (stories 7347 + 7351 + 7453): the projection is **batched** over all
+    /// rows, then each row attends only its own sequence's real KV in `caches[i]` — no padding mask, no
+    /// cross-row mixing. `caches.len()` must equal the batch. The projections / MLP / lm_head around
+    /// this stay batched, which is where the throughput comes from (and why the surrounding logits only
+    /// *track* batch-1 to sub-ULP — the batched matmul isn't M-invariant).
     ///
-    /// With `--features flash-attn` the per-sequence gathers feed **one**
-    /// [`try_flash_attn_varlen`](crate::primitives::attention::try_flash_attn_varlen) call over the
-    /// ragged KV of all sequences (story 7351) — one kernel launch instead of N. The eager
-    /// per-sequence SDPA loop is the fallback for everything varlen cannot serve (CPU/f32, Gemma-2
-    /// soft-cap, or the feature off), and is byte-identical to each sequence's batch-1 attention.
+    /// Story 7453 makes the gather batched: this step's new keys/values are written into the shared
+    /// pool in place (one `slice_set` per sequence, no per-block tensor churn), then **every** active
+    /// sequence's KV is gathered in **one** `index_select` over the pool's per-layer tensor (the
+    /// `gather` plan's index), already in the varlen kernel's `[Σ lₖ, kvh, hd]` layout — no per-sequence
+    /// `squeeze`/`transpose`/`cat`. With `--features flash-attn` that ragged KV feeds **one**
+    /// [`try_flash_attn_varlen`](crate::primitives::attention::try_flash_attn_varlen) call (one kernel
+    /// launch instead of N). The eager per-sequence SDPA loop is the fallback for everything varlen
+    /// cannot serve (CPU/f32, Gemma-2 soft-cap, or the feature off), splitting the same ragged gather
+    /// per sequence — byte-identical to each sequence's batch-1 attention.
     fn forward_per_seq(
         &self,
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        caches: &mut [&mut PagedKvCache],
+        caches: &[&mut PagedKvCache],
+        gather: &ThroughputGather,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let (q, k, v) = self.project(x, cos, sin)?; // [b,H,s,hd], [b,kvh,s,hd], [b,kvh,s,hd]
+        let (b, _h, s, _hd) = q.dims4()?;
+        let (kvh, hd) = (self.num_kv_heads, self.head_dim);
 
-        // Gather each sequence's real KV (appends this step's tokens to its own paged cache). The
-        // gathers are independent clones of pool storage, so collecting them all before attending is
-        // safe (a later sequence's freeze never mutates an earlier sequence's returned tensor).
-        let mut gathered = Vec::with_capacity(caches.len());
-        for (i, cache) in caches.iter_mut().enumerate() {
-            let ki = k.narrow(0, i, 1)?.contiguous()?;
-            let vi = v.narrow(0, i, 1)?.contiguous()?;
-            gathered.push(cache.update(layer_idx, &ki, &vi)?); // [1, kvh, lₖ, hd]
+        // Transpose this step's new K/V to the pool's token-major row layout **once** for the whole
+        // batch, then write each sequence's rows into its reserved pooled slots in place.
+        let k_tm = k.transpose(1, 2)?.contiguous()?; // [b, s, kvh, hd]
+        let v_tm = v.transpose(1, 2)?.contiguous()?;
+        for (i, cache) in caches.iter().enumerate() {
+            let ki = k_tm.narrow(0, i, 1)?.reshape((s, kvh, hd))?;
+            let vi = v_tm.narrow(0, i, 1)?.reshape((s, kvh, hd))?;
+            cache.write_step_rows(layer_idx, &ki, &vi)?;
         }
+
+        // One gather over every sequence's pooled token slots → ragged [Σ lₖ, kvh, hd] for K and V.
+        let (k_rag, v_rag) = caches[0].pool().borrow().gather(layer_idx, &gather.index)?;
 
         // Batched attention over all sequences in one ragged varlen kernel when eligible; otherwise
         // the eager per-sequence SDPA loop (CPU/f32, soft-cap, or no `flash-attn` feature).
         #[cfg(feature = "flash-attn")]
         if let Some(out) = crate::primitives::attention::try_flash_attn_varlen(
             &q,
-            &gathered,
+            &k_rag,
+            &v_rag,
+            &gather.cu_k,
+            gather.max_k,
             self.scale,
             self.softcap,
         )? {
             return self.output(&out);
         }
 
-        let mut outs = Vec::with_capacity(gathered.len());
-        for (i, (k_all, v_all)) in gathered.iter().enumerate() {
+        // Eager fallback: slice each sequence's rows out of the ragged gather, rebuild head-major
+        // [1, kvh, lₖ, hd], GQA-expand, and run the stock causal SDPA — identical to its batch-1 path.
+        let mut outs = Vec::with_capacity(b);
+        for i in 0..b {
+            let start = gather.cu_k[i] as usize;
+            let li = gather.cu_k[i + 1] as usize - start;
+            let to_hm = |t: &Tensor| -> Result<Tensor> {
+                Ok(t.narrow(0, start, li)?
+                    .reshape((1, li, kvh, hd))?
+                    .transpose(1, 2)?
+                    .contiguous()?)
+            };
+            let k_all = repeat_kv(&to_hm(&k_rag)?, self.groups)?;
+            let v_all = repeat_kv(&to_hm(&v_rag)?, self.groups)?;
             let qi = q.narrow(0, i, 1)?; // [1, H, s, hd]
-            let k_all = repeat_kv(k_all, self.groups)?;
-            let v_all = repeat_kv(v_all, self.groups)?;
             outs.push(sdpa(
                 &qi,
                 &k_all,
