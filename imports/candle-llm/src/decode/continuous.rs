@@ -158,15 +158,23 @@ pub fn generate_continuous(
     let mut lanes: Vec<Lane> = Vec::new();
     let mut next_req = 0usize;
 
-    // Fill the initial slots (prefill is per-sequence: each prompt at its own length, no left-pad).
-    while lanes.len() < config.max_batch && next_req < requests.len() {
-        if let Some(lane) = admit_lane(
-            model, &pool, num_layers, requests, &seq_ids, next_req, &mut sched, &device, on_event,
-        )? {
-            lanes.push(lane);
-        }
-        next_req += 1;
-    }
+    // Fill the initial slots. In `Throughput` mode a wave of newly-admitted requests sharing a prompt
+    // length is prefilled **together** in one batched forward (story 7485); `Exact` mode and odd
+    // lengths prefill batch-1 (no left-pad — each prompt at its own length).
+    admit_to_capacity(
+        model,
+        &pool,
+        num_layers,
+        requests,
+        &seq_ids,
+        &mut next_req,
+        &mut lanes,
+        config.max_batch,
+        config.exactness,
+        &mut sched,
+        &device,
+        on_event,
+    )?;
 
     // Decode loop: step every live lane, retire finished ones, refill freed slots from the queue.
     // Cancel is checked once at the top of each step (before another forward) so a mid-stream cancel
@@ -187,16 +195,21 @@ pub fn generate_continuous(
         }
         lanes = survivors;
 
-        // Admit-on-retire: refill every freed slot from the waiting requests.
-        while lanes.len() < config.max_batch && next_req < requests.len() {
-            if let Some(lane) = admit_lane(
-                model, &pool, num_layers, requests, &seq_ids, next_req, &mut sched, &device,
-                on_event,
-            )? {
-                lanes.push(lane);
-            }
-            next_req += 1;
-        }
+        // Admit-on-retire: refill every freed slot, batching a same-length wave's prefill (7485).
+        admit_to_capacity(
+            model,
+            &pool,
+            num_layers,
+            requests,
+            &seq_ids,
+            &mut next_req,
+            &mut lanes,
+            config.max_batch,
+            config.exactness,
+            &mut sched,
+            &device,
+            on_event,
+        )?;
     }
 
     // A cancel breaks the loop with live lanes still decoding and requests still waiting in the queue;
@@ -292,6 +305,162 @@ fn admit_lane(
         LaneStep::Continue => Some(lane),
         LaneStep::Done => None,
     })
+}
+
+/// Fill every free slot from the waiting requests. `Exact` admits one batch-1 [`admit_lane`] at a time
+/// (bit-exact). `Throughput` (story 7485) prefills a wave of newly-admitted requests sharing a prompt
+/// length **together** in one batched [`CausalLm::decode_logits_per_seq`] instead of N batch-1 forwards
+/// — the lever that kills the inter-wave batch-1 prefill stalls (worst under bursty admit-on-retire,
+/// e.g. uniform budgets where a whole wave retires at once). Differing lengths split into per-length
+/// groups; singletons fall back to batch-1. Loops until the batch is full or the queue drains, so a
+/// just-admitted request that retires on its own first token frees its slot again and is refilled in
+/// the same call — matching the one-at-a-time loop it replaces.
+#[allow(clippy::too_many_arguments)]
+fn admit_to_capacity(
+    model: &CausalLm,
+    pool: &std::rc::Rc<std::cell::RefCell<BlockPool>>,
+    num_layers: usize,
+    requests: &[BatchRequest],
+    seq_ids: &[SeqId],
+    next_req: &mut usize,
+    lanes: &mut Vec<Lane>,
+    max_batch: usize,
+    exactness: BatchExactness,
+    sched: &mut Scheduler,
+    device: &Device,
+    on_event: &mut dyn FnMut(usize, StreamEvent),
+) -> Result<()> {
+    while lanes.len() < max_batch && *next_req < requests.len() {
+        // The request indices that fill this pass's free slots, in admission order.
+        let avail = max_batch - lanes.len();
+        let mut wave: Vec<usize> = Vec::with_capacity(avail);
+        while wave.len() < avail && *next_req < requests.len() {
+            wave.push(*next_req);
+            *next_req += 1;
+        }
+        match exactness {
+            BatchExactness::Exact => {
+                for ri in wave {
+                    if let Some(lane) = admit_lane(
+                        model, pool, num_layers, requests, seq_ids, ri, sched, device, on_event,
+                    )? {
+                        lanes.push(lane);
+                    }
+                }
+            }
+            BatchExactness::Throughput => admit_wave_throughput(
+                model, pool, num_layers, requests, seq_ids, &wave, lanes, sched, device, on_event,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// Prefill an admission `wave` for the `Throughput` mode (story 7485): group the requests by prompt
+/// length and prefill each same-length group of ≥2 in **one** batched [`CausalLm::decode_logits_per_seq`]
+/// (its projections / MLP / lm_head batched, attention per-sequence over fresh paged caches), sampling
+/// each lane's first token from the shared `[group, vocab]` logits. Singletons (and any group of one)
+/// prefill batch-1 via [`admit_lane`]. Zero-budget / already-retired requests are dropped first with
+/// their terminal `Done` — exactly as [`admit_lane`] does — so each request still signals completion
+/// exactly once. Like the `Throughput` decode step, a batched-prefilled row only *tracks* its batch-1
+/// run on a GPU (the batched matmul is not M-invariant); on CPU it is bit-exact.
+#[allow(clippy::too_many_arguments)]
+fn admit_wave_throughput(
+    model: &CausalLm,
+    pool: &std::rc::Rc<std::cell::RefCell<BlockPool>>,
+    num_layers: usize,
+    requests: &[BatchRequest],
+    seq_ids: &[SeqId],
+    wave: &[usize],
+    lanes: &mut Vec<Lane>,
+    sched: &mut Scheduler,
+    device: &Device,
+    on_event: &mut dyn FnMut(usize, StreamEvent),
+) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    // Drop zero-budget / already-retired requests (the scheduler retires them at admission), emitting
+    // their terminal `Done` — keep only those that still need a prefill.
+    let mut active: Vec<usize> = Vec::with_capacity(wave.len());
+    for &ri in wave {
+        if sched.is_active(seq_ids[ri]) {
+            active.push(ri);
+        } else {
+            on_event(
+                ri,
+                StreamEvent::Done {
+                    reason: FinishReason::MaxTokens,
+                    generated: 0,
+                },
+            );
+        }
+    }
+    if active.is_empty() {
+        return Ok(());
+    }
+
+    // Group by prompt length so each batched prefill is a clean uniform-width forward (no left-pad).
+    // `BTreeMap` keeps groups in a deterministic order; within a group, admission order is preserved.
+    let mut by_len: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for &ri in &active {
+        by_len
+            .entry(requests[ri].prompt_ids.len())
+            .or_default()
+            .push(ri);
+    }
+
+    for (len, group) in by_len {
+        if group.len() < 2 {
+            // Singleton: a batched-of-1 forward buys nothing, so prefill batch-1 (the request is
+            // already active, so `admit_lane` will not re-emit a zero-budget `Done`).
+            if let Some(lane) = admit_lane(
+                model, pool, num_layers, requests, seq_ids, group[0], sched, device, on_event,
+            )? {
+                lanes.push(lane);
+            }
+            continue;
+        }
+
+        // Batched prefill: `group.len()` fresh caches, one `decode_logits_per_seq` over `[g, len]`.
+        let g = group.len();
+        let mut caches: Vec<PagedKvCache> = (0..g)
+            .map(|_| PagedKvCache::with_pool(pool.clone(), num_layers))
+            .collect();
+        let ids: Vec<u32> = group
+            .iter()
+            .flat_map(|&ri| requests[ri].prompt_ids.iter().map(|&t| t as u32))
+            .collect();
+        let ids = Tensor::from_vec(ids, (g, len), device)?;
+        // Each row's RoPE positions are `0..len` — a fresh prefill at offset 0.
+        let mut positions: Vec<i32> = Vec::with_capacity(g * len);
+        for _ in 0..g {
+            positions.extend(0..len as i32);
+        }
+        let logits = {
+            let mut crefs: Vec<&mut PagedKvCache> = caches.iter_mut().collect();
+            model.decode_logits_per_seq(&ids, &mut crefs, &positions)? // [g, vocab]
+        };
+
+        // Sample each lane's first token from its row and create the lane (mirrors `admit_lane`).
+        for (gi, (cache, &ri)) in caches.into_iter().zip(group.iter()).enumerate() {
+            let r = &requests[ri];
+            let mut lane = Lane {
+                seq: seq_ids[ri],
+                req_index: ri,
+                cache,
+                rng: SplitMix64::new(r.seed.unwrap_or_else(default_seed)),
+                params: r.sampling,
+                history: r.prompt_ids.clone(),
+                next_token: 0,
+            };
+            let lg = logits.narrow(0, gi, 1)?; // [1, vocab]
+            let tok = sample(&lg, &lane.history, &lane.params, &mut lane.rng, None)?;
+            if let LaneStep::Continue = record_token(sched, &mut lane, tok, on_event) {
+                lanes.push(lane);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One decode step's logits, one `[1, vocab]` per live lane (in lane order). `Exact` runs each

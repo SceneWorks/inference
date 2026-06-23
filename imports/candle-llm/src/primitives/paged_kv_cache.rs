@@ -136,8 +136,9 @@ impl BlockPool {
     }
 
     /// Initialize the pooled storage on first use from the head shape / dtype / device of the first
-    /// key/value written. Idempotent.
-    fn ensure_store(
+    /// key/value written. Idempotent. `pub(crate)` so a batched prefill can seed it from the model's
+    /// cfg before any write (story 7485 — see [`PagedKvCache::ensure_pool_store`]).
+    pub(crate) fn ensure_store(
         &mut self,
         num_layers: usize,
         n_kv_heads: usize,
@@ -504,10 +505,30 @@ impl PagedKvCache {
         Ok((to_hm(k)?, to_hm(v)?))
     }
 
+    /// Ensure the shared pool's storage is initialized so a **fresh** admission wave's caches can
+    /// [`reserve_step`](PagedKvCache::reserve_step) before any write. The per-sequence
+    /// [`KvCache::update`] normally seeds the store lazily from the first key written, but a **batched
+    /// prefill** (story 7485) reserves the whole wave's slots up front, before the first scatter — so
+    /// the store must already exist. Idempotent (a no-op once any sequence has prefilled through this
+    /// pool, e.g. every decode step). `n_kv_heads`/`head_dim`/`dtype`/`device` are the model's cfg head
+    /// shape, compute dtype, and device — the same values the first `update` would have used.
+    pub fn ensure_pool_store(
+        &self,
+        n_kv_heads: usize,
+        head_dim: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<()> {
+        self.pool
+            .borrow_mut()
+            .ensure_store(self.num_layers, n_kv_heads, head_dim, dtype, device)
+    }
+
     /// **Continuous `Throughput` step, part 1.** Reserve `s` new positions: allocate blocks, extend the
     /// block table, and record `new_slots` — without writing data (that is per-layer
-    /// [`write_step`](PagedKvCache::write_step)). The pool store must already be initialized (every
-    /// continuous lane prefills through [`KvCache::update`] first).
+    /// [`write_step`](PagedKvCache::write_step)). The pool store must already be initialized — every
+    /// continuous lane prefills first (through [`KvCache::update`], or, for a batched-prefill wave,
+    /// [`ensure_pool_store`](PagedKvCache::ensure_pool_store)).
     pub fn reserve_step(&mut self, s: usize) -> Result<()> {
         if self.pool.borrow().store.is_none() {
             return Err(Error::Msg(
