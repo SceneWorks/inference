@@ -18,6 +18,12 @@ Built bottom-up, mirroring `mlx-llm`'s structure on Candle tensors:
    Qwen3).
 3. **`decode`** — the streaming, cancellable decode loop driving any `Decode` model.
 4. **`provider`** — implements `core_llm::TextLlm` over the engine and registers it (`candle-llama`).
+5. **`prepare`** — implements `core_llm::SnapshotPreparer`: turn a downloaded model (an HF snapshot
+   dir or a `*.gguf`) into a persisted, loadable snapshot, optionally baking in Q4/Q8. Candle's
+   `QTensor` has no safetensors form, so a quantized snapshot is dense weights carrying the
+   quantization rounding plus a `quantization` block in `config.json`; the loader re-quantizes the
+   projections on load, so `prepare_snapshot` yields a genuinely quantized model in candle's storage
+   shape.
 
 ## Backends / features
 
@@ -66,9 +72,9 @@ parity tests:
 
 | env var | points at | exercised by |
 |---|---|---|
-| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache, **continuous** batching, **speculative** (prompt-lookup + draft-model), `bench` (tokens/s) |
-| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache, **continuous** batching, **speculative** (prompt-lookup + draft-model) |
-| `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load |
+| `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache, **continuous** batching, **speculative** (prompt-lookup + draft-model), **snapshot prepare** (dense + Q8), `bench` (tokens/s) |
+| `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache, **continuous** batching, **speculative** (prompt-lookup + draft-model), **snapshot prepare** (Q4) |
+| `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load, **snapshot prepare** (GGUF → snapshot, dense + Q8) |
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
 | `CANDLE_LLM_VLM_MODEL` | a SigLIP-based `LlavaForConditionalGeneration` snapshot dir (small: `llava-hf/llava-interleave-qwen-0.5b-hf`; faithful: JoyCaption) | `vlm` — image captioning + the multimodal conformance check |
 

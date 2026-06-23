@@ -12,7 +12,7 @@ use std::path::Path;
 
 use candle_core::Device;
 use core_llm::{
-    ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError,
+    Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError,
     FinishReason as CoreFinish, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
     Quantize, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
@@ -48,22 +48,27 @@ impl LlamaProvider {
     /// shards). Either way the decoder architecture is dispatched (Llama / Mistral / Qwen3) and the
     /// projections are optionally quantized on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        let quant = spec.quantize.map(|q| match q {
+        let requested = spec.quantize.map(|q| match q {
             Quantize::Q4 => QuantSpec::q4(),
             Quantize::Q8 => QuantSpec::q8(),
         });
         let device = select_device().map_err(to_core)?;
         if crate::gguf::is_gguf_path(&spec.source) {
-            Self::load_gguf(Path::new(&spec.source), &device, quant)
+            Self::load_gguf(Path::new(&spec.source), &device, requested)
         } else {
-            Self::load_dir(Path::new(&spec.source), &device, quant)
+            Self::load_dir(Path::new(&spec.source), &device, requested)
         }
     }
 
     /// Load from an HF snapshot directory (config.json + tokenizer.json + safetensors shards).
-    fn load_dir(dir: &Path, device: &Device, quant: Option<QuantSpec>) -> CoreResult<Self> {
+    ///
+    /// `requested` is an explicit load-time quantization (`spec.quantize`); when it is `None` the
+    /// snapshot's own persisted `quantization` block (written by the [`prepare`](crate::prepare)
+    /// writer) is honored, so a `LoadSpec::dense` of a prepared Q4/Q8 snapshot loads quantized.
+    fn load_dir(dir: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
         let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
         let descriptor = descriptor_for(&cfg);
+        let quant = requested.or(cfg.quantization);
         let weights = Weights::from_dir(dir, device).map_err(to_core)?;
         let model = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
@@ -82,9 +87,10 @@ impl LlamaProvider {
     /// `tokenizer.json`, falling back to a reconstruction from the GGUF's embedded tokenizer
     /// metadata; the chat template prefers a sibling `tokenizer_config.json`, then the GGUF's own
     /// `chat_template`, then the typed Llama-3 default.
-    fn load_gguf(path: &Path, device: &Device, quant: Option<QuantSpec>) -> CoreResult<Self> {
+    fn load_gguf(path: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
         let ck = GgufCheckpoint::open(path, device).map_err(to_core)?;
         let descriptor = descriptor_for(&ck.config);
+        let quant = requested.or(ck.config.quantization);
         let model = CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
             .map_err(to_core)?;
 
@@ -237,6 +243,9 @@ impl TextLlm for LlamaProvider {
                                 id: id as u32,
                                 text: delta,
                                 index: step,
+                                // candle does not implement a controllable thinking mode
+                                // (supports_thinking = false), so every token is content.
+                                channel: Channel::Content,
                             });
                         }
                     }
@@ -267,6 +276,7 @@ impl TextLlm for LlamaProvider {
         });
         Ok(TextLlmOutput {
             text,
+            thinking: None,
             usage,
             finish_reason: Some(finish),
         })
@@ -286,6 +296,9 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             supports_system_prompt: true,
             // Text-only today; the VLM path flips this on for a vision provider.
             supports_vision: false,
+            // No controllable reasoning mode yet (a separate story); the contract requires an
+            // explicit enable-thinking request to be rejected, which validate_request enforces.
+            supports_thinking: false,
             // JSON-constrained decoding.
             supported_constraints: vec![Constraint::Json],
         },
@@ -349,7 +362,7 @@ fn map_finish(f: FinishReason) -> CoreFinish {
 
 /// Bridge an engine error into the contract error, preserving the typed cancellation / capability /
 /// load variants (do not stringify those).
-fn to_core(e: crate::Error) -> CoreError {
+pub(crate) fn to_core(e: crate::Error) -> CoreError {
     match e {
         crate::Error::Canceled => CoreError::Canceled,
         crate::Error::Unsupported(m) => CoreError::Unsupported(m),

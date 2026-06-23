@@ -317,6 +317,7 @@ mod real {
                     Content::Image(gray_384()),
                     Content::text("Describe this image in one short sentence."),
                 ],
+                thinking: None,
             }],
             sampling: Sampling::greedy(),
             max_new_tokens: max_new,

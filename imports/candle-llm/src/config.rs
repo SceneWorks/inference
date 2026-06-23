@@ -8,6 +8,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::primitives::projection::QuantSpec;
 use crate::primitives::Rope;
 
 /// The decoder architecture, dispatched from `config.json` (`architectures` / `model_type`).
@@ -243,6 +244,10 @@ pub struct ModelConfig {
     pub architecture: Architecture,
     /// Max context length (`max_position_embeddings`); `0` if unspecified.
     pub max_position_embeddings: i32,
+    /// Present when the snapshot bakes in quantization (a `quantization` block in `config.json`,
+    /// written by the [`prepare`](crate::prepare) snapshot writer, story 7662): the scheme the
+    /// projections load at when no explicit load-time `quantize` is requested. `None` ⇒ dense.
+    pub quantization: Option<QuantSpec>,
     /// Mixture-of-Experts parameters, present for an MoE decoder (Qwen2-MoE); `None` ⇒ dense MLP.
     pub moe: Option<MoeConfig>,
     /// Gemma-2 attention-score soft-cap (`attn_logit_softcapping`); `None` ⇒ no cap.
@@ -312,6 +317,16 @@ impl ModelConfig {
         let final_logit_softcap = f32_opt("final_logit_softcapping");
         let query_pre_attn_scalar = int("query_pre_attn_scalar");
         let partial_rotary_factor = f32_opt("partial_rotary_factor").unwrap_or(1.0);
+
+        // A `quantization` block marks a snapshot whose projections are quantized on load (the
+        // `prepare` writer stamps `{ "bits": 4 | 8 }`). The dense weights stay in `model.safetensors`;
+        // the loader re-quantizes the projections via Candle's QTensor, so a `LoadSpec::dense` of a
+        // prepared Q4/Q8 snapshot yields a genuinely quantized model.
+        let quantization = v
+            .get("quantization")
+            .and_then(|q| q.get("bits"))
+            .and_then(|b| b.as_u64())
+            .and_then(|bits| QuantSpec::from_bits(bits as u32));
 
         // Mixture-of-Experts FFN params: present iff a routed-expert count is configured
         // (`num_experts` for Qwen2-MoE, `n_routed_experts` for DeepSeek-V2).
@@ -402,6 +417,7 @@ impl ModelConfig {
             tie_word_embeddings,
             architecture,
             max_position_embeddings,
+            quantization,
             moe,
             attn_logit_softcap,
             final_logit_softcap,
@@ -769,6 +785,37 @@ mod tests {
         let rope = cfg.build_rope();
         assert_eq!(rope.dim(), 64);
         assert!(rope.interleaved());
+    }
+
+    #[test]
+    fn parses_quantization_block() {
+        let q4 = json!({
+            "hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 2,
+            "num_attention_heads": 16, "vocab_size": 32, "quantization": { "bits": 4 }
+        });
+        assert_eq!(
+            ModelConfig::from_json(&q4).unwrap().quantization,
+            Some(QuantSpec::q4())
+        );
+        let q8 = json!({
+            "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
+            "num_attention_heads": 2, "vocab_size": 32, "quantization": { "bits": 8 }
+        });
+        assert_eq!(
+            ModelConfig::from_json(&q8).unwrap().quantization,
+            Some(QuantSpec::q8())
+        );
+        // A dense snapshot (no block) and an unrecognized width both load dense.
+        let dense = json!({
+            "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
+            "num_attention_heads": 2, "vocab_size": 32
+        });
+        assert_eq!(ModelConfig::from_json(&dense).unwrap().quantization, None);
+        let bogus = json!({
+            "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
+            "num_attention_heads": 2, "vocab_size": 32, "quantization": { "bits": 5 }
+        });
+        assert_eq!(ModelConfig::from_json(&bogus).unwrap().quantization, None);
     }
 
     #[test]
