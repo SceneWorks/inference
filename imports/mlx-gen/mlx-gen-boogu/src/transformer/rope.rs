@@ -27,7 +27,9 @@ pub struct RopeTables {
     cos: Array,
     sin: Array,
     cap_len: i32,
-    ref_len: i32,
+    /// Per-reference token counts, in packing order (empty for text-to-image). The combined
+    /// reference block length is their sum; [`RopeTables::ref_image_at`] slices an individual one.
+    ref_lens: Vec<i32>,
 }
 
 impl RopeTables {
@@ -43,13 +45,11 @@ impl RopeTables {
         let mut positions = Vec::with_capacity(cap_len + h_tokens * w_tokens);
         text_positions(&mut positions, cap_len);
         grid_positions(&mut positions, cap_len as f32, h_tokens, w_tokens);
-        from_positions(&positions, axes_dim, theta, cap_len as i32, 0)
+        from_positions(&positions, axes_dim, theta, cap_len as i32, Vec::new())
     }
 
-    /// Build the joint table for an **edit** forward (one reference image): `cap_len` text positions,
-    /// then a `ref_h × ref_w` reference grid at t-axis `cap_len`, then the `h × w` target grid at
-    /// t-axis `cap_len + max(ref_h, ref_w)` (the reference's `pe_shift` advance) — matching the
-    /// `[instruct; ref; noise]` packing the DiT runs the single-stream over.
+    /// Build the joint table for an **edit** forward with a single reference image — a thin wrapper
+    /// over [`Self::build_edit_multi`] (kept for the single-reference call sites / tests).
     pub fn build_edit(
         cap_len: usize,
         ref_h: usize,
@@ -59,13 +59,40 @@ impl RopeTables {
         axes_dim: usize,
         theta: f32,
     ) -> Self {
-        let ref_len = ref_h * ref_w;
-        let mut positions = Vec::with_capacity(cap_len + ref_len + h_tokens * w_tokens);
+        Self::build_edit_multi(
+            cap_len,
+            &[(ref_h, ref_w)],
+            h_tokens,
+            w_tokens,
+            axes_dim,
+            theta,
+        )
+    }
+
+    /// Build the joint table for a **multi-reference** edit forward: `cap_len` text positions, then
+    /// each reference grid `(ref_hᵢ, ref_wᵢ)` placed at t-axis `pe_shift` and advancing `pe_shift` by
+    /// `max(ref_hᵢ, ref_wᵢ)` per reference (the OmniGen2 `pe_shift`), then the `h × w` target grid at
+    /// the final `pe_shift` — matching the `[instruct; ref₀; …; ref_{N-1}; noise]` packing. `ref_grids`
+    /// is in **token** units (latent dim // patch). An empty `ref_grids` is the text-to-image layout.
+    pub fn build_edit_multi(
+        cap_len: usize,
+        ref_grids: &[(usize, usize)],
+        h_tokens: usize,
+        w_tokens: usize,
+        axes_dim: usize,
+        theta: f32,
+    ) -> Self {
+        let total_ref: usize = ref_grids.iter().map(|(rh, rw)| rh * rw).sum();
+        let mut positions = Vec::with_capacity(cap_len + total_ref + h_tokens * w_tokens);
         text_positions(&mut positions, cap_len);
-        grid_positions(&mut positions, cap_len as f32, ref_h, ref_w);
-        let noise_t = (cap_len + ref_h.max(ref_w)) as f32;
-        grid_positions(&mut positions, noise_t, h_tokens, w_tokens);
-        from_positions(&positions, axes_dim, theta, cap_len as i32, ref_len as i32)
+        let mut pe_shift = cap_len;
+        for &(rh, rw) in ref_grids {
+            grid_positions(&mut positions, pe_shift as f32, rh, rw);
+            pe_shift += rh.max(rw);
+        }
+        grid_positions(&mut positions, pe_shift as f32, h_tokens, w_tokens);
+        let ref_lens = ref_grids.iter().map(|(rh, rw)| (rh * rw) as i32).collect();
+        from_positions(&positions, axes_dim, theta, cap_len as i32, ref_lens)
     }
 
     /// `(cos, sin)` for the text tokens only (`context_refiner`).
@@ -76,19 +103,32 @@ impl RopeTables {
         ))
     }
 
-    /// `(cos, sin)` for the reference-image patch tokens only (`ref_image_refiner`). Empty-safe via
-    /// `ref_len == 0` callers (T2I never calls this).
+    /// Total reference-block length (sum over all reference images; `0` for T2I).
+    fn ref_len_total(&self) -> i32 {
+        self.ref_lens.iter().sum()
+    }
+
+    /// `(cos, sin)` for the whole reference block `[ref₀; …; ref_{N-1}]`. Empty-safe (T2I → empty).
     pub fn ref_image(&self) -> Result<(Array, Array)> {
         let start = self.cap_len;
-        let end = self.cap_len + self.ref_len;
+        let end = self.cap_len + self.ref_len_total();
+        Ok((axis1(&self.cos, start, end)?, axis1(&self.sin, start, end)?))
+    }
+
+    /// `(cos, sin)` for the `j`-th reference image's patch tokens only — each reference is refined
+    /// **independently** by `ref_image_refiner` (its own positions, no cross-reference attention),
+    /// mirroring the reference's per-image `batch_ref_image_hidden_states` rows.
+    pub fn ref_image_at(&self, j: usize) -> Result<(Array, Array)> {
+        let start = self.cap_len + self.ref_lens[..j].iter().sum::<i32>();
+        let end = start + self.ref_lens[j];
         Ok((axis1(&self.cos, start, end)?, axis1(&self.sin, start, end)?))
     }
 
     /// `(cos, sin)` for the target (noise) patch tokens only (`noise_refiner`). These sit after the
-    /// reference block, so the range is `[cap_len + ref_len, end)`.
+    /// reference block, so the range is `[cap_len + ref_len_total, end)`.
     pub fn image(&self) -> Result<(Array, Array)> {
         let end = self.cos.shape()[1];
-        let start = self.cap_len + self.ref_len;
+        let start = self.cap_len + self.ref_len_total();
         Ok((axis1(&self.cos, start, end)?, axis1(&self.sin, start, end)?))
     }
 
@@ -132,7 +172,7 @@ fn from_positions(
     axes_dim: usize,
     theta: f32,
     cap_len: i32,
-    ref_len: i32,
+    ref_lens: Vec<i32>,
 ) -> RopeTables {
     let half_axis = axes_dim / 2; // 20 complex freqs per axis
     let half = half_axis * 3; // 60 for head_dim 120
@@ -161,7 +201,7 @@ fn from_positions(
         cos: Array::from_slice(&cos, &shape),
         sin: Array::from_slice(&sin, &shape),
         cap_len,
-        ref_len,
+        ref_lens,
     }
 }
 
