@@ -216,10 +216,56 @@ pub(crate) fn try_flash_attn_varlen(
         return Ok(None);
     }
     debug_assert_eq!(b, kv.len(), "one (k, v) gather per sequence");
+
+    // Pack the per-sequence gathers into the kernel's flat ragged layout (the data-movement a
+    // block-table kernel would remove — kept as its own seam so the sc-7258 cost bench can time the
+    // build separately from the kernel).
+    let vi = build_varlen_inputs(q, kv)?;
+
+    // One kernel over all sequences; bottom-right causal (window_size_right = 0). Output: [b*s, h, d].
+    let out = candle_flash_attn::flash_attn_varlen(
+        &vi.q, &vi.k, &vi.v, &vi.cu_q, &vi.cu_k, vi.max_q, vi.max_k, scale, true,
+    )?;
+    // Back to [b, heads, s, d] for the shared output projection.
+    Ok(Some(
+        out.reshape((b, s, h, d))?.transpose(1, 2)?.contiguous()?,
+    ))
+}
+
+/// The flat ragged tensors [`candle_flash_attn::flash_attn_varlen`] consumes, packed from the
+/// per-sequence gathers by [`build_varlen_inputs`].
+#[cfg(feature = "flash-attn")]
+pub(crate) struct VarlenInputs {
+    /// Sequence-major queries `[Σ s, heads, head_dim]`.
+    pub q: Tensor,
+    /// Ragged keys `[Σ lₖ, n_kv_heads, head_dim]` (un-expanded — the kernel is GQA-native).
+    pub k: Tensor,
+    /// Ragged values `[Σ lₖ, n_kv_heads, head_dim]`.
+    pub v: Tensor,
+    /// Cumulative query offsets `[b + 1]` (u32).
+    pub cu_q: Tensor,
+    /// Cumulative key offsets `[b + 1]` (u32).
+    pub cu_k: Tensor,
+    /// Longest query run (the uniform decode step `s`).
+    pub max_q: usize,
+    /// Longest cached key run.
+    pub max_k: usize,
+}
+
+/// Pack the per-sequence gathers into the flat layout [`candle_flash_attn::flash_attn_varlen`] wants.
+///
+/// `q` is the batched projection `[b, heads, s, head_dim]`; `kv` is one paged gather
+/// `[1, n_kv_heads, lₖ, head_dim]` per sequence in batch order. Queries become sequence-major rows
+/// (`[Σ s, heads, head_dim]`, sequence `i` owning rows `i*s .. (i+1)*s`); keys/values are squeezed,
+/// transposed to `[lₖ, n_kv_heads, head_dim]`, and concatenated along the token axis with cumulative
+/// `cu_seqlens` offsets. This is exactly the host-side gather/layout work a custom block-table kernel
+/// (story 7258) would subsume by reading the scattered blocks directly.
+#[cfg(feature = "flash-attn")]
+pub(crate) fn build_varlen_inputs(q: &Tensor, kv: &[(Tensor, Tensor)]) -> Result<VarlenInputs> {
+    let (b, h, s, d) = q.dims4()?;
     let device = q.device();
 
-    // Ragged queries: [b, heads, s, d] -> [b, s, heads, d] -> [b*s, heads, d] (sequence-major rows,
-    // so sequence i owns rows `i*s .. (i+1)*s`).
+    // Ragged queries: [b, heads, s, d] -> [b, s, heads, d] -> [b*s, heads, d].
     let q_ragged = q.transpose(1, 2)?.contiguous()?.reshape((b * s, h, d))?;
 
     // Ragged keys/values: each gather [1, kvh, lₖ, d] -> [lₖ, kvh, d]; concatenate along the token
@@ -246,14 +292,15 @@ pub(crate) fn try_flash_attn_varlen(
     let cu_q = Tensor::from_vec(cu_q, (b + 1,), device)?;
     let cu_k = Tensor::from_vec(cu_k, (kv.len() + 1,), device)?;
 
-    // One kernel over all sequences; bottom-right causal (window_size_right = 0). Output: [b*s, h, d].
-    let out = candle_flash_attn::flash_attn_varlen(
-        &q_ragged, &k_ragged, &v_ragged, &cu_q, &cu_k, s, max_k, scale, true,
-    )?;
-    // Back to [b, heads, s, d] for the shared output projection.
-    Ok(Some(
-        out.reshape((b, s, h, d))?.transpose(1, 2)?.contiguous()?,
-    ))
+    Ok(VarlenInputs {
+        q: q_ragged,
+        k: k_ragged,
+        v: v_ragged,
+        cu_q,
+        cu_k,
+        max_q: s,
+        max_k,
+    })
 }
 
 /// Concatenate tensors along axis 0; a single part is returned as-is (no copy). Used to pack the
@@ -450,5 +497,108 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff < 3e-2, "varlen vs eager per-seq max|Δ| = {diff}");
+    }
+
+    /// **sc-7258 go/no-go cost bench.** Within the continuous `Throughput` per-sequence attention path,
+    /// how much of the per-layer, per-step cost is the **gather + ragged build** (the host-side data
+    /// movement a custom block-table kernel would subsume by reading scattered blocks directly) versus
+    /// the **`flash_attn_varlen` kernel** itself (what a custom kernel would still have to do at least
+    /// as fast to win)? The `gather+build` fraction is the *ceiling* a from-scratch paged kernel could
+    /// reclaim from attention — the number the story is gated on.
+    ///
+    /// Each phase is `synchronize()`-bracketed so its GPU work is attributed to it, at the two real
+    /// test-model head shapes across occupancy (N) and context (L). Needs `--features flash-attn` +
+    /// CUDA; `#[ignore]`d (a bench, not a correctness gate).
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    #[ignore = "sc-7258 cost bench; needs CUDA"]
+    fn paged_attention_path_cost_on_cuda() {
+        use crate::primitives::kv_cache::KvCache;
+        use crate::primitives::PagedKvCache;
+        use std::time::Instant;
+
+        let device = Device::new_cuda(0).expect("cuda device");
+        let block_size = 16usize;
+        let iters = 30usize;
+        let warmup = 8usize;
+
+        // Bounded, varied bf16 `[1, heads, rows, d]` (cos keeps values in [-1, 1]).
+        let mk = |rows: usize, heads: usize, d: usize, phase: f64| {
+            let n = (rows * heads * d) as f32;
+            Tensor::arange(0f32, n, &device)
+                .unwrap()
+                .reshape((1, heads, rows, d))
+                .unwrap()
+                .affine(0.011, phase)
+                .unwrap()
+                .cos()
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let cat0 = |parts: Vec<Tensor>| Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0).unwrap();
+
+        // (label, heads, kv_heads, head_dim) for the two real test models.
+        for (label, h, kvh, d) in [("SmolLM2", 9usize, 3usize, 64usize), ("Qwen3", 16, 8, 128)] {
+            let scale = (d as f32).powf(-0.5);
+            println!("[{label}] H={h} KVH={kvh} D={d} (per-layer, per decode step):");
+            for &n in &[4usize, 8, 16] {
+                for &l in &[64usize, 256] {
+                    // N single-sequence paged caches (1 layer), each prefilled to length L.
+                    let mut caches: Vec<PagedKvCache> =
+                        (0..n).map(|_| PagedKvCache::new(1, block_size)).collect();
+                    for (i, c) in caches.iter_mut().enumerate() {
+                        for t in 0..l {
+                            let p = (i * 7 + t) as f64 * 0.01;
+                            c.update(0, &mk(1, kvh, d, p), &mk(1, kvh, d, p + 3.0))
+                                .unwrap();
+                        }
+                    }
+                    // This step's batched projection: q [n, H, 1, d], new k/v [n, KVH, 1, d].
+                    let q = cat0((0..n).map(|i| mk(1, h, d, i as f64 * 0.3)).collect());
+                    let k_step = cat0((0..n).map(|i| mk(1, kvh, d, 9.0 + i as f64)).collect());
+                    let v_step = cat0((0..n).map(|i| mk(1, kvh, d, 13.0 + i as f64)).collect());
+
+                    let (mut t_gather, mut t_build, mut t_kernel) = (0f64, 0f64, 0f64);
+                    for it in 0..(warmup + iters) {
+                        // gather: per-seq narrow+contiguous of the projection, append + paged gather.
+                        device.synchronize().unwrap();
+                        let t0 = Instant::now();
+                        let mut gathered = Vec::with_capacity(n);
+                        for (i, c) in caches.iter_mut().enumerate() {
+                            let ki = k_step.narrow(0, i, 1).unwrap().contiguous().unwrap();
+                            let vi = v_step.narrow(0, i, 1).unwrap().contiguous().unwrap();
+                            gathered.push(c.update(0, &ki, &vi).unwrap());
+                        }
+                        device.synchronize().unwrap();
+                        let t1 = Instant::now();
+                        // build: pack the ragged varlen layout.
+                        let vin = super::build_varlen_inputs(&q, &gathered).unwrap();
+                        device.synchronize().unwrap();
+                        let t2 = Instant::now();
+                        // kernel: the one flash_attn_varlen call.
+                        let _out = candle_flash_attn::flash_attn_varlen(
+                            &vin.q, &vin.k, &vin.v, &vin.cu_q, &vin.cu_k, vin.max_q, vin.max_k,
+                            scale, true,
+                        )
+                        .unwrap();
+                        device.synchronize().unwrap();
+                        let t3 = Instant::now();
+                        if it >= warmup {
+                            t_gather += (t1 - t0).as_secs_f64();
+                            t_build += (t2 - t1).as_secs_f64();
+                            t_kernel += (t3 - t2).as_secs_f64();
+                        }
+                    }
+                    let us = |s: f64| s / iters as f64 * 1e6;
+                    let (g, bd, kn) = (us(t_gather), us(t_build), us(t_kernel));
+                    let removable = 100.0 * (g + bd) / (g + bd + kn);
+                    println!(
+                        "  N={n:<2} L={l:<4} gather {g:7.1}us | build {bd:7.1}us | \
+                         kernel {kn:7.1}us | gather+build = {removable:3.0}% of attn"
+                    );
+                }
+            }
+        }
     }
 }
