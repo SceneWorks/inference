@@ -10,19 +10,27 @@
 //! `Throughput` path) — so the cache is a drop-in behind the [`KvCache`](crate::primitives::KvCache)
 //! trait and the decoder never changes.
 //!
-//! ## Pooled storage (story 7453)
+//! ## Pooled storage (stories 7453, 7467)
 //! The pool stores each layer's keys/values as **one** contiguous tensor
 //! `[capacity · block_size, n_kv_heads, head_dim]` (token-major — block `id` owns the contiguous row
-//! range `[id · block_size, (id+1) · block_size)`), rather than a `Vec` of per-block tensors. Two
-//! consequences make the batched gather cheap:
-//! - **Writes are in place.** A new token's key/value is written into its physical slot with
-//!   [`Tensor::slice_set`] — a bounded `copy2d`, no whole-pool copy and no per-block tensor churn.
+//! range `[id · block_size, (id+1) · block_size)`), rather than a `Vec` of per-block tensors. Three
+//! consequences make both the batched gather and the batched write cheap:
 //! - **A gather is one kernel.** A sequence's tokens (or, in the continuous `Throughput` step, *every*
 //!   active sequence's tokens at once) gather with a single [`Tensor::index_select`] over a token-slot
 //!   index tensor, instead of an `O(blocks)` `cat`. Because the rows are already token-major, the
 //!   gather feeds the varlen kernel's `[Σ lₖ, n_kv_heads, head_dim]` layout with no per-sequence
 //!   `squeeze`/`transpose`/`cat`. This is what removes the host-dispatch-bound gather that flatlined
-//!   the continuous `Throughput` decode (sc-7258's measurement → this story).
+//!   the continuous `Throughput` decode (sc-7258's measurement → sc-7453).
+//! - **A batched write is one kernel** (story 7467). The continuous `Throughput` step scatters *every*
+//!   active sequence's new token into its pooled slot with a single in-place [`Tensor::scatter_set`]
+//!   per side ([`BlockPool::scatter_write`]) over a target-slot index — the write-side analogue of the
+//!   gather — instead of an `O(N)` per-sequence [`Tensor::slice_set`] loop. With the gather collapsed
+//!   by sc-7453 the per-sequence write was the residual launch-latency cost (sc-7453's measurement →
+//!   this story); `scatter_set` touches only the written rows (no whole-pool copy, unlike the
+//!   allocating `scatter`/`index_add`).
+//! - **Single-sequence writes stay in place.** The `update` (`Exact`/drop-in) path writes one
+//!   sequence's run into its physical slot with [`Tensor::slice_set`] — a bounded `copy2d`, no
+//!   whole-pool copy and no per-block tensor churn.
 //!
 //! ## Why paging
 //! A growing-concat cache reserves nothing it does not use, but it also cannot **share** storage. The
@@ -246,6 +254,32 @@ impl BlockPool {
             store.v[layer].index_select(index, 0)?,
         ))
     }
+
+    /// **Batched fused write (story 7467).** Scatter this step's new keys/values for `layer` into the
+    /// pool with **one** in-place [`Tensor::scatter_set`] per side, replacing the continuous
+    /// `Throughput` path's `O(N)` per-sequence [`BlockPool::write_run`]/`slice_set` loop. `k`/`v` are
+    /// the whole batch's new tokens token-major `[Σ rows, n_kv_heads, head_dim]` (sequence order), and
+    /// `index` is the matching `[Σ rows, n_kv_heads, head_dim]` u32 target-slot tensor — element
+    /// `(t, ·, ·)` is token `t`'s physical pool row, broadcast across the head/dim columns the scatter
+    /// preserves. `scatter_set` writes **only** the `Σ rows` referenced rows (no whole-pool copy, unlike
+    /// the allocating `scatter`/`index_add`), so this is the write-side analogue of the single
+    /// `index_select` gather. Block boundaries need no run-splitting — the scattered rows may be
+    /// physically non-contiguous.
+    pub fn scatter_write(
+        &self,
+        layer: usize,
+        index: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .expect("pool store initialized before scatter write");
+        store.k[layer].scatter_set(index, k, 0)?;
+        store.v[layer].scatter_set(index, v, 0)?;
+        Ok(())
+    }
 }
 
 /// A single sequence's paged KV cache: a block table into a [`BlockPool`] plus the token→physical-slot
@@ -348,6 +382,14 @@ impl PagedKvCache {
     /// `Throughput` step concatenates across the batch.
     pub fn token_slots(&self) -> &[u32] {
         &self.slots
+    }
+
+    /// This step's newly-reserved token slots (a suffix of [`token_slots`](PagedKvCache::token_slots),
+    /// length equal to the last [`reserve_step`](PagedKvCache::reserve_step)'s `s`) — the per-sequence
+    /// target rows the continuous `Throughput` step concatenates across the batch into the one fused
+    /// [`BlockPool::scatter_write`] index.
+    pub fn new_token_slots(&self) -> &[u32] {
+        &self.new_slots
     }
 
     /// Logical token length (the [`KvCache::offset`] for the next step).
@@ -855,6 +897,92 @@ mod tests {
             .chain([207.0, 208.0])
             .collect();
         assert_eq!(b_rows, expect_b);
+    }
+
+    #[test]
+    fn scatter_write_matches_per_seq_loop() {
+        // The story 7467 fused write (one `scatter_set` over a broadcast slot index) must land the
+        // exact same bytes in the pool as the O(N) per-sequence `write_step_rows`/`slice_set` loop it
+        // replaces — over a ragged batch whose new tokens cross block boundaries (non-contiguous slots).
+        let bs = 4usize;
+        let (kvh, hd) = (2usize, 3usize);
+        // Two pools so the two write strategies start from identical (separately prefilled) state.
+        let pool_loop = BlockPool::new(bs);
+        let pool_scat = BlockPool::new(bs);
+        // Differing prefill lengths so the per-sequence block tables (and new-token slots) diverge;
+        // length 4 lands exactly on a boundary so its next token opens a fresh block (non-contiguous).
+        let lens = [3usize, 4, 7];
+        let mk_caches = |pool: &Rc<RefCell<BlockPool>>| -> Vec<PagedKvCache> {
+            lens.iter()
+                .enumerate()
+                .map(|(i, &l)| {
+                    let mut c = PagedKvCache::with_pool(pool.clone(), 1);
+                    let k = seq(kvh, l, hd, i as f32 * 1000.0);
+                    c.update(0, &k, &k).unwrap();
+                    c
+                })
+                .collect()
+        };
+        let mut caches_loop = mk_caches(&pool_loop);
+        let mut caches_scat = mk_caches(&pool_scat);
+
+        // This step's new token per sequence (distinct, non-colliding values), head-major [1,kvh,1,hd].
+        let new_k: Vec<Tensor> = (0..lens.len())
+            .map(|i| seq(kvh, 1, hd, 50_000.0 + i as f32 * 100.0))
+            .collect();
+        let new_v: Vec<Tensor> = (0..lens.len())
+            .map(|i| seq(kvh, 1, hd, 90_000.0 + i as f32 * 100.0))
+            .collect();
+
+        // (a) per-sequence loop: reserve + write each sequence's row via slice_set.
+        for (i, c) in caches_loop.iter_mut().enumerate() {
+            c.reserve_step(1).unwrap();
+            c.write_step_layer(0, &new_k[i], &new_v[i]).unwrap();
+        }
+
+        // (b) fused scatter: reserve, build the broadcast slot index over all sequences' new slots, and
+        // scatter the batch's new tokens (token-major [ΣS, kvh, hd]) in one call per side.
+        for c in caches_scat.iter_mut() {
+            c.reserve_step(1).unwrap();
+        }
+        let cols = kvh * hd;
+        let mut wslots: Vec<u32> = Vec::new();
+        for c in &caches_scat {
+            for &slot in c.new_token_slots() {
+                for _ in 0..cols {
+                    wslots.push(slot);
+                }
+            }
+        }
+        let total_new = wslots.len() / cols;
+        let index = Tensor::from_vec(wslots, (total_new, kvh, hd), &Device::Cpu).unwrap();
+        // Pack the per-sequence new tokens token-major [ΣS, kvh, hd] (squeeze head-major [1,kvh,1,hd]).
+        let to_tm = |t: &Tensor| {
+            t.squeeze(0)
+                .unwrap()
+                .transpose(0, 1)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+        };
+        let k_tm = Tensor::cat(&new_k.iter().map(to_tm).collect::<Vec<_>>(), 0).unwrap();
+        let v_tm = Tensor::cat(&new_v.iter().map(to_tm).collect::<Vec<_>>(), 0).unwrap();
+        pool_scat
+            .borrow()
+            .scatter_write(0, &index, &k_tm, &v_tm)
+            .unwrap();
+
+        // Gather each sequence's full KV from both pools — must be bit-identical.
+        for (cl, cs) in caches_loop.iter_mut().zip(caches_scat.iter_mut()) {
+            let (kl, vl) = cl.gather_head_major(0).unwrap();
+            let (ks, vs) = cs.gather_head_major(0).unwrap();
+            assert_eq!(host(&kl), host(&ks), "keys: scatter write != per-seq loop");
+            assert_eq!(
+                host(&vl),
+                host(&vs),
+                "values: scatter write != per-seq loop"
+            );
+        }
     }
 
     #[test]

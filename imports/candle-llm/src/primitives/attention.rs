@@ -463,24 +463,26 @@ mod tests {
         assert!(diff < 3e-2, "varlen vs eager per-seq max|Δ| = {diff}");
     }
 
-    /// **sc-7453 gather-collapse bench** (the sc-7258 cost split, re-pointed at the pooled gather).
-    /// Within the continuous `Throughput` per-sequence attention path, split the per-layer, per-step
-    /// cost into **write** (in-place `slice_set` of the step's new token per sequence), **gather** (the
-    /// **single** pooled `index_select` over every active sequence's token slots), **build** (the
+    /// **sc-7453 → sc-7467 cost-split bench.** Within the continuous `Throughput` per-sequence
+    /// attention path, split the per-layer, per-step cost into **write_loop** (the pre-7467 `O(N)`
+    /// per-sequence in-place `slice_set` of the step's new token), **write_scatter** (story 7467's
+    /// **one** in-place `scatter_set` per side over the same slots — the production path), **gather**
+    /// (the **single** pooled `index_select` over every active sequence's token slots), **build** (the
     /// `q`-packing + `cu_seqlens` host/device prep), and the **`flash_attn_varlen` kernel**.
     ///
-    /// Before sc-7453 the gather was an `O(N · blocks)` host-dispatch-bound `cat` per sequence that
-    /// dominated the path (~99% — the sc-7258 finding). This story replaces it with one `index_select`
-    /// over a pooled per-layer KV tensor: the **gather** column here is now a **flat** ~70–110 µs
-    /// regardless of N (the targeted collapse). The new visible cost is the per-sequence **write** (one
-    /// in-place `slice_set` of the step's token per sequence) — but each phase is `synchronize()`-
-    /// bracketed, so that column is launch-latency-dominated; across the real decode's many layers the
-    /// writes pipeline on the stream (the realized end-to-end throughput is `attention_bottleneck_bound`,
-    /// which rises 2.7–3.7× at N=16). Run at the two real test-model head shapes across occupancy (N)
-    /// and context (L). Needs `--features flash-attn` + CUDA; `#[ignore]`d (a bench, not a gate).
+    /// Two collapses are visible here. sc-7453 already replaced an `O(N · blocks)` per-sequence `cat`
+    /// gather (~99% of the path — the sc-7258 finding) with one `index_select`, so **gather** is now a
+    /// **flat** ~70–110 µs regardless of N. That left the per-sequence **write** as the residual
+    /// launch-latency cost (`O(N)` `slice_set` launches, ~86–95% of the sync-bracketed path at N=16);
+    /// sc-7467 collapses it too — **write_scatter** is one `scatter_set` per side, so it should be flat
+    /// in N like the gather while **write_loop** climbs. Each phase is `synchronize()`-bracketed, so
+    /// these columns are launch-latency-dominated; across the real decode's many layers the writes
+    /// pipeline on the stream, and the realized end-to-end throughput is `attention_bottleneck_bound`.
+    /// Run at the two real test-model head shapes across occupancy (N) and context (L). Needs
+    /// `--features flash-attn` + CUDA; `#[ignore]`d (a bench, not a gate).
     #[cfg(feature = "flash-attn")]
     #[test]
-    #[ignore = "sc-7453 gather-collapse bench; needs CUDA"]
+    #[ignore = "sc-7453/7467 cost-split bench; needs CUDA"]
     fn paged_attention_path_cost_on_cuda() {
         use crate::primitives::kv_cache::KvCache;
         use crate::primitives::{BlockPool, PagedKvCache};
@@ -531,10 +533,11 @@ mod tests {
                     let k_step = cat0((0..n).map(|i| mk(1, kvh, d, 9.0 + i as f64)).collect());
                     let v_step = cat0((0..n).map(|i| mk(1, kvh, d, 13.0 + i as f64)).collect());
 
-                    let (mut t_write, mut t_gather, mut t_build, mut t_kernel) =
-                        (0f64, 0f64, 0f64, 0f64);
+                    let cols = kvh * d;
+                    let (mut t_wloop, mut t_wscat, mut t_gather, mut t_build, mut t_kernel) =
+                        (0f64, 0f64, 0f64, 0f64, 0f64);
                     for it in 0..(warmup + iters) {
-                        // write: reserve the step + in-place slice_set the new token per sequence.
+                        // write_loop (pre-7467): reserve the step + O(N) per-sequence in-place slice_set.
                         device.synchronize().unwrap();
                         let t0 = Instant::now();
                         for (i, c) in caches.iter_mut().enumerate() {
@@ -545,6 +548,39 @@ mod tests {
                         }
                         device.synchronize().unwrap();
                         let t1 = Instant::now();
+                        // write_scatter (story 7467): ONE in-place scatter_set per side over the same
+                        // just-reserved slots — the production path. The slot index is broadcast across
+                        // the kvh*d columns the scatter preserves (built once per step in reality).
+                        let mut wslots: Vec<u32> = Vec::new();
+                        for c in &caches {
+                            for &slot in c.new_token_slots() {
+                                for _ in 0..cols {
+                                    wslots.push(slot);
+                                }
+                            }
+                        }
+                        let total_new = wslots.len() / cols;
+                        let w_index =
+                            Tensor::from_vec(wslots, (total_new, kvh, d), &device).unwrap();
+                        let k_sc = k_step
+                            .transpose(1, 2)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((total_new, kvh, d))
+                            .unwrap();
+                        let v_sc = v_step
+                            .transpose(1, 2)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((total_new, kvh, d))
+                            .unwrap();
+                        pool.borrow()
+                            .scatter_write(0, &w_index, &k_sc, &v_sc)
+                            .unwrap();
+                        device.synchronize().unwrap();
+                        let t1s = Instant::now();
                         // gather: ONE index_select over every sequence's token slots, concatenated.
                         let mut idx: Vec<u32> = Vec::new();
                         let mut cu_k = vec![0u32];
@@ -582,18 +618,24 @@ mod tests {
                         device.synchronize().unwrap();
                         let t4 = Instant::now();
                         if it >= warmup {
-                            t_write += (t1 - t0).as_secs_f64();
-                            t_gather += (t2 - t1).as_secs_f64();
+                            t_wloop += (t1 - t0).as_secs_f64();
+                            t_wscat += (t1s - t1).as_secs_f64();
+                            t_gather += (t2 - t1s).as_secs_f64();
                             t_build += (t3 - t2).as_secs_f64();
                             t_kernel += (t4 - t3).as_secs_f64();
                         }
                     }
                     let us = |s: f64| s / iters as f64 * 1e6;
-                    let (w, g, bd, kn) = (us(t_write), us(t_gather), us(t_build), us(t_kernel));
-                    let non_kernel = 100.0 * (w + g + bd) / (w + g + bd + kn);
+                    let (wl, ws, g, bd, kn) = (
+                        us(t_wloop),
+                        us(t_wscat),
+                        us(t_gather),
+                        us(t_build),
+                        us(t_kernel),
+                    );
                     println!(
-                        "  N={n:<2} L={l:<4} write {w:6.1}us | gather {g:6.1}us | build {bd:6.1}us | \
-                         kernel {kn:6.1}us | non-kernel = {non_kernel:3.0}% of attn"
+                        "  N={n:<2} L={l:<4} write_loop {wl:6.1}us -> write_scatter {ws:6.1}us | \
+                         gather {g:6.1}us | build {bd:6.1}us | kernel {kn:6.1}us"
                     );
                 }
             }
