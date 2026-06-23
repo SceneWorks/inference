@@ -469,6 +469,18 @@ impl CausalLm {
                 positions.len()
             )));
         }
+        // Story 7485: a batched **prefill** wave's caches are fresh (never written), so `reserve_step`
+        // would fail for lack of a pool store; seed it from the model's cfg head shape + compute dtype
+        // + device (idempotent — a no-op on every decode step, where the lanes already prefilled). The
+        // shared pool means seeding via any one cache initializes it for the whole wave.
+        if let Some(c) = caches.first() {
+            c.ensure_pool_store(
+                self.cfg.num_kv_heads as usize,
+                self.cfg.head_dim as usize,
+                self.dtype,
+                &self.device,
+            )?;
+        }
         // Story 7453: reserve this step's positions for every sequence (advance the block tables), then
         // build the **one** gather index spanning all sequences' pooled token slots — the per-layer
         // attention does a single `index_select`, not an O(N) per-sequence gather.
