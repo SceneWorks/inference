@@ -86,6 +86,13 @@ pub struct Message {
     pub role: Role,
     /// The ordered content of the turn (text and/or images).
     pub content: Vec<Content>,
+    /// An assistant turn's prior reasoning ("thinking"), separated from [`content`](Self::content) —
+    /// the multi-turn input dual of [`TextLlmOutput::thinking`](crate::TextLlmOutput::thinking).
+    /// `None` for non-reasoning turns. When set, it is exposed to a chat template as the standard
+    /// `reasoning_content` (and `thinking`) message field, so a reasoning model's template can
+    /// re-render or strip prior-turn reasoning per its own policy (e.g. Qwen3 keeps it only for the
+    /// most recent turn). Carry back a previous turn's `output.thinking` here to round-trip faithfully.
+    pub thinking: Option<String>,
 }
 
 impl Message {
@@ -94,7 +101,15 @@ impl Message {
         Self {
             role,
             content: vec![Content::Text(text.into())],
+            thinking: None,
         }
+    }
+
+    /// Attach prior reasoning ("thinking") to this turn (builder style); typically an assistant turn
+    /// carrying a previous generation's [`TextLlmOutput::thinking`](crate::TextLlmOutput::thinking).
+    pub fn with_thinking(mut self, thinking: impl Into<String>) -> Self {
+        self.thinking = Some(thinking.into());
+        self
     }
 
     /// A system text turn.
@@ -151,5 +166,14 @@ mod tests {
         assert_eq!(m.role, Role::User);
         assert_eq!(m.text_content(), "hi");
         assert!(!m.has_image());
+        assert_eq!(m.thinking, None);
+    }
+
+    #[test]
+    fn with_thinking_attaches_reasoning() {
+        let m = Message::assistant("the answer").with_thinking("the reasoning");
+        assert_eq!(m.role, Role::Assistant);
+        assert_eq!(m.text_content(), "the answer");
+        assert_eq!(m.thinking.as_deref(), Some("the reasoning"));
     }
 }
