@@ -33,6 +33,36 @@ impl Default for Sampling {
     }
 }
 
+/// Whether a model's reasoning ("thinking") mode is requested for a generation.
+///
+/// Reasoning models (e.g. Qwen3) gate an internal `<think>…</think>` chain on an `enable_thinking`
+/// chat-template kwarg. This enum is the backend-neutral control: it maps 1:1 to the
+/// `transformers` `chat_template_kwargs={"enable_thinking": …}` semantics via
+/// [`enable_thinking_kwarg`](TextLlmRequest::enable_thinking_kwarg). A provider only honors it when
+/// it advertises [`supports_thinking`](crate::TextLlmCapabilities::supports_thinking).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThinkingMode {
+    /// Use the model/template default — omit the kwarg entirely (the template decides).
+    #[default]
+    Auto,
+    /// Request reasoning **on** (`enable_thinking=true`).
+    Enabled,
+    /// Request reasoning **off** — "no-think" (`enable_thinking=false`).
+    Disabled,
+}
+
+impl ThinkingMode {
+    /// The `enable_thinking` chat-template kwarg this mode maps to: `None` for [`Auto`](Self::Auto)
+    /// (omit it, so the template's `is defined` test is false), else `Some(bool)`.
+    pub fn enable_thinking_kwarg(self) -> Option<bool> {
+        match self {
+            ThinkingMode::Auto => None,
+            ThinkingMode::Enabled => Some(true),
+            ThinkingMode::Disabled => Some(false),
+        }
+    }
+}
+
 impl Sampling {
     /// Deterministic greedy decoding.
     pub fn greedy() -> Self {
@@ -67,6 +97,10 @@ pub struct TextLlmRequest {
     pub seed: Option<u64>,
     /// Optional output constraint (e.g. valid JSON).
     pub constraint: Option<Constraint>,
+    /// Reasoning ("thinking") mode. Honored only by providers advertising
+    /// [`supports_thinking`](crate::TextLlmCapabilities::supports_thinking); [`ThinkingMode::Auto`]
+    /// (the default) leaves the model's template default in place.
+    pub thinking: ThinkingMode,
     /// Extra stop strings (beyond the model's own EOS tokens).
     pub stop: Vec<String>,
     /// Cooperative cancellation handle.
@@ -86,6 +120,13 @@ impl TextLlmRequest {
     /// Whether any message carries image content (vision input).
     pub fn has_image(&self) -> bool {
         self.messages.iter().any(crate::message::Message::has_image)
+    }
+
+    /// The `enable_thinking` chat-template kwarg for this request's [`thinking`](Self::thinking)
+    /// mode (`None` ⇒ omit it / use the template default). Feed into
+    /// [`RenderOptions`](crate::template::RenderOptions).
+    pub fn enable_thinking_kwarg(&self) -> Option<bool> {
+        self.thinking.enable_thinking_kwarg()
     }
 }
 

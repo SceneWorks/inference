@@ -22,8 +22,8 @@
 //! with a combined message.
 
 use core_llm::{
-    Content, Error, FinishReason, ImageRef, Message, Role, Sampling, StreamEvent, TextLlm,
-    TextLlmRequest, VERSION,
+    Channel, Content, Error, FinishReason, ImageRef, Message, Role, Sampling, StreamEvent, TextLlm,
+    TextLlmRequest, ThinkingMode, VERSION,
 };
 
 /// Configures the conformance run: the prompt, token budget, the sampling used for the determinism
@@ -98,12 +98,13 @@ pub fn textllm_conformance(make: impl Fn() -> Box<dyn TextLlm>, profile: &TextLl
     let p: &dyn TextLlm = provider.as_ref();
 
     let mut failures: Vec<String> = Vec::new();
-    let with_profile: [ProfileCheck; 5] = [
+    let with_profile: [ProfileCheck; 6] = [
         check_validate,
         check_streaming,
         check_mid_stream_cancel,
         check_seed_determinism,
         check_multimodal,
+        check_thinking,
     ];
     for f in with_profile {
         if let Err(e) = f(p, profile) {
@@ -190,12 +191,17 @@ pub fn check_streaming(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), 
 
     let mut indices = Vec::new();
     let mut streamed = String::new();
+    let mut streamed_thinking = String::new();
     let mut done: Option<(FinishReason, u32)> = None;
     let out = p
         .generate(&req, &mut |ev| match ev {
-            StreamEvent::Token { text, index, .. } => {
+            // Content deltas reconstruct output.text; thinking deltas reconstruct output.thinking.
+            StreamEvent::Token { text, index, channel, .. } => {
                 indices.push(index);
-                streamed.push_str(&text);
+                match channel {
+                    Channel::Thinking => streamed_thinking.push_str(&text),
+                    Channel::Content => streamed.push_str(&text),
+                }
             }
             StreamEvent::Done { finish_reason, usage } => {
                 done = Some((finish_reason, usage.generated_tokens));
@@ -232,7 +238,12 @@ pub fn check_streaming(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), 
     }
     if streamed != out.text {
         return Err(format!(
-            "check_streaming[{id}]: streamed token deltas do not reconstruct output.text"
+            "check_streaming[{id}]: streamed Content-channel deltas do not reconstruct output.text"
+        ));
+    }
+    if streamed_thinking != out.thinking.clone().unwrap_or_default() {
+        return Err(format!(
+            "check_streaming[{id}]: streamed Thinking-channel deltas do not reconstruct output.thinking"
         ));
     }
     Ok(())
@@ -365,6 +376,98 @@ pub fn check_multimodal(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(),
             )),
         }
     }
+}
+
+/// Thinking ("reasoning") handling is capability-honest. A non-thinking provider rejects an
+/// explicit enable as `Unsupported` (and accepts the no-op Auto / no-think modes). A thinking
+/// provider validates every mode, keeps the streamed reasoning channel in sync with
+/// `output.thinking`, and produces **no** reasoning for a no-think (Disabled) request.
+pub fn check_thinking(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), String> {
+    let id = p.descriptor().id.clone();
+    let supports = p.descriptor().capabilities.supports_thinking;
+    let with_mode = |mode: ThinkingMode| {
+        let mut r = profile.greedy_request();
+        r.thinking = mode;
+        r
+    };
+
+    if !supports {
+        // An explicit enable is unsatisfiable → reject as Unsupported (never silently ignore).
+        match p.validate(&with_mode(ThinkingMode::Enabled)) {
+            Err(Error::Unsupported(_)) => {}
+            Err(other) => {
+                return Err(format!(
+                    "check_thinking[{id}]: enable-thinking rejected, but not as Error::Unsupported: {other:?}"
+                ));
+            }
+            Ok(()) => {
+                return Err(format!(
+                    "check_thinking[{id}]: accepted an explicit enable-thinking request despite supports_thinking=false"
+                ));
+            }
+        }
+        // Auto and no-think are no-ops for a model that never reasons → must be accepted.
+        for mode in [ThinkingMode::Auto, ThinkingMode::Disabled] {
+            if let Err(e) = p.validate(&with_mode(mode)) {
+                return Err(format!(
+                    "check_thinking[{id}]: rejected {mode:?} despite it being a no-op for a non-thinking model: {e}"
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    // Thinking-capable: every mode validates.
+    for mode in [ThinkingMode::Auto, ThinkingMode::Enabled, ThinkingMode::Disabled] {
+        p.validate(&with_mode(mode))
+            .map_err(|e| format!("check_thinking[{id}]: thinking provider rejected {mode:?}: {e}"))?;
+    }
+
+    // Stream/result sync: the streamed channels must reconstruct (text, thinking). Run with Auto —
+    // the model decides whether to reason; this asserts consistency, not that it reasons.
+    let mut content = String::new();
+    let mut thinking = String::new();
+    let out = p
+        .generate(&with_mode(ThinkingMode::Auto), &mut |ev| {
+            if let StreamEvent::Token { text, channel, .. } = ev {
+                match channel {
+                    Channel::Thinking => thinking.push_str(&text),
+                    Channel::Content => content.push_str(&text),
+                }
+            }
+        })
+        .map_err(|e| format!("check_thinking[{id}]: generate() failed: {e}"))?;
+    if content != out.text {
+        return Err(format!(
+            "check_thinking[{id}]: streamed Content-channel deltas do not reconstruct output.text"
+        ));
+    }
+    if thinking != out.thinking.clone().unwrap_or_default() {
+        return Err(format!(
+            "check_thinking[{id}]: streamed Thinking-channel deltas do not reconstruct output.thinking"
+        ));
+    }
+
+    // No-think: a Disabled request must produce no reasoning at all.
+    let mut saw_thinking = false;
+    let nout = p
+        .generate(&with_mode(ThinkingMode::Disabled), &mut |ev| {
+            if let StreamEvent::Token { channel: Channel::Thinking, .. } = ev {
+                saw_thinking = true;
+            }
+        })
+        .map_err(|e| format!("check_thinking[{id}]: no-think generate() failed: {e}"))?;
+    if saw_thinking {
+        return Err(format!(
+            "check_thinking[{id}]: no-think (Disabled) request emitted a Thinking-channel token"
+        ));
+    }
+    if nout.thinking.as_deref().is_some_and(|t| !t.is_empty()) {
+        return Err(format!(
+            "check_thinking[{id}]: no-think (Disabled) request produced reasoning in output.thinking"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
