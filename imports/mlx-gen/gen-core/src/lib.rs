@@ -14,6 +14,7 @@ pub mod caption;
 pub mod error;
 pub mod face;
 pub mod generator;
+pub mod image_embed;
 pub mod imageops;
 pub mod json_constraint;
 pub mod media;
@@ -38,11 +39,12 @@ pub use generator::{
     GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
     ReplacementMode, VideoClipRef,
 };
+pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
 pub use media::{AudioTrack, Image};
 pub use registry::{
-    load, load_captioner, load_transform, CaptionerRegistration, ModelRegistration,
-    TransformRegistration,
+    load, load_captioner, load_image_embedder, load_transform, CaptionerRegistration,
+    ImageEmbedderRegistration, ModelRegistration, TransformRegistration,
 };
 pub use registry::{load_textllm, TextLlmRegistration};
 pub use registry::{load_trainer, TrainerRegistration};

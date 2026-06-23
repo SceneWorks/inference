@@ -595,6 +595,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-clip"
+version = "0.0.0"
+dependencies = [
+ "inventory",
+ "mlx-gen",
+ "mlx-gen-sdxl",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-face"
 version = "0.0.0"
 dependencies = [

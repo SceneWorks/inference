@@ -1,0 +1,17 @@
+[package]
+name = "mlx-gen-clip"
+version = "0.0.0"
+edition = "2021"
+description = "CLIP ViT-L/14 image-embedding provider crate for mlx-gen (Dataset Doctor, sc-6535)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "clip", "embedding", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Reuse the CLIP ViT body + preprocessing (same crate-reuse pattern as mlx-gen-flux → mlx-gen-sdxl;
+# no dependency cycle). The visual_projection head is local (it's the only piece that differs).
+mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
+mlx-rs = { workspace = true }
+inventory = { workspace = true }
