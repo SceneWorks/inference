@@ -27,9 +27,11 @@
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use rand::rngs::StdRng;
+use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::DiscreteModelSampling;
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 
@@ -83,6 +85,27 @@ pub fn seeded_prior(
     );
     let noise = draw_noise(rng, LATENT_CHANNELS, lh, lw, device)?;
     Ok(sampler.scale_prior_noise(&noise)?.to_dtype(dtype)?)
+}
+
+/// Draw the curated **VE σ-space** prior latents `noise · σ_max` for a `width × height` render — the
+/// launch-portable (sc-3673) seeded CPU draw the curated [`denoise_curated`] path starts from, vs the
+/// ancestral [`seeded_prior`]'s `σ·rsqrt(σ²+1)` scaling. `seed` keys the draw; the result is f32 (the
+/// σ-space math stays f32 — [`denoise_curated`] casts to the UNet compute dtype per eval). Returns NCHW
+/// `[1, 4, height/8, width/8]` on `device`.
+pub fn seeded_sigma_prior(
+    seed: u64,
+    width: u32,
+    height: u32,
+    sigma_max: f32,
+    device: &Device,
+) -> Result<Tensor> {
+    let (lh, lw) = (
+        (height / SPATIAL_SCALE) as usize,
+        (width / SPATIAL_SCALE) as usize,
+    );
+    let mut rng = StdRng::seed_from_u64(seed);
+    let noise = draw_noise(&mut rng, LATENT_CHANNELS, lh, lw, device)?;
+    Ok((noise * sigma_max as f64)?)
 }
 
 /// Preprocess a ControlNet control image (the InstantID kps / OpenPose skeleton) for the candle UNet:
@@ -311,6 +334,124 @@ pub fn denoise_ip_control(
         std::slice::from_ref(control),
         controlnet_encoder,
     )
+}
+
+/// Curated unified-sampler **conditioned** denoise (epic 7114, sc-7297) — the **additive** k-diffusion
+/// alternative to InstantID's bespoke ancestral default and Kolors' bespoke leading-Euler default, the
+/// candle twin of `mlx-gen-sdxl::denoise_curated`. Drives any curated [`gen_core::sampling::Solver`]
+/// (`euler` / `euler_ancestral` / `heun` / `dpmpp_2m` / `dpmpp_sde` / `uni_pc` / `lcm` / `ddim`) over a
+/// [`DiscreteModelSampling`] (ε-prediction) + a resolved σ schedule through the shared
+/// [`candle_gen::run_curated_sampler`], threading the SAME dual conditioning the bespoke loops carry:
+/// the summed ControlNet residuals (`controls`, the MultiControlNet rule) + the decoupled IP branch.
+///
+/// **The IP face/image tokens are NOT a parameter** — like [`denoise_ip_multi_control`], they are
+/// preconditioned on `unet` ([`UNet2DConditionModel::set_ip_context`], set once before this call; inert
+/// when cleared). The loop runs [`UNet2DConditionModel::forward_instantid`], which picks up whatever IP
+/// context is set, so one function serves ControlNet-only, IP-only, dual (InstantID), and plain modes.
+///
+/// The latents live in raw k-diffusion VE σ-space (`x = ε·σ_max` at the start — built by the caller);
+/// the UNet input is `x/√(σ²+1)` ([`DiscreteModelSampling::input_scale`]), cast to `dtype` (f16 for
+/// InstantID, f32 for Kolors) inside the predict closure. The conditioning `timestep` is the nearest
+/// training index ([`DiscreteModelSampling::timestep`]) — ComfyUI's behaviour for a discrete model under
+/// a curated solver. The output is returned in `dtype`, ready for the caller's decode.
+///
+/// `conditioning` / `pooled` / `time_ids` / `controlnet_encoder` are already **CFG-batched** by the
+/// caller (`[uncond, cond]`, the candle convention), as is each `ControlContext::cond_embed`; only the
+/// single-row σ-space latent is CFG-replicated here. `controlnet_encoder` is the cross-attention
+/// conditioning every branch shares (the face tokens for InstantID; the ControlNet's own text
+/// projection for Kolors) — unused when `controls` is empty (`control_encoder=None` in mlx terms).
+///
+/// N1: selected only when the request names a curated sampler/scheduler; the bespoke ancestral /
+/// leading-Euler defaults stay byte-exact (never entered here). Cancellation + progress route through
+/// the driver's `denoise` callback; the ancestral / dpmpp_sde noise comes from the seeded `seed`.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_curated(
+    unet: &UNet2DConditionModel,
+    sampler_name: Option<&str>,
+    ms: &DiscreteModelSampling,
+    sigmas: &[f32],
+    latents: Tensor,
+    conditioning: &Tensor,
+    pooled: &Tensor,
+    time_ids: &Tensor,
+    cfg: f64,
+    dtype: DType,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    controls: &[ControlContext],
+    controlnet_encoder: &Tensor,
+) -> Result<Tensor> {
+    let cfg_on = cfg > 1.0;
+    let out = candle_gen::run_curated_sampler(
+        sampler_name,
+        ms,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |x_in, timestep| -> Result<Tensor> {
+            // `x_in` is the `1/√(σ²+1)`-scaled latent (f32 from the solver); cast to the UNet compute
+            // dtype, then CFG-batch the single row to [uncond, cond].
+            let x = x_in.to_dtype(dtype)?;
+            let x_unet = if cfg_on {
+                Tensor::cat(&[&x, &x], 0)?
+            } else {
+                x
+            };
+            let t = timestep as f64;
+
+            // Sum each branch's (already `scale`'d) residuals — the MultiControlNet rule. One branch ⇒
+            // the single residual; zero ⇒ `None` (no injection). All branches share `controlnet_encoder`.
+            let mut combined: Option<ControlResiduals> = None;
+            for cc in controls {
+                let res = cc.controlnet.forward(
+                    &x_unet,
+                    &cc.cond_embed,
+                    t,
+                    controlnet_encoder,
+                    pooled,
+                    time_ids,
+                    cc.scale,
+                )?;
+                combined = Some(match combined {
+                    None => res,
+                    Some(prev) => prev.add(&res)?,
+                });
+            }
+
+            // The micro-conditioning forward + the decoupled IP branch (from the set context) + the
+            // (summed) control residuals.
+            let eps = match &combined {
+                Some(r) => unet.forward_instantid(
+                    &x_unet,
+                    t,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    Some(r.down.as_slice()),
+                    Some(&r.mid),
+                )?,
+                None => {
+                    unet.forward_instantid(&x_unet, t, conditioning, pooled, time_ids, None, None)?
+                }
+            };
+
+            // CFG combine: row 0 = uncond, row 1 = cond (the candle convention). Raw ε in f32 so the
+            // `DiscreteModelSampling` x0 recombine + solver math stay f32.
+            let eps = if cfg_on {
+                let chunks = eps.chunk(2, 0)?;
+                let (uncond, cond) = (&chunks[0], &chunks[1]);
+                (uncond + ((cond - uncond)? * cfg)?)?
+            } else {
+                eps
+            };
+            Ok(eps.to_dtype(DType::F32)?)
+        },
+    )?;
+    // Return in the compute dtype, ready for the caller's decode (matches the bespoke loops' latents).
+    Ok(out.to_dtype(dtype)?)
 }
 
 #[cfg(test)]
@@ -613,5 +754,124 @@ mod tests {
                 .any(|(x, y)| (x - y).abs() > 1e-4),
             "a positive ControlNet scale must change the denoise output"
         );
+    }
+
+    /// The curated conditioned denoise (sc-7297): drive a `DiscreteModelSampling` over a tiny σ schedule
+    /// with a single ControlNet branch + the set IP context. Preserves the latent shape, stays finite,
+    /// is deterministic for a fixed seed, and a positive ControlNet scale changes the output vs `0`
+    /// (the residuals reach the UNet through the curated path too). The CPU guard for the
+    /// `run_curated_sampler` wiring before the GPU/real-weight smoke (phase 5).
+    #[test]
+    fn denoise_curated_loop_with_controlnet() {
+        use candle_gen::gen_core::sampling::{AlphaSchedule, DiscreteModelSampling};
+
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut unet = build_unet(vb.clone(), &dev);
+        let c = cond(&dev);
+        unet.set_ip_context(Some(&c.ip_tokens), 0.8).unwrap();
+
+        let cn_cfg = ControlNetConfig {
+            unet: unet_cfg(),
+            addition_time_embed_dim: ADD_TIME_DIM,
+            projection_class_embeddings_input_dim: PROJ_DIM,
+            conditioning_channels: 3,
+            cond_block_out_channels: vec![4, 8, 16, 32],
+        };
+        let cn = ControlNet::new(vb, &cn_cfg).unwrap();
+        let control = Tensor::randn(0f32, 1f32, (2, 3, 64, 64), &dev).unwrap();
+        let cond_embed = cn.embed_cond(&control).unwrap();
+
+        // A short discrete σ schedule (trailing 0) over the SDXL ε contract.
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap();
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.5, 0.0];
+        // VE σ-space prior: unit noise · σ_max.
+        let prior =
+            (Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap() * sigmas[0] as f64).unwrap();
+
+        let run = |scale: f64| -> Tensor {
+            let cc = ControlContext {
+                controlnet: &cn,
+                cond_embed: cond_embed.clone(),
+                scale,
+            };
+            let cancel = CancelFlag::new();
+            let mut prog = |_p: Progress| {};
+            denoise_curated(
+                &unet,
+                Some("euler"),
+                &ms,
+                &sigmas,
+                prior.clone(),
+                &c.text,
+                &c.pooled,
+                &c.time_ids,
+                5.0,
+                DType::F32,
+                3,
+                &cancel,
+                &mut prog,
+                std::slice::from_ref(&cc),
+                &c.text, // the face/control cross-attn conditioning
+            )
+            .unwrap()
+        };
+
+        let active = run(0.9);
+        assert_eq!(active.dims(), &[1, 4, 8, 8]);
+        assert!(finite(&active));
+        // Determinism: same seed ⇒ identical.
+        assert_eq!(vals(&active), vals(&run(0.9)));
+        // scale = 0 ⇒ the zero-conv-scaled residuals vanish ⇒ the control has no effect.
+        let inactive = run(0.0);
+        assert!(
+            vals(&active)
+                .iter()
+                .zip(vals(&inactive).iter())
+                .any(|(x, y)| (x - y).abs() > 1e-4),
+            "a positive ControlNet scale must change the curated denoise output"
+        );
+    }
+
+    /// A pre-cancelled flag stops the curated denoise before any model eval (the driver bridges
+    /// `gen_core::Error::Canceled` ⇄ `CandleError::Canceled`).
+    #[test]
+    fn denoise_curated_honors_cancel() {
+        use candle_gen::gen_core::sampling::{AlphaSchedule, DiscreteModelSampling};
+
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut unet = build_unet(vb, &dev);
+        let c = cond(&dev);
+        unet.set_ip_context(Some(&c.ip_tokens), 0.8).unwrap();
+
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap();
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 0.0];
+        let prior = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap();
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let mut prog = |_p: Progress| {};
+        let err = denoise_curated(
+            &unet,
+            Some("euler"),
+            &ms,
+            &sigmas,
+            prior,
+            &c.text,
+            &c.pooled,
+            &c.time_ids,
+            5.0,
+            DType::F32,
+            3,
+            &cancel,
+            &mut prog,
+            &[],
+            &c.text,
+        );
+        assert!(matches!(err, Err(CandleError::Canceled)));
     }
 }

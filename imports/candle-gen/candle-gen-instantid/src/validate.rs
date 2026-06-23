@@ -213,6 +213,8 @@ fn real_weight_instantid() {
         ip_adapter_scale: 0.8,
         controlnet_scale: 0.8,
         openpose_scale: 0.7,
+        sampler: None,
+        scheduler: None,
         seed: 12345,
         cancel: CancelFlag::new(),
     };
