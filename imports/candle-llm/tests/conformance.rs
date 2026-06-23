@@ -25,7 +25,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_llm::primitives::sampler::{SplitMix64, TokenRng};
 use candle_llm::provider::PROVIDER_ID;
 use candle_llm::LlamaProvider;
-use core_llm::{LoadSpec, Quantize};
+use core_llm::{load_for_model, LoadSpec, Message, Quantize, TextLlmRequest};
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 
 const VOCAB: usize = 32;
@@ -189,4 +189,113 @@ fn gguf_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load gguf provider")),
         &TextLlmProfile::cheap(),
     );
+}
+
+// --- story 7406: model-first resolution (core_llm::load_for_model) over the weightless probe ---
+
+/// A `config.json`-only snapshot (no safetensors, no tokenizer) used to prove the `can_load` probe
+/// is weightless and architecture-aware.
+fn write_config_only(name: &str, config: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("candle-llm-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), config).unwrap();
+    dir
+}
+
+#[test]
+fn can_load_is_weightless_and_architecture_aware() {
+    // A directory with ONLY config.json (no shards): if the probe read weights this would fail. Each
+    // of candle's dispatched families is recognized weightlessly — the acceptance "additionally
+    // Gemma2/Phi3/GLM4/DeepSeek on candle-llm" at the resolution layer, without real weights.
+    for (name, arch, model_type) in [
+        ("llama", "LlamaForCausalLM", "llama"),
+        ("mistral", "MistralForCausalLM", "mistral"),
+        ("qwen3", "Qwen3ForCausalLM", "qwen3"),
+        ("qwen2moe", "Qwen2MoeForCausalLM", "qwen2_moe"),
+        ("gemma2", "Gemma2ForCausalLM", "gemma2"),
+        ("glm4", "Glm4ForCausalLM", "glm4"),
+        ("deepseek", "DeepseekV2ForCausalLM", "deepseek_v2"),
+        ("phi3", "Phi3ForCausalLM", "phi3"),
+    ] {
+        let dir = write_config_only(
+            &format!("canload-{name}"),
+            &format!(r#"{{"architectures":["{arch}"],"model_type":"{model_type}"}}"#),
+        );
+        let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
+        assert!(
+            candle_llm::provider::can_load(&spec),
+            "{name}: text provider must claim the snapshot weightlessly"
+        );
+        assert!(
+            !candle_llm::llava::can_load(&spec),
+            "{name}: vision provider must decline a text snapshot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An unsupported architecture is declined (no panic, no silent default).
+    let unknown = write_config_only(
+        "canload-unknown",
+        r#"{"architectures":["BertModel"],"model_type":"bert"}"#,
+    );
+    let uspec = LoadSpec::dense(unknown.to_str().unwrap().to_string());
+    assert!(!candle_llm::provider::can_load(&uspec));
+    let _ = std::fs::remove_dir_all(&unknown);
+
+    // A multimodal snapshot: the text provider declines (a `vision_config` is present even though
+    // the nested text arch is llama), the vision provider claims it.
+    let vlm = write_config_only(
+        "canload-vlm",
+        r#"{"architectures":["LlavaForConditionalGeneration"],"model_type":"llava",
+            "text_config":{"architectures":["LlamaForCausalLM"],"model_type":"llama"},
+            "vision_config":{"hidden_size":16}}"#,
+    );
+    let vspec = LoadSpec::dense(vlm.to_str().unwrap().to_string());
+    assert!(!candle_llm::provider::can_load(&vspec), "text provider must decline a VLM");
+    assert!(candle_llm::llava::can_load(&vspec), "vision provider must claim a VLM");
+    let _ = std::fs::remove_dir_all(&vlm);
+
+    // A `*.gguf` path is a text-model container the text provider accepts by extension (weightless),
+    // and which the vision provider declines.
+    let gguf = LoadSpec::dense("/models/whatever-Q4_K_M.gguf");
+    assert!(candle_llm::provider::can_load(&gguf), "text provider must accept a .gguf path");
+    assert!(!candle_llm::llava::can_load(&gguf));
+
+    // A nonexistent snapshot path is declined gracefully.
+    assert!(!candle_llm::provider::can_load(&LoadSpec::dense("/no/such/dir")));
+}
+
+#[test]
+fn load_for_model_resolves_synthetic_snapshot_without_naming_a_provider() {
+    let dir = write_snapshot();
+    let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
+
+    // No provider id named: the resolver reads config.json, picks the candle text provider via its
+    // can_load probe, loads it on CPU, and it generates — the full round-trip in CI.
+    let llm = load_for_model(&spec).expect("load_for_model resolves the synthetic snapshot");
+    assert_eq!(llm.descriptor().id, PROVIDER_ID);
+    assert_eq!(llm.descriptor().backend, "candle");
+
+    let req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 4);
+    let out = llm.complete(&req).expect("generate");
+    assert!(!out.text.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_for_model_unknown_architecture_is_a_typed_error() {
+    let dir = write_config_only(
+        "lfm-unknown",
+        r#"{"architectures":["BertModel"],"model_type":"bert"}"#,
+    );
+    let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
+    match load_for_model(&spec) {
+        Err(core_llm::Error::Unsupported(m)) => {
+            assert!(m.contains("no registered provider can serve"), "{m}");
+            assert!(m.contains("bert"), "error should surface the model arch: {m}");
+        }
+        Err(e) => panic!("expected Unsupported, got error: {e}"),
+        Ok(_) => panic!("expected Unsupported, got a loaded provider"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
