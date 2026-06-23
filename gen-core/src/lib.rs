@@ -60,6 +60,18 @@ pub use textllm::{
     TextLlmOutput, TextLlmRequest, TextLlmSampling,
 };
 pub use tiling::{TilingConfig, VaeTiling};
+
+// The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The
+// dependency is INVERTED: gen-core CONSUMES `core-llm` — the same way mlx-gen re-exports gen-core via
+// `pub use ::gen_core` — so a consumer that already pins gen-core reaches the unified
+// `core_llm::TextLlm` engine (and `core_llm::load_for_model` model-first resolution) through this one
+// path, with no separate core-llm pin. core-llm is itself tensor-free, preserving gen-core's invariant.
+//
+// This re-export is purely ADDITIVE: the legacy `gen_core::TextLlm` contract above stays in place
+// during the cutover so the existing provider crates keep building. As each provider migrates onto
+// `core_llm::TextLlm` (sc-7158 / sc-7404 / sc-7265), the legacy contract is retired — the closing step
+// of sc-7189.
+pub use ::core_llm;
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
 pub use train::{

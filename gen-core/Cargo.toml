@@ -23,3 +23,7 @@ tokenizers = { workspace = true }
 safetensors = { workspace = true }
 # JSON parse for the PEFT/diffusers `lora_adapter_metadata` header blob in weightsmeta (sc-5513).
 serde_json = { workspace = true }
+# The independent LLM-serving contract (epic 7153, sc-7189). gen-core re-exports it as
+# `gen_core::core_llm` so the gen-ai side consumes the unified `core_llm::TextLlm` engine. core-llm is
+# itself tensor-free, so depending on it keeps gen-core's zero-tensor invariant intact.
+core-llm = { workspace = true }
