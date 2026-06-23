@@ -139,6 +139,64 @@ impl BooguTextEncoder {
         }
         Ok(rms_norm(&hidden, &self.final_norm, self.eps)?)
     }
+
+    /// Multi-image-conditioned forward (Edit, `N ∈ [1, 5]` references). Splices each reference's
+    /// `image_embedsⱼ` (`[nⱼ, 4096]`) at its own contiguous `<|image_pad|>` run, runs the 36 decoder
+    /// layers under the 3-D interleaved MRoPE (positions advance `max(hⱼ, wⱼ)/merge` per image), and
+    /// injects each image's 3 `deepstack` features at its run after layers 0/1/2 — the multi-image
+    /// generalization of [`Self::last_hidden_with_image`] (`N = 1` is identical). `grids[j]` is image
+    /// `j`'s patch grid `[t, h, w]`, in the same order the runs appear in `input_ids`. `b = 1`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn last_hidden_with_image_multi(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        image_embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+        image_token_id: i32,
+    ) -> Result<Array> {
+        let sh = input_ids.shape();
+        let (b, s) = (sh[0], sh[1]);
+        let ids = host_i32(input_ids)?;
+
+        // One contiguous image-token run per reference image, in sequence order.
+        let runs = image_token_runs(&ids, image_token_id, s);
+        if runs.len() != image_embeds.len() || runs.len() != grids.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "boogu multi-image encode: {} image-token runs but {} embeds / {} grids",
+                runs.len(),
+                image_embeds.len(),
+                grids.len()
+            )));
+        }
+
+        // Token embeddings, then splice each image's vision embeds at its run.
+        let mut hidden = self.embed_tokens.forward(input_ids)?;
+        let dt = hidden.dtype();
+        for ((start, end), emb) in runs.iter().zip(image_embeds) {
+            let img = emb.expand_dims(0)?.as_dtype(dt)?; // [1, nⱼ, 4096]
+            hidden = replace_seq(&hidden, &img, *start, *end, s)?;
+        }
+
+        // 3-D interleaved MRoPE (per-image position advance) + causal mask.
+        let (pt, ph, pw) = mrope_positions_multi(&ids, image_token_id, grids);
+        let (cos, sin) = mrope_cos_sin(&pt, &ph, &pw, self.head_dim, self.rope_theta, dt)?;
+        let mask = build_mask(attention_mask, b, s)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
+            // Deepstack: add each image's layer-i feature at its run (LM layers 0/1/2).
+            for ((start, end), ds_img) in runs.iter().zip(deepstack) {
+                if i < ds_img.len() {
+                    let ds = ds_img[i].expand_dims(0)?.as_dtype(dt)?; // [1, nⱼ, 4096]
+                    let mid = add(&slice_seq(&hidden, *start, *end)?, &ds)?;
+                    hidden = replace_seq(&hidden, &mid, *start, *end, s)?;
+                }
+            }
+        }
+        Ok(rms_norm(&hidden, &self.final_norm, self.eps)?)
+    }
 }
 
 /// Slice `[b, s, d]` along the sequence axis (axis 1) to `[start, end)`.
@@ -188,6 +246,62 @@ fn mrope_positions(
     (pt, ph, pw)
 }
 
+/// Contiguous runs of `image_token_id` in `ids` (`[start, end)` per run), in sequence order — one run
+/// per reference image (the tokenizer separates images with `<|vision_end|><|vision_start|>` markers).
+fn image_token_runs(ids: &[i32], image_token_id: i32, s: i32) -> Vec<(i32, i32)> {
+    let mut runs = Vec::new();
+    let mut i = 0i32;
+    while i < s {
+        if ids[i as usize] == image_token_id {
+            let start = i;
+            while i < s && ids[i as usize] == image_token_id {
+                i += 1;
+            }
+            runs.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// Multi-image 3-D MRoPE positions (mirrors `get_rope_index` over `image_grid_thw`): text tokens
+/// advance `(i, i, i)`; the `k`-th image block (using `grids[k]`) at offset `cur` gets `t = cur`,
+/// `h = cur + row`, `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then
+/// `cur += max(h, w) / merge`. The single-image [`mrope_positions`] is the `grids.len() == 1` case.
+fn mrope_positions_multi(
+    ids: &[i32],
+    image_token_id: i32,
+    grids: &[[i32; 3]],
+) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let (mut pt, mut ph, mut pw) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cur = 0i32;
+    let mut img_i = 0usize;
+    let mut i = 0usize;
+    while i < ids.len() {
+        if ids[i] == image_token_id {
+            let g = grids[img_i];
+            let (llm_h, llm_w) = (g[1] / SPATIAL_MERGE, g[2] / SPATIAL_MERGE);
+            let step = g[1].max(g[2]) / SPATIAL_MERGE;
+            for idx in 0..(llm_h * llm_w) {
+                pt.push(cur);
+                ph.push(cur + idx / llm_w);
+                pw.push(cur + idx % llm_w);
+            }
+            cur += step;
+            i += (llm_h * llm_w) as usize;
+            img_i += 1;
+        } else {
+            pt.push(cur);
+            ph.push(cur);
+            pw.push(cur);
+            cur += 1;
+            i += 1;
+        }
+    }
+    (pt, ph, pw)
+}
+
 /// Build the interleaved-MRoPE `cos`/`sin` `[1, s, head_dim]` (cast to `dt`). Each of the `head_dim/2`
 /// frequencies takes its position from the T/H/W axis per the interleave: within the first
 /// `mrope_section[1]·3` indices, `j%3==1 → H`, `j%3==2 → W`, else `T` (the tail stays `T`).
@@ -225,4 +339,48 @@ fn mrope_cos_sin(
     }
     let arr = Array::from_slice(&emb, &[1, s as i32, head_dim]);
     Ok((arr.cos()?.as_dtype(dt)?, arr.sin()?.as_dtype(dt)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{image_token_runs, mrope_positions, mrope_positions_multi};
+
+    const IMG: i32 = 999;
+
+    /// Two image blocks of different sizes interleaved with text: the contiguous `<|image_pad|>` runs
+    /// are located correctly and in order.
+    #[test]
+    fn image_token_runs_finds_each_block() {
+        // [t t | img0×4 | t | img1×1 | t]
+        let ids = [1, 1, IMG, IMG, IMG, IMG, 1, IMG, 1];
+        assert_eq!(
+            image_token_runs(&ids, IMG, ids.len() as i32),
+            vec![(2, 6), (7, 8)]
+        );
+        // No image tokens → no runs.
+        assert!(image_token_runs(&[1, 2, 3], IMG, 3).is_empty());
+    }
+
+    /// MRoPE positions advance per image: image `k` sits at the running `cur`, its merged grid fills
+    /// the (t,h,w) axes, and `cur` then jumps by `max(h,w)/merge` — so the second image starts past
+    /// the first, and trailing text continues from there.
+    #[test]
+    fn mrope_positions_multi_advances_per_image() {
+        // img0 grid 4×4 (merge 2 ⇒ 2×2 = 4 tokens, step 2); img1 grid 2×2 (⇒ 1 token, step 1).
+        let ids = [1, 1, IMG, IMG, IMG, IMG, 1, IMG, 1];
+        let grids = [[1, 4, 4], [1, 2, 2]];
+        let (pt, ph, pw) = mrope_positions_multi(&ids, IMG, &grids);
+        assert_eq!(pt, vec![0, 1, 2, 2, 2, 2, 4, 5, 6]);
+        assert_eq!(ph, vec![0, 1, 2, 2, 3, 3, 4, 5, 6]);
+        assert_eq!(pw, vec![0, 1, 2, 3, 2, 3, 4, 5, 6]);
+    }
+
+    /// The single-image [`mrope_positions`] is exactly the one-grid case of the multi version.
+    #[test]
+    fn mrope_single_matches_multi_one_grid() {
+        let ids = [1, IMG, IMG, IMG, IMG, 1];
+        let single = mrope_positions(&ids, IMG, 4, 4);
+        let multi = mrope_positions_multi(&ids, IMG, &[[1, 4, 4]]);
+        assert_eq!(single, multi);
+    }
 }

@@ -375,8 +375,19 @@ impl BooguPipeline {
         instruction: &str,
         opts: &EditOptions,
     ) -> Result<Image> {
-        self.generate_edit_with_progress(
-            reference,
+        self.generate_edit_multi(std::slice::from_ref(reference), instruction, opts)
+    }
+
+    /// Multi-reference Edit (`N ∈ [1, 5]`): VAE-encode each reference and pack them all into the DiT
+    /// image sequence. `N = 1` is [`Self::generate_edit`]. See [`Self::generate_edit_multi_with_progress`].
+    pub fn generate_edit_multi(
+        &self,
+        references: &[Image],
+        instruction: &str,
+        opts: &EditOptions,
+    ) -> Result<Image> {
+        self.generate_edit_multi_with_progress(
+            references,
             instruction,
             opts,
             &CancelFlag::new(),
@@ -394,27 +405,59 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
-        validate_multiple_of_16(reference.width, reference.height, "boogu")?;
+        self.generate_edit_multi_with_progress(
+            std::slice::from_ref(reference),
+            instruction,
+            opts,
+            cancel,
+            on_progress,
+        )
+    }
 
-        // Reference → clean VAE latent [1, 16, rH/8, rW/8].
-        let ref_pixels = image_to_pixels(reference)?;
-        let ref_latent = self.vae.encode(&ref_pixels)?;
+    /// Multi-reference Edit with [`Progress`] + cancellation. VAE-encodes each of the `N ∈ [1, 5]`
+    /// references into its own clean latent, optionally runs each through the Qwen3-VL vision tower
+    /// (faithful semantic path), and flow-match denoises (true-CFG) with all references packed into
+    /// the DiT image sequence (`forward_edit_multi`, `[ref₀; …; ref_{N-1}; noise]`). The reference
+    /// latents are shared by both CFG passes; only the instruction differs. `N = 1` matches
+    /// [`Self::generate_edit_with_progress`].
+    pub fn generate_edit_multi_with_progress(
+        &self,
+        references: &[Image],
+        instruction: &str,
+        opts: &EditOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "boogu edit: at least one reference image is required".into(),
+            ));
+        }
+        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+        for r in references {
+            validate_multiple_of_16(r.width, r.height, "boogu")?;
+        }
+
+        // Each reference → clean VAE latent [1, 16, rH/8, rW/8].
+        let ref_latents: Vec<Array> = references
+            .iter()
+            .map(|r| self.vae.encode(&image_to_pixels(r)?))
+            .collect::<Result<Vec<_>>>()?;
 
         // Condition encoding: edit instruction + CFG-negative (empty/drop) instruction. Both DiT
-        // passes carry the same reference latent — only the instruction differs (TI2I text guidance).
+        // passes carry the same reference latents — only the instruction differs (TI2I text guidance).
         let (cond, cond_mask) = if opts.condition_on_image {
-            self.encode_image_instruction(reference, instruction)?
+            self.encode_image_instruction(references, instruction)?
         } else {
             let (ids, mask) = self.tok.encode_edit(instruction)?;
             (self.te.last_hidden(&ids, &mask)?, mask)
         };
         let do_cfg = opts.text_guidance_scale > 1.0;
         let uncond = if do_cfg {
-            // Reference `use_input_images_4_neg_instruct`: condition the negative on the image too
+            // Reference `use_input_images_4_neg_instruct`: condition the negative on the images too
             // (empty instruction); otherwise the text-only empty/drop instruction.
             if opts.condition_on_image && opts.use_input_images_4_neg_instruct {
-                Some(self.encode_image_instruction(reference, "")?)
+                Some(self.encode_image_instruction(references, "")?)
             } else {
                 let (u_ids, u_mask) = self.tok.encode_negative()?;
                 Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
@@ -450,12 +493,12 @@ impl BooguPipeline {
                 let t = Array::from_slice(&[timestep], &[1]);
                 let cond_v = self
                     .dit
-                    .forward_edit(x, &ref_latent, &t, &cond, &cond_mask)?;
+                    .forward_edit_multi(x, &ref_latents, &t, &cond, &cond_mask)?;
                 let pred = match &uncond {
                     Some((u_hidden, u_mask)) => {
                         let uncond_v =
                             self.dit
-                                .forward_edit(x, &ref_latent, &t, u_hidden, u_mask)?;
+                                .forward_edit_multi(x, &ref_latents, &t, u_hidden, u_mask)?;
                         add(
                             &cond_v,
                             &multiply(
@@ -477,14 +520,15 @@ impl BooguPipeline {
         self.decode_latents(&lat)
     }
 
-    /// Image-conditioned instruction features for the edit path: preprocess the reference, run the
-    /// (lazily-loaded, f32) Qwen3-VL vision tower, build the chat template with the reference image
-    /// block, and run the image-conditioned MLLM forward. Returns `(features [1, L, 4096], mask [1, L])`
-    /// — the same `(hidden, mask)` shape the DiT `forward_edit` consumes, but now with the
-    /// `<|image_pad|>` positions carrying the vision tower's merged embeds + deepstack injections.
+    /// Image-conditioned instruction features for the edit path: preprocess each reference, run the
+    /// (lazily-loaded, f32) Qwen3-VL vision tower over each, build the chat template with one image
+    /// block per reference, and run the multi-image-conditioned MLLM forward. Returns
+    /// `(features [1, L, 4096], mask [1, L])` — the same `(hidden, mask)` shape the DiT
+    /// `forward_edit_multi` consumes, but with each `<|image_pad|>` run carrying its reference's merged
+    /// embeds + deepstack injections. A single reference is the `references.len() == 1` case.
     fn encode_image_instruction(
         &self,
-        reference: &Image,
+        references: &[Image],
         instruction: &str,
     ) -> Result<(Array, Array)> {
         self.ensure_vision()?;
@@ -493,25 +537,33 @@ impl BooguPipeline {
             .as_ref()
             .expect("vision tower loaded by ensure_vision");
 
-        // Reference → Qwen3-VL preprocessing (its own smart-resize / grid) → vision tower.
-        let rgb =
-            image::RgbImage::from_raw(reference.width, reference.height, reference.pixels.clone())
-                .ok_or_else(|| {
-                    Error::Msg("boogu edit: reference pixels != width·height·3".into())
-                })?;
-        let (pixel_values, grid) = preprocess_image(&rgb)?;
-        let (image_embeds, deepstack) = tower.forward(&pixel_values, &[grid])?;
+        // Each reference → Qwen3-VL preprocessing (its own smart-resize / grid) → vision tower; collect
+        // per-image embeds / deepstack / grid + the merged-token count that drives the chat template.
+        let mut image_embeds: Vec<Array> = Vec::with_capacity(references.len());
+        let mut deepstacks: Vec<Vec<Array>> = Vec::with_capacity(references.len());
+        let mut grids: Vec<[i32; 3]> = Vec::with_capacity(references.len());
+        let mut counts: Vec<usize> = Vec::with_capacity(references.len());
+        for r in references {
+            let rgb = image::RgbImage::from_raw(r.width, r.height, r.pixels.clone()).ok_or_else(
+                || Error::Msg("boogu edit: reference pixels != width·height·3".into()),
+            )?;
+            let (pixel_values, grid) = preprocess_image(&rgb)?;
+            let (embeds, deepstack) = tower.forward(&pixel_values, &[grid])?;
+            counts.push(embeds.shape()[0] as usize);
+            image_embeds.push(embeds);
+            deepstacks.push(deepstack);
+            grids.push(grid);
+        }
 
-        // Chat template with N = merged vision tokens worth of `<|image_pad|>` placeholders, then the
-        // image-conditioned MLLM forward (vision splice + 3-D MRoPE + deepstack injection).
-        let n = image_embeds.shape()[0] as usize;
-        let (ids, mask) = self.tok.encode_edit_with_image(instruction, n)?;
-        let feats = self.te.last_hidden_with_image(
+        // Chat template with one `<|image_pad|>` block per reference, then the multi-image-conditioned
+        // MLLM forward (per-image vision splice + 3-D MRoPE advancing per image + deepstack injection).
+        let (ids, mask) = self.tok.encode_edit_with_images(instruction, &counts)?;
+        let feats = self.te.last_hidden_with_image_multi(
             &ids,
             &mask,
             &image_embeds,
-            &deepstack,
-            grid,
+            &deepstacks,
+            &grids,
             IMAGE_TOKEN_ID,
         )?;
         Ok((feats, mask))
