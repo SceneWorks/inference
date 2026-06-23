@@ -8,6 +8,7 @@
 
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{Generator, ModelDescriptor};
+use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 use crate::runtime::LoadSpec;
 use crate::textllm::{TextLlm, TextLlmDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
@@ -48,6 +49,16 @@ pub struct CaptionerRegistration {
 
 inventory::collect!(CaptionerRegistration);
 
+/// An image-embedder provider's registration (parallel to [`ModelRegistration`]). Unlike
+/// `FaceEmbedder` — a directly-constructed utility — image embedders self-register so the worker's
+/// `dataset_analysis` job can `load_image_embedder(id, spec)` by id, exactly like captioners.
+pub struct ImageEmbedderRegistration {
+    pub descriptor: fn() -> ImageEmbedderDescriptor,
+    pub load: fn(&LoadSpec) -> Result<Box<dyn ImageEmbedder>>,
+}
+
+inventory::collect!(ImageEmbedderRegistration);
+
 /// A text-LLM provider's registration (parallel to [`ModelRegistration`]).
 pub struct TextLlmRegistration {
     pub descriptor: fn() -> TextLlmDescriptor,
@@ -74,6 +85,11 @@ pub fn trainers() -> impl Iterator<Item = &'static TrainerRegistration> {
 /// All registered captioners (one per linked provider crate that supports image-to-text captioning).
 pub fn captioners() -> impl Iterator<Item = &'static CaptionerRegistration> {
     inventory::iter::<CaptionerRegistration>.into_iter()
+}
+
+/// All registered image embedders (one per linked provider crate).
+pub fn image_embedders() -> impl Iterator<Item = &'static ImageEmbedderRegistration> {
+    inventory::iter::<ImageEmbedderRegistration>.into_iter()
 }
 
 /// All registered text-LLM providers (one per linked provider crate that supports text generation).
@@ -132,6 +148,19 @@ pub fn load_captioner(id: &str, spec: &LoadSpec) -> Result<Box<dyn Captioner>> {
     debug_assert!(
         matches.next().is_none(),
         "duplicate captioner id '{id}' registered (first-wins shadows the rest)"
+    );
+    (reg.load)(spec)
+}
+
+/// Load an image embedder by id (e.g. `"clip_vit_l14"`).
+pub fn load_image_embedder(id: &str, spec: &LoadSpec) -> Result<Box<dyn ImageEmbedder>> {
+    let mut matches = image_embedders().filter(|r| (r.descriptor)().id == id);
+    let reg = matches
+        .next()
+        .ok_or_else(|| Error::Msg(format!("no image embedder registered for id '{id}'")))?;
+    debug_assert!(
+        matches.next().is_none(),
+        "duplicate image embedder id '{id}' registered (first-wins shadows the rest)"
     );
     (reg.load)(spec)
 }
