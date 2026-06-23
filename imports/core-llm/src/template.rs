@@ -192,6 +192,14 @@ impl ChatTemplate for JinjaChatTemplate {
                 let mut map = BTreeMap::new();
                 map.insert("role", m.role.as_str().to_string());
                 map.insert("content", m.text_content());
+                // A turn's prior reasoning is exposed under both standard keys so a reasoning
+                // model's template finds it: `reasoning_content` (Qwen3 / DeepSeek) and `thinking`.
+                // Inserted only when present, so a template's `reasoning_content is string` test is
+                // false otherwise (the model's own retention/stripping policy then applies).
+                if let Some(thinking) = &m.thinking {
+                    map.insert("reasoning_content", thinking.clone());
+                    map.insert("thinking", thinking.clone());
+                }
                 map
             })
             .collect();
@@ -391,6 +399,7 @@ mod tests {
             Message {
                 role: Role::Tool,
                 content: vec![crate::message::Content::Text("result".into())],
+                thinking: None,
             },
         ];
         assert_eq!(t.render(&msgs, false).unwrap(), "user:q<tool>result</tool>");
@@ -451,6 +460,83 @@ mod tests {
             .render_with(&msgs, &RenderOptions::generation().with_enable_thinking(Some(false)))
             .unwrap();
         assert_eq!(disabled, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    }
+
+    #[test]
+    fn jinja_message_thinking_is_exposed_as_reasoning_content() {
+        // A turn's `thinking` is visible to the template as `reasoning_content` (and `thinking`);
+        // absent when None, so the template's `is string` gate is false.
+        let probe = JinjaChatTemplate::new(
+            "{% for m in messages %}{% if m.reasoning_content is string %}RC={{ m.reasoning_content }};{% else %}RC=none;{% endif %}{% if m.thinking is string %}T={{ m.thinking }};{% endif %}{% endfor %}",
+        );
+        let msgs = [
+            Message::user("q"),
+            Message::assistant("A").with_thinking("R"),
+        ];
+        assert_eq!(probe.render(&msgs, false).unwrap(), "RC=none;RC=R;T=R;");
+    }
+
+    // Mirrors Qwen3's assistant handling: reasoning is re-emitted from `reasoning_content` only for
+    // the most recent turn; an earlier turn's reasoning is dropped (the template owns the policy —
+    // the contract only carries the field).
+    const REASONING_RETENTION: &str = "{% for m in messages %}{{ '<|im_start|>' + m.role + '\\n' }}{% if m.reasoning_content is string and loop.last %}{{ '<think>\\n' + m.reasoning_content + '\\n</think>\\n\\n' }}{% endif %}{{ m.content + '<|im_end|>\\n' }}{% endfor %}";
+
+    #[test]
+    fn jinja_reasoning_kept_for_latest_turn() {
+        let t = JinjaChatTemplate::new(REASONING_RETENTION);
+        let msgs = [Message::user("q1"), Message::assistant("A1").with_thinking("R1")];
+        let out = t.render(&msgs, false).unwrap();
+        assert!(out.contains("<|im_start|>assistant\n<think>\nR1\n</think>\n\nA1<|im_end|>"), "{out}");
+    }
+
+    #[test]
+    fn jinja_prior_turn_reasoning_is_stripped_by_template_policy() {
+        // The same assistant turn, now followed by a newer user turn, renders without its reasoning —
+        // carrying `thinking` does not force-inject it; the template decides.
+        let t = JinjaChatTemplate::new(REASONING_RETENTION);
+        let msgs = [
+            Message::user("q1"),
+            Message::assistant("A1").with_thinking("R1"),
+            Message::user("q2"),
+        ];
+        let out = t.render(&msgs, false).unwrap();
+        assert!(out.contains("<|im_start|>assistant\nA1<|im_end|>"), "{out}");
+        assert!(!out.contains("<think>"), "prior-turn reasoning must be stripped: {out}");
+    }
+
+    #[test]
+    #[ignore = "needs a real Qwen3 tokenizer_config via MLX_LLM_QWEN3_MODEL"]
+    fn qwen3_real_template_round_trips_reasoning() {
+        // Faithfulness against the *actual* Qwen3 chat template (not a stand-in): carrying
+        // Message::thinking re-renders the reasoning for the latest assistant turn and the template's
+        // own policy strips it once a newer user turn follows.
+        let dir = std::env::var("MLX_LLM_QWEN3_MODEL").expect("set MLX_LLM_QWEN3_MODEL");
+        let t = JinjaChatTemplate::from_tokenizer_config_file(format!("{dir}/tokenizer_config.json"))
+            .expect("load real Qwen3 chat template");
+
+        // Assistant is the most recent turn → its reasoning is re-emitted from reasoning_content.
+        let latest = [
+            Message::user("What is 2+2?"),
+            Message::assistant("2+2 is 4.").with_thinking("The user asks 2+2; that is 4."),
+        ];
+        let rendered = t.render(&latest, false).unwrap();
+        assert!(
+            rendered.contains("<think>\nThe user asks 2+2; that is 4.\n</think>\n\n2+2 is 4."),
+            "latest-turn reasoning must be re-rendered: {rendered}"
+        );
+
+        // A newer user turn follows → Qwen3 strips the prior assistant turn's reasoning.
+        let prior = [
+            Message::user("What is 2+2?"),
+            Message::assistant("2+2 is 4.").with_thinking("The user asks 2+2; that is 4."),
+            Message::user("And 3+3?"),
+        ];
+        let rendered = t.render_with(&prior, &RenderOptions::generation()).unwrap();
+        assert!(rendered.contains("<|im_start|>assistant\n2+2 is 4.<|im_end|>"), "{rendered}");
+        assert!(
+            !rendered.contains("The user asks 2+2"),
+            "prior-turn reasoning must be stripped by Qwen3's template: {rendered}"
+        );
     }
 
     #[test]

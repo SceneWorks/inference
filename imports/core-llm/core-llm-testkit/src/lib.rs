@@ -80,6 +80,7 @@ impl TextLlmProfile {
             messages: vec![Message {
                 role: Role::User,
                 content: vec![Content::Text(self.prompt.clone()), Content::Image(img.clone())],
+                thinking: None,
             }],
             sampling: Sampling::greedy(),
             max_new_tokens: self.max_new_tokens,
