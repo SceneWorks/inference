@@ -39,10 +39,21 @@ fn render_chat(system: &str, user: &str) -> String {
 /// user text — exactly the Qwen3-VL chat template + processor expansion for `content = [image, text]`
 /// (verified against the golden `input_ids`: image first, no separator, then the instruction).
 fn render_chat_with_image(system: &str, user: &str, num_image_tokens: usize) -> String {
-    let pads = IMAGE_PAD.repeat(num_image_tokens);
-    format!(
-        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{VISION_START}{pads}{VISION_END}{user}<|im_end|>\n"
-    )
+    render_chat_with_images(system, user, &[num_image_tokens])
+}
+
+/// Render the ChatML string for a **multi-image**-conditioned `(system, user)` turn: one bare vision
+/// block (`<|vision_start|>` + `nⱼ`×`<|image_pad|>` + `<|vision_end|>`) per reference image, in order
+/// and back-to-back (no separator, no "Picture N:" label — the reference leaves `add_vision_id` off),
+/// then the user instruction. Mirrors the Qwen3-VL chat template for `content = [image×N, text]`.
+fn render_chat_with_images(system: &str, user: &str, num_image_tokens: &[usize]) -> String {
+    let mut blocks = String::new();
+    for &n in num_image_tokens {
+        blocks.push_str(VISION_START);
+        blocks.push_str(&IMAGE_PAD.repeat(n));
+        blocks.push_str(VISION_END);
+    }
+    format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{blocks}{user}<|im_end|>\n")
 }
 
 /// The Boogu condition tokenizer: the snapshot's `mllm/tokenizer.json` wrapped so we can render the
@@ -115,6 +126,23 @@ impl BooguTokenizer {
         ))?)
     }
 
+    /// Encode a **multi-image** edit instruction → `(input_ids, attention_mask)` `[1, L]`, with one
+    /// `<|image_pad|>` block per reference image (`num_image_tokens[j]` = merged vision tokens for
+    /// reference `j`). The text encoder then replaces each block with that reference's vision-tower
+    /// embeds ([`crate::text_encoder::BooguTextEncoder::last_hidden_with_image_multi`]). The single-ref
+    /// [`Self::encode_edit_with_image`] is the `num_image_tokens.len() == 1` case.
+    pub fn encode_edit_with_images(
+        &self,
+        instruction: &str,
+        num_image_tokens: &[usize],
+    ) -> Result<(Array, Array)> {
+        ids_to_arrays(self.encode(&render_chat_with_images(
+            SYSTEM_PROMPT_DROP,
+            instruction,
+            num_image_tokens,
+        ))?)
+    }
+
     /// Raw id vector for the positive instruction (parity testing against the golden).
     pub fn t2i_ids(&self, prompt: &str) -> Result<Vec<i32>> {
         self.encode(&render_chat(SYSTEM_PROMPT_T2I, prompt))
@@ -129,4 +157,31 @@ fn ids_to_arrays(ids: Vec<i32>) -> Result<(Array, Array)> {
         Array::from_slice(&ids, &[1, len]),
         Array::from_slice(&mask, &[1, len]),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_chat_with_image, render_chat_with_images, SYSTEM_PROMPT_DROP};
+
+    /// One image block per reference, back-to-back (no separator, no "Picture N:" label), each with
+    /// its own `<|image_pad|>` count, then the instruction.
+    #[test]
+    fn multi_image_render_emits_one_block_per_reference() {
+        let s = render_chat_with_images("S", "hi", &[2, 1]);
+        assert_eq!(
+            s,
+            "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\n\
+             <|vision_start|><|image_pad|><|image_pad|><|vision_end|>\
+             <|vision_start|><|image_pad|><|vision_end|>hi<|im_end|>\n"
+        );
+    }
+
+    /// The single-image render is exactly the one-element case of the multi render.
+    #[test]
+    fn single_image_render_is_multi_with_one() {
+        assert_eq!(
+            render_chat_with_image(SYSTEM_PROMPT_DROP, "make it green", 64),
+            render_chat_with_images(SYSTEM_PROMPT_DROP, "make it green", &[64])
+        );
+    }
 }

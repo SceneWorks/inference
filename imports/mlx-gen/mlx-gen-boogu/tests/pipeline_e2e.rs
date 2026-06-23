@@ -270,3 +270,67 @@ fn turbo_smoke() {
     .unwrap();
     println!("wrote {}", out.display());
 }
+
+/// E7b **multi-reference** edit (sc-7645): compose TWO references into one edit. Renders two distinct
+/// subjects (T2I on the Edit checkpoint), then runs the edit with BOTH as references and an instruction
+/// that combines them — exercising `generate_edit_multi` (2 reference latents packed
+/// `[ref₀; ref₁; noise]` into the DiT image sequence + a 2-image Qwen3-VL chat template with per-image
+/// `image_index_embedding` and MRoPE). Saves the two refs + the composite for visual A/B; coherence
+/// (does the result contain BOTH subjects?) is judged by eye on the saved files. Needs the Edit
+/// checkpoint (`BOOGU_EDIT_DIR`, falls back to `BOOGU_BASE_DIR`).
+#[test]
+#[ignore = "needs real weights (128 GB Mac): set BOOGU_EDIT_DIR (falls back to BOOGU_BASE_DIR)"]
+fn edit_multi_smoke() {
+    let pipe = BooguPipeline::from_snapshot(edit_dir()).expect("load Boogu Edit pipeline");
+
+    let t2i = |prompt: &str, seed: u64| {
+        pipe.generate(
+            prompt,
+            &GenerateOptions {
+                height: 512,
+                width: 512,
+                steps: 24,
+                text_guidance_scale: 4.0,
+                seed,
+                ..Default::default()
+            },
+        )
+        .expect("generate reference")
+    };
+    let ref_a = t2i("a single red apple on a plain white background", 0);
+    let ref_b = t2i("a single yellow banana on a plain white background", 2);
+    save_and_check(
+        &ref_a,
+        "boogu_mlx_editmulti_ref_apple_512.png",
+        "ref a (apple)",
+    );
+    save_and_check(
+        &ref_b,
+        "boogu_mlx_editmulti_ref_banana_512.png",
+        "ref b (banana)",
+    );
+
+    // Two references → one composite edit.
+    let refs = [ref_a, ref_b];
+    let composite = pipe
+        .generate_edit_multi(
+            &refs,
+            "place the apple from the first image and the banana from the second image together on a wooden table",
+            &EditOptions {
+                height: 512,
+                width: 512,
+                steps: 24,
+                text_guidance_scale: 4.0,
+                seed: 7,
+                condition_on_image: true,
+                use_input_images_4_neg_instruct: false,
+                ..Default::default()
+            },
+        )
+        .expect("generate_edit_multi");
+    save_and_check(
+        &composite,
+        "boogu_mlx_editmulti_apple_banana_512.png",
+        "edit (2-ref composite)",
+    );
+}
