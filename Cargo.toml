@@ -36,6 +36,13 @@ sceneworks-gen-core = { path = "gen-core" }
 # Contract conformance suite (epic 3720, sc-4481). Zero tensor deps; family crates dev-depend on it
 # to run their real model through the backend-neutral checks (cancel/progress/seed/capabilities).
 sceneworks-gen-core-testkit = { path = "gen-core-testkit" }
+# The independent LLM-serving contract (epic 7153). The dependency is INVERTED: gen-core CONSUMES
+# core-llm (gen-core re-exports it as `gen_core::core_llm`, mirroring how mlx-gen re-exports gen-core),
+# so the gen-ai side runs its LLM providers through the unified `core_llm::TextLlm` engine instead of
+# the duplicate `gen_core::TextLlm`. core-llm is tensor-free (thiserror/inventory/tokenizers/serde_json/
+# minijinja) so this preserves gen-core's zero-tensor invariant. Branch-pinned to match the mlx-llm
+# convention; cargo unifies on one core-llm across the graph. See sc-7189.
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 thiserror = "2"
 # Link-time model registration (the DI-container stand-in; see docs/MODEL_ARCHITECTURE.md §4).
 inventory = "0.3"
