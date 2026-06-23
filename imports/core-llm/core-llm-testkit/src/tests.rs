@@ -4,8 +4,9 @@
 use super::*;
 
 use core_llm::{
-    Error, FinishReason, LoadSpec, Result as CoreResult, StreamEvent, TextLlm, TextLlmCapabilities,
-    TextLlmDescriptor, TextLlmOutput, TextLlmRegistration, TextLlmRequest, Usage,
+    Channel, Error, FinishReason, LoadSpec, Result as CoreResult, StreamEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRegistration, TextLlmRequest,
+    Usage,
 };
 
 #[derive(Clone)]
@@ -42,6 +43,7 @@ fn stub_caps() -> TextLlmCapabilities {
         max_new_tokens: 0,
         supports_system_prompt: true,
         supports_vision: false,
+        supports_thinking: false,
         supported_constraints: Vec::new(),
     }
 }
@@ -115,6 +117,7 @@ impl TextLlm for StubTextLlm {
                 });
                 return Ok(TextLlmOutput {
                     text,
+                    thinking: None,
                     usage,
                     finish_reason: Some(FinishReason::Cancelled),
                 });
@@ -131,6 +134,7 @@ impl TextLlm for StubTextLlm {
                     id: val as u32,
                     text: piece,
                     index: i,
+                    channel: Channel::Content,
                 });
             }
         }
@@ -150,6 +154,7 @@ impl TextLlm for StubTextLlm {
         });
         Ok(TextLlmOutput {
             text: final_text,
+            thinking: None,
             usage,
             finish_reason: Some(FinishReason::Length),
         })
@@ -188,6 +193,29 @@ fn each_check_passes_for_good_stub() {
     check_cancellation(p, &pr).unwrap();
     check_seed_determinism(p, &pr).unwrap();
     check_multimodal(p, &pr).unwrap();
+    check_thinking(p, &pr).unwrap();
+}
+
+#[test]
+fn thinking_capable_stub_passes_thinking() {
+    // An honest provider that advertises supports_thinking: every mode validates, the no-think path
+    // produces no reasoning, and the (here empty) reasoning channel stays consistent with output.
+    let mut s = good();
+    s.descriptor.capabilities.supports_thinking = true;
+    check_thinking(&s, &TextLlmProfile::cheap()).unwrap();
+}
+
+#[test]
+fn dishonest_enable_thinking_is_caught() {
+    // supports_thinking=false but validate accepts everything → check_thinking catches the lie.
+    let s = stub(
+        "dishonest-think",
+        Behavior {
+            honest_validate: false,
+            ..Behavior::good()
+        },
+    );
+    assert!(check_thinking(&s, &TextLlmProfile::cheap()).is_err());
 }
 
 #[test]

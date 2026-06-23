@@ -9,16 +9,52 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use minijinja::{context, Environment, Value};
+use minijinja::{Environment, Value};
 
 use crate::error::{Error, Result};
 use crate::message::Message;
+
+/// Options for a chat-template render. Extensible carrier for the standard chat-template kwargs
+/// beyond the conversation itself.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenderOptions {
+    /// Append the opening of an assistant turn so the model continues as the assistant.
+    pub add_generation_prompt: bool,
+    /// The `enable_thinking` chat-template kwarg: `None` omits it (template default — the Jinja
+    /// `is defined` test is false), `Some(true)`/`Some(false)` request reasoning on/off. Maps from
+    /// [`TextLlmRequest::enable_thinking_kwarg`](crate::TextLlmRequest::enable_thinking_kwarg).
+    pub enable_thinking: Option<bool>,
+}
+
+impl RenderOptions {
+    /// Options that append a generation prompt and leave the thinking mode at the template default.
+    pub fn generation() -> Self {
+        Self {
+            add_generation_prompt: true,
+            enable_thinking: None,
+        }
+    }
+
+    /// Set the `enable_thinking` kwarg (builder style).
+    pub fn with_enable_thinking(mut self, enable_thinking: Option<bool>) -> Self {
+        self.enable_thinking = enable_thinking;
+        self
+    }
+}
 
 /// Renders a conversation into a single prompt string the tokenizer then encodes.
 pub trait ChatTemplate {
     /// Render `messages`. When `add_generation_prompt` is set, append the opening of an assistant
     /// turn so the model continues as the assistant.
     fn render(&self, messages: &[Message], add_generation_prompt: bool) -> Result<String>;
+
+    /// Render with the full [`RenderOptions`] (chat-template kwargs). The default ignores any kwarg
+    /// a simple typed template has no notion of (e.g. `enable_thinking`) and delegates to
+    /// [`render`](ChatTemplate::render); [`JinjaChatTemplate`] overrides it to thread the kwargs
+    /// into the Jinja context.
+    fn render_with(&self, messages: &[Message], opts: &RenderOptions) -> Result<String> {
+        self.render(messages, opts.add_generation_prompt)
+    }
 }
 
 /// The Llama-3 instruct chat format.
@@ -127,6 +163,16 @@ impl JinjaChatTemplate {
 
 impl ChatTemplate for JinjaChatTemplate {
     fn render(&self, messages: &[Message], add_generation_prompt: bool) -> Result<String> {
+        self.render_with(
+            messages,
+            &RenderOptions {
+                add_generation_prompt,
+                enable_thinking: None,
+            },
+        )
+    }
+
+    fn render_with(&self, messages: &[Message], opts: &RenderOptions) -> Result<String> {
         let mut env = Environment::new();
         // Match transformers' Jinja environment (ImmutableSandboxedEnvironment, trim/lstrip blocks).
         env.set_trim_blocks(true);
@@ -150,12 +196,18 @@ impl ChatTemplate for JinjaChatTemplate {
             })
             .collect();
 
-        let ctx = context! {
-            messages => Value::from_serialize(&msgs),
-            add_generation_prompt => add_generation_prompt,
-            bos_token => self.bos_token.clone(),
-            eos_token => self.eos_token.clone(),
-        };
+        // Build the context as a map so `enable_thinking` can be *omitted* entirely when the kwarg
+        // is `None` — a template's `enable_thinking is defined` test must then be false, matching
+        // `transformers` omitting it from `chat_template_kwargs`. Inserting an explicit
+        // `Value::UNDEFINED` would not read as undefined to that test.
+        let mut ctx: BTreeMap<&str, Value> = BTreeMap::new();
+        ctx.insert("messages", Value::from_serialize(&msgs));
+        ctx.insert("add_generation_prompt", Value::from(opts.add_generation_prompt));
+        ctx.insert("bos_token", Value::from(self.bos_token.clone()));
+        ctx.insert("eos_token", Value::from(self.eos_token.clone()));
+        if let Some(enable_thinking) = opts.enable_thinking {
+            ctx.insert("enable_thinking", Value::from(enable_thinking));
+        }
         tmpl.render(ctx).map_err(jinja_err)
     }
 }
@@ -371,6 +423,34 @@ mod tests {
         });
         let t = JinjaChatTemplate::from_tokenizer_config(&cfg).unwrap();
         assert_eq!(t.render(&[Message::user("hi")], false).unwrap(), "hi");
+    }
+
+    // The Qwen3 generation-prompt branch, verbatim: a no-think (`enable_thinking=false`) request
+    // injects an empty think block; otherwise the model produces its own.
+    const QWEN3_THINK_TAIL: &str = "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% if enable_thinking is defined and enable_thinking is false %}{{ '<think>\\n\\n</think>\\n\\n' }}{% endif %}{% endif %}";
+
+    #[test]
+    fn jinja_enable_thinking_drives_qwen3_nothink_branch() {
+        let t = JinjaChatTemplate::new(QWEN3_THINK_TAIL);
+        let msgs = [Message::user("hi")];
+
+        // Auto (kwarg omitted) ⇒ `is defined` is false ⇒ no injection. This is what plain
+        // `render` / the pre-fix behavior produced, and is why no-think was previously unreachable.
+        let auto = t.render_with(&msgs, &RenderOptions::generation()).unwrap();
+        assert_eq!(auto, "<|im_start|>assistant\n");
+        assert_eq!(t.render(&msgs, true).unwrap(), auto, "render == render_with(Auto)");
+
+        // Enabled ⇒ defined and true ⇒ branch (which only fires on `is false`) does not inject.
+        let enabled = t
+            .render_with(&msgs, &RenderOptions::generation().with_enable_thinking(Some(true)))
+            .unwrap();
+        assert_eq!(enabled, "<|im_start|>assistant\n");
+
+        // Disabled ⇒ defined and false ⇒ the empty think block is injected (no-think now reachable).
+        let disabled = t
+            .render_with(&msgs, &RenderOptions::generation().with_enable_thinking(Some(false)))
+            .unwrap();
+        assert_eq!(disabled, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
     }
 
     #[test]

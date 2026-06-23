@@ -29,6 +29,22 @@ pub enum FinishReason {
     ContentFilter,
 }
 
+/// Which channel a streamed token belongs to: the model's reasoning trace or its final answer.
+///
+/// Only reasoning ("thinking") models emit [`Thinking`](Channel::Content) spans; every token from a
+/// non-thinking model — and every token outside a `<think>…</think>` block — is
+/// [`Content`](Channel::Content). The provider classifies tokens with a
+/// [`ThinkingSegmenter`](crate::ThinkingSegmenter).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Channel {
+    /// Part of the final answer.
+    #[default]
+    Content,
+    /// Part of the model's reasoning trace (the contents of a `<think>…</think>` block); the
+    /// markers themselves are stripped and not emitted.
+    Thinking,
+}
+
 /// An event emitted as a generation streams.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
@@ -41,6 +57,9 @@ pub enum StreamEvent {
         text: String,
         /// 0-based index among generated tokens.
         index: usize,
+        /// Whether this token is reasoning or final-answer text. Always
+        /// [`Channel::Content`] for non-thinking providers.
+        channel: Channel,
     },
     /// Terminal event: generation finished.
     Done {
@@ -54,8 +73,14 @@ pub enum StreamEvent {
 /// The result of a generation (also recoverable by accumulating [`StreamEvent::Token`] text).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextLlmOutput {
-    /// The full generated text.
+    /// The final answer — reasoning and its `<think>…</think>` markers excluded. Recoverable by
+    /// accumulating the [`Channel::Content`] token deltas.
     pub text: String,
+    /// The model's reasoning trace, when it produced one: the concatenated
+    /// [`Channel::Thinking`] text (markers stripped). `None` for a non-thinking run, a no-think
+    /// request, or a model with no reasoning mode. Mirrors OpenAI's `reasoning_content` vs
+    /// `content` split.
+    pub thinking: Option<String>,
     /// Token usage.
     pub usage: Usage,
     /// Why generation stopped (`None` only on a default-constructed value).

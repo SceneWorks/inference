@@ -19,6 +19,8 @@
 //! - [`Constraint`] + [`JsonState`] — constrained-decoding policy (generic JSON grammar).
 //! - [`Tokenizer`] + [`ChatTemplate`] — host-side text policy.
 //! - [`StopMatcher`] — backend-neutral request stop-string matching over decoded text.
+//! - [`ThinkingSegmenter`] — backend-neutral reasoning/answer segmentation (`<think>…</think>`),
+//!   paired with the [`ThinkingMode`] request control and `supports_thinking` capability.
 //! - [`Scheduler`] — backend-neutral continuous-batching policy (admission + per-sequence retire).
 //! - [`PrefixIndex`] — backend-neutral shared-prefix KV-reuse policy (longest-match + LRU).
 //! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
@@ -42,6 +44,7 @@ pub mod speculative;
 pub mod stop;
 pub mod template;
 pub mod text_llm;
+pub mod thinking;
 pub mod tokenizer;
 
 pub use cancel::CancelFlag;
@@ -49,19 +52,20 @@ pub use capabilities::{TextLlmCapabilities, TextLlmDescriptor};
 pub use constraint::{Constraint, ConstraintDecodeTable, JsonConstraint, JsonState};
 pub use error::{Error, Result};
 pub use message::{Content, ImageRef, Message, Role};
-pub use output::{FinishReason, StreamEvent, TextLlmOutput, Usage};
+pub use output::{Channel, FinishReason, StreamEvent, TextLlmOutput, Usage};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use registry::{
     load_for_model, load_for_model_with, load_textllm, textllms, ModelRequirements,
     TextLlmRegistration,
 };
-pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest};
+pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
 pub use stop::{StopChunk, StopMatcher};
-pub use template::{ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template};
+pub use template::{ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template, RenderOptions};
 pub use text_llm::TextLlm;
+pub use thinking::{ThinkingSegmenter, ThinkingSpan};
 pub use tokenizer::Tokenizer;
 
 /// The crate version, surfaced in conformance / diagnostic messages.

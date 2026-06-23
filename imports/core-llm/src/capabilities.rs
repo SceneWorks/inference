@@ -15,6 +15,11 @@ pub struct TextLlmCapabilities {
     pub supports_system_prompt: bool,
     /// Whether image (vision) content is accepted.
     pub supports_vision: bool,
+    /// Whether the model has a controllable reasoning ("thinking") mode — i.e. it honors the
+    /// [`thinking`](crate::TextLlmRequest::thinking) request control (its chat template gates an
+    /// `enable_thinking` kwarg). `false` ⇒ the model never reasons, and an explicit
+    /// [`ThinkingMode::Enabled`](crate::request::ThinkingMode::Enabled) request is rejected.
+    pub supports_thinking: bool,
     /// The output constraints this provider can enforce (empty = none).
     pub supported_constraints: Vec<Constraint>,
 }
@@ -52,6 +57,17 @@ impl TextLlmCapabilities {
         if !self.supports_vision && req.has_image() {
             return Err(Error::Unsupported(format!(
                 "[{id}] provider does not support image (vision) input"
+            )));
+        }
+
+        // Reject only an explicit *enable*: a model with no reasoning mode cannot satisfy it. A
+        // no-think (Disabled) request is trivially satisfied (the model never thinks) and Auto
+        // defers to the template, so both are accepted regardless of support.
+        if !self.supports_thinking
+            && req.thinking == crate::request::ThinkingMode::Enabled
+        {
+            return Err(Error::Unsupported(format!(
+                "[{id}] provider does not support a thinking (reasoning) mode"
             )));
         }
 
