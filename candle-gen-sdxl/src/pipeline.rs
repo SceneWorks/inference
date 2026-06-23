@@ -101,6 +101,15 @@ const SDXL_BETA_START: f32 = 0.00085;
 const SDXL_BETA_END: f32 = 0.012;
 const SDXL_TRAIN_STEPS: usize = 1000;
 
+/// Build SDXL's ε-prediction α-cumprod schedule (`scaled_linear` β over 1000 train steps) — the
+/// [`DiscreteModelSampling`] source the curated unified-sampler path integrates over. Shared by the
+/// txt2img [`Pipeline::denoise_curated`] (sc-7124), the Lightning policy, and the conditioned
+/// [`crate::ip_provider`] curated denoise (sc-7297), so they speak one SDXL noise schedule.
+pub(crate) fn sdxl_alpha_schedule() -> Result<AlphaSchedule> {
+    AlphaSchedule::scaled_linear(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END)
+        .map_err(|e| CandleError::Msg(format!("sdxl curated schedule: {e}")))
+}
+
 /// The per-image seed within a batch: image `index` of a `count`-image request renders at
 /// `base_seed + index` (wrapping at the u64 ceiling). Mirrors the SceneWorks `SdxlDiffusersAdapter`'s
 /// per-image seed increment (sc-3677 parity), so the *n*-th image of a batch reproduces in isolation
@@ -117,8 +126,7 @@ pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
 /// backends share the reference trailing-spacing + interpolated σ table. The candle side is only the
 /// ~5-line tensor application in [`Pipeline::denoise_lightning`].
 fn lightning_policy(num_steps: usize) -> Result<LightningPolicy> {
-    let sched = AlphaSchedule::scaled_linear(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END)
-        .map_err(|e| CandleError::Msg(format!("sdxl lightning schedule: {e}")))?;
+    let sched = sdxl_alpha_schedule()?;
     Ok(LightningPolicy::new(&sched, SDXL_TRAIN_STEPS, num_steps))
 }
 
@@ -549,8 +557,7 @@ impl Pipeline {
         seed: u64,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
-        let sched = AlphaSchedule::scaled_linear(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END)
-            .map_err(|e| CandleError::Msg(format!("sdxl curated schedule: {e}")))?;
+        let sched = sdxl_alpha_schedule()?;
         let ms = DiscreteModelSampling::sdxl(&sched);
         // Native curated schedule = ComfyUI's SDXL default (`normal`); the scheduler axis overrides it.
         let native = schedule_sigmas(Scheduler::Normal, &ms, steps);

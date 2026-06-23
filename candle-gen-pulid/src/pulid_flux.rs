@@ -33,6 +33,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_flux::{
@@ -87,6 +88,15 @@ pub struct PulidFluxRequest {
     pub guidance: f32,
     /// PuLID id_weight (reference-face strength; `0.0` ⇒ the no-id ablation = plain FLUX).
     pub id_weight: f32,
+    /// Curated unified-sampler selection (epic 7114, sc-7297). `None` (or `flow_match` / `euler`) keeps
+    /// the native flow-match Euler default; a curated [`Solver`](candle_gen::gen_core::sampling::Solver)
+    /// name routes the PuLID-injected flow denoise through that integrator (the candle PuLID runs its
+    /// OWN flow loop, vs the mlx PuLID which delegates to the FLUX backbone — so the knob is threaded
+    /// here directly through [`candle_gen::run_flow_sampler`]).
+    pub sampler: Option<String>,
+    /// Curated σ-schedule selection (epic 7114). `None` (or a native alias) ⇒ FLUX's verbatim
+    /// time-shifted `get_schedule`; a curated scheduler name re-strides σ over the dev time-shift `mu`.
+    pub scheduler: Option<String>,
     pub seed: u64,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
@@ -101,6 +111,8 @@ impl Default for PulidFluxRequest {
             steps: 25,
             guidance: DEFAULT_GUIDANCE,
             id_weight: DEFAULT_ID_WEIGHT,
+            sampler: None,
+            scheduler: None,
             seed: 0,
             cancel: CancelFlag::default(),
         }
@@ -137,6 +149,18 @@ fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
         )));
     }
     Ok(files)
+}
+
+/// The FLUX.1-dev flow-match time-shift `mu` for the curated scheduler axis (epic 7114, sc-7297) — the
+/// same linear map candle's `get_schedule(.., Some((seq_len, BASE_SHIFT, MAX_SHIFT)))` applies, so
+/// gen-core's exponential time-shift lands on the native schedule's shift (the candle-gen-flux
+/// `flow_mu` twin; PuLID is always dev so there is no schnell `mu = 0` branch). Used ONLY to feed the
+/// curated [`candle_gen::resolve_flow_schedule`]; the default path returns the verbatim native schedule
+/// (N1 byte-exact).
+fn flow_mu(seq_len: usize) -> f32 {
+    let m = (MAX_SHIFT - BASE_SHIFT) / (4096.0 - 256.0);
+    let b = BASE_SHIFT - m * 256.0;
+    (m * seq_len as f64 + b) as f32
 }
 
 /// L2-normalize each row of `[B, D]` over the feature axis (the PuLID `id_cond_vit` normalization),
@@ -320,6 +344,9 @@ impl PulidFlux {
             &timesteps,
             guidance,
             &pulid_ca,
+            req.sampler.as_deref(),
+            req.scheduler.as_deref(),
+            req.seed,
             &req.cancel,
             on_progress,
         )?;
@@ -327,45 +354,61 @@ impl PulidFlux {
         decode_latents(&self.vae, &latents, req.height as usize, req.width as usize)
     }
 
-    /// The flow-match Euler denoise with the PuLID CA injector — the FLUX denoise calling
-    /// [`IpFlux::forward_injected`] (`Some(injector)`). `img += pred·(t_prev − t_curr)` over the
-    /// **descending** schedule.
+    /// The flow-match denoise with the PuLID CA injector, routed through the unified curated
+    /// sampler/scheduler driver (epic 7114, sc-7297). The `scheduler` axis re-strides FLUX's native
+    /// `get_schedule(..)` over the dev time-shift `mu`; the `sampler` axis picks the integrator. The
+    /// forked [`IpFlux::forward_injected`] (`Some(injector)`) is the model forward, and the PuLID CA
+    /// identity injection stays INSIDE the `predict` closure so a multi-eval solver (heun / dpmpp) re-runs
+    /// the whole step. The DEFAULT (`sampler`/`scheduler` unset ⇒ euler over the native schedule) is the
+    /// N1 path for the legacy inline flow-match Euler loop `img += pred·(σ_{i+1} − σ_i)`. FLUX feeds the
+    /// raw timestep (`Sigma` convention: `t == σ`); guidance is a per-batch tensor the dev DiT embeds.
+    /// Cancellation + progress are owned by the driver.
+    #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
         state: &State,
         timesteps: &[f64],
         guidance: f64,
         injector: &PulidCa,
+        sampler: Option<&str>,
+        scheduler: Option<&str>,
+        seed: u64,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let b_sz = state.img.dim(0)?;
         let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
-        let total = timesteps.len().saturating_sub(1) as u32;
-        let mut img = state.img.clone();
-        for (i, window) in timesteps.windows(2).enumerate() {
-            if cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let (t_curr, t_prev) = (window[0], window[1]);
-            let t_vec = Tensor::full(t_curr as f32, b_sz, &self.device)?;
-            let pred = self.transformer.forward_injected(
-                &img,
-                &state.img_ids,
-                &state.txt,
-                &state.txt_ids,
-                &t_vec,
-                &state.vec,
-                Some(&guidance_t),
-                Some(injector as &dyn DitImageInjector),
-            )?;
-            img = (img + (pred * (t_prev - t_curr))?)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
-        Ok(img)
+        // Native schedule = candle's verbatim `get_schedule(..)` (f32 descending, trailing 0.0); the
+        // default (scheduler unset / native alias) returns it byte-exact, so the legacy flow-match Euler
+        // path is the N1 no-op for `img += pred·(σ_{i+1} − σ_i)`.
+        let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
+        let mu = flow_mu(state.img.dim(1)?);
+        let steps = native.len().saturating_sub(1);
+        let sigmas = candle_gen::resolve_flow_schedule(scheduler, mu, steps, &native);
+        candle_gen::run_flow_sampler(
+            sampler,
+            TimestepConvention::Sigma,
+            &sigmas,
+            state.img.clone(),
+            seed,
+            cancel,
+            on_progress,
+            |img, t| -> Result<Tensor> {
+                // The forked DiT forward returns a `candle_core::Result`; `?` bridges it into the
+                // driver's `CandleError`. The PuLID CA identity injection lives inside this closure.
+                let t_vec = Tensor::full(t, b_sz, &self.device)?;
+                Ok(self.transformer.forward_injected(
+                    img,
+                    &state.img_ids,
+                    &state.txt,
+                    &state.txt_ids,
+                    &t_vec,
+                    &state.vec,
+                    Some(&guidance_t),
+                    Some(injector as &dyn DitImageInjector),
+                )?)
+            },
+        )
     }
 }
 
