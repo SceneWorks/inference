@@ -16,7 +16,13 @@ use crate::media::Image;
 use crate::Result;
 
 /// A whole-image embedding provider (a CLIP-style vision encoder).
-pub trait ImageEmbedder: Send + Sync {
+///
+/// No `Send`/`Sync` bound — like [`Captioner`](crate::caption::Captioner) and
+/// [`Generator`](crate::generator::Generator), and unlike [`FaceEmbedder`](crate::face::FaceEmbedder)
+/// (which only candle implements). An MLX provider holds `mlx_rs::Array`s, whose raw handle is not
+/// `Sync`; the worker loads and runs the embedder entirely inside one `spawn_blocking` task, so it
+/// never crosses threads.
+pub trait ImageEmbedder {
     /// Stable identity + advertised shape, constructible without loading weights.
     fn descriptor(&self) -> &ImageEmbedderDescriptor;
 
