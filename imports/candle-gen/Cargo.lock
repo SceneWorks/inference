@@ -357,6 +357,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-krea"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-qwen-image",
+ "candle-transformers",
+ "image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "serde_json",
+]
+
+[[package]]
 name = "candle-gen-lens"
 version = "0.0.0"
 dependencies = [
