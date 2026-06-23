@@ -437,4 +437,110 @@ mod real {
             }
         }
     }
+
+    /// **sc-7477 ragged + admit-on-retire serving bench.** `attention_bottleneck_bound` uses
+    /// **uniform** lengths and budgets — `generate_batch`'s best case (zero padding waste, one full
+    /// batch) and continuous batching's worst relative case — so its 14–39% gap is an upper bound. The
+    /// real continuous-batching win is **ragged lengths + ragged budgets under a concurrency cap**:
+    /// `generate_batch` cannot admit a new request mid-flight, so to serve `M > max_batch` requests at
+    /// `≤ max_batch` concurrency it must run them in **chunks** that each drain to completion (a short
+    /// request idles its slot until the chunk's longest sequence finishes); continuous **admits on
+    /// retire**, refilling each freed slot immediately and keeping the pipe full.
+    ///
+    /// This pits the two at equal concurrency (`max_batch`) over `M` requests, in a **uniform** and a
+    /// **ragged** scenario, reporting realized tok/s and the gap. The hypothesis (sc-7477): the gap is
+    /// largest uniform and **shrinks or inverts** ragged. Also prints `generate_batch` as one
+    /// `M`-wide batch (its raw-throughput best case, ignoring the no-mid-flight-admission constraint) for
+    /// reference. Set `CANDLE_LLM_TEST_MODEL` (SmolLM2) and/or `CANDLE_LLM_QWEN3_MODEL`.
+    #[test]
+    #[ignore = "needs CANDLE_LLM_TEST_MODEL / CANDLE_LLM_QWEN3_MODEL (CUDA bench)"]
+    fn ragged_churn_serving_bench() {
+        const M: usize = 48; // total requests served
+        const MAX_BATCH: usize = 16; // concurrency cap for both engines
+                                     // Ragged prompt lengths + budgets (cycled across the M requests).
+        const PLENS: [usize; 6] = [8, 16, 32, 64, 96, 128];
+        const BUDGETS: [usize; 5] = [16, 32, 48, 64, 96];
+
+        for env in ["CANDLE_LLM_TEST_MODEL", "CANDLE_LLM_QWEN3_MODEL"] {
+            let Some((model, tok)) = load(env) else {
+                eprintln!("skip: set {env}");
+                continue;
+            };
+            // A long real-token pool to slice ragged prompt lengths from (repeat to clear 128 tokens).
+            let big =
+                "The quick brown fox jumps over the lazy dog near the old riverbank, while a \
+                       curious cat watched the clouds drift slowly across the wide afternoon sky. "
+                    .repeat(12);
+            let pool = encode(&tok, &big);
+            assert!(pool.len() >= 128, "token pool too short: {}", pool.len());
+
+            // Sum of generated tokens over a set of generate_batch chunks, capped to MAX_BATCH each.
+            let gb_chunked = |reqs: &[BatchRequest]| -> (usize, f64) {
+                let t = Instant::now();
+                let mut toks = 0usize;
+                for chunk in reqs.chunks(MAX_BATCH) {
+                    let outs =
+                        generate_batch(&model, chunk, &CancelFlag::new(), &mut |_, _| {}).unwrap();
+                    toks += outs.iter().map(|o| o.tokens.len()).sum::<usize>();
+                }
+                (toks, t.elapsed().as_secs_f64())
+            };
+            let cont = |reqs: &[BatchRequest]| -> (usize, f64) {
+                let cfg = ContinuousConfig {
+                    max_batch: MAX_BATCH,
+                    block_size: 16,
+                    exactness: BatchExactness::Throughput,
+                };
+                let t = Instant::now();
+                let outs = run(&model, reqs, &cfg);
+                let toks: usize = outs.iter().map(|o| o.tokens.len()).sum();
+                (toks, t.elapsed().as_secs_f64())
+            };
+            let report = |label: &str, reqs: &[BatchRequest]| {
+                let (gt, gs) = gb_chunked(reqs);
+                let (ct, cs) = cont(reqs);
+                let (gtps, ctps) = (gt as f64 / gs, ct as f64 / cs);
+                println!(
+                    "  [{label}] M={M} cap={MAX_BATCH}: generate_batch(chunked) {gtps:7.1} tok/s \
+                     ({gt} tok {gs:.2}s) | continuous {ctps:7.1} tok/s ({ct} tok {cs:.2}s) | \
+                     gap {:4.0}%",
+                    100.0 * (1.0 - ctps / gtps)
+                );
+            };
+
+            println!("\n[{env}] ragged_churn_serving_bench:");
+            // UNIFORM control: every request the same (longest) prompt + (largest) budget.
+            let uniform: Vec<BatchRequest> = (0..M)
+                .map(|_| {
+                    req(
+                        pool[..*PLENS.last().unwrap()].to_vec(),
+                        *BUDGETS.last().unwrap(),
+                    )
+                })
+                .collect();
+            report("uniform", &uniform);
+
+            // RAGGED: prompt lengths and budgets cycle across requests.
+            let ragged: Vec<BatchRequest> = (0..M)
+                .map(|i| {
+                    req(
+                        pool[..PLENS[i % PLENS.len()]].to_vec(),
+                        BUDGETS[i % BUDGETS.len()],
+                    )
+                })
+                .collect();
+            report("ragged ", &ragged);
+
+            // Reference: generate_batch as ONE M-wide batch over the ragged set (its raw-throughput
+            // best case — assumes all M present up front, ignoring the no-mid-flight-admission limit).
+            let t = Instant::now();
+            let outs = generate_batch(&model, &ragged, &CancelFlag::new(), &mut |_, _| {}).unwrap();
+            let big_toks: usize = outs.iter().map(|o| o.tokens.len()).sum();
+            println!(
+                "  [ref] generate_batch one {M}-wide batch (ragged): {:7.1} tok/s ({big_toks} tok {:.2}s)",
+                big_toks as f64 / t.elapsed().as_secs_f64(),
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
 }

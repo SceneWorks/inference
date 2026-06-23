@@ -1345,4 +1345,420 @@ mod tests {
         assert!(plan("model.norm.weight").is_cpu());
         assert!(plan("lm_head.weight").is_cpu());
     }
+
+    /// **sc-7477 per-step decode phase decomposition.** Reconstructs **one** decode step for both the
+    /// continuous `Throughput` path ([`CausalLm::decode_logits_per_seq`]) and the `generate_batch`
+    /// decode path ([`CausalLm::decode_logits_masked`]) at batch `N`, over a uniform cached context of
+    /// length `L`, and sync-brackets every phase — embed, RoPE-table build, the per-step index/mask
+    /// **build**, and per layer: input-norm, q/k/v projection, the attention core (scatter-write +
+    /// gather + varlen kernel for continuous; cache-cat + masked SDPA for the batch path), o-projection,
+    /// MLP — plus the final norm + lm_head. The non-attention phases are the **same batched ops on the
+    /// same shapes** in both paths, so the per-step gap must live in the attention core + the index/mask
+    /// build; this attributes it, and the `attention / total` ratio per model explains the
+    /// SmolLM2-vs-Qwen3 asymmetry.
+    ///
+    /// Calls the **real** layer methods (`project`/`output`/`combine_ffn`/`scatter_write`/`gather`/the
+    /// varlen kernel / `sdpa`) in the real forwards' order, so the breakdown does not drift from the
+    /// production path. Each phase is `synchronize()`-bracketed, so the columns are
+    /// launch-latency-attributed and the *sum* over-counts the real pipelined step (the realized
+    /// end-to-end throughput is `attention_bottleneck_bound`); the cross-path *comparison* is the signal.
+    /// Needs `--features flash-attn` + CUDA + `CANDLE_LLM_TEST_MODEL` / `CANDLE_LLM_QWEN3_MODEL`.
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    #[ignore = "sc-7477 phase bench; needs CUDA + CANDLE_LLM_TEST_MODEL / CANDLE_LLM_QWEN3_MODEL"]
+    fn decode_step_phase_breakdown_on_cuda() {
+        use crate::config::ModelConfig;
+        use crate::primitives::attention::{repeat_kv, sdpa, try_flash_attn_varlen};
+        use crate::primitives::kv_cache::KvCache;
+        use crate::primitives::{BlockPool, PagedKvCache, Weights};
+        use std::time::Instant;
+
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skip: no CUDA device");
+                return;
+            }
+        };
+        const N: usize = 16; // occupancy where the gap is largest
+        const L: usize = 60; // prior cached length (uniform); the step attends L+1
+        let iters = 30usize;
+        let warmup = 8usize;
+
+        for env in ["CANDLE_LLM_TEST_MODEL", "CANDLE_LLM_QWEN3_MODEL"] {
+            let Ok(dir) = std::env::var(env) else {
+                eprintln!("skip {env}: unset");
+                continue;
+            };
+            if dir.is_empty() {
+                eprintln!("skip {env}: empty");
+                continue;
+            }
+            let cfg = ModelConfig::from_dir(&dir).unwrap();
+            let model = CausalLm::from_weights(&Weights::from_dir(&dir, &device).unwrap(), "", cfg)
+                .unwrap();
+            let dt = model.dtype;
+            let nkv = model.cfg.num_kv_heads as usize;
+            let hd = model.cfg.head_dim as usize;
+            let nl = model.cfg.num_layers;
+            println!(
+                "\n[{env}] N={N} L={L} (attends {}), layers={nl}, H={} KVH={nkv} D={hd}, dtype={dt:?}",
+                L + 1,
+                model.cfg.num_heads
+            );
+
+            // Bounded bf16/f16 dummy of arbitrary shape (values irrelevant to kernel timing).
+            let mk = |dims: &[usize], phase: f64| -> Tensor {
+                let n: usize = dims.iter().product();
+                Tensor::arange(0f32, n as f32, &device)
+                    .unwrap()
+                    .reshape(dims)
+                    .unwrap()
+                    .affine(0.013, phase)
+                    .unwrap()
+                    .cos()
+                    .unwrap()
+                    .to_dtype(dt)
+                    .unwrap()
+            };
+
+            let ids = Tensor::from_vec(vec![5u32; N], (N, 1), &device).unwrap();
+            let positions: Vec<i32> = (0..N).map(|_| L as i32).collect();
+            let us = |s: f64| s / iters as f64 * 1e6;
+            let sync = || device.synchronize().unwrap();
+
+            // ===================== Continuous Throughput path =====================
+            // N paged caches over one pool, prefilled to L, with this step's +1 token reserved so the
+            // gather index spans L+1 per sequence. State is held fixed across iters (re-scatter to the
+            // same slots, re-gather the same index) so every iter measures the step at the same L.
+            let pool = BlockPool::new(16);
+            let mut pcaches: Vec<PagedKvCache> = (0..N)
+                .map(|_| PagedKvCache::with_pool(pool.clone(), nl))
+                .collect();
+            for c in pcaches.iter_mut() {
+                for layer in 0..nl {
+                    c.update(
+                        layer,
+                        &mk(&[1, nkv, L, hd], 0.1),
+                        &mk(&[1, nkv, L, hd], 0.2),
+                    )
+                    .unwrap();
+                }
+            }
+            for c in pcaches.iter_mut() {
+                c.reserve_step(1).unwrap();
+            }
+
+            let (mut c_embed, mut c_rope, mut c_build, mut c_iln, mut c_proj) =
+                (0f64, 0f64, 0f64, 0f64, 0f64);
+            let (mut c_write, mut c_gather, mut c_kernel, mut c_oproj, mut c_mlp, mut c_head) =
+                (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+            // Sub-task 4: split build into host-loop (Vec construction) vs from_vec (H2D copy).
+            let (mut c_build_host, mut c_build_copy) = (0f64, 0f64);
+
+            {
+                let crefs: Vec<&mut PagedKvCache> = pcaches.iter_mut().collect();
+                for it in 0..(warmup + iters) {
+                    let rec = it >= warmup;
+
+                    sync();
+                    let t = Instant::now();
+                    let mut h = model.embed(&ids).unwrap();
+                    sync();
+                    let t_e = Instant::now();
+                    let (cos, sin) = model.rope_tables(&positions, N as i32, 1).unwrap();
+                    sync();
+                    let t_r = Instant::now();
+
+                    // build: the per-step gather + fused-write index (host loops + H2D copies).
+                    let cols = nkv * hd;
+                    let mut index: Vec<u32> = Vec::new();
+                    let mut wslots: Vec<u32> = Vec::new();
+                    let mut cu_k = vec![0u32];
+                    let mut acc = 0u32;
+                    let mut max_k = 0usize;
+                    for c in crefs.iter() {
+                        let ts = c.token_slots();
+                        index.extend_from_slice(ts);
+                        acc += ts.len() as u32;
+                        cu_k.push(acc);
+                        max_k = max_k.max(ts.len());
+                        for &slot in c.new_token_slots() {
+                            for _ in 0..cols {
+                                wslots.push(slot);
+                            }
+                        }
+                    }
+                    let total_new = wslots.len() / cols;
+                    let t_bh = Instant::now(); // host loops done; below is the H2D copy
+                    let index = Tensor::from_vec(index, (acc as usize,), &device).unwrap();
+                    let write_index =
+                        Tensor::from_vec(wslots, (total_new, nkv, hd), &device).unwrap();
+                    sync();
+                    let t_b = Instant::now();
+
+                    for (li, layer) in model.layers.iter().enumerate() {
+                        let a = match &layer.attn {
+                            Attention::Gqa(a) => a,
+                            Attention::Mla(_) => unreachable!("test models are GQA"),
+                        };
+                        sync();
+                        let l0 = Instant::now();
+                        let xn = rms_norm(&h, &layer.input_ln, layer.eps).unwrap();
+                        sync();
+                        let l1 = Instant::now();
+                        let (q, k, v) = a.project(&xn, &cos, &sin).unwrap();
+                        sync();
+                        let l2 = Instant::now();
+                        let k_tm = k
+                            .transpose(1, 2)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((total_new, nkv, hd))
+                            .unwrap();
+                        let v_tm = v
+                            .transpose(1, 2)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((total_new, nkv, hd))
+                            .unwrap();
+                        crefs[0]
+                            .pool()
+                            .borrow()
+                            .scatter_write(li, &write_index, &k_tm, &v_tm)
+                            .unwrap();
+                        sync();
+                        let l3 = Instant::now();
+                        let (k_rag, v_rag) = crefs[0].pool().borrow().gather(li, &index).unwrap();
+                        sync();
+                        let l4 = Instant::now();
+                        let out = try_flash_attn_varlen(
+                            &q, &k_rag, &v_rag, &cu_k, max_k, a.scale, a.softcap,
+                        )
+                        .unwrap()
+                        .expect("varlen-eligible");
+                        sync();
+                        let l5 = Instant::now();
+                        let attn = a.output(&out).unwrap();
+                        sync();
+                        let l6 = Instant::now();
+                        h = layer.combine_ffn(&h, &attn).unwrap();
+                        sync();
+                        let l7 = Instant::now();
+                        if rec {
+                            c_iln += (l1 - l0).as_secs_f64();
+                            c_proj += (l2 - l1).as_secs_f64();
+                            c_write += (l3 - l2).as_secs_f64();
+                            c_gather += (l4 - l3).as_secs_f64();
+                            c_kernel += (l5 - l4).as_secs_f64();
+                            c_oproj += (l6 - l5).as_secs_f64();
+                            c_mlp += (l7 - l6).as_secs_f64();
+                        }
+                    }
+                    // The norm + lm_head phase (head) is measured cleanly in the standalone block below.
+                    let last = h.narrow(1, 0, 1).unwrap().contiguous().unwrap();
+                    let _logits = model.project_logits(&last).unwrap();
+                    sync();
+                    if rec {
+                        c_embed += (t_e - t).as_secs_f64();
+                        c_rope += (t_r - t_e).as_secs_f64();
+                        c_build += (t_b - t_r).as_secs_f64();
+                        c_build_host += (t_bh - t_r).as_secs_f64();
+                        c_build_copy += (t_b - t_bh).as_secs_f64();
+                    }
+                }
+            }
+
+            // Norm + lm_head on a [N,1,hidden] hidden state (identical in both paths).
+            {
+                let hh = mk(&[N, 1, model.cfg.hidden_size as usize], 0.3);
+                for it in 0..(warmup + iters) {
+                    sync();
+                    let t = Instant::now();
+                    let _ = model.project_logits(&hh).unwrap();
+                    sync();
+                    if it >= warmup {
+                        c_head += t.elapsed().as_secs_f64();
+                    }
+                }
+            }
+
+            let c_attn = c_build + c_write + c_gather + c_kernel;
+            let c_total = c_embed
+                + c_rope
+                + c_build
+                + c_iln
+                + c_proj
+                + c_write
+                + c_gather
+                + c_kernel
+                + c_oproj
+                + c_mlp
+                + c_head;
+            println!("  -- continuous Throughput per-step (sync-bracketed, sum over {nl} layers):");
+            println!(
+                "     embed {:6.1} | rope {:6.1} | build {:6.1} (host {:5.1}+copy {:5.1}) | \
+                 iln {:6.1} | qkv-proj {:7.1} | write {:6.1} | gather {:6.1} | kernel {:7.1} | \
+                 o-proj {:7.1} | mlp {:8.1} | norm+head {:6.1} | TOTAL {:8.1} us",
+                us(c_embed),
+                us(c_rope),
+                us(c_build),
+                us(c_build_host),
+                us(c_build_copy),
+                us(c_iln),
+                us(c_proj),
+                us(c_write),
+                us(c_gather),
+                us(c_kernel),
+                us(c_oproj),
+                us(c_mlp),
+                us(c_head),
+                us(c_total),
+            );
+            println!(
+                "     attention (build+write+gather+kernel) {:7.1} us = {:.0}% of step",
+                us(c_attn),
+                100.0 * c_attn / c_total
+            );
+
+            // ===================== generate_batch decode path =====================
+            // One dense [N,nkv,L,hd] cached K/V per layer (reused), catted with the step's new token
+            // and attended by one masked SDPA — exactly decode_logits_masked's per-step attention.
+            let k_cached = mk(&[N, nkv, L, hd], 0.4);
+            let v_cached = mk(&[N, nkv, L, hd], 0.5);
+            let (mut b_embed, mut b_rope, mut b_build, mut b_iln, mut b_proj) =
+                (0f64, 0f64, 0f64, 0f64, 0f64);
+            let (mut b_cat, mut b_kernel, mut b_oproj, mut b_mlp) = (0f64, 0f64, 0f64, 0f64);
+            for it in 0..(warmup + iters) {
+                let rec = it >= warmup;
+                sync();
+                let t = Instant::now();
+                let mut h = model.embed(&ids).unwrap();
+                sync();
+                let t_e = Instant::now();
+                let (cos, sin) = model.rope_tables(&positions, N as i32, 1).unwrap();
+                sync();
+                let t_r = Instant::now();
+                // build: the [N,1,1,L+1] additive decode mask (host loop + H2D + dtype cast),
+                // mirroring batch::decode_mask. Uniform lengths -> every key attendable (no left-pad).
+                let kt = L + 1;
+                let pad_len = 0i32; // uniform lengths: no left-pad region to block
+                let mut mh = Vec::with_capacity(N * kt);
+                for _lane in 0..N {
+                    for j in 0..kt {
+                        mh.push(if (j as i32) >= pad_len {
+                            0.0f32
+                        } else {
+                            -1e30f32
+                        });
+                    }
+                }
+                let mask = Tensor::from_vec(mh, (N, 1, 1, kt), &device)
+                    .unwrap()
+                    .to_dtype(dt)
+                    .unwrap();
+                sync();
+                let t_b = Instant::now();
+                for layer in model.layers.iter() {
+                    let a = match &layer.attn {
+                        Attention::Gqa(a) => a,
+                        Attention::Mla(_) => unreachable!(),
+                    };
+                    sync();
+                    let l0 = Instant::now();
+                    let xn = rms_norm(&h, &layer.input_ln, layer.eps).unwrap();
+                    sync();
+                    let l1 = Instant::now();
+                    let (q, k, v) = a.project(&xn, &cos, &sin).unwrap();
+                    sync();
+                    let l2 = Instant::now();
+                    let k_all = Tensor::cat(&[&k_cached, &k], 2).unwrap();
+                    let v_all = Tensor::cat(&[&v_cached, &v], 2).unwrap();
+                    let k_all = repeat_kv(&k_all, a.groups).unwrap();
+                    let v_all = repeat_kv(&v_all, a.groups).unwrap();
+                    sync();
+                    let l3 = Instant::now();
+                    let out = sdpa(
+                        &q,
+                        &k_all,
+                        &v_all,
+                        a.scale,
+                        a.softcap,
+                        AttnMask::Additive(&mask),
+                    )
+                    .unwrap();
+                    sync();
+                    let l4 = Instant::now();
+                    let attn = a.output(&out).unwrap();
+                    sync();
+                    let l5 = Instant::now();
+                    h = layer.combine_ffn(&h, &attn).unwrap();
+                    sync();
+                    let l6 = Instant::now();
+                    if rec {
+                        b_iln += (l1 - l0).as_secs_f64();
+                        b_proj += (l2 - l1).as_secs_f64();
+                        b_cat += (l3 - l2).as_secs_f64();
+                        b_kernel += (l4 - l3).as_secs_f64();
+                        b_oproj += (l5 - l4).as_secs_f64();
+                        b_mlp += (l6 - l5).as_secs_f64();
+                    }
+                }
+                let last = h.narrow(1, 0, 1).unwrap().contiguous().unwrap();
+                let _ = model.project_logits(&last).unwrap();
+                sync();
+                if rec {
+                    b_embed += (t_e - t).as_secs_f64();
+                    b_rope += (t_r - t_e).as_secs_f64();
+                    b_build += (t_b - t_r).as_secs_f64();
+                }
+            }
+            let b_attn = b_build + b_cat + b_kernel;
+            let b_total = b_embed
+                + b_rope
+                + b_build
+                + b_iln
+                + b_proj
+                + b_cat
+                + b_kernel
+                + b_oproj
+                + b_mlp
+                + c_head; // norm+head identical to continuous; reuse the clean measurement
+            println!("  -- generate_batch decode per-step (sync-bracketed, sum over {nl} layers):");
+            println!(
+                "     embed {:6.1} | rope {:6.1} | build {:6.1} | iln {:6.1} | qkv-proj {:7.1} | \
+                 cat {:6.1} | sdpa {:7.1} | o-proj {:7.1} | mlp {:8.1} | norm+head {:6.1} | \
+                 TOTAL {:8.1} us",
+                us(b_embed),
+                us(b_rope),
+                us(b_build),
+                us(b_iln),
+                us(b_proj),
+                us(b_cat),
+                us(b_kernel),
+                us(b_oproj),
+                us(b_mlp),
+                us(c_head),
+                us(b_total),
+            );
+            println!(
+                "     attention (build+cat+sdpa) {:7.1} us = {:.0}% of step",
+                us(b_attn),
+                100.0 * b_attn / b_total
+            );
+            println!(
+                "  -- GAP: cont {:.1} - batch {:.1} = {:.1} us/step ({:.0}% slower); \
+                 attn-core delta {:.1} us (cont {:.1} - batch {:.1})",
+                us(c_total),
+                us(b_total),
+                us(c_total - b_total),
+                100.0 * (c_total / b_total - 1.0),
+                us(c_attn - b_attn),
+                us(c_attn),
+                us(b_attn),
+            );
+        }
+    }
 }
