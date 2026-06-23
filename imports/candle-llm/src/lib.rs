@@ -16,6 +16,8 @@
 //!    and registers it (`candle-llama`), so consumers stream a generation entirely through
 //!    `core-llm`. Passing the `core-llm-testkit` conformance suite as a second backend is what
 //!    de-provisionalizes the contract (story 7237).
+//! 5. [`prepare`] — registers a [`core_llm::SnapshotPreparerRegistration`]: convert an HF snapshot
+//!    or a `*.gguf` into a persisted, loadable snapshot, optionally baking in Q4/Q8 (story 7662).
 //!
 //! Compute runs in `bf16` on the GPU backends (CUDA / Metal) and `f32` on CPU. Candle `Tensor`s are
 //! `Send`/`Sync`, so a loaded model is freely shareable across threads.
@@ -28,6 +30,7 @@ pub mod gguf;
 pub mod image;
 pub mod llava;
 pub mod models;
+pub mod prepare;
 pub mod primitives;
 pub mod provider;
 

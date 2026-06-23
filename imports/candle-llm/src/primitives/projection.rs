@@ -32,6 +32,24 @@ impl QuantSpec {
             dtype: GgmlDType::Q8_0,
         }
     }
+
+    /// Map a persisted `quantization.bits` value to a spec: `4 → Q4_K`, `8 → Q8_0`. Any other width
+    /// is unrecognized (`None`) — the snapshot writer only ever emits 4 or 8.
+    pub fn from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            4 => Some(Self::q4()),
+            8 => Some(Self::q8()),
+            _ => None,
+        }
+    }
+
+    /// The bit width to persist in a snapshot's `quantization` block (`Q4_K → 4`, `Q8_0 → 8`).
+    pub fn bits(&self) -> u32 {
+        match self.dtype {
+            GgmlDType::Q8_0 => 8,
+            _ => 4,
+        }
+    }
 }
 
 /// A linear projection weight, dense or quantized.

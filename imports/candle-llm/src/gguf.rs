@@ -35,6 +35,9 @@ use crate::primitives::Weights;
 pub struct GgufCheckpoint {
     /// Model config reconstructed from the GGUF metadata table.
     pub config: ModelConfig,
+    /// The HF-shaped `config.json` value the [`config`](Self::config) was parsed from — retained so
+    /// the snapshot writer (story 7662) can serialize it back out for a converted snapshot.
+    pub config_json: Json,
     /// Dense, transformer-keyed weights (q/k already un-permuted to the HF layout).
     pub weights: Weights,
     /// Stop token ids from `tokenizer.ggml.eos_token_id` (+ EOT when distinct); empty if absent.
@@ -124,7 +127,8 @@ impl GgufCheckpoint {
         // lm_head tied iff the GGUF has no separate output projection.
         let tied = !tensors.contains_key("lm_head.weight");
 
-        let config = reconstruct_config(meta, &arch, num_heads, num_kv_heads, vocab, tied)?;
+        let (config, config_json) =
+            reconstruct_config(meta, &arch, num_heads, num_kv_heads, vocab, tied)?;
         let weights = Weights::from_map(tensors, device.clone());
 
         // --- tokenizer / template / stop-token metadata ---
@@ -138,6 +142,7 @@ impl GgufCheckpoint {
 
         Ok(Self {
             config,
+            config_json,
             weights,
             stop_tokens,
             chat_template,
@@ -156,6 +161,16 @@ impl GgufCheckpoint {
     /// GGUF (`model = "llama"`, scores-only, no merges) is rejected with a clear message asking for a
     /// sibling `tokenizer.json`.
     pub fn tokenizer_from_metadata(&self) -> Result<core_llm::Tokenizer> {
+        let json = self.tokenizer_json_from_metadata()?;
+        core_llm::Tokenizer::from_json(&json).map_err(|e| Error::Msg(format!("gguf: {e}")))
+    }
+
+    /// Build the HF `tokenizer.json` string from the GGUF's embedded tokenizer metadata (the source
+    /// for [`tokenizer_from_metadata`](Self::tokenizer_from_metadata), exposed so the snapshot writer
+    /// (story 7662) can persist a self-contained `tokenizer.json` when converting a GGUF). Errors on a
+    /// tokenizer kind that can't be rebuilt from GGUF (no tokens, or SentencePiece/unigram with no
+    /// merges) — the caller should supply a sibling `tokenizer.json` in that case.
+    pub fn tokenizer_json_from_metadata(&self) -> Result<String> {
         if self.tok_tokens.is_empty() {
             return Err(Error::Unsupported(
                 "gguf: no tokenizer.ggml.tokens metadata; provide a sibling tokenizer.json".into(),
@@ -168,8 +183,7 @@ impl GgufCheckpoint {
                 self.tok_model.as_deref().unwrap_or("?")
             )));
         }
-        let json = self.build_bpe_tokenizer_json();
-        core_llm::Tokenizer::from_json(&json).map_err(|e| Error::Msg(format!("gguf: {e}")))
+        Ok(self.build_bpe_tokenizer_json())
     }
 
     /// Build a HF `tokenizer.json` (byte-level BPE) string from the retained GGUF tokenizer metadata.
@@ -318,7 +332,7 @@ fn reconstruct_config(
     num_kv_heads: usize,
     vocab: i64,
     tied: bool,
-) -> Result<ModelConfig> {
+) -> Result<(ModelConfig, Json)> {
     let key = |s: &str| format!("{arch}.{s}");
     let req_u64 = |s: &str| -> Result<u64> {
         meta_u64(meta, &key(s))
@@ -364,7 +378,9 @@ fn reconstruct_config(
     if let Some(scaling) = reconstruct_rope_scaling(meta, arch) {
         cfg.insert("rope_scaling".into(), scaling);
     }
-    ModelConfig::from_json(&Json::Object(cfg))
+    let json = Json::Object(cfg);
+    let config = ModelConfig::from_json(&json)?;
+    Ok((config, json))
 }
 
 /// Best-effort llama3 RoPE-scaling reconstruction from GGUF metadata; absent keys ⇒ standard RoPE.

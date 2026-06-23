@@ -23,10 +23,10 @@ use candle_core::{Device, Tensor};
 use serde_json::Value;
 
 use core_llm::{
-    ChatTemplate, Content, Error as CoreError, FinishReason as CoreFinish, JinjaChatTemplate,
-    Llama3Template, LoadSpec, Message, Result as CoreResult, Sampling, StreamEvent as CoreEvent,
-    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer,
-    Usage,
+    Channel, ChatTemplate, Content, Error as CoreError, FinishReason as CoreFinish,
+    JinjaChatTemplate, Llama3Template, LoadSpec, Message, Quantize, Result as CoreResult, Sampling,
+    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, Tokenizer, Usage,
 };
 
 use crate::config::ModelConfig;
@@ -38,6 +38,7 @@ use crate::image::SiglipImageProcessor;
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
 use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, gelu_erf, linear};
+use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 use crate::primitives::{input_ids, Weights};
 
@@ -260,14 +261,28 @@ impl LlavaModel {
     /// `text_config` for the decoder and loads the LLaVA-prefixed weight tree
     /// (`language_model.*`, `vision_tower.vision_model.*`, `multi_modal_projector.*`).
     pub fn from_dir(dir: impl AsRef<Path>, device: &Device) -> Result<Self> {
+        Self::from_dir_with(dir, device, None)
+    }
+
+    /// Like [`from_dir`](Self::from_dir) but optionally quantizing the **language decoder**'s
+    /// projections (`requested`, else the snapshot's own persisted `quantization` block). The vision
+    /// tower and projector always stay dense (they run in f32). This is the VLM resolution of the
+    /// former blanket "load-time quantization is not supported" guard: the decoder's quant rides the
+    /// same tensor-level path as the text provider (story 7662).
+    pub fn from_dir_with(
+        dir: impl AsRef<Path>,
+        device: &Device,
+        requested: Option<QuantSpec>,
+    ) -> Result<Self> {
         let dir = dir.as_ref();
         let text = std::fs::read_to_string(dir.join("config.json"))?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Config(format!("llava config.json: {e}")))?;
         let cfg = LlavaConfig::from_json(&v)?;
 
+        let quant = requested.or(cfg.text.quantization);
         let w = Weights::from_dir(dir, device)?;
-        let language = CausalLm::from_weights(&w, "language_model", cfg.text.clone())?;
+        let language = CausalLm::from_weights_with(&w, "language_model", cfg.text.clone(), quant)?;
         let vision = SiglipVisionTower::from_weights(&w, "vision_tower.vision_model", cfg.vision)?;
         let projector =
             LlavaProjector::from_weights(&w, "multi_modal_projector", cfg.projector_gelu_tanh)?;
@@ -401,16 +416,17 @@ pub struct LlavaProvider {
 }
 
 impl LlavaProvider {
-    /// Load from a snapshot directory (config.json + tokenizer.json + shards).
+    /// Load from a snapshot directory (config.json + tokenizer.json + shards). An explicit
+    /// `spec.quantize` (or the snapshot's persisted `quantization` block) quantizes the language
+    /// decoder's projections; the vision tower and projector stay dense.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        if spec.quantize.is_some() {
-            return Err(CoreError::Unsupported(
-                "llava: load-time quantization is not supported".into(),
-            ));
-        }
+        let requested = spec.quantize.map(|q| match q {
+            Quantize::Q4 => QuantSpec::q4(),
+            Quantize::Q8 => QuantSpec::q8(),
+        });
         let dir = Path::new(&spec.source);
         let device = select_device().map_err(to_core)?;
-        let model = LlavaModel::from_dir(dir, &device).map_err(to_core)?;
+        let model = LlavaModel::from_dir_with(dir, &device, requested).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = crate::provider::eos_token_ids(dir);
         let stop_tokens = if stop_tokens.is_empty() {
@@ -544,6 +560,7 @@ impl TextLlm for LlavaProvider {
                         id: id as u32,
                         text: delta,
                         index: step,
+                        channel: Channel::Content,
                     });
                 }
             }
@@ -575,6 +592,7 @@ impl TextLlm for LlavaProvider {
         });
         Ok(TextLlmOutput {
             text,
+            thinking: None,
             usage,
             finish_reason: Some(finish),
         })
@@ -592,6 +610,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             max_new_tokens: 0,
             supports_system_prompt: true,
             supports_vision: true,
+            supports_thinking: false,
             supported_constraints: Vec::new(),
         },
     }

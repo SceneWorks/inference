@@ -137,6 +137,12 @@ impl Weights {
     pub fn device(&self) -> &Device {
         &self.device
     }
+
+    /// Consume into the underlying `name → Tensor` map (used by the snapshot writer, which mutates
+    /// then re-serializes the tensors via `candle_core::safetensors::save`).
+    pub fn into_map(self) -> HashMap<String, Tensor> {
+        self.tensors
+    }
 }
 
 #[cfg(test)]
