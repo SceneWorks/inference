@@ -28,6 +28,9 @@
 //!   preserving acceptance sampler).
 //! - [`registry`] — link-time provider registration, id-based routing, and **model-first**
 //!   resolution ([`load_for_model`] / [`ModelRequirements`] over a weightless `can_load` probe).
+//! - [`prepare_snapshot`] — persisted, backend-neutral snapshot preparation: turn a downloaded
+//!   HF-safetensors or GGUF source into a loadable, optionally-quantized snapshot, delegating the
+//!   tensor work to the linked backend ([`PrepareSpec`] / [`SnapshotPreparerRegistration`]).
 
 pub mod cancel;
 pub mod capabilities;
@@ -37,6 +40,7 @@ pub mod message;
 pub mod output;
 pub mod paging;
 pub mod prefix;
+pub mod prepare;
 pub mod registry;
 pub mod request;
 pub mod schedule;
@@ -55,6 +59,10 @@ pub use message::{Content, ImageRef, Message, Role};
 pub use output::{Channel, FinishReason, StreamEvent, TextLlmOutput, Usage};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
+pub use prepare::{
+    detect_format, prepare_snapshot, snapshot_preparers, ModelFormat, PrepareReport, PrepareSpec,
+    SnapshotPreparerRegistration,
+};
 pub use registry::{
     load_for_model, load_for_model_with, load_textllm, textllms, ModelRequirements,
     TextLlmRegistration,

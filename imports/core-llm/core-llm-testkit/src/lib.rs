@@ -22,9 +22,11 @@
 //! with a combined message.
 
 use core_llm::{
-    Channel, Content, Error, FinishReason, ImageRef, Message, Role, Sampling, StreamEvent, TextLlm,
-    TextLlmRequest, ThinkingMode, VERSION,
+    load_for_model, prepare_snapshot, Channel, Content, Error, FinishReason, ImageRef, LoadSpec,
+    Message, PrepareSpec, Quantize, Role, Sampling, StreamEvent, TextLlm, TextLlmRequest,
+    ThinkingMode, VERSION,
 };
+use std::path::PathBuf;
 
 /// Configures the conformance run: the prompt, token budget, the sampling used for the determinism
 /// check, and an optional image for the multimodal check.
@@ -481,6 +483,89 @@ pub fn check_thinking(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), S
             "check_thinking[{id}]: no-think (Disabled) request produced reasoning in output.thinking"
         ));
     }
+    Ok(())
+}
+
+/// Profile for the snapshot-preparer conformance check: a real model `source` the linked backend can
+/// prepare and then load, a writable `out_dir` the test owns, and the `quantize` scheme to exercise
+/// (`None` covers the dense / passthrough path; `Some(_)` exercises persisted re-quantization).
+#[derive(Clone, Debug)]
+pub struct SnapshotPreparerProfile {
+    /// A downloaded model the linked backend can prepare (an HF-safetensors dir or a `*.gguf`).
+    pub source: PathBuf,
+    /// A writable directory the prepared snapshot is written into.
+    pub out_dir: PathBuf,
+    /// The quantization to bake in (`None` ⇒ dense).
+    pub quantize: Option<Quantize>,
+}
+
+/// Drive the registered snapshot preparer through the contract's guarantees end-to-end on a real
+/// fixture: [`prepare_snapshot`](core_llm::prepare_snapshot) materializes a persisted snapshot from
+/// `profile.source` whose [`PrepareReport`](core_llm::PrepareReport) is self-consistent and whose
+/// `out_dir` [`load_for_model`](core_llm::load_for_model) can load, and an unrecognized source is a
+/// typed [`Error::Unsupported`] rather than a panic.
+///
+/// This is **not** part of the always-on [`textllm_conformance`] run — it needs a model on disk and
+/// both a preparer and a provider linked, so a backend's tests call it directly behind their
+/// gated-real-model fixture.
+pub fn check_snapshot_preparer(profile: &SnapshotPreparerProfile) -> Result<(), String> {
+    let spec = PrepareSpec {
+        source: profile.source.clone(),
+        out_dir: profile.out_dir.clone(),
+        quantize: profile.quantize,
+    };
+
+    let report = prepare_snapshot(&spec).map_err(|e| {
+        format!(
+            "check_snapshot_preparer: prepare_snapshot('{}') failed: {e}",
+            profile.source.display()
+        )
+    })?;
+
+    if report.quantized != profile.quantize {
+        return Err(format!(
+            "check_snapshot_preparer: report.quantized {:?} != requested {:?}",
+            report.quantized, profile.quantize
+        ));
+    }
+    if report.num_tensors == 0 {
+        return Err(
+            "check_snapshot_preparer: report.num_tensors is 0 (nothing was written?)".to_string(),
+        );
+    }
+    if !report.out_dir.exists() {
+        return Err(format!(
+            "check_snapshot_preparer: report.out_dir '{}' does not exist after prepare",
+            report.out_dir.display()
+        ));
+    }
+
+    // The headline guarantee: the prepared snapshot is loadable through the contract.
+    load_for_model(&LoadSpec::dense(report.out_dir.to_string_lossy().to_string())).map_err(|e| {
+        format!(
+            "check_snapshot_preparer: prepared snapshot '{}' not loadable via load_for_model: {e}",
+            report.out_dir.display()
+        )
+    })?;
+
+    // An unrecognized source is a typed Unsupported, not a panic or a generic error.
+    let bogus = profile.out_dir.join("core-llm-testkit-not-a-model");
+    let bogus_out = profile.out_dir.join("core-llm-testkit-bogus-out");
+    match prepare_snapshot(&PrepareSpec::dense(bogus, bogus_out)) {
+        Err(Error::Unsupported(_)) => {}
+        Err(other) => {
+            return Err(format!(
+                "check_snapshot_preparer: unknown source gave `{other}` (want Unsupported)"
+            ));
+        }
+        Ok(_) => {
+            return Err(
+                "check_snapshot_preparer: prepare_snapshot succeeded on a non-model source"
+                    .to_string(),
+            );
+        }
+    }
+
     Ok(())
 }
 
