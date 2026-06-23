@@ -158,6 +158,8 @@ fn real_weight_ip_adapter() {
         steps: 50,
         guidance: 5.0,
         ip_adapter_scale: 0.6,
+        sampler: None,
+        scheduler: None,
         seed: 12345,
         cancel: CancelFlag::new(),
     };

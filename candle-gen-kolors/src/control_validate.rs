@@ -114,6 +114,8 @@ fn real_weight_control() {
         steps: 30,
         guidance: 5.0,
         control_scale: 1.0,
+        sampler: None,
+        scheduler: None,
         seed: 12345,
         cancel: CancelFlag::new(),
     };

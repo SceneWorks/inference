@@ -182,6 +182,8 @@ fn real_weight_pulid() {
         steps,
         guidance: 4.0,
         id_weight: 1.0,
+        sampler: None,
+        scheduler: None,
         seed: 12345,
         cancel: CancelFlag::new(),
     };
