@@ -20,7 +20,10 @@ Built bottom-up, mirroring `mlx-llm`'s structure on Candle tensors:
 4. **`provider`** — implements `core_llm::TextLlm` over the engine and registers it (`candle-llama`).
    Supports a controllable **thinking mode** for models whose chat template gates `enable_thinking`
    (e.g. Qwen3): a `ThinkingSegmenter` splits the stream into `<think>…</think>` reasoning vs answer,
-   surfaced on the `Thinking` / `Content` channels and in `out.thinking`.
+   surfaced on the `Thinking` / `Content` channels and in `out.thinking`. Supports **tool (function)
+   calling** for models whose chat template renders tools (e.g. Qwen3.6): a request's `tools` render
+   into the prompt, and a `ToolCallSegmenter` lifts the model's `<tool_call>` blocks (Qwen3.6 XML or
+   JSON/Hermes) out of the answer text into structured `out.tool_calls`.
 5. **`prepare`** — implements `core_llm::SnapshotPreparer`: turn a downloaded model (an HF snapshot
    dir or a `*.gguf`) into a persisted, loadable snapshot, optionally baking in Q4/Q8. Candle's
    `QTensor` has no safetensors form, so a quantized snapshot is dense weights carrying the
@@ -77,6 +80,7 @@ parity tests:
 |---|---|---|
 | `CANDLE_LLM_TEST_MODEL` | a Llama-family HF snapshot dir (e.g. SmolLM2-135M-Instruct) | conformance (dense + **Q8** quantize-on-load), batch decode, **prefix-cache** reuse, **paged** cache, **continuous** batching, **speculative** (prompt-lookup + draft-model), **snapshot prepare** (dense + Q8), `bench` (tokens/s) |
 | `CANDLE_LLM_QWEN3_MODEL` | a Qwen3 HF snapshot dir | conformance (dense + **Q4** quantize-on-load; q/k RMSNorm, head_dim 128), **prefix-cache** reuse, **paged** cache, **continuous** batching, **speculative** (prompt-lookup + draft-model), **snapshot prepare** (Q4), **thinking** (Qwen3 gates `enable_thinking` → real `<think>` reasoning) |
+| `CANDLE_LLM_QWEN35_MODEL` | a Qwen3.6 (`qwen3_5` / Qwen3-Next) snapshot dir (27B dense or 35B-A3B MoE) | `qwen35` — resolve/dispatch, coherent text, think/no-think, Q8, conformance; **tool calling** (`qwen35_tools` — the model emits a `<tool_call>` that the provider parses into `out.tool_calls`) |
 | `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load, **snapshot prepare** (GGUF → snapshot, dense + Q8) |
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
 | `CANDLE_LLM_VLM_MODEL` | a SigLIP-based `LlavaForConditionalGeneration` snapshot dir (small: `llava-hf/llava-interleave-qwen-0.5b-hf`; faithful: JoyCaption) | `vlm` — image captioning + the multimodal conformance check |

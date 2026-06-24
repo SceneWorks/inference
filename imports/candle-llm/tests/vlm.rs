@@ -318,6 +318,7 @@ mod real {
                     Content::text("Describe this image in one short sentence."),
                 ],
                 thinking: None,
+                tool_calls: Vec::new(),
             }],
             sampling: Sampling::greedy(),
             max_new_tokens: max_new,
