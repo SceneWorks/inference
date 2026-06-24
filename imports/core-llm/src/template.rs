@@ -10,34 +10,47 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use minijinja::{Environment, Value};
+use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::error::{Error, Result};
 use crate::message::Message;
+use crate::tool::ToolSpec;
 
 /// Options for a chat-template render. Extensible carrier for the standard chat-template kwargs
 /// beyond the conversation itself.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct RenderOptions {
+pub struct RenderOptions<'a> {
     /// Append the opening of an assistant turn so the model continues as the assistant.
     pub add_generation_prompt: bool,
     /// The `enable_thinking` chat-template kwarg: `None` omits it (template default — the Jinja
     /// `is defined` test is false), `Some(true)`/`Some(false)` request reasoning on/off. Maps from
     /// [`TextLlmRequest::enable_thinking_kwarg`](crate::TextLlmRequest::enable_thinking_kwarg).
     pub enable_thinking: Option<bool>,
+    /// Tools / functions offered to the model. Threaded into the template's `tools` context
+    /// (matching `transformers` `tools=`); empty ⇒ the context is omitted, so a template's `if tools`
+    /// test is false and the render is byte-identical to a no-tools render.
+    pub tools: &'a [ToolSpec],
 }
 
-impl RenderOptions {
+impl<'a> RenderOptions<'a> {
     /// Options that append a generation prompt and leave the thinking mode at the template default.
     pub fn generation() -> Self {
         Self {
             add_generation_prompt: true,
             enable_thinking: None,
+            tools: &[],
         }
     }
 
     /// Set the `enable_thinking` kwarg (builder style).
     pub fn with_enable_thinking(mut self, enable_thinking: Option<bool>) -> Self {
         self.enable_thinking = enable_thinking;
+        self
+    }
+
+    /// Set the offered `tools` (builder style).
+    pub fn with_tools(mut self, tools: &'a [ToolSpec]) -> Self {
+        self.tools = tools;
         self
     }
 }
@@ -49,10 +62,10 @@ pub trait ChatTemplate {
     fn render(&self, messages: &[Message], add_generation_prompt: bool) -> Result<String>;
 
     /// Render with the full [`RenderOptions`] (chat-template kwargs). The default ignores any kwarg
-    /// a simple typed template has no notion of (e.g. `enable_thinking`) and delegates to
+    /// a simple typed template has no notion of (e.g. `enable_thinking`, `tools`) and delegates to
     /// [`render`](ChatTemplate::render); [`JinjaChatTemplate`] overrides it to thread the kwargs
     /// into the Jinja context.
-    fn render_with(&self, messages: &[Message], opts: &RenderOptions) -> Result<String> {
+    fn render_with(&self, messages: &[Message], opts: &RenderOptions<'_>) -> Result<String> {
         self.render(messages, opts.add_generation_prompt)
     }
 }
@@ -168,11 +181,12 @@ impl ChatTemplate for JinjaChatTemplate {
             &RenderOptions {
                 add_generation_prompt,
                 enable_thinking: None,
+                tools: &[],
             },
         )
     }
 
-    fn render_with(&self, messages: &[Message], opts: &RenderOptions) -> Result<String> {
+    fn render_with(&self, messages: &[Message], opts: &RenderOptions<'_>) -> Result<String> {
         let mut env = Environment::new();
         // Match transformers' Jinja environment (ImmutableSandboxedEnvironment, trim/lstrip blocks).
         env.set_trim_blocks(true);
@@ -186,21 +200,30 @@ impl ChatTemplate for JinjaChatTemplate {
             .map_err(jinja_err)?;
         let tmpl = env.get_template("chat").map_err(jinja_err)?;
 
-        let msgs: Vec<BTreeMap<&str, String>> = messages
+        // Each message is a JSON object so a turn can carry structured fields (`tool_calls`) beyond
+        // the flat `role`/`content` strings — the same shape `transformers` passes the template.
+        let msgs: Vec<Json> = messages
             .iter()
             .map(|m| {
-                let mut map = BTreeMap::new();
-                map.insert("role", m.role.as_str().to_string());
-                map.insert("content", m.text_content());
+                let mut map = JsonMap::new();
+                map.insert("role".into(), Json::String(m.role.as_str().to_string()));
+                map.insert("content".into(), Json::String(m.text_content()));
                 // A turn's prior reasoning is exposed under both standard keys so a reasoning
                 // model's template finds it: `reasoning_content` (Qwen3 / DeepSeek) and `thinking`.
                 // Inserted only when present, so a template's `reasoning_content is string` test is
                 // false otherwise (the model's own retention/stripping policy then applies).
                 if let Some(thinking) = &m.thinking {
-                    map.insert("reasoning_content", thinking.clone());
-                    map.insert("thinking", thinking.clone());
+                    map.insert("reasoning_content".into(), Json::String(thinking.clone()));
+                    map.insert("thinking".into(), Json::String(thinking.clone()));
                 }
-                map
+                // An assistant turn's tool calls, in the `{type, function:{name, arguments}}` shape a
+                // tool template re-renders. Inserted only when present, so a `message.tool_calls`
+                // truthiness test is false otherwise.
+                if !m.tool_calls.is_empty() {
+                    let calls: Vec<Json> = m.tool_calls.iter().map(|c| c.to_template_json()).collect();
+                    map.insert("tool_calls".into(), Json::Array(calls));
+                }
+                Json::Object(map)
             })
             .collect();
 
@@ -215,6 +238,13 @@ impl ChatTemplate for JinjaChatTemplate {
         ctx.insert("eos_token", Value::from(self.eos_token.clone()));
         if let Some(enable_thinking) = opts.enable_thinking {
             ctx.insert("enable_thinking", Value::from(enable_thinking));
+        }
+        // Offered tools in the OpenAI function shape the template renders (`tool | tojson`). Inserted
+        // only when non-empty, so a template's `if tools` test is false on a no-tools render (the
+        // result is then byte-identical to before this field existed).
+        if !opts.tools.is_empty() {
+            let tools: Vec<Json> = opts.tools.iter().map(|t| t.to_template_json()).collect();
+            ctx.insert("tools", Value::from_serialize(&tools));
         }
         tmpl.render(ctx).map_err(jinja_err)
     }
@@ -400,6 +430,7 @@ mod tests {
                 role: Role::Tool,
                 content: vec![crate::message::Content::Text("result".into())],
                 thinking: None,
+                tool_calls: Vec::new(),
             },
         ];
         assert_eq!(t.render(&msgs, false).unwrap(), "user:q<tool>result</tool>");
@@ -409,6 +440,103 @@ mod tests {
     fn jinja_pycompat_str_methods() {
         let t = JinjaChatTemplate::new("{{ messages[0]['content'].strip().upper() }}");
         assert_eq!(t.render(&[Message::user("  hi  ")], false).unwrap(), "HI");
+    }
+
+    fn weather_tool() -> crate::tool::ToolSpec {
+        crate::tool::ToolSpec::new(
+            "get_weather",
+            "Get the weather",
+            serde_json::json!({"type":"object","properties":{"location":{"type":"string"}}}),
+        )
+    }
+
+    // The Qwen3.6 tools branch, verbatim (the `<tools>` block + the `tool | tojson` loop). Renders
+    // only when `tools` is a non-empty iterable — which is exactly when our context inserts it.
+    const QWEN36_TOOLS_BRANCH: &str = "{%- if tools and tools is iterable and tools is not mapping %}{{- '<tools>' }}{%- for tool in tools %}{{- '\\n' }}{{- tool | tojson }}{%- endfor %}{{- '\\n</tools>' }}{%- else %}NO_TOOLS{%- endif %}";
+
+    #[test]
+    fn jinja_renders_tools_section_when_offered() {
+        let t = JinjaChatTemplate::new(QWEN36_TOOLS_BRANCH);
+        let tools = [weather_tool()];
+        let out = t
+            .render_with(&[Message::user("hi")], &RenderOptions::generation().with_tools(&tools))
+            .unwrap();
+        // The tool renders in the OpenAI function shape, keys in insertion order (preserve_order).
+        assert_eq!(
+            out,
+            "<tools>\n{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get the weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"}}}}}\n</tools>"
+        );
+    }
+
+    #[test]
+    fn jinja_tools_section_omitted_when_none() {
+        // No tools offered ⇒ the `if tools` branch is false (we omit the context entirely), so the
+        // render is identical to before this field existed.
+        let t = JinjaChatTemplate::new(QWEN36_TOOLS_BRANCH);
+        assert_eq!(t.render(&[Message::user("hi")], false).unwrap(), "NO_TOOLS");
+        assert_eq!(
+            t.render_with(&[Message::user("hi")], &RenderOptions::generation())
+                .unwrap(),
+            "NO_TOOLS"
+        );
+    }
+
+    // The Qwen3.6 assistant tool_calls branch, verbatim: unwrap `.function`, emit the `<function=…>`
+    // / `<parameter=…>` XML, string args as-is and non-string args via tojson.
+    const QWEN36_TOOLCALL_BRANCH: &str = "{%- for message in messages %}{%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}{%- for tool_call in message.tool_calls %}{%- if tool_call.function is defined %}{%- set tool_call = tool_call.function %}{%- endif %}{{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}{%- if tool_call.arguments is defined %}{%- for args_name, args_value in tool_call.arguments|items %}{{- '<parameter=' + args_name + '>\\n' }}{%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}{{- args_value }}{{- '\\n</parameter>\\n' }}{%- endfor %}{%- endif %}{{- '</function>\\n</tool_call>' }}{%- endfor %}{%- endif %}{%- endfor %}";
+
+    #[test]
+    fn jinja_round_trips_assistant_tool_calls_as_xml() {
+        let t = JinjaChatTemplate::new(QWEN36_TOOLCALL_BRANCH);
+        let mut args = serde_json::Map::new();
+        args.insert("location".into(), serde_json::json!("Paris")); // string → rendered as-is
+        args.insert("days".into(), serde_json::json!(3)); // non-string → rendered via tojson
+        let call = crate::tool::ToolCall::new("get_weather", args);
+        let msgs = [Message::assistant("").with_tool_calls(vec![call])];
+        let out = t.render(&msgs, false).unwrap();
+        assert_eq!(
+            out,
+            "<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the real Qwen3.6 tokenizer_config via MLX_LLM_QWEN35_MODEL"]
+    fn qwen36_real_template_renders_tools_and_calls() {
+        // Faithfulness against the *actual* Qwen3.6 chat template (not a stand-in): a request that
+        // offers a tool renders the `<tools>` section + the call format instructions, and a prior
+        // assistant tool_call turn re-renders as the `<function=…>` / `<parameter=…>` XML.
+        let dir = std::env::var("MLX_LLM_QWEN35_MODEL").expect("set MLX_LLM_QWEN35_MODEL");
+        let t = JinjaChatTemplate::from_tokenizer_config_file(format!("{dir}/tokenizer_config.json"))
+            .expect("load real Qwen3.6 chat template");
+
+        let tools = [weather_tool()];
+        let offered = t
+            .render_with(&[Message::user("weather in Paris?")], &RenderOptions::generation().with_tools(&tools))
+            .unwrap();
+        assert!(offered.contains("<tools>"), "tools section: {offered}");
+        assert!(
+            offered.contains("{\"type\":\"function\",\"function\":{\"name\":\"get_weather\""),
+            "tool json: {offered}"
+        );
+        assert!(offered.contains("<tool_call>"), "call-format instructions: {offered}");
+
+        let mut args = serde_json::Map::new();
+        args.insert("location".into(), serde_json::json!("Paris"));
+        let call = crate::tool::ToolCall::new("get_weather", args);
+        let round = t
+            .render(
+                &[
+                    Message::user("weather in Paris?"),
+                    Message::assistant("").with_tool_calls(vec![call]),
+                ],
+                false,
+            )
+            .unwrap();
+        assert!(
+            round.contains("<function=get_weather>\n<parameter=location>\nParis\n</parameter>"),
+            "round-trip tool_call XML: {round}"
+        );
     }
 
     #[test]

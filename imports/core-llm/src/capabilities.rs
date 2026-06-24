@@ -20,6 +20,10 @@ pub struct TextLlmCapabilities {
     /// `enable_thinking` kwarg). `false` ⇒ the model never reasons, and an explicit
     /// [`ThinkingMode::Enabled`](crate::request::ThinkingMode::Enabled) request is rejected.
     pub supports_thinking: bool,
+    /// Whether the model supports tool / function calling — i.e. its chat template renders a `tools`
+    /// section and it emits parseable `<tool_call>` blocks. `false` ⇒ a request carrying
+    /// [`tools`](crate::TextLlmRequest::tools) is rejected (never silently dropped).
+    pub supports_tools: bool,
     /// The output constraints this provider can enforce (empty = none).
     pub supported_constraints: Vec<Constraint>,
 }
@@ -68,6 +72,13 @@ impl TextLlmCapabilities {
         {
             return Err(Error::Unsupported(format!(
                 "[{id}] provider does not support a thinking (reasoning) mode"
+            )));
+        }
+
+        // Offered tools the provider cannot render/parse are rejected, not silently dropped.
+        if !self.supports_tools && !req.tools.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "[{id}] provider does not support tool (function) calling"
             )));
         }
 

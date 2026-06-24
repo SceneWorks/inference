@@ -142,8 +142,9 @@ impl ThinkingSegmenter {
 
 /// Byte length of the longest suffix of `pending` that equals a *proper* prefix of `marker`. Full
 /// matches are ruled out by the caller before this is called, so the result is always shorter than
-/// `marker`. The char-boundary guard on `marker` keeps a multibyte marker from panic-slicing.
-fn max_partial_suffix(pending: &str, marker: &str) -> usize {
+/// `marker`. The char-boundary guard on `marker` keeps a multibyte marker from panic-slicing. Shared
+/// with [`crate::tool::ToolCallSegmenter`], which splits on `<tool_call>` markers the same way.
+pub(crate) fn max_partial_suffix(pending: &str, marker: &str) -> usize {
     let mut k = pending.len().min(marker.len());
     while k > 0 {
         if marker.is_char_boundary(k) && pending.ends_with(&marker[..k]) {

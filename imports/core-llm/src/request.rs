@@ -101,6 +101,12 @@ pub struct TextLlmRequest {
     /// [`supports_thinking`](crate::TextLlmCapabilities::supports_thinking); [`ThinkingMode::Auto`]
     /// (the default) leaves the model's template default in place.
     pub thinking: ThinkingMode,
+    /// Tools / functions offered to the model (matching `transformers` `tools=`). Rendered into the
+    /// prompt by the chat template and used to type-coerce the model's parsed tool calls. Honored only
+    /// by providers advertising [`supports_tools`](crate::TextLlmCapabilities::supports_tools); a
+    /// non-empty `tools` on a provider without that capability is rejected by
+    /// [`validate`](crate::TextLlm::validate). Empty ⇒ no tool section, behavior unchanged.
+    pub tools: Vec<crate::tool::ToolSpec>,
     /// Extra stop strings (beyond the model's own EOS tokens).
     pub stop: Vec<String>,
     /// Cooperative cancellation handle.

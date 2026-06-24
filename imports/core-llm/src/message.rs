@@ -80,7 +80,10 @@ impl Content {
 }
 
 /// One turn in a conversation: a role and its ordered content blocks.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Eq` (only `PartialEq`): a [`tool_calls`](Self::tool_calls) argument is a `serde_json::Value`,
+/// which is `PartialEq` but not `Eq` (it can hold a float).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Message {
     /// Who authored the turn.
     pub role: Role,
@@ -93,6 +96,13 @@ pub struct Message {
     /// re-render or strip prior-turn reasoning per its own policy (e.g. Qwen3 keeps it only for the
     /// most recent turn). Carry back a previous turn's `output.thinking` here to round-trip faithfully.
     pub thinking: Option<String>,
+    /// An assistant turn's tool / function calls — the multi-turn input dual of
+    /// [`TextLlmOutput::tool_calls`](crate::TextLlmOutput::tool_calls). Empty for non-tool turns. When
+    /// non-empty it is exposed to a chat template as the standard `tool_calls` message field, so a
+    /// tool-capable model's template re-renders the prior call(s) (e.g. Qwen3.6's `<tool_call>` XML).
+    /// Carry back a previous turn's `output.tool_calls` here, paired with the [`Role::Tool`] result
+    /// turn(s), to continue a multi-step tool exchange faithfully.
+    pub tool_calls: Vec<crate::tool::ToolCall>,
 }
 
 impl Message {
@@ -102,6 +112,7 @@ impl Message {
             role,
             content: vec![Content::Text(text.into())],
             thinking: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -109,6 +120,14 @@ impl Message {
     /// carrying a previous generation's [`TextLlmOutput::thinking`](crate::TextLlmOutput::thinking).
     pub fn with_thinking(mut self, thinking: impl Into<String>) -> Self {
         self.thinking = Some(thinking.into());
+        self
+    }
+
+    /// Attach tool / function calls to this turn (builder style); typically an assistant turn carrying
+    /// a previous generation's [`TextLlmOutput::tool_calls`](crate::TextLlmOutput::tool_calls) for a
+    /// multi-step tool exchange.
+    pub fn with_tool_calls(mut self, tool_calls: Vec<crate::tool::ToolCall>) -> Self {
+        self.tool_calls = tool_calls;
         self
     }
 
@@ -167,6 +186,7 @@ mod tests {
         assert_eq!(m.text_content(), "hi");
         assert!(!m.has_image());
         assert_eq!(m.thinking, None);
+        assert!(m.tool_calls.is_empty());
     }
 
     #[test]
@@ -175,5 +195,13 @@ mod tests {
         assert_eq!(m.role, Role::Assistant);
         assert_eq!(m.text_content(), "the answer");
         assert_eq!(m.thinking.as_deref(), Some("the reasoning"));
+    }
+
+    #[test]
+    fn with_tool_calls_attaches_calls() {
+        let call = crate::tool::ToolCall::new("get_weather", serde_json::Map::new());
+        let m = Message::assistant("").with_tool_calls(vec![call.clone()]);
+        assert_eq!(m.role, Role::Assistant);
+        assert_eq!(m.tool_calls, vec![call]);
     }
 }

@@ -23,11 +23,15 @@ inventory = "0.3"
 # HF tokenizers (the same Rust core `transformers` wraps) — host-side text<->ids. `onig` only (no
 # http/progressbar): byte-level BPE needs just the regex. Builds tensor-free on Linux/Windows/Mac.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-# config.json / tokenizer.json parsing and the JSON-constraint cross-check.
-serde_json = "1"
+# config.json / tokenizer.json parsing and the JSON-constraint cross-check. `preserve_order` keeps
+# tool-spec/tool-call argument key order insertion-faithful (matching transformers) through the
+# chat-template render and tool-call round-trip (story 7636).
+serde_json = { version = "1", features = ["preserve_order"] }
 # Jinja chat-template rendering (story 7164): HF models ship a Jinja `chat_template`. minijinja is
 # the same engine semantics transformers uses (sandboxed Jinja2). Pure Rust, cross-platform.
-minijinja = "2"
+# `json` enables the `tojson` filter the tool-calling templates use to render the `tools` section
+# (story 7636); `preserve_order` keeps that render's key order insertion-faithful.
+minijinja = { version = "2", features = ["json", "preserve_order"] }
 # Python-compatible str methods (.strip()/.startswith()/…) that HF templates rely on.
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 

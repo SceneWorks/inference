@@ -24,7 +24,7 @@
 use core_llm::{
     load_for_model, prepare_snapshot, Channel, Content, Error, FinishReason, ImageRef, LoadSpec,
     Message, PrepareSpec, Quantize, Role, Sampling, StreamEvent, TextLlm, TextLlmRequest,
-    ThinkingMode, VERSION,
+    ThinkingMode, ToolSpec, VERSION,
 };
 use std::path::PathBuf;
 
@@ -43,6 +43,10 @@ pub struct TextLlmProfile {
     /// A synthetic image for the multimodal check (`Some` exercises vision support or its honest
     /// rejection; `None` skips the multimodal check).
     pub image: Option<ImageRef>,
+    /// Tools offered in the tool-calling check (exercises tool support or its honest rejection).
+    /// Non-empty so a tools-capable provider renders + runs them and a non-tools provider rejects
+    /// them as `Unsupported`.
+    pub tools: Vec<ToolSpec>,
 }
 
 impl TextLlmProfile {
@@ -60,6 +64,15 @@ impl TextLlmProfile {
                 repetition_context: 0,
             },
             image: Some(ImageRef::new(8, 8, vec![0u8; 8 * 8 * 3]).expect("8x8 RGB")),
+            tools: vec![ToolSpec::new(
+                "get_weather",
+                "Get the current weather for a city",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "location": { "type": "string" } },
+                    "required": ["location"]
+                }),
+            )],
         }
     }
 
@@ -83,10 +96,22 @@ impl TextLlmProfile {
                 role: Role::User,
                 content: vec![Content::Text(self.prompt.clone()), Content::Image(img.clone())],
                 thinking: None,
+                tool_calls: Vec::new(),
             }],
             sampling: Sampling::greedy(),
             max_new_tokens: self.max_new_tokens,
             seed: Some(0),
+            ..Default::default()
+        }
+    }
+
+    fn tools_request(&self) -> TextLlmRequest {
+        TextLlmRequest {
+            messages: vec![Message::user(self.prompt.clone())],
+            sampling: Sampling::greedy(),
+            max_new_tokens: self.max_new_tokens,
+            seed: Some(0),
+            tools: self.tools.clone(),
             ..Default::default()
         }
     }
@@ -101,13 +126,14 @@ pub fn textllm_conformance(make: impl Fn() -> Box<dyn TextLlm>, profile: &TextLl
     let p: &dyn TextLlm = provider.as_ref();
 
     let mut failures: Vec<String> = Vec::new();
-    let with_profile: [ProfileCheck; 6] = [
+    let with_profile: [ProfileCheck; 7] = [
         check_validate,
         check_streaming,
         check_mid_stream_cancel,
         check_seed_determinism,
         check_multimodal,
         check_thinking,
+        check_tools,
     ];
     for f in with_profile {
         if let Err(e) = f(p, profile) {
@@ -482,6 +508,67 @@ pub fn check_thinking(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), S
         return Err(format!(
             "check_thinking[{id}]: no-think (Disabled) request produced reasoning in output.thinking"
         ));
+    }
+    Ok(())
+}
+
+/// Tool ("function") calling is capability-honest. A non-tools provider rejects a request carrying
+/// tools as `Unsupported` (never silently drops them). A tools provider validates a tools request,
+/// generates without error, keeps its streamed Content channel in sync with `output.text`, excludes
+/// the raw `<tool_call>` markup from `output.text`, and returns only well-formed (named) tool calls.
+/// It deliberately does **not** assert the model *chooses* to call a tool (model- and
+/// prompt-dependent) — the live parse of an actually-emitted call is proven by a backend's gated
+/// real-weight test.
+pub fn check_tools(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), String> {
+    let id = p.descriptor().id.clone();
+    if profile.tools.is_empty() {
+        return Ok(()); // nothing to exercise
+    }
+    let supports = p.descriptor().capabilities.supports_tools;
+    let req = profile.tools_request();
+
+    if !supports {
+        // Offered tools the provider can't honor must be rejected, not ignored.
+        return match p.validate(&req) {
+            Err(Error::Unsupported(_)) => Ok(()),
+            Err(other) => Err(format!(
+                "check_tools[{id}]: tools request rejected, but not as Error::Unsupported: {other:?}"
+            )),
+            Ok(()) => Err(format!(
+                "check_tools[{id}]: accepted a tools request despite supports_tools=false"
+            )),
+        };
+    }
+
+    // Tools-capable: a tools request validates and generates.
+    p.validate(&req)
+        .map_err(|e| format!("check_tools[{id}]: tools provider rejected a tools request: {e}"))?;
+
+    let mut content = String::new();
+    let out = p
+        .generate(&req, &mut |ev| {
+            if let StreamEvent::Token { text, channel: Channel::Content, .. } = ev {
+                content.push_str(&text);
+            }
+        })
+        .map_err(|e| format!("check_tools[{id}]: tools generate() failed: {e}"))?;
+
+    if content != out.text {
+        return Err(format!(
+            "check_tools[{id}]: streamed Content-channel deltas do not reconstruct output.text with tools active"
+        ));
+    }
+    if out.text.contains("<tool_call>") {
+        return Err(format!(
+            "check_tools[{id}]: raw <tool_call> markup leaked into output.text (must be parsed out)"
+        ));
+    }
+    for (i, call) in out.tool_calls.iter().enumerate() {
+        if call.name.trim().is_empty() {
+            return Err(format!(
+                "check_tools[{id}]: parsed tool_call #{i} has an empty function name"
+            ));
+        }
     }
     Ok(())
 }
