@@ -238,7 +238,10 @@ fn generate_think_stops_and_appends() {
     assert_eq!(think_token_ids, want_tokens[..=first].to_vec());
     let forwards = (first + 1) as i32; // each emitted token (incl. </think>) is forwarded once
     assert_eq!(t_idx, (prefix_len - 1) + forwards + append_ids.len() as i32);
-    assert_eq!(cache.offset(), prefix_len + forwards + append_ids.len() as i32);
+    assert_eq!(
+        cache.offset(),
+        prefix_len + forwards + append_ids.len() as i32
+    );
 
     // ---- immediate EOS: the first token is EOS → empty think, only the append lands. ----
     let eos = want_tokens[0]; // 37 — the very first greedy pick
