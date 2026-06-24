@@ -53,11 +53,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: false,
             // Turbo is text-to-image only.
             conditioning: Vec::new(),
-            // LoRA (Raw-trained, applied at Turbo inference) is enabled when the forward + adapter
-            // path land (sc-7568 forward, sc-7577 trainer, sc-7578 loraCompatibility). The scaffold's
-            // `load` rejects adapters, so advertise `false` until the engine can honor them.
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA/LoKr trained on the undistilled Raw DiT (sc-7577) apply at Turbo inference via the
+            // shared `apply_adapters_strict` seam onto the `Krea2Transformer` adapter host (sc-7911).
+            // Family-match cross-apply, no base-model gating (the Lens / Z-Image precedent).
+            supports_lora: true,
+            supports_lokr: true,
             // Rectified-flow v-param over the unified curated-sampler framework (epic 7114). The
             // distilled-coherent sampler subset is narrowed by the real-weight survey at e2e (sc-7571,
             // the Boogu Turbo precedent); the scaffold advertises the full curated menu as a starting
@@ -87,17 +87,13 @@ pub struct Krea {
 /// Load a Krea generator from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`] pointing
 /// at a Krea 2 snapshot (`transformer/ text_encoder/ vae/ tokenizer/`). Parses + validates the DiT
 /// config against the spike architecture (catches a wrong/truncated snapshot at load); a precision
-/// override and LoRA/LoKr adapters are rejected rather than silently ignored.
+/// override is rejected rather than silently ignored. Raw-trained LoRA/LoKr adapters in `spec.adapters`
+/// are installed onto the DiT (sc-7911).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let id = KREA_2_TURBO_ID;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{id}: only the default dense precision is wired (drop the precision override)"
-        )));
-    }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(format!(
-            "{id}: LoRA/LoKr adapters are not yet supported (tracked: sc-7577 trainer, sc-7578 apply)"
         )));
     }
     let root = match &spec.weights {
@@ -113,6 +109,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // turnkey vs a dense bf16 snapshot. `spec.quantize` then quantizes the dense base in place (a no-op
     // on an already-packed snapshot — `AdaptableLinear::quantize` skips quantized bases).
     let mut pipeline = KreaPipeline::from_snapshot(root)?;
+    // Install Raw-trained LoRA/LoKr adapters onto the DiT BEFORE the optional quantize, so the
+    // residual stacks over the (possibly already-packed) base — the Lens load→apply→quantize order.
+    // The shared seam errors (never silently drops) on an adapter target that matches no module.
+    if !spec.adapters.is_empty() {
+        pipeline.apply_adapters(&spec.adapters)?;
+    }
     if let Some(q) = spec.quantize {
         pipeline.quantize(q.bits())?;
     }
@@ -210,6 +212,7 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::{AdapterKind, AdapterSpec};
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -231,6 +234,9 @@ mod tests {
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.conditioning.is_empty());
+        // Raw-trained LoRA/LoKr apply at Turbo inference (sc-7911).
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert_eq!(DEFAULT_STEPS, 8);
         assert!(d.capabilities.mac_only);
@@ -277,10 +283,31 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_and_adapters() {
+    fn load_rejects_single_file() {
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load(&file).err().expect("error").to_string();
         assert!(e.contains("snapshot directory"), "got: {e}");
+    }
+
+    #[test]
+    fn load_accepts_adapter_spec_without_rejecting() {
+        // sc-7911: adapters are no longer rejected at the door; a LoadSpec carrying an adapter
+        // resolves the snapshot first, so a missing snapshot — not an "unsupported adapters" error —
+        // is what surfaces (the real install runs in the #[ignore] real-weight harness).
+        let spec =
+            LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into())).with_adapters(vec![
+                AdapterSpec::new(
+                    std::path::PathBuf::from("/nonexistent-krea/adapter.safetensors"),
+                    1.0,
+                    AdapterKind::Lora,
+                ),
+            ]);
+        let e = load(&spec).err().expect("error").to_string();
+        assert!(
+            !e.to_lowercase().contains("not yet supported")
+                && !e.to_lowercase().contains("not supported"),
+            "adapters must be accepted, got: {e}"
+        );
     }
 
     #[test]
