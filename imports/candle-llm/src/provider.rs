@@ -12,20 +12,25 @@ use std::path::Path;
 
 use candle_core::{Device, Tensor};
 use core_llm::{
-    Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError,
-    FinishReason as CoreFinish, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
-    Quantize, RenderOptions, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
-    Tokenizer, ToolCallSegmenter, Usage,
+    Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Content, Error as CoreError,
+    FinishReason as CoreFinish, ImageRef, JinjaChatTemplate, JsonConstraint, Llama3Template,
+    LoadSpec, Message, Quantize, RenderOptions, Result as CoreResult, Sampling,
+    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage,
 };
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig, StreamEvent,
+    generate_from_prefill, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
+    StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
-use crate::models::{CausalLm, Qwen35Config, Qwen35Model};
+use crate::image::Qwen35ImageProcessor;
+use crate::models::{
+    CausalLm, Qwen35Cache, Qwen35Config, Qwen35Model, Qwen35VisionConfig, Qwen35VisionModel,
+};
+use crate::primitives::nn::input_ids;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{KvCache, Weights};
@@ -76,6 +81,157 @@ impl Decoder {
             Decoder::Qwen35(m) => m.is_quantized(),
         }
     }
+
+    /// The concrete hybrid decoder, when this is the Qwen3.6 path (the multimodal embeds / M-RoPE
+    /// hooks live on [`Qwen35Model`], not the generic [`Decode`] trait).
+    fn as_qwen35(&self) -> Option<&Qwen35Model> {
+        match self {
+            Decoder::Qwen35(m) => Some(m),
+            Decoder::Causal(_) => None,
+        }
+    }
+}
+
+/// The Qwen3.6 vision side of the provider: the ViT tower, the image preprocessor, the multimodal
+/// token id + merge size needed to expand placeholders and assign M-RoPE positions, and the device
+/// the encoder runs on. Present only when the loaded `qwen3_5` checkpoint carries `model.visual.*`.
+struct Qwen35Vision {
+    tower: Qwen35VisionModel,
+    processor: Qwen35ImageProcessor,
+    image_token_id: i32,
+    spatial_merge_size: i32,
+    device: Device,
+}
+
+impl Qwen35Vision {
+    /// Encode one image to its merged patch rows `[n_tokens, hidden]` (the merger output is already
+    /// the language hidden size — no separate projector) plus the image's `grid_thw` (`[1, h, w]` in
+    /// patch units). `n_tokens = (grid_h/merge)·(grid_w/merge)` is the placeholder expansion count.
+    fn encode(&self, img: &ImageRef) -> CoreResult<(Tensor, [i32; 3])> {
+        let (pixels, grid) = self
+            .processor
+            .preprocess(
+                &img.pixels,
+                img.width as usize,
+                img.height as usize,
+                &self.device,
+            )
+            .map_err(to_core)?;
+        let features = self.tower.forward(&pixels, &grid).map_err(to_core)?;
+        Ok((features, grid[0]))
+    }
+}
+
+/// The prepared multimodal prefill: the image-token-expanded prompt ids, the decoder input embeds
+/// with image features spliced in, and the interleaved M-RoPE position rows + delta.
+struct MultimodalPrefill {
+    expanded_ids: Vec<i32>,
+    embeds: Tensor,
+    positions: (Vec<i32>, Vec<i32>, Vec<i32>, i32),
+}
+
+/// A [`Decode`] wrapper that shifts the RoPE offset by a constant `delta` — the Qwen3.6 multimodal
+/// decode steps continue from `mrope_delta` past the cached length (image tokens compress the
+/// position cursor, so post-prompt text positions are `cache_len + mrope_delta`, not `cache_len`).
+/// The new tokens are text, so a single shifted 1-D position is the correct M-RoPE position.
+struct ShiftedQwen35<'a> {
+    model: &'a Qwen35Model,
+    delta: i32,
+}
+
+impl Decode for ShiftedQwen35<'_> {
+    fn make_cache(&self) -> Box<dyn KvCache> {
+        Box::new(self.model.new_cache())
+    }
+
+    fn device(&self) -> &Device {
+        Decode::device(self.model)
+    }
+
+    fn step(
+        &self,
+        ids: &Tensor,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> crate::error::Result<Tensor> {
+        let c = cache
+            .as_any_mut()
+            .downcast_mut::<Qwen35Cache>()
+            .ok_or_else(|| {
+                crate::error::Error::Msg("ShiftedQwen35: cache is not a Qwen35Cache".into())
+            })?;
+        self.model.decode_logits(ids, c, offset + self.delta)
+    }
+}
+
+/// Collect the image blocks of a conversation, in order.
+fn collect_images(messages: &[Message]) -> Vec<&ImageRef> {
+    messages
+        .iter()
+        .flat_map(|m| {
+            m.content.iter().filter_map(|c| match c {
+                Content::Image(img) => Some(img),
+                Content::Text(_) => None,
+            })
+        })
+        .collect()
+}
+
+/// Replace each image block with the Qwen-VL placeholder text so the (text-only) chat template
+/// renders `<|vision_start|><|image_pad|><|vision_end|>`; the single `image_pad` token is expanded to
+/// the per-image token count after tokenizing. Keeps the core-llm template contract image-free.
+fn substitute_image_placeholders(messages: &[Message]) -> Vec<Message> {
+    const PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+    messages
+        .iter()
+        .map(|m| Message {
+            role: m.role,
+            content: m
+                .content
+                .iter()
+                .map(|c| match c {
+                    Content::Image(_) => Content::text(PLACEHOLDER),
+                    Content::Text(t) => Content::Text(t.clone()),
+                })
+                .collect(),
+            thinking: m.thinking.clone(),
+            tool_calls: m.tool_calls.clone(),
+        })
+        .collect()
+}
+
+/// Expand each `image_token_id` placeholder in `ids` into `counts[i]` image tokens (the i-th image's
+/// merged-patch count), in order. Errors if the placeholder count and image count disagree.
+fn expand_image_placeholders(
+    ids: &[i32],
+    image_token_id: i32,
+    counts: &[usize],
+) -> crate::error::Result<Vec<i32>> {
+    use crate::error::Error;
+    let mut out = Vec::with_capacity(ids.len());
+    let mut ci = 0usize;
+    for &id in ids {
+        if id == image_token_id {
+            let n = *counts.get(ci).ok_or_else(|| {
+                Error::Msg(format!(
+                    "qwen3.6 vision: {} image placeholders but only {} images supplied",
+                    ci + 1,
+                    counts.len()
+                ))
+            })?;
+            ci += 1;
+            out.extend(std::iter::repeat_n(image_token_id, n));
+        } else {
+            out.push(id);
+        }
+    }
+    if ci != counts.len() {
+        return Err(Error::Msg(format!(
+            "qwen3.6 vision: {ci} image placeholders rendered but {} images supplied",
+            counts.len()
+        )));
+    }
+    Ok(out)
 }
 
 /// A generic Llama provider implementing [`core_llm::TextLlm`].
@@ -88,6 +244,9 @@ pub struct LlamaProvider {
     /// Cached per-vocab decode table for constrained decoding — built once (it decodes the whole
     /// vocabulary) on the first JSON-constrained request, then reused.
     constraint_table: OnceCell<ConstraintDecodeTable>,
+    /// The Qwen3.6 vision tower + preprocessor, present iff this is a `qwen3_5` checkpoint carrying
+    /// `model.visual.*`. Drives the image path in [`LlamaProvider::generate`].
+    vision: Option<Qwen35Vision>,
 }
 
 impl LlamaProvider {
@@ -120,8 +279,7 @@ impl LlamaProvider {
         let weights = Weights::from_dir(dir, device).map_err(to_core)?;
         let (model, mut descriptor) = if arch == Architecture::Qwen35 {
             // Qwen3.6 hybrid decoder: its own config, the VLM-nested `model.language_model` prefix, and
-            // a top-level untied `lm_head`. (The 27B VLM-wrapped checkpoint carries a `vision_config`;
-            // the text path ignores it — vision is a follow-on story.)
+            // a top-level untied `lm_head`.
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
             let descriptor = descriptor_for_qwen35(&qcfg);
             let m =
@@ -135,6 +293,33 @@ impl LlamaProvider {
             let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
             (Decoder::Causal(m), descriptor)
         };
+
+        // Qwen3.6 vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
+        // VLM) and the config exposes a `vision_config`. Absent → a text-only `qwen3_5` checkpoint.
+        let vision = if arch == Architecture::Qwen35
+            && cfg_value.get("vision_config").is_some()
+            && weights.contains("model.visual.patch_embed.proj.weight")
+        {
+            let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
+            let tower =
+                Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg).map_err(to_core)?;
+            let image_token_id = cfg_value
+                .get("image_token_id")
+                .and_then(|x| x.as_i64())
+                .map(|x| x as i32)
+                .unwrap_or(248056);
+            descriptor.capabilities.supports_vision = true;
+            Some(Qwen35Vision {
+                tower,
+                processor: Qwen35ImageProcessor::default(),
+                image_token_id,
+                spatial_merge_size: vcfg.spatial_merge_size,
+                device: device.clone(),
+            })
+        } else {
+            None
+        };
+
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
         let (template, supports_thinking, supports_tools) = load_chat_template(dir);
@@ -147,6 +332,7 @@ impl LlamaProvider {
             template,
             stop_tokens,
             constraint_table: OnceCell::new(),
+            vision,
         })
     }
 
@@ -188,6 +374,7 @@ impl LlamaProvider {
             template,
             stop_tokens,
             constraint_table: OnceCell::new(),
+            vision: None, // GGUF is the dense Llama-family path only — no Qwen3.6 VLM.
         })
     }
 
@@ -206,7 +393,64 @@ impl LlamaProvider {
             template: Box::new(Llama3Template),
             stop_tokens,
             constraint_table: OnceCell::new(),
+            vision: None,
         }
+    }
+
+    /// Build the multimodal prefill: encode each image (preprocess → ViT → merged rows), expand the
+    /// rendered `image_pad` placeholders to the per-image token counts, splice the features into the
+    /// token embeds, and compute the interleaved M-RoPE 3-D positions. `prompt_ids` is the tokenized
+    /// prompt (one `image_token_id` per image, from the rendered placeholders).
+    fn prepare_multimodal(
+        &self,
+        prompt_ids: &[i32],
+        images: &[&ImageRef],
+    ) -> CoreResult<MultimodalPrefill> {
+        let vision = self.vision.as_ref().ok_or_else(|| {
+            CoreError::Load("qwen3.6 vision: provider has no vision tower".into())
+        })?;
+        let model = self
+            .model
+            .as_qwen35()
+            .ok_or_else(|| CoreError::Load("qwen3.6 vision requires the qwen3_5 decoder".into()))?;
+
+        let mut feats: Vec<Tensor> = Vec::with_capacity(images.len());
+        let mut counts: Vec<usize> = Vec::with_capacity(images.len());
+        let mut grids: Vec<[i32; 3]> = Vec::with_capacity(images.len());
+        for img in images {
+            let (f, grid) = vision.encode(img)?;
+            counts.push(f.dim(0).map_err(|e| to_core(e.into()))?);
+            grids.push(grid);
+            feats.push(f);
+        }
+
+        let expanded = expand_image_placeholders(prompt_ids, vision.image_token_id, &counts)
+            .map_err(to_core)?;
+        let refs: Vec<&Tensor> = feats.iter().collect();
+        let all_features = match refs.as_slice() {
+            [one] => (*one).clone(),
+            many => Tensor::cat(many, 0).map_err(|e| to_core(e.into()))?,
+        };
+
+        let ids = input_ids(&expanded, &vision.device).map_err(to_core)?;
+        let embeds = model.embed_input_ids(&ids).map_err(to_core)?;
+        let spliced = model
+            .splice_image_features(&embeds, &expanded, &all_features, vision.image_token_id)
+            .map_err(to_core)?;
+        let positions = model
+            .mrope_positions(
+                &expanded,
+                &grids,
+                vision.image_token_id,
+                vision.spatial_merge_size,
+            )
+            .map_err(to_core)?;
+
+        Ok(MultimodalPrefill {
+            expanded_ids: expanded,
+            embeds: spliced,
+            positions,
+        })
     }
 }
 
@@ -333,12 +577,28 @@ impl TextLlm for LlamaProvider {
             return Err(CoreError::Canceled); // typed pre-inference cancel
         }
 
+        // Multimodal (Qwen3.6 + image content): replace image blocks with the Qwen-VL placeholder so
+        // the (image-free) chat template renders `<|vision_start|><|image_pad|><|vision_end|>`. The
+        // images are encoded + spliced after tokenizing. Text-only requests are unchanged.
+        let images: Vec<&ImageRef> = match &self.vision {
+            Some(_) => collect_images(&req.messages),
+            None => Vec::new(),
+        };
+        let multimodal = !images.is_empty();
+        let substituted;
+        let messages: &[Message] = if multimodal {
+            substituted = substitute_image_placeholders(&req.messages);
+            &substituted
+        } else {
+            &req.messages
+        };
+
         // Render the conversation and tokenize. The template already includes BOS, so encode without
         // auto special tokens. `enable_thinking` flows into the template kwarg so a no-think
         // (Disabled) request injects the model's closed `<think></think>` generation prompt; Auto
         // omits the kwarg (template default).
         let prompt = self.template.render_with(
-            &req.messages,
+            messages,
             &RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.enable_thinking_kwarg(),
@@ -351,7 +611,18 @@ impl TextLlm for LlamaProvider {
             .into_iter()
             .map(|id| id as i32)
             .collect();
-        let prompt_len = prompt_ids.len();
+
+        // Encode + splice the images and compute M-RoPE positions (the image-token-expanded prompt
+        // becomes the effective sequence). `None` on the text-only path.
+        let mm = if multimodal {
+            Some(self.prepare_multimodal(&prompt_ids, &images)?)
+        } else {
+            None
+        };
+        let prompt_len = mm
+            .as_ref()
+            .map(|m| m.expanded_ids.len())
+            .unwrap_or(prompt_ids.len());
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -486,15 +757,48 @@ impl TextLlm for LlamaProvider {
                 }
             };
             let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
-            generate_with(
-                &self.model,
-                &prompt_ids,
-                &config,
-                &req.cancel,
-                &mut sink,
-                constraint,
-            )
-            .map_err(to_core)?
+            match &mm {
+                // Multimodal: prefill the spliced embeds with interleaved M-RoPE, then decode the
+                // continuation (text positions shifted by `mrope_delta`) through the shared loop.
+                Some(m) => {
+                    let model = self.model.as_qwen35().ok_or_else(|| {
+                        CoreError::Load("qwen3.6 vision requires the qwen3_5 decoder".into())
+                    })?;
+                    let mut cache = model.new_cache();
+                    let (t, h, w, delta) = &m.positions;
+                    let first = model
+                        .decode_logits_from_embeds(
+                            &m.embeds,
+                            [t.as_slice(), h.as_slice(), w.as_slice()],
+                            &mut cache,
+                        )
+                        .map_err(to_core)?;
+                    let shifted = ShiftedQwen35 {
+                        model,
+                        delta: *delta,
+                    };
+                    generate_from_prefill(
+                        &shifted,
+                        &mut cache,
+                        first,
+                        m.expanded_ids.clone(),
+                        &config,
+                        &req.cancel,
+                        &mut sink,
+                        constraint,
+                    )
+                    .map_err(to_core)?
+                }
+                None => generate_with(
+                    &self.model,
+                    &prompt_ids,
+                    &config,
+                    &req.cancel,
+                    &mut sink,
+                    constraint,
+                )
+                .map_err(to_core)?,
+            }
         };
 
         // End-of-generation tails, in pipeline order. First the reasoning segmenter's held-back
