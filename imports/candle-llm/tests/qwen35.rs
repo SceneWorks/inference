@@ -1,6 +1,6 @@
 //! Real-weights end-to-end tests for Qwen3.6 (`qwen3_5`), the hybrid Gated-DeltaNet /
-//! gated-full-attention text decoder (story sc-7632). Point `CANDLE_LLM_QWEN35_MODEL` at a Qwen3.6
-//! snapshot (the 27B dense today; the 35B-A3B MoE once slice 4 lands):
+//! gated-full-attention text decoder (story sc-7632). The same tests cover both variants — point
+//! `CANDLE_LLM_QWEN35_MODEL` at the 27B (dense) or the 35B-A3B (MoE) snapshot:
 //!
 //! ```text
 //! CANDLE_LLM_QWEN35_MODEL=D:\repos\models\Qwen3.6-27B \
