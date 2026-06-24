@@ -17,8 +17,10 @@
 
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::adapters::loader::apply_adapters_strict;
 use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
 use mlx_gen::media::Image;
+use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler, CancelFlag, Progress, Result, TimestepConvention,
 };
@@ -71,6 +73,18 @@ impl KreaPipeline {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.te.quantize(bits)?;
         self.dit.quantize(bits)?;
+        Ok(())
+    }
+
+    /// Install Raw-trained LoRA/LoKr adapters onto the single-stream DiT (sc-7911). The shared
+    /// [`apply_adapters_strict`] seam parses PEFT/diffusers/kohya/LoKr files, folds alpha/rank, and
+    /// pushes a residual onto each matched `AdaptableLinear` — erroring (never silently dropping) on an
+    /// adapter target that matches no module. The `Krea2Transformer` adapter host routes the trained
+    /// `transformer_blocks.{i}.attn.{to_q,to_k,to_v,to_out.0}` paths (+ `text_fusion` + globals); the
+    /// residual stacks over the (possibly already-quantized) base, so it composes with the Q8/Q4
+    /// turnkey. Multiple + mixed LoRA/LoKr adapters stack by construction.
+    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
+        apply_adapters_strict(&mut self.dit, specs, "krea_2")?;
         Ok(())
     }
 
