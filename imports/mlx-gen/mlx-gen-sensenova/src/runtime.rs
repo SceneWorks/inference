@@ -22,12 +22,21 @@
 //! reference, which sets `model.current_index = t_idx` before each step and lets the forward
 //! increment it. The understanding path ([`Path::Und`]) drives text decode.
 
-use mlx_rs::ops::indexing::argmax as argmax_device;
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
+
+// Shared decode sampler (sc-7159): on-device greedy argmax + the unified temperature/top-k/top-p
+// sampler + the deterministic SplitMix64. The bespoke think/no-think + dual-path rollout stays here.
+use mlx_llm::primitives::sampler::{argmax_device, argmax_host, sample as mll_sample};
+use mlx_llm::primitives::{SamplingParams, SplitMix64};
 
 use crate::qwen3::{KvCache, Path, Qwen3Backbone};
+
+/// Map an mlx-llm primitive error onto the gen-core contract error.
+fn mll<E: std::fmt::Display>(e: E) -> Error {
+    Error::Msg(e.to_string())
+}
 
 /// How the next token is chosen from a logits row.
 #[derive(Clone, Copy, Debug)]
@@ -46,15 +55,33 @@ pub enum Sampler {
 
 impl Sampler {
     /// Pick a token id from a `[vocab]` logits row, advancing `rng` for the stochastic variants.
-    fn pick(&self, logits: &[f32], rng: &mut SplitMix64) -> i32 {
+    ///
+    /// Delegates to the shared sampler (sc-7159): greedy is the shared lowest-index [`argmax_host`];
+    /// the stochastic variant is the unified [`mll_sample`] (temperature + top-k + nucleus top-p, no
+    /// repetition penalty) over the row lifted to an `Array`. The greedy path is bit-identical to the
+    /// prior local argmax; the stochastic path is a valid resample from the same shaped distribution
+    /// (the shared sampler draws over candidates in index/top-k order rather than the prior
+    /// sorted-descending order — no golden pins a stochastic sequence, and every gated rollout, plus
+    /// all image-token decoding, is greedy).
+    fn pick(&self, logits: &[f32], rng: &mut SplitMix64) -> Result<i32> {
         match *self {
-            Sampler::Greedy => argmax(logits),
+            Sampler::Greedy => Ok(argmax_host(logits)),
             Sampler::Sample {
                 temperature,
                 top_p,
                 top_k,
                 ..
-            } => sample(logits, temperature, top_p, top_k, rng),
+            } => {
+                let row = Array::from_slice(logits, &[1, logits.len() as i32]);
+                let params = SamplingParams {
+                    temperature,
+                    top_p,
+                    top_k,
+                    repetition_penalty: 1.0,
+                    repetition_context: 0,
+                };
+                mll_sample(&row, &[], &params, rng, None).map_err(mll)
+            }
         }
     }
 
@@ -96,10 +123,11 @@ impl Qwen3Backbone {
         let ids = Array::from_slice(&[token], &[1, 1]);
         let embeds = self.embed(&ids)?;
         let hidden = self.forward_cached(&embeds, &[pos_t], &[0], &[0], Path::Und, cache, true)?;
-        let logits = self.lm_head(&hidden)?; // [1, 1, vocab]
-        let vocab = logits.shape()[2];
-        let idx = argmax_device(&logits.reshape(&[vocab])?, None)?;
-        Ok(idx.item::<u32>() as i32)
+        // The shared on-device argmax flattens the `[1, 1, vocab]` logits internally and breaks ties
+        // to the lowest index — the same single-element host transfer + tie rule as the prior local
+        // `argmax_device` (F-140).
+        let logits = self.lm_head(&hidden)?;
+        argmax_device(&logits).map_err(mll)
     }
 
     /// Splice a run of known tokens into the cache (no sampling), advancing the temporal axis from
@@ -154,7 +182,7 @@ impl Qwen3Backbone {
         let mut out = Vec::new();
         let mut t = t_idx;
         for _ in 0..max_new_tokens {
-            let next = sampler.pick(&logits, &mut rng);
+            let next = sampler.pick(&logits, &mut rng)?;
             if eos.contains(&next) {
                 break;
             }
@@ -218,111 +246,11 @@ impl Qwen3Backbone {
     }
 }
 
-/// Index of the maximum logit (ties → lowest index, matching `torch.argmax`).
+/// Index of the maximum logit (ties → lowest index, matching `torch.argmax`). Delegates to the
+/// shared host argmax (sc-7159); kept as a crate-internal name so the gen-path image-token decode in
+/// `t2i.rs` (greedy over `[vocab]` rows already on host) keeps one call site.
 pub(crate) fn argmax(logits: &[f32]) -> i32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    best as i32
-}
-
-/// Temperature + top-k + nucleus (top-p) sampling over a logits row.
-fn sample(logits: &[f32], temperature: f32, top_p: f32, top_k: usize, rng: &mut SplitMix64) -> i32 {
-    let temperature = temperature.max(1e-6);
-    let mut order: Vec<usize> = (0..logits.len()).collect();
-    // Total order: descending logit, ties broken by ascending index. This reproduces the previous
-    // stable `sort_by` (logit-only) + `truncate` exactly — equal logits kept ascending-index order —
-    // so the selected top-k set and its order are identical.
-    let by_logit_then_index = |&a: &usize, &b: &usize| {
-        logits[b]
-            .partial_cmp(&logits[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    };
-
-    // top-k truncation. For a small `top_k`, partition the k highest indices into `order[..k]` with
-    // `select_nth` instead of sorting all ~152k indices, then sort only those k (F-140).
-    let k = if top_k == 0 {
-        order.len()
-    } else {
-        top_k.min(order.len())
-    };
-    if k < order.len() {
-        order.select_nth_unstable_by(k - 1, by_logit_then_index);
-        order.truncate(k);
-    }
-    order.sort_unstable_by(by_logit_then_index);
-
-    // Softmax (in the truncated set) at the given temperature, numerically stabilised.
-    let max_logit = logits[order[0]];
-    let mut probs: Vec<f32> = order
-        .iter()
-        .map(|&i| ((logits[i] - max_logit) / temperature).exp())
-        .collect();
-    let sum: f32 = probs.iter().sum();
-    for p in &mut probs {
-        *p /= sum;
-    }
-
-    // top-p (nucleus): keep the smallest prefix whose cumulative prob ≥ top_p.
-    if top_p < 1.0 {
-        let mut cum = 0.0f32;
-        let mut cutoff = probs.len();
-        for (i, &p) in probs.iter().enumerate() {
-            cum += p;
-            if cum >= top_p {
-                cutoff = i + 1;
-                break;
-            }
-        }
-        order.truncate(cutoff);
-        probs.truncate(cutoff);
-        let renorm: f32 = probs.iter().sum();
-        for p in &mut probs {
-            *p /= renorm;
-        }
-    }
-
-    // Inverse-CDF sample.
-    let r = rng.next_f32();
-    let mut cum = 0.0f32;
-    for (i, &p) in probs.iter().enumerate() {
-        cum += p;
-        if r <= cum {
-            return order[i] as i32;
-        }
-    }
-    order[order.len() - 1] as i32
-}
-
-/// SplitMix64 increment (the golden-ratio odd constant). Single source for the seed-advance step so
-/// the value-producing constants can't drift between callers (F-133).
-pub(crate) const SPLITMIX64_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// SplitMix64 — a tiny deterministic PRNG for reproducible sampling (mirrors the joycaption runtime).
-pub(crate) struct SplitMix64(u64);
-
-impl SplitMix64 {
-    pub(crate) fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    pub(crate) fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(SPLITMIX64_INCREMENT);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn next_f32(&mut self) -> f32 {
-        ((self.next_u64() >> 40) as f32) / ((1u64 << 24) as f32)
-    }
+    argmax_host(logits)
 }
 
 #[cfg(test)]
@@ -337,95 +265,18 @@ mod tests {
 
     #[test]
     fn top_k_one_is_argmax() {
+        // top_k = 1 collapses the shaped distribution to the single max → deterministic argmax,
+        // whatever the seed. Exercises the shared sampler through `Sampler::pick`.
         let logits = [0.1, 2.0, 0.5, 1.0];
-        let mut rng = SplitMix64::new(123);
-        // top_k = 1 collapses the distribution to the single max → deterministic argmax.
-        for _ in 0..16 {
-            assert_eq!(sample(&logits, 1.0, 1.0, 1, &mut rng), 1);
-        }
-    }
-
-    /// Brute-force reference: the pre-F-140 selection (full stable sort by logit, then truncate),
-    /// with the same softmax / top-p / inverse-CDF tail. The optimized `sample` (select_nth + total
-    /// order) must match it exactly, including ties at the top-k boundary.
-    fn sample_ref(
-        logits: &[f32],
-        temperature: f32,
-        top_p: f32,
-        top_k: usize,
-        rng: &mut SplitMix64,
-    ) -> i32 {
-        let temperature = temperature.max(1e-6);
-        let mut order: Vec<usize> = (0..logits.len()).collect();
-        order.sort_by(|&a, &b| {
-            logits[b]
-                .partial_cmp(&logits[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let k = if top_k == 0 {
-            order.len()
-        } else {
-            top_k.min(order.len())
+        let s = Sampler::Sample {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 1,
+            seed: 123,
         };
-        order.truncate(k);
-        let max_logit = logits[order[0]];
-        let mut probs: Vec<f32> = order
-            .iter()
-            .map(|&i| ((logits[i] - max_logit) / temperature).exp())
-            .collect();
-        let sum: f32 = probs.iter().sum();
-        for p in &mut probs {
-            *p /= sum;
-        }
-        if top_p < 1.0 {
-            let mut cum = 0.0f32;
-            let mut cutoff = probs.len();
-            for (i, &p) in probs.iter().enumerate() {
-                cum += p;
-                if cum >= top_p {
-                    cutoff = i + 1;
-                    break;
-                }
-            }
-            order.truncate(cutoff);
-            probs.truncate(cutoff);
-            let renorm: f32 = probs.iter().sum();
-            for p in &mut probs {
-                *p /= renorm;
-            }
-        }
-        let r = rng.next_f32();
-        let mut cum = 0.0f32;
-        for (i, &p) in probs.iter().enumerate() {
-            cum += p;
-            if r <= cum {
-                return order[i] as i32;
-            }
-        }
-        order[order.len() - 1] as i32
-    }
-
-    #[test]
-    fn select_nth_matches_full_sort_with_ties() {
-        // Logits with many exact ties (including at plausible top-k boundaries), so the optimized
-        // select_nth selection and the reference full-sort selection must agree index-for-index.
-        let logits = [
-            2.0f32, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 3.0, 0.5, 3.0, 2.0, 0.5, 1.0, 3.0, 0.0,
-        ];
-        for &top_k in &[0usize, 1, 2, 3, 5, 8, 13, 15, 100] {
-            for &top_p in &[1.0f32, 0.9, 0.5, 0.1] {
-                for &temperature in &[1.0f32, 0.7] {
-                    for seed in 0..6u64 {
-                        let mut a = SplitMix64::new(seed);
-                        let mut b = SplitMix64::new(seed);
-                        assert_eq!(
-                            sample(&logits, temperature, top_p, top_k, &mut a),
-                            sample_ref(&logits, temperature, top_p, top_k, &mut b),
-                            "mismatch at top_k={top_k} top_p={top_p} temp={temperature} seed={seed}"
-                        );
-                    }
-                }
-            }
+        let mut rng = SplitMix64::new(s.seed());
+        for _ in 0..16 {
+            assert_eq!(s.pick(&logits, &mut rng).unwrap(), 1);
         }
     }
 
@@ -441,7 +292,7 @@ mod tests {
         let run = || {
             let mut rng = SplitMix64::new(s.seed());
             (0..8)
-                .map(|_| s.pick(&logits, &mut rng))
+                .map(|_| s.pick(&logits, &mut rng).unwrap())
                 .collect::<Vec<_>>()
         };
         assert_eq!(run(), run(), "same seed → identical token sequence");
