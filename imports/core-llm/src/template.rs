@@ -540,6 +540,114 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs the real Qwen3.6 tokenizer_config via MLX_LLM_QWEN35_MODEL"]
+    fn qwen36_real_template_thinking_reasoning_and_vision() {
+        // Faithfulness against the *actual* Qwen3.6 chat template (not a stand-in), the host-policy
+        // audit (sc-7631): ChatML structure, the `enable_thinking` no-think branch, the prior-turn
+        // reasoning-retention policy, and how image content is (not) rendered. The companion
+        // `qwen36_real_template_renders_tools_and_calls` covers the tool-injection / call round-trip.
+        use crate::message::{Content, ImageRef};
+
+        let dir = std::env::var("MLX_LLM_QWEN35_MODEL").expect("set MLX_LLM_QWEN35_MODEL");
+        let t = JinjaChatTemplate::from_tokenizer_config_file(format!("{dir}/tokenizer_config.json"))
+            .expect("load real Qwen3.6 chat template");
+
+        // ChatML structure: a user turn renders as an `<|im_start|>user … <|im_end|>` block.
+        let chatml = t.render(&[Message::user("Hello")], false).unwrap();
+        assert!(
+            chatml.contains("<|im_start|>user\nHello<|im_end|>\n"),
+            "ChatML user block: {chatml}"
+        );
+
+        // Thinking generation-prompt branch (the no-think reachability the provider relies on):
+        // Disabled injects the model's closed empty think block; Auto/Enabled open `<think>\n` so the
+        // model produces its own. (Generation prompt is the tail of the rendered string.)
+        let msgs = [Message::user("What is 2+2?")];
+        let disabled = t
+            .render_with(&msgs, &RenderOptions::generation().with_enable_thinking(Some(false)))
+            .unwrap();
+        assert!(
+            disabled.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "disabled = closed empty think block: {disabled}"
+        );
+        let auto = t.render_with(&msgs, &RenderOptions::generation()).unwrap();
+        assert!(
+            auto.ends_with("<|im_start|>assistant\n<think>\n"),
+            "auto opens <think>: {auto}"
+        );
+        let enabled = t
+            .render_with(&msgs, &RenderOptions::generation().with_enable_thinking(Some(true)))
+            .unwrap();
+        assert!(
+            enabled.ends_with("<|im_start|>assistant\n<think>\n"),
+            "enabled opens <think>: {enabled}"
+        );
+
+        // Reasoning-retention policy: the latest assistant turn re-emits its `reasoning_content` (from
+        // Message::thinking); once a newer user turn follows, the template strips the prior reasoning.
+        let latest = [
+            Message::user("What is 2+2?"),
+            Message::assistant("2+2 is 4.").with_thinking("The user asks 2+2; that is 4."),
+        ];
+        let rendered = t.render(&latest, false).unwrap();
+        assert!(
+            rendered.contains("<think>\nThe user asks 2+2; that is 4.\n</think>\n\n2+2 is 4."),
+            "latest-turn reasoning must be re-rendered: {rendered}"
+        );
+        let prior = [
+            Message::user("What is 2+2?"),
+            Message::assistant("2+2 is 4.").with_thinking("The user asks 2+2; that is 4."),
+            Message::user("And 3+3?"),
+        ];
+        let rendered = t.render_with(&prior, &RenderOptions::generation()).unwrap();
+        assert!(
+            rendered.contains("<|im_start|>assistant\n2+2 is 4.<|im_end|>"),
+            "prior assistant content kept: {rendered}"
+        );
+        assert!(
+            !rendered.contains("The user asks 2+2"),
+            "prior-turn reasoning must be stripped by Qwen3.6's policy: {rendered}"
+        );
+
+        // Vision handling — the host-policy finding. The contract flattens a turn's content to text
+        // (`Message::text_content` drops image blocks), so the template's native vision-counting
+        // branch (which only fires for *structured* content lists, emitting `<|image_pad|>`) does NOT
+        // run: an image block renders as nothing, just the accompanying text.
+        let with_image = Message {
+            role: Role::User,
+            content: vec![
+                Content::Image(ImageRef::new(2, 2, vec![0u8; 12]).unwrap()),
+                Content::text("describe this"),
+            ],
+            thinking: None,
+            tool_calls: Vec::new(),
+        };
+        let img_rendered = t.render(std::slice::from_ref(&with_image), false).unwrap();
+        assert!(img_rendered.contains("describe this"), "text kept: {img_rendered}");
+        assert!(
+            !img_rendered.contains("<|image_pad|>"),
+            "the template does NOT insert vision tokens for flattened content — the provider \
+             substitutes the placeholder text instead: {img_rendered}"
+        );
+
+        // The actual vision path: the provider substitutes the Qwen-VL placeholder *text* before
+        // rendering (one `<|image_pad|>` per image, expanded to the patch count after tokenizing), and
+        // the real template passes that text through verbatim via its `content is string` branch.
+        let substituted = t
+            .render(
+                &[Message::user(
+                    "<|vision_start|><|image_pad|><|vision_end|>describe this",
+                )],
+                false,
+            )
+            .unwrap();
+        assert!(
+            substituted.contains("<|vision_start|><|image_pad|><|vision_end|>describe this"),
+            "provider-substituted vision placeholder renders verbatim: {substituted}"
+        );
+    }
+
+    #[test]
     fn jinja_from_tokenizer_config_extracts_template_and_tokens() {
         let cfg = serde_json::json!({
             "chat_template": "{{ bos_token }}{% for m in messages %}{{ m['role'] + ':' + m['content'] + eos_token }}{% endfor %}",
