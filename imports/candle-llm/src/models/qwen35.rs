@@ -33,7 +33,7 @@ use crate::primitives::gated_delta::{
 use crate::primitives::nn::{embed, linear, rms_norm, silu};
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
-use crate::primitives::Weights;
+use crate::primitives::{KvCache, Weights};
 
 /// Mixture-of-Experts FFN parameters (`qwen3_5_moe`, the 35B-A3B). Parsed so the loader can detect
 /// the MoE variant; the MoE FFN itself is wired in sc-7632 slice 4.
@@ -645,6 +645,76 @@ impl Qwen35Model {
             device,
             quantized: quant.is_some(),
         })
+    }
+}
+
+impl KvCache for Qwen35Cache {
+    fn offset(&self) -> i32 {
+        Qwen35Cache::offset(self)
+    }
+
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn batch_size(&self) -> i32 {
+        self.layers
+            .iter()
+            .find_map(|l| match l {
+                Qwen35LayerCache::Attn(a) => a.kv.as_ref().map(|(k, _)| k.dims()[0] as i32),
+                Qwen35LayerCache::Delta(_) => None,
+            })
+            .unwrap_or(0)
+    }
+
+    fn reset(&mut self) {
+        Qwen35Cache::reset(self)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    // The hybrid cache is driven natively by `Qwen35Model` (which downcasts via `as_any_mut`); the
+    // softmax-only trait mutators below are never invoked through the trait object on this path.
+    fn update(
+        &mut self,
+        _layer: usize,
+        _keys: &Tensor,
+        _values: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        Err(Error::Msg(
+            "Qwen35Cache: generic KvCache::update is not supported (hybrid cache is driven natively)"
+                .into(),
+        ))
+    }
+
+    fn retain_sequences(&mut self, _keep: &[i32]) -> Result<()> {
+        Err(Error::Msg(
+            "Qwen35Cache: retain_sequences not supported".into(),
+        ))
+    }
+
+    fn truncate(&mut self, _len: i32) -> Result<()> {
+        Err(Error::Msg("Qwen35Cache: truncate not supported".into()))
+    }
+}
+
+impl crate::decode::Decode for Qwen35Model {
+    fn make_cache(&self) -> Box<dyn KvCache> {
+        Box::new(self.new_cache())
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn step(&self, input_ids: &Tensor, cache: &mut dyn KvCache, offset: i32) -> Result<Tensor> {
+        let cache = cache
+            .as_any_mut()
+            .downcast_mut::<Qwen35Cache>()
+            .ok_or_else(|| Error::Msg("Qwen35Model::step: cache is not a Qwen35Cache".into()))?;
+        self.decode_logits(input_ids, cache, offset)
     }
 }
 

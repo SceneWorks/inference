@@ -35,6 +35,12 @@ pub enum Architecture {
     /// implementation rather than GQA — plus a fine-grained MoE FFN (many routed experts, several
     /// shared experts, the first layers dense) and YaRN RoPE on the `qk_rope_head_dim` sub-vector.
     DeepseekV2,
+    /// Qwen3.6 (`model_type` `qwen3_5`, the Qwen3-Next architecture): a **hybrid** decoder
+    /// interleaving Gated DeltaNet linear-attention layers with gated full-attention layers on a
+    /// fixed schedule. A distinct model ([`Qwen35Model`](crate::models::Qwen35Model)) carrying its own
+    /// [`Qwen35Config`](crate::models::Qwen35Config), not the generic decoder — the provider routes it
+    /// specially rather than building a [`ModelConfig`].
+    Qwen35,
 }
 
 impl Architecture {
@@ -53,7 +59,11 @@ impl Architecture {
             arch.unwrap_or("").to_lowercase(),
             model_type.unwrap_or("").to_lowercase()
         );
-        if hay.contains("qwen3") {
+        if hay.contains("qwen3_5") || hay.contains("qwen3_next") {
+            // Qwen3.6 (`qwen3_5` / Qwen3-Next) — the hybrid Gated-DeltaNet decoder. Checked before
+            // `qwen3` because "qwen3_5" contains "qwen3".
+            Ok(Architecture::Qwen35)
+        } else if hay.contains("qwen3") {
             Ok(Architecture::Qwen3)
         } else if hay.contains("qwen2_moe") || hay.contains("qwen2moe") {
             Ok(Architecture::Qwen2Moe)
@@ -91,6 +101,7 @@ impl Architecture {
             Architecture::Gemma2 => "gemma2",
             Architecture::Glm4 => "glm4",
             Architecture::DeepseekV2 => "deepseek_v2",
+            Architecture::Qwen35 => "qwen3_5",
         }
     }
 

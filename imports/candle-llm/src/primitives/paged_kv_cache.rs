@@ -644,6 +644,10 @@ impl KvCache for PagedKvCache {
         self.len = 0;
         self.index_dev = None;
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 impl PagedKvCache {
