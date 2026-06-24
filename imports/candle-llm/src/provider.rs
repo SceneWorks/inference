@@ -14,8 +14,9 @@ use candle_core::Device;
 use core_llm::{
     Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError,
     FinishReason as CoreFinish, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
-    Quantize, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
+    Quantize, RenderOptions, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
+    Tokenizer, Usage,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -67,17 +68,19 @@ impl LlamaProvider {
     /// writer) is honored, so a `LoadSpec::dense` of a prepared Q4/Q8 snapshot loads quantized.
     fn load_dir(dir: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
         let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
-        let descriptor = descriptor_for(&cfg);
+        let mut descriptor = descriptor_for(&cfg);
         let quant = requested.or(cfg.quantization);
         let weights = Weights::from_dir(dir, device).map_err(to_core)?;
         let model = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
+        let (template, supports_thinking) = load_chat_template(dir);
+        descriptor.capabilities.supports_thinking = supports_thinking;
         Ok(Self {
             descriptor,
             model,
             tokenizer,
-            template: load_chat_template(dir),
+            template,
             stop_tokens,
             constraint_table: OnceCell::new(),
         })
@@ -89,7 +92,7 @@ impl LlamaProvider {
     /// `chat_template`, then the typed Llama-3 default.
     fn load_gguf(path: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
         let ck = GgufCheckpoint::open(path, device).map_err(to_core)?;
-        let descriptor = descriptor_for(&ck.config);
+        let mut descriptor = descriptor_for(&ck.config);
         let quant = requested.or(ck.config.quantization);
         let model = CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
             .map_err(to_core)?;
@@ -108,11 +111,13 @@ impl LlamaProvider {
             ck.stop_tokens.clone()
         };
 
+        let (template, supports_thinking) = gguf_chat_template(dir, &ck);
+        descriptor.capabilities.supports_thinking = supports_thinking;
         Ok(Self {
             descriptor,
             model,
             tokenizer,
-            template: gguf_chat_template(dir, &ck),
+            template,
             stop_tokens,
             constraint_table: OnceCell::new(),
         })
@@ -150,27 +155,49 @@ impl ConstraintMask for JsonMask<'_> {
 }
 
 /// Use the model's own Jinja `chat_template` (from `tokenizer_config.json`) when present; otherwise
-/// fall back to the typed Llama-3 template.
-fn load_chat_template(dir: &Path) -> Box<dyn ChatTemplate> {
+/// fall back to the typed Llama-3 template. Also reports whether the template exposes a controllable
+/// reasoning mode — true iff its source gates an `enable_thinking` kwarg (the transformers convention
+/// used by Qwen3, …; detected by source, not by family). The Llama-3 fallback never reasons.
+fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool) {
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
-        Ok(t) => Box::new(t),
-        Err(_) => Box::new(Llama3Template),
+        Ok(t) => {
+            let supports_thinking = t.source().contains("enable_thinking");
+            (Box::new(t), supports_thinking)
+        }
+        Err(_) => (Box::new(Llama3Template), false),
     }
 }
 
 /// Pick a chat template for a GGUF load: a sibling `tokenizer_config.json` first, then the GGUF's
-/// own embedded `chat_template` metadata, then the typed Llama-3 default.
-fn gguf_chat_template(dir: &Path, ck: &GgufCheckpoint) -> Box<dyn ChatTemplate> {
+/// own embedded `chat_template` metadata, then the typed Llama-3 default. Also reports
+/// `supports_thinking` (the chosen template's source gates `enable_thinking`).
+fn gguf_chat_template(dir: &Path, ck: &GgufCheckpoint) -> (Box<dyn ChatTemplate>, bool) {
     if let Ok(t) = JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json"))
     {
-        return Box::new(t);
+        let supports_thinking = t.source().contains("enable_thinking");
+        return (Box::new(t), supports_thinking);
     }
     if let Some(src) = &ck.chat_template {
+        let supports_thinking = src.contains("enable_thinking");
         let bos = ck.bos_token.clone().unwrap_or_default();
         let eos = ck.eos_token.clone().unwrap_or_default();
-        return Box::new(JinjaChatTemplate::with_tokens(src.clone(), bos, eos));
+        return (
+            Box::new(JinjaChatTemplate::with_tokens(src.clone(), bos, eos)),
+            supports_thinking,
+        );
     }
-    Box::new(Llama3Template)
+    (Box::new(Llama3Template), false)
+}
+
+/// Whether a rendered prompt ends with an **unclosed** `<think>` block — i.e. the chat template
+/// opened reasoning in the prompt (a Qwen3-style thinking/auto generation prompt) so the model
+/// generates inside it. True iff the last `<think>` occurs after the last `</think>` (or there is no
+/// close), so the segmenter is primed into the Thinking channel.
+fn prompt_opens_thinking(prompt: &str) -> bool {
+    match prompt.rfind("<think>") {
+        None => false,
+        Some(open) => prompt.rfind("</think>").is_none_or(|close| open > close),
+    }
 }
 
 impl TextLlm for LlamaProvider {
@@ -195,8 +222,16 @@ impl TextLlm for LlamaProvider {
         }
 
         // Render the conversation and tokenize. The template already includes BOS, so encode without
-        // auto special tokens.
-        let prompt = self.template.render(&req.messages, true)?;
+        // auto special tokens. `enable_thinking` flows into the template kwarg so a no-think
+        // (Disabled) request injects the model's closed `<think></think>` generation prompt; Auto
+        // omits the kwarg (template default).
+        let prompt = self.template.render_with(
+            &req.messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: req.enable_thinking_kwarg(),
+            },
+        )?;
         let prompt_ids: Vec<i32> = self
             .tokenizer
             .encode(&prompt, false)?
@@ -226,27 +261,73 @@ impl TextLlm for LlamaProvider {
             None => None,
         };
 
+        // A reasoning segmenter when the model advertises a thinking mode: it splits the decoded
+        // stream into `<think>…</think>` reasoning vs answer (markers stripped) across the Thinking /
+        // Content channels. `None` otherwise, so a non-thinking provider stays on the original
+        // single-channel path (byte-identical streaming).
+        let thinking_active = self.descriptor.capabilities.supports_thinking;
+        let mut segmenter = thinking_active.then(ThinkingSegmenter::default);
+        // Some chat templates open the reasoning block *in the prompt* (e.g. a Qwen3 generation
+        // prompt ending `…<|im_start|>assistant\n<think>\n`), so the model generates inside the block
+        // and only emits the closing `</think>`. Prime the segmenter into the Thinking channel by
+        // feeding it that already-rendered opening marker (stripped, emits nothing); a Disabled
+        // request renders a *closed* `<think></think>`, so this correctly does not prime.
+        if let Some(seg) = segmenter.as_mut() {
+            if prompt_opens_thinking(&prompt) {
+                let _ = seg.push("<think>");
+            }
+        }
+        // Reasoning text (Thinking channel) and the answer (Content channel), accumulated as the
+        // segmenter releases each span; the answer becomes the result text when thinking is active.
+        let mut thinking_buf = String::new();
+        let mut streamed = String::new();
+        // Contract token index over *emitted* events, not the raw decode step — stripped
+        // `<think>`/`</think>` marker tokens produce no event, so this stays gap-free (and equals the
+        // step in the common one-delta-per-token, non-thinking case).
+        let mut emit_index = 0usize;
+        let mut last_id = 0u32; // id of the last emitted token, for the flushed-tail events
+
         // Drive the internal loop; translate token-id events to contract text-delta events via
-        // incremental detokenization (re-decode the running sequence, emit the new suffix).
+        // incremental detokenization (re-decode the running sequence, emit the new suffix). The
+        // segmenter (when active) splits each delta into reasoning vs answer.
         let tokenizer = &self.tokenizer;
         let out = {
             let mut acc: Vec<u32> = Vec::new();
             let mut shown = 0usize;
             let mut sink = |ev: StreamEvent| {
                 if let StreamEvent::Token { id, step } = ev {
-                    acc.push(id as u32);
+                    let id = id as u32;
+                    acc.push(id);
                     if let Ok(text) = tokenizer.decode(&acc, true) {
                         if text.len() > shown {
                             let delta = text[shown..].to_string();
                             shown = text.len();
-                            on_event(CoreEvent::Token {
-                                id: id as u32,
-                                text: delta,
-                                index: step,
-                                // candle does not implement a controllable thinking mode
-                                // (supports_thinking = false), so every token is content.
-                                channel: Channel::Content,
-                            });
+                            match segmenter.as_mut() {
+                                Some(seg) => {
+                                    for span in seg.push(&delta) {
+                                        match span.channel {
+                                            Channel::Thinking => thinking_buf.push_str(&span.text),
+                                            Channel::Content => streamed.push_str(&span.text),
+                                        }
+                                        last_id = id;
+                                        on_event(CoreEvent::Token {
+                                            id,
+                                            text: span.text,
+                                            index: emit_index,
+                                            channel: span.channel,
+                                        });
+                                        emit_index += 1;
+                                    }
+                                }
+                                None => {
+                                    on_event(CoreEvent::Token {
+                                        id,
+                                        text: delta,
+                                        index: step,
+                                        channel: Channel::Content,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -263,8 +344,33 @@ impl TextLlm for LlamaProvider {
             .map_err(to_core)?
         };
 
-        let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
-        let text = tokenizer.decode(&gen_u32, true)?;
+        // End-of-generation tail: the segmenter's held-back partial marker (it turned out not to
+        // begin a marker) emitted as current-channel text.
+        if let Some(seg) = segmenter.as_mut() {
+            for span in seg.flush() {
+                match span.channel {
+                    Channel::Thinking => thinking_buf.push_str(&span.text),
+                    Channel::Content => streamed.push_str(&span.text),
+                }
+                on_event(CoreEvent::Token {
+                    id: last_id,
+                    text: span.text,
+                    index: emit_index,
+                    channel: span.channel,
+                });
+                emit_index += 1;
+            }
+        }
+
+        // Result text: the streamed answer when thinking is active (markers + reasoning excluded);
+        // otherwise the original decode-all-tokens path (byte-identical to the non-thinking case).
+        let text = if thinking_active {
+            streamed
+        } else {
+            let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
+            tokenizer.decode(&gen_u32, true)?
+        };
+        let thinking = (!thinking_buf.is_empty()).then_some(thinking_buf);
         let finish = map_finish(out.finish_reason);
         let usage = Usage {
             prompt_tokens: prompt_len as u32,
@@ -276,7 +382,7 @@ impl TextLlm for LlamaProvider {
         });
         Ok(TextLlmOutput {
             text,
-            thinking: None,
+            thinking,
             usage,
             finish_reason: Some(finish),
         })
@@ -410,4 +516,25 @@ pub fn can_load(spec: &LoadSpec) -> bool {
         return false;
     }
     Architecture::from_config(&v).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_opens_thinking;
+
+    #[test]
+    fn prompt_opens_thinking_matches_template_modes() {
+        // A Qwen3-style thinking/auto generation prompt opens the block and leaves it unclosed.
+        assert!(prompt_opens_thinking("<|im_start|>assistant\n<think>\n"));
+        // A no-think (Disabled) prompt renders a closed `<think></think>`.
+        assert!(!prompt_opens_thinking(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
+        // A prior closed reasoning turn followed by a fresh open block still opens.
+        assert!(prompt_opens_thinking(
+            "<think>\nold\n</think>\n\nq<|im_start|>assistant\n<think>\n"
+        ));
+        // No reasoning markers at all (a non-thinking template).
+        assert!(!prompt_opens_thinking("<|im_start|>assistant\n"));
+    }
 }
