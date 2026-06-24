@@ -29,7 +29,7 @@ use core_llm::{
     TextLlmRequest, Tokenizer, Usage,
 };
 
-use crate::config::ModelConfig;
+use crate::config::{Architecture, ModelConfig};
 use crate::decode::stream::default_seed;
 use crate::decode::{CancelFlag, FinishReason};
 use crate::device::select_device;
@@ -673,13 +673,23 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// tower) — which [`LlavaConfig::from_json`] requires. Never opens a safetensors shard.
 pub fn can_load(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
-    let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
+    let path = if dir.is_dir() {
+        dir.join("config.json")
+    } else {
+        dir.to_path_buf()
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
         return false;
     };
+    // LLaVA = a SigLIP/CLIP vision tower + a `text_config` decoder. Decline Qwen3.6 (`qwen3_5`): its
+    // VLM checkpoint also carries `text_config` + `vision_config`, but it is the hybrid Gated-DeltaNet
+    // decoder + a Qwen-VL ViT — served by the `candle-llama` provider (as text), not as a SigLIP LLaVA.
+    if matches!(Architecture::from_config(&v), Ok(Architecture::Qwen35)) {
+        return false;
+    }
     v.get("text_config").is_some() && v.get("vision_config").is_some()
 }
 

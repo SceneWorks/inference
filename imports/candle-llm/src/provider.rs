@@ -10,7 +10,7 @@
 use std::cell::OnceCell;
 use std::path::Path;
 
-use candle_core::Device;
+use candle_core::{Device, Tensor};
 use core_llm::{
     Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError,
     FinishReason as CoreFinish, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
@@ -20,21 +20,68 @@ use core_llm::{
 };
 
 use crate::config::{Architecture, ModelConfig};
-use crate::decode::{generate_with, ConstraintMask, FinishReason, GenerationConfig, StreamEvent};
+use crate::decode::{
+    generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig, StreamEvent,
+};
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
-use crate::models::CausalLm;
+use crate::models::{CausalLm, Qwen35Config, Qwen35Model};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
-use crate::primitives::Weights;
+use crate::primitives::{KvCache, Weights};
 
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "candle-llama";
 
+/// The loaded decoder behind the provider: the generic Llama-family [`CausalLm`] or the Qwen3.6
+/// hybrid [`Qwen35Model`] (DeltaNet linear attention + gated full attention), both driven through the
+/// shared [`Decode`] loop. Dispatched by [`Architecture`] at load.
+enum Decoder {
+    Causal(CausalLm),
+    Qwen35(Qwen35Model),
+}
+
+impl Decode for Decoder {
+    fn make_cache(&self) -> Box<dyn KvCache> {
+        match self {
+            Decoder::Causal(m) => m.make_cache(),
+            Decoder::Qwen35(m) => m.make_cache(),
+        }
+    }
+
+    fn device(&self) -> &Device {
+        match self {
+            Decoder::Causal(m) => m.device(),
+            Decoder::Qwen35(m) => m.device(),
+        }
+    }
+
+    fn step(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> crate::error::Result<Tensor> {
+        match self {
+            Decoder::Causal(m) => m.step(input_ids, cache, offset),
+            Decoder::Qwen35(m) => m.step(input_ids, cache, offset),
+        }
+    }
+}
+
+impl Decoder {
+    fn is_quantized(&self) -> bool {
+        match self {
+            Decoder::Causal(m) => m.is_quantized(),
+            Decoder::Qwen35(m) => m.is_quantized(),
+        }
+    }
+}
+
 /// A generic Llama provider implementing [`core_llm::TextLlm`].
 pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
-    model: CausalLm,
+    model: Decoder,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
     stop_tokens: Vec<i32>,
@@ -67,11 +114,27 @@ impl LlamaProvider {
     /// snapshot's own persisted `quantization` block (written by the [`prepare`](crate::prepare)
     /// writer) is honored, so a `LoadSpec::dense` of a prepared Q4/Q8 snapshot loads quantized.
     fn load_dir(dir: &Path, device: &Device, requested: Option<QuantSpec>) -> CoreResult<Self> {
-        let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
-        let mut descriptor = descriptor_for(&cfg);
-        let quant = requested.or(cfg.quantization);
+        let cfg_value = read_json(dir, "config.json")
+            .ok_or_else(|| CoreError::Load(format!("read config.json in {}", dir.display())))?;
+        let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
         let weights = Weights::from_dir(dir, device).map_err(to_core)?;
-        let model = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+        let (model, mut descriptor) = if arch == Architecture::Qwen35 {
+            // Qwen3.6 hybrid decoder: its own config, the VLM-nested `model.language_model` prefix, and
+            // a top-level untied `lm_head`. (The 27B VLM-wrapped checkpoint carries a `vision_config`;
+            // the text path ignores it — vision is a follow-on story.)
+            let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
+            let descriptor = descriptor_for_qwen35(&qcfg);
+            let m =
+                Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, requested)
+                    .map_err(to_core)?;
+            (Decoder::Qwen35(m), descriptor)
+        } else {
+            let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
+            let descriptor = descriptor_for(&cfg);
+            let quant = requested.or(cfg.quantization);
+            let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+            (Decoder::Causal(m), descriptor)
+        };
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
         let (template, supports_thinking) = load_chat_template(dir);
@@ -94,8 +157,11 @@ impl LlamaProvider {
         let ck = GgufCheckpoint::open(path, device).map_err(to_core)?;
         let mut descriptor = descriptor_for(&ck.config);
         let quant = requested.or(ck.config.quantization);
-        let model = CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
-            .map_err(to_core)?;
+        // GGUF is the dense Llama-family path only (no hybrid Qwen3.6 GGUF remap).
+        let model = Decoder::Causal(
+            CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
+                .map_err(to_core)?,
+        );
 
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let sibling_tokenizer = dir.join("tokenizer.json");
@@ -133,7 +199,7 @@ impl LlamaProvider {
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
         Self {
             descriptor: provider_descriptor(),
-            model,
+            model: Decoder::Causal(model),
             tokenizer,
             template: Box::new(Llama3Template),
             stop_tokens,
@@ -420,31 +486,57 @@ fn descriptor_for(cfg: &ModelConfig) -> TextLlmDescriptor {
     d
 }
 
-/// Read `eos_token_id` (int or array) from `config.json`; falls back to the Llama-3 stop ids.
+/// A descriptor for a loaded Qwen3.6 (`qwen3_5`) hybrid decoder. The context length comes from the
+/// [`Qwen35Config`] (which `ModelConfig` does not represent). Text-only here; the vision path is a
+/// follow-on story.
+fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
+    let mut d = provider_descriptor();
+    d.family = Architecture::Qwen35.family().to_string();
+    d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
+    d
+}
+
+/// Resolve the stop-token ids for a snapshot directory. Prefers `generation_config.json` (HF's
+/// canonical "how to generate" source — where models like Qwen3.6 put the turn-end ids; its
+/// top-level `config.json` `eos_token_id` is null), then `config.json` (top-level, then the nested
+/// `text_config` of a VLM wrapper), then the Llama-3 defaults. Each `eos_token_id` may be a single
+/// int or an array.
 pub fn eos_token_ids(dir: &Path) -> Vec<i32> {
     let fallback = vec![128001, 128008, 128009]; // <|end_of_text|>, <|eom_id|>, <|eot_id|>
-    let Ok(text) = std::fs::read_to_string(dir.join("config.json")) else {
-        return fallback;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return fallback;
-    };
-    match v.get("eos_token_id") {
-        Some(serde_json::Value::Number(n)) => {
-            n.as_i64().map(|x| vec![x as i32]).unwrap_or(fallback)
+    if let Some(ids) = read_json(dir, "generation_config.json")
+        .as_ref()
+        .and_then(|v| parse_token_ids(v.get("eos_token_id")))
+    {
+        return ids;
+    }
+    if let Some(v) = read_json(dir, "config.json") {
+        if let Some(ids) = parse_token_ids(v.get("eos_token_id"))
+            .or_else(|| parse_token_ids(v.get("text_config").and_then(|t| t.get("eos_token_id"))))
+        {
+            return ids;
         }
-        Some(serde_json::Value::Array(a)) => {
+    }
+    fallback
+}
+
+/// Read and parse a JSON file in `dir`, or `None` if absent / malformed.
+fn read_json(dir: &Path, name: &str) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(dir.join(name)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Parse an `eos_token_id`-style field — a single int or an array of ints — into a non-empty id list.
+fn parse_token_ids(v: Option<&serde_json::Value>) -> Option<Vec<i32>> {
+    match v? {
+        serde_json::Value::Number(n) => n.as_i64().map(|x| vec![x as i32]),
+        serde_json::Value::Array(a) => {
             let ids: Vec<i32> = a
                 .iter()
                 .filter_map(|x| x.as_i64().map(|x| x as i32))
                 .collect();
-            if ids.is_empty() {
-                fallback
-            } else {
-                ids
-            }
+            (!ids.is_empty()).then_some(ids)
         }
-        _ => fallback,
+        _ => None,
     }
 }
 
@@ -505,17 +597,26 @@ pub fn can_load(spec: &LoadSpec) -> bool {
         return true;
     }
     let dir = Path::new(&spec.source);
-    let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
+    let path = if dir.is_dir() {
+        dir.join("config.json")
+    } else {
+        dir.to_path_buf()
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return false;
     };
-    if v.get("vision_config").is_some() {
+    // A multimodal snapshot (a `vision_config` block) is normally declined so a vision provider claims
+    // it — EXCEPT Qwen3.6 (`qwen3_5`), which this provider serves as a **text** model: its 27B/35B
+    // checkpoints are VLM-wrapped, but the hybrid text decoder stands alone (vision is a follow-on
+    // story). So a `vision_config` config is declined only when it is not a qwen3_5.
+    let arch = Architecture::from_config(&v);
+    if v.get("vision_config").is_some() && !matches!(arch, Ok(Architecture::Qwen35)) {
         return false;
     }
-    Architecture::from_config(&v).is_ok()
+    arch.is_ok()
 }
 
 #[cfg(test)]

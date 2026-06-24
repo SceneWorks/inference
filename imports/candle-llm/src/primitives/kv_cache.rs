@@ -51,6 +51,15 @@ pub trait KvCache {
 
     /// Drop all cached state, returning the cache to its freshly-constructed (empty) condition.
     fn reset(&mut self);
+
+    /// Downcast hook for a cache driven **natively** by its model. The Qwen3.6 hybrid cache mixes
+    /// recurrent (DeltaNet) and growing-KV layers advanced together, so [`Qwen35Model`] downcasts the
+    /// `&mut dyn KvCache` it is handed back to the concrete [`Qwen35Cache`] rather than going through
+    /// the softmax-only [`KvCache::update`].
+    ///
+    /// [`Qwen35Model`]: crate::models::Qwen35Model
+    /// [`Qwen35Cache`]: crate::models::Qwen35Cache
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Growing-concat KV cache: one `Option<(K, V)>` slot per layer, concatenated along the sequence
@@ -161,6 +170,10 @@ impl KvCache for ContiguousKvCache {
         for slot in &mut self.layers {
             *slot = None;
         }
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
