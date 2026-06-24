@@ -19,6 +19,8 @@ name = "core_llm_testkit"
 # The only runtime dependency: the contract crate. The suite drives providers purely through the
 # public trait, so it links no tensor library — it runs on any platform, like core-llm itself.
 core-llm = { path = ".." }
+# Build the JSON-Schema for the tool-calling check's sample tool (`ToolSpec::parameters`). Tensor-free.
+serde_json = "1"
 
 [dev-dependencies]
 # The self-tests register an in-crate stub provider to exercise the registry round-trip check.

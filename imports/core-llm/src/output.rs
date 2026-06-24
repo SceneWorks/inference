@@ -71,16 +71,26 @@ pub enum StreamEvent {
 }
 
 /// The result of a generation (also recoverable by accumulating [`StreamEvent::Token`] text).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Not `Eq` (only `PartialEq`): a [`tool_calls`](Self::tool_calls) argument is a `serde_json::Value`,
+/// which is `PartialEq` but not `Eq` (it can hold a float).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TextLlmOutput {
-    /// The final answer — reasoning and its `<think>…</think>` markers excluded. Recoverable by
-    /// accumulating the [`Channel::Content`] token deltas.
+    /// The final answer — reasoning markers (`<think>…</think>`) and tool-call blocks
+    /// (`<tool_call>…</tool_call>`) excluded. Recoverable by accumulating the [`Channel::Content`]
+    /// token deltas.
     pub text: String,
     /// The model's reasoning trace, when it produced one: the concatenated
     /// [`Channel::Thinking`] text (markers stripped). `None` for a non-thinking run, a no-think
     /// request, or a model with no reasoning mode. Mirrors OpenAI's `reasoning_content` vs
     /// `content` split.
     pub thinking: Option<String>,
+    /// Tool / function calls the model emitted, parsed from its `<tool_call>` blocks (empty if none,
+    /// or if the request offered no tools). The raw call markup is excluded from [`text`](Self::text)
+    /// — it is structure, not answer content. Carry these back on an assistant
+    /// [`Message::tool_calls`](crate::Message::tool_calls), paired with the tool result turn(s), to
+    /// continue a multi-step tool exchange.
+    pub tool_calls: Vec<crate::tool::ToolCall>,
     /// Token usage.
     pub usage: Usage,
     /// Why generation stopped (`None` only on a default-constructed value).

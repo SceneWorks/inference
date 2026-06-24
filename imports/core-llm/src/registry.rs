@@ -273,6 +273,7 @@ mod tests {
             supports_system_prompt: true,
             supports_vision: vision,
             supports_thinking: false,
+            supports_tools: false,
             supported_constraints: constraints.to_vec(),
         }
     }
