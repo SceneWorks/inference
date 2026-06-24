@@ -33,9 +33,12 @@ use crate::fm::{
     FmHead, TimestepEmbedder,
 };
 use crate::qwen3::{KvCache, Path, Qwen3Backbone, RopeMask};
-use crate::runtime::{argmax, Sampler, SplitMix64, SPLITMIX64_INCREMENT};
+use crate::runtime::{argmax, Sampler};
 use crate::text::{build_neo1_query, image_indexes, text_indexes, tokens, SYSTEM_MESSAGE_FOR_GEN};
 use crate::vision::NeoVisionEmbedder;
+// The shared deterministic PRNG backs the Box–Muller noise sampler; the `KvCache` trait is brought
+// in anonymously so the cached-length reads (`cache.offset()`) resolve on the shared cache (sc-7159).
+use mlx_llm::primitives::{KvCache as _, SplitMix64};
 
 /// Per-step cancellation + progress for the denoise loops, matching the SDXL family's `&CancelFlag` +
 /// `on_progress` threading. `None` ⇒ uncancellable with no progress (diagnostic/parity callers); the
@@ -514,9 +517,9 @@ impl T2iModel {
         let needs_cfg = opts.cfg_scale > 1.0 && cache_uncond.is_some();
         // The RoPE tables + block mask are invariant across steps for a given cache, so build them
         // once per cache instead of inside every `predict_v` call (F-139).
-        let rm_cond = self.prepare_gen(token_h, token_w, text_len, cache_cond.len())?;
+        let rm_cond = self.prepare_gen(token_h, token_w, text_len, cache_cond.offset())?;
         let rm_uncond = match cache_uncond.as_ref() {
-            Some((cu, tlu)) => Some(self.prepare_gen(token_h, token_w, *tlu, cu.len())?),
+            Some((cu, tlu)) => Some(self.prepare_gen(token_h, token_w, *tlu, cu.offset())?),
             None => None,
         };
         let mut traj = Vec::with_capacity(steps);
@@ -1321,13 +1324,13 @@ impl T2iModel {
         // The RoPE tables + block mask are invariant across steps for a given cache, so build one per
         // cache (cond + the optional img/uncond) up front instead of inside every `predict_v` call
         // — up to 3 guidance branches × `num_steps` identical ~MB mask builds otherwise (F-139).
-        let rm_cond = self.prepare_gen(token_h, token_w, cond_t, cache_cond.len())?;
+        let rm_cond = self.prepare_gen(token_h, token_w, cond_t, cache_cond.offset())?;
         let rm_img = match img.as_ref() {
-            Some((c, tl)) => Some(self.prepare_gen(token_h, token_w, *tl, c.len())?),
+            Some((c, tl)) => Some(self.prepare_gen(token_h, token_w, *tl, c.offset())?),
             None => None,
         };
         let rm_uncond = match uncond.as_ref() {
-            Some((c, tl)) => Some(self.prepare_gen(token_h, token_w, *tl, c.len())?),
+            Some((c, tl)) => Some(self.prepare_gen(token_h, token_w, *tl, c.offset())?),
             None => None,
         };
         let mut traj = Vec::with_capacity(steps);
@@ -1599,12 +1602,12 @@ pub fn smart_resize(
 /// Standard-normal `[shape]` via Box–Muller over a SplitMix64 stream (deterministic per `seed`).
 fn gaussian(shape: &[i32], seed: u64) -> Result<Array> {
     let n: usize = shape.iter().map(|&d| d as usize).product();
-    // Reuse the shared `SplitMix64` so the scramble constants live in one place (F-133). The original
-    // inline form pre-incremented `seed` once before producing any value, so seed the RNG offset by
-    // one increment to keep the produced stream byte-identical. The f64 (0, 1] mapping below is
-    // gaussian-specific (53-bit mantissa, biased off zero to keep `ln()` finite) and differs from
-    // `SplitMix64::next_f32`, so it stays here.
-    let mut rng = SplitMix64::new(seed.wrapping_add(SPLITMIX64_INCREMENT));
+    // Reuse the shared `mlx_llm` `SplitMix64` so the scramble constants live in one place (F-133;
+    // sc-7159). The original inline form pre-incremented `seed` once before producing any value, so
+    // seed the RNG offset by one increment to keep the produced stream byte-identical. The f64 (0, 1]
+    // mapping below is gaussian-specific (53-bit mantissa, biased off zero to keep `ln()` finite) and
+    // differs from `SplitMix64::next_f32`, so it stays here.
+    let mut rng = SplitMix64::new(seed.wrapping_add(SplitMix64::INCREMENT));
     let mut next_f = || ((rng.next_u64() >> 11) as f64 + 1.0) / ((1u64 << 53) as f64);
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
@@ -1631,7 +1634,7 @@ mod tests {
 
     #[test]
     fn gaussian_matches_inline_reference() {
-        // Guard the F-133 dedup: the refactored `gaussian` (now reusing `runtime::SplitMix64`) must
+        // Guard the F-133 dedup: the refactored `gaussian` (now reusing `mlx_llm::SplitMix64`) must
         // produce a byte-identical stream to the original inline SplitMix64 Box–Muller. Reconstruct
         // the original algorithm here independently so future drift in either copy is caught.
         fn reference(shape: &[i32], seed: u64) -> Vec<f32> {

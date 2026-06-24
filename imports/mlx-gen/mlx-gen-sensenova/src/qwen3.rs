@@ -22,15 +22,53 @@
 
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, matmul, multiply, softmax_axis, split};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
+// Shared on-device decode primitives (sc-7159): the growing-concat KV cache, the standard-RoPE
+// table builder, and the half-split rotation. The bespoke dual-path / dual-theta-MRoPE / block-mask
+// runtime stays local; only the leaves (cache storage, cos/sin table, rotate-half) are delegated.
+// The `KvCache` trait is brought in anonymously (for `update`/`offset`) so it doesn't clash with the
+// `KvCache` type alias re-exported below.
+use mlx_llm::primitives::{apply_rope as mll_apply_rope, ContiguousKvCache, KvCache as _, Rope};
+
 use crate::config::NeoChatConfig;
 use crate::distill::lora_delta;
+
+/// Map an mlx-llm primitive error onto the gen-core contract error (the shared decode primitives
+/// return `mlx_llm::Result`; this crate works in `mlx_gen::Result`).
+fn mll<E: std::fmt::Display>(e: E) -> Error {
+    Error::Msg(e.to_string())
+}
+
+/// Re-export the shared KV cache under the crate's historical name so the AR runtime + denoise loops
+/// (`runtime.rs`, `t2i.rs`) keep naming one type. The persisting `update_cache=True` append is the
+/// trait's [`ContiguousKvCache::update`]; the non-persisting `update_cache=False` denoise read is
+/// [`extend_use_only`].
+pub type KvCache = ContiguousKvCache;
+
+/// Non-persisting cache use (`update_cache=False`): concat the cached prefix with this step's K/V for
+/// this forward only, leaving the shared cache unchanged. The denoise loop runs a fresh image block
+/// against the frozen text prefix every step without polluting the cache. The persisting counterpart
+/// is the shared [`ContiguousKvCache::update`]. Returns the full `[B,Hkv,S_all,D]` K/V.
+fn extend_use_only(
+    cache: &ContiguousKvCache,
+    layer: usize,
+    k: &Array,
+    v: &Array,
+) -> Result<(Array, Array)> {
+    match cache.peek(layer) {
+        Some((pk, pv)) => Ok((
+            concatenate_axis(&[pk, k], 2)?,
+            concatenate_axis(&[pv, v], 2)?,
+        )),
+        None => Ok((k.clone(), v.clone())),
+    }
+}
 
 /// Which transformer path a forward runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,64 +77,6 @@ pub enum Path {
     Und,
     /// Image-generation path (the `_mot_gen` weights). The reference `forward_gen`.
     Gen,
-}
-
-/// Per-layer key/value cache for incremental decode (the reference's HF `DynamicCache`). Each entry
-/// holds the **already-RoPE'd** keys and the raw values in `[B, Hkv, S, D]` layout (kv-head count,
-/// pre-GQA-expansion — matching what the reference appends before `repeat_kv`). The flash-attn
-/// `[B,S,H,D]` repack (`prepare_flash_kv_cache`) is a torch-kernel micro-opt with no MLX analogue;
-/// the plain `[B,Hkv,S,D]` concat here is its functional equivalent.
-pub struct KvCache {
-    layers: Vec<Option<(Array, Array)>>,
-    seq_len: i32,
-}
-
-impl KvCache {
-    /// Total cached sequence length (the reference cache's `get_seq_length()`).
-    pub fn len(&self) -> i32 {
-        self.seq_len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.seq_len == 0
-    }
-
-    /// Persisting append (`update_cache=True`): concat the new K/V onto layer `i` and store the
-    /// result back. Returns the full `[B,Hkv,S_all,D]` K/V for this forward.
-    ///
-    /// Cost (F-141): each append materializes a fresh `[B,Hkv,S+1,D]` tensor, so a decode of `n`
-    /// tokens copies `O(n²)` elements per layer — it dominates long think/VQA rollouts (e.g. a
-    /// 1024-token think block across 42 layers). This is deliberate: it mirrors the reference HF
-    /// `DynamicCache` exactly and the path is held bit-exact (`cache-equiv 0.0`). A pre-allocated
-    /// rolling buffer with `slice_update` is the textbook fix, but in MLX's immutable/lazy model it
-    /// only avoids the copy when the buffer is *donated* (refcount 1); here the cache retains the
-    /// buffer while attention reads a view of it each step, so donation rarely fires and the win is
-    /// uncertain. Left as-is until decode throughput is shown to be a bottleneck (owner decision,
-    /// sc-4141) rather than risk the bit-exact guarantee speculatively.
-    fn append(&mut self, i: usize, k: Array, v: Array) -> Result<(Array, Array)> {
-        let merged = match self.layers[i].take() {
-            Some((pk, pv)) => (
-                concatenate_axis(&[&pk, &k], 2)?,
-                concatenate_axis(&[&pv, &v], 2)?,
-            ),
-            None => (k, v),
-        };
-        self.layers[i] = Some((merged.0.clone(), merged.1.clone()));
-        Ok(merged)
-    }
-
-    /// Non-persisting use (`update_cache=False`): concat past + current for this forward only, but
-    /// do **not** store the current K/V. This is the denoise-loop path — each diffusion step runs a
-    /// fresh image block against the frozen text prefix without polluting the cache.
-    fn extend(&self, i: usize, k: &Array, v: &Array) -> Result<(Array, Array)> {
-        match &self.layers[i] {
-            Some((pk, pv)) => Ok((
-                concatenate_axis(&[pk, k], 2)?,
-                concatenate_axis(&[pv, v], 2)?,
-            )),
-            None => Ok((k.clone(), v.clone())),
-        }
-    }
 }
 
 /// `y = x · Wᵀ` for a stored `[out, in]` bias-less Linear.
@@ -255,31 +235,28 @@ impl Layer {
 }
 
 /// RoPE cos/sin for arbitrary integer positions over `dim` rotary dims (f32), shaped `[1, S, dim]`.
-/// Mirrors `Qwen3RotaryEmbedding`: `inv_freq[j] = theta^(-2j/dim)`, `emb = cat(freqs, freqs)`.
+///
+/// Delegates to the shared [`Rope::standard`] + [`Rope::cos_sin_at`] (sc-7159): `Rope::standard`'s
+/// `inv_freq[j] = theta^(-2j/dim)` and `cos_sin_at`'s NeoX `cat(freqs, freqs)` layout are byte-for-
+/// byte the prior hand-rolled `Qwen3RotaryEmbedding` table (a 1×1·1×half matmul reduces to the same
+/// per-element products as the host scalar multiply). SenseNova's tri-axis RoPE composes three of
+/// these at **two thetas** (`rope_theta` over `head_dim/2` for the temporal axis; `rope_theta_hw`
+/// over `head_dim/4` for height + width) — that dual-theta / per-axis-dim construction is *not* the
+/// single-theta `mrope_section` stitch [`Rope::mrope_cos_sin`] models, so the consolidation is onto
+/// the per-axis `cos_sin_at` leaf, not the M-RoPE helper. The three rotations are concatenated by
+/// the caller in [`Qwen3Backbone::qk_rope`].
 fn rope_cos_sin(positions: &[i32], dim: usize, theta: f32) -> Result<(Array, Array)> {
-    let half = dim / 2;
-    let inv_freq: Vec<f32> = (0..half)
-        .map(|j| 1.0f32 / theta.powf((2 * j) as f32 / dim as f32))
-        .collect();
-    let pos: Vec<f32> = positions.iter().map(|&p| p as f32).collect();
-    let s = positions.len() as i32;
-    let pos = Array::from_slice(&pos, &[s, 1]);
-    let inv = Array::from_slice(&inv_freq, &[1, half as i32]);
-    let freqs = matmul(&pos, &inv)?; // [S, half]
-    let emb = concatenate_axis(&[&freqs, &freqs], 1)?; // [S, dim]
-    let cos = emb.cos()?.expand_dims(0)?; // [1, S, dim]
-    let sin = emb.sin()?.expand_dims(0)?;
-    Ok((cos, sin))
+    Rope::standard(dim as i32, theta)
+        .cos_sin_at(positions, Dtype::Float32)
+        .map_err(mll)
 }
 
 /// HF half-split rotary: `x*cos + rotate_half(x)*sin`, with `cos`/`sin` `[1,S,dim]` broadcast over
-/// the head axis of `x` `[B,S,H,dim]`.
+/// the head axis of `x` `[B,S,H,dim]`. Delegates to the shared NeoX [`mll_apply_rope`] (sc-7159):
+/// `cos`/`sin` span the full rotary `dim` of the sub-tensor (`rd == head_dim`), so it takes the
+/// half-split branch — identical to the prior hand-rolled `cat(-x2, x1)` rotation.
 fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let cos = cos.expand_dims(2)?; // [1,S,1,dim]
-    let sin = sin.expand_dims(2)?;
-    let parts = split(x, 2, 3)?;
-    let rot = concatenate_axis(&[&parts[1].negative()?, &parts[0]], 3)?;
-    Ok(add(&multiply(x, &cos)?, &multiply(&rot, &sin)?)?)
+    mll_apply_rope(x, cos, sin, false).map_err(mll)
 }
 
 /// Expand `[B,S,Hkv,D]` → `[B,S,Hkv*groups,D]` (GQA), repeating each kv head `groups` times.
@@ -324,7 +301,6 @@ pub struct RopeMask {
     cos_w: Array,
     sin_w: Array,
     mask: Array,
-    n_tokens: i32,
 }
 
 impl Qwen3Backbone {
@@ -454,12 +430,12 @@ impl Qwen3Backbone {
         Ok(rms_norm(&hidden, final_norm, self.eps)?)
     }
 
-    /// A fresh empty cache (one slot per decoder layer).
+    /// A fresh empty cache (one slot per decoder layer). The shared growing-concat
+    /// [`ContiguousKvCache`] is the byte-for-byte equivalent of the prior hand-rolled per-layer
+    /// `concat`-on-the-sequence-axis cache (the deliberate O(n²) HF `DynamicCache` mirror, F-141);
+    /// cached length is now tracked by [`ContiguousKvCache::offset`] rather than a separate field.
     pub fn new_cache(&self) -> KvCache {
-        KvCache {
-            layers: (0..self.layers.len()).map(|_| None).collect(),
-            seq_len: 0,
-        }
+        ContiguousKvCache::new(self.layers.len())
     }
 
     /// The cached counterpart of [`Qwen3Backbone::forward_path`] — the incremental-decode forward
@@ -467,7 +443,7 @@ impl Qwen3Backbone {
     ///
     /// `embeds` `[B, S_new, hidden]` are the **new** tokens; `temporal`/`height`/`width` are their
     /// `(t,h,w)` positions (each length `S_new`). Attention runs the `S_new` queries against the
-    /// `cache.len() + S_new` cached-plus-new keys under a mask that lets every new token see all
+    /// `cache.offset() + S_new` cached-plus-new keys under a mask that lets every new token see all
     /// cached context (the reference's all-zero past block) and applies block-causal masking within
     /// the new tokens (same temporal index → bidirectional, else causal). When `append` is true the
     /// new K/V is persisted (text decode); when false it is used for this forward only (the
@@ -484,7 +460,7 @@ impl Qwen3Backbone {
         cache: &mut KvCache,
         append: bool,
     ) -> Result<Array> {
-        let rm = self.prepare_rope_mask(temporal, height, width, cache.len())?;
+        let rm = self.prepare_rope_mask(temporal, height, width, cache.offset())?;
         self.forward_prepared(embeds, &rm, path, cache, append)
     }
 
@@ -512,13 +488,12 @@ impl Qwen3Backbone {
             cos_w,
             sin_w,
             mask,
-            n_tokens: temporal.len() as i32,
         })
     }
 
     /// The decoder stack over `embeds` using a prebuilt [`RopeMask`]. Identical to [`forward_cached`]
     /// once the RoPE/mask are built; split out so the per-step builds can be hoisted (F-139). The
-    /// `RopeMask`'s `past` must match `cache.len()` — true within a denoise run (use-only `append =
+    /// `RopeMask`'s `past` must match `cache.offset()` — true within a denoise run (use-only `append =
     /// false` leaves the cache length fixed).
     pub fn forward_prepared(
         &self,
@@ -553,9 +528,8 @@ impl Qwen3Backbone {
             let normed = rms_norm(&hidden, post_ln, self.eps)?;
             hidden = add(&hidden, &mlp.forward(&normed)?)?;
         }
-        if append {
-            cache.seq_len += rm.n_tokens;
-        }
+        // When persisting, the shared cache already advanced its sequence axis inside each layer's
+        // `update` (and reports the new length via `offset()`); no separate length bookkeeping needed.
 
         let final_norm = match path {
             Path::Und => &self.norm,
@@ -624,11 +598,13 @@ impl Qwen3Backbone {
             .reshape(&[b, s, self.num_kv_heads, hd])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // Merge with the cache (persist or use-only), then GQA-expand the full K/V.
+        // Merge with the cache (persist or use-only), then GQA-expand the full K/V. The persisting
+        // path is the shared cache's `update` (`update_cache=True`); the denoise use-only path is the
+        // local `extend_use_only` adapter (the shared trait has no non-persisting read).
         let (k_all, v_all) = if append {
-            cache.append(layer_idx, k, v)?
+            cache.update(layer_idx, &k, &v).map_err(mll)?
         } else {
-            cache.extend(layer_idx, &k, &v)?
+            extend_use_only(cache, layer_idx, &k, &v)?
         };
         let groups = self.num_heads / self.num_kv_heads;
         let k_all = repeat_kv_bhsd(&k_all, groups)?;

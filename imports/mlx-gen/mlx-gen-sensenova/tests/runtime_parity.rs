@@ -14,6 +14,9 @@
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, Path, Qwen3Backbone, Sampler, ThinkRollout};
+// The shared KV cache reports its cached length via `KvCache::offset()` (sc-7159); bring the trait
+// into scope so the cache-equivalence assertions below can read it.
+use mlx_llm::primitives::KvCache;
 use mlx_rs::Array;
 
 const FIXTURE: &str = concat!(
@@ -117,7 +120,7 @@ fn ar_runtime_matches_reference() {
     let pr = peak_rel(&prefill_logits, want_prefix_logits);
     println!("prefill logits vs reference: peak-rel={pr:.3e}");
     assert!(pr < 5e-3, "prefill logits peak-rel {pr:.3e} exceeds 5e-3");
-    assert_eq!(cache.len(), prefix_len);
+    assert_eq!(cache.offset(), prefix_len);
 
     // The first generated token comes from the prefix's last-position logits.
     let last_idx = Array::from_slice(&[prefix_len - 1], &[1]);
@@ -154,7 +157,7 @@ fn ar_runtime_matches_reference() {
         tokens, want_tokens,
         "greedy token stream must match the reference"
     );
-    assert_eq!(cache.len(), prefix_len + n as i32);
+    assert_eq!(cache.offset(), prefix_len + n as i32);
 
     // ---- The `generate` wrapper yields the same stream (fresh prefill cache). ----
     let mut cache2 = model.new_cache();
@@ -235,7 +238,7 @@ fn generate_think_stops_and_appends() {
     assert_eq!(think_token_ids, want_tokens[..=first].to_vec());
     let forwards = (first + 1) as i32; // each emitted token (incl. </think>) is forwarded once
     assert_eq!(t_idx, (prefix_len - 1) + forwards + append_ids.len() as i32);
-    assert_eq!(cache.len(), prefix_len + forwards + append_ids.len() as i32);
+    assert_eq!(cache.offset(), prefix_len + forwards + append_ids.len() as i32);
 
     // ---- immediate EOS: the first token is EOS → empty think, only the append lands. ----
     let eos = want_tokens[0]; // 37 — the very first greedy pick
@@ -256,5 +259,5 @@ fn generate_think_stops_and_appends() {
         "EOS on the first token → no think tokens"
     );
     assert_eq!(roll.t_idx, (prefix_len - 1) + append_ids.len() as i32);
-    assert_eq!(cache.len(), prefix_len + append_ids.len() as i32);
+    assert_eq!(cache.offset(), prefix_len + append_ids.len() as i32);
 }

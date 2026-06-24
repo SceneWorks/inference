@@ -831,6 +831,7 @@ version = "0.0.0"
 dependencies = [
  "inventory",
  "mlx-gen",
+ "mlx-llm",
  "pmetal-mlx-rs",
  "serde_json",
 ]
