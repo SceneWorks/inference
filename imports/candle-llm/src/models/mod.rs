@@ -6,9 +6,11 @@
 //! `&mut dyn KvCache`.
 
 pub mod llama;
+pub mod qwen35;
 pub mod siglip;
 
 pub use llama::{shard_plan, CausalLm};
+pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Model};
 pub use siglip::{
     select_vision_feature, SiglipVisionConfig, SiglipVisionOutput, SiglipVisionTower,
 };
