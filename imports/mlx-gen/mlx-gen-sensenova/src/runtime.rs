@@ -123,9 +123,10 @@ impl Qwen3Backbone {
         let ids = Array::from_slice(&[token], &[1, 1]);
         let embeds = self.embed(&ids)?;
         let hidden = self.forward_cached(&embeds, &[pos_t], &[0], &[0], Path::Und, cache, true)?;
-        let logits = self.lm_head(&hidden)?; // [1, 1, vocab]
-        // The shared on-device argmax flattens internally and breaks ties to the lowest index — the
-        // same single-element host transfer + tie rule as the prior local `argmax_device` (F-140).
+        // The shared on-device argmax flattens the `[1, 1, vocab]` logits internally and breaks ties
+        // to the lowest index — the same single-element host transfer + tie rule as the prior local
+        // `argmax_device` (F-140).
+        let logits = self.lm_head(&hidden)?;
         argmax_device(&logits).map_err(mll)
     }
 
