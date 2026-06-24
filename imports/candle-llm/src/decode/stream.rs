@@ -205,6 +205,35 @@ pub fn generate_with_cache(
     )
 }
 
+/// Drive the decode loop from an externally-produced **prefill**: the caller has already run the
+/// prompt through the decoder into `first` last-position logits over a `cache` positioned past the
+/// prompt, and supplies `history` (the effective prompt ids — the repetition-penalty window).
+///
+/// The Qwen3.6 multimodal path uses this: its prefill is
+/// [`Qwen35Model::decode_logits_from_embeds`](crate::models::Qwen35Model::decode_logits_from_embeds)
+/// (image features spliced into the token embeds + interleaved M-RoPE), not a plain token-id prefill,
+/// and the continuation `decoder` shifts subsequent positions by the `mrope_delta`. The cache is
+/// borrowed (not consumed) so the caller still owns it after.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_from_prefill(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
+    first: Tensor,
+    history: Vec<i32>,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn ConstraintMask>,
+) -> Result<GenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled); // typed pre-inference cancel
+    }
+    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    decode_loop(
+        decoder, cache, first, rng, history, config, cancel, on_event, constraint,
+    )
+}
+
 /// The token-by-token decode loop shared by [`generate_with`] and the prefix-cached path
 /// ([`crate::decode::generate_cached`]): given the prefill `logits`, an RNG, the seeded `history`
 /// (the prompt — the repetition-penalty window), and a `cache` already positioned past the prompt,
