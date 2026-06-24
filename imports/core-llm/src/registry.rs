@@ -195,23 +195,35 @@ fn summary(regs: &[&TextLlmRegistration]) -> String {
 /// fields, NOT a mapped family) for error messages. Reads only `config.json`; `None` when the source
 /// is not a readable snapshot config (e.g. a `*.gguf` path). This stays generic — `core-llm` never
 /// interprets the architecture, it only surfaces what the file says.
+///
+/// For a **VLM-wrapped** config the top-level `model_type` is the wrapper (e.g. Qwen3.6's
+/// `qwen3_5` / `Qwen3_5ForConditionalGeneration`), while the actual decoder type is nested under
+/// `text_config.model_type` (`qwen3_5_text`). Surfacing the nested type means an unknown-architecture
+/// error names the real decoder a provider would dispatch on, not just the multimodal wrapper.
 fn raw_arch_hint(spec: &LoadSpec) -> Option<String> {
     let p = std::path::Path::new(&spec.source);
     let cfg = if p.is_dir() { p.join("config.json") } else { p.to_path_buf() };
     let text = std::fs::read_to_string(&cfg).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let arch = v
+    let str_at = |val: &serde_json::Value, key: &str| -> Option<String> {
+        val.get(key).and_then(|s| s.as_str()).map(String::from)
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(a) = v
         .get("architectures")
         .and_then(|a| a.as_array())
         .and_then(|a| a.first())
-        .and_then(|s| s.as_str());
-    let model_type = v.get("model_type").and_then(|s| s.as_str());
-    match (arch, model_type) {
-        (Some(a), Some(m)) => Some(format!("architectures={a}, model_type={m}")),
-        (Some(a), None) => Some(format!("architectures={a}")),
-        (None, Some(m)) => Some(format!("model_type={m}")),
-        (None, None) => None,
+        .and_then(|s| s.as_str())
+    {
+        parts.push(format!("architectures={a}"));
     }
+    if let Some(m) = str_at(&v, "model_type") {
+        parts.push(format!("model_type={m}"));
+    }
+    if let Some(tm) = v.get("text_config").and_then(|tc| str_at(tc, "model_type")) {
+        parts.push(format!("text_config.model_type={tm}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 fn no_provider_msg(spec: &LoadSpec, all: &[&TextLlmRegistration]) -> String {
@@ -343,6 +355,44 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn raw_arch_hint_surfaces_nested_text_config_model_type() {
+        // A VLM-wrapped config (Qwen3.6 shape): the top-level `model_type` is the multimodal wrapper,
+        // while the real decoder type a provider dispatches on is nested under `text_config`. The hint
+        // must surface BOTH so an unknown-architecture error names the actual decoder, not just the
+        // wrapper — otherwise the message points the reader at `qwen3_5` when the gap is `qwen3_5_text`.
+        let dir = std::env::temp_dir().join(format!("core-llm-archhint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            br#"{"architectures":["Qwen3_5ForConditionalGeneration"],
+                "model_type":"qwen3_5",
+                "text_config":{"model_type":"qwen3_5_text"},
+                "vision_config":{"model_type":"qwen3_5"}}"#,
+        )
+        .unwrap();
+        let hint = raw_arch_hint(&LoadSpec::dense(dir.to_str().unwrap().to_string()))
+            .expect("a readable config yields a hint");
+        assert_eq!(
+            hint,
+            "architectures=Qwen3_5ForConditionalGeneration, model_type=qwen3_5, \
+             text_config.model_type=qwen3_5_text"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A flat (non-wrapped) config still works and omits the nested part.
+        let flat = std::env::temp_dir().join(format!("core-llm-archhint-flat-{}", std::process::id()));
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(
+            flat.join("config.json"),
+            br#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+        let hint = raw_arch_hint(&LoadSpec::dense(flat.to_str().unwrap().to_string())).unwrap();
+        assert_eq!(hint, "architectures=LlamaForCausalLM, model_type=llama");
+        let _ = std::fs::remove_dir_all(&flat);
     }
 
     #[test]
