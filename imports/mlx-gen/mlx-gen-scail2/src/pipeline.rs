@@ -13,7 +13,6 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::gen_core;
 use mlx_gen::{
     default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
@@ -118,34 +117,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-/// Registry adapter: bridge the crate's rich [`Result`] into the registry's [`gen_core::Result`].
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor => load }
 
-inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor, load: load_registered }
-}
-
-impl Generator for Scail2 {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        Ok(self.run(req, on_progress)?)
-    }
-}
+mlx_gen::impl_generator!(Scail2 {
+    validate: |s, req| s
+        .descriptor
+        .capabilities
+        .validate_request(s.descriptor.id, req),
+    generate: run,
+});
 
 /// The first conditioning input matching `f`.
 fn find_conditioning<'a, T>(

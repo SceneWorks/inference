@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array};
 
-use mlx_gen::gen_core;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -110,14 +109,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-/// Registry adapter: bridge the crate's rich [`Result`] into the registry's [`gen_core::Result`].
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor, load: load_registered }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor => load }
 
 /// One expert (high or low) with its prepared per-expert cross-attention K/V for the cond / empty-neg
 /// text contexts (text embedding is per-expert, so K/V is built per expert).
@@ -322,23 +316,10 @@ pub fn denoise_bernini_wvitcfg(
     Ok(latent)
 }
 
-impl Generator for BerniniRenderer {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(BerniniRenderer {
+    validate: |s, req| s.validate_impl(req),
+    generate: generate_impl,
+});
 
 impl BerniniRenderer {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
