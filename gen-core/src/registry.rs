@@ -191,6 +191,10 @@ mod tests {
     use crate::media::Image;
     use crate::runtime::{Progress, WeightsSource};
     use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
+    use crate::train::{
+        Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+    };
+    use std::path::PathBuf;
 
     struct DummyGen {
         desc: ModelDescriptor,
@@ -228,8 +232,167 @@ mod tests {
         }))
     }
 
-    inventory::submit! {
-        ModelRegistration { descriptor: dummy_descriptor, load: dummy_load }
+    crate::register_generators! { dummy_descriptor => dummy_load }
+
+    struct DummyDelegatedGen {
+        descriptor: ModelDescriptor,
+    }
+
+    impl DummyDelegatedGen {
+        fn generate_impl(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> Result<GenerationOutput> {
+            Ok(GenerationOutput::Images(vec![Image::default()]))
+        }
+    }
+
+    crate::impl_generator!(DummyDelegatedGen {
+        validate: |_s, _req| Ok::<(), Error>(()),
+        generate: generate_impl,
+    });
+
+    fn dummy_delegated_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "dummy_delegated_test_model",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+        }
+    }
+
+    fn dummy_delegated_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+        Ok(Box::new(DummyDelegatedGen {
+            descriptor: dummy_delegated_descriptor(),
+        }))
+    }
+
+    crate::register_generators! { dummy_delegated_descriptor => dummy_delegated_load }
+
+    struct DummyTrainer {
+        desc: TrainerDescriptor,
+    }
+
+    impl Trainer for DummyTrainer {
+        fn descriptor(&self) -> &TrainerDescriptor {
+            &self.desc
+        }
+
+        fn validate(&self, _req: &TrainingRequest) -> Result<()> {
+            Ok(())
+        }
+
+        fn train(
+            &mut self,
+            _req: &TrainingRequest,
+            _on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<TrainingOutput> {
+            Ok(TrainingOutput {
+                adapter_path: PathBuf::from("/tmp/dummy.safetensors"),
+                steps: 0,
+                final_loss: 0.0,
+            })
+        }
+    }
+
+    fn dummy_trainer_descriptor() -> TrainerDescriptor {
+        TrainerDescriptor {
+            id: "dummy_test_trainer",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            supports_lora: true,
+            supports_lokr: false,
+        }
+    }
+
+    fn dummy_trainer_load(_spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+        Ok(Box::new(DummyTrainer {
+            desc: dummy_trainer_descriptor(),
+        }))
+    }
+
+    crate::register_trainer! { dummy_trainer_descriptor => dummy_trainer_load }
+
+    // Multi-arm fixtures: a single `register_generators!` / `register_trainer!` invocation with two
+    // `desc => load` arms exercises the `,+` repetition that single-arm callers never reach. This is
+    // the path the provider migration sweep (sc-7780) leans on for multi-variant crates like boogu.
+    fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "dummy_multi_gen_a",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+        }
+    }
+
+    fn dummy_multi_gen_b_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "dummy_multi_gen_b",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+        }
+    }
+
+    fn dummy_multi_gen_a_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+        Ok(Box::new(DummyGen {
+            desc: dummy_multi_gen_a_descriptor(),
+        }))
+    }
+
+    fn dummy_multi_gen_b_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+        Ok(Box::new(DummyGen {
+            desc: dummy_multi_gen_b_descriptor(),
+        }))
+    }
+
+    crate::register_generators! {
+        dummy_multi_gen_a_descriptor => dummy_multi_gen_a_load,
+        dummy_multi_gen_b_descriptor => dummy_multi_gen_b_load,
+    }
+
+    fn dummy_multi_trainer_a_descriptor() -> TrainerDescriptor {
+        TrainerDescriptor {
+            id: "dummy_multi_trainer_a",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            supports_lora: true,
+            supports_lokr: false,
+        }
+    }
+
+    fn dummy_multi_trainer_b_descriptor() -> TrainerDescriptor {
+        TrainerDescriptor {
+            id: "dummy_multi_trainer_b",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            supports_lora: true,
+            supports_lokr: false,
+        }
+    }
+
+    fn dummy_multi_trainer_a_load(_spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+        Ok(Box::new(DummyTrainer {
+            desc: dummy_multi_trainer_a_descriptor(),
+        }))
+    }
+
+    fn dummy_multi_trainer_b_load(_spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+        Ok(Box::new(DummyTrainer {
+            desc: dummy_multi_trainer_b_descriptor(),
+        }))
+    }
+
+    crate::register_trainer! {
+        dummy_multi_trainer_a_descriptor => dummy_multi_trainer_a_load,
+        dummy_multi_trainer_b_descriptor => dummy_multi_trainer_b_load,
     }
 
     struct DummyCaptioner {
@@ -306,6 +469,40 @@ mod tests {
     #[test]
     fn dummy_appears_in_iteration() {
         assert!(generators().any(|r| (r.descriptor)().id == "dummy_test_model"));
+    }
+
+    #[test]
+    fn macro_delegated_generator_resolves_by_id() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = load("dummy_delegated_test_model", &spec).expect("dummy is registered");
+        assert_eq!(g.descriptor().id, "dummy_delegated_test_model");
+        g.validate(&GenerationRequest::default()).unwrap();
+    }
+
+    #[test]
+    fn macro_registered_trainer_resolves_by_id() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let t = load_trainer("dummy_test_trainer", &spec).expect("dummy trainer is registered");
+        assert_eq!(t.descriptor().id, "dummy_test_trainer");
+        assert!(trainers().any(|r| (r.descriptor)().id == "dummy_test_trainer"));
+    }
+
+    #[test]
+    fn multi_arm_register_generators_registers_each() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["dummy_multi_gen_a", "dummy_multi_gen_b"] {
+            let g = load(id, &spec).unwrap_or_else(|_| panic!("{id} is registered"));
+            assert_eq!(g.descriptor().id, id);
+        }
+    }
+
+    #[test]
+    fn multi_arm_register_trainer_registers_each() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["dummy_multi_trainer_a", "dummy_multi_trainer_b"] {
+            let t = load_trainer(id, &spec).unwrap_or_else(|_| panic!("{id} is registered"));
+            assert_eq!(t.descriptor().id, id);
+        }
     }
 
     #[test]
