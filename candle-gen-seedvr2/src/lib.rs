@@ -33,7 +33,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, default_seed, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
@@ -289,14 +288,10 @@ fn load_registered_7b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_with(spec, MODEL_ID_7B)
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_3b, load: load_registered_3b }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_7b, load: load_registered_7b }
+candle_gen::register_generators! {
+    descriptor => load_registered,
+    descriptor_3b => load_registered_3b,
+    descriptor_7b => load_registered_7b,
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).

@@ -31,7 +31,6 @@ use candle_transformers::models::clip::text_model::{
 };
 use tokenizers::Tokenizer;
 
-use candle_gen::gen_core::registry::{ImageEmbedderRegistration, TextEmbedderRegistration};
 use candle_gen::gen_core::runtime::{LoadSpec, WeightsSource};
 use candle_gen::gen_core::{
     Image, ImageEmbedder, ImageEmbedderDescriptor, Result as GenResult, TextEmbedder,
@@ -296,22 +295,10 @@ pub fn load_text(spec: &LoadSpec) -> Result<Box<dyn TextEmbedder>> {
     Ok(Box::new(ClipTextEmbedder::from_snapshot(root)?))
 }
 
-/// Registry adapter: bridge the crate's `Result` into the backend-neutral `gen_core::Result`.
-fn load_registered(spec: &LoadSpec) -> GenResult<Box<dyn ImageEmbedder>> {
-    load(spec).map_err(Into::into)
-}
-
-fn load_text_registered(spec: &LoadSpec) -> GenResult<Box<dyn TextEmbedder>> {
-    load_text(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ImageEmbedderRegistration { descriptor, load: load_registered }
-}
-
-inventory::submit! {
-    TextEmbedderRegistration { descriptor: text_descriptor, load: load_text_registered }
-}
+// Link-time registration: the macros emit `gen_core`'s `inventory::submit!`s and bridge the crate
+// `Result` into `gen_core::Result` via `Into::into`, so no hand-written adapter is needed (sc-7786).
+candle_gen::register_image_embedder! { descriptor => load }
+candle_gen::register_text_embedder! { text_descriptor => load_text }
 
 #[cfg(test)]
 mod tests {
