@@ -50,7 +50,15 @@ fn save_png(out: &Array, path: &str) {
         .unwrap()
         .reshape(&[3, h, w])
         .unwrap();
-    let hwc = chw.transpose_axes(&[1, 2, 0]).unwrap(); // [H,W,3]
+    // NB: `as_slice` returns *physical* storage order. A bare `transpose` is a strided view whose
+    // buffer is still the original `[3,H,W]` (channel-planar) layout — reading that as interleaved
+    // `[H,W,3]` shuffles every pixel into a 3×3-tiled, channel-averaged (grayscale) mess. Reshape
+    // after the transpose to force a logical-order contiguous copy before slicing.
+    let hwc = chw
+        .transpose_axes(&[1, 2, 0])
+        .unwrap()
+        .reshape(&[h * w * 3])
+        .unwrap(); // [H·W·3] interleaved RGB
     let v: Vec<f32> = hwc.as_slice::<f32>().to_vec();
     let buf: Vec<u8> = v
         .iter()
@@ -80,7 +88,11 @@ fn from_clean_landscape() {
     let gemma = Gemma2::from_weights(&gw, "model.", &Gemma2Config::gemma_2_2b()).unwrap();
     let enc = CaptionEncoder::new(gemma, format!("{snap}/tokenizer.json")).unwrap();
     // Run the decode in bf16 (the reference's inference dtype + the dtype the LQ-adapter convs expect).
-    let caption_embs = enc.encode(CAPTION).unwrap().as_dtype(Dtype::Bfloat16).unwrap();
+    let caption_embs = enc
+        .encode(CAPTION)
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
     eprintln!("caption_embs {:?}", caption_embs.shape());
 
     // --- clean latent (dumped from the QwenImage_VAE_2d encode) ---
