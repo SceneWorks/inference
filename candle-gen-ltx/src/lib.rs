@@ -42,7 +42,6 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
@@ -462,9 +461,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor, load }
-}
+candle_gen::register_generators! { descriptor => load }
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
 pub fn force_link() {}

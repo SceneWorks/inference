@@ -34,7 +34,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use candle_gen::candle_core::Device;
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Progress,
     WeightsSource,
@@ -176,14 +175,10 @@ pub fn load_flash(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 // Link-time self-registration into gen-core's model registry — one descriptor per variant.
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_hd, load: load_hd }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_base, load: load_base }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_flash, load: load_flash }
+candle_gen::register_generators! {
+    descriptor_hd => load_hd,
+    descriptor_base => load_base,
+    descriptor_flash => load_flash,
 }
 
 /// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry

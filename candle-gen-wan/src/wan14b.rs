@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
@@ -657,11 +656,9 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(spec, Variant::I2v)
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_t2v_14b, load: load_t2v_14b }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_i2v_14b, load: load_i2v_14b }
+candle_gen::register_generators! {
+    descriptor_t2v_14b => load_t2v_14b,
+    descriptor_i2v_14b => load_i2v_14b,
 }
 
 #[cfg(test)]

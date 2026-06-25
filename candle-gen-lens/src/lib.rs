@@ -44,7 +44,6 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
@@ -677,11 +676,9 @@ fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_with(spec, BASE_DEFAULTS)
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_turbo, load: load_turbo }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_base, load: load_base }
+candle_gen::register_generators! {
+    descriptor_turbo => load_turbo,
+    descriptor_base => load_base,
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registrations from being dead-stripped).

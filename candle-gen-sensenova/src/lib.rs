@@ -39,7 +39,6 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, WeightsSource,
@@ -352,11 +351,9 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> gen_core::Result<Box<dyn Generator
 }
 
 // Link-time self-registration of both ids into gen-core's model registry.
-inventory::submit! {
-    ModelRegistration { descriptor, load }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_fast, load: load_fast }
+candle_gen::register_generators! {
+    descriptor => load,
+    descriptor_fast => load_fast,
 }
 
 /// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
