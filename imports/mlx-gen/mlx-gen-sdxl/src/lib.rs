@@ -58,6 +58,7 @@ pub use pipeline::{
 pub use sampler::EulerSampler;
 pub use text_encoder::{ClipOutput, ClipTextEncoder};
 pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
+pub use training::family::{train_family, SdxlFamilyHooks, TrainTimestep};
 pub use training::{load_trainer, SdxlTrainer};
 pub use unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 pub use vae::Autoencoder;

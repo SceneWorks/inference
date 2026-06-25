@@ -71,7 +71,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 }
 
 /// A tiny config: small rank, low resolution (bucketed to 64 → 8×8 latent), few steps.
-fn config(network_type: NetworkType) -> TrainingConfig {
+fn config(network_type: NetworkType, gradient_checkpointing: bool) -> TrainingConfig {
     TrainingConfig {
         rank: 8,
         alpha: 8.0,
@@ -82,11 +82,21 @@ fn config(network_type: NetworkType) -> TrainingConfig {
         seed: 7,
         network_type,
         decompose_factor: -1,
+        gradient_checkpointing,
         ..Default::default()
     }
 }
 
 fn run(tmp: &Path, file_name: &str, network_type: NetworkType) -> (Vec<f32>, u32, PathBuf) {
+    run_cfg(tmp, file_name, network_type, false)
+}
+
+fn run_cfg(
+    tmp: &Path,
+    file_name: &str,
+    network_type: NetworkType,
+    gradient_checkpointing: bool,
+) -> (Vec<f32>, u32, PathBuf) {
     let items = make_dataset(tmp);
     // Reference the provider crate so its `inventory::submit!` registration is linked into this test
     // binary (a consumer that links the crate gets it for free; an integration test that names
@@ -99,7 +109,7 @@ fn run(tmp: &Path, file_name: &str, network_type: NetworkType) -> (Vec<f32>, u32
 
     let req = TrainingRequest {
         items,
-        config: config(network_type),
+        config: config(network_type, gradient_checkpointing),
         output_dir: tmp.join("out"),
         file_name: file_name.to_string(),
         trigger_words: vec![],
@@ -215,6 +225,54 @@ fn kolors_trainer_trains_and_writes_lokr_that_reloads() {
     println!("[kolors-lokr] e2e OK — {n_targets} targets reload + merge, forward finite");
 }
 
+/// sc-7781 — the `gradient_checkpointing` path (per-block recompute) trains end-to-end on Kolors too,
+/// now that it inherits the shared SDXL-family backbone (`mlx_gen_sdxl::train_family`). Convergence
+/// matches the dense path (the block-ckpt forward+grads are validated bit-close to dense by the
+/// `block_ckpt_grads_match_dense` unit gate, which exercises the Kolors `encoder_hid_proj` U-Net), and
+/// the adapter still saves + reloads through the SDXL inference path. Mirrors
+/// `sdxl_trainer_gradient_checkpointing_converges`.
+#[test]
+#[ignore = "needs real Kolors weights"]
+fn kolors_trainer_gradient_checkpointing_converges() {
+    let tmp = std::env::temp_dir().join("kolors_trainer_gc_e2e");
+    let (losses, steps, adapter_path) = run_cfg(
+        &tmp,
+        "swatch_lora_gc.safetensors",
+        NetworkType::Lora,
+        true, // gradient_checkpointing ON → forward_block_checkpointed
+    );
+    assert_eq!(steps, 16);
+    assert!(
+        losses.iter().all(|l| l.is_finite()),
+        "no NaN/Inf under checkpointing"
+    );
+    let q = losses.len() / 4;
+    let mean = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
+    let (first_q, last_q) = (mean(&losses[..q]), mean(&losses[losses.len() - q..]));
+    assert!(
+        last_q < first_q * 0.9,
+        "checkpointed training should converge like dense: {first_q:.5} -> {last_q:.5}"
+    );
+    let mut unet = load_unet_kolors_dtype(&snapshot(), Dtype::Float32).unwrap();
+    let report = apply_sdxl_adapters_with(
+        &mut unet,
+        &[AdapterSpec {
+            path: adapter_path,
+            scale: 1.0,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }],
+        LoraCoverage::Complete,
+    )
+    .expect("checkpointed LoRA adapter should reload onto the Kolors U-Net");
+    assert!(report.merged > 0, "checkpointed adapter should merge");
+    forward_finite(&unet);
+    println!(
+        "[kolors-gc] e2e OK — checkpointed training converged {first_q:.5} -> {last_q:.5}, reloads"
+    );
+}
+
 /// A forward over the adapted Kolors U-Net produces a finite eps (the reloaded adapter installs +
 /// runs) — under Kolors conditioning shapes: ChatGLM context `[1, N, 4096]`, pooled `[1, 4096]`, and
 /// the real-resolution `time_ids = (H, W, 0, 0, H, W)`.
@@ -245,7 +303,7 @@ fn kolors_trainer_emits_preview_samples() {
         mlx_gen::load_trainer("kolors", &LoadSpec::new(WeightsSource::Dir(snapshot())))
             .expect("kolors trainer should be registered");
 
-    let mut cfg = config(NetworkType::Lora);
+    let mut cfg = config(NetworkType::Lora, false);
     cfg.steps = 8;
     cfg.sample_every = 4;
     cfg.sample_steps = 6;
