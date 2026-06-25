@@ -20,6 +20,13 @@
 // through `candle_gen::gen_core` (single gen-core resolution — see the skew gate). Mirrors how
 // mlx-gen re-exports gen_core for mlx-gen-sdxl.
 pub use gen_core;
+// Re-export the link-time registration macros so provider crates call `candle_gen::register_*!`
+// (the candle twin of `mlx_gen::register_generators!`). They emit `gen_core`'s `inventory::submit!`
+// + the `Into::into` error bridge, so providers drop their hand-written `_registered` adapters.
+pub use gen_core::{
+    register_captioner, register_generators, register_image_embedder, register_text_embedder,
+    register_trainer,
+};
 // Re-export the candle backend so provider crates share this crate's exact candle build.
 pub use candle_core;
 pub use candle_nn;

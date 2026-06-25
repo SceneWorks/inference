@@ -153,7 +153,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, Progress, WeightsSource,
@@ -416,9 +415,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
 // `gen_core::load("sdxl", …)` resolve the candle generator — no central match statement to edit.
-inventory::submit! {
-    ModelRegistration { descriptor, load }
-}
+candle_gen::register_generators! { descriptor => load }
 
 /// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
 /// references nothing in this crate directly, so the linker (MSVC in particular, on a release
