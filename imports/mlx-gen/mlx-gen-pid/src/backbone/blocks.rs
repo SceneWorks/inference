@@ -3,7 +3,7 @@
 //! the corresponding classes in `pixeldit_official.py`.
 
 use mlx_rs::fast::scaled_dot_product_attention;
-use mlx_rs::ops::{concatenate_axis, split};
+use mlx_rs::ops::{concatenate_axis, pad, split};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -33,6 +33,32 @@ fn merge_heads(x: &Array) -> Result<Array> {
 
 fn to_bhsd(x: &Array) -> Result<Array> {
     Ok(x.transpose_axes(&[0, 2, 1, 3])?) // [B,S,H,Dh] -> [B,H,S,Dh]
+}
+
+/// Flash-attention entry that stays on MLX's *fused* full-attention kernel for any head_dim.
+///
+/// MLX only flashes (never materializes the `[B,H,S,S]` scores) when `head_dim ∈ {64, 80, 128}`
+/// (`ScaledDotProductAttention::use_fallback`). The pixel stream's head_dim is **72**, which falls to
+/// the dense path and OOMs at SR-4K — pixel-stream attention is over `L = Hs·Ws` tokens (65 536 at
+/// 4096²), so the dense scores are `[B, 16, 65536, 65536] ≈ 274 GB`. Zero-pad q/k/v's head_dim up to
+/// the next supported size, flash, then slice the output back. The padded dims are zero in both q and
+/// k so `QKᵀ` is unchanged, and `scale` stays the caller's original `head_dim^-0.5` — exact, not an
+/// approximation. A head_dim already in the supported set (the patch stream's 64) takes the direct
+/// path with no copy.
+fn flash_sdpa(q: &Array, k: &Array, v: &Array, scale: f32) -> Result<Array> {
+    let hd = q.shape()[3];
+    match [64, 80, 128].into_iter().find(|&t| t >= hd) {
+        Some(t) if t != hd => {
+            let w = [(0, 0), (0, 0), (0, 0), (0, t - hd)];
+            let qp = pad(q, &w[..], None, None)?;
+            let kp = pad(k, &w[..], None, None)?;
+            let vp = pad(v, &w[..], None, None)?;
+            let o = scaled_dot_product_attention(&qp, &kp, &vp, scale, None, None)?;
+            let idx = Array::from_slice(&(0..hd).collect::<Vec<i32>>(), &[hd]);
+            Ok(o.take_axis(&idx, 3)?)
+        }
+        _ => Ok(scaled_dot_product_attention(q, k, v, scale, None, None)?),
+    }
 }
 
 /// `RotaryAttention` — single-stream qk-normed rotary attention (the PiT pixel block's attention).
@@ -65,7 +91,7 @@ impl RotaryAttention {
         let (q, k, v) = (to_bhsd(&q)?, to_bhsd(&k)?, to_bhsd(&v)?);
         let (q, k) = apply_rope(&q, &k, cos, sin)?;
         let scale = (self.head_dim as f32).powf(-0.5);
-        let o = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
+        let o = flash_sdpa(&q, &k, &v, scale)?;
         self.proj.forward(&merge_heads(&o)?)
     }
 }
@@ -131,7 +157,7 @@ impl MMDiTJointAttention {
         let k = concatenate_axis(&[&ky, &kx], 2)?;
         let v = concatenate_axis(&[&vy, &vx], 2)?;
         let scale = (self.head_dim as f32).powf(-0.5);
-        let out = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
+        let out = flash_sdpa(&q, &k, &v, scale)?;
 
         let txt_idx = Array::from_slice(&(0..ny).collect::<Vec<i32>>(), &[ny]);
         let img_idx = Array::from_slice(&(ny..ny + nx).collect::<Vec<i32>>(), &[nx]);
