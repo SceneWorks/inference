@@ -153,7 +153,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#0b5315ba7794908c3571342eeb06343e2f7a848f"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#a49ca6d9738d5e0786f29634d57c8d1bd1939c38"
 dependencies = [
  "inventory",
  "minijinja",
@@ -553,8 +553,10 @@ version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb3d648e68cea56d9858d535ee28f9538404e2dd8cb08ed0bd05dca379477f39"
 dependencies = [
+ "indexmap",
  "memo-map",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -876,7 +878,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=44929a001ab8a8837403a71c65cf064224de0cdc#44929a001ab8a8837403a71c65cf064224de0cdc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=38e1cc1730a11b1e40c2c8ecda01606763a12d51#38e1cc1730a11b1e40c2c8ecda01606763a12d51"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -888,7 +890,7 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/mlx-llm?rev=29e382bd6a3800accf0bac5daf5d8eb61e1a2adf#29e382bd6a3800accf0bac5daf5d8eb61e1a2adf"
+source = "git+https://github.com/SceneWorks/mlx-llm?rev=6c052ba6bbb81be0b95bd5e4ba650d25edb62896#6c052ba6bbb81be0b95bd5e4ba650d25edb62896"
 dependencies = [
  "core-llm",
  "half",
@@ -901,7 +903,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=44929a001ab8a8837403a71c65cf064224de0cdc#44929a001ab8a8837403a71c65cf064224de0cdc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=38e1cc1730a11b1e40c2c8ecda01606763a12d51#38e1cc1730a11b1e40c2c8ecda01606763a12d51"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -1057,7 +1059,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=44929a001ab8a8837403a71c65cf064224de0cdc#44929a001ab8a8837403a71c65cf064224de0cdc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=38e1cc1730a11b1e40c2c8ecda01606763a12d51#38e1cc1730a11b1e40c2c8ecda01606763a12d51"
 dependencies = [
  "dyn-clone",
  "half",
@@ -1080,7 +1082,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=44929a001ab8a8837403a71c65cf064224de0cdc#44929a001ab8a8837403a71c65cf064224de0cdc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=38e1cc1730a11b1e40c2c8ecda01606763a12d51#38e1cc1730a11b1e40c2c8ecda01606763a12d51"
 dependencies = [
  "bindgen",
  "cc",
@@ -1346,6 +1348,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
