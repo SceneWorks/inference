@@ -26,7 +26,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, gen_core, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, ModelRegistration, Progress, Quant, Result,
+    ModelDescriptor, Progress, Quant, Result,
 };
 use mlx_gen_face::FaceAnalysis;
 use mlx_gen_flux::config::FluxVariant;
@@ -371,15 +371,11 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(PulidFlux::new(flux, eva, pulid, face)?))
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load_pulid_flux`] into it.
-fn load_pulid_flux_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_pulid_flux(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_pulid_flux_registered }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl
+// Generator` above stays hand-written because `validate` adds a reference-face check beyond the
+// FLUX backbone's, so it is not the plain delegation `impl_generator!` expresses.
+mlx_gen::register_generators! { descriptor => load_pulid_flux }
 
 #[cfg(test)]
 mod tests {
