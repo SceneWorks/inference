@@ -50,7 +50,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, Progress, Quant, WeightsSource,
@@ -215,9 +214,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, descriptor())
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor, load }
-}
+candle_gen::register_generators! { descriptor => load }
 
 /// Force-link hook (keeps the `inventory::submit!` registrations — the `krea_2_turbo` generator and the
 /// `krea_2_raw` trainer — from being dead-stripped).

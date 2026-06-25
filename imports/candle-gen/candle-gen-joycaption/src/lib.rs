@@ -27,7 +27,6 @@ use candle_gen::gen_core::core_llm::{
     self, Content, ImageRef, LoadSpec as CoreLoadSpec, Message, ModelRequirements, Role, Sampling,
     StreamEvent, TextLlm, TextLlmRequest,
 };
-use candle_gen::gen_core::registry::CaptionerRegistration;
 use candle_gen::gen_core::{
     CaptionFinishReason, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor, Error,
     LoadSpec, Progress, Result, WeightsSource,
@@ -236,9 +235,7 @@ fn map_finish(f: core_llm::FinishReason) -> CaptionFinishReason {
     }
 }
 
-inventory::submit! {
-    CaptionerRegistration { descriptor, load }
-}
+candle_gen::register_captioner! { descriptor => load }
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
 pub fn force_link() {}

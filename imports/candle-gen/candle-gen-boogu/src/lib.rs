@@ -34,7 +34,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
@@ -305,20 +304,10 @@ pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, descriptor_edit(), Variant::Edit)
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor, load }
-}
-inventory::submit! {
-    ModelRegistration {
-        descriptor: descriptor_turbo,
-        load: load_turbo,
-    }
-}
-inventory::submit! {
-    ModelRegistration {
-        descriptor: descriptor_edit,
-        load: load_edit,
-    }
+candle_gen::register_generators! {
+    descriptor => load,
+    descriptor_turbo => load_turbo,
+    descriptor_edit => load_edit,
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registrations from being dead-stripped).

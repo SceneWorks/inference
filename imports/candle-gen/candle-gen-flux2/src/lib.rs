@@ -60,7 +60,6 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
@@ -552,11 +551,9 @@ pub fn load_dev(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 // Link-time self-registration into gen-core's model registry — one per txt2img variant.
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_klein, load: load_klein }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_dev, load: load_dev }
+candle_gen::register_generators! {
+    descriptor_klein => load_klein,
+    descriptor_dev => load_dev,
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped when the
