@@ -18,9 +18,9 @@
 use mlx_rs::Dtype;
 
 use mlx_gen::{
-    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
+    Quant, Result, WeightsSource,
 };
 
 use crate::config::DitConfig;
@@ -122,21 +122,10 @@ fn load_with(spec: &LoadSpec, id: &'static str) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl Generator for Seedvr2Generator {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
-    }
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Seedvr2Generator {
+    validate: |s, req| s.validate_impl(req),
+    generate: generate_impl,
+});
 
 /// The LR input image carried by the request's `Reference` conditioning.
 fn reference_image(req: &GenerationRequest) -> Option<&Image> {
@@ -233,24 +222,23 @@ impl Seedvr2Generator {
     }
 }
 
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_with(spec, MODEL_ID).map_err(Into::into)
+// Thin id-binding loaders over `load_with` (each pins the variant id), so they can't be a plain
+// `load` path. They return the crate's rich `Result`; `register_generators!` adds the
+// `gen_core::Result` bridge (epic 3720) and emits each `inventory::submit!`.
+fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_with(spec, MODEL_ID)
 }
-fn load_registered_3b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_with(spec, MODEL_ID_3B).map_err(Into::into)
+fn load_3b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_with(spec, MODEL_ID_3B)
 }
-fn load_registered_7b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_with(spec, MODEL_ID_7B).map_err(Into::into)
+fn load_7b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_with(spec, MODEL_ID_7B)
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_3b, load: load_registered_3b }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_7b, load: load_registered_7b }
+mlx_gen::register_generators! {
+    descriptor => load_base,
+    descriptor_3b => load_3b,
+    descriptor_7b => load_7b,
 }
 
 #[cfg(test)]
