@@ -2,9 +2,10 @@
 """Dump the qwenimage `clean_latent` (QwenImage_VAE_2d encode) for the mlx-gen-pid e2e decode.
 
 Loads ONLY the small Qwen-Image 2D VAE (`QwenImageVAE2d`, ~100 MB Wan-2D conv VAE) — not the 1.36 B
-net or the gemma encoder — on CPU in f32, and encodes a runA input at a downscaled (256→32²) and the
-native (1024→128²) resolution. The VAE is the one piece of the from_clean path not yet in Rust (a
-different 2D-conv VAE than mlx-gen-qwen-image's 3D QwenVae); MLX consumes these latents for the decode.
+net or the gemma encoder — on CPU in f32, and encodes each runA `from_clean` input at a downscaled
+(512→64²) and the native (1024→128²) resolution. The VAE is the one piece of the from_clean path not
+yet in Rust (a different 2D-conv VAE than mlx-gen-qwen-image's 3D QwenVae); MLX consumes these latents
+for the decode. One safetensors per sample → `clean_latent_<name>.safetensors`.
 
 Run: /Users/michael/Repos/mlx-gen/_vendor/pid/.venv-pid/bin/python tools/dump_pid_clean_latent.py
 """
@@ -37,31 +38,31 @@ from pid._src.inference.inference_utils import load_input_image  # noqa: E402
 
 SNAP = os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--PiD/snapshots/b4887b3c8fc65277a9b7a084292bf9fc0778c5ac")
 VAE_PTH = f"{SNAP}/checkpoints/QwenImage_VAE_2d.pth"
-INPUT = os.path.expanduser("~/pid-validate-samples/01_runA_from_clean/landscape__input__1024.png")
-OUT = "/Users/michael/Repos/mlx-gen/.claude/worktrees/dazzling-gauss-61cef9/tools/golden/pid/clean_latent_landscape.safetensors"
+RUNA = os.path.expanduser("~/pid-validate-samples/01_runA_from_clean")
+OUT_DIR = "/Users/michael/Repos/mlx-gen/.claude/worktrees/dazzling-gauss-61cef9/tools/golden/pid"
+
+# The three runA `from_clean` samples (each `<name>__input__1024.png`).
+SAMPLES = ["landscape", "portrait", "text_storefront"]
 
 
 def main():
     print("building Qwen-Image 2D VAE (cpu, f32)...", flush=True)
     vae = QwenImageVAE2d(z_dim=16, vae_pth=VAE_PTH, dtype=torch.float32, device="cpu", is_amp=False)
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-    img = load_input_image(INPUT).to(dtype=torch.float32, device="cpu")  # [1,3,1024,1024] in [-1,1]
-    print(f"input {tuple(img.shape)}", flush=True)
-    tensors = {}
-    with torch.no_grad():
-        # 512 -> latent 64 -> PiD 2048 (the low end of the 2k->4k student's trained regime; tractable
-        # for MLX attention, unlike the native 1024->4096 which materializes a 274 GB pixel-attn scores).
-        img_small = F.interpolate(img, size=(512, 512), mode="bicubic", align_corners=False).clamp(-1, 1)
-        z_small = vae.encode(img_small)  # [1,16,64,64]
-        tensors["clean_latent_small"] = z_small.float().contiguous()
-        print(f"  small {tuple(z_small.shape)} mean={z_small.mean():.4f} std={z_small.std():.4f}", flush=True)
-        z_native = vae.encode(img)  # [1,16,128,128]
-        tensors["clean_latent_native"] = z_native.float().contiguous()
-        print(f"  native {tuple(z_native.shape)} mean={z_native.mean():.4f} std={z_native.std():.4f}", flush=True)
-
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    save_file(tensors, OUT)
-    print(f"wrote {OUT}", flush=True)
+    for name in SAMPLES:
+        inp = f"{RUNA}/{name}__input__1024.png"
+        img = load_input_image(inp).to(dtype=torch.float32, device="cpu")  # [1,3,1024,1024] in [-1,1]
+        tensors = {}
+        with torch.no_grad():
+            # 512 -> latent 64 -> PiD 2048 (low end of the 2k->4k regime; tractable for a quick check).
+            img_small = F.interpolate(img, size=(512, 512), mode="bicubic", align_corners=False).clamp(-1, 1)
+            tensors["clean_latent_small"] = vae.encode(img_small).float().contiguous()  # [1,16,64,64]
+            tensors["clean_latent_native"] = vae.encode(img).float().contiguous()       # [1,16,128,128]
+        out = f"{OUT_DIR}/clean_latent_{name}.safetensors"
+        save_file(tensors, out)
+        zn = tensors["clean_latent_native"]
+        print(f"{name}: native {tuple(zn.shape)} mean={zn.mean():.4f} std={zn.std():.4f} -> {out}", flush=True)
 
 
 if __name__ == "__main__":
