@@ -28,7 +28,14 @@ resolver = "2"
 # (non-recoverable worker kill). The new mlx-sys/patches/command-buffer-recoverable.patch records the
 # error and re-throws it synchronously on the waiting thread (eval -> Result::Err) instead. Pure
 # MLX-core-patch change; no Rust API moved, so the worker import surface is unchanged.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "44929a001ab8a8837403a71c65cf064224de0cdc" }
+# SHA 38e1cc17 = 44929a00 + sc-7898: the metallib resolver (device.cpp) preferred the shared user
+# cache (~/.cache/pmetal/lib/mlx.metallib) OVER the build's own compiled-in metallib (METAL_PATH), so
+# an older/incomplete pmetal build could clobber that cache and silently shadow a complete build —
+# small-M (bm64) steel-GEMM "not found" panic on every LoRA training step while large-M inference
+# worked (sc-7889). Reordered load_default_library to try the own-build metallib BEFORE the user cache
+# (cargo install still falls through to the cache). Resolver-only change; no Rust API moved. Guarded
+# by mlx-gen-qwen-image/tests/bf16_matmul_sweep.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "38e1cc1730a11b1e40c2c8ecda01606763a12d51" }
 # Backend-neutral contract layer (epic 3720). Workspace member; mlx-gen re-exports it so the old
 # `mlx_gen::…` paths keep resolving. Family crates depend on it for `gen_core::Result` at the
 # contract boundary.
