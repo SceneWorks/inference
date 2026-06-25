@@ -202,6 +202,32 @@ fn write_config_only(name: &str, config: &str) -> PathBuf {
     dir
 }
 
+/// Write a minimal, **zero-tensor** GGUF (V3) carrying a single `general.architecture` metadata
+/// string — enough for the header-only `can_load` probe, with no tensor data at all, so a probe that
+/// resolves it provably read no weights. Returns the `.gguf` file path. (Format per the GGUF spec:
+/// little-endian magic `GGUF`, u32 version, u64 tensor_count, u64 metadata_kv_count, then KV pairs;
+/// a string is a u64 length prefix + UTF-8 bytes, and value-type `8` is String.)
+fn write_minimal_gguf(name: &str, arch: &str) -> PathBuf {
+    fn push_str(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"GGUF"); // magic
+    buf.extend_from_slice(&3u32.to_le_bytes()); // version
+    buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+    buf.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count
+    push_str(&mut buf, "general.architecture");
+    buf.extend_from_slice(&8u32.to_le_bytes()); // value type 8 = String
+    push_str(&mut buf, arch);
+
+    let dir = std::env::temp_dir().join(format!("candle-llm-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.gguf"));
+    std::fs::write(&path, &buf).unwrap();
+    path
+}
+
 #[test]
 fn can_load_is_weightless_and_architecture_aware() {
     // A directory with ONLY config.json (no shards): if the probe read weights this would fail. Each
@@ -255,11 +281,36 @@ fn can_load_is_weightless_and_architecture_aware() {
     assert!(candle_llm::llava::can_load(&vspec), "vision provider must claim a VLM");
     let _ = std::fs::remove_dir_all(&vlm);
 
-    // A `*.gguf` path is a text-model container the text provider accepts by extension (weightless),
-    // and which the vision provider declines.
-    let gguf = LoadSpec::dense("/models/whatever-Q4_K_M.gguf");
-    assert!(candle_llm::provider::can_load(&gguf), "text provider must accept a .gguf path");
-    assert!(!candle_llm::llava::can_load(&gguf));
+    // A `*.gguf` file: the text provider reads ONLY the header (the fixtures below carry zero tensor
+    // data) to confirm `general.architecture`. A supported arch (llama/qwen3) is claimed; the vision
+    // provider declines either (story 7420 — replaces the earlier extension-only accept).
+    for arch in ["llama", "qwen3"] {
+        let path = write_minimal_gguf(&format!("canload-gguf-{arch}"), arch);
+        let spec = LoadSpec::dense(path.to_str().unwrap().to_string());
+        assert!(
+            candle_llm::provider::can_load(&spec),
+            "{arch}: text provider must claim a supported-arch GGUF weightlessly"
+        );
+        assert!(
+            !candle_llm::llava::can_load(&spec),
+            "{arch}: vision provider must decline a GGUF"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // An unsupported / non-LLM GGUF arch (here `bert`) is declined — likewise weightlessly, from the
+    // header alone — so `load_for_model` returns a clean `Unsupported` instead of routing it here.
+    let bert = write_minimal_gguf("canload-gguf-bert", "bert");
+    let bspec = LoadSpec::dense(bert.to_str().unwrap().to_string());
+    assert!(
+        !candle_llm::provider::can_load(&bspec),
+        "text provider must decline an unsupported/non-LLM GGUF arch"
+    );
+    let _ = std::fs::remove_dir_all(bert.parent().unwrap());
+
+    // A `*.gguf` path that doesn't exist (or isn't a parseable GGUF) is declined gracefully — the
+    // header probe fails closed rather than claiming a file it can't read.
+    assert!(!candle_llm::provider::can_load(&LoadSpec::dense("/no/such/model-Q4_K_M.gguf")));
 
     // A nonexistent snapshot path is declined gracefully.
     assert!(!candle_llm::provider::can_load(&LoadSpec::dense("/no/such/dir")));
@@ -297,5 +348,62 @@ fn load_for_model_unknown_architecture_is_a_typed_error() {
         Err(e) => panic!("expected Unsupported, got error: {e}"),
         Ok(_) => panic!("expected Unsupported, got a loaded provider"),
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_for_model_unsupported_gguf_is_a_typed_error() {
+    // A non-LLM GGUF (here `general.architecture = "bert"`): no provider claims it via its weightless
+    // header probe, so model-first resolution returns a typed `Unsupported` — the same outcome as an
+    // unsupported safetensors snapshot, not a generic load error from routing it to candle-llama and
+    // failing deep in the GGUF reader (story 7420).
+    let path = write_minimal_gguf("lfm-gguf-bert", "bert");
+    let spec = LoadSpec::dense(path.to_str().unwrap().to_string());
+    match load_for_model(&spec) {
+        Err(core_llm::Error::Unsupported(m)) => {
+            assert!(m.contains("no registered provider can serve"), "{m}");
+        }
+        Err(e) => panic!("expected Unsupported, got error: {e}"),
+        Ok(_) => panic!("expected Unsupported, got a loaded provider"),
+    }
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// Gated: a real GGUF (`CANDLE_LLM_GGUF`) is claimed by the weightless header probe, resolves through
+/// model-first `load_for_model` (no provider id named), AND the probe is provably weightless —
+/// truncating the file at its `tensor_data_offset` (dropping every tensor block) still resolves
+/// `can_load`.
+#[test]
+#[ignore = "needs a GGUF via CANDLE_LLM_GGUF"]
+fn gguf_resolves_through_load_for_model_and_probe_is_weightless() {
+    use candle_core::quantized::gguf_file::Content;
+
+    let gguf = std::env::var("CANDLE_LLM_GGUF").expect("set CANDLE_LLM_GGUF");
+    let spec = LoadSpec::dense(gguf.clone());
+    assert!(
+        candle_llm::provider::can_load(&spec),
+        "a real supported-arch GGUF must be claimed by the header probe"
+    );
+
+    // Model-first resolution: no provider id named, the resolver picks candle-llama via can_load.
+    let llm = load_for_model(&spec).expect("load_for_model resolves a real GGUF");
+    assert_eq!(llm.descriptor().backend, "candle");
+
+    // Weightless: copy only the bytes up to `tensor_data_offset` (the magic + metadata + tensor-info
+    // table, with NO tensor blocks) and confirm can_load still resolves — proving the probe read no
+    // weights even on a real checkpoint.
+    let mut f = std::fs::File::open(&gguf).expect("open gguf");
+    let header_len = Content::read(&mut f).expect("read gguf header").tensor_data_offset as usize;
+    let mut bytes = std::fs::read(&gguf).expect("read gguf");
+    bytes.truncate(header_len);
+    let dir = std::env::temp_dir().join(format!("candle-llm-gguf-trunc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let trunc = dir.join("header-only.gguf");
+    std::fs::write(&trunc, &bytes).unwrap();
+    let tspec = LoadSpec::dense(trunc.to_str().unwrap().to_string());
+    assert!(
+        candle_llm::provider::can_load(&tspec),
+        "header-only (tensor-data-truncated) GGUF must still resolve — the probe is weightless"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

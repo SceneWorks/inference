@@ -255,6 +255,37 @@ pub fn is_gguf_path(source: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Read **only** the GGUF header/metadata table — never a tensor block — and return the
+/// `general.architecture` string, or `None` if `path` can't be opened/parsed or omits the key.
+///
+/// Candle's `Content::read` parses the magic, the metadata KV table, and the tensor-info table
+/// (names/shapes/offsets) and then stops at `tensor_data_offset`; it never reads a tensor block. So
+/// this probe is **weightless**: a GGUF truncated right after its metadata still resolves. The text
+/// provider's `can_load` uses it to confirm a `.gguf`'s architecture before claiming the file,
+/// mirroring the safetensors path's `config.json` probe (story 7420).
+pub fn gguf_architecture(path: impl AsRef<Path>) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let content = Content::read(&mut file).ok()?;
+    meta_str(&content.metadata, "general.architecture").map(str::to_string)
+}
+
+/// Map a GGUF `general.architecture` to the `(model_type, architectures[0])` HF identifiers the
+/// engine's decoder dispatch understands, or `None` if this provider's GGUF loader can't reconstruct
+/// it. llama.cpp labels both Llama and Mistral `"llama"`; Qwen3 is `"qwen3"`. Every other GGUF
+/// architecture (`qwen2`, `gemma2`, `phi3`, a non-LLM `bert`/`clip`, …) has no GGUF reconstruction
+/// path and is declined.
+///
+/// `reconstruct_config` (the loader) and the provider's `can_load` (the weightless resolve probe)
+/// both consult this one mapping, so the "can this load?" and "does this load?" decisions can never
+/// drift apart.
+pub fn gguf_arch_to_hf(arch: &str) -> Option<(&'static str, &'static str)> {
+    match arch {
+        "llama" => Some(("llama", "LlamaForCausalLM")),
+        "qwen3" => Some(("qwen3", "Qwen3ForCausalLM")),
+        _ => None,
+    }
+}
+
 /// Map a GGML tensor name to the transformer (HF) key the decoder loads, or `None` if it is not a
 /// weight the engine consumes.
 pub fn remap_key(name: &str) -> Option<String> {
@@ -338,16 +369,12 @@ fn reconstruct_config(
         meta_u64(meta, &key(s))
             .ok_or_else(|| Error::Config(format!("gguf: missing metadata {}", key(s))))
     };
-    let (model_type, hf_arch) = match arch {
-        "llama" => ("llama", "LlamaForCausalLM"),
-        "qwen3" => ("qwen3", "Qwen3ForCausalLM"),
-        other => {
-            return Err(Error::Unsupported(format!(
-                "gguf architecture {other:?} (engine supports llama/mistral and qwen3; \
-                 mistral GGUFs are labelled \"llama\")"
-            )))
-        }
-    };
+    let (model_type, hf_arch) = gguf_arch_to_hf(arch).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "gguf architecture {arch:?} (engine supports llama/mistral and qwen3; \
+             mistral GGUFs are labelled \"llama\")"
+        ))
+    })?;
 
     let hidden = req_u64("embedding_length")? as i64;
     let blocks = req_u64("block_count")? as i64;

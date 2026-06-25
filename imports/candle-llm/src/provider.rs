@@ -1011,16 +1011,30 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 }
 
 /// Weightless model-first probe (story 7406): can the `candle-llama` provider serve the model at
-/// `spec.source`? A `*.gguf` file is a text-model container this provider loads directly, so it is
-/// accepted by extension. Otherwise this reads **only** `config.json` and runs the same
-/// [`Architecture::from_config`] dispatch the loader uses (Llama / Mistral / Qwen2 / Qwen3 /
-/// Qwen2-MoE / Gemma2 / GLM-4 / DeepSeek-V2 / Phi-3) — it never opens a safetensors shard, so
-/// `core-llm`'s `load_for_model` can resolve a provider by model without loading weights. A
-/// multimodal snapshot (a `vision_config` block — including a VLM whose `model_type` substring-
-/// matches a text family, e.g. `mllama`) is declined so the vision provider claims it instead.
+/// `spec.source`?
+///
+/// For a `*.gguf` file this reads **only** the GGUF header/metadata (never a tensor block, via
+/// [`gguf_architecture`](crate::gguf::gguf_architecture)) and accepts it iff its `general.architecture`
+/// is one the native GGUF loader can reconstruct ([`gguf_arch_to_hf`](crate::gguf::gguf_arch_to_hf):
+/// `llama`/`mistral` and `qwen3`); an unsupported or non-LLM GGUF (`bert`, a `clip` mmproj, …) is
+/// declined so `load_for_model` returns a clean `Unsupported` rather than routing it here to fail at
+/// load (story 7420, replacing the earlier extension-only accept).
+///
+/// Otherwise this reads **only** `config.json` and runs the same [`Architecture::from_config`] dispatch
+/// the loader uses (Llama / Mistral / Qwen2 / Qwen3 / Qwen2-MoE / Gemma2 / GLM-4 / DeepSeek-V2 / Phi-3)
+/// — it never opens a safetensors shard, so `core-llm`'s `load_for_model` can resolve a provider by
+/// model without loading weights. A multimodal snapshot (a `vision_config` block — including a VLM
+/// whose `model_type` substring-matches a text family, e.g. `mllama`) is declined so the vision
+/// provider claims it instead.
 pub fn can_load(spec: &LoadSpec) -> bool {
     if crate::gguf::is_gguf_path(&spec.source) {
-        return true;
+        // Confirm the GGUF's architecture from its header alone (weightless) — accept iff the loader
+        // can actually reconstruct it. A `.gguf` that is missing/corrupt or names an unsupported arch
+        // resolves to `None` and is declined.
+        return crate::gguf::gguf_architecture(&spec.source)
+            .as_deref()
+            .and_then(crate::gguf::gguf_arch_to_hf)
+            .is_some();
     }
     let dir = Path::new(&spec.source);
     let path = if dir.is_dir() {
