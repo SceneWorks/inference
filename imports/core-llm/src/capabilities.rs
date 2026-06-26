@@ -15,6 +15,11 @@ pub struct TextLlmCapabilities {
     pub supports_system_prompt: bool,
     /// Whether image (vision) content is accepted.
     pub supports_vision: bool,
+    /// Whether video content (sampled frames + per-frame timestamps) is accepted. Independent of
+    /// [`supports_vision`](Self::supports_vision): a model may take images but not video. `false` ⇒ a
+    /// request carrying [`Content::Video`](crate::message::Content::Video) is rejected, never silently
+    /// dropped.
+    pub supports_video: bool,
     /// Whether the model has a controllable reasoning ("thinking") mode — i.e. it honors the
     /// [`thinking`](crate::TextLlmRequest::thinking) request control (its chat template gates an
     /// `enable_thinking` kwarg). `false` ⇒ the model never reasons, and an explicit
@@ -43,7 +48,11 @@ impl TextLlmCapabilities {
         if req.messages.is_empty() {
             return reject("request has no messages".into());
         }
-        if req.messages.iter().all(|m| m.text_content().trim().is_empty() && !m.has_image()) {
+        if req
+            .messages
+            .iter()
+            .all(|m| m.text_content().trim().is_empty() && !m.has_image() && !m.has_video())
+        {
             return reject("request has no non-empty content".into());
         }
 
@@ -61,6 +70,12 @@ impl TextLlmCapabilities {
         if !self.supports_vision && req.has_image() {
             return Err(Error::Unsupported(format!(
                 "[{id}] provider does not support image (vision) input"
+            )));
+        }
+
+        if !self.supports_video && req.has_video() {
+            return Err(Error::Unsupported(format!(
+                "[{id}] provider does not support video input"
             )));
         }
 

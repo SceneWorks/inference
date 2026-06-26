@@ -675,7 +675,7 @@ mod tests {
         // is absent. Asserts: ChatML structure, the `add_generation_prompt` tail, the tools section,
         // and the vision finding (flattened content drops image blocks → no native vision token; the
         // provider's substituted placeholder text passes through verbatim).
-        use crate::message::{Content, ImageRef, Role};
+        use crate::message::{Content, ImageRef, Role, VideoRef};
         let Some(dir) = qwen3vl_snapshot_dir() else {
             eprintln!("skipping qwen3vl_real_template_chatml_tools_and_vision: Qwen3-VL-8B snapshot \
                        not present (set MLX_LLM_QWEN3VL_MODEL or QWEN3VL_SNAPSHOT)");
@@ -746,6 +746,43 @@ mod tests {
         assert!(
             substituted.contains("<|vision_start|><|image_pad|><|vision_end|>describe this"),
             "provider-substituted vision placeholder renders verbatim: {substituted}"
+        );
+
+        // Video flattens the same way: a `Content::Video` block renders as nothing; the provider
+        // substitutes the Text–Timestamp-Alignment placeholder text before rendering.
+        let frame = ImageRef::new(2, 2, vec![0u8; 12]).unwrap();
+        let with_video = Message {
+            role: Role::User,
+            content: vec![
+                Content::Video(VideoRef::new(vec![frame.clone(), frame], vec![0.0, 0.5]).unwrap()),
+                Content::text("what happens"),
+            ],
+            thinking: None,
+            tool_calls: Vec::new(),
+        };
+        let vid_rendered = t.render(std::slice::from_ref(&with_video), false).unwrap();
+        assert!(vid_rendered.contains("what happens"), "video-turn text kept: {vid_rendered}");
+        assert!(
+            !vid_rendered.contains("<|video_pad|>"),
+            "flattened video content must NOT insert video tokens — the provider substitutes the \
+             timestamp+placeholder text instead: {vid_rendered}"
+        );
+
+        // The provider-substituted video placeholder (per-frame `<{t} seconds>` timestamp + a vision
+        // block wrapping `<|video_pad|>`) renders verbatim through the `content is string` branch —
+        // the Text–Timestamp-Alignment shape `Qwen3VLProcessor.replace_video_token` emits.
+        let vid_substituted = t
+            .render(
+                &[Message::user(
+                    "<0.0 seconds><|vision_start|><|video_pad|><|vision_end|>\
+                     <0.5 seconds><|vision_start|><|video_pad|><|vision_end|>what happens",
+                )],
+                false,
+            )
+            .unwrap();
+        assert!(
+            vid_substituted.contains("<0.0 seconds><|vision_start|><|video_pad|><|vision_end|>"),
+            "provider-substituted video timestamp+placeholder renders verbatim: {vid_substituted}"
         );
     }
 

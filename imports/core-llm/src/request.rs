@@ -128,6 +128,11 @@ impl TextLlmRequest {
         self.messages.iter().any(crate::message::Message::has_image)
     }
 
+    /// Whether any message carries video content.
+    pub fn has_video(&self) -> bool {
+        self.messages.iter().any(crate::message::Message::has_video)
+    }
+
     /// The `enable_thinking` chat-template kwarg for this request's [`thinking`](Self::thinking)
     /// mode (`None` ⇒ omit it / use the template default). Feed into
     /// [`RenderOptions`](crate::template::RenderOptions).
