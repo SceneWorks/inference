@@ -175,7 +175,12 @@ fn can_load_stub(_spec: &LoadSpec) -> bool {
     true
 }
 inventory::submit! {
-    TextLlmRegistration { descriptor: stub_descriptor, load: load_stub, can_load: can_load_stub }
+    TextLlmRegistration {
+        descriptor: stub_descriptor,
+        load: load_stub,
+        can_load: can_load_stub,
+        weightless_vision: None,
+    }
 }
 
 #[test]

@@ -14,7 +14,7 @@
 //! `config.json`; the resolver picks the first registered provider whose probe accepts the model and
 //! whose declared capabilities meet the caller's [`ModelRequirements`].
 
-use crate::capabilities::{TextLlmCapabilities, TextLlmDescriptor};
+use crate::capabilities::TextLlmDescriptor;
 use crate::constraint::Constraint;
 use crate::error::{Error, Result};
 use crate::request::{LoadSpec, TextLlmRequest};
@@ -32,6 +32,26 @@ pub struct TextLlmRegistration {
     /// over the snapshot's `config.json` — it MUST NOT read safetensors / weight shards. Drives
     /// [`load_for_model`]; the architecture knowledge stays in the backend, never in `core-llm`.
     pub can_load: fn(&LoadSpec) -> bool,
+    /// **Weightless** per-snapshot vision probe: does this provider serve the model at `spec.source`
+    /// *with* vision (image) support? Like [`can_load`](Self::can_load), it reads only `config.json`
+    /// and MUST NOT touch weight shards; the architecture knowledge stays in the backend.
+    ///
+    /// This exists because a single registration's **static** [`descriptor`](Self::descriptor)
+    /// reports one `supports_vision` for the whole provider, but vision capability is often
+    /// *per-snapshot*: one generic provider serves both text-only checkpoints and VLM wrappers
+    /// (e.g. mlx-llm's `mlx-llama` serves a plain Qwen3 *and* a Qwen3-VL `qwen3_vl` wrapper). Its
+    /// static descriptor must stay `supports_vision=false` (most snapshots are text-only), so a
+    /// model-first vision-required load (`load_for_model_with(spec, with_vision())`) would otherwise
+    /// be rejected at the pre-load gate for a genuinely vision-capable VLM snapshot. A backend sets
+    /// this to sniff the snapshot's `config.json` (a `vision_config` plus a VLM `model_type`) so the
+    /// gate recognizes that snapshot as vision-capable without loading weights.
+    ///
+    /// `None` ⇒ the provider has no per-snapshot vision distinction; the gate falls back to the
+    /// static descriptor's [`supports_vision`](TextLlmCapabilities::supports_vision) (the prior
+    /// behavior, so a registration that does not set this field is unchanged). A `Some(_)` that
+    /// returns `false` for a snapshot likewise defers to the static descriptor — the probe only ever
+    /// *adds* vision capability for a snapshot, never revokes the statically-declared one.
+    pub weightless_vision: Option<fn(&LoadSpec) -> bool>,
 }
 
 inventory::collect!(TextLlmRegistration);
@@ -140,23 +160,26 @@ fn select<'a>(
     }
 
     // 2. Capability filter: keep only providers whose declared capabilities meet the request surface.
+    //    Vision is judged per-snapshot (the registration's weightless probe ∨ the static
+    //    descriptor), so a generic provider whose static descriptor is text-only still qualifies for
+    //    a vision-required load when its probe recognizes *this* snapshot as a VLM wrapper.
     let viable: Vec<&TextLlmRegistration> = accepting
         .iter()
         .copied()
-        .filter(|r| meets(&(r.descriptor)().capabilities, reqs))
+        .filter(|r| meets(r, spec, reqs))
         .collect();
     if viable.is_empty() {
         return Err(Error::Unsupported(unmet_caps_msg(spec, reqs, &accepting)));
     }
 
     // 3. Tie-break. When vision was not requested and several providers match, prefer a text
-    //    (non-vision) provider so a plain load never hands back a model that expects an image;
-    //    otherwise take the first-registered viable provider.
+    //    (non-vision *for this snapshot*) provider so a plain load never hands back a model that
+    //    expects an image; otherwise take the first-registered viable provider.
     if viable.len() > 1 && !reqs.vision {
         if let Some(text) = viable
             .iter()
             .copied()
-            .find(|r| !(r.descriptor)().capabilities.supports_vision)
+            .find(|r| !serves_vision(r, spec))
         {
             return Ok(text);
         }
@@ -164,11 +187,23 @@ fn select<'a>(
     Ok(viable[0])
 }
 
-/// Whether a provider's declared capabilities satisfy the caller's requirements.
-fn meets(caps: &TextLlmCapabilities, reqs: &ModelRequirements) -> bool {
-    if reqs.vision && !caps.supports_vision {
+/// Whether a registration serves `spec` **with vision** — judged per-snapshot: the registration's
+/// weightless vision probe (when set) recognizes this snapshot as a VLM, OR the static descriptor
+/// already declares `supports_vision`. The probe only ever *adds* capability (it cannot revoke a
+/// statically-declared one), so a provider with no probe behaves exactly as before.
+fn serves_vision(reg: &TextLlmRegistration, spec: &LoadSpec) -> bool {
+    reg.weightless_vision.map(|p| p(spec)).unwrap_or(false)
+        || (reg.descriptor)().capabilities.supports_vision
+}
+
+/// Whether a registration satisfies the caller's requirements for `spec`. Vision is judged
+/// per-snapshot via [`serves_vision`]; constraints come from the static descriptor (they are not
+/// snapshot-dependent).
+fn meets(reg: &TextLlmRegistration, spec: &LoadSpec, reqs: &ModelRequirements) -> bool {
+    if reqs.vision && !serves_vision(reg, spec) {
         return false;
     }
+    let caps = (reg.descriptor)().capabilities;
     reqs.constraints
         .iter()
         .all(|c| caps.supports_constraint(*c))
@@ -255,6 +290,7 @@ fn unmet_caps_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::TextLlmCapabilities;
     use crate::output::{StreamEvent, TextLlmOutput};
 
     // --- A throwaway provider whose `load` is never invoked by `select` (resolution only). ---
@@ -308,6 +344,83 @@ mod tests {
         }
     }
 
+    // --- Qwen3-VL model-first routing fixtures (sc-8077) ---------------------------------------
+    // A *generic* backend provider (the mlx-llm `mlx-llama` shape): one registration serves both
+    // plain text checkpoints and VLM wrappers, so its STATIC descriptor must report
+    // `supports_vision=false` (most snapshots are text-only). It supplies a weightless per-snapshot
+    // vision probe to advertise vision for an actual VLM wrapper without loading weights.
+    fn generic_text_desc() -> TextLlmDescriptor {
+        TextLlmDescriptor {
+            id: "mlx-llama".into(),
+            family: "qwen3_vl".into(),
+            backend: "mlx".into(),
+            capabilities: caps(false, &[Constraint::Json]),
+        }
+    }
+    // A *dedicated* vision provider (the JoyCaption/LLaVA shape): static `supports_vision=true`, but
+    // its `can_load` only claims the LLaVA signature — it must NOT claim a Qwen3-VL snapshot.
+    fn joycaption_desc() -> TextLlmDescriptor {
+        TextLlmDescriptor {
+            id: "mlx-joycaption".into(),
+            family: "llava".into(),
+            backend: "mlx".into(),
+            capabilities: caps(true, &[]),
+        }
+    }
+
+    /// Write a faithful Qwen3-VL `config.json` (model_type `qwen3_vl`, nested `qwen3_vl_text`
+    /// decoder, `vision_config` present) into a fresh temp dir and return a [`LoadSpec`] for it. This
+    /// mirrors the cached `Qwen/Qwen3-VL-8B-Instruct` (rev 0c351dd0) wrapper shape.
+    fn qwen3vl_snapshot(tag: &str) -> (std::path::PathBuf, LoadSpec) {
+        let dir = std::env::temp_dir().join(format!(
+            "core-llm-qwen3vl-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            br#"{"architectures":["Qwen3VLForConditionalGeneration"],
+                "model_type":"qwen3_vl",
+                "image_token_id":151655,
+                "text_config":{"model_type":"qwen3_vl_text","max_position_embeddings":262144},
+                "vision_config":{"model_type":"qwen3_vl","depth":27}}"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
+        (dir, spec)
+    }
+
+    /// A weightless vision probe of the `mlx-llama` shape: reads only `config.json` and advertises
+    /// vision for a Qwen-VL wrapper (a `vision_config` plus a `qwen3_vl` / `qwen3_5` `model_type`).
+    /// This is the contract-side stand-in for the mlx-llm provider's own probe.
+    fn qwen_vl_vision_probe(spec: &LoadSpec) -> bool {
+        let p = std::path::Path::new(&spec.source);
+        let cfg = if p.is_dir() { p.join("config.json") } else { p.to_path_buf() };
+        let Ok(text) = std::fs::read_to_string(&cfg) else {
+            return false;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return false;
+        };
+        if v.get("vision_config").is_none() {
+            return false;
+        }
+        let mt = |val: &serde_json::Value, key: &str| {
+            val.get(key)
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default()
+        };
+        let top = mt(&v, "model_type");
+        let nested = v
+            .get("text_config")
+            .map(|tc| mt(tc, "model_type"))
+            .unwrap_or_default();
+        let hay = format!("{top} {nested}");
+        hay.contains("qwen3_vl") || hay.contains("qwen3vl") || hay.contains("qwen3_5")
+    }
+
     fn yes(_spec: &LoadSpec) -> bool {
         true
     }
@@ -323,6 +436,21 @@ mod tests {
             descriptor,
             load: never_loads,
             can_load,
+            weightless_vision: None,
+        }
+    }
+
+    /// A registration that adds a per-snapshot weightless vision probe (the model-first VLM gate).
+    fn reg_with_vision_probe(
+        descriptor: fn() -> TextLlmDescriptor,
+        can_load: fn(&LoadSpec) -> bool,
+        weightless_vision: fn(&LoadSpec) -> bool,
+    ) -> TextLlmRegistration {
+        TextLlmRegistration {
+            descriptor,
+            load: never_loads,
+            can_load,
+            weightless_vision: Some(weightless_vision),
         }
     }
 
@@ -449,5 +577,89 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    // --- Qwen3-VL model-first vision routing (sc-8077) ----------------------------------------
+    // Resolve the chosen provider id for a *real on-disk* snapshot (the weightless probes read its
+    // `config.json`).
+    fn picked_for<'a>(
+        regs: &'a [&'a TextLlmRegistration],
+        spec: &LoadSpec,
+        reqs: &ModelRequirements,
+    ) -> Result<String> {
+        select(regs.iter().copied(), spec, reqs).map(|r| (r.descriptor)().id)
+    }
+
+    #[test]
+    fn weightless_vision_probe_routes_qwen3vl_for_a_vision_required_load() {
+        // The story-D gap, closed: the generic `mlx-llama` provider's STATIC descriptor reports
+        // `supports_vision=false` (it also serves text-only models), so a model-first
+        // vision-required load used to be rejected at the pre-load capability gate for a genuine
+        // Qwen3-VL snapshot — only the id-based / default-requirements path worked. With the
+        // weightless per-snapshot vision probe, the gate now recognizes the `qwen3_vl` wrapper as
+        // vision-capable from `config.json` alone and resolves it.
+        let (dir, spec) = qwen3vl_snapshot("vision-required");
+        // Sanity: the static descriptor really is text-only — without the probe this would fail.
+        assert!(!generic_text_desc().capabilities.supports_vision);
+
+        let generic = reg_with_vision_probe(generic_text_desc, yes, qwen_vl_vision_probe);
+        let reqs = ModelRequirements::default().with_vision();
+        let id = picked_for(&[&generic], &spec, &reqs)
+            .expect("vision-required model-first load must resolve the qwen3_vl provider");
+        assert_eq!(id, "mlx-llama");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_a_probe_a_text_only_descriptor_still_rejects_a_vision_load() {
+        // Guard the gate's other side: a text-only provider with NO weightless vision probe must
+        // still be rejected for a vision-required load (the probe only ever *adds* capability — it
+        // is not a blanket bypass of the vision gate).
+        let (dir, spec) = qwen3vl_snapshot("no-probe");
+        let generic = reg(generic_text_desc, yes); // no vision probe
+        let reqs = ModelRequirements::default().with_vision();
+        let err = picked_for(&[&generic], &spec, &reqs).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "a text-only provider with no vision probe must not satisfy a vision-required load: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qwen3vl_snapshot_is_not_misrouted_to_the_joycaption_vision_path() {
+        // No misrouting (AC #2): a dedicated JoyCaption/LLaVA vision provider declines a Qwen3-VL
+        // snapshot via its `can_load` (LLaVA-signature only), so even though its STATIC descriptor
+        // advertises vision, it never claims the architecture. A vision-required Qwen3-VL load must
+        // resolve to the generic `mlx-llama` provider (whose weightless probe advertises vision for
+        // this snapshot), NOT the JoyCaption path — mirroring the qwen3.6→JoyCaption fix.
+        let (dir, spec) = qwen3vl_snapshot("no-misroute");
+        let joycaption = reg(joycaption_desc, no); // LLaVA-only can_load declines qwen3_vl
+        let generic = reg_with_vision_probe(generic_text_desc, yes, qwen_vl_vision_probe);
+
+        // Registered in either order, vision-required routing lands on mlx-llama, never joycaption.
+        let reqs = ModelRequirements::default().with_vision();
+        assert_eq!(
+            picked_for(&[&joycaption, &generic], &spec, &reqs).unwrap(),
+            "mlx-llama"
+        );
+        assert_eq!(
+            picked_for(&[&generic, &joycaption], &spec, &reqs).unwrap(),
+            "mlx-llama"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qwen3vl_default_load_also_resolves_the_generic_provider() {
+        // A plain (default-requirements) load of the same snapshot — the id-based path that already
+        // worked — still resolves to the generic provider and is unaffected by the new probe (a
+        // JoyCaption provider that declines the architecture never competes).
+        let (dir, spec) = qwen3vl_snapshot("default");
+        let joycaption = reg(joycaption_desc, no);
+        let generic = reg_with_vision_probe(generic_text_desc, yes, qwen_vl_vision_probe);
+        let id = picked_for(&[&joycaption, &generic], &spec, &ModelRequirements::default()).unwrap();
+        assert_eq!(id, "mlx-llama");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
