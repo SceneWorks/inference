@@ -24,7 +24,7 @@
 use core_llm::{
     load_for_model, prepare_snapshot, Channel, Content, Error, FinishReason, ImageRef, LoadSpec,
     Message, PrepareSpec, Quantize, Role, Sampling, StreamEvent, TextLlm, TextLlmRequest,
-    ThinkingMode, ToolSpec, VERSION,
+    ThinkingMode, ToolSpec, VideoRef, VERSION,
 };
 use std::path::PathBuf;
 
@@ -43,6 +43,9 @@ pub struct TextLlmProfile {
     /// A synthetic image for the multimodal check (`Some` exercises vision support or its honest
     /// rejection; `None` skips the multimodal check).
     pub image: Option<ImageRef>,
+    /// A synthetic video for the video check (`Some` exercises video support or its honest rejection;
+    /// `None` skips the video check).
+    pub video: Option<VideoRef>,
     /// Tools offered in the tool-calling check (exercises tool support or its honest rejection).
     /// Non-empty so a tools-capable provider renders + runs them and a non-tools provider rejects
     /// them as `Unsupported`.
@@ -64,6 +67,16 @@ impl TextLlmProfile {
                 repetition_context: 0,
             },
             image: Some(ImageRef::new(8, 8, vec![0u8; 8 * 8 * 3]).expect("8x8 RGB")),
+            video: Some(
+                VideoRef::new(
+                    vec![
+                        ImageRef::new(8, 8, vec![0u8; 8 * 8 * 3]).expect("8x8 RGB frame"),
+                        ImageRef::new(8, 8, vec![255u8; 8 * 8 * 3]).expect("8x8 RGB frame"),
+                    ],
+                    vec![0.0, 0.5],
+                )
+                .expect("2-frame synthetic video"),
+            ),
             tools: vec![ToolSpec::new(
                 "get_weather",
                 "Get the current weather for a city",
@@ -105,6 +118,21 @@ impl TextLlmProfile {
         }
     }
 
+    fn video_request(&self, video: &VideoRef) -> TextLlmRequest {
+        TextLlmRequest {
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content::Text(self.prompt.clone()), Content::Video(video.clone())],
+                thinking: None,
+                tool_calls: Vec::new(),
+            }],
+            sampling: Sampling::greedy(),
+            max_new_tokens: self.max_new_tokens,
+            seed: Some(0),
+            ..Default::default()
+        }
+    }
+
     fn tools_request(&self) -> TextLlmRequest {
         TextLlmRequest {
             messages: vec![Message::user(self.prompt.clone())],
@@ -126,12 +154,13 @@ pub fn textllm_conformance(make: impl Fn() -> Box<dyn TextLlm>, profile: &TextLl
     let p: &dyn TextLlm = provider.as_ref();
 
     let mut failures: Vec<String> = Vec::new();
-    let with_profile: [ProfileCheck; 7] = [
+    let with_profile: [ProfileCheck; 8] = [
         check_validate,
         check_streaming,
         check_mid_stream_cancel,
         check_seed_determinism,
         check_multimodal,
+        check_video,
         check_thinking,
         check_tools,
     ];
@@ -415,6 +444,37 @@ pub fn check_multimodal(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(),
             )),
             Ok(()) => Err(format!(
                 "check_multimodal[{id}]: accepted image input despite supports_vision=false"
+            )),
+        }
+    }
+}
+
+/// Video handling: a video-capable provider generates from a sampled video (frames + per-frame
+/// timestamps); a provider without video support rejects video input as `Unsupported` (never
+/// silently ignores it).
+pub fn check_video(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), String> {
+    let id = p.descriptor().id.clone();
+    let Some(video) = &profile.video else {
+        return Ok(());
+    };
+    let req = profile.video_request(video);
+
+    if p.descriptor().capabilities.supports_video {
+        let out = p
+            .generate(&req, &mut |_| {})
+            .map_err(|e| format!("check_video[{id}]: video generate() failed: {e}"))?;
+        if out.usage.generated_tokens == 0 {
+            return Err(format!("check_video[{id}]: video generation produced no tokens"));
+        }
+        Ok(())
+    } else {
+        match p.validate(&req) {
+            Err(Error::Unsupported(_)) => Ok(()),
+            Err(other) => Err(format!(
+                "check_video[{id}]: video input rejected, but not as Error::Unsupported: {other:?}"
+            )),
+            Ok(()) => Err(format!(
+                "check_video[{id}]: accepted video input despite supports_video=false"
             )),
         }
     }

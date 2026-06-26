@@ -61,25 +61,43 @@ inventory::collect!(TextLlmRegistration);
 /// The [`Default`] is "no special needs": any architecture-matching provider qualifies.
 #[derive(Clone, Debug, Default)]
 pub struct ModelRequirements {
-    /// The provider must accept image (vision) input.
+    /// The provider must accept image (vision) input. Video input implies this too (Qwen3-VL serves
+    /// image and video through the same vision-capable provider), so [`from_request`](Self::from_request)
+    /// sets it when the request carries either.
     pub vision: bool,
+    /// The provider must accept video input. Routed through the same per-snapshot vision probe as
+    /// [`vision`](Self::vision) (the vision tower handles both modalities), so this currently adds no
+    /// routing constraint beyond `vision`; it records the request's intent for future video-only
+    /// provider disambiguation.
+    pub video: bool,
     /// The provider must be able to enforce each of these output constraints.
     pub constraints: Vec<Constraint>,
 }
 
 impl ModelRequirements {
-    /// Derive the requirements implied by a concrete request: vision if any message carries an
-    /// image, plus the request's output constraint (if any). This is the bridge the worker uses —
-    /// `load_for_model_with(spec, &ModelRequirements::from_request(req))`.
+    /// Derive the requirements implied by a concrete request: vision if any message carries an image
+    /// **or video** (both route to the vision-capable provider), the `video` flag when any message
+    /// carries video, plus the request's output constraint (if any). This is the bridge the worker
+    /// uses — `load_for_model_with(spec, &ModelRequirements::from_request(req))`.
     pub fn from_request(req: &TextLlmRequest) -> Self {
+        let video = req.has_video();
         Self {
-            vision: req.has_image(),
+            vision: req.has_image() || video,
+            video,
             constraints: req.constraint.iter().copied().collect(),
         }
     }
 
     /// Require image (vision) input support.
     pub fn with_vision(mut self) -> Self {
+        self.vision = true;
+        self
+    }
+
+    /// Require video input support (implies [`with_vision`](Self::with_vision) — video routes through
+    /// the vision-capable provider).
+    pub fn with_video(mut self) -> Self {
+        self.video = true;
         self.vision = true;
         self
     }
@@ -320,6 +338,7 @@ mod tests {
             max_new_tokens: 0,
             supports_system_prompt: true,
             supports_vision: vision,
+            supports_video: false,
             supports_thinking: false,
             supports_tools: false,
             supported_constraints: constraints.to_vec(),

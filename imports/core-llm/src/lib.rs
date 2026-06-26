@@ -60,7 +60,7 @@ pub use cancel::CancelFlag;
 pub use capabilities::{TextLlmCapabilities, TextLlmDescriptor};
 pub use constraint::{Constraint, ConstraintDecodeTable, JsonConstraint, JsonState};
 pub use error::{Error, Result};
-pub use message::{Content, ImageRef, Message, Role};
+pub use message::{Content, ImageRef, Message, Role, VideoRef};
 pub use output::{Channel, FinishReason, StreamEvent, TextLlmOutput, Usage};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};

@@ -58,13 +58,63 @@ impl ImageRef {
     }
 }
 
+/// A sampled video: an ordered list of decoded RGB frames plus each frame's timestamp (seconds).
+/// Tensor-free, like [`ImageRef`] — the host samples/decodes the video into frames at its boundary
+/// and a provider lifts the frames into tensors and renders the per-frame timestamps.
+///
+/// **Text–Timestamp Alignment.** Qwen3-VL grounds temporal questions by interleaving each frame with
+/// its wall-clock timestamp in the prompt (`<{t:.1f} seconds>` before each frame's vision block). The
+/// per-frame [`timestamps`](Self::timestamps) carry exactly that data, so a provider can reproduce
+/// the reference timestamp tokens without re-deriving them from a frame index + fps. They are
+/// **already merged** by the model's `temporal_patch_size` (one timestamp per emitted vision frame,
+/// i.e. per merged temporal patch), matching `Qwen3VLProcessor.replace_video_token`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoRef {
+    /// The sampled frames, in temporal order. Each is a decoded RGB8 [`ImageRef`].
+    pub frames: Vec<ImageRef>,
+    /// Per-frame timestamp in seconds (one per [`frames`](Self::frames) entry), in temporal order.
+    /// Drives Text–Timestamp Alignment. `f32` (not `Eq`) so frame-rate math round-trips faithfully.
+    pub timestamps: Vec<f32>,
+}
+
+impl VideoRef {
+    /// Construct, validating that there is exactly one timestamp per frame and at least one frame.
+    pub fn new(frames: Vec<ImageRef>, timestamps: Vec<f32>) -> Result<Self, String> {
+        if frames.is_empty() {
+            return Err("VideoRef: needs at least one frame".to_string());
+        }
+        if frames.len() != timestamps.len() {
+            return Err(format!(
+                "VideoRef: {} frames but {} timestamps (need one timestamp per frame)",
+                frames.len(),
+                timestamps.len()
+            ));
+        }
+        Ok(Self { frames, timestamps })
+    }
+
+    /// The number of sampled frames.
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Whether the video has no frames (never true for a `VideoRef` built via [`Self::new`]).
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
 /// A single piece of message content.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Eq` (only `PartialEq`): [`Content::Video`] carries `f32` timestamps.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Content {
     /// Text content.
     Text(String),
     /// Image content (vision input).
     Image(ImageRef),
+    /// Video content (sampled frames + per-frame timestamps for Text–Timestamp Alignment).
+    Video(VideoRef),
 }
 
 impl Content {
@@ -76,6 +126,11 @@ impl Content {
     /// Whether this is image content.
     pub fn is_image(&self) -> bool {
         matches!(self, Content::Image(_))
+    }
+
+    /// Whether this is video content.
+    pub fn is_video(&self) -> bool {
+        matches!(self, Content::Video(_))
     }
 }
 
@@ -146,13 +201,13 @@ impl Message {
         Self::text(Role::Assistant, text)
     }
 
-    /// Concatenated text of this turn (image blocks omitted).
+    /// Concatenated text of this turn (image and video blocks omitted).
     pub fn text_content(&self) -> String {
         self.content
             .iter()
             .filter_map(|c| match c {
                 Content::Text(t) => Some(t.as_str()),
-                Content::Image(_) => None,
+                Content::Image(_) | Content::Video(_) => None,
             })
             .collect::<Vec<_>>()
             .join("")
@@ -161,6 +216,11 @@ impl Message {
     /// Whether the turn contains any image content.
     pub fn has_image(&self) -> bool {
         self.content.iter().any(Content::is_image)
+    }
+
+    /// Whether the turn contains any video content.
+    pub fn has_video(&self) -> bool {
+        self.content.iter().any(Content::is_video)
     }
 }
 
@@ -172,6 +232,37 @@ mod tests {
     fn image_validates_pixel_count() {
         assert!(ImageRef::new(2, 2, vec![0u8; 12]).is_ok());
         assert!(ImageRef::new(2, 2, vec![0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn video_validates_frame_timestamp_pairing() {
+        let frame = ImageRef::new(2, 2, vec![0u8; 12]).unwrap();
+        // One frame, one timestamp: ok.
+        assert!(VideoRef::new(vec![frame.clone()], vec![0.0]).is_ok());
+        // Two frames, two timestamps: ok.
+        let v = VideoRef::new(vec![frame.clone(), frame.clone()], vec![0.0, 0.5]).unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(!v.is_empty());
+        // Mismatched counts: err.
+        assert!(VideoRef::new(vec![frame.clone()], vec![0.0, 0.5]).is_err());
+        // No frames: err.
+        assert!(VideoRef::new(vec![], vec![]).is_err());
+    }
+
+    #[test]
+    fn message_video_helpers() {
+        let frame = ImageRef::new(1, 1, vec![1, 2, 3]).unwrap();
+        let video = VideoRef::new(vec![frame], vec![0.0]).unwrap();
+        let m = Message {
+            role: Role::User,
+            content: vec![Content::Video(video), Content::text("describe")],
+            thinking: None,
+            tool_calls: Vec::new(),
+        };
+        assert!(m.has_video());
+        assert!(!m.has_image());
+        // Video blocks are omitted from the flattened text, like images.
+        assert_eq!(m.text_content(), "describe");
     }
 
     #[test]
