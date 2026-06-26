@@ -647,6 +647,108 @@ mod tests {
         );
     }
 
+    /// Locate the cached `Qwen/Qwen3-VL-8B-Instruct` snapshot (rev 0c351dd0) for the real
+    /// chat-template oracle. `MLX_LLM_QWEN3VL_MODEL` / `QWEN3VL_SNAPSHOT` override; otherwise the
+    /// default HF cache path. `None` ⇒ the gated test self-skips cleanly (the snapshot is present in
+    /// CI for sc-8077).
+    #[cfg(test)]
+    fn qwen3vl_snapshot_dir() -> Option<std::path::PathBuf> {
+        for var in ["MLX_LLM_QWEN3VL_MODEL", "QWEN3VL_SNAPSHOT"] {
+            if let Ok(path) = std::env::var(var) {
+                let path = std::path::PathBuf::from(path);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+        let home = std::env::var("HOME").ok()?;
+        let path = std::path::PathBuf::from(home).join(
+            ".cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        );
+        path.exists().then_some(path)
+    }
+
+    #[test]
+    fn qwen3vl_real_template_chatml_tools_and_vision() {
+        // Faithfulness against the *actual* Qwen3-VL-8B-Instruct chat template (sc-8077), mirroring
+        // the Qwen3.6 host-policy audit (sc-7631) for the qwen3_vl VLM. Self-skips when the snapshot
+        // is absent. Asserts: ChatML structure, the `add_generation_prompt` tail, the tools section,
+        // and the vision finding (flattened content drops image blocks → no native vision token; the
+        // provider's substituted placeholder text passes through verbatim).
+        use crate::message::{Content, ImageRef, Role};
+        let Some(dir) = qwen3vl_snapshot_dir() else {
+            eprintln!("skipping qwen3vl_real_template_chatml_tools_and_vision: Qwen3-VL-8B snapshot \
+                       not present (set MLX_LLM_QWEN3VL_MODEL or QWEN3VL_SNAPSHOT)");
+            return;
+        };
+        let t = JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json"))
+            .expect("load real Qwen3-VL chat template");
+
+        // The Qwen3-VL-8B-Instruct template is NOT a thinking template (no `enable_thinking` /
+        // `reasoning_content` gating) — its generation prompt is a plain `<|im_start|>assistant\n`,
+        // never a primed `<think>`. This is exactly what the provider's capability detection keys on.
+        assert!(
+            !t.source().contains("enable_thinking"),
+            "Qwen3-VL-8B-Instruct template must not gate enable_thinking (supports_thinking=false)"
+        );
+        // It DOES render tool calls (the `<tools>` section / `tool_call` blocks), which is what the
+        // provider's `supports_tools` detection keys on.
+        assert!(
+            t.source().contains("tool_call") && t.source().contains("<tools>"),
+            "Qwen3-VL template must render tools (supports_tools=true)"
+        );
+
+        // ChatML structure + the generation-prompt tail.
+        let chatml = t.render(&[Message::user("Hello")], true).unwrap();
+        assert!(chatml.contains("<|im_start|>user\nHello<|im_end|>\n"), "ChatML user block: {chatml}");
+        assert!(chatml.ends_with("<|im_start|>assistant\n"), "generation prompt tail: {chatml}");
+
+        // Tools section: offering a tool renders the `<tools>` block with the OpenAI function json.
+        let tools = [weather_tool()];
+        let offered = t
+            .render_with(&[Message::user("weather in Paris?")], &RenderOptions::generation().with_tools(&tools))
+            .unwrap();
+        assert!(offered.contains("<tools>"), "tools section: {offered}");
+        assert!(
+            offered.contains("{\"type\":\"function\",\"function\":{\"name\":\"get_weather\""),
+            "tool json: {offered}"
+        );
+
+        // Vision handling (the host-policy finding): the contract flattens content to text
+        // (`Message::text_content` drops image blocks), so the template's native vision branch does
+        // NOT emit `<|image_pad|>` for a structured image block — only the accompanying text renders.
+        let with_image = Message {
+            role: Role::User,
+            content: vec![
+                Content::Image(ImageRef::new(2, 2, vec![0u8; 12]).unwrap()),
+                Content::text("describe this"),
+            ],
+            thinking: None,
+            tool_calls: Vec::new(),
+        };
+        let img_rendered = t.render(std::slice::from_ref(&with_image), false).unwrap();
+        assert!(img_rendered.contains("describe this"), "text kept: {img_rendered}");
+        assert!(
+            !img_rendered.contains("<|image_pad|>"),
+            "flattened content must NOT insert vision tokens — the provider substitutes the \
+             placeholder text instead: {img_rendered}"
+        );
+
+        // The actual vision path: the provider substitutes the Qwen-VL placeholder *text* before
+        // rendering, and the real template passes it through verbatim via its `content is string`
+        // branch (one `<|image_pad|>` per image, expanded to the patch count after tokenizing).
+        let substituted = t
+            .render(
+                &[Message::user("<|vision_start|><|image_pad|><|vision_end|>describe this")],
+                false,
+            )
+            .unwrap();
+        assert!(
+            substituted.contains("<|vision_start|><|image_pad|><|vision_end|>describe this"),
+            "provider-substituted vision placeholder renders verbatim: {substituted}"
+        );
+    }
+
     #[test]
     fn jinja_from_tokenizer_config_extracts_template_and_tokens() {
         let cfg = serde_json::json!({
