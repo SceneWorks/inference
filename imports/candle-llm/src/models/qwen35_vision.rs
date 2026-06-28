@@ -42,8 +42,9 @@ const ROPE_THETA: f32 = 10000.0;
 /// attention primitive's convention — avoids `-inf` through the softmax).
 const MASK_NEG: f32 = -1e30;
 
-/// Geometry of the Qwen3.6 vision tower (`vision_config`).
-#[derive(Clone, Copy, Debug)]
+/// Geometry of the Qwen-VL vision tower (`vision_config`). Shared by Qwen3.6 (`qwen3_5`) and
+/// Qwen3-VL (`qwen3_vl`); the latter additionally taps intermediate encoder layers for DeepStack.
+#[derive(Clone, Debug)]
 pub struct Qwen35VisionConfig {
     pub depth: usize,
     pub hidden_size: i32,
@@ -55,6 +56,9 @@ pub struct Qwen35VisionConfig {
     pub spatial_merge_size: i32,
     pub out_hidden_size: i32,
     pub num_position_embeddings: i32,
+    /// Encoder layer indices whose hidden states are tapped, merged, and fed into the first decoder
+    /// layers (Qwen3-VL DeepStack — e.g. `[8, 16, 24]`); empty ⇒ no DeepStack (plain Qwen3.6 tower).
+    pub deepstack_visual_indexes: Vec<usize>,
 }
 
 impl Qwen35VisionConfig {
@@ -67,6 +71,11 @@ impl Qwen35VisionConfig {
         let req = |k: &str| -> Result<i32> {
             int(k).ok_or_else(|| Error::Config(format!("qwen3_5 vision_config missing `{k}`")))
         };
+        let deepstack_visual_indexes = c
+            .get("deepstack_visual_indexes")
+            .and_then(|x| x.as_array())
+            .map(|xs| xs.iter().filter_map(|x| x.as_u64().map(|x| x as usize)).collect())
+            .unwrap_or_default();
         Ok(Self {
             depth: req("depth")? as usize,
             hidden_size: req("hidden_size")?,
@@ -78,6 +87,7 @@ impl Qwen35VisionConfig {
             spatial_merge_size: int("spatial_merge_size").unwrap_or(2),
             out_hidden_size: req("out_hidden_size")?,
             num_position_embeddings: req("num_position_embeddings")?,
+            deepstack_visual_indexes,
         })
     }
 
@@ -189,7 +199,9 @@ impl VisionBlock {
     }
 }
 
-/// The `spatial_merge_size²` patch merger → `out_hidden_size` (the pooler output).
+/// The `spatial_merge_size²` patch merger → `out_hidden_size`. The main merger (pooler output) norms
+/// over `hidden` then reshapes; a DeepStack merger norms **after** the reshape, over `merge_dim`
+/// (`use_postshuffle_norm` — its `norm` weights are sized `merge_dim` accordingly).
 struct PatchMerger {
     norm_w: Tensor,
     norm_b: Tensor,
@@ -198,26 +210,43 @@ struct PatchMerger {
     fc2_w: Tensor,
     fc2_b: Option<Tensor>,
     merge_dim: usize,
+    use_postshuffle_norm: bool,
 }
 
 impl PatchMerger {
-    /// `[num_patches, hidden]` → `[num_patches / merge², out_hidden]`. The per-patch LayerNorm runs
-    /// over `hidden` first, then adjacent `merge²` patches are concatenated (`view`) and projected.
+    /// `[num_patches, hidden]` → `[num_patches / merge², out_hidden]`. With `use_postshuffle_norm`,
+    /// adjacent `merge²` patches are concatenated first and the LayerNorm runs over `merge_dim`;
+    /// otherwise the per-patch LayerNorm over `hidden` runs first, then the reshape.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let m = layer_norm(x, &self.norm_w, &self.norm_b, LN_EPS)?;
-        let m = m.reshape(((), self.merge_dim))?;
+        let m = if self.use_postshuffle_norm {
+            let grouped = x.reshape(((), self.merge_dim))?;
+            layer_norm(&grouped, &self.norm_w, &self.norm_b, LN_EPS)?
+        } else {
+            layer_norm(x, &self.norm_w, &self.norm_b, LN_EPS)?.reshape(((), self.merge_dim))?
+        };
         // `nn.GELU()` default = exact erf — candle's `gelu_erf`.
         let m = gelu_erf(&linear(&m, &self.fc1_w, self.fc1_b.as_ref())?)?;
         linear(&m, &self.fc2_w, self.fc2_b.as_ref())
     }
 }
 
-/// A loaded Qwen3.6 vision tower.
+/// The output of [`Qwen35VisionModel::forward_with_deepstack`]: the final per-patch hidden states,
+/// the merged `pooler_output` the decoder splices in, and the per-tap DeepStack feature sets
+/// (Qwen3-VL — empty for a plain Qwen3.6 tower).
+pub struct Qwen35VisionOutput {
+    pub last_hidden_state: Tensor,
+    pub pooler_output: Tensor,
+    pub deepstack_features: Vec<Tensor>,
+}
+
+/// A loaded Qwen-VL vision tower (Qwen3.6 / Qwen3-VL — identical architecture; Qwen3-VL adds the
+/// DeepStack tap mergers).
 pub struct Qwen35VisionModel {
     patch_embed: PatchEmbed,
     pos_embed: Tensor,
     blocks: Vec<VisionBlock>,
     merger: PatchMerger,
+    deepstack_mergers: Vec<PatchMerger>,
     cfg: Qwen35VisionConfig,
 }
 
@@ -262,21 +291,33 @@ impl Qwen35VisionModel {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let merger = PatchMerger {
-            norm_w: req(p("merger.norm.weight"))?,
-            norm_b: req(p("merger.norm.bias"))?,
-            fc1_w: req(p("merger.linear_fc1.weight"))?,
-            fc1_b: opt(p("merger.linear_fc1.bias"))?,
-            fc2_w: req(p("merger.linear_fc2.weight"))?,
-            fc2_b: opt(p("merger.linear_fc2.bias"))?,
-            merge_dim: cfg.merge_dim() as usize,
+        let merge_dim = cfg.merge_dim() as usize;
+        let load_merger = |stem: String, use_postshuffle_norm: bool| -> Result<PatchMerger> {
+            let m = |leaf: &str| format!("{stem}.{leaf}");
+            Ok(PatchMerger {
+                norm_w: req(m("norm.weight"))?,
+                norm_b: req(m("norm.bias"))?,
+                fc1_w: req(m("linear_fc1.weight"))?,
+                fc1_b: opt(m("linear_fc1.bias"))?,
+                fc2_w: req(m("linear_fc2.weight"))?,
+                fc2_b: opt(m("linear_fc2.bias"))?,
+                merge_dim,
+                use_postshuffle_norm,
+            })
         };
+
+        let merger = load_merger(p("merger"), false)?;
+        // The DeepStack tap mergers (`deepstack_merger_list.{i}`) norm post-shuffle (over merge_dim).
+        let deepstack_mergers = (0..cfg.deepstack_visual_indexes.len())
+            .map(|i| load_merger(p(&format!("deepstack_merger_list.{i}")), true))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             patch_embed,
             pos_embed,
             blocks,
             merger,
+            deepstack_mergers,
             cfg,
         })
     }
@@ -291,6 +332,18 @@ impl Qwen35VisionModel {
     /// one embedding per merged `merge×merge` block, in the same merge-block order the preprocessor
     /// emits patches.
     pub fn forward(&self, pixel_values: &Tensor, grid_thw: &[[i32; 3]]) -> Result<Tensor> {
+        Ok(self.forward_with_deepstack(pixel_values, grid_thw)?.pooler_output)
+    }
+
+    /// Encode like [`Self::forward`] but also return the per-tap **DeepStack** feature sets
+    /// (Qwen3-VL): at each `deepstack_visual_indexes` encoder layer the running hidden states are
+    /// run through the corresponding DeepStack merger, yielding one `[total_patches / merge²,
+    /// out_hidden]` feature set per tap (in tap order). Empty for a Qwen3.6 tower (no taps).
+    pub fn forward_with_deepstack(
+        &self,
+        pixel_values: &Tensor,
+        grid_thw: &[[i32; 3]],
+    ) -> Result<Qwen35VisionOutput> {
         let cfg = &self.cfg;
         let merge = cfg.spatial_merge_size;
         let head_dim = cfg.head_dim() as usize;
@@ -314,10 +367,23 @@ impl Qwen35VisionModel {
             None => AttnMask::None,
         };
 
-        for blk in &self.blocks {
+        let mut deepstack_features = Vec::with_capacity(self.deepstack_mergers.len());
+        for (layer_num, blk) in self.blocks.iter().enumerate() {
             hs = blk.forward(&hs, &cos, &sin, cfg.num_heads as usize, head_dim, mask)?;
+            if let Some(tap) = cfg
+                .deepstack_visual_indexes
+                .iter()
+                .position(|&idx| idx == layer_num)
+            {
+                deepstack_features.push(self.deepstack_mergers[tap].forward(&hs)?);
+            }
         }
-        self.merger.forward(&hs)
+        let pooler_output = self.merger.forward(&hs)?;
+        Ok(Qwen35VisionOutput {
+            last_hidden_state: hs,
+            pooler_output,
+            deepstack_features,
+        })
     }
 
     /// Gather + bilinearly weight the learned position table for the image grid → `[total_patches,
@@ -574,6 +640,7 @@ mod tests {
             spatial_merge_size: 2,
             out_hidden_size: 48,
             num_position_embeddings: 36,
+            deepstack_visual_indexes: Vec::new(),
         }
     }
 
@@ -731,7 +798,7 @@ mod tests {
         put("model.visual.merger.linear_fc2.bias", "mg_fc2_b", &[out_h]);
 
         let w = Weights::from_map(m, dev.clone());
-        let model = Qwen35VisionModel::from_weights(&w, "model.visual", cfg).unwrap();
+        let model = Qwen35VisionModel::from_weights(&w, "model.visual", cfg.clone()).unwrap();
 
         let pixel = Tensor::from_vec(arr(&j, "pixel"), (n, cfg.patch_in() as usize), &dev).unwrap();
         let out = model.forward(&pixel, &grid).unwrap();
@@ -750,5 +817,55 @@ mod tests {
             rel < 3e-3,
             "vision encoder vs reference: rel err {rel} (max|Δ| {max_abs}, max|exp| {max_mag})"
         );
+    }
+
+    fn qwen3vl_oracle() -> serde_json::Value {
+        serde_json::from_str(include_str!("testdata/qwen3vl_vision_oracle.json")).unwrap()
+    }
+
+    /// The Qwen3-VL vision config (`vision_config`) parses the DeepStack tap indexes, and the
+    /// deterministic host helpers (`cu_seqlens`, 2-D `position_ids`, bilinear indices/weights)
+    /// reproduce the real Qwen3-VL HF reference exactly for its grid — the weightless half of the
+    /// mlx-llm sc-8073 oracle (the full real-weight pooled + DeepStack parity runs through the
+    /// provider e2e on CUDA). The Qwen3-VL ViT IS the Qwen3.6 tower plus DeepStack taps.
+    #[test]
+    fn qwen3vl_config_and_host_helpers_match_reference() {
+        let j = qwen3vl_oracle();
+        let cfg = Qwen35VisionConfig::from_json(&serde_json::json!({
+            "vision_config": {
+                "depth": 27, "hidden_size": 1152, "num_heads": 16, "intermediate_size": 4304,
+                "in_channels": 3, "patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2,
+                "out_hidden_size": 4096, "num_position_embeddings": 2304,
+                "deepstack_visual_indexes": [8, 16, 24]
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.head_dim(), 72);
+        assert_eq!(cfg.grid_per_side(), 48);
+        assert_eq!(cfg.patch_in(), 1536);
+        assert_eq!(cfg.merge_dim(), 4608);
+        assert_eq!(cfg.deepstack_visual_indexes, vec![8, 16, 24]);
+
+        let grid: Vec<[i32; 3]> = {
+            let g = arr_i32(&j, "grid_thw");
+            vec![[g[0], g[1], g[2]]]
+        };
+
+        let cu = vision_cu_seqlens(&grid);
+        assert_eq!(cu, arr_i32(&j, "expect_cu"));
+
+        let pos = vision_position_ids(&grid, cfg.spatial_merge_size);
+        let pos_flat: Vec<i32> = pos.iter().flat_map(|&(r, c)| [r, c]).collect();
+        assert_eq!(pos_flat, arr_i32(&j, "expect_pos_ids"));
+
+        let (idx, wts) = vision_bilinear(&grid, cfg.grid_per_side(), cfg.spatial_merge_size);
+        assert_eq!(idx, arr_i32(&j, "expect_bi"));
+        let exp_bw = arr(&j, "expect_bw");
+        let md = wts
+            .iter()
+            .zip(&exp_bw)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(md < 1e-6, "qwen3-vl bilinear weights vs oracle: max abs diff {md}");
     }
 }
