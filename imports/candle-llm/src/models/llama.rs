@@ -19,6 +19,7 @@ use candle_nn::{Linear, Module};
 use crate::config::{Architecture, ModelConfig};
 use crate::device::compute_dtype;
 use crate::error::Result;
+use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositions};
 use crate::primitives::attention::{sdpa, AttnMask};
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::{embed, gelu, rms_norm, silu, soft_cap};
@@ -78,7 +79,17 @@ impl CausalLm {
         dtype: DType,
     ) -> Result<Self> {
         let device = w.device().clone();
-        let p = |suffix: &str| join(prefix, suffix);
+        // The Qwen3-VL VLM wrapper nests the decoder under `model.language_model.*` (embeddings,
+        // norm, `layers.{i}.*`) with the untied `lm_head.weight` at the checkpoint root; a plain
+        // `*ForCausalLM` keeps the historical `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight`
+        // layout. `decoder_root` carries the right stem so the per-key suffixes below are uniform.
+        let vlm_nested = cfg.architecture.is_qwen3_vl();
+        let decoder_root = if vlm_nested {
+            "model.language_model".to_string()
+        } else {
+            join(prefix, "model")
+        };
+        let p = |suffix: &str| join(&decoder_root, suffix);
         let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
         let proj = |key: String| -> Result<Projection> { Projection::load(req(key)?, quant) };
         // Like `proj`, but also loads a sibling `.bias` when present (Qwen2 attention carries q/k/v
@@ -105,12 +116,17 @@ impl CausalLm {
             }
         };
 
-        let embed_tokens = req(p("model.embed_tokens.weight"))?;
-        let norm = norm_w(p("model.norm.weight"))?;
+        let embed_tokens = req(p("embed_tokens.weight"))?;
+        let norm = norm_w(p("norm.weight"))?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::new(embed_tokens.clone(), None)
         } else {
-            Linear::new(req(p("lm_head.weight"))?, None)
+            let head_key = if vlm_nested {
+                "lm_head.weight".to_string()
+            } else {
+                join(prefix, "lm_head.weight")
+            };
+            Linear::new(req(head_key)?, None)
         };
 
         let qk_norm = cfg.has_qk_norm();
@@ -128,7 +144,7 @@ impl CausalLm {
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            let lp = |suffix: &str| join(prefix, &format!("model.layers.{i}.{suffix}"));
+            let lp = |suffix: &str| join(&decoder_root, &format!("layers.{i}.{suffix}"));
 
             // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention. MLA's
             // low-rank q/kv projections are wholly distinct from GQA's q/k/v, so it is its own path.
@@ -416,6 +432,117 @@ impl CausalLm {
         self.forward_to_last_logits(input_embeds, cache, &cos, &sin, AttnMask::Causal)
     }
 
+    /// Embed token ids `[1, S]` → `[1, S, hidden]` in the compute dtype — the Qwen3-VL multimodal
+    /// splice point (image/video-token rows are overwritten with the vision tower's merged features).
+    pub fn embed_input_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
+        Ok(self.embed(input_ids)?.to_dtype(self.dtype)?)
+    }
+
+    /// Replace every row of `embeds` `[1, S, hidden]` whose id is any of `placeholder_tokens` with the
+    /// next `vision_features` row, in sequence order — the mixed image+video splice (delegates to the
+    /// shared [`crate::models::deepstack::splice_vision_features`]).
+    pub fn splice_vision_features(
+        &self,
+        embeds: &Tensor,
+        input_ids: &[i32],
+        vision_features: &Tensor,
+        placeholder_tokens: &[i32],
+    ) -> Result<Tensor> {
+        deepstack::splice_vision_features(embeds, input_ids, vision_features, placeholder_tokens)
+    }
+
+    /// Interleaved-M-RoPE 3-D position rows + `mrope_delta` for an image-only prompt (the
+    /// `get_rope_index` port, B=1); see [`Self::mrope_positions_mm`] for image+video.
+    pub fn mrope_positions(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<MropePositions> {
+        deepstack::mrope_positions_mm(
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            &[],
+            image_token_id,
+            spatial_merge_size,
+        )
+    }
+
+    /// The full image **and** video interleaved-M-RoPE entry (see the shared
+    /// [`crate::models::deepstack::mrope_positions_mm`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mrope_positions_mm(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        video_grid_thw: &[[i32; 3]],
+        video_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<MropePositions> {
+        deepstack::mrope_positions_mm(
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            video_grid_thw,
+            video_token_id,
+            spatial_merge_size,
+        )
+    }
+
+    /// Prefill precomputed `embeds` `[1, S, hidden]` (text embeds with vision features spliced in)
+    /// using **interleaved M-RoPE** from the explicit 3-D `positions` (temporal/height/width rows,
+    /// each length `S`) **and DeepStack feature fusion**: after decoder layer `i` (for
+    /// `i < deepstack.len()`) the `i`-th tapped/merged ViT feature set is added to the visual-token
+    /// rows (`visual_pos_mask`). Returns last-position logits `[1, vocab]`. The Qwen3-VL prefill seam
+    /// (`Qwen3VLTextModel.forward` + `_deepstack_process`); with all three position rows equal and an
+    /// empty `deepstack` it is bit-identical to a plain 1-D-RoPE prefill.
+    pub fn decode_logits_from_embeds_mrope_deepstack(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut dyn KvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+    ) -> Result<Tensor> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            self.dtype,
+            &self.device,
+        )?;
+        let h0 = embeds.to_dtype(self.dtype)?;
+        let (b, s, _) = h0.dims3()?;
+        // The hidden state + RoPE tables follow each layer onto its device (a no-op clone for a
+        // single-device model); DeepStack features are moved onto the running device by the fusion.
+        let mut cur = h0.device().clone();
+        let mut cos_d = cos.clone();
+        let mut sin_d = sin.clone();
+        let h = deepstack_fused_decoder_layers(
+            &h0,
+            visual_pos_mask,
+            deepstack,
+            self.layers.len(),
+            |i, h| {
+                let dev = &self.layer_devices[i];
+                let h = if cur.same_device(dev) {
+                    h.clone()
+                } else {
+                    cos_d = cos.to_device(dev)?;
+                    sin_d = sin.to_device(dev)?;
+                    cur = dev.clone();
+                    h.to_device(dev)?
+                };
+                self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, cache, i)
+            },
+        )?;
+        let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
+        let logits = self.project_logits(&last_h)?;
+        Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
+    }
+
     /// Batched forward over a **left-padded** `[batch, seq]` step with **per-sequence** RoPE positions
     /// and an explicit additive attention mask — the decode primitive the dynamic-batch scheduler
     /// (story 7255) runs each step.
@@ -636,6 +763,60 @@ impl crate::decode::Decode for CausalLm {
 
     fn step(&self, input_ids: &Tensor, cache: &mut dyn KvCache, offset: i32) -> Result<Tensor> {
         self.decode_logits(input_ids, cache, offset)
+    }
+}
+
+impl crate::models::VlmDecode for CausalLm {
+    fn embed_input_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
+        CausalLm::embed_input_ids(self, input_ids)
+    }
+
+    fn splice_vision_features(
+        &self,
+        embeds: &Tensor,
+        input_ids: &[i32],
+        vision_features: &Tensor,
+        placeholder_tokens: &[i32],
+    ) -> Result<Tensor> {
+        CausalLm::splice_vision_features(self, embeds, input_ids, vision_features, placeholder_tokens)
+    }
+
+    fn mrope_positions_mm(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        video_grid_thw: &[[i32; 3]],
+        video_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<MropePositions> {
+        CausalLm::mrope_positions_mm(
+            self,
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            video_grid_thw,
+            video_token_id,
+            spatial_merge_size,
+        )
+    }
+
+    fn prefill_with_deepstack(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut dyn KvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+    ) -> Result<Tensor> {
+        // The generic decoder's cache is already the trait-object form — no downcast needed.
+        self.decode_logits_from_embeds_mrope_deepstack(
+            embeds,
+            positions,
+            cache,
+            visual_pos_mask,
+            deepstack,
+        )
     }
 }
 
