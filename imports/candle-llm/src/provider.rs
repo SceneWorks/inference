@@ -172,6 +172,9 @@ fn collect_images(messages: &[Message]) -> Vec<&ImageRef> {
             m.content.iter().filter_map(|c| match c {
                 Content::Image(img) => Some(img),
                 Content::Text(_) => None,
+                // candle-llama is text-only (`supports_video=false`); a video request is rejected by
+                // validate_request before it reaches here, so this arm is just for exhaustiveness.
+                Content::Video(_) => None,
             })
         })
         .collect()
@@ -192,6 +195,10 @@ fn substitute_image_placeholders(messages: &[Message]) -> Vec<Message> {
                 .map(|c| match c {
                     Content::Image(_) => Content::text(PLACEHOLDER),
                     Content::Text(t) => Content::Text(t.clone()),
+                    // Text-only candle-llama: video is rejected upstream (`supports_video=false`), so
+                    // it never reaches here; drop to empty text to stay exhaustive without emitting a
+                    // vision placeholder for content this backend cannot serve.
+                    Content::Video(_) => Content::text(""),
                 })
                 .collect(),
             thinking: m.thinking.clone(),
@@ -891,6 +898,8 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             supports_system_prompt: true,
             // Text-only today; the VLM path flips this on for a vision provider.
             supports_vision: false,
+            // Text-only candle-llama accepts no video content.
+            supports_video: false,
             // No controllable reasoning mode yet (a separate story); the contract requires an
             // explicit enable-thinking request to be rejected, which validate_request enforces.
             supports_thinking: false,
@@ -1003,6 +1012,9 @@ inventory::submit! {
         descriptor: provider_descriptor,
         load: load_registered,
         can_load,
+        // No per-snapshot vision distinction for the text-only candle-llama provider; the gate falls
+        // back to the static descriptor (byte-identical to prior behavior).
+        weightless_vision: None,
     }
 }
 

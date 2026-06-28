@@ -612,6 +612,8 @@ pub fn descriptor() -> TextLlmDescriptor {
             max_new_tokens: 0,
             supports_system_prompt: true,
             supports_vision: true,
+            // Single-image caption path only; no video support.
+            supports_video: false,
             supports_thinking: false,
             // Vision/caption path only; no tool calling (mirrors the mlx JoyCaption provider).
             supports_tools: false,
@@ -664,6 +666,8 @@ inventory::submit! {
         descriptor,
         load: load_registered,
         can_load,
+        // The static descriptor already declares `supports_vision=true`; no per-snapshot probe needed.
+        weightless_vision: None,
     }
 }
 
