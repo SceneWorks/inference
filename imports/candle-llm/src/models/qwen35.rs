@@ -26,6 +26,7 @@ use serde_json::Value;
 
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
+use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{repeat_kv, sdpa, AttnMask};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
@@ -794,6 +795,35 @@ impl Qwen35Model {
         self.project_last(&h)
     }
 
+    /// Like [`Self::decode_logits_from_embeds`] but with **DeepStack** feature fusion: after layer
+    /// `i` (for `i < deepstack.len()`) the `i`-th tapped/merged ViT feature set is added to the
+    /// visual-token rows (`visual_pos_mask`). `deepstack` is empty for the Qwen3.6 vision path (its
+    /// ViT has no DeepStack taps), where this reduces to [`Self::decode_logits_from_embeds`].
+    pub fn decode_logits_from_embeds_deepstack(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+    ) -> Result<Tensor> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            self.dtype,
+            &self.device,
+        )?;
+        let h0 = embeds.to_dtype(self.dtype)?;
+        let h = deepstack_fused_decoder_layers(
+            &h0,
+            visual_pos_mask,
+            deepstack,
+            self.layers.len(),
+            |i, h| self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i]),
+        )?;
+        self.project_last(&h)
+    }
+
     /// Build from a loaded checkpoint (dense). See [`Qwen35Model::from_weights_dtype`].
     pub fn from_weights(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
         Self::from_weights_with(w, prefix, cfg, None)
@@ -1029,6 +1059,57 @@ impl crate::decode::Decode for Qwen35Model {
             .downcast_mut::<Qwen35Cache>()
             .ok_or_else(|| Error::Msg("Qwen35Model::step: cache is not a Qwen35Cache".into()))?;
         self.decode_logits(input_ids, cache, offset)
+    }
+}
+
+impl crate::models::VlmDecode for Qwen35Model {
+    fn embed_input_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
+        Qwen35Model::embed_input_ids(self, input_ids)
+    }
+
+    fn splice_vision_features(
+        &self,
+        embeds: &Tensor,
+        input_ids: &[i32],
+        vision_features: &Tensor,
+        placeholder_tokens: &[i32],
+    ) -> Result<Tensor> {
+        deepstack::splice_vision_features(embeds, input_ids, vision_features, placeholder_tokens)
+    }
+
+    fn mrope_positions_mm(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        video_grid_thw: &[[i32; 3]],
+        video_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<crate::models::MropePositions> {
+        deepstack::mrope_positions_mm(
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            video_grid_thw,
+            video_token_id,
+            spatial_merge_size,
+        )
+    }
+
+    fn prefill_with_deepstack(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut dyn KvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+    ) -> Result<Tensor> {
+        // The hybrid decoder drives its own `Qwen35Cache` (the same downcast `Decode::step` does).
+        let cache = cache
+            .as_any_mut()
+            .downcast_mut::<Qwen35Cache>()
+            .ok_or_else(|| Error::Msg("qwen3_5 prefill: expected a Qwen35Cache".into()))?;
+        self.decode_logits_from_embeds_deepstack(embeds, positions, cache, visual_pos_mask, deepstack)
     }
 }
 

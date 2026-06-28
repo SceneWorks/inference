@@ -28,7 +28,7 @@ use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
 use crate::image::Qwen35ImageProcessor;
 use crate::models::{
-    CausalLm, Qwen35Cache, Qwen35Config, Qwen35Model, Qwen35VisionConfig, Qwen35VisionModel,
+    CausalLm, Qwen35Config, Qwen35Model, Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::nn::input_ids;
 use crate::primitives::projection::QuantSpec;
@@ -82,19 +82,22 @@ impl Decoder {
         }
     }
 
-    /// The concrete hybrid decoder, when this is the Qwen3.6 path (the multimodal embeds / M-RoPE
-    /// hooks live on [`Qwen35Model`], not the generic [`Decode`] trait).
-    fn as_qwen35(&self) -> Option<&Qwen35Model> {
+    /// The decoder as the backend-neutral multimodal seam. Both backbones implement [`VlmDecode`]
+    /// (the Qwen3.6 hybrid and the generic Qwen3-VL causal decoder), so the provider drives the
+    /// image prefill + decode through one trait object rather than forking on the concrete type.
+    fn as_vlm(&self) -> &dyn VlmDecode {
         match self {
-            Decoder::Qwen35(m) => Some(m),
-            Decoder::Causal(_) => None,
+            Decoder::Causal(m) => m,
+            Decoder::Qwen35(m) => m,
         }
     }
 }
 
-/// The Qwen3.6 vision side of the provider: the ViT tower, the image preprocessor, the multimodal
+/// The Qwen-VL vision side of the provider: the ViT tower, the image preprocessor, the multimodal
 /// token id + merge size needed to expand placeholders and assign M-RoPE positions, and the device
-/// the encoder runs on. Present only when the loaded `qwen3_5` checkpoint carries `model.visual.*`.
+/// the encoder runs on. Present when the loaded `qwen3_5` (Qwen3.6) or `qwen3_vl` (Qwen3-VL)
+/// checkpoint carries `model.visual.*`. The two share the identical Qwen3-VL ViT tower
+/// ([`Qwen35VisionModel`]); only the decoder prefill differs (hybrid vs generic-causal).
 struct Qwen35Vision {
     tower: Qwen35VisionModel,
     processor: Qwen35ImageProcessor,
@@ -105,9 +108,11 @@ struct Qwen35Vision {
 
 impl Qwen35Vision {
     /// Encode one image to its merged patch rows `[n_tokens, hidden]` (the merger output is already
-    /// the language hidden size — no separate projector) plus the image's `grid_thw` (`[1, h, w]` in
-    /// patch units). `n_tokens = (grid_h/merge)·(grid_w/merge)` is the placeholder expansion count.
-    fn encode(&self, img: &ImageRef) -> CoreResult<(Tensor, [i32; 3])> {
+    /// the language hidden size — no separate projector), the per-tap **DeepStack** feature sets
+    /// (each `[n_tokens, hidden]`, one per `deepstack_visual_indexes` tap — empty for a Qwen3.6
+    /// tower), plus the image's `grid_thw` (`[1, h, w]` in patch units). `n_tokens =
+    /// (grid_h/merge)·(grid_w/merge)` is the placeholder expansion count.
+    fn encode(&self, img: &ImageRef) -> CoreResult<(Tensor, Vec<Tensor>, [i32; 3])> {
         let (pixels, grid) = self
             .processor
             .preprocess(
@@ -117,35 +122,41 @@ impl Qwen35Vision {
                 &self.device,
             )
             .map_err(to_core)?;
-        let features = self.tower.forward(&pixels, &grid).map_err(to_core)?;
-        Ok((features, grid[0]))
+        let out = self.tower.forward_with_deepstack(&pixels, &grid).map_err(to_core)?;
+        Ok((out.pooler_output, out.deepstack_features, grid[0]))
     }
 }
 
 /// The prepared multimodal prefill: the image-token-expanded prompt ids, the decoder input embeds
-/// with image features spliced in, and the interleaved M-RoPE position rows + delta.
+/// with image features spliced in, the interleaved M-RoPE position rows + delta, the per-position
+/// visual mask (`true` at image-token positions), and the per-tap DeepStack feature sets fused into
+/// the first decoder layers.
 struct MultimodalPrefill {
     expanded_ids: Vec<i32>,
     embeds: Tensor,
     positions: (Vec<i32>, Vec<i32>, Vec<i32>, i32),
+    visual_pos_mask: Vec<bool>,
+    deepstack: Vec<Tensor>,
 }
 
-/// A [`Decode`] wrapper that shifts the RoPE offset by a constant `delta` — the Qwen3.6 multimodal
-/// decode steps continue from `mrope_delta` past the cached length (image tokens compress the
-/// position cursor, so post-prompt text positions are `cache_len + mrope_delta`, not `cache_len`).
-/// The new tokens are text, so a single shifted 1-D position is the correct M-RoPE position.
-struct ShiftedQwen35<'a> {
-    model: &'a Qwen35Model,
+/// A [`Decode`] wrapper that shifts the RoPE offset by a constant `delta` for the post-prompt
+/// continuation of a multimodal decode. Image tokens compress the position cursor, so the text
+/// positions that follow the prompt are `cache_len + mrope_delta`, not `cache_len`; the new tokens
+/// are text, so a single shifted 1-D position is the correct (interleaved-)M-RoPE position. Drives
+/// either backbone through [`VlmDecode`]'s [`Decode`] supertrait — each decoder downcasts its own
+/// cache inside `step`, so no concrete-type fork is needed here.
+struct Shifted<'a> {
+    model: &'a dyn VlmDecode,
     delta: i32,
 }
 
-impl Decode for ShiftedQwen35<'_> {
+impl Decode for Shifted<'_> {
     fn make_cache(&self) -> Box<dyn KvCache> {
-        Box::new(self.model.new_cache())
+        self.model.make_cache()
     }
 
     fn device(&self) -> &Device {
-        Decode::device(self.model)
+        self.model.device()
     }
 
     fn step(
@@ -154,13 +165,7 @@ impl Decode for ShiftedQwen35<'_> {
         cache: &mut dyn KvCache,
         offset: i32,
     ) -> crate::error::Result<Tensor> {
-        let c = cache
-            .as_any_mut()
-            .downcast_mut::<Qwen35Cache>()
-            .ok_or_else(|| {
-                crate::error::Error::Msg("ShiftedQwen35: cache is not a Qwen35Cache".into())
-            })?;
-        self.model.decode_logits(ids, c, offset + self.delta)
+        self.model.step(ids, cache, offset + self.delta)
     }
 }
 
@@ -301,20 +306,28 @@ impl LlamaProvider {
             (Decoder::Causal(m), descriptor)
         };
 
-        // Qwen3.6 vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
-        // VLM) and the config exposes a `vision_config`. Absent → a text-only `qwen3_5` checkpoint.
-        let vision = if arch == Architecture::Qwen35
+        // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
+        // VLM) and the config exposes a `vision_config`. Covers Qwen3.6 (`qwen3_5`) and Qwen3-VL
+        // (`qwen3_vl`), which share the identical Qwen3-VL ViT tower (Qwen3-VL adds DeepStack taps).
+        // Absent → a text-only checkpoint.
+        let vision = if (arch == Architecture::Qwen35 || arch == Architecture::Qwen3Vl)
             && cfg_value.get("vision_config").is_some()
             && weights.contains("model.visual.patch_embed.proj.weight")
         {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
-            let tower =
-                Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg).map_err(to_core)?;
+            let tower = Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
+                .map_err(to_core)?;
+            // Both real configs carry `image_token_id`; the fallback is the family's canonical id
+            // (Qwen3.6 248056, Qwen3-VL 151655) so a hand-rolled config still resolves.
             let image_token_id = cfg_value
                 .get("image_token_id")
                 .and_then(|x| x.as_i64())
                 .map(|x| x as i32)
-                .unwrap_or(248056);
+                .unwrap_or(if arch == Architecture::Qwen3Vl {
+                    151655
+                } else {
+                    248056
+                });
             descriptor.capabilities.supports_vision = true;
             Some(Qwen35Vision {
                 tower,
@@ -414,40 +427,66 @@ impl LlamaProvider {
         images: &[&ImageRef],
     ) -> CoreResult<MultimodalPrefill> {
         let vision = self.vision.as_ref().ok_or_else(|| {
-            CoreError::Load("qwen3.6 vision: provider has no vision tower".into())
+            CoreError::Load("qwen-vl vision: provider has no vision tower".into())
         })?;
-        let model = self
-            .model
-            .as_qwen35()
-            .ok_or_else(|| CoreError::Load("qwen3.6 vision requires the qwen3_5 decoder".into()))?;
+        let model = self.model.as_vlm();
 
+        // Encode each image in order so the concatenated feature buffer lines up one-to-one with the
+        // image placeholder spans. Each tap's DeepStack features are accumulated separately, then
+        // concatenated across images per tap (one `[Σ n_tokens, hidden]` set per tap).
         let mut feats: Vec<Tensor> = Vec::with_capacity(images.len());
         let mut counts: Vec<usize> = Vec::with_capacity(images.len());
         let mut grids: Vec<[i32; 3]> = Vec::with_capacity(images.len());
+        let mut deepstack_by_tap: Vec<Vec<Tensor>> = Vec::new();
         for img in images {
-            let (f, grid) = vision.encode(img)?;
+            let (f, deepstack, grid) = vision.encode(img)?;
             counts.push(f.dim(0).map_err(|e| to_core(e.into()))?);
             grids.push(grid);
             feats.push(f);
+            if deepstack_by_tap.is_empty() {
+                deepstack_by_tap.resize_with(deepstack.len(), Vec::new);
+            }
+            if deepstack.len() != deepstack_by_tap.len() {
+                return Err(CoreError::Load(format!(
+                    "qwen-vl vision: inconsistent DeepStack tap count {} != {}",
+                    deepstack.len(),
+                    deepstack_by_tap.len()
+                )));
+            }
+            for (tap, feature) in deepstack.into_iter().enumerate() {
+                deepstack_by_tap[tap].push(feature);
+            }
         }
 
         let expanded = expand_image_placeholders(prompt_ids, vision.image_token_id, &counts)
             .map_err(to_core)?;
+        let visual_pos_mask: Vec<bool> =
+            expanded.iter().map(|&id| id == vision.image_token_id).collect();
         let refs: Vec<&Tensor> = feats.iter().collect();
         let all_features = match refs.as_slice() {
             [one] => (*one).clone(),
             many => Tensor::cat(many, 0).map_err(|e| to_core(e.into()))?,
         };
+        let mut deepstack = Vec::with_capacity(deepstack_by_tap.len());
+        for by_image in deepstack_by_tap {
+            let refs: Vec<&Tensor> = by_image.iter().collect();
+            deepstack.push(match refs.as_slice() {
+                [one] => (*one).clone(),
+                many => Tensor::cat(many, 0).map_err(|e| to_core(e.into()))?,
+            });
+        }
 
         let ids = input_ids(&expanded, &vision.device).map_err(to_core)?;
         let embeds = model.embed_input_ids(&ids).map_err(to_core)?;
         let spliced = model
-            .splice_image_features(&embeds, &expanded, &all_features, vision.image_token_id)
+            .splice_vision_features(&embeds, &expanded, &all_features, &[vision.image_token_id])
             .map_err(to_core)?;
         let positions = model
-            .mrope_positions(
+            .mrope_positions_mm(
                 &expanded,
                 &grids,
+                vision.image_token_id,
+                &[],
                 vision.image_token_id,
                 vision.spatial_merge_size,
             )
@@ -457,6 +496,8 @@ impl LlamaProvider {
             expanded_ids: expanded,
             embeds: spliced,
             positions,
+            visual_pos_mask,
+            deepstack,
         })
     }
 }
@@ -768,25 +809,25 @@ impl TextLlm for LlamaProvider {
                 // Multimodal: prefill the spliced embeds with interleaved M-RoPE, then decode the
                 // continuation (text positions shifted by `mrope_delta`) through the shared loop.
                 Some(m) => {
-                    let model = self.model.as_qwen35().ok_or_else(|| {
-                        CoreError::Load("qwen3.6 vision requires the qwen3_5 decoder".into())
-                    })?;
-                    let mut cache = model.new_cache();
+                    let model = self.model.as_vlm();
+                    let mut cache = model.make_cache();
                     let (t, h, w, delta) = &m.positions;
                     let first = model
-                        .decode_logits_from_embeds(
+                        .prefill_with_deepstack(
                             &m.embeds,
                             [t.as_slice(), h.as_slice(), w.as_slice()],
-                            &mut cache,
+                            &mut *cache,
+                            &m.visual_pos_mask,
+                            &m.deepstack,
                         )
                         .map_err(to_core)?;
-                    let shifted = ShiftedQwen35 {
+                    let shifted = Shifted {
                         model,
                         delta: *delta,
                     };
                     generate_from_prefill(
                         &shifted,
-                        &mut cache,
+                        &mut *cache,
                         first,
                         m.expanded_ids.clone(),
                         &config,
@@ -1012,9 +1053,11 @@ inventory::submit! {
         descriptor: provider_descriptor,
         load: load_registered,
         can_load,
-        // No per-snapshot vision distinction for the text-only candle-llama provider; the gate falls
-        // back to the static descriptor (byte-identical to prior behavior).
-        weightless_vision: None,
+        // Per-snapshot vision probe: the static descriptor reports `supports_vision=false` (most
+        // snapshots are text-only), but a Qwen3.6 / Qwen3-VL checkpoint with a `vision_config` IS
+        // vision-capable — this provider loads its ViT tower alongside the decoder. The probe lets a
+        // vision-required model-first load resolve it without reading weights.
+        weightless_vision: Some(can_load_vision),
     }
 }
 
@@ -1038,6 +1081,33 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// model without loading weights. A multimodal snapshot (a `vision_config` block — including a VLM
 /// whose `model_type` substring-matches a text family, e.g. `mllama`) is declined so the vision
 /// provider claims it instead.
+/// Weightless per-snapshot vision probe (core-llm `weightless_vision`): does this provider serve the
+/// snapshot at `spec.source` *with* vision? True for a Qwen3.6 (`qwen3_5`) / Qwen3-VL (`qwen3_vl`)
+/// HF checkpoint carrying a `vision_config` (the ViT tower loads alongside the decoder). Reads only
+/// `config.json` — never a weight shard. GGUF is declined (candle's GGUF path is dense text-only).
+pub fn can_load_vision(spec: &LoadSpec) -> bool {
+    if crate::gguf::is_gguf_path(&spec.source) {
+        return false;
+    }
+    let dir = Path::new(&spec.source);
+    let path = if dir.is_dir() {
+        dir.join("config.json")
+    } else {
+        dir.to_path_buf()
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    v.get("vision_config").is_some()
+        && matches!(
+            Architecture::from_config(&v),
+            Ok(Architecture::Qwen35) | Ok(Architecture::Qwen3Vl)
+        )
+}
+
 pub fn can_load(spec: &LoadSpec) -> bool {
     if crate::gguf::is_gguf_path(&spec.source) {
         // Confirm the GGUF's architecture from its header alone (weightless) — accept iff the loader
@@ -1061,11 +1131,13 @@ pub fn can_load(spec: &LoadSpec) -> bool {
         return false;
     };
     // A multimodal snapshot (a `vision_config` block) is normally declined so a vision provider claims
-    // it — EXCEPT Qwen3.6 (`qwen3_5`), which this provider serves as a **text** model: its 27B/35B
-    // checkpoints are VLM-wrapped, but the hybrid text decoder stands alone (vision is a follow-on
-    // story). So a `vision_config` config is declined only when it is not a qwen3_5.
+    // it — EXCEPT Qwen3.6 (`qwen3_5`) and Qwen3-VL (`qwen3_vl`), which this provider serves directly:
+    // their 27B/35B / 8B checkpoints are VLM-wrapped, but this provider carries the matching ViT tower
+    // (the decoder + vision both load here). So a `vision_config` config is declined only when it is
+    // neither qwen3_5 nor qwen3_vl.
     let arch = Architecture::from_config(&v);
-    if v.get("vision_config").is_some() && !matches!(arch, Ok(Architecture::Qwen35)) {
+    let serves_vision = matches!(arch, Ok(Architecture::Qwen35) | Ok(Architecture::Qwen3Vl));
+    if v.get("vision_config").is_some() && !serves_vision {
         return false;
     }
     arch.is_ok()
