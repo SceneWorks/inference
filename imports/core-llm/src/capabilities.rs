@@ -29,6 +29,13 @@ pub struct TextLlmCapabilities {
     /// section and it emits parseable `<tool_call>` blocks. `false` ⇒ a request carrying
     /// [`tools`](crate::TextLlmRequest::tools) is rejected (never silently dropped).
     pub supports_tools: bool,
+    /// Whether the provider can build a **quantized KV cache** from a
+    /// [`LoadSpec::kv_cache_quant`](crate::LoadSpec::kv_cache_quant) request (sc-8533). `false` ⇒ a
+    /// load carrying a `kv_cache_quant` must fail with [`Error::Unsupported`](crate::Error::Unsupported),
+    /// never silently fall back to a dense cache. Advertised so a host UI only offers the toggle
+    /// where it is honored (e.g. the MLX generic-Llama provider, not candle-llm or the hybrid
+    /// Qwen3.6 cache).
+    pub supports_kv_cache_quant: bool,
     /// The output constraints this provider can enforce (empty = none).
     pub supported_constraints: Vec<Constraint>,
 }
@@ -82,9 +89,7 @@ impl TextLlmCapabilities {
         // Reject only an explicit *enable*: a model with no reasoning mode cannot satisfy it. A
         // no-think (Disabled) request is trivially satisfied (the model never thinks) and Auto
         // defers to the template, so both are accepted regardless of support.
-        if !self.supports_thinking
-            && req.thinking == crate::request::ThinkingMode::Enabled
-        {
+        if !self.supports_thinking && req.thinking == crate::request::ThinkingMode::Enabled {
             return Err(Error::Unsupported(format!(
                 "[{id}] provider does not support a thinking (reasoning) mode"
             )));
