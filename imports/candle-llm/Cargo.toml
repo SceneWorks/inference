@@ -24,11 +24,16 @@ candle-flash-attn = { git = "https://github.com/huggingface/candle", rev = "65ec
 # published repo during development (crates.io publish coordination is a later story); shares its
 # `CancelFlag`, `Tokenizer`, chat templates, and the `TextLlm` trait so there is one contract, not
 # two. candle-llm is the second backend, whose passing the conformance suite de-provisionalizes it.
-# Pinned to an explicit rev (NOT `branch = "main"`): a floating branch lets any `cargo update` re-
-# resolve core-llm to main HEAD and re-break the build org-wide (sc-8021). This rev carries the
-# Qwen3-VL contract additions (`Content::Video`, `supports_video`, `weightless_vision`; sc-8077/8081)
-# that candle-llm is compile-compatible with (sc-8177). Re-pin in lockstep with the other consumers.
-core-llm = { git = "https://github.com/SceneWorks/core-llm", rev = "3870ed1" }
+# Pinned to `branch = "main"` to match the rest of the SceneWorks graph (sc-8116, epic 8103). mlx-llm
+# and (transitively) sceneworks-gen-core pin core-llm `branch = "main"`; cargo keys a git source by its
+# (url, reference), so a `rev = "3870ed1"` spec here does NOT unify with their `branch = "main"` spec
+# EVEN at the identical commit — the worker's `--features backend-candle` graph then materialises TWO
+# core-llm packages (one per spec) and the duplicate `core_llm` types clash (broke candle-gen's CUDA
+# conformance suite when this rev was pulled into candle-gen-joycaption). Using `branch = "main"` here
+# (the proven bf99e5b4 approach, now carrying the Qwen3-VL vision tower) unifies on ONE core-llm. The
+# sc-8021 "don't float to main HEAD" concern is handled by the committed Cargo.lock pinning the resolved
+# commit; re-pin in lockstep with the other consumers when core-llm's resolved commit moves.
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 # Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
 # inventory so the distributed slice links.
 inventory = "0.3"
@@ -39,8 +44,8 @@ serde_json = "1"
 
 [dev-dependencies]
 # The contract conformance suite (story 7201): run the registered LlamaProvider through the
-# backend-neutral checks. Same git source AND rev as the core-llm dep so cargo unifies on one core-llm.
-core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", rev = "3870ed1" }
+# backend-neutral checks. Same git source AND ref as the core-llm dep so cargo unifies on one core-llm.
+core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 
 [features]
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).
