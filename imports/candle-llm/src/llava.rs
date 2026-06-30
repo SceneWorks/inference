@@ -617,6 +617,10 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_thinking: false,
             // Vision/caption path only; no tool calling (mirrors the mlx JoyCaption provider).
             supports_tools: false,
+            // KV-cache quantization (sc-8533): not implemented by candle-llm; advertise `false` so a
+            // `LoadSpec::kv_cache_quant` is cleanly rejected by the contract (mirrors the mlx JoyCaption
+            // provider, which also reports false).
+            supports_kv_cache_quant: false,
             supported_constraints: Vec::new(),
         },
     }

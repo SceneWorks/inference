@@ -169,6 +169,8 @@ fn qwen35_quantize_on_load_q8() {
     let q8 = LlamaProvider::load(&LoadSpec {
         source: model_dir(),
         quantize: Some(Quantize::Q8),
+        // candle-llm does not support KV-cache quantization (sc-8533): always dense.
+        kv_cache_quant: None,
     })
     .expect("load q8");
     assert!(q8.is_quantized(), "Q8 load must report quantized");

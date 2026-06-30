@@ -146,6 +146,8 @@ fn run_quantized_conformance(env_var: &str, quant: Quantize) {
     let spec = LoadSpec {
         source: dir,
         quantize: Some(quant),
+        // candle-llm does not support KV-cache quantization (sc-8533): always dense.
+        kv_cache_quant: None,
     };
     textllm_conformance(
         || {
