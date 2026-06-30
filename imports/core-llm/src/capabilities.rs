@@ -29,13 +29,6 @@ pub struct TextLlmCapabilities {
     /// section and it emits parseable `<tool_call>` blocks. `false` ⇒ a request carrying
     /// [`tools`](crate::TextLlmRequest::tools) is rejected (never silently dropped).
     pub supports_tools: bool,
-    /// Whether the provider can build a **quantized KV cache** from a
-    /// [`LoadSpec::kv_cache_quant`](crate::LoadSpec::kv_cache_quant) request (sc-8533). `false` ⇒ a
-    /// load carrying a `kv_cache_quant` must fail with [`Error::Unsupported`](crate::Error::Unsupported),
-    /// never silently fall back to a dense cache. Advertised so a host UI only offers the toggle
-    /// where it is honored (e.g. the MLX generic-Llama provider, not candle-llm or the hybrid
-    /// Qwen3.6 cache).
-    pub supports_kv_cache_quant: bool,
     /// The output constraints this provider can enforce (empty = none).
     pub supported_constraints: Vec<Constraint>,
 }

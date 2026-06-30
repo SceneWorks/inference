@@ -72,13 +72,13 @@ pub use registry::{
     load_for_model, load_for_model_with, load_textllm, textllms, ModelRequirements,
     TextLlmRegistration,
 };
-pub use request::{
-    KvCacheQuant, KvCacheQuantMethod, LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode,
-};
+pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
 pub use stop::{StopChunk, StopMatcher};
-pub use template::{ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template, RenderOptions};
+pub use template::{
+    ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template, RenderOptions,
+};
 pub use text_llm::TextLlm;
 pub use thinking::{ThinkingSegmenter, ThinkingSpan};
 pub use tokenizer::Tokenizer;

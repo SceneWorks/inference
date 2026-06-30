@@ -46,7 +46,6 @@ fn stub_caps() -> TextLlmCapabilities {
         supports_video: false,
         supports_thinking: false,
         supports_tools: false,
-        supports_kv_cache_quant: false,
         supported_constraints: Vec::new(),
     }
 }

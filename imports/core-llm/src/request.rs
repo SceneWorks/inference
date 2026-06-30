@@ -149,14 +149,6 @@ pub struct LoadSpec {
     pub source: String,
     /// Optional load-time **weight** quantization (the model projection weights).
     pub quantize: Option<Quantize>,
-    /// Optional **KV-cache** quantization (sc-8533). Entirely distinct from
-    /// [`quantize`](Self::quantize) — that compresses the model *weights* at load, this compresses
-    /// the per-step *key/value cache* during generation. `None` (the default) ⇒ a dense KV cache,
-    /// unchanged behavior. A provider only honors it when it advertises
-    /// [`supports_kv_cache_quant`](crate::TextLlmCapabilities::supports_kv_cache_quant); an
-    /// unsupported provider/model must surface a clean
-    /// [`Error::Unsupported`](crate::Error::Unsupported) rather than silently ignoring it.
-    pub kv_cache_quant: Option<KvCacheQuant>,
 }
 
 /// Load-time quantization request.
@@ -168,104 +160,12 @@ pub enum Quantize {
     Q8,
 }
 
-/// KV-cache quantization configuration (sc-8533): a compression **method** plus a **bit-width**.
-///
-/// This is the runtime KV-cache compression knob, **not** the load-time weight quantization
-/// ([`Quantize`]). A provider builds its quantized KV cache from this when it advertises
-/// [`supports_kv_cache_quant`](crate::TextLlmCapabilities::supports_kv_cache_quant); otherwise the
-/// load must fail cleanly with [`Error::Unsupported`](crate::Error::Unsupported). Kept `Optional` on
-/// [`LoadSpec`] so existing callers and providers without support (e.g. candle-llm) are unaffected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvCacheQuant {
-    /// The compression method.
-    pub method: KvCacheQuantMethod,
-    /// Bits per quantized value. Method-dependent valid range (e.g. RVQ supports 1..=8); a provider
-    /// rejects an out-of-range width with [`Error::Unsupported`](crate::Error::Unsupported).
-    pub bits: u8,
-}
-
-impl KvCacheQuant {
-    /// An RVQ KV-cache quantization at the given bit-width.
-    pub fn rvq(bits: u8) -> Self {
-        Self {
-            method: KvCacheQuantMethod::Rvq,
-            bits,
-        }
-    }
-}
-
-/// The KV-cache compression method (sc-8533). Open enum so future methods (VecInfer, …) add a
-/// variant without breaking the contract; a provider rejects a method it does not implement with
-/// [`Error::Unsupported`](crate::Error::Unsupported).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KvCacheQuantMethod {
-    /// Residual vector quantization (story D's `QuantizedKvCache` RVQ path on MLX).
-    Rvq,
-}
-
 impl LoadSpec {
-    /// A dense (non-quantized) load from `source` — no weight quant and no KV-cache quant.
+    /// A dense (non-quantized) load from `source`.
     pub fn dense(source: impl Into<String>) -> Self {
         Self {
             source: source.into(),
             quantize: None,
-            kv_cache_quant: None,
         }
-    }
-
-    /// This load spec with a KV-cache quantization configuration applied (builder-style).
-    pub fn with_kv_cache_quant(mut self, kv: KvCacheQuant) -> Self {
-        self.kv_cache_quant = Some(kv);
-        self
-    }
-}
-
-#[cfg(test)]
-mod kv_cache_quant_tests {
-    use super::*;
-
-    /// The default / dense load carries NO kv-cache quant — backward compatible with every existing
-    /// caller (a `..Default::default()` or `LoadSpec::dense(..)` construction is unaffected).
-    #[test]
-    fn dense_and_default_have_no_kv_cache_quant() {
-        assert_eq!(LoadSpec::dense("/snap").kv_cache_quant, None);
-        assert_eq!(LoadSpec::default().kv_cache_quant, None);
-        // And the existing weight-quant knob is untouched / independent.
-        assert_eq!(LoadSpec::dense("/snap").quantize, None);
-    }
-
-    /// The builder sets only the KV-cache knob, leaving weight quant independent (the two are
-    /// distinct, never conflated — the explicit acceptance requirement).
-    #[test]
-    fn kv_cache_quant_is_independent_of_weight_quant() {
-        let spec = LoadSpec {
-            source: "/snap".into(),
-            quantize: Some(Quantize::Q4),
-            ..Default::default()
-        }
-        .with_kv_cache_quant(KvCacheQuant::rvq(4));
-        assert_eq!(spec.quantize, Some(Quantize::Q4)); // weight quant preserved
-        assert_eq!(
-            spec.kv_cache_quant,
-            Some(KvCacheQuant {
-                method: KvCacheQuantMethod::Rvq,
-                bits: 4
-            })
-        );
-    }
-
-    /// The `rvq` helper builds the RVQ method at the requested bit-width.
-    #[test]
-    fn rvq_helper_carries_method_and_bits() {
-        let kv = KvCacheQuant::rvq(8);
-        assert_eq!(kv.method, KvCacheQuantMethod::Rvq);
-        assert_eq!(kv.bits, 8);
-    }
-
-    /// A default-constructed capability set advertises KV-cache quant as OFF — providers opt in
-    /// explicitly, so candle-llm and any provider that hasn't been wired stays unsupported.
-    #[test]
-    fn capability_defaults_to_unsupported() {
-        assert!(!crate::TextLlmCapabilities::default().supports_kv_cache_quant);
     }
 }
