@@ -33,6 +33,9 @@ candle-flash-attn = { git = "https://github.com/huggingface/candle", rev = "65ec
 # (the proven bf99e5b4 approach, now carrying the Qwen3-VL vision tower) unifies on ONE core-llm. The
 # sc-8021 "don't float to main HEAD" concern is handled by the committed Cargo.lock pinning the resolved
 # commit; re-pin in lockstep with the other consumers when core-llm's resolved commit moves.
+# DEV-PIN (sc-8528 KV-quant backout): temporarily pointed at the core-llm removal branch so this
+# crate builds WITHOUT the removed `supports_kv_cache_quant` / `kv_cache_quant` fields. COORDINATOR:
+# flip back to `branch = "main"` after the core-llm backout PR merges, then relock.
 core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 # Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
 # inventory so the distributed slice links.
@@ -45,6 +48,7 @@ serde_json = "1"
 [dev-dependencies]
 # The contract conformance suite (story 7201): run the registered LlamaProvider through the
 # backend-neutral checks. Same git source AND ref as the core-llm dep so cargo unifies on one core-llm.
+# DEV-PIN (sc-8528): see the core-llm note above — COORDINATOR flips back to `branch = "main"` post-merge.
 core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 
 [features]

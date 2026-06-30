@@ -1073,10 +1073,6 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (story 7636).
             supports_tools: false,
-            // KV-cache quantization (sc-8533): candle-llm does NOT implement it. Advertising `false`
-            // makes the contract reject a `LoadSpec::kv_cache_quant` with `Error::Unsupported` rather
-            // than silently ignoring it (and keeps a host UI from offering the toggle for this backend).
-            supports_kv_cache_quant: false,
             // JSON-constrained decoding.
             supported_constraints: vec![Constraint::Json],
         },
