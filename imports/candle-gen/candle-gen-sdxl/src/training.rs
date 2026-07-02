@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var, D};
-use candle_nn::{Module, VarBuilder};
+use candle_nn::Module;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
@@ -428,7 +428,7 @@ fn resolve_target_paths(
 /// attention is off (non-differentiable; training uses the materialized math attention).
 fn build_unet(root: &Path, device: &Device, dtype: DType) -> Result<UNet2DConditionModel> {
     let path = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, device)? };
+    let vb = candle_gen::mmap_var_builder(&[path], dtype, device)?;
     Ok(UNet2DConditionModel::new(
         vb,
         4,
@@ -554,13 +554,11 @@ impl SdxlTrainer {
         // --- load + cache: VAE latents (.mean × scale) + dual-CLIP conditioning ---
         on_progress(TrainingProgress::LoadingModel);
         let vae = {
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    &[hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?],
-                    DType::F32,
-                    device,
-                )?
-            };
+            let vb = candle_gen::mmap_var_builder(
+                &[hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?],
+                DType::F32,
+                device,
+            )?;
             VaeMomentsEncoder::new(vb, VAE_SCALE)?
         };
         let clip = DualClip::load(&self.root, device)?;
