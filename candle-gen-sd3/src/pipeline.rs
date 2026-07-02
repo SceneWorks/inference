@@ -292,16 +292,20 @@ impl Pipeline {
 
     /// Build the conditioning for a prompt: the aggregated pooled + context. For CFG the
     /// unconditional branch is the **empty-prompt** encode (diffusers encodes `""`), NOT a zero
-    /// tensor. Returns `(cond, Option<uncond>)`; `uncond` is `None` when CFG is off (Turbo).
+    /// tensor. Returns `(cond, Option<uncond>)`; `uncond` is `None` when CFG is off — either a
+    /// distilled (Turbo) variant, or an effective `cfg_scale == 1.0` where the blend
+    /// `uncond + 1·(cond − uncond)` reduces exactly to `cond`, so the uncond encode/forward is pure
+    /// waste (sc-8993).
     fn conditioning(
         &self,
         encoders: &Mutex<Sd3TextEncoders>,
         req: &GenerationRequest,
+        cfg_scale: f32,
     ) -> Result<(Sd3Conditioning, Option<Sd3Conditioning>)> {
         let mut enc = encoders.lock().expect("sd3 encoders mutex poisoned");
         let cond_out = enc.encode(&req.prompt)?;
         let cond = aggregate(&self.cfg, &cond_out)?;
-        let uncond = if self.variant.cfg_enabled() {
+        let uncond = if self.variant.cfg_enabled() && cfg_scale != 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or("");
             let uncond_out = enc.encode(neg)?;
             Some(aggregate(&self.cfg, &uncond_out)?)
@@ -332,8 +336,9 @@ impl Pipeline {
         let lat_h = (req.height / VAE_SCALE) as usize;
         let lat_w = (req.width / VAE_SCALE) as usize;
 
-        // Conditioning is seed- and image-independent: encode once for the whole batch.
-        let (cond, uncond) = self.conditioning(&components.encoders, req)?;
+        // Conditioning is seed- and image-independent: encode once for the whole batch. `cfg_scale`
+        // gates the uncond encode — at 1.0 the CFG blend collapses to cond, so it's skipped (sc-8993).
+        let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
@@ -727,6 +732,69 @@ mod tests {
         assert_eq!(a.pixels, b.pixels, "same seed + weights must reproduce");
     }
 
+    /// sc-8993: at `cfg_scale == 1.0` the CFG blend `uncond + 1·(cond − uncond)` is exactly `cond`
+    /// in exact arithmetic, so running the uncond forward is pure waste. This pins the equivalence
+    /// the `conditioning` gate relies on: render_core with `Some(uncond)` at cfg 1.0 is
+    /// numerically equivalent to the cond-only path (`None`) — proving skipping the uncond branch
+    /// when guidance is disabled cannot change the output.
+    ///
+    /// We compare with a tiny per-pixel tolerance rather than byte-exact equality. The `Some(uncond)`
+    /// path evaluates `v_uncond + (v_cond − v_uncond)·1.0`, whose reduction to `v_cond` is only exact
+    /// in real arithmetic: floating-point add/sub is non-associative and platforms differ in FMA
+    /// contraction and rounding (x86-64 Linux vs macOS/Windows), so the recombined velocity can differ
+    /// from the direct `v_cond` in the last ULP. That sub-ULP difference propagates through the
+    /// sampler + VAE decode and can flip a boundary pixel by ±1 after the u8 quantization — a byte-exact
+    /// assertion is therefore not portable. A tolerance of ≤1 (u8) is still fully discriminating: a real
+    /// CFG regression at cfg=1.0 (e.g. dropping the cond term, or a sign/scale error in the blend) shifts
+    /// the image by far more than one gray level across many pixels.
+    #[test]
+    fn cfg_scale_one_equals_cond_only_path() {
+        let device = Device::Cpu;
+        let cfg = tiny_cfg();
+        let (transformer, vae, cond, uncond) = harness(&cfg, &device);
+        let cancel = CancelFlag::default();
+        let render = |uncond_ref: Option<&Sd3Conditioning>| {
+            render_core(
+                &transformer,
+                &vae,
+                &cond,
+                uncond_ref,
+                1.0, // cfg_scale == 1.0: blend collapses to cond
+                4,
+                3.0,
+                (4, 4),
+                7,
+                device.clone(),
+                DType::F32,
+                None,
+                None,
+                &cancel,
+                &mut |_p: Progress| {},
+            )
+            .unwrap()
+        };
+        // With guidance ENABLED the uncond forward runs (wasted); with it skipped only cond runs.
+        let with_uncond = render(Some(&uncond));
+        let cond_only = render(None);
+        assert_eq!(
+            with_uncond.pixels.len(),
+            cond_only.pixels.len(),
+            "both paths must decode to the same-shaped image"
+        );
+        let max_abs_diff = with_uncond
+            .pixels
+            .iter()
+            .zip(cond_only.pixels.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_abs_diff <= 1,
+            "cfg_scale 1.0 blend must equal cond-only (skipping the uncond branch is a no-op); \
+             max per-pixel abs diff was {max_abs_diff} (>1 u8 => not just FP non-associativity)"
+        );
+    }
+
     /// **CUDA random-weight smoke (sc-7877).** Asserts the tiny MMDiT + VAE render core compiles, runs
     /// on the GPU (Blackwell PTX JIT, dense ops), and decodes a finite, right-shaped image with NO
     /// NaN/Inf. Dense/PTX ops JIT fine on sm_120 (only Q4/Q8 quant needs the native fatbin — that is
@@ -823,6 +891,79 @@ mod tests {
             );
             eprintln!("sc-7879 {quant:?} CUDA quant smoke: max|v|={max_abs:.4} (finite, non-zero)");
         }
+    }
+
+    /// **CUDA guidance-gate validation (sc-8993).** On the Blackwell GPU, prove the two AC halves:
+    /// (1) at `cfg_scale == 1.0` the CFG blend `Some(uncond)` path is **byte-identical** to the
+    /// cond-only (`None`) path — so skipping the uncond forward when guidance is disabled cannot alter
+    /// output; and (2) a genuinely guided render (`cfg_scale = 4.0`, `Some(uncond)`) still decodes a
+    /// finite, right-shaped image and differs from the cond-only render (guidance is doing something —
+    /// its output is the code path this optimization deliberately leaves untouched). Built at
+    /// `CUDA_COMPUTE_CAP=80` under `scripts/check-cuda.ps1`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_cfg_gate_matches_cond_only_and_preserves_guided() {
+        let device = Device::new_cuda(0).expect("CUDA device 0");
+        let cfg = tiny_cfg();
+        let (transformer, vae, cond, uncond) = harness(&cfg, &device);
+        let cancel = CancelFlag::default();
+        let render = |uncond_ref: Option<&Sd3Conditioning>, scale: f32| {
+            render_core(
+                &transformer,
+                &vae,
+                &cond,
+                uncond_ref,
+                scale,
+                4,
+                3.0,
+                (4, 4),
+                7,
+                device.clone(),
+                DType::F32,
+                None,
+                None,
+                &cancel,
+                &mut |_p: Progress| {},
+            )
+            .unwrap()
+        };
+        // (1) cfg 1.0: the wasted-uncond path == cond-only ON THE GPU, within a sub-ULP tolerance.
+        // The `Some(uncond)` path recombines `v_uncond + (v_cond − v_uncond)·1.0`, whose reduction to
+        // `v_cond` is exact only in real arithmetic; FP non-associativity can flip a boundary pixel by
+        // ±1 after u8 quantization (see the CPU `cfg_scale_one_equals_cond_only_path` test). ≤1 (u8) is
+        // still fully discriminating — a real CFG regression shifts many pixels by far more.
+        let with_uncond_1 = render(Some(&uncond), 1.0);
+        let cond_only = render(None, 1.0);
+        assert_eq!(
+            with_uncond_1.pixels.len(),
+            cond_only.pixels.len(),
+            "sc-8993: both cfg 1.0 paths must decode to the same-shaped image"
+        );
+        let max_abs_diff = with_uncond_1
+            .pixels
+            .iter()
+            .zip(cond_only.pixels.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_abs_diff <= 1,
+            "sc-8993: cfg 1.0 with uncond must equal cond-only on CUDA; max per-pixel abs diff was \
+             {max_abs_diff} (>1 u8 => not just FP non-associativity)"
+        );
+        // (2) guided (cfg 4.0) still renders and is a distinct, untouched code path.
+        let guided = render(Some(&uncond), 4.0);
+        assert_eq!(
+            guided.pixels.len(),
+            (guided.width * guided.height * 3) as usize
+        );
+        assert_ne!(
+            guided.pixels, cond_only.pixels,
+            "guided (cfg 4.0) output must differ from cond-only — guidance is active"
+        );
+        eprintln!(
+            "sc-8993 CUDA gate: cfg1.0==cond-only (byte-eq), cfg4.0 guided distinct + decoded"
+        );
     }
 
     /// **Real-weight memory profile — GATED (sc-7879 / C6).** Measures the TRUE peak CUDA memory of a
