@@ -504,6 +504,35 @@ impl TextRope {
     }
 }
 
+/// HF **half-split** RoPE apply: `x·cos + rotate_half(x)·sin`, where `rotate_half([x1, x2]) =
+/// [-x2, x1]` splits `x` on the head dim. `x` is `[b, s, heads, head_dim]`; `cos`/`sin` are
+/// `[1, s, head_dim]` (from [`TextRope::forward`]) and broadcast over the head axis (2). This is the
+/// GQA text-encoder RoPE convention (distinct from the DiT's interleaved rotation); shared by the
+/// Qwen-Image and Krea Qwen3-VL text-encoder attentions, which open-coded the identical op sequence
+/// (F-078).
+pub fn apply_text_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+    let cos = cos.expand_dims(2)?; // [1,s,1,hd]
+    let sin = sin.expand_dims(2)?;
+    let parts = mlx_rs::ops::split(x, 2, 3)?; // halves along the head dim
+    let rot = mlx_rs::ops::concatenate_axis(&[&parts[1].negative()?, &parts[0]], 3)?;
+    Ok(add(&multiply(x, &cos)?, &multiply(&rot, &sin)?)?)
+}
+
+/// Grouped-query-attention key/value expansion: `[b, s, hkv, hd]` → `[b, s, hkv·groups, hd]`,
+/// repeating each kv head `groups` times consecutively (`repeat_interleave` over the head axis,
+/// matching `mx.repeat(x, groups, axis=2)` / torch `enable_gqa`). `groups == 1` is the identity.
+/// Shared by the Qwen-Image / Krea text-encoder attentions and the Krea DiT (F-078).
+pub fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
+    if groups == 1 {
+        return Ok(x.clone());
+    }
+    let sh = x.shape();
+    let (b, s, hkv, hd) = (sh[0], sh[1], sh[2], sh[3]);
+    let x = x.expand_dims(3)?; // [b,s,hkv,1,hd]
+    let x = broadcast_to(&x, &[b, s, hkv, groups, hd])?;
+    Ok(x.reshape(&[b, s, hkv * groups, hd])?)
+}
+
 /// Additive attention mask `[b, 1, s, s]` for a **causal** LM: `0` where a query may attend (the key
 /// is at or before the query position **and** is not padding per `attention_mask` `[b, s]` of 0/1),
 /// `-inf` otherwise. Built on the host from the i32 attention mask, mirroring the fork's
@@ -511,6 +540,17 @@ impl TextRope {
 pub fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
     let am = crate::array::host_i32(attention_mask)?;
     let (b, s) = (b as usize, s as usize);
+    // F-061: `am[bi*s + j]` indexes this caller-supplied slice against the independent `b`/`s` params;
+    // a mask shorter than `b*s` (a provider bug) would otherwise panic (process abort) in shared core.
+    if am.len() != b * s {
+        return Err(Error::Msg(format!(
+            "build_mask: attention_mask has {} elements, expected b*s = {}*{} = {}",
+            am.len(),
+            b,
+            s,
+            b * s
+        )));
+    }
     let mut data = vec![0f32; b * s * s];
     for bi in 0..b {
         for i in 0..s {
@@ -530,6 +570,18 @@ pub fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
 /// [`window_unpartition`]. Shared by the SAM2/SAM3 vision trunks' windowed-attention blocks (6940).
 pub fn window_partition(x: &Array, window: i32) -> Result<(Array, (i32, i32))> {
     let sh = x.shape();
+    // F-062: mirror the F-041 sibling guards (`upsample_nearest`/`group_norm`). A non-NHWC input
+    // panics on `sh[1..4]`; `window <= 0` divides by zero in the pad/reshape math below.
+    if sh.len() != 4 {
+        return Err(Error::Msg(format!(
+            "window_partition: expected an NHWC (rank 4) tensor, got shape {sh:?}"
+        )));
+    }
+    if window <= 0 {
+        return Err(Error::Msg(format!(
+            "window_partition: window must be > 0, got {window}"
+        )));
+    }
     let (b, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
     let pad_h = (window - h % window) % window;
     let pad_w = (window - w % window) % window;
@@ -556,7 +608,19 @@ pub fn window_unpartition(
 ) -> Result<Array> {
     let (hp, wp) = pad_hw;
     let (h, w) = hw;
+    // F-062: `window <= 0` divides by zero below, and a degenerate `pad_hw` (`hp*wp < window²`) makes
+    // `num_per_image == 0` → a second divide-by-zero on `windows.shape()[0] / num_per_image`.
+    if window <= 0 {
+        return Err(Error::Msg(format!(
+            "window_unpartition: window must be > 0, got {window}"
+        )));
+    }
     let num_per_image = (hp * wp) / window / window;
+    if num_per_image <= 0 {
+        return Err(Error::Msg(format!(
+            "window_unpartition: degenerate pad_hw {pad_hw:?} for window {window} (no whole windows)"
+        )));
+    }
     let b = windows.shape()[0] / num_per_image;
     let x = windows
         .reshape(&[b, hp / window, wp / window, window, window, -1])?

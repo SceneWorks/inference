@@ -35,9 +35,37 @@ pub const DEFAULT_GROUP_SIZE: i32 = 64;
 /// `[out, in/gs]` ⇒ `in = scales.cols·gs`; the u32-packed `weight` is `[out, in·bits/32]` ⇒
 /// `bits = wq.cols·32/in`. Exact for any group-aligned Q4/Q8 pack, so the bit-width need not be
 /// carried in a side manifest.
-fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> i32 {
-    let in_dim = scales.shape()[1] * group_size;
-    wq.shape()[1] * 32 / in_dim
+///
+/// F-011: returns `Result` and validates the shapes a corrupt/mis-converted pre-quantized snapshot
+/// would otherwise mishandle: a 1-D `scales` (or `wq`) panics on the shape index; a `[out, 0]` scales
+/// tensor makes `in_dim == 0` → integer divide-by-zero; a mis-packed `wq` yields bits ∉ {4,8}. The
+/// shared load seam for every Group-B packed snapshot feeds straight off external `.safetensors`, so
+/// these shapes are untrusted.
+pub fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> Result<i32> {
+    let sshape = scales.shape();
+    let wshape = wq.shape();
+    if sshape.len() != 2 || wshape.len() != 2 {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: scales and weight must be 2-D, got scales {:?} / weight {:?}",
+            sshape, wshape
+        )));
+    }
+    let in_dim = sshape[1] * group_size;
+    if in_dim == 0 {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: zero input dim (scales cols {} × group_size {})",
+            sshape[1], group_size
+        )));
+    }
+    let bits = wshape[1] * 32 / in_dim;
+    if !matches!(bits, 4 | 8) {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: inferred bit-width {bits} ∉ {{4, 8}} \
+             (weight cols {}, in_dim {in_dim}); snapshot is corrupt or mis-converted",
+            wshape[1]
+        )));
+    }
+    Ok(bits)
 }
 
 /// Load `{base}` as an [`AdaptableLinear`] — **packed** (Q4/Q8) when `{base}.scales` is present (a
@@ -54,7 +82,7 @@ pub fn lin(w: &Weights, base: &str, bias: bool, group_size: i32) -> Result<Adapt
     };
     if let Some(scales) = w.get(&format!("{base}.scales")) {
         let wq = w.require(&format!("{base}.weight"))?;
-        let bits = packed_bits(wq, scales, group_size);
+        let bits = packed_bits(wq, scales, group_size)?;
         return Ok(AdaptableLinear::from_quantized_parts(
             wq.clone(),
             scales.clone(),
@@ -75,7 +103,7 @@ pub fn lin(w: &Weights, base: &str, bias: bool, group_size: i32) -> Result<Adapt
 pub fn embedding(w: &Weights, base: &str, group_size: i32) -> Result<TokenEmbedding> {
     if let Some(scales) = w.get(&format!("{base}.scales")) {
         let wq = w.require(&format!("{base}.weight"))?;
-        let bits = packed_bits(wq, scales, group_size);
+        let bits = packed_bits(wq, scales, group_size)?;
         return Ok(TokenEmbedding::from_quantized_parts(
             wq.clone(),
             scales.clone(),
@@ -146,4 +174,140 @@ pub fn quantize_map(
         }
     }
     Ok(out)
+}
+
+// ============================================================================================
+// Turnkey-assembly glue — the Group-B converter tail the provider `convert.rs` modules used to
+// clone verbatim (sc-9108 / F-045). Each provider still owns its per-component pack predicates and
+// its `prequantize_turnkey` wiring, but routes the config annotation, the symlink-resolving
+// directory copy, and the non-weight asset tail through these shared helpers so the six converters
+// stay byte-identical (they had drifted: z-image dropped `LICENSE.txt`; krea's copy skipped the
+// symlink deref; sensenova never annotated its config).
+// ============================================================================================
+
+/// The canonical set of top-level non-weight assets a turnkey snapshot copies verbatim from the
+/// dense source (in addition to the component dirs it packs / passes through): the diffusers pipeline
+/// manifest and every license/readme variant an upstream repo might ship. A converter iterates this,
+/// copying each that exists (deref'ing HF-cache symlinks). Owning it here fixes the F-045 drift where
+/// z-image omitted `LICENSE.txt` and shipped license-less rehosted tiers.
+pub const TURNKEY_ASSET_FILES: &[&str] = &[
+    "model_index.json",
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSE.txt",
+    "README.md",
+];
+
+/// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}` block
+/// added (HF/diffusers-compat; the Rust loaders auto-detect packed weights via `{base}.scales` and
+/// ignore this block — it is provenance/informational). A missing source config starts from an empty
+/// object. The written bytes are `serde_json::to_string_pretty` of the merged value, byte-identical
+/// across every provider that packs per-component dirs.
+pub fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
+    let src_cfg = src.join("config.json");
+    let mut v: serde_json::Value = if src_cfg.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&src_cfg)?).map_err(|e| {
+            crate::Error::Msg(format!("quant convert: parse {}: {e}", src_cfg.display()))
+        })?
+    } else {
+        serde_json::json!({})
+    };
+    v["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
+    let text = serde_json::to_string_pretty(&v)
+        .map_err(|e| crate::Error::Msg(format!("quant convert: serialize config.json: {e}")))?;
+    std::fs::create_dir_all(dst)?;
+    std::fs::write(dst.join("config.json"), text)?;
+    Ok(())
+}
+
+/// Recursively copy a directory's files, resolving symlinks (HF snapshots symlink into
+/// `../../blobs/…`) to real bytes so the assembled tier is self-contained and HF-uploadable. This is
+/// the symlink-resolving copy the six sibling converters share (the F-045 unification point where
+/// krea's non-deref'ing copy is brought into line).
+pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir(&path, &target)?;
+        } else {
+            let real = std::fs::canonicalize(&path)?;
+            std::fs::copy(&real, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy a single top-level asset `name` from `src_root` to `dst_root` if it exists, deref'ing an
+/// HF-cache symlink to real bytes. Returns whether the file was present and copied. The per-file
+/// building block behind [`copy_turnkey_assets`] (some converters — e.g. sensenova — need the copied?
+/// signal per file).
+pub fn copy_asset(src_root: &Path, dst_root: &Path, name: &str) -> Result<bool> {
+    let src = src_root.join(name);
+    if !src.exists() {
+        return Ok(false);
+    }
+    let real = std::fs::canonicalize(&src)?;
+    std::fs::create_dir_all(dst_root)?;
+    std::fs::copy(&real, dst_root.join(name))?;
+    Ok(true)
+}
+
+/// Copy every [`TURNKEY_ASSET_FILES`] entry that exists from `src_root` to `dst_root` (deref'ing
+/// symlinks). The shared non-weight tail of `prequantize_turnkey`.
+pub fn copy_turnkey_assets(src_root: &Path, dst_root: &Path) -> Result<()> {
+    for name in TURNKEY_ASSET_FILES {
+        copy_asset(src_root, dst_root, name)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-011: a Q4 pack at group_size 64 derives bits == 4 from the standard shapes.
+    #[test]
+    fn packed_bits_derives_q4() {
+        // scales [out, in/gs] = [128, 4] ⇒ in_dim 256; wq [out, in·4/32] = [128, 32] ⇒ bits 4.
+        let scales = Array::zeros::<f32>(&[128, 4]).unwrap();
+        let wq = Array::zeros::<u32>(&[128, 32]).unwrap();
+        assert_eq!(packed_bits(&wq, &scales, 64).unwrap(), 4);
+    }
+
+    #[test]
+    fn packed_bits_derives_q8() {
+        // scales [out, in/gs] = [64, 2] ⇒ in_dim 128; wq [out, in·8/32] = [64, 32] ⇒ bits 8.
+        let scales = Array::zeros::<f32>(&[64, 2]).unwrap();
+        let wq = Array::zeros::<u32>(&[64, 32]).unwrap();
+        assert_eq!(packed_bits(&wq, &scales, 64).unwrap(), 8);
+    }
+
+    #[test]
+    fn packed_bits_rejects_1d_shapes() {
+        let scales = Array::zeros::<f32>(&[64]).unwrap(); // 1-D
+        let wq = Array::zeros::<u32>(&[64, 32]).unwrap();
+        let err = packed_bits(&wq, &scales, 64).unwrap_err().to_string();
+        assert!(err.contains("must be 2-D"), "{err}");
+    }
+
+    #[test]
+    fn packed_bits_rejects_zero_in_dim() {
+        // [out, 0] scales ⇒ in_dim 0 ⇒ integer divide-by-zero today; now a typed error.
+        let scales = Array::zeros::<f32>(&[64, 0]).unwrap();
+        let wq = Array::zeros::<u32>(&[64, 32]).unwrap();
+        let err = packed_bits(&wq, &scales, 64).unwrap_err().to_string();
+        assert!(err.contains("zero input dim"), "{err}");
+    }
+
+    #[test]
+    fn packed_bits_rejects_non_q4_q8_width() {
+        // in_dim 256, wq cols 24 ⇒ bits 24·32/256 = 3 ∉ {4,8}.
+        let scales = Array::zeros::<f32>(&[64, 4]).unwrap(); // in_dim 256
+        let wq = Array::zeros::<u32>(&[64, 24]).unwrap(); // bits 3
+        let err = packed_bits(&wq, &scales, 64).unwrap_err().to_string();
+        assert!(err.contains("∉ {4, 8}"), "{err}");
+    }
 }

@@ -113,12 +113,10 @@ struct PlannerKnobs {
 }
 
 impl PlannerKnobs {
-    fn from_dir(root: &Path) -> Self {
-        let v: serde_json::Value =
-            std::fs::read(root.join(crate::convert::BERNINI_PLANNER_SIDECAR))
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or(serde_json::Value::Null);
+    fn from_dir(root: &Path) -> Result<Self> {
+        // Absent sidecar → defaults; present-but-corrupt → error (F-097), via the shared reader.
+        let v =
+            crate::config::read_knob_sidecar(&root.join(crate::convert::BERNINI_PLANNER_SIDECAR))?;
         let i = |k: &str, d: i64| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(d);
         let cd = v
             .get("clip_diff_cfg")
@@ -126,7 +124,7 @@ impl PlannerKnobs {
             .unwrap_or(serde_json::Value::Null);
         let cdi = |k: &str, d: i64| cd.get(k).and_then(serde_json::Value::as_i64).unwrap_or(d);
         let cdf = |k: &str, d: f64| cd.get(k).and_then(serde_json::Value::as_f64).unwrap_or(d);
-        Self {
+        Ok(Self {
             max_sequence_length: i("max_sequence_length", 512) as i32,
             num_mask_token: i("num_mask_token", 4096) as i32,
             // The `vit_decoder` (`SimpleMLPAdaLN`) depth is fixed at 16 in the released checkpoint; the
@@ -134,7 +132,7 @@ impl PlannerKnobs {
             clip_diff_depth: 16,
             clip_diff_in_channels: cdi("z_channels", 3584) as i32,
             clip_diff_shift: cdf("shift", 2.0) as f32,
-        }
+        })
     }
 }
 
@@ -190,7 +188,7 @@ impl BerniniPlanner {
         // Kept dense (see the quant policy below) — small + the clip_diff runs the MAR flow loop.
         let connector = MlpConnector::from_weights(&cw, "")?;
 
-        let knobs = PlannerKnobs::from_dir(root);
+        let knobs = PlannerKnobs::from_dir(root)?;
         let vw = Weights::from_file(root.join("vit_decoder.safetensors"))?;
         let clip_diff = DiffLossFm::from_weights(
             &vw,
@@ -329,10 +327,7 @@ fn vae_encode_video(vae: &WanVae, frames: &[RgbImage], z_dim: usize, key: &Array
     drop_batch(&video_vae_latent(vae, &video, &eps)?)
 }
 
-/// Drop the leading batch dim of `[1, z, T, H, W]` → `[z, T, H, W]` (what `PackedForward` expects).
-fn drop_batch(z: &Array) -> Result<Array> {
-    Ok(z.reshape(&z.shape()[1..])?)
-}
+use crate::preprocess::drop_batch;
 
 /// The gen-target ViT grid `[t, h, w]` (sizes `n_query`, the MAR token count). For an image target
 /// (`frames == 1`) `t = 1`; for a video target the ViT samples `vit_fps` (= fps/8) frames from the
@@ -583,7 +578,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             config.model_type
         )));
     }
-    let knobs = BerniniKnobs::from_dir(&root);
+    let knobs = BerniniKnobs::from_dir(&root)?;
     Ok(Box::new(Bernini {
         descriptor: descriptor(),
         config,
@@ -653,10 +648,6 @@ impl Bernini {
         let mode = resolve_vit_mode(req.video_mode.as_deref(), has_video, has_image, out_video);
 
         // --- Stage 1: planner (loaded → 3 streams + MAR loop → freed) ---
-        on_progress(Progress::Step {
-            current: 0,
-            total: steps as u32,
-        });
         let planner = BerniniPlanner::load(&self.root, self.quant)?;
 
         // Preprocess the conditioning: videos first, then images (the conversation / source_id order).
@@ -742,6 +733,12 @@ impl Bernini {
             vit_txt_cfg: FullDefaults::VIT_TXT_CFG,
             vit_img_cfg: FullDefaults::VIT_IMG_CFG,
         };
+        // One folded Progress::Step bar across both compute stages (F-038): the multi-minute MAR
+        // planning loop (`planning_step` steps × 3 Qwen2.5-VL-7B forwards) occupies
+        // `1..=planning_step`, the renderer denoise `planning_step+1..=total` — monotone, complete,
+        // 1-based (the testkit progress contract).
+        let planner_steps = vit_cfg.planning_step as u32;
+        let total = planner_steps + steps as u32;
         if n_query > planner.knobs.num_mask_token {
             return Err(Error::Msg(format!(
                 "bernini: gen-target needs {n_query} ViT tokens but the planner has only {} mask \
@@ -770,6 +767,12 @@ impl Bernini {
             &order,
             &step_noise,
             &req.cancel,
+            &mut |p| {
+                on_progress(Progress::Step {
+                    current: p as u32,
+                    total,
+                })
+            },
             &planner.mask_token,
         )?;
         eval([
@@ -881,10 +884,11 @@ impl Bernini {
                 self.knobs.interpolate_src_id,
             );
             let boundary = self.knobs.switch_dit_boundary * cfg.num_train_timesteps as f32;
-            let total = steps as u32;
+            // Renderer denoise steps continue the folded bar after the planner stage (1-based `i`
+            // from `denoise_bernini_wvitcfg`): `planning_step+1 ..= total`.
             let mut on_step = |i: usize| {
                 on_progress(Progress::Step {
-                    current: i as u32,
+                    current: planner_steps + i as u32,
                     total,
                 })
             };
@@ -998,7 +1002,9 @@ fn seeded_permutation(n: i32, seed: u64) -> Result<Vec<i32>> {
     let noise = random::normal::<f32>(&[n], None, None, Some(&key))?;
     let vals = noise.as_slice::<f32>().to_vec();
     let mut idx: Vec<i32> = (0..n).collect();
-    idx.sort_by(|&a, &b| vals[a as usize].partial_cmp(&vals[b as usize]).unwrap());
+    // F-097: `total_cmp` gives a total order (NaN-safe, bit-stable) — `partial_cmp().unwrap()` would
+    // panic if the seeded noise ever produced a NaN. Behaviour-identical for the finite values here.
+    idx.sort_by(|&a, &b| vals[a as usize].total_cmp(&vals[b as usize]));
     Ok(idx)
 }
 

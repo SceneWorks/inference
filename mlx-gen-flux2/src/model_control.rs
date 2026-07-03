@@ -242,7 +242,7 @@ impl Flux2DevControl {
 
         let (prompt_embeds, text_ids) = self.encode(&req.prompt)?;
 
-        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref());
+        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref())?;
         let lat_h = (req.height / 16) as usize;
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
@@ -336,7 +336,7 @@ impl Generator for Flux2DevControl {
         // Shared capability floor (size/count/guidance/negative/accepted conditioning + multiple-of-16),
         // then the shared control-present check (sc-8241's `ControlBranch::require_control_present`).
         // `is_edit = false`: the control variant requires a *Control* image, not an edit reference.
-        validate_request(&self.descriptor, false, req)?;
+        validate_request(&self.descriptor, false, false, req)?;
         self.require_control_present(req)?;
         Ok(())
     }

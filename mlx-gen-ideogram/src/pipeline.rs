@@ -33,7 +33,7 @@ use mlx_gen::{CancelFlag, Error, LatentDecoder, Progress, Result};
 use mlx_gen_flux2::{patchify_latents, Flux2Vae};
 
 use crate::adapters::apply_ideogram_adapters;
-use crate::config::Ideogram4DitConfig;
+use crate::config::{Ideogram4DitConfig, MAX_TEXT_TOKENS};
 use crate::loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_unconditional_transformer, load_vae,
 };
@@ -47,8 +47,8 @@ pub const AE_SCALE: u32 = 8;
 const IMAGE_POSITION_OFFSET: i32 = 65536;
 const LLM_TOKEN_INDICATOR: i32 = 3;
 const OUTPUT_IMAGE_INDICATOR: i32 = 2;
-/// Reference `Ideogram4PipelineConfig.max_text_tokens` — a longer prompt is rejected by `_tokenize`.
-const MAX_TEXT_TOKENS: usize = 2048;
+// `MAX_TEXT_TOKENS` (the reference `Ideogram4PipelineConfig.max_text_tokens`) is the single
+// `config::MAX_TEXT_TOKENS` source (F-110) — a longer prompt is rejected by `_tokenize`.
 /// Per-step guidance schedule tail: the reference `DEFAULT_GUIDANCE_SCHEDULE` drops to 3.0 for the
 /// final `POLISH_STEPS` low-noise steps (the rest use the base guidance, typically 7.0).
 const POLISH_STEPS: usize = 3;
@@ -125,7 +125,7 @@ fn preprocess_source_image(image: &Image, width: u32, height: u32) -> Result<Arr
     let resized: Vec<f32> = if (ih, iw) == (th, tw) {
         image.pixels.iter().map(|&p| p as f32).collect()
     } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)?
     };
     let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
     Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))
@@ -163,7 +163,7 @@ fn preprocess_mask_packed(mask: &Image, width: u32, height: u32) -> Result<Array
             mask.width as usize,
             h,
             w,
-        );
+        )?;
         let u8s: Vec<u8> = resized
             .iter()
             .map(|&v| v.round().clamp(0.0, 255.0) as u8)
@@ -320,22 +320,6 @@ impl Ideogram4Pipeline {
         Ok(EditInit { z0, mask, strength })
     }
 
-    /// [`tokenize`](Self::tokenize) the prompt, then [`generate`](Self::generate) — the top-level
-    /// text-to-image entry point.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_from_prompt(
-        &self,
-        prompt: &str,
-        height: u32,
-        width: u32,
-        num_steps: usize,
-        guidance: f32,
-        seed: u64,
-    ) -> Result<Array> {
-        let ids = self.tokenize(prompt)?;
-        self.generate(&ids, height, width, num_steps, guidance, seed)
-    }
-
     /// Generate one image. `input_ids`: the chat-templated prompt tokens. Returns an RGB `[H, W, 3]`
     /// `uint8` array. No progress/cancellation — see
     /// [`generate_with_progress`](Self::generate_with_progress).
@@ -467,25 +451,28 @@ impl Ideogram4Pipeline {
         let ids = Array::from_slice(input_ids, &[1, num_text]);
         let attn = Array::from_slice(&vec![1i32; num_text as usize], &[1, num_text]);
         let te_out = self.te.prompt_embeds(&ids, &attn)?; // [1, num_text, llm_dim]
-        let llm_features = concatenate_axis(&[&te_out, &zeros(&[1, num_img, llm_dim])], 1)?; // [1, seq, llm_dim]
+        let llm_features = concatenate_axis(&[&te_out, &zeros(&[1, num_img, llm_dim])?], 1)?; // [1, seq, llm_dim]
 
         // ── Packed positions / segments / role indicators (host-built) ──
         let pack = Packing::build(num_text, grid_h, grid_w);
         let position_ids = Array::from_slice(&pack.position_ids, &[1, seq, 3]);
-        let segment_ids = Array::from_slice(&pack.segment_ids, &[1, seq]);
         let indicator = Array::from_slice(&pack.indicator, &[1, seq]);
+        // Step-invariant conditioning (role masks + MRoPE) built ONCE per branch, not per step (F-029).
+        // `segment_ids` are all `1` (a single packed segment), so the additive attention mask is
+        // identically zero and is dropped (`None`) rather than built/added every forward.
+        let cond_prep = self.cond.prepare(&position_ids, &indicator, 1, seq)?;
         // The unconditional (negative) branch runs over the image-only slice. Built only in quality
         // mode — turbo (`uncond=None`) skips it entirely, avoiding both the second DiT forward and
         // the large `neg_llm` zero tensor (num_img × 53248 f32, ~0.9 GB at 1024²).
-        let neg = self.uncond.as_ref().map(|uncond| {
-            (
-                uncond,
-                Array::from_slice(&pack.neg_position_ids, &[1, num_img, 3]),
-                Array::from_slice(&pack.neg_segment_ids, &[1, num_img]),
-                Array::from_slice(&pack.neg_indicator, &[1, num_img]),
-                zeros(&[1, num_img, llm_dim]),
-            )
-        });
+        let neg = match self.uncond.as_ref() {
+            Some(uncond) => {
+                let neg_position_ids = Array::from_slice(&pack.neg_position_ids, &[1, num_img, 3]);
+                let neg_indicator = Array::from_slice(&pack.neg_indicator, &[1, num_img]);
+                let neg_prep = uncond.prepare(&neg_position_ids, &neg_indicator, 1, num_img)?;
+                Some((uncond, neg_prep, zeros(&[1, num_img, llm_dim])?))
+            }
+            None => None,
+        };
 
         // ── Flow-matching schedule (mu/std from the V4 preset for this step count) ──
         // (mu, std) come from the reference V4 preset for this step count (NOT a caller-supplied
@@ -514,7 +501,7 @@ impl Ideogram4Pipeline {
             }
             None => noise.clone(),
         };
-        let text_z_padding = zeros(&[1, num_text, ch]);
+        let text_z_padding = zeros(&[1, num_text, ch])?;
         let img_range = Array::from_slice(&(num_text..seq).collect::<Vec<i32>>(), &[num_img]);
 
         // ── Flow-matching Euler denoise (high → low noise) ──
@@ -527,26 +514,14 @@ impl Ideogram4Pipeline {
             let t = Array::from_slice(&[t_val as f32], &[1]);
 
             let pos_z = concatenate_axis(&[&text_z_padding, &z], 1)?;
-            let pos_out = self.cond.forward(
-                &llm_features,
-                &pos_z,
-                &t,
-                &position_ids,
-                &segment_ids,
-                &indicator,
-            )?;
+            let pos_out =
+                self.cond
+                    .forward_prepared(&llm_features, &pos_z, &t, &cond_prep, None)?;
             let pos_v = pos_out.take_axis(&img_range, 1)?; // image-token velocities
 
             let v = match &neg {
-                Some((uncond, neg_position_ids, neg_segment_ids, neg_indicator, neg_llm)) => {
-                    let neg_v = uncond.forward(
-                        neg_llm,
-                        &z,
-                        &t,
-                        neg_position_ids,
-                        neg_segment_ids,
-                        neg_indicator,
-                    )?;
+                Some((uncond, neg_prep, neg_llm)) => {
+                    let neg_v = uncond.forward_prepared(neg_llm, &z, &t, neg_prep, None)?;
                     // Per-step asymmetric CFG: `v = gw·pos_v + (1−gw)·neg_v`. The reference uses a
                     // per-step guidance schedule (DEFAULT_GUIDANCE_SCHEDULE = 7.0 for the main steps,
                     // dropping to 3.0 for the final 3 "polish" steps) — a CONSTANT high guidance
@@ -646,19 +621,19 @@ impl Ideogram4Pipeline {
     }
 }
 
-/// f32 zeros of the given shape.
-fn zeros(shape: &[i32]) -> Array {
-    let n: i32 = shape.iter().product();
-    Array::from_slice(&vec![0f32; n as usize], shape)
+/// Device-side f32 zeros of the given shape (F-028). Previously built a host `vec![0f32; n]` and
+/// copied it up — at 1024² the LLM-feature padding + `neg_llm` are `num_img × 53248` f32 (~0.9 GB
+/// each, ×2 in quality mode), so materializing them on host was hundreds of MB of pointless traffic
+/// per render. `mlx_rs::ops::zeros` allocates them on device with no host round-trip.
+fn zeros(shape: &[i32]) -> Result<Array> {
+    Ok(mlx_rs::ops::zeros::<f32>(shape)?)
 }
 
 /// Host-built packed sequence metadata: text tokens (`LLM`) then image tokens (`IMAGE`).
 struct Packing {
     position_ids: Vec<i32>,
-    segment_ids: Vec<i32>,
     indicator: Vec<i32>,
     neg_position_ids: Vec<i32>,
-    neg_segment_ids: Vec<i32>,
     neg_indicator: Vec<i32>,
 }
 
@@ -687,13 +662,13 @@ impl Packing {
             neg_position_ids.extend_from_slice(&p);
             indicator.push(OUTPUT_IMAGE_INDICATOR);
         }
-        let seq = num_text + num_img;
+        // NOTE: the packed sequence is a single segment (segment_ids ≡ 1), so no segment tensor is
+        // stored — the DiT denoise runs with `mask = None` (F-029). The public `Ideogram4Transformer::
+        // forward` still accepts an explicit `segment_ids` for the parity golden.
         Self {
             position_ids,
-            segment_ids: vec![1; seq as usize],
             indicator,
             neg_position_ids,
-            neg_segment_ids: vec![1; num_img as usize],
             neg_indicator: vec![OUTPUT_IMAGE_INDICATOR; num_img as usize],
         }
     }

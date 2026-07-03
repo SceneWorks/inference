@@ -49,7 +49,7 @@ use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
     TrainAdapter,
 };
-use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::schedule::{lr_multiplier, schedule_updates, LrSchedule};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     gen_core, CancelFlag, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
@@ -590,7 +590,13 @@ impl WanMoeTrainer {
             }
             // Dual: high (index 1) on odd steps, low (index 0) on even. Dense: the single expert.
             let ei = if dual && step % 2 == 1 { 1 } else { 0 };
-            let (clean, ctxs) = &cache[((step - 1) as usize) % cache.len()];
+            // F-016: DECOUPLE the expert alternation from the item selection. With the old
+            // `(step-1) % cache.len()` index, step parity and item parity were locked, so an
+            // EVEN-sized dataset gave each expert only half the items for the whole run (expert 1
+            // saw odd-indexed items, expert 0 even-indexed). Advance the item index by one per
+            // `n_experts` steps instead so both experts sweep the full dataset.
+            let n_experts = if dual { 2 } else { 1 };
+            let (clean, ctxs) = &cache[(((step - 1) as usize) / n_experts) % cache.len()];
             let ctx = &ctxs[ei];
             let band = states[ei].band;
             let t = sample_band_timestep(
@@ -634,27 +640,11 @@ impl WanMoeTrainer {
             accumulate_grads(&mut st.accumulated, grads)?;
             // Fire an optimizer update every `accum` micro-steps for THIS expert (or on the final step).
             if st.micro.is_multiple_of(accum) || step == cfg.steps {
-                let mult = lr_multiplier(
-                    cfg.lr_scheduler,
-                    st.update_idx,
-                    st.total_updates,
-                    st.warmup_updates,
-                );
-                st.opt.set_lr_scaled(mult);
-                let avg = average_grads(
-                    st.accumulated
-                        .take()
-                        .expect("an update fires only after accumulation"),
-                    accum,
-                )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                st.opt.step(&mut st.params, &clipped)?;
-                eval(st.params.values())?;
-                st.update_idx += 1;
+                // F-017: average by the ACTUAL in-window count, not the full `accum`. The final-step
+                // flush is usually a partial window (cfg.steps % accum != 0); dividing by `accum`
+                // down-scaled that update (halved effective LR on the tail). Mirrors the z-image/lens
+                // F-069 fix. (z-image/lens port of sc-9097's shared floor.)
+                flush_expert_update(st, cfg.lr_scheduler, accum_window(st.micro, accum))?;
             }
 
             on_progress(TrainingProgress::Training {
@@ -729,6 +719,19 @@ impl WanMoeTrainer {
             }
         }
 
+        // F-017 (second half): the in-loop final-step flush covers only the expert that owns the
+        // FINAL step — the OTHER expert's pending partial window was silently discarded at loop
+        // exit (dual, steps=6, accum=2: expert 1's step-5 grad was dropped). Flush every remaining
+        // accumulator, each averaged by its own in-window count (`micro % accum`, non-zero whenever
+        // an accumulator is pending). Already-flushed full windows are untouched (bit-exact); a
+        // cancel break likewise applies its pending partial rather than discarding trained work
+        // (the run only saves below when `steps_run > 0`).
+        for st in &mut states {
+            if st.accumulated.is_some() {
+                flush_expert_update(st, cfg.lr_scheduler, accum_window(st.micro, accum))?;
+            }
+        }
+
         // Cancelled before completing a single step (`steps == 0` is rejected upstream by
         // `validate`): the adapter factors are still freshly initialized with `B = 0`, a no-op
         // adapter. Surface the typed `Error::Canceled` (sc-4895, bridged 1:1 to
@@ -764,6 +767,40 @@ impl WanMoeTrainer {
             final_loss: last_loss,
         })
     }
+}
+
+/// Grad-accumulation averaging window for a flush fired after `micro` accumulated micro-steps:
+/// the full `accum` on a window boundary, else the in-window remainder (always ≥ 1 — a flush only
+/// fires with at least one pending micro-step). Pure; pinned by the `accum_window_math` test.
+fn accum_window(micro: u32, accum: u32) -> u32 {
+    if micro.is_multiple_of(accum) {
+        accum
+    } else {
+        micro % accum
+    }
+}
+
+/// One optimizer update from `st`'s pending grad accumulator, averaged by `window` (the actual
+/// in-window micro-step count, F-017). Shared by the in-loop window/final-step flush and the
+/// loop-exit tail flush so both fire the identical update sequence.
+fn flush_expert_update(st: &mut ExpertState, schedule: LrSchedule, window: u32) -> Result<()> {
+    let mult = lr_multiplier(schedule, st.update_idx, st.total_updates, st.warmup_updates);
+    st.opt.set_lr_scaled(mult);
+    let avg = average_grads(
+        st.accumulated
+            .take()
+            .expect("an update fires only after accumulation"),
+        window,
+    )?;
+    let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
+    let clipped: LoraParams = clipped
+        .into_iter()
+        .map(|(k, v)| (k, v.into_owned()))
+        .collect();
+    st.opt.step(&mut st.params, &clipped)?;
+    eval(st.params.values())?;
+    st.update_idx += 1;
+    Ok(())
 }
 
 /// Per-expert adapter filename: `{stem}.{suffix}{ext}` (final) or `{stem}-step{step:06}.{suffix}{ext}`
@@ -1057,6 +1094,30 @@ fn decode_image(path: &Path) -> Result<Image> {
         height,
         pixels: rgb.into_raw(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accum_window;
+
+    /// F-017: pins the grad-accum averaging-window math — the full `accum` on a window boundary,
+    /// the in-window remainder on a partial (final-step / loop-exit tail) flush.
+    #[test]
+    fn accum_window_math() {
+        // No accumulation: every flush is a 1-window.
+        assert_eq!(accum_window(1, 1), 1);
+        assert_eq!(accum_window(7, 1), 1);
+        // Boundary flushes: the full window.
+        assert_eq!(accum_window(2, 2), 2);
+        assert_eq!(accum_window(4, 2), 2);
+        assert_eq!(accum_window(6, 3), 3);
+        // Partial tail flushes — the F-017 shapes (dual, steps=6, accum=2: each expert sees 3
+        // micro-steps = one full window + a pending 1-step tail).
+        assert_eq!(accum_window(3, 2), 1);
+        assert_eq!(accum_window(5, 2), 1);
+        assert_eq!(accum_window(7, 3), 1);
+        assert_eq!(accum_window(8, 3), 2);
+    }
 }
 
 // ===========================================================================================

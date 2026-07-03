@@ -2,15 +2,15 @@
 members = ["gen-core", "gen-core-testkit", "mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-clip", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-bernini", "mlx-gen-scail2", "mlx-gen-face", "mlx-gen-pulid", "mlx-gen-instantid", "mlx-gen-svd", "mlx-gen-joycaption", "mlx-gen-sam2", "mlx-gen-sam3", "mlx-gen-sensenova", "mlx-gen-kolors", "mlx-gen-chroma", "mlx-gen-lens", "mlx-gen-seedvr2", "mlx-gen-ideogram", "mlx-gen-boogu", "mlx-gen-krea", "mlx-gen-pid", "mlx-gen-sd3", "mlx-gen-depth", "mlx-gen-sana"]
 resolver = "2"
 
-# Single source of truth for the deps shared across the root and all 16 member crates (F-151). The
-# next MLX/fork bump (sc-2517/2772/2781 etc.) is now a one-line edit here instead of 17 synchronized
-# ones — a missed crate would otherwise produce two distinct `mlx-rs` builds, cross-crate `Array`
-# type-mismatch errors, and a doubled (very expensive) MLX-from-source build. Members opt in with
-# `<dep> = { workspace = true }`.
+# Single source of truth for the deps shared across the root and all 31 member crates (F-151). The
+# next MLX/fork bump (sc-2517/2772/2781 etc.) is now a one-line edit here instead of dozens of
+# synchronized per-crate ones — a missed crate would otherwise produce two distinct `mlx-rs` builds,
+# cross-crate `Array` type-mismatch errors, and a doubled (very expensive) MLX-from-source build.
+# Members opt in with `<dep> = { workspace = true }`.
 [workspace.dependencies]
 # mlx-rs fork pinned to our own GitHub copy by commit SHA (supply-chain capture — immune to the
 # upstream fork being yanked/deleted). `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX
-# core v0.31.1 (vs upstream mlx-rs 0.25.3, welded to MLX 0.25.1 — 2–3.6× slower Metal kernels).
+# core v0.31.2 (vs upstream mlx-rs 0.25.3, welded to MLX 0.25.1 — 2–3.6× slower Metal kernels).
 # The mlx-c C layer is a submodule of ml-explore/mlx-c (Apple) at v0.6.0; pmetal's delta is
 # additive Rust bindings only. Aliased as `mlx-rs` so `use mlx_rs::…` is unchanged.
 # SHA e59ffd88 = 1f293623 + the sc-2781 MLX 0.31.1->0.31.2 bump (+ a TEMPORARY mlx-c fft FFTNorm patch
@@ -52,9 +52,26 @@ sceneworks-gen-core-testkit = { path = "gen-core-testkit" }
 # core-llm (gen-core re-exports it as `gen_core::core_llm`, mirroring how mlx-gen re-exports gen-core),
 # so the gen-ai side runs its LLM providers through the unified `core_llm::TextLlm` engine instead of
 # the duplicate `gen_core::TextLlm`. core-llm is tensor-free (thiserror/inventory/tokenizers/serde_json/
-# minijinja) so this preserves gen-core's zero-tensor invariant. Branch-pinned to match the mlx-llm
-# convention; cargo unifies on one core-llm across the graph. See sc-7189.
+# minijinja) so this preserves gen-core's zero-tensor invariant. Deliberately `branch = "main"`, NOT
+# a rev pin (F-048): mlx-llm (pinned just below) declares core-llm at `branch = "main"`, and cargo
+# treats `?branch=main` and `?rev=…` as DISTINCT source ids even at the identical commit — a rev pin
+# here would put TWO core-llm packages in the lock, splitting the `inventory` registry statics so
+# mlx-llm's providers register into one core-llm instance while gen-core resolves through the other
+# (JoyCaption provider lookup breaks at runtime; the exact two-builds failure mode the mlx-llm pin
+# below exists to prevent). The commit is frozen by Cargo.lock + `--locked` in CI instead, so a
+# changed core-llm is still a deliberate, reviewed re-lock rather than silent drift. True rev-pinning
+# requires mlx-llm's own core-llm dep to move off `branch = "main"` upstream first; until then both
+# must stay on the branch source id. See sc-7189 / sc-9109.
 core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+# The shared on-device LLM engine (KV cache + sampler + RoPE): the only MLX-backed LLM decode runtime.
+# Pinned to the SAME rev the SceneWorks worker pins so cargo unifies ONE mlx-llm — one `Array`, one
+# `core-llm` — across the worker dependency graph (the worker also depends on mlx-llm directly for
+# prompt-refine). Both mlx-gen and mlx-llm build the identical pmetal `mlx-rs`, so there is a single
+# MLX build and one `Array` type. Hoisted here (F-049) from the 3 crates that copy-pasted it
+# (joycaption + flux2 + sensenova, sensenova once more as a dev-dep): a single source of truth so a
+# divergent pin — the failure mode workspace.dependencies exists to prevent — cannot reintroduce the
+# two-Array-builds class. Bump in lockstep with core-llm + the worker.
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }
 thiserror = "2"
 # Link-time model registration (the DI-container stand-in; see docs/MODEL_ARCHITECTURE.md §4).
 inventory = "0.3"
@@ -69,6 +86,12 @@ safetensors = "0.4"
 # per-module `alpha_pattern`/`rank_pattern`) in gen-core's weights-metadata layer (sc-5513). Already
 # in the lock transitively via safetensors; surfaced as a direct dep for the blob parser.
 serde_json = "1"
+# PNG/JPEG decode for the e2e parity tests' visual-dump fixtures (every family test crate dev-depends
+# on it). Hoisted here (F-115): the per-crate pins had drifted to two feature sets (`["png"]` vs
+# `["png","jpeg"]`), so a crate that loads a JPEG fixture would silently need the wider set. The
+# superset `["png","jpeg"]` is the safe default for a dev-only dep (additive; crates that only render
+# PNG pay nothing extra at runtime).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [package]
 name = "mlx-gen"
@@ -89,3 +112,7 @@ sceneworks-gen-core = { workspace = true }
 thiserror = { workspace = true }
 inventory = { workspace = true }
 tokenizers = { workspace = true }
+# The hoisted turnkey converter glue (quant::write_quantized_config, F-045) writes the packed
+# snapshot's config.json `"quantization"` marker; the per-crate converters already used serde_json,
+# now the shared core copy does.
+serde_json = { workspace = true }

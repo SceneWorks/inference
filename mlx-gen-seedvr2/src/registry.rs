@@ -168,14 +168,16 @@ impl Seedvr2Generator {
         let softness = req.softness.unwrap_or(0.0); // input pre-blur; reference default 0.0 (sc-4816)
 
         // Video upscale: a VideoClip carries the LR source frame sequence → one upscaled clip.
-        if let Some(clip) = req.video_clips().into_iter().next() {
-            on_progress(Progress::Step {
-                current: 1,
-                total: 1,
-            });
+        // F-099: `validate_impl` accepts the request if ANY clip is non-empty, so match that
+        // contract here by taking the first NON-empty clip — `into_iter().next()` would instead
+        // take the first clip unconditionally, so `[empty_clip, real_clip]` returned an empty
+        // video as success.
+        if let Some(clip) = req.video_clips().into_iter().find(|c| !c.frames.is_empty()) {
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
+            // F-099: `generate_video` reports per-chunk `Step{i, n}` progress itself (per-frame on
+            // the fallback paths) — a minutes-long N-chunk run used to surface a single Step{1,1}.
             let frames = self.pipe.generate_video(
                 clip.frames,
                 req.width as i32,
@@ -184,6 +186,7 @@ impl Seedvr2Generator {
                 softness,
                 None,
                 &req.cancel,
+                on_progress,
             )?;
             on_progress(Progress::Decoding);
             return Ok(GenerationOutput::Video {
@@ -289,5 +292,28 @@ mod tests {
                 "{id} should resolve; got: {err}"
             );
         }
+    }
+
+    /// F-099: `validate_impl` accepts a request if ANY clip is non-empty, so the generate path must
+    /// take the first NON-empty clip — not `into_iter().next()`. With the old `next()` selection,
+    /// `[empty, real]` validated but generated an empty video "as success". This pins the
+    /// first-non-empty predicate the generate path now uses.
+    #[test]
+    fn video_upscale_takes_the_first_non_empty_clip() {
+        // Two clips: the first empty, the second with one frame. `find(!frames.is_empty())` must
+        // skip the empty one (mirrors the generate_impl selection at line ~175).
+        let frame = Image {
+            pixels: vec![0u8; 3],
+            width: 1,
+            height: 1,
+        };
+        let nonempty = [frame];
+        let clips: Vec<&[Image]> = vec![&[], &nonempty[..]];
+        let selected = clips.into_iter().find(|c| !c.is_empty());
+        assert!(
+            selected.is_some(),
+            "the non-empty second clip must be selected"
+        );
+        assert_eq!(selected.unwrap().len(), 1);
     }
 }

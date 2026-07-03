@@ -145,6 +145,14 @@ pub fn denoise(
 /// `guidance == 1.0` (or `neg_cap_feats == None`) collapses to a single cond forward — identical to the
 /// Turbo loop — so a base request with `guidance=1` costs the same as Turbo. `start_step` mirrors the
 /// base loop (`0` for txt2img, [`init_time_step`] for img2img).
+///
+/// **CFG gate (F-093, reference-verified):** the `guidance != 1.0` skip is CORRECT and bit-identical,
+/// NOT the sana/diffusers `guidance_scale > 1.0`. mlx-gen (like the mflux fork) uses the *shifted*
+/// guidance convention `v = v_uncond + guidance·(v_cond − v_uncond)`, so `guidance == 1.0` yields
+/// exactly `v_cond` — running the uncond forward would be wasted. The diffusers `ZImagePipeline` gates
+/// on `_guidance_scale > 0` with the un-shifted formula `pred = cond + scale·(cond − uncond)`; its
+/// `scale == 0` (CFG off) is precisely this convention's `guidance == 1.0` (`scale = guidance − 1`), so
+/// the two gates agree. Do NOT "fix" this to `> 1.0`.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_cfg_with_progress(
     transformer: &ZImageTransformer,
@@ -403,14 +411,22 @@ pub(crate) fn encode_prompt(
 /// [`encode_prompt`], an **empty** caption is legitimate here — it is the unconditional embedding the
 /// CFG uncond branch consumes.
 ///
-/// An empty negative prompt must NOT go through [`TextTokenizer::tokenize`]: gen-core short-circuits an
-/// empty prompt to a `[1, 0]` sequence **before** the chat template is applied
-/// (`pad_to_max_length = false`), so it would trip the size-0 guard below and error — the exact trap
-/// fixed on the candle backend by candle sc-8646; this is the MLX twin (sc-8958). Instead render the
-/// QwenInstruct scaffolding around `""` via [`TextTokenizer::encode_chat_ids`]
-/// (`<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n`); every
-/// templated token is valid, so the attention mask is all-ones — identical to the non-padded `tokenize`
-/// output for a real caption. A non-empty negative prompt takes the ordinary `tokenize` path.
+/// For an empty negative prompt we render the QwenInstruct chat scaffolding around `""` directly via
+/// [`TextTokenizer::encode_chat_ids`] (`<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n`) rather
+/// than going through [`TextTokenizer::tokenize`]. The templated tokens are all valid, so the
+/// attention mask is all-ones. This mirrors the non-padded `tokenize` output for a real caption and
+/// matches the diffusers/Qwen reference uncond (the base-CFG-with-unset-negative path that sc-8958
+/// fixed). A non-empty negative prompt takes the ordinary `tokenize` path.
+///
+/// Rationale note (sc-8958 / review F-031): an earlier comment justified this on the grounds that
+/// gen-core short-circuits an empty prompt to a `[1, 0]` sequence "before the chat template is applied
+/// (`pad_to_max_length = false`)", which would trip the size-0 guard below. That mechanism **cannot
+/// fire here**: z-image builds its tokenizer with `pad_to_max_length: true` (loader.rs), and gen-core's
+/// empty→`[1,0]` short-circuit is gated on `!pad_to_max_length` (tokenizer.rs). The real reason to
+/// render the scaffolding directly is fidelity + cost: it produces the diffusers-correct uncond
+/// embedding without depending on max-length padding. (No MLX-side failure was ever reproduced for the
+/// original sc-8958 report; the candle-side sc-8646 trap it cited was real, but does not apply to the
+/// MLX backend under `pad_to_max_length: true`.)
 pub(crate) fn encode_uncond(
     tokenizer: &TextTokenizer,
     text_encoder: &TextEncoder,
