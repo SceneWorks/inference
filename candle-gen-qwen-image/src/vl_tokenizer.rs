@@ -74,9 +74,12 @@ pub fn preprocess_edit_image(
     let resized: Vec<u8> = if (image.height, image.width) == (ch, cw) {
         image.data.to_vec()
     } else {
+        // `resize_bicubic_u8` already returns integer-valued, [0,255]-clamped f32; the `round().clamp()`
+        // is an explicit/defensive u8 quantization matching the sibling `image_processor` path
+        // (byte-identical here — not a bug fix).
         resize_bicubic_u8(image.data, image.height, image.width, ch, cw)
             .iter()
-            .map(|&v| v as u8)
+            .map(|&v| v.round().clamp(0.0, 255.0) as u8)
             .collect()
     };
 
