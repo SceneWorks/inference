@@ -147,7 +147,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// — differing only by the preprocessor-produced control image (no mode index, S0). Spelled out as
 /// `Only([Pose, Canny, Depth])` so a free-form `ControlKind::Other` is rejected rather than silently
 /// coerced into the union path. A free function so the policy is unit-testable without a loaded model.
-fn accepted_kinds() -> AcceptedControlKinds {
+/// `pub(crate)` so the Turbo variant (same Fun-Controlnet-Union checkpoint) shares it — F-089: the
+/// turbo variant previously fell back to `AcceptedControlKinds::Any`, accepting `Other("scribble")`
+/// the base rejects, an inconsistent contract on the same weights.
+pub(crate) fn accepted_kinds() -> AcceptedControlKinds {
     AcceptedControlKinds::Only(vec![
         ControlKind::Pose,
         ControlKind::Canny,
@@ -228,7 +231,7 @@ impl ZImageControl {
             SCHEDULE_SHIFT.ln(),
             steps,
             &native.sigmas,
-        ));
+        ))?;
 
         // The 33ch control context is constant across steps + the batch + both CFG branches — build
         // once. It stays **f32** (the fork feeds it f32, which promotes the whole control branch to f32).

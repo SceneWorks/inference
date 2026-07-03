@@ -119,7 +119,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // quantize the TE+VAE, hence sc-2532; do not generalize that here.)
     let mut transformer = loader::load_transformer(root)?;
     if let Some(q) = spec.quantize {
-        transformer.quantize(q.bits())?;
+        // F-076: reject a requested-vs-packed quant-tier mismatch instead of silently serving the
+        // snapshot's tier; skip the no-op quantize when the turnkey is already packed at the
+        // requested bits (see `loader::needs_load_time_quant`).
+        if loader::needs_load_time_quant(root, q.bits(), MODEL_ID)? {
+            transformer.quantize(q.bits())?;
+        }
     }
     // LoRA/LoKr (sc-2528): applied after quantization, as forward-time residuals over the
     // (possibly quantized) transformer — fork-faithful. No-op when `spec.adapters` is empty.

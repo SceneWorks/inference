@@ -58,10 +58,21 @@ const LONG_SEQ_TOKEN_THRESHOLD: usize = 10_000;
 /// reference `i` is tagged at `t = REFERENCE_TIME_STRIDE * (i + 1)` (10, 20, 30, …) so each edit
 /// reference occupies its own time band, distinct from the target's `t = 0`. The stride must exceed a
 /// single reference's t-extent (1, since each ref is one packed grid at a fixed t) to avoid two refs
-/// colliding on the same time index; at the `MultiReference` capability cap (`max_count = 8`) the band
-/// tops out at `t = 80`, well inside the RoPE t-axis range. Named so the invariant is explicit rather
-/// than a bare `10 + 10*i`.
+/// colliding on the same time index; at the [`MAX_EDIT_REFERENCES`] cap (8) the band tops out at
+/// `t = 80`, well inside the RoPE t-axis range. Named so the invariant is explicit rather than a bare
+/// `10 + 10*i`.
 const REFERENCE_TIME_STRIDE: i32 = 10;
+
+/// F-027: hard cap on the number of edit references a single request may supply. Each reference adds
+/// ~4096 joint-DiT tokens (sc-6124 measured ~104 GB peak with 2 UNBOUNDED refs at 1024² → quadratic
+/// SDPA + OOM from request input), and the RoPE time band tops out at `REFERENCE_TIME_STRIDE * 8 = 80`
+/// (the [`REFERENCE_TIME_STRIDE`] invariant). This constant is the ONLY enforcement of that invariant:
+/// `Capabilities::max_count` bounds `req.count` (the output batch size), NOT the reference count, so
+/// the shared capability floor never caps references — previously `collect_edit_references` flattened
+/// every Reference/MultiReference with no bound. Checked both in `validate_request` (up-front worker
+/// rejection) and `collect_edit_references` (the generate path). Request-input OOM is the repo's
+/// historical highest-severity class.
+const MAX_EDIT_REFERENCES: usize = 8;
 
 /// Sanitize model-generated text for a single-line, machine-parsed log record (the worker consumes
 /// the `ENHANCED_PROMPT:` / `ENHANCER_FALLBACK:` prefix): replace every control/whitespace char (incl.
@@ -178,11 +189,14 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     // (the loaders read the per-component `quantization` manifest, sc-5917). The VAE is identical.
     // Both dev variants (txt2img + edit) load the same snapshot through these loaders.
     let dev = variant.is_dev();
+    // For dev, parse the ~45 GB `text_encoder/` shard set ONCE and build the Mistral language tower,
+    // the Pixtral vision tower, and the multimodal projector from the same `Weights` (F-112) — the
+    // vision tower + projector are consumed after quantization below. klein has neither.
+    let mut dev_vision: Option<(PixtralVisionTower, Mistral3Projector)> = None;
     let (mut text_encoder, mut transformer) = if dev {
-        (
-            loader::load_text_encoder_dev(root)?,
-            loader::load_transformer_dev(root)?,
-        )
+        let (encoder, vision_tower, projector) = loader::load_dev_text_encoder_group(root)?;
+        dev_vision = Some((vision_tower, projector));
+        (encoder, loader::load_transformer_dev(root)?)
     } else {
         (
             loader::load_text_encoder(root)?,
@@ -219,13 +233,9 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     // (the `text_encoder/` snapshot's `vision_tower.*` / `multi_modal_projector.*`, full precision).
     // The Mistral generation head (final norm + LM head) was loaded into `text_encoder` by
     // `load_text_encoder_dev`. klein has no vision tower → `None` (caption upsampling is unavailable).
-    let (vision_tower, projector) = if dev {
-        (
-            Some(loader::load_vision_tower_dev(root)?),
-            Some(loader::load_multimodal_projector_dev(root)?),
-        )
-    } else {
-        (None, None)
+    let (vision_tower, projector) = match dev_vision {
+        Some((vt, proj)) => (Some(vt), Some(proj)),
+        None => (None, None),
     };
     // PiD decoder overlay (epic 7840, sc-7847): load the `flux2` student + Gemma caption encoder once
     // when the spec carries it. The student is shared across the whole FLUX.2 family (klein + dev).
@@ -381,6 +391,17 @@ impl Flux2 {
             return Err(Error::Msg(format!(
                 "{}: edit requires at least one reference image",
                 self.descriptor.id
+            )));
+        }
+        // F-027: cap the reference count — each ref adds ~4096 joint-DiT tokens (quadratic SDPA + a
+        // request-input OOM class); see [`MAX_EDIT_REFERENCES`]. Also enforced in `validate_request`
+        // so `validate()` rejects up front; this generate-path check covers direct callers.
+        if refs.len() > MAX_EDIT_REFERENCES {
+            return Err(Error::Msg(format!(
+                "{}: edit supports at most {MAX_EDIT_REFERENCES} reference images (got {}); \
+                 each adds ~4096 joint-DiT tokens",
+                self.descriptor.id,
+                refs.len()
             )));
         }
         Ok(refs)
@@ -558,7 +579,7 @@ pub(crate) fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32)
 }
 
 mlx_gen::impl_generator!(Flux2 {
-    validate: |s, req| validate_request(&s.descriptor, s.variant.is_edit(), req),
+    validate: |s, req| validate_request(&s.descriptor, s.variant.is_edit(), s.variant.is_kv(), req),
     generate: generate_impl,
 });
 
@@ -621,7 +642,7 @@ impl Flux2 {
             None
         };
 
-        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref());
+        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref())?;
         let lat_h = (req.height / 16) as usize;
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
@@ -718,12 +739,16 @@ impl Flux2 {
         // (sc-8234: ArcFace 0.60 → 0.38 under a strong scene prompt). With `s > 1` the denoise
         // extrapolates the with-reference velocity against the reference-dropped (image-unconditional)
         // velocity: `v = v_img0 + s·(v_ref − v_img0)`, reusing the existing `include_ref=false` forward
-        // (the kv-cache code path). The `FLUX2_IMG_GUIDANCE` env var overrides `req.image_guidance`
-        // (debug). Scoped to the non-kv edit path (a reference present, no KV cache — checked per step).
-        let img_guidance: Option<f32> = std::env::var("FLUX2_IMG_GUIDANCE")
+        // (the non-kv-cache code path). `req.image_guidance` wins; `FLUX2_IMG_GUIDANCE` is a debug
+        // fallback only (F-087: the env previously *overrode* the request, leaking pixel changes
+        // untraceably). Scoped to the non-kv edit path — a reference present with no KV cache; the kv
+        // variant rejects `image_guidance` in `validate_impl` (it would silently no-op here otherwise).
+        let img_guidance_debug = std::env::var("FLUX2_IMG_GUIDANCE")
             .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok())
-            .or(req.image_guidance)
+            .and_then(|s| s.trim().parse::<f32>().ok());
+        let img_guidance: Option<f32> = req
+            .image_guidance
+            .or(img_guidance_debug)
             .filter(|s| *s > 1.0 && reference.is_some());
 
         let sampler_name = req.sampler.as_deref();
@@ -827,6 +852,7 @@ impl Flux2 {
 pub(crate) fn validate_request(
     desc: &ModelDescriptor,
     is_edit: bool,
+    is_kv: bool,
     req: &GenerationRequest,
 ) -> Result<()> {
     // Empty-prompt first so it wins over the shared floor for a bare default request.
@@ -849,9 +875,33 @@ pub(crate) fn validate_request(
     // `generate` (`collect_edit_references`); surface it at validate time — mirroring
     // `Flux2DevControl`'s `require_control_present` — so an editor rejects a reference-less request up
     // front instead of after loading and starting the run.
-    if is_edit && collect_reference_images(req).is_empty() {
+    if is_edit {
+        let n_refs = collect_reference_images(req).len();
+        if n_refs == 0 {
+            return Err(Error::Msg(format!(
+                "{}: edit requires at least one reference image",
+                desc.id
+            )));
+        }
+        // F-027: mirror `collect_edit_references`' reference cap at validate time (same F-088
+        // rationale) so a worker's `validate()` rejects an over-cap request — e.g. 50 refs, a
+        // quadratic-SDPA OOM — up front instead of after loading and starting the run.
+        if n_refs > MAX_EDIT_REFERENCES {
+            return Err(Error::Msg(format!(
+                "{}: edit supports at most {MAX_EDIT_REFERENCES} reference images (got {n_refs}); \
+                 each adds ~4096 joint-DiT tokens",
+                desc.id
+            )));
+        }
+    }
+    // F-087: image-guidance CFG runs only on the non-kv edit path (it needs the uncached
+    // `include_ref=false` forward). On the kv variant a set `image_guidance` would silently no-op
+    // (the cached step's `cache_ref` is `Some`, so the extrapolation arm never fires) — reject it
+    // up front instead of letting the request appear to succeed while doing nothing.
+    if is_kv && req.image_guidance.is_some() {
         return Err(Error::Msg(format!(
-            "{}: edit requires at least one reference image",
+            "{}: image_guidance is not supported on the kv-edit variant \
+             (it would be silently ignored — the cached reference path can't run the dropped-ref CFG)",
             desc.id
         )));
     }
@@ -1086,6 +1136,46 @@ mod tests {
         // The txt2img variant tolerates no reference.
         let t2i = Flux2::new_for_tests(Flux2Variant::Klein9b);
         assert!(t2i.validate(&req).is_ok());
+    }
+
+    #[test]
+    fn edit_over_cap_references_rejected() {
+        // F-027: more than `MAX_EDIT_REFERENCES` refs is rejected at BOTH `validate` (up-front worker
+        // rejection) and the generate-path collector; exactly the cap is accepted.
+        let model = Flux2::new_for_tests(Flux2Variant::Klein9bEdit);
+        let over = GenerationRequest {
+            prompt: "combine these".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![Image::default(); MAX_EDIT_REFERENCES + 1],
+            }],
+            ..Default::default()
+        };
+        let err = model.validate(&over).unwrap_err().to_string();
+        assert!(
+            err.contains("at most 8 reference images (got 9)"),
+            "validate should reject an over-cap request, got: {err}"
+        );
+        let err = model
+            .collect_edit_references(&over)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("at most 8 reference images (got 9)"),
+            "generate-path collector should reject an over-cap request, got: {err}"
+        );
+        // At the cap: both paths accept.
+        let at_cap = GenerationRequest {
+            prompt: "combine these".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![Image::default(); MAX_EDIT_REFERENCES],
+            }],
+            ..Default::default()
+        };
+        model.validate(&at_cap).unwrap();
+        assert_eq!(
+            model.collect_edit_references(&at_cap).unwrap().len(),
+            MAX_EDIT_REFERENCES
+        );
     }
 
     // ---- sc-5919 FLUX.2-dev edit (DiT-concat reference conditioning) ---------------------------

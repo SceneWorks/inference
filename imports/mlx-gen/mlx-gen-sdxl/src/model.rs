@@ -310,7 +310,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
     let cfg = DiffusionConfig::sdxl_base();
     let alpha_schedule =
-        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end)?;
+        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
@@ -357,6 +357,16 @@ impl Sdxl {
             && !is_accel
             && sampler_name != "euler_ancestral";
         let use_curated = !is_accel && (sampler_curated || scheduler_curated);
+        // F-082: the accel samplers build their own distilled few-step schedule, so a request pairing
+        // one with a curated σ scheduler used to validate and then silently drop the scheduler.
+        // Reject the combination instead of misreporting the request as honored.
+        if is_accel && scheduler_curated {
+            return Err(Error::Msg(format!(
+                "sdxl: the {sampler_name:?} acceleration sampler uses its own distilled schedule \
+                 and cannot honor the {:?} scheduler — drop `scheduler` (or pick a curated sampler)",
+                req.scheduler.as_deref().unwrap_or_default()
+            )));
+        }
         // Per-variant defaults for the few-step samplers; the production defaults otherwise.
         let (def_steps, def_cfg, eta) = if is_accel {
             accel_defaults(sampler_name)

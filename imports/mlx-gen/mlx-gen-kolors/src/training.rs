@@ -44,10 +44,10 @@
 //!     ([`mlx_gen_sdxl::apply_sdxl_adapters`]): LoRA targets the **complete** attention surface
 //!     (down/mid/up `to_q/k/v/to_out.0`) under the PEFT prefix `base_model.model.unet.`; LoKr targets
 //!     the **vendored** surface (down/up attention only — the SDXL LoKr loader keeps `mid_block` out,
-//!     sc-2640) and reconstructs at **f32** (the SDXL/Kolors merge dtype). (Wiring this LoRA into the
-//!     Kolors *inference* registry — which today rejects `spec.adapters` — is a separate follow-on, the
-//!     sc-3874 note; the produced adapter already reloads through the SDXL inference path, validated by
-//!     `tests/trainer_e2e.rs`.)
+//!     sc-2640) and reconstructs at **f32** (the SDXL/Kolors merge dtype). The Kolors inference
+//!     registry applies `spec.adapters` (LoRA/LoKr merged into the dense U-Net before quantization
+//!     since sc-4733), so the produced adapter reloads through the Kolors inference path directly
+//!     (validated by `tests/trainer_e2e.rs`).
 
 use mlx_gen::sampler::AlphaSchedule;
 use mlx_gen::weights::Weights;
@@ -66,12 +66,8 @@ use mlx_gen_sdxl::{
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
 use crate::model::{kolors_time_ids, render_sample};
 use crate::registry::MODEL_ID;
-use crate::sampler::NUM_TRAIN_TIMESTEPS;
+use crate::sampler::{BETA_END, BETA_START, NUM_TRAIN_TIMESTEPS};
 use crate::tokenizer::KolorsTokenizer;
-
-/// Kolors `scaled_linear` betas — `β₀ = 0.00085`, `β₁ = 0.014` (the [`KolorsEulerSampler`] config).
-const BETA_START: f32 = 0.00085;
-const BETA_END: f32 = 0.014;
 
 /// The Kolors family deltas behind the shared [`train_family`] backbone (sc-7781): the ChatGLM3-6B
 /// encoder + its tokenizer, and the DDPM `alphas_cumprod` schedule that drives the noising. Held in
@@ -227,7 +223,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
                 None,
                 Dtype::Bfloat16,
             )?),
-            schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END)?,
+            schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END),
         },
     }))
 }
@@ -247,6 +243,11 @@ impl Trainer for KolorsTrainer {
         }
         if req.config.rank == 0 {
             return Err("kolors trainer: rank must be > 0".into());
+        }
+        // F-023: steps == 0 makes the `1..=steps` loop empty and the run returns `Canceled`. z-image
+        // checks it; mirror (the sdxl-family comment claiming upstream rejection was false).
+        if req.config.steps == 0 {
+            return Err("kolors trainer: steps must be > 0".into());
         }
         if !TrainOptimizer::is_supported(&req.config.optimizer) {
             return Err(format!(
@@ -386,8 +387,7 @@ mod first_step_repro {
                     ChatGlmModel::from_weights(&te_w, ChatGlmConfig::chatglm3_6b(), None, dtype)
                         .unwrap(),
                 ),
-                schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END)
-                    .unwrap(),
+                schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END),
             },
         };
         let cfg = TrainingConfig {
