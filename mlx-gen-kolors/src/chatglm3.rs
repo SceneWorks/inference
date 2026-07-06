@@ -40,7 +40,7 @@ use mlx_rs::ops::{
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::silu;
-use mlx_gen::quant::DEFAULT_GROUP_SIZE;
+use mlx_gen::quant::{packed_bits, DEFAULT_GROUP_SIZE};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -109,8 +109,12 @@ enum ChatGlmLinear {
 
 impl ChatGlmLinear {
     /// Load `{key}.weight` (+ `.scales`/`.biases` when quantized) and, when `with_bias`, `{key}.bias`.
-    /// Quantized iff `quant` is `Some` and `{key}.scales` is present. All non-packed tensors cast to
-    /// `dtype` (the compute dtype).
+    /// **Packed-detect (sc-9946):** a projection loads `Quant` iff `{key}.scales` is present on disk (a
+    /// pre-quantized turnkey tier, [`crate::convert`]), **independent of** the `quant` arg — the
+    /// bit-width is inferred from the packed shapes via [`packed_bits`] at the codebase-default group
+    /// size, so a Q4/Q8 tier loads with no quant manifest to thread. An explicit `quant` (the sc-3096
+    /// selective path) still overrides the geometry when supplied. Dense otherwise. All non-packed
+    /// tensors cast to `dtype` (the compute dtype); the u32 codes are kept as-is.
     fn load(
         w: &Weights,
         key: &str,
@@ -123,20 +127,29 @@ impl ChatGlmLinear {
         } else {
             None
         };
-        match (quant, w.get(&format!("{key}.scales"))) {
-            (Some(qz), Some(scales)) => Ok(ChatGlmLinear::Quant {
-                q: w.require(&format!("{key}.weight"))?.clone(),
+        if let Some(scales) = w.get(&format!("{key}.scales")) {
+            let q = w.require(&format!("{key}.weight"))?.clone();
+            // Honor an explicit geometry (sc-3096); otherwise infer it from the packed shapes.
+            let (group, bits) = match quant {
+                Some(qz) => (qz.group, qz.bits),
+                None => {
+                    let group = DEFAULT_GROUP_SIZE;
+                    (group, packed_bits(&q, scales, group)?)
+                }
+            };
+            return Ok(ChatGlmLinear::Quant {
+                q,
                 scales: scales.as_dtype(dtype)?,
                 qbias: w.require(&format!("{key}.biases"))?.as_dtype(dtype)?,
-                group: qz.group,
-                bits: qz.bits,
+                group,
+                bits,
                 bias,
-            }),
-            _ => Ok(ChatGlmLinear::Dense {
-                w: w.require(&format!("{key}.weight"))?.as_dtype(dtype)?,
-                bias,
-            }),
+            });
         }
+        Ok(ChatGlmLinear::Dense {
+            w: w.require(&format!("{key}.weight"))?.as_dtype(dtype)?,
+            bias,
+        })
     }
 
     /// `y = x · Wᵀ (+ bias)`. Dense bias add is the FUSED `addmm` (single rounding, matching the core
@@ -508,24 +521,29 @@ fn take_heads(x: &Array, start: i32, count: i32) -> Result<Array> {
 
 /// Load the token-embedding table as a dense matrix (dequantizing if the snapshot is quantized —
 /// per-group affine dequant is row-independent, so dequant-then-gather == the reference's
-/// gather-then-dequant).
+/// gather-then-dequant). Packed-detect on `{key}.scales` (sc-9946), independent of the `quant` arg,
+/// with the geometry inferred from the packed shapes when not supplied. The turnkey converter
+/// ([`crate::convert`]) keeps the embedding **dense** (matching [`ChatGlmModel::quantize`]), so this
+/// dequant branch is a defensive path — a hand-packed embedding still loads correctly.
 fn load_embedding(
     w: &Weights,
     key: &str,
     quant: Option<ChatGlmQuant>,
     dtype: Dtype,
 ) -> Result<Array> {
-    match (quant, w.get(&format!("{key}.scales"))) {
-        (Some(qz), Some(scales)) => {
-            let q = w.require(&format!("{key}.weight"))?;
-            let qbias = w.require(&format!("{key}.biases"))?;
-            Ok(
-                dequantize(q, scales, Some(qbias), Some(qz.group), Some(qz.bits))?
-                    .as_dtype(dtype)?,
-            )
-        }
-        _ => Ok(w.require(&format!("{key}.weight"))?.as_dtype(dtype)?),
+    if let Some(scales) = w.get(&format!("{key}.scales")) {
+        let q = w.require(&format!("{key}.weight"))?;
+        let qbias = w.require(&format!("{key}.biases"))?;
+        let (group, bits) = match quant {
+            Some(qz) => (qz.group, qz.bits),
+            None => {
+                let group = DEFAULT_GROUP_SIZE;
+                (group, packed_bits(q, scales, group)?)
+            }
+        };
+        return Ok(dequantize(q, scales, Some(qbias), Some(group), Some(bits))?.as_dtype(dtype)?);
     }
+    Ok(w.require(&format!("{key}.weight"))?.as_dtype(dtype)?)
 }
 
 #[cfg(test)]
@@ -558,5 +576,92 @@ mod tests {
         assert_eq!(at(1, 0, 2), 0.0);
         // ...whereas row 0's real query 0 is strictly causal.
         assert_ne!(at(0, 0, 2), at(1, 0, 2));
+    }
+
+    fn byte_equal(a: &Array, b: &Array) -> bool {
+        a.shape() == b.shape()
+            && a.dtype() == b.dtype()
+            && mlx_rs::ops::eq(a, b)
+                .unwrap()
+                .all(None)
+                .unwrap()
+                .item::<bool>()
+    }
+
+    /// sc-9946: the offline turnkey pack ([`crate::convert`] via `mlx_rs::ops::quantize`) is
+    /// byte-identical to the load-time [`ChatGlmLinear::quantize`] (`QuantizedLinear`) — the
+    /// pre-quantize-on-disk == quantize-at-load guarantee for the ChatGLM3 projections — AND a
+    /// packed triple round-trips through the packed-detect [`ChatGlmLinear::load`] (bit-width
+    /// inferred, `quant = None`) back to the same `Quant`.
+    #[test]
+    fn offline_pack_byte_identical_and_packed_detect_round_trips() {
+        // A biased projection (the fused `query_key_value` carries a bias) — [out=128, in=256].
+        let w = Array::from_slice(
+            &(0..128 * 256).map(|i| (i as f32).sin()).collect::<Vec<_>>(),
+            &[128, 256],
+        );
+        let bias = Array::from_slice(
+            &(0..128).map(|i| i as f32 * 0.01).collect::<Vec<_>>(),
+            &[128],
+        );
+
+        // Load-time path: Dense → quantize(4) (casts to bf16, group 64).
+        let mut load_time = ChatGlmLinear::Dense {
+            w: w.clone(),
+            bias: Some(bias.clone()),
+        };
+        load_time.quantize(4, None).unwrap();
+        let ChatGlmLinear::Quant {
+            q: q_lt,
+            scales: sc_lt,
+            qbias: qb_lt,
+            group,
+            bits,
+            ..
+        } = &load_time
+        else {
+            panic!("quantize() must yield a Quant");
+        };
+        assert_eq!((*group, *bits), (DEFAULT_GROUP_SIZE, 4));
+
+        // Offline path: the exact op `quantize_map` runs (bf16 cast, group 64).
+        let (q_off, sc_off, qb_off) =
+            mlx_rs::ops::quantize(w.as_dtype(Dtype::Bfloat16).unwrap(), DEFAULT_GROUP_SIZE, 4)
+                .unwrap();
+        assert!(
+            byte_equal(q_lt, &q_off),
+            "codes differ offline vs load-time"
+        );
+        assert!(byte_equal(sc_lt, &sc_off), "scales differ");
+        assert!(byte_equal(qb_lt, &qb_off), "affine biases differ");
+
+        // Packed-detect load of the offline triple (quant = None ⇒ bits inferred from shapes).
+        let mut pw = Weights::empty();
+        pw.insert("proj.weight", q_off.clone());
+        pw.insert("proj.scales", sc_off.clone());
+        pw.insert("proj.biases", qb_off.clone());
+        pw.insert("proj.bias", bias.clone());
+        let loaded = ChatGlmLinear::load(&pw, "proj", None, true, Dtype::Float32).unwrap();
+        let ChatGlmLinear::Quant { q, group, bits, .. } = &loaded else {
+            panic!("packed-detect must yield a Quant when .scales is present");
+        };
+        assert_eq!(
+            (*group, *bits),
+            (DEFAULT_GROUP_SIZE, 4),
+            "geometry inferred"
+        );
+        assert!(
+            byte_equal(q, &q_off),
+            "packed-detect load must keep the u32 codes verbatim"
+        );
+
+        // A dense weight (no .scales) still loads Dense.
+        let mut dw = Weights::empty();
+        dw.insert("d.weight", w.clone());
+        let dense = ChatGlmLinear::load(&dw, "d", None, false, Dtype::Float32).unwrap();
+        assert!(
+            matches!(dense, ChatGlmLinear::Dense { .. }),
+            "no .scales ⇒ dense"
+        );
     }
 }
