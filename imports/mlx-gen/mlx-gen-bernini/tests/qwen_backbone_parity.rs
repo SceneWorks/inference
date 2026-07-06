@@ -38,6 +38,7 @@ fn config_from_meta(w: &Weights) -> QwenVlTextConfig {
         rms_norm_eps: m("rms_norm_eps").parse().unwrap(),
         rope_theta: m("rope_theta").parse().unwrap(),
         mrope_section: [sec[0], sec[1], sec[2]],
+        quantization: None,
     }
 }
 

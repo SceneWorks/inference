@@ -41,6 +41,11 @@ pub struct QwenVlTextConfig {
     pub rope_theta: f32,
     /// The 3 MRoPE channel sections (temporal, height, width); sum·2 = head_dim.
     pub mrope_section: [usize; 3],
+    /// `Some((bits, group_size))` when the snapshot ships a **pre-quantized** backbone (a hosted quant
+    /// tier — sc-9945): `from_weights` then loads the packed `.weight`/`.scales`/`.biases` triples for
+    /// the decoder Linears instead of dense weights. Parsed from a `"quantization": {"bits","group_size"}`
+    /// block in `qwen2_5_vl_config.json`. `None` for the legacy dense snapshot (quantized at load time).
+    pub quantization: Option<(i32, i32)>,
 }
 
 impl Default for QwenVlTextConfig {
@@ -56,6 +61,7 @@ impl Default for QwenVlTextConfig {
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
             mrope_section: [16, 24, 24],
+            quantization: None,
         }
     }
 }
@@ -94,6 +100,14 @@ impl QwenVlTextConfig {
             rms_norm_eps: f("rms_norm_eps", 1e-6),
             rope_theta: f("rope_theta", 1_000_000.0),
             mrope_section: mrope,
+            quantization: v.get("quantization").and_then(|q| {
+                let bits = q.get("bits").and_then(serde_json::Value::as_i64)? as i32;
+                let group = q
+                    .get("group_size")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(64) as i32;
+                Some((bits, group))
+            }),
         })
     }
 }
@@ -103,13 +117,35 @@ fn require(w: &Weights, key: &str) -> Result<Array> {
 }
 
 /// A Linear with optional bias from `{prefix}.weight` (+ `{prefix}.bias`), quantizable.
-fn linear(w: &Weights, prefix: &str, bias: bool) -> Result<AdaptableLinear> {
-    let weight = require(w, &format!("{prefix}.weight"))?;
+///
+/// When `quant` is `Some((bits, group))` (a **pre-quantized** snapshot) AND this Linear carries packed
+/// weights on disk (`{prefix}.scales` present), build a quantized base straight from the packed
+/// `.weight`/`.scales`/`.biases` parts — mirrors `mlx_gen_wan`'s `load_linear`. Otherwise build a dense
+/// base (which the legacy load-time path can still quantize). `.scales` presence is the per-Linear
+/// signal, so a dense tensor in an otherwise-quantized snapshot (e.g. an untouched projection) still
+/// loads dense.
+fn linear(
+    w: &Weights,
+    prefix: &str,
+    bias: bool,
+    quant: Option<(i32, i32)>,
+) -> Result<AdaptableLinear> {
     let b = if bias {
         Some(require(w, &format!("{prefix}.bias"))?)
     } else {
         None
     };
+    if let (Some((bits, group)), Some(scales)) = (quant, w.get(&format!("{prefix}.scales"))) {
+        return Ok(AdaptableLinear::from_quantized_parts(
+            require(w, &format!("{prefix}.weight"))?,
+            scales.clone(),
+            require(w, &format!("{prefix}.biases"))?,
+            b,
+            group,
+            bits,
+        ));
+    }
+    let weight = require(w, &format!("{prefix}.weight"))?;
     Ok(AdaptableLinear::dense(weight, b))
 }
 
@@ -122,12 +158,12 @@ struct Attn {
 }
 
 impl Attn {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, quant: Option<(i32, i32)>) -> Result<Self> {
         Ok(Self {
-            q: linear(w, &format!("{prefix}.q_proj"), true)?,
-            k: linear(w, &format!("{prefix}.k_proj"), true)?,
-            v: linear(w, &format!("{prefix}.v_proj"), true)?,
-            o: linear(w, &format!("{prefix}.o_proj"), false)?,
+            q: linear(w, &format!("{prefix}.q_proj"), true, quant)?,
+            k: linear(w, &format!("{prefix}.k_proj"), true, quant)?,
+            v: linear(w, &format!("{prefix}.v_proj"), true, quant)?,
+            o: linear(w, &format!("{prefix}.o_proj"), false, quant)?,
         })
     }
 
@@ -147,11 +183,11 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, quant: Option<(i32, i32)>) -> Result<Self> {
         Ok(Self {
-            gate: linear(w, &format!("{prefix}.gate_proj"), false)?,
-            up: linear(w, &format!("{prefix}.up_proj"), false)?,
-            down: linear(w, &format!("{prefix}.down_proj"), false)?,
+            gate: linear(w, &format!("{prefix}.gate_proj"), false, quant)?,
+            up: linear(w, &format!("{prefix}.up_proj"), false, quant)?,
+            down: linear(w, &format!("{prefix}.down_proj"), false, quant)?,
         })
     }
 
@@ -175,12 +211,12 @@ struct Layer {
 }
 
 impl Layer {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, quant: Option<(i32, i32)>) -> Result<Self> {
         Ok(Self {
             input_ln: require(w, &format!("{prefix}.input_layernorm.weight"))?,
             post_ln: require(w, &format!("{prefix}.post_attention_layernorm.weight"))?,
-            attn: Attn::from_weights(w, &format!("{prefix}.self_attn"))?,
-            mlp: Mlp::from_weights(w, &format!("{prefix}.mlp"))?,
+            attn: Attn::from_weights(w, &format!("{prefix}.self_attn"), quant)?,
+            mlp: Mlp::from_weights(w, &format!("{prefix}.mlp"), quant)?,
         })
     }
 
@@ -209,8 +245,9 @@ impl Qwen25VlText {
     /// Build from a converted planner snapshot's `qwen2_5_vl.safetensors` (keys `model.*`). `prefix`
     /// is the model namespace — `"model"` for the sc-5144 layout.
     pub fn from_weights(w: &Weights, cfg: QwenVlTextConfig, prefix: &str) -> Result<Self> {
+        let quant = cfg.quantization;
         let layers = (0..cfg.num_layers)
-            .map(|i| Layer::from_weights(w, &format!("{prefix}.layers.{i}")))
+            .map(|i| Layer::from_weights(w, &format!("{prefix}.layers.{i}"), quant))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             embed_tokens: require(w, &format!("{prefix}.embed_tokens.weight"))?,
