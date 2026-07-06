@@ -52,7 +52,7 @@ pub mod eight_bit_linear;
 pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
 pub use repack::{
     dequant_mlx_q4_reference, dequant_mlx_q4_reference_gs, dequant_mlx_q8, dequant_mlx_q8_gs,
-    f16_exact, mlx_packed_bits, mlx_packed_bits_gs, repack_mlx_q4_to_q4_1,
+    f16_exact, mlx_packed_bits, mlx_packed_bits_gs, pack_mlx_affine, repack_mlx_q4_to_q4_1,
     repack_mlx_q4_to_q4_1_gs, MLX_GROUP_SIZE,
 };
 
