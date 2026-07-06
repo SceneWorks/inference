@@ -11,6 +11,7 @@
 //!    (sc-3097/98).
 
 pub mod chatglm3;
+pub mod convert;
 pub mod ip_adapter;
 pub mod model;
 pub mod registry;
