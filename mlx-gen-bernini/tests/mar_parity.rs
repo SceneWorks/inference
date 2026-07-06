@@ -74,6 +74,7 @@ fn mar_loop_matches_reference_f32() {
         rms_norm_eps: 1e-6,
         rope_theta: 1_000_000.0,
         mrope_section: [1, 2, 1],
+        quantization: None,
     };
     let backbone = Qwen25VlText::from_weights(&w, cfg, "w.model").expect("backbone");
     let connector = MlpConnector::from_weights(&w, "conn").expect("connector");

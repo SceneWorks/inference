@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+use mlx_rs::ops::quantize;
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
@@ -165,6 +166,56 @@ fn write_json(path: PathBuf, v: &serde_json::Value) -> Result<()> {
         .map_err(|e| Error::Msg(format!("serialize {}: {e}", path.display())))?;
     std::fs::write(&path, text)?;
     Ok(())
+}
+
+/// The Qwen2.5-VL **text-backbone** Linear suffixes that the sc-5146 load-time policy quantizes
+/// (`Qwen25VlText::quantize` → each decoder layer's attention + SwiGLU projections). The vision tower
+/// (`visual.*` — group-64-misaligned), token embedding, and RMSNorms are deliberately absent, so they
+/// pass through dense. Q/K/V carry a separate `.bias` tensor that is NOT a `.weight` and so is never
+/// matched here — it stays dense alongside the packed triple (mirrors [`AdaptableLinear`]'s
+/// quantized-with-bias layout).
+const QWEN_PLANNER_QUANT_SUFFIXES: &[&str] = &[
+    ".self_attn.q_proj",
+    ".self_attn.k_proj",
+    ".self_attn.v_proj",
+    ".self_attn.o_proj",
+    ".mlp.gate_proj",
+    ".mlp.up_proj",
+    ".mlp.down_proj",
+];
+
+/// Pre-bake the sc-5146 load-time planner quantization into an on-disk `qwen2_5_vl.safetensors` map:
+/// each [`QWEN_PLANNER_QUANT_SUFFIXES`]-matched decoder Linear `{base}.weight` (bf16) under the
+/// `model.layers.` prefix becomes the packed triple `{base}.weight` (u32) + `{base}.scales` +
+/// `{base}.biases` via MLX `quantize` (byte-identical to `AdaptableLinear::quantize`, which packs the
+/// same bf16-native weights at the same group size). Everything else — the `visual.*` vision tower,
+/// `model.embed_tokens`, the RMSNorms, and every `.bias` — passes through unchanged.
+///
+/// The consume side is [`crate::qwen2_5_vl::Qwen25VlText::from_weights`], which loads these packed
+/// parts when its config carries a `quantization` block (mirrors the renderer's
+/// [`mlx_gen_wan::convert::quantize_wan_transformer`] + `WanTransformer::from_weights` pairing).
+pub fn quantize_qwen_planner_backbone(
+    map: HashMap<String, Array>,
+    bits: i32,
+    group_size: i32,
+) -> Result<HashMap<String, Array>> {
+    let mut out = HashMap::with_capacity(map.len());
+    for (k, v) in map {
+        let base = k.strip_suffix(".weight");
+        let is_q = base.is_some_and(|b| {
+            b.starts_with("model.layers.")
+                && QWEN_PLANNER_QUANT_SUFFIXES.iter().any(|s| b.ends_with(s))
+        });
+        if let (true, Some(base)) = (is_q, base) {
+            let (wq, scales, biases) = quantize(&v, group_size, bits)?;
+            out.insert(format!("{base}.weight"), wq);
+            out.insert(format!("{base}.scales"), scales);
+            out.insert(format!("{base}.biases"), biases);
+        } else {
+            out.insert(k, v);
+        }
+    }
+    Ok(out)
 }
 
 /// Symlink (zero-copy) or recursively copy `src` → `dst`, replacing any existing target. Symlinks the
@@ -453,6 +504,74 @@ mod tests {
             let got = route_key(k);
             let got_ref = got.as_ref().map(|(o, s)| (*o, s.as_str()));
             assert_eq!(got_ref, *want, "routing {k}");
+        }
+    }
+
+    /// sc-9945: pre-baking the planner quant packs exactly the LLM-backbone attention + SwiGLU
+    /// Linears (`model.layers.*`), keeps the q/k/v `.bias`, and leaves the vision tower, the token
+    /// embedding, and the RMSNorms dense — matching the sc-5146 load-time policy
+    /// (`Qwen25VlText::quantize`).
+    #[test]
+    fn quantize_qwen_planner_backbone_selects_llm_only() {
+        let bf = |shape: &[i32]| {
+            mlx_rs::Array::ones::<f32>(shape)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+        };
+        let q = quantize_qwen_planner_backbone(
+            [
+                // Backbone attention + SwiGLU → packed.
+                ("model.layers.0.self_attn.q_proj.weight", bf(&[64, 128])),
+                ("model.layers.0.self_attn.q_proj.bias", bf(&[64])),
+                ("model.layers.0.self_attn.o_proj.weight", bf(&[64, 128])),
+                ("model.layers.0.mlp.gate_proj.weight", bf(&[64, 128])),
+                ("model.layers.0.mlp.down_proj.weight", bf(&[64, 128])),
+                // Dense: embedding, final norm, per-layer norms.
+                ("model.embed_tokens.weight", bf(&[128, 64])),
+                ("model.norm.weight", bf(&[64])),
+                ("model.layers.0.input_layernorm.weight", bf(&[64])),
+                // Dense: the vision tower is never packed (group-64-misaligned), even though its
+                // block Linears share the `mlp`/`attn` naming — the `model.layers.` prefix gates it out.
+                ("visual.blocks.0.attn.qkv.weight", bf(&[192, 64])),
+                ("visual.blocks.0.mlp.gate_proj.weight", bf(&[64, 128])),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+            8,
+            64,
+        )
+        .unwrap();
+
+        // Packed backbone Linears: u32 weight + scales + biases; the q_proj bias is preserved.
+        for base in [
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.o_proj",
+            "model.layers.0.mlp.gate_proj",
+            "model.layers.0.mlp.down_proj",
+        ] {
+            assert!(q.contains_key(&format!("{base}.scales")), "packed: {base}");
+            assert!(q.contains_key(&format!("{base}.biases")), "packed: {base}");
+            assert_ne!(
+                q[&format!("{base}.weight")].dtype(),
+                Dtype::Bfloat16,
+                "packed (u32): {base}"
+            );
+        }
+        assert!(q.contains_key("model.layers.0.self_attn.q_proj.bias")); // linear bias preserved
+
+        // Dense pass-through: still bf16 `.weight`, no `.scales`.
+        for key in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "visual.blocks.0.attn.qkv.weight",
+            "visual.blocks.0.mlp.gate_proj.weight",
+        ] {
+            assert_eq!(q[key].dtype(), Dtype::Bfloat16, "dense: {key}");
+            let base = key.strip_suffix(".weight").unwrap();
+            assert!(!q.contains_key(&format!("{base}.scales")), "dense: {key}");
         }
     }
 
