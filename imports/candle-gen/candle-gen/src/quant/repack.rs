@@ -283,6 +283,90 @@ pub fn dequant_mlx_q8_gs(
     )
 }
 
+/// **Producer** side of the packed-tier format (sc-10026): quantize a dense `[out, in]` `weight` into
+/// the MLX affine packed triple `(wq, scales, biases)` the consume path ([`repack_mlx_q4_to_q4_1_gs`] /
+/// [`dequant_mlx_q8_gs`] / [`super::QLinear::from_packed_gs`]) reads — the exact inverse. Lets candle
+/// **host** its own diffusers-keyed packed tiers (rather than reverse-remapping the native-keyed MLX
+/// tiers), so the packed-detect seam loads them with no key/layout translation.
+///
+/// Group-wise **affine** along the input dim, matching the dequant `w = scale·q + bias`: for each
+/// group of `group_size` consecutive elements of a row, `bias = min`, `scale = (max − min) / (2^bits −
+/// 1)`, `q = round((w − bias) / scale)` clamped to `[0, 2^bits − 1]` (a constant group has `scale = 0`
+/// and every `q = 0`, so it dequantizes back to `bias = w` exactly). Codes pack LSB-first into u32
+/// (`bits = 4`: 8 codes/word, `wq` is `[out, in/8]`; `bits = 8`: 4 codes/word, `wq` is `[out, in/4]`),
+/// and `scales`/`biases` are `[out, in/group_size]` f32 — the shapes [`mlx_packed_bits_gs`] and the
+/// loaders assume. `bits` must be 4 or 8; `in` must be a multiple of `group_size`, which for `bits = 4`
+/// must itself be a multiple of 8 (a u32 word holds 8 nibbles) — group 64 satisfies both.
+///
+/// Q4 round-trips **losslessly** through the `Q4_1` repack (same affine form); Q8's consume path
+/// re-quantizes to `Q8_0` (see the module docs), so a Q8 tier carries that second rounding — packing
+/// here is exact either way (the codes reproduce `scale·q + bias`).
+pub fn pack_mlx_affine(
+    weight: &Tensor,
+    bits: usize,
+    group_size: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    if bits != 4 && bits != 8 {
+        candle_core::bail!("pack_mlx_affine: bits must be 4 or 8 (got {bits})");
+    }
+    let (out_dim, in_dim) = weight.dims2()?;
+    if !in_dim.is_multiple_of(group_size) {
+        candle_core::bail!("pack_mlx_affine: in dim {in_dim} not a multiple of group {group_size}");
+    }
+    let codes_per_word = 32 / bits; // 8 for Q4, 4 for Q8
+    if !group_size.is_multiple_of(codes_per_word) {
+        candle_core::bail!(
+            "pack_mlx_affine: group {group_size} must be a multiple of {codes_per_word} for {bits}-bit packing"
+        );
+    }
+    let levels = ((1u32 << bits) - 1) as f32; // 15 (Q4) or 255 (Q8)
+    let w = weight
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let groups_per_row = in_dim / group_size;
+    let mut codes = vec![0u8; out_dim * in_dim];
+    let mut scales = Vec::with_capacity(out_dim * groups_per_row);
+    let mut biases = Vec::with_capacity(out_dim * groups_per_row);
+    for row in 0..out_dim {
+        for g in 0..groups_per_row {
+            let base = row * in_dim + g * group_size;
+            let group = &w[base..base + group_size];
+            let (mut lo, mut hi) = (group[0], group[0]);
+            for &v in &group[1..] {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            let scale = (hi - lo) / levels;
+            for (k, &v) in group.iter().enumerate() {
+                let q = if scale > 0.0 {
+                    ((v - lo) / scale).round().clamp(0.0, levels) as u8
+                } else {
+                    0
+                };
+                codes[base + k] = q;
+            }
+            scales.push(scale);
+            biases.push(lo);
+        }
+    }
+    // Pack codes LSB-first into u32 words (nibble/byte `k` of word into bit `bits·k`).
+    let words: Vec<u32> = codes
+        .chunks_exact(codes_per_word)
+        .map(|c| {
+            c.iter()
+                .enumerate()
+                .fold(0u32, |acc, (i, &q)| acc | ((q as u32) << (bits * i)))
+        })
+        .collect();
+    let dev = Device::Cpu;
+    let wq = Tensor::from_vec(words, (out_dim, in_dim / codes_per_word), &dev)?;
+    let scales = Tensor::from_vec(scales, (out_dim, groups_per_row), &dev)?;
+    let biases = Tensor::from_vec(biases, (out_dim, groups_per_row), &dev)?;
+    Ok((wq, scales, biases))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,6 +510,104 @@ mod tests {
             .to_vec1::<f32>()?;
         let want = affine_grid(&codes, &scales, &biases, in_dim, MLX_GROUP_SIZE);
         assert_eq!(got, want);
+        Ok(())
+    }
+
+    /// A deterministic pseudo-random dense weight for the packer round-trips.
+    fn dense_weight(out_dim: usize, in_dim: usize) -> Tensor {
+        let data: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| {
+                let x = (i as f32 * 0.017 + (i / in_dim) as f32 * 0.31).sin();
+                x * 1.7 - 0.2
+            })
+            .collect();
+        Tensor::from_vec(data, (out_dim, in_dim), &Device::Cpu).unwrap()
+    }
+
+    /// The `pack_mlx_affine` **producer** is the exact inverse of the consume path: packing a dense
+    /// weight at Q4 then dequantizing (via `dequant_mlx_q4_reference` AND the real `Q4_1` repack)
+    /// reproduces `scale·q + bias` for the codes the pack chose, and stays within the affine group's
+    /// quant step of the original weight. Also pins the emitted shapes (`mlx_packed_bits` = 4).
+    #[test]
+    fn pack_mlx_affine_q4_roundtrips_through_repack() -> Result<()> {
+        let (out_dim, in_dim) = (6, 128); // 2 groups/row at group 64
+        let w = dense_weight(out_dim, in_dim);
+        let (wq, s, b) = pack_mlx_affine(&w, 4, MLX_GROUP_SIZE)?;
+        assert_eq!(wq.dims2()?, (out_dim, in_dim / 8));
+        assert_eq!(s.dims2()?, (out_dim, in_dim / MLX_GROUP_SIZE));
+        assert_eq!(mlx_packed_bits(in_dim / 8, in_dim / MLX_GROUP_SIZE), 4);
+
+        // Dequant reference == the real Q4_1 repack dequant (the pack matches the consume path exactly).
+        let reference = dequant_mlx_q4_reference(&wq, &s, &b)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let repacked = repack_mlx_q4_to_q4_1(&wq, &s, &b, &Device::Cpu)?
+            .dequantize(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(
+            reference, repacked,
+            "pack → repack dequant != pack → reference grid"
+        );
+
+        // The Q4 pack reconstructs the weight faithfully. The affine quant bound is `scale/2`, but the
+        // `Q4_1` repack casts each group's scale/bias to f16 (module docs), which can nudge a dequant a
+        // hair past `scale/2` — so assert the house cosine-parity metric (> 0.9999), not a per-element
+        // half-step (the exact `reference == repacked` check above already pins the pack↔consume match).
+        let orig = w.flatten_all()?.to_vec1::<f32>()?;
+        let (mut dot, mut no, mut nr) = (0f64, 0f64, 0f64);
+        for (&o, &r) in orig.iter().zip(reference.iter()) {
+            dot += o as f64 * r as f64;
+            no += o as f64 * o as f64;
+            nr += r as f64 * r as f64;
+        }
+        let cos = dot / (no.sqrt() * nr.sqrt() + 1e-12);
+        assert!(cos > 0.999, "Q4 pack→dequant cosine {cos:.6} too low");
+        Ok(())
+    }
+
+    /// `pack_mlx_affine` at Q8 produces a triple the Q8 consume path dequantizes back to within an
+    /// 8-bit group step of the weight, with the right shapes (`wq [out, in/4]`, `mlx_packed_bits` = 8).
+    #[test]
+    fn pack_mlx_affine_q8_roundtrips() -> Result<()> {
+        let (out_dim, in_dim) = (4, 128);
+        let w = dense_weight(out_dim, in_dim);
+        let (wq, s, b) = pack_mlx_affine(&w, 8, MLX_GROUP_SIZE)?;
+        assert_eq!(wq.dims2()?, (out_dim, in_dim / 4));
+        assert_eq!(mlx_packed_bits(in_dim / 4, in_dim / MLX_GROUP_SIZE), 8);
+
+        let got = dequant_mlx_q8(&wq, &s, &b)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let scales = s.flatten_all()?.to_vec1::<f32>()?;
+        let orig = w.flatten_all()?.to_vec1::<f32>()?;
+        let gpr = in_dim / MLX_GROUP_SIZE;
+        for (i, (&o, &r)) in orig.iter().zip(got.iter()).enumerate() {
+            let (row, col) = (i / in_dim, i % in_dim);
+            let step = scales[row * gpr + col / MLX_GROUP_SIZE];
+            assert!(
+                (o - r).abs() <= step / 2.0 + 1e-6,
+                "elem {i}: Q8 exceeds half-step"
+            );
+        }
+        Ok(())
+    }
+
+    /// A constant group packs to `scale = 0` / all-zero codes and dequantizes back to the exact value
+    /// (`bias`), not NaN — the division-by-zero guard.
+    #[test]
+    fn pack_mlx_affine_constant_group_is_exact() -> Result<()> {
+        let (out_dim, in_dim) = (1, 64); // one group
+        let w = Tensor::full(0.75f32, (out_dim, in_dim), &Device::Cpu)?;
+        let (wq, s, b) = pack_mlx_affine(&w, 4, MLX_GROUP_SIZE)?;
+        assert_eq!(s.flatten_all()?.to_vec1::<f32>()?, vec![0.0]);
+        let got = dequant_mlx_q4_reference(&wq, &s, &b)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(
+            got.iter().all(|&v| v == 0.75),
+            "constant group must dequant to 0.75 exactly"
+        );
         Ok(())
     }
 }

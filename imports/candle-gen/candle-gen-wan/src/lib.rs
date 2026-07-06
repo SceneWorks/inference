@@ -20,6 +20,7 @@
 //! ([`vae::WanVae::decode_budgeted`], sc-7111) caps a single high-res frame's VRAM spike.
 
 pub mod adapters;
+pub mod candle_tier_build;
 pub mod config;
 pub mod conv3d;
 pub mod dit_train;
