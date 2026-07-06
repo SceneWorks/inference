@@ -58,6 +58,7 @@ fn assembly_matches_reference() {
         rms_norm_eps: 1e-6,
         rope_theta: 1_000_000.0,
         mrope_section: [1, 2, 1],
+        quantization: None,
     };
     let backbone = Qwen25VlText::from_weights(&w, cfg, "model").expect("backbone");
 
