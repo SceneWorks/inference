@@ -149,24 +149,28 @@ impl FinalLayer {
 /// whose long side exceeds this extrapolates it out of distribution — a 4× SR of a tall image pushes
 /// the *height* coordinate past it (e.g. a 1280px-tall gen → 5120px decode > 3840) and the light
 /// 2-block pixel refiner biases toward a color cast in exactly those out-of-range (bottom) rows. See
-/// [`pixel_pos_scale`].
+/// [`pixel_pos_axis_scale`].
 const PIXEL_POS_TRAIN_MAX: f64 = 3840.0;
 
-/// Aspect-preserving positional-interpolation factor for the pixel pos table: shrink the coordinate
-/// grid so the long side never exceeds [`PIXEL_POS_TRAIN_MAX`], keeping every position inside the
-/// trained range (the standard PI fix for resolution extrapolation). An exact **no-op** (`1.0`) for
-/// any decode whose long side already fits — so the golden-parity fixtures and every in-distribution
-/// (≤3840) decode are byte-identical to the raw-absolute reference; the scaling only engages for the
-/// over-range tall/wide case the reference never handled. Mirrors the mlx-gen-pid fix in lockstep.
+/// **Per-axis** positional-interpolation factor for one pixel-pos axis: shrink *this* axis's
+/// coordinate only if it alone exceeds [`PIXEL_POS_TRAIN_MAX`]. The sincos table encodes height and
+/// width in separate halves with the same frequencies, so each axis must be kept in its trained range
+/// **independently** — they do NOT share a scale. An earlier aspect-preserving version scaled both
+/// axes by the long-side factor; that needlessly compressed the in-range (short) axis and itself
+/// introduced a color cast on it (a wide 5120×2880 decode got its already-in-range 2880 height dragged
+/// to 2160 → green bottom), while the height axis is the only one that actually casts when
+/// out-of-range. Per-axis clamping fixes the genuinely-OOD axis (tall's 5120 height) and leaves an
+/// in-range axis byte-identical to the raw-absolute reference. Mirrors the mlx-gen-pid fix in lockstep.
 ///
-/// `PID_PIXEL_POS_ABS=1` forces the raw-absolute reference behavior (the pre-fix path) for A/B.
-fn pixel_pos_scale(h: i32, w: i32) -> f64 {
+/// Exact **no-op** (`1.0`) for any axis already ≤ [`PIXEL_POS_TRAIN_MAX`]. `PID_PIXEL_POS_ABS=1`
+/// forces the raw-absolute reference behavior (the pre-fix path) for A/B.
+fn pixel_pos_axis_scale(n: i32) -> f64 {
     if std::env::var("PID_PIXEL_POS_ABS").is_ok_and(|v| v == "1") {
         return 1.0;
     }
-    let long = h.max(w) as f64;
-    if long > PIXEL_POS_TRAIN_MAX {
-        PIXEL_POS_TRAIN_MAX / long
+    let n = n as f64;
+    if n > PIXEL_POS_TRAIN_MAX {
+        PIXEL_POS_TRAIN_MAX / n
     } else {
         1.0
     }
@@ -176,9 +180,10 @@ fn pixel_pos_scale(h: i32, w: i32) -> f64 {
 /// matching `get_2d_sincos_pos_embed_from_grid`. Computed in f64, cast f32. First half encodes the
 /// **w** coordinate, second half the **h** coordinate (the reference's swapped `emb_h`/`emb_w`).
 ///
-/// Coordinates are scaled by [`pixel_pos_scale`] first so a super-resolved decode whose long side
-/// exceeds the trained pixel extent stays in distribution (fixes the tall-image bottom color cast);
-/// a no-op for any decode that already fits, preserving reference/golden parity.
+/// Each axis's coordinates are scaled by [`pixel_pos_axis_scale`] first so a super-resolved decode
+/// whose height (or width) exceeds the trained pixel extent stays in distribution (fixes the
+/// tall-image bottom color cast) without disturbing an in-range axis; a no-op for any axis that
+/// already fits, preserving reference/golden parity.
 pub fn sincos_2d_pos(embed_dim: i32, h: i32, w: i32, device: &Device) -> Result<Tensor> {
     let d = (embed_dim / 2) as usize; // per-axis dim
     let half = d / 2; // omega length
@@ -192,13 +197,13 @@ pub fn sincos_2d_pos(embed_dim: i32, h: i32, w: i32, device: &Device) -> Result<
             out[half + k] = a.cos() as f32;
         }
     };
-    let scale = pixel_pos_scale(h, w);
+    let (scale_h, scale_w) = (pixel_pos_axis_scale(h), pixel_pos_axis_scale(w));
     let n = (h * w) as usize;
     let mut buf = vec![0f32; n * embed_dim as usize];
     for i in 0..h {
-        let yp = i as f64 * scale;
+        let yp = i as f64 * scale_h;
         for j in 0..w {
-            let xp = j as f64 * scale;
+            let xp = j as f64 * scale_w;
             let p = (i * w + j) as usize;
             let base = p * embed_dim as usize;
             oned(xp, &mut buf[base..base + d]); // first half: w coordinate (j)
