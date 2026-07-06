@@ -17,23 +17,44 @@ use candle_gen::candle_core::{Result, Tensor};
 use crate::weights::Weights;
 
 /// Max im2col elements (`batch · H_out · W_out · C · kH · kW`) per `conv2d` call. candle's CUDA conv2d
-/// builds an im2col buffer of this size; above a few hundred million it silently corrupts/zeros part
-/// of the output (an 8·64²·512·9 ≈ 151M call is fine, a 16·128²·512·9 ≈ 1.2B call drops frames). We
-/// chunk the merged `B·T_out` batch so every conv2d stays in the proven-safe band. The image path
-/// (`T_out==1`) never tripped this; it only bites multi-frame (video) clips at high resolution.
+/// builds an im2col buffer of this size; above a few hundred million it silently corrupts (an
+/// 8·64²·512·9 ≈ 151M call is fine; a 16·128²·512·9 ≈ 1.2B call drops frames, and a still-image
+/// 1·1536²·128·9 ≈ 2.7B VAE-decode conv fills its output with uninitialized memory — `f32::MAX` —
+/// which casts to 0 → an all-black image, sc-10083). We keep every conv2d under this band by splitting
+/// the merged `B·T_out` batch **and**, when even a single frame's im2col is too big, the output rows.
 const IM2COL_BUDGET: usize = 128 * 1024 * 1024;
 
-/// `x.conv2d`, but with the batch axis split into chunks small enough that each call's im2col stays
-/// under [`IM2COL_BUDGET`]; results are concatenated back along the batch axis. Identical math to a
-/// single `conv2d`, just split to dodge the large-buffer corruption.
+/// `x.conv2d`, but split so each call's im2col stays under [`IM2COL_BUDGET`], dodging the large-buffer
+/// corruption. Identical math to a single `conv2d`. Splits the batch axis first (cheap — video's
+/// merged `B·T_out`); when even one frame's im2col exceeds the budget (high-resolution still-image VAE
+/// convs, `T_out==1` so there's no batch to split), it falls back to chunking the **output rows**
+/// ([`row_chunked_conv2d`]). Before the row fallback the image path corrupted silently at ≥1536²
+/// (sc-10083): `chunked_conv2d` clamped `max_batch` to 1 and ran the oversized conv anyway.
 fn chunked_conv2d(x: &Tensor, w: &Tensor, padding: usize, stride: usize) -> Result<Tensor> {
+    chunked_conv2d_budgeted(x, w, padding, stride, IM2COL_BUDGET)
+}
+
+/// [`chunked_conv2d`] with the im2col budget injected (so the row-chunking split is unit-testable
+/// against a plain `conv2d` without a multi-GB tensor).
+fn chunked_conv2d_budgeted(
+    x: &Tensor,
+    w: &Tensor,
+    padding: usize,
+    stride: usize,
+    budget: usize,
+) -> Result<Tensor> {
     let n = x.dim(0)?;
     let (c, h, wd) = (x.dim(1)?, x.dim(2)?, x.dim(3)?);
     let (_o, _i, kh, kw) = w.dims4()?;
     let h_out = (h + 2 * padding).saturating_sub(kh) / stride + 1;
     let w_out = (wd + 2 * padding).saturating_sub(kw) / stride + 1;
     let cols_per_frame = (h_out * w_out * c * kh * kw).max(1);
-    let max_batch = (IM2COL_BUDGET / cols_per_frame).clamp(1, n);
+    // A single frame's im2col already busts the budget → can't be helped by batch splitting (still
+    // images are B·T_out == 1). Chunk the output rows instead (sc-10083).
+    if cols_per_frame > budget {
+        return row_chunked_conv2d(x, w, padding, stride, budget);
+    }
+    let max_batch = (budget / cols_per_frame).clamp(1, n);
     if n <= max_batch {
         return x.conv2d(w, padding, stride, 1, 1);
     }
@@ -46,6 +67,51 @@ fn chunked_conv2d(x: &Tensor, w: &Tensor, padding: usize, stride: usize) -> Resu
     }
     let refs: Vec<&Tensor> = parts.iter().collect();
     Tensor::cat(&refs, 0)
+}
+
+/// Compute a conv2d as a stack of output-**row** bands, each small enough to stay under `budget`, then
+/// concatenate along the height axis. Bit-identical to `x.conv2d(w, padding, stride, 1, 1)`: the
+/// symmetric zero padding is applied explicitly up front (so a `padding=0` conv on each band matches
+/// candle's built-in symmetric pad), and output rows `[ro, ro+rb)` need exactly padded-input rows
+/// `[ro·stride, ro·stride + (rb-1)·stride + kH)`. Used when a single frame's im2col exceeds the budget
+/// (high-resolution VAE encode/decode convs), where batch splitting can't help (sc-10083).
+fn row_chunked_conv2d(
+    x: &Tensor,
+    w: &Tensor,
+    padding: usize,
+    stride: usize,
+    budget: usize,
+) -> Result<Tensor> {
+    let n = x.dim(0)?;
+    let c = x.dim(1)?;
+    let (_o, _i, kh, kw) = w.dims4()?;
+    // Explicit symmetric zero-pad on H (dim 2) and W (dim 3); the band convs then run with padding=0.
+    let xp = if padding > 0 {
+        x.pad_with_zeros(2, padding, padding)?
+            .pad_with_zeros(3, padding, padding)?
+    } else {
+        x.clone()
+    };
+    let hp = xp.dim(2)?;
+    let wp = xp.dim(3)?;
+    let h_out = hp.saturating_sub(kh) / stride + 1;
+    let w_out = wp.saturating_sub(kw) / stride + 1;
+    // Rows per band so `n · rb · w_out · c · kh · kw <= budget`; at least one row (best effort even if
+    // a single output row is itself over budget — vastly smaller than the whole frame either way).
+    let cols_per_out_row = (n * w_out * c * kh * kw).max(1);
+    let band_rows = (budget / cols_per_out_row).max(1);
+    let mut parts = Vec::new();
+    let mut ro = 0;
+    while ro < h_out {
+        let rb = (h_out - ro).min(band_rows);
+        let in_start = ro * stride;
+        let in_len = (rb - 1) * stride + kh;
+        let band = xp.narrow(2, in_start, in_len)?;
+        parts.push(band.conv2d(w, 0, stride, 1, 1)?);
+        ro += rb;
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, 2)
 }
 
 pub struct CausalConv3d {
@@ -299,6 +365,39 @@ mod tests {
             max_err < 1e-3,
             "conv3d decomposition wrong at T>1 (st={st}): max_err={max_err}"
         );
+        Ok(())
+    }
+
+    /// [`row_chunked_conv2d`] (and the budget-driven split in [`chunked_conv2d_budgeted`]) is
+    /// bit-identical to a single `conv2d`, for stride 1 and 2, padded and unpadded, across a budget
+    /// small enough to force multi-row bands (sc-10083: this is the still-image high-res path where
+    /// batch splitting can't help and the unbudgeted conv silently corrupted its output).
+    #[test]
+    fn row_chunk_matches_plain_conv2d() -> Result<()> {
+        let dev = Device::Cpu;
+        let (o, i) = (5usize, 3usize);
+        for (kh, kw, padding, stride) in
+            [(3usize, 3usize, 1usize, 1usize), (3, 3, 1, 2), (1, 1, 0, 1)]
+        {
+            let w = Tensor::randn(0f32, 1.0, (o, i, kh, kw), &dev)?;
+            // (N,C,H,W) — a couple of batch items + a tall-enough H to split into several row bands.
+            let x = Tensor::randn(0f32, 1.0, (2usize, i, 17, 13), &dev)?;
+            let reference = x.conv2d(&w, padding, stride, 1, 1)?;
+            // A tiny budget forces both the `cols_per_frame > budget` row fallback and multi-row bands.
+            let got = chunked_conv2d_budgeted(&x, &w, padding, stride, 64)?;
+            assert_eq!(got.dims(), reference.dims());
+            let gv = got.flatten_all()?.to_vec1::<f32>()?;
+            let rv = reference.flatten_all()?.to_vec1::<f32>()?;
+            let max_err = gv
+                .iter()
+                .zip(rv.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_err < 1e-4,
+                "row-chunked conv2d diverged (kh={kh},kw={kw},pad={padding},stride={stride}): {max_err}"
+            );
+        }
         Ok(())
     }
 
