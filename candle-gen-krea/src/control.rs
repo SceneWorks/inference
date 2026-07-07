@@ -29,8 +29,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::train::flow_match::{self, velocity_loss};
+use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
 use candle_gen::{CandleError, Result};
 
 use crate::config::Krea2Config;
@@ -411,6 +414,111 @@ pub fn forward_with_control(
     Ok(dit.velocity_out(&x, &ctx)?)
 }
 
+/// One training micro-step's forward + backward at flow-match `sigma`: build the noised latent, run
+/// the control-branched velocity prediction (training residual scale **1.0** — `control_scale` is an
+/// inference knob), regress the raw velocity toward `noise − x0`, and return `(loss, grads)` keyed by
+/// the branch `Var`s. The training twin of the Krea LoRA trainer's `compute_loss_grads`.
+///
+/// `use_checkpoint` selects the **gradient-checkpointed** backward (the sc-5165 / sc-7900 segmented
+/// VJP the big-DiT LoRA trainers use, [`checkpointed_backward`]) over the dense monolithic
+/// `loss.backward()`. The dense backward retains every activation of the 28 frozen main blocks + the
+/// `N` branch blocks at once (OOM ≥ 512² on a 96 GB card); the checkpointed chain keeps only the
+/// segment-boundary states. Topology: the chain state is `[main_h, branch_h]` through main blocks
+/// `0..N` — segment `i` advances the branch one block, projects its residual onto `main_h`'s image
+/// tokens, then runs main block `i` — dropping to `[main_h]` after the last injection, with the
+/// `velocity_out` + loss regression as the final segment. The pre-main front-end + control embedding
+/// are frozen (no upstream `Var`s), so the seed boundary is simply detached.
+#[allow(clippy::too_many_arguments)]
+pub fn control_loss_grads(
+    dit: &KreaTrainDit,
+    branch: &ControlBranch,
+    x0: &Tensor,
+    ctrl_latent: &Tensor,
+    cap: &Tensor,
+    sigma: f32,
+    noise: &Tensor,
+    mae: bool,
+    compute_dtype: DType,
+    use_checkpoint: bool,
+) -> Result<(f32, GradStore)> {
+    let device = x0.device();
+    let (x_t, target) = flow_match::build_batch(x0, noise, sigma as f64)?;
+    let x_t = x_t.to_dtype(compute_dtype)?;
+    let context = cap.unsqueeze(0)?; // (L, n, d) -> (1, L, n, d)
+    let t = Tensor::from_vec(vec![sigma], (1,), device)?;
+
+    if !use_checkpoint {
+        let v = forward_with_control(dit, branch, &x_t, &t, &context, ctrl_latent, 1.0)?;
+        let loss = velocity_loss(&v, &target, mae)?;
+        let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+        let grads = loss.backward()?;
+        return Ok((loss_val, grads));
+    }
+
+    // Frozen pre-main + control embedding (no Vars upstream → the detached seed boundary).
+    let (combined, ctx) = dit.forward_pre_main(&x_t, &t, &context)?;
+    let ctrl_tokens = dit.embed_latent(ctrl_latent)?;
+    let branch_input = {
+        let txt = combined.narrow(1, 0, ctx.cap_len)?;
+        let img = (combined.narrow(1, ctx.cap_len, ctx.img_len)? + &ctrl_tokens)?;
+        Tensor::cat(&[&txt, &img], 1)?
+    };
+
+    let n = branch.blocks.len();
+    let blocks = dit.blocks();
+    let ctx_ref = &ctx;
+    let mut segs: Vec<Segment> = Vec::with_capacity(blocks.len() + 1);
+    for (i, blk) in blocks.iter().enumerate() {
+        if i < n {
+            // [main_h, branch_h] -> advance the branch, inject its residual, run main block i.
+            let cblk = &branch.blocks[i];
+            let drop_branch = i + 1 == n; // last injection: the branch stream leaves the state
+            segs.push(Box::new(move |st: &[Tensor]| {
+                use candle_gen::candle_core::Error as CoreError;
+                let (main_h, branch_h) = (&st[0], &st[1]);
+                let bh = cblk
+                    .forward(branch_h, &ctx_ref.tvec, &ctx_ref.rcos, &ctx_ref.rsin, false)
+                    .map_err(CoreError::wrap)?;
+                let bh_img = bh.narrow(1, ctx_ref.cap_len, ctx_ref.img_len)?;
+                let res = cblk
+                    .proj_out
+                    .forward(&bh_img, false)
+                    .map_err(CoreError::wrap)?;
+                let txt = main_h.narrow(1, 0, ctx_ref.cap_len)?;
+                let img = (main_h.narrow(1, ctx_ref.cap_len, ctx_ref.img_len)?
+                    + res.to_dtype(main_h.dtype())?)?;
+                let inj = Tensor::cat(&[&txt, &img], 1)?;
+                let mh = blk.forward(&inj, &ctx_ref.tvec, &ctx_ref.rcos, &ctx_ref.rsin)?;
+                if drop_branch {
+                    Ok(vec![mh])
+                } else {
+                    Ok(vec![mh, bh])
+                }
+            }));
+        } else {
+            // [main_h] -> plain frozen main block.
+            segs.push(Box::new(move |st: &[Tensor]| {
+                Ok(vec![blk.forward(
+                    &st[0],
+                    &ctx_ref.tvec,
+                    &ctx_ref.rcos,
+                    &ctx_ref.rsin,
+                )?])
+            }));
+        }
+    }
+    // Final segment: the output head + the flow-match regression -> [loss].
+    let target_owned = target.clone();
+    segs.push(Box::new(move |st: &[Tensor]| {
+        let v = dit.velocity_out(&st[0], ctx_ref)?;
+        Ok(vec![velocity_loss(&v, &target_owned, mae)?])
+    }));
+
+    let seed = [combined.detach(), branch_input.detach()];
+    let vars = branch.vars();
+    checkpointed_backward(&segs, &seed, &vars)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,6 +634,75 @@ mod tests {
             loss1 < loss0,
             "AdamW steps on a fixed batch should lower the loss: {loss0} -> {loss1}"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The correctness gate for the gradient-checkpointing lever: [`control_loss_grads`] with
+    /// `use_checkpoint = true` (the segmented `[main_h, branch_h]` VJP) must reproduce the dense
+    /// monolithic `loss.backward()` — same loss, same gradient on **every** branch `Var` (mod float
+    /// reassociation). The control twin of the LoRA trainer's `dense_and_checkpoint_grads_match`.
+    #[test]
+    fn dense_and_checkpoint_grads_match_control() {
+        let dev = Device::Cpu;
+        let (dit, c, path) = tiny_dit();
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        nudge_vars(&branch, &dev);
+        let vars = branch.vars();
+
+        let (x0, cap, noise) = tiny_batch(&c);
+        let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+
+        let run = |ckpt: bool| {
+            control_loss_grads(
+                &dit,
+                &branch,
+                &x0,
+                &ctrl,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                DType::F32,
+                ckpt,
+            )
+            .unwrap()
+        };
+        let (loss_d, g_d) = run(false);
+        let (loss_c, g_c) = run(true);
+
+        assert!(
+            (loss_d - loss_c).abs() < 1e-4,
+            "loss: dense {loss_d} vs checkpoint {loss_c}"
+        );
+        let grad_vec = |g: &candle_gen::candle_core::backprop::GradStore, v: &Var| {
+            g.get(v.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let mut saw_nonzero = false;
+        for (idx, v) in vars.iter().enumerate() {
+            assert!(
+                g_d.get(v.as_tensor()).is_some() && g_c.get(v.as_tensor()).is_some(),
+                "var {idx} missing a gradient (dense or checkpoint)"
+            );
+            let a = grad_vec(&g_d, v);
+            let b = grad_vec(&g_c, v);
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-4,
+                    "grad mismatch for var {idx} (dense {x} vs checkpoint {y})"
+                );
+                if x.abs() > 1e-6 {
+                    saw_nonzero = true;
+                }
+            }
+        }
+        assert!(saw_nonzero, "expected nonzero branch grads to compare");
         let _ = std::fs::remove_file(path);
     }
 

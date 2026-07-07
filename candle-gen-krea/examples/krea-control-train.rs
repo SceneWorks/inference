@@ -17,21 +17,23 @@
 //! `--synth N` first writes N synthetic (gradient target, stick-figure pose) pairs + manifest into
 //! `--data` — the self-contained smoke path when the real COCO-pose data isn't staged yet.
 //!
-//! Flags: `--snapshot <dir>` `--data <dir>` `--out <dir>` `--steps N` `--batch N` `--lr F`
-//! `--save-every N` `--n-blocks N` (default 7) `--resolution N` (default 512) `--seed N`
-//! `--branch-dtype bf16|f32` (default bf16) `--resume <ckpt.safetensors>` `--synth N`
-//! `--timestep-type sigmoid|uniform|linear|weighted` (default uniform).
+//! Flags: `--snapshot <dir>` `--data <dir>` `--out <dir>` `--steps N` `--batch N` (gradient
+//! accumulation — memory-flat) `--lr F` `--save-every N` `--n-blocks N` (default 7)
+//! `--resolution N` (default 512) `--seed N` `--branch-dtype bf16|f32` (default bf16)
+//! `--resume <ckpt.safetensors>` `--synth N`
+//! `--timestep-type sigmoid|uniform|linear|weighted` (default uniform)
+//! `--warmup-steps N` (linear LR warmup from 0; default 0 = off)
+//! `--checkpoint true|false` (gradient-checkpointed backward, default true — the dense backward
+//! OOMs ≥ 512² on a 96 GB card).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::train::flow_match::{
-    self, component_vb, sample_noise, sample_unit_timestep, velocity_loss,
-};
+use candle_gen::train::flow_match::{self, component_vb, sample_noise, sample_unit_timestep};
 use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
-use candle_gen_krea::control::{forward_with_control, ControlBranch};
+use candle_gen_krea::control::{control_loss_grads, ControlBranch};
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::{Krea2Config, KreaTeConfig, KreaTextEncoder, KreaTokenizer, KreaTrainDit};
 use candle_gen_qwen_image::vae::QwenVaeEncoder;
@@ -53,6 +55,10 @@ struct Args {
     resume: Option<PathBuf>,
     synth: usize,
     timestep_type: String,
+    /// Linear LR warmup from 0 over the first N steps (0 = off).
+    warmup_steps: u32,
+    /// Gradient-checkpointed backward (default on — dense OOMs ≥ 512² on a 96 GB card).
+    checkpoint: bool,
 }
 
 fn parse_args() -> Args {
@@ -71,6 +77,8 @@ fn parse_args() -> Args {
         resume: None,
         synth: 0,
         timestep_type: "uniform".into(),
+        warmup_steps: 0,
+        checkpoint: true,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -102,6 +110,14 @@ fn parse_args() -> Args {
             "--resume" => a.resume = Some(val().into()),
             "--synth" => a.synth = val().parse().expect("--synth"),
             "--timestep-type" => a.timestep_type = val(),
+            "--warmup-steps" => a.warmup_steps = val().parse().expect("--warmup-steps"),
+            "--checkpoint" => {
+                a.checkpoint = match val().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "on" => true,
+                    "false" | "0" | "off" => false,
+                    other => panic!("--checkpoint must be true|false, got {other}"),
+                }
+            }
             other => panic!("unknown flag {other}"),
         }
         i += 2;
@@ -364,7 +380,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(path)
     };
 
-    // ── train loop: micro-steps over the batch, averaged grads, clip, AdamW ──
+    // ── train loop: micro-steps over the batch (grad accumulation — memory-flat in batch size),
+    //    averaged grads, clip 1.0, linear LR warmup, AdamW ──
     for step in start_step..(start_step + a.steps) {
         let t0 = Instant::now();
         let mut acc = None;
@@ -378,30 +395,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 flow_match::timestep_seed(a.seed, micro),
             );
             let noise = sample_noise(x0.dims(), flow_match::noise_seed(a.seed, micro), &device)?;
-            let (x_t, target) = flow_match::build_batch(x0, &noise, sigma as f64)?;
-            let t = Tensor::from_vec(vec![sigma], (1,), &device)?;
-            let v = forward_with_control(&dit, &branch, &x_t, &t, cap, ctrl, 1.0)?;
-            let loss = velocity_loss(&v, &target, false)?;
-            loss_sum += loss.to_vec0::<f32>()?;
-            let grads = loss.backward()?;
+            let (loss, grads) = control_loss_grads(
+                &dit,
+                &branch,
+                x0,
+                ctrl,
+                cap,
+                sigma,
+                &noise,
+                false,
+                DType::BF16,
+                a.checkpoint,
+            )?;
+            loss_sum += loss;
             accumulate_grads(&mut acc, grads, &vars)?;
         }
         let mut grads = acc.expect("batch >= 1");
         scale_grads(&mut grads, &vars, 1.0 / a.batch as f64)?;
         let gnorm = clip_grad_norm(&mut grads, &vars, 1.0)?;
+        // Linear LR warmup from 0 over the first `warmup_steps` optimizer updates.
+        let warm = if a.warmup_steps > 0 {
+            ((step + 1) as f32 / a.warmup_steps as f32).min(1.0)
+        } else {
+            1.0
+        };
+        opt.set_lr_scaled(warm);
         opt.step(&grads)?;
 
         let loss = loss_sum / a.batch as f32;
         let secs = t0.elapsed().as_secs_f32();
+        let lr_eff = a.lr * warm;
         println!(
-            "step {:>5}/{} loss {loss:.5} grad_norm {gnorm:.3} {secs:.2}s",
+            "step {:>5}/{} loss {loss:.5} grad_norm {gnorm:.3} lr {lr_eff:.2e} {secs:.2}s",
             step + 1,
             start_step + a.steps
         );
         writeln!(
             log,
             "{}",
-            serde_json::json!({"step": step + 1, "loss": loss, "grad_norm": gnorm, "secs": secs, "lr": a.lr})
+            serde_json::json!({"step": step + 1, "loss": loss, "grad_norm": gnorm, "secs": secs, "lr": lr_eff})
         )?;
         if !loss.is_finite() {
             return Err(format!("non-finite loss at step {}", step + 1).into());
