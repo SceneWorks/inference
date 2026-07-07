@@ -41,6 +41,11 @@ use crate::loader::{rms_scale_weight, Weights};
 use crate::train_dit::{repeat_kv, rms_scale_diff, sdpa_diff, KreaTrainDit, MainCtx};
 use crate::transformer::rope::apply_interleaved_rope;
 
+/// Default residual RMS clamp τ: an injected residual may at most MATCH the main image-token
+/// stream's RMS (`τ = 1.0`) — a control signal that needs more than that is overwriting, not
+/// steering (the sc-8460 step-500 degeneracy reached 25×).
+pub const DEFAULT_RESIDUAL_CLAMP: f64 = 1.0;
+
 /// A trainable no-bias linear over a [`Var`] weight `[out, in]`; the weight is cast to the activation
 /// dtype in the forward (differentiable — f32 master weights train through it).
 struct VLin {
@@ -227,6 +232,15 @@ pub struct ControlBranch {
     /// Inference mode: weight reads are detached from the autograd graph (see [`rd`]). Off (training)
     /// by default; flip with [`freeze`](Self::freeze) before using the branch in a sampler loop.
     frozen: bool,
+    /// Residual RMS clamp τ (sc-8460 step-500 probe): each injected residual's RMS is capped at
+    /// `τ ×` the RMS of the main image-token slice it lands on. `None` = unclamped. Without it the
+    /// zero-init block-0 projection is free to grow until it **overwrites** the main stream (the
+    /// step-500 run reached ‖res₀‖ ≈ 25×‖main₀‖ while the single-forward training loss stayed
+    /// normal — downstream RMSNorms absorb the scale — yet the 8-step sampler compounds the
+    /// hypersensitive velocity into full-frame noise). The clamp factor is treated as a constant
+    /// (stop-grad, like adaptive grad clipping), so training simply optimizes within the budget.
+    /// Applied identically in the training, checkpointed, inference, and probe paths.
+    clamp_tau: Option<f64>,
 }
 
 impl ControlBranch {
@@ -299,6 +313,7 @@ impl ControlBranch {
             blocks,
             named: reg.named,
             frozen: false,
+            clamp_tau: Some(DEFAULT_RESIDUAL_CLAMP),
         })
     }
 
@@ -308,6 +323,39 @@ impl ControlBranch {
     /// training).
     pub fn freeze(&mut self) {
         self.frozen = true;
+    }
+
+    /// Override the residual RMS clamp τ (`None` = unclamped — the pre-fix behavior, kept for
+    /// A/B-ing checkpoints trained without the clamp). See the field docs for why the default is on.
+    pub fn set_residual_clamp(&mut self, tau: Option<f64>) {
+        self.clamp_tau = tau;
+    }
+
+    /// Clamp an (already `control_scale`-scaled) residual so its RMS is at most
+    /// `τ × RMS(main image tokens)`: `res · min(1, τ·rms(main)/rms(res))`. The factor is a detached
+    /// scalar (stop-grad, like adaptive gradient clipping), so gradients flow through the scaled
+    /// residual only. No-op when unclamped, when the residual is already within budget, or when it
+    /// is exactly zero (the step-0 identity is untouched).
+    fn apply_clamp(&self, res: &Tensor, main_img: &Tensor) -> Result<Tensor> {
+        let Some(tau) = self.clamp_tau else {
+            return Ok(res.clone());
+        };
+        let rms = |t: &Tensor| -> Result<f64> {
+            Ok((t
+                .detach()
+                .to_dtype(DType::F32)?
+                .sqr()?
+                .mean_all()?
+                .to_scalar::<f32>()? as f64)
+                .sqrt())
+        };
+        let rn = rms(res)?;
+        let cap = tau * rms(main_img)?;
+        if rn <= cap || rn == 0.0 {
+            Ok(res.clone())
+        } else {
+            Ok((res * (cap / rn))?)
+        }
     }
 
     /// Number of branch blocks (`N`).
@@ -404,14 +452,67 @@ pub fn forward_with_control(
     let mut x = combined;
     for (i, blk) in dit.blocks().iter().enumerate() {
         if let Some(r) = residuals.get(i) {
-            let scaled = (r * control_scale)?.to_dtype(x.dtype())?;
             let txt = x.narrow(1, 0, ctx.cap_len)?;
-            let img = (x.narrow(1, ctx.cap_len, ctx.img_len)? + scaled)?;
+            let img = x.narrow(1, ctx.cap_len, ctx.img_len)?;
+            let scaled = (r * control_scale)?.to_dtype(x.dtype())?;
+            let scaled = branch.apply_clamp(&scaled, &img)?;
+            let img = (img + scaled)?;
             x = Tensor::cat(&[&txt, &img], 1)?;
         }
         x = blk.forward(&x, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
     }
     Ok(dit.velocity_out(&x, &ctx)?)
+}
+
+/// DIAGNOSTIC (sc-8460 step-500 probe): the branched forward with per-injection-point norms. For
+/// each branch block `i` reports `(‖res_i‖₂, ‖main_img_i‖₂)` — the residual actually added and the
+/// main-stream image-token slice it lands on — plus the branched velocity and the un-branched base
+/// velocity for the same inputs. Runs in whatever mode the branch is in (train-tracked or frozen).
+#[allow(clippy::type_complexity)]
+pub fn probe_forward(
+    dit: &KreaTrainDit,
+    branch: &ControlBranch,
+    latent: &Tensor,
+    timestep: &Tensor,
+    context: &Tensor,
+    ctrl_latent: &Tensor,
+    control_scale: f64,
+) -> Result<(Vec<(f64, f64)>, Tensor, Tensor)> {
+    let norm = |t: &Tensor| -> Result<f64> {
+        Ok(t.to_dtype(DType::F32)?
+            .sqr()?
+            .sum_all()?
+            .to_scalar::<f32>()? as f64)
+        .map(f64::sqrt)
+    };
+    let (combined, ctx) = dit.forward_pre_main(latent, timestep, context)?;
+    let ctrl_tokens = dit.embed_latent(ctrl_latent)?;
+    let residuals = branch.residuals(&combined, &ctrl_tokens, &ctx)?;
+
+    let mut report = Vec::with_capacity(residuals.len());
+    let mut x = combined.clone();
+    for (i, blk) in dit.blocks().iter().enumerate() {
+        if let Some(r) = residuals.get(i) {
+            let txt = x.narrow(1, 0, ctx.cap_len)?;
+            let img = x.narrow(1, ctx.cap_len, ctx.img_len)?;
+            let scaled = (r * control_scale)?.to_dtype(x.dtype())?;
+            // Reported norms are POST-clamp — what is actually added to the stream.
+            let scaled = branch.apply_clamp(&scaled, &img)?;
+            report.push((norm(&scaled)?, norm(&img)?));
+            let img = (img + scaled)?;
+            x = Tensor::cat(&[&txt, &img], 1)?;
+        }
+        x = blk.forward(&x, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
+    }
+    let v_branched = dit.velocity_out(&x, &ctx)?;
+
+    // Un-branched base velocity over the SAME pre-main output.
+    let mut xb = combined;
+    for blk in dit.blocks() {
+        xb = blk.forward(&xb, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
+    }
+    let v_base = dit.velocity_out(&xb, &ctx)?;
+    Ok((report, v_branched, v_base))
 }
 
 /// One training micro-step's forward + backward at flow-match `sigma`: build the noised latent, run
@@ -485,8 +586,11 @@ pub fn control_loss_grads(
                     .forward(&bh_img, false)
                     .map_err(CoreError::wrap)?;
                 let txt = main_h.narrow(1, 0, ctx_ref.cap_len)?;
-                let img = (main_h.narrow(1, ctx_ref.cap_len, ctx_ref.img_len)?
-                    + res.to_dtype(main_h.dtype())?)?;
+                let img = main_h.narrow(1, ctx_ref.cap_len, ctx_ref.img_len)?;
+                let res = branch
+                    .apply_clamp(&res.to_dtype(main_h.dtype())?, &img)
+                    .map_err(CoreError::wrap)?;
+                let img = (img + res)?;
                 let inj = Tensor::cat(&[&txt, &img], 1)?;
                 let mh = blk.forward(&inj, &ctx_ref.tvec, &ctx_ref.rcos, &ctx_ref.rsin)?;
                 if drop_branch {
@@ -703,6 +807,144 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "expected nonzero branch grads to compare");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Train/infer branch-path parity (the sc-8460 step-500 probe regression gate): with the SAME
+    /// nudged weights, the training-mode forward (graph-tracked Vars, as `control_loss_grads`
+    /// applies the branch) and the frozen inference-mode forward (as `krea-control-infer` applies
+    /// it) must be **exactly** equal — freezing changes graph tracking, never values — and
+    /// [`probe_forward`]'s branched velocity must match both.
+    #[test]
+    fn train_and_infer_branch_paths_match() {
+        let dev = Device::Cpu;
+        let (dit, c, path) = tiny_dit();
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+        let train_b = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        nudge_vars(&train_b, &dev);
+        let ckpt = std::env::temp_dir().join(format!(
+            "krea_ctrl_parity_{}.safetensors",
+            std::process::id()
+        ));
+        train_b.save(&ckpt).unwrap();
+        let mut infer_b = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
+        infer_b.freeze();
+
+        let (x0, cap, _) = tiny_batch(&c);
+        let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+        let ctxt = cap.unsqueeze(0).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let v_train =
+            flat(&forward_with_control(&dit, &train_b, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        let v_infer =
+            flat(&forward_with_control(&dit, &infer_b, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        assert_eq!(
+            v_train, v_infer,
+            "train-mode and frozen forwards must be identical"
+        );
+
+        let (report, v_probe, v_base) =
+            probe_forward(&dit, &infer_b, &x0, &t, &ctxt, &ctrl, 1.0).unwrap();
+        assert_eq!(
+            flat(&v_probe),
+            v_infer,
+            "probe forward must match the real forward"
+        );
+        assert_eq!(report.len(), 1);
+        assert!(report[0].0.is_finite() && report[0].1 > 0.0);
+        // Nudged (nonzero) projections => the branched velocity differs from base.
+        assert_ne!(flat(&v_base), v_infer);
+        let _ = std::fs::remove_file(ckpt);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The residual RMS clamp (sc-8460 step-500 fix): with projections blown up far past the
+    /// stream scale, the default clamp caps every injected residual at `τ × ‖main‖` (probe-verified),
+    /// gradients still flow through the clamped path, an in-budget residual is untouched
+    /// (clamp(None) == clamp(τ) when small), and the step-0 zero residual stays an exact identity.
+    #[test]
+    fn residual_clamp_caps_swamping() {
+        let dev = Device::Cpu;
+        let (dit, c, path) = tiny_dit();
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+
+        // Blow the projections up: residuals many times the stream norm.
+        let mut big = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        for (name, v) in &big.named {
+            if name.contains("proj_out") {
+                v.set(&Tensor::randn(0f32, 5.0f32, v.as_tensor().dims(), &dev).unwrap())
+                    .unwrap();
+            }
+        }
+
+        let (x0, cap, noise) = tiny_batch(&c);
+        let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+        let ctxt = cap.unsqueeze(0).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+
+        // Unclamped: the ratio exceeds τ (the degenerate regime).
+        big.set_residual_clamp(None);
+        let (rep_off, _, _) = probe_forward(&dit, &big, &x0, &t, &ctxt, &ctrl, 1.0).unwrap();
+        assert!(
+            rep_off[0].0 / rep_off[0].1 > DEFAULT_RESIDUAL_CLAMP * 1.5,
+            "test setup should swamp: ratio {}",
+            rep_off[0].0 / rep_off[0].1
+        );
+
+        // Clamped: the post-clamp ratio is capped at τ (probe norms are per-tensor L2 over equal
+        // element counts, so the L2 ratio equals the RMS ratio).
+        big.set_residual_clamp(Some(DEFAULT_RESIDUAL_CLAMP));
+        let (rep_on, _, _) = probe_forward(&dit, &big, &x0, &t, &ctxt, &ctrl, 1.0).unwrap();
+        assert!(
+            rep_on[0].0 / rep_on[0].1 <= DEFAULT_RESIDUAL_CLAMP * 1.01,
+            "clamp must cap the ratio: {}",
+            rep_on[0].0 / rep_on[0].1
+        );
+
+        // Gradients still flow through the clamped path.
+        let (loss, grads) = control_loss_grads(
+            &dit,
+            &big,
+            &x0,
+            &ctrl,
+            &cap,
+            0.5,
+            &noise,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        assert!(loss.is_finite());
+        let some_proj = big
+            .named
+            .iter()
+            .find(|(n, _)| n.contains("proj_out"))
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(
+            grads.get(some_proj.as_tensor()).is_some(),
+            "clamped residual must still carry gradient to the projection"
+        );
+
+        // An in-budget residual is untouched by the clamp (identical velocities), and the exact
+        // zero-init residual stays an identity with the clamp on.
+        let mut small = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let v_id = flat(&forward_with_control(&dit, &small, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        assert_eq!(
+            v_id,
+            flat(&dit.forward(&x0, &t, &ctxt).unwrap()),
+            "zero residual + clamp must stay a step-0 identity"
+        );
+        nudge_vars(&small, &dev); // tiny residuals, far under the τ budget
+        small.set_residual_clamp(Some(DEFAULT_RESIDUAL_CLAMP));
+        let v_on = flat(&forward_with_control(&dit, &small, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        small.set_residual_clamp(None);
+        let v_off = flat(&forward_with_control(&dit, &small, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        assert_eq!(v_on, v_off, "an in-budget residual must pass unclamped");
         let _ = std::fs::remove_file(path);
     }
 

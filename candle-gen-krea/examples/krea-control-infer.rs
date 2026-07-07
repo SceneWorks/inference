@@ -47,6 +47,8 @@ struct Args {
     steps: usize,
     size: u32,
     out: PathBuf,
+    /// Residual RMS clamp τ (0 = off; default `control::DEFAULT_RESIDUAL_CLAMP`).
+    residual_clamp: f64,
 }
 
 fn parse_args() -> Args {
@@ -60,6 +62,7 @@ fn parse_args() -> Args {
         steps: 8,
         size: 1024,
         out: PathBuf::from("krea_control_render.png"),
+        residual_clamp: candle_gen_krea::control::DEFAULT_RESIDUAL_CLAMP,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -80,6 +83,7 @@ fn parse_args() -> Args {
             "--steps" => a.steps = val().parse().expect("--steps"),
             "--size" => a.size = val().parse().expect("--size"),
             "--out" => a.out = val().into(),
+            "--residual-clamp" => a.residual_clamp = val().parse().expect("--residual-clamp"),
             other => panic!("unknown flag {other}"),
         }
         i += 2;
@@ -129,6 +133,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut b = ControlBranch::from_checkpoint(p, &cfg, &device)?;
             // Inference: detach weight reads so the sampler loop builds no autograd graph.
             b.freeze();
+            let clamp = (a.residual_clamp > 0.0).then_some(a.residual_clamp);
+            b.set_residual_clamp(clamp);
+            eprintln!("residual clamp tau: {clamp:?}");
             eprintln!(
                 "branch: {} blocks, {:.2}B params, control_scale {}",
                 b.num_blocks(),
