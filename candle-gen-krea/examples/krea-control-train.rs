@@ -126,6 +126,7 @@ fn parse_args() -> Args {
 }
 
 struct Row {
+    id: String,
     target: String,
     pose: String,
     caption: String,
@@ -146,8 +147,21 @@ fn read_manifest(data: &Path) -> Vec<Row> {
                     .unwrap_or_else(|| panic!("manifest row missing string field {k:?}: {l}"))
                     .to_string()
             };
+            let target = field("target");
+            // Encode-cache key: the manifest id, falling back to the target filename stem.
+            let id = v
+                .get("id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    Path::new(&target)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| target.clone())
+                });
             Row {
-                target: field("target"),
+                id,
+                target,
                 pose: field("pose"),
                 caption: field("caption"),
             }
@@ -283,42 +297,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         a.branch_dtype
     );
 
-    // ── cache: VAE-encode targets + poses, TE-encode captions (all f32); drop the encoders ──
+    // ── cache: VAE-encode targets + poses, TE-encode captions. The cache lives on the **CPU**
+    // (and is persisted to `<data>/.encode-cache/` keyed by manifest id + resolution, so a relaunch
+    // skips the encode pass entirely); each sample is copied to the device inside the step loop just
+    // before use. A GPU-resident cache scales with dataset size — at 5k items it filled the card and
+    // WDDM-paged the whole run (~400 s/step). Latents stay f32 (the flow-match mix runs in f32);
+    // the caption stack is stored bf16 (the DiT casts it to bf16 at forward anyway — identical
+    // values, half the RAM: ~3 MB/item → ~16 GB CPU RAM at 5k items).
     let t_cache = Instant::now();
-    let vae_enc = QwenVaeEncoder::new(component_vb(
-        &a.snapshot,
-        "vae",
-        &device,
-        DType::F32,
-        "krea control trainer",
-    )?)?;
-    let tokenizer = KreaTokenizer::from_snapshot(&a.snapshot, &device)?;
-    let te_cfg = KreaTeConfig::from_snapshot(&a.snapshot)?;
-    let te_w = Weights::from_dir(&a.snapshot.join("text_encoder"), &device, DType::F32)?;
-    let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
+    let cpu = candle_gen::candle_core::Device::Cpu;
+    let cache_dir = a.data.join(".encode-cache");
+    std::fs::create_dir_all(&cache_dir)?;
+    let cache_paths: Vec<PathBuf> = rows
+        .iter()
+        .map(|r| cache_dir.join(format!("{}_{edge}.safetensors", r.id)))
+        .collect();
 
-    // (x0 latent, control latent, caption stack), all f32 on device.
+    // Load the encoders only if at least one item is missing from the disk cache.
+    let encoders = if cache_paths.iter().any(|p| !p.exists()) {
+        let vae_enc = QwenVaeEncoder::new(component_vb(
+            &a.snapshot,
+            "vae",
+            &device,
+            DType::F32,
+            "krea control trainer",
+        )?)?;
+        let tokenizer = KreaTokenizer::from_snapshot(&a.snapshot, &device)?;
+        let te_cfg = KreaTeConfig::from_snapshot(&a.snapshot)?;
+        let te_w = Weights::from_dir(&a.snapshot.join("text_encoder"), &device, DType::F32)?;
+        let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
+        Some((vae_enc, tokenizer, te, te_w))
+    } else {
+        eprintln!(
+            "encode cache complete under {} — skipping the encoders",
+            cache_dir.display()
+        );
+        None
+    };
+
+    // (x0 latent f32, control latent f32, caption stack bf16), all on CPU.
     let mut cache: Vec<(Tensor, Tensor, Tensor)> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let target = candle_gen::train::dataset::load_image_tensor(
-            &a.data.join(&row.target),
-            edge,
-            &device,
-        )?;
-        let pose =
-            candle_gen::train::dataset::load_image_tensor(&a.data.join(&row.pose), edge, &device)?;
-        let x0 = vae_enc.encode(&target)?;
-        let ctrl = vae_enc.encode(&pose)?;
-        let ids = tokenizer.encode_prompt(&row.caption, MAX_TEXT_TOKENS)?;
-        // (1, L, layers, hidden) -> the unbatched (L, layers, hidden) stack `control_loss_grads`
-        // consumes (it re-adds the batch axis), matching the LoRA trainer's cached format.
-        let cap = te.forward(&ids)?.squeeze(0)?.to_dtype(DType::F32)?;
-        cache.push((x0, ctrl, cap));
-        eprintln!("cached {}/{}", i + 1, rows.len());
+        let path = &cache_paths[i];
+        let entry = if path.exists() {
+            let m = candle_gen::candle_core::safetensors::load(path, &cpu)?;
+            let get = |k: &str| {
+                m.get(k)
+                    .cloned()
+                    .ok_or_else(|| format!("encode cache {} missing {k}", path.display()))
+            };
+            (get("x0")?, get("ctrl")?, get("cap")?)
+        } else {
+            let (vae_enc, tokenizer, te, _) = encoders
+                .as_ref()
+                .expect("encoders loaded when any item is uncached");
+            let target = candle_gen::train::dataset::load_image_tensor(
+                &a.data.join(&row.target),
+                edge,
+                &device,
+            )?;
+            let pose = candle_gen::train::dataset::load_image_tensor(
+                &a.data.join(&row.pose),
+                edge,
+                &device,
+            )?;
+            let x0 = vae_enc.encode(&target)?.to_device(&cpu)?;
+            let ctrl = vae_enc.encode(&pose)?.to_device(&cpu)?;
+            let ids = tokenizer.encode_prompt(&row.caption, MAX_TEXT_TOKENS)?;
+            // (1, L, layers, hidden) -> the unbatched (L, layers, hidden) stack
+            // `control_loss_grads` consumes (it re-adds the batch axis), stored bf16 on CPU.
+            let cap = te
+                .forward(&ids)?
+                .squeeze(0)?
+                .to_dtype(DType::BF16)?
+                .to_device(&cpu)?;
+            let mut m = std::collections::HashMap::new();
+            m.insert("x0".to_string(), x0.clone());
+            m.insert("ctrl".to_string(), ctrl.clone());
+            m.insert("cap".to_string(), cap.clone());
+            candle_gen::candle_core::safetensors::save(&m, path)?;
+            (x0, ctrl, cap)
+        };
+        cache.push(entry);
+        if (i + 1) % 100 == 0 || i + 1 == rows.len() {
+            eprintln!("cached {}/{}", i + 1, rows.len());
+        }
     }
-    drop(te);
-    drop(te_w);
-    drop(vae_enc);
+    drop(encoders);
     eprintln!("cache done in {:.1}s", t_cache.elapsed().as_secs_f32());
 
     // ── frozen base DiT (bf16) + trainable branch ──
@@ -390,7 +455,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut loss_sum = 0f32;
         for j in 0..a.batch {
             let micro = step * a.batch + j;
-            let (x0, ctrl, cap) = &cache[(micro as usize) % cache.len()];
+            // The cache is CPU-resident (dataset-size-independent VRAM); copy this sample's tensors
+            // to the device for the micro-step only — they drop at the end of the iteration.
+            let (x0_c, ctrl_c, cap_c) = &cache[(micro as usize) % cache.len()];
+            let x0 = x0_c.to_device(&device)?;
+            let ctrl = ctrl_c.to_device(&device)?;
+            let cap = cap_c.to_device(&device)?;
             let sigma = sample_unit_timestep(
                 &a.timestep_type,
                 "none",
@@ -400,9 +470,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (loss, grads) = control_loss_grads(
                 &dit,
                 &branch,
-                x0,
-                ctrl,
-                cap,
+                &x0,
+                &ctrl,
+                &cap,
                 sigma,
                 &noise,
                 false,
