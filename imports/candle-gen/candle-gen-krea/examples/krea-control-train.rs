@@ -59,6 +59,9 @@ struct Args {
     warmup_steps: u32,
     /// Gradient-checkpointed backward (default on — dense OOMs ≥ 512² on a 96 GB card).
     checkpoint: bool,
+    /// Residual RMS clamp τ (0 = off). Default `control::DEFAULT_RESIDUAL_CLAMP` — prevents the
+    /// block-0 stream-overwrite degeneracy the step-500 probe found (sc-8460).
+    residual_clamp: f64,
 }
 
 fn parse_args() -> Args {
@@ -79,6 +82,7 @@ fn parse_args() -> Args {
         timestep_type: "uniform".into(),
         warmup_steps: 0,
         checkpoint: true,
+        residual_clamp: candle_gen_krea::control::DEFAULT_RESIDUAL_CLAMP,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -111,6 +115,7 @@ fn parse_args() -> Args {
             "--synth" => a.synth = val().parse().expect("--synth"),
             "--timestep-type" => a.timestep_type = val(),
             "--warmup-steps" => a.warmup_steps = val().parse().expect("--warmup-steps"),
+            "--residual-clamp" => a.residual_clamp = val().parse().expect("--residual-clamp"),
             "--checkpoint" => {
                 a.checkpoint = match val().to_ascii_lowercase().as_str() {
                     "true" | "1" | "on" => true,
@@ -391,7 +396,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dit_w = Weights::from_dir(&a.snapshot.join("transformer"), &device, DType::BF16)?;
     let dit = KreaTrainDit::load(&dit_w, &cfg)?;
 
-    let (branch, start_step) = match &a.resume {
+    let (mut branch, start_step) = match &a.resume {
         Some(ckpt) => {
             let b = ControlBranch::from_checkpoint(ckpt, &cfg, &device)?;
             let meta = ckpt.with_extension("json");
@@ -420,6 +425,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     drop(dit_w);
 
+    let clamp = (a.residual_clamp > 0.0).then_some(a.residual_clamp);
+    branch.set_residual_clamp(clamp);
+    eprintln!("residual clamp tau: {clamp:?}");
+    let branch = branch; // immutable from here
     let vars = branch.vars();
     let mut opt = TrainOptimizer::from_config("adamw", vars.clone(), a.lr, 0.0)?;
 
