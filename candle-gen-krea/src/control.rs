@@ -45,9 +45,21 @@ struct VLin {
 }
 
 impl VLin {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let w = self.w.as_tensor().to_dtype(x.dtype())?;
+    fn forward(&self, x: &Tensor, frozen: bool) -> Result<Tensor> {
+        let w = rd(&self.w, frozen).to_dtype(x.dtype())?;
         Ok(x.broadcast_matmul(&w.t()?)?)
+    }
+}
+
+/// Read a `Var`'s current value: the live (graph-tracked) variable while training, or a **detached**
+/// storage-sharing view when the branch is [frozen](ControlBranch::freeze) for inference. Without the
+/// detach, every sampler step would build (and, chained through the Euler update, RETAIN across all
+/// steps) a full autograd graph over the branch + the 28 main blocks — an OOM at render resolution.
+fn rd(v: &Var, frozen: bool) -> Tensor {
+    if frozen {
+        v.as_tensor().detach()
+    } else {
+        v.as_tensor().clone()
     }
 }
 
@@ -110,17 +122,17 @@ impl ControlAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor, rope: (&Tensor, &Tensor)) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, rope: (&Tensor, &Tensor), frozen: bool) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.heads, self.kv_heads, self.head_dim);
 
-        let q = self.q.forward(x)?.reshape((b, s, nh, hd))?;
-        let k = self.k.forward(x)?.reshape((b, s, nkv, hd))?;
-        let v = self.v.forward(x)?.reshape((b, s, nkv, hd))?;
-        let gate = self.gate.forward(x)?;
+        let q = self.q.forward(x, frozen)?.reshape((b, s, nh, hd))?;
+        let k = self.k.forward(x, frozen)?.reshape((b, s, nkv, hd))?;
+        let v = self.v.forward(x, frozen)?.reshape((b, s, nkv, hd))?;
+        let gate = self.gate.forward(x, frozen)?;
 
-        let q = rms_scale_diff(&q, self.norm_q.as_tensor(), self.eps)?;
-        let k = rms_scale_diff(&k, self.norm_k.as_tensor(), self.eps)?;
+        let q = rms_scale_diff(&q, &rd(&self.norm_q, frozen), self.eps)?;
+        let k = rms_scale_diff(&k, &rd(&self.norm_k, frozen), self.eps)?;
         let (cos, sin) = rope;
         let q = apply_interleaved_rope(&q, cos, sin)?;
         let k = apply_interleaved_rope(&k, cos, sin)?;
@@ -136,7 +148,7 @@ impl ControlAttention {
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
 
         let gated = (o * sigmoid(&gate)?)?;
-        self.o.forward(&gated)
+        self.o.forward(&gated, frozen)
     }
 }
 
@@ -171,25 +183,33 @@ impl ControlBlock {
     }
 
     /// Mirror of [`crate::train_dit`]'s `TrainBlock::forward` over the `Var`-backed weights.
-    fn forward(&self, x: &Tensor, tvec: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        tvec: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        frozen: bool,
+    ) -> Result<Tensor> {
         use candle_gen::candle_core::D;
-        let sst = self.sst.as_tensor().to_dtype(tvec.dtype())?;
+        let sst = rd(&self.sst, frozen).to_dtype(tvec.dtype())?;
         let m = tvec.broadcast_add(&sst)?; // [b, 1, 6·hidden]
         let chunks = m.chunk(6, D::Minus1)?;
         let (prescale, preshift, pregate) = (&chunks[0], &chunks[1], &chunks[2]);
         let (postscale, postshift, postgate) = (&chunks[3], &chunks[4], &chunks[5]);
 
-        let pre = rms_scale_diff(x, self.prenorm.as_tensor(), self.eps)?
+        let pre = rms_scale_diff(x, &rd(&self.prenorm, frozen), self.eps)?
             .broadcast_mul(&(prescale + 1.0)?)?
             .broadcast_add(preshift)?;
-        let attn = self.attn.forward(&pre, (cos, sin))?;
+        let attn = self.attn.forward(&pre, (cos, sin), frozen)?;
         let x = (x + attn.broadcast_mul(pregate)?)?;
 
-        let post = rms_scale_diff(&x, self.postnorm.as_tensor(), self.eps)?
+        let post = rms_scale_diff(&x, &rd(&self.postnorm, frozen), self.eps)?
             .broadcast_mul(&(postscale + 1.0)?)?
             .broadcast_add(postshift)?;
-        let gated = (self.ff_gate.forward(&post)?.silu()? * self.ff_up.forward(&post)?)?;
-        let mlp = self.ff_down.forward(&gated)?;
+        let gated =
+            (self.ff_gate.forward(&post, frozen)?.silu()? * self.ff_up.forward(&post, frozen)?)?;
+        let mlp = self.ff_down.forward(&gated, frozen)?;
         Ok((&x + mlp.broadcast_mul(postgate)?)?)
     }
 }
@@ -201,6 +221,9 @@ impl ControlBlock {
 pub struct ControlBranch {
     blocks: Vec<ControlBlock>,
     named: Vec<(String, Var)>,
+    /// Inference mode: weight reads are detached from the autograd graph (see [`rd`]). Off (training)
+    /// by default; flip with [`freeze`](Self::freeze) before using the branch in a sampler loop.
+    frozen: bool,
 }
 
 impl ControlBranch {
@@ -272,7 +295,16 @@ impl ControlBranch {
         Ok(Self {
             blocks,
             named: reg.named,
+            frozen: false,
         })
+    }
+
+    /// Switch the branch to inference mode: every weight read is detached, so a sampler loop builds
+    /// **no** autograd graph (which the Euler update would otherwise chain and retain across all
+    /// steps — an OOM at render resolution). Values are unchanged; there is no unfreeze (reload for
+    /// training).
+    pub fn freeze(&mut self) {
+        self.frozen = true;
     }
 
     /// Number of branch blocks (`N`).
@@ -319,9 +351,9 @@ impl ControlBranch {
         let mut h = Tensor::cat(&[&txt, &img], 1)?;
         let mut out = Vec::with_capacity(self.blocks.len());
         for blk in &self.blocks {
-            h = blk.forward(&h, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
+            h = blk.forward(&h, &ctx.tvec, &ctx.rcos, &ctx.rsin, self.frozen)?;
             let h_img = h.narrow(1, ctx.cap_len, ctx.img_len)?;
-            out.push(blk.proj_out.forward(&h_img)?);
+            out.push(blk.proj_out.forward(&h_img, self.frozen)?);
         }
         Ok(out)
     }
@@ -510,7 +542,9 @@ mod tests {
         let ckpt =
             std::env::temp_dir().join(format!("krea_ctrl_ckpt_{}.safetensors", std::process::id()));
         branch.save(&ckpt).unwrap();
-        let loaded = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
+        let mut loaded = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
+        // Inference mode (detached weight reads) must not change values — only graph tracking.
+        loaded.freeze();
         assert_eq!(loaded.num_blocks(), 1);
         assert_eq!(loaded.num_params(), branch.num_params());
 
