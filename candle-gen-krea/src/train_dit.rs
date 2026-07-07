@@ -59,7 +59,7 @@ pub const KREA_ATTN_TARGETS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
 /// no-backward fused `ops::rms_norm`). `weight` is the pre-folded `scale + 1` f32 tensor; the reduction
 /// runs in f32 (the reference upcasts) and the result is cast back to `x`'s dtype, so it is numerically
 /// the same op the inference path applies — just one the autograd can traverse.
-fn rms_scale_diff(x: &Tensor, weight_f32: &Tensor, eps: f64) -> Result<Tensor> {
+pub(crate) fn rms_scale_diff(x: &Tensor, weight_f32: &Tensor, eps: f64) -> Result<Tensor> {
     let dt = x.dtype();
     let xf = x.to_dtype(DType::F32)?;
     let hidden = xf.dim(D::Minus1)? as f64;
@@ -70,7 +70,7 @@ fn rms_scale_diff(x: &Tensor, weight_f32: &Tensor, eps: f64) -> Result<Tensor> {
 
 /// Repeat each kv head `groups` times consecutively (`[b,s,hkv,hd] → [b,s,hkv·groups,hd]`) — the
 /// composable `repeat_interleave` matching the inference block's `repeat_kv` (reference `enable_gqa`).
-fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
+pub(crate) fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
     if groups == 1 {
         return Ok(x.clone());
     }
@@ -83,7 +83,7 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 
 /// Bidirectional, unmasked scaled-dot-product attention with a **composable** softmax (the inference
 /// `sdpa` uses the no-backward fused `softmax_last_dim`). `q`/`k`/`v`: `[b, h, s, hd]`.
-fn sdpa_diff(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+pub(crate) fn sdpa_diff(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
     let q = q.contiguous()?;
     let k = k.contiguous()?;
     let v = v.contiguous()?;
@@ -193,7 +193,7 @@ impl TrainAttention {
 /// One trainable single-stream block (`DoubleSharedModulation`) — the differentiable twin of
 /// [`crate::transformer::block`]'s `SingleStreamBlock`. The SwiGLU FFN is the inference crate's
 /// (composable, frozen) [`SwiGlu`]; only the norms are swapped for the composable [`rms_scale_diff`].
-struct TrainBlock {
+pub(crate) struct TrainBlock {
     scale_shift_table: Tensor, // [1, 1, 6·hidden]
     prenorm: Tensor,           // f32, scale + 1
     postnorm: Tensor,          // f32, scale + 1
@@ -233,7 +233,13 @@ impl TrainBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor, tvec: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(
+        &self,
+        x: &Tensor,
+        tvec: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
         let m = tvec.broadcast_add(&self.scale_shift_table)?; // [b, 1, 6·hidden]
         let chunks = m.chunk(6, D::Minus1)?;
         let (prescale, preshift, pregate) = (&chunks[0], &chunks[1], &chunks[2]);
@@ -258,12 +264,12 @@ impl TrainBlock {
 /// segment. None of these carry a trainable factor, so they are the detached boundary of the
 /// checkpointed backward.
 pub struct MainCtx {
-    tvec: Tensor, // [b, 1, 6·hidden] shared modulation
-    rcos: Tensor, // joint RoPE cos table
-    rsin: Tensor, // joint RoPE sin table
-    t: Tensor,    // [b, 1, hidden] for the final SimpleModulation
-    cap_len: usize,
-    img_len: usize,
+    pub(crate) tvec: Tensor, // [b, 1, 6·hidden] shared modulation
+    pub(crate) rcos: Tensor, // joint RoPE cos table
+    pub(crate) rsin: Tensor, // joint RoPE sin table
+    t: Tensor,               // [b, 1, hidden] for the final SimpleModulation
+    pub(crate) cap_len: usize,
+    pub(crate) img_len: usize,
     ht: usize,
     wt: usize,
     latent_ch: usize,
@@ -450,6 +456,22 @@ impl KreaTrainDit {
             combined = blk.forward(&combined, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
         }
         self.velocity_out(&combined, &ctx)
+    }
+
+    /// The single-stream stack, exposed for the pose-ControlNet spike (sc-8460): the control branch
+    /// injects per-block residuals into this stack from the outside
+    /// ([`crate::control::forward_with_control`]).
+    pub(crate) fn blocks(&self) -> &[TrainBlock] {
+        &self.blocks
+    }
+
+    /// Patch-embed an extra (control) latent through the **frozen** base `img_in` — the control
+    /// branch's conditioning embedder (sc-8460). `latent`: `[b, 16, H, W]` → `[b, img_len, hidden]`,
+    /// exactly the embedding [`forward_pre_main`](Self::forward_pre_main) gives the noisy latent.
+    pub(crate) fn embed_latent(&self, latent: &Tensor) -> Result<Tensor> {
+        let p = self.cfg.patch_size;
+        self.img_in
+            .forward(&patchify(&latent.to_dtype(self.dtype)?, p)?)
     }
 }
 
