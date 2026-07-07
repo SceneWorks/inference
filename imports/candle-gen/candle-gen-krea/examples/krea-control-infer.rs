@@ -126,7 +126,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dit = KreaTrainDit::load(&dit_w, &cfg)?;
     let branch = match (&a.ckpt, use_branch) {
         (Some(p), true) => {
-            let b = ControlBranch::from_checkpoint(p, &cfg, &device)?;
+            let mut b = ControlBranch::from_checkpoint(p, &cfg, &device)?;
+            // Inference: detach weight reads so the sampler loop builds no autograd graph.
+            b.freeze();
             eprintln!(
                 "branch: {} blocks, {:.2}B params, control_scale {}",
                 b.num_blocks(),
