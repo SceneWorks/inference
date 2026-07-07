@@ -310,7 +310,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let x0 = vae_enc.encode(&target)?;
         let ctrl = vae_enc.encode(&pose)?;
         let ids = tokenizer.encode_prompt(&row.caption, MAX_TEXT_TOKENS)?;
-        let cap = te.forward(&ids)?.to_dtype(DType::F32)?; // (1, L, layers, hidden)
+        // (1, L, layers, hidden) -> the unbatched (L, layers, hidden) stack `control_loss_grads`
+        // consumes (it re-adds the batch axis), matching the LoRA trainer's cached format.
+        let cap = te.forward(&ids)?.squeeze(0)?.to_dtype(DType::F32)?;
         cache.push((x0, ctrl, cap));
         eprintln!("cached {}/{}", i + 1, rows.len());
     }
