@@ -567,12 +567,8 @@ pub fn probe_forward(
     control_scale: f64,
 ) -> Result<(Vec<(f64, f64, f64)>, Tensor, Tensor)> {
     let norm = |t: &Tensor| -> Result<f64> {
-        Ok(t.detach()
-            .to_dtype(DType::F32)?
-            .sqr()?
-            .sum_all()?
-            .to_scalar::<f32>()? as f64)
-        .map(f64::sqrt)
+        let sq = t.detach().to_dtype(DType::F32)?.sqr()?.sum_all()?;
+        Ok((sq.to_scalar::<f32>()? as f64).sqrt())
     };
     let (combined, ctx) = dit.forward_pre_main(latent, timestep, context)?;
     let ctrl_tokens = dit.embed_latent(ctrl_latent)?;
