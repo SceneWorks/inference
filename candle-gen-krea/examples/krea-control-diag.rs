@@ -161,11 +161,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "size {size} sigma {sigma:.4}: |v_base| {n_base:.2}  train-vs-infer rel {d_paths}  branched-vs-base rel {d_branch:.3}"
             );
-            let ratios: Vec<String> = report
+            let pre: Vec<String> = report
                 .iter()
-                .map(|(r, m)| format!("{:.3}", r / (m + 1e-9)))
+                .map(|(p, _, m)| format!("{:.3}", p / (m + 1e-9)))
                 .collect();
-            println!("  res/main ratios per block: [{}]", ratios.join(", "));
+            let post: Vec<String> = report
+                .iter()
+                .map(|(_, q, m)| format!("{:.3}", q / (m + 1e-9)))
+                .collect();
+            println!(
+                "  res/main pre-clamp [{}] post-clamp [{}] (inject offset {})",
+                pre.join(", "),
+                post.join(", "),
+                b_infer.inject_offset()
+            );
         }
     }
     Ok(())

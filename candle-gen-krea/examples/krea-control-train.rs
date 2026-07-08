@@ -33,7 +33,7 @@ use std::time::Instant;
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::train::flow_match::{self, component_vb, sample_noise, sample_unit_timestep};
 use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
-use candle_gen_krea::control::{control_loss_grads, ControlBranch};
+use candle_gen_krea::control::{control_loss_grads, probe_forward, ControlBranch};
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::{Krea2Config, KreaTeConfig, KreaTextEncoder, KreaTokenizer, KreaTrainDit};
 use candle_gen_qwen_image::vae::QwenVaeEncoder;
@@ -62,6 +62,13 @@ struct Args {
     /// Residual RMS clamp τ (0 = off). Default `control::DEFAULT_RESIDUAL_CLAMP` — prevents the
     /// block-0 stream-overwrite degeneracy the step-500 probe found (sc-8460).
     residual_clamp: f64,
+    /// Branch block `i` injects into main block `i + offset` (default
+    /// `control::DEFAULT_INJECT_OFFSET` = 1: skip main block 0, the degenerate site).
+    inject_offset: usize,
+    /// lr multiplier for the injection-projection group (default 0.1).
+    proj_lr_mult: f32,
+    /// Decoupled weight decay for the injection-projection group (default 0.05).
+    proj_weight_decay: f32,
 }
 
 fn parse_args() -> Args {
@@ -83,6 +90,9 @@ fn parse_args() -> Args {
         warmup_steps: 0,
         checkpoint: true,
         residual_clamp: candle_gen_krea::control::DEFAULT_RESIDUAL_CLAMP,
+        inject_offset: candle_gen_krea::control::DEFAULT_INJECT_OFFSET,
+        proj_lr_mult: 0.1,
+        proj_weight_decay: 0.05,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -116,6 +126,11 @@ fn parse_args() -> Args {
             "--timestep-type" => a.timestep_type = val(),
             "--warmup-steps" => a.warmup_steps = val().parse().expect("--warmup-steps"),
             "--residual-clamp" => a.residual_clamp = val().parse().expect("--residual-clamp"),
+            "--inject-offset" => a.inject_offset = val().parse().expect("--inject-offset"),
+            "--proj-lr-mult" => a.proj_lr_mult = val().parse().expect("--proj-lr-mult"),
+            "--proj-weight-decay" => {
+                a.proj_weight_decay = val().parse().expect("--proj-weight-decay")
+            }
             "--checkpoint" => {
                 a.checkpoint = match val().to_ascii_lowercase().as_str() {
                     "true" | "1" | "on" => true,
@@ -414,11 +429,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (b, step)
         }
         None => {
-            let b = ControlBranch::from_base(&dit_w, &cfg, a.n_blocks, a.branch_dtype)?;
+            let b = ControlBranch::from_base(
+                &dit_w,
+                &cfg,
+                a.n_blocks,
+                a.branch_dtype,
+                a.inject_offset,
+            )?;
             eprintln!(
-                "fresh branch: {} blocks, {:.2}B trainable params",
+                "fresh branch: {} blocks, {:.2}B trainable params, inject offset {}",
                 b.num_blocks(),
-                b.num_params() as f64 / 1e9
+                b.num_params() as f64 / 1e9,
+                b.inject_offset()
             );
             (b, 0)
         }
@@ -430,7 +452,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("residual clamp tau: {clamp:?}");
     let branch = branch; // immutable from here
     let vars = branch.vars();
-    let mut opt = TrainOptimizer::from_config("adamw", vars.clone(), a.lr, 0.0)?;
+    // Two optimizer groups (run-3 fix): the branch-block bodies at the full lr with no decay, and
+    // the injection projections at a reduced lr WITH decoupled weight decay — magnitude control on
+    // the injection gain must be structural (AdamW's normalized steps otherwise regrow a zero-init
+    // projection to unit gain regardless of lr). Both step from the same clipped GradStore; each
+    // optimizer only updates its own vars.
+    let body_vars = branch.body_vars();
+    let proj_vars = branch.proj_vars();
+    let mut opt_body = TrainOptimizer::from_config("adamw", body_vars, a.lr, 0.0)?;
+    let mut opt_proj = TrainOptimizer::from_config(
+        "adamw",
+        proj_vars,
+        a.lr * a.proj_lr_mult,
+        a.proj_weight_decay,
+    )?;
+    eprintln!(
+        "optimizer groups: body lr {} | proj lr {} wd {}",
+        a.lr,
+        a.lr * a.proj_lr_mult,
+        a.proj_weight_decay
+    );
 
     let log_path = a.out.join("train_log.jsonl");
     let mut log = std::fs::OpenOptions::new()
@@ -500,8 +541,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             1.0
         };
-        opt.set_lr_scaled(warm);
-        opt.step(&grads)?;
+        opt_body.set_lr_scaled(warm);
+        opt_proj.set_lr_scaled(warm);
+        opt_body.step(&grads)?;
+        opt_proj.step(&grads)?;
 
         let loss = loss_sum / a.batch as f32;
         let secs = t0.elapsed().as_secs_f32();
@@ -518,6 +561,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         if !loss.is_finite() {
             return Err(format!("non-finite loss at step {}", step + 1).into());
+        }
+
+        // ── telemetry (run-3 fix): per-injection pre/post-clamp residual/main RMS ratios every 50
+        // steps, on a FIXED probe (sample 0, σ = 0.5, fixed noise) so the trajectory is comparable
+        // across steps. `probe_forward` is graph-free (detached weight reads) — one cheap forward.
+        if (step + 1) % 50 == 0 || step == start_step {
+            let (x0_c, ctrl_c, cap_c) = &cache[0];
+            let x0 = x0_c.to_device(&device)?;
+            let ctrl = ctrl_c.to_device(&device)?;
+            let cap = cap_c.to_device(&device)?.unsqueeze(0)?;
+            let sigma = 0.5f32;
+            let noise = sample_noise(x0.dims(), flow_match::noise_seed(a.seed, u32::MAX), &device)?;
+            let (x_t, _) = flow_match::build_batch(&x0, &noise, sigma as f64)?;
+            let t = Tensor::from_vec(vec![sigma], (1,), &device)?;
+            let (rep, _, _) = probe_forward(&dit, &branch, &x_t, &t, &cap, &ctrl, 1.0)?;
+            let ratio = |num: f64, den: f64| (num / (den + 1e-9) * 1e4).round() / 1e4;
+            let pre: Vec<f64> = rep.iter().map(|(p, _, m)| ratio(*p, *m)).collect();
+            let post: Vec<f64> = rep.iter().map(|(_, q, m)| ratio(*q, *m)).collect();
+            println!(
+                "telemetry step {:>5}: res/main pre-clamp {:?} post-clamp {:?}",
+                step + 1,
+                pre,
+                post
+            );
+            writeln!(
+                log,
+                "{}",
+                serde_json::json!({"step": step + 1, "telemetry_pre": pre, "telemetry_post": post})
+            )?;
         }
 
         let done = step + 1 == start_step + a.steps;

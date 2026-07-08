@@ -78,7 +78,14 @@ pub(crate) fn attn_ffn(
 /// Serialize a tiny Krea transformer to a temp `.safetensors` and load it as a [`KreaTrainDit`].
 /// Returns `(dit, cfg, temp_path)` — the caller drops the file when done.
 pub(crate) fn tiny_dit() -> (KreaTrainDit, Krea2Config, PathBuf) {
-    let c = tiny_cfg();
+    tiny_dit_layers(1)
+}
+
+/// [`tiny_dit`] with a configurable single-stream depth (the control-branch inject-offset tests
+/// need ≥ 2 main blocks).
+pub(crate) fn tiny_dit_layers(num_layers: usize) -> (KreaTrainDit, Krea2Config, PathBuf) {
+    let mut c = tiny_cfg();
+    c.num_layers = num_layers;
     let (hidden, heads, kv, hd) = (
         c.hidden_size,
         c.num_attention_heads,
