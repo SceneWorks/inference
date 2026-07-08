@@ -41,10 +41,25 @@ use crate::loader::{rms_scale_weight, Weights};
 use crate::train_dit::{repeat_kv, rms_scale_diff, sdpa_diff, KreaTrainDit, MainCtx};
 use crate::transformer::rope::apply_interleaved_rope;
 
-/// Default residual RMS clamp τ: an injected residual may at most MATCH the main image-token
-/// stream's RMS (`τ = 1.0`) — a control signal that needs more than that is overwriting, not
-/// steering (the sc-8460 step-500 degeneracy reached 25×).
-pub const DEFAULT_RESIDUAL_CLAMP: f64 = 1.0;
+/// Default residual RMS clamp τ. The run-3 probe showed `τ = 1.0` is destruction-permissive: the
+/// block-0 projection regrew to the ceiling even at lr 2e-5 (AdamW's normalized steps reach unit
+/// gain on a zero-init 6144² matrix in ~`0.0128/lr` steps under any persistent gradient), and a
+/// full-stream-RMS injection at the earliest blocks overwrites rather than steers. At `0.15` even a
+/// ceiling-riding block remains a perturbation.
+pub const DEFAULT_RESIDUAL_CLAMP: f64 = 0.15;
+
+/// Default injection offset: the residual from branch block `i` is added to the main stream
+/// entering block `i + offset`. `1` skips main block 0 — the run-3 degeneracy's preferred site
+/// (it precedes ALL base computation, so overwriting there is the cheapest way to satisfy the
+/// training loss; every probe showed block 0 pinned at the clamp ceiling while blocks ≥ 2 stayed
+/// healthy). Tradeoff: the control signal first lands after one base block of computation — the
+/// standard "branch output feeds the NEXT block" DiT-ControlNet layout, at the cost of no direct
+/// control over block 0's features.
+pub const DEFAULT_INJECT_OFFSET: usize = 1;
+
+/// Checkpoint key persisting [`DEFAULT_INJECT_OFFSET`]'s actual value (an f32 `[1]` tensor — the
+/// spike checkpoint format has no metadata header). Absent in pre-offset checkpoints ⇒ `0`.
+const META_INJECT_OFFSET: &str = "meta.inject_offset";
 
 /// A trainable no-bias linear over a [`Var`] weight `[out, in]`; the weight is cast to the activation
 /// dtype in the forward (differentiable — f32 master weights train through it).
@@ -241,15 +256,26 @@ pub struct ControlBranch {
     /// (stop-grad, like adaptive grad clipping), so training simply optimizes within the budget.
     /// Applied identically in the training, checkpointed, inference, and probe paths.
     clamp_tau: Option<f64>,
+    /// Residual from branch block `i` injects into main block `i + inject_offset` (see
+    /// [`DEFAULT_INJECT_OFFSET`]). Persisted in the checkpoint; must match between train and infer.
+    inject_offset: usize,
 }
 
 impl ControlBranch {
     /// Copy the first `n` base single-stream blocks (from the same mmap'd `transformer/` [`Weights`]
     /// the frozen DiT loads) into a trainable branch at `dtype`, with zero-init output projections.
-    pub fn from_base(w: &Weights, cfg: &Krea2Config, n: usize, dtype: DType) -> Result<Self> {
-        if n == 0 || n > cfg.num_layers {
+    /// Branch block `i`'s residual injects into main block `i + inject_offset`.
+    pub fn from_base(
+        w: &Weights,
+        cfg: &Krea2Config,
+        n: usize,
+        dtype: DType,
+        inject_offset: usize,
+    ) -> Result<Self> {
+        if n == 0 || inject_offset + n > cfg.num_layers {
             return Err(CandleError::Msg(format!(
-                "control branch: n_blocks must be in 1..={} (got {n})",
+                "control branch: need 1 <= n_blocks and inject_offset + n_blocks <= {} \
+                 (got n_blocks {n}, inject_offset {inject_offset})",
                 cfg.num_layers
             )));
         }
@@ -276,11 +302,12 @@ impl ControlBranch {
                 other => Ok(w.get(&format!("{base}.{other}"))?.to_dtype(dtype)?),
             }
         };
-        Self::build(&get, cfg, n)
+        Self::build(&get, cfg, n, inject_offset)
     }
 
     /// Load a branch back from a spike checkpoint (`.safetensors` written by [`save`](Self::save));
-    /// `N` and dtypes are read from the file.
+    /// `N`, dtypes, and the injection offset are read from the file (a pre-offset checkpoint has no
+    /// meta key ⇒ offset 0, its training-time layout).
     pub fn from_checkpoint(path: &Path, cfg: &Krea2Config, device: &Device) -> Result<Self> {
         let tensors = candle_gen::candle_core::safetensors::load(path, device)?;
         let n = 1 + tensors
@@ -293,6 +320,10 @@ impl ControlBranch {
                     path.display()
                 ))
             })?;
+        let inject_offset = match tensors.get(META_INJECT_OFFSET) {
+            Some(t) => t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0] as usize,
+            None => 0,
+        };
         let get = |key: &str| -> Result<Tensor> {
             tensors.get(key).cloned().ok_or_else(|| {
                 CandleError::Msg(format!(
@@ -301,10 +332,10 @@ impl ControlBranch {
                 ))
             })
         };
-        Self::build(&get, cfg, n)
+        Self::build(&get, cfg, n, inject_offset)
     }
 
-    fn build(get: &Getter, cfg: &Krea2Config, n: usize) -> Result<Self> {
+    fn build(get: &Getter, cfg: &Krea2Config, n: usize, inject_offset: usize) -> Result<Self> {
         let mut reg = VarReg::default();
         let blocks = (0..n)
             .map(|i| ControlBlock::build(&mut reg, get, i, cfg))
@@ -314,7 +345,13 @@ impl ControlBranch {
             named: reg.named,
             frozen: false,
             clamp_tau: Some(DEFAULT_RESIDUAL_CLAMP),
+            inject_offset,
         })
+    }
+
+    /// The main-block index branch block `i`'s residual injects into is `i + inject_offset()`.
+    pub fn inject_offset(&self) -> usize {
+        self.inject_offset
     }
 
     /// Switch the branch to inference mode: every weight read is detached, so a sampler loop builds
@@ -369,6 +406,26 @@ impl ControlBranch {
         self.named.iter().map(|(_, v)| v.clone()).collect()
     }
 
+    /// The zero-init output-projection `Var`s only — the optimizer group that gets weight decay +
+    /// a reduced lr (magnitude control on the injection gain must be structural: AdamW's normalized
+    /// steps regrow a zero-init 6144² projection to unit gain in ~`0.0128/lr` steps otherwise).
+    pub fn proj_vars(&self) -> Vec<Var> {
+        self.named
+            .iter()
+            .filter(|(n, _)| n.contains("proj_out"))
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    /// Every non-projection `Var` (the branch block bodies) — the plain optimizer group.
+    pub fn body_vars(&self) -> Vec<Var> {
+        self.named
+            .iter()
+            .filter(|(n, _)| !n.contains("proj_out"))
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
     /// Trainable parameter count.
     pub fn num_params(&self) -> usize {
         self.named
@@ -377,13 +434,19 @@ impl ControlBranch {
             .sum()
     }
 
-    /// Write the branch to a flat `.safetensors` (the spike checkpoint [`from_checkpoint`] reads).
+    /// Write the branch to a flat `.safetensors` (the spike checkpoint [`from_checkpoint`] reads),
+    /// including the injection-offset meta tensor.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let map: HashMap<String, Tensor> = self
+        let mut map: HashMap<String, Tensor> = self
             .named
             .iter()
             .map(|(k, v)| (k.clone(), v.as_tensor().clone()))
             .collect();
+        let dev = candle_gen::candle_core::Device::Cpu;
+        map.insert(
+            META_INJECT_OFFSET.to_string(),
+            Tensor::from_vec(vec![self.inject_offset as f32], (1,), &dev)?,
+        );
         Ok(candle_gen::candle_core::safetensors::save(&map, path)?)
     }
 
@@ -397,16 +460,35 @@ impl ControlBranch {
         ctrl_tokens: &Tensor,
         ctx: &MainCtx,
     ) -> Result<Vec<Tensor>> {
+        self.residuals_mode(combined, ctrl_tokens, ctx, self.frozen)
+    }
+
+    /// [`residuals`](Self::residuals) with an explicit graph mode — `frozen = true` forces detached
+    /// weight reads regardless of the branch state (the always-graph-free probe path).
+    fn residuals_mode(
+        &self,
+        combined: &Tensor,
+        ctrl_tokens: &Tensor,
+        ctx: &MainCtx,
+        frozen: bool,
+    ) -> Result<Vec<Tensor>> {
         let txt = combined.narrow(1, 0, ctx.cap_len)?;
         let img = (combined.narrow(1, ctx.cap_len, ctx.img_len)? + ctrl_tokens)?;
         let mut h = Tensor::cat(&[&txt, &img], 1)?;
         let mut out = Vec::with_capacity(self.blocks.len());
         for blk in &self.blocks {
-            h = blk.forward(&h, &ctx.tvec, &ctx.rcos, &ctx.rsin, self.frozen)?;
+            h = blk.forward(&h, &ctx.tvec, &ctx.rcos, &ctx.rsin, frozen)?;
             let h_img = h.narrow(1, ctx.cap_len, ctx.img_len)?;
-            out.push(blk.proj_out.forward(&h_img, self.frozen)?);
+            out.push(blk.proj_out.forward(&h_img, frozen)?);
         }
         Ok(out)
+    }
+
+    /// The residual (by branch-block index) that injects into main block `j`, honoring
+    /// [`inject_offset`](Self::inject_offset): `Some(j - offset)` when `offset <= j < offset + N`.
+    fn residual_index_for_main_block(&self, j: usize) -> Option<usize> {
+        j.checked_sub(self.inject_offset)
+            .filter(|&i| i < self.blocks.len())
     }
 }
 
@@ -450,8 +532,11 @@ pub fn forward_with_control(
     let residuals = branch.residuals(&combined, &ctrl_tokens, &ctx)?;
 
     let mut x = combined;
-    for (i, blk) in dit.blocks().iter().enumerate() {
-        if let Some(r) = residuals.get(i) {
+    for (j, blk) in dit.blocks().iter().enumerate() {
+        if let Some(r) = branch
+            .residual_index_for_main_block(j)
+            .and_then(|k| residuals.get(k))
+        {
             let txt = x.narrow(1, 0, ctx.cap_len)?;
             let img = x.narrow(1, ctx.cap_len, ctx.img_len)?;
             let scaled = (r * control_scale)?.to_dtype(x.dtype())?;
@@ -464,10 +549,13 @@ pub fn forward_with_control(
     Ok(dit.velocity_out(&x, &ctx)?)
 }
 
-/// DIAGNOSTIC (sc-8460 step-500 probe): the branched forward with per-injection-point norms. For
-/// each branch block `i` reports `(‖res_i‖₂, ‖main_img_i‖₂)` — the residual actually added and the
-/// main-stream image-token slice it lands on — plus the branched velocity and the un-branched base
-/// velocity for the same inputs. Runs in whatever mode the branch is in (train-tracked or frozen).
+/// DIAGNOSTIC + TELEMETRY (sc-8460): the branched forward with per-injection-point norms. For each
+/// branch block `i` (injecting into main block `i + offset`) reports
+/// `(‖res_i‖₂ pre-clamp, ‖res_i‖₂ post-clamp, ‖main_img‖₂)` — the residual the branch WANTED to
+/// add, what was actually added, and the main-stream image-token slice it lands on — plus the
+/// branched velocity and the un-branched base velocity for the same inputs. Always runs with
+/// **detached** weight reads (graph-free) regardless of the branch mode, so the trainer can call it
+/// mid-run for live ratio telemetry without retaining a training-sized graph.
 #[allow(clippy::type_complexity)]
 pub fn probe_forward(
     dit: &KreaTrainDit,
@@ -477,9 +565,10 @@ pub fn probe_forward(
     context: &Tensor,
     ctrl_latent: &Tensor,
     control_scale: f64,
-) -> Result<(Vec<(f64, f64)>, Tensor, Tensor)> {
+) -> Result<(Vec<(f64, f64, f64)>, Tensor, Tensor)> {
     let norm = |t: &Tensor| -> Result<f64> {
-        Ok(t.to_dtype(DType::F32)?
+        Ok(t.detach()
+            .to_dtype(DType::F32)?
             .sqr()?
             .sum_all()?
             .to_scalar::<f32>()? as f64)
@@ -487,19 +576,21 @@ pub fn probe_forward(
     };
     let (combined, ctx) = dit.forward_pre_main(latent, timestep, context)?;
     let ctrl_tokens = dit.embed_latent(ctrl_latent)?;
-    let residuals = branch.residuals(&combined, &ctrl_tokens, &ctx)?;
+    let residuals = branch.residuals_mode(&combined, &ctrl_tokens, &ctx, true)?;
 
     let mut report = Vec::with_capacity(residuals.len());
     let mut x = combined.clone();
-    for (i, blk) in dit.blocks().iter().enumerate() {
-        if let Some(r) = residuals.get(i) {
+    for (j, blk) in dit.blocks().iter().enumerate() {
+        if let Some(r) = branch
+            .residual_index_for_main_block(j)
+            .and_then(|k| residuals.get(k))
+        {
             let txt = x.narrow(1, 0, ctx.cap_len)?;
             let img = x.narrow(1, ctx.cap_len, ctx.img_len)?;
             let scaled = (r * control_scale)?.to_dtype(x.dtype())?;
-            // Reported norms are POST-clamp — what is actually added to the stream.
-            let scaled = branch.apply_clamp(&scaled, &img)?;
-            report.push((norm(&scaled)?, norm(&img)?));
-            let img = (img + scaled)?;
+            let clamped = branch.apply_clamp(&scaled, &img)?;
+            report.push((norm(&scaled)?, norm(&clamped)?, norm(&img)?));
+            let img = (img + clamped)?;
             x = Tensor::cat(&[&txt, &img], 1)?;
         }
         x = blk.forward(&x, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
@@ -525,10 +616,12 @@ pub fn probe_forward(
 /// `loss.backward()`. The dense backward retains every activation of the 28 frozen main blocks + the
 /// `N` branch blocks at once (OOM ≥ 512² on a 96 GB card); the checkpointed chain keeps only the
 /// segment-boundary states. Topology: the chain state is `[main_h, branch_h]` through main blocks
-/// `0..N` — segment `i` advances the branch one block, projects its residual onto `main_h`'s image
-/// tokens, then runs main block `i` — dropping to `[main_h]` after the last injection, with the
-/// `velocity_out` + loss regression as the final segment. The pre-main front-end + control embedding
-/// are frozen (no upstream `Var`s), so the seed boundary is simply detached.
+/// `0..offset+N` — segments before the injection window pass the branch input through untouched;
+/// segment `j` in the window advances branch block `j − offset`, projects + clamps its residual onto
+/// `main_h`'s image tokens, then runs main block `j` — dropping to `[main_h]` after the last
+/// injection, with the `velocity_out` + loss regression as the final segment. The pre-main
+/// front-end + control embedding are frozen (no upstream `Var`s), so the seed boundary is simply
+/// detached.
 #[allow(clippy::too_many_arguments)]
 pub fn control_loss_grads(
     dit: &KreaTrainDit,
@@ -566,12 +659,21 @@ pub fn control_loss_grads(
     };
 
     let n = branch.blocks.len();
+    let offset = branch.inject_offset;
     let blocks = dit.blocks();
     let ctx_ref = &ctx;
     let mut segs: Vec<Segment> = Vec::with_capacity(blocks.len() + 1);
-    for (i, blk) in blocks.iter().enumerate() {
-        if i < n {
-            // [main_h, branch_h] -> advance the branch, inject its residual, run main block i.
+    for (j, blk) in blocks.iter().enumerate() {
+        if j < offset {
+            // Before the injection window: [main_h, branch_h] -> run main block j, pass the
+            // (still-unconsumed) branch input through the boundary untouched.
+            segs.push(Box::new(move |st: &[Tensor]| {
+                let mh = blk.forward(&st[0], &ctx_ref.tvec, &ctx_ref.rcos, &ctx_ref.rsin)?;
+                Ok(vec![mh, st[1].clone()])
+            }));
+        } else if let Some(i) = branch.residual_index_for_main_block(j) {
+            // [main_h, branch_h] -> advance branch block i = j - offset, inject its residual into
+            // main block j's input, run main block j.
             let cblk = &branch.blocks[i];
             let drop_branch = i + 1 == n; // last injection: the branch stream leaves the state
             segs.push(Box::new(move |st: &[Tensor]| {
@@ -600,7 +702,7 @@ pub fn control_loss_grads(
                 }
             }));
         } else {
-            // [main_h] -> plain frozen main block.
+            // Past the injection window: [main_h] -> plain frozen main block.
             segs.push(Box::new(move |st: &[Tensor]| {
                 Ok(vec![blk.forward(
                     &st[0],
@@ -626,7 +728,7 @@ pub fn control_loss_grads(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testfix::{tiny_batch, tiny_dit};
+    use crate::testfix::{tiny_batch, tiny_dit, tiny_dit_layers};
     use candle_gen::candle_core::Device;
     use candle_gen::train::flow_match::velocity_loss;
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
@@ -645,7 +747,7 @@ mod tests {
         let dev = Device::Cpu;
         let (dit, c, path) = tiny_dit();
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
-        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
 
         let (x0, cap, _) = tiny_batch(&c);
         let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
@@ -667,7 +769,7 @@ mod tests {
         let dev = Device::Cpu;
         let (dit, c, path) = tiny_dit();
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
-        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
 
         let (x0, cap, _) = tiny_batch(&c);
@@ -690,7 +792,7 @@ mod tests {
         let dev = Device::Cpu;
         let (dit, c, path) = tiny_dit();
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
-        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
         let vars = branch.vars();
 
@@ -750,7 +852,7 @@ mod tests {
         let dev = Device::Cpu;
         let (dit, c, path) = tiny_dit();
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
-        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
         let vars = branch.vars();
 
@@ -820,7 +922,7 @@ mod tests {
         let dev = Device::Cpu;
         let (dit, c, path) = tiny_dit();
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
-        let train_b = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        let train_b = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&train_b, &dev);
         let ckpt = std::env::temp_dir().join(format!(
             "krea_ctrl_parity_{}.safetensors",
@@ -871,7 +973,7 @@ mod tests {
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
 
         // Blow the projections up: residuals many times the stream norm.
-        let mut big = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        let mut big = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         for (name, v) in &big.named {
             if name.contains("proj_out") {
                 v.set(&Tensor::randn(0f32, 5.0f32, v.as_tensor().dims(), &dev).unwrap())
@@ -884,23 +986,29 @@ mod tests {
         let ctxt = cap.unsqueeze(0).unwrap();
         let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
 
-        // Unclamped: the ratio exceeds τ (the degenerate regime).
+        // Unclamped: pre == post and the ratio exceeds τ (the degenerate regime).
         big.set_residual_clamp(None);
         let (rep_off, _, _) = probe_forward(&dit, &big, &x0, &t, &ctxt, &ctrl, 1.0).unwrap();
+        assert_eq!(rep_off[0].0, rep_off[0].1, "no clamp => post == pre");
         assert!(
-            rep_off[0].0 / rep_off[0].1 > DEFAULT_RESIDUAL_CLAMP * 1.5,
+            rep_off[0].0 / rep_off[0].2 > DEFAULT_RESIDUAL_CLAMP * 1.5,
             "test setup should swamp: ratio {}",
-            rep_off[0].0 / rep_off[0].1
+            rep_off[0].0 / rep_off[0].2
         );
 
-        // Clamped: the post-clamp ratio is capped at τ (probe norms are per-tensor L2 over equal
-        // element counts, so the L2 ratio equals the RMS ratio).
+        // Clamped: the PRE-clamp ratio still reports the raw (over-budget) magnitude while the
+        // POST-clamp ratio is capped at τ (probe norms are per-tensor L2 over equal element counts,
+        // so the L2 ratio equals the RMS ratio).
         big.set_residual_clamp(Some(DEFAULT_RESIDUAL_CLAMP));
         let (rep_on, _, _) = probe_forward(&dit, &big, &x0, &t, &ctxt, &ctrl, 1.0).unwrap();
         assert!(
-            rep_on[0].0 / rep_on[0].1 <= DEFAULT_RESIDUAL_CLAMP * 1.01,
+            rep_on[0].0 / rep_on[0].2 > DEFAULT_RESIDUAL_CLAMP * 1.5,
+            "pre-clamp telemetry must keep reporting the raw magnitude"
+        );
+        assert!(
+            rep_on[0].1 / rep_on[0].2 <= DEFAULT_RESIDUAL_CLAMP * 1.01,
             "clamp must cap the ratio: {}",
-            rep_on[0].0 / rep_on[0].1
+            rep_on[0].1 / rep_on[0].2
         );
 
         // Gradients still flow through the clamped path.
@@ -931,7 +1039,7 @@ mod tests {
 
         // An in-budget residual is untouched by the clamp (identical velocities), and the exact
         // zero-init residual stays an identity with the clamp on.
-        let mut small = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        let mut small = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let v_id = flat(&forward_with_control(&dit, &small, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
         assert_eq!(
@@ -939,7 +1047,15 @@ mod tests {
             flat(&dit.forward(&x0, &t, &ctxt).unwrap()),
             "zero residual + clamp must stay a step-0 identity"
         );
-        nudge_vars(&small, &dev); // tiny residuals, far under the τ budget
+        nudge_vars(&small, &dev);
+        // Force the projections tiny so the residual is far under the τ budget (the generic nudge
+        // is borderline at τ = 0.15).
+        for (name, v) in &small.named {
+            if name.contains("proj_out") {
+                v.set(&Tensor::randn(0f32, 1e-4f32, v.as_tensor().dims(), &dev).unwrap())
+                    .unwrap();
+            }
+        }
         small.set_residual_clamp(Some(DEFAULT_RESIDUAL_CLAMP));
         let v_on = flat(&forward_with_control(&dit, &small, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
         small.set_residual_clamp(None);
@@ -955,7 +1071,7 @@ mod tests {
         let dev = Device::Cpu;
         let (dit, c, path) = tiny_dit();
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
-        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
 
         let ckpt =
@@ -984,6 +1100,88 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(a, b, "checkpoint roundtrip must reproduce the forward");
+        let _ = std::fs::remove_file(ckpt);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The injection offset (run-3 fix): with a 2-block main and `offset = 1`, the zero-init branch
+    /// is still an exact identity; a nudged branch's residual lands on main block 1 only — the
+    /// dense/checkpointed grads still match under the offset topology; the offset survives the
+    /// checkpoint roundtrip (and its forward with it); and `from_base` rejects an offset that would
+    /// push the injection window past the main stack.
+    #[test]
+    fn inject_offset_topology() {
+        let dev = Device::Cpu;
+        let (dit, c, path) = tiny_dit_layers(2);
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+
+        // offset + n must fit in the main stack.
+        assert!(ControlBranch::from_base(&w, &c, 2, DType::F32, 1).is_err());
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 1).unwrap();
+        assert_eq!(branch.inject_offset(), 1);
+
+        let (x0, cap, noise) = tiny_batch(&c);
+        let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+        let ctxt = cap.unsqueeze(0).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // Zero-init identity holds under the offset.
+        let v_id = flat(&forward_with_control(&dit, &branch, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        assert_eq!(v_id, flat(&dit.forward(&x0, &t, &ctxt).unwrap()));
+
+        // Nudged: dense vs checkpointed grads match under the offset topology.
+        nudge_vars(&branch, &dev);
+        let vars = branch.vars();
+        let run = |ckpt: bool| {
+            control_loss_grads(
+                &dit,
+                &branch,
+                &x0,
+                &ctrl,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                DType::F32,
+                ckpt,
+            )
+            .unwrap()
+        };
+        let (loss_d, g_d) = run(false);
+        let (loss_c, g_c) = run(true);
+        assert!(
+            (loss_d - loss_c).abs() < 1e-4,
+            "offset loss: dense {loss_d} vs checkpoint {loss_c}"
+        );
+        for (idx, v) in vars.iter().enumerate() {
+            let a = g_d.get(v.as_tensor()).unwrap().flatten_all().unwrap();
+            let b = g_c.get(v.as_tensor()).unwrap().flatten_all().unwrap();
+            for (x, y) in a
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .zip(b.to_vec1::<f32>().unwrap().iter())
+            {
+                assert!(
+                    (x - y).abs() < 1e-4,
+                    "offset grad mismatch for var {idx} (dense {x} vs checkpoint {y})"
+                );
+            }
+        }
+
+        // The offset is persisted and the reloaded forward matches.
+        let ckpt =
+            std::env::temp_dir().join(format!("krea_ctrl_off_{}.safetensors", std::process::id()));
+        branch.save(&ckpt).unwrap();
+        let loaded = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
+        assert_eq!(loaded.inject_offset(), 1);
+        let a = flat(&forward_with_control(&dit, &branch, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        let b = flat(&forward_with_control(&dit, &loaded, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        assert_eq!(
+            a, b,
+            "offset checkpoint roundtrip must reproduce the forward"
+        );
         let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
     }
