@@ -105,26 +105,56 @@ impl AnimaPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let dtype = Dtype::Bfloat16;
+        let noise = create_noise(opts.seed, opts.width, opts.height)?;
+        let sampler = opts.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
+        // VAE decode (applies the baked latents_mean/std de-norm) → [1, 3, 1, H, W] f32 in [-1, 1].
+        let latent = self.denoise(
+            &noise,
+            prompt,
+            negative,
+            variant,
+            opts.steps,
+            opts.guidance,
+            sampler,
+            opts.seed,
+            Dtype::Bfloat16,
+            cancel,
+            on_progress,
+        )?;
+        let decoded = self.components.vae.decode(&latent)?;
+        decoded_to_image(&decoded)
+    }
+
+    /// The flow denoise loop shared by [`generate`](Self::generate) and the stage-7 parity hook. Encodes
+    /// the prompt (+ negative for CFG variants), then runs `sampler` over [`anima_sigmas`] from the given
+    /// `init` latent, evaluating the DiT in `dtype`. Returns the final latent `[1, 16, 1, H/8, W/8]`
+    /// (f32, pre-VAE). The DiT is a **standard flow denoiser**: it predicts `v ≈ ε − x0` and embeds the
+    /// **raw σ** as its timestep, so the sampler (`TimestepConvention::Sigma`, `x + (σ_next − σ)·v`)
+    /// consumes it directly — no negation, no `1 − σ` timestep.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise(
+        &self,
+        init: &Array,
+        prompt: &str,
+        negative: &str,
+        variant: Variant,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        seed: u64,
+        dtype: Dtype,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
         let cond = self.encode_prompt(prompt)?;
         let uncond = if variant.uses_cfg() {
             Some(self.encode_prompt(negative)?)
         } else {
             None
         };
-
-        let sigmas = anima_sigmas(opts.steps);
-        let noise = create_noise(opts.seed, opts.width, opts.height)?;
-        let guidance = Array::from_slice(&[opts.guidance], &[1]);
-        let sampler = opts.sampler.as_deref().or(Some(DEFAULT_SAMPLER));
-
+        let sigmas = anima_sigmas(steps);
+        let guidance = Array::from_slice(&[guidance], &[1]);
         let dit = &self.components.dit;
-        // The DiT is a **standard flow denoiser**: it predicts the flow velocity `v ≈ ε − x0` and
-        // embeds the **raw σ** as its timestep (matching the reference `timestep = t / 1000 = σ`). So
-        // `run_flow_sampler` (`TimestepConvention::Sigma`, integrating `x + (σ_next − σ)·v`) consumes
-        // the DiT output directly — no negation, no `1 − σ` timestep. (Verified via `cos(v, ε − x0)`
-        // ≈ 0.96 against a known VAE-encoded latent; a sign or timestep error collapses output to
-        // a wash/noise.)
         let predict = |x: &Array, sigma: f32| -> Result<Array> {
             let s = Array::from_slice(&[sigma], &[1]);
             let v_cond = dit.forward(x, &s, &cond, dtype)?;
@@ -139,21 +169,41 @@ impl AnimaPipeline {
             // Integrate in f32 (the reference keeps latents f32).
             Ok(v.as_dtype(Dtype::Float32)?)
         };
-
-        let latent = run_flow_sampler(
-            sampler,
+        run_flow_sampler(
+            Some(sampler),
             TimestepConvention::Sigma,
             &sigmas,
-            noise,
-            opts.seed,
+            init.clone(),
+            seed,
             cancel,
             on_progress,
             predict,
-        )?;
+        )
+    }
 
-        // VAE decode (applies the baked latents_mean/std de-norm) → [1, 3, 1, H, W] f32 in [-1, 1].
-        let decoded = self.components.vae.decode(&latent)?;
-        decoded_to_image(&decoded)
+    /// Test hook (sc-10524 stage-7 golden): run the flow denoise from an **injected** initial latent
+    /// (instead of sampling noise) with an explicit `sampler`/`dtype`, returning the final latent
+    /// `[1, 16, 1, H/8, W/8]` (pre-VAE). Lets an MLX-vs-diffusers end-to-end comparison feed BOTH sides
+    /// the identical starting point + a deterministic solver, so residual drift is float error, not the
+    /// chaos of two independently-sampled noises.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_from_latent(
+        &self,
+        init: &Array,
+        prompt: &str,
+        negative: &str,
+        variant: Variant,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        dtype: Dtype,
+    ) -> Result<Array> {
+        let cancel = CancelFlag::default();
+        let mut prog = |_p: Progress| {};
+        self.denoise(
+            init, prompt, negative, variant, steps, guidance, sampler, 0, dtype, &cancel, &mut prog,
+        )
     }
 }
 
