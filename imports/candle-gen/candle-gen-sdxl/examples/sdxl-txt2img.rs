@@ -25,7 +25,8 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    self, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
+    WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -111,8 +112,24 @@ fn main() -> Result<()> {
     };
     let mut probe = vram_gpu.map(candle_gen::testkit::VramProbe::start);
 
-    // Resolve through the registry — proves the inventory seam (THIS crate's `submit!` is linked).
+    // `--lora <file> [--lora-scale s]` folds a trained kohya/PEFT LoRA into the UNet at load. On a
+    // packed (q4/q8) snapshot this exercises the sc-9528 packed-adapter fold (dequant→fold→keep-dense);
+    // on a dense bf16 snapshot it is the sc-5165 dense merge. `--lora-kind lokr` for a LoKr file.
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    let spec = match arg(&args, "--lora") {
+        Some(lora) => {
+            let scale: f32 = arg(&args, "--lora-scale")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0);
+            let kind = match arg(&args, "--lora-kind").as_deref() {
+                Some("lokr") => AdapterKind::Lokr,
+                _ => AdapterKind::Lora,
+            };
+            println!("[smoke] lora={lora} scale={scale} kind={kind:?}");
+            spec.with_adapters(vec![AdapterSpec::new(PathBuf::from(lora), scale, kind)])
+        }
+        None => spec,
+    };
     let load_phase = probe.as_ref().map(|p| p.phase());
     let gen = gen_core::registry::load("sdxl", &spec)?;
     if let (Some(p), Some(ph)) = (probe.as_mut(), load_phase) {
