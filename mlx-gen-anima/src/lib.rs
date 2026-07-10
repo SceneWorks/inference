@@ -27,6 +27,7 @@
 
 pub mod conditioner;
 pub mod config;
+pub mod convert;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
@@ -38,6 +39,7 @@ pub mod vae;
 
 pub use conditioner::AnimaTextConditioner;
 pub use config::{ConditionerConfig, DitConfig, Qwen3Config, Variant};
+pub use convert::{is_dit_quant_target, quantize_anima_dit};
 pub use loader::{split_anima_keys, AnimaComponents};
 pub use model::{
     descriptor_aesthetic, descriptor_base, descriptor_turbo, load_aesthetic, load_base, load_turbo,
