@@ -1,0 +1,42 @@
+[package]
+name = "candle-gen-anima"
+version = "0.0.0"
+edition = "2021"
+description = "Anima (Cosmos-Predict2 DiT + AnimaTextConditioner) anime T2I provider crate for candle-gen (the CUDA/Windows sibling of mlx-gen-anima)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "anima", "cosmos"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh). Anima has NO candle-transformers
+# reference: the Cosmos-Predict2 DiT + AnimaTextConditioner + the plain Qwen3-0.6B encoder are all
+# written here on candle-core/candle-nn.
+candle-gen = { path = "../candle-gen" }
+# VAE: Anima's `qwen_image_vae.safetensors` IS the Qwen-Image `AutoencoderKLQwenImage` (z16, 8×,
+# per-channel latents_mean/std). Reuse `candle_gen_qwen_image::vae::QwenVae` wholesale rather than
+# re-porting the Conv3d VAE; this crate only ports the original→diffusers key rename (`vae::convert_vae_key`).
+candle-gen-qwen-image = { path = "../candle-gen-qwen-image" }
+# Link-time self-registration of the three anima generators into gen-core's model registry.
+inventory = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[features]
+# Default works on Mac / Linux CPU with NO extra features (candle-core defaults to the CPU backend);
+# this is the lane the `cargo check -F backend-candle` parity build and the CPU golden tests use.
+default = []
+# Apple Metal GPU backend (Mac dev). Forwarded to candle-gen + the reused VAE crate.
+metal = ["candle-gen/metal", "candle-gen-qwen-image/metal"]
+# NVIDIA CUDA backend (the production Windows/Linux target). Forwarded to candle-gen + the VAE crate.
+cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda"]
+
+[dev-dependencies]
+# Shared test-support helpers (sc-9055 / F-069: candle_gen::testkit) + serde_json to read the
+# committed parity goldens (no Python at test time).
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
+serde_json = { workspace = true }
+# Backend-neutral gen-core contract conformance (capability honesty / registry round-trip). Weight-gated.
+sceneworks-gen-core-testkit = { workspace = true }
