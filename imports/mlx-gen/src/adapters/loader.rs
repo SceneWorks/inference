@@ -93,6 +93,40 @@ impl LokrFile {
             out_dtype,
         )
     }
+
+    /// The **structured** (deferred, allocation-free) counterpart to [`delta`](Self::delta) for a
+    /// packed base (sc-10578, extending sc-10050 from the video providers to every family on the
+    /// shared install path): build the small `[a,c]`/`[b,d]` Kronecker factors so the residual applies
+    /// via the vec-trick without ever materializing the `[out,in]` delta.
+    ///
+    /// **Scale differs from [`delta`](Self::delta) by design.** `delta` bakes only `alpha/rank` and
+    /// leaves the user `strength` to [`Adapter::Lokr`]'s `scale` field; the structured residual carries
+    /// no separate scale (it is baked into `factors.w2`), so the FULL `alpha/rank · strength` is
+    /// applied here. Mismatching these two is a silent mis-scale, not a crash.
+    ///
+    /// Returns `Ok(None)` when the module has no 2-D matrix form (a conv-shaped factor); the peft
+    /// LoKr format never carries a tucker `lokr_t2` — that is third-party-only, hence the `None`
+    /// passed through. The caller then materializes (dense base) or errors (packed base).
+    pub fn factors(
+        &self,
+        factors: &BTreeMap<String, Array>,
+        strength: f32,
+        base_shape: &[i32],
+        out_dtype: Dtype,
+    ) -> Result<Option<LokrFactors>> {
+        build_lokr_factors(
+            (self.alpha / self.rank) * strength,
+            base_shape,
+            factors.get("lokr_w1"),
+            factors.get("lokr_w1_a"),
+            factors.get("lokr_w1_b"),
+            factors.get("lokr_w2"),
+            None, // peft LoKr never carries a tucker `lokr_t2` (lycoris conv-only).
+            factors.get("lokr_w2_a"),
+            factors.get("lokr_w2_b"),
+            out_dtype,
+        )
+    }
 }
 
 /// Parse a LoKr `.safetensors` into [`LokrFile`]: read `rank`/`alpha` from metadata (alpha defaults
@@ -170,23 +204,49 @@ enum LycorisKeyResolution<'t> {
 
 /// Shared install skeleton for the non-BFL LyCORIS appliers ([`apply_lokr`],
 /// [`apply_lokr_thirdparty`], [`apply_loha_thirdparty`] — F-067): resolve each module's raw key to
-/// a host dotted path per `resolution`, reconstruct its `ΔW` at the target's base shape via the
-/// per-module `delta` closure (which bakes in the format's `alpha/rank` scale and dtype), and stack
-/// it as an [`Adapter::Lokr`] residual at the user `scale`. A key that resolves to no module is
-/// surfaced in `unmatched_paths` under its raw spelling, never silently dropped. The BFL
+/// a host dotted path per `resolution`, then stack a residual onto the target. A key that resolves to
+/// no module is surfaced in `unmatched_paths` under its raw spelling, never silently dropped. The BFL
 /// fused→split twin is [`install_bfl_lycoris`].
-fn install_lycoris_groups<K, F>(
+///
+/// **On a packed base, prefer the deferred residual** (sc-10578):
+///   * **Dense base** — `delta(base_shape)` materializes the `[out,in]` `ΔW` (the closure bakes in the
+///     format's `alpha/rank` scale and dtype) and it stacks as an [`Adapter::Lokr`] at the user
+///     `scale`. Byte-for-byte the pre-sc-10578 behavior, which every family's fork-parity goldens
+///     depend on.
+///   * **Packed base, deferrable module** — `factors(scale, base_shape)` builds the small Kronecker
+///     factors and it stacks as an [`Adapter::LokrStructured`], applying the residual via the vec-trick
+///     **without ever allocating `[out,in]`**. Note the scale: the structured residual carries none of
+///     its own (it is baked into `factors.w2`), so the user `scale` is passed *in* here, whereas the
+///     dense path passes it to `Adapter::Lokr`. Getting that backwards is a silent mis-scale.
+///   * **Packed base, NOT deferrable** (`factors` → `Ok(None)`: LoHa's Hadamard product, which has no
+///     deferred form at all; a tucker/CP `lokr_t2`; a conv-shaped factor) — **fall back to the
+///     materialized delta**, exactly as before. It is correct: [`Adapter::Lokr`]'s residual is
+///     `scale · x·ΔWᵀ`, which never reads the base, so it rides over `quantized_matmul` unchanged.
+///     It is merely memory-hungry.
+///
+/// **Why the fallback and not an error.** An earlier cut of sc-10578 rejected the non-deferrable
+/// packed combination outright, reasoning from sc-10051 (LoHa on quantized Wan: steer to bf16, do not
+/// materialize). That was wrong *here*. Wan reaches its own `apply_wan_adapters_additive`; this shared
+/// path is reached by eleven provider crates, adapters are installed **after** `.quantize()` in every
+/// one of them, and the worker defaults `spec.quantize` to `Some(Q8)` for **every** MLX model. So
+/// `is_quantized()` is true on the default path almost everywhere, and erroring would have turned a
+/// working third-party LoHa into a hard load failure for any model at its default tier — a broad
+/// regression traded for a memory bound nobody asked for. Whether a packed base should refuse a
+/// multi-GB materialized delta is a real product question; it is **sc-10678**, not this story's to
+/// decide unilaterally.
+fn install_lycoris_groups<K, F, G>(
     host: &mut impl AdaptableHost,
-    groups: impl IntoIterator<Item = (K, F)>,
+    groups: impl IntoIterator<Item = (K, F, G)>,
     scale: f32,
     resolution: LycorisKeyResolution<'_>,
 ) -> Result<ApplyReport>
 where
     K: AsRef<str> + Into<String>,
     F: FnOnce(&[i32]) -> Result<Array>,
+    G: FnOnce(f32, &[i32]) -> Result<Option<LokrFactors>>,
 {
     let mut report = ApplyReport::default();
-    for (raw, delta) in groups {
+    for (raw, delta, factors) in groups {
         let dotted = match &resolution {
             LycorisKeyResolution::Dotted => raw.as_ref(),
             LycorisKeyResolution::Thirdparty(table) => resolve_lokr_path(raw.as_ref(), table)
@@ -194,6 +254,18 @@ where
         };
         let parts: Vec<&str> = dotted.split('.').collect();
         match host.adaptable_mut(&parts) {
+            // Packed base: take the deferred form when the module has one, else materialize as before.
+            Some(lin) if lin.is_quantized() => {
+                let base_shape = lin.base_shape();
+                match factors(scale, &base_shape)? {
+                    Some(f) => lin.push(Adapter::LokrStructured { factors: f }),
+                    None => {
+                        let delta = delta(&base_shape)?;
+                        lin.push(Adapter::Lokr { delta, scale });
+                    }
+                }
+                report.applied += 1;
+            }
             Some(lin) => {
                 let base_shape = lin.base_shape();
                 let delta = delta(&base_shape)?;
@@ -213,9 +285,13 @@ pub fn apply_lokr(host: &mut impl AdaptableHost, w: &Weights, scale: f32) -> Res
     let file = &file;
     let groups = file.groups.iter().map(|(path, factors)| {
         // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609).
-        (path.as_str(), move |base: &[i32]| {
-            file.delta(factors, base, Dtype::Bfloat16)
-        })
+        (
+            path.as_str(),
+            move |base: &[i32]| file.delta(factors, base, Dtype::Bfloat16),
+            move |strength: f32, base: &[i32]| {
+                file.factors(factors, strength, base, Dtype::Bfloat16)
+            },
+        )
     });
     install_lycoris_groups(host, groups, scale, LycorisKeyResolution::Dotted)
 }
@@ -417,9 +493,11 @@ pub fn apply_lokr_thirdparty(
     let groups = groups.iter().map(|(raw, g)| {
         // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609) — same as
         // peft `apply_lokr`.
-        (raw.as_str(), move |base: &[i32]| {
-            g.delta(base, Dtype::Bfloat16)
-        })
+        (
+            raw.as_str(),
+            move |base: &[i32]| g.delta(base, Dtype::Bfloat16),
+            move |strength: f32, base: &[i32]| g.factors(strength, base, Dtype::Bfloat16),
+        )
     });
     install_lycoris_groups(
         host,
@@ -549,6 +627,15 @@ pub fn parse_loha_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyL
 /// `scale · x·ΔWᵀ` forward path — no distinct adapter variant needed). Module-key resolution
 /// (flattened-prefixed → dotted via [`kohya_table`]) and unmatched-path surfacing mirror
 /// [`apply_lokr_thirdparty`].
+///
+/// The Hadamard product has **no deferred (unmaterialized) form** — unlike LoKr's Kronecker vec-trick —
+/// so the factors builder below is unconditionally `None`: there is nothing to build. On a packed Q4/Q8
+/// base, `install_lycoris_groups` therefore falls back to the materialized `[out,in]` delta. That is
+/// CORRECT (the residual `scale · x·ΔWᵀ` never reads the base, so it rides over `quantized_matmul`
+/// unchanged) but holds a dense tensor per target. Refusing the trade instead — sc-10051's call for
+/// quantized Wan — would break every third-party LoHa on the DEFAULT tier of every MLX model, because
+/// adapters install *after* `.quantize()` and the worker defaults `spec.quantize` to `Some(Q8)`.
+/// Whether a packed base should refuse a multi-GB delta is sc-10678, not this path's call to make.
 pub fn apply_loha_thirdparty(
     host: &mut impl AdaptableHost,
     w: &Weights,
@@ -558,9 +645,12 @@ pub fn apply_loha_thirdparty(
     let groups = parse_loha_thirdparty(w)?;
     let groups = groups.iter().map(|(raw, g)| {
         // Same bf16 residual as the LoKr paths (PARITY-BF16, sc-2609).
-        (raw.as_str(), move |base: &[i32]| {
-            g.delta(base, Dtype::Bfloat16)
-        })
+        (
+            raw.as_str(),
+            move |base: &[i32]| g.delta(base, Dtype::Bfloat16),
+            // Hadamard has no Kronecker structure to defer — never deferrable, on any base.
+            |_strength: f32, _base: &[i32]| -> Result<Option<LokrFactors>> { Ok(None) },
+        )
     });
     install_lycoris_groups(
         host,
@@ -3601,6 +3691,313 @@ mod tests {
         assert_eq!(
             classify_adapter_format(&w, AdapterKind::Lora, &plain, &mut tp),
             AdapterFormat::LoraKindMismatch
+        );
+    }
+
+    // ---- Packed (Q4/Q8) base: structured LoKr, never a materialized delta (sc-10578) -------------
+
+    /// `[out, in] = [64, 64]` — `in` is exactly one group at the default `group_size = 64`, so the
+    /// base quantizes cleanly and `base_shape()` recovers `[64, 64]` off the `[64, 1]` scales grid.
+    const PK_OUT: i32 = 64;
+    const PK_IN: i32 = 64;
+
+    /// A deterministic base weight whose entries are multiples of `1/16` — exact in bf16, so the
+    /// `PARITY-BF16` downcast inside `quantize()` introduces no rounding of its own.
+    fn pk_base_weight() -> Array {
+        let v: Vec<f32> = (0..(PK_OUT * PK_IN) as usize)
+            .map(|i| ((i % 17) as f32 - 8.0) / 16.0)
+            .collect();
+        Array::from_slice(&v, &[PK_OUT, PK_IN])
+    }
+
+    /// A peft LoKr over `lin`: `w1 [8,8] ⊗ w2 [8,8] → ΔW [64,64]`, `alpha/rank = 8/4 = 2.0`.
+    /// Factor entries are ±powers of two so `kron` and both scale multiplies stay exact in bf16 —
+    /// any residual mismatch is then a real disagreement, not float noise.
+    fn pk_lokr_file(name: &str) -> Weights {
+        let w1: Vec<f32> = (0..64)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.25 })
+            .collect();
+        let w2: Vec<f32> = (0..64)
+            .map(|i| if i % 3 == 0 { 0.25 } else { -0.5 })
+            .collect();
+        let mut meta = HashMap::new();
+        meta.insert("networkType".to_string(), "lokr".to_string());
+        meta.insert("rank".to_string(), "4".to_string());
+        meta.insert("alpha".to_string(), "8.0".to_string());
+        let path = tmp(name);
+        Array::save_safetensors(
+            vec![
+                ("lin.lokr_w1", &Array::from_slice(&w1, &[8, 8])),
+                ("lin.lokr_w2", &Array::from_slice(&w2, &[8, 8])),
+            ],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+        Weights::from_file(&path).unwrap()
+    }
+
+    /// `ΔW = kron(w1, w2)` at the full `alpha/rank · strength` scale, applied as `x·ΔWᵀ` in f32 —
+    /// an INDEPENDENT reference, computed from the LoKr definition rather than by re-running either
+    /// install path. Both the dense (materialized) and packed (structured) residuals must match it.
+    fn pk_reference_residual(w: &Weights, x: &Array, full_scale: f32) -> Array {
+        use mlx_rs::ops::{kron, matmul, multiply};
+        let w1 = w
+            .require("lin.lokr_w1")
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let w2 = w
+            .require("lin.lokr_w2")
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let delta = multiply(kron(&w1, &w2).unwrap(), Array::from_f32(full_scale)).unwrap();
+        matmul(x, delta.t()).unwrap()
+    }
+
+    fn pk_x() -> Array {
+        let v: Vec<f32> = (0..(2 * PK_IN) as usize)
+            .map(|i| ((i % 9) as f32 - 4.0) / 8.0)
+            .collect();
+        Array::from_slice(&v, &[2, PK_IN])
+    }
+
+    /// The load-bearing test. On a packed base a LoKr must install as the STRUCTURED Kronecker form
+    /// (no `[out,in]` delta ever allocated) and must reproduce the same residual as the dense,
+    /// materialized path. `alpha/rank = 2.0` and `strength = 2.5` are both ≠ 1 and differ from each
+    /// other, so a scale threaded through the wrong path cannot coincidentally pass.
+    #[test]
+    fn lokr_on_packed_base_installs_structured_and_matches_dense() {
+        let w = pk_lokr_file("sc10578_packed_lokr.safetensors");
+        let x = pk_x();
+        let strength = 2.5f32;
+        let reference = pk_reference_residual(&w, &x, 2.0 * strength);
+
+        // Dense base → materialized `Adapter::Lokr` (unchanged pre-sc-10578 behavior).
+        let mut dense = OneLinear {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+        };
+        apply_lokr(&mut dense, &w, strength).unwrap();
+        let dense_adapter = &dense.lin.adapters()[0];
+        assert!(
+            matches!(dense_adapter, Adapter::Lokr { .. }),
+            "a DENSE base must keep the materialized delta — the other families' fork-parity \
+             goldens depend on it"
+        );
+        let dense_residual = dense_adapter.residual(&x).unwrap();
+
+        // Packed base → structured `Adapter::LokrStructured`.
+        for bits in [4, 8] {
+            let mut packed = OneLinear {
+                lin: AdaptableLinear::dense(pk_base_weight(), None),
+            };
+            packed.lin.quantize(bits, Some(64)).unwrap();
+            assert!(packed.lin.is_quantized());
+            assert_eq!(packed.lin.base_shape(), vec![PK_OUT, PK_IN]);
+
+            apply_lokr(&mut packed, &w, strength).unwrap();
+            let adapter = &packed.lin.adapters()[0];
+            let factors = match adapter {
+                Adapter::LokrStructured { factors } => factors,
+                Adapter::Lokr { .. } => panic!(
+                    "q{bits}: a packed base installed a MATERIALIZED delta — this is the memory \
+                     regression sc-10578 exists to prevent"
+                ),
+                _ => panic!("q{bits}: unexpected adapter variant"),
+            };
+            // The whole point: only the small factors are held, never `[out, in]`.
+            assert_eq!(factors.w1.shape(), &[8, 8]);
+            assert_eq!(factors.w2.shape(), &[8, 8]);
+            assert!(
+                (factors.w1.size() + factors.w2.size()) * 16 < (PK_OUT * PK_IN) as usize,
+                "q{bits}: structured factors must be far smaller than the [out,in] delta"
+            );
+
+            let structured_residual = adapter.residual(&x).unwrap();
+            assert!(
+                all_close(&structured_residual, &reference, 1e-3, 1e-4, None)
+                    .unwrap()
+                    .item::<bool>(),
+                "q{bits}: structured residual must match the independent kron reference"
+            );
+            assert!(
+                all_close(&structured_residual, &dense_residual, 1e-3, 1e-4, None)
+                    .unwrap()
+                    .item::<bool>(),
+                "q{bits}: structured and materialized residuals must agree"
+            );
+        }
+    }
+
+    /// MUTATION CHECK for the test above. `LokrFile::factors` bakes the FULL `alpha/rank · strength`
+    /// into `w2` because the structured residual carries no separate scale, whereas `delta` bakes only
+    /// `alpha/rank` and leaves `strength` to `Adapter::Lokr::scale`. Dropping `strength` here is the
+    /// exact silent mis-scale that distinction invites — confirm the assertion above would catch it.
+    #[test]
+    fn structured_lokr_residual_is_sensitive_to_the_strength_factor() {
+        let w = pk_lokr_file("sc10578_packed_lokr_mut.safetensors");
+        let x = pk_x();
+        let strength = 2.5f32;
+        let reference = pk_reference_residual(&w, &x, 2.0 * strength);
+
+        let file = parse_lokr(&w).unwrap();
+        let group = file.groups.get("lin").unwrap();
+
+        // Correct: full scale = (alpha/rank) · strength.
+        let good = file
+            .factors(group, strength, &[PK_OUT, PK_IN], Dtype::Bfloat16)
+            .unwrap()
+            .expect("a linear LoKr is deferrable");
+        assert!(
+            all_close(good.residual(&x).unwrap(), &reference, 1e-3, 1e-4, None)
+                .unwrap()
+                .item::<bool>()
+        );
+
+        // Mutated: `strength` forgotten (scale = alpha/rank only). Must FAIL the same assertion —
+        // otherwise the test above is incapable of catching a dropped strength.
+        let bad = file
+            .factors(group, 1.0, &[PK_OUT, PK_IN], Dtype::Bfloat16)
+            .unwrap()
+            .expect("a linear LoKr is deferrable");
+        assert!(
+            !all_close(bad.residual(&x).unwrap(), &reference, 1e-3, 1e-4, None)
+                .unwrap()
+                .item::<bool>(),
+            "dropping `strength` must change the residual — otherwise the scale assertions are vacuous"
+        );
+    }
+
+    /// LoHa has no deferred form at all (Hadamard, not Kronecker), so on a packed base it falls back to
+    /// the materialized `[out,in]` delta — the pre-sc-10578 behavior, preserved deliberately. Erroring
+    /// instead (my first cut) would break every third-party LoHa on the DEFAULT tier of every MLX model:
+    /// adapters install AFTER `.quantize()`, and the worker defaults `spec.quantize` to `Some(Q8)`. The
+    /// fallback is correct — `Adapter::Lokr`'s residual never reads the base — just memory-hungry.
+    /// Whether a packed base should refuse a multi-GB delta is sc-10678.
+    #[test]
+    fn loha_on_packed_base_falls_back_to_materialization() {
+        let r = 4;
+        let a: Vec<f32> = (0..(PK_OUT * r) as usize)
+            .map(|i| (i % 5) as f32 * 0.1)
+            .collect();
+        let b: Vec<f32> = (0..(r * PK_IN) as usize)
+            .map(|i| (i % 7) as f32 * 0.1)
+            .collect();
+        let (wa, wb) = (
+            Array::from_slice(&a, &[PK_OUT, r]),
+            Array::from_slice(&b, &[r, PK_IN]),
+        );
+        let path = tmp("sc10578_packed_loha.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("lin.hada_w1_a", &wa),
+                ("lin.hada_w1_b", &wb),
+                ("lin.hada_w2_a", &wa),
+                ("lin.hada_w2_b", &wb),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+        assert!(is_loha_keys(&w));
+
+        // Dense base: still works, materialized as before.
+        let mut dense = OneLinear {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+        };
+        assert_eq!(
+            apply_loha_thirdparty(&mut dense, &w, 1.0).unwrap().applied,
+            1
+        );
+
+        // Packed base: falls back to the materialized delta — installed, NOT rejected.
+        let mut packed = OneLinear {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+        };
+        packed.lin.quantize(8, Some(64)).unwrap();
+        assert_eq!(
+            apply_loha_thirdparty(&mut packed, &w, 1.0).unwrap().applied,
+            1,
+            "a LoHa must still install on a packed base — erroring here would break every \
+             third-party LoHa on the default tier of every MLX model (adapters install AFTER \
+             .quantize(), and the worker defaults spec.quantize to Some(Q8))"
+        );
+        match packed.lin.adapters() {
+            [Adapter::Lokr { delta, .. }] => assert_eq!(delta.shape(), &[PK_OUT, PK_IN]),
+            _ => panic!("LoHa on a packed base must install the materialized delta"),
+        }
+        // And it must be CORRECT, not merely present: the residual is base-independent, so the packed
+        // and dense installs produce the same one. (Catches a fallback that silently mis-scales.)
+        let x = pk_x();
+        assert!(
+            all_close(
+                packed.lin.adapters()[0].residual(&x).unwrap(),
+                dense.lin.adapters()[0].residual(&x).unwrap(),
+                1e-5,
+                1e-6,
+                None
+            )
+            .unwrap()
+            .item::<bool>(),
+            "the packed fallback residual must equal the dense one"
+        );
+        assert!(
+            packed.lin.is_quantized(),
+            "the fallback must not dequantize the base"
+        );
+    }
+
+    /// A tucker/CP `lokr_t2` has no 2-D matrix form, so `build_lokr_factors` returns `None` and the
+    /// packed base falls back to the materialized path — **exactly what a dense base does**. Here that
+    /// fallback then fails, because a conv-shaped `ΔW` cannot reshape onto a Linear `[64,64]` target
+    /// (lycoris only emits `lokr_t2` for conv layers). The point of the test is that packed and dense
+    /// behave IDENTICALLY: sc-10578 introduced no new failure mode for non-deferrable modules.
+    #[test]
+    fn tucker_lokr_on_packed_base_matches_dense_behavior() {
+        let t2 = Array::from_slice(&[0.1f32; 2 * 2 * 3 * 3], &[2, 2, 3, 3]);
+        let w2a = Array::from_slice(&[0.2f32; 2 * 8], &[2, 8]);
+        let w2b = Array::from_slice(&[0.3f32; 2 * 8], &[2, 8]);
+        let w1 = Array::from_slice(&[0.4f32; 8 * 8], &[8, 8]);
+        let path = tmp("sc10578_packed_tucker_lokr.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("lin.lokr_w1", &w1),
+                ("lin.lokr_t2", &t2),
+                ("lin.lokr_w2_a", &w2a),
+                ("lin.lokr_w2_b", &w2b),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+
+        // Dense base: the materialized path rejects a conv delta on a Linear target.
+        let mut dense = OneLinear {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+        };
+        let dense_err = apply_lokr_thirdparty(&mut dense, &w, 1.0)
+            .expect_err("a conv/tucker delta cannot reshape onto a Linear base")
+            .to_string();
+
+        // Packed base: falls back to that same path, so it fails the same way — not with a new,
+        // sc-10578-specific rejection.
+        let mut packed = OneLinear {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+        };
+        packed.lin.quantize(4, Some(64)).unwrap();
+        let e = apply_lokr_thirdparty(&mut packed, &w, 1.0)
+            .expect_err("a tucker LoKr on a packed base fails via the materialized fallback")
+            .to_string();
+        assert_eq!(
+            e, dense_err,
+            "packed must fail identically to dense — sc-10578 must add no new failure mode"
+        );
+        assert!(
+            packed.lin.adapters().is_empty(),
+            "nothing installed on failure"
         );
     }
 }
