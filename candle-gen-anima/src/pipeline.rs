@@ -132,8 +132,14 @@ impl AnimaPipeline {
         };
 
         let sigmas = anima_sigmas(opts.steps);
-        let noise =
-            create_noise(opts.seed, opts.width, opts.height, &self.device)?.to_dtype(dtype)?;
+        // Keep the initial latent in **f32** — the sampler integrates in f32 (`predict` returns the
+        // velocity as f32; the VAE is loaded + decodes in f32), and the DiT casts its input to the
+        // compute dtype internally (`CosmosDiT::forward`). Casting the noise to `dtype` here is a no-op
+        // on the CPU/f32 parity lane but yields a **bf16** latent on the GPU lanes, so the sampler's
+        // `x + (σ_next − σ)·v` add mixes a bf16 `x` with an f32 `v` → "dtype mismatch in add" on the
+        // very first step. This never fired on the CPU-only goldens; it only bites on real CUDA/Metal
+        // (sc-10625). Latents stay f32 end-to-end; only the DiT forward runs in `dtype`.
+        let noise = create_noise(opts.seed, opts.width, opts.height, &self.device)?;
         let guidance = opts.guidance as f64;
         let sampler = opts.sampler.as_deref().or(Some(DEFAULT_SAMPLER));
 
