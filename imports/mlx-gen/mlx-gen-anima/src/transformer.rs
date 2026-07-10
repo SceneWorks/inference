@@ -558,3 +558,77 @@ impl AdaptableHost for CosmosDiT {
         out
     }
 }
+
+// -------------------------------------------------------------------------------------------------
+// Test-only structural constructor
+// -------------------------------------------------------------------------------------------------
+
+/// Build the full DiT module tree with **placeholder** (1×1) weights so the target-enumeration guard
+/// (sc-10522) can exercise the real [`AdaptableHost::adaptable_paths`] surface without the licensed
+/// checkpoint or any Metal compute — enumeration only walks the module tree; no placeholder tensor is
+/// ever evaluated.
+#[cfg(test)]
+mod structural {
+    use super::*;
+
+    fn ph_lin() -> AdaptableLinear {
+        AdaptableLinear::dense(Array::from_slice(&[0.0f32], &[1, 1]), None)
+    }
+    fn ph_norm() -> Array {
+        Array::from_slice(&[1.0f32], &[1])
+    }
+
+    impl CosmosDiT {
+        /// A weight-free DiT with `cfg.num_layers` structurally-complete blocks (28 for Anima),
+        /// for the path-enumeration guard. Placeholder tensors only; nothing is evaluated.
+        pub(crate) fn structural(cfg: DitConfig) -> Self {
+            let heads = cfg.num_attention_heads as i32;
+            let head_dim = cfg.attention_head_dim as i32;
+            let attn = || Attention {
+                to_q: ph_lin(),
+                to_k: ph_lin(),
+                to_v: ph_lin(),
+                to_out: ph_lin(),
+                norm_q: ph_norm(),
+                norm_k: ph_norm(),
+                heads,
+                head_dim,
+                scale: 1.0,
+            };
+            let adaln0 = || AdaLayerNormZero {
+                linear_1: ph_lin(),
+                linear_2: ph_lin(),
+            };
+            let blocks = (0..cfg.num_layers)
+                .map(|_| Block {
+                    norm1: adaln0(),
+                    attn1: attn(),
+                    norm2: adaln0(),
+                    attn2: attn(),
+                    norm3: adaln0(),
+                    ff: FeedForward {
+                        proj_in: ph_lin(),
+                        proj_out: ph_lin(),
+                    },
+                })
+                .collect();
+            Self {
+                patch_embed: ph_lin(),
+                time_embed: TimeEmbed {
+                    linear_1: ph_lin(),
+                    linear_2: ph_lin(),
+                    norm: ph_norm(),
+                    hidden: cfg.hidden_size(),
+                },
+                blocks,
+                norm_out: AdaLayerNorm {
+                    linear_1: ph_lin(),
+                    linear_2: ph_lin(),
+                    hidden: cfg.hidden_size() as i32,
+                },
+                proj_out: ph_lin(),
+                cfg,
+            }
+        }
+    }
+}
