@@ -18,6 +18,8 @@ use mlx_gen_anima::conditioner::AnimaTextConditioner;
 use mlx_gen_anima::config::{ConditionerConfig, DitConfig, Variant};
 use mlx_gen_anima::loader::split_anima_keys;
 use mlx_gen_anima::pipeline::{AnimaPipeline, GenOptions};
+use mlx_gen_anima::strip_prompt_weights;
+use mlx_gen_anima::tokenizer::AnimaTokenizers;
 use mlx_gen_anima::transformer::CosmosDiT;
 
 /// Glob the Anima snapshot's `split_files/` dir from the HF cache (no hardcoded sha).
@@ -74,6 +76,23 @@ fn coherence(img: &Image) -> (f32, f32) {
     let coarse_std =
         (coarse.iter().map(|&x| (x - cm).powi(2)).sum::<f32>() / coarse.len() as f32).sqrt();
     (std, coarse_std)
+}
+
+/// Flatten a (possibly bf16) array to host f32.
+fn to_f32(a: &Array) -> Vec<f32> {
+    a.as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec()
+}
+
+/// Max |a - b| over two equally-shaped arrays (host f32).
+fn maxabs_diff(a: &Array, b: &Array) -> f32 {
+    let (av, bv) = (to_f32(a), to_f32(b));
+    assert_eq!(av.len(), bv.len(), "shape mismatch");
+    av.iter()
+        .zip(&bv)
+        .fold(0f32, |m, (x, y)| m.max((x - y).abs()))
 }
 
 fn save_png(img: &Image, path: &std::path::Path) {
@@ -253,4 +272,187 @@ fn generate_all_three_variants_1024() {
 
         mlx_rs::memory::clear_cache();
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Prompt weighting (sc-10566) — the EPIC ACCEPTANCE proof that `(chibi:2)` changes the output, and
+// that the weight hits the **T5 query-token path**, not Qwen.
+//
+// Reference convention (read, NOT vendored — ComfyUI is GPL-3.0, mlx-gen is Apache-2.0):
+//   * comfy/text_encoders/anima.py L26-27  — Qwen token weights forced to 1.0; T5 weights preserved.
+//   * comfy/ldm/anima/model.py    L198-206 — `out = self.llm_adapter(...); out = out * t5xxl_weights`
+//                                            (per-token scale of the adapter OUTPUT, before pad-to-512).
+//   * comfy/model_base.py         L1470    — `t5xxl_weights.unsqueeze(0).unsqueeze(-1)` → `[1, St, 1]`.
+// We implement exactly `out[:, i, :] *= w[i]` on the conditioner output; Qwen is untouched.
+// -------------------------------------------------------------------------------------------------
+
+/// **STRUCTURAL characterization** (mutation-sensitive): the weight scales *only* the weighted T5
+/// query-token OUTPUT rows, by exactly their factor, leaving every other row bit-identical. This
+/// uniquely pins `out * w` at the conditioner output: a wrong-place implementation (scaling the
+/// embedding INPUT) or wrong-tower implementation (scaling the Qwen cross-attn source) smears the
+/// change across ALL output rows via the 6 attention blocks, so the unweighted-rows-unchanged
+/// assertion FAILS. Uses a fixed random Qwen source (no text encoder needed) so it isolates the
+/// conditioner. `2.0` is a power of two ⇒ the bf16 product is exact, so equality is checked exactly.
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot"]
+fn prompt_weighting_scales_only_weighted_t5_rows() {
+    let split = split_files().expect("Anima snapshot");
+    let w = Weights::from_file(dit_file(&split, Variant::Base)).unwrap();
+    let cond =
+        AnimaTextConditioner::from_weights(&w, "net.llm_adapter", ConditionerConfig::anima())
+            .unwrap();
+    let tk = AnimaTokenizers::load().unwrap();
+
+    // Weighted prompt → T5 ids + per-token weights (the `chibi` span carries 2.0; the rest 1.0).
+    let (ids, weights) = tk
+        .encode_t5_weighted("1girl, (chibi:2.0), masterpiece")
+        .unwrap();
+    let st = ids.shape()[1] as usize;
+    assert_eq!(weights.len(), st);
+    assert!(
+        weights.iter().any(|&x| (x - 2.0).abs() < 1e-6) && weights.contains(&1.0),
+        "expected a mix of 2.0 and 1.0 weights, got {weights:?}"
+    );
+
+    // A fixed random Qwen source (same `St` length so the structure is unambiguous).
+    let key = mlx_rs::random::key(7).unwrap();
+    let source = mlx_rs::random::normal::<f32>(&[1, st as i32, 1024], None, None, Some(&key))
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+
+    // Identical inputs, weights off vs on.
+    let base = cond
+        .forward_weighted(&source, &ids, None, Dtype::Bfloat16)
+        .unwrap();
+    let wt = cond
+        .forward_weighted(&source, &ids, Some(&weights), Dtype::Bfloat16)
+        .unwrap();
+    assert_eq!(base.shape(), &[1, 512, 1024]);
+    assert_eq!(wt.shape(), &[1, 512, 1024]);
+
+    let (bv, wv) = (to_f32(&base), to_f32(&wt));
+    let d = 1024usize;
+    let (mut changed_rows, mut unchanged_max, mut weighted_max) = (0usize, 0f32, 0f32);
+    for (r, (base_row, wt_row)) in bv.chunks(d).zip(wv.chunks(d)).enumerate() {
+        let w_r = if r < st { weights[r] } else { 1.0 };
+        let mut row_diff = 0f32;
+        for (c, (&b, &w)) in base_row.iter().zip(wt_row).enumerate() {
+            // Exact per-row characterization: weighted == base * w_r (bf16-exact for w ∈ {1.0, 2.0}).
+            let expected = b * w_r;
+            assert!(
+                (w - expected).abs() == 0.0,
+                "row {r} col {c}: weighted {w} != base*{w_r} {expected}"
+            );
+            row_diff = row_diff.max((w - b).abs());
+        }
+        if (w_r - 1.0).abs() < 1e-6 {
+            unchanged_max = unchanged_max.max(row_diff);
+        } else {
+            weighted_max = weighted_max.max(row_diff);
+            if row_diff > 0.0 {
+                changed_rows += 1;
+            }
+        }
+    }
+    println!(
+        "[per-row] St={st} weighted-rows-changed={changed_rows} \
+         max|Δ| weighted-rows={weighted_max:.4} unweighted+pad-rows={unchanged_max:.6}"
+    );
+    // The weighted rows changed; the unweighted/pad rows did NOT (mutation-sensitive assertion).
+    assert!(changed_rows > 0, "the weighted T5 rows must change");
+    assert!(
+        weighted_max > 0.0,
+        "the weighted rows must differ from base"
+    );
+    assert_eq!(
+        unchanged_max, 0.0,
+        "unweighted / pad rows must be bit-identical — a nonzero delta means the weight leaked off \
+         the T5 output path (wrong place / wrong tower)"
+    );
+}
+
+/// **BOTH DIRECTIONS + IMAGE** through the full pipeline: (1) T5-side `(chibi:2.0)` changes the
+/// conditioner output; (2) the Qwen tower is weight-blind (its ids are identical for the weighted and
+/// de-weighted prompt, so it contributes 0 — the whole change is the T5 path); and the weighting
+/// visibly changes a generated image. Turbo (CFG-free, 10 steps) keeps it cheap.
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (real 2B DiT denoise)"]
+fn prompt_weighting_both_directions_and_image() {
+    let split = split_files().expect("Anima snapshot");
+    let out = out_dir();
+    std::fs::create_dir_all(&out).unwrap();
+
+    let plain = "1girl, chibi, masterpiece, silver hair, detailed illustration";
+    let weighted = "1girl, (chibi:2.0), masterpiece, silver hair, detailed illustration";
+
+    let pipeline =
+        AnimaPipeline::from_source(&WeightsSource::Dir(split.clone()), Variant::Turbo).unwrap();
+
+    // Direction 1 — T5-side weighting CHANGES the conditioner output.
+    let base_c = pipeline.encode_prompt(plain).unwrap();
+    let wt_c = pipeline.encode_prompt(weighted).unwrap();
+    let d_t5 = maxabs_diff(&base_c, &wt_c);
+    println!("[both-directions] T5-side (chibi:2.0) vs plain — conditioner max|Δ| = {d_t5:.4}");
+    assert!(
+        d_t5 > 0.1,
+        "T5-side weighting must change the conditioner output (max|Δ| {d_t5})"
+    );
+
+    // Direction 2 — Qwen tower is weight-BLIND: identical ids for weighted vs de-weighted prompt, so
+    // the Qwen contribution to the change is exactly 0 (ComfyUI pins the Qwen token weights to 1.0;
+    // no path routes the weight to Qwen).
+    let (q_plain, _) = pipeline.components().tokenizers.encode_qwen(plain).unwrap();
+    let (q_wt, _) = pipeline
+        .components()
+        .tokenizers
+        .encode_qwen(&strip_prompt_weights(weighted))
+        .unwrap();
+    assert_eq!(
+        q_plain.as_slice::<i32>(),
+        q_wt.as_slice::<i32>(),
+        "Qwen ids must be identical — the Qwen tower never sees the weight (Qwen-side Δ = 0)"
+    );
+
+    // Image — (chibi:2.0) must visibly change the generated image vs the unweighted prompt.
+    let opts = GenOptions {
+        width: 1024,
+        height: 1024,
+        steps: Variant::Turbo.default_steps() as usize,
+        guidance: Variant::Turbo.default_guidance(),
+        seed: 42,
+        sampler: None,
+    };
+    let cancel = CancelFlag::default();
+    let mut prog = |_p: Progress| {};
+    let img_plain = pipeline
+        .generate(plain, "", Variant::Turbo, &opts, &cancel, &mut prog)
+        .unwrap();
+    let img_wt = pipeline
+        .generate(weighted, "", Variant::Turbo, &opts, &cancel, &mut prog)
+        .unwrap();
+    let p_plain = out.join("prompt_weight_turbo_plain.png");
+    let p_wt = out.join("prompt_weight_turbo_chibi2.png");
+    save_png(&img_plain, &p_plain);
+    save_png(&img_wt, &p_wt);
+    println!("wrote {}", p_plain.display());
+    println!("wrote {}", p_wt.display());
+    assert_coherent(&img_plain, "prompt_weight_plain");
+    assert_coherent(&img_wt, "prompt_weight_chibi2");
+
+    // Mean absolute per-pixel difference (0..255) between the two renders (same seed).
+    let mad = img_plain
+        .pixels
+        .iter()
+        .zip(&img_wt.pixels)
+        .map(|(a, b)| (*a as f32 - *b as f32).abs())
+        .sum::<f32>()
+        / img_plain.pixels.len() as f32;
+    println!("[both-directions] image mean-abs-pixel-diff (plain vs (chibi:2.0)) = {mad:.2}");
+    assert!(
+        mad > 1.0,
+        "(chibi:2.0) must visibly change the generated image (MAD {mad})"
+    );
+
+    mlx_rs::memory::clear_cache();
 }
