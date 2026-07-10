@@ -1,0 +1,370 @@
+//! Anima MLX-port parity goldens (sc-10524, epic 10512) — the **real-weights** stages. `#[ignore]`d +
+//! weights-gated (they need the licensed `circlestone-labs/Anima` snapshot in the HF cache + Metal), so
+//! they **never run in CI**. Run locally with:
+//!   cargo test -p mlx-gen-anima --release --test parity_real_weights -- --ignored --nocapture
+//!
+//! Each test reads a committed golden JSON (computed by `tests/fixtures/gen_anima_parity_goldens.py`
+//! from the diffusers 0.39.0 reference; Apache-2.0) — **no Python at test time** — and runs the MLX port
+//! on the single-file checkpoint, then compares a committed deterministic subsample + summary stats.
+//!
+//!   * **Stage 2** — Qwen3-0.6B `last_hidden_state` AFTER the attention-mask multiply. bf16 both sides.
+//!   * **Stage 3** — `AnimaTextConditioner` output `(1, 512, 1024)`, right-padded after masking. fp32.
+//!   * **Stage 4** — Cosmos DiT forward: one block, then all 28. fp32. Localizes adaLN-LoRA / RoPE drift.
+//!
+//! Stages 3 & 4 feed a DETERMINISTIC LCG input (bit-identical to the Python generator's `lcg_fill`), so
+//! no large input tensor is committed and the golden isolates the component's math (fp32, ~1e-3
+//! Metal-vs-CPU) rather than bf16 quantization. Stage 2's input is the deterministic Qwen2 token ids.
+
+use std::path::{Path, PathBuf};
+
+use mlx_rs::ops::multiply;
+use mlx_rs::{Array, Dtype};
+use serde_json::Value;
+
+use mlx_gen::weights::Weights;
+use mlx_gen_anima::conditioner::AnimaTextConditioner;
+use mlx_gen_anima::config::{ConditionerConfig, DitConfig, Qwen3Config, Variant};
+use mlx_gen_anima::text_encoder::AnimaQwen3;
+use mlx_gen_anima::tokenizer::AnimaTokenizers;
+use mlx_gen_anima::transformer::CosmosDiT;
+
+// ------------------------------------------------------------------------------------------------
+// Shared helpers.
+// ------------------------------------------------------------------------------------------------
+
+/// Glob the Anima snapshot's `split_files/` dir from the HF cache (no hardcoded sha). Mirrors
+/// `tests/real_weights.rs`.
+fn split_files() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let base = PathBuf::from(home)
+        .join(".cache/huggingface/hub/models--circlestone-labs--Anima/snapshots");
+    std::fs::read_dir(&base)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find_map(|e| {
+            let p = e.path().join("split_files");
+            p.join("diffusion_models").is_dir().then_some(p)
+        })
+}
+
+fn dit_file(split: &Path) -> PathBuf {
+    split
+        .join("diffusion_models")
+        .join(Variant::Base.dit_filename())
+}
+
+fn load_golden(name: &str) -> Value {
+    let path = format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+}
+
+/// Portable LCG in [-1, 1) — **bit-identical** to the Python generator's `lcg_fill` (pure integer
+/// recurrence + f64->f32 cast). Feeds the stage-3/4 deterministic synthetic inputs.
+fn lcg_fill(n: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed & 0x7fff_ffff;
+    (0..n)
+        .map(|_| {
+            s = (s.wrapping_mul(1103515245).wrapping_add(12345)) & 0x7fff_ffff;
+            (s as f64 / 2147483647.0 * 2.0 - 1.0) as f32
+        })
+        .collect()
+}
+
+fn i64s(v: &Value) -> Vec<i64> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap())
+        .collect()
+}
+
+/// Flatten a Rust output to f64 and assert its shape + element count against a golden summary.
+fn flatten_checked(got: &Array, g: &Value, label: &str) -> Vec<f64> {
+    let want_shape: Vec<i32> = g["shape"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap() as i32)
+        .collect();
+    assert_eq!(got.shape(), &want_shape[..], "{label}: shape");
+    let flat: Vec<f64> = got
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .iter()
+        .map(|&x| x as f64)
+        .collect();
+    let count = g["count"].as_u64().unwrap() as usize;
+    assert_eq!(flat.len(), count, "{label}: element count");
+    flat
+}
+
+/// The **aggregate-stats parity gate** (the real structural-correctness assertion): recompute
+/// mean/std/l2 on the Rust output and require they match the golden within `stat_rtol`. A structural
+/// port bug (wrong sign / dropped mask / mis-scaled RoPE) shifts these by orders of magnitude; bf16 /
+/// fp32 reduced-precision does not. Returns the flattened output for optional elementwise checks.
+fn assert_stats(got: &Array, g: &Value, label: &str, stat_rtol: f64) -> Vec<f64> {
+    let flat = flatten_checked(got, g, label);
+    let count = flat.len();
+    let mean = flat.iter().sum::<f64>() / count as f64;
+    let var = flat.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / count as f64;
+    let std = var.sqrt();
+    let l2 = flat.iter().map(|&x| x * x).sum::<f64>().sqrt();
+    let (gmean, gstd, gl2) = (
+        g["mean"].as_f64().unwrap(),
+        g["std"].as_f64().unwrap(),
+        g["l2"].as_f64().unwrap(),
+    );
+    let rel = |a: f64, b: f64| (a - b).abs() / (b.abs().max(1e-6));
+    println!(
+        "[{label}] stats: mean {mean:.5} (g {gmean:.5}), std {std:.5} (g {gstd:.5}), l2 {l2:.4} (g {gl2:.4})"
+    );
+    // mean can be ~0 (relative error explodes), so gate it absolutely against the std scale.
+    assert!(
+        (mean - gmean).abs() < stat_rtol * gstd.abs().max(1e-3),
+        "{label}: mean drift {mean} vs {gmean}"
+    );
+    assert!(
+        rel(std, gstd) < stat_rtol,
+        "{label}: std drift {std} vs {gstd}"
+    );
+    assert!(rel(l2, gl2) < stat_rtol, "{label}: l2 drift {l2} vs {gl2}");
+    flat
+}
+
+/// Aggregate stats only (shape/count/mean/std/l2). Used where the committed summary carries no
+/// elementwise samples — e.g. stage-3's FULL `[1,512,1024]` (its samples live in the active region;
+/// the full summary exists to verify the right-padding via count/std/l2).
+fn assert_stats_only(got: &Array, g: &Value, label: &str, stat_rtol: f64) {
+    let _ = assert_stats(got, g, label, stat_rtol);
+}
+
+/// Relative-L2 over the committed sample set: `‖got−want‖₂ / ‖want‖₂`. This is the robust
+/// "no quality regression" metric for a **bf16 cross-backend** comparison — unlike a per-element
+/// bound it is not dominated by a single small-magnitude residual whose bf16 rounding differs between
+/// torch-CPU and MLX-Metal (a correct-port artifact of catastrophic cancellation, not a bug). The
+/// aggregate-stats gate (`assert_stats`) plus this relative-L2 together pin structural correctness.
+fn assert_sampled_rel_l2(got: &Array, g: &Value, label: &str, stat_rtol: f64, max_rel_l2: f64) {
+    let flat = assert_stats(got, g, label, stat_rtol);
+    let idx = i64s(&g["sample_indices"]);
+    let vals: Vec<f64> = g["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap())
+        .collect();
+    assert_eq!(
+        idx.len(),
+        vals.len(),
+        "{label}: index/value length mismatch"
+    );
+    assert!(
+        idx.len() >= 16,
+        "{label}: too few golden samples ({}) — asserts nothing",
+        idx.len()
+    );
+    let mut num = 0f64;
+    let mut den = 0f64;
+    for (&i, &want) in idx.iter().zip(&vals) {
+        let d = flat[i as usize] - want;
+        num += d * d;
+        den += want * want;
+    }
+    let rel_l2 = (num / den.max(1e-12)).sqrt();
+    println!(
+        "[{label}] sampled rel-L2 = {rel_l2:.4e} over {} samples (bound {max_rel_l2:.1e})",
+        idx.len()
+    );
+    assert!(
+        rel_l2 < max_rel_l2,
+        "{label}: sampled rel-L2 {rel_l2:.4e} exceeds {max_rel_l2:.1e} — a real port bug, not bf16 noise"
+    );
+}
+
+/// Full comparison: the aggregate-stats gate PLUS every committed sample index. `stat_rtol` gates the
+/// aggregate (tight — the real parity gate); `sample_atol`/`sample_rtol` gate individual elements
+/// (looser for bf16 peak elements, which diverge a few % between torch-CPU and MLX-Metal even on a
+/// correct port — the aggregate proves correctness, the samples localize).
+fn assert_matches_summary(
+    got: &Array,
+    g: &Value,
+    label: &str,
+    stat_rtol: f64,
+    sample_atol: f64,
+    sample_rtol: f64,
+) {
+    let flat = assert_stats(got, g, label, stat_rtol);
+    let idx = i64s(&g["sample_indices"]);
+    let vals: Vec<f64> = g["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap())
+        .collect();
+    assert_eq!(
+        idx.len(),
+        vals.len(),
+        "{label}: golden index/value length mismatch"
+    );
+    assert!(
+        idx.len() >= 16,
+        "{label}: too few golden samples ({}) — a short/empty loop asserts nothing",
+        idx.len()
+    );
+    let mut max_abs = 0f64;
+    for (&i, &want) in idx.iter().zip(&vals) {
+        let got = flat[i as usize];
+        let d = (got - want).abs();
+        max_abs = max_abs.max(d);
+        assert!(
+            d <= sample_atol + sample_rtol * want.abs(),
+            "{label}: sample[{i}] = {got:.6}, want {want:.6} (|d| {d:.6} > {})",
+            sample_atol + sample_rtol * want.abs()
+        );
+    }
+    println!(
+        "[{label}] max sample |Δ| = {max_abs:.6} over {} samples",
+        idx.len()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// Stage 2 — Qwen3-0.6B last_hidden_state after the mask multiply (bf16).
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot + Metal"]
+fn stage2_qwen3_last_hidden_state() {
+    let split = split_files().expect("Anima snapshot");
+    let g = load_golden("qwen3_hidden_golden.json");
+    let want_ids = i64s(&g["meta"]["qwen_ids"]);
+
+    let te_w = Weights::from_file(split.join("text_encoders/qwen_3_06b_base.safetensors")).unwrap();
+    let te = AnimaQwen3::from_weights(&te_w, "model", &Qwen3Config::anima()).unwrap();
+    let tk = AnimaTokenizers::load().unwrap();
+    let (ids, mask) = tk
+        .encode_qwen(g["meta"]["prompt"].as_str().unwrap())
+        .unwrap();
+    // The Rust tokenizer must reproduce the golden's ids (else the whole comparison is moot).
+    let got_ids: Vec<i64> = ids.as_slice::<i32>().iter().map(|&x| x as i64).collect();
+    assert_eq!(
+        got_ids, want_ids,
+        "stage2: Qwen ids drifted from the golden"
+    );
+
+    let hidden = te.forward(&ids, &mask).unwrap(); // [1, S, 1024] bf16
+                                                   // the mask-multiply trap (no-op for an all-ones batch-1 mask, applied for faithfulness).
+    let m = mask
+        .as_dtype(hidden.dtype())
+        .unwrap()
+        .expand_dims(2)
+        .unwrap();
+    let hidden = multiply(&hidden, &m).unwrap();
+    // bf16 tower vs a torch bf16 reference. Gate on (a) the aggregate stats (mean/std/l2 match to <0.3%
+    // — the structural-correctness gate; a real port bug moves these by orders of magnitude) and (b) the
+    // sampled relative-L2 (~1e-2 — the robust no-quality-regression metric). A per-element bound is the
+    // WRONG metric here: bf16 elements that are small residuals of large cancellations diverge a few %
+    // in absolute terms between torch-CPU and MLX-Metal even on a correct port (the fp32 stages 3 & 4,
+    // which share rms_norm/attention/linear, pass a per-element 1e-2 — proving the math is right).
+    assert_sampled_rel_l2(&hidden, &g["last_hidden_state"], "stage2_qwen3", 1e-2, 3e-2);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Stage 3 — AnimaTextConditioner output (1, 512, 1024), right-padded after masking (fp32).
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot + Metal"]
+fn stage3_conditioner_output() {
+    let split = split_files().expect("Anima snapshot");
+    let g = load_golden("conditioner_golden.json");
+    let st = g["meta"]["st"].as_u64().unwrap() as i32;
+    let t5_ids: Vec<i32> = i64s(&g["meta"]["t5_ids"])
+        .iter()
+        .map(|&x| x as i32)
+        .collect();
+    let src_shape: Vec<i32> = i64s(&g["meta"]["lcg"]["source_shape"])
+        .iter()
+        .map(|&x| x as i32)
+        .collect();
+
+    let w = Weights::from_file(dit_file(&split)).unwrap();
+    let cond =
+        AnimaTextConditioner::from_weights(&w, "net.llm_adapter", ConditionerConfig::anima())
+            .unwrap();
+
+    let n: usize = src_shape.iter().product::<i32>() as usize;
+    let source = Array::from_slice(&lcg_fill(n, 3), &src_shape[..]); // fp32
+    let target = Array::from_slice(&t5_ids, &[1, st]);
+    let out = cond.forward(&source, &target, Dtype::Float32).unwrap();
+    assert_eq!(
+        out.shape(),
+        &[1, 512, 1024],
+        "stage3: must right-pad to 512 tokens"
+    );
+
+    // The right-padded rows [st:512] must be exactly the zero pad the DiT expects.
+    let flat = out.as_slice::<f32>();
+    let pad_from = (st as usize) * 1024;
+    let pad_abs_max = flat[pad_from..].iter().fold(0f32, |m, &v| m.max(v.abs()));
+    println!("[stage3] pad rows [{st}:512] abs-max = {pad_abs_max:.2e}");
+    assert!(
+        pad_abs_max < 1e-4,
+        "stage3: rows past the real tokens must be zero padding"
+    );
+
+    // Aggregate stats over the full [1,512,1024] verify the padding; sample values assert the ACTIVE
+    // conditioned region (rows [0:st]).
+    assert_stats_only(&out, &g["full"], "stage3_full", 1e-2);
+    let rows: Vec<i32> = (0..st).collect();
+    let active = out.take_axis(Array::from_slice(&rows, &[st]), 1).unwrap();
+    // fp32 both sides -> the conditioner isolates cleanly: tight aggregate + tight per-element.
+    assert_matches_summary(&active, &g["active"], "stage3_active", 1e-2, 5e-3, 1e-2);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Stage 4 — Cosmos DiT forward: one block, then all 28 (fp32). adaLN-LoRA + NTK 3D RoPE hot spots.
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot + Metal"]
+fn stage4_dit_forward_block0_and_full() {
+    let split = split_files().expect("Anima snapshot");
+    let g = load_golden("dit_forward_golden.json");
+    let lat_shape: Vec<i32> = i64s(&g["meta"]["latent_shape"])
+        .iter()
+        .map(|&x| x as i32)
+        .collect();
+    let enc_shape: Vec<i32> = i64s(&g["meta"]["encoder_shape"])
+        .iter()
+        .map(|&x| x as i32)
+        .collect();
+    let sigma_v = g["meta"]["lcg"]["sigma"].as_f64().unwrap() as f32;
+
+    let w = Weights::from_file(dit_file(&split)).unwrap();
+    let dit = CosmosDiT::from_weights(&w, "net", DitConfig::anima()).unwrap();
+
+    let latent = Array::from_slice(
+        &lcg_fill(lat_shape.iter().product::<i32>() as usize, 1),
+        &lat_shape[..],
+    );
+    let encoder = Array::from_slice(
+        &lcg_fill(enc_shape.iter().product::<i32>() as usize, 2),
+        &enc_shape[..],
+    );
+    let sigma = Array::from_slice(&[sigma_v], &[1]);
+
+    // one block (localizes adaLN-LoRA modulation + NTK-scaled 3D RoPE to a single block). fp32 both
+    // sides -> ~1e-3 Metal-vs-CPU; a 1e-2 gate cleanly separates correct-port noise from a real bug.
+    let block0 = dit
+        .forward_hidden(&latent, &sigma, &encoder, Dtype::Float32, Some(1))
+        .unwrap();
+    assert_matches_summary(&block0, &g["block0"], "stage4_block0", 1e-2, 5e-3, 1e-2);
+
+    // all 28 blocks + norm_out + proj_out + unpatchify (the final velocity).
+    let full = dit
+        .forward(&latent, &sigma, &encoder, Dtype::Float32)
+        .unwrap();
+    assert_matches_summary(&full, &g["full"], "stage4_full", 1e-2, 5e-3, 1e-2);
+}

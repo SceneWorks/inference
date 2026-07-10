@@ -27,3 +27,5 @@ image = { workspace = true }
 # Backend-neutral gen-core contract conformance (capability honesty / progress monotonicity / typed
 # cancellation / seed determinism / registry round-trip). Weight-gated (#[ignore]).
 sceneworks-gen-core-testkit = { workspace = true }
+# Read the committed parity goldens (sc-10524) at test time — no Python at test time.
+serde_json = { workspace = true }
