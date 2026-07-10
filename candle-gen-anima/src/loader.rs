@@ -140,3 +140,52 @@ impl AnimaComponents {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_core::Tensor;
+    use std::collections::HashMap;
+
+    /// Write a one-tensor safetensors whose only key is `{root}.x_embedder.proj.1.weight`, then assert
+    /// `detect_dit_prefix` recovers `{root}` — covering **both** shipped DiT roots (`net` for the base
+    /// cut, `model.diffusion_model` for turbo/aesthetic). A hardcoded `net.` would mis-detect the second.
+    fn write_anchor(dir: &std::path::Path, root: &str) -> PathBuf {
+        let path = dir.join(format!("{}.safetensors", root.replace('.', "_")));
+        let mut m = HashMap::new();
+        m.insert(
+            format!("{root}.x_embedder.proj.1.weight"),
+            Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_gen::candle_core::safetensors::save(&m, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn detect_dit_prefix_covers_both_roots() {
+        let dir = std::env::temp_dir().join(format!("anima_prefix_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for root in ["net", "model.diffusion_model"] {
+            let path = write_anchor(&dir, root);
+            assert_eq!(
+                detect_dit_prefix(&path).unwrap(),
+                root,
+                "prefix must be detected, not hardcoded, for root {root:?}"
+            );
+        }
+
+        // A file with no anchor key errors (never assumes a prefix).
+        let mut m = HashMap::new();
+        m.insert(
+            "something.else.weight".to_string(),
+            Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(),
+        );
+        let bad = dir.join("noanchor.safetensors");
+        candle_gen::candle_core::safetensors::save(&m, &bad).unwrap();
+        assert!(detect_dit_prefix(&bad).is_err(), "no anchor key ⇒ error");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
