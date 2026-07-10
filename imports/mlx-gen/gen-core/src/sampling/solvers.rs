@@ -961,6 +961,11 @@ mod tests {
             want.len(),
             "dpmpp_2m_sde golden trajectory length"
         );
+        assert_eq!(
+            got.len(),
+            7,
+            "6 steps + trailing terminal => 7 latent snapshots"
+        );
         for (k, (a, b)) in got.iter().zip(&want).enumerate() {
             assert_close(a, b, GOLDEN_TOL, &format!("dpmpp_2m_sde golden step {k}"));
         }
