@@ -349,3 +349,63 @@ impl AdaptableHost for AnimaTextConditioner {
         out
     }
 }
+
+// -------------------------------------------------------------------------------------------------
+// Test-only structural constructor
+// -------------------------------------------------------------------------------------------------
+
+/// Build the conditioner module tree with **placeholder** (1×1) weights so the target-enumeration
+/// guard (sc-10522) can exercise the real [`AdaptableHost::adaptable_paths`] surface without the
+/// licensed checkpoint or any Metal compute — enumeration only walks the tree; nothing is evaluated.
+#[cfg(test)]
+mod structural {
+    use super::*;
+
+    fn ph_lin() -> AdaptableLinear {
+        AdaptableLinear::dense(Array::from_slice(&[0.0f32], &[1, 1]), None)
+    }
+    fn ph_norm() -> Array {
+        Array::from_slice(&[1.0f32], &[1])
+    }
+
+    impl AnimaTextConditioner {
+        /// A weight-free conditioner with `cfg.num_layers` structurally-complete blocks (6 for Anima),
+        /// for the path-enumeration guard. Placeholder tensors only; nothing is evaluated.
+        pub(crate) fn structural(cfg: ConditionerConfig) -> Self {
+            let heads = cfg.num_attention_heads as i32;
+            let head_dim = cfg.head_dim() as i32;
+            let attn = || Attention {
+                q_proj: ph_lin(),
+                k_proj: ph_lin(),
+                v_proj: ph_lin(),
+                o_proj: ph_lin(),
+                q_norm: ph_norm(),
+                k_norm: ph_norm(),
+                heads,
+                head_dim,
+                scale: 1.0,
+                eps: cfg.norm_eps,
+            };
+            let blocks = (0..cfg.num_layers)
+                .map(|_| Block {
+                    norm_self_attn: ph_norm(),
+                    self_attn: attn(),
+                    norm_cross_attn: ph_norm(),
+                    cross_attn: attn(),
+                    norm_mlp: ph_norm(),
+                    mlp_in: ph_lin(),
+                    mlp_out: ph_lin(),
+                    eps: cfg.norm_eps,
+                })
+                .collect();
+            Self {
+                embed: TokenEmbedding::Dense(Array::from_slice(&[0.0f32], &[1, 1])),
+                blocks,
+                out_proj: ph_lin(),
+                norm: ph_norm(),
+                rope: TextRope::new(head_dim, cfg.rope_theta),
+                cfg,
+            }
+        }
+    }
+}
