@@ -7,11 +7,17 @@
 //!
 //! **The verified trap (sc-10274 class):** the `anima-turbo-lora-v0.2` file is 508 target pairs =
 //! 448 DiT (`blocks.*`) + **60 `llm_adapter.*`**, while `anima-greg-rutkowski-style` is 448 DiT-only,
-//! zero adapter. A DiT-only injection walk loads the turbo LoRA at partial strength and *looks* like
-//! it worked. The conditioner is therefore a first-class injectable target: this host strips the
+//! zero adapter. The conditioner is therefore a first-class injectable target: this host strips the
 //! leading `llm_adapter.` segment and routes into the [`AnimaTextConditioner`] host; everything else
 //! routes into the [`CosmosDiT`] host. Because the install is `apply_adapters_strict`, an unrouted
 //! `llm_adapter.*` target is a hard error, not a silent partial — the count is proven, not assumed.
+//!
+//! One nuance the count hides: for `anima-turbo-lora-v0.2` specifically, all 60 conditioner `lora_B`
+//! are **zero-initialized** (untrained), so `B·A ≡ 0` and dropping them would be numerically inert for
+//! *this* file. The guard is about the MECHANISM, not this one file's magnitudes: a future non-zero
+//! conditioner LoRA — and the already-shipped `anima-rl-v0.1`, which also carries 60 `llm_adapter.*`
+//! targets — must not silently load at partial strength. Enforcing routing by count, independent of the
+//! trained delta, is what keeps the sc-10274 "loads partial, looks fine" class un-repeatable here.
 
 use mlx_gen::adapters::loader::{apply_adapters_strict, ApplyReport};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
