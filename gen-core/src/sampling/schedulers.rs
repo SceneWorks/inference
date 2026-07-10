@@ -17,7 +17,7 @@ use super::ModelSampling;
 /// The curated scheduler vocabulary (epic 7114 decision 2). `Normal`/`Simple` are the model's native
 /// schedule sampled two ways; `Karras`/`Exponential` are analytic σ ramps; `SgmUniform` is `Normal`
 /// with the SGM endpoint convention; `Beta` biases steps toward the schedule ends; `DdimUniform` is
-/// the DDIM stride.
+/// the DDIM stride; `Beta57` is the RES4LYF `beta_scheduler(α=0.5, β=0.7)` (richer texture/detail).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scheduler {
     Normal,
@@ -27,6 +27,7 @@ pub enum Scheduler {
     SgmUniform,
     Beta,
     DdimUniform,
+    Beta57,
 }
 
 impl Scheduler {
@@ -41,6 +42,7 @@ impl Scheduler {
             "sgm_uniform" => Self::SgmUniform,
             "beta" => Self::Beta,
             "ddim_uniform" => Self::DdimUniform,
+            "beta57" => Self::Beta57,
             _ => return None,
         })
     }
@@ -55,11 +57,12 @@ impl Scheduler {
             Self::SgmUniform => "sgm_uniform",
             Self::Beta => "beta",
             Self::DdimUniform => "ddim_uniform",
+            Self::Beta57 => "beta57",
         }
     }
 
     /// Every scheduler in the curated vocabulary, in menu order.
-    pub const ALL: [Scheduler; 7] = [
+    pub const ALL: [Scheduler; 8] = [
         Self::Normal,
         Self::Simple,
         Self::Karras,
@@ -67,6 +70,7 @@ impl Scheduler {
         Self::SgmUniform,
         Self::Beta,
         Self::DdimUniform,
+        Self::Beta57,
     ];
 }
 
@@ -88,6 +92,11 @@ pub fn schedule_sigmas(scheduler: Scheduler, ms: &dyn ModelSampling, steps: usiz
         Scheduler::Simple => simple_sigmas(ms, steps),
         Scheduler::DdimUniform => ddim_uniform_sigmas(ms, steps),
         Scheduler::Beta => beta_sigmas(ms, steps, 0.6, 0.6),
+        // beta57 (RES4LYF / Anima community): the same beta_scheduler as `Beta` but with `α = 0.5`,
+        // `β = 0.7` — biasing more steps toward the high-noise phase for richer texture/detail. Verified
+        // against RES4LYF's ClownsharkBatwing scheduler and the standalone forge-beta57-scheduler
+        // (`stats.beta.ppf(q, 0.5, 0.7)`), both identical to ComfyUI `beta_scheduler` with those params.
+        Scheduler::Beta57 => beta_sigmas(ms, steps, 0.5, 0.7),
     }
 }
 
@@ -486,5 +495,27 @@ mod tests {
             assert_eq!(Scheduler::from_name(s.name()), Some(s));
         }
         assert_eq!(Scheduler::from_name("nope"), None);
+        assert_eq!(Scheduler::from_name("beta57"), Some(Scheduler::Beta57));
+        assert_eq!(
+            Scheduler::ALL.len(),
+            8,
+            "curated scheduler set is 8 (added beta57)"
+        );
+    }
+
+    #[test]
+    fn beta57_is_beta_scheduler_with_alpha_half_beta_seven_tenths() {
+        // beta57 (RES4LYF / forge-beta57-scheduler) is EXACTLY beta_scheduler(α=0.5, β=0.7) — a
+        // distinct schedule from the α=β=0.6 `beta`, verified against both reference implementations.
+        let ms = sdxl();
+        let got = schedule_sigmas(Scheduler::Beta57, &ms, 12);
+        let want = beta_sigmas(&ms, 12, 0.5, 0.7);
+        assert_eq!(
+            got, want,
+            "beta57 must dispatch to beta_sigmas(α=0.5, β=0.7)"
+        );
+        assert!(is_descending_to_zero(&got), "beta57 {got:?}");
+        // It genuinely differs from the α=β=0.6 `beta` schedule.
+        assert_ne!(got, beta_sigmas(&ms, 12, 0.6, 0.6));
     }
 }
