@@ -210,6 +210,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-anima"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-qwen-image",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+]
+
+[[package]]
 name = "candle-gen-boogu"
 version = "0.0.0"
 dependencies = [
