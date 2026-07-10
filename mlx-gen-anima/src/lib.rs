@@ -31,6 +31,7 @@ pub mod convert;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
+pub mod prompt_weight;
 pub mod rope;
 pub mod text_encoder;
 pub mod tokenizer;
@@ -46,6 +47,7 @@ pub use model::{
     Anima,
 };
 pub use pipeline::{anima_sigmas, AnimaPipeline, GenOptions, DEFAULT_SAMPLER};
+pub use prompt_weight::{parse_prompt_weights, strip_prompt_weights};
 pub use text_encoder::AnimaQwen3;
 pub use transformer::CosmosDiT;
 pub use vae::{load_vae, QwenVae};
