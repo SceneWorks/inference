@@ -10,10 +10,12 @@
 //! orders of magnitude) + a deterministic sub-sample.
 //!
 //!   * **Stage 2** — Qwen3-0.6B `last_hidden_state` AFTER the attention-mask multiply (GQA 16/8 +
-//!     the 6-pad-row mask-multiply trap). f32 candle vs a bf16 torch reference (looser sample bound).
+//!     the 6-pad-row mask-multiply trap: 18 real + 6 right-pad rows at mask 0, so the multiply zeros
+//!     real padded rows — the pad-check bites, not a vacuous empty slice). f32 candle vs bf16 torch.
 //!   * **Stage 3** — `AnimaTextConditioner` output `[1, 512, 1024]`, right-padded after masking. f32 both.
-//!   * **Stage 4** — Cosmos DiT full forward (velocity `[1, 16, 1, 8, 8]`). f32 both. Exercises
-//!     adaLN-LoRA modulation, NTK-scaled 3-axis RoPE, the 17-ch mask concat, patch/unpatch.
+//!   * **Stage 4** — Cosmos DiT full forward (velocity `[1, 16, 1, 8, 12]` — NON-SQUARE post-patch grid,
+//!     so an h/w RoPE axis swap is detectable). f32 both. Exercises adaLN-LoRA modulation, NTK-scaled
+//!     3-axis RoPE, the 17-ch mask concat, patch/unpatch.
 //!
 //! Stages 3 & 4 feed DETERMINISTIC `lcg_fill` inputs (bit-identical to the Python generators), so the
 //! golden isolates the component's fp32 math rather than bf16 quantization.

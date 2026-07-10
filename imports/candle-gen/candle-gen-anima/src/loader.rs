@@ -63,6 +63,29 @@ pub fn detect_dit_prefix(dit_path: &Path) -> Result<String> {
         })
 }
 
+/// Resolve `variant`'s DiT file and report whether it is a **packed** (Q4/Q8) tier — i.e. its
+/// safetensors header carries any `.scales` code tensor. Header-only (no weight data materialized), so
+/// it is cheap enough to gate a `LoadSpec` on. Lets the generator fail fast when a quantized tier is
+/// requested against a dense checkpoint instead of silently loading bf16 — a tier downgrade the caller
+/// never sees (`lin()` packed-detects PER-TENSOR, so a dense checkpoint just builds dense).
+pub fn dit_is_packed(source: &WeightsSource, variant: Variant) -> Result<bool> {
+    let root = resolve_split_files(source)?;
+    let dit_path = root.join("diffusion_models").join(variant.dit_filename());
+    if !dit_path.is_file() {
+        return Err(CandleError::Msg(format!(
+            "anima: DiT file not found: {}",
+            dit_path.display()
+        )));
+    }
+    // Header-only mmap: reads the tensor names without materializing any weight data.
+    // SAFETY: read-only, process-owned weight file, mapped only to read the header here.
+    let st = unsafe { MmapedSafetensors::new(&dit_path)? };
+    Ok(st
+        .tensors()
+        .into_iter()
+        .any(|(k, _)| k.ends_with(".scales")))
+}
+
 /// Resolve the `split_files/` directory holding `diffusion_models/`, `text_encoders/`, `vae/`.
 fn resolve_split_files(source: &WeightsSource) -> Result<PathBuf> {
     match source {
@@ -145,10 +168,13 @@ impl AnimaComponents {
             // A packed (Q4/Q8) DiT stores u32 codes, not dense `.weight` matrices — folding `B·A` into
             // codes would silently corrupt them (the delta shape never matches the packed shape, so the
             // fold would no-op partially). Refuse the packed+adapter combo here rather than mis-merge.
+            // The additive-branch merge (`y = xW_packed + scale·(xA)B`, epic 10043 prior art) that would
+            // make this work is tracked as **sc-10578** (both MLX and candle lanes); the rejection is
+            // correct until it lands.
             if base.keys().any(|k| k.ends_with(".scales")) {
                 return Err(CandleError::Msg(format!(
                     "anima: cannot fold a LoRA/LoKr onto a packed (Q4/Q8) DiT tier at {} — apply the \
-                     adapter to the dense checkpoint",
+                     adapter to the dense checkpoint (packed-tier adapter support: sc-10578)",
                     dit_path.display()
                 )));
             }
