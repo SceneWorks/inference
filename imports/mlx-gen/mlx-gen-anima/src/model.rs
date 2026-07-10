@@ -7,7 +7,7 @@
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Result,
+    Progress, Quant, Result,
 };
 
 use crate::config::{Variant, RES_MULTIPLE};
@@ -46,13 +46,13 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             max_size: RES_MAX,
             max_count: MAX_COUNT,
             mac_only: true,
-            // No quant tiers yet: this story loads only the single-file bf16 checkpoint, so we must
-            // NOT advertise Q4/Q8. The worker reads `supported_quants` for its capability advertisement
-            // (gen-core sc-3723), so advertising a tier `load` rejects would surface Q4/Q8 in the UI and
-            // hand the user a load-time failure on an advertised option — a runtime lie, not a
-            // placeholder. sc-10517 will populate this to `&[Quant::Q4, Quant::Q8]` when it lands the
-            // actual quantized weights + load path.
-            supported_quants: &[],
+            // Q4/Q8 quant tiers (sc-10517). Anima is convert-at-install: the SceneWorks worker packs
+            // the Cosmos DiT on-device (the conditioner + Qwen3 TE + VAE stay dense bf16), and this
+            // crate's loader packed-detects the tier off the on-disk `{base}.scales` — so `load`
+            // ACCEPTS any `spec.quantize` (it is advisory; the resolved tier dir dictates precision,
+            // like SANA). The worker reads `supported_quants` for its capability advertisement
+            // (gen-core sc-3723); every advertised tier actually loads, so this is honest.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: true,
         },
@@ -93,14 +93,14 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>>
             "{id}: only the default dense bf16 precision is wired (drop the precision override)"
         )));
     }
-    // No quant tiers are wired yet (sc-10517): `Capabilities::supported_quants` is `&[]`, so the worker
-    // never advertises Q4/Q8. This rejection is defense-in-depth against a stale or hand-built request —
-    // reject a quantize request explicitly rather than silently serving bf16.
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(format!(
-            "{id}: no quant tiers are wired yet (bf16 only; Q4/Q8 tracked in sc-10517)"
-        )));
-    }
+    // Q4/Q8 tiers (sc-10517) are NOT quantized at load. Anima is convert-at-install: the SceneWorks
+    // worker packs the Cosmos DiT on-device (`convert::quantize_anima_dit`, conditioner + Qwen3 TE +
+    // VAE kept dense bf16), and the DiT's `AdaptableLinear`s packed-detect the tier off the on-disk
+    // `{base}.scales` inside `CosmosDiT::from_weights`. So a `spec.quantize` value is ADVISORY — the
+    // resolved tier directory dictates the actual precision — and we accept any tier without a
+    // load-time `.quantize()` (mirrors SANA, the Group-B packed-detect convert-at-install path;
+    // Kolors/sd3 by contrast load-time-quantize, so SANA is the true precedent here).
+    let _ = spec.quantize;
     let pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
     Ok(Box::new(Anima {
         descriptor: descriptor_for(variant),
@@ -186,7 +186,7 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::gen_core;
-    use mlx_gen::{Quant, WeightsSource};
+    use mlx_gen::WeightsSource;
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -219,9 +219,9 @@ mod tests {
         assert!(b.capabilities.requires_sigma_shift);
         assert!(b.capabilities.supports_lora && b.capabilities.supports_lokr);
         assert!(b.capabilities.mac_only);
-        // No quant tiers advertised yet (sc-10517 will populate this to [Q4, Q8]); advertising a tier
-        // `load` rejects would be a capability lie the worker would surface to the UI.
-        assert_eq!(b.capabilities.supported_quants, &[] as &[Quant]);
+        // Q4/Q8 tiers advertised (sc-10517): convert-at-install packs the DiT on-device and the loader
+        // packed-detects each tier, so every advertised tier actually loads — an honest advertisement.
+        assert_eq!(b.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert_eq!(b.capabilities.min_size, 512);
         assert_eq!(b.capabilities.max_size, 1536);
         // Turbo is the CFG-free merged student.
@@ -255,13 +255,17 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_quantize_until_sc10517() {
-        let spec =
-            LoadSpec::new(WeightsSource::Dir("/nonexistent-anima".into())).with_quant(Quant::Q4);
-        let e = load_base(&spec).err().expect("error").to_string();
-        assert!(
-            e.contains("sc-10517"),
-            "expected quant-defer message, got: {e}"
-        );
+    fn load_accepts_quant_spec() {
+        // Q4/Q8 are wired (sc-10517) as packed-detected tiers: a quantize request must get PAST the
+        // load gate (no "unsupported"/defer rejection) and fail later on the missing snapshot instead —
+        // proving `spec.quantize` is accepted as advisory, not rejected.
+        for q in [Quant::Q4, Quant::Q8] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-anima".into())).with_quant(q);
+            let e = load_base(&spec).err().expect("error").to_string();
+            assert!(
+                !e.contains("quant") && !e.contains("sc-10517"),
+                "quant spec must be accepted, got a quant-rejection: {e}"
+            );
+        }
     }
 }
