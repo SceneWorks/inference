@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use mlx_rs::memory::{get_active_memory, get_memory_limit};
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
@@ -202,6 +203,58 @@ enum LycorisKeyResolution<'t> {
     Thirdparty(&'t BTreeMap<String, String>),
 }
 
+/// Bytes → GiB base for the sc-10678 pre-flight guard's messages.
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+/// The materialized `[out,in]` LoKr/LoHa delta dtype is bf16 (PARITY-BF16, sc-2609): 2 bytes/element.
+const DELTA_DTYPE_BYTES: usize = 2;
+/// Fraction of the MLX memory limit the guard treats as usable, leaving headroom for the forward-pass
+/// activation working set (mirrors the sc-4874 training pre-flight's 0.85).
+const MATERIALIZE_BUDGET_HEADROOM: f64 = 0.85;
+
+/// Bytes a materialized `[out, in]` bf16 delta occupies — the memory a non-deferrable adapter (LoHa /
+/// tucker-LoKr) forces onto a packed base per target (sc-10678). Pure (no MLX state) ⇒ deterministically
+/// unit-testable.
+fn projected_delta_bytes(base_shape: &[i32]) -> usize {
+    base_shape
+        .iter()
+        .map(|&d| d.max(0) as usize)
+        .product::<usize>()
+        * DELTA_DTYPE_BYTES
+}
+
+/// Whether materializing `projected_new` more bytes on top of the `active` resident set would cross the
+/// safe budget (`limit × headroom`). `limit == 0` means MLX has no cap set (unlimited) ⇒ never guard.
+/// Pure (the caller supplies the live `get_active_memory()` / `get_memory_limit()`) ⇒ deterministically
+/// unit-testable without touching global MLX memory state.
+fn materialization_exceeds_budget(active: usize, projected_new: usize, limit: usize) -> bool {
+    if limit == 0 {
+        return false;
+    }
+    let safe = (limit as f64 * MATERIALIZE_BUDGET_HEADROOM) as usize;
+    active.saturating_add(projected_new) > safe
+}
+
+/// What one resolved LyCORIS group will do in the install pass — computed up front so the packed +
+/// non-deferrable **materialization** (LoHa / tucker-LoKr) can be projected and budget-checked BEFORE any
+/// `[out,in]` delta is allocated (sc-10678). Deferrable / dense / unmatched groups carry no such cost.
+enum LycorisPlan<F> {
+    /// Key resolved to no module (surfaced in `unmatched_paths` under its raw spelling).
+    Unmatched(String),
+    /// Dense base → materialize `[out,in]` and stack as `Adapter::Lokr` (unchanged, fork-parity).
+    Dense { dotted: String, delta: F },
+    /// Packed base with a deferrable Kronecker form → stack `Adapter::LokrStructured` (allocation-free).
+    Deferred {
+        dotted: String,
+        factors: LokrFactors,
+    },
+    /// Packed base, NOT deferrable → materialize `[out,in]` (the budget-guarded case).
+    Materialize {
+        dotted: String,
+        base_shape: Vec<i32>,
+        delta: F,
+    },
+}
+
 /// Shared install skeleton for the non-BFL LyCORIS appliers ([`apply_lokr`],
 /// [`apply_lokr_thirdparty`], [`apply_loha_thirdparty`] — F-067): resolve each module's raw key to
 /// a host dotted path per `resolution`, then stack a residual onto the target. A key that resolves to
@@ -224,16 +277,18 @@ enum LycorisKeyResolution<'t> {
 ///     `scale · x·ΔWᵀ`, which never reads the base, so it rides over `quantized_matmul` unchanged.
 ///     It is merely memory-hungry.
 ///
-/// **Why the fallback and not an error.** An earlier cut of sc-10578 rejected the non-deferrable
-/// packed combination outright, reasoning from sc-10051 (LoHa on quantized Wan: steer to bf16, do not
-/// materialize). That was wrong *here*. Wan reaches its own `apply_wan_adapters_additive`; this shared
-/// path is reached by eleven provider crates, adapters are installed **after** `.quantize()` in every
-/// one of them, and the worker defaults `spec.quantize` to `Some(Q8)` for **every** MLX model. So
-/// `is_quantized()` is true on the default path almost everywhere, and erroring would have turned a
-/// working third-party LoHa into a hard load failure for any model at its default tier — a broad
-/// regression traded for a memory bound nobody asked for. Whether a packed base should refuse a
-/// multi-GB materialized delta is a real product question; it is **sc-10678**, not this story's to
-/// decide unilaterally.
+/// **The materialized fallback is budget-guarded, not silent (sc-10678).** An earlier cut of sc-10578
+/// rejected the non-deferrable packed combination outright, reasoning from sc-10051 (LoHa on quantized
+/// Wan: steer to bf16, do not materialize). That was wrong as a blanket rule *here*: this shared path is
+/// reached by eleven provider crates, adapters install **after** `.quantize()` in every one, and the
+/// worker defaults `spec.quantize` to `Some(Q8)` for **every** MLX model — so `is_quantized()` is true on
+/// the default path almost everywhere, and erroring unconditionally would turn a working third-party LoHa
+/// that *fits* into a hard failure. So the fallback stays: a materialization that fits the memory budget
+/// runs, on the user's chosen (quantized) tier. But a materialization that would **not** fit is refused
+/// UP FRONT with a catchable, actionable error ([`materialization_exceeds_budget`]) rather than left to a
+/// silent mid-run SIGKILL when the OS hard-kills the worker. The tier is never switched (it is a creative
+/// choice, not a perf knob); bf16 is only *suggested*, framed as a different render. This is the sc-10678
+/// decision (E: pre-flight memory guard), mirroring the sc-4874 training pre-flight.
 fn install_lycoris_groups<K, F, G>(
     host: &mut impl AdaptableHost,
     groups: impl IntoIterator<Item = (K, F, G)>,
@@ -246,33 +301,102 @@ where
     G: FnOnce(f32, &[i32]) -> Result<Option<LokrFactors>>,
 {
     let mut report = ApplyReport::default();
+
+    // Pass 1 — resolve every group to a concrete plan, consuming the `factors` probe (which is cheap:
+    // it builds the small Kronecker factors or returns `None`, but never the `[out,in]` delta). Sum the
+    // bytes the packed + non-deferrable **materializations** will allocate, so we can budget-check them
+    // before the (potentially multi-GB) delta reconstruction runs. Deferred / dense / unmatched groups
+    // add nothing to `projected_materialize`.
+    let mut plans: Vec<LycorisPlan<F>> = Vec::new();
+    let mut projected_materialize: usize = 0;
     for (raw, delta, factors) in groups {
-        let dotted = match &resolution {
-            LycorisKeyResolution::Dotted => raw.as_ref(),
+        let dotted: String = match &resolution {
+            LycorisKeyResolution::Dotted => raw.as_ref().to_string(),
             LycorisKeyResolution::Thirdparty(table) => resolve_lokr_path(raw.as_ref(), table)
-                .unwrap_or_else(|| strip_common_lora_prefix(raw.as_ref())),
+                .unwrap_or_else(|| strip_common_lora_prefix(raw.as_ref()))
+                .to_string(),
         };
         let parts: Vec<&str> = dotted.split('.').collect();
         match host.adaptable_mut(&parts) {
-            // Packed base: take the deferred form when the module has one, else materialize as before.
+            // Packed base: take the deferred form when the module has one, else plan a materialization.
             Some(lin) if lin.is_quantized() => {
                 let base_shape = lin.base_shape();
                 match factors(scale, &base_shape)? {
-                    Some(f) => lin.push(Adapter::LokrStructured { factors: f }),
+                    Some(f) => plans.push(LycorisPlan::Deferred { dotted, factors: f }),
                     None => {
-                        let delta = delta(&base_shape)?;
-                        lin.push(Adapter::Lokr { delta, scale });
+                        projected_materialize += projected_delta_bytes(&base_shape);
+                        plans.push(LycorisPlan::Materialize {
+                            dotted,
+                            base_shape,
+                            delta,
+                        });
                     }
                 }
-                report.applied += 1;
             }
-            Some(lin) => {
-                let base_shape = lin.base_shape();
+            Some(_) => plans.push(LycorisPlan::Dense { dotted, delta }),
+            None => plans.push(LycorisPlan::Unmatched(raw.into())),
+        }
+    }
+
+    // sc-10678 — pre-flight memory guard. A non-deferrable adapter (LoHa / tucker-LoKr) on a PACKED
+    // (q4/q8) base must materialize a dense `[out,in]` delta per target; over a whole model that can
+    // dwarf the packed footprint (and exceed even the dense tier). Left unchecked it OOMs the worker via
+    // an uncatchable SIGKILL mid-run. Refuse UP FRONT — but only when the projected materialization would
+    // actually exceed the budget, so a LoHa that fits still runs on the user's chosen tier (a plain LoRA,
+    // an all-deferred LoKr, or a dense base never reach this branch: `projected_materialize == 0`).
+    if projected_materialize > 0 {
+        let active = get_active_memory();
+        let limit = get_memory_limit();
+        if materialization_exceeds_budget(active, projected_materialize, limit) {
+            return Err(Error::Msg(format!(
+                "This adapter (LoHa / tucker-LoKr) cannot run unmerged on a quantized (q4/q8) tier: it \
+                 has no allocation-free form, so it must materialize a dense delta for every target — \
+                 ~{:.1} GB on top of the ~{:.1} GB already resident, over the ~{:.1} GB budget. Use a \
+                 plain LoRA/LoKr instead (near-zero extra memory on any tier, and it keeps the quantized \
+                 tier's look). Or, if you have it, the bf16 tier — note bf16 renders differently from the \
+                 quantized tier.",
+                projected_materialize as f64 / GIB,
+                active as f64 / GIB,
+                (limit as f64 * MATERIALIZE_BUDGET_HEADROOM) / GIB,
+            )));
+        }
+    }
+
+    // Pass 2 — install. Behaviour is identical to the pre-guard single loop: deferred residual on a
+    // deferrable packed module, materialized `Adapter::Lokr` on a non-deferrable packed or dense module,
+    // and `unmatched_paths` under the raw key. Re-resolving by `dotted` is a cheap map lookup (the host
+    // is not structurally mutated between passes).
+    for plan in plans {
+        match plan {
+            LycorisPlan::Unmatched(raw) => report.unmatched_paths.push(raw),
+            LycorisPlan::Deferred { dotted, factors } => {
+                let parts: Vec<&str> = dotted.split('.').collect();
+                if let Some(lin) = host.adaptable_mut(&parts) {
+                    lin.push(Adapter::LokrStructured { factors });
+                    report.applied += 1;
+                }
+            }
+            LycorisPlan::Materialize {
+                dotted,
+                base_shape,
+                delta,
+            } => {
                 let delta = delta(&base_shape)?;
-                lin.push(Adapter::Lokr { delta, scale });
-                report.applied += 1;
+                let parts: Vec<&str> = dotted.split('.').collect();
+                if let Some(lin) = host.adaptable_mut(&parts) {
+                    lin.push(Adapter::Lokr { delta, scale });
+                    report.applied += 1;
+                }
             }
-            None => report.unmatched_paths.push(raw.into()),
+            LycorisPlan::Dense { dotted, delta } => {
+                let parts: Vec<&str> = dotted.split('.').collect();
+                if let Some(lin) = host.adaptable_mut(&parts) {
+                    let base_shape = lin.base_shape();
+                    let delta = delta(&base_shape)?;
+                    lin.push(Adapter::Lokr { delta, scale });
+                    report.applied += 1;
+                }
+            }
         }
     }
     Ok(report)
@@ -3947,6 +4071,110 @@ mod tests {
             packed.lin.is_quantized(),
             "the fallback must not dequantize the base"
         );
+    }
+
+    /// sc-10678 pre-flight guard — the projection is exact (`out·in·2` bytes for the bf16 delta) and the
+    /// budget check is a pure comparison, so both are deterministically testable with **no** global MLX
+    /// memory state (the `install_lycoris_groups` wiring reads `get_active_memory()`/`get_memory_limit()`
+    /// and hands the values to these; the fits-path accumulation is exercised by
+    /// `loha_on_packed_base_falls_back_to_materialization`, whose tiny delta stays under any real budget).
+    #[test]
+    fn projected_delta_bytes_is_out_times_in_times_bf16() {
+        assert_eq!(projected_delta_bytes(&[2048, 2048]), 2048 * 2048 * 2);
+        assert_eq!(projected_delta_bytes(&[64, 128]), 64 * 128 * 2);
+        // A whole DiT's worth of non-deferrable deltas (Anima: 448 targets ≈ 2048² each) ≈ 3.75 GiB —
+        // the memory-lie that motivated the guard (a ~1 GB q4 DiT would balloon past bf16).
+        let whole = 448 * projected_delta_bytes(&[2048, 2048]);
+        let gib = whole as f64 / (1024.0 * 1024.0 * 1024.0);
+        assert!((3.5..4.0).contains(&gib), "448×2048² bf16 ≈ {gib:.2} GiB");
+    }
+
+    #[test]
+    fn materialization_exceeds_budget_respects_headroom_and_unlimited() {
+        let gib = 1024usize * 1024 * 1024;
+        // 4 GiB of new deltas on a 1 GiB resident set, 16 GiB limit → 5 GiB < 16·0.85=13.6 → fits.
+        assert!(!materialization_exceeds_budget(gib, 4 * gib, 16 * gib));
+        // Same deltas against a 4 GiB limit → 5 GiB > 4·0.85=3.4 → refuse.
+        assert!(materialization_exceeds_budget(gib, 4 * gib, 4 * gib));
+        // The 0.85 headroom bites between 8 and 9 GiB against a 10 GiB limit (safe = 8.5) — dropping the
+        // headroom (using the raw limit) would flip the second assert, so this pins it.
+        assert!(
+            !materialization_exceeds_budget(0, 8 * gib, 10 * gib),
+            "8 < 8.5 fits"
+        );
+        assert!(
+            materialization_exceeds_budget(0, 9 * gib, 10 * gib),
+            "9 > 8.5 refuses"
+        );
+        // limit == 0 ⇒ MLX has no cap set (unlimited) ⇒ never guard, even for a huge projection.
+        assert!(!materialization_exceeds_budget(gib, 100 * gib, 0));
+        // Nothing resident + nothing projected → never exceeds. NOTE the plain-LoRA / all-deferred /
+        // dense case (`projected == 0`) is short-circuited in `install_lycoris_groups` BEFORE this is
+        // called (`if projected_materialize > 0`), so the guard never fires on the resident set alone —
+        // this pure fn, given a resident set already over budget, WOULD return true, which is why the
+        // `projected > 0` gate lives at the call site, not here.
+        assert!(!materialization_exceeds_budget(0, 0, gib));
+    }
+
+    /// sc-10678 — the over-budget REFUSAL path, end to end through `apply_loha_thirdparty`. `#[ignore]`d
+    /// because it mutates the PROCESS-GLOBAL MLX memory limit (`set_memory_limit`), which would clobber
+    /// concurrent allocations in the default multi-threaded runner. Run it ALONE:
+    /// `cargo test -p mlx-gen --lib loha_on_packed_over_budget_is_refused -- --ignored --exact`.
+    /// Sets the limit below the resident set so any materialization exceeds it, applies a LoHa to a
+    /// packed base, and asserts a catchable, ACTIONABLE error (not a mid-run SIGKILL), leaving the base
+    /// untouched — then restores the limit. The guard fires in pass 1 (shape-only, no allocation), so the
+    /// tiny limit never spuriously errors before the refusal.
+    #[test]
+    #[ignore = "mutates the process-global MLX memory limit; run alone"]
+    fn loha_on_packed_over_budget_is_refused() {
+        let r = 4;
+        let a: Vec<f32> = (0..(PK_OUT * r) as usize)
+            .map(|i| (i % 5) as f32 * 0.1)
+            .collect();
+        let b: Vec<f32> = (0..(r * PK_IN) as usize)
+            .map(|i| (i % 7) as f32 * 0.1)
+            .collect();
+        let (wa, wb) = (
+            Array::from_slice(&a, &[PK_OUT, r]),
+            Array::from_slice(&b, &[r, PK_IN]),
+        );
+        let path = tmp("sc10678_over_budget_loha.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("lin.hada_w1_a", &wa),
+                ("lin.hada_w1_b", &wb),
+                ("lin.hada_w2_a", &wa),
+                ("lin.hada_w2_b", &wb),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+
+        let mut packed = OneLinear {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+        };
+        packed.lin.quantize(8, Some(64)).unwrap();
+
+        // Force any materialization over budget: limit = 1 byte ⇒ safe = 0. Save + restore.
+        let prev = mlx_rs::memory::set_memory_limit(1);
+        let result = apply_loha_thirdparty(&mut packed, &w, 1.0);
+        mlx_rs::memory::set_memory_limit(prev);
+
+        let err = result
+            .expect_err("a LoHa over budget on a packed base must be refused, not materialized");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("quantized") && msg.contains("plain LoRA/LoKr"),
+            "the refusal must be actionable (name the quantized-tier issue + the plain-LoRA escape): {msg}"
+        );
+        // A refused install leaks no partial adapter, and never dequantizes the base.
+        assert!(
+            packed.lin.adapters().is_empty(),
+            "a refused install must not leave a partial adapter"
+        );
+        assert!(packed.lin.is_quantized());
     }
 
     /// A tucker/CP `lokr_t2` has no 2-D matrix form, so `build_lokr_factors` returns `None` and the
