@@ -265,7 +265,12 @@ impl Block {
         let (normed, gate) = self.norm1.forward(hidden, embedded, temb)?;
         let attn = self.attn1.forward(&normed, None, Some(rope))?;
         let hidden = add(hidden, &multiply(&gate, &attn)?)?;
-        // 2. cross attention (no RoPE)
+        // 2. cross attention (no RoPE). No attention mask over the conditioner's 512-token output: the
+        // diffusers reference leaves the zero-padded positions UNMASKED too — `AnimaTextConditioner`
+        // right-pads with zeros and returns a bare tensor (condition_embedder_anima.py:346, no mask),
+        // and Cosmos cross-attn runs SDPA with `attn_mask=None` (transformer_cosmos.py:204). Padded keys
+        // are zero vectors, not −inf, so they share logit 0; matching the reference means no mask here.
+        // Do NOT "fix" this into a mask — that would introduce a conditioning divergence, not remove one.
         let (normed, gate) = self.norm2.forward(&hidden, embedded, temb)?;
         let attn = self.attn2.forward(&normed, Some(encoder), None)?;
         let hidden = add(&hidden, &multiply(&gate, &attn)?)?;
