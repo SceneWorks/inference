@@ -236,26 +236,27 @@ impl Generator for Anima {
         };
         let negative = req.negative_prompt.clone().unwrap_or_default();
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for n in 0..req.count {
+        // Shared batch frame (sc-7792): the `0..count` loop + per-image `image_seed(base_seed, n)`
+        // derivation + `Vec` collect that every provider repeats. The model body stays hand-written in
+        // the closure (captures `on_progress` + the borrowed pipeline).
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let opts = GenOptions {
                 width: req.width,
                 height: req.height,
                 steps,
                 guidance,
-                seed: candle_gen::image_seed(base_seed, n),
+                seed,
                 sampler: req.sampler.clone(),
             };
-            let img = pipeline.generate(
+            pipeline.generate(
                 &req.prompt,
                 &negative,
                 self.variant,
                 &opts,
                 &req.cancel,
                 on_progress,
-            )?;
-            images.push(img);
-        }
+            )
+        })?;
         Ok(GenerationOutput::Images(images))
     }
 }
