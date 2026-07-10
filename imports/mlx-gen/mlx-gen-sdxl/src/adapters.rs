@@ -53,7 +53,9 @@ use mlx_gen::adapters::loader::{
     is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr_thirdparty,
     resolve_lokr_path,
 };
-use mlx_gen::adapters::{conv_lora_delta, reconstruct_lokr_delta, AdaptableHost};
+use mlx_gen::adapters::{
+    build_lokr_factors, conv_lora_delta, reconstruct_lokr_delta, AdaptableHost, Adapter,
+};
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{
     resolve_kohya_stem, LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY,
@@ -137,8 +139,15 @@ fn rows(a: &Array, lo: i32, hi: i32) -> Result<Array> {
     Ok(a.take_axis(&idx, 0)?)
 }
 
-/// Merge `delta` into the dense Linear at `dotted`, counting the merge (or surfacing a miss as
-/// skipped). The path is the internal module path (FF already translated to `ff.linearN`).
+/// Apply a reconstructed `[out,in]` `delta` at the Linear at `dotted`, counting it (or surfacing a
+/// miss as skipped). The path is the internal module path (FF already translated to `ff.linearN`).
+///
+/// On a **dense** base the delta is MERGED (`W += δ`) — the bit-exact, sampler-chaos-safe path SDXL
+/// has always used. On a **packed** (Q4/Q8) base the merge is impossible (`merge_dense_delta` rejects
+/// a quantized weight), so the delta rides as a forward-time [`Adapter::Lokr`] residual `x·δᵀ`
+/// (sc-10734). This generic path is used for `conv_shortcut` (a 1×1 conv stored — and quantized — as
+/// a Linear) and as the safety net; the main attention/FF LoRA targets take the memory-cheap
+/// factor-based [`apply_lora_into`] instead of materializing `[out,in]` deltas.
 fn merge_into(
     unet: &mut UNet2DConditionModel,
     dotted: &str,
@@ -148,7 +157,16 @@ fn merge_into(
     let parts: Vec<&str> = dotted.split('.').collect();
     match unet.adaptable_mut(&parts) {
         Some(lin) => {
-            lin.merge_dense_delta(delta)?;
+            if lin.is_quantized() {
+                // `Adapter::Lokr` residual is `scale·x·δᵀ`; with the `[out,in]` δ and scale 1.0 this is
+                // exactly the merged `x·(W+δ)ᵀ − x·Wᵀ`, on a base that cannot be merged into.
+                lin.push(Adapter::Lokr {
+                    delta: delta.clone(),
+                    scale: 1.0,
+                });
+            } else {
+                lin.merge_dense_delta(delta)?;
+            }
             report.merged += 1;
         }
         None => report.skipped_keys += 1,
@@ -156,37 +174,97 @@ fn merge_into(
     Ok(())
 }
 
-/// Route a computed LoRA `delta` for diffusers `path` into the U-Net, translating the GEGLU FF:
+/// Apply a LoRA `(down, up)` factor pair at the Linear `dotted`, choosing by the base's quantization
+/// (sc-10734). On a **dense** base: reconstruct the delta and MERGE it (`W += δ`) — the bit-exact,
+/// chaos-safe path (a residual's `W·x + δ·x` differs from the merged `(W+δ)·x` by ~1 ULP, which SDXL's
+/// ancestral sampler amplifies visibly). On a **packed** (Q4/Q8) base the merge is impossible, so push
+/// a forward-time [`Adapter::Lora`] residual `scale·(x·A)·B` with `A = downᵀ`, `B = upᵀ` and the
+/// `alpha/rank` factor folded into `B` (mirroring Wan's `install_one_lora`) — memory-cheap: the small
+/// factors are stored, never the `[out,in]` delta, so a LoRA on q4/q8 stays at plain-LoRA memory.
+/// A LoRA target's scaling: the `alpha`/`rank` fold and the user `scale`. Bundled so the routing
+/// helpers stay under clippy's argument bound and thread one value.
+#[derive(Clone, Copy)]
+struct LoraScale {
+    alpha: f32,
+    rank: f32,
+    scale: f32,
+}
+
+fn apply_lora_into(
+    unet: &mut UNet2DConditionModel,
+    dotted: &str,
+    down: &Array,
+    up: &Array,
+    s: LoraScale,
+    report: &mut SdxlLoraReport,
+) -> Result<()> {
+    let parts: Vec<&str> = dotted.split('.').collect();
+    match unet.adaptable_mut(&parts) {
+        Some(lin) => {
+            if lin.is_quantized() {
+                // `A = downᵀ`, `B = upᵀ` with `alpha/rank` folded into B (Wan's `install_one_lora`);
+                // user `scale` stays the residual scale. Fold into an owned `b` (a dtype-matched
+                // scalar keeps the factor dtype, matching the fork's weak-float multiply).
+                let a = down.t();
+                let mut b = up.t();
+                b = multiply(&b, &scalar(s.alpha / s.rank).as_dtype(up.dtype())?)?;
+                lin.push(Adapter::Lora {
+                    a,
+                    b,
+                    scale: s.scale,
+                });
+            } else {
+                let delta = lora_delta(down, up, s.alpha, s.rank, s.scale)?;
+                lin.merge_dense_delta(&delta)?;
+            }
+            report.merged += 1;
+        }
+        None => report.skipped_keys += 1,
+    }
+    Ok(())
+}
+
+/// Route a LoRA `(down, up)` for diffusers `path` into the U-Net, translating the GEGLU FF:
 /// `ff.net.0.proj` (a fused `[2·hidden, D]` proj) row-splits into the value half `ff.linear1` (rows
 /// `[0:hidden]`) and the gate half `ff.linear2` (`[hidden:2·hidden]`); `ff.net.2` maps to `ff.linear3`.
 /// Every other path (attention / proj / time_emb / mid_block) routes 1:1.
-fn merge_lora_routed(
+///
+/// The FF split acts on the **UP** factor's output rows (`rows(up)`), not the reconstructed delta —
+/// `rows(up@down) == rows(up)@down` to the last bit (see [`rows`]), so the dense merge stays
+/// byte-identical to the old delta-row-split while the packed path never forms the delta.
+fn apply_lora_routed(
     unet: &mut UNet2DConditionModel,
     path: &str,
-    delta: &Array,
+    down: &Array,
+    up: &Array,
+    s: LoraScale,
     report: &mut SdxlLoraReport,
 ) -> Result<()> {
     if let Some(prefix) = path.strip_suffix(".ff.net.0.proj") {
-        let two_h = delta.shape()[0];
+        let two_h = up.shape()[0];
         let h = two_h / 2;
-        merge_into(
+        apply_lora_into(
             unet,
             &format!("{prefix}.ff.linear1"),
-            &rows(delta, 0, h)?,
+            down,
+            &rows(up, 0, h)?,
+            s,
             report,
         )?;
-        merge_into(
+        apply_lora_into(
             unet,
             &format!("{prefix}.ff.linear2"),
-            &rows(delta, h, two_h)?,
+            down,
+            &rows(up, h, two_h)?,
+            s,
             report,
         )?;
         return Ok(());
     }
     if let Some(prefix) = path.strip_suffix(".ff.net.2") {
-        return merge_into(unet, &format!("{prefix}.ff.linear3"), delta, report);
+        return apply_lora_into(unet, &format!("{prefix}.ff.linear3"), down, up, s, report);
     }
-    merge_into(unet, path, delta, report)
+    apply_lora_into(unet, path, down, up, s, report)
 }
 
 /// Route a fused conv-layer LoRA `delta` (trained-file NCHW `[out, in, kH, kW]`) into the U-Net
@@ -207,14 +285,18 @@ fn merge_conv_routed(
         report.merged += 1;
         return Ok(());
     }
-    // conv_shortcut (1×1) is a Linear: fold the [out,in,1,1] delta to [out,in].
+    // conv_shortcut (1×1) is a Linear: fold the [out,in,1,1] delta to [out,in]. It is a quantizable
+    // Linear, so route through `merge_into` — which merges on a dense base but rides the delta as a
+    // forward-time residual on a packed q4/q8 base (sc-10734), rather than a raw merge_dense_delta
+    // that would reject the quantized weight. `merge_into` counts the merge or the skip itself.
     let sh = delta_nchw.shape();
     if sh[2] == 1 && sh[3] == 1 {
-        if let Some(lin) = unet.adaptable_mut(&parts) {
-            lin.merge_dense_delta(&delta_nchw.reshape(&[sh[0], sh[1]])?)?;
-            report.merged += 1;
-            return Ok(());
-        }
+        return merge_into(
+            unet,
+            &parts.join("."),
+            &delta_nchw.reshape(&[sh[0], sh[1]])?,
+            report,
+        );
     }
     report.skipped_keys += 1;
     Ok(())
@@ -362,10 +444,18 @@ fn merge_one(
         }
         let rank = cfg_rank.unwrap_or(down.shape()[0] as f32);
         let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank);
-        let delta = lora_delta(&down, &up, alpha, rank, scale)?;
         // Routes 1:1 for attention/proj/time_emb/mid_block; row-splits the GEGLU `ff.net.0.proj`.
-        // A PEFT path naming a genuinely non-routable module surfaces as skipped inside `merge_into`.
-        merge_lora_routed(unet, &path, &delta, report)?;
+        // A PEFT path naming a genuinely non-routable module surfaces as skipped. Threads the factors
+        // (not a pre-formed delta) so a packed base takes the memory-cheap forward-time residual
+        // (sc-10734); a dense base merges exactly as before.
+        apply_lora_routed(
+            unet,
+            &path,
+            &down,
+            &up,
+            LoraScale { alpha, rank, scale },
+            report,
+        )?;
     }
     Ok(())
 }
@@ -391,6 +481,20 @@ fn classify_lokr_key(
         }
     }
     None
+}
+
+/// The actionable error for a LoKr variant that is genuinely NOT deferrable via the vec-trick on a
+/// packed base — only the conv-only tucker/CP `w2` form, which the all-Linear SDXL LoKr surface never
+/// produces. Point the user at the bf16 tier (where it merges into the dense weight) rather than a
+/// silent OOM/wrong result. sc-10734 / epic 10043 (mirrors the Wan message).
+fn non_deferrable_lokr_error(path: &str) -> mlx_gen::Error {
+    format!(
+        "LoKr at '{path}' uses a tucker/CP (conv) factorization that cannot be applied on a quantized \
+         (packed Q4/Q8) SDXL tier without materializing the full delta — use the bf16 tier (where it \
+         merges into the dense weight). This form does not occur for the SDXL U-Net's Linear LoKr \
+         targets (sc-10734)."
+    )
+    .into()
 }
 
 /// Merge one LoKr file into `unet` at `scale` (sc-2640). The vendored SDXL path *rejects* LoKr, so
@@ -438,22 +542,44 @@ fn merge_one_lokr(
         match unet.adaptable_mut(&parts) {
             Some(lin) => {
                 let base_shape = lin.base_shape();
-                let delta = reconstruct_lokr_delta(
-                    alpha,
-                    rank,
-                    &base_shape,
-                    f.get("lokr_w1"),
-                    f.get("lokr_w1_a"),
-                    f.get("lokr_w1_b"),
-                    f.get("lokr_w2"),
-                    f.get("lokr_w2_a"),
-                    f.get("lokr_w2_b"),
-                    Dtype::Float32,
-                )?;
-                // The alpha/rank factor is baked into `delta`; apply the user scale on top (scale-0 ⇒
-                // δ·0 ⇒ a bit-exact no-op merge).
-                let delta = multiply(&delta, scalar(scale))?;
-                lin.merge_dense_delta(&delta)?;
+                if lin.is_quantized() {
+                    // Packed base (sc-10734 / epic 10043): the deferred, structured Kronecker residual
+                    // — `vec(w1·reshape(x)·w2ᵀ)` — never materializes the `[out,in]` delta, so a LoKr
+                    // works on q4/q8 at plain-LoRA memory. The FULL `(alpha/rank)·scale` bakes into the
+                    // structured `w2` (a structured residual carries no separate scale).
+                    match build_lokr_factors(
+                        (alpha / rank) * scale,
+                        &base_shape,
+                        f.get("lokr_w1"),
+                        f.get("lokr_w1_a"),
+                        f.get("lokr_w1_b"),
+                        f.get("lokr_w2"),
+                        None, // SDXL LoKr targets are all Linear — never a tucker/CP w2
+                        f.get("lokr_w2_a"),
+                        f.get("lokr_w2_b"),
+                        Dtype::Float32,
+                    )? {
+                        Some(factors) => lin.push(Adapter::LokrStructured { factors }),
+                        None => return Err(non_deferrable_lokr_error(&path)),
+                    }
+                } else {
+                    let delta = reconstruct_lokr_delta(
+                        alpha,
+                        rank,
+                        &base_shape,
+                        f.get("lokr_w1"),
+                        f.get("lokr_w1_a"),
+                        f.get("lokr_w1_b"),
+                        f.get("lokr_w2"),
+                        f.get("lokr_w2_a"),
+                        f.get("lokr_w2_b"),
+                        Dtype::Float32,
+                    )?;
+                    // The alpha/rank factor is baked into `delta`; apply the user scale on top (scale-0
+                    // ⇒ δ·0 ⇒ a bit-exact no-op merge).
+                    let delta = multiply(&delta, scalar(scale))?;
+                    lin.merge_dense_delta(&delta)?;
+                }
                 report.merged += 1;
             }
             None => report.skipped_keys += 1,
@@ -488,7 +614,15 @@ fn merge_thirdparty_delta(
             let base_shape = lin.base_shape();
             let delta = delta_at(&base_shape)?;
             let delta = multiply(&delta, scalar(scale))?;
-            lin.merge_dense_delta(&delta)?;
+            if lin.is_quantized() {
+                // Packed base (sc-10734): third-party LoKr/LoHa have no single structured form here
+                // (a LoHa in particular is not Kronecker-deferrable), so ride the reconstructed delta
+                // as a forward-time `Adapter::Lokr` residual (`x·δᵀ`, scale already folded in). These
+                // third-party files are rare and their `[out,in]` deltas small relative to the UNet.
+                lin.push(Adapter::Lokr { delta, scale: 1.0 });
+            } else {
+                lin.merge_dense_delta(&delta)?;
+            }
             report.merged += 1;
         }
         None => report.skipped_keys += 1,

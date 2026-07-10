@@ -22,7 +22,8 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant,
+    WeightsSource,
 };
 use mlx_gen_sdxl::{apply_sdxl_adapters, load_unet};
 // Force-link the provider so its `inventory::submit!` registers `"sdxl"`.
@@ -246,4 +247,69 @@ fn scale_zero_lora_is_bit_exact_noop() {
         "scale-0 LoRA must be a bit-exact no-op ({differ} px differ)"
     );
     println!("✓ scale-0 LoRA is a bit-exact no-op");
+}
+
+/// sc-10734: a LoRA applies on a **quantized (Q8)** SDXL base. Before the additive-residual switch,
+/// mlx-gen-sdxl merged the LoRA into the base weight (`merge_dense_delta`), which rejects a quantized
+/// weight ("base is quantized; a LoRA must be merged before quantization") — so LoRA-on-q4/q8 errored
+/// at load for the whole SDXL family. The packed base now takes the forward-time `Adapter::Lora`
+/// residual instead, so the LoRA loads AND moves the render. `SDXL_SNAPSHOT` = any SDXL diffusers tree
+/// (a turnkey `bf16/` tier works), `SDXL_LORA_PATH` = a kohya SDXL LoRA. The dense path is unchanged
+/// (see `lora_render_matches_vendored`); this only exercises the new packed path.
+#[test]
+#[ignore = "sc-10734: needs an SDXL diffusers snapshot (SDXL_SNAPSHOT) + a kohya SDXL LoRA (SDXL_LORA_PATH)"]
+fn lora_applies_on_quantized_q8_base() {
+    let lora = PathBuf::from(
+        std::env::var("SDXL_LORA_PATH")
+            .expect("set SDXL_LORA_PATH to a kohya SDXL LoRA .safetensors"),
+    );
+    let render_q8 = |adapters: Vec<AdapterSpec>| -> Image {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_quant(Quant::Q8);
+        if !adapters.is_empty() {
+            spec = spec.with_adapters(adapters);
+        }
+        let model = mlx_gen::load("sdxl", &spec)
+            .expect("load sdxl (Q8) — the fix: no merge on a packed base");
+        let req = GenerationRequest {
+            prompt: "1girl, solo, silver hair, anime portrait, masterpiece".to_string(),
+            negative_prompt: Some("lowres, worst quality, blurry".to_string()),
+            width: 768,
+            height: 768,
+            seed: Some(7),
+            steps: Some(16),
+            guidance: Some(7.0),
+            ..Default::default()
+        };
+        match model.generate(&req, &mut |_| {}).unwrap() {
+            GenerationOutput::Images(mut v) => v.pop().unwrap(),
+            other => panic!("expected Images, got {other:?}"),
+        }
+    };
+
+    // Baseline (Q8, no adapter), then Q8 + the LoRA — same prompt/seed. The load-bearing checks: the
+    // second load SUCCEEDS (no `merge_dense_delta: base is quantized`) and the pixels MOVE (an unread
+    // adapter would leave the image identical).
+    let without = render_q8(vec![]);
+    let with = render_q8(vec![AdapterSpec {
+        path: lora,
+        scale: 1.0,
+        kind: AdapterKind::Lora,
+        pass_scales: None,
+        moe_expert: None,
+    }]);
+
+    let n = without.pixels.len().max(1) as f64;
+    let delta: f64 = without
+        .pixels
+        .iter()
+        .zip(&with.pixels)
+        .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as f64)
+        .sum::<f64>()
+        / n;
+    assert!(
+        delta > 1.0,
+        "a LoRA on a Q8 base did not change the output (mean_abs_delta {delta:.2}) — the additive \
+         residual is not being applied"
+    );
+    println!("✓ sc-10734: LoRA applies on a Q8 SDXL base (forward-time residual, no merge); mean_abs_delta {delta:.2}");
 }
