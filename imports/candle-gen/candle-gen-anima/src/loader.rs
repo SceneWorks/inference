@@ -14,7 +14,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{AdapterSpec, WeightsSource};
 use candle_gen::{CandleError, Result};
 
-use crate::adapters::apply_anima_adapters;
+use crate::adapters::{apply_anima_adapters, install_anima_residuals};
 use crate::conditioner::AnimaTextConditioner;
 use crate::config::{ConditionerConfig, DitConfig, Qwen3Config, Variant};
 use crate::text_encoder::AnimaQwen3;
@@ -77,9 +77,17 @@ pub fn dit_is_packed(source: &WeightsSource, variant: Variant) -> Result<bool> {
             dit_path.display()
         )));
     }
+    dit_path_is_packed(&dit_path)
+}
+
+/// Header-only check: does this DiT safetensors file carry any `.scales` code tensor (a packed Q4/Q8
+/// tier)? Reads only the tensor names, no weight data. The single source of truth for "is this DiT
+/// packed" — the `LoadSpec` gate, the tier-mismatch guard, and the adapter fold-vs-residual branch all
+/// route through it.
+fn dit_path_is_packed(dit_path: &Path) -> Result<bool> {
     // Header-only mmap: reads the tensor names without materializing any weight data.
     // SAFETY: read-only, process-owned weight file, mapped only to read the header here.
-    let st = unsafe { MmapedSafetensors::new(&dit_path)? };
+    let st = unsafe { MmapedSafetensors::new(dit_path)? };
     Ok(st
         .tensors()
         .into_iter()
@@ -156,28 +164,23 @@ impl AnimaComponents {
         // The DiT file carries both the Cosmos DiT and the bundled conditioner. Detect the root prefix
         // (`net` or `model.diffusion_model`), then build both from ONE VarBuilder.
         let prefix = detect_dit_prefix(&dit_path)?;
-        let dit_vb = if adapters.is_empty() {
-            // Fast path: mmap the checkpoint directly (no adapter fold).
+        // A packed (Q4/Q8) DiT stores u32 codes + `.scales`, so a LoRA/LoKr has no dense `.weight` to
+        // fold into. When adapters are present on a packed tier we build the model from the mmap (the
+        // packed codes survive load) and install the adapters as **forward-time residuals** afterwards
+        // (`y = base(x) + scale·(xA)B`, sc-10640 / epic 10043). A dense tier keeps the weight-level fold,
+        // byte-for-byte unchanged, and the plain model has no adapters at all.
+        let packed_with_adapters = !adapters.is_empty() && dit_path_is_packed(&dit_path)?;
+        let dit_vb = if adapters.is_empty() || packed_with_adapters {
+            // Plain model, OR packed + adapters (residuals installed post-build): mmap the checkpoint
+            // directly — no fold, so the packed codes are never cast/materialized.
             candle_gen::mmap_var_builder(std::slice::from_ref(&dit_path), dtype, device)?
         } else {
-            // Adapter path: fold every LoRA/LoKr delta into the base weights at the safetensors-key
-            // level (merge, don't residual — the DiT is chaos-sensitive), then build from the merged
-            // map. The 448 DiT + 60 conditioner targets both fold into `{prefix}.{path}.weight`; a
-            // target that fails to route hard-errors (no silent partial — sc-10274).
+            // Dense tier + adapters: fold every LoRA/LoKr delta into the base weights at the
+            // safetensors-key level (merge, don't residual — the DiT is chaos-sensitive), then build
+            // from the merged map. The 448 DiT + 60 conditioner targets both fold into
+            // `{prefix}.{path}.weight`; a target that fails to route hard-errors (no silent partial —
+            // sc-10274).
             let mut base = load_dit_map(&dit_path)?;
-            // A packed (Q4/Q8) DiT stores u32 codes, not dense `.weight` matrices — folding `B·A` into
-            // codes would silently corrupt them (the delta shape never matches the packed shape, so the
-            // fold would no-op partially). Refuse the packed+adapter combo here rather than mis-merge.
-            // The additive-branch merge (`y = xW_packed + scale·(xA)B`, epic 10043 prior art) that would
-            // make this work is tracked as **sc-10578** (both MLX and candle lanes); the rejection is
-            // correct until it lands.
-            if base.keys().any(|k| k.ends_with(".scales")) {
-                return Err(CandleError::Msg(format!(
-                    "anima: cannot fold a LoRA/LoKr onto a packed (Q4/Q8) DiT tier at {} — apply the \
-                     adapter to the dense checkpoint (packed-tier adapter support: sc-10578)",
-                    dit_path.display()
-                )));
-            }
             let _report = apply_anima_adapters(&mut base, &prefix, adapters)?;
             // Unify to the compute dtype + device (the fold ran in f32 on CPU) and build.
             let merged: HashMap<String, Tensor> = base
@@ -186,11 +189,17 @@ impl AnimaComponents {
                 .collect::<Result<_>>()?;
             VarBuilder::from_tensors(merged, dtype, device)
         };
-        let dit = CosmosDiT::new(&dit_vb.pp(&prefix), DitConfig::anima())?;
-        let conditioner = AnimaTextConditioner::new(
+        let mut dit = CosmosDiT::new(&dit_vb.pp(&prefix), DitConfig::anima())?;
+        let mut conditioner = AnimaTextConditioner::new(
             &dit_vb.pp(&prefix).pp("llm_adapter"),
             ConditionerConfig::anima(),
         )?;
+        // Packed tier + adapters: install the LoRA(s) as forward-time residuals over the packed DiT +
+        // dense conditioner. (The dense-tier fold above already baked adapters into the weights, and the
+        // plain model has none.) LoKr/LoHa on a packed tier hard-errors here — sc-10713.
+        if packed_with_adapters {
+            let _report = install_anima_residuals(&mut dit, &mut conditioner, adapters)?;
+        }
 
         let te_path = root.join(TEXT_ENCODER_FILE);
         let te_vb = candle_gen::mmap_var_builder(std::slice::from_ref(&te_path), dtype, device)?;
