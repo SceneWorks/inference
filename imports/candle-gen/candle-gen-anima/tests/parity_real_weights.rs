@@ -21,9 +21,10 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::WeightsSource;
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, WeightsSource};
 use serde_json::Value;
 
+use candle_gen_anima::adapters::apply_anima_adapters;
 use candle_gen_anima::conditioner::AnimaTextConditioner;
 use candle_gen_anima::config::{ConditionerConfig, DitConfig, Qwen3Config, Variant};
 use candle_gen_anima::loader::detect_dit_prefix;
@@ -365,8 +366,130 @@ fn loader_detects_base_prefix_and_assembles() {
     // The base cut roots at `net`; assembling the full component set proves every key resolves.
     let prefix = detect_dit_prefix(&dit_file(&split)).unwrap();
     assert_eq!(prefix, "net", "base variant roots at `net`");
-    let comps =
-        AnimaComponents::load(&WeightsSource::Dir(split), Variant::Base, &Device::Cpu).unwrap();
+    let comps = AnimaComponents::load(&WeightsSource::Dir(split), Variant::Base, &Device::Cpu, &[])
+        .unwrap();
     assert_eq!(comps.dtype, DType::F32, "CPU compute dtype is f32");
     let _ = comps.dit.config();
+}
+
+// ------------------------------------------------------------------------------------------------
+// LoRA — the real Anima-Official-LoRAs files: 508 (448 DiT + 60 conditioner) vs 448 DiT-only, folded
+// onto the real base DiT+conditioner, on CPU. Weight-level property; no GPU. (sc-10525 / MLX sc-10521.)
+// ------------------------------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+/// Glob one Anima-Official-LoRAs file from the HF cache (no hardcoded sha).
+fn lora_file(name: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let base = PathBuf::from(home)
+        .join(".cache/huggingface/hub/models--circlestone-labs--Anima-Official-LoRAs/snapshots");
+    std::fs::read_dir(&base)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find_map(|e| {
+            let p = e.path().join(name);
+            p.is_file().then_some(p)
+        })
+}
+
+/// Load the real base DiT single-file into a CPU `HashMap` (f32 for the fold), like the loader's
+/// adapter path.
+fn base_map(dit: &Path) -> HashMap<String, candle_gen::candle_core::Tensor> {
+    candle_gen::candle_core::safetensors::load(dit, &Device::Cpu).unwrap()
+}
+
+fn spec(path: PathBuf) -> AdapterSpec {
+    AdapterSpec::new(path, 1.0, AdapterKind::Lora)
+}
+
+#[test]
+#[ignore = "needs the licensed Anima snapshot + Anima-Official-LoRAs in the HF cache"]
+fn lora_turbo_508_and_style_448_fold_onto_the_real_base() {
+    let Some(split) = split_files() else {
+        eprintln!("lora: Anima snapshot absent -> skip");
+        return;
+    };
+    let (Some(turbo), Some(style)) = (
+        lora_file("anima-turbo-lora-v0.2.safetensors"),
+        lora_file("anima-greg-rutkowski-style.safetensors"),
+    ) else {
+        eprintln!("lora: Anima-Official-LoRAs absent -> skip");
+        return;
+    };
+    let dit = dit_file(&split);
+    let prefix = detect_dit_prefix(&dit).unwrap();
+
+    // Snapshot a DiT target and a conditioner target to prove per-class fold behavior.
+    let dit_key = format!("{prefix}.blocks.0.self_attn.q_proj.weight");
+    let cond_key = format!("{prefix}.llm_adapter.blocks.0.self_attn.q_proj.weight");
+    let max_abs = |t: &candle_gen::candle_core::Tensor| {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    };
+    let diff_max = |a: &candle_gen::candle_core::Tensor, b: &candle_gen::candle_core::Tensor| {
+        (a.to_dtype(DType::F32).unwrap() - b.to_dtype(DType::F32).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    };
+
+    // --- anima-turbo-lora-v0.2: 508 targets (448 DiT + 60 conditioner). ---
+    let mut base = base_map(&dit);
+    let before_dit = base[&dit_key].clone();
+    let before_cond = base[&cond_key].clone();
+    let report = apply_anima_adapters(&mut base, &prefix, &[spec(turbo.clone())]).unwrap();
+    assert_eq!(
+        report.merged, 508,
+        "anima-turbo-lora-v0.2 must fold 508 targets (448 DiT + 60 conditioner), got {}",
+        report.merged
+    );
+    // The DiT target changed (non-zero delta); the conditioner target is unchanged (all 60 conditioner
+    // lora_B are zero-init in this file, so B·A ≡ 0 — inert, but the count above proves it still ROUTED).
+    assert!(
+        diff_max(&base[&dit_key], &before_dit) > 1e-6,
+        "DiT target must change"
+    );
+    assert!(
+        diff_max(&base[&cond_key], &before_cond) < 1e-6,
+        "conditioner target has zero lora_B → unchanged (but must still be routed in the 508 count)"
+    );
+    println!(
+        "[lora_turbo] 508 routed; DiT Δmax {:.3e}, cond Δmax {:.3e} (zero-B)",
+        diff_max(&base[&dit_key], &before_dit),
+        diff_max(&base[&cond_key], &before_cond)
+    );
+    drop(base);
+
+    // --- anima-greg-rutkowski-style: 448 DiT-only, zero conditioner. ---
+    let mut base = base_map(&dit);
+    let report = apply_anima_adapters(&mut base, &prefix, &[spec(style)]).unwrap();
+    assert_eq!(
+        report.merged, 448,
+        "greg-rutkowski is 448 DiT-only, got {}",
+        report.merged
+    );
+    drop(base);
+
+    // --- Mutation (sc-10274): a DiT-only base (llm_adapter modules dropped) must REJECT the turbo
+    // LoRA's 60 conditioner targets, not silently drop them. ---
+    let mut base = base_map(&dit);
+    base.retain(|k, _| !k.contains("llm_adapter"));
+    let err = apply_anima_adapters(&mut base, &prefix, &[spec(turbo)])
+        .expect_err("a DiT-only base must reject the 60 conditioner targets");
+    assert!(
+        err.to_string().contains("did not route"),
+        "expected unrouted error, got: {err}"
+    );
+    let _ = max_abs; // (helper kept for symmetry with the stats readouts)
 }

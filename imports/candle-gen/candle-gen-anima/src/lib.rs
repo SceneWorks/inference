@@ -19,17 +19,17 @@
 //! - **VAE** — the **Qwen-Image** `AutoencoderKLQwenImage`, reusing [`vae::QwenVae`] (from
 //!   `candle-gen-qwen-image`) via the original→diffusers key rename [`vae::convert_vae_key`].
 //! - **Scheduler** — `FlowMatchEulerDiscreteScheduler` static `shift=3.0`, `sigmas = linspace(1, 1/N, N)`
-//!   ([`pipeline::anima_sigmas`]); default solver `euler` on this candle `gen-core` pin (the MLX lane's
-//!   recommended `er_sde`, sc-10519, is not yet in this candle pin's curated menu — see
-//!   [`pipeline::DEFAULT_SAMPLER`]).
+//!   ([`pipeline::anima_sigmas`]); default solver the recommended `er_sde` (sc-10519), carried by the
+//!   `441ecec` gen-core pin ([`pipeline::DEFAULT_SAMPLER`]).
 //!
 //! **`backend = "candle"`, `mac_only = false`** — this crate is what lets the manifest drop the
 //! `macOnly: true` gate the MLX-only port carried (sc-10523 wires it worker-side).
 //!
-//! **First-slice surface:** txt2img at the single-file dense checkpoint. Q4/Q8 quant tiers (sc-10517
-//! MLX counterpart) and the LoRA/LoKr injection surface (sc-10521 MLX counterpart) are **not wired on
-//! the candle lane yet** — adapters + quantize are rejected at load (not silently dropped).
+//! **Surface:** txt2img at the single-file dense checkpoint, with **LoRA/LoKr injection** (448 DiT + 60
+//! conditioner targets folded at load, stacked + mixed, strict routing — [`adapters`]). Q4/Q8 candle
+//! quant tiers are the counterpart of MLX sc-10517 (see the `quant` gap note in [`loader`]).
 
+pub mod adapters;
 pub mod conditioner;
 pub mod config;
 pub mod loader;
@@ -59,8 +59,9 @@ use candle_gen::gen_core::{
 
 use crate::config::RES_MULTIPLE;
 
-/// No candle quant tiers wired yet (see the descriptor note) — advertised as the empty set.
-const EMPTY_QUANTS: &[Quant] = &[];
+/// The candle quant tiers Anima advertises — Q4 + Q8 (the counterpart of MLX sc-10517). The DiT loads
+/// packed (dequant-dense per step, CPU-capable); the conditioner / Qwen3 TE / VAE stay dense bf16.
+const ANIMA_QUANTS: &[Quant] = &[Quant::Q4, Quant::Q8];
 
 const MAX_COUNT: u32 = 8;
 const RES_MIN: u32 = 512;
@@ -83,14 +84,13 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_guidance: cfg_capable,
             supports_true_cfg: false,
             conditioning: vec![],
-            // The candle LoRA/LoKr injection surface (the counterpart of MLX sc-10521) is NOT wired on
-            // this lane yet — adapters are rejected at load, so advertising support would be a
-            // capability lie the worker would surface to the UI. Flips to true when the candle
-            // adapter-host follow-up lands.
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA/LoKr injection is wired (the candle counterpart of MLX sc-10521): every trained
+            // adapter's 448 DiT + 60 conditioner targets fold at load, stacked + mixed, strict routing
+            // (`adapters::apply_anima_adapters`). Weight-level fold, validated bit-exact on CPU.
+            supports_lora: true,
+            supports_lokr: true,
             // Rectified-flow over the unified curated-sampler framework (epic 7114). The native default
-            // (req.sampler == None) is `euler` on this candle pin; the full curated menu is advertised.
+            // (req.sampler == None) is the recommended er_sde solver; the full curated menu is advertised.
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
             supported_guidance_methods: vec![],
@@ -99,9 +99,10 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             max_count: MAX_COUNT,
             // The whole point of the candle port: Anima is no longer Mac-only.
             mac_only: false,
-            // No quant tiers yet on the candle lane (sc-10517 MLX counterpart): loading only the
-            // single-file dense checkpoint, so we must NOT advertise Q4/Q8 (a load-time-reject lie).
-            supported_quants: EMPTY_QUANTS,
+            // Q4 + Q8 (the candle counterpart of MLX sc-10517): the DiT packed-detects and runs the
+            // dequant-dense forward (CPU-capable — NOT the CUDA-only int8 fast GEMM); conditioner /
+            // Qwen3 TE / VAE stay dense bf16. A pre-packed tier is a real, loadable snapshot.
+            supported_quants: ANIMA_QUANTS,
             supports_kv_cache: false,
             requires_sigma_shift: true,
         },
@@ -125,6 +126,9 @@ pub struct Anima {
     variant: Variant,
     root: WeightsSource,
     device: Device,
+    /// LoRA/LoKr adapters to bake onto the DiT + conditioner at pipeline build (empty for the plain
+    /// model). Captured at load; folded lazily when the pipeline is first assembled.
+    adapters: Vec<gen_core::AdapterSpec>,
     pipeline: Mutex<Option<AnimaPipeline>>,
 }
 
@@ -140,28 +144,29 @@ pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn Generator>> {
     let id = variant.id();
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id}: no candle quant tiers wired yet (dense bf16/f32 only; Q4/Q8 tracked as the candle \
-             counterpart of sc-10517)"
-        )));
-    }
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id}: candle LoRA/LoKr injection not wired yet (the candle counterpart of sc-10521)"
-        )));
-    }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id}: candle Anima is txt2img only (no control / IP-adapter)"
         )));
     }
+    // A Q4/Q8 tier is a **pre-packed** snapshot (the worker points `spec.weights` at it; the DiT
+    // packed-detects it at load). Folding a LoRA/LoKr into u32-packed codes is a separate dequant-fold
+    // job — reject the packed+adapter COMBO rather than silently mis-merge into the codes.
+    if spec.quantize.is_some() && !spec.adapters.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: LoRA/LoKr on a quantized (Q4/Q8) tier is not wired — apply the adapter to the dense \
+             checkpoint, or use the dense tier"
+        )));
+    }
+    // LoRA/LoKr adapters (`spec.adapters`) are accepted — folded onto the DiT + conditioner when the
+    // pipeline is assembled (`adapters::apply_anima_adapters`).
     let device = candle_gen::default_device().map_err(gen_core::Error::from)?;
     Ok(Box::new(Anima {
         descriptor: descriptor_for(variant),
         variant,
         root: spec.weights.clone(),
         device,
+        adapters: spec.adapters.clone(),
         pipeline: Mutex::new(None),
     }))
 }
@@ -178,6 +183,7 @@ impl Anima {
                 &self.root,
                 self.variant,
                 &self.device,
+                &self.adapters,
             )?);
         }
         Ok(())
@@ -310,19 +316,20 @@ mod tests {
         assert!(b.capabilities.requires_sigma_shift);
         // The candle port removes the Mac-only gate.
         assert!(!b.capabilities.mac_only);
-        // No candle quant/LoRA lane wired yet — honest capabilities (no load-time lie).
-        assert!(!b.capabilities.supports_lora && !b.capabilities.supports_lokr);
-        assert_eq!(b.capabilities.supported_quants, &[] as &[Quant]);
+        // LoRA/LoKr injection is wired; Q4/Q8 tiers are advertised (packed-detect, dequant-dense).
+        assert!(b.capabilities.supports_lora && b.capabilities.supports_lokr);
+        assert_eq!(b.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert_eq!(b.capabilities.min_size, 512);
         assert_eq!(b.capabilities.max_size, 1536);
         // Turbo is the CFG-free merged student.
         let t = descriptor_turbo();
         assert!(!t.capabilities.supports_guidance);
         assert!(!t.capabilities.supports_negative_prompt);
-        // `euler` (this crate's default flow solver on the pinned candle gen-core) is advertised.
+        // The default flow solver (er_sde on the 441ecec gen-core pin) is a real curated sampler.
+        assert_eq!(pipeline::DEFAULT_SAMPLER, "er_sde");
         assert!(
             b.capabilities.samplers.contains(&pipeline::DEFAULT_SAMPLER),
-            "default sampler advertised in the curated menu"
+            "er_sde advertised in the curated menu (441ecec gen-core pin carries the ErSde solver)"
         );
     }
 
@@ -337,21 +344,28 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces() {
+    fn load_accepts_adapters_and_quant_but_rejects_the_combo_and_control() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let base = WeightsSource::Dir("/snap".into());
-        let quant = LoadSpec::new(base.clone()).with_quant(Quant::Q4);
+        let lora_spec = || {
+            vec![AdapterSpec::new(
+                "/lora.safetensors".into(),
+                1.0,
+                AdapterKind::Lora,
+            )]
+        };
+
+        // A plain LoRA load and a plain Q4 load both SUCCEED (lazily built; the fold / packed-detect
+        // happen at first generate). Advertising the capability and then rejecting at load would be a lie.
+        assert!(load_base(&LoadSpec::new(base.clone()).with_adapters(lora_spec())).is_ok());
+        assert!(load_base(&LoadSpec::new(base.clone()).with_quant(Quant::Q4)).is_ok());
+
+        // The packed+LoRA COMBO is rejected (folding into u32 codes is a dequant-fold follow-up).
+        let combo = LoadSpec::new(base.clone())
+            .with_quant(Quant::Q8)
+            .with_adapters(lora_spec());
         assert!(matches!(
-            load_base(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
-        let lora = LoadSpec::new(base).with_adapters(vec![AdapterSpec::new(
-            "/lora.safetensors".into(),
-            1.0,
-            AdapterKind::Lora,
-        )]);
-        assert!(matches!(
-            load_base(&lora).err().expect("err"),
+            load_base(&combo).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
     }

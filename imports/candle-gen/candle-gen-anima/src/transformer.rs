@@ -13,12 +13,11 @@
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{Linear, Module, VarBuilder};
+use candle_gen::quant::{QLinear, MLX_GROUP_SIZE};
 use candle_gen::Result;
 
 use crate::config::DitConfig;
-use crate::nn::{
-    apply_rope_half, layer_norm_no_affine, lin, modulate, rms_norm, sdpa, timestep_sincos,
-};
+use crate::nn::{apply_rope_half, layer_norm_no_affine, modulate, rms_norm, sdpa, timestep_sincos};
 use crate::rope::cosmos_image_rope;
 
 /// q/k RMSNorm eps in diffusers `Attention` (`qk_norm="rms_norm"`, default `eps=1e-5`).
@@ -28,11 +27,59 @@ const NORM_EPS: f64 = 1e-6;
 /// Sinusoidal timestep-embedding `max_period` (`Timesteps` default).
 const TIME_MAX_PERIOD: f64 = 10000.0;
 
+/// A DiT projection that is either **dense** (`{name}.weight`) or **MLX-packed** (`{name}.weight` u32
+/// codes + `.scales` + `.biases`), auto-detected by the presence of `{name}.scales`. The packed forward
+/// dequantizes the weight to a dense matmul per step (sc-7702 `DequantDense` — CPU-capable, coherent at
+/// Q4; NOT the CUDA-only int8 `QMatMul` fast path). Anima's tiers pack ONLY the DiT (the conditioner /
+/// Qwen3 TE / VAE stay dense bf16 — the sc-10517 dense-TE precedent), all at MLX group size 64. Every
+/// DiT projection is bias-less, so no `.bias` sibling is read.
+enum DitLinear {
+    Dense(Linear),
+    Packed(QLinear),
+}
+
+impl DitLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            DitLinear::Dense(l) => Ok(l.forward(x)?),
+            DitLinear::Packed(q) => Ok(q.forward(x)?),
+        }
+    }
+}
+
+/// Bias-less, **packed-detecting**, **shapeless** DiT linear from `{name}` on `vb`: if `{name}.scales`
+/// is present, load the packed triple at their native dtypes (u32 codes must NOT be cast through the
+/// vb's float dtype) and repack straight from the parts (dims recovered from the packed shapes at group
+/// 64); otherwise the dense weight is read unchanged. One call serves both a dense bf16 checkpoint and a
+/// pre-quantized Q4/Q8 tier (the candle counterpart of MLX sc-10517).
+fn lin(vb: &VarBuilder, name: &str) -> Result<DitLinear> {
+    let scales_key = format!("{name}.scales");
+    if vb.contains_tensor(&scales_key) {
+        let device = vb.device().clone();
+        let wq = vb.get_unchecked_dtype(&format!("{name}.weight"), DType::U32)?;
+        let scales = vb.get_unchecked_dtype(&scales_key, DType::F32)?;
+        let biases = vb.get_unchecked_dtype(&format!("{name}.biases"), DType::F32)?;
+        Ok(DitLinear::Packed(QLinear::from_packed_gs(
+            &wq,
+            &scales,
+            &biases,
+            None,
+            MLX_GROUP_SIZE,
+            &device,
+        )?))
+    } else {
+        Ok(DitLinear::Dense(Linear::new(
+            vb.get_unchecked(&format!("{name}.weight"))?,
+            None,
+        )))
+    }
+}
+
 /// `CosmosEmbedding`: sinusoidal time_proj → `CosmosTimestepEmbedding` (`temb`, 3·hidden) + `RMSNorm`
 /// (`embedded_timestep`, hidden).
 struct TimeEmbed {
-    linear_1: Linear,
-    linear_2: Linear,
+    linear_1: DitLinear,
+    linear_2: DitLinear,
     norm: Tensor,
     hidden: usize,
     device: Device,
@@ -63,8 +110,8 @@ impl TimeEmbed {
 /// `CosmosAdaLayerNormZero` (norm1/2/3): LayerNorm(no affine) then `(1+scale)·norm + shift`, plus a
 /// `gate`. `linear_2` emits `3·hidden` (shift|scale|gate), added to `temb`.
 struct AdaLayerNormZero {
-    linear_1: Linear,
-    linear_2: Linear,
+    linear_1: DitLinear,
+    linear_2: DitLinear,
 }
 
 impl AdaLayerNormZero {
@@ -98,8 +145,8 @@ impl AdaLayerNormZero {
 /// `CosmosAdaLayerNorm` (final `norm_out`): LayerNorm(no affine) then `(1+scale)·norm + shift`.
 /// `linear_2` emits `2·hidden` (shift|scale), added to `temb[..., :2·hidden]`.
 struct AdaLayerNorm {
-    linear_1: Linear,
-    linear_2: Linear,
+    linear_1: DitLinear,
+    linear_2: DitLinear,
     hidden: usize,
 }
 
@@ -128,10 +175,10 @@ impl AdaLayerNorm {
 /// `CosmosAttention` — self (attn1: q/k/v from hidden, RoPE) or cross (attn2: q from hidden, k/v from
 /// text, no RoPE). Per-head q/k RMSNorm; heads == kv_heads (no GQA repeat for Anima).
 struct Attention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: DitLinear,
+    to_k: DitLinear,
+    to_v: DitLinear,
+    to_out: DitLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     heads: usize,
@@ -200,14 +247,14 @@ impl Attention {
         let o = o
             .transpose(1, 2)?
             .reshape((b, sq, self.heads * self.head_dim))?;
-        self.to_out.forward(&o).map_err(Into::into)
+        self.to_out.forward(&o)
     }
 }
 
 /// `FeedForward(mult=4, activation="gelu")` — `net.2(gelu_exact(net.0.proj(x)))`, no bias.
 struct FeedForward {
-    proj_in: Linear,  // mlp.layer1
-    proj_out: Linear, // mlp.layer2
+    proj_in: DitLinear,  // mlp.layer1
+    proj_out: DitLinear, // mlp.layer2
 }
 
 impl FeedForward {
@@ -221,7 +268,7 @@ impl FeedForward {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // gelu_exact = erf GELU (candle `gelu_erf`), matching `mlx_gen::nn::gelu_exact`.
         let h = self.proj_in.forward(x)?.gelu_erf()?;
-        self.proj_out.forward(&h).map_err(Into::into)
+        self.proj_out.forward(&h)
     }
 }
 
@@ -275,11 +322,11 @@ impl Block {
 
 /// The full Cosmos-Predict2 DiT.
 pub struct CosmosDiT {
-    patch_embed: Linear, // x_embedder.proj.1
+    patch_embed: DitLinear, // x_embedder.proj.1
     time_embed: TimeEmbed,
     blocks: Vec<Block>,
     norm_out: AdaLayerNorm,
-    proj_out: Linear, // final_layer.linear
+    proj_out: DitLinear, // final_layer.linear
     cfg: DitConfig,
     device: Device,
 }
@@ -377,5 +424,111 @@ impl CosmosDiT {
         let hidden = self.norm_out.forward(&hidden, &embedded, &temb)?;
         let hidden = self.proj_out.forward(&hidden)?;
         self.unpatchify(&hidden, pe_t, pe_h, pe_w)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Quant path (Q4 packed) exercised on candle's **CPU** backend: the DiT `lin()` packed-detects an
+    //! MLX-packed triple and the dequant-dense forward reproduces the affine grid — proving pack → load
+    //! → forward on CPU, no CUDA. (The CUDA-only path is the int8 fast GEMM, which Anima does NOT use.)
+    use super::*;
+    use candle_gen::candle_core::safetensors::MmapedSafetensors;
+    use candle_gen::candle_core::Device;
+    use std::collections::HashMap;
+
+    /// Test-side MLX Q4 packer (group `g`): per-element 4-bit codes → u32 words (LSB-first nibbles).
+    /// Returns `(wq [out, in/8] u32, scales [out, in/g], biases [out, in/g], affine grid [out, in])` —
+    /// the exact packed-parts fixture `lin()` consumes, plus the affine grid the dequant reproduces.
+    fn q4_packed(out_dim: usize, in_dim: usize, g: usize) -> (Tensor, Tensor, Tensor, Vec<f32>) {
+        let dev = Device::Cpu;
+        let codes: Vec<u8> = (0..out_dim * in_dim)
+            .map(|i| ((i * 7 + i / 13) % 16) as u8)
+            .collect();
+        let gpr = in_dim / g;
+        let groups = out_dim * gpr;
+        let scales: Vec<f32> = (0..groups).map(|gi| 0.0625 * (gi as f32 + 1.0)).collect();
+        let biases: Vec<f32> = (0..groups).map(|gi| -0.5 - 0.25 * gi as f32).collect();
+        let grid: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| {
+                let (row, col) = (i / in_dim, i % in_dim);
+                let gi = row * gpr + col / g;
+                scales[gi] * codes[i] as f32 + biases[gi]
+            })
+            .collect();
+        let words: Vec<u32> = codes
+            .chunks_exact(8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
+            })
+            .collect();
+        let wq = Tensor::from_vec(words, (out_dim, in_dim / 8), &dev).unwrap();
+        let s = Tensor::from_vec(scales, (out_dim, gpr), &dev).unwrap();
+        let b = Tensor::from_vec(biases, (out_dim, gpr), &dev).unwrap();
+        (wq, s, b, grid)
+    }
+
+    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(&b) {
+            dot += (*x as f64) * (*y as f64);
+            na += (*x as f64) * (*x as f64);
+            nb += (*y as f64) * (*y as f64);
+        }
+        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+    }
+
+    /// A packed DiT projection (`.scales` present) loads `Packed` and its dequant-dense forward matches
+    /// the affine grid bit-exact on CPU; a dense sibling (no `.scales`) stays `Dense`. Group size 64
+    /// (Anima's tier), the `lin()` default. This is the pack → load → forward CPU validation.
+    #[test]
+    fn packed_dit_linear_loads_and_forwards_on_cpu() {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 128usize); // in divisible by group 64
+        let (wq, s, b, grid) = q4_packed(out_dim, in_dim, MLX_GROUP_SIZE);
+
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        map.insert("blocks.0.self_attn.q_proj.weight".into(), wq);
+        map.insert("blocks.0.self_attn.q_proj.scales".into(), s);
+        map.insert("blocks.0.self_attn.q_proj.biases".into(), b);
+        // A dense sibling (no `.scales`) — the dense path must stay unchanged.
+        map.insert(
+            "blocks.0.self_attn.k_proj.weight".into(),
+            Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap(),
+        );
+
+        let tmp = std::env::temp_dir().join(format!("anima_q4_{}.safetensors", std::process::id()));
+        candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
+        // SAFETY: just-written file, nothing else touches it during the test.
+        let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
+        let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
+
+        let packed = lin(&vb, "blocks.0.self_attn.q_proj").unwrap();
+        assert!(
+            matches!(packed, DitLinear::Packed(_)),
+            "`.scales` ⇒ packed load"
+        );
+        let dense = lin(&vb, "blocks.0.self_attn.k_proj").unwrap();
+        assert!(
+            matches!(dense, DitLinear::Dense(_)),
+            "no `.scales` ⇒ dense path"
+        );
+
+        // The packed dequant-dense forward reproduces the affine grid on CPU.
+        let grid_lin = DitLinear::Dense(Linear::new(
+            Tensor::from_vec(grid, (out_dim, in_dim), &dev).unwrap(),
+            None,
+        ));
+        let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
+        let cos = cosine(&packed.forward(&x).unwrap(), &grid_lin.forward(&x).unwrap());
+        assert!(
+            cos > 0.99999,
+            "packed vs affine-grid cosine {cos:.6} (CPU dequant-dense)"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
