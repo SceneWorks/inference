@@ -757,6 +757,81 @@ mod tests {
         assert!(max < tol, "{label}: max abs diff {max:e} (tol {tol:e})");
     }
 
+    // =============================================================================================
+    // Independent Python golden (sc-10519, adversarial-review fix). The er_sde / dpmpp_2m_sde
+    // trajectories below are pinned against numbers produced by ComfyUI's OWN `sample_er_sde` /
+    // `sample_dpmpp_2m_sde` (vendored verbatim, driven in VE space, s_noise=0), NOT by re-reading
+    // this Rust — so a sign/coefficient error in a Stage-2/3 or midpoint term is caught. Fixture +
+    // generator + the verbatim ComfyUI source live in `gen-core/tests/fixtures/`.
+    // =============================================================================================
+
+    /// f32-appropriate trajectory tolerance. The golden is float64; the Rust port carries latents in
+    /// f32, yet the measured max drift over the whole 6-step schedule is ~1.2e-7 (a single f32 ULP at
+    /// O(1) — pure CPU scalar math, so the agreement is essentially exact). `1e-5` keeps ~80x headroom
+    /// for cross-platform f32 rounding while staying two orders TIGHTER than a Metal-grade 1e-3 fudge.
+    /// A real sign/coefficient bug moves a step by O(1e-2..1e0), far above this (verified by mutation).
+    const GOLDEN_TOL: f32 = 1e-5;
+
+    /// The toy denoiser mirrored bit-for-bit from `gen-core/tests/fixtures/gen_sde_solver_golden.py`:
+    /// `denoised = 0.5·x + 0.25·sin(1.3·x) + 0.2·σ·cos(0.7·x) − 0.1·σ`. A NON-constant field in both
+    /// `x` and `σ`, so the higher-order terms genuinely engage. Computed in f64 (matching the float64
+    /// reference) then demoted, isolating the SOLVER's f32 arithmetic as the only source of drift.
+    fn toy_denoised(x: &[f32], sigma: f32) -> Vec<f32> {
+        let sig = sigma as f64;
+        x.iter()
+            .map(|&xj| {
+                let xj = xj as f64;
+                (0.5 * xj + 0.25 * (1.3 * xj).sin() + 0.2 * sig * (0.7 * xj).cos() - 0.1 * sig)
+                    as f32
+            })
+            .collect()
+    }
+
+    fn load_golden() -> serde_json::Value {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sde_solver_golden.json"
+        );
+        let text = std::fs::read_to_string(path).expect("read sde_solver_golden.json fixture");
+        serde_json::from_str(&text).expect("parse sde_solver_golden.json")
+    }
+
+    fn json_vec(v: &serde_json::Value) -> Vec<f32> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    }
+
+    fn json_rows(v: &serde_json::Value) -> Vec<Vec<f32>> {
+        v.as_array().unwrap().iter().map(json_vec).collect()
+    }
+
+    /// Drive `solver` over the golden schedule with a recording denoiser, returning the full
+    /// trajectory `[x_0, x_1, …, x_N]` — the pre-step latent captured at each `denoise` call plus the
+    /// final returned latent, exactly mirroring the Python generator's capture.
+    fn run_recorded_trajectory<S: Sampler<CpuLatentOps>>(
+        solver: &S,
+        x_init: &[f32],
+        sigmas: &[f32],
+    ) -> Vec<Vec<f32>> {
+        let ops = CpuLatentOps;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let mut recorded: Vec<Vec<f32>> = Vec::new();
+        let final_x = {
+            let mut dn = |xx: &Vec<f32>, s: f32| -> Result<Vec<f32>> {
+                recorded.push(xx.clone());
+                Ok(toy_denoised(xx, s))
+            };
+            solver
+                .sample(&ops, &ms, &mut dn, x_init.to_vec(), sigmas, 0)
+                .unwrap()
+        };
+        recorded.push(final_x);
+        recorded
+    }
+
     #[test]
     fn deterministic_solvers_integrate_constant_velocity_exactly() {
         // Euler (from unified) + the deterministic curated solvers must all hit the exact solution.
@@ -841,62 +916,124 @@ mod tests {
         }
     }
 
-    /// er_sde's first step (`i==0`, `stage_used==1`) is exactly the Stage-1 Euler blend
-    /// `r·x + (1−r)·x0` with `r = φ(σ_{i+1})/φ(σ_i)`, plus the ER-SDE noise term — pinned bit-for-bit
-    /// against the hand-transcribed ComfyUI formula (VE space, `α=1`).
+    /// er_sde reproduces ComfyUI's `sample_er_sde` step-by-step over a 6-step VE schedule (deterministic,
+    /// `s_noise=0`) — reaching Stage-3 (`i>=2`) so the 200-point Riemann integrals and the Stage-2/3
+    /// finite-difference corrections are all exercised against the INDEPENDENT float64 golden, not a
+    /// re-transcription of this Rust. Catches a sign/coefficient error anywhere in the higher-order path.
     #[test]
-    fn er_sde_first_step_matches_hand_formula() {
-        let ops = CpuLatentOps;
-        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
-        let (sigma, s_next) = (0.8_f32, 0.5_f32);
-        let x = vec![0.4_f32, -0.2, 1.0];
-        let v = vec![0.6_f32, 0.1, -0.3];
-        let seed = 11u64;
-        // Flow denoise: x0 = x − σ·v.
-        let x0: Vec<f32> = x.iter().zip(&v).map(|(&xi, &vi)| xi - sigma * vi).collect();
-        // Hand reference: φ(l)=l·(exp(l^0.3)+10); r=φ(s_next)/φ(σ); Stage-1 blend + noise term.
-        let phi = |l: f64| l * (l.powf(0.3).exp() + 10.0);
-        let r = (phi(s_next as f64) / phi(sigma as f64)) as f32;
-        let x1 = ops.axpy(r, &x, 1.0 - r, &x0).unwrap();
-        let var = (s_next as f64).powi(2) - (sigma as f64).powi(2) * (r as f64).powi(2);
-        let nc = var.max(0.0).sqrt() as f32;
-        let noise = ops.randn_like(&x1, seed, 0).unwrap();
-        let want = ops.axpy(1.0, &x1, nc, &noise).unwrap();
-
-        let mut dn = |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |_xin, _t| Ok(v.clone()));
-        let got = ErSde::default()
-            .sample(&ops, &ms, &mut dn, x.clone(), &[sigma, s_next], seed)
-            .unwrap();
-        assert_close(&got, &want, 1e-6, "er_sde first step");
+    fn er_sde_matches_python_golden_trajectory() {
+        let g = load_golden();
+        let sigmas = json_vec(&g["sigmas"]);
+        let x_init = json_vec(&g["x_init"]);
+        let want = json_rows(&g["er_sde"]["trajectory"]);
+        let solver = ErSde {
+            s_noise: 0.0,
+            max_stage: 3,
+        };
+        let got = run_recorded_trajectory(&solver, &x_init, &sigmas);
+        assert_eq!(got.len(), want.len(), "er_sde golden trajectory length");
+        assert_eq!(
+            got.len(),
+            7,
+            "6 steps + trailing terminal => 7 latent snapshots"
+        );
+        for (k, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_close(a, b, GOLDEN_TOL, &format!("er_sde golden step {k}"));
+        }
     }
 
-    /// dpmpp_2m_sde's first step (`i==0`, no history) is the 1st-order DPM++(2M) SDE step plus the
-    /// SDE noise term — pinned bit-for-bit against the hand-transcribed ComfyUI formula (VE space,
-    /// `α_t=1`, `η=1`, midpoint).
+    /// dpmpp_2m_sde reproduces ComfyUI's `sample_dpmpp_2m_sde` (`solver_type='midpoint'`, `η=1`)
+    /// step-by-step over the same schedule (deterministic, `s_noise=0`) — exercising the midpoint
+    /// 2nd-order correction against the INDEPENDENT float64 golden.
     #[test]
-    fn dpmpp_2m_sde_first_step_matches_hand_formula() {
+    fn dpmpp_2m_sde_matches_python_golden_trajectory() {
+        let g = load_golden();
+        let sigmas = json_vec(&g["sigmas"]);
+        let x_init = json_vec(&g["x_init"]);
+        let want = json_rows(&g["dpmpp_2m_sde"]["trajectory"]);
+        let solver = Dpmpp2mSde {
+            eta: 1.0,
+            s_noise: 0.0,
+        };
+        let got = run_recorded_trajectory(&solver, &x_init, &sigmas);
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "dpmpp_2m_sde golden trajectory length"
+        );
+        for (k, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_close(a, b, GOLDEN_TOL, &format!("dpmpp_2m_sde golden step {k}"));
+        }
+    }
+
+    /// er_sde's first step (`i==0`, Stage-1) pinned against the INDEPENDENT golden value (`s_noise=0`),
+    /// then the noise term proven wired by its EXACT linearity in `s_noise` — the noise vector is drawn
+    /// on the (s_noise-independent) deterministic `x_next`, so `out(s_noise) − det = s_noise·(coeff·ε)`,
+    /// i.e. doubling `s_noise` must exactly double the deviation. No hand-transcription of the coeff.
+    #[test]
+    fn er_sde_first_step_matches_python_golden_and_scales_noise() {
         let ops = CpuLatentOps;
         let ms = FlowModelSampling::new(TimestepConvention::Sigma);
-        let (sigma, s_next) = (0.8_f32, 0.5_f32);
-        let x = vec![0.4_f32, -0.2, 1.0];
-        let v = vec![0.6_f32, 0.1, -0.3];
-        let seed = 5u64;
-        let x0: Vec<f32> = x.iter().zip(&v).map(|(&xi, &vi)| xi - sigma * vi).collect();
-        let (eta, s_noise) = (1.0_f64, 1.0_f64);
-        let h = -(s_next as f64).ln() - (-(sigma as f64).ln()); // λ(s_next) − λ(σ)
-        let h_eta = h * (eta + 1.0);
-        let coeff_x = (s_next as f64 / sigma as f64 * (-eta * h).exp()) as f32;
-        let coeff_d = (-((-h_eta).exp() - 1.0)) as f32; // 1 − e^{−h_eta}
-        let x1 = ops.axpy(coeff_x, &x, coeff_d, &x0).unwrap();
-        let nc = (s_next as f64 * (1.0 - (-2.0 * eta * h).exp()).sqrt() * s_noise) as f32;
-        let noise = ops.randn_like(&x1, seed, 0).unwrap();
-        let want = ops.axpy(1.0, &x1, nc, &noise).unwrap();
+        let g = load_golden();
+        let sigmas = json_vec(&g["sigmas"]);
+        let x_init = json_vec(&g["x_init"]);
+        let want_x1 = json_rows(&g["er_sde"]["trajectory"])[1].clone();
+        let two = [sigmas[0], sigmas[1]];
 
-        let mut dn = |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |_xin, _t| Ok(v.clone()));
-        let got = Dpmpp2mSde::default()
-            .sample(&ops, &ms, &mut dn, x.clone(), &[sigma, s_next], seed)
-            .unwrap();
-        assert_close(&got, &want, 1e-6, "dpmpp_2m_sde first step");
+        let run = |s_noise: f32| {
+            let mut dn = |xx: &Vec<f32>, s: f32| Ok(toy_denoised(xx, s));
+            ErSde {
+                s_noise,
+                max_stage: 3,
+            }
+            .sample(&ops, &ms, &mut dn, x_init.clone(), &two, 3)
+            .unwrap()
+        };
+        // Deterministic first step == the independent golden (non-tautological value check at i=0).
+        let det = run(0.0);
+        assert_close(&det, &want_x1, GOLDEN_TOL, "er_sde first step golden");
+        // Noise term is present and scales linearly with s_noise.
+        let o1 = run(1.0);
+        let o2 = run(2.0);
+        assert_ne!(o1, det, "er_sde must inject noise when s_noise>0");
+        let d1: Vec<f32> = o1.iter().zip(&det).map(|(&a, &b)| a - b).collect();
+        let d2: Vec<f32> = o2.iter().zip(&det).map(|(&a, &b)| a - b).collect();
+        let twice: Vec<f32> = d1.iter().map(|&v| 2.0 * v).collect();
+        assert_close(&d2, &twice, 1e-6, "er_sde noise term linear in s_noise");
+    }
+
+    /// dpmpp_2m_sde's first step (`i==0`, no history) pinned against the INDEPENDENT golden value
+    /// (`η=1`, `s_noise=0`), then the SDE noise term proven wired by its exact linearity in `s_noise`.
+    #[test]
+    fn dpmpp_2m_sde_first_step_matches_python_golden_and_scales_noise() {
+        let ops = CpuLatentOps;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let g = load_golden();
+        let sigmas = json_vec(&g["sigmas"]);
+        let x_init = json_vec(&g["x_init"]);
+        let want_x1 = json_rows(&g["dpmpp_2m_sde"]["trajectory"])[1].clone();
+        let two = [sigmas[0], sigmas[1]];
+
+        let run = |s_noise: f32| {
+            let mut dn = |xx: &Vec<f32>, s: f32| Ok(toy_denoised(xx, s));
+            Dpmpp2mSde { eta: 1.0, s_noise }
+                .sample(&ops, &ms, &mut dn, x_init.clone(), &two, 5)
+                .unwrap()
+        };
+        let det = run(0.0);
+        assert_close(&det, &want_x1, GOLDEN_TOL, "dpmpp_2m_sde first step golden");
+        let o1 = run(1.0);
+        let o2 = run(2.0);
+        assert_ne!(o1, det, "dpmpp_2m_sde must inject noise when s_noise>0");
+        let d1: Vec<f32> = o1.iter().zip(&det).map(|(&a, &b)| a - b).collect();
+        let d2: Vec<f32> = o2.iter().zip(&det).map(|(&a, &b)| a - b).collect();
+        let twice: Vec<f32> = d1.iter().map(|&v| 2.0 * v).collect();
+        assert_close(
+            &d2,
+            &twice,
+            1e-6,
+            "dpmpp_2m_sde noise term linear in s_noise",
+        );
     }
 
     #[test]
