@@ -127,26 +127,22 @@ fn reference_image(req: &GenerationRequest) -> Option<&Image> {
 
 impl Seedvr2Generator {
     fn pipeline(&self) -> gen_core::Result<std::sync::Arc<Seedvr2Pipeline>> {
-        // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
-        // while locked must not turn every later `generate` into a panic).
-        let mut guard = candle_gen::lock_recover(&self.pipe);
-        if let Some(p) = guard.as_ref() {
-            return Ok(p.clone());
-        }
-        let mut p = Seedvr2Pipeline::load(
-            &self.root,
-            self.dit_file,
-            &self.cfg,
-            self.dtype,
-            &self.device,
-        )?;
-        // sc-5927: int8/int4 quantize the DiT Linears at load (the VAE stays dense).
-        if let Some(q) = self.quant {
-            p.quantize(q)?;
-        }
-        let p = std::sync::Arc::new(p);
-        *guard = Some(p.clone());
-        Ok(p)
+        // `cached` recovers a poisoned lock (sc-9015) internally; the inner `?` bridges the
+        // candle-side load/quantize errors into `gen_core::Error`.
+        candle_gen::cached(&self.pipe, || {
+            let mut p = Seedvr2Pipeline::load(
+                &self.root,
+                self.dit_file,
+                &self.cfg,
+                self.dtype,
+                &self.device,
+            )?;
+            // sc-5927: int8/int4 quantize the DiT Linears at load (the VAE stays dense).
+            if let Some(q) = self.quant {
+                p.quantize(q)?;
+            }
+            Ok(std::sync::Arc::new(p))
+        })
     }
 }
 
@@ -222,8 +218,7 @@ impl Generator for Seedvr2Generator {
                 self.descriptor.id
             ))
         })?;
-        let mut out = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
+        let out = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             if req.cancel.is_cancelled() {
                 return Err(gen_core::Error::Canceled);
             }
@@ -231,7 +226,6 @@ impl Generator for Seedvr2Generator {
                 current: 1,
                 total: 1,
             });
-            let seed = base_seed.wrapping_add(i as u64);
             let img = pipe.generate(
                 image,
                 req.width as usize,
@@ -240,8 +234,8 @@ impl Generator for Seedvr2Generator {
                 softness,
             )?;
             on_progress(Progress::Decoding);
-            out.push(img);
-        }
+            Ok(img)
+        })?;
         Ok(GenerationOutput::Images(out))
     }
 }

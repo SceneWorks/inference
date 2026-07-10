@@ -376,9 +376,7 @@ impl Pipeline {
             self.variant.id(),
         )?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = base_seed.wrapping_add(index as u64);
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let latents =
                 pipeline::create_noise(&self.cfg, seed, req.width, req.height, &self.device)?;
 
@@ -437,9 +435,8 @@ impl Pipeline {
                 Some(pid) => pid.decode(&packed)?,
                 None => comps.vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
             };
-            images.push(to_image(&decoded)?);
-        }
-        Ok(images)
+            to_image(&decoded)
+        })
     }
 }
 
@@ -476,16 +473,10 @@ pub struct Flux2Generator {
 
 impl Flux2Generator {
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("flux2 components cache mutex poisoned");
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = pipe.load_components()?;
-        *guard = Some(c.clone());
-        Ok(c)
+        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
+        Ok(candle_gen::cached(&self.components, || {
+            pipe.load_components()
+        })?)
     }
 }
 
