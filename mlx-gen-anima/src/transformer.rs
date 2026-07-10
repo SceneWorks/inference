@@ -14,7 +14,7 @@ use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, zeros_dtype};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{apply_text_rope, gelu_exact, modulate, silu, timestep_sincos};
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
@@ -426,5 +426,135 @@ impl CosmosDiT {
         Ok(self
             .run_blocks(latents, sigma, encoder, dtype, num_blocks)?
             .0)
+    }
+}
+
+// ---- LoRA/LoKr adapter surface (sc-10521) --------------------------------------------------------
+//
+// The official Anima LoRAs address DiT modules by their **original Cosmos** names (the same names the
+// checkpoint uses — `self_attn`/`cross_attn`, `q_proj`/`k_proj`/`v_proj`/`output_proj`,
+// `mlp.layer1`/`mlp.layer2`, and the three `adaln_modulation_{self_attn,cross_attn,mlp}.{1,2}` down/up
+// pairs), under the ComfyUI `diffusion_model.` prefix (stripped by the loader). Every projection is an
+// `AdaptableLinear`, so the host is just a dotted-path → `&mut AdaptableLinear` router. The three
+// adaLN-modulation `.1`/`.2` pairs ARE LoRA targets (adaln_lora_dim 256) — easy to miss (16 of a
+// block's targets, 6 of which are adaLN), so they are routed here explicitly.
+
+impl AdaptableHost for Attention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["q_proj"] => Some(&mut self.to_q),
+            ["k_proj"] => Some(&mut self.to_k),
+            ["v_proj"] => Some(&mut self.to_v),
+            ["output_proj"] => Some(&mut self.to_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["q_proj", "k_proj", "v_proj", "output_proj"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+}
+
+impl AdaptableHost for FeedForward {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["layer1"] => Some(&mut self.proj_in),
+            ["layer2"] => Some(&mut self.proj_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["layer1", "layer2"].into_iter().map(String::from).collect()
+    }
+}
+
+/// The adaLN-modulation `SiLU → linear_1 → linear_2` down/up pair is addressed by the trained files as
+/// `‹adaln_modulation_*›.1` / `.2` — both LoRA targets (the `.2` up-projection's out_features is
+/// `adaln_lora_dim`·… , confirming these pairs really are adapted). Shared by [`AdaLayerNormZero`]
+/// (blocks) and [`AdaLayerNorm`] (final layer) via their identical `linear_1`/`linear_2` fields.
+impl AdaptableHost for AdaLayerNormZero {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["1"] => Some(&mut self.linear_1),
+            ["2"] => Some(&mut self.linear_2),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["1", "2"].into_iter().map(String::from).collect()
+    }
+}
+
+impl AdaptableHost for AdaLayerNorm {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["1"] => Some(&mut self.linear_1),
+            ["2"] => Some(&mut self.linear_2),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["1", "2"].into_iter().map(String::from).collect()
+    }
+}
+
+impl AdaptableHost for Block {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["self_attn", rest @ ..] => self.attn1.adaptable_mut(rest),
+            ["cross_attn", rest @ ..] => self.attn2.adaptable_mut(rest),
+            ["mlp", rest @ ..] => self.ff.adaptable_mut(rest),
+            ["adaln_modulation_self_attn", rest @ ..] => self.norm1.adaptable_mut(rest),
+            ["adaln_modulation_cross_attn", rest @ ..] => self.norm2.adaptable_mut(rest),
+            ["adaln_modulation_mlp", rest @ ..] => self.norm3.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        out.extend(prefixed_paths("self_attn", &self.attn1));
+        out.extend(prefixed_paths("cross_attn", &self.attn2));
+        out.extend(prefixed_paths("mlp", &self.ff));
+        out.extend(prefixed_paths("adaln_modulation_self_attn", &self.norm1));
+        out.extend(prefixed_paths("adaln_modulation_cross_attn", &self.norm2));
+        out.extend(prefixed_paths("adaln_modulation_mlp", &self.norm3));
+        out
+    }
+}
+
+/// The Cosmos DiT adapter host: `blocks.N.*` route into the per-block leaves (the 448 = 28×16 target
+/// surface the official LoRAs address); the DiT globals (`x_embedder.proj.1`, `t_embedder.1.linear_*`,
+/// `final_layer.*`) are routable too, though the shipped Anima LoRAs never target them. Only the
+/// block targets are enumerated for the kohya table (matching Z-Image's convention — globals stay
+/// reachable via the dotted diffusers/peft form, which is all the real files use).
+impl AdaptableHost for CosmosDiT {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["x_embedder", "proj", "1"] => Some(&mut self.patch_embed),
+            ["t_embedder", "1", "linear_1"] => Some(&mut self.time_embed.linear_1),
+            ["t_embedder", "1", "linear_2"] => Some(&mut self.time_embed.linear_2),
+            ["final_layer", "adaln_modulation", rest @ ..] => self.norm_out.adaptable_mut(rest),
+            ["final_layer", "linear"] => Some(&mut self.proj_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("blocks.{i}"), b));
+        }
+        out
     }
 }

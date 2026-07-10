@@ -100,8 +100,26 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>>
     // resolved tier directory dictates the actual precision — and we accept any tier without a
     // load-time `.quantize()` (mirrors SANA, the Group-B packed-detect convert-at-install path;
     // Kolors/sd3 by contrast load-time-quantize, so SANA is the true precedent here).
+    //
+    // Quant + LoRA/LoKr together is NOT supported in this lane (sc-10578): the shared `AdaptableLinear`
+    // *can* run an adapter over a packed base, but the Anima product path does not ship that combination
+    // yet, so a packed tier requested WITH adapters is rejected explicitly rather than silently baked —
+    // rather than being lost when sc-10517 narrowed sc-10521's blanket "reject all quantize" guard.
+    // Quant-only (advisory-accept, below) and LoRA-on-dense (apply_adapters, below) each stay supported.
+    if spec.quantize.is_some() && !spec.adapters.is_empty() {
+        return Err(Error::Msg(format!(
+            "{id}: quant tiers + LoRA/LoKr adapters together are not supported yet (sc-10578) — use a \
+             dense bf16 tier with adapters, or a packed tier without"
+        )));
+    }
     let _ = spec.quantize;
-    let pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
+    let mut pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
+    // Bake any LoRA/LoKr adapters onto the still-mutable model (DiT + bundled conditioner), stacked
+    // and mixed, strictly (an unmatched target errors rather than loading a partial distillation —
+    // sc-10521 / sc-10274). No-op when `spec.adapters` is empty.
+    if !spec.adapters.is_empty() {
+        pipeline.apply_adapters(&spec.adapters)?;
+    }
     Ok(Box::new(Anima {
         descriptor: descriptor_for(variant),
         variant,
