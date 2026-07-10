@@ -101,17 +101,13 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>>
     // load-time `.quantize()` (mirrors SANA, the Group-B packed-detect convert-at-install path;
     // Kolors/sd3 by contrast load-time-quantize, so SANA is the true precedent here).
     //
-    // Quant + LoRA/LoKr together is NOT supported in this lane (sc-10578): the shared `AdaptableLinear`
-    // *can* run an adapter over a packed base, but the Anima product path does not ship that combination
-    // yet, so a packed tier requested WITH adapters is rejected explicitly rather than silently baked —
-    // rather than being lost when sc-10517 narrowed sc-10521's blanket "reject all quantize" guard.
-    // Quant-only (advisory-accept, below) and LoRA-on-dense (apply_adapters, below) each stay supported.
-    if spec.quantize.is_some() && !spec.adapters.is_empty() {
-        return Err(Error::Msg(format!(
-            "{id}: quant tiers + LoRA/LoKr adapters together are not supported yet (sc-10578) — use a \
-             dense bf16 tier with adapters, or a packed tier without"
-        )));
-    }
+    // Quant + LoRA/LoKr together IS supported (sc-10578). No guard is needed here: the DiT's
+    // `AdaptableLinear`s already carry a `LinearBase::Quantized` on a packed tier, and `AdaptableLinear`
+    // evaluates `base(x) + Σ adapter.residual(x)` — i.e. the additive branch `y = xW_packed + scale·(xA)B`
+    // (epic 10043) — leaving the packed codes untouched. A LoKr on a packed base installs as the
+    // structured `Adapter::LokrStructured` (the Kronecker vec-trick), so it never materializes an
+    // `[out,in]` delta; the shared `install_lycoris_groups` picks that form off `is_quantized()`.
+    // A LoHa (no deferred form) on a packed base errors there rather than silently ballooning memory.
     let _ = spec.quantize;
     let mut pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
     // Bake any LoRA/LoKr adapters onto the still-mutable model (DiT + bundled conditioner), stacked
@@ -288,14 +284,20 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_quant_plus_adapter_sc10578() {
-        // Quant + LoRA/LoKr together is unsupported in this lane (sc-10578). The shared
-        // `AdaptableLinear` *can* run an adapter over a packed Q4/Q8 base, so nothing downstream
-        // rejects the pair — the ONLY guard was sc-10521's blanket "reject all quantize", which
-        // sc-10517 removed to allow quant-only tiers. The integration merge must therefore keep a
-        // narrowed guard so a packed tier requested WITH an adapter is rejected at the load gate,
-        // BEFORE any weight is read (the guard runs before `AnimaPipeline::from_source`, so the
-        // nonexistent dir + fake adapter path are never dereferenced — the sc-10578 error fires first).
+    fn load_accepts_quant_plus_adapter_sc10578() {
+        // The inverse of the guard this story removed. A packed tier requested WITH an adapter must no
+        // longer be rejected on CAPABILITY grounds: `AdaptableLinear` runs `base(x) + Σ residual(x)`
+        // over a `LinearBase::Quantized` (the epic-10043 additive branch), and a packed LoKr installs as
+        // the structured Kronecker form. The pair is supported.
+        //
+        // A nonexistent weights dir still errors — but it must now fail on WEIGHTS/IO, not on the pair.
+        // Asserting the absence of the old rejection is what keeps a future "narrow the guard back"
+        // refactor from silently re-breaking q4+LoRA, which is the single most common Anima workflow.
+        //
+        // This test only guards the load GATE. The numeric proof that the residual actually rides on
+        // the packed codes lives in the real-weights `tests/packed_adapters.rs` (`#[ignore]`d, not run
+        // in CI); the CI-covered proof of the install math is in the shared core unit tests,
+        // `mlx-gen/src/adapters/loader.rs::lokr_on_packed_base_installs_structured_and_matches_dense`.
         use mlx_gen::runtime::{AdapterKind, AdapterSpec};
         for variant_load in [load_base, load_aesthetic, load_turbo] {
             let adapter = AdapterSpec::new(
@@ -308,11 +310,11 @@ mod tests {
                 .with_adapters(vec![adapter]);
             let e = variant_load(&spec)
                 .err()
-                .expect("packed tier + adapter must error")
+                .expect("a nonexistent weights dir still errors")
                 .to_string();
             assert!(
-                e.contains("sc-10578"),
-                "packed tier + adapter must be rejected with the sc-10578 guard, got: {e}"
+                !e.contains("sc-10578") && !e.contains("not supported"),
+                "packed tier + adapter must NOT be rejected as unsupported, got: {e}"
             );
         }
     }
