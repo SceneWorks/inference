@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_rs::ops::multiply;
+use mlx_rs::ops::{concatenate_axis, multiply};
 use mlx_rs::{Array, Dtype};
 use serde_json::Value;
 
@@ -27,7 +27,9 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::weights::Weights;
 use mlx_gen::WeightsSource;
 use mlx_gen_anima::conditioner::AnimaTextConditioner;
-use mlx_gen_anima::config::{ConditionerConfig, DitConfig, Qwen3Config, Variant};
+use mlx_gen_anima::config::{
+    ConditionerConfig, DitConfig, Qwen3Config, Variant, QWEN_PAD_TOKEN_ID,
+};
 use mlx_gen_anima::pipeline::AnimaPipeline;
 use mlx_gen_anima::text_encoder::AnimaQwen3;
 use mlx_gen_anima::tokenizer::AnimaTokenizers;
@@ -150,7 +152,13 @@ fn assert_stats_only(got: &Array, g: &Value, label: &str, stat_rtol: f64) {
 /// bound it is not dominated by a single small-magnitude residual whose bf16 rounding differs between
 /// torch-CPU and MLX-Metal (a correct-port artifact of catastrophic cancellation, not a bug). The
 /// aggregate-stats gate (`assert_stats`) plus this relative-L2 together pin structural correctness.
-fn assert_sampled_rel_l2(got: &Array, g: &Value, label: &str, stat_rtol: f64, max_rel_l2: f64) {
+fn assert_sampled_rel_l2(
+    got: &Array,
+    g: &Value,
+    label: &str,
+    stat_rtol: f64,
+    max_rel_l2: f64,
+) -> f64 {
     let flat = assert_stats(got, g, label, stat_rtol);
     let idx = i64s(&g["sample_indices"]);
     let vals: Vec<f64> = g["sample_values"]
@@ -185,6 +193,7 @@ fn assert_sampled_rel_l2(got: &Array, g: &Value, label: &str, stat_rtol: f64, ma
         rel_l2 < max_rel_l2,
         "{label}: sampled rel-L2 {rel_l2:.4e} exceeds {max_rel_l2:.1e} — a real port bug, not bf16 noise"
     );
+    rel_l2
 }
 
 /// Full comparison: the aggregate-stats gate PLUS every committed sample index. `stat_rtol` gates the
@@ -244,28 +253,60 @@ fn stage2_qwen3_last_hidden_state() {
     let split = split_files().expect("Anima snapshot");
     let g = load_golden("qwen3_hidden_golden.json");
     let want_ids = i64s(&g["meta"]["qwen_ids"]);
+    let real = g["meta"]["real_tokens"].as_u64().unwrap() as usize;
+    let pad_k = g["meta"]["padded_tokens"].as_u64().unwrap() as i32;
 
     let te_w = Weights::from_file(split.join("text_encoders/qwen_3_06b_base.safetensors")).unwrap();
     let te = AnimaQwen3::from_weights(&te_w, "model", &Qwen3Config::anima()).unwrap();
     let tk = AnimaTokenizers::load().unwrap();
-    let (ids, mask) = tk
+    let (real_ids, real_mask) = tk
         .encode_qwen(g["meta"]["prompt"].as_str().unwrap())
         .unwrap();
-    // The Rust tokenizer must reproduce the golden's ids (else the whole comparison is moot).
+    // The Rust tokenizer must reproduce the golden's REAL tokens (the [0:real] prefix).
+    let got_real: Vec<i64> = real_ids
+        .as_slice::<i32>()
+        .iter()
+        .map(|&x| x as i64)
+        .collect();
+    assert_eq!(
+        &got_real[..],
+        &want_ids[..real],
+        "stage2: real Qwen ids drifted from the golden"
+    );
+
+    // Explicitly right-pad with `pad_k` Qwen2-pad tokens at mask 0. The golden's mask carries real 0s, so
+    // the mask-multiply below has actual rows to zero — an all-ones batch-1 mask made the trap a no-op and
+    // dropping the multiply then changed nothing (sc-10524 review).
+    let pad_ids = Array::from_slice(&vec![QWEN_PAD_TOKEN_ID; pad_k as usize], &[1, pad_k]);
+    let pad_mask = Array::from_slice(&vec![0i32; pad_k as usize], &[1, pad_k]);
+    let ids = concatenate_axis(&[&real_ids, &pad_ids], 1).unwrap();
+    let mask = concatenate_axis(&[&real_mask, &pad_mask], 1).unwrap();
     let got_ids: Vec<i64> = ids.as_slice::<i32>().iter().map(|&x| x as i64).collect();
     assert_eq!(
         got_ids, want_ids,
-        "stage2: Qwen ids drifted from the golden"
+        "stage2: padded Qwen ids must match the golden"
     );
 
     let hidden = te.forward(&ids, &mask).unwrap(); // [1, S, 1024] bf16
-                                                   // the mask-multiply trap (no-op for an all-ones batch-1 mask, applied for faithfulness).
+                                                   // the mask-multiply trap — NON-TRIVIAL now: it zeros the `pad_k` padded rows.
     let m = mask
         .as_dtype(hidden.dtype())
         .unwrap()
         .expand_dims(2)
         .unwrap();
     let hidden = multiply(&hidden, &m).unwrap();
+    // The padded rows [real:] must be EXACTLY zero after the multiply — drop the multiply and they stay
+    // nonzero (the causal tower still computes them), so the stats/rel-L2 below diverge. This is the
+    // assertion that makes the mask-multiply trap catch a regression.
+    let hf = hidden.as_dtype(Dtype::Float32).unwrap();
+    let pad_abs_max = hf.as_slice::<f32>()[real * 1024..]
+        .iter()
+        .fold(0f32, |m, &v| m.max(v.abs()));
+    println!("[stage2] pad rows [{real}:] abs-max = {pad_abs_max:.2e}");
+    assert!(
+        pad_abs_max < 1e-4,
+        "stage2: mask-multiply must zero the {pad_k} padded rows (got abs-max {pad_abs_max:.2e})"
+    );
     // bf16 tower vs a torch bf16 reference. Gate on (a) the aggregate stats (mean/std/l2 match to <0.3%
     // — the structural-correctness gate; a real port bug moves these by orders of magnitude) and (b) the
     // sampled relative-L2 (~1e-2 — the robust no-quality-regression metric). A per-element bound is the
@@ -500,9 +541,11 @@ fn stage7_e2e_all_variants() {
         let pipeline =
             AnimaPipeline::from_source(&WeightsSource::Dir(split.clone()), variant).unwrap();
 
-        // Identical injected init + deterministic Euler + identical schedule, fp32 both sides.
-        let latent = pipeline
-            .denoise_from_latent(
+        // Identical injected init + deterministic Euler + identical schedule, fp32 both sides. Capture the
+        // latent after 1 and 5 Euler steps so the accumulation-vs-bias question is TESTABLE, not asserted
+        // by prose (sc-10524 review).
+        let (latent, caps) = pipeline
+            .denoise_from_latent_capture(
                 &init,
                 prompt,
                 negative,
@@ -511,24 +554,62 @@ fn stage7_e2e_all_variants() {
                 guidance,
                 "euler",
                 Dtype::Float32,
+                &[1, 5],
             )
             .unwrap();
+
+        // Intermediate-step parity — makes the accumulation-vs-bias question TESTABLE, not asserted by
+        // prose (sc-10524 review). Two effects could inflate the final residual:
+        //   (1) a FIXED bias — the MLX Qwen3+conditioner encode is bf16-locked (text_encoder.rs forces
+        //       Bfloat16; the `dtype` arg reaches only `dit.forward`) while this reference runs fp32, so a
+        //       bf16-conditioning offset enters v at every step. A large bias shows up as a step-1 rel-L2
+        //       that is already a big fraction of the final; and
+        //   (2) diffuse float ACCUMULATION over the 30 (10 for turbo) Euler steps, amplified in the stiff
+        //       low-σ endgame, which grows super-linearly with step count.
+        // MEASURED (this checkpoint): step-1 rel-L2 ~2e-5, step-5 ~2e-4 (turbo 3e-3), final ~3–8e-2 — the
+        // early deltas are 3–4 orders of magnitude BELOW the final and grow super-linearly, so the residual
+        // is accumulation-dominated (endgame amplification); the bf16-conditioning offset is present but a
+        // MINOR per-step contributor, not a dominant bias (isolating it exactly needs an fp32-TE variant,
+        // which requires making the encode dtype configurable — a production change, tracked separately).
+        // Same bounds as the final; if a real bias ever emerged, step-1 would blow past 2e-2 here first.
+        let steps_g = v["step_latents"].as_object().expect("step_latents object");
+        assert_eq!(
+            caps.len(),
+            steps_g.len(),
+            "stage7_{id}: captured step count"
+        );
+        let mut step_rel: Vec<(usize, f64)> = Vec::new();
+        for (k, arr) in &caps {
+            let g_step = &steps_g[&k.to_string()];
+            let r =
+                assert_sampled_rel_l2(arr, g_step, &format!("stage7_{id}_step{k}"), 2e-2, 1.2e-1);
+            step_rel.push((*k, r));
+        }
+
         // Final-latent parity (pre-VAE). The distribution/trajectory match is the parity signal: with an
         // identical injected init + deterministic Euler + identical schedule, the aggregate stats
-        // (mean/std/l2) match to <0.2% (tight gate). The element-wise relative-L2 carries ~8% of diffuse
-        // float drift accumulated over 30 Euler steps — the per-step DiT parity is 1e-2 (stage 4), so this
-        // is float accumulation, not a structural bug; the `max_rel_l2` is a generous structural-bug
-        // tripwire (a wrong sign / CFG / RoPE diverges by >>0.5). The IMAGE below is the real
-        // visual-indistinguishability gate.
+        // (mean/std/l2) match to <0.2% (tight gate). The element-wise relative-L2 carries float
+        // accumulation (amplified in the low-σ endgame; see the step-1/step-5 deltas above) plus a minor
+        // bf16-conditioning offset — the per-step DiT parity is 1e-2 (stage 4), so this is accumulation,
+        // not a structural bug; the `max_rel_l2` is a generous structural-bug tripwire (a wrong sign / CFG
+        // / RoPE diverges by >>0.5). The IMAGE below is the real visual-indistinguishability gate.
         // Measured (fp32, this checkpoint): aggregate mean/std/l2 within <0.2%; sampled rel-L2 3.4e-2
         // (turbo) .. 8.0e-2 (base/aesthetic). Bounds: aggregate 2e-2 (tight); rel-L2 1.2e-1 (structural
         // tripwire — a wrong sign/CFG/RoPE blows past this AND the image gate by orders of magnitude).
-        assert_sampled_rel_l2(
+        let final_rel = assert_sampled_rel_l2(
             &latent,
             &v["final_latent"],
             &format!("stage7_{id}_latent"),
             2e-2,
             1.2e-1,
+        );
+        println!(
+            "[stage7_{id}] rel-L2 by step {:?} -> final {final_rel:.4e} \
+             (early deltas <<final and super-linear => accumulation/endgame-amplification, not a fixed bias)",
+            step_rel
+                .iter()
+                .map(|(k, r)| format!("{k}:{r:.4e}"))
+                .collect::<Vec<_>>()
         );
 
         // Decoded-image parity (the "visually indistinguishable" check): MLX QwenVae.decode applies the

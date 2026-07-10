@@ -205,6 +205,75 @@ impl AnimaPipeline {
             init, prompt, negative, variant, steps, guidance, sampler, 0, dtype, &cancel, &mut prog,
         )
     }
+
+    /// Test hook (sc-10524 stage-7 golden, intermediate-latent capture): run the same deterministic
+    /// denoise as [`denoise_from_latent`], additionally snapshotting the latent AFTER each step count in
+    /// `capture_after` (`x_k` = the state after `k` Euler steps). Returns `(final_latent, [(k, x_k)])`.
+    ///
+    /// `x_k` is exactly the input the `(k+1)`-th DiT call sees (the sampler calls `predict(x_k, σ_k)` at
+    /// step `k`), so it matches the Python generator's `caps[k]` bit-for-bit in definition. Comparing the
+    /// per-step deltas lets the parity test distinguish a systematic BIAS (the MLX bf16-conditioning lock —
+    /// present from step 1) from diffuse float ACCUMULATION (grows with step count).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_from_latent_capture(
+        &self,
+        init: &Array,
+        prompt: &str,
+        negative: &str,
+        variant: Variant,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        dtype: Dtype,
+        capture_after: &[usize],
+    ) -> Result<(Array, Vec<(usize, Array)>)> {
+        let cancel = CancelFlag::default();
+        let mut prog = |_p: Progress| {};
+        let cond = self.encode_prompt(prompt)?;
+        let uncond = if variant.uses_cfg() {
+            Some(self.encode_prompt(negative)?)
+        } else {
+            None
+        };
+        let sigmas = anima_sigmas(steps);
+        let guidance = Array::from_slice(&[guidance], &[1]);
+        let dit = &self.components.dit;
+        let want: std::collections::HashSet<usize> = capture_after.iter().copied().collect();
+        let call = std::cell::Cell::new(0usize);
+        let captures: std::cell::RefCell<Vec<(usize, Array)>> = std::cell::RefCell::new(Vec::new());
+        let predict = |x: &Array, sigma: f32| -> Result<Array> {
+            // The sampler calls predict(x_k, σ_k) at step k, so `x` here is the state after k steps.
+            let k = call.get();
+            if want.contains(&k) {
+                let snap = x.as_dtype(Dtype::Float32)?;
+                mlx_rs::transforms::eval([&snap])?;
+                captures.borrow_mut().push((k, snap));
+            }
+            call.set(k + 1);
+            let s = Array::from_slice(&[sigma], &[1]);
+            let v_cond = dit.forward(x, &s, &cond, dtype)?;
+            let v = match &uncond {
+                Some(u) => {
+                    let v_u = dit.forward(x, &s, u, dtype)?;
+                    add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
+                }
+                None => v_cond,
+            };
+            Ok(v.as_dtype(Dtype::Float32)?)
+        };
+        let final_latent = run_flow_sampler(
+            Some(sampler),
+            TimestepConvention::Sigma,
+            &sigmas,
+            init.clone(),
+            0,
+            &cancel,
+            &mut prog,
+            predict,
+        )?;
+        Ok((final_latent, captures.into_inner()))
+    }
 }
 
 #[cfg(test)]

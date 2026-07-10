@@ -163,6 +163,7 @@ FIXTURE_PROMPTS = [
 ]
 MAIN_PROMPT = FIXTURE_PROMPTS[0]
 MAX_SEQ = 512
+QWEN_PAD_TOKEN_ID = 151643  # Qwen2 <|endoftext|> pad id (config::QWEN_PAD_TOKEN_ID)
 
 
 def stage1_tokenizers() -> bool:
@@ -270,18 +271,36 @@ def stage2_qwen3(torch) -> bool:
 
     te = AutoModel.from_pretrained(snap / "text_encoder", dtype=torch.bfloat16).eval()
     ids, mask = _qwen_ids_for(MAIN_PROMPT, snap, torch)
+    real = int(ids.shape[1])
+    # EXPLICITLY right-pad the batch-1 input with K Qwen2-pad tokens (id 151643) at attention-mask 0, so
+    # the mask-multiply trap has real padded rows to zero. The all-ones batch-1 mask made it a no-op —
+    # dropping the multiply then changed nothing (sc-10524 review). With K padded rows, dropping the
+    # multiply leaves them nonzero (the causal tower still computes them) → the summary diverges.
+    pad_k = 6
+    pad_id = QWEN_PAD_TOKEN_ID
+    ids = torch.cat([ids, ids.new_full((ids.shape[0], pad_k), pad_id)], dim=1)
+    mask = torch.cat([mask, mask.new_zeros((mask.shape[0], pad_k))], dim=1)
     with torch.no_grad():
         out = te(input_ids=ids, attention_mask=mask)
         hidden = out.last_hidden_state
-        hidden = hidden * mask.to(hidden.dtype).unsqueeze(-1)  # the mask-multiply trap
+        hidden = hidden * mask.to(hidden.dtype).unsqueeze(-1)  # the mask-multiply trap (now non-trivial)
     arr = hidden.to(torch.float32).numpy()
+    pad_abs_max = float(np.abs(arr[:, real:, :]).max())  # must be exactly 0 after the multiply
     doc = {
         "meta": _meta(
             "Qwen3-0.6B (text_encoder/) last_hidden_state AFTER the attention-mask multiply, bf16 tower. "
-            "Input = Qwen2 ids for the main fixture prompt.",
-            {"prompt": MAIN_PROMPT, "qwen_ids": ids[0].tolist(), "qwen_mask": mask[0].tolist()},
+            f"Input = Qwen2 ids for the main fixture prompt + {pad_k} right-pad tokens (id {pad_id}) at "
+            "mask 0, so the mask-multiply zeros real padded rows (not a no-op).",
+            {
+                "prompt": MAIN_PROMPT,
+                "qwen_ids": ids[0].tolist(),
+                "qwen_mask": mask[0].tolist(),
+                "real_tokens": real,
+                "padded_tokens": pad_k,
+            },
         ),
         "last_hidden_state": summarize(arr),
+        "pad_abs_max": pad_abs_max,
     }
     write("qwen3_hidden_golden.json", doc)
     return True
@@ -367,8 +386,10 @@ def stage4_dit(torch) -> bool:
     # NTK 3D RoPE) from bf16 quantization; also sidesteps diffusers' keep_in_fp32_modules cast guard.
     dit = CosmosTransformer3DModel.from_pretrained(snap / "transformer").float().eval()
 
-    # deterministic LCG inputs (bit-reproducible in the Rust test).
-    lat_shape = [1, 16, 1, 8, 8]
+    # deterministic LCG inputs (bit-reproducible in the Rust test). The latent is NON-SQUARE (h=8, w=12
+    # ⇒ post-patch grid 4×6) so an h/w RoPE-axis transposition is DETECTABLE — a square fixture hides it
+    # (sc-10524 review). Regenerate if you change these dims; the Rust test reads `latent_shape` from meta.
+    lat_shape = [1, 16, 1, 8, 12]
     enc_shape = [1, 8, 1024]
     latent = torch.tensor(lcg_fill(int(np.prod(lat_shape)), seed=1).reshape(lat_shape))  # fp32
     encoder = torch.tensor(lcg_fill(int(np.prod(enc_shape)), seed=2).reshape(enc_shape))  # fp32
@@ -394,9 +415,11 @@ def stage4_dit(torch) -> bool:
 
     doc = {
         "meta": _meta(
-            "CosmosTransformer3DModel(transformer/) forward, bf16. Deterministic LCG inputs: "
-            "latent [1,16,1,8,8] seed=1, encoder [1,8,1024] seed=2, sigma=0.7, padding_mask=zeros. "
-            "block0 = hidden after transformer_blocks[0] [1,16,2048]; full = final velocity [1,16,1,8,8]. "
+            "CosmosTransformer3DModel(transformer/) forward, fp32 (the model is cast .float() below — "
+            "isolates port math from bf16 quantization). Deterministic LCG inputs: "
+            "latent [1,16,1,8,12] seed=1 (NON-SQUARE ⇒ post-patch 4×6, so an h/w RoPE swap is detectable), "
+            "encoder [1,8,1024] seed=2, sigma=0.7, padding_mask=zeros. "
+            "block0 = hidden after transformer_blocks[0] [1,24,2048]; full = final velocity [1,16,1,8,12]. "
             "Exercises adaLN-LoRA modulation + NTK-scaled 3D RoPE.",
             {
                 "lcg": {"latent_seed": 1, "encoder_seed": 2, "sigma": 0.7},

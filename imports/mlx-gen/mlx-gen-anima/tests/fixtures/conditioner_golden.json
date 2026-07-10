@@ -7,7 +7,7 @@
       "diffusers": "0.39.0",
       "transformers": "5.13.0",
       "numpy": "2.5.1",
-      "python": "3.12.11"
+      "python": "3.12.13"
     },
     "diffusers_repo": "circlestone-labs/Anima-Base-v1.0-Diffusers",
     "single_file_repo": "circlestone-labs/Anima",
