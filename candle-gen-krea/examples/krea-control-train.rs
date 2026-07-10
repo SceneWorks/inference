@@ -443,11 +443,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clamp = (a.residual_clamp > 0.0).then_some(a.residual_clamp);
     branch.set_residual_clamp(clamp);
     eprintln!("residual clamp tau: {clamp:?}");
-    let branch = branch; // immutable from here
-                         // The trainable target, optimizer groups, accumulation, clip, warmup, checkpointing, and
-                         // telemetry now live in the reusable `ControlTrainer` (sc-8462) — this example is a thin CLI over
-                         // it. The numerics are unchanged from the spike; the trainer streams `TrainEvent`s we render to
-                         // stdout + a JSONL log (the same lines the spike printed).
+
+    // The trainable target, optimizer groups, accumulation, clip, warmup, checkpointing, and
+    // telemetry now live in the reusable `ControlTrainer` (sc-8462) — this example is a thin CLI over
+    // it. The numerics are unchanged from the spike; the trainer streams `TrainEvent`s we render to
+    // stdout + a JSONL log (the same lines the spike printed).
     let cfg_train = ControlTrainConfig {
         lr: a.lr,
         proj_lr_mult: a.proj_lr_mult,

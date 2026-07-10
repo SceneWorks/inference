@@ -168,6 +168,10 @@ pub enum TrainEvent {
 /// Interval (in updates) between fixed-probe telemetry emissions during `run`.
 const TELEMETRY_EVERY: u32 = 50;
 
+/// Accepted `timestep_type` values (mirrors `sample_unit_timestep`'s recognized set — anything else
+/// it silently treats as sigmoid, so the trainer rejects unknown values instead).
+const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "uniform", "linear", "weighted"];
+
 /// Drives control-branch training over a fixed set of pre-encoded [`ControlSample`]s against a frozen
 /// [`KreaTrainDit`] base. Construct with [`ControlTrainer::new`], then either [`run`](Self::run) to
 /// completion (streaming [`TrainEvent`]s) or single-step with [`step`](Self::step).
@@ -210,6 +214,15 @@ impl ControlTrainer {
                 "control trainer: batch must be >= 1".into(),
             ));
         }
+        // Reject an unsupported timestep sampler up front rather than let `sample_unit_timestep`
+        // silently route it to its sigmoid fallback (repo policy: typed reject, never silent
+        // fallback — the operator would otherwise train on a schedule they did not ask for).
+        if !TIMESTEP_TYPES.contains(&cfg.timestep_type.as_str()) {
+            return Err(CandleError::Msg(format!(
+                "control trainer: unsupported timestep_type {:?} (expected one of {:?})",
+                cfg.timestep_type, TIMESTEP_TYPES
+            )));
+        }
         std::fs::create_dir_all(&out_dir)
             .map_err(|e| CandleError::Msg(format!("create out dir {}: {e}", out_dir.display())))?;
         let vars = branch.vars();
@@ -246,7 +259,8 @@ impl ControlTrainer {
 
     /// Run one optimizer update: `batch` accumulated micro-steps, averaged + clipped gradients, warmup
     /// LR, both optimizer groups stepped. Advances the internal step counter and returns its
-    /// [`StepReport`].
+    /// [`StepReport`]. A caller stepping manually should inspect [`StepReport::loss`] for a non-finite
+    /// value (divergence) — [`run`](Self::run) does this and aborts; a bare `step` loop must too.
     pub fn step(&mut self) -> Result<StepReport> {
         let t0 = Instant::now();
         let mut acc = None;
@@ -285,7 +299,11 @@ impl ControlTrainer {
             accumulate_grads(&mut acc, grads, &self.vars)?;
         }
         let mut grads = acc.expect("batch >= 1");
-        scale_grads(&mut grads, &self.vars, 1.0 / self.cfg.batch as f64)?;
+        // Average the accumulated micro-step gradients; skip at batch == 1 (the common config) — the
+        // ×1.0 pass would still reallocate every one of the ~3B-param branch gradient tensors.
+        if self.cfg.batch > 1 {
+            scale_grads(&mut grads, &self.vars, 1.0 / self.cfg.batch as f64)?;
+        }
         let grad_norm = clip_grad_norm(&mut grads, &self.vars, 1.0)?;
         // Linear LR warmup from 0 over the first `warmup_steps` updates.
         let warm = if self.cfg.warmup_steps > 0 {
@@ -352,23 +370,24 @@ impl ControlTrainer {
         Ok(path)
     }
 
-    /// Train for `cfg.max_steps` further updates, streaming [`TrainEvent`]s to `on_event`
-    /// (step reports every update, fixed-probe telemetry every 50, and each checkpoint). Errors on a
-    /// non-finite loss. Returns the final checkpoint path.
-    pub fn run(&mut self, mut on_event: impl FnMut(&TrainEvent)) -> Result<PathBuf> {
+    /// Train for `cfg.max_steps` further updates, streaming [`TrainEvent`]s to `on_event` (a step
+    /// report every update, fixed-probe telemetry every 50, and each checkpoint — the last carrying its
+    /// path). Aborts with an error on a non-finite loss, *after* emitting that step's report so the
+    /// divergence is visible in the caller's log. A zero `max_steps` is a clean no-op.
+    pub fn run(&mut self, mut on_event: impl FnMut(&TrainEvent)) -> Result<()> {
         let start = self.step;
         let target = self.step + self.cfg.max_steps;
-        let mut last_ckpt = None;
         while self.step < target {
             let at_start = self.step == start;
             let rep = self.step()?;
-            if !rep.loss.is_finite() {
+            let diverged = !rep.loss.is_finite();
+            let step_no = rep.step;
+            on_event(&TrainEvent::Step(rep));
+            if diverged {
                 return Err(CandleError::Msg(format!(
-                    "non-finite loss at step {}",
-                    rep.step
+                    "non-finite loss at step {step_no}"
                 )));
             }
-            on_event(&TrainEvent::Step(rep));
 
             if self.step.is_multiple_of(TELEMETRY_EVERY) || at_start {
                 let (pre, post) = self.probe()?;
@@ -382,14 +401,13 @@ impl ControlTrainer {
             let done = self.step == target;
             if (self.cfg.save_every > 0 && self.step.is_multiple_of(self.cfg.save_every)) || done {
                 let path = self.save_checkpoint(self.step)?;
-                last_ckpt = Some(path.clone());
                 on_event(&TrainEvent::Checkpoint {
                     step: self.step,
                     path,
                 });
             }
         }
-        last_ckpt.ok_or_else(|| CandleError::Msg("control trainer: no checkpoint written".into()))
+        Ok(())
     }
 }
 
@@ -451,13 +469,22 @@ mod tests {
             .0
         };
         let before = eval(&tr);
-        let ckpt = tr.run(|_ev| {}).unwrap();
+        let mut ckpt = None;
+        tr.run(|ev| {
+            if let TrainEvent::Checkpoint { path, .. } = ev {
+                ckpt = Some(path.clone());
+            }
+        })
+        .unwrap();
         let after = eval(&tr);
         assert!(
             after < before,
             "trainer should lower the fixed-probe loss: {before} -> {after}"
         );
-        assert!(ckpt.exists(), "run must leave a final checkpoint");
+        assert!(
+            ckpt.is_some_and(|p| p.exists()),
+            "run must emit a final checkpoint event whose file exists"
+        );
         let _ = std::fs::remove_file(path);
     }
 }
