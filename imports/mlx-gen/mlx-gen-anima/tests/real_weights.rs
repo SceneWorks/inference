@@ -18,7 +18,7 @@ use mlx_gen_anima::conditioner::AnimaTextConditioner;
 use mlx_gen_anima::config::{ConditionerConfig, DitConfig, Variant};
 use mlx_gen_anima::convert::quantize_anima_dit;
 use mlx_gen_anima::loader::split_anima_keys;
-use mlx_gen_anima::model::{load_base, load_turbo};
+use mlx_gen_anima::model::{load_aesthetic, load_base, load_turbo};
 use mlx_gen_anima::pipeline::{AnimaPipeline, GenOptions};
 use mlx_gen_anima::transformer::CosmosDiT;
 
@@ -313,26 +313,33 @@ fn assemble_tier_dir(split: &std::path::Path, variant: Variant, bits: i32) -> Pa
 
 #[test]
 #[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (packs + real 2B DiT denoise)"]
-fn generate_quant_tiers_base_q8_q4_and_turbo_q4() {
+fn generate_quant_tiers_all_variants_q8_q4() {
     let split = split_files().expect("Anima snapshot");
     let out = out_dir();
     std::fs::create_dir_all(&out).unwrap();
     let prompt =
         "an anime girl with long silver hair and blue eyes, detailed illustration, masterpiece";
 
-    // (variant, quant, bits). Base at BOTH quantized tiers; turbo (which roots the DiT at
-    // `model.diffusion_model`, not `net`) at q4 to prove the prefix detection survives quantization.
+    // The FULL {variant} × {q8,q4} tier matrix (epic acceptance: all 3 variants generate on MLX at
+    // bf16/q8/q4; bf16×3 is covered by the earlier per-variant real-weights tests). Base roots the
+    // DiT at `net`; aesthetic + turbo root at `model.diffusion_model`. Pack + packed-detect are
+    // prefix-agnostic, so exercising both roots at BOTH bit widths also closes the last uncovered
+    // `{root} × {bits}` corner — `model.diffusion_model` × q8 (aesthetic-q8 / turbo-q8).
     for (variant, quant, bits) in [
         (Variant::Base, Quant::Q8, 8),
         (Variant::Base, Quant::Q4, 4),
+        (Variant::Aesthetic, Quant::Q8, 8),
+        (Variant::Aesthetic, Quant::Q4, 4),
+        (Variant::Turbo, Quant::Q8, 8),
         (Variant::Turbo, Quant::Q4, 4),
     ] {
         let tier = assemble_tier_dir(&split, variant, bits);
-        let spec = LoadSpec::new(WeightsSource::Dir(tier)).with_quant(quant);
+        let spec = LoadSpec::new(WeightsSource::Dir(tier.clone())).with_quant(quant);
         // Drive the real generator entry point (proves `load` accepts the advertised tier).
         let generator = match variant {
+            Variant::Base => load_base(&spec),
+            Variant::Aesthetic => load_aesthetic(&spec),
             Variant::Turbo => load_turbo(&spec),
-            _ => load_base(&spec),
         }
         .expect("load packed tier");
         let req = GenerationRequest {
@@ -351,6 +358,9 @@ fn generate_quant_tiers_base_q8_q4_and_turbo_q4() {
         save_png(&img, &path);
         println!("wrote {}", path.display());
         assert_coherent(&img, &format!("{}_q{bits}", variant.id()));
+        // Disk is tight (each packed q8 DiT is ~2 GiB): drop the tier dir the moment its image lands.
+        drop(generator);
+        let _ = std::fs::remove_dir_all(&tier);
         mlx_rs::memory::clear_cache();
     }
 }
