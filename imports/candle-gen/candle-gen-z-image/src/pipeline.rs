@@ -216,6 +216,10 @@ pub(crate) struct Pipeline {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
     /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
+    /// External ComfyUI component sources (epic 10451 Phase 2, sc-10668). `Some` ⇒ `load_components`
+    /// builds the DiT/TE/VAE from the in-place ComfyUI files (DiT + VAE key-remapped in memory)
+    /// instead of a diffusers snapshot dir. Dense-only: no packed tier, no adapters, no PiD.
+    comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiSources>>,
 }
 
 /// The loaded Z-Image components, `Arc`-shared so the generator can cache them across `generate`
@@ -250,6 +254,27 @@ impl Pipeline {
             dtype,
             adapters: adapters.to_vec(),
             pid_spec,
+            comfyui: None,
+        }
+    }
+
+    /// Build the (light) pipeline handle for an in-place **ComfyUI** Z-Image load (sc-10668): the DiT
+    /// and VAE are key-remapped from the ComfyUI single-file components in memory and the Qwen3 encoder
+    /// loads verbatim, all at first [`load_components`](Self::load_components). `root` is set to the
+    /// sources' `tokenizer_dir` so [`common::build_tokenizer`] finds `tokenizer/tokenizer.json`. Does no
+    /// weight I/O here. Dense-only (no packed tier / adapters / PiD).
+    pub(crate) fn load_comfyui(
+        sources: std::sync::Arc<crate::comfyui::ComfyuiSources>,
+        device: &Device,
+        dtype: DType,
+    ) -> Self {
+        Self {
+            root: sources.tokenizer_dir.clone(),
+            device: device.clone(),
+            dtype,
+            adapters: Vec::new(),
+            pid_spec: None,
+            comfyui: Some(sources),
         }
     }
 
@@ -258,6 +283,11 @@ impl Pipeline {
     /// attention dispatch (CUDA flash-attn / Metal SDPA); on a build without those features the
     /// reference falls back to the backend-agnostic manual path, so this is inert there.
     pub(crate) fn load_components(&self, use_accelerated_attn: bool) -> Result<Components> {
+        // sc-10668: an in-place ComfyUI load remaps the DiT/VAE and loads the Qwen3 TE verbatim from
+        // the three ComfyUI single-files — no snapshot dir, no packed detection, no adapters/PiD.
+        if let Some(sources) = self.comfyui.clone() {
+            return self.load_comfyui_components(&sources, use_accelerated_attn);
+        }
         // A pre-quantized MLX-packed tier (`SceneWorks/z-image-turbo-mlx` q4/q8) carries a
         // `quantization` block in each component's `config.json`; on detection the TE + DiT + VAE load
         // **straight from the packed parts** (sc-9408, no dense bf16 staging). A dense snapshot
@@ -332,6 +362,54 @@ impl Pipeline {
             vae: Arc::new(vae),
             tokenizer: Arc::new(tokenizer),
             pid,
+        })
+    }
+
+    /// Load the three heavy components from an in-place ComfyUI install (sc-10668): the DiT and VAE are
+    /// key-remapped in memory ([`crate::comfyui`]) then built via `VarBuilder::from_tensors` (the same
+    /// in-memory path [`transformer_vb_with_adapters`](Self::transformer_vb_with_adapters) uses for LoRA
+    /// merge); the Qwen3 text encoder loads verbatim from its ComfyUI file (standard HF layout); the
+    /// tokenizer comes from our shipped snapshot. Dense bf16 only — the fp8/scaled-fp8/GGUF quant slices
+    /// (sc-10670/10671/10672/10680/10681) add a dequant step ahead of the same key remaps.
+    fn load_comfyui_components(
+        &self,
+        sources: &crate::comfyui::ComfyuiSources,
+        use_accelerated_attn: bool,
+    ) -> Result<Components> {
+        use candle_gen::candle_core::safetensors;
+
+        // DiT: ComfyUI-native keys → diffusers/candle keys (fused-qkv split + renames), then build.
+        let dit_map = safetensors::load(&sources.transformer_file, &Device::Cpu)?;
+        let dit_map = crate::comfyui::remap_dit_comfyui_to_diffusers(dit_map)?;
+        let mut dit_cfg = DitConfig::z_image_turbo();
+        dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
+        let dit_vb = VarBuilder::from_tensors(dit_map, self.dtype, &self.device);
+        let transformer = DiT::Dense(Box::new(ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?));
+
+        // Text encoder: standard HF Qwen3 — loaded verbatim (only a bf16 cast via mmap).
+        let te_vb = candle_gen::mmap_var_builder(
+            std::slice::from_ref(&sources.text_encoder_file),
+            self.dtype,
+            &self.device,
+        )?;
+        let text_encoder = TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+            &TextEncoderConfig::z_image(),
+            te_vb,
+        )?));
+
+        // VAE: BFL/ldm keys → diffusers keys (incl. the up-block reversal + 1×1-conv→Linear squeeze).
+        let vae_map = safetensors::load(&sources.vae_file, &Device::Cpu)?;
+        let vae_map = crate::comfyui::remap_vae_ldm_to_diffusers(vae_map)?;
+        let vae_vb = VarBuilder::from_tensors(vae_map, self.dtype, &self.device);
+        let vae = AutoEncoderKL::new(&VaeConfig::z_image(), vae_vb)?;
+
+        let tokenizer = common::build_tokenizer(&self.root, "z-image comfyui")?;
+        Ok(Components {
+            text_encoder: Arc::new(text_encoder),
+            transformer: Arc::new(transformer),
+            vae: Arc::new(vae),
+            tokenizer: Arc::new(tokenizer),
+            pid: None,
         })
     }
 
