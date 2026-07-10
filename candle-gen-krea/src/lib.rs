@@ -44,12 +44,29 @@ pub mod vae;
 mod train_dit;
 mod training;
 
+// The pose-ControlNet control branch (sc-8460 spike / sc-8462, epic 8459): a trainable N-block side
+// branch over the frozen DiT with zero-init per-block residual injection. Public so the spike's
+// trainer/inference example binaries can drive it; the worker route is a later story.
+pub mod control;
+
+// The callable control-branch trainer (sc-8462): the spike CLI's training loop lifted into a
+// reusable `ControlTrainer` so the ControlNet Training Studio worker driver (epic 10159 B2) can
+// drive a run and stream its progress. Kept gen-core-neutral for the later MLX training lane.
+pub mod control_train;
+
+// Shared test-only tiny-DiT fixture (training + control tests).
+#[cfg(test)]
+mod testfix;
+
 pub use adapters::{merge_adapters, merge_into_weights, MergeReport};
 pub use config::Krea2Config;
 pub use pipeline::Components;
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder};
 pub use tokenizer::KreaTokenizer;
+// The composable trainable DiT, exposed for the sc-8460 control-branch spike binaries (the branch
+// injects into its block stack; its forward is the spike's inference surface).
+pub use train_dit::KreaTrainDit;
 pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae};
 
