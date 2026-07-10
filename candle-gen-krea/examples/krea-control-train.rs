@@ -30,10 +30,12 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::train::flow_match::{self, component_vb, sample_noise, sample_unit_timestep};
-use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
-use candle_gen_krea::control::{control_loss_grads, probe_forward, ControlBranch};
+use candle_gen::candle_core::DType;
+use candle_gen::train::flow_match::component_vb;
+use candle_gen_krea::control::ControlBranch;
+use candle_gen_krea::control_train::{
+    ControlSample, ControlTrainConfig, ControlTrainer, TrainEvent,
+};
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::{Krea2Config, KreaTeConfig, KreaTextEncoder, KreaTokenizer, KreaTrainDit};
 use candle_gen_qwen_image::vae::QwenVaeEncoder;
@@ -356,17 +358,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // (x0 latent f32, control latent f32, caption stack bf16), all on CPU.
-    let mut cache: Vec<(Tensor, Tensor, Tensor)> = Vec::with_capacity(rows.len());
+    let mut cache: Vec<ControlSample> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let path = &cache_paths[i];
-        let entry = if path.exists() {
-            let m = candle_gen::candle_core::safetensors::load(path, &cpu)?;
-            let get = |k: &str| {
-                m.get(k)
-                    .cloned()
-                    .ok_or_else(|| format!("encode cache {} missing {k}", path.display()))
-            };
-            (get("x0")?, get("ctrl")?, get("cap")?)
+        let sample = if path.exists() {
+            ControlSample::load(path)?
         } else {
             let (vae_enc, tokenizer, te, _) = encoders
                 .as_ref()
@@ -391,14 +387,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .squeeze(0)?
                 .to_dtype(DType::BF16)?
                 .to_device(&cpu)?;
-            let mut m = std::collections::HashMap::new();
-            m.insert("x0".to_string(), x0.clone());
-            m.insert("ctrl".to_string(), ctrl.clone());
-            m.insert("cap".to_string(), cap.clone());
-            candle_gen::candle_core::safetensors::save(&m, path)?;
-            (x0, ctrl, cap)
+            let sample = ControlSample { x0, ctrl, cap };
+            sample.save(path)?;
+            sample
         };
-        cache.push(entry);
+        cache.push(sample);
         if (i + 1) % 100 == 0 || i + 1 == rows.len() {
             eprintln!("cached {}/{}", i + 1, rows.len());
         }
@@ -451,21 +444,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     branch.set_residual_clamp(clamp);
     eprintln!("residual clamp tau: {clamp:?}");
     let branch = branch; // immutable from here
-    let vars = branch.vars();
-    // Two optimizer groups (run-3 fix): the branch-block bodies at the full lr with no decay, and
-    // the injection projections at a reduced lr WITH decoupled weight decay — magnitude control on
-    // the injection gain must be structural (AdamW's normalized steps otherwise regrow a zero-init
-    // projection to unit gain regardless of lr). Both step from the same clipped GradStore; each
-    // optimizer only updates its own vars.
-    let body_vars = branch.body_vars();
-    let proj_vars = branch.proj_vars();
-    let mut opt_body = TrainOptimizer::from_config("adamw", body_vars, a.lr, 0.0)?;
-    let mut opt_proj = TrainOptimizer::from_config(
-        "adamw",
-        proj_vars,
-        a.lr * a.proj_lr_mult,
-        a.proj_weight_decay,
-    )?;
+                         // The trainable target, optimizer groups, accumulation, clip, warmup, checkpointing, and
+                         // telemetry now live in the reusable `ControlTrainer` (sc-8462) — this example is a thin CLI over
+                         // it. The numerics are unchanged from the spike; the trainer streams `TrainEvent`s we render to
+                         // stdout + a JSONL log (the same lines the spike printed).
+    let cfg_train = ControlTrainConfig {
+        lr: a.lr,
+        proj_lr_mult: a.proj_lr_mult,
+        proj_weight_decay: a.proj_weight_decay,
+        batch: a.batch,
+        max_steps: a.steps,
+        warmup_steps: a.warmup_steps,
+        timestep_type: a.timestep_type.clone(),
+        seed: a.seed,
+        grad_checkpoint: a.checkpoint,
+        mae: false,
+        compute_dtype: DType::BF16,
+        save_every: a.save_every,
+        resolution: edge,
+    };
     eprintln!(
         "optimizer groups: body lr {} | proj lr {} wd {}",
         a.lr,
@@ -478,126 +475,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .create(true)
         .append(true)
         .open(&log_path)?;
+    let total = start_step + a.steps;
 
-    let save = |branch: &ControlBranch, step: u32| -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let path = a.out.join(format!("control_step{step}.safetensors"));
-        branch.save(&path)?;
-        std::fs::write(
-            path.with_extension("json"),
-            serde_json::json!({
-                "step": step,
-                "n_blocks": branch.num_blocks(),
-                "baseModel": "krea_2_turbo",
-                "family": "krea_2",
-                "kind": "pose_control_branch",
-                "resolution": edge,
-            })
-            .to_string(),
-        )?;
-        Ok(path)
-    };
-
-    // ── train loop: micro-steps over the batch (grad accumulation — memory-flat in batch size),
-    //    averaged grads, clip 1.0, linear LR warmup, AdamW ──
-    for step in start_step..(start_step + a.steps) {
-        let t0 = Instant::now();
-        let mut acc = None;
-        let mut loss_sum = 0f32;
-        for j in 0..a.batch {
-            let micro = step * a.batch + j;
-            // The cache is CPU-resident (dataset-size-independent VRAM); copy this sample's tensors
-            // to the device for the micro-step only — they drop at the end of the iteration.
-            let (x0_c, ctrl_c, cap_c) = &cache[(micro as usize) % cache.len()];
-            let x0 = x0_c.to_device(&device)?;
-            let ctrl = ctrl_c.to_device(&device)?;
-            let cap = cap_c.to_device(&device)?;
-            let sigma = sample_unit_timestep(
-                &a.timestep_type,
-                "none",
-                flow_match::timestep_seed(a.seed, micro),
-            );
-            let noise = sample_noise(x0.dims(), flow_match::noise_seed(a.seed, micro), &device)?;
-            let (loss, grads) = control_loss_grads(
-                &dit,
-                &branch,
-                &x0,
-                &ctrl,
-                &cap,
-                sigma,
-                &noise,
-                false,
-                DType::BF16,
-                a.checkpoint,
-            )?;
-            loss_sum += loss;
-            accumulate_grads(&mut acc, grads, &vars)?;
-        }
-        let mut grads = acc.expect("batch >= 1");
-        scale_grads(&mut grads, &vars, 1.0 / a.batch as f64)?;
-        let gnorm = clip_grad_norm(&mut grads, &vars, 1.0)?;
-        // Linear LR warmup from 0 over the first `warmup_steps` optimizer updates.
-        let warm = if a.warmup_steps > 0 {
-            ((step + 1) as f32 / a.warmup_steps as f32).min(1.0)
-        } else {
-            1.0
-        };
-        opt_body.set_lr_scaled(warm);
-        opt_proj.set_lr_scaled(warm);
-        opt_body.step(&grads)?;
-        opt_proj.step(&grads)?;
-
-        let loss = loss_sum / a.batch as f32;
-        let secs = t0.elapsed().as_secs_f32();
-        let lr_eff = a.lr * warm;
-        println!(
-            "step {:>5}/{} loss {loss:.5} grad_norm {gnorm:.3} lr {lr_eff:.2e} {secs:.2}s",
-            step + 1,
-            start_step + a.steps
-        );
-        writeln!(
-            log,
-            "{}",
-            serde_json::json!({"step": step + 1, "loss": loss, "grad_norm": gnorm, "secs": secs, "lr": lr_eff})
-        )?;
-        if !loss.is_finite() {
-            return Err(format!("non-finite loss at step {}", step + 1).into());
-        }
-
-        // ── telemetry (run-3 fix): per-injection pre/post-clamp residual/main RMS ratios every 50
-        // steps, on a FIXED probe (sample 0, σ = 0.5, fixed noise) so the trajectory is comparable
-        // across steps. `probe_forward` is graph-free (detached weight reads) — one cheap forward.
-        if (step + 1) % 50 == 0 || step == start_step {
-            let (x0_c, ctrl_c, cap_c) = &cache[0];
-            let x0 = x0_c.to_device(&device)?;
-            let ctrl = ctrl_c.to_device(&device)?;
-            let cap = cap_c.to_device(&device)?.unsqueeze(0)?;
-            let sigma = 0.5f32;
-            let noise = sample_noise(x0.dims(), flow_match::noise_seed(a.seed, u32::MAX), &device)?;
-            let (x_t, _) = flow_match::build_batch(&x0, &noise, sigma as f64)?;
-            let t = Tensor::from_vec(vec![sigma], (1,), &device)?;
-            let (rep, _, _) = probe_forward(&dit, &branch, &x_t, &t, &cap, &ctrl, 1.0)?;
-            let ratio = |num: f64, den: f64| (num / (den + 1e-9) * 1e4).round() / 1e4;
-            let pre: Vec<f64> = rep.iter().map(|(p, _, m)| ratio(*p, *m)).collect();
-            let post: Vec<f64> = rep.iter().map(|(_, q, m)| ratio(*q, *m)).collect();
+    let mut trainer = ControlTrainer::new(
+        dit,
+        branch,
+        cache,
+        cfg_train,
+        a.out.clone(),
+        start_step,
+        device,
+    )?;
+    trainer.run(|ev| match ev {
+        TrainEvent::Step(r) => {
             println!(
-                "telemetry step {:>5}: res/main pre-clamp {:?} post-clamp {:?}",
-                step + 1,
-                pre,
-                post
+                "step {:>5}/{total} loss {:.5} grad_norm {:.3} lr {:.2e} {:.2}s",
+                r.step, r.loss, r.grad_norm, r.lr, r.secs
             );
-            writeln!(
+            let _ = writeln!(
                 log,
                 "{}",
-                serde_json::json!({"step": step + 1, "telemetry_pre": pre, "telemetry_post": post})
-            )?;
+                serde_json::json!({"step": r.step, "loss": r.loss, "grad_norm": r.grad_norm, "secs": r.secs, "lr": r.lr})
+            );
         }
-
-        let done = step + 1 == start_step + a.steps;
-        if (a.save_every > 0 && (step + 1) % a.save_every == 0) || done {
-            let p = save(&branch, step + 1)?;
-            eprintln!("checkpoint -> {}", p.display());
+        TrainEvent::Telemetry { step, pre, post } => {
+            println!("telemetry step {step:>5}: res/main pre-clamp {pre:?} post-clamp {post:?}");
+            let _ = writeln!(
+                log,
+                "{}",
+                serde_json::json!({"step": step, "telemetry_pre": pre, "telemetry_post": post})
+            );
         }
-    }
+        TrainEvent::Checkpoint { path, .. } => {
+            eprintln!("checkpoint -> {}", path.display());
+        }
+    })?;
     eprintln!("training complete; log at {}", log_path.display());
     Ok(())
 }
