@@ -407,6 +407,211 @@ impl<L: LatentOps> Sampler<L> for Ddim {
 }
 
 // =================================================================================================
+// er_sde — ComfyUI / k-diffusion `sample_er_sde` (Extended Reverse-Time SDE, ER-SDE-Solver-3).
+// =================================================================================================
+
+/// The ER-SDE noise scaler `φ(λ) = λ·(e^{λ^{0.3}} + 10)` (ComfyUI `default_er_sde_noise_scaler`). In
+/// the unified VE-sigma space the ER-SDE "λ" IS the schedule σ (`er_lambda_t = σ_t/α_t`, `α = 1`), so
+/// this is evaluated at σ.
+#[inline]
+fn er_sde_noise_scaler(l: f64) -> f64 {
+    l * (l.powf(0.3).exp() + 10.0)
+}
+
+/// Extended Reverse-Time SDE solver (ER-SDE-Solver-3): a faithful port of ComfyUI / k-diffusion
+/// `sample_er_sde` reduced to the unified VE-sigma space (`α = 1`, so `er_lambda_t = σ_t` and the
+/// per-step `alpha_t` factors drop out). A stochastic multistep solver — a 1st-order (Euler-like)
+/// blend `x ← r·x + (1−r)·x0` with `r = φ(σ_{i+1})/φ(σ_i)`, then 2nd- and 3rd-order corrections built
+/// from finite-difference denoised derivatives and a 200-point σ-integral of `1/φ`, then fresh
+/// per-step Gaussian noise. Anima's recommended sampler. Reference:
+/// <https://github.com/QinpengCui/ER-SDE-Solver> (arXiv:2309.06169) via ComfyUI's `sample_er_sde`.
+#[derive(Clone, Copy, Debug)]
+pub struct ErSde {
+    /// Fresh-noise scale (ComfyUI default `1.0`; `0` makes the solver deterministic).
+    pub s_noise: f32,
+    /// Highest correction order to use (ComfyUI `max_stage`, default `3` = ER-SDE-Solver-3).
+    pub max_stage: u8,
+}
+
+impl Default for ErSde {
+    fn default() -> Self {
+        Self {
+            s_noise: 1.0,
+            max_stage: 3,
+        }
+    }
+}
+
+impl<L: LatentOps> Sampler<L> for ErSde {
+    fn sample(
+        &self,
+        ops: &L,
+        _ms: &dyn super::ModelSampling,
+        denoise: &mut DenoiseFn<'_, L>,
+        mut x: L::Latent,
+        sigmas: &[f32],
+        seed: u64,
+    ) -> Result<L::Latent> {
+        const NUM_INTEGRATION_POINTS: usize = 200;
+        let max_stage = self.max_stage.max(1) as usize;
+        let mut old_denoised: Option<L::Latent> = None;
+        let mut old_denoised_d: Option<L::Latent> = None;
+        for i in 0..sigmas.len().saturating_sub(1) {
+            let sigma = sigmas[i];
+            let s_next = sigmas[i + 1];
+            let x0 = denoise(&x, sigma)?;
+            if is_terminal(sigma) || s_next == 0.0 {
+                // Terminal (or degenerate leading σ==0): land on the denoised estimate, no noise.
+                x = x0.clone();
+                old_denoised = Some(x0);
+                continue;
+            }
+            let stage_used = max_stage.min(i + 1);
+            // VE-sigma space: er_lambda == σ, α == 1 (so r_alpha == 1 and the α_t prefactors drop out).
+            let lam_s = sigma as f64;
+            let lam_t = s_next as f64;
+            let phi_s = er_sde_noise_scaler(lam_s);
+            let phi_t = er_sde_noise_scaler(lam_t);
+            let r = phi_t / phi_s;
+
+            // Stage 1 (Euler): x = r·x + (1 − r)·x0.
+            let mut x_next = ops.axpy(r as f32, &x, (1.0 - r) as f32, &x0)?;
+
+            if stage_used >= 2 {
+                let dt = lam_t - lam_s; // < 0 (σ descends)
+                let step = -dt / NUM_INTEGRATION_POINTS as f64; // > 0
+                                                                // 200-point Riemann integrals over [σ_{i+1}, σ_i): λ_pos[k] = σ_{i+1} + k·step.
+                let (mut s_int, mut s_u_int) = (0.0_f64, 0.0_f64);
+                for k in 0..NUM_INTEGRATION_POINTS {
+                    let lp = lam_t + k as f64 * step;
+                    let phi = er_sde_noise_scaler(lp);
+                    s_int += 1.0 / phi;
+                    s_u_int += (lp - lam_s) / phi;
+                }
+                s_int *= step;
+                s_u_int *= step;
+
+                // Stage 2: denoised_d = (x0 − old_x0)/(σ_i − σ_{i-1}); x += (dt + s·φ(σ_{i+1}))·denoised_d.
+                let inv_d = 1.0 / (lam_s - sigmas[i - 1] as f64);
+                let old = old_denoised
+                    .as_ref()
+                    .expect("stage_used>=2 implies i>=1, so old_denoised is set");
+                let denoised_d = ops.axpy(inv_d as f32, &x0, -inv_d as f32, old)?;
+                let c2 = (dt + s_int * phi_t) as f32;
+                x_next = ops.axpy(1.0, &x_next, c2, &denoised_d)?;
+
+                if stage_used >= 3 {
+                    // Stage 3: denoised_u = (denoised_d − old_denoised_d)/((σ_i − σ_{i-2})/2);
+                    //          x += (dt²/2 + s_u·φ(σ_{i+1}))·denoised_u.
+                    let inv_u = 1.0 / ((lam_s - sigmas[i - 2] as f64) / 2.0);
+                    let old_d = old_denoised_d
+                        .as_ref()
+                        .expect("stage_used>=3 implies i>=2, so old_denoised_d is set");
+                    let denoised_u = ops.axpy(inv_u as f32, &denoised_d, -inv_u as f32, old_d)?;
+                    let c3 = (dt * dt / 2.0 + s_u_int * phi_t) as f32;
+                    x_next = ops.axpy(1.0, &x_next, c3, &denoised_u)?;
+                }
+                old_denoised_d = Some(denoised_d);
+            }
+
+            // Fresh per-step noise: x += s_noise·√max(σ_{i+1}² − σ_i²·r², 0)·ε (nan_to_num guard).
+            x = x_next;
+            if self.s_noise > 0.0 {
+                let var = lam_t * lam_t - lam_s * lam_s * r * r;
+                let noise_coeff = self.s_noise as f64 * var.max(0.0).sqrt();
+                if noise_coeff != 0.0 {
+                    let noise = ops.randn_like(&x, seed, i)?;
+                    x = ops.axpy(1.0, &x, noise_coeff as f32, &noise)?;
+                }
+            }
+            old_denoised = Some(x0);
+        }
+        Ok(x)
+    }
+}
+
+// =================================================================================================
+// dpmpp_2m_sde — ComfyUI / k-diffusion `sample_dpmpp_2m_sde` (DPM-Solver++(2M) SDE, midpoint).
+// =================================================================================================
+
+/// DPM-Solver++(2M) SDE (midpoint variant): a faithful port of ComfyUI / k-diffusion
+/// `sample_dpmpp_2m_sde` reduced to the unified VE-sigma space (`α_t = 1`). A stochastic 2nd-order
+/// multistep solver — like [`Dpmpp2m`] it reuses the previous step's denoised estimate for the
+/// 2nd-order term, but adds an `η`-scaled SDE contraction plus fresh Gaussian noise each step. Anima's
+/// creative alternative (`dpmpp_2m_sde_gpu`). Falls back to 1st order on the first step and to a plain
+/// denoise on the terminal step. Reference: ComfyUI `sample_dpmpp_2m_sde` (`solver_type='midpoint'`).
+#[derive(Clone, Copy, Debug)]
+pub struct Dpmpp2mSde {
+    /// SDE stochasticity scale (ComfyUI default `1.0`).
+    pub eta: f32,
+    /// Fresh-noise scale (ComfyUI default `1.0`).
+    pub s_noise: f32,
+}
+
+impl Default for Dpmpp2mSde {
+    fn default() -> Self {
+        Self {
+            eta: 1.0,
+            s_noise: 1.0,
+        }
+    }
+}
+
+impl<L: LatentOps> Sampler<L> for Dpmpp2mSde {
+    fn sample(
+        &self,
+        ops: &L,
+        _ms: &dyn super::ModelSampling,
+        denoise: &mut DenoiseFn<'_, L>,
+        mut x: L::Latent,
+        sigmas: &[f32],
+        seed: u64,
+    ) -> Result<L::Latent> {
+        let eta = self.eta as f64;
+        let mut old_denoised: Option<L::Latent> = None;
+        let mut h_last: Option<f64> = None;
+        for i in 0..sigmas.len().saturating_sub(1) {
+            let sigma = sigmas[i];
+            let s_next = sigmas[i + 1];
+            let x0 = denoise(&x, sigma)?;
+            if is_terminal(sigma) || s_next == 0.0 {
+                // Terminal (or degenerate leading σ==0): land on the denoised estimate, no noise.
+                x = x0.clone();
+                old_denoised = Some(x0);
+                continue;
+            }
+            // VE-sigma space: λ = −ln σ, α_t = 1.
+            let h = lambda(s_next) - lambda(sigma); // > 0
+            let h_eta = h * (eta + 1.0);
+            // x = (σ_{i+1}/σ_i)·e^{−ηh}·x + (1 − e^{−(η+1)h})·x0.
+            let coeff_x = (s_next as f64 / sigma as f64 * (-eta * h).exp()) as f32;
+            let coeff_d = (-(-h_eta).exp_m1()) as f32; // 1 − e^{−h_eta}
+            let mut x_next = ops.axpy(coeff_x, &x, coeff_d, &x0)?;
+            // Midpoint 2nd-order correction once a previous denoised estimate exists.
+            if let (Some(old), Some(hl)) = (&old_denoised, h_last) {
+                let r = hl / h; // h_last / h
+                let c = (0.5 * (-(-h_eta).exp_m1()) / r) as f32;
+                let diff = ops.axpy(1.0, &x0, -1.0, old)?; // x0 − old_x0
+                x_next = ops.axpy(1.0, &x_next, c, &diff)?;
+            }
+            // Fresh per-step noise: x += σ_{i+1}·√(1 − e^{−2ηh})·s_noise·ε.
+            x = x_next;
+            if eta > 0.0 && self.s_noise > 0.0 {
+                let noise_coeff =
+                    s_next as f64 * (-(-2.0 * eta * h).exp_m1()).sqrt() * self.s_noise as f64;
+                if noise_coeff != 0.0 {
+                    let noise = ops.randn_like(&x, seed, i)?;
+                    x = ops.axpy(1.0, &x, noise_coeff as f32, &noise)?;
+                }
+            }
+            old_denoised = Some(x0);
+            h_last = Some(h);
+        }
+        Ok(x)
+    }
+}
+
+// =================================================================================================
 // Registry — name <-> solver, the per-request selection seam the worker/engine drives (sc-7127).
 // =================================================================================================
 
@@ -421,6 +626,8 @@ pub enum Solver {
     UniPc,
     Lcm,
     Ddim,
+    ErSde,
+    Dpmpp2mSde,
 }
 
 impl Solver {
@@ -436,6 +643,8 @@ impl Solver {
             "uni_pc" => Self::UniPc,
             "lcm" => Self::Lcm,
             "ddim" => Self::Ddim,
+            "er_sde" => Self::ErSde,
+            "dpmpp_2m_sde" => Self::Dpmpp2mSde,
             _ => return None,
         })
     }
@@ -451,16 +660,21 @@ impl Solver {
             Self::UniPc => "uni_pc",
             Self::Lcm => "lcm",
             Self::Ddim => "ddim",
+            Self::ErSde => "er_sde",
+            Self::Dpmpp2mSde => "dpmpp_2m_sde",
         }
     }
 
     /// Whether the solver draws fresh per-step noise (needs a request seed for reproducibility).
     pub fn is_stochastic(self) -> bool {
-        matches!(self, Self::EulerAncestral | Self::DpmppSde | Self::Lcm)
+        matches!(
+            self,
+            Self::EulerAncestral | Self::DpmppSde | Self::Lcm | Self::ErSde | Self::Dpmpp2mSde
+        )
     }
 
     /// Every curated solver, in menu order.
-    pub const ALL: [Solver; 8] = [
+    pub const ALL: [Solver; 10] = [
         Self::Euler,
         Self::EulerAncestral,
         Self::Heun,
@@ -469,6 +683,8 @@ impl Solver {
         Self::UniPc,
         Self::Lcm,
         Self::Ddim,
+        Self::ErSde,
+        Self::Dpmpp2mSde,
     ];
 
     /// Box the matching [`Sampler`] for a backend `L`.
@@ -482,6 +698,8 @@ impl Solver {
             Self::UniPc => Box::new(UniPc),
             Self::Lcm => Box::new(Lcm),
             Self::Ddim => Box::new(Ddim),
+            Self::ErSde => Box::new(ErSde::default()),
+            Self::Dpmpp2mSde => Box::new(Dpmpp2mSde::default()),
         }
     }
 }
@@ -539,6 +757,81 @@ mod tests {
         assert!(max < tol, "{label}: max abs diff {max:e} (tol {tol:e})");
     }
 
+    // =============================================================================================
+    // Independent Python golden (sc-10519, adversarial-review fix). The er_sde / dpmpp_2m_sde
+    // trajectories below are pinned against numbers produced by ComfyUI's OWN `sample_er_sde` /
+    // `sample_dpmpp_2m_sde` (vendored verbatim, driven in VE space, s_noise=0), NOT by re-reading
+    // this Rust — so a sign/coefficient error in a Stage-2/3 or midpoint term is caught. Fixture +
+    // generator + the verbatim ComfyUI source live in `gen-core/tests/fixtures/`.
+    // =============================================================================================
+
+    /// f32-appropriate trajectory tolerance. The golden is float64; the Rust port carries latents in
+    /// f32, yet the measured max drift over the whole 6-step schedule is ~1.2e-7 (a single f32 ULP at
+    /// O(1) — pure CPU scalar math, so the agreement is essentially exact). `1e-5` keeps ~80x headroom
+    /// for cross-platform f32 rounding while staying two orders TIGHTER than a Metal-grade 1e-3 fudge.
+    /// A real sign/coefficient bug moves a step by O(1e-2..1e0), far above this (verified by mutation).
+    const GOLDEN_TOL: f32 = 1e-5;
+
+    /// The toy denoiser mirrored bit-for-bit from `gen-core/tests/fixtures/gen_sde_solver_golden.py`:
+    /// `denoised = 0.5·x + 0.25·sin(1.3·x) + 0.2·σ·cos(0.7·x) − 0.1·σ`. A NON-constant field in both
+    /// `x` and `σ`, so the higher-order terms genuinely engage. Computed in f64 (matching the float64
+    /// reference) then demoted, isolating the SOLVER's f32 arithmetic as the only source of drift.
+    fn toy_denoised(x: &[f32], sigma: f32) -> Vec<f32> {
+        let sig = sigma as f64;
+        x.iter()
+            .map(|&xj| {
+                let xj = xj as f64;
+                (0.5 * xj + 0.25 * (1.3 * xj).sin() + 0.2 * sig * (0.7 * xj).cos() - 0.1 * sig)
+                    as f32
+            })
+            .collect()
+    }
+
+    fn load_golden() -> serde_json::Value {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sde_solver_golden.json"
+        );
+        let text = std::fs::read_to_string(path).expect("read sde_solver_golden.json fixture");
+        serde_json::from_str(&text).expect("parse sde_solver_golden.json")
+    }
+
+    fn json_vec(v: &serde_json::Value) -> Vec<f32> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    }
+
+    fn json_rows(v: &serde_json::Value) -> Vec<Vec<f32>> {
+        v.as_array().unwrap().iter().map(json_vec).collect()
+    }
+
+    /// Drive `solver` over the golden schedule with a recording denoiser, returning the full
+    /// trajectory `[x_0, x_1, …, x_N]` — the pre-step latent captured at each `denoise` call plus the
+    /// final returned latent, exactly mirroring the Python generator's capture.
+    fn run_recorded_trajectory<S: Sampler<CpuLatentOps>>(
+        solver: &S,
+        x_init: &[f32],
+        sigmas: &[f32],
+    ) -> Vec<Vec<f32>> {
+        let ops = CpuLatentOps;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let mut recorded: Vec<Vec<f32>> = Vec::new();
+        let final_x = {
+            let mut dn = |xx: &Vec<f32>, s: f32| -> Result<Vec<f32>> {
+                recorded.push(xx.clone());
+                Ok(toy_denoised(xx, s))
+            };
+            solver
+                .sample(&ops, &ms, &mut dn, x_init.to_vec(), sigmas, 0)
+                .unwrap()
+        };
+        recorded.push(final_x);
+        recorded
+    }
+
     #[test]
     fn deterministic_solvers_integrate_constant_velocity_exactly() {
         // Euler (from unified) + the deterministic curated solvers must all hit the exact solution.
@@ -574,6 +867,8 @@ mod tests {
             &EulerAncestral::default() as &dyn Sampler<CpuLatentOps>,
             &DpmppSde::default(),
             &Lcm,
+            &ErSde::default(),
+            &Dpmpp2mSde::default(),
         ] {
             let a = run(solver, 7);
             let b = run(solver, 7);
@@ -582,6 +877,168 @@ mod tests {
             assert_eq!(a, b, "same seed must reproduce");
             assert_ne!(a, c, "different seed must differ");
         }
+    }
+
+    /// Both SDE solvers must inject NO noise on the terminal step (`σ_next == 0`): a single-step
+    /// schedule `[σ, 0]` lands EXACTLY on the denoised estimate, seed-independently (the invariant the
+    /// story pins — a stochastic solver must degrade to a plain denoise at the clean node).
+    #[test]
+    fn sde_solvers_add_no_noise_on_terminal_step() {
+        let ops = CpuLatentOps;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let sigmas = [0.5_f32, 0.0];
+        let x_init = vec![0.2_f32, -0.6, 1.1];
+        let v = vec![0.4_f32, 0.4, -0.2];
+        // Flow denoise: x0 at σ=0.5 = x − 0.5·v.
+        let want: Vec<f32> = x_init
+            .iter()
+            .zip(&v)
+            .map(|(&xi, &vi)| xi - 0.5 * vi)
+            .collect();
+        for solver in [
+            &ErSde::default() as &dyn Sampler<CpuLatentOps>,
+            &Dpmpp2mSde::default(),
+        ] {
+            let run = |seed: u64| {
+                let mut dn =
+                    |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |_xin, _t| Ok(v.clone()));
+                solver
+                    .sample(&ops, &ms, &mut dn, x_init.clone(), &sigmas, seed)
+                    .unwrap()
+            };
+            let a = run(1);
+            let b = run(999);
+            assert_eq!(
+                a, b,
+                "terminal step must not inject noise (seed-independent)"
+            );
+            assert_close(&a, &want, 1e-6, "terminal step lands on x0");
+        }
+    }
+
+    /// er_sde reproduces ComfyUI's `sample_er_sde` step-by-step over a 6-step VE schedule (deterministic,
+    /// `s_noise=0`) — reaching Stage-3 (`i>=2`) so the 200-point Riemann integrals and the Stage-2/3
+    /// finite-difference corrections are all exercised against the INDEPENDENT float64 golden, not a
+    /// re-transcription of this Rust. Catches a sign/coefficient error anywhere in the higher-order path.
+    #[test]
+    fn er_sde_matches_python_golden_trajectory() {
+        let g = load_golden();
+        let sigmas = json_vec(&g["sigmas"]);
+        let x_init = json_vec(&g["x_init"]);
+        let want = json_rows(&g["er_sde"]["trajectory"]);
+        let solver = ErSde {
+            s_noise: 0.0,
+            max_stage: 3,
+        };
+        let got = run_recorded_trajectory(&solver, &x_init, &sigmas);
+        assert_eq!(got.len(), want.len(), "er_sde golden trajectory length");
+        assert_eq!(
+            got.len(),
+            7,
+            "6 steps + trailing terminal => 7 latent snapshots"
+        );
+        for (k, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_close(a, b, GOLDEN_TOL, &format!("er_sde golden step {k}"));
+        }
+    }
+
+    /// dpmpp_2m_sde reproduces ComfyUI's `sample_dpmpp_2m_sde` (`solver_type='midpoint'`, `η=1`)
+    /// step-by-step over the same schedule (deterministic, `s_noise=0`) — exercising the midpoint
+    /// 2nd-order correction against the INDEPENDENT float64 golden.
+    #[test]
+    fn dpmpp_2m_sde_matches_python_golden_trajectory() {
+        let g = load_golden();
+        let sigmas = json_vec(&g["sigmas"]);
+        let x_init = json_vec(&g["x_init"]);
+        let want = json_rows(&g["dpmpp_2m_sde"]["trajectory"]);
+        let solver = Dpmpp2mSde {
+            eta: 1.0,
+            s_noise: 0.0,
+        };
+        let got = run_recorded_trajectory(&solver, &x_init, &sigmas);
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "dpmpp_2m_sde golden trajectory length"
+        );
+        assert_eq!(
+            got.len(),
+            7,
+            "6 steps + trailing terminal => 7 latent snapshots"
+        );
+        for (k, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_close(a, b, GOLDEN_TOL, &format!("dpmpp_2m_sde golden step {k}"));
+        }
+    }
+
+    /// er_sde's first step (`i==0`, Stage-1) pinned against the INDEPENDENT golden value (`s_noise=0`),
+    /// then the noise term proven wired by its EXACT linearity in `s_noise` — the noise vector is drawn
+    /// on the (s_noise-independent) deterministic `x_next`, so `out(s_noise) − det = s_noise·(coeff·ε)`,
+    /// i.e. doubling `s_noise` must exactly double the deviation. No hand-transcription of the coeff.
+    #[test]
+    fn er_sde_first_step_matches_python_golden_and_scales_noise() {
+        let ops = CpuLatentOps;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let g = load_golden();
+        let sigmas = json_vec(&g["sigmas"]);
+        let x_init = json_vec(&g["x_init"]);
+        let want_x1 = json_rows(&g["er_sde"]["trajectory"])[1].clone();
+        let two = [sigmas[0], sigmas[1]];
+
+        let run = |s_noise: f32| {
+            let mut dn = |xx: &Vec<f32>, s: f32| Ok(toy_denoised(xx, s));
+            ErSde {
+                s_noise,
+                max_stage: 3,
+            }
+            .sample(&ops, &ms, &mut dn, x_init.clone(), &two, 3)
+            .unwrap()
+        };
+        // Deterministic first step == the independent golden (non-tautological value check at i=0).
+        let det = run(0.0);
+        assert_close(&det, &want_x1, GOLDEN_TOL, "er_sde first step golden");
+        // Noise term is present and scales linearly with s_noise.
+        let o1 = run(1.0);
+        let o2 = run(2.0);
+        assert_ne!(o1, det, "er_sde must inject noise when s_noise>0");
+        let d1: Vec<f32> = o1.iter().zip(&det).map(|(&a, &b)| a - b).collect();
+        let d2: Vec<f32> = o2.iter().zip(&det).map(|(&a, &b)| a - b).collect();
+        let twice: Vec<f32> = d1.iter().map(|&v| 2.0 * v).collect();
+        assert_close(&d2, &twice, 1e-6, "er_sde noise term linear in s_noise");
+    }
+
+    /// dpmpp_2m_sde's first step (`i==0`, no history) pinned against the INDEPENDENT golden value
+    /// (`η=1`, `s_noise=0`), then the SDE noise term proven wired by its exact linearity in `s_noise`.
+    #[test]
+    fn dpmpp_2m_sde_first_step_matches_python_golden_and_scales_noise() {
+        let ops = CpuLatentOps;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let g = load_golden();
+        let sigmas = json_vec(&g["sigmas"]);
+        let x_init = json_vec(&g["x_init"]);
+        let want_x1 = json_rows(&g["dpmpp_2m_sde"]["trajectory"])[1].clone();
+        let two = [sigmas[0], sigmas[1]];
+
+        let run = |s_noise: f32| {
+            let mut dn = |xx: &Vec<f32>, s: f32| Ok(toy_denoised(xx, s));
+            Dpmpp2mSde { eta: 1.0, s_noise }
+                .sample(&ops, &ms, &mut dn, x_init.clone(), &two, 5)
+                .unwrap()
+        };
+        let det = run(0.0);
+        assert_close(&det, &want_x1, GOLDEN_TOL, "dpmpp_2m_sde first step golden");
+        let o1 = run(1.0);
+        let o2 = run(2.0);
+        assert_ne!(o1, det, "dpmpp_2m_sde must inject noise when s_noise>0");
+        let d1: Vec<f32> = o1.iter().zip(&det).map(|(&a, &b)| a - b).collect();
+        let d2: Vec<f32> = o2.iter().zip(&det).map(|(&a, &b)| a - b).collect();
+        let twice: Vec<f32> = d1.iter().map(|&v| 2.0 * v).collect();
+        assert_close(
+            &d2,
+            &twice,
+            1e-6,
+            "dpmpp_2m_sde noise term linear in s_noise",
+        );
     }
 
     #[test]
@@ -638,9 +1095,21 @@ mod tests {
             assert_eq!(Solver::from_name(s.name()), Some(s));
             let _boxed: Box<dyn Sampler<CpuLatentOps>> = s.boxed();
         }
+        assert_eq!(
+            Solver::ALL.len(),
+            10,
+            "curated solver set is 10 (added er_sde + dpmpp_2m_sde)"
+        );
         assert!(sampler_by_name::<CpuLatentOps>("euler").is_some());
+        assert!(sampler_by_name::<CpuLatentOps>("er_sde").is_some());
+        assert!(sampler_by_name::<CpuLatentOps>("dpmpp_2m_sde").is_some());
         assert!(sampler_by_name::<CpuLatentOps>("nope").is_none());
         assert!(Solver::Lcm.is_stochastic());
         assert!(!Solver::Heun.is_stochastic());
+        // Both new SDE solvers draw fresh per-step noise -> stochastic.
+        assert!(Solver::ErSde.is_stochastic());
+        assert!(Solver::Dpmpp2mSde.is_stochastic());
+        // dpmpp_2m_sde must NOT be confused with the distinct dpmpp_sde solver.
+        assert_ne!(Solver::Dpmpp2mSde, Solver::DpmppSde);
     }
 }

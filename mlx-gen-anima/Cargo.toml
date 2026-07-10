@@ -1,0 +1,31 @@
+[package]
+name = "mlx-gen-anima"
+version = "0.0.0"
+edition = "2021"
+description = "Anima (Cosmos-Predict2 DiT + AnimaTextConditioner) anime T2I provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "anima", "cosmos"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Qwen3-0.6B text tower: reuse z-image's Qwen3 decoder block (`EncoderLayer`) + `TextRope` wholesale —
+# it already handles the GQA 16/8 shape Anima needs (the story-mandated donor).
+mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# VAE: Anima's `qwen_image_vae.safetensors` is the Qwen-Image `AutoencoderKLQwenImage`; reuse `QwenVae`
+# + its diffusers->internal key remap (`loader::remap_vae_keys`) rather than re-porting the Conv3d VAE.
+mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time self-registration of the three anima generators into the `mlx_gen` registry.
+inventory = { workspace = true }
+# Encode the e2e real-weight smoke output to PNG (real-weights generate test); mirrors mlx-gen-krea.
+image = { workspace = true }
+
+[dev-dependencies]
+# Backend-neutral gen-core contract conformance (capability honesty / progress monotonicity / typed
+# cancellation / seed determinism / registry round-trip). Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }
+# Read the committed parity goldens (sc-10524) at test time — no Python at test time.
+serde_json = { workspace = true }
