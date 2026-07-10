@@ -156,40 +156,33 @@ pub struct SenseNovaGenerator {
 
 impl SenseNovaGenerator {
     fn components(&self) -> Result<Components> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("sensenova components cache mutex poisoned");
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let cfg = NeoChatConfig::from_dir(&self.root)?;
-        let vb = f32_vb(&self.root, &self.device)?;
-        let mut model = T2iModel::from_weights(&vb, &cfg)?;
-        if self.fast {
-            // Merge the 8-step distill LoRA into the dense generation path. Assert full coverage —
-            // `7 · layers` gen-path projections + the 2 FM-head Linears — so a stale/mismatched LoRA
-            // fails loudly rather than silently merging a subset.
-            let lora_path = resolve_distill_lora(&self.root)?;
-            let lora = DistillLora::from_file(&lora_path)?;
-            let applied = model.merge_distill_lora(&lora)?;
-            let expected = cfg.llm.num_hidden_layers * 7 + 2;
-            if applied != expected {
-                return Err(CandleError::Msg(format!(
-                    "{}: distill LoRA merged {applied} targets, expected {expected} \
-                     (7·{} gen-path linears + 2 fm_head) — wrong LoRA file?",
-                    self.descriptor.id, cfg.llm.num_hidden_layers
-                )));
+        candle_gen::cached(&self.components, || {
+            let cfg = NeoChatConfig::from_dir(&self.root)?;
+            let vb = f32_vb(&self.root, &self.device)?;
+            let mut model = T2iModel::from_weights(&vb, &cfg)?;
+            if self.fast {
+                // Merge the 8-step distill LoRA into the dense generation path. Assert full coverage —
+                // `7 · layers` gen-path projections + the 2 FM-head Linears — so a stale/mismatched LoRA
+                // fails loudly rather than silently merging a subset.
+                let lora_path = resolve_distill_lora(&self.root)?;
+                let lora = DistillLora::from_file(&lora_path)?;
+                let applied = model.merge_distill_lora(&lora)?;
+                let expected = cfg.llm.num_hidden_layers * 7 + 2;
+                if applied != expected {
+                    return Err(CandleError::Msg(format!(
+                        "{}: distill LoRA merged {applied} targets, expected {expected} \
+                         (7·{} gen-path linears + 2 fm_head) — wrong LoRA file?",
+                        self.descriptor.id, cfg.llm.num_hidden_layers
+                    )));
+                }
             }
-        }
-        let tokenizer = SenseNovaTokenizer::from_dir(&self.root)?;
-        let comps = Components {
-            tokenizer: Arc::new(tokenizer),
-            model: Arc::new(model),
-            cfg: Arc::new(cfg),
-        };
-        *guard = Some(comps.clone());
-        Ok(comps)
+            let tokenizer = SenseNovaTokenizer::from_dir(&self.root)?;
+            Ok(Components {
+                tokenizer: Arc::new(tokenizer),
+                model: Arc::new(model),
+                cfg: Arc::new(cfg),
+            })
+        })
     }
 
     /// Map a request to [`T2iOptions`] (distilled vs base defaults; explicit request values win).
@@ -227,14 +220,13 @@ impl SenseNovaGenerator {
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (w, h) = (req.width as usize, req.height as usize);
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             // A 50-step 8B run is multi-minute; check cancellation between images too (the per-step
             // check lives in the denoise loop).
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
-            let opts = self.options(req, &comps.cfg, base_seed.wrapping_add(i as u64));
+            let opts = self.options(req, &comps.cfg, seed);
             let img = comps.model.generate(
                 &comps.tokenizer,
                 &req.prompt,
@@ -244,8 +236,9 @@ impl SenseNovaGenerator {
                 &req.cancel,
                 on_progress,
             )?;
-            images.push(tensor_to_image(&img)?);
-        }
+            // `?` bridges the candle-side `tensor_to_image` error into `CandleError`.
+            Ok(tensor_to_image(&img)?)
+        })?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -295,6 +288,7 @@ fn f32_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
         .map_err(|e| CandleError::Msg(format!("sensenova: read {}: {e}", root.display())))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .filter(|p| !candle_gen::gen_core::weightsmeta::is_hidden_file(p))
         .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some(DISTILL_LORA_FILE))
         .collect();
     files.sort();

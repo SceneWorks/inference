@@ -534,6 +534,8 @@ mod tests {
             "uni_pc",
             "lcm",
             "ddim",
+            "er_sde",
+            "dpmpp_2m_sde",
         ] {
             let sampler = sampler_by_name::<CandleLatentOps>(name).expect("known solver");
             // Smooth velocity field v = 0.25·x + 0.1.
@@ -754,7 +756,9 @@ mod tests {
                 "dpmpp_sde",
                 "uni_pc",
                 "lcm",
-                "ddim"
+                "ddim",
+                "er_sde",
+                "dpmpp_2m_sde"
             ]
         );
         assert_eq!(
@@ -766,7 +770,8 @@ mod tests {
                 "exponential",
                 "sgm_uniform",
                 "beta",
-                "ddim_uniform"
+                "ddim_uniform",
+                "beta57"
             ]
         );
     }
