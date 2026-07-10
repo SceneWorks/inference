@@ -349,15 +349,19 @@ impl CosmosDiT {
         Ok(x.reshape(&[b, oc, pe_t * pt, pe_h * ph, pe_w * pw])?)
     }
 
-    /// Denoise forward. `latents`: `[B, 16, 1, Hl, Wl]` (any dtype — cast to `dtype`). `sigma`: `[B]`.
-    /// `encoder`: `[B, 512, text_embed_dim]`. Returns the velocity `[B, 16, 1, Hl, Wl]` in `dtype`.
-    pub fn forward(
+    /// Shared prep + transformer-block loop. Runs `num_blocks` blocks (`None` = all) over the patchified
+    /// hidden state and returns `(hidden [B, seq, hidden], (pe_t, pe_h, pe_w), embedded, temb)`. The
+    /// per-op math is identical to a full [`forward`]; only the number of blocks run is parameterized —
+    /// so [`forward`] and the stage-4 golden hook [`forward_hidden`] share ONE copy of the block math.
+    #[allow(clippy::type_complexity)]
+    fn run_blocks(
         &self,
         latents: &Array,
         sigma: &Array,
         encoder: &Array,
         dtype: Dtype,
-    ) -> Result<Array> {
+        num_blocks: Option<usize>,
+    ) -> Result<(Array, (i32, i32, i32), Array, Array)> {
         let latents = latents.as_dtype(dtype)?;
         let sh = latents.shape();
         let (b, _c, t, hl, wl) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
@@ -381,15 +385,46 @@ impl CosmosDiT {
         // 4. time embedding.
         let (temb, embedded) = self.time_embed.forward(sigma, dtype)?;
 
-        // 5. transformer blocks.
+        // 5. transformer blocks (all, or the first `num_blocks` for the stage-4 localization golden).
+        let take = num_blocks.unwrap_or(self.blocks.len());
         let mut hidden = hidden;
-        for block in &self.blocks {
+        for block in self.blocks.iter().take(take) {
             hidden = block.forward(&hidden, encoder, &embedded, &temb, (&rope.cos, &rope.sin))?;
         }
+        Ok((hidden, (pe_t, pe_h, pe_w), embedded, temb))
+    }
 
+    /// Denoise forward. `latents`: `[B, 16, 1, Hl, Wl]` (any dtype — cast to `dtype`). `sigma`: `[B]`.
+    /// `encoder`: `[B, 512, text_embed_dim]`. Returns the velocity `[B, 16, 1, Hl, Wl]` in `dtype`.
+    pub fn forward(
+        &self,
+        latents: &Array,
+        sigma: &Array,
+        encoder: &Array,
+        dtype: Dtype,
+    ) -> Result<Array> {
+        let (hidden, (pe_t, pe_h, pe_w), embedded, temb) =
+            self.run_blocks(latents, sigma, encoder, dtype, None)?;
         // 6. output norm + projection + unpatchify.
         let hidden = self.norm_out.forward(&hidden, &embedded, &temb)?;
         let hidden = self.proj_out.forward(&hidden)?;
         self.unpatchify(&hidden, pe_t, pe_h, pe_w)
+    }
+
+    /// Test hook (sc-10524 stage-4 golden): the raw hidden state after `num_blocks` transformer blocks
+    /// (**pre** `norm_out` / `proj_out` / unpatchify), shape `[B, seq, hidden]`. `None` runs all blocks.
+    /// Lets the parity golden localize a drift to a single block vs. the full 28-block stack.
+    #[doc(hidden)]
+    pub fn forward_hidden(
+        &self,
+        latents: &Array,
+        sigma: &Array,
+        encoder: &Array,
+        dtype: Dtype,
+        num_blocks: Option<usize>,
+    ) -> Result<Array> {
+        Ok(self
+            .run_blocks(latents, sigma, encoder, dtype, num_blocks)?
+            .0)
     }
 }

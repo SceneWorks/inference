@@ -609,6 +609,7 @@ dependencies = [
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]
