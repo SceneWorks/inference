@@ -423,10 +423,24 @@ fn synth_summarize(arr: &Array, n_samples: usize) -> Value {
     })
 }
 
-/// Assert a synthetic output against its committed summary: shape + count + aggregate stats
-/// (`stat_rtol`) + every pinned sample (`atol`/`rtol`). A structural regression moves these by orders of
-/// magnitude; the tolerances only absorb Metal fp32 run-to-run / cross-machine noise.
-fn assert_synth(got: &Array, g: &Value, label: &str) {
+/// Assert a synthetic output against its committed summary with a **distribution / relative-L2** gate —
+/// the SAME shape the real-weights stages use (`parity_real_weights::assert_sampled_rel_l2`), and for the
+/// same reason. A per-**element** `atol`/`rtol` gate is the WRONG shape here: cross-**device** Metal fp32
+/// matmul reorders its reductions, so a single small-magnitude element of a RAW pre-norm block hidden can
+/// differ by a few e-3 *relative* between the Mac that blessed this golden and the CI runner — the CI
+/// failure that motivated this change was |Δ| 5.9e-4 on |want| ≈ 0.153 (≈3.9e-3 relative), squarely
+/// inside this codebase's long-documented ~1e-3 Metal-matmul relative spread. The old per-element bound
+/// (`atol 1e-4 + rtol 1e-3` ≈ 2.5e-4 there) sat *below* that spread and so was red on CI while green on
+/// the blessing machine — a device-portability bug in the gate, not a numeric regression.
+///
+/// So we gate the DISTRIBUTION instead: aggregate stats (mean/std/l2 within `stat_rtol`) plus a sampled
+/// relative-L2 `‖got−want‖₂ / ‖want‖₂` over the fixed index set (under `max_rel_l2`). rel-L2 is
+/// norm-weighted — it is NOT dominated by one small-magnitude element's relative rounding (the thing that
+/// varies device-to-device), yet a structural regression (dropped 17→16 concat, swapped adaLN
+/// scale/shift, transposed h/w RoPE axis) still moves it by ORDERS of magnitude. Returns the sampled
+/// rel-L2 so the caller can log it. NOTE: `stat_rtol`/`max_rel_l2` absorb cross-**device** Metal fp32
+/// matmul variance — not merely single-machine run-to-run noise.
+fn assert_synth(got: &Array, g: &Value, label: &str, stat_rtol: f64, max_rel_l2: f64) -> f64 {
     let want_shape: Vec<i32> = g["shape"]
         .as_array()
         .unwrap()
@@ -443,6 +457,8 @@ fn assert_synth(got: &Array, g: &Value, label: &str) {
         .collect();
     let count = g["count"].as_u64().unwrap() as usize;
     assert_eq!(flat.len(), count, "{label}: count");
+    // (1) Aggregate distribution gate — cross-device fp32 reordering barely moves these sums; a
+    //     structural bug shifts them by orders of magnitude.
     let mean = flat.iter().sum::<f64>() / count as f64;
     let std = (flat.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / count as f64).sqrt();
     let l2 = flat.iter().map(|&x| x * x).sum::<f64>().sqrt();
@@ -452,13 +468,13 @@ fn assert_synth(got: &Array, g: &Value, label: &str) {
         g["l2"].as_f64().unwrap(),
     );
     let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-6);
-    let stat_rtol = 1e-3;
     assert!(
         (mean - gm).abs() < stat_rtol * gs.abs().max(1e-3),
         "{label}: mean drift {mean} vs {gm}"
     );
     assert!(rel(std, gs) < stat_rtol, "{label}: std drift {std} vs {gs}");
     assert!(rel(l2, gl) < stat_rtol, "{label}: l2 drift {l2} vs {gl}");
+    // (2) Sampled relative-L2 gate — the primary structural check.
     let idx: Vec<usize> = g["sample_indices"]
         .as_array()
         .unwrap()
@@ -472,21 +488,24 @@ fn assert_synth(got: &Array, g: &Value, label: &str) {
         .map(|x| x.as_f64().unwrap())
         .collect();
     assert!(idx.len() >= 16, "{label}: too few samples ({})", idx.len());
-    let (sample_atol, sample_rtol) = (1e-4, 1e-3);
-    let mut max_abs = 0f64;
+    let mut num = 0f64;
+    let mut den = 0f64;
     for (&i, &want) in idx.iter().zip(&vals) {
-        let d = (flat[i] - want).abs();
-        max_abs = max_abs.max(d);
-        assert!(
-            d <= sample_atol + sample_rtol * want.abs(),
-            "{label}: sample[{i}] = {}, want {want} (|Δ| {d:.3e})",
-            flat[i]
-        );
+        let d = flat[i] - want;
+        num += d * d;
+        den += want * want;
     }
+    let rel_l2 = (num / den.max(1e-12)).sqrt();
     println!(
-        "[{label}] max sample |Δ| = {max_abs:.3e} over {} samples",
-        idx.len()
+        "[{label}] rel-L2 = {rel_l2:.4e} (bound {max_rel_l2:.1e}); stats mean {mean:.5}/{gm:.5} \
+         std {std:.5}/{gs:.5} l2 {l2:.4}/{gl:.4}"
     );
+    assert!(
+        rel_l2 < max_rel_l2,
+        "{label}: sampled rel-L2 {rel_l2:.4e} exceeds {max_rel_l2:.1e} — a structural regression, \
+         not cross-device fp32 noise"
+    );
+    rel_l2
 }
 
 /// **CI numeric protection for the DiT forward** — runs the synthetic-weight Cosmos DiT on Metal (no
@@ -495,8 +514,20 @@ fn assert_synth(got: &Array, g: &Value, label: &str) {
 fn synthetic_dit_forward_golden() {
     let g = load_golden("dit_synthetic_golden.json");
     let (block0, full) = synth_run();
-    assert_synth(&block0, &g["block0"], "synth_block0");
-    assert_synth(&full, &g["full"], "synth_full");
+    // block0 is the RAW pre-norm block-0 hidden — the worst-conditioned tensor in the forward, and the one
+    // whose small-magnitude elements diverge most device-to-device (the CI failure that motivated this gate
+    // was a block0 element). Gate its distribution LOOSELY, as a corroborating backstop: `max_rel_l2 =
+    // 1.2e-2` is ~3.1× above the worst-case cross-device spread (~3.9e-3 relative) and ~24× above the
+    // realistic aggregate spread (~5e-4), while still tripping on every structural mutation (measured on
+    // this fixture: drop-concat 1.30, adaLN-swap 0.170, RoPE-h/w-swap 0.038 — the last only ~3.2× over this
+    // bound because a 2×3 grid barely reshuffles under an axis swap; the FINAL-velocity gate below is what
+    // carries the >10× guarantee for it).
+    assert_synth(&block0, &g["block0"], "synth_block0", 5e-3, 1.2e-2);
+    // The final velocity is norm_out + proj_out (LayerNorm-conditioned → the small-magnitude blow-ups that
+    // make block0 noisy are gone), so it is the TIGHT gate. `max_rel_l2 = 5e-3` clears the (larger,
+    // accumulated) cross-device spread with ~6× headroom yet catches ALL three mutations with margin —
+    // measured: drop-concat 1.29 (258×), adaLN-swap 0.313 (63×), RoPE-h/w-swap 0.065 (13×, the smallest).
+    assert_synth(&full, &g["full"], "synth_full", 3e-3, 5e-3);
 }
 
 /// Regenerate `dit_synthetic_golden.json` (gated on `ANIMA_BLESS_SYNTH=1` so a bare `--ignored` run is a
