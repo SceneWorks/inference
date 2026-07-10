@@ -3,11 +3,13 @@
 //! grid over `head_dim` channels, split `dim_t | dim_h | dim_w` and duplicated (`[t,h,w]·2`) so the
 //! half-split rotate (`apply_text_rope`) rotates matching frequency pairs.
 //!
-//! **Per-axis OOD clamp (VERIFIED trap, same class as the PiD sincos-pos-embed bug).** The reference
+//! **Per-axis OOD reject (VERIFIED trap, same class as the PiD sincos-pos-embed bug).** The reference
 //! indexes `seq = arange(max(max_size))` per spatial axis; a request whose post-patch extent exceeds
 //! `max_size` (`(128,120,120)` = `max_size/patch`, ~1920 px/side spatially) would index positions the
-//! model never trained on (and truncate the `seq` slice → shape corruption). We reject it here rather
-//! than silently emit garbage — `1536²` (post-patch 96) fits, `>1920 px/side` does not.
+//! model never trained on (and truncate the `seq` slice → shape corruption). We **error** here rather
+//! than silently emit garbage (or clamp/wrap the index) — `1536²` (post-patch 96) fits, `>1920 px/side`
+//! is rejected. (Unreachable via the normal path — `RES_MAX=1536` caps the post-patch extent at 96 < 120
+//! — but kept as defense against a future max-size change.)
 
 use mlx_rs::Array;
 

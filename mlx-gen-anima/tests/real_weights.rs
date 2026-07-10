@@ -183,12 +183,13 @@ fn vae_decode_shape() {
 }
 
 // NOTE: the flow-velocity convention (the DiT is a standard flow denoiser, `v ≈ ε − x0`) and the raw-σ
-// timestep were verified during the port via a `cos(v, ε − x0)` measurement against a KNOWN
-// VAE-encoded latent (≈0.96 with timestep=σ; ≈0 with timestep=σ·1000). That check materializes many
-// arrays and is flaky when run in the same test binary as other Metal tests (an mlx-rs cross-test
-// default-stream quirk), so it is not kept as a standing test — the end-to-end `generate_*` test below
-// is the standing guard: a wrong sign or timestep collapses the output into a wash/noise that
-// `assert_coherent` rejects. See `pipeline.rs` for the convention documentation.
+// timestep have a dedicated `cos(v, ε − x0)` regression guard against a KNOWN VAE-encoded latent
+// (≈0.9+ with timestep=σ; a negated velocity flips it strongly negative; a σ·1000 timestep collapses
+// it toward 0). That check materializes many arrays, so — rather than run it in this shared binary,
+// where mlx-rs's single Metal default stream can cross-contaminate — it lives in its own
+// integration-test binary at `tests/velocity_convention.rs` (also `#[ignore]`d / real-weights-gated).
+// The end-to-end `generate_*` test below is a second, coarser guard: a wrong sign or timestep collapses
+// the output into a wash/noise that `assert_coherent` rejects. See `pipeline.rs` for the convention.
 
 // -------------------------------------------------------------------------------------------------
 // Acceptance: generate a real, coherent image for all three variants (bf16, 1024², fixed seed).

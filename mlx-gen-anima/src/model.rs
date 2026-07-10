@@ -7,7 +7,7 @@
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Quant, Result,
+    Progress, Result,
 };
 
 use crate::config::{Variant, RES_MULTIPLE};
@@ -15,8 +15,9 @@ use crate::pipeline::{AnimaPipeline, GenOptions};
 
 const MAX_COUNT: u32 = 8;
 const RES_MIN: u32 = 512;
-/// Above ~1920 px/side the Cosmos RoPE indexes OOD; the shipped ceiling is 1536² (post-patch 96,
-/// well within the 120-position max_size). See [`crate::rope`].
+/// Above ~1920 px/side the Cosmos RoPE would index out of its trained range; `rope.rs` **rejects**
+/// (errors on) such a request rather than clamping. The shipped ceiling is 1536² (post-patch 96, well
+/// within the 120-position max_size), so the guard is unreachable via the normal path. See [`crate::rope`].
 const RES_MAX: u32 = 1536;
 
 /// Build the descriptor for a variant. Turbo is the merged CFG-free student (no guidance / negative
@@ -45,9 +46,13 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             max_size: RES_MAX,
             max_count: MAX_COUNT,
             mac_only: true,
-            // Quant TIERS land in sc-10517 (this story loads the single-file bf16 checkpoint); the
-            // surface is declared here per the epic plan. `load` rejects a `quantize` request until then.
-            supported_quants: &[Quant::Q4, Quant::Q8],
+            // No quant tiers yet: this story loads only the single-file bf16 checkpoint, so we must
+            // NOT advertise Q4/Q8. The worker reads `supported_quants` for its capability advertisement
+            // (gen-core sc-3723), so advertising a tier `load` rejects would surface Q4/Q8 in the UI and
+            // hand the user a load-time failure on an advertised option — a runtime lie, not a
+            // placeholder. sc-10517 will populate this to `&[Quant::Q4, Quant::Q8]` when it lands the
+            // actual quantized weights + load path.
+            supported_quants: &[],
             supports_kv_cache: false,
             requires_sigma_shift: true,
         },
@@ -88,11 +93,12 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>>
             "{id}: only the default dense bf16 precision is wired (drop the precision override)"
         )));
     }
-    // Quant tiers are sc-10517: the Capabilities advertise Q4/Q8, but this story loads the single-file
-    // bf16 checkpoint only. Reject a quantize request explicitly rather than silently serving bf16.
+    // No quant tiers are wired yet (sc-10517): `Capabilities::supported_quants` is `&[]`, so the worker
+    // never advertises Q4/Q8. This rejection is defense-in-depth against a stale or hand-built request —
+    // reject a quantize request explicitly rather than silently serving bf16.
     if spec.quantize.is_some() {
         return Err(Error::Msg(format!(
-            "{id}: Q4/Q8 quant tiers are not yet wired (tracked in sc-10517); load the bf16 checkpoint"
+            "{id}: no quant tiers are wired yet (bf16 only; Q4/Q8 tracked in sc-10517)"
         )));
     }
     let pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
@@ -180,7 +186,7 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::gen_core;
-    use mlx_gen::WeightsSource;
+    use mlx_gen::{Quant, WeightsSource};
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -213,7 +219,9 @@ mod tests {
         assert!(b.capabilities.requires_sigma_shift);
         assert!(b.capabilities.supports_lora && b.capabilities.supports_lokr);
         assert!(b.capabilities.mac_only);
-        assert_eq!(b.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        // No quant tiers advertised yet (sc-10517 will populate this to [Q4, Q8]); advertising a tier
+        // `load` rejects would be a capability lie the worker would surface to the UI.
+        assert_eq!(b.capabilities.supported_quants, &[] as &[Quant]);
         assert_eq!(b.capabilities.min_size, 512);
         assert_eq!(b.capabilities.max_size, 1536);
         // Turbo is the CFG-free merged student.
