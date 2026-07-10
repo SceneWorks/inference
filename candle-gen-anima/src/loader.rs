@@ -5,13 +5,16 @@
 //! (`{prefix}.llm_adapter.*`). We detect the root `{prefix}` from the checkpoint keys and build both
 //! from the same mmap'd VarBuilder with their respective sub-prefixes.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::safetensors::MmapedSafetensors;
-use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::WeightsSource;
+use candle_gen::candle_core::safetensors::{self as cst, MmapedSafetensors};
+use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::{AdapterSpec, WeightsSource};
 use candle_gen::{CandleError, Result};
 
+use crate::adapters::apply_anima_adapters;
 use crate::conditioner::AnimaTextConditioner;
 use crate::config::{ConditionerConfig, DitConfig, Qwen3Config, Variant};
 use crate::text_encoder::AnimaQwen3;
@@ -89,6 +92,14 @@ fn resolve_split_files(source: &WeightsSource) -> Result<PathBuf> {
     }
 }
 
+/// Load every tensor of the Anima DiT single-file checkpoint into a CPU key→`Tensor` map (native
+/// dtype) for the adapter-merge path — the fold runs on CPU in f32, then the merged map is cast to the
+/// compute dtype + moved to the device. Only taken when adapters are present (it gives up the mmap the
+/// adapter-free path keeps, so the plain model pays nothing).
+fn load_dit_map(path: &Path) -> Result<HashMap<String, Tensor>> {
+    Ok(cst::load(path, &Device::Cpu)?)
+}
+
 /// The assembled Anima components for one variant.
 pub struct AnimaComponents {
     pub dit: CosmosDiT,
@@ -101,8 +112,14 @@ pub struct AnimaComponents {
 }
 
 impl AnimaComponents {
-    /// Load all components for `variant` from a weights source (a `split_files/` dir or a DiT file).
-    pub fn load(source: &WeightsSource, variant: Variant, device: &Device) -> Result<Self> {
+    /// Load all components for `variant`. `adapters` are LoRA/LoKr `.safetensors` baked onto the DiT +
+    /// bundled conditioner at load (stacked, mixed) — empty for the plain model.
+    pub fn load(
+        source: &WeightsSource,
+        variant: Variant,
+        device: &Device,
+        adapters: &[AdapterSpec],
+    ) -> Result<Self> {
         let root = resolve_split_files(source)?;
         let dit_path = root.join("diffusion_models").join(variant.dit_filename());
         if !dit_path.is_file() {
@@ -114,9 +131,35 @@ impl AnimaComponents {
         let dtype = compute_dtype();
 
         // The DiT file carries both the Cosmos DiT and the bundled conditioner. Detect the root prefix
-        // (`net` or `model.diffusion_model`), then build both from ONE mmap'd VarBuilder.
+        // (`net` or `model.diffusion_model`), then build both from ONE VarBuilder.
         let prefix = detect_dit_prefix(&dit_path)?;
-        let dit_vb = candle_gen::mmap_var_builder(std::slice::from_ref(&dit_path), dtype, device)?;
+        let dit_vb = if adapters.is_empty() {
+            // Fast path: mmap the checkpoint directly (no adapter fold).
+            candle_gen::mmap_var_builder(std::slice::from_ref(&dit_path), dtype, device)?
+        } else {
+            // Adapter path: fold every LoRA/LoKr delta into the base weights at the safetensors-key
+            // level (merge, don't residual — the DiT is chaos-sensitive), then build from the merged
+            // map. The 448 DiT + 60 conditioner targets both fold into `{prefix}.{path}.weight`; a
+            // target that fails to route hard-errors (no silent partial — sc-10274).
+            let mut base = load_dit_map(&dit_path)?;
+            // A packed (Q4/Q8) DiT stores u32 codes, not dense `.weight` matrices — folding `B·A` into
+            // codes would silently corrupt them (the delta shape never matches the packed shape, so the
+            // fold would no-op partially). Refuse the packed+adapter combo here rather than mis-merge.
+            if base.keys().any(|k| k.ends_with(".scales")) {
+                return Err(CandleError::Msg(format!(
+                    "anima: cannot fold a LoRA/LoKr onto a packed (Q4/Q8) DiT tier at {} — apply the \
+                     adapter to the dense checkpoint",
+                    dit_path.display()
+                )));
+            }
+            let _report = apply_anima_adapters(&mut base, &prefix, adapters)?;
+            // Unify to the compute dtype + device (the fold ran in f32 on CPU) and build.
+            let merged: HashMap<String, Tensor> = base
+                .into_iter()
+                .map(|(k, v)| Ok((k, v.to_dtype(dtype)?.to_device(device)?)))
+                .collect::<Result<_>>()?;
+            VarBuilder::from_tensors(merged, dtype, device)
+        };
         let dit = CosmosDiT::new(&dit_vb.pp(&prefix), DitConfig::anima())?;
         let conditioner = AnimaTextConditioner::new(
             &dit_vb.pp(&prefix).pp("llm_adapter"),

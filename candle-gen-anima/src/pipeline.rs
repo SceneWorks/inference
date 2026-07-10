@@ -12,12 +12,11 @@ use rand::SeedableRng;
 use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
 use crate::loader::AnimaComponents;
 
-/// Anima's default flow solver on the candle lane. The MLX lane defaults to the recommended `er_sde`
-/// (sc-10519), but this crate's pinned candle `gen-core` predates that solver — `er_sde` is not yet in
-/// the candle curated menu, so advertising/using it would be a silent fallback. We default to `euler`
-/// (the flow solver present on this pin, algebraically the reference Euler integrator) until the candle
-/// `gen-core` rev advances to include the sc-10519 `er_sde` port; a request `sampler` still overrides it.
-pub const DEFAULT_SAMPLER: &str = "euler";
+/// Anima's default flow solver: the recommended **ER-SDE-3** (`er_sde`, sc-10519), matching the MLX
+/// lane. The workspace `gen-core` is pinned to `441ecec` (mlx-gen PR #673's CI-green head), which
+/// carries the `ErSde` solver in the curated menu — so this is a real curated sampler, not a silent
+/// fallback. A request `sampler` overrides it; any curated flow solver (euler, dpmpp_2m, …) is valid.
+pub const DEFAULT_SAMPLER: &str = "er_sde";
 
 /// The Anima sigma schedule: `linspace(1.0, 1/N, N)` (**NOT** the diffusers default) time-shifted by
 /// the static `shift=3.0` (`3σ / (1 + 2σ)`), with the trailing terminal `0.0`. Length `N + 1`, descending.
@@ -72,9 +71,14 @@ pub struct AnimaPipeline {
 }
 
 impl AnimaPipeline {
-    pub fn from_source(source: &WeightsSource, variant: Variant, device: &Device) -> Result<Self> {
+    pub fn from_source(
+        source: &WeightsSource,
+        variant: Variant,
+        device: &Device,
+        adapters: &[candle_gen::gen_core::AdapterSpec],
+    ) -> Result<Self> {
         Ok(Self {
-            components: AnimaComponents::load(source, variant, device)?,
+            components: AnimaComponents::load(source, variant, device, adapters)?,
             device: device.clone(),
         })
     }
