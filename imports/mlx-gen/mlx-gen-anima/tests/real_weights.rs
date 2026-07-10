@@ -18,7 +18,6 @@ use mlx_gen_anima::conditioner::AnimaTextConditioner;
 use mlx_gen_anima::config::{ConditionerConfig, DitConfig, Variant};
 use mlx_gen_anima::loader::split_anima_keys;
 use mlx_gen_anima::pipeline::{AnimaPipeline, GenOptions};
-use mlx_gen_anima::strip_prompt_weights;
 use mlx_gen_anima::tokenizer::AnimaTokenizers;
 use mlx_gen_anima::transformer::CosmosDiT;
 
@@ -389,29 +388,83 @@ fn prompt_weighting_both_directions_and_image() {
     let pipeline =
         AnimaPipeline::from_source(&WeightsSource::Dir(split.clone()), Variant::Turbo).unwrap();
 
-    // Direction 1 — T5-side weighting CHANGES the conditioner output.
+    // Direction 1 — T5-side weighting CHANGES the conditioner output. This `max|Δ|` is only a smoke
+    // bound (a wrong-but-nonzero impl clears it); the REAL correctness proof is the bf16-exact per-row
+    // check in Direction 2 below and in `prompt_weighting_scales_only_weighted_t5_rows`.
     let base_c = pipeline.encode_prompt(plain).unwrap();
     let wt_c = pipeline.encode_prompt(weighted).unwrap();
     let d_t5 = maxabs_diff(&base_c, &wt_c);
     println!("[both-directions] T5-side (chibi:2.0) vs plain — conditioner max|Δ| = {d_t5:.4}");
     assert!(
-        d_t5 > 0.1,
+        d_t5 > 0.5,
         "T5-side weighting must change the conditioner output (max|Δ| {d_t5})"
     );
 
-    // Direction 2 — Qwen tower is weight-BLIND: identical ids for weighted vs de-weighted prompt, so
-    // the Qwen contribution to the change is exactly 0 (ComfyUI pins the Qwen token weights to 1.0;
-    // no path routes the weight to Qwen).
-    let (q_plain, _) = pipeline.components().tokenizers.encode_qwen(plain).unwrap();
-    let (q_wt, _) = pipeline
+    // Direction 2 — the weight VALUE is independent of the Qwen tower (the real Qwen-blindness proof;
+    // the old "ids match" leg was true by construction). Encode the SAME prompt at two powers-of-two
+    // weights (2.0 vs 4.0 ⇒ bf16-exact) through the production `encode_prompt`. The stripped text,
+    // Qwen tokens and T5 ids are identical, so the conditioner output may differ ONLY on the weighted
+    // T5 rows (scaled 2.0 vs 4.0 ⇒ enc4 = enc2 × 2.0 exactly). If the weight leaked into the Qwen
+    // path, its cross-attention source would differ between the two weights and smear a change into
+    // EVERY output row — so the unweighted/pad rows would NOT be bit-identical.
+    let p2 = "1girl, (chibi:2.0), masterpiece, silver hair, detailed illustration";
+    let p4 = "1girl, (chibi:4.0), masterpiece, silver hair, detailed illustration";
+    let (ids2, w2) = pipeline
         .components()
         .tokenizers
-        .encode_qwen(&strip_prompt_weights(weighted))
+        .encode_t5_weighted(p2)
+        .unwrap();
+    let (ids4, w4) = pipeline
+        .components()
+        .tokenizers
+        .encode_t5_weighted(p4)
         .unwrap();
     assert_eq!(
-        q_plain.as_slice::<i32>(),
-        q_wt.as_slice::<i32>(),
-        "Qwen ids must be identical — the Qwen tower never sees the weight (Qwen-side Δ = 0)"
+        ids2.as_slice::<i32>(),
+        ids4.as_slice::<i32>(),
+        "same T5 tokens — only the weight VALUE differs between the two prompts"
+    );
+    let st = w2.len();
+    let enc2 = pipeline.encode_prompt(p2).unwrap();
+    let enc4 = pipeline.encode_prompt(p4).unwrap();
+    let (e2, e4) = (to_f32(&enc2), to_f32(&enc4));
+    let d = 1024usize;
+    let (mut qwen_row_maxabs, mut weighted_rows) = (0f32, 0usize);
+    for (r, (r2, r4)) in e2.chunks(d).zip(e4.chunks(d)).enumerate() {
+        let (a, b) = (
+            if r < st { w2[r] } else { 1.0 },
+            if r < st { w4[r] } else { 1.0 },
+        );
+        if (a - 1.0).abs() < 1e-6 && (b - 1.0).abs() < 1e-6 {
+            // Unweighted / pad row — must be BIT-IDENTICAL across the two weight values: the Qwen
+            // contribution (and unweighted T5 rows) is invariant to the weight VALUE.
+            let m = r2
+                .iter()
+                .zip(r4)
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            qwen_row_maxabs = qwen_row_maxabs.max(m);
+        } else {
+            // Weighted row — scaled by exactly b/a (4.0 / 2.0 = 2.0, bf16-exact).
+            let ratio = b / a;
+            for (x, y) in r2.iter().zip(r4) {
+                assert!(
+                    (y - x * ratio).abs() == 0.0,
+                    "row {r}: enc4 {y} != enc2*{ratio} {}",
+                    x * ratio
+                );
+            }
+            weighted_rows += 1;
+        }
+    }
+    println!(
+        "[both-directions] Qwen weight-value blindness: weight 2.0 vs 4.0 — unweighted/pad rows \
+         max|Δ| = {qwen_row_maxabs:.6} (weighted rows scaled exactly ×2.0: {weighted_rows})"
+    );
+    assert!(weighted_rows > 0, "expected some weighted T5 rows");
+    assert_eq!(
+        qwen_row_maxabs, 0.0,
+        "unweighted / pad rows must be identical across weight VALUES — a nonzero delta means the \
+         weight value leaked into the Qwen tower (cross-attn smears it into every row)"
     );
 
     // Image — (chibi:2.0) must visibly change the generated image vs the unweighted prompt.
