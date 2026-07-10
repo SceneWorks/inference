@@ -25,6 +25,7 @@
 //! Tokenization is dual: Qwen2 BPE (no BOS/EOS, pad 151643) for the encoder, T5 SentencePiece (with
 //! EOS) for the conditioner's query tokens ([`tokenizer`]).
 
+pub mod adapters;
 pub mod conditioner;
 pub mod config;
 pub mod loader;
@@ -36,6 +37,7 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
 
+pub use adapters::{apply_anima_adapters, AnimaAdapterHost};
 pub use conditioner::AnimaTextConditioner;
 pub use config::{ConditionerConfig, DitConfig, Qwen3Config, Variant};
 pub use loader::{split_anima_keys, AnimaComponents};
