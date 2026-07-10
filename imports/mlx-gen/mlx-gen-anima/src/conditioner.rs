@@ -243,12 +243,15 @@ impl AnimaTextConditioner {
 
 // ---- LoRA/LoKr adapter surface (sc-10521) --------------------------------------------------------
 //
-// The **turbo** LoRA (`anima-turbo-lora-v0.2`) carries 60 = 6×10 `llm_adapter.*` targets that a
-// DiT-only injection walk silently drops — the exact sc-10274 (eros distill LoRA) failure class. The
-// conditioner MUST be a first-class injectable target. The trained files address it (after the loader
-// strips the `diffusion_model.` prefix and the top-level host strips the `llm_adapter.` segment) by
-// the conditioner's own module names: `blocks.N.{self_attn,cross_attn}.{q_proj,k_proj,v_proj,o_proj}`
-// and `blocks.N.mlp.{0,2}` (no norm targets).
+// The **turbo** LoRA (`anima-turbo-lora-v0.2`) addresses 60 = 6×10 `llm_adapter.*` targets that a
+// DiT-only injection walk would silently drop — the sc-10274 (eros distill LoRA) failure class. (Those
+// 60 `lora_B` are zero-initialized in the turbo file, so `B·A ≡ 0` and dropping them is numerically
+// inert for *it*; routing must still be enforced for future non-zero conditioner LoRAs and the shipped
+// `anima-rl-v0.1`, which also carries these 60 targets.) The conditioner MUST therefore be a
+// first-class injectable target. The trained files address it (after the loader strips the
+// `diffusion_model.` prefix and the top-level host strips the `llm_adapter.` segment) by the
+// conditioner's own module names: `blocks.N.{self_attn,cross_attn}.{q_proj,k_proj,v_proj,o_proj}` and
+// `blocks.N.mlp.{0,2}` (no norm targets).
 
 impl AdaptableHost for Attention {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
