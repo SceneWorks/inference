@@ -29,6 +29,7 @@
 //! conditioner targets folded at load, stacked + mixed, strict routing — [`adapters`]). Q4/Q8 candle
 //! quant tiers are the counterpart of MLX sc-10517 (see the `quant` gap note in [`loader`]).
 
+pub mod adapt;
 pub mod adapters;
 pub mod conditioner;
 pub mod config;
@@ -150,16 +151,12 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         )));
     }
     // A Q4/Q8 tier is a **pre-packed** snapshot (the worker points `spec.weights` at it; the DiT
-    // packed-detects it at load). Folding a LoRA/LoKr into u32-packed codes is a separate dequant-fold
-    // job (additive-branch `y = xW_packed + scale·(xA)B`, epic 10043 prior art) — tracked as
-    // **sc-10578** (packed q4/q8 tier + LoRA/LoKr, both MLX and candle lanes). Reject the packed+adapter
-    // COMBO here rather than silently mis-merge into the codes; an error is correct until sc-10578 lands.
-    if spec.quantize.is_some() && !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id}: LoRA/LoKr on a quantized (Q4/Q8) tier is not wired (sc-10578) — apply the adapter to \
-             the dense checkpoint, or use the dense tier"
-        )));
-    }
+    // packed-detects it at load). LoRA/LoKr on a packed tier is now wired (sc-10640): the loader builds
+    // the packed model and installs each adapter as a **forward-time residual** (`y = xW_packed +
+    // scale·(xA)B`, epic 10043 prior art) rather than folding into the codes — so no rejection here. The
+    // dense-checkpoint fold and the packed residual are both handled in `loader::AnimaComponents::load`
+    // (a LoKr/LoHa on a packed tier still errors, in the loader — sc-10713).
+    //
     // A requested Q4/Q8 tier MUST be an actually-packed checkpoint (u32 codes + `.scales`). Anima ships
     // no packed tier yet, and `lin()` packed-detects PER-TENSOR — so a `quantize = Q8` request against a
     // DENSE DiT would silently build bf16 and return success (a tier downgrade the caller never sees).
@@ -377,8 +374,36 @@ mod tests {
         root
     }
 
+    /// Write a minimal **packed** DiT split_files layout (an anchor tensor WITH a `.scales`/`.biases`
+    /// sibling) so the quant-guard header-detects it as packed. Returns the split_files root.
+    fn write_packed_split_files() -> std::path::PathBuf {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        let root = std::env::temp_dir().join(format!("anima_packed_guard_{}", std::process::id()));
+        let dm = root.join("diffusion_models");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dm).unwrap();
+        let mut m = std::collections::HashMap::new();
+        // The anchor `.weight` (u32 codes) + `.scales`/`.biases` — enough for the header-only packed
+        // detect (`dit_path_is_packed` looks only for a `.scales` sibling).
+        m.insert(
+            "net.x_embedder.proj.1.weight".to_string(),
+            Tensor::zeros((2, 2), DType::U32, &Device::Cpu).unwrap(),
+        );
+        m.insert(
+            "net.x_embedder.proj.1.scales".to_string(),
+            Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap(),
+        );
+        m.insert(
+            "net.x_embedder.proj.1.biases".to_string(),
+            Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_gen::candle_core::safetensors::save(&m, dm.join(Variant::Base.dit_filename()))
+            .unwrap();
+        root
+    }
+
     #[test]
-    fn load_accepts_adapters_but_rejects_quant_on_dense_the_combo_and_control() {
+    fn load_accepts_lora_and_packed_combo_but_rejects_quant_on_dense() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let root = write_dense_split_files();
         let base = WeightsSource::Dir(root.clone());
@@ -410,16 +435,36 @@ mod tests {
             );
         }
 
-        // The packed+LoRA COMBO is rejected before the packed-detect (folding into u32 codes is the
-        // additive-branch dequant-fold tracked as sc-10578).
-        let combo = LoadSpec::new(base.clone())
+        // Q8 + LoRA against a DENSE checkpoint still errors — but for the **tier-mismatch** reason (Q8 on
+        // a dense DiT), NOT a packed+adapter combo rejection. That combo rejection was REMOVED in sc-10640
+        // (the combo is now wired via forward-time residuals); the guard that fires here is the same dense
+        // tier-mismatch as the no-adapter case above, so the message names DENSE.
+        let dense_combo = LoadSpec::new(base.clone())
             .with_quant(Quant::Q8)
             .with_adapters(lora_spec());
-        assert!(matches!(
-            load_base(&combo).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        let gen_core::Error::Unsupported(msg) = load_base(&dense_combo).err().expect("err") else {
+            panic!("expected Unsupported");
+        };
+        assert!(
+            msg.contains("DENSE"),
+            "dense-tier mismatch (Q8 on dense), not a packed-combo rejection: {msg}"
+        );
+
+        // sc-10640: Q4/Q8 + LoRA on a **packed** checkpoint is now ACCEPTED at load (built lazily; the
+        // residual install runs at first generate). This is exactly the combo that used to be rejected.
+        let packed_root = write_packed_split_files();
+        let packed = WeightsSource::Dir(packed_root.clone());
+        assert!(
+            load_base(
+                &LoadSpec::new(packed)
+                    .with_quant(Quant::Q8)
+                    .with_adapters(lora_spec())
+            )
+            .is_ok(),
+            "packed tier + LoRA must be accepted at load (sc-10640) — no combo rejection"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&packed_root);
     }
 }

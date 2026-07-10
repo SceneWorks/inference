@@ -20,9 +20,9 @@
 //! {"format":"pt"}`, zero `.alpha` tensors) means α = r means scale 1.0, folded via the same f32 math
 //! a candle trainer's forward would use.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use candle_gen::candle_core::Tensor;
+use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta};
 use candle_gen::train::merge::{
@@ -30,6 +30,10 @@ use candle_gen::train::merge::{
     Role,
 };
 use candle_gen::{CandleError, Result};
+
+use crate::adapt::AdaptLinear;
+use crate::conditioner::AnimaTextConditioner;
+use crate::transformer::CosmosDiT;
 
 /// LoRA-key namespace prefixes an Anima adapter may carry, longest-first so the more specific PEFT form
 /// wins (the trained files use `diffusion_model.`; a bare-key candle-trained adapter matches `""`).
@@ -266,6 +270,186 @@ pub fn apply_anima_adapters(
     Ok(report)
 }
 
+// ---- Unmerged additive-LoRA path (sc-10640, epic 10043) -----------------------------------------
+//
+// A packed q4/q8 DiT has no dense `.weight` to fold `B·A` into (`apply_anima_adapters` folds the delta
+// before the model is built), so on a packed tier the adapters apply as **forward-time residuals** on
+// the *already-built* model: `y = base(x) + scale·((x·A)·B)` ([`AdaptLinear::push_lora`]), the packed
+// codes used AS-IS — no dense weight is materialized, so a q4 base keeps its q4 footprint. This is the
+// candle twin of the MLX additive branch (sc-10578) and the direct analog of `candle-gen-wan`'s
+// `install_additive` (sc-10094). Both the 448 DiT targets (packed) and the 60 conditioner targets (dense
+// bf16 — Anima packs ONLY the DiT) install uniformly through this one path. **LoKr/LoHa on a packed tier
+// is rejected**: its residual needs a materialized `[out,in]` delta (≈3.9 GB over the 448 DiT targets —
+// more memory than the bf16 tier it was meant to shrink), so the structured Kronecker residual is
+// deferred to sc-10713. On a dense tier LoKr/LoHa still fold through [`apply_anima_adapters`].
+
+/// A LoRA residual resolved from a file, pending attachment to a host projection: `a = downᵀ`
+/// `[in, rank]`, `b = upᵀ·(alpha/rank)` `[rank, out]` (the `alpha/rank` ratio folded into `b`, matching
+/// the fold path's split), `scale` = the spec's user strength. Held f32 (the merge dtype).
+struct PendingLora {
+    a: Tensor,
+    b: Tensor,
+    scale: f64,
+}
+
+/// True when a file carries LoKr/LoHa factors (or is declared LoKr) — such an adapter cannot apply
+/// additively on a **packed** base (its residual needs a materialized `[out,in]` grid; the structured
+/// Kronecker residual is sc-10713), and on a dense base it belongs on the [`apply_anima_adapters`] fold
+/// path. Mirrors `candle-gen-wan::adapters::is_lokr_or_loha`.
+fn is_lokr_or_loha(af: &AdapterFile, kind: AdapterKind) -> bool {
+    kind == AdapterKind::Lokr
+        || af.declares_lokr()
+        || af.tensors.keys().any(|k| {
+            k.contains(".lokr_")
+                || k.contains(".hada_")
+                || k.starts_with("lokr_")
+                || k.starts_with("hada_")
+        })
+}
+
+/// Resolve one LoRA file's complete `(down, up[, alpha])` groups into per-path [`PendingLora`]s at
+/// `scale`, mirroring [`merge_lora_file`]'s classification + `alpha/rank` split — but producing the
+/// **unmerged** `a`/`b` factors instead of a folded delta.
+fn resolve_lora_file(
+    af: &AdapterFile,
+    scale: f32,
+    pending: &mut BTreeMap<String, Vec<PendingLora>>,
+    skipped_keys: &mut usize,
+) -> Result<()> {
+    let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
+    for (key, t) in &af.tensors {
+        match classify_lora_key(key) {
+            Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
+            Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
+            Some((path, Role::Alpha)) => {
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+            }
+            None => *skipped_keys += 1,
+        }
+    }
+    for (path, t) in triples {
+        let (Some(down), Some(up)) = (t.down, t.up) else {
+            *skipped_keys += 1; // half-pair
+            continue;
+        };
+        if down.dims().len() != 2 || up.dims().len() != 2 {
+            *skipped_keys += 1; // Anima adapts Linears only
+            continue;
+        }
+        let rank = down.dims()[0] as f64;
+        if rank == 0.0 {
+            *skipped_keys += 1;
+            continue;
+        }
+        // No PEFT `.alpha` ⇒ α = rank ⇒ ratio 1.0 (the missing-alpha convention), same as the fold.
+        let alpha = t.alpha.map(|a| a as f64).unwrap_or(rank);
+        let ratio = alpha / rank;
+        // a = downᵀ [in, rank]; b = (upᵀ·ratio) [rank, out]. f32, contiguous for the matmul.
+        let a = down.to_dtype(DType::F32)?.t()?.contiguous()?;
+        let b = (up.to_dtype(DType::F32)?.t()?.contiguous()? * ratio)?;
+        pending.entry(path).or_default().push(PendingLora {
+            a,
+            b,
+            scale: scale as f64,
+        });
+    }
+    Ok(())
+}
+
+/// Install `specs` as **forward-time additive residuals** on an already-built (packed) DiT + conditioner
+/// — the packed-tier path where [`apply_anima_adapters`] can't fold (sc-10640). The DiT (packed) and
+/// conditioner (dense bf16) projections are visited uniformly; each resolved LoRA target pushes a
+/// residual onto its projection, the packed codes untouched. **Strict**, exactly like the fold path: a
+/// target present in a file but absent from the host surface is a hard error naming the unrouted paths
+/// (the sc-10274 no-silent-partial guard), and a spec set that routes zero targets also hard-errors.
+/// **LoKr/LoHa on a packed tier is a hard, actionable error** (sc-10713). Returns the [`MergeReport`]
+/// (`report.merged` = the residual-installed target count: 508 for the turbo LoRA, 448 for a DiT-only
+/// style LoRA).
+pub fn install_anima_residuals(
+    dit: &mut CosmosDiT,
+    conditioner: &mut AnimaTextConditioner,
+    specs: &[AdapterSpec],
+) -> Result<MergeReport> {
+    // The factors are read on the CPU; the base weight lives on the DiT's device (CUDA on a packed
+    // tier), so they are moved onto it during the attach — else the residual matmul is a device mismatch.
+    let device = dit.device().clone();
+    let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+    let mut report = MergeReport::default();
+    for spec in specs {
+        let af = read_adapter(&spec.path)?;
+        if is_lokr_or_loha(&af, spec.kind) {
+            return Err(CandleError::Msg(format!(
+                "anima: a LoKr/LoHa adapter cannot apply on a quantized (packed q4/q8) Anima tier — its \
+                 residual would materialize a full [out,in] delta (≈3.9 GB over the 448 DiT targets, \
+                 more than the bf16 tier). Use the dense (bf16) tier, where it folds into the weight, or \
+                 a plain LoRA, which applies additively on any tier. The structured Kronecker residual \
+                 is tracked in sc-10713. Offending file: {}",
+                spec.path.display()
+            )));
+        }
+        resolve_lora_file(&af, spec.scale, &mut pending, &mut report.skipped_keys)?;
+    }
+
+    // Attach: walk the DiT + conditioner once, pushing any resolved residual for each projection's path.
+    // A factor whose dims don't match the target projection is surfaced as a skipped key, never a
+    // crashing forward (the additive analog of the fold path's `merge_into` shape guard).
+    let mut matched: HashSet<String> = HashSet::new();
+    {
+        let pending = &pending;
+        let matched = &mut matched;
+        let report = &mut report;
+        let device = &device;
+        let mut visit = |path: &str, lin: &mut AdaptLinear| -> Result<()> {
+            if let Some(list) = pending.get(path) {
+                matched.insert(path.to_string());
+                let (out_f, in_f) = lin.base_shape();
+                for p in list {
+                    if p.a.dims()[0] != in_f || p.b.dims()[1] != out_f {
+                        report.skipped_keys += 1; // shape-mismatched factor for this projection
+                        continue;
+                    }
+                    lin.push_lora(p.a.to_device(device)?, p.b.to_device(device)?, p.scale);
+                    report.merged += 1;
+                }
+            }
+            Ok(())
+        };
+        dit.visit_adaptable_mut(&mut visit)?;
+        conditioner.visit_adaptable_mut(&mut visit)?;
+    }
+
+    // Strict: a resolved target absent from the host surface is a hard error (no silent partial residual
+    // — sc-10274), and a spec set that routes nothing is a misconfiguration.
+    let mut unrouted: Vec<String> = pending
+        .keys()
+        .filter(|p| !matched.contains(*p))
+        .cloned()
+        .collect();
+    if !unrouted.is_empty() {
+        unrouted.sort();
+        return Err(CandleError::Msg(format!(
+            "anima: {} adapter target(s) did not route to a DiT/conditioner projection (no silent \
+             partial residual — sc-10274). First unrouted: {}",
+            unrouted.len(),
+            unrouted
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if report.merged == 0 {
+        return Err(no_target_matched(
+            "anima",
+            "expected ComfyUI `diffusion_model.<path>.lora_A/B.weight` (DiT `blocks.*` + conditioner \
+             `llm_adapter.blocks.*`) on a packed tier",
+            specs.len(),
+        ));
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +663,138 @@ mod tests {
             added > 0.0,
             "stacked LoRA delta must add on top of the LoKr, not replace it"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `is_lokr_or_loha` fires on LoKr factor keys, LoHa (`hada_`) factor keys, and a declared `Lokr`
+    /// kind — and passes a plain LoRA (so a LoRA still reaches the additive residual path on a packed
+    /// tier, while a LoKr/LoHa is rejected there — sc-10713).
+    #[test]
+    fn is_lokr_or_loha_detects_lokr_loha_and_passes_lora() {
+        let dir = std::env::temp_dir().join(format!("anima_islokr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A LoKr file (`lokr_` keys) → true even when the spec kind is Lora (keys win).
+        let mut lm = HashMap::new();
+        lm.insert(
+            "diffusion_model.blocks.0.self_attn.q_proj.lokr_w1".to_string(),
+            rand_t(2, 3, 1),
+        );
+        let lokr_path = dir.join("lokr.safetensors");
+        candle_gen::candle_core::safetensors::save(&lm, &lokr_path).unwrap();
+        let lokr_af = read_adapter(&lokr_path).unwrap();
+        assert!(
+            is_lokr_or_loha(&lokr_af, AdapterKind::Lora),
+            "lokr_ keys ⇒ true"
+        );
+
+        // A LoHa file (`hada_` keys) → true.
+        let mut hm = HashMap::new();
+        hm.insert(
+            "diffusion_model.blocks.0.self_attn.q_proj.hada_w1_a".to_string(),
+            rand_t(2, 3, 2),
+        );
+        let loha_path = dir.join("loha.safetensors");
+        candle_gen::candle_core::safetensors::save(&hm, &loha_path).unwrap();
+        let loha_af = read_adapter(&loha_path).unwrap();
+        assert!(
+            is_lokr_or_loha(&loha_af, AdapterKind::Lora),
+            "hada_ keys ⇒ true"
+        );
+
+        // A plain LoRA (`lora_A`/`lora_B`) → false, so it reaches the additive residual path; but a
+        // declared `Lokr` kind → true regardless of keys.
+        let lora_path = write_lora(&dir, &["blocks.0.self_attn.q_proj"], 8, 6, 2);
+        let lora_af = read_adapter(&lora_path).unwrap();
+        assert!(
+            !is_lokr_or_loha(&lora_af, AdapterKind::Lora),
+            "plain LoRA ⇒ false"
+        );
+        assert!(
+            is_lokr_or_loha(&lora_af, AdapterKind::Lokr),
+            "declared Lokr kind ⇒ true"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `resolve_lora_file` produces the **unmerged** factors the additive residual needs: `a = downᵀ`
+    /// `[in, rank]`, `b = upᵀ·(alpha/rank)` `[rank, out]`. With no PEFT alpha the ratio is 1.0, so `b`
+    /// equals `upᵀ` exactly — pinning the transpose + scale the residual matmul `(x·a)·b` expects.
+    #[test]
+    fn resolve_lora_file_factors_are_transposed_and_alpha_scaled() {
+        let (out, inp, rank) = (8usize, 6usize, 2usize);
+        let dir = std::env::temp_dir().join(format!("anima_resolve_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = "blocks.0.self_attn.q_proj";
+        let lora_path = write_lora(&dir, &[path], out, inp, rank);
+        let af = read_adapter(&lora_path).unwrap();
+
+        let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+        let mut skipped = 0usize;
+        resolve_lora_file(&af, 1.0, &mut pending, &mut skipped).unwrap();
+
+        let list = pending.get(path).expect("the target must resolve");
+        assert_eq!(list.len(), 1);
+        let p = &list[0];
+        assert_eq!(p.a.dims(), &[inp, rank], "a = downᵀ [in, rank]");
+        assert_eq!(p.b.dims(), &[rank, out], "b = upᵀ [rank, out]");
+        assert_eq!(p.scale, 1.0);
+
+        // b must equal upᵀ exactly (ratio 1.0, no PEFT alpha).
+        let up = af
+            .tensors
+            .get(&format!("diffusion_model.{path}.lora_B.weight"))
+            .unwrap();
+        let want_b = up.t().unwrap().contiguous().unwrap();
+        let dev_max = (p.b.sub(&want_b).unwrap())
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            dev_max < 1e-6,
+            "b must equal upᵀ (ratio 1.0), max diff {dev_max}"
+        );
+
+        // With an explicit `.alpha` ≠ rank, `b` picks up the `alpha/rank` ratio. This is the non-vacuous
+        // case: dropping `* ratio` in `resolve_lora_file` makes THIS assertion fail (the ratio-1.0 case
+        // above cannot catch it).
+        let mut m2 = HashMap::new();
+        m2.insert(
+            format!("diffusion_model.{path}.lora_A.weight"),
+            rand_t(rank, inp, 42),
+        );
+        let up2 = rand_t(out, rank, 43);
+        m2.insert(format!("diffusion_model.{path}.lora_B.weight"), up2.clone());
+        m2.insert(
+            format!("diffusion_model.{path}.alpha"),
+            Tensor::from_vec(vec![(2 * rank) as f32], (1,), &Device::Cpu).unwrap(), // ratio 2.0
+        );
+        let ap = dir.join("lora_alpha.safetensors");
+        candle_gen::candle_core::safetensors::save(&m2, &ap).unwrap();
+        let af2 = read_adapter(&ap).unwrap();
+        let mut pending2: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+        let mut skipped2 = 0usize;
+        resolve_lora_file(&af2, 1.0, &mut pending2, &mut skipped2).unwrap();
+        let p2 = &pending2.get(path).unwrap()[0];
+        let want_b2 = (up2.t().unwrap().contiguous().unwrap() * 2.0f64).unwrap();
+        let d2 = (p2.b.sub(&want_b2).unwrap())
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            d2 < 1e-6,
+            "b must equal upᵀ·(alpha/rank=2.0), max diff {d2}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
