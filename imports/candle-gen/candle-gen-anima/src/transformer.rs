@@ -12,10 +12,10 @@
 //! GQA 16/8 lives only in the Qwen3 encoder).
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::{Linear, Module, VarBuilder};
-use candle_gen::quant::{QLinear, MLX_GROUP_SIZE};
+use candle_gen::candle_nn::VarBuilder;
 use candle_gen::Result;
 
+use crate::adapt::AdaptLinear;
 use crate::config::DitConfig;
 use crate::nn::{apply_rope_half, layer_norm_no_affine, modulate, rms_norm, sdpa, timestep_sincos};
 use crate::rope::cosmos_image_rope;
@@ -27,59 +27,19 @@ const NORM_EPS: f64 = 1e-6;
 /// Sinusoidal timestep-embedding `max_period` (`Timesteps` default).
 const TIME_MAX_PERIOD: f64 = 10000.0;
 
-/// A DiT projection that is either **dense** (`{name}.weight`) or **MLX-packed** (`{name}.weight` u32
-/// codes + `.scales` + `.biases`), auto-detected by the presence of `{name}.scales`. The packed forward
-/// dequantizes the weight to a dense matmul per step (sc-7702 `DequantDense` — CPU-capable, coherent at
-/// Q4; NOT the CUDA-only int8 `QMatMul` fast path). Anima's tiers pack ONLY the DiT (the conditioner /
-/// Qwen3 TE / VAE stay dense bf16 — the sc-10517 dense-TE precedent), all at MLX group size 64. Every
-/// DiT projection is bias-less, so no `.bias` sibling is read.
-enum DitLinear {
-    Dense(Linear),
-    Packed(QLinear),
-}
-
-impl DitLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            DitLinear::Dense(l) => Ok(l.forward(x)?),
-            DitLinear::Packed(q) => Ok(q.forward(x)?),
-        }
-    }
-}
-
-/// Bias-less, **packed-detecting**, **shapeless** DiT linear from `{name}` on `vb`: if `{name}.scales`
-/// is present, load the packed triple at their native dtypes (u32 codes must NOT be cast through the
-/// vb's float dtype) and repack straight from the parts (dims recovered from the packed shapes at group
-/// 64); otherwise the dense weight is read unchanged. One call serves both a dense bf16 checkpoint and a
-/// pre-quantized Q4/Q8 tier (the candle counterpart of MLX sc-10517).
-fn lin(vb: &VarBuilder, name: &str) -> Result<DitLinear> {
-    let scales_key = format!("{name}.scales");
-    if vb.contains_tensor(&scales_key) {
-        let device = vb.device().clone();
-        let wq = vb.get_unchecked_dtype(&format!("{name}.weight"), DType::U32)?;
-        let scales = vb.get_unchecked_dtype(&scales_key, DType::F32)?;
-        let biases = vb.get_unchecked_dtype(&format!("{name}.biases"), DType::F32)?;
-        Ok(DitLinear::Packed(QLinear::from_packed_gs(
-            &wq,
-            &scales,
-            &biases,
-            None,
-            MLX_GROUP_SIZE,
-            &device,
-        )?))
-    } else {
-        Ok(DitLinear::Dense(Linear::new(
-            vb.get_unchecked(&format!("{name}.weight"))?,
-            None,
-        )))
-    }
-}
+// Every DiT projection is a bias-less, **packed-detecting** [`AdaptLinear`] (`crate::adapt`): dense
+// `{name}.weight`, or an MLX-packed `{name}.weight` u32 codes + `.scales` + `.biases` (auto-detected by
+// `{name}.scales`), plus zero or more forward-time LoRA residuals. The packed forward dequantizes to a
+// dense matmul per step (sc-7702 `DequantDense` — CPU-capable, coherent at Q4; NOT the CUDA-only int8
+// `QMatMul` fast path). Anima's tiers pack ONLY the DiT (the conditioner / Qwen3 TE / VAE stay dense
+// bf16 — the sc-10517 dense-TE precedent), all at MLX group size 64. With no adapter attached the
+// forward is byte-identical to the pre-sc-10640 bare linear.
 
 /// `CosmosEmbedding`: sinusoidal time_proj → `CosmosTimestepEmbedding` (`temb`, 3·hidden) + `RMSNorm`
 /// (`embedded_timestep`, hidden).
 struct TimeEmbed {
-    linear_1: DitLinear,
-    linear_2: DitLinear,
+    linear_1: AdaptLinear,
+    linear_2: AdaptLinear,
     norm: Tensor,
     hidden: usize,
     device: Device,
@@ -88,8 +48,8 @@ struct TimeEmbed {
 impl TimeEmbed {
     fn new(vb: &VarBuilder, cfg: &DitConfig) -> Result<Self> {
         Ok(Self {
-            linear_1: lin(vb, "t_embedder.1.linear_1")?,
-            linear_2: lin(vb, "t_embedder.1.linear_2")?,
+            linear_1: AdaptLinear::detect(vb, "t_embedder.1.linear_1")?,
+            linear_2: AdaptLinear::detect(vb, "t_embedder.1.linear_2")?,
             norm: vb.get_unchecked("t_embedding_norm.weight")?,
             hidden: cfg.hidden_size(),
             device: vb.device().clone(),
@@ -105,20 +65,31 @@ impl TimeEmbed {
         let embedded = rms_norm(&proj, &self.norm, NORM_EPS)?;
         Ok((temb, embedded))
     }
+
+    /// Visit this embedding's two adaptable projections for the additive-adapter walk (sc-10640).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.linear_1"), &mut self.linear_1)?;
+        f(&format!("{prefix}.linear_2"), &mut self.linear_2)?;
+        Ok(())
+    }
 }
 
 /// `CosmosAdaLayerNormZero` (norm1/2/3): LayerNorm(no affine) then `(1+scale)·norm + shift`, plus a
 /// `gate`. `linear_2` emits `3·hidden` (shift|scale|gate), added to `temb`.
 struct AdaLayerNormZero {
-    linear_1: DitLinear,
-    linear_2: DitLinear,
+    linear_1: AdaptLinear,
+    linear_2: AdaptLinear,
 }
 
 impl AdaLayerNormZero {
     fn new(vb: &VarBuilder, prefix: &str) -> Result<Self> {
         Ok(Self {
-            linear_1: lin(vb, &format!("{prefix}.1"))?,
-            linear_2: lin(vb, &format!("{prefix}.2"))?,
+            linear_1: AdaptLinear::detect(vb, &format!("{prefix}.1"))?,
+            linear_2: AdaptLinear::detect(vb, &format!("{prefix}.2"))?,
         })
     }
 
@@ -140,21 +111,33 @@ impl AdaLayerNormZero {
         let normed = layer_norm_no_affine(hidden, NORM_EPS)?;
         Ok((modulate(&normed, &scale, &shift)?, gate))
     }
+
+    /// Visit the modulation's two adaptable projections (`{prefix}.1`, `{prefix}.2`) for the
+    /// additive-adapter walk (sc-10640) — the adaLN down/up pair the official LoRA targets.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.1"), &mut self.linear_1)?;
+        f(&format!("{prefix}.2"), &mut self.linear_2)?;
+        Ok(())
+    }
 }
 
 /// `CosmosAdaLayerNorm` (final `norm_out`): LayerNorm(no affine) then `(1+scale)·norm + shift`.
 /// `linear_2` emits `2·hidden` (shift|scale), added to `temb[..., :2·hidden]`.
 struct AdaLayerNorm {
-    linear_1: DitLinear,
-    linear_2: DitLinear,
+    linear_1: AdaptLinear,
+    linear_2: AdaptLinear,
     hidden: usize,
 }
 
 impl AdaLayerNorm {
     fn new(vb: &VarBuilder, prefix: &str, cfg: &DitConfig) -> Result<Self> {
         Ok(Self {
-            linear_1: lin(vb, &format!("{prefix}.1"))?,
-            linear_2: lin(vb, &format!("{prefix}.2"))?,
+            linear_1: AdaptLinear::detect(vb, &format!("{prefix}.1"))?,
+            linear_2: AdaptLinear::detect(vb, &format!("{prefix}.2"))?,
             hidden: cfg.hidden_size(),
         })
     }
@@ -170,15 +153,27 @@ impl AdaLayerNorm {
         let normed = layer_norm_no_affine(hidden, NORM_EPS)?;
         modulate(&normed, &scale, &shift)
     }
+
+    /// Visit the final modulation's two adaptable projections (`{prefix}.1`, `{prefix}.2`) for the
+    /// additive-adapter walk (sc-10640).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.1"), &mut self.linear_1)?;
+        f(&format!("{prefix}.2"), &mut self.linear_2)?;
+        Ok(())
+    }
 }
 
 /// `CosmosAttention` — self (attn1: q/k/v from hidden, RoPE) or cross (attn2: q from hidden, k/v from
 /// text, no RoPE). Per-head q/k RMSNorm; heads == kv_heads (no GQA repeat for Anima).
 struct Attention {
-    to_q: DitLinear,
-    to_k: DitLinear,
-    to_v: DitLinear,
-    to_out: DitLinear,
+    to_q: AdaptLinear,
+    to_k: AdaptLinear,
+    to_v: AdaptLinear,
+    to_out: AdaptLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     heads: usize,
@@ -190,10 +185,10 @@ impl Attention {
     fn new(vb: &VarBuilder, prefix: &str, cfg: &DitConfig) -> Result<Self> {
         let hd = cfg.attention_head_dim;
         Ok(Self {
-            to_q: lin(vb, &format!("{prefix}.q_proj"))?,
-            to_k: lin(vb, &format!("{prefix}.k_proj"))?,
-            to_v: lin(vb, &format!("{prefix}.v_proj"))?,
-            to_out: lin(vb, &format!("{prefix}.output_proj"))?,
+            to_q: AdaptLinear::detect(vb, &format!("{prefix}.q_proj"))?,
+            to_k: AdaptLinear::detect(vb, &format!("{prefix}.k_proj"))?,
+            to_v: AdaptLinear::detect(vb, &format!("{prefix}.v_proj"))?,
+            to_out: AdaptLinear::detect(vb, &format!("{prefix}.output_proj"))?,
             norm_q: vb.get_unchecked(&format!("{prefix}.q_norm.weight"))?,
             norm_k: vb.get_unchecked(&format!("{prefix}.k_norm.weight"))?,
             heads: cfg.num_attention_heads,
@@ -249,19 +244,33 @@ impl Attention {
             .reshape((b, sq, self.heads * self.head_dim))?;
         self.to_out.forward(&o)
     }
+
+    /// Visit this attention's four adaptable projections (`{prefix}.{q,k,v,output}_proj`) for the
+    /// additive-adapter walk (sc-10640).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.q_proj"), &mut self.to_q)?;
+        f(&format!("{prefix}.k_proj"), &mut self.to_k)?;
+        f(&format!("{prefix}.v_proj"), &mut self.to_v)?;
+        f(&format!("{prefix}.output_proj"), &mut self.to_out)?;
+        Ok(())
+    }
 }
 
 /// `FeedForward(mult=4, activation="gelu")` — `net.2(gelu_exact(net.0.proj(x)))`, no bias.
 struct FeedForward {
-    proj_in: DitLinear,  // mlp.layer1
-    proj_out: DitLinear, // mlp.layer2
+    proj_in: AdaptLinear,  // mlp.layer1
+    proj_out: AdaptLinear, // mlp.layer2
 }
 
 impl FeedForward {
     fn new(vb: &VarBuilder, prefix: &str) -> Result<Self> {
         Ok(Self {
-            proj_in: lin(vb, &format!("{prefix}.layer1"))?,
-            proj_out: lin(vb, &format!("{prefix}.layer2"))?,
+            proj_in: AdaptLinear::detect(vb, &format!("{prefix}.layer1"))?,
+            proj_out: AdaptLinear::detect(vb, &format!("{prefix}.layer2"))?,
         })
     }
 
@@ -269,6 +278,18 @@ impl FeedForward {
         // gelu_exact = erf GELU (candle `gelu_erf`), matching `mlx_gen::nn::gelu_exact`.
         let h = self.proj_in.forward(x)?.gelu_erf()?;
         self.proj_out.forward(&h)
+    }
+
+    /// Visit the FFN's two adaptable projections (`{prefix}.layer1`, `{prefix}.layer2`) for the
+    /// additive-adapter walk (sc-10640).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.layer1"), &mut self.proj_in)?;
+        f(&format!("{prefix}.layer2"), &mut self.proj_out)?;
+        Ok(())
     }
 }
 
@@ -318,15 +339,36 @@ impl Block {
         let ff = self.ff.forward(&normed)?;
         Ok((hidden + gate.broadcast_mul(&ff)?)?)
     }
+
+    /// Visit this block's 16 adaptable projections (self/cross attn q/k/v/out, the three adaLN
+    /// modulation `.1`/`.2` pairs, ff layer1/layer2) for the additive-adapter walk (sc-10640).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        self.norm1
+            .visit_adaptable_mut(&format!("{prefix}.adaln_modulation_self_attn"), f)?;
+        self.attn1
+            .visit_adaptable_mut(&format!("{prefix}.self_attn"), f)?;
+        self.norm2
+            .visit_adaptable_mut(&format!("{prefix}.adaln_modulation_cross_attn"), f)?;
+        self.attn2
+            .visit_adaptable_mut(&format!("{prefix}.cross_attn"), f)?;
+        self.norm3
+            .visit_adaptable_mut(&format!("{prefix}.adaln_modulation_mlp"), f)?;
+        self.ff.visit_adaptable_mut(&format!("{prefix}.mlp"), f)?;
+        Ok(())
+    }
 }
 
 /// The full Cosmos-Predict2 DiT.
 pub struct CosmosDiT {
-    patch_embed: DitLinear, // x_embedder.proj.1
+    patch_embed: AdaptLinear, // x_embedder.proj.1
     time_embed: TimeEmbed,
     blocks: Vec<Block>,
     norm_out: AdaLayerNorm,
-    proj_out: DitLinear, // final_layer.linear
+    proj_out: AdaptLinear, // final_layer.linear
     cfg: DitConfig,
     device: Device,
 }
@@ -340,11 +382,11 @@ impl CosmosDiT {
             blocks.push(Block::new(vb, &format!("blocks.{i}"), &cfg)?);
         }
         Ok(Self {
-            patch_embed: lin(vb, "x_embedder.proj.1")?,
+            patch_embed: AdaptLinear::detect(vb, "x_embedder.proj.1")?,
             time_embed: TimeEmbed::new(vb, &cfg)?,
             blocks,
             norm_out: AdaLayerNorm::new(vb, "final_layer.adaln_modulation", &cfg)?,
-            proj_out: lin(vb, "final_layer.linear")?,
+            proj_out: AdaptLinear::detect(vb, "final_layer.linear")?,
             cfg,
             device: vb.device().clone(),
         })
@@ -352,6 +394,40 @@ impl CosmosDiT {
 
     pub fn config(&self) -> &DitConfig {
         &self.cfg
+    }
+
+    /// Whether the DiT loaded from a **packed** MLX tier (its projections are quantized). Probed on
+    /// `proj_out` (`final_layer.linear`, in=hidden), like `candle-gen-wan`'s `is_packed` — a hidden-wide
+    /// projection that is always group-64-packable, so it packs whenever the tier does. NOT `patch_embed`:
+    /// its `in` (17·pt·ph·pw = 68) is not a multiple of the group size, so a converter may leave it dense
+    /// even in a packed tier. A dense checkpoint packs none.
+    pub fn is_packed(&self) -> bool {
+        self.proj_out.is_packed()
+    }
+
+    /// The device the DiT weights live on — residual factors are read on CPU and moved here.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut AdaptLinear)` once each with the
+    /// projection's DiT-root-relative dotted path (`blocks.<i>.*` + the globals). The additive-adapter
+    /// installer routes forward-time residuals through this (sc-10640; the candle analog of mlx-gen's
+    /// `AdaptableHost` and of `candle-gen-wan`'s `visit_adaptable_mut`). Covers EVERY projection — not
+    /// just the canonical 448 — so a residual routes exactly the surface the dense fold would.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        f("x_embedder.proj.1", &mut self.patch_embed)?;
+        self.time_embed.visit_adaptable_mut("t_embedder.1", f)?;
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("blocks.{i}"), f)?;
+        }
+        self.norm_out
+            .visit_adaptable_mut("final_layer.adaln_modulation", f)?;
+        f("final_layer.linear", &mut self.proj_out)?;
+        Ok(())
     }
 
     /// Patchify a `[B, C, 1, Hl, Wl]` latent (`C=17` after mask concat) to `[B, seq, C·pt·ph·pw]`.
@@ -429,12 +505,15 @@ impl CosmosDiT {
 
 #[cfg(test)]
 mod tests {
-    //! Quant path (Q4 packed) exercised on candle's **CPU** backend: the DiT `lin()` packed-detects an
-    //! MLX-packed triple and the dequant-dense forward reproduces the affine grid — proving pack → load
-    //! → forward on CPU, no CUDA. (The CUDA-only path is the int8 fast GEMM, which Anima does NOT use.)
+    //! Quant path (Q4 packed) exercised on candle's **CPU** backend: `AdaptLinear::detect` packed-detects
+    //! an MLX-packed triple and the dequant-dense forward reproduces the affine grid — proving pack →
+    //! load → forward on CPU, no CUDA. (The CUDA-only path is the int8 fast GEMM, which Anima does NOT
+    //! use.)
     use super::*;
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
     use candle_gen::candle_core::Device;
+    use candle_gen::candle_nn::{Linear, Module};
+    use candle_gen::quant::MLX_GROUP_SIZE;
     use std::collections::HashMap;
 
     /// Test-side MLX Q4 packer (group `g`): per-element 4-bit codes → u32 words (LSB-first nibbles).
@@ -482,9 +561,9 @@ mod tests {
         (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
     }
 
-    /// A packed DiT projection (`.scales` present) loads `Packed` and its dequant-dense forward matches
-    /// the affine grid bit-exact on CPU; a dense sibling (no `.scales`) stays `Dense`. Group size 64
-    /// (Anima's tier), the `lin()` default. This is the pack → load → forward CPU validation.
+    /// A packed DiT projection (`.scales` present) loads packed and its dequant-dense forward matches
+    /// the affine grid bit-exact on CPU; a dense sibling (no `.scales`) stays dense. Group size 64
+    /// (Anima's tier), the `AdaptLinear::detect` default. This is the pack → load → forward CPU validation.
     #[test]
     fn packed_dit_linear_loads_and_forwards_on_cpu() {
         let dev = Device::Cpu;
@@ -507,22 +586,17 @@ mod tests {
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
 
-        let packed = lin(&vb, "blocks.0.self_attn.q_proj").unwrap();
-        assert!(
-            matches!(packed, DitLinear::Packed(_)),
-            "`.scales` ⇒ packed load"
-        );
-        let dense = lin(&vb, "blocks.0.self_attn.k_proj").unwrap();
-        assert!(
-            matches!(dense, DitLinear::Dense(_)),
-            "no `.scales` ⇒ dense path"
-        );
+        let packed = AdaptLinear::detect(&vb, "blocks.0.self_attn.q_proj").unwrap();
+        assert!(packed.is_packed(), "`.scales` ⇒ packed load");
+        assert_eq!(packed.base_shape(), (out_dim, in_dim));
+        let dense = AdaptLinear::detect(&vb, "blocks.0.self_attn.k_proj").unwrap();
+        assert!(!dense.is_packed(), "no `.scales` ⇒ dense path");
 
         // The packed dequant-dense forward reproduces the affine grid on CPU.
-        let grid_lin = DitLinear::Dense(Linear::new(
+        let grid_lin = Linear::new(
             Tensor::from_vec(grid, (out_dim, in_dim), &dev).unwrap(),
             None,
-        ));
+        );
         let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
         let cos = cosine(&packed.forward(&x).unwrap(), &grid_lin.forward(&x).unwrap());
         assert!(

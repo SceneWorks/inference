@@ -8,11 +8,12 @@
 //! `out_proj.*`, `norm.weight`) — identical to the diffusers `AnimaTextConditioner` state dict.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
+use candle_gen::candle_nn::{Embedding, Module, VarBuilder};
 use candle_gen::Result;
 
+use crate::adapt::AdaptLinear;
 use crate::config::ConditionerConfig;
-use crate::nn::{apply_rope_half, lin, lin_bias, rms_norm, sdpa};
+use crate::nn::{apply_rope_half, rms_norm, sdpa};
 use crate::rope::text_rope;
 
 /// `(cos, sin)` RoPE tables, one pair per sequence length.
@@ -21,10 +22,10 @@ type Rope<'a> = (&'a Tensor, &'a Tensor);
 /// `AnimaTextConditionerAttention`: q/k/v/o projections (no bias), per-head q/k RMSNorm (eps 1e-6),
 /// half-split RoPE. Query positions and key positions can differ (cross-attn: target vs source).
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: AdaptLinear,
+    k_proj: AdaptLinear,
+    v_proj: AdaptLinear,
+    o_proj: AdaptLinear,
     q_norm: Tensor,
     k_norm: Tensor,
     heads: usize,
@@ -37,10 +38,10 @@ impl Attention {
     fn new(vb: &VarBuilder, prefix: &str, cfg: &ConditionerConfig) -> Result<Self> {
         let hd = cfg.head_dim();
         Ok(Self {
-            q_proj: lin(vb, &format!("{prefix}.q_proj"))?,
-            k_proj: lin(vb, &format!("{prefix}.k_proj"))?,
-            v_proj: lin(vb, &format!("{prefix}.v_proj"))?,
-            o_proj: lin(vb, &format!("{prefix}.o_proj"))?,
+            q_proj: AdaptLinear::dense(vb, &format!("{prefix}.q_proj"))?,
+            k_proj: AdaptLinear::dense(vb, &format!("{prefix}.k_proj"))?,
+            v_proj: AdaptLinear::dense(vb, &format!("{prefix}.v_proj"))?,
+            o_proj: AdaptLinear::dense(vb, &format!("{prefix}.o_proj"))?,
             q_norm: vb.get_unchecked(&format!("{prefix}.q_norm.weight"))?,
             k_norm: vb.get_unchecked(&format!("{prefix}.k_norm.weight"))?,
             heads: cfg.num_attention_heads,
@@ -89,7 +90,21 @@ impl Attention {
         let o = o
             .transpose(1, 2)?
             .reshape((b, sq, self.heads * self.head_dim))?;
-        self.o_proj.forward(&o).map_err(Into::into)
+        self.o_proj.forward(&o)
+    }
+
+    /// Visit this attention's four adaptable projections (`{prefix}.{q,k,v,o}_proj`) for the
+    /// additive-adapter walk (sc-10640) — the conditioner's LoRA surface.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.q_proj"), &mut self.q_proj)?;
+        f(&format!("{prefix}.k_proj"), &mut self.k_proj)?;
+        f(&format!("{prefix}.v_proj"), &mut self.v_proj)?;
+        f(&format!("{prefix}.o_proj"), &mut self.o_proj)?;
+        Ok(())
     }
 }
 
@@ -100,8 +115,8 @@ struct Block {
     norm_cross_attn: Tensor,
     cross_attn: Attention,
     norm_mlp: Tensor,
-    mlp_in: Linear,  // mlp.0 (bias)
-    mlp_out: Linear, // mlp.2 (bias)
+    mlp_in: AdaptLinear,  // mlp.0 (bias)
+    mlp_out: AdaptLinear, // mlp.2 (bias)
     eps: f64,
 }
 
@@ -113,8 +128,8 @@ impl Block {
             norm_cross_attn: vb.get_unchecked(&format!("{prefix}.norm_cross_attn.weight"))?,
             cross_attn: Attention::new(vb, &format!("{prefix}.cross_attn"), cfg)?,
             norm_mlp: vb.get_unchecked(&format!("{prefix}.norm_mlp.weight"))?,
-            mlp_in: lin_bias(vb, &format!("{prefix}.mlp.0"))?,
-            mlp_out: lin_bias(vb, &format!("{prefix}.mlp.2"))?,
+            mlp_in: AdaptLinear::dense_bias(vb, &format!("{prefix}.mlp.0"))?,
+            mlp_out: AdaptLinear::dense_bias(vb, &format!("{prefix}.mlp.2"))?,
             eps: cfg.norm_eps,
         })
     }
@@ -145,13 +160,30 @@ impl Block {
             .forward(&self.mlp_in.forward(&normed)?.gelu_erf()?)?;
         Ok((h + mlp)?)
     }
+
+    /// Visit this block's 10 adaptable projections (self/cross attn q/k/v/o, `mlp.0`, `mlp.2`) for the
+    /// additive-adapter walk (sc-10640). `prefix` carries the `llm_adapter.` namespace so the yielded
+    /// paths match a trained adapter's `diffusion_model.llm_adapter.blocks.<i>.*` keys after stripping.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        self.self_attn
+            .visit_adaptable_mut(&format!("{prefix}.self_attn"), f)?;
+        self.cross_attn
+            .visit_adaptable_mut(&format!("{prefix}.cross_attn"), f)?;
+        f(&format!("{prefix}.mlp.0"), &mut self.mlp_in)?;
+        f(&format!("{prefix}.mlp.2"), &mut self.mlp_out)?;
+        Ok(())
+    }
 }
 
 /// The full `AnimaTextConditioner`.
 pub struct AnimaTextConditioner {
     embed: Embedding,
     blocks: Vec<Block>,
-    out_proj: Linear, // bias
+    out_proj: AdaptLinear, // bias
     norm: Tensor,
     cfg: ConditionerConfig,
     device: Device,
@@ -168,7 +200,7 @@ impl AnimaTextConditioner {
         Ok(Self {
             embed,
             blocks,
-            out_proj: lin_bias(vb, "out_proj")?,
+            out_proj: AdaptLinear::dense_bias(vb, "out_proj")?,
             norm: vb.get_unchecked("norm.weight")?,
             cfg,
             device: vb.device().clone(),
@@ -218,5 +250,21 @@ impl AnimaTextConditioner {
 
     pub fn config(&self) -> &ConditionerConfig {
         &self.cfg
+    }
+
+    /// Walk every adaptable conditioner projection, invoking `f(path, &mut AdaptLinear)` with the
+    /// **`llm_adapter.`-prefixed** dotted path (matching a trained adapter's key after namespace strip):
+    /// each block's 10 targets + `out_proj`. The residual installer (sc-10640) routes forward-time
+    /// residuals through this on a packed tier, where the conditioner stays dense bf16 but its adapter
+    /// still applies unmerged.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("llm_adapter.blocks.{i}"), f)?;
+        }
+        f("llm_adapter.out_proj", &mut self.out_proj)?;
+        Ok(())
     }
 }
