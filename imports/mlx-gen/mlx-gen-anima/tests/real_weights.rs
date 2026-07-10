@@ -12,11 +12,13 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::CancelFlag;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Progress, WeightsSource};
+use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 
 use mlx_gen_anima::conditioner::AnimaTextConditioner;
 use mlx_gen_anima::config::{ConditionerConfig, DitConfig, Variant};
+use mlx_gen_anima::convert::quantize_anima_dit;
 use mlx_gen_anima::loader::split_anima_keys;
+use mlx_gen_anima::model::{load_base, load_turbo};
 use mlx_gen_anima::pipeline::{AnimaPipeline, GenOptions};
 use mlx_gen_anima::transformer::CosmosDiT;
 
@@ -102,13 +104,29 @@ fn assert_coherent(img: &Image, label: &str) {
 
 #[test]
 #[ignore = "needs the circlestone-labs/Anima snapshot"]
-fn checkpoint_split_is_118_adapter_567_dit() {
+fn checkpoint_split_is_118_adapter_567_dit_all_variants() {
     let split = split_files().expect("Anima snapshot");
-    let w = Weights::from_file(dit_file(&split, Variant::Base)).unwrap();
-    let (dit, adapter) = split_anima_keys(&w);
-    println!("dit keys = {}, adapter keys = {}", dit.len(), adapter.len());
-    assert_eq!(adapter.len(), 118, "expected 118 llm_adapter tensors");
-    assert_eq!(dit.len(), 567, "expected 567 DiT tensors");
+    // ALL THREE variants — not just base. Base roots the DiT at `net`, aesthetic + turbo at
+    // `model.diffusion_model`; the story's original "split on `net.llm_adapter.`" instruction would
+    // have produced an EMPTY conditioner (0 adapter, 685 DiT) for the latter two. `split_anima_keys`
+    // is prefix-agnostic (matches `llm_adapter.` anywhere), so all three must split 118 + 567.
+    for variant in [Variant::Base, Variant::Aesthetic, Variant::Turbo] {
+        let w = Weights::from_file(dit_file(&split, variant)).unwrap();
+        let (dit, adapter) = split_anima_keys(&w);
+        println!(
+            "[{}] dit keys = {}, adapter keys = {}",
+            variant.id(),
+            dit.len(),
+            adapter.len()
+        );
+        assert_eq!(
+            adapter.len(),
+            118,
+            "{}: expected 118 llm_adapter tensors",
+            variant.id()
+        );
+        assert_eq!(dit.len(), 567, "{}: expected 567 DiT tensors", variant.id());
+    }
 }
 
 #[test]
@@ -251,6 +269,88 @@ fn generate_all_three_variants_1024() {
             assert_coherent(&img_e, "anima_base_euler");
         }
 
+        mlx_rs::memory::clear_cache();
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Acceptance (sc-10517): the q8 / q4 quant tiers actually LOAD (packed-detect) and generate a coherent
+// 1024² image — the on-device convert-at-install path. bf16 is proven above. This packs the DiT with
+// `quantize_anima_dit` (the crate converter primitive the SceneWorks worker mirrors), assembles a
+// `split_files`-shaped tier dir (packed DiT + symlinked dense TE/VAE), and drives the FULL `load_*`
+// entry point with `spec.quantize` set — so it proves (a) `load` accepts the tier, (b) the packed DiT
+// loads and generates, and (c) the bundled conditioner survived the pack (a mangled conditioner
+// collapses the output to noise that `assert_coherent` rejects).
+// -------------------------------------------------------------------------------------------------
+
+/// Assemble a temp `split_files`-shaped tier dir: pack the variant DiT to Q`bits` and symlink the
+/// shared dense Qwen3 TE + Qwen-Image VAE (absolute targets, deref'd from the HF cache). Returns the
+/// tier dir the Anima loader reads (`diffusion_models/ text_encoders/ vae/`).
+fn assemble_tier_dir(split: &std::path::Path, variant: Variant, bits: i32) -> PathBuf {
+    let tier = out_dir().join(format!("tier_{}_q{bits}", variant.id()));
+    let _ = std::fs::remove_dir_all(&tier);
+    for sub in ["diffusion_models", "text_encoders", "vae"] {
+        std::fs::create_dir_all(tier.join(sub)).unwrap();
+    }
+    // Pack ONLY the Cosmos DiT (the conditioner + TE + VAE stay dense bf16).
+    quantize_anima_dit(
+        &dit_file(split, variant),
+        &tier.join("diffusion_models").join(variant.dit_filename()),
+        bits,
+        64,
+    )
+    .unwrap();
+    // Symlink the shared dense components (canonicalize to deref the HF-cache blob symlinks).
+    for (sub, file) in [
+        ("text_encoders", "qwen_3_06b_base.safetensors"),
+        ("vae", "qwen_image_vae.safetensors"),
+    ] {
+        let src = std::fs::canonicalize(split.join(sub).join(file)).unwrap();
+        std::os::unix::fs::symlink(&src, tier.join(sub).join(file)).unwrap();
+    }
+    tier
+}
+
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (packs + real 2B DiT denoise)"]
+fn generate_quant_tiers_base_q8_q4_and_turbo_q4() {
+    let split = split_files().expect("Anima snapshot");
+    let out = out_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let prompt =
+        "an anime girl with long silver hair and blue eyes, detailed illustration, masterpiece";
+
+    // (variant, quant, bits). Base at BOTH quantized tiers; turbo (which roots the DiT at
+    // `model.diffusion_model`, not `net`) at q4 to prove the prefix detection survives quantization.
+    for (variant, quant, bits) in [
+        (Variant::Base, Quant::Q8, 8),
+        (Variant::Base, Quant::Q4, 4),
+        (Variant::Turbo, Quant::Q4, 4),
+    ] {
+        let tier = assemble_tier_dir(&split, variant, bits);
+        let spec = LoadSpec::new(WeightsSource::Dir(tier)).with_quant(quant);
+        // Drive the real generator entry point (proves `load` accepts the advertised tier).
+        let generator = match variant {
+            Variant::Turbo => load_turbo(&spec),
+            _ => load_base(&spec),
+        }
+        .expect("load packed tier");
+        let req = GenerationRequest {
+            prompt: prompt.into(),
+            width: 1024,
+            height: 1024,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut prog = |_p: Progress| {};
+        let img = match generator.generate(&req, &mut prog).expect("generate") {
+            GenerationOutput::Images(mut imgs) => imgs.remove(0),
+            other => panic!("expected images, got {other:?}"),
+        };
+        let path = out.join(format!("{}_1024_q{bits}.png", variant.id()));
+        save_png(&img, &path);
+        println!("wrote {}", path.display());
+        assert_coherent(&img, &format!("{}_q{bits}", variant.id()));
         mlx_rs::memory::clear_cache();
     }
 }
