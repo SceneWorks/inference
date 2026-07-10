@@ -189,10 +189,15 @@ def encode(prompt, text_encoder, conditioner, qwen_tok, t5_tok):
         return conditioner(source_hidden_states=src, target_input_ids=t5)
 
 
-def denoise(dit, cond, uncond, init, steps, guidance):
+def denoise(dit, cond, uncond, init, steps, guidance, capture_after=(1, 5)):
+    """Deterministic Euler over the flow-match schedule. Also snapshots the latent AFTER the step counts
+    in `capture_after` (x_k = state after k Euler steps) so the parity test can distinguish systematic
+    BIAS (a fixed offset present from step 1 — e.g. the MLX bf16-conditioning lock) from diffuse float
+    ACCUMULATION (grows with step count). x_k here == the input the (k+1)-th DiT call would see."""
     sigmas = anima_sigmas(steps)
     x = init.clone()
     pm = torch.zeros(1, 1, init.shape[-2], init.shape[-1], device=DEVICE)
+    caps = {}
     for i in range(steps):
         s, sn = sigmas[i], sigmas[i + 1]
         ts = torch.tensor([s], device=DEVICE)
@@ -204,7 +209,9 @@ def denoise(dit, cond, uncond, init, steps, guidance):
             else:
                 v = vc
         x = x + (sn - s) * v
-    return x
+        if (i + 1) in capture_after:
+            caps[i + 1] = x.detach().float().cpu().numpy().copy()
+    return x, caps
 
 
 def decode_to_uint8(vae, latent):
@@ -273,7 +280,8 @@ def main():
         dit, cond_model = load_transformer_and_conditioner(variant, base_snap, sf_snap, anima_conv)
         cond = encode(PROMPT, text_encoder, cond_model, qwen_tok, t5_tok)
         uncond = encode(NEGATIVE, text_encoder, cond_model, qwen_tok, t5_tok) if uses_cfg else None
-        latent = denoise(dit, cond, uncond, init, steps, guidance)
+        capture_after = (1, 5)  # snapshot x after 1 and 5 Euler steps (both exist for steps>=10)
+        latent, caps = denoise(dit, cond, uncond, init, steps, guidance, capture_after)
         if DEVICE == "mps":
             torch.mps.synchronize()
         rgb = decode_to_uint8(vae, latent)
@@ -289,6 +297,10 @@ def main():
             "guidance": guidance,
             "uses_cfg": uses_cfg,
             "final_latent": summarize(latent.float().cpu().numpy()),
+            # Intermediate-step latents (x after 1 and 5 Euler steps). A bias shows up at step 1; pure
+            # accumulation grows toward the final. The Rust test asserts these and reports the per-step
+            # rel-L2 so accumulation-vs-bias is testable, not asserted by prose.
+            "step_latents": {str(k): summarize(v) for k, v in sorted(caps.items())},
             "image": img_summary(rgb),
         }
         print(f"  latent std={results[variant]['final_latent']['std']:.4f} "
@@ -331,7 +343,10 @@ def main():
             "bf16-locked, but fp32 reference is empirically the closer target for MLX-bf16 than a torch-bf16 "
             "encode (two different bf16 roundings diverge more than fp32-truth-vs-bf16). Trajectory in fp32.",
             "note": "Parity = no quality regression. Same injected init + Euler + schedule -> residual is "
-            "Metal-vs-MPS float error, not chaos.",
+            "Metal-vs-MPS float error, not chaos. The MLX Qwen3+conditioner encode is bf16-locked while "
+            "this reference runs fp32, so a FIXED bf16-conditioning offset propagates through every step ON "
+            "TOP of float accumulation; `step_latents` (x after 1 & 5 steps) let the Rust test tell the two "
+            "apart (a bias is already present at step 1; accumulation grows toward the final).",
         },
         "variants": results,
     }
