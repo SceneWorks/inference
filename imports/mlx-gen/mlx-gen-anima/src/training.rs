@@ -76,6 +76,13 @@ use crate::vae::QwenVae;
 /// training must match so the adapter round-trips.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
 
+/// Saved-adapter storage dtype. The trainable factors are f32 master-weights, but the shipped Anima
+/// adapters (`anima-turbo-lora-v0.2`, `anima-greg-rutkowski-style`) are **bf16**, and the inference
+/// loader reconstructs the residual at bf16 regardless — so the saved factors are cast to bf16 to
+/// match the shipped convention and halve file size (~138 MB → ~69 MB), with no round-trip loss
+/// beyond the bf16 rounding the loader would apply anyway.
+const SAVE_DTYPE: Dtype = Dtype::Bfloat16;
+
 /// ComfyUI adapter key prefix the official Anima LoRAs (and the sc-10521 inference loader) use —
 /// `diffusion_model.blocks.*` for the DiT, `diffusion_model.llm_adapter.blocks.*` for the conditioner.
 const KEY_PREFIX: &str = "diffusion_model.";
@@ -555,7 +562,14 @@ fn save_adapter(
     match adapter {
         TrainAdapter::Lora { .. } => save_anima_lora(params, target_paths, alpha, rank, path),
         TrainAdapter::Lokr { targets } => {
-            save_lokr(params, targets, alpha, rank, cfg.decompose_factor, path)
+            // Store the Kronecker factors bf16 ([`SAVE_DTYPE`]) too — the inference LoKr loader
+            // reconstructs the delta at bf16 ([`LOKR_DTYPE`]) regardless, so casting the f32 master
+            // factors here is round-trip-lossless and halves the file, matching the LoRA convention.
+            let bf16: LoraParams = params
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), v.as_dtype(SAVE_DTYPE)?)))
+                .collect::<Result<_>>()?;
+            save_lokr(&bf16, targets, alpha, rank, cfg.decompose_factor, path)
         }
     }
 }
@@ -564,7 +578,8 @@ fn save_adapter(
 /// `diffusion_model.{path}.lora_A.weight` `[r,in]` / `diffusion_model.{path}.lora_B.weight` `[out,r]`,
 /// with the `alpha/rank` scale **baked into `lora_B`** so the file carries no alpha (α = r ⇒ the
 /// sc-10521 inference loader applies it at scale 1.0, exactly reproducing the trained residual). The
-/// metadata is `{"format":"pt"}` only, matching the official `anima-turbo-lora-v0.2` `__metadata__`.
+/// factors are stored **bf16** ([`SAVE_DTYPE`]) and the metadata is `{"format":"pt"}` only, matching
+/// the official `anima-turbo-lora-v0.2` `__metadata__` and dtype.
 fn save_anima_lora(
     params: &LoraParams,
     target_paths: &[String],
@@ -582,10 +597,13 @@ fn save_anima_lora(
         let b = params
             .get(format!("{p}.lora_b").as_str())
             .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {p}.lora_b")))?;
-        owned.push((format!("{KEY_PREFIX}{p}.lora_A.weight"), a.clone()));
+        owned.push((
+            format!("{KEY_PREFIX}{p}.lora_A.weight"),
+            a.as_dtype(SAVE_DTYPE)?,
+        ));
         owned.push((
             format!("{KEY_PREFIX}{p}.lora_B.weight"),
-            multiply(b, &scale)?,
+            multiply(b, &scale)?.as_dtype(SAVE_DTYPE)?,
         ));
     }
     let entries: Vec<(String, &Array)> = owned.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -802,5 +820,86 @@ mod tests {
         assert!((x_t.as_slice::<f32>()[1] - 3.25).abs() < 1e-5);
         // target = [1,1] - [2,4] = [-1,-3]
         assert_eq!(target.as_slice::<f32>(), &[-1.0, -3.0]);
+    }
+
+    /// CI-runnable, **weights-free** guard on the trainable-target surface (sc-10522). Builds the DiT +
+    /// conditioner *structurally* (placeholder 1×1 weights, no licensed checkpoint, no Metal compute),
+    /// then asserts the trainer enumerates exactly **508** targets = **448** DiT (`blocks.*`) + **60**
+    /// conditioner (`llm_adapter.blocks.*`). Deliberately **structural** (path strings, no numerics),
+    /// so — unlike a Metal golden — it cannot go device-dependently red: a regression that drops the
+    /// conditioner leg (the sc-10274 partial-injection class) collapses this to 448 and fails here.
+    /// This is the always-on analogue of the real-weights `trainable_surface_is_508_*` (which is
+    /// `#[ignore]`d and needs the snapshot); it runs under a plain `cargo test -p mlx-gen-anima`.
+    #[test]
+    fn trainable_surface_is_508_dit_plus_60_conditioner_weightsfree() {
+        use crate::config::{ConditionerConfig, DitConfig};
+        let dit = CosmosDiT::structural(DitConfig::anima());
+        let cond = AnimaTextConditioner::structural(ConditionerConfig::anima());
+
+        // Empty `lora_target_modules` ⇒ the full 508-target surface the official Anima LoRAs carry.
+        let cfg = TrainingConfig::default();
+        let paths = resolve_target_paths(&dit, &cond, &cfg);
+        assert_eq!(
+            paths.len(),
+            508,
+            "full trainable surface must be 508 (448 DiT + 60 conditioner), got {}",
+            paths.len()
+        );
+
+        let cond_paths: Vec<&String> = paths
+            .iter()
+            .filter(|p| p.starts_with("llm_adapter."))
+            .collect();
+        let dit_paths: Vec<&String> = paths
+            .iter()
+            .filter(|p| !p.starts_with("llm_adapter."))
+            .collect();
+        assert_eq!(
+            cond_paths.len(),
+            60,
+            "conditioner (llm_adapter) must contribute exactly 60 targets — dropping it is the \
+             sc-10274 partial-injection regression"
+        );
+        assert_eq!(
+            dit_paths.len(),
+            448,
+            "DiT must contribute exactly 448 targets (28 blocks × 16)"
+        );
+        assert!(
+            cond_paths
+                .iter()
+                .all(|p| p.starts_with("llm_adapter.blocks.")),
+            "every conditioner target must be a per-block llm_adapter path"
+        );
+        assert!(
+            dit_paths.iter().all(|p| p.starts_with("blocks.")),
+            "every DiT target must be a per-block path"
+        );
+
+        // A non-empty target filter narrows the surface by PEFT-style suffix match, and must stay
+        // non-empty and strictly narrower than the full surface.
+        let filtered = TrainingConfig {
+            lora_target_modules: vec![
+                "q_proj".into(),
+                "k_proj".into(),
+                "v_proj".into(),
+                "output_proj".into(),
+            ],
+            ..Default::default()
+        };
+        let attn_only = resolve_target_paths(&dit, &cond, &filtered);
+        assert!(
+            !attn_only.is_empty() && attn_only.len() < paths.len(),
+            "suffix filter must narrow the surface, got {}",
+            attn_only.len()
+        );
+        assert!(
+            attn_only
+                .iter()
+                .all(|p| ["q_proj", "k_proj", "v_proj", "output_proj"]
+                    .iter()
+                    .any(|s| p.ends_with(&format!(".{s}")))),
+            "every filtered path must match a requested suffix"
+        );
     }
 }
