@@ -286,4 +286,34 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn load_rejects_quant_plus_adapter_sc10578() {
+        // Quant + LoRA/LoKr together is unsupported in this lane (sc-10578). The shared
+        // `AdaptableLinear` *can* run an adapter over a packed Q4/Q8 base, so nothing downstream
+        // rejects the pair — the ONLY guard was sc-10521's blanket "reject all quantize", which
+        // sc-10517 removed to allow quant-only tiers. The integration merge must therefore keep a
+        // narrowed guard so a packed tier requested WITH an adapter is rejected at the load gate,
+        // BEFORE any weight is read (the guard runs before `AnimaPipeline::from_source`, so the
+        // nonexistent dir + fake adapter path are never dereferenced — the sc-10578 error fires first).
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+        for variant_load in [load_base, load_aesthetic, load_turbo] {
+            let adapter = AdapterSpec::new(
+                "/nonexistent-anima-lora.safetensors".into(),
+                1.0,
+                AdapterKind::Lora,
+            );
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-anima".into()))
+                .with_quant(Quant::Q8)
+                .with_adapters(vec![adapter]);
+            let e = variant_load(&spec)
+                .err()
+                .expect("packed tier + adapter must error")
+                .to_string();
+            assert!(
+                e.contains("sc-10578"),
+                "packed tier + adapter must be rejected with the sc-10578 guard, got: {e}"
+            );
+        }
+    }
 }
