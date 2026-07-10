@@ -101,7 +101,13 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>>
             "{id}: no quant tiers are wired yet (bf16 only; Q4/Q8 tracked in sc-10517)"
         )));
     }
-    let pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
+    let mut pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
+    // Bake any LoRA/LoKr adapters onto the still-mutable model (DiT + bundled conditioner), stacked
+    // and mixed, strictly (an unmatched target errors rather than loading a partial distillation —
+    // sc-10521 / sc-10274). No-op when `spec.adapters` is empty.
+    if !spec.adapters.is_empty() {
+        pipeline.apply_adapters(&spec.adapters)?;
+    }
     Ok(Box::new(Anima {
         descriptor: descriptor_for(variant),
         variant,

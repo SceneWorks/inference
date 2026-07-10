@@ -12,7 +12,7 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, zeros_dtype};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{apply_text_rope, gelu_exact, TextRope, TokenEmbedding};
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
@@ -238,5 +238,78 @@ impl AnimaTextConditioner {
 
     pub fn config(&self) -> &ConditionerConfig {
         &self.cfg
+    }
+}
+
+// ---- LoRA/LoKr adapter surface (sc-10521) --------------------------------------------------------
+//
+// The **turbo** LoRA (`anima-turbo-lora-v0.2`) carries 60 = 6×10 `llm_adapter.*` targets that a
+// DiT-only injection walk silently drops — the exact sc-10274 (eros distill LoRA) failure class. The
+// conditioner MUST be a first-class injectable target. The trained files address it (after the loader
+// strips the `diffusion_model.` prefix and the top-level host strips the `llm_adapter.` segment) by
+// the conditioner's own module names: `blocks.N.{self_attn,cross_attn}.{q_proj,k_proj,v_proj,o_proj}`
+// and `blocks.N.mlp.{0,2}` (no norm targets).
+
+impl AdaptableHost for Attention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["q_proj"] => Some(&mut self.q_proj),
+            ["k_proj"] => Some(&mut self.k_proj),
+            ["v_proj"] => Some(&mut self.v_proj),
+            ["o_proj"] => Some(&mut self.o_proj),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["q_proj", "k_proj", "v_proj", "o_proj"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+}
+
+impl AdaptableHost for Block {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["self_attn", rest @ ..] => self.self_attn.adaptable_mut(rest),
+            ["cross_attn", rest @ ..] => self.cross_attn.adaptable_mut(rest),
+            ["mlp", "0"] => Some(&mut self.mlp_in),
+            ["mlp", "2"] => Some(&mut self.mlp_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        out.extend(prefixed_paths("self_attn", &self.self_attn));
+        out.extend(prefixed_paths("cross_attn", &self.cross_attn));
+        out.push("mlp.0".to_string());
+        out.push("mlp.2".to_string());
+        out
+    }
+}
+
+/// The `AnimaTextConditioner` adapter host: `blocks.N.*` route into the per-block leaves (the 60 = 6×10
+/// adapter targets the turbo LoRA carries); `out_proj` is routable too (the shipped LoRAs never target
+/// it). Only block targets are enumerated for the kohya table.
+impl AdaptableHost for AnimaTextConditioner {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["out_proj"] => Some(&mut self.out_proj),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("blocks.{i}"), b));
+        }
+        out
     }
 }

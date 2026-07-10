@@ -5,9 +5,10 @@
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::adapters::loader::ApplyReport;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::media::Image;
-use mlx_gen::runtime::CancelFlag;
+use mlx_gen::runtime::{AdapterSpec, CancelFlag};
 use mlx_gen::{run_flow_sampler, Progress, Result, TimestepConvention, WeightsSource};
 
 use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
@@ -77,6 +78,19 @@ impl AnimaPipeline {
 
     pub fn components(&self) -> &AnimaComponents {
         &self.components
+    }
+
+    /// Bake LoRA/LoKr adapters onto the DiT **and** the bundled `AnimaTextConditioner` at load time
+    /// (sc-10521). Stacked + mixed LoRA/LoKr are supported by construction; an unmatched target is a
+    /// hard error (strict). No-op for an empty spec list. Returns the [`ApplyReport`] (its `applied`
+    /// count is 508 for the turbo LoRA — 448 DiT + 60 conditioner — and 448 for the DiT-only style
+    /// LoRA). Applied on the still-mutable model during `load`, mirroring the Z-Image/Qwen seam.
+    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<ApplyReport> {
+        crate::adapters::apply_anima_adapters(
+            &mut self.components.dit,
+            &mut self.components.conditioner,
+            specs,
+        )
     }
 
     /// Encode a prompt to the DiT's `encoder_hidden_states` `[1, 512, 1024]` (bf16): Qwen3
