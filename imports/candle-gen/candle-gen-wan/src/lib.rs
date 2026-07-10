@@ -38,21 +38,22 @@ pub mod vae;
 pub mod vae16;
 pub mod wan14b;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, MoeExpert, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
 use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
     TextEncoderConfig, TransformerConfig, VaeConfig, DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_GUIDANCE,
-    DEFAULT_STEPS, MODEL_ID, NEGATIVE_FALLBACK, SIZE_MULTIPLE,
+    DEFAULT_STEPS, MIN_SIZE, MODEL_ID, NEGATIVE_FALLBACK, SIZE_MULTIPLE,
 };
 use rope::WanRope;
 use scheduler::{flow_shift, FlowScheduler, Sampler};
@@ -82,11 +83,17 @@ struct Pipeline {
     vae_cfg: VaeConfig,
     root: PathBuf,
     device: Device,
+    /// LoRA/LoKr adapters to apply to the DiT at load (sc-10095). On a dense tier they FOLD into the
+    /// weights ([`adapters::merge_adapters`]); on a packed q4/q8 tier they attach as forward-time
+    /// **additive** residuals ([`adapters::install_additive`], sc-10094) — a packed tier has no dense
+    /// `W` to fold into.
+    adapters: Vec<AdapterSpec>,
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device) -> Self {
+    fn load(root: &Path, device: &Device, adapters: Vec<AdapterSpec>) -> Self {
         Self {
+            adapters,
             te_cfg: TextEncoderConfig::umt5_xxl(),
             dit_cfg: TransformerConfig::ti2v_5b(),
             vae_cfg: VaeConfig::ti2v_5b(),
@@ -109,7 +116,7 @@ impl Pipeline {
 
     fn load_components(&self) -> CResult<Components> {
         let te = Umt5Encoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
-        let dit = WanTransformer::new(&self.dit_cfg, self.component_vb("transformer", DIT_DTYPE)?)?;
+        let dit = self.build_dit()?;
         let vae = WanVae::new(&self.vae_cfg, self.component_vb("vae", VAE_DTYPE)?)?;
         let tok = text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan")?;
         Ok(Components {
@@ -118,6 +125,56 @@ impl Pipeline {
             vae: Arc::new(vae),
             tok: Arc::new(tok),
         })
+    }
+
+    /// Build the TI2V-5B DiT, applying [`Self::adapters`] by tier (sc-10095): a **dense** tier folds the
+    /// delta into the weights ([`adapters::merge_adapters`], the merge-not-residual fast path, byte
+    /// identical to before); a **packed** q4/q8 tier attaches forward-time **additive** residuals on the
+    /// packed `QLinear` ([`adapters::install_additive`], sc-10094) — a packed tier has no dense `W` to
+    /// fold into, and LoKr/LoHa on it is rejected there (deferred to sc-10050/10051). The 5B is a single
+    /// (non-MoE) DiT, so every adapter is shared (`moe_expert = None`); the `expert` arg is a formality.
+    fn build_dit(&self) -> CResult<WanTransformer> {
+        let vb = self.component_vb("transformer", DIT_DTYPE)?;
+        // Packed-tier marker: the sc-10025 seam packs every DiT Linear (incl. `proj_out`).
+        let packed = vb.contains_tensor("proj_out.scales");
+        if packed {
+            let mut dit = WanTransformer::new(&self.dit_cfg, vb)?;
+            if self.adapters.is_empty() {
+                return Ok(dit);
+            }
+            let report = adapters::install_additive(&mut dit, &self.adapters, MoeExpert::High)?;
+            if report.applied == 0 {
+                return Err(CandleError::Msg(format!(
+                    "wan: {} LoRA adapter file(s) matched no projection on the packed TI2V-5B DiT — \
+                     check the key format (expected PEFT `<path>.lora_A/B.weight` or kohya \
+                     `lora_unet_<flat>` targeting the DiT attention/FFN Linears)",
+                    self.adapters.len()
+                )));
+            }
+            return Ok(dit);
+        }
+        if self.adapters.is_empty() {
+            return Ok(WanTransformer::new(&self.dit_cfg, vb)?);
+        }
+        // Dense tier + adapters: fold the delta into the dense weights before build (`merge_adapters`
+        // hard-errors on its own zero-match).
+        drop(vb);
+        let mut map = self.load_component_map("transformer")?;
+        adapters::merge_adapters(&mut map, &self.adapters)?;
+        let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
+        Ok(WanTransformer::new(&self.dit_cfg, vb)?)
+    }
+
+    /// Load every `.safetensors` in the component subdir `sub` into one CPU tensor map (native dtype) —
+    /// the merge-ready form the dense adapter fold needs (vs the mmap `component_vb` fast path).
+    fn load_component_map(&self, sub: &str) -> CResult<HashMap<String, Tensor>> {
+        let dir = self.root.join(sub);
+        let files = candle_gen::sorted_safetensors(&dir, "wan")?;
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        for f in &files {
+            map.extend(cst::load(f, &Device::Cpu)?);
+        }
+        Ok(map)
     }
 
     /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (f32, zero-padded to `max_length`). Shared
@@ -243,20 +300,19 @@ pub struct WanGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
+    /// LoRA/LoKr adapters applied to the DiT at first load (sc-10095) — folded (dense) or additive
+    /// (packed q4/q8 tier).
+    adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Components>>,
 }
 
 impl WanGenerator {
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
-        // while locked must not turn every later `generate` into a panic).
-        let mut guard = candle_gen::lock_recover(&self.components);
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = pipe.load_components()?;
-        *guard = Some(c.clone());
-        Ok(c)
+        // `cached` recovers a poisoned lock (sc-9015) internally; `?` bridges the candle-side
+        // `load_components` error into `gen_core::Error`.
+        Ok(candle_gen::cached(&self.components, || {
+            pipe.load_components()
+        })?)
     }
 }
 
@@ -297,7 +353,7 @@ impl Generator for WanGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(&self.root, &self.device);
+        let pipe = Pipeline::load(&self.root, &self.device, self.adapters.clone());
         let components = self.components(&pipe)?;
         let (frames, fps) = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Video {
@@ -309,9 +365,9 @@ impl Generator for WanGenerator {
 }
 
 /// Wan2.2 TI2V-5B txt2video descriptor — the surface sc-3697 wires: CFG txt2video with a negative
-/// prompt, UniPC / Euler samplers; no conditioning (image / VACE deferred), no LoRA. Advertises the
-/// Q4/Q8 packed tiers (sc-10025) — the tiers are pre-quantized MLX snapshots the packed-detect loaders
-/// read directly (no on-the-fly quantization); tier ingestion is sc-10026.
+/// prompt, UniPC / Euler samplers; no conditioning (image / VACE deferred). **LoRA/LoKr** apply at load
+/// (sc-10095: folded on a dense tier, additive on a packed one). Advertises the Q4/Q8 packed tiers
+/// (sc-10025) — pre-quantized snapshots the packed-detect loaders read directly (no on-the-fly quant).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -323,8 +379,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_guidance: true,
             supports_true_cfg: false,
             conditioning: vec![],
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA/LoKr apply at load (sc-10095): folded on a dense tier, or as additive residuals on a
+            // packed q4/q8 tier (sc-10094). LoKr/LoHa on a packed tier is rejected at load (sc-10050/10051).
+            supports_lora: true,
+            supports_lokr: true,
             // Native flow samplers (curated `uni_pc` default / `euler`) + the epic 7114 P4 (sc-7124)
             // curated fold-in: the gen-core-only solvers over Wan's native flow σ schedule. The curated
             // `uni_pc` (sc-7296) is honored by Wan's OWN native UniPC; gen-core's VE-space `uni_pc`/
@@ -342,7 +400,10 @@ pub fn descriptor() -> ModelDescriptor {
             ],
             schedulers: vec![],
             supported_guidance_methods: vec![],
-            min_size: 32,
+            // Per-side floor 480 (= a 15×15 latent-token grid): below it the z48 vae22's coarse
+            // effective 32× stride starves the DiT, which renders rainbow garbage at ANY flow-shift
+            // (dense + packed alike, sc-10306). Enforced by `Capabilities::validate_request`.
+            min_size: MIN_SIZE,
             max_size: 1280,
             max_count: 1,
             mac_only: false,
@@ -357,7 +418,8 @@ pub fn descriptor() -> ModelDescriptor {
 /// a `Wan-AI/Wan2.2-TI2V-5B-Diffusers` dense snapshot OR a pre-quantized MLX tier
 /// (`SceneWorks/wan2.2-ti2v-5b-mlx` q4/q8) — the packed-detect loaders (sc-10025) read whichever the
 /// dir holds. `spec.quantize` is a no-op: the tier is already packed (or dense), never requantized at
-/// load. Adapters / control overlays are rejected (not wired).
+/// load. **LoRA/LoKr adapters** apply at first `generate` (sc-10095: folded on a dense tier, additive on
+/// a packed one); control / VACE / IP-adapter overlays are still rejected (not wired).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -369,14 +431,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "candle wan does not support LoRA/LoKr yet".into(),
-        ));
-    }
-    // No `spec.quantize` reject (sc-10025): the quant matrix is packed-tier, not on-the-fly — a q4/q8
-    // tier is pre-quantized (the packed-detect loaders read its `.scales`), a dense tier loads dense, so
-    // `spec.quantize` is a no-op tier-select marker resolved worker-side (mirrors ltx sc-9417).
+    // Adapters are applied at first load (sc-10095): the packed-vs-dense branch lives in
+    // `Pipeline::build_dit`. No `spec.quantize` reject (sc-10025): the quant matrix is packed-tier, not
+    // on-the-fly — a q4/q8 tier is pre-quantized (the packed-detect loaders read its `.scales`), a dense
+    // tier loads dense, so `spec.quantize` is a no-op tier-select marker resolved worker-side (ltx sc-9417).
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle wan does not support image / VACE conditioning yet (txt2video only)".into(),
@@ -387,6 +445,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         root,
         device,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -433,8 +492,9 @@ mod tests {
         let g = registry::load(MODEL_ID, &spec).unwrap();
         let ok = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
-            width: 256,
-            height: 256,
+            width: 512,
+            height: 512,
+            count: 1,
             guidance: Some(5.0),
             negative_prompt: Some("blurry".into()),
             frames: Some(17),
@@ -449,32 +509,40 @@ mod tests {
                 ..ok.clone()
             })
             .is_ok());
+        // Each bad case spreads from the valid `ok` so it is rejected for its OWN reason, not an
+        // unrelated default.
         for bad in [
             // empty prompt
-            GenerationRequest::default(),
+            GenerationRequest {
+                prompt: String::new(),
+                ..ok.clone()
+            },
             // frames not ≡ 1 (mod 4)
             GenerationRequest {
-                prompt: "x".into(),
                 frames: Some(16),
-                ..Default::default()
+                ..ok.clone()
             },
-            // size not a multiple of 32
+            // size not a multiple of 32 (500 is in-range but 500 % 32 != 0)
             GenerationRequest {
-                prompt: "x".into(),
-                width: 300,
-                ..Default::default()
+                width: 500,
+                ..ok.clone()
+            },
+            // below the per-side min-size floor (sc-10306): 320² is 32-aligned but under 480 → the z48
+            // token grid is too coarse to converge, so the descriptor rejects it up front.
+            GenerationRequest {
+                width: 320,
+                height: 320,
+                ..ok.clone()
             },
             // zero steps
             GenerationRequest {
-                prompt: "x".into(),
                 steps: Some(0),
-                ..Default::default()
+                ..ok.clone()
             },
             // unadvertised sampler
             GenerationRequest {
-                prompt: "x".into(),
                 sampler: Some("dpmpp2m".into()),
-                ..Default::default()
+                ..ok.clone()
             },
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
@@ -482,17 +550,15 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_lora_accepts_quant() {
+    fn load_accepts_lora_and_quant() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        // LoRA/LoKr is still unwired → rejected.
+        // LoRA/LoKr is wired (sc-10095) — load is lazy, so attaching adapters resolves OK (the fold /
+        // additive install happens at the first `generate`).
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
-        // Quant is now a no-op tier-select marker (packed-detect load, sc-10025), not a reject — a q4/q8
+        assert!(load(&lora).is_ok(), "LoRA is accepted (applied lazily)");
+        // Quant is a no-op tier-select marker (packed-detect load, sc-10025), not a reject — a q4/q8
         // tier is pre-quantized, so `spec.quantize` no longer errors (lazy load, no fs touch here).
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
         assert!(
@@ -506,5 +572,136 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/w.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    // ---- packed-tier adapter routing (sc-10095) -------------------------------------------------
+
+    use candle_gen::candle_nn::VarMap;
+
+    /// A tiny Wan DiT config — the dit_train shape (z16, 2 layers), enough to exercise the packed-detect
+    /// + additive-route path in `Pipeline::build_dit` cheaply on CPU.
+    fn tiny_cfg() -> TransformerConfig {
+        TransformerConfig {
+            in_channels: 16,
+            out_channels: 16,
+            num_layers: 2,
+            num_heads: 1,
+            head_dim: 128,
+            dim: 128,
+            ffn_dim: 256,
+            freq_dim: 256,
+            text_dim: 64,
+            patch: (1, 2, 2),
+            eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_max_seq_len: 1024,
+        }
+    }
+
+    /// Build a tiny **packed** transformer tier on disk under `{root}/transformer/`: a randomized dense
+    /// DiT map, MLX-affine-packed by the sc-10026 producer, written as `model.safetensors` (+ a
+    /// `quantize_config.json`) — the exact packed-detect layout the sc-10025 seam loads.
+    fn write_packed_transformer(root: &Path, cfg: &TransformerConfig) {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let _ = WanTransformer::new(cfg, vb).unwrap();
+        for v in vm.all_vars() {
+            v.set(&Tensor::randn(0f32, 0.1f32, v.dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let map: HashMap<String, Tensor> = {
+            let data = vm.data().lock().unwrap();
+            data.iter()
+                .map(|(k, v)| (k.clone(), v.as_tensor().clone()))
+                .collect()
+        };
+        let (packed, _n) = candle_tier_build::pack_transformer_component(map, 4).unwrap();
+        let dir = root.join("transformer");
+        std::fs::create_dir_all(&dir).unwrap();
+        cst::save(&packed, dir.join("model.safetensors")).unwrap();
+        std::fs::write(dir.join("quantize_config.json"), "{\"bits\":4}").unwrap();
+    }
+
+    fn tiny_pipeline(root: &Path, adapters: Vec<AdapterSpec>) -> Pipeline {
+        Pipeline {
+            adapters,
+            te_cfg: TextEncoderConfig::umt5_xxl(),
+            dit_cfg: tiny_cfg(),
+            vae_cfg: VaeConfig::ti2v_5b(),
+            root: root.to_path_buf(),
+            device: Device::Cpu,
+        }
+    }
+
+    /// `build_dit` loads a packed tier through the packed path (`is_packed()`), and with a LoRA it
+    /// installs the residual additively (the base stays packed — no dense weight materialized) rather
+    /// than folding, which a packed tier can't support. The core sc-10095 routing on a real tier layout.
+    #[test]
+    fn build_dit_routes_packed_tier_through_additive() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let root = std::env::temp_dir().join(format!("sc10095_5b_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        write_packed_transformer(&root, &cfg);
+
+        // No adapters: the packed tier loads packed, unadapted.
+        let base = tiny_pipeline(&root, vec![]).build_dit().unwrap();
+        assert!(
+            base.is_packed(),
+            "packed tier must load through the packed path"
+        );
+
+        // A LoRA on `blocks.0.attn1.to_q`: applies additively, base stays packed.
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        m.insert(
+            "blocks.0.attn1.to_q.lora_A.weight".into(),
+            (Tensor::randn(0f32, 1f32, (4, cfg.dim), &dev).unwrap() * 0.1).unwrap(),
+        );
+        m.insert(
+            "blocks.0.attn1.to_q.lora_B.weight".into(),
+            (Tensor::randn(0f32, 1f32, (cfg.dim, 4), &dev).unwrap() * 0.1).unwrap(),
+        );
+        let lora_path = root.join("lora.safetensors");
+        cst::save(&m, &lora_path).unwrap();
+        let specs = vec![candle_gen::gen_core::AdapterSpec::new(
+            lora_path,
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        )];
+        let adapted = tiny_pipeline(&root, specs).build_dit().unwrap();
+        assert!(
+            adapted.is_packed(),
+            "the additive LoRA must not un-pack the base"
+        );
+        // (The numeric forward shift is a CUDA-only check — the DiT runs bf16, and CPU has no bf16
+        // matmul; that's the on-device sc-10026 gate. The QLinear-level additive-on-packed forward is
+        // covered on CPU in `quant::tests::additive_lora_on_packed_shifts_and_finite`.)
+
+        // A LoRA that matches NO projection is surfaced by the packed zero-match guard (proving the
+        // additive install actually ran, not a silent no-op) — a misconfigured file hard-errors rather
+        // than rendering unadapted.
+        let mut bogus: HashMap<String, Tensor> = HashMap::new();
+        bogus.insert(
+            "blocks.99.attn1.to_q.lora_A.weight".into(),
+            Tensor::randn(0f32, 1f32, (4, cfg.dim), &dev).unwrap(),
+        );
+        bogus.insert(
+            "blocks.99.attn1.to_q.lora_B.weight".into(),
+            Tensor::randn(0f32, 1f32, (cfg.dim, 4), &dev).unwrap(),
+        );
+        let bogus_path = root.join("bogus.safetensors");
+        cst::save(&bogus, &bogus_path).unwrap();
+        let bogus_specs = vec![candle_gen::gen_core::AdapterSpec::new(
+            bogus_path,
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        )];
+        assert!(
+            tiny_pipeline(&root, bogus_specs).build_dit().is_err(),
+            "a LoRA matching no packed projection must hard-error (zero-match guard)"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
