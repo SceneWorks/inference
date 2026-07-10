@@ -208,33 +208,64 @@ fn trap_rope_rejects_per_axis_ood_never_indexes_oob() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// Trap — prompt weighting. ComfyUI (`comfy/text_encoders/anima.py`) forces the Qwen token weights to
-// 1.0 and carries `t5xxl_weights` separately, so weighting must hit the **T5 query tokens**, not Qwen.
-// mlx-gen-anima does NOT implement prompt weighting yet: the pipeline tokenizes plain text with no
-// per-token weight vector on either side. This test PINS that current reality (weight syntax like
-// `(chibi:2)` is literal text to both tokenizers) so the gap is explicit and can't silently regress.
-// Wiring T5-side weighting (and pinning Qwen weights to 1.0) is tracked as a follow-up.
+// Prompt weighting (sc-10566). ComfyUI (`comfy/text_encoders/anima.py`) forces the Qwen token weights
+// to 1.0 and carries `t5xxl_weights` separately, so weighting hits the **T5 query tokens**, not Qwen.
+// mlx-gen-anima now parses `(text:weight)` emphasis and carries a per-token weight vector on the T5
+// side only. This test (which REPLACES the sc-10524 `trap_prompt_weighting_absent_*` guard) proves the
+// weight syntax is PARSED OUT — not fed as literal characters — and that an unweighted prompt is a
+// strict no-op. The numeric both-directions / mutation / image proofs (real weights + Metal) live in
+// `tests/real_weights.rs` (`#[ignore]`d). No licensed weights are needed here — tokenizers only.
 // -------------------------------------------------------------------------------------------------
 
 #[test]
-fn trap_prompt_weighting_absent_weight_syntax_is_literal_text() {
+fn prompt_weighting_is_parsed_out_and_plain_is_strict_noop() {
+    use mlx_gen_anima::strip_prompt_weights;
     let tk = AnimaTokenizers::load().expect("load tokenizers");
-    // `(chibi:2)` tokenizes to MORE tokens than bare `chibi` on both sides — proof the weight is not
-    // parsed out; it is fed as literal characters. There is no weight vector applied anywhere.
-    let (bare_q, _) = tk.encode_qwen("chibi").unwrap();
-    let (wt_q, _) = tk.encode_qwen("(chibi:2)").unwrap();
-    let bare_t5 = tk.encode_t5("chibi").unwrap();
-    let wt_t5 = tk.encode_t5("(chibi:2)").unwrap();
-    assert!(
-        wt_q.shape()[1] > bare_q.shape()[1],
-        "Qwen: `(chibi:2)` is literal text (more tokens than `chibi`) — weighting not parsed"
+
+    // `(chibi:2)` is PARSED, not literal: the T5 stream tokenizes `chibi` (emphasis removed) — the
+    // SAME ids as bare `chibi` — with a per-token weight 2.0, not the characters `( c h i b i : 2 )`.
+    let (bare_ids, bare_w) = tk.encode_t5_weighted("chibi").unwrap();
+    let (wt_ids, wt_w) = tk.encode_t5_weighted("(chibi:2)").unwrap();
+    assert_eq!(
+        bare_ids.as_slice::<i32>(),
+        wt_ids.as_slice::<i32>(),
+        "T5 ids for `(chibi:2)` must equal bare `chibi` (weight syntax stripped, not tokenized)"
     );
     assert!(
-        wt_t5.shape()[1] > bare_t5.shape()[1],
-        "T5: `(chibi:2)` is literal text (more tokens than `chibi`) — weighting not parsed"
+        bare_w.iter().all(|&w| w == 1.0),
+        "bare `chibi` weights must all be 1.0, got {bare_w:?}"
     );
-    // NOTE (sc-10524 finding): the T5-vs-Qwen prompt-weighting behaviour cannot be tested for real
-    // until weighting is implemented. Tracked as a follow-up story; see the PR description.
+    // The `chibi` token(s) carry weight 2.0; the trailing EOS stays 1.0.
+    assert!(
+        wt_w.iter().any(|&w| (w - 2.0).abs() < 1e-6),
+        "weighted `(chibi:2)` must carry a 2.0 token weight, got {wt_w:?}"
+    );
+    assert_eq!(*wt_w.last().unwrap(), 1.0, "T5 EOS weight must be 1.0");
+
+    // Qwen tower is weight-BLIND: it is tokenized on the de-weighted text, so `(chibi:2)` gives the
+    // exact same Qwen ids as `chibi` (the weight never reaches the Qwen path).
+    let (q_bare, _) = tk.encode_qwen("chibi").unwrap();
+    let (q_wt, _) = tk.encode_qwen(&strip_prompt_weights("(chibi:2)")).unwrap();
+    assert_eq!(
+        q_bare.as_slice::<i32>(),
+        q_wt.as_slice::<i32>(),
+        "Qwen ids must be identical for `chibi` and (de-weighted) `(chibi:2)`"
+    );
+
+    // Strict no-op: an unweighted prompt yields the SAME T5 ids as `encode_t5` and all-1.0 weights.
+    for plain in ["1girl, silver hair, masterpiece", "a cat", ""] {
+        let (pw_ids, pw_w) = tk.encode_t5_weighted(plain).unwrap();
+        let base_ids = tk.encode_t5(plain).unwrap();
+        assert_eq!(
+            pw_ids.as_slice::<i32>(),
+            base_ids.as_slice::<i32>(),
+            "encode_t5_weighted must match encode_t5 for the unweighted prompt {plain:?}"
+        );
+        assert!(
+            pw_w.iter().all(|&w| w == 1.0),
+            "unweighted prompt {plain:?} must have all-1.0 weights, got {pw_w:?}"
+        );
+    }
 }
 
 // =================================================================================================

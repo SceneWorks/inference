@@ -9,7 +9,7 @@
 //! the Anima convert script loads with `strict=True` (no rename).
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, zeros_dtype};
+use mlx_rs::ops::{add, concatenate_axis, multiply, zeros_dtype};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -205,6 +205,24 @@ impl AnimaTextConditioner {
         target_ids: &Array,
         dtype: Dtype,
     ) -> Result<Array> {
+        self.forward_weighted(source_hidden, target_ids, None, dtype)
+    }
+
+    /// [`forward`](Self::forward) with **ComfyUI-style prompt weighting** applied to the T5
+    /// query-token path (sc-10566). `target_weights`, when present, is a per-target-token weight
+    /// vector aligned 1:1 with `target_ids` (the real, unpadded T5 sequence): each token's full
+    /// `target_dim` OUTPUT vector is scaled by its scalar weight **before** the right-pad to 512 —
+    /// exactly ComfyUI's `out = self.llm_adapter(...); out = out * t5xxl_weights`
+    /// (`comfy/ldm/anima/model.py:198-206`, with `t5xxl_weights` reshaped to `[1, St, 1]` in
+    /// `comfy/model_base.py:1470`). The Qwen source path is untouched (its weights are pinned to
+    /// `1.0` upstream), and an all-`1.0` weight vector is a strict no-op (identical to [`forward`]).
+    pub fn forward_weighted(
+        &self,
+        source_hidden: &Array,
+        target_ids: &Array,
+        target_weights: Option<&[f32]>,
+        dtype: Dtype,
+    ) -> Result<Array> {
         let ssh = source_hidden.shape();
         let (b, ss) = (ssh[0], ssh[1]);
         let st = target_ids.shape()[1];
@@ -220,11 +238,26 @@ impl AnimaTextConditioner {
         for block in &self.blocks {
             hidden = block.forward(&hidden, source_hidden, target_rope, source_rope)?;
         }
-        let hidden = rms_norm(
+        let mut hidden = rms_norm(
             &self.out_proj.forward(&hidden)?,
             &self.norm,
             self.cfg.norm_eps,
         )?;
+
+        // Prompt weighting: scale each T5 query-token OUTPUT vector by its weight (T5 path only).
+        // Skip entirely when every weight is 1.0 so the unweighted path stays bit-identical.
+        if let Some(w) = target_weights {
+            if w.iter().any(|&x| x != 1.0) {
+                // Align the weight vector to St, padding/truncating with 1.0 (fail gracefully on a
+                // length mismatch rather than panic on a shape error).
+                let st_usize = st as usize;
+                let mut wv = vec![1.0f32; st_usize];
+                let take = w.len().min(st_usize);
+                wv[..take].copy_from_slice(&w[..take]);
+                let warr = Array::from_slice(&wv, &[1, st, 1]).as_dtype(dtype)?; // [1, St, 1]
+                hidden = multiply(&hidden, &warr)?; // broadcast over B and target_dim
+            }
+        }
 
         // Right-pad to min_sequence_length so the DiT always sees exactly 512 text tokens.
         let min = self.cfg.min_sequence_length as i32;

@@ -81,17 +81,26 @@ impl AnimaPipeline {
 
     /// Encode a prompt to the DiT's `encoder_hidden_states` `[1, 512, 1024]` (bf16): Qwen3
     /// `last_hidden_state` → **mask-multiply** (VERIFIED trap) → `AnimaTextConditioner`.
+    ///
+    /// ComfyUI-style `(text:weight)` emphasis (sc-10566) applies to the **T5 query-token path only**:
+    /// the Qwen tower is tokenized on the de-weighted text (its token weights are forced to `1.0`),
+    /// while the parsed per-token weights scale the conditioner output. See [`crate::prompt_weight`].
     pub fn encode_prompt(&self, prompt: &str) -> Result<Array> {
         let c = &self.components;
-        let (qwen_ids, qwen_mask) = c.tokenizers.encode_qwen(prompt)?;
+        // Qwen is weight-blind: strip the emphasis syntax to plain text before tokenizing (a no-op for
+        // an unweighted prompt). This mirrors ComfyUI forcing the Qwen token weights to 1.0.
+        let qwen_text = crate::prompt_weight::strip_prompt_weights(prompt);
+        let (qwen_ids, qwen_mask) = c.tokenizers.encode_qwen(&qwen_text)?;
         let source = c.text_encoder.forward(&qwen_ids, &qwen_mask)?; // [1, S, 1024] bf16
                                                                      // Multiply the Qwen states by the attention mask BEFORE the conditioner (zeros padded/uncond
                                                                      // tokens) — the flagged trap. Batch-1 real prompts have an all-ones mask (no-op); the empty
                                                                      // uncond prompt's single token (mask 0) is zeroed so the conditioner cross-attn contributes 0.
         let mask = qwen_mask.as_dtype(source.dtype())?.expand_dims(2)?; // [1, S, 1]
         let source = multiply(&source, &mask)?;
-        let t5_ids = c.tokenizers.encode_t5(prompt)?; // [1, St]
-        c.conditioner.forward(&source, &t5_ids, source.dtype())
+        // T5 carries the per-token weights (all 1.0 ⇒ strict no-op equal to the unweighted path).
+        let (t5_ids, t5_weights) = c.tokenizers.encode_t5_weighted(prompt)?; // [1, St], len St
+        c.conditioner
+            .forward_weighted(&source, &t5_ids, Some(&t5_weights), source.dtype())
     }
 
     /// Generate one image. `negative` is used only when `variant.uses_cfg()`.
