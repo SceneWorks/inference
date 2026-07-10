@@ -107,7 +107,8 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>>
     // (epic 10043) — leaving the packed codes untouched. A LoKr on a packed base installs as the
     // structured `Adapter::LokrStructured` (the Kronecker vec-trick), so it never materializes an
     // `[out,in]` delta; the shared `install_lycoris_groups` picks that form off `is_quantized()`.
-    // A LoHa (no deferred form) on a packed base errors there rather than silently ballooning memory.
+    // (A LoHa has no deferred form, so it falls back to the materialized delta there — correct, but
+    // memory-hungry. Whether a packed base should refuse that is sc-10678, not a load-gate concern.)
     let _ = spec.quantize;
     let mut pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
     // Bake any LoRA/LoKr adapters onto the still-mutable model (DiT + bundled conditioner), stacked

@@ -202,45 +202,43 @@ enum LycorisKeyResolution<'t> {
     Thirdparty(&'t BTreeMap<String, String>),
 }
 
-/// How a LyCORIS applier handles a module that lands on a **packed (Q4/Q8)** base, where the
-/// materialized `[out,in]` delta of [`Adapter::Lokr`] would defeat the point of the quantized tier
-/// (sc-10578). Both fields are only ever read to build an error message.
-struct PackedResidual<'a> {
-    /// The adapter format, named in the error (`"LoKr"`, `"third-party LoKr"`, `"LoHa"`).
-    format: &'a str,
-    /// Why this format's module has no deferred form, when its factors builder returns `None`.
-    no_deferred_form: &'a str,
-}
-
 /// Shared install skeleton for the non-BFL LyCORIS appliers ([`apply_lokr`],
 /// [`apply_lokr_thirdparty`], [`apply_loha_thirdparty`] — F-067): resolve each module's raw key to
 /// a host dotted path per `resolution`, then stack a residual onto the target. A key that resolves to
 /// no module is surfaced in `unmatched_paths` under its raw spelling, never silently dropped. The BFL
 /// fused→split twin is [`install_bfl_lycoris`].
 ///
-/// **The residual form depends on whether the base is packed** (sc-10578):
+/// **On a packed base, prefer the deferred residual** (sc-10578):
 ///   * **Dense base** — `delta(base_shape)` materializes the `[out,in]` `ΔW` (the closure bakes in the
 ///     format's `alpha/rank` scale and dtype) and it stacks as an [`Adapter::Lokr`] at the user
-///     `scale`. Unchanged from before this story: byte-for-byte the previous behavior, which every
-///     other family's fork-parity goldens depend on.
-///   * **Packed base** — `factors(scale, base_shape)` builds the small Kronecker factors and it stacks
-///     as an [`Adapter::LokrStructured`], applying the residual via the vec-trick **without ever
-///     allocating `[out,in]`**. Note the scale: the structured residual carries none of its own (it is
-///     baked into `factors.w2`), so the user `scale` is passed *in* here, whereas the dense path passes
-///     it to `Adapter::Lokr`.
+///     `scale`. Byte-for-byte the pre-sc-10578 behavior, which every family's fork-parity goldens
+///     depend on.
+///   * **Packed base, deferrable module** — `factors(scale, base_shape)` builds the small Kronecker
+///     factors and it stacks as an [`Adapter::LokrStructured`], applying the residual via the vec-trick
+///     **without ever allocating `[out,in]`**. Note the scale: the structured residual carries none of
+///     its own (it is baked into `factors.w2`), so the user `scale` is passed *in* here, whereas the
+///     dense path passes it to `Adapter::Lokr`. Getting that backwards is a silent mis-scale.
+///   * **Packed base, NOT deferrable** (`factors` → `Ok(None)`: LoHa's Hadamard product, which has no
+///     deferred form at all; a tucker/CP `lokr_t2`; a conv-shaped factor) — **fall back to the
+///     materialized delta**, exactly as before. It is correct: [`Adapter::Lokr`]'s residual is
+///     `scale · x·ΔWᵀ`, which never reads the base, so it rides over `quantized_matmul` unchanged.
+///     It is merely memory-hungry.
 ///
-/// A packed base whose module has no deferred form (`factors` → `Ok(None)`: a tucker/CP `lokr_t2`, a
-/// conv-shaped factor, or LoHa's Hadamard product, which has no deferred form at all) is a hard
-/// **error**, not a silent materialization. Sized on Anima's 448 DiT targets, materializing would cost
-/// ≈3.9 GB bf16 on top of a ~1 GB q4 DiT — i.e. the q4 tier would use *more* memory than bf16, while
-/// every structural test still passed. Erring here mirrors sc-10051 (LoHa on quantized Wan: steer to
-/// bf16, do not materialize).
+/// **Why the fallback and not an error.** An earlier cut of sc-10578 rejected the non-deferrable
+/// packed combination outright, reasoning from sc-10051 (LoHa on quantized Wan: steer to bf16, do not
+/// materialize). That was wrong *here*. Wan reaches its own `apply_wan_adapters_additive`; this shared
+/// path is reached by eleven provider crates, adapters are installed **after** `.quantize()` in every
+/// one of them, and the worker defaults `spec.quantize` to `Some(Q8)` for **every** MLX model. So
+/// `is_quantized()` is true on the default path almost everywhere, and erroring would have turned a
+/// working third-party LoHa into a hard load failure for any model at its default tier — a broad
+/// regression traded for a memory bound nobody asked for. Whether a packed base should refuse a
+/// multi-GB materialized delta is a real product question; it is **sc-10678**, not this story's to
+/// decide unilaterally.
 fn install_lycoris_groups<K, F, G>(
     host: &mut impl AdaptableHost,
     groups: impl IntoIterator<Item = (K, F, G)>,
     scale: f32,
     resolution: LycorisKeyResolution<'_>,
-    packed: PackedResidual<'_>,
 ) -> Result<ApplyReport>
 where
     K: AsRef<str> + Into<String>,
@@ -256,17 +254,14 @@ where
         };
         let parts: Vec<&str> = dotted.split('.').collect();
         match host.adaptable_mut(&parts) {
+            // Packed base: take the deferred form when the module has one, else materialize as before.
             Some(lin) if lin.is_quantized() => {
                 let base_shape = lin.base_shape();
                 match factors(scale, &base_shape)? {
                     Some(f) => lin.push(Adapter::LokrStructured { factors: f }),
                     None => {
-                        return Err(Error::Msg(format!(
-                            "{} adapter: module `{dotted}` cannot apply to a packed (Q4/Q8) base — \
-                             {}. Materializing its [out, in] delta would cost more memory than the \
-                             dense tier it replaces. Use a bf16 tier for this adapter.",
-                            packed.format, packed.no_deferred_form
-                        )))
+                        let delta = delta(&base_shape)?;
+                        lin.push(Adapter::Lokr { delta, scale });
                     }
                 }
                 report.applied += 1;
@@ -298,18 +293,7 @@ pub fn apply_lokr(host: &mut impl AdaptableHost, w: &Weights, scale: f32) -> Res
             },
         )
     });
-    install_lycoris_groups(
-        host,
-        groups,
-        scale,
-        LycorisKeyResolution::Dotted,
-        PackedResidual {
-            format: "LoKr",
-            no_deferred_form:
-                "its Kronecker factors are not both 2-D matrices (a conv-shaped LoKr \
-                               has no vec-trick form)",
-        },
-    )
+    install_lycoris_groups(host, groups, scale, LycorisKeyResolution::Dotted)
 }
 
 // ---- Third-party LyCORIS LoKr (sc-3642) ----------------------------------------------------------
@@ -520,11 +504,6 @@ pub fn apply_lokr_thirdparty(
         groups,
         scale,
         LycorisKeyResolution::Thirdparty(&table),
-        PackedResidual {
-            format: "third-party LoKr",
-            no_deferred_form: "it carries a tucker/CP `lokr_t2` factor (or a conv-shaped factor), \
-                               which has no 2-D matrix form and so no vec-trick residual",
-        },
     )
 }
 
@@ -649,11 +628,14 @@ pub fn parse_loha_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyL
 /// (flattened-prefixed → dotted via [`kohya_table`]) and unmatched-path surfacing mirror
 /// [`apply_lokr_thirdparty`].
 ///
-/// **Dense bases only.** The Hadamard product has NO deferred (unmaterialized) form — unlike LoKr's
-/// Kronecker vec-trick — so a LoHa on a packed Q4/Q8 base would have to materialize the full `[out,in]`
-/// delta, negating the quantized tier. `install_lycoris_groups` therefore errors on a packed target;
-/// the factors builder below is unconditionally `None` because there is nothing to build. This is
-/// sc-10051's "steer to bf16, do not materialize" decision, generalized off Wan onto the shared path.
+/// The Hadamard product has **no deferred (unmaterialized) form** — unlike LoKr's Kronecker vec-trick —
+/// so the factors builder below is unconditionally `None`: there is nothing to build. On a packed Q4/Q8
+/// base, `install_lycoris_groups` therefore falls back to the materialized `[out,in]` delta. That is
+/// CORRECT (the residual `scale · x·ΔWᵀ` never reads the base, so it rides over `quantized_matmul`
+/// unchanged) but holds a dense tensor per target. Refusing the trade instead — sc-10051's call for
+/// quantized Wan — would break every third-party LoHa on the DEFAULT tier of every MLX model, because
+/// adapters install *after* `.quantize()` and the worker defaults `spec.quantize` to `Some(Q8)`.
+/// Whether a packed base should refuse a multi-GB delta is sc-10678, not this path's call to make.
 pub fn apply_loha_thirdparty(
     host: &mut impl AdaptableHost,
     w: &Weights,
@@ -675,11 +657,6 @@ pub fn apply_loha_thirdparty(
         groups,
         scale,
         LycorisKeyResolution::Thirdparty(&table),
-        PackedResidual {
-            format: "LoHa",
-            no_deferred_form: "the Hadamard product has no deferred (unmaterialized) form, unlike \
-                               LoKr's Kronecker vec-trick",
-        },
     )
 }
 
@@ -3892,10 +3869,14 @@ mod tests {
         );
     }
 
-    /// LoHa has no deferred form at all (Hadamard, not Kronecker). On a packed base it must ERROR,
-    /// not materialize a `[out,in]` delta — sc-10051's "steer to bf16" decision, now on the shared path.
+    /// LoHa has no deferred form at all (Hadamard, not Kronecker), so on a packed base it falls back to
+    /// the materialized `[out,in]` delta — the pre-sc-10578 behavior, preserved deliberately. Erroring
+    /// instead (my first cut) would break every third-party LoHa on the DEFAULT tier of every MLX model:
+    /// adapters install AFTER `.quantize()`, and the worker defaults `spec.quantize` to `Some(Q8)`. The
+    /// fallback is correct — `Adapter::Lokr`'s residual never reads the base — just memory-hungry.
+    /// Whether a packed base should refuse a multi-GB delta is sc-10678.
     #[test]
-    fn loha_on_packed_base_errors_rather_than_materializing() {
+    fn loha_on_packed_base_falls_back_to_materialization() {
         let r = 4;
         let a: Vec<f32> = (0..(PK_OUT * r) as usize)
             .map(|i| (i % 5) as f32 * 0.1)
@@ -3931,26 +3912,50 @@ mod tests {
             1
         );
 
-        // Packed base: hard error naming the format and the reason.
+        // Packed base: falls back to the materialized delta — installed, NOT rejected.
         let mut packed = OneLinear {
             lin: AdaptableLinear::dense(pk_base_weight(), None),
         };
         packed.lin.quantize(8, Some(64)).unwrap();
-        let e = apply_loha_thirdparty(&mut packed, &w, 1.0)
-            .expect_err("LoHa on a packed base must error")
-            .to_string();
-        assert!(e.contains("LoHa"), "error must name the format: {e}");
-        assert!(
-            e.contains("no deferred"),
-            "error must say why it cannot apply: {e}"
+        assert_eq!(
+            apply_loha_thirdparty(&mut packed, &w, 1.0).unwrap().applied,
+            1,
+            "a LoHa must still install on a packed base — erroring here would break every \
+             third-party LoHa on the default tier of every MLX model (adapters install AFTER \
+             .quantize(), and the worker defaults spec.quantize to Some(Q8))"
         );
-        assert!(packed.lin.adapters().is_empty(), "nothing may be installed");
+        match packed.lin.adapters() {
+            [Adapter::Lokr { delta, .. }] => assert_eq!(delta.shape(), &[PK_OUT, PK_IN]),
+            _ => panic!("LoHa on a packed base must install the materialized delta"),
+        }
+        // And it must be CORRECT, not merely present: the residual is base-independent, so the packed
+        // and dense installs produce the same one. (Catches a fallback that silently mis-scales.)
+        let x = pk_x();
+        assert!(
+            all_close(
+                packed.lin.adapters()[0].residual(&x).unwrap(),
+                dense.lin.adapters()[0].residual(&x).unwrap(),
+                1e-5,
+                1e-6,
+                None
+            )
+            .unwrap()
+            .item::<bool>(),
+            "the packed fallback residual must equal the dense one"
+        );
+        assert!(
+            packed.lin.is_quantized(),
+            "the fallback must not dequantize the base"
+        );
     }
 
-    /// A tucker/CP `lokr_t2` has no 2-D matrix form, so `build_lokr_factors` returns `None`. On a
-    /// packed base that must error rather than fall back to materialization.
+    /// A tucker/CP `lokr_t2` has no 2-D matrix form, so `build_lokr_factors` returns `None` and the
+    /// packed base falls back to the materialized path — **exactly what a dense base does**. Here that
+    /// fallback then fails, because a conv-shaped `ΔW` cannot reshape onto a Linear `[64,64]` target
+    /// (lycoris only emits `lokr_t2` for conv layers). The point of the test is that packed and dense
+    /// behave IDENTICALLY: sc-10578 introduced no new failure mode for non-deferrable modules.
     #[test]
-    fn tucker_lokr_on_packed_base_errors() {
+    fn tucker_lokr_on_packed_base_matches_dense_behavior() {
         let t2 = Array::from_slice(&[0.1f32; 2 * 2 * 3 * 3], &[2, 2, 3, 3]);
         let w2a = Array::from_slice(&[0.2f32; 2 * 8], &[2, 8]);
         let w2b = Array::from_slice(&[0.3f32; 2 * 8], &[2, 8]);
@@ -3969,14 +3974,30 @@ mod tests {
         .unwrap();
         let w = Weights::from_file(&path).unwrap();
 
+        // Dense base: the materialized path rejects a conv delta on a Linear target.
+        let mut dense = OneLinear {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+        };
+        let dense_err = apply_lokr_thirdparty(&mut dense, &w, 1.0)
+            .expect_err("a conv/tucker delta cannot reshape onto a Linear base")
+            .to_string();
+
+        // Packed base: falls back to that same path, so it fails the same way — not with a new,
+        // sc-10578-specific rejection.
         let mut packed = OneLinear {
             lin: AdaptableLinear::dense(pk_base_weight(), None),
         };
         packed.lin.quantize(4, Some(64)).unwrap();
         let e = apply_lokr_thirdparty(&mut packed, &w, 1.0)
-            .expect_err("a tucker LoKr on a packed base must error")
+            .expect_err("a tucker LoKr on a packed base fails via the materialized fallback")
             .to_string();
-        assert!(e.contains("tucker"), "error must name the cause: {e}");
-        assert!(packed.lin.adapters().is_empty(), "nothing may be installed");
+        assert_eq!(
+            e, dense_err,
+            "packed must fail identically to dense — sc-10578 must add no new failure mode"
+        );
+        assert!(
+            packed.lin.adapters().is_empty(),
+            "nothing installed on failure"
+        );
     }
 }
