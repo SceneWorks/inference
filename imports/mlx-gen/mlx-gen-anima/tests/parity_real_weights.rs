@@ -570,8 +570,18 @@ fn stage7_e2e_all_variants() {
         // early deltas are 3–4 orders of magnitude BELOW the final and grow super-linearly, so the residual
         // is accumulation-dominated (endgame amplification); the bf16-conditioning offset is present but a
         // MINOR per-step contributor, not a dominant bias (isolating it exactly needs an fp32-TE variant,
-        // which requires making the encode dtype configurable — a production change, tracked separately).
-        // Same bounds as the final; if a real bias ever emerged, step-1 would blow past 2e-2 here first.
+        // which requires making the encode dtype configurable — a production change, tracked as a filed
+        // follow-up story).
+        //
+        // The intermediate bounds must actually LOCK the measured value — the whole reason we capture the
+        // step latents is to distinguish accumulation from a fixed bias, and the final's loose structural
+        // tripwire (rel-L2 1.2e-1) would let a ~12% bias sail through here, defeating that (sc-10524
+        // review). So each step is gated a few× above its MEASURED value, not at the final's bound:
+        //   step-1: rel-L2 1e-3 (≈50× over the measured 2e-5; ~120× tighter than the old 1.2e-1);
+        //   step-5: rel-L2 1e-2 (covers the turbo-variant worst case ~3e-3 with headroom; ~12× tighter).
+        // Aggregate stats are locked at 5e-3 (>2.5× over the final's measured <0.2%; steps are closer to
+        // the reference than the final, so this holds with margin). If a real conditioning bias ever
+        // emerged, step-1 would blow past 1e-3 here long before the final tripwire noticed.
         let steps_g = v["step_latents"].as_object().expect("step_latents object");
         assert_eq!(
             caps.len(),
@@ -581,8 +591,17 @@ fn stage7_e2e_all_variants() {
         let mut step_rel: Vec<(usize, f64)> = Vec::new();
         for (k, arr) in &caps {
             let g_step = &steps_g[&k.to_string()];
-            let r =
-                assert_sampled_rel_l2(arr, g_step, &format!("stage7_{id}_step{k}"), 2e-2, 1.2e-1);
+            let rel_bound = match k {
+                1 => 1e-3,
+                _ => 1e-2, // step-5 (and any later capture): covers the turbo ~3e-3 worst case
+            };
+            let r = assert_sampled_rel_l2(
+                arr,
+                g_step,
+                &format!("stage7_{id}_step{k}"),
+                5e-3,
+                rel_bound,
+            );
             step_rel.push((*k, r));
         }
 
