@@ -50,7 +50,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // the Cosmos DiT on-device (the conditioner + Qwen3 TE + VAE stay dense bf16), and this
             // crate's loader packed-detects the tier off the on-disk `{base}.scales` — so `load`
             // ACCEPTS any `spec.quantize` (it is advisory; the resolved tier dir dictates precision,
-            // like SANA/Kolors). The worker reads `supported_quants` for its capability advertisement
+            // like SANA). The worker reads `supported_quants` for its capability advertisement
             // (gen-core sc-3723); every advertised tier actually loads, so this is honest.
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
@@ -98,7 +98,8 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>>
     // VAE kept dense bf16), and the DiT's `AdaptableLinear`s packed-detect the tier off the on-disk
     // `{base}.scales` inside `CosmosDiT::from_weights`. So a `spec.quantize` value is ADVISORY — the
     // resolved tier directory dictates the actual precision — and we accept any tier without a
-    // load-time `.quantize()` (mirrors SANA/Kolors, the Group-B packed-detect convert-at-install path).
+    // load-time `.quantize()` (mirrors SANA, the Group-B packed-detect convert-at-install path;
+    // Kolors/sd3 by contrast load-time-quantize, so SANA is the true precedent here).
     let _ = spec.quantize;
     let pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
     Ok(Box::new(Anima {
