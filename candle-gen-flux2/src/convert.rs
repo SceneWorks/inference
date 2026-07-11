@@ -42,7 +42,7 @@ use candle_gen::candle_core::safetensors::MmapedSafetensors;
 // carries `From<std::io::Error>` (the `Io` variant) + a `Msg` constructor, so the converter's many
 // filesystem `?` calls just work and a `candle_core::Error` flows up to the worker (which maps it to a
 // String). candle-gen's `CandleError` has no `From<io::Error>`, so it would force a `.map_err` per fs call.
-use candle_gen::candle_core::{Device, Error, Result, Tensor};
+use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 
 /// Borrowed-from-base subdirs the candle [`crate`] loader consumes (`text_encoder` / `vae` /
 /// `tokenizer`). A transformer-only fine-tune does not touch these, so taking them from the installed
@@ -233,6 +233,162 @@ fn build_target_state_dict(src: &MmapedSafetensors) -> Result<HashMap<String, Te
             format!("single_transformer_blocks.{i}"),
         );
         for (src_suffix, dst_suffix) in SINGLE_RENAMES {
+            out.insert(
+                format!("{d}.{dst_suffix}"),
+                load(&format!("{s}.{src_suffix}"))?,
+            );
+        }
+    }
+
+    Ok(out)
+}
+
+// --- In-place ComfyUI FLUX.2-dev fp8-mixed DiT (epic 10451 Phase 2e, sc-10680) ---
+//
+// The measured target is `diffusion_models/flux2_dev_fp8mixed.safetensors` (555 tensors: BF16×171,
+// F32×256, **F8_E4M3×128**). Same BFL-native keys + structural remap as klein (renames + qkv row-split
+// + the adaLN half-swap), but two convention differences the klein tables above do NOT cover:
+//
+//   1. **Per-head RMSNorm weights are named `.scale`**, not `.weight` — the BFL-official spelling (the
+//      klein *community* fine-tune the [`DOUBLE_RENAMES`]/[`SINGLE_RENAMES`] targets were built from
+//      re-keyed those to `.weight`). So the norm SOURCE suffixes here are `.scale`.
+//   2. **dev carries a guidance embedder** (`guidance_in.{in,out}_layer`) — klein is CFG-free-distilled
+//      and has none; the klein [`TOP_RENAMES`] omits it.
+//
+// and one quant difference: the MLP Linears are **inline-scale fp8** — an `F8_E4M3` `.weight` with a
+// sibling `.weight_scale` F32 scalar (`w = w_fp8·weight_scale`); the `.input_scale` sibling is the
+// activation quant scale, irrelevant to a dequantized matmul, so it is dropped.
+
+/// dev-only guidance embedder: BFL `guidance_in.{in,out}_layer` → diffusers
+/// `time_guidance_embed.guidance_embedder.linear_{1,2}` (the structural twin of the `time_in` →
+/// `timestep_embedder` entries in [`TOP_RENAMES`]). `Flux2Transformer::new` gates the guidance embedder
+/// on the presence of `guidance_embedder.linear_1.weight`, so these keys switch the DiT into dev mode.
+const COMFY_GUIDANCE_RENAMES: &[(&str, &str)] = &[
+    (
+        "guidance_in.in_layer.weight",
+        "time_guidance_embed.guidance_embedder.linear_1.weight",
+    ),
+    (
+        "guidance_in.out_layer.weight",
+        "time_guidance_embed.guidance_embedder.linear_2.weight",
+    ),
+];
+
+/// Per-double-block renames for the BFL-official checkpoint — identical to [`DOUBLE_RENAMES`] except the
+/// per-head RMSNorm SOURCE suffixes are `.scale` (BFL-official) rather than `.weight` (klein community).
+const COMFY_DOUBLE_RENAMES: &[(&str, &str)] = &[
+    ("img_attn.norm.query_norm.scale", "attn.norm_q.weight"),
+    ("img_attn.norm.key_norm.scale", "attn.norm_k.weight"),
+    ("img_attn.proj.weight", "attn.to_out.0.weight"),
+    ("img_mlp.0.weight", "ff.linear_in.weight"),
+    ("img_mlp.2.weight", "ff.linear_out.weight"),
+    ("txt_attn.norm.query_norm.scale", "attn.norm_added_q.weight"),
+    ("txt_attn.norm.key_norm.scale", "attn.norm_added_k.weight"),
+    ("txt_attn.proj.weight", "attn.to_add_out.weight"),
+    ("txt_mlp.0.weight", "ff_context.linear_in.weight"),
+    ("txt_mlp.2.weight", "ff_context.linear_out.weight"),
+];
+
+/// Per-single-block renames for the BFL-official checkpoint — as [`SINGLE_RENAMES`] but with `.scale`
+/// RMSNorm source suffixes.
+const COMFY_SINGLE_RENAMES: &[(&str, &str)] = &[
+    ("linear1.weight", "attn.to_qkv_mlp_proj.weight"),
+    ("linear2.weight", "attn.to_out.weight"),
+    ("norm.query_norm.scale", "attn.norm_q.weight"),
+    ("norm.key_norm.scale", "attn.norm_k.weight"),
+];
+
+/// Build the diffusers-key transformer tensor map for an **in-place ComfyUI FLUX.2-dev fp8-mixed** DiT
+/// (epic 10451 Phase 2e, sc-10680) — the dequant-aware sibling of [`build_target_state_dict`], for
+/// `VarBuilder::from_tensors`. Same structural remap (renames + qkv row-split + adaLN half-swap) with
+/// the dev guidance embedder ([`COMFY_GUIDANCE_RENAMES`]) and the BFL-official `.scale` norm spellings
+/// ([`COMFY_DOUBLE_RENAMES`]/[`COMFY_SINGLE_RENAMES`]), plus **inline-scale fp8 dequant** applied inside
+/// the load closure: an `F8_E4M3` weight is `w = w_fp8·weight_scale → dtype`; every other tensor is a
+/// plain cast to `dtype`. `weight_scale` is a per-tensor F32 scalar; `input_scale` (the activation
+/// scale) is never referenced. `dtype` is the pipeline compute dtype (f32).
+///
+/// **Typed reject** (surfaced, never a silent degraded load) when an `F8_E4M3` weight has no
+/// `.weight_scale` sibling — a partial/unsupported checkpoint. Source tensors are loaded lazily from the
+/// mmap and dropped after each op, so only the produced map is held resident. Leaves the tested
+/// [`build_target_state_dict`]/[`convert_and_assemble`] (klein, bf16, no dequant) untouched.
+pub(crate) fn build_comfyui_dit_map(
+    src: &MmapedSafetensors,
+    dtype: DType,
+) -> Result<HashMap<String, Tensor>> {
+    let cpu = Device::Cpu;
+    let names: Vec<String> = src.tensors().into_iter().map(|(name, _)| name).collect();
+    // Dequant-aware load: an `F8_E4M3` `.weight` is multiplied by its `.weight_scale` sibling and
+    // upcast to `dtype`; every other tensor is a plain cast. `chunk3`/`swap_halves` receive the
+    // already-cast tensor (the qkv + adaLN are BF16, so no dequant runs through them).
+    let load = |name: &str| -> Result<Tensor> {
+        let t = src
+            .load(name, &cpu)
+            .map_err(|e| Error::Msg(format!("flux2 comfyui: source is missing `{name}`: {e}")))?;
+        if t.dtype() != DType::F8E4M3 {
+            return t.to_dtype(dtype);
+        }
+        // Inline-scale fp8: dequant against the `.weight_scale` sibling (typed-reject if absent).
+        let base = name.strip_suffix(".weight").ok_or_else(|| {
+            Error::Msg(format!(
+                "flux2 comfyui: fp8 tensor `{name}` does not end in `.weight`"
+            ))
+        })?;
+        let scale_name = format!("{base}.weight_scale");
+        let scale = src.load(&scale_name, &cpu).map_err(|e| {
+            Error::Msg(format!(
+                "flux2 comfyui: fp8 weight `{name}` is missing its `{scale_name}` scale sibling \
+                 (partial/unsupported checkpoint?): {e}"
+            ))
+        })?;
+        // Scalar (shape `[]`); flatten so a stray `[1]` shape is tolerated too.
+        let s = scale
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let s = *s
+            .first()
+            .ok_or_else(|| Error::Msg(format!("flux2 comfyui: `{scale_name}` is empty")))?;
+        t.to_dtype(DType::F32)?
+            .affine(s as f64, 0.0)?
+            .to_dtype(dtype)
+    };
+
+    let mut out: HashMap<String, Tensor> = HashMap::new();
+    for (s, d) in TOP_RENAMES {
+        out.insert((*d).to_string(), load(s)?);
+    }
+    for (s, d) in COMFY_GUIDANCE_RENAMES {
+        out.insert((*d).to_string(), load(s)?);
+    }
+    out.insert(ADALN_TARGET.to_string(), swap_halves(&load(ADALN_SOURCE)?)?);
+
+    let n_double = count_blocks(names.iter().map(String::as_str), "double_blocks");
+    for i in 0..n_double {
+        let (s, d) = (
+            format!("double_blocks.{i}"),
+            format!("transformer_blocks.{i}"),
+        );
+        for (src_suffix, [q, k, v]) in DOUBLE_QKV {
+            let [tq, tk, tv] = chunk3(&load(&format!("{s}.{src_suffix}"))?)?;
+            out.insert(format!("{d}.{q}"), tq);
+            out.insert(format!("{d}.{k}"), tk);
+            out.insert(format!("{d}.{v}"), tv);
+        }
+        for (src_suffix, dst_suffix) in COMFY_DOUBLE_RENAMES {
+            out.insert(
+                format!("{d}.{dst_suffix}"),
+                load(&format!("{s}.{src_suffix}"))?,
+            );
+        }
+    }
+
+    let n_single = count_blocks(names.iter().map(String::as_str), "single_blocks");
+    for i in 0..n_single {
+        let (s, d) = (
+            format!("single_blocks.{i}"),
+            format!("single_transformer_blocks.{i}"),
+        );
+        for (src_suffix, dst_suffix) in COMFY_SINGLE_RENAMES {
             out.insert(
                 format!("{d}.{dst_suffix}"),
                 load(&format!("{s}.{src_suffix}"))?,
@@ -434,7 +590,6 @@ pub fn convert_and_assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::candle_core::DType;
 
     fn ramp(rows: usize, cols: usize, start: f32) -> Tensor {
         let v: Vec<f32> = (0..rows * cols).map(|i| start + i as f32).collect();
@@ -700,6 +855,212 @@ mod tests {
         assert!(out.join("model_index.json").is_file());
         assert!(out.join("transformer").join("config.json").is_file());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A scalar (rank-0) F32 tensor — the shape the inline-scale `.weight_scale`/`.input_scale`
+    /// siblings carry in the measured `flux2_dev_fp8mixed` header.
+    fn scalar(v: f32) -> Tensor {
+        Tensor::from_vec(vec![v], (), &Device::Cpu).unwrap()
+    }
+
+    /// A minimal BFL-native fp8-mixed fixture (one double + one single block + every top-level key,
+    /// including the dev `guidance_in` and the `.scale`-named RMSNorms): the MLP Linears are `F8_E4M3`
+    /// with `.weight_scale`/`.input_scale` scalar siblings, everything else BF16. When
+    /// `include_single_linear1_scale` is false the `single_blocks.0.linear1.weight_scale` sibling is
+    /// omitted (to exercise the typed reject). Returns the saved file path + the two fp8 weights that
+    /// must dequant, keyed by their diffusers target, with their scale, so the caller can assert the
+    /// exact `w = w_fp8·weight_scale` math independent of fp8 rounding.
+    fn write_comfyui_fixture(
+        dir: &Path,
+        d: usize,
+        include_single_linear1_scale: bool,
+    ) -> (PathBuf, Vec<(String, Tensor, f32)>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut src: HashMap<String, Tensor> = HashMap::new();
+        // Top-level (BF16) — every TOP_RENAME + the dev guidance embedder + adaLN.
+        for (s, _) in TOP_RENAMES {
+            src.insert(
+                (*s).to_string(),
+                ramp(d, d, 1.0).to_dtype(DType::BF16).unwrap(),
+            );
+        }
+        for (s, _) in COMFY_GUIDANCE_RENAMES {
+            src.insert(
+                (*s).to_string(),
+                ramp(d, d, 5.0).to_dtype(DType::BF16).unwrap(),
+            );
+        }
+        src.insert(
+            ADALN_SOURCE.to_string(),
+            ramp(2 * d, d, 100.0).to_dtype(DType::BF16).unwrap(),
+        );
+        // Double block 0: BF16 qkv/proj/norms(.scale), fp8 mlp with scale siblings.
+        src.insert(
+            "double_blocks.0.img_attn.qkv.weight".into(),
+            ramp(3 * d, d, 10.0).to_dtype(DType::BF16).unwrap(),
+        );
+        src.insert(
+            "double_blocks.0.txt_attn.qkv.weight".into(),
+            ramp(3 * d, d, 20.0).to_dtype(DType::BF16).unwrap(),
+        );
+        for leaf in [
+            "img_attn.norm.query_norm.scale",
+            "img_attn.norm.key_norm.scale",
+            "txt_attn.norm.query_norm.scale",
+            "txt_attn.norm.key_norm.scale",
+        ] {
+            src.insert(
+                format!("double_blocks.0.{leaf}"),
+                ramp(1, d, 0.0).to_dtype(DType::BF16).unwrap(),
+            );
+        }
+        src.insert(
+            "double_blocks.0.img_attn.proj.weight".into(),
+            ramp(d, d, 0.0).to_dtype(DType::BF16).unwrap(),
+        );
+        src.insert(
+            "double_blocks.0.txt_attn.proj.weight".into(),
+            ramp(d, d, 0.0).to_dtype(DType::BF16).unwrap(),
+        );
+        let mut expect: Vec<(String, Tensor, f32)> = Vec::new();
+        // fp8 MLP leaves: (source key, target key, [out,in], scale).
+        let fp8_leaves: &[(&str, &str, [usize; 2], f32)] = &[
+            (
+                "double_blocks.0.img_mlp.0.weight",
+                "transformer_blocks.0.ff.linear_in.weight",
+                [2 * d, d],
+                2.0,
+            ),
+            (
+                "double_blocks.0.img_mlp.2.weight",
+                "transformer_blocks.0.ff.linear_out.weight",
+                [d, 2 * d],
+                0.5,
+            ),
+            (
+                "double_blocks.0.txt_mlp.0.weight",
+                "transformer_blocks.0.ff_context.linear_in.weight",
+                [2 * d, d],
+                3.0,
+            ),
+            (
+                "double_blocks.0.txt_mlp.2.weight",
+                "transformer_blocks.0.ff_context.linear_out.weight",
+                [d, 2 * d],
+                0.25,
+            ),
+            (
+                "single_blocks.0.linear1.weight",
+                "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight",
+                [3 * d, d],
+                4.0,
+            ),
+            (
+                "single_blocks.0.linear2.weight",
+                "single_transformer_blocks.0.attn.to_out.weight",
+                [d, 3 * d],
+                1.5,
+            ),
+        ];
+        for (skey, dkey, [rows, cols], scale) in fp8_leaves {
+            let w_fp8 = ramp(*rows, *cols, 1.0).to_dtype(DType::F8E4M3).unwrap();
+            // The exact dequant target: (fp8 → f32) · scale — independent of fp8 rounding.
+            let expected = w_fp8
+                .to_dtype(DType::F32)
+                .unwrap()
+                .affine(*scale as f64, 0.0)
+                .unwrap();
+            expect.push(((*dkey).to_string(), expected, *scale));
+            let is_omitted_scale =
+                !include_single_linear1_scale && *skey == "single_blocks.0.linear1.weight";
+            let base = skey.strip_suffix(".weight").unwrap();
+            src.insert((*skey).to_string(), w_fp8);
+            if !is_omitted_scale {
+                src.insert(format!("{base}.weight_scale"), scalar(*scale));
+            }
+            // The activation scale is always present but never consumed.
+            src.insert(format!("{base}.input_scale"), scalar(7.0));
+        }
+        // Single block 0 BF16 norms.
+        for leaf in ["norm.query_norm.scale", "norm.key_norm.scale"] {
+            src.insert(
+                format!("single_blocks.0.{leaf}"),
+                ramp(1, d, 0.0).to_dtype(DType::BF16).unwrap(),
+            );
+        }
+        let file = dir.join("flux2_dev_fp8mixed_fixture.safetensors");
+        candle_gen::candle_core::safetensors::save(&src, &file).unwrap();
+        (file, expect)
+    }
+
+    #[test]
+    fn build_comfyui_dit_map_dequants_and_remaps() {
+        let d = 4usize;
+        let tmp = std::env::temp_dir().join(format!("cg_flux2_comfyui_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (file, expect) = write_comfyui_fixture(&tmp, d, true);
+
+        // SAFETY: read-only mmap of the fixture we just wrote.
+        let mmap = unsafe { MmapedSafetensors::new(&file).unwrap() };
+        let map = build_comfyui_dit_map(&mmap, DType::F32).unwrap();
+
+        // Every fp8 MLP leaf dequants to exactly `(w_fp8 → f32)·weight_scale` under its diffusers key.
+        for (dkey, expected, scale) in &expect {
+            let got = map
+                .get(dkey)
+                .unwrap_or_else(|| panic!("missing dequanted key {dkey}"));
+            assert_eq!(got.dtype(), DType::F32);
+            let g = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let e = expected.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(
+                g, e,
+                "dequant of {dkey} (scale {scale}) must be w_fp8·weight_scale"
+            );
+        }
+
+        // The dev guidance embedder is present (switches the DiT into guidance-distilled dev mode).
+        assert!(map.contains_key("time_guidance_embed.guidance_embedder.linear_1.weight"));
+        assert!(map.contains_key("time_guidance_embed.guidance_embedder.linear_2.weight"));
+        assert!(map.contains_key("time_guidance_embed.timestep_embedder.linear_1.weight"));
+
+        // The BFL-official `.scale` RMSNorms landed under the diffusers `.weight` names.
+        for k in [
+            "transformer_blocks.0.attn.norm_q.weight",
+            "transformer_blocks.0.attn.norm_added_k.weight",
+            "single_transformer_blocks.0.attn.norm_q.weight",
+        ] {
+            assert!(map.contains_key(k), "expected remapped norm {k}");
+        }
+
+        // The scale companions are consumed, never emitted (no `.weight_scale`/`.input_scale` leaks).
+        assert!(
+            !map.keys()
+                .any(|k| k.contains("weight_scale") || k.contains("input_scale")),
+            "scale siblings must be dropped"
+        );
+        // The qkv row-split still runs (BF16, no dequant): q is the first third of the fused img qkv.
+        assert!(map.contains_key("transformer_blocks.0.attn.to_q.weight"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn build_comfyui_dit_map_rejects_missing_weight_scale() {
+        let d = 4usize;
+        let tmp = std::env::temp_dir().join(format!("cg_flux2_comfyui_bad_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Omit `single_blocks.0.linear1.weight_scale` → the fp8 weight has no scale sibling.
+        let (file, _) = write_comfyui_fixture(&tmp, d, false);
+        let mmap = unsafe { MmapedSafetensors::new(&file).unwrap() };
+        let err = build_comfyui_dit_map(&mmap, DType::F32).expect_err(
+            "an fp8 weight with no .weight_scale must be a typed reject, not a silent load",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("weight_scale") && msg.contains("linear1"),
+            "the reject must name the missing scale sibling, got: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
