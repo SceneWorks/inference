@@ -988,6 +988,7 @@ mod tests {
             items: vec![mlx_gen::TrainingItem {
                 image_path: PathBuf::from("/tmp/x.png"),
                 caption: "a swatch".into(),
+                control_image_path: None,
             }],
             config,
             output_dir: PathBuf::from("/tmp/sd3_unused"),
@@ -1509,10 +1510,12 @@ mod real_weight_repro {
             TrainingItem {
                 image_path: img_a.clone(),
                 caption: "sks a solid crimson swatch".into(),
+                control_image_path: None,
             },
             TrainingItem {
                 image_path: img_b.clone(),
                 caption: "sks a solid cobalt swatch".into(),
+                control_image_path: None,
             },
         ];
 
@@ -1655,10 +1658,12 @@ mod real_weight_repro {
             TrainingItem {
                 image_path: img_a.clone(),
                 caption: "sks a solid crimson swatch".into(),
+                control_image_path: None,
             },
             TrainingItem {
                 image_path: img_b.clone(),
                 caption: "sks a solid cobalt swatch".into(),
+                control_image_path: None,
             },
         ];
 

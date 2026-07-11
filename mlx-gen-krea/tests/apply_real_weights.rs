@@ -109,6 +109,7 @@ fn train_tiny_adapter(raw: &std::path::Path, network_type: NetworkType, tag: &st
         items: vec![TrainingItem {
             image_path: img_path,
             caption: "a vivid abstract color swatch".into(),
+            control_image_path: None,
         }],
         config: TrainingConfig {
             rank: 4,
@@ -227,6 +228,7 @@ fn train_concept_lora(
             .map(|p| TrainingItem {
                 image_path: p.clone(),
                 caption: caption.to_string(),
+                control_image_path: None,
             })
             .collect(),
         config: TrainingConfig {
