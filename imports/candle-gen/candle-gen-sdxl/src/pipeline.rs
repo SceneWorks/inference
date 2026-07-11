@@ -1270,8 +1270,16 @@ mod tests {
     /// `RVXL_SAMPLER=` (engine default) + real CFG.
     #[test]
     fn omitted_sampler_routes_to_curated_ddim_not_native() {
-        assert_eq!(resolve_sampler(None), Some("ddim"), "omitted ⇒ curated ddim");
-        assert_eq!(resolve_sampler(Some("ddim")), Some("ddim"), "ddim ⇒ curated ddim");
+        assert_eq!(
+            resolve_sampler(None),
+            Some("ddim"),
+            "omitted ⇒ curated ddim"
+        );
+        assert_eq!(
+            resolve_sampler(Some("ddim")),
+            Some("ddim"),
+            "ddim ⇒ curated ddim"
+        );
         assert_eq!(
             resolve_sampler(Some("dpmpp_2m")),
             Some("dpmpp_2m"),
