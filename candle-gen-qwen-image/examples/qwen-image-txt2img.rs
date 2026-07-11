@@ -7,6 +7,18 @@
 //!   --snapshot "C:\Users\…\models--Qwen--Qwen-Image\snapshots\<hash>" \
 //!   --prompt "a photo of a rusty robot holding a lit candle" --steps 20 --guidance 4 --seed 42 --out out.png
 //! ```
+//!
+//! With `--comfyui-dit <file>` it instead loads that in-place ComfyUI Qwen-Image DiT (plain
+//! `fp8_e4m3fn`, `model.diffusion_model.*`) via [`candle_gen_qwen_image::load_from_comfyui_dit`],
+//! sourcing the TE / VAE / tokenizer from `--snapshot` (a resident Qwen-Image tier dir). The sc-10670
+//! GPU-val path — verifies the prefix-strip + fp8→bf16 upcast render on real weights:
+//!
+//! ```text
+//! cargo run --release --example qwen-image-txt2img --features cuda -- \
+//!   --comfyui-dit "C:\Users\…\ComfyUI-Shared\models\diffusion_models\qwen_image_2512_fp8_e4m3fn.safetensors" \
+//!   --snapshot "D:\.cache\huggingface\hub\models--SceneWorks--qwen-image-mlx\snapshots\<hash>\q4" \
+//!   --prompt "a rusty robot holding a lit candle" --steps 20 --guidance 4 --seed 42 --out qwen_comfyui.png
+//! ```
 
 use std::path::PathBuf;
 
@@ -52,8 +64,18 @@ fn main() -> Result<()> {
     );
 
     candle_gen_qwen_image::force_link();
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load("qwen_image", &spec)?;
+    // sc-10670: `--comfyui-dit` reads a ComfyUI Qwen-Image DiT in place (fp8→bf16 + prefix strip),
+    // sourcing TE/VAE/tokenizer from `--snapshot`; otherwise the registry loads the whole snapshot.
+    let gen = match arg(&args, "--comfyui-dit") {
+        Some(dit) => {
+            println!("[smoke] comfyui-dit={dit} (in place, fp8→bf16)");
+            candle_gen_qwen_image::load_from_comfyui_dit(PathBuf::from(&dit), PathBuf::from(&snapshot))?
+        }
+        None => {
+            let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+            gen_core::registry::load("qwen_image", &spec)?
+        }
+    };
     println!(
         "[smoke] resolved engine id={} backend={}",
         gen.descriptor().id,
