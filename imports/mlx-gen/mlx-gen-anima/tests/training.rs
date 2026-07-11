@@ -289,6 +289,29 @@ fn inspect_lora_file(path: &PathBuf) -> (usize, bool, bool, bool) {
     (n_a, cond_nonzero, dit_nonzero, has_alpha)
 }
 
+/// `(max |Δ|, key_mismatches)` between two saved LoRA adapter files over their tensors (compared f32).
+/// A resumed run that reproduces the uninterrupted one has `max |Δ| ≈ 0` and no key mismatches.
+fn adapter_max_abs_diff(a: &PathBuf, b: &PathBuf) -> (f32, usize) {
+    let wa = Weights::from_file(a).expect("load adapter a");
+    let wb = Weights::from_file(b).expect("load adapter b");
+    let ka: std::collections::HashSet<String> = wa.keys().map(str::to_string).collect();
+    let kb: std::collections::HashSet<String> = wb.keys().map(str::to_string).collect();
+    let mut max = 0f32;
+    for k in ka.intersection(&kb) {
+        let ta = wa.require(k).unwrap().as_dtype(Dtype::Float32).unwrap();
+        let tb = wb.require(k).unwrap().as_dtype(Dtype::Float32).unwrap();
+        let d = subtract(&ta, &tb)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        mlx_rs::transforms::eval([&d]).unwrap();
+        max = max.max(d.item::<f32>());
+    }
+    (max, ka.symmetric_difference(&kb).count())
+}
+
 // -------------------------------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------------------------------
@@ -378,6 +401,103 @@ fn train_lora_end_to_end() {
     assert!(
         ml > mb,
         "LoRA did not push output toward the overfit magenta style ({mb:.1} → {ml:.1})"
+    );
+}
+
+/// sc-10642 mid-run RESUME validation. Train `steps` with `save_every = K` (K < steps) so the run drops
+/// a resume snapshot (optimizer state + 508 factors + `{step, update_idx}`) at step K; then a FRESH
+/// trainer with `cfg.resume = true` restores that snapshot and runs K+1..steps. Because the snapshot
+/// lands on an optimizer-update boundary (`gradient_accumulation = 1`), the resumed adapter must
+/// reproduce the uninterrupted run's adapter to fp tolerance, and the resumed run must start at step K+1
+/// (proving it restored the step count, not restarted at 0) with the full 508-target surface asserted.
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train ×2)"]
+fn train_resume_matches_uninterrupted() {
+    if split_files().is_none() {
+        eprintln!("skip: no Anima snapshot");
+        return;
+    }
+    let steps = env_u32("ANIMA_RESUME_STEPS", 8);
+    let save_every = env_u32("ANIMA_RESUME_SAVE_EVERY", 4);
+    assert!(
+        save_every > 0 && save_every < steps,
+        "need a snapshot strictly before the final step (save_every {save_every} < steps {steps})"
+    );
+    let edge = env_u32("ANIMA_TRAIN_EDGE", 384);
+    let make_cfg = |resume: bool| TrainingConfig {
+        rank: 16,
+        alpha: 16.0,
+        learning_rate: 1e-4,
+        steps,
+        resolution: edge,
+        seed: 7,
+        network_type: NetworkType::Lora,
+        decompose_factor: -1,
+        save_every,
+        resume,
+        optimizer: "adamw".into(),
+        ..Default::default()
+    };
+    let file_name = "anima_sc10642_resume.safetensors";
+    let spec = LoadSpec::new(WeightsSource::Dir(split_files().unwrap()));
+
+    // (1) Uninterrupted run — drops a step-K resume snapshot in output_dir + the final adapter.
+    let req_u = train_request(tiny_magenta_dataset(4), make_cfg(false), file_name);
+    let mut trainer_u = load_trainer_base(&spec).expect("load trainer");
+    let mut u_min = u32::MAX;
+    let out_u = {
+        let mut on_p = |p: TrainingProgress| {
+            if let TrainingProgress::Training { step, .. } = p {
+                u_min = u_min.min(step);
+            }
+        };
+        trainer_u
+            .train(&req_u, &mut on_p)
+            .expect("uninterrupted train")
+    };
+    assert_eq!(u_min, 1, "uninterrupted run starts at step 1");
+    assert_eq!(out_u.steps, steps, "uninterrupted run completes all steps");
+    drop(trainer_u);
+    mlx_rs::memory::clear_cache();
+
+    // Copy the uninterrupted adapter aside — the resume run overwrites the same `file_name` path.
+    let uninterrupted_path = out_dir().join("anima_sc10642_uninterrupted.safetensors");
+    std::fs::copy(&out_u.adapter_path, &uninterrupted_path).expect("copy uninterrupted adapter");
+
+    // (2) Resume run — a fresh trainer restores the step-K snapshot and continues K+1..steps.
+    let req_r = train_request(tiny_magenta_dataset(4), make_cfg(true), file_name);
+    let mut trainer_r = load_trainer_base(&spec).expect("reload trainer");
+    let (mut r_min, mut r_max) = (u32::MAX, 0u32);
+    let out_r = {
+        let mut on_p = |p: TrainingProgress| {
+            if let TrainingProgress::Training { step, .. } = p {
+                r_min = r_min.min(step);
+                r_max = r_max.max(step);
+            }
+        };
+        trainer_r.train(&req_r, &mut on_p).expect("resume train")
+    };
+
+    // (3) Assertions: resumed at K+1 (step count restored, NOT from 0), ran to the end, reproduced U.
+    let (max_d, mismatched) = adapter_max_abs_diff(&uninterrupted_path, &out_r.adapter_path);
+    eprintln!(
+        "[sc-10642] resumed steps {r_min}..={r_max}; resume vs uninterrupted: max |Δ| = {max_d:e} \
+         ({mismatched} key mismatches)"
+    );
+    assert_eq!(
+        r_min,
+        save_every + 1,
+        "resumed run must start at step K+1 (=snapshot+1), not 0/1 — the step count was restored"
+    );
+    assert_eq!(r_max, steps, "resumed run reaches the final step");
+    assert_eq!(out_r.steps, steps, "resume reports the absolute final step");
+    assert_eq!(
+        mismatched, 0,
+        "resumed adapter has a different key set than the uninterrupted one"
+    );
+    assert!(
+        max_d <= 1e-6,
+        "resumed adapter must reproduce the uninterrupted run to tolerance (max |Δ| {max_d:e})"
     );
 }
 
@@ -490,4 +610,151 @@ fn trainable_surface_is_508_dit_plus_conditioner() {
     );
     assert_eq!(dit.len() + cond.len(), 508);
     assert!(cond.iter().all(|p| p.starts_with("llm_adapter.blocks.")));
+}
+
+/// sc-10641 — in-training preview sampling, real weights end-to-end. Runs a short magenta overfit with
+/// previews enabled at a fixed cadence and asserts:
+///   (1) INTERVAL — `TrainingProgress::Sample` events fire at EXACTLY the cadence steps (multiples of
+///       `sample_every` within `[1, steps]`), `sample_prompts.len()` per cadence, 1-based `index`.
+///   (2) NON-DEGENERATE — every preview is a correctly-sized RGB bitmap with real pixel variance (a
+///       genuine denoise+decode, not an empty stub).
+///   (3) REFLECTS ADAPTER STATE — prompt[0]'s final-cadence preview is more magenta than its first, and
+///       more magenta than a base-model generation of the same prompt. That can only happen if the
+///       preview samples the LIVE in-training adapter (the DiT AND the conditioner adapters, sc-10522);
+///       a preview that reused a cached/base conditioner output could not track the overfit.
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train + periodic preview gens)"]
+fn train_emits_in_training_previews() {
+    if split_files().is_none() {
+        eprintln!("skip: no Anima snapshot");
+        return;
+    }
+    let steps = env_u32("ANIMA_TRAIN_STEPS", 250);
+    let sample_every = (steps / 5).max(1);
+    let mut cfg = overfit_config(NetworkType::Lora);
+    cfg.steps = steps;
+    cfg.sample_every = sample_every;
+    cfg.sample_steps = env_u32("ANIMA_PREVIEW_STEPS", 6);
+    cfg.sample_guidance_scale = 4.5; // base is a CFG variant
+    cfg.sample_prompts = vec![
+        "sksanima style, a portrait of a girl".into(),
+        "sksanima style, a landscape".into(),
+    ];
+    let edge = cfg.resolution; // 512 → bucketed to itself
+    let n_prompts = cfg.sample_prompts.len() as u32;
+    let prompt0 = cfg.sample_prompts[0].clone();
+    let req = train_request(
+        tiny_magenta_dataset(4),
+        cfg,
+        "anima_sc10641_preview.safetensors",
+    );
+
+    let spec = LoadSpec::new(WeightsSource::Dir(split_files().unwrap()));
+    let mut trainer = load_trainer_base(&spec).expect("load anima trainer");
+    type Sample = (u32, u32, u32, mlx_gen::media::Image);
+    let mut samples: Vec<Sample> = Vec::new();
+    let mut on_progress = |p: TrainingProgress| {
+        if let TrainingProgress::Sample {
+            step,
+            index,
+            total,
+            image,
+            ..
+        } = p
+        {
+            samples.push((step, index, total, image));
+        }
+    };
+    trainer.train(&req, &mut on_progress).expect("train");
+    drop(trainer);
+    mlx_rs::memory::clear_cache();
+
+    // (1) INTERVAL — exactly the cadence multiples, each with `n_prompts` 1-based-indexed previews.
+    let expected_steps: Vec<u32> = (1..=steps)
+        .filter(|&s| s.is_multiple_of(sample_every))
+        .collect();
+    let got_steps: Vec<u32> = {
+        let mut v: Vec<u32> = samples.iter().map(|s| s.0).collect();
+        v.dedup();
+        v
+    };
+    assert_eq!(
+        got_steps, expected_steps,
+        "previews must fire at exactly the cadence steps (every {sample_every})"
+    );
+    for step in &expected_steps {
+        let at: Vec<&Sample> = samples.iter().filter(|s| s.0 == *step).collect();
+        assert_eq!(
+            at.len() as u32,
+            n_prompts,
+            "cadence {step}: expected {n_prompts} previews, got {}",
+            at.len()
+        );
+        for (i, s) in at.iter().enumerate() {
+            assert_eq!(s.1, i as u32 + 1, "cadence {step}: 1-based index");
+            assert_eq!(s.2, n_prompts, "cadence {step}: total == prompt count");
+        }
+    }
+
+    // (2) NON-DEGENERATE — right size + real pixel variance.
+    for (step, index, _t, img) in &samples {
+        assert_eq!(
+            (img.width, img.height),
+            (edge, edge),
+            "preview step {step}/{index}: wrong size"
+        );
+        assert_eq!(img.pixels.len(), (edge * edge * 3) as usize);
+        let (lo, hi) = img
+            .pixels
+            .iter()
+            .fold((255u8, 0u8), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+        assert!(
+            hi > lo,
+            "preview step {step}/{index} is a flat constant image (min==max) — not a real render"
+        );
+    }
+
+    // (3) REFLECTS ADAPTER STATE — prompt[0]'s magenta tilt grows first→last cadence, and the final
+    // preview is more magenta than a base-model generation (the overfit target the LoRA is learning).
+    let first_step = *expected_steps.first().unwrap();
+    let last_step = *expected_steps.last().unwrap();
+    let p0 = |step: u32| -> &mlx_gen::media::Image {
+        &samples
+            .iter()
+            .find(|s| s.0 == step && s.1 == 1)
+            .expect("prompt0 preview at cadence")
+            .3
+    };
+    let (first, last) = (p0(first_step), p0(last_step));
+    let (mf, ml) = (magenta_score(first), magenta_score(last));
+    save_png(first, &out_dir().join("preview_first.png"));
+    save_png(last, &out_dir().join("preview_last.png"));
+
+    let base =
+        AnimaPipeline::from_source(&WeightsSource::Dir(split_files().unwrap()), Variant::Base)
+            .expect("base pipeline");
+    let img_base = generate(&base, &prompt0, 1234, cfg_preview_steps());
+    let mb = magenta_score(&img_base);
+    save_png(&img_base, &out_dir().join("preview_base.png"));
+
+    eprintln!(
+        "[sc-10641] {} previews across {} cadences; prompt0 magenta: base {mb:.1}, first(step {first_step}) {mf:.1} → last(step {last_step}) {ml:.1}",
+        samples.len(),
+        expected_steps.len()
+    );
+    assert!(
+        ml > mf,
+        "previews must track the in-training adapter: prompt0 should tilt toward the overfit magenta \
+         from the first cadence ({mf:.1}) to the last ({ml:.1})"
+    );
+    assert!(
+        ml > mb,
+        "the final preview must reflect the trained adapter (more magenta than the base model: \
+         base {mb:.1} vs final preview {ml:.1})"
+    );
+}
+
+/// Preview denoise-step count used by the base-model comparison generation in the preview test.
+fn cfg_preview_steps() -> usize {
+    env_u32("ANIMA_PREVIEW_STEPS", 6) as usize
 }
