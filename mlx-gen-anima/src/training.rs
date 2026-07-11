@@ -1259,6 +1259,74 @@ mod tests {
         );
     }
 
+    /// Grad-parity in the EXACT production combined config (sc-10576). `train_impl` runs a checkpointed
+    /// LoRA step with THREE flags at once: DiT whole-block checkpoint ON, DiT sdpa-segment OFF
+    /// (`dit.set_sdpa_checkpoint(!use_checkpoint)` → OFF), and conditioner sdpa-segment ON
+    /// (`conditioner.set_sdpa_checkpoint(true)`). The other grad-parity tests exercise those mechanisms
+    /// only in isolation (whole-block with cond-segment OFF; sdpa-segment on the dense path), so none of
+    /// them pins the interaction of all three. This one reproduces the production combination verbatim
+    /// and asserts its grads equal the fully-dense reference (no checkpointing anywhere) to fp tolerance
+    /// for BOTH the DiT and the conditioner (`llm_adapter`) factors, and that both actually train.
+    /// Synthetic small model, Metal, no real weights. Failure-capable: regressing the production forward
+    /// to capture `encoder` collapses the conditioner grad to zero and reddens this test (verified by
+    /// temporarily routing `compute_loss_grads` through `_encoder_captured`).
+    #[test]
+    fn production_combined_config_grads_match_dense() {
+        let (mut dit, mut cond, params, adapter, _tp, blocks) = tiny_model_and_adapter();
+        let (x0, source, t5_ids, noise) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
+
+        let grads_of = |dit: &mut CosmosDiT,
+                        cond: &mut AnimaTextConditioner,
+                        dit_seg: bool,
+                        cond_seg: bool,
+                        ck: Option<&[Vec<String>]>| {
+            dit.set_sdpa_checkpoint(dit_seg);
+            cond.set_sdpa_checkpoint(cond_seg);
+            let (_l, g) = compute_loss_grads(
+                dit,
+                cond,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &x0,
+                &source,
+                &t5_ids,
+                0.5,
+                &noise,
+                false,
+                ck,
+                Dtype::Float32,
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            g
+        };
+
+        // Fully-dense reference: no whole-block checkpointing and every SDPA-segment flag OFF, so every
+        // activation is retained — the autograd ground truth.
+        let g_dense = grads_of(&mut dit, &mut cond, false, false, None);
+        // Production combined config, verbatim: whole-block ON, DiT segment OFF, conditioner segment ON.
+        let g_prod = grads_of(&mut dit, &mut cond, false, true, Some(&blocks));
+
+        let max_rel = max_rel_diff(&g_dense, &g_prod);
+        eprintln!("[sc-10576] production-combined-vs-dense grad max rel diff: {max_rel:.2e}");
+        assert!(
+            max_rel < 1e-3,
+            "production combined-config grads must match fully-dense within fp tolerance: max rel {max_rel:.2e}"
+        );
+        // Both factor groups must actually train in the production config (proves the conditioner grad
+        // path stays live once whole-block + segment checkpointing are combined — the sc-10522 trap).
+        assert!(
+            cond_lora_b_grad(&g_prod) > 1e-6,
+            "conditioner must receive gradient in the production combined config"
+        );
+        assert!(
+            dit_lora_b_grad(&g_prod) > 1e-6,
+            "DiT must receive gradient in the production combined config"
+        );
+    }
+
     /// SDPA-segment checkpointing (the dense/LoKr path) must not change grads either: dense grads with
     /// segment ckpt ON == OFF, to fp tolerance.
     #[test]
@@ -1635,6 +1703,15 @@ mod preflight_tests {
 
     #[test]
     fn projected_peak_reproduces_measured_points() {
+        // SCOPE: this guards coefficient-TRANSCRIPTION only, NOT fit accuracy. `projected_dense_peak_gb`
+        // is an EXACT 3-point quadratic fit (`a + b·s + c·s²`) through these same three calibration
+        // points, so an intact fit ALWAYS reproduces its own interpolation points — this test can catch a
+        // fat-fingered/drifted coefficient (or a broken `unified_tokens`), but by construction it cannot
+        // vouch for how well the curve predicts a HELD-OUT edge. Real fit accuracy is validated against
+        // fresh GPU measurements by the `#[ignore]`d `first_step_dense_peak_sweep` (refit both if it
+        // prints materially different peaks). We deliberately do NOT add a synthetic 4th point here: a
+        // meaningful held-out check needs a real measurement, and a made-up one would prove nothing.
+        //
         // Measured on the 128 GB target (first_step_dense_peak_sweep, bf16, rank16, SDPA-seg ON):
         //   edge 512  (s 1536) → 21.18 GB
         //   edge 768  (s 2816) → 32.05 GB
