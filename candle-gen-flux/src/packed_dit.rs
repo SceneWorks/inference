@@ -457,7 +457,7 @@ impl TimeTextEmbed {
     }
 }
 
-/// diffusers `AdaLayerNormContinuous` output head (`norm_out`): `silu(emb) @ linear` → `(shift, scale)`,
+/// diffusers `AdaLayerNormContinuous` output head (`norm_out`): `silu(emb) @ linear` → `(scale, shift)`,
 /// `norm(hidden)·(1+scale)+shift`, then the `proj_out` to the packed latent channels.
 struct OutputHead {
     norm_linear: QLinear,
@@ -481,7 +481,14 @@ impl OutputHead {
     }
 
     fn forward(&self, hidden: &Tensor, emb: &Tensor) -> Result<Tensor> {
-        // diffusers chunks the AdaLNContinuous projection as (shift, scale) — shift FIRST.
+        // diffusers `AdaLayerNormContinuous` chunks the projection as (scale, shift) — **scale FIRST**
+        // (`scale, shift = emb.chunk(2)`), unlike the 6-chunk `AdaLayerNormZero` (shift-first) the double/
+        // single blocks use. So `p[0]` is the scale and `p[1]` is the shift. Reading them shift-first
+        // swaps the multiplicative and additive modulation at the final layer — leaving composition intact
+        // (the correct blocks) but corrupting every token's output latent into a fixed per-patch magenta
+        // grid (sc-10914). This matches BFL's shift-first `final_layer.adaLN_modulation.1` only because the
+        // diffusers→BFL conversion swaps the two halves (verified: the real `norm_out.linear` weight halves
+        // are the byte-swapped BFL `adaLN_modulation.1` halves).
         let p = self
             .norm_linear
             .forward(&emb.silu()?)?
@@ -489,8 +496,8 @@ impl OutputHead {
         let normed = self
             .norm
             .forward(hidden)?
-            .broadcast_mul(&(p[1].unsqueeze(1)? + 1.0)?)?
-            .broadcast_add(&p[0].unsqueeze(1)?)?;
+            .broadcast_mul(&(p[0].unsqueeze(1)? + 1.0)?)?
+            .broadcast_add(&p[1].unsqueeze(1)?)?;
         self.proj_out.forward(&normed)
     }
 }
@@ -942,6 +949,17 @@ mod tests {
         Ok(())
     }
 
+    /// Swap the two halves of a tensor along dim 0 — the (scale, shift) → (shift, scale) re-ordering the
+    /// diffusers→BFL output-head conversion needs (`norm_out.linear` is scale-first `AdaLayerNormContinuous`,
+    /// BFL `adaLN_modulation.1` is shift-first). Applies to the `[2·hidden, hidden]` weight and `[2·hidden]`
+    /// bias alike (sc-10914).
+    fn swap_halves(x: &Tensor) -> Tensor {
+        let h = x.dim(0).unwrap() / 2;
+        let lo = x.narrow(0, 0, h).unwrap();
+        let hi = x.narrow(0, h, h).unwrap();
+        Tensor::cat(&[&hi, &lo], 0).unwrap()
+    }
+
     /// Read a vendored tensor out of the populated `VarMap` by its diffusers key.
     fn t(map: &HashMap<String, Var>, key: &str) -> Tensor {
         map.get(key)
@@ -998,11 +1016,15 @@ mod tests {
                     g(&format!("time_text_embed.guidance_embedder.linear_2.{wb}")),
                 );
             }
-            // Output head: diffusers `norm_out.linear` (shift,scale) ≡ BFL `adaLN_modulation.1`;
-            // `proj_out` ≡ BFL `final_layer.linear`.
+            // Output head: diffusers `norm_out.linear` is (scale, shift) — **scale-first**
+            // (`AdaLayerNormContinuous`) — whereas BFL `final_layer.adaLN_modulation.1` is (shift, scale)
+            // shift-first. So the conversion **swaps the two halves** (verified against the real checkpoint:
+            // the diffusers `norm_out.linear` halves are the byte-swapped BFL halves). `proj_out` ≡ BFL
+            // `final_layer.linear`. (sc-10914 — swapping here is what anchors the corrected scale-first
+            // `OutputHead` chunk order against stock; a straight copy would re-hide the original bug.)
             put(
                 format!("final_layer.adaLN_modulation.1.{wb}"),
-                g(&format!("norm_out.linear.{wb}")),
+                swap_halves(&g(&format!("norm_out.linear.{wb}"))),
             );
             put(
                 format!("final_layer.linear.{wb}"),
@@ -1165,11 +1187,27 @@ mod tests {
     /// (correct remap still matches exactly; a Q↔K swap now diverges by O(1) — verified ~2.9 on the tight
     /// anchor). See that fn for the mechanism.
     fn run_parity(num_double: usize, num_single: usize, guidance: bool, tol: f32) -> Result<f32> {
+        run_parity_cfg(parity_cfg(guidance), num_double, num_single, guidance, tol)
+    }
+
+    /// As [`run_parity`] but with a caller-supplied base [`Config`] — so a test can pin the vendored DiT
+    /// against stock at the **real** FLUX.1 hyperparameters (head_dim 128, `axes_dim` [16,56,56], packed
+    /// `in_channels` 64) rather than only the tiny parity config. The tiny config's `axes_dim` [2,2,4]
+    /// and head_dim 8 cannot exercise a RoPE / attention-reshape bug that only manifests at the real
+    /// per-axis rope widths.
+    fn run_parity_cfg(
+        base: Config,
+        num_double: usize,
+        num_single: usize,
+        guidance: bool,
+        tol: f32,
+    ) -> Result<f32> {
         use candle_transformers::models::flux::model::{Config as StockConfig, Flux};
         use candle_transformers::models::flux::WithForward;
 
         let dev = Device::Cpu;
-        let mut cfg = parity_cfg(guidance);
+        let mut cfg = base;
+        cfg.guidance_embed = guidance;
         cfg.depth = num_double;
         cfg.depth_single_blocks = num_single;
 
@@ -1259,6 +1297,39 @@ mod tests {
             // Sanity: the divergence must be well within the documented GELU-variant band, not O(1).
             assert!(d < 5e-3, "full-network parity max|Δ| = {d}");
         }
+        Ok(())
+    }
+
+    /// The **real** FLUX.1 hyperparameters (sc-10914 investigation): head_dim 128, `axes_dim` [16,56,56],
+    /// packed `in_channels` 64, hidden 3072/24 heads. Only the tiny seq lengths keep it GPU-free. This
+    /// exercises the RoPE per-axis rope widths + the attention reshape at the widths the shipping tiers
+    /// actually use — which the tiny [`parity_cfg`] ([2,2,4], head_dim 8) cannot.
+    fn real_cfg() -> Config {
+        Config {
+            in_channels: 64,
+            vec_in_dim: POOLED_DIM,
+            context_in_dim: CONTEXT_DIM,
+            hidden_size: 3072,
+            mlp_ratio: 4.0,
+            num_heads: 24,
+            depth: 0,
+            depth_single_blocks: 0,
+            axes_dim: vec![16, 56, 56],
+            theta: 10_000,
+            qkv_bias: true,
+            guidance_embed: true,
+        }
+    }
+
+    /// Real-dims single-block + IO + **output-head** path must be bit-exact against stock. This is the
+    /// anchor for the scale-first `OutputHead` chunk order at the real `axes_dim`/head_dim/64-channel
+    /// widths the shipping tiers use — paired with the half-swap in [`remap_to_bfl`], reverting the
+    /// output head to shift-first breaks it (sc-10914). One double block is already covered by the tiny
+    /// [`vendored_dit_full_network_close_to_stock_bfl_dense`]; kept to depth=0 here to bound CI cost.
+    #[test]
+    fn vendored_dit_real_config_matches_stock_bfl_dense() -> Result<()> {
+        let d = run_parity_cfg(real_cfg(), 0, 1, true, 1e-4)?;
+        assert!(d < 1e-4, "real-config single/IO parity max|Δ| = {d}");
         Ok(())
     }
 }
