@@ -69,7 +69,10 @@ fn main() -> Result<()> {
     let gen = match arg(&args, "--comfyui-dit") {
         Some(dit) => {
             println!("[smoke] comfyui-dit={dit} (in place, fp8→bf16)");
-            candle_gen_qwen_image::load_from_comfyui_dit(PathBuf::from(&dit), PathBuf::from(&snapshot))?
+            candle_gen_qwen_image::load_from_comfyui_dit(
+                PathBuf::from(&dit),
+                PathBuf::from(&snapshot),
+            )?
         }
         None => {
             let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
