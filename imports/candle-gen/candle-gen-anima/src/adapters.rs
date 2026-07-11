@@ -296,7 +296,10 @@ pub fn apply_anima_adapters(
 // packed tier that is exactly the ≈3.9 GB memory-lie sc-10640 forbids (a q4 DiT + 448 dense deltas > the
 // bf16 tier), so a LoHa on a packed base is a hard, actionable error — never a silent materialization. No
 // official Anima LoHa exists, so nothing is user-blocked; a bespoke deferred form is unwarranted. On a
-// dense tier both LoKr and LoHa still fold through [`apply_anima_adapters`].
+// dense tier a LoKr still folds through [`apply_anima_adapters`] (via `reconstruct_lokr_delta`), but a
+// LoHa is likewise unhandled there: the dense path imports no LoHa reconstruction, so a LoHa's `hada_*`
+// keys route to zero targets and hit the `no_target_matched` hard error — never a fold — matching the
+// packed path's loud LoHa rejection. (Again moot: no official Anima LoHa exists.)
 
 /// A LoRA residual resolved from a file, pending attachment to a host projection: `a = downᵀ`
 /// `[in, rank]`, `b = upᵀ·(alpha/rank)` `[rank, out]` (the `alpha/rank` ratio folded into `b`, matching
@@ -310,7 +313,9 @@ struct PendingLora {
 /// True when a file carries **LoHa** (Hadamard-product) factors (`hada_*` keys). LoHa has no
 /// `AdapterKind` variant (gen-core knows only `Lora`/`Lokr`), so it is detected by keys alone. On a
 /// packed base a LoHa is **rejected** (its Hadamard product has no allocation-free deferred form — see
-/// the module docs / sc-10713); on a dense base it folds through [`apply_anima_adapters`].
+/// the module docs / sc-10713); on a dense base it is likewise unhandled — the dense fold path
+/// [`apply_anima_adapters`] reconstructs only LoRA/LoKr, so a LoHa's `hada_*` keys route to zero targets
+/// and error out at target-matching rather than folding. Moot in practice: no official Anima LoHa exists.
 fn is_loha(af: &AdapterFile) -> bool {
     af.tensors
         .keys()
