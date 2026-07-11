@@ -19,6 +19,11 @@
 //!   --snapshot "D:\.cache\huggingface\hub\models--SceneWorks--qwen-image-mlx\snapshots\<hash>\q4" \
 //!   --prompt "a rusty robot holding a lit candle" --steps 20 --guidance 4 --seed 42 --out qwen_comfyui.png
 //! ```
+//!
+//! Adding `--comfyui-vae <file>` also reads the tree's `vae/qwen_image_vae.safetensors` in place
+//! (native WAN-VAE keys → diffusers remap, sc-10830). The byte-compare GPU-val is two runs with the
+//! same DiT + seed, one with `--comfyui-vae` and one without: the images should be near-identical
+//! (same VAE weights, only the key layout differs).
 
 use std::path::PathBuf;
 
@@ -68,10 +73,19 @@ fn main() -> Result<()> {
     // sourcing TE/VAE/tokenizer from `--snapshot`; otherwise the registry loads the whole snapshot.
     let gen = match arg(&args, "--comfyui-dit") {
         Some(dit) => {
-            println!("[smoke] comfyui-dit={dit} (in place, fp8→bf16)");
+            let vae = arg(&args, "--comfyui-vae");
+            match &vae {
+                Some(v) => println!(
+                    "[smoke] comfyui-dit={dit} (fp8→bf16) + comfyui-vae={v} (WAN→diffusers)"
+                ),
+                None => {
+                    println!("[smoke] comfyui-dit={dit} (in place, fp8→bf16); VAE from snapshot")
+                }
+            }
             candle_gen_qwen_image::load_from_comfyui_dit(
                 PathBuf::from(&dit),
                 PathBuf::from(&snapshot),
+                vae.map(PathBuf::from),
             )?
         }
         None => {
