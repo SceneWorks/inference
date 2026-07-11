@@ -79,7 +79,7 @@ fn worst_cosine_for(quant: Quant) -> f32 {
         quant.bits()
     );
     let w = Weights::from_dir(text_encoder_dir()).expect("load text_encoder shards");
-    let encoder = LensTextEncoder::from_weights_quant(&w, &cfg, Dtype::Bfloat16, Some(quant))
+    let encoder = LensTextEncoder::from_weights_quant(w, &cfg, Dtype::Bfloat16, Some(quant))
         .expect("build quantized encoder");
 
     let mut worst = 1f32;
