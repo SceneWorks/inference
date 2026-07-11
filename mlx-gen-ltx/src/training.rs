@@ -1442,6 +1442,7 @@ mod validate_request_tests {
                 .map(|i| TrainingItem {
                     image_path: PathBuf::from(format!("img{i}.png")),
                     caption: "a cat".into(),
+                    control_image_path: None,
                 })
                 .collect(),
             config: TrainingConfig::default(),
