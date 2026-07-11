@@ -42,11 +42,12 @@ pub mod control_fun;
 pub mod edit;
 pub mod image_processor;
 pub mod pipeline;
-// ComfyUI single-file Qwen-Image DiT → in-memory remap seam (epic 10451 Phase 2b, sc-10670): strip the
-// `model.diffusion_model.` prefix + upcast the plain `fp8_e4m3fn` DiT to bf16, making a user's existing
-// ComfyUI Qwen-Image base weights loadable in place via `VarBuilder::from_tensors`. The text encoder,
-// VAE, and tokenizer still come from a resident Qwen-Image diffusers snapshot (the ComfyUI VAE/TE are a
-// separate 3D-VAE remap / scaled-fp8 slice). Entry point: [`load_from_comfyui_dit`].
+// ComfyUI single-file Qwen-Image → in-memory remap seam (epic 10451 Phase 2b): strip the
+// `model.diffusion_model.` prefix + upcast the plain `fp8_e4m3fn` DiT to bf16 (sc-10670), and remap the
+// native WAN-VAE keys of the tree's `vae/qwen_image_vae.safetensors` to the diffusers schema (sc-10830)
+// — making a user's existing ComfyUI Qwen-Image DiT + VAE loadable in place via
+// `VarBuilder::from_tensors`. The Qwen2.5-VL text encoder (scaled-fp8, sc-10671) and tokenizer still
+// come from a resident Qwen-Image diffusers snapshot. Entry point: [`load_from_comfyui_dit`].
 mod comfyui;
 // Qwen-Image DiT packed-load seam (sc-9415, sc-9089 umbrella): route every DiT `Linear` through the
 // shared `candle_gen::quant` packed-detect so the pre-quantized MLX tiers (`SceneWorks/qwen-image-mlx`
@@ -80,6 +81,11 @@ mod vision_validate;
 /// Qwen-Image-Edit full provider real-weight GPU validation (sc-5487) — env-driven, `#[ignore]`d.
 #[cfg(test)]
 mod edit_validate;
+
+/// In-place ComfyUI Qwen-Image VAE (native WAN-VAE keys) real-weight GPU validation (sc-10830) —
+/// env-driven, `#[ignore]`d.
+#[cfg(test)]
+mod comfyui_vae_validate;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -132,9 +138,14 @@ struct Pipeline {
     pid_spec: Option<PidWeights>,
     /// An in-place ComfyUI Qwen-Image DiT single-file (epic 10451 Phase 2b, sc-10670). When set, the
     /// transformer is built from this file (prefix-strip + fp8→bf16, see [`comfyui`]) instead of the
-    /// snapshot's `transformer/` dir; the text encoder / VAE / tokenizer still come from `root`. `None`
+    /// snapshot's `transformer/` dir; the text encoder / tokenizer still come from `root`. `None`
     /// on the registry path (dense/packed snapshot transformer).
     comfyui_dit: Option<PathBuf>,
+    /// An in-place ComfyUI Qwen-Image VAE single-file (epic 10451 Phase 2b, sc-10830, `vae/
+    /// qwen_image_vae.safetensors`, native WAN-VAE keys). When set, the VAE is built from this file
+    /// (key-remapped, see [`comfyui::remap_vae_wan_to_diffusers`]); when `None` the VAE falls back to
+    /// the snapshot's `vae/` dir. Independent of `comfyui_dit` (either can be in place).
+    comfyui_vae: Option<PathBuf>,
 }
 
 impl Pipeline {
@@ -146,13 +157,20 @@ impl Pipeline {
             device: device.clone(),
             pid_spec,
             comfyui_dit: None,
+            comfyui_vae: None,
         }
     }
 
-    /// Same as [`load`](Self::load) but with the transformer sourced from an in-place ComfyUI DiT
-    /// single-file (sc-10670). `root` is the resident Qwen-Image diffusers snapshot that supplies the
-    /// text encoder / VAE / tokenizer; `comfyui_dit` is the user's ComfyUI DiT file, read in place.
-    fn load_comfyui(root: &Path, device: &Device, comfyui_dit: PathBuf) -> Self {
+    /// Same as [`load`](Self::load) but with the transformer (and, when `comfyui_vae` is set, the VAE)
+    /// sourced from in-place ComfyUI single-files (sc-10670 / sc-10830). `root` is the resident
+    /// Qwen-Image diffusers snapshot that supplies the text encoder / tokenizer (and the VAE when
+    /// `comfyui_vae` is `None`).
+    fn load_comfyui(
+        root: &Path,
+        device: &Device,
+        comfyui_dit: PathBuf,
+        comfyui_vae: Option<PathBuf>,
+    ) -> Self {
         Self {
             te_cfg: TextEncoderConfig::qwen_image(),
             dit_cfg: TransformerConfig::qwen_image(),
@@ -160,6 +178,7 @@ impl Pipeline {
             device: device.clone(),
             pid_spec: None,
             comfyui_dit: Some(comfyui_dit),
+            comfyui_vae,
         }
     }
 
@@ -206,7 +225,18 @@ impl Pipeline {
                 )?
             }
         };
-        let vae = QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?;
+        let vae = match &self.comfyui_vae {
+            // In-place ComfyUI VAE single-file (sc-10830): remap the native WAN-VAE keys to the
+            // diffusers schema in memory, then build via `VarBuilder::from_tensors` at ENC_DTYPE — the
+            // f32 upcast happens on `get` (the map's bf16 → f32), byte-matching the snapshot VAE mmap.
+            Some(vae_file) => {
+                let vae_map = candle_gen::candle_core::safetensors::load(vae_file, &Device::Cpu)?;
+                let vae_map = comfyui::remap_vae_wan_to_diffusers(vae_map)?;
+                let vae_vb = VarBuilder::from_tensors(vae_map, ENC_DTYPE, &self.device);
+                QwenVae::new(vae_vb)?
+            }
+            None => QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?,
+        };
         let tokenizer = TextTokenizer::from_file(
             self.root.join("tokenizer/tokenizer.json"),
             TokenizerConfig {
@@ -370,9 +400,13 @@ pub struct QwenImageGenerator {
     pid_spec: Option<PidWeights>,
     /// An in-place ComfyUI Qwen-Image DiT single-file (epic 10451 Phase 2b, sc-10670), set only by
     /// [`load_from_comfyui_dit`]. When present, the lazy component build sources the transformer from
-    /// this file (prefix-strip + fp8→bf16) and the TE/VAE/tokenizer from [`Self::root`]; `None` on the
+    /// this file (prefix-strip + fp8→bf16) and the TE/tokenizer from [`Self::root`]; `None` on the
     /// registry path.
     comfyui_dit: Option<PathBuf>,
+    /// An in-place ComfyUI Qwen-Image VAE single-file (epic 10451 Phase 2b, sc-10830), set only by
+    /// [`load_from_comfyui_dit`]. When present the VAE is read from this file (native WAN-VAE keys
+    /// remapped); `None` ⇒ the snapshot's `vae/`.
+    comfyui_vae: Option<PathBuf>,
     components: Mutex<Option<Components>>,
 }
 
@@ -420,7 +454,12 @@ impl Generator for QwenImageGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         let pipe = match &self.comfyui_dit {
-            Some(dit_file) => Pipeline::load_comfyui(&self.root, &self.device, dit_file.clone()),
+            Some(dit_file) => Pipeline::load_comfyui(
+                &self.root,
+                &self.device,
+                dit_file.clone(),
+                self.comfyui_vae.clone(),
+            ),
             None => Pipeline::load(&self.root, &self.device, self.pid_spec.clone()),
         };
         let components = self.components(&pipe)?;
@@ -510,21 +549,27 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
         comfyui_dit: None,
+        comfyui_vae: None,
         components: Mutex::new(None),
     }))
 }
 
-/// Construct a lazy candle Qwen-Image generator that reads its **DiT in place** from an existing
-/// ComfyUI single-file (epic 10451 Phase 2b, sc-10670) — no copy, no re-download. `transformer_file`
-/// is the user's ComfyUI Qwen-Image DiT (`diffusion_models/qwen_image_*_fp8_e4m3fn.safetensors`,
-/// keyed `model.diffusion_model.*`, plain fp8); its keys are prefix-stripped and its weights upcast to
-/// bf16 in memory ([`comfyui`]) at component build. `snapshot_dir` is a resident Qwen-Image diffusers
-/// snapshot (`text_encoder/`, `vae/`, `tokenizer/`) supplying the standard, shared components — the
-/// ComfyUI tree's own VAE (native WAN-VAE keys) and Qwen2.5-VL text encoders (scaled-fp8) are separate
-/// later slices. txt2img only; no adapters / control / PiD on this lane.
+/// Construct a lazy candle Qwen-Image generator that reads its **DiT** (and optionally its **VAE**) in
+/// place from existing ComfyUI single-files (epic 10451 Phase 2b, sc-10670 / sc-10830) — no copy, no
+/// re-download. `transformer_file` is the user's ComfyUI Qwen-Image DiT
+/// (`diffusion_models/qwen_image_*_fp8_e4m3fn.safetensors`, keyed `model.diffusion_model.*`, plain
+/// fp8); its keys are prefix-stripped and its weights upcast to bf16 in memory ([`comfyui`]) at
+/// component build.
+///
+/// `vae_file`, when `Some`, is the tree's `vae/qwen_image_vae.safetensors` (native WAN-VAE keys,
+/// remapped to the diffusers schema by [`comfyui::remap_vae_wan_to_diffusers`]); when `None` the VAE
+/// comes from `snapshot_dir`'s `vae/`. `snapshot_dir` is a resident Qwen-Image diffusers snapshot
+/// supplying the Qwen2.5-VL text encoder (still snapshot-sourced — it is scaled-fp8, sc-10671) and the
+/// tokenizer (and the VAE when `vae_file` is `None`). txt2img only; no adapters / control / PiD.
 pub fn load_from_comfyui_dit(
     transformer_file: impl Into<PathBuf>,
     snapshot_dir: impl Into<PathBuf>,
+    vae_file: Option<PathBuf>,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let device = candle_gen::default_device()?;
     Ok(Box::new(QwenImageGenerator {
@@ -533,6 +578,7 @@ pub fn load_from_comfyui_dit(
         device,
         pid_spec: None,
         comfyui_dit: Some(transformer_file.into()),
+        comfyui_vae: vae_file,
         components: Mutex::new(None),
     }))
 }
