@@ -26,7 +26,7 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use candle_gen::gen_core::{AdapterSpec, Image, Progress};
+use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, Progress};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
@@ -43,6 +43,11 @@ use crate::vl_tokenizer::{
 const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::F32;
 
+/// The conditioning produced by [`QwenEdit::encode_conditioning`] and consumed by
+/// [`QwenEdit::denoise_and_decode`]: `(pos_embeds, neg_embeds, static_reference_latents, cond_grids)`.
+/// The pieces that must survive the VL-encoder drop in the sequential path (all small — no model weights).
+type EditConditioning = (Tensor, Option<Tensor>, Tensor, Vec<(usize, usize)>);
+
 /// Paths to the Qwen-Image-Edit checkpoint.
 pub struct QwenEditPaths {
     /// The `Qwen/Qwen-Image-Edit` diffusers snapshot dir (`text_encoder/` [LM + vision], `transformer/`,
@@ -52,6 +57,14 @@ pub struct QwenEditPaths {
     /// Lightning distill, stacked ahead of any user adapters. **Empty** = the production (non-distilled)
     /// edit path: the transformer loads via the mmap fast path, byte-identical to before.
     pub adapters: Vec<AdapterSpec>,
+    /// Component-residency policy (epic 10765 Phase 1c follow-up, sc-10968). `Sequential` routes
+    /// [`QwenEdit::generate`] through the phased load→encode→DROP→load path (load the VL encoder + VAE
+    /// encoder, VL-encode the prompt + VAE-encode the references, then DROP the VL encoder before the DiT
+    /// loads), capping peak VRAM at the cost of a per-request reload; `Resident` (default) loads all four
+    /// components once at [`QwenEdit::load`] and keeps them, like the pre-sc-10968 behavior. The worker's
+    /// edit fit-gate sets this when it predicts the resident sum won't fit but the sequential working set
+    /// will (mirrors the txt2img `LoadSpec::offload_policy`, sc-10867).
+    pub offload_policy: OffloadPolicy,
 }
 
 /// One Qwen-Image-Edit generation request.
@@ -215,32 +228,50 @@ fn tokenizer_json_path(root: &Path) -> Result<PathBuf> {
     )))
 }
 
-/// The loaded Qwen-Image-Edit model: the VL conditioning encoder, the MMDiT, the VAE (decode) + VAE
-/// encoder (reference dual-latent), the image processor + tokenizer.
+/// The loaded Qwen-Image-Edit model. Under the default `Resident` policy all four heavy components (the
+/// VL conditioning encoder, the MMDiT, and the VAE decoder + encoder) load once at [`Self::load`] and
+/// live in [`ResidentComponents`]. Under the `Sequential` policy (epic 10765 Phase 1c follow-up,
+/// sc-10968) none are pre-loaded — [`Self::generate`] loads them per phase and DROPS the VL encoder
+/// before the DiT loads, so peak VRAM is `max(VL+VAE-enc, DiT+VAE-dec)` instead of the resident sum;
+/// `root` + `adapters` are retained for the per-phase reloads. The image processor, tokenizer, and
+/// `zero_cond_t` flag are cheap and always resident.
 pub struct QwenEdit {
     device: Device,
-    vl_encoder: QwenVisionLanguageEncoder,
-    transformer: QwenTransformer,
-    vae: QwenVae,
-    vae_encoder: QwenVaeEncoder,
+    /// Snapshot dir — retained for the `Sequential` per-phase reloads (`text_encoder/`, `transformer/`,
+    /// `vae/`, `tokenizer/`).
+    root: PathBuf,
+    /// The MMDiT adapters (sc-6220) — retained so the `Sequential` path re-folds the SAME LoRA/LoKr
+    /// overlay on every transformer reload, keeping the DiT bit-identical to the resident path.
+    adapters: Vec<AdapterSpec>,
+    /// The heavy components: `Some` under `Resident` (loaded once, reused across requests), `None` under
+    /// `Sequential` (loaded + dropped per phase inside [`Self::generate_sequential`]) — this `Option`
+    /// encodes the residency policy after [`Self::load`] resolves it.
+    resident: Option<ResidentComponents>,
     processor: QwenImageProcessor,
     tokenizer: TextTokenizer,
     zero_cond_t: bool,
 }
 
+/// The four heavy Qwen-Image-Edit components, co-resident under the default `Resident` policy.
+struct ResidentComponents {
+    vl_encoder: QwenVisionLanguageEncoder,
+    transformer: QwenTransformer,
+    vae: QwenVae,
+    vae_encoder: QwenVaeEncoder,
+}
+
 impl QwenEdit {
-    /// Load the Qwen-Image-Edit components from a snapshot dir.
+    /// Load the Qwen-Image-Edit components from a snapshot dir. Under the default `Resident` policy all
+    /// four heavy components load now; under `Sequential` (sc-10968) they are deferred to the per-phase
+    /// loads in [`Self::generate_sequential`], and only the cheap tokenizer / processor / `zero_cond_t`
+    /// load here.
     pub fn load(paths: &QwenEditPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let root = &paths.root;
+        let root = paths.root.clone();
         let te_cfg = TextEncoderConfig::qwen_image();
 
-        let vl_encoder = load_vision_language_encoder(root, &device)?;
-        let transformer = load_transformer(root, &paths.adapters, DIT_DTYPE, &device)?;
-        let vae = QwenVae::new(component_vb(root, "vae", ENC_DTYPE, &device)?)?;
-        let vae_encoder = QwenVaeEncoder::new(component_vb(root, "vae", ENC_DTYPE, &device)?)?;
         let tokenizer = TextTokenizer::from_file(
-            tokenizer_json_path(root)?,
+            tokenizer_json_path(&root)?,
             TokenizerConfig {
                 max_length: te_cfg.max_length,
                 pad_token_id: te_cfg.pad_token_id,
@@ -250,13 +281,30 @@ impl QwenEdit {
         )
         .map_err(|e| CandleError::Msg(format!("qwen edit: load tokenizer: {e}")))?;
 
+        // Sequential residency (sc-10968): defer the four heavy components to `generate_sequential`'s
+        // phased loads, keeping only `root` + `adapters` for the reloads. Resident (default): load all
+        // four now and hold them across requests, byte-identical to the pre-sc-10968 path. Selected by the
+        // worker fit-gate via `offload_policy`, or forced by the `CANDLE_GEN_OFFLOAD=sequential` env the
+        // GPU A/B harness drives (the shared txt2img override, sc-10867).
+        let sequential = paths.offload_policy == OffloadPolicy::Sequential
+            || crate::sequential_offload_enabled();
+        let resident = if sequential {
+            None
+        } else {
+            Some(ResidentComponents {
+                vl_encoder: load_vision_language_encoder(&root, &device)?,
+                transformer: load_transformer(&root, &paths.adapters, DIT_DTYPE, &device)?,
+                vae: QwenVae::new(component_vb(&root, "vae", ENC_DTYPE, &device)?)?,
+                vae_encoder: QwenVaeEncoder::new(component_vb(&root, "vae", ENC_DTYPE, &device)?)?,
+            })
+        };
+
         Ok(Self {
-            zero_cond_t: read_zero_cond_t(root)?,
+            zero_cond_t: read_zero_cond_t(&root)?,
             device,
-            vl_encoder,
-            transformer,
-            vae,
-            vae_encoder,
+            root,
+            adapters: paths.adapters.clone(),
+            resident,
             processor: QwenImageProcessor::default(),
             tokenizer,
         })
@@ -264,8 +312,10 @@ impl QwenEdit {
 
     /// VL-encode one prompt against the precomputed `vision` embeds → `[1, S−64, 3584]` at the DiT
     /// dtype. `n_image_tokens` is the shared `<|image_pad|>` run length (from the image preprocess).
+    /// Takes `vl_encoder` by ref so the resident and sequential paths encode identically.
     fn encode_prompt(
         &self,
+        vl_encoder: &QwenVisionLanguageEncoder,
         prompt: &str,
         n_image_tokens: usize,
         vision: &Tensor,
@@ -273,35 +323,68 @@ impl QwenEdit {
         let ids = tokenize_edit_text(&self.tokenizer, prompt, n_image_tokens)?;
         let len = ids.len();
         let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
-        let embeds = self.vl_encoder.encode_with_vision(&input_ids, vision)?;
+        let embeds = vl_encoder.encode_with_vision(&input_ids, vision)?;
         Ok(embeds.to_dtype(DIT_DTYPE)?)
     }
 
-    /// Reference-conditioned edit. `references` is the (validated non-empty) reference image set: the
-    /// **first** drives the VL prompt embeds, **all** are VAE-encoded into the dual-latent sequence,
-    /// and the **last** sets the condition resolution (the fork's `_compute_dimensions`).
-    pub fn generate(
+    /// Load ONLY the VL conditioning encoder (Qwen2.5-VL LM + vision tower) for the sequential path
+    /// (sc-10968) — the big component dropped before the DiT loads. Same load as [`Self::load`]'s.
+    fn load_vl_seq(&self) -> Result<QwenVisionLanguageEncoder> {
+        load_vision_language_encoder(&self.root, &self.device)
+    }
+
+    /// Load ONLY the VAE encoder (reference dual-latent) for the sequential path (sc-10968). Needed
+    /// DURING the encode phase (before the VL drop), unlike the txt2img path — the references are
+    /// VAE-encoded there, so this is co-resident with the VL encoder, not the DiT.
+    fn load_vae_encoder_seq(&self) -> Result<QwenVaeEncoder> {
+        Ok(QwenVaeEncoder::new(component_vb(
+            &self.root,
+            "vae",
+            ENC_DTYPE,
+            &self.device,
+        )?)?)
+    }
+
+    /// Load ONLY the MMDiT for the sequential path (sc-10968) — loaded after the VL encoder was dropped,
+    /// reusing its freed allocator pool. Re-folds the SAME `adapters` so the DiT is bit-identical to the
+    /// resident path.
+    fn load_transformer_seq(&self) -> Result<QwenTransformer> {
+        load_transformer(&self.root, &self.adapters, DIT_DTYPE, &self.device)
+    }
+
+    /// Load ONLY the VAE decoder for the sequential path (sc-10968) — co-resident with the DiT through
+    /// decode. Small relative to the DiT, so splitting it further buys ~nothing.
+    fn load_vae_seq(&self) -> Result<QwenVae> {
+        Ok(QwenVae::new(component_vb(
+            &self.root,
+            "vae",
+            ENC_DTYPE,
+            &self.device,
+        )?)?)
+    }
+
+    /// The shared conditioning head (sc-10968): VL-encode the vision tower + prompt(s) and VAE-encode the
+    /// reference dual-latent, borrowing the VL + VAE encoders so the resident and sequential paths produce
+    /// byte-identical `(pos, neg, static_latents, cond_grids)`. The **first** reference drives the VL
+    /// prompt embeds, **all** are VAE-encoded into the dual-latent sequence, and the **last** sets the
+    /// condition resolution — the exact semantics of the pre-sc-10968 monolithic `generate`.
+    fn encode_conditioning(
         &self,
+        vl_encoder: &QwenVisionLanguageEncoder,
+        vae_encoder: &QwenVaeEncoder,
         req: &QwenEditRequest,
         references: &[Image],
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
-        if req.cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
+    ) -> Result<EditConditioning> {
         let first = references.first().ok_or_else(|| {
             CandleError::Msg("qwen edit: at least one reference image is required".into())
         })?;
         let last = references.last().expect("non-empty checked");
-        let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         // VL conditioning: preprocess the first reference once (image-only), run the vision tower once,
         // then encode the positive (+ negative for CFG) prompts reusing the vision embeds.
         let edit_img = preprocess_edit_image(&self.processor, image_input(first), &self.device)?;
-        let vision = self
-            .vl_encoder
-            .encode_vision(&edit_img.pixel_values, &[edit_img.grid])?;
-        let pos = self.encode_prompt(&req.prompt, edit_img.n_image_tokens, &vision)?;
+        let vision = vl_encoder.encode_vision(&edit_img.pixel_values, &[edit_img.grid])?;
+        let pos = self.encode_prompt(vl_encoder, &req.prompt, edit_img.n_image_tokens, &vision)?;
         // CFG-off on the lightning path: the distill LoRA is CFG-distilled, so a single forward per
         // step (no negative branch) — matching the MLX lightning recipe (sc-6220).
         let neg = if req.guidance > 1.0 && !req.lightning {
@@ -310,7 +393,7 @@ impl QwenEdit {
             } else {
                 req.negative.as_str()
             };
-            Some(self.encode_prompt(n, edit_img.n_image_tokens, &vision)?)
+            Some(self.encode_prompt(vl_encoder, n, edit_img.n_image_tokens, &vision)?)
         } else {
             None
         };
@@ -322,7 +405,7 @@ impl QwenEdit {
         let mut cond_grids = Vec::with_capacity(references.len());
         for im in references {
             let (latents, grid) = encode_reference_latents(
-                &self.vae_encoder,
+                vae_encoder,
                 image_input(im),
                 vl_w as u32,
                 vl_h as u32,
@@ -336,18 +419,36 @@ impl QwenEdit {
         } else {
             Tensor::cat(&packed.iter().collect::<Vec<_>>(), 1)?
         };
+        Ok((pos, neg, static_latents, cond_grids))
+    }
+
+    /// The shared denoise + decode tail (sc-10968): given already-encoded `(pos, neg, static_latents,
+    /// cond_grids)` and the just-resident DiT + VAE decoder, run the flow sampler (dual-latent concat +
+    /// true-CFG blend inside the `predict` closure) and decode. Borrows the DiT / VAE so BOTH the resident
+    /// and sequential paths run this identical loop — only the load/free schedule differs, not this code.
+    ///
+    /// Lightning uses the static-shift schedule (resolution-independent); production uses the dynamic-μ
+    /// schedule (sc-6220). Routed through the unified curated sampler/scheduler framework (epic 7114 P4,
+    /// sc-7123): the bespoke edit provider has no `req.sampler`/`req.scheduler` surface yet, so both stay
+    /// `None` (the N1 default: `euler` over the native schedule). The model is fed the raw sigma (`Sigma`
+    /// convention); Qwen-Image-Edit is **true CFG**, and the dual-latent concat/slice (concatenate the
+    /// updating noise with the static reference latents over the sequence axis, then slice the noise
+    /// prefix post-forward) lives — with the pos/neg/blend — inside the `predict` closure.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_and_decode(
+        &self,
+        transformer: &QwenTransformer,
+        vae: &QwenVae,
+        req: &QwenEditRequest,
+        pos: &Tensor,
+        neg: Option<&Tensor>,
+        static_latents: &Tensor,
+        cond_grids: &[(usize, usize)],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
         let noise_seq = lat_h * lat_w;
 
-        // Lightning uses the static-shift schedule (resolution-independent); production uses the
-        // dynamic-μ schedule (sc-6220). Routed through the unified curated sampler/scheduler framework
-        // (epic 7114 P4, sc-7123): `native` is whichever legacy schedule the path uses (returned
-        // verbatim — N1 byte-exact for the default), and `mu` steers the (non-default) curated scheduler
-        // axis by the path's own shift. The bespoke edit provider has no `req.sampler`/`req.scheduler`
-        // surface yet, so both stay `None` (the N1 default: `euler` over the native schedule —
-        // algebraically the legacy `euler_step` loop). The model is fed the raw sigma (`Sigma`
-        // convention); Qwen-Image-Edit is **true CFG**, and the dual-latent concat/slice (concatenate the
-        // updating noise with the static reference latents over the sequence axis, then slice the noise
-        // prefix post-forward) lives — together with the pos/neg/blend — inside the `predict` closure.
         let (native, mu) = if req.lightning {
             (
                 pipeline::lightning_sigmas(req.steps),
@@ -373,30 +474,28 @@ impl QwenEdit {
             on_progress,
             |latents, sigma| -> Result<Tensor> {
                 // Concatenate the (updating) noise with the (static) reference latents over the sequence.
-                let joint = Tensor::cat(&[latents, &static_latents], 1)?;
-                let pos_v = self
-                    .transformer
+                let joint = Tensor::cat(&[latents, static_latents], 1)?;
+                let pos_v = transformer
                     .forward_edit(
                         &joint,
-                        &pos,
+                        pos,
                         sigma,
                         lat_h,
                         lat_w,
-                        &cond_grids,
+                        cond_grids,
                         self.zero_cond_t,
                     )?
                     .narrow(1, 0, noise_seq)?;
-                match &neg {
+                match neg {
                     Some(neg) => {
-                        let neg_v = self
-                            .transformer
+                        let neg_v = transformer
                             .forward_edit(
                                 &joint,
                                 neg,
                                 sigma,
                                 lat_h,
                                 lat_w,
-                                &cond_grids,
+                                cond_grids,
                                 self.zero_cond_t,
                             )?
                             .narrow(1, 0, noise_seq)?;
@@ -413,8 +512,88 @@ impl QwenEdit {
 
         on_progress(Progress::Decoding);
         let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
-        let decoded = self.vae.decode(&lat)?;
+        let decoded = vae.decode(&lat)?;
         to_image(&decoded)
+    }
+
+    /// Reference-conditioned edit. `references` is the (validated non-empty) reference image set: the
+    /// **first** drives the VL prompt embeds, **all** are VAE-encoded into the dual-latent sequence,
+    /// and the **last** sets the condition resolution (the fork's `_compute_dimensions`). Dispatches on
+    /// the residency policy (sc-10968): `Resident` borrows the cached components; `Sequential` loads them
+    /// per phase, dropping the VL encoder before the DiT — bit-identical output, lower peak.
+    pub fn generate(
+        &self,
+        req: &QwenEditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        match &self.resident {
+            Some(r) => {
+                let (pos, neg, static_latents, cond_grids) =
+                    self.encode_conditioning(&r.vl_encoder, &r.vae_encoder, req, references)?;
+                self.denoise_and_decode(
+                    &r.transformer,
+                    &r.vae,
+                    req,
+                    &pos,
+                    neg.as_ref(),
+                    &static_latents,
+                    &cond_grids,
+                    on_progress,
+                )
+            }
+            None => self.generate_sequential(req, references, on_progress),
+        }
+    }
+
+    /// Sequential-residency edit (epic 10765 Phase 1c follow-up, sc-10968): load the VL encoder + VAE
+    /// encoder → encode the vision/prompt conditioning + VAE-encode the references → DROP the VL encoder
+    /// (and VAE encoder) → load the DiT + VAE decoder → denoise/decode. Peak VRAM is
+    /// `max(VL+VAE-enc, DiT+VAE-dec)`, reclaiming the big Qwen2.5-VL encoder before the DiT so a card that
+    /// OOMs the resident path can still render. Output is bit-identical to the resident path — the SAME
+    /// [`encode_conditioning`](Self::encode_conditioning) head and
+    /// [`denoise_and_decode`](Self::denoise_and_decode) tail run; only the load/free schedule differs.
+    ///
+    /// Unlike the txt2img path (drop the TE → load DiT+VAE), the encode phase here holds TWO components:
+    /// the VL encoder AND the VAE encoder (the references are VAE-encoded into the dual-latent sequence
+    /// there). Both drop together at the end of Phase 1; the VAE **decoder** loads fresh in Phase 2. The
+    /// surviving state — `pos`/`neg` embeds, `static_latents`, `cond_grids` — is small (no model weights).
+    fn generate_sequential(
+        &self,
+        req: &QwenEditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        // Phase 1 — load the VL encoder + VAE encoder, encode the conditioning + VAE-encode the
+        // references, then DROP both (scoped) so the ~8 GB Qwen2.5-VL frees before the DiT loads.
+        let (pos, neg, static_latents, cond_grids) = {
+            let vl_encoder = self.load_vl_seq()?;
+            let vae_encoder = self.load_vae_encoder_seq()?;
+            self.encode_conditioning(&vl_encoder, &vae_encoder, req, references)?
+        };
+
+        // A reload is expensive — bail before Phase 2 if the request was cancelled during encode.
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+
+        // Phase 2 — load the DiT (reusing the encoder's freed pool) + the VAE decoder, then run the shared
+        // denoise + decode tail.
+        let transformer = self.load_transformer_seq()?;
+        let vae = self.load_vae_seq()?;
+        self.denoise_and_decode(
+            &transformer,
+            &vae,
+            req,
+            &pos,
+            neg.as_ref(),
+            &static_latents,
+            &cond_grids,
+            on_progress,
+        )
     }
 }
 
@@ -545,5 +724,73 @@ mod tests {
         // Neither present → a descriptive error rather than a silent panic.
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(tokenizer_json_path(&tmp).is_err());
+    }
+
+    /// Sequential-residency GPU validation (epic 10765 Phase 1c follow-up, sc-10968) — the edit sibling of
+    /// `qwen_image_probed_generate_for_offload_ab`. ONE probed reference edit whose mode is either the
+    /// `CANDLE_GEN_OFFLOAD` env (the override) or `QWEN_OFFLOAD_MODE=spec-sequential` →
+    /// `QwenEditPaths::offload_policy` (the worker-facing contract); prints the device peak VRAM and writes
+    /// the raw RGB pixels to `QWEN_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and
+    /// compare: the pixel files must be byte-identical (parity) and the sequential peak materially lower
+    /// (the Qwen2.5-VL encoder + VAE encoder dropped before the DiT loads). Two processes are REQUIRED —
+    /// cudarc's caching allocator never returns pages, so a second in-process run reads the first's peak.
+    /// Ignored by default; needs a real-file (hardlink-staged) Qwen-Image-Edit snapshot in
+    /// `QWEN_EDIT_SNAPSHOT`, a reference PPM in `QWEN_EDIT_REF`, and a CUDA device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs QWEN_EDIT_SNAPSHOT + QWEN_EDIT_REF (a reference PPM) + a CUDA GPU"]
+    fn qwen_edit_probed_generate_for_offload_ab() {
+        use candle_gen::testkit::{env_path, read_ppm, PeakSampler};
+
+        let root = env_path("QWEN_EDIT_SNAPSHOT");
+        let out = std::env::var("QWEN_OUT").expect("set QWEN_OUT to the pixel-dump path");
+        let reference = read_ppm(&env_path("QWEN_EDIT_REF"));
+
+        // Two ways to select sequential residency, both exercised by the A/B runner: the env override, or
+        // `QWEN_OFFLOAD_MODE=spec-sequential` → `QwenEditPaths::offload_policy` (the worker contract).
+        let spec_mode = std::env::var("QWEN_OFFLOAD_MODE").unwrap_or_default();
+        let offload_policy = if spec_mode == "spec-sequential" {
+            OffloadPolicy::Sequential
+        } else {
+            OffloadPolicy::Resident
+        };
+        let req = QwenEditRequest {
+            prompt: "make the background a snowy mountain at sunset".into(),
+            width: 1024,
+            height: 1024,
+            steps: 8,
+            guidance: 4.0,
+            seed: 42,
+            lightning: false,
+            ..Default::default()
+        };
+
+        let sampler = PeakSampler::start(0);
+        let model = QwenEdit::load(&QwenEditPaths {
+            root,
+            adapters: vec![],
+            offload_policy,
+        })
+        .expect("load QwenEdit");
+        let img = model
+            .generate(&req, &[reference], &mut |_| {})
+            .expect("generate");
+        let peak_mib = sampler.stop();
+        std::fs::write(&out, &img.pixels).expect("write pixels");
+
+        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
+        let mode = if spec_mode == "spec-sequential" {
+            "spec-sequential"
+        } else if env_mode.eq_ignore_ascii_case("sequential") {
+            "env-sequential"
+        } else {
+            "resident"
+        };
+        eprintln!(
+            "SEQ_AB mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
+            img.pixels.len(),
+            img.width,
+            img.height
+        );
     }
 }
