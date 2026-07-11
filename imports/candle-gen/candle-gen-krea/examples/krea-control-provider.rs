@@ -21,7 +21,9 @@ use std::path::PathBuf;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, Progress};
-use candle_gen_krea::{Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE};
+use candle_gen_krea::{
+    Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
+};
 
 struct Args {
     snapshot: PathBuf,
@@ -96,7 +98,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         root: a.snapshot,
         control: a.ckpt,
     })?;
-    eprintln!("loaded Krea2Control; rendering {}x{} @ scale {}", a.size, a.size, a.scale);
+    eprintln!(
+        "loaded Krea2Control; rendering {}x{} @ scale {}",
+        a.size, a.size, a.scale
+    );
 
     let req = Krea2ControlRequest {
         prompt: a.prompt,
