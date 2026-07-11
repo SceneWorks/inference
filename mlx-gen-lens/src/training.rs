@@ -184,7 +184,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     let enc_cfg = GptOssConfig::lens();
     let enc_w = Weights::from_dir(root.join("text_encoder"))?;
     let encoder =
-        LensTextEncoder::from_weights_quant(&enc_w, &enc_cfg, dtype, TRAINER_ENCODER_QUANT)?;
+        LensTextEncoder::from_weights_quant(enc_w, &enc_cfg, dtype, TRAINER_ENCODER_QUANT)?;
     let dit_cfg = LensDitConfig::lens();
     let dit_w = Weights::from_dir(root.join("transformer"))?;
     let transformer = LensTransformer::from_weights(&dit_w, &dit_cfg, dtype)?;

@@ -83,7 +83,7 @@ fn lens_encoder_matches_reference() {
     let cfg = GptOssConfig::lens();
     eprintln!("loading text_encoder weights (3 MXFP4 shards → bf16 dequant)…");
     let w = Weights::from_dir(text_encoder_dir()).expect("load text_encoder shards");
-    let encoder = LensTextEncoder::from_weights(&w, &cfg, Dtype::Bfloat16).expect("build encoder");
+    let encoder = LensTextEncoder::from_weights(w, &cfg, Dtype::Bfloat16).expect("build encoder");
 
     // Collect every (prompt, layer) result first, then gate — the bf16 worst-element peak_rel grows
     // with capture depth (reference bf16-on-CPU vs ours bf16-on-Metal accumulate differently over up

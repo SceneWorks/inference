@@ -52,14 +52,14 @@ impl LensTextEncoder {
     /// capturing the [`DEFAULT_SELECTED_LAYERS`]. Only layers `0..=max(selected)` are constructed —
     /// for the default selection that is all 24, but a smaller selection loads (and dequantizes the
     /// MXFP4 experts of) only the needed prefix.
-    pub fn from_weights(w: &Weights, cfg: &GptOssConfig, dtype: Dtype) -> Result<Self> {
+    pub fn from_weights(w: Weights, cfg: &GptOssConfig, dtype: Dtype) -> Result<Self> {
         Self::with_selected_layers(w, cfg, dtype, DEFAULT_SELECTED_LAYERS.to_vec(), None)
     }
 
     /// As [`from_weights`](Self::from_weights) but quantizes the MoE experts to Q4/Q8 (sc-3172) so the
     /// encoder loads at `~12 GB` instead of `~40 GB` bf16. Attention / router / embedding stay dense.
     pub fn from_weights_quant(
-        w: &Weights,
+        w: Weights,
         cfg: &GptOssConfig,
         dtype: Dtype,
         quant: Option<Quant>,
@@ -69,8 +69,14 @@ impl LensTextEncoder {
 
     /// As [`from_weights`](Self::from_weights) but with an explicit (non-empty, unique, in-range)
     /// capture-index list (`set_selected_layers`) and optional MoE-expert quantization.
+    ///
+    /// **Consumes `w`** (sc-11030): each layer's source tensors are dropped from the map as soon as
+    /// the layer is built, so the 13 GB gpt-oss source and the growing 21/63 GB built encoder don't
+    /// both stay resident. This bounds the load-time unified-memory transient to ~the built size,
+    /// which is what lets `OffloadPolicy::Sequential` actually reduce peak memory (otherwise the
+    /// source+built LOAD spike, not the resident component sum, is the peak — no staging win).
     pub fn with_selected_layers(
-        w: &Weights,
+        mut w: Weights,
         cfg: &GptOssConfig,
         dtype: Dtype,
         selected_layers: Vec<usize>,
@@ -100,15 +106,22 @@ impl LensTextEncoder {
         }
 
         let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
+        // Source is dropped from the map as each component is built (sc-11030) — the load transient
+        // stays ~= the built encoder rather than source(13 GB) + built.
+        w.remove("model.embed_tokens.weight");
         let mut layers = Vec::with_capacity(max_layer + 1);
         for i in 0..=max_layer {
             layers.push(GptOssDecoderLayer::from_weights(
-                w,
+                &w,
                 &format!("model.layers.{i}"),
                 cfg,
                 dtype,
                 quant,
             )?);
+            // Free this layer's source tensors now that the layer is built (its Linears/experts were
+            // copied/quantized into fresh Arrays, so the source is unreferenced). MLX returns the
+            // buffers to its reuse pool for the next layer's allocations.
+            w.remove_prefix(&format!("model.layers.{i}."));
         }
 
         let (inv_freq, attn_scaling) = cfg.yarn_rope();
