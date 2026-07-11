@@ -952,6 +952,7 @@ mod tests {
             items: vec![mlx_gen::TrainingItem {
                 image_path: PathBuf::from("/tmp/x.png"),
                 caption: "a swatch".into(),
+                control_image_path: None,
             }],
             config,
             output_dir: PathBuf::from("/tmp/krea_unused"),

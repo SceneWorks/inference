@@ -88,6 +88,7 @@ fn tiny_magenta_dataset(n: usize) -> Vec<TrainingItem> {
         items.push(TrainingItem {
             image_path: path,
             caption: "sksanima style, vivid magenta background, 1girl".into(),
+            control_image_path: None,
         });
     }
     items
