@@ -22,6 +22,10 @@
 //! choices reconciled against the macOS `mlx-gen-z-image` provider.
 
 mod adapters;
+// ComfyUI single-file → candle in-memory remap seam (epic 10451 Phase 2, sc-10668): the DiT
+// fused-qkv split + leaf renames and the VAE ldm→diffusers key/shape remap that make a ComfyUI
+// Z-Image install's separate component files loadable in place via `VarBuilder::from_tensors`.
+mod comfyui;
 // Crate-private shared plumbing (sc-9002 / F-022): the loader, VAE decode → RGB8, `[0,255] → [-1,1]`
 // image preprocess, deterministic VAE-encode mean, seeded-noise prior, and the Qwen tokenizer policy —
 // one home for what the three entry points (pipeline/edit/control) used to triplicate.
@@ -139,6 +143,10 @@ pub struct ZImageGenerator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    /// External ComfyUI component sources (epic 10451 Phase 2, sc-10668). `Some` ⇒ the pipeline builds
+    /// the DiT/TE/VAE from the in-place remapped ComfyUI single-files rather than a diffusers snapshot
+    /// dir. Set only by [`load_from_comfyui_components`]; the registry `load` leaves it `None`.
+    comfyui: Option<std::sync::Arc<comfyui::ComfyuiSources>>,
     /// Cached components + the accel-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache, never
     /// across the denoise.
@@ -211,13 +219,17 @@ impl Generator for ZImageGenerator {
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?`. The light `Pipeline` handle carries the snapshot/device; the
         // heavy components come from the cache.
-        let pipe = Pipeline::load(
-            &self.root,
-            &self.device,
-            self.dtype,
-            &self.adapters,
-            self.pid_spec.clone(),
-        );
+        let pipe = match &self.comfyui {
+            // In-place ComfyUI load (sc-10668): the DiT/VAE remap + verbatim Qwen3 TE.
+            Some(sources) => Pipeline::load_comfyui(sources.clone(), &self.device, self.dtype),
+            None => Pipeline::load(
+                &self.root,
+                &self.device,
+                self.dtype,
+                &self.adapters,
+                self.pid_spec.clone(),
+            ),
+        };
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -318,6 +330,41 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         // any) so the lazy component build loads the engine once. Unlike quant/control above, it is not
         // rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
+        comfyui: None,
+        components: Mutex::new(None),
+    }))
+}
+
+/// Construct an in-place **ComfyUI** Z-Image generator (epic 10451 Phase 2, sc-10668) from the three
+/// separate ComfyUI component files + the directory holding our shipped `tokenizer/tokenizer.json` (the
+/// one tiny file a ComfyUI tree does not ship). The DiT and VAE are key-remapped in memory at first
+/// `generate` ([`comfyui`]) and the Qwen3 encoder loads verbatim — read in place, no copy, no
+/// re-download. Dense bf16 only (the fp8/scaled-fp8/GGUF tiers are later slices).
+///
+/// Invoked **directly by the SceneWorks worker** (like [`edit`] / [`control`]), not through the
+/// gen-core registry — the registered `z_image_turbo` descriptor still expects a diffusers snapshot
+/// dir, so this stays a bespoke worker entry point rather than a `WeightsSource` variant.
+pub fn load_from_comfyui_components(
+    transformer_file: impl Into<PathBuf>,
+    text_encoder_file: impl Into<PathBuf>,
+    vae_file: impl Into<PathBuf>,
+    tokenizer_dir: impl Into<PathBuf>,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let device = candle_gen::default_device()?;
+    let sources = std::sync::Arc::new(comfyui::ComfyuiSources {
+        transformer_file: transformer_file.into(),
+        text_encoder_file: text_encoder_file.into(),
+        vae_file: vae_file.into(),
+        tokenizer_dir: tokenizer_dir.into(),
+    });
+    Ok(Box::new(ZImageGenerator {
+        descriptor: descriptor(),
+        root: sources.tokenizer_dir.clone(),
+        device,
+        dtype: DType::BF16,
+        adapters: Vec::new(),
+        pid_spec: None,
+        comfyui: Some(sources),
         components: Mutex::new(None),
     }))
 }
