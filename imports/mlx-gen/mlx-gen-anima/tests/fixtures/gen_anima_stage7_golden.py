@@ -69,6 +69,34 @@ NEGATIVE = ""
 W = H = 1024
 INIT_SEED = 7  # shared init latent across all variants
 
+# sc-10577 — the ISOLATION MEASUREMENT of the bf16-conditioning offset. This reference generator runs
+# fp32 both sides and cannot itself compute the MLX bf16-vs-fp32 delta, so the numbers below are the
+# MEASURED output of `tests/parity_real_weights.rs::stage7_bf16_conditioning_offset_sc10577` (Apple
+# Metal, this checkpoint). Emitted into the golden's metadata (and reproducible from that test) so a
+# future reader need not re-derive it. If the port changes such that these move, rerun that test and
+# update these constants. Values: relative-L2 (final-latent) unless noted.
+SC10577_MEASUREMENT = {
+    "story": "sc-10577",
+    "measured_by": "tests/parity_real_weights.rs::stage7_bf16_conditioning_offset_sc10577 (Apple Metal)",
+    "what": "The identical injected-init + deterministic-Euler + schedule stage-7 denoise (DiT fp32) rerun "
+    "with an fp32-upcast Qwen3 TE + AnimaTextConditioner (mirroring this reference's .float(), via "
+    "loader::load_conditioning_at_dtype) vs the shipped bf16-weight conditioning — both compared to this "
+    "fp32 golden. The drop from the bf16-TE residual to the fp32-TE residual is the bf16-conditioning offset.",
+    "direct_conditioner_offset_rel_l2": {"anima_base": 1.374e-3, "anima_aesthetic": 1.301e-3, "anima_turbo": 1.301e-3},
+    "final_rel_l2_bf16_te": {"anima_base": 7.8083e-2, "anima_aesthetic": 7.9509e-2, "anima_turbo": 3.3763e-2},
+    "final_rel_l2_fp32_te": {"anima_base": 8.5411e-2, "anima_aesthetic": 8.8546e-2, "anima_turbo": 3.0453e-2},
+    "residual_removed_by_fp32_te_pct": {"anima_base": -9.4, "anima_aesthetic": -11.4, "anima_turbo": 9.8},
+    "bf16_vs_fp32_final_latent_delta_rel_l2": {"anima_base": 3.139e-2, "anima_aesthetic": 3.719e-2, "anima_turbo": 1.567e-2},
+    "conclusion": "bf16-conditioning is NOT the dominant term in the ~7.8e-2 stage-7 residual. The direct "
+    "bf16-vs-fp32 conditioner-output offset is only ~1.3e-3, and matching the reference's conditioning "
+    "precision changes the final residual by only ~±10% (never collapses it): it slightly HURTS "
+    "base/aesthetic (+9..11%) and slightly HELPS turbo (-10%). The ~3e-2 conditioning-propagation "
+    "perturbation is roughly orthogonal to the MLX-vs-reference gap, which is dominated by cross-backend "
+    "(Metal-vs-MPS) DiT/VAE float accumulation independent of conditioning precision. Directly confirms "
+    "sc-10524's accumulation-dominated inference. Production stays bf16 (an fp32 encode would ~double the "
+    "TE + conditioner memory for no parity gain).",
+}
+
 
 # ---------------- provenance ----------------
 def diffusers_base_snapshot() -> Path:
@@ -346,7 +374,10 @@ def main():
             "Metal-vs-MPS float error, not chaos. The MLX Qwen3+conditioner encode is bf16-locked while "
             "this reference runs fp32, so a FIXED bf16-conditioning offset propagates through every step ON "
             "TOP of float accumulation; `step_latents` (x after 1 & 5 steps) let the Rust test tell the two "
-            "apart (a bias is already present at step 1; accumulation grows toward the final).",
+            "apart (a bias is already present at step 1; accumulation grows toward the final). sc-10577 then "
+            "DIRECTLY measured the bf16-conditioning contribution — see `sc10577_bf16_conditioning_offset`.",
+            # sc-10577: the direct isolation measurement of the bf16-conditioning offset (see the constant).
+            "sc10577_bf16_conditioning_offset": SC10577_MEASUREMENT,
         },
         "variants": results,
     }

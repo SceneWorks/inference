@@ -21,11 +21,31 @@ pub struct AnimaQwen3 {
     norm: Array,
     rope: TextRope,
     eps: f32,
+    /// The tower's compute dtype. `Bfloat16` for the shipped path (Anima's on-disk Qwen3 weights are
+    /// bf16, so this is a no-op cast that matches the reference `text_encoder.dtype`). `Float32` builds
+    /// the fp32-TE **reference** variant that isolates the bf16-conditioning parity offset (sc-10577).
+    compute_dtype: Dtype,
 }
 
 impl AnimaQwen3 {
-    /// `prefix` is the checkpoint root of the Qwen3 model (`"model"` for `model.embed_tokens.*`).
+    /// `prefix` is the checkpoint root of the Qwen3 model (`"model"` for `model.embed_tokens.*`). The
+    /// tower runs in **bf16** — byte-identical to the shipped path (Anima's Qwen3 weights are bf16 on
+    /// disk). Use [`from_weights_dtype`](Self::from_weights_dtype) for the sc-10577 fp32 reference.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &Qwen3Config) -> Result<Self> {
+        Self::from_weights_dtype(w, prefix, cfg, Dtype::Bfloat16)
+    }
+
+    /// Build the tower recording an explicit **compute dtype** (sc-10577). `Bfloat16` reproduces the
+    /// shipped bf16 path exactly. `Float32` runs the whole tower in fp32 to build the fp32-TE reference
+    /// variant that isolates the bf16-conditioning parity offset — the caller MUST supply fp32-upcast
+    /// weights (MLX `matmul` requires the activation and weight dtypes to match), which
+    /// [`crate::loader::load_conditioning_at_dtype`] does via `Weights::cast_all`.
+    pub fn from_weights_dtype(
+        w: &Weights,
+        prefix: &str,
+        cfg: &Qwen3Config,
+        compute_dtype: Dtype,
+    ) -> Result<Self> {
         let embed = mlx_gen::quant::embedding(
             w,
             &join(prefix, "embed_tokens"),
@@ -48,18 +68,29 @@ impl AnimaQwen3 {
             norm: w.require(&join(prefix, "norm.weight"))?.clone(),
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             eps: cfg.rms_norm_eps,
+            compute_dtype,
         })
     }
 
+    /// The tower's compute dtype (`Bfloat16` shipped; `Float32` for the sc-10577 fp32-TE reference).
+    pub fn compute_dtype(&self) -> Dtype {
+        self.compute_dtype
+    }
+
     /// `input_ids` / `attention_mask`: `[B, S]` int32. Returns the **last_hidden_state** `[B, S, hidden]`
-    /// (bf16) — the last decoder layer AFTER the final norm (a causal LM with padding masking).
+    /// in [`compute_dtype`](Self::compute_dtype) — the last decoder layer AFTER the final norm (a causal
+    /// LM with padding masking).
     pub fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
-        // bf16 tower (matches the reference `text_encoder.dtype`): embed gathers f32 rows, cast to bf16.
-        let mut h = self.embed.forward(input_ids)?.as_dtype(Dtype::Bfloat16)?;
+        // `compute_dtype` tower (bf16 shipped — matches the reference `text_encoder.dtype`; fp32 for the
+        // sc-10577 reference variant): embed gathers weight-dtype rows, cast to the compute dtype.
+        let mut h = self
+            .embed
+            .forward(input_ids)?
+            .as_dtype(self.compute_dtype)?;
         let (cos, sin) = self.rope.forward(s)?;
-        let mask = build_mask(attention_mask, b, s)?.as_dtype(Dtype::Bfloat16)?;
+        let mask = build_mask(attention_mask, b, s)?.as_dtype(self.compute_dtype)?;
         for layer in &self.layers {
             h = layer.forward(&h, &cos, &sin, &mask)?;
         }

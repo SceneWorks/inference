@@ -508,6 +508,208 @@ fn assert_image_matches(pixels: &[u8], g: &Value, label: &str, mean_tol: f64, sa
     );
 }
 
+/// Full-tensor relative-L2 `‖a−b‖₂ / ‖b‖₂` over every element (both flattened to f64). Used to measure
+/// the DIRECT bf16-vs-fp32 conditioning offset and the bf16-vs-fp32 final-latent delta (sc-10577).
+fn rel_l2_full(a: &Array, b: &Array) -> f64 {
+    let fa: Vec<f64> = a
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .iter()
+        .map(|&x| x as f64)
+        .collect();
+    let fb: Vec<f64> = b
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .iter()
+        .map(|&x| x as f64)
+        .collect();
+    assert_eq!(fa.len(), fb.len(), "rel_l2_full: shape mismatch");
+    let (mut num, mut den) = (0f64, 0f64);
+    for (&x, &y) in fa.iter().zip(&fb) {
+        num += (x - y) * (x - y);
+        den += y * y;
+    }
+    (num / den.max(1e-12)).sqrt()
+}
+
+/// Sampled relative-L2 of `got` against a golden `final_latent` summary's committed sample set — the
+/// SAME metric `assert_sampled_rel_l2` gates, but returned as a bare number (no bound) so the sc-10577
+/// isolation test can report bf16-TE and fp32-TE residuals side by side.
+fn sampled_rel_l2_value(got: &Array, g: &Value) -> f64 {
+    let flat: Vec<f64> = got
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .iter()
+        .map(|&x| x as f64)
+        .collect();
+    let idx = i64s(&g["sample_indices"]);
+    let vals: Vec<f64> = g["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap())
+        .collect();
+    let (mut num, mut den) = (0f64, 0f64);
+    for (&i, &want) in idx.iter().zip(&vals) {
+        let d = flat[i as usize] - want;
+        num += d * d;
+        den += want * want;
+    }
+    (num / den.max(1e-12)).sqrt()
+}
+
+// ------------------------------------------------------------------------------------------------
+// sc-10577 — ISOLATE the bf16-conditioning offset (fp32-TE reference variant).
+//
+// sc-10524's stage-7 golden left the ~7.8e-2 base final-latent residual attributed to accumulation by
+// INFERENCE (step-1 rel-L2 ~2e-5 ≪ final, super-linear growth). This test MEASURES the bf16-conditioning
+// contribution directly: it runs the identical injected-init + deterministic-Euler + schedule stage-7
+// denoise (DiT fp32) TWICE per variant — once with the shipped bf16-weight conditioning, once with an
+// fp32-upcast TE + conditioner (mirroring the diffusers reference's `.float()`, via
+// `loader::load_conditioning_at_dtype`) — and compares each final latent to the SAME fp32 reference
+// golden. The drop from the bf16-TE residual to the fp32-TE residual IS the bf16-conditioning offset.
+//
+// It also reports the DIRECT conditioning offset (rel-L2 between the bf16 and fp32 conditioner outputs,
+// pre-DiT) — the pure bf16-vs-fp32 weight-precision difference before any trajectory amplification.
+// ------------------------------------------------------------------------------------------------
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot + Metal; SLOW (real 2B denoise x2 per variant)"]
+fn stage7_bf16_conditioning_offset_sc10577() {
+    let split = split_files().expect("Anima snapshot");
+    let g = load_golden("e2e_golden.json");
+    let prompt = g["meta"]["prompt"].as_str().unwrap();
+    let negative = g["meta"]["negative"].as_str().unwrap();
+    let init_shape: Vec<i32> = i64s(&g["meta"]["init"]["shape"])
+        .iter()
+        .map(|&x| x as i32)
+        .collect();
+    let seed = g["meta"]["init"]["seed"].as_u64().unwrap();
+    let n: usize = init_shape.iter().product::<i32>() as usize;
+    let init = Array::from_slice(&gauss_fill(n, seed), &init_shape[..]);
+    let source = WeightsSource::Dir(split.clone());
+
+    let variants = g["variants"].as_object().expect("variants object");
+    println!(
+        "\n=== sc-10577 bf16-conditioning offset isolation (fp32-TE vs bf16-TE stage-7 residual) ==="
+    );
+    // Collect every variant's numbers and print them BEFORE asserting, so the full measurement is
+    // legible even if a bound fires.
+    let mut rows: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+    for (id, v) in variants {
+        let variant = Variant::from_id(id).unwrap_or_else(|| panic!("unknown variant {id}"));
+        let steps = v["steps"].as_u64().unwrap() as usize;
+        let guidance = v["guidance"].as_f64().unwrap() as f32;
+        let pipeline = AnimaPipeline::from_source(&source, variant).unwrap();
+
+        // Shipped bf16-weight conditioning.
+        let cond_bf16 = pipeline.encode_prompt(prompt).unwrap();
+        let uncond_bf16 = variant
+            .uses_cfg()
+            .then(|| pipeline.encode_prompt(negative).unwrap());
+
+        // fp32-upcast reference conditioning (TE + conditioner weights → fp32, mirroring `.float()`).
+        let (te32, cond_mod32) =
+            mlx_gen_anima::loader::load_conditioning_at_dtype(&source, variant, Dtype::Float32)
+                .unwrap();
+        let cond_fp32 = pipeline
+            .encode_prompt_with(prompt, &te32, &cond_mod32)
+            .unwrap();
+        let uncond_fp32 = variant.uses_cfg().then(|| {
+            pipeline
+                .encode_prompt_with(negative, &te32, &cond_mod32)
+                .unwrap()
+        });
+
+        // (A) DIRECT conditioning offset — the pure bf16-vs-fp32 conditioner-output difference (pre-DiT).
+        let cond_offset = rel_l2_full(&cond_bf16, &cond_fp32);
+
+        // (B) End-to-end: identical injected init + Euler + schedule, DiT fp32, conditioning bf16 vs fp32.
+        let latent_bf16 = pipeline
+            .denoise_from_latent_with_conditioning(
+                &init,
+                &cond_bf16,
+                uncond_bf16.as_ref(),
+                steps,
+                guidance,
+                "euler",
+                Dtype::Float32,
+            )
+            .unwrap();
+        let latent_fp32 = pipeline
+            .denoise_from_latent_with_conditioning(
+                &init,
+                &cond_fp32,
+                uncond_fp32.as_ref(),
+                steps,
+                guidance,
+                "euler",
+                Dtype::Float32,
+            )
+            .unwrap();
+
+        // Residual of each MLX run vs the fp32 diffusers reference golden (the committed sample set).
+        let rel_bf16 = sampled_rel_l2_value(&latent_bf16, &v["final_latent"]);
+        let rel_fp32 = sampled_rel_l2_value(&latent_fp32, &v["final_latent"]);
+        // Fraction of the bf16-TE residual that matching the reference's conditioning precision removed
+        // (NEGATIVE ⇒ it made the residual WORSE), and the direct bf16-vs-fp32 final-latent delta.
+        let removed = rel_bf16 - rel_fp32;
+        let pct = 100.0 * removed / rel_bf16.max(1e-12);
+        let latent_delta = rel_l2_full(&latent_bf16, &latent_fp32);
+
+        println!(
+            "[sc10577 {id}] cond-offset(bf16 vs fp32) = {cond_offset:.3e} | final rel-L2 vs fp32-ref: \
+             bf16-TE = {rel_bf16:.4e}, fp32-TE = {rel_fp32:.4e} | removed = {removed:.4e} ({pct:.1}% of the residual) | \
+             bf16-vs-fp32 latent Δ = {latent_delta:.3e}"
+        );
+
+        rows.push((id.clone(), cond_offset, rel_bf16, rel_fp32, latent_delta));
+        mlx_rs::memory::clear_cache();
+    }
+
+    // The MEASURED conclusion (do not tune toward a predetermined answer — sc-10577):
+    //   * The DIRECT bf16-vs-fp32 conditioner-output offset is TINY (~1.3e-3 across all variants), and
+    //   * matching the reference's conditioning precision changes the stage-7 residual by only ~±10% —
+    //     it never collapses it: base 7.8e-2 → 8.5e-2 (+9%), aesthetic 8.0e-2 → 8.9e-2 (+11%), turbo
+    //     3.4e-2 → 3.0e-2 (−10%). fp32-TE HURTS base/aesthetic slightly and HELPS turbo slightly — the
+    //     ~3e-2 conditioning-propagation perturbation is roughly orthogonal to the MLX-vs-reference gap.
+    // ⇒ the bf16-conditioning offset is NOT the dominant term in the ~7.8e-2 residual; the residual is
+    //   dominated by cross-backend (Metal-vs-MPS) DiT/VAE float accumulation, independent of the
+    //   conditioning precision. This CONFIRMS (and, via the mixed-sign near-null result, strengthens)
+    //   sc-10524's accumulation-dominated inference. The bounds below LOCK that finding: they fire if a
+    //   future change ever makes the conditioning precision the dominant term (flipping the conclusion).
+    for (id, cond_offset, rel_bf16, rel_fp32, _delta) in &rows {
+        // The raw conditioning offset is small — the bf16 conditioner is close to the fp32 one.
+        assert!(
+            *cond_offset < 5e-3,
+            "sc10577 {id}: direct bf16-vs-fp32 conditioning offset {cond_offset:.3e} unexpectedly large"
+        );
+        // Both MLX runs land in the reference ballpark (structural tripwire — the 1.2e-1 stage-7 uses).
+        assert!(
+            *rel_bf16 < 1.2e-1 && *rel_fp32 < 1.2e-1,
+            "sc10577 {id}: a final rel-L2 (bf16 {rel_bf16:.3e} / fp32 {rel_fp32:.3e}) blew the 1.2e-1 tripwire"
+        );
+        // THE FINDING: fp32-TE removes < half the residual ⇒ bf16-conditioning is NOT dominant. (If a
+        // future change made conditioning dominant, fp32-TE would collapse the residual and this fires.)
+        let removed_frac = (rel_bf16 - rel_fp32) / rel_bf16.max(1e-12);
+        assert!(
+            removed_frac < 0.5,
+            "sc10577 {id}: fp32-TE removed {:.0}% of the residual — bf16-conditioning became dominant; \
+             re-examine the accumulation-vs-conditioning conclusion",
+            100.0 * removed_frac
+        );
+    }
+    println!(
+        "CONCLUSION: bf16-conditioning is NOT the dominant term — the fp32-TE variant changes the \
+         stage-7 residual by only ~±10% (base/aesthetic +9..11%, turbo -10%; never collapses it), and \
+         the direct conditioning offset is ~1.3e-3. The ~7.8e-2 residual is cross-backend \
+         accumulation-dominated (confirms sc-10524)."
+    );
+    println!("=== end sc-10577 ===\n");
+}
+
 #[test]
 #[ignore = "needs the circlestone-labs/Anima snapshot + Metal; SLOW (real 2B denoise x3 variants)"]
 fn stage7_e2e_all_variants() {
@@ -569,9 +771,13 @@ fn stage7_e2e_all_variants() {
         // MEASURED (this checkpoint): step-1 rel-L2 ~2e-5, step-5 ~2e-4 (turbo 3e-3), final ~3–8e-2 — the
         // early deltas are 3–4 orders of magnitude BELOW the final and grow super-linearly, so the residual
         // is accumulation-dominated (endgame amplification); the bf16-conditioning offset is present but a
-        // MINOR per-step contributor, not a dominant bias (isolating it exactly needs an fp32-TE variant,
-        // which requires making the encode dtype configurable — a production change, tracked as a filed
-        // follow-up story).
+        // MINOR per-step contributor, not a dominant bias. This is now DIRECTLY MEASURED, not just inferred:
+        // sc-10577's `stage7_bf16_conditioning_offset_sc10577` (this file) reruns the identical stage-7
+        // denoise with an fp32-upcast TE + conditioner (via `loader::load_conditioning_at_dtype`) and finds
+        // the direct bf16-vs-fp32 conditioner-output offset is only ~1.4e-3 and that matching the reference's
+        // conditioning precision does NOT reduce the final residual (base 7.8e-2 → 8.5e-2) — so the residual
+        // is cross-backend accumulation-dominated, NOT bf16-conditioning-dominated. See that test for the
+        // full per-variant numbers.
         //
         // The intermediate bounds must actually LOCK the measured value — the whole reason we capture the
         // step latents is to distinguish accumulation from a fixed bias, and the final's loose structural
