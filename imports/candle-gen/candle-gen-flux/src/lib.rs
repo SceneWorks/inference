@@ -583,7 +583,15 @@ mod tests {
         let dir = std::env::var("FLUX_DEV_DIR")
             .expect("set FLUX_DEV_DIR to a real-file (hardlink-staged) FLUX.1-dev snapshot");
         let out = std::env::var("FLUX_OUT").expect("set FLUX_OUT to the pixel-dump path");
-        let spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
+        // Two ways to select sequential residency, both exercised by the A/B runner:
+        //   - env `CANDLE_GEN_OFFLOAD=sequential` (the override, sc-10769), OR
+        //   - `FLUX_OFFLOAD_MODE=spec-sequential` → drive it through `LoadSpec::offload_policy`
+        //     (the worker-facing contract, sc-10821), with CANDLE_GEN_OFFLOAD UNSET.
+        let mut spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
+        let spec_mode = std::env::var("FLUX_OFFLOAD_MODE").unwrap_or_default();
+        if spec_mode == "spec-sequential" {
+            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
+        }
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,
@@ -602,7 +610,14 @@ mod tests {
             other => panic!("expected images, got {other:?}"),
         };
         std::fs::write(&out, &img.pixels).expect("write pixels");
-        let mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_else(|_| "resident".into());
+        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
+        let mode = if spec_mode == "spec-sequential" {
+            "spec-sequential"
+        } else if env_mode.eq_ignore_ascii_case("sequential") {
+            "env-sequential"
+        } else {
+            "resident"
+        };
         eprintln!(
             "SEQ_AB mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
             img.pixels.len(),
