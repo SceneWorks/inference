@@ -580,42 +580,11 @@ impl Pipeline {
         })
     }
 
-    /// Detect a pre-quantized MLX SDXL tier at `root` (sc-9416): `Some((unet_file, group_size))` when
-    /// `unet/config.json` carries a `quantization` block ([`PackedConfig`]) and the packed weight file
-    /// exists, else `None` (a dense diffusers snapshot — the stock build). The dual CLIP text encoders
-    /// are also packed in these tiers, but the candle CLIP path is stock/dense-only; that packed-CLIP
-    /// load is deferred to **sc-9527** (see [`encode_one`](Self::encode_one)). Errors on a packed tier
-    /// whose group size the vendored UNet's Linear seam does not thread (only 64 today) rather than
-    /// silently repacking at the wrong grid.
+    /// Detect a pre-quantized MLX SDXL tier at this pipeline's `root` — the free
+    /// [`detect_packed_unet`] (shared with the InstantID/edit/IP-Adapter UNet loader, sc-10813) keyed
+    /// on `self.root`.
     fn detect_packed_unet(&self) -> Result<Option<(PathBuf, usize)>> {
-        let cfg_path = self.root.join("unet/config.json");
-        if !cfg_path.is_file() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(&cfg_path)
-            .map_err(|e| CandleError::Msg(format!("sdxl: read unet/config.json: {e}")))?;
-        let cfg: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| CandleError::Msg(format!("sdxl: parse unet/config.json: {e}")))?;
-        let Some(packed) = PackedConfig::from_config(&cfg) else {
-            return Ok(None);
-        };
-        let group_size = packed.group_size as usize;
-        // The vendored UNet's Linear seam threads the default MLX group size (64) through its leaf
-        // constructors; a non-64 tier would repack on the wrong grid, so refuse it loudly. The SDXL MLX
-        // tiers all pack at 64, so this never fires on a real tier.
-        if group_size != MLX_GROUP_SIZE {
-            // sc-9528 kept this loud reject: the vendored UNet's top-level `new` → blocks → leaves chain
-            // threads only the default group 64 (the leaf `*_gs` constructors exist, but wiring a non-64
-            // group through the many nested block constructors is the same infeasibility lens/sd3 hit in
-            // sc-9474). A non-64 SDXL MLX tier does not exist today; refuse it rather than repack on the
-            // wrong grid. The adapter fold ([`crate::packed_adapters`]) asserts gs==64 for the same reason.
-            return Err(CandleError::Msg(format!(
-                "sdxl: packed tier group_size {group_size} unsupported (only {MLX_GROUP_SIZE}); \
-                 a non-64 SDXL tier needs the group threaded through the UNet blocks (sc-9528)"
-            )));
-        }
-        let file = snapshot_file(&self.root, "unet/diffusion_pytorch_model.safetensors")?;
-        Ok(Some((file, group_size)))
+        detect_packed_unet(&self.root)
     }
 
     /// Build the vendored packed-detecting SDXL UNet from a packed MLX-tier `unet/` checkpoint
@@ -1137,6 +1106,47 @@ pub(crate) fn detect_packed_clip(root: &Path, which: &Clip) -> Result<Option<(Pa
     };
     let file = snapshot_file(root, &format!("{dir}/model.safetensors"))?;
     Ok(Some((file, packed.group_size as usize)))
+}
+
+/// Detect a pre-quantized MLX SDXL tier at `root` (sc-9416): `Some((unet_file, group_size))` when
+/// `unet/config.json` carries a `quantization` block ([`PackedConfig`]) and the packed weight file
+/// (`diffusion_pytorch_model.safetensors`, not the dense `.fp16` name) exists, else `None` (a dense
+/// diffusers snapshot — the stock/dense build). Errors on a packed tier whose group size the vendored
+/// UNet's Linear seam does not thread (only 64 today) rather than silently repacking at the wrong grid.
+///
+/// Shared by the base txt2img load ([`Pipeline::load_components`], via the [`Pipeline::detect_packed_unet`]
+/// method wrapper) AND the InstantID/edit/IP-Adapter vendored-UNet loader ([`crate::loaders::load_instantid_unet`],
+/// sc-10813) — both take the packed vs dense fork from the SAME `unet/config.json` probe so a q4/q8 tier
+/// serves the edit / inpaint / IP-Adapter lanes, not just plain txt2img.
+pub(crate) fn detect_packed_unet(root: &Path) -> Result<Option<(PathBuf, usize)>> {
+    let cfg_path = root.join("unet/config.json");
+    if !cfg_path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&cfg_path)
+        .map_err(|e| CandleError::Msg(format!("sdxl: read unet/config.json: {e}")))?;
+    let cfg: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| CandleError::Msg(format!("sdxl: parse unet/config.json: {e}")))?;
+    let Some(packed) = PackedConfig::from_config(&cfg) else {
+        return Ok(None);
+    };
+    let group_size = packed.group_size as usize;
+    // The vendored UNet's Linear seam threads the default MLX group size (64) through its leaf
+    // constructors; a non-64 tier would repack on the wrong grid, so refuse it loudly. The SDXL MLX
+    // tiers all pack at 64, so this never fires on a real tier.
+    if group_size != MLX_GROUP_SIZE {
+        // sc-9528 kept this loud reject: the vendored UNet's top-level `new` → blocks → leaves chain
+        // threads only the default group 64 (the leaf `*_gs` constructors exist, but wiring a non-64
+        // group through the many nested block constructors is the same infeasibility lens/sd3 hit in
+        // sc-9474). A non-64 SDXL MLX tier does not exist today; refuse it rather than repack on the
+        // wrong grid. The adapter fold ([`crate::packed_adapters`]) asserts gs==64 for the same reason.
+        return Err(CandleError::Msg(format!(
+            "sdxl: packed tier group_size {group_size} unsupported (only {MLX_GROUP_SIZE}); \
+             a non-64 SDXL tier needs the group threaded through the UNet blocks (sc-9528)"
+        )));
+    }
+    let file = snapshot_file(root, "unet/diffusion_pytorch_model.safetensors")?;
+    Ok(Some((file, group_size)))
 }
 
 /// Resolve a component file inside the SDXL snapshot dir, erroring clearly if absent (e.g. a
