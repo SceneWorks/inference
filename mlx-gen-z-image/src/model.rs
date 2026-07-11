@@ -12,11 +12,12 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
-    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
-    Result, WeightsSource,
+    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::Dtype;
+use std::path::Path;
 
 use crate::loader;
 use crate::pipeline::{self, denoise_with_progress, encode_init_latents, init_time_step};
@@ -97,13 +98,62 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct ZImageTurbo {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
+    /// Component-residency strategy (epic 10834 Phase 1, sc-10839), selected from
+    /// [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen text encoder + DiT + VAE
+    /// warm for the whole job and across jobs; `Sequential` holds only the [`LoadSpec`] and re-loads
+    /// per generation in phase order (encode → **drop the text encoder** → denoise/decode), bounding
+    /// peak unified memory to `max(text-encoder, DiT+VAE)` instead of the sum — the big win on
+    /// Z-Image, whose Qwen encoder is comparable to the DiT.
+    residency: Residency,
+}
+
+/// The heavy-component residency for a [`ZImageTurbo`] (sc-10839). See [`ZImageTurbo::residency`].
+enum Residency {
+    /// Every component loaded once at [`load`] and held (today's warm-cache path). `generate`
+    /// borrows these. Boxed so this heavy variant doesn't bloat every `Sequential` handle
+    /// (`clippy::large_enum_variant`).
+    Resident(Box<ResidentComponents>),
+    /// Only the [`LoadSpec`] is held; each `generate` re-loads the components in phase order and
+    /// frees them after, so peak memory is `max(text-encoder, DiT+VAE)` and nothing stays resident
+    /// across jobs. The per-phase loaders rebuild byte-identical components to the `Resident` path.
+    Sequential(Box<LoadSpec>),
+}
+
+/// The Qwen text encoder held resident (the phase-A component dropped first under `Sequential`),
+/// paired with the heavy render bundle. Split so the `Resident` and `Sequential` paths hand the
+/// render body the exact same [`ZImageHeavy`] borrow.
+struct ResidentComponents {
     text_encoder: TextEncoder,
+    heavy: ZImageHeavyOwned,
+}
+
+/// The heavy render-phase components (the DiT transformer, the VAE, and the optional PiD decoder) —
+/// everything but the text encoder. Owned by the `Resident` components or by a `Sequential` generate.
+struct ZImageHeavyOwned {
     transformer: ZImageTransformer,
     vae: Vae,
     /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
     /// `LoadSpec` carried `pid`; selected per-generation by `req.use_pid`. Z-Image shares Flux1's VAE
     /// latent space, so it reuses the `flux` PiD student via the `zimage-turbo` registry alias.
     pid: Option<PidEngine>,
+}
+
+/// A borrow of the heavy render-phase components, so the denoise/decode body runs identically
+/// whether they are held resident or were just loaded by the `Sequential` path (candle's `DitRef`).
+struct ZImageHeavy<'a> {
+    transformer: &'a ZImageTransformer,
+    vae: &'a Vae,
+    pid: Option<&'a PidEngine>,
+}
+
+impl ZImageHeavyOwned {
+    fn as_ref(&self) -> ZImageHeavy<'_> {
+        ZImageHeavy {
+            transformer: &self.transformer,
+            vae: &self.vae,
+            pid: self.pid.as_ref(),
+        }
+    }
 }
 
 /// Construct a [`ZImageTurbo`] from a [`LoadSpec`].
@@ -117,22 +167,48 @@ pub struct ZImageTurbo {
 /// full memory saving and fork-matching output (sc-2532). An fp32 precision override is not wired
 /// (the validated dense path is bf16) and is rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let c = load_components(
-        spec,
-        "z_image_turbo: only dense bf16 is wired in the Rust port; the text encoder already \
-         runs f32 internally (drop the precision override)",
-        "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
-         transformer/ vae/), not a single .safetensors file",
-    )?;
+    // Component residency (epic 10834 Phase 1, sc-10839): `Resident` (default) builds every heavy
+    // component now via [`load_components`] and holds it warm; `Sequential` keeps only the spec and
+    // re-loads per generate in phase order (encode → drop the text encoder → denoise/decode) to bound
+    // peak memory. Both use the same per-phase loaders, so the components are byte-identical.
+    let (tokenizer, residency) = match spec.offload_policy {
+        OffloadPolicy::Resident => {
+            let c = load_components(spec, PRECISION_MSG, FILE_MSG)?;
+            (
+                c.tokenizer,
+                Residency::Resident(Box::new(ResidentComponents {
+                    text_encoder: c.text_encoder,
+                    heavy: ZImageHeavyOwned {
+                        transformer: c.transformer,
+                        vae: c.vae,
+                        pid: c.pid,
+                    },
+                })),
+            )
+        }
+        OffloadPolicy::Sequential => {
+            // Validate precision + snapshot dir up front (fail fast, same as `Resident`); the heavy
+            // build is deferred to each generate.
+            let root = resolve_precision_and_root(spec, PRECISION_MSG, FILE_MSG)?;
+            (
+                loader::load_tokenizer(root)?,
+                Residency::Sequential(Box::new(spec.clone())),
+            )
+        }
+    };
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
-        tokenizer: c.tokenizer,
-        text_encoder: c.text_encoder,
-        transformer: c.transformer,
-        vae: c.vae,
-        pid: c.pid,
+        tokenizer,
+        residency,
     }))
 }
+
+/// The `z_image_turbo` precision-override / single-file rejection messages, shared by the `Resident`
+/// [`load_components`] call and the `Sequential` [`resolve_precision_and_root`] guard.
+const PRECISION_MSG: &str = "z_image_turbo: only dense bf16 is wired in the Rust port; the text \
+     encoder already runs f32 internally (drop the precision override)";
+const FILE_MSG: &str = "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
+     transformer/ vae/), not a single .safetensors file";
 
 /// The non-control Z-Image model components loaded from a snapshot — the shared body of the plain
 /// [`load`] and the full-model [`crate::model_base::load`] (F-090). Both build the identical set with
@@ -146,34 +222,45 @@ pub(crate) struct ZImageComponents {
     pub pid: Option<PidEngine>,
 }
 
-/// Shared non-control load body (F-090): precision guard → resolve the snapshot dir → dense load of
-/// transformer/text-encoder/VAE → whole-model Q4/Q8 → LoRA/LoKr residuals → optional PiD overlay.
-/// Byte-identical to the block the plain-Turbo and full-model loaders each open-coded; the only
-/// per-variant text (the precision override + single-file rejection messages) is passed in.
-pub(crate) fn load_components(
-    spec: &LoadSpec,
+/// Precision guard + snapshot-dir resolution (rejecting a single-file source), shared by
+/// [`load_components`] and the `Sequential` per-phase loaders (sc-10839).
+fn resolve_precision_and_root<'a>(
+    spec: &'a LoadSpec,
     precision_msg: &str,
     file_msg: &str,
-) -> Result<ZImageComponents> {
+) -> Result<&'a Path> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(precision_msg.into()));
     }
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => return Err(Error::Msg(file_msg.into())),
-    };
-    // Q4/Q8 quantizes the **whole model** in place after the dense bf16 load — the fork's
-    // `nn.quantize` over (transformer, text_encoder, vae), group_size 64, every quantizable Linear
-    // (+ the text encoder's token Embedding). This is what "quantize to Q4/Q8" means everywhere
-    // (mflux/diffusers/mlx-lm): a public consumer asking for Q4 gets the full memory saving and an
-    // output that matches the fork — not a transformer-only partial quantization (sc-2532).
-    let mut transformer = loader::load_transformer(root)?;
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(file_msg.into())),
+    }
+}
+
+/// Load the Qwen text encoder (+ optional whole-model Q4/Q8), the phase-A component dropped first
+/// under `Sequential`. Q4/Q8 is `group_size 64` over every quantizable Linear + the token Embedding
+/// (sc-2532); factored out so the `Resident` and `Sequential` paths build byte-identical encoders.
+fn load_text_encoder_only(root: &Path, quant: Option<Quant>) -> Result<TextEncoder> {
     let mut text_encoder = loader::load_text_encoder(root)?;
+    if let Some(q) = quant {
+        text_encoder.quantize(q.bits())?;
+    }
+    Ok(text_encoder)
+}
+
+/// Load the heavy render-phase components — DiT transformer (+ Q4/Q8 + LoRA/LoKr residuals), VAE
+/// (+ Q4/Q8), and the optional PiD overlay — everything but the text encoder. Factored so the
+/// `Sequential` path loads these AFTER the encoder is dropped (bounding peak to
+/// `max(text-encoder, DiT+VAE)`). Quantize-then-adapters order matches the pre-sc-10839
+/// `load_components`; the components are independent of the text encoder (separate weight files,
+/// deterministic RNG-free quant), so the `Resident` composition below is byte-identical.
+fn load_heavy(spec: &LoadSpec, root: &Path) -> Result<ZImageHeavyOwned> {
+    let mut transformer = loader::load_transformer(root)?;
     let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();
         transformer.quantize(bits)?;
-        text_encoder.quantize(bits)?;
         vae.quantize(bits)?;
     }
     // LoRA/LoKr (sc-2602): applied after quantization, as forward-time residuals over the
@@ -190,13 +277,36 @@ pub(crate) fn load_components(
         .as_ref()
         .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
         .transpose()?;
+    Ok(ZImageHeavyOwned {
+        transformer,
+        vae,
+        pid,
+    })
+}
+
+/// Shared non-control load body (F-090): precision guard → resolve the snapshot dir → dense load of
+/// text-encoder/transformer/VAE → whole-model Q4/Q8 → LoRA/LoKr residuals → optional PiD overlay.
+/// Composed (sc-10839) from the same per-phase loaders the `Sequential` residency uses, so all three
+/// consumers (plain-Turbo, full-model, ControlNet) build the identical component set. The only
+/// per-variant text (the precision override + single-file rejection messages) is passed in.
+pub(crate) fn load_components(
+    spec: &LoadSpec,
+    precision_msg: &str,
+    file_msg: &str,
+) -> Result<ZImageComponents> {
+    let root = resolve_precision_and_root(spec, precision_msg, file_msg)?;
+    // Whole-model Q4/Q8 (the fork's `nn.quantize` over transformer, text_encoder, vae — group_size
+    // 64, every quantizable Linear + the text encoder's token Embedding; sc-2532) and the LoRA/LoKr
+    // residual path live in the per-phase loaders below.
+    let text_encoder = load_text_encoder_only(root, spec.quantize)?;
+    let heavy = load_heavy(spec, root)?;
     let tokenizer = loader::load_tokenizer(root)?;
     Ok(ZImageComponents {
         tokenizer,
         text_encoder,
-        transformer,
-        vae,
-        pid,
+        transformer: heavy.transformer,
+        vae: heavy.vae,
+        pid: heavy.pid,
     })
 }
 
@@ -206,6 +316,75 @@ mlx_gen::impl_generator!(ZImageTurbo {
 });
 
 impl ZImageTurbo {
+    /// Text-encode `prompt` into `cap_feats` per the residency (epic 10834 Phase 1, sc-10839).
+    /// `Resident` borrows the warm Qwen encoder (byte-identical to the pre-sc-10839 call);
+    /// `Sequential` loads it, encodes, applies the txt2img PARITY-BF16 cast, forces materialization
+    /// (`eval`), then DROPS the encoder + `clear_cache()` so its memory frees before the DiT loads.
+    /// The bf16 cast is applied INSIDE so the `Sequential` `eval` barrier materializes the final
+    /// `cap` (not the pre-cast f32 graph) before the encoder is dropped.
+    fn encode(&self, prompt: &str, is_img2img: bool) -> Result<mlx_rs::Array> {
+        // txt2img runs the DiT in bf16 (the parity-proven path); img2img matches the fork's f32 init
+        // latents, so keep cap f32. PARITY-BF16 (sc-2609): round the text embeddings to bf16 to match
+        // the fork's golden; f32 is sharper — flip to f32 once parity is not the goal.
+        let cast = |cap: mlx_rs::Array| -> Result<mlx_rs::Array> {
+            if is_img2img {
+                Ok(cap)
+            } else {
+                Ok(cap.as_dtype(Dtype::Bfloat16)?)
+            }
+        };
+        match &self.residency {
+            Residency::Resident(c) => cast(pipeline::encode_prompt(
+                &self.tokenizer,
+                &c.text_encoder,
+                prompt,
+                MODEL_ID,
+            )?),
+            Residency::Sequential(spec) => {
+                let root = resolve_precision_and_root(spec, PRECISION_MSG, FILE_MSG)?;
+                let te = load_text_encoder_only(root, spec.quantize)?;
+                let cap = cast(pipeline::encode_prompt(
+                    &self.tokenizer,
+                    &te,
+                    prompt,
+                    MODEL_ID,
+                )?)?;
+                // MLX is lazy — materialize NOW while `te` is alive, else `cap` keeps the encoder
+                // weights referenced through the graph and the drop frees nothing (cf. Wan's
+                // `encode_text_staged`).
+                mlx_rs::transforms::eval([&cap])?;
+                drop(te);
+                mlx_rs::memory::clear_cache();
+                Ok(cap)
+            }
+        }
+    }
+
+    /// Load the heavy render components (DiT + VAE + PiD) for a `Sequential` job — after
+    /// [`Self::encode`] dropped the text encoder — or `None` under `Resident` (already held). Kept
+    /// separate from [`Self::heavy`] so the owned bundle outlives the render-body borrow.
+    fn load_seq_heavy(&self) -> Result<Option<ZImageHeavyOwned>> {
+        match &self.residency {
+            Residency::Resident(_) => Ok(None),
+            Residency::Sequential(spec) => {
+                let root = resolve_precision_and_root(spec, PRECISION_MSG, FILE_MSG)?;
+                Ok(Some(load_heavy(spec, root)?))
+            }
+        }
+    }
+
+    /// Borrow the heavy render components: the warm bundle under `Resident`, or the just-loaded
+    /// `seq_heavy` under `Sequential`. The render body is written once against this borrow.
+    fn heavy<'a>(&'a self, seq_heavy: &'a Option<ZImageHeavyOwned>) -> ZImageHeavy<'a> {
+        match (&self.residency, seq_heavy) {
+            (Residency::Resident(c), _) => c.heavy.as_ref(),
+            (_, Some(owned)) => owned.as_ref(),
+            (Residency::Sequential(_), None) => {
+                unreachable!("Sequential residency always loads seq_heavy before rendering")
+            }
+        }
+    }
+
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
@@ -227,18 +406,17 @@ impl ZImageTurbo {
         };
         let is_img2img = start_step > 0;
 
-        // Prompt → cap_feats (f32). txt2img runs the DiT in bf16 (the parity-proven path); img2img
-        // matches the fork's f32 init latents, so keep cap f32 too (so the unified stream is one
-        // dtype). The DiT promotes per-op against the bf16 weights either way.
-        let cap =
-            pipeline::encode_prompt(&self.tokenizer, &self.text_encoder, &req.prompt, MODEL_ID)?;
-        let cap = if is_img2img {
-            cap
-        } else {
-            // PARITY-BF16 (sc-2609): round the text embeddings to bf16 to match the fork's golden;
-            // f32 is more accurate (sharper). Flip to f32 for quality once parity is not the goal.
-            cap.as_dtype(Dtype::Bfloat16)?
-        };
+        // Phase A: prompt → cap_feats (epic 10834 Phase 1, sc-10839). Under `Sequential` this loads
+        // the Qwen encoder, encodes, forces materialization, then DROPS it + `clear_cache()` so its
+        // memory frees before the DiT/VAE load below — the peak-bounding win (the Qwen encoder is
+        // comparable to the DiT). Under `Resident` it borrows the warm encoder. See `Self::encode`.
+        let cap = self.encode(&req.prompt, is_img2img)?;
+
+        // Establish the heavy render components (DiT + VAE + PiD). `Resident` borrows the warm
+        // bundle; `Sequential` loads it NOW — after the encoder was dropped — and frees it when the
+        // job ends. The denoise/decode body below runs identically for both residencies.
+        let seq_heavy = self.load_seq_heavy()?;
+        let heavy = self.heavy(&seq_heavy);
 
         // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
         // seed-independent — build it once. See SCHEDULE_SHIFT. An unset `req.scheduler` keeps this
@@ -261,13 +439,8 @@ impl ZImageTurbo {
         // reads `sigmas[start_step]`, valid since `keep > start_step`). The clean path yields `(0.0,
         // len())` → full schedule, σ=0, byte-identical. `start_step` is the img2img noise-blend offset.
         let (capture_sigma, keep) = flow_capture_for_request(req, &resolved_sigmas, start_step);
-        let pid_decoder = resolve_pid_decoder_at_sigma(
-            self.pid.as_ref(),
-            req,
-            base_seed,
-            MODEL_ID,
-            capture_sigma,
-        )?;
+        let pid_decoder =
+            resolve_pid_decoder_at_sigma(heavy.pid, req, base_seed, MODEL_ID, capture_sigma)?;
         let scheduler = FlowMatchEuler::from_sigmas(resolved_sigmas[..keep].to_vec())?;
 
         // VAE-encode the init image once: the clean latents depend only on the init image + target
@@ -276,7 +449,7 @@ impl ZImageTurbo {
         let clean = if is_img2img {
             let (image, _) = reference.expect("is_img2img implies a reference");
             Some(encode_init_latents(
-                &self.vae, image, req.width, req.height,
+                heavy.vae, image, req.width, req.height,
             )?)
         } else {
             None
@@ -286,7 +459,7 @@ impl ZImageTurbo {
         // difference is the plain `denoise_with_progress` step.
         let sampler_name = req.sampler.as_deref();
         let images = pipeline::render_batch(
-            &self.vae,
+            heavy.vae,
             pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
             &scheduler,
             clean.as_ref(),
@@ -296,7 +469,7 @@ impl ZImageTurbo {
             on_progress,
             |latents, seed, op| {
                 denoise_with_progress(
-                    &self.transformer,
+                    heavy.transformer,
                     &scheduler,
                     sampler_name,
                     seed,
@@ -308,6 +481,15 @@ impl ZImageTurbo {
                 )
             },
         )?;
+        // Sequential (sc-10839): free the DiT/VAE/PiD working set now that every image is rendered,
+        // then `clear_cache()` to return the pages to the OS. `heavy` (a struct of borrows) is unused
+        // past the render, so NLL has already ended its borrow of `seq_heavy`; dropping the owned
+        // bundle frees the components before `clear_cache()`. Resident is a no-op (`seq_heavy` None).
+        let was_sequential = seq_heavy.is_some();
+        drop(seq_heavy);
+        if was_sequential {
+            mlx_rs::memory::clear_cache();
+        }
         Ok(GenerationOutput::Images(images))
     }
 }
