@@ -315,9 +315,13 @@ mod tests {
     fn training_item_ctors_set_control() {
         let img = PathBuf::from("a.png");
         let lora = TrainingItem::captioned(img.clone(), "a cat".into());
-        assert_eq!(lora.control_image_path, None, "captioned = no control (LoRA)");
+        assert_eq!(
+            lora.control_image_path, None,
+            "captioned = no control (LoRA)"
+        );
 
-        let ctrl = TrainingItem::with_control(img.clone(), "a cat".into(), PathBuf::from("a.pose.png"));
+        let ctrl =
+            TrainingItem::with_control(img.clone(), "a cat".into(), PathBuf::from("a.pose.png"));
         assert_eq!(ctrl.control_image_path, Some(PathBuf::from("a.pose.png")));
         assert_eq!(ctrl.image_path, img);
     }
