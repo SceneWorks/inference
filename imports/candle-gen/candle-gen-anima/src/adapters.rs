@@ -31,7 +31,7 @@ use candle_gen::train::merge::{
 };
 use candle_gen::{CandleError, Result};
 
-use crate::adapt::AdaptLinear;
+use crate::adapt::{AdaptLinear, LokrFactors};
 use crate::conditioner::AnimaTextConditioner;
 use crate::transformer::CosmosDiT;
 
@@ -278,10 +278,25 @@ pub fn apply_anima_adapters(
 // codes used AS-IS — no dense weight is materialized, so a q4 base keeps its q4 footprint. This is the
 // candle twin of the MLX additive branch (sc-10578) and the direct analog of `candle-gen-wan`'s
 // `install_additive` (sc-10094). Both the 448 DiT targets (packed) and the 60 conditioner targets (dense
-// bf16 — Anima packs ONLY the DiT) install uniformly through this one path. **LoKr/LoHa on a packed tier
-// is rejected**: its residual needs a materialized `[out,in]` delta (≈3.9 GB over the 448 DiT targets —
-// more memory than the bf16 tier it was meant to shrink), so the structured Kronecker residual is
-// deferred to sc-10713. On a dense tier LoKr/LoHa still fold through [`apply_anima_adapters`].
+// bf16 — Anima packs ONLY the DiT) install uniformly through this one path.
+//
+// **LoKr → structured Kronecker residual (sc-10713).** A LoKr also applies unmerged on a packed base, via
+// the Kronecker vec-trick `vec(w1·reshape(x)·w2ᵀ)` ([`LokrFactors`], the candle port of mlx-gen's
+// `Adapter::LokrStructured`): the small `[a,c]`/`[b,d]` factors are applied WITHOUT ever forming the
+// `[out,in]` delta, so a LoKr costs the same memory as a plain LoRA on any tier. The FULL
+// `(alpha/rank)·strength` scale is baked into `w2` (the structured residual carries no separate scale) —
+// distinct from the fold path's `reconstruct_lokr_delta`, which bakes only `alpha/rank` and rides
+// `strength` in the merge scale (the two-conventions trap, sc-10578). A LoKr module with no 2-D matrix
+// form (a conv/tucker factor, or a factor/base mismatch) is not deferrable and is rejected on packed
+// rather than materialized.
+//
+// **LoHa → rejected on packed (sc-10713 / sc-10678 policy call).** The Hadamard product
+// `(w1_a·w1_b) ⊙ (w2_a·w2_b)` has NO Kronecker structure and therefore no allocation-free deferred form:
+// applying it requires forming the two full `[out,in]` matrices before the elementwise multiply. On a
+// packed tier that is exactly the ≈3.9 GB memory-lie sc-10640 forbids (a q4 DiT + 448 dense deltas > the
+// bf16 tier), so a LoHa on a packed base is a hard, actionable error — never a silent materialization. No
+// official Anima LoHa exists, so nothing is user-blocked; a bespoke deferred form is unwarranted. On a
+// dense tier both LoKr and LoHa still fold through [`apply_anima_adapters`].
 
 /// A LoRA residual resolved from a file, pending attachment to a host projection: `a = downᵀ`
 /// `[in, rank]`, `b = upᵀ·(alpha/rank)` `[rank, out]` (the `alpha/rank` ratio folded into `b`, matching
@@ -292,19 +307,96 @@ struct PendingLora {
     scale: f64,
 }
 
-/// True when a file carries LoKr/LoHa factors (or is declared LoKr) — such an adapter cannot apply
-/// additively on a **packed** base (its residual needs a materialized `[out,in]` grid; the structured
-/// Kronecker residual is sc-10713), and on a dense base it belongs on the [`apply_anima_adapters`] fold
-/// path. Mirrors `candle-gen-wan::adapters::is_lokr_or_loha`.
-fn is_lokr_or_loha(af: &AdapterFile, kind: AdapterKind) -> bool {
+/// True when a file carries **LoHa** (Hadamard-product) factors (`hada_*` keys). LoHa has no
+/// `AdapterKind` variant (gen-core knows only `Lora`/`Lokr`), so it is detected by keys alone. On a
+/// packed base a LoHa is **rejected** (its Hadamard product has no allocation-free deferred form — see
+/// the module docs / sc-10713); on a dense base it folds through [`apply_anima_adapters`].
+fn is_loha(af: &AdapterFile) -> bool {
+    af.tensors
+        .keys()
+        .any(|k| k.contains(".hada_") || k.starts_with("hada_"))
+}
+
+/// True when a file carries **LoKr** (Kronecker) factors, is stamped `networkType=lokr`, or is declared
+/// `AdapterKind::Lokr`. On a packed base a LoKr installs as a **structured residual** (the vec-trick,
+/// [`resolve_lokr_file`] → [`LokrFactors`]); on a dense base it folds through [`apply_anima_adapters`].
+fn is_lokr(af: &AdapterFile, kind: AdapterKind) -> bool {
     kind == AdapterKind::Lokr
         || af.declares_lokr()
-        || af.tensors.keys().any(|k| {
-            k.contains(".lokr_")
-                || k.contains(".hada_")
-                || k.starts_with("lokr_")
-                || k.starts_with("hada_")
-        })
+        || af
+            .tensors
+            .keys()
+            .any(|k| k.contains(".lokr_") || k.starts_with("lokr_"))
+}
+
+/// A LoKr residual resolved from a file, pending attachment to a host projection as a **structured**
+/// (Kronecker vec-trick) residual. Holds the small per-module factors (full `lokr_w1`/`lokr_w2` or their
+/// low-rank `w_a`/`w_b` legs) at **f32**, plus the fully-effective `scale` (`(alpha/rank)·strength`,
+/// derived once per file — the FULL scale the structured residual bakes into `w2`, unlike the fold path's
+/// `alpha/rank`-only delta, sc-10578). The `[a,c]`/`[b,d]` [`LokrFactors`] are built at attach time, when
+/// the target projection's `[out,in]` base shape is known (so a·b==out, c·d==in can be checked without
+/// materializing anything).
+struct PendingLokr {
+    w1: Option<Tensor>,
+    w1_a: Option<Tensor>,
+    w1_b: Option<Tensor>,
+    w2: Option<Tensor>,
+    w2_a: Option<Tensor>,
+    w2_b: Option<Tensor>,
+    scale: f64,
+}
+
+/// Resolve one LoKr file's per-module factor groups into [`PendingLokr`]s at the fully-effective scale,
+/// mirroring [`merge_lokr_file`]'s `rank`/`alpha` read (`af.meta`, defaulting `rank=1`, `alpha=rank`) and
+/// factor grouping — but producing the **unmerged** small factors for the structured residual instead of
+/// a folded `[out,in]` delta. The `(alpha/rank)·strength` scale is baked here (the structured residual
+/// has no separate scale), NOT `alpha/rank` alone as the fold path does (the two-conventions trap).
+fn resolve_lokr_file(
+    af: &AdapterFile,
+    scale: f32,
+    pending: &mut BTreeMap<String, Vec<PendingLokr>>,
+    skipped_keys: &mut usize,
+) -> Result<()> {
+    let rank = af
+        .meta
+        .get("rank")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    let alpha = af
+        .meta
+        .get("alpha")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(rank);
+    // FULL effective scale — mirrors `reconstruct_lokr_delta`'s `(alpha/rank)·scale`, but baked into the
+    // structured factors rather than split across a delta (alpha/rank) + an Adapter scale (strength).
+    let full = (alpha as f64 / rank as f64) * scale as f64;
+
+    let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
+    for (key, t) in &af.tensors {
+        match classify_lokr_key(key) {
+            Some((path, factor)) => {
+                grouped.entry(path).or_default().insert(factor, t.clone());
+            }
+            None => *skipped_keys += 1,
+        }
+    }
+
+    for (path, f) in grouped {
+        // f32 factors for the vec-trick build (the merge/train dtype), matching `reconstruct_lokr_delta`.
+        let get = |k: &str| -> Result<Option<Tensor>> {
+            Ok(f.get(k).map(|t| t.to_dtype(DType::F32)).transpose()?)
+        };
+        pending.entry(path).or_default().push(PendingLokr {
+            w1: get("lokr_w1")?,
+            w1_a: get("lokr_w1_a")?,
+            w1_b: get("lokr_w1_b")?,
+            w2: get("lokr_w2")?,
+            w2_a: get("lokr_w2_a")?,
+            w2_b: get("lokr_w2_b")?,
+            scale: full,
+        });
+    }
+    Ok(())
 }
 
 /// Resolve one LoRA file's complete `(down, up[, alpha])` groups into per-path [`PendingLora`]s at
@@ -358,13 +450,18 @@ fn resolve_lora_file(
 
 /// Install `specs` as **forward-time additive residuals** on an already-built (packed) DiT + conditioner
 /// — the packed-tier path where [`apply_anima_adapters`] can't fold (sc-10640). The DiT (packed) and
-/// conditioner (dense bf16) projections are visited uniformly; each resolved LoRA target pushes a
-/// residual onto its projection, the packed codes untouched. **Strict**, exactly like the fold path: a
-/// target present in a file but absent from the host surface is a hard error naming the unrouted paths
-/// (the sc-10274 no-silent-partial guard), and a spec set that routes zero targets also hard-errors.
-/// **LoKr/LoHa on a packed tier is a hard, actionable error** (sc-10713). Returns the [`MergeReport`]
-/// (`report.merged` = the residual-installed target count: 508 for the turbo LoRA, 448 for a DiT-only
-/// style LoRA).
+/// conditioner (dense bf16) projections are visited uniformly; each resolved target pushes a residual
+/// onto its projection, the packed codes untouched. **Strict**, exactly like the fold path: a target
+/// present in a file but absent from the host surface is a hard error naming the unrouted paths (the
+/// sc-10274 no-silent-partial guard), and a spec set that routes zero targets also hard-errors.
+///
+/// **LoRA** installs as `scale·((x·A)·B)` ([`AdaptLinear::push_lora`]). **LoKr** installs as a
+/// **structured Kronecker residual** ([`AdaptLinear::push_lokr_structured`], sc-10713) — the vec-trick,
+/// no `[out,in]` materialized; a LoKr module with no deferrable 2-D form on a packed base is a hard,
+/// actionable error rather than a silent materialization. **LoHa** on a packed base is a hard, actionable
+/// error (its Hadamard product has no allocation-free form — see the module docs). Returns the
+/// [`MergeReport`] (`report.merged` = the residual-installed target count: 508 for the turbo LoRA, 448
+/// for a DiT-only style LoRA).
 pub fn install_anima_residuals(
     dit: &mut CosmosDiT,
     conditioner: &mut AnimaTextConditioner,
@@ -373,36 +470,48 @@ pub fn install_anima_residuals(
     // The factors are read on the CPU; the base weight lives on the DiT's device (CUDA on a packed
     // tier), so they are moved onto it during the attach — else the residual matmul is a device mismatch.
     let device = dit.device().clone();
-    let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+    let mut pending_lora: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+    let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
     let mut report = MergeReport::default();
     for spec in specs {
         let af = read_adapter(&spec.path)?;
-        if is_lokr_or_loha(&af, spec.kind) {
+        // LoHa (Hadamard) has no allocation-free structured form — reject on the packed tier (never a
+        // silent materialization of the ~3.9 GB per-target delta the packed path exists to avoid).
+        if is_loha(&af) {
             return Err(CandleError::Msg(format!(
-                "anima: a LoKr/LoHa adapter cannot apply on a quantized (packed q4/q8) Anima tier — its \
-                 residual would materialize a full [out,in] delta (≈3.9 GB over the 448 DiT targets, \
-                 more than the bf16 tier). Use the dense (bf16) tier, where it folds into the weight, or \
-                 a plain LoRA, which applies additively on any tier. The structured Kronecker residual \
-                 is tracked in sc-10713. Offending file: {}",
+                "anima: a LoHa adapter cannot apply on a quantized (packed q4/q8) Anima tier — its \
+                 Hadamard product (w1_a·w1_b) ⊙ (w2_a·w2_b) has no allocation-free structured form (unlike \
+                 LoKr's Kronecker vec-trick), so it would have to materialize a full [out,in] delta per \
+                 target (≈3.9 GB over the 448 DiT targets, more than the bf16 tier it was meant to shrink). \
+                 Use the dense (bf16) tier, where it folds into the weight, or a plain LoRA/LoKr, which \
+                 applies additively on any tier. sc-10713. Offending file: {}",
                 spec.path.display()
             )));
         }
-        resolve_lora_file(&af, spec.scale, &mut pending, &mut report.skipped_keys)?;
+        if is_lokr(&af, spec.kind) {
+            resolve_lokr_file(&af, spec.scale, &mut pending_lokr, &mut report.skipped_keys)?;
+        } else {
+            resolve_lora_file(&af, spec.scale, &mut pending_lora, &mut report.skipped_keys)?;
+        }
     }
 
     // Attach: walk the DiT + conditioner once, pushing any resolved residual for each projection's path.
-    // A factor whose dims don't match the target projection is surfaced as a skipped key, never a
-    // crashing forward (the additive analog of the fold path's `merge_into` shape guard).
+    // A LoRA factor whose dims don't match the target projection is surfaced as a skipped key, never a
+    // crashing forward (the additive analog of the fold path's `merge_into` shape guard). A LoKr that
+    // does not decompose the target's `[out,in]` via the vec-trick (a conv/tucker or shape-mismatched
+    // LoKr) is a HARD error on the packed tier — it has no allocation-free form, and materializing it
+    // would defeat the packed tier (sc-10713), so it must not be silently dropped or force a dense delta.
     let mut matched: HashSet<String> = HashSet::new();
     {
-        let pending = &pending;
+        let pending_lora = &pending_lora;
+        let pending_lokr = &pending_lokr;
         let matched = &mut matched;
         let report = &mut report;
         let device = &device;
         let mut visit = |path: &str, lin: &mut AdaptLinear| -> Result<()> {
-            if let Some(list) = pending.get(path) {
+            let (out_f, in_f) = lin.base_shape();
+            if let Some(list) = pending_lora.get(path) {
                 matched.insert(path.to_string());
-                let (out_f, in_f) = lin.base_shape();
                 for p in list {
                     if p.a.dims()[0] != in_f || p.b.dims()[1] != out_f {
                         report.skipped_keys += 1; // shape-mismatched factor for this projection
@@ -410,6 +519,39 @@ pub fn install_anima_residuals(
                     }
                     lin.push_lora(p.a.to_device(device)?, p.b.to_device(device)?, p.scale);
                     report.merged += 1;
+                }
+            }
+            if let Some(list) = pending_lokr.get(path) {
+                matched.insert(path.to_string());
+                for p in list {
+                    // Build the small `[a,c]`/`[b,d]` Kronecker factors against the now-known base shape —
+                    // never the `[out,in]` delta. `None` ⇒ not deferrable on packed ⇒ hard reject.
+                    match LokrFactors::build(
+                        p.scale,
+                        (out_f, in_f),
+                        p.w1.as_ref(),
+                        p.w1_a.as_ref(),
+                        p.w1_b.as_ref(),
+                        p.w2.as_ref(),
+                        None, // peft LoKr never carries a tucker `lokr_t2` (lycoris conv-only).
+                        p.w2_a.as_ref(),
+                        p.w2_b.as_ref(),
+                    )? {
+                        Some(f) => {
+                            lin.push_lokr_structured(f.to_device(device)?);
+                            report.merged += 1;
+                        }
+                        None => {
+                            return Err(CandleError::Msg(format!(
+                                "anima: a LoKr target ({path}) has no allocation-free structured form on a \
+                                 quantized (packed q4/q8) tier — its factors do not decompose the \
+                                 [out,in]=[{out_f},{in_f}] base via the Kronecker vec-trick (a conv/tucker \
+                                 or shape-mismatched LoKr). Materializing the full [out,in] delta would \
+                                 defeat the packed tier (the ≈3.9 GB memory-lie sc-10640 forbids). Use the \
+                                 dense (bf16) tier, where it folds, or a plain LoRA. sc-10713."
+                            )));
+                        }
+                    }
                 }
             }
             Ok(())
@@ -420,13 +562,15 @@ pub fn install_anima_residuals(
 
     // Strict: a resolved target absent from the host surface is a hard error (no silent partial residual
     // — sc-10274), and a spec set that routes nothing is a misconfiguration.
-    let mut unrouted: Vec<String> = pending
+    let mut unrouted: Vec<String> = pending_lora
         .keys()
+        .chain(pending_lokr.keys())
         .filter(|p| !matched.contains(*p))
         .cloned()
         .collect();
+    unrouted.sort();
+    unrouted.dedup();
     if !unrouted.is_empty() {
-        unrouted.sort();
         return Err(CandleError::Msg(format!(
             "anima: {} adapter target(s) did not route to a DiT/conditioner projection (no silent \
              partial residual — sc-10274). First unrouted: {}",
@@ -666,16 +810,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `is_lokr_or_loha` fires on LoKr factor keys, LoHa (`hada_`) factor keys, and a declared `Lokr`
-    /// kind — and passes a plain LoRA (so a LoRA still reaches the additive residual path on a packed
-    /// tier, while a LoKr/LoHa is rejected there — sc-10713).
+    /// `is_lokr` fires on `lokr_` factor keys and a declared `Lokr` kind (→ structured residual path);
+    /// `is_loha` fires on `hada_` keys (→ reject-on-packed); a plain LoRA is neither (→ LoRA residual
+    /// path). The three kinds are routed disjointly in `install_anima_residuals` (sc-10713).
     #[test]
-    fn is_lokr_or_loha_detects_lokr_loha_and_passes_lora() {
+    fn is_lokr_and_is_loha_route_the_three_adapter_kinds() {
         let dir = std::env::temp_dir().join(format!("anima_islokr_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // A LoKr file (`lokr_` keys) → true even when the spec kind is Lora (keys win).
+        // A LoKr file (`lokr_` keys) → `is_lokr` true even when the spec kind is Lora (keys win); not LoHa.
         let mut lm = HashMap::new();
         lm.insert(
             "diffusion_model.blocks.0.self_attn.q_proj.lokr_w1".to_string(),
@@ -684,12 +828,10 @@ mod tests {
         let lokr_path = dir.join("lokr.safetensors");
         candle_gen::candle_core::safetensors::save(&lm, &lokr_path).unwrap();
         let lokr_af = read_adapter(&lokr_path).unwrap();
-        assert!(
-            is_lokr_or_loha(&lokr_af, AdapterKind::Lora),
-            "lokr_ keys ⇒ true"
-        );
+        assert!(is_lokr(&lokr_af, AdapterKind::Lora), "lokr_ keys ⇒ is_lokr");
+        assert!(!is_loha(&lokr_af), "lokr_ keys ⇒ not is_loha");
 
-        // A LoHa file (`hada_` keys) → true.
+        // A LoHa file (`hada_` keys) → `is_loha` true; not LoKr.
         let mut hm = HashMap::new();
         hm.insert(
             "diffusion_model.blocks.0.self_attn.q_proj.hada_w1_a".to_string(),
@@ -698,25 +840,58 @@ mod tests {
         let loha_path = dir.join("loha.safetensors");
         candle_gen::candle_core::safetensors::save(&hm, &loha_path).unwrap();
         let loha_af = read_adapter(&loha_path).unwrap();
+        assert!(is_loha(&loha_af), "hada_ keys ⇒ is_loha");
         assert!(
-            is_lokr_or_loha(&loha_af, AdapterKind::Lora),
-            "hada_ keys ⇒ true"
+            !is_lokr(&loha_af, AdapterKind::Lora),
+            "hada_ keys ⇒ not is_lokr"
         );
 
-        // A plain LoRA (`lora_A`/`lora_B`) → false, so it reaches the additive residual path; but a
-        // declared `Lokr` kind → true regardless of keys.
+        // A plain LoRA (`lora_A`/`lora_B`) → neither (reaches the LoRA residual path); but a declared
+        // `Lokr` kind → `is_lokr` regardless of keys.
         let lora_path = write_lora(&dir, &["blocks.0.self_attn.q_proj"], 8, 6, 2);
         let lora_af = read_adapter(&lora_path).unwrap();
         assert!(
-            !is_lokr_or_loha(&lora_af, AdapterKind::Lora),
-            "plain LoRA ⇒ false"
+            !is_lokr(&lora_af, AdapterKind::Lora) && !is_loha(&lora_af),
+            "plain LoRA ⇒ neither"
         );
         assert!(
-            is_lokr_or_loha(&lora_af, AdapterKind::Lokr),
-            "declared Lokr kind ⇒ true"
+            is_lokr(&lora_af, AdapterKind::Lokr),
+            "declared Lokr kind ⇒ is_lokr"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `resolve_lokr_file` groups a file's per-module factors and bakes the FULL `(alpha/rank)·strength`
+    /// scale (the structured-residual convention, sc-10578) — not `alpha/rank` alone as the fold path
+    /// does. Metadata `rank=2, alpha=8` + strength 0.5 ⇒ `full = (8/2)·0.5 = 2.0`. Constructs the
+    /// `AdapterFile` directly (its `meta` is the header `__metadata__` the reader would surface).
+    #[test]
+    fn resolve_lokr_file_bakes_full_alpha_rank_strength_scale() {
+        let path = "blocks.0.self_attn.q_proj";
+        let tensors = HashMap::from([
+            (format!("diffusion_model.{path}.lokr_w1"), rand_t(2, 3, 11)),
+            (format!("diffusion_model.{path}.lokr_w2"), rand_t(4, 2, 12)),
+        ]);
+        let meta = HashMap::from([
+            ("rank".to_string(), "2".to_string()),
+            ("alpha".to_string(), "8".to_string()),
+        ]);
+        let af = AdapterFile { tensors, meta };
+
+        let mut pending: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
+        let mut skipped = 0usize;
+        resolve_lokr_file(&af, 0.5, &mut pending, &mut skipped).unwrap();
+        let list = pending.get(path).expect("the LoKr target must resolve");
+        assert_eq!(list.len(), 1);
+        // full = (alpha/rank)·strength = (8/2)·0.5 = 2.0. Dropping the `·strength` term (a real
+        // two-conventions bug) would make this 4.0 — a non-vacuous check.
+        assert!(
+            (list[0].scale - 2.0).abs() < 1e-9,
+            "full scale must be (alpha/rank)·strength = 2.0, got {}",
+            list[0].scale
+        );
+        assert!(list[0].w1.is_some() && list[0].w2.is_some());
     }
 
     /// `resolve_lora_file` produces the **unmerged** factors the additive residual needs: `a = downᵀ`
