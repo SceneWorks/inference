@@ -10,14 +10,23 @@
 //!   2. the opt-in path is genuinely **fp32** end-to-end (`from_weights_dtype(.., Float32)` with fp32
 //!      weights → `compute_dtype() == Float32`, forward output **Float32** with no bf16 anywhere);
 //!   3. the two are the SAME computation at different weight precision (they agree within a loose
-//!      bound) — i.e. fp32 is not a divergent code path, it is the reference-precision variant.
+//!      bound) — i.e. fp32 is not a divergent code path, it is the reference-precision variant;
+//!   4. the fp32 opt-in genuinely uses fp32 **weights**, not merely fp32-typed activations: at equal
+//!      (fp32) compute, the fp32-weight tower diverges from a bf16-weight tower by MORE than bf16
+//!      rounding. This is the failure-capable half of guard 2 — the `output == Float32` assertion
+//!      alone is confounded (see NOTE: the f32 RoPE tables promote a bf16-weight tower's output to f32
+//!      too), so on its own it would still pass if `forward` ignored `compute_dtype` and silently kept
+//!      bf16 weights. Guard 4 pins the property down: if the fp32 path collapsed to bf16 weights the
+//!      two towers would be the SAME fp32 computation → bit-identical output → rel-L2 == 0 → RED.
 //!
 //! NOTE on dtypes: the shared text RoPE tables (`TextRope::forward`) are f32, and MLX promotes mixed
 //! bf16×f32 ops — so the bf16 tower's INTERNAL activations (and hence its output dtype) promote to f32
 //! even though its WEIGHTS are bf16. The bf16-vs-fp32 distinction this story isolates is therefore the
 //! weight PRECISION (bf16 on disk vs the reference's fp32 upcast), which is exactly what the fp32-TE
-//! variant changes. So these guards assert `compute_dtype()` + the fp32 output dtype, not the
-//! promotion-dependent bf16 output dtype.
+//! variant changes. So these guards assert `compute_dtype()`, the fp32 output dtype, AND — because that
+//! output-dtype check is confounded by the same promotion — a weight-PRECISION discriminator (guard 4)
+//! that a bf16-weight tower could not pass; they do NOT assert the promotion-dependent bf16 output
+//! dtype.
 
 use mlx_rs::{Array, Dtype};
 
@@ -299,6 +308,33 @@ fn qwen3_tower_default_is_bf16_and_fp32_opt_in_is_fp32() {
         r < 1.5e-1,
         "bf16 and fp32 towers must be the same computation (rel-L2 {r:.3e})"
     );
+
+    // Guard 4 — the DISCRIMINATING guard for "fp32 variant uses fp32 WEIGHTS". The
+    // `out_fp32.dtype() == Float32` check above is necessary but NOT sufficient: the shared f32 RoPE
+    // tables promote activations to f32, so a bf16-weight tower's output is Float32 too — that check
+    // would still pass if `forward` ignored `compute_dtype` and kept bf16 weights. Build a reference
+    // tower with the SAME fp32 compute but bf16-ROUNDED weights (the ONLY difference from `te_fp32` is
+    // weight precision) and require the outputs to diverge by more than bf16 rounding. If the fp32
+    // path silently used bf16 weights, the two towers would be one bit-identical fp32 computation
+    // (rel-L2 == 0) and this assertion goes RED.
+    let te_bf16_weights = AnimaQwen3::from_weights_dtype(
+        &tiny_qwen3_weights(&cfg, Dtype::Bfloat16),
+        "model",
+        &cfg,
+        Dtype::Float32,
+    )
+    .unwrap();
+    let out_bf16_weights = te_bf16_weights.forward(&ids, &mask).unwrap();
+    let r_weight = rel_l2(&flat_f64(&out_fp32), &flat_f64(&out_bf16_weights));
+    println!(
+        "[encode_dtype] qwen3 fp32-weight vs bf16-weight (both fp32 compute) rel-L2 = {r_weight:.3e}"
+    );
+    assert!(
+        r_weight > 5e-4,
+        "fp32 variant must genuinely use fp32 WEIGHTS: at equal (fp32) compute the fp32-weight and \
+         bf16-weight towers must differ by more than bf16 rounding (rel-L2 {r_weight:.3e}); a value \
+         near 0 means the fp32 path collapsed to bf16 weights"
+    );
 }
 
 #[test]
@@ -350,5 +386,23 @@ fn conditioner_honors_dtype_arg_bf16_and_fp32() {
     assert!(
         r < 1.5e-1,
         "conditioner bf16 and fp32 must be the same computation (rel-L2 {r:.3e})"
+    );
+
+    // Guard 4 — the DISCRIMINATING guard for "fp32 variant uses fp32 WEIGHTS" (see the qwen3 tower
+    // test). Re-run the bf16-WEIGHTS conditioner at fp32 compute (fp32 source + `Float32` dtype) so
+    // the ONLY difference from `cond_fp32` is weight precision, and require the outputs to genuinely
+    // diverge. If the fp32 path silently used bf16 weights, both would be one bit-identical fp32
+    // computation (rel-L2 == 0) and this assertion goes RED.
+    let out_bf16_weights = cond_bf16
+        .forward(&source_fp32, &target, Dtype::Float32)
+        .unwrap();
+    let r_weight = rel_l2(&flat_f64(&out_fp32), &flat_f64(&out_bf16_weights));
+    println!(
+        "[encode_dtype] conditioner fp32-weight vs bf16-weight (both fp32 compute) rel-L2 = {r_weight:.3e}"
+    );
+    assert!(
+        r_weight > 5e-4,
+        "fp32 conditioner must genuinely use fp32 WEIGHTS: at equal (fp32) compute the fp32-weight \
+         and bf16-weight outputs must differ by more than bf16 rounding (rel-L2 {r_weight:.3e})"
     );
 }
