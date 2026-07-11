@@ -21,6 +21,10 @@
 
 pub mod adapters;
 pub mod candle_tier_build;
+// ComfyUI single-file Wan2.2 expert → in-memory remap+dequant seam (epic 10451 Phase 2c, sc-10671):
+// scaled-fp8 dequant (`w = w_fp8·scale_weight`) + native-Wan → diffusers key remap, so a user's existing
+// ComfyUI Wan base experts load in place via `VarBuilder::from_tensors`. Entry: `load_from_comfyui_experts`.
+mod comfyui;
 pub mod config;
 pub mod conv3d;
 pub mod dit_train;
