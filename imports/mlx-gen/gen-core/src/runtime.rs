@@ -53,6 +53,23 @@ pub enum Precision {
     Fp32,
 }
 
+/// Component-residency strategy for a load (epic 10765 Phase 1, sc-10769/sc-10821). The default keeps
+/// every model component resident for the whole generation (fast, cross-request cached). `Sequential`
+/// asks a provider that supports it to load→use→DROP each heavy component in phase order (text encoder →
+/// transformer/UNet → VAE) so peak VRAM is bounded to the largest single working set instead of the sum,
+/// letting a small card run a model that would OOM resident — at the cost of the cross-request weight
+/// cache. Advisory, never an error: a provider that has not wired it treats `Sequential` as `Resident`.
+/// The candle FLUX provider honors it today; the rest ignore it until wired.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OffloadPolicy {
+    /// All components co-resident for the whole generation (today's behavior). Fast; keeps the cache.
+    #[default]
+    Resident,
+    /// Load→use→drop each heavy component in phase order to minimize peak VRAM. Advisory: a provider
+    /// that has not wired it falls back to `Resident`.
+    Sequential,
+}
+
 /// How to load a model. `weights` is required; everything else defaults to dense bf16. The
 /// device is the process-default Metal GPU — the crate runs single-device (the MLX default
 /// device is not thread-safe; the worker serializes jobs per thread).
@@ -106,6 +123,12 @@ pub struct LoadSpec {
     /// (`LTX_GEMMA_DIR`, else `<root>/text_encoder`). Backend-neutral (just a path), so a caller can
     /// drive the TE location through the spec instead of a process-global env var.
     pub text_encoder: Option<WeightsSource>,
+    /// Component-residency strategy (epic 10765, sc-10821). [`OffloadPolicy::Resident`] (default) keeps
+    /// every component resident for the whole generation; [`OffloadPolicy::Sequential`] asks a supporting
+    /// provider to load→use→drop each heavy component after its phase so peak VRAM is the largest single
+    /// working set, not the sum. Advisory — providers that have not wired it (everything except the
+    /// candle FLUX lane today) ignore it. Backend-neutral.
+    pub offload_policy: OffloadPolicy,
 }
 
 /// Where the optional PiD decoder's weights come from (epic 7840). A PiD decoder is tied to a
@@ -152,12 +175,21 @@ impl LoadSpec {
             pid: None,
             identity: None,
             text_encoder: None,
+            offload_policy: OffloadPolicy::Resident,
         }
     }
 
     /// Builder-style quantization override.
     pub fn with_quant(mut self, quant: Quant) -> Self {
         self.quantize = Some(quant);
+        self
+    }
+
+    /// Builder-style component-residency override (epic 10765, sc-10821). [`OffloadPolicy::Sequential`]
+    /// asks a supporting provider (the candle FLUX lane today) to load→use→drop each heavy component to
+    /// cap peak VRAM; the default [`OffloadPolicy::Resident`] keeps everything co-resident.
+    pub fn with_offload_policy(mut self, offload_policy: OffloadPolicy) -> Self {
+        self.offload_policy = offload_policy;
         self
     }
 
