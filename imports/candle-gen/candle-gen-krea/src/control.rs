@@ -724,10 +724,13 @@ pub fn control_loss_grads(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testfix::{tiny_batch, tiny_dit, tiny_dit_layers};
+    use crate::testfix::{
+        randn_seeded, tiny_batch, tiny_batch_seeded, tiny_dit, tiny_dit_layers, tiny_dit_seeded,
+    };
     use candle_gen::candle_core::Device;
     use candle_gen::train::flow_match::velocity_loss;
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
+    use rand::{rngs::StdRng, SeedableRng};
 
     fn nudge_vars(branch: &ControlBranch, dev: &Device) {
         for v in branch.vars() {
@@ -786,14 +789,30 @@ mod tests {
     #[test]
     fn backward_reaches_branch_and_descends() {
         let dev = Device::Cpu;
-        let (dit, c, path) = tiny_dit();
+        // Draw the ENTIRE fixture — base DiT weights, branch nudge, probe batch, control latent —
+        // from one seeded `StdRng`, for the same reason as `control_train::control_trainer_descends`
+        // (sc-10794): candle's CPU `randn` is unseedable (it pulls the process-global `rand::rng()`),
+        // so before this every draw was nondeterministic and a marginal 6-step descent could flip
+        // sign on an unlucky init (or on ubuntu's float reassociation vs macos), red-failing CI. A
+        // distinct fixed seed makes the loss trajectory reproducible run-to-run and platform-to-
+        // platform; the larger step budget then buys an unambiguous drop (see the relative-floor
+        // assert below). Seed is 10794-adjacent but distinct from the sibling tests so they don't
+        // share a trajectory.
+        let mut rng = StdRng::seed_from_u64(10795);
+        let (dit, c, path) = tiny_dit_seeded(&mut rng);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
-        nudge_vars(&branch, &dev);
+        // Seeded twin of `nudge_vars`: nudge off the zero-init identity so there's a signal to
+        // descend, but through the seeded rng so the nudge is reproducible too (leaving the shared
+        // unseeded `nudge_vars` untouched for the structural/identity tests that don't need a seed).
+        for v in branch.vars() {
+            v.set(&randn_seeded(&mut rng, 0.0, 0.02, v.as_tensor().dims()))
+                .unwrap();
+        }
         let vars = branch.vars();
 
-        let (x0, cap, noise) = tiny_batch(&c);
-        let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+        let (x0, cap, noise) = tiny_batch_seeded(&c, &mut rng);
+        let ctrl = randn_seeded(&mut rng, 0.0, 1.0, x0.dims());
         let ctxt = cap.unsqueeze(0).unwrap();
         let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
         let x_t = ((&x0 * 0.5).unwrap() + (&noise * 0.5).unwrap()).unwrap();
@@ -825,16 +844,23 @@ mod tests {
 
         let mut opt = TrainOptimizer::from_config("adamw", vars.clone(), 1e-2, 0.0).unwrap();
         let mut grads = grads;
-        for _ in 0..6 {
+        for _ in 0..60 {
             clip_grad_norm(&mut grads, &vars, 1.0).unwrap();
             opt.step(&grads).unwrap();
             let (_l, g) = loss_of(());
             grads = g;
         }
         let (loss1, _) = loss_of(());
+        // A correctly working branch descends the fixed-batch loss by a wide margin over these 60
+        // AdamW steps. Assert a >=10% relative drop rather than a bare `loss1 < loss0`: the 0.90 bar
+        // sits far clear of the real ratio, so cross-platform float reassociation (the ubuntu-vs-macos
+        // delta that flaked the sibling `control_trainer_descends`) cannot lift it over the bar, while
+        // a branch that stopped learning (ratio ~1.0) still fails hard. This stays a genuine descent
+        // gate, not a `<= before + epsilon` no-op.
         assert!(
-            loss1 < loss0,
-            "AdamW steps on a fixed batch should lower the loss: {loss0} -> {loss1}"
+            loss1 < loss0 * 0.9,
+            "AdamW steps on a fixed batch should lower the loss by >=10%: {loss0} -> {loss1} (ratio {})",
+            loss1 / loss0
         );
         let _ = std::fs::remove_file(path);
     }
