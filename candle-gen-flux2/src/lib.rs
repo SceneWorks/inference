@@ -64,10 +64,10 @@ use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
+    ModelDescriptor, OffloadPolicy, PidWeights, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
-use candle_gen_pid::PidEngine;
+use candle_gen_pid::{PidDecoder, PidEngine};
 
 use config::{Flux2Config, Flux2Variant, SIZE_MULTIPLE};
 use text_encoder::Flux2PromptEncoder;
@@ -201,6 +201,30 @@ impl Pipeline {
         self.load_quantizable(
             |cfg, vb| Ok(Flux2PromptEncoder::new(cfg, vb)?),
             |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
+        )
+    }
+
+    /// Load ONLY the text encoder for the sequential-residency path (epic 10765 Phase 1c, sc-10868) —
+    /// dropped right after the prompt encode so the decoder-LM TE (Mistral 24B on dev, Qwen3 on klein)
+    /// frees before the DiT loads. Same per-tier routing (packed / dense+quant / dense) as the paired
+    /// [`load_te_and_dit`](Self::load_te_and_dit) TE half; the DiT half is loaded separately (and later)
+    /// via [`load_dit_seq`](Self::load_dit_seq).
+    pub(crate) fn load_te_seq(&self) -> CResult<Flux2PromptEncoder> {
+        self.load_one_quantizable(
+            "text_encoder",
+            |vb| Ok(Flux2PromptEncoder::new(&self.cfg, vb)?),
+            |m, q, d| Ok(m.quantize(q, d)?),
+        )
+    }
+
+    /// Load ONLY the DiT for the sequential path (sc-10868) — loaded after the text encoder was dropped,
+    /// so it reuses the TE's freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE). Same per-tier
+    /// routing as the paired [`load_te_and_dit`](Self::load_te_and_dit) DiT half.
+    pub(crate) fn load_dit_seq(&self) -> CResult<Flux2Transformer> {
+        self.load_one_quantizable(
+            "transformer",
+            |vb| Ok(Flux2Transformer::new(&self.cfg, vb)?),
+            |m, q, d| Ok(m.quantize(q, d)?),
         )
     }
 
@@ -338,21 +362,79 @@ impl Pipeline {
             .unwrap_or(self.variant.default_steps() as usize);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
-        let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         // Prompt embeds are seed-independent: encode once.
         let prompt_embeds = self.encode(&comps.te, &comps.tokenizer, &req.prompt)?;
         // Two guidance regimes. dev is guidance-distilled: a single forward feeds the guidance scalar
         // to the DiT's embedded-guidance embedder (no negative pass). klein is distilled / true-CFG:
         // a classifier-free negative pass only when guidance > 1 (it runs CFG-free at 1.0).
-        let embedded_guidance = self.variant.uses_embedded_guidance();
-        let negative = if !embedded_guidance && guidance > 1.0 {
-            let neg = req.negative_prompt.as_deref().unwrap_or(" ");
-            Some(self.encode(&comps.te, &comps.tokenizer, neg)?)
-        } else {
-            None
-        };
+        let negative = self.encode_negative(&comps.te, &comps.tokenizer, req, guidance)?;
 
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native Flux2Vae decode. Shared across `count` images (same prompt).
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            comps.pid.as_deref(),
+            req,
+            base_seed,
+            self.variant.id(),
+        )?;
+
+        self.sample(
+            req,
+            &comps.transformer,
+            &comps.vae,
+            &prompt_embeds,
+            negative.as_ref(),
+            pid_decoder.as_ref(),
+            guidance,
+            steps,
+            base_seed,
+            on_progress,
+        )
+    }
+
+    /// Encode the optional classifier-free **negative** prompt for the klein CFG blend: `Some` only on a
+    /// non-embedded-guidance variant with `guidance > 1` (klein runs CFG-free at 1.0; dev is embedded-
+    /// guidance, single-forward, so always `None`). Takes the TE + tokenizer directly so both the
+    /// resident [`render`] (cached components) and the sequential [`render_sequential`] (a just-loaded,
+    /// about-to-be-dropped TE) share the exact CFG condition — the conditioning stays byte-identical.
+    fn encode_negative(
+        &self,
+        te: &Flux2PromptEncoder,
+        tok: &TextTokenizer,
+        req: &GenerationRequest,
+        guidance: f32,
+    ) -> CResult<Option<Tensor>> {
+        if !self.variant.uses_embedded_guidance() && guidance > 1.0 {
+            let neg = req.negative_prompt.as_deref().unwrap_or(" ");
+            Ok(Some(self.encode(te, tok, neg)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The per-image denoise + decode loop shared by the resident [`render`] and the sequential
+    /// [`render_sequential`] (epic 10765 Phase 1c, sc-10868). Given the already-encoded `prompt_embeds`
+    /// (+ optional klein CFG `negative`), a borrowed DiT + VAE, and the resolved PiD seam, the sampled
+    /// output is **byte-identical** across both residency modes — only the load/free schedule of the
+    /// components handed in differs.
+    #[allow(clippy::too_many_arguments)]
+    fn sample(
+        &self,
+        req: &GenerationRequest,
+        transformer: &Flux2Transformer,
+        vae: &Flux2Vae,
+        prompt_embeds: &Tensor,
+        negative: Option<&Tensor>,
+        pid_decoder: Option<&PidDecoder>,
+        guidance: f32,
+        steps: usize,
+        base_seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<Vec<Image>> {
+        let embedded_guidance = self.variant.uses_embedded_guidance();
+        let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
         let img_ids = pipeline::prepare_grid_ids(lat_h, lat_w);
         let txt_ids = pipeline::prepare_text_ids(self.cfg.max_sequence_length);
 
@@ -365,16 +447,6 @@ impl Pipeline {
         let native = pipeline::schedule(steps, req.width, req.height);
         let sigmas =
             candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
-
-        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
-        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
-        // else `None` → the native Flux2Vae decode. Shared across `count` images (same prompt).
-        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-            comps.pid.as_deref(),
-            req,
-            base_seed,
-            self.variant.id(),
-        )?;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let latents =
@@ -395,27 +467,26 @@ impl Pipeline {
                     let ts = sigma * 1000.0;
                     let out = if embedded_guidance {
                         // dev: single forward feeding the embedded guidance scalar to the DiT.
-                        comps.transformer.forward(
+                        transformer.forward(
                             latents,
-                            &prompt_embeds,
+                            prompt_embeds,
                             &img_ids,
                             &txt_ids,
                             ts,
                             Some(guidance),
                         )?
                     } else {
-                        let v = comps.transformer.forward(
+                        let v = transformer.forward(
                             latents,
-                            &prompt_embeds,
+                            prompt_embeds,
                             &img_ids,
                             &txt_ids,
                             ts,
                             None,
                         )?;
-                        match &negative {
+                        match negative {
                             Some(neg) => {
-                                let vn = comps
-                                    .transformer
+                                let vn = transformer
                                     .forward(latents, neg, &img_ids, &txt_ids, ts, None)?;
                                 // vn + guidance·(v − vn)
                                 (&vn + ((&v - &vn)? * guidance as f64)?)?
@@ -429,15 +500,88 @@ impl Pipeline {
 
             on_progress(Progress::Decoding);
             let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
-            let decoded = match &pid_decoder {
+            let decoded = match pid_decoder {
                 // PiD consumes the packed BN-normalized [1,128,H/16,W/16] latent directly (the same
                 // tensor decode_packed BN-de-normalizes); returns [1,3,4H,4W].
                 Some(pid) => pid.decode(&packed)?,
-                None => comps.vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
+                None => vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
             };
             to_image(&decoded)
         })
     }
+
+    /// Sequential-residency render (epic 10765 Phase 1c, sc-10868): load the text encoder → encode the
+    /// prompt(s) → DROP it → load the DiT + VAE → denoise/decode. Peak VRAM is bounded to the DiT+VAE
+    /// working set instead of TE+DiT+VAE (reclaiming the decoder-LM TE — the largest such win off-Mac on
+    /// the 32B **dev**, where the Mistral TE is multiple GB), so a card that OOMs the resident path can
+    /// still render. Output is **bit-identical** to [`render`](Self::render) — the SAME encode ([`encode`]
+    /// / [`encode_negative`]), the shared [`sample`](Self::sample) denoise+decode loop; only the load/free
+    /// schedule differs.
+    ///
+    /// Selected by the generator when [`sequential_offload_enabled`] (`CANDLE_GEN_OFFLOAD=sequential`) or
+    /// `LoadSpec::offload_policy == Sequential` (the worker fit-gate sets it). Because it drops components,
+    /// it does NOT populate the generator's `Components` cache — repeat requests reload from the (page-
+    /// cached) snapshot; that reload cost is the deliberate trade for the lower peak, which is why it is
+    /// opt-in per the fit-gate rather than the default.
+    fn render_sequential(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<Vec<Image>> {
+        let steps = req
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or(self.variant.default_steps() as usize);
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+
+        // Phase 1 — load ONLY the text encoder (+ its cheap tokenizer), encode the prompt (+ the klein
+        // CFG negative), then DROP both (scoped) so the decoder-LM TE frees before the DiT loads. The
+        // encode delegates to the SAME `encode`/`encode_negative` the resident path uses, so the
+        // conditioning tensors are byte-identical to `render`.
+        let (prompt_embeds, negative) = {
+            let te = self.load_te_seq()?;
+            let tokenizer = self.build_tokenizer()?;
+            let prompt_embeds = self.encode(&te, &tokenizer, &req.prompt)?;
+            let negative = self.encode_negative(&te, &tokenizer, req, guidance)?;
+            (prompt_embeds, negative)
+        };
+
+        // Phase 2 — load the DiT (reusing the TE's freed pool) + the VAE + the optional PiD decoder.
+        let transformer = self.load_dit_seq()?;
+        let vae = Flux2Vae::new(self.component_vb("vae")?)?;
+        let pid = match self.pid_spec.as_ref() {
+            Some(spec) => Some(PidEngine::from_spec(spec, PID_BACKBONE, &self.device)?),
+            None => None,
+        };
+        let pid_decoder =
+            candle_gen_pid::resolve_pid_decoder(pid.as_ref(), req, base_seed, self.variant.id())?;
+
+        // Phase 3 — per-image denoise + decode, identical to `render`'s loop.
+        self.sample(
+            req,
+            &transformer,
+            &vae,
+            &prompt_embeds,
+            negative.as_ref(),
+            pid_decoder.as_ref(),
+            guidance,
+            steps,
+            base_seed,
+            on_progress,
+        )
+    }
+}
+
+/// Whether the sequential-residency offload path is enabled (epic 10765 Phase 1c, sc-10868). Reads the
+/// process-wide `CANDLE_GEN_OFFLOAD` env (shared with the candle FLUX.1 lane, sc-10769): `sequential`
+/// (case-insensitive) selects the phased load/free path; unset or any other value keeps the resident,
+/// cross-request-cached default. The worker's fit-gate drives the same choice per-load via
+/// `LoadSpec::offload_policy`; this env toggle is the GPU A/B harness seam.
+pub(crate) fn sequential_offload_enabled() -> bool {
+    std::env::var("CANDLE_GEN_OFFLOAD")
+        .map(|value| value.trim().eq_ignore_ascii_case("sequential"))
+        .unwrap_or(false)
 }
 
 /// Map a decoded `[1, 3, H, W]` tensor in `[-1, 1]` to an RGB8 [`Image`].
@@ -468,6 +612,12 @@ pub struct Flux2Generator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    /// Component-residency policy captured from `LoadSpec::offload_policy` (epic 10765 Phase 1c,
+    /// sc-10868). `Sequential` routes `generate` through [`Pipeline::render_sequential`] (load→encode→drop
+    /// the text encoder before the DiT), capping peak VRAM at the cost of the components cache; `Resident`
+    /// (default) keeps the cached path. The worker's fit-gate sets this when it predicts the resident sum
+    /// won't fit but the DiT+VAE working set will.
+    offload_policy: OffloadPolicy,
     components: Mutex<Option<Components>>,
 }
 
@@ -520,8 +670,20 @@ impl Generator for Flux2Generator {
             &self.device,
             self.pid_spec.clone(),
         );
-        let components = self.components(&pipe)?;
-        let images = pipe.render(req, &components, on_progress)?;
+        // Sequential-residency offload (epic 10765, sc-10868): when selected, load→encode→drop the text
+        // encoder before loading the DiT so peak VRAM is DiT+VAE, not TE+DiT+VAE — letting a card that
+        // OOMs the resident path render. Output is bit-identical; it bypasses the components cache (it
+        // drops what it loads). Driven by `LoadSpec::offload_policy` (the worker fit-gate sets
+        // `Sequential`); `CANDLE_GEN_OFFLOAD=sequential` is an env override kept for the GPU A/B harness.
+        // The default stays the resident, cross-request-cached path.
+        let sequential =
+            self.offload_policy == OffloadPolicy::Sequential || sequential_offload_enabled();
+        let images = if sequential {
+            pipe.render_sequential(req, on_progress)?
+        } else {
+            let components = self.components(&pipe)?;
+            pipe.render(req, &components, on_progress)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -631,6 +793,9 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
         // any) so the lazy component build loads the engine once. Unlike adapters/control above, it is
         // not rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
+        // Component-residency policy (epic 10765 Phase 1c, sc-10868) — `Sequential` routes generate
+        // through `render_sequential`. Captured at load; the resident default is unchanged.
+        offload_policy: spec.offload_policy,
         components: Mutex::new(None),
     }))
 }
@@ -937,5 +1102,106 @@ mod tests {
             .expect("expected an error")
             .to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    /// The sequential-residency offload contract (epic 10765 Phase 1c, sc-10868): `with_offload_policy`
+    /// is captured at load (not rejected), and the env override + spec policy select the phased path.
+    /// Loading stays lazy, so this asserts the plumbing on CPU without any weights or a GPU: a
+    /// `Sequential` spec builds a generator (the `render_sequential` route is selected inside `generate`,
+    /// exercised end-to-end by the cuda A/B below), and the default spec stays `Resident`.
+    #[test]
+    fn offload_policy_is_captured_not_rejected() {
+        // Default (no policy set) → Resident: the generator builds, the cached `render` path is default.
+        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        assert_eq!(spec.offload_policy, OffloadPolicy::Resident);
+        assert!(load_dev(&spec).is_ok());
+        assert!(load_klein(&spec).is_ok());
+
+        // `Sequential` is honored, not rejected — for both variants (dev's Mistral TE is the big win; the
+        // klein path is wired identically). The weights are never touched (lazy build).
+        let seq = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        assert_eq!(seq.offload_policy, OffloadPolicy::Sequential);
+        assert!(load_dev(&seq).is_ok());
+        assert!(load_klein(&seq).is_ok());
+
+        // The env override is read independently of the spec (the GPU A/B harness seam).
+        std::env::set_var("CANDLE_GEN_OFFLOAD", "SeQuEnTiAl");
+        assert!(super::sequential_offload_enabled());
+        std::env::set_var("CANDLE_GEN_OFFLOAD", "resident");
+        assert!(!super::sequential_offload_enabled());
+        std::env::remove_var("CANDLE_GEN_OFFLOAD");
+        assert!(!super::sequential_offload_enabled());
+    }
+
+    /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10868). ONE probed FLUX.2-dev
+    /// generation whose mode is chosen by the same two seams `generate` reads — `CANDLE_GEN_OFFLOAD`
+    /// (the env override, sc-10769) or `LoadSpec::offload_policy` (the worker-facing contract, sc-10821)
+    /// — and prints the device peak VRAM + writes the raw RGB pixels to `FLUX2_OUT`. Run it TWICE in
+    /// SEPARATE processes (resident vs sequential) and compare: the pixel files must be byte-identical
+    /// (parity) and the sequential peak materially lower (the decoder-LM Mistral TE dropped before the
+    /// DiT loads). Two processes are REQUIRED — candle's cudarc caching allocator never returns pages to
+    /// the driver, so a second in-process run reuses the first run's pool and reads the same peak.
+    /// Ignored by default; needs a real-file (hardlink-staged, not raw-HF-symlink) FLUX.2-dev snapshot in
+    /// `FLUX2_DEV_DIR`, a `FLUX2_QUANT` of `q4`/`q8` (the 32B needs it — omit only for a dense fixture),
+    /// and a CUDA device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn flux2_dev_probed_generate_for_offload_ab() {
+        let dir = std::env::var("FLUX2_DEV_DIR")
+            .expect("set FLUX2_DEV_DIR to a real-file (hardlink-staged) FLUX.2-dev snapshot");
+        let out = std::env::var("FLUX2_OUT").expect("set FLUX2_OUT to the pixel-dump path");
+        // Two ways to select sequential residency, both exercised by the A/B runner:
+        //   - env `CANDLE_GEN_OFFLOAD=sequential` (the override, sc-10769), OR
+        //   - `FLUX2_OFFLOAD_MODE=spec-sequential` → drive it through `LoadSpec::offload_policy`
+        //     (the worker-facing contract, sc-10821), with CANDLE_GEN_OFFLOAD UNSET.
+        let mut spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
+        // The 32B dev fits only quantized; honor FLUX2_QUANT (q4/q8), else load dense (fixture-only).
+        spec = match std::env::var("FLUX2_QUANT")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str()
+        {
+            "q4" => spec.with_quant(Quant::Q4),
+            "q8" => spec.with_quant(Quant::Q8),
+            _ => spec,
+        };
+        let spec_mode = std::env::var("FLUX2_OFFLOAD_MODE").unwrap_or_default();
+        if spec_mode == "spec-sequential" {
+            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
+        }
+        let req = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle, studio lighting".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(42),
+            count: 1,
+            ..Default::default()
+        };
+        let sampler = candle_gen::testkit::PeakSampler::start(0);
+        let g = load_dev(&spec).expect("load flux2_dev");
+        let output = g.generate(&req, &mut |_| {}).expect("generate");
+        let peak_mib = sampler.stop();
+        let img = match output {
+            GenerationOutput::Images(mut v) => v.remove(0),
+            other => panic!("expected images, got {other:?}"),
+        };
+        std::fs::write(&out, &img.pixels).expect("write pixels");
+        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
+        let mode = if spec_mode == "spec-sequential" {
+            "spec-sequential"
+        } else if env_mode.eq_ignore_ascii_case("sequential") {
+            "env-sequential"
+        } else {
+            "resident"
+        };
+        eprintln!(
+            "SEQ_AB mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
+            img.pixels.len(),
+            img.width,
+            img.height
+        );
     }
 }
