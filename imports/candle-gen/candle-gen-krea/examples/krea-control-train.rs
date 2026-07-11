@@ -462,6 +462,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         compute_dtype: DType::BF16,
         save_every: a.save_every,
         resolution: edge,
+        // This spike CLI trains pose control; the studio path sets this from the job's control_type.
+        control_type: Some("pose".into()),
     };
     eprintln!(
         "optimizer groups: body lr {} | proj lr {} wd {}",
