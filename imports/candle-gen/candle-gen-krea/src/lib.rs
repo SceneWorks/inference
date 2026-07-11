@@ -60,12 +60,20 @@ pub mod control_train;
 // [`force_link`], like the LoRA trainer in `training`.
 mod control_trainer;
 
+// The Krea 2 Turbo pose-ControlNet **inference** provider (sc-8464, epic 8459): loads a trained
+// control-branch overlay on the frozen Turbo base and renders a pose-conditioned image. The
+// deployable form of the sc-8460 spike inference harness; the worker `KreaControl` route calls it.
+pub mod control_provider;
+
 // Shared test-only tiny-DiT fixture (training + control tests).
 #[cfg(test)]
 mod testfix;
 
 pub use adapters::{merge_adapters, merge_into_weights, MergeReport};
 pub use config::Krea2Config;
+pub use control_provider::{
+    Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
+};
 pub use pipeline::Components;
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder};
