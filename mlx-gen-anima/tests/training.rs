@@ -490,3 +490,150 @@ fn trainable_surface_is_508_dit_plus_conditioner() {
     assert_eq!(dit.len() + cond.len(), 508);
     assert!(cond.iter().all(|p| p.starts_with("llm_adapter.blocks.")));
 }
+
+/// sc-10641 — in-training preview sampling, real weights end-to-end. Runs a short magenta overfit with
+/// previews enabled at a fixed cadence and asserts:
+///   (1) INTERVAL — `TrainingProgress::Sample` events fire at EXACTLY the cadence steps (multiples of
+///       `sample_every` within `[1, steps]`), `sample_prompts.len()` per cadence, 1-based `index`.
+///   (2) NON-DEGENERATE — every preview is a correctly-sized RGB bitmap with real pixel variance (a
+///       genuine denoise+decode, not an empty stub).
+///   (3) REFLECTS ADAPTER STATE — prompt[0]'s final-cadence preview is more magenta than its first, and
+///       more magenta than a base-model generation of the same prompt. That can only happen if the
+///       preview samples the LIVE in-training adapter (the DiT AND the conditioner adapters, sc-10522);
+///       a preview that reused a cached/base conditioner output could not track the overfit.
+#[test]
+#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train + periodic preview gens)"]
+fn train_emits_in_training_previews() {
+    if split_files().is_none() {
+        eprintln!("skip: no Anima snapshot");
+        return;
+    }
+    let steps = env_u32("ANIMA_TRAIN_STEPS", 250);
+    let sample_every = (steps / 5).max(1);
+    let mut cfg = overfit_config(NetworkType::Lora);
+    cfg.steps = steps;
+    cfg.sample_every = sample_every;
+    cfg.sample_steps = env_u32("ANIMA_PREVIEW_STEPS", 6);
+    cfg.sample_guidance_scale = 4.5; // base is a CFG variant
+    cfg.sample_prompts = vec![
+        "sksanima style, a portrait of a girl".into(),
+        "sksanima style, a landscape".into(),
+    ];
+    let edge = cfg.resolution; // 512 → bucketed to itself
+    let n_prompts = cfg.sample_prompts.len() as u32;
+    let prompt0 = cfg.sample_prompts[0].clone();
+    let req = train_request(
+        tiny_magenta_dataset(4),
+        cfg,
+        "anima_sc10641_preview.safetensors",
+    );
+
+    let spec = LoadSpec::new(WeightsSource::Dir(split_files().unwrap()));
+    let mut trainer = load_trainer_base(&spec).expect("load anima trainer");
+    type Sample = (u32, u32, u32, mlx_gen::media::Image);
+    let mut samples: Vec<Sample> = Vec::new();
+    let mut on_progress = |p: TrainingProgress| {
+        if let TrainingProgress::Sample {
+            step,
+            index,
+            total,
+            image,
+            ..
+        } = p
+        {
+            samples.push((step, index, total, image));
+        }
+    };
+    trainer.train(&req, &mut on_progress).expect("train");
+    drop(trainer);
+    mlx_rs::memory::clear_cache();
+
+    // (1) INTERVAL — exactly the cadence multiples, each with `n_prompts` 1-based-indexed previews.
+    let expected_steps: Vec<u32> = (1..=steps)
+        .filter(|&s| s.is_multiple_of(sample_every))
+        .collect();
+    let got_steps: Vec<u32> = {
+        let mut v: Vec<u32> = samples.iter().map(|s| s.0).collect();
+        v.dedup();
+        v
+    };
+    assert_eq!(
+        got_steps, expected_steps,
+        "previews must fire at exactly the cadence steps (every {sample_every})"
+    );
+    for step in &expected_steps {
+        let at: Vec<&Sample> = samples.iter().filter(|s| s.0 == *step).collect();
+        assert_eq!(
+            at.len() as u32,
+            n_prompts,
+            "cadence {step}: expected {n_prompts} previews, got {}",
+            at.len()
+        );
+        for (i, s) in at.iter().enumerate() {
+            assert_eq!(s.1, i as u32 + 1, "cadence {step}: 1-based index");
+            assert_eq!(s.2, n_prompts, "cadence {step}: total == prompt count");
+        }
+    }
+
+    // (2) NON-DEGENERATE — right size + real pixel variance.
+    for (step, index, _t, img) in &samples {
+        assert_eq!(
+            (img.width, img.height),
+            (edge, edge),
+            "preview step {step}/{index}: wrong size"
+        );
+        assert_eq!(img.pixels.len(), (edge * edge * 3) as usize);
+        let (lo, hi) = img
+            .pixels
+            .iter()
+            .fold((255u8, 0u8), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+        assert!(
+            hi > lo,
+            "preview step {step}/{index} is a flat constant image (min==max) — not a real render"
+        );
+    }
+
+    // (3) REFLECTS ADAPTER STATE — prompt[0]'s magenta tilt grows first→last cadence, and the final
+    // preview is more magenta than a base-model generation (the overfit target the LoRA is learning).
+    let first_step = *expected_steps.first().unwrap();
+    let last_step = *expected_steps.last().unwrap();
+    let p0 = |step: u32| -> &mlx_gen::media::Image {
+        &samples
+            .iter()
+            .find(|s| s.0 == step && s.1 == 1)
+            .expect("prompt0 preview at cadence")
+            .3
+    };
+    let (first, last) = (p0(first_step), p0(last_step));
+    let (mf, ml) = (magenta_score(first), magenta_score(last));
+    save_png(first, &out_dir().join("preview_first.png"));
+    save_png(last, &out_dir().join("preview_last.png"));
+
+    let base =
+        AnimaPipeline::from_source(&WeightsSource::Dir(split_files().unwrap()), Variant::Base)
+            .expect("base pipeline");
+    let img_base = generate(&base, &prompt0, 1234, cfg_preview_steps());
+    let mb = magenta_score(&img_base);
+    save_png(&img_base, &out_dir().join("preview_base.png"));
+
+    eprintln!(
+        "[sc-10641] {} previews across {} cadences; prompt0 magenta: base {mb:.1}, first(step {first_step}) {mf:.1} → last(step {last_step}) {ml:.1}",
+        samples.len(),
+        expected_steps.len()
+    );
+    assert!(
+        ml > mf,
+        "previews must track the in-training adapter: prompt0 should tilt toward the overfit magenta \
+         from the first cadence ({mf:.1}) to the last ({ml:.1})"
+    );
+    assert!(
+        ml > mb,
+        "the final preview must reflect the trained adapter (more magenta than the base model: \
+         base {mb:.1} vs final preview {ml:.1})"
+    );
+}
+
+/// Preview denoise-step count used by the base-model comparison generation in the preview test.
+fn cfg_preview_steps() -> usize {
+    env_u32("ANIMA_PREVIEW_STEPS", 6) as usize
+}

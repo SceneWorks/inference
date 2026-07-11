@@ -11,8 +11,11 @@ use mlx_gen::media::Image;
 use mlx_gen::runtime::{AdapterSpec, CancelFlag};
 use mlx_gen::{run_flow_sampler, Progress, Result, TimestepConvention, WeightsSource};
 
+use crate::conditioner::AnimaTextConditioner;
 use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
 use crate::loader::AnimaComponents;
+use crate::transformer::CosmosDiT;
+use crate::vae::QwenVae;
 
 /// Anima's recommended default sampler (the ER-SDE-3 solver added for this epic, sc-10519). A request
 /// `sampler` overrides it; any curated flow solver (euler, dpmpp_2m, …) is valid.
@@ -297,6 +300,140 @@ impl AnimaPipeline {
         )?;
         Ok((final_latent, captures.into_inner()))
     }
+}
+
+// ==================================================================================================
+// In-training preview sampling (sc-10641)
+// ==================================================================================================
+//
+// The trainer renders a periodic preview from the IN-PROGRESS adapter so the user can watch the LoRA
+// converge (the sc-5637 `TrainingProgress::Sample` contract). Unlike z-image (one DiT host), an Anima
+// preview MUST run the conditioner (`llm_adapter`) forward through the LIVE graph: its 60 adapter
+// targets are trained, so reusing a cached conditioner OUTPUT would render a model whose conditioner
+// adapters are silently inert — the exact sc-10522 trap. The trainer therefore caches the conditioner
+// INPUTS (masked Qwen3 states + T5 ids) and calls [`render_preview`], which re-runs the conditioner
+// (with the current adapters installed) every preview. These helpers are forward-only (no gradients)
+// and mirror the inference denoise ([`AnimaPipeline::denoise`]): [`anima_sigmas`] + [`run_flow_sampler`]
+// over [`TimestepConvention::Sigma`], CFG-combining a live uncond conditioner forward on CFG variants.
+
+/// Render one preview image from the in-training adapter (sc-10641): run the (live) conditioner, denoise
+/// the DiT from seeded noise, VAE-decode → RGB. `source`/`t5_ids` are the cached conditioner inputs for
+/// the positive prompt; `uncond` is the cached empty-prompt inputs (CFG variants only). Forward-only.
+///
+/// The conditioner forward here is the sc-10522 correctness point: the DiT + conditioner adapters must
+/// already be installed on `dit`/`conditioner` (the trainer re-installs the current factors before each
+/// cadence), so this reflects the conditioner adapters' training — it is NOT a cached output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_preview(
+    dit: &CosmosDiT,
+    conditioner: &AnimaTextConditioner,
+    vae: &QwenVae,
+    source: &Array,
+    t5_ids: &Array,
+    uncond: Option<&(Array, Array)>,
+    steps: usize,
+    guidance: f32,
+    edge: u32,
+    seed: u64,
+    dtype: Dtype,
+) -> Result<Image> {
+    let init = create_noise(seed, edge, edge)?;
+    let latent = render_preview_latent(
+        dit,
+        conditioner,
+        source,
+        t5_ids,
+        uncond,
+        &init,
+        steps,
+        guidance,
+        seed,
+        dtype,
+    )?;
+    let decoded = vae.decode(&latent)?; // [1, 3, 1, H, W] f32 in [-1, 1]
+    decoded_to_image(&decoded)
+}
+
+/// The VAE-free core of [`render_preview`]: run the LIVE conditioner (positive + optional uncond) then
+/// denoise the DiT from `init`, returning the final latent `[1, 16, 1, H/8, W/8]`. Split out so a
+/// weights-free (no-VAE) test can drive the exact production path and prove the conditioner is live —
+/// if this ever regressed to a cached conditioner output, the latent would stop responding to the
+/// conditioner adapters (the sc-10522 trap) and the guard test reddens.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_preview_latent(
+    dit: &CosmosDiT,
+    conditioner: &AnimaTextConditioner,
+    source: &Array,
+    t5_ids: &Array,
+    uncond: Option<&(Array, Array)>,
+    init: &Array,
+    steps: usize,
+    guidance: f32,
+    seed: u64,
+    dtype: Dtype,
+) -> Result<Array> {
+    // LIVE conditioner forward — reflects the in-training `llm_adapter` adapters (sc-10522).
+    let cond = conditioner.forward(source, t5_ids, dtype)?;
+    // CFG (base/aesthetic): a live uncond conditioner forward too. Skipped at guidance 1.0 (the
+    // combination collapses to the positive forward) and for guidance-free variants (uncond == None).
+    let uncond_enc = match uncond {
+        Some((s, ids)) if guidance != 1.0 => Some(conditioner.forward(s, ids, dtype)?),
+        _ => None,
+    };
+    render_latent_with_enc(
+        dit,
+        &cond,
+        uncond_enc.as_ref(),
+        init,
+        steps,
+        guidance,
+        seed,
+        dtype,
+    )
+}
+
+/// Denoise the DiT from `init` over [`anima_sigmas`] using a PRE-COMPUTED conditioner output `cond`
+/// (+ optional `uncond_enc` for CFG). The sampling half of [`render_preview_latent`], factored so the
+/// live path and the guard test share one integrator and differ ONLY in whether `cond` was produced
+/// live or (the trap) reused stale.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_latent_with_enc(
+    dit: &CosmosDiT,
+    cond: &Array,
+    uncond_enc: Option<&Array>,
+    init: &Array,
+    steps: usize,
+    guidance: f32,
+    seed: u64,
+    dtype: Dtype,
+) -> Result<Array> {
+    let sigmas = anima_sigmas(steps.max(1));
+    let guidance = Array::from_slice(&[guidance], &[1]);
+    let cancel = CancelFlag::default();
+    let mut prog = |_p: Progress| {};
+    let predict = |x: &Array, sigma: f32| -> Result<Array> {
+        let s = Array::from_slice(&[sigma], &[1]);
+        let v_cond = dit.forward(x, &s, cond, dtype)?;
+        let v = match uncond_enc {
+            // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
+            Some(u) => {
+                let v_u = dit.forward(x, &s, u, dtype)?;
+                add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
+            }
+            None => v_cond,
+        };
+        Ok(v.as_dtype(Dtype::Float32)?)
+    };
+    run_flow_sampler(
+        Some(DEFAULT_SAMPLER),
+        TimestepConvention::Sigma,
+        &sigmas,
+        init.clone(),
+        seed,
+        &cancel,
+        &mut prog,
+        predict,
+    )
 }
 
 #[cfg(test)]
