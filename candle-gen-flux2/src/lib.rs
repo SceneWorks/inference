@@ -112,6 +112,12 @@ pub(crate) struct Pipeline {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pub(crate) pid_spec: Option<PidWeights>,
+    /// An in-place ComfyUI FLUX.2-dev fp8-mixed DiT single-file (epic 10451 Phase 2e, sc-10680). When
+    /// `Some`, the transformer is built from this file (inline-scale fp8 dequant + BFL→diffusers remap,
+    /// see [`convert::build_comfyui_dit_map`]) instead of the snapshot's `transformer/` dir; the text
+    /// encoder / VAE / tokenizer still come from the resident snapshot `root`. `None` on every other
+    /// path (registry txt2img, edit, control).
+    pub(crate) comfyui_dit: Option<PathBuf>,
 }
 
 impl Pipeline {
@@ -132,6 +138,30 @@ impl Pipeline {
             dtype: DType::F32,
             quant,
             pid_spec,
+            comfyui_dit: None,
+        }
+    }
+
+    /// Same as [`load`](Self::load) but sourcing the DiT from an in-place ComfyUI FLUX.2-dev fp8-mixed
+    /// single-file (sc-10680). `root` is the resident FLUX.2-dev diffusers snapshot supplying the Mistral
+    /// text encoder / VAE / tokenizer (the single DiT file carries none of those). `quant` (Q4/Q8) is
+    /// honored for the DiT the same way the resident dev path is — the 32B does not fit the GPU dense
+    /// after the fp8→f32 dequant, so each projection is folded onto the GPU. PiD is not wired here.
+    pub(crate) fn load_comfyui(
+        quant: Option<Quant>,
+        root: &Path,
+        device: &Device,
+        comfyui_dit: PathBuf,
+    ) -> Self {
+        Self {
+            variant: Flux2Variant::Dev,
+            cfg: Flux2Variant::Dev.config(),
+            root: root.to_path_buf(),
+            device: device.clone(),
+            dtype: DType::F32,
+            quant,
+            pid_spec: None,
+            comfyui_dit: Some(comfyui_dit),
         }
     }
 
@@ -286,8 +316,43 @@ impl Pipeline {
         }
     }
 
+    /// Build the DiT from an in-place ComfyUI FLUX.2-dev fp8-mixed single-file (sc-10680): dequant the
+    /// inline-scale fp8 MLPs + remap the BFL keys into an in-memory map ([`convert::build_comfyui_dit_map`])
+    /// at the compute dtype (f32), then route by `self.quant` exactly as [`load_one_quantizable`]'s
+    /// dense-tier regime does — the snapshot `transformer/` dir simply replaced by the single file:
+    /// - **quant** (the 32B dev path): stage the dense f32 DiT in CPU RAM, then fold each projection onto
+    ///   the GPU (`quantize`); the dense f32 32B never lands on the GPU (it would not fit).
+    /// - **no quant** (small fixtures only): build dense on-device.
+    fn load_comfyui_dit(&self, dit_file: &Path) -> CResult<Flux2Transformer> {
+        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
+        let mmap =
+            unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(dit_file) }
+                .map_err(|e| {
+                    CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_file.display()))
+                })?;
+        let map = convert::build_comfyui_dit_map(&mmap, self.dtype)?;
+        match self.quant {
+            Some(q) => {
+                let vb = VarBuilder::from_tensors(map, self.dtype, &Device::Cpu);
+                let mut dit = Flux2Transformer::new(&self.cfg, vb)?;
+                dit.quantize(q, &self.device)?;
+                Ok(dit)
+            }
+            None => {
+                let vb = VarBuilder::from_tensors(map, self.dtype, &self.device);
+                Ok(Flux2Transformer::new(&self.cfg, vb)?)
+            }
+        }
+    }
+
     fn load_components(&self) -> CResult<Components> {
-        let (te, transformer) = self.load_te_and_dit()?;
+        let (te, transformer) = match &self.comfyui_dit {
+            // In-place ComfyUI DiT (sc-10680): the Mistral TE is NOT in the single DiT file, so it comes
+            // from the snapshot through the same per-tier quant path (`load_te_seq` is the TE-only
+            // quantizable loader); the DiT is dequanted + quantized from the in-place file.
+            Some(dit_file) => (self.load_te_seq()?, self.load_comfyui_dit(dit_file)?),
+            None => self.load_te_and_dit()?,
+        };
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
         let tokenizer = self.build_tokenizer()?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
@@ -618,6 +683,11 @@ pub struct Flux2Generator {
     /// (default) keeps the cached path. The worker's fit-gate sets this when it predicts the resident sum
     /// won't fit but the DiT+VAE working set will.
     offload_policy: OffloadPolicy,
+    /// An in-place ComfyUI FLUX.2-dev fp8-mixed DiT single-file (epic 10451 Phase 2e, sc-10680), set
+    /// only by [`load_from_comfyui_dit`]. When `Some`, the lazy component build sources the transformer
+    /// from this file (inline-scale fp8 dequant + BFL→diffusers remap) and the TE / VAE / tokenizer from
+    /// [`Self::root`] (a resident FLUX.2-dev snapshot); `None` on the registry path.
+    comfyui_dit: Option<PathBuf>,
     components: Mutex<Option<Components>>,
 }
 
@@ -663,21 +733,28 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(
-            self.variant,
-            self.quant,
-            &self.root,
-            &self.device,
-            self.pid_spec.clone(),
-        );
+        let pipe = match &self.comfyui_dit {
+            Some(dit_file) => {
+                Pipeline::load_comfyui(self.quant, &self.root, &self.device, dit_file.clone())
+            }
+            None => Pipeline::load(
+                self.variant,
+                self.quant,
+                &self.root,
+                &self.device,
+                self.pid_spec.clone(),
+            ),
+        };
         // Sequential-residency offload (epic 10765, sc-10868): when selected, load→encode→drop the text
         // encoder before loading the DiT so peak VRAM is DiT+VAE, not TE+DiT+VAE — letting a card that
         // OOMs the resident path render. Output is bit-identical; it bypasses the components cache (it
         // drops what it loads). Driven by `LoadSpec::offload_policy` (the worker fit-gate sets
         // `Sequential`); `CANDLE_GEN_OFFLOAD=sequential` is an env override kept for the GPU A/B harness.
-        // The default stays the resident, cross-request-cached path.
-        let sequential =
-            self.offload_policy == OffloadPolicy::Sequential || sequential_offload_enabled();
+        // Never taken on the in-place ComfyUI DiT lane — that transformer is a single file, not
+        // `root/transformer/`, so the sequential per-phase loaders can't source it (falls back to
+        // resident). The default stays the resident, cross-request-cached path.
+        let sequential = self.comfyui_dit.is_none()
+            && (self.offload_policy == OffloadPolicy::Sequential || sequential_offload_enabled());
         let images = if sequential {
             pipe.render_sequential(req, on_progress)?
         } else {
@@ -796,6 +873,37 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
         // Component-residency policy (epic 10765 Phase 1c, sc-10868) — `Sequential` routes generate
         // through `render_sequential`. Captured at load; the resident default is unchanged.
         offload_policy: spec.offload_policy,
+        comfyui_dit: None,
+        components: Mutex::new(None),
+    }))
+}
+
+/// Construct a lazy candle FLUX.2-**dev** generator that reads its **DiT** in place from an existing
+/// ComfyUI fp8-mixed single-file (epic 10451 Phase 2e, sc-10680) — no copy, no re-download.
+/// `transformer_file` is the user's `diffusion_models/flux2_dev_fp8mixed.safetensors` (BFL-native keys,
+/// inline-scale fp8 MLPs); its keys are remapped + its fp8 weights dequanted (`w = w_fp8·weight_scale`)
+/// in memory at component build ([`convert::build_comfyui_dit_map`]). `snapshot_dir` is a resident
+/// FLUX.2-dev diffusers snapshot supplying the Mistral text encoder, VAE, and tokenizer (none of which
+/// are in the single DiT file). `quant` (Q4/Q8) folds the dequanted DiT + the Mistral TE onto the GPU —
+/// the 32B dev does not fit dense — matching the resident dev path; `None` is fixture-only. txt2img
+/// only; no adapters / control / edit / PiD.
+pub fn load_from_comfyui_dit(
+    transformer_file: impl Into<PathBuf>,
+    snapshot_dir: impl Into<PathBuf>,
+    quant: Option<Quant>,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let device = candle_gen::default_device()?;
+    Ok(Box::new(Flux2Generator {
+        variant: Flux2Variant::Dev,
+        descriptor: descriptor(Flux2Variant::Dev),
+        root: snapshot_dir.into(),
+        device,
+        quant,
+        pid_spec: None,
+        // The in-place ComfyUI DiT lane keeps everything resident (its transformer is a single file, not
+        // `root/transformer/`, so the sequential per-phase loaders don't apply).
+        offload_policy: OffloadPolicy::Resident,
+        comfyui_dit: Some(transformer_file.into()),
         components: Mutex::new(None),
     }))
 }
@@ -1092,6 +1200,24 @@ mod tests {
             err.contains("text_encoder"),
             "delegation surfaces the loader's missing-component error, got: {err}"
         );
+    }
+
+    /// The in-place ComfyUI DiT entry point (epic 10451 Phase 2e, sc-10680) builds a lazy dev generator
+    /// without touching weights: it stamps the dev descriptor + carries the DiT file, and the resident
+    /// snapshot dir is the root supplying the TE/VAE/tokenizer. Loading is lazy, so this asserts the
+    /// plumbing on CPU with no weights (the render itself is GPU-validated separately).
+    #[test]
+    fn load_from_comfyui_dit_builds_lazy_dev_generator() {
+        let g = load_from_comfyui_dit(
+            "/tree/diffusion_models/flux2_dev_fp8mixed.safetensors",
+            "/snap/flux2-dev",
+            Some(Quant::Q8),
+        )
+        .expect("comfyui dev generator builds lazily");
+        assert_eq!(g.descriptor().id, FLUX2_DEV_ID);
+        assert_eq!(g.descriptor().family, "flux2");
+        assert_eq!(g.descriptor().backend, "candle");
+        assert_eq!(g.descriptor().modality, Modality::Image);
     }
 
     #[test]
