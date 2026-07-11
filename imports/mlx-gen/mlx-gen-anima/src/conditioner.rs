@@ -8,8 +8,10 @@
 //! `out_proj.*`, `norm.weight`) — identical to the diffusers `AnimaTextConditioner` state dict, which
 //! the Anima convert script loads with `strict=True` (no rename).
 
+use mlx_rs::error::Result as MlxResult;
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, zeros_dtype};
+use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
@@ -39,6 +41,12 @@ struct Attention {
     head_dim: i32,
     scale: f32,
     eps: f32,
+    /// sc-10576 — SDPA-segment gradient checkpointing (see the DiT `Attention::ckpt_sdpa`). The
+    /// conditioner is never whole-block checkpointed (it runs in the traced graph so its 60 adapter
+    /// factors get gradients), so — like z-image's refiner leg — its attention segment ckpt is left ON
+    /// during training to bound the retained `[heads, S, S]` probability matrix. Numerically identical
+    /// to the retained backward; inference never sets it.
+    ckpt_sdpa: bool,
 }
 
 impl Attention {
@@ -55,7 +63,12 @@ impl Attention {
             head_dim: hd,
             scale: (hd as f32).powf(-0.5),
             eps: cfg.norm_eps,
+            ckpt_sdpa: false,
         })
+    }
+
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.ckpt_sdpa = on;
     }
 
     /// `hidden`: `[B, Sq, D]` (query source). `encoder`: `Some([B, Sk, Ctx])` (cross) or `None`
@@ -94,7 +107,21 @@ impl Attention {
         let q = q.transpose_axes(&[0, 2, 1, 3])?;
         let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+        let o = if self.ckpt_sdpa {
+            // sc-10576: checkpoint the SDPA (q/k/v threaded, scale captured) — recompute the seq²
+            // attention in the backward instead of retaining it. Numerically identical.
+            let scale = self.scale;
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                Ok(vec![scaled_dot_product_attention(
+                    &inp[0], &inp[1], &inp[2], scale, None, None,
+                )?])
+            });
+            seg(&[q, k, v])?.into_iter().next().ok_or_else(|| {
+                mlx_gen::Error::Msg("anima conditioner: checkpoint SDPA produced no output".into())
+            })?
+        } else {
+            scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
+        };
         let o = o
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, sq, self.heads * self.head_dim])?;
@@ -126,6 +153,11 @@ impl Block {
             mlp_out: lin(w, &join(prefix, "mlp.2"), true)?,
             eps: cfg.norm_eps,
         })
+    }
+
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.self_attn.set_sdpa_checkpoint(on);
+        self.cross_attn.set_sdpa_checkpoint(on);
     }
 
     fn forward(
@@ -272,6 +304,15 @@ impl AnimaTextConditioner {
     pub fn config(&self) -> &ConditionerConfig {
         &self.cfg
     }
+
+    /// Toggle SDPA-segment gradient checkpointing (sc-10576) on every conditioner block. Training-only:
+    /// the trainer leaves this ON (the conditioner is never whole-block checkpointed), matching the
+    /// z-image refiner leg. Numerically identical to the retained backward; inference never calls it.
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for b in &mut self.blocks {
+            b.set_sdpa_checkpoint(on);
+        }
+    }
 }
 
 // ---- LoRA/LoKr adapter surface (sc-10521) --------------------------------------------------------
@@ -385,6 +426,7 @@ mod structural {
                 head_dim,
                 scale: 1.0,
                 eps: cfg.norm_eps,
+                ckpt_sdpa: false,
             };
             let blocks = (0..cfg.num_layers)
                 .map(|_| Block {
@@ -403,6 +445,95 @@ mod structural {
                 blocks,
                 out_proj: ph_lin(),
                 norm: ph_norm(),
+                rope: TextRope::new(head_dim, cfg.rope_theta),
+                cfg,
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test-only SYNTHETIC constructor — real (small) random weights, evaluable on Metal (sc-10576)
+// -------------------------------------------------------------------------------------------------
+
+/// Real-weight conditioner for the grad-parity test (sc-10576): a dimension-parametric build with
+/// small random weights so the 6-block conditioner forward+backward runs on Metal without the licensed
+/// checkpoint. Mirrors [`CosmosDiT::synthetic`]. `cfg` sets every dim; use a tiny `cfg` for speed.
+#[cfg(test)]
+pub(crate) mod synthetic {
+    use super::*;
+    use mlx_rs::random;
+
+    pub(crate) struct Rng(pub u64);
+
+    impl Rng {
+        fn lin(&mut self, out: i32, in_f: i32, bias: bool) -> AdaptableLinear {
+            self.0 = self.0.wrapping_add(1);
+            let key = random::key(self.0).unwrap();
+            let w = random::normal::<f32>(&[out, in_f], None, None, Some(&key)).unwrap();
+            let w = multiply(&w, Array::from_slice(&[0.05f32], &[1])).unwrap();
+            let b = bias.then(|| Array::zeros::<f32>(&[out]).unwrap());
+            AdaptableLinear::dense(w, b)
+        }
+
+        fn norm(&mut self, d: i32) -> Array {
+            Array::ones::<f32>(&[d]).unwrap()
+        }
+
+        fn attn(&mut self, heads: i32, head_dim: i32, kv_in: i32, eps: f32) -> Attention {
+            let d = heads * head_dim;
+            Attention {
+                q_proj: self.lin(d, d, false),
+                k_proj: self.lin(d, kv_in, false),
+                v_proj: self.lin(d, kv_in, false),
+                o_proj: self.lin(d, d, false),
+                q_norm: self.norm(head_dim),
+                k_norm: self.norm(head_dim),
+                heads,
+                head_dim,
+                scale: (head_dim as f32).powf(-0.5),
+                eps,
+                ckpt_sdpa: false,
+            }
+        }
+    }
+
+    impl AnimaTextConditioner {
+        /// A synthetic conditioner with real random weights. `cfg` sets every dim (`model_dim`,
+        /// `source_dim` for the cross-attn kv, `target_vocab_size` for the T5 embedding).
+        pub(crate) fn synthetic(cfg: ConditionerConfig, seed: u64) -> Self {
+            let d = cfg.model_dim as i32;
+            let heads = cfg.num_attention_heads as i32;
+            let head_dim = cfg.head_dim() as i32;
+            let src = cfg.source_dim as i32;
+            let target = cfg.target_dim as i32;
+            let ff = (cfg.mlp_ratio * d as f32).round() as i32;
+            let vocab = cfg.target_vocab_size as i32;
+            let eps = cfg.norm_eps;
+
+            let mut r = Rng(seed);
+            // Learned T5 query-token embedding [vocab, model_dim].
+            let embed_rand =
+                random::normal::<f32>(&[vocab, d], None, None, Some(&random::key(seed).unwrap()))
+                    .unwrap();
+            let embed_w = multiply(&embed_rand, Array::from_slice(&[0.05f32], &[1])).unwrap();
+            let blocks = (0..cfg.num_layers)
+                .map(|_| Block {
+                    norm_self_attn: r.norm(d),
+                    self_attn: r.attn(heads, head_dim, d, eps), // self: kv from hidden (model_dim)
+                    norm_cross_attn: r.norm(d),
+                    cross_attn: r.attn(heads, head_dim, src, eps), // cross: kv from Qwen source_dim
+                    norm_mlp: r.norm(d),
+                    mlp_in: r.lin(ff, d, true),
+                    mlp_out: r.lin(d, ff, true),
+                    eps,
+                })
+                .collect();
+            Self {
+                embed: TokenEmbedding::Dense(embed_w),
+                blocks,
+                out_proj: r.lin(target, d, true),
+                norm: r.norm(target),
                 rope: TextRope::new(head_dim, cfg.rope_theta),
                 cfg,
             }
