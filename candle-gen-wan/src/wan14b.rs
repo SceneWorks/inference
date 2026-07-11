@@ -126,6 +126,11 @@ struct Pipeline {
     /// Trained LoRA/LoKr adapters to merge into the experts at load (sc-5167). Each is routed to the
     /// high and/or low expert by its [`AdapterSpec::moe_expert`].
     adapters: Vec<AdapterSpec>,
+    /// In-place ComfyUI expert files (epic 10451 Phase 2c, sc-10671). When set, the two experts are
+    /// built from these files (scaled-fp8 dequant + key remap, see [`crate::comfyui`]) instead of the
+    /// snapshot's `transformer/` + `transformer_2/`; the UMT5 TE / VAE / tokenizer still come from
+    /// `root`. `None` on the registry path.
+    comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiExperts>>,
 }
 
 impl Pipeline {
@@ -138,7 +143,39 @@ impl Pipeline {
             root: root.to_path_buf(),
             device: device.clone(),
             adapters,
+            comfyui: None,
         }
+    }
+
+    /// Same as [`load`](Self::load) but with the two experts sourced from an in-place ComfyUI install
+    /// (sc-10671). `root` is the resident Wan snapshot tier supplying the UMT5 TE / VAE / tokenizer;
+    /// `comfyui` names the user's two ComfyUI expert files, read in place.
+    fn load_comfyui(
+        root: &Path,
+        device: &Device,
+        variant: Variant,
+        comfyui: std::sync::Arc<crate::comfyui::ComfyuiExperts>,
+    ) -> Self {
+        Self {
+            te_cfg: TextEncoderConfig::umt5_xxl(),
+            dit_cfg: variant.dit_cfg(),
+            vae_cfg: Vae16Config::wan21(),
+            variant,
+            root: root.to_path_buf(),
+            device: device.clone(),
+            adapters: Vec::new(),
+            comfyui: Some(comfyui),
+        }
+    }
+
+    /// Build one expert from an in-place ComfyUI file (sc-10671): load its native tensor map on CPU,
+    /// remap keys + dequant the scaled-fp8 weights ([`crate::comfyui`]) into the diffusers schema, then
+    /// build via `VarBuilder::from_tensors` (the in-memory path the packed/adapter loads already use).
+    fn build_expert_comfyui(&self, file: &Path) -> CResult<WanTransformer> {
+        let map = cst::load(file, &Device::Cpu)?;
+        let map = crate::comfyui::remap_and_dequant_comfyui_expert(map, DIT_DTYPE)?;
+        let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
+        Ok(WanTransformer::new(&self.dit_cfg, vb)?)
     }
 
     fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
@@ -219,8 +256,21 @@ impl Pipeline {
     fn load_components(&self) -> CResult<Components> {
         let te = Umt5Encoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
         // transformer/ = high-noise expert, transformer_2/ = low-noise expert (diffusers WanPipeline).
-        let (high, high_applied) = self.build_expert("transformer", MoeExpert::High)?;
-        let (low, low_applied) = self.build_expert("transformer_2", MoeExpert::Low)?;
+        // In-place ComfyUI mode (sc-10671): build both experts from the user's files (remap + dequant);
+        // no adapters (the ComfyUI base lane does not fold LoRAs), so the zero-match guard below is inert.
+        let (high, high_applied, low, low_applied) = match &self.comfyui {
+            Some(experts) => (
+                self.build_expert_comfyui(&experts.high_file)?,
+                None,
+                self.build_expert_comfyui(&experts.low_file)?,
+                None,
+            ),
+            None => {
+                let (high, high_applied) = self.build_expert("transformer", MoeExpert::High)?;
+                let (low, low_applied) = self.build_expert("transformer_2", MoeExpert::Low)?;
+                (high, high_applied, low, low_applied)
+            }
+        };
         // Packed-tier zero-match guard (sc-10095): on the additive path a non-empty adapter set that
         // attached NO residual across either expert is a format/prefix misconfiguration (the dense fold
         // path self-guards inside `merge_adapters`, so it returns `None` here and is exempt). Both experts
@@ -508,6 +558,10 @@ pub struct Wan14bGenerator {
     root: PathBuf,
     device: Device,
     adapters: Vec<AdapterSpec>,
+    /// In-place ComfyUI experts (epic 10451 Phase 2c, sc-10671), set only by
+    /// [`load_from_comfyui_experts`]. When present, the lazy component build sources both experts from
+    /// these files and the UMT5 TE / VAE / tokenizer from [`Self::root`]; `None` on the registry path.
+    comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiExperts>>,
     components: Mutex<Option<Components>>,
 }
 
@@ -576,12 +630,17 @@ impl Generator for Wan14bGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(
-            &self.root,
-            &self.device,
-            self.variant,
-            self.adapters.clone(),
-        );
+        let pipe = match &self.comfyui {
+            Some(experts) => {
+                Pipeline::load_comfyui(&self.root, &self.device, self.variant, experts.clone())
+            }
+            None => Pipeline::load(
+                &self.root,
+                &self.device,
+                self.variant,
+                self.adapters.clone(),
+            ),
+        };
         let components = self.components(&pipe)?;
         let (frames, fps) = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Video {
@@ -667,6 +726,37 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         root,
         device,
         adapters: spec.adapters.clone(),
+        comfyui: None,
+        components: Mutex::new(None),
+    }))
+}
+
+/// Construct a lazy candle Wan2.2 A14B generator that reads its **two DiT experts in place** from an
+/// existing ComfyUI install (epic 10451 Phase 2c, sc-10671) — no copy, no re-download. `high_file` /
+/// `low_file` are the user's ComfyUI high/low-noise expert files (native-Wan keys, companion scaled-fp8);
+/// each is remapped + dequant'd to bf16 in memory ([`crate::comfyui`]) at component build. `snapshot_dir`
+/// is a resident Wan2.2 A14B snapshot tier (`text_encoder/`, `vae/`, `tokenizer/`) supplying the standard
+/// UMT5 TE / VAE / tokenizer — the ComfyUI tree's own UMT5 is itself scaled-fp8 and its VAE a separate key
+/// schema. `variant` selects the T2V or I2V config (`patch_embedding` in-channels differ). No adapters /
+/// control on this lane.
+pub fn load_from_comfyui_experts(
+    high_file: impl Into<PathBuf>,
+    low_file: impl Into<PathBuf>,
+    snapshot_dir: impl Into<PathBuf>,
+    i2v: bool,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let variant = if i2v { Variant::I2v } else { Variant::T2v };
+    let device = candle_gen::default_device()?;
+    Ok(Box::new(Wan14bGenerator {
+        descriptor: descriptor_for(variant),
+        variant,
+        root: snapshot_dir.into(),
+        device,
+        adapters: Vec::new(),
+        comfyui: Some(std::sync::Arc::new(crate::comfyui::ComfyuiExperts {
+            high_file: high_file.into(),
+            low_file: low_file.into(),
+        })),
         components: Mutex::new(None),
     }))
 }
