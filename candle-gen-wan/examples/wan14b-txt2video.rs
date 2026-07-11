@@ -9,6 +9,11 @@
 //!   --prompt "a fluffy cat walking across a sunny garden, cinematic" \
 //!   --width 320 --height 320 --frames 17 --steps 20 --seed 42 --out wan14b_smoke
 //! ```
+//!
+//! With `--comfyui-high <file> --comfyui-low <file>` it instead loads those two in-place ComfyUI Wan2.2
+//! experts (native-Wan keys, companion scaled-fp8) via
+//! [`candle_gen_wan::wan14b::load_from_comfyui_experts`], sourcing the UMT5 TE / VAE / tokenizer from
+//! `--snapshot` (a resident Wan tier dir). The sc-10671 GPU-val path.
 
 use std::path::PathBuf;
 
@@ -79,8 +84,25 @@ fn main() -> Result<()> {
     );
 
     candle_gen_wan::force_link();
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
-    let gen = gen_core::registry::load("wan2_2_t2v_14b", &spec)?;
+    // sc-10671: `--comfyui-high/--comfyui-low` read the two ComfyUI experts in place (scaled-fp8 dequant
+    // + native→diffusers remap), sourcing TE/VAE/tokenizer from `--snapshot`; else the registry loads
+    // the whole snapshot.
+    let gen = match (arg(&args, "--comfyui-high"), arg(&args, "--comfyui-low")) {
+        (Some(high), Some(low)) => {
+            println!("[smoke] comfyui experts: high={high} low={low} (in place, scaled-fp8→bf16)");
+            candle_gen_wan::wan14b::load_from_comfyui_experts(
+                PathBuf::from(&high),
+                PathBuf::from(&low),
+                PathBuf::from(&snapshot),
+                false,
+            )?
+        }
+        _ => {
+            let spec =
+                LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
+            gen_core::registry::load("wan2_2_t2v_14b", &spec)?
+        }
+    };
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",
         gen.descriptor().id,
