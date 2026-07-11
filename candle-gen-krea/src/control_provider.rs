@@ -240,7 +240,12 @@ fn validate_request(req: &Krea2ControlRequest) -> Result<()> {
 /// produces at train time, so the VAE-encoded control latent is identical to what the branch was
 /// trained on. The worker driver renders the control map at the provider's output dims, so a size
 /// mismatch is a wiring bug, not a resize case (the lib carries no image codec) — it errors loudly.
-fn control_image_to_nchw(image: &Image, width: u32, height: u32, device: &Device) -> Result<Tensor> {
+fn control_image_to_nchw(
+    image: &Image,
+    width: u32,
+    height: u32,
+    device: &Device,
+) -> Result<Tensor> {
     let (iw, ih) = (image.width, image.height);
     if (iw, ih) != (width, height) {
         return Err(CandleError::Msg(format!(
