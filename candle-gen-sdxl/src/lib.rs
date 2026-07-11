@@ -79,9 +79,10 @@ pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 pub mod weights;
 
 // Euler / Euler-ancestral sampler (sc-5491) — the InstantID/diffusers-SDXL solver the InstantID
-// denoise loop runs (the txt2img `pipeline` keeps candle-transformers' non-ancestral DDIM). Port of
-// `mlx-gen-sdxl::sampler::EulerSampler`, with the ancestral noise injected (the loop owns the seeded
-// RNG, sc-3673) and the schedule scalars in host f64 (no Python parity to hold ULP-for-ULP).
+// denoise loop runs (the txt2img `pipeline` runs the unified curated framework: DDIM eta=0 by
+// default, sc-10826). Port of `mlx-gen-sdxl::sampler::EulerSampler`, with the ancestral noise
+// injected (the loop owns the seeded RNG, sc-3673) and the schedule scalars in host f64 (no Python
+// parity to hold ULP-for-ULP).
 pub mod sampler;
 pub use sampler::EulerAncestralSampler;
 
@@ -394,11 +395,13 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lokr: true,
             // DDIM (eta=0) is the deterministic, launch-portable DEFAULT (sc-3673); `lightning`
             // (sc-6128) is the few-step Euler-trailing path for distilled checkpoints. epic 7114 P4
-            // (sc-7124) ADDS the curated ε/DDPM menu (euler / euler_ancestral / heun / dpmpp_2m /
+            // (sc-7124) added the curated ε/DDPM menu (euler / euler_ancestral / heun / dpmpp_2m /
             // dpmpp_sde / uni_pc / lcm + ddim) over `DiscreteModelSampling`, plus the curated σ-schedule
-            // axis (normal / karras / sgm_uniform / …); a curated solver name routes the new EPS path
-            // while `ddim` (== the native default) and `lightning` keep their byte-exact native paths
-            // (N1). The legacy `discrete` scheduler alias is retained (falls back to the native schedule).
+            // axis (normal / karras / sgm_uniform / …). sc-10826: every non-`lightning` render — the
+            // omitted-sampler default (→ curated `ddim`) AND every named solver — now routes the curated
+            // EPS path; the native candle-transformers DDIM inference loop (which ghosted on the default)
+            // is gone, so `ddim` and the default take the clean curated `ddim` solver. `lightning` keeps
+            // its native few-step path. The legacy `discrete` scheduler alias falls back to the native schedule.
             samplers: candle_gen::menu_with_aliases(
                 candle_gen::curated_sampler_names(),
                 &["lightning"],
@@ -509,8 +512,9 @@ mod tests {
         // sc-10767 (epic 9083): the packed q4/q8 MLX-tier inference path (sc-9416/9527/9528) is now
         // advertised, so the worker keeps quant tier-selects on the candle lane rather than deferring.
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
-        // sc-7124: the curated ε/DDPM sampler menu + the native `lightning` alias; `ddim` (== the
-        // native default) is part of the curated vocabulary. The curated scheduler axis + `discrete`.
+        // sc-7124: the curated ε/DDPM sampler menu + the native `lightning` alias; `ddim` is part of
+        // the curated vocabulary and (sc-10826) is now the omitted-sampler default's solver too. The
+        // curated scheduler axis + `discrete`.
         assert_eq!(
             d.capabilities.samplers,
             candle_gen::menu_with_aliases(candle_gen::curated_sampler_names(), &["lightning"])
