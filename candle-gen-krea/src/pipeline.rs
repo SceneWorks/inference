@@ -396,7 +396,7 @@ fn init_noise(height: u32, width: u32, seed: u64, device: &Device) -> Result<Ten
 /// and the PiD super-resolving decode (which already emits `[-1, 1]` pixels, possibly at 4× the size).
 /// The reference `clamp(-1,1)·0.5 + 0.5` denormalize is the `(x+1)·127.5` below; the output size is read
 /// from the tensor, never assumed (PiD may be larger than VAE-native).
-fn to_image(decoded: &Tensor) -> Result<Image> {
+pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
     let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
