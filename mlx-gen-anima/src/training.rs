@@ -33,6 +33,15 @@
 //! (`3σ/(1+2σ)`, [`SIGMA_SHIFT`]) the inference schedule uses, and that shifted σ drives both the
 //! `x_t = (1−σ)·x0 + σ·noise` interpolation and the DiT timestep.
 //!
+//! ## Mid-run resume (sc-10642)
+//! At each `save_every` the trainer additionally writes a resume bundle (the shared sc-9560 engine in
+//! [`mlx_gen::train::checkpoint`]): the optimizer state + the raw trainable factors + `{step,
+//! update_idx, optimizer}`. With `cfg.resume`, a fresh run of the same adapter restores that state and
+//! continues from `step + 1`. On restore it **asserts the full 448 DiT + 60 `llm_adapter` = 508 target
+//! surface** against the live model (never inferred from the file) — a checkpoint that had dropped the
+//! 60 conditioner targets would resume an inert conditioner while every structural check still passed
+//! (the sc-10522 trap), so [`assert_resume_surface_matches`] fails it loudly.
+//!
 //! ## Round-trip
 //! The trained adapter round-trips through the sc-10521 inference loader: LoRA is saved with the
 //! ComfyUI `diffusion_model.` prefix + PEFT `lora_A`/`lora_B` keys and **no alpha** (the shipped Anima
@@ -40,12 +49,13 @@
 //! LoKr is saved by the shared [`save_lokr`] in the bare-path `lokr_*` convention the sc-10521 LoKr
 //! path consumes. Both reconstruct the residual at **bf16** to match the inference loader.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost};
 use mlx_gen::gen_core;
 use mlx_gen::media::Image;
+use mlx_gen::train::checkpoint;
 use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
 use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, save_lokr, LoraParams,
@@ -68,6 +78,7 @@ use crate::adapters::AnimaAdapterHost;
 use crate::conditioner::AnimaTextConditioner;
 use crate::config::{Variant, SIGMA_SHIFT};
 use crate::loader::AnimaComponents;
+use crate::pipeline::render_preview;
 use crate::text_encoder::AnimaQwen3;
 use crate::tokenizer::AnimaTokenizers;
 use crate::transformer::CosmosDiT;
@@ -87,6 +98,11 @@ const SAVE_DTYPE: Dtype = Dtype::Bfloat16;
 /// ComfyUI adapter key prefix the official Anima LoRAs (and the sc-10521 inference loader) use —
 /// `diffusion_model.blocks.*` for the DiT, `diffusion_model.llm_adapter.blocks.*` for the conditioner.
 const KEY_PREFIX: &str = "diffusion_model.";
+
+/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-10641), matching
+/// z-image's cap; extra prompts beyond this are ignored (a preview is a quick convergence check, not a
+/// full sweep, and each one is an inference denoise on the live 2B DiT).
+const SAMPLE_PROMPT_CAP: usize = 4;
 
 // ==================================================================================================
 // Flow-match batch construction
@@ -212,6 +228,73 @@ fn resolve_target_paths(
         .collect()
 }
 
+/// The distinct adapter *target paths* present in a trainable-factor map, split into the DiT
+/// (`blocks.*`) surface and the conditioner (`llm_adapter.*`) surface. Every factor is keyed
+/// `{path}.<factor>` (`.lora_a`/`.lora_b`/`.lokr_w1`/`.lokr_w2`/`.lokr_w2_a`/`.lokr_w2_b`), so the
+/// target path is the key with its trailing factor segment stripped. Used by the sc-10642 resume guard
+/// to count the 448 DiT + 60 `llm_adapter` = 508 targets a full-surface run trains.
+fn split_target_surface(params: &LoraParams) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut dit = BTreeSet::new();
+    let mut cond = BTreeSet::new();
+    for key in params.keys() {
+        let path = key.rsplit_once('.').map_or(key.as_ref(), |(p, _)| p);
+        if path.starts_with("llm_adapter.") {
+            cond.insert(path.to_string());
+        } else {
+            dit.insert(path.to_string());
+        }
+    }
+    (dit, cond)
+}
+
+/// The sc-10522 / sc-10642 restore guard. A resumed run rebuilds its trainable surface from the LIVE
+/// model (`resolve_target_paths` → `build_lora/lokr_targets`, the full **508** targets = 448 DiT +
+/// 60 `llm_adapter` for the default config) and then swaps the checkpoint's factors in. If the
+/// checkpoint had dropped the 60 conditioner (`llm_adapter.*`) targets — or otherwise disagreed with
+/// this run's surface — resume would silently continue with an **inert conditioner** while every
+/// structural check (converging DiT loss, valid adapter file) still passed: the exact sc-10522 trap.
+/// So before swapping the factors we ASSERT the checkpoint's factor surface is EXACTLY the one this run
+/// rebuilt — same DiT paths, same `llm_adapter` paths, same factor keys — and fail loudly with a typed
+/// [`Error`](mlx_gen::Error) otherwise, naming the DiT/conditioner target split so the mismatch is
+/// diagnosable. The count is asserted against the live model's surface, never inferred from the file.
+fn assert_resume_surface_matches(restored: &LoraParams, expected: &LoraParams) -> Result<()> {
+    // Exact factor-key equality is the strongest guarantee — it also catches a LoRA↔LoKr network-type
+    // mismatch or a single dropped factor, not just a wholesale missing target class.
+    let restored_keys: BTreeSet<&str> = restored.keys().map(|k| k.as_ref()).collect();
+    let expected_keys: BTreeSet<&str> = expected.keys().map(|k| k.as_ref()).collect();
+    if restored_keys == expected_keys {
+        return Ok(());
+    }
+    let (rd, rc) = split_target_surface(restored);
+    let (ed, ec) = split_target_surface(expected);
+    Err(mlx_gen::Error::Msg(format!(
+        "anima resume: checkpoint trainable surface does not match this run — refusing to resume into a \
+         silently-different model (sc-10522). checkpoint carries {rt} targets ({rdn} DiT `blocks.*` + \
+         {rcn} `llm_adapter` conditioner); this run rebuilt {et} targets ({edn} DiT + {ecn} \
+         conditioner). a checkpoint missing the {ecn} conditioner targets would resume an inert \
+         conditioner — start a fresh run or resume the matching adapter.",
+        rt = rd.len() + rc.len(),
+        rdn = rd.len(),
+        rcn = rc.len(),
+        et = ed.len() + ec.len(),
+        edn = ed.len(),
+        ecn = ec.len(),
+    )))
+}
+
+/// Whether in-training preview sampling (sc-10641) is active for this run: a positive cadence AND at
+/// least one prompt AND not already cancelled. `false` ⇒ no conditioner-input pre-encode and no render,
+/// so a run that does not opt in (the default) behaves exactly as before.
+fn previews_enabled(cfg: &TrainingConfig, cancelled: bool) -> bool {
+    cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !cancelled
+}
+
+/// Whether micro-step `step` (1-based) lands on the preview cadence. `sample_every == 0` never fires
+/// (also guarded upstream by [`previews_enabled`], but kept total here so the predicate is self-contained).
+fn preview_due(step: u32, sample_every: u32) -> bool {
+    sample_every > 0 && step.is_multiple_of(sample_every)
+}
+
 // ==================================================================================================
 // The trainer
 // ==================================================================================================
@@ -222,6 +305,9 @@ fn resolve_target_paths(
 /// that round-trips through the sc-10521 inference loader.
 pub struct AnimaTrainer {
     descriptor: TrainerDescriptor,
+    /// Which Anima variant this trainer wraps — decides whether in-training previews (sc-10641) run CFG
+    /// (base/aesthetic) or a single guidance-free forward (turbo).
+    variant: Variant,
     tokenizers: AnimaTokenizers,
     /// The Qwen3 encoder — in an `Option` so it can be **dropped after caching** (it is idle during
     /// training; every caption is already encoded to its cached `source_hidden`, and it is a multi-GB
@@ -280,6 +366,7 @@ fn load_variant_trainer(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Tra
     let components = AnimaComponents::load(&spec.weights, variant)?;
     Ok(Box::new(AnimaTrainer {
         descriptor: trainer_descriptor_for(variant),
+        variant,
         tokenizers: components.tokenizers,
         text_encoder: Some(components.text_encoder),
         vae: components.vae,
@@ -380,6 +467,35 @@ impl AnimaTrainer {
             return Err("anima trainer: no usable dataset items".into());
         }
 
+        // sc-10641 — pre-encode the preview-sample prompts' conditioner INPUTS while the Qwen3 encoder
+        // is still resident (it is freed just below). We cache the conditioner INPUTS (masked Qwen3
+        // states + T5 ids), NOT its output: the conditioner (`llm_adapter`) is a trained target, so each
+        // preview must re-run it through the live graph to reflect its adapters (the sc-10522 trap — a
+        // cached conditioner output would render silently-inert conditioner adapters). For CFG variants
+        // (base/aesthetic) the empty-prompt uncond inputs are cached once too. Skipped when sampling is
+        // off (the default) or the run is already cancelled.
+        let previews_on = previews_enabled(cfg, req.cancel.is_cancelled());
+        let sample_inputs: Vec<(String, Array, Array)> = if previews_on {
+            let mut v = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
+            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                let (source, t5_ids) = self.encode_conditioner_inputs(prompt)?;
+                eval([&source, &t5_ids])?;
+                v.push((prompt.clone(), source, t5_ids));
+            }
+            v
+        } else {
+            Vec::new()
+        };
+        // Uncond (empty-prompt) conditioner inputs — cached once, only for CFG variants at guidance ≠ 1.
+        let uncond_inputs: Option<(Array, Array)> =
+            if !sample_inputs.is_empty() && self.variant.uses_cfg() {
+                let (s, ids) = self.encode_conditioner_inputs("")?;
+                eval([&s, &ids])?;
+                Some((s, ids))
+            } else {
+                None
+            };
+
         // Every caption is encoded into `cache`; the multi-GB Qwen3 encoder is now dead weight for
         // the rest of the run. Drop it and evict its buffers before the train loop.
         self.text_encoder = None;
@@ -456,13 +572,44 @@ impl AnimaTrainer {
         let accum = cfg.gradient_accumulation.max(1);
         let (total_updates, warmup_updates) =
             schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
+        let stem = Path::new(&req.file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("adapter")
+            .to_string();
+
+        // sc-10642 — mid-run resume (the shared sc-9560 / F-125 engine). When `cfg.resume` is set and a
+        // prior interrupted run of THIS adapter left a snapshot in `output_dir`, restore its optimizer
+        // state + trainable factors + step/update index and continue from `start_step + 1` rather than
+        // step 0. The restored factors REPLACE the fresh `B = 0`/zeroed init built above; the fresh build
+        // still ran first so `params` carries the live model's full expected surface for the sc-10522
+        // guard. Snapshots land on optimizer-update boundaries at each `save_every`, so resume is
+        // bit-exact for `gradient_accumulation = 1` (the default) and when `save_every` is a multiple of
+        // the accumulation otherwise.
+        let mut update_idx: u32 = 0;
+        let mut start_step: u32 = 0;
+        if cfg.resume {
+            if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
+                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
+                // sc-10522: the checkpoint MUST carry the full 448 DiT + 60 `llm_adapter` surface this
+                // run rebuilt, or the conditioner resumes inert. Assert against the live model's surface
+                // BEFORE swapping the factors in — a typed error, not a silent inert-conditioner resume.
+                assert_resume_surface_matches(&loaded, &params)?;
+                params = loaded;
+                start_step = meta.step;
+                update_idx = meta.update_idx;
+                eprintln!(
+                    "[sc-10642] anima resuming '{stem}' from step {start_step} (optimizer update \
+                     {update_idx})"
+                );
+            }
+        }
 
         // --- train loop ---
         let mut accumulated: Option<LoraParams> = None;
-        let mut update_idx: u32 = 0;
         let mut last_loss = 0.0f32;
-        let mut steps_run = 0u32;
-        for step in 1..=cfg.steps {
+        let mut steps_run = start_step;
+        for step in start_step + 1..=cfg.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
@@ -539,7 +686,77 @@ impl AnimaTrainer {
                     .output_dir
                     .join(intermediate_filename(&req.file_name, step));
                 save_adapter(&adapter, &params, &target_paths, alpha, rank, cfg, &ckpt)?;
+                // sc-10642 — alongside the user-facing adapter checkpoint, write the resume bundle
+                // (optimizer state + raw trainable factors + `{step, update_idx, optimizer}`), so an
+                // interrupted run can continue from here with `cfg.resume` rather than restarting at 0.
+                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
                 on_progress(TrainingProgress::Checkpoint { step });
+            }
+
+            // sc-10641 — periodic preview samples from the in-progress adapter so the user can watch the
+            // LoRA converge (the sc-5637 `TrainingProgress::Sample` contract). Install the CURRENT factors
+            // as concrete adapters for the forward-only render (the traced `loss_fn` re-installs them at
+            // the next step, so no teardown is needed), then render each cached sample prompt. The render
+            // re-runs the conditioner through the LIVE graph (`render_preview` → `conditioner.forward`),
+            // so the preview reflects the 60 `llm_adapter` conditioner adapters' training — never a cached
+            // output (sc-10522). Best-effort: a render failure logs and continues the (long) run.
+            if previews_on && preview_due(step, cfg.sample_every) {
+                let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
+                {
+                    let mut host = AnimaAdapterHost {
+                        dit: &mut self.dit,
+                        conditioner: &mut self.conditioner,
+                    };
+                    adapter.install_as(&mut host, &params, alpha, rank, lora_dtype, LOKR_DTYPE)?;
+                }
+                let guidance = if self.variant.uses_cfg() {
+                    cfg.sample_guidance_scale
+                } else {
+                    1.0 // turbo is the merged CFG-free student — a single forward, guidance inert.
+                };
+                let total = sample_inputs.len() as u32;
+                for (i, (prompt, source, t5_ids)) in sample_inputs.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        break;
+                    }
+                    let sample_seed = cfg
+                        .seed
+                        .wrapping_add(step as u64)
+                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
+                        .wrapping_add(i as u64);
+                    match render_preview(
+                        &self.dit,
+                        &self.conditioner,
+                        &self.vae,
+                        source,
+                        t5_ids,
+                        uncond_inputs.as_ref(),
+                        cfg.sample_steps.max(1) as usize,
+                        guidance,
+                        edge,
+                        sample_seed,
+                        compute_dtype,
+                    ) {
+                        Ok(image) => on_progress(TrainingProgress::Sample {
+                            step,
+                            index: i as u32 + 1,
+                            total,
+                            prompt: prompt.clone(),
+                            image,
+                        }),
+                        Err(e) => eprintln!(
+                            "[sc-10641] anima preview sample failed at step {step} (prompt {}): {e} \
+                             — skipping this preview, training continues",
+                            i + 1
+                        ),
+                    }
+                }
+                // sc-5567 — release the preview's transient forward+VAE-decode residency before
+                // training resumes. MLX pools freed buffers, so a full `sample_steps` denoise plus
+                // VAE decode on the 2B DiT can push peak residency above the train steady state and
+                // SIGKILL a tightly-budgeted run (sc-10576 memory focus). Preview path only — the
+                // training-step working set is untouched.
+                mlx_rs::memory::clear_cache();
             }
         }
 
@@ -1523,6 +1740,167 @@ mod tests {
         );
     }
 
+    // ======================================================================================
+    // sc-10641 — in-training preview sampling
+    // ======================================================================================
+
+    /// Max abs element-wise diff between two same-shape latents.
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        a.subtract(b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>()
+    }
+
+    /// The interval contract, deterministically (no weights): previews are enabled only with a positive
+    /// cadence + at least one prompt + not cancelled, and fire on EXACTLY the cadence multiples — nowhere
+    /// else. A regression to `>=`, an off-by-one, or firing when disabled reddens this.
+    #[test]
+    fn preview_cadence_contract() {
+        let base = TrainingConfig {
+            sample_every: 5,
+            sample_prompts: vec!["1girl".into()],
+            ..Default::default()
+        };
+        assert!(previews_enabled(&base, false));
+        assert!(!previews_enabled(&base, true), "cancelled ⇒ disabled");
+        assert!(
+            !previews_enabled(
+                &TrainingConfig {
+                    sample_every: 0,
+                    ..base.clone()
+                },
+                false
+            ),
+            "cadence 0 ⇒ disabled"
+        );
+        assert!(
+            !previews_enabled(
+                &TrainingConfig {
+                    sample_prompts: vec![],
+                    ..base.clone()
+                },
+                false
+            ),
+            "no prompts ⇒ disabled"
+        );
+        // The default config never opts in.
+        assert!(!previews_enabled(&TrainingConfig::default(), false));
+
+        // Fires on multiples of the cadence, nowhere else.
+        let due: Vec<u32> = (1..=12).filter(|&s| preview_due(s, 5)).collect();
+        assert_eq!(due, vec![5, 10]);
+        assert!(!preview_due(1, 5) && !preview_due(7, 5) && !preview_due(11, 5));
+        assert!(
+            (1..=10).all(|s| !preview_due(s, 0)),
+            "cadence 0 never fires"
+        );
+    }
+
+    /// sc-10641 live-graph guard (the critical correctness point). The preview MUST re-run the
+    /// conditioner (`llm_adapter`) through the LIVE graph so it reflects the in-training conditioner
+    /// adapters — never a cached output (the sc-10522 trap). Synthetic small model, Metal, no real
+    /// weights. A trained (non-zero `lora_b`) adapter is installed on the CONDITIONER ONLY (the DiT
+    /// factors stay at the `B=0` no-op), so the ONLY thing that can move the preview latent is the live
+    /// conditioner. The production `render_preview_latent` (conditioner run live) is compared against
+    /// `render_latent_with_enc` fed a STALE conditioner output captured BEFORE install:
+    ///   - live ≠ stale  ⇒ the preview genuinely re-ran the conditioner adapters — FAILS if it ever
+    ///     regressed to caching the conditioner output.
+    ///   - live == render_latent_with_enc(live enc) ⇒ the conditioner is the sole live-dependent input,
+    ///     so the first assertion can't pass for a spurious reason.
+    #[test]
+    fn preview_samples_conditioner_through_live_graph() {
+        let (mut dit, mut cond, params0, adapter, _tp, _blocks) = tiny_model_and_adapter();
+        // `tiny_inputs` returns (x0, source, t5_ids, noise); the noise is the preview's starting latent.
+        let (_x0, source, t5_ids, init) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
+
+        // Stale conditioner output — captured from the BASE conditioner (no adapters installed). This is
+        // exactly what caching the conditioner OUTPUT would freeze into the preview (the trap).
+        let enc_stale = cond.forward(&source, &t5_ids, Dtype::Float32).unwrap();
+        eval([&enc_stale]).unwrap();
+
+        // "Train" the conditioner: give its `lora_b` non-zero values (build_lora_targets inits them to
+        // 0). DiT `lora_b` left at 0 (inert) ⇒ the DiT forward is constant across both legs.
+        let mut trained = params0.clone();
+        for (k, v) in trained.iter_mut() {
+            if k.starts_with("llm_adapter.") && k.ends_with(".lora_b") {
+                *v = random::normal::<f32>(v.shape(), None, None, Some(&random::key(99).unwrap()))
+                    .unwrap();
+            }
+        }
+        {
+            let mut host = AnimaAdapterHost {
+                dit: &mut dit,
+                conditioner: &mut cond,
+            };
+            adapter
+                .install_as(&mut host, &trained, 4.0, 4.0, None, LOKR_DTYPE)
+                .unwrap();
+        }
+
+        let steps = 3usize;
+        // Production preview path: conditioner run LIVE (reflects the trained conditioner adapters).
+        let latent_live = crate::pipeline::render_preview_latent(
+            &dit,
+            &cond,
+            &source,
+            &t5_ids,
+            None,
+            &init,
+            steps,
+            1.0,
+            7,
+            Dtype::Float32,
+        )
+        .unwrap();
+        // Same DiT, but a STALE (pre-training) conditioner output — the trap.
+        let latent_stale = crate::pipeline::render_latent_with_enc(
+            &dit,
+            &enc_stale,
+            None,
+            &init,
+            steps,
+            1.0,
+            7,
+            Dtype::Float32,
+        )
+        .unwrap();
+        // Positive control: feed render_latent_with_enc the LIVE conditioner output → must equal the
+        // live preview (proves the conditioner is the only live-dependent input; no spurious diff).
+        let enc_live = cond.forward(&source, &t5_ids, Dtype::Float32).unwrap();
+        let latent_ctrl = crate::pipeline::render_latent_with_enc(
+            &dit,
+            &enc_live,
+            None,
+            &init,
+            steps,
+            1.0,
+            7,
+            Dtype::Float32,
+        )
+        .unwrap();
+        eval([&latent_live, &latent_stale, &latent_ctrl]).unwrap();
+
+        let live_vs_stale = max_abs_diff(&latent_live, &latent_stale);
+        let live_vs_ctrl = max_abs_diff(&latent_live, &latent_ctrl);
+        eprintln!(
+            "[sc-10641] preview latent live-vs-stale {live_vs_stale:.3e}, live-vs-ctrl {live_vs_ctrl:.3e}"
+        );
+        assert!(
+            live_vs_stale > 1e-4,
+            "preview must re-run the conditioner LIVE: a cached (stale) conditioner output yields the \
+             same latent (max abs diff {live_vs_stale:.3e}) — the sc-10522 inert-adapter trap"
+        );
+        assert!(
+            live_vs_ctrl < 1e-5,
+            "render_preview_latent's only live input is the conditioner: feeding the live enc must \
+             reproduce the preview (max abs diff {live_vs_ctrl:.3e})"
+        );
+    }
+
     // -------- real-weights measurement + validation (sc-10576), #[ignore]d + snapshot-gated --------
 
     fn anima_split() -> Option<std::path::PathBuf> {
@@ -1693,6 +2071,143 @@ mod tests {
             refused,
             "dense 1536 (projected {dense_proj:.0} GB) must be refused by the pre-flight guard"
         );
+    }
+
+    // ==============================================================================================
+    // sc-10642 — mid-run resume (CI, Metal-synthetic; no real weights)
+    // ==============================================================================================
+
+    /// Round-trip: a few optimizer steps over the Anima trainable surface → `save_resume` → discover →
+    /// `load_resume` restores the optimizer state + trainable factors + step/update index. The restored
+    /// factors match bit-for-bit, the step count comes back as N (not 0), and the restored optimizer's
+    /// next step matches the uninterrupted optimizer's — the sc-9560 exactness the resume wiring relies
+    /// on, exercised on Anima's own two-host (DiT + `llm_adapter`) factor map.
+    #[test]
+    fn resume_round_trips_optimizer_factors_and_step() {
+        let (_dit, _cond, params, _adapter, _tp, _blocks) = tiny_model_and_adapter();
+        // Synthetic non-zero grads keyed exactly as the factors (so both optimizer instances step
+        // identically). `lora_b` starts at 0, so a real grad is needed to move the state.
+        let grads: LoraParams = params
+            .iter()
+            .map(|(k, v)| {
+                let g =
+                    random::normal::<f32>(v.shape(), None, None, Some(&random::key(99).unwrap()))
+                        .unwrap();
+                (k.clone(), g)
+            })
+            .collect();
+        let mut opt = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+        opt.set_lr_scaled(1.0);
+        let mut p = params.clone();
+        opt.step(&mut p, &grads).unwrap();
+        opt.step(&mut p, &grads).unwrap();
+        eval(p.values()).unwrap();
+
+        let dir = std::env::temp_dir().join("mlxgen_anima_resume_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = "anima_style";
+        checkpoint::save_resume(&dir, stem, 4, 2, &opt, &p).unwrap();
+
+        // Discovery returns the snapshot's step; load restores it.
+        let (found, step) = checkpoint::find_latest_resume(&dir, stem).expect("resume snapshot");
+        assert_eq!(step, 4, "find_latest_resume returns the snapshot step");
+        let mut opt2 = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+        let (loaded, meta) = checkpoint::load_resume(&found, &mut opt2).unwrap();
+
+        // The Anima surface guard passes on a faithful round-trip (fresh-build keys == restored keys).
+        assert_resume_surface_matches(&loaded, &params).unwrap();
+
+        // Step count + update index restored — resume continues at N, not 0.
+        assert_eq!(meta.step, 4, "resumes at the recorded step, not 0");
+        assert_eq!(meta.update_idx, 2, "optimizer-update index restored");
+        assert_eq!(meta.optimizer, "adamw");
+
+        // Trainable factors (adapter weights) restored bit-for-bit.
+        assert_eq!(loaded.len(), p.len(), "same factor count");
+        for (k, v) in &p {
+            let l = loaded.get(k).expect("restored factor");
+            let d = v
+                .subtract(l)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            assert!(d == 0.0, "factor {k} not restored bit-exact: |Δ| = {d:e}");
+        }
+
+        // Optimizer state restored: the restored optimizer's next step == the uninterrupted one's.
+        let mut a = p.clone();
+        let mut b = loaded;
+        opt.set_lr_scaled(1.0);
+        opt2.set_lr_scaled(1.0);
+        opt.step(&mut a, &grads).unwrap();
+        opt2.step(&mut b, &grads).unwrap();
+        eval(a.values()).unwrap();
+        eval(b.values()).unwrap();
+        let m = max_rel_diff(&a, &b);
+        assert!(
+            m <= 1e-6,
+            "restored optimizer's next step diverged: max_rel {m:e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sc-10522 restore assertion. The guard passes when the checkpoint's factor surface matches the
+    /// live model's, and ERRORS (failure-capable) when the checkpoint dropped the conditioner
+    /// (`llm_adapter.*`) targets — the trap where the DiT keeps training and every structural check
+    /// passes while the conditioner is silently inert — or dropped any single factor.
+    #[test]
+    fn resume_restore_asserts_full_target_surface() {
+        let (_dit, _cond, params, _adapter, _tp, _blocks) = tiny_model_and_adapter();
+
+        // The tiny synthetic surface is a scaled-down analogue of the real 448 DiT + 60 `llm_adapter`
+        // split; the guard is size-agnostic (it asserts restored == live surface). Both classes present.
+        let (dit_paths, cond_paths) = split_target_surface(&params);
+        assert!(!dit_paths.is_empty(), "tiny surface has DiT targets");
+        assert!(
+            !cond_paths.is_empty(),
+            "tiny surface has conditioner targets"
+        );
+
+        // Faithful restore (identical surface) passes.
+        assert_resume_surface_matches(&params, &params).unwrap();
+
+        // Drop the conditioner (`llm_adapter.*`) factors — the sc-10522 inert-conditioner trap. ERROR.
+        let mut dropped = params.clone();
+        let cond_keys: Vec<_> = dropped
+            .keys()
+            .filter(|k| k.starts_with("llm_adapter."))
+            .cloned()
+            .collect();
+        assert!(
+            !cond_keys.is_empty(),
+            "there are conditioner factors to drop"
+        );
+        for k in cond_keys {
+            dropped.remove(&k);
+        }
+        let err = assert_resume_surface_matches(&dropped, &params)
+            .expect_err("a checkpoint missing the conditioner targets must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("sc-10522"), "error names the trap: {msg}");
+        assert!(
+            msg.contains("0 `llm_adapter` conditioner"),
+            "error reports 0 conditioner targets in the checkpoint: {msg}"
+        );
+
+        // Dropping a single DiT factor is also caught (wrong count within a class, not a whole class).
+        let mut one_missing = params.clone();
+        let a_dit = one_missing
+            .keys()
+            .find(|k| !k.starts_with("llm_adapter.") && k.ends_with(".lora_a"))
+            .cloned()
+            .expect("a DiT lora_a factor");
+        one_missing.remove(&a_dit);
+        assert_resume_surface_matches(&one_missing, &params)
+            .expect_err("a checkpoint missing a single factor must be refused");
     }
 }
 
