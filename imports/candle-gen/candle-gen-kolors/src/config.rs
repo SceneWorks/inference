@@ -10,12 +10,13 @@
 //! SDXL's 2816 = pooled 1280 + 1536).
 //!
 //! The candle deviations from the mlx descriptor are the two backend-correct ones the SDXL / FLUX /
-//! Z-Image / Chroma candle slices already make: `backend = "candle"` and `mac_only = false`. Like
-//! those slices this v1 wires **txt2img only** — LoRA/LoKr, Q4/Q8, ControlNet-pose, and IP-Adapter
-//! (all wired in the mlx provider) are NOT advertised here, and are rejected at load rather than
-//! silently dropped (the false-capability trap).
+//! Z-Image / Chroma candle slices already make: `backend = "candle"` and `mac_only = false`. This lane
+//! wires **txt2img + packed q4/q8 tiers** (sc-10819, epic 9083 — the `SceneWorks/kolors-mlx` tier is
+//! packed-detected from disk); LoRA/LoKr, ControlNet-pose, and IP-Adapter (all wired in the mlx
+//! provider) are NOT advertised here, and are rejected at load rather than silently dropped (the
+//! false-capability trap).
 
-use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor};
+use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor, Quant};
 
 /// Registry id — matches the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";
@@ -32,11 +33,11 @@ pub const DEFAULT_SAMPLER: &str = "euler_discrete";
 /// Kolors works in the SDXL VAE's /8 latent — both image dims must be multiples of 8.
 pub const SIZE_MULTIPLE: u32 = 8;
 
-/// Kolors' identity + the surface this candle slice wires: real classifier-free guidance (negative
-/// prompt + CFG scale), txt2img only. No conditioning / LoRA / quantization is advertised — those
-/// remain the Python fallback's job until candle wires them, so the descriptor never promises a path
-/// `generate` can't serve. Two backend-correct deviations from `mlx-gen-kolors`: `backend = "candle"`
-/// and `mac_only = false`.
+/// Kolors' identity + the surface this candle lane wires: real classifier-free guidance (negative
+/// prompt + CFG scale), txt2img, and packed **Q4/Q8** MLX-tier inference (sc-10819). No conditioning /
+/// LoRA is advertised — those remain the Python fallback's job until candle wires them, so the
+/// descriptor never promises a path `generate` can't serve. Two backend-correct deviations from
+/// `mlx-gen-kolors`: `backend = "candle"` and `mac_only = false`.
 ///
 /// epic 7114 P4 (sc-7124): the native leading `euler_discrete` is the byte-exact DEFAULT, but the
 /// curated ε/DDPM sampler menu (euler / euler_ancestral / heun / dpmpp_2m / dpmpp_sde / uni_pc / lcm /
@@ -84,8 +85,12 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 8,
             // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
             mac_only: false,
-            // No on-the-fly quantization wired yet.
-            supported_quants: &[],
+            // Packed q4/q8 MLX-tier inference (sc-10819, epic 9083): the `SceneWorks/kolors-mlx` tier
+            // packs the SDXL-family UNet + the four ChatGLM3 projections (VAE dense), and the candle
+            // loader packed-detects it from disk (`pipeline::load_components`). Advertise Q4/Q8; the
+            // `LoadSpec::quantize` overlay is an advisory no-op on an already-packed tier (as with
+            // sdxl/boogu/flux2-dev). bf16 tiers stay dense (Quant::None).
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -152,11 +157,12 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
-        // txt2img: no conditioning / LoRA / quant advertised in this slice.
+        // txt2img: no conditioning / LoRA advertised on the candle lane.
         assert!(d.capabilities.conditioning.is_empty());
         assert!(!d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_lokr);
-        assert!(d.capabilities.supported_quants.is_empty());
+        // sc-10819: packed q4/q8 MLX-tier inference is wired end-to-end, so Q4/Q8 are advertised.
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         // sc-7124: the curated ε/DDPM sampler menu + the native `euler_discrete` alias; the curated
         // scheduler axis + the legacy `discrete` alias. A curated solver name routes the new EPS path.
         assert_eq!(

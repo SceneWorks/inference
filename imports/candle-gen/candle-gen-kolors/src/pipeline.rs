@@ -24,9 +24,16 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::{AlphaSchedule, Scheduler, Solver};
 use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::quant::{PackedConfig, QLinear, MLX_GROUP_SIZE};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, Result};
+// The vendored, packed-detecting SDXL UNet (candle-gen-sdxl, sc-9416) — its whole Linear surface routes
+// through `candle_gen::quant`, so it loads a packed MLX tier straight from the packed parts. Kolors is an
+// SDXL-family UNet, so the tier's `unet/` loads into it 1:1; the two Kolors deltas (the 5632
+// `add_embedding` + the external `encoder_hid_proj`) are handled outside the block stack, exactly as the
+// Kolors IP-Adapter provider already does (sc-10819).
 use candle_gen_pid::PidEngine;
+use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel as VendoredUNet};
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
 
 use crate::chatglm3::ChatGlmModel;
@@ -100,13 +107,92 @@ pub(crate) struct Pipeline {
     pid_spec: Option<PidWeights>,
 }
 
+/// Kolors' two UNet deltas vs stock SDXL, both auto-present in the checkpoint: the `add_embedding` MLP
+/// takes **5632** = pooled(4096) + 6·256 time-ids (vs SDXL's 2816), and an `encoder_hid_proj` Linear
+/// projects the ChatGLM3 context (4096) to the cross-attention width (2048). The vendored SDXL UNet
+/// carries the first via [`VendoredUNet::with_add_embedding`]; the second is applied outside the block
+/// stack (the vendored UNet's context arrives already at 2048). Mirrors [`crate::ip_provider`].
+const ADDITION_TIME_EMBED_DIM: usize = 256;
+const PROJECTION_INPUT_DIM: usize = 5632;
+const CONTEXT_DIM: usize = 4096;
+const CROSS_ATTENTION_DIM: usize = 2048;
+
+/// The Kolors denoise UNet, in one of two builds sharing the projected-context forward contract
+/// (sc-10819):
+///
+/// - [`Self::Dense`] — the crate's [`KolorsUNet`] (stock candle-transformers cross-attn blocks + the
+///   internal `encoder_hid_proj`), built for a **dense** `Kwai-Kolors/Kolors-diffusers` snapshot.
+///   Byte-identical to the pre-sc-10819 txt2img path (zero regression on every dense checkpoint).
+/// - [`Self::Packed`] — the vendored, packed-detecting SDXL [`VendoredUNet`] carrying the two Kolors
+///   deltas (the 5632 `add_embedding` + an **external** packed-detecting `encoder_hid_proj`), built
+///   **only** for a pre-quantized MLX tier (`SceneWorks/kolors-mlx` q4/q8), where the whole
+///   attention/FF/proj/time-embed Linear surface loads straight from the packed
+///   `{weight u32, scales, biases}` parts (no dense staging) and the convolutions + norms stay dense.
+///   This is the SAME vendored stack the Kolors IP-Adapter provider renders through ([`crate::ip_provider`]),
+///   minus the IP install — so a q4/q8 tier reproduces the Kolors txt2img numerics at a packed footprint.
+///
+/// Both are `Arc`-shared so the seed/prompt-independent UNet is cached across `generate` calls.
+#[derive(Clone)]
+pub(crate) enum KolorsUnet {
+    Dense(Arc<KolorsUNet>),
+    Packed {
+        unet: Arc<VendoredUNet>,
+        /// The Kolors `encoder_hid_proj` (ChatGLM3 4096 → cross-attn 2048), packed-detected (the MLX
+        /// tier packs it inside `unet/`, so a bare `candle_nn::Linear` can't read it). The vendored UNet
+        /// has no internal `encoder_hid_proj`, so it is applied here (like [`crate::ip_provider`]).
+        encoder_hid_proj: Arc<QLinear>,
+    },
+}
+
+impl KolorsUnet {
+    /// Project the raw ChatGLM3 context `[B, S, 4096]` to the cross-attention width `[B, S, 2048]`.
+    /// Step-invariant (prompt-only, not timestep), so the caller hoists it out of the denoise loop
+    /// (sc-9040 / F-056) and feeds the result to [`Self::forward_projected`].
+    fn project_context(&self, context: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(u) => Ok(u.project_context(context)?),
+            Self::Packed {
+                encoder_hid_proj, ..
+            } => Ok(encoder_hid_proj.forward(context)?),
+        }
+    }
+
+    /// Predict `eps` for one denoise step from an **already-projected** context. Both builds take the
+    /// same `(model_in, timestep, encoder_hidden_states 2048-wide, pooled, time_ids)`; the packed
+    /// vendored UNet routes through `forward_instantid` with no IP tokens and no ControlNet residuals —
+    /// numerically a plain Kolors forward (the exact path [`crate::ip_provider`]'s base denoise uses).
+    fn forward_projected(
+        &self,
+        xs: &Tensor,
+        timestep: f64,
+        encoder_hidden_states: &Tensor,
+        pooled: &Tensor,
+        time_ids: &Tensor,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Dense(u) => {
+                Ok(u.forward_projected(xs, timestep, encoder_hidden_states, pooled, time_ids)?)
+            }
+            Self::Packed { unet, .. } => Ok(unet.forward_instantid(
+                xs,
+                timestep,
+                encoder_hidden_states,
+                pooled,
+                time_ids,
+                None, // txt2img — no ControlNet down residuals
+                None, // … and no mid residual
+            )?),
+        }
+    }
+}
+
 /// The loaded Kolors components, `Arc`-shared so the generator can cache them across `generate` calls.
 /// All four are immutable in the forward (no per-call mutable state), so no interior locking is needed.
 #[derive(Clone)]
 pub(crate) struct Components {
     tokenizer: Arc<KolorsTokenizer>,
     chatglm: Arc<ChatGlmModel>,
-    unet: Arc<KolorsUNet>,
+    unet: KolorsUnet,
     vae: Arc<AutoEncoderKL>,
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
     pid: Option<Arc<PidEngine>>,
@@ -122,14 +208,67 @@ impl Pipeline {
     }
 
     /// Load the four heavy components from the Kolors-diffusers snapshot (`tokenizer/`, `text_encoder/`
-    /// ChatGLM3-6B, `unet/` SDXL-family UNet, `vae/` SDXL VAE), all at f32.
+    /// ChatGLM3-6B, `unet/` SDXL-family UNet, `vae/` SDXL VAE).
+    ///
+    /// **Packed q4/q8 tiers (sc-10819, epic 9083).** A pre-quantized `SceneWorks/kolors-mlx` tier packs
+    /// the UNet (pack-all) + the four ChatGLM3 projections, mirroring the dense VAE (mlx-gen #659). The
+    /// packing is **detected from disk** (the `quantization` block in `unet/` & `text_encoder/`
+    /// `config.json`, the same probe the SDXL packed load uses), not from `LoadSpec::quantize`:
+    /// - the ChatGLM3 encoder's four projections packed-detect per Linear (`.scales` sibling) with the
+    ///   `group_size` threaded from `text_encoder/config.json`;
+    /// - a packed `unet/` builds the vendored, packed-detecting SDXL UNet with the two Kolors deltas; a
+    ///   dense `unet/` builds the stock [`KolorsUNet`] (the byte-exact default path);
+    /// - the VAE stays dense f32 in every tier (the MLX packer mirrors it, not packs it).
     pub(crate) fn load_components(&self) -> Result<Components> {
         let tokenizer = KolorsTokenizer::from_dir(self.root.join("tokenizer"))?;
-        let chatglm = ChatGlmModel::new(
+
+        // ChatGLM3-6B text encoder. The four GLM projections packed-detect on their `.scales` sibling
+        // (`ChatGlmModel::new_gs`); the group is threaded from `text_encoder/config.json` when packed
+        // (a dense tier has no block → the default 64, ignored by the dense Linear arm).
+        let te_dir = self.root.join("text_encoder");
+        let te_group = detect_packed_group(&te_dir.join("config.json"))?.unwrap_or(MLX_GROUP_SIZE);
+        let chatglm = ChatGlmModel::new_gs(
             ChatGlmConfig::chatglm3_6b(),
-            self.f32_vb(&self.root.join("text_encoder"))?,
+            self.f32_vb(&te_dir)?,
+            te_group,
         )?;
-        let unet = KolorsUNet::new(self.f32_vb(&self.root.join("unet"))?, false)?;
+
+        // UNet: a packed MLX tier (a `quantization` block in `unet/config.json`) builds the vendored,
+        // packed-detecting SDXL UNet + the two Kolors deltas straight from the packed parts; a dense
+        // snapshot builds the stock `KolorsUNet` (byte-exact default path, zero regression).
+        let unet = match detect_packed_unet(&self.root)? {
+            Some((unet_file, group_size)) => {
+                let vs = candle_gen::mmap_var_builder(&[unet_file], DType::F32, &self.device)?;
+                // The vendored UNet + the 5632 `add_embedding` (both packed-detecting via the shared
+                // `candle_gen::quant` seam); `sdxl_unet_config` is the canonical 3-block SDXL geometry
+                // Kolors shares. `false` = math attention (the vendored flash path is a stub).
+                let vendored = VendoredUNet::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
+                    .with_add_embedding(
+                        vs.clone(),
+                        ADDITION_TIME_EMBED_DIM,
+                        PROJECTION_INPUT_DIM,
+                    )?;
+                // The Kolors `encoder_hid_proj` is packed inside `unet/` (pack-all), so it must
+                // packed-detect too — a bare `candle_nn::Linear` would read the u32 codes as garbage.
+                let encoder_hid_proj = QLinear::linear_detect_gs(
+                    CONTEXT_DIM,
+                    CROSS_ATTENTION_DIM,
+                    &vs,
+                    "encoder_hid_proj",
+                    true,
+                    group_size,
+                )?;
+                KolorsUnet::Packed {
+                    unet: Arc::new(vendored),
+                    encoder_hid_proj: Arc::new(encoder_hid_proj),
+                }
+            }
+            None => KolorsUnet::Dense(Arc::new(KolorsUNet::new(
+                self.f32_vb(&self.root.join("unet"))?,
+                false,
+            )?)),
+        };
+
         let vae = AutoEncoderKL::new(
             self.f32_vb(&self.root.join("vae"))?,
             3,
@@ -149,7 +288,7 @@ impl Pipeline {
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
             chatglm: Arc::new(chatglm),
-            unet: Arc::new(unet),
+            unet,
             vae: Arc::new(vae),
             pid,
         })
@@ -353,6 +492,52 @@ impl Pipeline {
     }
 }
 
+/// Parse the packed `group_size` out of a component `config.json` (sc-10819): `Some(group_size)` when
+/// the file carries a `quantization` block ([`PackedConfig`]), else `None` (a dense component — a
+/// missing config is treated as dense; the downstream loader gives the precise "missing X" error). Used
+/// for the ChatGLM3 `text_encoder/` group thread (the per-Linear `.scales` detection is
+/// [`QLinear::linear_detect_gs`]'s job, so this only recovers the grid, never gates the packed path).
+fn detect_packed_group(cfg_path: &Path) -> Result<Option<usize>> {
+    if !cfg_path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(cfg_path)
+        .map_err(|e| CandleError::Msg(format!("kolors: read {}: {e}", cfg_path.display())))?;
+    let cfg: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| CandleError::Msg(format!("kolors: parse {}: {e}", cfg_path.display())))?;
+    Ok(PackedConfig::from_config(&cfg).map(|p| p.group_size as usize))
+}
+
+/// Detect a pre-quantized MLX Kolors tier at `root` (sc-10819): `Some((unet_file, group_size))` when
+/// `unet/config.json` carries a `quantization` block ([`PackedConfig`]) and the packed weight file
+/// (`diffusion_pytorch_model.safetensors`) exists, else `None` (a dense diffusers snapshot → the stock
+/// [`KolorsUNet`]). Mirrors `candle_gen_sdxl`'s `detect_packed_unet`: the Kolors UNet reuses the vendored
+/// SDXL UNet, whose Linear seam threads only the default MLX group 64 through its nested blocks, so a
+/// non-64 tier is refused loudly rather than repacked on the wrong grid (the `SceneWorks/kolors-mlx`
+/// tiers pack at 64, so this never fires on a real tier).
+fn detect_packed_unet(root: &Path) -> Result<Option<(PathBuf, usize)>> {
+    let cfg_path = root.join("unet/config.json");
+    let Some(group_size) = detect_packed_group(&cfg_path)? else {
+        return Ok(None);
+    };
+    if group_size != MLX_GROUP_SIZE {
+        return Err(CandleError::Msg(format!(
+            "kolors: packed tier group_size {group_size} unsupported (the vendored SDXL UNet threads \
+             only {MLX_GROUP_SIZE}); a non-64 tier needs the group threaded through the UNet blocks"
+        )));
+    }
+    let file = root.join("unet/diffusion_pytorch_model.safetensors");
+    if !file.is_file() {
+        return Err(CandleError::Msg(format!(
+            "kolors: packed tier {} declares a quantization block but the packed UNet file {} is \
+             missing",
+            root.display(),
+            file.display()
+        )));
+    }
+    Ok(Some((file, group_size)))
+}
+
 /// The SDXL VAE config (`stabilityai/stable-diffusion-xl-base-1.0/vae/config.json`) — Kolors reuses it.
 /// `pub(crate)` so the IP-Adapter provider (sc-5488) builds the identical VAE.
 pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
@@ -404,6 +589,73 @@ mod tests {
         // Unknown names fall back to the native default (N3 at this layer = stay native).
         assert_eq!(curated_route(Some("not_a_solver"), None), None);
         assert_eq!(curated_route(None, Some("not_a_scheduler")), None);
+    }
+
+    /// sc-10819: `detect_packed_unet` returns `Some((file, group))` when `unet/config.json` carries a
+    /// `quantization` block AND the packed weight file exists (a `SceneWorks/kolors-mlx` tier), `None`
+    /// for a dense snapshot (no block), and errors on a non-64 group (the vendored SDXL UNet threads
+    /// only 64). `detect_packed_group` returns the text-encoder group for the ChatGLM3 thread. GPU-free.
+    #[test]
+    fn detect_packed_unet_reads_quantization_block() {
+        let tmp = std::env::temp_dir().join(format!("sc10819_detect_{}", std::process::id()));
+        let unet_dir = tmp.join("unet");
+        std::fs::create_dir_all(&unet_dir).unwrap();
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"quantization": {"bits": 4, "group_size": 64}, "cross_attention_dim": 2048}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            unet_dir.join("diffusion_pytorch_model.safetensors"),
+            b"stub",
+        )
+        .unwrap();
+
+        let got = detect_packed_unet(&tmp).unwrap();
+        assert!(got.is_some(), "a quantization block ⇒ packed tier");
+        assert_eq!(got.unwrap().1, 64, "group_size threaded from config");
+
+        // A bits-only block still packs (group defaults to 64, never silent-dense — the sc-9410 rule).
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"quantization": {"bits": 8}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_packed_unet(&tmp).unwrap().map(|(_, g)| g), Some(64));
+
+        // A dense config (no quantization block) ⇒ None (the stock KolorsUNet build).
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"cross_attention_dim": 2048}"#,
+        )
+        .unwrap();
+        assert!(detect_packed_unet(&tmp).unwrap().is_none());
+
+        // A non-64 group is rejected loudly rather than repacked on the wrong grid.
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"quantization": {"bits": 4, "group_size": 32}}"#,
+        )
+        .unwrap();
+        assert!(detect_packed_unet(&tmp).is_err());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `detect_packed_group` recovers the packed group for the ChatGLM3 `text_encoder/` thread, and is
+    /// `None` for a dense config or an absent file (the dense fallback the loader defaults to 64).
+    #[test]
+    fn detect_packed_group_reads_text_encoder_config() {
+        let tmp = std::env::temp_dir().join(format!("sc10819_group_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = tmp.join("config.json");
+        // Absent file ⇒ dense.
+        assert_eq!(detect_packed_group(&cfg).unwrap(), None);
+        std::fs::write(&cfg, br#"{"quantization": {"bits": 8, "group_size": 64}}"#).unwrap();
+        assert_eq!(detect_packed_group(&cfg).unwrap(), Some(64));
+        std::fs::write(&cfg, br#"{"hidden_size": 4096}"#).unwrap();
+        assert_eq!(detect_packed_group(&cfg).unwrap(), None);
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
