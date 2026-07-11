@@ -863,6 +863,7 @@ mod tests {
                 .map(|i| TrainingItem {
                     image_path: format!("/img{i}.png").into(),
                     caption: "x".into(),
+                    control_image_path: None,
                 })
                 .collect(),
             config,
@@ -1186,6 +1187,7 @@ mod tests {
             items: vec![TrainingItem {
                 image_path: "/img0.png".into(),
                 caption: "x".into(),
+                control_image_path: None,
             }],
             config,
             output_dir: std::env::temp_dir().join("candle_flow_match_preview_test"),

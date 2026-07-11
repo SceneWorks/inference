@@ -109,6 +109,10 @@ pub struct ControlTrainConfig {
     pub save_every: u32,
     /// Bucketed square edge the samples were encoded at — recorded in the checkpoint meta sidecar.
     pub resolution: u32,
+    /// Control type this branch is trained for (`"pose"`/`"canny"`/`"depth"`/…). Recorded in the
+    /// checkpoint/overlay meta `kind` (`"{control_type}_control_branch"`) so registration describes it
+    /// correctly rather than a hardcoded label. `None` ⇒ `"pose"` (the first control type).
+    pub control_type: Option<String>,
 }
 
 impl Default for ControlTrainConfig {
@@ -127,6 +131,7 @@ impl Default for ControlTrainConfig {
             compute_dtype: DType::BF16,
             save_every: 100,
             resolution: 512,
+            control_type: None,
         }
     }
 }
@@ -349,25 +354,51 @@ impl ControlTrainer {
         Ok((pre, post))
     }
 
-    /// Write a checkpoint (`control_step{step}.safetensors` + a `.json` meta sidecar carrying the step,
-    /// block count, and encode resolution) into `out_dir`; returns its path.
+    /// Overlay meta sidecar contents: the branch's block count + encode resolution, the base model,
+    /// and the `kind` derived from `cfg.control_type` (`"{control_type}_control_branch"`, default
+    /// `"pose"`). `step` is included for intermediate checkpoints, omitted for a final overlay.
+    fn overlay_meta(&self, step: Option<u32>, base_model: &str) -> serde_json::Value {
+        let kind = format!(
+            "{}_control_branch",
+            self.cfg.control_type.as_deref().unwrap_or("pose")
+        );
+        let mut meta = serde_json::json!({
+            "n_blocks": self.branch.num_blocks(),
+            "baseModel": base_model,
+            "family": "krea_2",
+            "kind": kind,
+            "resolution": self.cfg.resolution,
+        });
+        if let Some(step) = step {
+            meta["step"] = serde_json::json!(step);
+        }
+        meta
+    }
+
+    /// Write an intermediate checkpoint (`control_step{step}.safetensors` + a `.json` meta sidecar)
+    /// into `out_dir`; returns its path.
     pub fn save_checkpoint(&self, step: u32) -> Result<PathBuf> {
         let path = self.out_dir.join(format!("control_step{step}.safetensors"));
         self.branch.save(&path)?;
         std::fs::write(
             path.with_extension("json"),
-            serde_json::json!({
-                "step": step,
-                "n_blocks": self.branch.num_blocks(),
-                "baseModel": "krea_2_turbo",
-                "family": "krea_2",
-                "kind": "pose_control_branch",
-                "resolution": self.cfg.resolution,
-            })
-            .to_string(),
+            self.overlay_meta(Some(step), "krea_2_turbo").to_string(),
         )
         .map_err(|e| CandleError::Msg(format!("write checkpoint meta: {e}")))?;
         Ok(path)
+    }
+
+    /// Save the trained branch as a **final overlay** to an explicit `path` (e.g. the studio's
+    /// `output_dir/file_name`), with a `.json` meta sidecar stamped with `base_model` + the
+    /// control-type `kind`. Unlike [`save_checkpoint`](Self::save_checkpoint) the meta omits `step`.
+    pub fn save_overlay(&self, path: &Path, base_model: &str) -> Result<()> {
+        self.branch.save(path)?;
+        std::fs::write(
+            path.with_extension("json"),
+            self.overlay_meta(None, base_model).to_string(),
+        )
+        .map_err(|e| CandleError::Msg(format!("write overlay meta: {e}")))?;
+        Ok(())
     }
 
     /// Train for `cfg.max_steps` further updates, streaming [`TrainEvent`]s to `on_event` (a step
