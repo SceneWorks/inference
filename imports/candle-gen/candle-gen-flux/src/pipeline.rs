@@ -45,15 +45,19 @@
 //! (mlx's `Reference`/IP-adapter) and LoRA/LoKr are NOT wired here — they are rejected loudly (the
 //! worker routes them to the Python fallback) rather than silently dropped.
 //!
-//! **Packed Q4/Q8 tiers (sc-9407, sc-9089 umbrella).** [`Pipeline::load_components`] auto-detects a
-//! pre-quantized MLX-packed **diffusers**-layout tier (`SceneWorks/flux1-schnell-mlx` q4/q8) by the
-//! `quantization` block in a component's `config.json` ([`Pipeline::component_is_packed`]) and loads the
-//! CLIP + T5 + DiT **straight from the packed parts** through the shared [`candle_gen::quant`]
-//! packed-detect (the vendored [`crate::packed_dit`] / [`crate::packed_te`] models) — no dense bf16
-//! staging. The VAE dequantizes its 8 packed mid-block attention projections to dense and feeds a stock
-//! diffusers `AutoEncoderKL`. A dense **BFL** snapshot (no `quantization` block) takes the stock path
-//! unchanged. On-the-fly quantization of a dense tier is still NOT done (only the pre-packed tier is a
-//! quantized path).
+//! **Diffusers-layout tiers — packed Q4/Q8 (sc-9407, sc-9089 umbrella) + dense bf16 (sc-10888).**
+//! [`Pipeline::load_components`] auto-detects the snapshot layout ([`Pipeline::uses_diffusers_layout`]).
+//! Every **diffusers**-layout tier off the `SceneWorks/flux1-{dev,schnell}-mlx` turnkey — the packed
+//! q4/q8 tiers (a `quantization` block in a component's `config.json`, [`Pipeline::component_is_packed`])
+//! **and** the dense bf16 tier (a `transformer/` diffusers subdir with no `quantization` block and no
+//! root single-file checkpoint) — loads the CLIP + T5 + DiT through the vendored [`crate::packed_dit`] /
+//! [`crate::packed_te`] models over the shared [`candle_gen::quant`] packed-**detect**: on q4/q8 each
+//! weight loads **straight from the packed parts** (no dense bf16 staging); on bf16 — where no tensor has
+//! a `.scales` sibling — the SAME builders load it **dense**, so bf16 is q4/q8 minus the dequant (no
+//! separate loader). The VAE dequantizes any packed mid-block attention projection to dense (a no-op on
+//! the fully-dense bf16 VAE) and feeds a stock diffusers `AutoEncoderKL`. A dense **BFL single-file**
+//! snapshot (root `flux1-*.safetensors`) takes the stock candle-transformers path unchanged. On-the-fly
+//! quantization of a dense tier is still NOT done (only the pre-packed tier is a quantized path).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -253,15 +257,15 @@ impl Pipeline {
         })
     }
 
-    /// Load the four heavy components from the snapshot, auto-detecting the tier. A pre-quantized
-    /// **MLX-packed** diffusers tier (`SceneWorks/flux1-schnell-mlx` q4/q8) carries a `quantization`
-    /// block in each component's `config.json` ([`Self::component_is_packed`]) — on detection the CLIP /
-    /// T5 / DiT / VAE load **straight from the packed parts** (sc-9407, no dense bf16 staging). A dense
-    /// **BFL** snapshot (black-forest-labs `FLUX.1-schnell`, no `quantization` block) takes the stock
-    /// path unchanged (sc-3694).
+    /// Load the four heavy components from the snapshot, auto-detecting the layout
+    /// ([`Self::uses_diffusers_layout`]). Every **diffusers-layout** tier off the
+    /// `SceneWorks/flux1-{dev,schnell}-mlx` turnkey — packed q4/q8 **and** dense bf16 (sc-10888) — loads
+    /// through the vendored diffusers component builders ([`Self::load_diffusers_components`]); a dense
+    /// **BFL** single-file snapshot (black-forest-labs `FLUX.1-{dev,schnell}`) takes the stock
+    /// `candle-transformers` path unchanged (sc-3694).
     pub(crate) fn load_components(&self) -> Result<Components> {
-        if self.component_is_packed("transformer")? {
-            return self.load_packed_components();
+        if self.uses_diffusers_layout()? {
+            return self.load_diffusers_components();
         }
         self.load_stock_components()
     }
@@ -301,31 +305,40 @@ impl Pipeline {
         })
     }
 
-    /// The pre-quantized MLX-packed diffusers-layout path (sc-9407): the vendored packed-detect
-    /// [`PackedClipText`] / [`PackedT5Encoder`] / [`PackedFluxDit`] load straight from the packed parts
-    /// (q4 → `Q4_1` lossless, q8 → `Q8_0` requant — no dense staging); the diffusers `AutoEncoderKL` VAE
-    /// is fed the 8 dequantized-to-dense attention projections (the rest of the VAE is already dense).
-    fn load_packed_components(&self) -> Result<Components> {
-        // CLIP-L (diffusers `text_encoder/model.safetensors`, `text_model.` prefix). Every projection +
-        // the token/position embeddings are packed; the LayerNorms stay dense.
+    /// The **diffusers-layout** component path — packed q4/q8 (sc-9407) **and** dense bf16 (sc-10888)
+    /// off the same `SceneWorks/flux1-{dev,schnell}-mlx` turnkey. The vendored packed-**detect**
+    /// [`PackedClipText`] / [`PackedT5Encoder`] / [`PackedFluxDit`] build every projection through the
+    /// shared [`QLinear::linear_detect`](candle_gen::quant::QLinear::linear_detect) /
+    /// [`QEmbedding::detect`](crate::quant::QEmbedding): on a packed tier they load straight from the
+    /// packed parts (q4 → `Q4_1` lossless, q8 → `Q8_0` requant — no dense staging); on the dense bf16
+    /// tier — where no tensor carries a `.scales` sibling — the SAME builders load each weight **dense**,
+    /// so bf16 is q4/q8 minus the dequant (no separate loader). The diffusers `AutoEncoderKL` VAE is fed
+    /// [`Self::vae_vb_dequantized`], which dequantizes any packed mid-block attention projection to dense
+    /// and passes every already-dense tensor through (a no-op on the fully-dense bf16 VAE).
+    fn load_diffusers_components(&self) -> Result<Components> {
+        // CLIP-L (diffusers `text_encoder/model.safetensors`, `text_model.` prefix). On the packed tiers
+        // every projection + the token/position embeddings are packed; on bf16 they load dense. The
+        // LayerNorms stay dense in every tier.
         let clip_vb = self.component_vb("text_encoder")?;
         let clip = PackedClipText::new(&ClipConfig::flux(), clip_vb.pp("text_model"))?;
 
-        // T5-XXL encoder (diffusers `text_encoder_2/`, single-file in the packed tier). `shared` + every
-        // block projection + block 0's `relative_attention_bias` are packed.
+        // T5-XXL encoder (diffusers `text_encoder_2/`; single-file on the packed tiers, sharded on bf16).
+        // `shared` + every block projection + block 0's `relative_attention_bias` are packed on q4/q8,
+        // dense on bf16.
         let t5_vb = self.component_vb("text_encoder_2")?;
         let t5 = PackedT5Encoder::new(&PackedT5Config::xxl(), t5_vb)?;
 
-        // FLUX diffusers DiT (`FluxTransformer2DModel`): 19 double + 38 single blocks, every Linear
-        // packed. The block counts come from the component `config.json` (defaulting to FLUX.1's 19/38).
+        // FLUX diffusers DiT (`FluxTransformer2DModel`): 19 double + 38 single blocks, every Linear packed
+        // (q4/q8) or dense (bf16). The block counts come from the component `config.json` (defaulting to
+        // FLUX.1's 19/38).
         let (num_double, num_single) = self.dit_block_counts()?;
         let dit_vb = self.component_vb("transformer")?;
         let transformer =
             PackedFluxDit::new(&flux_config(self.variant), num_double, num_single, dit_vb)?;
 
         // Diffusers `AutoEncoderKL` (identical config to z-image's VAE — 16 latent ch, [128,256,512,512],
-        // scaling 0.3611 / shift 0.1159). The 8 packed mid-block attention projections dequantize to
-        // dense; everything else is already dense bf16.
+        // scaling 0.3611 / shift 0.1159). On q4/q8 the 8 packed mid-block attention projections dequantize
+        // to dense; on bf16 nothing is packed, so every tensor passes through dense.
         let vae = AutoEncoderKL::new(&flux_vae_config(), self.vae_vb_dequantized()?)?;
 
         Ok(Components::Packed {
@@ -370,6 +383,41 @@ impl Pipeline {
             ))
         })?;
         Ok(candle_gen::quant::PackedConfig::from_config(&v).is_some())
+    }
+
+    /// Whether this snapshot uses the **diffusers component layout** (`transformer/`, `text_encoder*/`,
+    /// `vae/` subdirs) rather than the black-forest-labs single-file layout — i.e. whether to build the
+    /// vendored diffusers components ([`load_diffusers_components`](Self::load_diffusers_components)) or
+    /// the stock BFL [`IpFlux`] / `AutoEncoder` ([`load_stock_components`](Self::load_stock_components)).
+    ///
+    /// Three shapes off the `SceneWorks/flux1-{dev,schnell}-mlx` turnkey resolve here:
+    /// - **packed q4/q8** — a `quantization` block in `transformer/config.json`
+    ///   ([`Self::component_is_packed`]) ⇒ diffusers layout (`true`); the builders load straight from the
+    ///   packed parts.
+    /// - **dense bf16** (sc-10888) — no `quantization` block and **no** root BFL single-file DiT
+    ///   checkpoint, but a `transformer/` diffusers subdir (sharded `diffusion_pytorch_model-*`) ⇒
+    ///   diffusers layout (`true`). The SAME builders load it dense: the shared packed-detect reads each
+    ///   tensor dense when its `.scales` sibling is absent, so bf16 is q4/q8 minus the dequant.
+    /// - dense **BFL single-file** (root `flux1-{dev,schnell}.safetensors`) ⇒ NOT diffusers layout
+    ///   (`false`); the stock candle-transformers path (byte-exact, unchanged; sc-3694 / sc-10769).
+    ///
+    /// The BFL root checkpoint is checked FIRST for the non-packed case so a **full** black-forest-labs
+    /// snapshot — which ships BOTH the root single-file AND the diffusers subdirs — keeps the proven
+    /// stock path rather than switching layouts.
+    pub(crate) fn uses_diffusers_layout(&self) -> Result<bool> {
+        if self.component_is_packed("transformer")? {
+            return Ok(true);
+        }
+        // Dense diffusers tier (bf16): the root BFL single-file DiT is absent but the diffusers
+        // `transformer/` subdir is present. (A BFL snapshot whose root checkpoint is present stays stock.)
+        Ok(!self.has_bfl_dit_checkpoint() && self.root.join("transformer").is_dir())
+    }
+
+    /// Whether the root black-forest-labs single-file DiT checkpoint
+    /// (`flux1-{dev,schnell}.safetensors`) is present — the discriminator between a dense BFL snapshot
+    /// (stock path) and a dense diffusers snapshot (the sc-10888 bf16 tier).
+    fn has_bfl_dit_checkpoint(&self) -> bool {
+        self.root.join(self.variant.transformer_file()).is_file()
     }
 
     /// The DiT double / single block counts from the packed `transformer/config.json`
@@ -744,11 +792,12 @@ impl Pipeline {
     }
 
     /// Load ONLY the text encoders for the sequential-residency path (epic 10765 Phase 1, sc-10769) —
-    /// dropped right after the encode so the ~9 GB T5-XXL frees before the DiT loads. Same per-tier
+    /// dropped right after the encode so the ~9 GB T5-XXL frees before the DiT loads. Same per-layout
     /// loads as [`load_stock_components`](Self::load_stock_components) /
-    /// [`load_packed_components`](Self::load_packed_components), minus the DiT/VAE/PiD.
-    fn load_text_encoders_seq(&self, packed: bool) -> Result<SeqTextEncoders> {
-        if packed {
+    /// [`load_diffusers_components`](Self::load_diffusers_components), minus the DiT/VAE/PiD. `diffusers`
+    /// selects the vendored diffusers builders (packed q4/q8 or dense bf16) over the stock BFL encoders.
+    fn load_text_encoders_seq(&self, diffusers: bool) -> Result<SeqTextEncoders> {
+        if diffusers {
             let clip_vb = self.component_vb("text_encoder")?;
             let clip = PackedClipText::new(&ClipConfig::flux(), clip_vb.pp("text_model"))?;
             let t5_vb = self.component_vb("text_encoder_2")?;
@@ -791,8 +840,8 @@ impl Pipeline {
 
     /// Load ONLY the DiT for the sequential path (sc-10769) — loaded after the text encoders were
     /// dropped, so it reuses their freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE).
-    fn load_transformer_seq(&self, packed: bool) -> Result<LoadedDit> {
-        if packed {
+    fn load_transformer_seq(&self, diffusers: bool) -> Result<LoadedDit> {
+        if diffusers {
             let (num_double, num_single) = self.dit_block_counts()?;
             let dit_vb = self.component_vb("transformer")?;
             Ok(LoadedDit::Packed(PackedFluxDit::new(
@@ -818,8 +867,8 @@ impl Pipeline {
 
     /// Load ONLY the VAE for the sequential path (sc-10769). Small relative to the DiT, so it stays
     /// co-resident with the DiT through decode (splitting them further buys ~nothing on FLUX).
-    fn load_vae_seq(&self, packed: bool) -> Result<LoadedVae> {
-        if packed {
+    fn load_vae_seq(&self, diffusers: bool) -> Result<LoadedVae> {
+        if diffusers {
             Ok(LoadedVae::Packed(Box::new(AutoEncoderKL::new(
                 &flux_vae_config(),
                 self.vae_vb_dequantized()?,
@@ -848,7 +897,7 @@ impl Pipeline {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
-        let packed = self.component_is_packed("transformer")?;
+        let diffusers = self.uses_diffusers_layout()?;
         let steps = req
             .steps
             .map(|s| s as usize)
@@ -864,13 +913,13 @@ impl Pipeline {
 
         // Phase 1 — text encode, then DROP the encoders (scoped) so T5-XXL frees before the DiT loads.
         let (t5_emb, clip_emb) = {
-            let tes = self.load_text_encoders_seq(packed)?;
+            let tes = self.load_text_encoders_seq(diffusers)?;
             self.encode_seq(&tes, &req.prompt)?
         };
 
         // Phase 2 — load the DiT (reusing the encoders' freed pool) + the VAE + the optional PiD decoder.
-        let dit = self.load_transformer_seq(packed)?;
-        let vae = self.load_vae_seq(packed)?;
+        let dit = self.load_transformer_seq(diffusers)?;
+        let vae = self.load_vae_seq(diffusers)?;
         let pid_engine = self.load_pid()?;
         let pid_decoder = candle_gen_pid::resolve_pid_decoder(
             pid_engine.as_deref(),
@@ -1147,6 +1196,77 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+        Ok(())
+    }
+
+    /// `uses_diffusers_layout` routes ALL diffusers-layout tiers (packed q4/q8 AND dense bf16) to the
+    /// vendored diffusers builders, and only a BFL single-file snapshot to the stock path (sc-10888). The
+    /// dense bf16 tier (`transformer/config.json` with no `quantization` block + no root
+    /// `flux1-dev.safetensors`) is the regression this guards: it used to fall to the stock BFL branch and
+    /// die on a missing `flux1-dev.safetensors`. A **full** BFL snapshot (root single-file AND diffusers
+    /// subdirs) must still choose stock — the root checkpoint is checked first. GPU-free (small JSON/empty
+    /// files).
+    #[test]
+    fn uses_diffusers_layout_distinguishes_all_three_tiers() -> Result<()> {
+        let base = std::env::temp_dir().join(format!("sc10888_layout_{}", std::process::id()));
+        let mk_transformer_config = |dir: &Path, body: &str| -> Result<()> {
+            std::fs::create_dir_all(dir.join("transformer")).ok();
+            std::fs::write(dir.join("transformer").join("config.json"), body)
+                .map_err(|e| CandleError::Msg(e.to_string()))
+        };
+
+        // (1) Packed q4/q8 diffusers tier — `quantization` block ⇒ diffusers layout.
+        let packed = base.join("packed");
+        mk_transformer_config(
+            &packed,
+            r#"{ "num_layers": 19, "quantization": { "bits": 4, "group_size": 64 } }"#,
+        )?;
+        let pipe = Pipeline::load(Variant::Dev, &packed, &Device::Cpu, DType::F32, None);
+        assert!(
+            pipe.uses_diffusers_layout()?,
+            "packed q4/q8 must use the diffusers builders"
+        );
+
+        // (2) Dense bf16 diffusers tier — no `quantization` block, no root BFL checkpoint, but a
+        // `transformer/` subdir ⇒ diffusers layout (the sc-10888 fix). This shape previously fell to the
+        // stock path and failed on a missing `flux1-dev.safetensors`.
+        let bf16 = base.join("bf16");
+        mk_transformer_config(&bf16, r#"{ "num_layers": 19, "num_single_layers": 38 }"#)?;
+        let pipe = Pipeline::load(Variant::Dev, &bf16, &Device::Cpu, DType::F32, None);
+        assert!(
+            !pipe.has_bfl_dit_checkpoint(),
+            "the bf16 diffusers tier has no root single-file checkpoint"
+        );
+        assert!(
+            pipe.uses_diffusers_layout()?,
+            "dense bf16 diffusers tier must use the diffusers builders (sc-10888)"
+        );
+
+        // (3) Dense BFL single-file snapshot — root `flux1-dev.safetensors` present, no diffusers
+        // `transformer/` ⇒ NOT diffusers layout (stock path).
+        let bfl = base.join("bfl");
+        std::fs::create_dir_all(&bfl).ok();
+        std::fs::write(bfl.join(Variant::Dev.transformer_file()), b"")
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+        let pipe = Pipeline::load(Variant::Dev, &bfl, &Device::Cpu, DType::F32, None);
+        assert!(
+            !pipe.uses_diffusers_layout()?,
+            "a BFL single-file snapshot must take the stock path"
+        );
+
+        // (4) FULL BFL snapshot — ships BOTH the root single-file AND the diffusers subdirs. The
+        // root-checkpoint-first check must keep it on the proven stock path, not switch layouts.
+        let full = base.join("full_bfl");
+        mk_transformer_config(&full, r#"{ "num_layers": 19, "num_single_layers": 38 }"#)?;
+        std::fs::write(full.join(Variant::Dev.transformer_file()), b"")
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+        let pipe = Pipeline::load(Variant::Dev, &full, &Device::Cpu, DType::F32, None);
+        assert!(
+            !pipe.uses_diffusers_layout()?,
+            "a full BFL snapshot (root checkpoint present) must stay stock even with diffusers subdirs"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
         Ok(())
     }
 
