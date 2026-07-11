@@ -79,6 +79,69 @@ fn coherence(img: &Image) -> (f32, f32) {
     (std, coarse_std)
 }
 
+/// Variance of the 3×3 (4-neighbour) Laplacian over the interior luma pixels — the classic focus /
+/// sharpness metric (OpenCV's `Laplacian(ksize=1).var()`). A sharp, detailed render carries strong
+/// high-frequency edge energy → high variance; a washed / smudgy render (the sc-10714 q4 smudge, or
+/// any mutation whose velocity trajectory collapses into a soft wash) loses that edge energy → low
+/// variance. This is the HIGH-frequency complement to `coherence()`, which only separates
+/// image-vs-noise at LOW frequency and so waves a wash through. Luma is on the 0–255 scale.
+fn laplacian_variance_px(px: &[u8], w: usize, h: usize) -> f32 {
+    if w < 3 || h < 3 {
+        return 0.0;
+    }
+    let gray: Vec<f32> = px
+        .chunks(3)
+        .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
+        .collect();
+    let (mut sum, mut sumsq, mut n) = (0f64, 0f64, 0u64);
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let lap = 4.0 * gray[y * w + x]
+                - gray[y * w + x - 1]
+                - gray[y * w + x + 1]
+                - gray[(y - 1) * w + x]
+                - gray[(y + 1) * w + x];
+            sum += lap as f64;
+            sumsq += (lap as f64) * (lap as f64);
+            n += 1;
+        }
+    }
+    let n = n as f64;
+    ((sumsq - sum * sum / n) / n) as f32
+}
+
+fn laplacian_variance(img: &Image) -> f32 {
+    laplacian_variance_px(&img.pixels, img.width as usize, img.height as usize)
+}
+
+/// `passes`× 3×3 box blur of the RGB pixels — a faithful stand-in for the "washed / smudgy" failure
+/// mode (loss of high-frequency detail). Used only by the sharpness-floor mutation-check, to prove a
+/// realistic wash actually trips the floor (a floor no wash can reach would be vacuous).
+fn box_blur(px: &[u8], w: usize, h: usize, passes: u32) -> Vec<u8> {
+    let mut cur = px.to_vec();
+    for _ in 0..passes {
+        let src = cur.clone();
+        for y in 0..h {
+            for x in 0..w {
+                for ch in 0..3 {
+                    let (mut s, mut cnt) = (0u32, 0u32);
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let (ny, nx) = (y as i32 + dy, x as i32 + dx);
+                            if ny >= 0 && ny < h as i32 && nx >= 0 && nx < w as i32 {
+                                s += src[(ny as usize * w + nx as usize) * 3 + ch] as u32;
+                                cnt += 1;
+                            }
+                        }
+                    }
+                    cur[(y * w + x) * 3 + ch] = (s / cnt) as u8;
+                }
+            }
+        }
+    }
+    cur
+}
+
 /// Flatten a (possibly bf16) array to host f32.
 fn to_f32(a: &Array) -> Vec<f32> {
     a.as_dtype(Dtype::Float32)
@@ -102,17 +165,70 @@ fn save_png(img: &Image, path: &std::path::Path) {
     buf.save(path).expect("save png");
 }
 
+// Sharpness floor (sc-10818). A clean, detailed Anima render is SHARP — high-frequency edge energy →
+// high Laplacian variance. Measured on-device (gated Anima snapshot, Metal, seed 42, 1024², empty
+// negative): the clean bf16/q8 tiers land lap_var 1032–2844 (softest = the base Euler-solver render,
+// 1032), while the CFG q4 tiers are LEGITIMATELY washed by quant-error × CFG amplification over 30
+// steps (sc-10714) — base-q4 410, aesthetic-q4 214, turbo-q4 (CFG-free) 870 — yet ALL still clear
+// `coherence()` (std>8, coarse32>12). That is the exact hole this floor closes: a coherent-but-washed
+// render passes coherence() but fails the sharpness floor. The full floor guards bf16/q8/turbo; the
+// deliberately-soft `*_q4` CFG corners use a weaker floor. Each floor sits ~1.7–2.1× under its softest
+// clean render, and a box-blur "wash" collapses lap_var ~10× (base 1946→159, base-q4 410→33) to well
+// below the floor — proven by `assert_wash_trips_floor`.
+const SHARPNESS_FLOOR: f32 = 600.0; // clean bf16/q8 ≥ 1032; a wash → ≤ ~410. 1.7× under the softest clean.
+const SHARPNESS_FLOOR_Q4: f32 = 100.0; // clean CFG q4 ≥ 214 (aesthetic-q4); a wash → ≤ ~33. 2.1× under.
+
+/// The sharpness floor for a render, keyed off its label. The `*_q4` CFG tiers (base/aesthetic) are
+/// legitimately softer, so they get the weaker floor; everything else (bf16, q8, turbo, `*_q8`) gets
+/// the full floor.
+fn sharpness_floor(label: &str) -> f32 {
+    if label.ends_with("_q4") {
+        SHARPNESS_FLOOR_Q4
+    } else {
+        SHARPNESS_FLOOR
+    }
+}
+
+/// Mutation-check that keeps the floor honest: a box-blur "wash" of a CLEAN render must drop its
+/// Laplacian variance BELOW the floor (while the clean render itself sits above it). Proves the floor
+/// actually discriminates sharp-from-washed rather than being vacuously low. Call it on a wash-prone
+/// CFG render per floor (base bf16 for `SHARPNESS_FLOOR`, base-q4 for `SHARPNESS_FLOOR_Q4`) — NOT on
+/// the CFG-free turbo tiers, which stay sharp enough that a single blur leaves lap_var comparatively
+/// high.
+fn assert_wash_trips_floor(img: &Image, label: &str) {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let floor = sharpness_floor(label);
+    let sharp = laplacian_variance(img);
+    let washed = laplacian_variance_px(&box_blur(&img.pixels, w, h, 1), w, h);
+    assert!(
+        sharp > floor && washed < floor,
+        "{label}: the sharpness floor {floor:.0} must lie between the clean render ({sharp:.0}) and \
+         its washed copy ({washed:.0}) — floor is miscalibrated or vacuous"
+    );
+}
+
 fn assert_coherent(img: &Image, label: &str) {
     assert_eq!(img.width, 1024);
     assert_eq!(img.height, 1024);
     let (std, coarse_std) = coherence(img);
-    println!("[{label}] grayscale std = {std:.2}, coarse32 std = {coarse_std:.2}");
+    let lap = laplacian_variance(img);
+    let floor = sharpness_floor(label);
+    println!(
+        "[{label}] grayscale std = {std:.2}, coarse32 std = {coarse_std:.2}, lap_var = {lap:.2} (floor {floor:.0})"
+    );
     assert!(std > 8.0, "{label}: image is near-blank (std {std:.2})");
     // Real generations carry strong coarse layout (coarse32 std ~30-40); VAE-decoded noise averages to
     // a near-uniform coarse map (coarse32 std < ~8). A coherent anime image clears this easily.
     assert!(
         coarse_std > 12.0,
         "{label}: output lacks coarse structure — looks like noise, not a coherent image (coarse32 std {coarse_std:.2})"
+    );
+    // Sharpness floor (sc-10818): the HIGH-frequency guard `coherence()` lacks. A washed/smudgy render
+    // (the sc-10714 q4 smudge, or a mutation whose velocity trajectory collapses into a soft wash)
+    // loses edge detail → low lap_var, even while it still clears the low-frequency coherence bounds.
+    assert!(
+        lap > floor,
+        "{label}: output is washed/smudgy — Laplacian variance {lap:.2} ≤ sharpness floor {floor:.2}"
     );
 }
 
@@ -263,6 +379,11 @@ fn generate_all_three_variants_1024() {
         save_png(&img, &path);
         println!("wrote {}", path.display());
         assert_coherent(&img, variant.id());
+        // Sharpness-floor mutation-check (sc-10818): the base bf16 render is the wash-prone CFG
+        // reference for SHARPNESS_FLOOR — prove a wash of it actually trips the floor.
+        if variant == Variant::Base {
+            assert_wash_trips_floor(&img, variant.id());
+        }
 
         // Base: also render with the reference Euler solver (matches diffusers FlowMatchEuler) as a
         // cross-check that the DiT/conditioner port is correct independent of the stochastic solver.
@@ -375,7 +496,13 @@ fn generate_quant_tiers_all_variants_q8_q4() {
         let path = out.join(format!("{}_1024_q{bits}.png", variant.id()));
         save_png(&img, &path);
         println!("wrote {}", path.display());
-        assert_coherent(&img, &format!("{}_q{bits}", variant.id()));
+        let label = format!("{}_q{bits}", variant.id());
+        assert_coherent(&img, &label);
+        // Sharpness-floor mutation-check (sc-10818): base-q4 is the wash-prone CFG reference for the
+        // weaker SHARPNESS_FLOOR_Q4 — prove a wash of the legitimately-soft q4 render still trips it.
+        if variant == Variant::Base && bits == 4 {
+            assert_wash_trips_floor(&img, &label);
+        }
         // Disk is tight (each packed q8 DiT is ~2 GiB): drop the tier dir the moment its image lands.
         drop(generator);
         let _ = std::fs::remove_dir_all(&tier);
