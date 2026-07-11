@@ -30,10 +30,39 @@ pub const PREFIX_TOKENS: usize = 34;
 /// Qwen <|endoftext|> id — the pad token (unused on the natural-length path).
 const PAD_TOKEN_ID: i32 = 151643;
 
+/// Qwen3-VL vision markers — added-tokens in `tokenizer.json` (like `<|im_start|>`), so rendering them
+/// as literal strings + `encode(add_special_tokens=false)` maps each to its single id
+/// (151652 / 151655 / 151653). The image-grounded (edit) template wraps each reference as
+/// `<|vision_start|>` + `<|image_pad|>`×n + `<|vision_end|>`, where n is that image's merged vision-token
+/// count (from the vision tower); the encoder then replaces the `<|image_pad|>` positions with the
+/// vision features (epic 10871 P2).
+const VISION_START: &str = "<|vision_start|>";
+const VISION_END: &str = "<|vision_end|>";
+const IMAGE_PAD: &str = "<|image_pad|>";
+
 /// Render the full template string for a user prompt:
 /// `{PREFIX}{user}{SUFFIX}`.
 fn render(user: &str) -> String {
     format!("{PREFIX}{user}{SUFFIX}")
+}
+
+/// Render the image-grounded (edit) template: the same system [`PREFIX`] + user role, with each
+/// reference's vision block (`<|vision_start|><|image_pad|>×n<|vision_end|>`) preceding the instruction,
+/// then [`SUFFIX`]. `num_image_tokens[k]` is the merged vision-token count for reference `k`.
+///
+/// NB the exact edit template (system prompt + marker/instruction layout) must match the reference
+/// ComfyUI-Krea2Edit node the LoRA was trained against; this is validated on real weights in P2.3 — a
+/// mismatch shifts the tokenization the LoRA expects (and the [`PREFIX_TOKENS`] drop count).
+fn render_with_images(instruction: &str, num_image_tokens: &[usize]) -> String {
+    let mut vision = String::new();
+    for &n in num_image_tokens {
+        vision.push_str(VISION_START);
+        for _ in 0..n {
+            vision.push_str(IMAGE_PAD);
+        }
+        vision.push_str(VISION_END);
+    }
+    format!("{PREFIX}{vision}{instruction}{SUFFIX}")
 }
 
 /// The Krea condition tokenizer: the snapshot's `tokenizer/tokenizer.json` wrapped to render the Krea
@@ -78,6 +107,24 @@ impl KreaTokenizer {
     /// padding on the natural-length path). The encoder drops the leading [`PREFIX_TOKENS`].
     pub fn encode_prompt(&self, prompt: &str) -> Result<(Array, Array)> {
         let ids = self.ids(prompt)?;
+        let len = ids.len() as i32;
+        let mask = vec![1i32; ids.len()];
+        Ok((
+            Array::from_slice(&ids, &[1, len]),
+            Array::from_slice(&mask, &[1, len]),
+        ))
+    }
+
+    /// Encode the image-grounded (edit) template → `(input_ids, attention_mask)` `[1, L]` int32
+    /// (mask all-ones). `num_image_tokens[k]` is reference `k`'s merged vision-token count (from
+    /// [`mlx_gen_boogu::VisionTower::forward`]) — the number of `<|image_pad|>` placeholders the encoder
+    /// then fills with vision features (epic 10871 P2). See [`render_with_images`] for the template caveat.
+    pub fn encode_with_images(
+        &self,
+        instruction: &str,
+        num_image_tokens: &[usize],
+    ) -> Result<(Array, Array)> {
+        let ids = self.encode(&render_with_images(instruction, num_image_tokens))?;
         let len = ids.len() as i32;
         let mask = vec![1i32; ids.len()];
         Ok((
