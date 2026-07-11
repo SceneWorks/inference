@@ -774,9 +774,15 @@ impl Pipeline {
     /// tokenization + conditioning tensors are byte-identical to [`render`](Self::render).
     fn encode_seq(&self, tes: &SeqTextEncoders, prompt: &str) -> Result<(Tensor, Tensor)> {
         match tes {
-            SeqTextEncoders::Stock { clip, t5, toks } => {
-                encode_text(self.variant, toks, &self.device, self.dtype, clip, t5, prompt)
-            }
+            SeqTextEncoders::Stock { clip, t5, toks } => encode_text(
+                self.variant,
+                toks,
+                &self.device,
+                self.dtype,
+                clip,
+                t5,
+                prompt,
+            ),
             SeqTextEncoders::Packed { clip, t5, toks } => {
                 self.encode_text_packed(clip, t5, toks, prompt)
             }
