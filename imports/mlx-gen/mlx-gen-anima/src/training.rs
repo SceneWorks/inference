@@ -68,6 +68,7 @@ use crate::adapters::AnimaAdapterHost;
 use crate::conditioner::AnimaTextConditioner;
 use crate::config::{Variant, SIGMA_SHIFT};
 use crate::loader::AnimaComponents;
+use crate::pipeline::render_preview;
 use crate::text_encoder::AnimaQwen3;
 use crate::tokenizer::AnimaTokenizers;
 use crate::transformer::CosmosDiT;
@@ -87,6 +88,11 @@ const SAVE_DTYPE: Dtype = Dtype::Bfloat16;
 /// ComfyUI adapter key prefix the official Anima LoRAs (and the sc-10521 inference loader) use —
 /// `diffusion_model.blocks.*` for the DiT, `diffusion_model.llm_adapter.blocks.*` for the conditioner.
 const KEY_PREFIX: &str = "diffusion_model.";
+
+/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-10641), matching
+/// z-image's cap; extra prompts beyond this are ignored (a preview is a quick convergence check, not a
+/// full sweep, and each one is an inference denoise on the live 2B DiT).
+const SAMPLE_PROMPT_CAP: usize = 4;
 
 // ==================================================================================================
 // Flow-match batch construction
@@ -212,6 +218,19 @@ fn resolve_target_paths(
         .collect()
 }
 
+/// Whether in-training preview sampling (sc-10641) is active for this run: a positive cadence AND at
+/// least one prompt AND not already cancelled. `false` ⇒ no conditioner-input pre-encode and no render,
+/// so a run that does not opt in (the default) behaves exactly as before.
+fn previews_enabled(cfg: &TrainingConfig, cancelled: bool) -> bool {
+    cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !cancelled
+}
+
+/// Whether micro-step `step` (1-based) lands on the preview cadence. `sample_every == 0` never fires
+/// (also guarded upstream by [`previews_enabled`], but kept total here so the predicate is self-contained).
+fn preview_due(step: u32, sample_every: u32) -> bool {
+    sample_every > 0 && step.is_multiple_of(sample_every)
+}
+
 // ==================================================================================================
 // The trainer
 // ==================================================================================================
@@ -222,6 +241,9 @@ fn resolve_target_paths(
 /// that round-trips through the sc-10521 inference loader.
 pub struct AnimaTrainer {
     descriptor: TrainerDescriptor,
+    /// Which Anima variant this trainer wraps — decides whether in-training previews (sc-10641) run CFG
+    /// (base/aesthetic) or a single guidance-free forward (turbo).
+    variant: Variant,
     tokenizers: AnimaTokenizers,
     /// The Qwen3 encoder — in an `Option` so it can be **dropped after caching** (it is idle during
     /// training; every caption is already encoded to its cached `source_hidden`, and it is a multi-GB
@@ -280,6 +302,7 @@ fn load_variant_trainer(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Tra
     let components = AnimaComponents::load(&spec.weights, variant)?;
     Ok(Box::new(AnimaTrainer {
         descriptor: trainer_descriptor_for(variant),
+        variant,
         tokenizers: components.tokenizers,
         text_encoder: Some(components.text_encoder),
         vae: components.vae,
@@ -379,6 +402,35 @@ impl AnimaTrainer {
             }
             return Err("anima trainer: no usable dataset items".into());
         }
+
+        // sc-10641 — pre-encode the preview-sample prompts' conditioner INPUTS while the Qwen3 encoder
+        // is still resident (it is freed just below). We cache the conditioner INPUTS (masked Qwen3
+        // states + T5 ids), NOT its output: the conditioner (`llm_adapter`) is a trained target, so each
+        // preview must re-run it through the live graph to reflect its adapters (the sc-10522 trap — a
+        // cached conditioner output would render silently-inert conditioner adapters). For CFG variants
+        // (base/aesthetic) the empty-prompt uncond inputs are cached once too. Skipped when sampling is
+        // off (the default) or the run is already cancelled.
+        let previews_on = previews_enabled(cfg, req.cancel.is_cancelled());
+        let sample_inputs: Vec<(String, Array, Array)> = if previews_on {
+            let mut v = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
+            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                let (source, t5_ids) = self.encode_conditioner_inputs(prompt)?;
+                eval([&source, &t5_ids])?;
+                v.push((prompt.clone(), source, t5_ids));
+            }
+            v
+        } else {
+            Vec::new()
+        };
+        // Uncond (empty-prompt) conditioner inputs — cached once, only for CFG variants at guidance ≠ 1.
+        let uncond_inputs: Option<(Array, Array)> =
+            if !sample_inputs.is_empty() && self.variant.uses_cfg() {
+                let (s, ids) = self.encode_conditioner_inputs("")?;
+                eval([&s, &ids])?;
+                Some((s, ids))
+            } else {
+                None
+            };
 
         // Every caption is encoded into `cache`; the multi-GB Qwen3 encoder is now dead weight for
         // the rest of the run. Drop it and evict its buffers before the train loop.
@@ -540,6 +592,66 @@ impl AnimaTrainer {
                     .join(intermediate_filename(&req.file_name, step));
                 save_adapter(&adapter, &params, &target_paths, alpha, rank, cfg, &ckpt)?;
                 on_progress(TrainingProgress::Checkpoint { step });
+            }
+
+            // sc-10641 — periodic preview samples from the in-progress adapter so the user can watch the
+            // LoRA converge (the sc-5637 `TrainingProgress::Sample` contract). Install the CURRENT factors
+            // as concrete adapters for the forward-only render (the traced `loss_fn` re-installs them at
+            // the next step, so no teardown is needed), then render each cached sample prompt. The render
+            // re-runs the conditioner through the LIVE graph (`render_preview` → `conditioner.forward`),
+            // so the preview reflects the 60 `llm_adapter` conditioner adapters' training — never a cached
+            // output (sc-10522). Best-effort: a render failure logs and continues the (long) run.
+            if previews_on && preview_due(step, cfg.sample_every) {
+                let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
+                {
+                    let mut host = AnimaAdapterHost {
+                        dit: &mut self.dit,
+                        conditioner: &mut self.conditioner,
+                    };
+                    adapter.install_as(&mut host, &params, alpha, rank, lora_dtype, LOKR_DTYPE)?;
+                }
+                let guidance = if self.variant.uses_cfg() {
+                    cfg.sample_guidance_scale
+                } else {
+                    1.0 // turbo is the merged CFG-free student — a single forward, guidance inert.
+                };
+                let total = sample_inputs.len() as u32;
+                for (i, (prompt, source, t5_ids)) in sample_inputs.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        break;
+                    }
+                    let sample_seed = cfg
+                        .seed
+                        .wrapping_add(step as u64)
+                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
+                        .wrapping_add(i as u64);
+                    match render_preview(
+                        &self.dit,
+                        &self.conditioner,
+                        &self.vae,
+                        source,
+                        t5_ids,
+                        uncond_inputs.as_ref(),
+                        cfg.sample_steps.max(1) as usize,
+                        guidance,
+                        edge,
+                        sample_seed,
+                        compute_dtype,
+                    ) {
+                        Ok(image) => on_progress(TrainingProgress::Sample {
+                            step,
+                            index: i as u32 + 1,
+                            total,
+                            prompt: prompt.clone(),
+                            image,
+                        }),
+                        Err(e) => eprintln!(
+                            "[sc-10641] anima preview sample failed at step {step} (prompt {}): {e} \
+                             — skipping this preview, training continues",
+                            i + 1
+                        ),
+                    }
+                }
             }
         }
 
@@ -1519,6 +1631,167 @@ mod tests {
         assert!(
             under.is_ok(),
             "a 512² run under a 256 GB budget must pass the guard"
+        );
+    }
+
+    // ======================================================================================
+    // sc-10641 — in-training preview sampling
+    // ======================================================================================
+
+    /// Max abs element-wise diff between two same-shape latents.
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        a.subtract(b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>()
+    }
+
+    /// The interval contract, deterministically (no weights): previews are enabled only with a positive
+    /// cadence + at least one prompt + not cancelled, and fire on EXACTLY the cadence multiples — nowhere
+    /// else. A regression to `>=`, an off-by-one, or firing when disabled reddens this.
+    #[test]
+    fn preview_cadence_contract() {
+        let base = TrainingConfig {
+            sample_every: 5,
+            sample_prompts: vec!["1girl".into()],
+            ..Default::default()
+        };
+        assert!(previews_enabled(&base, false));
+        assert!(!previews_enabled(&base, true), "cancelled ⇒ disabled");
+        assert!(
+            !previews_enabled(
+                &TrainingConfig {
+                    sample_every: 0,
+                    ..base.clone()
+                },
+                false
+            ),
+            "cadence 0 ⇒ disabled"
+        );
+        assert!(
+            !previews_enabled(
+                &TrainingConfig {
+                    sample_prompts: vec![],
+                    ..base.clone()
+                },
+                false
+            ),
+            "no prompts ⇒ disabled"
+        );
+        // The default config never opts in.
+        assert!(!previews_enabled(&TrainingConfig::default(), false));
+
+        // Fires on multiples of the cadence, nowhere else.
+        let due: Vec<u32> = (1..=12).filter(|&s| preview_due(s, 5)).collect();
+        assert_eq!(due, vec![5, 10]);
+        assert!(!preview_due(1, 5) && !preview_due(7, 5) && !preview_due(11, 5));
+        assert!(
+            (1..=10).all(|s| !preview_due(s, 0)),
+            "cadence 0 never fires"
+        );
+    }
+
+    /// sc-10641 live-graph guard (the critical correctness point). The preview MUST re-run the
+    /// conditioner (`llm_adapter`) through the LIVE graph so it reflects the in-training conditioner
+    /// adapters — never a cached output (the sc-10522 trap). Synthetic small model, Metal, no real
+    /// weights. A trained (non-zero `lora_b`) adapter is installed on the CONDITIONER ONLY (the DiT
+    /// factors stay at the `B=0` no-op), so the ONLY thing that can move the preview latent is the live
+    /// conditioner. The production `render_preview_latent` (conditioner run live) is compared against
+    /// `render_latent_with_enc` fed a STALE conditioner output captured BEFORE install:
+    ///   - live ≠ stale  ⇒ the preview genuinely re-ran the conditioner adapters — FAILS if it ever
+    ///     regressed to caching the conditioner output.
+    ///   - live == render_latent_with_enc(live enc) ⇒ the conditioner is the sole live-dependent input,
+    ///     so the first assertion can't pass for a spurious reason.
+    #[test]
+    fn preview_samples_conditioner_through_live_graph() {
+        let (mut dit, mut cond, params0, adapter, _tp, _blocks) = tiny_model_and_adapter();
+        // `tiny_inputs` returns (x0, source, t5_ids, noise); the noise is the preview's starting latent.
+        let (_x0, source, t5_ids, init) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
+
+        // Stale conditioner output — captured from the BASE conditioner (no adapters installed). This is
+        // exactly what caching the conditioner OUTPUT would freeze into the preview (the trap).
+        let enc_stale = cond.forward(&source, &t5_ids, Dtype::Float32).unwrap();
+        eval([&enc_stale]).unwrap();
+
+        // "Train" the conditioner: give its `lora_b` non-zero values (build_lora_targets inits them to
+        // 0). DiT `lora_b` left at 0 (inert) ⇒ the DiT forward is constant across both legs.
+        let mut trained = params0.clone();
+        for (k, v) in trained.iter_mut() {
+            if k.starts_with("llm_adapter.") && k.ends_with(".lora_b") {
+                *v = random::normal::<f32>(v.shape(), None, None, Some(&random::key(99).unwrap()))
+                    .unwrap();
+            }
+        }
+        {
+            let mut host = AnimaAdapterHost {
+                dit: &mut dit,
+                conditioner: &mut cond,
+            };
+            adapter
+                .install_as(&mut host, &trained, 4.0, 4.0, None, LOKR_DTYPE)
+                .unwrap();
+        }
+
+        let steps = 3usize;
+        // Production preview path: conditioner run LIVE (reflects the trained conditioner adapters).
+        let latent_live = crate::pipeline::render_preview_latent(
+            &dit,
+            &cond,
+            &source,
+            &t5_ids,
+            None,
+            &init,
+            steps,
+            1.0,
+            7,
+            Dtype::Float32,
+        )
+        .unwrap();
+        // Same DiT, but a STALE (pre-training) conditioner output — the trap.
+        let latent_stale = crate::pipeline::render_latent_with_enc(
+            &dit,
+            &enc_stale,
+            None,
+            &init,
+            steps,
+            1.0,
+            7,
+            Dtype::Float32,
+        )
+        .unwrap();
+        // Positive control: feed render_latent_with_enc the LIVE conditioner output → must equal the
+        // live preview (proves the conditioner is the only live-dependent input; no spurious diff).
+        let enc_live = cond.forward(&source, &t5_ids, Dtype::Float32).unwrap();
+        let latent_ctrl = crate::pipeline::render_latent_with_enc(
+            &dit,
+            &enc_live,
+            None,
+            &init,
+            steps,
+            1.0,
+            7,
+            Dtype::Float32,
+        )
+        .unwrap();
+        eval([&latent_live, &latent_stale, &latent_ctrl]).unwrap();
+
+        let live_vs_stale = max_abs_diff(&latent_live, &latent_stale);
+        let live_vs_ctrl = max_abs_diff(&latent_live, &latent_ctrl);
+        eprintln!(
+            "[sc-10641] preview latent live-vs-stale {live_vs_stale:.3e}, live-vs-ctrl {live_vs_ctrl:.3e}"
+        );
+        assert!(
+            live_vs_stale > 1e-4,
+            "preview must re-run the conditioner LIVE: a cached (stale) conditioner output yields the \
+             same latent (max abs diff {live_vs_stale:.3e}) — the sc-10522 inert-adapter trap"
+        );
+        assert!(
+            live_vs_ctrl < 1e-5,
+            "render_preview_latent's only live input is the conditioner: feeding the live enc must \
+             reproduce the preview (max abs diff {live_vs_ctrl:.3e})"
         );
     }
 
