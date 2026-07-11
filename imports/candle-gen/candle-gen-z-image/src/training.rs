@@ -877,6 +877,7 @@ mod tests {
         let item = candle_gen::gen_core::train::TrainingItem {
             image_path: "/img.png".into(),
             caption: "x".into(),
+            control_image_path: None,
         };
         let base = TrainingRequest {
             items: vec![item.clone()],

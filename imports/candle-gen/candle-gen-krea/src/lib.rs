@@ -54,6 +54,12 @@ pub mod control;
 // drive a run and stream its progress. Kept gen-core-neutral for the later MLX training lane.
 pub mod control_train;
 
+// The gen_core `Trainer` adapter for Krea pose-ControlNet (sc-10163, epic 10159 B2): registers
+// `krea_2_control` so the studio drives control-branch training through the same `load_trainer` path
+// LoRA uses. Private (reached via the registry by id); its `register_trainer!` is kept linked by
+// [`force_link`], like the LoRA trainer in `training`.
+mod control_trainer;
+
 // Shared test-only tiny-DiT fixture (training + control tests).
 #[cfg(test)]
 mod testfix;
