@@ -96,7 +96,7 @@ pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 const LABEL: &str = "krea trainer";
 
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for during caption caching (matches the pipeline).
-const MAX_TEXT_TOKENS: usize = 1024;
+pub(crate) const MAX_TEXT_TOKENS: usize = 1024;
 
 /// `(x_t, target, timestep)` for one sample at flow-match `σ`: delegates the latent mix
 /// (`x_t = (1−σ)·x0 + σ·noise`, `target = noise − x0`) to the shared
@@ -164,7 +164,11 @@ fn compute_loss_grads(
 /// Tokenize `caption` + encode it through the Qwen3-VL text encoder to the cached conditioning stack
 /// `(L, num_text_layers, text_hidden)` at f32 — the exact tokenizer + select-layer stack the inference
 /// [`crate::pipeline`] uses (parity), minus the device-dtype cast (caching keeps f32).
-fn encode_caption(tok: &KreaTokenizer, te: &KreaTextEncoder, caption: &str) -> Result<Tensor> {
+pub(crate) fn encode_caption(
+    tok: &KreaTokenizer,
+    te: &KreaTextEncoder,
+    caption: &str,
+) -> Result<Tensor> {
     let ids = tok.encode_prompt(caption, MAX_TEXT_TOKENS)?;
     let enc = te.forward(&ids)?; // (1, L, num_text_layers, text_hidden)
     Ok(enc.squeeze(0)?.to_dtype(DType::F32)?)
@@ -500,7 +504,7 @@ impl FlowMatchTrainer for KreaTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testfix::{tiny_batch, tiny_dit};
+    use crate::testfix::{randn_seeded, tiny_batch, tiny_batch_seeded, tiny_dit, tiny_dit_seeded};
     use candle_gen::gen_core::registry;
     use candle_gen::train::lora::build_lora_targets;
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
@@ -649,14 +653,23 @@ mod tests {
     #[test]
     fn optimizer_steps_descend() {
         let dev = Device::Cpu;
-        let (mut dit, c, path) = tiny_dit();
+        // Draw the ENTIRE fixture — base DiT weights, LoRA adapter nudge, and probe batch — from one
+        // seeded `StdRng`, for the same reason as `control_train::control_trainer_descends` (sc-10794):
+        // candle's CPU `randn` is unseedable (it pulls the process-global `rand::rng()`), so before this
+        // every draw was nondeterministic and a marginal 6-step descent could flip sign on an unlucky
+        // init (or on ubuntu's float reassociation vs macos), red-failing CI. A distinct fixed seed
+        // makes the loss trajectory reproducible run-to-run and platform-to-platform; the larger step
+        // budget then buys an unambiguous drop (see the relative-floor assert below). Seed is
+        // 10794-adjacent but distinct from the sibling tests so they don't share a trajectory.
+        let mut rng = StdRng::seed_from_u64(10796);
+        let (mut dit, c, path) = tiny_dit_seeded(&mut rng);
         let suffixes: Vec<String> = KREA_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         for v in &set.vars {
-            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+            v.set(&randn_seeded(&mut rng, 0.0, 0.02, v.as_tensor().dims()))
                 .unwrap();
         }
-        let (x0, cap, noise) = tiny_batch(&c);
+        let (x0, cap, noise) = tiny_batch_seeded(&c, &mut rng);
         let mut opt = TrainOptimizer::from_config("adamw", set.vars.clone(), 1e-2, 0.0).unwrap();
         let (loss0, grads) = compute_loss_grads(
             &dit,
@@ -671,7 +684,7 @@ mod tests {
         )
         .unwrap();
         let mut grads = grads;
-        for _ in 0..6 {
+        for _ in 0..60 {
             clip_grad_norm(&mut grads, &set.vars, 1.0).unwrap();
             opt.step(&grads).unwrap();
             let (_l, g) = compute_loss_grads(
@@ -700,9 +713,16 @@ mod tests {
             false,
         )
         .unwrap();
+        // A correctly working LoRA adapter descends the fixed-batch loss by a wide margin over these
+        // 60 AdamW steps. Assert a >=10% relative drop rather than a bare `loss1 < loss0`: the 0.90
+        // bar sits far clear of the real ratio, so cross-platform float reassociation (the ubuntu-vs-
+        // macos delta that flaked the sibling `control_trainer_descends`) cannot lift it over the bar,
+        // while an adapter that stopped learning (ratio ~1.0) still fails hard. This stays a genuine
+        // descent gate, not a `<= before + epsilon` no-op.
         assert!(
-            loss1 < loss0,
-            "steps on a fixed batch should lower the loss: {loss0} -> {loss1}"
+            loss1 < loss0 * 0.9,
+            "steps on a fixed batch should lower the loss by >=10%: {loss0} -> {loss1} (ratio {})",
+            loss1 / loss0
         );
         let _ = std::fs::remove_file(path);
     }
@@ -734,6 +754,7 @@ mod tests {
         let item = TrainingItem {
             image_path: "/img.png".into(),
             caption: "x".into(),
+            control_image_path: None,
         };
         let base = TrainingRequest {
             items: vec![item],

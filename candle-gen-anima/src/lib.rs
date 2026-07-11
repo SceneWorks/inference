@@ -50,7 +50,7 @@ pub use text_encoder::AnimaQwen3;
 pub use transformer::CosmosDiT;
 pub use vae::{load_vae, QwenVae};
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
@@ -130,7 +130,12 @@ pub struct Anima {
     /// LoRA/LoKr adapters to bake onto the DiT + conditioner at pipeline build (empty for the plain
     /// model). Captured at load; folded lazily when the pipeline is first assembled.
     adapters: Vec<gen_core::AdapterSpec>,
-    pipeline: Mutex<Option<AnimaPipeline>>,
+    /// Lazily-built, shared pipeline behind the shared read-through cache ([`candle_gen::cached`],
+    /// sc-7792). The slot holds an `Arc<AnimaPipeline>` — cheap to clone — so `pipeline()` can return
+    /// an owned handle and **release the cache lock before the denoise** (see [`Anima::pipeline`]),
+    /// matching every sibling candle-gen provider. Before sc-10608 this was a bespoke
+    /// `Mutex<Option<AnimaPipeline>>` whose guard was held *across* the whole generation.
+    pipeline: Mutex<Option<Arc<AnimaPipeline>>>,
 }
 
 pub fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
@@ -184,21 +189,45 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
 }
 
 impl Anima {
-    /// Lazily assemble (and cache) the pipeline on first `generate`.
-    fn pipeline(&self) -> gen_core::Result<()> {
-        let mut guard = self
-            .pipeline
-            .lock()
-            .expect("anima pipeline cache mutex poisoned");
-        if guard.is_none() {
-            *guard = Some(AnimaPipeline::from_source(
-                &self.root,
-                self.variant,
-                &self.device,
-                &self.adapters,
-            )?);
-        }
-        Ok(())
+    /// Lazily assemble (and cache) the pipeline on first `generate`, returning a **shared owned
+    /// handle**.
+    ///
+    /// ## Concurrency decision (sc-10608)
+    ///
+    /// This adopts the shared [`candle_gen::cached`] read-through cache (sc-7792) that every sibling
+    /// candle-gen provider uses. The consequence — the whole point of the story — is a deliberate
+    /// change to the lock/denoise relationship:
+    ///
+    /// - **Before:** a bespoke `Mutex<Option<AnimaPipeline>>` whose guard was held **across the entire
+    ///   denoise**. A second `generate` on the same loaded model blocked on the cache mutex until the
+    ///   first finished all its steps — concurrent generation was serialized *by accident*.
+    /// - **Now:** `cached()` holds the lock only across the (idempotent) build and a cheap `Arc` clone,
+    ///   then drops the guard. `generate` runs the denoise on the returned `Arc<AnimaPipeline>`
+    ///   **outside the lock**, so a second caller only waits to clone the `Arc`, not for the first
+    ///   generation to finish.
+    ///
+    /// Running the denoise outside the lock is **safe** here — this is verified deliberately, not
+    /// inherited from the siblings:
+    /// 1. `AnimaPipeline` / `AnimaComponents` are stateless forwards over **immutable, `Arc`-backed
+    ///    candle weights** — every `forward`/`encode`/`decode` in the generate path takes `&self`. The
+    ///    only `&mut self` methods (`visit_adaptable_mut` adapter installers) run at load, never during
+    ///    generation. No `RefCell`/`Cell`/scratch buffer is mutated per step, and each `generate` draws
+    ///    its own noise + tensors. There is therefore no shared mutable state for two concurrent
+    ///    generations to race on.
+    /// 2. `Arc<AnimaPipeline>: Send + Sync` is compiler-enforced: the cache is `Mutex<Option<Arc<…>>>`,
+    ///    and `Anima` must be `Sync` to satisfy the `Generator` bound, which requires the pipeline to be
+    ///    `Send + Sync` (pinned by `pipeline_handle_is_send_and_sync`).
+    /// 3. The candle `Device` internally synchronizes GPU submission, so concurrent forwards are
+    ///    serialized at the driver — safe, never corrupting.
+    ///
+    /// The lock-release contract is pinned by `cache_lock_is_released_before_generation` below;
+    /// returning an owned `Arc` (not a `MutexGuard`) makes "hold the lock across the denoise"
+    /// structurally impossible to reintroduce without changing this signature.
+    fn pipeline(&self) -> gen_core::Result<Arc<AnimaPipeline>> {
+        Ok(candle_gen::cached(&self.pipeline, || {
+            AnimaPipeline::from_source(&self.root, self.variant, &self.device, &self.adapters)
+                .map(Arc::new)
+        })?)
     }
 }
 
@@ -217,12 +246,9 @@ impl Generator for Anima {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
-        self.pipeline()?;
-        let guard = self
-            .pipeline
-            .lock()
-            .expect("anima pipeline cache mutex poisoned");
-        let pipeline = guard.as_ref().expect("pipeline built above");
+        // Build-or-clone the shared pipeline, then run the denoise on the returned `Arc` **outside**
+        // the cache lock (sc-10608 — see `Anima::pipeline` for the concurrency decision).
+        let pipeline = self.pipeline()?;
 
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
@@ -466,5 +492,81 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&packed_root);
+    }
+
+    /// The pipeline handle must be `Send + Sync` so the denoise can run outside the cache lock
+    /// (sc-10608). `Anima` is `Sync` (required by the `Generator` bound), its cache is
+    /// `Mutex<Option<Arc<AnimaPipeline>>>`, and `Mutex<Option<Arc<T>>>` is only `Sync` when
+    /// `T: Send + Sync`. A change that made `AnimaPipeline` non-`Sync` would break `Anima: Sync` — this
+    /// static assertion fails to compile first, with a clear pointer to the reason.
+    #[test]
+    fn pipeline_handle_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Arc<AnimaPipeline>>();
+        assert_send_sync::<Anima>();
+    }
+
+    /// Pins the concurrency decision of sc-10608: the pipeline cache lock is **released before the
+    /// denoise**, so a second request can obtain the pipeline while the first is mid-generation. Before
+    /// sc-10608, `Anima` held the cache guard **across** the whole generation, serializing concurrent
+    /// callers by accident; adopting [`candle_gen::cached`] (which returns an owned `Arc` and drops the
+    /// guard) removes that.
+    ///
+    /// This drives the exact mechanism `Anima::pipeline` now uses — `candle_gen::cached()` over a
+    /// `Mutex<Option<Arc<T>>>` — with a stand-in payload, because building a real `AnimaPipeline` needs
+    /// full weights (exercised on the gated real-weights lane, not this CPU unit test). Returning an
+    /// owned `Arc` (not a `MutexGuard`) is what makes the pre-sc-10608 "hold the lock across the
+    /// denoise" shape structurally impossible to reintroduce without changing `pipeline()`'s signature.
+    #[test]
+    fn cache_lock_is_released_before_generation() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::time::Duration;
+
+        // The shared read-through cache anima uses (`Mutex<Option<Arc<T>>>`); `u32` stands in for
+        // `Arc<AnimaPipeline>`.
+        let slot: Arc<Mutex<Option<Arc<u32>>>> = Arc::new(Mutex::new(None));
+
+        let in_gen = Arc::new(Barrier::new(2)); // A now holds its handle and is "mid-generation"
+        let end_gen = Arc::new(Barrier::new(2)); // A may finish only after B acquired concurrently
+        let (slot_a, in_a, end_a) = (Arc::clone(&slot), Arc::clone(&in_gen), Arc::clone(&end_gen));
+
+        let a = std::thread::spawn(move || {
+            // Build-or-clone via the shared accessor path, then hold ONLY the returned `Arc` across the
+            // "denoise" — never the cache guard (the sc-10608 contract).
+            let handle = candle_gen::cached(&slot_a, || Ok::<_, ()>(Arc::new(7u32))).unwrap();
+            in_a.wait();
+            end_a.wait(); // if B were blocked on the cache lock, this rendezvous would never complete
+            *handle
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let (slot_b, in_b, end_b) = (Arc::clone(&slot), Arc::clone(&in_gen), Arc::clone(&end_gen));
+        std::thread::spawn(move || {
+            in_b.wait(); // A is holding its pipeline handle right now.
+                         // A second request must obtain the pipeline WHILE A is mid-generation. The
+                         // pre-sc-10608 "guard held across the denoise" shape would block this until A
+                         // finished; `cached()` returns immediately (and hits the cache — the panic
+                         // asserts no double-build).
+            let handle = candle_gen::cached(&slot_b, || -> Result<Arc<u32>, ()> {
+                panic!("cache hit expected, not a rebuild")
+            })
+            .unwrap();
+            let _ = tx.send(*handle);
+            end_b.wait();
+        });
+
+        // B must acquire the pipeline promptly while A is still mid-generation — not after A releases.
+        // A held-across-denoise regression would make B block and this `recv_timeout` fire.
+        let got = rx.recv_timeout(Duration::from_secs(2)).expect(
+            "second caller must obtain the pipeline while the first is mid-generation — the cache lock \
+             must NOT be held across the denoise (sc-10608)",
+        );
+        assert_eq!(got, 7, "second caller got the cached pipeline, no rebuild");
+        assert_eq!(a.join().unwrap(), 7);
+        assert!(
+            slot.try_lock().is_ok(),
+            "cache lock is free after generation, never wedged across a denoise"
+        );
     }
 }

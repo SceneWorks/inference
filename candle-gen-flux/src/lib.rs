@@ -251,8 +251,16 @@ impl Generator for FluxGenerator {
             self.dtype,
             self.pid_spec.clone(),
         );
-        let components = self.components(&pipe)?;
-        let images = pipe.render(req, &components, on_progress)?;
+        // Sequential-residency offload (epic 10765 Phase 1, sc-10769): when enabled, load→encode→drop
+        // the text encoders before loading the DiT so peak VRAM is DiT+VAE, not TE+DiT+VAE — letting a
+        // card that OOMs the resident path render. Output is bit-identical; it bypasses the components
+        // cache (it drops what it loads). The default stays the resident, cross-request-cached path.
+        let images = if pipeline::sequential_offload_enabled() {
+            pipe.render_sequential(req, on_progress)?
+        } else {
+            let components = self.components(&pipe)?;
+            pipe.render(req, &components, on_progress)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -545,5 +553,48 @@ mod tests {
             let err = load(&spec).err().expect("expected an error").to_string();
             assert!(err.contains("snapshot directory"), "got: {err}");
         }
+    }
+
+    /// Sequential-residency GPU validation (epic 10765 Phase 1, sc-10769). ONE probed generation whose
+    /// mode is the `CANDLE_GEN_OFFLOAD` env the generator reads; prints the device peak VRAM and writes
+    /// the raw RGB pixels to `FLUX_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and
+    /// compare: the pixel files must be byte-identical (parity) and the sequential peak materially lower
+    /// (the ~9 GB T5-XXL dropped before the DiT loads). Two processes are REQUIRED — candle's cudarc
+    /// caching allocator never returns pages to the driver, so a second in-process run would reuse the
+    /// first run's pool and read the same peak. Ignored by default; needs a real-file (hardlink-staged,
+    /// not raw-HF-symlink) FLUX.1-dev snapshot in `FLUX_DEV_DIR` + a CUDA device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn flux_dev_probed_generate_for_offload_ab() {
+        let dir = std::env::var("FLUX_DEV_DIR")
+            .expect("set FLUX_DEV_DIR to a real-file (hardlink-staged) FLUX.1-dev snapshot");
+        let out = std::env::var("FLUX_OUT").expect("set FLUX_OUT to the pixel-dump path");
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
+        let req = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle, studio lighting".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(42),
+            count: 1,
+            ..Default::default()
+        };
+        let sampler = candle_gen::testkit::PeakSampler::start(0);
+        let g = load_dev(&spec).expect("load flux1_dev");
+        let output = g.generate(&req, &mut |_| {}).expect("generate");
+        let peak_mib = sampler.stop();
+        let img = match output {
+            GenerationOutput::Images(mut v) => v.remove(0),
+            other => panic!("expected images, got {other:?}"),
+        };
+        std::fs::write(&out, &img.pixels).expect("write pixels");
+        let mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_else(|_| "resident".into());
+        eprintln!(
+            "SEQ_AB mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
+            img.pixels.len(),
+            img.width,
+            img.height
+        );
     }
 }

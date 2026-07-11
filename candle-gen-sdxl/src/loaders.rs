@@ -8,7 +8,7 @@
 //! converted `ip-adapter.safetensors` (`image_proj.*` Resampler + `ip_adapter.*` pairs) and calls
 //! [`UNet2DConditionModel::install_ip_adapter`] on the returned UNet, mirroring `InstantId::load`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
@@ -29,22 +29,40 @@ use crate::unet::{
 const ADDITION_TIME_EMBED_DIM: usize = 256;
 const PROJECTION_INPUT_DIM: usize = 2816;
 
-/// Load the **vendored** SDXL UNet from `root/unet/diffusion_pytorch_model.fp16.safetensors` with the
-/// `add_embedding` head loaded (so [`UNet2DConditionModel::forward_instantid`] runs). Math attention
-/// (`use_flash_attn = false`) — the vendored flash path is a stub; perf tuning is later. The caller
-/// installs the IP-Adapter K/V pairs.
+/// Load the **vendored** SDXL UNet with the `add_embedding` head loaded (so
+/// [`UNet2DConditionModel::forward_instantid`] runs). Math attention (`use_flash_attn = false`) — the
+/// vendored flash path is a stub; perf tuning is later. The caller installs the IP-Adapter K/V pairs.
+///
+/// sc-10813: packed-detect the tier the SAME way the base txt2img load does. When `root` is a packed
+/// MLX q4/q8 tier ([`crate::pipeline::detect_packed_unet`] — a `quantization` block in
+/// `unet/config.json` at group 64), feed the packed `unet/diffusion_pytorch_model.safetensors`; the
+/// vendored UNet body + `add_embedding` head packed-detect per-Linear off the `.scales` siblings (their
+/// `linear_detect_gs` seams take the packed path automatically), so the edit / inpaint / IP-Adapter
+/// lanes fit a low-VRAM budget instead of forcing the dense bf16 tier. A dense diffusers snapshot has no
+/// such block, so it loads the `.fp16` weights through the identical dense path (byte-unchanged).
 pub fn load_instantid_unet(
     root: &Path,
     device: &Device,
     dtype: DType,
 ) -> Result<UNet2DConditionModel> {
-    let unet_file = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+    let unet_file = instantid_unet_file(root)?;
     // One mmap'd VarBuilder feeds both the UNet body and the `add_embedding` head (both live in the
     // same `unet/` checkpoint). `VarBuilder` is Arc-backed, so the clone is cheap.
     let vs = candle_gen::mmap_var_builder(&[unet_file], dtype, device)?;
     let unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
         .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
     Ok(unet)
+}
+
+/// The `unet/` weight file the vendored InstantID/edit/IP-Adapter UNet loads from (sc-10813): the packed
+/// `diffusion_pytorch_model.safetensors` on a packed MLX q4/q8 tier (via
+/// [`crate::pipeline::detect_packed_unet`], group 64 validated there), else the dense `.fp16` file. Split
+/// out so the packed-vs-dense fork is unit-testable without weights or a GPU.
+fn instantid_unet_file(root: &Path) -> Result<PathBuf> {
+    Ok(match crate::pipeline::detect_packed_unet(root)? {
+        Some((packed_file, _group_size)) => packed_file,
+        None => snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?,
+    })
 }
 
 /// As [`load_instantid_unet`], but fold user LoRA/LoKr `adapters` into the UNet weights at load
@@ -122,4 +140,58 @@ pub fn load_sdxl_controlnet(
     };
     let vs = candle_gen::mmap_var_builder(&[file], dtype, device)?;
     ControlNet::new(vs, &ControlNetConfig::sdxl())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sc-10813: the InstantID/edit/IP-Adapter UNet loader picks the packed
+    /// `diffusion_pytorch_model.safetensors` on a packed MLX q4/q8 tier (a `quantization` block in
+    /// `unet/config.json`) and the dense `.fp16` file on a plain diffusers snapshot — the same fork the
+    /// base txt2img load takes, so the edit / inpaint / IP-Adapter lanes serve a low-VRAM tier instead of
+    /// forcing dense bf16. GPU-free: asserts file selection only (no mmap / weights).
+    #[test]
+    fn instantid_unet_file_forks_packed_vs_dense() {
+        let tmp =
+            std::env::temp_dir().join(format!("sc10813_instantid_unet_{}", std::process::id()));
+        let unet_dir = tmp.join("unet");
+        std::fs::create_dir_all(&unet_dir).unwrap();
+
+        // Packed tier: a group-64 `quantization` block + the packed weight file at the non-`.fp16` name.
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"quantization": {"bits": 4, "group_size": 64}, "cross_attention_dim": 2048}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            unet_dir.join("diffusion_pytorch_model.safetensors"),
+            b"stub",
+        )
+        .unwrap();
+        assert_eq!(
+            instantid_unet_file(&tmp).unwrap(),
+            unet_dir.join("diffusion_pytorch_model.safetensors"),
+            "a packed tier ⇒ the packed weight file (not the dense .fp16)"
+        );
+
+        // Dense snapshot: no quantization block ⇒ the `.fp16` file.
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"cross_attention_dim": 2048, "sample_size": 128}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            unet_dir.join("diffusion_pytorch_model.fp16.safetensors"),
+            b"stub",
+        )
+        .unwrap();
+        assert_eq!(
+            instantid_unet_file(&tmp).unwrap(),
+            unet_dir.join("diffusion_pytorch_model.fp16.safetensors"),
+            "a dense snapshot ⇒ the .fp16 weight file (unchanged pre-sc-10813 behavior)"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

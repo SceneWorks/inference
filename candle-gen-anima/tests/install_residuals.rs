@@ -1,14 +1,15 @@
-//! `install_anima_residuals` at the model seam (sc-10640) — builds a **real** (tiny) `CosmosDiT` +
-//! `AnimaTextConditioner` from synthetic dense weights and drives the forward-time additive-residual
-//! installer end to end: the visit routes both a DiT target and a conditioner target, the residual
-//! actually shifts the built model's forward, a scale-0 residual is a mutation no-op, a LoKr/LoHa is
-//! rejected with the sc-10713 message, and an off-surface target hard-errors (the sc-10274 strict guard).
+//! `install_anima_residuals` at the model seam (sc-10640, sc-10713) — builds a **real** (tiny)
+//! `CosmosDiT` + `AnimaTextConditioner` from synthetic dense weights and drives the forward-time
+//! additive-residual installer end to end: the visit routes both a DiT target and a conditioner target,
+//! the residual actually shifts the built model's forward, a scale-0 residual is a mutation no-op, a
+//! **LoKr installs as a structured Kronecker residual** and shifts the forward, a **LoHa is rejected**
+//! with the sc-10713 message, and an off-surface target hard-errors (the sc-10274 strict guard).
 //!
-//! The install path is base-agnostic — it pushes residuals via `AdaptLinear::push_lora`, which never
-//! reads the base weight — so a **dense** synthetic host exercises the routing/strict/reject logic
-//! faithfully (no group-64 packed fixture needed). The packed-survives-load property (`.scales` intact,
-//! no dense weight materialized) is proven at the linear granularity in the crate's `adapt` unit tests
-//! against a real MLX-packed `QLinear`.
+//! The install path is base-agnostic — it pushes residuals via `AdaptLinear::push_lora` /
+//! `push_lokr_structured`, which never read the base weight — so a **dense** synthetic host exercises the
+//! routing/strict/reject logic faithfully (no group-64 packed fixture needed). The packed-survives-load
+//! property (`.scales` intact, no dense weight materialized) and the LoKr↔folded-delta parity are proven
+//! at the linear granularity in the crate's `adapt` unit tests against a real MLX-packed `QLinear`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -302,35 +303,82 @@ fn install_routes_dit_and_conditioner_and_residual_shifts_forward() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LoKr (declared kind) is rejected with the actionable sc-10713 message — the packed tier cannot
-/// materialize a full `[out,in]` delta.
+/// A LoKr (detected by `lokr_` keys even under an `AdapterKind::Lora` spec) installs as a **structured
+/// Kronecker residual** and shifts the DiT forward — no `[out,in]` materialized (sc-10713). Targets the
+/// DiT q_proj `[out,in] = [12,12]`, factored as `w1 [2,2] ⊗ w2 [6,6]` (a·b = 12, c·d = 12).
 #[test]
-fn lokr_on_the_residual_path_is_a_clear_error() {
+fn lokr_installs_as_structured_residual_and_shifts_forward() {
     let dir = std::env::temp_dir().join(format!("anima_install_lokr_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    // A file carrying explicit LoKr factor keys → rejected even as an `AdapterKind::Lora` spec.
+    let baseline = dit_forward(&build_dit());
+
+    // Full-factor LoKr on the DiT q_proj: w1 [2,2], w2 [6,6] ⇒ kron = [12,12]. Non-zero factors so the
+    // residual is real. No metadata ⇒ rank = alpha = 1 ⇒ full scale = 1.0.
     let mut m = HashMap::new();
+    let scaled =
+        |n: usize, seed: u64| -> Vec<f32> { lcg(n, seed).iter().map(|&v| 0.3f32 * v).collect() };
     m.insert(
         "diffusion_model.blocks.0.self_attn.q_proj.lokr_w1".to_string(),
-        Tensor::from_vec(lcg(4, 5), (2, 2), &Device::Cpu).unwrap(),
+        Tensor::from_vec(scaled(4, 5), (2, 2), &Device::Cpu).unwrap(),
     );
     m.insert(
         "diffusion_model.blocks.0.self_attn.q_proj.lokr_w2".to_string(),
-        Tensor::from_vec(lcg(36, 6), (6, 6), &Device::Cpu).unwrap(),
+        Tensor::from_vec(scaled(36, 6), (6, 6), &Device::Cpu).unwrap(),
     );
     let path = dir.join("lokr.safetensors");
     candle_gen::candle_core::safetensors::save(&m, &path).unwrap();
 
     let mut dit = build_dit();
     let mut cond = build_cond();
+    // `AdapterKind::Lora` spec — the `lokr_` keys drive the LoKr dispatch (keys win).
+    let spec = AdapterSpec::new(path, 1.0, AdapterKind::Lora);
+    let report = install_anima_residuals(&mut dit, &mut cond, std::slice::from_ref(&spec))
+        .expect("a linear LoKr must install as a structured residual, not error");
+    assert_eq!(
+        report.merged, 1,
+        "the LoKr target must route as a structured residual"
+    );
+    assert!(
+        max_abs_diff(&dit_forward(&dit), &baseline) > 1e-4,
+        "the structured LoKr residual must move the DiT forward"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A LoHa (Hadamard, `hada_` keys) is rejected with the actionable sc-10713 message — its Hadamard
+/// product has no allocation-free structured form, so it cannot ride unmerged on a packed tier.
+#[test]
+fn loha_on_the_residual_path_is_a_clear_error() {
+    let dir = std::env::temp_dir().join(format!("anima_install_loha_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A file carrying explicit LoHa factor keys (`hada_*`) → rejected.
+    let mut m = HashMap::new();
+    for (k, r, c) in [
+        ("hada_w1_a", 12usize, 2usize),
+        ("hada_w1_b", 2, 12),
+        ("hada_w2_a", 12, 2),
+        ("hada_w2_b", 2, 12),
+    ] {
+        m.insert(
+            format!("diffusion_model.blocks.0.self_attn.q_proj.{k}"),
+            Tensor::from_vec(lcg(r * c, 7), (r, c), &Device::Cpu).unwrap(),
+        );
+    }
+    let path = dir.join("loha.safetensors");
+    candle_gen::candle_core::safetensors::save(&m, &path).unwrap();
+
+    let mut dit = build_dit();
+    let mut cond = build_cond();
     let spec = AdapterSpec::new(path, 1.0, AdapterKind::Lora);
     let err = install_anima_residuals(&mut dit, &mut cond, std::slice::from_ref(&spec))
-        .expect_err("LoKr on the packed residual path must error");
+        .expect_err("LoHa on the packed residual path must error");
     let msg = err.to_string();
     assert!(
-        msg.contains("LoKr/LoHa") && msg.contains("sc-10713"),
-        "reject must name LoKr/LoHa and the follow-up story: {msg}"
+        msg.contains("LoHa") && msg.contains("sc-10713"),
+        "reject must name LoHa and the follow-up story: {msg}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
