@@ -96,7 +96,7 @@ pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 const LABEL: &str = "krea trainer";
 
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for during caption caching (matches the pipeline).
-const MAX_TEXT_TOKENS: usize = 1024;
+pub(crate) const MAX_TEXT_TOKENS: usize = 1024;
 
 /// `(x_t, target, timestep)` for one sample at flow-match `σ`: delegates the latent mix
 /// (`x_t = (1−σ)·x0 + σ·noise`, `target = noise − x0`) to the shared
@@ -164,7 +164,11 @@ fn compute_loss_grads(
 /// Tokenize `caption` + encode it through the Qwen3-VL text encoder to the cached conditioning stack
 /// `(L, num_text_layers, text_hidden)` at f32 — the exact tokenizer + select-layer stack the inference
 /// [`crate::pipeline`] uses (parity), minus the device-dtype cast (caching keeps f32).
-fn encode_caption(tok: &KreaTokenizer, te: &KreaTextEncoder, caption: &str) -> Result<Tensor> {
+pub(crate) fn encode_caption(
+    tok: &KreaTokenizer,
+    te: &KreaTextEncoder,
+    caption: &str,
+) -> Result<Tensor> {
     let ids = tok.encode_prompt(caption, MAX_TEXT_TOKENS)?;
     let enc = te.forward(&ids)?; // (1, L, num_text_layers, text_hidden)
     Ok(enc.squeeze(0)?.to_dtype(DType::F32)?)
@@ -734,6 +738,7 @@ mod tests {
         let item = TrainingItem {
             image_path: "/img.png".into(),
             caption: "x".into(),
+            control_image_path: None,
         };
         let base = TrainingRequest {
             items: vec![item],
