@@ -92,6 +92,11 @@ pub struct TrainingConfig {
     /// LoRA target module suffixes (e.g. `["to_q","to_k","to_v","to_out.0"]`); empty = the family
     /// default set.
     pub lora_target_modules: Vec<String>,
+    /// ControlNet control type for a control-branch training run (`"pose"`/`"canny"`/`"depth"`/…);
+    /// `None` for LoRA/LoKr training. Selects the branch's conditioning semantics and is recorded in
+    /// the produced overlay's metadata so the model catalog / registration describes it correctly
+    /// (rather than a hardcoded label). A control-branch trainer requires it set.
+    pub control_type: Option<String>,
     /// Flow-match timestep sampling distribution (`sigmoid`/`linear`/`uniform`/…) — the *noise*
     /// schedule, distinct from `lr_scheduler`.
     pub timestep_type: String,
@@ -151,6 +156,7 @@ impl Default for TrainingConfig {
             network_type: NetworkType::Lora,
             decompose_factor: -1,
             lora_target_modules: Vec::new(),
+            control_type: None,
             timestep_type: "sigmoid".to_string(),
             timestep_bias: "balanced".to_string(),
             loss_type: "mse".to_string(),
@@ -175,6 +181,32 @@ impl Default for TrainingConfig {
 pub struct TrainingItem {
     pub image_path: PathBuf,
     pub caption: String,
+    /// Optional per-item control-conditioning image (the ControlNet case): a rendered condition
+    /// aligned to `image_path` — a pose skeleton, canny edge map, depth map, … `None` is the LoRA
+    /// case, which every existing trainer ignores. A control-branch trainer requires it present on
+    /// every item (its `validate` rejects the request otherwise).
+    pub control_image_path: Option<PathBuf>,
+}
+
+impl TrainingItem {
+    /// A captioned item with no control conditioning (the LoRA case) — the common constructor that
+    /// keeps callers insulated from the optional `control_image_path` field.
+    pub fn captioned(image_path: PathBuf, caption: String) -> Self {
+        Self {
+            image_path,
+            caption,
+            control_image_path: None,
+        }
+    }
+
+    /// A captioned item paired with a control-conditioning image (the ControlNet case).
+    pub fn with_control(image_path: PathBuf, caption: String, control_image_path: PathBuf) -> Self {
+        Self {
+            image_path,
+            caption,
+            control_image_path: Some(control_image_path),
+        }
+    }
 }
 
 /// A training run: the dataset, the hyperparameters, and where to write the adapter. The base model
@@ -273,4 +305,27 @@ pub trait Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> crate::Result<TrainingOutput>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn training_item_ctors_set_control() {
+        let img = PathBuf::from("a.png");
+        let lora = TrainingItem::captioned(img.clone(), "a cat".into());
+        assert_eq!(lora.control_image_path, None, "captioned = no control (LoRA)");
+
+        let ctrl = TrainingItem::with_control(img.clone(), "a cat".into(), PathBuf::from("a.pose.png"));
+        assert_eq!(ctrl.control_image_path, Some(PathBuf::from("a.pose.png")));
+        assert_eq!(ctrl.image_path, img);
+    }
+
+    #[test]
+    fn config_default_has_no_control_type() {
+        // Additive: LoRA callers building via `..Default::default()` get `control_type: None` and
+        // are unaffected; only a control-branch trainer sets it.
+        assert_eq!(TrainingConfig::default().control_type, None);
+    }
 }

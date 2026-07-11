@@ -45,6 +45,7 @@ fn train_lora(tmp: &Path) -> PathBuf {
         items.push(TrainingItem {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
+            control_image_path: None,
         });
     }
     let mut trainer =

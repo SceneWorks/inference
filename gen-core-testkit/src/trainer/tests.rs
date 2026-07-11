@@ -185,6 +185,7 @@ fn item(name: &str) -> TrainingItem {
     TrainingItem {
         image_path: PathBuf::from(format!("/nonexistent/{name}.png")),
         caption: format!("a {name}"),
+        control_image_path: None,
     }
 }
 
