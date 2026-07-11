@@ -14,6 +14,7 @@ use mlx_gen::{run_flow_sampler, Progress, Result, TimestepConvention, WeightsSou
 use crate::conditioner::AnimaTextConditioner;
 use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
 use crate::loader::AnimaComponents;
+use crate::text_encoder::AnimaQwen3;
 use crate::transformer::CosmosDiT;
 use crate::vae::QwenVae;
 
@@ -103,21 +104,39 @@ impl AnimaPipeline {
     /// the Qwen tower is tokenized on the de-weighted text (its token weights are forced to `1.0`),
     /// while the parsed per-token weights scale the conditioner output. See [`crate::prompt_weight`].
     pub fn encode_prompt(&self, prompt: &str) -> Result<Array> {
+        self.encode_prompt_with(
+            prompt,
+            &self.components.text_encoder,
+            &self.components.conditioner,
+        )
+    }
+
+    /// [`encode_prompt`](Self::encode_prompt) with an EXPLICIT text-encoder + conditioner pair, so a
+    /// caller can encode with the resident **bf16** modules or an **fp32-upcast reference** pair from
+    /// [`crate::loader::load_conditioning_at_dtype`] (sc-10577). The conditioning dtype is whatever `te`
+    /// produces (its `compute_dtype`), threaded into the conditioner — so `te` and `cond` MUST share a
+    /// dtype (both bf16, the shipped default, or both fp32). With the resident bf16 modules this is
+    /// byte-identical to the pre-sc-10577 `encode_prompt`.
+    pub fn encode_prompt_with(
+        &self,
+        prompt: &str,
+        te: &AnimaQwen3,
+        cond: &AnimaTextConditioner,
+    ) -> Result<Array> {
         let c = &self.components;
         // Qwen is weight-blind: strip the emphasis syntax to plain text before tokenizing (a no-op for
         // an unweighted prompt). This mirrors ComfyUI forcing the Qwen token weights to 1.0.
         let qwen_text = crate::prompt_weight::strip_prompt_weights(prompt);
         let (qwen_ids, qwen_mask) = c.tokenizers.encode_qwen(&qwen_text)?;
-        let source = c.text_encoder.forward(&qwen_ids, &qwen_mask)?; // [1, S, 1024] bf16
-                                                                     // Multiply the Qwen states by the attention mask BEFORE the conditioner (zeros padded/uncond
-                                                                     // tokens) — the flagged trap. Batch-1 real prompts have an all-ones mask (no-op); the empty
-                                                                     // uncond prompt's single token (mask 0) is zeroed so the conditioner cross-attn contributes 0.
+        let source = te.forward(&qwen_ids, &qwen_mask)?; // [1, S, 1024] in te.compute_dtype
+                                                         // Multiply the Qwen states by the attention mask BEFORE the conditioner (zeros padded/uncond
+                                                         // tokens) — the flagged trap. Batch-1 real prompts have an all-ones mask (no-op); the empty
+                                                         // uncond prompt's single token (mask 0) is zeroed so the conditioner cross-attn contributes 0.
         let mask = qwen_mask.as_dtype(source.dtype())?.expand_dims(2)?; // [1, S, 1]
         let source = multiply(&source, &mask)?;
         // T5 carries the per-token weights (all 1.0 ⇒ strict no-op equal to the unweighted path).
         let (t5_ids, t5_weights) = c.tokenizers.encode_t5_weighted(prompt)?; // [1, St], len St
-        c.conditioner
-            .forward_weighted(&source, &t5_ids, Some(&t5_weights), source.dtype())
+        cond.forward_weighted(&source, &t5_ids, Some(&t5_weights), source.dtype())
     }
 
     /// Generate one image. `negative` is used only when `variant.uses_cfg()`.
@@ -178,16 +197,49 @@ impl AnimaPipeline {
         } else {
             None
         };
+        self.denoise_loop(
+            init,
+            &cond,
+            uncond.as_ref(),
+            steps,
+            guidance,
+            sampler,
+            seed,
+            dtype,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// The core flow-denoise loop given ALREADY-COMPUTED conditioning (sc-10577 decoupling): run
+    /// `sampler` over [`anima_sigmas`] from `init`, evaluating the DiT in `dit_dtype`, with CFG when
+    /// `uncond` is `Some`. Split out of [`denoise`](Self::denoise) so a caller can inject bf16 or fp32
+    /// conditioning into the IDENTICAL DiT trajectory — the isolation measurement for the
+    /// bf16-conditioning parity offset.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_loop(
+        &self,
+        init: &Array,
+        cond: &Array,
+        uncond: Option<&Array>,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        seed: u64,
+        dit_dtype: Dtype,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
         let sigmas = anima_sigmas(steps);
         let guidance = Array::from_slice(&[guidance], &[1]);
         let dit = &self.components.dit;
         let predict = |x: &Array, sigma: f32| -> Result<Array> {
             let s = Array::from_slice(&[sigma], &[1]);
-            let v_cond = dit.forward(x, &s, &cond, dtype)?;
-            let v = match &uncond {
+            let v_cond = dit.forward(x, &s, cond, dit_dtype)?;
+            let v = match uncond {
                 // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
                 Some(u) => {
-                    let v_u = dit.forward(x, &s, u, dtype)?;
+                    let v_u = dit.forward(x, &s, u, dit_dtype)?;
                     add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
                 }
                 None => v_cond,
@@ -204,6 +256,30 @@ impl AnimaPipeline {
             cancel,
             on_progress,
             predict,
+        )
+    }
+
+    /// Test hook (sc-10577 isolation measurement): the deterministic stage-7 denoise from an **injected**
+    /// latent using ALREADY-COMPUTED conditioning `cond` (+ `uncond` for CFG variants), so the caller
+    /// feeds either the resident bf16 conditioning or an fp32-upcast reference through the identical
+    /// injected-init + Euler + schedule trajectory. The DiT runs in `dit_dtype` (fp32 for the stage-7
+    /// golden). The delta between the two runs' final latents IS the bf16-conditioning contribution.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_from_latent_with_conditioning(
+        &self,
+        init: &Array,
+        cond: &Array,
+        uncond: Option<&Array>,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        dit_dtype: Dtype,
+    ) -> Result<Array> {
+        let cancel = CancelFlag::default();
+        let mut prog = |_p: Progress| {};
+        self.denoise_loop(
+            init, cond, uncond, steps, guidance, sampler, 0, dit_dtype, &cancel, &mut prog,
         )
     }
 

@@ -39,7 +39,38 @@
     },
     "sampler": "euler (deterministic flow-match), x += (sigma_next-sigma)*v; timestep=raw sigma",
     "dtype": "fp32 both sides (Rust denoise_from_latent(dtype=Float32)); the MLX Qwen3 encode is bf16-locked, but fp32 reference is empirically the closer target for MLX-bf16 than a torch-bf16 encode (two different bf16 roundings diverge more than fp32-truth-vs-bf16). Trajectory in fp32.",
-    "note": "Parity = no quality regression. Same injected init + Euler + schedule -> residual is Metal-vs-MPS float error, not chaos. The MLX Qwen3+conditioner encode is bf16-locked while this reference runs fp32, so a FIXED bf16-conditioning offset propagates through every step ON TOP of float accumulation; `step_latents` (x after 1 & 5 steps) let the Rust test tell the two apart (a bias is already present at step 1; accumulation grows toward the final)."
+    "note": "Parity = no quality regression. Same injected init + Euler + schedule -> residual is Metal-vs-MPS float error, not chaos. The MLX Qwen3+conditioner encode is bf16-locked while this reference runs fp32, so a FIXED bf16-conditioning offset propagates through every step ON TOP of float accumulation; `step_latents` (x after 1 & 5 steps) let the Rust test tell the two apart (a bias is already present at step 1; accumulation grows toward the final). sc-10577 then DIRECTLY measured the bf16-conditioning contribution \u2014 see `sc10577_bf16_conditioning_offset`.",
+    "sc10577_bf16_conditioning_offset": {
+      "story": "sc-10577",
+      "measured_by": "tests/parity_real_weights.rs::stage7_bf16_conditioning_offset_sc10577 (Apple Metal)",
+      "what": "The identical injected-init + deterministic-Euler + schedule stage-7 denoise (DiT fp32) rerun with an fp32-upcast Qwen3 TE + AnimaTextConditioner (mirroring this reference's .float(), via loader::load_conditioning_at_dtype) vs the shipped bf16-weight conditioning \u2014 both compared to this fp32 golden. The drop from the bf16-TE residual to the fp32-TE residual is the bf16-conditioning offset.",
+      "direct_conditioner_offset_rel_l2": {
+        "anima_base": 0.001374,
+        "anima_aesthetic": 0.001301,
+        "anima_turbo": 0.001301
+      },
+      "final_rel_l2_bf16_te": {
+        "anima_base": 0.078083,
+        "anima_aesthetic": 0.079509,
+        "anima_turbo": 0.033763
+      },
+      "final_rel_l2_fp32_te": {
+        "anima_base": 0.085411,
+        "anima_aesthetic": 0.088546,
+        "anima_turbo": 0.030453
+      },
+      "residual_removed_by_fp32_te_pct": {
+        "anima_base": -9.4,
+        "anima_aesthetic": -11.4,
+        "anima_turbo": 9.8
+      },
+      "bf16_vs_fp32_final_latent_delta_rel_l2": {
+        "anima_base": 0.03139,
+        "anima_aesthetic": 0.03719,
+        "anima_turbo": 0.01567
+      },
+      "conclusion": "bf16-conditioning is NOT the dominant term in the ~7.8e-2 stage-7 residual. The direct bf16-vs-fp32 conditioner-output offset is only ~1.3e-3, and matching the reference's conditioning precision changes the final residual by only ~+/-10% (never collapses it): it slightly HURTS base/aesthetic (+9..11%) and slightly HELPS turbo (-10%). The ~3e-2 conditioning-propagation perturbation is roughly orthogonal to the MLX-vs-reference gap, which is dominated by cross-backend (Metal-vs-MPS) DiT/VAE float accumulation independent of conditioning precision. Directly confirms sc-10524's accumulation-dominated inference. Production stays bf16 (an fp32 encode would ~double the TE + conditioner memory for no parity gain)."
+    }
   },
   "variants": {
     "anima_base": {
