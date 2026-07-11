@@ -60,7 +60,7 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::{
     schedule_sigmas, AlphaSchedule, DiscreteModelSampling, LightningPolicy, SamplerPolicy,
-    Scheduler, Solver,
+    Scheduler,
 };
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
@@ -73,8 +73,6 @@ use candle_gen_pid::{PidDecoder, PidEngine};
 /// Re-exported (sc-8373) so `candle-gen-instantid` loads the SAME `sdxl` student — InstantID composes
 /// the SDXL VAE, so there is no InstantID-specific PiD checkpoint.
 pub const PID_BACKBONE: &str = "sdxl";
-use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
-use candle_transformers::models::stable_diffusion::schedulers::SchedulerConfig;
 use candle_transformers::models::stable_diffusion::unet_2d::{
     BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig,
 };
@@ -96,6 +94,31 @@ pub(crate) const VAE_SCALE: f64 = 0.13025;
 /// omits them.
 const DEFAULT_STEPS: usize = 30;
 const DEFAULT_GUIDANCE: f64 = 7.0;
+/// The sampler an **omitted** `req.sampler` resolves to (sc-10826): the curated `ddim` solver — a
+/// k-diffusion DDIM (eta=0, non-ancestral) over the SDXL ε-schedule, driven by the unified
+/// [`gen_core::sampling`] framework via [`Pipeline::denoise_curated`]. It **replaces** the native
+/// candle-transformers `DDIMScheduler` inference loop, which rendered a ghosted, translucent
+/// double-exposure (guidance-invariant) on the default path while every curated solver — including
+/// this curated `ddim` — is clean. Being eta=0 / non-ancestral it keeps the sc-3673 launch-portable
+/// determinism the native default targeted (generation stays a pure function of `(seed, request)`),
+/// and `ddim` is part of the advertised curated vocabulary ([`candle_gen::curated_sampler_names`]),
+/// so it remains a valid selection.
+const DEFAULT_SAMPLER: &str = "ddim";
+
+/// The curated solver a txt2img render resolves `req.sampler` to (sc-10826), factored out of
+/// [`Pipeline::render`] so the default-routing rule is unit-testable without a GPU:
+/// - `Some(LIGHTNING_SAMPLER)` ⇒ `None` — the `lightning` render owns its own few-step path.
+/// - `None` (omitted) ⇒ `Some(DEFAULT_SAMPLER)` — the curated `ddim` solver (the fix: the native
+///   candle-transformers DDIM loop that ghosted is gone).
+/// - any other `Some(name)` ⇒ `Some(name)` verbatim — the curated solver by that name (an unknown
+///   name euler-falls-back inside `run_curated_sampler`, N3).
+fn resolve_sampler(sampler: Option<&str>) -> Option<&str> {
+    if sampler == Some(LIGHTNING_SAMPLER) {
+        None
+    } else {
+        Some(sampler.unwrap_or(DEFAULT_SAMPLER))
+    }
+}
 
 /// The few-step **Lightning** sampler id (sc-6128) — diffusers Euler-trailing, selected per request
 /// via `req.sampler` and advertised in [`crate::descriptor`]'s `samplers`. The SceneWorks worker forces
@@ -667,15 +690,21 @@ impl Pipeline {
         pid: Option<&PidEngine>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
-        // sc-6128: a `lightning` request runs the few-step Euler-trailing path; the native DDIM path is
-        // the byte-exact default (zero regression). epic 7114 P4 (sc-7124) ADDS the curated EPS menu as
-        // NEW options: a curated solver name (≠ the native `ddim`/`lightning` defaults) routes the
-        // unified `Sampler` over `DiscreteModelSampling` (EPS) — the default path stays untouched (N1).
+        // sc-6128: a `lightning` request runs the few-step Euler-trailing path. Every other render —
+        // the omitted-sampler default AND every explicit curated solver name (incl. `ddim`) — routes
+        // through the unified curated `Sampler` over `DiscreteModelSampling` (EPS), epic 7114 P4 / sc-7124.
+        //
+        // sc-10826: the omitted-sampler default previously ran candle-transformers' native
+        // `DDIMScheduler` inference loop, which rendered a ghosted, translucent double-exposure
+        // (guidance-invariant) while every curated solver — including the curated `ddim` — is clean.
+        // So the default now maps to `DEFAULT_SAMPLER` (the curated `ddim`), and the native loop is
+        // gone. `ddim` no longer diverts to the native path; it takes the curated `ddim` solver like
+        // every other name. Determinism is preserved (curated `ddim` is eta=0 / non-ancestral).
         let lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
-        let curated: Option<&str> = req
-            .sampler
-            .as_deref()
-            .filter(|n| Solver::from_name(n).is_some() && *n != "ddim");
+        // The curated solver name for a non-lightning render: the request's name, or `ddim` by default
+        // (`resolve_sampler`). `None` ⇒ a `lightning` render (its own path). An unknown name falls back
+        // to euler inside `run_curated_sampler` (N3 — never a hard fail).
+        let curated: Option<&str> = resolve_sampler(req.sampler.as_deref());
         let steps = req.steps.map(|s| s as usize).unwrap_or(if lightning {
             LIGHTNING_DEFAULT_STEPS
         } else {
@@ -725,6 +754,9 @@ impl Pipeline {
             let latents = if let Some((policy, cond)) = &lightning_ctx {
                 self.denoise_lightning(&init, policy, cond, unet, &req.cancel, on_progress, total)?
             } else if let Some(name) = curated {
+                // The default path (sc-10826): `curated` is `Some` for every non-lightning render, so
+                // the omitted-sampler default (→ the curated `ddim`) and every explicit curated name
+                // run this one unified sampler. The native candle-transformers DDIM loop is gone.
                 self.denoise_curated(
                     req,
                     name,
@@ -738,41 +770,14 @@ impl Pipeline {
                     on_progress,
                 )?
             } else {
-                // DDIM (eta=0): non-ancestral / deterministic, vs candle's default Euler-ancestral
-                // (which injects fresh noise every step). SceneWorks/diffusers SDXL defaults to
-                // EulerDiscrete — also non-ancestral, deterministic; DDIM is the closest deterministic
-                // solver candle ships and gives portable, collapse-free output. Its config defaults
-                // ARE the SDXL values (scaled_linear β 0.00085→0.012, epsilon prediction, 1000 train
-                // steps).
-                let mut scheduler = DDIMSchedulerConfig::default().build(steps)?;
-                let timesteps = scheduler.timesteps().to_vec();
-                let mut latents = (init * scheduler.init_noise_sigma())?.to_dtype(self.dtype)?;
-
-                for (step_i, &timestep) in timesteps.iter().enumerate() {
-                    if req.cancel.is_cancelled() {
-                        return Err(CandleError::Canceled);
-                    }
-                    let model_in = if use_guide {
-                        Tensor::cat(&[&latents, &latents], 0)?
-                    } else {
-                        latents.clone()
-                    };
-                    let model_in = scheduler.scale_model_input(model_in, timestep)?;
-                    let noise_pred = unet.forward(&model_in, timestep as f64, text_embeddings)?;
-                    let noise_pred = if use_guide {
-                        let chunks = noise_pred.chunk(2, 0)?;
-                        let (uncond, cond) = (&chunks[0], &chunks[1]);
-                        (uncond + ((cond - uncond)? * guidance)?)?
-                    } else {
-                        noise_pred
-                    };
-                    latents = scheduler.step(&noise_pred, timestep, &latents)?;
-                    on_progress(Progress::Step {
-                        current: step_i as u32 + 1,
-                        total,
-                    });
-                }
-                latents
+                // Unreachable by construction: `curated` is `Some` whenever `lightning_ctx` is `None`
+                // (a non-lightning render always resolves a curated name via `DEFAULT_SAMPLER`). A
+                // typed error rather than an `unwrap`/`unreachable!` so a future routing change can't
+                // silently fall through to a broken (or removed) path.
+                return Err(CandleError::Msg(
+                    "sdxl: no denoise path selected (neither lightning nor curated) — a routing bug"
+                        .into(),
+                ));
             };
 
             on_progress(Progress::Decoding);
@@ -1254,6 +1259,36 @@ mod tests {
             "a non-64 group_size must be rejected, not silently mis-repacked"
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// sc-10826: an **omitted** sampler must resolve to the curated `ddim` solver — the native
+    /// candle-transformers `DDIMScheduler` inference loop (which rendered a ghosted, translucent
+    /// double-exposure on the default path) is removed, so the default now runs the same unified
+    /// curated framework every named sampler does. `lightning` keeps its own path (`None`), and an
+    /// explicit curated name passes through unchanged. This pins the routing rule the ghost fix hinges
+    /// on, GPU-free — the human-eyeball coherence check is the `realvisxl_lightning` GPU smoke with
+    /// `RVXL_SAMPLER=` (engine default) + real CFG.
+    #[test]
+    fn omitted_sampler_routes_to_curated_ddim_not_native() {
+        assert_eq!(resolve_sampler(None), Some("ddim"), "omitted ⇒ curated ddim");
+        assert_eq!(resolve_sampler(Some("ddim")), Some("ddim"), "ddim ⇒ curated ddim");
+        assert_eq!(
+            resolve_sampler(Some("dpmpp_2m")),
+            Some("dpmpp_2m"),
+            "an explicit curated name passes through"
+        );
+        assert_eq!(
+            resolve_sampler(Some(LIGHTNING_SAMPLER)),
+            None,
+            "lightning takes its own few-step path, not the curated framework"
+        );
+        // The default is a genuinely-advertised curated solver, so it never silently euler-falls-back
+        // or targets a removed native path.
+        assert_eq!(DEFAULT_SAMPLER, "ddim");
+        assert!(
+            candle_gen::curated_sampler_names().contains(&DEFAULT_SAMPLER),
+            "DEFAULT_SAMPLER must be in the advertised curated menu"
+        );
     }
 
     /// sc-3677 parity: the production txt2img values the candle lane resolves an omitted field to
