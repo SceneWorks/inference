@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{AdapterKind, AdapterSpec, Image, Progress};
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, Image, OffloadPolicy, Progress};
 use candle_gen::testkit::{env_path, mean_abs_diff, read_ppm, write_ppm};
 
 use crate::edit::{QwenEdit, QwenEditPaths, QwenEditRequest};
@@ -52,6 +52,7 @@ fn real_weight_edit() {
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
         adapters: vec![],
+        offload_policy: OffloadPolicy::Resident,
     })
     .expect("load QwenEdit");
     println!(
@@ -174,6 +175,7 @@ fn high_res_edit_avoids_i32_overflow() {
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
         adapters: vec![],
+        offload_policy: OffloadPolicy::Resident,
     })
     .expect("load QwenEdit");
 
@@ -228,6 +230,7 @@ fn lightning_edit_4steps() {
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
         adapters: vec![AdapterSpec::new(lora, 1.0, AdapterKind::Lora)],
+        offload_policy: OffloadPolicy::Resident,
     })
     .expect("load QwenEdit + lightning LoRA");
     println!(
