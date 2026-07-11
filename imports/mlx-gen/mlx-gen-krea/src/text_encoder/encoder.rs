@@ -9,14 +9,18 @@
 //! the OUTPUT of 0-indexed layers `[1,4,…,34]`. The final `language_model.norm` is never applied (all
 //! selected layers are pre-final-norm), and only `max+1` layers are run (later layers can't matter).
 
-use mlx_rs::ops::concatenate_axis;
-use mlx_rs::Array;
+use mlx_rs::ops::{add, concatenate_axis};
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{build_mask, TextRope, TokenEmbedding};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use super::{embedding, join, KreaTeConfig, Qwen3DecoderLayer};
+
+/// Qwen3-VL spatial merge factor (`spatial_merge_size`); a `merge×merge` block of ViT patches collapses
+/// to one LM image token. Fixed at 2 across the family.
+const SPATIAL_MERGE: i32 = 2;
 
 pub struct KreaTextEncoder {
     embed_tokens: TokenEmbedding,
@@ -25,6 +29,13 @@ pub struct KreaTextEncoder {
     /// 0-indexed decoder-layer OUTPUT indices to capture (= `select_hidden[i] - 1`), in stack order.
     out_layers: Vec<usize>,
     prefix_tokens: i32,
+    /// Image-grounded (edit) encoding params (epic 10871 P2): the `<|image_pad|>` id whose positions the
+    /// vision features replace, the interleaved-MRoPE section widths, and the head-dim/θ the MRoPE
+    /// `cos`/`sin` are built from. Unused by the text-only [`forward`](Self::forward).
+    image_token_id: i32,
+    mrope_section: [i32; 3],
+    head_dim: i32,
+    rope_theta: f32,
 }
 
 impl KreaTextEncoder {
@@ -66,6 +77,10 @@ impl KreaTextEncoder {
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             out_layers,
             prefix_tokens: cfg.prefix_tokens as i32,
+            image_token_id: cfg.image_token_id,
+            mrope_section: cfg.mrope_section,
+            head_dim: cfg.head_dim,
+            rope_theta: cfg.rope_theta,
         })
     }
 
@@ -97,8 +112,15 @@ impl KreaTextEncoder {
             }
         }
 
-        // Stack the captured layers (in `out_layers` order) on a NEW axis 2 → [b, s, n, hidden],
-        // matching the reference `torch.stack([hidden_states[i] for i in select], dim=2)`.
+        self.stack_and_trim(saved)
+    }
+
+    /// The shared tail of the text-only [`forward`](Self::forward) and the grounded
+    /// [`forward_with_image`](Self::forward_with_image): stack the captured `select_hidden` layers on a
+    /// new axis 2 → `[b, s, n, hidden]` (the reference `torch.stack([hidden_states[i] …], dim=2)`), then
+    /// drop the leading template-prefix tokens. Dropping needs strictly more tokens than the prefix; a
+    /// shorter sequence would build an empty index and hit an opaque `take_axis` panic (F-081).
+    fn stack_and_trim(&self, saved: Vec<(usize, Array)>) -> Result<Array> {
         let pick = |idx: usize| -> Result<&Array> {
             saved
                 .iter()
@@ -114,9 +136,6 @@ impl KreaTextEncoder {
         let refs: Vec<&Array> = expanded.iter().collect();
         let stacked = concatenate_axis(&refs, 2)?; // [b, s, n, hidden]
 
-        // Drop the leading template-prefix tokens (the system instruction). Dropping needs strictly
-        // more tokens than the prefix; a shorter sequence would build an empty index and hit an
-        // opaque `take_axis` panic (F-081; the guard qwen's encoders already have).
         let n = stacked.shape()[1];
         if n <= self.prefix_tokens {
             return Err(Error::Msg(format!(
@@ -126,5 +145,212 @@ impl KreaTextEncoder {
         }
         let idx: Vec<i32> = (self.prefix_tokens..n).collect();
         Ok(stacked.take_axis(Array::from_slice(&idx, &[idx.len() as i32]), 1)?)
+    }
+
+    /// **Image-grounded** condition encoding (epic 10871 P2.1) — the Qwen3-VL "dual conditioning" text
+    /// half: run the encoder with the source image's vision features spliced over the `<|image_pad|>`
+    /// block and 3-D MRoPE positions, so the LM "sees" the image while reading the edit instruction.
+    /// Mirrors [`forward`](Self::forward) but (a) replaces the `<|image_pad|>` token embeddings with the
+    /// vision tower's merged `image_embeds` `[n, hidden]`, (b) additively injects the `deepstack`
+    /// features at those positions for the first `deepstack.len()` layers, and (c) uses interleaved
+    /// MRoPE (the image block carries its 2-D merged grid position; text stays sequential). Returns the
+    /// same stacked `[b, s - prefix_tokens, num_select, hidden]` the DiT `TextFusionTransformer` consumes.
+    /// `image_embeds` / `deepstack` come from [`mlx_gen_boogu::VisionTower::forward`]; `grid_thw` is that
+    /// image's `[t, h, w]` patch grid.
+    ///
+    /// NB `prefix_tokens` is the text-to-image template's system-prefix length; the edit template's
+    /// prefix must match (or be re-derived) so the drop stays aligned — verified on the real edit
+    /// template + weights in P2.3.
+    pub fn forward_with_image(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        image_embeds: &Array,
+        deepstack: &[Array],
+        grid_thw: [i32; 3],
+    ) -> Result<Array> {
+        let sh = input_ids.shape();
+        let (b, s) = (sh[0], sh[1]);
+        let ids_arr = input_ids.as_dtype(Dtype::Int32)?;
+        let ids: Vec<i32> = ids_arr.as_slice::<i32>().to_vec();
+        let (img_start, img_end) = *image_token_runs(&ids, self.image_token_id, s)
+            .first()
+            .ok_or_else(|| {
+                Error::Msg("krea te (grounded): prompt has no <|image_pad|> tokens".into())
+            })?;
+
+        // Embed tokens, then splice the vision features over the <|image_pad|> block.
+        let mut hidden = self.embed_tokens.forward(input_ids)?; // [1, s, hidden]
+        let dt = hidden.dtype();
+        let img = image_embeds.expand_dims(0)?; // [1, n, hidden]
+        hidden = replace_seq(&hidden, &img, img_start, img_end, s)?;
+
+        // 3-D MRoPE: text tokens sequential; the image block carries its merged (h/m × w/m) grid.
+        let (pt, ph, pw) = mrope_positions(&ids, self.image_token_id, grid_thw[1], grid_thw[2]);
+        let (cos, sin) = mrope_cos_sin(
+            &pt,
+            &ph,
+            &pw,
+            self.head_dim,
+            self.rope_theta,
+            self.mrope_section,
+            dt,
+        )?;
+        let mask = build_mask(attention_mask, b, s)?;
+
+        let mut saved: Vec<(usize, Array)> = Vec::with_capacity(self.out_layers.len());
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
+            // Deepstack: add the i-th merged vision feature at the image positions for LM layers
+            // 0..deepstack.len() (the Qwen3-VL deepstack contract).
+            if i < deepstack.len() {
+                let mid = slice_seq(&hidden, img_start, img_end)?;
+                let inj = add(&mid, &deepstack[i].expand_dims(0)?)?;
+                hidden = replace_seq(&hidden, &inj, img_start, img_end, s)?;
+            }
+            if self.out_layers.contains(&i) {
+                saved.push((i, hidden.clone()));
+            }
+        }
+        self.stack_and_trim(saved)
+    }
+}
+
+// ── Image-grounded helpers (ported from `mlx-gen-boogu`'s Qwen3-VL text encoder) ─────────────────
+
+/// Slice `[b, s, d]` along the sequence axis to `[start, end)`.
+fn slice_seq(x: &Array, start: i32, end: i32) -> Result<Array> {
+    let idx: Vec<i32> = (start..end).collect();
+    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
+}
+
+/// Replace `x[:, start:end, :]` with `repl` (`[b, end-start, d]`) via concat of the surrounding slices —
+/// the masked-replace splice (no in-place scatter).
+fn replace_seq(x: &Array, repl: &Array, start: i32, end: i32, s: i32) -> Result<Array> {
+    let before = slice_seq(x, 0, start)?;
+    let after = slice_seq(x, end, s)?;
+    Ok(concatenate_axis(&[&before, repl, &after], 1)?)
+}
+
+/// Contiguous runs of `image_token_id` in `ids` (`[start, end)` per run), in sequence order — one run
+/// per reference image (the tokenizer separates images with `<|vision_end|><|vision_start|>`).
+fn image_token_runs(ids: &[i32], image_token_id: i32, s: i32) -> Vec<(i32, i32)> {
+    let mut runs = Vec::new();
+    let mut i = 0i32;
+    while i < s {
+        if ids[i as usize] == image_token_id {
+            let start = i;
+            while i < s && ids[i as usize] == image_token_id {
+                i += 1;
+            }
+            runs.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// 3-D MRoPE positions per token: text tokens advance `(i, i, i)`; an image block (at offset `cur`) gets
+/// `t = cur`, `h = cur + row`, `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then
+/// `cur += max(h, w) / merge`. Mirrors Qwen3-VL `get_rope_index`.
+fn mrope_positions(
+    ids: &[i32],
+    image_token_id: i32,
+    grid_h: i32,
+    grid_w: i32,
+) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let (llm_h, llm_w) = (grid_h / SPATIAL_MERGE, grid_w / SPATIAL_MERGE);
+    let step = grid_h.max(grid_w) / SPATIAL_MERGE;
+    let (mut pt, mut ph, mut pw) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cur = 0i32;
+    let mut i = 0usize;
+    while i < ids.len() {
+        if ids[i] == image_token_id {
+            for idx in 0..(llm_h * llm_w) {
+                pt.push(cur);
+                ph.push(cur + idx / llm_w);
+                pw.push(cur + idx % llm_w);
+            }
+            cur += step;
+            i += (llm_h * llm_w) as usize;
+        } else {
+            pt.push(cur);
+            ph.push(cur);
+            pw.push(cur);
+            cur += 1;
+            i += 1;
+        }
+    }
+    (pt, ph, pw)
+}
+
+/// Build the interleaved-MRoPE `cos`/`sin` `[1, s, head_dim]` (cast to `dt`). For each of the
+/// `head_dim/2` freqs `j`: within the first `section[1]·3` indices `j%3==1 → H`, within `section[2]·3`
+/// `j%3==2 → W`, else `T`; `angle = pos·θ^(−2j/head_dim)`, written to both halves (`emb = cat(f, f)`).
+fn mrope_cos_sin(
+    pt: &[i32],
+    ph: &[i32],
+    pw: &[i32],
+    head_dim: i32,
+    theta: f32,
+    section: [i32; 3],
+    dt: Dtype,
+) -> Result<(Array, Array)> {
+    let s = pt.len();
+    let half = (head_dim / 2) as usize;
+    let sec_h = (section[1] * 3) as usize;
+    let sec_w = (section[2] * 3) as usize;
+    let inv: Vec<f32> = (0..half)
+        .map(|j| (theta as f64).powf(-(2.0 * j as f64) / head_dim as f64) as f32)
+        .collect();
+
+    let hd = head_dim as usize;
+    let mut emb = vec![0f32; s * hd];
+    for i in 0..s {
+        for j in 0..half {
+            let pos = if j < sec_h && j % 3 == 1 {
+                ph[i]
+            } else if j < sec_w && j % 3 == 2 {
+                pw[i]
+            } else {
+                pt[i]
+            };
+            let angle = pos as f32 * inv[j];
+            emb[i * hd + j] = angle;
+            emb[i * hd + half + j] = angle;
+        }
+    }
+    let arr = Array::from_slice(&emb, &[1, s as i32, head_dim]);
+    Ok((arr.cos()?.as_dtype(dt)?, arr.sin()?.as_dtype(dt)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MRoPE positions: text tokens advance sequentially `(i,i,i)`; the image block sits at the running
+    /// offset with its 2-D merged grid on the H/W axes, and the cursor jumps by `max(h,w)/merge` after.
+    #[test]
+    fn mrope_positions_lays_out_text_then_image_grid() {
+        // ids: [txt, txt, img×4, txt] with a 4×4 patch grid → merged 2×2 = 4 image tokens.
+        let img = 99;
+        let ids = vec![1, 2, img, img, img, img, 3];
+        let (pt, ph, pw) = mrope_positions(&ids, img, 4, 4);
+        // Text @0,1 → (0,0,0),(1,1,1). Image @cur=2, llm 2×2: idx→(2, 2+row, 2+col). Then cur += 4/2=2
+        // → next text @ (4,4,4).
+        assert_eq!(pt, vec![0, 1, 2, 2, 2, 2, 4]);
+        assert_eq!(ph, vec![0, 1, 2, 2, 3, 3, 4]);
+        assert_eq!(pw, vec![0, 1, 2, 3, 2, 3, 4]);
+    }
+
+    /// Text-only MRoPE (no image tokens) is a plain sequential ramp on all three axes — the reduction
+    /// that lets the text path keep using 1-D `TextRope`.
+    #[test]
+    fn mrope_positions_text_only_is_sequential() {
+        let (pt, ph, pw) = mrope_positions(&[10, 11, 12, 13], 99, 4, 4);
+        assert_eq!(pt, vec![0, 1, 2, 3]);
+        assert_eq!(pt, ph);
+        assert_eq!(pt, pw);
     }
 }

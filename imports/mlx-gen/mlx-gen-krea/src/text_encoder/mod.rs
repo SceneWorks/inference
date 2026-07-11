@@ -29,10 +29,63 @@ pub use mlx_gen::nn::TextRope;
 
 use std::path::Path;
 
+use image::RgbImage;
+use mlx_rs::Array;
+
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::media::Image;
 use mlx_gen::nn::TokenEmbedding;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+use mlx_gen_boogu::{vision::preprocess::preprocess_image, VisionConfig, VisionTower};
+
+/// The Krea 2 Qwen3-VL-**4B** vision-tower config (epic 10871 P2.1, sc-10879), read from the real
+/// `text_encoder/config.json` `vision_config` (sc-10875): a narrower/shallower trunk than boogu's 8B
+/// (`hidden 1024` vs 1152, `depth 24` vs 27) projecting to the 4B LM width (`out_hidden 2560`), with
+/// deepstack taps at `[5,11,17]` (vs boogu's `[8,16,24]`). Feeds the (shared) `mlx_gen_boogu::VisionTower`
+/// so the parity-critical tower is not duplicated. `out_hidden_size` MUST equal the LM `hidden_size`
+/// (2560) so the merged image embeds splice straight into the token stream.
+pub fn krea_vision_config() -> VisionConfig {
+    VisionConfig {
+        hidden_size: 1024,
+        num_heads: 16,
+        intermediate_size: 4096,
+        depth: 24,
+        out_hidden_size: 2560,
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: 2304,
+        deepstack_visual_indexes: vec![5, 11, 17],
+    }
+}
+
+/// Image-grounded (edit) condition encoding for a **single** reference (epic 10871 P2.1): the full
+/// orchestration behind the Qwen3-VL "dual conditioning" text half — preprocess the source image, run
+/// the [`VisionTower`], build the grounded template ids (`<|image_pad|>`×merged-count), and run
+/// [`KreaTextEncoder::forward_with_image`]. Returns the DiT-consumable `context`
+/// `[1, s - prefix_tokens, num_select, hidden]` (used downstream with `mask = None`, exactly like the
+/// text-only [`KreaTextEncoder::forward`] output). Mirrors boogu's `encode_image_instruction`.
+///
+/// Two-reference edits (scene + subject) extend this to the multi-image splice (epic 10871 P1.3/P2.3);
+/// the tokenizer + MRoPE helpers already handle N images.
+pub fn encode_grounded(
+    vision: &VisionTower,
+    tok: &KreaTokenizer,
+    te: &KreaTextEncoder,
+    reference: &Image,
+    instruction: &str,
+) -> Result<Array> {
+    let rgb = RgbImage::from_raw(reference.width, reference.height, reference.pixels.clone())
+        .ok_or_else(|| Error::Msg("krea grounded: source image is not valid RGB8".into()))?;
+    let (pixels, grid) = preprocess_image(&rgb)?;
+    // Merged image embeds `[n, hidden]` + deepstack (one per `deepstack_visual_indexes` entry).
+    let (embeds, deepstack) = vision.forward(&pixels, &[grid])?;
+    let n = embeds.shape()[0] as usize;
+    let (ids, mask) = tok.encode_with_images(instruction, &[n])?;
+    te.forward_with_image(&ids, &mask, &embeds, &deepstack, grid)
+}
 
 /// Qwen3-VL-4B text-tower architecture (verified from the published `text_encoder/config.json`:
 /// `qwen3_vl_text`, hidden 2560, 36 layers, GQA 32/8, head_dim 128, FFN 9728, eps 1e-6) + the Krea
@@ -55,6 +108,14 @@ pub struct KreaTeConfig {
     /// Leading template-prefix tokens dropped from the conditioning (`Qwen3VLConditioner`'s
     /// `prompt_template_encode_start_idx`); the system-instruction prefix tokenizes to this many.
     pub prefix_tokens: usize,
+    /// The `<|image_pad|>` token id — the placeholder positions the image-grounded path (epic 10871 P2)
+    /// replaces with vision-tower features. Qwen3-VL's `image_token_id` = 151655.
+    pub image_token_id: i32,
+    /// Qwen3-VL interleaved-MRoPE section widths `[T, H, W]` over `head_dim/2` (`text_config
+    /// .rope_parameters.mrope_section`); summing to `head_dim/2 = 64`. Plain 1-D RoPE for a text-only
+    /// prompt reduces to `[64,0,0]` (all axes index the same sequential position); with image tokens the
+    /// H/W sections carry the 2-D grid position (see the encoder's grounded forward).
+    pub mrope_section: [i32; 3],
 }
 
 impl KreaTeConfig {
@@ -70,6 +131,8 @@ impl KreaTeConfig {
             rope_theta: 5_000_000.0,
             select_hidden: vec![2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35],
             prefix_tokens: 34,
+            image_token_id: 151655,
+            mrope_section: [24, 20, 20],
         }
     }
 
@@ -115,6 +178,26 @@ impl KreaTeConfig {
                 .unwrap_or(d.rope_theta),
             select_hidden: d.select_hidden.clone(),
             prefix_tokens: d.prefix_tokens,
+            // `image_token_id` is top-level (not under `text_config`); `mrope_section` lives in
+            // `text_config.rope_parameters` (or the legacy `rope_scaling`). Fall back to the 4B defaults.
+            image_token_id: v
+                .get("image_token_id")
+                .and_then(serde_json::Value::as_i64)
+                .map(|n| n as i32)
+                .unwrap_or(d.image_token_id),
+            mrope_section: tc
+                .get("rope_parameters")
+                .or_else(|| tc.get("rope_scaling"))
+                .and_then(|r| r.get("mrope_section"))
+                .and_then(|a| a.as_array())
+                .and_then(|a| {
+                    let sec: Vec<i32> = a
+                        .iter()
+                        .filter_map(|x| x.as_i64().map(|n| n as i32))
+                        .collect();
+                    <[i32; 3]>::try_from(sec).ok()
+                })
+                .unwrap_or(d.mrope_section),
         };
 
         // `text_encoder_select_layers` lives in the pipeline manifest.
