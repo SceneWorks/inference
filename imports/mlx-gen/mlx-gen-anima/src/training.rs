@@ -58,6 +58,7 @@ use mlx_gen::{
     TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
+use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{multiply, subtract};
 use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
@@ -339,6 +340,19 @@ impl AnimaTrainer {
         // loss / grads / optimizer stay f32 (master-weights). This matches the inference dtype.
         let compute_dtype = Dtype::Bfloat16;
 
+        // sc-10576 — fail-fast pre-flight memory guard. The dense (non-block-checkpointed) first step
+        // materializes the whole DiT forward graph — at 1536² the retained per-block seq² self-attention
+        // (≈9216 image tokens) makes that working set exceed unified memory, and the OS hard-kills the
+        // worker with an UNCATCHABLE SIGKILL (the run just appears to hang at the last cached latent).
+        // We predict it and refuse up front with an actionable, catchable error — BEFORE the (minutes-
+        // long) latent caching — whenever gradient checkpointing is NOT enabled (LoRA checkpointing OR
+        // the LoKr/dense fallback). With whole-block checkpointing on, the first step fits, so skip it.
+        let will_checkpoint =
+            matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
+        if !will_checkpoint {
+            preflight_memory_guard(edge, compute_dtype == Dtype::Bfloat16)?;
+        }
+
         // --- prepare → cache: VAE latents + (masked Qwen3 states, T5 ids) into memory ---
         on_progress(TrainingProgress::LoadingModel);
         let total = req.items.len() as u32;
@@ -403,6 +417,34 @@ impl AnimaTrainer {
             lt == "mae" || lt == "l1"
         };
 
+        // sc-10576 — gradient checkpointing. Collect, per DiT block, the adapter-routable LOCAL paths
+        // trained on it (`self_attn.q_proj`, `adaln_modulation_mlp.2`, …); the 28-block DiT stack is
+        // where the first-step activation memory concentrates (its per-block seq² self-attention), so
+        // that is what we whole-block checkpoint. The 60 conditioner (`llm_adapter.*`) targets are NOT
+        // collected here — the conditioner runs UN-checkpointed inside the traced grad graph (only 512
+        // text tokens), so its factors train through ordinary autograd, and — critically — its gradient
+        // path stays live because the DiT checkpoints thread `encoder` as an explicit input (sc-10522).
+        let n_layers = self.dit.config().num_layers;
+        let block_local_targets = collect_dit_block_local_targets(&target_paths, n_layers);
+
+        // Gradient checkpointing is an OPT-IN option, never auto-forced — a run that would OOM is caught
+        // by the fail-fast pre-flight guard above (which recommends this flag) rather than silently
+        // changing the user's training dynamics. Only the LoRA path is whole-block checkpointed today;
+        // LoKr (a distinct Kronecker reconstruction) falls back to the dense path, exactly like z-image.
+        let is_lora = matches!(adapter, TrainAdapter::Lora { .. });
+        let use_checkpoint = is_lora && cfg.gradient_checkpointing;
+        let checkpoint_blocks: Option<&[Vec<String>]> = if use_checkpoint {
+            Some(&block_local_targets)
+        } else {
+            None
+        };
+        // SDPA-segment checkpointing: the conditioner is never whole-block checkpointed, so it keeps
+        // segment ckpt ON (bounds its retained attention). The DiT keeps segment ckpt ON only when
+        // whole-block checkpointing is OFF (the dense / LoKr path) — when whole-block is on, the block
+        // recompute already covers attention and nesting would recompute it twice for no memory win.
+        self.dit.set_sdpa_checkpoint(!use_checkpoint);
+        self.conditioner.set_sdpa_checkpoint(true);
+
         // AdamW with wd=0 is identical to Adam, so the one optimizer covers both choices.
         let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
             0.0
@@ -451,6 +493,7 @@ impl AnimaTrainer {
                 sigma,
                 &noise,
                 mae,
+                checkpoint_blocks,
                 compute_dtype,
             )?;
             last_loss = loss;
@@ -667,12 +710,107 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
     Ok(shifted.clamp(1e-3, 1.0 - 1e-3))
 }
 
+/// Image tokens the DiT self-attends at a square training `edge`: VAE /8 then patch /2 ⇒ `edge/16`
+/// per side, squared. The `+512` is the conditioner's fixed padded text length (cross-attended, not
+/// self-attended) — folded in so `s` is the "total token" proxy the projection is fit against.
+fn unified_tokens(edge: u32) -> f64 {
+    let per_side = (edge as f64 / 16.0).ceil();
+    per_side * per_side + 512.0
+}
+
+/// Projected DENSE first-step peak GPU memory, in GB, as a function of the token proxy `s`
+/// ([`unified_tokens`]) — an empirical fit to peaks measured on the 128 GB target with the Anima base.
+///
+/// Structure follows the z-image / sc-4874 decomposition `weights + linear·s + quad·s²`: the constant
+/// is the resident base (the ~2B-param bf16 Cosmos DiT + the small conditioner + Qwen-Image VAE, after
+/// the Qwen3 text encoder is freed post-caching), the linear term is the per-token hidden-state
+/// activations retained across the 28 blocks (+ the s·512 cross-attention), and the quadratic term is
+/// the residual seq² self-attention. Since the DENSE training path runs with SDPA-segment
+/// checkpointing ON ([`AnimaTrainer::train_impl`] sets `dit.set_sdpa_checkpoint(!use_checkpoint)`), the
+/// quadratic term is demoted from "one retained `[16-heads, s, s]` matrix per block" to a single
+/// layer's backward transient. bf16 roughly halves the weights + activation terms vs an f32 base
+/// (Anima has no f32 base, but the parameter is kept for symmetry with the z-image guard).
+///
+/// **Calibrated** against `first_step_dense_peak_sweep` (128 GB Mac, rank 16, batch 1) — see that
+/// `#[ignore]`d test and the `preflight_tests` fit check; refit both if it prints materially different
+/// numbers.
+fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
+    if bf16 {
+        ANIMA_PEAK_CONST_BF16 + ANIMA_PEAK_LINEAR_BF16 * s + ANIMA_PEAK_QUAD_BF16 * s * s
+    } else {
+        // No f32 Anima base exists; a ~1.8× scale of the bf16 fit is a conservative upper bound.
+        1.8 * (ANIMA_PEAK_CONST_BF16 + ANIMA_PEAK_LINEAR_BF16 * s + ANIMA_PEAK_QUAD_BF16 * s * s)
+    }
+}
+
+// sc-10576 memory-projection coefficients — an exact `a + b·s + c·s²` fit to THREE measured Anima
+// dense first-step peaks (edge 512/768/1024 ⇒ s 1536/2816/4608 ⇒ 21.2/32.0/49.4 GB, bf16, rank16) on
+// the 128 GB target (`first_step_dense_peak_sweep`). The linear term dominates (per-token activations
+// retained across the 28 blocks); the quadratic is small because the dense path runs SDPA-segment
+// checkpointing. Extrapolates to ~113 GB at edge 1536 (s 9728) — over this machine's working set, so
+// the guard refuses a dense 1536² run. CALIBRATED — re-run the sweep + `preflight_tests` fit check if
+// the model/activation shape changes; do not hand-edit.
+const ANIMA_PEAK_CONST_BF16: f64 = 9.84;
+const ANIMA_PEAK_LINEAR_BF16: f64 = 6.775e-3;
+const ANIMA_PEAK_QUAD_BF16: f64 = 3.946e-7;
+
+/// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
+/// SIGKILLed), returning a catchable, actionable error instead. The budget is MLX's own reported
+/// memory limit (≈ the device's recommended working set), scaled by 0.85 for worker/host headroom —
+/// exceeding it is the regime where the dense run dies. Only consulted when whole-block gradient
+/// checkpointing is OFF.
+fn preflight_memory_guard(edge: u32, bf16: bool) -> Result<()> {
+    let s = unified_tokens(edge);
+    let projected = projected_dense_peak_gb(s, bf16);
+    let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
+    let safe = budget_gb * 0.85;
+    if projected > safe {
+        return Err(format!(
+            "anima trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
+             (the DiT forward working set materializes in one allocation), exceeding this machine's \
+             ~{safe:.0} GB safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS \
+             would hard-kill the worker (SIGKILL) at the first step with no recoverable error \
+             (sc-10576). Enable Gradient Checkpointing (recomputes block activations in the backward) \
+             or reduce the training resolution."
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Per-DiT-block LOCAL LoRA target paths (`block_local_targets[i]` for block `i`), extracted from the
+/// combined `target_paths`: keep only the DiT `blocks.{i}.{local}` entries (the conditioner's
+/// `llm_adapter.blocks.…` entries are deliberately excluded — the conditioner is never whole-block
+/// checkpointed). Mirrors z-image's `main_block_local_targets` collection; the order per block matches
+/// the params keys `blocks.{i}.{local}.lora_a` that [`build_lora_targets`] produced.
+fn collect_dit_block_local_targets(target_paths: &[String], n_layers: usize) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = vec![Vec::new(); n_layers];
+    for path in target_paths {
+        if path.starts_with("llm_adapter.") {
+            continue; // conditioner target — trains through ordinary autograd, not checkpointed
+        }
+        if let Some((idx, local)) = path.strip_prefix("blocks.").and_then(|r| r.split_once('.')) {
+            if let Ok(i) = idx.parse::<usize>() {
+                if i < n_layers {
+                    out[i].push(local.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr) onto BOTH
 /// the DiT and the conditioner, run the conditioner (→ `encoder_hidden_states`) then the DiT, regress
 /// the velocity `forward()` output toward `noise − x0`, return `(loss, grads)`. The conditioner runs
 /// **inside** the traced graph, so its adapter factors receive gradients. `dtype` is the bf16 compute
 /// dtype: `x_t` is cast at entry, the LoRA factors are cast inside the traced install, and the DiT/
 /// conditioner run bf16; the noising math, loss, and grads stay f32.
+///
+/// `checkpoint_blocks`, when `Some`, lists per-DiT-block LOCAL LoRA target paths and switches the DiT
+/// forward to the gradient-checkpointed path (sc-10576) — each block recomputes its activations in the
+/// backward instead of retaining them, and threads `encoder` as an explicit checkpoint input so the
+/// conditioner keeps its gradient. `None` runs the dense (activation-retaining) DiT forward.
 #[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     dit: &mut CosmosDiT,
@@ -687,6 +825,7 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Array,
     mae: bool,
+    checkpoint_blocks: Option<&[Vec<String>]>,
     dtype: Dtype,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
@@ -696,8 +835,11 @@ fn compute_loss_grads(
     let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
         // Install ALL targets (DiT + conditioner) via the combined host, then drop the host so the
-        // `&self` forwards can borrow the two sub-models. F-149: NEVER check the cancel flag inside
-        // this traced closure (it would be stringified through `Exception::custom` and lose the typed
+        // `&self` forwards can borrow the two sub-models. On the checkpointed path the DiT block
+        // adapters installed here are simply REPLACED inside each checkpoint segment by the explicit-
+        // input factors (so they cost nothing there); the conditioner adapters always train through
+        // this install (ordinary autograd). F-149: NEVER check the cancel flag inside this traced
+        // closure (it would be stringified through `Exception::custom` and lose the typed
         // `Error::Canceled`); cancellation is the caller's job at the step boundary.
         {
             let mut host = AnimaAdapterHost {
@@ -710,9 +852,14 @@ fn compute_loss_grads(
             .forward(&src, &ids, dtype)
             .map_err(|e| Exception::custom(e.to_string()))?;
         let s = Array::from_slice(&[timestep], &[1]);
-        let v = dit
-            .forward(&x_t, &s, &enc, dtype)
-            .map_err(|e| Exception::custom(e.to_string()))?;
+        let v = match checkpoint_blocks {
+            Some(blocks) => dit
+                .forward_with_main_checkpointed(&x_t, &s, &enc, dtype, &p, blocks, alpha)
+                .map_err(|e| Exception::custom(e.to_string()))?,
+            None => dit
+                .forward(&x_t, &s, &enc, dtype)
+                .map_err(|e| Exception::custom(e.to_string()))?,
+        };
         let v = v.as_dtype(Dtype::Float32)?;
         let diff = subtract(&v, &target)?;
         let loss = if mae {
@@ -901,5 +1048,629 @@ mod tests {
                     .any(|s| p.ends_with(&format!(".{s}")))),
             "every filtered path must match a requested suffix"
         );
+    }
+
+    // ======================================================================================
+    // sc-10576 — gradient checkpointing + pre-flight OOM guard
+    // ======================================================================================
+
+    use crate::config::{ConditionerConfig, DitConfig};
+
+    /// A tiny but structurally-complete DiT config (2 heads × 8 = hidden 16, 2 blocks) for a
+    /// Metal-cheap grad-parity model. `text_embed_dim` MUST equal the conditioner `target_dim` (the
+    /// DiT cross-attends the conditioner output).
+    fn tiny_dit_cfg() -> DitConfig {
+        DitConfig {
+            in_channels: 4,
+            out_channels: 4,
+            num_attention_heads: 2,
+            attention_head_dim: 8,
+            num_layers: 2,
+            mlp_ratio: 2.0,
+            text_embed_dim: 16,
+            adaln_lora_dim: 8,
+            max_size: (4, 16, 16),
+            patch_size: (1, 2, 2),
+            rope_scale: (1.0, 4.0, 4.0),
+            concat_padding_mask: true,
+        }
+    }
+
+    fn tiny_cond_cfg() -> ConditionerConfig {
+        ConditionerConfig {
+            source_dim: 16,
+            target_dim: 16,
+            model_dim: 16,
+            num_layers: 2,
+            num_attention_heads: 2,
+            mlp_ratio: 2.0,
+            target_vocab_size: 32,
+            min_sequence_length: 8,
+            rope_theta: 10000.0,
+            norm_eps: 1e-6,
+        }
+    }
+
+    /// `(x0 latent, source Qwen states, T5 ids, noise)` for the tiny model, all f32 (the parity test
+    /// runs f32 so the fp tolerance isn't loosened by bf16 rounding).
+    fn tiny_inputs(
+        dcfg: &DitConfig,
+        ccfg: &ConditionerConfig,
+        edge: i32,
+    ) -> (Array, Array, Array, Array) {
+        let hl = edge / 8;
+        let x0 = random::normal::<f32>(
+            &[1, dcfg.in_channels as i32, 1, hl, hl],
+            None,
+            None,
+            Some(&random::key(11).unwrap()),
+        )
+        .unwrap();
+        let noise =
+            random::normal::<f32>(x0.shape(), None, None, Some(&random::key(12).unwrap())).unwrap();
+        let source = random::normal::<f32>(
+            &[1, 6, ccfg.source_dim as i32],
+            None,
+            None,
+            Some(&random::key(13).unwrap()),
+        )
+        .unwrap();
+        let ids_f = random::uniform::<_, f32>(
+            0.0,
+            ccfg.target_vocab_size as f32,
+            &[1, 4],
+            Some(&random::key(14).unwrap()),
+        )
+        .unwrap();
+        let t5_ids = ids_f.as_dtype(Dtype::Int32).unwrap();
+        eval([&x0, &noise, &source, &t5_ids]).unwrap();
+        (x0, source, t5_ids, noise)
+    }
+
+    /// Σ|grad| over the conditioner (`llm_adapter.*`) `lora_b` factors — non-zero iff the encoder
+    /// gradient path is live (lora_a starts at B=0, so its grad is 0; lora_b carries the signal).
+    fn cond_lora_b_grad(g: &LoraParams) -> f32 {
+        g.iter()
+            .filter(|(k, _)| k.starts_with("llm_adapter.") && k.ends_with(".lora_b"))
+            .map(|(_, v)| v.abs().unwrap().sum(None).unwrap().item::<f32>())
+            .sum()
+    }
+
+    /// Σ|grad| over the DiT (`blocks.*`) `lora_b` factors.
+    fn dit_lora_b_grad(g: &LoraParams) -> f32 {
+        g.iter()
+            .filter(|(k, _)| !k.starts_with("llm_adapter.") && k.ends_with(".lora_b"))
+            .map(|(_, v)| v.abs().unwrap().sum(None).unwrap().item::<f32>())
+            .sum()
+    }
+
+    /// Max relative grad diff between two param maps (per key: `‖a−b‖∞ / max(‖a‖∞, 1e-6)`).
+    fn max_rel_diff(ga: &LoraParams, gb: &LoraParams) -> f32 {
+        let mut m = 0f32;
+        for (k, a) in ga {
+            let b = gb.get(k).expect("same keys");
+            let num = a
+                .subtract(b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            let den = a.abs().unwrap().max(None).unwrap().item::<f32>().max(1e-6);
+            m = m.max(num / den);
+        }
+        m
+    }
+
+    /// Build a tiny synthetic (DiT + conditioner) and the combined LoRA factor surface on it.
+    #[allow(clippy::type_complexity)]
+    fn tiny_model_and_adapter() -> (
+        CosmosDiT,
+        AnimaTextConditioner,
+        LoraParams,
+        TrainAdapter,
+        Vec<String>,
+        Vec<Vec<String>>,
+    ) {
+        let dcfg = tiny_dit_cfg();
+        let ccfg = tiny_cond_cfg();
+        let mut dit = CosmosDiT::synthetic(dcfg, 42);
+        let mut cond = AnimaTextConditioner::synthetic(ccfg, 43);
+        let tcfg = TrainingConfig {
+            rank: 4,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&dit, &cond, &tcfg);
+        let (targets, params) = {
+            let mut host = AnimaAdapterHost {
+                dit: &mut dit,
+                conditioner: &mut cond,
+            };
+            build_lora_targets(&mut host, &target_paths, 4, 7).unwrap()
+        };
+        let blocks = collect_dit_block_local_targets(&target_paths, dcfg.num_layers);
+        (
+            dit,
+            cond,
+            params,
+            TrainAdapter::Lora { targets },
+            target_paths,
+            blocks,
+        )
+    }
+
+    /// Grad-parity: whole-block checkpointed grads == dense grads for BOTH the DiT and the conditioner
+    /// (`llm_adapter`) factors, to fp tolerance. Synthetic small model, Metal, no real weights — the
+    /// always-on analogue of z-image's `#[ignore]`d `checkpointed_grads_match_dense`. Also asserts the
+    /// conditioner actually receives gradient (the encoder path is live) in both legs.
+    #[test]
+    fn checkpointed_grads_match_dense_dit_and_conditioner() {
+        let (mut dit, mut cond, params, adapter, _tp, blocks) = tiny_model_and_adapter();
+        // Hold every SDPA-segment flag OFF so the ONLY difference between the two legs is whole-block
+        // checkpointing of the DiT (isolates the sc-10522 encoder-threading correctness).
+        dit.set_sdpa_checkpoint(false);
+        cond.set_sdpa_checkpoint(false);
+        let (x0, source, t5_ids, noise) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
+
+        let grads_of =
+            |dit: &mut CosmosDiT, cond: &mut AnimaTextConditioner, ck: Option<&[Vec<String>]>| {
+                let (_l, g) = compute_loss_grads(
+                    dit,
+                    cond,
+                    &params,
+                    &adapter,
+                    4.0,
+                    4.0,
+                    &x0,
+                    &source,
+                    &t5_ids,
+                    0.5,
+                    &noise,
+                    false,
+                    ck,
+                    Dtype::Float32,
+                )
+                .unwrap();
+                eval(g.values()).unwrap();
+                g
+            };
+        let g_dense = grads_of(&mut dit, &mut cond, None);
+        let g_ckpt = grads_of(&mut dit, &mut cond, Some(&blocks));
+
+        let max_rel = max_rel_diff(&g_dense, &g_ckpt);
+        eprintln!("[sc-10576] checkpointed-vs-dense grad max rel diff: {max_rel:.2e}");
+        assert!(
+            max_rel < 1e-3,
+            "checkpointed grads must match dense within fp tolerance: max rel {max_rel:.2e}"
+        );
+        // Both legs must actually train the conditioner (proves encoder grad flows) and the DiT.
+        assert!(
+            cond_lora_b_grad(&g_dense) > 1e-6,
+            "conditioner must receive gradient (dense)"
+        );
+        assert!(
+            cond_lora_b_grad(&g_ckpt) > 1e-6,
+            "conditioner must receive gradient (checkpointed) — the sc-10522 inert-adapter trap"
+        );
+        assert!(
+            dit_lora_b_grad(&g_ckpt) > 1e-6,
+            "DiT must receive gradient (checkpointed)"
+        );
+    }
+
+    /// SDPA-segment checkpointing (the dense/LoKr path) must not change grads either: dense grads with
+    /// segment ckpt ON == OFF, to fp tolerance.
+    #[test]
+    fn sdpa_segment_checkpoint_grads_match_retained() {
+        let (mut dit, mut cond, params, adapter, _tp, _blocks) = tiny_model_and_adapter();
+        let (x0, source, t5_ids, noise) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
+        let grads_of = |dit: &mut CosmosDiT, cond: &mut AnimaTextConditioner, on: bool| {
+            dit.set_sdpa_checkpoint(on);
+            cond.set_sdpa_checkpoint(on);
+            let (_l, g) = compute_loss_grads(
+                dit,
+                cond,
+                &params,
+                &adapter,
+                4.0,
+                4.0,
+                &x0,
+                &source,
+                &t5_ids,
+                0.5,
+                &noise,
+                false,
+                None,
+                Dtype::Float32,
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            g
+        };
+        let g_off = grads_of(&mut dit, &mut cond, false);
+        let g_on = grads_of(&mut dit, &mut cond, true);
+        let max_rel = max_rel_diff(&g_off, &g_on);
+        eprintln!("[sc-10576] sdpa-seg-ckpt-vs-retained grad max rel diff: {max_rel:.2e}");
+        assert!(
+            max_rel < 1e-3,
+            "SDPA-segment checkpointing must not change grads: max rel {max_rel:.2e}"
+        );
+    }
+
+    /// The sc-10522 trap made executable: threading `encoder` keeps the conditioner live; CAPTURING it
+    /// (the deliberately-wrong impl) drops the conditioner gradient to ZERO while the DiT still trains
+    /// and the loss still falls — exactly the silent inert-adapter failure. A mutation guard: if the
+    /// production forward regressed to capturing `encoder`, `checkpointed_grads_match_dense_…` would go
+    /// red here (conditioner grad ≈ 0 ≠ the dense non-zero).
+    #[test]
+    fn captured_encoder_zeros_conditioner_grad_mutation() {
+        let (mut dit, mut cond, params, adapter, _tp, blocks) = tiny_model_and_adapter();
+        dit.set_sdpa_checkpoint(false);
+        cond.set_sdpa_checkpoint(false);
+        let (x0, source, t5_ids, noise) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
+
+        // Correct (threaded) path.
+        let (_l, g_ok) = compute_loss_grads(
+            &mut dit,
+            &mut cond,
+            &params,
+            &adapter,
+            4.0,
+            4.0,
+            &x0,
+            &source,
+            &t5_ids,
+            0.5,
+            &noise,
+            false,
+            Some(&blocks),
+            Dtype::Float32,
+        )
+        .unwrap();
+        eval(g_ok.values()).unwrap();
+
+        // Wrong (captured) path — same math except `encoder` is a captured constant in each block's
+        // checkpoint segment, so the backward produces no cotangent for it.
+        let g_bad = grads_encoder_captured(
+            &mut dit, &mut cond, &params, &adapter, &x0, &source, &t5_ids, 0.5, &noise, &blocks,
+        );
+
+        let ok = cond_lora_b_grad(&g_ok);
+        let bad = cond_lora_b_grad(&g_bad);
+        let dit_bad = dit_lora_b_grad(&g_bad);
+        eprintln!(
+            "[sc-10576] conditioner lora_b Σ|grad|: threaded {ok:.3e} vs captured {bad:.3e}; DiT (captured) {dit_bad:.3e}"
+        );
+        assert!(ok > 1e-6, "threaded encoder: conditioner must train");
+        assert!(
+            bad < 1e-9,
+            "captured encoder: conditioner grad must collapse to ZERO (the trap), got {bad:.3e}"
+        );
+        assert!(
+            dit_bad > 1e-6,
+            "captured encoder still trains the DiT — that is why the bug is silent"
+        );
+    }
+
+    /// Compute grads via the deliberately-wrong `encoder`-captured checkpoint forward (mutation test).
+    #[allow(clippy::too_many_arguments)]
+    fn grads_encoder_captured(
+        dit: &mut CosmosDiT,
+        cond: &mut AnimaTextConditioner,
+        params: &LoraParams,
+        adapter: &TrainAdapter,
+        x0: &Array,
+        source: &Array,
+        t5_ids: &Array,
+        sigma: f32,
+        noise: &Array,
+        blocks: &[Vec<String>],
+    ) -> LoraParams {
+        let (x_t, target, timestep) = build_batch(x0, noise, sigma).unwrap();
+        let src = source.clone();
+        let ids = t5_ids.clone();
+        let blk = blocks.to_vec();
+        let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
+            {
+                let mut host = AnimaAdapterHost {
+                    dit: &mut *dit,
+                    conditioner: &mut *cond,
+                };
+                adapter.install_as(&mut host, &p, 4.0, 4.0, None, LOKR_DTYPE)?;
+            }
+            let enc = cond
+                .forward(&src, &ids, Dtype::Float32)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            let s = Array::from_slice(&[timestep], &[1]);
+            let v = dit
+                .forward_with_main_checkpointed_encoder_captured(
+                    &x_t,
+                    &s,
+                    &enc,
+                    Dtype::Float32,
+                    &p,
+                    &blk,
+                    4.0,
+                )
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            let diff = subtract(&v, &target)?;
+            Ok(vec![diff.square()?.mean(None)?])
+        };
+        let mut vg = keyed_value_and_grad(loss_fn);
+        vg(params.clone(), 0).unwrap().1
+    }
+
+    #[test]
+    fn collect_dit_block_local_targets_excludes_conditioner() {
+        let tp = vec![
+            "blocks.0.self_attn.q_proj".to_string(),
+            "blocks.1.mlp.layer2".to_string(),
+            "blocks.1.adaln_modulation_mlp.2".to_string(),
+            "llm_adapter.blocks.0.self_attn.q_proj".to_string(),
+        ];
+        let out = collect_dit_block_local_targets(&tp, 2);
+        assert_eq!(out[0], vec!["self_attn.q_proj".to_string()]);
+        assert_eq!(
+            out[1],
+            vec![
+                "mlp.layer2".to_string(),
+                "adaln_modulation_mlp.2".to_string()
+            ]
+        );
+        let total: usize = out.iter().map(|b| b.len()).sum();
+        assert_eq!(
+            total, 3,
+            "the conditioner llm_adapter target must be excluded"
+        );
+    }
+
+    #[test]
+    fn unified_tokens_grows_with_edge() {
+        assert_eq!(unified_tokens(512), 32.0 * 32.0 + 512.0);
+        assert_eq!(unified_tokens(1024), 64.0 * 64.0 + 512.0);
+        assert!(unified_tokens(1536) > unified_tokens(1024));
+    }
+
+    /// The pre-flight guard mechanism, deterministically (no real weights): an over-budget projection
+    /// returns a catchable, flag-recommending error; a within-budget one is `Ok`. Drives the MLX
+    /// memory limit directly so the assertion is machine-independent.
+    #[test]
+    fn preflight_guard_refuses_over_budget() {
+        use mlx_rs::memory::set_memory_limit;
+        let prev = set_memory_limit(8 * 1024 * 1024 * 1024); // 8 GB budget → safe ~6.8 GB
+        let over = preflight_memory_guard(1536, true);
+        set_memory_limit(256 * 1024 * 1024 * 1024); // 256 GB budget → safe ~217 GB
+        let under = preflight_memory_guard(512, true);
+        set_memory_limit(prev); // restore
+        let err = over.unwrap_err().to_string();
+        assert!(
+            err.contains("Gradient Checkpointing") && err.contains("1536"),
+            "over-budget error must be actionable + name the resolution: {err}"
+        );
+        assert!(
+            under.is_ok(),
+            "a 512² run under a 256 GB budget must pass the guard"
+        );
+    }
+
+    // -------- real-weights measurement + validation (sc-10576), #[ignore]d + snapshot-gated --------
+
+    fn anima_split() -> Option<std::path::PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let base = std::path::PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--circlestone-labs--Anima/snapshots");
+        std::fs::read_dir(&base)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find_map(|e| {
+                let p = e.path().join("split_files");
+                p.join("diffusion_models").is_dir().then_some(p)
+            })
+    }
+
+    /// Load the real DiT + conditioner (+ keep the VAE resident like the train loop); drop the Qwen3
+    /// text encoder + tokenizers, exactly as `train_impl` does post-caching.
+    fn load_real_dit_cond(
+        split: &std::path::Path,
+    ) -> (CosmosDiT, AnimaTextConditioner, crate::vae::QwenVae) {
+        use mlx_gen::WeightsSource;
+        let comps =
+            AnimaComponents::load(&WeightsSource::Dir(split.to_path_buf()), Variant::Base).unwrap();
+        let AnimaComponents {
+            dit,
+            conditioner,
+            vae,
+            text_encoder,
+            tokenizers,
+        } = comps;
+        drop(text_encoder);
+        drop(tokenizers);
+        mlx_rs::memory::clear_cache();
+        (dit, conditioner, vae)
+    }
+
+    /// Run one real bf16 first training step at `edge` and return `(peak GB, loss)`. Synthesizes the
+    /// cached inputs (latent + Qwen states + T5 ids) directly — the memory profile is value-independent,
+    /// so this needs only the real DiT/conditioner weights, not the VAE/text encoders.
+    fn measure_first_step(
+        dit: &mut CosmosDiT,
+        cond: &mut AnimaTextConditioner,
+        edge: i32,
+        use_checkpoint: bool,
+    ) -> (f32, f32) {
+        use mlx_rs::memory::{get_peak_memory, reset_peak_memory};
+        let tcfg = TrainingConfig {
+            rank: 16,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(dit, cond, &tcfg);
+        let (targets, params) = {
+            let mut host = AnimaAdapterHost {
+                dit,
+                conditioner: cond,
+            };
+            build_lora_targets(&mut host, &target_paths, 16, 7).unwrap()
+        };
+        let adapter = TrainAdapter::Lora { targets };
+        let blocks = collect_dit_block_local_targets(&target_paths, dit.config().num_layers);
+        let ck: Option<&[Vec<String>]> = if use_checkpoint { Some(&blocks) } else { None };
+        dit.set_sdpa_checkpoint(!use_checkpoint);
+        cond.set_sdpa_checkpoint(true);
+
+        let hl = edge / 8;
+        let x0 = random::normal::<f32>(
+            &[1, 16, 1, hl, hl],
+            None,
+            None,
+            Some(&random::key(1).unwrap()),
+        )
+        .unwrap();
+        let noise =
+            random::normal::<f32>(x0.shape(), None, None, Some(&random::key(2).unwrap())).unwrap();
+        let source =
+            random::normal::<f32>(&[1, 64, 1024], None, None, Some(&random::key(3).unwrap()))
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+        let ids = random::uniform::<_, f32>(0.0, 32000.0, &[1, 32], Some(&random::key(4).unwrap()))
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap();
+        eval([&x0, &noise, &source, &ids]).unwrap();
+
+        reset_peak_memory();
+        let (loss, grads) = compute_loss_grads(
+            dit,
+            cond,
+            &params,
+            &adapter,
+            16.0,
+            16.0,
+            &x0,
+            &source,
+            &ids,
+            0.5,
+            &noise,
+            false,
+            ck,
+            Dtype::Bfloat16,
+        )
+        .unwrap();
+        eval(grads.values()).unwrap();
+        let peak = get_peak_memory() as f32 / (1024.0 * 1024.0 * 1024.0);
+        (peak, loss)
+    }
+
+    /// sc-10576 CALIBRATION: sweep the dense (whole-block OFF, SDPA-segment ON) first-step peak at
+    /// 512/768/1024 to fit `projected_dense_peak_gb`. Prints measured vs. projected — refit the
+    /// `ANIMA_PEAK_*` constants if these move materially.
+    #[test]
+    #[ignore = "needs the circlestone-labs/Anima snapshot; measures GPU peak (sc-10576 calibration)"]
+    fn first_step_dense_peak_sweep() {
+        let Some(split) = anima_split() else {
+            eprintln!("skip: no Anima snapshot");
+            return;
+        };
+        let (mut dit, mut cond, _vae) = load_real_dit_cond(&split);
+        eprintln!("[sc-10576] dense first-step peak sweep (bf16, rank16, SDPA-seg ckpt ON):");
+        for edge in [512, 768, 1024] {
+            let (peak, loss) = measure_first_step(&mut dit, &mut cond, edge, false);
+            let s = unified_tokens(edge as u32);
+            eprintln!(
+                "[sc-10576]   edge {edge:>4}  s {s:>7.0}  peak {peak:6.2} GB  loss {loss:.4}  (projected {:6.2} GB)",
+                projected_dense_peak_gb(s, true)
+            );
+        }
+    }
+
+    /// sc-10576 VALIDATION: (1) a direct measured A/B at 1024² (both fit) proving whole-block
+    /// checkpointing reduces the first-step peak, then (2) the 1536² criterion — checkpointing makes
+    /// the step fit, while the dense projection is refused by the pre-flight guard.
+    #[test]
+    #[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT steps at 1024²/1536²)"]
+    fn first_step_1536_checkpointed_vs_dense() {
+        let Some(split) = anima_split() else {
+            eprintln!("skip: no Anima snapshot");
+            return;
+        };
+        let (mut dit, mut cond, _vae) = load_real_dit_cond(&split);
+        let budget = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
+
+        // (1) Measured A/B at 1024 — both fit, so the reduction is observed, not projected.
+        let (dense_1024, _) = measure_first_step(&mut dit, &mut cond, 1024, false);
+        let (ckpt_1024, _) = measure_first_step(&mut dit, &mut cond, 1024, true);
+        eprintln!(
+            "[sc-10576] edge 1024  dense {dense_1024:.2} GB  ckpt {ckpt_1024:.2} GB  ({:.0}% reduction)",
+            100.0 * (1.0 - ckpt_1024 / dense_1024)
+        );
+        assert!(
+            ckpt_1024 < dense_1024,
+            "whole-block checkpointing must reduce the first-step peak: dense {dense_1024:.2} GB vs ckpt {ckpt_1024:.2} GB"
+        );
+
+        // (2) The 1536² criterion: checkpointed fits, dense is over the safe budget → guard refuses.
+        let (ck_peak, ck_loss) = measure_first_step(&mut dit, &mut cond, 1536, true);
+        let dense_proj = projected_dense_peak_gb(unified_tokens(1536), true);
+        let refused = preflight_memory_guard(1536, true).is_err();
+        eprintln!(
+            "[sc-10576] edge 1536 CHECKPOINTED peak {ck_peak:.2} GB loss {ck_loss:.4} | budget {budget:.0} GB | dense projected {dense_proj:.1} GB | preflight-refuses {refused}"
+        );
+        assert!(
+            ck_peak as f64 <= budget,
+            "checkpointed 1536 must fit this machine's budget: {ck_peak:.2} GB vs {budget:.0} GB"
+        );
+        assert!(
+            refused,
+            "dense 1536 (projected {dense_proj:.0} GB) must be refused by the pre-flight guard"
+        );
+    }
+}
+
+/// The empirical fit must reproduce the measured Anima dense first-step peaks (sc-10576) within a few
+/// GB, stay monotone in `s`, and put the checkpointing regime on the right side of a typical budget.
+#[cfg(test)]
+mod preflight_tests {
+    use super::{projected_dense_peak_gb, unified_tokens};
+
+    #[test]
+    fn projected_peak_reproduces_measured_points() {
+        // Measured on the 128 GB target (first_step_dense_peak_sweep, bf16, rank16, SDPA-seg ON):
+        //   edge 512  (s 1536) → 21.18 GB
+        //   edge 768  (s 2816) → 32.05 GB
+        //   edge 1024 (s 4608) → 49.44 GB
+        // The exact 3-point fit must reproduce each within ~1 GB.
+        let approx = |edge: u32, want: f64| {
+            let got = projected_dense_peak_gb(unified_tokens(edge), true);
+            assert!(
+                (got - want).abs() < 1.0,
+                "edge {edge}: projected {got:.2} GB vs measured {want:.2} GB"
+            );
+        };
+        approx(512, 21.18);
+        approx(768, 32.05);
+        approx(1024, 49.44);
+    }
+
+    #[test]
+    fn projected_peak_puts_1536_over_a_128gb_budget() {
+        // Dense 1536² (s 9728) extrapolates well above a 128 GB machine's working set — so the guard
+        // refuses it (or it SIGKILLs), which is exactly the regime whole-block checkpointing unblocks.
+        let dense_1536 = projected_dense_peak_gb(unified_tokens(1536), true);
+        assert!(
+            dense_1536 > 100.0,
+            "dense 1536² must project over budget (got {dense_1536:.0} GB)"
+        );
+    }
+
+    #[test]
+    fn projected_peak_is_monotone_and_ordered() {
+        let p = |edge: u32| projected_dense_peak_gb(unified_tokens(edge), true);
+        assert!(p(512) < p(1024));
+        assert!(p(1024) < p(1536));
+        assert!(p(1536) < p(2048));
+        // f32 upper bound is strictly above the bf16 fit.
+        let s = unified_tokens(1024);
+        assert!(projected_dense_peak_gb(s, false) > projected_dense_peak_gb(s, true));
     }
 }
