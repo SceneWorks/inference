@@ -150,27 +150,13 @@ impl Krea2Transformer {
     ) -> Result<JointPrep> {
         let cfg = &self.cfg;
         let p = cfg.patch_size as i32;
-        let dt = self.dtype;
         let sh = latent.shape();
         let (h, w) = (sh[2], sh[3]);
         let (ht, wt) = (h / p, w / p);
         let latent_ch = cfg.in_channels as i32 / (p * p);
 
-        // Trim the text stream to its valid length (B = 1).
-        let n_tok = context.shape()[1];
-        let cap_len = match mask {
-            Some(m) => sum(&m.as_dtype(Dtype::Float32)?, false)?.item::<f32>() as i32,
-            None => n_tok,
-        };
-        // Contiguous head slice `[0, cap_len)` via a split boundary, not an arange-gather (F-114).
-        let context = split_axis1(context, cap_len)?.swap_remove(0).as_dtype(dt)?;
-
-        // Text fusion (12 layers → 1) then the text input projection.
-        let ctx = self.text_fusion.forward(&context)?; // [b, cap, text_hidden]
-        let ctx = self.txt_in_norm.forward(&ctx)?;
-        let ctx = self
-            .txt_in_l2
-            .forward(&gelu_tanh(&self.txt_in_l1.forward(&ctx)?)?)?; // [b, cap, hidden]
+        // Trim + fuse + project the text stream (step-invariant), shared with the edit path.
+        let (ctx, cap_len) = self.text_stream(context, mask)?;
 
         // Joint RoPE tables (also step-invariant: depend only on cap_len + image grid).
         let rope = RopeTables::build_t2i(
@@ -191,6 +177,142 @@ impl Krea2Transformer {
             latent_ch,
             p,
         })
+    }
+
+    /// Trim the (B = 1) text stream to its valid `cap_len` (the encoder's padding mask), then run the
+    /// 12-layer text fusion + the text-input projection → `([b, cap, hidden], cap_len)`. Step-invariant
+    /// (depends only on `context`/`mask`), so both [`prepare`](Self::prepare) and
+    /// [`prepare_edit`](Self::prepare_edit) hoist it out of the denoise loop. Factored out so the two
+    /// paths share one text-stream implementation.
+    fn text_stream(&self, context: &Array, mask: Option<&Array>) -> Result<(Array, i32)> {
+        let dt = self.dtype;
+        let n_tok = context.shape()[1];
+        let cap_len = match mask {
+            Some(m) => sum(&m.as_dtype(Dtype::Float32)?, false)?.item::<f32>() as i32,
+            None => n_tok,
+        };
+        // Contiguous head slice `[0, cap_len)` via a split boundary, not an arange-gather (F-114).
+        let context = split_axis1(context, cap_len)?.swap_remove(0).as_dtype(dt)?;
+        let ctx = self.text_fusion.forward(&context)?; // [b, cap, text_hidden]
+        let ctx = self.txt_in_norm.forward(&ctx)?;
+        let ctx = self
+            .txt_in_l2
+            .forward(&gelu_tanh(&self.txt_in_l1.forward(&ctx)?)?)?; // [b, cap, hidden]
+        Ok((ctx, cap_len))
+    }
+
+    /// Build the **step-invariant** conditioning for a Kontext-style **edit** forward ([`EditPrep`]): the
+    /// fused text stream, the CLEAN in-context reference tokens embedded through the (adapter-carrying)
+    /// `img_in`, and the joint 3-axis RoPE laid out `[text ; refs… ; target]` with each reference at its
+    /// own frame (see [`rope::RopeTables::build_edit`]). `noise_latent` supplies only the target grid
+    /// geometry (its *values* are not read). Each entry of `ref_latents` is a `[b, 16, H, W]` VAE latent
+    /// at the SAME resolution as `noise_latent` (the references share the target grid), in the fixed
+    /// source order (scene, then subject). Like [`prepare`](Self::prepare), this runs ONCE per denoise —
+    /// the reference tokens are clean (timestep-independent), so they are hoisted here, not re-embedded
+    /// per step.
+    pub fn prepare_edit(
+        &self,
+        context: &Array,
+        mask: Option<&Array>,
+        noise_latent: &Array,
+        ref_latents: &[Array],
+    ) -> Result<EditPrep> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size as i32;
+        let dt = self.dtype;
+        let sh = noise_latent.shape();
+        let (h, w) = (sh[2], sh[3]);
+        let (ht, wt) = (h / p, w / p);
+        let latent_ch = cfg.in_channels as i32 / (p * p);
+
+        let (ctx, cap_len) = self.text_stream(context, mask)?;
+
+        // Embed each clean reference latent through the SAME `img_in` as the noise (adapters included);
+        // the reference tokens are step-invariant, so this hoist mirrors the text-stream one.
+        let n_refs = ref_latents.len();
+        let ref_tokens = if n_refs == 0 {
+            None
+        } else {
+            let embedded: Vec<Array> = ref_latents
+                .iter()
+                .map(|r| self.img_in.forward(&patchify(&r.as_dtype(dt)?, p)?))
+                .collect::<Result<_>>()?;
+            let refs: Vec<&Array> = embedded.iter().collect();
+            Some(concatenate_axis(&refs, 1)?) // [b, n_refs·ht·wt, hidden]
+        };
+
+        // Joint RoPE with the reference frames inserted between text and target (Kontext layout).
+        let rope = RopeTables::build_edit(
+            cap_len as usize,
+            ht as usize,
+            wt as usize,
+            n_refs,
+            cfg.axes_dims_rope,
+            cfg.rope_theta as f64,
+        );
+        let (rcos, rsin) = rope.joint();
+        Ok(EditPrep {
+            ctx,
+            ref_tokens,
+            rcos,
+            rsin,
+            cap_len,
+            ht,
+            wt,
+            latent_ch,
+            p,
+            n_refs: n_refs as i32,
+        })
+    }
+
+    /// Velocity prediction for the **edit** path from a precomputed [`EditPrep`]: patch-embed the noise
+    /// target, assemble the joint sequence `[ctx ; refs ; noise]`, run the block stack under the same
+    /// shared modulation `tvec`, then the final layer — and slice back ONLY the noise (target) tokens,
+    /// the contiguous tail after `cap_len + n_refs·(ht·wt)`. Numerically the text-to-image
+    /// [`forward_prepared`](Self::forward_prepared) with the reference tokens spliced in and the RoPE
+    /// carrying their frame offset; `in_channels` is unchanged (sequence concat, not channel concat).
+    pub fn forward_prepared_edit(
+        &self,
+        noise_latent: &Array,
+        timestep: &Array,
+        prep: &EditPrep,
+    ) -> Result<Array> {
+        let cfg = &self.cfg;
+        let dt = self.dtype;
+
+        // Noise (target) patch embed.
+        let img = self
+            .img_in
+            .forward(&patchify(&noise_latent.as_dtype(dt)?, prep.p)?)?; // [b, img_len, hidden]
+
+        // Timestep embed → `t`; shared modulation `tvec` — identical to `joint_inputs` (one timestep
+        // broadcasts over the whole sequence; the reference tokens' "clean" role is carried by their
+        // RoPE frame + the LoRA, not a per-token timestep).
+        let t_sin = temb(timestep, cfg.timestep_embed_dim as i32)?.as_dtype(dt)?; // [b, 1, tdim]
+        let t = self
+            .time_embed_l2
+            .forward(&gelu_tanh(&self.time_embed_l1.forward(&t_sin)?)?)?; // [b, 1, hidden]
+        let tvec = self.time_mod_proj.forward(&gelu_tanh(&t)?)?; // [b, 1, 6·hidden]
+
+        // Joint sequence `[ctx ; refs ; noise]` (references present only when `n_refs > 0`).
+        let mut parts: Vec<&Array> = Vec::with_capacity(3);
+        parts.push(&prep.ctx);
+        if let Some(rt) = &prep.ref_tokens {
+            parts.push(rt);
+        }
+        parts.push(&img);
+        let mut combined = concatenate_axis(&parts, 1)?;
+
+        for blk in &self.blocks {
+            combined = blk.forward(&combined, &tvec, &prep.rcos, &prep.rsin)?;
+        }
+
+        // Final layer, then slice the noise tokens — the contiguous tail after text + references.
+        let out = self.final_layer(&combined, &t)?; // [b, cap+refs+img_len, in_channels]
+        let img_len = prep.ht * prep.wt;
+        let head = prep.cap_len + prep.n_refs * img_len;
+        let img_out = split_axis1(&out, head)?.swap_remove(1); // [b, img_len, in_channels]
+        unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
     }
 
     /// Velocity prediction from a precomputed [`JointPrep`] — runs the per-step compute only: image
@@ -463,6 +585,25 @@ pub struct JointPrep {
     wt: i32,
     latent_ch: i32,
     p: i32,
+}
+
+/// The **step-invariant** conditioning for a Kontext-style edit forward ([`Krea2Transformer::prepare_edit`]):
+/// the fused text stream (`ctx`), the CLEAN in-context reference tokens (`ref_tokens`, `None` when there
+/// are no references — then the edit forward reduces to plain text-to-image), the joint RoPE tables laid
+/// out `[text ; refs ; target]`, the target patchify/slice geometry, and `n_refs` (how many reference
+/// grids precede the noise tokens, so [`Krea2Transformer::forward_prepared_edit`] can slice the target
+/// tail). Reused across every denoise step (F-079).
+pub struct EditPrep {
+    ctx: Array,
+    ref_tokens: Option<Array>,
+    rcos: Array,
+    rsin: Array,
+    cap_len: i32,
+    ht: i32,
+    wt: i32,
+    latent_ch: i32,
+    p: i32,
+    n_refs: i32,
 }
 
 /// LoRA/LoKr target routing for the Krea single-stream DiT (sc-7577 trainer / sc-7578 inference apply):

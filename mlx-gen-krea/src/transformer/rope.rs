@@ -55,6 +55,48 @@ impl RopeTables {
         from_positions(&positions, axes, theta)
     }
 
+    /// Build the joint table for an **edit** forward (Kontext-style in-context reference tokens): the
+    /// same `cap_len` text `(0,0,0)` + row-major target grid `(0, row, col)` as [`build_t2i`], but with
+    /// `n_refs` reference image grids inserted **between** the text and the target — each reference `i`
+    /// (0-based) at a distinct RoPE **frame** `i + 1` on the otherwise-unused t-axis (the target/noise
+    /// stays at frame 0). The token order matches the reference ComfyUI-Krea2Edit node
+    /// (`torch.cat([context] + src_imgs + [tgt_img])`): `[text ; ref_0 ; … ; ref_{n-1} ; target]`, with
+    /// positions text `(0,0,0)`, ref `i` `(i+1, row, col)`, target `(0, row, col)`. References share the
+    /// target's `h_tokens × w_tokens` grid (they are VAE-encoded at the target resolution). `n_refs = 0`
+    /// is byte-identical to [`build_t2i`].
+    ///
+    /// [`build_t2i`]: Self::build_t2i
+    pub fn build_edit(
+        cap_len: usize,
+        h_tokens: usize,
+        w_tokens: usize,
+        n_refs: usize,
+        axes: [usize; 3],
+        theta: f64,
+    ) -> Self {
+        let grid = h_tokens * w_tokens;
+        let mut positions = Vec::with_capacity(cap_len + (n_refs + 1) * grid);
+        for _ in 0..cap_len {
+            positions.push((0.0, 0.0, 0.0));
+        }
+        // References first (frames 1..=n_refs), in the fixed source order, then the target at frame 0 —
+        // the exact `[text ; refs… ; target]` sequence the block stack + `finalize` consume.
+        for i in 0..n_refs {
+            let frame = (i + 1) as f64;
+            for r in 0..h_tokens {
+                for c in 0..w_tokens {
+                    positions.push((frame, r as f64, c as f64));
+                }
+            }
+        }
+        for r in 0..h_tokens {
+            for c in 0..w_tokens {
+                positions.push((0.0, r as f64, c as f64));
+            }
+        }
+        from_positions(&positions, axes, theta)
+    }
+
     /// `(cos, sin)` for the full joint `[text; image]` sequence (the single-stream blocks).
     pub fn joint(&self) -> (Array, Array) {
         (self.cos.clone(), self.sin.clone())
@@ -125,4 +167,57 @@ pub fn apply_interleaved_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Arr
 
     let out = concatenate_axis(&[&out_e.expand_dims(4)?, &out_o.expand_dims(4)?], 4)?;
     Ok(out.reshape(&[b, s, h, hd])?.as_dtype(dt)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AXES: [usize; 3] = [32, 48, 48]; // the Krea 2 `axes_dims_rope` (t, h, w)
+    const THETA: f64 = 10000.0;
+
+    /// `build_edit` with zero references is byte-identical to `build_t2i` — the edit builder must not
+    /// perturb the plain text-to-image table (the shared t2i path stays exact).
+    #[test]
+    fn build_edit_zero_refs_is_identical_to_t2i() {
+        let a = RopeTables::build_t2i(3, 2, 2, AXES, THETA);
+        let b = RopeTables::build_edit(3, 2, 2, 0, AXES, THETA);
+        assert_eq!(a.cos.shape(), b.cos.shape());
+        assert_eq!(a.cos.as_slice::<f32>(), b.cos.as_slice::<f32>());
+        assert_eq!(a.sin.as_slice::<f32>(), b.sin.as_slice::<f32>());
+    }
+
+    /// The reference grid sits at a distinct RoPE **frame** (t-axis) while text + target stay at frame 0
+    /// — the Kontext-style in-context positioning the LoRA was trained against. Sequence order is
+    /// `[text ; ref(frame 1) ; target(frame 0)]`.
+    #[test]
+    fn build_edit_assigns_reference_a_distinct_frame() {
+        let (cap, ht, wt, nref) = (1usize, 2usize, 2usize, 1usize);
+        let t = RopeTables::build_edit(cap, ht, wt, nref, AXES, THETA);
+        let grid = ht * wt;
+        let half: usize = AXES.iter().map(|d| d / 2).sum(); // 64
+        assert_eq!(t.cos.shape().len(), 3);
+        assert_eq!(t.cos.shape()[1], (cap + (nref + 1) * grid) as i32);
+        assert_eq!(t.cos.shape()[2], half as i32);
+        let cos = t.cos.as_slice::<f32>();
+        let row = |tok: usize| &cos[tok * half..tok * half + half];
+        let t_axis = AXES[0] / 2; // 16 freqs on the (frame) t-axis; inv_freq[0] = theta^0 = 1
+
+        // Text token (frame 0): the whole t-axis block is identity (cos = 1).
+        for &c in &row(0)[..t_axis] {
+            assert!((c - 1.0).abs() < 1e-6, "text token t-axis must be identity");
+        }
+        // First reference token (frame 1): the leading t-axis entry rotates by cos(1·1).
+        assert!(
+            (row(cap)[0] - (1.0f64.cos() as f32)).abs() < 1e-6,
+            "reference token must sit at frame 1"
+        );
+        // First target/noise token (frame 0 again): t-axis identity.
+        for &c in &row(cap + nref * grid)[..t_axis] {
+            assert!(
+                (c - 1.0).abs() < 1e-6,
+                "target token must be back at frame 0"
+            );
+        }
+    }
 }

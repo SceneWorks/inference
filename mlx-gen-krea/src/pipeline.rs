@@ -31,11 +31,12 @@ use mlx_gen::{
 
 use std::path::Path;
 
-use crate::loader::{load_text_encoder, load_transformer};
+use crate::loader::{load_text_encoder, load_transformer, load_vision_tower};
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
-use crate::text_encoder::{KreaTextEncoder, KreaTokenizer};
+use crate::text_encoder::{encode_grounded, KreaTextEncoder, KreaTokenizer};
 use crate::transformer::Krea2Transformer;
 use crate::vae::{load_vae, QwenVae};
+use mlx_gen_boogu::VisionTower;
 
 /// Turbo text-to-image knobs, resolved from the [`crate::model`] request. Dimensions are validated at
 /// the Generator layer (multiple-of-16, in the resolution range) before the pipeline runs.
@@ -57,6 +58,10 @@ pub struct KreaPipeline {
     te: KreaTextEncoder,
     dit: Krea2Transformer,
     vae: QwenVae,
+    /// Qwen3-VL vision tower for image-grounded (edit) encoding (epic 10871 P2). NB loaded eagerly by
+    /// [`Self::from_snapshot`] for the P2.3 validation; production should load it lazily / edit-only so
+    /// text-to-image doesn't pay the ~0.6 GB (tracked for P3).
+    vision: VisionTower,
 }
 
 impl KreaPipeline {
@@ -68,6 +73,7 @@ impl KreaPipeline {
             te: load_text_encoder(root)?,
             dit: load_transformer(root)?,
             vae: load_vae(root)?,
+            vision: load_vision_tower(root)?,
         })
     }
 
@@ -466,6 +472,140 @@ impl KreaPipeline {
                 let v = match &prep_neg {
                     Some(neg) => {
                         let uncond = self.dit.forward_prepared(x, &t, neg)?;
+                        krea_cfg_combine(&cond, &uncond, guidance)?
+                    }
+                    None => cond,
+                };
+                Ok(v.as_dtype(Dtype::Float32)?)
+            },
+        )?;
+
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder)
+    }
+
+    /// Generate one edited RGB image from a source image + an instruction, with no cancellation, a
+    /// no-op progress sink, and the native VAE decode. Convenience wrapper over
+    /// [`Self::generate_edit_with_progress`] for a single reference (mirrors [`Self::generate_base`]).
+    pub fn generate_edit(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        source: &Image,
+        opts: &TurboOptions,
+    ) -> Result<Image> {
+        self.generate_edit_with_progress(
+            prompt,
+            negative_prompt,
+            guidance,
+            &[source],
+            opts,
+            None,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// **Kontext-style image edit** on the Krea 2 Raw (true-CFG) path (epic 10871, sc-10876). Unlike
+    /// img2img — which VAE-encodes the reference into the *init latent* and denoises from a noised copy
+    /// of it — an edit keeps the source as **in-context conditioning**: it denoises from PURE NOISE while
+    /// the VAE-encoded source token(s) ride alongside the noise in the transformer sequence at a distinct
+    /// RoPE frame (see [`Krea2Transformer::prepare_edit`] / [`Krea2Transformer::forward_prepared_edit`]).
+    /// This matches the training contract of the Krea 2 edit LoRA (the reference ComfyUI-Krea2Edit node's
+    /// `[context, src_imgs…, target]` sequence with reference frames `1..N` and target frame `0`).
+    ///
+    /// `sources` are the reference image(s) in the fixed order (scene, then subject) — each is
+    /// VAE-encoded at the TARGET resolution (`opts.width`×`opts.height`) so it shares the target latent
+    /// grid. Runs the full-CFG Raw sampler (two edit forwards/step combined by [`krea_cfg_combine`] when
+    /// `guidance > 0`, else one) over the whole resolution-dynamic [`base_schedule`] from noise — the
+    /// edit behaviour comes from the LoRA + the in-context tokens, not from a strength-truncated
+    /// schedule. Both the positive and (CFG-active) unconditional edit preps — text stream, clean
+    /// reference tokens, and joint RoPE — are hoisted ONCE (the F-079 hoist). `decoder` is the same
+    /// latent→pixel seam as the other paths (native [`QwenVae`] or a PiD decoder).
+    ///
+    /// NB the **dual-conditioning** the LoRA was trained with also feeds the source image into the
+    /// Qwen3-VL text encoder (image-grounded encoding); that half is epic 10871 P2 — this P1 entrypoint
+    /// wires the in-context VAE-token half, so a LoRA run here is the (off-distribution) VAE-only
+    /// milestone until the grounding lands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_edit_with_progress(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        sources: &[&Image],
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
+        if sources.is_empty() {
+            return Err(mlx_gen::Error::Msg(
+                "krea_2 edit: at least one source image is required".into(),
+            ));
+        }
+
+        // Source reference(s) → clean latents `[1, 16, H/8, W/8]` at the TARGET resolution (references
+        // share the target grid). `QwenVae::encode` returns the normalized `(e − mean)/std` latent; drop
+        // the singleton temporal axis (same front matter as img2img).
+        let mut ref_latents: Vec<Array> = Vec::with_capacity(sources.len());
+        for &src in sources {
+            let image_nchw = preprocess_init_image(src, opts.width, opts.height)?;
+            ref_latents.push(self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?);
+        }
+
+        // Edit denoises from PURE NOISE — the source is in-context conditioning, not a noised init.
+        let noise = init_noise(opts.height, opts.width, opts.seed)?;
+
+        // DUAL CONDITIONING (epic 10871 P2.3): the source image feeds BOTH the in-context VAE tokens
+        // (`ref_latents`, above) AND the Qwen3-VL grounded context — the edit LoRA's training contract.
+        // The grounded context replaces the text-only encode; the source image sits in both CFG branches
+        // (only the instruction text differs), matching the reference edit CFG. Single-reference
+        // grounding for now (multi-reference grounding is a follow-on; the VAE-token side already takes
+        // N sources). Each prep carries the clean reference tokens + the reference-frame RoPE.
+        let context = encode_grounded(&self.vision, &self.tok, &self.te, sources[0], prompt)?;
+        let prep_pos = self
+            .dit
+            .prepare_edit(&context, None, &noise, &ref_latents)?;
+        let prep_neg = if guidance > 0.0 {
+            let ncontext = encode_grounded(
+                &self.vision,
+                &self.tok,
+                &self.te,
+                sources[0],
+                negative_prompt,
+            )?;
+            Some(
+                self.dit
+                    .prepare_edit(&ncontext, None, &noise, &ref_latents)?,
+            )
+        } else {
+            None
+        };
+
+        // Full resolution-dynamic Raw schedule (the edit runs the whole schedule from noise, like t2i).
+        let sigmas = base_schedule(
+            opts.steps,
+            opts.width,
+            opts.height,
+            opts.scheduler.as_deref(),
+        );
+        let lat = run_flow_sampler(
+            opts.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            &sigmas,
+            noise,
+            opts.seed,
+            cancel,
+            on_progress,
+            |x, timestep| {
+                let t = Array::from_slice(&[timestep], &[1]);
+                let cond = self.dit.forward_prepared_edit(x, &t, &prep_pos)?;
+                let v = match &prep_neg {
+                    Some(neg) => {
+                        let uncond = self.dit.forward_prepared_edit(x, &t, neg)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,

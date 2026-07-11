@@ -18,6 +18,12 @@ mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }
 # so `req.use_pid` routes decode through a `mlx_gen_pid::PidDecoder` (built via the shared
 # `mlx_gen_qwen_image::pipeline::resolve_pid_decoder`). `mlx-gen-pid` depends only on core (acyclic).
 mlx-gen-pid = { path = "../mlx-gen-pid" }
+# Reuse the config-driven Qwen3-VL vision tower (epic 10871 P2.1, sc-10879): Krea 2's condition encoder
+# IS Qwen3-VL-4B, and the edit LoRA needs image-grounded encoding. boogu already ships a `VisionTower` /
+# `VisionConfig` (its own 8B); Krea builds the 4B variant from the same code rather than duplicate the
+# parity-critical tower — the same provider-reuse pattern as the qwen-image VAE above. Acyclic (boogu
+# does not depend on krea).
+mlx-gen-boogu = { path = "../mlx-gen-boogu" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration of the `krea_2_turbo` generator into the `mlx_gen` registry

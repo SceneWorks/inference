@@ -64,6 +64,15 @@ pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 const DEFAULT_RAW_STEPS: u32 = 52;
 const DEFAULT_RAW_GUIDANCE: f32 = 3.5;
 
+/// Registry id for the **image-edit** variant (epic 10871). The Kontext-style edit surface shares the
+/// undistilled Raw pipeline (full-CFG, denoise-from-noise) but routes a single `Reference` — the SOURCE
+/// image — through [`KreaPipeline::generate_edit_with_progress`] (in-context VAE tokens + Qwen3-VL
+/// grounding) instead of the img2img latent-init. A DISTINCT engine id (the Qwen-Image-Edit /
+/// FLUX.2-Klein-Edit pattern) is what disambiguates edit from img2img: the SAME source `Reference` means
+/// "edit" or "img2img" purely by which generator the worker loaded. The community `krea2_identity_edit`
+/// LoRA rides `spec.adapters`.
+pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
+
 /// Krea 2 Turbo identity + capabilities — constructible without loading weights (registry
 /// introspection / capability advertisement). Distilled few-step text-to-image: **CFG-free** (the TDM
 /// distillation baked the guided velocity into the weights, so no unconditional branch / `guidance`),
@@ -132,6 +141,18 @@ pub fn raw_descriptor() -> ModelDescriptor {
     d
 }
 
+/// Krea 2 **image-edit** identity + capabilities (epic 10871). Same full-CFG surface as
+/// [`raw_descriptor`] — an edit denoises from noise under true CFG, honoring guidance + a negative
+/// prompt — but with the distinct [`KREA_2_EDIT_ID`] so the worker's edit lane can select it. Carries the
+/// single-`Reference` (source) conditioning + LoRA/LoKr (the `krea2_identity_edit` edit LoRA). Derived
+/// from [`raw_descriptor`] so the shared surface (family/backend/samplers/quants/size/CFG) stays in
+/// lockstep; only the id (→ the `generate_impl` edit branch) differs.
+pub fn edit_descriptor() -> ModelDescriptor {
+    let mut d = raw_descriptor();
+    d.id = KREA_2_EDIT_ID;
+    d
+}
+
 /// A loaded Krea 2 generator (Turbo or Raw): the cached descriptor + the assembled pipeline (tokenizer +
 /// Qwen3-VL-4B condition encoder + single-stream DiT + Qwen-Image VAE). The variant is read back off
 /// `descriptor.id` at generate time (Turbo = CFG-free distilled; Raw = full-CFG undistilled).
@@ -159,6 +180,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// so `generate` runs the full-CFG path.
 pub fn load_raw(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(spec, raw_descriptor())
+}
+
+/// Load the **image-edit** generator (`krea_2_edit`, epic 10871). Identical snapshot assembly to
+/// [`load_raw`] — edit shares the Raw pipeline (the source is in-context conditioning, not a distinct
+/// model) — but stores the [`edit_descriptor`] so `generate` routes a source `Reference` to the Kontext
+/// edit entrypoint. The snapshot MUST carry the Qwen3-VL vision tower (`text_encoder/` `visual.*`) for
+/// the grounded half of the dual conditioning; the turnkey keeps it dense ([`crate::convert`]).
+pub fn load_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(spec, edit_descriptor())
 }
 
 /// Shared loader behind [`load`] / [`load_raw`]: assemble the pipeline from a snapshot dir, install any
@@ -241,8 +271,12 @@ impl Krea {
         validate_request(&self.descriptor, req)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
-        // Turbo = CFG-free distilled (8-step, fixed mu). One `Krea` struct, two render paths.
-        let is_raw = self.descriptor.id == KREA_2_RAW_ID;
+        // Turbo = CFG-free distilled (8-step, fixed mu). One `Krea` struct, two render paths. The edit
+        // variant (epic 10871) shares Raw's full-CFG sampler — an edit denoises from noise under true CFG
+        // — so `is_raw` (the full-CFG path selector for schedule/steps/guidance) covers edit too; only the
+        // per-image entrypoint below differs (`is_edit` → the Kontext edit path, not img2img/t2i).
+        let is_edit = self.descriptor.id == KREA_2_EDIT_ID;
+        let is_raw = self.descriptor.id == KREA_2_RAW_ID || is_edit;
         let steps = req.steps.unwrap_or(if is_raw {
             DEFAULT_RAW_STEPS
         } else {
@@ -302,7 +336,29 @@ impl Krea {
                 sampler: req.sampler.clone(),
                 scheduler: req.scheduler.clone(),
             };
-            let img = if let Some((init, ref_strength)) = reference {
+            let img = if is_edit {
+                // Kontext-style edit (epic 10871): the single `Reference` is the SOURCE image, kept as
+                // in-context conditioning (VAE tokens + Qwen3-VL grounding) — NOT a noised img2img init.
+                // It denoises from PURE NOISE under full CFG, so `strength` (schedule truncation) is
+                // meaningless for an edit and the reference's strength is ignored. The `krea2_identity_edit`
+                // LoRA in `spec.adapters` is what makes the in-context source actually steer the edit.
+                let (source, _) = reference.ok_or_else(|| {
+                    Error::Msg(format!(
+                        "{}: edit requires a source Reference image",
+                        self.descriptor.id
+                    ))
+                })?;
+                self.pipeline.generate_edit_with_progress(
+                    &req.prompt,
+                    &negative,
+                    guidance,
+                    &[source],
+                    &opts,
+                    decoder,
+                    &req.cancel,
+                    on_progress,
+                )?
+            } else if let Some((init, ref_strength)) = reference {
                 // Reference fidelity: the Reference's own strength wins, else the request-level img2img
                 // strength, else the 0.5 mid default (the full-range slider's default; A2/A3).
                 let strength = ref_strength.or(req.strength).unwrap_or(0.5);
@@ -407,11 +463,13 @@ fn img2img_conflicts_with_capture(has_reference: bool, keep: usize, num_sigmas: 
 }
 
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Both variants register
-// here — `krea_2_turbo` (distilled, CFG-free) and `krea_2_raw` (undistilled, full-CFG; epic 9992).
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Three variants register
+// here — `krea_2_turbo` (distilled, CFG-free), `krea_2_raw` (undistilled, full-CFG; epic 9992), and
+// `krea_2_edit` (the Raw pipeline routed to the Kontext edit entrypoint; epic 10871).
 mlx_gen::register_generators! {
     descriptor => load,
     raw_descriptor => load_raw,
+    edit_descriptor => load_edit,
 }
 
 #[cfg(test)]
@@ -688,6 +746,51 @@ mod tests {
         // Same snapshot loader as Turbo — a single-file weights source is rejected the same way.
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_raw(&file).err().expect("error").to_string();
+        assert!(e.contains("snapshot directory"), "got: {e}");
+    }
+
+    // --- Image-edit variant (Kontext-style) — epic 10871 ---
+
+    #[test]
+    fn edit_descriptor_is_krea_2_edit_and_cfg_capable() {
+        let d = edit_descriptor();
+        assert_eq!(d.id, "krea_2_edit");
+        assert_eq!(d.id, KREA_2_EDIT_ID);
+        assert_eq!(d.family, "krea_2");
+        assert_eq!(d.backend, "mlx");
+        assert_eq!(d.modality, Modality::Image);
+        // Edit shares Raw's full-CFG surface (guidance + negative prompt; an edit denoises from noise
+        // under true CFG), derived from `raw_descriptor()` — so it stays in lockstep with Raw.
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.supports_true_cfg);
+        // The source rides a single `Reference`; the `krea2_identity_edit` LoRA rides `spec.adapters`.
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
+        assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+    }
+
+    #[test]
+    fn edit_validate_accepts_reference_with_guidance_and_negative() {
+        // An edit job: a source Reference + full-CFG knobs must pass the capability floor.
+        let mut r = ref_req(1, None);
+        r.guidance = Some(3.5);
+        r.negative_prompt = Some("blurry, lowres".into());
+        assert!(validate_request(&edit_descriptor(), &r).is_ok());
+    }
+
+    #[test]
+    fn edit_reachable_via_registry_by_id() {
+        assert!(
+            gen_core::registry::generators().any(|r| (r.descriptor)().id == KREA_2_EDIT_ID),
+            "id {KREA_2_EDIT_ID} not registered"
+        );
+        // Same snapshot loader as Raw/Turbo — a single-file weights source is rejected the same way.
+        let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        let e = load_edit(&file).err().expect("error").to_string();
         assert!(e.contains("snapshot directory"), "got: {e}");
     }
 }
