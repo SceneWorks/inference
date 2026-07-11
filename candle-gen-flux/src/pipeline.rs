@@ -167,6 +167,59 @@ pub(crate) enum Components {
     },
 }
 
+/// A borrowed reference to just the DiT of either tier — the only component the denoise loop touches.
+/// Lets [`Pipeline::denoise`] be shared by the resident [`render`](Pipeline::render) (which borrows the
+/// DiT out of the cached [`Components`]) and the sequential [`render_sequential`](Pipeline::render_sequential)
+/// (which owns a just-loaded DiT after the text encoders were dropped). `Copy` — it is two thin refs.
+#[derive(Clone, Copy)]
+pub(crate) enum DitRef<'a> {
+    Stock(&'a IpFlux),
+    Packed(&'a PackedFluxDit),
+}
+
+/// A just-loaded DiT owned by the sequential path (epic 10765 Phase 1, sc-10769) — not `Arc`-cached,
+/// because sequential residency deliberately drops each component after its phase rather than keeping
+/// the cross-request cache.
+pub(crate) enum LoadedDit {
+    Stock(IpFlux),
+    Packed(PackedFluxDit),
+}
+
+impl LoadedDit {
+    fn as_ref(&self) -> DitRef<'_> {
+        match self {
+            LoadedDit::Stock(dit) => DitRef::Stock(dit),
+            LoadedDit::Packed(dit) => DitRef::Packed(dit),
+        }
+    }
+}
+
+/// A just-loaded VAE owned by the sequential path (sc-10769). Same tier split as [`Components`]'s `vae`.
+/// Both arms are boxed so the enum isn't dominated by the larger [`AutoEncoder`] (clippy
+/// `large_enum_variant`); it holds exactly one VAE for a render, so the extra indirection is free.
+pub(crate) enum LoadedVae {
+    Stock(Box<AutoEncoder>),
+    Packed(Box<AutoEncoderKL>),
+}
+
+/// The just-loaded text encoders owned by the sequential path (sc-10769). Held only across the encode
+/// phase, then dropped so the ~9 GB T5-XXL frees before the DiT loads (the FLUX sequential-residency
+/// win). Mirrors the tier split of [`Components`]; encoding delegates to the SAME shared encode
+/// functions the resident path uses (`encode_text` / [`Pipeline::encode_text_packed`]), so tokenization
+/// and outputs are byte-identical.
+pub(crate) enum SeqTextEncoders {
+    Stock {
+        clip: ClipTextTransformer,
+        t5: Mutex<T5EncoderModel>,
+        toks: FluxTokenizers,
+    },
+    Packed {
+        clip: PackedClipText,
+        t5: PackedT5Encoder,
+        toks: FluxTokenizers,
+    },
+}
+
 impl Pipeline {
     /// Build the (light) pipeline handle for the FLUX snapshot `root` at the given device/dtype. Does
     /// **no** weight I/O — components load lazily via [`load_components`](Self::load_components).
@@ -529,15 +582,13 @@ impl Pipeline {
                 get_schedule(steps, None)
             };
 
-            let latents = self.denoise(
-                components,
-                &state,
-                &timesteps,
-                guidance,
-                seed,
-                req,
-                on_progress,
-            )?;
+            // Borrow just the DiT out of the cached components for the shared denoise loop.
+            let dit = match components {
+                Components::Stock { transformer, .. } => DitRef::Stock(transformer),
+                Components::Packed { transformer, .. } => DitRef::Packed(transformer),
+            };
+            let latents =
+                self.denoise(dit, &state, &timesteps, guidance, seed, req, on_progress)?;
 
             on_progress(Progress::Decoding);
             match components {
@@ -572,7 +623,7 @@ impl Pipeline {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
-        components: &Components,
+        dit: DitRef,
         state: &State,
         timesteps: &[f64],
         guidance: f64,
@@ -609,10 +660,10 @@ impl Pipeline {
                 // The model is fed the raw timestep (`t == σ`) as a per-batch tensor. The forward
                 // returns a `candle_core::Result`; `?` bridges it into the driver's `CandleError`.
                 let t_vec = Tensor::full(t, b_sz, dev)?;
-                let out = match components {
+                let out = match dit {
                     // `IpFlux::forward` with `ip = None` is byte-identical to the stock
                     // `candle-transformers` `Flux::forward` (sc-9116) — plus the budgeted attention guard.
-                    Components::Stock { transformer, .. } => transformer.forward(
+                    DitRef::Stock(transformer) => transformer.forward(
                         img,
                         &state.img_ids,
                         &state.txt,
@@ -622,7 +673,7 @@ impl Pipeline {
                         Some(&guidance_t),
                         None,
                     )?,
-                    Components::Packed { transformer, .. } => transformer.forward(
+                    DitRef::Packed(transformer) => transformer.forward(
                         img,
                         &state.img_ids,
                         &state.txt,
@@ -691,6 +742,198 @@ impl Pipeline {
             Components::Packed { vae, .. } => self.decode_packed(vae, pid, latents, height, width),
         }
     }
+
+    /// Load ONLY the text encoders for the sequential-residency path (epic 10765 Phase 1, sc-10769) —
+    /// dropped right after the encode so the ~9 GB T5-XXL frees before the DiT loads. Same per-tier
+    /// loads as [`load_stock_components`](Self::load_stock_components) /
+    /// [`load_packed_components`](Self::load_packed_components), minus the DiT/VAE/PiD.
+    fn load_text_encoders_seq(&self, packed: bool) -> Result<SeqTextEncoders> {
+        if packed {
+            let clip_vb = self.component_vb("text_encoder")?;
+            let clip = PackedClipText::new(&ClipConfig::flux(), clip_vb.pp("text_model"))?;
+            let t5_vb = self.component_vb("text_encoder_2")?;
+            let t5 = PackedT5Encoder::new(&PackedT5Config::xxl(), t5_vb)?;
+            Ok(SeqTextEncoders::Packed {
+                clip,
+                t5,
+                toks: FluxTokenizers::load(&self.root)?,
+            })
+        } else {
+            let (clip, t5) =
+                crate::flux1_load::text_encoders(&self.root, self.dtype, &self.device, "flux")?;
+            Ok(SeqTextEncoders::Stock {
+                clip,
+                t5: Mutex::new(t5),
+                toks: FluxTokenizers::load(&self.root)?,
+            })
+        }
+    }
+
+    /// Encode `prompt` through the sequential text encoders, delegating to the SAME shared encode path
+    /// as the resident tier ([`encode_text`] / [`encode_text_packed`](Self::encode_text_packed)) so the
+    /// tokenization + conditioning tensors are byte-identical to [`render`](Self::render).
+    fn encode_seq(&self, tes: &SeqTextEncoders, prompt: &str) -> Result<(Tensor, Tensor)> {
+        match tes {
+            SeqTextEncoders::Stock { clip, t5, toks } => encode_text(
+                self.variant,
+                toks,
+                &self.device,
+                self.dtype,
+                clip,
+                t5,
+                prompt,
+            ),
+            SeqTextEncoders::Packed { clip, t5, toks } => {
+                self.encode_text_packed(clip, t5, toks, prompt)
+            }
+        }
+    }
+
+    /// Load ONLY the DiT for the sequential path (sc-10769) — loaded after the text encoders were
+    /// dropped, so it reuses their freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE).
+    fn load_transformer_seq(&self, packed: bool) -> Result<LoadedDit> {
+        if packed {
+            let (num_double, num_single) = self.dit_block_counts()?;
+            let dit_vb = self.component_vb("transformer")?;
+            Ok(LoadedDit::Packed(PackedFluxDit::new(
+                &flux_config(self.variant),
+                num_double,
+                num_single,
+                dit_vb,
+            )?))
+        } else {
+            let dit_vb = crate::flux1_load::dit_vb(
+                &self.root,
+                self.variant,
+                self.dtype,
+                &self.device,
+                "flux",
+            )?;
+            Ok(LoadedDit::Stock(IpFlux::new(
+                &flux_config(self.variant),
+                dit_vb,
+            )?))
+        }
+    }
+
+    /// Load ONLY the VAE for the sequential path (sc-10769). Small relative to the DiT, so it stays
+    /// co-resident with the DiT through decode (splitting them further buys ~nothing on FLUX).
+    fn load_vae_seq(&self, packed: bool) -> Result<LoadedVae> {
+        if packed {
+            Ok(LoadedVae::Packed(Box::new(AutoEncoderKL::new(
+                &flux_vae_config(),
+                self.vae_vb_dequantized()?,
+            )?)))
+        } else {
+            let (vae, _vae_vb) =
+                crate::flux1_load::vae(&self.root, self.variant, self.dtype, &self.device, "flux")?;
+            Ok(LoadedVae::Stock(Box::new(vae)))
+        }
+    }
+
+    /// Sequential-residency render (epic 10765 Phase 1, sc-10769): load the text encoders → encode →
+    /// DROP them → load the DiT + VAE → denoise/decode. Peak VRAM is bounded to the DiT+VAE working set
+    /// instead of TE+DiT+VAE (reclaiming the ~9 GB T5-XXL on FLUX), so a card that OOMs the resident
+    /// path can still render. Output is **bit-identical** to [`render`](Self::render) — the SAME encode,
+    /// denoise, and decode code runs (`encode_seq` → [`encode_text`], the shared [`denoise`](Self::denoise)
+    /// over a [`DitRef`], and [`decode`](Self::decode)/[`decode_packed`](Self::decode_packed)); only the
+    /// load/free schedule differs.
+    ///
+    /// Selected by the generator when [`sequential_offload_enabled`] (`CANDLE_GEN_OFFLOAD=sequential`).
+    /// Because it drops components, it does NOT populate the generator's `Components` cache — repeat
+    /// requests reload from the (page-cached) snapshot; that reload cost is the deliberate trade for the
+    /// lower peak, which is why it is opt-in per the fit-gate rather than the default.
+    pub(crate) fn render_sequential(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let packed = self.component_is_packed("transformer")?;
+        let steps = req
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or(self.variant.default_steps() as usize);
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let guidance: f64 = if self.variant.supports_guidance() {
+            req.guidance.unwrap_or(self.variant.default_guidance()) as f64
+        } else {
+            0.0
+        };
+        let lat_h = (req.height as usize).div_ceil(16) * 2;
+        let lat_w = (req.width as usize).div_ceil(16) * 2;
+
+        // Phase 1 — text encode, then DROP the encoders (scoped) so T5-XXL frees before the DiT loads.
+        let (t5_emb, clip_emb) = {
+            let tes = self.load_text_encoders_seq(packed)?;
+            self.encode_seq(&tes, &req.prompt)?
+        };
+
+        // Phase 2 — load the DiT (reusing the encoders' freed pool) + the VAE + the optional PiD decoder.
+        let dit = self.load_transformer_seq(packed)?;
+        let vae = self.load_vae_seq(packed)?;
+        let pid_engine = self.load_pid()?;
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            pid_engine.as_deref(),
+            req,
+            base_seed,
+            self.variant.model_id(),
+        )?;
+
+        // Phase 3 — per-image denoise + decode, identical to `render`'s loop.
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let noise = crate::flux1_load::seeded_noise(
+                seed,
+                LATENT_CHANNELS,
+                lat_h,
+                lat_w,
+                &self.device,
+                self.dtype,
+            )?;
+            let state = State::new(&t5_emb, &clip_emb, &noise)?;
+            let timesteps = if self.variant.is_dev() {
+                get_schedule(steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)))
+            } else {
+                get_schedule(steps, None)
+            };
+            let latents = self.denoise(
+                dit.as_ref(),
+                &state,
+                &timesteps,
+                guidance,
+                seed,
+                req,
+                on_progress,
+            )?;
+            on_progress(Progress::Decoding);
+            match &vae {
+                LoadedVae::Stock(vae) => self.decode(
+                    vae,
+                    pid_decoder.as_ref(),
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                ),
+                LoadedVae::Packed(vae) => self.decode_packed(
+                    vae,
+                    pid_decoder.as_ref(),
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                ),
+            }
+        })
+    }
+}
+
+/// Whether the sequential-residency offload path is enabled (epic 10765 Phase 1, sc-10769). Reads
+/// `CANDLE_GEN_OFFLOAD`: `sequential` (case-insensitive) selects the phased load/free path; unset or any
+/// other value keeps the resident, cross-request-cached default. The worker's fit-gate sets this when it
+/// predicts the resident TE+DiT+VAE sum won't fit but the DiT+VAE working set will (Slice 1b wires a
+/// per-load `LoadSpec::offload_policy`; this env toggle is the first-slice mechanism + the test seam).
+pub(crate) fn sequential_offload_enabled() -> bool {
+    std::env::var("CANDLE_GEN_OFFLOAD")
+        .map(|value| value.trim().eq_ignore_ascii_case("sequential"))
+        .unwrap_or(false)
 }
 
 /// Convert a decoded pixel tensor `(1, 3, H, W)` in `[-1, 1]` (f32) → RGB8 [`Image`] (`(x+1)·127.5`).
