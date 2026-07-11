@@ -125,6 +125,13 @@ pub mod vae_tiling;
 pub mod weights;
 pub use weights::Weights;
 
+// Shared native WAN-VAE (`Wan2.1` z16 3D-causal-conv autoencoder) → diffusers key remap (epic 10451):
+// both the Qwen-Image (sc-10830) and Wan2.2 (sc-10909) in-place ComfyUI lanes read the *same physical*
+// Wan2.1 16-channel VAE, stored with native WAN-VAE keys. The rename lives here (the `weights` module's
+// F-060 posture) rather than duplicated in each pipeline crate's `comfyui` seam.
+pub mod comfyui_vae;
+pub use comfyui_vae::remap_vae_wan_to_diffusers;
+
 // Poison-tolerant locking + read-through helper for the shared generator/component caches (sc-9015 /
 // F-031; `cached` sc-7792): a panic while holding a cache `Mutex` (e.g. a CUDA OOM lifted to a panic
 // mid-decode) poisons it, after which a plain `.lock().unwrap()` panics forever — one transient

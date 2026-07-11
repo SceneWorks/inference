@@ -128,7 +128,8 @@ struct Pipeline {
     adapters: Vec<AdapterSpec>,
     /// In-place ComfyUI expert files (epic 10451 Phase 2c, sc-10671). When set, the two experts are
     /// built from these files (scaled-fp8 dequant + key remap, see [`crate::comfyui`]) instead of the
-    /// snapshot's `transformer/` + `transformer_2/`; the UMT5 TE / VAE / tokenizer still come from
+    /// snapshot's `transformer/` + `transformer_2/`. The UMT5 TE + VAE are read in place too when the
+    /// spec carries their files (sc-10909), else from `root`; the tiny tokenizer always comes from
     /// `root`. `None` on the registry path.
     comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiExperts>>,
 }
@@ -176,6 +177,32 @@ impl Pipeline {
         let map = crate::comfyui::remap_and_dequant_comfyui_expert(map, DIT_DTYPE)?;
         let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
         Ok(WanTransformer::new(&self.dit_cfg, vb)?)
+    }
+
+    /// Build the UMT5 text encoder from an in-place ComfyUI file (sc-10909): load its native tensor map
+    /// on CPU, dequant the companion scaled-fp8 weights ([`crate::comfyui::dequant_comfyui_umt5`], no
+    /// key remap — the ComfyUI file already carries the HF `UMT5EncoderModel` keys), then build via
+    /// `VarBuilder::from_tensors` at [`ENC_DTYPE`] (f32, matching the snapshot TE).
+    fn build_te_comfyui(&self, file: &Path) -> CResult<Umt5Encoder> {
+        let map = cst::load(file, &Device::Cpu)?;
+        let map = crate::comfyui::dequant_comfyui_umt5(map, ENC_DTYPE)?;
+        let vb = VarBuilder::from_tensors(map, ENC_DTYPE, &self.device);
+        Ok(Umt5Encoder::new(&self.te_cfg, vb)?)
+    }
+
+    /// Build the z16 VAE from an in-place ComfyUI file (sc-10909): load its native tensor map on CPU,
+    /// remap the native WAN-VAE keys to the diffusers schema
+    /// ([`crate::comfyui::remap_vae_wan_to_diffusers`], values pass through as bf16), then build via
+    /// `VarBuilder::from_tensors` at [`VAE_DTYPE`] (f32 upcast on `get`, byte-matching the snapshot VAE
+    /// mmap). I2V builds the encoder too (the conditioning image's first-frame latent).
+    fn build_vae_comfyui(&self, file: &Path) -> CResult<WanVae16> {
+        let map = cst::load(file, &Device::Cpu)?;
+        let map = crate::comfyui::remap_vae_wan_to_diffusers(map)?;
+        let vb = VarBuilder::from_tensors(map, VAE_DTYPE, &self.device);
+        match self.variant {
+            Variant::I2v => Ok(WanVae16::new_with_encoder(&self.vae_cfg, vb)?),
+            Variant::T2v => Ok(WanVae16::new(&self.vae_cfg, vb)?),
+        }
     }
 
     fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
@@ -254,7 +281,12 @@ impl Pipeline {
     }
 
     fn load_components(&self) -> CResult<Components> {
-        let te = Umt5Encoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
+        // In-place ComfyUI mode (sc-10909): read the UMT5 TE from the tree when the caller passed it
+        // (scaled-fp8 dequant), else the snapshot `text_encoder/`.
+        let te = match self.comfyui.as_ref().and_then(|c| c.te_file.as_deref()) {
+            Some(te_file) => self.build_te_comfyui(te_file)?,
+            None => Umt5Encoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?,
+        };
         // transformer/ = high-noise expert, transformer_2/ = low-noise expert (diffusers WanPipeline).
         // In-place ComfyUI mode (sc-10671): build both experts from the user's files (remap + dequant);
         // no adapters (the ComfyUI base lane does not fold LoRAs), so the zero-match guard below is inert.
@@ -288,11 +320,18 @@ impl Pipeline {
                 }
             }
         }
-        let vae_vb = self.component_vb("vae", VAE_DTYPE)?;
-        let vae = match self.variant {
-            // I2V needs the VAE encoder (the conditioning image's first-frame latent).
-            Variant::I2v => WanVae16::new_with_encoder(&self.vae_cfg, vae_vb)?,
-            Variant::T2v => WanVae16::new(&self.vae_cfg, vae_vb)?,
+        // In-place ComfyUI mode (sc-10909): read the Wan VAE from the tree when the caller passed it
+        // (native→diffusers key remap), else the snapshot `vae/`. I2V needs the VAE encoder either way.
+        let vae = match self.comfyui.as_ref().and_then(|c| c.vae_file.as_deref()) {
+            Some(vae_file) => self.build_vae_comfyui(vae_file)?,
+            None => {
+                let vae_vb = self.component_vb("vae", VAE_DTYPE)?;
+                match self.variant {
+                    // I2V needs the VAE encoder (the conditioning image's first-frame latent).
+                    Variant::I2v => WanVae16::new_with_encoder(&self.vae_cfg, vae_vb)?,
+                    Variant::T2v => WanVae16::new(&self.vae_cfg, vae_vb)?,
+                }
+            }
         };
         let tok = crate::text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan-14b")?;
         Ok(Components {
@@ -560,7 +599,8 @@ pub struct Wan14bGenerator {
     adapters: Vec<AdapterSpec>,
     /// In-place ComfyUI experts (epic 10451 Phase 2c, sc-10671), set only by
     /// [`load_from_comfyui_experts`]. When present, the lazy component build sources both experts from
-    /// these files and the UMT5 TE / VAE / tokenizer from [`Self::root`]; `None` on the registry path.
+    /// these files, the UMT5 TE + VAE in place when their files are set (sc-10909) else from
+    /// [`Self::root`], and the tiny tokenizer always from [`Self::root`]; `None` on the registry path.
     comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiExperts>>,
     components: Mutex<Option<Components>>,
 }
@@ -734,14 +774,20 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
 /// Construct a lazy candle Wan2.2 A14B generator that reads its **two DiT experts in place** from an
 /// existing ComfyUI install (epic 10451 Phase 2c, sc-10671) — no copy, no re-download. `high_file` /
 /// `low_file` are the user's ComfyUI high/low-noise expert files (native-Wan keys, companion scaled-fp8);
-/// each is remapped + dequant'd to bf16 in memory ([`crate::comfyui`]) at component build. `snapshot_dir`
-/// is a resident Wan2.2 A14B snapshot tier (`text_encoder/`, `vae/`, `tokenizer/`) supplying the standard
-/// UMT5 TE / VAE / tokenizer — the ComfyUI tree's own UMT5 is itself scaled-fp8 and its VAE a separate key
-/// schema. `variant` selects the T2V or I2V config (`patch_embedding` in-channels differ). No adapters /
-/// control on this lane.
+/// each is remapped + dequant'd to bf16 in memory ([`crate::comfyui`]) at component build.
+///
+/// `te_file` / `vae_file` optionally read the UMT5 text encoder + Wan VAE in place too (sc-10909): the
+/// UMT5 (`umt5_xxl_fp8_e4m3fn_scaled`) is the same scaled-fp8 convention (dequant, no key remap), and
+/// the VAE (`wan_2.1_vae.safetensors`) is native-WAN-VAE keys remapped to diffusers. When either is
+/// `None` that component falls back to the `snapshot_dir` tier. `snapshot_dir` is a resident Wan2.2
+/// A14B snapshot tier that always supplies at least the tiny UMT5 tokenizer (and the TE/VAE when their
+/// files are absent). `variant` selects the T2V or I2V config (`patch_embedding` in-channels differ).
+/// No adapters / control on this lane.
 pub fn load_from_comfyui_experts(
     high_file: impl Into<PathBuf>,
     low_file: impl Into<PathBuf>,
+    te_file: Option<PathBuf>,
+    vae_file: Option<PathBuf>,
     snapshot_dir: impl Into<PathBuf>,
     i2v: bool,
 ) -> gen_core::Result<Box<dyn Generator>> {
@@ -756,6 +802,8 @@ pub fn load_from_comfyui_experts(
         comfyui: Some(std::sync::Arc::new(crate::comfyui::ComfyuiExperts {
             high_file: high_file.into(),
             low_file: low_file.into(),
+            te_file,
+            vae_file,
         })),
         components: Mutex::new(None),
     }))

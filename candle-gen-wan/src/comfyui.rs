@@ -26,10 +26,20 @@
 //!    cross-attention), so T2V and I2V experts share the key schema — only `patch_embedding` in-channels
 //!    (16 vs 36) differ, which the config carries, not the remap.
 //!
-//! The UMT5 text encoder, the Wan VAE, and the tokenizer are NOT read from the ComfyUI tree here (the
-//! tree's UMT5 is itself scaled-fp8 and its VAE a separate key schema); they come from a resident
-//! `SceneWorks/wan2.2-*-candle` snapshot tier, exactly as the Qwen lane sources its TE/VAE. Only the two
-//! big DiT experts — the reusable bulk — are read in place.
+//! The UMT5 text encoder and the Wan VAE are ALSO read from the ComfyUI tree when present (epic 10451
+//! Phase 2c follow-up, sc-10909), leaving only the tiny tokenizer snapshot-sourced:
+//!
+//! * **UMT5-XXL TE** (`text_encoders/umt5_xxl_fp8_e4m3fn_scaled`) is itself the *same* companion
+//!   scaled-fp8 convention as the DiT experts, so it reuses this module's dequant
+//!   ([`dequant_comfyui_umt5`]) — but with **no** key remap: the ComfyUI file already carries the HF
+//!   `UMT5EncoderModel` keys candle's [`crate::text_encoder::Umt5Encoder`] reads.
+//! * **Wan VAE** (`vae/wan_2.1_vae.safetensors`) is the *same physical* Wan2.1 16-channel VAE the
+//!   Qwen-Image lane reads (sc-10830); its native-key layout is remapped to the diffusers schema
+//!   [`crate::vae16::WanVae16`] reads by the shared core-crate [`remap_vae_wan_to_diffusers`].
+//!
+//! When a TE or VAE file is absent the component falls back to a resident `SceneWorks/wan2.2-*-candle`
+//! snapshot tier (the sc-10671 posture); with both present a Wan generation is sourced entirely from
+//! the user's ComfyUI tree plus our tiny tokenizer. The two big DiT experts are always read in place.
 //!
 //! Header-only classification (which file is a Wan DiT, which quant) is done upstream by SceneWorks
 //! (`sceneworks-core::base_weights`, sc-10662); this module is handed files already identified as Wan
@@ -41,32 +51,83 @@ use std::path::PathBuf;
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::{CandleError, Result};
 
-/// The two in-place ComfyUI expert files for a Wan2.2 A14B MoE load (sc-10671). Read in place, never
-/// copied; each is remapped + dequant'd ([`remap_and_dequant_comfyui_expert`]) at component build.
+/// The in-place ComfyUI files for a Wan2.2 A14B load. The two DiT experts are always read in place
+/// (sc-10671); the UMT5 text encoder and the Wan VAE are read in place too when present (sc-10909),
+/// else they fall back to the resident snapshot tier. Read in place, never copied; each is remapped +
+/// dequant'd/upcast in memory at component build ([`remap_and_dequant_comfyui_expert`],
+/// [`dequant_comfyui_umt5`], [`remap_vae_wan_to_diffusers`]).
 #[derive(Clone, Debug)]
 pub(crate) struct ComfyuiExperts {
     /// The **high-noise** expert (ComfyUI `*_high_noise_*` file) → candle `transformer/`.
     pub high_file: PathBuf,
     /// The **low-noise** expert (ComfyUI `*_low_noise_*` file) → candle `transformer_2/`.
     pub low_file: PathBuf,
+    /// The UMT5-XXL text encoder (`text_encoders/umt5_xxl_fp8_e4m3fn_scaled`, companion scaled-fp8).
+    /// `Some` ⇒ read in place ([`dequant_comfyui_umt5`]); `None` ⇒ the snapshot `text_encoder/` dir.
+    pub te_file: Option<PathBuf>,
+    /// The Wan VAE (`vae/wan_2.1_vae.safetensors`, native WAN-VAE keys, bf16). `Some` ⇒ read in place
+    /// ([`remap_vae_wan_to_diffusers`]); `None` ⇒ the snapshot `vae/` dir.
+    pub vae_file: Option<PathBuf>,
 }
+
+/// Native WAN-VAE → diffusers key remap for the in-place VAE (sc-10909). The ComfyUI
+/// `vae/wan_2.1_vae.safetensors` is the *same physical* Wan2.1 16-channel VAE the Qwen-Image lane
+/// reads (sc-10830) — its native-key layout is remapped to the diffusers schema
+/// [`crate::vae16::WanVae16`] reads by the shared core-crate helper (a pure key rename; values pass
+/// through as bf16, upcast to the VAE compute dtype at `VarBuilder` build). Re-exported so this
+/// module's in-place seam names it locally alongside the DiT + UMT5 transforms.
+pub use candle_gen::comfyui_vae::remap_vae_wan_to_diffusers;
 
 /// The top-level empty marker tensor ComfyUI writes to flag a scaled-fp8 checkpoint; dropped.
 const SCALED_FP8_MARKER: &str = "scaled_fp8";
 
 /// Remap + dequant a ComfyUI Wan2.2 expert tensor map into the schema
-/// [`crate::transformer::WanTransformer`] reads, ready for `VarBuilder::from_tensors`.
-///
-/// - **Dequant**: an `F8_E4M3` `{module}.weight` with a scalar `{module}.scale_weight` sibling becomes
-///   `w = (w_fp8·scale_weight)` cast to `dtype`. `.scale_input` companions and the `scaled_fp8` marker
-///   are consumed/dropped. Non-quantized tensors are cast to `dtype` (integer buffers pass through).
-/// - **Remap**: native-Wan keys → the diffusers keys candle reads ([`remap_wan_key`]).
+/// [`crate::transformer::WanTransformer`] reads, ready for `VarBuilder::from_tensors`. Native-Wan DiT
+/// keys → the diffusers keys candle reads ([`remap_wan_key`]); see [`dequant_scaled_fp8_map`] for the
+/// dequant.
 ///
 /// Errors when **no** `.scale_weight` companion is present — a file that is not a ComfyUI scaled-fp8
 /// Wan expert (wrong file/family/quant), surfaced rather than loaded as garbage (no silent fallback).
 pub fn remap_and_dequant_comfyui_expert(
     src: HashMap<String, Tensor>,
     dtype: DType,
+) -> Result<HashMap<String, Tensor>> {
+    dequant_scaled_fp8_map(src, dtype, "wan ComfyUI expert", remap_wan_key)
+}
+
+/// Dequant a ComfyUI UMT5-XXL text encoder tensor map (`umt5_xxl_fp8_e4m3fn_scaled`, the SAME companion
+/// scaled-fp8 convention as the DiT experts, sc-10909) to the schema [`crate::text_encoder::Umt5Encoder`]
+/// reads, ready for `VarBuilder::from_tensors`. The ComfyUI file already carries the HF
+/// `UMT5EncoderModel` keys candle reads (`shared.weight`, `encoder.block.N.layer.{0,1}.…`,
+/// `encoder.final_layer_norm.weight`) — so, unlike the DiT, there is **no** key remap, only the
+/// scaled-fp8 dequant (the embedding / norms / `relative_attention_bias` are dense and cast; the fp8
+/// Linears are `w = w_fp8·scale_weight`). `dtype` is the encoder compute dtype (f32).
+///
+/// Errors when **no** `.scale_weight` companion is present (not a scaled-fp8 UMT5 checkpoint).
+pub fn dequant_comfyui_umt5(
+    src: HashMap<String, Tensor>,
+    dtype: DType,
+) -> Result<HashMap<String, Tensor>> {
+    // UMT5 keys already match candle's schema — identity remap, dequant only.
+    dequant_scaled_fp8_map(src, dtype, "wan ComfyUI UMT5", |k| k.to_owned())
+}
+
+/// Shared companion-scaled-fp8 dequant over a ComfyUI tensor map, applying `remap` to each surviving
+/// key. `what` labels error messages (`"wan ComfyUI expert"` / `"wan ComfyUI UMT5"`).
+///
+/// - **Dequant**: an `F8_E4M3` `{module}.weight` with a scalar `{module}.scale_weight` sibling becomes
+///   `w = (w_fp8·scale_weight)` cast to `dtype`. `.scale_input` companions and the `scaled_fp8` marker
+///   are consumed/dropped. Non-quantized tensors are cast to `dtype` (integer buffers pass through).
+/// - **Remap**: `remap(key)` — the DiT native→diffusers rename, or identity for the already-diffusers
+///   UMT5 keys.
+///
+/// Errors when **no** `.scale_weight` companion is present — a file that is not a ComfyUI scaled-fp8
+/// checkpoint (wrong file/family/quant), surfaced rather than loaded as garbage (no silent fallback).
+fn dequant_scaled_fp8_map(
+    src: HashMap<String, Tensor>,
+    dtype: DType,
+    what: &str,
+    remap: impl Fn(&str) -> String,
 ) -> Result<HashMap<String, Tensor>> {
     // Pass 1: index the per-module `.scale_weight` scalars (base = key without the `.scale_weight`
     // suffix, e.g. `blocks.0.self_attn.q`). A weight `{base}.weight` dequants against `scales[base]`.
@@ -77,16 +138,16 @@ pub fn remap_and_dequant_comfyui_expert(
         }
     }
     if scales.is_empty() {
-        return Err(CandleError::Msg(
-            "wan ComfyUI expert: no `.scale_weight` companions found — not a ComfyUI Wan \
-             scaled-fp8 checkpoint (wrong file/family/quant?)"
-                .to_owned(),
-        ));
+        return Err(CandleError::Msg(format!(
+            "{what}: no `.scale_weight` companions found — not a ComfyUI scaled-fp8 checkpoint \
+             (wrong file/family/quant?)"
+        )));
     }
 
     let mut out = HashMap::with_capacity(src.len());
     for (key, tensor) in &src {
-        // Drop the marker, the rope `freqs` buffer (candle recomputes it), and both scale companions.
+        // Drop the marker, the rope `freqs` buffer (candle recomputes it; absent on UMT5), and both
+        // scale companions.
         if key == SCALED_FP8_MARKER || key == "freqs" || key.ends_with(".freqs") {
             continue;
         }
@@ -98,10 +159,10 @@ pub fn remap_and_dequant_comfyui_expert(
             .strip_suffix(".weight")
             .and_then(|base| scales.get(base))
         {
-            Some(scale) => dequant_scaled_fp8(key, tensor, scale, dtype)?,
-            None => cast_dense(key, tensor, dtype)?,
+            Some(scale) => dequant_scaled_fp8(what, key, tensor, scale, dtype)?,
+            None => cast_dense(what, key, tensor, dtype)?,
         };
-        out.insert(remap_wan_key(key), value);
+        out.insert(remap(key), value);
     }
     Ok(out)
 }
@@ -109,29 +170,35 @@ pub fn remap_and_dequant_comfyui_expert(
 /// `w = (w_fp8 → f32 · scale_weight) → dtype`. `scale_weight` is a per-tensor **scalar** (shape `[]`),
 /// applied via `affine` (multiply-by-f64) — reconstructing the real weight ComfyUI stored as fp8. The
 /// f32 intermediate is per-tensor (immediately downcast), so peak host memory stays one tensor, not the
-/// whole 14 GB expert.
-fn dequant_scaled_fp8(key: &str, w: &Tensor, scale: &Tensor, dtype: DType) -> Result<Tensor> {
+/// whole expert.
+fn dequant_scaled_fp8(
+    what: &str,
+    key: &str,
+    w: &Tensor,
+    scale: &Tensor,
+    dtype: DType,
+) -> Result<Tensor> {
     let s = scale
         .to_dtype(DType::F32)?
         .to_scalar::<f32>()
         .map_err(|e| {
             CandleError::Msg(format!(
-                "wan ComfyUI expert: scale_weight for {key:?} is not a scalar: {e}"
+                "{what}: scale_weight for {key:?} is not a scalar: {e}"
             ))
         })?;
     w.to_dtype(DType::F32)?
         .affine(s as f64, 0.0)?
         .to_dtype(dtype)
-        .map_err(|e| CandleError::Msg(format!("wan ComfyUI expert: dequant {key:?} failed: {e}")))
+        .map_err(|e| CandleError::Msg(format!("{what}: dequant {key:?} failed: {e}")))
 }
 
 /// Cast a non-quantized tensor to the compute `dtype`; integer buffers (indices/caches) pass through.
-fn cast_dense(key: &str, t: &Tensor, dtype: DType) -> Result<Tensor> {
+fn cast_dense(what: &str, key: &str, t: &Tensor, dtype: DType) -> Result<Tensor> {
     if t.dtype().is_int() {
         return Ok(t.clone());
     }
     t.to_dtype(dtype)
-        .map_err(|e| CandleError::Msg(format!("wan ComfyUI expert: cast {key:?} failed: {e}")))
+        .map_err(|e| CandleError::Msg(format!("{what}: cast {key:?} failed: {e}")))
 }
 
 /// Native-Wan → diffusers key rename ([`crate::transformer::WanTransformer`]'s schema). Every rule is
@@ -363,5 +430,65 @@ mod tests {
             w(&[2, 2], DType::BF16),
         );
         assert!(remap_and_dequant_comfyui_expert(src, DType::BF16).is_err());
+    }
+
+    // --- UMT5 dequant (sc-10909): same scaled-fp8, but identity key remap ---
+
+    #[test]
+    fn umt5_dequants_fp8_linear_without_remapping_keys() {
+        let mut src = HashMap::new();
+        // A UMT5 SelfAttention Linear: fp8 ones × scale 2.0 → 2.0, key unchanged (no DiT remap).
+        src.insert(
+            "encoder.block.0.layer.0.SelfAttention.q.weight".to_string(),
+            w(&[4, 4], DType::F8E4M3),
+        );
+        src.insert(
+            "encoder.block.0.layer.0.SelfAttention.q.scale_weight".to_string(),
+            scalar(2.0),
+        );
+        src.insert(
+            "encoder.block.0.layer.0.SelfAttention.q.scale_input".to_string(),
+            scalar(0.5),
+        );
+        // Dense tensors (embedding, norm, relative bias) cast to the compute dtype, keys unchanged.
+        src.insert("shared.weight".to_string(), w(&[8, 4], DType::F16));
+        src.insert(
+            "encoder.block.0.layer.0.layer_norm.weight".to_string(),
+            w(&[4], DType::F16),
+        );
+        src.insert(SCALED_FP8_MARKER.to_string(), w(&[0], DType::F8E4M3));
+        let out = dequant_comfyui_umt5(src, DType::F32).unwrap();
+
+        // The T5 key passes through verbatim (a DiT-style `self_attn.q`→`attn1.to_q` remap would break
+        // Umt5Encoder's VarBuilder).
+        let t = out
+            .get("encoder.block.0.layer.0.SelfAttention.q.weight")
+            .expect("umt5 Linear key unchanged");
+        assert_eq!(t.dtype(), DType::F32);
+        let v = t
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            (v[0] - 2.0).abs() < 0.05,
+            "1.0 * scale 2.0 = 2.0, got {}",
+            v[0]
+        );
+        // Dense tensors kept + cast; marker + scale companions dropped.
+        assert_eq!(out.get("shared.weight").unwrap().dtype(), DType::F32);
+        assert!(out.contains_key("encoder.block.0.layer.0.layer_norm.weight"));
+        assert!(!out.contains_key(SCALED_FP8_MARKER));
+        assert!(!out.contains_key("encoder.block.0.layer.0.SelfAttention.q.scale_weight"));
+        assert!(!out.contains_key("encoder.block.0.layer.0.SelfAttention.q.scale_input"));
+    }
+
+    #[test]
+    fn umt5_rejects_a_map_with_no_scale_companions() {
+        let mut src = HashMap::new();
+        src.insert("shared.weight".to_string(), w(&[8, 4], DType::BF16));
+        assert!(dequant_comfyui_umt5(src, DType::F32).is_err());
     }
 }
