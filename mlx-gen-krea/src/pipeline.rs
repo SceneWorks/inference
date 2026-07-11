@@ -31,11 +31,12 @@ use mlx_gen::{
 
 use std::path::Path;
 
-use crate::loader::{load_text_encoder, load_transformer};
+use crate::loader::{load_text_encoder, load_transformer, load_vision_tower};
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
-use crate::text_encoder::{KreaTextEncoder, KreaTokenizer};
+use crate::text_encoder::{encode_grounded, KreaTextEncoder, KreaTokenizer};
 use crate::transformer::Krea2Transformer;
 use crate::vae::{load_vae, QwenVae};
+use mlx_gen_boogu::VisionTower;
 
 /// Turbo text-to-image knobs, resolved from the [`crate::model`] request. Dimensions are validated at
 /// the Generator layer (multiple-of-16, in the resolution range) before the pipeline runs.
@@ -57,6 +58,10 @@ pub struct KreaPipeline {
     te: KreaTextEncoder,
     dit: Krea2Transformer,
     vae: QwenVae,
+    /// Qwen3-VL vision tower for image-grounded (edit) encoding (epic 10871 P2). NB loaded eagerly by
+    /// [`Self::from_snapshot`] for the P2.3 validation; production should load it lazily / edit-only so
+    /// text-to-image doesn't pay the ~0.6 GB (tracked for P3).
+    vision: VisionTower,
 }
 
 impl KreaPipeline {
@@ -68,6 +73,7 @@ impl KreaPipeline {
             te: load_text_encoder(root)?,
             dit: load_transformer(root)?,
             vae: load_vae(root)?,
+            vision: load_vision_tower(root)?,
         })
     }
 
@@ -553,17 +559,24 @@ impl KreaPipeline {
         // Edit denoises from PURE NOISE — the source is in-context conditioning, not a noised init.
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
 
-        // Positive + (CFG-active) unconditional edit preps, hoisted once (each carries the clean
-        // reference tokens + the reference-frame RoPE). The negative prompt defaults to `""` at the
-        // caller (reference `negative_prompts = [""] * n`).
-        let (ids, attn) = self.tok.encode_prompt(prompt)?;
-        let context = self.te.forward(&ids, &attn)?;
+        // DUAL CONDITIONING (epic 10871 P2.3): the source image feeds BOTH the in-context VAE tokens
+        // (`ref_latents`, above) AND the Qwen3-VL grounded context — the edit LoRA's training contract.
+        // The grounded context replaces the text-only encode; the source image sits in both CFG branches
+        // (only the instruction text differs), matching the reference edit CFG. Single-reference
+        // grounding for now (multi-reference grounding is a follow-on; the VAE-token side already takes
+        // N sources). Each prep carries the clean reference tokens + the reference-frame RoPE.
+        let context = encode_grounded(&self.vision, &self.tok, &self.te, sources[0], prompt)?;
         let prep_pos = self
             .dit
             .prepare_edit(&context, None, &noise, &ref_latents)?;
         let prep_neg = if guidance > 0.0 {
-            let (nids, nattn) = self.tok.encode_prompt(negative_prompt)?;
-            let ncontext = self.te.forward(&nids, &nattn)?;
+            let ncontext = encode_grounded(
+                &self.vision,
+                &self.tok,
+                &self.te,
+                sources[0],
+                negative_prompt,
+            )?;
             Some(
                 self.dit
                     .prepare_edit(&ncontext, None, &noise, &ref_latents)?,
