@@ -33,6 +33,15 @@
 //! (`3σ/(1+2σ)`, [`SIGMA_SHIFT`]) the inference schedule uses, and that shifted σ drives both the
 //! `x_t = (1−σ)·x0 + σ·noise` interpolation and the DiT timestep.
 //!
+//! ## Mid-run resume (sc-10642)
+//! At each `save_every` the trainer additionally writes a resume bundle (the shared sc-9560 engine in
+//! [`mlx_gen::train::checkpoint`]): the optimizer state + the raw trainable factors + `{step,
+//! update_idx, optimizer}`. With `cfg.resume`, a fresh run of the same adapter restores that state and
+//! continues from `step + 1`. On restore it **asserts the full 448 DiT + 60 `llm_adapter` = 508 target
+//! surface** against the live model (never inferred from the file) — a checkpoint that had dropped the
+//! 60 conditioner targets would resume an inert conditioner while every structural check still passed
+//! (the sc-10522 trap), so [`assert_resume_surface_matches`] fails it loudly.
+//!
 //! ## Round-trip
 //! The trained adapter round-trips through the sc-10521 inference loader: LoRA is saved with the
 //! ComfyUI `diffusion_model.` prefix + PEFT `lora_A`/`lora_B` keys and **no alpha** (the shipped Anima
@@ -40,12 +49,13 @@
 //! LoKr is saved by the shared [`save_lokr`] in the bare-path `lokr_*` convention the sc-10521 LoKr
 //! path consumes. Both reconstruct the residual at **bf16** to match the inference loader.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost};
 use mlx_gen::gen_core;
 use mlx_gen::media::Image;
+use mlx_gen::train::checkpoint;
 use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
 use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, save_lokr, LoraParams,
@@ -216,6 +226,60 @@ fn resolve_target_paths(
                 .any(|s| path == s || path.ends_with(&format!(".{s}")))
         })
         .collect()
+}
+
+/// The distinct adapter *target paths* present in a trainable-factor map, split into the DiT
+/// (`blocks.*`) surface and the conditioner (`llm_adapter.*`) surface. Every factor is keyed
+/// `{path}.<factor>` (`.lora_a`/`.lora_b`/`.lokr_w1`/`.lokr_w2`/`.lokr_w2_a`/`.lokr_w2_b`), so the
+/// target path is the key with its trailing factor segment stripped. Used by the sc-10642 resume guard
+/// to count the 448 DiT + 60 `llm_adapter` = 508 targets a full-surface run trains.
+fn split_target_surface(params: &LoraParams) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut dit = BTreeSet::new();
+    let mut cond = BTreeSet::new();
+    for key in params.keys() {
+        let path = key.rsplit_once('.').map_or(key.as_ref(), |(p, _)| p);
+        if path.starts_with("llm_adapter.") {
+            cond.insert(path.to_string());
+        } else {
+            dit.insert(path.to_string());
+        }
+    }
+    (dit, cond)
+}
+
+/// The sc-10522 / sc-10642 restore guard. A resumed run rebuilds its trainable surface from the LIVE
+/// model (`resolve_target_paths` → `build_lora/lokr_targets`, the full **508** targets = 448 DiT +
+/// 60 `llm_adapter` for the default config) and then swaps the checkpoint's factors in. If the
+/// checkpoint had dropped the 60 conditioner (`llm_adapter.*`) targets — or otherwise disagreed with
+/// this run's surface — resume would silently continue with an **inert conditioner** while every
+/// structural check (converging DiT loss, valid adapter file) still passed: the exact sc-10522 trap.
+/// So before swapping the factors we ASSERT the checkpoint's factor surface is EXACTLY the one this run
+/// rebuilt — same DiT paths, same `llm_adapter` paths, same factor keys — and fail loudly with a typed
+/// [`Error`](mlx_gen::Error) otherwise, naming the DiT/conditioner target split so the mismatch is
+/// diagnosable. The count is asserted against the live model's surface, never inferred from the file.
+fn assert_resume_surface_matches(restored: &LoraParams, expected: &LoraParams) -> Result<()> {
+    // Exact factor-key equality is the strongest guarantee — it also catches a LoRA↔LoKr network-type
+    // mismatch or a single dropped factor, not just a wholesale missing target class.
+    let restored_keys: BTreeSet<&str> = restored.keys().map(|k| k.as_ref()).collect();
+    let expected_keys: BTreeSet<&str> = expected.keys().map(|k| k.as_ref()).collect();
+    if restored_keys == expected_keys {
+        return Ok(());
+    }
+    let (rd, rc) = split_target_surface(restored);
+    let (ed, ec) = split_target_surface(expected);
+    Err(mlx_gen::Error::Msg(format!(
+        "anima resume: checkpoint trainable surface does not match this run — refusing to resume into a \
+         silently-different model (sc-10522). checkpoint carries {rt} targets ({rdn} DiT `blocks.*` + \
+         {rcn} `llm_adapter` conditioner); this run rebuilt {et} targets ({edn} DiT + {ecn} \
+         conditioner). a checkpoint missing the {ecn} conditioner targets would resume an inert \
+         conditioner — start a fresh run or resume the matching adapter.",
+        rt = rd.len() + rc.len(),
+        rdn = rd.len(),
+        rcn = rc.len(),
+        et = ed.len() + ec.len(),
+        edn = ed.len(),
+        ecn = ec.len(),
+    )))
 }
 
 /// Whether in-training preview sampling (sc-10641) is active for this run: a positive cadence AND at
@@ -508,13 +572,44 @@ impl AnimaTrainer {
         let accum = cfg.gradient_accumulation.max(1);
         let (total_updates, warmup_updates) =
             schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
+        let stem = Path::new(&req.file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("adapter")
+            .to_string();
+
+        // sc-10642 — mid-run resume (the shared sc-9560 / F-125 engine). When `cfg.resume` is set and a
+        // prior interrupted run of THIS adapter left a snapshot in `output_dir`, restore its optimizer
+        // state + trainable factors + step/update index and continue from `start_step + 1` rather than
+        // step 0. The restored factors REPLACE the fresh `B = 0`/zeroed init built above; the fresh build
+        // still ran first so `params` carries the live model's full expected surface for the sc-10522
+        // guard. Snapshots land on optimizer-update boundaries at each `save_every`, so resume is
+        // bit-exact for `gradient_accumulation = 1` (the default) and when `save_every` is a multiple of
+        // the accumulation otherwise.
+        let mut update_idx: u32 = 0;
+        let mut start_step: u32 = 0;
+        if cfg.resume {
+            if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
+                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
+                // sc-10522: the checkpoint MUST carry the full 448 DiT + 60 `llm_adapter` surface this
+                // run rebuilt, or the conditioner resumes inert. Assert against the live model's surface
+                // BEFORE swapping the factors in — a typed error, not a silent inert-conditioner resume.
+                assert_resume_surface_matches(&loaded, &params)?;
+                params = loaded;
+                start_step = meta.step;
+                update_idx = meta.update_idx;
+                eprintln!(
+                    "[sc-10642] anima resuming '{stem}' from step {start_step} (optimizer update \
+                     {update_idx})"
+                );
+            }
+        }
 
         // --- train loop ---
         let mut accumulated: Option<LoraParams> = None;
-        let mut update_idx: u32 = 0;
         let mut last_loss = 0.0f32;
-        let mut steps_run = 0u32;
-        for step in 1..=cfg.steps {
+        let mut steps_run = start_step;
+        for step in start_step + 1..=cfg.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
@@ -591,6 +686,10 @@ impl AnimaTrainer {
                     .output_dir
                     .join(intermediate_filename(&req.file_name, step));
                 save_adapter(&adapter, &params, &target_paths, alpha, rank, cfg, &ckpt)?;
+                // sc-10642 — alongside the user-facing adapter checkpoint, write the resume bundle
+                // (optimizer state + raw trainable factors + `{step, update_idx, optimizer}`), so an
+                // interrupted run can continue from here with `cfg.resume` rather than restarting at 0.
+                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
                 on_progress(TrainingProgress::Checkpoint { step });
             }
 
@@ -1971,6 +2070,143 @@ mod tests {
             refused,
             "dense 1536 (projected {dense_proj:.0} GB) must be refused by the pre-flight guard"
         );
+    }
+
+    // ==============================================================================================
+    // sc-10642 — mid-run resume (CI, Metal-synthetic; no real weights)
+    // ==============================================================================================
+
+    /// Round-trip: a few optimizer steps over the Anima trainable surface → `save_resume` → discover →
+    /// `load_resume` restores the optimizer state + trainable factors + step/update index. The restored
+    /// factors match bit-for-bit, the step count comes back as N (not 0), and the restored optimizer's
+    /// next step matches the uninterrupted optimizer's — the sc-9560 exactness the resume wiring relies
+    /// on, exercised on Anima's own two-host (DiT + `llm_adapter`) factor map.
+    #[test]
+    fn resume_round_trips_optimizer_factors_and_step() {
+        let (_dit, _cond, params, _adapter, _tp, _blocks) = tiny_model_and_adapter();
+        // Synthetic non-zero grads keyed exactly as the factors (so both optimizer instances step
+        // identically). `lora_b` starts at 0, so a real grad is needed to move the state.
+        let grads: LoraParams = params
+            .iter()
+            .map(|(k, v)| {
+                let g =
+                    random::normal::<f32>(v.shape(), None, None, Some(&random::key(99).unwrap()))
+                        .unwrap();
+                (k.clone(), g)
+            })
+            .collect();
+        let mut opt = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+        opt.set_lr_scaled(1.0);
+        let mut p = params.clone();
+        opt.step(&mut p, &grads).unwrap();
+        opt.step(&mut p, &grads).unwrap();
+        eval(p.values()).unwrap();
+
+        let dir = std::env::temp_dir().join("mlxgen_anima_resume_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = "anima_style";
+        checkpoint::save_resume(&dir, stem, 4, 2, &opt, &p).unwrap();
+
+        // Discovery returns the snapshot's step; load restores it.
+        let (found, step) = checkpoint::find_latest_resume(&dir, stem).expect("resume snapshot");
+        assert_eq!(step, 4, "find_latest_resume returns the snapshot step");
+        let mut opt2 = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+        let (loaded, meta) = checkpoint::load_resume(&found, &mut opt2).unwrap();
+
+        // The Anima surface guard passes on a faithful round-trip (fresh-build keys == restored keys).
+        assert_resume_surface_matches(&loaded, &params).unwrap();
+
+        // Step count + update index restored — resume continues at N, not 0.
+        assert_eq!(meta.step, 4, "resumes at the recorded step, not 0");
+        assert_eq!(meta.update_idx, 2, "optimizer-update index restored");
+        assert_eq!(meta.optimizer, "adamw");
+
+        // Trainable factors (adapter weights) restored bit-for-bit.
+        assert_eq!(loaded.len(), p.len(), "same factor count");
+        for (k, v) in &p {
+            let l = loaded.get(k).expect("restored factor");
+            let d = v
+                .subtract(l)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            assert!(d == 0.0, "factor {k} not restored bit-exact: |Δ| = {d:e}");
+        }
+
+        // Optimizer state restored: the restored optimizer's next step == the uninterrupted one's.
+        let mut a = p.clone();
+        let mut b = loaded;
+        opt.set_lr_scaled(1.0);
+        opt2.set_lr_scaled(1.0);
+        opt.step(&mut a, &grads).unwrap();
+        opt2.step(&mut b, &grads).unwrap();
+        eval(a.values()).unwrap();
+        eval(b.values()).unwrap();
+        let m = max_rel_diff(&a, &b);
+        assert!(
+            m <= 1e-6,
+            "restored optimizer's next step diverged: max_rel {m:e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sc-10522 restore assertion. The guard passes when the checkpoint's factor surface matches the
+    /// live model's, and ERRORS (failure-capable) when the checkpoint dropped the conditioner
+    /// (`llm_adapter.*`) targets — the trap where the DiT keeps training and every structural check
+    /// passes while the conditioner is silently inert — or dropped any single factor.
+    #[test]
+    fn resume_restore_asserts_full_target_surface() {
+        let (_dit, _cond, params, _adapter, _tp, _blocks) = tiny_model_and_adapter();
+
+        // The tiny synthetic surface is a scaled-down analogue of the real 448 DiT + 60 `llm_adapter`
+        // split; the guard is size-agnostic (it asserts restored == live surface). Both classes present.
+        let (dit_paths, cond_paths) = split_target_surface(&params);
+        assert!(!dit_paths.is_empty(), "tiny surface has DiT targets");
+        assert!(
+            !cond_paths.is_empty(),
+            "tiny surface has conditioner targets"
+        );
+
+        // Faithful restore (identical surface) passes.
+        assert_resume_surface_matches(&params, &params).unwrap();
+
+        // Drop the conditioner (`llm_adapter.*`) factors — the sc-10522 inert-conditioner trap. ERROR.
+        let mut dropped = params.clone();
+        let cond_keys: Vec<_> = dropped
+            .keys()
+            .filter(|k| k.starts_with("llm_adapter."))
+            .cloned()
+            .collect();
+        assert!(
+            !cond_keys.is_empty(),
+            "there are conditioner factors to drop"
+        );
+        for k in cond_keys {
+            dropped.remove(&k);
+        }
+        let err = assert_resume_surface_matches(&dropped, &params)
+            .expect_err("a checkpoint missing the conditioner targets must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("sc-10522"), "error names the trap: {msg}");
+        assert!(
+            msg.contains("0 `llm_adapter` conditioner"),
+            "error reports 0 conditioner targets in the checkpoint: {msg}"
+        );
+
+        // Dropping a single DiT factor is also caught (wrong count within a class, not a whole class).
+        let mut one_missing = params.clone();
+        let a_dit = one_missing
+            .keys()
+            .find(|k| !k.starts_with("llm_adapter.") && k.ends_with(".lora_a"))
+            .cloned()
+            .expect("a DiT lora_a factor");
+        one_missing.remove(&a_dit);
+        assert_resume_surface_matches(&one_missing, &params)
+            .expect_err("a checkpoint missing a single factor must be refused");
     }
 }
 
