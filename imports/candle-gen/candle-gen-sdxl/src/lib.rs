@@ -170,7 +170,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, PidWeights, Progress, WeightsSource,
+    Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -413,8 +413,12 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 8,
             // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
             mac_only: false,
-            // No on-the-fly quantization wired yet (sc-3674 territory).
-            supported_quants: &[],
+            // Packed q4/q8 MLX-tier inference (sc-9416 UNet + sc-9527 dual-CLIP + sc-9528 adapter fold)
+            // is wired end-to-end, so advertise Q4/Q8 (sc-10767, epic 9083 full-catalog parity). The
+            // tier is packed-detected from disk (`detect_packed_unet` / `detect_packed_clip`); the
+            // LoadSpec `quant` overlay is an advisory no-op on an already-packed tier (as with
+            // boogu/flux2-dev). bf16 tiers stay dense (Quant::None), verbatim.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -502,6 +506,9 @@ mod tests {
         assert!(d.capabilities.conditioning.is_empty());
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
+        // sc-10767 (epic 9083): the packed q4/q8 MLX-tier inference path (sc-9416/9527/9528) is now
+        // advertised, so the worker keeps quant tier-selects on the candle lane rather than deferring.
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         // sc-7124: the curated ε/DDPM sampler menu + the native `lightning` alias; `ddim` (== the
         // native default) is part of the curated vocabulary. The curated scheduler axis + `discrete`.
         assert_eq!(
