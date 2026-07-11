@@ -123,17 +123,36 @@ pub struct GenerateOptions<'a> {
     pub reasoner_temperature: f32,
 }
 
-/// A loaded Lens pipeline: the four components, shared by both variants, plus the **optional** local
-/// prompt reasoner (sc-3176 — `None` unless [`attach_reasoner`](LensPipeline::attach_reasoner)d, so the
-/// default pipeline carries no extra gpt-oss footprint for an off-by-default feature).
-pub struct LensPipeline {
+/// The **text-encode phase** of a Lens pipeline (sc-11030): the tokenizer + the gpt-oss MoE text
+/// encoder. The encoder is the LARGEST component (the ~20 B-param gpt-oss, ~13 GB q4 — comparable to
+/// or larger than the DiT), so it is the one dropped first under `OffloadPolicy::Sequential`: encode →
+/// **drop** → denoise/decode bounds peak unified memory to `max(text-encoder, DiT+VAE)`.
+pub struct LensText {
     tokenizer: LensTokenizer,
     encoder: LensTextEncoder,
-    transformer: LensTransformer,
-    vae: Flux2Vae,
-    reasoner: Option<crate::reasoner::LensReasoner>,
     num_text_layers: usize,
     dtype: Dtype,
+}
+
+/// The **heavy render phase** of a Lens pipeline (sc-11030): the denoising DiT + the Flux.2 VAE. Held
+/// after the text encoder is dropped under `Sequential`; both residencies run the identical
+/// [`render`](LensHeavy::render) body, so a `Sequential` job is byte-identical to `Resident`.
+pub struct LensHeavy {
+    transformer: LensTransformer,
+    vae: Flux2Vae,
+    dtype: Dtype,
+}
+
+/// A loaded Lens pipeline: the [`LensText`] + [`LensHeavy`] phases (sc-11030 split) held together,
+/// plus the **optional** local prompt reasoner (sc-3176 — `None` unless
+/// [`attach_reasoner`](LensPipeline::attach_reasoner)d, so the default pipeline carries no extra
+/// gpt-oss footprint for an off-by-default feature). This is the direct struct API used by the e2e
+/// parity tests + the trainer; the registry generator ([`crate::registry`]) holds the two phases
+/// separately so it can drop the encoder mid-job for `Sequential` residency.
+pub struct LensPipeline {
+    text: LensText,
+    heavy: LensHeavy,
+    reasoner: Option<crate::reasoner::LensReasoner>,
 }
 
 impl LensPipeline {
@@ -155,26 +174,10 @@ impl LensPipeline {
         quant: Option<Quant>,
     ) -> Result<Self> {
         let root = snapshot_dir.as_ref();
-        let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
-
-        let enc_cfg = GptOssConfig::lens();
-        let enc_w = Weights::from_dir(root.join("text_encoder"))?;
-        let encoder = LensTextEncoder::from_weights_quant(&enc_w, &enc_cfg, dtype, quant)?;
-
-        let dit_cfg = LensDitConfig::lens();
-        let dit_w = Weights::from_dir(root.join("transformer"))?;
-        let transformer = LensTransformer::from_weights(&dit_w, &dit_cfg, dtype)?;
-
-        let vae = load_vae(root)?;
-
         Ok(Self {
-            tokenizer,
-            encoder,
-            transformer,
-            vae,
+            text: LensText::load(root, dtype, quant)?,
+            heavy: LensHeavy::load(root, dtype)?,
             reasoner: None,
-            num_text_layers: dit_cfg.num_text_layers,
-            dtype,
         })
     }
 
@@ -183,6 +186,27 @@ impl LensPipeline {
     /// so the base pipeline pays nothing for this off-by-default feature.
     pub fn attach_reasoner(&mut self, reasoner: crate::reasoner::LensReasoner) {
         self.reasoner = Some(reasoner);
+    }
+}
+
+impl LensText {
+    /// Load the text-encode phase (sc-11030) — the tokenizer + the gpt-oss MoE text encoder — from a
+    /// Lens snapshot's `tokenizer/` + `text_encoder/`. `quant` (Q4/Q8) quantizes the encoder's MoE
+    /// experts at load (sc-3172): the ~38 GB / 20 B-param bulk → ~12 GB, the per-layer dequant the only
+    /// transient. `num_text_layers` is the arch constant (the DiT text-conditioning layer count), so
+    /// this loads without touching the DiT — the split that lets `Sequential` drop the encoder before
+    /// the DiT is loaded.
+    pub fn load(root: &std::path::Path, dtype: Dtype, quant: Option<Quant>) -> Result<Self> {
+        let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
+        let enc_cfg = GptOssConfig::lens();
+        let enc_w = Weights::from_dir(root.join("text_encoder"))?;
+        let encoder = LensTextEncoder::from_weights_quant(enc_w, &enc_cfg, dtype, quant)?;
+        Ok(Self {
+            tokenizer,
+            encoder,
+            num_text_layers: LensDitConfig::lens().num_text_layers,
+            dtype,
+        })
     }
 
     /// Encode one prompt to its per-layer DiT text features (sliced at [`TXT_OFFSET`]) + the valid
@@ -268,6 +292,26 @@ impl LensPipeline {
         }
         let encoder_mask = concatenate_axis(&[&pos_mask, &neg_mask], 0)?; // [2, S_txt]
         Ok((encoder_features, encoder_mask))
+    }
+}
+
+impl LensHeavy {
+    /// Load the heavy render phase (sc-11030) — the denoising DiT + the Flux.2 VAE, dense — from a Lens
+    /// snapshot's `transformer/` + `vae/`. DiT quant (sc-3175) and LoRA/LoKr (sc-3174) are applied
+    /// **after** load via [`quantize_dit`](Self::quantize_dit) / [`apply_adapters`](Self::apply_adapters)
+    /// (the registry orchestrates the adapters-then-quantize order); the VAE always runs f32 internally.
+    /// Independent of the text encoder (separate weight files, RNG-free), so the `Sequential` path
+    /// rebuilds a byte-identical bundle after the encoder is dropped.
+    pub fn load(root: &std::path::Path, dtype: Dtype) -> Result<Self> {
+        let dit_cfg = LensDitConfig::lens();
+        let dit_w = Weights::from_dir(root.join("transformer"))?;
+        let transformer = LensTransformer::from_weights(&dit_w, &dit_cfg, dtype)?;
+        let vae = load_vae(root)?;
+        Ok(Self {
+            transformer,
+            vae,
+            dtype,
+        })
     }
 
     /// The denoising loop over pre-encoded conditioning + an initial latent, on the engine **default**
@@ -486,6 +530,128 @@ impl LensPipeline {
         )
     }
 
+    /// Render one image from pre-encoded conditioning (sc-11030): seed → init latents → denoise →
+    /// decode → [`Image`]. The **single render body** shared by
+    /// [`LensPipeline::generate_with_progress`] and the registry generator's `Resident` / `Sequential`
+    /// paths, so a `Sequential` job — which has already dropped the text encoder before this runs —
+    /// produces byte-identical output to `Resident`. The init noise is drawn from the global RNG
+    /// reseeded with `seed` here, so hoisting the encode out of the count loop cannot perturb it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &self,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        guidance_scale: f32,
+        sampler: Option<&str>,
+        scheduler: Option<&str>,
+        seed: u64,
+        keep: Option<usize>,
+        pid_decoder: Option<&dyn mlx_gen::LatentDecoder>,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize),
+    ) -> Result<Image> {
+        let seq_len = (latent_h * latent_w) as i32;
+        mlx_rs::random::seed(seed)?;
+        let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
+        let latents = self.denoise_with_sampler_keep(
+            encoder_features,
+            encoder_mask,
+            &init,
+            latent_h,
+            latent_w,
+            num_steps,
+            guidance_scale,
+            sampler,
+            scheduler,
+            seed,
+            keep,
+            cancel,
+            &mut |cur, _total| on_step(cur),
+        )?;
+        // `vae::decode` returns NHWC [1, H, W, 3] (native) or [1, 4H, 4W, 3] (PiD, 4× SR), both in
+        // [-1,1] — `decoded_to_image` handles either.
+        let decoded = vae::decode(&self.vae, &latents, latent_h, latent_w, pid_decoder)?;
+        decoded_to_image(&decoded)
+    }
+}
+
+impl LensPipeline {
+    /// Text-encode the positive + negative prompts — delegates to the [`LensText`] phase (kept on
+    /// `LensPipeline` for the e2e parity gate + the direct struct API).
+    pub fn encode_prompt(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        date: &str,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<(Vec<Array>, Array)> {
+        self.text
+            .encode_prompt(prompt, negative_prompt, date, cancel)
+    }
+
+    /// The default-sampler denoise — delegates to the [`LensHeavy`] phase (e2e parity gate).
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise(
+        &self,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        init_latents: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        guidance_scale: f32,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Array> {
+        self.heavy.denoise(
+            encoder_features,
+            encoder_mask,
+            init_latents,
+            latent_h,
+            latent_w,
+            num_steps,
+            guidance_scale,
+            cancel,
+            on_step,
+        )
+    }
+
+    /// The curated-sampler denoise — delegates to the [`LensHeavy`] phase (e2e parity gate).
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_with_sampler(
+        &self,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        init_latents: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        guidance_scale: f32,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Array> {
+        self.heavy.denoise_with_sampler(
+            encoder_features,
+            encoder_mask,
+            init_latents,
+            latent_h,
+            latent_w,
+            num_steps,
+            guidance_scale,
+            sampler_name,
+            scheduler_name,
+            seed,
+            cancel,
+            on_step,
+        )
+    }
+
     /// Generate a single image (no cancellation / progress). Draws the initial latents from the
     /// global RNG seeded with `opts.seed`. Native-VAE decode (no PiD overlay).
     pub fn generate(&self, opts: &GenerateOptions) -> Result<Image> {
@@ -520,7 +686,6 @@ impl LensPipeline {
         }
         let latent_h = (opts.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (opts.width / VAE_SCALE_FACTOR) as usize;
-        let seq_len = (latent_h * latent_w) as i32;
 
         // Optional prompt refinement via the local reasoner (sc-3176) — before encoding.
         let refined;
@@ -545,15 +710,15 @@ impl LensPipeline {
         };
 
         let (encoder_features, encoder_mask) =
-            self.encode_prompt(prompt, opts.negative_prompt, opts.date, Some(cancel))?;
+            self.text
+                .encode_prompt(prompt, opts.negative_prompt, opts.date, Some(cancel))?;
 
-        mlx_rs::random::seed(opts.seed)?;
-        let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
-
-        let latents = self.denoise_with_sampler_keep(
+        // One render body (sc-11030): seed → init latents → denoise → decode. Byte-identical to the
+        // pre-split inline path — `render` reseeds the global RNG from `opts.seed` immediately before
+        // the init-noise draw, so the encode never perturbs it.
+        self.heavy.render(
             &encoder_features,
             &encoder_mask,
-            &init,
             latent_h,
             latent_w,
             opts.num_steps,
@@ -562,16 +727,19 @@ impl LensPipeline {
             opts.scheduler,
             opts.seed,
             keep,
+            pid_decoder,
             cancel,
-            &mut |cur, _total| on_step(cur),
-        )?;
-
-        // `vae::decode` returns NHWC [1, H, W, 3] (native) or [1, 4H, 4W, 3] (PiD, 4× SR) — both in
-        // [-1,1] — so the NHWC `decoded_to_image` below handles either.
-        let decoded = vae::decode(&self.vae, &latents, latent_h, latent_w, pid_decoder)?;
-        decoded_to_image(&decoded)
+            on_step,
+        )
     }
 
+    /// The loaded VAE — delegates to the [`LensHeavy`] phase (e2e parity test decode step).
+    pub fn vae(&self) -> &Flux2Vae {
+        self.heavy.vae()
+    }
+}
+
+impl LensHeavy {
     /// The loaded VAE (for the e2e parity test's decode step).
     pub fn vae(&self) -> &Flux2Vae {
         &self.vae
@@ -584,8 +752,8 @@ impl LensPipeline {
         Ok(())
     }
 
-    /// Quantize the DiT's linears to Q4/Q8 (sc-3175 — the complement to the encoder quant in
-    /// [`load_quant`](Self::load_quant)). Call **after** [`apply_adapters`](Self::apply_adapters): the
+    /// Quantize the DiT's linears to Q4/Q8 (sc-3175 — the complement to the encoder MoE-expert quant in
+    /// [`LensText::load`](LensText::load)). Call **after** [`apply_adapters`](Self::apply_adapters): the
     /// adapters are forward-time residuals over the now-quantized base, so quantize-after-merge is the
     /// correct order (the registry orchestrates it).
     pub fn quantize_dit(&mut self, quant: Quant) -> Result<()> {

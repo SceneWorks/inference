@@ -103,6 +103,21 @@ impl Weights {
         }
     }
 
+    /// Remove and return the tensor at `key` (`None` if absent). Lets a **consuming** loader release
+    /// each source tensor from the map as soon as it has been copied/quantized into the built model, so
+    /// the source and the growing built model don't both stay resident — bounding the load-time
+    /// unified-memory transient to ~the built size (sc-11030; the gpt-oss encoder is otherwise a
+    /// 13 GB-source + 21/63 GB-built spike). MLX returns the dropped buffer to its reuse pool.
+    pub fn remove(&mut self, key: &str) -> Option<Array> {
+        self.tensors.remove(key)
+    }
+
+    /// Drop every tensor whose key starts with `prefix` (e.g. `"model.layers.7."` once layer 7 is
+    /// built). The companion to [`remove`](Self::remove) for a whole sub-module's source tensors.
+    pub fn remove_prefix(&mut self, prefix: &str) {
+        self.tensors.retain(|k, _| !k.starts_with(prefix));
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }
