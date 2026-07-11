@@ -36,6 +36,9 @@ tokenizers = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
 rand = { workspace = true }
 rand_distr = { workspace = true }
+# Parse the `quantization` block out of `unet/` & `text_encoder/` `config.json` to detect a packed
+# MLX q4/q8 tier (sc-10819) — the same `PackedConfig::from_config` probe the SDXL packed load uses.
+serde_json = { workspace = true }
 
 [features]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
