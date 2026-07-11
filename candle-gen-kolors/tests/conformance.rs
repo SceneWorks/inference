@@ -42,3 +42,25 @@ fn kolors_conformance() {
     };
     conformance(|| candle_gen_kolors::load(&spec).unwrap(), &profile);
 }
+
+/// sc-10819 (epic 9083): the SAME gen-core contract suite against a **packed** `SceneWorks/kolors-mlx`
+/// q4/q8 tier — the regression guard that the packed ChatGLM3 + vendored SDXL UNet load path renders
+/// coherently through the full contract (validate-honesty, progress monotonicity, typed cancel,
+/// seed-determinism, registry round-trip), not just the dense snapshot. Point `KOLORS_PACKED_SNAPSHOT`
+/// at a `kolors-mlx/q4` or `kolors-mlx/q8` tier dir (each self-contained: packed `unet/` +
+/// `text_encoder/`, dense `vae/`, materialized `tokenizer/tokenizer.json`). The packed tier is
+/// detected from disk, so `LoadSpec` needs no `quantize` overlay.
+#[test]
+#[ignore = "needs KOLORS_PACKED_SNAPSHOT (a SceneWorks/kolors-mlx q4|q8 tier dir) + a CUDA GPU; run with --features cuda --ignored"]
+fn kolors_packed_conformance() {
+    let snap = std::env::var("KOLORS_PACKED_SNAPSHOT")
+        .expect("set KOLORS_PACKED_SNAPSHOT to a SceneWorks/kolors-mlx q4|q8 tier dir");
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
+    let profile = Profile {
+        width: 512,
+        height: 512,
+        steps: 4,
+        ..Profile::cheap()
+    };
+    conformance(|| candle_gen_kolors::load(&spec).unwrap(), &profile);
+}

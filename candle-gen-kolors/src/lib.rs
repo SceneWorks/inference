@@ -12,11 +12,11 @@
 //! 1100-step schedule) → the SDXL VAE, emitting `Progress`, honoring `req.cancel`, with
 //! **deterministic CPU-seeded noise** (sc-3673) so output is launch-portable per seed.
 //!
-//! The descriptor advertises **only** the wired txt2img surface (negative prompt + CFG guidance, but
-//! NOT LoRA/LoKr, quantization, ControlNet-pose, or IP-Adapter — all wired in the mlx provider) — so
-//! the worker routes the rest to the Python fallback rather than the candle backend silently dropping
-//! a control (the false-capability trap, exactly as the SDXL / FLUX / Z-Image / Chroma slices did).
-//! `backend` is `"candle"` and `mac_only` is `false`.
+//! The descriptor advertises the wired surface — txt2img (negative prompt + CFG guidance) and packed
+//! **Q4/Q8** MLX-tier inference (sc-10819, epic 9083) — but NOT LoRA/LoKr, ControlNet-pose, or
+//! IP-Adapter (all wired in the mlx provider), so the worker routes the rest to the Python fallback
+//! rather than the candle backend silently dropping a control (the false-capability trap, exactly as
+//! the SDXL / FLUX / Z-Image / Chroma slices did). `backend` is `"candle"` and `mac_only` is `false`.
 
 mod chatglm3;
 // Shared Kolors pipeline scaffolding (sc-9001 / F-021): the time_ids / initial-noise / decode /
@@ -138,10 +138,11 @@ impl Generator for KolorsGenerator {
 }
 
 /// Construct the (lazy) candle Kolors generator from a [`LoadSpec`]. `spec.weights` must be a
-/// [`WeightsSource::Dir`] pointing at a `Kwai-Kolors/Kolors-diffusers` snapshot (`text_encoder/`,
-/// `tokenizer/`, `unet/`, `vae/`, with `tokenizer/tokenizer.json` materialized). LoRA adapters,
-/// quantization, and control / IP-adapter overlays are rejected — none are wired in this slice, so
-/// refusing is more honest than silently dropping them.
+/// [`WeightsSource::Dir`] pointing at a `Kwai-Kolors/Kolors-diffusers` snapshot OR a packed
+/// `SceneWorks/kolors-mlx` q4/q8 tier (`text_encoder/`, `tokenizer/`, `unet/`, `vae/`, with
+/// `tokenizer/tokenizer.json` materialized). A packed tier is auto-detected from disk (sc-10819), so
+/// `spec.quantize` is an advisory no-op. LoRA adapters and control / IP-adapter overlays are still
+/// rejected — none are wired on the candle lane, so refusing is more honest than silently dropping them.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -159,11 +160,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(
-            "candle kolors does not support on-the-fly Q4/Q8 quantization yet".into(),
-        ));
-    }
+    // Packed q4/q8 MLX tiers are wired end-to-end (sc-10819, epic 9083): the tier is packed-detected
+    // from disk (`unet/` & `text_encoder/` `config.json` `quantization` blocks; see
+    // `pipeline::load_components`), so the `LoadSpec::quantize` overlay is an advisory no-op on an
+    // already-packed tier — exactly as SDXL/boogu/flux2-dev treat it. No reject here.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle kolors does not support control / IP-adapter overlays yet (txt2img only)"
@@ -297,11 +297,14 @@ mod tests {
             gen_core::Error::Unsupported(_)
         ));
 
+        // sc-10819: a packed q4/q8 tier is auto-detected from disk, so `quantize` is NO LONGER a load
+        // reject (contrast the LoRA/control overlays above). Load is lazy (no file I/O), so a quant-only
+        // spec at a nonexistent dir succeeds — the packed tier is resolved on the first `generate`.
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(
+            load(&quant).is_ok(),
+            "a quant spec must not be rejected — packed tiers are wired (sc-10819)"
+        );
 
         let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()));
         let err = load(&single).err().expect("err").to_string();
