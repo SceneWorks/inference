@@ -800,6 +800,7 @@ mod tests {
             items: vec![TrainingItem {
                 image_path: "/img.png".into(),
                 caption: "x".into(),
+                control_image_path: None,
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),
