@@ -433,7 +433,7 @@ impl Krea2Transformer {
     /// The per-step embed/assemble stage: image patch embed + timestep embed/modulation, fused with
     /// the step-invariant text stream + RoPE from [`prep`](JointPrep) into the joint inputs the block
     /// stack + final layer consume.
-    fn joint_inputs(
+    pub(crate) fn joint_inputs(
         &self,
         latent: &Array,
         timestep: &Array,
@@ -471,7 +471,7 @@ impl Krea2Transformer {
     }
 
     /// Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
-    fn finalize(&self, combined: &Array, t: &Array, j: &JointInputs) -> Result<Array> {
+    pub(crate) fn finalize(&self, combined: &Array, t: &Array, j: &JointInputs) -> Result<Array> {
         let out = self.final_layer(combined, t)?; // [b, cap+img_len, in_channels]
                                                   // The image tokens are the contiguous tail `[cap_len, cap_len+img_len)` — split at the caption
                                                   // boundary rather than gathering an arange (F-114). `out` has length exactly `cap+img_len`.
@@ -499,6 +499,24 @@ impl Krea2Transformer {
     /// bookkeeping indexes per block.
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// The frozen single-stream blocks, for the pose-control branch's own injection loop (sc-8465,
+    /// [`crate::control`]): it drives `blk.forward(..)` per block and adds a residual before selected
+    /// blocks, rather than the straight-through [`Self::forward_prepared`] loop.
+    pub(crate) fn blocks(&self) -> &[SingleStreamBlock] {
+        &self.blocks
+    }
+
+    /// Patch-embed a latent through the frozen base `img_in` (the SAME embedder the noisy image latent
+    /// uses in [`Self::joint_inputs`]), producing image tokens `[b, img_len, hidden]`. The pose-control
+    /// branch (sc-8465) embeds the VAE-encoded pose latent through this so its control tokens live in
+    /// the base image-token space before they are added onto the branch input.
+    pub(crate) fn embed_latent(&self, latent: &Array) -> Result<Array> {
+        self.img_in.forward(&patchify(
+            &latent.as_dtype(self.dtype)?,
+            self.cfg.patch_size as i32,
+        )?)
     }
 
     /// Cast the whole DiT to the training compute `dtype` in place (sc-7577). The `RmsScale` norms
@@ -559,17 +577,21 @@ impl Krea2Transformer {
 /// The embed/fuse preamble outputs shared by the dense and checkpointed forwards: the joint hidden
 /// state, the timestep embedding `t`, the shared modulation `tvec`, the joint RoPE tables, and the
 /// patchify/slice geometry the final layer needs.
-struct JointInputs {
-    combined: Array,
-    t: Array,
-    tvec: Array,
-    rcos: Array,
-    rsin: Array,
-    cap_len: i32,
-    ht: i32,
-    wt: i32,
-    latent_ch: i32,
-    p: i32,
+///
+/// `pub(crate)` (with `pub(crate)` fields) so the pose-control branch (sc-8465, [`crate::control`]) can
+/// run the frozen block stack itself — injecting a residual before selected blocks — instead of the
+/// straight-through [`Krea2Transformer::forward_prepared`] loop.
+pub(crate) struct JointInputs {
+    pub(crate) combined: Array,
+    pub(crate) t: Array,
+    pub(crate) tvec: Array,
+    pub(crate) rcos: Array,
+    pub(crate) rsin: Array,
+    pub(crate) cap_len: i32,
+    pub(crate) ht: i32,
+    pub(crate) wt: i32,
+    pub(crate) latent_ch: i32,
+    pub(crate) p: i32,
 }
 
 /// The **step-invariant** conditioning built once per denoise ([`KreaTransformer::prepare`]): the

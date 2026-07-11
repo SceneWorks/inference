@@ -31,6 +31,7 @@ use mlx_gen::{
 
 use std::path::Path;
 
+use crate::control::Krea2ControlBranch;
 use crate::loader::{load_text_encoder, load_transformer, load_vision_tower};
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
 use crate::text_encoder::{encode_grounded, KreaTextEncoder, KreaTokenizer};
@@ -171,6 +172,65 @@ impl KreaPipeline {
 
         on_progress(Progress::Decoding);
         self.decode_latents(&lat, decoder)
+    }
+
+    /// **Pose-ControlNet on Turbo** (sc-8465, epic 8459 S5) — the control-generate twin of
+    /// [`Self::generate_turbo_with_progress`]. Generate one pose-locked RGB image: the VAE-encoded pose
+    /// skeleton is embedded once through the frozen base `img_in` and injected as a `control_scale`-scaled,
+    /// RMS-clamped residual on every CFG-free Turbo step via the [`Krea2ControlBranch`]
+    /// ([`crate::control::Krea2ControlBranch::forward`]). Same tokenize → Qwen3-VL condition-encode →
+    /// 8-step rectified-flow Euler → VAE decode as the plain Turbo path, plus the branch forward per step.
+    ///
+    /// `control_scale == 0` is a bit-exact base passthrough (the branch is never run). The PiD decode /
+    /// `from_ldm` early-stop and img2img seams are intentionally NOT wired on the control lane (pose
+    /// control renders text→image from a skeleton; the native VAE decodes the clean final latent) —
+    /// matching the candle `Krea2Control` provider (sc-8464). Cancellation + progress stream through
+    /// [`run_flow_sampler`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_turbo_control_with_progress(
+        &self,
+        prompt: &str,
+        branch: &Krea2ControlBranch,
+        control_image: &Image,
+        control_scale: f32,
+        opts: &TurboOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo_control")?;
+
+        // Condition encoding (CFG-free, B=1 → mask = None), exactly as the plain Turbo path.
+        let (ids, attn) = self.tok.encode_prompt(prompt)?;
+        let context = self.te.forward(&ids, &attn)?;
+
+        // Pose skeleton → control latent [1, 16, H/8, W/8] (`QwenVae::encode` returns the normalized
+        // `(e − mean)/std` latent, the same space as `init_noise`; drop the singleton temporal axis).
+        // Embed once through the frozen base `img_in` — the pose is fixed across steps (step-invariant).
+        let image_nchw = preprocess_init_image(control_image, opts.width, opts.height)?;
+        let ctrl_latent = self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?;
+        let ctrl_tokens = self.dit.embed_latent(&ctrl_latent)?;
+
+        let noise = init_noise(opts.height, opts.width, opts.seed)?;
+        let sigmas = turbo_schedule(opts.steps, opts.scheduler.as_deref());
+        // Hoist the step-invariant text fusion + joint RoPE (F-079), as the plain Turbo path.
+        let prep = self.dit.prepare(&context, None, &noise)?;
+        let lat = run_flow_sampler(
+            opts.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            &sigmas,
+            noise,
+            opts.seed,
+            cancel,
+            on_progress,
+            |x, timestep| {
+                let t = Array::from_slice(&[timestep], &[1]);
+                let v = branch.forward(&self.dit, x, &t, &prep, &ctrl_tokens, control_scale)?;
+                Ok(v.as_dtype(Dtype::Float32)?)
+            },
+        )?;
+
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, None)
     }
 
     /// Generate one RGB image seeded from a reference `init` image at the given `strength` (img2img,

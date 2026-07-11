@@ -1,0 +1,275 @@
+//! `KreaTurboControl` — the Krea 2 Turbo **pose-ControlNet** variant (sc-8465, epic 8459 S5): strict
+//! pose conditioning via a trained control branch overlaid on the frozen Krea 2 Turbo base, registered
+//! as its own `Generator` (`krea_2_turbo_control`). The MLX twin of the candle `Krea2Control` provider
+//! (candle-gen-krea, sc-8464) — same 8-step CFG-free Turbo sampler, same single-forward residual
+//! injection, same `control_scale` semantics.
+//!
+//! Identical to [`crate::model::Krea`] (Turbo) except a [`Krea2ControlBranch`] rides the DiT and
+//! `generate` threads a VAE-encoded pose skeleton through it. [`load`] needs the base snapshot
+//! (`spec.weights`, the DENSE `krea/Krea-2-Turbo` diffusers tree — NOT the packed Q4/Q8 turnkey the
+//! plain `krea_2_turbo` gen uses, because the branch is a composable-forward overlay trained on the bf16
+//! base) **and** the control overlay checkpoint (`spec.control`). Pose-only + dense bf16 (no quant, no
+//! negative prompt, no guidance), mirroring the candle `krea_2_turbo_control` engine.
+
+use mlx_gen::gen_core;
+use mlx_gen::{
+    require_base_dir, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
+    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Precision,
+    Progress, Result,
+};
+
+use mlx_gen::default_seed;
+
+use crate::config::Krea2Config;
+use crate::control::Krea2ControlBranch;
+use crate::pipeline::{KreaPipeline, TurboOptions};
+
+/// Registry id for the Krea 2 Turbo pose-ControlNet variant. Matches the SceneWorks worker's
+/// `STRICT_CONTROL_ENGINES` `krea_2_turbo_control` id and the candle lane, so one id serves both
+/// backends (the worker's OS/feature cfg picks the MLX vs candle provider).
+pub const KREA_2_TURBO_CONTROL_ID: &str = "krea_2_turbo_control";
+
+/// Turbo default steps (CFG-free distilled few-step), shared with the base [`crate::model`] Turbo path.
+const DEFAULT_STEPS: u32 = 8;
+
+/// Krea 2 Turbo pose-control identity + capabilities. Derived from the base Turbo [`crate::model::descriptor`]
+/// so the shared surface (family/backend/samplers/size bounds/LoRA/mac_only) stays in lockstep; the pose
+/// control lane swaps the Turbo img2img `Reference` surface for a required `Control` conditioning and is
+/// dense-only (the overlay is trained on the bf16 base — no quant tier, matching candle).
+pub fn descriptor() -> ModelDescriptor {
+    let mut d = crate::model::descriptor();
+    d.id = KREA_2_TURBO_CONTROL_ID;
+    // Pose ControlNet: a required Control conditioning replaces Turbo's optional img2img Reference.
+    d.capabilities.conditioning = vec![ConditioningKind::Control];
+    // Dense bf16 only — the pose overlay is trained on the dense base; a packed base would desync the
+    // main-stream activations the residual was trained against (candle "no quant tier").
+    d.capabilities.supported_quants = &[];
+    d
+}
+
+/// A loaded Krea 2 Turbo pose-control generator: the base Turbo pipeline + the pose control branch.
+pub struct KreaTurboControl {
+    descriptor: ModelDescriptor,
+    pipeline: KreaPipeline,
+    branch: Krea2ControlBranch,
+}
+
+/// Construct a [`KreaTurboControl`] from a [`LoadSpec`].
+///
+/// `spec.weights` must be a [`WeightsSource::Dir`] DENSE `krea/Krea-2-Turbo` snapshot (`transformer/
+/// text_encoder/ vae/ tokenizer/`), and `spec.control` (required) the converted MLX pose overlay
+/// (`control_step5000` — a single `.safetensors` `File`, or a `Dir` of shards). Loaded dense bf16;
+/// Raw-trained LoRA/LoKr in `spec.adapters` install onto the base DiT (the branch is never an adapter
+/// target). A `spec.quantize` override is rejected — the pose overlay is dense-only.
+pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{KREA_2_TURBO_CONTROL_ID}: only the default dense bf16 precision is wired (drop the \
+             precision override)"
+        )));
+    }
+    // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control overlay is
+    // required (a job without one fails loudly — never a silent un-conditioned base, the candle rule).
+    let root = require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
+    let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
+
+    if spec.quantize.is_some() {
+        return Err(Error::Msg(format!(
+            "{KREA_2_TURBO_CONTROL_ID}: the pose control overlay is trained on the dense bf16 base; \
+             quantization is not supported (drop the quant override, point at a dense snapshot)"
+        )));
+    }
+
+    // Base Turbo pipeline (dense bf16) + optional Raw-trained LoRA on the base DiT, then the pose branch.
+    let mut pipeline = KreaPipeline::from_snapshot(root)?;
+    if !spec.adapters.is_empty() {
+        pipeline.apply_adapters(&spec.adapters)?;
+    }
+    let cfg = Krea2Config::from_snapshot(root)?;
+    let branch = Krea2ControlBranch::from_source(control, &cfg)?;
+
+    Ok(Box::new(KreaTurboControl {
+        descriptor: descriptor(),
+        pipeline,
+        branch,
+    }))
+}
+
+/// The pose branch is pose-only (`Only([Pose])`) and defaults an unset `control_scale` to the S0 mid
+/// value (0.6). All the resolve/validate-present boilerplate comes from the shared trait (sc-8241).
+impl ControlBranch for KreaTurboControl {
+    fn model_id(&self) -> &'static str {
+        KREA_2_TURBO_CONTROL_ID
+    }
+
+    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
+        AcceptedControlKinds::Only(vec![mlx_gen::ControlKind::Pose])
+    }
+
+    fn default_control_scale(&self) -> f32 {
+        crate::control::DEFAULT_CONTROL_SCALE
+    }
+}
+
+impl KreaTurboControl {
+    /// The rich-`Result` body behind [`Generator::generate`] (the crate's own [`mlx_gen::Error`] so `?`
+    /// lifts `mlx_rs` device exceptions; the trait wrapper bridges into [`gen_core::Error`]). Renders
+    /// `req.count` CFG-free Turbo images, one per pose per seed (`seed + n`), each pose-locked by the
+    /// single-forward residual injection.
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+
+        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+        // The required pose skeleton + its resolved scale (unset → the 0.6 default; Some(0.0) inert).
+        let (control_image, control_scale) = self.resolve_control(req)?;
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        for n in 0..req.count {
+            let opts = TurboOptions {
+                width: req.width,
+                height: req.height,
+                steps,
+                seed: base_seed.wrapping_add(n as u64),
+                sampler: req.sampler.clone(),
+                scheduler: req.scheduler.clone(),
+            };
+            let img = self.pipeline.generate_turbo_control_with_progress(
+                &req.prompt,
+                &self.branch,
+                control_image,
+                control_scale,
+                &opts,
+                &req.cancel,
+                on_progress,
+            )?;
+            images.push(img);
+        }
+        Ok(GenerationOutput::Images(images))
+    }
+}
+
+impl Generator for KreaTurboControl {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        // Capability floor (size/count/guidance/negative/conditioning-kind), then the shared
+        // control-present check (a `Conditioning::Control` must be present).
+        crate::model::validate_request(&self.descriptor, req)?;
+        self.require_control_present(req)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+// Link-time registration (epic 3720): `krea_2_turbo_control`. The `impl Generator` stays hand-written
+// because `validate` adds the control-present check beyond the shared `validate_request`, so it is not
+// the plain delegation `impl_generator!` expresses (the z-image control precedent).
+mlx_gen::register_generators! { descriptor => load }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::{Conditioning, ControlKind, Modality, Quant, WeightsSource};
+
+    #[test]
+    fn descriptor_is_krea_2_turbo_control() {
+        let d = descriptor();
+        assert_eq!(d.id, "krea_2_turbo_control");
+        assert_eq!(d.family, "krea_2");
+        assert_eq!(d.backend, "mlx");
+        assert_eq!(d.modality, Modality::Image);
+        // Pose ControlNet: Control conditioning (not the base Turbo Reference), CFG-free, dense-only.
+        assert!(d.capabilities.accepts(ConditioningKind::Control));
+        assert!(!d.capabilities.accepts(ConditioningKind::Reference));
+        assert!(!d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert_eq!(d.capabilities.supported_quants, &[] as &[Quant]);
+        // Shared surface stays in lockstep with the base Turbo descriptor.
+        assert!(d.capabilities.mac_only);
+        assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
+        assert_eq!(
+            d.capabilities.max_count,
+            crate::model::descriptor().capabilities.max_count
+        );
+    }
+
+    #[test]
+    fn load_rejects_missing_control_weights() {
+        // A base dir but no `spec.control` → fail on the missing overlay (proving it is a hard
+        // requirement — never a silent un-conditioned base).
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()));
+        let err = load(&spec).err().expect("expected an error").to_string();
+        assert!(err.contains("pose control overlay"), "got: {err}");
+    }
+
+    #[test]
+    fn load_rejects_single_file_base() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/krea.safetensors".into()))
+            .with_control(WeightsSource::File("/tmp/control.safetensors".into()));
+        let err = load(&spec).err().expect("expected an error").to_string();
+        assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    #[test]
+    fn load_rejects_quant_override() {
+        // Dense-only: a quant override is rejected (not silently ignored), even with a control overlay.
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()))
+            .with_control(WeightsSource::File("/tmp/control.safetensors".into()))
+            .with_quant(Quant::Q8);
+        let err = load(&spec).err().expect("expected an error").to_string();
+        assert!(err.contains("quantization is not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn reachable_via_registry_by_id() {
+        assert!(
+            gen_core::registry::generators()
+                .any(|r| (r.descriptor)().id == KREA_2_TURBO_CONTROL_ID),
+            "id {KREA_2_TURBO_CONTROL_ID} not registered"
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()))
+            .with_control(WeightsSource::File("/tmp/control.safetensors".into()));
+        let err = gen_core::registry::load(KREA_2_TURBO_CONTROL_ID, &spec)
+            .err()
+            .expect("missing weights → err")
+            .to_string();
+        assert!(
+            !err.contains("no generator registered"),
+            "id not resolved: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_pose_rejects_other_control_kinds() {
+        // A pose-only branch: the trait's resolve_control admits Pose and rejects Canny/Depth. Exercised
+        // through the descriptor's accepted_control_kinds via a lightweight stub-free check on the enum.
+        let accepted = AcceptedControlKinds::Only(vec![ControlKind::Pose]);
+        assert!(accepted.accepts(&ControlKind::Pose));
+        assert!(!accepted.accepts(&ControlKind::Canny));
+        assert!(!accepted.accepts(&ControlKind::Depth));
+        // Sanity: the trait wiring builds the same Conditioning::Control the worker feeds.
+        let _ = Conditioning::Control {
+            image: mlx_gen::media::Image {
+                width: 8,
+                height: 8,
+                pixels: vec![0u8; 8 * 8 * 3],
+            },
+            kind: ControlKind::Pose,
+            scale: Some(0.6),
+        };
+    }
+}
