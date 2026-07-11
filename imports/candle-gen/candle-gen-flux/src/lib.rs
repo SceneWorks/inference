@@ -100,7 +100,7 @@ use std::sync::Mutex;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, PidWeights, Progress, WeightsSource,
+    ModelDescriptor, OffloadPolicy, PidWeights, Progress, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -188,6 +188,12 @@ pub struct FluxGenerator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    /// Component-residency policy captured from `LoadSpec::offload_policy` (epic 10765 Phase 1b,
+    /// sc-10821). `Sequential` routes `generate` through `render_sequential` (load→encode→drop the text
+    /// encoders before the DiT), capping peak VRAM at the cost of the components cache; `Resident`
+    /// (default) keeps the cached path. The worker's fit-gate sets this when it predicts the resident
+    /// sum won't fit but the DiT+VAE working set will.
+    offload_policy: OffloadPolicy,
     /// Cached components. `Mutex` because `Generator` is shared and `generate` takes `&self`; the lock
     /// is held only to read/populate the cache, never across the denoise.
     components: Mutex<Option<Components>>,
@@ -251,11 +257,15 @@ impl Generator for FluxGenerator {
             self.dtype,
             self.pid_spec.clone(),
         );
-        // Sequential-residency offload (epic 10765 Phase 1, sc-10769): when enabled, load→encode→drop
+        // Sequential-residency offload (epic 10765, sc-10769/sc-10821): when selected, load→encode→drop
         // the text encoders before loading the DiT so peak VRAM is DiT+VAE, not TE+DiT+VAE — letting a
         // card that OOMs the resident path render. Output is bit-identical; it bypasses the components
-        // cache (it drops what it loads). The default stays the resident, cross-request-cached path.
-        let images = if pipeline::sequential_offload_enabled() {
+        // cache (it drops what it loads). Driven by `LoadSpec::offload_policy` (the worker fit-gate sets
+        // `Sequential`); `CANDLE_GEN_OFFLOAD=sequential` is an env override kept for the GPU A/B harness.
+        // The default stays the resident, cross-request-cached path.
+        let sequential = self.offload_policy == OffloadPolicy::Sequential
+            || pipeline::sequential_offload_enabled();
+        let images = if sequential {
             pipe.render_sequential(req, on_progress)?
         } else {
             let components = self.components(&pipe)?;
@@ -363,6 +373,9 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
         // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
         // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
+        // Component-residency policy (epic 10765 Phase 1b, sc-10821) — `Sequential` routes generate
+        // through `render_sequential`. Captured at load; ignored by every other candle family.
+        offload_policy: spec.offload_policy,
         components: Mutex::new(None),
     }))
 }
