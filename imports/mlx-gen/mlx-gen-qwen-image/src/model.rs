@@ -13,10 +13,11 @@
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, WeightsSource,
+    Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
+use std::path::Path;
 
 use crate::loader;
 use crate::pipeline::{
@@ -73,12 +74,43 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// A loaded Qwen-Image generator: the four model components assembled from a snapshot directory,
-/// plus the cached descriptor.
+/// A loaded Qwen-Image generator: the cached descriptor, the (tiny, always-warm) tokenizer, and the
+/// heavy-component residency strategy.
 pub struct QwenImage {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
+    /// Component-residency strategy (epic 10834 Phase 1, sc-11000), selected from
+    /// [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen2.5-VL text encoder + DiT +
+    /// VAE warm for the whole job and across jobs; `Sequential` holds only the [`LoadSpec`] and
+    /// re-loads per generation in phase order (encode → **drop the text encoder** → denoise/decode),
+    /// bounding peak unified memory to `max(text-encoder, DiT+VAE)` instead of the sum — the biggest
+    /// image-lane win (the Qwen2.5-VL encoder ≈15 GB is comparable to the 20 GB DiT: 36→20 GB).
+    residency: Residency,
+}
+
+/// The heavy-component residency for a [`QwenImage`] (sc-11000). See [`QwenImage::residency`].
+enum Residency {
+    /// Every component loaded once at [`load`] and held (today's warm-cache path). `generate`
+    /// borrows these. Boxed so this heavy variant doesn't bloat every `Sequential` handle
+    /// (`clippy::large_enum_variant`).
+    Resident(Box<ResidentComponents>),
+    /// Only the [`LoadSpec`] is held; each `generate` re-loads the components in phase order and
+    /// frees them after, so peak memory is `max(text-encoder, DiT+VAE)` and nothing stays resident
+    /// across jobs. The per-phase loaders rebuild byte-identical components to the `Resident` path.
+    Sequential(Box<LoadSpec>),
+}
+
+/// The Qwen2.5-VL text encoder held resident (the phase-A component dropped first under
+/// `Sequential`), paired with the heavy render bundle. Split so the `Resident` and `Sequential`
+/// paths hand the render body the exact same [`QwenHeavy`] borrow.
+struct ResidentComponents {
     text_encoder: QwenTextEncoder,
+    heavy: QwenHeavyOwned,
+}
+
+/// The heavy render-phase components (the MMDiT transformer, the VAE, and the optional PiD decoder) —
+/// everything but the text encoder. Owned by the `Resident` components or by a `Sequential` generate.
+struct QwenHeavyOwned {
     transformer: QwenTransformer,
     vae: QwenVae,
     /// Optional PiD super-resolving decoder (epic 7840, sc-7845), loaded when `spec.pid` is set;
@@ -86,37 +118,112 @@ pub struct QwenImage {
     pid: Option<PidEngine>,
 }
 
+/// A borrow of the heavy render-phase components, so the denoise/decode body runs identically
+/// whether they are held resident or were just loaded by the `Sequential` path (candle's `DitRef`).
+struct QwenHeavy<'a> {
+    transformer: &'a QwenTransformer,
+    vae: &'a QwenVae,
+    pid: Option<&'a PidEngine>,
+}
+
+impl QwenHeavyOwned {
+    fn as_ref(&self) -> QwenHeavy<'_> {
+        QwenHeavy {
+            transformer: &self.transformer,
+            vae: &self.vae,
+            pid: self.pid.as_ref(),
+        }
+    }
+}
+
 /// Construct a [`QwenImage`] from a [`LoadSpec`].
 ///
 /// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a `Qwen/Qwen-Image` snapshot (the
 /// diffusers multi-component tree). Weights load dense at their on-disk dtype (bf16); the text
 /// encoder promotes to f32 internally. `spec.quantize` (Q4/Q8) quantizes the transformer only
-/// (group_size 64) — the fork's full `quantize=N` scope (sc-2565; see the inline note below). An
-/// fp32 precision override is not wired (the validated dense path is bf16) and is rejected rather
-/// than silently ignored.
+/// (group_size 64) — the fork's full `quantize=N` scope (sc-2565; see the inline note in
+/// [`load_heavy`]). An fp32 precision override is not wired (the validated dense path is bf16) and
+/// is rejected rather than silently ignored.
+///
+/// Component residency (epic 10834 Phase 1, sc-11000): `Resident` (default) builds every heavy
+/// component now via [`load_components`] and holds it warm; `Sequential` keeps only the spec and
+/// re-loads per generate in phase order (encode → drop the text encoder → denoise/decode) to bound
+/// peak memory to `max(text-encoder, DiT+VAE)`. Both use the same per-phase loaders, so the
+/// components are byte-identical.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    let (tokenizer, residency) = match spec.offload_policy {
+        OffloadPolicy::Resident => {
+            let c = load_components(spec)?;
+            (
+                c.tokenizer,
+                Residency::Resident(Box::new(ResidentComponents {
+                    text_encoder: c.text_encoder,
+                    heavy: QwenHeavyOwned {
+                        transformer: c.transformer,
+                        vae: c.vae,
+                        pid: c.pid,
+                    },
+                })),
+            )
+        }
+        OffloadPolicy::Sequential => {
+            // Validate precision + snapshot dir up front (fail fast, same as `Resident`); the heavy
+            // build is deferred to each generate.
+            let root = resolve_root(spec)?;
+            (
+                loader::load_tokenizer(root)?,
+                Residency::Sequential(Box::new(spec.clone())),
+            )
+        }
+    };
+    Ok(Box::new(QwenImage {
+        descriptor: descriptor(),
+        tokenizer,
+        residency,
+    }))
+}
+
+/// Precision guard (only dense bf16 is wired) + snapshot-dir resolution (rejecting a single-file
+/// source), shared by [`load_components`] and the `Sequential` per-phase loaders (sc-11000).
+fn resolve_root(spec: &LoadSpec) -> Result<&Path> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "qwen_image: only dense bf16 is wired in the Rust port (drop the precision override)"
                 .into(),
         ));
     }
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p,
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "qwen_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ \
-                 vae/), not a single .safetensors file"
-                    .into(),
-            )),
-        };
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(
+            "qwen_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ \
+             vae/), not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// Load the Qwen2.5-VL text encoder — the phase-A component dropped first under `Sequential`.
+/// Qwen-Image quantizes the **transformer only** (the fork marks the `text_encoder` component
+/// `skip_quantization=True` — "Quantization causes significant semantic degradation"), so unlike
+/// Z-Image the encoder is never quantized; the `Resident` and `Sequential` paths build byte-identical
+/// encoders.
+fn load_text_encoder_only(root: &Path) -> Result<QwenTextEncoder> {
+    loader::load_text_encoder(root)
+}
+
+/// Load the heavy render-phase components — MMDiT transformer (+ Q4/Q8 + LoRA/LoKr residuals), VAE,
+/// and the optional PiD overlay — everything but the text encoder. Factored so the `Sequential`
+/// path loads these AFTER the encoder is dropped (bounding peak to `max(text-encoder, DiT+VAE)`).
+/// Quantize-then-adapters order matches the pre-sc-11000 `load`; the components are independent of
+/// the text encoder (separate weight files, deterministic RNG-free quant), so the `Resident`
+/// composition is byte-identical.
+fn load_heavy(spec: &LoadSpec, root: &Path) -> Result<QwenHeavyOwned> {
     // Q4/Q8 quantizes the **transformer only** (group_size 64) after the dense bf16 load. This is
     // the fork's full `quantize=N` scope, not a descope (sc-2565): `QwenWeightDefinition` marks the
-    // `text_encoder` component `skip_quantization=True` ("Quantization causes significant semantic
-    // degradation"), so its Linears/Embedding are never quantized; and the VAE is all-conv
-    // (`nn.Conv2d`/`Conv3d` lack `to_quantized`), so the fork's `nn.quantize(vae)` is a no-op. The
-    // transformer is the only component with quantizable leaves. (Z-Image differs — its fork *does*
-    // quantize the TE+VAE, hence sc-2532; do not generalize that here.)
+    // `text_encoder` component `skip_quantization=True`, and the VAE is all-conv (`nn.Conv2d`/
+    // `Conv3d` lack `to_quantized`), so the fork's `nn.quantize(vae)` is a no-op. The transformer is
+    // the only component with quantizable leaves. (Z-Image differs — its fork *does* quantize the
+    // TE+VAE, hence sc-2532; do not generalize that here.)
     let mut transformer = loader::load_transformer(root)?;
     if let Some(q) = spec.quantize {
         // F-076: reject a requested-vs-packed quant-tier mismatch instead of silently serving the
@@ -138,14 +245,36 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         .as_ref()
         .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
         .transpose()?;
-    Ok(Box::new(QwenImage {
-        descriptor: descriptor(),
-        tokenizer: loader::load_tokenizer(root)?,
-        text_encoder: loader::load_text_encoder(root)?,
+    let vae = loader::load_vae(root)?;
+    Ok(QwenHeavyOwned {
         transformer,
-        vae: loader::load_vae(root)?,
+        vae,
         pid,
-    }))
+    })
+}
+
+/// The Qwen-Image components loaded from a snapshot for the `Resident` path — composed (sc-11000)
+/// from the same per-phase loaders the `Sequential` residency uses, so both build the identical set.
+struct QwenComponents {
+    tokenizer: TextTokenizer,
+    text_encoder: QwenTextEncoder,
+    transformer: QwenTransformer,
+    vae: QwenVae,
+    pid: Option<PidEngine>,
+}
+
+fn load_components(spec: &LoadSpec) -> Result<QwenComponents> {
+    let root = resolve_root(spec)?;
+    let text_encoder = load_text_encoder_only(root)?;
+    let heavy = load_heavy(spec, root)?;
+    let tokenizer = loader::load_tokenizer(root)?;
+    Ok(QwenComponents {
+        tokenizer,
+        text_encoder,
+        transformer: heavy.transformer,
+        vae: heavy.vae,
+        pid: heavy.pid,
+    })
 }
 
 impl QwenImage {
@@ -180,6 +309,76 @@ mlx_gen::impl_generator!(QwenImage {
 });
 
 impl QwenImage {
+    /// Text-encode the positive (and, for true CFG, negative) prompts per the residency (epic 10834
+    /// Phase 1, sc-11000). `Resident` borrows the warm Qwen2.5-VL encoder (byte-identical to the
+    /// pre-sc-11000 calls); `Sequential` loads it, encodes both prompts, forces materialization
+    /// (`eval`), then DROPS the encoder + `clear_cache()` so its ~15 GB frees before the DiT loads.
+    /// `neg` is `None` under Lightning (CFG-distilled → a single forward/step).
+    fn encode(
+        &self,
+        req: &GenerationRequest,
+        is_lightning: bool,
+    ) -> Result<(mlx_rs::Array, Option<mlx_rs::Array>)> {
+        // Positive conditioning (bf16) always; the negative branch is only built for true CFG.
+        let encode_both = |te: &QwenTextEncoder| -> Result<(mlx_rs::Array, Option<mlx_rs::Array>)> {
+            let pos = encode_prompt(&self.tokenizer, te, &req.prompt, MODEL_ID)?;
+            let neg = if is_lightning {
+                None
+            } else {
+                Some(encode_prompt(
+                    &self.tokenizer,
+                    te,
+                    negative_or_fallback(req),
+                    MODEL_ID,
+                )?)
+            };
+            Ok((pos, neg))
+        };
+        match &self.residency {
+            Residency::Resident(c) => encode_both(&c.text_encoder),
+            Residency::Sequential(spec) => {
+                let root = resolve_root(spec)?;
+                let te = load_text_encoder_only(root)?;
+                let (pos, neg) = encode_both(&te)?;
+                // MLX is lazy — materialize NOW while `te` is alive, else `pos`/`neg` keep the encoder
+                // weights referenced through the graph and the drop frees nothing (cf. Wan's
+                // `encode_text_staged` / Z-Image's `encode`).
+                match &neg {
+                    Some(neg) => mlx_rs::transforms::eval([&pos, neg])?,
+                    None => mlx_rs::transforms::eval([&pos])?,
+                }
+                drop(te);
+                mlx_rs::memory::clear_cache();
+                Ok((pos, neg))
+            }
+        }
+    }
+
+    /// Load the heavy render components (DiT + VAE + PiD) for a `Sequential` job — after
+    /// [`Self::encode`] dropped the text encoder — or `None` under `Resident` (already held). Kept
+    /// separate from [`Self::heavy`] so the owned bundle outlives the render-body borrow.
+    fn load_seq_heavy(&self) -> Result<Option<QwenHeavyOwned>> {
+        match &self.residency {
+            Residency::Resident(_) => Ok(None),
+            Residency::Sequential(spec) => {
+                let root = resolve_root(spec)?;
+                Ok(Some(load_heavy(spec, root)?))
+            }
+        }
+    }
+
+    /// Borrow the heavy render components: the warm bundle under `Resident`, or the just-loaded
+    /// `seq_heavy` under `Sequential`. The render body is written once against this borrow.
+    fn heavy<'a>(&'a self, seq_heavy: &'a Option<QwenHeavyOwned>) -> QwenHeavy<'a> {
+        match (&self.residency, seq_heavy) {
+            (Residency::Resident(c), _) => c.heavy.as_ref(),
+            (_, Some(owned)) => owned.as_ref(),
+            (Residency::Sequential(_), None) => {
+                unreachable!("Sequential residency always loads seq_heavy before rendering")
+            }
+        }
+    }
+
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
@@ -210,27 +409,26 @@ impl QwenImage {
             ));
         }
 
-        // Positive conditioning (bf16) always. The negative branch is only built for true CFG; the
-        // Lightning LoRAs are CFG-distilled, so Lightning runs CFG-off (a single forward/step).
-        let pos = encode_prompt(&self.tokenizer, &self.text_encoder, &req.prompt, MODEL_ID)?;
-        let neg = if params.is_lightning {
-            None
-        } else {
-            Some(encode_prompt(
-                &self.tokenizer,
-                &self.text_encoder,
-                negative_or_fallback(req),
-                MODEL_ID,
-            )?)
-        };
+        // Phase A: prompt → embeds (epic 10834 Phase 1, sc-11000). Under `Sequential` this loads the
+        // Qwen2.5-VL encoder, encodes pos+neg, forces materialization, then DROPS it + `clear_cache()`
+        // so its ~15 GB frees before the DiT/VAE load below — the peak-bounding win. Under `Resident`
+        // it borrows the warm encoder. See `Self::encode`.
+        let (pos, neg) = self.encode(req, params.is_lightning)?;
+
+        // Establish the heavy render components (DiT + VAE + PiD). `Resident` borrows the warm bundle;
+        // `Sequential` loads it NOW — after the encoder was dropped — and frees it when the job ends.
+        // The denoise/decode body below runs identically for both residencies.
+        let seq_heavy = self.load_seq_heavy()?;
+        let heavy = self.heavy(&seq_heavy);
 
         // VAE-encode the init image to packed clean latents (f32) ONCE — it's seed-independent
         // (LANCZOS resize + a full VAE encode), so doing it inside the per-image loop ran the encoder
-        // `count` times for identical output (F-118).
+        // `count` times for identical output (F-118). Under `Sequential` this runs after the text
+        // encoder was dropped and the VAE loaded — independent of `pos`/`neg`, so byte-identical.
         let clean = if is_img2img {
             let (image, _) = reference.expect("is_img2img implies a reference");
             Some(encode_init_latents(
-                &self.vae, image, req.width, req.height,
+                heavy.vae, image, req.width, req.height,
             )?)
         } else {
             None
@@ -242,7 +440,7 @@ impl QwenImage {
         // step; otherwise the clean σ=0 full-denoise path (`capture_sigma = 0`, full schedule).
         let (capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, start_step);
         let pid_decoder = resolve_pid_decoder_at_sigma(
-            self.pid.as_ref(),
+            heavy.pid,
             req,
             params.base_seed,
             MODEL_ID,
@@ -250,7 +448,7 @@ impl QwenImage {
         )?;
         let decoder: &dyn LatentDecoder = match &pid_decoder {
             Some(d) => d,
-            None => &self.vae,
+            None => heavy.vae,
         };
         let denoise_sigmas = &params.sigmas[..keep];
         let images = decode_and_collect(
@@ -274,7 +472,7 @@ impl QwenImage {
                     None => noise,
                 };
                 denoise_with_progress(
-                    &self.transformer,
+                    heavy.transformer,
                     params.sampler_name.as_deref(),
                     denoise_sigmas,
                     seed,
@@ -290,6 +488,15 @@ impl QwenImage {
                 )
             },
         )?;
+        // Sequential (sc-11000): free the DiT/VAE/PiD working set now that every image is rendered,
+        // then `clear_cache()` to return the pages to the OS. `heavy` (a struct of borrows) is unused
+        // past the render, so NLL has already ended its borrow of `seq_heavy`; dropping the owned
+        // bundle frees the components before `clear_cache()`. Resident is a no-op (`seq_heavy` None).
+        let was_sequential = seq_heavy.is_some();
+        drop(seq_heavy);
+        if was_sequential {
+            mlx_rs::memory::clear_cache();
+        }
         Ok(GenerationOutput::Images(images))
     }
 }
