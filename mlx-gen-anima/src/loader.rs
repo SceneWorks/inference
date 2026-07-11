@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
+use mlx_rs::Dtype;
+
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result, WeightsSource};
 
@@ -134,4 +136,61 @@ impl AnimaComponents {
             tokenizers,
         })
     }
+}
+
+/// Build a `Weights` holding an fp-cast copy of ONLY the keys containing `marker` (avoids
+/// materializing the full DiT in fp32 just to reach the bundled conditioner).
+fn cast_subset(w: &Weights, marker: &str, dtype: Dtype) -> Result<Weights> {
+    let keys: Vec<String> = w
+        .keys()
+        .filter(|k| k.contains(marker))
+        .map(String::from)
+        .collect();
+    let mut out = Weights::empty();
+    for k in keys {
+        out.insert(k.clone(), w.require(&k)?.as_dtype(dtype)?);
+    }
+    Ok(out)
+}
+
+/// Load ONLY the conditioning stack — the Qwen3 text encoder + the bundled `AnimaTextConditioner` —
+/// for `variant` at a chosen **compute dtype** (sc-10577). Anima's on-disk TE + conditioner weights are
+/// bf16; passing [`Dtype::Float32`] upcasts every one to fp32, mirroring the diffusers reference's
+/// `.float()`, to build the **fp32-TE reference variant** used to isolate the bf16-conditioning parity
+/// offset. [`Dtype::Bfloat16`] reproduces the resident production modules (the cast is a no-op).
+///
+/// This is a **measurement path**, not the production load: an fp32 copy ~doubles the TE + conditioner
+/// memory, so [`AnimaComponents::load`] keeps them bf16 and this is only reached from the sc-10577
+/// parity harness. Returns `(text_encoder, conditioner)`.
+pub fn load_conditioning_at_dtype(
+    source: &WeightsSource,
+    variant: Variant,
+    dtype: Dtype,
+) -> Result<(AnimaQwen3, AnimaTextConditioner)> {
+    let root = resolve_split_files(source)?;
+
+    // Conditioner: bundled in the DiT file under `{prefix}.llm_adapter.*`. Cast only those keys.
+    let dit_path = root.join("diffusion_models").join(variant.dit_filename());
+    if !dit_path.is_file() {
+        return Err(Error::Msg(format!(
+            "anima: DiT file not found: {}",
+            dit_path.display()
+        )));
+    }
+    let dit_weights = Weights::from_file(&dit_path)?;
+    let prefix = detect_dit_prefix(&dit_weights)?;
+    let cond_weights = cast_subset(&dit_weights, ADAPTER_MARKER, dtype)?;
+    let conditioner = AnimaTextConditioner::from_weights(
+        &cond_weights,
+        &format!("{prefix}.llm_adapter"),
+        ConditionerConfig::anima(),
+    )?;
+
+    // Text encoder: its own file. The whole tower runs at `dtype`, so cast every weight.
+    let mut te_weights = Weights::from_file(root.join(TEXT_ENCODER_FILE))?;
+    te_weights.cast_all(dtype)?;
+    let text_encoder =
+        AnimaQwen3::from_weights_dtype(&te_weights, "model", &Qwen3Config::anima(), dtype)?;
+
+    Ok((text_encoder, conditioner))
 }
