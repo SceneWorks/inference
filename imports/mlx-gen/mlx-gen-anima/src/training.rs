@@ -652,6 +652,12 @@ impl AnimaTrainer {
                         ),
                     }
                 }
+                // sc-5567 — release the preview's transient forward+VAE-decode residency before
+                // training resumes. MLX pools freed buffers, so a full `sample_steps` denoise plus
+                // VAE decode on the 2B DiT can push peak residency above the train steady state and
+                // SIGKILL a tightly-budgeted run (sc-10576 memory focus). Preview path only — the
+                // training-step working set is untouched.
+                mlx_rs::memory::clear_cache();
             }
         }
 
