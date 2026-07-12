@@ -204,7 +204,7 @@ fn merge_lora_file(
             Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
             Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
             Some((path, Role::Alpha)) => {
-                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
             }
             None => report.skipped_keys += 1,
         }
@@ -285,7 +285,9 @@ fn merge_lokr_file(
         // factors so it can inform that module's scale.
         if let Some(stem) = key.strip_suffix(".alpha") {
             match resolve_lokr_module(stem, table) {
-                Some(path) => grouped.entry(path).or_default().alpha = Some(read_scalar(key, t)?),
+                Some(path) => {
+                    grouped.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
+                }
                 None => report.skipped_keys += 1,
             }
             continue;
@@ -528,7 +530,7 @@ fn resolve_lora_file(
             Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
             Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
             Some((path, Role::Alpha)) => {
-                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
             }
             None => *skipped_keys += 1,
         }
@@ -581,7 +583,9 @@ fn resolve_lokr_file(
     for (key, t) in &af.tensors {
         if let Some(stem) = key.strip_suffix(".alpha") {
             match resolve_lokr_module(stem, table) {
-                Some(path) => grouped.entry(path).or_default().alpha = Some(read_scalar(key, t)?),
+                Some(path) => {
+                    grouped.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
+                }
                 None => *skipped_keys += 1,
             }
             continue;
