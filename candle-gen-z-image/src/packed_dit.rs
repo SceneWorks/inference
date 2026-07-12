@@ -26,7 +26,15 @@
 use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_gen::candle_nn::{RmsNorm, VarBuilder};
 
-use crate::quant::QLinear;
+// The projection type is the shared residual-capable [`candle_gen::quant::AdaptLinear`] (sc-11105),
+// aliased to the crate-local `QLinear` name so every `linear_detect` call site below stays unchanged.
+// It carries an optional **forward-time additive LoRA/LoKr residual**, so a user LoRA (or the distill)
+// can apply on a **packed q4/q8** tier with the base kept packed — the deltas ride unmerged, never
+// folded into u32 codes ([`crate::adapters::install_additive`], mirroring qwen-image-edit in sc-11091).
+// With no adapter attached the forward is byte-identical to the bare base, so the dense-parity test and
+// every packed load are unchanged. (The crate's other packed seams — `packed_te`, the VAE dequant — keep
+// using the plain `crate::quant::QLinear` enum; only the DiT needs the residual surface.)
+use candle_gen::quant::AdaptLinear as QLinear;
 
 // Reused verbatim from candle-transformers — frozen sub-modules + the patchify/RoPE helpers that hold
 // no packed projection (identical reuse to `crate::dit`). Vendoring these would add drift for zero
@@ -84,6 +92,19 @@ impl TimestepEmbedder {
         let t_freq = self.timestep_embedding(t, device, self.dtype)?;
         let h = self.linear1.forward(&t_freq)?.silu()?;
         self.linear2.forward(&h)
+    }
+
+    /// Visit the two timestep-embedder projections (`{prefix}.mlp.0`, `{prefix}.mlp.2`) — dense in the
+    /// MLX tier, but part of the general adaptable surface so a user LoRA that targets them applies
+    /// additively on the dense base (equals the fold to f32 tolerance — sc-11105).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.mlp.0"), &mut self.linear1)?;
+        f(&format!("{prefix}.mlp.2"), &mut self.linear2)?;
+        Ok(())
     }
 }
 
@@ -174,6 +195,20 @@ impl ZImageAttention {
 
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
         self.to_out.forward(&context)
+    }
+
+    /// Visit the four attention projections (`{prefix}.to_q/to_k/to_v/to_out.0`) — the surface the
+    /// Z-Image trainer's LoRA/LoKr adapts (sc-11105). `to_out` carries the diffusers `.0` suffix.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.to_q"), &mut self.to_q)?;
+        f(&format!("{prefix}.to_k"), &mut self.to_k)?;
+        f(&format!("{prefix}.to_v"), &mut self.to_v)?;
+        f(&format!("{prefix}.to_out.0"), &mut self.to_out)?;
+        Ok(())
     }
 
     /// Attention dispatch. The Z-Image DiT **always** passes an attention mask (from `prepare_inputs`),
@@ -280,6 +315,18 @@ impl FeedForward {
         let x3 = self.w3.forward(x)?;
         self.w2.forward(&(x1 * x3)?)
     }
+
+    /// Visit the three SwiGLU projections (`{prefix}.w1/w2/w3`) — part of the adaptable surface (sc-11105).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.w1"), &mut self.w1)?;
+        f(&format!("{prefix}.w2"), &mut self.w2)?;
+        f(&format!("{prefix}.w3"), &mut self.w3)?;
+        Ok(())
+    }
 }
 
 // ==================== FinalLayer (packed seam) ====================
@@ -312,6 +359,21 @@ impl FinalLayer {
         let scale = (scale + 1.0)?.unsqueeze(1)?;
         let x = self.norm_final.forward(x)?.broadcast_mul(&scale)?;
         self.linear.forward(&x)
+    }
+
+    /// Visit the output-head projections (`{prefix}.linear`, `{prefix}.adaLN_modulation.1`) — part of
+    /// the adaptable surface (sc-11105). `norm_final` is param-free, not a projection.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.linear"), &mut self.linear)?;
+        f(
+            &format!("{prefix}.adaLN_modulation.1"),
+            &mut self.adaln_silu,
+        )?;
+        Ok(())
     }
 }
 
@@ -411,6 +473,24 @@ impl ZImageTransformerBlock {
             let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
             x + ffn_out
         }
+    }
+
+    /// Visit every adaptable projection in the block under `{prefix}` — the attention + feed-forward
+    /// projections, plus the optional `{prefix}.adaLN_modulation.0` (the four RMSNorms are dense, not
+    /// projections). sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.attention
+            .visit_adaptable_mut(&format!("{prefix}.attention"), f)?;
+        self.feed_forward
+            .visit_adaptable_mut(&format!("{prefix}.feed_forward"), f)?;
+        if let Some(adaln) = self.adaln_modulation.as_mut() {
+            f(&format!("{prefix}.adaLN_modulation.0"), adaln)?;
+        }
+        Ok(())
     }
 }
 
@@ -593,6 +673,39 @@ impl ZImageTransformer2DModel {
             self.cfg.in_channels,
         )
     }
+
+    /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
+    /// moved here at install (else the residual matmul is a device mismatch). sc-11105.
+    pub fn device(&self) -> &Device {
+        self.x_pad_token.device()
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the projection's
+    /// canonical DiT dotted path — the same paths [`crate::adapters::classify_lora_key`] resolves a LoRA
+    /// key to (the embedders, the per-block attention/feed-forward/adaLN projections across the three
+    /// stacks, and the final layer). The additive installer
+    /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
+    /// projection so a user adapter applies on a packed q4/q8 tier with the base kept packed (sc-11105).
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f("cap_embedder.1", &mut self.cap_embedder_linear)?;
+        f("all_x_embedder.2-1", &mut self.x_embedder)?;
+        self.t_embedder.visit_adaptable_mut("t_embedder", f)?;
+        for (i, blk) in self.noise_refiner.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("noise_refiner.{i}"), f)?;
+        }
+        for (i, blk) in self.context_refiner.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("context_refiner.{i}"), f)?;
+        }
+        for (i, blk) in self.layers.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+        }
+        self.final_layer
+            .visit_adaptable_mut("all_final_layer.2-1", f)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -671,6 +784,150 @@ mod parity_tests {
         assert!(
             diff < 1e-5,
             "vendored dense DiT diverged from stock by {diff}"
+        );
+    }
+
+    /// **Additive install on the vendored DiT (sc-11105).** A bare-dotted LoRA over two real `layers.0`
+    /// attention projections installs as forward-time residuals: the report counts both, the DiT forward
+    /// shifts vs the un-adapted model, and no target is left unresolved — proving the visitor's canonical
+    /// paths line up with `adapters::classify_lora_key` (a path mismatch would apply nothing and error).
+    /// This exercises the packed-tier install wiring end-to-end on a dense-base fixture; the base-agnostic
+    /// additive path is byte-equal on a packed base (the stays-packed / exact-residual property is proven
+    /// at the `candle_gen::quant::AdaptLinear` unit level).
+    #[test]
+    fn install_additive_lora_on_vendored_dit_applies_and_shifts() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        use std::collections::HashMap as Map;
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        // Two DiTs from the SAME params: one baseline, one adapted.
+        let base = ZImageTransformer2DModel::new(&cfg, vb.clone()).unwrap();
+        let mut adapted = ZImageTransformer2DModel::new(&cfg, vb).unwrap();
+
+        // A LoRA over layers.0 `to_q` + `to_v` (both [dim, dim] at this tiny cfg), bare-dotted.
+        let (out_dim, in_dim, rank) = (cfg.dim, cfg.dim, 2usize);
+        let mut map: Map<String, Tensor> = Map::new();
+        for proj in ["to_q", "to_v"] {
+            let path = format!("layers.0.attention.{proj}");
+            map.insert(
+                format!("{path}.lora_A.weight"),
+                Tensor::randn(0f32, 0.5f32, (rank, in_dim), &dev).unwrap(),
+            );
+            map.insert(
+                format!("{path}.lora_B.weight"),
+                Tensor::randn(0f32, 0.5f32, (out_dim, rank), &dev).unwrap(),
+            );
+        }
+        let tmp = std::env::temp_dir().join(format!(
+            "sc11105_install_{}.safetensors",
+            std::process::id()
+        ));
+        candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
+        let report = crate::adapters::install_additive(
+            &mut adapted,
+            &[AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lora)],
+        )
+        .unwrap();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(report.applied, 2, "both to_q + to_v residuals installed");
+        assert!(
+            report.skipped_targets.is_empty(),
+            "no unresolved targets (visitor paths match classify)"
+        );
+
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let y_base = base
+            .forward(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+            )
+            .unwrap();
+        let y_adapt = adapted
+            .forward(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+            )
+            .unwrap();
+        let shift = (y_adapt - y_base)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            shift > 1e-4,
+            "additive LoRA did not shift the DiT forward ({shift})"
+        );
+    }
+
+    /// [`crate::adapters::install_additive`] rejects an off-surface LoRA (no DiT target matched) and a
+    /// LoHa adapter (no allocation-free structured form on a packed tier) — the loud guards that keep a
+    /// misconfigured adapter from silently rendering unadapted on the packed tier (sc-11105).
+    #[test]
+    fn install_additive_rejects_off_surface_and_loha() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        use std::collections::HashMap as Map;
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+
+        // Off-surface: a nonexistent block → no target matched → err.
+        let mut dit = ZImageTransformer2DModel::new(&cfg, vb.clone()).unwrap();
+        let mut off: Map<String, Tensor> = Map::new();
+        off.insert(
+            "layers.99.attention.to_q.lora_A.weight".into(),
+            Tensor::zeros((2, cfg.dim), DType::F32, &dev).unwrap(),
+        );
+        off.insert(
+            "layers.99.attention.to_q.lora_B.weight".into(),
+            Tensor::zeros((cfg.dim, 2), DType::F32, &dev).unwrap(),
+        );
+        let tmp1 =
+            std::env::temp_dir().join(format!("sc11105_off_{}.safetensors", std::process::id()));
+        candle_gen::candle_core::safetensors::save(&off, &tmp1).unwrap();
+        let r = crate::adapters::install_additive(
+            &mut dit,
+            &[AdapterSpec::new(tmp1.clone(), 1.0, AdapterKind::Lora)],
+        );
+        std::fs::remove_file(&tmp1).ok();
+        assert!(
+            r.is_err(),
+            "an off-surface LoRA must error (no target matched)"
+        );
+
+        // LoHa: `hada_*` keys → rejected with a pointer to the dense tier.
+        let mut dit2 = ZImageTransformer2DModel::new(&cfg, vb).unwrap();
+        let mut loha: Map<String, Tensor> = Map::new();
+        let path = "layers.0.attention.to_q";
+        for k in ["hada_w1_a", "hada_w1_b", "hada_w2_a", "hada_w2_b"] {
+            loha.insert(
+                format!("{path}.{k}"),
+                Tensor::zeros((cfg.dim, 1), DType::F32, &dev).unwrap(),
+            );
+        }
+        let tmp2 =
+            std::env::temp_dir().join(format!("sc11105_loha_{}.safetensors", std::process::id()));
+        candle_gen::candle_core::safetensors::save(&loha, &tmp2).unwrap();
+        let r2 = crate::adapters::install_additive(
+            &mut dit2,
+            &[AdapterSpec::new(tmp2.clone(), 1.0, AdapterKind::Lora)],
+        );
+        std::fs::remove_file(&tmp2).ok();
+        assert!(
+            r2.is_err(),
+            "a LoHa adapter must be rejected on the packed additive path"
         );
     }
 }

@@ -292,19 +292,10 @@ impl Pipeline {
         // `quantization` block in each component's `config.json`; on detection the TE + DiT + VAE load
         // **straight from the packed parts** (sc-9408, no dense bf16 staging). A dense snapshot
         // (`Tongyi-MAI/Z-Image-Turbo`, no `quantization` block) takes the stock path unchanged. Adapters
-        // (LoRA/LoKr) are a dense-only path (they merge into dense DiT weights), so a packed tier is not
-        // combined with adapters — `load` rejects that combination.
+        // (LoRA/LoKr) fold into *dense* DiT weights on the dense tier; on a **packed** tier they ride as
+        // **forward-time additive residuals** on the packed base (sc-11105), so a user LoRA no longer
+        // forces a full dense build.
         let packed = self.component_is_packed("transformer")?;
-
-        // A packed tier is a dense-free load; LoRA/LoKr merge into *dense* DiT weights, so the two are
-        // incompatible. Reject loudly rather than silently ignore the adapters on the packed path.
-        if packed && !self.adapters.is_empty() {
-            return Err(CandleError::Msg(
-                "z-image: LoRA/LoKr adapters are not supported on a pre-quantized (packed) tier — \
-                 use a dense bf16 snapshot for adapter merge"
-                    .into(),
-            ));
-        }
 
         let text_encoder = if self.component_is_packed("text_encoder")? {
             let vb = self.component_vb("text_encoder")?;
@@ -319,19 +310,28 @@ impl Pipeline {
 
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
-        let transformer = if packed {
-            // Packed tier: build the vendored packed-detect DiT straight from the packed parts. Adapters
-            // are incompatible with a packed tier (rejected at load), so no merge path here.
+        let transformer = if packed || !self.adapters.is_empty() {
+            // A packed tier OR any adapter load builds the **vendored** packed-detect DiT: a packed tier
+            // loads straight from the packed parts; a dense tier loads bf16 unchanged (the vendored dense
+            // forward is byte-identical to the stock model — `packed_dit::parity_tests`). Any adapters
+            // install as **forward-time additive residuals** on that base (sc-11105, additive-everywhere
+            // for epic 10765): the base is never folded — a packed base stays packed, a dense base stays
+            // an unmutated mmap — so a user LoRA never pins an un-evictable folded weight (the fold path,
+            // `merge_adapters`, is retained as a public utility but no longer on the load path). Additive
+            // equals the old dense fold to f32 tolerance (~1 ULP). The stock model can't carry residuals,
+            // so an adapter load on a dense tier uses the vendored DiT here.
             let vb = self.component_vb("transformer")?;
-            DiT::Packed(Box::new(PackedDit::new(&dit_cfg, vb)?))
+            let mut dit = PackedDit::new(&dit_cfg, vb)?;
+            if !self.adapters.is_empty() {
+                crate::adapters::install_additive(&mut dit, &self.adapters)?;
+            }
+            DiT::Packed(Box::new(dit))
         } else {
-            let dit_vb = if self.adapters.is_empty() {
-                // No adapters: the stock mmap build — byte-identical to the pre-sc-5166 path.
-                self.component_vb("transformer")?
-            } else {
-                self.transformer_vb_with_adapters()?
-            };
-            DiT::Dense(Box::new(ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?))
+            // Dense tier, no adapters: the stock candle-transformers model (byte-identical fast path).
+            DiT::Dense(Box::new(ZImageTransformer2DModel::new(
+                &dit_cfg,
+                self.component_vb("transformer")?,
+            )?))
         };
 
         // The VAE packs only its 8 tiny (512×64) mid-block attention projections; rather than vendor the
@@ -366,9 +366,8 @@ impl Pipeline {
     }
 
     /// Load the three heavy components from an in-place ComfyUI install (sc-10668): the DiT and VAE are
-    /// key-remapped in memory ([`crate::comfyui`]) then built via `VarBuilder::from_tensors` (the same
-    /// in-memory path [`transformer_vb_with_adapters`](Self::transformer_vb_with_adapters) uses for LoRA
-    /// merge); the Qwen3 text encoder loads verbatim from its ComfyUI file (standard HF layout); the
+    /// key-remapped in memory ([`crate::comfyui`]) then built via `VarBuilder::from_tensors`; the Qwen3
+    /// text encoder loads verbatim from its ComfyUI file (standard HF layout); the
     /// tokenizer comes from our shipped snapshot. Dense bf16 only — the fp8/scaled-fp8/GGUF quant slices
     /// (sc-10670/10671/10672/10680/10681) add a dequant step ahead of the same key remaps.
     fn load_comfyui_components(
@@ -515,22 +514,6 @@ impl Pipeline {
     fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
         let files = self.component_files(sub)?;
         candle_gen::mmap_var_builder(&files, self.dtype, &self.device)
-    }
-
-    /// Build the DiT [`VarBuilder`] with the LoRA/LoKr [`AdapterSpec`]s merged into its weights
-    /// (sc-5166). The base `transformer/` tensors are loaded into a CPU map, each adapter's delta is
-    /// folded in ([`crate::adapters::merge_adapters`], f32 math), then the stock candle DiT is built
-    /// from the merged map — **merge, not residual** (Z-Image's flow-match sampler is chaos-sensitive;
-    /// `(W+δ)·x` ≠ `W·x + δ·x` to ~1 ULP). Only reached when adapters are present.
-    fn transformer_vb_with_adapters(&self) -> Result<VarBuilder<'static>> {
-        let files = self.component_files("transformer")?;
-        let mut tensors: HashMap<String, Tensor> = HashMap::new();
-        for f in &files {
-            let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
-            tensors.extend(part);
-        }
-        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
-        Ok(VarBuilder::from_tensors(tensors, self.dtype, &self.device))
     }
 
     /// Build the standalone f32 VAE **encoder** for the base img2img / `Reference` path (sc-8646). The

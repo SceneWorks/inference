@@ -26,11 +26,19 @@
 //! 16-channel latent. C1 builds the FULL Large forward at real shapes; C2 drives it from a pipeline.
 
 use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_gen::candle_nn::{self, Linear, RmsNorm, VarBuilder};
+use candle_gen::candle_nn::{self, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
 
 use crate::config::Sd3Config;
-use crate::quant::{conv2d_to, linear_detect_dense, linear_to, rms_norm_to, QLinear};
+// The dense-leaf helpers stay the crate's shared `quant` seam; the residual-capable projection type is
+// the shared [`candle_gen::quant::AdaptLinear`] (sc-11105), aliased to `QLinear` so every `linear_detect`
+// / `quantize` / `quantize_dequant_onto` call site below stays unchanged. It carries an optional
+// forward-time additive LoRA/LoKr residual so a user LoRA applies on a **packed q4/q8** tier with the
+// base kept packed ([`crate::adapters::install_additive`]) — the deltas ride unmerged, never folded into
+// u32 codes. `AdaptLinear::quantize` no-ops on a packed base, so the dense→Q4/Q8 fold path is unchanged
+// and the residuals survive it. With no adapter the forward is byte-identical to the bare base.
+use crate::quant::{conv2d_to, linear_detect_dense, rms_norm_to};
+use candle_gen::quant::AdaptLinear as QLinear;
 
 /// Affine-free LayerNorm eps (diffusers `elementwise_affine=False, eps=1e-6` on the AdaLN norms).
 const LN_EPS: f64 = 1e-6;
@@ -86,34 +94,59 @@ fn timestep_embedding(t: &Tensor, dim: usize) -> Result<Tensor> {
 /// `timestep_embedding -> linear_1 -> silu -> linear_2`. Used by the timestep branch and the pooled
 /// text-projection branch of [`CombinedTimestepTextEmbed`].
 struct MlpEmbed {
-    linear_1: Linear,
-    linear_2: Linear,
+    linear_1: QLinear,
+    linear_2: QLinear,
+    /// The loaded (dense) weight dtype — the model compute dtype (`vb.dtype()`); the sinusoid/pooled
+    /// inputs arrive f32 and are cast to it. Stored (not read off `.weight()`) since the projections are
+    /// now the shared [`QLinear`]/`AdaptLinear`, which does not expose the base weight.
+    dtype: DType,
 }
 
 impl MlpEmbed {
     /// **Packed-detecting** (sc-9414): on a packed MLX tier the two embedder linears carry a `.scales`
-    /// sibling and are dequantized to full-precision dense `Linear`s via [`linear_detect_dense`]; on a
-    /// dense tier they are plain dense reads (unchanged). Kept dense either way — these are small
-    /// leaves the legacy fold never enumerates.
+    /// sibling and are dequantized to full-precision dense leaves via [`linear_detect_dense`]; on a
+    /// dense tier they are plain dense reads (unchanged). Kept **dense** either way — never quantized —
+    /// but wrapped as the residual-capable [`QLinear`] so a user LoRA over the embedders applies
+    /// additively (sc-11105).
     fn new(in_dim: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            linear_1: linear_detect_dense(in_dim, hidden, &vb, "linear_1", true)?,
-            linear_2: linear_detect_dense(hidden, hidden, &vb, "linear_2", true)?,
+            linear_1: QLinear::from_dense(
+                linear_detect_dense(in_dim, hidden, &vb, "linear_1", true)?,
+                in_dim,
+                hidden,
+            ),
+            linear_2: QLinear::from_dense(
+                linear_detect_dense(hidden, hidden, &vb, "linear_2", true)?,
+                hidden,
+                hidden,
+            ),
+            dtype: vb.dtype(),
         })
     }
 
-    /// CPU-stage migration (sc-8504): move both dense linears to `device`.
+    /// CPU-stage migration (sc-8504): move both dense leaves (+ any residual) to `device`.
     fn migrate_to(&mut self, device: &Device) -> Result<()> {
-        self.linear_1 = linear_to(&self.linear_1, device)?;
-        self.linear_2 = linear_to(&self.linear_2, device)?;
+        self.linear_1.to_device(device)?;
+        self.linear_2.to_device(device)?;
         Ok(())
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // The sinusoid / pooled inputs arrive in f32; cast to the (loaded) weight dtype so the matmul
+        // The sinusoid / pooled inputs arrive in f32; cast to the loaded weight dtype so the matmul
         // dtypes agree on real bf16 weights (sc-7881, C6).
-        let x = x.to_dtype(self.linear_1.weight().dtype())?;
+        let x = x.to_dtype(self.dtype)?;
         self.linear_2.forward(&self.linear_1.forward(&x)?.silu()?)
+    }
+
+    /// Visit the two embedder projections (`{prefix}.linear_1`, `{prefix}.linear_2`) — sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.linear_1"), &mut self.linear_1)?;
+        f(&format!("{prefix}.linear_2"), &mut self.linear_2)?;
+        Ok(())
     }
 }
 
@@ -141,6 +174,20 @@ impl CombinedTimestepTextEmbed {
     fn migrate_to(&mut self, device: &Device) -> Result<()> {
         self.timestep.migrate_to(device)?;
         self.text.migrate_to(device)
+    }
+
+    /// Visit both embedders' projections (`{prefix}.timestep_embedder.*`, `{prefix}.text_embedder.*`) —
+    /// sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.timestep
+            .visit_adaptable_mut(&format!("{prefix}.timestep_embedder"), f)?;
+        self.text
+            .visit_adaptable_mut(&format!("{prefix}.text_embedder"), f)?;
+        Ok(())
     }
 
     /// `timesteps` `[B]` (already ×1000), `pooled` `[B, pooled_dim]` → `temb [B, inner]`.
@@ -237,7 +284,7 @@ impl PatchEmbed {
 /// AdaLN-Zero: `silu(temb) -> linear -> n_chunks × [B,1,inner]`. The image norm uses 6 chunks; the
 /// non-final context norm uses 6; the final context norm uses 2 (scale, shift; `context_pre_only`).
 struct AdaLayerNormZero {
-    linear: Linear,
+    linear: QLinear,
     n_chunks: usize,
 }
 
@@ -246,16 +293,30 @@ impl AdaLayerNormZero {
         Ok(Self {
             // Packed-detecting dense (sc-9414): on a packed tier `linear.{scales,biases}` is present
             // (the converter packs every DiT Linear) and dequantized to a dense leaf; on a dense tier a
-            // plain read. Kept dense — the chaos-sensitive modulation linear stays full precision.
-            linear: linear_detect_dense(inner, n_chunks * inner, &vb, "linear", true)?,
+            // plain read. Kept **dense** (never quantized — the chaos-sensitive modulation linear stays
+            // full precision) but wrapped as the residual-capable [`QLinear`] so a user LoRA over the
+            // AdaLN modulation applies additively (sc-11105).
+            linear: QLinear::from_dense(
+                linear_detect_dense(inner, n_chunks * inner, &vb, "linear", true)?,
+                inner,
+                n_chunks * inner,
+            ),
             n_chunks,
         })
     }
 
-    /// CPU-stage migration (sc-8504): move the dense modulation linear to `device`.
+    /// CPU-stage migration (sc-8504): move the dense modulation leaf (+ any residual) to `device`.
     fn migrate_to(&mut self, device: &Device) -> Result<()> {
-        self.linear = linear_to(&self.linear, device)?;
-        Ok(())
+        self.linear.to_device(device)
+    }
+
+    /// Visit the AdaLN modulation projection (`{prefix}.linear`) — sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.linear"), &mut self.linear)
     }
 
     /// Returns the `n_chunks` modulation slices, each `[B,1,inner]`.
@@ -388,6 +449,28 @@ impl JointAttention {
         Ok(())
     }
 
+    /// Visit the joint-attention projections under `{prefix}` (`to_q/to_k/to_v/to_out.0` image stream +
+    /// `add_q_proj/add_k_proj/add_v_proj/to_add_out` text stream) — the surface a user LoRA/LoKr adapts
+    /// (sc-11105). The q/k/v are the SPLIT diffusers projections; a fused-QKV kohya LoRA is row-sliced
+    /// onto them by the installer. The per-head q/k RMSNorms are not projections.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.to_q"), &mut self.to_q)?;
+        f(&format!("{prefix}.to_k"), &mut self.to_k)?;
+        f(&format!("{prefix}.to_v"), &mut self.to_v)?;
+        f(&format!("{prefix}.to_out.0"), &mut self.to_out)?;
+        f(&format!("{prefix}.add_q_proj"), &mut self.add_q)?;
+        f(&format!("{prefix}.add_k_proj"), &mut self.add_k)?;
+        f(&format!("{prefix}.add_v_proj"), &mut self.add_v)?;
+        if let Some(p) = &mut self.to_add_out {
+            f(&format!("{prefix}.to_add_out"), p)?;
+        }
+        Ok(())
+    }
+
     /// CPU-stage path (sc-8504): quantize every projection **onto `device`** (dense never lands on the
     /// GPU) and migrate the dense-kept per-head q/k RMSNorms there too.
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
@@ -510,6 +593,19 @@ impl SelfAttention {
         Ok(())
     }
 
+    /// Visit the image-only `attn2` projections under `{prefix}` (`to_q/to_k/to_v/to_out.0`) — sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.to_q"), &mut self.to_q)?;
+        f(&format!("{prefix}.to_k"), &mut self.to_k)?;
+        f(&format!("{prefix}.to_v"), &mut self.to_v)?;
+        f(&format!("{prefix}.to_out.0"), &mut self.to_out)?;
+        Ok(())
+    }
+
     /// CPU-stage path (sc-8504): quantize the `attn2` projections **onto `device`** + migrate q/k norms.
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
         self.to_q.quantize_dequant_onto(quant, device)?;
@@ -554,6 +650,17 @@ impl FeedForward {
     fn quantize(&mut self, quant: Quant) -> Result<()> {
         self.proj.quantize(quant)?;
         self.out.quantize(quant)?;
+        Ok(())
+    }
+
+    /// Visit the two GELU-MLP projections under `{prefix}` (`net.0.proj`, `net.2`) — sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.net.0.proj"), &mut self.proj)?;
+        f(&format!("{prefix}.net.2"), &mut self.out)?;
         Ok(())
     }
 
@@ -639,6 +746,31 @@ impl JointBlock {
         if let Some(ffc) = &mut self.ff_context {
             ffc.quantize(quant)?;
         }
+        Ok(())
+    }
+
+    /// Visit every adaptable projection in the block under `{prefix}` — the joint attention, the dual
+    /// `attn2` (if present), the GELU MLP, the text-stream `ff_context` (if present), and the AdaLN
+    /// modulation linears (`norm1.linear` / `norm1_context.linear` — kept dense but residual-capable).
+    /// sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.attn
+            .visit_adaptable_mut(&format!("{prefix}.attn"), f)?;
+        if let Some(a2) = &mut self.attn2 {
+            a2.visit_adaptable_mut(&format!("{prefix}.attn2"), f)?;
+        }
+        self.ff.visit_adaptable_mut(&format!("{prefix}.ff"), f)?;
+        if let Some(ffc) = &mut self.ff_context {
+            ffc.visit_adaptable_mut(&format!("{prefix}.ff_context"), f)?;
+        }
+        self.norm1
+            .visit_adaptable_mut(&format!("{prefix}.norm1"), f)?;
+        self.norm1_context
+            .visit_adaptable_mut(&format!("{prefix}.norm1_context"), f)?;
         Ok(())
     }
 
@@ -750,7 +882,7 @@ impl JointBlock {
 /// shift and scrambles the predicted velocity into spatial noise (sc-7881, C6 — the epic-7841 AdaLN
 /// bug magnet, caught against real weights). Pinned by [`tests`].
 struct AdaLayerNormContinuous {
-    linear: Linear,
+    linear: QLinear,
 }
 
 impl AdaLayerNormContinuous {
@@ -758,15 +890,28 @@ impl AdaLayerNormContinuous {
         // diffusers `norm_out.norm` is an affine-free LayerNorm, so there are no norm weights to
         // load — `forward` runs the parameterless `layer_norm` then applies the AdaLN scale/shift.
         // Packed-detecting dense (sc-9414): dequantized to a dense leaf on a packed tier, plain read
-        // otherwise; kept dense (the chaos-sensitive AdaLN-continuous head).
-        let linear = linear_detect_dense(inner, 2 * inner, &vb, "linear", true)?;
+        // otherwise; kept **dense** (never quantized — the chaos-sensitive AdaLN-continuous head) but
+        // wrapped as the residual-capable [`QLinear`] so a user LoRA applies additively (sc-11105).
+        let linear = QLinear::from_dense(
+            linear_detect_dense(inner, 2 * inner, &vb, "linear", true)?,
+            inner,
+            2 * inner,
+        );
         Ok(Self { linear })
     }
 
-    /// CPU-stage migration (sc-8504): move the dense AdaLN-continuous linear to `device`.
+    /// CPU-stage migration (sc-8504): move the dense AdaLN-continuous leaf (+ any residual) to `device`.
     fn migrate_to(&mut self, device: &Device) -> Result<()> {
-        self.linear = linear_to(&self.linear, device)?;
-        Ok(())
+        self.linear.to_device(device)
+    }
+
+    /// Visit the AdaLN-continuous projection (`{prefix}.linear`) — sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.linear"), &mut self.linear)
     }
 
     fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
@@ -867,6 +1012,42 @@ impl Sd3Transformer {
         Ok(())
     }
 
+    /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
+    /// moved here at install (else the residual matmul is a device mismatch). sc-11105. Read off the
+    /// dense-kept learned pos-embed table (always present, on the model device).
+    pub fn device(&self) -> &Device {
+        self.pos_embed.pos_embed.device()
+    }
+
+    /// Whether the DiT loaded from a packed MLX tier (any projection is quantized) — the gate the loader
+    /// uses to route adapters to the additive install vs the dense fold (sc-11105). Probes `proj_out`, a
+    /// projection packed in every quantized tier.
+    pub fn is_packed(&self) -> bool {
+        self.proj_out.is_packed()
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the projection's
+    /// canonical diffusers dotted path — the same paths [`crate::adapters::resolve_targets`] resolves an
+    /// adapter module to: `context_embedder`, `proj_out`, the `time_text_embed.{timestep,text}_embedder.
+    /// linear_{1,2}` + `norm_out.linear` dense-kept leaves, and each `transformer_blocks.{i}` joint/dual
+    /// attention + GELU-MLP + AdaLN projection. The additive installer
+    /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
+    /// projection so a user adapter applies on any tier with the base kept unmutated (sc-11105).
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f("context_embedder", &mut self.context_embedder)?;
+        self.time_text_embed
+            .visit_adaptable_mut("time_text_embed", f)?;
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
+        }
+        self.norm_out.visit_adaptable_mut("norm_out", f)?;
+        f("proj_out", &mut self.proj_out)?;
+        Ok(())
+    }
+
     /// Unpatchify image tokens `[B, h*w, patch_dim]` back to a `[B, C, H, W]` latent (the inverse of
     /// the conv2d patchify). `patch_dim = patch_size² · out_channels`.
     fn unpatchify(&self, x: &Tensor, h: usize, w: usize) -> Result<Tensor> {
@@ -915,7 +1096,7 @@ impl Sd3Transformer {
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
-    use candle_gen::candle_nn::{VarBuilder, VarMap};
+    use candle_gen::candle_nn::{Linear, VarBuilder, VarMap};
 
     /// A tiny SD3.5-shaped config: 1 head at head_dim 8 (inner 8), a couple of joint blocks, small
     /// CLIP/T5 dims — enough to exercise every vendored path cheaply on CPU.
@@ -998,7 +1179,7 @@ mod tests {
         // emb = bias = [scale..., shift...] regardless of temb.
         let w = Tensor::zeros((2 * inner, inner), DType::F32, &dev).unwrap();
         let b = Tensor::from_vec(vec![7f32, 7., 7., 7., 2., 2., 2., 2.], 2 * inner, &dev).unwrap();
-        ada.linear = Linear::new(w, Some(b));
+        ada.linear = QLinear::from_dense(Linear::new(w, Some(b)), inner, 2 * inner);
         let temb = Tensor::randn(0f32, 1f32, (1, inner), &dev).unwrap();
         // A single token row of all-1s normalizes to 0 (zero variance) → LN(x)=0, so
         // out = (1+scale)·0 + shift = shift. With scale FIRST, shift is the SECOND half = 2.
@@ -1040,7 +1221,8 @@ mod tests {
         let mut bias = vec![7f32; inner];
         bias.extend(vec![2f32; inner]);
         let b = Tensor::from_vec(bias, 2 * inner, &dev).unwrap();
-        pre_only.norm1_context.linear = Linear::new(w, Some(b));
+        pre_only.norm1_context.linear =
+            QLinear::from_dense(Linear::new(w, Some(b)), inner, 2 * inner);
         let (norm_txt, cm) = pre_only.context_modulation(&txt, &temb).unwrap();
         assert_eq!(cm.len(), 2);
         for v in norm_txt.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
@@ -1060,7 +1242,8 @@ mod tests {
         bias.extend(vec![9f32; inner]); // scale_msa
         bias.extend(vec![0f32; 4 * inner]); // gate_msa, shift_mlp, scale_mlp, gate_mlp
         let b = Tensor::from_vec(bias, 6 * inner, &dev).unwrap();
-        std_block.norm1_context.linear = Linear::new(w, Some(b));
+        std_block.norm1_context.linear =
+            QLinear::from_dense(Linear::new(w, Some(b)), inner, 6 * inner);
         let (norm_txt, cm) = std_block.context_modulation(&txt, &temb).unwrap();
         assert_eq!(cm.len(), 6);
         for v in norm_txt.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
@@ -1327,6 +1510,77 @@ mod tests {
         }
     }
 
+    /// **Additive install on the SD3.5 MMDiT (sc-11105).** A bare-dotted diffusers LoRA over two real
+    /// block-0 attention projections installs as forward-time residuals: the report counts both, the DiT
+    /// forward shifts vs the un-adapted model, and no target is unresolved — proving the visitor's
+    /// canonical paths line up with `adapters::resolve_targets`. Exercises the packed-tier install wiring
+    /// on a dense-base fixture (the base-agnostic additive path is byte-equal on a packed base; the
+    /// stays-packed property is proven at the `AdaptLinear` unit level).
+    #[test]
+    fn install_additive_lora_on_mmdit_applies_and_shifts() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        use std::collections::HashMap as Map;
+        let cfg = quant_cfg();
+        let (vm, latent, context, pooled, t) = quant_harness(&cfg);
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let base = Sd3Transformer::new(&cfg, vb.clone()).unwrap();
+        let mut adapted = Sd3Transformer::new(&cfg, vb).unwrap();
+
+        let inner = cfg.inner_dim;
+        let rank = 2usize;
+        let mut map: Map<String, Tensor> = Map::new();
+        // A per-target `(path, out_features)` set spanning the attention surface AND the newly-promoted
+        // dense-kept leaves (the AdaLN-continuous head + a timestep-embedder linear) — proving the
+        // AdaLN/embedder additive surface (sc-11105). Every target's `in_features` is `inner`.
+        let targets: [(&str, usize); 4] = [
+            ("transformer_blocks.0.attn.to_q", inner),
+            ("transformer_blocks.0.attn.to_out.0", inner),
+            ("time_text_embed.timestep_embedder.linear_2", inner), // square dense leaf
+            ("norm_out.linear", 2 * inner),                        // AdaLN-continuous head
+        ];
+        for (path, out) in targets {
+            map.insert(
+                format!("{path}.lora_A.weight"),
+                Tensor::randn(0f32, 0.5f32, (rank, inner), &dev).unwrap(),
+            );
+            map.insert(
+                format!("{path}.lora_B.weight"),
+                Tensor::randn(0f32, 0.5f32, (out, rank), &dev).unwrap(),
+            );
+        }
+        let tmp =
+            std::env::temp_dir().join(format!("sc11105_sd3_{}.safetensors", std::process::id()));
+        candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
+        let report = crate::adapters::install_additive(
+            &mut adapted,
+            &[AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lora)],
+        )
+        .unwrap();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(
+            report.applied, 4,
+            "attn (to_q + to_out.0) + AdaLN/embedder (norm_out.linear + timestep_embedder.linear_2) \
+             residuals installed"
+        );
+        assert!(report.skipped_targets.is_empty(), "no unresolved targets");
+
+        let y_base = base.forward(&latent, &context, &pooled, &t).unwrap();
+        let y_adapt = adapted.forward(&latent, &context, &pooled, &t).unwrap();
+        let shift = (y_adapt - y_base)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            shift > 1e-5,
+            "additive LoRA did not shift the DiT forward ({shift})"
+        );
+    }
+
     /// **Q8 forward is near-lossless; Q4 forward stays coherent** vs the dense MMDiT (CPU, random
     /// weights). Builds one transformer, captures the dense velocity, quantizes a *copy* of the same
     /// weights, and compares — the full-model analog of the per-linear `quant.rs` round-trip. Asserts
@@ -1403,11 +1657,8 @@ mod tests {
         staged.quantize_onto(quant, &dev).unwrap();
         let v_staged = staged.forward(&latent, &context, &pooled, &t).unwrap();
 
-        // The staged projections really transitioned to the Quantized arm.
-        assert!(matches!(
-            staged.blocks[0].attn.to_q,
-            crate::quant::QLinear::Quantized { .. }
-        ));
+        // The staged projections really transitioned to the packed (Quantized) base.
+        assert!(staged.blocks[0].attn.to_q.is_packed());
 
         let a = v_in_place.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = v_staged.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1482,12 +1733,13 @@ mod tests {
             model.quantize_onto(quant, &gpu).unwrap();
 
             // (a) A quantized projection is on the GPU at the expected block dtype. SD3.5 folds to the
-            // sc-7702-safe dequant-dense arm, so the weight is a `QuantWeight::Dequant(QTensor)`.
-            match &model.blocks[0].attn.to_q {
-                crate::quant::QLinear::Quantized {
+            // sc-7702-safe dequant-dense arm, so the packed base's inner `QLinear` is a
+            // `QuantWeight::Dequant(QTensor)` (reached via `AdaptLinear::base_qlinear`, sc-11105).
+            match model.blocks[0].attn.to_q.base_qlinear() {
+                Some(candle_gen::quant::QLinear::Quantized {
                     weight: candle_gen::quant::QuantWeight::Dequant(qt),
                     ..
-                } => {
+                }) => {
                     assert!(qt.device().is_cuda(), "quantized leaf not on CUDA");
                     let expected = match quant {
                         Quant::Q4 => GgmlDType::Q4_0,
@@ -1498,11 +1750,12 @@ mod tests {
                 _ => panic!("attn.to_q did not quantize to the dequant-dense arm"),
             }
 
-            // (b) Dense-kept leaves migrated to the GPU.
+            // (b) Dense-kept leaves migrated to the GPU. The AdaLN/embedder linears are now the shared
+            // residual-capable `QLinear` (sc-11105) which does not expose `.weight()`; their correct
+            // migration is covered transitively by the finite-forward assert (c) below — a leaf left on
+            // the CPU would device-mismatch-panic the GPU forward.
             assert!(model.pos_embed.proj.weight().device().is_cuda());
             assert!(model.pos_embed.pos_embed.device().is_cuda());
-            assert!(model.blocks[0].norm1.linear.weight().device().is_cuda());
-            assert!(model.norm_out.linear.weight().device().is_cuda());
             if let Some(rn) = &model.blocks[0].attn.norm_q {
                 assert!(rn.weight().device().is_cuda());
             }
@@ -1543,11 +1796,8 @@ mod tests {
         let mut model = Sd3Transformer::new(&cfg, vb).unwrap();
         model.quantize(Quant::Q4).unwrap();
         model.quantize(Quant::Q4).unwrap(); // no-op, must not panic
-                                            // The image q-projection of block 0 is now quantized.
-        assert!(matches!(
-            model.blocks[0].attn.to_q,
-            crate::quant::QLinear::Quantized { .. }
-        ));
+                                            // The image q-projection of block 0 is now packed.
+        assert!(model.blocks[0].attn.to_q.is_packed());
         let v = model.forward(&latent, &context, &pooled, &t).unwrap();
         for x in v.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
             assert!(x.is_finite());

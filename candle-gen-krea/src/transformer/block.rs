@@ -14,6 +14,7 @@ use candle_gen::candle_nn::ops::{sigmoid, softmax_last_dim};
 use super::rope::apply_interleaved_rope;
 use crate::loader::{linear_detect, rms_scale, rms_scale_weight, Weights};
 use crate::quant::QLinear;
+use candle_gen::quant::AdaptLinear;
 
 /// Join a module prefix with a leaf name.
 fn join(prefix: &str, name: &str) -> String {
@@ -150,6 +151,28 @@ impl GatedAttention {
         let gated = (o * sigmoid(&gate)?)?;
         self.o.forward(&gated)
     }
+
+    /// Visit the five gated-attention projections under `{prefix}` (`to_q/to_k/to_v/to_gate/to_out.0`) —
+    /// the surface a user LoRA/LoKr adapts (sc-11105). The q/k RMS scales are not projections. An
+    /// int8-ConvRot projection is skipped (never adaptable; the ConvRot lane rejects adapters).
+    pub fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for (leaf, proj) in [
+            ("to_q", &mut self.q),
+            ("to_k", &mut self.k),
+            ("to_v", &mut self.v),
+            ("to_gate", &mut self.gate),
+            ("to_out.0", &mut self.o),
+        ] {
+            if let Some(a) = proj.as_adapt_mut() {
+                f(&join(prefix, leaf), a)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ── SwiGLU feed-forward (reference `SwiGLU`: `down(silu(gate(x)) * up(x))`) ──────────────────
@@ -171,6 +194,24 @@ impl SwiGlu {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gated = (self.gate.forward(x)?.silu()? * self.up.forward(x)?)?;
         self.down.forward(&gated)
+    }
+
+    /// Visit the three SwiGLU projections under `{prefix}` (`gate/up/down`) — sc-11105.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for (leaf, proj) in [
+            ("gate", &mut self.gate),
+            ("up", &mut self.up),
+            ("down", &mut self.down),
+        ] {
+            if let Some(a) = proj.as_adapt_mut() {
+                f(&join(prefix, leaf), a)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -203,6 +244,17 @@ impl TextFusionBlock {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = (x + self.attn.forward(&self.prenorm.forward(x)?, None)?)?;
         &x + self.mlp.forward(&self.postnorm.forward(&x)?)?
+    }
+
+    /// Visit the block's attention + SwiGLU projections under `{prefix}.attn` / `{prefix}.ff` — sc-11105.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.attn.visit_adaptable_mut(&join(prefix, "attn"), f)?;
+        self.mlp.visit_adaptable_mut(&join(prefix, "ff"), f)?;
+        Ok(())
     }
 }
 
@@ -266,6 +318,17 @@ impl SingleStreamBlock {
             .broadcast_add(postshift)?;
         let mlp = self.mlp.forward(&post)?;
         &x + mlp.broadcast_mul(postgate)?
+    }
+
+    /// Visit the block's attention + SwiGLU projections under `{prefix}.attn` / `{prefix}.ff` — sc-11105.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.attn.visit_adaptable_mut(&join(prefix, "attn"), f)?;
+        self.mlp.visit_adaptable_mut(&join(prefix, "ff"), f)?;
+        Ok(())
     }
 }
 
@@ -337,5 +400,21 @@ impl TextFusionTransformer {
             h = blk.forward(&h)?;
         }
         Ok(h)
+    }
+
+    /// Visit the text-fusion blocks' adaptable projections under `text_fusion.layerwise_blocks.{i}` /
+    /// `text_fusion.refiner_blocks.{i}` (sc-11105) — the adapter surface. The `projector` (num_layers→1)
+    /// stays out of the surface (matching `merge_surface_keys`).
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for (i, blk) in self.layerwise.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("text_fusion.layerwise_blocks.{i}"), f)?;
+        }
+        for (i, blk) in self.refiner.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("text_fusion.refiner_blocks.{i}"), f)?;
+        }
+        Ok(())
     }
 }
