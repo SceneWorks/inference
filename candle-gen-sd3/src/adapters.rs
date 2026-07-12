@@ -483,9 +483,10 @@ pub fn merge_adapters(
 // additive path row-slices the **up** factor per chunk (`a = downᵀ` is shared, `b = up[chunk]ᵀ·ratio`)
 // so each split projection gets its slice as a residual — the additive analog of the merge's delta
 // row-slice. A fused-QKV **LoKr** can't be deferred (a row-slice of a Kronecker delta is not itself a
-// small Kronecker), so it is rejected on the packed tier (→ dense tier). The dense AdaLN/embedder leaves
-// (`norm1.linear`, `norm_out.linear`, the timestep/text embedders) are kept dense and are NOT part of
-// the additive surface — a LoRA targeting only those is surfaced as skipped / no-target (→ dense tier).
+// small Kronecker), so it is rejected on the packed tier (→ dense tier). The AdaLN/embedder leaves
+// (`norm1.linear`, `norm1_context.linear`, `norm_out.linear`, the timestep/text embedders) are kept
+// **dense** (never quantized) but are the residual-capable [`AdaptLinear`] too (sc-11105), so a LoRA
+// over them applies additively on the dense base — the full merge surface is covered additively.
 
 /// A resolved LoRA residual pending attachment: `a = downᵀ` `[in, rank]`, `b = up[chunk]ᵀ·(alpha/rank)`
 /// `[rank, out]`, `scale` the user strength. Read on CPU; moved to the DiT device at push.
@@ -784,23 +785,23 @@ pub fn install_additive(dit: &mut Sd3Transformer, specs: &[AdapterSpec]) -> Resu
     report.applied = applied;
     report.skipped_keys += skipped_keys;
 
-    // Pending targets absent from the DiT additive surface (e.g. a dense AdaLN/embedder leaf) are
-    // surfaced, never silently dropped.
+    // Pending targets absent from the DiT additive surface (a conv/text-encoder key) are surfaced,
+    // never silently dropped.
     for path in pending_lora.keys().chain(pending_lokr.keys()) {
         if !matched.contains(path) {
             report.skipped_targets.push(path.clone());
         }
     }
-    // A non-empty spec set that adapted nothing is a format/prefix misconfiguration (or an
-    // only-dense-leaf targeting) — fail loudly rather than render an unadapted image.
+    // A non-empty spec set that adapted nothing is a format/prefix misconfiguration — fail loudly
+    // rather than render an unadapted image.
     if !specs.is_empty() && report.applied == 0 {
         return Err(no_target_matched(
             "sd3",
             "expected a kohya `lora_sd3` file (`lora_unet_joint_blocks_<i>_<x|context>_block_…`, fused \
-             `attn_qkv`) or a diffusers-named LoRA/LoKr over the DiT attention / MLP projections \
-             (`transformer_blocks.<i>.attn.<to_q|to_k|to_v|to_out.0|add_*_proj|to_add_out>`, `.ff.*`, \
-             `.attn2.*`). AdaLN/embedder leaves stay dense (→ dense tier); conv/text-encoder adapters \
-             are out of surface",
+             `attn_qkv`) or a diffusers-named LoRA/LoKr over the DiT attention / MLP / AdaLN / embedder \
+             projections (`transformer_blocks.<i>.{attn.*,ff.*,attn2.*,norm1.linear,norm1_context.\
+             linear}`, `time_text_embed.*`, `norm_out.linear`). Conv (`pos_embed.proj`) / text-encoder \
+             adapters are out of surface",
             specs.len(),
         ));
     }

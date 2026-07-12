@@ -80,6 +80,22 @@ impl Adapter {
             Adapter::LokrStructured { factors } => factors.residual(x),
         }
     }
+
+    /// Move this residual's factors onto `device`, in place (the dense-leaf migration seam, sc-11105).
+    fn migrate_to(&mut self, device: &Device) -> candle_core::Result<()> {
+        match self {
+            Adapter::Lora { a, b, .. } => {
+                *a = a.to_device(device)?;
+                *b = b.to_device(device)?;
+            }
+            // `LokrFactors` fields are same-module-private; move `w1`/`w2` directly (candle_core::Result).
+            Adapter::LokrStructured { factors } => {
+                factors.w1 = factors.w1.to_device(device)?;
+                factors.w2 = factors.w2.to_device(device)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The two small Kronecker factors of a LoKr delta, kept **unmaterialized** for a deferred structured
@@ -510,6 +526,30 @@ impl AdaptLinear {
                 Ok(())
             }
         }
+    }
+
+    /// Move the projection — base + every attached residual factor — onto `device`, in place. The seam
+    /// a consumer's **dense-kept** leaf migrates through on the CPU-stage quant path (sd3's AdaLN /
+    /// embedder linears, sc-11105): they build on the CPU with the rest of the DiT, then migrate to the
+    /// GPU alongside the quantized projections. Mirrors [`super::QLinear::to_device`] (a dense base
+    /// moves; a packed base is a no-op — its quantized weight already lives on its device), and also
+    /// moves any forward-time residual so a migrated adapted leaf stays device-consistent.
+    pub fn to_device(&mut self, device: &Device) -> candle_core::Result<()> {
+        match &mut self.base {
+            Base::Dense(l) => {
+                let w = l.weight().to_device(device)?;
+                let b = match l.bias() {
+                    Some(b) => Some(b.to_device(device)?),
+                    None => None,
+                };
+                *l = Linear::new(w, b);
+            }
+            Base::Packed(q) => q.to_device(device)?,
+        }
+        for ad in &mut self.adapters {
+            ad.migrate_to(device)?;
+        }
+        Ok(())
     }
 }
 
