@@ -78,13 +78,39 @@ fn main() {
     let generator = load_edit(&spec).expect("load krea_2_edit generator");
 
     let src = load_rgb(&source);
-    eprintln!(
-        "[smoke] source {}x{} → edit '{instruction}' ({steps} steps, g={guidance}) via Generator::generate",
-        src.width, src.height
-    );
+    let (sw, sh) = (src.width, src.height);
 
-    // The worker's exact request shape: the source is a single `Conditioning::Reference`, prompt is the
-    // instruction. `generate_impl` sees the `krea_2_edit` descriptor and routes it to the edit entrypoint.
+    // Two-reference edit (epic 10871 P1.3): with a second source (`KREA_EDIT_SOURCE_B`) the worker sends
+    // a `Conditioning::MultiReference` in FIXED order — scene = image 1, person = image 2. Without it,
+    // the single-source path (one `Conditioning::Reference`) — both route through the same `krea_2_edit`
+    // Generator seam and on to `generate_edit_with_progress`.
+    let source_b = std::env::var("KREA_EDIT_SOURCE_B")
+        .ok()
+        .filter(|b| !b.trim().is_empty());
+    let conditioning = match &source_b {
+        Some(b) => {
+            let person = load_rgb(b);
+            eprintln!(
+                "[smoke] scene {sw}x{sh} + person {}x{} → MultiReference (scene, person) → edit '{instruction}' ({steps} steps, g={guidance})",
+                person.width, person.height
+            );
+            vec![Conditioning::MultiReference {
+                images: vec![src, person],
+            }]
+        }
+        None => {
+            eprintln!(
+                "[smoke] source {sw}x{sh} → edit '{instruction}' ({steps} steps, g={guidance}) via Generator::generate"
+            );
+            vec![Conditioning::Reference {
+                image: src,
+                strength: None,
+            }]
+        }
+    };
+
+    // The worker's exact request shape; `generate_impl` sees the `krea_2_edit` descriptor and routes the
+    // Reference / MultiReference source(s) to the edit entrypoint.
     let request = GenerationRequest {
         prompt: instruction.clone(),
         negative_prompt: Some(String::new()),
@@ -94,10 +120,7 @@ fn main() {
         seed: Some(42),
         steps: Some(steps),
         guidance: Some(guidance),
-        conditioning: vec![Conditioning::Reference {
-            image: src,
-            strength: None,
-        }],
+        conditioning,
         cancel: CancelFlag::new(),
         ..Default::default()
     };
