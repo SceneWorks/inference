@@ -156,4 +156,19 @@ impl ResnetBlock2D {
             .forward(&nn::ops::silu(&self.norm2.forward(&xs)?)?)?;
         (shortcut_xs + xs)? / self.config.output_scale_factor
     }
+
+    /// Visit this resnet's convolutions (`conv1`, `conv2`, and the optional `conv_shortcut`) so a
+    /// conv-layer LoRA can install additive residuals on them (sc-11682 — keeps the dense base a
+    /// pristine mmap instead of folding). The `time_emb_proj` Linear is NOT a conv target.
+    pub fn visit_conv_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut Conv2d) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&mut self.conv1)?;
+        f(&mut self.conv2)?;
+        if let Some(conv_shortcut) = &mut self.conv_shortcut {
+            f(conv_shortcut)?;
+        }
+        Ok(())
+    }
 }

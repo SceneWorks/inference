@@ -92,6 +92,12 @@ impl Adapter {
 /// profile as a plain LoRA. The row-major kron ordering here matches [`crate::train::lora`]'s `kron2d`
 /// (`out[i·b+k, j·d+l] = w1[i,j]·w2[k,l]`), so the structured residual equals the folded delta. The
 /// full `(alpha/rank)·strength` scale is baked into [`w2`](Self::w2) at build time.
+///
+/// `Clone`/`Debug` so a caller that stacks these residuals on its own adaptable seam (the SDXL
+/// [`crate::train::lora::LoraLinear`] additive channel, sc-11103) can hold them in a `#[derive(Clone,
+/// Debug)]` module without re-implementing the vec-trick — the factors are `Tensor`s (cheap `Arc`
+/// clone) plus `usize` shape metadata.
+#[derive(Clone, Debug)]
 pub struct LokrFactors {
     /// `[a, c]` — the left Kronecker factor (`out = a·b`, `in = c·d`).
     w1: Tensor,
@@ -199,7 +205,10 @@ impl LokrFactors {
     /// (`out = a·b`). The two matmuls touch only the small factor shapes — the full `[out, in]` delta
     /// is NEVER materialized, so this holds the same memory profile on a packed q4/q8 base as a plain
     /// LoRA. Factors are cast to the activation dtype so a bf16 stream runs bf16.
-    fn residual(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+    ///
+    /// Public so a caller stacking this residual on its own seam (the SDXL `LoraLinear` additive
+    /// channel, sc-11103) applies it without reaching through an [`AdaptLinear`].
+    pub fn residual(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let xd = x.dtype();
         let w1 = self.w1.to_dtype(xd)?;
         let w2t = self.w2.to_dtype(xd)?.t()?.contiguous()?; // [d, b]

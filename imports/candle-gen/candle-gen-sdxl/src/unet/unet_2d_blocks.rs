@@ -43,6 +43,16 @@ impl Downsample2D {
             span,
         })
     }
+
+    fn visit_conv_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut Conv2d) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        if let Some(conv) = &mut self.conv {
+            f(conv)?;
+        }
+        Ok(())
+    }
 }
 
 impl Module for Downsample2D {
@@ -80,6 +90,13 @@ impl Upsample2D {
         let conv = conv2d(in_channels, out_channels, 3, config, vs.pp("conv"))?;
         let span = tracing::span!(tracing::Level::TRACE, "upsample2d");
         Ok(Self { conv, span })
+    }
+
+    fn visit_conv_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut Conv2d) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&mut self.conv)
     }
 }
 
@@ -472,6 +489,19 @@ impl UNetMidBlock2DCrossAttn {
         Ok(())
     }
 
+    /// Visit every conv in the mid block (the lead resnet + each attention block's trailing resnet) for
+    /// a conv-LoRA additive install (sc-11682).
+    pub fn visit_conv_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut Conv2d) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.resnet.visit_conv_lora_mut(f)?;
+        for (_attn, resnet) in self.attn_resnets.iter_mut() {
+            resnet.visit_conv_lora_mut(f)?;
+        }
+        Ok(())
+    }
+
     /// Visit the mid block's cross-attentions (`attn2`) for the IP-Adapter install / token-set walk
     /// (sc-5491).
     pub fn visit_cross_attn_mut(
@@ -578,6 +608,21 @@ impl DownBlock2D {
             None => xs,
         };
         Ok((xs, output_states))
+    }
+
+    /// Visit every conv in this down block (each resnet's convs + the optional downsampler conv) for a
+    /// conv-LoRA additive install (sc-11682).
+    pub fn visit_conv_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut Conv2d) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for resnet in self.resnets.iter_mut() {
+            resnet.visit_conv_lora_mut(f)?;
+        }
+        if let Some(downsampler) = &mut self.downsampler {
+            downsampler.visit_conv_lora_mut(f)?;
+        }
+        Ok(())
     }
 }
 
@@ -692,6 +737,15 @@ impl CrossAttnDownBlock2D {
         Ok(())
     }
 
+    /// Visit every conv in this down block (delegates to the wrapped `DownBlock2D`) for a conv-LoRA
+    /// additive install (sc-11682).
+    pub fn visit_conv_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut Conv2d) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.downblock.visit_conv_lora_mut(f)
+    }
+
     /// Visit this down block's cross-attentions (`attn2`) for the IP-Adapter install / token-set walk
     /// (sc-5491).
     pub fn visit_cross_attn_mut(
@@ -804,6 +858,21 @@ impl UpBlock2D {
             None => Ok(xs),
         }
     }
+
+    /// Visit every conv in this up block (each resnet's convs + the optional upsampler conv) for a
+    /// conv-LoRA additive install (sc-11682).
+    pub fn visit_conv_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut Conv2d) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for resnet in self.resnets.iter_mut() {
+            resnet.visit_conv_lora_mut(f)?;
+        }
+        if let Some(upsampler) = &mut self.upsampler {
+            upsampler.visit_conv_lora_mut(f)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -914,6 +983,15 @@ impl CrossAttnUpBlock2D {
             attn.visit_lora_mut(f)?;
         }
         Ok(())
+    }
+
+    /// Visit every conv in this up block (delegates to the wrapped `UpBlock2D`) for a conv-LoRA additive
+    /// install (sc-11682).
+    pub fn visit_conv_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut Conv2d) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.upblock.visit_conv_lora_mut(f)
     }
 
     /// Visit this up block's cross-attentions (`attn2`) for the IP-Adapter install / token-set walk
