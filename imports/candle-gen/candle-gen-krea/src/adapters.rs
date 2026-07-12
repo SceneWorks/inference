@@ -35,10 +35,11 @@
 //! text-encoder LoRAs (this is a DiT-only merge) and conv-shaped (4-D) factors (the merge folds only
 //! into the 2-D Linear projections).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use candle_gen::candle_core::Tensor;
+use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+use candle_gen::quant::LokrFactors;
 use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
 // this crate previously hand-copied. Only the Krea-specific key→module resolution (ai-toolkit native
@@ -53,6 +54,7 @@ use candle_gen::{CandleError, Result};
 
 use crate::config::Krea2Config;
 use crate::loader::Weights;
+use crate::transformer::Krea2Transformer;
 
 /// PEFT key prefixes tolerated on read, longest-first. The candle Krea trainer writes **bare** dotted
 /// paths (no prefix), but community adapters and `peft.save_pretrained()` wrap the DiT under one of
@@ -462,6 +464,299 @@ pub fn merge_into_weights(
     let report = merge_adapters(&mut map, specs)?;
     map.retain(|k, t| base_ids.get(k).is_none_or(|&id| t.id() != id));
     w.set_overlay(map);
+    Ok(report)
+}
+
+// ---- Forward-time additive (unmerged) install on a PACKED tier (sc-11105) ------------------------
+//
+// On a **packed** q4/q8 Krea tier, [`merge_into_weights`] reconstructs each adapted projection's dense
+// weight from the packed parts and installs it as a dense overlay — so a user LoRA forces those
+// projections resident-dense. [`install_additive`] instead attaches each LoRA/LoKr as a **forward-time
+// residual** on the DiT's shared [`candle_gen::quant::AdaptLinear`] projections: `y = base(x) + Σ
+// scale·((x·A)·B)`, the base kept packed. So a user adapter applies on the q4/q8 tier at the base's
+// footprint. The dense tier keeps folding (bit-exact) via [`merge_into_weights`]. The resolver reuses
+// this crate's exact [`classify_lora_key`] / [`classify_lokr_key`] (incl. the ai-toolkit native rename)
+// + the peft/lycoris [`LokrGroup`] alpha/rank rule, so the additive residual equals the fold to f32
+// tolerance. Krea attention is **split** q/k/v (no fused-QKV), so each factor attaches 1:1.
+
+/// A resolved LoRA residual pending attachment: `a = downᵀ` `[in, rank]`, `b = upᵀ·(alpha/rank)`
+/// `[rank, out]`, `scale` the user strength. Read on CPU; moved to the DiT device at push.
+struct PendingLora {
+    a: Tensor,
+    b: Tensor,
+    scale: f64,
+}
+
+/// A LoKr module's raw factors + the FULL `(alpha/rank)·strength` scale, pending the projection's
+/// `[out, in]` to build the structured Kronecker factors ([`LokrFactors`], the vec-trick — never the
+/// dense delta).
+struct PendingLokr {
+    w1: Option<Tensor>,
+    w1_a: Option<Tensor>,
+    w1_b: Option<Tensor>,
+    w2: Option<Tensor>,
+    w2_a: Option<Tensor>,
+    w2_b: Option<Tensor>,
+    scale: f64,
+}
+
+/// A report of a forward-time additive install (sc-11105) — the packed-tier analog of [`MergeReport`].
+#[derive(Debug, Default)]
+pub struct AdditiveReport {
+    /// Projections that received a residual (one per `(path, file)` hit; multiple stack).
+    pub applied: usize,
+    /// Resolved target paths present in the adapter file(s) but absent from the DiT surface.
+    pub skipped_targets: Vec<String>,
+    /// Adapter-file keys outside the LoRA/LoKr surface, half-pairs, or shape-mismatched factors.
+    pub skipped_keys: usize,
+}
+
+/// Resolve one LoRA file into per-path [`PendingLora`] (`a = downᵀ`, `b = upᵀ·ratio`). Mirrors
+/// [`merge_lora_file`]'s classify (incl. the ai-toolkit native rename) + effective alpha/rank exactly,
+/// producing UNMERGED factors — so the additive residual equals the folded delta to f32 tolerance.
+fn resolve_lora_file(
+    af: &AdapterFile,
+    scale: f32,
+    table: &BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, Vec<PendingLora>>,
+    skipped_keys: &mut usize,
+) -> Result<()> {
+    let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
+    for (key, t) in &af.tensors {
+        match classify_lora_key(key, table) {
+            Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
+            Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
+            Some((path, Role::Alpha)) => {
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+            }
+            None => *skipped_keys += 1,
+        }
+    }
+    let cfg = LoraAdapterMeta::from_file_metadata(&af.meta);
+    for (path, t) in triples {
+        let (Some(down), Some(up)) = (t.down, t.up) else {
+            *skipped_keys += 1; // half-pair
+            continue;
+        };
+        if down.dims().len() != 2 || up.dims().len() != 2 {
+            *skipped_keys += 1; // conv-shaped LoRA — out of surface
+            continue;
+        }
+        let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
+        let rank = cfg_rank.unwrap_or(down.dims()[0] as f32) as f64;
+        if rank == 0.0 {
+            *skipped_keys += 1;
+            continue;
+        }
+        let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank as f32) as f64;
+        let ratio = alpha / rank;
+        let a = down.to_dtype(DType::F32)?.t()?.contiguous()?;
+        let b = (up.to_dtype(DType::F32)?.t()?.contiguous()? * ratio)?;
+        pending.entry(path).or_default().push(PendingLora {
+            a,
+            b,
+            scale: scale as f64,
+        });
+    }
+    Ok(())
+}
+
+/// Resolve one LoKr file into per-path [`PendingLokr`] with the FULL `(alpha/rank)·scale` baked. Mirrors
+/// [`merge_lokr_file`]'s two `(alpha, rank)` sources exactly — file-level peft metadata applied
+/// uniformly, else the per-module lycoris [`LokrGroup`] rule (rank from a decomposed factor's inner dim,
+/// alpha from the `.alpha` tensor, both-full ⇒ scale 1).
+fn resolve_lokr_file(
+    af: &AdapterFile,
+    scale: f32,
+    table: &BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, Vec<PendingLokr>>,
+    skipped_keys: &mut usize,
+) -> Result<()> {
+    let file_rank = af.meta.get("rank").and_then(|s| s.parse::<f32>().ok());
+    let file_alpha = af.meta.get("alpha").and_then(|s| s.parse::<f32>().ok());
+    let has_file_meta = file_rank.is_some() || file_alpha.is_some();
+
+    let mut grouped: BTreeMap<String, LokrGroup> = BTreeMap::new();
+    for (key, t) in &af.tensors {
+        if let Some(stem) = key.strip_suffix(".alpha") {
+            match resolve_lokr_module(stem, table) {
+                Some(path) => grouped.entry(path).or_default().alpha = Some(read_scalar(key, t)?),
+                None => *skipped_keys += 1,
+            }
+            continue;
+        }
+        match classify_lokr_key(key, table) {
+            Some((path, factor)) => {
+                grouped
+                    .entry(path)
+                    .or_default()
+                    .factors
+                    .insert(factor, t.clone());
+            }
+            None => *skipped_keys += 1,
+        }
+    }
+
+    for (path, g) in grouped {
+        // A group with only an `.alpha` (its factors targeted a non-routable module) can't be built.
+        if !g.factors.contains_key("lokr_w1") && !g.factors.contains_key("lokr_w1_a") {
+            *skipped_keys += 1;
+            continue;
+        }
+        let (alpha, rank) = if has_file_meta {
+            let rank = file_rank.unwrap_or(1.0);
+            (file_alpha.unwrap_or(rank), rank)
+        } else {
+            match g.rank() {
+                Some(r) => (g.alpha.unwrap_or(r), r),
+                None => (1.0, 1.0), // both factors full ⇒ lycoris scale 1
+            }
+        };
+        let full = (alpha as f64 / rank as f64) * scale as f64;
+        pending.entry(path).or_default().push(PendingLokr {
+            w1: g.factors.get("lokr_w1").cloned(),
+            w1_a: g.factors.get("lokr_w1_a").cloned(),
+            w1_b: g.factors.get("lokr_w1_b").cloned(),
+            w2: g.factors.get("lokr_w2").cloned(),
+            w2_a: g.factors.get("lokr_w2_a").cloned(),
+            w2_b: g.factors.get("lokr_w2_b").cloned(),
+            scale: full,
+        });
+    }
+    Ok(())
+}
+
+/// Install `specs` as **forward-time additive residuals** on a **packed** DiT (sc-11105): resolve each
+/// LoRA/LoKr file into unmerged factors, then walk the DiT once pushing residuals onto matched
+/// projections — the base is never dequantized or folded, so a q4/q8 tier keeps its footprint while the
+/// user adapter applies. Routing mirrors [`merge_adapters`] (a key-sniffed third-party LyCORIS LoKr is
+/// handled additively too, via the structured Kronecker vec-trick). A LoKr with no allocation-free
+/// structured form (a tucker/CP `lokr_t2`, or a base that does not factor as a·b × c·d) is rejected with
+/// a pointer to the dense tier. Like [`merge_adapters`], a non-empty spec set that matches **no** target
+/// errors (never renders unadapted).
+pub fn install_additive(
+    dit: &mut Krea2Transformer,
+    specs: &[AdapterSpec],
+) -> Result<AdditiveReport> {
+    let mut report = AdditiveReport::default();
+
+    // The kohya `flattened → dotted` table, built from the DiT's own adaptable projection paths (all
+    // Linear, rank-2), so a `lora_transformer_<flat>` key resolves exactly as the dense fold's
+    // `build_kohya_table` would (the additive-path analog with no base tensor map at hand).
+    let mut paths: Vec<String> = Vec::new();
+    dit.visit_adaptable_mut(&mut |path, _lin| {
+        paths.push(path.to_string());
+        Ok(())
+    })?;
+    let table: BTreeMap<String, String> = paths
+        .iter()
+        .map(|p| (p.replace('.', "_"), p.clone()))
+        .collect();
+
+    let mut pending_lora: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+    let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
+
+    for spec in specs {
+        let af = read_adapter(&spec.path)?;
+        // Route exactly as `merge_adapters`: an explicit/declared LoKr, or a key-sniffed third-party
+        // LyCORIS LoKr (`lokr_*` without a `networkType` stamp), resolves as LoKr; else LoRA. A
+        // `Lora`-declared file whose metadata says `networkType=lokr` is a loud mismatch.
+        let is_lokr = spec.kind == AdapterKind::Lokr || af.declares_lokr() || has_lokr_keys(&af);
+        if spec.kind == AdapterKind::Lora && af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "krea: adapter {} declared Lora but its metadata says networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        if is_lokr {
+            resolve_lokr_file(
+                &af,
+                spec.scale,
+                &table,
+                &mut pending_lokr,
+                &mut report.skipped_keys,
+            )?;
+        } else {
+            resolve_lora_file(
+                &af,
+                spec.scale,
+                &table,
+                &mut pending_lora,
+                &mut report.skipped_keys,
+            )?;
+        }
+    }
+
+    // Attach: walk the DiT once, pushing any resolved residual for each projection's canonical path. The
+    // factors are read on the CPU but the base weight lives on the DiT device (CUDA on a packed tier), so
+    // they are moved onto it at push. A factor whose dims don't match is surfaced as a skipped key, never
+    // a crashing forward (the additive analog of the fold path's shape guard).
+    let device = dit.device().clone();
+    let mut matched: HashSet<String> = HashSet::new();
+    let mut applied = 0usize;
+    let mut skipped_keys = 0usize;
+    dit.visit_adaptable_mut(&mut |path, lin| {
+        let (out_f, in_f) = lin.base_shape();
+        if let Some(list) = pending_lora.get(path) {
+            matched.insert(path.to_string());
+            for p in list {
+                if p.a.dims()[0] != in_f || p.b.dims()[1] != out_f {
+                    skipped_keys += 1;
+                    continue;
+                }
+                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
+                applied += 1;
+            }
+        }
+        if let Some(list) = pending_lokr.get(path) {
+            matched.insert(path.to_string());
+            for p in list {
+                match LokrFactors::build(
+                    p.scale,
+                    (out_f, in_f),
+                    p.w1.as_ref(),
+                    p.w1_a.as_ref(),
+                    p.w1_b.as_ref(),
+                    p.w2.as_ref(),
+                    None, // no tucker/CP `lokr_t2` on the peft/lycoris LoKr surface
+                    p.w2_a.as_ref(),
+                    p.w2_b.as_ref(),
+                )? {
+                    Some(factors) => {
+                        lin.push_lokr_structured(factors.to_device(&device)?);
+                        applied += 1;
+                    }
+                    None => {
+                        return Err(CandleError::Msg(format!(
+                            "krea: LoKr target `{path}` is not deferrable on a packed tier (a tucker/CP \
+                             `lokr_t2`, or a base that does not factor as a·b × c·d) — no \
+                             allocation-free structured form. Use a dense bf16 snapshot."
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    report.applied = applied;
+    report.skipped_keys += skipped_keys;
+
+    // Pending targets absent from the DiT surface are surfaced, never silently dropped.
+    for path in pending_lora.keys().chain(pending_lokr.keys()) {
+        if !matched.contains(path) {
+            report.skipped_targets.push(path.clone());
+        }
+    }
+    if !specs.is_empty() && report.applied == 0 {
+        return Err(no_target_matched(
+            "krea",
+            "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over \
+             the DiT attention (to_q|to_k|to_v|to_gate|to_out.0) and SwiGLU FFN (ff.gate|ff.up|ff.down) \
+             projections across the single-stream transformer_blocks and text_fusion blocks. Conv-layer \
+             / text-encoder adapters are out of surface",
+            specs.len(),
+        ));
+    }
     Ok(report)
 }
 
@@ -1274,5 +1569,121 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&adapter_file).ok();
+    }
+
+    /// **Additive == folded parity at the resolver level (sc-11105).** The unmerged factors
+    /// [`resolve_lora_file`] produces reproduce the folded `x·(W + δ)ᵀ` on a dense
+    /// [`candle_gen::quant::AdaptLinear`] base — using this crate's exact [`classify_lora_key`] (incl.
+    /// the ai-toolkit native rename) + effective alpha/rank — so the packed additive path and the dense
+    /// fold path agree to f32 tolerance. Uses the native `blocks.0.attn.wq` spelling to also cover
+    /// [`normalize_native_krea_path`].
+    #[test]
+    fn resolve_lora_matches_fold_on_dense() {
+        use candle_gen::candle_nn::Linear;
+        use candle_gen::quant::AdaptLinear;
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank) = (16usize, 12usize, 3usize);
+        // ai-toolkit native path → normalize_native rewrites to transformer_blocks.0.attn.to_q.
+        let native = "blocks.0.attn.wq";
+        let diffusers = "transformer_blocks.0.attn.to_q";
+        let down = Tensor::randn(0f32, 1f32, (rank, in_dim), &dev).unwrap();
+        let up = Tensor::randn(0f32, 1f32, (out_dim, rank), &dev).unwrap();
+        let (alpha, scale) = (6.0f32, 0.8f32);
+        let af = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{native}.lora_A.weight"), down.clone()),
+                (format!("{native}.lora_B.weight"), up.clone()),
+                (
+                    format!("{native}.alpha"),
+                    Tensor::from_vec(vec![alpha], (1,), &dev).unwrap(),
+                ),
+            ]),
+            meta: HashMap::new(),
+        };
+        let table: BTreeMap<String, String> = BTreeMap::new();
+        let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+        let mut skipped = 0usize;
+        resolve_lora_file(&af, scale, &table, &mut pending, &mut skipped).unwrap();
+        assert_eq!(skipped, 0);
+        let p = &pending[diffusers][0];
+        assert_eq!(p.a.dims(), &[in_dim, rank], "a = downᵀ [in, rank]");
+        assert_eq!(p.b.dims(), &[rank, out_dim], "b = upᵀ·ratio [rank, out]");
+
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let mut additive = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
+        additive.push_lora(p.a.clone(), p.b.clone(), p.scale);
+        let delta = reconstruct_lora_delta(&down, &up, alpha, rank as f32, scale).unwrap();
+        let folded =
+            AdaptLinear::from_dense(Linear::new((w + delta).unwrap(), None), in_dim, out_dim);
+        let x = Tensor::randn(0f32, 1f32, (2usize, in_dim), &dev).unwrap();
+        let d = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
+        assert!(d < 1e-4, "resolved additive != folded ({d})");
+    }
+
+    /// **Additive == folded parity for a peft LoKr (sc-11105).** The structured factors
+    /// [`resolve_lokr_file`] produces (full `(alpha/rank)·scale` baked) reproduce the folded LoKr delta
+    /// on a dense base — the packed additive path equals the dense fold to f32 tolerance.
+    #[test]
+    fn resolve_lokr_matches_fold_on_dense() {
+        use candle_gen::candle_nn::Linear;
+        use candle_gen::quant::{AdaptLinear, LokrFactors};
+        let dev = Device::Cpu;
+        let (a, b, c, d) = (2usize, 3, 4, 5);
+        let (out, inp) = (a * b, c * d);
+        let w1 = Tensor::randn(0f32, 1f32, (a, c), &dev).unwrap();
+        let w2 = Tensor::randn(0f32, 1f32, (b, d), &dev).unwrap();
+        let path = "transformer_blocks.0.attn.to_q";
+        let af = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{path}.lokr_w1"), w1.clone()),
+                (format!("{path}.lokr_w2"), w2.clone()),
+            ]),
+            meta: HashMap::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "2".to_string()),
+                ("alpha".to_string(), "4".to_string()),
+            ]),
+        };
+        let table: BTreeMap<String, String> = BTreeMap::new();
+        let mut pending: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
+        let mut skipped = 0usize;
+        resolve_lokr_file(&af, 0.5, &table, &mut pending, &mut skipped).unwrap();
+        let p = &pending[path][0];
+        // full = (alpha/rank)·scale = (4/2)·0.5 = 1.0.
+        let factors = LokrFactors::build(
+            p.scale,
+            (out, inp),
+            p.w1.as_ref(),
+            p.w1_a.as_ref(),
+            p.w1_b.as_ref(),
+            p.w2.as_ref(),
+            None,
+            p.w2_a.as_ref(),
+            p.w2_b.as_ref(),
+        )
+        .unwrap()
+        .expect("a plain linear LoKr is deferrable");
+        let base_w = Tensor::randn(0f32, 1f32, (out, inp), &dev).unwrap();
+        let mut additive = AdaptLinear::from_dense(Linear::new(base_w.clone(), None), inp, out);
+        additive.push_lokr_structured(factors);
+        let delta = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            4.0,
+            2.0,
+            0.5,
+            (out, inp),
+        )
+        .unwrap();
+        let folded =
+            AdaptLinear::from_dense(Linear::new((base_w + delta).unwrap(), None), inp, out);
+        let x = Tensor::randn(0f32, 1f32, (2usize, inp), &dev).unwrap();
+        let dd = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
+        assert!(dd < 1e-4, "resolved additive LoKr != folded ({dd})");
+        assert_eq!(skipped, 0);
     }
 }

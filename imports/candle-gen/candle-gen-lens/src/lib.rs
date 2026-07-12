@@ -34,11 +34,10 @@ pub mod training;
 pub mod transformer;
 pub mod vae;
 
-pub use adapters::{merge_adapters, MergeReport};
+pub use adapters::{install_additive, merge_adapters, AdditiveReport, MergeReport};
 pub use quant::QLinear;
 pub use reasoner::{LensReasoner, DEFAULT_MAX_NEW_TOKENS};
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -187,25 +186,6 @@ impl Pipeline {
         Ok(())
     }
 
-    /// The DiT `VarBuilder` with any [`AdapterSpec`]s merged into its weights (sc-5116). With no
-    /// adapters this is the stock mmap path; with adapters the `transformer/` shards load into a CPU
-    /// map, each LoRA/LoKr delta is folded in ([`adapters::merge_adapters`], f32 math), then the DiT
-    /// is built from the merged map — **merge, not residual** (the Lens flow-match sampler is
-    /// chaos-sensitive; `(W+δ)·x` ≠ `W·x + δ·x` to ~1 ULP, a visibly different image).
-    fn transformer_vb(&self) -> CResult<VarBuilder<'static>> {
-        if self.adapters.is_empty() {
-            return self.component_vb("transformer", DIT_DTYPE);
-        }
-        let files = self.component_files("transformer")?;
-        let mut tensors: HashMap<String, Tensor> = HashMap::new();
-        for f in &files {
-            let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
-            tensors.extend(part);
-        }
-        adapters::merge_adapters(&mut tensors, &self.adapters)?;
-        Ok(VarBuilder::from_tensors(tensors, DIT_DTYPE, &self.device))
-    }
-
     fn load_components(&self) -> CResult<Components> {
         let tokenizer =
             LensTokenizer::from_file(self.root.join("tokenizer").join("tokenizer.json"))?;
@@ -220,13 +200,26 @@ impl Pipeline {
             self.component_vb("text_encoder", ENC_DTYPE)?,
             self.quant.map(quant::ggml_dtype),
         )?;
-        let mut transformer = LensTransformer::new(&LensDitConfig::lens(), self.transformer_vb()?)?;
+        // Adapters ride as **forward-time additive residuals** on the DiT's projections — on BOTH the
+        // packed and the dense tier (sc-11105, additive-everywhere for epic 10765). The base weight is
+        // never mutated: the packed base stays packed (no dense `W` to fold into anyway), and the dense
+        // base stays an unmutated mmap — so the offload/eviction path can drop-and-restore it cheaply
+        // (a folded `W += δ` pins an in-memory host copy). `install_additive` equals the old dense fold
+        // to f32 tolerance (~1 ULP), so this trades a byte-exact adapter render for an evictable base.
+        let mut transformer = LensTransformer::new(
+            &LensDitConfig::lens(),
+            self.component_vb("transformer", DIT_DTYPE)?,
+        )?;
+        if !self.adapters.is_empty() {
+            adapters::install_additive(&mut transformer, &self.adapters)?;
+        }
         // Q4/Q8 the DiT's compute-heavy linears. Two routes compose (sc-9413): a packed MLX tier
         // (`SceneWorks/lens-mlx`, `.scales` present) already loaded each projection straight from the
         // packed parts inside `LensTransformer::new` (no dense staging), so this pass is a **no-op**
-        // over those; a dense bf16 tier loaded dense (and any merged adapter delta), so this pass folds
-        // it to `Q4_0`/`Q8_0` in place — the `apply_adapters → quantize` ordering (sc-5117). The
-        // per-`QLinear` `quantize` no-ops on an already-packed weight, so the two never double-quantize.
+        // over those; a dense bf16 tier loaded dense, so this pass folds it to `Q4_0`/`Q8_0` in place.
+        // The `install_additive → quantize` ordering: `AdaptLinear::quantize` folds only the **base**
+        // (dense→packed) and leaves any forward-time residual attached, so a dense-tier LoRA + Q4 request
+        // keeps its residual; the per-`QLinear` `quantize` no-ops on an already-packed base.
         if let Some(quant) = self.quant {
             transformer.quantize(quant)?;
         }
@@ -756,8 +749,8 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
             )));
         }
     };
-    // `spec.quantize` (encoder + DiT) and `spec.adapters` (DiT merge, sc-5116) are both applied
-    // downstream in `load_components`/`transformer_vb`, so neither is rejected here.
+    // `spec.quantize` (encoder + DiT) and `spec.adapters` (DiT additive install, sc-11105) are both
+    // applied downstream in `load_components`, so neither is rejected here.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: ControlNet / IP-Adapter conditioning is not part of the Lens port",

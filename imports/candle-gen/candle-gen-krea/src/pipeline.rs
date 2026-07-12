@@ -107,13 +107,20 @@ pub fn load_components(
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
 
     let cfg = Krea2Config::from_snapshot(root)?;
-    let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
     crate::convert::validate_transformer(&dit_w, &cfg)?;
-    // Fold any LoRA/LoKr adapters into the targeted dense weights before the DiT reads them. A
-    // non-empty spec that matches no target is a hard error inside `merge_into_weights` (the worker
-    // then falls back rather than silently rendering unadapted).
-    crate::adapters::merge_into_weights(&mut dit_w, &cfg, adapters)?;
-    let dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    // Adapters ride as **forward-time additive residuals** on the DiT's projections — on BOTH the packed
+    // and the dense tier (sc-11105, additive-everywhere for epic 10765). The base weight is never mutated:
+    // instead of reconstructing each adapted projection's dense weight (packed tier) or folding `W += δ`
+    // into the mmap (dense tier) — either of which pins an un-evictable in-memory copy — `install_additive`
+    // keeps the base an unmutated mmap/packed base and pushes the LoRA/LoKr delta as an unmerged residual,
+    // so the offload/eviction path can drop-and-restore it cheaply. It equals the old fold to f32 tolerance
+    // (~1 ULP). A non-empty spec that matches no target is a hard error (the worker then falls back rather
+    // than silently rendering unadapted).
+    let mut dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    if !adapters.is_empty() {
+        crate::adapters::install_additive(&mut dit, adapters)?;
+    }
 
     let vae = load_vae(root, device)?;
 

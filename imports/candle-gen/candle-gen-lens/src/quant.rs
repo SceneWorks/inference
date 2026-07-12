@@ -38,4 +38,13 @@
 // the dequant-dense (sc-7702-safe) forward: `QLinear::linear_detect` builds a packed `DequantDense`
 // projection and `QLinear::quantize` folds a dense one to the same, exactly as this crate's former
 // local copy did. Re-export under the crate-local names the transformer/lib already reference.
-pub use candle_gen::quant::{ggml_dtype, QLinear};
+//
+// The projection type is now the shared residual-capable [`candle_gen::quant::AdaptLinear`] (sc-11105),
+// aliased to `QLinear` so every `linear_detect` / `quantize` call site in the DiT stays unchanged. It
+// carries an optional **forward-time additive LoRA/LoKr residual** (`AdaptLinear::push_lora` /
+// `push_lokr_structured`), so a user LoRA applies on a **packed q4/q8** tier with the base kept packed
+// ([`crate::adapters::install_additive`]) — the deltas ride unmerged, never folded into u32 codes. The
+// dense tier keeps folding (bit-exact) via [`crate::adapters::merge_adapters`] + `LensTransformer::
+// quantize` (which no-ops on a packed base, so the residuals survive). With no adapter attached the
+// forward is byte-identical to the bare base.
+pub use candle_gen::quant::{ggml_dtype, AdaptLinear as QLinear};

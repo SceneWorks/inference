@@ -27,8 +27,9 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
-use super::{lin_gs, QLinear, MLX_GROUP_SIZE};
+use super::{lin_gs, DenseLinear, QLinear, MLX_GROUP_SIZE};
 use crate::{CandleError, Result};
+use gen_core::Quant;
 
 /// The frozen base weight — **dense** (`candle_nn::Linear`) or **MLX-packed** ([`super::QLinear`],
 /// dequant-on-forward). Both compute `x·Wᵀ (+ b)`; neither is ever mutated by an adapter.
@@ -78,6 +79,22 @@ impl Adapter {
             // The `scale` is already baked into `factors.w2`, so the vec-trick returns directly.
             Adapter::LokrStructured { factors } => factors.residual(x),
         }
+    }
+
+    /// Move this residual's factors onto `device`, in place (the dense-leaf migration seam, sc-11105).
+    fn migrate_to(&mut self, device: &Device) -> candle_core::Result<()> {
+        match self {
+            Adapter::Lora { a, b, .. } => {
+                *a = a.to_device(device)?;
+                *b = b.to_device(device)?;
+            }
+            // `LokrFactors` fields are same-module-private; move `w1`/`w2` directly (candle_core::Result).
+            Adapter::LokrStructured { factors } => {
+                factors.w1 = factors.w1.to_device(device)?;
+                factors.w2 = factors.w2.to_device(device)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -261,9 +278,10 @@ impl AdaptLinear {
 
     /// Wrap an already-built **packed** base [`super::QLinear`] with its logical `[out, in]` dims — the
     /// raw-tensor twin of [`Self::from_dense`], for a caller that builds the packed base directly from
-    /// the MLX triple tensors rather than through a [`VarBuilder`] (e.g. the ideogram DiT loader's
-    /// `Weights`-based `linear_detect`, sc-11104). The base stays quantized (dequant-on-forward); pushed
-    /// residuals ride unmerged, so a q4/q8 tier keeps its footprint.
+    /// the MLX triple tensors rather than through a [`VarBuilder`] (the ideogram DiT loader's
+    /// `Weights`-based `linear_detect`, sc-11104; the krea loader's `MmapedSafetensors` seam, sc-11105).
+    /// The base stays quantized (dequant-on-forward); pushed residuals ride unmerged, so a q4/q8 tier
+    /// keeps its footprint.
     pub fn from_packed(base: QLinear, in_dim: usize, out_dim: usize) -> Self {
         Self {
             base: Base::Packed(base),
@@ -427,6 +445,15 @@ impl AdaptLinear {
         (self.out_features, self.in_features)
     }
 
+    /// The packed base's inner shared [`super::QLinear`] (for a consumer's test to inspect the GGUF
+    /// block dtype / device of the folded leaf), or `None` on a dense base. sc-11105.
+    pub fn base_qlinear(&self) -> Option<&QLinear> {
+        match &self.base {
+            Base::Packed(q) => Some(q),
+            Base::Dense(_) => None,
+        }
+    }
+
     /// The projection's contraction (`in_features`) — the last-dim an `[in, rank]` LoRA `a` factor
     /// contracts against.
     pub fn in_features(&self) -> usize {
@@ -457,6 +484,72 @@ impl AdaptLinear {
     /// its footprint. Multiple pushes stack, and it mixes freely with LoRA residuals (push order).
     pub fn push_lokr_structured(&mut self, factors: LokrFactors) {
         self.adapters.push(Adapter::LokrStructured { factors });
+    }
+
+    /// Fold a **dense** base to an MLX-packed base in place (Q4/Q8), preserving any attached residuals —
+    /// or an **idempotent no-op** on an already-packed base. The shared-core twin of
+    /// [`super::QLinear::quantize`] for a consumer whose DiT quantizes AFTER any dense adapter fold
+    /// (lens / sd3, sc-11105): on a **dense** tier the projection folds dense→Q4/Q8 here; on a **packed**
+    /// tier it is the no-op the additive install relies on, so the forward-time residuals survive. Uses
+    /// the sc-7702-safe [`super::MatmulStrategy::DequantDense`] forward (via `QLinear::quantize`); the
+    /// residual stack is untouched — the deltas ride on top of the now-packed base. Only the **base**
+    /// weight is quantized (never a residual factor), so a dense base carrying residuals stays correct.
+    pub fn quantize(&mut self, quant: Quant) -> candle_core::Result<()> {
+        match &mut self.base {
+            // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
+            Base::Packed(_) => Ok(()),
+            Base::Dense(l) => {
+                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
+                q.quantize(quant)?;
+                self.base = Base::Packed(q);
+                Ok(())
+            }
+        }
+    }
+
+    /// As [`Self::quantize`] but folds a **dense** base to a packed base landing on an explicit `device`
+    /// (the CPU-stage → quantize-onto-GPU path, sc-8504 / sd3) — the base is quantized on its current
+    /// device and placed on `device` via [`super::QLinear::quantize_dequant_onto`]. An already-packed
+    /// base is an **idempotent no-op**. Only the base is folded; this is only used on the dense-fold
+    /// route (which carries no forward-time residuals), so the residual stack — empty there — is untouched.
+    pub fn quantize_dequant_onto(
+        &mut self,
+        quant: Quant,
+        device: &Device,
+    ) -> candle_core::Result<()> {
+        match &mut self.base {
+            Base::Packed(_) => Ok(()),
+            Base::Dense(l) => {
+                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
+                q.quantize_dequant_onto(quant, device)?;
+                self.base = Base::Packed(q);
+                Ok(())
+            }
+        }
+    }
+
+    /// Move the projection — base + every attached residual factor — onto `device`, in place. The seam
+    /// a consumer's **dense-kept** leaf migrates through on the CPU-stage quant path (sd3's AdaLN /
+    /// embedder linears, sc-11105): they build on the CPU with the rest of the DiT, then migrate to the
+    /// GPU alongside the quantized projections. Mirrors [`super::QLinear::to_device`] (a dense base
+    /// moves; a packed base is a no-op — its quantized weight already lives on its device), and also
+    /// moves any forward-time residual so a migrated adapted leaf stays device-consistent.
+    pub fn to_device(&mut self, device: &Device) -> candle_core::Result<()> {
+        match &mut self.base {
+            Base::Dense(l) => {
+                let w = l.weight().to_device(device)?;
+                let b = match l.bias() {
+                    Some(b) => Some(b.to_device(device)?),
+                    None => None,
+                };
+                *l = Linear::new(w, b);
+            }
+            Base::Packed(q) => q.to_device(device)?,
+        }
+        for ad in &mut self.adapters {
+            ad.migrate_to(device)?;
+        }
+        Ok(())
     }
 }
 
@@ -740,6 +833,62 @@ mod tests {
         assert!(
             dev_max < 1e-5,
             "packed residual != scale·(x·a)·b (max diff {dev_max})"
+        );
+    }
+
+    /// `quantize` folds a **dense** base to packed in place (idempotent no-op if already packed), keeping
+    /// any attached residual — the lens/sd3 "quantize after the dense fold" contract (sc-11105). The
+    /// folded-packed forward equals the packed base forward plus the same residual (f32 tol), and a
+    /// second quantize on the now-packed base is an exact no-op (the additive residuals survive).
+    #[test]
+    fn quantize_folds_dense_base_and_preserves_residual() {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank) = (64usize, 128usize, 4usize);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap() * 0.1).unwrap();
+        let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
+
+        let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
+        lin.push_lora(a.clone(), b.clone(), 0.7);
+        assert!(!lin.is_packed());
+        lin.quantize(Quant::Q8).unwrap();
+        assert!(lin.is_packed(), "dense base must fold to packed");
+        assert!(lin.is_adapted(), "residual must survive the fold");
+
+        let x = Tensor::randn(0f32, 1f32, (3usize, in_dim), &dev).unwrap();
+        let residual = ((x.matmul(&a).unwrap().matmul(&b).unwrap()) * 0.7).unwrap();
+        // The Q8-packed base alone (no residual) — same weight, same fold — plus the residual.
+        let mut base_only = AdaptLinear::from_dense(Linear::new(w, None), in_dim, out_dim);
+        base_only.quantize(Quant::Q8).unwrap();
+        let expected = (base_only.forward(&x).unwrap() + residual).unwrap();
+        let dev_max = (lin.forward(&x).unwrap() - expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            dev_max < 1e-4,
+            "adapted-packed forward != packed base + residual ({dev_max})"
+        );
+
+        // Idempotent: a second quantize is a no-op (packed stays packed; forward unchanged).
+        let y0 = lin.forward(&x).unwrap();
+        lin.quantize(Quant::Q4).unwrap();
+        let y1 = lin.forward(&x).unwrap();
+        let noop = (y1 - y0)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            noop, 0.0,
+            "quantize on an already-packed base must be a no-op"
         );
     }
 

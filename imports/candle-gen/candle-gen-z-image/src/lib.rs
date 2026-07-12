@@ -77,7 +77,7 @@ mod edit_validate;
 #[cfg(test)]
 mod base_img2img_validate;
 
-pub use adapters::{merge_adapters, MergeReport};
+pub use adapters::{install_additive, merge_adapters, AdditiveReport, MergeReport};
 // Base (non-Turbo) `z_image` generator (sc-8414). Its `descriptor`/`load`/`MODEL_ID` share the names
 // of the Turbo model's free functions below, so reach them through the `base` module path (consumers
 // use the registry id `"z_image"`).
