@@ -70,7 +70,9 @@ pub mod control_provider;
 #[cfg(test)]
 mod testfix;
 
-pub use adapters::{merge_adapters, merge_into_weights, MergeReport};
+pub use adapters::{
+    install_additive, merge_adapters, merge_into_weights, AdditiveReport, MergeReport,
+};
 pub use config::Krea2Config;
 pub use control_provider::{
     Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,

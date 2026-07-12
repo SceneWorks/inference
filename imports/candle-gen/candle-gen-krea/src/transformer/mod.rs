@@ -118,6 +118,31 @@ impl Krea2Transformer {
         })
     }
 
+    /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
+    /// moved here at install (else the residual matmul is a device mismatch). sc-11105.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut AdaptLinear)` once each with the
+    /// projection's canonical DiT dotted path — the single-stream `transformer_blocks.{i}` attention +
+    /// SwiGLU projections plus the `text_fusion.{layerwise,refiner}_blocks.{i}` ones (exactly
+    /// `crate::adapters::merge_surface_keys`). The additive installer
+    /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
+    /// projection so a user adapter applies on a packed q4/q8 tier with the base kept packed (sc-11105).
+    /// The `img_in`/`txt_in`/`time_*`/`final_layer.linear`/`text_fusion.projector` leaves are out of the
+    /// adapter surface (matching the dense merge), so they are not visited.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
+        }
+        self.text_fusion.visit_adaptable_mut(f)?;
+        Ok(())
+    }
+
     /// Build (or reuse) the joint RoPE `(cos, sin)` table for this render's fixed geometry (sc-8992).
     /// Recomputed only when `(cap_len, ht, wt, n_refs)` changes; otherwise the Arc-backed handles are
     /// cloned. `n_refs == 0` builds the plain t2i `[text, image]` table (byte-identical to building it

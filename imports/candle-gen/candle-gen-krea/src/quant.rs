@@ -32,19 +32,23 @@
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
-use candle_gen::quant as shared;
+use candle_gen::quant::{self as shared, AdaptLinear};
 
-/// A Linear projection that is **dense** (the loaded bf16 weight, possibly adapter-merged via the
-/// overlay), **packed** (loaded straight from the MLX-packed tier via the shared
-/// [`candle_gen::quant::QLinear`], sc-9411), or **int8-ConvRot** (a community INT8-ConvRot checkpoint's
-/// per-output-channel int8 projection, sc-9300). Built dense ([`Self::dense`]), packed
-/// ([`Self::packed`]), or int8 ([`Self::convrot_int8`]); every forward computes `x·Wᵀ + b`.
+/// A Linear projection that is **residual-capable** (dense or MLX-packed base + optional forward-time
+/// additive LoRA/LoKr residuals — the shared [`candle_gen::quant::AdaptLinear`], sc-11105) or
+/// **int8-ConvRot** (a community INT8-ConvRot checkpoint's per-output-channel int8 projection, sc-9300).
+/// Built dense ([`Self::dense`]), packed ([`Self::packed`]), or int8 ([`Self::convrot_int8`]); every
+/// forward computes `x·Wᵀ + b` (+ any additive residual).
+///
+/// The `Adapt` arm folds the former `Dense(Linear)` + `Packed(shared::QLinear)` cases into the one
+/// shared `AdaptLinear` (sc-11105): a dense base (the loaded bf16 weight, possibly adapter-merged via
+/// the overlay — [`crate::adapters::merge_into_weights`]) or an MLX-packed base loaded straight from the
+/// packed parts (`Q4_1`/`Q8_0`, **dequantizes-on-forward** into a dense matmul — sc-7702, *not* the int8
+/// `QMatMul` fast path). On a **packed** tier a user LoRA rides as a forward-time additive residual on
+/// the packed base ([`crate::adapters::install_additive`]) — the packed base keeps its footprint.
 pub enum QLinear {
-    Dense(Linear),
-    /// Loaded directly from the MLX-packed tier through the shared module — the resident `Q4_1`/`Q8_0`
-    /// weight **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast
-    /// path).
-    Packed(shared::QLinear),
+    /// Dense or MLX-packed base + optional forward-time additive residuals (sc-11105).
+    Adapt(AdaptLinear),
     /// A community **INT8-ConvRot** projection (sc-9300 loader + sc-9601 online rotation): the checkpoint
     /// ships `(N, K)` int8 codes for the **rotated** weight `RHT(W) = W·R` + a `[N]` per-output-row
     /// `weight_scale`, where `R` is the regular-Hadamard transform applied block-diagonally in groups of
@@ -136,14 +140,22 @@ impl ConvRotInt8 {
 
 impl QLinear {
     /// Wrap an already-loaded dense [`Linear`] (the loader built it from `{base}.weight` [+ `.bias`],
-    /// or from the adapter-merged overlay).
+    /// or from the adapter-merged overlay) as a dense-base [`AdaptLinear`] — the logical `[out, in]` dims
+    /// are recovered from the weight shape (`[out, in]`).
     pub fn dense(linear: Linear) -> Self {
-        Self::Dense(linear)
+        // `weight()` is `[out, in]`; read the dims before moving `linear` into the adapter.
+        let (out_dim, in_dim) = {
+            let d = linear.weight().dims();
+            (d[0], d[1])
+        };
+        Self::Adapt(AdaptLinear::from_dense(linear, in_dim, out_dim))
     }
 
     /// Build a **packed** projection from the MLX packed triple (`wq` u32 codes + `scales` + `biases`,
     /// optional dense `bias`) at the tier's `group_size`, on `wq`'s device, via the shared group-size
-    /// -aware loader. No dense weight is materialized.
+    /// -aware loader, wrapped as a packed-base [`AdaptLinear`] (residual-capable — sc-11105). No dense
+    /// weight is materialized. The logical `[out, in]` dims come from the `scales` shape (`[out,
+    /// in/group_size]`).
     pub fn packed(
         wq: &Tensor,
         scales: &Tensor,
@@ -152,9 +164,12 @@ impl QLinear {
         group_size: usize,
     ) -> Result<Self> {
         let device = wq.device().clone();
-        Ok(Self::Packed(shared::QLinear::from_packed_gs(
-            wq, scales, biases, bias, group_size, &device,
-        )?))
+        let (out_dim, in_dim) = {
+            let sd = scales.dims();
+            (sd[0], sd[1] * group_size)
+        };
+        let q = shared::QLinear::from_packed_gs(wq, scales, biases, bias, group_size, &device)?;
+        Ok(Self::Adapt(AdaptLinear::from_packed(q, in_dim, out_dim)))
     }
 
     /// Build an **INT8-ConvRot** projection (sc-9300 loader + sc-9601 rotation) straight from the
@@ -192,21 +207,22 @@ impl QLinear {
         }))
     }
 
-    /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed to the shared dequant-on-forward
-    /// `QLinear` (sc-7702); int8-ConvRot to the cuBLASLt IGEMM (CUDA) or a dequant-dense matmul (CPU).
+    /// `x·Wᵀ + b` (+ any additive residual). The `Adapt` arm delegates to the shared [`AdaptLinear`]
+    /// (dense `candle_nn::Linear`, or the packed dequant-on-forward `QLinear` — sc-7702 — plus its
+    /// residuals); int8-ConvRot to the cuBLASLt IGEMM (CUDA) or a dequant-dense matmul (CPU).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed(l) => l.forward(x),
+            Self::Adapt(l) => l.forward(x),
             Self::ConvRotInt8(l) => l.forward(x),
         }
     }
 
-    /// Whether this projection loaded directly from the MLX-packed tier (the packed path) — used by the
-    /// loaders + tests to assert a packed tier fired the packed path (not a silent dense fallback).
+    /// Whether this projection loaded directly from the MLX-packed tier (its `Adapt` base is packed) —
+    /// used by the loaders + tests to assert a packed tier fired the packed path (not a silent dense
+    /// fallback).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
+        matches!(self, Self::Adapt(a) if a.is_packed())
     }
 
     /// Whether this projection loaded as an INT8-ConvRot int8 layer (sc-9300) — the detect-arm assertion
@@ -214,6 +230,16 @@ impl QLinear {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_convrot_int8(&self) -> bool {
         matches!(self, Self::ConvRotInt8(_))
+    }
+
+    /// The inner residual-capable [`AdaptLinear`] (for the additive install to push a forward-time LoRA/
+    /// LoKr residual — sc-11105), or `None` on an int8-ConvRot projection (never adaptable — the ConvRot
+    /// lane rejects adapters). The `visit_adaptable_mut` walk yields this to the installer.
+    pub fn as_adapt_mut(&mut self) -> Option<&mut AdaptLinear> {
+        match self {
+            Self::Adapt(a) => Some(a),
+            Self::ConvRotInt8(_) => None,
+        }
     }
 }
 
