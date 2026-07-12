@@ -380,10 +380,14 @@ pub fn merge_adapters(
 // which — because SDXL-Lightning / RealVisXL-Lightning target the **FF** (the bulk of the UNet) —
 // dequantized most of the UNet and threw away the q4/q8 win. Instead we now push each LoRA/LoKr as a
 // **forward-time residual** onto the packed `LoraLinear` leaves (`y = base(x) + Σ scale·((x·A)·B)`, the
-// base kept packed), mirroring the qwen-image-edit adoption (sc-11091, #425). The **conv** surface
-// (resnet convs, samplers, `conv_in`/`conv_out`) is dense even on a packed tier, so a conv LoRA still
-// **folds** into its dense weight ([`fold_conv_adapters`]) at no packed cost. The dense tier keeps
-// folding the whole surface bit-exactly via [`merge_adapters`].
+// base kept packed), mirroring the qwen-image-edit adoption (sc-11091, #425). The adaptable Linear
+// surface spans attention / FF / `proj_in`/`proj_out` plus the packed time-embedding + `add_embedding`
+// heads and every resnet `time_emb_proj` (sc-11679 widened these last from bare `QLinear` leaves —
+// distillation targets the denoising blocks, not the timestep/micro-conditioning embeddings, so this is
+// a defensive widening for an adapter that does hit them). The **conv** surface (resnet convs, samplers,
+// `conv_in`/`conv_out`) is dense even on a packed tier, so a conv LoRA still **folds** into its dense
+// weight ([`fold_conv_adapters`]) at no packed cost. The dense tier keeps folding the whole surface
+// bit-exactly via [`merge_adapters`].
 
 /// A resolved LoRA residual pending attachment: `a = downᵀ` `[in, rank]`, `b = upᵀ·(alpha/rank)`
 /// `[rank, out]`, `scale` the user strength. Read on CPU; moved to the UNet device at push.
@@ -412,8 +416,10 @@ pub struct AdditiveReport {
     /// Projections that received a residual (one per `(path, file)` hit; multiple stack).
     pub applied: usize,
     /// Resolved **2-D Linear** target paths present in the adapter file(s) but absent from the UNet's
-    /// adaptable (`LoraLinear`) surface — e.g. a LoRA targeting `time_emb_proj` (still a bare packed
-    /// `QLinear`, not an additive leaf). Surfaced, never silently dropped.
+    /// adaptable (`LoraLinear`) surface — e.g. a LoRA whose classified path names a module this UNet
+    /// does not have. The adaptable surface now spans attention / FF / `proj_in`/`proj_out`, the
+    /// time-embedding + `add_embedding` heads, and every resnet `time_emb_proj` (sc-11103 + sc-11679),
+    /// so this fires only on a genuinely-absent target. Surfaced, never silently dropped.
     pub skipped_targets: Vec<String>,
     /// Adapter-file keys outside the LoRA/LoKr surface, half-pairs, 4-D conv pairs (folded separately by
     /// [`fold_conv_adapters`], not additive), or shape-mismatched factors.
