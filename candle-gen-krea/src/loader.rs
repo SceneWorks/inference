@@ -286,6 +286,40 @@ impl Weights {
         }
         self.get_cpu(weight_key)
     }
+
+    /// The on-device base weight for a **dense/composable** projection ([`linear`]) at the component
+    /// dtype. On a dense tier this is exactly [`Self::get`]. On a **packed** q4/q8 tier whose
+    /// `{base}.scales` sibling is present (and the weight is NOT adapter-merged into the overlay), the
+    /// stored `{base}.weight` is u32 codes — casting them would reinterpret the bit-packed nibbles — so
+    /// the dense grid is reconstructed from the packed triple ([`dequant_packed_base`], f32) and moved to
+    /// the component device/dtype. This lets the composable [`KreaTrainDit`](crate::KreaTrainDit) (the
+    /// control / train forward, which loads every projection via dense [`linear`], not the packed-detecting
+    /// [`linear_detect`]) consume a packed base by dequantizing on load — the mergeable-base seam
+    /// [`get_cpu_merge_base`](Self::get_cpu_merge_base) already uses, minus the CPU pin (spike:
+    /// packed-base pose-control lane).
+    pub(crate) fn get_dense_or_dequant(&self, weight_key: &str) -> Result<Tensor> {
+        // An adapter-merged dense weight in the overlay wins (mirrors `get`'s overlay-first read).
+        if self.overlay.contains_key(weight_key) {
+            return self.get(weight_key);
+        }
+        if let Some(base) = weight_key.strip_suffix(".weight") {
+            let scales_key = format!("{base}.scales");
+            if let (Some(cfg), true) = (self.packed, self.st.get(&scales_key).is_ok()) {
+                let wq = self.st.load(weight_key, &Device::Cpu)?;
+                let scales = self
+                    .st
+                    .load(&scales_key, &Device::Cpu)?
+                    .to_dtype(DType::F32)?;
+                let biases = self
+                    .st
+                    .load(&format!("{base}.biases"), &Device::Cpu)?
+                    .to_dtype(DType::F32)?;
+                let dense = dequant_packed_base(&wq, &scales, &biases, cfg.group_size as usize)?;
+                return dense.to_device(&self.device)?.to_dtype(self.dtype);
+            }
+        }
+        self.get(weight_key)
+    }
 }
 
 // ===================================================================================================
@@ -444,7 +478,7 @@ pub fn dequant_packed_base(
 /// Build a [`Linear`] from `{base}.weight` (+ `{base}.bias` when `bias`), inferring in/out dims from
 /// the stored tensor shape (`[out, in]`, PyTorch/HF convention).
 pub fn linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
-    let weight = w.get(&format!("{base}.weight"))?;
+    let weight = w.get_dense_or_dequant(&format!("{base}.weight"))?;
     let bias = if bias {
         Some(w.get(&format!("{base}.bias"))?)
     } else {
@@ -816,6 +850,51 @@ mod tests {
             .to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "dense tier base is the on-disk weight");
         std::fs::remove_dir_all(&ddir).ok();
+        Ok(())
+    }
+
+    /// **`linear()` dequantizes a packed tier instead of casting the u32 codes (sc-11727).** The
+    /// composable [`crate::KreaTrainDit`] (the control / train forward) loads every base projection
+    /// through the dense [`linear`], NOT the packed-detecting [`linear_detect`]. On a packed q4/q8 tier
+    /// `{base}.weight` is bit-packed u32 codes, so a plain cast would be garbage; `get_dense_or_dequant`
+    /// reconstructs the affine grid from the packed triple. This is what lets the Krea pose-control lane
+    /// run on the q8/q4 base (GPU-proven — q8 ≈ bf16, q4 pose-locked with mild haze).
+    #[test]
+    fn linear_dequantizes_packed_tier() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (128usize, 256usize);
+        let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        map.insert("attn.to_q.weight".into(), wq);
+        map.insert("attn.to_q.scales".into(), s);
+        map.insert("attn.to_q.biases".into(), b);
+        let dir =
+            std::env::temp_dir().join(format!("sc11727_linear_packed_{}", std::process::id()));
+        write_component(&dir, map, true);
+        let w = Weights::from_dir(&dir, &dev, DType::F32)?;
+
+        // Packed tier: `linear` reconstructs the dense affine grid (NOT the u32 codes).
+        let lin = linear(&w, "attn.to_q", false)?;
+        assert_eq!(
+            lin.weight().dims(),
+            &[out_dim, in_dim],
+            "reconstructed dense shape"
+        );
+        assert!(
+            cosine(lin.weight(), &grid) > 0.99999,
+            "linear() on a packed tier must reconstruct the affine grid, not cast the u32 codes"
+        );
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let want = Linear::new(grid, None).forward(&x)?;
+        let dev_max = (lin.forward(&x)?.sub(&want)?)
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            dev_max < 1e-4,
+            "packed linear forward must match the dense grid (max dev {dev_max})"
+        );
+        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
