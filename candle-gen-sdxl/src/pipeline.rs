@@ -670,18 +670,18 @@ impl Pipeline {
         let add =
             crate::adapters::install_additive(&mut unet, &self.adapters, &table, &self.device)?;
         // A non-empty spec set that neither folded a conv nor installed a residual is a misconfiguration.
-        crate::adapters::guard_packed_matched(self.adapters.len(), conv.merged + add.applied)?;
+        crate::adapters::guard_additive_matched(self.adapters.len(), conv.merged + add.applied)?;
         Ok(unet)
     }
 
-    /// Build the UNet with the [`AdapterSpec`]s merged into its weights (sc-5165). The base UNet
-    /// tensors are loaded onto **CPU** at their native dtype, the LoRA/LoKr deltas are folded in
-    /// ([`crate::adapters::merge_adapters`], f32 math), then the stock candle UNet is built from the
-    /// merged map — each tensor moved to the device and cast to the load dtype as the VarBuilder serves
-    /// it, so the merged weights live on the GPU exactly like the mmap path and peak GPU is unchanged.
-    ///
-    /// We merge into the dense weights rather than add a forward-time residual because SDXL's sampler
-    /// is chaos-sensitive (`(W+δ)·x` ≠ `W·x + δ·x` to ~1 ULP); see [`crate::adapters`].
+    /// Build the **stock flash-attn** UNet with the [`AdapterSpec`]s **merged** into its weights
+    /// (sc-5165). This is the ONE adapter path that still folds: the stock candle-transformers UNet has
+    /// no additive seam (plain `nn::Linear`/`Conv2d`), and it is used only for the fused flash-attn
+    /// kernel (built `--features flash-attn` AND `use_flash_attn`). So an adapted flash render keeps a
+    /// folded, host-materialized (non-mmap) UNet — NOT evictable under epic-10765 offload — whereas the
+    /// default vendored math path is additive over a pristine mmap ([`Self::
+    /// load_dense_vendored_unet_with_adapters`], sc-11682). Retiring this fold in favor of routing
+    /// adapted+flash renders through the vendored path is tracked in sc-11682.
     fn build_unet_with_adapters(
         &self,
         unet_file: &Path,
@@ -711,16 +711,31 @@ impl Pipeline {
         Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
     }
 
-    /// Dense vendored UNet with the [`AdapterSpec`]s merged in (sc-11154 / F-081) — the adapted
-    /// counterpart of [`Self::load_dense_vendored_unet`]. Mirrors [`Self::build_unet_with_adapters`]
-    /// (base tensors on CPU → [`crate::adapters::merge_adapters`] f32 fold → `from_tensors`) but targets
-    /// the vendored stack so the i32-overflow-safe budgeted attention applies. SDXL merges the delta
-    /// into the dense weights (not a forward residual) for chaos-sensitivity; see [`crate::adapters`].
+    /// Dense vendored UNet with the [`AdapterSpec`]s applied **additively** (sc-11682) — the adapted
+    /// counterpart of [`Self::load_dense_vendored_unet`], through the i32-overflow-safe vendored stack.
+    /// The bf16 base stays a **pristine mmap** (never folded into a host `from_tensors` map), so
+    /// epic-10765 offload/eviction can drop-and-restore it cheaply — a fold `W += δ` mutates the weight
+    /// into a non-disk-re-derivable host copy that must be pinned. The adapter rides as forward-time
+    /// residuals on both the Linear ([`crate::adapters::install_additive`]) and conv
+    /// ([`crate::adapters::install_additive_conv`]) surfaces; additive equals the fold to f32 tolerance
+    /// (and matches the trainer's own additive forward — the ~1-ULP `(W+δ)·x` gap is the *fold*'s, not
+    /// the residual's). The kohya table is read from the file header (no data copy) so community
+    /// `lora_unet_<flat>` keys resolve against the mmap base.
     fn load_dense_vendored_unet_with_adapters(&self, unet_file: &Path) -> Result<VendoredUNet> {
-        let mut tensors = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
-        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
-        let vs = VarBuilder::from_tensors(tensors, self.dtype, &self.device);
-        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
+        let table = crate::adapters::build_sdxl_kohya_table_from_file(unet_file)?;
+        let vs =
+            candle_gen::mmap_var_builder(&[unet_file.to_path_buf()], self.dtype, &self.device)?;
+        let mut unet = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
+        let lin =
+            crate::adapters::install_additive(&mut unet, &self.adapters, &table, &self.device)?;
+        let conv = crate::adapters::install_additive_conv(
+            &mut unet,
+            &self.adapters,
+            &table,
+            &self.device,
+        )?;
+        crate::adapters::guard_additive_matched(self.adapters.len(), lin.applied + conv.applied)?;
+        Ok(unet)
     }
 
     /// Render `req` against pre-resolved `text_embeddings` and (caller-cached, sc-5037) `unet`/`vae`,
