@@ -54,12 +54,12 @@ fn main() {
         "KREA_CTRL_BASE",
         "/Users/michael/.cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots/d009674080cc1bccf2b629d834c34bf5eccdb723/bf16",
     );
-    // The converted MLX overlay. Until it is re-hosted, produce it locally and point `KREA_CTRL_OVERLAY`
-    // at the output:
-    //   cargo run --example krea-control-convert -p mlx-gen-krea -- \
-    //     <hf-cache>/models--SceneWorks--krea2-pose-controlnet-beta/snapshots/<rev>/control_step5000.safetensors \
-    //     /tmp/control_step5000.mlx.safetensors
-    let overlay = env_or("KREA_CTRL_OVERLAY", "/tmp/control_step5000.mlx.safetensors");
+    // The candle pose overlay, loaded DIRECTLY (RmsScale accepts the candle `*.weight_p1` convention —
+    // no convert step). Defaults to the cached hosted checkpoint.
+    let overlay = env_or(
+        "KREA_CTRL_OVERLAY",
+        "/Users/michael/.cache/huggingface/hub/models--SceneWorks--krea2-pose-controlnet-beta/snapshots/cb3a0ac7590f5ec594a4eeb43b95ee1da0b5a0ac/control_step5000.safetensors",
+    );
     let pose = env_or(
         "KREA_CTRL_POSE",
         "/Users/michael/Repos/SceneWorks/poses/tpose_01.png",
