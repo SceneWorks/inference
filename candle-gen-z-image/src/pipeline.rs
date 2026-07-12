@@ -292,19 +292,10 @@ impl Pipeline {
         // `quantization` block in each component's `config.json`; on detection the TE + DiT + VAE load
         // **straight from the packed parts** (sc-9408, no dense bf16 staging). A dense snapshot
         // (`Tongyi-MAI/Z-Image-Turbo`, no `quantization` block) takes the stock path unchanged. Adapters
-        // (LoRA/LoKr) are a dense-only path (they merge into dense DiT weights), so a packed tier is not
-        // combined with adapters — `load` rejects that combination.
+        // (LoRA/LoKr) fold into *dense* DiT weights on the dense tier; on a **packed** tier they ride as
+        // **forward-time additive residuals** on the packed base (sc-11105), so a user LoRA no longer
+        // forces a full dense build.
         let packed = self.component_is_packed("transformer")?;
-
-        // A packed tier is a dense-free load; LoRA/LoKr merge into *dense* DiT weights, so the two are
-        // incompatible. Reject loudly rather than silently ignore the adapters on the packed path.
-        if packed && !self.adapters.is_empty() {
-            return Err(CandleError::Msg(
-                "z-image: LoRA/LoKr adapters are not supported on a pre-quantized (packed) tier — \
-                 use a dense bf16 snapshot for adapter merge"
-                    .into(),
-            ));
-        }
 
         let text_encoder = if self.component_is_packed("text_encoder")? {
             let vb = self.component_vb("text_encoder")?;
@@ -320,10 +311,16 @@ impl Pipeline {
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
         let transformer = if packed {
-            // Packed tier: build the vendored packed-detect DiT straight from the packed parts. Adapters
-            // are incompatible with a packed tier (rejected at load), so no merge path here.
+            // Packed tier: build the vendored packed-detect DiT straight from the packed parts, then —
+            // if the caller supplied adapters — install them as forward-time additive residuals on the
+            // packed base (sc-11105). The base stays packed (q4/q8 footprint); the deltas ride unmerged,
+            // never folded into u32 codes. With no adapters this is the byte-identical packed load.
             let vb = self.component_vb("transformer")?;
-            DiT::Packed(Box::new(PackedDit::new(&dit_cfg, vb)?))
+            let mut dit = PackedDit::new(&dit_cfg, vb)?;
+            if !self.adapters.is_empty() {
+                crate::adapters::install_additive(&mut dit, &self.adapters)?;
+            }
+            DiT::Packed(Box::new(dit))
         } else {
             let dit_vb = if self.adapters.is_empty() {
                 // No adapters: the stock mmap build — byte-identical to the pre-sc-5166 path.

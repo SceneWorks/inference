@@ -21,10 +21,12 @@
 //! text-encoder LoRAs (DiT-only merge) and conv-shaped (4-D) factors (the trainer adapts Linear
 //! attention projections only).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use candle_gen::candle_core::Tensor;
+use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+use candle_gen::quant::LokrFactors;
 use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
 // this crate previously hand-copied. Only the DiT-specific key→module resolution stays local below.
@@ -35,6 +37,8 @@ use candle_gen::train::merge::{
 // Re-exported so `candle_gen_z_image::MergeReport` (the crate's public surface) keeps resolving.
 pub use candle_gen::train::merge::MergeReport;
 use candle_gen::{CandleError, Result};
+
+use crate::packed_dit::ZImageTransformer2DModel;
 
 /// PEFT key prefixes tolerated on read, longest-first. The candle Z-Image trainer writes **bare**
 /// dotted paths (no prefix), but community adapters and `peft.save_pretrained()` wrap the DiT under
@@ -267,6 +271,293 @@ pub fn merge_adapters(
             "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` with \
              networkType=lokr (LoKr) over the DiT attention projections. Conv-layer / text-encoder \
              adapters are out of surface",
+            specs.len(),
+        ));
+    }
+    Ok(report)
+}
+
+// ---- Forward-time additive (unmerged) install on a PACKED tier (sc-11105) ------------------------
+//
+// The packed q4/q8 Z-Image tier (`SceneWorks/z-image-turbo-mlx`) has **no dense `W`** to fold a delta
+// into — the [`merge_adapters`] path above (`W += δ`) errors on u32 codes, which is why a user LoRA on a
+// packed tier used to force a full dense build. Instead, [`install_additive`] attaches each LoRA/LoKr as
+// a **forward-time residual** on the DiT's shared [`candle_gen::quant::AdaptLinear`] projections:
+// `y = base(x) + Σ scale·((x·A)·B)`, the base kept packed. So a user adapter applies on the q4/q8 tier at
+// the base's footprint, not a dense reload. The dense tier keeps folding (bit-exact) via
+// [`merge_adapters`]. This mirrors qwen-image-edit's `install_additive` (sc-11091, #425); the resolver
+// reuses this crate's exact [`classify_lora_key`]/[`classify_lokr_key`] + [`LoraAdapterMeta::effective`]
+// so the additive residual equals the fold to f32 tolerance.
+
+/// A resolved LoRA residual pending attachment: `a = downᵀ` `[in, rank]`, `b = upᵀ·(alpha/rank)`
+/// `[rank, out]`, `scale` the user strength. Read on CPU; moved to the DiT device at push.
+struct PendingLora {
+    a: Tensor,
+    b: Tensor,
+    scale: f64,
+}
+
+/// A LoKr module's raw factors + the FULL `(alpha/rank)·strength` scale, pending the projection's
+/// `[out, in]` to build the structured Kronecker factors ([`LokrFactors`], the vec-trick — never the
+/// dense delta).
+struct PendingLokr {
+    w1: Option<Tensor>,
+    w1_a: Option<Tensor>,
+    w1_b: Option<Tensor>,
+    w2: Option<Tensor>,
+    w2_a: Option<Tensor>,
+    w2_b: Option<Tensor>,
+    scale: f64,
+}
+
+/// A report of a forward-time additive install (sc-11105) — the packed-tier analog of [`MergeReport`].
+#[derive(Debug, Default)]
+pub struct AdditiveReport {
+    /// Projections that received a residual (one per `(path, file)` hit; multiple stack).
+    pub applied: usize,
+    /// Resolved target paths present in the adapter file(s) but absent from the DiT surface.
+    pub skipped_targets: Vec<String>,
+    /// Adapter-file keys outside the LoRA/LoKr surface, half-pairs, or shape-mismatched factors.
+    pub skipped_keys: usize,
+}
+
+/// Resolve one LoRA file into per-path [`PendingLora`] (`a = downᵀ`, `b = upᵀ·ratio`). Mirrors
+/// [`merge_lora_file`]'s classify + effective alpha/rank **exactly** (incl. the kohya `table`),
+/// producing UNMERGED factors instead of a folded delta — so the additive residual equals the folded
+/// delta to f32 tolerance.
+fn resolve_lora_file(
+    af: &AdapterFile,
+    scale: f32,
+    table: &BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, Vec<PendingLora>>,
+    skipped_keys: &mut usize,
+) -> Result<()> {
+    let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
+    for (key, t) in &af.tensors {
+        match classify_lora_key(key, table) {
+            Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
+            Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
+            Some((path, Role::Alpha)) => {
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+            }
+            None => *skipped_keys += 1,
+        }
+    }
+    let cfg = LoraAdapterMeta::from_file_metadata(&af.meta);
+    for (path, t) in triples {
+        let (Some(down), Some(up)) = (t.down, t.up) else {
+            *skipped_keys += 1; // half-pair (partner targeted a non-routable module)
+            continue;
+        };
+        if down.dims().len() != 2 || up.dims().len() != 2 {
+            *skipped_keys += 1; // conv-shaped LoRA — out of surface
+            continue;
+        }
+        let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
+        let rank = cfg_rank.unwrap_or(down.dims()[0] as f32) as f64;
+        if rank == 0.0 {
+            *skipped_keys += 1;
+            continue;
+        }
+        let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank as f32) as f64;
+        let ratio = alpha / rank;
+        // a = downᵀ [in, rank]; b = upᵀ·ratio [rank, out]. f32, contiguous for the matmul.
+        let a = down.to_dtype(DType::F32)?.t()?.contiguous()?;
+        let b = (up.to_dtype(DType::F32)?.t()?.contiguous()? * ratio)?;
+        pending.entry(path).or_default().push(PendingLora {
+            a,
+            b,
+            scale: scale as f64,
+        });
+    }
+    Ok(())
+}
+
+/// Resolve one LoKr file into per-path [`PendingLokr`] with the FULL `(alpha/rank)·scale` baked (the
+/// structured residual carries no separate scale field — the two-conventions trap). Mirrors
+/// [`merge_lokr_file`]'s rank/alpha read (file metadata, alpha defaults to rank) + the kohya `table`.
+fn resolve_lokr_file(
+    af: &AdapterFile,
+    scale: f32,
+    table: &BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, Vec<PendingLokr>>,
+    skipped_keys: &mut usize,
+) -> Result<()> {
+    let rank = af
+        .meta
+        .get("rank")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    let alpha = af
+        .meta
+        .get("alpha")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(rank);
+    let full = (alpha as f64 / rank as f64) * scale as f64;
+    let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
+    for (key, t) in &af.tensors {
+        match classify_lokr_key(key, table) {
+            Some((path, factor)) => {
+                grouped.entry(path).or_default().insert(factor, t.clone());
+            }
+            None => *skipped_keys += 1,
+        }
+    }
+    for (path, f) in grouped {
+        pending.entry(path).or_default().push(PendingLokr {
+            w1: f.get("lokr_w1").cloned(),
+            w1_a: f.get("lokr_w1_a").cloned(),
+            w1_b: f.get("lokr_w1_b").cloned(),
+            w2: f.get("lokr_w2").cloned(),
+            w2_a: f.get("lokr_w2_a").cloned(),
+            w2_b: f.get("lokr_w2_b").cloned(),
+            scale: full,
+        });
+    }
+    Ok(())
+}
+
+/// Install `specs` as **forward-time additive residuals** on a **packed** DiT (sc-11105): resolve each
+/// LoRA/LoKr file into unmerged factors, then walk the DiT once pushing residuals onto matched
+/// projections — the base is never dequantized or folded, so a q4/q8 tier keeps its footprint while the
+/// user adapter applies. A **LoHa** (no allocation-free structured form) and an **untagged third-party
+/// LyCORIS** adapter are rejected with a pointer to the dense tier. Like [`merge_adapters`], a non-empty
+/// spec set that matches **no** target errors (never renders unadapted).
+pub fn install_additive(
+    dit: &mut ZImageTransformer2DModel,
+    specs: &[AdapterSpec],
+) -> Result<AdditiveReport> {
+    let mut report = AdditiveReport::default();
+
+    // The kohya `flattened → dotted` table, built from the DiT's own projection paths (all Linear,
+    // rank-2), so a `lora_transformer_<flat>` key resolves exactly as the dense fold's
+    // `build_kohya_table` would (the additive-path analog with no base tensor map at hand).
+    let mut paths: Vec<String> = Vec::new();
+    dit.visit_adaptable_mut(&mut |path, _lin| {
+        paths.push(path.to_string());
+        Ok(())
+    })?;
+    let table: BTreeMap<String, String> = paths
+        .iter()
+        .map(|p| (p.replace('.', "_"), p.clone()))
+        .collect();
+
+    let mut pending_lora: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+    let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
+
+    for spec in specs {
+        let af = read_adapter(&spec.path)?;
+        if wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str)) {
+            return Err(CandleError::Msg(format!(
+                "z_image: a LoHa adapter cannot apply on a packed (q4/q8) tier — its Hadamard product \
+                 `(w1_a·w1_b) ⊙ (w2_a·w2_b)` has no allocation-free structured form (unlike LoKr's \
+                 Kronecker vec-trick), so it would materialize a full [out,in] delta per target. Use a \
+                 dense bf16 snapshot (where it folds into the weight) or a plain LoRA/LoKr. Offending \
+                 file: {}",
+                spec.path.display()
+            )));
+        }
+        // Untagged LyCORIS LoKr (`lokr_*` keys, no `networkType=lokr` stamp, not declared) carries its
+        // scale per-module in a way this additive resolver doesn't thread; reject on packed rather than
+        // silently mis-scale (the dense tier folds it via `merge_adapters`).
+        let untagged_lokr = !af.declares_lokr()
+            && spec.kind != AdapterKind::Lokr
+            && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str));
+        if untagged_lokr {
+            return Err(CandleError::Msg(format!(
+                "z_image: an untagged third-party LyCORIS LoKr cannot apply additively on a packed \
+                 (q4/q8) tier — use a dense bf16 snapshot (where `merge_adapters` folds it), a \
+                 PEFT-stamped LoKr (`networkType=lokr`), or a plain LoRA. Offending file: {}",
+                spec.path.display()
+            )));
+        }
+        if spec.kind == AdapterKind::Lokr || af.declares_lokr() {
+            resolve_lokr_file(
+                &af,
+                spec.scale,
+                &table,
+                &mut pending_lokr,
+                &mut report.skipped_keys,
+            )?;
+        } else {
+            resolve_lora_file(
+                &af,
+                spec.scale,
+                &table,
+                &mut pending_lora,
+                &mut report.skipped_keys,
+            )?;
+        }
+    }
+
+    // Attach: walk the DiT once, pushing any resolved residual for each projection's canonical path. The
+    // factors are read on the CPU but the base weight lives on the DiT device (CUDA on a packed tier),
+    // so they are moved onto it at push. A factor whose dims don't match the projection is surfaced as a
+    // skipped key, never a crashing forward (the additive analog of the fold path's shape guard).
+    let device = dit.device().clone();
+    let mut matched: HashSet<String> = HashSet::new();
+    let mut applied = 0usize;
+    let mut skipped_keys = 0usize;
+    dit.visit_adaptable_mut(&mut |path, lin| {
+        let (out_f, in_f) = lin.base_shape();
+        if let Some(list) = pending_lora.get(path) {
+            matched.insert(path.to_string());
+            for p in list {
+                if p.a.dims()[0] != in_f || p.b.dims()[1] != out_f {
+                    skipped_keys += 1;
+                    continue;
+                }
+                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
+                applied += 1;
+            }
+        }
+        if let Some(list) = pending_lokr.get(path) {
+            matched.insert(path.to_string());
+            for p in list {
+                match LokrFactors::build(
+                    p.scale,
+                    (out_f, in_f),
+                    p.w1.as_ref(),
+                    p.w1_a.as_ref(),
+                    p.w1_b.as_ref(),
+                    p.w2.as_ref(),
+                    None, // no tucker/CP `lokr_t2` on the peft LoKr surface
+                    p.w2_a.as_ref(),
+                    p.w2_b.as_ref(),
+                )? {
+                    Some(factors) => {
+                        lin.push_lokr_structured(factors.to_device(&device)?);
+                        applied += 1;
+                    }
+                    None => {
+                        return Err(CandleError::Msg(format!(
+                            "z_image: LoKr target `{path}` is not deferrable on a packed tier (a \
+                             tucker/CP `lokr_t2`, or a base that does not factor as a·b × c·d) — no \
+                             allocation-free structured form. Use a dense bf16 snapshot."
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    report.applied = applied;
+    report.skipped_keys += skipped_keys;
+
+    // Pending targets absent from the DiT surface are surfaced, never silently dropped.
+    for path in pending_lora.keys().chain(pending_lokr.keys()) {
+        if !matched.contains(path) {
+            report.skipped_targets.push(path.clone());
+        }
+    }
+    // A non-empty spec set that adapted nothing is a format/prefix misconfiguration — fail loudly rather
+    // than render an unadapted image (the additive twin of `merge_adapters`' zero-match guard).
+    if !specs.is_empty() && report.applied == 0 {
+        return Err(no_target_matched(
+            "z_image",
+            "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` with \
+             networkType=lokr (LoKr) over the DiT projections. Conv-layer / text-encoder adapters \
+             are out of surface",
             specs.len(),
         ));
     }
@@ -598,6 +889,79 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(mag > 0.0, "forced-nonzero B must yield a non-trivial delta");
+    }
+
+    /// **Additive == folded parity at the resolver level (sc-11105).** The unmerged factors
+    /// [`resolve_lora_file`] produces (`a = downᵀ`, `b = upᵀ·(alpha/rank)`, pushed at the user `scale`)
+    /// reproduce the folded `x·(W + δ)ᵀ` on a dense [`candle_gen::quant::AdaptLinear`] base — using this
+    /// crate's exact [`classify_lora_key`] + effective alpha/rank — so the **packed additive** path and
+    /// the **dense fold** path agree to f32 tolerance (the parity the ~1-ULP sampler sensitivity needs).
+    #[test]
+    fn resolve_lora_matches_fold_on_dense() {
+        use candle_gen::candle_nn::Linear;
+        use candle_gen::quant::AdaptLinear;
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank) = (16usize, 12usize, 3usize);
+        let path = "layers.0.attention.to_q";
+        let down = Tensor::randn(0f32, 1f32, (rank, in_dim), &dev).unwrap(); // A [rank, in]
+        let up = Tensor::randn(0f32, 1f32, (out_dim, rank), &dev).unwrap(); // B [out, rank]
+        let (alpha, scale) = (6.0f32, 0.8f32); // ratio = alpha/rank = 2.0
+        let af = AdapterFile {
+            tensors: HashMap::from([
+                // Bare/PEFT `.lora_A/.lora_B` (the naming this crate's `classify_lora_key` recognizes
+                // off the kohya prefix), matching the trainer's `save_lora_peft` output.
+                (format!("{path}.lora_A.weight"), down.clone()),
+                (format!("{path}.lora_B.weight"), up.clone()),
+                (
+                    format!("{path}.alpha"),
+                    Tensor::from_vec(vec![alpha], (1,), &dev).unwrap(),
+                ),
+            ]),
+            meta: HashMap::new(),
+        };
+        let table: BTreeMap<String, String> = BTreeMap::new();
+        let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+        let mut skipped = 0usize;
+        resolve_lora_file(&af, scale, &table, &mut pending, &mut skipped).unwrap();
+        assert_eq!(skipped, 0, "clean LoRA resolves with no skipped keys");
+        let p = &pending[path][0];
+        assert_eq!(p.a.dims(), &[in_dim, rank], "a = downᵀ [in, rank]");
+        assert_eq!(p.b.dims(), &[rank, out_dim], "b = upᵀ·ratio [rank, out]");
+
+        // Additive: base W + the resolved residual.
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let mut additive = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
+        additive.push_lora(p.a.clone(), p.b.clone(), p.scale);
+
+        // Folded: δ = (alpha/rank)·scale·(B·A); W_merged = W + δ.
+        let delta = reconstruct_lora_delta(&down, &up, alpha, rank as f32, scale).unwrap();
+        let folded =
+            AdaptLinear::from_dense(Linear::new((w + delta).unwrap(), None), in_dim, out_dim);
+
+        let x = Tensor::randn(0f32, 1f32, (2usize, in_dim), &dev).unwrap();
+        let d = (additive.forward(&x).unwrap() - folded.forward(&x).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(d < 1e-4, "resolved additive != folded (max diff {d})");
+    }
+
+    /// A **LoHa** file (`hada_*`) and an untagged third-party **LyCORIS LoKr** (`lokr_*`, no
+    /// `networkType` stamp) are detected by the key sniffers [`install_additive`] rejects on a packed
+    /// tier (they have no allocation-free structured form / mis-scale risk). sc-11105.
+    #[test]
+    fn loha_and_untagged_lokr_are_detected() {
+        use candle_gen::gen_core::weightsmeta as wmeta;
+        assert!(wmeta::keys_contain_loha(
+            ["layers.0.attention.to_q.hada_w1_a"].into_iter()
+        ));
+        assert!(wmeta::keys_contain_lokr(
+            ["layers.0.attention.to_q.lokr_w1"].into_iter()
+        ));
     }
 
     /// A non-empty spec list that matches nothing is a loud error (not a silent unadapted render).
