@@ -36,17 +36,21 @@ pub const KREA_2_TURBO_CONTROL_ID: &str = "krea_2_turbo_control";
 const DEFAULT_STEPS: u32 = 8;
 
 /// Krea 2 Turbo pose-control identity + capabilities. Derived from the base Turbo [`crate::model::descriptor`]
-/// so the shared surface (family/backend/samplers/size bounds/LoRA/mac_only) stays in lockstep; the pose
-/// control lane swaps the Turbo img2img `Reference` surface for a required `Control` conditioning and is
-/// dense-only (the overlay is trained on the bf16 base — no quant tier, matching candle).
+/// so the shared surface (family/backend/samplers/size bounds/LoRA/mac_only/**supported_quants**) stays in
+/// lockstep; the pose control lane only swaps the Turbo img2img `Reference` surface for a required `Control`
+/// conditioning.
+///
+/// Q4/Q8 base (sc-11727, candle-gen PR #471): the earlier "dense-only" gate assumed a packed base would
+/// desync the main-stream activations the residual was trained against. That assumption was refuted — a
+/// q8 base is visually indistinguishable from bf16 and q4 keeps the pose-lock fully intact (GPU-proven on
+/// the candle twin). mlx-gen's control lane reuses the same packed-capable [`Krea2Transformer`] as txt2img,
+/// so a packed snapshot runs a **true packed forward** (real memory savings), not candle's dequant-to-bf16
+/// VRAM overlay — so we inherit the base Turbo `&[Q4, Q8]` rather than blanking it.
 pub fn descriptor() -> ModelDescriptor {
     let mut d = crate::model::descriptor();
     d.id = KREA_2_TURBO_CONTROL_ID;
     // Pose ControlNet: a required Control conditioning replaces Turbo's optional img2img Reference.
     d.capabilities.conditioning = vec![ConditioningKind::Control];
-    // Dense bf16 only — the pose overlay is trained on the dense base; a packed base would desync the
-    // main-stream activations the residual was trained against (candle "no quant tier").
-    d.capabilities.supported_quants = &[];
     d
 }
 
@@ -58,9 +62,9 @@ pub struct KreaTurboControl {
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase +
     /// DiT + VAE + branch warm; `Sequential` holds only the per-phase loader closures and re-loads per
     /// generation in phase order (encode → **drop the text phase** → denoise/decode), bounding peak
-    /// unified memory to `max(text, DiT+VAE+branch)`. Dense bf16 only, so the tier that matters here is
-    /// bf16 (no Q8/Q4 lever). The [`Residency`] seam owns the eval/drop/clear discipline, the
-    /// stage-boundary cancel checks, and the error-safe cache flush.
+    /// unified memory to `max(text, DiT+VAE+branch)`. Base weights may be dense bf16 or packed Q4/Q8
+    /// (sc-11727); a packed base further lowers the `DiT+VAE+branch` term. The [`Residency`] seam owns the
+    /// eval/drop/clear discipline, the stage-boundary cancel checks, and the error-safe cache flush.
     residency: Residency<KreaText, ControlHeavyOwned>,
 }
 
@@ -91,11 +95,13 @@ impl ControlHeavyOwned {
 
 /// Construct a [`KreaTurboControl`] from a [`LoadSpec`].
 ///
-/// `spec.weights` must be a [`WeightsSource::Dir`] DENSE `krea/Krea-2-Turbo` snapshot (`transformer/
-/// text_encoder/ vae/ tokenizer/`), and `spec.control` (required) the converted MLX pose overlay
-/// (`control_step5000` — a single `.safetensors` `File`, or a `Dir` of shards). Loaded dense bf16;
-/// Raw-trained LoRA/LoKr in `spec.adapters` install onto the base DiT (the branch is never an adapter
-/// target). A `spec.quantize` override is rejected — the pose overlay is dense-only.
+/// `spec.weights` must be a [`WeightsSource::Dir`] `krea/Krea-2-Turbo` snapshot (`transformer/
+/// text_encoder/ vae/ tokenizer/`) — a dense bf16 tier OR a pre-packed Q4/Q8 turnkey — and `spec.control`
+/// (required) the converted MLX pose overlay (`control_step5000` — a single `.safetensors` `File`, or a
+/// `Dir` of shards). Raw-trained LoRA/LoKr in `spec.adapters` install onto the base DiT (the branch is
+/// never an adapter target). Quantization is supported (sc-11727): a pre-packed snapshot runs a true
+/// packed forward directly, and a dense snapshot + `spec.quantize` quantizes the base at load — either way
+/// only the base DiT/TE pack; the pose overlay itself stays the bf16 it was trained as.
 ///
 /// Component residency (epic 10834 Phase 1, sc-11101; hoisted to the shared [`Residency::from_policy`]
 /// seam in sc-11126, F-180): `Resident` (default) builds every component now and holds it warm;
@@ -113,22 +119,18 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 /// The up-front spec validation shared by [`load`] and [`build_control_residency`] (fail-fast for BOTH
-/// residencies): dense bf16, a base snapshot dir, the required pose overlay, and no quant override.
+/// residencies): bf16 activation precision, a base snapshot dir, and the required pose overlay. Quant is
+/// allowed (sc-11727) — a pre-packed snapshot or a `spec.quantize` request both pack only the base DiT/TE,
+/// leaving activations bf16 — so there is no quant rejection here.
 fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
-            "{KREA_2_TURBO_CONTROL_ID}: only the default dense bf16 precision is wired (drop the \
-             precision override)"
+            "{KREA_2_TURBO_CONTROL_ID}: only the default bf16 activation precision is wired (drop the \
+             precision override); Q4/Q8 weight packing is orthogonal and IS supported"
         )));
     }
     let _ = require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
     let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(format!(
-            "{KREA_2_TURBO_CONTROL_ID}: the pose control overlay is trained on the dense bf16 base; \
-             quantization is not supported (drop the quant override, point at a dense snapshot)"
-        )));
-    }
     Ok(())
 }
 
@@ -136,15 +138,16 @@ fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
 /// (sc-11101; hoisted to the shared seam in sc-11126, F-180) so the `match offload_policy` lives in one
 /// place rather than a bespoke per-crate copy. `Resident` eager-loads the text phase + heavy bundle now;
 /// `Sequential` captures the two per-phase loaders and loads nothing now, deferring each to
-/// [`Residency::run`]. Both go through the same [`KreaText::from_snapshot`] / [`load_control_heavy`], so
-/// the `Resident` composition is byte-identical to the pre-seam one. Dense bf16 only (quant is rejected
-/// by [`validate_control_spec`]), so there is no F-181 re-quant concern; the pose branch carries no PiD
-/// overlay, so the seam's `use_pid` arg is unused. The deferral is weight-free-testable: under
+/// [`Residency::run`]. Both go through the same [`crate::model::load_krea_text`] / [`load_control_heavy`],
+/// so the `Resident` composition is byte-identical to the pre-seam one. Quant packs only the base DiT/TE
+/// (sc-11727) and there is no re-quant across residencies (both share the load→adapt→quantize order), so
+/// no F-181 concern; the pose branch carries no PiD overlay, so the seam's `use_pid` arg is unused. The
+/// deferral is weight-free-testable: under
 /// `Sequential` this touches no component weights, so a dispatch that mapped `Sequential → Resident`
 /// (ignoring `offload_policy`) would eager-load here and fail the "Sequential defers" unit test.
 fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, ControlHeavyOwned>> {
-    // Up-front fail-fast for both policies (precision + base dir + control present + no quant), so a
-    // direct call (e.g. the F-180 unit test) rejects an invalid spec exactly as `load` does.
+    // Up-front fail-fast for both policies (precision + base dir + control present), so a direct call
+    // (e.g. the F-180 unit test) rejects an invalid spec exactly as `load` does.
     validate_control_spec(spec)?;
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
@@ -156,7 +159,9 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
                 KREA_2_TURBO_CONTROL_ID,
                 "a base snapshot directory",
             )?;
-            KreaText::from_snapshot(root)
+            // Reuse the txt2img text loader so the Qwen3-VL TE packs identically (sc-11727): pre-packed
+            // auto-detects, dense + `spec.quantize` quantizes at load, activations stay bf16.
+            crate::model::load_krea_text(&spec_text, root, KREA_2_TURBO_CONTROL_ID)
         },
         move |_use_pid| {
             let root = require_base_dir(
@@ -170,14 +175,23 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 }
 
 /// Load the pose-control heavy phase — the base DiT + VAE ([`KreaHeavy`]), Raw-trained LoRA/LoKr on the
-/// base DiT (the branch is never an adapter target), then the pose branch (`spec.control`). Dense bf16
-/// (no quant). Factored so `Sequential` loads these AFTER the text phase is dropped. `spec.control` was
-/// already validated present by [`load`]; re-requiring it here keeps the `Sequential` per-generate path
-/// self-contained.
+/// base DiT (the branch is never an adapter target), the optional base-DiT quantize, then the pose branch
+/// (`spec.control`). Factored so `Sequential` loads these AFTER the text phase is dropped. `spec.control`
+/// was already validated present by [`load`]; re-requiring it here keeps the `Sequential` per-generate
+/// path self-contained.
+///
+/// Quant order mirrors the txt2img lane (sc-11727): install adapters, THEN quantize, so the residual
+/// stacks over the (possibly already-packed) base. A pre-packed snapshot needs no `spec.quantize` — the
+/// auto-detecting loader already built packed Linears in [`KreaHeavy::from_snapshot`], and
+/// [`crate::model::load_time_quant_bits`] returns `None` (or errors on a bit mismatch). The pose branch
+/// stays bf16: its overlay carries no `.scales`, and [`KreaHeavy::quantize`] only touches the base DiT.
 fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned> {
     let mut heavy = KreaHeavy::from_snapshot(root)?;
     if !spec.adapters.is_empty() {
         heavy.apply_adapters(&spec.adapters)?;
+    }
+    if let Some(bits) = crate::model::load_time_quant_bits(spec, root, KREA_2_TURBO_CONTROL_ID)? {
+        heavy.quantize(bits)?;
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let cfg = Krea2Config::from_snapshot(root)?;
@@ -300,12 +314,13 @@ mod tests {
         assert_eq!(d.family, "krea_2");
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
-        // Pose ControlNet: Control conditioning (not the base Turbo Reference), CFG-free, dense-only.
+        // Pose ControlNet: Control conditioning (not the base Turbo Reference), CFG-free.
         assert!(d.capabilities.accepts(ConditioningKind::Control));
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
-        assert_eq!(d.capabilities.supported_quants, &[] as &[Quant]);
+        // Q4/Q8 base is supported (sc-11727) — inherited from the base Turbo descriptor, no longer blanked.
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         // Shared surface stays in lockstep with the base Turbo descriptor.
         assert!(d.capabilities.mac_only);
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
@@ -333,13 +348,20 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_quant_override() {
-        // Dense-only: a quant override is rejected (not silently ignored), even with a control overlay.
+    fn load_accepts_quant_override() {
+        // sc-11727: a quant override is NOT rejected (Q4/Q8 base is supported). Pin `Resident` so the load
+        // deterministically eager-loads and fails on the missing weights — NOT on a dense-only quant guard.
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()))
             .with_control(WeightsSource::File("/tmp/control.safetensors".into()))
+            .with_offload_policy(OffloadPolicy::Resident)
             .with_quant(Quant::Q8);
         let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("quantization is not supported"), "got: {err}");
+        assert!(
+            !err.contains("quantization is not supported")
+                && !err.contains("Q4/Q8")
+                && !err.contains("precision override"),
+            "quant override must be accepted, not rejected by a dense-only guard; got: {err}"
+        );
     }
 
     #[test]
