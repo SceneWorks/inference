@@ -14,14 +14,16 @@ use mlx_gen::media::Image;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Result,
+    WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
 
+use mlx_rs::Array;
 use std::path::Path;
 
-use crate::pipeline::{base_schedule, turbo_schedule, KreaPipeline, TurboOptions};
+use crate::pipeline::{base_schedule, turbo_schedule, KreaHeavy, KreaText, TurboOptions};
 
 /// Read the on-disk packed-quantization bits from `transformer/config.json` for a pre-quantized
 /// (Group-B packed) Krea turnkey (`"quantization": {"bits", "group_size"}`); `None` for dense.
@@ -161,16 +163,74 @@ pub fn edit_descriptor() -> ModelDescriptor {
     d
 }
 
-/// A loaded Krea 2 generator (Turbo or Raw): the cached descriptor + the assembled pipeline (tokenizer +
-/// Qwen3-VL-4B condition encoder + single-stream DiT + Qwen-Image VAE). The variant is read back off
-/// `descriptor.id` at generate time (Turbo = CFG-free distilled; Raw = full-CFG undistilled).
+/// A loaded Krea 2 generator (Turbo, Raw, or edit): the cached descriptor + a component-residency
+/// strategy. The variant is read back off `descriptor.id` at generate time (Turbo = CFG-free distilled;
+/// Raw = full-CFG undistilled; edit = the Raw pipeline routed to the Kontext edit entrypoint).
 pub struct Krea {
     descriptor: ModelDescriptor,
-    pipeline: KreaPipeline,
+    /// Component-residency strategy (epic 10834 Phase 1, sc-11101), selected from
+    /// [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen3-VL-4B text phase + DiT + VAE
+    /// warm for the whole job and across jobs; `Sequential` holds only the [`LoadSpec`] and re-loads per
+    /// generation in phase order (encode → **drop the text phase** → denoise/decode), bounding peak
+    /// unified memory to `max(text, DiT+VAE)` instead of the sum (the Qwen3-VL-4B text phase is the
+    /// dropped ~4B component; the single-stream DiT is 12B).
+    residency: Residency,
+}
+
+/// The heavy-component residency for a [`Krea`] (sc-11101). See [`Krea::residency`].
+enum Residency {
+    /// Every component loaded once at [`load_variant`] and held (today's warm-cache path). `generate`
+    /// borrows these. Boxed so this heavy variant doesn't bloat every `Sequential` handle
+    /// (`clippy::large_enum_variant`).
+    Resident(Box<KreaResident>),
+    /// Only the [`LoadSpec`] is held; each `generate` re-loads the components in phase order and frees
+    /// them after, so peak memory is `max(text, DiT+VAE)` and nothing stays resident across jobs. The
+    /// per-phase loaders rebuild byte-identical components to the `Resident` path.
+    Sequential(Box<LoadSpec>),
+}
+
+/// The Krea text phase held resident (the phase dropped first under `Sequential`), paired with the
+/// heavy render bundle. Split so the `Resident` and `Sequential` paths hand the render body the exact
+/// same [`KreaHeavyRef`] borrow.
+struct KreaResident {
+    text: KreaText,
+    heavy: KreaHeavyOwned,
+}
+
+/// The heavy render-phase components (the single-stream DiT + VAE, via [`KreaHeavy`], plus the optional
+/// PiD decoder) — everything but the text phase. Owned by the `Resident` components or by a
+/// `Sequential` generate.
+struct KreaHeavyOwned {
+    heavy: KreaHeavy,
     /// Optional PiD super-resolving decoder (epic 7840, sc-7845), loaded when `spec.pid` is set; Krea
     /// reuses the Qwen-Image latent space, so it shares the `qwenimage` PiD student. `req.use_pid`
     /// routes decode through it instead of the VAE. `None` for the plain VAE path.
     pid: Option<PidEngine>,
+}
+
+/// A borrow of the heavy render-phase components, so the denoise/decode dispatch runs identically
+/// whether they are held resident or were just loaded by the `Sequential` path.
+struct KreaHeavyRef<'a> {
+    heavy: &'a KreaHeavy,
+    pid: Option<&'a PidEngine>,
+}
+
+impl KreaHeavyOwned {
+    fn as_ref(&self) -> KreaHeavyRef<'_> {
+        KreaHeavyRef {
+            heavy: &self.heavy,
+            pid: self.pid.as_ref(),
+        }
+    }
+}
+
+/// The pre-encoded DiT text context(s) a `generate` renders from (sc-11101): the conditional context
+/// always, plus the unconditional one for true-CFG (`krea_2_raw` / `krea_2_edit` with `guidance > 0`).
+/// Produced once by [`Krea::encode`] (Turbo/Raw = plain text encode; edit = Qwen3-VL grounded encode)
+/// so a `Sequential` job can drop the text phase before the DiT loads.
+struct KreaContexts {
+    pos: Array,
+    neg: Option<Array>,
 }
 
 /// Load a Krea generator from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`] pointing
@@ -199,41 +259,62 @@ pub fn load_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(spec, edit_descriptor())
 }
 
-/// Shared loader behind [`load`] / [`load_raw`]: assemble the pipeline from a snapshot dir, install any
-/// Raw-trained LoRA/LoKr adapters, apply the optional (F-076-guarded) quantize, and overlay a PiD
-/// decoder. `descriptor` selects the variant (Turbo vs Raw) the returned [`Krea`] renders.
+/// Shared loader behind [`load`] / [`load_raw`] / [`load_edit`]: build the residency from a snapshot
+/// dir. `Resident` (default) assembles every component now and holds it warm; `Sequential` keeps only
+/// the [`LoadSpec`] and re-loads per generate in phase order (encode → drop the text phase →
+/// denoise/decode) to bound peak memory to `max(text, DiT+VAE)`. Both use the same per-phase loaders
+/// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
+/// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
-    let id = descriptor.id;
+    let residency = match spec.offload_policy {
+        OffloadPolicy::Resident => {
+            let root = resolve_root(spec, descriptor.id)?;
+            let text = load_krea_text(spec, root, descriptor.id)?;
+            let heavy = load_krea_heavy(spec, root, descriptor.id)?;
+            Residency::Resident(Box::new(KreaResident { text, heavy }))
+        }
+        OffloadPolicy::Sequential => {
+            // Validate precision + snapshot dir up front (fail fast, same as `Resident`); the heavy
+            // build is deferred to each generate.
+            let _ = resolve_root(spec, descriptor.id)?;
+            Residency::Sequential(Box::new(spec.clone()))
+        }
+    };
+    Ok(Box::new(Krea {
+        descriptor,
+        residency,
+    }))
+}
+
+/// Precision guard (only dense bf16 is wired) + snapshot-dir resolution (rejecting a single-file
+/// source), shared by [`load_krea_text`] / [`load_krea_heavy`] and the `Sequential` per-phase loaders
+/// (sc-11101).
+fn resolve_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{id}: only the default dense precision is wired (drop the precision override)"
         )));
     }
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(Error::Msg(format!(
-                "{id} expects a snapshot directory (transformer/ text_encoder/ vae/), not a single \
-                 .safetensors file"
-            )))
-        }
-    };
-    // Assemble the full Turbo pipeline (tokenizer + TE + DiT + VAE); auto-detects a packed Q4/Q8
-    // turnkey vs a dense bf16 snapshot. `spec.quantize` then quantizes the dense base in place (a no-op
-    // on an already-packed snapshot — `AdaptableLinear::quantize` skips quantized bases).
-    let mut pipeline = KreaPipeline::from_snapshot(root)?;
-    // Install Raw-trained LoRA/LoKr adapters onto the DiT BEFORE the optional quantize, so the
-    // residual stacks over the (possibly already-packed) base — the Lens load→apply→quantize order.
-    // The shared seam errors (never silently drops) on an adapter target that matches no module.
-    if !spec.adapters.is_empty() {
-        pipeline.apply_adapters(&spec.adapters)?;
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(format!(
+            "{id} expects a snapshot directory (transformer/ text_encoder/ vae/), not a single \
+             .safetensors file"
+        ))),
     }
-    if let Some(q) = spec.quantize {
-        // F-076: on an already-packed turnkey, `pipeline.quantize()` is a no-op, so e.g. Q4 over a
-        // Q8 turnkey would silently serve Q8. Compare the requested bits against the config.json
-        // `quantization.bits` marker the Group-B converter writes; error on mismatch. A dense
-        // snapshot (no marker) takes the ordinary in-place quantize.
-        if let Some(packed) = packed_quant_bits(root) {
+}
+
+/// Resolve the load-time quantize for a component (F-076). Returns `Some(bits)` to quantize the dense
+/// base in place, or `None` when there is no quant OR the turnkey is already packed at the requested
+/// bits (`quantize()` would be a no-op). Errors on a packed-vs-requested mismatch so e.g. Q4 over a Q8
+/// turnkey never silently serves Q8. Shared by the text + heavy loaders (the marker in
+/// `transformer/config.json` is model-wide), so both phases decide identically.
+fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Result<Option<i32>> {
+    let Some(q) = spec.quantize else {
+        return Ok(None);
+    };
+    match packed_quant_bits(root) {
+        Some(packed) => {
             if packed != q.bits() {
                 return Err(Error::Msg(format!(
                     "{id}: snapshot is a pre-quantized Q{packed} turnkey but Q{} was \
@@ -243,9 +324,36 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
                     q.bits()
                 )));
             }
-        } else {
-            pipeline.quantize(q.bits())?;
+            Ok(None)
         }
+        None => Ok(Some(q.bits())),
+    }
+}
+
+/// Load the Krea text phase (tokenizer + Qwen3-VL-4B condition encoder + vision tower) — the component
+/// dropped first under `Sequential`. Applies the optional (F-076-guarded) text-encoder quantize; the
+/// VAE + vision tower stay dense (the monolithic `KreaPipeline::quantize` quantized `te` + `dit`, not
+/// the VAE/vision), so the `Resident` and `Sequential` paths build byte-identical text phases.
+fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<KreaText> {
+    let mut text = KreaText::from_snapshot(root)?;
+    if let Some(bits) = load_time_quant_bits(spec, root, id)? {
+        text.quantize(bits)?;
+    }
+    Ok(text)
+}
+
+/// Load the Krea heavy render phase (single-stream DiT + VAE + the optional PiD overlay) — everything
+/// but the text phase. Install Raw-trained LoRA/LoKr adapters onto the DiT BEFORE the optional quantize,
+/// so the residual stacks over the (possibly already-packed) base (the Lens load→apply→quantize order);
+/// the shared seam errors (never silently drops) on an adapter target that matches no module. Factored
+/// so `Sequential` loads these AFTER the text phase is dropped (bounding peak to `max(text, DiT+VAE)`).
+fn load_krea_heavy(spec: &LoadSpec, root: &Path, id: &str) -> Result<KreaHeavyOwned> {
+    let mut heavy = KreaHeavy::from_snapshot(root)?;
+    if !spec.adapters.is_empty() {
+        heavy.apply_adapters(&spec.adapters)?;
+    }
+    if let Some(bits) = load_time_quant_bits(spec, root, id)? {
+        heavy.quantize(bits)?;
     }
     // Optional PiD decoder overlay (sc-7845): Krea reuses the Qwen-Image latent space, so it loads the
     // same `qwenimage` student + Gemma-2 caption encoder when `spec.pid` is set.
@@ -254,11 +362,7 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
         .as_ref()
         .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
         .transpose()?;
-    Ok(Box::new(Krea {
-        descriptor,
-        pipeline,
-        pid,
-    }))
+    Ok(KreaHeavyOwned { heavy, pid })
 }
 
 mlx_gen::impl_generator!(Krea {
@@ -267,10 +371,102 @@ mlx_gen::impl_generator!(Krea {
 });
 
 impl Krea {
+    /// Text-encode the prompt (and, for true CFG, the negative) per the residency (sc-11101). `Resident`
+    /// borrows the warm Qwen3-VL-4B text phase (byte-identical to the pre-sc-11101 per-image re-encode —
+    /// the encode is deterministic, the per-image variation comes from the seed inside `render`);
+    /// `Sequential` loads the text phase, encodes, forces materialization (`eval`), then DROPS it +
+    /// `clear_cache()` so its ~4 GB frees before the DiT/VAE load. `is_edit` uses the Qwen3-VL grounded
+    /// encode over the source image; `is_raw`/Turbo the plain text encode. The unconditional context is
+    /// built only when `guidance > 0` (reference `cfg = guidance > 0`; Turbo is CFG-free → always `None`).
+    fn encode(
+        &self,
+        req: &GenerationRequest,
+        is_raw: bool,
+        is_edit: bool,
+        guidance: f32,
+        negative: &str,
+        edit_source: Option<&Image>,
+    ) -> Result<KreaContexts> {
+        let build = |text: &KreaText| -> Result<KreaContexts> {
+            if is_edit {
+                let src = edit_source.ok_or_else(|| {
+                    Error::Msg(format!(
+                        "{}: edit requires a source image",
+                        self.descriptor.id
+                    ))
+                })?;
+                let pos = text.encode_grounded(src, &req.prompt)?;
+                let neg = if guidance > 0.0 {
+                    Some(text.encode_grounded(src, negative)?)
+                } else {
+                    None
+                };
+                Ok(KreaContexts { pos, neg })
+            } else if is_raw {
+                let pos = text.encode(&req.prompt)?;
+                let neg = if guidance > 0.0 {
+                    Some(text.encode(negative)?)
+                } else {
+                    None
+                };
+                Ok(KreaContexts { pos, neg })
+            } else {
+                Ok(KreaContexts {
+                    pos: text.encode(&req.prompt)?,
+                    neg: None,
+                })
+            }
+        };
+        match &self.residency {
+            Residency::Resident(c) => build(&c.text),
+            Residency::Sequential(spec) => {
+                let root = resolve_root(spec, self.descriptor.id)?;
+                let text = load_krea_text(spec, root, self.descriptor.id)?;
+                let ctx = build(&text)?;
+                // MLX is lazy — materialize NOW while `text` is alive, else `pos`/`neg` keep the encoder
+                // weights referenced through the graph and the drop frees nothing (cf. qwen-image's
+                // `encode` / lens's staged encode).
+                match &ctx.neg {
+                    Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
+                    None => mlx_rs::transforms::eval([&ctx.pos])?,
+                }
+                drop(text);
+                mlx_rs::memory::clear_cache();
+                Ok(ctx)
+            }
+        }
+    }
+
+    /// Load the heavy render components (DiT + VAE + PiD) for a `Sequential` job — after [`Self::encode`]
+    /// dropped the text phase — or `None` under `Resident` (already held). Kept separate from
+    /// [`Self::heavy`] so the owned bundle outlives the render-body borrow.
+    fn load_seq_heavy(&self) -> Result<Option<KreaHeavyOwned>> {
+        match &self.residency {
+            Residency::Resident(_) => Ok(None),
+            Residency::Sequential(spec) => {
+                let root = resolve_root(spec, self.descriptor.id)?;
+                Ok(Some(load_krea_heavy(spec, root, self.descriptor.id)?))
+            }
+        }
+    }
+
+    /// Borrow the heavy render components: the warm bundle under `Resident`, or the just-loaded
+    /// `seq_heavy` under `Sequential`. The render dispatch is written once against this borrow.
+    fn heavy<'a>(&'a self, seq_heavy: &'a Option<KreaHeavyOwned>) -> KreaHeavyRef<'a> {
+        match (&self.residency, seq_heavy) {
+            (Residency::Resident(c), _) => c.heavy.as_ref(),
+            (_, Some(owned)) => owned.as_ref(),
+            (Residency::Sequential(_), None) => {
+                unreachable!("Sequential residency always loads seq_heavy before rendering")
+            }
+        }
+    }
+
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
     /// [`mlx_gen::Error`] so `?` lifts `mlx_rs` device exceptions transparently; the trait wrapper
-    /// bridges the tail into [`gen_core::Error`]. Renders `req.count` CFG-free Turbo images, one per
-    /// seed (`seed + n`, mirroring the reference per-prompt seeding).
+    /// bridges the tail into [`gen_core::Error`]. Renders `req.count` images, one per seed (`seed + n`,
+    /// mirroring the reference per-prompt seeding), through the residency (encode → drop text phase under
+    /// `Sequential` → load heavy → per-image render → free heavy).
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -290,38 +486,15 @@ impl Krea {
         } else {
             DEFAULT_STEPS
         }) as usize;
-        // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): when `req.use_pid`, build one PiD
-        // decoder from the prompt and reuse it across the batch — same prompt → same caption; per-image
-        // variation comes from the per-seed latent. `None` → the native VAE. Errors if PiD was requested
-        // but not loaded. With `req.pid_capture_sigma`, resolve the achieved degrade σ + the truncation
-        // `keep` from the (seed-independent) schedule and decode the partially-denoised x_k; else the
-        // clean σ=0 full-denoise path (`capture_sigma = 0`, `keep = MAX`). Raw uses the resolution-
-        // dynamic schedule; both share the Qwen-Image latent space the PiD student decodes.
+        // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): resolve the achieved degrade σ + the
+        // truncation `keep` from the (seed-independent) schedule; the PiD decoder itself is built below
+        // (it needs the heavy phase's PiD engine). Raw/edit use the resolution-dynamic schedule.
         let sigmas = if is_raw {
             base_schedule(steps, req.width, req.height, req.scheduler.as_deref())
         } else {
             turbo_schedule(steps, req.scheduler.as_deref())
         };
         let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
-        let pid_decoder = resolve_pid_decoder_at_sigma(
-            self.pid.as_ref(),
-            req,
-            base_seed,
-            self.descriptor.id,
-            capture_sigma,
-        )?;
-        let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        // img2img (epic 8588 slice A, sc-10135): a single `Conditioning::Reference` seeds the Turbo
-        // denoise from the VAE-encoded reference at `strength` (the reference's own strength, else the
-        // request-level `strength`, else 0.5). Turbo only — the Raw descriptor never advertises
-        // `Reference`, so `reference` is always `None` on the Raw path. A PiD `from_ldm` early-stop
-        // CAPTURE is not wired for img2img yet (sc-10121): reject THAT combo rather than silently desync
-        // the decoder's σ from the img2img-sliced schedule. A capture is active only when the truncation
-        // `keep` lands BEFORE the end of the schedule; the no-capture path (full denoise → the PiD
-        // super-res decoder or the native VAE decodes the clean final latent) reports `keep ==
-        // sigmas.len()` and is perfectly fine with img2img. NB `flow_capture_for_request` returns
-        // `sigmas.len()` (NOT `usize::MAX`) for the no-capture case, so the earlier `keep != usize::MAX`
-        // guard was always true and rejected EVERY img2img gen, PiD or not (the on-device break).
         // Edit extracts its own ordered source list (a single `Reference` or a `MultiReference`
         // scene+person pair, epic 10871 P1.3); img2img/t2i use the single-`Reference` helper. Kept
         // separate so an edit's `MultiReference` never trips `single_reference`'s "exactly one
@@ -336,6 +509,11 @@ impl Krea {
         } else {
             single_reference(req)?
         };
+        // A PiD `from_ldm` early-stop CAPTURE is not wired for img2img yet (sc-10121): reject THAT combo
+        // rather than silently desync the decoder's σ from the img2img-sliced schedule. A capture is
+        // active only when `keep` lands BEFORE the end of the schedule; the no-capture path reports
+        // `keep == sigmas.len()` and is fine with img2img (`flow_capture_for_request` returns
+        // `sigmas.len()`, NOT `usize::MAX`, for no-capture).
         if img2img_conflicts_with_capture(reference.is_some(), keep, sigmas.len()) {
             return Err(Error::Msg(format!(
                 "{}: PiD from_ldm early-stop is not supported with img2img reference conditioning \
@@ -347,6 +525,38 @@ impl Krea {
         // (reference `negative_prompts = [""] * n`). Inert on the Turbo (CFG-free) path.
         let guidance = req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE);
         let negative = req.negative_prompt.clone().unwrap_or_default();
+
+        // Phase A: prompt → context(s) (sc-11101). Under `Sequential` this loads the Qwen3-VL-4B text
+        // phase, encodes, forces materialization, then DROPS it + `clear_cache()` so its ~4 GB frees
+        // before the DiT/VAE load below — the peak-bounding win. Under `Resident` it borrows the warm
+        // text phase. Edit grounds on the first source image.
+        let ctx = self.encode(
+            req,
+            is_raw,
+            is_edit,
+            guidance,
+            &negative,
+            edit_sources.first().copied(),
+        )?;
+
+        // Phase B: heavy render components (DiT + VAE + PiD). `Resident` borrows the warm bundle;
+        // `Sequential` loads it NOW — after the text phase was dropped — and frees it when the job ends.
+        // The render dispatch below runs identically for both residencies.
+        let seq_heavy = self.load_seq_heavy()?;
+        let heavy = self.heavy(&seq_heavy);
+
+        // PiD decode overlay (sc-7845): one decoder serves the whole count loop (same prompt → same
+        // caption). Errors if `req.use_pid` but the model wasn't loaded with `LoadSpec::pid`; `None`
+        // → the native VAE. Resolved against the heavy phase's PiD engine.
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            heavy.pid,
+            req,
+            base_seed,
+            self.descriptor.id,
+            capture_sigma,
+        )?;
+        let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
             let opts = TurboOptions {
@@ -357,17 +567,17 @@ impl Krea {
                 sampler: req.sampler.clone(),
                 scheduler: req.scheduler.clone(),
             };
+            // The one render body per path (sc-11101): the same `KreaHeavy::render_*` for both
+            // residencies, so a Sequential job (text phase already dropped) is byte-identical to Resident.
             let img = if is_edit {
                 // Kontext-style edit (epic 10871): the source image(s) are kept as in-context
-                // conditioning (VAE tokens + Qwen3-VL grounding) — NOT a noised img2img init. Denoises
-                // from PURE NOISE under full CFG, so `strength` (schedule truncation) is meaningless and
-                // a reference's strength is ignored. `edit_sources` is the ordered slice (scene, then
-                // person; P1.3) the pipeline VAE-encodes at successive RoPE frames. The
-                // `krea2_identity_edit` LoRA in `spec.adapters` is what makes the in-context source(s)
-                // actually steer the edit.
-                self.pipeline.generate_edit_with_progress(
-                    &req.prompt,
-                    &negative,
+                // conditioning (VAE tokens + the Qwen3-VL grounding baked into `ctx`) — NOT a noised
+                // img2img init. Denoises from PURE NOISE under full CFG, so a reference's strength is
+                // ignored; `edit_sources` is the ordered slice the pipeline VAE-encodes at successive
+                // RoPE frames. The `krea2_identity_edit` LoRA in `spec.adapters` steers the edit.
+                heavy.heavy.render_edit(
+                    &ctx.pos,
+                    ctx.neg.as_ref(),
                     guidance,
                     &edit_sources,
                     &opts,
@@ -382,9 +592,9 @@ impl Krea {
                 // img2img dispatch splits by variant: Raw takes the true-CFG entrypoint (guidance +
                 // negative prompt honored, sc-10224); Turbo takes the CFG-free distilled one (sc-10135).
                 if is_raw {
-                    self.pipeline.generate_base_img2img_with_progress(
-                        &req.prompt,
-                        &negative,
+                    heavy.heavy.render_base_img2img(
+                        &ctx.pos,
+                        ctx.neg.as_ref(),
                         guidance,
                         init,
                         strength,
@@ -394,8 +604,8 @@ impl Krea {
                         on_progress,
                     )?
                 } else {
-                    self.pipeline.generate_turbo_img2img_with_progress(
-                        &req.prompt,
+                    heavy.heavy.render_turbo_img2img(
+                        &ctx.pos,
                         init,
                         strength,
                         &opts,
@@ -405,9 +615,9 @@ impl Krea {
                     )?
                 }
             } else if is_raw {
-                self.pipeline.generate_base_with_progress(
-                    &req.prompt,
-                    &negative,
+                heavy.heavy.render_base(
+                    &ctx.pos,
+                    ctx.neg.as_ref(),
                     guidance,
                     &opts,
                     decoder,
@@ -416,8 +626,8 @@ impl Krea {
                     on_progress,
                 )?
             } else {
-                self.pipeline.generate_turbo_with_progress(
-                    &req.prompt,
+                heavy.heavy.render_turbo(
+                    &ctx.pos,
                     &opts,
                     decoder,
                     keep,
@@ -426,6 +636,15 @@ impl Krea {
                 )?
             };
             images.push(img);
+        }
+        // Sequential (sc-11101): free the DiT/VAE/PiD working set now that every image is rendered, then
+        // `clear_cache()` to return the pages to the OS. `heavy` (a struct of borrows) is unused past the
+        // loop, so NLL has ended its borrow of `seq_heavy`; dropping the owned bundle frees the
+        // components before `clear_cache()`. Resident is a no-op (`seq_heavy` None).
+        let was_sequential = seq_heavy.is_some();
+        drop(seq_heavy);
+        if was_sequential {
+            mlx_rs::memory::clear_cache();
         }
         Ok(GenerationOutput::Images(images))
     }
