@@ -8,8 +8,9 @@
 //! - raw — `SceneWorks/krea-2-raw-mlx` (`bf16`, quantized in place), env `KREA_RAW_DIR`.
 //! - edit — dense `krea/Krea-2-Raw` + the `conradlocke/krea2-identity-edit` LoRA (`KREA_EDIT_DIR` /
 //!   `KREA_EDIT_LORA`).
-//! - control — dense base (`SceneWorks/krea-2-turbo-mlx/bf16`) + the
-//!   `SceneWorks/krea2-pose-controlnet-beta` overlay (`KREA_CONTROL_DIR` / `KREA_CONTROL_OVERLAY`).
+//! - control — a bf16 OR packed Q4/Q8 base (`SceneWorks/krea-2-turbo-mlx/<tier>`) + the
+//!   `SceneWorks/krea2-pose-controlnet-beta` overlay (`KREA_CONTROL_DIR` / `KREA_CONTROL_OVERLAY`); the
+//!   quantized A/B (sc-11727) quantizes the base at load via `with_quant`.
 //!
 //! Run e.g. `cargo test -p mlx-gen-krea --release --test sequential_residency_real_weights --
 //! --ignored --nocapture`.
@@ -20,9 +21,9 @@
 //! than the DiT (the qwen-image pattern), so the win is the denoise-phase DiT+activations that
 //! `Resident` stacks on the resident text phase.
 //!
-//! Quant note: turbo/raw/edit quantize BOTH the Qwen3-VL TE Linears AND the DiT — measure Q8/Q4.
-//! Control is dense-bf16-only (the overlay is trained on the dense base), so it is measured at bf16;
-//! its dropped text phase is the ~8 GB bf16 encoder, and the pose branch stays on the heavy side.
+//! Quant note: turbo/raw/edit quantize BOTH the Qwen3-VL TE Linears AND the DiT — measure Q8/Q4. Control
+//! now measures at bf16 AND Q4/Q8 (sc-11727): the quantized A/B packs the same TE+DiT set, activations
+//! stay bf16, and the pose branch stays on the heavy side (its bf16 overlay is never packed).
 
 // Force-link the provider crate so its `inventory` generator registrations run.
 use mlx_gen_krea as _;
@@ -265,23 +266,10 @@ fn edit_sequential_bounds_peak_and_is_byte_identical() {
     });
 }
 
-#[test]
-#[ignore = "needs a dense Krea base + the pose overlay (KREA_CONTROL_DIR / KREA_CONTROL_OVERLAY)"]
-fn control_sequential_bounds_peak_and_is_byte_identical() {
-    // Pose control is dense bf16 only (the overlay is trained on the dense base) — measured at bf16.
-    // The `Krea2ControlBranch` is a SECOND heavy component that stays on the heavy side; only the
-    // Qwen3-VL text phase drops. Base = the turbo turnkey's dense bf16 subdir.
-    let root = std::env::var("KREA_CONTROL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| turbo_root("bf16"));
-    let overlay = std::env::var("KREA_CONTROL_OVERLAY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            hf_snapshot("models--SceneWorks--krea2-pose-controlnet-beta")
-                .join("control_step5000.safetensors")
-        });
+/// The pose-control conditioning shared by the bf16 and quantized control A/B tests.
+fn control_request() -> GenerationRequest {
     let size = env_u32("KREA_SEQ_SIZE", 768);
-    let req = GenerationRequest {
+    GenerationRequest {
         prompt: "a person standing in a studio, photograph".into(),
         width: size,
         height: size,
@@ -293,10 +281,57 @@ fn control_sequential_bounds_peak_and_is_byte_identical() {
             scale: Some(0.6),
         }],
         ..Default::default()
-    };
-    // Dense bf16 (no quant override — control rejects it).
+    }
+}
+
+/// Resolve the pose overlay path (env override → the beta HF snapshot).
+fn control_overlay() -> PathBuf {
+    std::env::var("KREA_CONTROL_OVERLAY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            hf_snapshot("models--SceneWorks--krea2-pose-controlnet-beta")
+                .join("control_step5000.safetensors")
+        })
+}
+
+#[test]
+#[ignore = "needs a dense Krea base + the pose overlay (KREA_CONTROL_DIR / KREA_CONTROL_OVERLAY)"]
+fn control_sequential_bounds_peak_and_is_byte_identical() {
+    // Pose control at the dense bf16 base. The `Krea2ControlBranch` is a SECOND heavy component that
+    // stays on the heavy side; only the Qwen3-VL text phase drops. Base = the turbo turnkey's bf16 subdir.
+    let root = std::env::var("KREA_CONTROL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| turbo_root("bf16"));
+    let overlay = control_overlay();
+    let req = control_request();
     assert_ab("krea_2_turbo_control", "krea_2_turbo_control", &req, || {
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_control(WeightsSource::File(overlay.clone()))
     });
+}
+
+#[test]
+#[ignore = "needs a dense Krea base + the pose overlay (KREA_CONTROL_DIR / KREA_CONTROL_OVERLAY); Q8 or KREA_SEQ_Q4=1"]
+fn control_quant_sequential_bounds_peak_and_is_byte_identical() {
+    // sc-11727 (mirror of candle-gen PR #471): the pose-control lane is NOT dense-only — a Q4/Q8 base
+    // renders pose-locked (candle GPU-proof: q8 indistinguishable from bf16, q4 pose-lock intact). Here
+    // we quantize the dense base at load (`with_quant`) and assert the residency invariant still holds:
+    // Sequential is byte-identical to Resident AND bounds peak. mlx-gen runs a TRUE packed forward on the
+    // base DiT (not candle's dequant-to-bf16), so the packed tier also lowers the heavy-phase peak.
+    let root = std::env::var("KREA_CONTROL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| turbo_root("bf16"));
+    let overlay = control_overlay();
+    let req = control_request();
+    let q = seq_quant().unwrap();
+    assert_ab(
+        "krea_2_turbo_control (quant)",
+        "krea_2_turbo_control",
+        &req,
+        || {
+            LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_control(WeightsSource::File(overlay.clone()))
+                .with_quant(q)
+        },
+    );
 }
