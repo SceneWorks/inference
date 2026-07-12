@@ -34,7 +34,7 @@ pub mod training;
 pub mod transformer;
 pub mod vae;
 
-pub use adapters::{merge_adapters, MergeReport};
+pub use adapters::{install_additive, merge_adapters, AdditiveReport, MergeReport};
 pub use quant::QLinear;
 pub use reasoner::{LensReasoner, DEFAULT_MAX_NEW_TOKENS};
 
@@ -220,7 +220,22 @@ impl Pipeline {
             self.component_vb("text_encoder", ENC_DTYPE)?,
             self.quant.map(quant::ggml_dtype),
         )?;
-        let mut transformer = LensTransformer::new(&LensDitConfig::lens(), self.transformer_vb()?)?;
+        // Adapters on a **packed** MLX tier ride as forward-time additive residuals on the packed base
+        // (sc-11105) — the packed base has no dense `W` for `merge_adapters` to fold into (`W += δ` on
+        // u32 codes), which is why a user LoRA used to force a full dense build. On a **dense** tier they
+        // still fold into the weight before the DiT is built (bit-exact — the chaos-sensitive sampler's
+        // preferred path). `transformer_vb` already handles the no-adapter mmap fast path and the dense
+        // fold; here we only divert the packed+adapters case to a plain mmap build + install.
+        let additive = !self.adapters.is_empty() && self.packed_group_size("transformer").is_some();
+        let dit_vb = if additive {
+            self.component_vb("transformer", DIT_DTYPE)?
+        } else {
+            self.transformer_vb()?
+        };
+        let mut transformer = LensTransformer::new(&LensDitConfig::lens(), dit_vb)?;
+        if additive {
+            adapters::install_additive(&mut transformer, &self.adapters)?;
+        }
         // Q4/Q8 the DiT's compute-heavy linears. Two routes compose (sc-9413): a packed MLX tier
         // (`SceneWorks/lens-mlx`, `.scales` present) already loaded each projection straight from the
         // packed parts inside `LensTransformer::new` (no dense staging), so this pass is a **no-op**

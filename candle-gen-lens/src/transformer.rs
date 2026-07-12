@@ -226,6 +226,18 @@ impl GateMlp {
         self.w3.quantize(quant)?;
         Ok(())
     }
+
+    /// Visit the three SwiGLU projections (`{prefix}.w1/w2/w3`) — part of the adaptable surface (sc-11105).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.w1"), &mut self.w1)?;
+        f(&format!("{prefix}.w2"), &mut self.w2)?;
+        f(&format!("{prefix}.w3"), &mut self.w3)?;
+        Ok(())
+    }
 }
 
 /// Lens joint (dual-stream) attention. **Fused** `img_qkv`/`txt_qkv` (biased) split into per-stream
@@ -273,6 +285,21 @@ impl JointAttention {
         self.txt_qkv.quantize(quant)?;
         self.to_out.quantize(quant)?;
         self.to_add_out.quantize(quant)?;
+        Ok(())
+    }
+
+    /// Visit the four joint-attention projections (`{prefix}.img_qkv/txt_qkv/to_out.0/to_add_out`) — the
+    /// surface the Lens trainer's LoRA/LoKr adapts (sc-11105). `img_qkv`/`txt_qkv` are the FUSED q/k/v
+    /// projections; a fused-QKV LoRA rides the single projection unmerged (no split needed).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.img_qkv"), &mut self.img_qkv)?;
+        f(&format!("{prefix}.txt_qkv"), &mut self.txt_qkv)?;
+        f(&format!("{prefix}.to_out.0"), &mut self.to_out)?;
+        f(&format!("{prefix}.to_add_out"), &mut self.to_add_out)?;
         Ok(())
     }
 
@@ -376,6 +403,24 @@ impl LensTransformerBlock {
         self.attn.quantize(quant)?;
         self.img_mlp.quantize(quant)?;
         self.txt_mlp.quantize(quant)?;
+        Ok(())
+    }
+
+    /// Visit every adaptable projection in the block under `{prefix}` — the joint attention + both
+    /// SwiGLU MLPs. The AdaLN modulations (`img_mod`/`txt_mod`, plain dense `Linear`) and the RMSNorms
+    /// are not `QLinear` and are not part of the additive surface (a LoRA targeting them routes to the
+    /// dense tier). sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.attn
+            .visit_adaptable_mut(&format!("{prefix}.attn"), f)?;
+        self.img_mlp
+            .visit_adaptable_mut(&format!("{prefix}.img_mlp"), f)?;
+        self.txt_mlp
+            .visit_adaptable_mut(&format!("{prefix}.txt_mlp"), f)?;
         Ok(())
     }
 
@@ -589,6 +634,38 @@ impl LensTransformer {
         Ok(())
     }
 
+    /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
+    /// moved here at install (else the residual matmul is a device mismatch). sc-11105.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Whether the DiT loaded from a packed MLX tier (any projection is quantized) — the gate the loader
+    /// uses to route adapters to the additive install vs the dense fold (sc-11105). Probes `img_in`, a
+    /// projection packed in every quantized tier.
+    pub fn is_packed(&self) -> bool {
+        self.img_in.is_packed()
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the projection's
+    /// canonical DiT dotted path — the same paths [`crate::adapters::classify_lora_key`] resolves a LoRA
+    /// key to (`img_in`, `txt_in`, `proj_out`, and each `transformer_blocks.{i}` attention + SwiGLU
+    /// projection). The additive installer ([`crate::adapters::install_additive`]) pushes a resolved
+    /// LoRA/LoKr residual onto each matched projection so a user adapter applies on a packed q4/q8 tier
+    /// with the base kept packed (sc-11105).
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f("img_in", &mut self.img_in)?;
+        f("txt_in", &mut self.txt_in)?;
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
+        }
+        f("proj_out", &mut self.proj_out)?;
+        Ok(())
+    }
+
     /// Forward.
     ///
     /// - `hidden_states`: `[B, img_len, in_channels]` patchified image latents (`img_len = frame·h·w`).
@@ -770,6 +847,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **Additive install on the Lens DiT (sc-11105).** A bare-dotted LoRA over two real `attn`
+    /// projections in block 0 installs as forward-time residuals: the report counts both, the DiT
+    /// forward shifts vs the un-adapted model, and no target is left unresolved — proving the visitor's
+    /// canonical paths line up with `adapters::classify_lora_key`. Exercises the packed-tier install
+    /// wiring end-to-end on a dense-base fixture (the base-agnostic additive path is byte-equal on a
+    /// packed base; the stays-packed property is proven at the `AdaptLinear` unit level).
+    #[test]
+    fn install_additive_lora_on_dit_applies_and_shifts() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        use std::collections::HashMap as Map;
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let base = LensTransformer::new(&cfg, vb.clone()).unwrap();
+        let mut adapted = LensTransformer::new(&cfg, vb).unwrap();
+
+        let inner = cfg.inner_dim;
+        let rank = 2usize;
+        let mut map: Map<String, Tensor> = Map::new();
+        for proj in ["to_out.0", "to_add_out"] {
+            let path = format!("transformer_blocks.0.attn.{proj}");
+            map.insert(
+                format!("{path}.lora_A.weight"),
+                Tensor::randn(0f32, 0.5f32, (rank, inner), &dev).unwrap(),
+            );
+            map.insert(
+                format!("{path}.lora_B.weight"),
+                Tensor::randn(0f32, 0.5f32, (inner, rank), &dev).unwrap(),
+            );
+        }
+        let tmp =
+            std::env::temp_dir().join(format!("sc11105_lens_{}.safetensors", std::process::id()));
+        candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
+        let report = crate::adapters::install_additive(
+            &mut adapted,
+            &[AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lora)],
+        )
+        .unwrap();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(
+            report.applied, 2,
+            "both to_out.0 + to_add_out residuals installed"
+        );
+        assert!(report.skipped_targets.is_empty(), "no unresolved targets");
+
+        let (h, w) = (2usize, 2usize);
+        let img_len = h * w;
+        let hidden = Tensor::randn(0f32, 1f32, (1, img_len, cfg.in_channels), &dev).unwrap();
+        let feat = Tensor::randn(0f32, 1f32, (1, 3, cfg.enc_hidden_dim), &dev).unwrap();
+        let y_base = base
+            .forward(&hidden, std::slice::from_ref(&feat), None, 0.5, 1, h, w)
+            .unwrap();
+        let y_adapt = adapted
+            .forward(&hidden, std::slice::from_ref(&feat), None, 0.5, 1, h, w)
+            .unwrap();
+        let shift = (y_adapt - y_base)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            shift > 1e-5,
+            "additive LoRA did not shift the DiT forward ({shift})"
+        );
     }
 
     #[test]
