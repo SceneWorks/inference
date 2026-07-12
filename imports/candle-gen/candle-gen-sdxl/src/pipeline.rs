@@ -551,11 +551,10 @@ impl Pipeline {
         // parts (no dense staging); every dense snapshot keeps the stock build below, unchanged.
         let unet = match self.detect_packed_unet()? {
             Some((packed_file, group_size)) => {
-                // sc-9528: a packed tier WITH a trained LoRA/LoKr now folds via dequant → merge →
-                // keep-dense (option a). The delta cannot be added to the u32-packed weights directly
-                // and SDXL merges (not residuals) for chaos-sensitivity, so the adapted Linears are
-                // dequantized, the delta is folded through `adapters::merge_adapters` (shared, verbatim),
-                // and only those adapted layers are served dense — every unadapted layer stays packed.
+                // sc-11103: a packed tier WITH a distill LoRA/LoKr applies it **additively** — the packed
+                // Linears take a forward-time residual (base kept packed) and any conv LoRA folds into the
+                // dense convs (`load_packed_unet_with_adapters`), so the q4/q8 footprint survives instead
+                // of dequant-folding the FF (the retired sc-9528 path).
                 let vendored = if self.adapters.is_empty() {
                     self.load_packed_unet(&packed_file, group_size)?
                 } else {
@@ -637,33 +636,42 @@ impl Pipeline {
         Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
     }
 
-    /// Build the vendored packed UNet from a packed MLX-tier checkpoint with the [`AdapterSpec`]s folded
-    /// in (sc-9528 — the sc-9089j follow-up deferred from sc-9416). Since a trained LoRA/LoKr delta
-    /// cannot be added to the u32-packed weights, and SDXL merges rather than adds a forward-time
-    /// residual (chaos-sensitivity, see [`crate::adapters`]), the packed Linears are **dequantized** to
-    /// dense f32, the delta is **folded** through [`crate::adapters::merge_adapters`] (shared, verbatim —
-    /// no LoRA/LoKr math reimplemented), and only the adapted layers are **kept dense** while every
-    /// unadapted layer stays packed ([`crate::packed_adapters`]). The resulting mixed (dense-adapted +
-    /// packed-unadapted) tensor map feeds the vendored UNet through a `VarBuilder::from_tensors`, whose
-    /// per-Linear `linear_detect_gs` packed-detects each layer by its `.scales` sibling — so an adapted
-    /// layer routes through the dense arm and an unadapted one keeps its packed footprint.
+    /// Build the vendored packed UNet from a packed MLX-tier checkpoint with the [`AdapterSpec`]s applied
+    /// **additively** (sc-11103, the sc-9528 dequant-fold replacement). A distill LoRA on a packed tier
+    /// now rides the packed Linears as a **forward-time residual** (`y = base(x) + Σ scale·((x·A)·B)`,
+    /// [`crate::adapters::install_additive`]) — the u32 codes are never dequantized, so the q4/q8
+    /// footprint survives (SDXL-Lightning / RealVisXL-Lightning target the FF, the bulk of the UNet).
+    /// The **conv** surface stays dense on a packed tier, so a conv LoRA still **folds** into it
+    /// ([`crate::adapters::fold_conv_adapters`]) at no packed cost. The additive residual equals the
+    /// dense fold to f32 tolerance — the accuracy bar the packed base's own quant already accepts (the
+    /// per-ULP chaos-sensitivity argument is about a *re-quantized* fold, not a residual on the frozen
+    /// packed base, so it does not apply here).
     fn load_packed_unet_with_adapters(
         &self,
         unet_file: &Path,
         group_size: usize,
     ) -> Result<VendoredUNet> {
         // The vendored UNet's top-level constructor threads only the default MLX group 64 through its
-        // blocks; a non-64 tier would dequantize/repartition at `group_size` while the UNet reads at 64.
-        // Refuse it loudly (mirrors `detect_packed_unet`) rather than silently mis-fold.
-        crate::packed_adapters::assert_group_size_supported(group_size)?;
-        let raw = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
-        let merged =
-            crate::packed_adapters::fold_adapters_into_packed_map(raw, &self.adapters, group_size)?;
-        // `from_tensors` serves the u32 packed weights via the vendored seam's `get_unchecked_dtype`
-        // (exactly as the mmap path) and the dense merged weights via the vb dtype — so the packed vs
-        // dense fork is taken per Linear as loaded. `false` = no flash-attn on the packed path.
-        let vs = VarBuilder::from_tensors(merged, self.dtype, &self.device);
-        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
+        // blocks; a non-64 tier would pack/read at mismatched grids. Refuse it loudly (mirrors
+        // `detect_packed_unet`) rather than mis-apply.
+        crate::adapters::assert_group_size_supported(group_size)?;
+        let mut raw = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
+        // Shared kohya `flattened → dotted` table for both packed adapter passes (conv fold + additive).
+        let table = crate::adapters::build_sdxl_kohya_table(&raw);
+        // Fold any conv-LoRA into the dense conv weights BEFORE the build; the packed Linears are left
+        // untouched so they load packed and take the additive residual below.
+        let conv = crate::adapters::fold_conv_adapters(&mut raw, &self.adapters, &table)?;
+        // `from_tensors` serves the u32 packed Linears via the vendored seam's `get_unchecked_dtype`
+        // (exactly as the mmap path) and the (conv-folded) dense weights via the vb dtype. `false` = no
+        // flash-attn on the packed path.
+        let vs = VarBuilder::from_tensors(raw, self.dtype, &self.device);
+        let mut unet = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
+        // Push the LoRA/LoKr residuals onto the packed Linear leaves — the base stays packed.
+        let add =
+            crate::adapters::install_additive(&mut unet, &self.adapters, &table, &self.device)?;
+        // A non-empty spec set that neither folded a conv nor installed a residual is a misconfiguration.
+        crate::adapters::guard_packed_matched(self.adapters.len(), conv.merged + add.applied)?;
+        Ok(unet)
     }
 
     /// Build the UNet with the [`AdapterSpec`]s merged into its weights (sc-5165). The base UNet
@@ -1182,7 +1190,8 @@ pub(crate) fn detect_packed_unet(root: &Path) -> Result<Option<(PathBuf, usize)>
         // threads only the default group 64 (the leaf `*_gs` constructors exist, but wiring a non-64
         // group through the many nested block constructors is the same infeasibility lens/sd3 hit in
         // sc-9474). A non-64 SDXL MLX tier does not exist today; refuse it rather than repack on the
-        // wrong grid. The adapter fold ([`crate::packed_adapters`]) asserts gs==64 for the same reason.
+        // wrong grid. The packed adapter path ([`crate::adapters::assert_group_size_supported`]) asserts
+        // gs==64 for the same reason.
         return Err(CandleError::Msg(format!(
             "sdxl: packed tier group_size {group_size} unsupported (only {MLX_GROUP_SIZE}); \
              a non-64 SDXL tier needs the group threaded through the UNet blocks (sc-9528)"
