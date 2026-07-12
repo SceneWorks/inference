@@ -676,6 +676,7 @@ dependencies = [
 name = "mlx-gen-face"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
  "pmetal-mlx-rs",
 ]
