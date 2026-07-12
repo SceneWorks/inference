@@ -419,21 +419,34 @@ impl UNet2DConditionModel {
 }
 
 impl LoraHost for UNet2DConditionModel {
-    /// Walk every cross-attention block (down/mid/up) and visit its adaptable projections. The
-    /// `Basic` (non-cross-attn) down/up blocks have no `SpatialTransformer`, hence no targets.
+    /// Walk every adaptable Linear in the UNet and visit it (attention + FF projections, the
+    /// time-embedding / `add_embedding` micro-conditioning heads, and every resnet's `time_emb_proj`).
+    /// sc-11679 widened this from the cross-attention-only walk: the `Basic` (non-cross-attn) down/up
+    /// blocks carry no `SpatialTransformer` but DO carry resnets, so a distill LoRA targeting the
+    /// timestep-embedding surface reaches them additively on a packed tier. The trainer's
+    /// [`build_lora_targets`](candle_gen::train::lora::build_lora_targets) matches only its configured
+    /// suffixes (default attention-only), so the time-embedding leaves are visited-but-unmatched during
+    /// training — and the `time_embedding` / `add_embedding` heads are detached in the trainer's forward
+    /// (a per-step constant), so they are inference-additive targets, not trainable ones.
     fn visit_lora_mut(
         &mut self,
         f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
+        self.time_embedding.visit_lora_mut(f)?;
+        if let Some(add_embedding) = &mut self.add_embedding {
+            add_embedding.visit_lora_mut(f)?;
+        }
         for db in self.down_blocks.iter_mut() {
-            if let UNetDownBlock::CrossAttn(b) = db {
-                b.visit_lora_mut(f)?;
+            match db {
+                UNetDownBlock::Basic(b) => b.visit_lora_mut(f)?,
+                UNetDownBlock::CrossAttn(b) => b.visit_lora_mut(f)?,
             }
         }
         self.mid_block.visit_lora_mut(f)?;
         for ub in self.up_blocks.iter_mut() {
-            if let UNetUpBlock::CrossAttn(b) = ub {
-                b.visit_lora_mut(f)?;
+            match ub {
+                UNetUpBlock::Basic(b) => b.visit_lora_mut(f)?,
+                UNetUpBlock::CrossAttn(b) => b.visit_lora_mut(f)?,
             }
         }
         Ok(())
@@ -865,5 +878,89 @@ mod instantid_tests {
         assert!(unet2
             .install_ip_adapter(vec![pair(), pair(), pair(), pair(), pair()])
             .is_err()); // too many
+    }
+
+    /// sc-11679: the additive-LoRA walk (`visit_lora_mut`, driving both the trainer's target
+    /// enumeration and the packed-tier `install_additive`) now reaches the time-embedding heads and
+    /// every resnet `time_emb_proj`, not just the attention / FF projections — so a LoRA targeting the
+    /// timestep / micro-conditioning surface installs additively instead of being reported skipped.
+    #[test]
+    fn additive_surface_reaches_time_embedding_and_resnet_time_emb_proj() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        use candle_gen::train::lora::{build_lora_targets, save_lora_peft, SDXL_PEFT_PREFIX};
+        use std::collections::{BTreeMap, HashMap};
+
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev);
+        // pooled(16) + time_ids_len(2)·addition_time_embed_dim(8) = 32 — load `add_embedding` too so its
+        // head joins the walk (the InstantID inference surface).
+        let mut unet = UNet2DConditionModel::new(vb.clone(), 4, 4, false, tiny_cfg())
+            .unwrap()
+            .with_add_embedding(vb, 8, 32)
+            .unwrap();
+
+        // (1) The widened walk reaches the time-embedding + add_embedding heads and the resnet timestep
+        // projections across Basic + cross-attn blocks and the mid block — while keeping the attention
+        // surface (no regression).
+        let paths = unet.lora_target_paths().unwrap();
+        for want in [
+            "time_embedding.linear_1",
+            "time_embedding.linear_2",
+            "add_embedding.linear_1",
+            "add_embedding.linear_2",
+            "down_blocks.0.resnets.0.time_emb_proj", // Basic (non-cross-attn) down block
+            "mid_block.resnets.0.time_emb_proj",     // mid block lead resnet
+        ] {
+            assert!(
+                paths.iter().any(|p| p == want),
+                "widened visit_lora_mut must reach `{want}` (got {paths:?})"
+            );
+        }
+        assert!(
+            paths.iter().any(|p| p.ends_with(".attn1.to_q")),
+            "the attention surface must still be visited"
+        );
+
+        // (2) End-to-end: a LoRA authored over those leaves (via the real trainer save path, so the dims
+        // are correct by construction) installs additively on a fresh UNet — every target `applied`, none
+        // reported as a `skipped_target`.
+        let targets = vec!["time_emb_proj".to_string(), "linear_1".to_string()];
+        let set = build_lora_targets(&mut unet, &targets, 2, 4.0, 7, &dev).unwrap();
+        for (i, v) in set.vars.iter().enumerate() {
+            if i % 2 == 1 {
+                // force each B factor nonzero so ΔW ≠ 0
+                v.set(&Tensor::randn(0f32, 1f32, v.as_tensor().dims(), &dev).unwrap())
+                    .unwrap();
+            }
+        }
+        let file = std::env::temp_dir().join(format!(
+            "sc11679_time_surface_{}.safetensors",
+            std::process::id()
+        ));
+        save_lora_peft(&set, SDXL_PEFT_PREFIX, &HashMap::new(), &file).unwrap();
+
+        let vb2 = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev);
+        let mut fresh = UNet2DConditionModel::new(vb2.clone(), 4, 4, false, tiny_cfg())
+            .unwrap()
+            .with_add_embedding(vb2, 8, 32)
+            .unwrap();
+        let report = crate::adapters::install_additive(
+            &mut fresh,
+            &[AdapterSpec::new(file.clone(), 1.0, AdapterKind::Lora)],
+            &BTreeMap::new(), // PEFT keys resolve without a kohya table
+            &dev,
+        )
+        .unwrap();
+        std::fs::remove_file(&file).ok();
+        assert_eq!(
+            report.applied,
+            set.len(),
+            "every time-surface target must install additively"
+        );
+        assert!(
+            report.skipped_targets.is_empty(),
+            "no time-surface target may be reported skipped: {:?}",
+            report.skipped_targets
+        );
     }
 }
