@@ -150,6 +150,14 @@ pub fn raw_descriptor() -> ModelDescriptor {
 pub fn edit_descriptor() -> ModelDescriptor {
     let mut d = raw_descriptor();
     d.id = KREA_2_EDIT_ID;
+    // Edit accepts a single source (`Reference`) OR a scene+person pair (`MultiReference`, epic 10871
+    // P1.3 — scene = image 1, person = image 2, fixed order). The img2img Raw/Turbo descriptors stay
+    // single-`Reference`; only the edit surface advertises `MultiReference`, so `validate_request`
+    // accepts a two-source edit here while still rejecting it on the img2img path.
+    d.capabilities.conditioning = vec![
+        ConditioningKind::Reference,
+        ConditioningKind::MultiReference,
+    ];
     d
 }
 
@@ -314,7 +322,20 @@ impl Krea {
         // sigmas.len()` and is perfectly fine with img2img. NB `flow_capture_for_request` returns
         // `sigmas.len()` (NOT `usize::MAX`) for the no-capture case, so the earlier `keep != usize::MAX`
         // guard was always true and rejected EVERY img2img gen, PiD or not (the on-device break).
-        let reference = single_reference(req)?;
+        // Edit extracts its own ordered source list (a single `Reference` or a `MultiReference`
+        // scene+person pair, epic 10871 P1.3); img2img/t2i use the single-`Reference` helper. Kept
+        // separate so an edit's `MultiReference` never trips `single_reference`'s "exactly one
+        // Reference" img2img guard, and an img2img job still can't smuggle in two references.
+        let edit_sources = if is_edit {
+            edit_references(req)?
+        } else {
+            Vec::new()
+        };
+        let reference = if is_edit {
+            None
+        } else {
+            single_reference(req)?
+        };
         if img2img_conflicts_with_capture(reference.is_some(), keep, sigmas.len()) {
             return Err(Error::Msg(format!(
                 "{}: PiD from_ldm early-stop is not supported with img2img reference conditioning \
@@ -337,22 +358,18 @@ impl Krea {
                 scheduler: req.scheduler.clone(),
             };
             let img = if is_edit {
-                // Kontext-style edit (epic 10871): the single `Reference` is the SOURCE image, kept as
-                // in-context conditioning (VAE tokens + Qwen3-VL grounding) — NOT a noised img2img init.
-                // It denoises from PURE NOISE under full CFG, so `strength` (schedule truncation) is
-                // meaningless for an edit and the reference's strength is ignored. The `krea2_identity_edit`
-                // LoRA in `spec.adapters` is what makes the in-context source actually steer the edit.
-                let (source, _) = reference.ok_or_else(|| {
-                    Error::Msg(format!(
-                        "{}: edit requires a source Reference image",
-                        self.descriptor.id
-                    ))
-                })?;
+                // Kontext-style edit (epic 10871): the source image(s) are kept as in-context
+                // conditioning (VAE tokens + Qwen3-VL grounding) — NOT a noised img2img init. Denoises
+                // from PURE NOISE under full CFG, so `strength` (schedule truncation) is meaningless and
+                // a reference's strength is ignored. `edit_sources` is the ordered slice (scene, then
+                // person; P1.3) the pipeline VAE-encodes at successive RoPE frames. The
+                // `krea2_identity_edit` LoRA in `spec.adapters` is what makes the in-context source(s)
+                // actually steer the edit.
                 self.pipeline.generate_edit_with_progress(
                     &req.prompt,
                     &negative,
                     guidance,
-                    &[source],
+                    &edit_sources,
                     &opts,
                     decoder,
                     &req.cancel,
@@ -449,6 +466,46 @@ fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f3
             "krea_2_turbo: img2img supports exactly one Reference image".into(),
         )),
     }
+}
+
+/// The most reference images a Krea edit accepts (epic 10871 P1.3): scene = image 1, person = image 2.
+/// The edit LoRA was trained on this fixed pair order — swapping degrades identity — and the ComfyUI-
+/// Krea2Edit node caps at two. Mirrors candle-gen-krea's `MAX_EDIT_REFERENCES`.
+const MAX_EDIT_REFERENCES: usize = 2;
+
+/// The ordered source image(s) for a Krea edit (epic 10871): one `Conditioning::Reference` (the common
+/// single-source edit) or one `Conditioning::MultiReference` (scene, then person — the fixed P1.3
+/// order). At least one is required; at most [`MAX_EDIT_REFERENCES`]. Distinct from [`single_reference`]
+/// (img2img), which rejects `MultiReference` and any count > 1 — the edit surface is the only one that
+/// advertises `MultiReference` ([`edit_descriptor`]). The returned slice is passed straight to
+/// [`KreaPipeline::generate_edit_with_progress`], which VAE-encodes each at successive RoPE frames.
+fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
+    let sources: Vec<&Image> = match req.conditioning.as_slice() {
+        [Conditioning::Reference { image, .. }] => vec![image],
+        [Conditioning::MultiReference { images }] => images.iter().collect(),
+        [] => {
+            return Err(Error::Msg(format!(
+                "{KREA_2_EDIT_ID}: edit requires a source image (a Reference or a MultiReference)"
+            )))
+        }
+        _ => {
+            return Err(Error::Msg(format!(
+                "{KREA_2_EDIT_ID}: edit expects a single Reference or one MultiReference of sources"
+            )))
+        }
+    };
+    if sources.is_empty() {
+        return Err(Error::Msg(format!(
+            "{KREA_2_EDIT_ID}: edit requires at least one source image"
+        )));
+    }
+    if sources.len() > MAX_EDIT_REFERENCES {
+        return Err(Error::Msg(format!(
+            "{KREA_2_EDIT_ID}: at most {MAX_EDIT_REFERENCES} references are supported \
+             (scene = image 1, person = image 2)"
+        )));
+    }
+    Ok(sources)
 }
 
 /// Whether an img2img reference conflicts with an ACTIVE PiD `from_ldm` early-stop capture — the combo
@@ -567,6 +624,34 @@ mod tests {
         assert_eq!(one.map(|(_, s)| s), Some(Some(0.4)));
         // More than one → error (Krea conditions on a single reference).
         assert!(single_reference(&ref_req(2, None)).is_err());
+    }
+
+    #[test]
+    fn edit_references_takes_one_reference_or_a_scene_person_pair() {
+        // A single `Reference` → one source (the common single-image edit).
+        assert_eq!(edit_references(&ref_req(1, None)).unwrap().len(), 1);
+
+        // A `MultiReference` → the ordered source list (scene, then person; P1.3).
+        let mut two = req(1024, 1024);
+        two.conditioning = vec![Conditioning::MultiReference {
+            images: vec![tiny_image(), tiny_image()],
+        }];
+        assert_eq!(edit_references(&two).unwrap().len(), 2);
+
+        // Empty conditioning → error (an edit needs a source).
+        assert!(edit_references(&req(1024, 1024)).is_err());
+
+        // Past the scene/person cap → error naming the fixed order.
+        let mut three = req(1024, 1024);
+        three.conditioning = vec![Conditioning::MultiReference {
+            images: vec![tiny_image(), tiny_image(), tiny_image()],
+        }];
+        let err = edit_references(&three).unwrap_err().to_string();
+        assert!(err.contains("scene") && err.contains("person"), "{err}");
+
+        // Two separate `Reference`s (not a `MultiReference`) → error: an edit takes one Reference or
+        // one MultiReference, never a bare list.
+        assert!(edit_references(&ref_req(2, None)).is_err());
     }
 
     #[test]
@@ -764,10 +849,14 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);
-        // The source rides a single `Reference`; the `krea2_identity_edit` LoRA rides `spec.adapters`.
+        // The source rides a single `Reference`, or a scene+person pair rides a `MultiReference`
+        // (epic 10871 P1.3); the `krea2_identity_edit` LoRA rides `spec.adapters`.
         assert_eq!(
             d.capabilities.conditioning,
-            vec![ConditioningKind::Reference]
+            vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference
+            ]
         );
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
