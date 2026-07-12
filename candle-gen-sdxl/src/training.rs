@@ -879,7 +879,17 @@ mod tests {
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let mut unet = tiny_unet(vb);
-        let paths = unet.lora_target_paths().unwrap();
+        // sc-11679 widened `visit_lora_mut` to the time-embedding heads, but the checkpoint backward
+        // treats the time embedding as a detached per-step constant (compute_loss_grads), so a
+        // `time_embedding` adapter carries a gradient in the dense forward but NOT the checkpoint one —
+        // an intentional asymmetry that this dense-vs-checkpoint parity gate must not train. The resnet
+        // `time_emb_proj` leaves stay in (they live inside the block forward, so both paths carry them).
+        let paths: Vec<String> = unet
+            .lora_target_paths()
+            .unwrap()
+            .into_iter()
+            .filter(|p| !p.starts_with("time_embedding.") && !p.starts_with("add_embedding."))
+            .collect();
         let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
         // Move B off zero so both A and B grads are nonzero (a no-op-init adapter would zero A's grad).
         for v in &set.vars {

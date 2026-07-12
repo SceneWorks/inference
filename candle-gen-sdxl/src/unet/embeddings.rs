@@ -1,5 +1,5 @@
 use candle_core::{Result, Tensor, D};
-use candle_gen::quant::QLinear;
+use candle_gen::train::lora::{lora_linear_detect, LoraLinear};
 use candle_nn as nn;
 use candle_nn::Module;
 
@@ -7,9 +7,12 @@ use candle_nn::Module;
 pub struct TimestepEmbedding {
     // sc-9416: `linear_1`/`linear_2` packed-detect through the shared `candle_gen::quant` seam — the
     // MLX SDXL tiers pack `time_embedding.linear_{1,2}` + `add_embedding.linear_{1,2}`. Dense
-    // checkpoints have no `.scales` sibling, so `linear_detect` takes the plain dense path unchanged.
-    linear_1: QLinear,
-    linear_2: QLinear,
+    // checkpoints have no `.scales` sibling, so `lora_linear_detect` takes the plain dense path unchanged.
+    // sc-11679: each leaf is a `LoraLinear` (frozen packed/dense base + optional forward-time additive
+    // residual) so a distill LoRA that targets `time_embedding` / `add_embedding` rides them additively
+    // on a packed tier — byte-identical with no residual (the packed q4/q8 base is never dequantized).
+    linear_1: LoraLinear,
+    linear_2: LoraLinear,
 }
 
 impl TimestepEmbedding {
@@ -31,17 +34,22 @@ impl TimestepEmbedding {
         time_embed_dim: usize,
         group_size: usize,
     ) -> Result<Self> {
-        let linear_1 =
-            QLinear::linear_detect_gs(channel, time_embed_dim, &vs, "linear_1", true, group_size)?;
-        let linear_2 = QLinear::linear_detect_gs(
-            time_embed_dim,
-            time_embed_dim,
-            &vs,
-            "linear_2",
-            true,
-            group_size,
-        )?;
+        let linear_1 = lora_linear_detect(channel, time_embed_dim, &vs, "linear_1", group_size)?;
+        let linear_2 =
+            lora_linear_detect(time_embed_dim, time_embed_dim, &vs, "linear_2", group_size)?;
         Ok(Self { linear_1, linear_2 })
+    }
+
+    /// Visit this embedding's two adaptable Linears (`linear_1`, `linear_2`) so a LoRA targeting the
+    /// `time_embedding` / `add_embedding` micro-conditioning head can install forward-time additive
+    /// residuals on them (sc-11679). Byte-identical with no residual — the packed base is never folded.
+    pub fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&mut self.linear_1)?;
+        f(&mut self.linear_2)?;
+        Ok(())
     }
 }
 

@@ -7,7 +7,7 @@
 //!
 use super::conv::{conv2d, Conv2d};
 use candle_core::{Result, Tensor, D};
-use candle_gen::quant::QLinear;
+use candle_gen::train::lora::{lora_linear_detect, LoraLinear};
 use candle_nn as nn;
 use candle_nn::Module;
 
@@ -53,8 +53,11 @@ pub struct ResnetBlock2D {
     conv2: Conv2d,
     // sc-9416: the `time_emb_proj` Linear packed-detects (the MLX SDXL tiers pack
     // `resnets.*.time_emb_proj`); the surrounding convs/norms stay dense. Dense checkpoints have no
-    // `.scales` sibling, so `linear_detect` takes the plain dense path unchanged.
-    time_emb_proj: Option<QLinear>,
+    // `.scales` sibling, so `lora_linear_detect` takes the plain dense path unchanged.
+    // sc-11679: a `LoraLinear` (frozen packed/dense base + optional forward-time additive residual) so a
+    // distill LoRA targeting `time_emb_proj` rides it additively on a packed tier — byte-identical with
+    // no residual (the packed q4/q8 base is never dequantized).
+    time_emb_proj: Option<LoraLinear>,
     conv_shortcut: Option<Conv2d>,
     span: tracing::Span,
     config: ResnetBlock2DConfig,
@@ -113,12 +116,11 @@ impl ResnetBlock2D {
         };
         let time_emb_proj = match config.temb_channels {
             None => None,
-            Some(temb_channels) => Some(QLinear::linear_detect_gs(
+            Some(temb_channels) => Some(lora_linear_detect(
                 temb_channels,
                 out_channels,
                 &vs,
                 "time_emb_proj",
-                true,
                 group_size,
             )?),
         };
@@ -155,6 +157,19 @@ impl ResnetBlock2D {
             .conv2
             .forward(&nn::ops::silu(&self.norm2.forward(&xs)?)?)?;
         (shortcut_xs + xs)? / self.config.output_scale_factor
+    }
+
+    /// Visit this resnet's adaptable **Linear** (`time_emb_proj`, when present) so a LoRA targeting the
+    /// resnet timestep projection can install a forward-time additive residual on it (sc-11679). The
+    /// convolutions are the conv-LoRA path's job ([`visit_conv_lora_mut`](Self::visit_conv_lora_mut)).
+    pub fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        if let Some(time_emb_proj) = &mut self.time_emb_proj {
+            f(time_emb_proj)?;
+        }
+        Ok(())
     }
 
     /// Visit this resnet's convolutions (`conv1`, `conv2`, and the optional `conv_shortcut`) so a
