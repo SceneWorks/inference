@@ -12,3 +12,7 @@ categories = ["science"]
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
+
+[dev-dependencies]
+# `face_cosine` example (epic 10871 P4.2 identity scoring) loads PNG/JPG inputs.
+image = { workspace = true }
