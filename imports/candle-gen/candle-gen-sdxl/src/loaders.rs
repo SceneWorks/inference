@@ -68,7 +68,7 @@ fn instantid_unet_file(root: &Path) -> Result<PathBuf> {
 /// As [`load_instantid_unet`], but apply user LoRA/LoKr `adapters` to the UNet at load (sc-6038).
 /// InstantID runs on a stock SDXL (RealVisXL) UNet, so SDXL-family LoRAs apply on top of the IdentityNet
 /// and face IP-Adapter. Mirrors the SDXL generator's adapter path ([`crate::pipeline`]'s
-/// `build_unet_with_adapters` / `load_packed_unet_with_adapters`).
+/// `load_dense_vendored_unet_with_adapters` / `load_packed_unet_with_adapters`).
 ///
 /// sc-11176 (F-084): fork on the packed tier the SAME way the non-adapter [`load_instantid_unet`]
 /// (sc-10813) and the txt2img adapter lane do — the pre-fix loader hard-coded the dense `.fp16` file, so
