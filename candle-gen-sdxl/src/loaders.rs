@@ -65,32 +65,29 @@ fn instantid_unet_file(root: &Path) -> Result<PathBuf> {
     })
 }
 
-/// As [`load_instantid_unet`], but fold user LoRA/LoKr `adapters` into the UNet weights at load
-/// (sc-6038). InstantID runs on a stock SDXL (RealVisXL) UNet, so SDXL-family LoRAs apply on top of
-/// the IdentityNet + face IP-Adapter. Mirrors the SDXL generator's adapter path
-/// ([`crate::pipeline`]'s `build_unet_with_adapters` / `load_packed_unet_with_adapters`).
+/// As [`load_instantid_unet`], but apply user LoRA/LoKr `adapters` to the UNet at load (sc-6038).
+/// InstantID runs on a stock SDXL (RealVisXL) UNet, so SDXL-family LoRAs apply on top of the IdentityNet
+/// and face IP-Adapter. Mirrors the SDXL generator's adapter path ([`crate::pipeline`]'s
+/// `load_dense_vendored_unet_with_adapters` / `load_packed_unet_with_adapters`).
 ///
 /// sc-11176 (F-084): fork on the packed tier the SAME way the non-adapter [`load_instantid_unet`]
-/// (sc-10813) and the registered txt2img adapter lane (sc-9528) do — the pre-fix loader hard-coded the
-/// dense `.fp16` file, so an InstantID/edit/IP-Adapter LoRA job against a packed MLX q4/q8 tier
-/// hard-failed with a misleading "snapshot is missing …fp16.safetensors" even though the packed tier
-/// was present and the same LoRA works on the registered lane.
+/// (sc-10813) and the txt2img adapter lane do — the pre-fix loader hard-coded the dense `.fp16` file, so
+/// an InstantID/edit/IP-Adapter LoRA job against a packed MLX q4/q8 tier hard-failed with a misleading
+/// "snapshot is missing …fp16.safetensors" even though the packed tier was present.
 ///
-/// - **Packed tier** ([`crate::pipeline::detect_packed_unet`] ⇒ `Some`): a trained LoRA/LoKr delta
-///   cannot be added to the u32-packed weights and SDXL merges rather than adds a forward-time residual
-///   (chaos-sensitivity, see [`crate::adapters`]), so the packed Linears are **dequantized** to dense
-///   f32, the deltas **folded** through [`crate::adapters::merge_adapters`] (shared, verbatim), and only
-///   the adapted layers **kept dense** while every unadapted layer stays packed
-///   ([`crate::packed_adapters::fold_adapters_into_packed_map`], group 64 asserted). The mixed map feeds
-///   both the UNet body and the `add_embedding` head via one `VarBuilder::from_tensors`, whose per-Linear
-///   `linear_detect_gs` routes an adapted layer through the dense arm and an unadapted one through the
-///   packed arm — exactly the txt2img packed+adapter lane's behavior, plus the `add_embedding` head.
-/// - **Dense snapshot** (`None`): load the `unet/` `.fp16` tensors onto CPU at their native dtype, fold
-///   the deltas in (f32 math), then build the UNet + `add_embedding` head from the merged map — each
-///   tensor moved to `device` and cast to `dtype` as the VarBuilder serves it, so peak GPU is unchanged
-///   vs the mmap path (byte-unchanged pre-sc-11176 behavior).
+/// - **Packed tier** ([`crate::pipeline::detect_packed_unet`] ⇒ `Some`, sc-11103): the distill LoRA rides
+///   the packed Linears **additively** (`y = base(x) + Σ scale·((x·A)·B)`,
+///   [`crate::adapters::install_additive`]) — the u32 codes are never dequantized, so the q4/q8 footprint
+///   survives — and any conv LoRA **folds** into the dense convs
+///   ([`crate::adapters::fold_conv_adapters`]) before the UNet body + `add_embedding` head are built. The
+///   additive residual equals the dense fold to f32 tolerance.
+/// - **Dense snapshot** (`None`, sc-11682): keep the `.fp16` base a **pristine mmap** (evictable —
+///   epic 10765) and apply the adapter **additively** on both the Linear
+///   ([`crate::adapters::install_additive`]) and conv ([`crate::adapters::install_additive_conv`])
+///   surfaces, instead of folding into a host `from_tensors` map. Additive equals the old fold to f32
+///   tolerance (~1-ULP golden shift).
 ///
-/// An empty `adapters` slice merges nothing; a non-empty slice that matches no target errors (it never
+/// An empty `adapters` slice applies nothing; a non-empty slice that matches no target errors (it never
 /// renders an unadapted image silently). The caller installs the IP-Adapter K/V pairs on the returned
 /// UNet. `VarBuilder::from_tensors` is Arc-backed, so the body/head clone is cheap.
 pub fn load_instantid_unet_with_adapters(
@@ -99,27 +96,37 @@ pub fn load_instantid_unet_with_adapters(
     dtype: DType,
     adapters: &[AdapterSpec],
 ) -> Result<UNet2DConditionModel> {
-    let vs = match crate::pipeline::detect_packed_unet(root)? {
+    match crate::pipeline::detect_packed_unet(root)? {
         Some((packed_file, group_size)) => {
             // The vendored UNet threads only the default MLX group 64 through its blocks; a non-64 tier
-            // would dequantize/repartition at `group_size` while the UNet reads at 64. Refuse it loudly
-            // (mirrors `detect_packed_unet` / the txt2img packed+adapter lane) rather than mis-fold.
-            crate::packed_adapters::assert_group_size_supported(group_size)?;
-            let raw = candle_core::safetensors::load(&packed_file, &Device::Cpu)?;
-            let merged =
-                crate::packed_adapters::fold_adapters_into_packed_map(raw, adapters, group_size)?;
-            VarBuilder::from_tensors(merged, dtype, device)
+            // would pack/read at mismatched grids. Refuse it loudly rather than mis-apply.
+            crate::adapters::assert_group_size_supported(group_size)?;
+            let mut raw = candle_core::safetensors::load(&packed_file, &Device::Cpu)?;
+            let table = crate::adapters::build_sdxl_kohya_table(&raw);
+            // Conv LoRA folds into the dense convs; the packed Linears stay packed for the additive push.
+            let conv = crate::adapters::fold_conv_adapters(&mut raw, adapters, &table)?;
+            let vs = VarBuilder::from_tensors(raw, dtype, device);
+            let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
+                .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+            let add = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
+            crate::adapters::guard_additive_matched(adapters.len(), conv.merged + add.applied)?;
+            Ok(unet)
         }
         None => {
+            // sc-11682: keep the bf16 base a pristine mmap (evictable — epic 10765) and apply the
+            // adapter additively (Linear + conv residuals) instead of folding into a host `from_tensors`
+            // map. The `add_embedding` head shares the same mmap VarBuilder.
             let unet_file = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-            let mut tensors = candle_core::safetensors::load(&unet_file, &Device::Cpu)?;
-            crate::adapters::merge_adapters(&mut tensors, adapters)?;
-            VarBuilder::from_tensors(tensors, dtype, device)
+            let table = crate::adapters::build_sdxl_kohya_table_from_file(&unet_file)?;
+            let vs = candle_gen::mmap_var_builder(&[unet_file], dtype, device)?;
+            let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
+                .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+            let lin = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
+            let conv = crate::adapters::install_additive_conv(&mut unet, adapters, &table, device)?;
+            crate::adapters::guard_additive_matched(adapters.len(), lin.applied + conv.applied)?;
+            Ok(unet)
         }
-    };
-    let unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-        .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
-    Ok(unet)
+    }
 }
 
 /// Load the f16-stable SDXL VAE (`madebyollin/sdxl-vae-fp16-fix`, resolved via `hf-hub` exactly as the
@@ -228,8 +235,8 @@ mod tests {
 
     /// sc-11176 (F-084): the InstantID/edit/IP-Adapter **adapter** loader forks on the packed tier the
     /// same way the non-adapter load does — a packed q4/q8 tier routes through the packed weight file
-    /// (`packed_adapters::fold_adapters_into_packed_map`), NOT the dense `.fp16` snapshot. Pre-fix it
-    /// hard-coded `.fp16`, so a packed-tier LoRA job hard-failed with a misleading
+    /// (loaded on CPU for the sc-11103 conv-fold + additive install), NOT the dense `.fp16` snapshot.
+    /// Pre-fix it hard-coded `.fp16`, so a packed-tier LoRA job hard-failed with a misleading
     /// "snapshot is missing …fp16.safetensors" even though the packed tier was present. GPU-free: drives
     /// the branch on stub weights and asserts the packed arm never surfaces the dense `.fp16` diagnosis
     /// (and the dense arm still does), proving the fork is taken.

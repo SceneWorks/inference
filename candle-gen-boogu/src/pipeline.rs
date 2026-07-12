@@ -59,7 +59,26 @@ const LATENT_CHANNELS: usize = 16;
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for (generous; Boogu prompts are short).
 /// Enforced up front by [`crate::tokenizer::BooguTokenizer`] so an over-length prompt returns a clear
 /// length error instead of an opaque tensor-shape error deep in the condition encoder (sc-9047).
+///
+/// This bounds ONLY the text-to-image / CFG-negative / text-only-edit paths, which run through the
+/// pre-built [`crate::text_encoder::Rotary`] table (`narrow` into a table sized to this cap). The
+/// image-grounded edit path is bounded by [`MAX_EDIT_TOKENS`] instead — see below.
 pub(crate) const MAX_TEXT_TOKENS: usize = 1280;
+
+/// Max tokens for the **image-grounded edit** conditioning (sc-11193 / F-087). Far larger than
+/// [`MAX_TEXT_TOKENS`] because the edit template embeds one `<|image_pad|>` per merged vision token —
+/// a single advertised-max `2048²` reference is `2048²/1024 = 4096` tokens, so the 1280 t2i cap made
+/// every advertised reference size unservable (a `≥1152²` reference alone emits `≥1296` pads and could
+/// never pass, misdirecting the failure onto the prompt). Unlike the t2i path this is NOT bounded by
+/// the encoder's RoPE-table size: the grounded [`crate::text_encoder::BooguTextEncoder::last_hidden_with_images`]
+/// builds a fresh interleaved-MRoPE table sized to the actual sequence. The cap mirrors krea's
+/// `MAX_EDIT_TOKENS` and is a practical RoPE-and-memory ceiling — NOT an i32-safety limit. The shared
+/// [`candle_gen::sdpa_budgeted_bhsd`] path this PR (sc-11193) routes the grounded TE attention through
+/// chunks the query rows for ANY sequence length, so the i32 `[1, 32, S, S]` score overflow no longer
+/// bounds the cap and it could in principle be raised further if the advertised multi-reference edit
+/// surface needs it. Larger reference sets are rejected up front with an error naming the
+/// reference-token count (not the prompt).
+pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 
 /// Component compute dtypes. The Qwen3-VL TE runs in **f32** (parity-grade for this encoder, shared
 /// with the ideogram port); the 10 B DiT runs **bf16** (native on candle's CUDA backend); the small
@@ -422,7 +441,9 @@ fn encode_image_instruction(
 
     // Chat template with one block of merged vision tokens (`<|image_pad|>`) per reference, then the
     // multi-image MLLM forward (per-block vision splice + 3-D MRoPE + deepstack injection).
-    let ids = comps.tok.encode_edit_with_images(instruction, &counts)?;
+    let ids = comps
+        .tok
+        .encode_edit_with_images(instruction, &counts, MAX_EDIT_TOKENS)?;
     Ok(comps.te.last_hidden_with_images(
         &ids,
         &image_embeds,

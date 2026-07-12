@@ -404,13 +404,27 @@ pub fn render_edit(
     edit: &EditComponents,
     req: &GenerationRequest,
     references: &[Image],
+    // `true` = the CFG-free distilled Turbo edit (`krea_2_turbo_edit`, sc-11640): few-step
+    // `turbo_schedule` (fixed mu), guidance forced to 0 (a single conditional forward). `false` = the
+    // undistilled Raw edit (`krea_2_edit`, epic 10871): the resolution-dynamic `base_schedule` under
+    // full CFG. Mirrors mlx-gen-krea `render_edit(distilled)`.
+    distilled: bool,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     check_reference_count(references.len())?;
-    let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
+    let steps =
+        req.steps
+            .map(|s| s as usize)
+            .unwrap_or(if distilled { TURBO_STEPS } else { RAW_STEPS });
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-    let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+    // Turbo edit is CFG-free: force guidance 0 so the unconditional grounded encode is skipped and the
+    // sampler runs a single conditional forward. Raw edit honors the request guidance (default 3.5).
+    let guidance = if distilled {
+        0.0
+    } else {
+        req.guidance.unwrap_or(RAW_GUIDANCE)
+    };
 
     // Wire (b): run the vision tower ONCE per reference (shared across the pos/neg instruction encodings).
     let grounding = encode_vision(&edit.vision, references, device)?;
@@ -430,8 +444,25 @@ pub fn render_edit(
     let ref_latents =
         encode_references(&edit.vae_encoder, references, req.width, req.height, device)?;
 
-    // Resolution-dynamic Raw schedule (the edit path is undistilled, like `render_base`).
-    let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
+    // Turbo edit runs the distilled few-step `turbo_schedule` (fixed mu) the CFG-free student expects;
+    // Raw edit runs the resolution-dynamic `base_schedule` (undistilled, like `render_base`).
+    let sigmas = if distilled {
+        turbo_schedule(steps, req.scheduler.as_deref())
+    } else {
+        base_schedule(steps, req.width, req.height, req.scheduler.as_deref())
+    };
+
+    // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853, sc-11197): a per-generation
+    // PiD decoder bound to this request when `req.use_pid` is set (errors if requested but not loaded),
+    // else `None` → the native QwenVae decode. The edit id honors `use_pid` exactly like its `render` /
+    // `render_base` txt2img siblings — an edit generator loaded with a PiD engine (`spec.pid`) is no
+    // longer a dead wire. `model_id` names the surface for the error message (Raw vs distilled Turbo edit).
+    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+        comps.pid.as_deref(),
+        req,
+        base_seed,
+        edit_pid_model_id(distilled),
+    )?;
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
@@ -457,7 +488,13 @@ pub fn render_edit(
             },
         )?;
         on_progress(Progress::Decoding);
-        let decoded = comps.vae.decode(&lat)?.to_dtype(DType::F32)?;
+        // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both consume
+        // the same normalized `[1,16,H/8,W/8]` latent (a zero-transform seam); PiD returns a larger
+        // `[1,3,4H,4W]` tensor and `to_image` reads the size from it — matching `render` / `render_base`.
+        let decoded = match &pid_decoder {
+            Some(pid) => pid.decode(&lat)?,
+            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
+        };
         to_image(&decoded)
     })
 }
@@ -594,6 +631,27 @@ pub fn base_schedule(steps: usize, width: u32, height: u32, scheduler: Option<&s
     candle_gen::resolve_flow_schedule(scheduler, mu as f32, steps, &native)
 }
 
+/// The **Turbo** flow-match sigma schedule for `steps`: the TDM-distilled fixed-mu (`TURBO_MU = 1.15`)
+/// exponential-shift `turbo_sigmas`, optionally reshaped by a curated scheduler over the same mu. Length
+/// `steps + 1`, descending with a trailing `0.0`. The distilled CFG-free Turbo edit (`krea_2_turbo_edit`,
+/// sc-11640) denoises on this trajectory the few-step student was trained on, NOT the resolution-dynamic
+/// `base_schedule`. Mirrors mlx-gen-krea `turbo_schedule` + the `render_turbo` inline build.
+pub fn turbo_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
+    let native = turbo_sigmas(steps);
+    candle_gen::resolve_flow_schedule(scheduler, TURBO_MU as f32, steps, &native)
+}
+
+/// The surface id for the image-edit PiD decode-seam error message (sc-11197): the registered Raw edit
+/// ([`crate::KREA_2_EDIT_ID`]) vs the distilled Turbo edit ([`crate::KREA_2_TURBO_EDIT_ID`], driven
+/// through the worker's bespoke lane with `distilled = true`). Pure so the routing is unit-testable.
+fn edit_pid_model_id(distilled: bool) -> &'static str {
+    if distilled {
+        crate::KREA_2_TURBO_EDIT_ID
+    } else {
+        crate::KREA_2_EDIT_ID
+    }
+}
+
 /// Krea's classifier-free-guidance velocity combine — the reference `sampling.py:129`
 /// `v = v_cond + guidance·(v_cond − v_uncond)`, **NOT** the standard `v_uncond + g·Δ`. Krea's guidance
 /// is offset by one: the standard form applies one full step LESS guidance, and at `guidance = 1.0`
@@ -714,6 +772,58 @@ mod tests {
             let got = v.to_vec1::<f32>().unwrap()[0];
             assert!((got - want).abs() < 1e-5, "g={g}: got {got}, want {want}");
         }
+    }
+
+    /// The edit path names the right surface for the PiD decode-seam error (sc-11197): the registered
+    /// Raw edit id when undistilled, the distilled Turbo-edit tag when `distilled = true`.
+    #[test]
+    fn edit_pid_model_id_names_the_surface() {
+        assert_eq!(edit_pid_model_id(false), crate::KREA_2_EDIT_ID);
+        assert_eq!(edit_pid_model_id(true), crate::KREA_2_TURBO_EDIT_ID);
+    }
+
+    /// The image-edit decode seam honors `req.use_pid` exactly like `render` / `render_base` (sc-11197,
+    /// F-088). Before the fix `render_edit` never consulted `use_pid` and always decoded with the native
+    /// VAE — the descriptor-accepts / render-drops trap. This asserts the shared seam `render_edit` now
+    /// calls (`resolve_pid_decoder` with the edit id): `use_pid = true` with no loaded engine is a hard
+    /// error (no longer silently dropped), and `use_pid = false` resolves to the native path (`None`).
+    #[test]
+    fn edit_decode_seam_honors_use_pid() {
+        // use_pid requested but no PiD engine loaded → the same hard error the txt2img siblings raise
+        // (previously `render_edit` swallowed the flag and returned a native-resolution image).
+        let want_pid = GenerationRequest {
+            prompt: "make it autumn".into(),
+            width: 512,
+            height: 512,
+            use_pid: true,
+            ..Default::default()
+        };
+        // (`PidDecoder` is not `Debug`, so match the seam result rather than `unwrap_err`.)
+        let err =
+            match candle_gen_pid::resolve_pid_decoder(None, &want_pid, 0, edit_pid_model_id(false))
+            {
+                Ok(_) => panic!("use_pid = true with no loaded PiD engine must be a hard error"),
+                Err(e) => e.to_string(),
+            };
+        assert!(
+            err.contains(crate::KREA_2_EDIT_ID) && err.contains("use_pid"),
+            "use_pid on the edit id must error when unloaded, naming the surface: {err}"
+        );
+
+        // use_pid unset → the native QwenVae decode (no decoder resolved), decoupled from any engine.
+        let no_pid = GenerationRequest {
+            prompt: "make it autumn".into(),
+            width: 512,
+            height: 512,
+            use_pid: false,
+            ..Default::default()
+        };
+        let resolved =
+            candle_gen_pid::resolve_pid_decoder(None, &no_pid, 0, edit_pid_model_id(false));
+        assert!(
+            matches!(resolved, Ok(None)),
+            "use_pid = false must resolve to the native decode path (None)"
+        );
     }
 
     /// The Raw schedule uses the resolution-dynamic mu (vs Turbo's fixed 1.15): at 1024² the image-token

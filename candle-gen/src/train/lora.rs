@@ -30,7 +30,7 @@ use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::Distribution;
 
-use crate::quant::QLinear;
+use crate::quant::{LokrFactors, QLinear};
 use crate::{CandleError, Result};
 
 /// PEFT gaussian-init standard deviation for the **LoRA** `A` factor (diffusers/PEFT
@@ -96,6 +96,44 @@ enum Adapter {
     },
 }
 
+/// A **forward-time additive (unmerged) inference residual** stacked onto a [`LoraLinear`] — the
+/// packed-tier analog of the trainable [`Adapter`] (sc-11103, epic 10765). Unlike [`Adapter`] (a single
+/// `Var`-backed trainable residual that a **dense** base folds at merge time), these are frozen f32
+/// factors added *at forward* and valid on **any** base including an MLX-**packed** [`QLinear`] — the
+/// base weight is never dequantized or mutated, so a q4/q8 SDXL tier keeps its footprint while a distill
+/// LoRA rides on top. This is the SDXL adoption of the shared additive path
+/// ([`crate::quant::AdaptLinear`], sc-11091): the LoRA arm is the same two-small-matmul residual, and
+/// the LoKr arm delegates to the shared allocation-free [`LokrFactors`] vec-trick (no `[out,in]` delta,
+/// so a LoKr stays packed too). Multiple residuals stack, applied in push order after the base.
+#[derive(Debug, Clone)]
+enum AdditiveResidual {
+    /// `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with `alpha/rank`
+    /// folded in). The deferred two-matmul form — never the `[out,in]` product — so it stays memory-free
+    /// on a packed base. Mirrors [`crate::quant::AdaptLinear`]'s `Lora` arm exactly.
+    Lora { a: Tensor, b: Tensor, scale: f64 },
+    /// The structured LoKr residual via the shared Kronecker vec-trick; the full `(alpha/rank)·strength`
+    /// scale is baked into the [`LokrFactors`], so `[out,in]` is never formed.
+    LokrStructured { factors: LokrFactors },
+}
+
+impl AdditiveResidual {
+    /// The residual this adapter contributes, in the activation dtype of `x` (factors are held f32 and
+    /// cast per forward — they are tiny). Identical to [`crate::quant::AdaptLinear`]'s residual so the
+    /// packed-additive SDXL path and the dense-fold path agree to f32 tolerance.
+    fn residual(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            AdditiveResidual::Lora { a, b, scale } => {
+                let xd = x.dtype();
+                let r = x
+                    .broadcast_matmul(&a.to_dtype(xd)?)?
+                    .broadcast_matmul(&b.to_dtype(xd)?)?;
+                r * *scale
+            }
+            AdditiveResidual::LokrStructured { factors } => factors.residual(x),
+        }
+    }
+}
+
 /// 2-D Kronecker product `kron(a[m,n], b[p,q]) = [m·p, n·q]` via broadcast — differentiable, so grads
 /// flow to `a`/`b`. `out[i·p+k, j·q+l] = a[i,j]·b[k,l]`.
 fn kron2d(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
@@ -158,6 +196,11 @@ pub struct LoraLinear {
     /// `Var`-backed adapter is parked here and `adapter` holds a detached snapshot, so the inference
     /// forward builds no autograd graph. [`thaw_adapter`](Self::thaw_adapter) restores it.
     frozen: Option<Adapter>,
+    /// Forward-time additive **inference** residuals (sc-11103), applied in push order AFTER the base
+    /// (and after any trainable `adapter`). Empty on the plain / trainable path ⇒ forward is byte-
+    /// identical to before. Valid on a **packed** base — the SDXL packed-tier distill-LoRA path pushes
+    /// these instead of dequant-folding, so the q4/q8 footprint survives.
+    additive: Vec<AdditiveResidual>,
 }
 
 impl LoraLinear {
@@ -176,6 +219,7 @@ impl LoraLinear {
             path,
             adapter: None,
             frozen: None,
+            additive: Vec::new(),
         }
     }
 
@@ -196,6 +240,7 @@ impl LoraLinear {
             path,
             adapter: None,
             frozen: None,
+            additive: Vec::new(),
         }
     }
 
@@ -249,6 +294,30 @@ impl LoraLinear {
     /// Drop any installed residual (back to the frozen base — the inference path with no adapter).
     pub fn clear(&mut self) {
         self.adapter = None;
+    }
+
+    /// Attach a forward-time **additive LoRA** inference residual `scale·((x·a)·b)` (sc-11103): `a`
+    /// `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with `alpha/rank` folded in), `scale` the
+    /// per-adapter user strength. Unlike [`install_lora`](Self::install_lora) (trainable, dense-only),
+    /// this is valid on **any** base including a **packed** [`QLinear`] — the base weight is never
+    /// dequantized, so a q4/q8 tier keeps its footprint. Multiple pushes stack (applied in push order).
+    pub fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+        self.additive.push(AdditiveResidual::Lora { a, b, scale });
+    }
+
+    /// Attach a forward-time **additive structured LoKr** inference residual via the shared Kronecker
+    /// vec-trick (sc-11103): the full `(alpha/rank)·strength` scale is baked into `factors`, so the
+    /// `[out,in]` delta is never formed and the residual is memory-free on a packed base. Valid on any
+    /// base; multiple pushes stack and mix freely with additive LoRA residuals (push order).
+    pub fn push_additive_lokr(&mut self, factors: LokrFactors) {
+        self.additive
+            .push(AdditiveResidual::LokrStructured { factors });
+    }
+
+    /// Whether any forward-time additive inference residual is attached (sc-11103) — distinct from
+    /// [`is_adapted`](Self::is_adapted), which reports the single *trainable* adapter.
+    pub fn has_additive(&self) -> bool {
+        !self.additive.is_empty()
     }
 
     fn install_lokr(&mut self, w1: Tensor, w2: LokrW2, scale: f64) {
@@ -325,8 +394,8 @@ impl Adapter {
 impl Module for LoraLinear {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let y = self.base.forward(x)?;
-        match &self.adapter {
-            None => Ok(y),
+        let mut y = match &self.adapter {
+            None => y,
             // Factors are f32; cast to the activation dtype for the matmul. The cast is
             // differentiable, so grads flow back to the f32 `Var`s (master-weights). The factor
             // tensors share storage with those `Var`s, so this reads the current optimizer-updated value.
@@ -335,7 +404,7 @@ impl Module for LoraLinear {
                 let down = down.to_dtype(xd)?;
                 let up = up.to_dtype(xd)?;
                 let lora = x.broadcast_matmul(&down.t()?)?.broadcast_matmul(&up.t()?)?;
-                y + (lora * *scale)?
+                (y + (lora * *scale)?)?
             }
             Some(Adapter::Lokr {
                 w1,
@@ -353,9 +422,15 @@ impl Module for LoraLinear {
                 // dtype for the residual matmul x·ΔWᵀ.
                 let delta = kron2d(w1, &factor2)?.reshape((*out_f, *in_f))?;
                 let delta = (delta * *scale)?.to_dtype(x.dtype())?;
-                y + x.broadcast_matmul(&delta.t()?)?
+                (y + x.broadcast_matmul(&delta.t()?)?)?
             }
+        };
+        // Forward-time additive inference residuals (sc-11103), applied in push order after the base +
+        // trainable adapter. Empty on the plain / trainable path, so this loop is a no-op there.
+        for ar in &self.additive {
+            y = (y + ar.residual(x)?)?;
         }
+        Ok(y)
     }
 }
 
@@ -1073,6 +1148,107 @@ mod tests {
     fn dense_base_is_not_packed() {
         let ll = fixed_linear(&[1.0; 8], 2, 4);
         assert!(!ll.is_packed());
+    }
+
+    /// sc-11103: a forward-time **additive** LoRA residual on a **packed** `LoraLinear` base shifts the
+    /// output by exactly `scale·((x·a)·b)` (isolated by cancelling the bit-identical packed base), keeps
+    /// the base **packed** (no dense weight materialized — the packed footprint survives), and a scale-0
+    /// residual is an exact no-op. This is the SDXL packed-tier distill-LoRA path's core property — the
+    /// additive residual is added *over* the packed weight, never folded into a re-quantized dense one.
+    #[test]
+    fn additive_lora_on_packed_base_adds_exact_residual_and_scale0_noop() {
+        let dev = Device::Cpu;
+        let (out_f, in_f, rank) = (64usize, 128usize, 4usize);
+        let (wq, s, b) = q4_packed_triple(out_f, in_f);
+        let q = QLinear::from_packed(&wq, &s, &b, None, &dev).unwrap();
+        // Two bit-identical packed bases: one bare (reference), one adapted.
+        let base = LoraLinear::from_qlinear(q.clone(), in_f, out_f, "attn1.to_q".into());
+        let mut adapted = LoraLinear::from_qlinear(q, in_f, out_f, "attn1.to_q".into());
+        let a = (Tensor::randn(0f32, 1f32, (in_f, rank), &dev).unwrap() * 0.1).unwrap();
+        let bfac = (Tensor::randn(0f32, 1f32, (rank, out_f), &dev).unwrap() * 0.1).unwrap();
+        let scale = 0.7f64;
+        adapted.push_additive_lora(a.clone(), bfac.clone(), scale);
+        assert!(
+            adapted.is_packed(),
+            "the additive residual must not un-pack the base"
+        );
+        assert!(adapted.has_additive());
+        assert!(
+            !adapted.is_adapted(),
+            "additive is not the trainable adapter"
+        );
+
+        let x = Tensor::randn(0f32, 1f32, (4usize, in_f), &dev).unwrap();
+        // adapted − base cancels the identical packed base (quant error included) → the pure residual.
+        let residual_actual = (adapted.forward(&x).unwrap() - base.forward(&x).unwrap()).unwrap();
+        let residual_expected = ((x.matmul(&a).unwrap().matmul(&bfac).unwrap()) * scale).unwrap();
+        let dmax = (residual_actual - residual_expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        // 1e-4, not 1e-5: this synthetic packed grid is large-magnitude, so `(base + residual) − base`
+        // loses a few ULPs to f32 cancellation. The residual itself is exact; the bound guards its value.
+        assert!(
+            dmax < 1e-4,
+            "packed additive residual != scale·(x·a)·b ({dmax})"
+        );
+
+        // scale 0 ⇒ exact no-op vs the un-adapted packed base.
+        let (wq, s, b) = q4_packed_triple(out_f, in_f);
+        let q2 = QLinear::from_packed(&wq, &s, &b, None, &dev).unwrap();
+        let mut zero = LoraLinear::from_qlinear(q2, in_f, out_f, "attn1.to_q".into());
+        zero.push_additive_lora(a, bfac, 0.0);
+        let zero_dev = (zero.forward(&x).unwrap() - base.forward(&x).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            zero_dev, 0.0,
+            "a scale-0 additive residual must be an exact no-op"
+        );
+    }
+
+    /// sc-11103: the additive residual `scale·((x·a)·b)` reproduces the **folded** `x·(W + δ)ᵀ` with
+    /// `δ = (alpha/rank)·scale·(up·down)` on a **dense** base — the additive == folded identity (tight in
+    /// f32). This is the acceptance parity the packed path relies on: pushing the residual equals what the
+    /// dense tier folds, so a distill LoRA renders the same on q4/q8 (up to the base's own quant error).
+    #[test]
+    fn additive_lora_matches_dense_fold() {
+        let dev = Device::Cpu;
+        let (out_f, in_f, rank) = (48usize, 64usize, 4usize);
+        let w = Tensor::randn(0f32, 1f32, (out_f, in_f), &dev).unwrap();
+        let down = Tensor::randn(0f32, 1f32, (rank, in_f), &dev).unwrap(); // A [rank, in]
+        let up = Tensor::randn(0f32, 1f32, (out_f, rank), &dev).unwrap(); // B [out, rank]
+        let (alpha, user_scale) = (8.0f64, 0.7f64);
+        let ratio = alpha / rank as f64;
+        // a = downᵀ [in, rank]; b = (upᵀ·ratio) [rank, out] — the resolver's factor convention.
+        let a = down.t().unwrap().contiguous().unwrap();
+        let b = (up.t().unwrap().contiguous().unwrap() * ratio).unwrap();
+        let mut lin =
+            LoraLinear::from_linear(Linear::new(w.clone(), None), in_f, out_f, "p".into());
+        lin.push_additive_lora(a, b, user_scale);
+
+        // Folded reference: δ = ratio·user_scale·(up·down); W_merged = W + δ.
+        let delta = ((up.matmul(&down).unwrap()) * (ratio * user_scale)).unwrap();
+        let folded = Linear::new((w + delta).unwrap(), None);
+        let x = Tensor::randn(0f32, 1f32, (3usize, in_f), &dev).unwrap();
+        let dmax = (lin.forward(&x).unwrap() - folded.forward(&x).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(dmax < 1e-4, "additive vs folded deviates by {dmax}");
     }
 
     /// Installing an adapter on a packed base is a programmer error (debug-guarded): a packed tier has

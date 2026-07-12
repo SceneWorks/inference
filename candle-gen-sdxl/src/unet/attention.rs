@@ -1,6 +1,5 @@
 //! Attention Based Building Blocks
 use candle_core::{DType, Result, Tensor, D};
-use candle_gen::quant::QLinear;
 use candle_gen::train::lora::{lora_linear_detect, lora_linear_no_bias_detect, LoraLinear};
 use candle_nn as nn;
 use candle_nn::Module;
@@ -13,15 +12,27 @@ use candle_nn::Module;
 
 #[derive(Debug)]
 struct GeGlu {
-    proj: QLinear,
+    // sc-11103: `ff.net.0.proj` is a `LoraLinear` (frozen packed/dense base + optional forward-time
+    // additive residual) rather than a bare `QLinear`, so a distill LoRA can ride it **additively** on a
+    // packed tier instead of dequant-folding the FF (the bulk of the UNet). With no residual installed it
+    // is byte-identical to the previous `QLinear` (the packed base IS a `QLinear`; the dense arm is the
+    // same `candle_nn::linear`), so inference / training are unchanged.
+    proj: LoraLinear,
     span: tracing::Span,
 }
 
 impl GeGlu {
     fn new(vs: nn::VarBuilder, dim_in: usize, dim_out: usize, group_size: usize) -> Result<Self> {
-        let proj = QLinear::linear_detect_gs(dim_in, dim_out * 2, &vs, "proj", true, group_size)?;
+        let proj = lora_linear_detect(dim_in, dim_out * 2, &vs, "proj", group_size)?;
         let span = tracing::span!(tracing::Level::TRACE, "geglu");
         Ok(Self { proj, span })
+    }
+
+    fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&mut self.proj)
     }
 }
 
@@ -37,7 +48,9 @@ impl Module for GeGlu {
 #[derive(Debug)]
 struct FeedForward {
     project_in: GeGlu,
-    linear: QLinear,
+    // sc-11103: `ff.net.2` is a `LoraLinear` (see [`GeGlu::proj`]) so the FF output projection also takes
+    // a distill LoRA additively on a packed tier. Byte-identical with no residual.
+    linear: LoraLinear,
     span: tracing::Span,
 }
 
@@ -57,13 +70,24 @@ impl FeedForward {
         let dim_out = dim_out.unwrap_or(dim);
         let vs = vs.pp("net");
         let project_in = GeGlu::new(vs.pp("0"), dim, inner_dim, group_size)?;
-        let linear = QLinear::linear_detect_gs(inner_dim, dim_out, &vs, "2", true, group_size)?;
+        let linear = lora_linear_detect(inner_dim, dim_out, &vs, "2", group_size)?;
         let span = tracing::span!(tracing::Level::TRACE, "ff");
         Ok(Self {
             project_in,
             linear,
             span,
         })
+    }
+
+    /// Visit the two adaptable FF projections (`ff.net.0.proj`, `ff.net.2`) so a distill LoRA can
+    /// install additive residuals on them (sc-11103) — the FF is the bulk of the UNet, so keeping it
+    /// packed (residual, not dequant-fold) is the whole point of the packed-tier additive path.
+    fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.project_in.visit_lora_mut(f)?;
+        f(&mut self.linear)
     }
 }
 
@@ -384,6 +408,10 @@ impl BasicTransformerBlock {
     ) -> candle_gen::Result<()> {
         self.attn1.visit_lora_mut(f)?;
         self.attn2.visit_lora_mut(f)?;
+        // sc-11103: the FF projections join the adaptable walk so a packed-tier distill LoRA rides them
+        // additively. The trainer's `build_lora_targets` matches only `SDXL_ATTN_TARGETS`, so these extra
+        // leaves are visited-but-unmatched during training (no behavior change there).
+        self.ff.visit_lora_mut(f)?;
         Ok(())
     }
 
@@ -420,7 +448,9 @@ impl Default for SpatialTransformerConfig {
 enum Proj {
     Conv2d(nn::Conv2d),
     // sc-9416: the linear projection variant (SDXL's `use_linear_projection = true`) packed-detects.
-    Linear(QLinear),
+    // sc-11103: as a `LoraLinear` (frozen packed/dense base + optional additive residual) so a distill
+    // LoRA rides `proj_in`/`proj_out` additively on a packed tier. Byte-identical with no residual.
+    Linear(LoraLinear),
 }
 
 // Aka Transformer2DModel
@@ -470,12 +500,11 @@ impl SpatialTransformer {
         let inner_dim = n_heads * d_head;
         let norm = nn::group_norm(config.num_groups, in_channels, 1e-6, vs.pp("norm"))?;
         let proj_in = if config.use_linear_projection {
-            Proj::Linear(QLinear::linear_detect_gs(
+            Proj::Linear(lora_linear_detect(
                 in_channels,
                 inner_dim,
                 &vs,
                 "proj_in",
-                true,
                 group_size,
             )?)
         } else {
@@ -502,12 +531,11 @@ impl SpatialTransformer {
             transformer_blocks.push(tb)
         }
         let proj_out = if config.use_linear_projection {
-            Proj::Linear(QLinear::linear_detect_gs(
+            Proj::Linear(lora_linear_detect(
                 in_channels,
                 inner_dim,
                 &vs,
                 "proj_out",
-                true,
                 group_size,
             )?)
         } else {
@@ -573,13 +601,21 @@ impl SpatialTransformer {
         xs + residual
     }
 
-    /// Visit every adaptable attention projection in this transformer's blocks (sc-5165).
+    /// Visit every adaptable projection in this transformer (sc-5165): the linear `proj_in`/`proj_out`
+    /// (sc-11103 — when `use_linear_projection`, the SDXL case; the conv-projection variant is not a
+    /// Linear adapter target) and every block's attention + FF projections.
     pub fn visit_lora_mut(
         &mut self,
         f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
+        if let Proj::Linear(p) = &mut self.proj_in {
+            f(p)?;
+        }
         for block in self.transformer_blocks.iter_mut() {
             block.visit_lora_mut(f)?;
+        }
+        if let Proj::Linear(p) = &mut self.proj_out {
+            f(p)?;
         }
         Ok(())
     }
@@ -598,10 +634,12 @@ impl SpatialTransformer {
 
     /// Test-only: whether the linear `proj_in`/`proj_out` loaded packed (sc-9416). Conv-projection
     /// variants are never packed (MLX affine-packs only Linear weights), so this is `false` for them.
+    /// sc-11103: `proj_in`/`proj_out` are `LoraLinear` now, so the packed check is `is_packed` (the
+    /// packed base) rather than the old `QLinear::is_quantized`.
     #[cfg(test)]
     pub(crate) fn linear_projs_packed(&self) -> bool {
-        matches!(&self.proj_in, Proj::Linear(q) if q.is_quantized())
-            && matches!(&self.proj_out, Proj::Linear(q) if q.is_quantized())
+        matches!(&self.proj_in, Proj::Linear(q) if q.is_packed())
+            && matches!(&self.proj_out, Proj::Linear(q) if q.is_packed())
     }
 
     /// Test-only: whether every transformer block's self- and cross-attention projections loaded packed.
