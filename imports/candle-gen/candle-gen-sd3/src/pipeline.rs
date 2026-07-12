@@ -192,61 +192,79 @@ impl Pipeline {
         // pre-sc-7881 path). The merge always runs **before** quantization so Q4/Q8 folds the adapted
         // weights. `dit_vb_on(device)` returns the right source on the requested device.
         // Whether `transformer/` is a pre-quantized MLX-packed tier (`config.json` carries a
-        // `quantization` block). Adapters merge into *dense* `transformer/` keys, so an adapter merge is
-        // incompatible with a packed tier — fall back to the dense CPU-stage path when adapters are
-        // present (the hosted packed tiers ship no LoRA-mergeable dense keys anyway).
+        // `quantization` block). On a packed tier the dense fold (`merge_adapters`, `W += δ`) can't run
+        // (the base is u32 codes), so adapters ride as **forward-time additive residuals** on the packed
+        // base (sc-11105) — a user LoRA no longer forces a full dense build. A dense tier keeps folding.
         let packed_cfg = self.transformer_packed_config();
         let packed_tier = self.adapters.is_empty() && packed_cfg.is_some();
+        // Packed tier WITH adapters: build packed + install additive residuals (sc-11105).
+        let additive = !self.adapters.is_empty() && packed_cfg.is_some();
         // sc-9474: the shared packed loaders (`QLinear::linear_detect` / `linear_detect_dense`) repack
         // at the MLX default group size 64, which every hosted `sd3.5-*-mlx` tier uses. The parsed
         // `PackedConfig.group_size` is threaded here as a LOUD guard so a hypothetical future group-32
         // tier (as boogu's is) fails at load rather than silently repacking to garbage. If a non-64 SD3.5
         // tier is ever shipped, thread `group_size` through `Sd3Transformer::new` into the `*_gs` shared
-        // entry points (`linear_detect_gs` / `lin_gs`), as candle-gen-boogu (sc-9410) does.
-        if packed_tier {
-            if let Some(cfg) = &packed_cfg {
-                if cfg.group_size != candle_gen::quant::MLX_GROUP_SIZE as i32 {
-                    return Err(CandleError::Msg(format!(
-                        "sd3 packed transformer/ tier declares quantization.group_size = {} but the \
-                         candle-gen-sd3 packed loaders assume the MLX default {} (sc-9474). Thread the \
-                         parsed group_size through Sd3Transformer::new into the shared `*_gs` entry \
-                         points (as candle-gen-boogu does) before loading this tier.",
-                        cfg.group_size,
-                        candle_gen::quant::MLX_GROUP_SIZE,
-                    )));
-                }
+        // entry points (`linear_detect_gs` / `lin_gs`), as candle-gen-boogu (sc-9410) does. Runs for any
+        // packed tier (with or without adapters).
+        if let Some(cfg) = &packed_cfg {
+            if cfg.group_size != candle_gen::quant::MLX_GROUP_SIZE as i32 {
+                return Err(CandleError::Msg(format!(
+                    "sd3 packed transformer/ tier declares quantization.group_size = {} but the \
+                     candle-gen-sd3 packed loaders assume the MLX default {} (sc-9474). Thread the \
+                     parsed group_size through Sd3Transformer::new into the shared `*_gs` entry \
+                     points (as candle-gen-boogu does) before loading this tier.",
+                    cfg.group_size,
+                    candle_gen::quant::MLX_GROUP_SIZE,
+                )));
             }
         }
-        let transformer = match self.quant {
-            // sc-9414 packed path: build the MMDiT **directly on the GPU** from the MLX-packed tier —
-            // each projection packed-detects its `.scales` sibling and lands its Q4_1/Q8_0 footprint
-            // straight on the device (no dense bf16 staging, no load-then-quantize). The post-load
-            // `quantize_onto` pass is a no-op on the already-packed projections and only re-migrates the
-            // dense-kept leaves (already on the GPU). The AdaLN/embedder leaves are dequantized to dense
-            // full-precision leaves inside `new` (see `quant::linear_detect_dense`). TE + VAE stay dense.
-            Some(q) if packed_tier => {
-                let mut transformer = Sd3Transformer::new(
-                    &self.cfg,
-                    self.component_vb_on("transformer", &self.device)?,
-                )?;
+        let transformer = if additive {
+            // Packed tier + adapters: build the packed MMDiT directly on the device (each projection
+            // packed-detects its `.scales` sibling), then install the LoRA/LoKr as forward-time additive
+            // residuals on the packed base (sc-11105) — the base stays packed (q4/q8 footprint); the
+            // deltas ride unmerged, never folded into u32 codes. A requested `quantize_onto` is a no-op on
+            // the already-packed projections and only re-migrates the dense-kept leaves.
+            let mut transformer = Sd3Transformer::new(
+                &self.cfg,
+                self.component_vb_on("transformer", &self.device)?,
+            )?;
+            crate::adapters::install_additive(&mut transformer, &self.adapters)?;
+            if let Some(q) = self.quant {
                 transformer.quantize_onto(q, &self.device)?;
-                transformer
             }
-            // sc-8504 CPU-stage path (dense tier): build the dense MMDiT on a **CPU** VarBuilder, then
-            // `quantize_onto` the compute device — the quantized projections land directly on the GPU
-            // (the dense projection weight never touches it) and the dense-kept leaves migrate
-            // alongside. This drops the in-place dense-build transient (sc-7879 built dense on-device
-            // then folded in place, so dense + quantized briefly coexisted on the GPU). The resulting
-            // Q4_0/Q8_0 blocks are bit-identical to the in-place path (the quantizer routes through the
-            // CPU either way). The TE + VAE stay dense bf16.
-            Some(q) => {
-                let cpu = Device::Cpu;
-                let mut transformer = Sd3Transformer::new(&self.cfg, self.dit_vb_on(&cpu)?)?;
-                transformer.quantize_onto(q, &self.device)?;
-                transformer
+            transformer
+        } else {
+            match self.quant {
+                // sc-9414 packed path: build the MMDiT **directly on the GPU** from the MLX-packed tier —
+                // each projection packed-detects its `.scales` sibling and lands its Q4_1/Q8_0 footprint
+                // straight on the device (no dense bf16 staging, no load-then-quantize). The post-load
+                // `quantize_onto` pass is a no-op on the already-packed projections and only re-migrates the
+                // dense-kept leaves (already on the GPU). The AdaLN/embedder leaves are dequantized to dense
+                // full-precision leaves inside `new` (see `quant::linear_detect_dense`). TE + VAE stay dense.
+                Some(q) if packed_tier => {
+                    let mut transformer = Sd3Transformer::new(
+                        &self.cfg,
+                        self.component_vb_on("transformer", &self.device)?,
+                    )?;
+                    transformer.quantize_onto(q, &self.device)?;
+                    transformer
+                }
+                // sc-8504 CPU-stage path (dense tier): build the dense MMDiT on a **CPU** VarBuilder, then
+                // `quantize_onto` the compute device — the quantized projections land directly on the GPU
+                // (the dense projection weight never touches it) and the dense-kept leaves migrate
+                // alongside. This drops the in-place dense-build transient (sc-7879 built dense on-device
+                // then folded in place, so dense + quantized briefly coexisted on the GPU). The resulting
+                // Q4_0/Q8_0 blocks are bit-identical to the in-place path (the quantizer routes through the
+                // CPU either way). The TE + VAE stay dense bf16.
+                Some(q) => {
+                    let cpu = Device::Cpu;
+                    let mut transformer = Sd3Transformer::new(&self.cfg, self.dit_vb_on(&cpu)?)?;
+                    transformer.quantize_onto(q, &self.device)?;
+                    transformer
+                }
+                // Dense bf16: load straight onto the compute device.
+                None => Sd3Transformer::new(&self.cfg, self.dit_vb_on(&self.device)?)?,
             }
-            // Dense bf16: load straight onto the compute device.
-            None => Sd3Transformer::new(&self.cfg, self.dit_vb_on(&self.device)?)?,
         };
         let vae = load_vae(self.component_vb("vae")?)?;
         Ok(Components {

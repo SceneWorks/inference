@@ -36,7 +36,7 @@ pub mod quant;
 pub mod transformer;
 pub mod vae;
 
-pub use adapters::{merge_adapters, MergeReport};
+pub use adapters::{install_additive, merge_adapters, AdditiveReport, MergeReport};
 pub use config::Sd3Config;
 pub use memory::{min_memory_gb, MemoryProfile, ParamCounts, Precision};
 pub use pipeline::Variant;
