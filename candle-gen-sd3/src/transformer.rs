@@ -30,7 +30,15 @@ use candle_gen::candle_nn::{self, Linear, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
 
 use crate::config::Sd3Config;
-use crate::quant::{conv2d_to, linear_detect_dense, linear_to, rms_norm_to, QLinear};
+// The dense-leaf helpers stay the crate's shared `quant` seam; the residual-capable projection type is
+// the shared [`candle_gen::quant::AdaptLinear`] (sc-11105), aliased to `QLinear` so every `linear_detect`
+// / `quantize` / `quantize_dequant_onto` call site below stays unchanged. It carries an optional
+// forward-time additive LoRA/LoKr residual so a user LoRA applies on a **packed q4/q8** tier with the
+// base kept packed ([`crate::adapters::install_additive`]) — the deltas ride unmerged, never folded into
+// u32 codes. `AdaptLinear::quantize` no-ops on a packed base, so the dense→Q4/Q8 fold path is unchanged
+// and the residuals survive it. With no adapter the forward is byte-identical to the bare base.
+use crate::quant::{conv2d_to, linear_detect_dense, linear_to, rms_norm_to};
+use candle_gen::quant::AdaptLinear as QLinear;
 
 /// Affine-free LayerNorm eps (diffusers `elementwise_affine=False, eps=1e-6` on the AdaLN norms).
 const LN_EPS: f64 = 1e-6;
@@ -388,6 +396,28 @@ impl JointAttention {
         Ok(())
     }
 
+    /// Visit the joint-attention projections under `{prefix}` (`to_q/to_k/to_v/to_out.0` image stream +
+    /// `add_q_proj/add_k_proj/add_v_proj/to_add_out` text stream) — the surface a user LoRA/LoKr adapts
+    /// (sc-11105). The q/k/v are the SPLIT diffusers projections; a fused-QKV kohya LoRA is row-sliced
+    /// onto them by the installer. The per-head q/k RMSNorms are not projections.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.to_q"), &mut self.to_q)?;
+        f(&format!("{prefix}.to_k"), &mut self.to_k)?;
+        f(&format!("{prefix}.to_v"), &mut self.to_v)?;
+        f(&format!("{prefix}.to_out.0"), &mut self.to_out)?;
+        f(&format!("{prefix}.add_q_proj"), &mut self.add_q)?;
+        f(&format!("{prefix}.add_k_proj"), &mut self.add_k)?;
+        f(&format!("{prefix}.add_v_proj"), &mut self.add_v)?;
+        if let Some(p) = &mut self.to_add_out {
+            f(&format!("{prefix}.to_add_out"), p)?;
+        }
+        Ok(())
+    }
+
     /// CPU-stage path (sc-8504): quantize every projection **onto `device`** (dense never lands on the
     /// GPU) and migrate the dense-kept per-head q/k RMSNorms there too.
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
@@ -510,6 +540,19 @@ impl SelfAttention {
         Ok(())
     }
 
+    /// Visit the image-only `attn2` projections under `{prefix}` (`to_q/to_k/to_v/to_out.0`) — sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.to_q"), &mut self.to_q)?;
+        f(&format!("{prefix}.to_k"), &mut self.to_k)?;
+        f(&format!("{prefix}.to_v"), &mut self.to_v)?;
+        f(&format!("{prefix}.to_out.0"), &mut self.to_out)?;
+        Ok(())
+    }
+
     /// CPU-stage path (sc-8504): quantize the `attn2` projections **onto `device`** + migrate q/k norms.
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
         self.to_q.quantize_dequant_onto(quant, device)?;
@@ -554,6 +597,17 @@ impl FeedForward {
     fn quantize(&mut self, quant: Quant) -> Result<()> {
         self.proj.quantize(quant)?;
         self.out.quantize(quant)?;
+        Ok(())
+    }
+
+    /// Visit the two GELU-MLP projections under `{prefix}` (`net.0.proj`, `net.2`) — sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.net.0.proj"), &mut self.proj)?;
+        f(&format!("{prefix}.net.2"), &mut self.out)?;
         Ok(())
     }
 
@@ -638,6 +692,27 @@ impl JointBlock {
         self.ff.quantize(quant)?;
         if let Some(ffc) = &mut self.ff_context {
             ffc.quantize(quant)?;
+        }
+        Ok(())
+    }
+
+    /// Visit every adaptable projection in the block under `{prefix}` — the joint attention, the dual
+    /// `attn2` (if present), the GELU MLP, and the text-stream `ff_context` (if present). The AdaLN
+    /// modulation linears (`norm1.linear` / `norm1_context.linear`) stay dense and are not part of the
+    /// additive surface (a LoRA targeting them routes to the dense tier). sc-11105.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.attn
+            .visit_adaptable_mut(&format!("{prefix}.attn"), f)?;
+        if let Some(a2) = &mut self.attn2 {
+            a2.visit_adaptable_mut(&format!("{prefix}.attn2"), f)?;
+        }
+        self.ff.visit_adaptable_mut(&format!("{prefix}.ff"), f)?;
+        if let Some(ffc) = &mut self.ff_context {
+            ffc.visit_adaptable_mut(&format!("{prefix}.ff_context"), f)?;
         }
         Ok(())
     }
@@ -864,6 +939,38 @@ impl Sd3Transformer {
         self.pos_embed.migrate_to(device)?;
         self.time_text_embed.migrate_to(device)?;
         self.norm_out.migrate_to(device)?;
+        Ok(())
+    }
+
+    /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
+    /// moved here at install (else the residual matmul is a device mismatch). sc-11105. Read off the
+    /// dense-kept learned pos-embed table (always present, on the model device).
+    pub fn device(&self) -> &Device {
+        self.pos_embed.pos_embed.device()
+    }
+
+    /// Whether the DiT loaded from a packed MLX tier (any projection is quantized) — the gate the loader
+    /// uses to route adapters to the additive install vs the dense fold (sc-11105). Probes `proj_out`, a
+    /// projection packed in every quantized tier.
+    pub fn is_packed(&self) -> bool {
+        self.proj_out.is_packed()
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the projection's
+    /// canonical diffusers dotted path — the same paths [`crate::adapters::resolve_targets`] resolves an
+    /// adapter module to (`context_embedder`, `proj_out`, and each `transformer_blocks.{i}` joint/dual
+    /// attention + GELU-MLP projection). The additive installer
+    /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
+    /// projection so a user adapter applies on a packed q4/q8 tier with the base kept packed (sc-11105).
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f("context_embedder", &mut self.context_embedder)?;
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
+        }
+        f("proj_out", &mut self.proj_out)?;
         Ok(())
     }
 
@@ -1327,6 +1434,68 @@ mod tests {
         }
     }
 
+    /// **Additive install on the SD3.5 MMDiT (sc-11105).** A bare-dotted diffusers LoRA over two real
+    /// block-0 attention projections installs as forward-time residuals: the report counts both, the DiT
+    /// forward shifts vs the un-adapted model, and no target is unresolved — proving the visitor's
+    /// canonical paths line up with `adapters::resolve_targets`. Exercises the packed-tier install wiring
+    /// on a dense-base fixture (the base-agnostic additive path is byte-equal on a packed base; the
+    /// stays-packed property is proven at the `AdaptLinear` unit level).
+    #[test]
+    fn install_additive_lora_on_mmdit_applies_and_shifts() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        use std::collections::HashMap as Map;
+        let cfg = quant_cfg();
+        let (vm, latent, context, pooled, t) = quant_harness(&cfg);
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let base = Sd3Transformer::new(&cfg, vb.clone()).unwrap();
+        let mut adapted = Sd3Transformer::new(&cfg, vb).unwrap();
+
+        let inner = cfg.inner_dim;
+        let rank = 2usize;
+        let mut map: Map<String, Tensor> = Map::new();
+        for proj in ["attn.to_q", "attn.to_out.0"] {
+            let path = format!("transformer_blocks.0.{proj}");
+            map.insert(
+                format!("{path}.lora_A.weight"),
+                Tensor::randn(0f32, 0.5f32, (rank, inner), &dev).unwrap(),
+            );
+            map.insert(
+                format!("{path}.lora_B.weight"),
+                Tensor::randn(0f32, 0.5f32, (inner, rank), &dev).unwrap(),
+            );
+        }
+        let tmp =
+            std::env::temp_dir().join(format!("sc11105_sd3_{}.safetensors", std::process::id()));
+        candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
+        let report = crate::adapters::install_additive(
+            &mut adapted,
+            &[AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lora)],
+        )
+        .unwrap();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(
+            report.applied, 2,
+            "both to_q + to_out.0 residuals installed"
+        );
+        assert!(report.skipped_targets.is_empty(), "no unresolved targets");
+
+        let y_base = base.forward(&latent, &context, &pooled, &t).unwrap();
+        let y_adapt = adapted.forward(&latent, &context, &pooled, &t).unwrap();
+        let shift = (y_adapt - y_base)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            shift > 1e-5,
+            "additive LoRA did not shift the DiT forward ({shift})"
+        );
+    }
+
     /// **Q8 forward is near-lossless; Q4 forward stays coherent** vs the dense MMDiT (CPU, random
     /// weights). Builds one transformer, captures the dense velocity, quantizes a *copy* of the same
     /// weights, and compares — the full-model analog of the per-linear `quant.rs` round-trip. Asserts
@@ -1403,11 +1572,8 @@ mod tests {
         staged.quantize_onto(quant, &dev).unwrap();
         let v_staged = staged.forward(&latent, &context, &pooled, &t).unwrap();
 
-        // The staged projections really transitioned to the Quantized arm.
-        assert!(matches!(
-            staged.blocks[0].attn.to_q,
-            crate::quant::QLinear::Quantized { .. }
-        ));
+        // The staged projections really transitioned to the packed (Quantized) base.
+        assert!(staged.blocks[0].attn.to_q.is_packed());
 
         let a = v_in_place.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = v_staged.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1482,12 +1648,13 @@ mod tests {
             model.quantize_onto(quant, &gpu).unwrap();
 
             // (a) A quantized projection is on the GPU at the expected block dtype. SD3.5 folds to the
-            // sc-7702-safe dequant-dense arm, so the weight is a `QuantWeight::Dequant(QTensor)`.
-            match &model.blocks[0].attn.to_q {
-                crate::quant::QLinear::Quantized {
+            // sc-7702-safe dequant-dense arm, so the packed base's inner `QLinear` is a
+            // `QuantWeight::Dequant(QTensor)` (reached via `AdaptLinear::base_qlinear`, sc-11105).
+            match model.blocks[0].attn.to_q.base_qlinear() {
+                Some(candle_gen::quant::QLinear::Quantized {
                     weight: candle_gen::quant::QuantWeight::Dequant(qt),
                     ..
-                } => {
+                }) => {
                     assert!(qt.device().is_cuda(), "quantized leaf not on CUDA");
                     let expected = match quant {
                         Quant::Q4 => GgmlDType::Q4_0,
@@ -1543,11 +1710,8 @@ mod tests {
         let mut model = Sd3Transformer::new(&cfg, vb).unwrap();
         model.quantize(Quant::Q4).unwrap();
         model.quantize(Quant::Q4).unwrap(); // no-op, must not panic
-                                            // The image q-projection of block 0 is now quantized.
-        assert!(matches!(
-            model.blocks[0].attn.to_q,
-            crate::quant::QLinear::Quantized { .. }
-        ));
+                                            // The image q-projection of block 0 is now packed.
+        assert!(model.blocks[0].attn.to_q.is_packed());
         let v = model.forward(&latent, &context, &pooled, &t).unwrap();
         for x in v.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
             assert!(x.is_finite());
