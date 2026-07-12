@@ -54,7 +54,7 @@ pub use control::Krea2ControlBranch;
 pub use loader::{load_text_encoder, load_transformer};
 pub use model::{descriptor, load, load_raw, raw_descriptor, Krea, KREA_2_RAW_ID, KREA_2_TURBO_ID};
 pub use model_control::{KreaTurboControl, KREA_2_TURBO_CONTROL_ID};
-pub use pipeline::{KreaPipeline, TurboOptions};
+pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
 pub use training::{load_trainer, KreaRawTrainer, KREA_2_RAW_TRAINER_ID};

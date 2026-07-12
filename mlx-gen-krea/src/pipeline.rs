@@ -14,6 +14,14 @@
 //! byte-exact default; a per-generation curated sampler/scheduler (epic 7114) reshapes over the same
 //! mu. The `clamp(-1,1)` + denormalize the reference applies after decode lives in `decoded_to_image`
 //! (`clip(x·0.5 + 0.5, 0, 1)`, the algebraic equal).
+//!
+//! **Component residency (epic 10834 Phase 1, sc-11101).** The pipeline is split into a [`KreaText`]
+//! phase (tokenizer + Qwen3-VL-4B condition encoder + vision tower) and a [`KreaHeavy`] phase
+//! (single-stream DiT + Qwen-Image VAE). Each render body takes a *pre-encoded* DiT context Array, so
+//! the `Sequential` residency in [`crate::model`] / [`crate::model_control`] can encode → drop the
+//! text phase → load the heavy phase → render, bounding peak unified memory to `max(text, DiT+VAE)`
+//! instead of the sum. [`KreaPipeline`] stays a thin composition (`text` + `heavy`) whose delegators
+//! preserve the byte-exact monolithic behaviour for the trainer-adjacent tests + the `Resident` path.
 
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -52,39 +60,80 @@ pub struct TurboOptions {
     pub scheduler: Option<String>,
 }
 
-/// The assembled Krea 2 Turbo pipeline: tokenizer + Qwen3-VL-4B condition encoder + single-stream DiT
-/// + Qwen-Image VAE.
-pub struct KreaPipeline {
+/// The **text-encode phase** of a Krea 2 pipeline (epic 10834 Phase 1, sc-11101): tokenizer +
+/// Qwen3-VL-4B condition encoder + the Qwen3-VL vision tower (image-grounded edit encoding). This is
+/// the component dropped first under `Sequential` residency — it produces the DiT text context
+/// Array(s) and holds no DiT/VAE, so once the contexts are materialized (`eval`) it can be freed
+/// before the heavy phase loads. The `Resident` path holds it warm for the whole job.
+pub struct KreaText {
     tok: KreaTokenizer,
     te: KreaTextEncoder,
-    dit: Krea2Transformer,
-    vae: QwenVae,
     /// Qwen3-VL vision tower for image-grounded (edit) encoding (epic 10871 P2). NB loaded eagerly by
     /// [`Self::from_snapshot`] for the P2.3 validation; production should load it lazily / edit-only so
     /// text-to-image doesn't pay the ~0.6 GB (tracked for P3).
     vision: VisionTower,
 }
 
-impl KreaPipeline {
-    /// Load all Turbo components from a Krea 2 snapshot (`tokenizer/ text_encoder/ transformer/ vae/`).
+impl KreaText {
+    /// Load the tokenizer + Qwen3-VL-4B condition encoder + vision tower from a Krea 2 snapshot's
+    /// `tokenizer/` + `text_encoder/` dirs.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         Ok(Self {
             tok: KreaTokenizer::from_snapshot(root)?,
             te: load_text_encoder(root)?,
-            dit: load_transformer(root)?,
-            vae: load_vae(root)?,
             vision: load_vision_tower(root)?,
         })
     }
 
-    /// Quantize the DiT + text-encoder Linears in place (group-wise affine Q4/Q8); the VAE stays dense
-    /// (the published `vae/` is f32), matching the converter's quant-target set. A no-op on an
-    /// already-packed snapshot (`AdaptableLinear::quantize` skips quantized bases).
+    /// Quantize the text-encoder Linears in place (group-wise affine Q4/Q8). The DiT is quantized on the
+    /// heavy side ([`KreaHeavy::quantize`]); the VAE + vision tower stay dense (matching the converter's
+    /// quant-target set — the monolithic `KreaPipeline::quantize` did `te` + `dit`, not the VAE/vision).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.te.quantize(bits)?;
-        self.dit.quantize(bits)?;
-        Ok(())
+        self.te.quantize(bits)
+    }
+
+    /// Encode a plain text prompt → the DiT text context `[1, n_tok, 12, 2560]` (the 12 selected
+    /// Qwen3-VL hidden layers, stacked + prefix-dropped). Used by the Turbo/Raw/control/img2img paths.
+    /// Deterministic (no RNG), so encoding once and reusing across a `count` loop is byte-identical to a
+    /// per-image re-encode.
+    pub fn encode(&self, prompt: &str) -> Result<Array> {
+        let (ids, attn) = self.tok.encode_prompt(prompt)?;
+        self.te.forward(&ids, &attn)
+    }
+
+    /// Image-grounded edit context (epic 10871 P2.3): the `source` image feeds the Qwen3-VL vision
+    /// tower alongside the instruction text, replacing the text-only encode for the Kontext edit path.
+    pub fn encode_grounded(&self, source: &Image, prompt: &str) -> Result<Array> {
+        encode_grounded(&self.vision, &self.tok, &self.te, source, prompt)
+    }
+}
+
+/// The **heavy render phase** of a Krea 2 pipeline (epic 10834 Phase 1, sc-11101): the single-stream
+/// DiT + the Qwen-Image VAE — everything but the text encoder. Each `render_*` body takes a pre-encoded
+/// context Array (from [`KreaText`]), so both the `Resident` and `Sequential` residencies drive the
+/// exact same render code. Owned by the `Resident` components or loaded per-generate by `Sequential`.
+pub struct KreaHeavy {
+    dit: Krea2Transformer,
+    vae: QwenVae,
+}
+
+impl KreaHeavy {
+    /// Load the single-stream DiT + Qwen-Image VAE from a Krea 2 snapshot's `transformer/` + `vae/`
+    /// dirs.
+    pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        Ok(Self {
+            dit: load_transformer(root)?,
+            vae: load_vae(root)?,
+        })
+    }
+
+    /// Quantize the DiT Linears in place (group-wise affine Q4/Q8); the VAE stays dense (the published
+    /// `vae/` is f32), matching the converter's quant-target set. A no-op on an already-packed snapshot
+    /// (`AdaptableLinear::quantize` skips quantized bases).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.dit.quantize(bits)
     }
 
     /// Install Raw-trained LoRA/LoKr adapters onto the single-stream DiT (sc-7911). The shared
@@ -99,37 +148,12 @@ impl KreaPipeline {
         Ok(())
     }
 
-    /// Generate one RGB image from a text prompt. Convenience wrapper over
-    /// [`Self::generate_turbo_with_progress`] with no cancellation, a no-op progress sink, and the
-    /// native VAE decode (no PiD).
-    pub fn generate_turbo(&self, prompt: &str, opts: &TurboOptions) -> Result<Image> {
-        // `keep = usize::MAX` → the full schedule (clean σ=0 decode; no from_ldm early-stop).
-        self.generate_turbo_with_progress(
-            prompt,
-            opts,
-            None,
-            usize::MAX,
-            &CancelFlag::new(),
-            &mut |_| {},
-        )
-    }
-
-    /// Generate one RGB image, streaming [`Progress`] and honoring `cancel` at each denoise step. A
-    /// pre/mid-flight cancellation returns [`mlx_gen::Error::Canceled`]; the per-step `eval` (inside
-    /// [`run_flow_sampler`]) bounds the lazy MLX graph so the cancel check can interrupt mid-render.
-    /// `decoder` (epic 7840, sc-7845): the latent→pixel decode seam — `None` uses the native
-    /// [`QwenVae`] (the byte-exact default), `Some` routes through a PiD super-resolving decoder
-    /// (built per-generation from the prompt by the caller). The caller owns the PiD decoder so it can
-    /// be reused across a batch (same prompt → same caption); PiD output is 4× the native resolution.
-    ///
-    /// `keep` (epic 7840, sc-7993) is the PiD `from_ldm` early-stop truncation: run only the first
-    /// `keep` schedule entries so the denoise exits at a partially-denoised `x_k`, then hand that latent
-    /// to the PiD `decoder` bound to the matching degrade σ. `usize::MAX` (the clean default) runs the
-    /// full schedule (σ=0). The caller resolves `keep` + σ together from [`turbo_schedule`] via
-    /// `mlx_gen_pid::flow_capture_for_request`, so the truncation and the decoder's σ always agree.
-    pub fn generate_turbo_with_progress(
+    /// **Turbo t2i render** — the denoise/decode body of [`KreaPipeline::generate_turbo_with_progress`]
+    /// with the text encode hoisted out (`context`, pre-encoded by [`KreaText::encode`]). CFG-free, B=1
+    /// → mask = None. `keep` (from_ldm early-stop) truncates the schedule; `usize::MAX` runs it all.
+    pub fn render_turbo(
         &self,
-        prompt: &str,
+        context: &Array,
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
         keep: usize,
@@ -137,11 +161,6 @@ impl KreaPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo")?;
-
-        // Condition encoding: the 12 selected Qwen3-VL hidden layers, stacked + prefix-dropped → the
-        // DiT's text_fusion context [1, n_tok, 12, 2560]. CFG-free, B=1 → mask = None.
-        let (ids, attn) = self.tok.encode_prompt(prompt)?;
-        let context = self.te.forward(&ids, &attn)?;
 
         // Initial latent noise [1, 16, H/8, W/8] (f32; the DiT casts to its compute dtype).
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
@@ -154,7 +173,7 @@ impl KreaPipeline {
         // Hoist the step-invariant text fusion + joint RoPE out of the per-step closure (F-079): the
         // context (and the latent geometry) are fixed across the denoise, so `prepare` runs ONCE and
         // every step reuses `prep` via `forward_prepared` (bit-identical to the per-step `forward`).
-        let prep = self.dit.prepare(&context, None, &noise)?;
+        let prep = self.dit.prepare(context, None, &noise)?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -174,22 +193,17 @@ impl KreaPipeline {
         self.decode_latents(&lat, decoder)
     }
 
-    /// **Pose-ControlNet on Turbo** (sc-8465, epic 8459 S5) — the control-generate twin of
-    /// [`Self::generate_turbo_with_progress`]. Generate one pose-locked RGB image: the VAE-encoded pose
-    /// skeleton is embedded once through the frozen base `img_in` and injected as a `control_scale`-scaled,
-    /// RMS-clamped residual on every CFG-free Turbo step via the [`Krea2ControlBranch`]
-    /// ([`crate::control::Krea2ControlBranch::forward`]). Same tokenize → Qwen3-VL condition-encode →
-    /// 8-step rectified-flow Euler → VAE decode as the plain Turbo path, plus the branch forward per step.
-    ///
-    /// `control_scale == 0` is a bit-exact base passthrough (the branch is never run). The PiD decode /
-    /// `from_ldm` early-stop and img2img seams are intentionally NOT wired on the control lane (pose
-    /// control renders text→image from a skeleton; the native VAE decodes the clean final latent) —
-    /// matching the candle `Krea2Control` provider (sc-8464). Cancellation + progress stream through
-    /// [`run_flow_sampler`].
+    /// **Pose-ControlNet Turbo render** (sc-8465, epic 8459 S5) — the denoise/decode body of
+    /// [`KreaPipeline::generate_turbo_control_with_progress`] with the text encode hoisted out. The
+    /// VAE-encoded pose skeleton is embedded once through the frozen base `img_in` and injected as a
+    /// `control_scale`-scaled, RMS-clamped residual on every CFG-free Turbo step via the
+    /// [`Krea2ControlBranch`]. `control_scale == 0` is a bit-exact base passthrough (the branch is never
+    /// run). The PiD decode / `from_ldm` early-stop and img2img seams are intentionally NOT wired on the
+    /// control lane (matching the candle `Krea2Control` provider, sc-8464).
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_turbo_control_with_progress(
+    pub fn render_turbo_control(
         &self,
-        prompt: &str,
+        context: &Array,
         branch: &Krea2ControlBranch,
         control_image: &Image,
         control_scale: f32,
@@ -198,10 +212,6 @@ impl KreaPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo_control")?;
-
-        // Condition encoding (CFG-free, B=1 → mask = None), exactly as the plain Turbo path.
-        let (ids, attn) = self.tok.encode_prompt(prompt)?;
-        let context = self.te.forward(&ids, &attn)?;
 
         // Pose skeleton → control latent [1, 16, H/8, W/8] (`QwenVae::encode` returns the normalized
         // `(e − mean)/std` latent, the same space as `init_noise`; drop the singleton temporal axis).
@@ -213,7 +223,7 @@ impl KreaPipeline {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         let sigmas = turbo_schedule(opts.steps, opts.scheduler.as_deref());
         // Hoist the step-invariant text fusion + joint RoPE (F-079), as the plain Turbo path.
-        let prep = self.dit.prepare(&context, None, &noise)?;
+        let prep = self.dit.prepare(context, None, &noise)?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -233,51 +243,15 @@ impl KreaPipeline {
         self.decode_latents(&lat, None)
     }
 
-    /// Generate one RGB image seeded from a reference `init` image at the given `strength` (img2img,
-    /// slice A / sc-8590). Convenience wrapper over [`Self::generate_turbo_img2img_with_progress`] with
-    /// no cancellation, a no-op progress sink, and the native VAE decode (no PiD).
-    pub fn generate_turbo_img2img(
-        &self,
-        prompt: &str,
-        init: &Image,
-        strength: f32,
-        opts: &TurboOptions,
-    ) -> Result<Image> {
-        self.generate_turbo_img2img_with_progress(
-            prompt,
-            init,
-            strength,
-            opts,
-            None,
-            &CancelFlag::new(),
-            &mut |_| {},
-        )
-    }
-
-    /// **img2img latent-init on Turbo** (epic 8588 slice A; sc-8589 validated the strength window,
-    /// sc-8590 productionized this). Generate one RGB image seeded from a reference `init` at the given
-    /// `strength` — reference fidelity in the fork's [`init_time_step`] convention: higher strength →
-    /// later start step → fewer denoise steps → the output stays closer to the reference; `strength ≤ 0`
-    /// degenerates to a full txt2img (start step 0, identical to [`Self::generate_turbo_with_progress`]).
-    ///
-    /// Reuses the proven shared [`mlx_gen::img2img`] leaves (the Qwen-Image / Z-Image img2img path) with
-    /// Krea's **unpacked** `[1, 16, H/8, W/8]` latent (the DiT patchifies internally, so — unlike Qwen —
-    /// the clean latent is NOT pre-packed): VAE-encode the reference into the same normalized latent
-    /// space as [`init_noise`] (`QwenVae::encode` returns `(e − mean)/std`), blend
+    /// **img2img latent-init Turbo render** (epic 8588 slice A; sc-8589/sc-8590) — the denoise/decode
+    /// body of [`KreaPipeline::generate_turbo_img2img_with_progress`] with the text encode hoisted out.
+    /// VAE-encode the reference into the same normalized latent space as [`init_noise`], blend
     /// `(1 − σ_k)·clean + σ_k·noise` at the start sigma `σ_k = sigmas[k]`, and run the rectified-flow
-    /// Euler sampler over `sigmas[k..]`. Distilled Turbo is CFG-free → one DiT forward per step (no
-    /// guidance branch), and the step-invariant text-fusion + joint RoPE are prepared ONCE (the F-079
-    /// hoist), exactly like [`Self::generate_turbo_with_progress`].
-    ///
-    /// `decoder` is the same latent→pixel seam as the t2i path (`None` = native [`QwenVae`], `Some` = a
-    /// PiD super-resolving decoder over the final clean latent). The PiD `from_ldm` early-stop (`keep`)
-    /// is intentionally NOT plumbed here: combining a partial-denoise capture with the img2img start
-    /// step needs the caller to resolve the capture against the *sliced* schedule — tracked separately
-    /// so it is not silently dropped. Cancellation + progress stream through [`run_flow_sampler`].
+    /// Euler sampler over `sigmas[k..]`. Distilled Turbo is CFG-free → one DiT forward per step.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_turbo_img2img_with_progress(
+    pub fn render_turbo_img2img(
         &self,
-        prompt: &str,
+        context: &Array,
         init: &Image,
         strength: f32,
         opts: &TurboOptions,
@@ -286,9 +260,6 @@ impl KreaPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo")?;
-
-        let (ids, attn) = self.tok.encode_prompt(prompt)?;
-        let context = self.te.forward(&ids, &attn)?;
 
         // Reference → clean latent [1, 16, H/8, W/8]. `QwenVae::encode` already returns the normalized
         // `(e − mean)/std` latent (the same space as `init_noise`); drop the singleton temporal axis.
@@ -303,7 +274,7 @@ impl KreaPipeline {
         let sigmas = &full[start..];
         let x_start = add_noise_by_interpolation(&clean, &noise, full[start])?;
 
-        let prep = self.dit.prepare(&context, None, &x_start)?;
+        let prep = self.dit.prepare(context, None, &x_start)?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -323,48 +294,17 @@ impl KreaPipeline {
         self.decode_latents(&lat, decoder)
     }
 
-    /// Generate one RGB image through the **Raw** classifier-free-guidance path with no cancellation, a
-    /// no-op progress sink, and the native VAE decode (no PiD). Convenience wrapper over
-    /// [`Self::generate_base_with_progress`].
-    pub fn generate_base(
-        &self,
-        prompt: &str,
-        negative_prompt: &str,
-        guidance: f32,
-        opts: &TurboOptions,
-    ) -> Result<Image> {
-        self.generate_base_with_progress(
-            prompt,
-            negative_prompt,
-            guidance,
-            opts,
-            None,
-            usize::MAX,
-            &CancelFlag::new(),
-            &mut |_| {},
-        )
-    }
-
-    /// Generate one RGB image through the **Raw** classifier-free-guidance path (`krea_2_raw`): the
-    /// undistilled 12B DiT with a real guidance scale + optional user negative prompt (reference
-    /// `sampling.py::sample` with `guidance > 0`). Two DiT forwards per step — the conditional (positive
-    /// prompt) and the unconditional (the negative prompt, or `""` when none) — combined by the
-    /// **reference** formula `v = cond + guidance·(cond − uncond)` (NOT the standard
-    /// `uncond + g·(cond − uncond)`: Krea's guidance is offset by one). `guidance ≤ 0` collapses to a
-    /// single conditional forward (the uncond context is never encoded), matching the reference
-    /// `cfg = guidance > 0` short-circuit.
-    ///
-    /// The Raw schedule is resolution-**dynamic** ([`base_schedule`] / [`dynamic_mu`]), unlike the
-    /// distilled Turbo's fixed `mu = 1.15`. `decoder` / `keep` are the same PiD decode + `from_ldm`
-    /// early-stop seam as [`Self::generate_turbo_with_progress`] (Krea reuses the Qwen-Image latent
-    /// space); the caller resolves them from [`base_schedule`] so the truncation and the decoder's σ
-    /// agree. Both the positive and unconditional contexts are prepared ONCE (the F-079 hoist), so each
-    /// step reuses the two `JointPrep`s.
+    /// **Raw true-CFG t2i render** (`krea_2_raw`) — the denoise/decode body of
+    /// [`KreaPipeline::generate_base_with_progress`] with the text encodes hoisted out. `ctx_pos` is the
+    /// conditional context; `ctx_neg` (`Some` only when `guidance > 0`) the unconditional one. Two DiT
+    /// forwards/step combined by the reference `v = cond + guidance·(cond − uncond)`
+    /// ([`krea_cfg_combine`]); `ctx_neg == None` collapses to a single conditional forward. Both preps
+    /// are hoisted ONCE (the F-079 hoist) against the shared noise.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_base_with_progress(
+    pub fn render_base(
         &self,
-        prompt: &str,
-        negative_prompt: &str,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
         guidance: f32,
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
@@ -374,23 +314,15 @@ impl KreaPipeline {
     ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
 
-        // Positive (conditional) condition encoding → step-invariant prep (the Turbo F-079 hoist).
-        let (ids, attn) = self.tok.encode_prompt(prompt)?;
-        let context = self.te.forward(&ids, &attn)?;
-
         // Initial latent noise [1, 16, H/8, W/8] — shared by both prep branches (same geometry).
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
-        let prep_pos = self.dit.prepare(&context, None, &noise)?;
+        let prep_pos = self.dit.prepare(ctx_pos, None, &noise)?;
 
-        // Unconditional branch, encoded + prepared ONLY when CFG is active (reference
-        // `cfg = guidance > 0`). The negative prompt defaults to `""` at the caller (reference
-        // `negative_prompts = [""] * n`).
-        let prep_neg = if guidance > 0.0 {
-            let (nids, nattn) = self.tok.encode_prompt(negative_prompt)?;
-            let ncontext = self.te.forward(&nids, &nattn)?;
-            Some(self.dit.prepare(&ncontext, None, &noise)?)
-        } else {
-            None
+        // Unconditional branch prepared ONLY when CFG is active (the caller passes `Some` iff
+        // `guidance > 0` — reference `cfg = guidance > 0`; the negative prompt defaulted to `""`).
+        let prep_neg = match ctx_neg {
+            Some(nc) => Some(self.dit.prepare(nc, None, &noise)?),
+            None => None,
         };
 
         // Resolution-dynamic Raw schedule (mu from image-token count), truncated to `keep` for a PiD
@@ -428,54 +360,16 @@ impl KreaPipeline {
         self.decode_latents(&lat, decoder)
     }
 
-    /// Generate one RGB image seeded from a reference `init` at `strength` through the **Raw**
-    /// true-CFG path, with no cancellation, a no-op progress sink, and the native VAE decode (no PiD).
-    /// Convenience wrapper over [`Self::generate_base_img2img_with_progress`] (mirrors
-    /// [`Self::generate_turbo_img2img`] / [`Self::generate_base`]).
+    /// **img2img latent-init Raw true-CFG render** (`krea_2_raw`, epic 8588 slice A / sc-10224) — the
+    /// denoise/decode body of [`KreaPipeline::generate_base_img2img_with_progress`] with the text
+    /// encodes hoisted out. Seed the denoise from a VAE-encoded `init` reference (strength-derived start
+    /// step + noise-blend) instead of pure noise, then run the full-CFG Raw sampler over the tail of the
+    /// resolution-dynamic [`base_schedule`]. Both preps are hoisted ONCE against the blended `x_start`.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_base_img2img(
+    pub fn render_base_img2img(
         &self,
-        prompt: &str,
-        negative_prompt: &str,
-        guidance: f32,
-        init: &Image,
-        strength: f32,
-        opts: &TurboOptions,
-    ) -> Result<Image> {
-        self.generate_base_img2img_with_progress(
-            prompt,
-            negative_prompt,
-            guidance,
-            init,
-            strength,
-            opts,
-            None,
-            &CancelFlag::new(),
-            &mut |_| {},
-        )
-    }
-
-    /// **img2img latent-init on the Raw (true-CFG) path** (`krea_2_raw`, epic 8588 slice A / sc-10224).
-    /// The CFG counterpart of [`Self::generate_turbo_img2img_with_progress`]: seed the denoise from a
-    /// VAE-encoded `init` reference instead of pure noise, then run the full-CFG Raw sampler (two DiT
-    /// forwards/step combined by [`krea_cfg_combine`]) over the tail of the resolution-dynamic
-    /// [`base_schedule`]. Merges the Turbo-img2img front matter (VAE-encode → strength-derived start step
-    /// → noise-blend) with the Raw CFG loop from [`Self::generate_base_with_progress`] — so unlike Turbo
-    /// img2img (CFG-free), this honors `guidance` + the `negative_prompt`, which is the whole point of
-    /// Raw.
-    ///
-    /// `strength` follows the fork's [`init_time_step`] convention (higher → later start step → fewer
-    /// denoise steps → closer to the reference; `strength ≤ 0` degenerates to full txt2img). Both the
-    /// positive and (CFG-active) unconditional contexts are prepared ONCE against the blended `x_start`
-    /// (the F-079 hoist). The PiD `from_ldm` early-stop (`keep`) is intentionally NOT plumbed here — same
-    /// as Turbo img2img: combining a partial-denoise capture with the img2img start step needs the caller
-    /// to resolve the capture against the *sliced* schedule (tracked in sc-10121); the model layer rejects
-    /// that combo. `decoder` is the same latent→pixel seam (native [`QwenVae`] or a PiD decoder).
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_base_img2img_with_progress(
-        &self,
-        prompt: &str,
-        negative_prompt: &str,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
         guidance: f32,
         init: &Image,
         strength: f32,
@@ -505,17 +399,11 @@ impl KreaPipeline {
         let sigmas = &full[start..];
         let x_start = add_noise_by_interpolation(&clean, &noise, full[start])?;
 
-        // Positive + (CFG-active) unconditional preps, hoisted once against the blended start latent
-        // (mirrors `generate_base_with_progress`; the negative prompt defaults to `""` at the caller).
-        let (ids, attn) = self.tok.encode_prompt(prompt)?;
-        let context = self.te.forward(&ids, &attn)?;
-        let prep_pos = self.dit.prepare(&context, None, &x_start)?;
-        let prep_neg = if guidance > 0.0 {
-            let (nids, nattn) = self.tok.encode_prompt(negative_prompt)?;
-            let ncontext = self.te.forward(&nids, &nattn)?;
-            Some(self.dit.prepare(&ncontext, None, &x_start)?)
-        } else {
-            None
+        // Positive + (CFG-active) unconditional preps, hoisted once against the blended start latent.
+        let prep_pos = self.dit.prepare(ctx_pos, None, &x_start)?;
+        let prep_neg = match ctx_neg {
+            Some(nc) => Some(self.dit.prepare(nc, None, &x_start)?),
+            None => None,
         };
 
         let lat = run_flow_sampler(
@@ -544,55 +432,16 @@ impl KreaPipeline {
         self.decode_latents(&lat, decoder)
     }
 
-    /// Generate one edited RGB image from a source image + an instruction, with no cancellation, a
-    /// no-op progress sink, and the native VAE decode. Convenience wrapper over
-    /// [`Self::generate_edit_with_progress`] for a single reference (mirrors [`Self::generate_base`]).
-    pub fn generate_edit(
-        &self,
-        prompt: &str,
-        negative_prompt: &str,
-        guidance: f32,
-        source: &Image,
-        opts: &TurboOptions,
-    ) -> Result<Image> {
-        self.generate_edit_with_progress(
-            prompt,
-            negative_prompt,
-            guidance,
-            &[source],
-            opts,
-            None,
-            &CancelFlag::new(),
-            &mut |_| {},
-        )
-    }
-
-    /// **Kontext-style image edit** on the Krea 2 Raw (true-CFG) path (epic 10871, sc-10876). Unlike
-    /// img2img — which VAE-encodes the reference into the *init latent* and denoises from a noised copy
-    /// of it — an edit keeps the source as **in-context conditioning**: it denoises from PURE NOISE while
-    /// the VAE-encoded source token(s) ride alongside the noise in the transformer sequence at a distinct
-    /// RoPE frame (see [`Krea2Transformer::prepare_edit`] / [`Krea2Transformer::forward_prepared_edit`]).
-    /// This matches the training contract of the Krea 2 edit LoRA (the reference ComfyUI-Krea2Edit node's
-    /// `[context, src_imgs…, target]` sequence with reference frames `1..N` and target frame `0`).
-    ///
-    /// `sources` are the reference image(s) in the fixed order (scene, then subject) — each is
-    /// VAE-encoded at the TARGET resolution (`opts.width`×`opts.height`) so it shares the target latent
-    /// grid. Runs the full-CFG Raw sampler (two edit forwards/step combined by [`krea_cfg_combine`] when
-    /// `guidance > 0`, else one) over the whole resolution-dynamic [`base_schedule`] from noise — the
-    /// edit behaviour comes from the LoRA + the in-context tokens, not from a strength-truncated
-    /// schedule. Both the positive and (CFG-active) unconditional edit preps — text stream, clean
-    /// reference tokens, and joint RoPE — are hoisted ONCE (the F-079 hoist). `decoder` is the same
-    /// latent→pixel seam as the other paths (native [`QwenVae`] or a PiD decoder).
-    ///
-    /// NB the **dual-conditioning** the LoRA was trained with also feeds the source image into the
-    /// Qwen3-VL text encoder (image-grounded encoding); that half is epic 10871 P2 — this P1 entrypoint
-    /// wires the in-context VAE-token half, so a LoRA run here is the (off-distribution) VAE-only
-    /// milestone until the grounding lands.
+    /// **Kontext-style edit render** on the Krea 2 Raw (true-CFG) path (epic 10871, sc-10876) — the
+    /// denoise/decode body of [`KreaPipeline::generate_edit_with_progress`] with the grounded text
+    /// encodes hoisted out. `ctx_pos` / `ctx_neg` are the *grounded* contexts (source image + text)
+    /// from [`KreaText::encode_grounded`]; `sources` are the reference image(s) VAE-encoded here at the
+    /// TARGET resolution as in-context tokens (`prepare_edit`). Denoises from PURE NOISE under full CFG.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_edit_with_progress(
+    pub fn render_edit(
         &self,
-        prompt: &str,
-        negative_prompt: &str,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
         guidance: f32,
         sources: &[&Image],
         opts: &TurboOptions,
@@ -620,29 +469,12 @@ impl KreaPipeline {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
 
         // DUAL CONDITIONING (epic 10871 P2.3): the source image feeds BOTH the in-context VAE tokens
-        // (`ref_latents`, above) AND the Qwen3-VL grounded context — the edit LoRA's training contract.
-        // The grounded context replaces the text-only encode; the source image sits in both CFG branches
-        // (only the instruction text differs), matching the reference edit CFG. Single-reference
-        // grounding for now (multi-reference grounding is a follow-on; the VAE-token side already takes
-        // N sources). Each prep carries the clean reference tokens + the reference-frame RoPE.
-        let context = encode_grounded(&self.vision, &self.tok, &self.te, sources[0], prompt)?;
-        let prep_pos = self
-            .dit
-            .prepare_edit(&context, None, &noise, &ref_latents)?;
-        let prep_neg = if guidance > 0.0 {
-            let ncontext = encode_grounded(
-                &self.vision,
-                &self.tok,
-                &self.te,
-                sources[0],
-                negative_prompt,
-            )?;
-            Some(
-                self.dit
-                    .prepare_edit(&ncontext, None, &noise, &ref_latents)?,
-            )
-        } else {
-            None
+        // (`ref_latents`, above) AND the Qwen3-VL grounded context (`ctx_pos`/`ctx_neg`, hoisted by the
+        // caller). Each prep carries the clean reference tokens + the reference-frame RoPE.
+        let prep_pos = self.dit.prepare_edit(ctx_pos, None, &noise, &ref_latents)?;
+        let prep_neg = match ctx_neg {
+            Some(nc) => Some(self.dit.prepare_edit(nc, None, &noise, &ref_latents)?),
+            None => None,
         };
 
         // Full resolution-dynamic Raw schedule (the edit runs the whole schedule from noise, like t2i).
@@ -689,11 +521,327 @@ impl KreaPipeline {
     }
 }
 
+/// The assembled Krea 2 Turbo pipeline: the [`KreaText`] encode phase + the [`KreaHeavy`] render phase.
+/// A thin composition (epic 10834 Phase 1, sc-11101) — the delegators below reproduce the byte-exact
+/// monolithic behaviour (encode + render inline) for the `Resident` path and the weight-gated tests,
+/// while [`crate::model`] / [`crate::model_control`] drive the two phases directly for `Sequential`.
+pub struct KreaPipeline {
+    text: KreaText,
+    heavy: KreaHeavy,
+}
+
+impl KreaPipeline {
+    /// Load all Turbo components from a Krea 2 snapshot (`tokenizer/ text_encoder/ transformer/ vae/`).
+    pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        Ok(Self {
+            text: KreaText::from_snapshot(root)?,
+            heavy: KreaHeavy::from_snapshot(root)?,
+        })
+    }
+
+    /// Quantize the DiT + text-encoder Linears in place (group-wise affine Q4/Q8); the VAE stays dense
+    /// (the published `vae/` is f32), matching the converter's quant-target set. A no-op on an
+    /// already-packed snapshot (`AdaptableLinear::quantize` skips quantized bases).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.text.quantize(bits)?;
+        self.heavy.quantize(bits)?;
+        Ok(())
+    }
+
+    /// Install Raw-trained LoRA/LoKr adapters onto the single-stream DiT (sc-7911). See
+    /// [`KreaHeavy::apply_adapters`].
+    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
+        self.heavy.apply_adapters(specs)
+    }
+
+    /// Generate one RGB image from a text prompt. Convenience wrapper over
+    /// [`Self::generate_turbo_with_progress`] with no cancellation, a no-op progress sink, and the
+    /// native VAE decode (no PiD).
+    pub fn generate_turbo(&self, prompt: &str, opts: &TurboOptions) -> Result<Image> {
+        // `keep = usize::MAX` → the full schedule (clean σ=0 decode; no from_ldm early-stop).
+        self.generate_turbo_with_progress(
+            prompt,
+            opts,
+            None,
+            usize::MAX,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// Generate one RGB image, streaming [`Progress`] and honoring `cancel` at each denoise step. A
+    /// pre/mid-flight cancellation returns [`mlx_gen::Error::Canceled`]; the per-step `eval` (inside
+    /// [`run_flow_sampler`]) bounds the lazy MLX graph so the cancel check can interrupt mid-render.
+    /// `decoder` (epic 7840, sc-7845): the latent→pixel decode seam — `None` uses the native
+    /// [`QwenVae`] (the byte-exact default), `Some` routes through a PiD super-resolving decoder
+    /// (built per-generation from the prompt by the caller). `keep` (epic 7840, sc-7993) is the PiD
+    /// `from_ldm` early-stop truncation (`usize::MAX` runs the full schedule).
+    pub fn generate_turbo_with_progress(
+        &self,
+        prompt: &str,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let context = self.text.encode(prompt)?;
+        self.heavy
+            .render_turbo(&context, opts, decoder, keep, cancel, on_progress)
+    }
+
+    /// **Pose-ControlNet on Turbo** (sc-8465, epic 8459 S5). See [`KreaHeavy::render_turbo_control`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_turbo_control_with_progress(
+        &self,
+        prompt: &str,
+        branch: &Krea2ControlBranch,
+        control_image: &Image,
+        control_scale: f32,
+        opts: &TurboOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let context = self.text.encode(prompt)?;
+        self.heavy.render_turbo_control(
+            &context,
+            branch,
+            control_image,
+            control_scale,
+            opts,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Generate one RGB image seeded from a reference `init` image at the given `strength` (img2img,
+    /// slice A / sc-8590). Convenience wrapper over [`Self::generate_turbo_img2img_with_progress`].
+    pub fn generate_turbo_img2img(
+        &self,
+        prompt: &str,
+        init: &Image,
+        strength: f32,
+        opts: &TurboOptions,
+    ) -> Result<Image> {
+        self.generate_turbo_img2img_with_progress(
+            prompt,
+            init,
+            strength,
+            opts,
+            None,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// **img2img latent-init on Turbo** (epic 8588 slice A). See [`KreaHeavy::render_turbo_img2img`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_turbo_img2img_with_progress(
+        &self,
+        prompt: &str,
+        init: &Image,
+        strength: f32,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let context = self.text.encode(prompt)?;
+        self.heavy.render_turbo_img2img(
+            &context,
+            init,
+            strength,
+            opts,
+            decoder,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Generate one RGB image through the **Raw** classifier-free-guidance path with no cancellation, a
+    /// no-op progress sink, and the native VAE decode (no PiD). Convenience wrapper over
+    /// [`Self::generate_base_with_progress`].
+    pub fn generate_base(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        opts: &TurboOptions,
+    ) -> Result<Image> {
+        self.generate_base_with_progress(
+            prompt,
+            negative_prompt,
+            guidance,
+            opts,
+            None,
+            usize::MAX,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// Generate one RGB image through the **Raw** classifier-free-guidance path (`krea_2_raw`). See
+    /// [`KreaHeavy::render_base`]. The unconditional context is encoded ONLY when `guidance > 0`
+    /// (reference `cfg = guidance > 0`); the negative prompt defaults to `""` at the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_base_with_progress(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let ctx_pos = self.text.encode(prompt)?;
+        let ctx_neg = if guidance > 0.0 {
+            Some(self.text.encode(negative_prompt)?)
+        } else {
+            None
+        };
+        self.heavy.render_base(
+            &ctx_pos,
+            ctx_neg.as_ref(),
+            guidance,
+            opts,
+            decoder,
+            keep,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Generate one RGB image seeded from a reference `init` at `strength` through the **Raw**
+    /// true-CFG path, with no cancellation, a no-op progress sink, and the native VAE decode (no PiD).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_base_img2img(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        init: &Image,
+        strength: f32,
+        opts: &TurboOptions,
+    ) -> Result<Image> {
+        self.generate_base_img2img_with_progress(
+            prompt,
+            negative_prompt,
+            guidance,
+            init,
+            strength,
+            opts,
+            None,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// **img2img latent-init on the Raw (true-CFG) path** (`krea_2_raw`, epic 8588 slice A / sc-10224).
+    /// See [`KreaHeavy::render_base_img2img`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_base_img2img_with_progress(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        init: &Image,
+        strength: f32,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let ctx_pos = self.text.encode(prompt)?;
+        let ctx_neg = if guidance > 0.0 {
+            Some(self.text.encode(negative_prompt)?)
+        } else {
+            None
+        };
+        self.heavy.render_base_img2img(
+            &ctx_pos,
+            ctx_neg.as_ref(),
+            guidance,
+            init,
+            strength,
+            opts,
+            decoder,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Generate one edited RGB image from a source image + an instruction, with no cancellation, a
+    /// no-op progress sink, and the native VAE decode. Convenience wrapper over
+    /// [`Self::generate_edit_with_progress`] for a single reference.
+    pub fn generate_edit(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        source: &Image,
+        opts: &TurboOptions,
+    ) -> Result<Image> {
+        self.generate_edit_with_progress(
+            prompt,
+            negative_prompt,
+            guidance,
+            &[source],
+            opts,
+            None,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// **Kontext-style image edit** on the Krea 2 Raw (true-CFG) path (epic 10871, sc-10876). See
+    /// [`KreaHeavy::render_edit`]. The grounded context (`encode_grounded` over `sources[0]`) replaces
+    /// the text-only encode; the unconditional grounded context is built ONLY when `guidance > 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_edit_with_progress(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        sources: &[&Image],
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if sources.is_empty() {
+            return Err(mlx_gen::Error::Msg(
+                "krea_2 edit: at least one source image is required".into(),
+            ));
+        }
+        // Single-reference grounding for now (the VAE-token side already takes N sources); the grounded
+        // context sits in both CFG branches (only the instruction text differs).
+        let ctx_pos = self.text.encode_grounded(sources[0], prompt)?;
+        let ctx_neg = if guidance > 0.0 {
+            Some(self.text.encode_grounded(sources[0], negative_prompt)?)
+        } else {
+            None
+        };
+        self.heavy.render_edit(
+            &ctx_pos,
+            ctx_neg.as_ref(),
+            guidance,
+            sources,
+            opts,
+            decoder,
+            cancel,
+            on_progress,
+        )
+    }
+}
+
 /// The Turbo flow-match sigma schedule for `steps` (native exponential-mu by default, or a curated
 /// scheduler over the same mu). Length `steps + 1`, strictly descending with a trailing `0.0`. Exposed
 /// so the caller can resolve a PiD `from_ldm` early-stop capture (sc-7993, via
 /// `mlx_gen_pid::flow_capture_for_request`) before building the decoder — the same schedule
-/// [`KreaPipeline::generate_turbo_with_progress`] then runs (the build is pure host math).
+/// [`KreaHeavy::render_turbo`] then runs (the build is pure host math).
 pub fn turbo_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
     let native = turbo_sigmas(steps);
     resolve_flow_schedule(scheduler, TURBO_MU as f32, steps, &native)
@@ -703,7 +851,7 @@ pub fn turbo_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
 /// with a resolution-**dynamic** `mu` interpolated in image-token count ([`dynamic_mu`]), unlike the
 /// Turbo fixed `mu = 1.15`. Length `steps + 1`, descending with a trailing `0.0`; a curated scheduler
 /// (epic 7114) reshapes over the same dynamic mu. Exposed so the caller can resolve a PiD `from_ldm`
-/// early-stop capture from the same schedule [`KreaPipeline::generate_base_with_progress`] runs.
+/// early-stop capture from the same schedule [`KreaHeavy::render_base`] runs.
 pub fn base_schedule(steps: usize, width: u32, height: u32, scheduler: Option<&str>) -> Vec<f32> {
     // Image token count = (W/16)·(H/16) (latent /8 then patch /2) — the reference `x.shape[1]`.
     let seq_len = (width as f64 / 16.0) * (height as f64 / 16.0);

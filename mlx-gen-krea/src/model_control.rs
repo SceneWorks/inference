@@ -14,15 +14,18 @@
 use mlx_gen::gen_core;
 use mlx_gen::{
     require_base_dir, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
-    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Precision,
-    Progress, Result,
+    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
+    OffloadPolicy, Precision, Progress, Result,
 };
 
 use mlx_gen::default_seed;
 
+use mlx_rs::Array;
+use std::path::Path;
+
 use crate::config::Krea2Config;
 use crate::control::Krea2ControlBranch;
-use crate::pipeline::{KreaPipeline, TurboOptions};
+use crate::pipeline::{KreaHeavy, KreaText, TurboOptions};
 
 /// Registry id for the Krea 2 Turbo pose-ControlNet variant. Matches the SceneWorks worker's
 /// `STRICT_CONTROL_ENGINES` `krea_2_turbo_control` id and the candle lane, so one id serves both
@@ -47,11 +50,58 @@ pub fn descriptor() -> ModelDescriptor {
     d
 }
 
-/// A loaded Krea 2 Turbo pose-control generator: the base Turbo pipeline + the pose control branch.
+/// A loaded Krea 2 Turbo pose-control generator: the cached descriptor + a component-residency strategy
+/// (the base Turbo text phase + DiT/VAE + the pose control branch).
 pub struct KreaTurboControl {
     descriptor: ModelDescriptor,
-    pipeline: KreaPipeline,
+    /// Component-residency strategy (epic 10834 Phase 1, sc-11101), selected from
+    /// [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase + DiT + VAE + branch warm;
+    /// `Sequential` holds only the [`LoadSpec`] and re-loads per generation in phase order (encode →
+    /// **drop the text phase** → denoise/decode), bounding peak unified memory to `max(text, DiT+VAE+
+    /// branch)`. Dense bf16 only, so the tier that matters here is bf16 (no Q8/Q4 lever).
+    residency: ControlResidency,
+}
+
+/// The heavy-component residency for a [`KreaTurboControl`] (sc-11101). See [`KreaTurboControl::residency`].
+enum ControlResidency {
+    /// Every component loaded once at [`load`] and held (today's warm path). Boxed so this heavy variant
+    /// doesn't bloat every `Sequential` handle (`clippy::large_enum_variant`).
+    Resident(Box<ControlResident>),
+    /// Only the [`LoadSpec`] is held; each `generate` re-loads the components in phase order and frees
+    /// them after. The per-phase loaders rebuild byte-identical components to the `Resident` path.
+    Sequential(Box<LoadSpec>),
+}
+
+/// The Krea text phase held resident (dropped first under `Sequential`), paired with the heavy render
+/// bundle (DiT + VAE + the pose control branch).
+struct ControlResident {
+    text: KreaText,
+    heavy: ControlHeavyOwned,
+}
+
+/// The heavy render-phase components for pose control: the single-stream DiT + VAE ([`KreaHeavy`]) plus
+/// the pose [`Krea2ControlBranch`] — which is a SECOND heavy component that stays on the heavy side (it
+/// rides the DiT), mirroring qwen-image-control's `QwenControlHeavyOwned`. Owned by the `Resident`
+/// components or a `Sequential` generate.
+struct ControlHeavyOwned {
+    heavy: KreaHeavy,
     branch: Krea2ControlBranch,
+}
+
+/// A borrow of the pose-control heavy components, so the render loop runs identically whether they are
+/// held resident or were just loaded by the `Sequential` path.
+struct ControlHeavyRef<'a> {
+    heavy: &'a KreaHeavy,
+    branch: &'a Krea2ControlBranch,
+}
+
+impl ControlHeavyOwned {
+    fn as_ref(&self) -> ControlHeavyRef<'_> {
+        ControlHeavyRef {
+            heavy: &self.heavy,
+            branch: &self.branch,
+        }
+    }
 }
 
 /// Construct a [`KreaTurboControl`] from a [`LoadSpec`].
@@ -61,18 +111,22 @@ pub struct KreaTurboControl {
 /// (`control_step5000` — a single `.safetensors` `File`, or a `Dir` of shards). Loaded dense bf16;
 /// Raw-trained LoRA/LoKr in `spec.adapters` install onto the base DiT (the branch is never an adapter
 /// target). A `spec.quantize` override is rejected — the pose overlay is dense-only.
+///
+/// Component residency (epic 10834 Phase 1, sc-11101): `Resident` (default) builds every component now
+/// and holds it warm; `Sequential` keeps only the spec and re-loads per generate in phase order (encode
+/// → drop the text phase → denoise/decode). Both use the same per-phase loaders, so the components are
+/// byte-identical. Validity (base dir, control present, no quant, bf16) is checked up front either way.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    // Fail fast — validate the whole spec up front for BOTH residencies (mirrors the pre-sc-11101 load
+    // order): dense bf16, a base snapshot dir, the required control overlay, and no quant override.
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{KREA_2_TURBO_CONTROL_ID}: only the default dense bf16 precision is wired (drop the \
              precision override)"
         )));
     }
-    // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control overlay is
-    // required (a job without one fails loudly — never a silent un-conditioned base, the candle rule).
     let root = require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
-    let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
-
+    let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     if spec.quantize.is_some() {
         return Err(Error::Msg(format!(
             "{KREA_2_TURBO_CONTROL_ID}: the pose control overlay is trained on the dense bf16 base; \
@@ -80,19 +134,35 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
 
-    // Base Turbo pipeline (dense bf16) + optional Raw-trained LoRA on the base DiT, then the pose branch.
-    let mut pipeline = KreaPipeline::from_snapshot(root)?;
-    if !spec.adapters.is_empty() {
-        pipeline.apply_adapters(&spec.adapters)?;
-    }
-    let cfg = Krea2Config::from_snapshot(root)?;
-    let branch = Krea2ControlBranch::from_source(control, &cfg)?;
+    let residency = match spec.offload_policy {
+        OffloadPolicy::Resident => {
+            let text = KreaText::from_snapshot(root)?;
+            let heavy = load_control_heavy(spec, root)?;
+            ControlResidency::Resident(Box::new(ControlResident { text, heavy }))
+        }
+        OffloadPolicy::Sequential => ControlResidency::Sequential(Box::new(spec.clone())),
+    };
 
     Ok(Box::new(KreaTurboControl {
         descriptor: descriptor(),
-        pipeline,
-        branch,
+        residency,
     }))
+}
+
+/// Load the pose-control heavy phase — the base DiT + VAE ([`KreaHeavy`]), Raw-trained LoRA/LoKr on the
+/// base DiT (the branch is never an adapter target), then the pose branch (`spec.control`). Dense bf16
+/// (no quant). Factored so `Sequential` loads these AFTER the text phase is dropped. `spec.control` was
+/// already validated present by [`load`]; re-requiring it here keeps the `Sequential` per-generate path
+/// self-contained.
+fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned> {
+    let mut heavy = KreaHeavy::from_snapshot(root)?;
+    if !spec.adapters.is_empty() {
+        heavy.apply_adapters(&spec.adapters)?;
+    }
+    let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
+    let cfg = Krea2Config::from_snapshot(root)?;
+    let branch = Krea2ControlBranch::from_source(control, &cfg)?;
+    Ok(ControlHeavyOwned { heavy, branch })
 }
 
 /// The pose branch is pose-only (`Only([Pose])`) and defaults an unset `control_scale` to the S0 mid
@@ -112,10 +182,58 @@ impl ControlBranch for KreaTurboControl {
 }
 
 impl KreaTurboControl {
+    /// Text-encode the prompt per the residency (sc-11101). Pose control is CFG-free (one context, no
+    /// negative). `Resident` borrows the warm text phase (byte-identical to the pre-sc-11101 per-image
+    /// re-encode); `Sequential` loads the text phase, encodes, forces materialization (`eval`), then
+    /// DROPS it + `clear_cache()` so its ~4 GB frees before the DiT/VAE/branch load.
+    fn encode(&self, prompt: &str) -> Result<Array> {
+        match &self.residency {
+            ControlResidency::Resident(c) => c.text.encode(prompt),
+            ControlResidency::Sequential(spec) => {
+                let root =
+                    require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
+                let text = KreaText::from_snapshot(root)?;
+                let ctx = text.encode(prompt)?;
+                // MLX is lazy — materialize NOW while `text` is alive, else `ctx` keeps the encoder
+                // weights referenced through the graph and the drop frees nothing.
+                mlx_rs::transforms::eval([&ctx])?;
+                drop(text);
+                mlx_rs::memory::clear_cache();
+                Ok(ctx)
+            }
+        }
+    }
+
+    /// Load the heavy render components (DiT + VAE + branch) for a `Sequential` job — after
+    /// [`Self::encode`] dropped the text phase — or `None` under `Resident` (already held).
+    fn load_seq_heavy(&self) -> Result<Option<ControlHeavyOwned>> {
+        match &self.residency {
+            ControlResidency::Resident(_) => Ok(None),
+            ControlResidency::Sequential(spec) => {
+                let root =
+                    require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
+                Ok(Some(load_control_heavy(spec, root)?))
+            }
+        }
+    }
+
+    /// Borrow the heavy render components: the warm bundle under `Resident`, or the just-loaded
+    /// `seq_heavy` under `Sequential`. The render loop is written once against this borrow.
+    fn heavy<'a>(&'a self, seq_heavy: &'a Option<ControlHeavyOwned>) -> ControlHeavyRef<'a> {
+        match (&self.residency, seq_heavy) {
+            (ControlResidency::Resident(c), _) => c.heavy.as_ref(),
+            (_, Some(owned)) => owned.as_ref(),
+            (ControlResidency::Sequential(_), None) => {
+                unreachable!("Sequential residency always loads seq_heavy before rendering")
+            }
+        }
+    }
+
     /// The rich-`Result` body behind [`Generator::generate`] (the crate's own [`mlx_gen::Error`] so `?`
     /// lifts `mlx_rs` device exceptions; the trait wrapper bridges into [`gen_core::Error`]). Renders
     /// `req.count` CFG-free Turbo images, one per pose per seed (`seed + n`), each pose-locked by the
-    /// single-forward residual injection.
+    /// single-forward residual injection — through the residency (encode → drop text phase under
+    /// `Sequential` → load heavy+branch → per-image render → free heavy).
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -128,6 +246,15 @@ impl KreaTurboControl {
         // The required pose skeleton + its resolved scale (unset → the 0.6 default; Some(0.0) inert).
         let (control_image, control_scale) = self.resolve_control(req)?;
 
+        // Phase A: prompt → context (sc-11101). Under `Sequential` this loads the text phase, encodes,
+        // forces materialization, then DROPS it + `clear_cache()` before the DiT/VAE/branch load below.
+        let context = self.encode(&req.prompt)?;
+
+        // Phase B: heavy render components (DiT + VAE + the pose branch). `Resident` borrows the warm
+        // bundle; `Sequential` loads it NOW — after the text phase was dropped — and frees it when done.
+        let seq_heavy = self.load_seq_heavy()?;
+        let heavy = self.heavy(&seq_heavy);
+
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
             let opts = TurboOptions {
@@ -138,9 +265,9 @@ impl KreaTurboControl {
                 sampler: req.sampler.clone(),
                 scheduler: req.scheduler.clone(),
             };
-            let img = self.pipeline.generate_turbo_control_with_progress(
-                &req.prompt,
-                &self.branch,
+            let img = heavy.heavy.render_turbo_control(
+                &context,
+                heavy.branch,
                 control_image,
                 control_scale,
                 &opts,
@@ -148,6 +275,13 @@ impl KreaTurboControl {
                 on_progress,
             )?;
             images.push(img);
+        }
+        // Sequential (sc-11101): free the DiT/VAE/branch working set now that every image is rendered,
+        // then `clear_cache()`. Resident is a no-op (`seq_heavy` None).
+        let was_sequential = seq_heavy.is_some();
+        drop(seq_heavy);
+        if was_sequential {
+            mlx_rs::memory::clear_cache();
         }
         Ok(GenerationOutput::Images(images))
     }
