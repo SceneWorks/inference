@@ -58,12 +58,12 @@ mod adapters;
 // The merge entry point + its report are public: the worker can introspect what merged (the candle
 // analog of `mlx-gen-sdxl::apply_sdxl_adapters`'s report), and the trainer-verify lane
 // (`tests/trainer_e2e.rs`) asserts a trained adapter merges into every target with nothing skipped.
-pub use adapters::{merge_adapters, MergeReport};
-// Adapters on a **packed** (pre-quantized MLX tier) UNet (sc-9528, the sc-9089j follow-up deferred from
-// sc-9416): dequantize the packed Linears, fold the LoRA/LoKr delta through `merge_adapters` verbatim,
-// and keep the handful of adapted layers dense while every unadapted layer stays packed. Replaces the
-// sc-9416 "adapters on a packed tier are unsupported" guard with a real fold.
-mod packed_adapters;
+pub use adapters::{merge_adapters, AdditiveReport, MergeReport};
+// Adapters on a **packed** (pre-quantized MLX tier) UNet (sc-11103, epic 10765): the distill LoRA rides
+// the packed Linears **additively** (`adapters::install_additive`, no dequant — the q4/q8 footprint
+// survives) and any conv LoRA folds into the dense convs (`adapters::fold_conv_adapters`). This retired
+// the sc-9528 dequant→fold→keep-dense path (`packed_adapters.rs`), which dequantized the FF (the bulk of
+// the UNet) and defeated the point of the packed tier for SDXL-Lightning / RealVisXL-Lightning.
 
 // IP-Adapter (sc-5491, epic 5480): the perceiver `Resampler` (`image_proj.*` → image/identity tokens)
 // + the decoupled cross-attn K/V pairs (`ip_adapter.*`), the candle twin of `mlx-gen-sdxl::ip_adapter`.
