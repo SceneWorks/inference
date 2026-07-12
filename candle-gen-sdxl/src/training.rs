@@ -1007,8 +1007,8 @@ mod tests {
     /// F-061 / sc-9045: the trainer no longer carries a private UNet config — it builds `build_unet`
     /// from the single **exported** [`crate::unet::sdxl_unet_config`] the inference lanes share, so
     /// train-vs-inference config drift after a candle re-pin is structurally impossible. Pin the
-    /// canonical SDXL values here (the same set `pipeline::sdxl_stock_unet_config_pins_canonical_values`
-    /// asserts) so an accidental edit to the one source of truth is caught, not silently propagated.
+    /// canonical SDXL values here so an accidental edit to the one source of truth is caught, not
+    /// silently propagated.
     #[test]
     fn trainer_uses_exported_unet_config() {
         let c = sdxl_unet_config();

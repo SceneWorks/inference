@@ -73,9 +73,7 @@ use candle_gen_pid::{PidDecoder, PidEngine};
 /// Re-exported (sc-8373) so `candle-gen-instantid` loads the SAME `sdxl` student — InstantID composes
 /// the SDXL VAE, so there is no InstantID-specific PiD checkpoint.
 pub const PID_BACKBONE: &str = "sdxl";
-use candle_transformers::models::stable_diffusion::unet_2d::{
-    BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig,
-};
+use candle_transformers::models::stable_diffusion::unet_2d::UNet2DConditionModel;
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use candle_transformers::models::stable_diffusion::{self, StableDiffusionConfig};
 
@@ -551,11 +549,10 @@ impl Pipeline {
         // parts (no dense staging); every dense snapshot keeps the stock build below, unchanged.
         let unet = match self.detect_packed_unet()? {
             Some((packed_file, group_size)) => {
-                // sc-9528: a packed tier WITH a trained LoRA/LoKr now folds via dequant → merge →
-                // keep-dense (option a). The delta cannot be added to the u32-packed weights directly
-                // and SDXL merges (not residuals) for chaos-sensitivity, so the adapted Linears are
-                // dequantized, the delta is folded through `adapters::merge_adapters` (shared, verbatim),
-                // and only those adapted layers are served dense — every unadapted layer stays packed.
+                // sc-11103: a packed tier WITH a distill LoRA/LoKr applies it **additively** — the packed
+                // Linears take a forward-time residual (base kept packed) and any conv LoRA folds into the
+                // dense convs (`load_packed_unet_with_adapters`), so the q4/q8 footprint survives instead
+                // of dequant-folding the FF (the retired sc-9528 path).
                 let vendored = if self.adapters.is_empty() {
                     self.load_packed_unet(&packed_file, group_size)?
                 } else {
@@ -566,24 +563,27 @@ impl Pipeline {
             None => {
                 let unet_file =
                     snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-                if use_flash_attn {
-                    // The fused flash-attn kernel never materializes the full `[B·H, S, S]` scores
-                    // tensor, so it does not hit the i32-overflow (sc-11154 / F-081); keep the stock
-                    // candle UNet so the fused kernel is used (byte-identical to pre-sc-5165).
-                    let unet = if self.adapters.is_empty() {
+                if use_flash_attn && self.adapters.is_empty() {
+                    // **Unadapted + flash only.** The fused flash-attn kernel never materializes the full
+                    // `[B·H, S, S]` scores tensor, so it does not hit the i32-overflow (sc-11154 / F-081)
+                    // and needs no additive seam; keep the stock candle UNet so the fused kernel is used
+                    // (byte-identical to pre-sc-5165). An ADAPTED render falls through to the vendored
+                    // additive path below (sc-11682): the vendored flash path is a stub, and an additive
+                    // residual over a pristine (evictable) mmap base is worth more for an adapted render
+                    // than the fused kernel — so the old stock fold path is retired and adapted renders
+                    // always take the i32-overflow-safe vendored math path.
+                    let unet =
                         self.config
-                            .build_unet(unet_file, &self.device, 4, true, self.dtype)?
-                    } else {
-                        self.build_unet_with_adapters(&unet_file, true)?
-                    };
+                            .build_unet(unet_file, &self.device, 4, true, self.dtype)?;
                     SdxlUnet::Stock(Arc::new(unet))
                 } else {
-                    // Math-path attention (the default — no `flash-attn` feature): the stock candle
-                    // UNet materializes a full `[B·H, S, S]` scores tensor that overflows i32 at
-                    // ≥ ~1664² (2048²: `2·10·16384² ≈ 5.4e9 > i32::MAX`) and silently corrupts on CUDA
-                    // (sc-11154 / F-081). Route the dense load through the vendored UNet, whose math
-                    // attention is the i32-overflow-safe `sdpa_budgeted_flat` — bit-identical to the
-                    // stock forward per `vendored_unet_matches_stock_forward`.
+                    // Math-path attention (the default — no `flash-attn` feature — AND every adapted
+                    // render): the stock candle UNet materializes a full `[B·H, S, S]` scores tensor that
+                    // overflows i32 at ≥ ~1664² (2048²: `2·10·16384² ≈ 5.4e9 > i32::MAX`) and silently
+                    // corrupts on CUDA (sc-11154 / F-081). Route through the vendored UNet, whose math
+                    // attention is the i32-overflow-safe `sdpa_budgeted_flat` (bit-identical to the stock
+                    // forward per `vendored_unet_matches_stock_forward`); an adapter rides additively over
+                    // the mmap base (sc-11682), never folded.
                     let vendored = if self.adapters.is_empty() {
                         self.load_dense_vendored_unet(&unet_file)?
                     } else {
@@ -637,55 +637,41 @@ impl Pipeline {
         Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
     }
 
-    /// Build the vendored packed UNet from a packed MLX-tier checkpoint with the [`AdapterSpec`]s folded
-    /// in (sc-9528 — the sc-9089j follow-up deferred from sc-9416). Since a trained LoRA/LoKr delta
-    /// cannot be added to the u32-packed weights, and SDXL merges rather than adds a forward-time
-    /// residual (chaos-sensitivity, see [`crate::adapters`]), the packed Linears are **dequantized** to
-    /// dense f32, the delta is **folded** through [`crate::adapters::merge_adapters`] (shared, verbatim —
-    /// no LoRA/LoKr math reimplemented), and only the adapted layers are **kept dense** while every
-    /// unadapted layer stays packed ([`crate::packed_adapters`]). The resulting mixed (dense-adapted +
-    /// packed-unadapted) tensor map feeds the vendored UNet through a `VarBuilder::from_tensors`, whose
-    /// per-Linear `linear_detect_gs` packed-detects each layer by its `.scales` sibling — so an adapted
-    /// layer routes through the dense arm and an unadapted one keeps its packed footprint.
+    /// Build the vendored packed UNet from a packed MLX-tier checkpoint with the [`AdapterSpec`]s applied
+    /// **additively** (sc-11103, the sc-9528 dequant-fold replacement). A distill LoRA on a packed tier
+    /// now rides the packed Linears as a **forward-time residual** (`y = base(x) + Σ scale·((x·A)·B)`,
+    /// [`crate::adapters::install_additive`]) — the u32 codes are never dequantized, so the q4/q8
+    /// footprint survives (SDXL-Lightning / RealVisXL-Lightning target the FF, the bulk of the UNet).
+    /// The **conv** surface stays dense on a packed tier, so a conv LoRA still **folds** into it
+    /// ([`crate::adapters::fold_conv_adapters`]) at no packed cost. The additive residual equals the
+    /// dense fold to f32 tolerance — the accuracy bar the packed base's own quant already accepts (the
+    /// per-ULP chaos-sensitivity argument is about a *re-quantized* fold, not a residual on the frozen
+    /// packed base, so it does not apply here).
     fn load_packed_unet_with_adapters(
         &self,
         unet_file: &Path,
         group_size: usize,
     ) -> Result<VendoredUNet> {
         // The vendored UNet's top-level constructor threads only the default MLX group 64 through its
-        // blocks; a non-64 tier would dequantize/repartition at `group_size` while the UNet reads at 64.
-        // Refuse it loudly (mirrors `detect_packed_unet`) rather than silently mis-fold.
-        crate::packed_adapters::assert_group_size_supported(group_size)?;
-        let raw = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
-        let merged =
-            crate::packed_adapters::fold_adapters_into_packed_map(raw, &self.adapters, group_size)?;
-        // `from_tensors` serves the u32 packed weights via the vendored seam's `get_unchecked_dtype`
-        // (exactly as the mmap path) and the dense merged weights via the vb dtype — so the packed vs
-        // dense fork is taken per Linear as loaded. `false` = no flash-attn on the packed path.
-        let vs = VarBuilder::from_tensors(merged, self.dtype, &self.device);
-        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
-    }
-
-    /// Build the UNet with the [`AdapterSpec`]s merged into its weights (sc-5165). The base UNet
-    /// tensors are loaded onto **CPU** at their native dtype, the LoRA/LoKr deltas are folded in
-    /// ([`crate::adapters::merge_adapters`], f32 math), then the stock candle UNet is built from the
-    /// merged map — each tensor moved to the device and cast to the load dtype as the VarBuilder serves
-    /// it, so the merged weights live on the GPU exactly like the mmap path and peak GPU is unchanged.
-    ///
-    /// We merge into the dense weights rather than add a forward-time residual because SDXL's sampler
-    /// is chaos-sensitive (`(W+δ)·x` ≠ `W·x + δ·x` to ~1 ULP); see [`crate::adapters`].
-    fn build_unet_with_adapters(
-        &self,
-        unet_file: &Path,
-        use_flash_attn: bool,
-    ) -> Result<UNet2DConditionModel> {
-        let mut tensors = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
-        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
-        // `build_unet` reads `StableDiffusionConfig`'s private `unet` config + builds its own
-        // VarBuilder from a file path, so it cannot be fed a merged map; replicate its two lines with
-        // the canonical SDXL UNet config (pinned to candle's `StableDiffusionConfig::sdxl_`).
-        let vs = VarBuilder::from_tensors(tensors, self.dtype, &self.device);
-        let unet = UNet2DConditionModel::new(vs, 4, 4, use_flash_attn, sdxl_stock_unet_config())?;
+        // blocks; a non-64 tier would pack/read at mismatched grids. Refuse it loudly (mirrors
+        // `detect_packed_unet`) rather than mis-apply.
+        crate::adapters::assert_group_size_supported(group_size)?;
+        let mut raw = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
+        // Shared kohya `flattened → dotted` table for both packed adapter passes (conv fold + additive).
+        let table = crate::adapters::build_sdxl_kohya_table(&raw);
+        // Fold any conv-LoRA into the dense conv weights BEFORE the build; the packed Linears are left
+        // untouched so they load packed and take the additive residual below.
+        let conv = crate::adapters::fold_conv_adapters(&mut raw, &self.adapters, &table)?;
+        // `from_tensors` serves the u32 packed Linears via the vendored seam's `get_unchecked_dtype`
+        // (exactly as the mmap path) and the (conv-folded) dense weights via the vb dtype. `false` = no
+        // flash-attn on the packed path.
+        let vs = VarBuilder::from_tensors(raw, self.dtype, &self.device);
+        let mut unet = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
+        // Push the LoRA/LoKr residuals onto the packed Linear leaves — the base stays packed.
+        let add =
+            crate::adapters::install_additive(&mut unet, &self.adapters, &table, &self.device)?;
+        // A non-empty spec set that neither folded a conv nor installed a residual is a misconfiguration.
+        crate::adapters::guard_additive_matched(self.adapters.len(), conv.merged + add.applied)?;
         Ok(unet)
     }
 
@@ -703,16 +689,31 @@ impl Pipeline {
         Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
     }
 
-    /// Dense vendored UNet with the [`AdapterSpec`]s merged in (sc-11154 / F-081) — the adapted
-    /// counterpart of [`Self::load_dense_vendored_unet`]. Mirrors [`Self::build_unet_with_adapters`]
-    /// (base tensors on CPU → [`crate::adapters::merge_adapters`] f32 fold → `from_tensors`) but targets
-    /// the vendored stack so the i32-overflow-safe budgeted attention applies. SDXL merges the delta
-    /// into the dense weights (not a forward residual) for chaos-sensitivity; see [`crate::adapters`].
+    /// Dense vendored UNet with the [`AdapterSpec`]s applied **additively** (sc-11682) — the adapted
+    /// counterpart of [`Self::load_dense_vendored_unet`], through the i32-overflow-safe vendored stack.
+    /// The bf16 base stays a **pristine mmap** (never folded into a host `from_tensors` map), so
+    /// epic-10765 offload/eviction can drop-and-restore it cheaply — a fold `W += δ` mutates the weight
+    /// into a non-disk-re-derivable host copy that must be pinned. The adapter rides as forward-time
+    /// residuals on both the Linear ([`crate::adapters::install_additive`]) and conv
+    /// ([`crate::adapters::install_additive_conv`]) surfaces; additive equals the fold to f32 tolerance
+    /// (and matches the trainer's own additive forward — the ~1-ULP `(W+δ)·x` gap is the *fold*'s, not
+    /// the residual's). The kohya table is read from the file header (no data copy) so community
+    /// `lora_unet_<flat>` keys resolve against the mmap base.
     fn load_dense_vendored_unet_with_adapters(&self, unet_file: &Path) -> Result<VendoredUNet> {
-        let mut tensors = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
-        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
-        let vs = VarBuilder::from_tensors(tensors, self.dtype, &self.device);
-        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
+        let table = crate::adapters::build_sdxl_kohya_table_from_file(unet_file)?;
+        let vs =
+            candle_gen::mmap_var_builder(&[unet_file.to_path_buf()], self.dtype, &self.device)?;
+        let mut unet = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
+        let lin =
+            crate::adapters::install_additive(&mut unet, &self.adapters, &table, &self.device)?;
+        let conv = crate::adapters::install_additive_conv(
+            &mut unet,
+            &self.adapters,
+            &table,
+            &self.device,
+        )?;
+        crate::adapters::guard_additive_matched(self.adapters.len(), lin.applied + conv.applied)?;
+        Ok(unet)
     }
 
     /// Render `req` against pre-resolved `text_embeddings` and (caller-cached, sc-5037) `unet`/`vae`,
@@ -1092,40 +1093,6 @@ fn tile_blend_decode(
     Ok(output.broadcast_div(&weights.clamp(1e-8f32, f32::MAX)?)?)
 }
 
-/// The canonical SDXL UNet config — a verbatim copy of the `unet` block candle's
-/// `StableDiffusionConfig::sdxl_` builds (pinned to the workspace candle rev; values from
-/// `stabilityai/stable-diffusion-xl-base-1.0/unet/config.json`). `build_unet` reads that config from a
-/// **private** field and only accepts a file path, so the adapter-merge path — which must feed a
-/// merged in-memory tensor map — reconstructs it here. The no-adapter path still goes through
-/// `build_unet`, so this is exercised only when adapters are present; the conformance lane (sc-5165
-/// verify) renders an adapted image, which would NaN/garble if these drifted from the stock config.
-fn sdxl_stock_unet_config() -> UNet2DConditionModelConfig {
-    let bc = |out_channels, use_cross_attn, attention_head_dim| BlockConfig {
-        out_channels,
-        use_cross_attn,
-        attention_head_dim,
-    };
-    UNet2DConditionModelConfig {
-        blocks: vec![
-            bc(320, None, 5),
-            bc(640, Some(2), 10),
-            bc(1280, Some(10), 20),
-        ],
-        center_input_sample: false,
-        cross_attention_dim: 2048,
-        downsample_padding: 1,
-        flip_sin_to_cos: true,
-        freq_shift: 0.,
-        layers_per_block: 2,
-        mid_block_scale_factor: 1.,
-        norm_eps: 1e-5,
-        norm_num_groups: 32,
-        // The pipeline builds `StableDiffusionConfig::sdxl(None, …)`, i.e. unsliced attention.
-        sliced_attention_size: None,
-        use_linear_projection: true,
-    }
-}
-
 /// Detect a **packed** MLX-tier CLIP encoder `which` in the snapshot at `root` (sc-9527, sc-9089j
 /// follow-up to sc-9416): `Some((packed_weight_file, group_size))` when
 /// `text_encoder{,_2}/config.json` carries a `quantization` block ([`PackedConfig`]) AND the packed
@@ -1182,7 +1149,8 @@ pub(crate) fn detect_packed_unet(root: &Path) -> Result<Option<(PathBuf, usize)>
         // threads only the default group 64 (the leaf `*_gs` constructors exist, but wiring a non-64
         // group through the many nested block constructors is the same infeasibility lens/sd3 hit in
         // sc-9474). A non-64 SDXL MLX tier does not exist today; refuse it rather than repack on the
-        // wrong grid. The adapter fold ([`crate::packed_adapters`]) asserts gs==64 for the same reason.
+        // wrong grid. The packed adapter path ([`crate::adapters::assert_group_size_supported`]) asserts
+        // gs==64 for the same reason.
         return Err(CandleError::Msg(format!(
             "sdxl: packed tier group_size {group_size} unsupported (only {MLX_GROUP_SIZE}); \
              a non-64 SDXL tier needs the group threaded through the UNet blocks (sc-9528)"
@@ -1376,33 +1344,6 @@ mod tests {
         }
         // An unknown repo must be refused, not silently resolved against `main`.
         assert!(hub_revision("some/unpinned-repo").is_err());
-    }
-
-    /// sc-5165: the adapter-merge path reconstructs the SDXL UNet config locally (since `build_unet`
-    /// reads it from a private field of `StableDiffusionConfig`). Pin its canonical values so an
-    /// accidental edit — which would silently build the adapter-path UNet differently from the
-    /// no-adapter `build_unet` path — is caught here, not only on the GPU conformance lane.
-    #[test]
-    fn sdxl_stock_unet_config_pins_canonical_values() {
-        let c = sdxl_stock_unet_config();
-        assert_eq!(c.blocks.len(), 3);
-        assert_eq!(c.blocks[0].out_channels, 320);
-        assert_eq!(c.blocks[0].use_cross_attn, None);
-        assert_eq!(c.blocks[0].attention_head_dim, 5);
-        assert_eq!(c.blocks[1].out_channels, 640);
-        assert_eq!(c.blocks[1].use_cross_attn, Some(2));
-        assert_eq!(c.blocks[1].attention_head_dim, 10);
-        assert_eq!(c.blocks[2].out_channels, 1280);
-        assert_eq!(c.blocks[2].use_cross_attn, Some(10));
-        assert_eq!(c.blocks[2].attention_head_dim, 20);
-        assert_eq!(c.cross_attention_dim, 2048);
-        assert_eq!(c.layers_per_block, 2);
-        assert_eq!(c.norm_num_groups, 32);
-        assert_eq!(c.downsample_padding, 1);
-        assert!(c.use_linear_projection);
-        assert!(!c.center_input_sample);
-        assert!(c.flip_sin_to_cos);
-        assert_eq!(c.sliced_attention_size, None);
     }
 
     /// sc-6128: the Lightning policy is diffusers `EulerDiscreteScheduler(timestep_spacing="trailing",

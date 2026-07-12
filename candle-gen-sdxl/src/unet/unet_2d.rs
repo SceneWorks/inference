@@ -441,6 +441,32 @@ impl LoraHost for UNet2DConditionModel {
 }
 
 impl UNet2DConditionModel {
+    /// Walk every convolution in the UNet — `conv_in`/`conv_out`, every down/up block's resnet + sampler
+    /// convs (both `Basic` and `CrossAttn`, since all carry convs), and the mid block's resnet convs — so
+    /// a conv-layer LoRA can install additive residuals on them (sc-11682). Keeping the conv base an
+    /// unmutated mmap (residual, not fold) is what lets epic-10765 offload evict/restore it cheaply.
+    pub fn visit_conv_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut Conv2d) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&mut self.conv_in)?;
+        for db in self.down_blocks.iter_mut() {
+            match db {
+                UNetDownBlock::Basic(b) => b.visit_conv_lora_mut(f)?,
+                UNetDownBlock::CrossAttn(b) => b.visit_conv_lora_mut(f)?,
+            }
+        }
+        self.mid_block.visit_conv_lora_mut(f)?;
+        for ub in self.up_blocks.iter_mut() {
+            match ub {
+                UNetUpBlock::Basic(b) => b.visit_conv_lora_mut(f)?,
+                UNetUpBlock::CrossAttn(b) => b.visit_conv_lora_mut(f)?,
+            }
+        }
+        f(&mut self.conv_out)?;
+        Ok(())
+    }
+
     /// The PEFT module paths of every adaptable attention projection (`to_q`/`to_k`/`to_v`/`to_out.0`
     /// across the down/mid/up cross-attention blocks), in deterministic walk order. Drives trainer
     /// target resolution + the `mid_block` exclusion check for LoKr (sc-2640).
