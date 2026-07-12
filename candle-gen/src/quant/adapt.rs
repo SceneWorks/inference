@@ -27,8 +27,9 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
-use super::{lin_gs, QLinear, MLX_GROUP_SIZE};
+use super::{lin_gs, DenseLinear, QLinear, MLX_GROUP_SIZE};
 use crate::{CandleError, Result};
+use gen_core::Quant;
 
 /// The frozen base weight — **dense** (`candle_nn::Linear`) or **MLX-packed** ([`super::QLinear`],
 /// dequant-on-forward). Both compute `x·Wᵀ (+ b)`; neither is ever mutated by an adapter.
@@ -435,6 +436,27 @@ impl AdaptLinear {
     pub fn push_lokr_structured(&mut self, factors: LokrFactors) {
         self.adapters.push(Adapter::LokrStructured { factors });
     }
+
+    /// Fold a **dense** base to an MLX-packed base in place (Q4/Q8), preserving any attached residuals —
+    /// or an **idempotent no-op** on an already-packed base. The shared-core twin of
+    /// [`super::QLinear::quantize`] for a consumer whose DiT quantizes AFTER any dense adapter fold
+    /// (lens / sd3, sc-11105): on a **dense** tier the projection folds dense→Q4/Q8 here; on a **packed**
+    /// tier it is the no-op the additive install relies on, so the forward-time residuals survive. Uses
+    /// the sc-7702-safe [`super::MatmulStrategy::DequantDense`] forward (via `QLinear::quantize`); the
+    /// residual stack is untouched — the deltas ride on top of the now-packed base. Only the **base**
+    /// weight is quantized (never a residual factor), so a dense base carrying residuals stays correct.
+    pub fn quantize(&mut self, quant: Quant) -> candle_core::Result<()> {
+        match &mut self.base {
+            // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
+            Base::Packed(_) => Ok(()),
+            Base::Dense(l) => {
+                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
+                q.quantize(quant)?;
+                self.base = Base::Packed(q);
+                Ok(())
+            }
+        }
+    }
 }
 
 impl Module for AdaptLinear {
@@ -717,6 +739,62 @@ mod tests {
         assert!(
             dev_max < 1e-5,
             "packed residual != scale·(x·a)·b (max diff {dev_max})"
+        );
+    }
+
+    /// `quantize` folds a **dense** base to packed in place (idempotent no-op if already packed), keeping
+    /// any attached residual — the lens/sd3 "quantize after the dense fold" contract (sc-11105). The
+    /// folded-packed forward equals the packed base forward plus the same residual (f32 tol), and a
+    /// second quantize on the now-packed base is an exact no-op (the additive residuals survive).
+    #[test]
+    fn quantize_folds_dense_base_and_preserves_residual() {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank) = (64usize, 128usize, 4usize);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap() * 0.1).unwrap();
+        let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
+
+        let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
+        lin.push_lora(a.clone(), b.clone(), 0.7);
+        assert!(!lin.is_packed());
+        lin.quantize(Quant::Q8).unwrap();
+        assert!(lin.is_packed(), "dense base must fold to packed");
+        assert!(lin.is_adapted(), "residual must survive the fold");
+
+        let x = Tensor::randn(0f32, 1f32, (3usize, in_dim), &dev).unwrap();
+        let residual = ((x.matmul(&a).unwrap().matmul(&b).unwrap()) * 0.7).unwrap();
+        // The Q8-packed base alone (no residual) — same weight, same fold — plus the residual.
+        let mut base_only = AdaptLinear::from_dense(Linear::new(w, None), in_dim, out_dim);
+        base_only.quantize(Quant::Q8).unwrap();
+        let expected = (base_only.forward(&x).unwrap() + residual).unwrap();
+        let dev_max = (lin.forward(&x).unwrap() - expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            dev_max < 1e-4,
+            "adapted-packed forward != packed base + residual ({dev_max})"
+        );
+
+        // Idempotent: a second quantize is a no-op (packed stays packed; forward unchanged).
+        let y0 = lin.forward(&x).unwrap();
+        lin.quantize(Quant::Q4).unwrap();
+        let y1 = lin.forward(&x).unwrap();
+        let noop = (y1 - y0)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            noop, 0.0,
+            "quantize on an already-packed base must be a no-op"
         );
     }
 
