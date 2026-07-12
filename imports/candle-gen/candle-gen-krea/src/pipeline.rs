@@ -107,23 +107,20 @@ pub fn load_components(
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
 
     let cfg = Krea2Config::from_snapshot(root)?;
-    let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
     crate::convert::validate_transformer(&dit_w, &cfg)?;
-    // Adapters on a **packed** MLX tier ride as forward-time additive residuals on the packed base
-    // (sc-11105) — instead of reconstructing each adapted projection's dense weight from the packed parts
-    // and installing it as a dense overlay (which forces those projections resident-dense),
-    // `install_additive` keeps the base packed and pushes the LoRA/LoKr delta as an unmerged residual. On
-    // a **dense** tier the delta still folds into the weight (`merge_into_weights`, bit-exact — the
-    // chaos-sensitive sampler's preferred path). A non-empty spec that matches no target is a hard error
-    // in either path (the worker then falls back rather than silently rendering unadapted).
-    let dit = if !adapters.is_empty() && dit_w.packed().is_some() {
-        let mut dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    // Adapters ride as **forward-time additive residuals** on the DiT's projections — on BOTH the packed
+    // and the dense tier (sc-11105, additive-everywhere for epic 10765). The base weight is never mutated:
+    // instead of reconstructing each adapted projection's dense weight (packed tier) or folding `W += δ`
+    // into the mmap (dense tier) — either of which pins an un-evictable in-memory copy — `install_additive`
+    // keeps the base an unmutated mmap/packed base and pushes the LoRA/LoKr delta as an unmerged residual,
+    // so the offload/eviction path can drop-and-restore it cheaply. It equals the old fold to f32 tolerance
+    // (~1 ULP). A non-empty spec that matches no target is a hard error (the worker then falls back rather
+    // than silently rendering unadapted).
+    let mut dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    if !adapters.is_empty() {
         crate::adapters::install_additive(&mut dit, adapters)?;
-        dit
-    } else {
-        crate::adapters::merge_into_weights(&mut dit_w, &cfg, adapters)?;
-        Krea2Transformer::load(&dit_w, &cfg)?
-    };
+    }
 
     let vae = load_vae(root, device)?;
 
