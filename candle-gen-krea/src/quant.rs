@@ -30,7 +30,7 @@
 //! untargeted projections, while an adapted projection resolves to its correct merged dense weight —
 //! there is no packed `quantize_onto` to no-op here (that is the VarBuilder crates' seam).
 
-use candle_gen::candle_core::{DType, Result, Tensor};
+use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
 use candle_gen::quant::{self as shared, AdaptLinear};
 
@@ -66,12 +66,16 @@ pub enum QLinear {
 }
 
 /// The stored parts of an INT8-ConvRot projection (sc-9300 loader + sc-9601 rotation): the `(N, K)` int8
-/// codes of the **rotated** weight `W·R` (on the CPU as `I64`, staged to a resident device `i8` inside
-/// `Int8Linear`), the `[N]` per-output-row dequant scale, the ConvRot `group_size` (the regular-Hadamard
-/// order, 256), and the optional dense bias (ConvRot Krea projections are bias-free, but the field keeps
-/// the type general). On CUDA a per-channel `Int8Linear` is built lazily on first forward and cached; the
-/// CPU fallback dequantizes the rotated `w[o, :] = q[o, :] · scale[o]`. Both paths first apply the online
-/// activation rotation `RHT(x)` (built once, cached in `rot`) so the GEMM reconstructs `x·Wᵀ`.
+/// codes of the **rotated** weight `W·R` (on the CPU as `I64`, staged to the resident **compute** device
+/// `i8` inside `Int8Linear`), the `[N]` per-output-row dequant scale, the ConvRot `group_size` (the
+/// regular-Hadamard order, 256), and the optional dense bias (ConvRot Krea projections are bias-free, but
+/// the field keeps the type general). When the model's compute device is CUDA, a per-channel `Int8Linear`
+/// is built **eagerly at construction** on that device (F-121 / sc-11208) — the loader materializes the
+/// int8 codes on the CPU to avoid 8× VRAM, so the leg is built on the compute device the activations live
+/// on, **not** the CPU-resident codes' device, and `Int8Linear::from_per_channel_parts` stages the CPU
+/// codes onto it. The CPU / non-CUDA fallback dequantizes the rotated `w[o, :] = q[o, :] · scale[o]`. Both
+/// paths first apply the online activation rotation `RHT(x)` (built once, cached in `rot`) so the GEMM
+/// reconstructs `x·Wᵀ`.
 pub struct ConvRotInt8 {
     w_i8: Tensor,
     scale: Vec<f32>,
@@ -81,8 +85,15 @@ pub struct ConvRotInt8 {
     /// The `[group_size, group_size]` rotation `R = H/√group_size`, built lazily on the activation's
     /// device on first forward and cached (tiny — 256² f32 — but shouldn't rebuild per projection/step).
     rot: std::sync::OnceLock<Tensor>,
+    /// The cuBLASLt IGEMM leg, built eagerly at construction on the model's resident **compute** device
+    /// when that device is CUDA (F-121 / sc-11208): a cublasLt init failure surfaces as the crate's typed
+    /// error from [`QLinear::convrot_int8`] (where `?` is available) instead of aborting the sampler
+    /// thread via `.expect()` mid-render. Built on the compute device, **not** the CPU-resident codes'
+    /// device (the loader keeps the int8 codes on the CPU to save VRAM), so a normal CUDA render always
+    /// takes this int8 IGEMM leg. `None` when the compute device isn't CUDA (CPU / Metal fallback in
+    /// [`Self::forward`]).
     #[cfg(feature = "cuda")]
-    lt: std::sync::OnceLock<std::sync::Arc<candle_gen::quant::Int8Linear>>,
+    lt: Option<std::sync::Arc<candle_gen::quant::Int8Linear>>,
 }
 
 impl ConvRotInt8 {
@@ -111,21 +122,13 @@ impl ConvRotInt8 {
 
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() {
-            let lin = self.lt.get_or_init(|| {
-                std::sync::Arc::new(
-                    candle_gen::quant::Int8Linear::from_per_channel_parts(
-                        self.w_i8.clone(),
-                        self.scale.clone(),
-                        self.bias.clone(),
-                        std::sync::Arc::new(
-                            candle_gen::quant::CublasLt::new(x.device())
-                                .expect("cublasLt handle for int8 convrot"),
-                        ),
-                    )
-                    .expect("build Int8Linear from convrot parts"),
-                )
-            });
-            return lin.forward(&xr);
+            // Eagerly built in `convrot_int8` (F-121 / sc-11208) on the compute device; present whenever
+            // the model's compute device is CUDA — which is the case on every real CUDA render, even
+            // though the int8 codes themselves are CPU-materialized. If it's absent (CPU/Metal compute),
+            // fall through to the dequant-dense path.
+            if let Some(lin) = &self.lt {
+                return lin.forward(&xr);
+            }
         }
         // CPU / non-CUDA fallback: dequant-to-dense matmul (sc-7702-style; keeps activations full-precision).
         let in_dtype = x.dtype();
@@ -176,13 +179,23 @@ impl QLinear {
     /// checkpoint's stored parts: the `(N, K)` int8 codes `w_i8` of the **rotated** weight `W·R` (any
     /// dtype; narrowed at the int8 stage), the `[N]` per-output-row `weight_scale`, the ConvRot
     /// `group_size` (the regular-Hadamard order the export folded into the weight — `convrot_groupsize`,
-    /// 256), and the optional dense `bias`. No re-quantization. `group_size` must be a power of four and
-    /// divide `K`; the forward applies the online `RHT(x)` so `RHT(x)·(W·R)ᵀ = x·Wᵀ`.
+    /// 256), the optional dense `bias`, and `device` — the model's resident **compute** device (where the
+    /// activations live). No re-quantization. `group_size` must be a power of four and divide `K`; the
+    /// forward applies the online `RHT(x)` so `RHT(x)·(W·R)ᵀ = x·Wᵀ`.
+    ///
+    /// **`device` is the compute device, not `w_i8.device()` (F-121 / sc-11208).** The loader
+    /// materializes the int8 codes on the CPU to avoid holding them at 8× the size on the GPU
+    /// ([`crate::loader::Weights::get_int8_codes`]), so `w_i8` is CPU-resident on a real CUDA render.
+    /// The cuBLASLt IGEMM leg must therefore be built on the passed-in CUDA compute device — not gated on
+    /// the CPU-resident codes' device — so a normal CUDA render takes the int8 IGEMM path (byte-identical
+    /// to the pre-eager lazy build, which staged onto the activation's device);
+    /// `Int8Linear::from_per_channel_parts` stages the CPU codes onto that device.
     pub fn convrot_int8(
         w_i8: Tensor,
         scale: Vec<f32>,
         group_size: usize,
         bias: Option<Tensor>,
+        device: &Device,
     ) -> Result<Self> {
         let (n, k) = w_i8.dims2()?;
         if scale.len() != n {
@@ -196,6 +209,28 @@ impl QLinear {
                 "krea convrot: group_size {group_size} must be a power of four dividing K ({k})"
             )));
         }
+        // Build the cuBLASLt IGEMM leg eagerly on the model's resident COMPUTE device (F-121 /
+        // sc-11208) so a cublasLt init failure is this typed error (where `?` is available), not an
+        // `.expect()` panic on the first sampler forward. Gated on `device.is_cuda()`, NOT
+        // `w_i8.device().is_cuda()`: the loader keeps the int8 codes on the CPU (VRAM), so gating on the
+        // codes' device would leave `lt` None on every real CUDA render and drop into a cross-device
+        // dequant-dense matmul. `from_per_channel_parts` stages the CPU codes onto `device`.
+        #[cfg(feature = "cuda")]
+        let lt = if device.is_cuda() {
+            let cublas = std::sync::Arc::new(candle_gen::quant::CublasLt::new(device)?);
+            Some(std::sync::Arc::new(
+                candle_gen::quant::Int8Linear::from_per_channel_parts(
+                    w_i8.clone(),
+                    scale.clone(),
+                    bias.clone(),
+                    cublas,
+                )?,
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let _ = device;
         Ok(Self::ConvRotInt8(ConvRotInt8 {
             w_i8,
             scale,
@@ -203,7 +238,7 @@ impl QLinear {
             bias,
             rot: std::sync::OnceLock::new(),
             #[cfg(feature = "cuda")]
-            lt: std::sync::OnceLock::new(),
+            lt,
         }))
     }
 
@@ -396,6 +431,119 @@ mod tests {
         assert_eq!(
             dev_max, 0.0,
             "group-64 packed embedding deviates from the grid"
+        );
+        Ok(())
+    }
+
+    /// F-121 (sc-11208): `convrot_int8` now builds the cuBLASLt IGEMM leg eagerly (where `?` is
+    /// available) rather than in a lazy `get_or_init(|| … .expect())` on the sampler thread. On CPU
+    /// that eager leg is skipped, so a valid build must construct + forward without panicking, and
+    /// malformed parts must be typed errors from the constructor (never a `.expect()`/panic).
+    #[test]
+    fn convrot_int8_constructor_is_typed_error_not_panic() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 128usize);
+        let mut wv = vec![0f32; out_dim * in_dim];
+        for o in 0..out_dim {
+            for j in 0..in_dim {
+                wv[o * in_dim + j] = ((o * 7 + j * 3) % 51) as f32 / 25.0 - 1.0;
+            }
+        }
+        // Canonical weight → rotate → per-row int8: the on-disk ConvRot granularity.
+        let w = Tensor::from_vec(wv, (out_dim, in_dim), &dev)?;
+        let r = candle_gen::quant::regular_hadamard(G, &dev)?;
+        let rw = candle_gen::quant::convrot_rotate(&w, &r)?;
+        let pc = candle_gen::quant::quantize_weight_int8_per_channel(&rw)?;
+
+        // Valid build + forward (CPU compute → dequant-dense leg): must not panic.
+        let lin = QLinear::convrot_int8(pc.q.clone(), pc.scale.clone(), G, None, &dev)?;
+        assert!(lin.is_convrot_int8());
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        assert_eq!(lin.forward(&x)?.dims(), &[4, out_dim]);
+
+        // Malformed parts ⇒ typed errors from the constructor, not panics.
+        assert!(
+            QLinear::convrot_int8(pc.q.clone(), vec![1.0; out_dim + 1], G, None, &dev).is_err(),
+            "scale-len mismatch must be a typed error"
+        );
+        assert!(
+            QLinear::convrot_int8(pc.q.clone(), pc.scale.clone(), G + 1, None, &dev).is_err(),
+            "non-power-of-four group_size must be a typed error"
+        );
+        Ok(())
+    }
+
+    /// F-121 device regression (sc-11208): the production ConvRot path materializes the int8 codes on
+    /// the **CPU** (the loader's `get_int8_codes`, to avoid 8× VRAM), so `convrot_int8` must build the
+    /// cuBLASLt IGEMM leg on the model's resident **compute** device (the activation's CUDA device), NOT
+    /// the CPU-resident codes' device. This reproduces that exact split — CPU codes + a CUDA compute
+    /// device + a CUDA activation — and asserts the int8 IGEMM leg (not a cross-device dequant-dense
+    /// fallback, which the buggy `w_i8.device().is_cuda()` gate would have hit) runs and matches the CPU
+    /// dequant-dense reference within int8 tolerance. A CPU-only test cannot catch this — on CPU `lt` is
+    /// legitimately `None`. Skips cleanly when no CUDA device is present.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn convrot_int8_cuda_forward_with_cpu_codes_matches_dequant_dense() -> Result<()> {
+        let cuda = match Device::cuda_if_available(0) {
+            Ok(d @ Device::Cuda(_)) => d,
+            _ => {
+                eprintln!("[sc-11208] no CUDA device; skipping ConvRot int8 CUDA forward gate");
+                return Ok(());
+            }
+        };
+        let cpu = Device::Cpu;
+        // cuBLASLt int8 needs K and N multiples of 16; group_size (a power of four) must divide K.
+        let (out_dim, in_dim) = (64usize, 128usize);
+        let mut wv = vec![0f32; out_dim * in_dim];
+        for o in 0..out_dim {
+            for j in 0..in_dim {
+                wv[o * in_dim + j] = ((o * 7 + j * 3) % 51) as f32 / 25.0 - 1.0;
+            }
+        }
+        // Canonical weight → rotate → per-row int8, codes left on the CPU exactly as the loader's
+        // `get_int8_codes` materializes them in production.
+        let w = Tensor::from_vec(wv, (out_dim, in_dim), &cpu)?;
+        let r = candle_gen::quant::regular_hadamard(G, &cpu)?;
+        let rw = candle_gen::quant::convrot_rotate(&w, &r)?;
+        let pc = candle_gen::quant::quantize_weight_int8_per_channel(&rw)?;
+        let w_i8_cpu = pc.q;
+        assert!(
+            !w_i8_cpu.device().is_cuda(),
+            "fixture must mirror production: int8 codes materialized on the CPU"
+        );
+
+        // Compute device = CUDA (the resident / activation device), codes on CPU: the production split.
+        let lin_cuda = QLinear::convrot_int8(w_i8_cpu.clone(), pc.scale.clone(), G, None, &cuda)?;
+        assert!(lin_cuda.is_convrot_int8());
+        let x = Tensor::randn(0f32, 1f32, (8, in_dim), &cuda)?;
+        // Must take the int8 IGEMM leg (built on `cuda`), NOT fall through to a cross-device
+        // dequant-dense matmul (CPU weight × CUDA activation), which is the F-121 bug this guards.
+        let y_cuda = lin_cuda
+            .forward(&x)?
+            .to_dtype(DType::F32)?
+            .to_device(&cpu)?;
+
+        // Reference: the SAME parts on a CPU compute device (dequant-dense leg), full-precision
+        // activation — the int8-tolerance yardstick for the IGEMM path.
+        let lin_cpu = QLinear::convrot_int8(w_i8_cpu, pc.scale.clone(), G, None, &cpu)?;
+        let y_ref = lin_cpu.forward(&x.to_device(&cpu)?)?.to_dtype(DType::F32)?;
+
+        let cos = cosine(&y_cuda, &y_ref);
+        let num = (y_cuda.sub(&y_ref)?)
+            .sqr()?
+            .mean_all()?
+            .to_scalar::<f32>()?
+            .sqrt();
+        let den = y_ref
+            .sqr()?
+            .mean_all()?
+            .to_scalar::<f32>()?
+            .sqrt()
+            .max(1e-6);
+        let rel = num / den;
+        assert!(
+            cos > 0.99 && rel < 0.1,
+            "CUDA int8 IGEMM vs CPU dequant-dense: cosine {cos:.5}, rel-RMS {rel:.4}"
         );
         Ok(())
     }
