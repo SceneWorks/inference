@@ -405,6 +405,15 @@ impl AdaptLinear {
         (self.out_features, self.in_features)
     }
 
+    /// The packed base's inner shared [`super::QLinear`] (for a consumer's test to inspect the GGUF
+    /// block dtype / device of the folded leaf), or `None` on a dense base. sc-11105.
+    pub fn base_qlinear(&self) -> Option<&QLinear> {
+        match &self.base {
+            Base::Packed(q) => Some(q),
+            Base::Dense(_) => None,
+        }
+    }
+
     /// The projection's contraction (`in_features`) — the last-dim an `[in, rank]` LoRA `a` factor
     /// contracts against.
     pub fn in_features(&self) -> usize {
@@ -452,6 +461,27 @@ impl AdaptLinear {
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
                 q.quantize(quant)?;
+                self.base = Base::Packed(q);
+                Ok(())
+            }
+        }
+    }
+
+    /// As [`Self::quantize`] but folds a **dense** base to a packed base landing on an explicit `device`
+    /// (the CPU-stage → quantize-onto-GPU path, sc-8504 / sd3) — the base is quantized on its current
+    /// device and placed on `device` via [`super::QLinear::quantize_dequant_onto`]. An already-packed
+    /// base is an **idempotent no-op**. Only the base is folded; this is only used on the dense-fold
+    /// route (which carries no forward-time residuals), so the residual stack — empty there — is untouched.
+    pub fn quantize_dequant_onto(
+        &mut self,
+        quant: Quant,
+        device: &Device,
+    ) -> candle_core::Result<()> {
+        match &mut self.base {
+            Base::Packed(_) => Ok(()),
+            Base::Dense(l) => {
+                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
+                q.quantize_dequant_onto(quant, device)?;
                 self.base = Base::Packed(q);
                 Ok(())
             }
