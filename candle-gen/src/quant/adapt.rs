@@ -251,6 +251,20 @@ impl AdaptLinear {
         }
     }
 
+    /// Wrap an already-built **packed** [`super::QLinear`] (an MLX packed tier loaded from **raw
+    /// tensors** — the krea loader's seam, which reads through an `MmapedSafetensors` overlay rather than
+    /// a `VarBuilder`, sc-11105) with its logical `[out, in]` dims. The base stays packed (`is_packed()`
+    /// true, no dense weight materialized); residuals ride on top. The raw-tensor counterpart to
+    /// [`Self::linear_detect`] (which packed-detects off a `VarBuilder`).
+    pub fn from_packed(q: QLinear, in_dim: usize, out_dim: usize) -> Self {
+        Self {
+            base: Base::Packed(q),
+            out_features: out_dim,
+            in_features: in_dim,
+            adapters: Vec::new(),
+        }
+    }
+
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`), shape-
     /// checked exactly like `candle_nn::linear` — so it loads unchanged on `VarMap`-backed test
     /// fixtures.
