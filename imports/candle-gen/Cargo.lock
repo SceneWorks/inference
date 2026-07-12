@@ -550,6 +550,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
+ "rayon",
  "sceneworks-gen-core-testkit",
 ]
 
@@ -2752,7 +2753,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=592419ca926d58dfb4f888228a2c4c04c839e806#592419ca926d58dfb4f888228a2c4c04c839e806"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=b8c415261a9fc6a2409a8ffc989881f0e6a3c99b#b8c415261a9fc6a2409a8ffc989881f0e6a3c99b"
 dependencies = [
  "core-llm",
  "inventory",
@@ -2765,7 +2766,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=592419ca926d58dfb4f888228a2c4c04c839e806#592419ca926d58dfb4f888228a2c4c04c839e806"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=b8c415261a9fc6a2409a8ffc989881f0e6a3c99b#b8c415261a9fc6a2409a8ffc989881f0e6a3c99b"
 dependencies = [
  "sceneworks-gen-core",
 ]
