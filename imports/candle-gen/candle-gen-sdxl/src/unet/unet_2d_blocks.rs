@@ -478,13 +478,17 @@ impl UNetMidBlock2DCrossAttn {
         Ok(xs)
     }
 
-    /// Visit the mid block's cross-attention transformer(s) for adapter install/clear (sc-5165).
+    /// Visit the mid block's adaptable Linears for adapter install/clear: the lead resnet's
+    /// `time_emb_proj` + each attention block's cross-attention transformer (attention + FF) and its
+    /// trailing resnet's `time_emb_proj` (sc-5165 attention/FF, sc-11679 resnet timestep projection).
     pub fn visit_lora_mut(
         &mut self,
         f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
-        for (attn, _resnet) in self.attn_resnets.iter_mut() {
+        self.resnet.visit_lora_mut(f)?;
+        for (attn, resnet) in self.attn_resnets.iter_mut() {
             attn.visit_lora_mut(f)?;
+            resnet.visit_lora_mut(f)?;
         }
         Ok(())
     }
@@ -610,6 +614,19 @@ impl DownBlock2D {
         Ok((xs, output_states))
     }
 
+    /// Visit every resnet's adaptable `time_emb_proj` Linear in this down block so a LoRA targeting the
+    /// timestep projection rides it additively (sc-11679). A `Basic` (non-cross-attn) block has no
+    /// attention, so its resnets are the only adaptable Linears here.
+    pub fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for resnet in self.resnets.iter_mut() {
+            resnet.visit_lora_mut(f)?;
+        }
+        Ok(())
+    }
+
     /// Visit every conv in this down block (each resnet's convs + the optional downsampler conv) for a
     /// conv-LoRA additive install (sc-11682).
     pub fn visit_conv_lora_mut(
@@ -726,11 +743,13 @@ impl CrossAttnDownBlock2D {
         Ok((xs, output_states))
     }
 
-    /// Visit every cross-attention transformer in this down block for adapter install/clear (sc-5165).
+    /// Visit every adaptable Linear in this down block for adapter install/clear: each cross-attention
+    /// transformer's attention + FF projections (sc-5165) and each resnet's `time_emb_proj` (sc-11679).
     pub fn visit_lora_mut(
         &mut self,
         f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
+        self.downblock.visit_lora_mut(f)?;
         for attn in self.attentions.iter_mut() {
             attn.visit_lora_mut(f)?;
         }
@@ -859,6 +878,19 @@ impl UpBlock2D {
         }
     }
 
+    /// Visit every resnet's adaptable `time_emb_proj` Linear in this up block so a LoRA targeting the
+    /// timestep projection rides it additively (sc-11679). A `Basic` (non-cross-attn) block has no
+    /// attention, so its resnets are the only adaptable Linears here.
+    pub fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for resnet in self.resnets.iter_mut() {
+            resnet.visit_lora_mut(f)?;
+        }
+        Ok(())
+    }
+
     /// Visit every conv in this up block (each resnet's convs + the optional upsampler conv) for a
     /// conv-LoRA additive install (sc-11682).
     pub fn visit_conv_lora_mut(
@@ -974,11 +1006,13 @@ impl CrossAttnUpBlock2D {
         }
     }
 
-    /// Visit every cross-attention transformer in this up block for adapter install/clear (sc-5165).
+    /// Visit every adaptable Linear in this up block for adapter install/clear: each cross-attention
+    /// transformer's attention + FF projections (sc-5165) and each resnet's `time_emb_proj` (sc-11679).
     pub fn visit_lora_mut(
         &mut self,
         f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
+        self.upblock.visit_lora_mut(f)?;
         for attn in self.attentions.iter_mut() {
             attn.visit_lora_mut(f)?;
         }
