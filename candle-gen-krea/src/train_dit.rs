@@ -46,6 +46,8 @@ use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{LoraHost, LoraLinear};
 
 use crate::config::Krea2Config;
+use candle_gen::quant::QLinear as SharedQLinear;
+
 use crate::loader::{linear, rms_scale_weight, Weights};
 use crate::transformer::block::{RmsScale, SwiGlu, TextFusionTransformer};
 use crate::transformer::rope::{apply_interleaved_rope, RopeTables};
@@ -103,6 +105,60 @@ fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
     Ok(LoraLinear::from_linear(base, in_f, out_f, path.to_string()))
 }
 
+/// Packed-inference twin of [`lora_proj`] (sc-11727). On a packed q4/q8 tier, build the projection's
+/// frozen base as a **packed** [`QLinear`] (`linear_detect`) — the codes STAY packed in VRAM and
+/// dequantize on-forward (sc-7702), which is the whole point for a small-card user; a dense-materialized
+/// bf16 weight would defeat the tier they installed. Wrap it as an inference-only
+/// [`LoraLinear::from_qlinear`] so a USER LoRA (sc-11720/sc-11721) still rides additively over the packed
+/// base. The logical `[out, in]` dims come from the `.scales` shape (`[out, in/group]`), so no dense
+/// weight is materialized just to read them. On a dense (bf16) tier there is no packed base to keep, so
+/// defer to [`lora_proj`] (identical). INFERENCE-ONLY: a packed base cannot host a trainable `Var`
+/// residual, so the trainer keeps [`lora_proj`].
+fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
+    let scales_key = format!("{path}.scales");
+    match w.packed() {
+        Some(cfg) if w.contains(&scales_key) => {
+            // Build the SHARED `candle_gen::quant::QLinear` straight from the MLX packed triple (the same
+            // source `crate::loader::linear_detect` reads, but that returns the krea-local `QLinear`
+            // wrapper). `from_packed_gs` repacks into a GGUF `QTensor` that stays quantized in VRAM and
+            // dequantizes on-forward (sc-7702) — the codes are NOT materialized to a dense weight.
+            let group = cfg.group_size as usize;
+            let wq = w.get_native(&format!("{path}.weight"))?;
+            let scales = w.get_f32(&scales_key)?;
+            let biases = w.get_f32(&format!("{path}.biases"))?;
+            let dense_bias = if bias {
+                Some(w.get(&format!("{path}.bias"))?)
+            } else {
+                None
+            };
+            let sdims = scales.dims();
+            let (out_f, in_f) = (sdims[0], sdims[1] * group);
+            let ql = SharedQLinear::from_packed_gs(
+                &wq,
+                &scales,
+                &biases,
+                dense_bias,
+                group,
+                w.device(),
+            )?;
+            Ok(LoraLinear::from_qlinear(ql, in_f, out_f, path.to_string()))
+        }
+        _ => lora_proj(w, path, bias),
+    }
+}
+
+/// The projection loader a [`KreaTrainDit`] build uses: the packed-detecting [`lora_proj_packed`] on the
+/// control-INFERENCE path (`packed = true`, codes stay in VRAM), else the dense trainable [`lora_proj`].
+type ProjLoader = fn(&Weights, &str, bool) -> Result<LoraLinear>;
+
+fn proj_loader(packed: bool) -> ProjLoader {
+    if packed {
+        lora_proj_packed
+    } else {
+        lora_proj
+    }
+}
+
 /// Sigmoid-gated GQA attention with the four attention projections as adaptable [`LoraLinear`]s and a
 /// frozen `to_gate` / per-head `+1` RMSNorm — the trainable twin of [`crate::transformer::block`]'s
 /// `GatedAttention`.
@@ -129,13 +185,15 @@ impl TrainAttention {
         kv_heads: usize,
         head_dim: usize,
         eps: f64,
+        packed: bool,
     ) -> Result<Self> {
+        let proj = proj_loader(packed);
         Ok(Self {
-            q: lora_proj(w, &format!("{prefix}.to_q"), false)?,
-            k: lora_proj(w, &format!("{prefix}.to_k"), false)?,
-            v: lora_proj(w, &format!("{prefix}.to_v"), false)?,
-            gate: lora_proj(w, &format!("{prefix}.to_gate"), false)?,
-            o: lora_proj(w, &format!("{prefix}.to_out.0"), false)?,
+            q: proj(w, &format!("{prefix}.to_q"), false)?,
+            k: proj(w, &format!("{prefix}.to_k"), false)?,
+            v: proj(w, &format!("{prefix}.to_v"), false)?,
+            gate: proj(w, &format!("{prefix}.to_gate"), false)?,
+            o: proj(w, &format!("{prefix}.to_out.0"), false)?,
             norm_q: rms_scale_weight(w, &format!("{prefix}.norm_q.weight"))?,
             norm_k: rms_scale_weight(w, &format!("{prefix}.norm_k.weight"))?,
             heads,
@@ -214,6 +272,7 @@ impl TrainBlock {
         head_dim: usize,
         hidden: usize,
         eps: f64,
+        packed: bool,
     ) -> Result<Self> {
         let sst = w
             .get(&format!("{prefix}.scale_shift_table"))?
@@ -229,6 +288,7 @@ impl TrainBlock {
                 kv_heads,
                 head_dim,
                 eps,
+                packed,
             )?,
             mlp: SwiGlu::load(w, &format!("{prefix}.ff"))?,
             eps,
@@ -306,8 +366,27 @@ pub struct KreaTrainDit {
 }
 
 impl KreaTrainDit {
-    /// Build from a loaded `transformer/` weight set at `w`'s compute dtype.
+    /// Build the composable DiT for **training** (the control-branch trainer / LoRA trainer): every
+    /// adaptable projection is a dense `Var`-trainable [`LoraLinear`], so a packed tier is dequantized to
+    /// dense on load. This is the historical `load`; the control **inference** provider should use
+    /// [`load_inference`](Self::load_inference) to keep a packed q4/q8 base packed in VRAM (sc-11727).
     pub fn load(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        Self::load_impl(w, cfg, false)
+    }
+
+    /// Build the composable DiT for the **control-inference** lane: on a packed q4/q8 tier the attention
+    /// and front-end projections load as **packed** [`QLinear`] bases (dequant-on-forward, codes stay in
+    /// VRAM — a q4 DiT keeps its ~¼ footprint instead of ballooning to dense bf16), the FFN / text-fusion
+    /// leaves already packed-detect, and a USER LoRA still rides additively. The frozen base is never
+    /// trained, so nothing needs `Var` master weights. On a dense (bf16) tier this is identical to
+    /// [`load`](Self::load). sc-11727 packed pose-control forward.
+    pub fn load_inference(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        Self::load_impl(w, cfg, true)
+    }
+
+    /// Shared build. `packed = true` routes the adaptable projections through the packed-keeping
+    /// [`lora_proj_packed`] (control inference); `false` keeps the dense trainable [`lora_proj`].
+    fn load_impl(w: &Weights, cfg: &Krea2Config, packed: bool) -> Result<Self> {
         let (heads, kv, hd, eps) = (
             cfg.num_attention_heads,
             cfg.num_kv_heads,
@@ -316,6 +395,7 @@ impl KreaTrainDit {
         );
         let (theads, tkv) = (cfg.text_num_attention_heads, cfg.text_num_kv_heads);
         let hidden = cfg.hidden_size;
+        let proj = proj_loader(packed);
 
         let final_sstable = w
             .get("final_layer.scale_shift_table")?
@@ -325,13 +405,13 @@ impl KreaTrainDit {
             cfg: cfg.clone(),
             device: w.device().clone(),
             dtype: w.dtype(),
-            img_in: lora_proj(w, "img_in", true)?,
-            time_embed_l1: lora_proj(w, "time_embed.linear_1", true)?,
-            time_embed_l2: lora_proj(w, "time_embed.linear_2", true)?,
+            img_in: proj(w, "img_in", true)?,
+            time_embed_l1: proj(w, "time_embed.linear_1", true)?,
+            time_embed_l2: proj(w, "time_embed.linear_2", true)?,
             time_mod_proj: linear(w, "time_mod_proj", true)?,
             txt_in_norm: RmsScale::load(w, "txt_in.norm.weight", eps)?,
-            txt_in_l1: lora_proj(w, "txt_in.linear_1", true)?,
-            txt_in_l2: lora_proj(w, "txt_in.linear_2", true)?,
+            txt_in_l1: proj(w, "txt_in.linear_1", true)?,
+            txt_in_l2: proj(w, "txt_in.linear_2", true)?,
             text_fusion: TextFusionTransformer::load(
                 w,
                 cfg.num_layerwise_text_blocks,
@@ -351,11 +431,12 @@ impl KreaTrainDit {
                         hd,
                         hidden,
                         eps,
+                        packed,
                     )
                 })
                 .collect::<Result<_>>()?,
             final_norm: rms_scale_weight(w, "final_layer.norm.weight")?,
-            final_linear: lora_proj(w, "final_layer.linear", true)?,
+            final_linear: proj(w, "final_layer.linear", true)?,
             final_sstable,
         })
     }
