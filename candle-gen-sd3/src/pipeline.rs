@@ -24,7 +24,6 @@
 //!   (`StdRng`) seeded by `seed`, moved to the device — NOT candle's CUDA `randn`. The Euler step is
 //!   non-stochastic, so generation is a pure function of `(seed, request)`.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -186,19 +185,18 @@ impl Pipeline {
     pub(crate) fn load_components(&self) -> Result<Components> {
         let encoders =
             Sd3TextEncoders::load(&self.root, self.cfg.t5_seq_len, &self.device, self.dtype)?;
-        // The DiT VarBuilder source depends on whether adapters are merged (sc-7881): with adapters,
-        // base `transformer/` is read into a CPU tensor map and the LoRA/LoKr deltas folded in
-        // (`merge_adapters`) before the build; otherwise the stock mmap build (byte-identical to the
-        // pre-sc-7881 path). The merge always runs **before** quantization so Q4/Q8 folds the adapted
-        // weights. `dit_vb_on(device)` returns the right source on the requested device.
+        // Adapters ride as **forward-time additive residuals** on the DiT (sc-11105) — on BOTH tiers:
+        // the base is never folded (`W += δ` would pin an un-evictable in-memory copy — epic 10765), so
+        // it stays an unmutated mmap (dense) / packed base. Quantization (if any) then folds ONLY the
+        // base in place and the residuals survive. `merge_adapters` (the old dense fold) is retained as a
+        // public utility but no longer on the load path.
         // Whether `transformer/` is a pre-quantized MLX-packed tier (`config.json` carries a
-        // `quantization` block). On a packed tier the dense fold (`merge_adapters`, `W += δ`) can't run
-        // (the base is u32 codes), so adapters ride as **forward-time additive residuals** on the packed
-        // base (sc-11105) — a user LoRA no longer forces a full dense build. A dense tier keeps folding.
+        // `quantization` block) — gates the no-adapter packed-detect build below + the group-size guard.
         let packed_cfg = self.transformer_packed_config();
         let packed_tier = self.adapters.is_empty() && packed_cfg.is_some();
-        // Packed tier WITH adapters: build packed + install additive residuals (sc-11105).
-        let additive = !self.adapters.is_empty() && packed_cfg.is_some();
+        // Adapters ride as forward-time additive residuals on the DiT — on BOTH tiers (sc-11105,
+        // additive-everywhere for epic 10765); the base is never mutated, so it stays evictable.
+        let additive = !self.adapters.is_empty();
         // sc-9474: the shared packed loaders (`QLinear::linear_detect` / `linear_detect_dense`) repack
         // at the MLX default group size 64, which every hosted `sd3.5-*-mlx` tier uses. The parsed
         // `PackedConfig.group_size` is threaded here as a LOUD guard so a hypothetical future group-32
@@ -219,18 +217,21 @@ impl Pipeline {
             }
         }
         let transformer = if additive {
-            // Packed tier + adapters: build the packed MMDiT directly on the device (each projection
-            // packed-detects its `.scales` sibling), then install the LoRA/LoKr as forward-time additive
-            // residuals on the packed base (sc-11105) — the base stays packed (q4/q8 footprint); the
-            // deltas ride unmerged, never folded into u32 codes. A requested `quantize_onto` is a no-op on
-            // the already-packed projections and only re-migrates the dense-kept leaves.
+            // Adapters on ANY tier: build the MMDiT on the device (a packed tier packed-detects each
+            // `.scales` sibling; a dense tier loads the unmutated bf16 mmap), then install the LoRA/LoKr
+            // as **forward-time additive residuals** — the base is never folded, so it stays evictable
+            // (a `W += δ` fold pins an un-evictable in-memory copy — epic 10765). A requested `quantize`
+            // then folds ONLY the base in place (dense→Q4/Q8; a no-op on an already-packed base) and the
+            // residuals survive. Additive equals the old dense fold to f32 tolerance (~1 ULP). The
+            // dense-tier adapter case builds dense on the device (the sc-8504 CPU-stage optimization is
+            // for the no-adapter path); the adapter's residual never lands as a dense base weight.
             let mut transformer = Sd3Transformer::new(
                 &self.cfg,
                 self.component_vb_on("transformer", &self.device)?,
             )?;
             crate::adapters::install_additive(&mut transformer, &self.adapters)?;
             if let Some(q) = self.quant {
-                transformer.quantize_onto(q, &self.device)?;
+                transformer.quantize(q)?;
             }
             transformer
         } else {
@@ -258,12 +259,16 @@ impl Pipeline {
                 // CPU either way). The TE + VAE stay dense bf16.
                 Some(q) => {
                     let cpu = Device::Cpu;
-                    let mut transformer = Sd3Transformer::new(&self.cfg, self.dit_vb_on(&cpu)?)?;
+                    let mut transformer =
+                        Sd3Transformer::new(&self.cfg, self.component_vb_on("transformer", &cpu)?)?;
                     transformer.quantize_onto(q, &self.device)?;
                     transformer
                 }
                 // Dense bf16: load straight onto the compute device.
-                None => Sd3Transformer::new(&self.cfg, self.dit_vb_on(&self.device)?)?,
+                None => Sd3Transformer::new(
+                    &self.cfg,
+                    self.component_vb_on("transformer", &self.device)?,
+                )?,
             }
         };
         let vae = load_vae(self.component_vb("vae")?)?;
@@ -319,39 +324,6 @@ impl Pipeline {
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
-    }
-
-    /// The DiT [`VarBuilder`] on `device`: the stock mmap build when no adapters are present, else the
-    /// LoRA/LoKr-merged build ([`Self::transformer_vb_with_adapters`]). Used by
-    /// [`load_components`](Self::load_components) for both the dense (device = GPU) and sc-8504
-    /// CPU-stage-quant (device = CPU) paths, so the adapter merge composes with quantization for free.
-    fn dit_vb_on(&self, device: &Device) -> Result<VarBuilder<'static>> {
-        if self.adapters.is_empty() {
-            self.component_vb_on("transformer", device)
-        } else {
-            self.transformer_vb_with_adapters(device)
-        }
-    }
-
-    /// Build the MMDiT [`VarBuilder`] (on `device`) with the LoRA/LoKr [`AdapterSpec`]s merged into its
-    /// weights (sc-7881). The base `transformer/` tensors are loaded into a CPU map, each adapter's delta
-    /// is folded in ([`crate::adapters::merge_adapters`], f32 math), then the MMDiT is built from the
-    /// merged map — **merge, not residual** (SD3.5's flow-match sampler is chaos-sensitive; `(W+δ)·x` ≠
-    /// `W·x + δ·x` to ~1 ULP). Only reached when adapters are present; quantization (if any) folds the
-    /// merged weights afterwards in [`load_components`](Self::load_components). `device` is the GPU for
-    /// the dense path and the CPU for the sc-8504 CPU-stage-quant path.
-    fn transformer_vb_with_adapters(&self, device: &Device) -> Result<VarBuilder<'static>> {
-        let files = self.component_files("transformer")?;
-        let mut tensors: HashMap<String, Tensor> = HashMap::new();
-        for f in &files {
-            let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
-            tensors.extend(part);
-        }
-        // Discard the merge report — the silent twin (`candle-gen-z-image`'s
-        // `transformer_vb_with_adapters`) does the same; a mismatched adapter surface already errors
-        // inside `merge_adapters`, so library code stays quiet on stderr (sc-9035 / F-051).
-        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
-        Ok(VarBuilder::from_tensors(tensors, self.dtype, device))
     }
 
     /// Build the conditioning for a prompt: the aggregated pooled + context. For CFG the
