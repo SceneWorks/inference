@@ -346,7 +346,7 @@ fn resolve_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
 /// bits (`quantize()` would be a no-op). Errors on a packed-vs-requested mismatch so e.g. Q4 over a Q8
 /// turnkey never silently serves Q8. Shared by the text + heavy loaders (the marker in
 /// `transformer/config.json` is model-wide), so both phases decide identically.
-fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Result<Option<i32>> {
+pub(crate) fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Result<Option<i32>> {
     let Some(q) = spec.quantize else {
         return Ok(None);
     };
@@ -371,7 +371,7 @@ fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Result<Option
 /// dropped first under `Sequential`. Applies the optional (F-076-guarded) text-encoder quantize; the
 /// VAE + vision tower stay dense (the monolithic `KreaPipeline::quantize` quantized `te` + `dit`, not
 /// the VAE/vision), so the `Resident` and `Sequential` paths build byte-identical text phases.
-fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<KreaText> {
+pub(crate) fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<KreaText> {
     let mut text = KreaText::from_snapshot(root)?;
     if let Some(bits) = load_time_quant_bits(spec, root, id)? {
         text.quantize(bits)?;
