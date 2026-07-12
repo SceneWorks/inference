@@ -4,16 +4,20 @@
 //! `KreaEdit` routing/descriptor is P3 (sc-10882/10883) — the engine capability is exercised here.
 //!
 //! The dual-conditioning contract needs BOTH wires ON to be on-distribution (R8), so this loads the
-//! community identity-edit LoRA (`conradlocke/krea2-identity-edit`) into the Raw DiT and feeds a real
-//! source image. `#[ignore]` — needs the real Krea 2 Raw snapshot, the edit LoRA, a source image, and a
-//! CUDA GPU:
+//! community identity-edit LoRA (`conradlocke/krea2-identity-edit`) into the DiT and feeds a real
+//! source image. `#[ignore]` — needs a real Krea 2 snapshot (Raw or Turbo), the edit LoRA, a source
+//! image, and a CUDA GPU:
 //! ```sh
-//! KREA_RAW_DIR=D:\models\Krea-2-Raw \
+//! KREA_RAW_DIR=D:\models\Krea-2-Turbo \
 //! KREA_EDIT_LORA=D:\models\krea2-identity-edit.safetensors \
-//! KREA_EDIT_SOURCE=D:\fixtures\person.ppm \
+//! KREA_EDIT_SOURCE=D:\fixtures\person.png \
+//! KREA_EDIT_DISTILLED=1 \
 //!   cargo test -p candle-gen-krea --release --features cuda --test edit_real_weights -- --ignored --nocapture
 //! ```
-//! Optionally set `KREA_EDIT_SOURCE_B` for the two-reference (scene = image 1, person = image 2) path.
+//! `KREA_EDIT_DISTILLED=1` drives the CFG-free distilled **Turbo** edit (`krea_2_turbo_edit`, sc-11640:
+//! guidance forced to 0, ~8-step `turbo_schedule`) against the Turbo turnkey; unset (or `0`) drives the
+//! undistilled full-CFG **Raw** edit. Optionally set `KREA_EDIT_SOURCE_B` for the two-reference (scene =
+//! image 1, person = image 2) path. Sources may be binary P6 `.ppm` or `.png`.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -85,6 +89,26 @@ fn read_ppm(path: &PathBuf) -> Image {
     }
 }
 
+/// Decode a source reference from either a binary P6 `.ppm` or a `.png` into an RGB8 [`Image`]. PNG is
+/// handled by the `image` dev-dep (already used for `save`) so real-world fixtures don't need a manual
+/// PPM conversion step.
+fn read_source(path: &PathBuf) -> Image {
+    let is_png = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+    if !is_png {
+        return read_ppm(path);
+    }
+    let rgb = image::open(path).expect("decode PNG source").to_rgb8();
+    let (width, height) = rgb.dimensions();
+    Image {
+        width,
+        height,
+        pixels: rgb.into_raw(),
+    }
+}
+
 fn save(img: &Image, name: &str) {
     let dir = std::env::temp_dir().join("krea_edit_smoke");
     std::fs::create_dir_all(&dir).unwrap();
@@ -119,10 +143,16 @@ fn edit_renders_coherent_with_dual_conditioning() {
     let root = PathBuf::from(root);
     let device = candle_gen::default_device().expect("device");
 
+    // `KREA_EDIT_DISTILLED=1` → the CFG-free distilled Turbo edit (guidance forced to 0, ~8-step
+    // `turbo_schedule`) against the Turbo turnkey; unset/`0` → the undistilled full-CFG Raw edit.
+    let distilled = std::env::var("KREA_EDIT_DISTILLED")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE"));
+
     // References in fixed order: scene = image 1, person = image 2 (sc-10878).
-    let mut references = vec![read_ppm(&PathBuf::from(&source))];
+    let mut references = vec![read_source(&PathBuf::from(&source))];
     if let Ok(b) = std::env::var("KREA_EDIT_SOURCE_B") {
-        references.push(read_ppm(&PathBuf::from(b)));
+        references.push(read_source(&PathBuf::from(b)));
     }
     // Target resolution: `KREA_EDIT_SIZE=WxH` (both multiples of 16) overrides; else the reference's
     // size. A smaller target keeps the DiT joint sequence (and its memory/time) light — the vision
@@ -134,10 +164,12 @@ fn edit_renders_coherent_with_dual_conditioning() {
             Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
         })
         .unwrap_or((references[0].width, references[0].height));
+    // Turbo defaults to the distilled few-step budget (~8); Raw to the undistilled 20. `KREA_EDIT_STEPS`
+    // overrides either.
     let steps = std::env::var("KREA_EDIT_STEPS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(20u32);
+        .unwrap_or(if distilled { 8 } else { 20u32 });
     let prompt = std::env::var("KREA_EDIT_PROMPT")
         .unwrap_or_else(|_| "make the person smile warmly, keep their identity".into());
 
@@ -169,7 +201,7 @@ fn edit_renders_coherent_with_dual_conditioning() {
         &edit,
         &req,
         &references,
-        false,
+        distilled,
         &device,
         &mut |_| {},
     )
@@ -180,13 +212,17 @@ fn edit_renders_coherent_with_dual_conditioning() {
     let img = &imgs[0];
     assert_eq!((img.width, img.height), (w, h), "output dims");
     let (std, distinct, adj) = image_stats(&img.pixels, img.width);
+    let mode = if distilled { "turbo" } else { "raw" };
     eprintln!(
-        "[krea edit {w}x{h} refs={}] load {load_s:.1}s · render {gen_s:.1}s · std={std:.1} \
-         distinct={distinct} adjΔ={adj:.1} coherent={}",
+        "[krea {mode} edit {w}x{h} refs={} steps={steps}] load {load_s:.1}s · render {gen_s:.1}s · \
+         std={std:.1} distinct={distinct} adjΔ={adj:.1} coherent={}",
         references.len(),
         is_coherent(img)
     );
-    save(img, &format!("edit_{w}x{h}_refs{}", references.len()));
+    save(
+        img,
+        &format!("edit_{mode}_{w}x{h}_refs{}", references.len()),
+    );
     assert!(
         is_coherent(img),
         "edit render must be a coherent image, not noise (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
