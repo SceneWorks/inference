@@ -134,17 +134,22 @@ fn load_transformer_tensors(root: &Path) -> Result<HashMap<String, Tensor>> {
     Ok(map)
 }
 
-/// Build the MMDiT, applying LoRA/LoKr `adapters` by the route the base tier allows (sc-6220, sc-11091):
+/// Build the MMDiT, applying LoRA/LoKr `adapters` by the route the base tier + adapter type allow
+/// (sc-6220, sc-11091, sc-11684):
 ///
 /// * **No adapters** — the mmap fast path (byte-identical to before), serving a dense *or* packed base.
-/// * **Adapters + packed q4/q8 base** — build the DiT packed (the base kept in q4/q8 codes via the mmap
-///   fast path), then attach each adapter as a **forward-time additive residual**
-///   ([`crate::adapters::install_additive`]): `y = base(x) + Σ scale·((x·A)·B)`, the base never
-///   dequantized/folded. So the Qwen-Image-Edit-2511-Lightning distill (all 720 attn+MLP Linears)
-///   applies on the packed tier at the base's footprint rather than forcing the ~41 GB dense DiT load.
-/// * **Adapters + dense bf16 base** — the eager-load + **fold** path (`W += δ` in f32,
-///   [`crate::adapters::merge_adapters`]), bit-exact as before (the chaos-sensitive sampler wants the
-///   merged forward, not a residual, on the dense tier).
+/// * **Additive residual** ([`crate::adapters::install_additive`]) — the DEFAULT whenever the adapters
+///   have a deferred form (plain LoRA / structured LoKr), on a **packed q4/q8 OR dense bf16** base. Build
+///   the DiT via the mmap fast path (base kept as-is — q4/q8 codes or dense weights, never
+///   dequantized/folded) then push each adapter as `y = base(x) + Σ scale·((x·A)·B)`. So the
+///   Qwen-Image-Edit-2511-Lightning distill (all 720 attn+MLP Linears) applies at the base's footprint and
+///   the adapted DiT stays streamable under sequential residency ([`QwenEdit::load_transformer_seq`]) —
+///   instead of the eager fold's whole-DiT CPU load. Costs ~1 ULP vs the fold (`W·x + δ·x ≠ (W+δ)·x`),
+///   accepted uniformly across tiers (sc-11684).
+/// * **Dense fold fallback** ([`crate::adapters::merge_adapters`], `W += δ` in f32) — ONLY for adapter
+///   types with no deferred form (**LoHa**'s Hadamard, **untagged third-party LyCORIS LoKr**) on a dense
+///   base. Bit-exact but not streamable; these types are rare and dense-only (on a packed base
+///   `install_additive` errors — there is no dense `W` to fold into).
 ///
 /// A non-empty `adapters` slice that matches no MMDiT module errors on either route (it never renders an
 /// unadapted image silently).
@@ -168,9 +173,15 @@ fn load_transformer(
             gs,
         )?);
     }
-    if crate::transformer_is_packed(&dit_dir) {
-        // Packed additive path (sc-11091): build the DiT with the base kept packed (mmap fast path), then
-        // push the LoRA/LoKr as forward-time residuals — never folding an f32 delta into u32 codes.
+    // Additive residual for anything with a deferred form — REQUIRED on a packed base (no dense `W` to
+    // fold), and now the default on a DENSE base too (sc-11684) so the adapted DiT loads at the base's
+    // footprint and streams under sequential residency instead of the eager whole-DiT fold. LoHa /
+    // untagged-LyCORIS-LoKr on a dense base have no deferred form → fall through to the fold below.
+    if crate::transformer_is_packed(&dit_dir)
+        || crate::adapters::adapters_additive_capable(adapters)?
+    {
+        // Base kept as-is (packed q4/q8 codes or dense weights) via the mmap fast path, then push the
+        // LoRA/LoKr as forward-time residuals — never folding a delta into the base.
         let mut dit =
             QwenTransformer::new_gs(&cfg, component_vb(root, "transformer", dtype, device)?, gs)?;
         // Discard the report — like the fold path below, library code stays quiet on stderr; a
@@ -178,9 +189,10 @@ fn load_transformer(
         let _ = crate::adapters::install_additive(&mut dit, adapters)?;
         return Ok(dit);
     }
-    // Dense fold path: a LoRA/LoKr overlay on a dense base folds into the weight before the MMDiT is
-    // built (each merged tensor cast to `dtype` + moved to `device` as the VarBuilder serves it, so peak
-    // GPU is unchanged vs the mmap path — mirrors `candle-gen-sdxl`'s `load_instantid_unet_with_adapters`).
+    // Dense fold FALLBACK (sc-11684): LoHa / untagged-LyCORIS-LoKr on a dense base — no deferred additive
+    // form, so fold the delta into the weight before the MMDiT is built (each merged tensor cast to
+    // `dtype` + moved to `device` as the VarBuilder serves it, so peak GPU is unchanged vs the mmap path).
+    // Bit-exact but not streamable; these adapter types are rare and dense-only.
     let mut tensors = load_transformer_tensors(root)?;
     crate::adapters::merge_adapters(&mut tensors, adapters)?;
     let vb = VarBuilder::from_tensors(tensors, dtype, device);
@@ -361,8 +373,10 @@ impl QwenEdit {
     }
 
     /// Load ONLY the MMDiT for the sequential path (sc-10968) — loaded after the VL encoder was dropped,
-    /// reusing its freed allocator pool. Re-folds the SAME `adapters` so the DiT is bit-identical to the
-    /// resident path.
+    /// reusing its freed allocator pool. Re-applies the SAME `adapters` by the SAME route as the resident
+    /// path ([`load_transformer`]: additive for LoRA/LoKr, fold for LoHa/untagged-LoKr) so the DiT is
+    /// identical to it. With the additive route (sc-11684) the base loads via the streamable mmap fast
+    /// path here rather than the eager whole-DiT fold.
     fn load_transformer_seq(&self) -> Result<QwenTransformer> {
         load_transformer(&self.root, &self.adapters, DIT_DTYPE, &self.device)
     }
