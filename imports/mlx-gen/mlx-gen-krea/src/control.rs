@@ -17,16 +17,13 @@
 //! [`SingleStreamBlock`] forward, so the residuals match the candle branch within the same MLX-vs-candle
 //! tolerance the base DiT already carries.
 //!
-//! The overlay checkpoint is the epic-5594 convert-once artifact produced from the candle
-//! `control_step5000.safetensors` by `examples/krea-control-convert.rs`: identical values, with the four
-//! RMSNorm scales un-folded from the candle `*.weight_p1` (`scale + 1`) back to the raw `*.weight` this
-//! crate's [`crate::transformer::block::RmsScale`] re-folds at load — so the branch blocks load through
-//! the unmodified [`SingleStreamBlock::from_weights`].
+//! The branch loads the candle overlay checkpoint (`control_step5000.safetensors`) DIRECTLY — no offline
+//! convert step. The only candle↔MLX on-disk difference is the four RMSNorm scales, which candle stores
+//! pre-folded as `*.weight_p1` (`= scale + 1`); [`crate::transformer::block::RmsScale`] accepts that
+//! convention verbatim (alongside the base snapshot's raw `*.weight`), so every branch block loads
+//! through the unmodified [`SingleStreamBlock::from_weights`] against the same file the candle lane uses.
 
-use std::collections::HashMap;
-use std::path::Path;
-
-use mlx_rs::ops::{add, concatenate_axis, divide, maximum, minimum, multiply, sqrt, subtract};
+use mlx_rs::ops::{add, concatenate_axis, divide, maximum, minimum, multiply, sqrt};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -269,55 +266,6 @@ fn read_inject_offset(w: &Weights) -> usize {
         .unwrap_or(DEFAULT_INJECT_OFFSET)
 }
 
-// ── candle → MLX overlay convert-once (epic 5594) ───────────────────────────────────────────────
-
-/// Convert a candle-format pose overlay to the MLX-native layout (epic 5594 convert-once /
-/// re-host-on-SceneWorks-HF). The ONLY structural delta between the two: the four RMSNorm scales
-/// (`norm1`, `norm2`, `attn.norm_q`, `attn.norm_k` per block) are stored **pre-folded** as `scale + 1`
-/// under a `*.weight_p1` suffix in candle, whereas this crate's [`crate::transformer::block::RmsScale`]
-/// reads the **raw** `*.weight` and re-folds `+1` at load — so un-fold them (`weight = weight_p1 − 1`,
-/// in f32) and drop the `_p1` suffix. Every other tensor — the bf16 attention/FFN matmuls, the
-/// `scale_shift_table`, the zero-init `proj_out`, and the `meta.inject_offset` marker — is copied
-/// **verbatim** (identical values, identical keys), so the branch forward is otherwise unchanged.
-/// Returns the converted (key, tensor) pairs.
-pub fn convert_candle_overlay(src: &Weights) -> Result<Vec<(String, Array)>> {
-    let mut out = Vec::with_capacity(src.len());
-    for key in src.keys() {
-        let t = src.require(key)?;
-        match key.strip_suffix(".weight_p1") {
-            Some(stem) => {
-                // Un-fold candle's `scale + 1` back to the raw scale MLX's RmsScale re-folds at load.
-                let raw = subtract(&t.as_dtype(mlx_rs::Dtype::Float32)?, scalar(1.0))?;
-                out.push((format!("{stem}.weight"), raw));
-            }
-            None => out.push((key.to_string(), t.clone())),
-        }
-    }
-    Ok(out)
-}
-
-/// Read a candle overlay `.safetensors`, [`convert_candle_overlay`] it, and write the MLX-native overlay
-/// to `dst_path` (a single `.safetensors`). The offline convert-once step behind
-/// `examples/krea-control-convert.rs`; the produced file is re-hosted on SceneWorks HF and referenced by
-/// the worker's control-overlay manifest.
-pub fn convert_candle_overlay_file(
-    src_path: impl AsRef<Path>,
-    dst_path: impl AsRef<Path>,
-) -> Result<()> {
-    let src = Weights::from_file(src_path)?;
-    let converted = convert_candle_overlay(&src)?;
-    let refs: Vec<(&str, &Array)> = converted.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let meta = HashMap::from([
-        ("format".to_string(), "mlx".to_string()),
-        (
-            "converted_by".to_string(),
-            "mlx-gen-krea krea-control-convert (sc-8465, epic 8459 S5)".to_string(),
-        ),
-    ]);
-    Array::save_safetensors(refs, Some(&meta), dst_path.as_ref())?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,39 +330,6 @@ mod tests {
             (got - 0.1).abs() < 1e-4,
             "in-budget RMS should pass through, got {got}"
         );
-    }
-
-    /// The convert-once step un-folds the four RMSNorm `*.weight_p1` scales (`scale + 1`) back to the
-    /// raw `*.weight` (`− 1`) MLX re-folds at load, and copies every other tensor + the meta marker
-    /// verbatim (same key, same value).
-    #[test]
-    fn convert_unfolds_norm_scales_and_copies_rest() {
-        let mut w = Weights::empty();
-        w.insert(
-            "blocks.0.norm1.weight_p1",
-            Array::from_slice(&[2.5f32], &[1]),
-        ); // raw = 1.5
-        w.insert(
-            "blocks.0.attn.norm_q.weight_p1",
-            Array::from_slice(&[1.0f32], &[1]),
-        ); // raw = 0.0
-        w.insert(
-            "blocks.0.attn.to_q.weight",
-            Array::from_slice(&[0.5f32, 0.5], &[1, 2]),
-        );
-        w.insert("meta.inject_offset", Array::from_slice(&[1.0f32], &[1]));
-
-        let map: std::collections::HashMap<String, Array> =
-            convert_candle_overlay(&w).unwrap().into_iter().collect();
-
-        // `*.weight_p1` → `*.weight`, minus 1.
-        assert!(!map.contains_key("blocks.0.norm1.weight_p1"));
-        assert!((map["blocks.0.norm1.weight"].item::<f32>() - 1.5).abs() < 1e-6);
-        assert!((map["blocks.0.attn.norm_q.weight"].item::<f32>() - 0.0).abs() < 1e-6);
-        // Matmul + meta copied verbatim (same key).
-        assert!(map.contains_key("blocks.0.attn.to_q.weight"));
-        assert!(map.contains_key("meta.inject_offset"));
-        assert_eq!(map.len(), 4);
     }
 
     /// A zero residual (step 0, zero-init `proj_out`) survives the clamp as zero — the identity that

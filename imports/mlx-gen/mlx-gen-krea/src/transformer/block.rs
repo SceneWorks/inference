@@ -39,6 +39,20 @@ pub struct RmsScale {
 
 impl RmsScale {
     pub fn from_weights(w: &Weights, key: &str, eps: f32) -> Result<Self> {
+        // The base snapshot stores the raw `scale` (centered at 0) under `*.weight`; we fold the
+        // reference `+1` here. The Krea pose-control overlay (sc-8465) instead stores the norm scale
+        // PRE-FOLDED as `*.weight_p1` (= `scale + 1`, candle-gen's on-disk convention) — accept that
+        // verbatim so the control branch loads the candle overlay DIRECTLY, with no offline convert
+        // step. The base path is unchanged: a base snapshot has no `*.weight_p1`, so it always takes the
+        // raw `*.weight` + fold branch below.
+        if let Some(stem) = key.strip_suffix(".weight") {
+            if let Some(folded) = w.get(&format!("{stem}.weight_p1")) {
+                return Ok(Self {
+                    weight: folded.as_dtype(Dtype::Float32)?,
+                    eps,
+                });
+            }
+        }
         let scale = w.require(key)?.as_dtype(Dtype::Float32)?;
         Ok(Self {
             weight: plus1(&scale)?,
@@ -639,5 +653,28 @@ mod tests {
     #[test]
     fn gated_attention_rejects_unknown_leaf() {
         assert!(gated().adaptable_mut(&["nope"]).is_none());
+    }
+
+    /// sc-8465: `RmsScale::from_weights` accepts EITHER the base snapshot's raw `*.weight` (folded `+1`
+    /// at load) OR the Krea control overlay's pre-folded `*.weight_p1` (`= scale + 1`, used verbatim), so
+    /// the pose branch loads the candle overlay directly. Both must yield the SAME effective weight, and
+    /// the pre-folded variant must win only when the raw one is absent (base loading stays unchanged).
+    #[test]
+    fn rms_scale_accepts_raw_weight_or_prefolded_weight_p1() {
+        // raw scale [1.5, -0.5] under `*.weight` → effective weight = scale + 1 = [2.5, 0.5].
+        let mut raw = Weights::empty();
+        raw.insert("n.weight", Array::from_slice(&[1.5f32, -0.5], &[2]));
+        let from_raw = RmsScale::from_weights(&raw, "n.weight", 1e-5).unwrap();
+
+        // pre-folded [2.5, 0.5] under `*.weight_p1` → used verbatim (already scale + 1).
+        let mut folded = Weights::empty();
+        folded.insert("n.weight_p1", Array::from_slice(&[2.5f32, 0.5], &[2]));
+        let from_folded = RmsScale::from_weights(&folded, "n.weight", 1e-5).unwrap();
+
+        assert_eq!(from_raw.weight.as_slice::<f32>(), &[2.5f32, 0.5]);
+        assert_eq!(from_folded.weight.as_slice::<f32>(), &[2.5f32, 0.5]);
+
+        // Missing both → the canonical MissingTensor error on the raw key (not a silent `_p1` miss).
+        assert!(RmsScale::from_weights(&Weights::empty(), "n.weight", 1e-5).is_err());
     }
 }
