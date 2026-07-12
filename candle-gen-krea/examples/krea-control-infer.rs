@@ -125,10 +125,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Frozen base DiT (bf16, composable — the train-time forward) + optional branch.
+    // Frozen base DiT (composable — the train-time forward) + optional branch. Inference load keeps a
+    // packed q4/q8 base packed in VRAM (dequant-on-forward); identical on a dense bf16 tier (sc-11727).
     let cfg = Krea2Config::from_snapshot(&a.snapshot)?;
     let dit_w = Weights::from_dir(&a.snapshot.join("transformer"), &device, DType::BF16)?;
-    let dit = KreaTrainDit::load(&dit_w, &cfg)?;
+    let dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
     let branch = match (&a.ckpt, use_branch) {
         (Some(p), true) => {
             let mut b = ControlBranch::from_checkpoint(p, &cfg, &device)?;
