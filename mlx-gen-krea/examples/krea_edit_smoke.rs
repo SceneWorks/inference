@@ -8,7 +8,9 @@
 //! (in-context VAE tokens + Qwen3-VL grounding). This is a MANUAL on-Metal validation (a 12.9B model),
 //! NOT a CI test. Paths default to the local HF cache; override via env (`KREA_SNAPSHOT`,
 //! `KREA_EDIT_LORA`, `KREA_EDIT_SOURCE`, `KREA_EDIT_INSTRUCTION`, `KREA_EDIT_OUT`, `KREA_EDIT_STEPS`,
-//! `KREA_EDIT_GUIDANCE`).
+//! `KREA_EDIT_GUIDANCE`). Two-reference: set `KREA_EDIT_SOURCE_B` (scene = SOURCE, person = SOURCE_B) →
+//! a `Conditioning::MultiReference`. R5 ablation: `KREA_EDIT_LORA=none` loads WITHOUT the identity LoRA
+//! (dual conditioning present but untrained/inert) — used for the epic-10871 P4.2 dual-vs-inert delta.
 //!
 //! Run: `cargo run --release --example krea_edit_smoke -p mlx-gen-krea`
 
@@ -70,11 +72,25 @@ fn main() {
 
     // Build the LoadSpec the way the worker does: snapshot dir + the edit LoRA as an adapter, then load
     // the `krea_2_edit` generator (the production Generator seam, not the direct pipeline method).
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(vec![
-        AdapterSpec::new(PathBuf::from(&lora), 1.0, AdapterKind::Lora),
-    ]);
+    // `KREA_EDIT_LORA=none` (or empty) → load WITHOUT the identity LoRA: the R5 ablation. The engine
+    // still runs the full dual conditioning (VAE in-context tokens + Qwen3-VL grounding), but with the
+    // conditioning inert the base is off-distribution — what the worker R5 gate blocks (epic 10871 P4.2).
+    let base = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    let no_lora = lora.trim().is_empty() || lora.trim().eq_ignore_ascii_case("none");
+    let spec = if no_lora {
+        eprintln!(
+            "[smoke] NO edit LoRA (R5 ablation — dual conditioning present but untrained/inert)"
+        );
+        base
+    } else {
+        eprintln!("[smoke] edit LoRA {lora}");
+        base.with_adapters(vec![AdapterSpec::new(
+            PathBuf::from(&lora),
+            1.0,
+            AdapterKind::Lora,
+        )])
+    };
     eprintln!("[smoke] loading krea_2_edit generator from {snapshot}");
-    eprintln!("[smoke] edit LoRA {lora}");
     let generator = load_edit(&spec).expect("load krea_2_edit generator");
 
     let src = load_rgb(&source);
