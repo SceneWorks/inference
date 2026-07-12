@@ -751,17 +751,174 @@ fn fold_conv_lora_file(
     Ok(())
 }
 
-/// The single "adapted nothing" guard for the packed path (sc-11103): a non-empty spec set that installed
-/// **no** additive residual AND folded **no** conv delta is a format / prefix misconfiguration — fail
-/// loudly rather than render an unadapted image (the packed twin of [`merge_adapters`]' zero-match guard).
-pub(crate) fn guard_packed_matched(specs_len: usize, applied_total: usize) -> Result<()> {
+/// Build the kohya `flattened → dotted` table from a UNet weight **file** without loading tensor data
+/// (sc-11682) — reads only the safetensors header (names + shapes) via a memory map, so the dense
+/// additive lanes can resolve community `lora_unet_<flat>` keys against an **mmap** base without first
+/// materializing the whole UNet in a host `HashMap` (which is the un-evictable state this avoids).
+pub(crate) fn build_sdxl_kohya_table_from_file(
+    file: &std::path::Path,
+) -> Result<BTreeMap<String, String>> {
+    // SAFETY: read-only, process-owned weight file; the map is dropped at the end of this function and
+    // only its header (tensor names + shapes) is read — no tensor data is dereferenced.
+    let st = unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(file)? };
+    let mut table = BTreeMap::new();
+    for (name, view) in st.tensors() {
+        if let Some(dotted) = name.strip_suffix(".weight") {
+            let rank = view.shape().len();
+            if rank == 2 || rank == 4 {
+                table.insert(dotted.replace('.', "_"), dotted.to_string());
+            }
+        }
+    }
+    Ok(table)
+}
+
+/// A resolved conv-LoRA residual pending attachment: `down` `[rank, in, kH, kW]`, `up` `[out, rank, 1,
+/// 1]`, `scale` the FULL `(alpha/rank)·strength` baked in (the conv `Conv2d` residual carries no
+/// separate alpha/rank). Read on CPU; moved to the UNet device at push.
+struct PendingConv {
+    down: Tensor,
+    up: Tensor,
+    scale: f64,
+}
+
+/// Resolve one LoRA file's **4-D conv** `(down, up)` pairs into per-path [`PendingConv`] with the full
+/// `(alpha/rank)·scale` baked (sc-11682) — the additive twin of [`fold_conv_lora_file`], producing
+/// UNMERGED factors instead of a folded delta. 2-D Linear pairs are the additive-Linear path's job
+/// ([`install_additive`]).
+fn resolve_conv_lora_file(
+    af: &AdapterFile,
+    scale: f32,
+    table: &BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, Vec<PendingConv>>,
+    skipped_keys: &mut usize,
+) -> Result<()> {
+    let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
+    for (key, t) in &af.tensors {
+        match classify_lora_key(key, table) {
+            Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
+            Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
+            Some((path, Role::Alpha)) => {
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+            }
+            None => {} // out-of-surface keys are counted by the Linear resolver, not here
+        }
+    }
+    let cfg = LoraAdapterMeta::from_file_metadata(&af.meta);
+    for (path, t) in triples {
+        let (Some(down), Some(up)) = (t.down, t.up) else {
+            continue; // half-pair (counted by the Linear resolver)
+        };
+        // Conv-only: 2-D Linear pairs go through `install_additive`.
+        if down.dims().len() != 4 || up.dims().len() != 4 {
+            continue;
+        }
+        let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
+        let rank = cfg_rank.unwrap_or(down.dims()[0] as f32) as f64;
+        if rank == 0.0 {
+            *skipped_keys += 1;
+            continue;
+        }
+        let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank as f32) as f64;
+        let full = (alpha / rank) * scale as f64;
+        pending.entry(path).or_default().push(PendingConv {
+            down: down.to_dtype(DType::F32)?.contiguous()?,
+            up: up.to_dtype(DType::F32)?.contiguous()?,
+            scale: full,
+        });
+    }
+    Ok(())
+}
+
+/// Install `specs`' **conv-layer** LoRA as forward-time additive residuals on the UNet's convolutions
+/// (sc-11682): resolve the 4-D `(down, up)` pairs, then walk the convs once
+/// ([`crate::unet::UNet2DConditionModel::visit_conv_lora_mut`]) pushing each onto its matched conv — the
+/// base conv weight is never folded, so a dense mmap tier stays evictable. `table` resolves community
+/// `lora_unet_<flat>` keys. Conv-LoRA is LoRA-only (LoKr/LoHa are Linear-only), so LoKr specs and
+/// LoKr/LoHa-keyed files contribute nothing here. Like [`install_additive`], no zero-match guard — the
+/// caller combines the Linear + conv `applied` for the single "adapted nothing" check.
+pub(crate) fn install_additive_conv(
+    unet: &mut crate::unet::UNet2DConditionModel,
+    specs: &[AdapterSpec],
+    table: &BTreeMap<String, String>,
+    device: &candle_gen::candle_core::Device,
+) -> Result<AdditiveReport> {
+    let mut pending: BTreeMap<String, Vec<PendingConv>> = BTreeMap::new();
+    let mut report = AdditiveReport::default();
+    for spec in specs {
+        if spec.kind == AdapterKind::Lokr {
+            continue; // conv surface is LoRA-only
+        }
+        let af = read_adapter(&spec.path)?;
+        if af.declares_lokr()
+            || wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str))
+            || wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str))
+        {
+            continue; // Linear-only adapter forms — no conv surface
+        }
+        resolve_conv_lora_file(
+            &af,
+            spec.scale,
+            table,
+            &mut pending,
+            &mut report.skipped_keys,
+        )?;
+    }
+
+    let mut matched: HashSet<String> = HashSet::new();
+    let mut applied = 0usize;
+    let mut skipped_keys = 0usize;
+    unet.visit_conv_lora_mut(&mut |conv| {
+        if let Some(list) = pending.get(conv.path()) {
+            matched.insert(conv.path().to_string());
+            let wd = conv.weight_dims(); // [out, in, kH, kW]
+            for p in list {
+                let (d, u) = (p.down.dims(), p.up.dims());
+                let shape_ok = wd.len() == 4
+                    && d.len() == 4
+                    && u.len() == 4
+                    && d[1] == wd[1]
+                    && d[2] == wd[2]
+                    && d[3] == wd[3]
+                    && u[0] == wd[0]
+                    && u[1] == d[0]
+                    && u[2] == 1
+                    && u[3] == 1;
+                if !shape_ok {
+                    skipped_keys += 1;
+                    continue;
+                }
+                conv.push_additive_conv(
+                    p.down.to_device(device)?,
+                    p.up.to_device(device)?,
+                    p.scale,
+                );
+                applied += 1;
+            }
+        }
+        Ok(())
+    })?;
+    report.applied = applied;
+    report.skipped_keys += skipped_keys;
+    for path in pending.keys() {
+        if !matched.contains(path) {
+            report.skipped_targets.push(path.clone());
+        }
+    }
+    Ok(report)
+}
+
+/// The single "adapted nothing" guard for the additive adapter paths (sc-11103 packed / sc-11682 dense):
+/// a non-empty spec set that installed **no** Linear residual AND no conv residual (dense) / folded no
+/// conv (packed) is a format / prefix misconfiguration — fail loudly rather than render an unadapted
+/// image (the additive twin of [`merge_adapters`]' zero-match guard).
+pub(crate) fn guard_additive_matched(specs_len: usize, applied_total: usize) -> Result<()> {
     if specs_len > 0 && applied_total == 0 {
         return Err(no_target_matched(
-            "sdxl (packed)",
+            "sdxl (additive)",
             "expected PEFT `base_model.model.unet.<path>.lora_A/B.weight` or kohya \
              `lora_unet_<flat>.lora_down/up.weight` over the UNet's attention / FF / proj Linears (LoRA \
-             or PEFT LoKr, applied additively on the packed base), or a conv-layer LoRA (folded into the \
-             dense convs)",
+             or PEFT LoKr) or its conv layers (conv LoRA) — applied additively",
             specs_len,
         ));
     }
@@ -1634,14 +1791,14 @@ mod tests {
     /// **The combined "adapted nothing" guard.** A non-empty spec set that installed no residual AND
     /// folded no conv errors; zero specs (or any nonzero total) is fine.
     #[test]
-    fn guard_packed_matched_errors_only_on_zero_total() {
+    fn guard_additive_matched_errors_only_on_zero_total() {
         assert!(
-            guard_packed_matched(0, 0).is_ok(),
+            guard_additive_matched(0, 0).is_ok(),
             "empty specs never error"
         );
-        assert!(guard_packed_matched(2, 3).is_ok(), "any match is fine");
+        assert!(guard_additive_matched(2, 3).is_ok(), "any match is fine");
         assert!(
-            guard_packed_matched(1, 0).is_err(),
+            guard_additive_matched(1, 0).is_err(),
             "a spec that adapted nothing must fail loudly"
         );
     }
@@ -1732,6 +1889,56 @@ mod tests {
         assert!(
             max_abs_diff(&additive.forward(&x).unwrap(), &folded.forward(&x).unwrap()) < 1e-4,
             "resolved additive != folded"
+        );
+    }
+
+    /// **Conv resolver (sc-11682).** [`resolve_conv_lora_file`] produces UNMERGED conv factors — `down`
+    /// `[rank, in, kH, kW]`, `up` `[out, rank, 1, 1]`, with the FULL `(alpha/rank)·scale` baked — for the
+    /// 4-D conv surface, and skips 2-D Linear pairs (those go through [`install_additive`]). The
+    /// conv-forward parity of those factors against the fold is pinned in `unet::conv`'s tests.
+    #[test]
+    fn resolve_conv_lora_produces_unmerged_factors() {
+        let dev = Device::Cpu;
+        let (out_c, in_c, rank) = (8usize, 4usize, 2usize);
+        let path = "conv_in";
+        let down = Tensor::randn(0f32, 1f32, (rank, in_c, 3, 3), &dev).unwrap();
+        let up = Tensor::randn(0f32, 1f32, (out_c, rank, 1, 1), &dev).unwrap();
+        let (alpha, scale) = (4.0f32, 0.5f32); // (alpha/rank)·scale = (4/2)·0.5 = 1.0
+                                               // Include a 2-D Linear pair that must be ignored by the conv resolver.
+        let af = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{path}.lora_A.weight"), down.clone()),
+                (format!("{path}.lora_B.weight"), up.clone()),
+                (
+                    format!("{path}.alpha"),
+                    Tensor::from_vec(vec![alpha], (1,), &dev).unwrap(),
+                ),
+                (
+                    "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_A.weight"
+                        .to_string(),
+                    Tensor::randn(0f32, 1f32, (rank, 16), &dev).unwrap(),
+                ),
+                (
+                    "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_B.weight"
+                        .to_string(),
+                    Tensor::randn(0f32, 1f32, (16, rank), &dev).unwrap(),
+                ),
+            ]),
+            meta: HashMap::new(),
+        };
+        let mut pending: BTreeMap<String, Vec<PendingConv>> = BTreeMap::new();
+        let mut skipped = 0usize;
+        resolve_conv_lora_file(&af, scale, &BTreeMap::new(), &mut pending, &mut skipped).unwrap();
+        assert!(
+            !pending.contains_key("down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q"),
+            "the 2-D Linear pair must not be resolved as a conv"
+        );
+        let p = &pending[path][0];
+        assert_eq!(p.down.dims(), &[rank, in_c, 3, 3]);
+        assert_eq!(p.up.dims(), &[out_c, rank, 1, 1]);
+        assert!(
+            (p.scale - 1.0).abs() < 1e-6,
+            "full scale (alpha/rank)·user = 1.0"
         );
     }
 }

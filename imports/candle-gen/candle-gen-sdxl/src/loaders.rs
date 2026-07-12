@@ -81,9 +81,11 @@ fn instantid_unet_file(root: &Path) -> Result<PathBuf> {
 ///   survives — and any conv LoRA **folds** into the dense convs
 ///   ([`crate::adapters::fold_conv_adapters`]) before the UNet body + `add_embedding` head are built. The
 ///   additive residual equals the dense fold to f32 tolerance.
-/// - **Dense snapshot** (`None`): load the `unet/` `.fp16` tensors onto CPU, fold the deltas in (f32
-///   math), then build the UNet + `add_embedding` head from the merged map — byte-unchanged pre-sc-11176
-///   dense behavior.
+/// - **Dense snapshot** (`None`, sc-11682): keep the `.fp16` base a **pristine mmap** (evictable —
+///   epic 10765) and apply the adapter **additively** on both the Linear
+///   ([`crate::adapters::install_additive`]) and conv ([`crate::adapters::install_additive_conv`])
+///   surfaces, instead of folding into a host `from_tensors` map. Additive equals the old fold to f32
+///   tolerance (~1-ULP golden shift).
 ///
 /// An empty `adapters` slice applies nothing; a non-empty slice that matches no target errors (it never
 /// renders an unadapted image silently). The caller installs the IP-Adapter K/V pairs on the returned
@@ -107,16 +109,21 @@ pub fn load_instantid_unet_with_adapters(
             let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
                 .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
             let add = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
-            crate::adapters::guard_packed_matched(adapters.len(), conv.merged + add.applied)?;
+            crate::adapters::guard_additive_matched(adapters.len(), conv.merged + add.applied)?;
             Ok(unet)
         }
         None => {
+            // sc-11682: keep the bf16 base a pristine mmap (evictable — epic 10765) and apply the
+            // adapter additively (Linear + conv residuals) instead of folding into a host `from_tensors`
+            // map. The `add_embedding` head shares the same mmap VarBuilder.
             let unet_file = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-            let mut tensors = candle_core::safetensors::load(&unet_file, &Device::Cpu)?;
-            crate::adapters::merge_adapters(&mut tensors, adapters)?;
-            let vs = VarBuilder::from_tensors(tensors, dtype, device);
-            let unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
+            let table = crate::adapters::build_sdxl_kohya_table_from_file(&unet_file)?;
+            let vs = candle_gen::mmap_var_builder(&[unet_file], dtype, device)?;
+            let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
                 .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+            let lin = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
+            let conv = crate::adapters::install_additive_conv(&mut unet, adapters, &table, device)?;
+            crate::adapters::guard_additive_matched(adapters.len(), lin.applied + conv.applied)?;
             Ok(unet)
         }
     }
