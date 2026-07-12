@@ -74,14 +74,14 @@ use candle_gen_pid::{PidDecoder, PidEngine};
 /// The PiD backbone (latent-space) tag for FLUX (epic 7840 / sc-7853): the `flux` 16-ch latent-space
 /// student (4× SR). Shared by Boogu / Chroma / Z-Image, which reuse this FLUX.1 VAE latent space.
 const PID_BACKBONE: &str = "flux";
+use crate::vae::diffusers::{AutoEncoderKL, VaeConfig};
+use crate::vae::native::{AutoEncoder, Config as AeConfig};
 use candle_transformers::models::clip::text_model::{
     Activation as ClipActivation, ClipTextConfig, ClipTextTransformer,
 };
-use candle_transformers::models::flux::autoencoder::{AutoEncoder, Config as AeConfig};
 use candle_transformers::models::flux::model::Config as FluxConfig;
 use candle_transformers::models::flux::sampling::{get_schedule, unpack, State};
 use candle_transformers::models::t5::T5EncoderModel;
-use candle_transformers::models::z_image::vae::{AutoEncoderKL, VaeConfig};
 use tokenizers::Tokenizer;
 
 use crate::ip_dit::IpFlux;
@@ -1004,8 +1004,8 @@ fn to_image(decoded: &Tensor) -> Result<Image> {
 }
 
 /// The diffusers `AutoEncoderKL` config for the FLUX packed VAE — identical to z-image's (16 latent
-/// channels, `[128, 256, 512, 512]`, layers 2, scaling 0.3611 / shift 0.1159, norm groups 32), so the
-/// shared `candle_transformers::models::z_image::vae` decoder loads the FLUX packed VAE directly.
+/// channels, `[128, 256, 512, 512]`, layers 2, scaling 0.3611 / shift 0.1159, norm groups 32). The
+/// live path now decodes the FLUX packed VAE through the vendored `crate::vae::diffusers::AutoEncoderKL`.
 fn flux_vae_config() -> VaeConfig {
     VaeConfig::z_image()
 }
