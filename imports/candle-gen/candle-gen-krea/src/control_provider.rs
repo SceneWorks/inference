@@ -125,7 +125,10 @@ impl Krea2Control {
 
         // Frozen base DiT (bf16, composable — the train-time forward the branch was trained against).
         let dit_w = Weights::from_dir(&paths.root.join("transformer"), &device, DType::BF16)?;
-        let mut dit = KreaTrainDit::load(&dit_w, &cfg)?;
+        // Control INFERENCE: keep a packed q4/q8 base packed in VRAM (dequant-on-forward) so a small-card
+        // user gets the footprint they installed the tier for, not a dense-bf16 balloon (sc-11727). On a
+        // dense/bf16 tier this is identical to `load`.
+        let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
         drop(dit_w);
         // User LoRA/LoKr adapters ride additively on the frozen base DiT (sc-11720): the base stays an
         // unmutated mmap and each adapter is pushed as a forward-time residual, so pose lock (the control
