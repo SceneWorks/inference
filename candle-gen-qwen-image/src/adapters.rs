@@ -8,11 +8,18 @@
 //! over the per-block joint-attention + stream-MLP linears, merged at scale 1.0 so the 4-step
 //! lightning schedule produces a clean edit. General Qwen-family LoRA/LoKr ride the same path.
 //!
-//! **Merge, don't residual** (same rationale as the SDXL merge): the flow-match Euler denoise is
-//! precision-sensitive, so folding the delta into the dense weight (`W += δ`) reproduces the merged
-//! forward `(W+δ)·x` exactly, with no per-step residual op. The delta is reconstructed with the same
-//! f32 math the trainer's forward uses ([`reconstruct_lora_delta`] / [`reconstruct_lokr_delta`] /
-//! [`reconstruct_loha_delta`]), so a candle-trained adapter round-trips.
+//! **Two routes — additive residual is the default, fold is the fallback.** Originally this module only
+//! folded (`W += δ`, "merge, don't residual", the SDXL-merge rationale — the flow-match Euler denoise is
+//! precision-sensitive, so a merged `(W+δ)·x` is bit-exact vs a residual's ~1 ULP). sc-11091 added a
+//! forward-time additive residual ([`install_additive`], `y = base(x) + Σ scale·((x·A)·B)`) so a LoRA/LoKr
+//! applies without dequantizing a packed q4/q8 base; sc-11684 makes that residual the DEFAULT on a DENSE
+//! base too — the base loads via the mmap fast path (never folded) so the adapted DiT keeps the base's
+//! footprint and stays streamable under sequential residency. The ~1-ULP additive/fold difference is
+//! accepted uniformly across tiers. The **fold** ([`merge_adapters`]) survives ONLY as the dense fallback
+//! for adapter types with no deferred form (**LoHa**, untagged LyCORIS LoKr); the router
+//! [`adapters_additive_capable`] picks the route. Both paths reconstruct with the same f32 trainer math
+//! ([`reconstruct_lora_delta`] / [`reconstruct_lokr_delta`] / [`reconstruct_loha_delta`]) so a
+//! candle-trained adapter round-trips, and additive == folded to f32 tolerance (`resolve_lora_matches_fold_on_dense`).
 //!
 //! **Merge at the safetensors-key level.** The candle MMDiT reads the diffusers transformer keys 1:1
 //! (`transformer_blocks.{i}.attn.to_q.weight`, `…img_mlp.net.0.proj.weight`, …), so a LoRA's
@@ -262,6 +269,31 @@ fn merge_loha_thirdparty(
 /// same `(file, spec)` (sc-11188 / F-086).
 fn is_untagged_lycoris_lokr(af: &AdapterFile) -> bool {
     !af.declares_lokr() && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str))
+}
+
+/// Whether every adapter in `specs` can apply via the forward-time additive residual
+/// ([`install_additive`]) — i.e. each is a plain **LoRA** or a PEFT-stamped **(structured) LoKr**, both of
+/// which have an allocation-free deferred form (`(x·A)·B` / the Kronecker vec-trick). Returns `false` if
+/// ANY adapter is a **LoHa** (Hadamard — no deferred form) or an **untagged third-party LyCORIS LoKr**
+/// (per-module scale this additive resolver doesn't thread); those have to take the dense `merge_adapters`
+/// fold instead. Read purely from each file's own keys/metadata (never `spec.kind`), matching
+/// [`install_additive`]'s own rejection surface so the router and the installer can't diverge on the same
+/// `(file, spec)` (sc-11684 dense routing; sc-11188 / F-086 authoritative-metadata stance).
+pub(crate) fn adapters_additive_capable(specs: &[AdapterSpec]) -> Result<bool> {
+    for spec in specs {
+        let af = read_adapter(&spec.path)?;
+        if !adapter_file_additive_capable(&af) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The per-file half of [`adapters_additive_capable`], split out so the LoHa / untagged-LyCORIS-LoKr
+/// decision is unit-testable on an in-memory [`AdapterFile`] without a `read_adapter` disk round-trip.
+fn adapter_file_additive_capable(af: &AdapterFile) -> bool {
+    !wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str))
+        && !is_untagged_lycoris_lokr(af)
 }
 
 /// Fold every adapter spec in `specs` into the base MMDiT tensor `map` (CPU, native dtype) at each
@@ -704,6 +736,67 @@ mod tests {
             meta: HashMap::new(),
         };
         assert!(!is_untagged_lycoris_lokr(&lora));
+    }
+
+    /// sc-11684 dense routing: `adapter_file_additive_capable` (the per-file half of
+    /// [`adapters_additive_capable`]) is `true` for a plain LoRA and a PEFT-stamped LoKr (both have a
+    /// deferred additive form), and `false` for a LoHa or an untagged third-party LyCORIS LoKr — so on a
+    /// DENSE base those two fall through to the fold while everything else takes the streamable additive
+    /// route. Mirrors `install_additive`'s own rejection surface so the router and installer agree.
+    #[test]
+    fn additive_capable_true_for_lora_lokr_false_for_loha_untagged() {
+        let path = "transformer_blocks.0.attn.to_q";
+        let lora = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{path}.lora_down.weight"), t2(&[1.0, 0.0], 1, 2)),
+                (format!("{path}.lora_up.weight"), t2(&[1.0, 0.0], 2, 1)),
+            ]),
+            meta: HashMap::new(),
+        };
+        assert!(
+            adapter_file_additive_capable(&lora),
+            "plain LoRA → additive"
+        );
+
+        let tagged_lokr = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{path}.lokr_w1"), t2(&[1.0, 0.0, 0.0, 1.0], 2, 2)),
+                (format!("{path}.lokr_w2"), t2(&[0.5, 0.0, 0.0, 0.5], 2, 2)),
+            ]),
+            meta: HashMap::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "2".to_string()),
+                ("alpha".to_string(), "2".to_string()),
+            ]),
+        };
+        assert!(
+            adapter_file_additive_capable(&tagged_lokr),
+            "PEFT-stamped LoKr → additive (structured Kronecker)"
+        );
+
+        let loha = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{path}.hada_w1_a"), t2(&[1.0, 0.0], 1, 2)),
+                (format!("{path}.hada_w1_b"), t2(&[1.0, 0.0], 1, 2)),
+            ]),
+            meta: HashMap::new(),
+        };
+        assert!(
+            !adapter_file_additive_capable(&loha),
+            "LoHa has no deferred form → dense fold fallback"
+        );
+
+        let untagged_lokr = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{path}.lokr_w1"), t2(&[1.0, 0.0, 0.0, 1.0], 2, 2)),
+                (format!("{path}.lokr_w2"), t2(&[0.5, 0.0, 0.0, 0.5], 2, 2)),
+            ]),
+            meta: HashMap::new(), // no networkType stamp
+        };
+        assert!(
+            !adapter_file_additive_capable(&untagged_lokr),
+            "untagged LyCORIS LoKr → dense fold fallback"
+        );
     }
 
     /// The lightx2v Lightning shape: bare dotted path + `lora_down`/`lora_up` + per-module `.alpha`.
