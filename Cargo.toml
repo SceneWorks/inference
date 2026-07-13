@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = []
+exclude = ["imports/*"]
+
+# Phase 1 deliberately excludes the byte-preserving source imports. Phase 2 moves
+# packages into their final ownership layout and converts internal Git dependencies
+# to workspace paths before adding them as members.
+
