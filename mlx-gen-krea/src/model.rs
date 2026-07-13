@@ -48,7 +48,9 @@ pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
 const MAX_COUNT: u32 = 8;
 /// Resolution bounds (W/H). Turbo renders up to 2048²; the catalog/worker gate the UI options tighter.
 const RES_MIN: u32 = 256;
-const RES_MAX: u32 = 2048;
+/// `pub(crate)` so the pose-control lane's load-time branch-quant gate (sc-11748) can size its
+/// worst-case-resolution estimate against the largest render the model can serve.
+pub(crate) const RES_MAX: u32 = 2048;
 /// patch_size(2)·vae_downsample(8) = 16 — patchify requires W/H divisible by this.
 const RES_MULTIPLE: u32 = 16;
 
@@ -372,6 +374,27 @@ pub(crate) fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Re
         }
         None => Ok(Some(q.bits())),
     }
+}
+
+/// The base DiT's **effective** quant bits for the pose-control branch gate (sc-11748): the tier the base
+/// actually runs at, whether packed AT LOAD (a dense snapshot + `spec.quantize`) or ALREADY packed on
+/// disk (a Q4/Q8 turnkey). Distinct from [`load_time_quant_bits`], which returns `None` for a pre-packed
+/// turnkey (there is nothing to quantize *at load*) — but a pre-packed base still has a tier the pose
+/// branch should match. `None` ⇒ a dense bf16 base (no tier). Surfaces the same packed-vs-requested
+/// mismatch error as [`load_time_quant_bits`].
+pub(crate) fn effective_base_quant_bits(
+    spec: &LoadSpec,
+    root: &Path,
+    id: &str,
+) -> Result<Option<i32>> {
+    if let Some(packed) = packed_quant_bits(root) {
+        // Pre-packed turnkey: run load_time_quant_bits for its packed-vs-requested mismatch guard (e.g. a
+        // Q4 request over a Q8 turnkey), then report the on-disk tier (load_time_quant_bits itself
+        // returns None here).
+        load_time_quant_bits(spec, root, id)?;
+        return Ok(Some(packed));
+    }
+    load_time_quant_bits(spec, root, id)
 }
 
 /// Load the Krea text phase (tokenizer + Qwen3-VL-4B condition encoder + vision tower) — the component

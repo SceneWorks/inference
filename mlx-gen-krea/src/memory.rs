@@ -267,6 +267,59 @@ pub fn plan_control_adaptation(safe_gib: f64, inputs: ControlLaneInputs<'_>) -> 
     })
 }
 
+/// Map a base-DiT quant width to the [`Quant`] tier the pose branch matches (`4 → Q4`, `8 → Q8`); any
+/// other width has no tier (the branch stays bf16).
+fn tier_from_bits(bits: i32) -> Option<Quant> {
+    match bits {
+        4 => Some(Quant::Q4),
+        8 => Some(Quant::Q8),
+        _ => None,
+    }
+}
+
+/// Decide whether to pack the pose control branch to the base tier at LOAD time (sc-11748) — the
+/// branch-quant lever's mechanism half. The branch is a resident weight that cannot be re-packed
+/// mid-render, so the decision must hold for the largest render the loaded model can serve: this runs
+/// the shared [`plan_control_adaptation`] policy at the lane's worst-case resolution (`max_size`²) and
+/// returns [`MemoryPlan::quantize_branch`].
+///
+/// - `base_bits` `None` (dense bf16 base) or a non-Q4/Q8 width ⇒ `false`: there is no base tier for the
+///   branch to match (the branch only ever packs to the base's tier).
+/// - A machine with headroom ⇒ `false`: the branch stays bf16 (no dequant-on-forward) — the sc-11750
+///   "large-memory Mac pays zero overhead" guarantee.
+/// - A constrained Mac whose projected footprint won't fit even after the cheaper residency /
+///   decode-tiling levers ⇒ `true`: pack the branch to the base tier.
+///
+/// `resolution_scales` is deliberately empty — resolution reduction is a separate lever (sc-11749); this
+/// gate stands on residency + decode-tiling + branch-quant, so it never assumes a resolution reduction
+/// this call would not apply. `safe_gib` is injected ([`mlx_gen::memory::safe_budget_gib`] at the call
+/// site) so the decision is unit-testable without a device.
+pub fn should_quantize_control_branch(
+    safe_gib: f64,
+    cfg: &Krea2Config,
+    branch_blocks: usize,
+    base_bits: Option<i32>,
+    max_size: u32,
+) -> bool {
+    let Some(base_tier) = base_bits.and_then(tier_from_bits) else {
+        return false;
+    };
+    plan_control_adaptation(
+        safe_gib,
+        ControlLaneInputs {
+            cfg,
+            branch_blocks,
+            base_tier: Some(base_tier),
+            width: max_size,
+            height: max_size,
+            supports_sequential: true,
+            allow_branch_quant: true,
+            resolution_scales: &[],
+        },
+    )
+    .quantize_branch
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +444,52 @@ mod tests {
             "must not drop res prematurely: {plan:?}"
         );
         assert!(!plan.engaged.contains(&Lever::ResolutionReduction));
+    }
+
+    // ── sc-11748: the load-time branch-quant gate (`should_quantize_control_branch`). ──────────────
+
+    /// A dense bf16 base (or a non-Q4/Q8 width) never packs the branch — there is no base tier to match,
+    /// even under a starved budget.
+    #[test]
+    fn branch_quant_gate_dense_base_never_packs() {
+        let cfg = Krea2Config::turbo();
+        assert!(!should_quantize_control_branch(2.0, &cfg, 7, None, 1024));
+        assert!(!should_quantize_control_branch(
+            2.0,
+            &cfg,
+            7,
+            Some(16),
+            1024
+        ));
+    }
+
+    /// The sc-11750 hard requirement: a large-memory Mac keeps the branch bf16 even with a packed base,
+    /// at either tier and up to the worst-case resolution — no dequant-on-forward tax on a machine that
+    /// does not need it.
+    #[test]
+    fn branch_quant_gate_large_memory_keeps_bf16() {
+        let cfg = Krea2Config::turbo();
+        assert!(!should_quantize_control_branch(
+            100.0,
+            &cfg,
+            7,
+            Some(4),
+            2048
+        ));
+        assert!(!should_quantize_control_branch(
+            100.0,
+            &cfg,
+            7,
+            Some(8),
+            2048
+        ));
+    }
+
+    /// A constrained Mac whose worst-case footprint won't fit even after residency + decode tiling packs
+    /// the branch to the base tier (the deeper-escalation lever engages).
+    #[test]
+    fn branch_quant_gate_constrained_mac_packs() {
+        let cfg = Krea2Config::turbo();
+        assert!(should_quantize_control_branch(12.0, &cfg, 7, Some(4), 2048));
     }
 }
