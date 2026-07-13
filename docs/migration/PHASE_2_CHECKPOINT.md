@@ -72,3 +72,7 @@ relocation.
 2. Port CI into platform lanes that invoke the root workspace explicitly.
 3. Run all-package metadata/check coverage on the supported host matrix.
 4. Only then begin model-first provider relocation and compatibility shims.
+
+The first item is implemented by `scripts/check-workspace.py`; it asserts the
+member count, path-only internal edges, single workspace/lockfile, exact backend
+Git revisions, and intentional tokenizer split from Cargo metadata.

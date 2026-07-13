@@ -25,3 +25,9 @@ docs/              Migration maps, architecture, compatibility, and release reco
 
 See [`docs/migration/PHASE_2_CHECKPOINT.md`](docs/migration/PHASE_2_CHECKPOINT.md)
 for the normalization invariants and validation record.
+
+Validate the normalized graph with:
+
+```sh
+./scripts/check-workspace.py
+```
