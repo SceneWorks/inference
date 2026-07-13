@@ -106,7 +106,8 @@ pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
 pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 
 /// Registry id for the **image-edit** variant (epic 10871 / sc-11085). Kontext-style instruction edit
-/// over one or two source references (scene = image 1, person = image 2) on the undistilled full-CFG
+/// over one or two source references (image 1 (required) + image 2 (optional), either can be a person)
+/// on the undistilled full-CFG
 /// base. The engine (pipeline `render_edit` + edit components) landed via #416 but was unreachable
 /// through the `Generator` seam until this id was registered — the candle mirror of the mlx-gen #693
 /// `krea_2_edit` seam. Matches the worker `payload.model` + manifest `engine_id`.
@@ -227,7 +228,7 @@ impl Generator for KreaGenerator {
                 req.width, req.height
             )));
         }
-        // The Edit variant needs 1..=2 source references (scene, then person). The capability floor
+        // The Edit variant needs 1..=2 source references (image 1, then image 2). The capability floor
         // above (empty `conditioning` on Turbo/Raw) already rejects any Reference/MultiReference on the
         // txt2img ids; only `krea_2_edit` advertises them, so resolve + count-check here.
         if self.descriptor.id == KREA_2_EDIT_ID {
@@ -248,7 +249,7 @@ impl Generator for KreaGenerator {
         // (52-step, dynamic-mu, two forwards/step); Turbo = CFG-free distilled (8-step, one forward).
         // One generator struct, three render paths.
         let images = if self.descriptor.id == KREA_2_EDIT_ID {
-            // Extract the fixed-order source set (scene = image 1, person = image 2) from the request
+            // Extract the fixed-order source set (image 1, then image 2) from the request
             // conditioning, load the edit-only components lazily, and run the Kontext edit path.
             let references: Vec<Image> =
                 resolve_edit_references(req)?.into_iter().cloned().collect();
@@ -365,7 +366,7 @@ pub fn raw_descriptor() -> ModelDescriptor {
 /// guidance + a user negative prompt, packed quants, LoRA/LoKr (the edit LoRA merges through the shared
 /// [`build`] adapter path) — and additionally advertises the source-reference conditioning:
 /// [`ConditioningKind::Reference`] for a single source and [`ConditioningKind::MultiReference`] for two
-/// (scene = image 1, person = image 2; [`pipeline::MAX_EDIT_REFERENCES`]).
+/// (image 1, then image 2; [`pipeline::MAX_EDIT_REFERENCES`]).
 pub fn edit_descriptor() -> ModelDescriptor {
     let mut d = raw_descriptor();
     d.id = KREA_2_EDIT_ID;
@@ -387,7 +388,7 @@ fn img2img_reference(req: &GenerationRequest) -> Option<(&Image, Option<f32>)> {
     })
 }
 
-/// The image-edit source references, in fixed order (scene = image 1, person = image 2; sc-10878) —
+/// The image-edit source references, in fixed order (image 1, then image 2; sc-10878) —
 /// collected from both [`Conditioning::Reference`] (a single source) and [`Conditioning::MultiReference`]
 /// (two sources). At least one and at most [`pipeline::MAX_EDIT_REFERENCES`] is required; zero or more
 /// than the cap is an error. Borrows from `req.conditioning`; the generate path clones the resolved set
@@ -404,12 +405,12 @@ fn resolve_edit_references(req: &GenerationRequest) -> gen_core::Result<Vec<&Ima
     if refs.is_empty() {
         return Err(gen_core::Error::Msg(format!(
             "{KREA_2_EDIT_ID}: an instruction edit requires at least one source reference image \
-             (scene = image 1, person = image 2)"
+             (image 1, then image 2)"
         )));
     }
     if refs.len() > pipeline::MAX_EDIT_REFERENCES {
         return Err(gen_core::Error::Msg(format!(
-            "{KREA_2_EDIT_ID}: at most {} references are supported (scene = image 1, person = image \
+            "{KREA_2_EDIT_ID}: at most {} references are supported (image 1, then image \
              2); got {}",
             pipeline::MAX_EDIT_REFERENCES,
             refs.len()
@@ -925,7 +926,7 @@ mod tests {
 
     #[test]
     fn resolve_edit_references_single_and_pair_fixed_order() {
-        // A single `Reference` → one source (the scene).
+        // A single `Reference` → one source (image 1).
         let one = GenerationRequest {
             prompt: "make it autumn".into(),
             conditioning: vec![Conditioning::Reference {
@@ -938,9 +939,9 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!((refs[0].width, refs[0].height), (2, 2));
 
-        // A two-image `MultiReference` → scene (image 1) then person (image 2), order preserved.
+        // A two-image `MultiReference` → image 1 then image 2, order preserved.
         let two = GenerationRequest {
-            prompt: "put the person in the scene".into(),
+            prompt: "combine the two references into one image".into(),
             conditioning: vec![Conditioning::MultiReference {
                 images: vec![ref_image(4, 4), ref_image(6, 6)],
             }],
@@ -948,8 +949,8 @@ mod tests {
         };
         let refs = resolve_edit_references(&two).unwrap();
         assert_eq!(refs.len(), 2);
-        assert_eq!((refs[0].width, refs[0].height), (4, 4), "scene = image 1");
-        assert_eq!((refs[1].width, refs[1].height), (6, 6), "person = image 2");
+        assert_eq!((refs[0].width, refs[0].height), (4, 4), "image 1");
+        assert_eq!((refs[1].width, refs[1].height), (6, 6), "image 2");
     }
 
     #[test]
@@ -961,7 +962,7 @@ mod tests {
         };
         assert!(resolve_edit_references(&none).is_err());
 
-        // Three references → past the fixed-order cap (scene, person).
+        // Three references → past the fixed-order cap (image 1, image 2).
         let three = GenerationRequest {
             prompt: "x".into(),
             conditioning: vec![Conditioning::MultiReference {

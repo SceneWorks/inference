@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn mrope_positions_advance_across_two_images() {
         // Block 0 ↔ grid [1,4,4] (merged 2×2 = 4 tokens, t-step max(4,4)/2 = 2);
-        // block 1 ↔ grid [1,4,2] (merged 2×1 = 2 tokens, t-step max(4,2)/2 = 2). The scene-then-person
+        // block 1 ↔ grid [1,4,2] (merged 2×1 = 2 tokens, t-step max(4,2)/2 = 2). The image-1-then-image-2
         // fixed order (sc-10878) is exactly the grid order fed here.
         let ids = [9u32, 9, IMG, IMG, IMG, IMG, 9, IMG, IMG, 9];
         let grids = [[1, 4, 4], [1, 4, 2]];
