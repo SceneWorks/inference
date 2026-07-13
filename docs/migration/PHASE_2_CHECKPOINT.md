@@ -58,21 +58,38 @@ The following passed from the repository root:
 - contract/testkit `cargo check --locked`
 - Candle roots: `cargo check --locked -p candle-llm -p candle-gen`
 - MLX roots: `cargo check --locked -p mlx-llm -p mlx-gen`
+- all Candle packages: `cargo check --locked -p candle-llm -p 'candle-gen*'`
+- all MLX packages: `cargo check --locked -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*'`
+- all contract, Candle, and MLX package selectors pass Clippy with `-D warnings`
+- all default Candle package tests pass; weight/GPU-dependent cases remain ignored by their existing gates
+- all Candle packages check with `--features metal` on the local macOS host
 - contract/testkit library tests: 357 passed, 0 failed, 3 ignored
 - `git diff --check`
 
-This checkpoint validates the normalized dependency seams and representative
-backend roots. It does not claim all 67 provider packages or platform-specific
-Metal/CUDA feature matrices have been tested; those lanes follow before provider
-relocation.
+The all-Candle check exposed one additive contract delta between the imported
+MLX head and Candle's recorded gen-core pin: `Capabilities` had gained
+`supports_sequential_offload`. All 24 Candle descriptors now declare the bit;
+FLUX, FLUX.2, and Qwen Image advertise `true` because they already implement the
+sequential policy, while unwired providers explicitly advertise `false`.
+The same contract commit added `Progress::Loading`; Candle's exhaustive example
+callbacks now display that phase so every `--all-targets` build remains compatible.
+
+This checkpoint validates the normalized dependency seams and every default
+workspace package on the local macOS host. Platform-specific Metal/CUDA feature
+matrices remain separate lanes before provider relocation.
 
 ## Next migration slice
 
-1. Add root-owned graph-skew and workspace-structure gates.
-2. Port CI into platform lanes that invoke the root workspace explicitly.
-3. Run all-package metadata/check coverage on the supported host matrix.
+1. Run the root-owned graph-skew and workspace-structure gate in CI.
+2. Run the root CI platform lanes and repair any host-specific failures.
+3. Validate the manual CUDA lane on its self-hosted Windows runner.
 4. Only then begin model-first provider relocation and compatibility shims.
 
 The first item is implemented by `scripts/check-workspace.py`; it asserts the
 member count, path-only internal edges, single workspace/lockfile, exact backend
 Git revisions, and intentional tokenizer split from Cargo metadata.
+
+The root `.github/workflows/ci.yml` owns the consolidated CI definition. It
+partitions backend-neutral contracts, Candle CPU, macOS MLX/Metal, and manual
+self-hosted Windows/CUDA work so `--workspace` cannot pull an unsupported backend
+onto the wrong host. Historical member-local workflow files were removed.
