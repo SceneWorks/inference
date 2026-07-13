@@ -1,7 +1,7 @@
 //! gen-core contract conformance for the candle SenseNova-U1 provider (sc-4481, epic 3692 / sc-5486).
 //!
 //! Runs the backend-neutral [`gen_core_testkit`] suite — validate-honesty, progress monotonicity,
-//! typed cancellation, seed-determinism, registry round-trip — against the real candle generator. The
+//! typed cancellation, seed-determinism — against the real candle generator. The
 //! **seed-determinism** check is the regression guard for the deterministic CPU-seeded noise (sc-3673
 //! parity) the denoise loop relies on.
 //!

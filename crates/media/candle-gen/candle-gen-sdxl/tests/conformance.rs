@@ -1,7 +1,7 @@
 //! gen-core contract conformance for the candle SDXL provider (sc-4481, epic 3720).
 //!
 //! Runs the backend-neutral [`gen_core_testkit`] suite — validate-honesty, progress monotonicity,
-//! typed cancellation, seed-determinism, registry round-trip — against the real candle generator.
+//! typed cancellation, seed-determinism — against the real candle generator.
 //! This is the suite whose **seed-determinism** check is the regression guard for the spike's
 //! repro defect (sc-3498) that sc-3673 fixed.
 //!
@@ -65,8 +65,7 @@ fn sdxl_conformance() {
         ..Profile::cheap()
     };
 
-    // Resolve through THIS crate's `load` (its inventory registration is linked into the test binary,
-    // so the suite's registry round-trip check also passes). Panics with aggregated failures.
+    // Resolve through this provider's direct loader. Panics with aggregated failures.
     conformance(|| candle_gen_sdxl::load(&spec).unwrap(), &profile);
 }
 

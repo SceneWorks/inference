@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
 
 /// Basic non-degeneracy: the render is not solid-black / constant (a broken packed forward — NaN or
@@ -62,9 +62,11 @@ fn render_tier(env: &str, tag: &str) {
         eprintln!("SKIP {tag}: set {env} to the packed tier subdir");
         return;
     };
-    candle_gen_z_image::force_link();
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&dir)));
-    let gen = gen_core::registry::load("z_image_turbo", &spec).expect("z_image_turbo registered");
+    let gen = candle_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image_turbo", &spec)
+        .expect("z_image_turbo registered");
 
     let req = GenerationRequest {
         prompt: "a photo of a rusty robot holding a lit candle, cinematic lighting".into(),

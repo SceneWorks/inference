@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
 
 /// Basic non-degeneracy: the render is not solid-black / constant (a broken packed forward — NaN or
@@ -69,12 +69,14 @@ fn render_tier(env: &str, tag: &str) {
         eprintln!("SKIP {tag}: set {env} to the packed lens tier subdir (…/q4 or …/q8)");
         return;
     };
-    candle_gen_lens::force_link();
     // No `.with_quant(...)`: the packed tier is detected from the on-disk `.scales` siblings, so this
     // proves the DiT + encoder packed-load is quant-independent (a pure lens-mlx snapshot loads packed
     // end-to-end with no quant request).
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&dir)));
-    let gen = gen_core::registry::load("lens_turbo", &spec).expect("lens_turbo registered");
+    let gen = candle_gen_lens::provider_registry()
+        .unwrap()
+        .load("lens_turbo", &spec)
+        .expect("lens_turbo registered");
     eprintln!(
         "[{tag}] engine id={} backend={}",
         gen.descriptor().id,

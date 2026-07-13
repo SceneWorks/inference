@@ -39,9 +39,8 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, registry, AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest,
-    Image, LoadSpec, NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
 };
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::{merge_into_weights, Krea2Config};
@@ -109,16 +108,15 @@ fn run(
     grad_ckpt: bool,
 ) -> RunOut {
     let items = make_dataset(tmp);
-    // Reference the provider crate so its `inventory::submit!` trainer registration is linked in.
-    candle_gen_krea::force_link();
-
-    let mut trainer = gen_core::load_trainer(
-        "krea_2_raw",
-        &LoadSpec::new(WeightsSource::Dir(
-            snapshot().expect("KREA_RAW_DIR / KREA_TURBO_DIR"),
-        )),
-    )
-    .expect("krea_2_raw candle trainer should be registered");
+    let mut trainer = candle_gen_krea::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "krea_2_raw",
+            &LoadSpec::new(WeightsSource::Dir(
+                snapshot().expect("KREA_RAW_DIR / KREA_TURBO_DIR"),
+            )),
+        )
+        .expect("krea_2_raw candle trainer should be registered");
 
     let req = TrainingRequest {
         items,
@@ -315,12 +313,13 @@ fn krea_preview_full_resolution_no_oom() {
     }
     let tmp = std::env::temp_dir().join("krea_preview_1024");
     let items = make_dataset(&tmp);
-    candle_gen_krea::force_link();
-    let mut trainer = gen_core::load_trainer(
-        "krea_2_raw",
-        &LoadSpec::new(WeightsSource::Dir(snapshot().unwrap())),
-    )
-    .expect("krea_2_raw trainer registered");
+    let mut trainer = candle_gen_krea::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "krea_2_raw",
+            &LoadSpec::new(WeightsSource::Dir(snapshot().unwrap())),
+        )
+        .expect("krea_2_raw trainer registered");
     // Production-shaped: 1024² with gradient checkpointing (the 12B DiT forces it), 28 sample-steps.
     let mut cfg = config(NetworkType::Lora, 2, true);
     cfg.resolution = 1024;
@@ -370,12 +369,13 @@ fn krea_trainer_emits_preview_samples() {
     }
     let tmp = std::env::temp_dir().join("krea_trainer_e2e_samples");
     let items = make_dataset(&tmp);
-    candle_gen_krea::force_link();
-    let mut trainer = gen_core::load_trainer(
-        "krea_2_raw",
-        &LoadSpec::new(WeightsSource::Dir(snapshot().unwrap())),
-    )
-    .expect("krea_2_raw trainer registered");
+    let mut trainer = candle_gen_krea::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "krea_2_raw",
+            &LoadSpec::new(WeightsSource::Dir(snapshot().unwrap())),
+        )
+        .expect("krea_2_raw trainer registered");
 
     // 4 steps, render a preview every 2 steps over 2 prompts → 2 cadences × 2 prompts = 4 Sample events.
     let mut cfg = config(NetworkType::Lora, 4, false);
@@ -480,14 +480,15 @@ fn train_concept(
     out_dir: &Path,
     file_name: &str,
 ) -> PathBuf {
-    candle_gen_krea::force_link();
-    let mut trainer = gen_core::load_trainer(
-        "krea_2_raw",
-        &LoadSpec::new(WeightsSource::Dir(
-            snapshot().expect("KREA_RAW_DIR / KREA_TURBO_DIR"),
-        )),
-    )
-    .expect("krea_2_raw trainer registered");
+    let mut trainer = candle_gen_krea::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "krea_2_raw",
+            &LoadSpec::new(WeightsSource::Dir(
+                snapshot().expect("KREA_RAW_DIR / KREA_TURBO_DIR"),
+            )),
+        )
+        .expect("krea_2_raw trainer registered");
     let req = TrainingRequest {
         items,
         config: cfg,
@@ -516,9 +517,11 @@ fn train_concept(
 
 /// Render one 1024² image at `krea_2_turbo` with `adapters` merged into the DiT (the sc-7836 path).
 fn render_turbo(root: &Path, prompt: &str, adapters: Vec<AdapterSpec>) -> Image {
-    candle_gen_krea::force_link();
     let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_adapters(adapters);
-    let gen = registry::load("krea_2_turbo", &spec).expect("load krea_2_turbo");
+    let gen = candle_gen_krea::provider_registry()
+        .unwrap()
+        .load("krea_2_turbo", &spec)
+        .expect("load krea_2_turbo");
     let req = GenerationRequest {
         prompt: prompt.into(),
         width: 1024,

@@ -16,8 +16,7 @@ use std::time::Instant;
 
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
 use candle_gen::gen_core::{
-    registry, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec,
-    WeightsSource,
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::{merge_adapters, merge_into_weights, Krea2Config};
@@ -100,7 +99,6 @@ fn save(img: &Image, name: &str) {
 }
 
 fn render(width: u32, height: u32) {
-    candle_gen_krea::force_link();
     let Some(root) = snapshot() else {
         eprintln!("skipping: set KREA_TURBO_DIR");
         return;
@@ -110,7 +108,10 @@ fn render(width: u32, height: u32) {
     // `tests::registers_krea_2_turbo_as_candle`).
     let spec = LoadSpec::new(WeightsSource::Dir(root));
     let t_load = Instant::now();
-    let gen = registry::load("krea_2_turbo", &spec).expect("load krea_2_turbo engine");
+    let gen = candle_gen_krea::provider_registry()
+        .unwrap()
+        .load("krea_2_turbo", &spec)
+        .expect("load krea_2_turbo engine");
     let load_s = t_load.elapsed().as_secs_f32();
 
     let req = GenerationRequest {
@@ -189,7 +190,6 @@ fn raw_snapshot() -> Option<PathBuf> {
 /// conditional forward. Steps default to the Raw preset (52) unless `KREA_RAW_STEPS` overrides (a lower
 /// count keeps the smoke fast while still exercising the CFG + dynamic-mu path).
 fn render_raw(width: u32, height: u32, guidance: f32, negative: &str) -> Option<Image> {
-    candle_gen_krea::force_link();
     let root = raw_snapshot()?;
     let steps = std::env::var("KREA_RAW_STEPS")
         .ok()
@@ -199,7 +199,10 @@ fn render_raw(width: u32, height: u32, guidance: f32, negative: &str) -> Option<
     // `tests::registers_krea_2_raw_as_candle`).
     let spec = LoadSpec::new(WeightsSource::Dir(root));
     let t_load = Instant::now();
-    let gen = registry::load("krea_2_raw", &spec).expect("load krea_2_raw engine");
+    let gen = candle_gen_krea::provider_registry()
+        .unwrap()
+        .load("krea_2_raw", &spec)
+        .expect("load krea_2_raw engine");
     let load_s = t_load.elapsed().as_secs_f32();
 
     let req = GenerationRequest {
@@ -359,7 +362,10 @@ fn adapter_merges_every_attention_target() {
 /// Render `req` against `krea_2_turbo` with `adapters` merged, returning the single image.
 fn render_with(root: &Path, width: u32, height: u32, adapters: Vec<AdapterSpec>) -> Image {
     let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_adapters(adapters);
-    let gen = registry::load("krea_2_turbo", &spec).expect("load krea_2_turbo engine");
+    let gen = candle_gen_krea::provider_registry()
+        .unwrap()
+        .load("krea_2_turbo", &spec)
+        .expect("load krea_2_turbo engine");
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width,
@@ -384,7 +390,6 @@ fn render_with(root: &Path, width: u32, height: u32, adapters: Vec<AdapterSpec>)
 #[test]
 #[ignore = "needs the real Krea 2 Turbo snapshot (KREA_TURBO_DIR); --features cuda"]
 fn turbo_engine_applies_lora_adapter() {
-    candle_gen_krea::force_link();
     let Some(root) = snapshot() else {
         eprintln!("skipping: set KREA_TURBO_DIR");
         return;
@@ -564,7 +569,6 @@ fn real_aitoolkit_lokr_merges_full_surface() {
 #[test]
 #[ignore = "needs the real Krea 2 Turbo snapshot (KREA_TURBO_DIR) + KREA_REALISM_LOKR; --features cuda"]
 fn turbo_engine_applies_aitoolkit_lokr() {
-    candle_gen_krea::force_link();
     let (Some(root), Ok(adapter)) = (snapshot(), std::env::var(AITOOLKIT_LOKR_ENV)) else {
         eprintln!("skipping: set KREA_TURBO_DIR and {AITOOLKIT_LOKR_ENV}");
         return;

@@ -34,9 +34,9 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image,
-    LoadSpec, MoeExpert, NetworkType, TrainingConfig, TrainingItem, TrainingProgress,
-    TrainingRequest, WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    MoeExpert, NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
+    WeightsSource,
 };
 
 /// The Wan A14B (T2V) base snapshot dir — `WAN_T2V_14B_SNAPSHOT` or the first HF-cache snapshot.
@@ -118,11 +118,13 @@ fn run(tmp: &Path, file_name: &str, network_type: NetworkType, steps: u32) -> Ru
     let items = make_dataset(tmp);
     assert_eq!(candle_gen_wan::config::MODEL_ID_T2V_14B, "wan2_2_t2v_14b");
 
-    let mut trainer = gen_core::load_trainer(
-        "wan2_2_t2v_14b",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .expect("wan2_2_t2v_14b candle trainer should be registered");
+    let mut trainer = candle_gen_wan::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "wan2_2_t2v_14b",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .expect("wan2_2_t2v_14b candle trainer should be registered");
 
     let req = TrainingRequest {
         items,
@@ -399,13 +401,13 @@ fn wan_trainer_emits_preview_samples() {
     }
     let tmp = std::env::temp_dir().join("candle_wan_trainer_samples_e2e");
     let items = make_dataset(&tmp);
-    // Reference the provider crate so its `inventory::submit!` trainer registration is linked in.
-    candle_gen_wan::force_link();
-    let mut trainer = gen_core::load_trainer(
-        "wan2_2_t2v_14b",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .expect("wan2_2_t2v_14b candle trainer should be registered");
+    let mut trainer = candle_gen_wan::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "wan2_2_t2v_14b",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .expect("wan2_2_t2v_14b candle trainer should be registered");
 
     // 4 steps, render a preview every 2 steps over 2 prompts → 2 cadences × 2 prompts = 4 Sample events.
     let mut cfg = config(NetworkType::Lora, 4);

@@ -39,9 +39,8 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image,
-    LoadSpec, NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
 };
 
 /// The Z-Image base snapshot dir — `Z_IMAGE_SNAPSHOT` or the first HF-cache snapshot.
@@ -121,14 +120,15 @@ fn run(
     grad_ckpt: bool,
 ) -> RunOut {
     let items = make_dataset(tmp);
-    // Reference the provider crate so its `inventory::submit!` trainer registration is linked in.
     assert_eq!(candle_gen_z_image::MODEL_ID, "z_image_turbo");
 
-    let mut trainer = gen_core::load_trainer(
-        "z_image_turbo",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .expect("z_image_turbo candle trainer should be registered");
+    let mut trainer = candle_gen_z_image::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "z_image_turbo",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .expect("z_image_turbo candle trainer should be registered");
 
     let req = TrainingRequest {
         items,
@@ -347,13 +347,14 @@ fn z_image_trainer_emits_preview_samples() {
     }
     let tmp = std::env::temp_dir().join("candle_zimage_trainer_samples_e2e");
     let items = make_dataset(&tmp);
-    // Reference the provider crate so its `inventory::submit!` trainer registration is linked in.
     assert_eq!(candle_gen_z_image::MODEL_ID, "z_image_turbo");
-    let mut trainer = gen_core::load_trainer(
-        "z_image_turbo",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .expect("z_image_turbo candle trainer should be registered");
+    let mut trainer = candle_gen_z_image::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "z_image_turbo",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .expect("z_image_turbo candle trainer should be registered");
 
     // 4 steps, render a preview every 2 steps over 2 prompts → 2 cadences × 2 prompts = 4 Sample events.
     let mut cfg = config(NetworkType::Lora, 4, false);

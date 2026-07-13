@@ -1,7 +1,7 @@
 //! gen-core contract conformance for the candle Wan provider (sc-4481, epic 3692 / sc-3697).
 //!
 //! Runs the backend-neutral [`gen_core_testkit`] suite — validate-honesty, progress monotonicity,
-//! typed cancellation, seed-determinism, registry round-trip — against the real candle generator.
+//! typed cancellation, seed-determinism — against the real candle generator.
 //! Drives a real `generate`, so it needs the CUDA backend + a local Wan2.2-TI2V-5B snapshot and is
 //! `#[ignore]`d by default:
 //!

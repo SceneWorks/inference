@@ -1,7 +1,7 @@
 //! gen-core contract conformance for the candle Wan2.2 **T2V-A14B** dual-expert MoE provider (sc-5174).
 //!
 //! Runs the backend-neutral [`gen_core_testkit`] suite — validate-honesty, progress monotonicity,
-//! typed cancellation, seed-determinism, registry round-trip — against the real candle MoE generator.
+//! typed cancellation, seed-determinism — against the real candle MoE generator.
 //! Drives a real `generate`, so it needs the CUDA backend + a local Wan2.2-T2V-A14B-Diffusers snapshot
 //! (two 14B experts + the z16 VAE) and is `#[ignore]`d by default:
 //!

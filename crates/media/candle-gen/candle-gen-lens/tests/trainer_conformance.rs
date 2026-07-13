@@ -2,8 +2,8 @@
 //! epic 3720 / sc-4895) — the candle twin of `mlx-gen-lens/tests/trainer_conformance.rs`.
 //!
 //! Drives the actual [`LensTrainer`](candle_gen_lens::training) through the backend-neutral checks
-//! (capability honesty, `TrainingProgress` monotonicity, typed cancellation before any step, registry
-//! round-trip). `#[ignore]` + `cfg(feature = "cuda")` because it needs the real `microsoft/Lens` weights
+//! (capability honesty, `TrainingProgress` monotonicity, typed cancellation before any step).
+//! `#[ignore]` + `cfg(feature = "cuda")` because it needs the real `microsoft/Lens` weights
 //! (`LENS_BASE_SNAPSHOT` or the HF cache) — including the ~40 GB gpt-oss encoder — and a CUDA GPU.
 //! On the Windows/Blackwell box (v143 vcvars + CUDA on PATH):
 //!
@@ -17,10 +17,6 @@
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};
-
-// Force-link the provider so its `inventory::submit!` trainer registration survives into the test
-// binary (the registry round-trip check resolves `lens` through it).
-use candle_gen_lens as _;
 
 use candle_gen::gen_core::{self, LoadSpec, TrainingItem, WeightsSource};
 use gen_core_testkit::TrainerProfile;
@@ -81,7 +77,10 @@ fn lens_trainer_satisfies_gen_core_contract() {
     gen_core_testkit::trainer_conformance(
         || {
             let spec = LoadSpec::new(WeightsSource::Dir(snap.clone()));
-            gen_core::load_trainer("lens", &spec).expect("load lens trainer")
+            candle_gen_lens::provider_registry()
+                .unwrap()
+                .load_trainer("lens", &spec)
+                .expect("load lens trainer")
         },
         &profile,
     );

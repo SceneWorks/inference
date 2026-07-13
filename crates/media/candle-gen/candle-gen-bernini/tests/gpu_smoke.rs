@@ -13,7 +13,6 @@
 
 use std::time::Instant;
 
-use candle_gen::gen_core::registry;
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
@@ -21,8 +20,6 @@ use candle_gen::gen_core::{
 #[test]
 #[ignore = "GPU smoke: needs a dual-expert Wan2.2-T2V-A14B candle snapshot + CUDA device"]
 fn gpu_smoke_raw_render() {
-    candle_gen_bernini::force_link();
-
     let snapshot = std::env::var("SCENEWORKS_BERNINI_SNAPSHOT").expect(
         "set SCENEWORKS_BERNINI_SNAPSHOT to a dual-expert Wan2.2-T2V-A14B candle snapshot dir",
     );
@@ -34,7 +31,10 @@ fn gpu_smoke_raw_render() {
     });
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone().into()));
-    let gen = registry::load("bernini_renderer", &spec).expect("load bernini_renderer");
+    let gen = candle_gen_bernini::provider_registry()
+        .unwrap()
+        .load("bernini_renderer", &spec)
+        .expect("load bernini_renderer");
     eprintln!("[bernini-gpu] loaded bernini_renderer from {snapshot}");
 
     // A single-frame (t2i) raw render: 256x256, a handful of steps so the dual-expert boundary (0.875)

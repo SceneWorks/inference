@@ -38,9 +38,8 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image,
-    LoadSpec, NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
 };
 
 /// The SDXL base snapshot dir — `SDXL_SNAPSHOT` or the first HF-cache snapshot.
@@ -110,13 +109,12 @@ struct RunOut {
 /// Train through the registry and collect the per-step losses + the adapter path.
 fn run(tmp: &Path, file_name: &str, network_type: NetworkType, steps: u32, gc: bool) -> RunOut {
     let items = make_dataset(tmp);
-    // Reference the provider crate so its `inventory::submit!` trainer registration is linked into
-    // this test binary (else dead-stripped — the test names nothing else from the crate's trainer).
     assert_eq!(candle_gen_sdxl::MODEL_ID, "sdxl");
 
-    let mut trainer =
-        gen_core::load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
-            .expect("sdxl candle trainer should be registered");
+    let mut trainer = candle_gen_sdxl::provider_registry()
+        .unwrap()
+        .load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("sdxl candle trainer should be registered");
 
     let req = TrainingRequest {
         items,
@@ -346,9 +344,10 @@ fn sdxl_trainer_emits_preview_samples() {
     let items = make_dataset(&tmp);
     // Link the provider crate's trainer registration into this binary.
     assert_eq!(candle_gen_sdxl::MODEL_ID, "sdxl");
-    let mut trainer =
-        gen_core::load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
-            .expect("sdxl candle trainer should be registered");
+    let mut trainer = candle_gen_sdxl::provider_registry()
+        .unwrap()
+        .load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("sdxl candle trainer should be registered");
 
     // 4 steps, render a preview every 2 steps over 2 prompts → 2 cadences × 2 prompts = 4 Sample events.
     let mut cfg = config(NetworkType::Lora, 4, false);

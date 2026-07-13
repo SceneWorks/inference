@@ -1,7 +1,7 @@
 //! gen-core contract conformance for the candle Kolors provider (sc-4481, epic 3692 / sc-5485).
 //!
 //! Runs the backend-neutral [`gen_core_testkit`] suite — validate-honesty, progress monotonicity,
-//! typed cancellation, seed-determinism, registry round-trip — against the real candle generator. The
+//! typed cancellation, seed-determinism — against the real candle generator. The
 //! **seed-determinism** check is the regression guard for the deterministic CPU-seeded noise (sc-3673
 //! parity) the pipeline relies on.
 //!
@@ -46,7 +46,7 @@ fn kolors_conformance() {
 /// sc-10819 (epic 9083): the SAME gen-core contract suite against a **packed** `SceneWorks/kolors-mlx`
 /// q4/q8 tier — the regression guard that the packed ChatGLM3 + vendored SDXL UNet load path renders
 /// coherently through the full contract (validate-honesty, progress monotonicity, typed cancel,
-/// seed-determinism, registry round-trip), not just the dense snapshot. Point `KOLORS_PACKED_SNAPSHOT`
+/// seed-determinism), not just the dense snapshot. Point `KOLORS_PACKED_SNAPSHOT`
 /// at a `kolors-mlx/q4` or `kolors-mlx/q8` tier dir (each self-contained: packed `unet/` +
 /// `text_encoder/`, dense `vae/`, materialized `tokenizer/tokenizer.json`). The packed tier is
 /// detected from disk, so `LoadSpec` needs no `quantize` overlay.

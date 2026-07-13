@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
 
 /// Basic per-frame non-degeneracy: the frame is not solid-black / constant (a broken packed forward —
@@ -69,10 +69,11 @@ fn render_tier(env: &str, tag: &str) {
         eprintln!("SKIP {tag}: set {env} to the packed tier subdir (e.g. …/q4)");
         return;
     };
-    candle_gen_ltx::force_link();
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&dir)));
-    let gen =
-        gen_core::registry::load("ltx_2_3_distilled", &spec).expect("ltx_2_3_distilled registered");
+    let gen = candle_gen_ltx::provider_registry()
+        .unwrap()
+        .load("ltx_2_3_distilled", &spec)
+        .expect("ltx_2_3_distilled registered");
 
     // Short + low-res + the baked distilled step schedule (8) to bound time + VRAM for the 22B model:
     // 9 frames (2 latent frames), 256×256, seed 42.

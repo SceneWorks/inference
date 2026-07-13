@@ -1,7 +1,7 @@
 //! gen-core captioner-contract conformance for the candle JoyCaption provider (epic 3692 / sc-3699).
 //!
 //! Runs the backend-neutral [`gen_core_testkit`] captioner suite — validate-honesty, `Progress`
-//! monotonicity, typed pre-cancellation, registry round-trip — against the real candle captioner.
+//! monotonicity, typed pre-cancellation — against the real candle captioner.
 //! The progress check drives a real `caption`, so it needs the CUDA backend + a local JoyCaption
 //! snapshot (`JOYCAPTION_SNAPSHOT`) and is `#[ignore]`d by default:
 //!

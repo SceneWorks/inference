@@ -1,7 +1,7 @@
 //! gen-core contract conformance for the candle LTX-2.3 provider (epic 3692 / sc-3698).
 //!
 //! Runs the backend-neutral [`gen_core_testkit`] suite — validate-honesty, progress monotonicity,
-//! typed cancellation, seed-determinism, registry round-trip — against the real candle generator.
+//! typed cancellation, seed-determinism — against the real candle generator.
 //! Drives a real `generate`, so it needs the CUDA backend + a local LTX-2.3 snapshot + a Gemma-3-12B
 //! encoder snapshot (`LTX_GEMMA_DIR`) and is `#[ignore]`d by default:
 //!

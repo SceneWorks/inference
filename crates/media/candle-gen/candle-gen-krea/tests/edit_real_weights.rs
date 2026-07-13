@@ -131,7 +131,6 @@ fn save(img: &Image, name: &str) {
 #[test]
 #[ignore = "needs KREA_RAW_DIR + KREA_EDIT_LORA + KREA_EDIT_SOURCE (a P6 PPM); --features cuda"]
 fn edit_renders_coherent_with_dual_conditioning() {
-    candle_gen_krea::force_link();
     let (Ok(root), Ok(lora), Ok(source)) = (
         std::env::var("KREA_RAW_DIR"),
         std::env::var("KREA_EDIT_LORA"),

@@ -48,8 +48,6 @@ fn assert_coherent(image: &Image, tag: &str) {
 #[test]
 #[ignore = "needs the ComfyUI Z-Image files + a resident tokenizer snapshot + a CUDA GPU; run --release --features cuda --ignored"]
 fn comfyui_zimage_renders_in_place() {
-    candle_gen_z_image::force_link();
-
     let root = PathBuf::from(
         std::env::var("COMFYUI_ROOT")
             .unwrap_or_else(|_| r"C:\Users\Michael\ComfyUI-Shared\models".to_owned()),

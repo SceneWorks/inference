@@ -36,9 +36,8 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image,
-    LoadSpec, NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
 };
 
 /// The `microsoft/Lens` base snapshot dir — `LENS_BASE_SNAPSHOT` or the first HF-cache snapshot.
@@ -109,9 +108,10 @@ fn run(tmp: &Path, file_name: &str, network_type: NetworkType, steps: u32) -> Ru
     let items = make_dataset(tmp);
     assert_eq!(candle_gen_lens::MODEL_ID_BASE, "lens");
 
-    let mut trainer =
-        gen_core::load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(snapshot())))
-            .expect("lens candle trainer should be registered");
+    let mut trainer = candle_gen_lens::provider_registry()
+        .unwrap()
+        .load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("lens candle trainer should be registered");
 
     let req = TrainingRequest {
         items,
@@ -224,7 +224,10 @@ fn render_finite_with_adapter(path: &Path, kind: AdapterKind) {
         1.0,
         kind,
     )]);
-    let g = gen_core::load("lens", &spec).expect("load lens generator with adapter");
+    let g = candle_gen_lens::provider_registry()
+        .unwrap()
+        .load("lens", &spec)
+        .expect("load lens generator with adapter");
     let req = GenerationRequest {
         prompt: "a solid colour swatch".into(),
         width: 256,
@@ -357,9 +360,10 @@ fn lens_trainer_emits_preview_samples() {
     let tmp = std::env::temp_dir().join("candle_lens_trainer_samples_e2e");
     let items = make_dataset(&tmp);
     assert_eq!(candle_gen_lens::MODEL_ID_BASE, "lens");
-    let mut trainer =
-        gen_core::load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(snapshot())))
-            .expect("lens candle trainer should be registered");
+    let mut trainer = candle_gen_lens::provider_registry()
+        .unwrap()
+        .load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("lens candle trainer should be registered");
 
     // 4 steps, render a preview every 2 steps over 2 prompts → 2 cadences × 2 prompts = 4 Sample events.
     let mut cfg = config(NetworkType::Lora, 4);

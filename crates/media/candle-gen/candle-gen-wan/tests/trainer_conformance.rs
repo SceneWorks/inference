@@ -2,8 +2,8 @@
 //! (sc-5167, epic 3720 / sc-4895) — the candle twin of `mlx-gen-wan/tests/trainer_conformance.rs`.
 //!
 //! Drives the actual [`WanMoeTrainer`](candle_gen_wan::training) through the backend-neutral checks
-//! (capability honesty, `TrainingProgress` monotonicity, typed cancellation before any step, registry
-//! round-trip). `#[ignore]` + `cfg(feature = "cuda")` because it needs the real
+//! (capability honesty, `TrainingProgress` monotonicity, typed cancellation before any step).
+//! `#[ignore]` + `cfg(feature = "cuda")` because it needs the real
 //! `Wan-AI/Wan2.2-T2V-A14B-Diffusers` weights (`WAN_T2V_14B_SNAPSHOT` or the HF cache) and a CUDA GPU.
 //! On the Windows/Blackwell box (v143 vcvars + CUDA on PATH):
 //!
@@ -16,10 +16,6 @@
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};
-
-// Force-link the provider so its `inventory::submit!` trainer registration survives into the test
-// binary (the registry round-trip check resolves `wan2_2_t2v_14b` through it).
-use candle_gen_wan as _;
 
 use candle_gen::gen_core::{self, LoadSpec, TrainingItem, WeightsSource};
 use gen_core_testkit::TrainerProfile;
@@ -79,7 +75,10 @@ fn wan_t2v_14b_trainer_satisfies_gen_core_contract() {
     gen_core_testkit::trainer_conformance(
         || {
             let spec = LoadSpec::new(WeightsSource::Dir(snap.clone()));
-            gen_core::load_trainer("wan2_2_t2v_14b", &spec).expect("load wan2_2_t2v_14b trainer")
+            candle_gen_wan::provider_registry()
+                .unwrap()
+                .load_trainer("wan2_2_t2v_14b", &spec)
+                .expect("load wan2_2_t2v_14b trainer")
         },
         &profile,
     );

@@ -1,7 +1,7 @@
 //! gen-core contract conformance for the candle Z-Image provider (sc-4481, epic 3720 / sc-3693).
 //!
 //! Runs the backend-neutral [`gen_core_testkit`] suite — validate-honesty, progress monotonicity,
-//! typed cancellation, seed-determinism, registry round-trip — against the real candle generator.
+//! typed cancellation, seed-determinism — against the real candle generator.
 //! The **seed-determinism** check is the regression guard for the deterministic CPU-seeded noise
 //! (sc-3673 parity) the pipeline relies on.
 //!
@@ -45,8 +45,7 @@ fn z_image_conformance() {
         ..Profile::cheap()
     };
 
-    // Resolve through THIS crate's `load` (its inventory registration is linked into the test binary,
-    // so the suite's registry round-trip check also passes). Panics with aggregated failures.
+    // Resolve through this provider's direct loader. Panics with aggregated failures.
     conformance(|| candle_gen_z_image::load(&spec).unwrap(), &profile);
 }
 
@@ -70,10 +69,12 @@ fn base_z_image_smoke() {
         .expect("set Z_IMAGE_BASE_SNAPSHOT to a Tongyi-MAI/Z-Image (base, non-Turbo) snapshot dir");
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
 
-    // Resolve the BASE engine id `z_image` through the registry (this crate's base inventory entry is
-    // linked into the test binary). A small render with real CFG (guidance 4.0 + a negative prompt)
+    // Resolve the base engine id `z_image` through this provider's explicit registry. A small render
+    // with real CFG (guidance 4.0 + a negative prompt)
     // over the shift=6.0 schedule; few steps keep it cheap while still exercising the CFG loop.
-    let gen = candle_gen::gen_core::registry::load("z_image", &spec)
+    let gen = candle_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image", &spec)
         .expect("candle base z_image is registered");
     assert_eq!(gen.descriptor().id, "z_image");
     assert!(gen.descriptor().capabilities.supports_guidance);
@@ -151,7 +152,9 @@ fn base_z_image_cfg_no_negative_smoke() {
         .expect("set Z_IMAGE_BASE_SNAPSHOT to a Tongyi-MAI/Z-Image (base, non-Turbo) snapshot dir");
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
 
-    let gen = candle_gen::gen_core::registry::load("z_image", &spec)
+    let gen = candle_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image", &spec)
         .expect("candle base z_image is registered");
 
     // The regression shape: CFG on (guidance 4.0), negative_prompt UNSET. Must not error.
