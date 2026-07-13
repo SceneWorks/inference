@@ -336,34 +336,18 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit_images: Vec<String> = registry
             .image_embedders()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility_images: Vec<String> = candle_gen::gen_core::registry::image_embedders()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "image-embed" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
         let explicit_text: Vec<String> = registry
             .text_embedders()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility_text: Vec<String> = candle_gen::gen_core::registry::text_embedders()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "text-embed" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
 
-        assert_eq!(explicit_images, compatibility_images);
         assert_eq!(explicit_images, ["clip_vit_l14"]);
-        assert_eq!(explicit_text, compatibility_text);
         assert_eq!(explicit_text, ["clip_vit_l14_text"]);
     }
 }

@@ -397,7 +397,6 @@ pub fn force_link() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
 
     /// The seam under test: this provider's `inventory::submit!` is linked into the test binary, so
@@ -406,7 +405,10 @@ mod tests {
     #[test]
     fn z_image_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load("z_image_turbo", &spec).expect("candle z-image is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load("z_image_turbo", &spec)
+            .expect("candle z-image is registered");
         assert_eq!(g.descriptor().id, "z_image_turbo");
         assert_eq!(g.descriptor().family, "z-image");
         assert_eq!(g.descriptor().backend, "candle");
@@ -446,7 +448,10 @@ mod tests {
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load("z_image_turbo", &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load("z_image_turbo", &spec)
+            .unwrap();
 
         let ok = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
@@ -548,37 +553,19 @@ mod tests {
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let mut explicit_generators: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility_generators: Vec<String> =
-            candle_gen::gen_core::registry::generators()
-                .filter_map(|registration| {
-                    let descriptor = (registration.descriptor)();
-                    (descriptor.family == "z-image" && descriptor.backend == "candle")
-                        .then(|| descriptor.id.to_string())
-                })
-                .collect();
         explicit_generators.sort();
-        compatibility_generators.sort();
-        assert_eq!(explicit_generators, compatibility_generators);
         assert_eq!(explicit_generators, ["z_image", "z_image_turbo"]);
 
         let explicit_trainers: Vec<String> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility_trainers: Vec<String> = candle_gen::gen_core::registry::trainers()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "z-image" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        assert_eq!(explicit_trainers, compatibility_trainers);
         assert_eq!(explicit_trainers, ["z_image_turbo"]);
     }
 }

@@ -335,20 +335,12 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .captioners()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility: Vec<String> = candle_gen::gen_core::registry::captioners()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "joycaption" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        assert_eq!(explicit, compatibility);
         assert_eq!(explicit, ["fancyfeast/llama-joycaption-beta-one-hf-llava"]);
     }
 }

@@ -133,22 +133,13 @@ mod compile_glue_guard_tests {
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let mut explicit_generators: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility_generators: Vec<String> = mlx_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "z-image" && descriptor.backend == "mlx")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
         explicit_generators.sort();
-        compatibility_generators.sort();
-        assert_eq!(explicit_generators, compatibility_generators);
         assert_eq!(
             explicit_generators,
             [
@@ -163,16 +154,6 @@ mod explicit_registry_tests {
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility_trainers: Vec<String> = mlx_gen::gen_core::registry::trainers()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                // The imported MLX trainer historically spells its family `z_image` while the
-                // generator descriptors use `z-image`; preserve that serialized identity here.
-                (descriptor.id == "z_image_turbo" && descriptor.backend == "mlx")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        assert_eq!(explicit_trainers, compatibility_trainers);
         assert_eq!(explicit_trainers, ["z_image_turbo"]);
     }
 }

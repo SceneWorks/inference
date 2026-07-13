@@ -397,14 +397,17 @@ impl Scail2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
 
     #[test]
     fn registers_and_resolves_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         // The snapshot dir doesn't exist, so `load` errors — but the engine must be REGISTERED (the
         // registry resolves the id to this provider's `load`).
-        let err = registry::load(MODEL_ID, &spec).err().expect("dir missing");
+        let err = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .err()
+            .expect("dir missing");
         assert!(
             err.to_string().contains("does not exist"),
             "expected a missing-dir error from the scail2 loader, got: {err}"

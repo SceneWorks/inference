@@ -294,7 +294,6 @@ impl Trainer for KreaControlTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::runtime::CancelFlag;
     use candle_gen::gen_core::train::{TrainingConfig, TrainingItem};
 
@@ -304,7 +303,9 @@ mod tests {
     #[test]
     fn control_trainer_registers_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer(KREA_2_CONTROL_ID, &spec)
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer(KREA_2_CONTROL_ID, &spec)
             .expect("candle krea control trainer is registered");
         assert_eq!(t.descriptor().id, KREA_2_CONTROL_ID);
         assert_eq!(t.descriptor().family, "krea_2");
@@ -321,7 +322,10 @@ mod tests {
     #[test]
     fn validate_requires_control_image_and_type() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer(KREA_2_CONTROL_ID, &spec).unwrap();
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer(KREA_2_CONTROL_ID, &spec)
+            .unwrap();
 
         let ok = TrainingRequest {
             items: vec![TrainingItem::with_control(

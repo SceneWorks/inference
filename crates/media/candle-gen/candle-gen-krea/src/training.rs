@@ -509,7 +509,6 @@ impl FlowMatchTrainer for KreaTrainer {
 mod tests {
     use super::*;
     use crate::testfix::{randn_seeded, tiny_batch, tiny_batch_seeded, tiny_dit, tiny_dit_seeded};
-    use candle_gen::gen_core::registry;
     use candle_gen::train::lora::build_lora_targets;
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
 
@@ -736,7 +735,9 @@ mod tests {
     #[test]
     fn trainer_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer(KREA_2_RAW_ID, &spec)
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer(KREA_2_RAW_ID, &spec)
             .expect("candle krea trainer is registered");
         assert_eq!(t.descriptor().id, KREA_2_RAW_ID);
         assert_eq!(t.descriptor().family, "krea_2");
@@ -753,7 +754,10 @@ mod tests {
         use candle_gen::gen_core::runtime::CancelFlag;
         use candle_gen::gen_core::train::TrainingItem;
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer(KREA_2_RAW_ID, &spec).unwrap();
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer(KREA_2_RAW_ID, &spec)
+            .unwrap();
 
         let item = TrainingItem {
             image_path: "/img.png".into(),

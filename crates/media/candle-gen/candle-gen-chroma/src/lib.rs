@@ -216,24 +216,13 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "chroma" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        let mut sorted_explicit = explicit.clone();
-        sorted_explicit.sort();
-        compatibility.sort();
 
-        assert_eq!(sorted_explicit, compatibility);
         assert_eq!(explicit, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
     }
 }
@@ -241,15 +230,16 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::{Conditioning, Image, Modality};
 
     #[test]
     fn all_three_variants_register_and_resolve_as_candle() {
         for id in [CHROMA1_HD_ID, CHROMA1_BASE_ID, CHROMA1_FLASH_ID] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-            let g =
-                registry::load(id, &spec).unwrap_or_else(|_| panic!("candle {id} is registered"));
+            let g = crate::provider_registry()
+                .unwrap()
+                .load(id, &spec)
+                .unwrap_or_else(|_| panic!("candle {id} is registered"));
             assert_eq!(g.descriptor().id, id);
             assert_eq!(g.descriptor().family, "chroma");
             assert_eq!(g.descriptor().backend, "candle");
@@ -260,7 +250,10 @@ mod tests {
     #[test]
     fn validate_accepts_true_cfg_and_negative_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let hd = registry::load(CHROMA1_HD_ID, &spec).unwrap();
+        let hd = crate::provider_registry()
+            .unwrap()
+            .load(CHROMA1_HD_ID, &spec)
+            .unwrap();
 
         // True CFG + negative prompt are advertised → accepted.
         let ok = GenerationRequest {

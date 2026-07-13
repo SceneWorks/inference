@@ -429,24 +429,13 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "flux" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        let mut sorted_explicit = explicit.clone();
-        sorted_explicit.sort();
-        compatibility.sort();
 
-        assert_eq!(sorted_explicit, compatibility);
         assert_eq!(explicit, ["flux1_schnell", "flux1_dev"]);
     }
 }
@@ -454,7 +443,6 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
 
     /// Both variants register and resolve as candle generators through gen-core's registry (their
@@ -464,8 +452,10 @@ mod tests {
     fn both_variants_register_and_resolve_as_candle() {
         for (id, family) in [(FLUX1_SCHNELL_ID, "flux"), (FLUX1_DEV_ID, "flux")] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-            let g =
-                registry::load(id, &spec).unwrap_or_else(|_| panic!("candle {id} is registered"));
+            let g = crate::provider_registry()
+                .unwrap()
+                .load(id, &spec)
+                .unwrap_or_else(|_| panic!("candle {id} is registered"));
             assert_eq!(g.descriptor().id, id);
             assert_eq!(g.descriptor().family, family);
             assert_eq!(g.descriptor().backend, "candle");
@@ -514,8 +504,14 @@ mod tests {
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let schnell = registry::load(FLUX1_SCHNELL_ID, &spec).unwrap();
-        let dev = registry::load(FLUX1_DEV_ID, &spec).unwrap();
+        let schnell = crate::provider_registry()
+            .unwrap()
+            .load(FLUX1_SCHNELL_ID, &spec)
+            .unwrap();
+        let dev = crate::provider_registry()
+            .unwrap()
+            .load(FLUX1_DEV_ID, &spec)
+            .unwrap();
 
         let ok = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),

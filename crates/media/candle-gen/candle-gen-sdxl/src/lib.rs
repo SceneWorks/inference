@@ -517,34 +517,18 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit_generators: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility_generators: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "sdxl" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
         let explicit_trainers: Vec<String> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility_trainers: Vec<String> = candle_gen::gen_core::registry::trainers()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "sdxl" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
 
-        assert_eq!(explicit_generators, compatibility_generators);
         assert_eq!(explicit_generators, ["sdxl"]);
-        assert_eq!(explicit_trainers, compatibility_trainers);
         assert_eq!(explicit_trainers, ["sdxl"]);
     }
 }
@@ -552,7 +536,6 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
 
     /// The seam under test: this provider's `inventory::submit!` is linked into the test binary,
@@ -561,7 +544,10 @@ mod tests {
     #[test]
     fn sdxl_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load("sdxl", &spec).expect("candle sdxl is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load("sdxl", &spec)
+            .expect("candle sdxl is registered");
         assert_eq!(g.descriptor().id, "sdxl");
         assert_eq!(g.descriptor().backend, "candle");
         assert_eq!(g.descriptor().modality, Modality::Image);
@@ -656,7 +642,10 @@ mod tests {
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load("sdxl", &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load("sdxl", &spec)
+            .unwrap();
 
         let ok = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
@@ -702,7 +691,10 @@ mod tests {
     #[test]
     fn validate_accepts_lightning_sampler() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load("sdxl", &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load("sdxl", &spec)
+            .unwrap();
 
         let lightning = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),

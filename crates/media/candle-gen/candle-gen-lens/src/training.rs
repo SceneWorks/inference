@@ -565,7 +565,6 @@ impl FlowMatchTrainer for LensTrainer {
 mod tests {
     use super::*;
     use candle_gen::candle_nn::{VarBuilder, VarMap};
-    use candle_gen::gen_core::registry;
     use candle_gen::train::lora::build_lora_targets;
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
 
@@ -782,7 +781,9 @@ mod tests {
     #[test]
     fn trainer_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer(MODEL_ID_BASE, &spec)
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer(MODEL_ID_BASE, &spec)
             .expect("candle lens trainer is registered");
         assert_eq!(t.descriptor().id, MODEL_ID_BASE);
         assert_eq!(t.descriptor().backend, "candle");
@@ -797,7 +798,10 @@ mod tests {
         use candle_gen::gen_core::runtime::CancelFlag;
         use candle_gen::gen_core::train::TrainingItem;
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer(MODEL_ID_BASE, &spec).unwrap();
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer(MODEL_ID_BASE, &spec)
+            .unwrap();
         let base = TrainingRequest {
             items: vec![TrainingItem {
                 image_path: "/img.png".into(),

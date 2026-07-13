@@ -546,20 +546,12 @@ pub fn force_link() {}
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "svd" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        assert_eq!(explicit, compatibility);
         assert_eq!(explicit, ["svd_xt"]);
     }
 }
@@ -567,12 +559,14 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
 
     #[test]
     fn registers_and_resolves_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).expect("svd is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("svd is registered");
         assert_eq!(g.descriptor().id, MODEL_ID);
         assert_eq!(g.descriptor().family, "svd");
         assert_eq!(g.descriptor().backend, "candle");
@@ -613,7 +607,10 @@ mod tests {
     #[test]
     fn validate_accepts_img2vid_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
         // 1024×576 = 16×64 / 9×64 with a well-formed reference passes.
         assert!(g.validate(&ref_req(1024, 576)).is_ok());
         // Missing reference image.

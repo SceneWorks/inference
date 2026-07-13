@@ -1095,11 +1095,14 @@ mod tests {
     #[test]
     #[ignore = "gated SD3.5 weights + HF token unavailable here; set SD35_LARGE_PATH to enable (C6)"]
     fn real_weight_render() {
-        use candle_gen::gen_core::{registry, GenerationRequest, LoadSpec, WeightsSource};
+        use candle_gen::gen_core::{GenerationRequest, LoadSpec, WeightsSource};
         let large_path = std::env::var("SD35_LARGE_PATH")
             .expect("set SD35_LARGE_PATH to a stable-diffusion-3.5-large diffusers snapshot dir");
         let spec = LoadSpec::new(WeightsSource::Dir(large_path.into()));
-        let g = registry::load(crate::MODEL_ID, &spec).expect("load sd3 large");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(crate::MODEL_ID, &spec)
+            .expect("load sd3 large");
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,
@@ -1162,7 +1165,7 @@ mod tests {
     #[ignore = "gated SD3.5 weights + a LoRA file unavailable here; set SD35_LARGE_PATH + SD35_LORA_PATH (sc-7881)"]
     fn lora_before_after_render() {
         use candle_gen::gen_core::{
-            registry, AdapterKind, AdapterSpec, GenerationRequest, LoadSpec, WeightsSource,
+            AdapterKind, AdapterSpec, GenerationRequest, LoadSpec, WeightsSource,
         };
         let large_path = std::env::var("SD35_LARGE_PATH")
             .expect("set SD35_LARGE_PATH to a stable-diffusion-3.5-large diffusers snapshot dir");
@@ -1185,7 +1188,10 @@ mod tests {
         let render = |adapters: Vec<AdapterSpec>| -> Image {
             let spec = LoadSpec::new(WeightsSource::Dir(large_path.clone().into()))
                 .with_adapters(adapters);
-            let g = registry::load(crate::MODEL_ID, &spec).expect("load sd3 large");
+            let g = crate::provider_registry()
+                .unwrap()
+                .load(crate::MODEL_ID, &spec)
+                .expect("load sd3 large");
             match g
                 .generate(&req, &mut |_p: Progress| {})
                 .expect("real-weight render")
@@ -1228,11 +1234,14 @@ mod tests {
     #[test]
     #[ignore = "gated SD3.5-Medium weights unavailable here; set SD35_MEDIUM_PATH to enable (C6)"]
     fn medium_real_weight_render() {
-        use candle_gen::gen_core::{registry, GenerationRequest, LoadSpec, WeightsSource};
+        use candle_gen::gen_core::{GenerationRequest, LoadSpec, WeightsSource};
         let medium_path = std::env::var("SD35_MEDIUM_PATH")
             .expect("set SD35_MEDIUM_PATH to a stable-diffusion-3.5-medium diffusers snapshot dir");
         let spec = LoadSpec::new(WeightsSource::Dir(medium_path.into()));
-        let g = registry::load(crate::MODEL_ID_MEDIUM, &spec).expect("load sd3 medium");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(crate::MODEL_ID_MEDIUM, &spec)
+            .expect("load sd3 medium");
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,

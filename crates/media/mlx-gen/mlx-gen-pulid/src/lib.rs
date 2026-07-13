@@ -30,21 +30,13 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility: Vec<String> = mlx_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "pulid" && descriptor.backend == "mlx")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
 
-        assert_eq!(explicit, compatibility);
         assert_eq!(explicit, ["pulid_flux"]);
     }
 }

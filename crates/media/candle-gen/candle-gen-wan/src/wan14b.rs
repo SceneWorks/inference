@@ -833,13 +833,15 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
 
     #[test]
     fn registers_both_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         for (id, conditioning_len) in [(MODEL_ID_T2V_14B, 0usize), (MODEL_ID_I2V_14B, 1)] {
-            let g = registry::load(id, &spec).expect("14b model is registered");
+            let g = crate::provider_registry()
+                .unwrap()
+                .load(id, &spec)
+                .expect("14b model is registered");
             assert_eq!(g.descriptor().id, id);
             assert_eq!(g.descriptor().family, "wan");
             assert_eq!(g.descriptor().backend, "candle");
@@ -903,7 +905,10 @@ mod tests {
     #[test]
     fn validate_enforces_surface() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t2v = registry::load(MODEL_ID_T2V_14B, &spec).unwrap();
+        let t2v = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_T2V_14B, &spec)
+            .unwrap();
         let ok = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
             width: 256,
@@ -956,7 +961,10 @@ mod tests {
         }
 
         // I2V rejects a request with no Reference image.
-        let i2v = registry::load(MODEL_ID_I2V_14B, &spec).unwrap();
+        let i2v = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_I2V_14B, &spec)
+            .unwrap();
         assert!(i2v.validate(&ok).is_err(), "i2v needs a reference image");
     }
 
@@ -965,7 +973,10 @@ mod tests {
     #[test]
     fn validate_enforces_max_area() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t2v = registry::load(MODEL_ID_T2V_14B, &spec).unwrap();
+        let t2v = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_T2V_14B, &spec)
+            .unwrap();
         let base = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
             frames: Some(17),
@@ -997,7 +1008,10 @@ mod tests {
         assert!(msg.contains("max area"), "actionable message: {msg}");
 
         // The same cap applies to the I2V variant (both keep two resident 14B experts).
-        let i2v = registry::load(MODEL_ID_I2V_14B, &spec).unwrap();
+        let i2v = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_I2V_14B, &spec)
+            .unwrap();
         assert!(
             i2v.validate(&GenerationRequest {
                 width: 1280,

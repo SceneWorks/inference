@@ -1302,7 +1302,6 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::DType;
     use candle_gen::candle_nn::VarBuilder;
-    use candle_gen::gen_core::registry;
     use std::collections::HashMap;
 
     /// The full `bernini` engine registers + resolves via the gen_core registry (lazy load succeeds for
@@ -1311,7 +1310,10 @@ mod tests {
     fn registers_and_resolves() {
         force_link();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).expect("bernini is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("bernini is registered");
         assert_eq!(g.descriptor().id, "bernini");
         assert_eq!(g.descriptor().family, "bernini");
         assert_eq!(g.descriptor().backend, "candle");
@@ -1456,7 +1458,10 @@ mod tests {
     fn validate_geometry_and_mode_conditioning() {
         force_link();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
         let ok = GenerationRequest {
             prompt: "a cat walking across a garden".into(),
             width: 256,

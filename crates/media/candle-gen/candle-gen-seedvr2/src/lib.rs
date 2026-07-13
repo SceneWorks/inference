@@ -335,24 +335,13 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "seedvr2" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        let mut sorted_explicit = explicit.clone();
-        sorted_explicit.sort();
-        compatibility.sort();
 
-        assert_eq!(sorted_explicit, compatibility);
         assert_eq!(explicit, ["seedvr2", "seedvr2_3b", "seedvr2_7b"]);
     }
 }
@@ -360,7 +349,6 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
 
     #[test]
     fn descriptor_is_seedvr2_image_and_video() {
@@ -382,7 +370,10 @@ mod tests {
     fn all_ids_resolve_in_registry() {
         for id in [MODEL_ID, MODEL_ID_3B, MODEL_ID_7B] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/seedvr2".into()));
-            let g = registry::load(id, &spec).expect("seedvr2 is registered");
+            let g = crate::provider_registry()
+                .unwrap()
+                .load(id, &spec)
+                .expect("seedvr2 is registered");
             assert_eq!(g.descriptor().family, "seedvr2");
             assert_eq!(g.descriptor().backend, "candle");
         }

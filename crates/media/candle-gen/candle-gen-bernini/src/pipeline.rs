@@ -509,14 +509,16 @@ impl Generator for BerniniRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
 
     #[test]
     fn registers_and_resolves_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         // load is lazy (components build on first generate), so the registry resolves + `load` succeeds
         // even for a missing dir; the descriptor identity is what we pin here.
-        let g = registry::load(MODEL_ID, &spec).expect("bernini_renderer is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("bernini_renderer is registered");
         assert_eq!(g.descriptor().id, MODEL_ID);
         assert_eq!(g.descriptor().family, "bernini");
         assert_eq!(g.descriptor().backend, "candle");
@@ -560,7 +562,10 @@ mod tests {
     #[test]
     fn validate_enforces_surface() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
         let ok = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
             width: 256,
@@ -617,7 +622,10 @@ mod tests {
     #[test]
     fn validate_rejects_mode_conditioning_mismatch() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
         // Conditioning mode name, no conditioning → reject.
         let v2v_no_src = GenerationRequest {
             prompt: "x".into(),

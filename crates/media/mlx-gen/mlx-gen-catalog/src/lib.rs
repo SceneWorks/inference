@@ -41,13 +41,8 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 
 #[cfg(test)]
 mod tests {
-    fn sorted(mut ids: Vec<String>) -> Vec<String> {
-        ids.sort();
-        ids
-    }
-
     #[test]
-    fn complete_catalog_matches_inventory_during_cutover() {
+    fn complete_catalog_has_stable_conforming_surface() {
         let registry = super::provider_registry().unwrap();
         let generators: Vec<String> = registry
             .generators()
@@ -70,46 +65,6 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(
-            sorted(generators.clone()),
-            sorted(
-                mlx_gen::gen_core::registry::generators()
-                    .map(|r| (r.descriptor)().id.to_string())
-                    .collect()
-            )
-        );
-        assert_eq!(
-            sorted(trainers.clone()),
-            sorted(
-                mlx_gen::gen_core::registry::trainers()
-                    .map(|r| (r.descriptor)().id.to_string())
-                    .collect()
-            )
-        );
-        assert_eq!(
-            sorted(captioners.clone()),
-            sorted(
-                mlx_gen::gen_core::registry::captioners()
-                    .map(|r| (r.descriptor)().id.to_string())
-                    .collect()
-            )
-        );
-        assert_eq!(
-            sorted(image_embedders.clone()),
-            sorted(
-                mlx_gen::gen_core::registry::image_embedders()
-                    .map(|r| (r.descriptor)().id.to_string())
-                    .collect()
-            )
-        );
-        assert_eq!(
-            sorted(text_embedders.clone()),
-            sorted(
-                mlx_gen::gen_core::registry::text_embedders()
-                    .map(|r| (r.descriptor)().id.to_string())
-                    .collect()
-            )
-        );
         assert_eq!(registry.transforms().len(), 0);
         assert_eq!(
             registry.descriptor_conformance_errors(),

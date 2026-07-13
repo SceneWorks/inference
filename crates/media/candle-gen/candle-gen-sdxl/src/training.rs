@@ -829,7 +829,6 @@ mod tests {
     use super::*;
     use crate::unet::{BlockConfig, UNet2DConditionModelConfig};
     use candle_core::{DType, Device};
-    use candle_gen::gen_core::registry;
     use candle_nn::{VarBuilder, VarMap};
 
     /// A tiny SDXL-shaped UNet (one cross-attn down block + one basic block + cross-attn mid/up) that
@@ -1048,7 +1047,10 @@ mod tests {
     #[test]
     fn trainer_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer("sdxl", &spec).expect("candle sdxl trainer is registered");
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer("sdxl", &spec)
+            .expect("candle sdxl trainer is registered");
         assert_eq!(t.descriptor().id, "sdxl");
         assert_eq!(t.descriptor().backend, "candle");
         assert!(t.descriptor().supports_lora);
@@ -1060,7 +1062,10 @@ mod tests {
     fn validate_rejects_bad_requests() {
         use candle_gen::gen_core::runtime::CancelFlag;
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer("sdxl", &spec).unwrap();
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer("sdxl", &spec)
+            .unwrap();
 
         let item = candle_gen::gen_core::train::TrainingItem {
             image_path: "/img.png".into(),

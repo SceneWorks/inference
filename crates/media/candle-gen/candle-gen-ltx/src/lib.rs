@@ -593,21 +593,13 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "ltx" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
 
-        assert_eq!(explicit, compatibility);
         assert_eq!(explicit, ["ltx_2_3_distilled"]);
     }
 }
@@ -615,12 +607,14 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
 
     #[test]
     fn registers_and_resolves_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).expect("ltx is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("ltx is registered");
         assert_eq!(g.descriptor().id, MODEL_ID);
         assert_eq!(g.descriptor().family, "ltx");
         assert_eq!(g.descriptor().backend, "candle");
@@ -712,7 +706,10 @@ mod tests {
     #[test]
     fn validate_accepts_txt2video_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
         let ok = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
             width: 704,
@@ -753,7 +750,10 @@ mod tests {
     #[test]
     fn validate_honors_or_rejects_req_steps() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
         let base = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
             width: 704,
@@ -790,7 +790,10 @@ mod tests {
     #[test]
     fn validate_rejects_unbounded_frame_count() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
         let base = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
             width: 1280,

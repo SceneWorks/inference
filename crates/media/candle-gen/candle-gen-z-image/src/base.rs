@@ -261,7 +261,6 @@ candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor =>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image};
 
     /// The seam under test: this provider's base `inventory::submit!` is linked into the test binary,
@@ -270,7 +269,10 @@ mod tests {
     #[test]
     fn base_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load("z_image", &spec).expect("candle base z-image is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load("z_image", &spec)
+            .expect("candle base z-image is registered");
         assert_eq!(g.descriptor().id, "z_image");
         assert_eq!(g.descriptor().family, "z-image");
         assert_eq!(g.descriptor().backend, "candle");
@@ -322,7 +324,10 @@ mod tests {
     #[test]
     fn validate_accepts_cfg_and_reference_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load("z_image", &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load("z_image", &spec)
+            .unwrap();
 
         let ok = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),

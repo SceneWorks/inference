@@ -210,21 +210,13 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "kolors" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
 
-        assert_eq!(explicit, compatibility);
         assert_eq!(explicit, ["kolors"]);
     }
 }
@@ -232,13 +224,15 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::{AdapterKind, AdapterSpec, Conditioning, Image, Modality, Quant};
 
     #[test]
     fn kolors_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).expect("candle kolors is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("candle kolors is registered");
         assert_eq!(g.descriptor().id, "kolors");
         assert_eq!(g.descriptor().family, "kolors");
         assert_eq!(g.descriptor().backend, "candle");
@@ -248,7 +242,10 @@ mod tests {
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
 
         let ok = GenerationRequest {
             prompt: "一只猫 / a cat holding a lit candle".into(),
@@ -295,7 +292,10 @@ mod tests {
     #[test]
     fn validate_accepts_curated_sampler_and_scheduler() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
 
         // The native default is still accepted.
         let native = GenerationRequest {

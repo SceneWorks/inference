@@ -511,44 +511,21 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit_generators: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility_generators: Vec<String> =
-            candle_gen::gen_core::registry::generators()
-                .filter_map(|registration| {
-                    let descriptor = (registration.descriptor)();
-                    (descriptor.family == "krea_2" && descriptor.backend == "candle")
-                        .then(|| descriptor.id.to_string())
-                })
-                .collect();
         let explicit_trainers: Vec<String> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility_trainers: Vec<String> = candle_gen::gen_core::registry::trainers()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "krea_2" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        let mut sorted_explicit_generators = explicit_generators.clone();
-        sorted_explicit_generators.sort();
-        compatibility_generators.sort();
-        let mut sorted_explicit_trainers = explicit_trainers.clone();
-        sorted_explicit_trainers.sort();
-        compatibility_trainers.sort();
 
-        assert_eq!(sorted_explicit_generators, compatibility_generators);
         assert_eq!(
             explicit_generators,
             ["krea_2_turbo", "krea_2_raw", "krea_2_edit"]
         );
-        assert_eq!(sorted_explicit_trainers, compatibility_trainers);
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
     }
 }
@@ -556,12 +533,14 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
 
     #[test]
     fn registers_krea_2_turbo_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(KREA_2_TURBO_ID, &spec).expect("krea_2_turbo is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_TURBO_ID, &spec)
+            .expect("krea_2_turbo is registered");
         assert_eq!(g.descriptor().id, KREA_2_TURBO_ID);
         assert_eq!(g.descriptor().family, "krea_2");
         assert_eq!(g.descriptor().backend, "candle");
@@ -573,7 +552,10 @@ mod tests {
     #[test]
     fn registers_krea_2_raw_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(KREA_2_RAW_ID, &spec).expect("krea_2_raw is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_RAW_ID, &spec)
+            .expect("krea_2_raw is registered");
         assert_eq!(g.descriptor().id, KREA_2_RAW_ID);
         assert_eq!(g.descriptor().family, "krea_2");
         assert_eq!(g.descriptor().backend, "candle");
@@ -607,7 +589,10 @@ mod tests {
     fn raw_validate_accepts_guidance_and_negative_prompt() {
         // The CFG floor that rejects these on Turbo must ACCEPT them on Raw.
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(KREA_2_RAW_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_RAW_ID, &spec)
+            .unwrap();
         let ok = GenerationRequest {
             prompt: "a red apple on a wooden table".into(),
             width: 1024,
@@ -648,7 +633,10 @@ mod tests {
     #[test]
     fn validate_accepts_txt2img_and_rejects_bad() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(KREA_2_TURBO_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_TURBO_ID, &spec)
+            .unwrap();
         let ok = GenerationRequest {
             prompt: "a red apple on a wooden table".into(),
             width: 1024,
@@ -682,7 +670,10 @@ mod tests {
     #[test]
     fn validate_rejects_whitespace_only_prompt() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(KREA_2_TURBO_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_TURBO_ID, &spec)
+            .unwrap();
         for ws in ["   ", "\t", "\n", " \t\n "] {
             let req = GenerationRequest {
                 prompt: ws.into(),
@@ -700,7 +691,10 @@ mod tests {
     #[test]
     fn validate_rejects_guidance_and_negative_prompt() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(KREA_2_TURBO_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_TURBO_ID, &spec)
+            .unwrap();
         let base = GenerationRequest {
             prompt: "x".into(),
             width: 512,
@@ -811,7 +805,10 @@ mod tests {
     #[test]
     fn registers_krea_2_edit_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(KREA_2_EDIT_ID, &spec).expect("krea_2_edit is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_EDIT_ID, &spec)
+            .expect("krea_2_edit is registered");
         assert_eq!(g.descriptor().id, KREA_2_EDIT_ID);
         assert_eq!(g.descriptor().family, "krea_2");
         assert_eq!(g.descriptor().backend, "candle");

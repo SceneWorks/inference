@@ -124,44 +124,21 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit_generators: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility_generators: Vec<String> = mlx_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "sd3" && descriptor.backend == "mlx")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
         let explicit_trainers: Vec<String> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility_trainers: Vec<String> = mlx_gen::gen_core::registry::trainers()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "sd3" && descriptor.backend == "mlx")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
 
-        compatibility_generators.sort();
-        compatibility_trainers.sort();
-        let mut sorted_explicit_generators = explicit_generators.clone();
-        let mut sorted_explicit_trainers = explicit_trainers.clone();
-        sorted_explicit_generators.sort();
-        sorted_explicit_trainers.sort();
-
-        assert_eq!(sorted_explicit_generators, compatibility_generators);
         assert_eq!(
             explicit_generators,
             ["sd3_5_large", "sd3_5_large_turbo", "sd3_5_medium"]
         );
-        assert_eq!(sorted_explicit_trainers, compatibility_trainers);
         assert_eq!(explicit_trainers, ["sd3_5_large", "sd3_5_medium"]);
     }
 }

@@ -396,24 +396,13 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "sensenova-u1" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        let mut sorted_explicit = explicit.clone();
-        sorted_explicit.sort();
-        compatibility.sort();
 
-        assert_eq!(sorted_explicit, compatibility);
         assert_eq!(explicit, ["sensenova_u1_8b", "sensenova_u1_8b_fast"]);
     }
 }
@@ -421,12 +410,14 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::{AdapterKind, AdapterSpec, Conditioning, Image, Quant};
 
     #[test]
     fn registers_both_ids_as_candle() {
-        let ids: Vec<&str> = registry::generators()
+        let ids: Vec<&str> = crate::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
             .map(|r| (r.descriptor)().id)
             .collect();
         assert!(ids.contains(&MODEL_ID), "{MODEL_ID} not registered");
@@ -436,7 +427,10 @@ mod tests {
         );
 
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).expect("candle sensenova is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("candle sensenova is registered");
         assert_eq!(g.descriptor().id, "sensenova_u1_8b");
         assert_eq!(g.descriptor().family, "sensenova-u1");
         assert_eq!(g.descriptor().backend, "candle");
@@ -465,7 +459,10 @@ mod tests {
     #[test]
     fn validate_accepts_t2i_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
 
         let ok = GenerationRequest {
             prompt: "a cat holding a lit candle".into(),

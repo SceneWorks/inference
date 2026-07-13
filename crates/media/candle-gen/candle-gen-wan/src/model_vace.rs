@@ -429,7 +429,6 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::ReplacementMode;
 
     fn control_req() -> GenerationRequest {
@@ -469,7 +468,10 @@ mod tests {
     #[test]
     fn registers_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID_VACE, &spec).expect("wan_vace is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_VACE, &spec)
+            .expect("wan_vace is registered");
         assert_eq!(g.descriptor().id, MODEL_ID_VACE);
         assert_eq!(g.descriptor().family, "wan");
         assert_eq!(g.descriptor().backend, "candle");
@@ -492,7 +494,10 @@ mod tests {
     #[test]
     fn validate_accepts_control_clip_and_rejects_bad_shapes() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID_VACE, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_VACE, &spec)
+            .unwrap();
         assert!(g.validate(&control_req()).is_ok());
 
         // No control clip.
@@ -528,7 +533,10 @@ mod tests {
     #[test]
     fn validate_rejects_frames_disagreeing_with_clip() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID_VACE, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_VACE, &spec)
+            .unwrap();
 
         // Agrees with the 5-frame control clip → accepted.
         let mut ok = control_req();
@@ -554,7 +562,10 @@ mod tests {
     #[test]
     fn validate_enforces_max_area() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID_VACE, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_VACE, &spec)
+            .unwrap();
 
         // Exactly at the cap (1280×704 = 901 120 px, both multiples of 16) is accepted.
         assert_eq!(704 * 1280, MAX_AREA_14B);

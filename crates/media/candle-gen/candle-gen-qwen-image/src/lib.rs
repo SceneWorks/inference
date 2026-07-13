@@ -779,21 +779,13 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "qwen-image" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
 
-        assert_eq!(explicit, compatibility);
         assert_eq!(explicit, ["qwen_image"]);
     }
 }
@@ -801,7 +793,6 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::ConditioningKind;
 
     /// sc-11187 / F-085: the CFG negative must never reach `tokenize("")`. An absent, empty, or
@@ -825,7 +816,10 @@ mod tests {
     #[test]
     fn registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).expect("qwen_image is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("qwen_image is registered");
         assert_eq!(g.descriptor().id, MODEL_ID);
         assert_eq!(g.descriptor().family, "qwen-image");
         assert_eq!(g.descriptor().backend, "candle");
@@ -969,7 +963,10 @@ mod tests {
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
         let ok = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
             guidance: Some(4.0),

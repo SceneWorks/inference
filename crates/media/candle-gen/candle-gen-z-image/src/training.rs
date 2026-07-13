@@ -590,7 +590,6 @@ impl FlowMatchTrainer for ZImageTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::train::lora::build_lora_targets;
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
     use candle_nn::{VarBuilder, VarMap};
@@ -846,7 +845,9 @@ mod tests {
     #[test]
     fn trainer_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer("z_image_turbo", &spec)
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer("z_image_turbo", &spec)
             .expect("candle z-image trainer is registered");
         assert_eq!(t.descriptor().id, "z_image_turbo");
         assert_eq!(t.descriptor().backend, "candle");
@@ -861,7 +862,10 @@ mod tests {
     fn validate_rejects_bad_requests() {
         use candle_gen::gen_core::runtime::CancelFlag;
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer("z_image_turbo", &spec).unwrap();
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer("z_image_turbo", &spec)
+            .unwrap();
 
         let item = candle_gen::gen_core::train::TrainingItem {
             image_path: "/img.png".into(),

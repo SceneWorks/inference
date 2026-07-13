@@ -348,24 +348,13 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "anima" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        let mut sorted_explicit = explicit.clone();
-        sorted_explicit.sort();
-        compatibility.sort();
 
-        assert_eq!(sorted_explicit, compatibility);
         assert_eq!(explicit, ["anima_base", "anima_aesthetic", "anima_turbo"]);
     }
 }
@@ -373,7 +362,6 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -387,11 +375,13 @@ mod tests {
     #[test]
     fn three_variants_registered_as_candle() {
         for id in ["anima_base", "anima_aesthetic", "anima_turbo"] {
-            let g = registry::load(
-                id,
-                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
-            )
-            .unwrap_or_else(|_| panic!("id {id} not registered"));
+            let g = crate::provider_registry()
+                .unwrap()
+                .load(
+                    id,
+                    &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+                )
+                .unwrap_or_else(|_| panic!("id {id} not registered"));
             assert_eq!(g.descriptor().id, id);
             assert_eq!(g.descriptor().family, "anima");
             assert_eq!(g.descriptor().backend, "candle");

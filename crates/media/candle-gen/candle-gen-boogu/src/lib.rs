@@ -346,24 +346,13 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "boogu" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        let mut sorted_explicit = explicit.clone();
-        sorted_explicit.sort();
-        compatibility.sort();
 
-        assert_eq!(sorted_explicit, compatibility);
         assert_eq!(
             explicit,
             ["boogu_image", "boogu_image_turbo", "boogu_image_edit"]
@@ -374,13 +363,15 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
 
     #[test]
     fn registers_all_three_ids_as_candle() {
         for id in [BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID, BOOGU_IMAGE_EDIT_ID] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-            let g = registry::load(id, &spec).unwrap_or_else(|_| panic!("{id} is registered"));
+            let g = crate::provider_registry()
+                .unwrap()
+                .load(id, &spec)
+                .unwrap_or_else(|_| panic!("{id} is registered"));
             assert_eq!(g.descriptor().id, id);
             assert_eq!(g.descriptor().family, "boogu");
             assert_eq!(g.descriptor().backend, "candle");
@@ -449,7 +440,10 @@ mod tests {
     #[test]
     fn edit_validate_reference_count() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(BOOGU_IMAGE_EDIT_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(BOOGU_IMAGE_EDIT_ID, &spec)
+            .unwrap();
         let img = |w: u32, h: u32| Image {
             width: w,
             height: h,
@@ -501,7 +495,10 @@ mod tests {
     fn base_rejects_reference_conditioning() {
         // Base has no conditioning surface, so the capability floor rejects a Reference.
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(BOOGU_IMAGE_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(BOOGU_IMAGE_ID, &spec)
+            .unwrap();
         let r = GenerationRequest {
             prompt: "x".into(),
             width: 512,
@@ -522,7 +519,10 @@ mod tests {
     #[test]
     fn validate_accepts_txt2img_and_rejects_bad() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(BOOGU_IMAGE_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(BOOGU_IMAGE_ID, &spec)
+            .unwrap();
         let ok = GenerationRequest {
             prompt: "a red apple on a wooden table".into(),
             guidance: Some(4.0),
@@ -552,7 +552,10 @@ mod tests {
     #[test]
     fn validate_rejects_whitespace_only_prompt() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(BOOGU_IMAGE_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(BOOGU_IMAGE_ID, &spec)
+            .unwrap();
         for ws in ["   ", "\t", "\n", " \t\n "] {
             let req = GenerationRequest {
                 prompt: ws.into(),

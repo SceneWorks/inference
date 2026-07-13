@@ -482,36 +482,17 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+    fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let explicit_generators: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let mut compatibility_generators: Vec<String> =
-            candle_gen::gen_core::registry::generators()
-                .filter_map(|registration| {
-                    let descriptor = (registration.descriptor)();
-                    (descriptor.family == "wan" && descriptor.backend == "candle")
-                        .then(|| descriptor.id.to_string())
-                })
-                .collect();
         let explicit_trainers: Vec<String> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        let compatibility_trainers: Vec<String> = candle_gen::gen_core::registry::trainers()
-            .filter_map(|registration| {
-                let descriptor = (registration.descriptor)();
-                (descriptor.family == "wan" && descriptor.backend == "candle")
-                    .then(|| descriptor.id.to_string())
-            })
-            .collect();
-        let mut sorted_explicit_generators = explicit_generators.clone();
-        sorted_explicit_generators.sort();
-        compatibility_generators.sort();
 
-        assert_eq!(sorted_explicit_generators, compatibility_generators);
         assert_eq!(
             explicit_generators,
             [
@@ -521,7 +502,6 @@ mod explicit_registry_tests {
                 "wan_vace",
             ]
         );
-        assert_eq!(explicit_trainers, compatibility_trainers);
         assert_eq!(explicit_trainers, ["wan2_2_t2v_14b"]);
     }
 }
@@ -529,13 +509,15 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::registry;
     use candle_gen::gen_core::ConditioningKind;
 
     #[test]
     fn registers_and_resolves_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).expect("wan is registered");
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("wan is registered");
         assert_eq!(g.descriptor().id, MODEL_ID);
         assert_eq!(g.descriptor().family, "wan");
         assert_eq!(g.descriptor().backend, "candle");
@@ -560,7 +542,10 @@ mod tests {
     #[test]
     fn validate_accepts_txt2video_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
         let ok = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
             width: 512,

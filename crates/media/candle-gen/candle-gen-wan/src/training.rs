@@ -715,7 +715,6 @@ fn apply_update(ex: &mut ExpertState, accum: u32, cfg: &TrainingConfig) -> Resul
 mod tests {
     use super::*;
     use candle_gen::candle_nn::{VarBuilder, VarMap};
-    use candle_gen::gen_core::registry;
     use candle_gen::train::lora::build_lora_targets;
     use candle_gen::train::optim::clip_grad_norm;
 
@@ -1096,7 +1095,9 @@ mod tests {
     #[test]
     fn trainer_registers_and_resolves_as_candle() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer(MODEL_ID_T2V_14B, &spec)
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer(MODEL_ID_T2V_14B, &spec)
             .expect("candle wan a14b trainer is registered");
         assert_eq!(t.descriptor().id, MODEL_ID_T2V_14B);
         assert_eq!(t.descriptor().backend, "candle");
@@ -1111,7 +1112,10 @@ mod tests {
         use candle_gen::gen_core::runtime::CancelFlag;
         use candle_gen::gen_core::train::TrainingItem;
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = registry::load_trainer(MODEL_ID_T2V_14B, &spec).unwrap();
+        let t = crate::provider_registry()
+            .unwrap()
+            .load_trainer(MODEL_ID_T2V_14B, &spec)
+            .unwrap();
         let base = TrainingRequest {
             items: vec![TrainingItem {
                 image_path: "/img.png".into(),
