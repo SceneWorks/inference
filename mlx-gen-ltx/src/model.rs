@@ -59,6 +59,7 @@ use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 use crate::pipeline::{
     decode_audio_track, decode_to_frames, generate_av_latents, generate_av_latents_iclora,
     preprocess_conditioning_clip, preprocess_conditioning_image, StageClip, StageKeyframe,
+    STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
@@ -131,6 +132,56 @@ const TEMPORAL_SCALE: u32 = 8;
 const MAX_FRAMES: u32 = 1025;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
 const SPATIAL_SCALE: u32 = 32;
+/// The folded denoise-step total surfaced as `Progress::Step.total` (F-050): stage-1 (`STAGE1_SIGMAS`,
+/// 8 steps) + stage-2 (`STAGE2_SIGMAS`, 3 steps) of the baked distilled schedule.
+const TOTAL_STEPS: u32 = (STAGE1_SIGMAS.len() + STAGE2_SIGMAS.len() - 2) as u32;
+
+/// Folds the LTX two-stage distilled denoise into one monotone `1..=TOTAL_STEPS` progress bar
+/// (F-050, sc-11133). Each stage forwards a **per-stage** 1-based `current` (the σ-derived value from
+/// `step_gate` on the curated path, or `i+1` on the native path) that restarts at 1 when the next
+/// stage begins; a curated 2nd-order solver (`heun`/`dpmpp_sde`) also forwards the same `current`
+/// twice per step (predictor + corrector). [`observe`](StageProgressFold::observe) maps that raw
+/// stream to an absolute, deduplicated, clamped `current`: it returns `Some(current)` only when the
+/// global bar strictly advances, so the emitted sequence is monotone non-decreasing, reaches `total`,
+/// and never overruns it.
+struct StageProgressFold {
+    total: u32,
+    /// Steps completed in prior stages (added to the current stage's forwarded value).
+    stage_offset: u32,
+    /// The last per-stage value observed (a drop below it signals a new stage).
+    last_fwd: u32,
+    /// The last absolute `current` emitted (dedupe / monotonicity anchor).
+    emitted: u32,
+}
+
+impl StageProgressFold {
+    fn new(total: u32) -> Self {
+        Self {
+            total,
+            stage_offset: 0,
+            last_fwd: 0,
+            emitted: 0,
+        }
+    }
+
+    /// Observe one forwarded per-stage `current`; returns the absolute bar position to emit, or
+    /// `None` if the bar did not advance (a multi-eval repeat).
+    fn observe(&mut self, fwd: u32) -> Option<u32> {
+        if fwd < self.last_fwd {
+            // The forwarded value dropped — the next stage restarted its counter at 1. Fold the
+            // completed stages in so this stage's steps stack on top rather than overwriting.
+            self.stage_offset = self.emitted;
+        }
+        self.last_fwd = fwd;
+        let abs = (self.stage_offset + fwd).min(self.total);
+        if abs > self.emitted {
+            self.emitted = abs;
+            Some(abs)
+        } else {
+            None
+        }
+    }
+}
 /// I2V conditioning strength when neither the `Reference` nor `req.strength` supplies one (reference
 /// CLI `--image-strength` default): `1.0` = full denoise, fully pinning the conditioned frame.
 const DEFAULT_IMAGE_STRENGTH: f32 = 1.0;
@@ -495,6 +546,12 @@ impl Ltx {
         audio_s2: &Array,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // F-051: honor a cancel before the (unbounded) pre-denoise conditioning stage — the Gemma TE
+        // encode plus up-to-N per-keyframe/per-clip VAE encodes all run here, ahead of the first
+        // denoise-loop check.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let (ids, mask) = self.tokenizer.encode(&req.prompt, MAX_PROMPT_TOKENS)?;
         let (video_ctx, audio_ctx) = self.text_encoder.encode_av(&ids, &mask)?;
         // Replace-latent conditioning: VAE-encode each keyframe at both stage resolutions (half/full).
@@ -578,13 +635,21 @@ impl Ltx {
             ));
         }
 
-        let mut step = 0usize;
-        let mut on_step = |_: usize| {
-            step += 1;
-            on_progress(Progress::Step {
-                current: step as u32,
-                total: 11,
-            });
+        // F-050 (sc-11133): fold the two-stage (8 + 3 step) distilled schedule into one monotone
+        // `1..=11` bar from the σ-DERIVED `current` each stage forwards — NOT a blind per-call counter.
+        // The curated 2nd-order solvers LTX advertises (`heun`, `dpmpp_sde`) evaluate the model twice
+        // per step, so `on_step` fires twice per step; the old counter reached 22 against `total: 11`
+        // (>100% overrun). `StageProgressFold` detects the per-stage restart, folds prior stages in,
+        // dedupes the multi-eval repeats, and clamps — so the bar stays monotone non-decreasing,
+        // reaches `total`, and never overruns.
+        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let mut on_step = |cur: usize| {
+            if let Some(current) = fold.observe(cur as u32) {
+                on_progress(Progress::Step {
+                    current,
+                    total: TOTAL_STEPS,
+                });
+            }
         };
         // extend_clip / video_bridge ride the IC-LoRA keyframe-append path (stage-1 in-context tokens);
         // everything else (T2V / I2V / first_last_frame) is the replace-latent path.
@@ -632,7 +697,7 @@ impl Ltx {
         };
 
         on_progress(Progress::Decoding);
-        let frames = decode_to_frames(&self.vae, &video_latents)?;
+        let frames = decode_to_frames(&self.vae, &video_latents, &req.cancel)?;
         let images = frames_to_images(&frames)?;
         // Audio always denoised (it conditions the video); decode it unless `--no-audio`.
         let audio = if Self::no_audio(req) {
@@ -643,6 +708,7 @@ impl Ltx {
                 &self.vocoder,
                 &audio_latents,
                 self.audio_sample_rate,
+                &req.cancel,
             )?)
         };
         Ok(GenerationOutput::Video {
@@ -688,14 +754,20 @@ impl Ltx {
         let lf = Self::latent_dims(req).0 as i32;
         let mut out = Vec::new();
         if let Some((image, strength)) = self.resolve_reference(req)? {
-            out.push((
-                self.encode_conditioning(image, req.height / 2, req.width / 2)?,
-                self.encode_conditioning(image, req.height, req.width)?,
-                IMAGE_FRAME_IDX,
-                strength,
-            ));
+            // F-051: check + materialize before each VAE encode so a cancel during this (unbounded)
+            // conditioning stage is honored between encodes rather than only at the first denoise step.
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let s1 = self.encode_conditioning(image, req.height / 2, req.width / 2)?;
+            let s2 = self.encode_conditioning(image, req.height, req.width)?;
+            mlx_rs::transforms::eval([&s1, &s2])?;
+            out.push((s1, s2, IMAGE_FRAME_IDX, strength));
         }
         for kf in req.keyframes() {
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let idx = if kf.frame_idx < 0 {
                 lf + kf.frame_idx
             } else {
@@ -707,12 +779,10 @@ impl Ltx {
                     kf.frame_idx
                 )));
             }
-            out.push((
-                self.encode_conditioning(kf.image, req.height / 2, req.width / 2)?,
-                self.encode_conditioning(kf.image, req.height, req.width)?,
-                idx,
-                kf.strength,
-            ));
+            let s1 = self.encode_conditioning(kf.image, req.height / 2, req.width / 2)?;
+            let s2 = self.encode_conditioning(kf.image, req.height, req.width)?;
+            mlx_rs::transforms::eval([&s1, &s2])?;
+            out.push((s1, s2, idx, kf.strength));
         }
         Ok(out)
     }
@@ -727,6 +797,10 @@ impl Ltx {
         let lf = Self::latent_dims(req).0 as i32;
         let mut out = Vec::new();
         for clip in req.video_clips() {
+            // F-051: honor a cancel between the (unbounded) per-clip VAE encodes.
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             if clip.frames.is_empty() {
                 return Err(Error::Msg(
                     "ltx_2_3: video conditioning clip is empty".into(),
@@ -744,7 +818,9 @@ impl Ltx {
                 )));
             }
             let video = preprocess_conditioning_clip(clip.frames, req.width / 2, req.height / 2)?;
-            out.push((self.vae.encode(&video)?, idx, clip.strength));
+            let latent = self.vae.encode(&video)?;
+            latent.eval()?;
+            out.push((latent, idx, clip.strength));
         }
         // replace_person: the masked control clip rides the same keyframe-append path. Build the
         // gray-neutralized control frames host-side (port of the worker's `_apply_replacement_mask`),
@@ -753,6 +829,9 @@ impl Ltx {
         // but does not change the math here — the per-frame mask already encodes the region (the native
         // LTX path is region-driven; `replacement_mode` only affects the diffusers WanVACE path).
         if let Some(cc) = req.control_clip() {
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             if cc.frames.is_empty() {
                 return Err(Error::Msg(
                     "ltx_2_3: replace_person control clip is empty".into(),
@@ -783,7 +862,9 @@ impl Ltx {
                 .map(|(f, m)| apply_replacement_mask(f, m, cc.masking_strength))
                 .collect::<Result<_>>()?;
             let video = preprocess_conditioning_clip(&masked, req.width / 2, req.height / 2)?;
-            out.push((self.vae.encode(&video)?, idx, cc.masking_strength));
+            let latent = self.vae.encode(&video)?;
+            latent.eval()?;
+            out.push((latent, idx, cc.masking_strength));
         }
         Ok(out)
     }
@@ -909,6 +990,36 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
+    // F-054: range-validate every conditioning strength to [0, 1]. `strength > 1` → a negative denoise
+    // mask (`1 − strength`) → negative per-token σ timesteps and extrapolating blends (silent garbage,
+    // every stage "succeeds"); `< 0` (or NaN — `contains` is false for NaN) is likewise degenerate.
+    // `apply_replacement_mask` clamps a local copy but the same value flows unclamped as the clip
+    // strength, so reject it at the request boundary. The top-level img2img `strength` is also covered
+    // by the shared floor's finiteness guard; the range check here is LTX-specific.
+    let check_strength = |label: &str, s: f32| -> Result<()> {
+        if !(0.0..=1.0).contains(&s) {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: {label} strength must be in [0, 1] (got {s})"
+            )));
+        }
+        Ok(())
+    };
+    if let Some(s) = req.strength {
+        check_strength("img2img", s)?;
+    }
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference {
+                strength: Some(s), ..
+            } => check_strength("reference", *s)?,
+            Conditioning::Keyframe { strength, .. } => check_strength("keyframe", *strength)?,
+            Conditioning::VideoClip { strength, .. } => check_strength("video clip", *strength)?,
+            Conditioning::ControlClip {
+                masking_strength, ..
+            } => check_strength("control clip masking", *masking_strength)?,
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -992,6 +1103,45 @@ mlx_gen::register_generators! { descriptor => load }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-050 (sc-11133): drive `StageProgressFold` over the exact event stream a curated 2nd-order
+    /// solver produces — each stage's σ-derived `current` forwarded TWICE per step (predictor +
+    /// corrector) — and assert the folded bar is monotone, reaches `TOTAL_STEPS`, and never overruns.
+    /// Before the fix the blind counter reached 22 against `total: 11`.
+    #[test]
+    fn stage_progress_fold_dedupes_multi_eval_and_reaches_total() {
+        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let mut emitted = Vec::new();
+        // Stage 1: 8 steps, each forwarded value seen twice (heun predictor+corrector), monotone
+        // per-stage 1..=8. Stage 2: 3 steps, restarts at 1, forwarded 1..=3 twice each.
+        let stage1: Vec<u32> = (1..=8).flat_map(|c| [c, c]).collect();
+        let stage2: Vec<u32> = (1..=3).flat_map(|c| [c, c]).collect();
+        for fwd in stage1.into_iter().chain(stage2) {
+            if let Some(cur) = fold.observe(fwd) {
+                emitted.push(cur);
+            }
+        }
+        assert_eq!(
+            emitted,
+            (1..=11).collect::<Vec<_>>(),
+            "the folded bar must be exactly 1..=11 (monotone, complete, no overrun)"
+        );
+    }
+
+    /// The native distilled path forwards `i+1` once per step (no multi-eval); the fold must still
+    /// produce the same clean `1..=11` sequence.
+    #[test]
+    fn stage_progress_fold_handles_single_eval_native_path() {
+        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let mut emitted = Vec::new();
+        for fwd in (1..=8).chain(1..=3) {
+            if let Some(cur) = fold.observe(fwd) {
+                emitted.push(cur);
+            }
+        }
+        assert_eq!(emitted, (1..=11).collect::<Vec<_>>());
+        assert_eq!(TOTAL_STEPS, 11);
+    }
 
     #[test]
     fn descriptor_advertises_curated_samplers_no_scheduler() {

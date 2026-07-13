@@ -326,6 +326,8 @@ fn trainer_descriptor_for(variant: Variant) -> TrainerDescriptor {
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,
+        // LoRA/LoKr only — no control-branch training path (F-006).
+        supports_control: false,
     }
 }
 
@@ -388,6 +390,9 @@ impl Trainer for AnimaTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+        // request (typed `Unsupported`) rather than silently training a plain adapter.
+        gen_core::train::validate_control_request(self.descriptor(), req)?;
         validate_request(req)?;
         if resolve_target_paths(&self.dit, &self.conditioner, &req.config).is_empty() {
             return Err(format!(
@@ -736,6 +741,7 @@ impl AnimaTrainer {
                         edge,
                         sample_seed,
                         compute_dtype,
+                        &req.cancel,
                     ) {
                         Ok(image) => on_progress(TrainingProgress::Sample {
                             step,
@@ -744,6 +750,9 @@ impl AnimaTrainer {
                             prompt: prompt.clone(),
                             image,
                         }),
+                        // F-117: a cancelled preview denoise exits the preview loop (the outer loop's
+                        // cancel check then unwinds the run); other failures skip one preview.
+                        Err(mlx_gen::Error::Canceled) => break,
                         Err(e) => eprintln!(
                             "[sc-10641] anima preview sample failed at step {step} (prompt {}): {e} \
                              — skipping this preview, training continues",
@@ -1854,6 +1863,7 @@ mod tests {
             1.0,
             7,
             Dtype::Float32,
+            &Default::default(),
         )
         .unwrap();
         // Same DiT, but a STALE (pre-training) conditioner output — the trap.
@@ -1866,6 +1876,7 @@ mod tests {
             1.0,
             7,
             Dtype::Float32,
+            &Default::default(),
         )
         .unwrap();
         // Positive control: feed render_latent_with_enc the LIVE conditioner output → must equal the
@@ -1880,6 +1891,7 @@ mod tests {
             1.0,
             7,
             Dtype::Float32,
+            &Default::default(),
         )
         .unwrap();
         eval([&latent_live, &latent_stale, &latent_ctrl]).unwrap();

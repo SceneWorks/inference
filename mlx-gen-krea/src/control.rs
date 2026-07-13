@@ -91,8 +91,10 @@ impl Krea2ControlBranch {
     }
 
     /// Assemble the branch from an already-loaded overlay. Infers `N` from the `blocks.{i}.*` keys and
-    /// builds each block through the unmodified [`SingleStreamBlock::from_weights`] (the converter
-    /// pre-unfolds the RMSNorm scales to the raw `*.weight` this expects) plus its `proj_out`.
+    /// builds each block through the unmodified [`SingleStreamBlock::from_weights`] plus its `proj_out`.
+    /// F-075: there is NO offline convert step — the candle-gen pose overlay ships the RMSNorm scales
+    /// pre-folded as `*.weight_p1` (`= scale + 1`), and `crate::transformer::block::RmsScale::from_weights`
+    /// loads that verbatim (native `weight_p1` load, sc-8465), so the overlay drops straight in.
     pub fn from_weights(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
         let (heads, kv, hd, hidden, eps) = (
             cfg.num_attention_heads as i32,
@@ -105,7 +107,8 @@ impl Krea2ControlBranch {
         if n == 0 {
             return Err(Error::Msg(
                 "krea_2_turbo_control: overlay has no `blocks.{i}.*` control-branch tensors — is this \
-                 the converted MLX pose overlay (examples/krea-control-convert.rs)?"
+                 the Krea 2 pose-control overlay (the candle-gen `.safetensors` with `blocks.{i}.*` + \
+                 `blocks.{i}.proj_out` and pre-folded `*.weight_p1` RMSNorm scales)?"
                     .into(),
             ));
         }
@@ -133,6 +136,28 @@ impl Krea2ControlBranch {
     /// The injection offset read from the overlay.
     pub fn inject_offset(&self) -> usize {
         self.inject_offset
+    }
+
+    /// Pack the branch's Linear projections to Q4/Q8 in place (sc-11748) — each copied
+    /// [`SingleStreamBlock`]'s attention + SwiGLU (through its own `quantize`) plus the zero-init
+    /// `proj_out`, all at the Krea [`crate::quant::GROUP_SIZE`]. The MLX twin of
+    /// [`crate::pipeline::KreaHeavy::quantize`] over the base DiT: the SAME group-wise affine packer and
+    /// dequant-on-forward math, so a branch packed to the base tier carries the base's numerics (candle
+    /// #480 GPU-proof: q8 ≈ bf16 pose-lock, q4 keeps pose-lock with mild haze). The RMSNorm scales,
+    /// `scale_shift_table`, and the residual clamp stay dense — negligible bytes, never the memory win —
+    /// matching the base DiT's quant-target set. Idempotent: [`AdaptableLinear::quantize`] skips an
+    /// already-packed base, so a re-quantize is a no-op.
+    ///
+    /// LOAD-TIME only — the branch is a resident weight that cannot be re-packed mid-render, so
+    /// [`crate::model_control`]'s `load_control_heavy` decides once at load (via the sc-11750 budget gate)
+    /// whether to call this. `control_scale == 0` still short-circuits to the bit-exact base forward
+    /// regardless of tier (the branch is skipped there).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for cb in &mut self.blocks {
+            cb.block.quantize(bits)?;
+            cb.proj_out.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        }
+        Ok(())
     }
 
     /// Velocity prediction with the pose-control residual injected — the MLX twin of the candle
@@ -330,6 +355,82 @@ mod tests {
             (got - 0.1).abs() < 1e-4,
             "in-budget RMS should pass through, got {got}"
         );
+    }
+
+    /// A `[out, in]` weight filled with a deterministic nonzero ramp (avoids a degenerate all-zero group
+    /// scale in the quantizer). Every quant-target in-dim in [`tiny_overlay`] is a multiple of the Krea
+    /// group size (64), so [`Krea2ControlBranch::quantize`] can pack it.
+    fn ramp(out: i32, in_: i32) -> Array {
+        let n = (out * in_) as usize;
+        let data: Vec<f32> = (0..n).map(|k| 0.02 * ((k % 17) as f32 - 8.0)).collect();
+        Array::from_slice(&data, &[out, in_])
+    }
+
+    /// A synthetic pose overlay of `n` group-aligned branch blocks (`hidden = 64`), enough to build a real
+    /// [`Krea2ControlBranch`] and pack it — values are irrelevant (these tests route by the quantized flag,
+    /// never forward).
+    fn tiny_overlay(n: usize) -> (Weights, Krea2Config) {
+        let cfg = Krea2Config {
+            hidden_size: 64,
+            num_attention_heads: 2,
+            num_kv_heads: 1,
+            attention_head_dim: 32,
+            intermediate_size: 128,
+            ..Krea2Config::turbo()
+        };
+        let (h, q, kv, inter, hd) = (64, 64, 32, 128, 32);
+        let mut w = Weights::empty();
+        for i in 0..n {
+            let p = format!("blocks.{i}");
+            w.insert(format!("{p}.scale_shift_table"), ramp(6, h));
+            w.insert(
+                format!("{p}.norm1.weight"),
+                ramp(1, h).reshape(&[h]).unwrap(),
+            );
+            w.insert(
+                format!("{p}.norm2.weight"),
+                ramp(1, h).reshape(&[h]).unwrap(),
+            );
+            w.insert(format!("{p}.attn.to_q.weight"), ramp(q, h));
+            w.insert(format!("{p}.attn.to_k.weight"), ramp(kv, h));
+            w.insert(format!("{p}.attn.to_v.weight"), ramp(kv, h));
+            w.insert(format!("{p}.attn.to_gate.weight"), ramp(q, h));
+            w.insert(format!("{p}.attn.to_out.0.weight"), ramp(h, q));
+            w.insert(
+                format!("{p}.attn.norm_q.weight"),
+                ramp(1, hd).reshape(&[hd]).unwrap(),
+            );
+            w.insert(
+                format!("{p}.attn.norm_k.weight"),
+                ramp(1, hd).reshape(&[hd]).unwrap(),
+            );
+            w.insert(format!("{p}.ff.gate.weight"), ramp(inter, h));
+            w.insert(format!("{p}.ff.up.weight"), ramp(inter, h));
+            w.insert(format!("{p}.ff.down.weight"), ramp(h, inter));
+            w.insert(format!("{p}.proj_out.weight"), ramp(h, h));
+        }
+        (w, cfg)
+    }
+
+    /// sc-11748: `quantize` packs every branch block's `proj_out` (and its attn/SwiGLU — a quantize error
+    /// there would fail the pass) at both tiers, and is idempotent (a re-quantize stays packed, no error).
+    #[test]
+    fn quantize_packs_every_block_and_is_idempotent() {
+        for bits in [8, 4] {
+            let (w, cfg) = tiny_overlay(3);
+            let mut branch = Krea2ControlBranch::from_weights(&w, &cfg).unwrap();
+            assert!(
+                branch.blocks.iter().all(|b| !b.proj_out.is_quantized()),
+                "the bf16 overlay must load dense"
+            );
+            branch.quantize(bits).unwrap();
+            assert!(
+                branch.blocks.iter().all(|b| b.proj_out.is_quantized()),
+                "every proj_out must pack at q{bits}"
+            );
+            branch.quantize(bits).unwrap(); // idempotent
+            assert!(branch.blocks.iter().all(|b| b.proj_out.is_quantized()));
+        }
     }
 
     /// A zero residual (step 0, zero-init `proj_out`) survives the clamp as zero — the identity that

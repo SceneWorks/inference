@@ -157,6 +157,8 @@ fn trainer_descriptor() -> TrainerDescriptor {
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,
+        // LoRA/LoKr only — no control-branch training path (F-006).
+        supports_control: false,
     }
 }
 
@@ -263,6 +265,9 @@ impl Trainer for KreaRawTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+        // request (typed `Unsupported`) rather than silently training a plain adapter.
+        gen_core::train::validate_control_request(self.descriptor(), req)?;
         validate_request(req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would train zero
         // parameters yet "succeed". Catch it here, where the loaded DiT is available to match against.
@@ -902,6 +907,16 @@ fn render_sample(
     let noise = random::normal::<f32>(&[1, 16, hl, wl], None, None, Some(&random::key(seed)?))?;
     let img_seq = (edge as f64 / 16.0).powi(2);
     let sigmas = krea_sigmas(steps, dynamic_mu(img_seq));
+    // Hoist the step-invariant text fusion + host RoPE out of the per-step closure (F-079), matching the
+    // inference render paths: `prepare` depends only on the context + latent geometry (never the noise
+    // values or timestep), so building the prep(s) ONCE and reusing them via `forward_prepared` is
+    // bit-identical to the per-step `forward` (which was `prepare` + `forward_prepared` internally).
+    let prep_pos = dit.prepare(ctx_pos, None, &noise)?;
+    let prep_neg = if guidance > 0.0 {
+        Some(dit.prepare(ctx_neg, None, &noise)?)
+    } else {
+        None
+    };
     // F-077: honor the training request's cancel per denoise step. Previously a fresh
     // `CancelFlag::new()` here meant the preview render could never be cancelled mid-denoise.
     let lat = run_flow_sampler(
@@ -914,17 +929,18 @@ fn render_sample(
         &mut |_: Progress| {},
         |x, timestep| {
             let tt = Array::from_slice(&[timestep], &[1]);
-            let v_cond = dit.forward(x, &tt, ctx_pos, None)?;
+            let v_cond = dit.forward_prepared(x, &tt, &prep_pos)?;
             // CFG via the shared [`krea_cfg_combine`] (reference `sampling.py:129`
             // `v_cond + g·(v_cond − v_uncond)`, one source of truth with the Raw inference path). Prior
             // to sc-10009 this used the standard `v_uncond + g·Δ`, which at the shared default
             // `sample_guidance_scale = 1.0` collapsed to exactly `v_cond` — zero effective CFG, the
             // washed-out previews. `guidance == 0` still collapses to the bare conditional velocity.
-            let v = if guidance > 0.0 {
-                let v_uncond = dit.forward(x, &tt, ctx_neg, None)?;
-                krea_cfg_combine(&v_cond, &v_uncond, guidance)?
-            } else {
-                v_cond
+            let v = match &prep_neg {
+                Some(neg) => {
+                    let v_uncond = dit.forward_prepared(x, &tt, neg)?;
+                    krea_cfg_combine(&v_cond, &v_uncond, guidance)?
+                }
+                None => v_cond,
             };
             Ok(v.as_dtype(Dtype::Float32)?)
         },

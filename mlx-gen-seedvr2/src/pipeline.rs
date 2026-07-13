@@ -197,7 +197,26 @@ impl Seedvr2Pipeline {
         softness: f32,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        self.generate_budgeted(
+        // Progress-free wrapper (unchanged public API): the registry path uses
+        // `generate_with_progress` to thread the folded per-tile / per-image bar (F-162/F-164).
+        self.generate_with_progress(image, width, height, seed, softness, cancel, &mut |_, _| {})
+    }
+
+    /// [`Self::generate`] with a per-tile progress hook (F-162/F-164, sc-11133): `on_step(tile_idx,
+    /// n_tiles)` fires once per completed tile on the spatial-tiling path, and once as `(1, 1)` on the
+    /// single-pass path, so the registry can fold a monotone, non-restarting bar across the count loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_progress(
+        &self,
+        image: &Image,
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Image> {
+        self.generate_budgeted_with_progress(
             image,
             width,
             height,
@@ -205,6 +224,7 @@ impl Seedvr2Pipeline {
             softness,
             video::safe_budget_gib(),
             cancel,
+            on_step,
         )
     }
 
@@ -225,6 +245,34 @@ impl Seedvr2Pipeline {
         safe_gib: f64,
         cancel: &CancelFlag,
     ) -> Result<Image> {
+        self.generate_budgeted_with_progress(
+            image,
+            width,
+            height,
+            seed,
+            softness,
+            safe_gib,
+            cancel,
+            &mut |_, _| {},
+        )
+    }
+
+    /// [`Self::generate_budgeted`] with the per-tile progress hook threaded through (F-162/F-164):
+    /// the tiled branch reports `(tile_idx, n_tiles)` per tile; the single-pass branch reports a lone
+    /// `(1, 1)` (and, like the pre-fix registry, checks cancel right after so a cancel tripped at that
+    /// step returns the typed error before the pass).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_budgeted_with_progress(
+        &self,
+        image: &Image,
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        safe_gib: f64,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Image> {
         // Tile when EITHER the memory budget is exceeded (sc-6067) OR the output edge is past the VAE
         // decoder's correctness limit (sc-8228/sc-8261): above ~1536² the decoder corrupts its output
         // in a single pass, so a 2048² upscale that *fits* memory must still be tiled. The spatial
@@ -235,7 +283,16 @@ impl Seedvr2Pipeline {
         );
         let over_vae_cap = width.max(height) > video::VAE_SAFE_DECODE_EDGE_PX;
         if over_budget || over_vae_cap {
-            return self.generate_tiled(image, width, height, seed, softness, safe_gib, cancel);
+            return self.generate_tiled(
+                image, width, height, seed, softness, safe_gib, cancel, on_step,
+            );
+        }
+
+        // Single-pass path: one logical "tile". Report it, then honor a cancel tripped at that step
+        // boundary before the (1-step) pass — mirroring the pre-fix registry's emit-then-check order.
+        on_step(1, 1);
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
         }
 
         let neg = self
@@ -286,6 +343,7 @@ impl Seedvr2Pipeline {
         softness: f32,
         safe_gib: f64,
         cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
     ) -> Result<Image> {
         let neg = self
             .neg_embed
@@ -295,9 +353,11 @@ impl Seedvr2Pipeline {
         let tile = video::plan_spatial_tile_px(self.weights_bytes, safe_gib);
         let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
         let processed = self.preprocess_frame(image, width, height, softness)?; // (1,3,1,H,W)
-        let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg, cancel)?;
+        let decoded = self.run_frame_tiled_with_progress(
+            &processed, seed, tile, overlap, &neg, cancel, on_step,
+        )?;
         Ok(self
-            .frames_from_decoded(&decoded, &processed, 1)?
+            .frames_from_decoded(&decoded, &processed, 1, cancel)?
             .into_iter()
             .next()
             .expect("one tiled frame"))
@@ -386,10 +446,18 @@ impl Seedvr2Pipeline {
         decoded: &Array,
         style: &Array,
         count: i32,
+        cancel: &CancelFlag,
     ) -> Result<Vec<Image>> {
         let style_t = style.shape()[2];
         let mut out = Vec::with_capacity(count as usize);
         for t in 0..count {
+            // F-163: per-frame color correction is single-threaded host math (5-level wavelet + three
+            // full-frame sorts, `as_slice`-materialized), so a whole chunk of it was uncancellable.
+            // Each iteration already forces the prior frame's work to host, making this a genuine
+            // per-frame yield point (no `eval` needed) — bounds cancel latency to one frame.
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let d = decoded.take_axis(Array::from_int(t), 2)?; // (1,3,Hc,Wc)
             let s = style.take_axis(Array::from_int(t.min(style_t - 1)), 2)?;
             let corrected = color::apply_color_correction(
@@ -530,7 +598,7 @@ impl Seedvr2Pipeline {
             let cond = Self::condition(&latent)?;
             let latents = self.denoise(&noise, &cond, &neg, &ts)?;
             let decoded = self.decode_crop_5d(&latents, height, width)?;
-            chunk_frames.push(self.frames_from_decoded(&decoded, &clip, *len)?);
+            chunk_frames.push(self.frames_from_decoded(&decoded, &clip, *len, cancel)?);
         }
         Ok(video::assemble_overlap(
             &plan,
@@ -607,7 +675,7 @@ impl Seedvr2Pipeline {
                 .preprocess(f, width, height, softness)?
                 .expand_dims(2)?; // (1,3,1,H,W)
             let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg, cancel)?;
-            let imgs = self.frames_from_decoded(&decoded, &processed, 1)?;
+            let imgs = self.frames_from_decoded(&decoded, &processed, 1, cancel)?;
             out.push(imgs.into_iter().next().expect("one frame"));
         }
         Ok(out)
@@ -629,13 +697,42 @@ impl Seedvr2Pipeline {
         neg: &Array,
         cancel: &CancelFlag,
     ) -> Result<Array> {
+        // Progress-free wrapper (unchanged public API): the still-image path threads a real per-tile
+        // reporter via `run_frame_tiled_with_progress` (F-164); parity/video callers don't need one.
+        self.run_frame_tiled_with_progress(
+            processed,
+            seed,
+            tile,
+            overlap,
+            neg,
+            cancel,
+            &mut |_, _| {},
+        )
+    }
+
+    /// [`Self::run_frame_tiled`] with a per-tile progress hook (F-164, sc-11133): `on_step(tile_idx,
+    /// n_tiles)` fires once per completed tile (1-based `tile_idx`), so the minutes-long HD upscale —
+    /// the *normal* path for 2048²+ stills since the sc-8261 VAE cap — reports liveness instead of
+    /// appearing frozen behind a single `Step{1,1}`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_frame_tiled_with_progress(
+        &self,
+        processed: &Array,
+        seed: u64,
+        tile: i32,
+        overlap: i32,
+        neg: &Array,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Array> {
         let sh = processed.shape(); // (1,3,1,H,W)
         let (height, width) = (sh[3], sh[4]);
         let plan = video::plan_spatial_tiles(height, width, tile, overlap);
+        let n_tiles = plan.len();
         let ts = Array::from_f32(TIMESTEP);
         let mut acc: Option<Array> = None; // (1,3,1,H,W)
         let mut wsum: Option<Array> = None; // (1,1,1,H,W)
-        for t in &plan {
+        for (tile_idx, t) in plan.iter().enumerate() {
             // Per-tile cancel — the per-tile `eval` at the end of each iter (below) makes the
             // prior tile's compute materialized, so this check is effective (sc-5551).
             if cancel.is_cancelled() {
@@ -687,6 +784,8 @@ impl Seedvr2Pipeline {
             });
             // materialize so the just-processed tile's activations (and prior graph) are freed.
             eval([acc.as_ref().unwrap(), wsum.as_ref().unwrap()])?;
+            // F-164: report this completed tile (1-based) against the tile count for liveness.
+            on_step(tile_idx + 1, n_tiles);
         }
         Ok(divide(acc.expect("≥1 tile"), wsum.expect("≥1 tile"))?)
     }

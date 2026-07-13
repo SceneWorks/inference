@@ -305,6 +305,96 @@ pub fn check_progress_with(
     Ok(())
 }
 
+/// **Progress contract (the whole-class property, sc-11133 / F-030/F-050/F-136/F-162/F-164).** The
+/// structural invariant every `generate` must satisfy, checked over the *ordered* event stream rather
+/// than just the `Step` values [`check_progress`] inspects:
+///
+/// 1. **Monotone, in-bounds `Step`.** `Step.current` is non-decreasing and never exceeds `Step.total`
+///    (no >100% overrun — the F-050 multi-eval-sampler class), and `Step.total` is constant.
+/// 2. **Reaches `total`.** The final `Step.current` equals `Step.total` — the bar is never frozen
+///    below completion (the F-030 PiD-early-stop class where a truncated schedule never reaches its
+///    advertised total).
+/// 3. **`Decoding` exactly once.** The terminal `Progress::Decoding` phase is emitted once — not zero
+///    times (frozen through the longest stage — F-030) and not once-per-output (the restarting-bar
+///    class — F-136/F-162).
+///
+/// This is deliberately *laxer than* [`check_progress`] on the `Step` axis (non-decreasing with
+/// repeats allowed, rather than exactly `1..=total`) so it fits multi-stage / folded-bar pipelines,
+/// while adding the `Decoding`-cardinality guarantee [`check_progress`] does not express. Providers
+/// that fold N outputs into one bar (`total = N × steps`) satisfy it; providers that restart the bar
+/// per output, overrun it, or skip `Decoding` fail it. Use [`check_progress_contract_with`] for the
+/// image→video / super-resolution / renderer families whose `generate` needs a request the text-only
+/// [`base_request`] cannot express.
+pub fn check_progress_contract(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
+    check_progress_contract_with(g, &base_request(profile))
+}
+
+/// **Progress contract (request-supplied).** The general form of [`check_progress_contract`] for
+/// providers whose `generate` needs conditioning the text-only [`base_request`] cannot supply
+/// (image→video, super-resolution, the renderer families) — the same shape as
+/// [`check_cancellation_with`]. Asserts the same three invariants: monotone in-bounds `Step`, the bar
+/// reaches `total`, and `Progress::Decoding` is emitted exactly once.
+pub fn check_progress_contract_with(
+    g: &dyn Generator,
+    req: &GenerationRequest,
+) -> Result<(), String> {
+    let id = g.descriptor().id;
+    let mut steps: Vec<(u32, u32)> = Vec::new();
+    let mut decoding_count = 0u32;
+    g.generate(req, &mut |p| match p {
+        Progress::Step { current, total } => steps.push((current, total)),
+        Progress::Decoding => decoding_count += 1,
+        Progress::Loading(_) => {}
+    })
+    .map_err(|e| format!("progress-contract[{id}]: generate() failed on the cheap request: {e}"))?;
+
+    if steps.is_empty() {
+        return Err(format!(
+            "progress-contract[{id}]: generate() emitted no Progress::Step events"
+        ));
+    }
+    let total = steps[0].1;
+    if total == 0 {
+        return Err(format!(
+            "progress-contract[{id}]: Progress::Step.total was 0"
+        ));
+    }
+    let mut prev = 0u32;
+    for &(current, t) in &steps {
+        if t != total {
+            return Err(format!(
+                "progress-contract[{id}]: Step.total changed mid-run ({total} then {t} at current={current})"
+            ));
+        }
+        if current > total {
+            return Err(format!(
+                "progress-contract[{id}]: Step.current {current} exceeds total {total} (>100% overrun — \
+                 a multi-eval sampler or wrapped counter must clamp/derive current so it never overruns; F-050)"
+            ));
+        }
+        if current < prev {
+            return Err(format!(
+                "progress-contract[{id}]: Step.current must be monotone non-decreasing; saw {prev} then {current}"
+            ));
+        }
+        prev = current;
+    }
+    if prev != total {
+        return Err(format!(
+            "progress-contract[{id}]: Step.current reached {prev} but total is {total} — the bar must reach \
+             its total by completion (a truncated/early-stopped schedule must report the effective total, not \
+             a stale one; F-030)"
+        ));
+    }
+    if decoding_count != 1 {
+        return Err(format!(
+            "progress-contract[{id}]: Progress::Decoding was emitted {decoding_count} times, expected exactly 1 \
+             (zero = the decode stage is invisible/frozen; >1 = the bar restarts per output — F-030/F-136/F-162)"
+        ));
+    }
+    Ok(())
+}
+
 /// **Cancellation.** Tripping `CancelFlag` at the first step boundary makes `generate` return the
 /// **typed** `Err(Error::Canceled)` (not a stringified `Msg`) within a bounded number of further
 /// steps (≤ 2), and produces no partial output.
@@ -359,6 +449,57 @@ pub fn check_cancellation_with(g: &dyn Generator, req: &GenerationRequest) -> Re
         Err(other) => Err(format!(
             "cancellation[{id}]: must return the typed Err(Error::Canceled) on cancel, got {other:?} \
              — a stringified Error::Msg breaks the typed-cancellation contract (epic 3720 D3)"
+        )),
+    }
+}
+
+/// **Pre-generate cancellation (the non-denoise-seam class).** A request whose `CancelFlag` is
+/// **already tripped when `generate` is called** must return the typed `Err(Error::Canceled)` and
+/// produce no output — the provider must consult the flag *before* running its expensive pre-denoise
+/// work (prompt/vision encode, reference VAE encodes, identity tower, sequential component loads),
+/// not only inside the denoise loop.
+///
+/// This complements [`check_cancellation`], which trips the flag *mid-denoise* (at the first emitted
+/// `Progress::Step`) and therefore only exercises the denoise loop. The whole class of "cancellation
+/// regresses at the encode / VAE-decode / identity / load seams the denoise loop doesn't cover"
+/// (the sc-11128 / F-018/F-019/F-029/F-037/F-108/F-142/F-135 family) is what this check mechanically
+/// guards: a provider that runs its full encode→denoise→decode before ever looking at the flag fails
+/// here even though it might pass the mid-denoise check. Mirrors the captioner's pre-inference
+/// cancellation contract ([`check_captioner_cancellation`]).
+///
+/// Note on lazy backends: because this hands an *already*-cancelled request, the provider's up-front
+/// check observes the trip without needing a forced `eval` — the false-green trap (a cancel arriving
+/// *during* a lazily-built encode) is a per-provider concern the provider's own tests must cover by
+/// forcing materialization at the seam; the contract-level guarantee this enforces is that such a
+/// check exists at all.
+pub fn check_precancellation(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
+    check_precancellation_with(g, &base_request(profile))
+}
+
+/// **Pre-generate cancellation (request-supplied).** The general form of [`check_precancellation`]
+/// for providers whose `generate` needs conditioning the text-only [`base_request`] cannot supply
+/// (image→video, super-resolution, the renderer families) — the same shape as
+/// [`check_cancellation_with`]. Trips `req.cancel` up front, then asserts the typed
+/// `Err(Error::Canceled)` with no partial output.
+pub fn check_precancellation_with(
+    g: &dyn Generator,
+    req: &GenerationRequest,
+) -> Result<(), String> {
+    let id = g.descriptor().id;
+    let mut req = req.clone();
+    req.cancel = Default::default();
+    req.cancel.cancel();
+    match g.generate(&req, &mut |_| {}) {
+        Ok(_) => Err(format!(
+            "pre-cancellation[{id}]: generate() returned Ok despite a CancelFlag already tripped at \
+             call time; it must consult req.cancel before its pre-denoise encode/load work and return \
+             Err(Error::Canceled)"
+        )),
+        Err(Error::Canceled) => Ok(()),
+        Err(other) => Err(format!(
+            "pre-cancellation[{id}]: must return the typed Err(Error::Canceled) for an already-cancelled \
+             request, got {other:?} — a provider that only checks cancel inside the denoise loop (or \
+             stringifies the error) fails the non-denoise-seam contract (sc-11128)"
         )),
     }
 }
@@ -453,10 +594,12 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &Profile) -> Result<(), String>;
-    let checks: [Check; 4] = [
+    let checks: [Check; 6] = [
         check_validate_honesty,
         check_progress,
+        check_progress_contract,
         check_cancellation,
+        check_precancellation,
         check_seed_determinism,
     ];
 

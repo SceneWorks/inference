@@ -21,6 +21,7 @@ pub mod imageops;
 pub mod json_constraint;
 mod macros;
 pub mod media;
+pub mod mempolicy;
 pub mod registry;
 pub mod runtime;
 pub mod sampling;
@@ -46,6 +47,7 @@ pub use generator::{
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
 pub use media::{AudioTrack, Image};
+pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{
     load, load_captioner, load_image_embedder, load_text_embedder, load_transform,
     CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, TextEmbedderRegistration,

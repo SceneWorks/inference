@@ -183,8 +183,13 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 /// Quant order mirrors the txt2img lane (sc-11727): install adapters, THEN quantize, so the residual
 /// stacks over the (possibly already-packed) base. A pre-packed snapshot needs no `spec.quantize` — the
 /// auto-detecting loader already built packed Linears in [`KreaHeavy::from_snapshot`], and
-/// [`crate::model::load_time_quant_bits`] returns `None` (or errors on a bit mismatch). The pose branch
-/// stays bf16: its overlay carries no `.scales`, and [`KreaHeavy::quantize`] only touches the base DiT.
+/// [`crate::model::load_time_quant_bits`] returns `None` (or errors on a bit mismatch).
+///
+/// The pose branch loads bf16 from its overlay (it carries no `.scales`), then is budget-gated to the
+/// base tier at load (sc-11748): [`crate::memory::should_quantize_control_branch`] packs it only when the
+/// base is itself packed AND the device budget won't fit the bf16 branch — otherwise the branch stays
+/// bf16 (a large-memory Mac pays no dequant-on-forward tax, per sc-11750). It is a LOAD-TIME decision (a
+/// resident weight can't be re-packed mid-render).
 fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned> {
     let mut heavy = KreaHeavy::from_snapshot(root)?;
     if !spec.adapters.is_empty() {
@@ -195,7 +200,25 @@ fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned>
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let cfg = Krea2Config::from_snapshot(root)?;
-    let branch = Krea2ControlBranch::from_source(control, &cfg)?;
+    let mut branch = Krea2ControlBranch::from_source(control, &cfg)?;
+    // sc-11748 — budget-gated branch quant. The pose overlay always loads bf16; pack it to the base tier
+    // ONLY when the base is itself packed AND the device budget won't fit the bf16 branch at the lane's
+    // worst-case resolution. This is a LOAD-TIME gate: the branch is a resident weight that cannot be
+    // re-packed mid-render, so the decision is made once here (matching whichever tier the base runs at,
+    // whether packed at load or a pre-packed turnkey). A large-memory Mac keeps the branch bf16 — no
+    // dequant-on-forward — per sc-11750; `control_scale == 0` stays bit-exact to the base at any tier.
+    let base_bits = crate::model::effective_base_quant_bits(spec, root, KREA_2_TURBO_CONTROL_ID)?;
+    if let Some(bits) = base_bits {
+        if crate::memory::should_quantize_control_branch(
+            mlx_gen::memory::safe_budget_gib(),
+            &cfg,
+            branch.num_blocks(),
+            base_bits,
+            crate::model::RES_MAX,
+        ) {
+            branch.quantize(bits)?;
+        }
+    }
     Ok(ControlHeavyOwned { heavy, branch })
 }
 
@@ -248,6 +271,14 @@ impl KreaTurboControl {
             |heavy_owned, context, on_progress| {
                 let heavy = heavy_owned.as_ref();
 
+                // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
+                // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
+                // noise. Build the plan ONCE; each seed reuses it via `render_control_from`.
+                let plan =
+                    heavy
+                        .heavy
+                        .prepare_control(&context, control_image, req.width, req.height)?;
+
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let opts = TurboOptions {
@@ -258,10 +289,9 @@ impl KreaTurboControl {
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
                     };
-                    let img = heavy.heavy.render_turbo_control(
-                        &context,
+                    let img = heavy.heavy.render_control_from(
+                        &plan,
                         heavy.branch,
-                        control_image,
                         control_scale,
                         &opts,
                         &req.cancel,

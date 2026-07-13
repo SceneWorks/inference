@@ -19,12 +19,13 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, run_flow_sampler, Error, GenerationOutput, GenerationRequest, Generator,
-    LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result, TimestepConvention,
-    WeightsSource,
+    default_seed, run_flow_sampler, CancelFlag, Error, GenerationOutput, GenerationRequest,
+    Generator, LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result,
+    TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
+use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use crate::caption_upsample;
@@ -351,10 +352,17 @@ impl Flux2 {
         images: &[&mlx_gen::media::Image],
         width: u32,
         height: u32,
+        cancel: &CancelFlag,
     ) -> Result<(Array, Array)> {
         let mut packed: Vec<Array> = Vec::with_capacity(images.len());
         let mut ids: Vec<Array> = Vec::with_capacity(images.len());
         for (i, image) in images.iter().enumerate() {
+            // F-037: honor a cancel between the (up to 8) per-reference VAE encodes. `eval` on the
+            // just-packed latent forces this reference's encode so the next iteration's check observes
+            // real progress (no lazy-eval false green).
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let pre = preprocess_ref_image(image, width, height)?; // NHWC [1,H,W,3]
             let enc = vae.encode_mean(&pre)?; // NHWC [1,H/8,W/8,32]
             let enc = enc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for the pipeline helpers
@@ -362,7 +370,9 @@ impl Flux2 {
             let patchified = patchify_latents(&enc)?; // [1,128,h,w]
             let normed = vae.bn_normalize_nchw(&patchified)?;
             let sh = patchified.shape();
-            packed.push(pack_latents(&normed)?); // [1, seq_ref, 128]
+            let packed_ref = pack_latents(&normed)?; // [1, seq_ref, 128]
+            eval([&packed_ref])?;
+            packed.push(packed_ref);
             ids.push(prepare_grid_ids(
                 sh[2] as usize,
                 sh[3] as usize,
@@ -594,6 +604,11 @@ impl Flux2 {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let (tokenizer, te, transformer, vae) = self.parts()?;
+        // F-037: bail before the pre-denoise conditioning stage (up to 8 reference VAE encodes at
+        // 2048², the TE encode, and the img2img init encode — all ahead of the first denoise step).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
@@ -606,7 +621,7 @@ impl Flux2 {
         // output keeps the leading `target_seq` image tokens.
         let reference = if self.variant.is_edit() {
             let images = self.collect_edit_references(req)?;
-            Some(self.encode_references(vae, &images, req.width, req.height)?)
+            Some(self.encode_references(vae, &images, req.width, req.height, &req.cancel)?)
         } else {
             None
         };
@@ -754,9 +769,13 @@ impl Flux2 {
         // fallback only (F-087: the env previously *overrode* the request, leaking pixel changes
         // untraceably). Scoped to the non-kv edit path — a reference present with no KV cache; the kv
         // variant rejects `image_guidance` in `validate_impl` (it would silently no-op here otherwise).
+        // The env debug override is parsed without going through `validate_request`, so filter a
+        // non-finite value here (F-036): a parsed `inf`/`NaN` would otherwise pass the `> 1.0` filter
+        // below (for `inf`) or poison the extrapolation combine.
         let img_guidance_debug = std::env::var("FLUX2_IMG_GUIDANCE")
             .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok());
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite());
         let img_guidance: Option<f32> = req
             .image_guidance
             .or(img_guidance_debug)
@@ -905,14 +924,20 @@ pub(crate) fn validate_request(
             )));
         }
     }
-    // F-087: image-guidance CFG runs only on the non-kv edit path (it needs the uncached
-    // `include_ref=false` forward). On the kv variant a set `image_guidance` would silently no-op
-    // (the cached step's `cache_ref` is `Some`, so the extrapolation arm never fires) — reject it
-    // up front instead of letting the request appear to succeed while doing nothing.
-    if is_kv && req.image_guidance.is_some() {
+    // image_guidance (reference true-CFG) is honored ONLY on the non-kv EDIT path — it needs the
+    // uncached `include_ref=false` forward against a present reference. Everywhere else a set value is
+    // silently ignored, so reject it up front instead of letting the request appear to succeed while
+    // doing nothing (F-036 extends the F-087 kv-only rejection to txt2img and the control variant,
+    // which both call this with `is_edit = false`). Non-finite `image_guidance` is already rejected by
+    // the shared floor's central finiteness guard above (F-001).
+    if req.image_guidance.is_some() && (!is_edit || is_kv) {
+        let why = if is_kv {
+            "the kv-edit variant's cached reference path can't run the dropped-ref CFG"
+        } else {
+            "image_guidance applies only to the non-kv edit path (a reference true-CFG lever)"
+        };
         return Err(Error::Msg(format!(
-            "{}: image_guidance is not supported on the kv-edit variant \
-             (it would be silently ignored — the cached reference path can't run the dropped-ref CFG)",
+            "{}: image_guidance is not supported here — {why}; it would be silently ignored",
             desc.id
         )));
     }
@@ -1186,6 +1211,52 @@ mod tests {
         assert_eq!(
             model.collect_edit_references(&at_cap).unwrap().len(),
             MAX_EDIT_REFERENCES
+        );
+    }
+
+    #[test]
+    fn image_guidance_rejected_where_not_honored() {
+        // F-036: `image_guidance` is honored ONLY on the non-kv EDIT path. A set value on txt2img or
+        // the kv-edit variant is silently ignored, so validate rejects it up front; the non-kv edit
+        // path accepts it (with a reference present).
+        let t2i = Flux2::new_for_tests(Flux2Variant::Klein9b);
+        let t2i_req = GenerationRequest {
+            prompt: "a fox".into(),
+            image_guidance: Some(2.0),
+            ..Default::default()
+        };
+        let err = t2i.validate(&t2i_req).unwrap_err().to_string();
+        assert!(
+            err.contains("image_guidance is not supported here"),
+            "txt2img must reject image_guidance, got: {err}"
+        );
+
+        // Non-kv edit with a reference + image_guidance validates.
+        let edit = Flux2::new_for_tests(Flux2Variant::Klein9bEdit);
+        let edit_req = GenerationRequest {
+            prompt: "make it night".into(),
+            image_guidance: Some(2.5),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            edit.validate(&edit_req).is_ok(),
+            "non-kv edit should honor image_guidance"
+        );
+
+        // A non-finite image_guidance is rejected by the shared floor's central finiteness guard
+        // (F-001), even on the honoring edit path.
+        let nan_req = GenerationRequest {
+            image_guidance: Some(f32::NAN),
+            ..edit_req
+        };
+        let err = edit.validate(&nan_req).unwrap_err().to_string();
+        assert!(
+            err.contains("image_guidance") && err.contains("finite"),
+            "non-finite image_guidance must be rejected, got: {err}"
         );
     }
 
