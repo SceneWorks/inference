@@ -4,17 +4,18 @@
 //! reference PNGs + an instruction, render an edited image through the production `krea_2_edit` Generator
 //! seam (`registry::load` → `Generator::generate` → `pipeline::render_edit`), and write a PNG.
 //!
-//! Two-reference order is **fixed**: scene = image 1, person = image 2 (the LoRA's trained layout;
-//! swapping degrades results). One ref → `Conditioning::Reference`; two → `Conditioning::MultiReference`.
+//! Two-reference order is **fixed**: image 1 (required) + image 2 (optional), either can be a person
+//! (the LoRA's trained layout; swapping degrades results). One ref → `Conditioning::Reference`; two →
+//! `Conditioning::MultiReference`.
 //!
 //! **R5 ablation:** pass the LoRA arg as `none` (or empty) to load WITHOUT the identity LoRA — the dual
 //! conditioning (in-context VAE tokens + Qwen3-VL grounding) still runs but is inert/off-distribution,
 //! the degraded mode the worker R5 gate blocks. Used for the epic-10871 P4.2 dual-vs-inert delta.
 //!
 //! ```text
-//! # two-reference face-prominent (scene, then person), with the edit LoRA
+//! # two-reference face-prominent (image 1, then image 2), with the edit LoRA
 //! cargo run -p candle-gen-krea --example krea-edit --features cuda --release -- \
-//!   E:\...\Krea-2-Raw scene.png,person.png "a close-up of the woman ... in this street" \
+//!   E:\...\Krea-2-Raw image1.png,image2.png "a close-up of the woman ... in this street" \
 //!   1024 1024 16 42 out.png E:\...\krea2_identity_edit_v1_1_r128.safetensors 3.0
 //! ```
 //! Arg order: <snapshot_dir> <ref.png[,ref2.png]> <instruction> [width=1024] [height=1024] \
@@ -63,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ref_arg = a
         .get(2)
         .cloned()
-        .unwrap_or_else(|| "scene.png,person.png".into());
+        .unwrap_or_else(|| "image1.png,image2.png".into());
     let instruction = a
         .get(3)
         .cloned()
@@ -79,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let guidance: f32 = a.get(10).and_then(|s| s.parse().ok()).unwrap_or(3.0);
     let lora_scale: f32 = a.get(11).and_then(|s| s.parse().ok()).unwrap_or(1.0);
 
-    // References in fixed order (scene = image 1, person = image 2), each snapped to a mult-of-16 buffer.
+    // References in fixed order (image 1, then image 2), each snapped to a mult-of-16 buffer.
     let references: Vec<Image> = ref_arg
         .split(',')
         .map(|p| load_reference(p.trim()))
@@ -92,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }]
     } else {
         eprintln!(
-            "two-reference edit (scene = image 1, person = image 2), {} refs",
+            "two-reference edit (image 1, then image 2), {} refs",
             references.len()
         );
         vec![Conditioning::MultiReference { images: references }]

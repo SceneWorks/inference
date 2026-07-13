@@ -16,8 +16,8 @@
 //! ```
 //! `KREA_EDIT_DISTILLED=1` drives the CFG-free distilled **Turbo** edit (`krea_2_turbo_edit`, sc-11640:
 //! guidance forced to 0, ~8-step `turbo_schedule`) against the Turbo turnkey; unset (or `0`) drives the
-//! undistilled full-CFG **Raw** edit. Optionally set `KREA_EDIT_SOURCE_B` for the two-reference (scene =
-//! image 1, person = image 2) path. Sources may be binary P6 `.ppm` or `.png`.
+//! undistilled full-CFG **Raw** edit. Optionally set `KREA_EDIT_SOURCE_B` for the two-reference (image 1,
+//! then image 2) path. Sources may be binary P6 `.ppm` or `.png`.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -127,7 +127,7 @@ fn save(img: &Image, name: &str) {
 /// The engine edit AC on the real GPU: load the Raw DiT with the identity-edit LoRA merged, feed the
 /// source reference(s) + an instruction, and render a coherent edited image (a flow-sign / seq-concat /
 /// RoPE-frame / vision-splice bug yields noise → fails the coherence gate). Two references when
-/// `KREA_EDIT_SOURCE_B` is set (scene = image 1, person = image 2 — sc-10878).
+/// `KREA_EDIT_SOURCE_B` is set (image 1, then image 2 — sc-10878).
 #[test]
 #[ignore = "needs KREA_RAW_DIR + KREA_EDIT_LORA + KREA_EDIT_SOURCE (a P6 PPM); --features cuda"]
 fn edit_renders_coherent_with_dual_conditioning() {
@@ -149,7 +149,7 @@ fn edit_renders_coherent_with_dual_conditioning() {
         .ok()
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE"));
 
-    // References in fixed order: scene = image 1, person = image 2 (sc-10878).
+    // References in fixed order: image 1, then image 2 (sc-10878).
     let mut references = vec![read_source(&PathBuf::from(&source))];
     if let Ok(b) = std::env::var("KREA_EDIT_SOURCE_B") {
         references.push(read_source(&PathBuf::from(b)));

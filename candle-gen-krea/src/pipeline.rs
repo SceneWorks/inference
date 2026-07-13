@@ -59,7 +59,8 @@ pub const RAW_STEPS: usize = 52;
 pub const RAW_GUIDANCE: f32 = 3.5;
 
 /// The image-edit reference cap (epic 10871 / sc-10878). The edit LoRA was trained on **one or two**
-/// references in a **fixed order** — scene = image 1, person = image 2 — and the authors note swapping
+/// references in a **fixed order** — image 1 (required) + image 2 (optional), either can be a person —
+/// and the authors note swapping
 /// the order degrades results. The engine's `forward_edit` is generic over N references (each at its own
 /// RoPE frame), but the trained contract is 1..=2, so the pipeline caps here.
 pub const MAX_EDIT_REFERENCES: usize = 2;
@@ -491,7 +492,7 @@ pub fn load_edit_components(root: &Path, device: &Device) -> Result<EditComponen
 }
 
 /// Render the **image-edit** path (epic 10871 / sc-10877, sc-10878) — a source reference (or two:
-/// scene = image 1, person = image 2) plus an instruction produce an edited image with identity/subject
+/// image 1, then image 2) plus an instruction produce an edited image with identity/subject
 /// preserved. Kontext-style: each reference is VAE-encoded at the **target** resolution and prepended to
 /// the DiT sequence at its own RoPE frame ([`Krea2Transformer::forward_edit`]); the denoise runs the Raw
 /// true-CFG loop **from pure noise** (the source is in-context conditioning, NOT a noised init — the key
@@ -543,7 +544,7 @@ pub fn render_edit(
     };
 
     // Wire (a): VAE-encode each reference at the TARGET resolution → the normalized 16-ch latent (static
-    // across steps). Fixed order preserved (scene, then person — sc-10878).
+    // across steps). Fixed order preserved (image 1, then image 2 — sc-10878).
     let ref_latents =
         encode_references(&edit.vae_encoder, references, req.width, req.height, device)?;
 
@@ -604,7 +605,7 @@ pub fn render_edit(
 
 /// VAE-encode each source `references` image at the target `(width, height)` → the normalized 16-ch
 /// latent `[1, 16, H/8, W/8]` the DiT's `img_in` consumes (same space as the noise). Fixed order is
-/// preserved (the returned vec is in `references` order — scene, then person; sc-10878).
+/// preserved (the returned vec is in `references` order — image 1, then image 2; sc-10878).
 fn encode_references(
     vae_encoder: &QwenVaeEncoder,
     references: &[Image],
@@ -621,7 +622,7 @@ fn encode_references(
 }
 
 /// Validate the source-reference count against the fixed-order [`MAX_EDIT_REFERENCES`] cap (sc-10878):
-/// at least one (an edit needs a source) and at most two (scene, then person). Pure so it is unit-testable.
+/// at least one (an edit needs a source) and at most two (image 1, then image 2). Pure so it is unit-testable.
 fn check_reference_count(n: usize) -> Result<()> {
     if n == 0 {
         return Err(CandleError::Msg(
@@ -630,8 +631,8 @@ fn check_reference_count(n: usize) -> Result<()> {
     }
     if n > MAX_EDIT_REFERENCES {
         return Err(CandleError::Msg(format!(
-            "krea edit: at most {MAX_EDIT_REFERENCES} references are supported (scene = image 1, \
-             person = image 2); got {n}"
+            "krea edit: at most {MAX_EDIT_REFERENCES} references are supported (image 1, \
+             then image 2); got {n}"
         )));
     }
     Ok(())
@@ -913,14 +914,14 @@ mod tests {
 
     #[test]
     fn reference_count_enforces_fixed_order_cap() {
-        // 0 → error (an edit needs a source); 1 and 2 ok; 3 → error (past the scene/person cap).
+        // 0 → error (an edit needs a source); 1 and 2 ok; 3 → error (past the image 1 / image 2 cap).
         assert!(check_reference_count(0).is_err());
         assert!(check_reference_count(1).is_ok());
         assert!(check_reference_count(2).is_ok());
         let err = check_reference_count(3).unwrap_err().to_string();
         assert!(err.contains('2'), "names the cap: {err}");
         assert!(
-            err.contains("scene") && err.contains("person"),
+            err.contains("image 1") && err.contains("image 2"),
             "documents order: {err}"
         );
     }
