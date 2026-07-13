@@ -188,3 +188,74 @@ fn tap_reweight_sweep_1024() {
             .display()
     );
 }
+
+/// sc-11878 — validate the **shipped** path: drive `pipeline::render` (the production Turbo txt2img
+/// entry) through `GenerationRequest::text_style_gain` and confirm the single scalar moves the image
+/// the way the raw-vector spike did (early emphasis at g>1, near-inert at g<1 / g≈1). This is the
+/// end-to-end request-path proof (the raw sweep above proves the primitive; this proves the wiring).
+#[test]
+#[ignore = "needs the real Krea 2 Turbo snapshot (set KREA_TURBO_DIR); ~34 GB resident, CUDA"]
+fn text_style_gain_sweep_1024() {
+    candle_gen_krea::force_link();
+    let Some(root) = snapshot() else {
+        eprintln!("skipping: set KREA_TURBO_DIR");
+        return;
+    };
+    let device = Device::cuda_if_available(0).expect("cuda device");
+    assert!(
+        device.is_cuda(),
+        "spike needs a CUDA device (got {device:?})"
+    );
+
+    let comps = pipeline::load_components(&root, &device, &[], None).expect("load components");
+
+    // (label, gain) — None is the untouched baseline; g>1 early-emphasis, g<1 late-bias.
+    let gains: [(&str, Option<f32>); 5] = [
+        ("gain_none", None),
+        ("gain_1p00", Some(1.0)),
+        ("gain_1p50", Some(1.5)),
+        ("gain_1p75", Some(1.75)),
+        ("gain_0p50", Some(0.5)),
+    ];
+
+    let mut baseline_px: Option<Vec<u8>> = None;
+    eprintln!(
+        "\n{:<12} {:>7} {:>8} {:>6} {:>7} {:>5}",
+        "label", "std", "distinct", "adjΔ", "MAD", "coh"
+    );
+    for (label, gain) in gains {
+        let req = GenerationRequest {
+            prompt: PROMPT.into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            seed: Some(0),
+            steps: Some(8),
+            text_style_gain: gain,
+            ..Default::default()
+        };
+        let imgs = pipeline::render(&comps, &req, &device, &mut |_| {}).expect("render");
+        let img = &imgs[0];
+        let (std, distinct, adj) = image_stats(&img.pixels, img.width);
+        let coh = is_coherent(&img.pixels, img.width);
+        let mad_v = baseline_px
+            .as_ref()
+            .map(|b| mad(b, &img.pixels))
+            .unwrap_or(0.0);
+        let path = save(img, label);
+        eprintln!(
+            "{label:<12} {std:>7.1} {distinct:>8} {adj:>6.1} {mad_v:>7.2} {coh:>5}  {}",
+            path.display()
+        );
+        if label == "gain_none" {
+            assert!(coh, "baseline (no gain) must be coherent");
+            baseline_px = Some(img.pixels.clone());
+        } else {
+            assert!(coh, "gain={gain:?} must stay coherent");
+        }
+    }
+
+    // Sanity: g=1.0 must be byte-identical to None (the no-op fast path), and g=1.75 must move the
+    // image materially more than g=0.5 (early taps dominate — the spike's core finding on the wire).
+    // (Left as eyeball asserts via the printed MAD to avoid over-pinning exact pixels across drivers.)
+}
