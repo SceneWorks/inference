@@ -15,16 +15,18 @@
 //! Bespoke provider (NOT gen-core-registered), worker-invoked by name — the candle pattern for
 //! conditioned surfaces (mirrors [`crate::control_train`]'s trainer and the FLUX.2 control provider).
 //! Krea 2 Turbo is CFG-free + distilled few-step: a single guidance-inert forward per step, no
-//! negative pass. The base loads bf16 dense (the 12B + 3.3B branch + TE + VAE fit a 96 GB card); v1 is
-//! bf16-only (no quant tier — the studio-trained overlays are bf16). `generate` takes `&self` so one
-//! load serves many poses; the residual clamp is a fixed recipe constant set at load, not a knob.
+//! negative pass. The base DiT keeps a packed q4/q8 tier packed in VRAM (dequant-on-forward, sc-11727)
+//! and the control-branch overlay quantizes to a matching q4/q8 packed footprint on request
+//! (`branch_quant`, sc-11743) — the small-card path — while the studio-trained overlay is published
+//! bf16. `generate` takes `&self` so one load serves many poses; the residual clamp is a fixed recipe
+//! constant set at load, not a knob.
 
 use std::path::PathBuf;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{AdapterSpec, Image, Progress};
+use candle_gen::gen_core::{AdapterSpec, Image, Progress, Quant};
 use candle_gen::train::flow_match::component_vb;
 use candle_gen::{CandleError, Result};
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
@@ -63,6 +65,13 @@ pub struct Krea2ControlPaths {
     /// style adapter reshapes the generated subject while the control branch keeps the pose lock. The
     /// control branch is never adapted. Empty ⇒ the stock control build.
     pub adapters: Vec<AdapterSpec>,
+    /// Quantize the control-branch overlay to q4/q8 and keep it packed in VRAM (dequant-on-forward,
+    /// sc-11743). **`None` (bf16) is the default and the norm** — branch quant is a *quality cost* (the
+    /// residual is precision-sensitive, RMS-clamped at τ), so it is the **last-resort rung** on the Krea
+    /// control VRAM fit ladder (sc-11754): the worker's fit-gate engages it only when the predicted peak
+    /// still exceeds free VRAM after the cheaper rungs (VAE-decode tiling, activation chunking). It is
+    /// **not** auto-mirrored to the base tier — a q4 base on a card with headroom keeps a bf16 branch.
+    pub branch_quant: Option<Quant>,
 }
 
 /// One Krea 2 strict-pose control request. Krea 2 Turbo is CFG-free (no guidance / negative pass) —
@@ -96,8 +105,9 @@ impl Default for Krea2ControlRequest {
 }
 
 /// A loaded Krea 2 control model: the Qwen3-VL text encoder + the frozen composable Turbo DiT + the
-/// trained control branch + the Qwen-Image VAE (decode) with its encoder (control-image encode). All
-/// bf16/f32 dense — one load serves many poses.
+/// trained control branch + the Qwen-Image VAE (decode) with its encoder (control-image encode). The
+/// DiT and (on request) the control branch keep a packed q4/q8 footprint in VRAM (dequant-on-forward);
+/// one load serves many poses.
 pub struct Krea2Control {
     device: Device,
     tokenizer: KreaTokenizer,
@@ -138,9 +148,18 @@ impl Krea2Control {
             crate::adapters::install_additive(&mut dit, &paths.adapters)?;
         }
 
-        // Trained control branch. Freeze (detach weight reads so the sampler builds no autograd graph)
-        // and set the fixed recipe residual clamp — identical to train time (S0: τ = 0.15).
-        let mut branch = ControlBranch::from_checkpoint(&paths.control, &cfg, &device)?;
+        // Trained control branch. When a branch quant is requested (small-card load, sc-11743) each
+        // matmul leaf is folded to a packed q4/q8 QLinear straight onto the GPU (dequant-on-forward) so
+        // the ~6.6 GB dense branch never lands in VRAM; otherwise the bf16 branch loads as before.
+        // Freeze (detach weight reads so the sampler builds no autograd graph — a no-op for the
+        // already-frozen quantized load) and set the fixed recipe residual clamp, identical to train
+        // time (S0: τ = 0.15) — the clamp bounds each injection regardless of projection quant.
+        let mut branch = match paths.branch_quant {
+            Some(quant) => {
+                ControlBranch::from_checkpoint_quantized(&paths.control, &cfg, &device, quant)?
+            }
+            None => ControlBranch::from_checkpoint(&paths.control, &cfg, &device)?,
+        };
         branch.freeze();
         branch.set_residual_clamp(Some(DEFAULT_RESIDUAL_CLAMP));
 

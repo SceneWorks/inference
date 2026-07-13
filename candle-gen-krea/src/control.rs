@@ -32,6 +32,9 @@ use std::path::Path;
 use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::candle_nn::Linear;
+use candle_gen::gen_core::Quant;
+use candle_gen::quant::{DenseLinear, QLinear, QUANT_BLOCK};
 use candle_gen::train::flow_match::{self, velocity_loss};
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
 use candle_gen::{CandleError, Result};
@@ -74,6 +77,39 @@ impl VLin {
     }
 }
 
+/// A branch matmul leaf (attention/FFN/output projections): either a **dense** [`Var`]-backed [`VLin`]
+/// (training + bf16 inference) or a **packed** GGUF [`QLinear`] (small-card inference — the codes stay
+/// quantized in VRAM and dequantize on-forward, sc-11743). Both compute `x·Wᵀ`; the quantized arm
+/// ignores `frozen` (a `QTensor` is not a graph-tracked `Var`, so it never builds an autograd graph).
+///
+/// Quantizing only the matmul leaves mirrors the packed base DiT (sc-11727): the branch's bf16
+/// projections are 3.30 B params ≈ 6.6 GB, the second-largest resident block after the packed base, and
+/// drop to ~1.7 GB at q4. The tiny f32 norm/modulation scales stay dense [`Var`]s regardless.
+enum BranchLin {
+    Dense(VLin),
+    Quant(QLinear),
+}
+
+impl BranchLin {
+    fn forward(&self, x: &Tensor, frozen: bool) -> Result<Tensor> {
+        match self {
+            BranchLin::Dense(v) => v.forward(x, frozen),
+            // `QLinear::forward` returns candle-core's `Result`; `?` coerces into the crate `CandleError`.
+            BranchLin::Quant(q) => Ok(q.forward(x)?),
+        }
+    }
+}
+
+/// How the branch's matmul leaves are built: `Dense` keeps them as trainable [`Var`]-backed [`VLin`]s
+/// (training, resume, and bf16 inference); `Quant` folds each to a packed [`QLinear`] at load
+/// (dequant-on-forward) for small-card inference (sc-11743). `Quant` is **inference-only** — a packed
+/// leaf hosts no trainable `Var`, so the branch is frozen and never appears in the optimizer list.
+#[derive(Clone, Copy)]
+enum LeafMode {
+    Dense,
+    Quant(Quant),
+}
+
 /// Read a `Var`'s current value: the live (graph-tracked) variable while training, or a **detached**
 /// storage-sharing view when the branch is [frozen](ControlBranch::freeze) for inference. Without the
 /// detach, every sampler step would build (and, chained through the Euler update, RETAIN across all
@@ -86,23 +122,57 @@ fn rd(v: &Var, frozen: bool) -> Tensor {
     }
 }
 
-/// Registers every created [`Var`] under its checkpoint key, in a deterministic order.
-#[derive(Default)]
+/// Registers every created [`Var`] under its checkpoint key, in a deterministic order, and builds each
+/// matmul leaf per the [`LeafMode`]. Scalars (norm/modulation) are always `Var`s; matmul leaves are
+/// dense `Var`-backed [`VLin`]s or packed [`QLinear`]s (sc-11743).
 struct VarReg {
     named: Vec<(String, Var)>,
+    /// The device every leaf lands on. In [`LeafMode::Quant`] the checkpoint is staged in system RAM
+    /// and each matmul leaf is folded **onto** this device, so the dense branch never lands in VRAM.
+    device: Device,
+    mode: LeafMode,
 }
 
 impl VarReg {
+    fn new(device: Device, mode: LeafMode) -> Self {
+        Self {
+            named: Vec::new(),
+            device,
+            mode,
+        }
+    }
+
+    /// A scalar (norm/modulation) `Var`, always dense on [`Self::device`] — tiny and precision-sensitive
+    /// (folded RMSNorm scales, the modulation table), so it is never quantized.
     fn var(&mut self, name: String, t: &Tensor) -> Result<Var> {
-        let v = Var::from_tensor(t)?;
+        let v = Var::from_tensor(&t.to_device(&self.device)?)?;
         self.named.push((name, v.clone()));
         Ok(v)
     }
 
-    fn lin(&mut self, name: String, t: &Tensor) -> Result<VLin> {
-        Ok(VLin {
-            w: self.var(name, t)?,
-        })
+    /// A matmul leaf. `Dense` → a trainable `Var`-backed [`VLin`] (registered for the optimizer / save).
+    /// `Quant` → fold the `[out, in]` weight to a packed GGUF [`QLinear`] straight onto the device
+    /// (dequant-on-forward, sc-7702) — the dense weight never lands in VRAM (the base DiT's packed
+    /// pattern, sc-11727) and no trainable `Var` is registered (inference-only).
+    fn lin(&mut self, name: String, t: &Tensor) -> Result<BranchLin> {
+        match self.mode {
+            LeafMode::Dense => Ok(BranchLin::Dense(VLin {
+                w: self.var(name, t)?,
+            })),
+            LeafMode::Quant(quant) => {
+                let mut ql = QLinear::from_dense(DenseLinear::Linear(Linear::new(t.clone(), None)));
+                // GGUF Q4_0/Q8_0 blocks are 32-wide: a projection whose contraction (`in_features`,
+                // the `[out, in]` last dim) is not a multiple of 32 cannot pack — keep it dense on the
+                // device (the SAM3/SeedVR2 skip predicate). Every real Krea branch leaf is a large
+                // multiple of 32 (hidden 6144, intermediate 16384), so this only guards degenerate dims.
+                if t.dim(1)?.is_multiple_of(QUANT_BLOCK) {
+                    ql.quantize_dequant_onto(quant, &self.device)?;
+                } else {
+                    ql.to_device(&self.device)?;
+                }
+                Ok(BranchLin::Quant(ql))
+            }
+        }
     }
 }
 
@@ -112,11 +182,11 @@ type Getter<'a> = dyn Fn(&str) -> Result<Tensor> + 'a;
 
 /// Trainable twin of the base block's sigmoid-gated GQA attention — every projection is a [`Var`].
 struct ControlAttention {
-    q: VLin,
-    k: VLin,
-    v: VLin,
-    gate: VLin,
-    o: VLin,
+    q: BranchLin,
+    k: BranchLin,
+    v: BranchLin,
+    gate: BranchLin,
+    o: BranchLin,
     norm_q: Var, // f32, scale + 1
     norm_k: Var, // f32, scale + 1
     heads: usize,
@@ -182,10 +252,10 @@ struct ControlBlock {
     prenorm: Var,  // f32, scale + 1
     postnorm: Var, // f32, scale + 1
     attn: ControlAttention,
-    ff_gate: VLin,
-    ff_up: VLin,
-    ff_down: VLin,
-    proj_out: VLin, // zero-init [hidden, hidden] — the ControlNet identity seam
+    ff_gate: BranchLin,
+    ff_up: BranchLin,
+    ff_down: BranchLin,
+    proj_out: BranchLin, // zero-init [hidden, hidden] — the ControlNet identity seam
     eps: f64,
 }
 
@@ -302,14 +372,55 @@ impl ControlBranch {
                 other => Ok(w.get(&format!("{base}.{other}"))?.to_dtype(dtype)?),
             }
         };
-        Self::build(&get, cfg, n, inject_offset)
+        Self::build(
+            &get,
+            cfg,
+            n,
+            inject_offset,
+            w.device().clone(),
+            LeafMode::Dense,
+        )
     }
 
-    /// Load a branch back from a spike checkpoint (`.safetensors` written by [`save`](Self::save));
-    /// `N`, dtypes, and the injection offset are read from the file (a pre-offset checkpoint has no
-    /// meta key ⇒ offset 0, its training-time layout).
+    /// Load a branch back from a spike checkpoint (`.safetensors` written by [`save`](Self::save)) as
+    /// **dense bf16** `Var`s (training resume, or full-precision inference); `N`, dtypes, and the
+    /// injection offset are read from the file (a pre-offset checkpoint has no meta key ⇒ offset 0, its
+    /// training-time layout). See [`from_checkpoint_quantized`](Self::from_checkpoint_quantized) for the
+    /// small-card packed-inference load.
     pub fn from_checkpoint(path: &Path, cfg: &Krea2Config, device: &Device) -> Result<Self> {
-        let tensors = candle_gen::candle_core::safetensors::load(path, device)?;
+        Self::from_checkpoint_impl(path, cfg, device, LeafMode::Dense)
+    }
+
+    /// Load a branch from a spike checkpoint with every matmul leaf **quantized to q4/q8 and kept
+    /// packed in VRAM** (dequant-on-forward, sc-11743) — the small-card inference load. The trained
+    /// overlay is published bf16 only, so the checkpoint is staged in system RAM and each projection is
+    /// folded straight **onto** the GPU (the base DiT's packed-forward pattern, sc-11727): the ~6.6 GB
+    /// dense branch never lands in VRAM, and the resident footprint is ~1.7 GB at q4 / ~3.3 GB at q8.
+    /// The tiny f32 norm/modulation scales stay dense. **Inference-only** (the branch is frozen; no
+    /// matmul leaf is a trainable `Var`) — the residual RMS clamp (τ) still bounds each injection, so
+    /// quantization error in the projections cannot swamp the main stream.
+    pub fn from_checkpoint_quantized(
+        path: &Path,
+        cfg: &Krea2Config,
+        device: &Device,
+        quant: Quant,
+    ) -> Result<Self> {
+        Self::from_checkpoint_impl(path, cfg, device, LeafMode::Quant(quant))
+    }
+
+    fn from_checkpoint_impl(
+        path: &Path,
+        cfg: &Krea2Config,
+        device: &Device,
+        mode: LeafMode,
+    ) -> Result<Self> {
+        // Quant mode stages the checkpoint in system RAM and folds each matmul leaf ONTO the device, so
+        // the dense bf16 branch (~6.6 GB) never lands in VRAM; dense mode loads straight to the device.
+        let load_device = match mode {
+            LeafMode::Quant(_) => Device::Cpu,
+            LeafMode::Dense => device.clone(),
+        };
+        let tensors = candle_gen::candle_core::safetensors::load(path, &load_device)?;
         let n = 1 + tensors
             .keys()
             .filter_map(|k| split_block_key(k).ok().map(|(i, _)| i))
@@ -338,18 +449,27 @@ impl ControlBranch {
                 ))
             })
         };
-        Self::build(&get, cfg, n, inject_offset)
+        Self::build(&get, cfg, n, inject_offset, device.clone(), mode)
     }
 
-    fn build(get: &Getter, cfg: &Krea2Config, n: usize, inject_offset: usize) -> Result<Self> {
-        let mut reg = VarReg::default();
+    fn build(
+        get: &Getter,
+        cfg: &Krea2Config,
+        n: usize,
+        inject_offset: usize,
+        device: Device,
+        mode: LeafMode,
+    ) -> Result<Self> {
+        let mut reg = VarReg::new(device, mode);
         let blocks = (0..n)
             .map(|i| ControlBlock::build(&mut reg, get, i, cfg))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             blocks,
             named: reg.named,
-            frozen: false,
+            // A quantized branch hosts no trainable matmul `Var`, so it is inference-only: freeze up
+            // front (weight reads detached) rather than depend on the caller to do it.
+            frozen: matches!(mode, LeafMode::Quant(_)),
             clamp_tau: Some(DEFAULT_RESIDUAL_CLAMP),
             inject_offset,
         })
@@ -1243,6 +1363,118 @@ mod tests {
         assert_eq!(
             a, b,
             "offset checkpoint roundtrip must reproduce the forward"
+        );
+        let _ = std::fs::remove_file(ckpt);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The quantized branch load (sc-11743): [`ControlBranch::from_checkpoint_quantized`] must build the
+    /// same topology, come up **frozen** (inference-only — a packed matmul leaf hosts no trainable
+    /// `Var`), stay finite, and preserve the branch's residual **direction** — near-losslessly at Q8,
+    /// still correlated at the lossier Q4. Isolates the branch effect as `(with_branch − base)` so the
+    /// (identical) base stream can't inflate the similarity. Seeded for run-to-run + cross-platform
+    /// determinism (the `10794` float-reassociation lesson). Visual pose-lock at real dims is the GPU
+    /// validation; this is the CPU wiring gate for the packed leaves.
+    #[test]
+    fn from_checkpoint_quantized_preserves_branch_direction() {
+        let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(11743);
+        let (dit, c, path) = tiny_dit_seeded(&mut rng);
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
+        // Nudge off the zero-init identity (seeded) so there is a residual to preserve.
+        for v in branch.vars() {
+            v.set(&randn_seeded(&mut rng, 0.0, 0.02, v.as_tensor().dims()))
+                .unwrap();
+        }
+        let ckpt = std::env::temp_dir().join(format!(
+            "krea_ctrl_quant_{}.safetensors",
+            std::process::id()
+        ));
+        branch.save(&ckpt).unwrap();
+
+        let (x0, cap, _) = tiny_batch_seeded(&c, &mut rng);
+        let ctrl = randn_seeded(&mut rng, 0.0, 1.0, x0.dims());
+        let ctxt = cap.unsqueeze(0).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let base = flat(&dit.forward(&x0, &t, &ctxt).unwrap());
+
+        let mut bf16 = ControlBranch::from_checkpoint(&ckpt, &c, &dev).unwrap();
+        bf16.freeze();
+        let bf16_out =
+            flat(&forward_with_control(&dit, &bf16, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+
+        let delta = |o: &[f32]| -> Vec<f32> { o.iter().zip(&base).map(|(a, b)| a - b).collect() };
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+        let d_bf16 = delta(&bf16_out);
+        assert!(
+            d_bf16.iter().any(|v| v.abs() > 1e-6),
+            "the nudged branch must actually perturb the base (else the cosine is vacuous)"
+        );
+
+        // Q8: same topology, frozen at build (no explicit freeze), finite, residual direction intact.
+        let q8 = ControlBranch::from_checkpoint_quantized(&ckpt, &c, &dev, Quant::Q8).unwrap();
+        assert_eq!(q8.num_blocks(), 1);
+        assert!(
+            q8.frozen,
+            "a quantized branch is inference-only ⇒ frozen at build"
+        );
+        let q8_out = flat(&forward_with_control(&dit, &q8, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        assert!(q8_out.iter().all(|v| v.is_finite()));
+        let c8 = cos(&d_bf16, &delta(&q8_out));
+        assert!(
+            c8 > 0.95,
+            "Q8 branch residual must track bf16 near-losslessly: cos {c8}"
+        );
+
+        // Q4: lossier, but still loads, stays finite, and keeps a clearly positive correlation with the
+        // bf16 branch (coherent perturbation, not garbage).
+        let q4 = ControlBranch::from_checkpoint_quantized(&ckpt, &c, &dev, Quant::Q4).unwrap();
+        let q4_out = flat(&forward_with_control(&dit, &q4, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        assert!(q4_out.iter().all(|v| v.is_finite()));
+        let c4 = cos(&d_bf16, &delta(&q4_out));
+        assert!(
+            c4 > 0.5,
+            "Q4 branch residual must stay correlated with bf16: cos {c4}"
+        );
+
+        let _ = std::fs::remove_file(ckpt);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A **zero-init** branch loaded quantized is still an exact step-0 identity: `proj_out` is all
+    /// zeros, quantizing zeros yields zeros, so every injected residual is exactly zero regardless of
+    /// how the (quantized) branch body drifts — the ControlNet identity contract survives quantization.
+    #[test]
+    fn quantized_zero_init_is_identity() {
+        let dev = Device::Cpu;
+        let (dit, c, path) = tiny_dit();
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+        // Zero-init branch (untouched `from_base` — proj_out zeros), saved and reloaded quantized.
+        let zero = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
+        let ckpt =
+            std::env::temp_dir().join(format!("krea_ctrl_qid_{}.safetensors", std::process::id()));
+        zero.save(&ckpt).unwrap();
+        let q4 = ControlBranch::from_checkpoint_quantized(&ckpt, &c, &dev, Quant::Q4).unwrap();
+
+        let (x0, cap, _) = tiny_batch(&c);
+        let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+        let ctxt = cap.unsqueeze(0).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let base = flat(&dit.forward(&x0, &t, &ctxt).unwrap());
+        let with = flat(&forward_with_control(&dit, &q4, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
+        assert_eq!(
+            base, with,
+            "a zero-init quantized branch must stay a byte-exact step-0 identity"
         );
         let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
