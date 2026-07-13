@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::Progress;
+use candle_gen::gen_core::{Progress, Quant};
 use candle_gen::train::flow_match::component_vb;
 use candle_gen_krea::control::{forward_with_control, ControlBranch};
 use candle_gen_krea::loader::Weights;
@@ -50,6 +50,10 @@ struct Args {
     out: PathBuf,
     /// Residual RMS clamp τ (0 = off; default `control::DEFAULT_RESIDUAL_CLAMP`).
     residual_clamp: f64,
+    /// Quantize the control-branch overlay (sc-11743): `q4` / `q8` keep it packed in VRAM
+    /// (dequant-on-forward), `bf16` (default) is the full-precision branch — the A/B for the branch-quant
+    /// pose-lock delta on a fixed base tier.
+    branch_quant: Option<Quant>,
 }
 
 fn parse_args() -> Args {
@@ -64,6 +68,7 @@ fn parse_args() -> Args {
         size: 1024,
         out: PathBuf::from("krea_control_render.png"),
         residual_clamp: candle_gen_krea::control::DEFAULT_RESIDUAL_CLAMP,
+        branch_quant: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -85,6 +90,14 @@ fn parse_args() -> Args {
             "--size" => a.size = val().parse().expect("--size"),
             "--out" => a.out = val().into(),
             "--residual-clamp" => a.residual_clamp = val().parse().expect("--residual-clamp"),
+            "--branch-quant" => {
+                a.branch_quant = match val().as_str() {
+                    "q4" | "Q4" => Some(Quant::Q4),
+                    "q8" | "Q8" => Some(Quant::Q8),
+                    "bf16" | "none" => None,
+                    other => panic!("--branch-quant must be q4|q8|bf16 (got {other})"),
+                }
+            }
             other => panic!("unknown flag {other}"),
         }
         i += 2;
@@ -132,17 +145,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
     let branch = match (&a.ckpt, use_branch) {
         (Some(p), true) => {
-            let mut b = ControlBranch::from_checkpoint(p, &cfg, &device)?;
+            // Small-card load (sc-11743): quantize each branch matmul leaf to a packed q4/q8 QLinear
+            // (dequant-on-forward) so the ~6.6 GB dense branch never lands in VRAM; otherwise bf16.
+            let mut b = match a.branch_quant {
+                Some(q) => ControlBranch::from_checkpoint_quantized(p, &cfg, &device, q)?,
+                None => ControlBranch::from_checkpoint(p, &cfg, &device)?,
+            };
             // Inference: detach weight reads so the sampler loop builds no autograd graph.
             b.freeze();
             let clamp = (a.residual_clamp > 0.0).then_some(a.residual_clamp);
             b.set_residual_clamp(clamp);
             eprintln!("residual clamp tau: {clamp:?}");
             eprintln!(
-                "branch: {} blocks, {:.2}B params, control_scale {}",
+                "branch: {} blocks, {:.2}B params, control_scale {}, branch_quant {:?}",
                 b.num_blocks(),
                 b.num_params() as f64 / 1e9,
-                a.scale
+                a.scale,
+                a.branch_quant,
             );
             Some(b)
         }
