@@ -217,7 +217,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
     eprintln!("decoding… (tile_vae_decode={tile_vae})");
     let vae = load_vae(&a.snapshot, &device)?;
+    let decode_t0 = std::time::Instant::now();
     let decoded = vae.decode_with(&lat, tile_vae)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
+    device.synchronize()?;
+    eprintln!(
+        "DECODE_MS tile_vae_decode={tile_vae} {}",
+        decode_t0.elapsed().as_millis()
+    );
     let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
     let img = img
         .squeeze(0)?
