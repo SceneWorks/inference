@@ -318,13 +318,57 @@ pub(crate) fn validate_request(
 
 // Link-time registration of all three variants.
 candle_gen::register_generators! {
-    descriptor_base => load_base,
-    descriptor_aesthetic => load_aesthetic,
-    descriptor_turbo => load_turbo,
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
+}
+candle_gen::register_generators! {
+    pub(crate) const AESTHETIC_REGISTRATION = descriptor_aesthetic => load_aesthetic
+}
+candle_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registrations from being dead-stripped).
 pub fn force_link() {}
+
+/// Add all Candle Anima providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(BASE_REGISTRATION)
+        .register_generator(AESTHETIC_REGISTRATION)
+        .register_generator(TURBO_REGISTRATION)
+}
+
+/// Build the complete explicit Candle Anima provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "anima" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit = explicit.clone();
+        sorted_explicit.sort();
+        compatibility.sort();
+
+        assert_eq!(sorted_explicit, compatibility);
+        assert_eq!(explicit, ["anima_base", "anima_aesthetic", "anima_turbo"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

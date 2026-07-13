@@ -198,9 +198,13 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 
 // Link-time registration of all three variants.
 mlx_gen::register_generators! {
-    descriptor_base => load_base,
-    descriptor_aesthetic => load_aesthetic,
-    descriptor_turbo => load_turbo,
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
+}
+mlx_gen::register_generators! {
+    pub(crate) const AESTHETIC_REGISTRATION = descriptor_aesthetic => load_aesthetic
+}
+mlx_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
 }
 
 #[cfg(test)]

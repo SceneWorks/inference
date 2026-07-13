@@ -57,3 +57,73 @@ pub use training::{
 };
 pub use transformer::CosmosDiT;
 pub use vae::{load_vae, QwenVae};
+
+/// Add all MLX Anima generators and trainers to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::BASE_REGISTRATION)
+        .register_generator(model::AESTHETIC_REGISTRATION)
+        .register_generator(model::TURBO_REGISTRATION)
+        .register_trainer(training::BASE_TRAINER_REGISTRATION)
+        .register_trainer(training::AESTHETIC_TRAINER_REGISTRATION)
+        .register_trainer(training::TURBO_TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit MLX Anima provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    fn sorted(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_generators: Vec<String> = mlx_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "anima" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_trainers: Vec<String> = mlx_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "anima" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+
+        assert_eq!(
+            sorted(explicit_generators.clone()),
+            sorted(compatibility_generators)
+        );
+        assert_eq!(
+            explicit_generators,
+            ["anima_base", "anima_aesthetic", "anima_turbo"]
+        );
+        assert_eq!(
+            sorted(explicit_trainers.clone()),
+            sorted(compatibility_trainers)
+        );
+        assert_eq!(
+            explicit_trainers,
+            ["anima_base", "anima_aesthetic", "anima_turbo"]
+        );
+    }
+}
