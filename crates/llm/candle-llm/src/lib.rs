@@ -48,3 +48,30 @@ pub use error::{Error, Result};
 pub use llava::{LlavaConfig, LlavaModel, LlavaProvider};
 pub use models::CausalLm;
 pub use provider::LlamaProvider;
+
+/// Build the complete, explicit Candle LLM provider catalog.
+pub fn text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
+    core_llm::TextLlmRegistryBuilder::new()
+        .register(provider::REGISTRATION)
+        .register(llava::REGISTRATION)
+        .build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_link_time_compatibility_catalog() {
+        let mut explicit: Vec<String> = super::text_registry()
+            .unwrap()
+            .registrations()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        let mut compatibility: Vec<String> = core_llm::textllms()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        explicit.sort();
+        compatibility.sort();
+        assert_eq!(explicit, compatibility);
+        assert_eq!(explicit, ["candle-llama", "candle-llava"]);
+    }
+}

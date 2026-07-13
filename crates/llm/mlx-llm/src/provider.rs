@@ -1054,15 +1054,16 @@ fn to_core(e: crate::Error) -> CoreError {
     }
 }
 
-// Register `mlx-llama` into core-llm's provider registry at link time.
-inventory::submit! {
-    core_llm::TextLlmRegistration {
-        descriptor: provider_descriptor,
-        load: load_registered,
-        can_load,
-        weightless_vision: Some(weightless_vision),
-    }
-}
+/// Ordinary registration used by explicit runtime bundles.
+pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistration {
+    descriptor: provider_descriptor,
+    load: load_registered,
+    can_load,
+    weightless_vision: Some(weightless_vision),
+};
+
+// Compatibility registration for consumers that still use link-time discovery.
+inventory::submit! { REGISTRATION }
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(LlamaProvider::load(spec)?))

@@ -1173,19 +1173,20 @@ pub(crate) fn to_core(e: crate::Error) -> CoreError {
     }
 }
 
-// Register `candle-llama` into core-llm's provider registry at link time.
-inventory::submit! {
-    core_llm::TextLlmRegistration {
-        descriptor: provider_descriptor,
-        load: load_registered,
-        can_load,
-        // Per-snapshot vision probe: the static descriptor reports `supports_vision=false` (most
-        // snapshots are text-only), but a Qwen3.6 / Qwen3-VL checkpoint with a `vision_config` IS
-        // vision-capable — this provider loads its ViT tower alongside the decoder. The probe lets a
-        // vision-required model-first load resolve it without reading weights.
-        weightless_vision: Some(can_load_vision),
-    }
-}
+/// Ordinary registration used by explicit runtime bundles.
+pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistration {
+    descriptor: provider_descriptor,
+    load: load_registered,
+    can_load,
+    // Per-snapshot vision probe: the static descriptor reports `supports_vision=false` (most
+    // snapshots are text-only), but a Qwen3.6 / Qwen3-VL checkpoint with a `vision_config` IS
+    // vision-capable — this provider loads its ViT tower alongside the decoder. The probe lets a
+    // vision-required model-first load resolve it without reading weights.
+    weightless_vision: Some(can_load_vision),
+};
+
+// Compatibility registration for consumers that still use link-time discovery.
+inventory::submit! { REGISTRATION }
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(LlamaProvider::load(spec)?))

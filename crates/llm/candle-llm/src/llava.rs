@@ -660,16 +660,17 @@ fn to_core(e: Error) -> CoreError {
     }
 }
 
-// Register `candle-llava` into core-llm's provider registry at link time.
-inventory::submit! {
-    core_llm::TextLlmRegistration {
-        descriptor,
-        load: load_registered,
-        can_load,
-        // The static descriptor already declares `supports_vision=true`; no per-snapshot probe needed.
-        weightless_vision: None,
-    }
-}
+/// Ordinary registration used by explicit runtime bundles.
+pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistration {
+    descriptor,
+    load: load_registered,
+    can_load,
+    // The static descriptor already declares `supports_vision=true`; no per-snapshot probe needed.
+    weightless_vision: None,
+};
+
+// Compatibility registration for consumers that still use link-time discovery.
+inventory::submit! { REGISTRATION }
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(LlavaProvider::load(spec)?))

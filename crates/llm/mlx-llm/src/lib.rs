@@ -67,3 +67,30 @@ pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
 pub use models::CausalLm;
 pub use provider::LlamaProvider;
 pub use snapshot::{write_hf_snapshot, write_snapshot, SnapshotReport, SnapshotTokenizer};
+
+/// Build the complete, explicit MLX LLM provider catalog.
+pub fn text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
+    core_llm::TextLlmRegistryBuilder::new()
+        .register(provider::REGISTRATION)
+        .register(joycaption::REGISTRATION)
+        .build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_link_time_compatibility_catalog() {
+        let mut explicit: Vec<String> = super::text_registry()
+            .unwrap()
+            .registrations()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        let mut compatibility: Vec<String> = core_llm::textllms()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        explicit.sort();
+        compatibility.sort();
+        assert_eq!(explicit, compatibility);
+        assert_eq!(explicit, ["mlx-joycaption", "mlx-llama"]);
+    }
+}
