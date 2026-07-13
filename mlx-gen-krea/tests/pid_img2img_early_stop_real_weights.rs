@@ -24,8 +24,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use mlx_gen::img2img::init_time_step;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-use mlx_gen_krea::load;
+use mlx_gen_krea::pipeline::turbo_schedule;
+use mlx_gen_krea::{load, TURBO_STEPS};
+use mlx_gen_pid::flow_capture_for_request;
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var(name).ok().map(PathBuf::from)
@@ -137,10 +140,16 @@ fn krea_turbo_img2img_pid_from_ldm_early_stop() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.4);
+    // Default ceiling MUST land strictly inside the img2img-sliced window `sigmas[start..]` or the
+    // capture collapses to the clean σ=0 tail and this test false-greens by running the clean path
+    // twice (sc-11869). For strength 0.4 (start=3) on the 8-step Turbo schedule
+    // `[1.0, .957, .905, .840, .760, .655, .513, .311, 0.0]`, `0.55` resolves to `sigmas[6]=0.513`
+    // (`keep=7 > start+1`) — an ACTIVE capture. The active-capture assert below enforces this for
+    // any override too. The OLD default `0.3` sat below every positive σ → inactive.
     let capture_sigma: f32 = std::env::var("KREA_PID_CAPTURE_SIGMA")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0.3);
+        .unwrap_or(0.55);
 
     let spec = LoadSpec::new(WeightsSource::Dir(krea_snapshot())).with_pid(
         WeightsSource::File(pid_checkpoint()),
@@ -210,6 +219,29 @@ fn krea_turbo_img2img_pid_from_ldm_early_stop() {
         pid_capture_sigma: Some(capture_sigma),
         ..base_img2img.clone()
     };
+
+    // sc-11869: PROVE the from_ldm capture is ACTIVE for these params BEFORE generating — otherwise
+    // the run below would silently execute the clean σ=0 tail (identical to `clean`) and the
+    // coherence/4× asserts would pass without ever exercising the crossed path. Mirror the Turbo
+    // img2img resolution in `Krea::generate_impl`: `start = init_time_step(steps, strength)`, then
+    // resolve the capture against the FULL schedule with that `start`. An active capture is
+    // `keep < len` (a ceiling stopping at/before `start` collapses to `keep == len`, the clean tail).
+    let sched = turbo_schedule(TURBO_STEPS, None);
+    let start = init_time_step(TURBO_STEPS, Some(strength)).min(sched.len() - 1);
+    let (resolved_sigma, keep) = flow_capture_for_request(&early_req, &sched, start);
+    assert!(
+        keep < sched.len() && keep > start + 1,
+        "sc-11869: from_ldm capture INACTIVE at strength={strength}, σ_ceiling={capture_sigma} \
+         (start={start}, keep={keep}, len={}) — the gate would false-green on the clean σ=0 tail. \
+         Set KREA_PID_CAPTURE_SIGMA above the smallest positive σ of sigmas[start..].",
+        sched.len(),
+    );
+    eprintln!(
+        "sc-11869 active-capture check OK: start={start} keep={keep} resolved_sigma={resolved_sigma:.4} \
+         (schedule len {})",
+        sched.len(),
+    );
+
     let t = Instant::now();
     let early = only_image(
         model
@@ -232,6 +264,15 @@ fn krea_turbo_img2img_pid_from_ldm_early_stop() {
     assert!(
         is_coherent(&early),
         "img2img + from_ldm early-stop PiD is incoherent — likely a σ desync (sc-10121)"
+    );
+    // sc-11869: the active capture MUST change the output vs the clean σ=0 decode. Byte-identical
+    // pixels mean the capture silently collapsed to the clean tail (the false-green this guards) —
+    // coherence alone can't tell "the crossed path rendered a good image" from "the clean path ran
+    // twice". (The pre-capture assert above already proves `keep < len`; this is the on-image check.)
+    assert_ne!(
+        early.pixels, clean.pixels,
+        "sc-11869: early-stop output is byte-identical to the clean σ=0 decode — the from_ldm \
+         capture did not fire, so the crossed path was never exercised"
     );
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/pid");
