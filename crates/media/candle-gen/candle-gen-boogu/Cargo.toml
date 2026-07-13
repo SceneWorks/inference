@@ -32,3 +32,7 @@ cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Shared test-support helpers (`candle_gen::testkit` — PPM IO / env-path / mean-abs-diff) for the
+# `#[ignore]`d img2img real-weight validation (sc-11786). Cargo unifies this with the `[dependencies]`
+# `candle-gen` entry, but the `testkit` feature is dev-only so it never reaches the shipped provider.
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
