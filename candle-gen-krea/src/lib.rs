@@ -85,7 +85,7 @@ pub use tokenizer::KreaTokenizer;
 // injects into its block stack; its forward is the spike's inference surface).
 pub use train_dit::KreaTrainDit;
 pub use transformer::Krea2Transformer;
-pub use vae::{load_vae, QwenVae};
+pub use vae::{load_vae, QwenVae, QwenVaeEncoder};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -152,6 +152,11 @@ pub struct KreaGenerator {
     /// lazily on the first edit so the txt2img (Turbo/Raw) paths keep their footprint (epic 10871).
     /// Only ever populated for the `krea_2_edit` id.
     edit_components: Mutex<Option<Arc<pipeline::EditComponents>>>,
+    /// The Qwen-Image VAE **encoder**, loaded lazily on the first Turbo img2img request (sc-10134) — the
+    /// only extra wire reference-guided latent-init needs (it VAE-encodes the reference into the clean
+    /// init latent). Kept separate from `edit_components` so a plain img2img never pulls the Qwen3-VL
+    /// vision tower the Kontext edit path also loads. Only ever populated for the `krea_2_turbo` id.
+    img2img_encoder: Mutex<Option<Arc<QwenVaeEncoder>>>,
 }
 
 impl KreaGenerator {
@@ -183,6 +188,18 @@ impl KreaGenerator {
     fn edit_components(&self) -> gen_core::Result<Arc<pipeline::EditComponents>> {
         candle_gen::cached(&self.edit_components, || {
             Ok(Arc::new(pipeline::load_edit_components(
+                &self.root,
+                &self.device,
+            )?))
+        })
+    }
+
+    /// The Qwen-Image VAE encoder, loaded once on the first Turbo img2img request and cached (sc-10134).
+    /// Reads the `vae/` encoder weights that already ship in the Krea 2 snapshot — no vision tower, unlike
+    /// [`Self::edit_components`].
+    fn img2img_encoder(&self) -> gen_core::Result<Arc<QwenVaeEncoder>> {
+        candle_gen::cached(&self.img2img_encoder, || {
+            Ok(Arc::new(crate::vae::load_vae_encoder(
                 &self.root,
                 &self.device,
             )?))
@@ -253,6 +270,21 @@ impl Generator for KreaGenerator {
             )?
         } else if self.descriptor.id == KREA_2_RAW_ID {
             pipeline::render_base(&comps, req, &self.device, on_progress)?
+        } else if let Some((reference, strength)) = img2img_reference(req) {
+            // Turbo img2img (reference-guided latent-init, sc-10134): a single `Conditioning::Reference`
+            // seeds the CFG-free denoise from the VAE-encoded reference. The capability floor accepts only
+            // `Reference` on `krea_2_turbo` (a MultiReference is already rejected); the VAE encoder loads
+            // lazily on this first img2img request (no vision tower, unlike the edit path).
+            let vae_encoder = self.img2img_encoder()?;
+            pipeline::render_img2img(
+                &comps,
+                &vae_encoder,
+                req,
+                reference,
+                strength,
+                &self.device,
+                on_progress,
+            )?
         } else {
             pipeline::render(&comps, req, &self.device, on_progress)?
         };
@@ -263,7 +295,8 @@ impl Generator for KreaGenerator {
 /// Krea 2 Turbo identity + capabilities — constructible without loading weights (registry
 /// introspection / capability advertisement). Distilled few-step text-to-image: **CFG-free** (the TDM
 /// distillation baked the guided velocity into the weights, so no guidance / unconditional branch), no
-/// user negative prompt, no img2img/control conditioning on the Turbo checkpoint.
+/// user negative prompt. Accepts reference-guided **img2img** latent-init (sc-10134) — a single
+/// `Conditioning::Reference` — but no control conditioning on the Turbo checkpoint.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: KREA_2_TURBO_ID,
@@ -275,7 +308,12 @@ pub fn descriptor() -> ModelDescriptor {
             // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
             supports_guidance: false,
             supports_true_cfg: false,
-            conditioning: Vec::new(),
+            // Turbo img2img reference-guided latent-init (sc-10134, epic 8588): a single
+            // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
+            // reference (`pipeline::render_img2img`). A MultiReference is NOT accepted here (that is the
+            // `krea_2_edit` Kontext surface); control conditioning stays unsupported. Raw resets this to
+            // empty in `raw_descriptor` (Raw img2img is the separate sc-10226).
+            conditioning: vec![ConditioningKind::Reference],
             // LoRA/LoKr wired (sc-7836): a trained `krea_2_raw` adapter merges into the dense DiT
             // attention projections at load ([`adapters::merge_into_weights`]), closing the candle
             // train→infer loop.
@@ -314,6 +352,11 @@ pub fn raw_descriptor() -> ModelDescriptor {
     d.capabilities.supports_negative_prompt = true;
     d.capabilities.supports_guidance = true;
     d.capabilities.supports_true_cfg = false;
+    // Reset the img2img `Reference` conditioning inherited from `descriptor` (Turbo): Raw img2img is the
+    // separate sc-10226 (needs its own full-CFG `render_img2img` entrypoint), so Raw stays pure txt2img
+    // here — advertising Reference without a render path would silently drop it to plain txt2img.
+    // `edit_descriptor` (derived from this) then sets its own Reference + MultiReference surface.
+    d.capabilities.conditioning = Vec::new();
     d
 }
 
@@ -332,6 +375,17 @@ pub fn edit_descriptor() -> ModelDescriptor {
         ConditioningKind::MultiReference,
     ];
     d
+}
+
+/// The Turbo img2img reference + strength (sc-10134): the first [`Conditioning::Reference`] in the
+/// request, if any. Turbo advertises only `Reference` (no MultiReference), so at most one is present;
+/// `None` ⇒ plain CFG-free txt2img. `strength` is the optional per-reference img2img fidelity the worker
+/// threads from `advanced.strength`. Pure so it is unit-testable without weights.
+fn img2img_reference(req: &GenerationRequest) -> Option<(&Image, Option<f32>)> {
+    req.conditioning.iter().find_map(|c| match c {
+        Conditioning::Reference { image, strength } => Some((image, *strength)),
+        _ => None,
+    })
 }
 
 /// The image-edit source references, in fixed order (scene = image 1, person = image 2; sc-10878) —
@@ -439,6 +493,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         convrot_dit,
         components: Mutex::new(None),
         edit_components: Mutex::new(None),
+        img2img_encoder: Mutex::new(None),
     }))
 }
 
@@ -569,7 +624,11 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
-        assert!(d.capabilities.conditioning.is_empty());
+        // Turbo advertises single-reference img2img (sc-10134) — but NOT MultiReference (the edit surface).
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         // LoRA/LoKr merge wired (sc-7836); packed Q4/Q8 tiers advertised (sc-9607).
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
@@ -763,7 +822,8 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);
-        // And it advertises BOTH single- and two-reference conditioning (Turbo/Raw advertise neither).
+        // And it advertises BOTH single- and two-reference conditioning. Turbo advertises only single
+        // `Reference` (img2img, sc-10134); Raw advertises neither (Raw img2img is sc-10226).
         assert_eq!(
             d.capabilities.conditioning,
             vec![
@@ -771,7 +831,10 @@ mod tests {
                 ConditioningKind::MultiReference
             ]
         );
-        assert!(descriptor().capabilities.conditioning.is_empty());
+        assert_eq!(
+            descriptor().capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         assert!(raw_descriptor().capabilities.conditioning.is_empty());
         // Shared surface stays in lockstep with Raw/Turbo (derived from `raw_descriptor()`).
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
@@ -850,6 +913,60 @@ mod tests {
         };
         let err = resolve_edit_references(&three).unwrap_err().to_string();
         assert!(err.contains("at most 2"), "got: {err}");
+    }
+
+    // --- Turbo img2img (reference-guided latent-init) — sc-10134 / epic 8588 ---
+
+    #[test]
+    fn img2img_reference_extracts_first_reference_and_strength() {
+        // A single `Reference` with an explicit strength → (image, Some(strength)).
+        let req = GenerationRequest {
+            prompt: "a red apple".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: ref_image(8, 4),
+                strength: Some(0.6),
+            }],
+            ..Default::default()
+        };
+        let (image, strength) = img2img_reference(&req).expect("a Reference is present");
+        assert_eq!((image.width, image.height), (8, 4));
+        assert_eq!(strength, Some(0.6));
+
+        // No conditioning → plain txt2img (None).
+        let plain = GenerationRequest {
+            prompt: "a red apple".into(),
+            ..Default::default()
+        };
+        assert!(img2img_reference(&plain).is_none());
+    }
+
+    #[test]
+    fn turbo_validate_accepts_reference_rejects_multireference() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(KREA_2_TURBO_ID, &spec).unwrap();
+        // A single-reference img2img request validates on Turbo (the sc-10134 surface).
+        let img2img = GenerationRequest {
+            prompt: "a red apple on a wooden table".into(),
+            width: 1024,
+            height: 1024,
+            conditioning: vec![Conditioning::Reference {
+                image: ref_image(64, 64),
+                strength: Some(0.5),
+            }],
+            ..Default::default()
+        };
+        assert!(g.validate(&img2img).is_ok());
+        // A two-image MultiReference is NOT the Turbo img2img surface (that's `krea_2_edit`) — rejected.
+        let multi = GenerationRequest {
+            prompt: "x".into(),
+            width: 1024,
+            height: 1024,
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![ref_image(64, 64), ref_image(64, 64)],
+            }],
+            ..Default::default()
+        };
+        assert!(g.validate(&multi).is_err(), "MultiReference not on Turbo");
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).

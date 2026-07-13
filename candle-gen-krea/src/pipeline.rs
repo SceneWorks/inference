@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
-use candle_gen::gen_core::imageops::resize_bicubic_u8;
+use candle_gen::gen_core::imageops::{resize_bicubic_u8, resize_lanczos_u8};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
 use candle_gen::{CandleError, LatentDecoder, Result};
@@ -282,6 +282,100 @@ pub fn render(
         // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both consume
         // the same normalized `[1,16,H/8,W/8]` latent (a zero-transform seam); PiD returns a larger
         // `[1,3,4H,4W]` tensor and `to_image` reads the size from it.
+        let decoded = match &pid_decoder {
+            Some(pid) => pid.decode(&lat)?,
+            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
+        };
+        to_image(&decoded)
+    })
+}
+
+/// Render the **Turbo img2img** (reference-guided latent-init) path (sc-10134, epic 8588) — the CFG-free
+/// sibling of [`render`] seeded from a VAE-encoded reference instead of pure noise. The candle/CUDA twin
+/// of mlx-gen-krea's `generate_turbo_img2img` (mlx A1, sc-8590). The mechanism (the fork's `LatentCreator`
+/// img2img leaves, ported byte-for-byte from `mlx_gen::img2img`):
+/// 1. LANCZOS-resize the reference to the target resolution ([`preprocess_img2img_init`]), VAE-encode it
+///    to the normalized `[1,16,H/8,W/8]` **clean** latent — the same space as the init noise.
+/// 2. `start = init_time_step(steps, strength)` = `max(1, floor(steps·strength))` (reference fidelity:
+///    higher strength → later start → closer to the reference — the fork's convention, NOT SDXL's).
+/// 3. Blend `x_start = (1−σ_start)·clean + σ_start·noise` at `σ_start = sigmas[start]`
+///    ([`add_noise_by_interpolation`]).
+/// 4. Run the CFG-free rectified-flow Euler loop over `sigmas[start..]` from `x_start` (one DiT
+///    forward/step, exactly as [`render`]).
+///
+/// The condition encode, schedule, and PiD/native decode seam are identical to [`render`] — img2img
+/// changes only the initial latent and the schedule start. `strength == 1.0` (start == steps) leaves a
+/// single trailing `σ = 0.0`, i.e. the clean reference decoded verbatim (full fidelity, no denoise), the
+/// SDXL-edit "empty schedule is a no-op" behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn render_img2img(
+    comps: &Components,
+    vae_encoder: &QwenVaeEncoder,
+    req: &GenerationRequest,
+    reference: &Image,
+    strength: Option<f32>,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+
+    // Condition encoding (seed-independent), identical to `render`: img2img changes only the init latent.
+    let context = comps
+        .te
+        .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+
+    let native = turbo_sigmas(steps);
+    let sigmas = candle_gen::resolve_flow_schedule(
+        req.scheduler.as_deref(),
+        TURBO_MU as f32,
+        steps,
+        &native,
+    );
+
+    // The img2img start step + the σ that seeds the blend (the fork's leaves). Clamp `start` to the last
+    // schedule index defensively so `sigmas[start]` is always valid (a curated scheduler may re-stride the
+    // schedule to a length other than `steps + 1`).
+    let start = init_time_step(steps, strength).min(sigmas.len().saturating_sub(1));
+    let sigma_start = sigmas[start];
+
+    // The clean reference latent (seed-independent): LANCZOS-resize → `[-1,1]` pixels → the normalized
+    // 16-ch latent (f32, the noise's dtype for the blend + sampler).
+    let init_pixels = preprocess_img2img_init(reference, req.width, req.height, device)?;
+    let clean = vae_encoder.encode(&init_pixels)?.to_dtype(DType::F32)?;
+
+    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+        comps.pid.as_deref(),
+        req,
+        base_seed,
+        crate::KREA_2_TURBO_ID,
+    )?;
+
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let noise = init_noise(req.height, req.width, seed, device)?;
+        let x_start = add_noise_by_interpolation(&clean, &noise, sigma_start)?;
+        // `sigmas[start..]` seeds the sampler at `sigma_start` (= its first element, the state x_start is
+        // at). A single-element tail (strength == 1.0) has no Euler step — decode x_start (= clean) as-is.
+        let sub = &sigmas[start..];
+        let lat = if sub.len() < 2 {
+            x_start
+        } else {
+            candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::Sigma,
+                sub,
+                x_start,
+                seed,
+                &req.cancel,
+                on_progress,
+                |x, timestep| -> Result<Tensor> {
+                    let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                    let v = comps.dit.forward(x, &t, &context)?;
+                    Ok(v.to_dtype(DType::F32)?)
+                },
+            )?
+        };
+        on_progress(Progress::Decoding);
         let decoded = match &pid_decoder {
             Some(pid) => pid.decode(&lat)?,
             None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
@@ -677,6 +771,69 @@ pub(crate) fn krea_cfg_combine(
     Ok((v_cond + guided)?)
 }
 
+/// Resolve the img2img start step — the candle port of `mlx_gen::img2img::init_time_step` (the fork's
+/// `Config.init_time_step`): for `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`; otherwise
+/// `0` (pure txt2img — the blend at `σ = sigmas[0] = 1.0` is exactly the noise). Higher strength → later
+/// start → fewer denoise steps → output stays closer to the reference (the fork's reference-fidelity
+/// convention, the INVERSE of SDXL's "higher strength = more change"). Pure, so it is unit-testable.
+pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+    match strength {
+        Some(s) if s > 0.0 => {
+            let s = s.clamp(0.0, 1.0);
+            // Python `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
+            ((num_steps as f32 * s) as usize).max(1)
+        }
+        _ => 0,
+    }
+}
+
+/// The img2img noise-interpolation blend — the candle port of `mlx_gen::img2img::add_noise_by_interpolation`
+/// (the fork's `LatentCreator.add_noise_by_interpolation`): `(1 − σ)·clean + σ·noise`, seeding the denoise
+/// loop at `σ = sigmas[init_time_step]`. `clean` and `noise` share the normalized `[1,16,H/8,W/8]` latent
+/// space + f32 dtype.
+fn add_noise_by_interpolation(clean: &Tensor, noise: &Tensor, sigma: f32) -> Result<Tensor> {
+    let clean_part = (clean * (1.0 - sigma) as f64)?;
+    let noise_part = (noise * sigma as f64)?;
+    Ok((clean_part + noise_part)?)
+}
+
+/// Preprocess an RGB8 reference [`Image`] to the VAE-encoder input `[1, 3, H, W]` in `[-1, 1]` (f32) at the
+/// target `(width, height)` — the candle port of `mlx_gen::img2img::preprocess_init_image`. PIL **LANCZOS**
+/// resample (`resize_lanczos_u8`, the fork's `scale_to_dimensions`; a no-op when already sized), then
+/// `(v/255)·2 − 1`. Distinct from [`image_to_pixels`] (the edit path's BICUBIC vision-preprocess mirror) —
+/// the img2img init mirrors the mlx img2img leaf's LANCZOS filter exactly.
+fn preprocess_img2img_init(
+    im: &Image,
+    target_w: u32,
+    target_h: u32,
+    device: &Device,
+) -> Result<Tensor> {
+    let (w, h) = (target_w as usize, target_h as usize);
+    if im.pixels.len() != (im.width * im.height * 3) as usize {
+        return Err(CandleError::Msg(format!(
+            "krea img2img: reference pixel buffer {} != {}x{}x3",
+            im.pixels.len(),
+            im.width,
+            im.height
+        )));
+    }
+    let resized: Vec<f32> = if (im.width, im.height) == (target_w, target_h) {
+        im.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&im.pixels, im.height as usize, im.width as usize, h, w)?
+    };
+    // HWC [0,255] → CHW [-1,1] (`(v/255)·2 − 1` == `v/127.5 − 1`), matching the fork's `to_array`.
+    let mut chw = vec![0f32; 3 * h * w];
+    for c in 0..3 {
+        for y in 0..h {
+            for x in 0..w {
+                chw[c * h * w + y * w + x] = resized[(y * w + x) * 3 + c] / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok(Tensor::from_vec(chw, (1, 3, h, w), device)?)
+}
+
 /// Seeded initial Gaussian latent noise `[1, 16, H/8, W/8]` (f32; the VAE's 8× spatial compression).
 /// Deterministic, launch-portable CPU RNG (sc-3673 parity), exactly as the z-image/ideogram/boogu
 /// providers. The model layer offsets `seed` per image in a batch (reference `seed + i`).
@@ -856,5 +1013,71 @@ mod tests {
             turbo_sigmas(4),
             "Raw dynamic-mu differs from Turbo fixed-mu"
         );
+    }
+
+    /// `init_time_step` is the fork's `max(1, floor(steps·strength))` for strength in (0,1], else 0.
+    /// Higher strength → later start (closer to the reference); a tiny positive strength still starts at
+    /// 1 (never 0, which is txt2img); >1 clamps to full; None / 0 is pure txt2img (start 0).
+    #[test]
+    fn init_time_step_is_the_fork_convention() {
+        assert_eq!(init_time_step(8, None), 0);
+        assert_eq!(init_time_step(8, Some(0.0)), 0);
+        assert_eq!(init_time_step(8, Some(-0.5)), 0);
+        assert_eq!(init_time_step(8, Some(0.5)), 4);
+        assert_eq!(init_time_step(8, Some(1.0)), 8);
+        // floor(8·0.01) = 0 → clamped up to the minimum denoise start of 1.
+        assert_eq!(init_time_step(8, Some(0.01)), 1);
+        // strength clamps to 1.0 before the multiply.
+        assert_eq!(init_time_step(8, Some(2.0)), 8);
+        assert_eq!(init_time_step(52, Some(0.5)), 26);
+    }
+
+    /// `add_noise_by_interpolation` is the `(1−σ)·clean + σ·noise` blend: σ=0 → clean, σ=1 → noise,
+    /// σ=0.5 → the midpoint.
+    #[test]
+    fn add_noise_by_interpolation_blends_clean_and_noise() {
+        let clean = Tensor::from_vec(vec![2.0f32, 4.0], (2,), &Device::Cpu).unwrap();
+        let noise = Tensor::from_vec(vec![0.0f32, 0.0], (2,), &Device::Cpu).unwrap();
+        for (sigma, want) in [
+            (0.0f32, [2.0f32, 4.0]),
+            (1.0, [0.0, 0.0]),
+            (0.5, [1.0, 2.0]),
+        ] {
+            let out = add_noise_by_interpolation(&clean, &noise, sigma).unwrap();
+            let got = out.to_vec1::<f32>().unwrap();
+            assert!(
+                (got[0] - want[0]).abs() < 1e-6 && (got[1] - want[1]).abs() < 1e-6,
+                "σ={sigma}: got {got:?}, want {want:?}"
+            );
+        }
+    }
+
+    /// `preprocess_img2img_init` normalizes an RGB8 reference to `[1, 3, H, W]` in `[-1, 1]` (the same
+    /// `v/127.5 − 1` mapping as the edit `image_to_pixels`, but the img2img LANCZOS filter), and rejects a
+    /// malformed pixel buffer. At the source size it is a no-op resize (R=0 → −1, G=128 → ~0, B=255 → +1).
+    #[test]
+    fn preprocess_img2img_init_normalizes_and_shapes() {
+        let mut px = Vec::new();
+        for _ in 0..4 {
+            px.extend_from_slice(&[0u8, 128, 255]);
+        }
+        let im = Image {
+            width: 2,
+            height: 2,
+            pixels: px,
+        };
+        let t = preprocess_img2img_init(&im, 2, 2, &Device::Cpu).unwrap();
+        assert_eq!(t.dims(), &[1, 3, 2, 2]);
+        let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(v[0..4].iter().all(|&x| (x - (-1.0)).abs() < 1e-6));
+        assert!(v[4..8].iter().all(|&x| x.abs() < 0.01));
+        assert!(v[8..12].iter().all(|&x| (x - 1.0).abs() < 1e-6));
+
+        let bad = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 10],
+        };
+        assert!(preprocess_img2img_init(&bad, 4, 4, &Device::Cpu).is_err());
     }
 }
