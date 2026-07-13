@@ -120,6 +120,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         a.branch_quant, a.size, a.size, a.scale
     );
 
+    // `KREA_TILE_VAE=1` forces the seam-free tiled VAE decode below the im2col threshold (sc-11744) —
+    // the fit-ladder's cheapest VRAM rung; default false = the monolithic full-speed decode.
+    let tile_vae_decode = std::env::var("KREA_TILE_VAE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     let req = Krea2ControlRequest {
         prompt: a.prompt,
         width: a.size,
@@ -127,6 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         steps: a.steps,
         control_scale: a.scale,
         seed: a.seed,
+        tile_vae_decode,
         cancel: CancelFlag::new(),
     };
     let mut on_progress = |p: Progress| {
