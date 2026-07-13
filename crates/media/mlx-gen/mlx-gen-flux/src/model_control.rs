@@ -373,7 +373,9 @@ impl Generator for Flux1DevControl {
 // Link-time registration (epic 3720): the `inventory::submit!` so E2's worker can resolve the
 // `flux1_dev_control` generator by id. The `impl Generator` above stays hand-written because `validate`
 // adds a control-conditioning check beyond the plain capability floor.
-mlx_gen::register_generators! { descriptor_dev_control => load_dev_control }
+mlx_gen::register_generators! {
+    pub(crate) const DEV_CONTROL_REGISTRATION = descriptor_dev_control => load_dev_control
+}
 
 #[cfg(test)]
 mod tests {

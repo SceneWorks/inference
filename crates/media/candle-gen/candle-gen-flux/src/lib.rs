@@ -400,8 +400,10 @@ pub fn load_dev(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 // this crate makes `gen_core::load("flux1_schnell"/"flux1_dev", …)` resolve the candle generators
 // with no central match to edit.
 candle_gen::register_generators! {
-    descriptor_schnell => load_schnell,
-    descriptor_dev => load_dev,
+    pub(crate) const SCHNELL_REGISTRATION = descriptor_schnell => load_schnell
+}
+candle_gen::register_generators! {
+    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
 }
 
 /// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
@@ -409,6 +411,45 @@ candle_gen::register_generators! {
 /// can discard the whole rlib — taking the `inventory::submit!` registrations with it. Referencing
 /// this no-op from the consumer keeps the crate linked. (Same pattern as `candle_gen_sdxl::force_link`.)
 pub fn force_link() {}
+
+/// Add all Candle FLUX.1 providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(SCHNELL_REGISTRATION)
+        .register_generator(DEV_REGISTRATION)
+}
+
+/// Build the complete explicit Candle FLUX.1 provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "flux" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit = explicit.clone();
+        sorted_explicit.sort();
+        compatibility.sort();
+
+        assert_eq!(sorted_explicit, compatibility);
+        assert_eq!(explicit, ["flux1_schnell", "flux1_dev"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

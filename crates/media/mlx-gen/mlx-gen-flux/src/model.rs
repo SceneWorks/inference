@@ -570,8 +570,10 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
 // above stays hand-written because `generate` is bespoke (IP-adapter / true-CFG branching), not the
 // plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! {
-    descriptor_schnell => load_schnell,
-    descriptor_dev => load_dev,
+    pub(crate) const SCHNELL_REGISTRATION = descriptor_schnell => load_schnell
+}
+mlx_gen::register_generators! {
+    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
 }
 
 #[cfg(test)]

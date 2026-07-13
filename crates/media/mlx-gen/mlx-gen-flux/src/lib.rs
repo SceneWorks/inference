@@ -40,3 +40,46 @@ pub use pipeline::{
 };
 pub use text_encoder::{ClipTextEncoder, FluxTextEncoders, T5TextEncoder};
 pub use transformer::{FluxTransformer, FluxTransformerConfig};
+
+/// Add all MLX FLUX.1 providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::SCHNELL_REGISTRATION)
+        .register_generator(model::DEV_REGISTRATION)
+        .register_generator(model_control::DEV_CONTROL_REGISTRATION)
+}
+
+/// Build the complete explicit MLX FLUX.1 provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility: Vec<String> = mlx_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "flux" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit = explicit.clone();
+        sorted_explicit.sort();
+        compatibility.sort();
+
+        assert_eq!(sorted_explicit, compatibility);
+        assert_eq!(
+            explicit,
+            ["flux1_schnell", "flux1_dev", "flux1_dev_control"]
+        );
+    }
+}
