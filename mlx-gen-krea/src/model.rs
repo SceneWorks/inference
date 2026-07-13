@@ -25,8 +25,8 @@ use mlx_rs::Array;
 use std::path::Path;
 
 use crate::pipeline::{
-    base_schedule, turbo_schedule, EditPlan, Img2ImgPlan, KreaHeavy, KreaText, T2iPlan,
-    TurboOptions,
+    base_schedule, maybe_apply_style_gain, turbo_schedule, EditPlan, Img2ImgPlan, KreaHeavy,
+    KreaText, T2iPlan, TurboOptions,
 };
 
 /// Read the on-disk packed-quantization bits from `transformer/config.json` for a pre-quantized
@@ -485,7 +485,10 @@ impl Krea {
             };
             Ok(KreaContexts { pos, neg })
         } else if is_raw {
-            let pos = text.encode(&req.prompt)?;
+            // POSITIVE context carries the Krea "text style" tap-reweight gain (sc-11878); the
+            // CFG-negative context is encoded WITHOUT it so the knob steers only the conditional
+            // prediction (mirrors candle-gen-krea `encode_prompt_context`). `None`/g≈1 is a no-op.
+            let pos = maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
             let neg = if guidance > 0.0 {
                 Some(text.encode(negative)?)
             } else {
@@ -493,8 +496,9 @@ impl Krea {
             };
             Ok(KreaContexts { pos, neg })
         } else {
+            // Turbo (CFG-free) t2i/img2img: single conditional context, gain applied (no negative).
             Ok(KreaContexts {
-                pos: text.encode(&req.prompt)?,
+                pos: maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?,
                 neg: None,
             })
         }

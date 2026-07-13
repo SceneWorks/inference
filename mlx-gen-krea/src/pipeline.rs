@@ -1239,6 +1239,65 @@ pub(crate) fn krea_cfg_combine(v_cond: &Array, v_uncond: &Array, guidance: f32) 
     )?)
 }
 
+/// The GPU-validated-safe range for [`gen_core::GenerationRequest::text_style_gain`] — the sc-8596 A/B
+/// swept `[0.25, 1.75]` and every point stayed coherent. The engine clamps to this rather than trusting a
+/// caller/UI to bound it. Mirrors candle-gen-krea's `TEXT_STYLE_GAIN_RANGE` (sc-11878 Mac parity); the
+/// SceneWorks worker also clamps to the same range, so this is defense-in-depth, not the only guard.
+const TEXT_STYLE_GAIN_RANGE: (f32, f32) = (0.25, 1.75);
+
+/// SPIKE (sc-8596) — scale each of the stacked Qwen3-VL select-layer taps of a Krea text context
+/// `[b, n_tok, num_layers, hidden]` by `weights[i]` along the layer axis (axis 2): a
+/// `[1, 1, num_layers, 1]` broadcast multiply applied **before** the DiT's `TextFusionTransformer`
+/// aggregates the taps (layerwise-attn → `projector` num_layers→1 → refiner). An "IP-Adapter-LIKE"
+/// steering knob on the *text-only* weights — no new model weights. All-ones reproduces the input
+/// bit-for-bit; a mis-sized vector is rejected loudly so a bad sweep fails rather than silently
+/// broadcasting/truncating. Krea/Qwen-Image-family specific (depends on the multi-tap structure); it does
+/// NOT generalize to CLIP/T5 encoders. The candle-gen-krea twin of the same name (sc-11878).
+pub fn apply_tap_weights(context: &Array, weights: &[f32]) -> Result<Array> {
+    let n = context.shape()[2] as usize;
+    if weights.len() != n {
+        return Err(mlx_gen::Error::Msg(format!(
+            "krea tap reweight: {} weights but the context has {n} select layers",
+            weights.len()
+        )));
+    }
+    let w = Array::from_slice(weights, &[1, 1, n as i32, 1]).as_dtype(context.dtype())?;
+    Ok(multiply(context, &w)?)
+}
+
+/// Map the single "text style" gain scalar `g` to the per-layer tap ramp `w[i] = g + (2−2g)·i/(n−1)`
+/// (sc-11878 — the shipped control over the sc-8596 spike mechanism). `g` is clamped to
+/// [`TEXT_STYLE_GAIN_RANGE`]. `g = 1` yields all-ones (a no-op); `g > 1` emphasizes the early (low-level)
+/// taps (`w[0] = g`, tapering to `w[n−1] = 2−g`), `g < 1` biases the late (semantic) taps. At `g = 1.75`
+/// this reproduces the spike's `early_ramp` (1.75→0.25). `n = 1` degenerates to `[g]`. Byte-for-byte the
+/// candle-gen-krea `tap_gain_weights` (same clamp, same ramp) so the two backends agree at every `g`.
+fn tap_gain_weights(gain: f32, n: usize) -> Vec<f32> {
+    let g = gain.clamp(TEXT_STYLE_GAIN_RANGE.0, TEXT_STYLE_GAIN_RANGE.1);
+    if n <= 1 {
+        return vec![g; n];
+    }
+    (0..n)
+        .map(|i| g + (2.0 - 2.0 * g) * (i as f32) / ((n - 1) as f32))
+        .collect()
+}
+
+/// Apply the request's optional [`gen_core::GenerationRequest::text_style_gain`] to a freshly-encoded
+/// **positive** Krea text context (sc-11878). `None` — or a gain within 1e-4 of 1.0 — returns the context
+/// untouched (the no-op fast path), so a plain request pays nothing. The caller encodes the CFG-negative
+/// context WITHOUT the gain, so the knob steers only the conditional prediction (matching the sc-8596
+/// spike and candle-gen-krea's `maybe_apply_style_gain`). Reached only from the txt2img/img2img encode
+/// seam ([`crate::model::Krea::encode_contexts`]); the grounded-edit and pose-control paths do not pass a
+/// gain (the worker only wires it through the generic Turbo/Raw entry point).
+pub(crate) fn maybe_apply_style_gain(context: Array, gain: Option<f32>) -> Result<Array> {
+    match gain {
+        Some(g) if (g - 1.0).abs() > 1e-4 => {
+            let n = context.shape()[2] as usize;
+            apply_tap_weights(&context, &tap_gain_weights(g, n))
+        }
+        _ => Ok(context),
+    }
+}
+
 /// Seeded initial Gaussian latent noise `[1, 16, H/8, W/8]` (f32; the VAE's 8× spatial compression).
 /// The model layer offsets `seed` per image in a batch, mirroring the reference `seed + i`.
 fn init_noise(height: u32, width: u32, seed: u64) -> Result<Array> {
@@ -1272,6 +1331,94 @@ mod tests {
                 v.item::<f32>()
             );
         }
+    }
+
+    /// SPIKE (sc-8596): all-ones tap weights are an identity reweight (byte-exact), and a per-layer
+    /// scalar scales exactly its select-layer slice along axis 2 (a `[1,1,num_layers,1]` broadcast).
+    #[test]
+    fn apply_tap_weights_scales_layer_axis() {
+        // context [b=1, n_tok=2, num_layers=3, hidden=2], all ones.
+        let ctx = Array::ones::<f32>(&[1, 2, 3, 2]).unwrap();
+
+        // Identity: all-ones weights reproduce the input.
+        let id = apply_tap_weights(&ctx, &[1.0, 1.0, 1.0]).unwrap();
+        assert_eq!(id.as_slice::<f32>(), ctx.as_slice::<f32>());
+
+        // Per-layer scale: layer 0 → 2, layer 1 → 0, layer 2 → 0.5, along axis 2 only. Row-major layout
+        // is [b, n_tok, layer, hidden]; for all-ones input each element equals its layer's weight.
+        let out = apply_tap_weights(&ctx, &[2.0, 0.0, 0.5]).unwrap();
+        let v = out.as_slice::<f32>();
+        // Two n_tok rows, each: layer0 (2 elems) | layer1 (2) | layer2 (2).
+        let want = [2.0, 2.0, 0.0, 0.0, 0.5, 0.5, 2.0, 2.0, 0.0, 0.0, 0.5, 0.5];
+        assert_eq!(v.len(), want.len());
+        for (got, w) in v.iter().zip(want.iter()) {
+            assert!((got - w).abs() < 1e-6, "got {got}, want {w}");
+        }
+    }
+
+    /// sc-11878: the single "text style" gain scalar maps to the validated tap ramp — g=1 is a no-op
+    /// (all ones), g=1.75 reproduces the spike's early_ramp (1.75→0.25), and out-of-range clamps.
+    /// Byte-identical mapping to candle-gen-krea's `tap_gain_weights`.
+    #[test]
+    fn tap_gain_weights_maps_scalar_to_ramp() {
+        // g = 1 → all ones (no-op).
+        assert_eq!(tap_gain_weights(1.0, 12), vec![1.0; 12]);
+
+        // g = 1.75 → linear ramp 1.75 → 0.25 across 12 taps (the spike's early_ramp).
+        let w = tap_gain_weights(1.75, 12);
+        assert!((w[0] - 1.75).abs() < 1e-6);
+        assert!((w[11] - 0.25).abs() < 1e-6);
+        // Monotonically decreasing, symmetric about 1.0 at the midpoint.
+        assert!(w.windows(2).all(|p| p[0] > p[1]));
+        assert!((w[0] + w[11] - 2.0).abs() < 1e-6);
+
+        // g = 0.5 → mirror ramp 0.5 → 1.5 (late emphasis).
+        let lo = tap_gain_weights(0.5, 12);
+        assert!((lo[0] - 0.5).abs() < 1e-6);
+        assert!((lo[11] - 1.5).abs() < 1e-6);
+
+        // Clamp: 3.0 → 1.75, 0.0 → 0.25.
+        assert!((tap_gain_weights(3.0, 12)[0] - 1.75).abs() < 1e-6);
+        assert!((tap_gain_weights(0.0, 12)[0] - 0.25).abs() < 1e-6);
+
+        // Degenerate n.
+        assert_eq!(tap_gain_weights(1.5, 1), vec![1.5]);
+    }
+
+    /// `maybe_apply_style_gain` is a no-op for `None` and for a gain within 1e-4 of 1.0, and reweights
+    /// otherwise (byte-identical to the explicit `apply_tap_weights` with the mapped ramp).
+    #[test]
+    fn maybe_apply_style_gain_noop_and_apply() {
+        let ctx = Array::ones::<f32>(&[1, 2, 12, 4]).unwrap();
+
+        // None → untouched.
+        assert_eq!(
+            maybe_apply_style_gain(ctx.clone(), None)
+                .unwrap()
+                .as_slice::<f32>(),
+            ctx.as_slice::<f32>()
+        );
+
+        // g ≈ 1 → untouched (no-op fast path).
+        assert_eq!(
+            maybe_apply_style_gain(ctx.clone(), Some(1.00005))
+                .unwrap()
+                .as_slice::<f32>(),
+            ctx.as_slice::<f32>()
+        );
+
+        // g = 1.5 → equals the explicit ramp apply.
+        let got = maybe_apply_style_gain(ctx.clone(), Some(1.5)).unwrap();
+        let want = apply_tap_weights(&ctx, &tap_gain_weights(1.5, 12)).unwrap();
+        assert_eq!(got.as_slice::<f32>(), want.as_slice::<f32>());
+    }
+
+    /// A mis-sized weight vector must fail loudly (not silently truncate/broadcast).
+    #[test]
+    fn apply_tap_weights_rejects_wrong_len() {
+        let ctx = Array::ones::<f32>(&[1, 2, 3, 2]).unwrap();
+        assert!(apply_tap_weights(&ctx, &[1.0, 1.0]).is_err());
+        assert!(apply_tap_weights(&ctx, &[1.0; 4]).is_err());
     }
 
     /// F-073 parity invariant: the count-invariant plan is built from [`KreaHeavy::geom_latent`], which
