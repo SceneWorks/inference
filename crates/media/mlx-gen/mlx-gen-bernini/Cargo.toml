@@ -22,7 +22,7 @@ serde_json = { workspace = true }
 # Source-media decode (i2i/v2v/r2v/rv2v conditioning). PNG + JPEG cover the still inputs.
 image = { workspace = true }
 # Qwen2.5-VL ChatML tokenizer (planner templating, sc-5136).
-tokenizers = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 # Real-weight typed-cancellation conformance gate (story 6883): drives the registered

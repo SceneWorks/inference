@@ -1,16 +1,16 @@
 # Phase 2 Workspace Normalization Matrix
 
-> **Status:** Approved migration analysis; source moves and manifest rewrites have
-> not started.
+> **Status:** Normalization implemented locally and validated; see
+> `PHASE_2_CHECKPOINT.md`.
 
 ## Final Phase 2 ownership paths
 
 ```text
-crates/contracts/core-llm/   current imports/core-llm tree
-crates/llm/mlx-llm/         current imports/mlx-llm tree
-crates/llm/candle-llm/      current imports/candle-llm tree
-crates/media/mlx-gen/       current imports/mlx-gen tree
-crates/media/candle-gen/    current imports/candle-gen tree
+crates/contracts/core-llm/   core-llm tree
+crates/llm/mlx-llm/         mlx-llm tree
+crates/llm/candle-llm/      candle-llm tree
+crates/media/mlx-gen/       mlx-gen tree
+crates/media/candle-gen/    candle-gen tree
 ```
 
 Moving each root intact preserves all existing relative provider paths. The later
@@ -42,7 +42,7 @@ metadata's 67-package set is authoritative for initial workspace membership.
 | `mlx-rs` / `mlx-sys` | Personal-fork URL at one SHA | Keep one root workspace dependency at the existing SHA until canonical tag work. |
 | `inventory` | Version 0.3 in all workspaces | One root dependency; retained until explicit-registry phase. |
 | `thiserror` | Version 2 | One root dependency. |
-| `serde_json` | Version 1 with differing features | One root dependency with additive `preserve_order`. |
+| `serde_json` | Version 1 with differing features | Root inheritance stays at base version 1; direct `preserve_order` users retain their explicit feature to avoid changing other packages' map semantics. |
 | `tokenizers` | MLX/core 0.21; Candle media 0.22 | Preserve both versions mechanically: root inheritance remains 0.22 for Candle's 14 users; MLX's three inherited users become explicit 0.21 declarations. Contract already declares 0.21 directly. Do not upgrade during migration. |
 | Candle crates | One upstream Candle Git SHA | Keep shared root declarations at the exact current SHA. |
 
@@ -59,7 +59,8 @@ metadata's 67-package set is authoritative for initial workspace membership.
 8. Generate one lockfile.
 9. Run contract and Candle CPU metadata/check/test lanes before MLX/CUDA work.
 
-Each numbered step is a separate commit or independently revertible commit group.
+The byte-preserving move is commit `9e857956`. Workspace normalization is kept as
+the following independently reviewable commit.
 
 ## Guardrails
 
@@ -69,4 +70,3 @@ Each numbered step is a separate commit or independently revertible commit group
 - No registry refactor in Phase 2.
 - No model-first provider moves until the normalized graph passes platform checks.
 - The two tokenizer versions are intentional during normalization.
-

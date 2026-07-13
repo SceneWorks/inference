@@ -17,7 +17,7 @@ name = "gen_core"
 # depends on NOTHING tensor-related — thiserror (error), inventory (registry), tokenizers (text).
 thiserror = { workspace = true }
 inventory = { workspace = true }
-tokenizers = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # Neutral safetensors header/byte-view reader for the weights-metadata layer (sc-3722). NOT a tensor
 # dep — exposes keys/dtypes/shapes/raw bytes only.
 safetensors = { workspace = true }

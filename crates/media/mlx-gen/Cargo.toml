@@ -1,13 +1,12 @@
-[workspace]
-members = ["gen-core", "gen-core-testkit", "mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-clip", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-bernini", "mlx-gen-scail2", "mlx-gen-face", "mlx-gen-pulid", "mlx-gen-instantid", "mlx-gen-svd", "mlx-gen-joycaption", "mlx-gen-sam2", "mlx-gen-sam3", "mlx-gen-sensenova", "mlx-gen-kolors", "mlx-gen-chroma", "mlx-gen-lens", "mlx-gen-seedvr2", "mlx-gen-ideogram", "mlx-gen-boogu", "mlx-gen-krea", "mlx-gen-pid", "mlx-gen-sd3", "mlx-gen-depth", "mlx-gen-sana", "mlx-gen-anima"]
-resolver = "2"
+# Historical dependency rationale retained during migration. Active shared pins
+# live in the repository root Cargo.toml.
 
-# Single source of truth for the deps shared across the root and all 31 member crates (F-151). The
+# This was the single source of truth for the deps shared across the root and all 31 member crates. The
 # next MLX/fork bump (sc-2517/2772/2781 etc.) is now a one-line edit here instead of dozens of
 # synchronized per-crate ones — a missed crate would otherwise produce two distinct `mlx-rs` builds,
 # cross-crate `Array` type-mismatch errors, and a doubled (very expensive) MLX-from-source build.
 # Members opt in with `<dep> = { workspace = true }`.
-[workspace.dependencies]
+[package.metadata.legacy-workspace-dependencies]
 # mlx-rs fork pinned to our own GitHub copy by commit SHA (supply-chain capture — immune to the
 # upstream fork being yanked/deleted). `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX
 # core v0.31.2 (vs upstream mlx-rs 0.25.3, welded to MLX 0.25.1 — 2–3.6× slower Metal kernels).
@@ -111,7 +110,7 @@ mlx-sys = { workspace = true }
 sceneworks-gen-core = { workspace = true }
 thiserror = { workspace = true }
 inventory = { workspace = true }
-tokenizers = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # The hoisted turnkey converter glue (quant::write_quantized_config, F-045) writes the packed
 # snapshot's config.json `"quantization"` marker; the per-crate converters already used serde_json,
 # now the shared core copy does.

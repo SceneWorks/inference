@@ -9,11 +9,7 @@ readme = "README.md"
 keywords = ["mlx", "apple-silicon", "llm", "inference", "serving"]
 categories = ["science"]
 
-# The engine is the workspace root; `server/` is a separate example bin (story 7174) so its HTTP
-# deps never enter the engine's dependency graph. One lockfile + the root `.cargo/config.toml`
-# (single-threaded MLX, deployment target) cover both members.
-[workspace]
-members = ["server"]
+# The engine and example server are members of the repository root workspace.
 
 [dependencies]
 # mlx-rs is pinned to the pmetal fork by commit SHA — the SAME pin mlx-gen uses, so the two
@@ -26,29 +22,22 @@ members = ["server"]
 # compiled-in metallib (METAL_PATH) over the shared ~/.cache/pmetal user cache, so a stale/older
 # pmetal build can't shadow the current build's kernels (small-M bm64 GEMM panic). Kept in lock-step
 # with mlx-gen's pin so the two still build ONE mlx-rs.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "38e1cc1730a11b1e40c2c8ecda01606763a12d51" }
-# The backend-neutral contract this crate implements (epic 7153). Git dep on the published repo
-# during development (crates.io publish coordination is a later story); shares its `CancelFlag`,
-# `Tokenizer`, chat templates, and the `TextLlm` trait so there is one contract, not two.
-# Pinned by `branch = "main"` (sc-8116/sc-8533) so this crate unifies with candle-llm and the
-# sceneworks gen graph, which also pin core-llm `branch = "main"` — a `rev` spec here and a `branch`
-# spec there are distinct git sources, yielding two core-llm copies whose link-time provider registries
-# don't share. The committed Cargo.lock pins the resolved commit, so a stray `cargo update` can't float
-# core-llm to a new HEAD (the sc-8021 "don't float" guard, now enforced by the lockfile, not the pin).
-core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+mlx-rs = { workspace = true }
+# The backend-neutral contract this crate implements. The root workspace path is
+# load-bearing: every provider must register into the same core-llm package.
+core-llm = { workspace = true }
 # Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
 # inventory so the distributed slice links.
-inventory = "0.3"
+inventory = { workspace = true }
 # Error plumbing for the engine surface.
-thiserror = "2"
+thiserror = { workspace = true }
 # config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-gen convention.
-serde_json = "1"
+serde_json = { workspace = true }
 # half-precision scalar helpers for host-side dtype handling.
 half = "2"
 
 [dev-dependencies]
 # (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct
 # tokenizers dep needed.)
-# The contract conformance suite (story 7201): run the registered LlamaProvider through the
-# backend-neutral checks. Same git source AND ref as the core-llm dep so cargo unifies on one core-llm.
-core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+# Run the registered LlamaProvider through the backend-neutral contract checks.
+core-llm-testkit = { workspace = true }

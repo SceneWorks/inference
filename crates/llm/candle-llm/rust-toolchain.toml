@@ -1,7 +1,0 @@
-# Pin the Rust toolchain so a new `stable` release can't redden CI on an untouched workspace.
-# Pinned to the SAME channel as the candle-gen / mlx-llm siblings so the on-device family compiles
-# identically. Bump deliberately (review new lints in the same PR).
-[toolchain]
-channel = "1.96.0"
-components = ["rustfmt", "clippy"]
-profile = "minimal"
