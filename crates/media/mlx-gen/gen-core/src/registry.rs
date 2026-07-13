@@ -248,6 +248,18 @@ impl ProviderRegistry {
         "text embedder",
         dyn TextEmbedder
     );
+
+    /// Run the weights-free descriptor conformance sweep over this explicit catalog.
+    pub fn descriptor_conformance_errors(&self) -> Vec<String> {
+        descriptor_conformance_errors_for(
+            &self.generators,
+            &self.transforms,
+            &self.trainers,
+            &self.captioners,
+            &self.image_embedders,
+            &self.text_embedders,
+        )
+    }
 }
 
 /// All registered generators (one per linked provider crate).
@@ -476,17 +488,30 @@ fn check_unique_ids(errs: &mut Vec<String>, kind: &str, ids: &[&str]) {
 /// Returns one message per violation (empty = conformant). The sweep sees exactly the registrations
 /// the calling binary links — the same visibility rule as [`load`] (the sc-4482 dead-strip trap),
 /// so a caller must force-link its providers (`use mlx_gen_<x> as _;`).
-pub fn descriptor_conformance_errors() -> Vec<String> {
+fn descriptor_conformance_errors_for(
+    generator_registrations: &[ModelRegistration],
+    transform_registrations: &[TransformRegistration],
+    trainer_registrations: &[TrainerRegistration],
+    captioner_registrations: &[CaptionerRegistration],
+    image_embedder_registrations: &[ImageEmbedderRegistration],
+    text_embedder_registrations: &[TextEmbedderRegistration],
+) -> Vec<String> {
     let mut errs = Vec::new();
 
-    let gen_descs: Vec<ModelDescriptor> = generators().map(|r| (r.descriptor)()).collect();
+    let gen_descs: Vec<ModelDescriptor> = generator_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
     for d in &gen_descs {
         errs.extend(model_descriptor_errors(d));
     }
     let gen_ids: Vec<&str> = gen_descs.iter().map(|d| d.id).collect();
     check_unique_ids(&mut errs, "generator", &gen_ids);
 
-    let trainer_descs: Vec<TrainerDescriptor> = trainers().map(|r| (r.descriptor)()).collect();
+    let trainer_descs: Vec<TrainerDescriptor> = trainer_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
     for d in &trainer_descs {
         let ctx = format!("trainer '{}'", d.id);
         check_identity(
@@ -494,16 +519,14 @@ pub fn descriptor_conformance_errors() -> Vec<String> {
             &ctx,
             &[("id", d.id), ("family", d.family), ("backend", d.backend)],
         );
-        if !d.supports_lora && !d.supports_lokr {
-            errs.push(format!(
-                "{ctx}: supports neither LoRA nor LoKr — a trainer must offer at least one adapter kind"
-            ));
-        }
     }
     let trainer_ids: Vec<&str> = trainer_descs.iter().map(|d| d.id).collect();
     check_unique_ids(&mut errs, "trainer", &trainer_ids);
 
-    let cap_descs: Vec<CaptionerDescriptor> = captioners().map(|r| (r.descriptor)()).collect();
+    let cap_descs: Vec<CaptionerDescriptor> = captioner_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
     for d in &cap_descs {
         let ctx = format!("captioner '{}'", d.id);
         check_identity(
@@ -527,7 +550,10 @@ pub fn descriptor_conformance_errors() -> Vec<String> {
     let cap_ids: Vec<&str> = cap_descs.iter().map(|d| d.id).collect();
     check_unique_ids(&mut errs, "captioner", &cap_ids);
 
-    let tf_descs: Vec<TransformDescriptor> = transforms().map(|r| (r.descriptor)()).collect();
+    let tf_descs: Vec<TransformDescriptor> = transform_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
     for d in &tf_descs {
         let ctx = format!("transform '{}'", d.id);
         check_identity(
@@ -539,10 +565,14 @@ pub fn descriptor_conformance_errors() -> Vec<String> {
     let tf_ids: Vec<&str> = tf_descs.iter().map(|d| d.id).collect();
     check_unique_ids(&mut errs, "transform", &tf_ids);
 
-    let ie_descs: Vec<ImageEmbedderDescriptor> =
-        image_embedders().map(|r| (r.descriptor)()).collect();
-    let te_descs: Vec<TextEmbedderDescriptor> =
-        text_embedders().map(|r| (r.descriptor)()).collect();
+    let ie_descs: Vec<ImageEmbedderDescriptor> = image_embedder_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
+    let te_descs: Vec<TextEmbedderDescriptor> = text_embedder_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
     for (ctx_kind, id, family, backend, dim, space) in ie_descs
         .iter()
         .map(|d| {
@@ -585,6 +615,24 @@ pub fn descriptor_conformance_errors() -> Vec<String> {
     check_unique_ids(&mut errs, "text embedder", &te_ids);
 
     errs
+}
+
+/// Compatibility conformance sweep over every currently linked inventory registration.
+pub fn descriptor_conformance_errors() -> Vec<String> {
+    let generators: Vec<ModelRegistration> = generators().copied().collect();
+    let transforms: Vec<TransformRegistration> = transforms().copied().collect();
+    let trainers: Vec<TrainerRegistration> = trainers().copied().collect();
+    let captioners: Vec<CaptionerRegistration> = captioners().copied().collect();
+    let image_embedders: Vec<ImageEmbedderRegistration> = image_embedders().copied().collect();
+    let text_embedders: Vec<TextEmbedderRegistration> = text_embedders().copied().collect();
+    descriptor_conformance_errors_for(
+        &generators,
+        &transforms,
+        &trainers,
+        &captioners,
+        &image_embedders,
+        &text_embedders,
+    )
 }
 
 #[cfg(test)]

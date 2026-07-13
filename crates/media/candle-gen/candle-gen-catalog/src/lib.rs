@@ -109,6 +109,10 @@ mod tests {
             )
         );
         assert_eq!(registry.transforms().len(), 0);
+        assert_eq!(
+            registry.descriptor_conformance_errors(),
+            Vec::<String>::new()
+        );
         assert!(registry
             .generators()
             .all(|r| (r.descriptor)().backend == "candle"));
