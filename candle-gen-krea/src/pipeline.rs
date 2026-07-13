@@ -234,14 +234,62 @@ pub fn render(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-
     // Condition encoding (seed-independent): the 12 selected Qwen3-VL hidden layers, stacked +
     // prefix-dropped → the DiT's text_fusion context [1, n_tok, 12, 2560]. CFG-free, B=1.
     let context = comps
         .te
         .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+    render_from_context(comps, req, device, &context, on_progress)
+}
+
+/// SPIKE (sc-8596, HELD) — the ComfyUI-Conditioning-Rebalance trick ported to candle: reweight the 12
+/// stacked Qwen3-VL select-layer taps by a per-layer scalar **before** the DiT's `TextFusionTransformer`
+/// aggregates them (layerwise-attn → `projector` num_layers→1 → refiner). This is an "IP-Adapter-LIKE"
+/// steering knob on the *text-only* weights — no new model weights. `weights.len()` must equal the layer
+/// axis (`context.dim(2)` = 12); all-ones is a byte-exact no-op. Krea/Qwen-Image-family specific (depends
+/// on the multi-tap structure); it does NOT generalize to CLIP/T5 encoders. See [`apply_tap_weights`].
+pub fn render_tap_reweight(
+    comps: &Components,
+    req: &GenerationRequest,
+    device: &Device,
+    weights: &[f32],
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let context = comps
+        .te
+        .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+    let context = apply_tap_weights(&context, weights)?;
+    render_from_context(comps, req, device, &context, on_progress)
+}
+
+/// SPIKE (sc-8596) — scale each of the stacked select-layer taps of a Krea text context
+/// `[b, n_tok, num_layers, hidden]` by `weights[i]` along the layer axis (axis 2). A `[1,1,num_layers,1]`
+/// broadcast multiply; all-ones reproduces the input bit-for-bit. Errors if `weights.len()` ≠ the layer
+/// axis so a mis-sized sweep vector fails loudly rather than silently truncating.
+pub fn apply_tap_weights(context: &Tensor, weights: &[f32]) -> Result<Tensor> {
+    let n = context.dim(2)?;
+    if weights.len() != n {
+        return Err(CandleError::Msg(format!(
+            "krea tap reweight: {} weights but the context has {n} select layers",
+            weights.len()
+        )));
+    }
+    let w = Tensor::from_vec(weights.to_vec(), (1, 1, n, 1), context.device())?
+        .to_dtype(context.dtype())?;
+    Ok(context.broadcast_mul(&w)?)
+}
+
+/// The seed-loop + schedule + decode tail shared by [`render`] and the [`render_tap_reweight`] spike:
+/// everything downstream of the (possibly reweighted) `context` `[1, n_tok, 12, 2560]`.
+fn render_from_context(
+    comps: &Components,
+    req: &GenerationRequest,
+    device: &Device,
+    context: &Tensor,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Native exponential-mu Turbo sigmas are the byte-exact default; a curated scheduler reshapes over
     // the same mu. Raw sigma → DiT timestep, raw velocity → Euler `x + v·(σ_{i+1} − σ_i)`.
@@ -275,7 +323,7 @@ pub fn render(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = comps.dit.forward(x, &t, &context)?;
+                let v = comps.dit.forward(x, &t, context)?;
                 Ok(v.to_dtype(DType::F32)?)
             },
         )?;
@@ -995,6 +1043,57 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPIKE (sc-8596): all-ones tap weights are an identity reweight (byte-exact), and a per-layer
+    /// scalar scales exactly its select-layer slice along axis 2.
+    #[test]
+    fn apply_tap_weights_scales_layer_axis() {
+        // context [b=1, n_tok=2, num_layers=3, hidden=2], all ones.
+        let ctx = Tensor::ones((1, 2, 3, 2), DType::F32, &Device::Cpu).unwrap();
+
+        // Identity: all-ones weights reproduce the input.
+        let id = apply_tap_weights(&ctx, &[1.0, 1.0, 1.0]).unwrap();
+        assert_eq!(
+            id.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            ctx.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+
+        // Per-layer scale: layer 0 → 2, layer 1 → 0, layer 2 → 0.5, along axis 2 only.
+        let out = apply_tap_weights(&ctx, &[2.0, 0.0, 0.5]).unwrap();
+        // out[.., layer, ..] equals the weight for that layer (input was all ones).
+        let l0 = out
+            .narrow(2, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let l1 = out
+            .narrow(2, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let l2 = out
+            .narrow(2, 2, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(l0.iter().all(|&x| (x - 2.0).abs() < 1e-6));
+        assert!(l1.iter().all(|&x| x.abs() < 1e-6));
+        assert!(l2.iter().all(|&x| (x - 0.5).abs() < 1e-6));
+    }
+
+    /// A mis-sized weight vector must fail loudly (not silently truncate/broadcast).
+    #[test]
+    fn apply_tap_weights_rejects_wrong_len() {
+        let ctx = Tensor::ones((1, 2, 3, 2), DType::F32, &Device::Cpu).unwrap();
+        assert!(apply_tap_weights(&ctx, &[1.0, 1.0]).is_err());
+        assert!(apply_tap_weights(&ctx, &[1.0; 4]).is_err());
+    }
 
     /// `image_to_pixels` normalizes an RGB8 image to `[1, 3, H, W]` in `[-1, 1]` and, when the source is
     /// already at the target size, maps pixel `v` → `v/127.5 − 1` per channel with no resample (a mid-gray
