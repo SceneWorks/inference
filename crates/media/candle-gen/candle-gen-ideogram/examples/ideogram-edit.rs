@@ -13,8 +13,7 @@
 //! centered 50%×50% white box on black → inpaint just the middle).
 
 use candle_gen::gen_core::{
-    registry, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
-    WeightsSource,
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
 
 /// Wrap a plain prompt into Ideogram's minimal JSON caption (mirrors the worker's
@@ -73,7 +72,6 @@ fn center_box_mask(width: u32, height: u32) -> Image {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_ideogram::force_link();
     let a: Vec<String> = std::env::args().collect();
     let model = a.get(1).cloned().unwrap_or_else(|| "ideogram_4".into());
     let snapshot = a
@@ -125,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
-    let gen = registry::load(&model, &spec)?;
+    let gen = candle_gen_ideogram::provider_registry()?.load(&model, &spec)?;
     println!(
         "loaded: id={} family={} backend={}",
         gen.descriptor().id,

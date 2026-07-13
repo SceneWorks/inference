@@ -9,12 +9,10 @@
 //!            [sampler] [scheduler]  — curated names (sc-9009); omit for the engine's native path.
 
 use candle_gen::gen_core::{
-    registry, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_boogu::force_link();
-
     let a: Vec<String> = std::env::args().collect();
     let model = a.get(1).cloned().unwrap_or_else(|| "boogu_image".into());
     let snapshot = a
@@ -37,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scheduler = a.get(10).cloned().filter(|s| !s.is_empty());
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
-    let gen = registry::load(&model, &spec)?;
+    let gen = candle_gen_boogu::provider_registry()?.load(&model, &spec)?;
 
     let req = GenerationRequest {
         prompt,

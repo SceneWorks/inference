@@ -8,7 +8,7 @@
 //!       [out=render.png]
 
 use candle_gen::gen_core::{
-    registry, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 /// Wrap a plain prompt into Ideogram's minimal JSON caption (mirrors the worker's
@@ -60,9 +60,6 @@ fn looks_like_placeholder(pixels: &[u8], width: u32, height: u32) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Force-link the crate so its `inventory::submit!` registrations aren't dead-stripped (the
-    // example otherwise references no symbol from the lib).
-    candle_gen_ideogram::force_link();
     let a: Vec<String> = std::env::args().collect();
     let model = a.get(1).cloned().unwrap_or_else(|| "ideogram_4".into());
     let snapshot = a
@@ -81,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("model={model} snapshot={snapshot} {width}x{height} steps={steps} seed={seed}");
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
-    let gen = registry::load(&model, &spec)?;
+    let gen = candle_gen_ideogram::provider_registry()?.load(&model, &spec)?;
     println!(
         "loaded: id={} family={} backend={}",
         gen.descriptor().id,

@@ -1,5 +1,5 @@
 //! SD3.5 txt2img smoke driver — exercises the full candle-gen seam end-to-end on a real GPU:
-//! `gen_core::registry::load(<id>, …)` resolves THIS crate's inventory-registered generator, runs
+//! `provider_registry().load(<id>, …)` resolves THIS crate's explicitly registered generator, runs
 //! [`Generator::generate`] against a local SD3.5 diffusers snapshot, and writes each `gen_core::Image`
 //! to PNG.
 //!
@@ -26,7 +26,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant,
     WeightsSource,
 };
 
@@ -104,16 +104,12 @@ fn main() -> Result<()> {
          seed={seed} count={count}\n[smoke] prompt={prompt:?}"
     );
 
-    // Force-link the provider so its `inventory::submit!` registration survives the linker (we reach
-    // it only through the gen_core registry below).
-    candle_gen_sd3::force_link();
-
     let mut spec =
         LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
     if let Some(q) = arg(&args, "--quant") {
         spec = match q.as_str() {
-            "q8" | "Q8" => spec.with_quant(gen_core::Quant::Q8),
-            "q4" | "Q4" => spec.with_quant(gen_core::Quant::Q4),
+            "q8" | "Q8" => spec.with_quant(Quant::Q8),
+            "q4" | "Q4" => spec.with_quant(Quant::Q4),
             other => return Err(format!("--quant must be q4 or q8 (got {other})").into()),
         };
         println!("[smoke] DiT quant = {q}");
@@ -134,7 +130,7 @@ fn main() -> Result<()> {
     let mut probe = vram_gpu.map(candle_gen::testkit::VramProbe::start);
 
     let load_phase = probe.as_ref().map(|p| p.phase());
-    let gen = gen_core::registry::load(model_id, &spec)?;
+    let gen = candle_gen_sd3::provider_registry()?.load(model_id, &spec)?;
     if let (Some(p), Some(ph)) = (probe.as_mut(), load_phase) {
         p.end_load(ph);
     }

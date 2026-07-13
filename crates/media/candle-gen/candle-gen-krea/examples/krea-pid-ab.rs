@@ -11,7 +11,7 @@
 //! (`D:/.cache/huggingface`). Krea reuses the Qwen-Image VAE, so its PiD latent space is `qwenimage`.
 
 use candle_gen::gen_core::{
-    registry, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 /// First existing path from a set of candidates (the HF-cache snapshot layout varies by machine).
@@ -30,7 +30,6 @@ fn mean_u8(pixels: &[u8]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_krea::force_link();
     let a: Vec<String> = std::env::args().collect();
 
     let base = a.get(1).cloned().or_else(|| first_existing(&[
@@ -59,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         WeightsSource::File(pid_ckpt.into()),
         WeightsSource::Dir(gemma.into()),
     );
-    let gen = registry::load("krea_2_turbo", &spec)?;
+    let gen = candle_gen_krea::provider_registry()?.load("krea_2_turbo", &spec)?;
 
     let mut on_progress = |p: Progress| match p {
         Progress::Step { current, total } => eprintln!("  step {current}/{total}"),

@@ -1,5 +1,5 @@
-//! Qwen-Image txt2img smoke driver — resolves THIS crate's inventory-registered generator through
-//! `gen_core::registry::load("qwen_image", …)`, runs a real `generate` against a local Qwen-Image
+//! Qwen-Image txt2img smoke driver — resolves THIS crate's explicitly registered generator through
+//! `provider_registry().load("qwen_image", …)`, runs a real `generate` against a local Qwen-Image
 //! snapshot, and writes the `gen_core::Image` to PNG. The human-eyeball check behind sc-3696.
 //!
 //! ```text
@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -68,7 +68,6 @@ fn main() -> Result<()> {
         "[smoke] snapshot={snapshot}\n[smoke] {width}x{height} steps={steps:?} guidance={guidance:?} seed={seed}\n[smoke] prompt={prompt:?}"
     );
 
-    candle_gen_qwen_image::force_link();
     // sc-10670: `--comfyui-dit` reads a ComfyUI Qwen-Image DiT in place (fp8→bf16 + prefix strip),
     // sourcing TE/VAE/tokenizer from `--snapshot`; otherwise the registry loads the whole snapshot.
     let gen = match arg(&args, "--comfyui-dit") {
@@ -90,7 +89,7 @@ fn main() -> Result<()> {
         }
         None => {
             let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-            gen_core::registry::load("qwen_image", &spec)?
+            candle_gen_qwen_image::provider_registry()?.load("qwen_image", &spec)?
         }
     };
     println!(

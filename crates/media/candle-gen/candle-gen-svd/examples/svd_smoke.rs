@@ -11,8 +11,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    registry, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
-    WeightsSource,
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
 
 fn synthetic_image(w: u32, h: u32) -> Image {
@@ -48,7 +47,6 @@ fn write_png(path: &PathBuf, img: &Image) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_svd::force_link();
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(
         args.next()
@@ -74,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src = synthetic_image(w, h);
 
     let spec = LoadSpec::new(WeightsSource::Dir(root));
-    let gen = registry::load("svd_xt", &spec)?;
+    let gen = candle_gen_svd::provider_registry()?.load("svd_xt", &spec)?;
     eprintln!(
         "loaded engine id={} backend={}",
         gen.descriptor().id,

@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant, WeightsSource,
+    GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant, WeightsSource,
 };
 use candle_gen_flux2::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
 
@@ -86,7 +86,7 @@ fn gray_dummy(w: u32, h: u32) -> Image {
     }
 }
 
-/// txt2img via the inventory-registered generator `engine_id` (klein's baseline + self-generated
+/// txt2img via the explicitly registered generator `engine_id` (klein's baseline + self-generated
 /// reference). `quant` is honored for dev.
 #[allow(clippy::too_many_arguments)]
 fn txt2img(
@@ -103,7 +103,7 @@ fn txt2img(
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }
-    let gen = gen_core::registry::load(engine_id, &spec)?;
+    let gen = candle_gen_flux2::provider_registry()?.load(engine_id, &spec)?;
     let req = GenerationRequest {
         prompt: prompt.to_owned(),
         width: w,
@@ -172,8 +172,6 @@ fn main() -> Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("flux2_edit.png")),
     };
-
-    candle_gen_flux2::force_link();
 
     if dev_variant {
         let quant = match arg(&args, "--quant").as_deref() {

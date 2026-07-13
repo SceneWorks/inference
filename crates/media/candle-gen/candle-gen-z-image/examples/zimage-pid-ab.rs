@@ -5,7 +5,7 @@
 //! `cargo run -p candle-gen-z-image --example zimage-pid-ab --features cuda --release -- [model] [base] [pid] [gemma] [W] [H] [seed]`
 
 use candle_gen::gen_core::{
-    registry, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 fn me(c: &[&str]) -> Option<String> {
@@ -22,7 +22,6 @@ fn mean(px: &[u8]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_z_image::force_link();
     let a: Vec<String> = std::env::args().collect();
     let model = a.get(1).cloned().unwrap_or_else(|| "z_image_turbo".into());
     let base = a.get(2).cloned().or_else(|| me(&["D:/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6"])).ok_or("base snapshot not found")?;
@@ -38,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         WeightsSource::File(pid.into()),
         WeightsSource::Dir(gemma.into()),
     );
-    let gen = registry::load(&model, &spec)?;
+    let gen = candle_gen_z_image::provider_registry()?.load(&model, &spec)?;
     let mut op = |p: Progress| match p {
         Progress::Step { current, total } => eprintln!("  step {current}/{total}"),
         Progress::Decoding => eprintln!("  decoding…"),

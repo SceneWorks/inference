@@ -1,5 +1,5 @@
 //! Z-Image txt2img smoke driver — exercises the full candle-gen seam end-to-end on a real GPU:
-//! `gen_core::registry::load("z_image_turbo", …)` resolves THIS crate's inventory-registered
+//! `provider_registry().load("z_image_turbo", …)` resolves THIS crate's explicitly registered
 //! generator, runs [`Generator::generate`] against a local Z-Image-Turbo snapshot, and writes each
 //! `gen_core::Image` to PNG.
 //!
@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -71,10 +71,6 @@ fn main() -> Result<()> {
         "[smoke] snapshot={snapshot}\n[smoke] {width}x{height} steps={steps} seed={seed} count={count}\n[smoke] prompt={prompt:?}"
     );
 
-    // Force-link the provider so its `inventory::submit!` registration survives the linker (we reach
-    // it only through the gen_core registry below — see `candle_gen_z_image::force_link`).
-    candle_gen_z_image::force_link();
-
     // `--no-accel` exercises the runtime toggle: the worker drives it from the UI setting.
     // Inert since sc-9032 removed the no-op `flash-attn` feature — no fused dispatch is wired.
     if args.iter().any(|a| a == "--no-accel") {
@@ -96,7 +92,7 @@ fn main() -> Result<()> {
 
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
     let load_phase = probe.as_ref().map(|p| p.phase());
-    let gen = gen_core::registry::load("z_image_turbo", &spec)?;
+    let gen = candle_gen_z_image::provider_registry()?.load("z_image_turbo", &spec)?;
     if let (Some(p), Some(ph)) = (probe.as_mut(), load_phase) {
         p.end_load(ph);
     }

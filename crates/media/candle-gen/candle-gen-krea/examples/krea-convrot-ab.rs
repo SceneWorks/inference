@@ -51,7 +51,6 @@ fn pixel_stats(a: &Image, b: &Image) -> (f64, u8, f64) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_krea::force_link();
     let a: Vec<String> = std::env::args().collect();
     let snapshot = PathBuf::from(
         a.get(1)

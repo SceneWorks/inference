@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -81,12 +81,11 @@ fn main() -> Result<()> {
          steps={steps:?} seed={seed}\n[lens-render] prompt={prompt:?}"
     );
 
-    candle_gen_lens::force_link();
     let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }
-    let gen = gen_core::registry::load("lens_turbo", &spec)?;
+    let gen = candle_gen_lens::provider_registry()?.load("lens_turbo", &spec)?;
     println!(
         "[lens-render] resolved engine id={} backend={}",
         gen.descriptor().id,

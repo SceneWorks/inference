@@ -1,5 +1,5 @@
 //! SDXL txt2img smoke driver — exercises the full candle-gen seam end-to-end on a real GPU:
-//! `gen_core::registry::load("sdxl", …)` resolves THIS crate's inventory-registered generator, runs
+//! `provider_registry().load("sdxl", …)` resolves THIS crate's explicitly registered generator, runs
 //! [`Generator::generate`] against a local SDXL snapshot, and writes each `gen_core::Image` to PNG.
 //!
 //! This is the human-eyeball check behind sc-3675 (the worker, not this example, owns asset writes in
@@ -25,7 +25,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
     WeightsSource,
 };
 
@@ -84,10 +84,6 @@ fn main() -> Result<()> {
         "[smoke] snapshot={snapshot}\n[smoke] {width}x{height} steps={steps} guidance={guidance} sampler={sampler:?} seed={seed} count={count}\n[smoke] prompt={prompt:?}"
     );
 
-    // Force-link the provider so its `inventory::submit!` registration survives the linker (we reach
-    // it only through the gen_core registry below — see `candle_gen_sdxl::force_link`).
-    candle_gen_sdxl::force_link();
-
     // `--no-flash` exercises the runtime toggle (sc-3674): the worker drives it from the UI setting.
     // Inert since sc-9032 removed the no-op `flash-attn` feature — no fused kernel is compiled in.
     if args.iter().any(|a| a == "--no-flash") {
@@ -131,7 +127,7 @@ fn main() -> Result<()> {
         None => spec,
     };
     let load_phase = probe.as_ref().map(|p| p.phase());
-    let gen = gen_core::registry::load("sdxl", &spec)?;
+    let gen = candle_gen_sdxl::provider_registry()?.load("sdxl", &spec)?;
     if let (Some(p), Some(ph)) = (probe.as_mut(), load_phase) {
         p.end_load(ph);
     }

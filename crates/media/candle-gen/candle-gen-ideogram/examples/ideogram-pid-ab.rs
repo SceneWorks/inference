@@ -6,7 +6,7 @@
 //! `cargo run -p candle-gen-ideogram --example ideogram-pid-ab --features cuda --release -- [model] [base] [pid] [gemma] [W] [H] [seed]`
 
 use candle_gen::gen_core::{
-    registry, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 fn me(c: &[&str]) -> Option<String> {
@@ -23,7 +23,6 @@ fn mean(px: &[u8]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_ideogram::force_link();
     let a: Vec<String> = std::env::args().collect();
     let model = a
         .get(1)
@@ -42,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         WeightsSource::File(pid.into()),
         WeightsSource::Dir(gemma.into()),
     );
-    let gen = registry::load(&model, &spec)?;
+    let gen = candle_gen_ideogram::provider_registry()?.load(&model, &spec)?;
     let mut op = |p: Progress| match p {
         Progress::Step { current, total } => eprintln!("  step {current}/{total}"),
         Progress::Decoding => eprintln!("  decoding…"),

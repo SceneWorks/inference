@@ -1,5 +1,5 @@
 //! LTX-2.3 synchronized **audio+video** smoke driver (sc-5495) — resolves THIS crate's generator
-//! through `gen_core::registry::load("ltx_2_3_distilled", …)`, runs a real `generate` against a local
+//! through `provider_registry().load("ltx_2_3_distilled", …)`, runs a real `generate` against a local
 //! LTX-2.3 snapshot, and writes each decoded video frame to PNG **plus** the synchronized audio track
 //! to a 16-bit PCM WAV. Prints per-frame + audio stats with a degeneracy guard (the SVD lesson: a
 //! "passes" smoke that only checks range is fooled by noise — always view a frame AND listen).
@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -97,9 +97,8 @@ fn main() -> Result<()> {
          [smoke] prompt={prompt:?}"
     );
 
-    candle_gen_ltx::force_link();
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load("ltx_2_3_distilled", &spec)?;
+    let gen = candle_gen_ltx::provider_registry()?.load("ltx_2_3_distilled", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",
         gen.descriptor().id,

@@ -1,5 +1,5 @@
 //! Wan2.2 **T2V-A14B** (dual-expert MoE) txt2video smoke driver — resolves THIS crate's
-//! inventory-registered generator through `gen_core::registry::load("wan2_2_t2v_14b", …)`, runs a real
+//! explicitly registered generator through `provider_registry().load("wan2_2_t2v_14b", …)`, runs a real
 //! `generate` against a local Wan2.2-T2V-A14B diffusers snapshot, and writes each decoded frame to PNG.
 //! The human-eyeball check behind sc-5174.
 //!
@@ -20,8 +20,8 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, MoeExpert,
-    Progress, WeightsSource,
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, MoeExpert, Progress,
+    WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -85,7 +85,6 @@ fn main() -> Result<()> {
          [smoke] adapters: high={lora_high:?} low={lora_low:?} scale={lora_scale}"
     );
 
-    candle_gen_wan::force_link();
     // sc-10671: `--comfyui-high/--comfyui-low` read the two ComfyUI experts in place (scaled-fp8 dequant
     // + native→diffusers remap), sourcing TE/VAE/tokenizer from `--snapshot`; else the registry loads
     // the whole snapshot.
@@ -120,7 +119,7 @@ fn main() -> Result<()> {
         _ => {
             let spec =
                 LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
-            gen_core::registry::load("wan2_2_t2v_14b", &spec)?
+            candle_gen_wan::provider_registry()?.load("wan2_2_t2v_14b", &spec)?
         }
     };
     println!(

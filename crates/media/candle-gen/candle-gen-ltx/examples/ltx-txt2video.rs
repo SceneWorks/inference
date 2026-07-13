@@ -1,5 +1,5 @@
-//! LTX-2.3 (distilled 22B) txt2video smoke driver — resolves THIS crate's inventory-registered
-//! generator through `gen_core::registry::load("ltx_2_3_distilled", …)`, runs a real `generate`
+//! LTX-2.3 (distilled 22B) txt2video smoke driver — resolves THIS crate's explicitly registered
+//! generator through `provider_registry().load("ltx_2_3_distilled", …)`, runs a real `generate`
 //! against a local LTX-2.3 snapshot + a Gemma-3-12B encoder snapshot, and writes each decoded frame
 //! to PNG. The human-eyeball check behind sc-3698.
 //!
@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -56,9 +56,8 @@ fn main() -> Result<()> {
          [smoke] prompt={prompt:?}"
     );
 
-    candle_gen_ltx::force_link();
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load("ltx_2_3_distilled", &spec)?;
+    let gen = candle_gen_ltx::provider_registry()?.load("ltx_2_3_distilled", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",
         gen.descriptor().id,

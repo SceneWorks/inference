@@ -1,6 +1,6 @@
 //! Base (non-Turbo) Z-Image txt2img smoke driver (sc-8414) — the real-CFG sibling of
-//! `z-image-txt2img.rs`. Resolves THIS crate's inventory-registered **base** generator via
-//! `gen_core::registry::load("z_image", …)`, runs [`Generator::generate`] against a local
+//! `z-image-txt2img.rs`. Resolves THIS crate's explicitly registered **base** generator via
+//! `provider_registry().load("z_image", …)`, runs [`Generator::generate`] against a local
 //! `Tongyi-MAI/Z-Image` (base) snapshot with classifier-free guidance + a negative prompt over the
 //! static **shift=6.0** schedule, and writes each `gen_core::Image` to PNG.
 //!
@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -72,15 +72,12 @@ fn main() -> Result<()> {
         "[base smoke] snapshot={snapshot}\n[base smoke] {width}x{height} steps={steps} guidance={guidance} seed={seed} count={count}\n[base smoke] prompt={prompt:?} negative={negative:?}"
     );
 
-    // Force-link the provider so its base `inventory::submit!` registration survives the linker.
-    candle_gen_z_image::force_link();
-
     if args.iter().any(|a| a == "--no-accel") {
         candle_gen_z_image::set_accel_attn(false);
     }
 
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load("z_image", &spec)?;
+    let gen = candle_gen_z_image::provider_registry()?.load("z_image", &spec)?;
     println!(
         "[base smoke] resolved engine id={} backend={} supports_guidance={}",
         gen.descriptor().id,

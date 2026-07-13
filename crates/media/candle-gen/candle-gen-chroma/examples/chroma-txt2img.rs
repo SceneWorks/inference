@@ -1,6 +1,6 @@
 //! Chroma txt2img smoke driver — exercises the full candle-gen seam end-to-end on a real GPU:
-//! `gen_core::registry::load("chroma1_hd"|"chroma1_base"|"chroma1_flash", …)` resolves THIS crate's
-//! inventory-registered generator, runs [`Generator::generate`] against a local Chroma snapshot, and
+//! `provider_registry().load("chroma1_hd"|"chroma1_base"|"chroma1_flash", …)` resolves THIS crate's
+//! explicitly registered generator, runs [`Generator::generate`] against a local Chroma snapshot, and
 //! writes each `gen_core::Image` to PNG.
 //!
 //! The human-eyeball check behind sc-5484 (the worker, not this example, owns asset writes in
@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -72,11 +72,8 @@ fn main() -> Result<()> {
         "[smoke] snapshot={snapshot}\n[smoke] engine={engine} {width}x{height} steps={steps:?} true_cfg={true_cfg:?} seed={seed} count={count}\n[smoke] prompt={prompt:?}"
     );
 
-    // Force-link the provider so its `inventory::submit!` registrations survive the linker.
-    candle_gen_chroma::force_link();
-
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load(engine, &spec)?;
+    let gen = candle_gen_chroma::provider_registry()?.load(engine, &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={}",
         gen.descriptor().id,

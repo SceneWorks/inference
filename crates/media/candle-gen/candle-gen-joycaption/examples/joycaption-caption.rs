@@ -1,5 +1,5 @@
-//! JoyCaption captioning smoke driver — resolves THIS crate's inventory-registered captioner through
-//! `gen_core::registry::load_captioner(…)`, runs a real `caption` against a local JoyCaption snapshot
+//! JoyCaption captioning smoke driver — resolves THIS crate's explicitly registered captioner through
+//! `provider_registry().load_captioner(…)`, runs a real `caption` against a local JoyCaption snapshot
 //! and a real input image, and prints the generated caption. The human-eyeball check behind sc-3699.
 //!
 //! ```text
@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, CaptionOptions, CaptionRequest, CaptionSampling, LoadSpec, Progress, WeightsSource,
+    CaptionOptions, CaptionRequest, CaptionSampling, Image, LoadSpec, Progress, WeightsSource,
 };
 use candle_gen_joycaption::prompt::{build_prompt, JOY_CAPTION_MODEL_ID};
 
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     // Decode the input image to RGB8 → gen_core::Image.
     let rgb = image::open(&image_path)?.to_rgb8();
     let (w, h) = rgb.dimensions();
-    let image = gen_core::Image {
+    let image = Image {
         width: w,
         height: h,
         pixels: rgb.into_raw(),
@@ -65,9 +65,9 @@ fn main() -> Result<()> {
         "[smoke] snapshot={snapshot}\n[smoke] image={image_path} ({w}x{h})\n[smoke] prompt={prompt:?}"
     );
 
-    candle_gen_joycaption::force_link();
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let captioner = gen_core::registry::load_captioner(JOY_CAPTION_MODEL_ID, &spec)?;
+    let captioner =
+        candle_gen_joycaption::provider_registry()?.load_captioner(JOY_CAPTION_MODEL_ID, &spec)?;
     println!(
         "[smoke] resolved captioner id={} backend={}",
         captioner.descriptor().id,

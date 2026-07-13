@@ -1,5 +1,5 @@
 //! Kolors txt2img smoke driver — exercises the full candle-gen seam end-to-end on a real GPU:
-//! `gen_core::registry::load("kolors", …)` resolves THIS crate's inventory-registered generator, runs
+//! `provider_registry().load("kolors", …)` resolves THIS crate's explicitly registered generator, runs
 //! [`Generator::generate`] against a local Kolors snapshot, and writes each `gen_core::Image` to PNG.
 //!
 //! The human-eyeball check behind sc-5485 (the worker, not this example, owns asset writes in
@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -65,11 +65,8 @@ fn main() -> Result<()> {
         "[smoke] snapshot={snapshot}\n[smoke] engine=kolors {width}x{height} steps={steps:?} guidance={guidance:?} seed={seed} count={count} sampler={sampler:?} scheduler={scheduler:?}\n[smoke] prompt={prompt:?}"
     );
 
-    // Force-link the provider so its `inventory::submit!` registration survives the linker.
-    candle_gen_kolors::force_link();
-
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load("kolors", &spec)?;
+    let gen = candle_gen_kolors::provider_registry()?.load("kolors", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={}",
         gen.descriptor().id,

@@ -1,5 +1,5 @@
 //! Wan-VACE controllable-video smoke driver (sc-5494) — resolves THIS crate's generator through
-//! `gen_core::registry::load("wan_vace", …)`, builds a control clip + per-frame mask (+ optional
+//! `provider_registry().load("wan_vace", …)`, builds a control clip + per-frame mask (+ optional
 //! reference image) as one `Conditioning::ControlClip`, runs a real `generate` against a local
 //! Wan2.1-VACE-14B diffusers snapshot, and writes each decoded frame to PNG.
 //!
@@ -22,8 +22,8 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
-    ReplacementMode, WeightsSource,
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, ReplacementMode,
+    WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -214,9 +214,8 @@ fn main() -> Result<()> {
          [smoke] prompt={prompt:?}"
     );
 
-    candle_gen_wan::force_link();
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load("wan_vace", &spec)?;
+    let gen = candle_gen_wan::provider_registry()?.load("wan_vace", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",
         gen.descriptor().id,

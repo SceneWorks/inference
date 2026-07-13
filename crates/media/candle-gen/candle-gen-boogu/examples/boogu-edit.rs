@@ -20,8 +20,7 @@
 //! each down to the nearest multiple of 16 (≥ 256) with a Lanczos resize so any input PNG works.
 
 use candle_gen::gen_core::{
-    registry, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
-    WeightsSource,
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
 use image::imageops::FilterType;
 
@@ -52,8 +51,6 @@ fn load_reference(path: &str) -> Result<Image, Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_boogu::force_link();
-
     let a: Vec<String> = std::env::args().collect();
     let snapshot = a
         .get(1)
@@ -90,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
-    let gen = registry::load("boogu_image_edit", &spec)?;
+    let gen = candle_gen_boogu::provider_registry()?.load("boogu_image_edit", &spec)?;
 
     let req = GenerationRequest {
         prompt: instruction,

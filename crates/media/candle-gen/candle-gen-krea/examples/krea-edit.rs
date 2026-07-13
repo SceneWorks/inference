@@ -2,7 +2,7 @@
 //! P4.2 identity validation, sc-10886). The candle twin of the MLX `krea_edit_smoke` (mlx-gen #702):
 //! load the Krea 2 Raw snapshot with the `krea2_identity_edit` LoRA folded into the DiT, take one or two
 //! reference PNGs + an instruction, render an edited image through the production `krea_2_edit` Generator
-//! seam (`registry::load` → `Generator::generate` → `pipeline::render_edit`), and write a PNG.
+//! seam (`provider_registry().load` → `Generator::generate` → `pipeline::render_edit`), and write a PNG.
 //!
 //! Two-reference order is **fixed**: scene = image 1, person = image 2 (the LoRA's trained layout;
 //! swapping degrades results). One ref → `Conditioning::Reference`; two → `Conditioning::MultiReference`.
@@ -21,8 +21,8 @@
 //!            [steps=16] [seed=42] [out=krea_edit.png] [lora=none] [guidance=3.0] [lora_scale=1.0]
 
 use candle_gen::gen_core::{
-    registry, AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image,
-    LoadSpec, Progress, WeightsSource,
+    AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    Progress, WeightsSource,
 };
 use image::imageops::FilterType;
 
@@ -53,8 +53,6 @@ fn load_reference(path: &str) -> Result<Image, Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_krea::force_link();
-
     let a: Vec<String> = std::env::args().collect();
     let snapshot = a
         .get(1)
@@ -107,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         spec.adapters = vec![AdapterSpec::new(lora.into(), lora_scale, AdapterKind::Lora)];
     }
     eprintln!("[edit] loading krea_2_edit from {snapshot}");
-    let gen = registry::load("krea_2_edit", &spec)?;
+    let gen = candle_gen_krea::provider_registry()?.load("krea_2_edit", &spec)?;
 
     let req = GenerationRequest {
         prompt: instruction.clone(),

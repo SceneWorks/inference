@@ -13,13 +13,11 @@
 //! sc-8776 LoKr-sniff / widened-surface path end-to-end.
 
 use candle_gen::gen_core::{
-    registry, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
     WeightsSource,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    candle_gen_krea::force_link();
-
     let a: Vec<String> = std::env::args().collect();
     let model = a.get(1).cloned().unwrap_or_else(|| "krea_2_turbo".into());
     let snapshot = a
@@ -50,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             AdapterKind::Lora,
         )];
     }
-    let gen = registry::load(&model, &spec)?;
+    let gen = candle_gen_krea::provider_registry()?.load(&model, &spec)?;
 
     let req = GenerationRequest {
         prompt,

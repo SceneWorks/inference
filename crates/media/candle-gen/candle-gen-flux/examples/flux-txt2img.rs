@@ -1,6 +1,6 @@
 //! FLUX.1 txt2img smoke driver — exercises the full candle-gen seam end-to-end on a real GPU:
-//! `gen_core::registry::load("flux1_schnell"|"flux1_dev", …)` resolves THIS crate's
-//! inventory-registered generator, runs [`Generator::generate`] against a local FLUX.1 snapshot, and
+//! `provider_registry().load("flux1_schnell"|"flux1_dev", …)` resolves THIS crate's
+//! explicitly registered generator, runs [`Generator::generate`] against a local FLUX.1 snapshot, and
 //! writes each `gen_core::Image` to PNG.
 //!
 //! This is the human-eyeball check behind sc-3694 (the worker, not this example, owns asset writes in
@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -74,12 +74,8 @@ fn main() -> Result<()> {
         "[smoke] snapshot={snapshot}\n[smoke] engine={engine} {width}x{height} steps={steps:?} guidance={guidance:?} seed={seed} count={count}\n[smoke] prompt={prompt:?}"
     );
 
-    // Force-link the provider so its `inventory::submit!` registrations survive the linker (we reach
-    // them only through the gen_core registry below — see `candle_gen_flux::force_link`).
-    candle_gen_flux::force_link();
-
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load(engine, &spec)?;
+    let gen = candle_gen_flux::provider_registry()?.load(engine, &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={}",
         gen.descriptor().id,

@@ -1,5 +1,5 @@
 //! Wan2.2 **I2V-A14B** (dual-expert MoE, channel-concat) img2video smoke driver — resolves THIS
-//! crate's generator through `gen_core::registry::load("wan2_2_i2v_14b", …)`, feeds a conditioning
+//! crate's generator through `provider_registry().load("wan2_2_i2v_14b", …)`, feeds a conditioning
 //! image as a `Conditioning::Reference` (the first video frame), runs a real `generate` against a
 //! local Wan2.2-I2V-A14B diffusers snapshot, and writes each decoded frame to PNG. (sc-5174.)
 //!
@@ -14,8 +14,8 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image,
-    LoadSpec, MoeExpert, Progress, WeightsSource,
+    AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    MoeExpert, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -88,9 +88,8 @@ fn main() -> Result<()> {
         image.width, image.height
     );
 
-    candle_gen_wan::force_link();
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
-    let gen = gen_core::registry::load("wan2_2_i2v_14b", &spec)?;
+    let gen = candle_gen_wan::provider_registry()?.load("wan2_2_i2v_14b", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",
         gen.descriptor().id,

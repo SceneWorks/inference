@@ -1,5 +1,5 @@
-//! FLUX.2 txt2img smoke driver — resolves THIS crate's inventory-registered generator through
-//! `gen_core::registry::load(<id>, …)`, runs a real `generate` against a local FLUX.2 snapshot, and
+//! FLUX.2 txt2img smoke driver — resolves THIS crate's explicitly registered generator through
+//! `provider_registry().load(<id>, …)`, runs a real `generate` against a local FLUX.2 snapshot, and
 //! writes the `gen_core::Image` to PNG. The human-eyeball check behind sc-3695 (klein) / sc-7457 (dev).
 //!
 //! `--variant klein` (default) loads the distilled 9B (4-step, CFG-free); `--variant dev` loads the
@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -88,7 +88,6 @@ fn main() -> Result<()> {
     // the file, the TE / VAE / tokenizer from --snapshot. dev-only.
     let comfyui_dit = arg(&args, "--comfyui-dit").map(PathBuf::from);
 
-    candle_gen_flux2::force_link();
     let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
     if let Some(q) = quant {
         spec = spec.with_quant(q);
@@ -117,7 +116,7 @@ fn main() -> Result<()> {
             println!("[smoke] comfyui-dit={}", dit_file.display());
             candle_gen_flux2::load_from_comfyui_dit(dit_file, PathBuf::from(&snapshot), quant)?
         }
-        None => gen_core::registry::load(id, &spec)?,
+        None => candle_gen_flux2::provider_registry()?.load(id, &spec)?,
     };
     if let (Some(p), Some(ph)) = (probe.as_mut(), load_phase) {
         p.end_load(ph);

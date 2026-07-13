@@ -1,5 +1,5 @@
 //! Bernini renderer smoke driver (sc-11004) — resolves the `bernini_renderer` engine through
-//! `gen_core::registry::load`, feeds a `Reference` conditioning image so `resolve_mode` picks a
+//! `provider_registry().load`, feeds a `Reference` conditioning image so `resolve_mode` picks a
 //! **packed source-id conditioning** mode (i2i → `v2v`), and runs a real conditioned `generate` against
 //! a local Wan2.2-T2V-A14B (or Bernini) snapshot: the reference is VAE-encoded to a z16 source latent,
 //! patch-embedded with its source-id RoPE, packed on the DiT token axis with the noisy target, run
@@ -18,8 +18,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
-    WeightsSource,
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -103,10 +102,8 @@ fn main() -> Result<()> {
         !conditioning.is_empty()
     );
 
-    candle_gen_bernini::force_link();
-    candle_gen_wan::force_link();
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let gen = gen_core::registry::load("bernini_renderer", &spec)?;
+    let gen = candle_gen_bernini::provider_registry()?.load("bernini_renderer", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?} conditioning={:?}",
         gen.descriptor().id,
