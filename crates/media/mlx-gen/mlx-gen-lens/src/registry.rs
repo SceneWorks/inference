@@ -426,8 +426,10 @@ fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 mlx_gen::register_generators! {
-    descriptor_turbo => load_turbo,
-    descriptor_base => load_base,
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+}
+mlx_gen::register_generators! {
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
 }
 
 #[cfg(test)]

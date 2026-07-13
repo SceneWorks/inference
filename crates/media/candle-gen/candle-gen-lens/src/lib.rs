@@ -784,12 +784,71 @@ fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 candle_gen::register_generators! {
-    descriptor_turbo => load_turbo,
-    descriptor_base => load_base,
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+}
+candle_gen::register_generators! {
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registrations from being dead-stripped).
 pub fn force_link() {}
+
+/// Add all Candle Lens generators and trainers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(TURBO_REGISTRATION)
+        .register_generator(BASE_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit Candle Lens provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_generators: Vec<String> =
+            candle_gen::gen_core::registry::generators()
+                .filter_map(|registration| {
+                    let descriptor = (registration.descriptor)();
+                    (descriptor.family == "lens" && descriptor.backend == "candle")
+                        .then(|| descriptor.id.to_string())
+                })
+                .collect();
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_trainers: Vec<String> = candle_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "lens" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit_generators = explicit_generators.clone();
+        sorted_explicit_generators.sort();
+        compatibility_generators.sort();
+        let mut sorted_explicit_trainers = explicit_trainers.clone();
+        sorted_explicit_trainers.sort();
+        compatibility_trainers.sort();
+
+        assert_eq!(sorted_explicit_generators, compatibility_generators);
+        assert_eq!(explicit_generators, ["lens_turbo", "lens"]);
+        assert_eq!(sorted_explicit_trainers, compatibility_trainers);
+        assert_eq!(explicit_trainers, ["lens"]);
+    }
+}
 
 #[cfg(test)]
 mod integration_tests {

@@ -102,3 +102,59 @@ pub mod text;
 pub mod text_encoder;
 pub mod training;
 pub mod vae;
+
+/// Add all MLX Lens generators and trainers to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(registry::TURBO_REGISTRATION)
+        .register_generator(registry::BASE_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit MLX Lens provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_generators: Vec<String> = mlx_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "lens" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_trainers: Vec<String> = mlx_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "lens" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit_generators = explicit_generators.clone();
+        sorted_explicit_generators.sort();
+        compatibility_generators.sort();
+        let mut sorted_explicit_trainers = explicit_trainers.clone();
+        sorted_explicit_trainers.sort();
+        compatibility_trainers.sort();
+
+        assert_eq!(sorted_explicit_generators, compatibility_generators);
+        assert_eq!(explicit_generators, ["lens_turbo", "lens"]);
+        assert_eq!(sorted_explicit_trainers, compatibility_trainers);
+        assert_eq!(explicit_trainers, ["lens"]);
+    }
+}
