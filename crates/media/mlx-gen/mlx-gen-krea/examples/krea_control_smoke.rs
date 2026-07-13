@@ -1,7 +1,7 @@
-//! Real-weight smoke for the Krea 2 pose-ControlNet path through the PRODUCTION registry seam
+//! Real-weight smoke for the Krea 2 pose-ControlNet path through the explicit provider seam
 //! (sc-8465, epic 8459 S5). Loads the dense bf16 Krea 2 Turbo base + the converted MLX pose overlay via
-//! `gen_core::registry::load("krea_2_turbo_control", …)` (the exact seam the SceneWorks worker's
-//! `start_cached_gen_stream` uses), then renders the SAME pose skeleton at `control_scale = 0.6`
+//! `provider_registry().load("krea_2_turbo_control", …)`, then renders the same pose skeleton at
+//! `control_scale = 0.6`
 //! (pose-locked) and `control_scale = 0.0` (base passthrough) for an A/B. This is a MANUAL on-Metal
 //! validation (a ~12B model), NOT a CI test.
 //!
@@ -18,12 +18,6 @@ use mlx_gen::gen_core::{
     WeightsSource,
 };
 use mlx_gen::media::Image;
-
-// Force-link the crate so its `register_generators!` `inventory::submit!` for `krea_2_turbo_control`
-// survives linker GC and `gen_core::registry::load` can resolve it — the worker's `use mlx_gen_krea
-// as _;` anchor idiom (image_jobs.rs), reproduced here because this example references no other
-// mlx_gen_krea symbol.
-use mlx_gen_krea as _;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -74,13 +68,15 @@ fn main() {
     let scale: f32 = env_or("KREA_CTRL_SCALE", "0.6").parse().expect("scale");
     let seed: u64 = env_or("KREA_CTRL_SEED", "1234").parse().expect("seed");
 
-    // The worker's exact load seam: dense base dir + the overlay as the required control checkpoint,
-    // resolved through the registry by engine id.
+    // Dense base dir + the overlay as the required control checkpoint, resolved through the explicit
+    // provider registry by engine id.
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&base)))
         .with_control(WeightsSource::File(PathBuf::from(&overlay)));
     eprintln!("[smoke] loading krea_2_turbo_control: base {base}");
     eprintln!("[smoke] overlay {overlay}");
-    let generator = mlx_gen::gen_core::registry::load("krea_2_turbo_control", &spec)
+    let generator = mlx_gen_krea::provider_registry()
+        .expect("provider registry should build")
+        .load("krea_2_turbo_control", &spec)
         .expect("load krea_2_turbo_control generator");
 
     let skeleton = load_rgb(&pose);
