@@ -110,6 +110,11 @@ jobs:
           cargo clippy --locked
           -p candle-llm -p 'candle-gen*' -p runtime-cpu
           --all-targets -- -D warnings
+      - name: Reclaim Clippy artifacts before linking tests
+        # The complete all-target Clippy graph and the test graph do not fit concurrently on the
+        # hosted Linux runner. Clippy has already succeeded, so discard its target artifacts before
+        # rebuilding the narrower lib/test profile below.
+        run: cargo clean
       - name: Test Candle packages
         # `cargo test` without target selection also links every heavyweight real-weight example.
         # Clippy above still checks all targets; this step executes the actual lib/integration tests
