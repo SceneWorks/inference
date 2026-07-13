@@ -12,10 +12,12 @@
 //! prompt's Qwen chat-template wrapping reuses gen-core's [`TextTokenizer`] — the same template the
 //! mlx provider uses (the epic-3692 "carries over via gen-core" reuse).
 //!
-//! The descriptor advertises **only** the wired txt2img surface — NOT the full mlx-gen-z-image
-//! img2img / LoRA / quantization surface — so the worker routes the rest to the Python fallback
-//! rather than the candle backend silently dropping a control (the false-capability trap, exactly as
-//! the SDXL slice sc-3675 did). The descriptor's `backend` is `"candle"` and `mac_only` is `false`.
+//! The descriptor advertises the wired surface — txt2img, LoRA/LoKr (sc-5166), and reference-guided
+//! **img2img** latent-init (sc-11783, a single `Conditioning::Reference`) — but NOT the shapes candle
+//! doesn't serve through the registry (Q4/Q8 quant; the bespoke `edit_image` masked-edit + strict-pose
+//! control worker streams), so the worker routes those elsewhere rather than the candle backend silently
+//! dropping them (the false-capability trap, exactly as the SDXL slice sc-3675 did). The descriptor's
+//! `backend` is `"candle"` and `mac_only` is `false`.
 //!
 //! Z-Image-Turbo is guidance-distilled: no classifier-free guidance, no negative prompt; the wired
 //! sampler is the model's static-shift-3.0 flow-match Euler schedule. See [`pipeline`] for the parity
@@ -77,6 +79,13 @@ mod edit_validate;
 #[cfg(test)]
 mod base_img2img_validate;
 
+// `z_image_turbo` img2img/`Reference` real-weight GPU validation (sc-11783) — env-driven, `#[ignore]`d
+// integration test driving the REGISTERED Turbo generator through a `Conditioning::Reference` (strength
+// ablation + the strength-1.0 source round-trip + prompt divergence), the CFG-free sibling of
+// `base_img2img_validate`.
+#[cfg(test)]
+mod turbo_img2img_validate;
+
 pub use adapters::{install_additive, merge_adapters, AdditiveReport, MergeReport};
 // Base (non-Turbo) `z_image` generator (sc-8414). Its `descriptor`/`load`/`MODEL_ID` share the names
 // of the Turbo model's free functions below, so reach them through the `base` module path (consumers
@@ -86,15 +95,16 @@ pub use control::{ZImageControl, ZImageControlPaths, ZImageControlRequest, DEFAU
 pub use edit::{ZImageEdit, ZImageEditPaths, ZImageEditRequest, DEFAULT_EDIT_STRENGTH};
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, PidWeights, Progress, WeightsSource,
+    self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, WeightsSource,
 };
+use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
-use pipeline::{Components, Pipeline};
+use pipeline::{Components, Pipeline, DEFAULT_STEPS};
 
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TABLE["z_image_turbo"]`)
 /// and the macOS `mlx-gen-z-image` descriptor.
@@ -151,6 +161,11 @@ pub struct ZImageGenerator {
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache, never
     /// across the denoise.
     components: Mutex<Option<(bool, Components)>>,
+    /// Lazily-built, cached f32 VAE encoder for the img2img / `Reference` path (sc-11783). Built on the
+    /// **first img2img request only** — a pure txt2img workload never populates it, so the txt2img cost is
+    /// unchanged. Accel-independent (the encoder has no attention-dispatch toggle), so a single cached
+    /// instance serves every request. The Turbo mirror of the base generator's `vae_encoder` (sc-8646).
+    vae_encoder: Mutex<Option<Arc<VaeEncoder>>>,
 }
 
 impl ZImageGenerator {
@@ -173,6 +188,15 @@ impl ZImageGenerator {
         *guard = Some((accel, comps.clone()));
         Ok(comps)
     }
+
+    /// Get the cached f32 VAE encoder for the img2img / `Reference` path (sc-11783), building it on a
+    /// miss. Only ever called when a request carries a `Reference` at a strength that yields a non-empty
+    /// denoise (`start_step > 0`), so a txt2img-only workload never builds it. Mirrors the base
+    /// generator's `vae_encoder` (sc-8646).
+    fn vae_encoder(&self, pipe: &Pipeline) -> gen_core::Result<Arc<VaeEncoder>> {
+        // The inner `?` bridges the candle-side `load_vae_encoder` error into `gen_core::Error`.
+        candle_gen::cached(&self.vae_encoder, || Ok(Arc::new(pipe.load_vae_encoder()?)))
+    }
 }
 
 impl Generator for ZImageGenerator {
@@ -181,8 +205,10 @@ impl Generator for ZImageGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // The shared capability floor: since the descriptor advertises no conditioning, no guidance,
-        // and no negative prompt, any of those is rejected here (distilled-model honesty).
+        // The shared capability floor: the descriptor advertises a single `Reference` (img2img, sc-11783)
+        // but no guidance and no negative prompt, so guidance / negative / a MultiReference / any other
+        // conditioning kind is rejected here (distilled-model honesty). A >1-`Reference` request is caught
+        // by `resolve_reference` in `generate`.
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
@@ -228,16 +254,38 @@ impl Generator for ZImageGenerator {
             ),
         };
         let components = self.components(&pipe)?;
-        let images = pipe.render(req, &components, on_progress)?;
+
+        // img2img / `Reference` (sc-11783): resolve the single reference + its effective strength, and —
+        // when the strength yields a non-empty structure-preserving denoise (`start_step > 0`) — VAE-encode
+        // it to the clean init latent. `resolve_reference` errors on >1 reference; the capability floor in
+        // `validate` already rejects any non-`Reference` conditioning. Mirrors the base generator + the
+        // shared `render_base` img2img (sc-8646).
+        let reference = pipeline::resolve_reference(req)?;
+        let start_step = match &reference {
+            Some((_, strength)) => pipeline::init_time_step(
+                req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS),
+                *strength,
+            ),
+            None => 0,
+        };
+        let clean = if start_step > 0 {
+            let (image, _) = reference.expect("start_step > 0 implies a reference");
+            let encoder = self.vae_encoder(&pipe)?;
+            Some(pipe.encode_reference(&encoder, image, req.width, req.height)?)
+        } else {
+            None
+        };
+
+        let images = pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?;
         Ok(GenerationOutput::Images(images))
     }
 }
 
 /// Z-Image-Turbo's identity + the wired surface: distilled txt2img (no CFG, no negative prompt) plus
-/// LoRA/LoKr adapter merge (sc-5166). img2img conditioning + Q4/Q8 quantization stay the Python
-/// fallback's job until candle wires them, so the descriptor never promises a path `generate` can't
-/// serve. Two backend-correct deviations from `mlx-gen-z-image`: `backend = "candle"` and
-/// `mac_only = false`.
+/// LoRA/LoKr adapter merge (sc-5166) and reference-guided **img2img** latent-init (sc-11783, a single
+/// `Conditioning::Reference`). Q4/Q8 quantization stays the Python fallback's job until candle wires it,
+/// so the descriptor never promises a path `generate` can't serve. Two backend-correct deviations from
+/// `mlx-gen-z-image`: `backend = "candle"` and `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -250,10 +298,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
-            // txt2img only in sc-3693 — img2img (the mlx provider's `Reference`) lands later; an
-            // empty list means the shared `validate_request` rejects any conditioning and the worker
-            // keeps those shapes on the Python path.
-            conditioning: vec![],
+            // img2img reference-guided latent-init (sc-11783): a single `Conditioning::Reference` seeds
+            // the CFG-free denoise from the VAE-encoded reference (`render` + `encode_reference`, the
+            // Turbo mirror of the base `z_image` img2img sc-8646). The strict-pose ControlNet + the
+            // `edit_image` masked-edit surfaces stay bespoke worker streams (not registry-advertised).
+            conditioning: vec![ConditioningKind::Reference],
             // LoRA/LoKr now wired (sc-5166): a trained adapter merges into the dense DiT weights at
             // load ([`crate::adapters::merge_adapters`]), closing the candle train→infer loop. Q4/Q8
             // quantization is still deferred (rejected at load, not silently dropped).
@@ -329,6 +378,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         pid_spec: spec.pid.clone(),
         comfyui: None,
         components: Mutex::new(None),
+        vae_encoder: Mutex::new(None),
     }))
 }
 
@@ -363,6 +413,7 @@ pub fn load_from_comfyui_components(
         pid_spec: None,
         comfyui: Some(sources),
         components: Mutex::new(None),
+        vae_encoder: Mutex::new(None),
     }))
 }
 
@@ -407,7 +458,12 @@ mod tests {
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
-        assert!(d.capabilities.conditioning.is_empty());
+        // img2img reference-guided latent-init advertised (sc-11783) — a single `Reference`, NOT
+        // MultiReference (that stays a bespoke worker shape).
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         // LoRA/LoKr wired (sc-5166) — merged into the DiT at load.
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
@@ -436,6 +492,18 @@ mod tests {
         };
         assert!(g.validate(&ok).is_ok());
 
+        // img2img: a single `Reference` validates (sc-11783). A non-empty image isn't needed at the
+        // validate floor — the VAE-encode happens in `generate`.
+        let img2img = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.6),
+            }],
+            ..Default::default()
+        };
+        assert!(g.validate(&img2img).is_ok(), "single Reference is img2img");
+
         for bad in [
             // empty prompt
             GenerationRequest::default(),
@@ -463,22 +531,24 @@ mod tests {
                 steps: Some(0),
                 ..Default::default()
             },
-            // any conditioning (none advertised)
+            // a MultiReference is NOT the advertised img2img surface (only a single `Reference` is)
             GenerationRequest {
                 prompt: "x".into(),
-                conditioning: vec![Conditioning::Reference {
-                    image: Image::default(),
-                    strength: None,
+                conditioning: vec![Conditioning::MultiReference {
+                    images: vec![Image::default(), Image::default()],
                 }],
                 ..Default::default()
             },
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
-        // Sanity: img2img Reference is a kind the candle slice does not advertise.
-        assert!(!descriptor()
+        // Sanity: the img2img `Reference` kind is now advertised (sc-11783); MultiReference is not.
+        assert!(descriptor()
             .capabilities
             .accepts(ConditioningKind::Reference));
+        assert!(!descriptor()
+            .capabilities
+            .accepts(ConditioningKind::MultiReference));
     }
 
     /// Quantization / control overlays are rejected at load as typed `Unsupported`, so the worker
