@@ -62,6 +62,7 @@ The following passed from the repository root:
 - all MLX packages: `cargo check --locked -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*'`
 - all contract, Candle, and MLX package selectors pass Clippy with `-D warnings`
 - all default Candle package tests pass; weight/GPU-dependent cases remain ignored by their existing gates
+- all default MLX package tests pass; real-weight and performance cases remain ignored by their existing gates
 - all Candle packages check with `--features metal` on the local macOS host
 - contract/testkit library tests: 357 passed, 0 failed, 3 ignored
 - `git diff --check`
@@ -74,9 +75,10 @@ sequential policy, while unwired providers explicitly advertise `false`.
 The same contract commit added `Progress::Loading`; Candle's exhaustive example
 callbacks now display that phase so every `--all-targets` build remains compatible.
 
-This checkpoint validates the normalized dependency seams and every default
-workspace package on the local macOS host. Platform-specific Metal/CUDA feature
-matrices remain separate lanes before provider relocation.
+This checkpoint validates the normalized dependency seams, checks, Clippy, and
+default tests for every workspace package on the local macOS host. The local
+Candle Metal compile lane also passes. Hosted platform CI and the self-hosted
+Windows/CUDA lane remain separate gates before provider relocation.
 
 ## Next migration slice
 
