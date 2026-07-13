@@ -331,8 +331,9 @@ impl GenerationRequest {
             softness,
             enhance_temperature,
             pid_capture_sigma,
+            text_style_gain,
         } = self;
-        let floats: [(&'static str, Option<f32>); 15] = [
+        let floats: [(&'static str, Option<f32>); 16] = [
             ("guidance", *guidance),
             ("true_cfg", *true_cfg),
             ("scheduler_shift", *scheduler_shift),
@@ -348,6 +349,7 @@ impl GenerationRequest {
             ("softness", *softness),
             ("enhance_temperature", *enhance_temperature),
             ("pid_capture_sigma", *pid_capture_sigma),
+            ("text_style_gain", *text_style_gain),
         ];
         for (name, v) in floats {
             if let Some(x) = v {
