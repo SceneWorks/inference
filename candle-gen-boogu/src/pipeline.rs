@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{Module, VarBuilder};
+use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{self, Conditioning, GenerationRequest, Image, PidWeights, Progress};
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::z_image::sampling::postprocess_image;
@@ -144,9 +145,19 @@ fn vae_varbuilder(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
 }
 
 /// Render the **Base** (true-CFG) text-to-image path for `req`.
+///
+/// **img2img / `Reference` (sc-11786).** When `clean` is `Some` (the caller VAE-encoded a reference
+/// via [`encode_reference`]) and `start_step > 0`, each image blends the pre-encoded clean latent with
+/// the seeded noise at `σ_start = sigmas[start]` (`x_t = (1 − σ)·clean + σ·noise`) and denoises the
+/// **reduced** `start..` tail of the σ schedule — higher strength → later start → fewer steps → the
+/// output stays closer to the reference (the fork's [`init_time_step`] convention). `start_step == 0`
+/// (`clean` is `None`) is pure txt2img — byte-identical to the pre-sc-11786 path. Mirrors
+/// `mlx-gen-boogu`'s `generate_base_img2img_with_progress` (sc-10191).
 pub(crate) fn render_base(
     comps: &Components,
     req: &GenerationRequest,
+    clean: Option<&Tensor>,
+    start_step: usize,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
@@ -181,13 +192,21 @@ pub(crate) fn render_base(
         crate::BOOGU_IMAGE_ID,
     )?;
 
+    // img2img (sc-11786): seed at `σ_start` and denoise the reduced `start..` tail. `start` is clamped
+    // to the schedule (a curated scheduler may return a length ≠ `steps + 1`); the generator only threads
+    // a `clean` here when `start_step > 0`. For txt2img (`clean` is `None`, `start_step == 0`) this is the
+    // full schedule from pure noise — byte-identical to the pre-sc-11786 path.
+    let start = start_step.min(sigmas.len().saturating_sub(1));
+    let run_sigmas = &sigmas[start..];
+
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
+        let x_t = blend_reference(clean, noise, sigmas[start])?;
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::OneMinusSigma,
-            &sigmas,
-            noise,
+            run_sigmas,
+            x_t,
             seed,
             &req.cancel,
             on_progress,
@@ -210,16 +229,42 @@ pub(crate) fn render_base(
     })
 }
 
+/// img2img latent-init blend: `x_t = (1 − σ_start)·clean + σ_start·noise` when a reference `clean`
+/// latent is present, else the untouched `noise` (pure txt2img). The shared leaf both the Base and
+/// Turbo img2img paths seed from (sc-11786), matching `mlx_gen::img2img::add_noise_by_interpolation`.
+fn blend_reference(clean: Option<&Tensor>, noise: Tensor, sigma_start: f32) -> Result<Tensor> {
+    match clean {
+        Some(clean) => {
+            let s = sigma_start as f64;
+            Ok((clean.affine(1.0 - s, 0.0)? + noise.affine(s, 0.0)?)?)
+        }
+        None => Ok(noise),
+    }
+}
+
 /// Render the **Turbo** (DMD student few-step, CFG-free) text-to-image path for `req`.
+///
+/// **img2img / `Reference` (sc-11786).** When `clean` is `Some` (a VAE-encoded reference) and
+/// `start_step > 0`, the denoise routes through the curated [`run_flow_sampler`] over the DMD grid's
+/// noise-fraction view ([`turbo_native_sigmas`], regardless of `req.sampler`) so the img2img blend
+/// (`x_t = (1 − σ)·clean + σ·noise`) is applied on the same schedule the Base path uses, then denoises
+/// the reduced `start..` tail. `clean` is `None` (`start_step == 0`) keeps the pre-sc-11786 routing
+/// exactly: the native byte-exact DMD student loop unless a curated sampler/scheduler is selected.
+/// Mirrors `mlx-gen-boogu`'s `generate_turbo_img2img_with_progress` (sc-10191).
 pub(crate) fn render_turbo(
     comps: &Components,
     req: &GenerationRequest,
+    clean: Option<&Tensor>,
+    start_step: usize,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let cond = comps.te.last_hidden(&comps.tok.encode_t2i(&req.prompt)?)?;
+    // img2img seeds from a mid-schedule blended latent, which the native manual DMD loop below can't
+    // express — so an img2img request always takes the curated framework path (over the same DMD grid).
+    let is_img2img = clean.is_some() && start_step > 0;
 
     // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
     // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
@@ -237,19 +282,24 @@ pub(crate) fn render_turbo(
     // with the velocity negated); only the renoise convention differs (the curated solver re-noises,
     // the native loop flow-blends). Unset (the default) is the native DMD student loop, byte-exact
     // below.
-    if req.sampler.is_some() || req.scheduler.is_some() {
+    if is_img2img || req.sampler.is_some() || req.scheduler.is_some() {
         let native = turbo_native_sigmas(DEFAULT_TURBO_SIGMA, steps);
         // The DMD grid is linear in clean-fraction (no logistic shift), so mu = 0 for a curated
         // scheduler re-shape over the same σ span.
         let sigmas =
             candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+        // img2img (sc-11786): seed at `σ_start` and denoise the reduced `start..` tail. `clean` is
+        // `None` (start 0) for pure txt2img ⇒ full schedule from pure noise (byte-identical curated path).
+        let start = start_step.min(sigmas.len().saturating_sub(1));
+        let run_sigmas = &sigmas[start..];
         return candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let noise = init_noise(req.height, req.width, seed, 0, device)?;
+            let x_t = blend_reference(clean, noise, sigmas[start])?;
             let lat = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
-                &sigmas,
-                noise,
+                run_sigmas,
+                x_t,
                 seed,
                 &req.cancel,
                 on_progress,
@@ -321,12 +371,20 @@ pub(crate) struct EditComponents {
 pub(crate) fn load_edit_components(root: &Path, device: &Device) -> Result<EditComponents> {
     let mllm_w = Weights::from_dir(&root.join("mllm"), device, VAE_DTYPE)?;
     let vision = VisionTower::load(&mllm_w, VisionConfig::qwen3_vl(), "model.visual")?;
-    let vae_vb = vae_varbuilder(&root.join("vae"), device)?;
-    let vae_encoder = Encoder::new(&VaeConfig::z_image(), vae_vb.pp("encoder"))?;
+    let vae_encoder = load_vae_encoder(root, device)?;
     Ok(EditComponents {
         vision,
         vae_encoder,
     })
+}
+
+/// Build the standalone f32 FLUX.1 VAE **encoder** (`vae/encoder.*`) for the reference → clean-latent
+/// paths. Shared by the Edit lane's [`EditComponents`] (vision + encoder) and the Base/Turbo img2img
+/// latent-init encoder cache (sc-11786), so a plain img2img request loads ONLY the encoder — never the
+/// heavy vision tower the Edit lane needs.
+pub(crate) fn load_vae_encoder(root: &Path, device: &Device) -> Result<Encoder> {
+    let vae_vb = vae_varbuilder(&root.join("vae"), device)?;
+    Ok(Encoder::new(&VaeConfig::z_image(), vae_vb.pp("encoder"))?)
 }
 
 /// Render the **Edit** (true-CFG TI2I) path for `req` with one or more source `references`.
@@ -471,17 +529,116 @@ fn encode_image_instruction(
 /// (which *samples* the diagonal Gaussian; the Edit path needs the deterministic mode).
 fn vae_encode(encoder: &Encoder, reference: &Image, device: &Device) -> Result<Tensor> {
     let pixels = image_to_pixels(reference, device)?; // [1, 3, H, W] in [-1, 1], f32
-    let moments = encoder.forward(&pixels)?; // [1, 2C, H/8, W/8]
+    encode_mean_latent(encoder, &pixels)
+}
+
+/// Mean-encode a preprocessed `[1, 3, H, W]` f32 `[-1, 1]` pixel tensor → clean latent
+/// `[1, 16, H/8, W/8]`: take the distribution **mean** (first C of the encoder's `2·C` moment
+/// channels — NOT a sampled draw, which would use the device RNG and break sc-3673 launch portability)
+/// and map to latent space as `(mean − shift) · scale`. The shared leaf the Edit reference encode
+/// ([`vae_encode`]) and the Base/Turbo img2img latent-init ([`encode_reference`]) both build on.
+fn encode_mean_latent(encoder: &Encoder, pixels: &Tensor) -> Result<Tensor> {
+    let moments = encoder.forward(pixels)?; // [1, 2C, H/8, W/8]
     let two_c = moments.dim(1)?;
     if two_c % 2 != 0 {
         return Err(CandleError::Msg(format!(
-            "boogu edit: VAE encoder produced an odd channel count ({two_c}), expected 2·C"
+            "boogu: VAE encoder produced an odd channel count ({two_c}), expected 2·C"
         )));
     }
     let c = two_c / 2;
     let mean = moments.narrow(1, 0, c)?; // first C channels (the distribution mean)
     let cfg = VaeConfig::z_image();
     Ok(((mean - cfg.shift_factor)? * cfg.scaling_factor)?)
+}
+
+/// img2img start step — the "structure-preservation" convention shared with Z-Image / Krea Turbo and
+/// `mlx-gen`'s `img2img::init_time_step`: for a reference with `strength` in `(0, 1]`,
+/// `max(1, floor(num_steps · strength))`; otherwise `0` (pure txt2img, no reference blend). **Higher
+/// strength → later start → fewer denoise steps → output stays CLOSER to the reference** — the inverse
+/// of the SDXL knob, matched here so the strength knob behaves identically on the Mac (MLX) and Windows
+/// (candle) Boogu lanes. `floor` because Python `int(steps · strength)` truncates toward zero. Pure
+/// function so the cross-backend-parity law is unit-testable without a GPU.
+pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+    match strength {
+        Some(s) if s > 0.0 => {
+            let s = s.clamp(0.0, 1.0);
+            ((num_steps as f32 * s) as usize).max(1)
+        }
+        _ => 0,
+    }
+}
+
+/// The single img2img reference for the Base/Turbo t2i path (sc-11786): at most one
+/// [`Conditioning::Reference`] — multiple is an error (Boogu's multi-image path is the Edit
+/// checkpoint's `resolve_edit_references`, not img2img) — with its per-reference `strength` falling
+/// back to `req.strength`. `None` ⇒ pure txt2img. Mirrors `mlx-gen-boogu`'s `resolve_reference` and
+/// Z-Image's. `id` names the engine in the multi-reference error.
+pub(crate) fn resolve_reference<'a>(
+    req: &'a GenerationRequest,
+    id: &str,
+) -> Result<Option<(&'a Image, Option<f32>)>> {
+    let mut reference = None;
+    for c in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = c {
+            if reference.is_some() {
+                return Err(CandleError::Msg(format!(
+                    "{id}: multiple reference images are not supported on the t2i path (single img2img \
+                     init only; the Edit checkpoint handles multi-image edits)"
+                )));
+            }
+            reference = Some((image, strength.or(req.strength)));
+        }
+    }
+    Ok(reference)
+}
+
+/// VAE-encode `source` (LANCZOS-resized to the render `width × height`, normalized to `[-1, 1]` NCHW)
+/// to the deterministic clean init latent `[1, 16, H/8, W/8]` for the Base/Turbo img2img path
+/// (sc-11786). The img2img sibling of the Edit path's [`vae_encode`], but resized to the OUTPUT
+/// resolution (the clean latent must match the seeded noise shape) rather than encoded at the
+/// reference's own dimensions. `encoder` is the standalone f32 [`Encoder`] from [`load_vae_encoder`].
+pub(crate) fn encode_reference(
+    encoder: &Encoder,
+    source: &Image,
+    width: u32,
+    height: u32,
+    device: &Device,
+) -> Result<Tensor> {
+    let pixels = preprocess_init_image(source, width, height, device)?;
+    encode_mean_latent(encoder, &pixels)
+}
+
+/// RGB8 `img` fit to the render `width × height` (LANCZOS only when off-size) → `[1, 3, H, W]` f32 in
+/// `[-1, 1]` — the VAE encoder's input range. The img2img resize the Edit path's [`image_to_pixels`]
+/// (which never resizes) omits; mirrors `mlx_gen::img2img::preprocess_init_image` and Z-Image's
+/// `common::preprocess_image` (`ResizeIfNeeded`).
+fn preprocess_init_image(img: &Image, width: u32, height: u32, device: &Device) -> Result<Tensor> {
+    let (iw, ih) = (img.width as usize, img.height as usize);
+    let expected = iw * ih * 3;
+    if img.pixels.len() != expected {
+        return Err(CandleError::Msg(format!(
+            "boogu: reference pixel buffer {} bytes != {}x{}x3 ({expected})",
+            img.pixels.len(),
+            img.width,
+            img.height
+        )));
+    }
+    let (rw, rh) = (width as usize, height as usize);
+    let resized: Vec<f32> = if (ih, iw) == (rh, rw) {
+        img.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&img.pixels, ih, iw, rh, rw)? // HWC f32 [0,255]
+    };
+    // [0,255] → [-1,1], HWC → CHW.
+    let mut data = vec![0f32; 3 * rh * rw];
+    for y in 0..rh {
+        for x in 0..rw {
+            for c in 0..3 {
+                data[c * rh * rw + y * rw + x] = resized[(y * rw + x) * 3 + c] / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok(Tensor::from_vec(data, (1, 3, rh, rw), device)?.to_dtype(VAE_DTYPE)?)
 }
 
 /// RGB8 [`Image`] (HWC, `[0, 255]`) → the VAE encoder's `[1, 3, H, W]` f32 tensor in `[-1, 1]` — the
