@@ -278,17 +278,21 @@ fn classify_cancel(
     }
 }
 
-/// **Registry round-trip.** The trainer's descriptor `id` is discoverable through
-/// `gen_core::registry::trainers()` — its `inventory::submit!` registration survived linking.
-pub fn check_trainer_registry(t: &dyn Trainer) -> Result<(), String> {
+/// **Registry round-trip.** The trainer's descriptor `id` is present in the explicit registry
+/// supplied by the caller.
+pub fn check_trainer_registry(
+    registry: &gen_core::ProviderRegistry,
+    t: &dyn Trainer,
+) -> Result<(), String> {
     let id = t.descriptor().id;
-    if gen_core::registry::trainers().any(|r| (r.descriptor)().id == id) {
+    if registry
+        .trainers()
+        .any(|registration| (registration.descriptor)().id == id)
+    {
         Ok(())
     } else {
         Err(format!(
-            "registry[{id}]: descriptor id not found via gen_core::registry::trainers() — the \
-             provider crate is not linked/registered (missing inventory::submit! or dead-stripped; \
-             gen-core {})",
+            "registry[{id}]: descriptor id not found in the explicit provider registry (gen-core {})",
             gen_core::VERSION
         ))
     }
@@ -301,7 +305,7 @@ pub fn check_trainer_registry(t: &dyn Trainer) -> Result<(), String> {
 pub fn trainer_conformance(make: impl Fn() -> Box<dyn Trainer>, profile: &TrainerProfile) {
     let mut failures: Vec<String> = Vec::new();
 
-    // validate + registry share one (unconsumed) instance. Capture the descriptor id here (F-059) so
+    // Capture the descriptor id here (F-059) so
     // the aggregated-failure panic below doesn't reload a multi-GB trainer a fourth time just to name
     // it — a failing conformance run otherwise pays an extra multi-minute load (or a flaky reload
     // replaces the panic message entirely).
@@ -310,9 +314,6 @@ pub fn trainer_conformance(make: impl Fn() -> Box<dyn Trainer>, profile: &Traine
         let t = make();
         id = t.descriptor().id;
         if let Err(e) = check_trainer_validate(t.as_ref(), profile) {
-            failures.push(e);
-        }
-        if let Err(e) = check_trainer_registry(t.as_ref()) {
             failures.push(e);
         }
     }

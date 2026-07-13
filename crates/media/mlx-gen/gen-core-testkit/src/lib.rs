@@ -407,31 +407,32 @@ pub fn check_seed_determinism(g: &dyn Generator, profile: &Profile) -> Result<()
     Ok(())
 }
 
-/// **Registry round-trip.** The provider's descriptor `id` is discoverable through
-/// `gen_core::registry` — i.e. its `inventory::submit!` registration is present in the build graph
-/// (a missing/dead-stripped registration is the runtime "engine not found" trap, sc-4482).
-pub fn check_registry_roundtrip(g: &dyn Generator) -> Result<(), String> {
+/// **Registry round-trip.** The provider's descriptor `id` is present in the explicit registry
+/// supplied by the caller (a missing catalog entry is the runtime "engine not found" trap).
+pub fn check_registry_roundtrip(
+    registry: &gen_core::ProviderRegistry,
+    g: &dyn Generator,
+) -> Result<(), String> {
     let id = g.descriptor().id;
-    if gen_core::registry::generators().any(|r| (r.descriptor)().id == id) {
+    if registry
+        .generators()
+        .any(|registration| (registration.descriptor)().id == id)
+    {
         Ok(())
     } else {
         Err(format!(
-            "registry[{id}]: descriptor id not found via gen_core::registry::generators() — the provider \
-             crate is not linked/registered (missing inventory::submit! or dead-stripped; gen-core {})",
+            "registry[{id}]: descriptor id not found in the explicit provider registry (gen-core {})",
             gen_core::VERSION
         ))
     }
 }
 
 /// **Descriptor sweep (weights-free).** Run the registry-wide descriptor-level conformance sweep
-/// ([`gen_core::registry::descriptor_conformance_errors`], sc-9098 / F-009) over every registration
-/// linked into the calling binary and panic with the aggregated violations — the test-helper idiom
-/// of [`conformance`], minus any model load. Because no weights are touched, providers wire this as
-/// a **default** (non-`#[ignore]`d) test, so every registered id gets at least descriptor-level
-/// coverage on a fresh clone; the behavioral checks stay weights-gated. Remember the linkage
-/// gotcha: the sweep sees only what the calling binary links (`use mlx_gen_<x> as _;`).
-pub fn registry_conformance() {
-    let errs = gen_core::registry::descriptor_conformance_errors();
+/// over the explicit catalog supplied by the caller and panic with the aggregated violations — the
+/// test-helper idiom of [`conformance`], minus any model load. Because no weights are touched,
+/// providers wire this as a default (non-`#[ignore]`d) test; behavioral checks stay weights-gated.
+pub fn registry_conformance(registry: &gen_core::ProviderRegistry) {
+    let errs = registry.descriptor_conformance_errors();
     if !errs.is_empty() {
         panic!(
             "gen-core descriptor conformance FAILED ({} violations, gen-core {}):\n  - {}",
@@ -460,14 +461,10 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
         check_seed_determinism,
     ];
 
-    let mut failures: Vec<String> = checks
+    let failures: Vec<String> = checks
         .into_iter()
         .filter_map(|f| f(g, profile).err())
         .collect();
-    if let Err(e) = check_registry_roundtrip(g) {
-        failures.push(e);
-    }
-
     if !failures.is_empty() {
         panic!(
             "gen-core conformance FAILED for `{}` ({} backend, gen-core {}):\n  - {}",

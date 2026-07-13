@@ -166,17 +166,21 @@ pub fn check_captioner_cancellation(
 // finishing its caption after a mid-decode cancel is conformant, so such a check would be a false
 // positive. The generator seed-differs sub-check (the other half of F-085) lives in `lib.rs`.
 
-/// **Registry round-trip.** The captioner's descriptor `id` is discoverable through
-/// `gen_core::registry::captioners()` — its `inventory::submit!` registration survived linking.
-pub fn check_captioner_registry(c: &dyn Captioner) -> Result<(), String> {
+/// **Registry round-trip.** The captioner's descriptor `id` is present in the explicit registry
+/// supplied by the caller.
+pub fn check_captioner_registry(
+    registry: &gen_core::ProviderRegistry,
+    c: &dyn Captioner,
+) -> Result<(), String> {
     let id = c.descriptor().id;
-    if gen_core::registry::captioners().any(|r| (r.descriptor)().id == id) {
+    if registry
+        .captioners()
+        .any(|registration| (registration.descriptor)().id == id)
+    {
         Ok(())
     } else {
         Err(format!(
-            "registry[{id}]: descriptor id not found via gen_core::registry::captioners() — the \
-             provider crate is not linked/registered (missing inventory::submit! or dead-stripped; \
-             gen-core {})",
+            "registry[{id}]: descriptor id not found in the explicit provider registry (gen-core {})",
             gen_core::VERSION
         ))
     }
@@ -195,14 +199,10 @@ pub fn captioner_conformance(make: impl Fn() -> Box<dyn Captioner>, profile: &Ca
         check_captioner_progress,
         check_captioner_cancellation,
     ];
-    let mut failures: Vec<String> = checks
+    let failures: Vec<String> = checks
         .into_iter()
         .filter_map(|f| f(c, profile).err())
         .collect();
-    if let Err(e) = check_captioner_registry(c) {
-        failures.push(e);
-    }
-
     if !failures.is_empty() {
         panic!(
             "gen-core captioner conformance FAILED for `{}` (gen-core {}):\n  - {}",

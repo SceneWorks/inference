@@ -142,8 +142,16 @@ fn stub_descriptor() -> CaptionerDescriptor {
 fn stub_load(_spec: &LoadSpec) -> gen_core::Result<Box<dyn Captioner>> {
     Ok(StubCaptioner::boxed(STUB_ID, Behavior::good()))
 }
-inventory::submit! {
-    CaptionerRegistration { descriptor: stub_descriptor, load: stub_load }
+const STUB_REGISTRATION: CaptionerRegistration = CaptionerRegistration {
+    descriptor: stub_descriptor,
+    load: stub_load,
+};
+
+fn registry() -> gen_core::ProviderRegistry {
+    gen_core::ProviderRegistryBuilder::new()
+        .register_captioner(STUB_REGISTRATION)
+        .build()
+        .expect("stub captioner registry should build")
 }
 
 fn cheap() -> CaptionerProfile {
@@ -161,7 +169,7 @@ fn good_stub_passes_every_check_individually() {
     check_captioner_validate(&c, &cheap()).unwrap();
     check_captioner_progress(&c, &cheap()).unwrap();
     check_captioner_cancellation(&c, &cheap()).unwrap();
-    check_captioner_registry(&c).unwrap();
+    check_captioner_registry(&registry(), &c).unwrap();
 }
 
 #[test]
@@ -217,7 +225,7 @@ fn stringified_cancel_fails_cancellation_check() {
 #[test]
 fn unregistered_id_fails_registry_check() {
     let c = StubCaptioner::new(UNREG_ID, Behavior::good());
-    assert!(check_captioner_registry(&c).is_err());
+    assert!(check_captioner_registry(&registry(), &c).is_err());
 }
 
 #[test]

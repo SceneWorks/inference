@@ -11,7 +11,7 @@ use gen_core::{
 };
 use std::cell::Cell;
 
-/// The registered stub id (round-trips through the registry, see the `inventory::submit!` below).
+/// The registered stub id (round-trips through the explicit fixture registry below).
 const STUB_ID: &str = "testkit_stub";
 /// A stub id that is deliberately NOT registered — exercises the registry-check failure path.
 const UNREG_ID: &str = "testkit_unregistered_stub";
@@ -135,16 +135,22 @@ impl Generator for Stub {
     }
 }
 
-// Register the good stub so the registry round-trip resolves its id. This is the only
-// ModelRegistration in the testkit's test binary, so the registry contains exactly this one.
 fn stub_descriptor() -> ModelDescriptor {
     stub_desc(STUB_ID)
 }
 fn stub_load(_spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Stub::boxed(STUB_ID, Behavior::good()))
 }
-inventory::submit! {
-    ModelRegistration { descriptor: stub_descriptor, load: stub_load }
+const STUB_REGISTRATION: ModelRegistration = ModelRegistration {
+    descriptor: stub_descriptor,
+    load: stub_load,
+};
+
+fn registry() -> gen_core::ProviderRegistry {
+    gen_core::ProviderRegistryBuilder::new()
+        .register_generator(STUB_REGISTRATION)
+        .build()
+        .expect("stub registry should build")
 }
 
 fn cheap() -> Profile {
@@ -163,7 +169,7 @@ fn good_stub_passes_every_check_individually() {
     check_progress(&g, &cheap()).unwrap();
     check_cancellation(&g, &cheap()).unwrap();
     check_seed_determinism(&g, &cheap()).unwrap();
-    check_registry_roundtrip(&g).unwrap();
+    check_registry_roundtrip(&registry(), &g).unwrap();
 }
 
 #[test]
@@ -232,15 +238,14 @@ fn nondeterministic_fails_seed_check() {
 #[test]
 fn unregistered_id_fails_registry_check() {
     let g = Stub::new(UNREG_ID, Behavior::good());
-    assert!(check_registry_roundtrip(&g).is_err());
+    assert!(check_registry_roundtrip(&registry(), &g).is_err());
 }
 
-/// The weights-free descriptor sweep (sc-9098, F-009) is clean over this binary's registry (the
-/// good stub is its only registration). The per-violation firing is unit-tested next to the checks
-/// in `gen_core::registry`.
+/// The weights-free descriptor sweep (sc-9098, F-009) is clean over the explicit fixture registry.
+/// Per-violation firing is unit-tested next to the checks in `gen_core::registry`.
 #[test]
 fn registry_sweep_passes_for_the_registered_stub() {
-    registry_conformance();
+    registry_conformance(&registry());
 }
 
 /// `check_progress_with` accepts a request-supplied run (the SVD/SeedVR2/renderer shape) and flags

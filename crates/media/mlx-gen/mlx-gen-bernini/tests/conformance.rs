@@ -20,10 +20,8 @@
 use std::path::PathBuf;
 
 use gen_core_testkit::{check_progress_with, check_registry_roundtrip, check_validate_honesty};
-use mlx_gen::{registry, GenerationRequest, LoadSpec, WeightsSource};
+use mlx_gen::{GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_wan::convert::assemble_bernini_renderer_snapshot;
-// Force-link the provider (registers both `bernini_renderer` and `bernini`).
-use mlx_gen_bernini as _;
 
 fn hf_snapshot(repo: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -96,16 +94,18 @@ fn t2i_request(mode: &str, steps: u32) -> GenerationRequest {
 #[test]
 #[ignore = "real weights: assembles + loads the ~56 GB Bernini renderer snapshot, runs a short denoise"]
 fn bernini_renderer_satisfies_gen_core_contract() {
-    let gen = registry::load(
-        "bernini_renderer",
-        &LoadSpec::new(WeightsSource::Dir(ensure_renderer_snapshot())),
-    )
-    .expect("load bernini_renderer");
+    let registry = mlx_gen_bernini::provider_registry().expect("provider registry should build");
+    let gen = registry
+        .load(
+            "bernini_renderer",
+            &LoadSpec::new(WeightsSource::Dir(ensure_renderer_snapshot())),
+        )
+        .expect("load bernini_renderer");
     let g = gen.as_ref();
 
     // Cheap (validate-only) capability honesty + registry round-trip.
     check_validate_honesty(g, &gen_core_testkit::Profile::cheap()).expect("validate honesty");
-    check_registry_roundtrip(g).expect("registry round-trip");
+    check_registry_roundtrip(&registry, g).expect("registry round-trip");
 
     // Exact 1..=total progress on a 3-step 1-frame t2i (the F-038 1-based fix: the renderer's
     // Step.current must reach total). total == req.steps for the renderer-only pipeline.
@@ -115,15 +115,17 @@ fn bernini_renderer_satisfies_gen_core_contract() {
 #[test]
 #[ignore = "real weights: assembles + loads the full Bernini (planner+renderer) snapshot, runs the MAR loop + denoise"]
 fn bernini_full_pipeline_satisfies_gen_core_contract() {
-    let gen = registry::load(
-        "bernini",
-        &LoadSpec::new(WeightsSource::Dir(ensure_full_snapshot())),
-    )
-    .expect("load bernini");
+    let registry = mlx_gen_bernini::provider_registry().expect("provider registry should build");
+    let gen = registry
+        .load(
+            "bernini",
+            &LoadSpec::new(WeightsSource::Dir(ensure_full_snapshot())),
+        )
+        .expect("load bernini");
     let g = gen.as_ref();
 
     check_validate_honesty(g, &gen_core_testkit::Profile::cheap()).expect("validate honesty");
-    check_registry_roundtrip(g).expect("registry round-trip");
+    check_registry_roundtrip(&registry, g).expect("registry round-trip");
 
     // Typed cancellation, tripped at the first *planner* Step — proves the MAR stage is both
     // progress-visible and cancellable without ever reaching the heavy renderer denoise.

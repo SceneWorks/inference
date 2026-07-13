@@ -12,7 +12,7 @@ use gen_core::{
     TrainingProgress, TrainingRequest,
 };
 
-/// The registered stub id (round-trips through the registry, see the `inventory::submit!` below).
+/// The registered stub id (round-trips through the explicit fixture registry below).
 const STUB_ID: &str = "testkit_trainer_stub";
 /// A stub id deliberately NOT registered — exercises the registry-check failure path.
 const UNREG_ID: &str = "testkit_trainer_unregistered_stub";
@@ -170,15 +170,22 @@ impl Trainer for StubTrainer {
     }
 }
 
-// Register the good stub so the registry round-trip resolves its id.
 fn stub_descriptor() -> TrainerDescriptor {
     stub_desc(STUB_ID)
 }
 fn stub_load(_spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
     Ok(StubTrainer::boxed(STUB_ID, Behavior::good()))
 }
-inventory::submit! {
-    TrainerRegistration { descriptor: stub_descriptor, load: stub_load }
+const STUB_REGISTRATION: TrainerRegistration = TrainerRegistration {
+    descriptor: stub_descriptor,
+    load: stub_load,
+};
+
+fn registry() -> gen_core::ProviderRegistry {
+    gen_core::ProviderRegistryBuilder::new()
+        .register_trainer(STUB_REGISTRATION)
+        .build()
+        .expect("stub trainer registry should build")
 }
 
 fn item(name: &str) -> TrainingItem {
@@ -212,7 +219,7 @@ fn good_stub_passes_every_check_individually() {
     check_trainer_validate(&g, &profile()).unwrap();
     check_trainer_progress(&mut g, &profile()).unwrap();
     check_trainer_cancellation(&make_good, &profile()).unwrap();
-    check_trainer_registry(&g).unwrap();
+    check_trainer_registry(&registry(), &g).unwrap();
 }
 
 #[test]
@@ -280,7 +287,7 @@ fn stringified_cancel_fails_cancellation_check() {
 #[test]
 fn unregistered_id_fails_registry_check() {
     let g = StubTrainer::new(UNREG_ID, Behavior::good());
-    assert!(check_trainer_registry(&g).is_err());
+    assert!(check_trainer_registry(&registry(), &g).is_err());
 }
 
 #[test]

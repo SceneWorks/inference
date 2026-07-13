@@ -18,8 +18,3 @@ name = "gen_core_testkit"
 # the public `Generator` contract, so it links no tensor library and builds on Linux (the gen-core CI
 # lane) as readily as macOS — that backend-independence is the whole point (epic 3720, sc-4481).
 sceneworks-gen-core = { workspace = true }
-
-[dev-dependencies]
-# Only the self-tests need it — to `inventory::submit!` the stub generator so the registry
-# round-trip check has something to resolve. Pure-host, keeps the Linux lane building.
-inventory = { workspace = true }
