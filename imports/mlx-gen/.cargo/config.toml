@@ -1,0 +1,36 @@
+# MLX uses a shared default Metal device/stream that is NOT safe to drive from
+# multiple threads concurrently. cargo's test harness runs tests in parallel by
+# default, which SIGSEGVs once more than one test touches MLX at the same time.
+# Force the libtest harness to a single thread for the whole crate so `cargo test`
+# (and CI) just work. Individual ops are still fast; tests run sequentially.
+# `force = true` is load-bearing (F-160): a plain `[env]` entry is only applied when the
+# variable is UNSET, so without it anyone who already has `RUST_TEST_THREADS` exported would
+# silently run MLX tests in parallel and hit the exact SIGSEGV above. Forcing it overrides that.
+[env]
+RUST_TEST_THREADS = { value = "1", force = true }
+
+# Build MLX at the macOS 26.2 deployment target so the Apple matrix-unit ("NAX") Metal
+# kernels both compile in AND codegen correctly. mlx-sys's build.rs floors the target at
+# macOS 14 (Metal 310), which trips MLX's kernel gate and defines -DMLX_METAL_NO_NAX,
+# omitting the fast steel_gemm_*_nax / steel_attention_nax kernels -> ~2.5x slower DiT.
+# resolve_deployment_target() in the fork honors a higher value, so no fork edit is needed.
+#
+# WHY 26.2 (not 26.0) — sc-2772: the NAX kernels use Apple's Metal Performance Primitives
+# matrix-unit intrinsic (mpp::tensor_ops::matmul2d), which is only valid for macOS >= 26.2 —
+# the same floor is_nax_available() checks at runtime. At -mmacosx-version-min=26.0 the
+# kernels still COMPILE IN, but metalfe MISCOMPILES the tensor-op to GARBAGE for 16-bit
+# (bf16/f16) GEMM + fused SDPA, while the host (which checks 26.2) still dispatches to them.
+# That silent garbage is exactly what the sc-2714/sc-2770 dispatch-gate patches worked
+# around. Compiling at 26.2 makes the NAX 16-bit kernels CORRECT (proven byte-for-byte vs
+# Apple's official wheel metallib), so those patches were removed and 16-bit now uses the
+# (correct, faster) NAX matrix unit. f32 was always fine (it doesn't hit the miscompiled op).
+#
+# NOT forced: cargo only applies this when MACOSX_DEPLOYMENT_TARGET is unset, so a local
+# build (the shipping config) defaults to 26.2 -> correct NAX. CI overrides it to a lower
+# value because GitHub's hosted macOS runners cap at macos-15 / SDK 15 — they can't provide
+# SDK >= 26.2. CI therefore builds at Metal 320 to verify correctness; it cannot exercise the
+# NAX fast path at all (is_nax_available() is false there), so the lower target is harmless.
+# A macOS-26.2+ self-hosted runner is required to exercise/guard NAX. NB: build.rs has no
+# rerun-if-env-changed, so a clean rebuild of pmetal-mlx-sys is required for a change here to
+# take effect. Requires macOS 26.2 at runtime for the fast path. See sc-2352 / sc-2772.
+MACOSX_DEPLOYMENT_TARGET = "26.2"

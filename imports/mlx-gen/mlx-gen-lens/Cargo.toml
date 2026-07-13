@@ -1,0 +1,27 @@
+[package]
+name = "mlx-gen-lens"
+version = "0.0.0"
+edition = "2021"
+description = "Microsoft Lens / Lens-Turbo provider crate for mlx-gen — native MLX T2I (gpt-oss-20b MoE text encoder + dual-stream MMDiT + Flux.2 VAE)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "lens", "diffusion", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# The Lens VAE is the Flux.2 `AutoencoderKLFlux2` (32-ch latent, 2×2 patchify, bn-stats normalize) —
+# already ported; the Lens decode path reuses `Flux2Vae` / `load_vae` (sc-3169).
+mlx-gen-flux2 = { path = "../mlx-gen-flux2" }
+# Optional PiD super-resolving decoder overlay (epic 7840, sc-7847) — the `flux2` student (Lens is the
+# Flux.2 latent space). Depends only on mlx-gen core (acyclic).
+mlx-gen-pid = { path = "../mlx-gen-pid" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# config.json parsing (matches the sdxl/wan/ltx/flux2 provider convention: serde_json::Value, no derive).
+serde_json = { workspace = true }
+# Link-time generator registration (`inventory::submit!` collected by mlx_gen's `inventory::collect!`).
+inventory = { workspace = true }
+# Decode training-dataset images (LoRA/LoKr training, sc-5148) — the trainer center-crops + hands the
+# Image to the Flux.2 VAE preprocess. PNG + JPEG cover the SceneWorks dataset formats (mirrors z-image).
+image = { workspace = true }

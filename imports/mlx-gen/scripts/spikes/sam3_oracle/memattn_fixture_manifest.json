@@ -1,0 +1,91 @@
+{
+  "model": "facebook/sam3",
+  "image_url": "https://raw.githubusercontent.com/ultralytics/ultralytics/main/ultralytics/assets/zidane.jpg",
+  "num_calls": 2,
+  "num_object_pointer_tokens": 4,
+  "stages": {
+    "current_vision_features": {
+      "shape": [
+        5184,
+        1,
+        256
+      ],
+      "min": -2.2623727321624756,
+      "max": 2.446113109588623,
+      "mean": -0.003101648995652795,
+      "std": 0.3917993903160095,
+      "sha1_5dp": "071db4ea4e54d969"
+    },
+    "current_vision_position_embeddings": {
+      "shape": [
+        5184,
+        1,
+        256
+      ],
+      "min": -1.0,
+      "max": 1.0,
+      "mean": 0.4947257339954376,
+      "std": 0.5052193999290466,
+      "sha1_5dp": "8eea427d6879d042"
+    },
+    "memory": {
+      "shape": [
+        5188,
+        1,
+        64
+      ],
+      "min": -5.03125,
+      "max": 6.46875,
+      "mean": 0.07165953516960144,
+      "std": 1.0385493040084839,
+      "sha1_5dp": "11d9c59fb2596f1e"
+    },
+    "memory_pos": {
+      "shape": [
+        5188,
+        1,
+        64
+      ],
+      "min": -4.438387870788574,
+      "max": 2.7042737007141113,
+      "mean": 0.4971112906932831,
+      "std": 0.524951159954071,
+      "sha1_5dp": "7420c8c2c601fd0e"
+    },
+    "rope_cos": {
+      "shape": [
+        5184,
+        256
+      ],
+      "min": -1.0,
+      "max": 1.0,
+      "mean": 0.5774887204170227,
+      "std": 0.6465763449668884,
+      "sha1_5dp": "ff90ab73ad2b3ed1"
+    },
+    "rope_sin": {
+      "shape": [
+        5184,
+        256
+      ],
+      "min": -0.9999902248382568,
+      "max": 0.9999999403953552,
+      "mean": 0.16847938299179077,
+      "std": 0.4691065549850464,
+      "sha1_5dp": "79f7aa5c3eba279e"
+    },
+    "output": {
+      "shape": [
+        1,
+        1,
+        5184,
+        256
+      ],
+      "min": -5.570901870727539,
+      "max": 7.266819953918457,
+      "mean": 0.0372152104973793,
+      "std": 1.0472743511199951,
+      "sha1_5dp": "cd2d42ac48d25260"
+    }
+  }
+}

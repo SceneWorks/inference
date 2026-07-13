@@ -1,0 +1,173 @@
+//! DC-AE decoder configuration (epic 8485, spike sc-8486).
+//!
+//! Values mirror the diffusers `AutoencoderDC` config for `mit-han-lab/dc-ae-f32c32-sana-1.0`
+//! (the autoencoder behind SANA-1.6B 1024px). Only the **decoder** is modelled here — the spike's
+//! sole question is whether the f32 deep-compression *decode* reproduces cleanly on Metal.
+
+/// Per-stage block kind. The SANA-1.0 decoder runs `ResBlock` in the three shallow (high-res) stages
+/// and `EfficientViTBlock` (linear attention) in the three deep (low-res) stages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockType {
+    Res,
+    EfficientVit,
+}
+
+/// Decoder hyper-parameters. Stored stage order is shallow→deep (index 0 = 128-channel/full-res
+/// stage … index 5 = 1024-channel/lowest-res stage), matching the on-disk `decoder.up_blocks.{i}`
+/// numbering. Decode iterates them deep→shallow.
+#[derive(Clone, Debug)]
+pub struct DcAeConfig {
+    pub in_channels: i32,
+    pub latent_channels: i32,
+    pub attention_head_dim: i32,
+    pub block_out_channels: Vec<i32>,
+    pub layers_per_block: Vec<i32>,
+    /// Encoder layers per stage (`encoder_layers_per_block`). **Differs from the decoder's
+    /// `layers_per_block`**: the real `dc-ae-f32c32-sana-1.0` config ships `[2, 2, 2, 3, 3, 3]` for the
+    /// encoder vs `[3, 3, 3, 3, 3, 3]` for the decoder (sc-10190, img2img). Consumed by
+    /// [`crate::dc_ae::DcAeEncoder`]; unused by the decode path.
+    pub encoder_layers_per_block: Vec<i32>,
+    pub block_types: Vec<BlockType>,
+    /// One `kernel_size` per multiscale QKV projection in the EfficientViT stages (`[5]` for SANA-1.0).
+    pub qkv_multiscales: Vec<i32>,
+    /// `True` → upsample by nearest-`interpolate` + conv (SANA-1.0). `False` → conv + pixel-shuffle.
+    pub upsample_interpolate: bool,
+    /// RMS-norm epsilon (`1e-5` throughout the decoder).
+    pub norm_eps: f32,
+    /// Linear-attention denominator epsilon (`1e-15`).
+    pub attn_eps: f32,
+    /// VAE latent scaling factor (`z_decode = z / scaling_factor`). Applied by the caller, not the
+    /// decoder, mirroring diffusers `Decoder.forward` (which receives an already-scaled latent).
+    pub scaling_factor: f32,
+}
+
+impl DcAeConfig {
+    /// `mit-han-lab/dc-ae-f32c32-sana-1.0` decoder config.
+    pub fn sana_f32c32() -> Self {
+        use BlockType::{EfficientVit as E, Res as R};
+        Self {
+            in_channels: 3,
+            latent_channels: 32,
+            attention_head_dim: 32,
+            block_out_channels: vec![128, 256, 512, 512, 1024, 1024],
+            layers_per_block: vec![3, 3, 3, 3, 3, 3],
+            // Encoder is shallower in the three ResBlock stages (2 vs 3) per the real config.
+            encoder_layers_per_block: vec![2, 2, 2, 3, 3, 3],
+            block_types: vec![R, R, R, E, E, E],
+            qkv_multiscales: vec![5],
+            upsample_interpolate: true,
+            norm_eps: 1e-5,
+            attn_eps: 1e-15,
+            scaling_factor: 0.41407,
+        }
+    }
+
+    pub fn num_stages(&self) -> usize {
+        self.block_out_channels.len()
+    }
+}
+
+/// SANA Linear-DiT **trunk** configuration (epic 8485, story sc-8487).
+///
+/// Values mirror the diffusers `SanaTransformer2DModel` config for
+/// `Efficient-Large-Model/Sana_1600M_1024px_diffusers` (the 1.6B model Clark Labs ported). Only the
+/// fields the forward needs are modelled; positional embedding is **NoPE** (`interpolation_scale`
+/// is `None` in the real config, so `patch_embed` carries no `pos_embed` and the conv patchify
+/// supplies all locality), and `guidance_embeds`/`qk_norm` are off for SANA-1.6B.
+#[derive(Clone, Debug)]
+pub struct SanaTransformerConfig {
+    /// Latent channels in (DC-AE f32c32 → 32).
+    pub in_channels: i32,
+    /// Latent channels out (== `in_channels` for SANA-1.6B; matches DC-AE decode input).
+    pub out_channels: i32,
+    /// Self-attention heads.
+    pub num_attention_heads: i32,
+    /// Per-head dim of self-attention (`inner_dim = num_attention_heads * attention_head_dim`).
+    pub attention_head_dim: i32,
+    /// Number of `SanaTransformerBlock`s.
+    pub num_layers: i32,
+    /// Cross-attention heads.
+    pub num_cross_attention_heads: i32,
+    /// Per-head dim of cross-attention.
+    pub cross_attention_head_dim: i32,
+    /// Caption (cross-attn KV) embedding channels in (Gemma-2 CHI → 2304).
+    pub caption_channels: i32,
+    /// GLUMBConv Mix-FFN expand ratio (`hidden = int(mlp_ratio * inner_dim)`).
+    pub mlp_ratio: f32,
+    /// Patchify conv kernel/stride (`1` for SANA — DC-AE already did the 32× spatial compression).
+    pub patch_size: i32,
+    /// LayerNorm epsilon for the affine-free norms (`norm1`/`norm2`/`norm_out`).
+    pub norm_eps: f32,
+    /// `caption_norm` RMSNorm epsilon (`1e-5`).
+    pub caption_norm_eps: f32,
+    /// **SANA-Sprint** `qk_norm = "rms_norm_across_heads"` RMSNorm epsilon. diffusers builds the
+    /// attn1/attn2 qk-norm via `Attention.__init__` WITHOUT an explicit `eps`, so it falls back to
+    /// that constructor's default `eps = 1e-5` — distinct from [`Self::norm_eps`] (`1e-6`), which
+    /// only governs the affine-free `norm1`/`norm2`/`norm_out` LayerNorms. Only consulted on the
+    /// qk-norm path when [`Self::qk_norm`] is set.
+    pub attn_qk_norm_eps: f32,
+    /// Linear-attention denominator epsilon (`1e-15`, matching the DC-AE primitive).
+    pub attn_eps: f32,
+    /// **SANA-Sprint** (sc-8490): the transformer carries an extra *guidance embedder* — a
+    /// timestep-embedding-style MLP on the embedded CFG-free guidance scalar, summed into the
+    /// timestep conditioning (`conditioning = timesteps_emb + guidance_emb`). `false` for base
+    /// SANA-1.6B (the trunk is byte-unchanged); `true` for the Sprint distilled variant. When set,
+    /// the trunk's `time_embed.*` keys switch to the `SanaCombinedTimestepGuidanceEmbeddings` layout
+    /// (no `.emb.` nesting; adds `time_embed.guidance_embedder.*`).
+    pub guidance_embeds: bool,
+    /// Sprint `guidance_embeds_scale` (`0.1`) — the pipeline pre-multiplies the guidance scalar by
+    /// this before the embedder. Only consulted when [`Self::guidance_embeds`] is set.
+    pub guidance_embeds_scale: f32,
+    /// **SANA-Sprint** `qk_norm = "rms_norm_across_heads"`: an RMSNorm over the full projected
+    /// query/key (the whole `inner_dim`, applied before the head split and the ReLU) in BOTH `attn1`
+    /// (linear self-attn) and `attn2` (cross-attn). `false` for base SANA-1.6B (`qk_norm = None`),
+    /// `true` for Sprint. When set, the loader requires `attn1.norm_q/k.weight` +
+    /// `attn2.norm_q/k.weight`.
+    pub qk_norm: bool,
+}
+
+impl SanaTransformerConfig {
+    /// `inner_dim = num_attention_heads * attention_head_dim`.
+    pub fn inner_dim(&self) -> i32 {
+        self.num_attention_heads * self.attention_head_dim
+    }
+
+    /// `Efficient-Large-Model/Sana_1600M_1024px_diffusers` transformer config.
+    pub fn sana_1600m() -> Self {
+        Self {
+            in_channels: 32,
+            out_channels: 32,
+            num_attention_heads: 70,
+            attention_head_dim: 32, // inner_dim = 2240
+            num_layers: 20,
+            num_cross_attention_heads: 20,
+            cross_attention_head_dim: 112, // cross inner = 2240
+            caption_channels: 2304,
+            mlp_ratio: 2.5,
+            patch_size: 1,
+            norm_eps: 1e-6,
+            caption_norm_eps: 1e-5,
+            // diffusers builds the (Sprint-only) qk-norm without an explicit eps → Attention's
+            // default 1e-5, distinct from the 1e-6 affine-free LayerNorm eps above.
+            attn_qk_norm_eps: 1e-5,
+            attn_eps: 1e-15,
+            // Base SANA-1.6B has no guidance embedder and no qk-norm — the trunk is byte-unchanged.
+            guidance_embeds: false,
+            guidance_embeds_scale: 0.1,
+            qk_norm: false,
+        }
+    }
+
+    /// `Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers` transformer config (sc-8490): the
+    /// continuous-time-consistency-distilled, CFG-free few-step variant. Same Linear-DiT backbone as
+    /// [`Self::sana_1600m`], plus the Sprint deltas from the HF `transformer/config.json`:
+    /// `guidance_embeds = true`, `guidance_embeds_scale = 0.1`, `qk_norm = "rms_norm_across_heads"`.
+    pub fn sana_sprint_1600m() -> Self {
+        Self {
+            guidance_embeds: true,
+            guidance_embeds_scale: 0.1,
+            qk_norm: true,
+            ..Self::sana_1600m()
+        }
+    }
+}

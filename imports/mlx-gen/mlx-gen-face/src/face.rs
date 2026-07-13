@@ -1,0 +1,358 @@
+//! Unified `FaceAnalysis` — the one entry point that orchestrates the four native sub-models
+//! (sc-3085), mirroring insightface `app.get()` so the PuLID-FLUX (epic 3069) and InstantID
+//! (epic 3061) ports map 1:1. This is the payoff that removes the torch/onnx face stack.
+//!
+//! Pipeline (zero Python):
+//! - [`FaceAnalysis::analyze`]: detector blob (cv2-faithful resize-to-fit 640 + pad + normalize) →
+//!   SCRFD detect ([`crate::scrfd`]) → 5-pt `norm_crop` 112² ([`crate::align`]) → glintr100 embedding
+//!   ([`crate::iresnet`]) → `Vec<Face>` sorted largest-first.
+//! - [`FaceAnalysis::face_features_image`] (PuLID only): facexlib 512² align → BiSeNet parse
+//!   ([`crate::bisenet`]) → background-whitened grayscale.
+//!
+//! ## Parity note (sc-3131)
+//! Detection (bbox/kps) and parsing reproduce the reference exactly. The ArcFace embedding matches
+//! onnx's *canonical* pure-numpy `ReferenceEvaluator` at cos ≥ 0.998 — i.e. the native forward is the
+//! numerically-correct one; insightface's *ONNX Runtime* (CPU/MLAS) output is the one that diverges
+//! (~0.98, deep-conv only). The parity bar is therefore the canonical-math one (sc-3131).
+
+use mlx_gen::weights::Weights;
+use mlx_gen::{Error, Result};
+use mlx_rs::Array;
+
+use crate::bisenet::BiSeNet;
+use crate::iresnet::ArcFace;
+use crate::scrfd::{Detection, Scrfd, DET_SIZE};
+use crate::{align, bisenet};
+
+/// One detected face — mirrors insightface's `Face` fields the consumers use.
+#[derive(Clone, Debug)]
+pub struct Face {
+    /// `[x1, y1, x2, y2]` in original-image pixels.
+    pub bbox: [f32; 4],
+    /// 5 landmarks (L-eye, R-eye, nose, L-mouth, R-mouth) in original-image pixels.
+    pub kps: [[f32; 2]; 5],
+    /// SCRFD detection confidence.
+    pub det_score: f32,
+    /// Raw 512-d glintr100 recognition embedding (un-normalized; L2-normalize for cosine).
+    pub embedding: Vec<f32>,
+}
+
+/// Bounding-box area of a detection (for largest-first ordering).
+fn det_area(d: &Detection) -> f32 {
+    (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1])
+}
+
+/// cv2 `resize` `INTER_LINEAR` for an RGB `u8` HWC image — the SCRFD detector preprocessing.
+/// Faithful fixed-point bilinear: half-pixel source coords `(d+0.5)·scale − 0.5`, weights quantized
+/// to `INTER_RESIZE_COEF_BITS = 11`, two integer passes, `>>22` with rounding (the "interpolation is
+/// a family, match the variant" discipline — cv2's resize fixed-point, distinct from PIL/warpAffine).
+pub fn resize_bilinear_cv2(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Result<Vec<u8>> {
+    const C: usize = 3;
+    // `src` is indexed by `in_h`/`in_w`; reject a mismatched `(buf, h, w)` triple at the entry as a
+    // typed error rather than panic out-of-bounds in the horizontal pass (F-020/L-A).
+    if src.len() < in_h * in_w * C {
+        return Err(Error::Msg(format!(
+            "resize_bilinear_cv2: src buffer of {} bytes too small for {in_h}×{in_w}×3",
+            src.len()
+        )));
+    }
+    const BITS: i64 = 11;
+    const SCALE: f64 = (1i64 << BITS) as f64; // 2048
+
+    // Per-axis taps + 11-bit weights (cvRound, ties-to-even = saturate_cast<short>).
+    let coeffs = |in_n: usize, out_n: usize| {
+        let scale = in_n as f64 / out_n as f64;
+        let mut ofs = Vec::with_capacity(out_n);
+        let mut a = Vec::with_capacity(out_n);
+        for d in 0..out_n {
+            let f = (d as f64 + 0.5) * scale - 0.5;
+            let mut s = f.floor() as i64;
+            let mut fr = f - s as f64;
+            if s < 0 {
+                s = 0;
+                fr = 0.0;
+            }
+            if s >= in_n as i64 - 1 {
+                s = in_n as i64 - 1;
+                fr = 0.0;
+            }
+            let s1 = (s + 1).min(in_n as i64 - 1);
+            let w1 = (fr * SCALE).round_ties_even() as i64;
+            let w0 = ((1.0 - fr) * SCALE).round_ties_even() as i64;
+            ofs.push((s as usize, s1 as usize));
+            a.push((w0, w1));
+        }
+        (ofs, a)
+    };
+
+    let (xofs, xa) = coeffs(in_w, out_w);
+    let (yofs, ya) = coeffs(in_h, out_h);
+
+    // The vertical pass only reads the source rows named in `yofs` (≤ 2·out_h distinct), so the
+    // horizontal pass resamples just those rows — not all `in_h` — and `hbuf` is sized to match
+    // (cv2's 2-row ring buffer; F-088). For a 4000-px-tall image downscaled to ≤640 this avoids a
+    // ~61 MB i64 buffer and ~3× the work. `row_of` maps a source row to its compact `hbuf` index.
+    let mut needed: Vec<usize> = yofs.iter().flat_map(|&(s0, s1)| [s0, s1]).collect();
+    needed.sort_unstable();
+    needed.dedup();
+    let mut row_of = vec![usize::MAX; in_h];
+    for (hi, &sy) in needed.iter().enumerate() {
+        row_of[sy] = hi;
+    }
+
+    // Horizontal pass over the needed source rows → int (value·2048).
+    let mut hbuf = vec![0i64; needed.len() * out_w * C];
+    for (hi, &sy) in needed.iter().enumerate() {
+        for (dx, (&(sx, sx1), &(w0, w1))) in xofs.iter().zip(&xa).enumerate() {
+            for ch in 0..C {
+                hbuf[(hi * out_w + dx) * C + ch] = src[(sy * in_w + sx) * C + ch] as i64 * w0
+                    + src[(sy * in_w + sx1) * C + ch] as i64 * w1;
+            }
+        }
+    }
+
+    // Vertical pass → uint8, (acc + 2^21) >> 22.
+    let mut out = vec![0u8; out_h * out_w * C];
+    for (dy, (&(sy0, sy1), &(v0, v1))) in yofs.iter().zip(&ya).enumerate() {
+        let (r0, r1) = (row_of[sy0], row_of[sy1]);
+        for dx in 0..out_w {
+            for ch in 0..C {
+                let acc =
+                    hbuf[(r0 * out_w + dx) * C + ch] * v0 + hbuf[(r1 * out_w + dx) * C + ch] * v1;
+                out[(dy * out_w + dx) * C + ch] = (((acc + (1 << 21)) >> 22).clamp(0, 255)) as u8;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Build the SCRFD detector blob from an RGB `u8` image: insightface-faithful resize-to-fit 640
+/// (aspect-preserving) → top-left pad to 640² → `(rgb − 127.5) / 128`. Returns the NHWC
+/// `[1,640,640,3]` f32 blob and `det_scale` (= `new_h / h`).
+pub fn detector_blob(img: &[u8], h: usize, w: usize) -> Result<(Array, f32)> {
+    // `img` is resized/indexed by `h`/`w`; reject a mismatched `(buf, h, w)` triple at the entry as a
+    // typed error (F-020/L-A) — guards direct callers of this pub primitive.
+    if img.len() < h * w * 3 {
+        return Err(Error::Msg(format!(
+            "detector_blob: img buffer of {} bytes too small for {h}×{w}×3",
+            img.len()
+        )));
+    }
+    let det = DET_SIZE as usize;
+    let im_ratio = h as f64 / w as f64;
+    // F-101: an extreme aspect ratio truncates the short side to 0 (e.g. a very wide image →
+    // `det * im_ratio` floors to 0), which would make `det_scale == 0` and drive `coords / det_scale`
+    // to ±inf downstream. Clamp both edges to at least 1 px.
+    let (new_w, new_h) = if im_ratio > 1.0 {
+        (((det as f64 / im_ratio) as usize).max(1), det)
+    } else {
+        (det, ((det as f64 * im_ratio) as usize).max(1))
+    };
+    let det_scale = new_h as f32 / h as f32;
+    let resized = resize_bilinear_cv2(img, h, w, new_h, new_w)?;
+
+    // top-left into a 640² canvas; normalize (rgb-127.5)/128.
+    let mut blob = vec![0f32; det * det * 3];
+    let norm = |v: u8| (v as f32 - 127.5) / 128.0;
+    let pad0 = norm(0); // padded region = normalized 0
+    for v in blob.iter_mut() {
+        *v = pad0;
+    }
+    for y in 0..new_h {
+        for x in 0..new_w {
+            for ch in 0..3 {
+                blob[(y * det + x) * 3 + ch] = norm(resized[(y * new_w + x) * 3 + ch]);
+            }
+        }
+    }
+    Ok((
+        Array::from_slice(&blob, &[1, det as i32, det as i32, 3]),
+        det_scale,
+    ))
+}
+
+/// The native face-analysis stack: SCRFD + ArcFace (+ optional BiSeNet for the PuLID crop path).
+pub struct FaceAnalysis {
+    scrfd: Scrfd,
+    arcface: ArcFace,
+    parser: Option<BiSeNet>,
+    /// Detection score / NMS thresholds (insightface defaults: 0.5 / 0.4).
+    pub det_thresh: f32,
+    pub nms_thresh: f32,
+}
+
+impl FaceAnalysis {
+    /// Load the detection + recognition stack (the InstantID / ArcFace path). For the PuLID crop
+    /// path, add the parser with [`FaceAnalysis::with_parser`].
+    pub fn load(scrfd_weights: &Weights, arcface_weights: &Weights) -> Result<Self> {
+        Ok(Self {
+            scrfd: Scrfd::from_weights(scrfd_weights)?,
+            arcface: ArcFace::from_weights(arcface_weights)?,
+            parser: None,
+            det_thresh: 0.5,
+            nms_thresh: 0.4,
+        })
+    }
+
+    /// Attach the BiSeNet parser (enables [`FaceAnalysis::face_features_image`]).
+    pub fn with_parser(mut self, bisenet_weights: &Weights) -> Result<Self> {
+        self.parser = Some(BiSeNet::from_weights(bisenet_weights)?);
+        Ok(self)
+    }
+
+    /// Detect every face in an RGB `u8` image and return the detections sorted **largest-first**
+    /// (insightface `app.get()` order). No ArcFace recognition forward is run — consumers that need
+    /// only the box/landmarks (e.g. InstantID's `restore_face`, or picking the largest face before
+    /// embedding just that one) use this and skip embedding every detection (F-090). `h`/`w` are the
+    /// image dimensions.
+    pub fn detect(&self, img: &[u8], h: usize, w: usize) -> Result<Vec<Detection>> {
+        // A zero dimension passes the `len() < h*w*3` check below (`h*w*3 == 0`) but makes
+        // `detector_blob` compute `det_scale = new_h / 0 = NaN`, which contaminates every bbox/kps
+        // coordinate downstream. Reject it first (F-030).
+        if h == 0 || w == 0 {
+            return Err(Error::Msg(format!(
+                "face detect: image has a zero dimension ({h}×{w})"
+            )));
+        }
+        // The worker hands us a decoded buffer plus `(h, w)`; a mismatch would index out of bounds in
+        // the detector primitives. Reject it with a typed error rather than crash generation (F-081).
+        if img.len() < h * w * 3 {
+            return Err(Error::Msg(format!(
+                "face detect: img buffer of {} bytes too small for {h}×{w}×3",
+                img.len()
+            )));
+        }
+        let (blob, det_scale) = detector_blob(img, h, w)?;
+        let mut dets = self
+            .scrfd
+            .detect(&blob, det_scale, self.det_thresh, self.nms_thresh)?;
+        dets.sort_by(|a, b| det_area(b).total_cmp(&det_area(a)));
+        Ok(dets)
+    }
+
+    /// Align + ArcFace-embed a single [`detect`](Self::detect) result into a [`Face`]. Use this for
+    /// embed-on-demand — when only one face's identity is needed (e.g. the largest), this runs a single
+    /// `[1,112,112,3]` recognition forward instead of embedding every detection (F-090).
+    pub fn embed(&self, img: &[u8], h: usize, w: usize, det: &Detection) -> Result<Face> {
+        let crop = align::norm_crop(img, h, w, &det.kps)?;
+        let emb = self.arcface.forward(&align::to_arcface_input(&[crop])?)?;
+        Ok(Face {
+            bbox: det.bbox,
+            kps: det.kps,
+            det_score: det.score,
+            embedding: emb
+                .try_as_slice::<f32>()
+                .map_err(|e| format!("embedding readback: {e}"))?
+                .to_vec(),
+        })
+    }
+
+    /// Detect → align → embed every face in an RGB `u8` image, sorted **largest-first** (insightface
+    /// `app.get()` order — PuLID uses `[0]`, the max face). `h`/`w` are the image dimensions. Callers
+    /// that need only one face's identity should prefer [`detect`](Self::detect) + [`embed`](Self::embed).
+    pub fn analyze(&self, img: &[u8], h: usize, w: usize) -> Result<Vec<Face>> {
+        let dets = self.detect(img, h, w)?;
+        if dets.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Warp every detected face, then run ONE batched `[N,112,112,3]` ArcFace forward instead of N
+        // sequential iresnet100 GPU dispatches (F-089). iresnet100 inference has no cross-batch ops
+        // (its BatchNorms are folded into per-channel affines), so each `[N,512]` row is bit-identical
+        // to the per-face forward. `dets` is already area-sorted, so the rows come out largest-first.
+        let crops: Vec<Vec<u8>> = dets
+            .iter()
+            .map(|d| align::norm_crop(img, h, w, &d.kps))
+            .collect::<Result<Vec<_>>>()?;
+        let emb = self.arcface.forward(&align::to_arcface_input(&crops)?)?;
+        let emb = emb
+            .try_as_slice::<f32>()
+            .map_err(|e| format!("embedding readback: {e}"))?;
+        let dim = emb.len() / dets.len(); // [N, 512] → 512 per row
+
+        Ok(dets
+            .iter()
+            .enumerate()
+            .map(|(i, d)| Face {
+                bbox: d.bbox,
+                kps: d.kps,
+                det_score: d.score,
+                embedding: emb[i * dim..(i + 1) * dim].to_vec(),
+            })
+            .collect())
+    }
+
+    /// PuLID `face_features_image`: facexlib 512² align of `face` → BiSeNet parse → background
+    /// whitened, foreground grayscale. NHWC `[1,512,512,3]` f32. Requires [`FaceAnalysis::with_parser`].
+    pub fn face_features_image(
+        &self,
+        img: &[u8],
+        h: usize,
+        w: usize,
+        face: &Face,
+    ) -> Result<Array> {
+        let parser = self.parser.as_ref().ok_or_else(|| {
+            "face_features_image requires a BiSeNet parser (with_parser)".to_string()
+        })?;
+        let crop = align::align_face_512(img, h, w, &face.kps)?; // 512² RGB u8
+        let rgb01 = u8_to_rgb01(&crop, 512, 512);
+        let mask = parser.parse_mask(&bisenet::to_parse_input(&rgb01)?)?;
+        bisenet::face_features_image(&rgb01, &mask)
+    }
+}
+
+/// RGB `u8` HWC → NHWC `[1,H,W,3]` f32 in `[0,1]`.
+fn u8_to_rgb01(crop: &[u8], h: i32, w: i32) -> Array {
+    let data: Vec<f32> = crop.iter().map(|&v| v as f32 / 255.0).collect();
+    Array::from_slice(&data, &[1, h, w, 3])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-081: `resize_bilinear_cv2` indexes `src` by `in_h`/`in_w`; a buffer too small for the claimed
+    /// dims is caught at the entry, not as an opaque out-of-bounds in the horizontal pass.
+    #[test]
+    fn resize_rejects_undersized_buffer() {
+        let src = vec![0u8; 4 * 4 * 3 - 1]; // one byte short of 4×4×3
+        let err = resize_bilinear_cv2(&src, 4, 4, 8, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too small for 4×4×3"), "got: {err}");
+    }
+
+    /// A correctly-sized buffer resizes to the requested `out_h × out_w × 3`.
+    #[test]
+    fn resize_accepts_matched_buffer() {
+        let src = vec![128u8; 4 * 4 * 3];
+        let out = resize_bilinear_cv2(&src, 4, 4, 8, 8).unwrap();
+        assert_eq!(out.len(), 8 * 8 * 3);
+    }
+
+    /// F-088: resizing to the same size is a bit-exact passthrough (coeffs reduce to weight 2048/0),
+    /// so the row-subsetting must not perturb any pixel.
+    #[test]
+    fn resize_same_size_is_identity() {
+        let src: Vec<u8> = (0..5 * 3 * 3).map(|i| (i * 37 % 256) as u8).collect();
+        let out = resize_bilinear_cv2(&src, 5, 3, 5, 3).unwrap();
+        assert_eq!(out, src);
+    }
+
+    /// F-088: a tall constant image downscaled exercises the row-subsetting path (in_h ≫ out_h) and
+    /// must still produce the constant everywhere — a regression in the needed-rows remap would corrupt
+    /// it (e.g. an unmapped `usize::MAX` row index would panic / read garbage).
+    #[test]
+    fn resize_constant_preserved_on_tall_downscale() {
+        let (in_h, w) = (200usize, 4usize);
+        let src = vec![123u8; in_h * w * 3];
+        let out = resize_bilinear_cv2(&src, in_h, w, 8, w).unwrap();
+        assert_eq!(out.len(), 8 * w * 3);
+        assert!(out.iter().all(|&v| v == 123), "constant must be preserved");
+    }
+}

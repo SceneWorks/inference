@@ -1,0 +1,29 @@
+[package]
+name = "sceneworks-gen-core"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-neutral generative-model contract layer (zero tensor deps) shared by mlx-gen and candle-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["diffusion", "inference", "generative", "contract"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core::…` regardless of the (unique, publishable) package name.
+name = "gen_core"
+
+[dependencies]
+# Shared pins live in the workspace root [workspace.dependencies] (F-151). gen-core deliberately
+# depends on NOTHING tensor-related — thiserror (error), inventory (registry), tokenizers (text).
+thiserror = { workspace = true }
+inventory = { workspace = true }
+tokenizers = { workspace = true }
+# Neutral safetensors header/byte-view reader for the weights-metadata layer (sc-3722). NOT a tensor
+# dep — exposes keys/dtypes/shapes/raw bytes only.
+safetensors = { workspace = true }
+# JSON parse for the PEFT/diffusers `lora_adapter_metadata` header blob in weightsmeta (sc-5513).
+serde_json = { workspace = true }
+# The independent LLM-serving contract (epic 7153, sc-7189). gen-core re-exports it as
+# `gen_core::core_llm` so the gen-ai side consumes the unified `core_llm::TextLlm` engine. core-llm is
+# itself tensor-free, so depending on it keeps gen-core's zero-tensor invariant intact.
+core-llm = { workspace = true }

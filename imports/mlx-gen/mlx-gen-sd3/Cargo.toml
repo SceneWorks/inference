@@ -1,0 +1,33 @@
+[package]
+name = "mlx-gen-sd3"
+version = "0.0.0"
+edition = "2021"
+description = "Stable Diffusion 3.5 (MMDiT) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "stable-diffusion-3", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# E2 (sc-7861) REUSES sibling encoder crates — SD3.5 ships no net-new text encoder:
+#   * mlx-gen-sdxl: the CLIP text encoder, loaded twice (CLIP-L `text_encoder` + CLIP-G/OpenCLIP
+#     bigG `text_encoder_2`). SD3's CLIP-L config differs only by gaining a 768 text projection.
+#   * mlx-gen-flux: the T5-XXL encoder (`text_encoder_3`), identical to FLUX's T5.
+mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
+mlx-gen-flux = { path = "../mlx-gen-flux" }
+# SD3.5's 16-channel VAE is structurally a near-exact match for Z-Image's diffusers `AutoencoderKL`
+# (16-ch latents, GroupNorm-32, [128,256,512,512] blocks, layers_per_block 2, with a parameterized
+# latent scale/shift de-norm). E4 (sc-7863) REUSES that module — the `Vae` AutoencoderKL + the
+# diffusers→MLX VAE key remap — and plugs SD3.5's own 1.5305 / 0.0609 factors, rather than
+# re-implementing or borrowing flux2's 32-ch/packed VAE (wrong family). Mirrors how -kolors/-instantid
+# build on -sdxl and -pulid builds on -flux.
+mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time self-registration into mlx-gen's model registry (wired by the later E5 model story).
+inventory = { workspace = true }
+# Parse the diffusers `transformer/config.json` arch manifest in the converter / validator.
+serde_json = { workspace = true }
+# Decode the LoRA-training dataset images (T2 sc-7883). Also serves the e2e smoke PNG save in tests.
+image = { workspace = true }

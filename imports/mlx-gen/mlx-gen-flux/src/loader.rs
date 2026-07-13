@@ -1,0 +1,161 @@
+//! Snapshot-layout helpers for FLUX.1. The full checkpoint tree mirrors diffusers/mflux:
+//! `tokenizer/`, `tokenizer_2/`, `text_encoder/`, `text_encoder_2/`, `transformer/`, `vae/`.
+
+use std::path::Path;
+
+use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use mlx_gen::weights::Weights;
+use mlx_gen::{Result, WeightsSource};
+use mlx_gen_z_image::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
+
+use crate::config::{FluxTokenizerKind, FluxVariant};
+use crate::control_transformer::{FluxControlNet, FluxControlNetConfig, FluxControlTransformer};
+use crate::image_encoder::FluxIpImageEncoder;
+use crate::ip_adapter::FluxIpAdapter;
+use crate::text_encoder::{ClipTextEncoder, T5TextEncoder};
+use crate::transformer::{FluxTransformer, FluxTransformerConfig};
+
+/// Load the CLIP tokenizer. **Vendored** — the HF-faithful `clip_tokenizer.json` is compiled into the
+/// crate (sc-2787), NOT read from the snapshot: the FLUX repo ships CLIP only as `vocab.json` +
+/// `merges.txt`, which the core byte-level path mis-tokenizes (silently corrupting the pooled
+/// conditioning). So this takes **no snapshot path** — a customized `tokenizer/vocab.json` in the
+/// snapshot is intentionally NOT consulted (F-105).
+pub fn load_clip_tokenizer() -> Result<TextTokenizer> {
+    build_clip_tokenizer()
+}
+
+/// The vendored CLIP tokenizer build (shared by [`load_clip_tokenizer`] and the `Clip` arm of
+/// [`load_tokenizer`]). `max_length` is CLIP's fixed 77 (variant-independent).
+fn build_clip_tokenizer() -> Result<TextTokenizer> {
+    let config = TokenizerConfig {
+        max_length: FluxTokenizerKind::Clip.max_length(FluxVariant::Schnell), // 77, variant-independent
+        pad_token_id: FluxTokenizerKind::Clip.pad_token_id(),
+        chat_template: ChatTemplate::None,
+        pad_to_max_length: true,
+    };
+    // The FLUX repo ships CLIP only as `vocab.json`+`merges.txt` (no `tokenizer.json`), and the core
+    // byte-level `from_clip_bpe` mis-tokenizes CLIP (GPT-2 byte-level vs CLIP's lowercased word-BPE
+    // with `</w>`), silently corrupting the pooled conditioning on every render (sc-2787). Load the
+    // vendored, HF-faithful CLIP `tokenizer.json` compiled into the crate and NEVER fall back to the
+    // broken path — a missing/invalid asset errors loudly.
+    const CLIP_TOKENIZER_JSON: &str = include_str!("../assets/clip_tokenizer.json");
+    Ok(TextTokenizer::from_json_str(CLIP_TOKENIZER_JSON, config)?)
+}
+
+pub fn load_t5_tokenizer(root: &Path, variant: FluxVariant) -> Result<TextTokenizer> {
+    load_tokenizer(root, FluxTokenizerKind::T5, variant)
+}
+
+pub fn load_clip_encoder(root: &Path) -> Result<ClipTextEncoder> {
+    let w = Weights::from_dir(root.join("text_encoder"))?;
+    ClipTextEncoder::from_weights(&w, "")
+}
+
+pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
+    let w = Weights::from_dir(root.join("text_encoder_2"))?;
+    T5TextEncoder::from_weights(&w, "")
+}
+
+pub fn load_transformer(root: &Path, variant: FluxVariant) -> Result<FluxTransformer> {
+    let w = Weights::from_dir(root.join("transformer"))?;
+    FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))
+}
+
+/// Load the FLUX.1-dev base transformer + the Shakker Fun-Controlnet-Union control branch and assemble
+/// the [`FluxControlTransformer`] (sc-8238). `root` is the FLUX.1-dev snapshot dir (the base
+/// `transformer/`); `control` is the Shakker `FLUX.1-dev-ControlNet-Union-Pro-2.0` checkpoint (a single
+/// `diffusion_pytorch_model.safetensors` `File`, or a `Dir`). The control checkpoint reuses the base
+/// FLUX block key names (it is a partial copy of the FLUX transformer — `transformer_blocks.{i}.*` incl.
+/// `attn.to_out.0`), so the shared [`JointBlock`](crate::transformer) loader reads it un-aliased.
+pub fn load_control_transformer_dev(
+    root: &Path,
+    control: &WeightsSource,
+) -> Result<FluxControlTransformer> {
+    let base = load_transformer(root, FluxVariant::Dev)?;
+    let control_weights = match control {
+        WeightsSource::File(p) => Weights::from_file(p)?,
+        WeightsSource::Dir(p) => Weights::from_dir(p)?,
+    };
+    let branch = FluxControlNet::from_weights(
+        &control_weights,
+        "",
+        &FluxControlNetConfig::shakker_union_pro_2_0(),
+    )?;
+    Ok(FluxControlTransformer::new(base, branch))
+}
+
+/// Load the XLabs FLUX IP-Adapter (epic 3621) from a directory containing the adapter weights and a
+/// CLIP-ViT-L/14 image tower. The layout mirrors SDXL's `LoadSpec::ip_adapter` contract (the dir
+/// carries both the adapter and its image encoder):
+///
+/// ```text
+/// <dir>/ip_adapter.safetensors            # XLabs-AI/flux-ip-adapter
+/// <dir>/image_encoder/model.safetensors   # openai/clip-vit-large-patch14 (vision tower)
+/// ```
+///
+/// SceneWorks stages the CLIP tower next to the adapter (sc-3625); the engine only resolves the two
+/// files here. Returns the image encoder (sc-3622) and the adapter modules (sc-3623).
+pub fn load_flux_ip_adapter(dir: &Path) -> Result<(FluxIpImageEncoder, FluxIpAdapter)> {
+    let adapter =
+        FluxIpAdapter::from_weights(&Weights::from_file(dir.join("ip_adapter.safetensors"))?)?;
+    let encoder = FluxIpImageEncoder::from_weights(&Weights::from_file(
+        dir.join("image_encoder/model.safetensors"),
+    )?)?;
+    Ok((encoder, adapter))
+}
+
+/// Remap the raw VAE keys and build the Z-Image-config [`Vae`] (decoder + encoder). The shared body
+/// of [`load_vae`] / [`load_vae_from_source`], which differ only in how the `Weights` are sourced
+/// (sharded dir vs single file) (6941).
+fn vae_from_weights(mut w: Weights) -> Result<Vae> {
+    remap_vae_decoder(&mut w)?;
+    remap_vae_encoder(&mut w)?;
+    Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
+        &w,
+        "encoder",
+        &VaeEncoderConfig::default_z_image(),
+    )
+}
+
+pub fn load_vae(root: &Path) -> Result<Vae> {
+    vae_from_weights(Weights::from_dir(root.join("vae"))?)
+}
+
+pub fn load_vae_from_source(source: &WeightsSource) -> Result<Vae> {
+    match source {
+        WeightsSource::Dir(root) => load_vae(root),
+        WeightsSource::File(path) => vae_from_weights(Weights::from_file(path)?),
+    }
+}
+
+// F-086: the diffusers→NHWC decoder/encoder key remaps were line-for-line duplicated in the Boogu
+// loader; both delegate to the shared `mlx_gen_z_image::loader::{remap_vae_decoder, remap_vae_encoder}`
+// (byte-identical key set — same 6 conv/norm rename arms + same `.conv1./.conv2./.conv_shortcut./
+// {up,down}samplers.0.conv.` conv-weight transpose rule; the encoder keeps its `encoder.` prefix, the
+// decoder drops `decoder.`). Kept as `pub` re-exporting wrappers so this crate's API surface is stable.
+pub use mlx_gen_z_image::loader::{remap_vae_decoder, remap_vae_encoder};
+
+fn load_tokenizer(
+    root: &Path,
+    kind: FluxTokenizerKind,
+    variant: FluxVariant,
+) -> Result<TextTokenizer> {
+    let config = TokenizerConfig {
+        max_length: kind.max_length(variant),
+        pad_token_id: kind.pad_token_id(),
+        chat_template: ChatTemplate::None,
+        pad_to_max_length: true,
+    };
+    match kind {
+        // CLIP is vendored (compiled-in), independent of `root`/`variant` — see [`build_clip_tokenizer`].
+        FluxTokenizerKind::Clip => build_clip_tokenizer(),
+        FluxTokenizerKind::T5 => {
+            // T5 ships a real `tokenizer.json` in `tokenizer_2/` (verified fork-identical); use it,
+            // erroring loudly if absent rather than guessing.
+            Ok(TextTokenizer::from_file(
+                root.join(kind.subdir()).join("tokenizer.json"),
+                config,
+            )?)
+        }
+    }
+}

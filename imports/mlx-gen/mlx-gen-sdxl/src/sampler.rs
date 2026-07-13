@@ -1,0 +1,516 @@
+//! SDXL sampler — port of the vendored `_vendor/mlx_sd/sampler.py`
+//! `SimpleEulerSampler` / `SimpleEulerAncestralSampler`. SDXL's `StableDiffusionXL` uses the
+//! **ancestral** variant. The noise schedule comes from the `scaled_linear` betas; `sigmas` is a
+//! 1001-entry table (a leading 0 + 1000 training-step sigmas). Per-step `sigma(t)` is a linear
+//! interpolation of the table at the (float) time `t`.
+//!
+//! The ancestral step draws fresh noise from the **global** MLX RNG each step (seeded once at the
+//! start of generation). `mlx.random.normal` is f32 regardless of the model's compute dtype, so the
+//! draw sequence is precision-independent — running the Rust pipeline f32 reproduces the reference's
+//! exact noise stream for a given seed (validated by the e2e gate, sc-2400 S5).
+
+use mlx_rs::ops::multiply;
+use mlx_rs::{random, Array, Dtype};
+
+use mlx_gen::array::scalar;
+use mlx_gen::{DiffusionSampler, Error, Result};
+
+use crate::config::{BetaSchedule, DiffusionConfig};
+
+/// Round a host f32 to fp16 precision (round-to-nearest-even) and back, via MLX — so the value is
+/// the exact one the reference sees after `…astype(mx.float16)`. Used to reproduce the vendored
+/// `float16=True` schedule (`_linspace(...).astype(float16)`, the f16 interp `delta_x`) where a
+/// straight host-f32 value would be 1 ULP off and the chaos-sensitive ancestral sampler amplifies it.
+///
+/// Returns `Err` on an MLX cast failure — never the un-rounded `v`. A silently un-rounded timestep is
+/// 1 ULP off and seeds the chaotic ancestral trajectory (sc-2400 S6), i.e. the exact silent parity
+/// break this rounding exists to prevent; surface it loudly instead.
+fn round_to_f16(v: f32) -> Result<f32> {
+    let f16 = Array::from_slice(&[v], &[1]).as_dtype(Dtype::Float16)?;
+    let f32 = f16.as_dtype(Dtype::Float32)?;
+    Ok(f32.as_slice::<f32>()[0])
+}
+
+/// A discrete Euler / Euler-Ancestral sampler over a precomputed sigma table.
+pub struct EulerSampler {
+    /// `[0, σ_1, …, σ_1000]` (length `num_train_steps + 1`).
+    sigmas: Vec<f32>,
+    ancestral: bool,
+    /// Compute dtype of the denoise (the reference's `self.dtype`): `Float16` for the production
+    /// `float16=True` path, `Float32` for the tight stage gate. Drives the prior cast, the f16 step,
+    /// and the f16-rounded timestep schedule.
+    dtype: Dtype,
+}
+
+impl EulerSampler {
+    /// Build the sampler from a [`DiffusionConfig`] at f32. `ancestral` selects the
+    /// `SimpleEulerAncestralSampler` step (SDXL) vs the plain Euler step.
+    pub fn new(cfg: &DiffusionConfig, ancestral: bool) -> Result<Self> {
+        Self::new_with_dtype(cfg, ancestral, Dtype::Float32)
+    }
+
+    /// Build the sampler at a given compute `dtype` (the vendored `self.dtype` — `float16` for the
+    /// production path). The sigma table is always built in f32; `dtype` governs the per-step math.
+    /// Returns `Err` if the MLX sigma-table construction fails, so the registry `load` path can
+    /// surface it instead of panicking.
+    pub fn new_with_dtype(cfg: &DiffusionConfig, ancestral: bool, dtype: Dtype) -> Result<Self> {
+        let mut s = Self::try_new(cfg, ancestral)?;
+        s.dtype = dtype;
+        Ok(s)
+    }
+
+    /// The sigma table is built with **MLX ops** (`cumprod`/`sqrt`/`square`), not host f32, so it is
+    /// bit-identical to the reference `_sigmas` — a host cumprod over 1000 steps differs by ~2e-7,
+    /// and that is the only remaining chaos seed once the U-Net is bit-exact (sc-2400 S5). `_linspace`
+    /// (the vendored `arange/(N-1)·(b−a)+a`) is reproduced exactly, with the `**0.5` taken in f64
+    /// (matching python) before the f32 array math.
+    pub fn try_new(cfg: &DiffusionConfig, ancestral: bool) -> Result<Self> {
+        use mlx_rs::ops::{add, concatenate_axis, divide, multiply, sqrt, square, subtract, zeros};
+        let n = cfg.num_train_steps as i32;
+        // _linspace(a, b, n) = arange(n)/(n-1) · (b−a) + a, as f32 arrays.
+        let arange: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let x = divide(Array::from_slice(&arange, &[n]), scalar((n - 1) as f32))?;
+        let betas = match cfg.beta_schedule {
+            BetaSchedule::ScaledLinear => {
+                let (a, b) = ((cfg.beta_start as f64).sqrt(), (cfg.beta_end as f64).sqrt());
+                let lin = add(&multiply(&x, scalar((b - a) as f32))?, scalar(a as f32))?;
+                square(&lin)?
+            }
+            BetaSchedule::Linear => {
+                let (a, b) = (cfg.beta_start as f64, cfg.beta_end as f64);
+                add(&multiply(&x, scalar((b - a) as f32))?, scalar(a as f32))?
+            }
+        };
+        // alphas_cumprod = cumprod(1 − betas); sigmas = concat([0], sqrt((1−acp)/acp)).
+        let alphas = subtract(scalar(1.0), &betas)?;
+        let acp = alphas.cumprod(0, false, true)?;
+        let body = sqrt(&divide(&subtract(scalar(1.0), &acp)?, &acp)?)?;
+        let table = concatenate_axis(&[&zeros::<f32>(&[1])?, &body], 0)?;
+        let sigmas = table.as_slice::<f32>().to_vec();
+        Ok(Self {
+            sigmas,
+            ancestral,
+            dtype: Dtype::Float32,
+        })
+    }
+
+    /// The maximum (start) time index: `len(sigmas) - 1` = `num_train_steps`.
+    pub fn max_time(&self) -> f32 {
+        (self.sigmas.len() - 1) as f32
+    }
+
+    /// Linearly interpolate the sigma table at the (float) time `t` (the vendored `_interp`), host
+    /// f32. Used in tests; the denoise math uses [`Self::sigma_arr`] so the
+    /// interp runs through MLX (bit-exact to the reference at non-integer `t` — sc-2400 S6).
+    pub fn sigma(&self, t: f32) -> f32 {
+        let last = self.sigmas.len() - 1;
+        let lo = (t as usize).min(last);
+        let hi = (lo + 1).min(last);
+        let delta = t - lo as f32;
+        self.sigmas[lo] * (1.0 - delta) + delta * self.sigmas[hi]
+    }
+
+    /// `σ(t)` as an MLX scalar via the reference's `_interp` op order — `y_lo·(1−δ) + δ·y_hi`, with
+    /// the f32 sigma table dominating the products. At integer `t` (δ=0) this equals `sigmas[t]`; at
+    /// the non-integer `t` of an inexact-fraction schedule the MLX interp is bit-exact to the
+    /// reference where host f32 diverges by 1 ULP and the ancestral sampler amplifies it.
+    ///
+    /// `delta_f16`: when the timestep came from the **f16** schedule (the `float16=True` denoise
+    /// loop), the reference's `_interp` computes `delta_x` and `1 − delta_x` in f16 (its `x_new` is
+    /// f16) before promoting to f32 against the table — reproduce that f16 rounding. For a raw-f32 `t`
+    /// (e.g. img2img `add_noise`'s `start_step`) it stays f32.
+    fn sigma_arr(&self, t: f32, delta_f16: bool) -> Result<Array> {
+        use mlx_rs::ops::{add, multiply};
+        let last = self.sigmas.len() - 1;
+        let lo = (t as usize).min(last);
+        let hi = (lo + 1).min(last);
+        let raw = t - lo as f32;
+        let (delta, one_minus) = if delta_f16 {
+            let d = round_to_f16(raw)?;
+            (d, round_to_f16(1.0 - d)?)
+        } else {
+            (raw, 1.0 - raw)
+        };
+        let y_lo = scalar(self.sigmas[lo]);
+        let y_hi = scalar(self.sigmas[hi]);
+        Ok(add(
+            &multiply(&y_lo, scalar(one_minus))?,
+            &multiply(scalar(delta), &y_hi)?,
+        )?)
+    }
+
+    /// The `(t, t_prev)` step pairs: `_linspace(start_time, 0, num_steps + 1)` zipped with its tail.
+    ///
+    /// Op order matches the vendored `_linspace` EXACTLY: `x = arange/(n)`, then `(0−start)·x +
+    /// start` — NOT `start + (0−start)·i/n` (which divides last). `i/n` is f32-inexact (e.g. 1/5),
+    /// so the two orders differ by 1 ULP in the timestep `t`, and a 1-ULP `t` shifts the U-Net's
+    /// sinusoidal embedding enough to seed the chaotic ancestral trajectory (sc-2400 S6).
+    pub fn timesteps(&self, num_steps: usize, start_time: f32) -> Result<Vec<(f32, f32)>> {
+        let n = num_steps as f32;
+        let mut steps: Vec<f32> = (0..=num_steps)
+            .map(|i| {
+                let x = i as f32 / n; // arange/(num_steps) first, matching _linspace
+                (0.0 - start_time) * x + start_time
+            })
+            .collect();
+        // The `float16=True` schedule is `_linspace(...).astype(float16)` — the timesteps themselves
+        // are f16. Round each so the U-Net's sinusoidal embedding and the sigma interp see the exact
+        // f16 `t` the reference does (a 1-ULP `t` seeds the chaotic ancestral trajectory — sc-2400 S6).
+        if self.dtype == Dtype::Float16 {
+            for s in &mut steps {
+                *s = round_to_f16(*s)?;
+            }
+        }
+        Ok(steps.windows(2).map(|w| (w[0], w[1])).collect())
+    }
+
+    /// Sample the prior latents `noise · σ_last · (σ_last² + 1).rsqrt()` (f32, global RNG). `shape`
+    /// is NHWC `[B, H/8, W/8, 4]`.
+    ///
+    /// The scale path **byte-matches the reference's exact op order**: `(noise · σ_last) ·
+    /// rsqrt(σ_last²+1)` — two left-to-right array multiplies, NOT `noise · (σ_last · rsqrt(…))`.
+    /// f32 multiply is non-associative, so precomputing the scalar `σ_last·rsqrt(…)` first differs by
+    /// 1 ULP (~1e-7). Fed through the (bit-exact) ancestral trajectory at CFG=7, that single-ULP
+    /// prior perturbation is the *only* remaining chaos seed once the U-Net + sigma table are
+    /// bit-exact, and alone it moves the full render from pixel-parity to ~34% px>8 (sc-2400 S5).
+    /// The host `powf(-0.5)`→MLX `rsqrt` swap matters for the same reason. (The per-step `step()` math
+    /// stays host f32 — already bit-exact, proven by `denoise_per_step_matches_golden`.)
+    pub fn sample_prior(&self, shape: &[i32]) -> Result<Array> {
+        let noise = random::normal::<f32>(shape, None, None, None)?;
+        self.scale_prior_noise(&noise)
+    }
+
+    /// Scale already-drawn unit-normal `noise` into the prior latent space — the scaling half of
+    /// [`Self::sample_prior`], split out so the generic [`mlx_gen::DiffusionSampler`] denoise loop
+    /// can draw the noise itself and still reproduce the reference's exact op order. The two are
+    /// bit-identical (`sample_prior` = draw + `scale_prior_noise`).
+    ///
+    /// `(noise · σ_last) · rsqrt(σ_last²+1)` — reference order, in f32, then cast to the compute
+    /// dtype (the reference's `.astype(dtype)`), so a `float16=True` denoise starts from f16 latents.
+    pub fn scale_prior_noise(&self, noise: &Array) -> Result<Array> {
+        use mlx_rs::ops::{add, rsqrt, square};
+        let s = scalar(
+            *self
+                .sigmas
+                .last()
+                .ok_or_else(|| Error::Msg("sdxl sampler: empty sigma schedule".into()))?,
+        );
+        let factor = rsqrt(&add(&square(&s)?, scalar(1.0))?)?;
+        let prior = multiply(&multiply(noise, &s)?, &factor)?;
+        Ok(prior.as_dtype(self.dtype)?)
+    }
+
+    /// Add noise to clean latents at (float) time `t` — the vendored `add_noise`, used to seed
+    /// img2img: `(x + noise·σ(t)) · rsqrt(σ(t)²+1)`, drawing one global-RNG normal. The op order
+    /// matches the reference exactly (f32 non-associativity, like `sample_prior` — sc-2400 S6).
+    pub fn add_noise(&self, x: &Array, t: f32) -> Result<Array> {
+        use mlx_rs::ops::{add, rsqrt, square};
+        let noise = random::normal::<f32>(x.shape(), None, None, None)?;
+        // `t` here is the raw f32 `start_step` (`max_time·strength`), NOT a value off the f16
+        // schedule, so the interp `delta` is f32 (no f16 rounding) — matching the reference.
+        let s = self.sigma_arr(t, false)?;
+        let noised = add(x, &multiply(&noise, &s)?)?;
+        let factor = rsqrt(&add(&square(&s)?, scalar(1.0))?)?;
+        Ok(multiply(&noised, &factor)?)
+    }
+
+    /// Add a **caller-supplied** noise tensor to clean latents at (float) time `t`, in the same
+    /// renormalized convention as [`Self::add_noise`]: `(x + noise·σ(t)) · rsqrt(σ(t)²+1)`. Unlike
+    /// `add_noise` it draws no RNG — the legacy inpaint blend (sc-3057) pins the kept region to the
+    /// init noised with the **fixed** prior noise at each step's `σ`, so it must reuse one noise
+    /// tensor (and not perturb the ancestral RNG stream). At `t = 0`, `σ = 0` ⇒ returns the clean
+    /// `x` (the diffusers final-step blend against the un-noised init).
+    pub fn add_noise_with(&self, x: &Array, noise: &Array, t: f32) -> Result<Array> {
+        use mlx_rs::ops::{add, rsqrt, square};
+        let s = self.sigma_arr(t, false)?;
+        let noised = add(x, &multiply(noise, &s)?)?;
+        let factor = rsqrt(&add(&square(&s)?, scalar(1.0))?)?;
+        Ok(multiply(&noised, &factor)?)
+    }
+
+    /// One denoise step from `x_t` (at time `t`) to `x_{t_prev}`. Euler-ancestral when `ancestral`
+    /// (draws fresh global-RNG noise scaled by `σ_up`); plain Euler otherwise.
+    ///
+    /// All scalar math runs through **MLX ops** op-for-op with the reference, NOT host f32. Two
+    /// subtleties matter (each a 1-ULP that the chaos-sensitive ancestral sampler amplifies to a
+    /// visible whole-image divergence at non-round σ — sc-2400 S6):
+    /// - host `sqrt`/`powf(-0.5)` ≠ MLX `sqrt`/`rsqrt` at some σ → use MLX `sqrt`/`rsqrt`;
+    /// - `σ_up²` must be MLX **`power(σ_up, 2)`** (the reference's `σ_up**2`), NOT `square(σ_up)` —
+    ///   `mx.power(x,2)` and `mx.square(x)` differ by 1 ULP at some x (confirmed: σ_up=0.96565 →
+    ///   square `0x3f6eb715`, power `0x3f6eb714`), which shifts `σ_down` by 1 ULP.
+    ///
+    /// `σ(t)` itself is the host interp of the MLX-exact table (bit-exact at integer `t`).
+    ///
+    /// **Dtype:** the whole step runs in `eps_pred.dtype()` — the reference's `sigma =
+    /// self.sigmas(t).astype(eps_pred.dtype)` then all-f16 arithmetic for `float16=True`. So `σ` is
+    /// cast to the eps dtype, the `+1`/`**2` constants are cast too (an f32 scalar would promote an
+    /// f16 step to f32 and leave the latents f32, breaking the next forward), and the ancestral
+    /// noise is cast to the latent dtype before scaling (the reference's `noise.astype(x_t_prev.dtype)`).
+    /// For the f32 path every cast is a no-op → bit-identical to before.
+    pub fn step(&self, eps_pred: &Array, x_t: &Array, t: f32, t_prev: f32) -> Result<Array> {
+        use mlx_rs::ops::{add, divide, multiply, power, rsqrt, sqrt, square, subtract};
+        // Two dtypes, deliberately distinct: the step math runs in `eps_pred.dtype()` (the reference's
+        // `sigma.astype(eps_pred.dtype)` then all-eps-dtype arithmetic), but the interp `delta`'s f16
+        // rounding tracks the *schedule* dtype `self.dtype` — `t` comes from `timesteps(self.dtype)`,
+        // so `_interp`'s `x_new` is f16 iff the schedule is f16. They diverge for img2img at
+        // `float16=True`: its VAE-encoded init is f32 ⇒ eps is f32 ⇒ math runs f32, yet `t` is still a
+        // f16 schedule value ⇒ delta is f16-rounded. (For T2I both are f16; for the f32 model both f32.)
+        let dt = eps_pred.dtype();
+        let interp_f16 = self.dtype == Dtype::Float16;
+        let sigma = self.sigma_arr(t, interp_f16)?.as_dtype(dt)?;
+        let sigma_prev = self.sigma_arr(t_prev, interp_f16)?.as_dtype(dt)?;
+        let sigma2 = square(&sigma)?;
+        let sigma_prev2 = square(&sigma_prev)?;
+        let one = scalar(1.0).as_dtype(dt)?;
+        let two = scalar(2.0).as_dtype(dt)?;
+        // x' = sqrt(σ²+1)·x_t + eps·dt, with dt = σ_down − σ (ancestral) or σ_prev − σ (euler).
+        let scaled_x = |d: &Array| -> Result<Array> {
+            Ok(add(
+                &multiply(&sqrt(&add(&sigma2, &one)?)?, x_t)?,
+                &multiply(eps_pred, d)?,
+            )?)
+        };
+        let renorm = rsqrt(&add(&sigma_prev2, &one)?)?; // (σ_prev²+1)^-0.5
+        if self.ancestral {
+            // σ_up = sqrt(σ_prev²·(σ²−σ_prev²)/σ²); σ_down = sqrt(σ_prev² − σ_up²).
+            let sigma_up = sqrt(&divide(
+                &multiply(&sigma_prev2, &subtract(&sigma2, &sigma_prev2)?)?,
+                &sigma2,
+            )?)?;
+            // `power(σ_up, 2)` (the reference's `σ_up**2`), NOT `square` — they differ by 1 ULP.
+            let sigma_down = sqrt(&subtract(&sigma_prev2, &power(&sigma_up, two)?)?)?;
+            let mut x = scaled_x(&subtract(&sigma_down, &sigma)?)?;
+            let noise = random::normal::<f32>(x.shape(), None, None, None)?.as_dtype(x.dtype())?;
+            x = add(&x, &multiply(&noise, &sigma_up)?)?;
+            Ok(multiply(&x, &renorm)?)
+        } else {
+            let x = scaled_x(&subtract(&sigma_prev, &sigma)?)?;
+            Ok(multiply(&x, &renorm)?)
+        }
+    }
+}
+
+/// Adapts the SDXL ancestral [`EulerSampler`] to the generic [`mlx_gen::DiffusionSampler`] seam by
+/// baking in one run's schedule (`num_steps` from `start_time` down to 0). This is SDXL's production
+/// default sampler. [`DiffusionSampler::scale_model_input`] is the trait default (identity) because
+/// the ancestral step folds the input renormalization into itself — so routing the ancestral path
+/// through the trait is bit-identical to the pre-trait denoise loop (preserves the e2e 0.00%-px>8
+/// gate, sc-2400 S5). The few-step acceleration samplers (`LcmSampler`/`LightningSampler`/
+/// `TcdSampler`) live in `mlx_gen::sampler` and slot into the same loop.
+pub struct AncestralEuler<'a> {
+    inner: &'a EulerSampler,
+    /// `(t, t_prev)` per step — `EulerSampler::timesteps(num_steps, start_time)`.
+    schedule: Vec<(f32, f32)>,
+}
+
+impl<'a> AncestralEuler<'a> {
+    /// Bake in one run's schedule. `start_time` is `max_time` for txt2img, `max_time·strength` for
+    /// img2img; `num_steps` is the effective step count (img2img runs `int(steps·strength)`).
+    pub fn new(inner: &'a EulerSampler, num_steps: usize, start_time: f32) -> Result<Self> {
+        Ok(Self {
+            inner,
+            schedule: inner.timesteps(num_steps, start_time)?,
+        })
+    }
+
+    /// The per-node EDM/k-diffusion σ schedule of this baked run — `[σ(t₀), σ(t₁), …, σ(t_{n-1}), σ(0)]`
+    /// (length `num_steps + 1`, strictly descending to the terminal `0`). Used by the PiD `from_ldm`
+    /// early-stop (epic 7840, sc-8049) to resolve the variance-preserving capture plan
+    /// ([`mlx_gen::gen_core::sampling::vp_capture_plan`]) against the *exact* schedule this run denoises,
+    /// so the `keep` index and the achieved degrade σ agree with the truncated trajectory.
+    pub fn edm_sigmas(&self) -> Vec<f32> {
+        let mut v: Vec<f32> = self
+            .schedule
+            .iter()
+            .map(|&(t, _)| self.inner.sigma(t))
+            .collect();
+        if let Some(&(_, last_prev)) = self.schedule.last() {
+            v.push(self.inner.sigma(last_prev));
+        }
+        v
+    }
+
+    /// Truncate the baked schedule to its first `run_steps` steps — the PiD `from_ldm` early-stop
+    /// (epic 7840, sc-8049). This keeps the FULL schedule's spacing and stops after `run_steps` denoise
+    /// steps, leaving `x_k` at node `run_steps` (EDM σ = `edm_sigmas()[run_steps]`) — unlike rebuilding
+    /// with fewer steps, which would re-space the whole `[start_time → 0]` linspace. `run_steps ≥
+    /// schedule.len()` is a no-op (the clean full-denoise path). The stored ancestral latent is already
+    /// renormalized to the VP frame `(x0+σε)/√(σ²+1)`, so the truncated latent is handed to PiD as-is.
+    pub fn truncate_to(mut self, run_steps: usize) -> Self {
+        self.schedule.truncate(run_steps);
+        self
+    }
+}
+
+impl DiffusionSampler for AncestralEuler<'_> {
+    fn num_steps(&self) -> usize {
+        self.schedule.len()
+    }
+
+    fn timestep(&self, i: usize) -> f32 {
+        self.schedule[i].0
+    }
+
+    fn scale_initial_noise(&self, noise: &Array) -> Result<Array> {
+        self.inner.scale_prior_noise(noise)
+    }
+
+    fn step(&self, model_output: &Array, x: &Array, i: usize) -> Result<Array> {
+        let (t, t_prev) = self.schedule[i];
+        self.inner.step(model_output, x, t, t_prev)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructors_return_ok_for_valid_config() {
+        // F-066: `new`/`new_with_dtype` are fallible (no internal `.expect`) so the registry `load`
+        // path surfaces an MLX sigma-table failure as `Err` instead of panicking. The happy path
+        // must still build a well-formed sampler at the requested dtype.
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        assert_eq!(s.dtype, Dtype::Float32);
+        let s16 =
+            EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), false, Dtype::Float16)
+                .unwrap();
+        assert_eq!(s16.dtype, Dtype::Float16);
+        assert!(!s16.ancestral);
+    }
+
+    #[test]
+    fn sigma_table_endpoints_and_interp() {
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        assert_eq!(s.sigmas.len(), 1001);
+        assert_eq!(s.sigmas[0], 0.0);
+        assert_eq!(s.max_time(), 1000.0);
+        // Monotonic increasing table.
+        assert!(s.sigmas.windows(2).all(|w| w[1] >= w[0]));
+        // Linear interp at a half index.
+        let mid = s.sigma(10.5);
+        assert!((mid - 0.5 * (s.sigmas[10] + s.sigmas[11])).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zero_steps_yield_no_pairs() {
+        // img2img at strength ≤ 1/steps rounds to 0 steps; the schedule must produce no `(t, t_prev)`
+        // pairs so the denoise loop is a no-op (and never invokes the σ=0 ancestral step → NaN).
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        assert!(s.timesteps(0, 0.0).unwrap().is_empty());
+        assert!(s.timesteps(0, 1000.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ancestral_stored_latent_is_the_vp_frame() {
+        // PiD from_ldm (sc-8049): the early-stop hands the ancestral sampler's stored latent to the
+        // variance-preserving PiD student WITHOUT a rescale, on the claim that the leading-Euler sampler
+        // already keeps the latent renormalized to the VP frame `(x0+σε)/√(σ²+1) = √(1−σ_vp²)·x0 + σ_vp·ε`
+        // at every node. `add_noise_with` IS that renormalized frame convention (`EulerSampler::step`
+        // maintains it across the reverse loop — `x_{prev} = renorm·(√(σ²+1)·x_t + eps·Δσ)`), so proving
+        // the identity here validates the no-rescale decision WITHOUT the PiD weights. `σ_vp =
+        // σ/√(1+σ²)` and the VP `x0` coefficient `√(1−σ_vp²) = 1/√(1+σ²)`.
+        use mlx_gen::gen_core::sampling::vp_sigma_from_edm;
+        use mlx_rs::ops::{add, multiply};
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        let x0 = Array::from_slice(&[1.0f32, -2.0, 0.5, 3.0], &[4]);
+        let noise = Array::from_slice(&[0.3f32, 0.7, -1.1, 0.2], &[4]);
+        for &t in &[900.0f32, 500.0, 200.0, 50.0] {
+            let sigma = s.sigma(t);
+            let sigma_vp = vp_sigma_from_edm(sigma);
+            let alpha = (1.0 - sigma_vp * sigma_vp).sqrt(); // = 1/√(1+σ²)
+            let expected = add(
+                multiply(&x0, scalar(alpha)).unwrap(),
+                multiply(&noise, scalar(sigma_vp)).unwrap(),
+            )
+            .unwrap();
+            let got = s.add_noise_with(&x0, &noise, t).unwrap();
+            let (e, g) = (expected.as_slice::<f32>(), got.as_slice::<f32>());
+            for (a, b) in e.iter().zip(g) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "t={t} σ={sigma}: ancestral latent ≠ VP frame ({a} vs {b})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edm_sigmas_descend_to_zero_with_node_count() {
+        // The from_ldm VP capture (sc-8049) resolves `vp_capture_plan` against this per-node σ schedule.
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        let sampler = AncestralEuler::new(&s, 8, s.max_time()).unwrap();
+        let edm = sampler.edm_sigmas();
+        assert_eq!(
+            edm.len(),
+            sampler.num_steps() + 1,
+            "one σ per node incl. terminal 0"
+        );
+        assert_eq!(edm.len(), 9);
+        assert_eq!(*edm.last().unwrap(), 0.0, "terminal node σ=0");
+        assert!(edm.windows(2).all(|w| w[0] >= w[1]), "descending");
+        assert!(edm[0] > 0.0, "starts at a positive σ");
+    }
+
+    #[test]
+    fn truncate_to_preserves_full_schedule_spacing() {
+        // The from_ldm early-stop truncates the FULL schedule (keeping its spacing) rather than
+        // rebuilding with fewer steps (which would re-space the `[start → 0]` linspace) — sc-8049.
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        let full_edm = AncestralEuler::new(&s, 8, s.max_time())
+            .unwrap()
+            .edm_sigmas();
+        let trunc = AncestralEuler::new(&s, 8, s.max_time())
+            .unwrap()
+            .truncate_to(3);
+        assert_eq!(trunc.num_steps(), 3, "3 steps kept");
+        let trunc_edm = trunc.edm_sigmas();
+        assert_eq!(trunc_edm.len(), 4, "3 steps → 4 nodes");
+        for i in 0..4 {
+            assert!(
+                (trunc_edm[i] - full_edm[i]).abs() < 1e-6,
+                "node {i}: truncation must keep the full schedule's leading nodes"
+            );
+        }
+        // A natively-built 3-step schedule re-spaces, so its interior node differs from the truncation.
+        let native3 = AncestralEuler::new(&s, 3, s.max_time())
+            .unwrap()
+            .edm_sigmas();
+        assert!(
+            (trunc_edm[1] - native3[1]).abs() > 1e-4,
+            "truncation must NOT equal a re-spaced 3-step schedule"
+        );
+    }
+
+    #[test]
+    fn timesteps_span_start_to_zero() {
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        let ts = s.timesteps(4, 1000.0).unwrap();
+        assert_eq!(ts.len(), 4);
+        assert_eq!(ts[0].0, 1000.0);
+        assert!((ts.last().unwrap().1 - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn round_to_f16_rounds_and_is_fallible_ok() {
+        // F-067: returns Ok with the actually-rounded value — never the un-rounded input (a 1-ULP
+        // un-rounded `t` seeds the chaotic ancestral trajectory, the exact silent parity break this
+        // rounding prevents). 1.0 is f16-exact (round-trips identically); 0.1 is not (must move to
+        // the nearest f16 value), so an un-rounded-fallback regression would surface here.
+        assert_eq!(round_to_f16(1.0).unwrap(), 1.0);
+        let r = round_to_f16(0.1).unwrap();
+        assert_ne!(
+            r, 0.1_f32,
+            "0.1 is not f16-representable; rounding must change it"
+        );
+        assert!(
+            (r - 0.1).abs() < 1e-3,
+            "but stays within f16 resolution of 0.1"
+        );
+        assert_eq!(
+            round_to_f16(r).unwrap(),
+            r,
+            "rounding an f16-exact value is a no-op"
+        );
+    }
+}

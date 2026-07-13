@@ -1,0 +1,856 @@
+//! FLUX.1 provider registration and txt2img generation path.
+
+use mlx_gen::array::scalar;
+use mlx_gen::gen_core;
+use mlx_gen::image::decoded_to_image;
+use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::{
+    default_seed, run_flow_sampler, Conditioning, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result,
+    TimestepConvention, WeightsSource,
+};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_gen_z_image::vae::Vae;
+use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::{Array, Dtype};
+
+use crate::config::{FluxVariant, DEFAULT_SAMPLER, HYPER_SAMPLER};
+use crate::image_encoder::FluxIpImageEncoder;
+use crate::ip_adapter::{FluxIpAdapter, FluxIpInjector};
+use crate::loader;
+use crate::pipeline::{build_sigmas_with, create_noise, unpack_latents};
+use crate::text_encoder::FluxTextEncoders;
+use crate::transformer::FluxTransformer;
+
+/// Default `ip_adapter_scale` when a `Conditioning::Reference` omits its `strength` (epic 3621).
+/// SceneWorks maps `ipAdapterScale` (default 0.7) → `strength`; this is the engine-side fallback.
+const DEFAULT_IP_SCALE: f32 = 0.7;
+/// `true_cfg` clamp range for the IP-Adapter dev path (SceneWorks default 4.0).
+const TRUE_CFG_MIN: f32 = 1.0;
+const TRUE_CFG_MAX: f32 = 10.0;
+
+/// PiD backbone (latent-space) tag for FLUX.1 (epic 7840, sc-7846). Resolves to the `flux` 16-ch
+/// student in `mlx_gen_pid::registry`; used only at load time to build the [`PidEngine`]. Shared by
+/// both FLUX.1 variants (dev + schnell) — they share the FLUX.1 VAE latent space.
+pub const PID_BACKBONE: &str = "flux";
+
+pub fn descriptor_schnell() -> ModelDescriptor {
+    descriptor_for(FluxVariant::Schnell)
+}
+
+pub fn descriptor_dev() -> ModelDescriptor {
+    descriptor_for(FluxVariant::Dev)
+}
+
+pub fn descriptor_for(variant: FluxVariant) -> ModelDescriptor {
+    variant.descriptor()
+}
+
+pub fn load_schnell(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(FluxVariant::Schnell, spec)
+}
+
+pub fn load_dev(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(FluxVariant::Dev, spec)
+}
+
+fn load_variant(variant: FluxVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(load_flux1(variant, spec)?))
+}
+
+/// Load a fully-weighted [`Flux1`] (the concrete type, not boxed) — the entry point the PuLID-FLUX
+/// provider (`mlx-gen-pulid`, sc-3074) wraps so it can drive the denoise through
+/// [`Flux1::generate_with_injector`].
+pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{}: only dense bf16 is wired for the FLUX.1 port plan",
+            variant.id()
+        )));
+    }
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p,
+        WeightsSource::File(_) => {
+            return Err(Error::Msg(format!(
+                "{} expects a FLUX.1 snapshot directory (tokenizer/ tokenizer_2/ text_encoder/ \
+                 text_encoder_2/ transformer/ vae/), not a single .safetensors file",
+                variant.id()
+            )))
+        }
+    };
+
+    let t5_tokenizer = loader::load_t5_tokenizer(root, variant)?;
+    let clip_tokenizer = loader::load_clip_tokenizer()?;
+    let mut text_encoders = FluxTextEncoders {
+        t5: loader::load_t5_encoder(root)?,
+        clip: loader::load_clip_encoder(root)?,
+    };
+    let mut transformer = loader::load_transformer(root, variant)?;
+    let mut vae = loader::load_vae(root)?;
+    if let Some(q) = spec.quantize {
+        let bits = q.bits();
+        text_encoders.quantize(bits)?;
+        transformer.quantize(bits)?;
+        vae.quantize(bits)?;
+    }
+    // Install LoRA/LoKr adapters AFTER quantization (the fork merges/applies post-quantize too; a
+    // forward-time residual over the now-quantized base, never a fused merge). No-op when empty; a
+    // non-empty spec list that matches nothing — or any unmatched target — errors loudly (sc-2534).
+    crate::adapters::apply_flux_adapters(&mut transformer, &spec.adapters)?;
+
+    // Optional XLabs IP-Adapter (epic 3621), loaded from `LoadSpec::ip_adapter`. The plain txt2img
+    // path is unaffected when absent.
+    let ip_adapter = match &spec.ip_adapter {
+        Some(WeightsSource::Dir(p)) => Some(loader::load_flux_ip_adapter(p)?),
+        Some(WeightsSource::File(_)) => {
+            return Err(Error::Msg(format!(
+                "{}: ip_adapter expects a directory (ip_adapter.safetensors + image_encoder/), not a single file",
+                variant.id()
+            )))
+        }
+        None => None,
+    };
+
+    // Optional PiD decoder overlay (epic 7840, sc-7846): the FLUX.1 16-ch VAE latent space has a PiD
+    // student, so the final decode can route through `mlx_gen_pid` when `req.use_pid` is set. Loaded
+    // only when the spec carries `pid`; the plain txt2img/IP-Adapter paths are unaffected when absent.
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
+
+    Ok(Flux1 {
+        descriptor: descriptor_for(variant),
+        variant,
+        t5_tokenizer: Some(t5_tokenizer),
+        clip_tokenizer: Some(clip_tokenizer),
+        text_encoders: Some(text_encoders),
+        transformer: Some(transformer),
+        vae: Some(vae),
+        ip_adapter,
+        pid,
+    })
+}
+
+pub struct Flux1 {
+    descriptor: ModelDescriptor,
+    variant: FluxVariant,
+    t5_tokenizer: Option<TextTokenizer>,
+    clip_tokenizer: Option<TextTokenizer>,
+    text_encoders: Option<FluxTextEncoders>,
+    transformer: Option<FluxTransformer>,
+    vae: Option<Vae>,
+    /// XLabs IP-Adapter (epic 3621): the CLIP-ViT-L/14 image encoder (sc-3622) + the adapter modules
+    /// (sc-3623). `Some` only when a `LoadSpec::ip_adapter` was supplied. A `Conditioning::Reference`
+    /// request errors loudly when this is `None`.
+    ip_adapter: Option<(FluxIpImageEncoder, FluxIpAdapter)>,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
+    /// `LoadSpec` carried `pid`; selected per-generation by `req.use_pid`, swapping the native FLUX.1
+    /// VAE for a 4× PiD decode at the `run_denoise` decode call site.
+    pid: Option<PidEngine>,
+}
+
+impl Flux1 {
+    pub fn new_for_tests(variant: FluxVariant) -> Self {
+        Self {
+            descriptor: descriptor_for(variant),
+            variant,
+            t5_tokenizer: None,
+            clip_tokenizer: None,
+            text_encoders: None,
+            transformer: None,
+            vae: None,
+            ip_adapter: None,
+            pid: None,
+        }
+    }
+
+    pub fn encode_prompt(&self, prompt: &str) -> Result<(mlx_rs::Array, mlx_rs::Array)> {
+        let t5_tokenizer = self.t5_tokenizer.as_ref().ok_or_else(|| {
+            Error::Msg(format!(
+                "{}: T5 tokenizer is not loaded in this test-only instance",
+                self.descriptor.id
+            ))
+        })?;
+        let clip_tokenizer = self.clip_tokenizer.as_ref().ok_or_else(|| {
+            Error::Msg(format!(
+                "{}: CLIP tokenizer is not loaded in this test-only instance",
+                self.descriptor.id
+            ))
+        })?;
+        let text_encoders = self.text_encoders.as_ref().ok_or_else(|| {
+            Error::Msg(format!(
+                "{}: text encoders are not loaded in this test-only instance",
+                self.descriptor.id
+            ))
+        })?;
+        let (t5_ids, _) = mlx_gen::tokenizer::to_arrays(&t5_tokenizer.tokenize(prompt)?);
+        let (clip_ids, _) = mlx_gen::tokenizer::to_arrays(&clip_tokenizer.tokenize(prompt)?);
+        text_encoders.encode(&t5_ids, &clip_ids)
+    }
+
+    fn transformer(&self) -> Result<&FluxTransformer> {
+        self.transformer.as_ref().ok_or_else(|| {
+            Error::Msg(format!(
+                "{}: transformer is not loaded in this test-only instance",
+                self.descriptor.id
+            ))
+        })
+    }
+
+    fn vae(&self) -> Result<&Vae> {
+        self.vae.as_ref().ok_or_else(|| {
+            Error::Msg(format!(
+                "{}: VAE is not loaded in this test-only instance",
+                self.descriptor.id
+            ))
+        })
+    }
+}
+
+impl Generator for Flux1 {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        // Validate up front so an invalid request (bad dims/steps) fails fast, before the reference
+        // image (and the black-image CFG branch) is encoded — the deeper `run_denoise` validation
+        // would otherwise reject only after that work (L-validate-first).
+        self.validate(req)?;
+        // Reference-image (XLabs IP-Adapter) path, epic 3621. `validate` has confirmed at most one
+        // `Reference`; extract it here.
+        if let Some((image, strength)) = single_reference(req)? {
+            let (encoder, adapter) = self.ip_adapter.as_ref().ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: a reference image needs an IP-adapter — load it via LoadSpec::with_ip_adapter",
+                    self.descriptor.id
+                ))
+            })?;
+            let embeds = encoder.encode(image)?;
+            let scale = strength.unwrap_or(DEFAULT_IP_SCALE).clamp(0.0, 1.0);
+            let pos = FluxIpInjector::new(adapter, &embeds, scale)?;
+            // dev + an explicit `true_cfg` → real CFG against `negative_prompt`, image prompt only on
+            // the positive branch (diffusers' Flux IP `true_cfg_scale`). Otherwise the single distilled
+            // forward (schnell always; dev without true_cfg).
+            return match req.true_cfg {
+                Some(cfg) if self.variant.supports_guidance() => {
+                    // Match diffusers' Flux true-CFG IP: the negative branch conditions on a BLACK
+                    // image (zeros), NOT "no IP" — `FluxPipeline` sets `negative_ip_adapter_image =
+                    // np.zeros(...)` when unset. CFG then amplifies the reference-specific signal
+                    // (ref − blank), sharpening resemblance instead of the whole IP term. The size is
+                    // arbitrary (CLIP resizes to 224²), so `encode_black` names the zeros contract.
+                    let black_embeds = encoder.encode_black()?;
+                    let neg = FluxIpInjector::new(adapter, &black_embeds, scale)?;
+                    let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
+                    self.generate_with_injector_cfg(
+                        req,
+                        &pos,
+                        &neg,
+                        neg_prompt,
+                        cfg.clamp(TRUE_CFG_MIN, TRUE_CFG_MAX),
+                        0,
+                        on_progress,
+                    )
+                    .map_err(Into::into)
+                }
+                _ => self
+                    .generate_with_injector(req, Some(&pos), on_progress)
+                    .map_err(Into::into),
+            };
+        }
+        self.generate_with_injector(req, None, on_progress)
+            .map_err(Into::into)
+    }
+}
+
+/// Extract the single reference image + its optional `strength` (`ip_adapter_scale`) from a request,
+/// or `None` for plain txt2img. Errors on `MultiReference` or more than one reference (FLUX.1's
+/// XLabs IP-Adapter conditions on exactly one image).
+fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
+    match req.conditioning.as_slice() {
+        [] => Ok(None),
+        [Conditioning::Reference { image, strength }] => Ok(Some((image, *strength))),
+        _ => Err(Error::Msg(
+            "flux: reference conditioning supports exactly one Reference image".into(),
+        )),
+    }
+}
+
+impl Flux1 {
+    /// As [`Generator::generate`], but threading an optional per-block image-stream residual
+    /// injector (the PuLID id cross-attn, sc-3072/3074) into every denoise step's transformer
+    /// forward. `injector = None` is byte-identical to [`Generator::generate`] (it IS that path).
+    pub fn generate_with_injector(
+        &self,
+        req: &GenerationRequest,
+        injector: Option<&dyn crate::transformer::DitImageInjector>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let transformer = self.transformer()?;
+        let (prompt_embeds, pooled_prompt_embeds) = self.encode_prompt(&req.prompt)?;
+        self.run_denoise(req, on_progress, |x_in, _t, timestep, guidance| {
+            transformer.forward_injected(
+                x_in,
+                &prompt_embeds,
+                &pooled_prompt_embeds,
+                timestep,
+                guidance,
+                req.width,
+                req.height,
+                injector,
+            )
+        })
+    }
+
+    /// Dual-branch real-CFG denoise — the seam PuLID-FLUX `true_cfg > 1.0` (sc-3075) uses. Each step
+    /// runs a positive forward (`req.prompt` + `pos_injector`) and, once `t >= timestep_to_start_cfg`,
+    /// a negative forward (`neg_prompt` + `neg_injector`), combined as `neg + true_cfg·(pos − neg)`.
+    /// The distilled `guidance` is still applied on both branches (the upstream PuLID recipe). The
+    /// injectors are generic, so this carries no PuLID-specific code; with two no-op injectors it
+    /// reduces to classifier-free guidance between two prompts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_injector_cfg(
+        &self,
+        req: &GenerationRequest,
+        pos_injector: &dyn crate::transformer::DitImageInjector,
+        neg_injector: &dyn crate::transformer::DitImageInjector,
+        neg_prompt: &str,
+        true_cfg: f32,
+        timestep_to_start_cfg: usize,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let transformer = self.transformer()?;
+        let (pos_embeds, pos_pooled) = self.encode_prompt(&req.prompt)?;
+        let (neg_embeds, neg_pooled) = self.encode_prompt(neg_prompt)?;
+        self.run_denoise(req, on_progress, |x_in, t, timestep, guidance| {
+            let pos = transformer.forward_injected(
+                x_in,
+                &pos_embeds,
+                &pos_pooled,
+                timestep,
+                guidance,
+                req.width,
+                req.height,
+                Some(pos_injector),
+            )?;
+            if t >= timestep_to_start_cfg {
+                let neg = transformer.forward_injected(
+                    x_in,
+                    &neg_embeds,
+                    &neg_pooled,
+                    timestep,
+                    guidance,
+                    req.width,
+                    req.height,
+                    Some(neg_injector),
+                )?;
+                // neg + true_cfg · (pos − neg)
+                Ok(add(
+                    &neg,
+                    &multiply(&subtract(&pos, &neg)?, scalar(true_cfg))?,
+                )?)
+            } else {
+                Ok(pos)
+            }
+        })
+    }
+
+    /// Shared denoise scaffold for the injector generators (F-108): resolve seed / sampler / steps /
+    /// guidance, build the flow-match sigmas + sampler, enable the compile-glue, and run the
+    /// per-count → per-step loop (cancel check → `scale_model_input` → `velocity_fn` → `step` →
+    /// progress → unpack/decode). `velocity_fn(x_in, step_idx, timestep, guidance)` returns the step's
+    /// velocity — the only thing that differs between the single-branch and CFG paths. Bit-identical
+    /// to the prior inline loops (the base render stays e2e-parity-exact).
+    fn run_denoise(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        mut velocity_fn: impl FnMut(&Array, usize, f32, f32) -> Result<Array>,
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        let vae = self.vae()?;
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+        // Sampler selection (sc-2908). FLUX is flow-match: the base render and the few-step `hyper`
+        // profile share the SAME flow-match schedule (mflux's `LinearScheduler`) — `hyper` only
+        // changes the default step count + guidance (the acceleration is a distilled LoRA the caller
+        // loads at `scale≈0.125` via `spec.adapters`, not a different scheduler). An unset sampler is
+        // the base flow-match path; `validate_request` rejects any name not in the descriptor.
+        let sampler_name = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
+        let (def_steps, def_guidance) = profile_defaults(self.variant, sampler_name);
+        let steps = req.steps.unwrap_or(def_steps) as usize;
+        let guidance = if self.variant.supports_guidance() {
+            req.guidance.unwrap_or(def_guidance)
+        } else {
+            0.0
+        };
+        // The FLUX diffusion path is MIXED precision, matching the mflux reference (sc-2787): the
+        // latents (`create_noise` → f32) and the main residual stream stay f32; only the CLIP pooled
+        // embedding + the time/text/guidance conditioning run bf16 (in the encoders / `TimeTextEmbed`).
+        // So latents are NOT cast to bf16 — that would diverge from the fork.
+        // Native `LinearScheduler` schedule is the byte-exact default (epic 7114 N1); a curated
+        // `req.scheduler` re-shapes σ over FLUX.1's own resolution-dependent mu (schnell: unshifted).
+        let sigmas = build_sigmas_with(
+            steps,
+            req.width,
+            req.height,
+            self.variant.requires_sigma_shift(),
+            req.scheduler.as_deref(),
+        )?;
+        // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): when `use_pid` is
+        // set AND a PiD overlay was loaded, decode (and 4× super-resolve) the latent through PiD instead
+        // of the native VAE; errors loudly if `use_pid` was requested without a loaded overlay (no
+        // silent VAE fallback). `None` → the native VAE, the byte-exact default. When `pid_capture_sigma`
+        // additionally asks for an early exit on this flow-match schedule (flux is `vp_frame=false`, so
+        // the schedule σ *is* the degrade σ), stop the denoise at the achieved-σ step and hand PiD the
+        // partially-denoised x_k; otherwise the clean σ=0 full-denoise path (`capture_sigma = 0`, full
+        // schedule). One decoder is shared across the `count` loop (same prompt → same caption embeds);
+        // per-image variation comes from the per-seed denoised latent. (flux is txt2img here — no
+        // img2img blend in this path — so `start_step = 0`.)
+        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            self.descriptor.id,
+            capture_sigma,
+        )?;
+        let decoder: &dyn LatentDecoder = match &pid_decoder {
+            Some(d) => d,
+            None => vae,
+        };
+        let denoise_sigmas = &sigmas[..keep];
+        // Route the flow-match denoise through the unified curated-sampler framework (epic 7114 P3):
+        // the default `flow_match` / `hyper` profile maps to Euler (the legacy `x + v·Δσ` step, within
+        // the N1 parity tolerance), and the curated menu (heun / dpmpp_2m / uni_pc / …) becomes
+        // selectable. FLUX feeds the raw schedule sigma as the transformer timestep (Sigma convention).
+        // sc-2963: run the MMDiT's fusable elementwise glue (adaLN affine, gated residual, tanh-GELU
+        // FFN, RoPE rotation) through `mx.compile` — bit-exact and a per-step win. Scoped to this
+        // render by the RAII guard (F-007): the process-global toggle is restored on drop, even on `?`.
+        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        for i in 0..req.count {
+            let seed = base_seed.wrapping_add(i as u64);
+            let latents = create_noise(seed, req.width, req.height)?;
+            // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress are handled inside
+            // `run_flow_sampler`.
+            let final_latents = run_flow_sampler(
+                Some(sampler_name),
+                TimestepConvention::Sigma,
+                denoise_sigmas,
+                latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                |x_in, timestep| {
+                    // The curated samplers expose no step index, but the CFG-scheduling consumers
+                    // (`timestep_to_start_cfg`) need one — derive it as the count of schedule nodes
+                    // already descended past (exact for the single-eval default sampler).
+                    let step_idx = sigmas.iter().filter(|&&s| s > timestep).count();
+                    velocity_fn(x_in, step_idx, timestep, guidance)
+                },
+            )?;
+            on_progress(Progress::Decoding);
+            let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
+            let decoded = decoder.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+            images.push(decoded_to_image(&decoded)?);
+        }
+        Ok(GenerationOutput::Images(images))
+    }
+}
+
+/// Few-step profile defaults `(steps, guidance)` applied when the request omits them (sc-2908). The
+/// base flow-match path uses the variant's own defaults; the `hyper` profile (Hyper-FLUX.1-dev) is 8
+/// steps at guidance 3.5 — paired with the ByteDance Hyper-FLUX 8-step LoRA loaded at `scale≈0.125`
+/// (the documented `lora_scale`) via `spec.adapters`. `hyper` is dev-only (it is a FLUX.1-dev LoRA)
+/// and schnell never advertises it, so it never reaches here for schnell.
+fn profile_defaults(variant: FluxVariant, sampler: &str) -> (u32, f32) {
+    match sampler {
+        HYPER_SAMPLER => (8, crate::config::DEFAULT_GUIDANCE),
+        _ => (variant.default_steps(), crate::config::DEFAULT_GUIDANCE),
+    }
+}
+
+fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
+    if req.prompt.trim().is_empty() {
+        return Err(Error::Msg(format!("{}: prompt is required", desc.id)));
+    }
+    // Reject a sampler the variant does not advertise (e.g. `hyper` on schnell, or any typo) rather
+    // than silently falling back to the base flow-match path.
+    if let Some(s) = &req.sampler {
+        if !desc.capabilities.samplers.contains(&s.as_str()) {
+            return Err(Error::Msg(format!(
+                "{}: unsupported sampler {s:?} (supported: {:?})",
+                desc.id, desc.capabilities.samplers
+            )));
+        }
+    }
+    // Likewise reject an unadvertised scheduler (F-100: previously silently accepted). flux1's
+    // negative/true_cfg checks keep their IP-Adapter reference carve-out below, so this validate
+    // stays bespoke rather than fully delegating to `Capabilities::validate_request`.
+    if let Some(s) = &req.scheduler {
+        if !desc.capabilities.schedulers.contains(&s.as_str()) {
+            return Err(Error::Msg(format!(
+                "{}: unsupported scheduler {s:?} (supported: {:?})",
+                desc.id, desc.capabilities.schedulers
+            )));
+        }
+    }
+    if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
+        return Err(Error::Msg(format!(
+            "{}: width and height must be multiples of 16, got {}x{}",
+            desc.id, req.width, req.height
+        )));
+    }
+    let caps = &desc.capabilities;
+    if req.width < caps.min_size
+        || req.height < caps.min_size
+        || req.width > caps.max_size
+        || req.height > caps.max_size
+    {
+        return Err(Error::Msg(format!(
+            "{}: size {}x{} outside supported range {}..={}",
+            desc.id, req.width, req.height, caps.min_size, caps.max_size
+        )));
+    }
+    if req.count == 0 || req.count > caps.max_count {
+        return Err(Error::Msg(format!(
+            "{}: count must be 1..={}",
+            desc.id, caps.max_count
+        )));
+    }
+    // Reference conditioning (XLabs IP-Adapter, epic 3621): exactly one `Reference`. The negative
+    // prompt + true_cfg knobs ride the IP-Adapter dev path (real CFG), so they are permitted
+    // alongside a reference on a guidance-capable (dev) variant even though base txt2img advertises
+    // neither — but never on the plain (no-reference) path, which stays bit-identical.
+    let has_reference = match req.conditioning.as_slice() {
+        [] => false,
+        [Conditioning::Reference { .. }] => true,
+        _ => {
+            return Err(Error::Msg(format!(
+                "{}: only a single Reference image is supported (no MultiReference / multiple references)",
+                desc.id
+            )))
+        }
+    };
+    let ref_cfg_ok = has_reference && caps.supports_guidance;
+    if req.negative_prompt.is_some() && !caps.supports_negative_prompt && !ref_cfg_ok {
+        return Err(Error::Msg(format!(
+            "{}: negative prompts are not supported",
+            desc.id
+        )));
+    }
+    if req.guidance.is_some() && !caps.supports_guidance {
+        return Err(Error::Msg(format!(
+            "{}: guidance is not supported by this distilled variant",
+            desc.id
+        )));
+    }
+    if req.true_cfg.is_some() && !caps.supports_true_cfg && !ref_cfg_ok {
+        return Err(Error::Msg(format!(
+            "{}: true_cfg is not supported",
+            desc.id
+        )));
+    }
+    Ok(())
+}
+
+// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl Generator`
+// above stays hand-written because `generate` is bespoke (IP-adapter / true-CFG branching), not the
+// plain delegation `impl_generator!` expresses.
+mlx_gen::register_generators! {
+    descriptor_schnell => load_schnell,
+    descriptor_dev => load_dev,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{FLUX1_DEV_ID, FLUX1_SCHNELL_ID};
+
+    #[test]
+    fn validates_base_txt2img_request() {
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a red fox".into(),
+            guidance: Some(3.5),
+            ..Default::default()
+        };
+        model.validate(&req).unwrap();
+    }
+
+    #[test]
+    fn schnell_rejects_guidance() {
+        let model = Flux1::new_for_tests(FluxVariant::Schnell);
+        let req = GenerationRequest {
+            prompt: "a red fox".into(),
+            guidance: Some(3.5),
+            ..Default::default()
+        };
+        let err = model.validate(&req).unwrap_err().to_string();
+        assert!(err.contains("guidance is not supported"));
+    }
+
+    #[test]
+    fn rejects_non_multiple_of_16() {
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1025,
+            ..Default::default()
+        };
+        let err = model.validate(&req).unwrap_err().to_string();
+        assert!(err.contains("multiples of 16"));
+    }
+
+    #[test]
+    fn constants_match_expected_ids() {
+        assert_eq!(FluxVariant::Schnell.id(), FLUX1_SCHNELL_ID);
+        assert_eq!(FluxVariant::Dev.id(), FLUX1_DEV_ID);
+    }
+
+    // ---- epic 3621: XLabs IP-Adapter reference conditioning -----------------------------------
+
+    fn tiny_image() -> Image {
+        Image {
+            width: 8,
+            height: 8,
+            pixels: vec![128u8; 8 * 8 * 3],
+        }
+    }
+
+    fn reference(strength: Option<f32>) -> Conditioning {
+        Conditioning::Reference {
+            image: tiny_image(),
+            strength,
+        }
+    }
+
+    #[test]
+    fn both_variants_advertise_reference_conditioning() {
+        for v in [FluxVariant::Dev, FluxVariant::Schnell] {
+            assert!(
+                descriptor_for(v)
+                    .capabilities
+                    .conditioning
+                    .contains(&mlx_gen::ConditioningKind::Reference),
+                "{} must advertise Reference conditioning",
+                v.id()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_single_reference_with_ip_knobs_on_dev() {
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            guidance: Some(3.5),
+            true_cfg: Some(4.0),
+            negative_prompt: Some("blurry".into()),
+            conditioning: vec![reference(Some(0.7))],
+            ..Default::default()
+        };
+        // true_cfg + negative_prompt are permitted alongside a reference on dev even though base
+        // txt2img advertises neither.
+        model.validate(&req).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_true_cfg_without_reference() {
+        // The IP knobs are scoped to the reference path; the plain dev path stays unchanged.
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            true_cfg: Some(4.0),
+            ..Default::default()
+        };
+        assert!(model
+            .validate(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("true_cfg is not supported"));
+    }
+
+    #[test]
+    fn validate_rejects_true_cfg_on_schnell_even_with_reference() {
+        // schnell is not guidance/CFG-capable, so true_cfg is rejected regardless of a reference.
+        let model = Flux1::new_for_tests(FluxVariant::Schnell);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            true_cfg: Some(4.0),
+            conditioning: vec![reference(None)],
+            ..Default::default()
+        };
+        assert!(model
+            .validate(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("true_cfg is not supported"));
+    }
+
+    #[test]
+    fn validate_rejects_multiple_references() {
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            conditioning: vec![reference(None), reference(None)],
+            ..Default::default()
+        };
+        assert!(model
+            .validate(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("single Reference"));
+    }
+
+    #[test]
+    fn generate_reference_without_ip_adapter_errors() {
+        // No `LoadSpec::ip_adapter` → a reference request errors loudly before touching the (absent)
+        // transformer, so the descriptor never advertises a path that silently no-ops.
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            conditioning: vec![reference(Some(0.7))],
+            ..Default::default()
+        };
+        let err = model.generate(&req, &mut |_| {}).unwrap_err().to_string();
+        assert!(err.contains("needs an IP-adapter"), "got: {err}");
+    }
+
+    // ---- sc-2908: sampler capability surface + few-step profile -----------------------------
+
+    #[test]
+    fn dev_advertises_hyper_schnell_does_not() {
+        // Both expose the curated unified-framework integrator menu (epic 7114) + the base
+        // `flow_match` profile; Hyper-FLUX is a FLUX.1-dev LoRA, so only dev adds the `hyper` profile.
+        let dev = descriptor_for(FluxVariant::Dev).capabilities.samplers;
+        let schnell = descriptor_for(FluxVariant::Schnell).capabilities.samplers;
+        assert!(dev.contains(&HYPER_SAMPLER), "dev exposes hyper");
+        assert!(
+            !schnell.contains(&HYPER_SAMPLER),
+            "schnell does not expose the dev-only hyper profile"
+        );
+        for s in [DEFAULT_SAMPLER, "euler", "dpmpp_2m", "uni_pc"] {
+            assert!(dev.contains(&s), "dev exposes {s}");
+            assert!(schnell.contains(&s), "schnell exposes {s}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_base_and_hyper_on_dev() {
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        for s in [DEFAULT_SAMPLER, HYPER_SAMPLER] {
+            let req = GenerationRequest {
+                prompt: "a red fox".into(),
+                guidance: Some(3.5),
+                sampler: Some(s.into()),
+                ..Default::default()
+            };
+            assert!(
+                model.validate(&req).is_ok(),
+                "sampler {s:?} should be accepted on dev"
+            );
+        }
+        // An unset sampler is the base flow-match path.
+        let req = GenerationRequest {
+            prompt: "a red fox".into(),
+            guidance: Some(3.5),
+            ..Default::default()
+        };
+        assert!(model.validate(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unadvertised_scheduler() {
+        // F-100: an unsupported scheduler was silently accepted before. epic 7114 scheduler axis: the
+        // curated names ("karras", …) + the "linear" native alias now pass; an unknown name is rejected.
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let err = model
+            .validate(&GenerationRequest {
+                prompt: "a red fox".into(),
+                guidance: Some(3.5),
+                scheduler: Some("not_a_real_scheduler".into()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported scheduler"), "got: {err}");
+        for ok in ["linear", "karras", "sgm_uniform"] {
+            model
+                .validate(&GenerationRequest {
+                    prompt: "a red fox".into(),
+                    guidance: Some(3.5),
+                    scheduler: Some(ok.into()),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|e| panic!("{ok} should validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_hyper_on_schnell_and_unknown_samplers() {
+        // `hyper` is dev-only — schnell does not advertise it, so it is rejected, not downgraded.
+        let schnell = Flux1::new_for_tests(FluxVariant::Schnell);
+        let err = schnell
+            .validate(&GenerationRequest {
+                prompt: "a red fox".into(),
+                sampler: Some(HYPER_SAMPLER.into()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported sampler"), "got: {err}");
+        // A sampler outside the advertised menu is rejected on dev too. (`lcm`/`euler` are now in the
+        // curated menu (epic 7114), so the rejected names are the qwen-only `lightning` profile, a
+        // non-curated solver name `tcd`, and outright garbage.)
+        let dev = Flux1::new_for_tests(FluxVariant::Dev);
+        for bad in ["lightning", "tcd", "nonsense"] {
+            let err = dev
+                .validate(&GenerationRequest {
+                    prompt: "a red fox".into(),
+                    guidance: Some(3.5),
+                    sampler: Some(bad.into()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("unsupported sampler"),
+                "sampler {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn hyper_profile_defaults_are_eight_steps_guidance_3_5() {
+        // The few-step profile: 8 steps at guidance 3.5 (the Hyper-FLUX.1-dev recommendation).
+        assert_eq!(profile_defaults(FluxVariant::Dev, HYPER_SAMPLER), (8, 3.5));
+        // The base path keeps the variant's own defaults (dev 25, schnell 4).
+        assert_eq!(
+            profile_defaults(FluxVariant::Dev, DEFAULT_SAMPLER),
+            (
+                FluxVariant::Dev.default_steps(),
+                crate::config::DEFAULT_GUIDANCE
+            )
+        );
+        assert_eq!(
+            profile_defaults(FluxVariant::Schnell, DEFAULT_SAMPLER),
+            (
+                FluxVariant::Schnell.default_steps(),
+                crate::config::DEFAULT_GUIDANCE
+            )
+        );
+    }
+}

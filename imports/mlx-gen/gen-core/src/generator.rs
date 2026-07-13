@@ -1,0 +1,963 @@
+//! The `Generator` contract — prompt-conditioned synthesis of image **or** video (or both),
+//! including multi-modal models. See `docs/MODEL_ARCHITECTURE.md` §3.1.
+//!
+//! One trait covers everything text→media: T2I, T2V, edit (image+text→image), LTX
+//! (text→video+audio). Modality is a [`ModelDescriptor`] property plus a [`GenerationOutput`]
+//! variant — *not* a per-modality trait split (which breaks on multi-modal models).
+
+use crate::media::{AudioTrack, Image};
+use crate::runtime::{CancelFlag, Progress, Quant};
+use crate::{Error, Result};
+
+/// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
+/// worker runs each job on its own thread); the request carries a cancel flag and
+/// `on_progress` streams step/decode progress.
+pub trait Generator {
+    /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
+    fn descriptor(&self) -> &ModelDescriptor;
+
+    /// Reject a request this model cannot serve (unsupported conditioning, guidance on a
+    /// distilled model, out-of-range size/count, …) before doing expensive work.
+    fn validate(&self, req: &GenerationRequest) -> Result<()>;
+
+    /// Run generation to completion (or until `req.cancel` trips).
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput>;
+}
+
+/// What a [`Generator`] produced. The `Video` variant's `audio` is `Some` for LTX (always
+/// audio) and `None` for Wan — no contract change needed across the two.
+#[derive(Clone, Debug)]
+pub enum GenerationOutput {
+    Images(Vec<Image>),
+    Video {
+        frames: Vec<Image>,
+        fps: u32,
+        audio: Option<AudioTrack>,
+    },
+}
+
+/// The request union (lifted from the SceneWorks worker's `ImageRequest`/`VideoRequest`). Most
+/// fields are optional; a model reads what it supports and `validate()` rejects the rest. A
+/// single `Default`-able struct (no builder): `GenerationRequest { prompt, ..Default::default() }`.
+#[derive(Clone, Debug)]
+pub struct GenerationRequest {
+    // --- Core ---
+    pub prompt: String,
+    pub negative_prompt: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    /// Number of images to produce (1..=8 for image models).
+    pub count: u32,
+
+    // --- Sampling (all optional; model/descriptor supply defaults) ---
+    pub seed: Option<u64>,
+    pub steps: Option<u32>,
+    pub guidance: Option<f32>,
+    pub true_cfg: Option<f32>,
+    /// CFG-scheduling start step — the companion to [`true_cfg`](Self::true_cfg): real classifier-free
+    /// guidance (and any per-branch conditioning gated with it) engages only once the denoise reaches
+    /// this step, leaving earlier steps single-forward. `None` ⇒ each model's own default. Today only
+    /// PuLID-FLUX honors it (default 1; its photoreal preset uses 4 to delay CFG a few steps); models
+    /// without CFG scheduling ignore it.
+    pub timestep_to_start_cfg: Option<u32>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
+
+    /// Guidance method — how the conditional and unconditional model predictions are combined (epic
+    /// 7434, the fourth orthogonal sampling layer). `"cfg"` (plain) | `"cfg_rescale"` (Lin et al.
+    /// per-token norm-rescale) | `"apg"` (adaptive-projected guidance) | `"cfg_pp"` (CFG++ — renoise
+    /// from the unconditional branch). `None` ⇒ the engine's default guidance path (the N1 no-op).
+    /// Gated per-model-per-backend by [`Capabilities::supported_guidance_methods`]; an unadvertised
+    /// value is rejected here at the contract boundary, and dropped-to-default with a worker event by
+    /// the N3 fallback layer (P5).
+    pub guidance_method: Option<String>,
+    /// APG projection mix η (`apg` only): recombine as `orthogonal + η·parallel` against the
+    /// conditional base. `η = 1` with no momentum and `norm_threshold = 0` reduces APG to plain CFG.
+    /// `None` ⇒ the engine default. Ignored by non-APG methods.
+    pub guidance_eta: Option<f32>,
+    /// APG momentum (`apg` only): `running = diff + momentum·running`, the buffer persisting across
+    /// denoise steps (0 ⇒ no momentum). `None` ⇒ the engine default. Ignored by non-APG methods.
+    pub guidance_momentum: Option<f32>,
+    /// APG norm-threshold (`apg` only): clamp the guidance delta to `‖diff‖ ≤ norm_threshold`
+    /// (`0` disables the clamp). `None` ⇒ the engine default. Ignored by non-APG methods.
+    pub guidance_norm_threshold: Option<f32>,
+
+    // --- Conditioning ---
+    pub conditioning: Vec<Conditioning>,
+    /// img2img strength when a single `Reference` is supplied without its own strength.
+    pub strength: Option<f32>,
+    /// Wan-VACE control strength — the diffusers `conditioning_scale` / per-vace-layer
+    /// `control_hidden_states_scale` (`hidden += proj_out(control)·scale`), broadcast to every
+    /// `vace_layers` entry. `None` ⇒ the diffusers default `1.0`. Only the `wan_vace` model reads it;
+    /// other models ignore it. (sc-3441)
+    pub control_scale: Option<f32>,
+    /// Image-guidance (true CFG on the **reference/image** condition) for reference-conditioned edit
+    /// models — the identity-strength lever (sc-8273/sc-8278). When `Some(s)` with `s > 1`, the
+    /// denoise extrapolates the with-reference velocity against the reference-dropped
+    /// (image-unconditional) velocity: `v = v_img0 + s·(v_ref − v_img0)`, pulling output toward the
+    /// reference identity *without* pinning composition. `None`/`≤1` ⇒ off (the shipped behavior;
+    /// the reference is plain edit conditioning). Today only the FLUX.2 klein/dev **edit** path reads
+    /// it (non-kv); other models ignore it. The `FLUX2_IMG_GUIDANCE` env var overrides this (debug).
+    pub image_guidance: Option<f32>,
+
+    // --- Video (Option; consumed by video models at the follow-on port) ---
+    pub frames: Option<u32>,
+    pub fps: Option<u32>,
+    pub duration: Option<f32>,
+    pub video_mode: Option<String>,
+    /// Generate this many extra leading temporal chunks (each = `vae_stride_t` latent frames) and
+    /// discard them after decode, so the first *kept* frame has a full temporal receptive field of
+    /// real (non-zero-padded) data — mitigates first-frame VAE/causal-conv artifacts. `None`/0 = off
+    /// (the default). Consumed by Wan video models (`generate_wan.py`'s `trim_first_frames`); video
+    /// models that don't support it ignore it.
+    pub trim_first_frames: Option<u32>,
+
+    // --- SVD image→video micro-conditioning (sc-3523; ignored by other models) ---
+    /// SVD `motion_bucket_id` — the motion-strength bucket baked into the `added_time_ids`
+    /// micro-conditioning (higher = more motion). `None` ⇒ the model default (127). Only the
+    /// `svd_xt` model reads it; other models ignore it.
+    pub motion_bucket_id: Option<f32>,
+    /// SVD `noise_aug_strength` — Gaussian noise added to the VAE-encoded conditioning image (and
+    /// surfaced in `added_time_ids`); higher = less fidelity to the source / more motion. `None` ⇒
+    /// the model default (0.02). Only `svd_xt` reads it.
+    pub noise_aug_strength: Option<f32>,
+    /// Frames decoded per temporal-VAE pass (diffusers `decode_chunk_size`) — a memory/quality knob
+    /// for chunked video VAE decode (smaller = less peak memory, changes temporal-boundary
+    /// behavior). `None` ⇒ the model default. Only `svd_xt` reads it today.
+    pub decode_chunk_size: Option<u32>,
+    /// SVD motion **conditioning** fps — the cadence the model was trained on, baked into the
+    /// `added_time_ids` micro-conditioning (`fps − 1`); lower ⇒ smoother/slower motion. This is
+    /// distinct from [`fps`](Self::fps), which is the output/playback cadence used when muxing the
+    /// clip: SVD decouples them (diffusers `StableVideoDiffusionPipeline(fps=…)` vs
+    /// `export_to_video(fps=…)`). `None` ⇒ the model default (7). Only `svd_xt` reads it (sc-3764).
+    pub conditioning_fps: Option<u32>,
+
+    // --- SeedVR2 super-resolution (sc-4816; ignored by other models) ---
+    /// SeedVR2 input **softness** — a pre-blur applied to the bicubic-upscaled low-resolution input
+    /// before VAE encode (reference `SeedVR2.generate_image(softness=…)`). Higher = more smoothing of
+    /// source compression/noise artifacts before the one-step restoration (trades fine detail for
+    /// fewer amplified artifacts on degraded footage). `None`/0.0 ⇒ no pre-blur (the reference
+    /// default). Only the `seedvr2` upscaler reads it; other models ignore it.
+    pub softness: Option<f32>,
+
+    // --- Prompt enhancement (LTX-2.3 sc-2845 + FLUX.2-dev caption upsampling sc-6030; ignored by
+    //     other models) ---
+    /// Rewrite `prompt` with an autoregressive LLM before encoding. Default `false` — the diffusion
+    /// path is unchanged. On any enhancer failure the model falls back to the original prompt
+    /// (reference-faithful). Consumed by: LTX-2.3 (the Gemma-3 `--enhance-prompt`) and FLUX.2-**dev**
+    /// (the Mistral3 multimodal `upsample_prompt`, sc-6030 — text-only for T2I, image-conditioned on
+    /// the request's reference images for edit; gated like the reference `caption_upsample_temperature`).
+    pub enhance_prompt: bool,
+    /// Use the separate uncensored 4-bit Gemma enhancer (`--use-uncensored-enhancer`) instead of the
+    /// loaded text-encoder backbone. Only consulted when `enhance_prompt` is set. LTX-2.3 only;
+    /// FLUX.2-dev ignores it (its upsampler is the loaded Mistral3 tower).
+    pub use_uncensored_enhancer: bool,
+    /// Max tokens for prompt enhancement (LTX default 512, FLUX.2-dev caption-upsample default 512,
+    /// each model's own default when `None`).
+    pub enhance_max_tokens: Option<u32>,
+    /// Sampling temperature for prompt enhancement (model default when `None`: LTX 0.7, FLUX.2-dev
+    /// caption-upsample 0.15 — the reference `caption_upsample_temperature`).
+    pub enhance_temperature: Option<f32>,
+
+    // --- Decoder (epic 7840; ignored by models without a PiD backbone) ---
+    /// Route this generation's decode through the optional **PiD** super-resolving decoder instead of
+    /// the native VAE. Default `false` — the VAE-decode path is unchanged. Only honored when the model
+    /// was loaded with [`LoadSpec::pid`](crate::LoadSpec::pid) weights (the PiD-eligible providers,
+    /// Qwen-Image / Krea today — sc-7845); a provider with no PiD loaded errors rather than silently
+    /// ignoring the request, and PiD-ineligible models ignore the flag. Turning PiD on also changes the
+    /// output resolution (native → 4×), so it is not a transparent decoder swap. PiD output is
+    /// research/evaluation-only (NSCLv1), surfaced/labeled at the worker/web layer (Phase 3).
+    pub use_pid: bool,
+    /// PiD **`from_ldm` early-stop** capture σ (epic 7840, sc-7993). Only consulted when
+    /// [`use_pid`](Self::use_pid) is set. When `Some(σ)`, stop the denoise as soon as the schedule's
+    /// noise level first drops to `≤ σ`, then hand that *partially-denoised* `x_k` to PiD with the
+    /// **achieved** degrade σ (`= sigmas[k]`) — the speed optimization that lets the (expensive)
+    /// backbone denoise exit early and the 4-step pixel decoder finish the rest. `None`/`≤0` (the
+    /// default) = the clean σ=0 path (full denoise, then decode the clean latent). The value is a
+    /// noise *ceiling*, schedule-agnostic, so the same σ maps to the right step on an 8-step Turbo and
+    /// a 50-step trajectory alike (the policy is [`crate::sampling::flow_capture_plan`]).
+    ///
+    /// **Frame:** σ is interpreted in the **flow-matching** frame `x_t = (1−σ)x0 + σε` — the path wired
+    /// today is the qwenimage latent space (Qwen-Image / Krea / Lightning-Qwen). A latent space whose
+    /// PiD student is variance-preserving (SDXL) or whose `from_ldm` wiring is a follow-on errors rather
+    /// than silently ignoring the request (see `mlx_gen_pid::resolve_pid_decoder`).
+    pub pid_capture_sigma: Option<f32>,
+
+    // --- Control ---
+    pub cancel: CancelFlag,
+}
+
+impl Default for GenerationRequest {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            negative_prompt: None,
+            width: 1024,
+            height: 1024,
+            count: 1,
+            seed: None,
+            steps: None,
+            guidance: None,
+            true_cfg: None,
+            timestep_to_start_cfg: None,
+            sampler: None,
+            scheduler: None,
+            scheduler_shift: None,
+            guidance_method: None,
+            guidance_eta: None,
+            guidance_momentum: None,
+            guidance_norm_threshold: None,
+            conditioning: Vec::new(),
+            strength: None,
+            control_scale: None,
+            image_guidance: None,
+            frames: None,
+            fps: None,
+            duration: None,
+            video_mode: None,
+            trim_first_frames: None,
+            motion_bucket_id: None,
+            noise_aug_strength: None,
+            decode_chunk_size: None,
+            conditioning_fps: None,
+            softness: None,
+            enhance_prompt: false,
+            use_uncensored_enhancer: false,
+            enhance_max_tokens: None,
+            enhance_temperature: None,
+            use_pid: false,
+            pid_capture_sigma: None,
+            cancel: CancelFlag::default(),
+        }
+    }
+}
+
+/// A first_last_frame / multi-keyframe input — a borrowed, normalized view of a
+/// [`Conditioning::Keyframe`]. Returned by [`GenerationRequest::keyframes`].
+#[derive(Clone, Copy, Debug)]
+pub struct KeyframeRef<'a> {
+    pub image: &'a Image,
+    pub frame_idx: i32,
+    pub strength: f32,
+}
+
+/// An in-context conditioning clip — a borrowed view of a [`Conditioning::VideoClip`]. Returned by
+/// [`GenerationRequest::video_clips`].
+#[derive(Clone, Copy, Debug)]
+pub struct VideoClipRef<'a> {
+    pub frames: &'a [Image],
+    pub frame_idx: i32,
+    pub strength: f32,
+}
+
+/// A replace_person masked control clip — a borrowed view of a [`Conditioning::ControlClip`].
+/// Returned by [`GenerationRequest::control_clip`].
+#[derive(Clone, Copy, Debug)]
+pub struct ControlClipRef<'a> {
+    pub frames: &'a [Image],
+    pub mask: &'a [Image],
+    pub masking_strength: f32,
+    pub start_frame: i32,
+    pub mode: ReplacementMode,
+}
+
+impl GenerationRequest {
+    /// All [`Conditioning::Keyframe`] inputs (first_last_frame / multi-keyframe), in request order.
+    pub fn keyframes(&self) -> Vec<KeyframeRef<'_>> {
+        self.conditioning
+            .iter()
+            .filter_map(|c| match c {
+                Conditioning::Keyframe {
+                    image,
+                    frame_idx,
+                    strength,
+                } => Some(KeyframeRef {
+                    image,
+                    frame_idx: *frame_idx,
+                    strength: *strength,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// All [`Conditioning::VideoClip`] in-context clips (extend_clip / video_bridge), in request order.
+    pub fn video_clips(&self) -> Vec<VideoClipRef<'_>> {
+        self.conditioning
+            .iter()
+            .filter_map(|c| match c {
+                Conditioning::VideoClip {
+                    frames,
+                    frame_idx,
+                    strength,
+                } => Some(VideoClipRef {
+                    frames,
+                    frame_idx: *frame_idx,
+                    strength: *strength,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The replace_person masked control clip ([`Conditioning::ControlClip`]), if present. The first
+    /// one wins (a request carries at most one person edit per generation).
+    pub fn control_clip(&self) -> Option<ControlClipRef<'_>> {
+        self.conditioning.iter().find_map(|c| match c {
+            Conditioning::ControlClip {
+                frames,
+                mask,
+                masking_strength,
+                start_frame,
+                mode,
+            } => Some(ControlClipRef {
+                frames,
+                mask,
+                masking_strength: *masking_strength,
+                start_frame: *start_frame,
+                mode: *mode,
+            }),
+            _ => None,
+        })
+    }
+}
+
+/// Seed when a [`GenerationRequest`] omits one: nanos since the epoch (any nonzero value works —
+/// this only sets which sample is drawn; a caller wanting reproducibility passes `req.seed`).
+/// Shared by every generator (F-006).
+pub fn default_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        // Fall back to a nonzero value: 0 is the "no seed" sentinel a caller would pass to mean
+        // "pick one", so the default must never itself be 0 (F-089).
+        .unwrap_or(1)
+}
+
+/// Typed conditioning inputs. Each image family uses the subset its `Capabilities` advertises.
+///
+/// The video families ([`Conditioning::Keyframe`] / [`Conditioning::VideoClip`] /
+/// [`Conditioning::ControlClip`]) are the epic-3040 advanced-mode inputs and map onto the two LTX
+/// conditioning mechanisms (see `docs/SPIKE_ADVANCED_VIDEO_3040.md`): a [`Keyframe`](Conditioning::Keyframe)
+/// is **replace-latent** (overwrite the target latent at a frame index — first_last_frame); a
+/// [`VideoClip`](Conditioning::VideoClip) / [`ControlClip`](Conditioning::ControlClip) is
+/// **keyframe-append** (append the clip's VAE latents as extra in-context tokens — extend_clip /
+/// video_bridge / replace_person, the IC-LoRA path).
+#[derive(Clone, Debug)]
+pub enum Conditioning {
+    /// img2img / IP-Adapter / identity reference.
+    Reference { image: Image, strength: Option<f32> },
+    /// Multiple references with no per-image strength (Qwen-Image-Edit).
+    MultiReference { images: Vec<Image> },
+    /// FLUX.1-Redux references, each with its own strength.
+    ReduxRefs { refs: Vec<(Image, f32)> },
+    /// ControlNet / pose conditioning. `scale` mirrors [`Reference::strength`]: `None` means "use the
+    /// per-model default control scale" and `Some(x)` is an explicit override — including `Some(0.0)`,
+    /// a deliberately inert control branch. The `Option` is what distinguishes explicit-inert from
+    /// unset (the old bare `f32` could not; F-085).
+    Control {
+        image: Image,
+        kind: ControlKind,
+        scale: Option<f32>,
+    },
+    /// FLUX.1-Depth.
+    Depth { image: Image },
+    /// FIBO-Edit / inpaint mask.
+    Mask { image: Image },
+    /// A keyframe pinned at a specific output **latent** frame index (first_last_frame / general
+    /// multi-keyframe). VAE-encoded and its tokens **overwrite** the target latent at `frame_idx`
+    /// with denoise mask `1 − strength` (the replace-latent mechanism — reference
+    /// `VideoConditionByLatentIndex`). `strength = 1.0` fully pins the frame. first_last_frame is two
+    /// of these (at `0` and the last latent frame).
+    Keyframe {
+        image: Image,
+        frame_idx: i32,
+        strength: f32,
+    },
+    /// An in-context conditioning **clip** (extend_clip / video_bridge — the LTX IC-LoRA path). The
+    /// frames are VAE-encoded and **appended** as extra tokens at `frame_idx` (RoPE-offset on the
+    /// frame axis) with denoise mask `1 − strength` (reference `VideoConditionByKeyframeIndex`).
+    /// extend_clip = one clip at `frame_idx 0`; video_bridge = a left clip at `0` and a right clip at
+    /// the tail.
+    VideoClip {
+        frames: Vec<Image>,
+        frame_idx: i32,
+        strength: f32,
+    },
+    /// A masked control clip for replace_person. `frames` is the (host-built, person-region
+    /// neutralized) control clip; `mask` is the per-frame binary person mask (white = regenerate).
+    /// Drives the keyframe-append in-context conditioning **plus** mask injection (force the masked
+    /// region toward the re-noised source for the first `ceil(steps · masking_strength)` steps —
+    /// reference `prepare_mask_injection`). Person detect/track stays in onnx and supplies these.
+    ControlClip {
+        frames: Vec<Image>,
+        mask: Vec<Image>,
+        masking_strength: f32,
+        /// Output latent-frame the control clip aligns to (reference `masking_source.start_frame`).
+        start_frame: i32,
+        /// Replacement granularity (reference `replacement_mode`); the LTX mask path is region-driven
+        /// so it is carried for the worker contract / WanVACE parity rather than changing the mask math.
+        mode: ReplacementMode,
+    },
+}
+
+impl Conditioning {
+    /// The [`ConditioningKind`] discriminant — for capability checks / `validate()`. Centralized here
+    /// so adding a [`Conditioning`] variant updates every model's validation in one place.
+    pub fn kind(&self) -> ConditioningKind {
+        match self {
+            Conditioning::Reference { .. } => ConditioningKind::Reference,
+            Conditioning::MultiReference { .. } => ConditioningKind::MultiReference,
+            Conditioning::ReduxRefs { .. } => ConditioningKind::ReduxRefs,
+            Conditioning::Control { .. } => ConditioningKind::Control,
+            Conditioning::Depth { .. } => ConditioningKind::Depth,
+            Conditioning::Mask { .. } => ConditioningKind::Mask,
+            Conditioning::Keyframe { .. } => ConditioningKind::Keyframe,
+            Conditioning::VideoClip { .. } => ConditioningKind::VideoClip,
+            Conditioning::ControlClip { .. } => ConditioningKind::ControlClip,
+        }
+    }
+}
+
+/// Granularity of a replace_person edit (reference `replacement_mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplacementMode {
+    /// Replace the face region only.
+    #[default]
+    FaceOnly,
+    /// Replace the full person but keep the original outfit.
+    FullPersonKeepOutfit,
+    /// Replace the full person including the outfit.
+    FullPersonReplaceOutfit,
+}
+
+/// The control signal carried by [`Conditioning::Control`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlKind {
+    Pose,
+    Canny,
+    Depth,
+    Other(String),
+}
+
+/// Which [`Conditioning`] variants a model accepts — for capability introspection + validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditioningKind {
+    Reference,
+    MultiReference,
+    ReduxRefs,
+    Control,
+    Depth,
+    Mask,
+    /// first_last_frame / multi-keyframe ([`Conditioning::Keyframe`]).
+    Keyframe,
+    /// extend_clip / video_bridge ([`Conditioning::VideoClip`]).
+    VideoClip,
+    /// replace_person ([`Conditioning::ControlClip`]).
+    ControlClip,
+}
+
+/// What kind of media a model emits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Modality {
+    Image,
+    Video,
+    Both,
+}
+
+/// A model's stable identity + advertised capabilities. Returned by `descriptor()` and also
+/// constructible without loading weights (registry introspection).
+#[derive(Clone, Debug)]
+pub struct ModelDescriptor {
+    pub id: &'static str,
+    pub family: &'static str,
+    /// `"mlx"` | `"candle"` — the tensor backend whose provider crate registered this engine.
+    /// Drives the worker's registry-derived capability advertisement (sc-3723); MLX families set
+    /// `"mlx"`.
+    pub backend: &'static str,
+    pub modality: Modality,
+    pub capabilities: Capabilities,
+}
+
+/// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
+/// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
+/// ..Default::default() }`).
+#[derive(Clone, Debug, Default)]
+pub struct Capabilities {
+    pub supports_negative_prompt: bool,
+    pub supports_guidance: bool,
+    pub supports_true_cfg: bool,
+    pub conditioning: Vec<ConditioningKind>,
+    pub supports_lora: bool,
+    pub supports_lokr: bool,
+    pub samplers: Vec<&'static str>,
+    pub schedulers: Vec<&'static str>,
+    /// The guidance methods this model+backend honors (epic 7434), e.g. `["cfg", "cfg_rescale"]`.
+    /// Empty ⇒ only the engine's implicit default path (no selectable guidance axis). Per-model-
+    /// per-backend, like [`samplers`](Self::samplers) / [`schedulers`](Self::schedulers).
+    pub supported_guidance_methods: Vec<&'static str>,
+    pub min_size: u32,
+    pub max_size: u32,
+    pub max_count: u32,
+    pub mac_only: bool,
+    /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
+    /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
+    pub supported_quants: &'static [Quant],
+    // Loader hints.
+    pub supports_kv_cache: bool,
+    pub requires_sigma_shift: bool,
+    /// Whether this engine honors [`OffloadPolicy::Sequential`](crate::runtime::OffloadPolicy)
+    /// (epic 10765, sc-11126). [`OffloadPolicy::Sequential`] is *advisory* — a provider that has not
+    /// wired the load→use→drop residency lifecycle silently treats it as `Resident` (never an error),
+    /// which makes the fallback undiscoverable from the outside. This bit is the discovery signal: a
+    /// consumer (worker / UI) reads it to know whether requesting `Sequential` will actually bound peak
+    /// memory on this engine or be a no-op. `Default` is `false` so an unwired engine does not
+    /// over-advertise; a provider that drives the shared [`crate::runtime`] residency seam sets it
+    /// `true`.
+    pub supports_sequential_offload: bool,
+}
+
+impl Capabilities {
+    /// Whether this model accepts the given conditioning kind.
+    pub fn accepts(&self, kind: ConditioningKind) -> bool {
+        self.conditioning.contains(&kind)
+    }
+
+    /// Reject a request that violates the **advertised** capability surface — the model-agnostic
+    /// checks every `Generator::validate` shares, so a descriptor cannot promise something
+    /// `validate` then silently ignores at runtime:
+    ///
+    /// - `count` within `1..=max_count`,
+    /// - `steps` (when supplied) must be `>= 1` — an explicit `0` would run a 0-step denoise and
+    ///   VAE-decode pure noise (F-007); the schedule builders' `.max(1)` clamps document this as the
+    ///   real floor,
+    /// - `width`/`height` within `min_size..=max_size`,
+    /// - `negative_prompt` / `guidance` / `true_cfg` only when the matching `supports_*` flag is set,
+    ///   and `guidance` / `true_cfg` must be finite (a NaN would poison the guidance math, F-053),
+    /// - `sampler` / `scheduler` / `guidance_method` (when supplied) must name an advertised entry,
+    /// - every `conditioning` entry must be an [`accepts`](Self::accepts)ed kind.
+    ///
+    /// Capability-gap rejections (unsupported negative_prompt / guidance / true_cfg / sampler /
+    /// scheduler / guidance_method / conditioning) return the typed [`Error::Unsupported`] so a
+    /// consumer (SceneWorks worker / candle gating) can distinguish "this backend can't do that"
+    /// from a range violation or generic failure (F-008); malformed-value rejections (count/size/
+    /// steps out of range, non-finite guidance) return [`Error::Msg`].
+    ///
+    /// `id` is the model's descriptor id, used in error messages. Model-specific constraints — an
+    /// empty-prompt rejection, size-alignment (multiple-of-N), frame-count divisibility,
+    /// sampler→solver mapping — are layered on top by each model's own `validate`; this is the shared
+    /// floor, not a replacement for them.
+    pub fn validate_request(&self, id: &str, req: &GenerationRequest) -> Result<()> {
+        // Footgun guard (F-084): a descriptor that enables a capability but leaves max_count/max_size
+        // at the `Default` 0 would reject EVERY request with a confusing "out of range 0..=0". A real
+        // model always sets non-zero bounds, so catch the descriptor mistake in debug/test builds.
+        debug_assert!(
+            self.max_count > 0 && self.max_size > 0,
+            "{id}: Capabilities max_count={} max_size={} left at Default 0 — descriptor forgot its bounds",
+            self.max_count,
+            self.max_size
+        );
+        if req.count == 0 || req.count > self.max_count {
+            return Err(Error::Msg(format!(
+                "{id}: count {} out of range 1..={}",
+                req.count, self.max_count
+            )));
+        }
+        // An explicit `steps: Some(0)` runs a 0-step denoise and VAE-decodes pure scaled noise; the
+        // schedule builders' `.max(1)` clamps (sampling.rs) cite this as the real floor, so enforce it
+        // here rather than letting it fall through to ad-hoc per-provider guards (F-007). `None` falls
+        // back to each model's default; a *derived* 0 from img2img `int(steps·strength)` is a separate,
+        // legitimate no-op handled downstream.
+        if req.steps == Some(0) {
+            return Err(Error::Msg(format!(
+                "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+            )));
+        }
+        if req.width < self.min_size
+            || req.height < self.min_size
+            || req.width > self.max_size
+            || req.height > self.max_size
+        {
+            return Err(Error::Msg(format!(
+                "{id}: size {}x{} outside supported range {}..={}",
+                req.width, req.height, self.min_size, self.max_size
+            )));
+        }
+        if req.negative_prompt.is_some() && !self.supports_negative_prompt {
+            return Err(Error::Unsupported(format!(
+                "{id}: negative prompts are not supported"
+            )));
+        }
+        if req.guidance.is_some() && !self.supports_guidance {
+            return Err(Error::Unsupported(format!(
+                "{id}: guidance is not supported"
+            )));
+        }
+        if req.true_cfg.is_some() && !self.supports_true_cfg {
+            return Err(Error::Unsupported(format!(
+                "{id}: true_cfg is not supported"
+            )));
+        }
+        // A non-finite guidance / true_cfg would flow into the CFG combine and NaN-poison the run
+        // (a NaN passes `x > 1.0`-style checks silently); reject it at the boundary (F-053).
+        if let Some(g) = req.guidance {
+            if !g.is_finite() {
+                return Err(Error::Msg(format!(
+                    "{id}: guidance must be finite (got {g})"
+                )));
+            }
+        }
+        if let Some(c) = req.true_cfg {
+            if !c.is_finite() {
+                return Err(Error::Msg(format!(
+                    "{id}: true_cfg must be finite (got {c})"
+                )));
+            }
+        }
+        if let Some(s) = &req.sampler {
+            if !self.samplers.contains(&s.as_str()) {
+                return Err(Error::Unsupported(format!(
+                    "{id}: unsupported sampler {s:?} (supported: {:?})",
+                    self.samplers
+                )));
+            }
+        }
+        if let Some(s) = &req.scheduler {
+            if !self.schedulers.contains(&s.as_str()) {
+                return Err(Error::Unsupported(format!(
+                    "{id}: unsupported scheduler {s:?} (supported: {:?})",
+                    self.schedulers
+                )));
+            }
+        }
+        if let Some(m) = &req.guidance_method {
+            if !self.supported_guidance_methods.contains(&m.as_str()) {
+                return Err(Error::Unsupported(format!(
+                    "{id}: unsupported guidance_method {m:?} (supported: {:?})",
+                    self.supported_guidance_methods
+                )));
+            }
+        }
+        for c in &req.conditioning {
+            let kind = c.kind();
+            if !self.accepts(kind) {
+                return Err(Error::Unsupported(format!(
+                    "{id}: {kind:?} conditioning is not supported"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(w: u32, h: u32) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        }
+    }
+
+    #[test]
+    fn keyframes_accessor_collects_in_order() {
+        // first_last_frame: two keyframes at 0 and the last latent frame.
+        let req = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Keyframe {
+                    image: img(2, 2),
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
+                Conditioning::Reference {
+                    image: img(2, 2),
+                    strength: None,
+                },
+                Conditioning::Keyframe {
+                    image: img(4, 4),
+                    frame_idx: 8,
+                    strength: 0.75,
+                },
+            ],
+            ..Default::default()
+        };
+        let kf = req.keyframes();
+        assert_eq!(kf.len(), 2);
+        assert_eq!((kf[0].frame_idx, kf[0].strength), (0, 1.0));
+        assert_eq!((kf[1].frame_idx, kf[1].strength), (8, 0.75));
+        assert_eq!((kf[1].image.width, kf[1].image.height), (4, 4));
+        // Reference is not a keyframe and is not a video clip / control clip.
+        assert!(req.video_clips().is_empty());
+        assert!(req.control_clip().is_none());
+    }
+
+    #[test]
+    fn video_clips_accessor_collects_clips() {
+        // video_bridge: left clip @0, right clip @tail.
+        let req = GenerationRequest {
+            conditioning: vec![
+                Conditioning::VideoClip {
+                    frames: vec![img(2, 2), img(2, 2)],
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
+                Conditioning::VideoClip {
+                    frames: vec![img(2, 2)],
+                    frame_idx: 24,
+                    strength: 0.9,
+                },
+            ],
+            ..Default::default()
+        };
+        let clips = req.video_clips();
+        assert_eq!(clips.len(), 2);
+        assert_eq!((clips[0].frames.len(), clips[0].frame_idx), (2, 0));
+        assert_eq!((clips[1].frames.len(), clips[1].frame_idx), (1, 24));
+        assert!(req.keyframes().is_empty());
+    }
+
+    #[test]
+    fn control_clip_accessor_returns_first() {
+        let req = GenerationRequest {
+            conditioning: vec![Conditioning::ControlClip {
+                frames: vec![img(2, 2), img(2, 2)],
+                mask: vec![img(2, 2), img(2, 2)],
+                masking_strength: 0.8,
+                start_frame: 0,
+                mode: ReplacementMode::FaceOnly,
+            }],
+            ..Default::default()
+        };
+        let cc = req.control_clip().expect("control clip present");
+        assert_eq!((cc.frames.len(), cc.mask.len()), (2, 2));
+        assert_eq!(cc.masking_strength, 0.8);
+        assert_eq!(cc.mode, ReplacementMode::FaceOnly);
+    }
+
+    #[test]
+    fn accessors_empty_by_default() {
+        let req = GenerationRequest::default();
+        assert!(req.keyframes().is_empty());
+        assert!(req.video_clips().is_empty());
+        assert!(req.control_clip().is_none());
+    }
+
+    /// A capability surface that turns nothing extra on: a single 256..=1024 image, no
+    /// negative/guidance/true_cfg, no samplers/schedulers, only `Reference` conditioning.
+    fn caps() -> Capabilities {
+        Capabilities {
+            conditioning: vec![ConditioningKind::Reference],
+            samplers: vec!["euler"],
+            min_size: 256,
+            max_size: 1024,
+            max_count: 1,
+            ..Default::default()
+        }
+    }
+
+    fn base_req() -> GenerationRequest {
+        GenerationRequest {
+            prompt: "x".into(),
+            width: 512,
+            height: 512,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_request_accepts_in_surface() {
+        let c = caps();
+        assert!(c.validate_request("m", &base_req()).is_ok());
+        // An advertised sampler + an accepted conditioning kind are fine.
+        assert!(c
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    sampler: Some("euler".into()),
+                    conditioning: vec![Conditioning::Reference {
+                        image: img(8, 8),
+                        strength: None,
+                    }],
+                    ..base_req()
+                }
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_request_enforces_advertised_surface() {
+        let c = caps();
+        let cases: Vec<GenerationRequest> = vec![
+            // count out of range
+            GenerationRequest {
+                count: 0,
+                ..base_req()
+            },
+            GenerationRequest {
+                count: 2,
+                ..base_req()
+            },
+            // size out of range (below min, above max)
+            GenerationRequest {
+                width: 128,
+                ..base_req()
+            },
+            GenerationRequest {
+                height: 2048,
+                ..base_req()
+            },
+            // capability flags not advertised
+            GenerationRequest {
+                negative_prompt: Some("n".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                guidance: Some(3.5),
+                ..base_req()
+            },
+            GenerationRequest {
+                true_cfg: Some(4.0),
+                ..base_req()
+            },
+            // sampler / scheduler not advertised
+            GenerationRequest {
+                sampler: Some("unipc".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                scheduler: Some("linear".into()),
+                ..base_req()
+            },
+            // conditioning kind not accepted
+            GenerationRequest {
+                conditioning: vec![Conditioning::Depth { image: img(8, 8) }],
+                ..base_req()
+            },
+        ];
+        for (i, req) in cases.iter().enumerate() {
+            assert!(
+                c.validate_request("m", req).is_err(),
+                "case {i} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_request_rejects_explicit_zero_steps() {
+        // F-007: the floor now enforces the steps>=1 claim the schedule builders rely on.
+        let c = caps();
+        let bad = GenerationRequest {
+            steps: Some(0),
+            ..base_req()
+        };
+        let err = c.validate_request("m", &bad).unwrap_err();
+        assert!(matches!(err, Error::Msg(_)), "steps=0 is a range error");
+        assert!(err.to_string().contains("steps must be >= 1"));
+        // `None` and a positive count still pass.
+        assert!(c.validate_request("m", &base_req()).is_ok());
+        assert!(c
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    steps: Some(1),
+                    ..base_req()
+                }
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn capability_gaps_return_typed_unsupported() {
+        // F-008: capability-gap branches must be `Error::Unsupported`, not `Msg`, so candle gating /
+        // the worker can distinguish them. Malformed-value branches (range/finiteness) stay `Msg`.
+        let c = caps();
+        let gap_cases: Vec<GenerationRequest> = vec![
+            GenerationRequest {
+                negative_prompt: Some("n".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                guidance: Some(3.5),
+                ..base_req()
+            },
+            GenerationRequest {
+                true_cfg: Some(4.0),
+                ..base_req()
+            },
+            GenerationRequest {
+                sampler: Some("unipc".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                scheduler: Some("linear".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                guidance_method: Some("apg".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                conditioning: vec![Conditioning::Depth { image: img(8, 8) }],
+                ..base_req()
+            },
+        ];
+        for (i, req) in gap_cases.iter().enumerate() {
+            let err = c.validate_request("m", req).unwrap_err();
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "gap case {i} should be typed Unsupported, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_guidance_and_true_cfg_are_rejected() {
+        // F-053: a NaN passes `x > 1.0`-style checks; the floor rejects non-finite explicitly. Uses
+        // a caps that advertises guidance/true_cfg so the finiteness branch (not the support gate) runs.
+        let c = Capabilities {
+            supports_guidance: true,
+            supports_true_cfg: true,
+            ..caps()
+        };
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let g = GenerationRequest {
+                guidance: Some(bad),
+                ..base_req()
+            };
+            let err = c.validate_request("m", &g).unwrap_err();
+            assert!(
+                matches!(err, Error::Msg(_)),
+                "guidance {bad} → Msg range error"
+            );
+            assert!(err.to_string().contains("guidance must be finite"));
+            let t = GenerationRequest {
+                true_cfg: Some(bad),
+                ..base_req()
+            };
+            assert!(matches!(
+                c.validate_request("m", &t).unwrap_err(),
+                Error::Msg(_)
+            ));
+        }
+        // Finite guidance/true_cfg still pass.
+        assert!(c
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    guidance: Some(3.5),
+                    true_cfg: Some(2.0),
+                    ..base_req()
+                }
+            )
+            .is_ok());
+    }
+}

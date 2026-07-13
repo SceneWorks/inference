@@ -1,0 +1,804 @@
+//! sc-3045 — LoRA/LoKr **training** on the SDXL U-Net, in pure Rust on mlx-rs. The SDXL realization
+//! of the core [`Trainer`] contract (epic 3039), built on the same functional-autograd mechanism the
+//! Z-Image trainer proved (sc-3042/3044) and the host-generic factor machinery hoisted to core
+//! ([`mlx_gen::train::lora`], sc-3045). Parity target = the SceneWorks torch `SdxlLoraTrainer` /
+//! `_SdxlLoraBackend`.
+//!
+//! The whole prepare→cache→train→save lifecycle is the shared SDXL-family backbone
+//! ([`family::train_family`], sc-7781 — also driven by `mlx-gen-kolors`); this module supplies the
+//! SDXL deltas via [`SdxlFamilyHooks`] and keeps the registration glue + the memory-fit curve local.
+//!
+//! **What is SDXL-specific here** (the hook bodies; everything else is the shared backbone):
+//!   * **Noise / objective — discrete DDPM in the vendored sigma-space.** SDXL inference runs the
+//!     vendored k-diffusion Euler-Ancestral sampler ([`EulerSampler`]): latents are stored
+//!     *renormalized*, `scale_model_input` is the identity, and the per-step time `t` is the float
+//!     sigma-table index in `[0, 1000]` that the U-Net's sinusoidal embedding consumes. Crucially the
+//!     renormalized model input `(x0 + σ·noise)·rsqrt(σ²+1)` is **algebraically identical** to the
+//!     diffusers DDPM `noisy = √(ᾱ)·x0 + √(1−ᾱ)·noise` (since `rsqrt(σ²+1) = √(ᾱ)`,
+//!     `σ·rsqrt(σ²+1) = √(1−ᾱ)`), and the **epsilon** target is the unit `noise`. So training reuses
+//!     the crate's own [`EulerSampler::add_noise_with`] at a sampled integer table-index `t` — making
+//!     train/inference consistent **by construction** — and regresses the U-Net's `eps` toward
+//!     `noise`. (SDXL-base is epsilon-prediction; the v-prediction the torch reference's
+//!     `prediction_type` branch supports is never taken for SDXL-base, and the crate's eps-only
+//!     sampler could not consume a v-pred adapter — so eps is the correct and only objective here.)
+//!     `t` is sampled **uniform over the integer table indices `[1, 1000]`**, which maps 1:1 onto the
+//!     diffusers `randint(0, 1000)` the torch trainer uses (the table is `concat([0], σ_1..σ_1000)`).
+//!   * **`added_cond_kwargs`.** The U-Net forward takes the pooled `text_embeds` (CLIP-bigG pooled)
+//!     and the 6-element `time_ids`. The crate's inference path hardcodes
+//!     `time_ids = [512,512,0,0,512,512]` (the vendored `generate_latents` quirk — it ignores the
+//!     real size); training feeds the **same** [`text_time_ids`] so the conditioning the LoRA learns
+//!     under matches what inference applies it under. (This deliberately diverges from the torch
+//!     trainer's real-resolution time_ids — that would mismatch this engine's inference.)
+//!   * **Dual-CLIP conditioning.** `encoder_hidden_states = concat(CLIP-L.hidden[-2], bigG.hidden[-2])`
+//!     and pooled `text_embeds = bigG.pooled`, via [`encode_conditioning`]. Single forward, no CFG
+//!     (the torch ref encodes with `do_classifier_free_guidance=False`).
+//!   * **f32 base.** The U-Net + both text encoders + VAE load at f32 for clean autograd (the
+//!     inference path runs fp16; the trained f32 factors merge into the fp16 base at load, casts
+//!     handled by the loader). The VAE encodes the f32 init image to the scaled latent `x0`.
+//!   * **Adapter surface, matched to inference consumption.** LoRA targets the **complete** UNet
+//!     attention surface (down/mid/up `to_q/k/v/to_out.0`) — what `LoraCoverage::Complete`
+//!     (`model::load`'s default) merges, and what the torch PEFT suffix-match selects. LoKr targets
+//!     the **vendored** surface (down/up attention only): the SDXL LoKr loader keeps `mid_block` out
+//!     (sc-2640), so training mid_block LoKr would produce factors no inference path reads. LoRA
+//!     saves PEFT keys under `base_model.model.unet.` (what `_SdxlLoraBackend` emits); LoKr saves the
+//!     bare `<path>.lokr_*` keys; both reconstruct at **f32** (the SDXL merge dtype).
+
+pub mod family;
+
+use mlx_gen::{
+    gen_core, Image, LoadSpec, Modality, Result, TrainOptimizer, Trainer, TrainerDescriptor,
+    TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
+};
+use mlx_rs::{random, Array, Dtype};
+
+use crate::config::DiffusionConfig;
+use crate::model::MODEL_ID;
+use crate::pipeline::{encode_conditioning, render_sample, text_time_ids};
+use crate::sampler::EulerSampler;
+use crate::text_encoder::ClipTextEncoder;
+use crate::tokenizer::ClipBpeTokenizer;
+use crate::unet::UNet2DConditionModel;
+use crate::vae::Autoencoder;
+
+use family::{train_family, SdxlFamilyHooks, TrainTimestep};
+
+/// The SDXL family deltas behind the shared [`train_family`] backbone (sc-7781): the dual-CLIP
+/// encoder pair + tokenizer, and the Euler sampler whose sigma table drives the renormalized DDPM
+/// noising. Held in [`SdxlTrainer::hooks`].
+struct SdxlHooks {
+    tokenizer: ClipBpeTokenizer,
+    /// The dual CLIP encoders, in `Option`s so they can be **dropped after the caching loop** (sc-4941,
+    /// 32 GB-Mac headroom): they are idle during training (every prompt is already encoded to the
+    /// cached conditioning), so freeing them (~3.3 GB at f32) before the train loop leaves more of the
+    /// unified-memory budget for the U-Net working set.
+    te1: Option<ClipTextEncoder>,
+    te2: Option<ClipTextEncoder>,
+    /// The SDXL noise schedule (the same sigma table the inference Euler-Ancestral sampler uses);
+    /// training reuses its [`EulerSampler::add_noise_with`] for the renormalized DDPM noising.
+    sampler: EulerSampler,
+}
+
+impl SdxlHooks {
+    /// The two CLIP encoders, or a typed error if they were already freed after caching.
+    fn encoders(&self) -> Result<(&ClipTextEncoder, &ClipTextEncoder)> {
+        match (&self.te1, &self.te2) {
+            (Some(a), Some(b)) => Ok((a, b)),
+            _ => Err(mlx_gen::Error::Msg(
+                "sdxl trainer: text encoders already freed (encode after caching)".into(),
+            )),
+        }
+    }
+}
+
+impl SdxlFamilyHooks for SdxlHooks {
+    fn label(&self) -> &'static str {
+        "sdxl"
+    }
+
+    /// Caption → `(conditioning [1, N, 2048], pooled [1, 1280])`: tokenize (no negative — training is
+    /// CFG-off), run both CLIP encoders, and assemble the SDXL dual-CLIP conditioning + pooled embed
+    /// exactly as the inference [`encode_conditioning`] path.
+    fn encode_prompt(&self, caption: &str) -> Result<(Array, Array)> {
+        let (te1, te2) = self.encoders()?;
+        let tokens = self.tokenizer.tokenize_batch(caption, None)?;
+        encode_conditioning(te1, te2, &tokens)
+    }
+
+    /// Preview-sample CFG batch (`[2, …]` = positive then empty-negative): the tokenizer builds the
+    /// `Some("")` negative row, so `encode_conditioning` produces the `[2, …]` conditioning SDXL's
+    /// real-CFG preview denoise needs.
+    fn encode_sample_cfg(&self, prompt: &str) -> Result<(Array, Array)> {
+        let (te1, te2) = self.encoders()?;
+        let tokens = self.tokenizer.tokenize_batch(prompt, Some(""))?;
+        encode_conditioning(te1, te2, &tokens)
+    }
+
+    fn free_text_encoders(&mut self) {
+        self.te1 = None;
+        self.te2 = None;
+    }
+
+    /// SDXL micro-conditioning `time_ids`, hardcoded `[512,512,0,0,512,512]` (the vendored
+    /// `generate_latents` quirk) — ignores the real `edge` so the LoRA trains under the conditioning
+    /// inference applies it under.
+    fn time_ids(&self, batch: i32, _edge: u32) -> Array {
+        text_time_ids(batch)
+    }
+
+    /// Sample a **uniform integer** DDPM timestep over the sigma-table indices `[1, max_time]` (the
+    /// vendored table is `concat([0], σ_1..σ_1000)`, so index `t` maps to diffusers `ᾱ[t-1]` — a
+    /// uniform draw here equals the torch trainer's `randint(0, num_train_timesteps)`). Deterministic
+    /// in `seed`. At an integer `t` the sampler's sigma interpolation is exact (`σ = σ_t`).
+    fn sample_timestep(&self, seed: u64) -> Result<TrainTimestep> {
+        let k = random::key(seed)?;
+        let max_t = self.sampler.max_time(); // 1000.0
+        let u = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k))?.item::<f32>();
+        // floor(1 + u·max_t) ∈ [1, max_t] (u ∈ [0,1)); clamp the u→1 edge defensively.
+        let t = (1.0 + u * max_t).floor().clamp(1.0, max_t);
+        Ok(TrainTimestep::Sigma(t))
+    }
+
+    /// Renormalized model input `(x0 + σ(t)·noise)·rsqrt(σ(t)²+1)` — algebraically the diffusers DDPM
+    /// `noisy`. Reusing the sampler's own `add_noise_with` makes the training input bit-consistent with
+    /// the inference convention.
+    fn add_noise(&self, x0: &Array, noise: &Array, t: TrainTimestep) -> Result<Array> {
+        match t {
+            TrainTimestep::Sigma(s) => self.sampler.add_noise_with(x0, noise, s),
+            TrainTimestep::Index(_) => Err(mlx_gen::Error::Msg(
+                "sdxl trainer: expected a sigma-table (float) timestep".into(),
+            )),
+        }
+    }
+
+    fn peak_gb(&self, p: f64, bf16: bool) -> f64 {
+        projected_dense_peak_gb(p, bf16)
+    }
+
+    fn render_sample(
+        &self,
+        unet: &UNet2DConditionModel,
+        vae: &Autoencoder,
+        conditioning: &Array,
+        pooled: &Array,
+        guidance: f32,
+        seed: u64,
+        edge: u32,
+        steps: usize,
+        _dtype: Dtype,
+    ) -> Result<Image> {
+        render_sample(
+            unet,
+            vae,
+            &self.sampler,
+            conditioning,
+            pooled,
+            guidance,
+            seed,
+            edge,
+            steps,
+        )
+    }
+}
+
+/// LoRA/LoKr trainer for Stable Diffusion XL, implementing the core [`Trainer`] surface: a frozen
+/// f32 base (U-Net + dual CLIP + VAE + tokenizer) that drives the shared SDXL-family backbone
+/// ([`train_family`]) — caching a captioned image dataset to VAE-latents + dual-CLIP
+/// conditioning/pooled embeds, then running the functional-autograd loop — and writes an adapter that
+/// round-trips through the SDXL inference loader.
+pub struct SdxlTrainer {
+    descriptor: TrainerDescriptor,
+    vae: Autoencoder,
+    unet: UNet2DConditionModel,
+    hooks: SdxlHooks,
+}
+
+fn trainer_descriptor() -> TrainerDescriptor {
+    TrainerDescriptor {
+        id: MODEL_ID,
+        family: "sdxl",
+        backend: "mlx",
+        modality: Modality::Image,
+        supports_lora: true,
+        supports_lokr: true,
+    }
+}
+
+/// Construct the trainer from an SDXL snapshot directory (the diffusers multi-component tree:
+/// `tokenizer/ text_encoder/ text_encoder_2/ unet/ vae/`). Loads the base at **f32** (training needs
+/// the dense, high-precision base for clean autograd; inference runs fp16). Registered via
+/// [`TrainerRegistration`].
+pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p,
+        WeightsSource::File(_) => {
+            return Err(mlx_gen::Error::Msg(
+                "sdxl trainer expects a snapshot directory (tokenizer/ text_encoder/ \
+                 text_encoder_2/ unet/ vae/), not a single .safetensors file"
+                    .into(),
+            ))
+        }
+    };
+    Ok(Box::new(SdxlTrainer {
+        descriptor: trainer_descriptor(),
+        vae: crate::loader::load_vae(root)?,
+        unet: crate::loader::load_unet(root)?,
+        hooks: SdxlHooks {
+            tokenizer: crate::loader::load_tokenizer(root)?,
+            te1: Some(crate::loader::load_text_encoder_1(root)?),
+            te2: Some(crate::loader::load_text_encoder_2(root)?),
+            sampler: EulerSampler::new(&DiffusionConfig::sdxl_base(), true)?,
+        },
+    }))
+}
+
+// Link-time trainer registration (epic 3720): the macro emits the `inventory::submit!` and bridges
+// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_trainer! { trainer_descriptor => load_trainer }
+
+impl Trainer for SdxlTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        if req.items.is_empty() {
+            return Err("sdxl trainer: dataset is empty".into());
+        }
+        if req.config.rank == 0 {
+            return Err("sdxl trainer: rank must be > 0".into());
+        }
+        // F-023: steps == 0 makes the `1..=steps` loop empty and the run returns `Canceled` (the
+        // family.rs comment claims validate rejects this — it didn't). z-image checks it; mirror.
+        if req.config.steps == 0 {
+            return Err("sdxl trainer: steps must be > 0".into());
+        }
+        if !TrainOptimizer::is_supported(&req.config.optimizer) {
+            return Err(format!(
+                "sdxl trainer: optimizer '{}' is not available on MLX training (supported: \
+                 adamw, adam, rose, prodigy)",
+                req.config.optimizer
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        self.validate(req)?;
+        train_family(&mut self.hooks, &mut self.unet, &self.vae, req, on_progress)
+            .map_err(Into::into)
+    }
+}
+
+/// Projected dense first-step peak memory, in GB, as a function of the latent pixel count
+/// `p = (edge/8)²` (the SDXL VAE downscales /8; the U-Net working set is dominated by the conv-resnet
+/// activations that scale with this spatial extent — unlike z-image, whose peak is the attention
+/// seq² term). An empirical fit to peaks measured on the 128 GB target (`first_step_memory_sweep`,
+/// rank 16 / 560 LoRA targets / batch 1), AFTER the CLIP encoders are freed (the train-loop working
+/// set — what the guard models, since the guard projects the loop peak that follows caching).
+/// The structure is `resident + linear·p + quad·p²`: the constant is the resident base (U-Net + VAE,
+/// encoders freed), the linear term the per-pixel conv activations across the down/mid/up stack, the
+/// small quadratic the attention seq² at the 64²/32² grids. bf16 roughly halves all three. Assumes
+/// micro-batch 1 (the loop's actual shape); refit if the LoRA-target count or batch changes.
+fn projected_dense_peak_gb(p: f64, bf16: bool) -> f64 {
+    // Measured AFTER the CLIP encoders are freed (the train-loop working set): `first_step_memory_sweep`
+    // on the 128 GB target, f32 512/768/1024/1280 → 15.0/22.3/36.4/60.4 GB; bf16 → 7.7/11.3/18.3/30.4
+    // GB. The bf16 1024 peak (~18 GB) fits a 32 GB Mac; 1280 (~30 GB) is the headroom edge. p=(edge/8)².
+    if bf16 {
+        5.56 + 4.258e-4 * p + 2.157e-8 * p * p
+    } else {
+        10.78 + 8.582e-4 * p + 4.293e-8 * p * p
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::projected_dense_peak_gb;
+
+    /// The empirical fit must reproduce the measured (post-encoder-free) first-step peaks within a few
+    /// GB and stay monotonic — it is the basis of the pre-flight OOM guard. p = (edge/8)²: edge
+    /// 512→4096, 768→9216, 1024→16384, 1280→25600. Measured (`first_step_memory_sweep`, 128 GB):
+    /// f32 15.0/22.3/36.4/60.4 GB; bf16 7.7/11.3/18.3/30.4 GB.
+    #[test]
+    fn projection_matches_measured_curve() {
+        for (p, measured) in [
+            (4096.0, 15.0),
+            (9216.0, 22.3),
+            (16384.0, 36.4),
+            (25600.0, 60.4),
+        ] {
+            let proj = projected_dense_peak_gb(p, false);
+            assert!(
+                (proj - measured).abs() < 3.0,
+                "f32 projection at p={p} = {proj:.1} GB, expected ≈{measured} GB"
+            );
+        }
+        for (p, measured) in [
+            (4096.0, 7.7),
+            (9216.0, 11.3),
+            (16384.0, 18.3),
+            (25600.0, 30.4),
+        ] {
+            let proj = projected_dense_peak_gb(p, true);
+            assert!(
+                (proj - measured).abs() < 3.0,
+                "bf16 projection at p={p} = {proj:.1} GB, expected ≈{measured} GB"
+            );
+        }
+        // Monotonic increasing; bf16 strictly below f32.
+        assert!(projected_dense_peak_gb(4096.0, false) < projected_dense_peak_gb(16384.0, false));
+        assert!(projected_dense_peak_gb(16384.0, true) < projected_dense_peak_gb(16384.0, false));
+        // sc-4941's 32 GB-Mac goal: bf16 1024 LoRA training fits a 32 GB box. Such a box reports an
+        // MLX working-set limit of ~22 GB; the guard's budget is limit × 0.85 ≈ 18.7 GB. bf16 1024
+        // (~18.3 GB) clears it; f32 1024 (~36 GB) does not — so an f32 run on a 32 GB box is correctly
+        // steered to bf16 / lower resolution rather than SIGKILLed.
+        assert!(projected_dense_peak_gb(16384.0, true) < 18.7); // bf16 1024 fits a 32 GB box
+        assert!(projected_dense_peak_gb(16384.0, false) > 18.7); // f32 1024 does not
+    }
+}
+
+// ===========================================================================================
+// sc-4941 (sibling of z-image sc-4874) — first-step peak-memory characterization for the SDXL
+// U-Net LoRA trainer. The story's explicit mandate is "measure before assuming z-image magnitude":
+// the SDXL U-Net's attention runs at SMALLER latent grids (64²/32², not z-image's unified 64²×30
+// blocks) and its conv resnets have no seq² term, so the first-step working set must be measured,
+// not extrapolated from z-image's 135 GB-at-1024 curve. This harness drives the exact inner step
+// (`compute_loss_grads` + the backward grad `eval` the real loop forces) at swept resolution with
+// MLX peak probes around it.
+//
+//   cargo test -p mlx-gen-sdxl --release --lib first_step -- --ignored --nocapture
+// ===========================================================================================
+#[cfg(test)]
+mod first_step_repro {
+    use super::*;
+    use family::{compute_loss_grads, resolve_target_paths};
+    use mlx_gen::media::Image;
+    use mlx_gen::train::dataset::center_crop_square;
+    use mlx_gen::train::lora::{build_lora_targets, LoraParams, TrainAdapter};
+    use mlx_gen::TrainingConfig;
+    use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
+    use mlx_rs::transforms::eval;
+    use std::path::PathBuf;
+
+    use crate::pipeline::encode_init_latents;
+
+    /// Resolve an SDXL diffusers snapshot (env `SDXL_SNAPSHOT`, else the HF cache).
+    fn snapshot() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
+            return Some(PathBuf::from(p));
+        }
+        let home = std::env::var("HOME").ok()?;
+        let snaps = PathBuf::from(home).join(
+            ".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots",
+        );
+        std::fs::read_dir(&snaps)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_dir() && p.join("unet").is_dir())
+    }
+
+    /// A solid-colour `edge`×`edge` RGB source image (latent magnitude is irrelevant; the graph
+    /// size — driven by resolution — is the variable under test).
+    fn swatch(edge: u32) -> Image {
+        let mut img = image::RgbImage::new(edge, edge);
+        for px in img.pixels_mut() {
+            *px = image::Rgb([180u8, 60, 90]);
+        }
+        Image {
+            width: edge,
+            height: edge,
+            pixels: img.into_raw(),
+        }
+    }
+
+    fn gb(bytes: usize) -> f64 {
+        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Run one first training step at `edge` in `dtype` (caller casts the U-Net to match) and report
+    /// the peak GPU memory across forward+backward (forces the grad eval — the real step-1 kill point).
+    #[allow(clippy::too_many_arguments)]
+    fn one_step(
+        trainer: &mut SdxlTrainer,
+        adapter: &TrainAdapter,
+        params: &LoraParams,
+        cond: &Array,
+        pooled: &Array,
+        edge: u32,
+        dtype: Dtype,
+        checkpoint_targets: Option<Vec<String>>,
+        tag: &str,
+    ) -> Result<(f32, f64)> {
+        let img = center_crop_square(&swatch(edge));
+        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge)?;
+        let noise = random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1)?))?;
+        let time_ids = text_time_ids(1);
+        eval([&x0, &noise]).unwrap();
+
+        clear_cache();
+        reset_peak_memory();
+        let before = get_active_memory();
+        let t0 = std::time::Instant::now();
+        let (loss, grads) = compute_loss_grads(
+            &trainer.hooks,
+            &mut trainer.unet,
+            params,
+            adapter,
+            16.0,
+            16.0,
+            &x0,
+            cond,
+            pooled,
+            &time_ids,
+            TrainTimestep::Sigma(500.0),
+            &noise,
+            false,
+            dtype,
+            checkpoint_targets,
+        )?;
+        eval(grads.values())?; // force the backward (true working set)
+        let secs = t0.elapsed().as_secs_f64();
+        let peak = get_peak_memory();
+        eprintln!(
+            "[sc-4941]   edge {edge:>4} {tag}  loss {loss:.5}  active-before {:.2} GB  peak {:.2} GB  step {secs:.2}s",
+            gb(before),
+            gb(peak)
+        );
+        Ok((loss, gb(peak)))
+    }
+
+    /// Max relative grad diff between two param maps.
+    fn max_rel_diff(ga: &LoraParams, gb_: &LoraParams) -> f32 {
+        let mut max_rel = 0f32;
+        for (k, a) in ga {
+            let b = gb_.get(k).expect("same keys");
+            let num = a.subtract(b).unwrap().abs().unwrap().max(None).unwrap();
+            let den = a.abs().unwrap().max(None).unwrap().item::<f32>().max(1e-6);
+            max_rel = max_rel.max(num.item::<f32>() / den);
+        }
+        max_rel
+    }
+
+    fn build_trainer_and_adapter() -> (SdxlTrainer, TrainAdapter, LoraParams, Array, Array) {
+        let root = snapshot().expect("SDXL snapshot (HF cache or SDXL_SNAPSHOT)");
+        let mut trainer = SdxlTrainer {
+            descriptor: trainer_descriptor(),
+            vae: crate::loader::load_vae(&root).unwrap(),
+            unet: crate::loader::load_unet(&root).unwrap(),
+            hooks: SdxlHooks {
+                tokenizer: crate::loader::load_tokenizer(&root).unwrap(),
+                te1: Some(crate::loader::load_text_encoder_1(&root).unwrap()),
+                te2: Some(crate::loader::load_text_encoder_2(&root).unwrap()),
+                sampler: EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap(),
+            },
+        };
+        let cfg = TrainingConfig {
+            rank: 16,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&trainer.unet, &cfg);
+        let (targets, params) =
+            build_lora_targets(&mut trainer.unet, &target_paths, 16, 7).unwrap();
+        let (cond, pooled) = trainer
+            .hooks
+            .encode_prompt("a solid colour swatch")
+            .unwrap();
+        eval([&cond, &pooled]).unwrap();
+        // Drop the CLIP encoders exactly as the backbone does after caching, so the measured peaks
+        // reflect the post-free training working set.
+        trainer.hooks.te1 = None;
+        trainer.hooks.te2 = None;
+        mlx_rs::memory::clear_cache();
+        eprintln!(
+            "[sc-4941] loaded SDXL trainer (encoders freed); {} LoRA targets; cond {:?} pooled {:?}",
+            targets.len(),
+            cond.shape(),
+            pooled.shape()
+        );
+        (
+            trainer,
+            TrainAdapter::Lora { targets },
+            params,
+            cond,
+            pooled,
+        )
+    }
+
+    /// Sweep resolution tiny → production, printing the dense first-step peak curve in f32 then bf16
+    /// (cond/pooled cast to match). These measured points are the basis of the `projected_dense_peak_gb`
+    /// guard fit — refit the constants if this prints materially different numbers.
+    #[test]
+    #[ignore = "needs real SDXL weights; run as its own process"]
+    fn first_step_memory_sweep() {
+        let (mut trainer, adapter, params, cond, pooled) = build_trainer_and_adapter();
+        eprintln!("[sc-4941] SDXL dense f32 first-step sweep:");
+        for edge in [256u32, 512, 768, 1024, 1280] {
+            let _ = one_step(
+                &mut trainer,
+                &adapter,
+                &params,
+                &cond,
+                &pooled,
+                edge,
+                Dtype::Float32,
+                None,
+                "f32",
+            )
+            .map_err(|e| eprintln!("  edge {edge} CATCHABLE error: {e}"));
+        }
+        eprintln!("[sc-4941] casting U-Net to bf16…");
+        trainer.unet.cast_weights(Dtype::Bfloat16).unwrap();
+        let cond_b = cond.as_dtype(Dtype::Bfloat16).unwrap();
+        let pooled_b = pooled.as_dtype(Dtype::Bfloat16).unwrap();
+        let tp: Vec<String> = match &adapter {
+            TrainAdapter::Lora { targets } => targets.iter().map(|t| t.path.clone()).collect(),
+            _ => Vec::new(),
+        };
+        clear_cache();
+        eprintln!("[sc-4941] SDXL dense bf16 first-step sweep:");
+        for edge in [256u32, 512, 768, 1024, 1280] {
+            let _ = one_step(
+                &mut trainer,
+                &adapter,
+                &params,
+                &cond_b,
+                &pooled_b,
+                edge,
+                Dtype::Bfloat16,
+                None,
+                "bf16",
+            )
+            .map_err(|e| eprintln!("  edge {edge} CATCHABLE error: {e}"));
+        }
+        eprintln!("[sc-4941] SDXL bf16 BLOCK-CHECKPOINTED first-step sweep (1024/1280 — the 32 GB lever):");
+        for edge in [1024u32, 1280, 1536] {
+            let _ = one_step(
+                &mut trainer,
+                &adapter,
+                &params,
+                &cond_b,
+                &pooled_b,
+                edge,
+                Dtype::Bfloat16,
+                Some(tp.clone()),
+                "bf16-ckpt",
+            )
+            .map_err(|e| eprintln!("  edge {edge} CATCHABLE error: {e}"));
+        }
+        eprintln!("[sc-4941] sweep complete");
+    }
+
+    /// sc-4941 — always-bit-identical: the SDPA-segment checkpoint (opt-in) must not change grads vs
+    /// the retained backward. Same decomposed attention, recomputed instead of retained.
+    #[test]
+    #[ignore = "needs real SDXL weights; run as its own process"]
+    fn attn_ckpt_grads_match_retained() {
+        let (mut trainer, adapter, params, cond, pooled) = build_trainer_and_adapter();
+        let edge = 256u32;
+        let img = center_crop_square(&swatch(edge));
+        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+        let noise =
+            random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
+        let time_ids = text_time_ids(1);
+        eval([&x0, &noise]).unwrap();
+        let grads_of = |t: &mut SdxlTrainer, on: bool| -> LoraParams {
+            t.unet.set_sdpa_checkpoint(on);
+            let (_l, g) = compute_loss_grads(
+                &t.hooks,
+                &mut t.unet,
+                &params,
+                &adapter,
+                16.0,
+                16.0,
+                &x0,
+                &cond,
+                &pooled,
+                &time_ids,
+                TrainTimestep::Sigma(500.0),
+                &noise,
+                false,
+                Dtype::Float32,
+                None,
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            g
+        };
+        let g_retained = grads_of(&mut trainer, false);
+        let g_ckpt = grads_of(&mut trainer, true);
+        let max_rel = max_rel_diff(&g_retained, &g_ckpt);
+        eprintln!("[sc-4941] attn-ckpt-vs-retained grad max relative diff: {max_rel:.2e}");
+        assert!(
+            max_rel < 1e-5,
+            "attention-segment checkpointing must not change grads: max rel {max_rel:.2e}"
+        );
+    }
+
+    /// sc-4941 — block (gradient) checkpointing must not change the math: the per-block checkpointed
+    /// forward+grads must match the dense path within fp tolerance (it reuses the same install + block
+    /// forward, recompute-only). This is the correctness gate for the `gradient_checkpointing` lever.
+    #[test]
+    #[ignore = "needs real SDXL weights; run as its own process"]
+    fn block_ckpt_grads_match_dense() {
+        let (mut trainer, adapter, params, cond, pooled) = build_trainer_and_adapter();
+        let edge = 256u32; // math is resolution-agnostic; small enough that the dense path is cheap
+        let img = center_crop_square(&swatch(edge));
+        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+        let noise =
+            random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
+        let time_ids = text_time_ids(1);
+        eval([&x0, &noise]).unwrap();
+        let tp: Vec<String> = match &adapter {
+            TrainAdapter::Lora { targets } => targets.iter().map(|t| t.path.clone()).collect(),
+            _ => unreachable!("LoRA adapter in this harness"),
+        };
+        let grads_of = |t: &mut SdxlTrainer, ck: Option<Vec<String>>| -> LoraParams {
+            let (_l, g) = compute_loss_grads(
+                &t.hooks,
+                &mut t.unet,
+                &params,
+                &adapter,
+                16.0,
+                16.0,
+                &x0,
+                &cond,
+                &pooled,
+                &time_ids,
+                TrainTimestep::Sigma(500.0),
+                &noise,
+                false,
+                Dtype::Float32,
+                ck,
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            g
+        };
+        let g_dense = grads_of(&mut trainer, None);
+        let g_ckpt = grads_of(&mut trainer, Some(tp));
+        let max_rel = max_rel_diff(&g_dense, &g_ckpt);
+        eprintln!("[sc-4941] block-ckpt-vs-dense grad max relative diff: {max_rel:.2e}");
+        // Recompute-vs-retained fp noise (not a structural diff — a real checkpointing bug, like the
+        // duplicate-output VJP corruption this gate caught, shows up at ~1e0). The bound is a few e-3
+        // because the conv-heavy recompute reorders fp accumulation; a genuine mismatch is orders of
+        // magnitude larger.
+        assert!(
+            max_rel < 5e-3,
+            "block checkpointing must match the dense grads: max rel {max_rel:.2e}"
+        );
+    }
+
+    /// sc-4941 — bf16 is mixed precision, NOT bit parity: assert the bf16 grads point the same way as
+    /// f32 (global cosine + large-norm cosine) and the bf16 working set is genuinely smaller (a silent
+    /// f32 re-promotion in the forward would pass the cosine check while saving nothing — the memory
+    /// ratio IS the dtype assertion). Runs f32 first (the cast is destructive), then casts to bf16.
+    #[test]
+    #[ignore = "needs real SDXL weights; run as its own process"]
+    fn bf16_grads_direction_and_memory_vs_f32() {
+        let (mut trainer, adapter, params, cond, pooled) = build_trainer_and_adapter();
+
+        // Grad reference at 256 in f32.
+        let edge = 256u32;
+        let img = center_crop_square(&swatch(edge));
+        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+        let noise =
+            random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
+        let time_ids = text_time_ids(1);
+        eval([&x0, &noise]).unwrap();
+        let grads_of =
+            |t: &mut SdxlTrainer, c: &Array, p: &Array, dt: Dtype| -> (f32, LoraParams) {
+                let (l, g) = compute_loss_grads(
+                    &t.hooks,
+                    &mut t.unet,
+                    &params,
+                    &adapter,
+                    16.0,
+                    16.0,
+                    &x0,
+                    c,
+                    p,
+                    &time_ids,
+                    TrainTimestep::Sigma(500.0),
+                    &noise,
+                    false,
+                    dt,
+                    None,
+                )
+                .unwrap();
+                eval(g.values()).unwrap();
+                (l, g)
+            };
+        let (f32_loss, g_f32) = grads_of(&mut trainer, &cond, &pooled, Dtype::Float32);
+
+        // Memory A/B at 768 in f32 (big enough that activations dominate).
+        let (_, f32_peak) = one_step(
+            &mut trainer,
+            &adapter,
+            &params,
+            &cond,
+            &pooled,
+            768,
+            Dtype::Float32,
+            None,
+            "f32",
+        )
+        .unwrap();
+
+        trainer.unet.cast_weights(Dtype::Bfloat16).unwrap();
+        clear_cache();
+        let cond_b = cond.as_dtype(Dtype::Bfloat16).unwrap();
+        let pooled_b = pooled.as_dtype(Dtype::Bfloat16).unwrap();
+        let (bf16_loss, g_bf16) = grads_of(&mut trainer, &cond_b, &pooled_b, Dtype::Bfloat16);
+        assert!(
+            bf16_loss.is_finite(),
+            "bf16 loss must be finite: {bf16_loss}"
+        );
+        eprintln!("[sc-4941] loss f32 {f32_loss:.5} vs bf16 {bf16_loss:.5}");
+
+        let mut per: Vec<(String, f32, f32, f32)> = Vec::new(); // (key, cos, na, nb)
+        let (mut gdot, mut gna2, mut gnb2) = (0f64, 0f64, 0f64);
+        for (k, a) in &g_f32 {
+            let b = g_bf16.get(k).expect("same keys");
+            let dot = a.multiply(b).unwrap().sum(None).unwrap().item::<f32>();
+            let na2 = a.square().unwrap().sum(None).unwrap().item::<f32>();
+            let nb2 = b.square().unwrap().sum(None).unwrap().item::<f32>();
+            gdot += dot as f64;
+            gna2 += na2 as f64;
+            gnb2 += nb2 as f64;
+            let (na, nb) = (na2.sqrt(), nb2.sqrt());
+            if na > 1e-12 && nb > 1e-12 {
+                per.push((k.to_string(), dot / (na * nb), na, nb));
+            }
+        }
+        let global_cos = (gdot / (gna2.sqrt() * gnb2.sqrt())) as f32;
+        per.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+        let max_norm = per.iter().map(|p| p.2).fold(0f32, f32::max);
+        eprintln!("[sc-4941] bf16-vs-f32 grads: global cosine {global_cos:.5}; worst per-param:");
+        for (k, c, na, nb) in per.iter().take(8) {
+            eprintln!(
+                "    {k}: cos {c:.4}  |g| {na:.3e} vs {nb:.3e}  rel-norm {:.2e}",
+                na / max_norm
+            );
+        }
+        let min_large = per
+            .iter()
+            .filter(|p| p.2 >= 0.01 * max_norm)
+            .map(|p| p.1)
+            .fold(1f32, f32::min);
+        eprintln!("[sc-4941] min cosine among params with |g| >= 1% of max: {min_large:.4}");
+        assert!(
+            global_cos > 0.995,
+            "bf16 global grad must point the same way as f32: {global_cos:.5}"
+        );
+        assert!(
+            min_large > 0.95,
+            "a large-norm param's bf16 grad diverged from f32 (systematic bug): {min_large:.4}"
+        );
+
+        let (_, bf16_peak) = one_step(
+            &mut trainer,
+            &adapter,
+            &params,
+            &cond_b,
+            &pooled_b,
+            768,
+            Dtype::Bfloat16,
+            None,
+            "bf16",
+        )
+        .unwrap();
+        eprintln!(
+            "[sc-4941] 768 peak f32 {f32_peak:.2} GB vs bf16 {bf16_peak:.2} GB ({:.0}%)",
+            100.0 * bf16_peak / f32_peak
+        );
+        assert!(
+            bf16_peak < 0.70 * f32_peak,
+            "bf16 must materially shrink the working set: f32 {f32_peak:.2} GB vs bf16 {bf16_peak:.2} GB"
+        );
+    }
+}

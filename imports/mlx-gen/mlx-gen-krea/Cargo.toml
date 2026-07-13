@@ -1,0 +1,43 @@
+[package]
+name = "mlx-gen-krea"
+version = "0.0.0"
+edition = "2021"
+description = "Krea 2 (Turbo T2I inference / Raw LoRA-training base) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "krea-2", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Krea 2's VAE is the **Qwen-Image** `AutoencoderKLQwenImage` (the published `vae/config.json` declares
+# `_name_or_path = "Qwen/Qwen-Image"`); reuse `QwenVae` + its diffusers→internal key remap wholesale
+# rather than re-port the causal-Conv3d VAE (the boogu→z-image / kolors→sdxl provider-reuse precedent).
+mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }
+# Optional PiD super-resolving decoder (epic 7840, sc-7845): Krea reuses the Qwen-Image latent space,
+# so `req.use_pid` routes decode through a `mlx_gen_pid::PidDecoder` (built via the shared
+# `mlx_gen_qwen_image::pipeline::resolve_pid_decoder`). `mlx-gen-pid` depends only on core (acyclic).
+mlx-gen-pid = { path = "../mlx-gen-pid" }
+# Reuse the config-driven Qwen3-VL vision tower (epic 10871 P2.1, sc-10879): Krea 2's condition encoder
+# IS Qwen3-VL-4B, and the edit LoRA needs image-grounded encoding. boogu already ships a `VisionTower` /
+# `VisionConfig` (its own 8B); Krea builds the 4B variant from the same code rather than duplicate the
+# parity-critical tower — the same provider-reuse pattern as the qwen-image VAE above. Acyclic (boogu
+# does not depend on krea).
+mlx-gen-boogu = { path = "../mlx-gen-boogu" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time self-registration of the `krea_2_turbo` generator into the `mlx_gen` registry
+# (`model.rs::inventory::submit!`); discovered by `gen_core::registry::load(id, …)` when the worker
+# force-links this crate.
+inventory = { workspace = true }
+# Parse the diffusers `transformer/config.json` + `model_index.json` (architecture + quant manifest).
+serde_json = { workspace = true }
+# Decode training-dataset images (sc-7577 Raw LoRA trainer) + encode the e2e real-weight smoke output to
+# PNG (sc-7571); mirrors mlx-gen-lens / mlx-gen-z-image.
+image = { workspace = true }
+
+[dev-dependencies]
+# Backend-neutral gen-core contract conformance (capability honesty / progress monotonicity / typed
+# cancellation / seed determinism / registry round-trip) — Krea runs the real engine through it on the
+# macos-mlx lane, the sc-4481 standard every shipped family meets. Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }

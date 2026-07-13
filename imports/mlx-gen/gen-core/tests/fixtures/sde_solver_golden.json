@@ -1,0 +1,163 @@
+{
+  "meta": {
+    "purpose": "Independent golden trajectory for gen-core er_sde / dpmpp_2m_sde solvers.",
+    "reference": "ComfyUI comfy/k_diffusion/sampling.py sample_er_sde / sample_dpmpp_2m_sde",
+    "reference_url": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/b7a648ca2011489ba40eaacf01a5d6f4e9fab539/comfy/k_diffusion/sampling.py",
+    "reference_commit": "b7a648ca2011489ba40eaacf01a5d6f4e9fab539",
+    "reference_sha256": "cc5f944efd85c566484c3999beb74e8c19c894f2a50ca574d090c3a46ac6bd06",
+    "reference_license": "GPL-3.0-or-later (ComfyUI) -- deliberately NOT vendored into this Apache-2.0 repo",
+    "reference_handling": "FETCHED at regen time and checksum-verified; NOT vendored into this repo (only this computed JSON is committed).",
+    "regen_command": "python3 gen-core/tests/fixtures/gen_sde_solver_golden.py  (offline: COMFY_SAMPLING_PATH=/path/to/sampling.py python3 ...)",
+    "generator": "gen-core/tests/fixtures/gen_sde_solver_golden.py",
+    "python": "3.14.6",
+    "torch": "2.13.0",
+    "numpy": "2.5.1",
+    "dtype": "float64",
+    "space": "VE (alpha=1, half_log_snr=-log(sigma), er_lambda=sigma)",
+    "s_noise": 0.0,
+    "toy_denoiser": "0.5*x + 0.25*sin(1.3*x) + 0.2*sigma*cos(0.7*x) - 0.1*sigma",
+    "trajectory_layout": "trajectory[k] = latent state x_k at the start of step k; the final entry is the returned x after the terminal step."
+  },
+  "sigmas": [
+    12.0,
+    6.5,
+    3.4,
+    1.75,
+    0.85,
+    0.3,
+    0.0
+  ],
+  "x_init": [
+    0.7,
+    -1.2,
+    1.5,
+    -0.3,
+    0.9,
+    -0.6
+  ],
+  "er_sde": {
+    "max_stage": 3,
+    "s_noise": 0.0,
+    "trajectory": [
+      [
+        0.7,
+        -1.2,
+        1.5,
+        -0.3,
+        0.9,
+        -0.6
+      ],
+      [
+        1.1063798990550868,
+        -0.8005523967717822,
+        1.2218519194793973,
+        0.33866277284800916,
+        1.1759509606663792,
+        -0.007359800659884563
+      ],
+      [
+        1.0229936731282532,
+        -0.4136914791278407,
+        1.1541315591080052,
+        0.6271761160245217,
+        1.0579710713739843,
+        0.35967181772991025
+      ],
+      [
+        0.9488513366040155,
+        -0.1870025263436971,
+        1.0293931617230567,
+        0.6794712933601086,
+        0.9731092239924823,
+        0.48250025347916325
+      ],
+      [
+        0.852528198260388,
+        -0.06966452153597098,
+        0.9091606185340202,
+        0.6543783262341435,
+        0.8697864689803656,
+        0.501617178327561
+      ],
+      [
+        0.7247079236886308,
+        -0.003466473186928481,
+        0.7639158798644288,
+        0.5819860385289686,
+        0.7367244109565892,
+        0.4662246113106592
+      ],
+      [
+        0.5869993589215884,
+        0.02713998679238886,
+        0.6130114223279726,
+        0.48769245476216594,
+        0.5950324398490227,
+        0.40236027061722446
+      ]
+    ]
+  },
+  "dpmpp_2m_sde": {
+    "eta": 1.0,
+    "s_noise": 0.0,
+    "solver_type": "midpoint",
+    "trajectory": [
+      [
+        0.7,
+        -1.2,
+        1.5,
+        -0.3,
+        0.9,
+        -0.6
+      ],
+      [
+        1.2405290656316308,
+        -0.6686916349854328,
+        1.1300330739275743,
+        0.5494903233745947,
+        1.2670445198593088,
+        0.1882753402663562
+      ],
+      [
+        0.9538626319101569,
+        -0.02777331682918327,
+        1.1309876629322413,
+        0.9070933432066987,
+        0.972139104332307,
+        0.7345264543031722
+      ],
+      [
+        0.8621895921485463,
+        0.3507353587505767,
+        0.9520714251468302,
+        0.8578472661909384,
+        0.8754136428257074,
+        0.8111419592652608
+      ],
+      [
+        0.7339653210521937,
+        0.48178849589578715,
+        0.7873519420615605,
+        0.7367010448079063,
+        0.7425519667590265,
+        0.7257516373281583
+      ],
+      [
+        0.5609781858974318,
+        0.4733670124585799,
+        0.5901961049358085,
+        0.5652911974614164,
+        0.5660039384298656,
+        0.5687569062722321
+      ],
+      [
+        0.47250387046438813,
+        0.4077362377215342,
+        0.4935904753322028,
+        0.4756333933934309,
+        0.4761500034281798,
+        0.47814393045340176
+      ]
+    ]
+  }
+}

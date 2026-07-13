@@ -1,0 +1,114 @@
+//! # mlx-gen-z-image
+//!
+//! The **Z-Image** (Tongyi Z-Image-turbo) provider crate for [`mlx-gen`](mlx_gen). Depends only
+//! on the `mlx-gen` core (nn primitives, adapters, weights, quant, the `Generator` contract,
+//! the registry) and self-registers via `inventory` — linking this crate makes
+//! `mlx_gen::load("z_image_turbo", …)` resolve. See `docs/MODEL_ARCHITECTURE.md`.
+//!
+//! Ported & parity-proven against the frozen Python mflux fork (tolerance 1e-2 — Metal runs
+//! fp32 matmul in reduced precision) and validated end-to-end on real bf16 weights (sc-2352):
+//! the Qwen text encoder (prompt → `cap_feats`), the flow-match Euler scheduler, the DiT
+//! transformer (block, context block, timestep / RoPE embedders, final layer, full forward),
+//! and the VAE encoder + decoder. [`load`](model::load) assembles the model from a snapshot
+//! directory and [`ZImageTurbo::generate`](model::ZImageTurbo) runs the full prompt→image
+//! pipeline, including img2img (VAE-encode an init image + noise blend, sc-2533) and whole-model
+//! Q4/Q8 quantization (sc-2532).
+
+pub mod adapters;
+pub mod attention;
+pub mod context_block;
+pub mod control_transformer;
+pub mod control_transformer_block;
+pub mod convert;
+pub mod feed_forward;
+pub mod final_layer;
+pub mod loader;
+pub mod model;
+pub mod model_base;
+pub mod model_base_control;
+pub mod model_control;
+pub mod pipeline;
+pub mod quant;
+pub mod rope_embedder;
+pub mod text_encoder;
+pub mod timestep_embedder;
+pub mod training;
+pub mod transformer;
+pub mod transformer_block;
+pub mod vae;
+
+pub use adapters::apply_z_image_adapters;
+pub use context_block::ZImageContextBlock;
+pub use control_transformer::{ZImageControlTransformer, CONTROL_IN_DIM};
+pub use control_transformer_block::ZImageControlBlock;
+pub use final_layer::FinalLayer;
+pub use loader::{
+    load_control_transformer, load_text_encoder, load_tokenizer, load_transformer, load_vae,
+};
+pub use model::{descriptor, load, ZImageTurbo, MODEL_ID};
+// The base (`z_image`, sc-8320) and control (`z_image_turbo_control`) variants each register
+// themselves via `inventory`; their `descriptor`/`load`/`MODEL_ID` items share the names of the
+// turbo model's, so reach them through their module paths (consumers use the registry ids
+// `"z_image"` / `"z_image_turbo_control"`). The base reuses the identical `ZImageTransformer` — only
+// the scheduler shift (6.0 vs 3.0), default steps (50 vs 4), and the CFG path differ.
+pub use model_base::ZImage;
+// The base control variant (`z_image_control`, sc-8251) registers itself via `inventory`; its
+// `descriptor`/`load`/`MODEL_ID` share the names of the turbo control model's, so reach them through
+// the module path (consumers use the registry id `"z_image_control"`). It reuses the identical
+// `ZImageControlTransformer` as the turbo control variant — only the base descriptor (CFG) + the base
+// control repo differ.
+pub use model_base_control::ZImageControl;
+pub use model_control::ZImageTurboControl;
+pub use pipeline::{
+    add_noise_by_interpolation, create_noise, decoded_to_image, denoise, denoise_cfg_with_progress,
+    denoise_control_cfg_with_progress, denoise_control_with_progress, denoise_with_progress,
+    encode_control_context, encode_init_latents, init_time_step, pack_latents,
+    preprocess_init_image, slice_valid, unpack_latents,
+};
+pub use rope_embedder::RopeEmbedder;
+pub use timestep_embedder::TimestepEmbedder;
+pub use training::{LoraTarget, ZImageTurboTrainer};
+pub use transformer::{ZImageTransformer, ZImageTransformerConfig};
+pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
+
+// sc-2963 compiled-glue toggle (rollout of the Wan sc-2957 template): when on, the DiT's fusable
+// elementwise *glue* — the SwiGLU FFN activation (`silu(h1)·h3`), the gated residuals
+// (`x+gate·norm(out)`), the complex RoPE rotation, and the control-branch hint injection
+// (`x+hint·scale`) — runs through `mx.compile` so MLX fuses each chain into a single Metal kernel.
+// The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
+// process-global is shared with the FLUX family rather than each crate hand-rolling its own
+// `AtomicBool`. **Bit-exact** to the eager form; **enabled by the production denoise loops** (turbo +
+// control, [`pipeline`]); left **off by default** so the reference-parity gates run eager. The
+// mixed-precision dtype flow (base bf16, f32 `control_context`, sc-2720) is preserved unchanged.
+pub(crate) use mlx_gen::nn::compile_glue;
+pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
+
+#[cfg(test)]
+mod compile_glue_guard_tests {
+    use super::{compile_glue, set_compile_glue, CompileGlueGuard};
+
+    // Single-threaded test runner (`.cargo/config.toml` RUST_TEST_THREADS=1) makes the
+    // process-global `COMPILE_GLUE` safe to assert on, matching the existing `set_compile_glue`
+    // A/B tests in feed_forward / control_transformer.
+    #[test]
+    fn guard_enables_then_restores_prior_value() {
+        // Prior off → on within scope → restored off on drop (the doc's "eager by default" intent).
+        set_compile_glue(false);
+        {
+            let _g = CompileGlueGuard::enable();
+            assert!(compile_glue(), "guard enables compiled glue for its scope");
+        }
+        assert!(!compile_glue(), "guard restores the prior (off) on drop");
+
+        // Restores the *prior* value, not a hardcoded false: prior on stays on after drop.
+        set_compile_glue(true);
+        {
+            let _g = CompileGlueGuard::enable();
+            assert!(compile_glue());
+        }
+        assert!(compile_glue(), "guard restores the prior (on) on drop");
+
+        // Leave the global eager, as the reference-parity gates expect.
+        set_compile_glue(false);
+    }
+}

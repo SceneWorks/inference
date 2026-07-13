@@ -1,0 +1,219 @@
+//! Boogu DiT 3-axis (t, h, w) unified RoPE — the OmniGen2 `BooguImageDoubleStreamRotaryPosEmbed`.
+//!
+//! Two things differ from the Qwen3-VL text encoder's RoPE and matter for parity:
+//!  1. **Complex *interleaved* rotation** (`apply_rotary_emb(use_real=False)`, the "lumina" branch):
+//!     adjacent dims `(2k, 2k+1)` form a complex pair `x[2k] + i·x[2k+1]` rotated by `e^{iθ_k}`
+//!     (GPT-J / interleaved), *not* the text encoder's half-split `[x1, x2] → [-x2, x1]`. MLX has no
+//!     `view_as_complex`, so we do the real arithmetic directly.
+//!  2. **Three position axes**: per token the rotary frequency index `k ∈ [0, 60)` is grouped into
+//!     three contiguous blocks of 20 (`axes_dim_rope = [40,40,40]` ⇒ 20 complex freqs each), one per
+//!     axis. Text tokens use position `(i, i, i)`; image patch tokens use `(cap_len, row, col)`.
+//!
+//! Each axis shares the same 20-vector of inverse frequencies `θ^(−2j/40)` (`θ = 10000`). We build the
+//! `cos`/`sin` tables on the CPU in f32 (the reference builds the freqs in f32 on MPS) and slice the
+//! joint table into its text-only / image-only sub-ranges.
+
+use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
+use mlx_rs::{Array, Dtype};
+
+use mlx_gen::Result;
+
+/// Precomputed `cos`/`sin` rotary tables for one forward pass.
+///
+/// Layout is `[1, cap_len + ref_len + img_len, head_dim/2]` (f32) in the joint
+/// `[instruct; ref-image; noise-image]` order. For text-to-image there is no reference image
+/// (`ref_len == 0`) and the layout collapses to `[instruct; image]`.
+pub struct RopeTables {
+    cos: Array,
+    sin: Array,
+    cap_len: i32,
+    /// Per-reference token counts, in packing order (empty for text-to-image). The combined
+    /// reference block length is their sum; [`RopeTables::ref_image_at`] slices an individual one.
+    ref_lens: Vec<i32>,
+}
+
+impl RopeTables {
+    /// Build the joint table for a text-to-image forward (no reference images): `cap_len` text
+    /// positions followed by an `h_tokens × w_tokens` image grid (row-major, `h` outer).
+    pub fn build_t2i(
+        cap_len: usize,
+        h_tokens: usize,
+        w_tokens: usize,
+        axes_dim: usize,
+        theta: f32,
+    ) -> Self {
+        let mut positions = Vec::with_capacity(cap_len + h_tokens * w_tokens);
+        text_positions(&mut positions, cap_len);
+        grid_positions(&mut positions, cap_len as f32, h_tokens, w_tokens);
+        from_positions(&positions, axes_dim, theta, cap_len as i32, Vec::new())
+    }
+
+    /// Build the joint table for a **multi-reference** edit forward: `cap_len` text positions, then
+    /// each reference grid `(ref_hᵢ, ref_wᵢ)` placed at t-axis `pe_shift` and advancing `pe_shift` by
+    /// `max(ref_hᵢ, ref_wᵢ)` per reference (the OmniGen2 `pe_shift`), then the `h × w` target grid at
+    /// the final `pe_shift` — matching the `[instruct; ref₀; …; ref_{N-1}; noise]` packing. `ref_grids`
+    /// is in **token** units (latent dim // patch). An empty `ref_grids` is the text-to-image layout.
+    pub fn build_edit_multi(
+        cap_len: usize,
+        ref_grids: &[(usize, usize)],
+        h_tokens: usize,
+        w_tokens: usize,
+        axes_dim: usize,
+        theta: f32,
+    ) -> Self {
+        let total_ref: usize = ref_grids.iter().map(|(rh, rw)| rh * rw).sum();
+        let mut positions = Vec::with_capacity(cap_len + total_ref + h_tokens * w_tokens);
+        text_positions(&mut positions, cap_len);
+        let mut pe_shift = cap_len;
+        for &(rh, rw) in ref_grids {
+            grid_positions(&mut positions, pe_shift as f32, rh, rw);
+            pe_shift += rh.max(rw);
+        }
+        grid_positions(&mut positions, pe_shift as f32, h_tokens, w_tokens);
+        let ref_lens = ref_grids.iter().map(|(rh, rw)| (rh * rw) as i32).collect();
+        from_positions(&positions, axes_dim, theta, cap_len as i32, ref_lens)
+    }
+
+    /// `(cos, sin)` for the text tokens only (`context_refiner`).
+    pub fn text(&self) -> Result<(Array, Array)> {
+        Ok((
+            axis1(&self.cos, 0, self.cap_len)?,
+            axis1(&self.sin, 0, self.cap_len)?,
+        ))
+    }
+
+    /// Total reference-block length (sum over all reference images; `0` for T2I).
+    fn ref_len_total(&self) -> i32 {
+        self.ref_lens.iter().sum()
+    }
+
+    /// `(cos, sin)` for the whole reference block `[ref₀; …; ref_{N-1}]`. Empty-safe (T2I → empty).
+    pub fn ref_image(&self) -> Result<(Array, Array)> {
+        let start = self.cap_len;
+        let end = self.cap_len + self.ref_len_total();
+        Ok((axis1(&self.cos, start, end)?, axis1(&self.sin, start, end)?))
+    }
+
+    /// `(cos, sin)` for the `j`-th reference image's patch tokens only — each reference is refined
+    /// **independently** by `ref_image_refiner` (its own positions, no cross-reference attention),
+    /// mirroring the reference's per-image `batch_ref_image_hidden_states` rows.
+    pub fn ref_image_at(&self, j: usize) -> Result<(Array, Array)> {
+        let start = self.cap_len + self.ref_lens[..j].iter().sum::<i32>();
+        let end = start + self.ref_lens[j];
+        Ok((axis1(&self.cos, start, end)?, axis1(&self.sin, start, end)?))
+    }
+
+    /// `(cos, sin)` for the target (noise) patch tokens only (`noise_refiner`). These sit after the
+    /// reference block, so the range is `[cap_len + ref_len_total, end)`.
+    pub fn image(&self) -> Result<(Array, Array)> {
+        let end = self.cos.shape()[1];
+        let start = self.cap_len + self.ref_len_total();
+        Ok((axis1(&self.cos, start, end)?, axis1(&self.sin, start, end)?))
+    }
+
+    /// `(cos, sin)` for the combined image sequence `[ref; noise]` (the double-stream image
+    /// self-attention). For T2I (`ref_len == 0`) this equals [`Self::image`].
+    pub fn combined_image(&self) -> Result<(Array, Array)> {
+        let end = self.cos.shape()[1];
+        Ok((
+            axis1(&self.cos, self.cap_len, end)?,
+            axis1(&self.sin, self.cap_len, end)?,
+        ))
+    }
+
+    /// `(cos, sin)` for the full joint `[text; ref; noise]` sequence (double / single stream).
+    pub fn joint(&self) -> (Array, Array) {
+        (self.cos.clone(), self.sin.clone())
+    }
+}
+
+/// Push `cap_len` text positions `(i, i, i)`.
+fn text_positions(out: &mut Vec<(f32, f32, f32)>, cap_len: usize) {
+    for i in 0..cap_len {
+        out.push((i as f32, i as f32, i as f32));
+    }
+}
+
+/// Push an `h × w` row-major image grid at a fixed t-axis position: `(t, row, col)`.
+fn grid_positions(out: &mut Vec<(f32, f32, f32)>, t: f32, h: usize, w: usize) {
+    for r in 0..h {
+        for c in 0..w {
+            out.push((t, r as f32, c as f32));
+        }
+    }
+}
+
+/// Build the `cos`/`sin` tables from 3-axis positions: each rotary freq index `k ∈ [0, 3·axes_dim/2)`
+/// is grouped into three contiguous blocks of `axes_dim/2`, one per axis, all sharing the inverse
+/// frequencies `θ^(−2j/axes_dim)`.
+fn from_positions(
+    positions: &[(f32, f32, f32)],
+    axes_dim: usize,
+    theta: f32,
+    cap_len: i32,
+    ref_lens: Vec<i32>,
+) -> RopeTables {
+    let half_axis = axes_dim / 2; // 20 complex freqs per axis
+    let half = half_axis * 3; // 60 for head_dim 120
+    let inv: Vec<f32> = (0..half_axis)
+        .map(|j| theta.powf(-(2.0 * j as f32) / axes_dim as f32))
+        .collect();
+
+    let total = positions.len();
+    let mut cos = vec![0f32; total * half];
+    let mut sin = vec![0f32; total * half];
+    for (t, &(p0, p1, p2)) in positions.iter().enumerate() {
+        for k in 0..half {
+            let p = match k / half_axis {
+                0 => p0,
+                1 => p1,
+                _ => p2,
+            };
+            let angle = p * inv[k % half_axis];
+            cos[t * half + k] = angle.cos();
+            sin[t * half + k] = angle.sin();
+        }
+    }
+
+    let shape = [1, total as i32, half as i32];
+    RopeTables {
+        cos: Array::from_slice(&cos, &shape),
+        sin: Array::from_slice(&sin, &shape),
+        cap_len,
+        ref_lens,
+    }
+}
+
+/// Slice `[1, L, D]` along the sequence axis (axis 1) to `[start, end)`.
+fn axis1(x: &Array, start: i32, end: i32) -> Result<Array> {
+    let idx: Vec<i32> = (start..end).collect();
+    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
+}
+
+/// Apply the complex-interleaved rotary embedding to `x` in `[b, s, heads, head_dim]` layout.
+///
+/// `cos`/`sin` are `[1, s, head_dim/2]` (broadcast over heads). For each adjacent pair
+/// `(x[2k], x[2k+1])`:
+///   `out[2k]   = x[2k]·cos_k − x[2k+1]·sin_k`
+///   `out[2k+1] = x[2k]·sin_k + x[2k+1]·cos_k`
+/// Computed in f32 (the reference upcasts), then cast back to `x`'s dtype.
+pub fn apply_interleaved_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+    let dt = x.dtype();
+    let sh = x.shape();
+    let (b, s, h, hd) = (sh[0], sh[1], sh[2], sh[3]);
+    let half = hd / 2;
+
+    let cos = cos.as_dtype(Dtype::Float32)?.expand_dims(2)?; // [1, s, 1, half]
+    let sin = sin.as_dtype(Dtype::Float32)?.expand_dims(2)?;
+
+    let xr = x.as_dtype(Dtype::Float32)?.reshape(&[b, s, h, half, 2])?;
+    let parts = split(&xr, 2, 4)?; // 2 × [b, s, h, half, 1]
+    let xe = parts[0].reshape(&[b, s, h, half])?;
+    let xo = parts[1].reshape(&[b, s, h, half])?;
+
+    let out_e = subtract(&multiply(&xe, &cos)?, &multiply(&xo, &sin)?)?;
+    let out_o = add(&multiply(&xe, &sin)?, &multiply(&xo, &cos)?)?;
+
+    let out = concatenate_axis(&[&out_e.expand_dims(4)?, &out_o.expand_dims(4)?], 4)?;
+    Ok(out.reshape(&[b, s, h, hd])?.as_dtype(dt)?)
+}

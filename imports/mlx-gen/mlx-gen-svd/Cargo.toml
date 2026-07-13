@@ -1,0 +1,25 @@
+[package]
+name = "mlx-gen-svd"
+version = "0.0.0"
+edition = "2021"
+description = "Stable Video Diffusion (img2vid-xt) image-to-video provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "video", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# SVD reuses SDXL's 2D VAE encoder + CLIP-vision encoder + conv/attn UNet patterns (epic 3040 spike).
+mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time self-registration into mlx-gen's model registry.
+inventory = { workspace = true }
+
+[dev-dependencies]
+# Save the e2e render frames for inspection (matches the workspace `image` version).
+image = { workspace = true }
+# Real-weight typed-cancellation conformance gate (story 6883): drives the registered svd_xt
+# Generator through the testkit cancellation check. Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }

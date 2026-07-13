@@ -1,0 +1,92 @@
+{
+  "model": "facebook/sam3",
+  "image_url": "https://raw.githubusercontent.com/ultralytics/ultralytics/main/ultralytics/assets/zidane.jpg",
+  "num_memory_frames": 1,
+  "memory_frame_offsets": [
+    0
+  ],
+  "num_object_pointers": 1,
+  "object_pointer_offsets": [
+    1
+  ],
+  "max_object_pointers_to_use": 2,
+  "num_object_pointer_tokens": 4,
+  "stages": {
+    "current_vision_features": {
+      "shape": [
+        5184,
+        1,
+        256
+      ],
+      "min": -2.2623727321624756,
+      "max": 2.446113109588623,
+      "mean": -0.003101648995652795,
+      "std": 0.3917993903160095,
+      "sha1_5dp": "071db4ea4e54d969"
+    },
+    "current_vision_position_embeddings": {
+      "shape": [
+        5184,
+        1,
+        256
+      ],
+      "min": -1.0,
+      "max": 1.0,
+      "mean": 0.4947257339954376,
+      "std": 0.5052193999290466,
+      "sha1_5dp": "8eea427d6879d042"
+    },
+    "memory_features": {
+      "shape": [
+        1,
+        5184,
+        1,
+        64
+      ],
+      "min": -5.03125,
+      "max": 6.46875,
+      "mean": 0.07179766893386841,
+      "std": 1.0388596057891846,
+      "sha1_5dp": "570786b31f2404f3"
+    },
+    "memory_pos_enc": {
+      "shape": [
+        1,
+        5184,
+        1,
+        64
+      ],
+      "min": -1.0,
+      "max": 1.0,
+      "mean": 0.4847295880317688,
+      "std": 0.5148184299468994,
+      "sha1_5dp": "a413baf724a6c884"
+    },
+    "object_pointers": {
+      "shape": [
+        1,
+        1,
+        1,
+        256
+      ],
+      "min": -1.2908527851104736,
+      "max": 0.9863244891166687,
+      "mean": -0.10737404972314835,
+      "std": 0.46018287539482117,
+      "sha1_5dp": "11c3237080bef1d2"
+    },
+    "output": {
+      "shape": [
+        1,
+        256,
+        72,
+        72
+      ],
+      "min": -5.570901870727539,
+      "max": 7.266819953918457,
+      "mean": 0.0372152104973793,
+      "std": 1.0472743511199951,
+      "sha1_5dp": "b7742560d74de7da"
+    }
+  }
+}

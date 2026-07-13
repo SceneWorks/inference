@@ -1,0 +1,511 @@
+//! `Flux1DevControl` — the FLUX.1-dev **Fun-Controlnet-Union** variant (sc-8238, epic 8236): VACE-like
+//! strict structural conditioning (pose / canny / depth — input-agnostic, no discrete mode index) via
+//! `Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro-2.0`.
+//!
+//! This is the **E1 engine** story: the control branch struct, its weight load, the control-latent
+//! encode, the residual computation, and the injection into the FLUX.1-dev denoise. The transformer is a
+//! [`FluxControlTransformer`] (the parity-proven dev DiT + a diffusers-style [`FluxControlNet`] residual
+//! branch); `generate` threads a VAE-encoded control latent through it under the embedded-guidance
+//! denoise (dev is guidance-distilled — a single forward, no true-CFG). [`load_dev_control`] needs the
+//! dev snapshot (`spec.weights`) **and** the control checkpoint (`spec.control`).
+//!
+//! ## Compose-readiness (constraint 2)
+//! The control-residual injection coexists with the existing [`DitImageInjector`] seam (PuLID /
+//! `FluxIpInjector`): the denoise routes through [`FluxControlTransformer::forward_composed`], which
+//! threads an optional identity injector into the SAME base double-block stream as the control
+//! residuals (see [`crate::transformer::FluxTransformer::forward_control`]). A follow-on epic can stack
+//! identity (PuLID/IP-Adapter) + control in one denoise step by passing `Some(injector)` here — this
+//! E1 story wires the seam and exposes [`Flux1DevControl::generate_with_injector`] for it; the worker
+//! wiring + the registered descriptor are E2 (sc-8239).
+//!
+//! ## Scope note (E1 + E2)
+//! E1 (sc-8238) shipped the engine + a descriptor STUB. E2 (sc-8239) finalized the capability surface:
+//! [`descriptor_dev_control`] now mirrors FLUX.2's `flux2_dev_control` shape, the [`ControlBranch`] impl
+//! pins the accepted control kinds to pose/canny/depth (input-agnostic — no mode index, S0 sc-8237), and
+//! `tests/control_real_weights.rs` carries one `#[ignore]` real-weight Metal smoke per mode. The model
+//! resolves through the core registry as `flux1_dev_control` (`mlx_gen::load`); the SceneWorks worker
+//! exposure + manifest re-pin are the driver/manifest stories (sc-8243/sc-8244), not this crate.
+
+use mlx_gen::gen_core;
+use mlx_gen::image::decoded_to_image;
+use mlx_gen::img2img::preprocess_init_image;
+use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::{
+    curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
+    require_control, run_flow_sampler, AcceptedControlKinds, Capabilities, ConditioningKind,
+    ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, TimestepConvention,
+};
+use mlx_rs::{Array, Dtype};
+
+use crate::config::{FLUX1_DEV_CONTROL_ID, HYPER_SAMPLER};
+use crate::control_transformer::FluxControlTransformer;
+use crate::loader;
+use crate::pipeline::{build_sigmas_with, create_noise, pack_latents, unpack_latents};
+use crate::text_encoder::FluxTextEncoders;
+use crate::transformer::DitImageInjector;
+use mlx_gen_z_image::vae::Vae;
+
+use crate::config::{FluxVariant, DEFAULT_GUIDANCE};
+
+/// Default control-conditioning scale when a `Conditioning::Control` omits / does not override it. The
+/// Shakker recommends ~0.7 for Union-Pro-2.0; the request's per-control `scale` wins when set.
+const DEFAULT_CONTROL_SCALE: f32 = 0.7;
+
+/// The control variant's identity + capabilities (E2 sc-8239, finalized). Mirrors FLUX.2's
+/// `flux2_dev_control` descriptor (`mlx_gen_flux2::descriptor_dev_control`): the guidance-distilled dev base
+/// (embedded guidance, no negative prompt / true-CFG, no KV cache, mac-only) declaring a required
+/// `Control` conditioning (the structural hint). It diverges from FLUX.2 only where the engines do:
+/// FLUX.2 also declares a `Reference` (an img2img init the FLUX.2 fork seeds from) — the FLUX.1 Shakker
+/// control path has no img2img-init seam, so it declares `Control` alone. Neither declares a `Depth`
+/// `ConditioningKind`: depth is a *control image* (a `ControlKind::Depth` carried by
+/// `Conditioning::Control`), not the separate `Conditioning::Depth` map. The accepted control kinds
+/// (pose/canny/depth) live on the [`ControlBranch`] impl below, not in the descriptor — they gate
+/// `resolve_control`, not capability introspection.
+pub fn descriptor_dev_control() -> ModelDescriptor {
+    ModelDescriptor {
+        id: FLUX1_DEV_CONTROL_ID,
+        family: "flux",
+        backend: "mlx",
+        modality: Modality::Image,
+        capabilities: Capabilities {
+            supports_negative_prompt: false,
+            // dev consumes its guidance scale as an embedded scalar (FLUX.1-dev pattern), not CFG.
+            supports_guidance: true,
+            supports_true_cfg: false,
+            // Control (required) — the structural hint (pose/canny/depth, input-agnostic).
+            conditioning: vec![ConditioningKind::Control],
+            supported_quants: &[Quant::Q4, Quant::Q8],
+            // LoRA/LoKr target the base DiT (the control branch is never an adapter target).
+            supports_lora: true,
+            supports_lokr: true,
+            samplers: {
+                let mut s = curated_sampler_names();
+                s.push(crate::config::DEFAULT_SAMPLER);
+                s.push(HYPER_SAMPLER);
+                s
+            },
+            schedulers: {
+                let mut s = curated_scheduler_names();
+                s.push("linear");
+                s
+            },
+            supported_guidance_methods: vec![],
+            min_size: 256,
+            max_size: 2048,
+            max_count: 8,
+            mac_only: true,
+            supports_kv_cache: false,
+            requires_sigma_shift: FluxVariant::Dev.requires_sigma_shift(),
+            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            supports_sequential_offload: false,
+        },
+    }
+}
+
+/// A loaded control generator: the dev base components + the control transformer assembled from the dev
+/// snapshot and the Shakker Fun-Controlnet-Union overlay.
+pub struct Flux1DevControl {
+    descriptor: ModelDescriptor,
+    t5_tokenizer: TextTokenizer,
+    clip_tokenizer: TextTokenizer,
+    text_encoders: FluxTextEncoders,
+    transformer: FluxControlTransformer,
+    vae: Vae,
+}
+
+/// FLUX.1-dev Fun-Controlnet-Union (sc-8238): load the dev snapshot + the Shakker control checkpoint and
+/// assemble the [`Flux1DevControl`] generator.
+///
+/// `spec.weights` must be the dev snapshot directory (tokenizer/ tokenizer_2/ text_encoder/
+/// text_encoder_2/ transformer/ vae/); `spec.control` (required) the
+/// `FLUX.1-dev-ControlNet-Union-Pro-2.0` checkpoint (a single `.safetensors` `File`, or a `Dir`).
+/// `spec.quantize` (Q4/Q8) quantizes the whole model — base DiT + control branch + text encoders + VAE.
+pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{FLUX1_DEV_CONTROL_ID}: only dense bf16 is wired (Q4/Q8 = spec.quantize)"
+        )));
+    }
+    // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
+    // required. The model id + labels keep the messages aligned with the other control ports.
+    let root = require_base_dir(
+        spec,
+        FLUX1_DEV_CONTROL_ID,
+        "a FLUX.1-dev snapshot directory",
+    )?;
+    let control = require_control(
+        spec,
+        FLUX1_DEV_CONTROL_ID,
+        "FLUX.1-dev-ControlNet-Union-Pro-2.0",
+    )?;
+
+    let t5_tokenizer = loader::load_t5_tokenizer(root, FluxVariant::Dev)?;
+    let clip_tokenizer = loader::load_clip_tokenizer()?;
+    let mut text_encoders = FluxTextEncoders {
+        t5: loader::load_t5_encoder(root)?,
+        clip: loader::load_clip_encoder(root)?,
+    };
+    let mut transformer = loader::load_control_transformer_dev(root, control)?;
+    let mut vae = loader::load_vae(root)?;
+    if let Some(q) = spec.quantize {
+        let bits = q.bits();
+        text_encoders.quantize(bits)?;
+        transformer.quantize(bits)?;
+        vae.quantize(bits)?;
+    }
+    // LoRA/LoKr (sc-2657): applied to the base DiT (the control branch is never an adapter target),
+    // after quantization, as forward-time residuals. No-op when empty.
+    crate::adapters::apply_flux_adapters(transformer.base_mut(), &spec.adapters)?;
+
+    Ok(Box::new(Flux1DevControl {
+        descriptor: descriptor_dev_control(),
+        t5_tokenizer,
+        clip_tokenizer,
+        text_encoders,
+        transformer,
+        vae,
+    }))
+}
+
+impl Flux1DevControl {
+    /// Tokenize + encode the prompt into `(prompt_embeds, pooled_prompt_embeds)` (the dev T5 + CLIP
+    /// path; same as [`crate::model::Flux1::encode_prompt`]).
+    fn encode_prompt(&self, prompt: &str) -> Result<(Array, Array)> {
+        let (t5_ids, _) = mlx_gen::tokenizer::to_arrays(&self.t5_tokenizer.tokenize(prompt)?);
+        let (clip_ids, _) = mlx_gen::tokenizer::to_arrays(&self.clip_tokenizer.tokenize(prompt)?);
+        self.text_encoders.encode(&t5_ids, &clip_ids)
+    }
+
+    /// VAE-encode + pack the control hint into the packed control latent `[1, seq, 64]` (constant
+    /// across steps + the batch). The Shakker FLUX.1 ControlNet encodes the control image with the same
+    /// VAE and 2×2 pack as the noise latents (diffusers `prepare_image` → `vae.encode` →
+    /// `_pack_latents`), so the control latent aligns 1:1 with the base image tokens.
+    fn encode_control_latent(&self, image: &Image, width: u32, height: u32) -> Result<Array> {
+        let image_nchw = preprocess_init_image(image, width, height)?;
+        let encoded = self.vae.encode(&image_nchw)?; // [1, 16, H/8, W/8]
+        pack_latents(&encoded, width, height)
+    }
+
+    /// As [`Generator::generate`], but threading an OPTIONAL identity injector (PuLID / XLabs
+    /// IP-Adapter) into every control-denoise step — the **compose-ready** seam (constraint 2). With
+    /// `injector = None` this is the plain control path; `Some(..)` stacks identity + control in one
+    /// denoise (the seam a follow-on epic uses). `injector = None` IS [`Generator::generate`]'s path.
+    pub fn generate_with_injector(
+        &self,
+        req: &GenerationRequest,
+        injector: Option<&dyn DitImageInjector>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        // `resolve_control` resolves an unset (`None`) scale to `default_control_scale()` (the Shakker
+        // `DEFAULT_CONTROL_SCALE`); an explicit `Some(0.0)` now flows through as a deliberately inert
+        // branch (F-085 — the `Option<f32>` field distinguishes it from unset, so no 0.0 reject).
+        let (control_image, control_scale) = self.resolve_control(req)?;
+
+        let (prompt_embeds, pooled_prompt_embeds) = self.encode_prompt(&req.prompt)?;
+        let control_latent = self.encode_control_latent(control_image, req.width, req.height)?;
+
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let sampler_name = req
+            .sampler
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_SAMPLER);
+        let (def_steps, def_guidance) = if sampler_name == HYPER_SAMPLER {
+            (8, DEFAULT_GUIDANCE)
+        } else {
+            (FluxVariant::Dev.default_steps(), DEFAULT_GUIDANCE)
+        };
+        let steps = req.steps.unwrap_or(def_steps) as usize;
+        let guidance = req.guidance.unwrap_or(def_guidance);
+
+        let sigmas = build_sigmas_with(
+            steps,
+            req.width,
+            req.height,
+            FluxVariant::Dev.requires_sigma_shift(),
+            req.scheduler.as_deref(),
+        )?;
+
+        // Compiled elementwise glue (sc-2963), shared with the base flux1 path. Scoped + restored on
+        // drop by the RAII guard (F-007).
+        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        for i in 0..req.count {
+            let seed = base_seed.wrapping_add(i as u64);
+            let latents = create_noise(seed, req.width, req.height)?;
+            let final_latents = run_flow_sampler(
+                Some(sampler_name),
+                TimestepConvention::Sigma,
+                &sigmas,
+                latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                |x_in, timestep| {
+                    self.transformer.forward_composed(
+                        x_in,
+                        &control_latent,
+                        &prompt_embeds,
+                        &pooled_prompt_embeds,
+                        timestep,
+                        guidance,
+                        req.width,
+                        req.height,
+                        control_scale,
+                        injector,
+                    )
+                },
+            )?;
+            on_progress(Progress::Decoding);
+            let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
+            let decoded = self.vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+            images.push(decoded_to_image(&decoded)?);
+        }
+        Ok(GenerationOutput::Images(images))
+    }
+
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        // The plain control path is the compose-ready path with NO identity injector — exercising the
+        // same seam keeps the two from drifting (constraint 2: control never bypasses the injector hook).
+        self.generate_with_injector(req, None, on_progress)
+    }
+
+    fn validate_capability(&self, req: &GenerationRequest) -> Result<()> {
+        if req.prompt.trim().is_empty() {
+            return Err(Error::Msg(format!(
+                "{FLUX1_DEV_CONTROL_ID}: prompt is required"
+            )));
+        }
+        // Shared capability floor (F-025): the hand-rolled copy only checked sampler/scheduler and
+        // multiple-of-16, silently skipping min/max size, count bounds (`count: 0` succeeded on an
+        // empty batch), the steps>=1 floor, and negative_prompt/true_cfg/guidance rejection. Delegate
+        // to core (like Kolors, F-132) so those are enforced; the `?` preserves the typed
+        // `Error::Unsupported` for capability gaps.
+        self.descriptor
+            .capabilities
+            .validate_request(FLUX1_DEV_CONTROL_ID, req)?;
+        if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
+            return Err(Error::Msg(format!(
+                "{FLUX1_DEV_CONTROL_ID}: width and height must be multiples of 16, got {}x{}",
+                req.width, req.height
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The control kinds the Shakker Union-Pro-2.0 checkpoint admits: pose / canny / depth (input-agnostic
+/// — the kind is metadata, not a forward branch). Exposed as a free function so the policy is unit
+/// testable without a loaded generator (the [`ControlBranch::accepted_control_kinds`] method delegates
+/// here).
+fn accepted_control_kinds() -> AcceptedControlKinds {
+    AcceptedControlKinds::Only(vec![
+        ControlKind::Pose,
+        ControlKind::Canny,
+        ControlKind::Depth,
+    ])
+}
+
+/// The Shakker Union-Pro-2.0 is an *input-agnostic* union ControlNet: pose / canny / depth all share
+/// one VAE-encoded control path (the 2.0 checkpoint dropped the 1.0 discrete `control_mode` index — S0
+/// sc-8237 verified the whole Fun-Controlnet-Union family selects the control kind purely by which
+/// preprocessor produced the control image, NOT by a mode index). The control kind therefore never
+/// branches the forward; it is metadata only.
+///
+/// We accept exactly the three kinds Union-Pro-2.0 documents support
+/// ([`AcceptedControlKinds::Only`] of `Pose`/`Canny`/`Depth`) rather than the bare
+/// [`AcceptedControlKinds::Any`]: this rejects an unmodelled `ControlKind::Other(..)` at
+/// `resolve_control` with a clear message instead of silently feeding an unsupported hint through the
+/// VAE-encode path. All control boilerplate (resolve/validate-present + the load helpers) still comes
+/// from the shared trait (sc-8241).
+impl ControlBranch for Flux1DevControl {
+    fn model_id(&self) -> &'static str {
+        FLUX1_DEV_CONTROL_ID
+    }
+
+    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
+        accepted_control_kinds()
+    }
+
+    fn unsupported_kind_message(&self, kind: &ControlKind) -> String {
+        // The trait default wording ("v1 supports pose control only") is Qwen-v1 specific. Union-Pro-2.0
+        // supports pose/canny/depth — say so.
+        format!(
+            "{FLUX1_DEV_CONTROL_ID} supports pose/canny/depth control (Fun-Controlnet-Union), got {kind:?}"
+        )
+    }
+
+    fn default_control_scale(&self) -> f32 {
+        // The Shakker Union-Pro-2.0 recommendation for an unset (`scale = None`) control (F-085); an
+        // explicit `Some(x)` — including `Some(0.0)` for an inert branch — wins over this.
+        DEFAULT_CONTROL_SCALE
+    }
+}
+
+impl Generator for Flux1DevControl {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        // Capability floor (size/count/sampler/scheduler/prompt), then the shared control-present check
+        // (sc-8241's `ControlBranch::require_control_present`).
+        self.validate_capability(req)?;
+        self.require_control_present(req)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+// Link-time registration (epic 3720): the `inventory::submit!` so E2's worker can resolve the
+// `flux1_dev_control` generator by id. The `impl Generator` above stays hand-written because `validate`
+// adds a control-conditioning check beyond the plain capability floor.
+mlx_gen::register_generators! { descriptor_dev_control => load_dev_control }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::WeightsSource;
+
+    #[test]
+    fn descriptor_is_flux1_dev_control() {
+        let d = descriptor_dev_control();
+        assert_eq!(d.id, "flux1_dev_control");
+        assert_eq!(d.family, "flux");
+        assert!(d.capabilities.accepts(ConditioningKind::Control));
+        // dev embedded guidance: guidance on, negative / true-CFG off; no KV cache; mac-only.
+        assert!(d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.supports_kv_cache);
+        assert!(d.capabilities.mac_only);
+    }
+
+    #[test]
+    fn descriptor_mirrors_flux2_dev_control_shape() {
+        // The finalized FLUX.1 control descriptor mirrors the FLUX.2 `flux2_dev_control` capability
+        // shape (guidance-distilled dev base: guidance on, no negative/true-CFG/KV-cache, mac-only,
+        // LoRA/LoKr on, Q4/Q8) and declares a required `Control` conditioning. Neither declares a
+        // standalone `Depth` `ConditioningKind` — depth is a `ControlKind::Depth` control image.
+        let d = descriptor_dev_control();
+        assert!(d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.supports_kv_cache);
+        assert!(d.capabilities.mac_only);
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert!(d.capabilities.accepts(ConditioningKind::Control));
+        assert!(!d.capabilities.accepts(ConditioningKind::Depth));
+    }
+
+    #[test]
+    fn accepted_control_kinds_are_pose_canny_depth() {
+        // Input-agnostic Union (S0 sc-8237): no discrete mode index; we accept exactly the three kinds
+        // Shakker Union-Pro-2.0 documents (pose/canny/depth) and reject an unmodelled `Other(..)`.
+        let policy = accepted_control_kinds();
+        assert_eq!(
+            policy,
+            AcceptedControlKinds::Only(vec![
+                ControlKind::Pose,
+                ControlKind::Canny,
+                ControlKind::Depth,
+            ])
+        );
+        assert!(policy.accepts(&ControlKind::Pose));
+        assert!(policy.accepts(&ControlKind::Canny));
+        assert!(policy.accepts(&ControlKind::Depth));
+        assert!(!policy.accepts(&ControlKind::Other("scribble".into())));
+    }
+
+    #[test]
+    fn validate_floor_rejects_zero_count_and_capability_gaps() {
+        // F-025: the hand-rolled `validate_capability` skipped count/size bounds and negative/true_cfg
+        // rejection — `count: 0` silently succeeded on an empty batch. `validate_capability` now
+        // delegates to this shared floor; exercise it directly (no loaded weights needed).
+        let caps = descriptor_dev_control().capabilities;
+        let base = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            conditioning: vec![mlx_gen::Conditioning::Control {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![0u8; 64 * 64 * 3],
+                },
+                kind: ControlKind::Pose,
+                scale: Some(1.0),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            caps.validate_request(FLUX1_DEV_CONTROL_ID, &base).is_ok(),
+            "a well-formed control request should pass the floor"
+        );
+        // count: 0 must be rejected (previously an empty-batch success).
+        let zero_count = GenerationRequest {
+            count: 0,
+            ..base.clone()
+        };
+        assert!(caps
+            .validate_request(FLUX1_DEV_CONTROL_ID, &zero_count)
+            .is_err());
+        // Below-min size must be rejected.
+        let tiny = GenerationRequest {
+            width: 16,
+            height: 16,
+            ..base.clone()
+        };
+        assert!(caps.validate_request(FLUX1_DEV_CONTROL_ID, &tiny).is_err());
+        // true_cfg / negative_prompt are unadvertised → typed Unsupported.
+        let tcfg = GenerationRequest {
+            true_cfg: Some(4.0),
+            ..base.clone()
+        };
+        assert!(matches!(
+            caps.validate_request(FLUX1_DEV_CONTROL_ID, &tcfg),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn load_rejects_missing_control_weights() {
+        // Without `spec.control`, load must fail on the missing control weights (proving the control
+        // overlay is a hard requirement) — not on the missing snapshot.
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let err = load_dev_control(&spec)
+            .err()
+            .expect("expected error")
+            .to_string();
+        assert!(
+            err.contains("FLUX.1-dev-ControlNet-Union-Pro-2.0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_single_file_base() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/dev.safetensors".into()))
+            .with_control(WeightsSource::File("/tmp/control.safetensors".into()));
+        let err = load_dev_control(&spec)
+            .err()
+            .expect("expected error")
+            .to_string();
+        assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+}

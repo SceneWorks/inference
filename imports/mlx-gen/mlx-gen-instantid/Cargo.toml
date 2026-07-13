@@ -1,0 +1,23 @@
+[package]
+name = "mlx-gen-instantid"
+version = "0.0.0"
+edition = "2021"
+description = "InstantID identity-preserving SDXL provider for mlx-gen (face Resampler + IdentityNet ControlNet + kps control-image renderer)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "instantid", "sdxl", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
+mlx-gen-face = { path = "../mlx-gen-face" }
+# Optional PiD super-resolving decoder (epic 7840, sc-8370): InstantID reuses the `sdxl` PiD student
+# (it composes the SDXL VAE latent space), swapping the native VAE decode when a generation opts in.
+mlx-gen-pid = { path = "../mlx-gen-pid" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+
+[dev-dependencies]
+# PNG inspection output for the e2e test (matches the workspace `image` version).
+image = { workspace = true }

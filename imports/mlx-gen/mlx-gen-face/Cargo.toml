@@ -1,0 +1,18 @@
+[package]
+name = "mlx-gen-face"
+version = "0.0.0"
+edition = "2021"
+description = "Native MLX face-analysis provider crate for mlx-gen (ArcFace iresnet100 / SCRFD / BiSeNet / alignment)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "arcface", "face", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+
+[dev-dependencies]
+# `face_cosine` example (epic 10871 P4.2 identity scoring) loads PNG/JPG inputs.
+image = { workspace = true }

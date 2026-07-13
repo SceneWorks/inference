@@ -1,0 +1,735 @@
+//! Z-Image DiT denoiser. Port of `ZImageTransformer.__call__`: patchify image + caption
+//! (pad each to a multiple of 32, with 3-D position ids) → embed → noise/context refiners →
+//! unify → main transformer stack → final layer → unpatchify, returning the negated velocity.
+//!
+//! Attention is full-valid everywhere (the fork builds all-ones masks), so the blocks run
+//! `mask=None`. Padded token positions are set to the **learned** `x_pad_token` / `cap_pad_token`
+//! embeddings (the fork's `where(pad_mask, pad_token, ·)`) — NOT zero. With no attention mask the
+//! padded tokens mix into the real tokens, so their value matters; a fresh model zero-inits the
+//! pad tokens (which is why a tiny random fixture can't tell zeroing from pad-token), but the
+//! trained checkpoint's pad tokens are non-zero. Position ids / coord grids are computed in plain
+//! Rust and asserted exact in the parity test.
+
+use mlx_rs::error::{Exception, Result as MlxResult};
+use mlx_rs::fast::rms_norm;
+use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
+use mlx_rs::transforms::checkpoint;
+use mlx_rs::Array;
+
+use super::context_block::ZImageContextBlock;
+use super::final_layer::FinalLayer;
+use super::rope_embedder::RopeEmbedder;
+use super::timestep_embedder::TimestepEmbedder;
+use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::train::lora::LoraParams;
+use mlx_gen::weights::Weights;
+use mlx_gen::Result;
+
+/// Shape/hyperparameters of a Z-Image transformer.
+#[derive(Debug, Clone)]
+pub struct ZImageTransformerConfig {
+    pub patch_size: i32,
+    pub f_patch_size: i32,
+    pub in_channels: i32,
+    pub dim: i32,
+    pub n_layers: usize,
+    pub n_refiner_layers: usize,
+    pub n_heads: i32,
+    pub norm_eps: f32,
+    pub cap_feat_dim: i32,
+    pub rope_theta: f32,
+    pub t_scale: f32,
+    pub axes_dims: Vec<i32>,
+    pub axes_lens: Vec<i32>,
+    pub frequency_embedding_size: i32,
+}
+
+impl ZImageTransformerConfig {
+    /// The production Z-Image-turbo config (dim 3840, 30 layers).
+    pub fn turbo() -> Self {
+        Self {
+            patch_size: 2,
+            f_patch_size: 1,
+            in_channels: 16,
+            dim: 3840,
+            n_layers: 30,
+            n_refiner_layers: 2,
+            n_heads: 30,
+            norm_eps: 1e-5,
+            cap_feat_dim: 2560,
+            rope_theta: 256.0,
+            t_scale: 1000.0,
+            axes_dims: vec![32, 48, 48],
+            axes_lens: vec![1024, 512, 512],
+            frequency_embedding_size: 256,
+        }
+    }
+
+    fn block_cfg(&self) -> ZImageBlockConfig {
+        ZImageBlockConfig {
+            dim: self.dim,
+            n_heads: self.n_heads,
+            norm_eps: self.norm_eps,
+        }
+    }
+    fn embed_key(&self) -> String {
+        format!("{}-{}", self.patch_size, self.f_patch_size)
+    }
+}
+
+pub struct ZImageTransformer {
+    // Fields are `pub(crate)` so the ControlNet variant ([`crate::control_transformer`]) can
+    // compose the base submodules into its dual-injection forward without forking the
+    // parity-proven base `forward` (mirrors the fork's `ZImageControlTransformer(ZImageTransformer)`
+    // inheritance).
+    pub(crate) cfg: ZImageTransformerConfig,
+    pub(crate) x_embedder: AdaptableLinear,
+    pub(crate) cap_norm_w: Array,
+    pub(crate) cap_linear: AdaptableLinear,
+    pub(crate) t_embedder: TimestepEmbedder,
+    pub(crate) noise_refiner: Vec<ZImageTransformerBlock>,
+    pub(crate) context_refiner: Vec<ZImageContextBlock>,
+    pub(crate) layers: Vec<ZImageTransformerBlock>,
+    pub(crate) rope: RopeEmbedder,
+    pub(crate) final_layer: FinalLayer,
+    pub(crate) x_pad_token: Array,
+    pub(crate) cap_pad_token: Array,
+    /// sc-4887 — when `Some(dt)` (set only by [`cast_weights`](Self::cast_weights), i.e. only in
+    /// training), the caption stream joins the unified stack cast to `dt` after the context
+    /// refiners. The caption ENTRY (cap norm/linear + context refiners, 32 tokens) deliberately
+    /// stays f32: the Qwen embeddings carry outlier dims whose bf16 rounding measurably scrambles
+    /// the tiny context-refiner LoRA grads (per-param cosine vs f32 as low as 0.43), while costing
+    /// nothing to keep precise. `None` (every inference path) = zero behavior change.
+    pub(crate) train_unify_dtype: Option<mlx_rs::Dtype>,
+}
+
+/// `where(keep == 1, emb, pad)` for `emb` `[N, dim]`, `keep` `[N, 1]` (1 = real, 0 = padded),
+/// `pad` `[1, dim]` — set padded token positions to the learned pad-token embedding.
+/// Dtype-following on the PAD TOKEN (sc-4887), the weight-derived operand: the keep mask and the
+/// constant are built f32, which under the bf16 training cast (pad token bf16) would promote both
+/// token streams back to f32 right at entry. Keying off `pad` — NOT `emb` — keeps every inference
+/// config bit-identical: pad tokens are f32 in all of them (KEEP-F32; `quantize` never touches
+/// them), including the Q8/Q4 path whose `emb` arrives bf16 and must keep promoting to f32 exactly
+/// as the parity goldens were dumped. A 0/1 mask is exact in bf16.
+pub(crate) fn apply_pad(emb: &Array, keep: &Array, pad: &Array) -> Result<Array> {
+    let dt = pad.dtype();
+    let keep = keep.as_dtype(dt)?;
+    let one = Array::from_slice(&[1.0f32], &[1]).as_dtype(dt)?;
+    let inv = subtract(&one, &keep)?; // 1 - keep
+    Ok(add(&multiply(emb, &keep)?, &multiply(pad, &inv)?)?)
+}
+
+impl ZImageTransformer {
+    pub fn from_weights(w: &Weights, prefix: &str, cfg: ZImageTransformerConfig) -> Result<Self> {
+        // Tolerate an empty prefix (real checkpoints are un-prefixed) without a leading dot.
+        let p = |s: &str| {
+            if prefix.is_empty() {
+                s.to_string()
+            } else {
+                format!("{prefix}.{s}")
+            }
+        };
+        let key = cfg.embed_key();
+        let bcfg = cfg.block_cfg();
+
+        let block_vec = |base: &str, n: usize| -> Result<Vec<ZImageTransformerBlock>> {
+            (0..n)
+                .map(|i| ZImageTransformerBlock::from_weights(w, &p(&format!("{base}.{i}")), bcfg))
+                .collect()
+        };
+        let context_vec = |base: &str, n: usize| -> Result<Vec<ZImageContextBlock>> {
+            (0..n)
+                .map(|i| {
+                    ZImageContextBlock::from_weights(
+                        w,
+                        &p(&format!("{base}.{i}")),
+                        cfg.dim,
+                        cfg.n_heads,
+                        cfg.norm_eps,
+                    )
+                })
+                .collect()
+        };
+
+        Ok(Self {
+            // Packed-detect (sc-8670): the image patch embedder + caption projection load packed
+            // from a pre-quantized snapshot or dense otherwise; both carry a bias. `cap_embedder.0`
+            // is the caption RMSNorm scale (1-D) and stays a raw dense `Array`.
+            x_embedder: crate::quant::lin(w, &p(&format!("all_x_embedder.{key}")), true)?,
+            cap_norm_w: w.require(&p("cap_embedder.0.weight"))?.clone(),
+            cap_linear: crate::quant::lin(w, &p("cap_embedder.1"), true)?,
+            t_embedder: TimestepEmbedder::from_weights(
+                w,
+                &p("t_embedder"),
+                cfg.frequency_embedding_size,
+            )?,
+            noise_refiner: block_vec("noise_refiner", cfg.n_refiner_layers)?,
+            context_refiner: context_vec("context_refiner", cfg.n_refiner_layers)?,
+            layers: block_vec("layers", cfg.n_layers)?,
+            rope: RopeEmbedder::new(cfg.rope_theta, &cfg.axes_dims, &cfg.axes_lens),
+            final_layer: FinalLayer::from_weights(w, &p(&format!("all_final_layer.{key}")))?,
+            x_pad_token: w.require(&p("x_pad_token"))?.reshape(&[1, cfg.dim])?,
+            cap_pad_token: w.require(&p("cap_pad_token"))?.reshape(&[1, cfg.dim])?,
+            train_unify_dtype: None,
+            cfg,
+        })
+    }
+
+    /// Quantize every Linear in the DiT to Q4/Q8 (group_size 64), the mlx-rs equivalent of the
+    /// fork's `nn.quantize(transformer, bits=…)`. That predicate (`hasattr(module,"to_quantized")`)
+    /// matches *every* `nn.Linear` — here the image/caption embedders, the timestep + final
+    /// layers, and every block/context-block attention, FFN, and adaLN projection. RMSNorm /
+    /// LayerNorm scales and the learned pad tokens are not Linears, so they stay dense.
+    ///
+    /// The fork's full `nn.quantize` also covers the text encoder + VAE; the whole-model quant is
+    /// wired in `model.rs::load` (sc-2532). The quantization is byte-identical to the fork's
+    /// `mx.quantize` **because `AdaptableLinear::quantize` casts the weight to bf16 first** (the
+    /// fork's compute dtype). Z-Image-Turbo ships an f32 transformer checkpoint; quantizing it
+    /// as-loaded (f32) yields group scales ~0.13% off the fork's bf16 scales and a ~0.78% px>8
+    /// base-Q8 residual (sc-2604, once misread as "source-MLX-vs-wheel toolchain"). With the bf16
+    /// cast the Q8/Q4 e2e collapses to the dense floor (~0.03% px>8 @1024²) — see
+    /// `tests/e2e_real_weights.rs` and `tests/q8_xemb_diag.rs`.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for lin in [&mut self.x_embedder, &mut self.cap_linear] {
+            lin.quantize(bits, None)?;
+        }
+        self.t_embedder.quantize(bits)?;
+        self.final_layer.quantize(bits)?;
+        for block in &mut self.noise_refiner {
+            block.quantize(bits)?;
+        }
+        for block in &mut self.context_refiner {
+            block.quantize(bits)?;
+        }
+        for block in &mut self.layers {
+            block.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    /// Diagnostic accessor (sc-2604 Q8 root-cause): the image patch embedder, so a test can
+    /// byte-compare its loaded quantization and run its forward in isolation against the fork.
+    pub fn x_embedder(&self) -> &AdaptableLinear {
+        &self.x_embedder
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing (sc-4886) — `main` for the 30-block unified
+    /// stack, `refiners` for the noise/context refiners. Training-only knob: the trainer enables it
+    /// unconditionally (it is numerically identical to the dense backward and bounds the seq²
+    /// attention retention to one layer's transient); when whole-block checkpointing (sc-4874) is
+    /// on, the trainer turns the MAIN flag off — the block recompute already covers attention, and
+    /// nesting would recompute it twice for no memory win.
+    pub fn set_sdpa_checkpoint(&mut self, main: bool, refiners: bool) {
+        for b in &mut self.layers {
+            b.set_sdpa_checkpoint(main);
+        }
+        for b in &mut self.noise_refiner {
+            b.set_sdpa_checkpoint(refiners);
+        }
+        for b in &mut self.context_refiner {
+            b.set_sdpa_checkpoint(refiners);
+        }
+    }
+
+    /// Cast the DiT to the `dtype` training compute precision in place — the sc-4887 bf16 switch.
+    /// Covers the image/unified path (x embedder, t embedder, noise refiners, main stack, final
+    /// layer, x pad token); the caption ENTRY (cap norm/linear, context refiners, cap pad token)
+    /// deliberately stays f32 and the caption stream is cast to `dtype` only where it joins the
+    /// unified stack (see `train_unify_dtype`) — the Qwen embeddings' outlier dims make the tiny
+    /// context-refiner LoRA grads precision-sensitive, and 32 caption tokens cost nothing in f32.
+    /// Destructive for a narrowing cast (f32→bf16): reload for f32. Inference never calls this
+    /// (KEEP-F32, sc-2609 — the f32 render is the preferred output).
+    pub fn cast_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.x_embedder.cast_weights(dtype)?;
+        self.t_embedder.cast_weights(dtype)?;
+        self.final_layer.cast_weights(dtype)?;
+        for block in &mut self.noise_refiner {
+            block.cast_weights(dtype)?;
+        }
+        for block in &mut self.layers {
+            block.cast_weights(dtype)?;
+        }
+        if self.x_pad_token.dtype() != dtype {
+            self.x_pad_token = self.x_pad_token.as_dtype(dtype)?;
+        }
+        self.train_unify_dtype = (dtype != mlx_rs::Dtype::Float32).then_some(dtype);
+        Ok(())
+    }
+
+    /// The DiT's current compute dtype, probed from the image embedder's dense weight (`None` if
+    /// quantized). Lets the trainer detect a prior [`cast_weights`](Self::cast_weights) — the cast
+    /// is destructive, so a trainer asked for f32 after a bf16 cast must reload, not proceed.
+    pub fn compute_dtype(&self) -> Option<mlx_rs::Dtype> {
+        self.x_embedder.weight_dtype()
+    }
+
+    /// Build the [`Prepared`] step-invariant inputs (patchify metadata + RoPE freqs) for a latent of
+    /// shape `dims = (C, F, H, W)` and caption `cap_feats`. These depend only on the dims and caption,
+    /// so a denoise loop builds this once and reuses it for every step's [`forward_with`](Self::forward_with),
+    /// avoiding the per-step host-side Vec rebuilds and the `host_i32` RoPE-gather readbacks (F-042).
+    pub(crate) fn prepare(
+        &self,
+        dims: (i32, i32, i32, i32),
+        cap_feats: &Array,
+    ) -> Result<Prepared> {
+        let meta = self.patchify_meta(dims, cap_feats)?;
+        let x_freqs = self.rope.forward(&meta.x_pos_ids)?;
+        let cap_freqs = self.rope.forward(&meta.cap_pos_ids)?;
+        let unified_freqs = concatenate_axis(&[&x_freqs, &cap_freqs], 0)?;
+        Ok(Prepared {
+            cap_tokens: meta.cap_tokens,
+            x_size: meta.x_size,
+            x_keep: meta.x_keep,
+            cap_keep: meta.cap_keep,
+            img_pad: meta.img_pad,
+            x_freqs,
+            cap_freqs,
+            unified_freqs,
+        })
+    }
+
+    /// Run the DiT for one denoise step against a cached [`Prepared`]. `x` is the current latent
+    /// `(C, F, H, W)` (same dims as `prep` was built for) and `timestep` ∈ [0,1]; only the latent
+    /// values and timestep vary across steps. Returns the latent-shaped velocity `(C, F, H, W)`.
+    pub(crate) fn forward_with(&self, prep: &Prepared, x: &Array, timestep: f32) -> Result<Array> {
+        let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
+        let t_emb = self.t_embedder.forward(&t)?;
+
+        // Image stream: patchify (the only value-dependent step) -> embed -> pad -> noise refiner.
+        let x_tokens = self.patchify_image_tokens(x, prep.img_pad)?;
+        let mut x_emb = self.x_embedder.forward(&x_tokens)?;
+        x_emb = apply_pad(&x_emb, &prep.x_keep, &self.x_pad_token)?;
+        let mut x_emb = x_emb.expand_dims(0)?;
+        for layer in &self.noise_refiner {
+            x_emb = layer.forward(&x_emb, &prep.x_freqs, &t_emb)?;
+        }
+
+        // Caption stream: RMSNorm -> linear -> set padded to cap_pad_token -> context refiner.
+        let cap_normed = rms_norm(&prep.cap_tokens, &self.cap_norm_w, self.cfg.norm_eps)?;
+        let mut cap_emb = self.cap_linear.forward(&cap_normed)?;
+        cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.cap_pad_token)?;
+        let mut cap_emb = cap_emb.expand_dims(0)?;
+        for layer in &self.context_refiner {
+            cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
+        }
+
+        // Unify and run the main stack. In bf16 training the f32 caption stream joins cast to the
+        // training dtype here (see `train_unify_dtype`); inference: None, no-op.
+        let cap_emb = match self.train_unify_dtype {
+            Some(dt) => cap_emb.as_dtype(dt)?,
+            None => cap_emb,
+        };
+        let x_len = x_emb.shape()[1];
+        let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
+        for layer in &self.layers {
+            unified = layer.forward(&unified, &prep.unified_freqs, &t_emb)?;
+        }
+
+        // Final layer + unpatchify (only the real image tokens survive).
+        let unified = self.final_layer.forward(&unified, &t_emb)?;
+        let embed_dim = unified.shape()[2];
+        let head = unified
+            .reshape(&[unified.shape()[1], embed_dim])? // drop batch dim (size 1)
+            .take_axis(row_indices(x_len), 0)?; // (x_len, embed_dim)
+        let out = self.unpatchify(&head, prep.x_size)?;
+        Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
+    }
+
+    /// Training forward with **per-main-block gradient checkpointing** (sc-4874). Identical compute
+    /// to [`forward_with`](Self::forward_with), but each of the main `layers` runs inside an
+    /// `mlx::checkpoint` segment whose explicit inputs are the block hidden state plus that block's
+    /// trainable LoRA factors — so the reverse pass recomputes the block instead of retaining its
+    /// activations (bounding the first-step working set), while gradients still flow to the LoRA
+    /// params. The pre-main embedders/refiners and the final layer run normally (their LoRA, if any,
+    /// is installed on `self` by the caller and trains through ordinary autograd); the long unified
+    /// stack is where the activation memory concentrates, so that is what is checkpointed.
+    ///
+    /// `params` is the live trainable factor map; `main_block_local_targets[i]` lists the
+    /// adapter-routable LOCAL paths (e.g. `"attention.to_q"`) trained on main block `i`, in the order
+    /// their factors are threaded as checkpoint inputs. Blocks with no trained targets still run
+    /// checkpointed (hidden-only input) so the whole stack is uniformly recompute-on-backward.
+    pub(crate) fn forward_with_main_checkpointed(
+        &self,
+        prep: &Prepared,
+        x: &Array,
+        timestep: f32,
+        params: &LoraParams,
+        main_block_local_targets: &[Vec<String>],
+        alpha: f32,
+    ) -> Result<Array> {
+        let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
+        let t_emb = self.t_embedder.forward(&t)?;
+
+        // Image + caption streams + refiners — identical to `forward_with` (not checkpointed).
+        let x_tokens = self.patchify_image_tokens(x, prep.img_pad)?;
+        let mut x_emb = self.x_embedder.forward(&x_tokens)?;
+        x_emb = apply_pad(&x_emb, &prep.x_keep, &self.x_pad_token)?;
+        let mut x_emb = x_emb.expand_dims(0)?;
+        for layer in &self.noise_refiner {
+            x_emb = layer.forward(&x_emb, &prep.x_freqs, &t_emb)?;
+        }
+        let cap_normed = rms_norm(&prep.cap_tokens, &self.cap_norm_w, self.cfg.norm_eps)?;
+        let mut cap_emb = self.cap_linear.forward(&cap_normed)?;
+        cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.cap_pad_token)?;
+        let mut cap_emb = cap_emb.expand_dims(0)?;
+        for layer in &self.context_refiner {
+            cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
+        }
+
+        let cap_emb = match self.train_unify_dtype {
+            Some(dt) => cap_emb.as_dtype(dt)?,
+            None => cap_emb,
+        };
+        let x_len = x_emb.shape()[1];
+        let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
+
+        // Main stack — each block checkpointed with its LoRA factors as explicit inputs.
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Cheap clone (Arrays are refcounted): the closure must OWN its state because the
+            // backward recompute runs after this method's frame is gone; a borrow of `self` would
+            // dangle. `set_adapters` inside the closure replaces whatever the clone carried with the
+            // explicit-input LoRA, so any adapters the caller installed on `self.layers` are moot.
+            let mut blk = layer.clone();
+            let locals = main_block_local_targets.get(i).cloned().unwrap_or_default();
+            let freqs = prep.unified_freqs.clone();
+            let te = t_emb.clone();
+
+            // Threaded inputs: [hidden, a_0, b_0, a_1, b_1, ...] (raw `[r,in]`/`[out,r]` factors).
+            let mut inputs: Vec<Array> = Vec::with_capacity(1 + 2 * locals.len());
+            inputs.push(unified.clone());
+            for local in &locals {
+                let ak = format!("layers.{i}.{local}.lora_a");
+                let bk = format!("layers.{i}.{local}.lora_b");
+                inputs.push(
+                    params
+                        .get(ak.as_str())
+                        .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {ak}")))?
+                        .clone(),
+                );
+                inputs.push(
+                    params
+                        .get(bk.as_str())
+                        .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {bk}")))?
+                        .clone(),
+                );
+            }
+
+            let alpha_c = alpha;
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                // Reinstall the explicit-input factors with the SAME `(transpose, alpha/rank fold,
+                // scale=1)` `install_training_lora` applies — so the checkpointed block forward is
+                // numerically identical to the installed-adapter path, and grads route to `inp`.
+                // Dtype-following on the hidden state (sc-4887): under the bf16 training cast the
+                // f32 factors must join the bf16 stream or every adapted Linear re-promotes the
+                // block to f32. No-op in f32 mode; grads flow back f32 through the astype VJP.
+                let dt = inp[0].dtype();
+                for (j, local) in locals.iter().enumerate() {
+                    let a = inp[1 + 2 * j].t().as_dtype(dt)?; // [r,in] -> [in,r]
+                    let rank = a.shape()[1] as f32;
+                    let b = inp[2 + 2 * j]
+                        .t() // [out,r] -> [r,out]
+                        .multiply(Array::from_slice(&[alpha_c / rank], &[1]))?
+                        .as_dtype(dt)?;
+                    let segs: Vec<&str> = local.split('.').collect();
+                    blk.adaptable_mut(&segs)
+                        .ok_or_else(|| {
+                            Exception::custom(format!("checkpoint LoRA target not found: {local}"))
+                        })?
+                        .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+                }
+                let out = blk
+                    .forward(&inp[0], &freqs, &te)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(vec![out])
+            });
+            unified = seg(&inputs)?.into_iter().next().ok_or_else(|| {
+                mlx_gen::Error::Msg("z-image: checkpoint block produced no output".into())
+            })?;
+        }
+
+        // Final layer + unpatchify — identical to `forward_with`.
+        let unified = self.final_layer.forward(&unified, &t_emb)?;
+        let embed_dim = unified.shape()[2];
+        let head = unified
+            .reshape(&[unified.shape()[1], embed_dim])?
+            .take_axis(row_indices(x_len), 0)?;
+        let out = self.unpatchify(&head, prep.x_size)?;
+        Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
+    }
+
+    /// `x`: latent `(C, F, H, W)`; `cap_feats`: `(cap_len, cap_feat_dim)`; `timestep` in [0,1].
+    /// Returns the latent-shaped velocity `(C, F, H, W)`. Single-shot convenience: builds the
+    /// [`Prepared`] and runs one [`forward_with`](Self::forward_with) — bit-identical to caching
+    /// `prepare` across steps, since the prep depends only on the (loop-constant) dims + caption.
+    pub fn forward(&self, x: &Array, timestep: f32, cap_feats: &Array) -> Result<Array> {
+        let sh = x.shape();
+        let prep = self.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
+        self.forward_with(&prep, x, timestep)
+    }
+
+    /// Step-invariant half of [`patchify`](Self::patchify): the caption + image position-ids, keep
+    /// masks, padded caption tokens, and image-token padding — everything derived from the latent
+    /// *dims* and the caption, but not the latent *values*. Hoisted so a denoise loop can build it
+    /// once (F-042); [`patchify`](Self::patchify) and [`prepare`](Self::prepare) both call it.
+    pub(crate) fn patchify_meta(
+        &self,
+        dims: (i32, i32, i32, i32),
+        cap_feats: &Array,
+    ) -> Result<PatchMeta> {
+        let (pf, ph, pw) = (
+            self.cfg.f_patch_size,
+            self.cfg.patch_size,
+            self.cfg.patch_size,
+        );
+        let (_c, f, h, w) = dims;
+        let (ft, ht, wt) = (f / pf, h / ph, w / pw);
+
+        // Caption: pad to a multiple of 32; pos ids = [(1+i), 0, 0]; keep-mask zeros padding.
+        let cap_ori = cap_feats.shape()[0];
+        let (cap_pos, cap_keep, cap_pad) = caption_pos_keep(cap_ori);
+        let cap_total = cap_ori + cap_pad;
+        let cap_tokens = pad_rows(cap_feats, cap_pad)?;
+
+        // Image: pos ids start after the caption block; pad the token count to a multiple of 32.
+        let (img_pos, img_keep, img_pad) = image_pos_keep(ft, ht, wt, cap_total);
+        let img_total = ft * ht * wt + img_pad;
+
+        Ok(PatchMeta {
+            cap_tokens,
+            x_size: (f, h, w),
+            x_pos_ids: Array::from_slice(&img_pos, &[img_total, 3]),
+            cap_pos_ids: Array::from_slice(&cap_pos, &[cap_total, 3]),
+            x_keep: Array::from_slice(&img_keep, &[img_total, 1]),
+            cap_keep: Array::from_slice(&cap_keep, &[cap_total, 1]),
+            img_pad,
+        })
+    }
+
+    /// Per-step half of [`patchify`](Self::patchify): reshape the latent `(C,F,H,W)` into patch
+    /// tokens `(ft·ht·wt, pF·pH·pW·C)` and pad to the multiple-of-32 count from `patchify_meta`.
+    /// This is the only part of patchify that depends on the latent *values*.
+    pub(crate) fn patchify_image_tokens(&self, image: &Array, img_pad: i32) -> Result<Array> {
+        let (pf, ph, pw) = (
+            self.cfg.f_patch_size,
+            self.cfg.patch_size,
+            self.cfg.patch_size,
+        );
+        let sh = image.shape();
+        let (c, f, h, w) = (sh[0], sh[1], sh[2], sh[3]);
+        let (ft, ht, wt) = (f / pf, h / ph, w / pw);
+        let tokens = image
+            .reshape(&[c, ft, pf, ht, ph, wt, pw])
+            .and_then(|t| t.transpose_axes(&[1, 3, 5, 2, 4, 6, 0]))
+            .and_then(|t| t.reshape(&[ft * ht * wt, pf * ph * pw * c]))?;
+        pad_rows(&tokens, img_pad)
+    }
+
+    pub(crate) fn unpatchify(&self, x: &Array, size: (i32, i32, i32)) -> Result<Array> {
+        let (pf, ph, pw) = (
+            self.cfg.f_patch_size,
+            self.cfg.patch_size,
+            self.cfg.patch_size,
+        );
+        let (f, h, w) = size;
+        let oc = self.cfg.in_channels;
+        let ori = (f / pf) * (h / ph) * (w / pw);
+        Ok(x.take_axis(row_indices(ori), 0)? // drop any padding tokens
+            .reshape(&[f / pf, h / ph, w / pw, pf, ph, pw, oc])?
+            .transpose_axes(&[6, 0, 3, 1, 4, 2, 5])?
+            .reshape(&[oc, f, h, w])?)
+    }
+}
+
+/// The step-invariant patchify metadata produced by `patchify_meta` — the caption/image position
+/// ids, keep masks, padded caption tokens, and output size; everything except the value-dependent
+/// `x_tokens` (which `patchify_image_tokens` produces per step). `img_pad` is the count of padding
+/// image tokens, threaded to `patchify_image_tokens` so the per-step path pads identically.
+pub(crate) struct PatchMeta {
+    pub(crate) cap_tokens: Array,
+    pub(crate) x_size: (i32, i32, i32),
+    pub(crate) x_pos_ids: Array,
+    pub(crate) cap_pos_ids: Array,
+    pub(crate) x_keep: Array,
+    pub(crate) cap_keep: Array,
+    pub(crate) img_pad: i32,
+}
+
+/// Cached step-invariant forward inputs — the patchify metadata plus the gathered RoPE freqs — that
+/// [`ZImageTransformer::forward_with`] reuses for every denoise step (F-042).
+pub(crate) struct Prepared {
+    pub(crate) cap_tokens: Array,
+    pub(crate) x_size: (i32, i32, i32),
+    pub(crate) x_keep: Array,
+    pub(crate) cap_keep: Array,
+    pub(crate) img_pad: i32,
+    pub(crate) x_freqs: Array,
+    pub(crate) cap_freqs: Array,
+    pub(crate) unified_freqs: Array,
+}
+
+impl Prepared {
+    /// Cast the image/unified-side float inputs (x + unified RoPE freqs) to `dtype` — the sc-4887
+    /// bf16 training entry cast. The caption side (`cap_tokens`, `cap_freqs`) deliberately stays
+    /// f32 — the caption entry runs full precision and joins the unified stack cast (see
+    /// `ZImageTransformer::train_unify_dtype`). The keep masks are handled dtype-following inside
+    /// `apply_pad`. Inference never calls this (its `Prepared` stays f32, KEEP-F32 / sc-2609).
+    pub(crate) fn cast_floats(&self, dtype: mlx_rs::Dtype) -> Result<Prepared> {
+        Ok(Prepared {
+            cap_tokens: self.cap_tokens.clone(),
+            x_size: self.x_size,
+            x_keep: self.x_keep.clone(),
+            cap_keep: self.cap_keep.clone(),
+            img_pad: self.img_pad,
+            x_freqs: self.x_freqs.as_dtype(dtype)?,
+            cap_freqs: self.cap_freqs.clone(),
+            unified_freqs: self.unified_freqs.as_dtype(dtype)?,
+        })
+    }
+}
+
+/// Caption position-ids `[(1+i), 0, 0]` and keep-mask (1 for real tokens, 0 for padding), with the
+/// pad count that rounds `cap_ori` up to a multiple of 32. Pure (no MLX) so the metadata arithmetic
+/// is unit-testable.
+pub(crate) fn caption_pos_keep(cap_ori: i32) -> (Vec<i32>, Vec<f32>, i32) {
+    let cap_pad = (-(cap_ori as i64)).rem_euclid(32) as i32;
+    let cap_total = cap_ori + cap_pad;
+    let pos: Vec<i32> = (0..cap_total).flat_map(|i| [1 + i, 0, 0]).collect();
+    let keep: Vec<f32> = (0..cap_total)
+        .map(|i| if i < cap_ori { 1.0 } else { 0.0 })
+        .collect();
+    (pos, keep, cap_pad)
+}
+
+/// Image patch position-ids `[s0 + fi, hi, wi]` (raster `f,h,w` order, `s0 = cap_total + 1` so image
+/// positions follow the caption block) and keep-mask, with the pad count rounding `ft·ht·wt` up to a
+/// multiple of 32. Padding rows get pos id `[0,0,0]` and keep 0. Pure so it is unit-testable.
+pub(crate) fn image_pos_keep(
+    ft: i32,
+    ht: i32,
+    wt: i32,
+    cap_total: i32,
+) -> (Vec<i32>, Vec<f32>, i32) {
+    let img_ori = ft * ht * wt;
+    let img_pad = (-(img_ori as i64)).rem_euclid(32) as i32;
+    let img_total = img_ori + img_pad;
+    let s0 = cap_total + 1;
+    let mut pos: Vec<i32> = Vec::with_capacity((img_total as i64 * 3) as usize);
+    for fi in 0..ft {
+        for hi in 0..ht {
+            for wi in 0..wt {
+                pos.extend_from_slice(&[s0 + fi, hi, wi]);
+            }
+        }
+    }
+    pos.extend(std::iter::repeat_n(0, (img_pad * 3) as usize));
+    let keep: Vec<f32> = (0..img_total)
+        .map(|i| if i < img_ori { 1.0 } else { 0.0 })
+        .collect();
+    (pos, keep, img_pad)
+}
+
+/// `[0, 1, …, n-1]` as an int32 index array for `take_axis`.
+pub(crate) fn row_indices(n: i32) -> Array {
+    Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n])
+}
+
+/// Append `pad` zero rows to a 2-D `(N, D)` array. The pre-embed value of the padded rows is
+/// irrelevant: after patch-embed, `apply_pad` overwrites their embeddings with the **learned** pad
+/// token — NOT zero (see the module header) — so these appended rows are just placeholders. Zeros
+/// match the fork's repeat-then-pad-token construction.
+pub(crate) fn pad_rows(a: &Array, pad: i32) -> Result<Array> {
+    if pad <= 0 {
+        return Ok(a.clone());
+    }
+    let d = a.shape()[1];
+    let zeros = Array::from_slice(&vec![0f32; (pad * d) as usize], &[pad, d]);
+    Ok(concatenate_axis(&[a, &zeros], 0)?)
+}
+
+/// The Z-Image adapter key→module map — the Rust analog of the fork's `ZImageLoRAMapping`. Adapter
+/// files address modules by their **trained (diffusers) path**; this routes those paths to the
+/// crate's module tree, covering the full fork target surface: the three per-layer stacks
+/// (`layers` / `noise_refiner` / `context_refiner`) and the six global targets. Per-block routing
+/// is delegated to the block hosts (`attention.to_q/k/v`, `attention.to_out.0`,
+/// `feed_forward.w1/w2/w3`, `adaLN_modulation.0`). Trained-file vs internal naming differences are
+/// reconciled here (`all_x_embedder.{p}-{pf}`→`x_embedder`, `cap_embedder.1`→`cap_linear`,
+/// `t_embedder.mlp.{0,2}`→`linear{1,2}`, `all_final_layer.{p}-{pf}.{linear,adaLN_modulation.1}`).
+impl AdaptableHost for ZImageTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["layers", n, rest @ ..] => self
+                .layers
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["noise_refiner", n, rest @ ..] => self
+                .noise_refiner
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["context_refiner", n, rest @ ..] => self
+                .context_refiner
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            // Global targets. The `all_x_embedder` / `all_final_layer` patch-size suffix (e.g.
+            // `2-1`) is matched as a wildcard segment.
+            ["all_x_embedder", _] => Some(&mut self.x_embedder),
+            ["cap_embedder", "1"] => Some(&mut self.cap_linear),
+            ["t_embedder", rest @ ..] => self.t_embedder.adaptable_mut(rest),
+            ["all_final_layer", _, rest @ ..] => self.final_layer.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// kohya-reachable targets (sc-2618): the block-indexed layer targets across all three layer
+    /// types, in trained-file naming. Globals (`all_x_embedder`/`cap_embedder`/`t_embedder`/
+    /// `all_final_layer`) are excluded — the fork's `ZImageLoRAMapping` carries no `lora_unet_`
+    /// pattern for them (and the patch-size wildcard would make the flattening ambiguous); they stay
+    /// reachable via the dotted diffusers/peft form.
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // `layers` + `noise_refiner` are transformer blocks (with `adaLN_modulation.0`);
+        // `context_refiner` blocks have no adaLN — each block enumerates its own leaves.
+        for (i, b) in self.layers.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("layers.{i}"), b));
+        }
+        for (i, b) in self.noise_refiner.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("noise_refiner.{i}"), b));
+        }
+        for (i, b) in self.context_refiner.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("context_refiner.{i}"), b));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod patch_meta_tests {
+    use super::{caption_pos_keep, image_pos_keep};
+
+    #[test]
+    fn caption_pos_keep_pads_to_32_and_masks() {
+        let (pos, keep, pad) = caption_pos_keep(3);
+        assert_eq!(pad, 29); // 3 -> 32
+        assert_eq!(pos.len(), 32 * 3);
+        assert_eq!(keep.len(), 32);
+        assert_eq!(&pos[0..6], &[1, 0, 0, 2, 0, 0]); // pos id = (1 + i, 0, 0)
+        assert_eq!(keep[2], 1.0);
+        assert_eq!(keep[3], 0.0); // first padding row
+                                  // An exact multiple of 32 needs no padding.
+        assert_eq!(caption_pos_keep(32).2, 0);
+    }
+
+    #[test]
+    fn image_pos_keep_rasters_fhw_after_caption_and_pads() {
+        // cap_total = 33, dims ft=1 ht=2 wt=2 -> 4 real tokens, padded to 32.
+        let (pos, keep, pad) = image_pos_keep(1, 2, 2, 33);
+        assert_eq!(pad, 28); // 4 -> 32
+        assert_eq!(pos.len(), 32 * 3);
+        assert_eq!(keep.len(), 32);
+        // s0 = cap_total + 1 = 34; raster order (f, h, w).
+        assert_eq!(&pos[0..12], &[34, 0, 0, 34, 0, 1, 34, 1, 0, 34, 1, 1]);
+        assert_eq!(&pos[12..15], &[0, 0, 0]); // first padding row -> zeroed pos id
+        assert_eq!(keep[3], 1.0);
+        assert_eq!(keep[4], 0.0);
+    }
+}

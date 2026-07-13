@@ -1,0 +1,26 @@
+[package]
+name = "mlx-gen-wan"
+version = "0.0.0"
+edition = "2021"
+description = "Wan2.2 video (text-to-video + image-conditioned) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "video", "wan", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time self-registration into mlx-gen's model registry.
+inventory = { workspace = true }
+# config.json reading (config-driven loader).
+serde_json = { workspace = true }
+# UMT5 prompt cleaning (`_clean_text`): NFC + block-scoped fullwidth/halfwidth fold (the
+# `ftfy.fix_character_width` transform that maps the Chinese negative prompt's fullwidth commas
+# to ASCII — load-bearing for correct tokenization). See `text_encoder::clean_text`.
+unicode-normalization = "0.1"
+zip = { version = "8.6.0", default-features = false }
+# Decode training-dataset images (LoRA/LoKr training, sc-3046). PNG + JPEG cover the SceneWorks
+# dataset formats; the trainer center-crops + hands the Image to the VAE preprocess.
+image = { workspace = true }

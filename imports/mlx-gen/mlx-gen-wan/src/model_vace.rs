@@ -1,0 +1,667 @@
+//! `mlx-gen-wan` Wan-VACE model entry (`wan_vace`, epic 3040 / sc-3388, S3 / sc-3436) — the native
+//! port of diffusers `WanVACEPipeline`: a control video + per-frame mask (+ optional reference
+//! images) → controllable video, covering **replace_person** (the SceneWorks worker's current Wan
+//! `replace_person` path) plus **pose / depth / sketch control** and **extend / video_bridge** (the
+//! Wan answer to sc-3357 / sc-3385).
+//!
+//! VACE is **mode-agnostic at the engine boundary**, exactly like diffusers `WanVACEPipeline`: the
+//! worker builds the per-mode control video + mask (replace_person = the person-region-neutralized
+//! clip + the person mask; pose/depth control = the render + an all-active mask; extend/bridge = the
+//! source frames at the kept positions + a generated-span mask) and passes them as one
+//! [`Conditioning::ControlClip`]. The provider VAE-encodes the inactive/reactive split + unfolds the
+//! mask into the 96-ch control latent ([`crate::vace::prepare_video_latents`] /
+//! [`prepare_masks`](crate::vace::prepare_masks)) and runs the CFG VACE denoise loop
+//! ([`denoise_vace`](crate::vace::denoise_vace)). Reference images (from [`Conditioning::Reference`])
+//! are encoded to leading latent frames and dropped after denoise (diffusers
+//! `latents[:, :, num_reference_images:]`).
+//!
+//! **Snapshot layout** (the cutover, sc-3055, converts the diffusers VACE repo into this): the VACE
+//! transformer in **diffusers tensor layout** (read directly by [`WanVaceTransformer`]) at
+//! `model.safetensors` or a `transformer/` shard dir, plus the shared native-converted UMT5
+//! (`t5_encoder.safetensors` + `tokenizer.json`) and z16 Wan VAE (`vae.safetensors`) — the same
+//! components the base Wan 14B uses. **e2e is checkpoint-gated** (no VACE checkpoint in the local HF
+//! cache yet — `tests/wanvace_e2e.rs`, `#[ignore]`); the engine pieces are validated component-wise
+//! (S1 transformer structural parity, S2 conditioning byte-parity).
+
+use std::path::{Path, PathBuf};
+
+use mlx_gen::weights::Weights;
+use mlx_gen::{
+    AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Precision, Progress, Quant,
+    Result, WeightsSource,
+};
+use mlx_rs::ops::{add, concatenate_axis, multiply};
+use mlx_rs::{random, Array, Dtype};
+
+use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
+use crate::config::{WanModelConfig, WanVaceConfig};
+use crate::pipeline::{
+    align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, preprocess_i2v_image,
+    resolve_sampler_knobs,
+};
+use crate::scheduler::SolverKind;
+use crate::text_encoder::encode_text_staged;
+use crate::vace::{
+    build_vace_control, denoise_vace, denoise_vace_moe, prepare_masks, prepare_video_latents,
+    WanVaceTransformer,
+};
+use crate::vae::WanVae;
+
+/// Public registry id: `mlx_gen::load("wan_vace", spec)`.
+pub const MODEL_ID_VACE: &str = "wan_vace";
+
+/// The Wan z16 VAE strides (the VACE checkpoints are Wan2.1-based): temporal 4, spatial 8, patch 2.
+const VAE_T: usize = 4;
+const VAE_S: usize = 8;
+
+/// Drop the leading `num_ref` reference latent frames along the temporal axis (axis 1) — the diffusers
+/// `latents[:, :, num_reference_images:]` slice both VACE variants apply after denoise, before the VAE
+/// decode. `t_total` is the latent's temporal length; a no-op when `num_ref == 0` (F-010).
+fn drop_reference_frames(latents: Array, num_ref: usize, t_total: i32) -> Result<Array> {
+    if num_ref > 0 {
+        let keep = Array::from_slice(
+            &((num_ref as i32)..t_total).collect::<Vec<i32>>(),
+            &[t_total - num_ref as i32],
+        );
+        Ok(latents.take_axis(&keep, 1)?)
+    } else {
+        Ok(latents)
+    }
+}
+
+/// The pre-DiT setup shared by both VACE generators (F-072): everything from knob resolution through
+/// the z16-VAE control latent and the seeded init noise — byte-identical between the single- and
+/// dual-expert paths, which differ only in how they resolve `guidance` (single vs low/high) and thus
+/// `cfg_disabled` (computed by each caller and passed in). Fields are exactly the locals each
+/// `generate_impl` binds; the DiT stage and decode tail read them unchanged.
+struct VacePrep {
+    width: u32,
+    height: u32,
+    steps: usize,
+    shift: f32,
+    kind: SolverKind,
+    context: Array,
+    context_null: Option<Array>,
+    control: Array,
+    t_total: i32,
+    scales: Vec<f32>,
+    init_noise: Array,
+    num_ref: usize,
+}
+
+/// Run the shared VACE pre-DiT setup (Stages 1–2 + noise seeding). `cfg_disabled` is the caller's
+/// guidance decision (single-expert `guidance ≤ 1.0`; dual-expert `low ≤ 1.0 && high ≤ 1.0`) — the
+/// only place the two paths diverge before the DiT stage. Byte-identical to the code both
+/// `generate_impl`s previously open-coded.
+fn vace_prep(
+    root: &Path,
+    config: &WanVaceConfig,
+    req: &GenerationRequest,
+    cfg_disabled: bool,
+) -> Result<VacePrep> {
+    let base = &config.base;
+    let clip = req.control_clip().expect("validated present");
+
+    // --- Resolve knobs ---
+    // VACE aligns to patch · VAE_S with no max-area cap (the dense paths' `resolve_capped_dims`).
+    let width = align_dim(req.width, base.patch_size.2, VAE_S);
+    let height = align_dim(req.height, base.patch_size.1, VAE_S);
+    let (steps, shift, kind, seed) =
+        resolve_sampler_knobs(req, base.sample_steps, base.sample_shift);
+    let neg_prompt = req
+        .negative_prompt
+        .clone()
+        .unwrap_or_else(|| base.sample_neg_prompt.clone());
+
+    // Control video [-1,1] + mask [0,1] (diffusers `clamp((m+1)/2)`), each [3, F, H, W].
+    let control_video = preprocess_clip(clip.frames, width, height)?;
+    let mask = preprocess_clip(clip.mask, width, height)?;
+    let half = Array::from_slice(&[0.5f32], &[1]);
+    let mask = multiply(&add(&mask, Array::from_slice(&[1.0f32], &[1]))?, &half)?; // (m+1)/2 ∈ [0,1]
+
+    // Reference images (optional) → channels-first [3, H, W] each.
+    let references: Vec<Array> = req
+        .conditioning
+        .iter()
+        .filter_map(|c| match c {
+            mlx_gen::Conditioning::Reference { image, .. } => Some(image),
+            _ => None,
+        })
+        .map(|im| preprocess_i2v_image(im, width, height))
+        .collect::<Result<_>>()?;
+    let num_ref = references.len();
+
+    // --- Stage 1: UMT5 text encode ---
+    let (context, context_null) =
+        encode_text_staged(root, base, &req.prompt, &neg_prompt, cfg_disabled)?;
+
+    // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
+    let control = {
+        let w = Weights::from_file(root.join("vae.safetensors"))?;
+        let vae = WanVae::from_weights(&w)?;
+        let video_latents = prepare_video_latents(&vae, &control_video, Some(&mask), &references)?;
+        let mask_latents = prepare_masks(&mask, VAE_T, VAE_S, base.patch_size.1, num_ref)?;
+        let c = build_vace_control(&video_latents, &mask_latents)?;
+        mlx_rs::transforms::eval([&c])?;
+        c
+    };
+    // Control latent dims: [96, T_lat(+num_ref), h, w] → the noisy latent matches its frame/space.
+    let csh = control.shape();
+    let (t_total, h_lat, w_lat) = (csh[1], csh[2], csh[3]);
+    // Per-vace-layer control_hidden_states_scale (diffusers `conditioning_scale`), broadcast from
+    // the request (sc-3441). `None` ⇒ the diffusers default 1.0.
+    let scales = vec![req.control_scale.unwrap_or(1.0); config.vace_layers.len()];
+
+    // Seeded init noise [z16, T_lat(+num_ref), h, w].
+    let key = random::key(seed)?;
+    let init_noise = random::normal::<f32>(
+        &[base.vae_z_dim as i32, t_total, h_lat, w_lat],
+        None,
+        None,
+        Some(&key),
+    )?;
+
+    Ok(VacePrep {
+        width,
+        height,
+        steps,
+        shift,
+        kind,
+        context,
+        context_null,
+        control,
+        t_total,
+        scales,
+        init_noise,
+        num_ref,
+    })
+}
+
+/// The shared VACE decode tail (Stage 4, F-072): drop the leading reference latent frames, then
+/// z16-VAE-decode the denoised latents → RGB8 frames → a `Video` output. Byte-identical to the code
+/// both `generate_impl`s previously open-coded after their (single- vs dual-expert) DiT stage.
+fn vace_decode_tail(
+    root: &Path,
+    base: &WanModelConfig,
+    latents: Array,
+    prep: &VacePrep,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<GenerationOutput> {
+    // Drop the leading reference latent frames (diffusers `latents[:, :, num_reference_images:]`).
+    let latents = drop_reference_frames(latents, prep.num_ref, prep.t_total)?;
+
+    // --- Stage 4: z16 VAE decode → RGB8 frames ---
+    on_progress(Progress::Decoding);
+    // sc-6894 — the z16 VAE is non-causal in time (out_f = T_lat·VAE_T, ×4), NOT the causal 4·T−3
+    // (task 6897); only the tiling heuristic reads out_frames. Budgeted, catchable selector (F-009).
+    let out_frames = latents.shape()[1] * VAE_T as i32;
+    let tiling = auto_tiling_budgeted_z16(prep.height as i32, prep.width as i32, out_frames)?;
+    let frames_u8 = {
+        let w = Weights::from_file(root.join("vae.safetensors"))?;
+        let vae = WanVae::from_weights(&w)?;
+        decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
+    };
+    let images = frames_to_images(&frames_u8)?;
+
+    let fps = req.fps.unwrap_or(base.sample_fps);
+    Ok(GenerationOutput::Video {
+        frames: images,
+        fps,
+        audio: None,
+    })
+}
+
+/// Stable identity + advertised capabilities for `wan_vace`.
+pub fn descriptor_vace() -> ModelDescriptor {
+    ModelDescriptor {
+        id: MODEL_ID_VACE,
+        family: "wan",
+        backend: "mlx",
+        modality: Modality::Video,
+        capabilities: Capabilities {
+            // CFG (guide 5.0) + the Chinese anti-artifact negative prompt. The control input is a
+            // masked control clip (`ControlClip`, the universal VACE form the worker builds per
+            // mode); optional `Reference` images become leading conditioning frames.
+            supports_negative_prompt: true,
+            supports_guidance: true,
+            supports_true_cfg: false,
+            conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
+            // Q4/Q8 is wired (sc-3440, `spec.quantize` → `WanVaceTransformer::quantize`, mirroring the
+            // base Wan slice sc-2682). LoRA/LoKr is wired (sc-3439): `spec.adapters` merge onto the
+            // dense diffusers-layout VACE weight map via `merge_vace_adapters` before `from_weights` +
+            // quantize (the fork order — merge a dense adapter, then quantize), mirroring the base Wan
+            // slices sc-2683 (LoRA) / sc-2393 (LoKr) on the diffusers host.
+            supports_lora: true,
+            supports_lokr: true,
+            // sc-7296: curated gen-core vocabulary (`uni_pc`/`dpmpp_2m`) routed to Wan's native solvers
+            // + legacy aliases; VACE advertises native solvers only (no `run_flow_sampler` fold-ins).
+            samplers: crate::model::wan_native_samplers(),
+            schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
+            min_size: 16,
+            max_size: 1280,
+            max_count: 1,
+            mac_only: true,
+            supported_quants: &[Quant::Q4, Quant::Q8],
+            supports_kv_cache: false,
+            requires_sigma_shift: false,
+            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            supports_sequential_offload: false,
+        },
+    }
+}
+
+/// The loaded Wan-VACE model. Holds the resolved config + snapshot dir; the heavy components (UMT5
+/// TE, the z16 VAE, the VACE DiT) are **staged** inside [`WanVace::generate`] to bound peak memory.
+pub struct WanVace {
+    descriptor: ModelDescriptor,
+    config: WanVaceConfig,
+    root: PathBuf,
+    /// Optional load-time Q4/Q8 quantization of the VACE DiT `_quantize_predicate` surface (sc-3440),
+    /// applied in [`WanVace::generate`] after the dense transformer is built.
+    quantize: Option<Quant>,
+    /// LoRA/LoKr adapters merged onto the dense diffusers-layout VACE weight map (sc-3439), folded in
+    /// [`WanVace::generate`] **before** `from_weights` + quantize (the fork order). Empty for a plain
+    /// load — the no-adapter path is byte-identical to pre-sc-3439.
+    adapters: Vec<AdapterSpec>,
+}
+
+impl WanVace {
+    /// The resolved VACE config (exposed for tests).
+    pub fn config(&self) -> &WanVaceConfig {
+        &self.config
+    }
+
+    /// Merge the load-time LoRA/LoKr adapters onto the dense diffusers-layout VACE weight map in
+    /// place (sc-3439), before [`WanVaceTransformer::from_weights`] is built and before `spec.quantize`
+    /// quantizes (the fork order — merge a dense adapter, then quantize). No-op without adapters (the
+    /// no-adapter weight map is byte-identical). VACE is a single dense transformer (no MoE), so it
+    /// takes only **shared** (untagged) specs — a `moe_expert`-tagged spec (the dual-expert A14B
+    /// surface) is a misconfiguration here, surfaced rather than silently honored. Reuses the
+    /// diffusers-named [`merge_vace_adapters`] seam; per-key skips are reported (the reference warns
+    /// on skip), and a non-empty spec list that matched **nothing** is a format/prefix error.
+    fn merge_adapters(&self, w: &mut Weights) -> Result<()> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        if self.adapters.iter().any(|s| s.moe_expert.is_some()) {
+            return Err(Error::Msg(format!(
+                "{}: `moe_expert` (high/low) tagging is only for the dual-expert Wan2.2 A14B — the \
+                 single dense VACE transformer takes shared (untagged) adapters",
+                MODEL_ID_VACE
+            )));
+        }
+        let report = merge_vace_adapters(w, &self.adapters)?;
+        if report.applied == 0 {
+            return Err(Error::Msg(format!(
+                "{}: {} adapter file(s) matched no module — check the format (PEFT `lora_A/B` or \
+                 kohya `lora_down/up`, diffusers `blocks.N.attn1/attn2.to_*` / `ffn.net.*` / \
+                 `vace_blocks.*` module names, or native Wan names which are renamed to diffusers)",
+                MODEL_ID_VACE,
+                self.adapters.len()
+            )));
+        }
+        warn_skipped_adapters(MODEL_ID_VACE, &report.skipped);
+        Ok(())
+    }
+}
+
+/// `mlx_gen::load("wan_vace", spec)` — resolve the VACE config from the snapshot dir.
+pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => {
+            return Err(Error::Msg(
+                "wan_vace: expected a model directory (converted snapshot), not a single file"
+                    .into(),
+            ))
+        }
+    };
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(
+            "wan_vace: precision override is not wired (the DiT runs bf16 GEMMs over an f32 residual \
+             stream — the parity regime)"
+                .into(),
+        ));
+    }
+    let config = WanVaceConfig::from_model_dir(&root)?;
+    Ok(Box::new(WanVace {
+        descriptor: descriptor_vace(),
+        config,
+        root,
+        quantize: spec.quantize,
+        adapters: spec.adapters.clone(),
+    }))
+}
+
+/// Preprocess a list of frame [`Image`]s → a channels-first `[3, F, H, W]` clip in `[-1, 1]` (the
+/// Wan VAE input convention), via the per-frame cover-fit lanczos resize + center-crop.
+fn preprocess_clip(frames: &[Image], width: u32, height: u32) -> Result<Array> {
+    if frames.is_empty() {
+        return Err(Error::Msg("wan_vace: control clip has no frames".into()));
+    }
+    let planes: Vec<Array> = frames
+        .iter()
+        .map(|im| Ok(preprocess_i2v_image(im, width, height)?.expand_dims(1)?)) // [3,1,H,W]
+        .collect::<Result<_>>()?;
+    let refs: Vec<&Array> = planes.iter().collect();
+    Ok(concatenate_axis(&refs, 1)?) // [3, F, H, W]
+}
+
+// F-072: `WanVace`'s validate body was byte-identical to the documented-shared `validate_vace_clip`
+// (with `id = MODEL_ID_VACE`), which the dual-expert `WanVaceFun` already uses — so point both at it.
+mlx_gen::impl_generator!(WanVace {
+    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE, req),
+    generate: generate_impl,
+});
+
+impl WanVace {
+    /// The VACE pipeline (port of diffusers `WanVACEPipeline.__call__`): stage the phases to bound
+    /// memory — (1) UMT5 encode the prompt (+ neg unless CFG off); (2) load the z16 VAE, build the
+    /// 96-ch control latent from the control clip + mask + reference images; (3) load the VACE DiT,
+    /// run the CFG [`denoise_vace`] loop with per-vace-layer `control_hidden_states_scale`; (4) drop
+    /// the reference latent frames and z16-VAE-decode → RGB8 frames.
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        let base = &self.config.base;
+
+        // Single-expert guidance: a scalar request `guidance` overrides the config; CFG off ⇒ ≤ 1.0.
+        let guidance = base.sample_guide_scale.resolve_single(req.guidance);
+        let cfg_disabled = guidance <= 1.0;
+
+        // Stages 1–2 + noise seeding (shared with the dual-expert path, F-072).
+        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled)?;
+
+        // --- Stage 3: load the VACE DiT, embed contexts, CFG denoise ---
+        let latents = {
+            let mut w = load_vace_transformer_weights(&self.root)?;
+            // LoRA/LoKr (sc-3439): merge the diffusers-named adapters onto the dense bf16 weight map
+            // BEFORE building the transformer and BEFORE quantizing — the fork order (a LoRA folds
+            // into the dense weight, then `spec.quantize` quantizes the merged result). No-op without
+            // adapters (the weight map stays byte-identical).
+            self.merge_adapters(&mut w)?;
+            let mut dit = WanVaceTransformer::from_weights(&w, &self.config, Dtype::Bfloat16)?;
+            // Q4/Q8 (sc-3440): quantize the DiT `_quantize_predicate` surface in place after the dense
+            // build (the diffusers VACE snapshot ships dense bf16 — no pre-quantized VACE snapshot).
+            if let Some(q) = self.quantize {
+                dit.quantize(q.bits(), None)?;
+            }
+            let total = prep.steps as u32;
+            let mut on_step = |i: usize| {
+                on_progress(Progress::Step {
+                    current: i as u32,
+                    total,
+                })
+            };
+            denoise_vace(
+                &dit,
+                &prep.control,
+                &prep.scales,
+                prep.kind,
+                base.num_train_timesteps,
+                prep.steps,
+                prep.shift,
+                guidance,
+                &prep.context,
+                prep.context_null.as_ref(),
+                &prep.init_noise,
+                &req.cancel,
+                &mut on_step,
+            )?
+        };
+
+        // Stage 4: drop reference frames + z16-VAE decode → RGB8 (shared with the dual-expert path).
+        vace_decode_tail(&self.root, base, latents, &prep, req, on_progress)
+    }
+}
+
+/// Load the VACE transformer weights (diffusers layout) — a consolidated `model.safetensors` or a
+/// sharded `transformer/` dir, whichever the snapshot provides.
+fn load_vace_transformer_weights(root: &std::path::Path) -> Result<Weights> {
+    let single = root.join("model.safetensors");
+    if single.exists() {
+        return Weights::from_file(single);
+    }
+    let shard_dir = root.join("transformer");
+    if shard_dir.is_dir() {
+        return Weights::from_dir(shard_dir);
+    }
+    Err(Error::Msg(format!(
+        "wan_vace: no transformer weights at {} (expected model.safetensors or a transformer/ dir)",
+        root.display()
+    )))
+}
+
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor_vace => load }
+
+// ============================================================================================
+// Wan2.2 VACE-Fun A14B — dual-expert (MoE) controllable video (sc-6604, epic 3456).
+//
+// The dual-expert sibling of `wan_vace`: `alibaba-pai/Wan2.2-VACE-Fun-A14B` is VACE-trained on the
+// Wan2.2-T2V-A14B base, so it ships TWO `WanVACETransformer3DModel`s (high-noise `transformer/`,
+// low-noise `transformer_2/`), each with its OWN per-expert `vace_blocks` + `vace_patch_embedding` +
+// `text_embedder`, switched at the MoE `boundary_ratio` (0.875) — exactly the base Wan2.2-A14B MoE
+// boundary swap ([`crate::pipeline::denoise_moe`]) applied to the VACE forward. The control
+// conditioning (96-ch control latent + per-vace-layer scales) and the z16 VAE / UMT5 text encoder are
+// identical to single-expert `wan_vace` (VACE-Fun is z16-VAE like Wan2.1 VACE); only the DiT stage is
+// dual-expert. Reuses every host-side helper from the single-expert path verbatim.
+// ============================================================================================
+
+/// Public registry id: `mlx_gen::load("wan2_2_vace_fun_14b", spec)`.
+pub const MODEL_ID_VACE_FUN: &str = "wan2_2_vace_fun_14b";
+
+/// Stable identity + advertised capabilities for `wan2_2_vace_fun_14b` (same surface as `wan_vace`:
+/// a masked `ControlClip` + optional `Reference` images, CFG, Q4/Q8, LoRA/LoKr).
+pub fn descriptor_vace_fun() -> ModelDescriptor {
+    ModelDescriptor {
+        id: MODEL_ID_VACE_FUN,
+        ..descriptor_vace()
+    }
+}
+
+/// The loaded Wan2.2 VACE-Fun model (dual-expert). Mirrors [`WanVace`] but stages **two** transformers
+/// (high + low) in [`WanVaceFun::generate`].
+pub struct WanVaceFun {
+    descriptor: ModelDescriptor,
+    config: WanVaceConfig,
+    root: PathBuf,
+    quantize: Option<Quant>,
+    adapters: Vec<AdapterSpec>,
+}
+
+impl WanVaceFun {
+    /// The resolved VACE-Fun config (exposed for tests).
+    pub fn config(&self) -> &WanVaceConfig {
+        &self.config
+    }
+
+    /// Merge the load-time LoRA/LoKr adapters onto **one expert's** dense diffusers-layout weight map
+    /// (sc-6604), before [`WanVaceTransformer::from_weights`] + quantize (the fork order). Shared
+    /// (untagged) specs merge onto both experts; `moe_expert: high/low`-tagged specs route to their own
+    /// (the dual-expert `(loras)+(loras_high/low)` split). The caller folds the "matched nothing across
+    /// either expert" check across the two reports.
+    fn merge_expert_adapters(&self, w: &mut Weights, expert: MoeExpert) -> Result<usize> {
+        if self.adapters.is_empty() {
+            return Ok(0);
+        }
+        let report = merge_vace_adapters_expert(w, &self.adapters, expert)?;
+        warn_skipped_adapters(MODEL_ID_VACE_FUN, &report.skipped);
+        Ok(report.applied)
+    }
+}
+
+/// `mlx_gen::load("wan2_2_vace_fun_14b", spec)` — resolve the dual-expert VACE-Fun config.
+pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => return Err(Error::Msg(
+            "wan2_2_vace_fun_14b: expected a model directory (converted dual-expert snapshot), \
+                 not a single file"
+                .into(),
+        )),
+    };
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(
+            "wan2_2_vace_fun_14b: precision override is not wired (the DiT runs bf16 GEMMs over an \
+             f32 residual stream — the parity regime)"
+                .into(),
+        ));
+    }
+    let config = WanVaceConfig::vace_fun_from_model_dir(&root)?;
+    Ok(Box::new(WanVaceFun {
+        descriptor: descriptor_vace_fun(),
+        config,
+        root,
+        quantize: spec.quantize,
+        adapters: spec.adapters.clone(),
+    }))
+}
+
+// Identical control-clip contract as single-expert VACE.
+mlx_gen::impl_generator!(WanVaceFun {
+    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE_FUN, req),
+    generate: generate_impl,
+});
+
+impl WanVaceFun {
+    /// The dual-expert VACE pipeline: identical staging to [`WanVace::generate_impl`] (UMT5 encode →
+    /// z16 VAE control latent → DiT denoise → drop reference frames → decode) with the DiT stage
+    /// loading **both** experts and running the boundary-switched [`denoise_vace_moe`].
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        let base = &self.config.base;
+
+        // A scalar request `guidance` overrides both experts; otherwise the config (low, high) pair.
+        let (low_gs, high_gs) = base.sample_guide_scale.resolve_dual(req.guidance);
+        let cfg_disabled = low_gs <= 1.0 && high_gs <= 1.0;
+
+        // Stages 1–2 + noise seeding (shared with the single-expert path, F-072).
+        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled)?;
+
+        // --- Stage 3: load BOTH experts, embed contexts per expert, dual-expert MoE VACE denoise ---
+        let latents = {
+            // High-noise expert = `transformer/`; low-noise = `transformer_2/` (diffusers naming, the
+            // same high/low split the base A14B converter uses, model.rs:806).
+            let mut high_w = load_vace_fun_expert_weights(&self.root, MoeExpert::High)?;
+            let mut low_w = load_vace_fun_expert_weights(&self.root, MoeExpert::Low)?;
+            // LoRA/LoKr per expert (sc-6604) on the dense bf16 weights — BEFORE quantize (fork order).
+            let applied = self.merge_expert_adapters(&mut high_w, MoeExpert::High)?
+                + self.merge_expert_adapters(&mut low_w, MoeExpert::Low)?;
+            if !self.adapters.is_empty() && applied == 0 {
+                return Err(Error::Msg(format!(
+                    "{}: {} adapter file(s) matched no module across either expert — check the format \
+                     (PEFT `lora_A/B` or kohya `lora_down/up`, diffusers `blocks.N.attn1/attn2.to_*` / \
+                     `ffn.net.*` / `vace_blocks.*` names) and the `moe_expert` (high/low) tag",
+                    MODEL_ID_VACE_FUN,
+                    self.adapters.len()
+                )));
+            }
+            let mut high_dit =
+                WanVaceTransformer::from_weights(&high_w, &self.config, Dtype::Bfloat16)?;
+            let mut low_dit =
+                WanVaceTransformer::from_weights(&low_w, &self.config, Dtype::Bfloat16)?;
+            if let Some(q) = self.quantize {
+                high_dit.quantize(q.bits(), None)?;
+                low_dit.quantize(q.bits(), None)?;
+            }
+            let boundary_timestep = base.boundary * base.num_train_timesteps as f32;
+            let total = prep.steps as u32;
+            let mut on_step = |i: usize| {
+                on_progress(Progress::Step {
+                    current: i as u32,
+                    total,
+                })
+            };
+            denoise_vace_moe(
+                &low_dit,
+                &high_dit,
+                &prep.control,
+                &prep.scales,
+                prep.kind,
+                base.num_train_timesteps,
+                prep.steps,
+                prep.shift,
+                boundary_timestep,
+                low_gs,
+                high_gs,
+                &prep.context,
+                prep.context_null.as_ref(),
+                &prep.init_noise,
+                &req.cancel,
+                &mut on_step,
+            )?
+        };
+
+        // Stage 4: drop reference frames + z16-VAE decode → RGB8 (shared with the single-expert path).
+        vace_decode_tail(&self.root, base, latents, &prep, req, on_progress)
+    }
+}
+
+/// Load one VACE-Fun expert's transformer weights (diffusers layout). Prefers a converted-snapshot
+/// consolidated file (`high_noise_model.safetensors` / `low_noise_model.safetensors`, the names the
+/// base-A14B converter writes — model.rs:806), else the raw diffusers shard dir (`transformer/` for
+/// high, `transformer_2/` for low). Errors loudly when neither is present (no silent fallback).
+fn load_vace_fun_expert_weights(root: &std::path::Path, expert: MoeExpert) -> Result<Weights> {
+    let (label, single, dir) = match expert {
+        MoeExpert::High => ("high", "high_noise_model.safetensors", "transformer"),
+        MoeExpert::Low => ("low", "low_noise_model.safetensors", "transformer_2"),
+    };
+    let consolidated = root.join(single);
+    if consolidated.exists() {
+        return Weights::from_file(consolidated);
+    }
+    let shard_dir = root.join(dir);
+    if shard_dir.is_dir() {
+        return Weights::from_dir(shard_dir);
+    }
+    Err(Error::Msg(format!(
+        "wan2_2_vace_fun_14b: no {label}-noise expert weights at {} (expected {single} or a {dir}/ \
+         dir)",
+        root.display()
+    )))
+}
+
+/// Shared control-clip validation for both VACE generators (single + dual expert): the capability
+/// check plus the `ControlClip` presence + frame/mask-length + `1 + 4·k` frame-count contract.
+fn validate_vace_clip(
+    descriptor: &ModelDescriptor,
+    id: &'static str,
+    req: &GenerationRequest,
+) -> Result<()> {
+    descriptor.capabilities.validate_request(id, req)?;
+    let clip = req.control_clip().ok_or_else(|| {
+        Error::Msg(format!(
+            "{id}: needs a ControlClip (the masked control video — the worker builds it per mode: \
+             replace_person / pose-depth control / extend-bridge)"
+        ))
+    })?;
+    if clip.frames.len() != clip.mask.len() {
+        return Err(Error::Msg(format!(
+            "{id}: control frames ({}) and mask frames ({}) length mismatch",
+            clip.frames.len(),
+            clip.mask.len()
+        )));
+    }
+    if clip.frames.len() % VAE_T != 1 {
+        return Err(Error::Msg(format!(
+            "{id}: control clip frame count must be 1 + 4·k (got {})",
+            clip.frames.len()
+        )));
+    }
+    Ok(())
+}
+
+// Link-time registration for the dual-expert VACE-Fun variant (epic 3720).
+mlx_gen::register_generators! { descriptor_vace_fun => load_vace_fun }

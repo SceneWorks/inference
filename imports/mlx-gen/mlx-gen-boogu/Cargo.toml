@@ -1,0 +1,33 @@
+[package]
+name = "mlx-gen-boogu"
+version = "0.0.0"
+edition = "2021"
+description = "Boogu-Image-0.1 (Lumina-Image-2.0 / OmniGen2 lineage) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "boogu-image", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time self-registration of the three Boogu generators into the `mlx_gen` registry
+# (`model.rs::inventory::submit!`); discovered by `gen_core::registry::load(id, …)` when this crate
+# is force-linked from the worker.
+inventory = { workspace = true }
+# Parse the diffusers `transformer/config.json` (architecture + pre-quant manifest).
+serde_json = { workspace = true }
+# Boogu's VAE is the FLUX.1 16-ch `AutoencoderKL`, byte-identical to the VAE `mlx-gen-flux` reuses
+# from here — so we reuse the same `Vae`/`VaeDecoderConfig::default_z_image` rather than re-port it.
+mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# Optional PiD super-resolving decoder (epic 7840, sc-7846): Boogu shares the FLUX.1 16-ch VAE latent
+# space, so the final decode can route through `mlx_gen_pid::PidDecoder` (the `flux` student) when
+# `req.use_pid` is set. `mlx-gen-pid` depends only on core (no dep on this crate), so it's acyclic.
+mlx-gen-pid = { path = "../mlx-gen-pid" }
+# Qwen3-VL vision-tower image preprocessing (smart-resize) for the Edit path; also saves e2e renders.
+image = { workspace = true }
+
+[dev-dependencies]
+# Backend-neutral contract conformance suite — Boogu runs through it on the macos-mlx lane.
+sceneworks-gen-core-testkit = { workspace = true }

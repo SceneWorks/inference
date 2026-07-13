@@ -1,0 +1,242 @@
+{
+  "meta": {
+    "story": "sc-10524",
+    "epic": "10512",
+    "reference": "diffusers Anima tokenizers: Qwen2Tokenizer (tokenizer/) + T5TokenizerFast (t5_tokenizer/), padding='longest', truncation, max_length=512; empty prompt -> Qwen [[0]]/mask[[0]].",
+    "reference_packages": {
+      "diffusers": "0.39.0",
+      "transformers": "5.13.0",
+      "numpy": "2.5.1",
+      "python": "3.12.11"
+    },
+    "diffusers_repo": "circlestone-labs/Anima-Base-v1.0-Diffusers",
+    "single_file_repo": "circlestone-labs/Anima",
+    "regen_command": "<venv>/bin/python mlx-gen-anima/tests/fixtures/gen_anima_parity_goldens.py",
+    "generator": "mlx-gen-anima/tests/fixtures/gen_anima_parity_goldens.py",
+    "note": "Parity = no quality regression (Metal matmul ~1e-3; bf16 frozen-Python golden). Real-weights stages compare MLX bf16 vs a torch bf16 reference at ~1e-2 (mean-rel).",
+    "diffusers_snapshot_sha": "073c3a9db359c31ad0e8aa268d15775473c2176c",
+    "single_file_snapshot_sha": "53eec3898af698b2cf2a11379021fc9c5465d228",
+    "qwen_pad_token_id": 151643,
+    "max_sequence_length": 512
+  },
+  "cases": [
+    {
+      "prompt": "1girl, silver hair, blue eyes, (detailed:1.2), masterpiece",
+      "qwen_ids": [
+        16,
+        28552,
+        11,
+        14961,
+        6869,
+        11,
+        6303,
+        6414,
+        11,
+        320,
+        67,
+        10111,
+        25,
+        16,
+        13,
+        17,
+        701,
+        58731
+      ],
+      "qwen_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "t5_ids": [
+        209,
+        18722,
+        6,
+        4294,
+        1268,
+        6,
+        1692,
+        2053,
+        6,
+        41,
+        221,
+        17,
+        10990,
+        10,
+        10917,
+        201,
+        20975,
+        1
+      ]
+    },
+    {
+      "prompt": "@artist_name, (chibi:2), simple background",
+      "qwen_ids": [
+        31,
+        18622,
+        1269,
+        11,
+        320,
+        331,
+        39393,
+        25,
+        17,
+        701,
+        4285,
+        4004
+      ],
+      "qwen_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "t5_ids": [
+        3320,
+        1408,
+        343,
+        834,
+        4350,
+        6,
+        41,
+        75,
+        13506,
+        10,
+        7318,
+        6,
+        650,
+        2458,
+        1
+      ]
+    },
+    {
+      "prompt": "\u3053\u3093\u306b\u3061\u306f\u4e16\u754c",
+      "qwen_ids": [
+        89015,
+        99489
+      ],
+      "qwen_mask": [
+        1,
+        1
+      ],
+      "t5_ids": [
+        3,
+        2,
+        1
+      ]
+    },
+    {
+      "prompt": "\ud83c\udfa8\u2728 12345 67890",
+      "qwen_ids": [
+        146818,
+        144232,
+        220,
+        16,
+        17,
+        18,
+        19,
+        20,
+        220,
+        21,
+        22,
+        23,
+        24,
+        15
+      ],
+      "qwen_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "t5_ids": [
+        3,
+        2,
+        3,
+        14574,
+        2128,
+        431,
+        3940,
+        2394,
+        1
+      ]
+    },
+    {
+      "prompt": "((nested (parens)))",
+      "qwen_ids": [
+        1188,
+        59271,
+        320,
+        3380,
+        4412,
+        7705
+      ],
+      "qwen_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "t5_ids": [
+        41,
+        599,
+        1496,
+        1054,
+        41,
+        1893,
+        35,
+        7,
+        61,
+        61,
+        61,
+        1
+      ]
+    },
+    {
+      "prompt": "",
+      "qwen_ids": [
+        0
+      ],
+      "qwen_mask": [
+        0
+      ],
+      "t5_ids": [
+        1
+      ]
+    }
+  ]
+}
