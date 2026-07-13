@@ -60,8 +60,10 @@ name the upstream refresh that must remove each exception.
 
 ## Real-weight fixture policy
 
-Nightly/manual real-weight jobs use runner-provisioned snapshots and reject a
-moving branch identity. The initial representative models are fixed to:
+Nightly/manual real-weight jobs use persistent runner caches and reject a moving
+branch identity. A missing or incomplete snapshot is materialized on demand from
+the exact repository revision before verification; revision drift is rejected
+rather than overwritten. The initial representative models are fixed to:
 
 | Profile | Repository | Revision |
 |---|---|---|
@@ -69,15 +71,17 @@ moving branch identity. The initial representative models are fixed to:
 | thinking LLM | `Qwen/Qwen3-0.6B` | `c1899de289a04d12100db370d81485cdf75e47ca` |
 | media | `Tongyi-MAI/Z-Image-Turbo` | `f332072aa78be7aecdf3ee76d5c247082da564a6` |
 
-The verifier accepts the standard Hugging Face `snapshots/<revision>` layout or
-a materialized snapshot carrying `.sceneworks-model-revision`, and checks required
-files before any expensive test begins.
+The materializer uses pinned `huggingface_hub` 1.20.1. The verifier accepts the
+standard Hugging Face `snapshots/<revision>` layout or a materialized snapshot
+carrying `.sceneworks-model-revision`, and checks required files before any
+expensive test begins. Model bytes stay outside the Actions workspace and are
+reused by later self-hosted runs.
 
 ## Local validation
 
 The following pass from the repository root:
 
-- 13 repository-tooling unit tests;
+- 20 repository-tooling unit tests;
 - dependency-aware lane-selection examples for contracts, MLX, Candle, docs, and
   unknown paths;
 - documentation local-link validation;
@@ -96,7 +100,7 @@ invariants, and release metadata/SBOM.
 
 1. Repository publication and hosted Linux/macOS execution are complete.
 2. Configure the self-hosted Windows/CUDA and real-weight runner variables, then
-   execute those matrices against the pinned snapshots.
+   execute those matrices against the pinned, self-materializing snapshots.
 3. Create the immutable runtime tag only after those jobs pass.
 4. Rebuild and upload the tagged source/SBOM bundle, then verify its hashes.
 

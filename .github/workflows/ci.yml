@@ -192,7 +192,8 @@ jobs:
           sw_vers
           xcodebuild -version
           xcrun metal --version
-          rustup show
+          rustc --version
+          cargo --version
       - name: Cache Cargo and MLX native build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Exercise MLX engine and complete runtime catalog on NAX
