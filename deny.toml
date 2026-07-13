@@ -1,0 +1,54 @@
+[graph]
+all-features = false
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+
+[advisories]
+yanked = "warn"
+ignore = [
+    # Unmaintained `number_prefix` through hf-hub 0.4.3/indicatif. No security
+    # vulnerability or safe compatible upgrade; remove with the hf-hub refresh.
+    "RUSTSEC-2025-0119",
+    # Unmaintained `paste` through the pinned Candle/GEMM graph. Remove when the
+    # upstream Candle revision replaces it; no safe in-place upgrade exists.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/huggingface/candle",
+    "https://github.com/michaeltrefry/mlx-rs",
+]

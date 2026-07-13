@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["runtime-*"]
   pull_request:
   workflow_dispatch:
 
@@ -14,8 +15,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: select affected lanes
+    runs-on: ubuntu-latest
+    outputs:
+      workspace: ${{ steps.select.outputs.workspace }}
+      contracts: ${{ steps.select.outputs.contracts }}
+      candle_cpu: ${{ steps.select.outputs.candle_cpu }}
+      macos_metal: ${{ steps.select.outputs.macos_metal }}
+      windows_cuda: ${{ steps.select.outputs.windows_cuda }}
+      supply_chain: ${{ steps.select.outputs.supply_chain }}
+      docs: ${{ steps.select.outputs.docs }}
+      release: ${{ steps.select.outputs.release }}
+      real_weights: ${{ steps.select.outputs.real_weights }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Expand changed paths through workspace dependencies
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+            python3 scripts/ci/select_lanes.py --all --github-output "$GITHUB_OUTPUT"
+          else
+            python3 scripts/ci/select_lanes.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
+          fi
+
   workspace:
     name: workspace graph invariants
+    needs: changes
+    if: needs.changes.outputs.workspace == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -25,9 +59,13 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Validate normalized workspace
         run: ./scripts/check-workspace.py
+      - name: Test repository tooling
+        run: python3 -m unittest discover -s scripts/tests -v
 
   contracts:
     name: contracts + conformance testkits (Linux)
+    needs: changes
+    if: needs.changes.outputs.contracts == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -56,6 +94,8 @@ jobs:
 
   candle-cpu:
     name: Candle CPU packages (Linux)
+    needs: changes
+    if: needs.changes.outputs.candle_cpu == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -78,6 +118,8 @@ jobs:
 
   macos-metal:
     name: MLX + Candle Metal packages (macOS)
+    needs: changes
+    if: needs.changes.outputs.macos_metal == 'true'
     runs-on: macos-15
     env:
       # Hosted SDK 15 cannot compile the shipping macOS 26.2 NAX path. The root
@@ -120,7 +162,8 @@ jobs:
 
   windows-cuda:
     name: Candle CUDA packages (Windows, manual)
-    if: github.event_name == 'workflow_dispatch'
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true'
     runs-on: [self-hosted, windows, cuda]
     env:
       CUDA_COMPUTE_CAP: "80"
@@ -142,3 +185,61 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked -p candle-llm -p "candle-gen*" --features cuda
+
+  supply-chain:
+    name: dependency policy + advisories
+    needs: changes
+    if: needs.changes.outputs.supply_chain == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.19.9
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny --locked check advisories bans licenses sources
+
+  docs:
+    name: repository documentation
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Check local documentation links
+        run: python3 scripts/check_docs.py
+
+  release-metadata:
+    name: runtime manifest + SPDX SBOM
+    needs: changes
+    if: needs.changes.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Cache Cargo graph
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build dry-run release metadata
+        run: >-
+          python3 scripts/release/build_release.py
+          --tag runtime-2000.01.0-rc.0 --skip-archive
+      - name: Verify manifest, checksums, and SBOM graph
+        run: python3 scripts/release/verify_release.py dist/release --skip-smoke
+
+  release-artifacts:
+    name: tagged source archive + external smoke
+    needs: [changes, release-metadata]
+    if: startsWith(github.ref, 'refs/tags/runtime-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Cache Cargo graph
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build tagged source bundle
+        run: python3 scripts/release/build_release.py --tag "$GITHUB_REF_NAME"
+      - name: Verify and consume source bundle externally
+        run: python3 scripts/release/verify_release.py dist/release
+      - name: Upload immutable release inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ github.ref_name }}-source
+          path: dist/release/
+          if-no-files-found: error

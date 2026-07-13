@@ -1,0 +1,102 @@
+name: Real-weight validation
+
+on:
+  schedule:
+    - cron: "17 7 * * 0"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Real-weight profile to run
+        type: choice
+        required: true
+        default: all
+        options: [all, llm, media]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inference-real-weights-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mlx-llm:
+    name: MLX LLM real weights
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      MLX_LLM_TEST_MODEL: ${{ vars.MLX_LLM_TEST_MODEL }}
+      MLX_LLM_QWEN3_MODEL: ${{ vars.MLX_LLM_QWEN3_MODEL }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - run: rustup show
+      - name: Verify immutable snapshots
+        run: |
+          python3 scripts/release/verify_model_snapshot.py --model smollm2-135m-instruct --snapshot "$MLX_LLM_TEST_MODEL"
+          python3 scripts/release/verify_model_snapshot.py --model qwen3-0.6b --snapshot "$MLX_LLM_QWEN3_MODEL"
+      - name: Run representative conformance
+        run: |
+          cargo test --locked -p mlx-llm --test conformance real_model_passes_core_llm_conformance -- --ignored --nocapture
+          cargo test --locked -p mlx-llm --test conformance real_qwen3_passes_core_llm_conformance -- --ignored --nocapture
+
+  mlx-media:
+    name: MLX media real weights
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - run: rustup show
+      - name: Verify immutable snapshot
+        run: python3 scripts/release/verify_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
+      - name: Run provider conformance
+        run: >-
+          cargo test --locked -p mlx-gen-z-image --test conformance
+          z_image_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+
+  candle-llm:
+    name: Candle LLM real weights (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      CANDLE_LLM_TEST_MODEL: ${{ vars.CANDLE_LLM_TEST_MODEL }}
+      CANDLE_LLM_QWEN3_MODEL: ${{ vars.CANDLE_LLM_QWEN3_MODEL }}
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - run: rustup show
+      - name: Verify immutable snapshots
+        shell: pwsh
+        run: |
+          python scripts/release/verify_model_snapshot.py --model smollm2-135m-instruct --snapshot "$env:CANDLE_LLM_TEST_MODEL"
+          python scripts/release/verify_model_snapshot.py --model qwen3-0.6b --snapshot "$env:CANDLE_LLM_QWEN3_MODEL"
+      - name: Run representative conformance
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-llm --features cuda --test conformance real_model_passes_core_llm_conformance -- --ignored --nocapture
+          cargo test --locked -p candle-llm --features cuda --test conformance qwen3_passes_core_llm_conformance -- --ignored --nocapture
+
+  candle-media:
+    name: Candle media real weights (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      Z_IMAGE_SNAPSHOT: ${{ vars.Z_IMAGE_SNAPSHOT }}
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - run: rustup show
+      - name: Verify immutable snapshot
+        shell: pwsh
+        run: python scripts/release/verify_model_snapshot.py --model z-image-turbo --snapshot "$env:Z_IMAGE_SNAPSHOT"
+      - name: Run provider conformance
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture
