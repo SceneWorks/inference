@@ -134,9 +134,17 @@ fn q4_1024_control_render_fits_emulated_24gib_budget() {
 
     // (a) The gate engages at this budget for a q4/1024² decode (Sequential ⇒ no co-resident text).
     let cfg = Krea2Config::turbo();
-    let tiling =
-        plan_control_decode_tiling(safe, &cfg, BRANCH_BLOCKS, Some(Quant::Q4), None, 1024, 1024, false)
-            .expect("decode-tiling gate must not error at ~24 GiB");
+    let tiling = plan_control_decode_tiling(
+        safe,
+        &cfg,
+        BRANCH_BLOCKS,
+        Some(Quant::Q4),
+        None,
+        1024,
+        1024,
+        false,
+    )
+    .expect("decode-tiling gate must not error at ~24 GiB");
     assert!(
         tiling.is_some(),
         "decode tiling must engage for q4/1024² at a ~24 GiB budget"
@@ -147,7 +155,8 @@ fn q4_1024_control_render_fits_emulated_24gib_budget() {
         .with_control(WeightsSource::File(overlay()))
         .with_offload_policy(OffloadPolicy::Sequential)
         .with_quant(Quant::Q4);
-    let model = mlx_gen::load("krea_2_turbo_control", &spec).expect("load krea_2_turbo_control (q4)");
+    let model =
+        mlx_gen::load("krea_2_turbo_control", &spec).expect("load krea_2_turbo_control (q4)");
 
     let req = GenerationRequest {
         prompt: "a person standing in a studio, photograph".into(),
@@ -236,13 +245,15 @@ fn tiled_decode_matches_untiled_on_real_vae() {
         }),
         temporal: None,
     };
-    let tiled = vae
-        .decode_tiled(&latent, &cfg, None)
-        .expect("tiled decode");
+    let tiled = vae.decode_tiled(&latent, &cfg, None).expect("tiled decode");
 
     untiled.eval().unwrap();
     tiled.eval().unwrap();
-    assert_eq!(untiled.shape(), tiled.shape(), "tiled decode changed the output shape");
+    assert_eq!(
+        untiled.shape(),
+        tiled.shape(),
+        "tiled decode changed the output shape"
+    );
 
     // `decode()` returns a transposed (non-contiguous) NCTHW view, while `decode_tiled` ends with an
     // explicit `contiguous`. `as_slice` reads the *physical* buffer, so the two must be materialized in

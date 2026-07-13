@@ -121,7 +121,8 @@ pub fn tiled_decode(
     }
 
     let output = output.ok_or_else(|| Error::Msg("vae tiled decode: plan had no tiles".into()))?;
-    let weights = weights.ok_or_else(|| Error::Msg("vae tiled decode: plan had no tiles".into()))?;
+    let weights =
+        weights.ok_or_else(|| Error::Msg("vae tiled decode: plan had no tiles".into()))?;
     contiguous(&divide(&output, &maximum(&weights, scalar(1e-8))?)?)
 }
 
@@ -255,6 +256,9 @@ mod tests {
             .zip(e)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        assert!(max < 1e-4, "image tiled blend did not reconstruct: max|Δ|={max:.3e}");
+        assert!(
+            max < 1e-4,
+            "image tiled blend did not reconstruct: max|Δ|={max:.3e}"
+        );
     }
 }

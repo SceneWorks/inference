@@ -336,7 +336,15 @@ impl KreaHeavy {
         // This convenience path (KreaPipeline delegator + weight-gated tests) always decodes single-pass
         // (`None`); the budget-gated tiled decode is threaded by the `Generator` seam (`model_control`).
         let plan = self.prepare_control(context, control_image, opts.width, opts.height)?;
-        self.render_control_from(&plan, branch, control_scale, None, opts, cancel, on_progress)
+        self.render_control_from(
+            &plan,
+            branch,
+            control_scale,
+            None,
+            opts,
+            cancel,
+            on_progress,
+        )
     }
 
     /// Build the **count-invariant** pose-control plan (F-073): the step-invariant text prep AND the

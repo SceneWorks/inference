@@ -550,9 +550,10 @@ mod tests {
         let sp = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
         // A few GiB under single-pass: the 1024² decode spike (~6 GiB) means a smaller tile fits here.
         let safe = sp - 3.0;
-        let plan = plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
-            .unwrap()
-            .expect("single-pass over budget must tile");
+        let plan =
+            plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
+                .unwrap()
+                .expect("single-pass over budget must tile");
         assert!(
             plan.spatial.is_some(),
             "a 1024² decode over budget must tile the spatial axis: {plan:?}"
@@ -572,9 +573,13 @@ mod tests {
         let sp = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
         // Just above the ex-text single-pass peak: fits with text dropped, over budget with it resident.
         let safe = sp + 1.0;
-        let seq = plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
-            .unwrap();
-        assert!(seq.is_none(), "ex-text single-pass fits under Sequential: {seq:?}");
+        let seq =
+            plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
+                .unwrap();
+        assert!(
+            seq.is_none(),
+            "ex-text single-pass fits under Sequential: {seq:?}"
+        );
         let resident =
             plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, true)
                 .unwrap();
@@ -589,9 +594,10 @@ mod tests {
     #[test]
     fn decode_tiling_gate_errs_when_infeasible() {
         let cfg = Krea2Config::turbo();
-        let err = plan_control_decode_tiling(1.0, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
-            .unwrap_err()
-            .to_string();
+        let err =
+            plan_control_decode_tiling(1.0, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
+                .unwrap_err()
+                .to_string();
         assert!(
             err.contains("Qwen-VAE decode"),
             "over-budget decode must surface a catchable, tagged error: {err}"
