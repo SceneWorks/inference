@@ -1,4 +1,12 @@
-# Provisional organizational ownership; replace with team handles before consumer
-# cutover.
-* @SceneWorks
+# The current canonical repository maintainer owns every surface. Keep the
+# category entries explicit so ownership can move to dedicated SceneWorks teams
+# without changing the release topology.
+* @zakkeown
 
+/crates/contracts/ @zakkeown
+/crates/bundles/ @zakkeown
+/crates/llm/ @zakkeown
+/crates/media/ @zakkeown
+/scripts/ci/ @zakkeown
+/scripts/release/ @zakkeown
+/.github/ @zakkeown

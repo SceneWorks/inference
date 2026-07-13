@@ -41,6 +41,9 @@ why provider discovery is explicit, the alternatives considered, and the
 tradeoffs accepted—is recorded in
 [`docs/architecture/inference-rearchitecture.md`](docs/architecture/inference-rearchitecture.md).
 
+Contribution boundaries and security reporting are documented in
+[`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md).
+
 Validate the normalized graph with:
 
 ```sh

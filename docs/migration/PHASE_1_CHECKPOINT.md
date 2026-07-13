@@ -1,9 +1,9 @@
 # Phase 1 History Import Checkpoint
 
-> **Status:** Local import complete; GitHub repository creation and push blocked by
-> invalid GitHub CLI authentication.
+> **Status:** Complete. The assembled history and its migration/history refs are
+> published to the canonical private `SceneWorks/inference` repository.
 
-## Completed locally
+## Completed
 
 - Bootstrapped the provisional inference repository with Apache-2.0 licensing,
   Rust 1.96.0, migration guidance, and an empty/excluded root workspace.
@@ -17,6 +17,9 @@
 - Committed all `git-filter-repo` commit and ref maps under `docs/migration/`.
 - Recorded source commits, filtered commits, and tree IDs in
   `phase-1-sources.toml`.
+- Published `main`, every `migration-baseline/*` tag, and
+  `history/candle-gen-tracking-main` to the canonical remote without rewriting
+  any imported history.
 
 ## Equivalence result
 
@@ -32,16 +35,13 @@ repository root tree:
 | `candle-gen` | `b610bdf1565ceb810e7b938122473cca8b785b83` | Match |
 | Newer Candle tracking commit | `26790038397b8c45c55a56dd612e52a97847c965` | Match and preserved separately |
 
-## Remaining Phase 1 publication work
+## Publication outcome
 
-1. Reauthenticate GitHub CLI for an account allowed to create repositories in the
-   SceneWorks organization.
-2. Create public `SceneWorks/inference` without an auto-generated README/license so
-   it accepts the assembled history.
-3. Add the canonical `origin` remote.
-4. Push `main`, migration/history tags, and verify the remote objects.
-5. Add the remote URL to repository metadata and mark this checkpoint published.
+The Phase 0 recommendation proposed public visibility because the source
+repositories were public. The repository was instead created private, and the
+migration deliberately preserves that actual visibility. Changing it is an
+independent administrative decision and is not authorized by history import,
+runtime release, or consumer cutover.
 
 No package normalization, dependency conversion, or provider refactor belongs in
 this phase.
-
