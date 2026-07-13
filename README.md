@@ -9,7 +9,9 @@ bundles.
 This repository was assembled from the existing `core-llm`, `mlx-llm`,
 `candle-llm`, `mlx-gen`, and `candle-gen` histories. Phase 1 preserved and
 verified those histories; Phase 2 has moved all 67 packages into their ownership
-paths and normalized them under one Cargo workspace and lockfile.
+paths and normalized them under one Cargo workspace and lockfile. Phase 3 now
+provides dependency-aware CI selection, supply-chain policy, immutable real-weight
+fixture pins, and deterministic source/SBOM release tooling.
 
 The current authoritative migration plan and release-set baseline live in the
 SceneWorks repository under `documents/rearchitecture/`.
@@ -24,7 +26,9 @@ docs/              Migration maps, architecture, compatibility, and release reco
 ```
 
 See [`docs/migration/PHASE_2_CHECKPOINT.md`](docs/migration/PHASE_2_CHECKPOINT.md)
-for the normalization invariants and validation record.
+for normalization invariants and
+[`docs/migration/PHASE_3_CHECKPOINT.md`](docs/migration/PHASE_3_CHECKPOINT.md) for
+the local release-train validation record.
 
 Validate the normalized graph with:
 

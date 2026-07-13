@@ -64,9 +64,11 @@ def verify_sbom(bundle: Path, manifest: dict) -> None:
 
 def safe_members(archive: tarfile.TarFile, expected_prefix: str) -> list[tarfile.TarInfo]:
     members = archive.getmembers()
+    expected_root = expected_prefix.rstrip("/")
     for member in members:
         path = PurePosixPath(member.name)
-        if path.is_absolute() or ".." in path.parts or not member.name.startswith(expected_prefix):
+        in_release_root = member.name == expected_root or member.name.startswith(expected_prefix)
+        if path.is_absolute() or ".." in path.parts or not in_release_root:
             raise RuntimeError(f"unsafe or unexpected source path: {member.name}")
         if member.issym() or member.islnk():
             link = PurePosixPath(member.linkname)

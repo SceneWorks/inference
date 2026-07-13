@@ -13,3 +13,8 @@ old                                      new
 
 The source repositories are never history-rewritten or force-pushed.
 
+## Checkpoints
+
+- [`PHASE_1_CHECKPOINT.md`](PHASE_1_CHECKPOINT.md): history import and exact tree equivalence
+- [`PHASE_2_CHECKPOINT.md`](PHASE_2_CHECKPOINT.md): ownership layout and unified workspace
+- [`PHASE_3_CHECKPOINT.md`](PHASE_3_CHECKPOINT.md): CI selection and release-train tooling
