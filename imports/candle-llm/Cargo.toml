@@ -1,0 +1,68 @@
+[package]
+name = "candle-llm"
+version = "0.0.0"
+edition = "2021"
+description = "On-device text LLM serving engine for the Candle backend (cross-platform incl. Windows/CUDA); validates the core-llm contract. Work in progress."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/candle-llm"
+readme = "README.md"
+keywords = ["candle", "cuda", "llm", "inference", "serving"]
+categories = ["science"]
+
+[dependencies]
+# The Candle tensor backend. Pinned to the SAME git rev the `candle-gen` sibling family pins
+# (huggingface/candle post-0.10.2) so the whole on-device stack resolves ONE candle build — and
+# because that rev clears `CUDA_ERROR_INVALID_PTX` on Blackwell (sm_120). CPU by default; the
+# `cuda` / `metal` features select a GPU backend. Re-pin in lockstep with candle-gen.
+# Bumped `65ecb58` -> `c1e6756` (2026-07-02, lockstep with candle-gen): picks up upstream PR #3493,
+# the `QStorage::from_data(Cow::Owned…)` use-after-free fix. 4-commit range (the fix + three
+# Metal-only SDPA fixes); no API changes, candle-kernels byte-identical across the range.
+candle-core = { git = "https://github.com/huggingface/candle", rev = "c1e6756a89faefa888ea57b056394a0619925b87" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "c1e6756a89faefa888ea57b056394a0619925b87" }
+# Fused FlashAttention-2 CUDA kernels for the decode/prefill attention seam. Optional — pulled in
+# ONLY by the `flash-attn` feature (it compiles a large CUDA/CUTLASS kernel set and needs the CUDA
+# toolkit). Pinned to the SAME candle git rev so it links against one candle build.
+candle-flash-attn = { git = "https://github.com/huggingface/candle", rev = "c1e6756a89faefa888ea57b056394a0619925b87", optional = true }
+# The backend-neutral contract this crate implements (epic 7153, story 7154). Git dep on the
+# published repo during development (crates.io publish coordination is a later story); shares its
+# `CancelFlag`, `Tokenizer`, chat templates, and the `TextLlm` trait so there is one contract, not
+# two. candle-llm is the second backend, whose passing the conformance suite de-provisionalizes it.
+# Pinned to `branch = "main"` to match the rest of the SceneWorks graph (sc-8116, epic 8103). mlx-llm
+# and (transitively) sceneworks-gen-core pin core-llm `branch = "main"`; cargo keys a git source by its
+# (url, reference), so a `rev = "3870ed1"` spec here does NOT unify with their `branch = "main"` spec
+# EVEN at the identical commit — the worker's `--features backend-candle` graph then materialises TWO
+# core-llm packages (one per spec) and the duplicate `core_llm` types clash (broke candle-gen's CUDA
+# conformance suite when this rev was pulled into candle-gen-joycaption). Using `branch = "main"` here
+# (the proven bf99e5b4 approach, now carrying the Qwen3-VL vision tower) unifies on ONE core-llm. The
+# sc-8021 "don't float to main HEAD" concern is handled by the committed Cargo.lock pinning the resolved
+# commit; re-pin in lockstep with the other consumers when core-llm's resolved commit moves.
+# DEV-PIN (sc-8528 KV-quant backout): temporarily pointed at the core-llm removal branch so this
+# crate builds WITHOUT the removed `supports_kv_cache_quant` / `kv_cache_quant` fields. COORDINATOR:
+# flip back to `branch = "main"` after the core-llm backout PR merges, then relock.
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+# Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
+# inventory so the distributed slice links.
+inventory = "0.3"
+# Error plumbing for the engine surface.
+thiserror = "2"
+# config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-llm convention.
+serde_json = "1"
+
+[dev-dependencies]
+# The contract conformance suite (story 7201): run the registered LlamaProvider through the
+# backend-neutral checks. Same git source AND ref as the core-llm dep so cargo unifies on one core-llm.
+# DEV-PIN (sc-8528): see the core-llm note above — COORDINATOR flips back to `branch = "main"` post-merge.
+core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+
+[features]
+# Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).
+default = []
+# NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# Apple Metal GPU backend.
+metal = ["candle-core/metal", "candle-nn/metal"]
+# FlashAttention-2 (Windows/CUDA). Implies `cuda` and pulls in `candle-flash-attn`'s fused kernels,
+# which the attention seam (`primitives::attention::sdpa`) dispatches to for the dense causal path,
+# falling back to the eager softmax SDPA for the cases the kernel can't serve (soft-cap, mismatched
+# q/v head dims, padded-batch masks, f32/CPU). NOTE: candle-flash-attn ships sm80 kernels.
+flash-attn = ["cuda", "dep:candle-flash-attn"]
