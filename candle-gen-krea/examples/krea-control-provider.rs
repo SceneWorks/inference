@@ -109,14 +109,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = parse_args();
     let pose = load_pose(&a.pose, a.size)?;
 
+    // `KREA_CHUNK_ATTN=1` engages sc-6217-style query-row attention chunking on the base stack + branch
+    // (sc-11745) — the fit-ladder's activation-peak rung; default false = the unchunked full-speed
+    // forward. Set at load, so it flips before the sampler loop (the measurement harness A/Bs this).
+    let chunk_attention = std::env::var("KREA_CHUNK_ATTN")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     let model = Krea2Control::load(&Krea2ControlPaths {
         root: a.snapshot,
         control: a.ckpt,
         adapters: Vec::new(),
         branch_quant: a.branch_quant,
+        chunk_attention,
     })?;
     eprintln!(
-        "loaded Krea2Control (branch_quant {:?}); rendering {}x{} @ scale {}",
+        "loaded Krea2Control (branch_quant {:?}, chunk_attention {chunk_attention}); rendering {}x{} @ scale {}",
         a.branch_quant, a.size, a.size, a.scale
     );
 

@@ -39,7 +39,7 @@ use crate::pipeline::to_image;
 use crate::pipeline::MAX_TEXT_TOKENS;
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::tokenizer::KreaTokenizer;
-use crate::train_dit::KreaTrainDit;
+use crate::train_dit::{KreaTrainDit, KREA_ATTN_CHUNK_BUDGET};
 use crate::{load_vae, turbo_sigmas, TURBO_STEPS};
 
 /// Qwen-Image VAE 8× spatial compression (latent side = pixels / 8).
@@ -72,6 +72,17 @@ pub struct Krea2ControlPaths {
     /// still exceeds free VRAM after the cheaper rungs (VAE-decode tiling, activation chunking). It is
     /// **not** auto-mirrored to the base tier — a q4 base on a card with headroom keeps a bf16 branch.
     pub branch_quant: Option<Quant>,
+    /// Engage sc-6217-style **query-row attention chunking** on the composable base stack + the control
+    /// branch (sc-11745) — the fit-ladder rung **between** VAE-decode tiling (sc-11744) and branch-quant
+    /// (sc-11743). `false` (the default and the norm) runs each single-stream block's joint `[ctx; img]`
+    /// attention unchunked at the i32-guard budget — full speed, the ~11 GB-of-activations 1024² denoise
+    /// peak. The worker's Krea control fit-gate (sc-11754) flips this to `true` **only** when the
+    /// predicted *denoise*-phase peak exceeds free VRAM, lowering the scores budget to
+    /// [`KREA_ATTN_CHUNK_BUDGET`] so each per-block attention block is bounded (a small speed cost, no
+    /// quality cost — the chunked result is numerically identical). A **resolution cap** is a separate,
+    /// sharper lever the worker owns by choosing smaller render dims; it needs no knob here. On a card
+    /// with headroom this stays `false`.
+    pub chunk_attention: bool,
 }
 
 /// One Krea 2 strict-pose control request. Krea 2 Turbo is CFG-free (no guidance / negative pass) —
@@ -169,6 +180,18 @@ impl Krea2Control {
         };
         branch.freeze();
         branch.set_residual_clamp(Some(DEFAULT_RESIDUAL_CLAMP));
+
+        // Activation-chunking rung (sc-11745): the fit-gate flips this on only when the predicted
+        // *denoise* peak exceeds free VRAM. It bounds each single-stream block's joint `[ctx; img]`
+        // attention scratch by lowering the scores budget from the i32 guard to KREA_ATTN_CHUNK_BUDGET,
+        // forcing sc-6217-style query-row chunking (numerically identical, a small speed cost) on both
+        // the base stack and the branch. Off (the default) = unchunked at the i32 guard, full speed —
+        // the big-card path. Applied at load, uniformly to this model's denoise (the load-time twin of
+        // the branch_quant rung); a resolution cap is the worker's separate lever (smaller render dims).
+        if paths.chunk_attention {
+            dit.set_attention_budget(KREA_ATTN_CHUNK_BUDGET);
+            branch.set_attention_budget(KREA_ATTN_CHUNK_BUDGET);
+        }
 
         // VAE decode (final latent → pixels) + encoder (pose skeleton → control latent).
         let vae = load_vae(&paths.root, &device)?;
