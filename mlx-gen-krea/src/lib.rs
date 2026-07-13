@@ -50,6 +50,7 @@ pub mod config;
 pub mod control;
 pub mod convert;
 pub mod loader;
+pub mod memory;
 pub mod model;
 pub mod model_control;
 pub mod pipeline;
@@ -63,6 +64,7 @@ pub mod vae;
 pub use config::Krea2Config;
 pub use control::Krea2ControlBranch;
 pub use loader::{load_text_encoder, load_transformer};
+pub use memory::{plan_control_adaptation, ControlLaneInputs};
 pub use model::{
     descriptor, edit_descriptor, load, load_edit, load_raw, load_turbo_edit, raw_descriptor,
     turbo_edit_descriptor, Krea, KREA_2_EDIT_ID, KREA_2_RAW_ID, KREA_2_TURBO_EDIT_ID,
