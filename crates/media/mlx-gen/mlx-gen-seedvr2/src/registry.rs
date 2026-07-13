@@ -242,9 +242,13 @@ fn load_7b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 mlx_gen::register_generators! {
-    descriptor => load_base,
-    descriptor_3b => load_3b,
-    descriptor_7b => load_7b,
+    pub(crate) const BASE_REGISTRATION = descriptor => load_base
+}
+mlx_gen::register_generators! {
+    pub(crate) const THREE_B_REGISTRATION = descriptor_3b => load_3b
+}
+mlx_gen::register_generators! {
+    pub(crate) const SEVEN_B_REGISTRATION = descriptor_7b => load_7b
 }
 
 #[cfg(test)]
