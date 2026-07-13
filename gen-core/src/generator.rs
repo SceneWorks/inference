@@ -96,6 +96,15 @@ pub struct GenerationRequest {
     /// `vace_layers` entry. `None` ⇒ the diffusers default `1.0`. Only the `wan_vace` model reads it;
     /// other models ignore it. (sc-3441)
     pub control_scale: Option<f32>,
+    /// Krea "text style" gain — reweights the 12 stacked Qwen3-VL select-layer taps before the DiT's
+    /// `TextFusionTransformer` aggregates them (the ComfyUI-Conditioning-Rebalance mechanism, sc-8596/
+    /// sc-11878). A single scalar `g` maps to the per-layer ramp `w[i] = g + (2−2g)·i/(n−1)`: `g = 1`
+    /// (or `None`) is a byte-exact no-op, `g > 1` emphasizes the early (low-level) taps for a
+    /// warmer/richer/moodier look, `g < 1` biases toward the late (semantic) taps. GPU-validated safe
+    /// over `[0.25, 1.75]` (the engine clamps to that range). **Krea / Qwen-Image-family only** (depends
+    /// on the multi-tap text encoder); other models ignore it. It does NOT transfer subject/identity —
+    /// it is a stylistic nudge, distinct from the reference-image [`strength`](Self::strength) lever.
+    pub text_style_gain: Option<f32>,
     /// Image-guidance (true CFG on the **reference/image** condition) for reference-conditioned edit
     /// models — the identity-strength lever (sc-8273/sc-8278). When `Some(s)` with `s > 1`, the
     /// denoise extrapolates the with-reference velocity against the reference-dropped
@@ -215,6 +224,7 @@ impl Default for GenerationRequest {
             conditioning: Vec::new(),
             strength: None,
             control_scale: None,
+            text_style_gain: None,
             image_guidance: None,
             frames: None,
             fps: None,
