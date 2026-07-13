@@ -14,11 +14,16 @@
 //!
 //! ## Sampler / shift / timestep convention
 //!
-//! * **Flow-match Euler, static shift 3.0.** `Sana_1600M_1024px_diffusers` ships a
-//!   `FlowMatchEulerDiscreteScheduler` with `shift = 3.0` and `use_dynamic_shifting = false`, so the
-//!   native schedule is [`FlowMatchEuler::for_static_shift(steps, 3.0)`] (resolution-independent,
-//!   `exp(mu) = shift`). An unset `scheduler` keeps that byte-exact; a curated epic-7114 name re-shapes
-//!   σ over the same `mu = ln(3)` via [`mlx_gen::resolve_flow_schedule`].
+//! * **Flow-match Euler, static shift 3.0 (a deliberate divergence from the repo default).**
+//!   `Sana_1600M_1024px_diffusers` actually ships a `DPMSolverMultistepScheduler` (`solver_order = 2`,
+//!   `prediction_type = flow_prediction`, `use_flow_sigmas = true`, `flow_shift = 3.0`) — NOT a
+//!   `FlowMatchEulerDiscreteScheduler`. We deliberately run flow-match Euler instead: on the good
+//!   `_BF16` checkpoint the 2nd-order DPM solver produces a garish / over-saturated /
+//!   chromatic-aberration artifact, while Euler renders clean (verified in sc-11760). Do NOT "restore"
+//!   a DPM-Solver default to "match the reference" — that reintroduces the artifact. Only `flow_shift`
+//!   carries over: the native schedule is [`FlowMatchEuler::for_static_shift(steps, 3.0)`]
+//!   (resolution-independent, `exp(mu) = shift`). An unset `scheduler` keeps that byte-exact; a curated
+//!   epic-7114 name re-shapes σ over the same `mu = ln(3)` via [`mlx_gen::resolve_flow_schedule`].
 //! * **Timestep convention.** The unified sampler hands the predict closure `ms.timestep(σ) = σ`
 //!   ([`TimestepConvention::Sigma`]); the SANA trunk embeds the diffusers-scale timestep `σ · 1000`
 //!   (`num_train_timesteps`), so the closure scales it before the forward (identical to SD3's MMDiT).
@@ -61,7 +66,9 @@ pub const LATENT_CHANNELS: i32 = 32;
 pub const SPATIAL_SCALE: u32 = 32;
 /// diffusers `num_train_timesteps` — the SANA trunk embeds `sigma * 1000`.
 pub const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
-/// SANA-1.6B static flow-match shift (`scheduler_config.json` `shift = 3.0`, no dynamic shifting).
+/// SANA-1.6B static flow-match shift (`scheduler_config.json` `flow_shift = 3.0`, no dynamic
+/// shifting). The repo default solver is DPM-Solver; we run flow-match Euler over this shift by
+/// design — see the module doc's Sampler/shift section for why (sc-11760).
 pub const SCHEDULE_SHIFT: f32 = 3.0;
 /// diffusers `SanaPipeline` default `num_inference_steps`.
 pub const DEFAULT_STEPS: usize = 20;
@@ -660,7 +667,8 @@ mod tests {
 
     #[test]
     fn static_shift_schedule_matches_diffusers() {
-        // SANA-1.6B: FlowMatchEulerDiscreteScheduler shift=3.0, no dynamic shifting.
+        // SANA-1.6B: flow-match Euler over flow_shift=3.0, no dynamic shifting (our deliberate
+        // divergence from the repo's DPM-Solver default; see module doc).
         let s = FlowMatchEuler::for_static_shift(4, SCHEDULE_SHIFT);
         let expected = [1.0_f32, 0.9, 0.75, 0.5, 0.0];
         assert_eq!(s.sigmas.len(), 5);
