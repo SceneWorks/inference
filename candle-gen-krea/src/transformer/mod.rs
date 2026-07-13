@@ -277,7 +277,7 @@ impl Krea2Transformer {
     ///
     /// - `latent`: the noise target `[b, 16, H, W]`.
     /// - `refs`: the VAE-encoded reference latents, **each at the target resolution** `[b, 16, H, W]`
-    ///   (they share the target patch grid); fixed order (scene, then person — sc-10878). Empty ⇒
+    ///   (they share the target patch grid); fixed order (image 1, then image 2 — sc-10878). Empty ⇒
     ///   byte-identical to [`forward`](Self::forward) (the rope table falls back to `build_t2i`).
     /// - `context`: the (optionally image-grounded, P2) `[b, n_tokens, num_text_layers, text_hidden]`.
     ///

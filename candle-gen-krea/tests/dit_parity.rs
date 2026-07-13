@@ -162,7 +162,7 @@ fn tiny_dit_config() -> Krea2Config {
 ///     (`build_edit(n_refs=0) ≡ build_t2i`, and `[ctx, target]` == `[ctx, img]`).
 ///  2. **A reference influences the target** — one ref yields the same-shaped, finite velocity that
 ///     *differs* from the base (the in-context tokens actually condition the output).
-///  3. **Two refs** — the scene/person path runs and stays finite + correctly shaped (sc-10878).
+///  3. **Two refs** — the image-1/image-2 path runs and stays finite + correctly shaped (sc-10878).
 #[test]
 fn edit_forward_reduces_to_base_and_refs_influence() -> Result<()> {
     let w = load("dit_golden.safetensors");
@@ -201,7 +201,7 @@ fn edit_forward_reduces_to_base_and_refs_influence() -> Result<()> {
         "a reference must influence the target velocity (Δ={d1:e})"
     );
 
-    // 3. Two references (scene = image 1, person = image 2): runs, correct shape, finite.
+    // 3. Two references (image 1, then image 2): runs, correct shape, finite.
     let ref1 = ((&latent * (-0.3))? + 0.2)?;
     let edit2 = dit.forward_edit(&latent, &timestep, &context, &[ref0, ref1])?;
     assert_eq!(edit2.dims(), base.dims(), "two-ref edit shape");
