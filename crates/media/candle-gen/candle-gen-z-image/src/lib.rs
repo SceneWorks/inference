@@ -85,6 +85,23 @@ pub use base::ZImageBaseGenerator;
 pub use control::{ZImageControl, ZImageControlPaths, ZImageControlRequest, DEFAULT_CONTROL_SCALE};
 pub use edit::{ZImageEdit, ZImageEditPaths, ZImageEditRequest, DEFAULT_EDIT_STRENGTH};
 
+/// Add every registry-owned Candle Z-Image provider to an explicit media registry builder.
+///
+/// Bespoke control/edit utilities remain direct worker integrations and are intentionally absent.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(REGISTRATION)
+        .register_generator(base::REGISTRATION)
+        .register_trainer(training::REGISTRATION)
+}
+
+/// Build the complete explicit Candle Z-Image provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -369,7 +386,7 @@ pub fn load_from_comfyui_components(
 
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
 // `gen_core::load("z_image_turbo", …)` resolve the candle generator — no central match to edit.
-candle_gen::register_generators! { descriptor => load }
+candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 /// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
 /// references nothing in this crate directly, so the linker (MSVC on a release build in particular)
@@ -525,5 +542,43 @@ mod tests {
         assert!(!accel_attn_enabled());
         set_accel_attn(true);
         assert!(accel_attn_enabled());
+    }
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let mut explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_generators: Vec<String> =
+            candle_gen::gen_core::registry::generators()
+                .filter_map(|registration| {
+                    let descriptor = (registration.descriptor)();
+                    (descriptor.family == "z-image" && descriptor.backend == "candle")
+                        .then(|| descriptor.id.to_string())
+                })
+                .collect();
+        explicit_generators.sort();
+        compatibility_generators.sort();
+        assert_eq!(explicit_generators, compatibility_generators);
+        assert_eq!(explicit_generators, ["z_image", "z_image_turbo"]);
+
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_trainers: Vec<String> = candle_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "z-image" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        assert_eq!(explicit_trainers, compatibility_trainers);
+        assert_eq!(explicit_trainers, ["z_image_turbo"]);
     }
 }

@@ -71,6 +71,23 @@ pub use training::{LoraTarget, ZImageTurboTrainer};
 pub use transformer::{ZImageTransformer, ZImageTransformerConfig};
 pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 
+/// Add every Z-Image MLX provider to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_generator(model_base::REGISTRATION)
+        .register_generator(model_base_control::REGISTRATION)
+        .register_generator(model_control::REGISTRATION)
+        .register_trainer(training::REGISTRATION)
+}
+
+/// Build the complete explicit Z-Image MLX provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
 // sc-2963 compiled-glue toggle (rollout of the Wan sc-2957 template): when on, the DiT's fusable
 // elementwise *glue* — the SwiGLU FFN activation (`silu(h1)·h3`), the gated residuals
 // (`x+gate·norm(out)`), the complex RoPE rotation, and the control-branch hint injection
@@ -110,5 +127,52 @@ mod compile_glue_guard_tests {
 
         // Leave the global eager, as the reference-parity gates expect.
         set_compile_glue(false);
+    }
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let mut explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_generators: Vec<String> = mlx_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "z-image" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        explicit_generators.sort();
+        compatibility_generators.sort();
+        assert_eq!(explicit_generators, compatibility_generators);
+        assert_eq!(
+            explicit_generators,
+            [
+                "z_image",
+                "z_image_control",
+                "z_image_turbo",
+                "z_image_turbo_control"
+            ]
+        );
+
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_trainers: Vec<String> = mlx_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                // The imported MLX trainer historically spells its family `z_image` while the
+                // generator descriptors use `z-image`; preserve that serialized identity here.
+                (descriptor.id == "z_image_turbo" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        assert_eq!(explicit_trainers, compatibility_trainers);
+        assert_eq!(explicit_trainers, ["z_image_turbo"]);
     }
 }

@@ -256,7 +256,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 // Link-time self-registration into gen-core's model registry. A distinct id (`z_image`) → no clash
 // with the `z_image_turbo` submission in this same crate (`inventory::submit!` emits anonymous
 // statics). Linking this crate makes `gen_core::load("z_image", …)` resolve the candle base generator.
-candle_gen::register_generators! { descriptor => load }
+candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 #[cfg(test)]
 mod tests {

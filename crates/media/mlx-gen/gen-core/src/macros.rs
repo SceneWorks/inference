@@ -24,6 +24,14 @@ macro_rules! __register_kind {
 /// Register one or more generator descriptors and loaders with the link-time registry.
 #[macro_export]
 macro_rules! register_generators {
+    ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
+        $vis const $name: $crate::registry::ModelRegistration =
+            $crate::registry::ModelRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+            };
+        $crate::inventory::submit! { $name }
+    };
     ( $( $desc:path => $load:path ),+ $(,)? ) => {
         $crate::__register_kind! { $crate::registry::ModelRegistration, $( $desc => $load ),+ }
     };
@@ -32,6 +40,14 @@ macro_rules! register_generators {
 /// Register one or more trainer descriptors and loaders with the link-time registry.
 #[macro_export]
 macro_rules! register_trainer {
+    ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
+        $vis const $name: $crate::registry::TrainerRegistration =
+            $crate::registry::TrainerRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+            };
+        $crate::inventory::submit! { $name }
+    };
     ( $( $desc:path => $load:path ),+ $(,)? ) => {
         $crate::__register_kind! { $crate::registry::TrainerRegistration, $( $desc => $load ),+ }
     };

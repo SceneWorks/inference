@@ -136,7 +136,9 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
 
 // Link-time trainer registration (epic 3720): the macro emits the `inventory::submit!` and bridges
 // the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`.
-mlx_gen::register_trainer! { trainer_descriptor => load_trainer }
+mlx_gen::register_trainer! {
+    pub(crate) const REGISTRATION = trainer_descriptor => load_trainer
+}
 
 /// Recognized `timestep_type` values — the noise-schedule samplers [`sample_sigma`] branches on
 /// (`linear`/`uniform`/`weighted`) plus the `sigmoid` default it falls back to. Any other string
