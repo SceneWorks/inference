@@ -234,14 +234,102 @@ pub fn render(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-
     // Condition encoding (seed-independent): the 12 selected Qwen3-VL hidden layers, stacked +
     // prefix-dropped → the DiT's text_fusion context [1, n_tok, 12, 2560]. CFG-free, B=1.
+    let context = encode_prompt_context(comps, req)?;
+    render_from_context(comps, req, device, &context, on_progress)
+}
+
+/// SPIKE (sc-8596, HELD) — the ComfyUI-Conditioning-Rebalance trick ported to candle: reweight the 12
+/// stacked Qwen3-VL select-layer taps by a per-layer scalar **before** the DiT's `TextFusionTransformer`
+/// aggregates them (layerwise-attn → `projector` num_layers→1 → refiner). This is an "IP-Adapter-LIKE"
+/// steering knob on the *text-only* weights — no new model weights. `weights.len()` must equal the layer
+/// axis (`context.dim(2)` = 12); all-ones is a byte-exact no-op. Krea/Qwen-Image-family specific (depends
+/// on the multi-tap structure); it does NOT generalize to CLIP/T5 encoders. See [`apply_tap_weights`].
+pub fn render_tap_reweight(
+    comps: &Components,
+    req: &GenerationRequest,
+    device: &Device,
+    weights: &[f32],
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let context = encode_prompt_context(comps, req)?;
+    let context = apply_tap_weights(&context, weights)?;
+    render_from_context(comps, req, device, &context, on_progress)
+}
+
+/// SPIKE (sc-8596) — scale each of the stacked select-layer taps of a Krea text context
+/// `[b, n_tok, num_layers, hidden]` by `weights[i]` along the layer axis (axis 2). A `[1,1,num_layers,1]`
+/// broadcast multiply; all-ones reproduces the input bit-for-bit. Errors if `weights.len()` ≠ the layer
+/// axis so a mis-sized sweep vector fails loudly rather than silently truncating.
+pub fn apply_tap_weights(context: &Tensor, weights: &[f32]) -> Result<Tensor> {
+    let n = context.dim(2)?;
+    if weights.len() != n {
+        return Err(CandleError::Msg(format!(
+            "krea tap reweight: {} weights but the context has {n} select layers",
+            weights.len()
+        )));
+    }
+    let w = Tensor::from_vec(weights.to_vec(), (1, 1, n, 1), context.device())?
+        .to_dtype(context.dtype())?;
+    Ok(context.broadcast_mul(&w)?)
+}
+
+/// The GPU-validated-safe range for [`GenerationRequest::text_style_gain`] — the sc-8596 A/B swept
+/// `[0.25, 1.75]` and every point stayed coherent. The engine clamps to this rather than trusting a
+/// caller/UI to bound it.
+const TEXT_STYLE_GAIN_RANGE: (f32, f32) = (0.25, 1.75);
+
+/// Map the single "text style" gain scalar `g` to the per-layer tap ramp `w[i] = g + (2−2g)·i/(n−1)`
+/// (sc-11878, the shipped control over the sc-8596 spike mechanism). `g` is clamped to
+/// [`TEXT_STYLE_GAIN_RANGE`]. `g = 1` yields all-ones (a no-op); `g > 1` emphasizes the early
+/// (low-level) taps (`w[0] = g`, tapering to `w[n−1] = 2−g`), `g < 1` biases the late (semantic) taps.
+/// At `g = 1.75` this reproduces the spike's `early_ramp` (1.75→0.25). `n = 1` degenerates to `[g]`.
+fn tap_gain_weights(gain: f32, n: usize) -> Vec<f32> {
+    let g = gain.clamp(TEXT_STYLE_GAIN_RANGE.0, TEXT_STYLE_GAIN_RANGE.1);
+    if n <= 1 {
+        return vec![g; n];
+    }
+    (0..n)
+        .map(|i| g + (2.0 - 2.0 * g) * (i as f32) / ((n - 1) as f32))
+        .collect()
+}
+
+/// Apply the request's optional [`GenerationRequest::text_style_gain`] to a freshly-encoded positive
+/// context (sc-11878). `None` — or a gain within 1e-4 of 1.0 — returns the context untouched (the
+/// no-op fast path), so plain requests pay nothing. Krea-only: this seam is reached only from the
+/// candle-gen-krea render paths.
+fn maybe_apply_style_gain(context: Tensor, req: &GenerationRequest) -> Result<Tensor> {
+    match req.text_style_gain {
+        Some(g) if (g - 1.0).abs() > 1e-4 => {
+            let n = context.dim(2)?;
+            apply_tap_weights(&context, &tap_gain_weights(g, n))
+        }
+        _ => Ok(context),
+    }
+}
+
+/// Encode the positive prompt to the DiT context and apply the optional text-style gain — the single
+/// seam every txt2img / img2img entry point shares (sc-11878). The negative (CFG-uncond) context is
+/// encoded without the gain, so the knob steers only the conditional prediction (matching the spike).
+fn encode_prompt_context(comps: &Components, req: &GenerationRequest) -> Result<Tensor> {
     let context = comps
         .te
         .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+    maybe_apply_style_gain(context, req)
+}
+
+/// The seed-loop + schedule + decode tail shared by [`render`] and the [`render_tap_reweight`] spike:
+/// everything downstream of the (possibly reweighted) `context` `[1, n_tok, 12, 2560]`.
+fn render_from_context(
+    comps: &Components,
+    req: &GenerationRequest,
+    device: &Device,
+    context: &Tensor,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Native exponential-mu Turbo sigmas are the byte-exact default; a curated scheduler reshapes over
     // the same mu. Raw sigma → DiT timestep, raw velocity → Euler `x + v·(σ_{i+1} − σ_i)`.
@@ -275,7 +363,7 @@ pub fn render(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = comps.dit.forward(x, &t, &context)?;
+                let v = comps.dit.forward(x, &t, context)?;
                 Ok(v.to_dtype(DType::F32)?)
             },
         )?;
@@ -322,9 +410,7 @@ pub fn render_img2img(
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Condition encoding (seed-independent), identical to `render`: img2img changes only the init latent.
-    let context = comps
-        .te
-        .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+    let context = encode_prompt_context(comps, req)?;
 
     let native = turbo_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule(
@@ -406,9 +492,7 @@ pub fn render_base(
 
     // Positive (conditional) condition encoding (seed-independent): the 12 selected Qwen3-VL hidden
     // layers → the DiT's text_fusion context [1, n_tok, 12, 2560].
-    let context = comps
-        .te
-        .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+    let context = encode_prompt_context(comps, req)?;
 
     // Unconditional context, encoded ONLY when CFG is active (reference `cfg = guidance > 0`). An
     // absent / empty negative prompt defaults to `""` (reference `negative_prompts = [""] * n`).
@@ -509,9 +593,7 @@ pub fn render_base_img2img(
 
     // Positive (conditional) condition encoding (seed-independent), identical to `render_base`: img2img
     // changes only the init latent + schedule start, not the conditioning.
-    let context = comps
-        .te
-        .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+    let context = encode_prompt_context(comps, req)?;
 
     // Unconditional context, encoded ONLY when CFG is active (reference `cfg = guidance > 0`). An
     // absent / empty negative prompt defaults to `""` (reference `negative_prompts = [""] * n`).
@@ -995,6 +1077,122 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPIKE (sc-8596): all-ones tap weights are an identity reweight (byte-exact), and a per-layer
+    /// scalar scales exactly its select-layer slice along axis 2.
+    #[test]
+    fn apply_tap_weights_scales_layer_axis() {
+        // context [b=1, n_tok=2, num_layers=3, hidden=2], all ones.
+        let ctx = Tensor::ones((1, 2, 3, 2), DType::F32, &Device::Cpu).unwrap();
+
+        // Identity: all-ones weights reproduce the input.
+        let id = apply_tap_weights(&ctx, &[1.0, 1.0, 1.0]).unwrap();
+        assert_eq!(
+            id.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            ctx.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+
+        // Per-layer scale: layer 0 → 2, layer 1 → 0, layer 2 → 0.5, along axis 2 only.
+        let out = apply_tap_weights(&ctx, &[2.0, 0.0, 0.5]).unwrap();
+        // out[.., layer, ..] equals the weight for that layer (input was all ones).
+        let l0 = out
+            .narrow(2, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let l1 = out
+            .narrow(2, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let l2 = out
+            .narrow(2, 2, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(l0.iter().all(|&x| (x - 2.0).abs() < 1e-6));
+        assert!(l1.iter().all(|&x| x.abs() < 1e-6));
+        assert!(l2.iter().all(|&x| (x - 0.5).abs() < 1e-6));
+    }
+
+    /// sc-11878: the single "text style" gain scalar maps to the validated tap ramp — g=1 is a no-op
+    /// (all ones), g=1.75 reproduces the spike's early_ramp (1.75→0.25), and out-of-range clamps.
+    #[test]
+    fn tap_gain_weights_maps_scalar_to_ramp() {
+        // g = 1 → all ones (no-op).
+        assert_eq!(tap_gain_weights(1.0, 12), vec![1.0; 12]);
+
+        // g = 1.75 → linear ramp 1.75 → 0.25 across 12 taps (the spike's early_ramp).
+        let w = tap_gain_weights(1.75, 12);
+        assert!((w[0] - 1.75).abs() < 1e-6);
+        assert!((w[11] - 0.25).abs() < 1e-6);
+        // Monotonically decreasing, centered on 1.0 at the midpoint.
+        assert!(w.windows(2).all(|p| p[0] > p[1]));
+        assert!((w[0] + w[11] - 2.0).abs() < 1e-6);
+
+        // g = 0.5 → mirror ramp 0.5 → 1.5 (late emphasis).
+        let lo = tap_gain_weights(0.5, 12);
+        assert!((lo[0] - 0.5).abs() < 1e-6);
+        assert!((lo[11] - 1.5).abs() < 1e-6);
+
+        // Clamp: 3.0 → 1.75, 0.0 → 0.25.
+        assert!((tap_gain_weights(3.0, 12)[0] - 1.75).abs() < 1e-6);
+        assert!((tap_gain_weights(0.0, 12)[0] - 0.25).abs() < 1e-6);
+
+        // Degenerate n.
+        assert_eq!(tap_gain_weights(1.5, 1), vec![1.5]);
+    }
+
+    /// `maybe_apply_style_gain` is a no-op for `None` and for a gain within 1e-4 of 1.0, and reweights
+    /// otherwise (byte-identical to the explicit `apply_tap_weights` with the mapped ramp).
+    #[test]
+    fn maybe_apply_style_gain_noop_and_apply() {
+        let ctx = Tensor::ones((1, 2, 12, 4), DType::F32, &Device::Cpu).unwrap();
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // None → untouched.
+        let none = GenerationRequest {
+            text_style_gain: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            flat(&maybe_apply_style_gain(ctx.clone(), &none).unwrap()),
+            flat(&ctx)
+        );
+
+        // g ≈ 1 → untouched (no-op fast path).
+        let unit = GenerationRequest {
+            text_style_gain: Some(1.00005),
+            ..Default::default()
+        };
+        assert_eq!(
+            flat(&maybe_apply_style_gain(ctx.clone(), &unit).unwrap()),
+            flat(&ctx)
+        );
+
+        // g = 1.5 → equals the explicit ramp apply.
+        let g = GenerationRequest {
+            text_style_gain: Some(1.5),
+            ..Default::default()
+        };
+        let got = maybe_apply_style_gain(ctx.clone(), &g).unwrap();
+        let want = apply_tap_weights(&ctx, &tap_gain_weights(1.5, 12)).unwrap();
+        assert_eq!(flat(&got), flat(&want));
+    }
+
+    /// A mis-sized weight vector must fail loudly (not silently truncate/broadcast).
+    #[test]
+    fn apply_tap_weights_rejects_wrong_len() {
+        let ctx = Tensor::ones((1, 2, 3, 2), DType::F32, &Device::Cpu).unwrap();
+        assert!(apply_tap_weights(&ctx, &[1.0, 1.0]).is_err());
+        assert!(apply_tap_weights(&ctx, &[1.0; 4]).is_err());
+    }
 
     /// `image_to_pixels` normalizes an RGB8 image to `[1, 3, H, W]` in `[-1, 1]` and, when the source is
     /// already at the target size, maps pixel `v` → `v/127.5 − 1` per channel with no resample (a mid-gray
