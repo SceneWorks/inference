@@ -286,14 +286,63 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
 }
 
 // Link-time self-registration into gen-core's model registry — both the Large and Turbo ids.
-candle_gen::register_generators! { descriptor => load }
-candle_gen::register_generators! { descriptor_turbo => load_turbo }
-candle_gen::register_generators! { descriptor_medium => load_medium }
+candle_gen::register_generators! {
+    pub(crate) const LARGE_REGISTRATION = descriptor => load
+}
+candle_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+}
+candle_gen::register_generators! {
+    pub(crate) const MEDIUM_REGISTRATION = descriptor_medium => load_medium
+}
 
 /// Force-link hook (see `candle_gen_z_image::force_link`): a consumer that reaches this provider only
 /// through the registry references nothing here directly, so the linker can drop the rlib and its
 /// `inventory::submit!`. Referencing this no-op keeps it linked.
 pub fn force_link() {}
+
+/// Add all Candle SD3 providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(LARGE_REGISTRATION)
+        .register_generator(TURBO_REGISTRATION)
+        .register_generator(MEDIUM_REGISTRATION)
+}
+
+/// Build the complete explicit Candle SD3 provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "stable-diffusion-3" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit = explicit.clone();
+        sorted_explicit.sort();
+        compatibility.sort();
+
+        assert_eq!(sorted_explicit, compatibility);
+        assert_eq!(
+            explicit,
+            ["sd3_5_large", "sd3_5_large_turbo", "sd3_5_medium"]
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

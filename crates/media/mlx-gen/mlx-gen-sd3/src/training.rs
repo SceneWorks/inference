@@ -281,8 +281,10 @@ pub fn load_trainer_medium(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
 // the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`. Both
 // LoRA-training bases register here — Large (plain MMDiT) and Medium (MMDiT-X dual-attention).
 mlx_gen::register_trainer! {
-    trainer_descriptor => load_trainer,
-    medium_trainer_descriptor => load_trainer_medium,
+    pub(crate) const LARGE_TRAINER_REGISTRATION = trainer_descriptor => load_trainer
+}
+mlx_gen::register_trainer! {
+    pub(crate) const MEDIUM_TRAINER_REGISTRATION = medium_trainer_descriptor => load_trainer_medium
 }
 
 /// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,

@@ -368,9 +368,13 @@ fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f3
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Both the true-CFG
 // Large (E5) and the distilled CFG-off Large-Turbo (E6) register here on the shared backbone.
 mlx_gen::register_generators! {
-    descriptor => load,
-    turbo_descriptor => load_turbo,
-    medium_descriptor => load_medium,
+    pub(crate) const LARGE_REGISTRATION = descriptor => load
+}
+mlx_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = turbo_descriptor => load_turbo
+}
+mlx_gen::register_generators! {
+    pub(crate) const MEDIUM_REGISTRATION = medium_descriptor => load_medium
 }
 
 #[cfg(test)]
