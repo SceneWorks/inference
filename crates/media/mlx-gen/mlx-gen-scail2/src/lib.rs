@@ -43,3 +43,36 @@ pub use model::{Scail2Dit, Scail2Inputs};
 pub use preprocess::extract_and_compress_mask_to_latent;
 pub use resize::{clip_preprocess, downsample_half, interpolate, Interp};
 pub use rope::ScailRope;
+
+/// Add the MLX Scail2 provider to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_generator(pipeline::REGISTRATION)
+}
+
+/// Build the complete explicit MLX Scail2 provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility: Vec<String> = mlx_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "scail2" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        assert_eq!(explicit, compatibility);
+        assert_eq!(explicit, ["scail2_14b"]);
+    }
+}

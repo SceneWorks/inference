@@ -51,3 +51,36 @@ pub use pipeline::{descriptor, force_link, load, MODEL_ID};
 pub use preprocess::extract_and_compress_mask_to_latent;
 pub use resize::{clip_preprocess, downsample_half, interpolate, Interp};
 pub use rope::ScailRope;
+
+/// Add the Candle Scail2 provider to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_generator(pipeline::REGISTRATION)
+}
+
+/// Build the complete explicit Candle Scail2 provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "scail2" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        assert_eq!(explicit, compatibility);
+        assert_eq!(explicit, ["scail2_14b"]);
+    }
+}
