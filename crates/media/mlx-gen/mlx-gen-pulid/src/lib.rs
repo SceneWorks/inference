@@ -14,3 +14,37 @@ pub mod ca;
 pub mod eva_clip;
 pub mod idformer;
 pub mod pulid_flux;
+
+/// Add the MLX PuLID-FLUX generator to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_generator(pulid_flux::REGISTRATION)
+}
+
+/// Build the complete explicit MLX PuLID provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility: Vec<String> = mlx_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "pulid" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+
+        assert_eq!(explicit, compatibility);
+        assert_eq!(explicit, ["pulid_flux"]);
+    }
+}
