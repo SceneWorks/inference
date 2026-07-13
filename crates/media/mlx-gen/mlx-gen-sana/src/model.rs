@@ -381,8 +381,10 @@ impl Sana {
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
 mlx_gen::register_generators! {
-    descriptor => load,
-    sprint_descriptor => load_sprint,
+    pub(crate) const BASE_REGISTRATION = descriptor => load
+}
+mlx_gen::register_generators! {
+    pub(crate) const SPRINT_REGISTRATION = sprint_descriptor => load_sprint
 }
 
 #[cfg(test)]
