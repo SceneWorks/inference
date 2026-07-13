@@ -14,13 +14,19 @@ candle-gen-chroma = { path = "../candle-gen-chroma" }
 candle-gen-clip = { path = "../candle-gen-clip" }
 candle-gen-flux = { path = "../candle-gen-flux" }
 candle-gen-flux2 = { path = "../candle-gen-flux2" }
+candle-gen-depth = { path = "../candle-gen-depth" }
+candle-gen-face = { path = "../candle-gen-face" }
 candle-gen-ideogram = { path = "../candle-gen-ideogram" }
+candle-gen-instantid = { path = "../candle-gen-instantid" }
 candle-gen-joycaption = { path = "../candle-gen-joycaption" }
 candle-gen-kolors = { path = "../candle-gen-kolors" }
 candle-gen-krea = { path = "../candle-gen-krea" }
 candle-gen-lens = { path = "../candle-gen-lens" }
 candle-gen-ltx = { path = "../candle-gen-ltx" }
+candle-gen-pid = { path = "../candle-gen-pid" }
+candle-gen-pulid = { path = "../candle-gen-pulid" }
 candle-gen-qwen-image = { path = "../candle-gen-qwen-image" }
+candle-gen-sam3 = { path = "../candle-gen-sam3" }
 candle-gen-sana = { path = "../candle-gen-sana" }
 candle-gen-scail2 = { path = "../candle-gen-scail2" }
 candle-gen-sd3 = { path = "../candle-gen-sd3" }
@@ -42,13 +48,19 @@ metal = [
     "candle-gen-clip/metal",
     "candle-gen-flux/metal",
     "candle-gen-flux2/metal",
+    "candle-gen-depth/metal",
+    "candle-gen-face/metal",
     "candle-gen-ideogram/metal",
+    "candle-gen-instantid/metal",
     "candle-gen-joycaption/metal",
     "candle-gen-kolors/metal",
     "candle-gen-krea/metal",
     "candle-gen-lens/metal",
     "candle-gen-ltx/metal",
+    "candle-gen-pid/metal",
+    "candle-gen-pulid/metal",
     "candle-gen-qwen-image/metal",
+    "candle-gen-sam3/metal",
     "candle-gen-sana/metal",
     "candle-gen-scail2/metal",
     "candle-gen-sd3/metal",
@@ -68,13 +80,19 @@ cuda = [
     "candle-gen-clip/cuda",
     "candle-gen-flux/cuda",
     "candle-gen-flux2/cuda",
+    "candle-gen-depth/cuda",
+    "candle-gen-face/cuda",
     "candle-gen-ideogram/cuda",
+    "candle-gen-instantid/cuda",
     "candle-gen-joycaption/cuda",
     "candle-gen-kolors/cuda",
     "candle-gen-krea/cuda",
     "candle-gen-lens/cuda",
     "candle-gen-ltx/cuda",
+    "candle-gen-pid/cuda",
+    "candle-gen-pulid/cuda",
     "candle-gen-qwen-image/cuda",
+    "candle-gen-sam3/cuda",
     "candle-gen-sana/cuda",
     "candle-gen-scail2/cuda",
     "candle-gen-sd3/cuda",

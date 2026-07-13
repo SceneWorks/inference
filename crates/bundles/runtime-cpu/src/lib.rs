@@ -1,6 +1,12 @@
 //! Supported CPU runtime: explicit Candle media, LLM, and snapshot-preparer catalogs.
 
+pub use candle_gen_catalog::media;
+pub use candle_llm as llm;
 pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
+
+pub mod providers {
+    pub use candle_gen_catalog::providers::*;
+}
 
 pub const PLATFORM: &str = "cpu";
 pub const BACKEND: &str = "candle";
@@ -32,6 +38,7 @@ mod tests {
         assert!(snapshot.generator_ids.len() > 40);
         assert_eq!(snapshot.text_llm_ids, ["candle-llama", "candle-llava"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
+        assert_eq!(candle_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);
         assert_eq!(snapshot.to_json()["platform"], "cpu");
     }
 }

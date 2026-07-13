@@ -4,7 +4,46 @@
 //! stable ordering. Applications should construct one [`ProviderRegistry`] with [`provider_registry`]
 //! and route all media loads through it.
 
+pub use candle_gen as media;
 pub use candle_gen::gen_core::{ProviderRegistry, ProviderRegistryBuilder};
+
+/// Complete backend package surface owned by the Candle runtimes.
+///
+/// Some modules are ordinary registry providers; `depth`, `face`, `instantid`, `pid`, `pulid`, and
+/// `sam3` are intentionally bespoke utilities consumed through provider-specific APIs.
+pub mod providers {
+    pub use candle_gen_anima as anima;
+    pub use candle_gen_bernini as bernini;
+    pub use candle_gen_boogu as boogu;
+    pub use candle_gen_chroma as chroma;
+    pub use candle_gen_clip as clip;
+    pub use candle_gen_depth as depth;
+    pub use candle_gen_face as face;
+    pub use candle_gen_flux as flux;
+    pub use candle_gen_flux2 as flux2;
+    pub use candle_gen_ideogram as ideogram;
+    pub use candle_gen_instantid as instantid;
+    pub use candle_gen_joycaption as joycaption;
+    pub use candle_gen_kolors as kolors;
+    pub use candle_gen_krea as krea;
+    pub use candle_gen_lens as lens;
+    pub use candle_gen_ltx as ltx;
+    pub use candle_gen_pid as pid;
+    pub use candle_gen_pulid as pulid;
+    pub use candle_gen_qwen_image as qwen_image;
+    pub use candle_gen_sam3 as sam3;
+    pub use candle_gen_sana as sana;
+    pub use candle_gen_scail2 as scail2;
+    pub use candle_gen_sd3 as sd3;
+    pub use candle_gen_sdxl as sdxl;
+    pub use candle_gen_seedvr2 as seedvr2;
+    pub use candle_gen_sensenova as sensenova;
+    pub use candle_gen_svd as svd;
+    pub use candle_gen_wan as wan;
+    pub use candle_gen_z_image as z_image;
+}
+
+pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "pulid", "sam3"];
 
 /// Add every provider shipped by the Candle media platform to an explicit registry builder.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {

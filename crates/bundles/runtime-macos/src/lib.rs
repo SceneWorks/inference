@@ -1,6 +1,12 @@
 //! Supported Apple-silicon runtime: explicit MLX media, LLM, and snapshot-preparer catalogs.
 
+pub use mlx_gen_catalog::media;
+pub use mlx_llm as llm;
 pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
+
+pub mod providers {
+    pub use mlx_gen_catalog::providers::*;
+}
 
 pub const PLATFORM: &str = "macos";
 pub const BACKEND: &str = "mlx";
@@ -28,6 +34,7 @@ mod tests {
         assert!(snapshot.generator_ids.len() > 50);
         assert_eq!(snapshot.text_llm_ids, ["mlx-llama", "mlx-joycaption"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
+        assert_eq!(mlx_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);
         assert_eq!(snapshot.to_json()["platform"], "macos");
     }
 }

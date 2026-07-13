@@ -159,6 +159,9 @@ The catalog crates own only selection and ordering. They do not own model
 implementations, duplicate descriptors, or infer membership by scanning the
 workspace. A provider crate existing in the repository does not automatically
 mean it ships in a platform bundle; catalog inclusion is a deliberate decision.
+Provider-specific utilities that do not implement the general registry traits are
+still listed and re-exported by the catalog, making their platform ownership just
+as explicit as an ordinary generator registration.
 
 ### Immutable, value-scoped registries
 

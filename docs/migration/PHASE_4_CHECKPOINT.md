@@ -24,6 +24,11 @@ rejects media descriptor violations, backend mismatches, duplicate provider/prep
 and empty LLM identities. A constructed catalog exposes the exact media, LLM, and preparer
 registries plus a stable JSON-compatible snapshot for release and consumer compatibility checks.
 
+The MLX and Candle platform catalogs also own and re-export provider-specific utility packages that
+do not implement the general `Generator` contract. SAM2/SAM3, face, depth, InstantID, PiD, and the
+Candle PuLID utility therefore have explicit bundle ownership instead of remaining product-side
+dependency exceptions.
+
 ## Explicit LLM composition
 
 `mlx-llm` and `candle-llm` now expose ordinary builder functions for both provider loading and
@@ -71,4 +76,3 @@ global LLM compatibility functions retain the prior routing behavior.
 3. Cut SceneWorks and ChatWorks to named runtime catalogs and compare their provider snapshots.
 4. Remove the LLM `inventory` compatibility layer after the immutable release rollback point no
    longer requires it.
-
