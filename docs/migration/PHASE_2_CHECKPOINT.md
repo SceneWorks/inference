@@ -1,6 +1,7 @@
 # Phase 2 Workspace Normalization Checkpoint
 
-> **Status:** Complete locally; remote publication remains deferred.
+> **Status:** Complete and published. The normalization commits are part of the
+> canonical `SceneWorks/inference` history.
 
 ## Result
 

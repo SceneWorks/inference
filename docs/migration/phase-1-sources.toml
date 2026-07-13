@@ -1,5 +1,5 @@
 schema_version = 1
-status = "locally imported; remote publication pending"
+status = "published; import provenance frozen"
 captured_at = "2026-07-12"
 filter_tool = "git-filter-repo 2.47.0"
 filter_operation = "--to-subdirectory-filter imports/<repository>"
@@ -63,4 +63,3 @@ filtered_subtree = "26790038397b8c45c55a56dd612e52a97847c965"
 tag = "history/candle-gen-tracking-main"
 tree_match = true
 note = "Preserved but not merged into the compatibility baseline main tree."
-

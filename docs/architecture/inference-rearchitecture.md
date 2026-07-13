@@ -77,7 +77,7 @@ The rearchitecture was intended to:
 
 The change was not intended to:
 
-- collapse 69 packages into a single crate;
+- collapse the workspace into a single crate;
 - merge MLX and Candle implementations behind a lowest-common-denominator engine;
 - introduce a stable dynamic-plugin ABI or load third-party code at runtime;
 - move every provider into a new model-first directory layout;

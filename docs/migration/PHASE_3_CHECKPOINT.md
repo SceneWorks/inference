@@ -1,8 +1,8 @@
 # Phase 3 Release Train Checkpoint
 
-> **Status:** Implemented and validated locally; hosted platform execution,
-> repository publication, and the tagged release-candidate exit gate remain
-> deferred.
+> **Status:** Implemented and published. Hosted Linux/macOS execution is active;
+> the immutable runtime tag and self-hosted CUDA/NAX/real-weight evidence remain
+> release gates.
 
 ## Result
 
@@ -26,10 +26,10 @@ Runtime tags use `runtime-YYYY.MM.patch[-rc.N]`. The release builder derives all
 identity from a committed revision and emits:
 
 - a deterministic `tar.gz` source archive with a single versioned root;
-- `runtime-manifest.json` with 67 workspace packages, the Rust toolchain, lockfile
+- `runtime-manifest.json` with 74 workspace packages, the Rust toolchain, lockfile
   hash, and exact Candle/MLX Git revisions;
-- an SPDX 2.3 JSON SBOM containing all 449 cross-platform lockfile packages and
-  1,576 describe/dependency relationships;
+- an SPDX 2.3 JSON SBOM containing all 455 cross-platform lockfile packages and
+  1,608 describe/dependency relationships;
 - `SHA256SUMS` covering the manifest, source archive, and SBOM.
 
 The clean dry run `runtime-2026.07.0-rc.0` at
@@ -37,6 +37,10 @@ The clean dry run `runtime-2026.07.0-rc.0` at
 archive. Its verification safely extracted the archive and compiled an external
 Cargo consumer against the archived `core-llm` and `sceneworks-gen-core` paths.
 The dry-run tag was an artifact label only; no Git tag was created.
+
+The subsequent clean metadata/SBOM release gate `runtime-2026.07.0-rc.1` at
+`05584c6b13e08f653fe9896422ca22dd618ede98` passed with the current 74-package
+workspace and 455-package cross-platform lockfile. It likewise created no Git tag.
 
 ## Supply-chain policy
 
@@ -83,12 +87,17 @@ The following pass from the repository root:
 - safe source-archive extraction and external-consumer compilation;
 - the Phase 2 workspace gate and `git diff --check`.
 
-## Remaining Phase 3 exit gates
+GitHub Actions run [`29272581805`](https://github.com/SceneWorks/inference/actions/runs/29272581805)
+passed the complete hosted matrix at `05584c6b13e08f653fe9896422ca22dd618ede98`: repository
+documentation, contracts, Linux Candle CPU, macOS MLX/Candle Metal, dependency policy, workspace
+invariants, and release metadata/SBOM.
 
-1. Publish the repository and run the hosted Linux/macOS lanes.
+## Publication outcome and remaining release gates
+
+1. Repository publication and hosted Linux/macOS execution are complete.
 2. Configure the self-hosted Windows/CUDA and real-weight runner variables, then
    execute those matrices against the pinned snapshots.
-3. Create an immutable release-candidate tag only after those jobs pass.
+3. Create the immutable runtime tag only after those jobs pass.
 4. Rebuild and upload the tagged source/SBOM bundle, then verify its hashes.
 
 Product cutover and provider-registry refactoring remain later phases; this phase

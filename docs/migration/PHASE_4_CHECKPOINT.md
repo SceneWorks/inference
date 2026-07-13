@@ -55,6 +55,14 @@ The following passed from the repository root:
 - repository tooling and bundle lane-selection tests;
 - all `core-llm`, `candle-llm`, and `mlx-llm` library tests;
 - `runtime-cpu` and `runtime-macos` catalog smoke tests and doc tests;
+- the exact manual NAX command on macOS 26.5.2 / arm64 / Metal 32023.883: 174 `mlx-llm`
+  tests passed with one slow case ignored, plus complete and LLM-only `runtime-macos` catalog tests;
+- real-weight MLX LLM conformance with the pinned SmolLM2 135M snapshot at revision
+  `12fd25f77366fa6b3b4b768ec3050bf629380bac` and Qwen3 0.6B snapshot at revision
+  `c1899de289a04d12100db370d81485cdf75e47ca`;
+- real-weight Z-Image-Turbo generator conformance with the pinned snapshot at revision
+  `f332072aa78be7aecdf3ee76d5c247082da564a6`, including progress, typed cancellation,
+  pre-cancellation, and seed-determinism checks;
 - Clippy with `-D warnings` for the CPU and macOS bundle graphs;
 - the complete pre-bundle Candle CPU lane and contract suites recorded in the post-import
   reconciliation checkpoint.
@@ -71,6 +79,7 @@ the source-level compatibility rollback point; the release itself has no hidden 
 
 ## Remaining Phase 4 exit gates
 
-1. Run `runtime-macos` on the hosted macOS lane and the macOS 26.2+ NAX runner.
+1. Run the checked-in workflow on the macOS 26.2+ NAX runner; the hosted macOS lane and the exact
+   local NAX command already pass.
 2. Build and test `runtime-cuda` on the self-hosted CUDA runner.
 3. Publish the immutable runtime release and validate the final SceneWorks and ChatWorks pins.
