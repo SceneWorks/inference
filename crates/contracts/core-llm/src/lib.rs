@@ -70,7 +70,7 @@ pub use prepare::{
 };
 pub use registry::{
     load_for_model, load_for_model_with, load_textllm, textllms, ModelRequirements,
-    TextLlmRegistration,
+    TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
 pub use schedule::{Scheduler, SeqId, SeqSpec};

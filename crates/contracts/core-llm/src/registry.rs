@@ -22,6 +22,7 @@ use crate::text_llm::TextLlm;
 
 /// A registered provider: how to describe it (cheap), whether it can serve a given model (cheap,
 /// weightless), and how to load it (loads weights).
+#[derive(Clone, Copy)]
 pub struct TextLlmRegistration {
     /// Build the provider's descriptor without loading weights.
     pub descriptor: fn() -> TextLlmDescriptor,
@@ -55,6 +56,103 @@ pub struct TextLlmRegistration {
 }
 
 inventory::collect!(TextLlmRegistration);
+
+/// Builder for an ordinary, explicit LLM provider registry.
+///
+/// Unlike the process-global [`inventory`] registry, this value contains exactly the providers a
+/// caller adds, in a deterministic order. Platform bundle crates use it to make provider ownership
+/// visible and testable while the existing global APIs remain available as compatibility adapters.
+#[derive(Default)]
+pub struct TextLlmRegistryBuilder {
+    registrations: Vec<TextLlmRegistration>,
+}
+
+impl TextLlmRegistryBuilder {
+    /// Start an empty explicit registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a provider registration, preserving insertion order for model-first tie-breaking.
+    pub fn register(mut self, registration: TextLlmRegistration) -> Self {
+        self.registrations.push(registration);
+        self
+    }
+
+    /// Add several provider registrations in iterator order.
+    pub fn extend(mut self, registrations: impl IntoIterator<Item = TextLlmRegistration>) -> Self {
+        self.registrations.extend(registrations);
+        self
+    }
+
+    /// Validate uniqueness and produce the immutable registry.
+    ///
+    /// Duplicate ids fail here in every build profile; an explicit bundle never inherits the
+    /// inventory registry's historical debug-only, first-wins behavior.
+    pub fn build(self) -> Result<TextLlmRegistry> {
+        let mut ids = std::collections::BTreeSet::new();
+        for registration in &self.registrations {
+            let id = (registration.descriptor)().id;
+            if !ids.insert(id.clone()) {
+                return Err(Error::Msg(format!(
+                    "duplicate textllm id '{id}' in explicit registry"
+                )));
+            }
+        }
+        Ok(TextLlmRegistry {
+            registrations: self.registrations.into_boxed_slice(),
+        })
+    }
+
+    /// Copy every currently linked inventory registration into an explicit registry.
+    ///
+    /// This is the compatibility bridge used to compare old and new catalog snapshots during the
+    /// incremental migration. New platform bundles should list their registrations directly.
+    pub fn from_inventory() -> Self {
+        Self::new().extend(textllms().copied())
+    }
+}
+
+/// An immutable, explicit collection of LLM providers.
+pub struct TextLlmRegistry {
+    registrations: Box<[TextLlmRegistration]>,
+}
+
+impl TextLlmRegistry {
+    /// Iterate the registry in deterministic insertion order.
+    pub fn registrations(&self) -> impl ExactSizeIterator<Item = &TextLlmRegistration> {
+        self.registrations.iter()
+    }
+
+    /// Look up a provider by descriptor id.
+    pub fn find(&self, id: &str) -> Option<&TextLlmRegistration> {
+        self.registrations()
+            .find(|registration| (registration.descriptor)().id == id)
+    }
+
+    /// Load a provider by id.
+    pub fn load_textllm(&self, id: &str, spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
+        let registration = self
+            .find(id)
+            .ok_or_else(|| Error::Msg(format!("no textllm registered for id '{id}'")))?;
+        (registration.load)(spec)
+    }
+
+    /// Select and load a provider from the model snapshot with no additional capability needs.
+    pub fn load_for_model(&self, spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
+        self.load_for_model_with(spec, &ModelRequirements::default())
+    }
+
+    /// Select and load a provider from the model snapshot with explicit capability requirements.
+    pub fn load_for_model_with(
+        &self,
+        spec: &LoadSpec,
+        requirements: &ModelRequirements,
+    ) -> Result<Box<dyn TextLlm>> {
+        let registration = select(self.registrations(), spec, requirements)?;
+        (registration.load)(spec)
+    }
+}
 
 /// What a caller needs a provider to support, used to disambiguate when more than one registered
 /// provider accepts a model (e.g. a text and a vision provider both serve a multimodal snapshot).
@@ -479,6 +577,38 @@ mod tests {
     ) -> Result<String> {
         let spec = LoadSpec::dense("/no/such/snapshot");
         select(regs.iter().copied(), &spec, reqs).map(|r| (r.descriptor)().id)
+    }
+
+    #[test]
+    fn explicit_registry_routes_without_global_inventory() {
+        let registry = TextLlmRegistryBuilder::new()
+            .register(reg(text_desc, yes))
+            .register(reg(vision_desc, no))
+            .build()
+            .unwrap();
+        assert_eq!(registry.registrations().len(), 2);
+        assert_eq!(
+            (registry.find("text").unwrap().descriptor)().backend,
+            "test"
+        );
+        assert!(registry.find("missing").is_none());
+        registry
+            .load_for_model(&LoadSpec::dense("/no/such/snapshot"))
+            .unwrap();
+    }
+
+    #[test]
+    fn explicit_registry_rejects_duplicate_ids_deterministically() {
+        let error = TextLlmRegistryBuilder::new()
+            .register(reg(text_desc, yes))
+            .register(reg(text_desc, yes))
+            .build()
+            .err()
+            .expect("duplicate registry must fail");
+        assert_eq!(
+            error.to_string(),
+            "duplicate textllm id 'text' in explicit registry"
+        );
     }
 
     #[test]
