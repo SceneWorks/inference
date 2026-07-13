@@ -495,9 +495,13 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 // Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
 mlx_gen::register_generators! {
-    descriptor => load,
-    descriptor_turbo => load_turbo,
-    descriptor_edit => load_edit,
+    pub(crate) const BASE_REGISTRATION = descriptor => load
+}
+mlx_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+}
+mlx_gen::register_generators! {
+    pub(crate) const EDIT_REGISTRATION = descriptor_edit => load_edit
 }
 
 #[cfg(test)]
