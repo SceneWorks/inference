@@ -469,8 +469,20 @@ opt-level = 3
 # gen-core-testkit/` is EMPTY (gen-core BYTE-IDENTICAL), so candle-gen compiles UNCHANGED; pure
 # rev-alignment so the worker's skew gate resolves ONE gen-core rev (d2f3201) across mlx-gen + candle-gen.
 # NB: d2f3201 is the mlx-gen #708 BRANCH head — flip to the squashed mlx-gen main SHA once #708 merges.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "b8c415261a9fc6a2409a8ffc989881f0e6a3c99b" }
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "b8c415261a9fc6a2409a8ffc989881f0e6a3c99b" }
+# Rev b8c4152 -> b568fdb (mlx-gen sc-11126 / PR #709, main-merged in #710, epic 11120): gen-core gains
+# `Capabilities.supports_sequential_offload: bool` + the additive `Progress::Loading(LoadPhase)` variant
+# (the mlx-gen half of the Sequential-residency discovery contract). candle-gen adopts the field on all
+# 24 `Capabilities` literals (sc-11794): `true` on the three candle providers that wire the per-provider
+# `render_sequential` load->use->drop residency seam (flux sc-10821 / flux2 sc-10868 / qwen-image
+# sc-10867), `false` elsewhere — an independent audit, NOT a copy of mlx-gen's `true` set (mlx advertises
+# more because it wired a *shared* Residency seam onto those families; candle has not). `Progress::Loading`
+# is additive/non-breaking for candle lib code (emit-only, no exhaustive match); the exhaustive example
+# `match`es gain a no-op `Progress::Loading(_)` arm. This is the rev the SceneWorks worker will pin to pick
+# up Krea Q4/Q8 pose-control base (sc-11730); candle-gen catches up first so `check-gen-core-skew.sh
+# --features backend-candle` resolves ONE gen-core rev (the sc-10839 / candle-gen #404 lockstep). Both
+# lines below move as one.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "b568fdbfd7cfe3cc6c93dc836c2bd92b348ab2b7" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "b568fdbfd7cfe3cc6c93dc836c2bd92b348ab2b7" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels

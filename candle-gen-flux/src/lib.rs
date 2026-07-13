@@ -323,6 +323,10 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supported_quants: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // `generate` routes through `render_sequential` under `OffloadPolicy::Sequential`
+            // (load→encode→drop the T5/CLIP text stack before the DiT), so requesting Sequential
+            // genuinely bounds peak VRAM here rather than being a no-op fallback (sc-11126, sc-10821).
+            supports_sequential_offload: true,
         },
     }
 }

@@ -695,6 +695,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
+            // No candle `render_sequential` residency seam wired (sc-11126); Sequential falls back to
+            // Resident (no-op) here, so don't over-advertise it.
+            supports_sequential_offload: false,
         },
     }
 }

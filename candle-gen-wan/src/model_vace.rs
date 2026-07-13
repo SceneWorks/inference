@@ -384,6 +384,9 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[] as &[Quant],
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // No candle `render_sequential` residency seam wired (sc-11126); Sequential falls back to
+            // Resident (no-op) here, so don't over-advertise it.
+            supports_sequential_offload: false,
         },
     }
 }

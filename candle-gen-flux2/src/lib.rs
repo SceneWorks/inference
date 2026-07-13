@@ -826,6 +826,10 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             supports_kv_cache: false,
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
+            // `generate` routes through `render_sequential` under `OffloadPolicy::Sequential`
+            // (load→encode→drop each heavy component), so requesting Sequential genuinely bounds peak
+            // VRAM here rather than being a no-op fallback (sc-11126, sc-10868).
+            supports_sequential_offload: true,
         },
     }
 }

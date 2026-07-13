@@ -128,6 +128,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_kv_cache: true,
             // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
             requires_sigma_shift: true,
+            // No candle `render_sequential` residency seam wired (sc-11126); Sequential falls back to
+            // Resident (no-op) here, so don't over-advertise it.
+            supports_sequential_offload: false,
         },
     }
 }

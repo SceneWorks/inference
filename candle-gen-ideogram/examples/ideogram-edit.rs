@@ -157,6 +157,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Progress::Decoding => println!("  decoding ({:.1}s)", t0.elapsed().as_secs_f32()),
+        // Additive Sequential-residency load signal (sc-11126); no-op in this smoke example.
+        Progress::Loading(_) => {}
     };
 
     let GenerationOutput::Images(images) = gen.generate(&req, &mut on_progress)? else {
