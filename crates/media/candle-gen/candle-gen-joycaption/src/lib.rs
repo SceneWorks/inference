@@ -315,10 +315,43 @@ fn map_finish(f: core_llm::FinishReason) -> CaptionFinishReason {
     }
 }
 
-candle_gen::register_captioner! { descriptor => load }
+candle_gen::register_captioner! { pub(crate) const REGISTRATION = descriptor => load }
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
 pub fn force_link() {}
+
+/// Add the Candle JoyCaption provider to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_captioner(REGISTRATION)
+}
+
+/// Build the complete explicit Candle JoyCaption provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .captioners()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility: Vec<String> = candle_gen::gen_core::registry::captioners()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "joycaption" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        assert_eq!(explicit, compatibility);
+        assert_eq!(explicit, ["fancyfeast/llama-joycaption-beta-one-hf-llava"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

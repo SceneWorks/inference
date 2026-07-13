@@ -312,8 +312,61 @@ pub fn load_text(spec: &LoadSpec) -> Result<Box<dyn TextEmbedder>> {
 
 // Link-time registration: the macros emit `gen_core`'s `inventory::submit!`s and bridge the crate
 // `Result` into `gen_core::Result` via `Into::into`, so no hand-written adapter is needed (sc-7786).
-candle_gen::register_image_embedder! { descriptor => load }
-candle_gen::register_text_embedder! { text_descriptor => load_text }
+candle_gen::register_image_embedder! {
+    pub(crate) const IMAGE_REGISTRATION = descriptor => load
+}
+candle_gen::register_text_embedder! {
+    pub(crate) const TEXT_REGISTRATION = text_descriptor => load_text
+}
+
+/// Add the Candle CLIP providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_image_embedder(IMAGE_REGISTRATION)
+        .register_text_embedder(TEXT_REGISTRATION)
+}
+
+/// Build the complete explicit Candle CLIP provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_images: Vec<String> = registry
+            .image_embedders()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_images: Vec<String> = candle_gen::gen_core::registry::image_embedders()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "image-embed" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let explicit_text: Vec<String> = registry
+            .text_embedders()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_text: Vec<String> = candle_gen::gen_core::registry::text_embedders()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "text-embed" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+
+        assert_eq!(explicit_images, compatibility_images);
+        assert_eq!(explicit_images, ["clip_vit_l14"]);
+        assert_eq!(explicit_text, compatibility_text);
+        assert_eq!(explicit_text, ["clip_vit_l14_text"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

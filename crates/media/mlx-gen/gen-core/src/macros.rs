@@ -56,6 +56,14 @@ macro_rules! register_trainer {
 /// Register one or more captioner descriptors and loaders with the link-time registry.
 #[macro_export]
 macro_rules! register_captioner {
+    ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
+        $vis const $name: $crate::registry::CaptionerRegistration =
+            $crate::registry::CaptionerRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+            };
+        $crate::inventory::submit! { $name }
+    };
     ( $( $desc:path => $load:path ),+ $(,)? ) => {
         $crate::__register_kind! { $crate::registry::CaptionerRegistration, $( $desc => $load ),+ }
     };
@@ -64,6 +72,14 @@ macro_rules! register_captioner {
 /// Register one or more image-embedder descriptors and loaders with the link-time registry.
 #[macro_export]
 macro_rules! register_image_embedder {
+    ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
+        $vis const $name: $crate::registry::ImageEmbedderRegistration =
+            $crate::registry::ImageEmbedderRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+            };
+        $crate::inventory::submit! { $name }
+    };
     ( $( $desc:path => $load:path ),+ $(,)? ) => {
         $crate::__register_kind! {
             $crate::registry::ImageEmbedderRegistration, $( $desc => $load ),+
@@ -74,6 +90,14 @@ macro_rules! register_image_embedder {
 /// Register one or more text-embedder descriptors and loaders with the link-time registry.
 #[macro_export]
 macro_rules! register_text_embedder {
+    ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
+        $vis const $name: $crate::registry::TextEmbedderRegistration =
+            $crate::registry::TextEmbedderRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+            };
+        $crate::inventory::submit! { $name }
+    };
     ( $( $desc:path => $load:path ),+ $(,)? ) => {
         $crate::__register_kind! {
             $crate::registry::TextEmbedderRegistration, $( $desc => $load ),+
