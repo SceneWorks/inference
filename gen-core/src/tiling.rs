@@ -46,6 +46,16 @@ impl VaeTiling {
         temporal_scale: 4,
         causal_temporal: true,
     };
+    /// Qwen-Image `AutoencoderKLQwenImage` VAE (sc-11747): a still-image VAE — spatial ×8, and the
+    /// temporal axis is a **singleton** (T=1), so `temporal_scale: 1` non-causal makes the temporal
+    /// axis a no-op (`out_f = f = 1`) while the spatial ×8 upsample drives the H/W tiling. Used by the
+    /// Krea 2 pose-control decode (and reusable by the Qwen txt2img/edit lanes) to bound the
+    /// end-of-generation decode spike on a 32 GB Mac.
+    pub const QWEN_IMAGE: Self = Self {
+        spatial_scale: 8,
+        temporal_scale: 1,
+        causal_temporal: false,
+    };
 }
 
 /// Per-frame spatial tiling (tile + overlap in **output pixels**).

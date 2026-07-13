@@ -32,6 +32,7 @@ use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler, CancelFlag, LatentDecoder, Progress, Result,
     TimestepConvention,
@@ -332,8 +333,10 @@ impl KreaHeavy {
     ) -> Result<Image> {
         // Single-image convenience; the count loop in [`crate::model_control`] calls `prepare_control`
         // + `render_control_from` directly so the pose encode + prep are shared across seeds (F-073).
+        // This convenience path (KreaPipeline delegator + weight-gated tests) always decodes single-pass
+        // (`None`); the budget-gated tiled decode is threaded by the `Generator` seam (`model_control`).
         let plan = self.prepare_control(context, control_image, opts.width, opts.height)?;
-        self.render_control_from(&plan, branch, control_scale, opts, cancel, on_progress)
+        self.render_control_from(&plan, branch, control_scale, None, opts, cancel, on_progress)
     }
 
     /// Build the **count-invariant** pose-control plan (F-073): the step-invariant text prep AND the
@@ -363,12 +366,18 @@ impl KreaHeavy {
     }
 
     /// **Pose-control render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
-    /// [`ControlPlan`]. Byte-identical to the pre-hoist [`Self::render_turbo_control`].
+    /// [`ControlPlan`]. Byte-identical to the pre-hoist [`Self::render_turbo_control`] on the denoise
+    /// path; `decode_tiling` (sc-11747) selects the decode: `Some(cfg)` runs the memory-bounded tiled
+    /// Qwen-VAE decode (the 32 GB-Mac lever), `None` the single-pass decode (a machine with headroom, or
+    /// the convenience/test path). The tiled decode reconstructs the untiled image within blend
+    /// tolerance, so the pose-locked output is unchanged — only the decode peak drops.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_control_from(
         &self,
         plan: &ControlPlan,
         branch: &Krea2ControlBranch,
         control_scale: f32,
+        decode_tiling: Option<&TilingConfig>,
         opts: &TurboOptions,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -398,7 +407,7 @@ impl KreaHeavy {
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, None)
+        self.decode_latents_native_tiled(&lat, decode_tiling, cancel)
     }
 
     /// **img2img latent-init Turbo render** (epic 8588 slice A; sc-8589/sc-8590) — the denoise/decode
@@ -833,6 +842,27 @@ impl KreaHeavy {
     fn decode_latents(&self, lat: &Array, decoder: Option<&dyn LatentDecoder>) -> Result<Image> {
         let dec: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
         let decoded = dec.decode(lat)?.as_dtype(Dtype::Float32)?;
+        decoded_to_image(&decoded)
+    }
+
+    /// Decode a latent through the **native Qwen-VAE**, memory-bounded by tiling when `decode_tiling` is
+    /// `Some` (sc-11747). The control lane never routes a PiD decoder (the pose lane is native-VAE only),
+    /// so this is the control decode seam: `Some(cfg)` runs [`QwenVae::decode_tiled`] (the tiled decode
+    /// selected by the budget gate), `None` the single-pass [`QwenVae::decode`]. Same
+    /// `decoded_to_image` post-step (`clip(x·0.5 + 0.5, 0, 1)`, dropping the singleton temporal axis) as
+    /// [`Self::decode_latents`], so a tiled and an untiled decode yield the same image up to the blend
+    /// tolerance. `cancel` lets the tiled decode abort between tiles.
+    fn decode_latents_native_tiled(
+        &self,
+        lat: &Array,
+        decode_tiling: Option<&TilingConfig>,
+        cancel: &CancelFlag,
+    ) -> Result<Image> {
+        let decoded = match decode_tiling {
+            Some(cfg) => self.vae.decode_tiled(lat, cfg, Some(cancel))?,
+            None => self.vae.decode(lat)?,
+        }
+        .as_dtype(Dtype::Float32)?;
         decoded_to_image(&decoded)
     }
 }

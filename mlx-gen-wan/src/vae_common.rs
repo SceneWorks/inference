@@ -4,8 +4,7 @@
 //! channel axis at different positions) stay with their respective modules.
 
 use mlx_gen::tiling::TilePlan;
-use mlx_gen::{CancelFlag, Error, Result};
-use mlx_rs::ops::{add, divide, maximum, multiply, pad};
+use mlx_gen::{CancelFlag, Result};
 use mlx_rs::Array;
 
 /// A length-1 `f32` array, used as a broadcastable scalar operand in MLX ops.
@@ -60,27 +59,16 @@ impl FeatCache {
     }
 }
 
-/// `[1; 5]` with `len` placed at `axis` — a 1-D blend mask reshaped to broadcast along its own axis.
-fn axis_shape(axis: i32, len: i32) -> [i32; 5] {
-    let mut s = [1i32; 5];
-    s[axis as usize] = len;
-    s
-}
-
 /// The trapezoidally-blended tile-accumulate loop shared by both VAEs' `decode_tiled`. Slices each
 /// overlapping tile out of `denorm`, decodes it via the layout-specific `decode_tile` closure
 /// (conv2 → decoder → optional unpatchify → clamp), trapezoidally blends along the three tiled axes,
 /// and accumulates into the full output. `axes` are the `[t, h, w]` axis indices for the layout
-/// (`[2, 3, 4]` for NCTHW z16, `[1, 2, 3]` for channels-last z48); the mask shapes and pad
-/// placements derive from those indices, so the only per-layout input is the closure.
+/// (`[2, 3, 4]` for NCTHW z16, `[1, 2, 3]` for channels-last z48).
 ///
-/// `denorm` is the already-denormalized latent; `plan` comes from
-/// [`TilingConfig::plan`](mlx_gen::tiling::TilingConfig::plan). The reference's per-tile `mx.eval`
-/// (bounding the lazy graph + peak memory) is preserved.
-///
-/// `cancel` is the cooperative cancellation handle (F-014): the z48 decode is ~95% of a Lightning
-/// render's wall-clock (sc-4998), so a cancel is checked between tiles and returns [`Error::Canceled`].
-/// The per-tile `eval` already forces materialization, so the check observes the trip promptly.
+/// The slice/blend/pad/accumulate/normalize loop itself is the backend-shared
+/// [`mlx_gen::vae_tiling::tiled_decode`] (lifted there in sc-11747 so the Qwen-Image still-image VAE
+/// reuses the exact same seam-artifact-free implementation, not a per-crate copy); this thin wrapper
+/// keeps the wan call sites (`vae.rs`, `vae22.rs`) and their tests pointed at `crate::vae_common`.
 pub(crate) fn tile_decode_accumulate(
     denorm: &Array,
     plan: &TilePlan,
@@ -88,64 +76,7 @@ pub(crate) fn tile_decode_accumulate(
     cancel: Option<&CancelFlag>,
     decode_tile: impl Fn(&Array) -> Result<Array>,
 ) -> Result<Array> {
-    let [t_ax, h_ax, w_ax] = axes;
-    let mut output: Option<Array> = None;
-    let mut weights: Option<Array> = None;
-    for t in &plan.t {
-        for hh in &plan.h {
-            for ww in &plan.w {
-                if cancel.is_some_and(CancelFlag::is_cancelled) {
-                    return Err(Error::Canceled);
-                }
-                let tile = slice_axis(denorm, t_ax, t.start, t.end)?;
-                let tile = slice_axis(&tile, h_ax, hh.start, hh.end)?;
-                let tile = slice_axis(&tile, w_ax, ww.start, ww.end)?;
-                let dec = decode_tile(&tile)?;
-
-                let ds = dec.shape();
-                let at = ds[t_ax as usize].min(t.out_stop - t.out_start);
-                let ah = ds[h_ax as usize].min(hh.out_stop - hh.out_start);
-                let aw = ds[w_ax as usize].min(ww.out_stop - ww.out_start);
-
-                // 1-D masks → outer product, each broadcasting along its own (t/h/w) axis.
-                let tm = Array::from_slice(&t.mask[..at as usize], &axis_shape(t_ax, at));
-                let hm = Array::from_slice(&hh.mask[..ah as usize], &axis_shape(h_ax, ah));
-                let wm = Array::from_slice(&ww.mask[..aw as usize], &axis_shape(w_ax, aw));
-                let blend = multiply(&multiply(&tm, &hm)?, &wm)?;
-
-                let dec = slice_axis(&dec, t_ax, 0, at)?;
-                let dec = slice_axis(&dec, h_ax, 0, ah)?;
-                let dec = slice_axis(&dec, w_ax, 0, aw)?;
-                let weighted = multiply(&dec, &blend)?;
-
-                // Place at the (out_start) offsets by zero-padding to the full output shape.
-                let mut pads = [(0, 0); 5];
-                pads[t_ax as usize] = (t.out_start, plan.out_f - (t.out_start + at));
-                pads[h_ax as usize] = (hh.out_start, plan.out_h - (hh.out_start + ah));
-                pads[w_ax as usize] = (ww.out_start, plan.out_w - (ww.out_start + aw));
-                let weighted_full = pad(&weighted, &pads[..], None, None)?;
-                let blend_full = pad(&blend, &pads[..], None, None)?;
-
-                output = Some(match output {
-                    None => weighted_full,
-                    Some(acc) => add(&acc, &weighted_full)?,
-                });
-                weights = Some(match weights {
-                    None => blend_full,
-                    Some(acc) => add(&acc, &blend_full)?,
-                });
-                // Bound the lazy graph + peak memory (the reference's per-tile `mx.eval`).
-                output.as_ref().unwrap().eval()?;
-                weights.as_ref().unwrap().eval()?;
-            }
-        }
-    }
-
-    let output =
-        output.ok_or_else(|| Error::Msg("wan vae: tile-decode plan had no tiles".into()))?;
-    let weights =
-        weights.ok_or_else(|| Error::Msg("wan vae: tile-decode plan had no tiles".into()))?;
-    contiguous(&divide(&output, &maximum(&weights, scalar(1e-8))?)?)
+    mlx_gen::vae_tiling::tiled_decode(denorm, plan, axes, cancel, decode_tile)
 }
 
 #[cfg(test)]
@@ -238,7 +169,7 @@ mod tests {
         let res =
             tile_decode_accumulate(&denorm, &plan, [2, 3, 4], Some(&cancel), |t| Ok(t.clone()));
         assert!(
-            matches!(res, Err(Error::Canceled)),
+            matches!(res, Err(mlx_gen::Error::Canceled)),
             "a pre-tripped cancel must abort the tiled decode with Error::Canceled"
         );
     }
