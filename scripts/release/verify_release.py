@@ -93,7 +93,7 @@ def smoke_source_archive(bundle: Path, manifest: dict, offline: bool) -> None:
         source_root = temp / prefix.rstrip("/")
         consumer = temp / "consumer"
         (consumer / "src").mkdir(parents=True)
-        dependency = (source_root / "crates/media/mlx-gen/gen-core").as_posix()
+        dependency = (source_root / "crates/contracts/gen-core").as_posix()
         (consumer / "Cargo.toml").write_text(
             "[package]\n"
             'name = "inference-release-smoke"\n'

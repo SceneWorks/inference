@@ -8,7 +8,7 @@ bundles.
 
 This repository was assembled from the existing `core-llm`, `mlx-llm`,
 `candle-llm`, `mlx-gen`, and `candle-gen` histories. Phase 1 preserved and
-verified those histories; Phase 2 has moved all 67 packages into their ownership
+verified those histories; Phase 2 moved the imported packages into their ownership
 paths and normalized them under one Cargo workspace and lockfile. Phase 3 now
 provides dependency-aware CI selection, supply-chain policy, immutable real-weight
 fixture pins, and deterministic source/SBOM release tooling.

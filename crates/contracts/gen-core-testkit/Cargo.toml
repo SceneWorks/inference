@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Contract conformance suite for gen-core providers (cancel/progress/seed/capabilities). Zero tensor deps — runs against any Box<dyn Generator>, MLX or candle."
 license = "Apache-2.0"
-repository = "https://github.com/michaeltrefry/mlx-gen"
+repository = "https://github.com/SceneWorks/inference"
 keywords = ["diffusion", "inference", "generative", "contract", "testing"]
 categories = ["science"]
 

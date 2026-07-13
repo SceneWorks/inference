@@ -43,10 +43,10 @@ mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/
 # Backend-neutral contract layer (epic 3720). Workspace member; mlx-gen re-exports it so the old
 # `mlx_gen::…` paths keep resolving. Family crates depend on it for `gen_core::Result` at the
 # contract boundary.
-sceneworks-gen-core = { path = "gen-core" }
+sceneworks-gen-core = { path = "../../contracts/gen-core" }
 # Contract conformance suite (epic 3720, sc-4481). Zero tensor deps; family crates dev-depend on it
 # to run their real model through the backend-neutral checks (cancel/progress/seed/capabilities).
-sceneworks-gen-core-testkit = { path = "gen-core-testkit" }
+sceneworks-gen-core-testkit = { path = "../../contracts/gen-core-testkit" }
 # The independent LLM-serving contract (epic 7153). The dependency is INVERTED: gen-core CONSUMES
 # core-llm (gen-core re-exports it as `gen_core::core_llm`, mirroring how mlx-gen re-exports gen-core),
 # so the gen-ai side runs its LLM providers through the unified `core_llm::TextLlm` engine instead of

@@ -7,6 +7,8 @@
 
 ```text
 crates/contracts/core-llm/   core-llm tree
+crates/contracts/gen-core/   generative-media contract
+crates/contracts/gen-core-testkit/ generative-media conformance suite
 crates/llm/mlx-llm/         mlx-llm tree
 crates/llm/candle-llm/      candle-llm tree
 crates/media/mlx-gen/       mlx-gen tree
@@ -34,7 +36,7 @@ metadata's 67-package set is authoritative for initial workspace membership.
 
 | Dependency | Current forms | Phase 2 treatment |
 |---|---|---|
-| `sceneworks-gen-core` | MLX path; Candle Git SHA | One root workspace path to relocated MLX `gen-core`. |
+| `sceneworks-gen-core` | MLX path; Candle Git SHA | One root workspace path under the neutral contracts directory. |
 | `sceneworks-gen-core-testkit` | MLX path; Candle Git SHA | One root workspace path. |
 | `core-llm` | Separate branch-based Git dependencies | Path to relocated contract package. |
 | `mlx-llm` | Separate rev Git dependencies | Path to relocated MLX LLM package. |
