@@ -435,8 +435,10 @@ fn array_to_image(img: &Array) -> Result<Image> {
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The turbo variant
 // (issue #488) registers under `ideogram_4_turbo`.
 mlx_gen::register_generators! {
-    descriptor => load,
-    descriptor_turbo => load_turbo,
+    pub(crate) const QUALITY_REGISTRATION = descriptor => load
+}
+mlx_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
 }
 
 #[cfg(test)]
