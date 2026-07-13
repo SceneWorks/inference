@@ -342,6 +342,7 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         modality: Modality::Video,
         supports_lora: true,
         supports_lokr: true,
+        supports_control: false,
     }
 }
 

@@ -61,6 +61,7 @@ pub fn control_trainer_descriptor() -> TrainerDescriptor {
         modality: Modality::Image,
         supports_lora: false,
         supports_lokr: false,
+        supports_control: true,
     }
 }
 
