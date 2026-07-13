@@ -1,0 +1,84 @@
+[package]
+name = "candle-gen-catalog"
+version = "0.0.0"
+edition = "2021"
+description = "Explicit complete provider catalog for the SceneWorks Candle media platform."
+license = "Apache-2.0"
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+candle-gen-anima = { path = "../candle-gen-anima" }
+candle-gen-bernini = { path = "../candle-gen-bernini" }
+candle-gen-boogu = { path = "../candle-gen-boogu" }
+candle-gen-chroma = { path = "../candle-gen-chroma" }
+candle-gen-clip = { path = "../candle-gen-clip" }
+candle-gen-flux = { path = "../candle-gen-flux" }
+candle-gen-flux2 = { path = "../candle-gen-flux2" }
+candle-gen-ideogram = { path = "../candle-gen-ideogram" }
+candle-gen-joycaption = { path = "../candle-gen-joycaption" }
+candle-gen-kolors = { path = "../candle-gen-kolors" }
+candle-gen-krea = { path = "../candle-gen-krea" }
+candle-gen-lens = { path = "../candle-gen-lens" }
+candle-gen-ltx = { path = "../candle-gen-ltx" }
+candle-gen-qwen-image = { path = "../candle-gen-qwen-image" }
+candle-gen-scail2 = { path = "../candle-gen-scail2" }
+candle-gen-sd3 = { path = "../candle-gen-sd3" }
+candle-gen-sdxl = { path = "../candle-gen-sdxl" }
+candle-gen-seedvr2 = { path = "../candle-gen-seedvr2" }
+candle-gen-sensenova = { path = "../candle-gen-sensenova" }
+candle-gen-svd = { path = "../candle-gen-svd" }
+candle-gen-wan = { path = "../candle-gen-wan" }
+candle-gen-z-image = { path = "../candle-gen-z-image" }
+
+[features]
+default = []
+metal = [
+    "candle-gen/metal",
+    "candle-gen-anima/metal",
+    "candle-gen-bernini/metal",
+    "candle-gen-boogu/metal",
+    "candle-gen-chroma/metal",
+    "candle-gen-clip/metal",
+    "candle-gen-flux/metal",
+    "candle-gen-flux2/metal",
+    "candle-gen-ideogram/metal",
+    "candle-gen-joycaption/metal",
+    "candle-gen-kolors/metal",
+    "candle-gen-krea/metal",
+    "candle-gen-lens/metal",
+    "candle-gen-ltx/metal",
+    "candle-gen-qwen-image/metal",
+    "candle-gen-scail2/metal",
+    "candle-gen-sd3/metal",
+    "candle-gen-sdxl/metal",
+    "candle-gen-seedvr2/metal",
+    "candle-gen-sensenova/metal",
+    "candle-gen-svd/metal",
+    "candle-gen-wan/metal",
+    "candle-gen-z-image/metal",
+]
+cuda = [
+    "candle-gen/cuda",
+    "candle-gen-anima/cuda",
+    "candle-gen-bernini/cuda",
+    "candle-gen-boogu/cuda",
+    "candle-gen-chroma/cuda",
+    "candle-gen-clip/cuda",
+    "candle-gen-flux/cuda",
+    "candle-gen-flux2/cuda",
+    "candle-gen-ideogram/cuda",
+    "candle-gen-joycaption/cuda",
+    "candle-gen-kolors/cuda",
+    "candle-gen-krea/cuda",
+    "candle-gen-lens/cuda",
+    "candle-gen-ltx/cuda",
+    "candle-gen-qwen-image/cuda",
+    "candle-gen-scail2/cuda",
+    "candle-gen-sd3/cuda",
+    "candle-gen-sdxl/cuda",
+    "candle-gen-seedvr2/cuda",
+    "candle-gen-sensenova/cuda",
+    "candle-gen-svd/cuda",
+    "candle-gen-wan/cuda",
+    "candle-gen-z-image/cuda",
+]

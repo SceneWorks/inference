@@ -282,6 +282,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-catalog"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-anima",
+ "candle-gen-bernini",
+ "candle-gen-boogu",
+ "candle-gen-chroma",
+ "candle-gen-clip",
+ "candle-gen-flux",
+ "candle-gen-flux2",
+ "candle-gen-ideogram",
+ "candle-gen-joycaption",
+ "candle-gen-kolors",
+ "candle-gen-krea",
+ "candle-gen-lens",
+ "candle-gen-ltx",
+ "candle-gen-qwen-image",
+ "candle-gen-scail2",
+ "candle-gen-sd3",
+ "candle-gen-sdxl",
+ "candle-gen-seedvr2",
+ "candle-gen-sensenova",
+ "candle-gen-svd",
+ "candle-gen-wan",
+ "candle-gen-z-image",
+]
+
+[[package]]
 name = "candle-gen-chroma"
 version = "0.0.0"
 dependencies = [
@@ -2289,6 +2318,37 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+]
+
+[[package]]
+name = "mlx-gen-catalog"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "mlx-gen-anima",
+ "mlx-gen-bernini",
+ "mlx-gen-boogu",
+ "mlx-gen-chroma",
+ "mlx-gen-clip",
+ "mlx-gen-flux",
+ "mlx-gen-flux2",
+ "mlx-gen-ideogram",
+ "mlx-gen-joycaption",
+ "mlx-gen-kolors",
+ "mlx-gen-krea",
+ "mlx-gen-lens",
+ "mlx-gen-ltx",
+ "mlx-gen-pulid",
+ "mlx-gen-qwen-image",
+ "mlx-gen-sana",
+ "mlx-gen-scail2",
+ "mlx-gen-sd3",
+ "mlx-gen-sdxl",
+ "mlx-gen-seedvr2",
+ "mlx-gen-sensenova",
+ "mlx-gen-svd",
+ "mlx-gen-wan",
+ "mlx-gen-z-image",
 ]
 
 [[package]]

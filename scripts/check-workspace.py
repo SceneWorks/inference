@@ -12,10 +12,12 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 67
+EXPECTED_MEMBER_COUNT = 69
 INTERNAL_PACKAGES = {
+    "candle-gen-catalog",
     "core-llm",
     "core-llm-testkit",
+    "mlx-gen-catalog",
     "mlx-llm",
     "candle-llm",
     "sceneworks-gen-core",

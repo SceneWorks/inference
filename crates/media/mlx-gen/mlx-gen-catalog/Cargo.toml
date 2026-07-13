@@ -1,0 +1,33 @@
+[package]
+name = "mlx-gen-catalog"
+version = "0.0.0"
+edition = "2021"
+description = "Explicit complete provider catalog for the SceneWorks MLX media platform."
+license = "Apache-2.0"
+
+[dependencies]
+mlx-gen = { path = ".." }
+mlx-gen-anima = { path = "../mlx-gen-anima" }
+mlx-gen-bernini = { path = "../mlx-gen-bernini" }
+mlx-gen-boogu = { path = "../mlx-gen-boogu" }
+mlx-gen-chroma = { path = "../mlx-gen-chroma" }
+mlx-gen-clip = { path = "../mlx-gen-clip" }
+mlx-gen-flux = { path = "../mlx-gen-flux" }
+mlx-gen-flux2 = { path = "../mlx-gen-flux2" }
+mlx-gen-ideogram = { path = "../mlx-gen-ideogram" }
+mlx-gen-joycaption = { path = "../mlx-gen-joycaption" }
+mlx-gen-kolors = { path = "../mlx-gen-kolors" }
+mlx-gen-krea = { path = "../mlx-gen-krea" }
+mlx-gen-lens = { path = "../mlx-gen-lens" }
+mlx-gen-ltx = { path = "../mlx-gen-ltx" }
+mlx-gen-pulid = { path = "../mlx-gen-pulid" }
+mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }
+mlx-gen-sana = { path = "../mlx-gen-sana" }
+mlx-gen-scail2 = { path = "../mlx-gen-scail2" }
+mlx-gen-sd3 = { path = "../mlx-gen-sd3" }
+mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
+mlx-gen-seedvr2 = { path = "../mlx-gen-seedvr2" }
+mlx-gen-sensenova = { path = "../mlx-gen-sensenova" }
+mlx-gen-svd = { path = "../mlx-gen-svd" }
+mlx-gen-wan = { path = "../mlx-gen-wan" }
+mlx-gen-z-image = { path = "../mlx-gen-z-image" }

@@ -131,8 +131,8 @@ def main() -> int:
     validate_tag(manifest["release"]["tag"])
     if manifest["release"]["dirty"] and not args.allow_dirty:
         raise RuntimeError("release manifest records dirty inputs")
-    if manifest["workspace"]["package_count"] != 67:
-        raise RuntimeError("release manifest does not contain the expected 67 workspace packages")
+    if manifest["workspace"]["package_count"] != 69:
+        raise RuntimeError("release manifest does not contain the expected 69 workspace packages")
     verify_sbom(bundle, manifest)
     if not args.skip_smoke:
         smoke_source_archive(bundle, manifest, args.offline)
