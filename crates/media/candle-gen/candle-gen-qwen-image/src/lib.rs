@@ -757,10 +757,46 @@ pub fn load_from_comfyui_dit(
     }))
 }
 
-candle_gen::register_generators! { descriptor => load }
+candle_gen::register_generators! {
+    pub(crate) const REGISTRATION = descriptor => load
+}
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
 pub fn force_link() {}
+
+/// Add the Candle Qwen-Image generator to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_generator(REGISTRATION)
+}
+
+/// Build the complete explicit Candle Qwen-Image provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "qwen-image" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+
+        assert_eq!(explicit, compatibility);
+        assert_eq!(explicit, ["qwen_image"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

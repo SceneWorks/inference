@@ -534,7 +534,9 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl
 // Generator` above stays hand-written because `validate` adds a reference-image check beyond the
 // shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
-mlx_gen::register_generators! { descriptor => load }
+mlx_gen::register_generators! {
+    pub(crate) const REGISTRATION = descriptor => load
+}
 
 #[cfg(test)]
 mod tests {

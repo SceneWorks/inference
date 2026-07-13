@@ -56,3 +56,46 @@ pub use vl_tokenizer::{
     encode_reference_latents, preprocess_edit_image, tokenize_edit, tokenize_edit_text, EditImage,
     EditInputs,
 };
+
+/// Add all MLX Qwen-Image generators to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_generator(model_control::REGISTRATION)
+        .register_generator(model_edit::REGISTRATION)
+}
+
+/// Build the complete explicit MLX Qwen-Image provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility: Vec<String> = mlx_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "qwen-image" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit = explicit.clone();
+        sorted_explicit.sort();
+        compatibility.sort();
+
+        assert_eq!(sorted_explicit, compatibility);
+        assert_eq!(
+            explicit,
+            ["qwen_image", "qwen_image_control", "qwen_image_edit"]
+        );
+    }
+}
