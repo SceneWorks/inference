@@ -421,7 +421,17 @@ impl KreaHeavy {
         // directly so the clean-latent VAE encode + prep are shared across seeds (F-073).
         validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo")?;
         let plan = self.prepare_img2img(context, None, init, opts.width, opts.height)?;
-        self.render_turbo_img2img_from(&plan, strength, opts, decoder, cancel, on_progress)
+        // `usize::MAX` = the clean σ=0 default (no from_ldm capture); the Generator (`model.rs`) resolves
+        // and threads a real `keep` when a PiD capture is requested (sc-10121).
+        self.render_turbo_img2img_from(
+            &plan,
+            strength,
+            opts,
+            decoder,
+            usize::MAX,
+            cancel,
+            on_progress,
+        )
     }
 
     /// Build the **count-invariant** img2img plan (F-073): the seed-independent clean reference latent
@@ -455,21 +465,31 @@ impl KreaHeavy {
     }
 
     /// **CFG-free Turbo img2img render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing
-    /// the [`Img2ImgPlan`]. Byte-identical to the pre-hoist [`Self::render_turbo_img2img`].
+    /// the [`Img2ImgPlan`]. `keep` (sc-10121) is the PiD `from_ldm` early-stop truncation resolved by the
+    /// caller against the full schedule + this img2img `start` (`usize::MAX` = the clean σ=0 default).
+    /// With `keep == full.len()` it is byte-identical to the pre-sc-10121 [`Self::render_turbo_img2img`].
+    #[allow(clippy::too_many_arguments)]
     pub fn render_turbo_img2img_from(
         &self,
         plan: &Img2ImgPlan,
         strength: f32,
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
-        // Start step from strength; blend the clean latent with noise at σ_k, then denoise sigmas[k..].
+        // Start step from strength; blend the clean latent with noise at σ_k, then denoise the window.
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
-        let sigmas = &full[start..];
+        // PiD `from_ldm` early-stop (sc-10121): the caller resolved `keep` against THIS full schedule
+        // with THIS `start` (via `flow_capture_for_request`'s `start_step`), so truncating the img2img
+        // window to `full[start..keep]` exits at exactly `full[keep-1]` — the degrade σ the PiD decoder
+        // was built at. `keep == full.len()` (the clean default / no capture) runs the whole `[start..]`
+        // tail to σ=0, byte-identical to the pre-sc-10121 img2img path.
+        let end = keep.min(full.len());
+        let sigmas = &full[start..end];
         let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
@@ -588,19 +608,24 @@ impl KreaHeavy {
         // directly so the clean-latent VAE encode + preps are shared across seeds (F-073).
         validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
         let plan = self.prepare_img2img(ctx_pos, ctx_neg, init, opts.width, opts.height)?;
+        // `usize::MAX` = the clean σ=0 default (no from_ldm capture); the Generator (`model.rs`) resolves
+        // and threads a real `keep` when a PiD capture is requested (sc-10121).
         self.render_base_img2img_from(
             &plan,
             guidance,
             strength,
             opts,
             decoder,
+            usize::MAX,
             cancel,
             on_progress,
         )
     }
 
     /// **Raw true-CFG img2img render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing
-    /// the [`Img2ImgPlan`]. Byte-identical to the pre-hoist [`Self::render_base_img2img`].
+    /// the [`Img2ImgPlan`]. `keep` (sc-10121) is the PiD `from_ldm` early-stop truncation resolved by the
+    /// caller against the full [`base_schedule`] + this img2img `start` (`usize::MAX` = the clean σ=0
+    /// default). With `keep == full.len()` it is byte-identical to the pre-sc-10121 img2img path.
     #[allow(clippy::too_many_arguments)]
     pub fn render_base_img2img_from(
         &self,
@@ -609,13 +634,14 @@ impl KreaHeavy {
         strength: f32,
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
 
         // Start step from strength on the resolution-dynamic Raw schedule; blend the clean latent with
-        // noise at σ_k, then denoise sigmas[k..]. (Turbo uses `turbo_schedule`; Raw's mu is dynamic.)
+        // noise at σ_k, then denoise the window. (Turbo uses `turbo_schedule`; Raw's mu is dynamic.)
         let full = base_schedule(
             opts.steps,
             opts.width,
@@ -623,7 +649,11 @@ impl KreaHeavy {
             opts.scheduler.as_deref(),
         );
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
-        let sigmas = &full[start..];
+        // PiD `from_ldm` early-stop (sc-10121): `keep` was resolved against THIS schedule + `start`, so
+        // `full[start..keep]` exits at `full[keep-1]` — the decoder's degrade σ. `keep == full.len()`
+        // (the clean default / no capture) runs the whole `[start..]` tail to σ=0.
+        let end = keep.min(full.len());
+        let sigmas = &full[start..end];
         let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
 
         let lat = run_flow_sampler(
