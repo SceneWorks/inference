@@ -376,8 +376,10 @@ fn image_to_chw01(img: &Image) -> Result<Array> {
 // distilled variant (sc-3192) registers under `descriptor_fast`. `impl Generator` stays
 // hand-written because `validate` attributes rejections to the per-variant descriptor id (F-143).
 mlx_gen::register_generators! {
-    descriptor => load,
-    descriptor_fast => load_fast,
+    pub(crate) const QUALITY_REGISTRATION = descriptor => load
+}
+mlx_gen::register_generators! {
+    pub(crate) const FAST_REGISTRATION = descriptor_fast => load_fast
 }
 
 #[cfg(test)]

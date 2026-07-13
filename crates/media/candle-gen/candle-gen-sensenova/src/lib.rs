@@ -367,8 +367,10 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> gen_core::Result<Box<dyn Generator
 
 // Link-time self-registration of both ids into gen-core's model registry.
 candle_gen::register_generators! {
-    descriptor => load,
-    descriptor_fast => load_fast,
+    pub(crate) const QUALITY_REGISTRATION = descriptor => load
+}
+candle_gen::register_generators! {
+    pub(crate) const FAST_REGISTRATION = descriptor_fast => load_fast
 }
 
 /// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
@@ -376,6 +378,45 @@ candle_gen::register_generators! {
 /// the whole rlib — taking the `inventory::submit!` registrations with it. Referencing this no-op from
 /// the consumer keeps the crate linked. (Same pattern as `candle_gen_chroma::force_link`.)
 pub fn force_link() {}
+
+/// Add all Candle SenseNova providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(QUALITY_REGISTRATION)
+        .register_generator(FAST_REGISTRATION)
+}
+
+/// Build the complete explicit Candle SenseNova provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "sensenova-u1" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit = explicit.clone();
+        sorted_explicit.sort();
+        compatibility.sort();
+
+        assert_eq!(sorted_explicit, compatibility);
+        assert_eq!(explicit, ["sensenova_u1_8b", "sensenova_u1_8b_fast"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {
