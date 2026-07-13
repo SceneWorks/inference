@@ -765,10 +765,16 @@ fn img2img_conflicts_with_capture(has_reference: bool, keep: usize, num_sigmas: 
 // `krea_2_edit` (the Raw pipeline routed to the Kontext edit entrypoint; epic 10871), and
 // `krea_2_turbo_edit` (that edit surface on the distilled few-step CFG-free schedule; sc-11640).
 mlx_gen::register_generators! {
-    descriptor => load,
-    raw_descriptor => load_raw,
-    edit_descriptor => load_edit,
-    turbo_edit_descriptor => load_turbo_edit,
+    pub(crate) const TURBO_REGISTRATION = descriptor => load
+}
+mlx_gen::register_generators! {
+    pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw
+}
+mlx_gen::register_generators! {
+    pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit
+}
+mlx_gen::register_generators! {
+    pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit
 }
 
 #[cfg(test)]

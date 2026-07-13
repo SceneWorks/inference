@@ -478,14 +478,80 @@ pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 // `krea_2_raw` (undistilled, full-CFG; sc-9994 / epic 9992), and `krea_2_edit` (Kontext instruction
 // edit over 1-2 references; epic 10871 / sc-11085).
 candle_gen::register_generators! {
-    descriptor => load,
-    raw_descriptor => load_raw,
-    edit_descriptor => load_edit,
+    pub(crate) const TURBO_REGISTRATION = descriptor => load
+}
+candle_gen::register_generators! {
+    pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw
+}
+candle_gen::register_generators! {
+    pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registrations — the `krea_2_turbo`, `krea_2_raw`,
 /// and `krea_2_edit` generators and the `krea_2_raw` trainer — from being dead-stripped).
 pub fn force_link() {}
+
+/// Add all Candle Krea generators and trainers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(TURBO_REGISTRATION)
+        .register_generator(RAW_REGISTRATION)
+        .register_generator(EDIT_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
+        .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit Candle Krea provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_generators: Vec<String> =
+            candle_gen::gen_core::registry::generators()
+                .filter_map(|registration| {
+                    let descriptor = (registration.descriptor)();
+                    (descriptor.family == "krea_2" && descriptor.backend == "candle")
+                        .then(|| descriptor.id.to_string())
+                })
+                .collect();
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_trainers: Vec<String> = candle_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "krea_2" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit_generators = explicit_generators.clone();
+        sorted_explicit_generators.sort();
+        compatibility_generators.sort();
+        let mut sorted_explicit_trainers = explicit_trainers.clone();
+        sorted_explicit_trainers.sort();
+        compatibility_trainers.sort();
+
+        assert_eq!(sorted_explicit_generators, compatibility_generators);
+        assert_eq!(
+            explicit_generators,
+            ["krea_2_turbo", "krea_2_raw", "krea_2_edit"]
+        );
+        assert_eq!(sorted_explicit_trainers, compatibility_trainers);
+        assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

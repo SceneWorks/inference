@@ -92,7 +92,10 @@ pub fn load_control_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
 }
 
 // Link-time self-registration into gen-core's trainer registry (kept linked by `crate::force_link`).
-candle_gen::register_trainer! { control_trainer_descriptor => load_control_trainer }
+candle_gen::register_trainer! {
+    pub(crate) const CONTROL_TRAINER_REGISTRATION =
+        control_trainer_descriptor => load_control_trainer
+}
 
 impl KreaControlTrainer {
     /// Reject requests this trainer cannot serve: an empty dataset, an item without a control image,
