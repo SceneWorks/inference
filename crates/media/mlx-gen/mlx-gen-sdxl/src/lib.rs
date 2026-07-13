@@ -81,6 +81,55 @@ pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 pub(crate) use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
+/// Add the MLX SDXL generator and trainer to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit MLX SDXL provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_generators: Vec<String> = mlx_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "sdxl" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_trainers: Vec<String> = mlx_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "sdxl" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+
+        assert_eq!(explicit_generators, compatibility_generators);
+        assert_eq!(explicit_generators, ["sdxl"]);
+        assert_eq!(explicit_trainers, compatibility_trainers);
+        assert_eq!(explicit_trainers, ["sdxl"]);
+    }
+}
+
 /// SiLU `x·sigmoid(x)` — one fused kernel when the sc-2963 glue toggle is on, else the eager core
 /// [`mlx_gen::nn::silu`]. Bit-identical to eager in fp16 AND f32 (proven `max|Δ|=0`,
 /// `tests/compile_parity.rs`), so it is golden-safe on the precision-load-bearing fp16 UNet.

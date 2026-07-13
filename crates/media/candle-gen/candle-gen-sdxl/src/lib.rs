@@ -488,7 +488,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
 // `gen_core::load("sdxl", …)` resolve the candle generator — no central match statement to edit.
-candle_gen::register_generators! { descriptor => load }
+candle_gen::register_generators! {
+    pub(crate) const REGISTRATION = descriptor => load
+}
 
 /// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
 /// references nothing in this crate directly, so the linker (MSVC in particular, on a release
@@ -497,6 +499,55 @@ candle_gen::register_generators! { descriptor => load }
 /// from the consumer keeps the crate linked so the registration survives. The SceneWorks worker
 /// force-links each provider crate for exactly this reason (e.g. `sensenova_jobs`).
 pub fn force_link() {}
+
+/// Add the Candle SDXL generator and trainer to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit Candle SDXL provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_generators: Vec<String> = candle_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "sdxl" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_trainers: Vec<String> = candle_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "sdxl" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+
+        assert_eq!(explicit_generators, compatibility_generators);
+        assert_eq!(explicit_generators, ["sdxl"]);
+        assert_eq!(explicit_trainers, compatibility_trainers);
+        assert_eq!(explicit_trainers, ["sdxl"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {
