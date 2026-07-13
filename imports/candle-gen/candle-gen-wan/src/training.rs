@@ -1,0 +1,1155 @@
+//! The candle **Wan2.2 A14B MoE LoRA/LoKr trainer** (sc-5167) — the candle twin of `mlx-gen-wan`'s
+//! `WanMoeTrainer`, implementing the backend-neutral [`gen_core::Trainer`](candle_gen::gen_core::train::Trainer)
+//! with `backend = "candle"`. It retires the worker's Python torch `WanMoeLoraTrainer` (the dual-expert
+//! path of epic 5164) and reuses the shared [`candle_gen::train`] harness the SDXL/Z-Image stories
+//! established, building on [`crate::dit_train`]'s vendored trainable DiT.
+//!
+//! Registered under `"wan2_2_t2v_14b"` — the **T2V** A14B. (The I2V channel-concat conditioning and the
+//! dense 5B path — the latter blocked on a z48 VAE *encoder* port — are sc-5167 follow-ups.)
+//!
+//! ## Why Wan keeps a bespoke loop (sc-7787)
+//!
+//! The single-model flow-match driver ([`candle_gen::train::flow_match::run_flow_match_training`]) the
+//! Z-Image/Lens/Krea trainers adopted assumes **one** DiT, optimizer, adapter set, and timestep range.
+//! The Wan A14B is a **dual-expert MoE**: it alternates a high-noise expert (`transformer/`) and a
+//! low-noise expert (`transformer_2/`), each with its own LoRA/LoKr, optimizer, LR schedule, timestep
+//! band, and gradient-accumulation buffer, and emits an expert-suffixed save pair. That does not fit the
+//! single-model driver cleanly, so Wan keeps the alternating loop below and consumes only the **Tier-1
+//! shared helpers** from [`flow_match`] (sampling, batch math, validation, snapshot IO, adapter install
+//! + optimizer step). Exactly the split sc-7787 sanctions.
+//!
+//! ## The Wan realities that shape it
+//!
+//! Cache → loop → save, on the **flow-match** objective. The two Wan-specific twists vs the Z-Image
+//! trainer:
+//!  1. **No velocity negation.** Wan feeds the transformer output to the flow-match step *without*
+//!     negation (opposite of Z-Image's `noise_pred.neg()`), so the trainer regresses the **raw** DiT
+//!     velocity toward `noise − x0` (`target = noise − x0`). The timestep fed to the DiT is `t · 1000`
+//!     (the `[0, NUM_TRAIN_TIMESTEPS]` integer convention), not `1 − σ` — see [`compute_loss_grads`].
+//!  2. **MoE dual-expert.** The A14B denoises with a **high-noise** expert (`transformer/`, timestep
+//!     ≥ `boundary·1000`) and a **low-noise** expert (`transformer_2/`, below it). Each gets its **own**
+//!     LoRA/LoKr (separate factor map + optimizer + LR schedule + timestep band). Training **alternates**
+//!     per step (odd → high, even → low), sampling that expert's band, and emits a `{stem}.high_noise` /
+//!     `{stem}.low_noise` pair — what the inference loader ([`crate::adapters`] via [`crate::wan14b`])
+//!     merges back onto the matching expert ([`MoeExpert`](candle_gen::gen_core::MoeExpert)).
+//!
+//! Caching: each still image is z16-VAE-encoded to a single-frame latent `[1, 16, 1, h, w]` (the
+//! deterministic posterior **mean**, normalized) and its caption UMT5-encoded to `[1, 512, 4096]`
+//! (zero-padded to 512, the same context surface inference feeds). The VAE + text encoder are dropped
+//! after caching; the two experts are the working set.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use candle_gen::candle_core::backprop::GradStore;
+use candle_gen::candle_core::{DType, Device, Tensor, Var};
+
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
+use candle_gen::gen_core::tokenizer::TextTokenizer;
+use candle_gen::gen_core::train::{
+    Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+};
+use candle_gen::gen_core::{self, Image, LoadSpec, Modality, Progress, WeightsSource};
+use candle_gen::train::checkpoint::file_stem;
+use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::flow_match::{self, validate_flow_match_request, velocity_loss};
+use candle_gen::train::gradient_checkpoint::checkpointed_backward;
+use candle_gen::train::lora::{LoraHost, LoraSet};
+use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
+use candle_gen::train::schedule::schedule_updates;
+use candle_gen::{CandleError, Result};
+
+use crate::config::{
+    TextEncoderConfig, TransformerConfig, Vae16Config, MODEL_ID_T2V_14B, NUM_TRAIN_TIMESTEPS,
+    T2V_14B_BOUNDARY, T2V_14B_FLOW_SHIFT, VAE16_STRIDE_SPATIAL,
+};
+use crate::dit_train::{WanTransformerTrain, WAN_ATTN_TARGETS};
+use crate::pipeline::{create_noise, frames_to_images};
+use crate::rope::WanRope;
+use crate::scheduler::flow_sigmas;
+use crate::text_encoder::Umt5Encoder;
+use crate::vae16::WanVae16;
+
+/// Error-message prefix shared by [`validate_flow_match_request`] and the component-IO helpers.
+const LABEL: &str = "wan trainer";
+
+/// Sample a timestep `t ∈ [lo, hi)` inside an expert's noise band: draw a unit `t_unit`
+/// ([`flow_match::sample_unit_timestep`]) then affine-map it into `(lo, hi)`. The high-noise expert
+/// samples `(boundary, 1)`, the low-noise `(0, boundary)` — the per-expert split the A14B trains. This
+/// band map is Wan-specific (the other flow-match trainers train one model over the full `(0, 1)`), so
+/// it stays local; only the unit draw is shared.
+fn sample_band_timestep(
+    timestep_type: &str,
+    timestep_bias: &str,
+    band: (f64, f64),
+    seed: u64,
+) -> f64 {
+    let t_unit = flow_match::sample_unit_timestep(timestep_type, timestep_bias, seed) as f64;
+    let (lo, hi) = band;
+    (lo + t_unit * (hi - lo)).clamp(1e-3, 1.0 - 1e-3)
+}
+
+/// Which expert trains at `step` (1-based): odd steps → high-noise (`experts[0]`), even → low-noise
+/// (`experts[1]`). The two experts alternate so both accumulate roughly `steps/2` micro-steps.
+#[inline]
+fn expert_index(step: u32) -> usize {
+    if step % 2 == 1 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Dataset item consumed at `step` (1-based), indexing into a cache of `cache_len` items.
+///
+/// The index is the expert's own visit count `(step - 1) / 2`, **not** the raw step. Because the
+/// experts alternate by step parity ([`expert_index`]), indexing by `step` couples the item parity
+/// to the expert parity: for an even-sized dataset `(step - 1) % N` keeps the same parity forever, so
+/// the high-noise expert would only ever see even-indexed items and the low-noise expert only
+/// odd-indexed ones — each adapter silently training on a disjoint half of the user's images
+/// (sc-11157 / F-082). Advancing by the per-expert visit count instead makes each expert walk the
+/// full dataset in order (`0, 1, 2, …` cycling at `N`), independent of its parity.
+#[inline]
+fn expert_item_index(step: u32, cache_len: usize) -> usize {
+    (((step - 1) / 2) as usize) % cache_len
+}
+
+/// One micro-step's forward+backward over one expert's installed adapter `Var`s: build the noised
+/// latent at `t`, predict the **raw** velocity through the (LoRA-adapted) DiT, regress it toward
+/// `noise − x0`, return `(loss, grads)` keyed by `lora_vars`. `cos`/`sin` are the (constant,
+/// per-resolution) RoPE tables. A free function so the tests can drive it against a tiny DiT.
+///
+/// `use_checkpoint` selects the **gradient-checkpointed** backward. This is not just a memory lever for
+/// the 14B experts — it is **required**: candle's matmul backward materializes a gradient for the
+/// *frozen* base weight as well as the activation, so a dense 40-block backward holds ~40 layers of f32
+/// base-weight grads at once (tens of GB), OOMing even a 96 GB card with both experts resident. The
+/// checkpointed path runs the (adapter-free) pre-main forward detached, then segments the per-block
+/// stack so only one block's transient weight-grads are live at a time (see
+/// [`WanTransformerTrain::main_block_segments`]). Both paths yield the same adapter grads (the
+/// `dense_and_checkpoint_grads_match` test pins this on a tiny DiT).
+#[allow(clippy::too_many_arguments)]
+fn compute_loss_grads(
+    dit: &WanTransformerTrain,
+    lora_vars: &[Var],
+    x0: &Tensor,
+    umt5: &Tensor,
+    t: f64,
+    noise: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    mae: bool,
+    compute_dtype: DType,
+    use_checkpoint: bool,
+) -> Result<(f32, GradStore)> {
+    let (x_t, target) = flow_match::build_batch(x0, noise, t)?;
+    let x_t = x_t.to_dtype(compute_dtype)?;
+    // Text context + timestep are adapter-free constants the blocks consume.
+    let ctx = dit.embed_text(umt5)?;
+    let timestep = t * NUM_TRAIN_TIMESTEPS as f64;
+
+    if use_checkpoint {
+        // Pre-main (patch + time embed) has no adapters → run it detached; no upstream grads to stitch.
+        let (hidden, mctx) = dit.forward_pre_main(&x_t, timestep)?;
+        let hidden_d = hidden.detach();
+        let mut segs = dit.main_block_segments(&mctx, &ctx, cos, sin);
+        // Final segment: head → raw velocity (NO negation) → flow-match regression → [loss].
+        let target_owned = target.clone();
+        let mctx_ref = &mctx;
+        segs.push(Box::new(move |st: &[Tensor]| {
+            let v = dit.velocity_out(&st[0], mctx_ref)?;
+            Ok(vec![velocity_loss(&v, &target_owned, mae)?])
+        }));
+        checkpointed_backward(&segs, std::slice::from_ref(&hidden_d), lora_vars)
+    } else {
+        // Dense backward (tiny models / tests only — see the `use_checkpoint` note re: OOM at scale).
+        let v = dit.forward(&x_t, &ctx, timestep, cos, sin)?;
+        let loss = velocity_loss(&v, &target, mae)?;
+        let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+        let grads = loss.backward()?;
+        Ok((loss_val, grads))
+    }
+}
+
+/// Tokenize + UMT5-encode `caption` → `[1, 512, 4096]` (f32, zero-padded to 512 — the same context
+/// surface inference feeds; see [`crate::wan14b`]'s `encode`).
+///
+/// Shared Wan text-encode routine (sc-9000 / F-020). The trainer loads the UMT5 encoder at **bf16**
+/// (unlike the inference providers' f32), so it passes `out_dtype = F32` to reproduce its prior
+/// `.to_dtype(F32)` upcast of the bf16 embeds exactly.
+fn encode_caption(
+    tok: &TextTokenizer,
+    te_cfg: &TextEncoderConfig,
+    te: &Umt5Encoder,
+    caption: &str,
+    device: &Device,
+) -> Result<Tensor> {
+    crate::text_encode::umt5_encode_padded(
+        tok,
+        te_cfg,
+        te,
+        caption,
+        device,
+        DType::F32,
+        "wan trainer",
+    )
+}
+
+/// Insert `.{suffix}` before the extension of `file_name` (`a.safetensors` → `a.high_noise.safetensors`).
+fn with_expert_suffix(file_name: &str, suffix: &str) -> String {
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}.{suffix}.{ext}"),
+        None => format!("{file_name}.{suffix}"),
+    }
+}
+
+/// One MoE expert's full trainable state: the (vendored) DiT with adapters installed, its optimizer +
+/// LR schedule, its timestep band, and its own gradient-accumulation buffer + step counters.
+struct ExpertState {
+    dit: WanTransformerTrain,
+    set: LoraSet,
+    opt: TrainOptimizer,
+    band: (f64, f64),
+    accumulated: Option<GradStore>,
+    micro: u32,
+    update_idx: u32,
+    total_updates: u32,
+    warmup_updates: u32,
+    /// `"high_noise"` / `"low_noise"` — the saved-file suffix + the [`MoeExpert`] the inference loader
+    /// merges this onto.
+    suffix: &'static str,
+}
+
+/// Cap on the number of preview prompts rendered per [`TrainingConfig::sample_every`] cadence
+/// (sc-8650) — matches the shared `SAMPLE_PROMPT_CAP` the FlowMatchTrainer driver applies. A Wan still
+/// is a full dual-expert denoise + z16 VAE decode, so this keeps the preview cost bounded.
+const SAMPLE_PROMPT_CAP: usize = 4;
+
+/// The Wan preview-sample render state (sc-8650) — everything [`render_one_preview`] needs to render a
+/// single still frame on the **in-progress** experts (both carry their live LoRA/LoKr adapters), built
+/// once in [`WanMoeTrainer::train_impl`]'s cache phase while the UMT5 encoder is still resident and
+/// before the VAE encoder is dropped.
+///
+///  * `prompts` — the prompt strings (≤ [`SAMPLE_PROMPT_CAP`]) reported on each
+///    [`TrainingProgress::Sample`], 1:1 with `umt5`.
+///  * `umt5` — the per-prompt pre-encoded UMT5 caption embeds `[1, 512, 4096]` (f32, the exact context
+///    surface [`encode_caption`] produces), projected per-expert inside the render via
+///    [`WanTransformerTrain::embed_text`].
+///  * `vae` — a resident **decode-only** [`WanVae16`] (the cache pass loads the VAE *with* the encoder
+///    for latent caching, then drops it; the preview path needs only the decoder).
+///  * `edge` — the square training-resolution edge (`bucket_resolution(cfg.resolution)`, the same edge
+///    the cached latents use) the seeded single-frame preview noise is shaped at.
+struct WanSampleState {
+    prompts: Vec<String>,
+    umt5: Vec<Tensor>,
+    vae: WanVae16,
+    edge: u32,
+}
+
+/// Render ONE still preview frame (sc-8650) from the **in-progress** dual-expert A14B onto an RGB8
+/// [`Image`], best-effort. This mirrors the inference T2V denoise ([`crate::wan14b`]'s `render`) but on
+/// a **single-frame** latent (`F = 1`, the cheapest faithful still) and CFG-free.
+///
+/// **Dual-expert (not single-expert).** Both experts are resident with their live adapters during the
+/// loop, so the preview runs the *real* MoE boundary-band schedule — the high-noise expert
+/// (`experts[0]`) while the σ-derived integer timestep is `≥ boundary·1000`, the low-noise expert
+/// (`experts[1]`) below it — exactly as inference switches them. That is the simplest faithful option
+/// (a single-expert preview would denoise the whole trajectory through one band's adapter, which no
+/// inference path does) and it exercises *both* trained adapters, so a preview reflects the full LoRA.
+///
+/// Conventions match [`compute_loss_grads`] / inference: the DiT consumes the **raw** velocity (no sign
+/// flip) at timestep `σ · NUM_TRAIN_TIMESTEPS` (the `[0, 1000]` integer convention), driven over Wan's
+/// native flow-σ schedule by [`candle_gen::run_flow_sampler`] with [`TimestepConvention::Sigma`]. The
+/// schedule uses `steps = cfg.sample_steps.max(1)` and the T2V flow shift, and a fresh never-cancel
+/// flag (a preview need not honor cancel mid-denoise; `req.cancel` is not threaded here).
+///
+/// CFG-free: training pre-encodes only the positive caption, so `cfg.sample_guidance_scale` is ignored
+/// (the Wan trainer trains the velocity directly, no negative branch is cached).
+fn render_one_preview(
+    experts: &[ExpertState],
+    state: &WanSampleState,
+    index: usize,
+    cfg: &TrainingConfig,
+    seed: u64,
+    device: &Device,
+) -> Result<Image> {
+    let dit_cfg = TransformerConfig::t2v_14b();
+    let steps = cfg.sample_steps.max(1) as usize;
+    // The experts are built at the bf16 compute dtype; their `forward` does NOT cast inputs (like
+    // `compute_loss_grads`, which casts `x_t` → `compute_dtype`), so run the denoise in that dtype — the
+    // F32 `create_noise` prior would otherwise hit an F32×BF16 matmul mismatch on the first block.
+    let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
+
+    // Single-frame latent geometry (F = 1) at the square training edge, z16 strides.
+    let t_lat = 1usize;
+    let h_lat = (state.edge / VAE16_STRIDE_SPATIAL) as usize;
+    let w_lat = (state.edge / VAE16_STRIDE_SPATIAL) as usize;
+    let (pt, ph, pw) = dit_cfg.patch;
+    let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
+    let (cos, sin) = WanRope::new(&dit_cfg).cos_sin(ppf, pph, ppw, device)?;
+
+    // Per-expert projected text context (each expert owns its own `condition_embedder.text_embedder`).
+    let umt5 = &state.umt5[index];
+    let ctx_high = experts[0].dit.embed_text(umt5)?;
+    let ctx_low = experts[1].dit.embed_text(umt5)?;
+
+    // Seeded [1, 16, 1, h_lat, w_lat] noise (the inference `create_noise`, frame axis pinned to 1).
+    let noise = create_noise(seed, 16, t_lat, h_lat, w_lat, device)?.to_dtype(compute_dtype)?;
+
+    // Wan's native flow-σ schedule (descending, trailing 0.0) integrated by the shared euler flow
+    // sampler — the dual-expert MoE band switch lives inside the closure (boundary on σ·N).
+    let boundary_ts = T2V_14B_BOUNDARY * NUM_TRAIN_TIMESTEPS as f64;
+    let sigmas = flow_sigmas(steps, T2V_14B_FLOW_SHIFT);
+    let cancel = CancelFlag::new();
+    let mut on_progress = |_: Progress| {};
+    let lat = candle_gen::run_flow_sampler(
+        Some("euler"),
+        TimestepConvention::Sigma,
+        &sigmas,
+        noise,
+        seed,
+        &cancel,
+        &mut on_progress,
+        |x, sigma| -> Result<Tensor> {
+            // σ → integer timestep (σ·1000); MoE: high-noise expert at/above the boundary, low below.
+            let ts = sigma as f64 * NUM_TRAIN_TIMESTEPS as f64;
+            let (dit, ctx) = if ts >= boundary_ts {
+                (&experts[0].dit, &ctx_high)
+            } else {
+                (&experts[1].dit, &ctx_low)
+            };
+            let v = dit.forward(x, ctx, ts, &cos, &sin)?; // raw velocity (no negation)
+            Ok(v.to_dtype(compute_dtype)?)
+        },
+    )?;
+
+    // Decode the single-frame latent [1,16,1,h,w] → [1,3,1,8h,8w]; the frame axis (dim 2) carries one
+    // frame, so `frames_to_images` (the inference frame→Image conversion) yields exactly one Image. The
+    // denoise ran in `compute_dtype`; the resident VAE is F32 → cast back before decode.
+    let decoded = state.vae.decode(&lat.to_dtype(DType::F32)?)?; // [1, 3, 1, H, W] in [-1, 1]
+    frames_to_images(&decoded)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CandleError::Msg("wan: preview decode yielded no frame".into()))
+}
+
+/// Identity + capabilities of the candle Wan A14B trainer: LoRA + LoKr, `backend = "candle"`.
+pub fn trainer_descriptor() -> TrainerDescriptor {
+    TrainerDescriptor {
+        id: MODEL_ID_T2V_14B,
+        family: "wan",
+        backend: "candle",
+        modality: Modality::Video,
+        supports_lora: true,
+        supports_lokr: true,
+    }
+}
+
+/// A loaded candle Wan A14B (T2V) MoE trainer. Loading is **lazy** — the heavy VAE / text-encoder / two
+/// experts are built inside [`train`](Trainer::train) at the request's compute dtype.
+pub struct WanMoeTrainer {
+    descriptor: TrainerDescriptor,
+    root: PathBuf,
+    device: Device,
+}
+
+/// Construct the (lazy) candle Wan A14B trainer from a [`LoadSpec`] whose `weights` is the A14B snapshot
+/// directory (`tokenizer/ text_encoder/ transformer/ transformer_2/ vae/`).
+pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    let root =
+        match &spec.weights {
+            WeightsSource::Dir(p) => p.clone(),
+            WeightsSource::File(_) => return Err(CandleError::Msg(
+                "wan2_2_t2v_14b trainer expects a snapshot directory (tokenizer/ text_encoder/ \
+                 transformer/ transformer_2/ vae/), not a single .safetensors file"
+                    .into(),
+            )),
+        };
+    Ok(Box::new(WanMoeTrainer {
+        descriptor: trainer_descriptor(),
+        root,
+        device: candle_gen::default_device()?,
+    }))
+}
+
+// Link-time self-registration into gen-core's trainer registry (kept linked by `crate::force_link`).
+// `register_trainer!` bridges the crate's rich `Result` into `gen_core::Result` via `Into::into`.
+candle_gen::register_trainer! { trainer_descriptor => load_trainer }
+
+impl Trainer for WanMoeTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        validate_flow_match_request(req, LABEL).map_err(Into::into)
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        self.train_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl WanMoeTrainer {
+    fn train_impl(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> Result<TrainingOutput> {
+        validate_flow_match_request(req, LABEL)?;
+        let cfg = &req.config;
+        let device = &self.device;
+        on_progress(TrainingProgress::Preparing);
+        let edge = bucket_resolution(cfg.resolution);
+        let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
+        let dit_cfg = TransformerConfig::t2v_14b();
+
+        // --- load + cache: z16 VAE latent means + UMT5 caption embeds (both f32) ---
+        on_progress(TrainingProgress::LoadingModel);
+        let vae_cfg = Vae16Config::wan21();
+        let vae = WanVae16::new_with_encoder(
+            &vae_cfg,
+            flow_match::component_vb(&self.root, "vae", device, DType::F32, LABEL)?,
+        )?;
+        let te_cfg = TextEncoderConfig::umt5_xxl();
+        // Load the UMT5 encoder at bf16 for caching (11 GB vs 22 GB at f32) — it only produces the
+        // cached caption embeds (kept f32 in the cache), and is dropped before the experts load.
+        let text_encoder = Umt5Encoder::new(
+            &te_cfg,
+            flow_match::component_vb(&self.root, "text_encoder", device, DType::BF16, LABEL)?,
+        )?;
+        // Load+parse the UMT5 tokenizer ONCE, not once per dataset item / sample prompt (sc-8991 /
+        // F-011). Byte-identical config to the old per-caption `from_file`, so the cached ids match.
+        let tokenizer =
+            crate::text_encode::build_umt5_tokenizer(&self.root, &te_cfg, "wan trainer")?;
+
+        let total = req.items.len() as u32;
+        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len());
+        for (i, item) in req.items.iter().enumerate() {
+            if req.cancel.is_cancelled() {
+                break;
+            }
+            on_progress(TrainingProgress::Caching {
+                current: i as u32 + 1,
+                total,
+            });
+            let img = load_image_tensor(&item.image_path, edge, device)?; // [1,3,edge,edge] in [-1,1]
+            let video = img.unsqueeze(2)?; // [1,3,1,edge,edge] (T=1 still frame)
+            let x0 = vae.encode(&video)?.to_dtype(DType::F32)?; // [1,16,1,h,w] normalized mean
+            let cap = encode_caption(&tokenizer, &te_cfg, &text_encoder, &item.caption, device)?;
+            cache.push((x0, cap));
+        }
+
+        // --- preview-sample plan (sc-8650): pre-encode prompts + load a resident decode-only VAE ---
+        // Built here, while the UMT5 encoder is still resident and before the cache VAE is dropped, so
+        // `train_impl`'s loop can render previews from the in-progress experts (mirrors the inline
+        // pattern the bespoke-loop families use; the FlowMatchTrainer families do this in `cache`).
+        // `None` ⇒ sampling disabled (no cadence or no prompts) ⇒ the loop renders nothing.
+        let sample_state: Option<WanSampleState> =
+            if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !req.cancel.is_cancelled()
+            {
+                let mut umt5 = Vec::new();
+                let mut prompts = Vec::new();
+                for p in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                    // Same conditioning call the cache loop uses → identical [1, 512, 4096] surface.
+                    umt5.push(encode_caption(
+                        &tokenizer,
+                        &te_cfg,
+                        &text_encoder,
+                        p,
+                        device,
+                    )?);
+                    prompts.push(p.clone());
+                }
+                // Resident DECODE-ONLY z16 VAE (the cache VAE carried the encoder for latent caching; the
+                // preview path needs only the decoder). Loaded f32, like inference's VAE.
+                let preview_vae = WanVae16::new(
+                    &vae_cfg,
+                    flow_match::component_vb(&self.root, "vae", device, DType::F32, LABEL)?,
+                )?;
+                Some(WanSampleState {
+                    prompts,
+                    umt5,
+                    vae: preview_vae,
+                    edge,
+                })
+            } else {
+                None
+            };
+
+        drop(text_encoder);
+        drop(vae);
+        if cache.is_empty() {
+            if req.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            return Err(CandleError::Msg(
+                "wan trainer: no usable dataset items".into(),
+            ));
+        }
+
+        // RoPE tables for the (constant) token geometry — every cached latent shares one resolution.
+        let (_, _, _, hl, wl) = cache[0].0.dims5()?;
+        let (pt, ph, pw) = dit_cfg.patch;
+        let (ppf, pph, ppw) = (1 / pt, hl / ph, wl / pw);
+        let (cos, sin) = WanRope::new(&dit_cfg).cos_sin(ppf, pph, ppw, device)?;
+
+        // --- build the two experts (transformer/ = high-noise, transformer_2/ = low-noise) ---
+        let suffixes = flow_match::resolve_target_suffixes(cfg, &WAN_ATTN_TARGETS);
+        let accum = cfg.gradient_accumulation.max(1);
+        let weight_decay = flow_match::effective_weight_decay(cfg);
+        let mae = flow_match::is_mae(cfg);
+        let boundary = T2V_14B_BOUNDARY;
+
+        // odd steps → high (≈ ceil(steps/2) micro-steps), even → low (≈ floor(steps/2)).
+        let high_micro = cfg.steps.div_ceil(2);
+        let low_micro = cfg.steps / 2;
+        let mut experts: Vec<ExpertState> = Vec::with_capacity(2);
+        for (idx, (sub, suffix, band, micro)) in [
+            ("transformer", "high_noise", (boundary, 1.0), high_micro),
+            ("transformer_2", "low_noise", (0.0, boundary), low_micro),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut dit = WanTransformerTrain::new(
+                &dit_cfg,
+                flow_match::component_vb(&self.root, sub, device, compute_dtype, LABEL)?,
+            )?;
+            // Distinct per-expert seed (so the two adapters don't init identically), reproducible.
+            let seed = cfg
+                .seed
+                .wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9));
+            let set = flow_match::install_adapters(&mut dit, cfg, &suffixes, seed, device)?;
+            let opt = TrainOptimizer::from_config(
+                &cfg.optimizer,
+                set.vars.clone(),
+                cfg.learning_rate,
+                weight_decay,
+            )?;
+            let (total_updates, warmup_updates) =
+                schedule_updates(micro.max(1), accum, cfg.lr_warmup_steps / 2);
+            experts.push(ExpertState {
+                dit,
+                set,
+                opt,
+                band,
+                accumulated: None,
+                micro: 0,
+                update_idx: 0,
+                total_updates,
+                warmup_updates,
+                suffix,
+            });
+        }
+
+        // --- train loop (alternating experts) ---
+        // The 14B experts' dense backward is infeasible (candle materializes a grad for every frozen
+        // base weight too), so training always uses the gradient-checkpointed backward.
+        let use_checkpoint = true;
+        let mut last_loss = 0.0f32;
+        let mut steps_run = 0u32;
+        for step in 1..=cfg.steps {
+            if req.cancel.is_cancelled() {
+                break;
+            }
+            let ei = expert_index(step); // odd → high (experts[0]), even → low
+                                         // Index by the expert's own visit count, not the raw step — else on an even-sized
+                                         // dataset each expert stays parity-locked to a disjoint half (sc-11157 / F-082).
+            let (x0, cap) = &cache[expert_item_index(step, cache.len())];
+            let band = experts[ei].band;
+            let t = sample_band_timestep(
+                &cfg.timestep_type,
+                &cfg.timestep_bias,
+                band,
+                flow_match::timestep_seed(cfg.seed, step),
+            );
+            let noise = flow_match::sample_noise(
+                x0.dims(),
+                flow_match::noise_seed(cfg.seed, step),
+                device,
+            )?;
+            let (loss, grads) = compute_loss_grads(
+                &experts[ei].dit,
+                &experts[ei].set.vars,
+                x0,
+                cap,
+                t,
+                &noise,
+                &cos,
+                &sin,
+                mae,
+                compute_dtype,
+                use_checkpoint,
+            )?;
+            last_loss = loss;
+            steps_run = step;
+
+            let ex = &mut experts[ei];
+            accumulate_grads(&mut ex.accumulated, grads, &ex.set.vars)?;
+            ex.micro += 1;
+            if ex.micro.is_multiple_of(accum) {
+                apply_update(ex, accum, cfg)?;
+            }
+
+            on_progress(TrainingProgress::Training {
+                step,
+                total: cfg.steps,
+                loss: last_loss,
+            });
+
+            // --- preview samples (sc-8650) — render one still per prompt from the in-progress experts ---
+            // Best-effort: a render `Err` logs + skips, never aborting the run (a flaky preview must not
+            // fail a 14B training job). Both experts carry their live adapters, so `render_one_preview`
+            // runs the partially-trained dual-expert MoE directly.
+            if cfg.sample_every > 0 && step % cfg.sample_every == 0 {
+                if let Some(state) = sample_state.as_ref() {
+                    let total = state.prompts.len() as u32;
+                    // Freeze BOTH experts' adapters to detached snapshots so the preview denoise runs
+                    // graph-free (the factor `Var`s are otherwise tracked → the forward's activations are
+                    // retained → OOM at full resolution). Restored right after so training keeps its grads.
+                    for ex in experts.iter_mut() {
+                        let _ = ex.dit.visit_lora_mut(&mut |ll| {
+                            ll.freeze_adapter();
+                            Ok(())
+                        });
+                    }
+                    for (i, prompt) in state.prompts.iter().enumerate() {
+                        if req.cancel.is_cancelled() {
+                            break;
+                        }
+                        let seed = flow_match::sample_seed(cfg.seed, step, i);
+                        match render_one_preview(&experts, state, i, cfg, seed, device) {
+                            Ok(image) => on_progress(TrainingProgress::Sample {
+                                step,
+                                index: i as u32 + 1,
+                                total,
+                                prompt: prompt.clone(),
+                                image,
+                            }),
+                            Err(e) => eprintln!(
+                                "[sc-8650] wan: preview sample failed at step {step} (prompt {}): \
+                                 {e} — skipping this preview, training continues",
+                                i + 1
+                            ),
+                        }
+                    }
+                    for ex in experts.iter_mut() {
+                        let _ = ex.dit.visit_lora_mut(&mut |ll| {
+                            ll.thaw_adapter();
+                            Ok(())
+                        });
+                    }
+                }
+            }
+
+            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
+                flow_match::create_output_dir(&req.output_dir)?;
+                for ex in &experts {
+                    let name = with_expert_suffix(
+                        &format!("{}-step{step:06}.safetensors", file_stem(&req.file_name)),
+                        ex.suffix,
+                    );
+                    flow_match::save_adapter(&ex.set, &HashMap::new(), &req.output_dir.join(name))?;
+                }
+                on_progress(TrainingProgress::Checkpoint { step });
+            }
+        }
+
+        if steps_run == 0 {
+            return Err(CandleError::Canceled);
+        }
+        // Flush any expert's pending (sub-`accum`) accumulation so the final partial step is applied.
+        for ex in &mut experts {
+            if ex.accumulated.is_some() {
+                apply_update(ex, accum, cfg)?;
+            }
+        }
+
+        // --- save the high/low adapter pair; report the high-noise file as the primary path ---
+        on_progress(TrainingProgress::Saving);
+        flow_match::create_output_dir(&req.output_dir)?;
+        let mut primary: Option<PathBuf> = None;
+        for ex in &experts {
+            let path = req
+                .output_dir
+                .join(with_expert_suffix(&req.file_name, ex.suffix));
+            flow_match::save_adapter(&ex.set, &HashMap::new(), &path)?;
+            if ex.suffix == "high_noise" {
+                primary = Some(path);
+            }
+        }
+        Ok(TrainingOutput {
+            adapter_path: primary.expect("the high-noise expert is always present"),
+            steps: steps_run,
+            final_loss: last_loss,
+        })
+    }
+}
+
+/// Fire one optimizer update for `ex`: delegates the average-clip-step to the shared
+/// [`flow_match::apply_update`] (over `ex`'s own optimizer/accumulation/schedule), then advances the
+/// expert's update counter.
+fn apply_update(ex: &mut ExpertState, accum: u32, cfg: &TrainingConfig) -> Result<()> {
+    flow_match::apply_update(
+        &mut ex.opt,
+        &mut ex.accumulated,
+        &ex.set,
+        accum,
+        cfg,
+        ex.update_idx,
+        ex.total_updates,
+        ex.warmup_updates,
+    )?;
+    ex.update_idx += 1;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_nn::{VarBuilder, VarMap};
+    use candle_gen::gen_core::registry;
+    use candle_gen::train::lora::build_lora_targets;
+    use candle_gen::train::optim::clip_grad_norm;
+
+    /// A tiny Wan-shaped DiT (z16, head_dim 128, 1 head, 1 layer) — exercises the real flow-match
+    /// forward+backward on CPU.
+    fn tiny_cfg() -> TransformerConfig {
+        TransformerConfig {
+            in_channels: 16,
+            out_channels: 16,
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 128,
+            dim: 128,
+            ffn_dim: 256,
+            freq_dim: 256,
+            text_dim: 64,
+            patch: (1, 2, 2),
+            eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_max_seq_len: 1024,
+        }
+    }
+
+    /// Randomize every var in a fresh `VarMap` — `vb.get` raw tensors (notably the `patch_embedding`
+    /// conv weight) default to ZERO-init, and a zero patch kernel makes `hidden ≡ 0`, which makes the
+    /// LoRA adapters' inputs zero and their grads vacuously zero. Real training loads nonzero weights;
+    /// the tiny tests must do the same to exercise the gradient path.
+    fn randomize_base(vm: &VarMap, dev: &Device) {
+        for v in vm.all_vars() {
+            v.set(&Tensor::randn(0f32, 0.1f32, v.dims(), dev).unwrap())
+                .unwrap();
+        }
+    }
+
+    fn tiny_inputs(
+        cfg: &TransformerConfig,
+        dev: &Device,
+    ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
+        let x0 = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 1, 4, 4), dev).unwrap();
+        let umt5 = Tensor::randn(0f32, 1f32, (1, 3, cfg.text_dim), dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 1, 4, 4), dev).unwrap();
+        let (cos, sin) = WanRope::new(cfg).cos_sin(1, 2, 2, dev).unwrap();
+        (x0, umt5, noise, cos, sin)
+    }
+
+    /// ISOLATION: does `build_lora_targets` + `set.vars[i].set(..)` propagate to the installed
+    /// LoraLinear's forward, with NO Wan dit involved? (Pins the harness mechanism in this crate.)
+    #[test]
+    fn harness_factor_set_propagates_to_forward() {
+        use candle_gen::candle_nn::{Linear, Module};
+        use candle_gen::train::lora::{LoraHost, LoraLinear};
+        struct H(LoraLinear);
+        impl LoraHost for H {
+            fn visit_lora_mut(
+                &mut self,
+                f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+            ) -> candle_gen::Result<()> {
+                f(&mut self.0)
+            }
+        }
+        let dev = Device::Cpu;
+        let w = Tensor::zeros((4, 4), DType::F32, &dev).unwrap();
+        let mut h = H(LoraLinear::from_linear(
+            Linear::new(w, None),
+            4,
+            4,
+            "to_q".into(),
+        ));
+        let set = build_lora_targets(&mut h, &["to_q".to_string()], 2, 4.0, 7, &dev).unwrap();
+        let x = Tensor::randn(0f32, 1f32, (1, 4), &dev).unwrap();
+        let y0 =
+            h.0.forward(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.5f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let y1 =
+            h.0.forward(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+        assert_ne!(
+            y0, y1,
+            "setting set.vars must change the installed LoraLinear forward"
+        );
+    }
+
+    /// Band sampling is deterministic, in-band, and the high band lies above the low band.
+    #[test]
+    #[allow(clippy::manual_range_contains)] // the `±1e-6` tolerance reads clearer as explicit bounds
+    fn band_timestep_is_in_band_and_ordered() {
+        let hi = (T2V_14B_BOUNDARY, 1.0);
+        let lo = (0.0, T2V_14B_BOUNDARY);
+        for seed in [0u64, 1, 42, 9999] {
+            let a = sample_band_timestep("sigmoid", "balanced", hi, seed);
+            let b = sample_band_timestep("sigmoid", "balanced", hi, seed);
+            assert_eq!(a, b, "same seed reproduces");
+            assert!(
+                a >= T2V_14B_BOUNDARY - 1e-6 && a < 1.0,
+                "high band t out of range: {a}"
+            );
+            let l = sample_band_timestep("sigmoid", "balanced", lo, seed);
+            assert!(
+                l > 0.0 && l <= T2V_14B_BOUNDARY + 1e-6,
+                "low band t out of range: {l}"
+            );
+        }
+    }
+
+    /// Regression for sc-11157 / F-082: the dataset item must NOT stay parity-locked to the
+    /// alternating expert. Over a full pass, each expert must see EVERY item — most critically for
+    /// the even-sized datasets (2, 10, 20 items) that are the common LoRA case — so neither adapter
+    /// silently trains on a disjoint half. The pre-fix `(step - 1) % N` selector fails this: it kept
+    /// the high-noise expert on even indices and the low-noise on odd indices forever.
+    #[test]
+    fn experts_each_cover_the_whole_dataset() {
+        for &n in &[2usize, 4, 10, 20, 3, 7] {
+            // Run enough steps for every expert to complete at least one full cycle of the dataset.
+            let steps = (2 * n * 3) as u32;
+            let mut hi_seen = std::collections::BTreeSet::new();
+            let mut lo_seen = std::collections::BTreeSet::new();
+            for step in 1..=steps {
+                let idx = expert_item_index(step, n);
+                match expert_index(step) {
+                    0 => hi_seen.insert(idx),
+                    _ => lo_seen.insert(idx),
+                };
+            }
+            let full: std::collections::BTreeSet<usize> = (0..n).collect();
+            assert_eq!(
+                hi_seen, full,
+                "high-noise expert must cover all {n} items, saw {hi_seen:?}"
+            );
+            assert_eq!(
+                lo_seen, full,
+                "low-noise expert must cover all {n} items, saw {lo_seen:?}"
+            );
+        }
+    }
+
+    /// Guards the exact even-size parity trap from the finding: with N even, the OLD selector
+    /// `(step - 1) % N` collapses each expert onto one parity class. Assert the NEW selector breaks
+    /// that lock by having the high-noise expert reach at least one ODD index (impossible under the
+    /// old scheme) within N steps of its own progression.
+    #[test]
+    fn even_dataset_expert_is_not_parity_locked() {
+        let n = 10usize;
+        let mut hi_indices = Vec::new();
+        for step in (1..=(4 * n as u32)).filter(|s| expert_index(*s) == 0) {
+            hi_indices.push(expert_item_index(step, n));
+        }
+        assert!(
+            hi_indices.iter().any(|i| i % 2 == 1),
+            "high-noise expert never reached an odd index on N={n}: {hi_indices:?} — parity lock persists"
+        );
+        assert!(
+            hi_indices.iter().any(|i| i % 2 == 0),
+            "high-noise expert never reached an even index: {hi_indices:?}"
+        );
+    }
+
+    /// The keystone training gate: a real flow-match forward+backward over the tiny DiT with nonzero
+    /// LoRA factors yields a finite loss and a gradient on **every** adapter `Var`.
+    #[test]
+    fn backward_reaches_lora_factors() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut dit = WanTransformerTrain::new(&cfg, vb).unwrap();
+        randomize_base(&vm, &dev);
+        let suffixes: Vec<String> = WAN_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        // Move B off its zero-init so both A and B grads are nonzero (a no-op-init adapter zeros A's grad).
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let (x0, umt5, noise, cos, sin) = tiny_inputs(&cfg, &dev);
+        let (loss, grads) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        assert!(loss.is_finite(), "loss must be finite, got {loss}");
+        let mut saw_nonzero = false;
+        for (i, v) in set.vars.iter().enumerate() {
+            let g = grads
+                .get(v.as_tensor())
+                .unwrap_or_else(|| panic!("adapter var {i} has no gradient"));
+            let gv = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(
+                gv.iter().all(|x| x.is_finite()),
+                "var {i} gradient has non-finite entries"
+            );
+            if gv.iter().any(|x| x.abs() > 1e-9) {
+                saw_nonzero = true;
+            }
+        }
+        assert!(
+            saw_nonzero,
+            "every adapter gradient was zero — backprop is not reaching the factors"
+        );
+        // 4 projections × 2 attentions (attn1 self + attn2 cross) × num_layers, ×2 factors.
+        assert_eq!(set.vars.len(), 4 * 2 * cfg.num_layers * 2);
+    }
+
+    /// The correctness gate for the gradient-checkpointed backward (the path real training always uses):
+    /// it must reproduce the dense `loss.backward()` grads (mod float reassociation) on the tiny DiT.
+    /// All Wan adapters live in the checkpointed block stack (no retained pre-main adapters), so this
+    /// spans every adapter target.
+    #[test]
+    fn dense_and_checkpoint_grads_match() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut dit = WanTransformerTrain::new(&cfg, vb).unwrap();
+        randomize_base(&vm, &dev);
+        let suffixes: Vec<String> = WAN_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let (x0, umt5, noise, cos, sin) = tiny_inputs(&cfg, &dev);
+        let (loss_d, g_d) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        let (loss_c, g_c) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            true,
+        )
+        .unwrap();
+        assert!(
+            (loss_d - loss_c).abs() < 1e-4,
+            "loss: dense {loss_d} vs checkpoint {loss_c}"
+        );
+        let mut saw_nonzero = false;
+        for (i, v) in set.vars.iter().enumerate() {
+            let a = g_d
+                .get(v.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let b = g_c
+                .get(v.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-4,
+                    "grad mismatch for var {i} (dense {x} vs checkpoint {y})"
+                );
+                if x.abs() > 1e-6 {
+                    saw_nonzero = true;
+                }
+            }
+        }
+        assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+    }
+
+    /// A few optimizer steps on a fixed batch lower the loss — the step descends the flow-match
+    /// objective end to end through the harness.
+    #[test]
+    fn one_optimizer_step_descends() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut dit = WanTransformerTrain::new(&cfg, vb).unwrap();
+        randomize_base(&vm, &dev);
+        let suffixes: Vec<String> = WAN_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let (x0, umt5, noise, cos, sin) = tiny_inputs(&cfg, &dev);
+        let mut opt = TrainOptimizer::from_config("adamw", set.vars.clone(), 1e-2, 0.0).unwrap();
+        let (loss0, mut grads) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        for _ in 0..5 {
+            clip_grad_norm(&mut grads, &set.vars, 1.0).unwrap();
+            opt.step(&grads).unwrap();
+            let (_l, g) = compute_loss_grads(
+                &dit,
+                &set.vars,
+                &x0,
+                &umt5,
+                0.5,
+                &noise,
+                &cos,
+                &sin,
+                false,
+                DType::F32,
+                false,
+            )
+            .unwrap();
+            grads = g;
+        }
+        let (loss1, _) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        assert!(
+            loss1 < loss0,
+            "5 steps on a fixed batch should lower the loss: {loss0} -> {loss1}"
+        );
+    }
+
+    /// The trainer self-registers and resolves through gen-core's trainer registry as the candle Wan
+    /// A14B trainer; `load_trainer` is lazy, so a nonexistent weights dir still resolves.
+    #[test]
+    fn trainer_registers_and_resolves_as_candle() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let t = registry::load_trainer(MODEL_ID_T2V_14B, &spec)
+            .expect("candle wan a14b trainer is registered");
+        assert_eq!(t.descriptor().id, MODEL_ID_T2V_14B);
+        assert_eq!(t.descriptor().backend, "candle");
+        assert_eq!(t.descriptor().modality, Modality::Video);
+        assert!(t.descriptor().supports_lora && t.descriptor().supports_lokr);
+    }
+
+    /// `validate` rejects an empty dataset, zero rank/steps, an unsupported optimizer, and unrecognized
+    /// timestep/loss knobs — before any load (now via the shared `flow_match::validate_flow_match_request`).
+    #[test]
+    fn validate_rejects_bad_requests() {
+        use candle_gen::gen_core::runtime::CancelFlag;
+        use candle_gen::gen_core::train::TrainingItem;
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let t = registry::load_trainer(MODEL_ID_T2V_14B, &spec).unwrap();
+        let base = TrainingRequest {
+            items: vec![TrainingItem {
+                image_path: "/img.png".into(),
+                caption: "x".into(),
+                control_image_path: None,
+            }],
+            config: TrainingConfig::default(),
+            output_dir: "/out".into(),
+            file_name: "a.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        assert!(t.validate(&base).is_ok());
+        let bad = |mutate: &dyn Fn(&mut TrainingRequest)| {
+            let mut r = base.clone();
+            mutate(&mut r);
+            assert!(t.validate(&r).is_err());
+        };
+        bad(&|r| r.items.clear());
+        bad(&|r| r.config.rank = 0);
+        bad(&|r| r.config.steps = 0);
+        bad(&|r| r.config.optimizer = "lion".into());
+        bad(&|r| r.config.timestep_type = "bogus".into());
+        bad(&|r| r.config.loss_type = "huber".into());
+    }
+
+    /// The expert-suffix filename insertion lands before the extension.
+    #[test]
+    fn expert_suffix_naming() {
+        assert_eq!(
+            with_expert_suffix("mylora.safetensors", "high_noise"),
+            "mylora.high_noise.safetensors"
+        );
+        assert_eq!(
+            with_expert_suffix("mylora.safetensors", "low_noise"),
+            "mylora.low_noise.safetensors"
+        );
+        assert_eq!(
+            with_expert_suffix("noext", "high_noise"),
+            "noext.high_noise"
+        );
+    }
+}

@@ -1,0 +1,50 @@
+[package]
+name = "candle-gen-krea"
+version = "0.0.0"
+edition = "2021"
+description = "Krea 2 (Turbo T2I inference) provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-krea."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "krea-2", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# Krea 2's VAE is the **Qwen-Image** `AutoencoderKLQwenImage` (the published `vae/config.json` declares
+# `_name_or_path = "Qwen/Qwen-Image"`); reuse `candle_gen_qwen_image::vae::QwenVae` wholesale rather
+# than re-port the causal-Conv3d VAE — exactly as `mlx-gen-krea` reuses `mlx-gen-qwen-image`'s `QwenVae`
+# (the boogu→z-image / kolors→sdxl provider-reuse precedent).
+candle-gen-qwen-image = { path = "../candle-gen-qwen-image" }
+# Krea 2's Qwen3-VL condition encoder shares the **Qwen3-VL vision tower** with boogu (image-grounded
+# edit conditioning, epic 10871 / sc-10880). Reuse the parity-tested `candle_gen_boogu::vision`
+# `VisionTower` + image preprocess from a Krea-4B `VisionConfig` rather than re-port ~640 lines of
+# parity-critical ViT code — exactly as `mlx-gen-krea` depends on `mlx-gen-boogu` (and as krea already
+# reuses `mlx-gen-qwen-image`'s VAE). Krea's tower is 4B (narrower/shallower than boogu's 8B) but the
+# block code is dim-generic off `VisionConfig`.
+candle-gen-boogu = { path = "../candle-gen-boogu" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853). Krea reuses the Qwen-Image VAE, so
+# it shares the `qwenimage` PiD latent-space student. Wired behind `req.use_pid` (default off → the
+# byte-exact native QwenVae decode).
+candle-gen-pid = { path = "../candle-gen-pid" }
+# Link-time self-registration of the `krea_2_turbo` generator into the `candle_gen` registry
+# (`lib.rs::inventory::submit!`); discovered by `gen_core::registry::load(id, …)` when the worker
+# force-links this crate.
+inventory = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity, shared with z-image/ideogram/boogu).
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# Parse the diffusers `transformer/config.json` + `text_encoder/config.json` + `model_index.json`.
+serde_json = "1"
+# Read a trained adapter `.safetensors` header `__metadata__` (`networkType`/`rank`/`alpha`) for the
+# inference-side LoRA/LoKr merge (sc-7836) — candle's tensor loader drops the header blob. Candle's own
+# version (0.7), matching candle-gen / the other provider crates' `adapters.rs`.
+safetensors = "0.7"
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-gen-qwen-image/metal", "candle-gen-boogu/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda", "candle-gen-boogu/cuda", "candle-gen-pid/cuda"]
+
+[dev-dependencies]
+# Encode the e2e real-weight smoke output to PNG for eyeballing (sc-7582); mirrors the other families.
+image = { version = "0.25", default-features = false, features = ["png"] }

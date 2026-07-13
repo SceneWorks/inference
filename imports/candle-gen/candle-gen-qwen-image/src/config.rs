@@ -1,0 +1,178 @@
+//! Qwen-Image configuration, ported from `mlx-gen-qwen-image`. Dims are the production
+//! `qwen_image` values (T2I).
+
+/// Registry id for Qwen-Image txt2img.
+pub const MODEL_ID: &str = "qwen_image";
+
+pub const DEFAULT_WIDTH: u32 = 1024;
+pub const DEFAULT_HEIGHT: u32 = 1024;
+/// Default sampling steps for the **non-distilled** Qwen-Image base T2I model (sc-9046 / F-076).
+/// Qwen-Image base is a 20B undistilled flow-match model — 4 steps is a distilled/Lightning count and
+/// yields a visibly broken render, so the engine default must be a production step count. 30 matches
+/// the sibling non-distilled paths in this crate ([`crate::edit::QwenEditRequest`],
+/// [`crate::control_fun::QwenFunControlRequest`]) and sits inside the diffusers `QwenImagePipeline` range
+/// (20–50). An explicit caller-supplied `steps` is always honored — only this default changed. (The
+/// few-step distilled Lightning path lives on the Edit surface, gated by `QwenEditRequest::lightning`,
+/// and keeps its own low step count.)
+pub const DEFAULT_STEPS: u32 = 30;
+/// True-CFG guidance scale default.
+pub const DEFAULT_GUIDANCE: f32 = 4.0;
+/// Single space — the negative prompt used when a CFG request omits one.
+pub const NEGATIVE_FALLBACK: &str = " ";
+
+/// Both image dims must be multiples of 16 (VAE /8 then the DiT 2×2 patch).
+pub const SIZE_MULTIPLE: u32 = 16;
+
+/// VAE latent channels.
+pub const LATENT_CHANNELS: usize = 16;
+/// DiT 2×2 patch — the packed token feature width is `LATENT_CHANNELS * PATCH² = 64`.
+pub const PATCH: usize = 2;
+
+/// The Qwen-Image dual-stream MMDiT dims.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformerConfig {
+    /// Packed latent channels entering the transformer (`LATENT_CHANNELS * PATCH² = 64`).
+    pub in_channels: usize,
+    /// VAE latent channels leaving the transformer (16).
+    pub out_channels: usize,
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    /// Text embed width from Qwen2.5-VL (3584).
+    pub joint_attention_dim: usize,
+    /// Sinusoidal timestep-embedding width (256).
+    pub timestep_channels: usize,
+    /// 3-axis (frame, height, width) RoPE.
+    pub axes_dim: [usize; 3],
+    pub rope_theta: f32,
+    pub eps: f64,
+}
+
+impl TransformerConfig {
+    pub fn qwen_image() -> Self {
+        Self {
+            in_channels: LATENT_CHANNELS * PATCH * PATCH,
+            out_channels: LATENT_CHANNELS,
+            num_layers: 60,
+            num_heads: 24,
+            head_dim: 128,
+            joint_attention_dim: 3584,
+            timestep_channels: 256,
+            axes_dim: [16, 56, 56],
+            rope_theta: 10_000.0,
+            eps: 1e-6,
+        }
+    }
+
+    /// `Qwen/Qwen-Image-2512` (sc-8647 — parity with mlx-gen sc-8271). The Dec-2025 base refresh is
+    /// architecturally identical to the original `Qwen/Qwen-Image`: the same 60-layer dual-stream
+    /// MMDiT, the same 24×128 head geometry, the same 3-axis RoPE, and the same Qwen2.5-VL text
+    /// width. Only the trained weights differ, so the config is a verbatim drop-in. We expose it as a
+    /// distinct named constructor so the parity is explicit and test-pinned. (There is no mlx
+    /// registry alias; parity rides the worker-side 2512 base-default plus the shared
+    /// `DERIVED_TOKENIZER_OVERLAYS` `Qwen/Qwen-Image-2512` → `SceneWorks/qwen-image-tokenizer`
+    /// entry — sc-8271.) It also gives the 2512-Fun control overlay (sc-8350) a named base config.
+    pub fn qwen_image_2512() -> Self {
+        Self::qwen_image()
+    }
+
+    /// `num_heads * head_dim` — the model width (3072).
+    pub fn inner_dim(&self) -> usize {
+        self.num_heads * self.head_dim
+    }
+}
+
+/// The Qwen2.5-VL language-model (text path) dims.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextEncoderConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub n_layers: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub rope_theta: f32,
+    pub rms_norm_eps: f64,
+    /// Tokens dropped off the front of the encoded sequence (the QwenImage system-prompt prefix).
+    pub prompt_drop_idx: usize,
+    pub max_length: usize,
+    pub pad_token_id: i32,
+}
+
+impl TextEncoderConfig {
+    pub fn qwen_image() -> Self {
+        Self {
+            vocab_size: 152064,
+            hidden_size: 3584,
+            n_layers: 28,
+            n_heads: 28,
+            n_kv_heads: 4,
+            head_dim: 128,
+            intermediate_size: 18944,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
+            prompt_drop_idx: 34,
+            max_length: 1058,
+            pad_token_id: 151643,
+        }
+    }
+
+    /// `Qwen/Qwen-Image-2512` text path (sc-8647). The 2512 base reuses the same Qwen2.5-VL text
+    /// encoder and the same Qwen2 BPE tokenizer (unchanged across the Qwen-Image line — see the
+    /// worker's `DERIVED_TOKENIZER_OVERLAYS`, which points 2512 at the same hosted overlay), so the
+    /// text-encoder config is a verbatim drop-in.
+    pub fn qwen_image_2512() -> Self {
+        Self::qwen_image()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dims_match_fork() {
+        let t = TransformerConfig::qwen_image();
+        assert_eq!(t.num_layers, 60);
+        assert_eq!(t.inner_dim(), 3072);
+        assert_eq!(t.in_channels, 64);
+        assert_eq!(t.out_channels, 16);
+        assert_eq!(t.joint_attention_dim, 3584);
+        assert_eq!(t.axes_dim.iter().sum::<usize>(), t.head_dim);
+
+        let e = TextEncoderConfig::qwen_image();
+        assert_eq!(e.hidden_size, 3584);
+        assert_eq!(e.n_layers, 28);
+        assert_eq!(e.n_heads / e.n_kv_heads, 7);
+        assert_eq!(e.hidden_size, t.joint_attention_dim);
+    }
+
+    /// sc-9046 (F-076): the base txt2img default must be a production step count for the
+    /// **non-distilled** 20B Qwen-Image base — not the 4-step distilled/Lightning count. 30 matches
+    /// the sibling non-distilled paths (edit/control) and sits in the diffusers 20–50 range.
+    #[test]
+    fn default_steps_is_a_production_count_for_the_undistilled_base() {
+        // 30 is a production count (matches edit/control siblings, inside diffusers' 20–50 range) and
+        // is decisively out of few-step distilled/Lightning territory — never revert to 4 on the base.
+        assert_eq!(
+            DEFAULT_STEPS, 30,
+            "Qwen-Image base T2I is not distilled — the engine default must be a production step \
+             count (a 4-step default renders garbage)"
+        );
+    }
+
+    /// sc-8647 (parity with mlx-gen sc-8271): `Qwen/Qwen-Image-2512` is architecturally identical to
+    /// the original `Qwen/Qwen-Image`, so both config constructors are verbatim drop-ins.
+    #[test]
+    fn qwen_image_2512_is_a_verbatim_config_dropin() {
+        assert_eq!(
+            TransformerConfig::qwen_image_2512(),
+            TransformerConfig::qwen_image()
+        );
+        assert_eq!(
+            TextEncoderConfig::qwen_image_2512(),
+            TextEncoderConfig::qwen_image()
+        );
+    }
+}

@@ -1,0 +1,532 @@
+//! # candle-gen-sensenova
+//!
+//! The **SenseNova-U1** (NEO-Unify) provider crate for [`candle-gen`](candle_gen) — the candle
+//! (Windows/CUDA) sibling of `mlx-gen-sensenova`. It implements the backend-neutral
+//! [`gen_core::Generator`] contract and self-registers via `inventory`, so linking this crate makes
+//! `gen_core::load("sensenova_u1_8b", …)` (and `…_fast`) resolve the candle generator.
+//!
+//! **txt2img:** SenseNova-U1 is a *unified* multimodal model — a dense dual-path Qwen3 "MoT" backbone
+//! (understanding + generation paths) with a flow-matching image head; there is no separate VAE or
+//! text encoder. This slice wires the **non-think T2I** path the `Generator` contract drives: build
+//! the `neo1_0` query, prefill it on the understanding path, then run the flow-matching denoise loop
+//! on the generation path ([`crate::t2i`]) and unpatchify to RGB. Deterministic CPU-seeded noise
+//! (sc-3673) makes output launch-portable per seed.
+//!
+//! Two registered ids share the loader: **`sensenova_u1_8b`** (50 NFE, CFG 4.0) and
+//! **`sensenova_u1_8b_fast`** (8 NFE, CFG 1.0 — its loader merges the 8-step distill LoRA into the
+//! dense generation path). Both advertise **only** the wired T2I surface through the `Generator`
+//! contract — image-edit / Character Studio (it2i), user LoRAs, and quantization are NOT advertised
+//! and are rejected rather than silently dropped. `backend` is `"candle"` and `mac_only` is `false`.
+//!
+//! **Understanding surface (VQA + interleave, sc-5501):** SenseNova-U1's text / text+image modes
+//! ([`T2iModel::vqa`], [`T2iModel::interleave_gen`]) output what the neutral
+//! [`GenerationOutput`](gen_core::GenerationOutput) contract can't express, so they are exposed as
+//! direct methods on the concrete [`T2iModel`] (built via [`load_understanding`]) and driven by the
+//! worker off-registry — the candle sibling of `mlx-gen-sensenova`'s `T2iModel::{vqa, interleave_gen}`
+//! carve-outs. This retires the `sensenova_u1` VQA / interleave torch paths off-Mac.
+
+mod config;
+mod distill;
+mod fm;
+mod qwen3;
+mod runtime;
+mod t2i;
+mod text;
+mod vision;
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use candle_gen::candle_core::{DType, Device};
+use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::{
+    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Progress, WeightsSource,
+};
+use candle_gen::{CandleError, Result};
+
+use distill::{resolve_distill_lora, DistillLora, DISTILL_LORA_FILE};
+
+// The understanding surface (VQA + Document-Studio interleave) is driven by the worker **directly**
+// off the concrete `T2iModel` (its text / text+image output the neutral `Generator` contract can't
+// express), so re-export the types + a dense loader the worker assembles them from.
+pub use config::NeoChatConfig;
+pub use runtime::Sampler;
+pub use t2i::{
+    interleave_resolution_for, smart_resize, tensor_to_image, CfgNorm, InterleaveOutput, T2iModel,
+    T2iOptions, INTERLEAVE_RESOLUTIONS,
+};
+pub use text::{SenseNovaTokenizer, INTERLEAVE_SYSTEM_MESSAGE};
+
+/// Registry id — the base 8B-MoT variant.
+pub const MODEL_ID: &str = "sensenova_u1_8b";
+/// The 8-step distilled variant (same base weights, distill LoRA merged at load).
+pub const MODEL_ID_FAST: &str = "sensenova_u1_8b_fast";
+
+const DEFAULT_STEPS: u32 = 50;
+const DEFAULT_GUIDANCE: f32 = 4.0;
+/// Distilled defaults (`docs/base_vs_distill.md`): 8 NFE at CFG 1.0 (guidance off).
+const DEFAULT_STEPS_FAST: u32 = 8;
+const DEFAULT_GUIDANCE_FAST: f32 = 1.0;
+/// The product inference timestep-shift for the t2i path when the request doesn't override it
+/// (`req.scheduler_shift`). This is the *pipeline* shift the reference `t2i_generate` applies at
+/// sampling time — deliberately **3.0**, which is distinct from the checkpoint's config-declared
+/// `timestep_shift` (`NeoChatConfig::timestep_shift`, `1.0` for the shipped 8B-MoT). See
+/// [`NeoChatConfig::inference_timestep_shift`] for why the config field does *not* feed inference.
+const DEFAULT_TIMESTEP_SHIFT: f32 = 3.0;
+/// Cell = patch·merge: every side must be a multiple of this (the patchify grid).
+pub const SIZE_MULTIPLE: u32 = 32;
+
+/// The base descriptor (`sensenova_u1_8b`).
+pub fn descriptor() -> ModelDescriptor {
+    descriptor_for(MODEL_ID)
+}
+
+/// The 8-step distilled descriptor (`sensenova_u1_8b_fast`). Identical capability surface to the
+/// base — only the id and the generation defaults differ.
+pub fn descriptor_fast() -> ModelDescriptor {
+    descriptor_for(MODEL_ID_FAST)
+}
+
+/// SenseNova-U1's identity + the surface this candle slice wires: classifier-free guidance over the
+/// prompt, **txt2img only**. it2i/edit (Reference), true-CFG image guidance, VQA, interleave, user
+/// LoRA, and quantization (all wired in the mlx provider) are NOT advertised — they stay the Python
+/// fallback's job until candle wires them, so the descriptor never promises a path `generate` can't
+/// serve. Two backend-correct deviations from `mlx-gen-sensenova`: `backend = "candle"` and
+/// `mac_only = false`.
+fn descriptor_for(id: &'static str) -> ModelDescriptor {
+    ModelDescriptor {
+        id,
+        family: "sensenova-u1",
+        backend: "candle",
+        modality: Modality::Image,
+        capabilities: Capabilities {
+            supports_negative_prompt: false,
+            supports_guidance: true,
+            // it2i image-CFG (true_cfg) and reference conditioning are Phase 6 (understanding surface).
+            supports_true_cfg: false,
+            conditioning: vec![],
+            supports_lora: false,
+            supports_lokr: false,
+            // Bespoke-by-architecture (epic 7114 P4, sc-7123 — mirrors the mlx-gen SenseNova won't-do):
+            // SenseNova-U1 is an AUTOREGRESSIVE backbone whose `predict_v` mutates a per-step `KvCache`
+            // (`cache.len()` feeds the RoPE/position build) shared across the cond/uncond passes. The
+            // unified curated solvers do multiple model evals per step (heun = 2; dpmpp_2m/uni_pc reuse
+            // prior-step state) and would append to the cache multiple times → desynced AR positions →
+            // corrupt output. The native shifted-Euler (single eval/step, `req.scheduler_shift`) is the
+            // only valid integrator, so no curated sampler/scheduler menu is advertised (N3: empty list).
+            samplers: Vec::new(),
+            schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
+            min_size: 256,
+            max_size: 2048,
+            max_count: 8,
+            mac_only: false,
+            // No on-the-fly quantization wired in the candle slice (dense f32).
+            supported_quants: &[],
+            // The backbone uses a KV cache for the AR prefix + denoise.
+            supports_kv_cache: true,
+            // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
+            requires_sigma_shift: true,
+        },
+    }
+}
+
+/// The loaded SenseNova-U1 components, `Arc`-shared so the generator can cache them across calls.
+#[derive(Clone)]
+struct Components {
+    tokenizer: Arc<SenseNovaTokenizer>,
+    model: Arc<T2iModel>,
+    /// The parsed checkpoint config, kept so `options` can resolve the inference timestep shift from
+    /// the checkpoint's own `timestep_shift` rather than always the product default (sc-9029).
+    cfg: Arc<NeoChatConfig>,
+}
+
+/// A loaded candle SenseNova-U1 generator. Loading is **lazy**: `load` does no file I/O (registry
+/// introspection against a missing path still resolves), and the heavy unified model is built on the
+/// first [`generate`](Generator::generate) call and then cached.
+pub struct SenseNovaGenerator {
+    descriptor: ModelDescriptor,
+    root: PathBuf,
+    device: Device,
+    /// The 8-step distilled variant — merges the distill LoRA at build + applies distilled defaults.
+    fast: bool,
+    components: Mutex<Option<Components>>,
+}
+
+impl SenseNovaGenerator {
+    fn components(&self) -> Result<Components> {
+        candle_gen::cached(&self.components, || {
+            let cfg = NeoChatConfig::from_dir(&self.root)?;
+            let vb = f32_vb(&self.root, &self.device)?;
+            let mut model = T2iModel::from_weights(&vb, &cfg)?;
+            if self.fast {
+                // Merge the 8-step distill LoRA into the dense generation path. Assert full coverage —
+                // `7 · layers` gen-path projections + the 2 FM-head Linears — so a stale/mismatched LoRA
+                // fails loudly rather than silently merging a subset.
+                let lora_path = resolve_distill_lora(&self.root)?;
+                let lora = DistillLora::from_file(&lora_path)?;
+                let applied = model.merge_distill_lora(&lora)?;
+                let expected = cfg.llm.num_hidden_layers * 7 + 2;
+                if applied != expected {
+                    return Err(CandleError::Msg(format!(
+                        "{}: distill LoRA merged {applied} targets, expected {expected} \
+                         (7·{} gen-path linears + 2 fm_head) — wrong LoRA file?",
+                        self.descriptor.id, cfg.llm.num_hidden_layers
+                    )));
+                }
+            }
+            let tokenizer = SenseNovaTokenizer::from_dir(&self.root)?;
+            Ok(Components {
+                tokenizer: Arc::new(tokenizer),
+                model: Arc::new(model),
+                cfg: Arc::new(cfg),
+            })
+        })
+    }
+
+    /// Map a request to [`T2iOptions`] (distilled vs base defaults; explicit request values win).
+    ///
+    /// `cfg` is the loaded checkpoint config: the timestep shift is resolved through
+    /// [`NeoChatConfig::inference_timestep_shift`] so a future checkpoint variant that declares its
+    /// own inference shift is honored instead of being shadowed by the product default (sc-9029).
+    fn options(&self, req: &GenerationRequest, cfg: &NeoChatConfig, seed: u64) -> T2iOptions {
+        let (def_steps, def_guidance) = if self.fast {
+            (DEFAULT_STEPS_FAST, DEFAULT_GUIDANCE_FAST)
+        } else {
+            (DEFAULT_STEPS, DEFAULT_GUIDANCE)
+        };
+        T2iOptions {
+            cfg_scale: req.guidance.unwrap_or(def_guidance),
+            num_steps: req.steps.unwrap_or(def_steps) as usize,
+            // Precedence: explicit request wins; else the checkpoint's own inference shift if it
+            // declares one; else the product default (3.0). Reads the parsed config so the field is
+            // no longer a silent shadow (sc-9029 / F-045).
+            timestep_shift: req
+                .scheduler_shift
+                .unwrap_or_else(|| cfg.inference_timestep_shift(DEFAULT_TIMESTEP_SHIFT)),
+            seed,
+            ..Default::default()
+        }
+    }
+
+    /// The rich-`Result` body behind [`Generator::generate`].
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let comps = self.components()?;
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let (w, h) = (req.width as usize, req.height as usize);
+
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            // A 50-step 8B run is multi-minute; check cancellation between images too (the per-step
+            // check lives in the denoise loop).
+            if req.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            let opts = self.options(req, &comps.cfg, seed);
+            let img = comps.model.generate(
+                &comps.tokenizer,
+                &req.prompt,
+                w,
+                h,
+                &opts,
+                &req.cancel,
+                on_progress,
+            )?;
+            // `?` bridges the candle-side `tensor_to_image` error into `CandleError`.
+            Ok(tensor_to_image(&img)?)
+        })?;
+        Ok(GenerationOutput::Images(images))
+    }
+}
+
+impl Generator for SenseNovaGenerator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        let id = self.descriptor.id;
+        // Capability floor (count/size range, guidance; the empty `conditioning` rejects any
+        // conditioning entry).
+        self.descriptor.capabilities.validate_request(id, req)?;
+        if req.prompt.trim().is_empty() {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: prompt must not be empty"
+            )));
+        }
+        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+                req.width, req.height
+            )));
+        }
+        // `steps == 0` builds an empty denoise trajectory; `None` falls back to the variant default.
+        if req.steps == Some(0) {
+            return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
+        }
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+/// mmap an f32 [`VarBuilder`] over the SenseNova-U1 checkpoint shards (the flat `*.safetensors` under
+/// `root`, excluding the optional co-located distill LoRA).
+fn f32_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(root)
+        .map_err(|e| CandleError::Msg(format!("sensenova: read {}: {e}", root.display())))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .filter(|p| !candle_gen::gen_core::weightsmeta::is_hidden_file(p))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some(DISTILL_LORA_FILE))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "sensenova: no .safetensors found in {} (expected a SenseNova-U1-8B-MoT snapshot)",
+            root.display()
+        )));
+    }
+    // Shared audited unsafe-mmap surface (sc-8999 / F-019). The distill-LoRA exclusion filter above
+    // is a genuine per-site variation, so the read_dir/sort stays local; only the mmap is shared.
+    candle_gen::mmap_var_builder(&files, DType::F32, device)
+}
+
+/// Build the dense f32 understanding model ([`T2iModel`]) + tokenizer for a SenseNova-U1-8B-MoT
+/// snapshot — the VQA / interleave entry the worker drives directly (the modes the neutral
+/// `Generator` contract can't express). Loads **dense** (no distill LoRA, no quantization), exactly
+/// like the base registry path, so the understanding decode uses the full base model. The heavy mmap
+/// happens here, so the worker calls this once on its blocking thread per job.
+pub fn load_understanding(root: &Path) -> Result<(T2iModel, SenseNovaTokenizer)> {
+    let cfg = NeoChatConfig::from_dir(root)?;
+    let device = candle_gen::default_device()?;
+    let vb = f32_vb(root, &device)?;
+    let model = T2iModel::from_weights(&vb, &cfg)?;
+    let tokenizer = SenseNovaTokenizer::from_dir(root)?;
+    Ok((model, tokenizer))
+}
+
+/// Construct the (lazy) base candle SenseNova-U1 generator (`sensenova_u1_8b`).
+pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_inner(spec, false)
+}
+
+/// Construct the (lazy) 8-step distilled generator (`sensenova_u1_8b_fast`).
+pub fn load_fast(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_inner(spec, true)
+}
+
+fn load_inner(spec: &LoadSpec, fast: bool) -> gen_core::Result<Box<dyn Generator>> {
+    let id = if fast { MODEL_ID_FAST } else { MODEL_ID };
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(format!(
+                "{id} expects a SenseNova-U1-8B-MoT snapshot directory, not a single .safetensors file"
+            )));
+        }
+    };
+    // User-supplied LoRAs are unsupported on both ids — the distill LoRA is merged internally by the
+    // fast loader, never stacked via `spec.adapters`.
+    if !spec.adapters.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: user-supplied adapters are not supported (supports_lora=false)"
+        )));
+    }
+    if spec.quantize.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: on-the-fly Q4/Q8 quantization is not wired in the candle slice yet (dense f32 only)"
+        )));
+    }
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: control / IP-adapter overlays are not supported (txt2img only)"
+        )));
+    }
+    let device = candle_gen::default_device()?;
+    Ok(Box::new(SenseNovaGenerator {
+        descriptor: descriptor_for(id),
+        root,
+        device,
+        fast,
+        components: Mutex::new(None),
+    }))
+}
+
+// Link-time self-registration of both ids into gen-core's model registry.
+candle_gen::register_generators! {
+    descriptor => load,
+    descriptor_fast => load_fast,
+}
+
+/// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
+/// references nothing here directly, so the linker (MSVC on a release build in particular) can discard
+/// the whole rlib — taking the `inventory::submit!` registrations with it. Referencing this no-op from
+/// the consumer keeps the crate linked. (Same pattern as `candle_gen_chroma::force_link`.)
+pub fn force_link() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::gen_core::registry;
+    use candle_gen::gen_core::{AdapterKind, AdapterSpec, Conditioning, Image, Quant};
+
+    #[test]
+    fn registers_both_ids_as_candle() {
+        let ids: Vec<&str> = registry::generators()
+            .map(|r| (r.descriptor)().id)
+            .collect();
+        assert!(ids.contains(&MODEL_ID), "{MODEL_ID} not registered");
+        assert!(
+            ids.contains(&MODEL_ID_FAST),
+            "{MODEL_ID_FAST} not registered"
+        );
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID, &spec).expect("candle sensenova is registered");
+        assert_eq!(g.descriptor().id, "sensenova_u1_8b");
+        assert_eq!(g.descriptor().family, "sensenova-u1");
+        assert_eq!(g.descriptor().backend, "candle");
+        assert_eq!(g.descriptor().modality, Modality::Image);
+    }
+
+    #[test]
+    fn descriptor_advertises_only_wired_t2i_surface() {
+        let d = descriptor();
+        assert!(d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.mac_only);
+        assert!(d.capabilities.conditioning.is_empty());
+        assert!(!d.capabilities.supports_lora);
+        assert!(!d.capabilities.supports_lokr);
+        assert!(d.capabilities.supported_quants.is_empty());
+        assert!(d.capabilities.supports_kv_cache);
+        assert!(d.capabilities.requires_sigma_shift);
+        // The fast variant shares the capability surface; only id + defaults differ.
+        let f = descriptor_fast();
+        assert_eq!(f.id, MODEL_ID_FAST);
+        assert_eq!(f.family, d.family);
+        assert_eq!(f.capabilities.max_size, d.capabilities.max_size);
+    }
+
+    #[test]
+    fn validate_accepts_t2i_and_rejects_unsupported() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID, &spec).unwrap();
+
+        let ok = GenerationRequest {
+            prompt: "a cat holding a lit candle".into(),
+            width: 512,
+            height: 512,
+            guidance: Some(4.0),
+            ..Default::default()
+        };
+        assert!(g.validate(&ok).is_ok());
+
+        for bad in [
+            GenerationRequest {
+                width: 512,
+                height: 512,
+                ..Default::default()
+            }, // empty prompt
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 300, // not a multiple of 32
+                height: 512,
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 512,
+                height: 512,
+                steps: Some(0),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 512,
+                height: 512,
+                conditioning: vec![Conditioning::Reference {
+                    image: Image::default(),
+                    strength: None,
+                }],
+                ..Default::default()
+            },
+        ] {
+            assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
+        }
+    }
+
+    /// sc-9029 / F-045: `options` must route the timestep shift through the checkpoint config, not a
+    /// hardcoded 3.0. Pins the resolved `T2iOptions.timestep_shift` against request/config precedence.
+    #[test]
+    fn options_resolves_timestep_shift_from_request_then_config() {
+        let gen = SenseNovaGenerator {
+            descriptor: descriptor(),
+            root: "/nonexistent".into(),
+            device: candle_gen::default_device().unwrap(),
+            fast: false,
+            components: Mutex::new(None),
+        };
+        let req = GenerationRequest {
+            prompt: "a cat".into(),
+            width: 512,
+            height: 512,
+            ..Default::default()
+        };
+
+        // Shipped 8B-MoT (config timestep_shift = 1.0 identity) → product default 3.0, unchanged render.
+        let shipped = crate::config::mot_8b();
+        assert_eq!(gen.options(&req, &shipped, 0).timestep_shift, 3.0);
+
+        // An explicit request scheduler_shift wins over everything.
+        let req_shift = GenerationRequest {
+            scheduler_shift: Some(2.5),
+            ..req.clone()
+        };
+        assert_eq!(gen.options(&req_shift, &shipped, 0).timestep_shift, 2.5);
+
+        // A checkpoint variant declaring its own inference shift is honored (no longer shadowed).
+        let variant = crate::config::variant_with_timestep_shift(7.0);
+        assert_eq!(gen.options(&req, &variant, 0).timestep_shift, 7.0);
+        // ...but an explicit request still overrides the variant's config value.
+        assert_eq!(gen.options(&req_shift, &variant, 0).timestep_shift, 2.5);
+    }
+
+    #[test]
+    fn load_rejects_unwired_surfaces_and_single_file() {
+        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
+        ]);
+        assert!(matches!(
+            load(&lora).err().expect("err"),
+            gen_core::Error::Unsupported(_)
+        ));
+        // The fast loader rejects user adapters too (its distill LoRA is internal, not user-supplied).
+        assert!(matches!(
+            load_fast(&lora).err().expect("err"),
+            gen_core::Error::Unsupported(_)
+        ));
+
+        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        assert!(matches!(
+            load(&quant).err().expect("err"),
+            gen_core::Error::Unsupported(_)
+        ));
+
+        let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()));
+        let err = load(&single).err().expect("err").to_string();
+        assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+}

@@ -1,0 +1,55 @@
+[package]
+name = "candle-gen-joycaption"
+version = "0.0.0"
+edition = "2021"
+description = "JoyCaption (LLaVA: SigLIP + Llama-3.1-8B) image-captioning provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-joycaption."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "joycaption", "captioning", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+inventory = { workspace = true }
+# The unified LLM engine: serves the JoyCaption VLM as the `candle-llava` core-llm vision provider
+# that this shim now consumes through the contract (sc-7692). Pinned to the SAME rev the SceneWorks
+# worker pins so cargo unifies ONE candle-llm — one `candle_core::Tensor`, one `core-llm` — across the
+# worker dependency graph. Both candle-gen and candle-llm pin the identical `candle-core` rev, so there
+# is a single candle build and one `Tensor` type; `core-llm` is `branch = "main"` everywhere, so cargo
+# locks one rev. The in-core SigLIP tower + projector + splice + Llama decoder that used to live here
+# moved into candle-llm's `candle-llava` provider (story 7634).
+# Bumped `8ab61c8` -> `54ef5a1` (sc-8002): the SceneWorks worker's mlx-llm bump pulls `core-llm` to the
+# Qwen3.6 tool-calling API (`core_llm::Message.tool_calls` et al.); `54ef5a1` is the candle-llm rev that
+# carries the matching wiring (candle-llm #35) so cargo still unifies ONE candle-llm in the worker graph.
+# The shim's own `Message {…}` literals get `tool_calls: Vec::new()` for the new field (see src/lib.rs).
+# Bumped `54ef5a1` -> `bf99e5b` (sc-8177): the SceneWorks worker's mlx-llm bump (PR #928) pulls `core-llm`
+# forward to `3870ed1`, which added `Content::Video`, `TextLlmCapabilities.supports_video`, and
+# `TextLlmRegistration.weightless_vision`; `bf99e5b` is the candle-llm rev that adds the matching (text-only,
+# additive) wiring so candle-llm still compiles against the unified `core-llm` in the worker graph.
+# Bumped `bf99e5b` -> `d0ba3e6` (sc-8116, epic 8103): bring the Qwen3-VL vision tower (sc-8080: ViT +
+# DeepStack + interleaved M-RoPE) into the backend-candle graph for the vision-grounded Ideogram caption job.
+# This shim only `use candle_llm as _;` (force-link for the `inventory::submit!` provider registration — it
+# consumes NO candle-llm symbols), so the bump is purely a pin alignment that keeps cargo unifying ONE
+# candle-llm across the worker graph (the worker re-pins its own direct candle-llm dep to the same rev).
+# `d0ba3e6` is candle-llm main (`d15954c`, the vision tower) with its core-llm pin reverted `rev=3870ed1`
+# -> `branch=main` so it unifies with mlx-llm / sceneworks-gen-core (both `branch=main`); candle-llm main's
+# `rev=` spec would otherwise materialise a SECOND core-llm package and clash. Still `candle-core 65ecb58`
+# (the graph-wide rev), so one Tensor type, one core-llm (branch=main#3870ed1).
+# Bumped `d0ba3e6` -> `3d9fdf0` (2026-07-02, candle repin lockstep): candle-llm #46 bumps ITS
+# candle-core/nn/flash-attn pin `65ecb58` -> `c1e6756` (upstream Cow::Owned UAF fix, PR
+# huggingface/candle#3493) in lockstep with this workspace's candle bump — a `rev=` pin keyed to the
+# old candle rev would materialise TWO candle-core packages and clash. The range d0ba3e6..3d9fdf0 is
+# candle-llm main churn (sc-8528 KV-quant backout + docs) + the repin; this shim links no candle-llm
+# symbols, so it's pin alignment only.
+candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "3d9fdf04047bf3b1fbf323ab56c919f3a03f0794" }
+
+[features]
+default = []
+# Forward the backend feature to candle-llm as well so the `candle-llava` provider's tower + decoder
+# run on the selected device (the CUDA worker build needs candle-llm built with `cuda`).
+metal = ["candle-gen/metal", "candle-llm/metal"]
+cuda = ["candle-gen/cuda", "candle-llm/cuda"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+sceneworks-gen-core-testkit = { workspace = true }

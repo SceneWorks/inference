@@ -1,0 +1,725 @@
+//! Vendored, training-adapted Z-Image DiT (sc-5166).
+//!
+//! A faithful copy of the candle-transformers `z_image::transformer` model at the workspace candle
+//! pin (`65ecb58`), vendored because the native LoRA/LoKr trainer needs a **trainable** residual
+//! spliced into the attention projections (`to_q`/`to_k`/`to_v`/`to_out.0`) — the stock
+//! `ZImageAttention` builds them from frozen `nn::Linear` with no seam (the candle twin of SDXL's
+//! `src/unet/` vendoring, sc-5165).
+//!
+//! Only the three structs that *own* the attention projections are vendored — [`ZImageAttention`]
+//! (the LoRA seam), [`ZImageTransformerBlock`] (owns the attention), and
+//! [`ZImageTransformer2DModel`] (owns the blocks + the [`LoraHost`] walk). Everything else
+//! (`TimestepEmbedder`, `FeedForward`, `QkNorm`, `RopeEmbedder`, `FinalLayer`, `patchify`/
+//! `unpatchify`/`apply_rotary_emb`, the `Config`) is **reused** straight from candle-transformers —
+//! those are `pub`, frozen, and not adapter targets, so re-deriving them would only invite drift.
+//!
+//! Three deliberate deviations from the stock attention/blocks, all forced by candle's autograd —
+//! candle's *fused* kernels are `CustomOp`s with **no backward**, and they fail SILENTLY (yielding
+//! `None` grads upstream, not an error — the epic-5164 fused-ops trap), so every fused op on the
+//! differentiable path must be swapped for its composable equivalent:
+//!  1. **Composable softmax.** The stock `attention_basic` uses the fused `softmax_last_dim`; the
+//!     vendored attention uses `candle_nn::ops::softmax` so `loss.backward()` flows through it.
+//!  2. **Composable RMSNorm.** `candle_nn::RmsNorm::forward` dispatches to the fused `ops::rms_norm`
+//!     on contiguous input — which is exactly the gradient-killer that left the attention factors
+//!     with no grad in the first cut. Every norm here (the vendored [`QkNorm`], the block's four
+//!     `attention_norm`/`ffn_norm`s, the model's `cap_embedder_norm`) calls `forward_diff`, the
+//!     composable `LayerNorm` path. (The reused `FinalLayer`/`TimestepEmbedder`/`FeedForward` hold no
+//!     fused op — only Linears + `silu` + the manual-ops `LayerNormNoParams` — so they stay stock.)
+//!  3. **No flash-attn / SDPA dispatch.** Those fused kernels are likewise non-differentiable; the
+//!     trainer always runs the materialized math attention. (Inference keeps using the stock model —
+//!     this vendored copy is training-only; the [`crate::adapters`] merge is how a trained adapter
+//!     reaches inference.)
+//!
+//! With no adapter installed, the vendored forward is bit-identical to the stock forward (the
+//! `parity_tests` gate pins this). The `forward` returns the **raw** DiT velocity (no sign flip,
+//! matching candle-transformers); the trainer negates it to match the inference pipeline's
+//! `noise_pred.neg()` (the Z-Image sign convention) — see [`crate::training`].
+
+use candle_core::{DType, Module, Result, Tensor, D};
+use candle_nn::{RmsNorm, VarBuilder};
+
+use candle_gen::train::gradient_checkpoint::Segment;
+use candle_gen::train::lora::{lora_linear_no_bias, LoraHost, LoraLinear};
+
+// Reused verbatim from candle-transformers — frozen, non-adapter sub-modules + the patchify/RoPE
+// helpers. Vendoring these would add ~600 lines of drift surface for zero benefit (they hold no
+// LoRA seam *and* no fused-norm), so we import the `pub` originals at the workspace candle pin.
+// (`QkNorm` is the one exception — see the local [`QkNorm`] below — because its `RmsNorm::forward`
+// dispatches to a no-backward fused kernel.)
+use candle_transformers::models::z_image::transformer::{
+    apply_rotary_emb, create_coordinate_grid, patchify, unpatchify, Config, FeedForward,
+    FinalLayer, RopeEmbedder, TimestepEmbedder, ADALN_EMBED_DIM,
+};
+
+/// QK normalization (RMSNorm on the per-head query/key), vendored so it uses the **composable**
+/// `RmsNorm::forward_diff` rather than `RmsNorm::forward` (which dispatches to the no-backward fused
+/// `ops::rms_norm` on contiguous input — the q/k path feeds the attention output, so a fused norm
+/// here silently zeroes every attention factor's gradient). Same `norm_q`/`norm_k` weight keys as the
+/// stock `QkNorm`, so it loads the real weights unchanged.
+#[derive(Debug, Clone)]
+struct QkNorm {
+    norm_q: RmsNorm,
+    norm_k: RmsNorm,
+}
+
+impl QkNorm {
+    fn new(head_dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            norm_q: candle_nn::rms_norm(head_dim, eps, vb.pp("norm_q"))?,
+            norm_k: candle_nn::rms_norm(head_dim, eps, vb.pp("norm_k"))?,
+        })
+    }
+
+    fn forward(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
+        Ok((self.norm_q.forward_diff(q)?, self.norm_k.forward_diff(k)?))
+    }
+}
+
+/// The default LoRA target suffixes — the attention projections, matching the SDXL trainer's
+/// [`SDXL_ATTN_TARGETS`](candle_gen::train::lora::SDXL_ATTN_TARGETS), the torch
+/// `DEFAULT_LORA_TARGET_MODULES`, and the MLX Z-Image trainer. `to_out.0` is the first element of
+/// diffusers' `to_out` `ModuleList`, so its path segment literally contains the `.0`.
+pub const Z_IMAGE_ATTN_TARGETS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
+
+// ==================== ZImageAttention (LoRA seam) ====================
+
+/// Z-Image attention with QK normalization and 3D RoPE, with the four projections held as
+/// [`LoraLinear`] so the trainer can splice a trainable residual into each. Numerically identical to
+/// the stock `ZImageAttention` when no adapter is installed, except it always runs the materialized
+/// math attention with a composable softmax (the stock flash/SDPA/`softmax_last_dim` paths have no
+/// backward).
+#[derive(Debug, Clone)]
+pub struct ZImageAttention {
+    to_q: LoraLinear,
+    to_k: LoraLinear,
+    to_v: LoraLinear,
+    to_out: LoraLinear,
+    qk_norm: Option<QkNorm>,
+    n_heads: usize,
+    head_dim: usize,
+}
+
+impl ZImageAttention {
+    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let dim = cfg.dim;
+        let n_heads = cfg.n_heads;
+        let head_dim = cfg.head_dim();
+
+        // K/V are constructed at `n_kv_heads`, but `forward` reshapes them by `n_heads` — that is only
+        // valid when `n_kv_heads == n_heads` (full MHA). Every shipped Z-Image config satisfies this
+        // (turbo/base = 30/30); true GQA (`n_kv_heads < n_heads`) is NOT supported by this attention and
+        // would panic at the `forward` reshape. Assert the invariant so a variant port fails loudly here.
+        debug_assert_eq!(
+            cfg.n_kv_heads, n_heads,
+            "ZImageAttention is MHA-only; GQA (n_kv_heads < n_heads) is unsupported"
+        );
+        let to_q = lora_linear_no_bias(dim, n_heads * head_dim, vb.pp("to_q"))?;
+        let to_k = lora_linear_no_bias(dim, cfg.n_kv_heads * head_dim, vb.pp("to_k"))?;
+        let to_v = lora_linear_no_bias(dim, cfg.n_kv_heads * head_dim, vb.pp("to_v"))?;
+        let to_out = lora_linear_no_bias(n_heads * head_dim, dim, vb.pp("to_out").pp("0"))?;
+
+        let qk_norm = if cfg.qk_norm {
+            Some(QkNorm::new(head_dim, 1e-5, vb.clone())?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            to_q,
+            to_k,
+            to_v,
+            to_out,
+            qk_norm,
+            n_heads,
+            head_dim,
+        })
+    }
+
+    /// Visit the four adaptable projections (the [`LoraHost`] leaf walk).
+    fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&mut self.to_q)?;
+        f(&mut self.to_k)?;
+        f(&mut self.to_v)?;
+        f(&mut self.to_out)?;
+        Ok(())
+    }
+
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        attention_mask: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let (b, seq_len, _) = hidden_states.dims3()?;
+
+        // Project to Q, K, V (through the LoRA-adapted projections).
+        let q = hidden_states.apply(&self.to_q)?;
+        let k = hidden_states.apply(&self.to_k)?;
+        let v = hidden_states.apply(&self.to_v)?;
+
+        // (B, seq, n*hd) -> (B, seq, n, hd). K/V use `n_heads` (not `n_kv_heads`); valid only under the
+        // MHA invariant asserted in `new` (n_kv_heads == n_heads).
+        let q = q.reshape((b, seq_len, self.n_heads, self.head_dim))?;
+        let k = k.reshape((b, seq_len, self.n_heads, self.head_dim))?;
+        let v = v.reshape((b, seq_len, self.n_heads, self.head_dim))?;
+
+        let (q, k) = if let Some(ref norm) = self.qk_norm {
+            norm.forward(&q, &k)?
+        } else {
+            (q, k)
+        };
+
+        let q = apply_rotary_emb(&q, cos, sin)?;
+        let k = apply_rotary_emb(&k, cos, sin)?;
+
+        // (B, n, seq, hd)
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
+
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // Build the optional additive `[B,1,1,seq]` mask (1=valid → 0, 0=padding → -1e9) up front so the
+        // budgeted helper broadcasts it onto every query chunk. i32-overflow guard (sc-9116): the
+        // image-token scores `[B, n, seq, seq]` reach `~24·16384² ≈ 6.4e9 > i32::MAX` at a 2048² render,
+        // so chunk over the query rows (byte-identical for common sizes). The softmax closure keeps the
+        // composable `softmax(_, D::Minus1)` (the fused `softmax_last_dim` has no backward — trainer parity).
+        let mask = match attention_mask {
+            Some(m) => {
+                let m = m.unsqueeze(1)?.unsqueeze(2)?.to_dtype(q.dtype())?;
+                Some(((m - 1.0)? * 1e9)?)
+            }
+            None => None,
+        };
+        let context = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            mask.as_ref(),
+            |s| candle_nn::ops::softmax(s, D::Minus1),
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?;
+
+        // (B, n, seq, hd) -> (B, seq, dim)
+        let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
+        context.apply(&self.to_out)
+    }
+}
+
+// ==================== ZImageTransformerBlock ====================
+
+/// Z-Image transformer block with optional AdaLN modulation. Identical to the stock block except its
+/// attention is the vendored [`ZImageAttention`]; the norms / FFN / AdaLN projection are stock
+/// frozen modules.
+#[derive(Debug, Clone)]
+pub struct ZImageTransformerBlock {
+    attention: ZImageAttention,
+    feed_forward: FeedForward,
+    attention_norm1: RmsNorm,
+    attention_norm2: RmsNorm,
+    ffn_norm1: RmsNorm,
+    ffn_norm2: RmsNorm,
+    adaln_modulation: Option<candle_nn::Linear>,
+}
+
+impl ZImageTransformerBlock {
+    pub fn new(cfg: &Config, modulation: bool, vb: VarBuilder) -> Result<Self> {
+        let dim = cfg.dim;
+        let hidden_dim = cfg.hidden_dim();
+
+        let attention = ZImageAttention::new(cfg, vb.pp("attention"))?;
+        let feed_forward = FeedForward::new(dim, hidden_dim, vb.pp("feed_forward"))?;
+
+        let attention_norm1 = candle_nn::rms_norm(dim, cfg.norm_eps, vb.pp("attention_norm1"))?;
+        let attention_norm2 = candle_nn::rms_norm(dim, cfg.norm_eps, vb.pp("attention_norm2"))?;
+        let ffn_norm1 = candle_nn::rms_norm(dim, cfg.norm_eps, vb.pp("ffn_norm1"))?;
+        let ffn_norm2 = candle_nn::rms_norm(dim, cfg.norm_eps, vb.pp("ffn_norm2"))?;
+
+        let adaln_modulation = if modulation {
+            let adaln_dim = dim.min(ADALN_EMBED_DIM);
+            Some(candle_nn::linear(
+                adaln_dim,
+                4 * dim,
+                vb.pp("adaLN_modulation").pp("0"),
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            attention,
+            feed_forward,
+            attention_norm1,
+            attention_norm2,
+            ffn_norm1,
+            ffn_norm2,
+            adaln_modulation,
+        })
+    }
+
+    fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.attention.visit_lora_mut(f)
+    }
+
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        attn_mask: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln_input: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        if let Some(ref adaln) = self.adaln_modulation {
+            let adaln_input = adaln_input.expect("adaln_input required when modulation=true");
+            let modulation = adaln_input.apply(adaln)?.unsqueeze(1)?;
+            let chunks = modulation.chunk(4, D::Minus1)?;
+            let (scale_msa, gate_msa, scale_mlp, gate_mlp) =
+                (&chunks[0], &chunks[1], &chunks[2], &chunks[3]);
+
+            let gate_msa = gate_msa.tanh()?;
+            let gate_mlp = gate_mlp.tanh()?;
+            let scale_msa = (scale_msa + 1.0)?;
+            let scale_mlp = (scale_mlp + 1.0)?;
+
+            // Attention block
+            let normed = self.attention_norm1.forward_diff(x)?;
+            let scaled = normed.broadcast_mul(&scale_msa)?;
+            let attn_out = self.attention.forward(&scaled, attn_mask, cos, sin)?;
+            let attn_out = self.attention_norm2.forward_diff(&attn_out)?;
+            let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
+
+            // FFN block
+            let normed = self.ffn_norm1.forward_diff(&x)?;
+            let scaled = normed.broadcast_mul(&scale_mlp)?;
+            let ffn_out = self.feed_forward.forward(&scaled)?;
+            let ffn_out = self.ffn_norm2.forward_diff(&ffn_out)?;
+            x + gate_mlp.broadcast_mul(&ffn_out)?
+        } else {
+            let normed = self.attention_norm1.forward_diff(x)?;
+            let attn_out = self.attention.forward(&normed, attn_mask, cos, sin)?;
+            let attn_out = self.attention_norm2.forward_diff(&attn_out)?;
+            let x = (x + attn_out)?;
+
+            let normed = self.ffn_norm1.forward_diff(&x)?;
+            let ffn_out = self.feed_forward.forward(&normed)?;
+            let ffn_out = self.ffn_norm2.forward_diff(&ffn_out)?;
+            x + ffn_out
+        }
+    }
+}
+
+// ==================== ZImageTransformer2DModel ====================
+
+/// Z-Image Transformer 2D Model — the vendored, trainable twin of the stock
+/// `ZImageTransformer2DModel`. Built from the *same* `transformer/` safetensors keys (the reuse +
+/// the unchanged sub-module paths guarantee key parity), so it loads the real weights unchanged and,
+/// with no adapter installed, reproduces the stock forward bit-for-bit (`parity_tests`).
+// Fields are `pub(crate)` so the VACE-style ControlNet wrapper ([`crate::control`], a sibling module)
+// can run the dual-injection forward: it interleaves the base `noise_refiner` / `layers` loops with a
+// parallel control stack (control hints added after specific base blocks), which the single `forward`
+// can't express, so it re-walks the embed → refiner → main phases reading these directly. None of this
+// widening changes the txt2img/training paths (same module-internal reads).
+#[derive(Debug, Clone)]
+pub struct ZImageTransformer2DModel {
+    pub(crate) t_embedder: TimestepEmbedder,
+    pub(crate) cap_embedder_norm: RmsNorm,
+    pub(crate) cap_embedder_linear: candle_nn::Linear,
+    pub(crate) x_embedder: candle_nn::Linear,
+    pub(crate) final_layer: FinalLayer,
+    #[allow(dead_code)]
+    x_pad_token: Tensor,
+    #[allow(dead_code)]
+    cap_pad_token: Tensor,
+    pub(crate) noise_refiner: Vec<ZImageTransformerBlock>,
+    pub(crate) context_refiner: Vec<ZImageTransformerBlock>,
+    pub(crate) layers: Vec<ZImageTransformerBlock>,
+    pub(crate) rope_embedder: RopeEmbedder,
+    pub(crate) cfg: Config,
+}
+
+/// The constant side tensors the **main** transformer layers and the final layer consume, produced
+/// once by [`ZImageTransformer2DModel::forward_pre_main`]. None of these depend on an adapter `Var`
+/// (the AdaLN conditioning is the frozen `t_embedder`'s output; the RoPE tables + masks are pure
+/// functions of the token geometry), so the gradient-checkpointing path captures them as detached
+/// constants shared across every recomputed main-layer segment — exactly how the SDXL trainer captures
+/// the time embedding + encoder states. The image-token bookkeeping (`img_seq_len`/`orig_size`) is what
+/// [`ZImageTransformer2DModel::velocity_out`] needs to narrow + unpatchify the image portion back out.
+#[derive(Debug, Clone)]
+pub struct MainContext {
+    adaln_input: Tensor,
+    unified_cos: Tensor,
+    unified_sin: Tensor,
+    unified_attn_mask: Tensor,
+    img_seq_len: usize,
+    orig_size: (usize, usize, usize),
+}
+
+impl ZImageTransformer2DModel {
+    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let device = vb.device();
+        let dtype = vb.dtype();
+
+        let adaln_dim = cfg.dim.min(ADALN_EMBED_DIM);
+        let t_embedder = TimestepEmbedder::new(adaln_dim, 1024, vb.pp("t_embedder"))?;
+
+        let cap_embedder_norm = candle_nn::rms_norm(
+            cfg.cap_feat_dim,
+            cfg.norm_eps,
+            vb.pp("cap_embedder").pp("0"),
+        )?;
+        let cap_embedder_linear =
+            candle_nn::linear(cfg.cap_feat_dim, cfg.dim, vb.pp("cap_embedder").pp("1"))?;
+
+        let patch_dim = cfg.all_f_patch_size[0]
+            * cfg.all_patch_size[0]
+            * cfg.all_patch_size[0]
+            * cfg.in_channels;
+        let x_embedder = candle_nn::linear(patch_dim, cfg.dim, vb.pp("all_x_embedder").pp("2-1"))?;
+
+        let out_channels = cfg.all_patch_size[0]
+            * cfg.all_patch_size[0]
+            * cfg.all_f_patch_size[0]
+            * cfg.in_channels;
+        let final_layer =
+            FinalLayer::new(cfg.dim, out_channels, vb.pp("all_final_layer").pp("2-1"))?;
+
+        let x_pad_token = vb.get((1, cfg.dim), "x_pad_token")?;
+        let cap_pad_token = vb.get((1, cfg.dim), "cap_pad_token")?;
+
+        let mut noise_refiner = Vec::with_capacity(cfg.n_refiner_layers);
+        for i in 0..cfg.n_refiner_layers {
+            noise_refiner.push(ZImageTransformerBlock::new(
+                cfg,
+                true,
+                vb.pp("noise_refiner").pp(i),
+            )?);
+        }
+
+        let mut context_refiner = Vec::with_capacity(cfg.n_refiner_layers);
+        for i in 0..cfg.n_refiner_layers {
+            context_refiner.push(ZImageTransformerBlock::new(
+                cfg,
+                false,
+                vb.pp("context_refiner").pp(i),
+            )?);
+        }
+
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for i in 0..cfg.n_layers {
+            layers.push(ZImageTransformerBlock::new(
+                cfg,
+                true,
+                vb.pp("layers").pp(i),
+            )?);
+        }
+
+        let rope_embedder = RopeEmbedder::new(
+            cfg.rope_theta,
+            cfg.axes_dims.clone(),
+            cfg.axes_lens.clone(),
+            device,
+            dtype,
+        )?;
+
+        Ok(Self {
+            t_embedder,
+            cap_embedder_norm,
+            cap_embedder_linear,
+            x_embedder,
+            final_layer,
+            x_pad_token,
+            cap_pad_token,
+            noise_refiner,
+            context_refiner,
+            layers,
+            rope_embedder,
+            cfg: cfg.clone(),
+        })
+    }
+
+    /// Forward pass — returns the **raw** DiT velocity `(B, C, F, H, W)` (no sign flip; the inference
+    /// pipeline and the trainer apply `.neg()`). Byte-faithful to the stock model's forward.
+    ///
+    /// Factored into the three checkpointing phases ([`forward_pre_main`](Self::forward_pre_main) →
+    /// the main `layers` stack → [`velocity_out`](Self::velocity_out)) so the dense forward and the
+    /// gradient-checkpointed backward share one source of truth; the composition here is the dense
+    /// path, identical to the stock model (the `parity_tests` gate pins this).
+    ///
+    /// * `x` — latent `(B, C, F, H, W)`
+    /// * `t` — flow-match timestep in `[0, 1]` `(B,)`
+    /// * `cap_feats` — caption features `(B, text_len, cap_feat_dim)`
+    /// * `cap_mask` — caption attention mask `(B, text_len)`, 1=valid, 0=padding
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+    ) -> Result<Tensor> {
+        let (mut unified, ctx) = self.forward_pre_main(x, t, cap_feats, cap_mask)?;
+        for layer in &self.layers {
+            unified = layer.forward(
+                &unified,
+                Some(&ctx.unified_attn_mask),
+                &ctx.unified_cos,
+                &ctx.unified_sin,
+                Some(&ctx.adaln_input),
+            )?;
+        }
+        self.velocity_out(&unified, &ctx)
+    }
+
+    /// The **pre-main** forward (DiT phases 1–10): timestep embed, patchify + embed the image, embed
+    /// the caption, run the noise + context refiners, and concatenate `[image, text]` into the unified
+    /// hidden state fed to the main layers. Returns `(unified, ctx)` where `ctx` ([`MainContext`]) holds
+    /// the constant RoPE/mask/AdaLN tensors the main layers + final layer consume.
+    ///
+    /// The trainer's gradient-checkpointing path runs this **retained** (its graph kept live), so the
+    /// refiner + embedder adapter `Var`s train through ordinary autograd; only the main `layers` stack
+    /// is checkpointed (see [`crate::training`]).
+    pub fn forward_pre_main(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+    ) -> Result<(Tensor, MainContext)> {
+        let device = x.device();
+        let (b, _c, f, h, w) = x.dims5()?;
+        let patch_size = self.cfg.all_patch_size[0];
+        let f_patch_size = self.cfg.all_f_patch_size[0];
+
+        // 1. Timestep embedding
+        let t_scaled = (t * self.cfg.t_scale)?;
+        let adaln_input = self.t_embedder.forward(&t_scaled)?;
+
+        // 2. Patchify + embed image
+        let (x_patches, orig_size) = patchify(x, patch_size, f_patch_size)?;
+        let mut x = x_patches.apply(&self.x_embedder)?;
+        let img_seq_len = x.dim(1)?;
+
+        // 3. Image position IDs (offset past the text block)
+        let f_tokens = f / f_patch_size;
+        let h_tokens = h / patch_size;
+        let w_tokens = w / patch_size;
+        let text_len = cap_feats.dim(1)?;
+        let x_pos_ids =
+            create_coordinate_grid((f_tokens, h_tokens, w_tokens), (text_len + 1, 0, 0), device)?;
+        let (x_cos, x_sin) = self.rope_embedder.forward(&x_pos_ids)?;
+
+        // 4. Caption embedding (composable norm — see the module header on fused RMSNorm).
+        let cap_normed = self.cap_embedder_norm.forward_diff(cap_feats)?;
+        let mut cap = cap_normed.apply(&self.cap_embedder_linear)?;
+
+        // 5. Caption position IDs
+        let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
+        let (cap_cos, cap_sin) = self.rope_embedder.forward(&cap_pos_ids)?;
+
+        // 6. Attention masks
+        let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
+        let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
+
+        // 7. Noise refiner (image, with modulation)
+        for layer in &self.noise_refiner {
+            x = layer.forward(&x, Some(&x_attn_mask), &x_cos, &x_sin, Some(&adaln_input))?;
+        }
+
+        // 8. Context refiner (text, without modulation)
+        for layer in &self.context_refiner {
+            cap = layer.forward(&cap, Some(&cap_attn_mask), &cap_cos, &cap_sin, None)?;
+        }
+
+        // 9. Concatenate [image, text]
+        let unified = Tensor::cat(&[&x, &cap], 1)?;
+
+        // 10. Unified position IDs + mask
+        let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
+        let (unified_cos, unified_sin) = self.rope_embedder.forward(&unified_pos_ids)?;
+        let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
+
+        Ok((
+            unified,
+            MainContext {
+                adaln_input,
+                unified_cos,
+                unified_sin,
+                unified_attn_mask,
+                img_seq_len,
+                orig_size,
+            },
+        ))
+    }
+
+    /// One [`Segment`] per **main** transformer layer (DiT phase 11), each mapping `[unified] →
+    /// [unified]` using `ctx`'s constant RoPE/mask/AdaLN tensors. This is the Z-Image analog of the
+    /// SDXL UNet's `block_segments`: the bulk of the activation working set, fed to
+    /// [`checkpointed_backward`](candle_gen::train::gradient_checkpoint::checkpointed_backward) so each
+    /// layer is recomputed in the backward instead of retaining all of their activations at once. The
+    /// trainer appends a final `[unified] → [loss]` segment (the [`velocity_out`](Self::velocity_out)
+    /// head + the flow-match regression).
+    pub fn main_layer_segments<'a>(&'a self, ctx: &'a MainContext) -> Vec<Segment<'a>> {
+        self.layers
+            .iter()
+            .map(|layer| -> Segment<'a> {
+                Box::new(move |st: &[Tensor]| {
+                    Ok(vec![layer.forward(
+                        &st[0],
+                        Some(&ctx.unified_attn_mask),
+                        &ctx.unified_cos,
+                        &ctx.unified_sin,
+                        Some(&ctx.adaln_input),
+                    )?])
+                })
+            })
+            .collect()
+    }
+
+    /// The **post-main** head (DiT phases 12–13): take the image-token portion of the unified hidden
+    /// state, apply the final AdaLN layer, and unpatchify back to the raw velocity `(B, C, F, H, W)`.
+    /// `unified_final` is the output of the last main layer; `ctx` is the [`MainContext`] from
+    /// [`forward_pre_main`](Self::forward_pre_main).
+    pub fn velocity_out(&self, unified_final: &Tensor, ctx: &MainContext) -> Result<Tensor> {
+        let x_out = unified_final.narrow(1, 0, ctx.img_seq_len)?;
+        let x_out = self.final_layer.forward(&x_out, &ctx.adaln_input)?;
+        unpatchify(
+            &x_out,
+            ctx.orig_size,
+            self.cfg.all_patch_size[0],
+            self.cfg.all_f_patch_size[0],
+            self.cfg.in_channels,
+        )
+    }
+}
+
+impl LoraHost for ZImageTransformer2DModel {
+    fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for blk in self
+            .noise_refiner
+            .iter_mut()
+            .chain(self.context_refiner.iter_mut())
+            .chain(self.layers.iter_mut())
+        {
+            blk.visit_lora_mut(f)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    //! Pin the vendored DiT to the stock candle-transformers DiT: built from the *same*
+    //! `VarMap`-backed weights with no adapter installed, the two must produce bit-identical forward
+    //! output. The regression guard that the vendoring (the `LoraLinear` swap + composable softmax)
+    //! changed nothing numerically.
+    use super::*;
+    use candle_core::{Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+    use candle_transformers::models::z_image::preprocess::prepare_inputs;
+    use candle_transformers::models::z_image::transformer::{
+        Config, ZImageTransformer2DModel as StockModel,
+    };
+
+    /// A tiny Z-Image-shaped config: `head_dim` is locked to 128 by `axes_dims=[32,48,48]` (the RoPE
+    /// half-dims `16+24+24=64=head_dim/2`), so a single head at `dim=128` is the smallest valid DiT.
+    /// 2 main layers + 1 refiner each exercises every vendored path cheaply on CPU.
+    fn tiny_cfg() -> Config {
+        let mut cfg = Config::z_image_turbo();
+        cfg.dim = 128; // head_dim = 128/1 = 128 (axes_dims sum)
+        cfg.n_heads = 1;
+        cfg.n_kv_heads = 1;
+        cfg.n_layers = 2;
+        cfg.n_refiner_layers = 1;
+        cfg.cap_feat_dim = 64;
+        cfg.use_accelerated_attn = false; // force the math/basic path on the stock side
+        cfg
+    }
+
+    #[test]
+    fn vendored_dit_matches_stock_forward() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        // The vendored model is built first, populating the VarMap with random weights; the stock
+        // model then reads the SAME parameters (identical names/shapes), so any output difference is
+        // a forward-logic difference, not a weight difference.
+        let vendored = ZImageTransformer2DModel::new(&cfg, vb.clone()).unwrap();
+        let stock = StockModel::new(&cfg, vb).unwrap();
+
+        // latent (1, 16, 4, 4) -> patchified 2x2 = 4 image tokens; tiny caption of 3 tokens.
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+
+        let y_v = vendored
+            .forward(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+            )
+            .unwrap();
+        let y_s = stock
+            .forward(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+            )
+            .unwrap();
+
+        assert_eq!(y_v.dims(), y_s.dims());
+        let diff = (y_v - y_s)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 1e-5, "vendored DiT diverged from stock by {diff}");
+    }
+
+    /// The [`LoraHost`] walk reaches exactly `4 × (n_refiner·2 + n_layers)` projections — the four
+    /// attention `LoraLinear`s in every noise-refiner, context-refiner, and main block.
+    #[test]
+    fn lora_host_visits_every_attention_projection() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut model = ZImageTransformer2DModel::new(&cfg, vb).unwrap();
+        let mut paths: Vec<String> = Vec::new();
+        model
+            .visit_lora_mut(&mut |lin| {
+                paths.push(lin.path().to_string());
+                Ok(())
+            })
+            .unwrap();
+        let expected = 4 * (cfg.n_refiner_layers * 2 + cfg.n_layers);
+        assert_eq!(paths.len(), expected);
+        // Every default target suffix resolves against at least one visited path.
+        for suffix in Z_IMAGE_ATTN_TARGETS {
+            assert!(
+                paths
+                    .iter()
+                    .any(|p| p == suffix || p.ends_with(&format!(".{suffix}"))),
+                "no visited projection matched suffix {suffix}"
+            );
+        }
+        // Layer-0 main-block attention paths are present and correctly named.
+        assert!(paths.contains(&"layers.0.attention.to_q".to_string()));
+        assert!(paths.contains(&"layers.0.attention.to_out.0".to_string()));
+    }
+}

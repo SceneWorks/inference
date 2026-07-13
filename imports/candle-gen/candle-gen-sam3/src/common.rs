@@ -1,0 +1,433 @@
+//! Shared SAM3 leaf helpers for the candle port: a safetensors weight map ([`Weights`]), a
+//! per-last-dim [`Linear`], NHWC↔NCHW conv wrappers, and a small no-mask [`sdpa`] / [`layer_norm`].
+//! The candle twin of how `mlx-gen-sam3` uses `mlx_gen::weights::Weights` + `AdaptableLinear`.
+//!
+//! Layout: SAM3 loads the RAW `facebook/sam3` torch checkpoint, whose conv kernels are OIHW
+//! (`conv2d`) / IOHW (`conv_transpose2d`) — already candle-native — so we DON'T permute kernels (the
+//! MLX side does, because MLX convs are OHWI). We only transpose *activations* NHWC↔NCHW around each
+//! conv so the transformer body stays channels-last and mirrors the MLX modules line-by-line.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use candle_gen::candle_core::{safetensors, DType, Device, Tensor, D};
+use candle_gen::candle_nn::ops::softmax;
+use candle_gen::candle_nn::{GroupNorm, LayerNorm, Module};
+use candle_gen::gen_core::Quant;
+use candle_gen::quant::{DenseLinear, QLinear};
+use candle_gen::{CandleError, Result};
+
+/// A loaded SAM3 weight map. Tensors are coerced to f32 on load — the parity oracle is f32 and SAM3
+/// fits comfortably in f32 on the target box; the Q8/Q4 quant path lands in a later slice (sc-6246).
+pub struct Weights {
+    map: HashMap<String, Tensor>,
+}
+
+impl Weights {
+    /// Load every tensor from one `.safetensors` file onto `device`, coercing to f32.
+    pub fn from_file(path: impl AsRef<Path>, device: &Device) -> Result<Self> {
+        let mut map = HashMap::new();
+        Self::extend_from(&mut map, path.as_ref(), device)?;
+        Ok(Self { map })
+    }
+
+    /// Load + merge every `*.safetensors` shard in `dir` (the sharded `facebook/sam3` checkpoint).
+    pub fn from_dir(dir: impl AsRef<Path>, device: &Device) -> Result<Self> {
+        let dir = dir.as_ref();
+        let mut shards: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| CandleError::Msg(format!("read_dir {}: {e}", dir.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
+            .filter(|p| !candle_gen::gen_core::weightsmeta::is_hidden_file(p))
+            .collect();
+        shards.sort();
+        if shards.is_empty() {
+            return Err(CandleError::Msg(format!(
+                "no .safetensors files in {}",
+                dir.display()
+            )));
+        }
+        let mut map = HashMap::new();
+        for shard in &shards {
+            Self::extend_from(&mut map, shard, device)?;
+        }
+        Ok(Self { map })
+    }
+
+    fn extend_from(map: &mut HashMap<String, Tensor>, path: &Path, device: &Device) -> Result<()> {
+        let raw = safetensors::load(path, device)?;
+        for (k, v) in raw {
+            let v = match v.dtype() {
+                DType::F32 => v,
+                // Float casts run on-device. Integer casts (the parity fixtures' `input_ids` /
+                // `attention_mask` / `box_labels` / `instance_masks`) hit a missing int->f32 CUDA cast
+                // kernel on this candle build (`CUDA_ERROR_NOT_FOUND`), so route those through the CPU.
+                DType::F16 | DType::BF16 | DType::F64 => v.to_dtype(DType::F32)?,
+                _ => v
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?
+                    .to_device(device)?,
+            };
+            // A key that already exists means TWO shards define the same tensor. In a normal sharded
+            // safetensors checkpoint every key lives in exactly one shard, so a cross-shard duplicate is
+            // abnormal — a mis-sharded or double-listed checkpoint, or a stray `.safetensors` polluting
+            // the snapshot dir. Silently overwriting (the old `insert`) would let a stray file shadow the
+            // real weights with no diagnostic, so we hard-error naming the key and the offending shard
+            // rather than emit a bare library warning (F-064 / sc-9050; cf. the F-051 no-stderr policy —
+            // this is a genuine load fault, surfaced through the crate's normal `Result` channel).
+            if map.insert(k.clone(), v).is_some() {
+                return Err(CandleError::Msg(format!(
+                    "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors must \
+                     each live in exactly one .safetensors shard — this snapshot has {k:?} in more \
+                     than one file (mis-sharded checkpoint or a stray .safetensors in the dir)",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch a required tensor, erroring (not panicking) when a checkpoint is missing a key.
+    pub fn require(&self, key: &str) -> Result<Tensor> {
+        self.map
+            .get(key)
+            .cloned()
+            .ok_or_else(|| CandleError::Msg(format!("missing tensor: {key}")))
+    }
+
+    /// Fetch an optional tensor (e.g. a `.bias` that some projections omit).
+    pub fn get(&self, key: &str) -> Option<Tensor> {
+        self.map.get(key).cloned()
+    }
+}
+
+/// `"{prefix}.{leaf}"` (or just `leaf` when `prefix` is empty) — the empty-prefix-aware key join
+/// (mirrors `mlx-gen-sam3`'s `util::join`).
+pub(crate) fn join(prefix: &str, leaf: &str) -> String {
+    if prefix.is_empty() {
+        leaf.to_string()
+    } else {
+        format!("{prefix}.{leaf}")
+    }
+}
+
+/// A linear over the LAST dim — **dense** (the loaded `[out, in]` weight, pre-transposed to `[in, out]`
+/// at load) or **GGUF-quantized** (candle's int8 `QMatMul` over `Q4_0`/`Q8_0` blocks + the
+/// full-precision bias). Applies to any `[.., in]` tensor by flattening the leading dims (robust for
+/// both the NHWC `[b,H,W,C]` projections and the `[b,nh,seq,hd]` head tensors the SAM3 modules feed it).
+/// Built dense via [`Self::load`]; folded to quantized in place by [`Self::quantize`] (sc-6246, the
+/// candle twin of the MLX `AdaptableLinear` quant path).
+///
+/// **Thin newtype over the shared [`candle_gen::quant::QLinear`] seam (F-025 / sc-9005).** SAM3 was
+/// one of four drifted copies of the `Dense|Quantized` Linear; the seam now lives once in `candle-gen`.
+/// SAM3's load-bearing behaviors are preserved as explicit knobs: the **pre-transposed** dense layout
+/// (sc-8997/F-017), candle's **int8 `QMatMul`** matmul ([`MatmulStrategy::Int8Fast`] — SAM3's heads
+/// tolerate it; the PE vision ViT backbone that would overflow GGUF's f16 q8_1 block scale runs dense
+/// by default), the **`in_features % 32` skip** predicate (leaves the `2→256`/`4→256`/`258→256`
+/// projections dense), the **leading-dim flatten**, and **no dtype cast-back** (SAM3 runs pure f32).
+/// `Clone` is cheap (the shared seam is `Arc`-backed) — the video model clones the backbone to
+/// quantize it once and share the result (F-028).
+#[derive(Clone)]
+pub(crate) struct Linear(QLinear);
+
+impl Linear {
+    /// Load `{name}.weight` (+ optional `{name}.bias`) as a dense projection, pre-transposed to
+    /// `[in, out]` (sc-8997/F-017) — the SAM3 dense layout the shared seam's [`DenseLinear::Transposed`]
+    /// arm carries.
+    pub fn load(w: &Weights, name: &str) -> Result<Self> {
+        let weight = w.require(&format!("{name}.weight"))?; // [out, in]
+        Ok(Self(QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: weight.t()?.contiguous()?,
+            bias: w.get(&format!("{name}.bias")),
+        })))
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(self.0.forward(x)?)
+    }
+
+    /// Fold a dense projection to `Q4_0`/`Q8_0` in place **iff** `in_features % 32 == 0` (else it stays
+    /// dense — the reference predicate). Uses candle's int8 `QMatMul` forward, flattens the leading
+    /// dims, and does **not** cast back (SAM3 is pure f32) — the shared seam's int8-fast fold with
+    /// SAM3's exact knobs. The weight is quantized on the CPU and placed back on its original device;
+    /// the bias is promoted to f32. Idempotent.
+    ///
+    /// NOTE: off-Mac SAM3 runs DENSE by default (the worker leaves `SCENEWORKS_SAM3_QUANT` unset). This
+    /// is NOT a candle/Blackwell bug: candle's GGUF `QMatMul` is correct on sm_120 (seedvr2's DiT
+    /// quantizes near-losslessly on the same box). SAM3's PE vision ViT backbone is what breaks when
+    /// quantized — its massive activations overflow GGUF's f16 q8_1 block scale (amax/127 → inf → NaN),
+    /// on ANY device (sc-6361). The heads quantize fine; dense is bit-exact and fits, so quant buys
+    /// ~nothing here.
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        // skip_indivisible = true (the `% 32` predicate), flatten_leading = true, cast_back = false.
+        self.0.quantize_int8_fast(quant, true, true, false)?;
+        Ok(())
+    }
+}
+
+/// LayerNorm over the last dim with explicit weight/bias (eps as the reference's f64).
+pub(crate) fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f64) -> Result<Tensor> {
+    let ln = LayerNorm::new(w.clone(), b.clone(), eps);
+    Ok(ln.forward(x)?)
+}
+
+/// Scaled-dot-product attention, no mask. `q`/`k`/`v`: `[b, nh, seq, hd]` → `[b, nh, seq, hd]`.
+pub(crate) fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+    sdpa_masked(q, k, v, scale, None)
+}
+
+/// Scaled-dot-product attention with an optional **additive** mask, broadcast onto the
+/// `[b, nh, seq_q, seq_k]` scores before softmax (`-1e9` at blocked positions, `0` elsewhere — the
+/// CLIP causal+key-padding convention). `q`/`k`/`v`: `[b, nh, seq, hd]`; `mask`: any shape that
+/// broadcasts to the scores (e.g. `[1, 1, seq_q, seq_k]`). Mirrors the reference / MLX
+/// `scaled_dot_product_attention(..., mask, None)`.
+pub(crate) fn sdpa_masked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    let kt = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+    let mut attn = (q.contiguous()?.matmul(&kt)? * scale)?; // [b, nh, seq_q, seq_k]
+    if let Some(m) = mask {
+        attn = attn.broadcast_add(m)?;
+    }
+    let attn = softmax(&attn, D::Minus1)?;
+    Ok(attn.matmul(&v.contiguous()?)?)
+}
+
+/// `conv2d` on an NHWC activation with a torch-native OIHW kernel (loaded as-is). Transposes
+/// NHWC→NCHW, runs candle `conv2d`, adds the optional `[O]` bias, transposes back to NHWC.
+pub(crate) fn conv2d_nhwc(
+    x: &Tensor,
+    w: &Tensor,
+    bias: Option<&Tensor>,
+    stride: usize,
+    padding: usize,
+) -> Result<Tensor> {
+    let xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
+    let mut y = xc.conv2d(w, padding, stride, 1, 1)?; // [N, O, H', W']
+    if let Some(b) = bias {
+        y = y.broadcast_add(&b.reshape((1, b.elem_count(), 1, 1))?)?;
+    }
+    Ok(y.permute([0, 2, 3, 1])?.contiguous()?) // NCHW → NHWC
+}
+
+/// `conv2d` on an NHWC activation with a torch-native OIHW kernel and an explicit `groups`. The
+/// depthwise case (`groups == channels`, kernel `[C, 1, k, k]`) is the memory encoder's ConvNeXt 7×7;
+/// `groups == 1` falls back to plain [`conv2d_nhwc`]. Bias is `[O]`.
+pub(crate) fn conv2d_nhwc_grouped(
+    x: &Tensor,
+    w: &Tensor,
+    bias: Option<&Tensor>,
+    stride: usize,
+    padding: usize,
+    groups: usize,
+) -> Result<Tensor> {
+    let xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
+    let mut y = xc.conv2d(w, padding, stride, 1, groups)?; // [N, O, H', W']
+    if let Some(b) = bias {
+        y = y.broadcast_add(&b.reshape((1, b.elem_count(), 1, 1))?)?;
+    }
+    Ok(y.permute([0, 2, 3, 1])?.contiguous()?) // NCHW → NHWC
+}
+
+/// `conv_transpose2d` on an NHWC activation with a torch-native IOHW kernel (loaded as-is), pad 0 /
+/// output_pad 0, plus the `[O]` bias.
+pub(crate) fn conv_transpose2d_nhwc(
+    x: &Tensor,
+    w: &Tensor,
+    bias: &Tensor,
+    stride: usize,
+) -> Result<Tensor> {
+    let xc = x.permute([0, 3, 1, 2])?.contiguous()?;
+    let y = xc.conv_transpose2d(w, 0, 0, stride, 1)?; // padding, output_padding, stride, dilation
+    let y = y.broadcast_add(&bias.reshape((1, bias.elem_count(), 1, 1))?)?;
+    Ok(y.permute([0, 2, 3, 1])?.contiguous()?)
+}
+
+/// `k×k` max-pool (stride `k`) on an NHWC activation.
+pub(crate) fn maxpool2d_nhwc(x: &Tensor, k: usize) -> Result<Tensor> {
+    let xc = x.permute([0, 3, 1, 2])?.contiguous()?;
+    let y = xc.max_pool2d(k)?;
+    Ok(y.permute([0, 2, 3, 1])?.contiguous()?)
+}
+
+/// GroupNorm over an NHWC activation (the mask decoder runs channels-last). candle's [`GroupNorm`]
+/// normalizes channel-dim-1 (NCHW), so transpose NHWC→NCHW, normalize, transpose back. The channel
+/// count is read from the activation; `weight`/`bias` are the `[C]` affine params.
+pub(crate) fn group_norm_nhwc(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    num_groups: usize,
+    eps: f64,
+) -> Result<Tensor> {
+    let xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
+    let c = xc.dim(1)?;
+    let gn = GroupNorm::new(weight.clone(), bias.clone(), c, num_groups, eps)?;
+    Ok(gn.forward(&xc)?.permute([0, 2, 3, 1])?.contiguous()?) // NCHW → NHWC
+}
+
+/// Nearest-neighbour `factor`× upsample of an NHWC activation (the FPN pixel decoder's 2× upsample).
+/// candle's `upsample_nearest2d` works on the trailing two (NCHW H/W) dims, so transpose around it.
+pub(crate) fn upsample_nearest2d_nhwc(x: &Tensor, factor: usize) -> Result<Tensor> {
+    let xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
+    let (_, _, h, w) = xc.dims4()?;
+    let y = xc.upsample_nearest2d(h * factor, w * factor)?;
+    Ok(y.permute([0, 2, 3, 1])?.contiguous()?) // NCHW → NHWC
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (p, q) in a.iter().zip(&b) {
+            dot += (*p as f64) * (*q as f64);
+            na += (*p as f64) * (*p as f64);
+            nb += (*q as f64) * (*q as f64);
+        }
+        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+    }
+
+    fn dense(w: &Tensor, b: Option<&Tensor>) -> Linear {
+        Linear(QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: w.t().unwrap().contiguous().unwrap(),
+            bias: b.cloned(),
+        }))
+    }
+
+    /// A `[64, 32]` projection (in=32 = one Q4_0/Q8_0 block per row) quantizes and forwards
+    /// near-losslessly at Q8 / coherently at Q4 vs the dense f32 result — the per-linear analog of the
+    /// weights-gated full-model quant smoke, runnable on CPU with no weights.
+    fn quant_roundtrip(quant: Quant, min_cos: f32) {
+        let dev = Device::Cpu;
+        let w = Tensor::randn(0f32, 1f32, (64, 32), &dev).unwrap();
+        let b = Tensor::randn(0f32, 1f32, (64,), &dev).unwrap();
+        let mut lin = dense(&w, Some(&b));
+        let x = Tensor::randn(0f32, 1f32, (4, 32), &dev).unwrap();
+        let dense_out = lin.forward(&x).unwrap();
+        lin.quantize(quant).unwrap();
+        assert!(lin.0.is_quantized(), "must be quantized");
+        assert_eq!(
+            lin.0.matmul_strategy(),
+            Some(candle_gen::quant::MatmulStrategy::Int8Fast),
+            "SAM3 uses candle's int8 QMatMul forward"
+        );
+        let q_out = lin.forward(&x).unwrap();
+        let cos = cosine(&dense_out, &q_out);
+        assert!(cos > min_cos, "{quant:?} cosine {cos:.5} ≤ {min_cos}");
+    }
+
+    #[test]
+    fn q8_linear_is_near_lossless() {
+        quant_roundtrip(Quant::Q8, 0.999);
+    }
+
+    #[test]
+    fn q4_linear_stays_coherent() {
+        quant_roundtrip(Quant::Q4, 0.95);
+    }
+
+    /// Write a single-tensor `.safetensors` file (`name -> [value]`, f32) at `path`.
+    fn write_shard(path: &Path, name: &str, value: f32) {
+        let t = Tensor::new(&[value], &Device::Cpu).unwrap();
+        let mut m = HashMap::new();
+        m.insert(name.to_string(), t);
+        safetensors::save(&m, path).unwrap();
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "candle_gen_sam3_common_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Two shards with DISJOINT keys merge cleanly into the full key union (no false positive) — the
+    /// normal sharded-checkpoint path is preserved byte-for-byte (F-064 / sc-9050).
+    #[test]
+    fn from_dir_merges_disjoint_shards_into_key_union() {
+        let dir = scratch_dir("union");
+        write_shard(
+            &dir.join("model-00001-of-00002.safetensors"),
+            "a.weight",
+            1.0,
+        );
+        write_shard(
+            &dir.join("model-00002-of-00002.safetensors"),
+            "b.weight",
+            2.0,
+        );
+
+        let w = Weights::from_dir(&dir, &Device::Cpu).unwrap();
+        assert_eq!(
+            w.require("a.weight").unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0]
+        );
+        assert_eq!(
+            w.require("b.weight").unwrap().to_vec1::<f32>().unwrap(),
+            vec![2.0]
+        );
+        assert!(w.get("missing").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two shards that BOTH define the same key are detected and surfaced as a descriptive error naming
+    /// the offending key and shard file, instead of silently overwriting (F-064 / sc-9050).
+    #[test]
+    fn from_dir_errors_on_cross_shard_duplicate_key() {
+        let dir = scratch_dir("dup");
+        write_shard(
+            &dir.join("model-00001-of-00002.safetensors"),
+            "dup.weight",
+            1.0,
+        );
+        // A stray / mis-sharded second file redefines the same key.
+        write_shard(
+            &dir.join("model-00002-of-00002.safetensors"),
+            "dup.weight",
+            2.0,
+        );
+
+        match Weights::from_dir(&dir, &Device::Cpu) {
+            Err(CandleError::Msg(m)) => {
+                assert!(m.contains("duplicate tensor key"), "got: {m}");
+                assert!(m.contains("dup.weight"), "must name the key, got: {m}");
+                assert!(
+                    m.contains("model-00002-of-00002.safetensors"),
+                    "must name the shard, got: {m}"
+                );
+            }
+            Err(other) => panic!("expected a crafted duplicate-key Msg error, got: {other:?}"),
+            Ok(_) => panic!("expected an error on a cross-shard duplicate key, got Ok"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A linear whose contraction is not a multiple of 32 (in=20) stays dense (the reference
+    /// predicate that keeps SAM3's `2→256` / `4→256` / `258→256` projections full-precision), and
+    /// `quantize` is idempotent on an already-quantized linear.
+    #[test]
+    fn quantize_skips_odd_contraction_and_is_idempotent() {
+        let dev = Device::Cpu;
+        let odd = Tensor::randn(0f32, 1f32, (64, 20), &dev).unwrap();
+        let mut lin = dense(&odd, None);
+        lin.quantize(Quant::Q8).unwrap();
+        assert!(!lin.0.is_quantized(), "in=20 stays dense");
+
+        let w = Tensor::randn(0f32, 1f32, (64, 32), &dev).unwrap();
+        let mut q = dense(&w, None);
+        q.quantize(Quant::Q8).unwrap();
+        q.quantize(Quant::Q8).unwrap(); // idempotent, must not error
+        assert!(q.0.is_quantized());
+    }
+}

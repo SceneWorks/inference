@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Manual trigger for the windows-cuda lane below (it is gated to this event so it never auto-runs).
+  workflow_dispatch:
+
+# Supersede in-flight runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The default (CPU) build works on any platform. macOS additionally exercises the `metal`
+  # feature. This lane runs fmt + clippy + check + test + the gen-core skew gate's self-test.
+  build:
+    name: fmt + clippy + check + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        # No `@stable` — that would ignore the pin. `rustup show` installs the channel named in
+        # rust-toolchain.toml (its components come with it); the explicit add is idempotent.
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (default / CPU)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check (default / CPU)
+        run: cargo check --workspace
+
+      - name: Check (Metal backend)
+        if: matrix.os == 'macos-15'
+        run: cargo check --workspace --features metal
+
+      - name: Test (default / CPU)
+        run: cargo test --workspace
+
+      - name: lock-poison guard (no panicking cache/component locks)
+        run: bash scripts/check-lock-poison.sh
+
+      - name: gen-core skew gate (self-test)
+        run: bash scripts/check-gen-core-skew.sh --self-test
+
+      - name: gen-core skew gate (real graph)
+        run: bash scripts/check-gen-core-skew.sh
+
+  # Windows + CUDA lane. MANUAL-ONLY: gated to `workflow_dispatch`, so it never runs on push/PR and
+  # therefore needs NO standing runner. It is the reproducible CI recipe, dormant until you (a) start a
+  # self-hosted runner labelled [self-hosted, windows, cuda] and (b) dispatch the workflow by hand.
+  # Day to day, run the same checks locally with `pwsh scripts/check-cuda.ps1` before pushing — the CPU
+  # lanes above are blind to `#[cfg(feature = "cuda")]` code, so that script is the real cuda gate.
+  #
+  # The runner needs the toolchain in the README's packaging section: CUDA 12.9 toolkit (nvcc) + VS 2022
+  # v143 (MSVC 14.4x) Build Tools. GitHub-hosted runners have no GPU/CUDA, and their GPU larger-runners
+  # are Tesla T4 (sm_75) — below our sm_80 baseline — so they cannot run this build either.
+  #
+  # Packaging model (sc-3676, sc-7544): CUDA_COMPUTE_CAP is a SINGLE value (cudaforge `GpuArch::parse`;
+  # a `;`-list does not parse), so portability comes from a **baseline virtual arch** =80. The DENSE
+  # kernels emit compute_80 PTX the driver JIT-compiles to the runtime GPU's SASS; the QUANTIZED + MoE
+  # kernels (`nvcc -c` into libmoe.a) ship a multi-arch fatbin — native sm_80/sm_90/sm_120 SASS +
+  # forward PTX, via vendor/candle-kernels — because a single-arch sm_80-only cubin silently no-ops the
+  # quant matmuls on Blackwell sm_120 (sc-7544). One binary still runs sm_80 Ampere → sm_120 Blackwell.
+  # The `cargo test` step runs candle-gen's `cuda_quant_smoke` regression guard. Keep this in lockstep
+  # with README "Packaging", scripts/check-cuda.ps1 and scripts/package-cuda.ps1.
+  windows-cuda:
+    name: build + test (Windows / CUDA, sm_80 baseline + quant fatbin)
+    # Manual dispatch only — never auto-runs, so no runner is required for normal CI.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, windows, cuda]
+    env:
+      # Baseline virtual arch =80: seeds dense compute_80 PTX (driver-JIT'd up) + the quant fatbin's
+      # sm_80 baseline (vendor/candle-kernels layers sm_90/sm_120 SASS on top). NOT a hardware pin.
+      CUDA_COMPUTE_CAP: "80"
+      # Toolchain locations on the runner. Override here (not in code) if the runner layout changes —
+      # this keeps the build reproducible without a hand-set local shell.
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # nvcc emits one PTX per kernel under the candle-kernels build dir; cudaforge skips recompiling
+      # when the .ptx is newer than its .cu, so this caches across runs. cmd (not pwsh) sources vcvars
+      # in-process and runs cargo in the same environment — no MSYS `cmd /c` path mangling.
+      - name: Build (CUDA, baseline PTX)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo build --workspace --features cuda
+
+      - name: Test (CUDA)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --workspace --features cuda

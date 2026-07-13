@@ -1,0 +1,534 @@
+//! The Krea 2 dense single-stream DiT (`Krea2Transformer2DModel` / reference `mmdit.py`
+//! `SingleStreamDiT`) forward. Port of `mlx-gen-krea`'s `transformer/mod.rs`.
+//!
+//! ```text
+//!   img_in:        img tokens = Linear(patchify(latent, p=2))          [b, img_len, 6144]
+//!   time_embed:    t   = Linear(GELU(Linear(sinusoid(timestep))))      [b, 1, 6144]
+//!   time_mod_proj: tvec = Linear(GELU(t))                              [b, 1, 6·6144]   (shared modulation)
+//!   text_fusion:   ctx = aggregate(stacked 12 Qwen3-VL layers)         [b, cap, 2560]
+//!   txt_in:        ctx = Linear(GELU(Linear(RMSNorm(ctx))))            [b, cap, 6144]
+//!   combined = [ctx ; img]                                            [b, cap+img_len, 6144]
+//!   28× transformer_blocks (gated single-stream, DoubleSharedModulation, 3-axis RoPE)
+//!   final_layer:   (1+scale)·RMSNorm(x) + shift → Linear(6144→64)      [b, cap+img_len, 64]
+//!   slice image tokens → unpatchify                                   → velocity [b, 16, H, W]
+//! ```
+//!
+//! Per-sample `B = 1`: the text stream arrives already trimmed to its valid length (the candle
+//! tokenizer emits no padding) and the whole sequence runs **unmasked**.
+
+pub mod block;
+pub mod rope;
+
+use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+
+use crate::config::Krea2Config;
+use crate::loader::{linear_detect, Weights};
+use crate::quant::QLinear;
+use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
+use rope::RopeTables;
+
+/// The Krea 2 single-stream DiT.
+pub struct Krea2Transformer {
+    cfg: Krea2Config,
+    device: Device,
+    dtype: DType,
+    img_in: QLinear,
+    time_embed_l1: QLinear,
+    time_embed_l2: QLinear,
+    time_mod_proj: QLinear,
+    txt_in_norm: RmsScale,
+    txt_in_l1: QLinear,
+    txt_in_l2: QLinear,
+    text_fusion: TextFusionTransformer,
+    blocks: Vec<SingleStreamBlock>,
+    final_norm: RmsScale,
+    final_linear: QLinear,
+    final_sstable: Tensor, // [1, 2, hidden]
+    /// Per-render RoPE-table cache (sc-8992 / F-012, made multi-entry in sc-11201 / F-089). The joint
+    /// `(cos, sin)` table depends only on the fixed geometry `(cap_len, ht, wt, n_refs)` — not on the
+    /// flow time / the current latent — so it is identical across every denoise step. Keyed on that
+    /// geometry; hits Arc-clone the stored handles. Bounded to a few entries so the two true-CFG legs
+    /// (cond + uncond, which usually differ in `cap_len`) stay resident and don't evict each other.
+    rope_cache: RopeCache<(usize, usize, usize, usize), (Tensor, Tensor)>,
+}
+
+/// How many distinct RoPE geometries to keep cached per render. Under true CFG each denoise step
+/// runs two forwards (cond + uncond) whose contexts usually differ in `cap_len`, i.e. two geometries
+/// alternate across the render. A single-entry cache thrashed — evicting + rebuilding the host trig
+/// tables (plus an H2D upload) on every forward (sc-11201 / F-089). Holding a few entries keeps both
+/// legs resident; the small headroom absorbs any incidental extra geometry.
+const ROPE_CACHE_CAP: usize = 4;
+
+/// A tiny bounded, geometry-keyed cache for the per-render RoPE tables (sc-8992 / F-012, sc-11201 /
+/// F-089). Holds up to [`ROPE_CACHE_CAP`] distinct geometries so both true-CFG legs stay resident
+/// across every denoise step instead of evicting each other on every forward. On a miss the value is
+/// built and inserted; on overflow the oldest entry is evicted (FIFO — with two alternating keys and
+/// `cap ≥ 2` no eviction ever happens once both are cached). Hits clone the (Arc-backed) `V`.
+/// `Mutex` (not `RefCell`): the DiT is shared as `Arc<…>` (`Send + Sync`).
+struct RopeCache<K, V> {
+    entries: std::sync::Mutex<Vec<(K, V)>>,
+    cap: usize,
+}
+
+impl<K: PartialEq, V: Clone> RopeCache<K, V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+            cap,
+        }
+    }
+
+    /// Return the cached value for `key`, building + inserting it on a miss.
+    fn get_or_build(&self, key: K, build: impl FnOnce() -> Result<V>) -> Result<V> {
+        let mut guard = candle_gen::lock_recover(&self.entries);
+        if let Some((_, v)) = guard.iter().find(|(k, _)| *k == key) {
+            return Ok(v.clone());
+        }
+        let v = build()?;
+        if guard.len() >= self.cap {
+            guard.remove(0);
+        }
+        guard.push((key, v.clone()));
+        Ok(v)
+    }
+}
+
+impl Krea2Transformer {
+    /// Build from a loaded `transformer/` weight set.
+    pub fn load(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        let (heads, kv, hd, eps) = (
+            cfg.num_attention_heads,
+            cfg.num_kv_heads,
+            cfg.attention_head_dim,
+            cfg.norm_eps,
+        );
+        let (theads, tkv) = (cfg.text_num_attention_heads, cfg.text_num_kv_heads);
+        let hidden = cfg.hidden_size;
+
+        let final_sstable = w
+            .get("final_layer.scale_shift_table")?
+            .reshape((1, 2, hidden))?;
+
+        Ok(Self {
+            cfg: cfg.clone(),
+            device: w.device().clone(),
+            dtype: w.dtype(),
+            img_in: linear_detect(w, "img_in", true)?,
+            time_embed_l1: linear_detect(w, "time_embed.linear_1", true)?,
+            time_embed_l2: linear_detect(w, "time_embed.linear_2", true)?,
+            time_mod_proj: linear_detect(w, "time_mod_proj", true)?,
+            txt_in_norm: RmsScale::load(w, "txt_in.norm.weight", eps)?,
+            txt_in_l1: linear_detect(w, "txt_in.linear_1", true)?,
+            txt_in_l2: linear_detect(w, "txt_in.linear_2", true)?,
+            text_fusion: TextFusionTransformer::load(
+                w,
+                cfg.num_layerwise_text_blocks,
+                cfg.num_refiner_text_blocks,
+                theads,
+                tkv,
+                hd,
+                eps,
+            )?,
+            blocks: (0..cfg.num_layers)
+                .map(|i| {
+                    SingleStreamBlock::load(
+                        w,
+                        &format!("transformer_blocks.{i}"),
+                        heads,
+                        kv,
+                        hd,
+                        hidden,
+                        eps,
+                    )
+                })
+                .collect::<Result<_>>()?,
+            final_norm: RmsScale::load(w, "final_layer.norm.weight", eps)?,
+            final_linear: linear_detect(w, "final_layer.linear", true)?,
+            final_sstable,
+            rope_cache: RopeCache::new(ROPE_CACHE_CAP),
+        })
+    }
+
+    /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
+    /// moved here at install (else the residual matmul is a device mismatch). sc-11105.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut AdaptLinear)` once each with the
+    /// projection's canonical DiT dotted path — the single-stream `transformer_blocks.{i}` attention +
+    /// SwiGLU projections plus the `text_fusion.{layerwise,refiner}_blocks.{i}` ones (exactly
+    /// `crate::adapters::merge_surface_keys`). The additive installer
+    /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
+    /// projection so a user adapter applies on a packed q4/q8 tier with the base kept packed (sc-11105).
+    /// This inner walk covers the per-block attention + FFN; the front-end (`img_in`/`txt_in`/`time_*`/
+    /// `final_layer.linear`) leaves are added on top by the [`crate::adapters::AdditiveDit`] impl below
+    /// (sc-11720 wide surface), so they are NOT visited here. `text_fusion.projector` stays out of surface.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
+        }
+        self.text_fusion.visit_adaptable_mut(f)?;
+        Ok(())
+    }
+
+    /// Build (or reuse) the joint RoPE `(cos, sin)` table for this render's fixed geometry (sc-8992).
+    /// Recomputed only when `(cap_len, ht, wt, n_refs)` changes; otherwise the Arc-backed handles are
+    /// cloned. `n_refs == 0` builds the plain t2i `[text, image]` table (byte-identical to building it
+    /// inline); `n_refs > 0` builds the edit `[text, refs…, target]` table (sc-10877). Since
+    /// `build_edit(n_refs = 0) ≡ build_t2i`, the t2i call stays on the exact `build_t2i` path.
+    fn rope_tables(
+        &self,
+        cap_len: usize,
+        ht: usize,
+        wt: usize,
+        n_refs: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        self.rope_cache.get_or_build((cap_len, ht, wt, n_refs), || {
+            let (axes, theta) = (self.cfg.axes_dims_rope, self.cfg.rope_theta as f64);
+            let rope = if n_refs == 0 {
+                RopeTables::build_t2i(cap_len, ht, wt, axes, theta, &self.device)?
+            } else {
+                RopeTables::build_edit(cap_len, ht, wt, n_refs, axes, theta, &self.device)?
+            };
+            Ok(rope.joint())
+        })
+    }
+
+    /// Patch-embed a normalized `[b, 16, H, W]` latent through the (adapter-carrying) `img_in` →
+    /// `[b, img_len, hidden]`. Shared by the target-latent embed and the edit reference-latent embeds
+    /// (sc-10877) so every image token — noise or reference — goes through the identical projection.
+    fn embed_image(&self, latent: &Tensor) -> Result<Tensor> {
+        self.img_in.forward(&patchify(
+            &latent.to_dtype(self.dtype)?,
+            self.cfg.patch_size,
+        )?)
+    }
+
+    /// The shared timestep + text front-end (sc-10877): the sinusoidal timestep embed `t`, the shared
+    /// modulation `tvec = time_mod_proj(GELU(t))`, and the projected text context `ctx`
+    /// `[b, cap, hidden]`. Both [`forward`](Self::forward) (t2i) and [`forward_edit`](Self::forward_edit)
+    /// call this, so the t2i front-end stays byte-identical.
+    fn front_end(&self, timestep: &Tensor, context: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let cfg = &self.cfg;
+        let dt = self.dtype;
+        let context = context.to_dtype(dt)?;
+
+        // Timestep embed → `t`; shared modulation `tvec = time_mod_proj(GELU(t))`.
+        let t_sin = temb(timestep, cfg.timestep_embed_dim, &self.device)?.to_dtype(dt)?; // [b, 1, tdim]
+        let t = self
+            .time_embed_l2
+            .forward(&self.time_embed_l1.forward(&t_sin)?.gelu()?)?; // [b, 1, hidden]
+        let tvec = self.time_mod_proj.forward(&t.gelu()?)?; // [b, 1, 6·hidden]
+
+        // Text fusion (12 layers → 1) then the text input projection.
+        let ctx = self.text_fusion.forward(&context)?; // [b, cap, text_hidden]
+        let ctx = self.txt_in_norm.forward(&ctx)?;
+        let ctx = self
+            .txt_in_l2
+            .forward(&self.txt_in_l1.forward(&ctx)?.gelu()?)?; // [b, cap, hidden]
+        Ok((t, tvec, ctx))
+    }
+
+    /// Velocity prediction.
+    ///
+    /// - `latent`: `[b, 16, H, W]` (H, W multiples of `patch_size`),
+    /// - `timestep`: `[b]` f32 (raw flow time in `[0, 1]`),
+    /// - `context`: `[b, n_tokens, num_text_layers, text_hidden]` — the stacked Qwen3-VL select-layer
+    ///   hidden states (sc-7569), already trimmed to the valid token count (no padding).
+    ///
+    /// Returns the velocity `[b, 16, H, W]`.
+    pub fn forward(&self, latent: &Tensor, timestep: &Tensor, context: &Tensor) -> Result<Tensor> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size;
+        let (_, _, h, w) = latent.dims4()?;
+        let (ht, wt) = (h / p, w / p);
+        let img_len = ht * wt;
+        let latent_ch = cfg.in_channels / (p * p);
+        let cap_len = context.dim(1)?;
+
+        // Image patch embed + shared timestep/text front-end.
+        let img = self.embed_image(latent)?; // [b, img_len, hidden]
+        let (t, tvec, ctx) = self.front_end(timestep, context)?;
+
+        // Fuse to the joint sequence and run the single-stream stack under the joint RoPE.
+        let mut combined = Tensor::cat(&[&ctx, &img], 1)?; // [b, cap+img_len, hidden]
+
+        // The joint RoPE table is step-invariant (fixed geometry), so cache it per render (sc-8992).
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, 0)?;
+        for blk in &self.blocks {
+            combined = blk.forward(&combined, &tvec, &rcos, &rsin)?;
+        }
+
+        // Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
+        let out = self.final_layer(&combined, &t)?; // [b, cap+img_len, in_channels]
+        let img_out = out.narrow(1, cap_len, img_len)?;
+        unpatchify(&img_out, ht, wt, p, latent_ch)
+    }
+
+    /// **Kontext-style edit velocity prediction** (epic 10871 / sc-10877). Identical to
+    /// [`forward`](Self::forward) but with one or more in-context reference latents prepended between the
+    /// text and the noise: the joint sequence is `[text, refs…, target]`, each reference embedded through
+    /// the same frozen `img_in` and positioned at its own RoPE frame ([`RopeTables::build_edit`]). The
+    /// `in_channels` is unchanged (64) — this is **sequence** concat, not channel concat.
+    ///
+    /// - `latent`: the noise target `[b, 16, H, W]`.
+    /// - `refs`: the VAE-encoded reference latents, **each at the target resolution** `[b, 16, H, W]`
+    ///   (they share the target patch grid); fixed order (scene, then person — sc-10878). Empty ⇒
+    ///   byte-identical to [`forward`](Self::forward) (the rope table falls back to `build_t2i`).
+    /// - `context`: the (optionally image-grounded, P2) `[b, n_tokens, num_text_layers, text_hidden]`.
+    ///
+    /// Returns the velocity for the **target** tokens only `[b, 16, H, W]` (the reference tokens are
+    /// conditioning; their output slice is discarded).
+    pub fn forward_edit(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        refs: &[Tensor],
+    ) -> Result<Tensor> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size;
+        let (_, _, h, w) = latent.dims4()?;
+        let (ht, wt) = (h / p, w / p);
+        let img_len = ht * wt;
+        let latent_ch = cfg.in_channels / (p * p);
+        let n_refs = refs.len();
+        let cap_len = context.dim(1)?;
+
+        // Target + reference image tokens (references must share the target grid — VAE-encoded at the
+        // target resolution). All go through the identical `img_in` projection.
+        let img = self.embed_image(latent)?;
+        let mut ref_toks = Vec::with_capacity(n_refs);
+        for (i, r) in refs.iter().enumerate() {
+            let (_, _, rh, rw) = r.dims4()?;
+            if rh != h || rw != w {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "krea edit: reference {i} is {rh}x{rw} but the target latent is {h}x{w}; \
+                     references must be VAE-encoded at the target resolution"
+                )));
+            }
+            ref_toks.push(self.embed_image(r)?);
+        }
+
+        let (t, tvec, ctx) = self.front_end(timestep, context)?;
+
+        // Joint sequence `[ctx, refs…, target]` (references BEFORE the noise — the Krea2Edit contract).
+        let mut parts: Vec<&Tensor> = Vec::with_capacity(2 + n_refs);
+        parts.push(&ctx);
+        parts.extend(ref_toks.iter());
+        parts.push(&img);
+        let mut combined = Tensor::cat(&parts, 1)?;
+
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, n_refs)?;
+        for blk in &self.blocks {
+            combined = blk.forward(&combined, &tvec, &rcos, &rsin)?;
+        }
+
+        // Slice the TARGET tokens (they sit last, after the text + all reference blocks) + unpatchify.
+        let out = self.final_layer(&combined, &t)?;
+        let target_offset = cap_len + n_refs * img_len;
+        let img_out = out.narrow(1, target_offset, img_len)?;
+        unpatchify(&img_out, ht, wt, p, latent_ch)
+    }
+
+    /// Reference `LastLayer`: `SimpleModulation(t) = t + scale_shift_table` → `(scale, shift)`;
+    /// `Linear((1+scale)·RMSNorm(x) + shift)`.
+    fn final_layer(&self, x: &Tensor, t: &Tensor) -> Result<Tensor> {
+        let m = t.broadcast_add(&self.final_sstable)?; // [b, 2, hidden] (t broadcasts 1→2)
+        let scale = m.narrow(1, 0, 1)?; // [b, 1, hidden]
+        let shift = m.narrow(1, 1, 1)?;
+        let normed = self
+            .final_norm
+            .forward(x)?
+            .broadcast_mul(&(scale + 1.0)?)?
+            .broadcast_add(&shift)?;
+        self.final_linear.forward(&normed)
+    }
+}
+
+impl crate::adapters::AdditiveDit for Krea2Transformer {
+    /// The txt2img adapter surface: per-block attention + SwiGLU FFN (via the inner
+    /// [`Self::visit_adaptable_mut`]) PLUS the front-end + final leaves (sc-11720 wide surface). The
+    /// front-end `QLinear`s yield an [`AdaptLinear`](candle_gen::quant::AdaptLinear) only on a dense tier
+    /// (`as_adapt_mut`); on a packed tier they stay quantized and are simply skipped — user adapters
+    /// almost never target them, and the attention+FFN surface is unchanged.
+    fn visit_additive(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut dyn crate::adapters::AdditiveProj) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.visit_adaptable_mut(&mut |path, a| f(path, a))?;
+        for (path, proj) in [
+            ("img_in", &mut self.img_in),
+            ("time_embed.linear_1", &mut self.time_embed_l1),
+            ("time_embed.linear_2", &mut self.time_embed_l2),
+            ("txt_in.linear_1", &mut self.txt_in_l1),
+            ("txt_in.linear_2", &mut self.txt_in_l2),
+            ("final_layer.linear", &mut self.final_linear),
+        ] {
+            if let Some(a) = proj.as_adapt_mut() {
+                f(path, a)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn adapter_device(&self) -> Device {
+        self.device.clone()
+    }
+
+    fn adapter_surface_hint(&self) -> &'static str {
+        "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over the DiT \
+         attention (to_q|to_k|to_v|to_gate|to_out.0) + SwiGLU FFN (ff.gate|ff.up|ff.down) across the \
+         single-stream transformer_blocks and text_fusion blocks, plus the front-end \
+         (img_in|time_embed.linear_1/2|txt_in.linear_1/2|final_layer.linear) projections. Conv-layer / \
+         text-encoder adapters are out of surface"
+    }
+}
+
+/// Reference `temb`: `freqs = exp(−ln(1e4)·arange(half)/half)`, `args = (timestep·1e3)·freqs`,
+/// `concat([cos, sin], −1)` (cos-first). `timestep`: `[b]` → `[b, 1, dim]` (a per-sample vector that
+/// broadcasts over the sequence). Built in f32 (the reference upcasts).
+///
+/// `pub(crate)` so the trainable DiT ([`crate::train_dit`]) shares the exact embedding (parity).
+pub(crate) fn temb(timestep: &Tensor, dim: usize, device: &Device) -> Result<Tensor> {
+    let half = dim / 2;
+    let neg_ln = -(10000f64.ln()) as f32;
+    let freqs: Vec<f32> = (0..half)
+        .map(|i| (neg_ln * i as f32 / half as f32).exp())
+        .collect();
+    let freqs = Tensor::from_vec(freqs, (1, half), device)?; // [1, half]
+    let b = timestep.dim(0)?;
+    let scaled = (timestep.to_dtype(DType::F32)?.reshape((b, 1, 1))? * 1000.0)?; // [b, 1, 1]
+    let args = scaled.broadcast_mul(&freqs.reshape((1, 1, half))?)?; // [b, 1, half]
+    Tensor::cat(&[args.cos()?, args.sin()?], D::Minus1) // [b, 1, dim]
+}
+
+/// Reference `rearrange("b c (h ph) (w pw) -> b (h w) (c ph pw)")`: `[b, C, H, W] →
+/// [b, (H/p)(W/p), C·p·p]` with **channel-major** patch flattening (NOT boogu's `(ph pw c)`).
+///
+/// `pub(crate)` so the trainable DiT ([`crate::train_dit`]) patchifies identically.
+pub(crate) fn patchify(latent: &Tensor, p: usize) -> Result<Tensor> {
+    let (b, c, h, w) = latent.dims4()?;
+    let (ht, wt) = (h / p, w / p);
+    let x = latent.reshape((b, c, ht, p, wt, p))?; // b, c, ht, ph, wt, pw
+    let x = x.permute((0, 2, 4, 1, 3, 5))?; // b, ht, wt, c, ph, pw
+    x.contiguous()?.reshape((b, ht * wt, c * p * p))
+}
+
+/// Inverse of [`patchify`] (`"b (h w) (c ph pw) -> b c (h ph) (w pw)"`): `[b, (h)(w), C·p·p] →
+/// [b, C, h·p, w·p]`.
+///
+/// `pub(crate)` so the trainable DiT ([`crate::train_dit`]) unpatchifies identically.
+pub(crate) fn unpatchify(
+    tokens: &Tensor,
+    ht: usize,
+    wt: usize,
+    p: usize,
+    c: usize,
+) -> Result<Tensor> {
+    let b = tokens.dim(0)?;
+    let x = tokens.contiguous()?.reshape((b, ht, wt, c, p, p))?; // b, ht, wt, c, ph, pw
+    let x = x.permute((0, 3, 1, 4, 2, 5))?; // b, c, ht, ph, wt, pw
+    x.contiguous()?.reshape((b, c, ht * p, wt * p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+
+    #[test]
+    fn patchify_roundtrips_channel_major() {
+        let dev = Device::Cpu;
+        // [1, 4, 4, 6] with p=2 → 2×3 grid, 4·2·2 = 16 packed channels.
+        let x = Tensor::arange(0f32, (4 * 4 * 6) as f32, &dev)
+            .unwrap()
+            .reshape((1, 4, 4, 6))
+            .unwrap();
+        let packed = patchify(&x, 2).unwrap();
+        assert_eq!(packed.dims(), &[1, 2 * 3, 4 * 2 * 2]);
+        let back = unpatchify(&packed, 2, 3, 2, 4).unwrap();
+        assert_eq!(back.dims(), x.dims());
+        let a = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = back.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a, b, "patchify∘unpatchify must be the identity");
+    }
+
+    #[test]
+    fn temb_is_cos_first_and_scaled() {
+        let dev = Device::Cpu;
+        // t = 0 → all angles 0 → cos half = 1, sin half = 0.
+        let t = Tensor::from_vec(vec![0f32], (1,), &dev).unwrap();
+        let e = temb(&t, 8, &dev).unwrap();
+        assert_eq!(e.dims(), &[1, 1, 8]);
+        let v = e.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            v[..4].iter().all(|&x| (x - 1.0).abs() < 1e-6),
+            "cos-first half = 1 at t=0"
+        );
+        assert!(
+            v[4..].iter().all(|&x| x.abs() < 1e-6),
+            "sin half = 0 at t=0"
+        );
+    }
+
+    // sc-11201 / F-089: the RoPE cache must hold both true-CFG geometries at once so alternating
+    // cond/uncond forwards don't thrash it (rebuild every step). We exercise the bounded cache
+    // directly (it is model-independent) rather than standing up a full DiT.
+    #[test]
+    fn rope_cache_keeps_both_cfg_legs_resident() {
+        let cache: RopeCache<usize, i32> = RopeCache::new(ROPE_CACHE_CAP);
+        // Two alternating geometries stand in for the CFG cond (cap_len=77) and uncond (cap_len=12)
+        // token counts. `builds` counts how many times the (expensive) table build actually runs.
+        let mut builds = 0usize;
+        let (cond, uncond) = (77usize, 12usize);
+        for step in 0..52 {
+            for &cap in &[cond, uncond] {
+                let v = cache
+                    .get_or_build(cap, || {
+                        builds += 1;
+                        Ok(cap as i32 * 10)
+                    })
+                    .unwrap();
+                // Every hit returns exactly what a fresh build would (value keyed on geometry).
+                assert_eq!(v, cap as i32 * 10, "cached value must equal a fresh build");
+                let _ = step;
+            }
+        }
+        // 52 steps × 2 legs = 104 forwards, but only the first touch of each geometry builds:
+        // the single-entry cache would have rebuilt on all 104. This proves no thrash.
+        assert_eq!(
+            builds, 2,
+            "each CFG geometry built exactly once across all steps"
+        );
+    }
+
+    #[test]
+    fn rope_cache_evicts_oldest_beyond_capacity() {
+        // With more distinct geometries than capacity, the oldest is evicted (FIFO) and a re-touch
+        // rebuilds — but the two-geometry CFG case (cap ≥ 2) never reaches this.
+        let cache: RopeCache<usize, i32> = RopeCache::new(2);
+        let builds = std::cell::Cell::new(0usize);
+        let build = |k: usize| {
+            cache
+                .get_or_build(k, || {
+                    builds.set(builds.get() + 1);
+                    Ok(k as i32)
+                })
+                .unwrap()
+        };
+        build(1);
+        build(2);
+        assert_eq!(builds.get(), 2);
+        build(1); // still cached
+        assert_eq!(builds.get(), 2);
+        build(3); // evicts key 1 (oldest)
+        assert_eq!(builds.get(), 3);
+        build(1); // 1 was evicted → rebuild
+        assert_eq!(builds.get(), 4);
+    }
+}

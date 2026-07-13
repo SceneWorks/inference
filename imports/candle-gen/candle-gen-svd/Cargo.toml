@@ -1,0 +1,29 @@
+[package]
+name = "candle-gen-svd"
+version = "0.0.0"
+edition = "2021"
+description = "Stable Video Diffusion (img2vid-xt) provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-svd."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "video", "svd", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+inventory = { workspace = true }
+# SVD has NO candle-transformers reference: the UNetSpatioTemporalConditionModel, the
+# AutoencoderKLTemporalDecoder temporal VAE (candle ships no conv3d — the temporal taps are written
+# here on candle-core/candle-nn), the OpenCLIP ViT-H CLIPVisionModelWithProjection image encoder, and
+# the EDM EulerDiscreteScheduler are all ported here from the diffusers checkpoint.
+# Deterministic CPU-seeded initial noise + noise-augmentation (sc-3673 parity).
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[features]
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+sceneworks-gen-core-testkit = { workspace = true }

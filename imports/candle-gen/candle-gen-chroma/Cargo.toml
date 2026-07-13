@@ -1,0 +1,51 @@
+[package]
+name = "candle-gen-chroma"
+version = "0.0.0"
+edition = "2021"
+description = "Chroma (chroma1_hd / chroma1_base / chroma1_flash) provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-chroma."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "chroma", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853). Chroma is a FLUX.1-lineage DiT
+# over the FLUX.1 16-ch VAE, so it shares the `flux` PiD latent-space student. Wired behind
+# `req.use_pid` (default off → the byte-exact native VAE decode).
+candle-gen-pid = { path = "../candle-gen-pid" }
+# Link-time self-registration into gen-core's model registry (the three `inventory::submit!`).
+inventory = { workspace = true }
+# T5-XXL encoder (`t5::T5EncoderModel`) for the prompt conditioning, plus `flux::sampling::unpack`
+# for the 2x2 latent unpack (Chroma packs latents exactly like FLUX). Backend features are passed
+# through below so it shares candle-gen's exact candle build.
+candle-transformers = { workspace = true }
+# Prompt tokenization. Chroma has no chat template (plain T5 encode); the T5 `tokenizer.json` is
+# vendored (assets/, converted from the snapshot's `spiece.model` — google t5-v1.1-xxl), mirroring
+# the mlx provider, so tokenization is identical and never reconstructed from the network.
+tokenizers = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# Parse the snapshot's `text_encoder/config.json` into candle's `t5::Config` (same path the candle
+# `flux` provider uses for its T5). Matches the serde_json major candle's own tree pulls in (no dup).
+serde_json = "1"
+
+[features]
+# Pass the backend selection through to the core crate AND candle-transformers so a downstream
+# `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
+default = []
+metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda"]
+
+[dev-dependencies]
+# `examples/chroma-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to
+# PNG so a real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# gen-core conformance suite (sc-4481): drives this provider through the public Generator contract
+# (cancel / progress / seed-determinism / capability honesty). Pinned to the SAME gen-core rev the
+# workspace pins so it shares one contract build. Used by tests/conformance.rs (cuda-gated,
+# #[ignore]d — it runs a real generate, so it needs weights + GPU).
+sceneworks-gen-core-testkit = { workspace = true }

@@ -1,0 +1,49 @@
+[package]
+name = "candle-gen-lens"
+version = "0.0.0"
+edition = "2021"
+description = "Lens / Lens-Turbo (gpt-oss-20b MoE encoder + dual-stream MMDiT + Flux.2 VAE) text-to-image provider crate for candle-gen — the Windows/CUDA sibling of the mlx-gen Lens port (epic 3164). Epic 5107."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "lens", "text-to-image", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# Lens is a from-scratch candle port. The gpt-oss-20b text encoder is built in-crate on `candle_nn`
+# primitives (sc-5108): candle-transformers ships no `gpt_oss` (Gate-0 spike, epic 5107 — upstream
+# PRs #3129/#3581/#3391 are all unmerged), and it is used encoder-only with multi-layer hidden
+# capture, which no upstream model exposes. The decoder is adapted from the verified-parity reference
+# in candle PR #3581 (attention sinks + YaRN + sliding/full + clamped-SwiGLU + MXFP4 expert dequant).
+# The Lens VAE *is* the Flux.2 `AutoencoderKLFlux2` (32-ch latent, 2×2 patchify, bn-stats normalize),
+# already ported in candle-gen-flux2 — the Lens decode path reuses `Flux2Vae::decode_packed` (sc-5113).
+candle-gen-flux2 = { path = "../candle-gen-flux2" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853): Lens reuses the FLUX.2 VAE, so it
+# shares the `flux2` PiD latent-space student. Wired behind `req.use_pid` (default off → the byte-exact
+# native `Flux2Vae::decode_packed`).
+candle-gen-pid = { path = "../candle-gen-pid" }
+# Link-time self-registration into gen-core's model registry (`inventory::submit!`, sc-5115).
+inventory = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 pattern) — NOT candle's CUDA `randn`.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# Read trained adapter `.safetensors` (tensors + the `networkType`/`rank`/`alpha` metadata the LoKr
+# merge needs) at inference-side load (sc-5116 LoRA/LoKr merge). Candle's own version (0.7), matching
+# candle-gen, so the `View` impl candle-core provides for `Tensor` is the same one.
+safetensors = "0.7"
+# Parse the packed-tier `quantization: { bits, group_size }` block out of a component `config.json`
+# (sc-9474) — the parsed group size is threaded into a LOUD load-time guard so a future non-64 tier
+# fails rather than silently repacking to garbage. Same workspace pin as candle-gen / candle-gen-sd3.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The trainer e2e/conformance gates (tests/trainer_*.rs) write tiny PNG datasets and drive the gen-core
+# Trainer contract harness. Both are `#[ignore]` + `cfg(feature = "cuda")` (need the real Lens weights +
+# a GPU); the testkit lib name is `gen_core_testkit`.
+image = { version = "0.25", default-features = false, features = ["png"] }
+sceneworks-gen-core-testkit = { workspace = true }
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-gen-pid/cuda"]

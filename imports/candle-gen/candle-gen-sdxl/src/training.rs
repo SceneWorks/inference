@@ -1,0 +1,1102 @@
+//! The candle **SDXL LoRA/LoKr trainer** (sc-5165) — the candle twin of `mlx-gen-sdxl`'s trainer,
+//! implementing the backend-neutral [`gen_core::Trainer`](candle_gen::gen_core::train::Trainer) with
+//! `backend = "candle"`. It retires the worker's Python torch `LoraTrainer` for SDXL (epic 5164, the
+//! zero-Python north star).
+//!
+//! ## What it does, and the candle realities that shape it
+//!
+//! Cache → loop → save, mirroring the MLX trainer's lifecycle bands:
+//!
+//!  1. **Cache** — for each captioned image: decode/crop/resize to a VAE-input tensor
+//!     ([`dataset::load_image_tensor`]), encode the **deterministic latent mean**
+//!     (`VaeMomentsEncoder::encode_mean` → `mean × 0.13025`, the user's `.mean` decision — candle's
+//!     stock VAE hides the mean, hence the vendored encoder), and encode the caption through the dual
+//!     CLIP into `[1, 77, 2048]`. The CLIP + VAE encoders are dropped after caching.
+//!  2. **Loop** — sample a uniform integer DDPM timestep `t`, form `noisy = √ᾱ·x0 + √(1-ᾱ)·noise`
+//!     (candle's DDIM `add_noise`), predict ε through the UNet, regress ε→noise (MSE/MAE), and step
+//!     the adapter factors. Gradient accumulation, LR schedule, grad-norm clipping, and intermediate
+//!     checkpoints all match the MLX twin.
+//!  3. **Save** — a PEFT `.safetensors` (`save_lora_peft` / `save_lokr`).
+//!
+//! **Conditioning matches candle *inference*, not the MLX twin.** The candle SDXL UNet forward is
+//! `(noisy, timestep, encoder_hidden_states)` — it wires **no** pooled embed and **no** `time_ids`
+//! (the stock candle-transformers SDXL UNet has no `add_embedding`; see [`crate::pipeline`]). So the
+//! trainer feeds exactly that 3-tensor surface — optimizing the adapter against the precise function
+//! that will load it, not the MLX 5-arg forward. (Wiring true SDXL micro-conditioning into candle is a
+//! separate inference-side change.)
+//!
+//! **The eager-`Var` simplification.** Unlike the MLX trainer (which re-installs the factor map into
+//! the model inside every `value_and_grad`), candle's adapters are storage-sharing `Var`s installed
+//! **once** ([`build_lora_targets`]/[`build_lokr_targets`]): each forward re-reads the current factor
+//! storage and `loss.backward()` attributes grads straight to the `Var`s, so the per-step body is just
+//! forward → backward → clip → step, with no re-install.
+//!
+//! **Gradient checkpointing** (`config.gradient_checkpointing`) routes the backward through
+//! [`checkpointed_backward`] over the UNet's block segments ([`UNet2DConditionModel::block_segments`]),
+//! recomputing each down/mid/up block instead of retaining its activations — numerically the dense
+//! grads (a `tests` parity gate asserts this), at the cost of one extra forward.
+
+use std::path::{Path, PathBuf};
+
+use candle_core::backprop::GradStore;
+use candle_core::{DType, Device, Tensor, Var, D};
+use candle_nn::Module;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use tokenizers::Tokenizer;
+
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::{
+    schedule_sigmas, DiscreteModelSampling, Scheduler as SamplingScheduler,
+};
+use candle_gen::gen_core::train::{
+    NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
+    TrainingRequest,
+};
+use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
+use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
+use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
+use candle_gen::train::lora::{
+    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
+    LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
+};
+use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
+use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
+use candle_gen::{CandleError, Result};
+
+use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
+use candle_transformers::models::stable_diffusion::schedulers::{Scheduler, SchedulerConfig};
+use candle_transformers::models::stable_diffusion::{self, clip, StableDiffusionConfig};
+
+use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+
+use crate::denoise::decode_image;
+use crate::loaders::load_sdxl_vae;
+use crate::pipeline::{
+    hf_get, sdxl_alpha_schedule, snapshot_file, Clip, VAE_FIX_FILE, VAE_FIX_REPO, VAE_SCALE,
+};
+use crate::unet::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
+use crate::MODEL_ID;
+
+/// DDPM training-noise schedule length (the diffusers `num_train_timesteps`). `t` is sampled uniform
+/// over `[0, NUM_TRAIN_TIMESTEPS)`, matching torch's `randint(0, num_train_timesteps)`.
+const NUM_TRAIN_TIMESTEPS: usize = 1000;
+
+/// Cap on preview prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-8650). Mirrors the
+/// `SAMPLE_PROMPT_CAP` the FlowMatch driver applies to the flow-match families — a preview is a
+/// best-effort progress signal, so a long `sample_prompts` list never blows the per-cadence cost up.
+const SAMPLE_PROMPT_CAP: usize = 4;
+
+/// `"bf16"`/`"bfloat16"` → [`DType::BF16`]; anything else → [`DType::F32`] (the gen-core contract:
+/// unrecognized = f32). The adapter factors / loss / grads stay f32 regardless (master weights).
+fn parse_compute_dtype(s: &str) -> DType {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("bf16") || t.eq_ignore_ascii_case("bfloat16") {
+        DType::BF16
+    } else {
+        DType::F32
+    }
+}
+
+/// The two SDXL CLIP text encoders + their tokenizers, loaded f32 for clean cached embeddings.
+struct DualClip {
+    l: clip::ClipTextTransformer,
+    g: clip::ClipTextTransformer,
+    tok_l: Tokenizer,
+    tok_g: Tokenizer,
+    l_max: usize,
+    l_pad: u32,
+    g_max: usize,
+    g_pad: u32,
+    device: Device,
+}
+
+impl DualClip {
+    /// Load CLIP-L (`text_encoder/`) + CLIP-bigG (`text_encoder_2/`) from the snapshot and their
+    /// tokenizers from HF — the same sources the inference [`crate::pipeline`] uses, at f32.
+    fn load(root: &Path, device: &Device) -> Result<Self> {
+        let cfg = StableDiffusionConfig::sdxl(None, None, None);
+        let l_cfg = &cfg.clip;
+        let g_cfg = cfg
+            .clip2
+            .as_ref()
+            .ok_or_else(|| CandleError::Msg("sdxl config missing clip2".into()))?;
+        let (l_tok_repo, l_weights) = Clip::L.sources();
+        let (g_tok_repo, g_weights) = Clip::BigG.sources();
+        let tok_l = Tokenizer::from_file(hf_get(l_tok_repo, "tokenizer.json")?)
+            .map_err(|e| CandleError::Msg(format!("load tokenizer {l_tok_repo}: {e}")))?;
+        let tok_g = Tokenizer::from_file(hf_get(g_tok_repo, "tokenizer.json")?)
+            .map_err(|e| CandleError::Msg(format!("load tokenizer {g_tok_repo}: {e}")))?;
+        let l = stable_diffusion::build_clip_transformer(
+            l_cfg,
+            snapshot_file(root, l_weights)?,
+            device,
+            DType::F32,
+        )?;
+        let g = stable_diffusion::build_clip_transformer(
+            g_cfg,
+            snapshot_file(root, g_weights)?,
+            device,
+            DType::F32,
+        )?;
+        let l_pad = pad_id(&tok_l, l_cfg)?;
+        let g_pad = pad_id(&tok_g, g_cfg)?;
+        Ok(Self {
+            l,
+            g,
+            tok_l,
+            tok_g,
+            l_max: l_cfg.max_position_embeddings,
+            l_pad,
+            g_max: g_cfg.max_position_embeddings,
+            g_pad,
+            device: device.clone(),
+        })
+    }
+
+    /// Encode `caption` (no negative — training is CFG-off) to the SDXL dual-CLIP conditioning
+    /// `[1, 77, 2048]` = `cat([clip_L_hidden, clip_bigG_hidden], dim=-1)`, exactly the inference
+    /// `text_embeddings` concat (minus the `[uncond, cond]` batch stack).
+    fn encode(&self, caption: &str) -> Result<Tensor> {
+        let lt = tokenize_padded(&self.tok_l, self.l_max, self.l_pad, caption, &self.device)?;
+        let gt = tokenize_padded(&self.tok_g, self.g_max, self.g_pad, caption, &self.device)?;
+        let l = self.l.forward(&lt)?;
+        let g = self.g.forward(&gt)?;
+        Ok(Tensor::cat(&[l, g], D::Minus1)?)
+    }
+}
+
+/// Resolve a CLIP encoder's pad-token id from its tokenizer vocab + config `pad_with` (default
+/// `<|endoftext|>`).
+fn pad_id(tok: &Tokenizer, cfg: &clip::Config) -> Result<u32> {
+    let pad_token = cfg
+        .pad_with
+        .clone()
+        .unwrap_or_else(|| "<|endoftext|>".into());
+    tok.get_vocab(true)
+        .get(pad_token.as_str())
+        .copied()
+        .ok_or_else(|| CandleError::Msg(format!("pad token {pad_token:?} not in CLIP vocab")))
+}
+
+/// Tokenize `text`, pad to `max` with `pad`, and return a `[1, max]` id tensor (the inference encode
+/// closure, factored). Errors if the prompt exceeds the encoder's context.
+fn tokenize_padded(
+    tok: &Tokenizer,
+    max: usize,
+    pad: u32,
+    text: &str,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut tokens = tok
+        .encode(text, true)
+        .map_err(|e| CandleError::Msg(format!("tokenize: {e}")))?
+        .get_ids()
+        .to_vec();
+    if tokens.len() > max {
+        return Err(CandleError::Msg(format!(
+            "caption too long: {} tokens > {max}",
+            tokens.len()
+        )));
+    }
+    while tokens.len() < max {
+        tokens.push(pad);
+    }
+    Ok(Tensor::new(tokens.as_slice(), device)?.unsqueeze(0)?)
+}
+
+/// A uniform integer DDPM timestep in `[0, NUM_TRAIN_TIMESTEPS)`, deterministic in `seed` (the
+/// sc-3673 CPU-`StdRng` discipline, NOT candle's device RNG) — the candle analog of the MLX trainer's
+/// `sample_timestep` and torch's `randint(0, num_train_timesteps)`.
+fn sample_timestep(seed: u64) -> usize {
+    StdRng::seed_from_u64(seed).random_range(0..NUM_TRAIN_TIMESTEPS)
+}
+
+/// Deterministic `N(0, 1)` noise of the given shape, drawn from a seeded CPU `StdRng` then moved to
+/// `device` (sc-3673 launch-portable discipline). Used as both the diffusion noise and the ε target.
+fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
+    let n: usize = shape.iter().product();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
+    Ok(Tensor::from_vec(data, shape, &Device::Cpu)?.to_device(device)?)
+}
+
+/// ε-prediction loss in f32: `mean((eps - noise)²)` (MSE) or `mean|eps - noise|` (MAE). `eps` (the
+/// UNet output, in the compute dtype) is promoted to f32 so the loss/grads stay f32 (master weights).
+fn eps_loss(eps: &Tensor, target_f32: &Tensor, mae: bool) -> candle_core::Result<Tensor> {
+    let diff = (eps.to_dtype(DType::F32)? - target_f32)?;
+    if mae {
+        diff.abs()?.mean_all()
+    } else {
+        diff.sqr()?.mean_all()
+    }
+}
+
+/// The resident preview state (sc-8650) pre-built in the cache phase, before the dual CLIP is dropped:
+/// the per-prompt **CFG-batched** conditioning `[2, 77, 2048]` (`[uncond, cond]`, exactly the inference
+/// `text_embeddings` layout) and a resident f16 VAE **decoder** (the cache pass only loaded the moments
+/// *encoder*, which is dropped post-cache). `None` when sampling is disabled (`sample_every == 0` or no
+/// `sample_prompts`). The conditioning lives at the compute dtype so the in-training UNet consumes it
+/// directly; the prompt strings are carried alongside so the loop can label each `Sample` event.
+struct SamplePreview {
+    /// `[uncond, cond]` dual-CLIP conditioning per prompt, `[2, 77, 2048]` in the compute dtype.
+    conds: Vec<Tensor>,
+    /// The prompts (1:1 with `conds`), surfaced on each emitted [`TrainingProgress::Sample`].
+    prompts: Vec<String>,
+    /// The f16-stable SDXL VAE decoder (`madebyollin/sdxl-vae-fp16-fix`), resident for the run so each
+    /// preview decodes its final latent without a per-cadence reload.
+    vae: AutoEncoderKL,
+}
+
+/// Render one preview image (sc-8650) on the **in-training** UNet — adapters live as eager `Var`s, so
+/// this denoise sees the partially-trained adapter exactly as a train step would.
+///
+/// **Curated sampler, not the native DDIM loop (sc-11173 / F-083).** This drives the SAME unified
+/// [`candle_gen::run_curated_sampler`] path SDXL *inference* uses — a curated `ddim` solver over
+/// [`DiscreteModelSampling::sdxl`] — mirroring [`crate::pipeline::Pipeline::denoise_curated`]. It
+/// replaces the earlier native candle-transformers `DDIMScheduler` inference loop, which sc-10826 found
+/// rendered a ghosted, translucent double-exposure (guidance-invariant) and deleted from the inference
+/// `pipeline.rs` — but the preview kept driving that identical loop, so a healthy adapter looked broken
+/// mid-run. The curated `ddim` is eta=0 / non-ancestral, so the sc-3673 launch-portable determinism the
+/// native default targeted is preserved.
+///
+/// Seeded launch-portable noise (the sc-3673 CPU-`StdRng` discipline via [`sample_noise`]) is scaled
+/// into VE σ-space by σ_max (`sigmas[0]`), the solver runs `cfg.sample_steps.max(1)` steps with
+/// classifier-free guidance `cfg.sample_guidance_scale`, then a VAE decode to `gen_core::Image`. `cond`
+/// is the `[uncond, cond]` `[2, 77, 2048]` batch ([`SamplePreview::conds`]); `(lat_h, lat_w)` are the
+/// training latent dims (the cached `x0`'s /8 grid). Previews have no cancel/progress surface, so a
+/// never-cancelled flag + a no-op progress sink are passed. Best-effort — any error propagates so the
+/// loop logs and skips this preview (never aborts the run).
+#[allow(clippy::too_many_arguments)]
+fn render_one_preview(
+    unet: &UNet2DConditionModel,
+    vae: &AutoEncoderKL,
+    cond: &Tensor,
+    cfg: &TrainingConfig,
+    lat_h: usize,
+    lat_w: usize,
+    compute_dtype: DType,
+    seed: u64,
+    device: &Device,
+) -> Result<gen_core::Image> {
+    let latents = preview_latents(unet, cond, cfg, lat_h, lat_w, compute_dtype, seed, device)?;
+    // The shared decode expects compute-dtype latents (like the inference curated loop); un-scale +
+    // `x/2 + 0.5` + clamp + ×255 → RGB8 `Image` lives in `crate::denoise::decode_image`.
+    decode_image(vae, &latents, None)
+}
+
+/// The curated denoise behind [`render_one_preview`] (sc-11173 / F-083), returning the final
+/// compute-dtype latent `[1, 4, lat_h, lat_w]` — factored out of the decode so the sampler wiring is
+/// unit-testable against a tiny synthetic UNet (no real VAE). Drives the SAME unified
+/// [`candle_gen::run_curated_sampler`] SDXL inference uses — the curated `ddim` solver over
+/// [`DiscreteModelSampling::sdxl`] — with the closure mirroring
+/// [`crate::pipeline::Pipeline::denoise_curated`]: σ-space prior, `1/√(σ²+1)` input scaling, CFG batch,
+/// raw ε in f32.
+#[allow(clippy::too_many_arguments)]
+fn preview_latents(
+    unet: &UNet2DConditionModel,
+    cond: &Tensor,
+    cfg: &TrainingConfig,
+    lat_h: usize,
+    lat_w: usize,
+    compute_dtype: DType,
+    seed: u64,
+    device: &Device,
+) -> Result<Tensor> {
+    let steps = (cfg.sample_steps as usize).max(1);
+    let guidance = cfg.sample_guidance_scale as f64;
+    // CFG fires only above 1.0 (parity with the inference path's `use_guide`); the conditioning is
+    // already the `[uncond, cond]` batch, so a no-CFG preview narrows to the cond row.
+    let use_guide = guidance > 1.0;
+
+    // The SDXL ε-prediction ModelSampling + the native curated σ schedule (ComfyUI's `normal` default,
+    // the same schedule `Pipeline::denoise_curated` resolves from when the request omits a scheduler).
+    let sched = sdxl_alpha_schedule()?;
+    let ms = DiscreteModelSampling::sdxl(&sched);
+    let sigmas = schedule_sigmas(SamplingScheduler::Normal, &ms, steps);
+
+    // sc-3673 launch-portable initial noise: N(0,1) from a seeded CPU `StdRng` moved to the device,
+    // scaled into VE σ-space by σ_max (`sigmas[0]`). Kept f32 through the sampler (cast per eval).
+    let init = sample_noise(&[1, 4, lat_h, lat_w], seed, device)?;
+    let latents = (init * sigmas[0] as f64)?;
+
+    let cond_c = cond.to_dtype(compute_dtype)?;
+    let cond_only = cond_c.narrow(0, 1, 1)?;
+
+    // A preview has no cancel/progress surface — a never-cancelled flag + a no-op progress sink.
+    let cancel = CancelFlag::new();
+    let mut on_progress = |_: gen_core::Progress| {};
+
+    let out = candle_gen::run_curated_sampler(
+        Some("ddim"),
+        &ms,
+        &sigmas,
+        latents,
+        seed,
+        &cancel,
+        &mut on_progress,
+        |x_in, timestep| -> Result<Tensor> {
+            // `x_in` is already `1/√(σ²+1)`-scaled by the solver; CFG-batch the single row to
+            // `[uncond, cond]` and cast to the UNet compute dtype (exactly the inference closure).
+            let model_in = if use_guide {
+                Tensor::cat(&[x_in, x_in], 0)?
+            } else {
+                x_in.clone()
+            };
+            let model_in = model_in.to_dtype(compute_dtype)?;
+            let cond_in = if use_guide { &cond_c } else { &cond_only };
+            let noise_pred = unet.forward(&model_in, timestep as f64, cond_in)?;
+            let eps = if use_guide {
+                let chunks = noise_pred.chunk(2, 0)?;
+                let (uncond, cond) = (&chunks[0], &chunks[1]);
+                (uncond + ((cond - uncond)? * guidance)?)?
+            } else {
+                noise_pred
+            };
+            // Raw ε in f32 so the `DiscreteModelSampling` x0 recombine + solver math stay f32.
+            Ok(eps.to_dtype(DType::F32)?)
+        },
+    )?;
+    Ok(out.to_dtype(compute_dtype)?)
+}
+
+/// One micro-step's forward+backward over the installed adapter `Var`s: build the noised latent at
+/// timestep `t`, predict ε, regress it toward `noise`, and return `(loss, grads)` — `grads` keyed by
+/// the adapter `Var`s (ready for [`clip_grad_norm`] + [`TrainOptimizer::step`]).
+///
+/// `use_checkpoint` selects the gradient-checkpointed backward (recompute each block) over the dense
+/// `loss.backward()`; both yield the same grads (the `tests` parity gate). A free function (not a
+/// method) so the parity test can drive it against a tiny synthetic UNet without real weights.
+#[allow(clippy::too_many_arguments)]
+fn compute_loss_grads(
+    unet: &UNet2DConditionModel,
+    scheduler: &dyn Scheduler,
+    lora_vars: &[Var],
+    x0: &Tensor,
+    cond: &Tensor,
+    t: usize,
+    noise: &Tensor,
+    mae: bool,
+    compute_dtype: DType,
+    use_checkpoint: bool,
+) -> Result<(f32, GradStore)> {
+    let noisy = scheduler
+        .add_noise(x0, noise.clone(), t)?
+        .to_dtype(compute_dtype)?;
+    let target = noise.to_dtype(DType::F32)?;
+    let cond_c = cond.to_dtype(compute_dtype)?;
+    let bsize = x0.dim(0)?;
+    let device = x0.device();
+    let t_f64 = t as f64;
+
+    if use_checkpoint {
+        // Frozen, constant time embedding shared across every block segment (detached so it is not
+        // recomputed per segment-backward).
+        let emb = unet
+            .time_embed(t_f64, bsize, compute_dtype, device)?
+            .detach();
+        let h0 = unet.conv_in_forward(&noisy)?;
+        let mut segs: Vec<Segment> = unet.block_segments(&emb, &cond_c);
+        // Final segment: the frozen head + the ε→noise regression, mapping [final_hidden] → [loss].
+        let target_owned = target.clone();
+        segs.push(Box::new(move |st: &[Tensor]| {
+            let eps = unet.head_out(&st[0])?;
+            Ok(vec![eps_loss(&eps, &target_owned, mae)?])
+        }));
+        // State seed: hidden = conv_in_out, res₀ = conv_in_out (the UNet's `down_block_res_xs[0]`).
+        let inputs = [h0.clone(), h0];
+        checkpointed_backward(&segs, &inputs, lora_vars)
+    } else {
+        let eps = unet.forward(&noisy, t_f64, &cond_c)?;
+        let loss = eps_loss(&eps, &target, mae)?;
+        let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+        let grads = loss.backward()?;
+        Ok((loss_val, grads))
+    }
+}
+
+/// Resolve the config's target-module suffixes (default [`SDXL_ATTN_TARGETS`]) to full UNet attention
+/// paths, then prune for the adapter kind's inference surface: LoRA keeps the **complete** down/mid/up
+/// surface; LoKr excludes `mid_block` (the SDXL LoKr inference loader skips it — sc-2640 — so a
+/// mid_block LoKr factor would never load; keeping train/inference in lock-step). Returned paths are
+/// full dotted paths, which [`build_lora_targets`] matches exactly.
+fn resolve_target_paths(
+    unet: &mut UNet2DConditionModel,
+    cfg: &TrainingConfig,
+) -> Result<Vec<String>> {
+    let suffixes: Vec<String> = if cfg.lora_target_modules.is_empty() {
+        SDXL_ATTN_TARGETS.iter().map(|s| s.to_string()).collect()
+    } else {
+        cfg.lora_target_modules.clone()
+    };
+    let paths: Vec<String> = unet
+        .lora_target_paths()?
+        .into_iter()
+        .filter(|p| {
+            suffixes
+                .iter()
+                .any(|s| p == s || p.ends_with(&format!(".{s}")))
+        })
+        .filter(|p| match cfg.network_type {
+            NetworkType::Lokr => !p.contains("mid_block"),
+            NetworkType::Lora => true,
+        })
+        .collect();
+    if paths.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "sdxl trainer: no adapter targets matched {suffixes:?}"
+        )));
+    }
+    Ok(paths)
+}
+
+/// Build the vendored, trainable SDXL UNet from the snapshot `unet/` safetensors at `dtype`. Flash
+/// attention is off (non-differentiable; training uses the materialized math attention).
+fn build_unet(root: &Path, device: &Device, dtype: DType) -> Result<UNet2DConditionModel> {
+    let path = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+    let vb = candle_gen::mmap_var_builder(&[path], dtype, device)?;
+    Ok(UNet2DConditionModel::new(
+        vb,
+        4,
+        4,
+        false,
+        sdxl_unet_config(),
+    )?)
+}
+
+/// Create the output directory, mapping the `io::Error` into the crate error (candle's `CandleError`
+/// has no `From<io::Error>`).
+fn create_output_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| CandleError::Msg(format!("create output dir {}: {e}", dir.display())))
+}
+
+/// Write the adapter as a PEFT `.safetensors`: LoRA under the SDXL key prefix, LoKr with bare keys.
+fn save_adapter(set: &LoraSet, cfg: &TrainingConfig, path: &Path) -> Result<()> {
+    let meta = std::collections::HashMap::new();
+    match set.kind {
+        AdapterKind::Lora => save_lora_peft(set, SDXL_PEFT_PREFIX, &meta, path),
+        AdapterKind::Lokr => {
+            let _ = cfg; // decompose factor already carried on the set
+            save_lokr(set, &meta, path)
+        }
+    }
+}
+
+/// Identity + capabilities of the candle SDXL trainer: LoRA + LoKr, `backend = "candle"` (the two
+/// backend-correct deviations from `mlx-gen-sdxl`'s descriptor are `backend` and the host platform).
+pub fn trainer_descriptor() -> TrainerDescriptor {
+    TrainerDescriptor {
+        id: MODEL_ID,
+        family: "sdxl",
+        backend: "candle",
+        modality: Modality::Image,
+        supports_lora: true,
+        supports_lokr: true,
+    }
+}
+
+/// A loaded candle SDXL trainer. Loading is **lazy** (no file I/O — mirrors [`crate::SdxlGenerator`]):
+/// the heavy VAE/CLIP/UNet are built inside [`train`](Trainer::train) at the request's compute dtype.
+pub struct SdxlTrainer {
+    descriptor: TrainerDescriptor,
+    root: PathBuf,
+    device: Device,
+}
+
+/// Construct the (lazy) candle SDXL trainer from a [`LoadSpec`] whose `weights` is the SDXL snapshot
+/// directory (the diffusers multi-component tree: `text_encoder/ text_encoder_2/ unet/ …`).
+pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => return Err(CandleError::Msg(
+            "sdxl trainer expects a snapshot directory (text_encoder/ text_encoder_2/ unet/ …), \
+                 not a single .safetensors file"
+                .into(),
+        )),
+    };
+    Ok(Box::new(SdxlTrainer {
+        descriptor: trainer_descriptor(),
+        root,
+        device: candle_gen::default_device()?,
+    }))
+}
+
+// Link-time self-registration into gen-core's trainer registry (parallel to the generator's
+// registration in `lib.rs`). Kept linked by `crate::force_link`. `register_trainer!` bridges the
+// crate's rich `Result` into the registry's `gen_core::Result` via `Into::into`.
+candle_gen::register_trainer! { trainer_descriptor => load_trainer }
+
+impl Trainer for SdxlTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        self.train_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl SdxlTrainer {
+    /// Reject a request before any expensive load (empty dataset, zero rank, unsupported optimizer).
+    fn validate_impl(&self, req: &TrainingRequest) -> Result<()> {
+        if req.items.is_empty() {
+            return Err(CandleError::Msg("sdxl trainer: dataset is empty".into()));
+        }
+        if req.config.rank == 0 {
+            return Err(CandleError::Msg("sdxl trainer: rank must be > 0".into()));
+        }
+        if !TrainOptimizer::is_supported(&req.config.optimizer) {
+            return Err(CandleError::Msg(format!(
+                "sdxl trainer: optimizer '{}' is not available (supported: adamw, adam, rose, prodigy)",
+                req.config.optimizer
+            )));
+        }
+        Ok(())
+    }
+
+    /// The rich-`Result` body behind [`Trainer::train`]; the trait wrapper bridges its tail into
+    /// [`gen_core::Error`], keeping `?` on candle/family helpers transparent here.
+    fn train_impl(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> Result<TrainingOutput> {
+        self.validate_impl(req)?;
+        let cfg = &req.config;
+        let device = &self.device;
+        on_progress(TrainingProgress::Preparing);
+        let edge = bucket_resolution(cfg.resolution);
+        let compute_dtype = parse_compute_dtype(&cfg.train_dtype);
+
+        // --- load + cache: VAE latents (.mean × scale) + dual-CLIP conditioning ---
+        on_progress(TrainingProgress::LoadingModel);
+        let vae = {
+            let vb = candle_gen::mmap_var_builder(
+                &[hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?],
+                DType::F32,
+                device,
+            )?;
+            VaeMomentsEncoder::new(vb, VAE_SCALE)?
+        };
+        let clip = DualClip::load(&self.root, device)?;
+
+        let total = req.items.len() as u32;
+        let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len());
+        for (i, item) in req.items.iter().enumerate() {
+            if req.cancel.is_cancelled() {
+                break;
+            }
+            on_progress(TrainingProgress::Caching {
+                current: i as u32 + 1,
+                total,
+            });
+            let img = load_image_tensor(&item.image_path, edge, device)?;
+            let x0 = vae.encode_mean(&img)?;
+            let cond = clip.encode(&item.caption)?;
+            cache.push((x0, cond));
+        }
+
+        // --- preview samples (sc-8650): pre-encode the prompts + load a resident VAE decoder ---
+        // While the dual CLIP is still resident, encode up to SAMPLE_PROMPT_CAP sample prompts into the
+        // CFG batch `[uncond, cond]` (`cat([empty-negative, positive])`, exactly the inference
+        // `text_embeddings` layout) and load the f16 VAE *decoder* (the cache pass only built the moments
+        // *encoder*). `None` when sampling is off, so the no-preview path keeps the prior footprint.
+        let preview: Option<SamplePreview> =
+            if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() {
+                // The empty-negative conditioning is prompt-independent — encode it once and reuse it
+                // as the CFG `uncond` row for every preview prompt.
+                let uncond = clip.encode("")?;
+                let mut conds = Vec::new();
+                let mut prompts = Vec::new();
+                for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                    let cond = clip.encode(prompt)?;
+                    conds.push(Tensor::cat(&[uncond.clone(), cond], 0)?.to_dtype(compute_dtype)?);
+                    prompts.push(prompt.clone());
+                }
+                let vae_decoder = load_sdxl_vae(device, compute_dtype)?;
+                Some(SamplePreview {
+                    conds,
+                    prompts,
+                    vae: vae_decoder,
+                })
+            } else {
+                None
+            };
+
+        // Encoders are dead weight once the dataset is cached — drop them before the UNet loads.
+        drop(clip);
+        drop(vae);
+        if cache.is_empty() {
+            if req.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            return Err(CandleError::Msg(
+                "sdxl trainer: no usable dataset items".into(),
+            ));
+        }
+
+        // --- build UNet + install adapters ---
+        let mut unet = build_unet(&self.root, device, compute_dtype)?;
+        let target_paths = resolve_target_paths(&mut unet, cfg)?;
+        let lora_set = match cfg.network_type {
+            NetworkType::Lora => build_lora_targets(
+                &mut unet,
+                &target_paths,
+                cfg.rank,
+                cfg.alpha,
+                cfg.seed,
+                device,
+            )?,
+            NetworkType::Lokr => build_lokr_targets(
+                &mut unet,
+                &target_paths,
+                cfg.rank,
+                cfg.alpha,
+                cfg.decompose_factor,
+                cfg.seed,
+                device,
+            )?,
+        };
+        let use_checkpoint = cfg.gradient_checkpointing;
+
+        // --- scheduler + optimizer + schedule ---
+        let scheduler = DDIMSchedulerConfig::default().build(NUM_TRAIN_TIMESTEPS)?;
+        let mae = matches!(cfg.loss_type.to_ascii_lowercase().as_str(), "mae" | "l1");
+        // AdamW with wd=0 ≡ Adam, so the one optimizer covers both choices.
+        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
+            0.0
+        } else {
+            cfg.weight_decay
+        };
+        let mut opt = TrainOptimizer::from_config(
+            &cfg.optimizer,
+            lora_set.vars.clone(),
+            cfg.learning_rate,
+            weight_decay,
+        )?;
+        let accum = cfg.gradient_accumulation.max(1);
+        let (total_updates, warmup_updates) =
+            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
+        let stem = file_stem(&req.file_name).to_string();
+
+        // --- train loop ---
+        // Preview latent grid (sc-8650): the cached `x0`'s spatial dims are the exact /8 latent grid the
+        // dataset was encoded at, so a preview denoises at the training resolution (parity with the
+        // bucketed `edge` the cache loop used). Read once from the first cache entry.
+        let (lat_h, lat_w) = {
+            let (_, _, h, w) = cache[0].0.dims4()?;
+            (h, w)
+        };
+        let mut accumulated: Option<GradStore> = None;
+        let mut update_idx = 0u32;
+        let mut last_loss = 0.0f32;
+        let mut steps_run = 0u32;
+        for step in 1..=cfg.steps {
+            if req.cancel.is_cancelled() {
+                break;
+            }
+            let (x0, cond) = &cache[((step - 1) as usize) % cache.len()];
+            let t = sample_timestep(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64));
+            let noise = sample_noise(
+                x0.dims(),
+                cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
+                device,
+            )?;
+            let (loss, grads) = compute_loss_grads(
+                &unet,
+                scheduler.as_ref(),
+                &lora_set.vars,
+                x0,
+                cond,
+                t,
+                &noise,
+                mae,
+                compute_dtype,
+                use_checkpoint,
+            )?;
+            last_loss = loss;
+            steps_run = step;
+            accumulate_grads(&mut accumulated, grads, &lora_set.vars)?;
+
+            if step % accum == 0 || step == cfg.steps {
+                let mult =
+                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
+                opt.set_lr_scaled(mult);
+                let mut avg = accumulated
+                    .take()
+                    .expect("an update fires only after accumulation");
+                scale_grads(&mut avg, &lora_set.vars, 1.0 / accum as f64)?;
+                clip_grad_norm(&mut avg, &lora_set.vars, 1.0)?;
+                opt.step(&avg)?;
+                update_idx += 1;
+            }
+
+            on_progress(TrainingProgress::Training {
+                step,
+                total: cfg.steps,
+                loss: last_loss,
+            });
+
+            // Preview samples (sc-8650): at each cadence render every pre-encoded prompt on the live,
+            // partially-trained UNet (adapters are eager `Var`s — the denoise sees the current factors)
+            // and emit a `Sample` event per image. Best-effort: a render error is logged and skipped so
+            // a transient preview failure never aborts the training run.
+            if cfg.sample_every > 0 && step % cfg.sample_every == 0 {
+                if let Some(preview) = &preview {
+                    let total_previews = preview.prompts.len() as u32;
+                    // Freeze adapters to detached snapshots so the preview denoise runs graph-free (the
+                    // factor `Var`s are otherwise tracked → the forward's activations are retained →
+                    // OOM at full resolution). Restored right after so training keeps its grads.
+                    let _ = unet.visit_lora_mut(&mut |ll| {
+                        ll.freeze_adapter();
+                        Ok(())
+                    });
+                    for (i, prompt) in preview.prompts.iter().enumerate() {
+                        let seed = candle_gen::train::flow_match::sample_seed(cfg.seed, step, i);
+                        match render_one_preview(
+                            &unet,
+                            &preview.vae,
+                            &preview.conds[i],
+                            cfg,
+                            lat_h,
+                            lat_w,
+                            compute_dtype,
+                            seed,
+                            device,
+                        ) {
+                            Ok(image) => on_progress(TrainingProgress::Sample {
+                                step,
+                                index: i as u32 + 1,
+                                total: total_previews,
+                                prompt: prompt.clone(),
+                                image,
+                            }),
+                            Err(e) => eprintln!(
+                                "[sc-8650] sdxl: preview sample failed at step {step} \
+                                 (prompt {}): {e} — skipping",
+                                i + 1
+                            ),
+                        }
+                    }
+                    let _ = unet.visit_lora_mut(&mut |ll| {
+                        ll.thaw_adapter();
+                        Ok(())
+                    });
+                }
+            }
+
+            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
+                create_output_dir(&req.output_dir)?;
+                let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
+                save_adapter(&lora_set, cfg, &ckpt)?;
+                on_progress(TrainingProgress::Checkpoint { step });
+            }
+        }
+
+        // Cancelled before a single step completed: the factors are still the no-op init (`B = 0`),
+        // so surface the typed cancellation rather than shipping an identity adapter as a result.
+        if steps_run == 0 {
+            return Err(CandleError::Canceled);
+        }
+
+        // --- save final adapter ---
+        on_progress(TrainingProgress::Saving);
+        create_output_dir(&req.output_dir)?;
+        let adapter_path = req.output_dir.join(&req.file_name);
+        save_adapter(&lora_set, cfg, &adapter_path)?;
+        Ok(TrainingOutput {
+            adapter_path,
+            steps: steps_run,
+            final_loss: last_loss,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::unet::{BlockConfig, UNet2DConditionModelConfig};
+    use candle_core::{DType, Device};
+    use candle_gen::gen_core::registry;
+    use candle_nn::{VarBuilder, VarMap};
+
+    /// A tiny SDXL-shaped UNet (one cross-attn down block + one basic block + cross-attn mid/up) that
+    /// exercises the LoRA seam + the block-segment checkpointing cheaply on CPU, with random weights.
+    fn tiny_unet(vb: VarBuilder) -> UNet2DConditionModel {
+        let cfg = UNet2DConditionModelConfig {
+            blocks: vec![
+                BlockConfig {
+                    out_channels: 32,
+                    use_cross_attn: Some(1),
+                    attention_head_dim: 8,
+                },
+                BlockConfig {
+                    out_channels: 64,
+                    use_cross_attn: None,
+                    attention_head_dim: 8,
+                },
+            ],
+            center_input_sample: false,
+            cross_attention_dim: 64,
+            downsample_padding: 1,
+            flip_sin_to_cos: true,
+            freq_shift: 0.,
+            layers_per_block: 1,
+            mid_block_scale_factor: 1.,
+            norm_eps: 1e-5,
+            norm_num_groups: 32,
+            use_linear_projection: false,
+        };
+        UNet2DConditionModel::new(vb, 4, 4, false, cfg).unwrap()
+    }
+
+    fn grad_vec(grads: &GradStore, v: &Var) -> Vec<f32> {
+        grads
+            .get(v.as_tensor())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// The correctness gate for the `gradient_checkpointing` lever: the checkpointed backward
+    /// (block-recompute) must reproduce the dense `loss.backward()` grads (mod float reassociation),
+    /// over a real SDXL-shaped UNet with nonzero LoRA factors so every adapter `Var` carries signal.
+    #[test]
+    fn dense_and_checkpoint_grads_match() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut unet = tiny_unet(vb);
+        // sc-11679 widened `visit_lora_mut` to the time-embedding heads, but the checkpoint backward
+        // treats the time embedding as a detached per-step constant (compute_loss_grads), so a
+        // `time_embedding` adapter carries a gradient in the dense forward but NOT the checkpoint one —
+        // an intentional asymmetry that this dense-vs-checkpoint parity gate must not train. The resnet
+        // `time_emb_proj` leaves stay in (they live inside the block forward, so both paths carry them).
+        let paths: Vec<String> = unet
+            .lora_target_paths()
+            .unwrap()
+            .into_iter()
+            .filter(|p| !p.starts_with("time_embedding.") && !p.starts_with("add_embedding."))
+            .collect();
+        let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
+        // Move B off zero so both A and B grads are nonzero (a no-op-init adapter would zero A's grad).
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+
+        let scheduler = DDIMSchedulerConfig::default()
+            .build(NUM_TRAIN_TIMESTEPS)
+            .unwrap();
+        let x0 = Tensor::randn(0f32, 1f32, (1, 4, 16, 16), &dev).unwrap();
+        let cond = Tensor::randn(0f32, 1f32, (1, 7, 64), &dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, (1, 4, 16, 16), &dev).unwrap();
+
+        let (loss_d, g_d) = compute_loss_grads(
+            &unet,
+            scheduler.as_ref(),
+            &set.vars,
+            &x0,
+            &cond,
+            500,
+            &noise,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        let (loss_c, g_c) = compute_loss_grads(
+            &unet,
+            scheduler.as_ref(),
+            &set.vars,
+            &x0,
+            &cond,
+            500,
+            &noise,
+            false,
+            DType::F32,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            (loss_d - loss_c).abs() < 1e-4,
+            "loss: dense {loss_d} vs checkpoint {loss_c}"
+        );
+        let mut saw_nonzero = false;
+        for (idx, v) in set.vars.iter().enumerate() {
+            assert!(
+                g_d.get(v.as_tensor()).is_some() && g_c.get(v.as_tensor()).is_some(),
+                "var {idx} missing a gradient (dense or checkpoint)"
+            );
+            let a = grad_vec(&g_d, v);
+            let b = grad_vec(&g_c, v);
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-4,
+                    "grad mismatch (dense {x} vs checkpoint {y})"
+                );
+                if x.abs() > 1e-6 {
+                    saw_nonzero = true;
+                }
+            }
+        }
+        assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+    }
+
+    /// F-083 / sc-11173: the trainer preview drives the SAME curated sampler SDXL inference uses, not
+    /// the native candle-transformers `DDIMScheduler` loop that sc-10826 diagnosed as rendering a
+    /// ghosted double-exposure. Two guards:
+    ///  1. The hardcoded preview solver name `"ddim"` is a real advertised curated solver (so it takes
+    ///     the curated `ddim` path, never the silent Euler fallback — mirrors the pipeline's
+    ///     `DEFAULT_SAMPLER` gate).
+    ///  2. `preview_latents` runs the curated sampler end-to-end over a tiny SDXL-shaped UNet (CFG on)
+    ///     and returns a finite latent of the exact `[1, 4, lat_h, lat_w]` shape the decode expects.
+    #[test]
+    fn preview_uses_curated_sampler() {
+        assert!(
+            candle_gen::curated_sampler_names().contains(&"ddim"),
+            "the preview's `ddim` solver must be an advertised curated sampler, not a Euler fallback"
+        );
+
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut unet = tiny_unet(vb);
+        let paths = unet.lora_target_paths().unwrap();
+        let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+
+        // `[uncond, cond]` dual-CLIP-shaped conditioning at the tiny cross-attention dim (64).
+        let cond = Tensor::randn(0f32, 1f32, (2, 7, 64), &dev).unwrap();
+        let cfg = TrainingConfig {
+            sample_steps: 3,
+            sample_guidance_scale: 5.0,
+            ..TrainingConfig::default()
+        };
+        let (lat_h, lat_w) = (16, 16);
+        let latents =
+            preview_latents(&unet, &cond, &cfg, lat_h, lat_w, DType::F32, 42, &dev).unwrap();
+        assert_eq!(latents.dims4().unwrap(), (1, 4, lat_h, lat_w));
+        let flat = latents.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            flat.iter().all(|v| v.is_finite()),
+            "curated preview latents must be finite"
+        );
+    }
+
+    /// `sample_timestep` is deterministic in its seed and lands in `[0, NUM_TRAIN_TIMESTEPS)`.
+    #[test]
+    fn timestep_is_deterministic_and_in_range() {
+        for seed in [0u64, 1, 42, 9999] {
+            let a = sample_timestep(seed);
+            let b = sample_timestep(seed);
+            assert_eq!(a, b);
+            assert!(a < NUM_TRAIN_TIMESTEPS);
+        }
+        // Distinct seeds generally differ (not a hard guarantee, but a sanity check on the mapping).
+        assert_ne!(sample_timestep(1), sample_timestep(2));
+    }
+
+    /// F-061 / sc-9045: the trainer no longer carries a private UNet config — it builds `build_unet`
+    /// from the single **exported** [`crate::unet::sdxl_unet_config`] the inference lanes share, so
+    /// train-vs-inference config drift after a candle re-pin is structurally impossible. Pin the
+    /// canonical SDXL values here so an accidental edit to the one source of truth is caught, not
+    /// silently propagated.
+    #[test]
+    fn trainer_uses_exported_unet_config() {
+        let c = sdxl_unet_config();
+        assert_eq!(c.blocks.len(), 3);
+        assert_eq!(c.blocks[0].out_channels, 320);
+        assert_eq!(c.blocks[0].use_cross_attn, None);
+        assert_eq!(c.blocks[0].attention_head_dim, 5);
+        assert_eq!(c.blocks[1].out_channels, 640);
+        assert_eq!(c.blocks[1].use_cross_attn, Some(2));
+        assert_eq!(c.blocks[1].attention_head_dim, 10);
+        assert_eq!(c.blocks[2].out_channels, 1280);
+        assert_eq!(c.blocks[2].use_cross_attn, Some(10));
+        assert_eq!(c.blocks[2].attention_head_dim, 20);
+        assert_eq!(c.cross_attention_dim, 2048);
+        assert_eq!(c.layers_per_block, 2);
+        assert_eq!(c.norm_num_groups, 32);
+        assert_eq!(c.downsample_padding, 1);
+        assert!(c.use_linear_projection);
+        assert!(!c.center_input_sample);
+        assert!(c.flip_sin_to_cos);
+    }
+
+    /// The trainer self-registers and resolves through gen-core's trainer registry as the candle
+    /// SDXL trainer; `load_trainer` is lazy, so a nonexistent weights dir still resolves.
+    #[test]
+    fn trainer_registers_and_resolves_as_candle() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let t = registry::load_trainer("sdxl", &spec).expect("candle sdxl trainer is registered");
+        assert_eq!(t.descriptor().id, "sdxl");
+        assert_eq!(t.descriptor().backend, "candle");
+        assert!(t.descriptor().supports_lora);
+        assert!(t.descriptor().supports_lokr);
+    }
+
+    /// `validate` rejects an empty dataset, zero rank, and an unsupported optimizer before any load.
+    #[test]
+    fn validate_rejects_bad_requests() {
+        use candle_gen::gen_core::runtime::CancelFlag;
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let t = registry::load_trainer("sdxl", &spec).unwrap();
+
+        let item = candle_gen::gen_core::train::TrainingItem {
+            image_path: "/img.png".into(),
+            caption: "x".into(),
+            control_image_path: None,
+        };
+        let base = TrainingRequest {
+            items: vec![item.clone()],
+            config: TrainingConfig::default(),
+            output_dir: "/out".into(),
+            file_name: "a.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        assert!(t.validate(&base).is_ok());
+
+        let empty = TrainingRequest {
+            items: vec![],
+            ..base.clone()
+        };
+        assert!(t.validate(&empty).is_err());
+
+        let zero_rank = TrainingRequest {
+            config: TrainingConfig {
+                rank: 0,
+                ..TrainingConfig::default()
+            },
+            ..base.clone()
+        };
+        assert!(t.validate(&zero_rank).is_err());
+
+        let bad_opt = TrainingRequest {
+            config: TrainingConfig {
+                optimizer: "lion".into(),
+                ..TrainingConfig::default()
+            },
+            ..base
+        };
+        assert!(t.validate(&bad_opt).is_err());
+    }
+}

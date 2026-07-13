@@ -1,0 +1,62 @@
+[package]
+name = "candle-gen-sdxl"
+version = "0.0.0"
+edition = "2021"
+description = "Stable Diffusion XL (SDXL) provider crate for candle-gen (scaffold; pipeline lands in a later slice)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "sdxl", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853): SDXL's own `sdxl` latent-space
+# student (4× SR). Wired behind `req.use_pid` (default off → the byte-exact native SDXL VAE decode).
+candle-gen-pid = { path = "../candle-gen-pid" }
+# Link-time self-registration into gen-core's model registry (the `inventory::submit!` below).
+inventory = { workspace = true }
+# SDXL pipeline building blocks (dual CLIP / UNet / VAE / schedulers). Backend features are passed
+# through from this crate's features below so it shares candle-gen's exact candle build.
+candle-transformers = { workspace = true }
+# Direct candle deps for the vendored, training-adapted UNet stack (`src/unet/`, sc-5165): the stock
+# candle-transformers SD UNet exposes no LoRA/checkpoint seam, so we vendor + adapt it. Same workspace
+# pin candle-gen uses, so cargo unifies to one candle build (no skew; the vendored code refers to
+# `candle_core`/`candle_nn` directly rather than through candle-gen's re-export).
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+# The vendored UNet keeps candle-transformers' `tracing` spans verbatim (kept byte-faithful to
+# upstream so the copy can be re-diffed on a candle re-pin). Already in the tree via candle-transformers.
+tracing = "0.1"
+# CLIP tokenizers + HF snapshot resolution (the spike's proven loader path).
+tokenizers = { workspace = true }
+hf-hub = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673).
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# Read trained adapter `.safetensors` (tensors + the `networkType`/`rank`/`alpha` metadata the LoKr
+# merge needs) at inference-side load (sc-5165 adapter merge). Candle's own version (0.7), matching
+# candle-gen, so the `View` impl candle-core provides for `Tensor` is the same one.
+safetensors = "0.7"
+# Parse the packed MLX tier's `unet/config.json` `quantization` block (sc-9416 packed-load detect).
+serde_json = { workspace = true }
+
+[features]
+# Pass the backend selection through to the core crate AND candle-transformers so a downstream
+# `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
+default = []
+metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda"]
+
+[dev-dependencies]
+# Shared test-support helpers (sc-9055 / F-069: candle_gen::testkit).
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
+# `examples/sdxl-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a
+# real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# gen-core conformance suite (sc-4481): drives this provider through the public Generator contract
+# (cancel / progress / seed-determinism / capability honesty). Pinned to the SAME gen-core rev the
+# workspace pins (e9c569c2) so it shares one contract build. Used by tests/conformance.rs (cuda-gated,
+# #[ignore]d — it runs a real generate, so it needs weights + GPU).
+sceneworks-gen-core-testkit = { workspace = true }

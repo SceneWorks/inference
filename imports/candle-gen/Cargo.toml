@@ -1,0 +1,520 @@
+[workspace]
+members = ["candle-gen", "candle-gen-sdxl", "candle-gen-z-image", "candle-gen-flux", "candle-gen-flux2", "candle-gen-qwen-image", "candle-gen-anima", "candle-gen-wan", "candle-gen-scail2", "candle-gen-bernini", "candle-gen-ltx", "candle-gen-svd", "candle-gen-joycaption", "candle-gen-lens", "candle-gen-chroma", "candle-gen-kolors", "candle-gen-sensenova", "candle-gen-face", "candle-gen-instantid", "candle-gen-seedvr2", "candle-gen-pulid", "candle-gen-sam3", "candle-gen-ideogram", "candle-gen-boogu", "candle-gen-clip", "candle-gen-krea", "candle-gen-sd3", "candle-gen-depth", "candle-gen-pid"]
+resolver = "2"
+
+# Optimize DEPENDENCIES (not our own crates) even in debug/test builds. `cargo test --workspace` in
+# CI is an UNoptimized (opt-level 0) build, which compiles candle-core's `gemm` CPU matmul backend
+# without SIMD/inlining. That is fine for our thin first-party crates, but the numeric-parity unit
+# tests run real transformer forwards on CPU — e.g. `candle-gen-sdxl`'s `vendored_dense_matches_stock`
+# drives the FULL 32-layer OpenCLIP bigG tower (`stock::Config::sdxl2()`, whose private fields forbid a
+# reduced-depth ctor) through four forward passes. At opt-level 0 those matmuls run tens of times
+# slower and blow past libtest's 60s "still running" notice, making the fmt+clippy+test lane look hung.
+# `package."*"` optimizes ONLY third-party deps, so our crates still compile fast for quick iteration;
+# the one-time O3 dep build is cached by `Swatinem/rust-cache` in CI. `test` inherits `dev`'s overrides.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Single source of truth for the deps shared across the workspace (mirrors mlx-gen's F-151). The
+# next candle bump or gen-core pin bump is then a one-line edit here rather than N synchronized
+# ones — a missed crate would otherwise resolve two distinct `sceneworks-gen-core` builds and the
+# provider crate would register into one `inventory` registry while the consumer queries another
+# ("engine not found" at RUNTIME, not a compile error — see scripts/check-gen-core-skew.sh).
+[workspace.dependencies]
+# Backend-neutral contract layer (epic 3720). lib name is `gen_core` (neutral import path). This is
+# pinned by git SHA to the SAME rev the SceneWorks worker pins — do NOT drift it, or the skew gate
+# fires. candle-gen is the Windows/CUDA sibling of mlx-gen; both satisfy this one contract.
+# Bumped `1a97909` -> `41c95a1` (sc-5126): the worker moved its gen-core pin to `41c95a1` for the
+# Bernini provider (sc-4707, mlx-gen #433 — +11 additive lines in `weightsmeta.rs`, no API removed),
+# so the Lens inference cutover re-pins candle-gen to MATCH or the worker's `--features backend-candle`
+# graph resolves two gen-core revs and the skew gate fires (one inventory registry per rev). candle-gen
+# consumes none of the new weightsmeta surface; the bump is purely to keep the single-rev invariant.
+# Bumped `41c95a1` -> `af190c7` (sc-5500): adds the additive `TextLlm` contract (mlx-gen #448) that
+# `candle-gen-prompt-refine` implements. The worker re-pins to MATCH at its own cutover (sc-5525).
+# Bumped `af190c7` -> `fa0f75b` (sc-5551, candle-gen #55): lockstep with the worker's mlx pin bump
+# (SceneWorks #664) for the video-gen per-step cancel; gen-core additive, no candle surface change.
+# Bumped `fa0f75b` -> `d3ec5e5` (sc-5552): lockstep with the worker adding the native MLX
+# `mlx-gen-prompt-refine` provider (mlx-gen #457). gen-core is BYTE-IDENTICAL `fa0f75b` -> `d3ec5e5`
+# (the merge only adds an mlx provider crate); the bump is purely to keep the single-rev skew invariant
+# with the worker's mlx pin at its sc-5552 cutover.
+# The `sceneworks-gen-core-testkit` dev-deps below are bumped in lockstep for the same reason.
+# Bumped `d3ec5e5` -> `871d5cc` (sc-5490, epic 5480): the additive gen-core `FaceEmbedder` contract
+# (mlx-gen PR #458, merged to main) that `candle-gen-face` implements. The worker re-pins to MATCH when
+# it wires the candle InstantID/PuLID providers (sc-5491/5492); until then candle-gen leads this rev.
+# Bumped `871d5cc` -> `24c89c9` (sc-5491, epic 5480): catch up to the worker's mlx-gen pin, which
+# overtook candle-gen when mlx-gen #459 (sc-5637 training-preview samples) landed on main. The ONLY
+# gen-core delta is `train.rs` +39 additive lines (new `TrainingConfig` sample_* fields with
+# defaults + a `TrainingProgress::Sample` variant) — candle-gen has no trainers, so no surface
+# change; this is purely the alignment the worker's candle lane needs to resolve ONE gen-core rev.
+# Bumped `24c89c9` -> `40063d5` (sc-5491, epic 5480): the worker's mlx-gen pin moved again
+# (mlx-gen #460 smokes + #461 SCAIL-2 Q4 + #462 sc-5451 SCAIL-2 inference LoRA), so re-pin in lockstep
+# to keep the worker's `--features backend-candle` lane on ONE gen-core rev. gen-core is BYTE-IDENTICAL
+# `24c89c9` -> `40063d5` (the range is pure mlx-gen-scail2 Rust); zero candle surface change.
+# Bumped `40063d5` -> `891bee4` (sc-5700, epic 5439): the worker's mlx-gen pin moved again to catch up
+# to mlx-gen main (#463 sc-5681 high-res f32/tiled decode + DiT activation chunking, #464 sc-5690 VAE
+# tiling regression coverage, #465 sc-5684 SCAIL-2 lightx2v lightning diff-patch LoRA), so re-pin in
+# lockstep to keep the worker's `--features backend-candle` lane on ONE gen-core rev. The gen-core delta
+# `40063d5` -> `891bee4` is a SINGLE additive `tiling.rs` *test* case (the z48 vae22 combined-plan
+# coverage); the public gen-core surface is BYTE-IDENTICAL → zero candle surface change.
+# Bumped `32fdb34` -> `154af37` (sc-5492, epic 5480): catch up to the worker's mlx-gen pin, which
+# advanced past candle-gen when the FLUX.2-dev T2I series (mlx-gen #469-#472) landed on SceneWorks
+# main. The ONLY gen-core delta `32fdb34..154af37` is +27 ADDITIVE lines in `tokenizer.rs` (a new
+# `ChatTemplate::Flux2DevMistral` variant + its render arm); candle-gen only CONSTRUCTS specific
+# `ChatTemplate` variants (never matches exhaustively), so the addition is behavior-neutral — zero
+# candle surface change. This re-pin closes the pre-existing main skew (worker mlx 154af37 vs candle
+# 32fdb34, tracked as sc-5905) so the worker's `--features backend-candle` lane resolves ONE gen-core
+# rev again, which the candle PuLID worker route (sc-5492) needs.
+# Re-pinned `aeb471b` -> `3714e7b` (sc-5487, epic 5480): align candle-gen's gen-core pin with the
+# SceneWorks worker's ACTUAL mlx-gen pin (`3714e7b` on main) for the candle SDXL edit lane's single-rev
+# invariant. candle-gen #86 (sc-6038) had re-pinned to `aeb471b` AHEAD of the worker (the worker is
+# still at `3714e7b`), so a worker `--features backend-candle` build pinning candle-gen main would have
+# resolved TWO gen-core revs. `aeb471b` and `3714e7b` have BYTE-IDENTICAL gen-core (the `3714e7b..aeb471b`
+# delta is a single additive mlx-gen-instantid commit — the sc-6038 user-LoRA merge — + mlx-rs unchanged),
+# so this is a behavior-neutral rev alignment, NOT a feature revert: #86's InstantID-LoRA candle change
+# stays. When sc-6038's worker PR lands (bumping the worker mlx pin to `aeb471b` together with its
+# InstantId struct change), it moves both forward in lockstep.
+#
+# Bumped `3511476` -> `7b89d45` for the SceneWorks `ideogram_4` worker integration (mlx-gen #481):
+# the worker needs mlx-gen-ideogram's packed Q4/Q8 loader (`quant.rs`/`convert.rs`, macOS-only) to
+# load the published turnkey, so the worker pins mlx-gen `7b89d45`; candle-gen's gen-core must match
+# under the `--target all` skew gate. gen-core is BYTE-IDENTICAL between `3511476` and `7b89d45` (the
+# delta is the additive mlx-gen-ideogram quant crate; mlx-rs unchanged), so this is a behavior-neutral
+# rev alignment, NOT a feature change — candle builds nothing new.
+#
+# Bumped `7b89d45` -> `98592bb` (sc-6217): the SceneWorks worker mlx pin advanced `7b89d45` -> `98592bb`
+# (mlx-gen #485 / sc-6067, SeedVR2 image-upscale tiling) AFTER candle-gen #91, leaving the worker's
+# `--features backend-candle --target all` lane resolving two gen-core revs. gen-core is BYTE-IDENTICAL
+# `7b89d45` -> `98592bb` (the delta is pure mlx-gen-seedvr2 Rust; mlx-rs unchanged 44929a0), so this is a
+# behavior-neutral alignment to the worker's actual mlx pin — candle builds nothing new. Closes the
+# sc-5905 catch-up for this rev and lets the sc-6217 worker re-pin resolve a single gen-core rev again.
+#
+# Bumped `98592bb` -> `51a6792` (sc-6217 follow-up): the worker mlx pin advanced AGAIN `98592bb` ->
+# `51a6792` (mlx-gen #485 merge = the common descendant of sc-6067 SeedVR2 tiling + sc-6030 FLUX.2-dev
+# caption upsampling; surfaced by SceneWorks sc-6135 / #758) AFTER candle-gen #92 landed at `98592bb`,
+# re-opening the candle-lane rev skew. The gen-core delta `98592bb` -> `51a6792` is DOC-ONLY (the
+# sc-6030 `enhance_prompt` field comments — no contract / parity-snapshot change; mlx-rs unchanged
+# 44929a0), so this is again a behavior-neutral alignment to the worker's actual mlx pin — candle builds
+# nothing new. Keeps the sc-6217 worker re-pin (SceneWorks #759) resolving a SINGLE gen-core rev.
+#
+# Bumped `51a6792` -> `517ef11f` (sc-6247 de-skew): the worker mlx pin advanced AGAIN `51a6792` ->
+# `517ef11f` (mlx-gen #490 merge, sc-6330 Ideogram-4 edit) AFTER candle-gen pinned `51a6792`, re-opening
+# the candle-lane rev skew (it merged silently — the SceneWorks `--features backend-candle` lane is
+# workflow_dispatch-only, NOT a PR gate, so `image_jobs/instantid.rs` mixing the two gen-core builds went
+# unnoticed). The gen-core TREE is BYTE-IDENTICAL `51a6792` -> `517ef11f` (`git diff 51a6792 517ef11f --
+# gen-core/` is empty — #490 is pure mlx-gen-ideogram), so this is a behavior-neutral re-alignment to the
+# worker's actual mlx pin; candle builds nothing new. Unblocks the sc-6247 SceneWorks worker re-pin
+# (wiring candle-gen-sam3 into the off-Mac person-track) by restoring a SINGLE gen-core rev.
+# (sc-6220 / candle-gen #103 reached the SAME `517ef11f` via `51a6792` -> `e23a8b7` -> `517ef11` for the
+# Qwen-Image-Edit-2511-Lightning route; this merge with #104's de-skew converges on the one target —
+# byte-identical gen-core either way.)
+#
+# Bumped `517ef11f` -> `4740225` (sc-6346): the SceneWorks worker mlx pin advances `517ef11` ->
+# `4740225` (mlx-gen #499 — the SAM3 tracker fg/bg point-prompt path for Image-Editor smart-select),
+# so candle-gen's gen-core must match under the `--target all` skew gate. The gen-core TREE is
+# BYTE-IDENTICAL `517ef11` -> `4740225` (#499 is pure mlx-gen-sam3/tracker.rs; mlx-rs unchanged
+# 44929a0), so this is a behavior-neutral re-alignment to the worker's actual mlx pin — candle builds
+# nothing new. Restores a SINGLE gen-core rev for the worker's `--features backend-candle` lane.
+#
+# Bumped `4740225` -> `0b86fad` (sc-6399, epic 6387): the worker's mlx pin advances to `0b86fad`
+# (mlx-gen #504 — registers the Boogu-Image-0.1 Generator into the gen_core registry for the
+# SceneWorks worker integration), so candle-gen's gen-core must match under the `--target all` skew
+# gate. The gen-core TREE is BYTE-IDENTICAL `4740225` -> `0b86fad` (the range is pure mlx-gen-boogu —
+# a Mac-only image family with no candle sibling; mlx-rs unchanged 44929a0), so this is a
+# behavior-neutral re-alignment — candle builds nothing new. Restores a SINGLE gen-core rev for the
+# worker's `--features backend-candle` lane.
+# Bumped `0b86fad` -> `dc40c74` (mlx-gen #505, sc-3459 VACE-Fun): the SceneWorks worker's mlx pin
+# advances to `dc40c74` (the native dual-expert Wan2.2 VACE-Fun engine — a Mac-only mlx-gen-wan
+# addition with no candle sibling), so candle-gen's gen-core must MATCH under the worker's
+# `--features backend-candle` skew gate. gen-core is BYTE-IDENTICAL `0b86fad` -> `dc40c74` (the mlx PR
+# touched only mlx-gen-wan; mlx-rs unchanged 44929a0) — candle builds nothing new.
+# Bumped `dc40c74` -> `4d3aa49` (mlx-gen #506, sc-6585 JSON-constrained decoding): UNLIKE the prior
+# re-pins this is NOT byte-identical — gen-core adds the constrained-decoding contract
+# (`json_constraint::JsonState`, `TextLlmRequest.constraint`, `TextTokenizer::constraint_decode_table`),
+# and `candle-gen-prompt-refine` ACTUALLY uses it (the off-Mac twin of the magic-prompt JSON masking).
+# Re-pinned in lockstep so the worker's `--features backend-candle` skew gate resolves a SINGLE gen-core
+# rev (4d3aa49) shared with the mlx pin. mlx-rs unchanged 44929a0.
+# Bumped `4d3aa49` -> `7b97542` (sc-7076, candle half of sc-6894): pulls the new neutral
+# `gen_core::tiling::budgeted_plan` selector + `TileCandidates`/`TilingBudgetError` (mlx-gen #517) that
+# candle-gen-ltx/wan now consume for memory-bounded + catchable video VAE decode. The `4d3aa49..7b97542`
+# range is purely ADDITIVE gen-core (6921 dim guards, 6909 validation guards, 6894 budgeted_plan — no
+# API removed), so the existing candle surface compiles unchanged. candle-gen **leads this rev**: the
+# worker re-pins to MATCH at its next backend-candle cutover (normal pattern — see the bumps above);
+# until then the worker's combined build would resolve two gen-core revs, so land the worker bump in
+# lockstep when this merges. mlx-rs unchanged 44929a0.
+# Bumped `7b97542` -> `d8038be` (epic 7114 P2 / sc-7119): pulls the new ADDITIVE unified
+# sampler/scheduler framework into gen-core — `gen_core::sampling::{LatentOps, ModelSampling, Sampler,
+# the curated solver/scheduler library}` (mlx-gen #525/#526/#527, sc-7115/7116/7117). sc-7119 needs the
+# `LatentOps` trait to implement `CandleLatentOps` for `candle_core::Tensor`. The `7b97542..d8038be` range
+# is purely additive gen-core (the sampling module grew; no API removed), so the existing candle surface
+# compiles unchanged. candle-gen **leads this rev**: the worker re-pins to MATCH at its next
+# backend-candle cutover (the P5 lockstep story, sc-7129). The 17 per-crate `gen-core-testkit` dev-deps
+# below are bumped in lockstep so the skew gate resolves a SINGLE gen-core rev. mlx-rs unchanged 44929a0.
+# Bumped `d8038be` -> `c59f73cb` (epic 7114 P4 / sc-7123): pulls the ADDITIVE flow time-shift the P3
+# scheduler axis added to gen-core — `FlowModelSampling::with_shift(conv, mu)` (mlx-gen #532, sc-7120
+# task 7186) — so a candle flow engine can build a curated `normal`/`sgm_uniform`/`simple`/`beta`/
+# `ddim_uniform` schedule over its resolution-/config-dependent shift instead of a linear σ ramp.
+# The `d8038be..c59f73cb` gen-core public-API delta is EXACTLY this one new method (verified: the rest
+# of the range is mlx-gen-crate P3 adoption — the `run_curated_sampler`/`resolve_schedule` driver +
+# per-engine routing — which lives in mlx-gen's own `src/sampler.rs`, NOT gen-core), so the existing
+# candle surface compiles unchanged. candle-gen **leads this rev**: the worker re-pins to MATCH at the
+# P5 backend-candle cutover (sc-7129). The 17 per-crate `gen-core-testkit` dev-deps are bumped in
+# lockstep so the skew gate resolves a SINGLE gen-core rev. mlx-rs unchanged 44929a0.
+# Bumped `c59f73cb` -> `903f295` (epic 7114 sc-7296/sc-7305 pin-bump lockstep): catch up to mlx-gen main
+# after the lens curated-sampler adoption (mlx-gen #535, sc-7305) + the Wan engine-name reconcile
+# (mlx-gen #536, sc-7296). gen-core is BYTE-IDENTICAL `c59f73cb..903f295` — both PRs are additive in
+# their own provider crates (mlx-gen-lens / mlx-gen-wan), NOT gen-core — so the candle surface compiles
+# unchanged. Pure rev-alignment so the worker's skew gate resolves ONE gen-core rev when it re-pins
+# mlx-gen -> 903f295 + candle-gen -> this rev. The 17 per-crate + `sceneworks-gen-core-testkit` dev-deps
+# are bumped in lockstep. mlx-rs unchanged 44929a0.
+# Bumped `903f295` -> `04aa4aa` (epic 7114 sc-7432/sc-7389 pin-bump lockstep): catch up to mlx-gen main
+# after the conditioned curated-sampler adoption for the bespoke families (mlx-gen #537 PuLID / #538
+# InstantID / #539 Kolors, sc-7297). gen-core is BYTE-IDENTICAL `903f295..04aa4aa` (same `gen-core/`
+# tree SHA `5450444` — all three PRs are additive in their own provider crates mlx-gen-{pulid,instantid,
+# kolors}, NOT gen-core), so the candle surface compiles unchanged. Pure rev-alignment so the SceneWorks
+# worker's skew gate resolves ONE gen-core rev when it re-pins mlx-gen -> 04aa4aa + candle-gen -> this rev
+# for the sc-7432 worker integration (which threads the candle `sampler`/`scheduler` fields #130 added to
+# `KolorsControlRequest` / `IpAdapterKolorsRequest` / `PulidFluxRequest` / `InstantIdRequest`). The 17
+# per-crate + `sceneworks-gen-core-testkit` dev-deps are bumped in lockstep. mlx-rs unchanged 44929a0.
+# Bumped `04aa4aa` -> `43aa2bf` (sc-7491, epic 7114): a REAL gen-core change this time, not a rev-align.
+# gen-core gains `ModelSampling::noise_scaling_coeffs` (default VE `x0 + σ·noise`; FLOW overrides to the
+# convex blend `σ·noise + (1−σ)·x0`, mirroring ComfyUI `noise_scaling`) and threads `ms` into
+# `Sampler::sample` so the `lcm` consistency solver re-noises in the model's convention — fixing the flow
+# `lcm` blur (Boogu Turbo on mlx, and the whole flow cohort). Non-flow `lcm` is byte-unchanged; no engine
+# defaults to `lcm`, so no N1-default regression. candle mirrors the 4 `ms`-threaded `.sample` call sites
+# in `candle-gen/src/sampler.rs`; the `noise_scaling_coeffs` fix is inherited from gen-core, so
+# `CandleLatentOps` needs no new method. `43aa2bf` is the mlx-gen #541 MERGE commit on main (also carries
+# #540's additive image-embedder contract). The SceneWorks worker re-pins mlx-gen + candle-gen to this
+# rev in lockstep so the `--features backend-candle` skew gate resolves ONE gen-core rev (sc-7491 S4).
+# Bumped `43aa2bf` -> `418f900` (sc-6537): a REAL gen-core change adding the backend-neutral
+# `TextEmbedder` contract/registry plus the MLX CLIP-L text embedder provider. candle-gen-clip mirrors
+# that provider for CUDA/Windows and the 17 per-crate `sceneworks-gen-core-testkit` dev-deps move in
+# lockstep so SceneWorks resolves one gen-core rev when it pins mlx-gen + candle-gen for alignment.
+# Bumped `418f900` -> `54e87e9` (epic 7153, sc-7189): gen-core's additive `core_llm` re-export.
+# Bumped `54e87e9` -> `014f7c4` (epic 7565, sc-7572): the SceneWorks worker re-pins mlx-gen to 014f7c4
+# (Krea 2 Turbo P1) and pins candle-gen to THIS rev in lockstep so the `--features backend-candle` skew
+# gate resolves ONE gen-core rev. `git diff 54e87e9..014f7c4 -- gen-core/ gen-core-testkit/` is EMPTY
+# (byte-identical — the mlx-gen delta is the additive `mlx-gen-krea` provider + boogu multi-ref, neither
+# touching the contract), so candle-gen compiles unchanged; this is a pure pin bump (precedent 0df0ac5).
+# Moves the root sceneworks-gen-core dep + the 17 per-crate sceneworks-gen-core-testkit dev-deps together.
+# Bumped `cf6f338` -> `7a4c437` (epic 7153, sc-7189 Phase 3): mlx-gen #556 DELETES the legacy
+# `gen_core::TextLlm` trait + its `load_textllm`/`TextLlmRegistration` registry plumbing — the duplicate
+# contract is fully retired, `core_llm::TextLlm` is now the SOLE text-LLM seam. candle-gen no longer
+# references it (sc-7404 deleted `candle-gen-prompt-refine` -> candle-llm `candle-llama`), so candle-gen
+# compiles UNCHANGED: the `cf6f338..7a4c437` gen-core delta is EXACTLY that deletion (-824 lines, nothing
+# additive; `git diff cf6f338..7a4c437 -- gen-core/ gen-core-testkit/` is only the removed textllm files).
+# Re-pinned in lockstep so the worker's `--features backend-candle` skew gate resolves ONE gen-core rev
+# when it re-pins mlx-gen -> 7a4c437 + candle-gen -> this rev. The root sceneworks-gen-core dep + the 16
+# per-crate sceneworks-gen-core-testkit dev-deps move together.
+# Bumped `9c74001` -> `93ca0db` (epic 7778, sc-7786): a PURELY ADDITIVE gen-core change — the link-time
+# registration macros. mlx-gen sc-7779 + sc-7970 (#572) add `register_generators!`/`register_trainer!`
+# (widened to multi-arm) plus `register_captioner!`/`register_image_embedder!`/`register_text_embedder!`,
+# all folded onto one `__register_kind!` inner rule. `git diff 9c74001..93ca0db -- gen-core/ gen-core-testkit/`
+# touches ONLY gen-core/src/{lib,macros,registry}.rs (the macros + their tests); the contract types/traits are
+# byte-unchanged and gen-core-testkit is untouched, so candle-gen compiles unchanged. This same PR migrates
+# candle's 39 provider registrations onto `candle_gen::register_*!` (the candle twin of mlx-gen sc-7780).
+# candle-gen LEADS this rev; the SceneWorks worker re-pins mlx-gen + candle-gen -> 93ca0db at its next
+# `--features backend-candle` cutover so the skew gate resolves ONE gen-core rev. Root sceneworks-gen-core
+# dep + the 16 per-crate sceneworks-gen-core-testkit dev-deps move together.
+# Bumped `93ca0db` -> `c45caec` (epic 7840, sc-8002 / sc-7845 #574): a PURELY ADDITIVE gen-core change for
+# the PiD pixel-diffusion decoder seam — `git diff 93ca0db..c45caec -- gen-core/` is +11 generator.rs
+# (`GenerationRequest.use_pid: bool`, defaulted `false`), +32 runtime.rs (`LoadSpec.pid: Option<PidWeights>`
+# + `PidWeights{checkpoint,gemma}` + `with_pid()`), +2/-2 lib.rs (re-export `PidWeights`). No existing field
+# or signature changed, so candle-gen compiles UNCHANGED (verified: `cargo check --workspace --all-targets`
+# green; every `GenerationRequest {…}` literal already uses `..Default::default()`, and the lone `LoadSpec`-
+# shaped literal is core_llm's `CoreLoadSpec`, not `gen_core::LoadSpec`). candle-gen does not wire PiD itself
+# (that is Phase 4 sc-7853, `candle-gen-pid`); this rev only carries the contract so the worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev (== its mlx pin) when it moves mlx-gen +
+# candle-gen -> c45caec. Root sceneworks-gen-core dep + the 16 per-crate sceneworks-gen-core-testkit
+# dev-deps move together.
+# Bumped `c45caec` -> `7468d03` (epic 7841 SD3.5, sc-7871): a PURE gen-core lockstep re-pin so the
+# SceneWorks worker's `--features backend-candle` skew gate resolves ONE gen-core rev (== its mlx pin)
+# when it moves mlx-gen + candle-gen -> 7468d03 to pick up the new `mlx-gen-sd3` SD3.5 Large/Turbo
+# generators (mlx-gen #576-585). gen-core is BYTE-IDENTICAL c45caec..7468d03.
+# Bumped `7468d03` -> `1a784cd` (epic 7841 SD3.5, sc-7871 / S2 completion, M3 merged): re-pin to mlx-gen
+# main HEAD so the worker's skew gate stays single-rev when it moves to 1a784cd to pick up the new
+# `mlx-gen-sd3` SD3.5 **Medium** (MMDiT-X) generator (M3, sc-7869). gen-core is BYTE-IDENTICAL
+# 7468d03..1a784cd (`git diff 7468d03..1a784cd -- gen-core/ gen-core-testkit/` is EMPTY; the range is
+# mlx-gen-sd3 Rust only — no contract change), so candle-gen compiles UNCHANGED — NO candle source change,
+# no new provider (candle does NOT implement SD3.5; that is epic 7982). Root sceneworks-gen-core dep +
+# the 16 per-crate sceneworks-gen-core-testkit dev-deps move together.
+# Bumped `1a784cd` -> `221a171` (epic 7841 SD3.5, sc-7884 / T3 worker+UI LoRA-training wiring): re-pin to
+# mlx-gen main HEAD so the SceneWorks worker's `--features backend-candle` skew gate stays single-rev when
+# it moves to 221a171 to pick up the native MLX SD3.5 LoRA **trainer** (T2 sc-7883) + Medium training base
+# (T4 sc-7885) + the `apply_sd3_adapters` inference seam + E7 quant. gen-core is ADDITIVE-ONLY across
+# 1a784cd..221a171: `git diff` shows +14 generator.rs (`GenerationRequest.pid_capture_sigma: Option<f32>`,
+# defaulted `None` — PiD `from_ldm` early-stop, sc-7993) + a new `sampling.rs` free fn `flow_capture_plan`
+# (+ `CapturePlan`); NO existing field/signature changed, every `GenerationRequest {…}` literal already uses
+# `..Default::default()`, so candle-gen compiles UNCHANGED (verified `cargo check --workspace`). candle does
+# NOT implement the SD3.5 trainer (epic 7982). Root sceneworks-gen-core dep + the 16 per-crate
+# sceneworks-gen-core-testkit dev-deps move together.
+# Bumped `221a171` -> `1d2479b` (sc-8135): lockstep gen-core rev-alignment so the SceneWorks worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen to 1d2479b
+# (which clamps the SeedVR2 tiling budget by Metal `maxBufferLength`). `git diff 221a171..1d2479b --
+# gen-core/` is EMPTY — gen-core BYTE-IDENTICAL, candle compiles UNCHANGED; no new provider. Root
+# sceneworks-gen-core dep + the 16 per-crate sceneworks-gen-core-testkit dev-deps move together.
+# Bumped `39ef575` -> `98ddb6b` (sc-8345): lockstep gen-core rev-alignment so the SceneWorks worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen to 98ddb6b
+# (which fixes LoKr/LoHa apply in BFL/ComfyUI fused naming on FLUX.1/FLUX.2 — mlx-gen #609). `git diff
+# 39ef575..98ddb6b -- gen-core/` is EMPTY — gen-core BYTE-IDENTICAL, candle compiles UNCHANGED; no new
+# provider. Root sceneworks-gen-core dep + the 16 per-crate sceneworks-gen-core-testkit dev-deps move together.
+# Bumped `db6d834` -> `b6538cb` (sc-8395): lockstep gen-core rev-alignment so the SceneWorks worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen to b6538cb
+# (which strips the `diffusion_model.` prefix on the third-party LoKr/LoHa apply path so ai-toolkit Krea
+# adapters load — mlx-gen #611). `git diff db6d834..b6538cb` touches only `src/adapters/loader.rs` —
+# gen-core BYTE-IDENTICAL, candle compiles UNCHANGED; no new provider. The 16 per-crate testkit dev-deps
+# stay at 98ddb6b (pre-existing lag; the `candle-gen` umbrella the skew gate targets does not pull them).
+# Bumped `b6538cb` -> `875cf7f` (sc-8489): lockstep gen-core rev-alignment so the SceneWorks worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen to 875cf7f
+# (mlx-gen main HEAD = SANA Phase A end-to-end native t2i pipeline #615 + Phase B in-crate gen-core
+# `Generator` adapter + `register_generators!` registration of `sana_1600m` #616). `git diff
+# b6538cb..875cf7f -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL; the range only
+# ADDS the `mlx-gen-sana` provider crate (which candle does NOT link), so candle compiles UNCHANGED and
+# no new candle provider is pulled. Root sceneworks-gen-core dep moves; the 16 per-crate testkit
+# dev-deps stay at 98ddb6b (pre-existing lag the `candle-gen` umbrella skew gate does not pull).
+# Bumped `875cf7f` -> `bdf3233` (sc-8490): lockstep gen-core rev-alignment so the SceneWorks worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen to bdf3233
+# (mlx-gen main HEAD = SANA-Sprint Phase A #617 — the SCM sampler + guidance-embed trunk path +
+# `SanaPipeline::new_sprint` + the in-crate `sana_sprint_1600m` gen-core adapter, all inside the
+# already-present `mlx-gen-sana` provider crate). `git diff 875cf7f..bdf3233 -- gen-core/` is EMPTY —
+# gen-core BYTE-IDENTICAL; the range only ADDS Sprint code to the `mlx-gen-sana` provider crate (which
+# candle does NOT link), so candle compiles UNCHANGED and no new candle provider is pulled.
+# `sceneworks-gen-core-testkit` is now a SINGLE [workspace.dependencies] pin too (sc-8616, follow-up to
+# sc-8601/8602): the per-crate conformance dev-deps consume it via `{ workspace = true }`. Keep it on
+# the SAME rev as `sceneworks-gen-core` directly below — both lines move together in one edit.
+# (Why centralized: testkit is a dev-dep so it never reaches the worker's `candle-gen`-umbrella
+# `--features backend-candle` skew gate, BUT the LOCAL full-workspace CUDA pre-push gate
+# (scripts/check-cuda.ps1) builds every crate's TEST targets. When 17 hardcoded testkit pins lagged
+# behind a root-only re-pin the graph resolved two gen-core revs and the conformance test targets
+# (flux2/wan/sdxl, joycaption) failed to COMPILE on type-instance mismatch — `gen_core_testkit` @old
+# vs `candle_gen::gen_core` @new — forcing `--no-verify` throughout epic 8502 [sc-8601/8602, #186/#187].
+# One workspace pin kills that failure class: a root-only re-pin can no longer leave testkit behind.)
+# Bumped `bdf3233` -> `863f98d` (sc-8670): lockstep gen-core rev-alignment so the SceneWorks worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen to 863f98d
+# (mlx-gen #618 = z-image pre-quantized packed-load + dir-converter, the Group-B quant-matrix pilot).
+# `git diff bdf3233..863f98d -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL; the
+# range only adds `mlx-gen-z-image` packed-load/convert code (which candle does NOT link), so candle
+# compiles UNCHANGED and no new candle provider is pulled. Both lines below move together.
+# Bumped `863f98d` -> `cf74d3c` (sc-8669): lockstep gen-core rev-alignment for the worker's mlx-gen
+# re-pin to cf74d3c (mlx-gen #619 = qwen-image pre-quantized packed-load + transformer-only converter,
+# the 2nd Group-B crate). `git diff 863f98d..cf74d3c -- gen-core/ gen-core-testkit/` is EMPTY — gen-core
+# BYTE-IDENTICAL; the range only adds `mlx-gen-qwen-image` packed-load/convert code (candle does NOT
+# link it), so candle compiles UNCHANGED. Both lines below move together.
+# Bumped `ef43eac` -> `186ac4e` (sc-8763): lockstep gen-core rev-alignment for the worker's mlx-gen
+# re-pin to 627828b (mlx-gen #624 = chroma1 pre-quantized packed-load, the next Group-B crate, sc-8777).
+# gen-core/ + gen-core-testkit/ are unchanged across the range (the range only adds mlx-gen-chroma
+# packed-load code, which candle does NOT link), so candle compiles UNCHANGED. The lockstep re-pin is
+# still REQUIRED because Cargo unifies the git dep by rev across the workspace. Both lines move together.
+# Bumped `627828b` -> `cc9a8c1` (sc-8775): lockstep gen-core rev-alignment for the worker's mlx-gen
+# re-pin to cc9a8c1 (mlx-gen #625 = the DISTILLED SenseNova fast id's PRE-MERGED packed q4/q8/bf16 tiers
+# + marker-gated `load_fast`, the next Group-B slice). `git diff 627828b..cc9a8c1 -- gen-core/
+# gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL; the range only adds mlx-gen-sensenova
+# pre-merge/convert code (candle does NOT link it), so candle compiles UNCHANGED. The lockstep re-pin is
+# still REQUIRED because Cargo unifies the git dep by rev across the workspace. Both lines move together.
+# Bumped `cc9a8c1` -> `330d339` (sc-9123): lockstep gen-core rev-alignment for the worker's mlx-gen
+# re-pin to 330d339 (mlx-gen #634 sc-9093 = the SenseNova VQA/interleave cooperative-cancel API the
+# worker threads a real CancelFlag into, + #631/#632/#633/#635 review fixes). `git diff
+# cc9a8c1..330d339 -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL; the range only
+# touches mlx-gen provider crates (candle does NOT link them), so candle compiles UNCHANGED. The
+# lockstep re-pin is still REQUIRED because Cargo unifies the git dep by rev across the workspace.
+# Both lines move together.
+# Bumped `8239cc1` -> `b520a0e` (sc-8827): the sc-8827 mlx-gen branch rev `8239cc1` was orphaned when
+# mlx-gen PR #637 SQUASH-merged to mlx-gen main as `b520a0e7`. The worker pins gen-core + all mlx-gen
+# crates at the merged `b520a0e7`, so candle-gen must pin the SAME gen-core rev or the worker's
+# single-gen-core-rev skew gate fails. `git diff 8239cc1..b520a0e7 -- gen-core/ gen-core-testkit/` is a
+# lone `///` doc-comment tag rename (`F-114` -> `sc-8827`) in gen-core/src/runtime.rs — NO API, field,
+# type, or behavior change; the squash's struct-literal fix lives in mlx-gen provider crates candle does
+# NOT link, so candle compiles UNCHANGED. Both lines move together.
+# Bumped `b520a0e` -> `fd4f801` (sc-9940): catch up 15 gen-core commits so the worker's SANA quant-matrix
+# mlx-gen re-pin (ccd852c -> fd4f801, epic 8506 / sc-8513) keeps candle-gen on the SAME gen-core rev its
+# `--features backend-candle` skew gate demands. UNLIKE the prior bumps, `git diff b520a0e..fd4f801 --
+# gen-core/` is NON-empty (724 insertions, the #639 whole-workspace review remediation) and DRIFTED two
+# public APIs candle links: `imageops::resize_lanczos_u8`/`resize_bicubic_u8` became fallible
+# (`-> Result<Vec<f32>, gen_core::Error>`) and `AlphaSchedule::scaled_linear` became infallible (returns
+# `AlphaSchedule` directly). All candle-gen call sites were adapted in this same change. Both lines move
+# together. candle-core (huggingface c1e6756/65ecb58) is UNTOUCHED — only these two gen-core lines move.
+# Bumped `495bb19` -> `4f425de` (sc-9945, epic 8506): lockstep gen-core rev-alignment for the worker's
+# mlx-gen re-pin to `4f425de` (mlx-gen #658 = the Bernini pre-packable planner quant tier — a pub
+# `quantize_qwen_planner_backbone` + a packed-aware `Qwen25VlText` loader in mlx-gen-bernini). `git diff
+# 495bb19..4f425de -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL; the change is
+# mlx-gen-bernini-only (candle does NOT link it), so candle compiles UNCHANGED. The lockstep re-pin is
+# still REQUIRED because Cargo unifies the git dep by rev across the workspace (the worker's `--features
+# backend-candle` skew gate). Both lines move together. (Pre-merge this points at the mlx-gen branch
+# commit `4f425de`; flip to the merged mlx-gen `main` rev once #658 lands.)
+# Bumped `91ba8b9b` -> `f879d0d` (sc-10046, epic 10043): lockstep gen-core rev-alignment for the worker's
+# mlx-gen re-pin to `f879d0d` (mlx-gen #660 = additive-branch LoRA on quantized Wan — route the Wan
+# adapters through pre-quantized snapshots via additive install, sc-10045). `git diff
+# 91ba8b9b..f879d0d -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL; the entire range
+# is an mlx-gen-wan provider change (adapters.rs/model.rs/lib.rs, +1316/-57; candle does NOT link it), so
+# candle compiles UNCHANGED and no new candle provider is pulled. The lockstep re-pin is still REQUIRED
+# because Cargo unifies the git dep by rev across the workspace: the worker resolves ONE gen-core rev when
+# it pins mlx-gen -> f879d0d + candle-gen -> this rev (its `--features backend-candle` skew gate). Both
+# lines move together.
+# Bumped `f879d0d` -> `5c28c20` (PiD per-axis pos clamp): lockstep gen-core rev-alignment for the
+# worker's mlx-gen re-pin to `5c28c20` (mlx-gen #661 = per-axis pixel-pos clamp fixing the tall-image
+# green cast without regressing wide). `git diff f879d0d..5c28c20 -- gen-core/ gen-core-testkit/` is
+# EMPTY — gen-core BYTE-IDENTICAL; the range is only the mlx-gen-pid `sincos_2d_pos` host change (candle
+# carries its own copy, already on this main), so candle compiles UNCHANGED. The lockstep re-pin is
+# still REQUIRED so the worker resolves ONE gen-core rev (mlx-gen -> 5c28c20 + candle-gen -> this rev).
+# Both lines move together.
+# Bumped `5c28c20` -> `09f6ef99` (sc-10100, epic 10043): lockstep gen-core rev-alignment for the
+# worker's mlx-gen re-pin to `09f6ef99` (mlx-gen main = LoKr on quantized Wan tiers via structured
+# deferred-Kronecker apply, sc-10050 #662; + typed LoHa-on-quantized rejection with an actionable
+# bf16 steer, sc-10051 #663). `git diff 5c28c20..09f6ef99 -- gen-core/ gen-core-testkit/` is EMPTY —
+# gen-core BYTE-IDENTICAL; the entire range is provider-only (mlx-gen-wan adapters.rs/model.rs +
+# mlx-gen's own src/adapters.rs/adapters/loader.rs, +799/-133; candle does NOT link them), so candle
+# compiles UNCHANGED and no new candle provider is pulled. The lockstep re-pin is still REQUIRED
+# because Cargo unifies the git dep by rev across the workspace: re-align so the worker resolves ONE
+# gen-core rev when it pins mlx-gen -> 09f6ef99 + candle-gen -> this rev. Both lines move together.
+# Re-pin 35e69f4 -> 76d7f1a (epic 8588 slice A / sc-8588): mlx-gen #664 (Krea img2img latent-init) +
+# #666 (route Reference conditioning -> img2img in the Krea Generator). `git diff 35e69f4..76d7f1a --
+# gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL; both PRs are mlx-gen-krea-only (which
+# candle does NOT link here), so candle compiles UNCHANGED. The lockstep re-pin is still REQUIRED so the
+# SceneWorks worker resolves ONE gen-core rev when it pins mlx-gen -> 76d7f1a + candle-gen -> this rev.
+# Both lines move together.
+# Bumped `586f84f` -> `393512b` (epic 8588 A4.3 / sc-10191): lockstep gen-core rev-alignment for the
+# worker's mlx-gen re-pin to `393512b` (mlx-gen #669 = img2img reference-guided t2i on Boogu Base +
+# Turbo). `git diff 586f84f..393512b -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL;
+# #669 is mlx-gen-boogu-only (which candle does NOT link here), so candle compiles UNCHANGED. The
+# lockstep re-pin is still REQUIRED because Cargo unifies the git dep by rev across the workspace: the
+# worker resolves ONE gen-core rev only when it pins mlx-gen -> 393512b + candle-gen -> this rev (its
+# `--features backend-candle --target all` skew gate). Both lines move together.
+# Bumped `393512b` -> `ab6b1f4` (epic 8588 slice A / sc-10225): lockstep gen-core rev-alignment for the
+# worker's mlx-gen re-pin to `ab6b1f4` (mlx-gen #670 = Krea 2 Raw CFG img2img entrypoint, sc-10224).
+# `git diff 393512b..ab6b1f4 -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL; #670 is
+# mlx-gen-krea-only (which candle does NOT link here), so candle compiles UNCHANGED. The lockstep re-pin
+# is still REQUIRED because Cargo unifies the git dep by rev across the workspace: the worker resolves ONE
+# gen-core rev only when it pins mlx-gen -> ab6b1f4 + candle-gen -> this rev. Both lines move together.
+# Bumped `ab6b1f4` -> `fcf07df` (epic 8588 slice A4.2 / sc-10190): lockstep gen-core rev-alignment for the
+# worker's mlx-gen re-pin to `fcf07df` (mlx-gen #671 = SANA img2img via a from-scratch DC-AE encoder port).
+# `git diff ab6b1f4..fcf07df -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL; #671 is
+# mlx-gen-sana-only (which candle does NOT link here), so candle compiles UNCHANGED. The lockstep re-pin is
+# still REQUIRED because Cargo unifies the git dep by rev across the workspace: the worker resolves ONE
+# gen-core rev only when it pins mlx-gen -> this rev + candle-gen -> this rev. Both lines move together.
+#
+# Bumped `fcf07df` -> `441ecec` (sc-10525, epic 10512): Anima's default sampler is ER-SDE-3 (`er_sde`,
+# sc-10519), which candle-gen-anima needs in the curated menu. `fcf07df` is an ANCESTOR of `441ecec`
+# (`git merge-base --is-ancestor` = true), and `git diff fcf07df..441ecec -- gen-core/` is 3 ADDITIVE
+# sampler commits only (er_sde + dpmpp_2m_sde in `solvers.rs`/`schedulers.rs` + fixtures) — no API break,
+# so every existing candle crate compiles unchanged. `6b7721a4` was the head of mlx-gen branch
+# `claude/anima-integration`; its `gen-core/` tree is byte-identical to the prior `441ecec` pin
+# (it only ADDS the `mlx-gen-anima` crate), so that was a semantic no-op re-aligning the rev.
+#
+# Bumped `6b7721a4` -> `6a10ae1` (merge of origin/main; mlx-gen PR #680 `claude/anima-integration` -> main):
+# fulfils the PROVISIONAL note above ("re-bump to the squash-merge SHA once the mlx-gen anima PR lands on
+# main") AND is REQUIRED to build after merging candle-gen main #378. That PR added the shared
+# `weightsmeta::is_hidden_file` predicate (skips macOS AppleDouble `._model.safetensors` sidecars) and made
+# `loader::sorted_safetensors` + the depth/sam3/ideogram/sensenova/flux2 sibling globs CALL it. #378 pinned
+# gen-core `361a3d9` (mlx-gen #672) for that symbol; `6b7721a4` (the anima head, cut BEFORE #672) does NOT
+# have it, so keeping `6b7721a4` verbatim would leave those 6 call sites referencing a missing symbol.
+# `6a10ae1` = mlx-gen main HEAD, which merged BOTH the anima branch (`6b7721a4`) AND #672 (`361a3d9`).
+# `git diff 6b7721a4..6a10ae1 -- gen-core/ gen-core-testkit/` is EXACTLY the +83-line `is_hidden_file`
+# addition and nothing else — so anima's `mlx-gen-anima` crate, `er_sde`, `dpmpp_2m_sde`, and `beta57` are
+# all still present (curated_menus_match_vocabulary stays green) and #378's loader guard now resolves.
+# One gen-core rev, both branches' work preserved. LOCKSTEP: the SceneWorks worker (currently mlx-gen +
+# gen-core `fcf07df`, candle-gen `c5560540`) must move mlx-gen + gen-core + candle-gen to `6a10ae1` /
+# this candle-gen rev TOGETHER when it adopts anima, so `--features backend-candle` resolves ONE gen-core.
+# Bumped `6a10ae1` -> `a5c1fcd` (sc-10578, mlx-gen PR #681 merged to main): Anima LoRA/LoKr on a packed
+# q4/q8 tier. `git diff 6a10ae1..a5c1fcd -- gen-core/ gen-core-testkit/` is **EMPTY** — the contract is
+# byte-identical. The range touches exactly three files: `src/adapters/loader.rs` (the shared LyCORIS
+# install skeleton now routes a deferrable LoKr on a packed base to `Adapter::LokrStructured` instead of
+# materializing the `[out,in]` delta) plus `mlx-gen-anima/src/model.rs` + a new test binary. candle-gen
+# links NEITHER `mlx-gen` nor `mlx-gen-anima`, so it compiles UNCHANGED; this bump exists solely so the
+# SceneWorks worker's skew gate resolves ONE `sceneworks-gen-core` rev once it re-pins mlx-gen -> a5c1fcd.
+# sc-10163 (epic 10159 B2): bumped 5d88229 -> 8db1ab6 (mlx-gen #684) to pick up the additive control
+# training contract (`TrainingItem.control_image_path` + `TrainingConfig.control_type`) the new
+# `krea_2_control` trainer consumes. Additive-only for the mlx crates candle-gen doesn't link.
+# Rev 8db1ab6 -> 4df97dc (mlx-gen sc-10821): gen-core gains the additive `LoadSpec.offload_policy`
+# (Resident | Sequential) the candle-gen-flux sequential-residency lane reads. 4df97dc is 8db1ab6 + that
+# ONE additive commit (rebased onto the pinned rev, no unrelated catch-up), so this is a pure surface
+# add. LOCKSTEP: SceneWorks must move its mlx-gen pins -> `4df97dc` and its candle-gen pins -> the
+# candle-gen rev carrying THIS edit, together, in one PR. Both lines below move as one.
+# Rev 4df97dc -> 3612d33 (mlx-gen sc-10839 / PR #692, epic 10834): SDXL + Z-Image sequential component
+# residency (Residency enum; under Sequential the text encoder is dropped after encode with a single
+# clear_cache() at the phase boundary, so peak = largest single component). PURE mlx-gen provider Rust
+# (mlx-gen-sdxl + mlx-gen-z-image; 3612d33 = mlx-gen main HEAD, which also carries unrelated mlx-gen-anima
+# main work). `git diff 4df97dc..3612d33 -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL,
+# so candle-gen (which links neither mlx-gen nor those provider crates) compiles UNCHANGED. This is a pure
+# rev-alignment: it exists solely so the SceneWorks worker's `--features backend-candle` skew gate resolves
+# ONE gen-core rev when it re-pins mlx-gen -> 3612d33 and candle-gen -> the rev carrying THIS edit together.
+# Rev 3612d33 -> 498a12c (mlx-gen sc-11000 / PR #694, epic 10834): qwen-image sequential component
+# residency (the fan-out sibling of sc-10839; PURE mlx-gen-qwen-image provider Rust). `git diff
+# 3612d33..498a12c -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL, so candle-gen
+# compiles UNCHANGED; same pure rev-alignment so the worker's `--features backend-candle` skew gate
+# resolves ONE gen-core rev when it re-pins mlx-gen -> 498a12c and candle-gen -> the rev carrying THIS edit.
+# Rev 498a12c -> 19573a9 (mlx-gen PR #693, epic 10871 Krea 2 image-edit): re-pin so the SceneWorks
+# worker's `--features backend-candle` skew gate resolves ONE gen-core rev once it moves mlx-gen
+# 498a12c -> 19573a9 (which adds the native Krea 2 Kontext-style edit engine + the `krea_2_edit`
+# generator). `git diff 498a12c..19573a9 -- gen-core/ gen-core-testkit/` is EMPTY — gen-core
+# BYTE-IDENTICAL (the edit work is additive to mlx-gen-krea only), so candle-gen compiles UNCHANGED.
+# Rev 19573a9 -> 0d2a2be (mlx-gen sc-11006 / PR #695, epic 10834): qwen-image-edit + qwen-image-control
+# sequential component residency (the fan-out completion of sc-11000; PURE mlx-gen-qwen-image provider
+# Rust). `git diff 19573a9..0d2a2be -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL,
+# so candle-gen compiles UNCHANGED; pure rev-alignment so the worker's `--features backend-candle` skew
+# gate resolves ONE gen-core rev when it re-pins mlx-gen -> 0d2a2be and candle-gen -> the rev carrying
+# THIS edit.
+# Rev 0d2a2be -> 951227a (mlx-gen sc-11030 / PR #696, epic 10834): lens/lens_turbo sequential component
+# residency + the consuming gpt-oss encoder loader (PURE mlx-gen-lens provider Rust + `src/weights.rs`
+# additive `remove`/`remove_prefix`). `git diff 0d2a2be..951227a -- gen-core/ gen-core-testkit/` is EMPTY
+# — gen-core BYTE-IDENTICAL, so candle-gen compiles UNCHANGED; pure rev-alignment so the worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen -> 951227a and
+# candle-gen -> the rev carrying THIS edit. Both lines below move as one.
+# Rev ab46fcb -> 592419c (mlx-gen sc-11101 / PR #700, epic 10834): krea_2 family (turbo/raw/edit/
+# turbo_control) sequential component residency (the fan-out sibling of sc-11030; PURE mlx-gen-krea
+# provider Rust — KreaText/KreaHeavy split + Residency on Krea/KreaTurboControl). `git diff
+# ab46fcb..592419c -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL, so candle-gen
+# (which links neither mlx-gen nor mlx-gen-krea) compiles UNCHANGED; pure rev-alignment so the worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev when it re-pins mlx-gen -> 592419c and
+# candle-gen -> the rev carrying THIS edit. Both lines below move as one.
+# Rev 592419c -> d2f3201 (mlx-gen sc-11640 / PR #708 + main merge): the CFG-free Turbo edit
+# (krea_2_turbo_edit) — PURE mlx-gen-krea provider Rust. `git diff 592419c..d2f3201 -- gen-core/
+# gen-core-testkit/` is EMPTY (gen-core BYTE-IDENTICAL), so candle-gen compiles UNCHANGED; pure
+# rev-alignment so the worker's skew gate resolves ONE gen-core rev (d2f3201) across mlx-gen + candle-gen.
+# NB: d2f3201 is the mlx-gen #708 BRANCH head — flip to the squashed mlx-gen main SHA once #708 merges.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "b8c415261a9fc6a2409a8ffc989881f0e6a3c99b" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "b8c415261a9fc6a2409a8ffc989881f0e6a3c99b" }
+# candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
+# under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
+# sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
+# kernel the moment candle-transformers is linked (repo-wide; SDXL + z-image both; plain candle-core
+# works). Rev 65ecb58 clears it — verified by the SDXL + Z-Image GPU conformance on RTX PRO 6000
+# (sm_120). All three crates share ONE rev so the whole tree is one candle build. Re-pin in lockstep.
+# Bumped `65ecb58` -> `c1e6756` (2026-07-02): picks up upstream PR #3493, the use-after-free fix in
+# `as_t_slice`/`QStorage::from_data(Cow::Owned…)` that sc-9085 hit (garbage quantized weights; we
+# work around it with `Cow::Borrowed`, which stays regardless). The range is 4 commits — the fix
+# plus three Metal-only SDPA fixes; candle-kernels/ is BYTE-IDENTICAL across it, so the sc-7544
+# vendored fatbin fork below needs no re-vendor (VENDORED.md updated to record the new rev).
+candle-core = { git = "https://github.com/huggingface/candle", rev = "c1e6756a89faefa888ea57b056394a0619925b87" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "c1e6756a89faefa888ea57b056394a0619925b87" }
+# SDXL building blocks (dual CLIP, UNet2DConditionModel, VAE, schedulers) — the candle-gen-sdxl
+# pipeline (sc-3675) reuses these, mirroring how the spike (epic 3494) built on candle-transformers.
+candle-transformers = { git = "https://github.com/huggingface/candle", rev = "c1e6756a89faefa888ea57b056394a0619925b87" }
+# HF tokenizers (CLIP-L + CLIP-bigG tokenizer.json) and snapshot/file resolution for SDXL weights.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+# Fixed-algorithm CPU RNG for deterministic, launch-portable initial latent noise (sc-3673) — NOT
+# candle's CUDA `set_seed`. `StdRng` (ChaCha) is reproducible across launches for a given seed;
+# `rand_distr::StandardNormal` draws the N(0,1) latent. Versions match candle's own tree (no dup).
+rand = "0.9"
+rand_distr = "0.5"
+# Link-time model registration (the DI-container stand-in) — matches gen-core's `inventory`.
+inventory = "0.3"
+# Error bridge (CandleError -> gen_core::Error). Major matches mlx-gen (thiserror 2).
+thiserror = "2"
+# JSON parsing for the PEFT/diffusers `lora_adapter_metadata` config blob (sc-5374) — the inference
+# adapter merge reads `lora_alpha`/`r` (+ per-module `alpha_pattern`/`rank_pattern`) out of it when a
+# file carries no per-target `.alpha` tensor. Already in the lock via `safetensors`; surfaced direct.
+serde_json = "1"
+
+# sc-7544 (epic 6564): multi-arch fatbin for candle's CUDA *quantized* kernels on Blackwell.
+# candle-kernels compiles its GGUF `QMatMul`/MoE kernels into a static `libmoe.a` via `nvcc -c`
+# (SASS object, NOT `--ptx`). cudaforge emits ONE `-gencode` from `CUDA_COMPUTE_CAP`, so the cap=80
+# packaging baseline embeds only an sm_80 cubin — which cannot load on Blackwell sm_120, where every
+# Q4/Q8 matmul then silently returns zeros (dense PTX kernels JIT up fine; this is why dense models
+# render but quantized models came out black). cudaforge has no multi-target/cap-list support and the
+# candle pin is upstream (huggingface/candle, not a fork), so the fix is a LOCAL fork of candle-kernels
+# (`vendor/candle-kernels`, identical to the pinned rev except for three `-gencode` lines in build.rs)
+# patched in here. It emits sm_80 + sm_90 + sm_120 SASS + compute_120 PTX — one binary that runs
+# natively Ampere → Ada → Hopper → Blackwell and JITs forward. The patch key is the candle git URL so
+# it overrides the candle-kernels that `candle-core` (above) pulls transitively from that source.
+# RE-VENDOR THIS WHEN THE candle PIN BUMPS — see vendor/candle-kernels/VENDORED.md.
+[patch."https://github.com/huggingface/candle"]
+candle-kernels = { path = "vendor/candle-kernels" }

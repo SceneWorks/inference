@@ -1,0 +1,54 @@
+[package]
+name = "candle-gen"
+version = "0.0.0"
+edition = "2021"
+description = "Shared candle (CPU/Metal/CUDA) commons for SceneWorks generative image & video inference — device/dtype seam, weight loaders, seeded noise, unified samplers, training harness, and quantization; Windows/CUDA sibling of mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "inference", "generative"]
+categories = ["science"]
+readme = "../README.md"
+
+[dependencies]
+# Shared pins live in [workspace.dependencies] (mirrors mlx-gen F-151).
+sceneworks-gen-core = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+thiserror = { workspace = true }
+# Training harness (epic 5164 / sc-5165). `safetensors` is candle's own version (0.7) so the `View`
+# impl candle-core provides for `Tensor` applies — used to write PEFT/LoKr adapters *with metadata*
+# (candle-core's own save passes `None`). `rand`/`rand_distr` seed deterministic, launch-portable
+# adapter-factor init (the sc-3673 philosophy applied to LoRA `A`); `image` decodes the dataset.
+safetensors = "0.7"
+# Raw f16 block-byte assembly for the MLX-packed → GGML `Q4_1` repack seam (sc-9085/sc-9086):
+# `block_q4_1` stores its per-block scale/min as f16 and candle-core does not re-export `half`.
+# Same version candle-core itself resolves (Cargo.lock), so no duplicate-crate risk.
+half = "2"
+# fp8 E4M3 storage type for the cuBLASLt 8-bit GEMM wrapper (sc-9299, cuda-only): naming
+# `float8::F8E4M3` is required to clone candle's `CudaStorageSlice::F8E4M3` device buffer for the
+# raw cublasLt call. `optional` + pulled in only by the `cuda` feature so CPU/Metal builds stay lean;
+# same version candle-core resolves (Cargo.lock 0.7.0) → cargo unifies to ONE `float8` build, so the
+# `F8E4M3` we name is the SAME type candle stores.
+float8 = { version = "0.7", optional = true }
+# Parse the PEFT/diffusers `lora_adapter_metadata` JSON blob (sc-5374) in `train::lora` so the
+# inference adapter merge recovers `lora_alpha`/`r` when a file ships no per-target `.alpha` tensor.
+serde_json = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[features]
+# Default works on Mac with NO extra features: candle-core defaults to the CPU backend.
+default = []
+# Test-support helpers (sc-9055 / F-069): the shared `testkit` module (PPM IO / cosine / env-path /
+# GPU peak-VRAM / HF-cache resolution). Test-only — provider crates enable it under
+# `[dev-dependencies]` (or a test-only feature) so it never compiles into a production build.
+testkit = []
+# Apple Metal GPU backend — builds on Mac. NOT in `default` so the plain `cargo check` stays CPU.
+metal = ["candle-core/metal", "candle-nn/metal"]
+# NVIDIA CUDA backend (Windows target). MUST NOT be in `default` — it needs the CUDA toolkit and
+# will not build on Mac. All cuda-only code is gated behind `#[cfg(feature = "cuda")]`.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:float8"]
+# NOTE: a `flash-attn` feature was removed in sc-9032 — it was a pure no-op (`flash-attn = ["cuda"]`,
+# forwarded crate-to-crate) that wired no fused kernels. When the `candle-flash-attn` slice is
+# scheduled, reintroduce it here (and its forwards) behind real gated code, not as a bare alias.
