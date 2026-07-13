@@ -116,10 +116,13 @@ jobs:
         # rebuilding the narrower lib/test profile below.
         run: cargo clean
       - name: Test Candle packages
-        # `cargo test` without target selection also links every heavyweight real-weight example.
-        # Clippy above still checks all targets; this step executes the actual lib/integration tests
-        # without exhausting the hosted runner's disk while linking unrelated smoke binaries.
-        run: cargo test --locked --lib --tests -p candle-llm -p 'candle-gen*' -p runtime-cpu
+        # All-target Clippy above checks every integration and real-weight target. Execute the
+        # package unit/catalog suites one linker at a time: concurrently linking several provider
+        # test binaries exceeds the hosted runner's memory-backed linker capacity and crashes lld
+        # with SIGBUS even after the Clippy target tree has been reclaimed.
+        run: cargo test --locked --lib -j 1 -p candle-llm -p 'candle-gen*' -p runtime-cpu
+      - name: Test Candle LLM conformance
+        run: cargo test --locked -j 1 -p candle-llm --test conformance
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu
       - name: Guard poison-tolerant shared locks
