@@ -175,6 +175,28 @@ jobs:
           -p candle-llm -p 'candle-gen*'
           --features metal
 
+  macos-nax:
+    name: runtime-macos NAX (macOS 26.2, manual)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true'
+    runs-on: [self-hosted, macOS, ARM64, nax]
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "26.2"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain and platform versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun metal --version
+          rustup show
+      - name: Cache Cargo and MLX native build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Exercise MLX engine and complete runtime catalog on NAX
+        run: cargo test --locked --lib -p mlx-llm -p runtime-macos
+      - name: Exercise LLM-only runtime catalog on NAX
+        run: cargo test --locked --no-default-features --lib -p runtime-macos
+
   windows-cuda:
     name: Candle CUDA packages (Windows, manual)
     needs: changes
