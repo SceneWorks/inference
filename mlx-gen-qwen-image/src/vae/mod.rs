@@ -14,8 +14,10 @@ use mlx_rs::ops::{add, divide, multiply, split, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::nn::silu;
+use mlx_gen::tiling::{TilingConfig, VaeTiling};
+use mlx_gen::vae_tiling::tiled_decode;
 use mlx_gen::weights::Weights;
-use mlx_gen::{LatentDecoder, Result};
+use mlx_gen::{CancelFlag, LatentDecoder, Result};
 
 use blocks::{rms_norm_channels, CausalConv3d, DownBlock3D, MidBlock3D, UpBlock3D, NORM_EPS};
 
@@ -103,8 +105,27 @@ impl Decoder3D {
     }
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let mut x = self.conv_in.forward(x)?;
-        x = self.mid_block.forward(&x)?;
+        let x = self.forward_pre_upsample(x)?;
+        self.forward_upsample_tail(&x)
+    }
+
+    /// The **pre-upsample head**: `conv_in → mid_block` (the mid-block carries a *global* per-frame
+    /// spatial self-attention over all H·W tokens). Runs at LATENT resolution and is spatially GLOBAL,
+    /// so a tiled decode (sc-11747) must run this ONCE on the full latent — tiling it would make each
+    /// tile attend only within itself, changing the whole image. It is also cheap (latent res, fused
+    /// SDPA), so running it full adds no meaningful memory over the single-pass decode.
+    pub(super) fn forward_pre_upsample(&self, x: &Array) -> Result<Array> {
+        let x = self.conv_in.forward(x)?;
+        self.mid_block.forward(&x)
+    }
+
+    /// The **upsample tail**: `up_blocks → norm_out → SiLU → conv_out`. Every op here is spatially LOCAL
+    /// — resnet convs, nearest-2× + conv upsamplers, the per-position channel-L2 `norm_out`, and the head
+    /// conv — so it tiles seam-free (overlap + trapezoidal blend absorbs the conv halo). This is also
+    /// where the decode memory spike lives (the 8× spatial growth), so tiling it is what bounds the peak
+    /// (sc-11747). `x` is the pre-upsample head output at latent resolution.
+    pub(super) fn forward_upsample_tail(&self, x: &Array) -> Result<Array> {
+        let mut x = x.clone();
         for block in &self.up_blocks {
             x = block.forward(&x)?;
         }
@@ -137,10 +158,68 @@ impl QwenVae {
 
     /// 16-ch latent (NCHW or NCTHW) → image `(B, 3, 1, H, W)`. Denormalizes by `std`/`mean`.
     pub fn decode(&self, latents: &Array) -> Result<Array> {
+        self.decode_upsample_tail(&self.decode_pre_upsample(latents)?)
+    }
+
+    /// The decode **head** at LATENT resolution: denormalize (`·std + mean`) → `post_quant_conv` →
+    /// decoder `conv_in` → mid-block. The mid-block carries a *global* per-frame spatial self-attention,
+    /// so a tiled decode (sc-11747) must run this ONCE on the full latent — it is cheap (latent res,
+    /// fused SDPA) and spatially global, so tiling it would corrupt the whole image. Output is the
+    /// pre-upsample feature map `[B, C, T, H, W]` (spatially unchanged from the latent).
+    pub fn decode_pre_upsample(&self, latents: &Array) -> Result<Array> {
         let l = to_5d(latents)?;
         let l = add(&multiply(&l, &self.std)?, &self.mean)?;
         let l = self.post_quant_conv.forward(&l)?;
-        self.decoder.forward(&l)
+        self.decoder.forward_pre_upsample(&l)
+    }
+
+    /// The decode **upsample tail**: `up_blocks → norm_out → SiLU → conv_out`, taking the
+    /// [`decode_pre_upsample`](Self::decode_pre_upsample) head and producing the `(B, 3, 1, 8·H, 8·W)`
+    /// image. Every op is spatially LOCAL, so this is the stage a tiled decode splits into blended tiles
+    /// (and where the decode memory spike lives). Kept public so the tiling seam ([`Self::decode_tiled`])
+    /// and its parity tests can drive it directly.
+    pub fn decode_upsample_tail(&self, head: &Array) -> Result<Array> {
+        self.decoder.forward_upsample_tail(head)
+    }
+
+    /// **Tiled** decode for a memory-bounded large-image decode (sc-11747): split the latent into
+    /// overlapping spatial tiles, run `post_quant_conv` + the decoder stack per tile, and trapezoidally
+    /// blend them into the full `(B, 3, 1, 8·H, 8·W)` image — so the end-of-generation decode spike
+    /// scales with the tile size, not the full resolution (the peak obstacle to a Krea pose-control
+    /// render fitting a 32 GB Mac). Falls back to the single-pass [`decode`](Self::decode) when `cfg`
+    /// doesn't fire for these dims (small image / large-memory machine → zero tiling overhead).
+    ///
+    /// **Denormalize + `post_quant_conv` + the decoder's pre-upsample head run ONCE on the full latent**
+    /// (the head carries a *global* spatial self-attention, so tiling it would change the whole image and
+    /// it is cheap at latent resolution), then only the **upsample tail** — the spatially-local, memory-
+    /// spiking stage — is tiled and trapezoidally blended. The Qwen-Image VAE is a still-image VAE
+    /// (spatial ×8, singleton temporal axis, [`VaeTiling::QWEN_IMAGE`]) so only H/W tile; the shared blend
+    /// geometry lives in [`mlx_gen::tiling`] and the Array loop in [`mlx_gen::vae_tiling`]. No clamp here
+    /// (the single-pass [`decode`](Self::decode) doesn't clamp either — the `[-1,1]` clamp is applied
+    /// later by the engine's `decoded_to_image`), so the tiled output matches the untiled one to within
+    /// the blend tolerance.
+    pub fn decode_tiled(
+        &self,
+        latents: &Array,
+        cfg: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let l = to_5d(latents)?;
+        let sh = l.shape(); // [B, 16, T(=1), H, W]
+        let (f, h, w) = (sh[2], sh[3], sh[4]);
+        if !cfg.needs_tiling(VaeTiling::QWEN_IMAGE, f, h, w) {
+            return self.decode(latents);
+        }
+        // Head (denormalize → post_quant_conv → conv_in → mid-block global attention) runs ONCE on the
+        // full latent — identical to single-pass `decode` up to the up-blocks, so parity is exact here.
+        let head = self.decode_pre_upsample(&l)?;
+        // Tile the upsample tail. The head output is at latent resolution (H×W), so the same
+        // latent-shape plan drives the tiling; `VaeTiling::QWEN_IMAGE`'s ×8 spatial scale maps each
+        // tile to its 8× output slab. NCTHW: channel axis at 1, tiled axes [2, 3, 4] (T is the singleton).
+        let plan = cfg.plan(VaeTiling::QWEN_IMAGE, f, h, w);
+        tiled_decode(&head, &plan, [2, 3, 4], cancel, |tile| {
+            self.decode_upsample_tail(tile)
+        })
     }
 
     /// Image `(B, 3, H, W)` (or NCTHW) → scaled 16-ch latent `(B, 16, 1, H/8, W/8)`.

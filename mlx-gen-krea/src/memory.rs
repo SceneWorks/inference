@@ -33,7 +33,8 @@
 //! estimate stays ≥ the measured peak (within ≤ ~1.16× at every tested point).
 
 use mlx_gen::gen_core::mempolicy::{plan_memory_adaptation, LaneLevers, MemoryPlan, StagePeaks};
-use mlx_gen::Quant;
+use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingConfig};
+use mlx_gen::{Error, Quant, Result};
 
 use crate::config::Krea2Config;
 
@@ -183,6 +184,86 @@ pub fn qwen_vae_decode_tiled_floor_ex_text_gib(
         + RESIDENT_OVERHEAD_GIB
         + (DECODE_ACCUM_BYTES_PER_PIXEL * px) / GIB
         + DECODE_MIN_TILE_GIB
+}
+
+/// Candidate spatial tile sizes (OUTPUT px, multiples of the Qwen-Image VAE's ×8 spatial scale, blended
+/// with a 64 px overlap) offered to [`budgeted_plan`] for the tiled decode. Ordered largest-first for
+/// readability only — the selector keeps the largest-volume tile that fits regardless of position. The
+/// grid spans near-full (768) down to a small 256 tile so a constrained budget always has a fitting
+/// option; on Metal the decode spike is modest (~5.2 KB/px, sc-11847), so even large tiles shave the
+/// peak toward the un-tileable floor.
+const QWEN_DECODE_SPATIAL_PX: [i32; 7] = [768, 640, 512, 448, 384, 320, 256];
+
+/// **Budget-gated** tiling for the Krea control-lane Qwen-VAE decode (sc-11747) — the still-image
+/// analogue of Wan's `auto_tiling_budgeted_z16`. Estimates the decode peak from the render shape and
+/// returns the tiling the render-time decode should use:
+///   • `Ok(None)`    — the single-pass decode already fits `safe_gib` (small image / large-memory Mac);
+///                     the caller runs [`QwenVae::decode`](mlx_gen_qwen_image::vae::QwenVae::decode), so
+///                     single-pass is reached ONLY when safe and a machine with headroom pays ZERO
+///                     tiling overhead (the sc-11750 guarantee).
+///   • `Ok(Some(c))` — tiling is required; `c` sizes the LARGEST tile whose estimated peak ≤ `safe_gib`
+///                     (largest ⇒ fewest tiles ⇒ least overlap recompute ⇒ fastest within budget).
+///   • `Err(..)`     — infeasible even tiled (the resident weights + output buffers alone, or every
+///                     candidate tile, exceed `safe_gib`): a **catchable** error surfaced BEFORE the
+///                     decode, so the caller reports it rather than the OS/GPU killing the process
+///                     mid-decode. On the control lane the cheaper residency / branch-quant levers
+///                     (applied at load) should already have made this feasible; this is the backstop.
+///
+/// The decode `peak_cost` is the Krea/Qwen cost model — and unlike Wan's video cost model it MUST carry
+/// the resident heavy weights, because on Metal they DOMINATE the decode peak (sc-11847: the ~5.2 KB/px
+/// spike is only ~6 GiB @ 1024², the resident weights are the other ~16+ GiB); omitting them would let
+/// the single-pass gate under-count and never tile. The model is: `resident heavy (base DiT + branch) +
+/// fixed overhead (+ co-resident text) + the full-output f32 accumulators (unshrinkable) + the per-TILE
+/// conv spike`. Every constant is shared with the single-pass / tiled-floor estimators above, so this
+/// gate agrees with the [`plan_control_adaptation`] policy on whether single-pass fits.
+///
+/// `text_co_resident` adds the phase-A Qwen3-VL encoder footprint when it stays resident through the
+/// decode (the `Resident` path); under `Sequential` it is dropped before the heavy phase, matching the
+/// `*_ex_text_gib` semantics. `safe_gib` is injected ([`mlx_gen::memory::safe_budget_gib`] at the call
+/// site) so the gate is unit-testable without a device.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_control_decode_tiling(
+    safe_gib: f64,
+    cfg: &Krea2Config,
+    branch_blocks: usize,
+    base_tier: Option<Quant>,
+    branch_tier: Option<Quant>,
+    width: u32,
+    height: u32,
+    text_co_resident: bool,
+) -> Result<Option<TilingConfig>> {
+    let heavy_gib =
+        (base_dit_bytes(cfg, base_tier) + branch_bytes(cfg, branch_blocks, branch_tier)) / GIB;
+    let resident_text = if text_co_resident {
+        text_resident_gib(base_tier)
+    } else {
+        0.0
+    };
+    let resident = heavy_gib + RESIDENT_OVERHEAD_GIB + resident_text;
+
+    // peak_cost(out_f, out_h, out_w, tile_f, tile_h, tile_w): the still-image decode has out_f = 1; a
+    // zero tile yields the accumulator-only floor (`budgeted_plan`'s AccumulatorsExceedBudget probe).
+    let peak_cost = move |_of: i64, oh: i64, ow: i64, _tf: i64, th: i64, tw: i64| {
+        let out_px = (oh * ow) as f64;
+        let tile_px = (th * tw) as f64;
+        resident
+            + (DECODE_ACCUM_BYTES_PER_PIXEL * out_px) / GIB
+            + (DECODE_SPIKE_BYTES_PER_PIXEL * tile_px) / GIB
+    };
+    let candidates = TileCandidates {
+        spatial_px: &QWEN_DECODE_SPATIAL_PX,
+        spatial_overlap_px: 64,
+        temporal: &[], // still image — no temporal axis to tile
+    };
+    budgeted_plan(
+        height as i32,
+        width as i32,
+        1, // out_frames
+        safe_gib,
+        candidates,
+        peak_cost,
+    )
+    .map_err(|e| Error::Msg(format!("krea_2 control Qwen-VAE decode: {e}")))
 }
 
 /// Everything the Krea control lane needs to decide its memory-adaptation plan against a device budget.
@@ -444,6 +525,83 @@ mod tests {
             "must not drop res prematurely: {plan:?}"
         );
         assert!(!plan.engaged.contains(&Lever::ResolutionReduction));
+    }
+
+    // ── sc-11747: the render-time decode-tiling gate (`plan_control_decode_tiling`). ───────────────
+
+    /// A large-memory Mac (or any small render) → single-pass fits → `None`, so the caller runs the
+    /// untiled decode and pays ZERO tiling overhead (the sc-11750 fast-path guarantee).
+    #[test]
+    fn decode_tiling_gate_none_when_single_pass_fits() {
+        let cfg = Krea2Config::turbo();
+        let sp = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
+        // A budget comfortably above the single-pass peak → no tiling.
+        let plan =
+            plan_control_decode_tiling(sp + 2.0, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
+                .unwrap();
+        assert!(plan.is_none(), "single-pass fits → must not tile: {plan:?}");
+    }
+
+    /// A constrained budget under the single-pass peak but above the tiled floor → tiling engages with a
+    /// spatial tile, and the selector guarantees the chosen tile's estimated peak ≤ the budget.
+    #[test]
+    fn decode_tiling_gate_tiles_when_single_pass_over_budget() {
+        let cfg = Krea2Config::turbo();
+        let sp = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
+        // A few GiB under single-pass: the 1024² decode spike (~6 GiB) means a smaller tile fits here.
+        let safe = sp - 3.0;
+        let plan =
+            plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
+                .unwrap()
+                .expect("single-pass over budget must tile");
+        assert!(
+            plan.spatial.is_some(),
+            "a 1024² decode over budget must tile the spatial axis: {plan:?}"
+        );
+        assert!(
+            plan.temporal.is_none(),
+            "a still image has no temporal axis to tile: {plan:?}"
+        );
+    }
+
+    /// Co-resident text (the `Resident` path) RAISES the decode peak, so a budget that fits single-pass
+    /// ex-text can tip into tiling once the text encoder is counted. Proves the `text_co_resident` term
+    /// is wired.
+    #[test]
+    fn decode_tiling_gate_counts_coresident_text() {
+        let cfg = Krea2Config::turbo();
+        let sp = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
+        // Just above the ex-text single-pass peak: fits with text dropped, over budget with it resident.
+        let safe = sp + 1.0;
+        let seq =
+            plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
+                .unwrap();
+        assert!(
+            seq.is_none(),
+            "ex-text single-pass fits under Sequential: {seq:?}"
+        );
+        let resident =
+            plan_control_decode_tiling(safe, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, true)
+                .unwrap();
+        assert!(
+            resident.is_some(),
+            "co-resident text pushes the decode over budget → must tile: {resident:?}"
+        );
+    }
+
+    /// Infeasible even tiled (a budget below the resident weights + output-buffer floor) → a catchable
+    /// `Err`, surfaced before the decode rather than an OS/GPU kill mid-decode.
+    #[test]
+    fn decode_tiling_gate_errs_when_infeasible() {
+        let cfg = Krea2Config::turbo();
+        let err =
+            plan_control_decode_tiling(1.0, &cfg, 7, Some(Quant::Q4), None, 1024, 1024, false)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("Qwen-VAE decode"),
+            "over-budget decode must surface a catchable, tagged error: {err}"
+        );
     }
 
     // ── sc-11748: the load-time branch-quant gate (`should_quantize_control_branch`). ──────────────

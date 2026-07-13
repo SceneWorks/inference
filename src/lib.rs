@@ -69,6 +69,10 @@ pub mod tiling {
 pub mod transform {
     pub use gen_core::transform::*;
 }
+// Array-level tiled-decode blend loop (sc-11747): the MLX half of the gen-core tiling seam, shared by
+// every VAE that tiles a decode (Wan z16/z48, Qwen-Image). gen-core carries the pure geometry
+// ([`tiling::TilePlan`]); this carries the tensor loop.
+pub mod vae_tiling;
 
 pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
