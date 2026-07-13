@@ -591,9 +591,13 @@ impl Chroma {
 // Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
 mlx_gen::register_generators! {
-    descriptor_hd => load_hd,
-    descriptor_base => load_base,
-    descriptor_flash => load_flash,
+    pub(crate) const HD_REGISTRATION = descriptor_hd => load_hd
+}
+mlx_gen::register_generators! {
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
+}
+mlx_gen::register_generators! {
+    pub(crate) const FLASH_REGISTRATION = descriptor_flash => load_flash
 }
 
 #[cfg(test)]
