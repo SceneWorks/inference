@@ -307,6 +307,9 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,
+        // sc-10894 lockstep catch-up: gen-core gained `TrainerDescriptor.supports_control` (mirrors
+        // mlx-gen-z-image's `false` — the base LoRA/LoKr trainer trains no control branch).
+        supports_control: false,
     }
 }
 
