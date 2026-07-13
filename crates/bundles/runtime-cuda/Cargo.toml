@@ -1,0 +1,16 @@
+[package]
+name = "runtime-cuda"
+version = "0.0.0"
+edition = "2021"
+description = "Supported SceneWorks Candle CUDA media and LLM runtime composition."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[dependencies]
+runtime-catalog = { workspace = true }
+candle-gen-catalog = { workspace = true, features = ["cuda"] }
+candle-llm = { workspace = true, features = ["cuda"] }
+
+[features]
+default = []
+flash-attn = ["candle-llm/flash-attn"]

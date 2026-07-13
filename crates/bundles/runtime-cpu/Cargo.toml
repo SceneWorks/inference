@@ -1,0 +1,12 @@
+[package]
+name = "runtime-cpu"
+version = "0.0.0"
+edition = "2021"
+description = "Supported SceneWorks Candle CPU media and LLM runtime composition."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[dependencies]
+runtime-catalog = { workspace = true }
+candle-gen-catalog = { workspace = true }
+candle-llm = { workspace = true }

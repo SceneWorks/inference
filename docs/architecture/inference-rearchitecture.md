@@ -172,6 +172,23 @@ Tests may construct the same complete registry or a deliberately small registry.
 The set under test no longer changes because an unrelated crate was added to the
 test binary.
 
+### Named runtime bundles
+
+Media composition alone is not the supported product boundary. `runtime-macos`,
+`runtime-cuda`, and `runtime-cpu` each assemble one media registry, one LLM
+registry, and one snapshot-preparer registry. `runtime-catalog` validates that
+every descriptor and preparer belongs to the bundle's declared backend, then
+exposes a stable machine-readable snapshot.
+
+The LLM engines export ordinary builder functions for provider and preparer
+registrations. This gives model-first loading and snapshot preparation the same
+explicit ownership model as media generation. The older process-global LLM APIs
+remain only as temporary cutover adapters.
+
+The bundle names are also CI and release profile names. MLX, CUDA, and CPU are
+not additive features of one universal build, so `--workspace --all-features`
+is intentionally not a supported validation strategy.
+
 ### Executable catalog contracts
 
 Both platform catalog crates pin their complete, ordered ID surfaces in tests.
@@ -260,21 +277,25 @@ implicit fallback disappeared.
 
 ## Invariants for future changes
 
-Future media work should preserve these rules:
+Future inference work should preserve these rules:
 
 - backend-neutral contracts do not depend on MLX or Candle tensor types;
 - internal SceneWorks dependencies use workspace paths, not repository SHA pins;
 - media provider registration is explicit—do not add `inventory` submissions or
   `force_link` anchors as a shortcut;
 - every shipped family is named in its platform catalog;
+- every supported product consumes one named runtime bundle rather than assembling
+  backend crates;
+- LLM providers and snapshot preparers are added through explicit builders, not
+  new linker side effects;
 - duplicate provider IDs fail registry construction;
 - complete platform surfaces and descriptor conformance remain weights-free test
   gates;
 - consumers load through a registry value, not a process-global media facade;
 - differences between MLX and Candle catalogs are allowed when they represent
   real implementation differences and are pinned explicitly in tests;
-- the LLM inventory exception is deliberate but is not precedent for new media
-  registration.
+- the LLM inventory compatibility adapter is temporary cutover infrastructure,
+  not a supported composition boundary or precedent for new registration.
 
 ## Validation and outcome
 
@@ -286,8 +307,9 @@ migration revision with:
 - exact platform-catalog surface and descriptor-conformance tests;
 - `cargo test --locked --workspace --lib --tests`;
 - source audits confirming no legacy global media loaders, anonymous media
-  registrations, or force-link paths for the media registry remain (the
-  JoyCaption anchors for the separate LLM registries are intentional);
+  registrations, or force-link paths for the media registry remain; the LLM
+  inventory submissions are tracked compatibility adapters pending consumer
+  cutover;
 - a clean lockfile diff removing the obsolete media `inventory` dependency
   edges.
 
@@ -304,5 +326,6 @@ or if workspace scale can no longer be handled by dependency-aware CI. Any such
 change should preserve an inspectable composition root, deterministic catalog
 membership, duplicate-ID validation, and weights-free conformance checks.
 
-Migrating the LLM registry to the same model should be a separate decision based
-on its consumer graph, not an incidental cleanup bundled into media work.
+Remove the LLM inventory adapter only after SceneWorks and ChatWorks consume the
+explicit registries from an immutable runtime release and the documented rollback
+point no longer depends on link-time discovery.

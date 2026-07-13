@@ -32,6 +32,30 @@ class SelectLanesTests(unittest.TestCase):
         self.assertTrue(lanes["windows_cuda"])
         self.assertFalse(lanes["contracts"])
 
+    def test_shared_runtime_catalog_fans_out_to_every_platform(self) -> None:
+        lanes = select_lanes(["crates/bundles/runtime-catalog/src/lib.rs"])
+        for lane in (
+            "candle_cpu",
+            "macos_metal",
+            "windows_cuda",
+            "real_weights",
+            "release",
+        ):
+            self.assertTrue(lanes[lane], lane)
+
+    def test_named_runtime_bundle_selects_only_its_platform(self) -> None:
+        cases = {
+            "runtime-macos": "macos_metal",
+            "runtime-cpu": "candle_cpu",
+            "runtime-cuda": "windows_cuda",
+        }
+        for bundle, expected in cases.items():
+            with self.subTest(bundle=bundle):
+                lanes = select_lanes([f"crates/bundles/{bundle}/src/lib.rs"])
+                self.assertTrue(lanes[expected])
+                self.assertTrue(lanes["real_weights"])
+                self.assertTrue(lanes["release"])
+
     def test_docs_only_does_not_build_backends(self) -> None:
         lanes = select_lanes(["docs/migration/PHASE_2_CHECKPOINT.md"])
         self.assertTrue(lanes["workspace"])

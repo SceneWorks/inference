@@ -3404,6 +3404,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-catalog"
+version = "0.0.0"
+dependencies = [
+ "core-llm",
+ "sceneworks-gen-core",
+ "serde_json",
+]
+
+[[package]]
+name = "runtime-cpu"
+version = "0.0.0"
+dependencies = [
+ "candle-gen-catalog",
+ "candle-llm",
+ "runtime-catalog",
+]
+
+[[package]]
+name = "runtime-cuda"
+version = "0.0.0"
+dependencies = [
+ "candle-gen-catalog",
+ "candle-llm",
+ "runtime-catalog",
+]
+
+[[package]]
+name = "runtime-macos"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen-catalog",
+ "mlx-llm",
+ "runtime-catalog",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

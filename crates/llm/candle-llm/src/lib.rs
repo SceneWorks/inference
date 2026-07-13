@@ -49,12 +49,30 @@ pub use llava::{LlavaConfig, LlavaModel, LlavaProvider};
 pub use models::CausalLm;
 pub use provider::LlamaProvider;
 
-/// Build the complete, explicit Candle LLM provider catalog.
-pub fn text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
-    core_llm::TextLlmRegistryBuilder::new()
+/// Add every Candle LLM provider to an explicit registry builder.
+pub fn register_text_providers(
+    registry: core_llm::TextLlmRegistryBuilder,
+) -> core_llm::TextLlmRegistryBuilder {
+    registry
         .register(provider::REGISTRATION)
         .register(llava::REGISTRATION)
-        .build()
+}
+
+/// Build the complete, explicit Candle LLM provider catalog.
+pub fn text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
+    register_text_providers(core_llm::TextLlmRegistryBuilder::new()).build()
+}
+
+/// Add the Candle snapshot preparer to an explicit registry builder.
+pub fn register_snapshot_preparers(
+    registry: core_llm::SnapshotPreparerRegistryBuilder,
+) -> core_llm::SnapshotPreparerRegistryBuilder {
+    registry.register(prepare::REGISTRATION)
+}
+
+/// Build the complete, explicit Candle snapshot-preparer catalog.
+pub fn snapshot_preparer_registry() -> core_llm::Result<core_llm::SnapshotPreparerRegistry> {
+    register_snapshot_preparers(core_llm::SnapshotPreparerRegistryBuilder::new()).build()
 }
 
 #[cfg(test)]
@@ -73,5 +91,14 @@ mod explicit_registry_tests {
         compatibility.sort();
         assert_eq!(explicit, compatibility);
         assert_eq!(explicit, ["candle-llama", "candle-llava"]);
+
+        let preparers = super::snapshot_preparer_registry().unwrap();
+        assert_eq!(
+            preparers
+                .registrations()
+                .map(|registration| (registration.backend)())
+                .collect::<Vec<_>>(),
+            ["candle"]
+        );
     }
 }

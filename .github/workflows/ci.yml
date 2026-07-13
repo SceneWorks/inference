@@ -106,9 +106,12 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Clippy Candle packages
-        run: cargo clippy --locked -p candle-llm -p 'candle-gen*' --all-targets -- -D warnings
+        run: >-
+          cargo clippy --locked
+          -p candle-llm -p 'candle-gen*' -p runtime-cpu
+          --all-targets -- -D warnings
       - name: Test Candle packages
-        run: cargo test --locked -p candle-llm -p 'candle-gen*'
+        run: cargo test --locked -p candle-llm -p 'candle-gen*' -p runtime-cpu
       - name: Guard poison-tolerant shared locks
         run: bash crates/media/candle-gen/scripts/check-lock-poison.sh
       - name: Self-test the gen-core skew verdict
@@ -148,12 +151,12 @@ jobs:
       - name: Clippy MLX packages
         run: >-
           cargo clippy --locked
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*'
+          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
           --all-targets -- -D warnings
       - name: Test MLX packages
         run: >-
           cargo test --locked
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*'
+          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
       - name: Check Candle Metal packages
         run: >-
           cargo check --locked
@@ -179,12 +182,12 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo build --locked -p candle-llm -p "candle-gen*" --features cuda
+          cargo build --locked -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
       - name: Test Candle CUDA packages
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-llm -p "candle-gen*" --features cuda
+          cargo test --locked -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
 
   supply-chain:
     name: dependency policy + advisories

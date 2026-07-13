@@ -141,13 +141,14 @@ fn validate_loadable_snapshot(source: &Path) -> CoreResult<usize> {
     Ok(weights.len())
 }
 
-inventory::submit! {
+pub const REGISTRATION: core_llm::SnapshotPreparerRegistration =
     core_llm::SnapshotPreparerRegistration {
         backend,
         can_prepare,
         prepare,
-    }
-}
+    };
+
+inventory::submit! { REGISTRATION }
 
 #[cfg(test)]
 mod tests {

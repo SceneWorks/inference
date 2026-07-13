@@ -23,8 +23,9 @@ effect after workspace normalization.
 - [`PHASE_1_CHECKPOINT.md`](PHASE_1_CHECKPOINT.md): history import and exact tree equivalence
 - [`PHASE_2_CHECKPOINT.md`](PHASE_2_CHECKPOINT.md): ownership layout and unified workspace
 - [`PHASE_3_CHECKPOINT.md`](PHASE_3_CHECKPOINT.md): CI selection and release-train tooling
+- [`PHASE_4_CHECKPOINT.md`](PHASE_4_CHECKPOINT.md): explicit LLM/media composition and named runtime bundles
 
 The checkpoints record how the migration was executed and validated. The reasons
-for the repository and explicit media-registry decisions are recorded separately
+for the repository and explicit registry/bundle decisions are recorded separately
 in
 [`../architecture/inference-rearchitecture.md`](../architecture/inference-rearchitecture.md).

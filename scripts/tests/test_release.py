@@ -1,6 +1,7 @@
 import unittest
 
 from scripts.release.build_release import resolve_lock_dependency, spdx_id, validate_tag
+from scripts.release.verify_release import verify_workspace_manifest
 
 
 class ReleaseTests(unittest.TestCase):
@@ -31,6 +32,20 @@ class ReleaseTests(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             resolve_lock_dependency("same", packages)
+
+    def test_release_workspace_requires_named_runtime_bundles(self) -> None:
+        packages = [
+            {"name": name}
+            for name in ("runtime-catalog", "runtime-macos", "runtime-cuda", "runtime-cpu")
+        ]
+        verify_workspace_manifest(
+            {"workspace": {"package_count": len(packages), "packages": packages}}
+        )
+
+        with self.assertRaises(RuntimeError):
+            verify_workspace_manifest(
+                {"workspace": {"package_count": len(packages) + 1, "packages": packages}}
+            )
 
 
 if __name__ == "__main__":

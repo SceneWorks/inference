@@ -1,0 +1,12 @@
+[package]
+name = "runtime-catalog"
+version = "0.0.0"
+edition = "2021"
+description = "Tensor-neutral validated composition boundary shared by SceneWorks inference runtime bundles."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[dependencies]
+core-llm = { workspace = true }
+sceneworks-gen-core = { workspace = true }
+serde_json = { workspace = true }

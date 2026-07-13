@@ -62,6 +62,20 @@ def verify_sbom(bundle: Path, manifest: dict) -> None:
             raise RuntimeError(f"unknown relationship target: {relationship['relatedSpdxElement']}")
 
 
+def verify_workspace_manifest(manifest: dict) -> None:
+    workspace = manifest["workspace"]
+    packages = workspace["packages"]
+    if workspace["package_count"] != len(packages):
+        raise RuntimeError("workspace package count does not match its package inventory")
+    names = [package["name"] for package in packages]
+    if len(names) != len(set(names)):
+        raise RuntimeError("workspace package inventory contains duplicate names")
+    required = {"runtime-catalog", "runtime-macos", "runtime-cuda", "runtime-cpu"}
+    missing = sorted(required.difference(names))
+    if missing:
+        raise RuntimeError(f"release manifest is missing runtime packages: {missing}")
+
+
 def safe_members(archive: tarfile.TarFile, expected_prefix: str) -> list[tarfile.TarInfo]:
     members = archive.getmembers()
     expected_root = expected_prefix.rstrip("/")
@@ -131,8 +145,7 @@ def main() -> int:
     validate_tag(manifest["release"]["tag"])
     if manifest["release"]["dirty"] and not args.allow_dirty:
         raise RuntimeError("release manifest records dirty inputs")
-    if manifest["workspace"]["package_count"] != 69:
-        raise RuntimeError("release manifest does not contain the expected 69 workspace packages")
+    verify_workspace_manifest(manifest)
     verify_sbom(bundle, manifest)
     if not args.skip_smoke:
         smoke_source_archive(bundle, manifest, args.offline)

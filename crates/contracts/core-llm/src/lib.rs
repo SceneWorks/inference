@@ -66,7 +66,7 @@ pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use prepare::{
     detect_format, prepare_snapshot, snapshot_preparers, ModelFormat, PrepareReport, PrepareSpec,
-    SnapshotPreparerRegistration,
+    SnapshotPreparerRegistration, SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
 };
 pub use registry::{
     load_for_model, load_for_model_with, load_textllm, textllms, ModelRequirements,

@@ -108,6 +108,28 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             )
             continue
 
+        if _under(path, "crates/bundles/runtime-catalog"):
+            lanes.update(
+                candle_cpu=True,
+                macos_metal=True,
+                windows_cuda=True,
+                real_weights=True,
+                release=True,
+            )
+            continue
+
+        if _under(path, "crates/bundles/runtime-macos"):
+            lanes.update(macos_metal=True, real_weights=True, release=True)
+            continue
+
+        if _under(path, "crates/bundles/runtime-cpu"):
+            lanes.update(candle_cpu=True, real_weights=True, release=True)
+            continue
+
+        if _under(path, "crates/bundles/runtime-cuda"):
+            lanes.update(windows_cuda=True, real_weights=True, release=True)
+            continue
+
         if _under(path, "crates/llm/candle-llm") or _under(
             path, "crates/media/candle-gen"
         ):

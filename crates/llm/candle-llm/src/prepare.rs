@@ -353,14 +353,14 @@ fn copy_optional(src: &Path, out: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-// Register the candle snapshot preparer into core-llm's link-time registry.
-inventory::submit! {
-    SnapshotPreparerRegistration {
-        backend,
-        can_prepare,
-        prepare,
-    }
-}
+pub const REGISTRATION: SnapshotPreparerRegistration = SnapshotPreparerRegistration {
+    backend,
+    can_prepare,
+    prepare,
+};
+
+// Compatibility registration for consumers that have not adopted an explicit runtime bundle.
+inventory::submit! { REGISTRATION }
 
 #[cfg(test)]
 mod tests {

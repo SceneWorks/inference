@@ -167,6 +167,7 @@ pub struct PrepareReport {
 /// [`inventory::submit!`], exactly as they register a
 /// [`TextLlmRegistration`](crate::registry::TextLlmRegistration). Stored as `fn` pointers (not a
 /// trait object) because preparation is a stateless one-shot — there is no instance to hold.
+#[derive(Clone, Copy)]
 pub struct SnapshotPreparerRegistration {
     /// The backend tag for diagnostics (e.g. `"mlx"`, `"candle"`).
     pub backend: fn() -> &'static str,
@@ -178,6 +179,78 @@ pub struct SnapshotPreparerRegistration {
 }
 
 inventory::collect!(SnapshotPreparerRegistration);
+
+/// Builder for an ordinary, explicit snapshot-preparer registry.
+///
+/// Runtime bundles add exactly the backend preparers they ship. The process-global inventory
+/// remains only as a compatibility source for consumers that have not yet adopted a bundle.
+#[derive(Default)]
+pub struct SnapshotPreparerRegistryBuilder {
+    registrations: Vec<SnapshotPreparerRegistration>,
+}
+
+impl SnapshotPreparerRegistryBuilder {
+    /// Start an empty explicit registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a backend preparer, preserving insertion order for deterministic selection.
+    pub fn register(mut self, registration: SnapshotPreparerRegistration) -> Self {
+        self.registrations.push(registration);
+        self
+    }
+
+    /// Add several backend preparers in iterator order.
+    pub fn extend(
+        mut self,
+        registrations: impl IntoIterator<Item = SnapshotPreparerRegistration>,
+    ) -> Self {
+        self.registrations.extend(registrations);
+        self
+    }
+
+    /// Validate backend-name uniqueness and produce the immutable registry.
+    pub fn build(self) -> Result<SnapshotPreparerRegistry> {
+        let mut backends = std::collections::BTreeSet::new();
+        for registration in &self.registrations {
+            let backend = (registration.backend)();
+            if !backends.insert(backend) {
+                return Err(Error::Msg(format!(
+                    "duplicate snapshot preparer backend '{backend}' in explicit registry"
+                )));
+            }
+        }
+        Ok(SnapshotPreparerRegistry {
+            registrations: self.registrations.into_boxed_slice(),
+        })
+    }
+
+    /// Copy every currently linked inventory registration into an explicit registry.
+    pub fn from_inventory() -> Self {
+        Self::new().extend(snapshot_preparers().copied())
+    }
+}
+
+/// An immutable, explicit collection of snapshot preparers.
+pub struct SnapshotPreparerRegistry {
+    registrations: Box<[SnapshotPreparerRegistration]>,
+}
+
+impl SnapshotPreparerRegistry {
+    /// Iterate the registry in deterministic insertion order.
+    pub fn registrations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &SnapshotPreparerRegistration> {
+        self.registrations.iter()
+    }
+
+    /// Materialize a loadable snapshot through the first accepting bundled backend.
+    pub fn prepare_snapshot(&self, spec: &PrepareSpec) -> Result<PrepareReport> {
+        let registration = select_preparer(self.registrations(), spec)?;
+        (registration.prepare)(spec)
+    }
+}
 
 /// Iterate every registered snapshot preparer (link-time collected).
 pub fn snapshot_preparers() -> impl Iterator<Item = &'static SnapshotPreparerRegistration> {
@@ -381,6 +454,31 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_registry_routes_without_global_inventory() {
+        let registry = SnapshotPreparerRegistryBuilder::new()
+            .register(reg(mlx_tag, no))
+            .register(reg(candle_tag, yes))
+            .build()
+            .unwrap();
+        let report = registry
+            .prepare_snapshot(&PrepareSpec::dense("/some/model", "/out"))
+            .unwrap();
+        assert_eq!(report.num_tensors, 1);
+        assert_eq!(registry.registrations().len(), 2);
+    }
+
+    #[test]
+    fn explicit_registry_rejects_duplicate_backends() {
+        let error = SnapshotPreparerRegistryBuilder::new()
+            .register(reg(mlx_tag, no))
+            .register(reg(mlx_tag, yes))
+            .build()
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("duplicate snapshot preparer backend 'mlx'"));
     }
 
     #[test]

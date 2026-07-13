@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 70
+EXPECTED_MEMBER_COUNT = 74
 INTERNAL_PACKAGES = {
     "candle-gen-catalog",
     "core-llm",
@@ -22,6 +22,10 @@ INTERNAL_PACKAGES = {
     "candle-llm",
     "sceneworks-gen-core",
     "sceneworks-gen-core-testkit",
+    "runtime-catalog",
+    "runtime-macos",
+    "runtime-cpu",
+    "runtime-cuda",
 }
 PINNED_WORKSPACE_DEPENDENCIES = {
     "mlx-rs": ("pmetal-mlx-rs", "38e1cc1730a11b1e40c2c8ecda01606763a12d51"),

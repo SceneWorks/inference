@@ -5,6 +5,7 @@ members = [
     "crates/contracts/core-llm/core-llm-testkit",
     "crates/contracts/gen-core",
     "crates/contracts/gen-core-testkit",
+    "crates/bundles/*",
     "crates/llm/candle-llm",
     "crates/llm/mlx-llm",
     "crates/llm/mlx-llm/server",
@@ -25,6 +26,9 @@ mlx-llm = { path = "crates/llm/mlx-llm" }
 candle-llm = { path = "crates/llm/candle-llm" }
 sceneworks-gen-core = { path = "crates/contracts/gen-core" }
 sceneworks-gen-core-testkit = { path = "crates/contracts/gen-core-testkit" }
+runtime-catalog = { path = "crates/bundles/runtime-catalog" }
+mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
+candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 
 # MLX fork pins are unchanged from the imported repositories.
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "38e1cc1730a11b1e40c2c8ecda01606763a12d51" }
