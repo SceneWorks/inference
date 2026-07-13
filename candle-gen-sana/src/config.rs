@@ -22,7 +22,12 @@ pub struct DcAeConfig {
     pub latent_channels: i32,
     pub attention_head_dim: i32,
     pub block_out_channels: Vec<i32>,
+    /// **Decoder** blocks per stage (`decoder_layers_per_block`). The encoder is not symmetric — it
+    /// carries fewer blocks in the shallow stages — so it has its own [`Self::encoder_layers_per_block`].
     pub layers_per_block: Vec<i32>,
+    /// **Encoder** blocks per stage (`encoder_layers_per_block`, distinct from the decoder's — SANA-1.0
+    /// is `[2,2,2,3,3,3]` encode vs `[3,3,3,3,3,3]` decode).
+    pub encoder_layers_per_block: Vec<i32>,
     pub block_types: Vec<BlockType>,
     /// One `kernel_size` per multiscale QKV projection in the EfficientViT stages (`[5]` for SANA-1.0).
     pub qkv_multiscales: Vec<i32>,
@@ -45,6 +50,7 @@ impl DcAeConfig {
             attention_head_dim: 32,
             block_out_channels: vec![128, 256, 512, 512, 1024, 1024],
             layers_per_block: vec![3, 3, 3, 3, 3, 3],
+            encoder_layers_per_block: vec![2, 2, 2, 3, 3, 3],
             block_types: vec![R, R, R, E, E, E],
             qkv_multiscales: vec![5],
             norm_eps: 1e-5,
@@ -66,6 +72,7 @@ impl DcAeConfig {
             attention_head_dim: 8,
             block_out_channels: vec![16, 16, 32, 32],
             layers_per_block: vec![1, 1, 1, 1],
+            encoder_layers_per_block: vec![1, 1, 1, 1],
             block_types: vec![R, R, R, E],
             qkv_multiscales: vec![3],
             norm_eps: 1e-5,
