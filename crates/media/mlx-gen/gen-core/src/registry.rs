@@ -17,6 +17,7 @@ use crate::{Error, Result};
 
 /// A generator provider's registration — `descriptor` for introspection (no weights loaded),
 /// `load` to construct the model. ≈ `services.AddKeyedSingleton<IGenerator>("id", factory)`.
+#[derive(Clone, Copy)]
 pub struct ModelRegistration {
     pub descriptor: fn() -> ModelDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn Generator>>,
@@ -25,6 +26,7 @@ pub struct ModelRegistration {
 inventory::collect!(ModelRegistration);
 
 /// A transform provider's registration (parallel to [`ModelRegistration`]).
+#[derive(Clone, Copy)]
 pub struct TransformRegistration {
     pub descriptor: fn() -> TransformDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn Transform>>,
@@ -34,6 +36,7 @@ inventory::collect!(TransformRegistration);
 
 /// A trainer provider's registration (parallel to [`ModelRegistration`]) — `descriptor` for
 /// introspection, `load` to construct the trainer with its (frozen) base model from a [`LoadSpec`].
+#[derive(Clone, Copy)]
 pub struct TrainerRegistration {
     pub descriptor: fn() -> TrainerDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn Trainer>>,
@@ -42,6 +45,7 @@ pub struct TrainerRegistration {
 inventory::collect!(TrainerRegistration);
 
 /// A captioner provider's registration (parallel to [`ModelRegistration`]).
+#[derive(Clone, Copy)]
 pub struct CaptionerRegistration {
     pub descriptor: fn() -> CaptionerDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn Captioner>>,
@@ -52,6 +56,7 @@ inventory::collect!(CaptionerRegistration);
 /// An image-embedder provider's registration (parallel to [`ModelRegistration`]). Unlike
 /// `FaceEmbedder` — a directly-constructed utility — image embedders self-register so the worker's
 /// `dataset_analysis` job can `load_image_embedder(id, spec)` by id, exactly like captioners.
+#[derive(Clone, Copy)]
 pub struct ImageEmbedderRegistration {
     pub descriptor: fn() -> ImageEmbedderDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn ImageEmbedder>>,
@@ -61,12 +66,189 @@ inventory::collect!(ImageEmbedderRegistration);
 
 /// A text-embedder provider's registration (parallel to [`ImageEmbedderRegistration`]). Used by the
 /// worker's `dataset_analysis` job for caption/image alignment in CLIP's joint space.
+#[derive(Clone, Copy)]
 pub struct TextEmbedderRegistration {
     pub descriptor: fn() -> TextEmbedderDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn TextEmbedder>>,
 }
 
 inventory::collect!(TextEmbedderRegistration);
+
+/// Builder for an ordinary, explicit generative-media provider registry.
+///
+/// Platform bundles add exactly the registrations they ship. The inventory-backed global
+/// functions below remain available during cutover, and [`from_inventory`](Self::from_inventory)
+/// provides a parity bridge without making link-time discovery the long-term source of truth.
+#[derive(Default)]
+pub struct ProviderRegistryBuilder {
+    generators: Vec<ModelRegistration>,
+    transforms: Vec<TransformRegistration>,
+    trainers: Vec<TrainerRegistration>,
+    captioners: Vec<CaptionerRegistration>,
+    image_embedders: Vec<ImageEmbedderRegistration>,
+    text_embedders: Vec<TextEmbedderRegistration>,
+}
+
+macro_rules! builder_registration_method {
+    ($name:ident, $field:ident, $registration:ty) => {
+        pub fn $name(mut self, registration: $registration) -> Self {
+            self.$field.push(registration);
+            self
+        }
+    };
+}
+
+impl ProviderRegistryBuilder {
+    /// Start an empty explicit registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    builder_registration_method!(register_generator, generators, ModelRegistration);
+    builder_registration_method!(register_transform, transforms, TransformRegistration);
+    builder_registration_method!(register_trainer, trainers, TrainerRegistration);
+    builder_registration_method!(register_captioner, captioners, CaptionerRegistration);
+    builder_registration_method!(
+        register_image_embedder,
+        image_embedders,
+        ImageEmbedderRegistration
+    );
+    builder_registration_method!(
+        register_text_embedder,
+        text_embedders,
+        TextEmbedderRegistration
+    );
+
+    /// Copy every currently linked inventory registration into an explicit registry.
+    pub fn from_inventory() -> Self {
+        Self {
+            generators: generators().copied().collect(),
+            transforms: transforms().copied().collect(),
+            trainers: trainers().copied().collect(),
+            captioners: captioners().copied().collect(),
+            image_embedders: image_embedders().copied().collect(),
+            text_embedders: text_embedders().copied().collect(),
+        }
+    }
+
+    /// Validate per-kind id uniqueness and produce the immutable registry.
+    pub fn build(self) -> Result<ProviderRegistry> {
+        macro_rules! ensure_unique {
+            ($field:ident, $kind:literal) => {{
+                let mut ids = std::collections::BTreeSet::new();
+                for registration in &self.$field {
+                    let id = (registration.descriptor)().id;
+                    if !ids.insert(id) {
+                        return Err(Error::Msg(format!(
+                            concat!("duplicate ", $kind, " id '{id}' in explicit registry"),
+                            id = id
+                        )));
+                    }
+                }
+            }};
+        }
+        ensure_unique!(generators, "generator");
+        ensure_unique!(transforms, "transform");
+        ensure_unique!(trainers, "trainer");
+        ensure_unique!(captioners, "captioner");
+        ensure_unique!(image_embedders, "image embedder");
+        ensure_unique!(text_embedders, "text embedder");
+
+        Ok(ProviderRegistry {
+            generators: self.generators.into_boxed_slice(),
+            transforms: self.transforms.into_boxed_slice(),
+            trainers: self.trainers.into_boxed_slice(),
+            captioners: self.captioners.into_boxed_slice(),
+            image_embedders: self.image_embedders.into_boxed_slice(),
+            text_embedders: self.text_embedders.into_boxed_slice(),
+        })
+    }
+}
+
+/// An immutable, explicit catalog of generative-media providers.
+pub struct ProviderRegistry {
+    generators: Box<[ModelRegistration]>,
+    transforms: Box<[TransformRegistration]>,
+    trainers: Box<[TrainerRegistration]>,
+    captioners: Box<[CaptionerRegistration]>,
+    image_embedders: Box<[ImageEmbedderRegistration]>,
+    text_embedders: Box<[TextEmbedderRegistration]>,
+}
+
+macro_rules! explicit_registry_kind {
+    (
+        $iter:ident, $load:ident, $field:ident, $registration:ty,
+        $kind:literal, $trait:ty
+    ) => {
+        pub fn $iter(&self) -> impl ExactSizeIterator<Item = &$registration> {
+            self.$field.iter()
+        }
+
+        pub fn $load(&self, id: &str, spec: &LoadSpec) -> Result<Box<$trait>> {
+            let registration = self
+                .$iter()
+                .find(|registration| (registration.descriptor)().id == id)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        concat!("no ", $kind, " registered for id '{id}'"),
+                        id = id
+                    ))
+                })?;
+            (registration.load)(spec)
+        }
+    };
+}
+
+impl ProviderRegistry {
+    explicit_registry_kind!(
+        generators,
+        load,
+        generators,
+        ModelRegistration,
+        "generator",
+        dyn Generator
+    );
+    explicit_registry_kind!(
+        transforms,
+        load_transform,
+        transforms,
+        TransformRegistration,
+        "transform",
+        dyn Transform
+    );
+    explicit_registry_kind!(
+        trainers,
+        load_trainer,
+        trainers,
+        TrainerRegistration,
+        "trainer",
+        dyn Trainer
+    );
+    explicit_registry_kind!(
+        captioners,
+        load_captioner,
+        captioners,
+        CaptionerRegistration,
+        "captioner",
+        dyn Captioner
+    );
+    explicit_registry_kind!(
+        image_embedders,
+        load_image_embedder,
+        image_embedders,
+        ImageEmbedderRegistration,
+        "image embedder",
+        dyn ImageEmbedder
+    );
+    explicit_registry_kind!(
+        text_embedders,
+        load_text_embedder,
+        text_embedders,
+        TextEmbedderRegistration,
+        "text embedder",
+        dyn TextEmbedder
+    );
+}
 
 /// All registered generators (one per linked provider crate).
 pub fn generators() -> impl Iterator<Item = &'static ModelRegistration> {
@@ -693,6 +875,46 @@ mod tests {
         let g = load("dummy_test_model", &spec).expect("dummy is registered");
         assert_eq!(g.descriptor().id, "dummy_test_model");
         assert_eq!(g.descriptor().modality, Modality::Image);
+    }
+
+    #[test]
+    fn explicit_registry_resolves_without_global_inventory() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: dummy_descriptor,
+                load: dummy_load,
+            })
+            .build()
+            .unwrap();
+        assert_eq!(registry.generators().len(), 1);
+        let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/tmp")));
+        assert_eq!(
+            registry
+                .load("dummy_test_model", &spec)
+                .unwrap()
+                .descriptor()
+                .id,
+            "dummy_test_model"
+        );
+        assert!(registry.trainers().next().is_none());
+    }
+
+    #[test]
+    fn explicit_registry_rejects_duplicate_ids_deterministically() {
+        let registration = ModelRegistration {
+            descriptor: dummy_descriptor,
+            load: dummy_load,
+        };
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(registration)
+            .register_generator(registration)
+            .build()
+            .err()
+            .expect("duplicate registry must fail");
+        assert_eq!(
+            error.to_string(),
+            "duplicate generator id 'dummy_test_model' in explicit registry"
+        );
     }
 
     #[test]

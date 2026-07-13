@@ -48,8 +48,8 @@ pub use json_constraint::JsonState;
 pub use media::{AudioTrack, Image};
 pub use registry::{
     load, load_captioner, load_image_embedder, load_text_embedder, load_transform,
-    CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, TextEmbedderRegistration,
-    TransformRegistration,
+    CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, ProviderRegistry,
+    ProviderRegistryBuilder, TextEmbedderRegistration, TransformRegistration,
 };
 pub use registry::{load_trainer, TrainerRegistration};
 pub use runtime::{
