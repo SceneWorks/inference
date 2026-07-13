@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut on_progress = |p: Progress| match p {
         Progress::Step { current, total } => eprintln!("  step {current}/{total}"),
         Progress::Decoding => eprintln!("  decoding…"),
+        Progress::Loading(phase) => eprintln!("  loading {phase:?}"),
     };
 
     let base_req = GenerationRequest {

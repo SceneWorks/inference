@@ -157,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Progress::Decoding => println!("  decoding ({:.1}s)", t0.elapsed().as_secs_f32()),
+        Progress::Loading(phase) => println!("  loading {phase:?}"),
     };
 
     let GenerationOutput::Images(images) = gen.generate(&req, &mut on_progress)? else {

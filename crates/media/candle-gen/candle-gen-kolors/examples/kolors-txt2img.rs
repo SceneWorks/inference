@@ -97,6 +97,7 @@ fn main() -> Result<()> {
             let _ = std::io::stdout().flush();
         }
         Progress::Decoding => println!("\n[smoke] decoding"),
+        Progress::Loading(phase) => println!("\n[smoke] loading {phase:?}"),
     };
     let t_call = std::time::Instant::now();
     let output = gen.generate(&req, &mut on_progress)?;

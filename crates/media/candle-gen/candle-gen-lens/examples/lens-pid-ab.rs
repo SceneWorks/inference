@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut op = |p: Progress| match p {
         Progress::Step { current, total } => eprintln!("  step {current}/{total}"),
         Progress::Decoding => eprintln!("  decoding…"),
+        Progress::Loading(phase) => eprintln!("  loading {phase:?}"),
     };
     let req = GenerationRequest {
         prompt,

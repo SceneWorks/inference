@@ -146,6 +146,7 @@ fn main() -> Result<()> {
             let _ = std::io::stdout().flush();
         }
         Progress::Decoding => println!("\n[smoke] decoding"),
+        Progress::Loading(phase) => println!("\n[smoke] loading {phase:?}"),
     };
     let t0 = std::time::Instant::now();
     let gen_phase = probe.as_ref().map(|p| p.phase());
