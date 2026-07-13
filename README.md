@@ -13,7 +13,8 @@ paths and normalized them under one Cargo workspace and lockfile. Phase 3 now
 provides dependency-aware CI selection, supply-chain policy, immutable real-weight
 fixture pins, and deterministic source/SBOM release tooling.
 Phase 4 adds validated `runtime-macos`, `runtime-cuda`, and `runtime-cpu` composition boundaries for
-explicit media, LLM, and snapshot-preparation catalogs.
+explicit media, LLM, and snapshot-preparation catalogs; the former link-time provider registries
+have been removed. Phase 5 is the immutable release and final product-pin validation.
 
 The current authoritative migration plan and release-set baseline live in the
 SceneWorks repository under `documents/rearchitecture/`.

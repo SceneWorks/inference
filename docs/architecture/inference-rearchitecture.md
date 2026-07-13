@@ -11,16 +11,15 @@ SceneWorks inference is maintained as one history-preserving repository with one
 Cargo workspace, one lockfile, and explicit ownership boundaries for contracts,
 engines, provider families, and platform catalogs.
 
-Generative-media providers are composed explicitly. Provider crates publish named
-registration constants, each family exposes a `register_providers` function, and
-the MLX and Candle catalog crates enumerate the families shipped by their
-platform. Applications construct a `ProviderRegistry` from one of those platform
-catalogs and route discovery and loading through that value.
+Generative-media and LLM providers are composed explicitly. Provider crates
+publish named registration constants, family and engine crates expose builder
+functions, and the MLX and Candle catalog crates enumerate the providers shipped
+by their platform. Applications construct ordinary registry values from a named
+runtime bundle and route discovery and loading through those values.
 
-This replaces the former media `inventory` registry, global loading facade, and
-force-link compatibility anchors. The LLM engines also expose explicit catalogs,
-but their inventory-based compatibility path is intentionally outside this
-decision and remains until its consumers are migrated in a separate change.
+This replaces the former media and LLM `inventory` registries, global loading
+facades, and force-link compatibility anchors. There is no process-global
+provider-discovery state in the supported runtime graph.
 
 ## Context
 
@@ -65,7 +64,7 @@ The rearchitecture was intended to:
 1. Make a contract change and its backend adaptations atomic and reviewable.
 2. Give a checkout exactly one internal dependency graph and one lockfile.
 3. Preserve backend-neutral contracts and independent MLX/Candle implementations.
-4. Make each shipped media provider surface explicit, deterministic, inspectable,
+4. Make each shipped media and LLM provider surface explicit, deterministic, inspectable,
    and testable without loading model weights.
 5. Detect duplicate IDs and malformed descriptors at registry construction or in
    weights-free conformance tests.
@@ -85,8 +84,8 @@ The change was not intended to:
 - upgrade backend revisions, tokenizer versions, or public request schemas as a
   side effect of consolidation;
 - make `--workspace --all-features` a universal cross-platform build mode;
-- remove the LLM inventory registry before its own consumers and compatibility
-  requirements have been evaluated.
+- redesign model implementations or serialized request/response contracts as a
+  side effect of composition cleanup.
 
 The monorepo is a shared change and validation boundary, not a monolith.
 
@@ -191,9 +190,11 @@ provider graph. This is a composition profile of the same platform release, not 
 return to separately pinned backend crates.
 
 The LLM engines export ordinary builder functions for provider and preparer
-registrations. This gives model-first loading and snapshot preparation the same
-explicit ownership model as media generation. The older process-global LLM APIs
-remain only as temporary cutover adapters.
+registrations, plus backend-scoped convenience loaders implemented on those
+builders. This gives model-first loading and snapshot preparation the same
+explicit ownership model as media generation. The former process-global LLM APIs
+and linker submissions were removed after both product consumers adopted named
+runtime catalogs.
 
 The bundle names are also CI and release profile names. MLX, CUDA, and CPU are
 not additive features of one universal build, so `--workspace --all-features`
@@ -279,6 +280,8 @@ consumer had an explicit replacement:
    explicit registries.
 5. Remove media inventory submissions, global loaders, force-link anchors, and
    unused dependency edges only after the explicit path was complete.
+6. Cut SceneWorks and ChatWorks to named runtime catalogs, then remove the
+   equivalent LLM compatibility adapter before freezing the release tag.
 
 The implementation begins with the explicit media registry in `4f81dbcf`,
 composes the platform catalogs in `5401a056`, and completes compatibility removal
@@ -291,7 +294,7 @@ Future inference work should preserve these rules:
 
 - backend-neutral contracts do not depend on MLX or Candle tensor types;
 - internal SceneWorks dependencies use workspace paths, not repository SHA pins;
-- media provider registration is explicit—do not add `inventory` submissions or
+- provider registration is explicit—do not add `inventory` submissions or
   `force_link` anchors as a shortcut;
 - every shipped family is named in its platform catalog;
 - every supported product consumes one named runtime bundle rather than assembling
@@ -301,11 +304,11 @@ Future inference work should preserve these rules:
 - duplicate provider IDs fail registry construction;
 - complete platform surfaces and descriptor conformance remain weights-free test
   gates;
-- consumers load through a registry value, not a process-global media facade;
+- consumers load through registry values, not process-global facades;
 - differences between MLX and Candle catalogs are allowed when they represent
   real implementation differences and are pinned explicitly in tests;
-- the LLM inventory compatibility adapter is temporary cutover infrastructure,
-  not a supported composition boundary or precedent for new registration.
+- backend-scoped convenience loaders must derive their registry from explicit
+  registration functions and must not introduce hidden mutable or linker state.
 
 ## Validation and outcome
 
@@ -316,12 +319,10 @@ migration revision with:
   MLX/Candle media provider library and test targets;
 - exact platform-catalog surface and descriptor-conformance tests;
 - `cargo test --locked --workspace --lib --tests`;
-- source audits confirming no legacy global media loaders, anonymous media
-  registrations, or force-link paths for the media registry remain; the LLM
-  inventory submissions are tracked compatibility adapters pending consumer
-  cutover;
-- a clean lockfile diff removing the obsolete media `inventory` dependency
-  edges.
+- source audits confirming no legacy global provider loaders, anonymous
+  registrations, or force-link paths remain;
+- a clean lockfile diff removing every `inventory` dependency edge from the
+  canonical workspace.
 
 The resulting architecture does not promise that all provider implementations
 are identical or that platform work is cheap. It makes the shipped graph and the
@@ -336,6 +337,6 @@ or if workspace scale can no longer be handled by dependency-aware CI. Any such
 change should preserve an inspectable composition root, deterministic catalog
 membership, duplicate-ID validation, and weights-free conformance checks.
 
-Remove the LLM inventory adapter only after SceneWorks and ChatWorks consume the
-explicit registries from an immutable runtime release and the documented rollback
-point no longer depends on link-time discovery.
+If a future compatibility layer is needed, implement it over an explicit registry
+owned by the caller or named runtime bundle. Do not restore process-global or
+linker-discovered composition.

@@ -14,8 +14,9 @@
 
 use candle_llm::provider::{can_load, PROVIDER_ID};
 use candle_llm::LlamaProvider;
+use candle_llm::load_for_model;
 use core_llm::{
-    load_for_model, Channel, LoadSpec, Message, Quantize, Sampling, StreamEvent, TextLlm,
+    Channel, LoadSpec, Message, Quantize, Sampling, StreamEvent, TextLlm,
     TextLlmOutput, TextLlmRequest, ThinkingMode,
 };
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};

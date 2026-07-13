@@ -1,12 +1,12 @@
-//! `core-llm` — the backend-neutral contract, host policy, and provider registry for an on-device
+//! `core-llm` — the backend-neutral contract, host policy, and explicit provider registry for an on-device
 //! LLM serving engine.
 //!
 //! This crate is deliberately **tensor-free** and **gen-ai-free**: it builds standalone on Linux,
 //! Windows, and macOS, and depends on nothing from any tensor backend or image-generation stack.
 //! Tensor backends — [`mlx-llm`](https://github.com/SceneWorks/mlx-llm) (Apple MLX) and
 //! [`candle-llm`](https://github.com/SceneWorks/candle-llm) (Candle) — implement [`TextLlm`] and
-//! register through the [`registry`]; consumers select a provider and stream a generation entirely
-//! through this contract.
+//! expose registrations that a runtime bundle composes through the [`registry`]; consumers select a
+//! provider and stream a generation entirely through this contract.
 //!
 //! The contract was **extracted from the working mlx-llm engine** (epic 7153, story 7154), not
 //! designed in a vacuum, and is provisional until `candle-llm` validates it.
@@ -30,11 +30,12 @@
 //! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
 //! - [`speculative`] — backend-neutral speculative-decoding policy (n-gram proposer + distribution-
 //!   preserving acceptance sampler).
-//! - [`registry`] — link-time provider registration, id-based routing, and **model-first**
-//!   resolution ([`load_for_model`] / [`ModelRequirements`] over a weightless `can_load` probe).
-//! - [`prepare_snapshot`] — persisted, backend-neutral snapshot preparation: turn a downloaded
-//!   HF-safetensors or GGUF source into a loadable, optionally-quantized snapshot, delegating the
-//!   tensor work to the linked backend ([`PrepareSpec`] / [`SnapshotPreparerRegistration`]).
+//! - [`registry`] — explicit provider composition, id-based routing, and **model-first** resolution
+//!   ([`TextLlmRegistry::load_for_model`] / [`ModelRequirements`] over a weightless `can_load`
+//!   probe).
+//! - [`SnapshotPreparerRegistry::prepare_snapshot`] — persisted, backend-neutral snapshot
+//!   preparation: turn a downloaded HF-safetensors or GGUF source into a loadable,
+//!   optionally-quantized snapshot, delegating tensor work to a selected backend.
 
 pub mod cancel;
 pub mod capabilities;
@@ -65,12 +66,11 @@ pub use output::{Channel, FinishReason, StreamEvent, TextLlmOutput, Usage};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use prepare::{
-    detect_format, prepare_snapshot, snapshot_preparers, ModelFormat, PrepareReport, PrepareSpec,
-    SnapshotPreparerRegistration, SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
+    detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
+    SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
 };
 pub use registry::{
-    load_for_model, load_for_model_with, load_textllm, textllms, ModelRequirements,
-    TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
+    ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
 pub use schedule::{Scheduler, SeqId, SeqSpec};

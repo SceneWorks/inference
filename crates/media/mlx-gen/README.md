@@ -23,14 +23,14 @@ Requires a Mac with full Xcode + the Metal Toolchain (MLX's Metal kernels compil
 ## Usage
 
 mlx-gen is a Rust library workspace consumed in-process. Each model family lives in its own
-provider crate that self-registers into the core `mlx-gen` registry at link time — so you depend
-on `mlx-gen` plus whichever provider crates you want, then resolve models by id:
+provider crate and exports an explicit registry builder. Depend on `mlx-gen` plus the provider
+families you want, then construct and query the exact catalog you intend to ship:
 
 ```toml
 # Cargo.toml
 [dependencies]
-mlx-gen = { git = "https://github.com/michaeltrefry/mlx-gen" }
-mlx-gen-z-image = { git = "https://github.com/michaeltrefry/mlx-gen" }
+mlx-gen = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.07.0" }
+mlx-gen-z-image = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.07.0" }
 ```
 
 ```rust

@@ -13,7 +13,8 @@
 //! check. Loading goes through the registered `mlx-llama` provider, whose descriptor family reflects
 //! the architecture `config.json` dispatched to (the breadth lives behind one generic provider).
 
-use core_llm::{load_textllm, LoadSpec, Message, Sampling, StreamEvent, TextLlmRequest};
+use core_llm::{LoadSpec, Message, Sampling, StreamEvent, TextLlmRequest};
+use mlx_llm::load_textllm;
 use mlx_llm::provider::PROVIDER_ID;
 
 /// Load the snapshot at `$env` through the `mlx-llama` provider, check its reported family tag, and

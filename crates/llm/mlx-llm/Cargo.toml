@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 description = "On-device text + vision LLM serving engine for Apple MLX (work in progress)."
 license = "Apache-2.0"
-repository = "https://github.com/SceneWorks/mlx-llm"
+repository = "https://github.com/SceneWorks/inference"
 readme = "README.md"
 keywords = ["mlx", "apple-silicon", "llm", "inference", "serving"]
 categories = ["science"]
@@ -23,12 +23,8 @@ categories = ["science"]
 # pmetal build can't shadow the current build's kernels (small-M bm64 GEMM panic). Kept in lock-step
 # with mlx-gen's pin so the two still build ONE mlx-rs.
 mlx-rs = { workspace = true }
-# The backend-neutral contract this crate implements. The root workspace path is
-# load-bearing: every provider must register into the same core-llm package.
+# The backend-neutral contract this crate implements.
 core-llm = { workspace = true }
-# Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
-# inventory so the distributed slice links.
-inventory = { workspace = true }
 # Error plumbing for the engine surface.
 thiserror = { workspace = true }
 # config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-gen convention.

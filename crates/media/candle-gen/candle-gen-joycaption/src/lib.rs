@@ -34,11 +34,6 @@ use candle_gen::gen_core::{
 
 use prompt::{build_prompt, capabilities, JOY_CAPTION_FAMILY, JOY_CAPTION_MODEL_ID, SYSTEM_PROMPT};
 
-// Force-link the candle-llm engine so the `candle-llava` provider's `inventory::submit!` into
-// core-llm's registry survives the linker — this crate resolves the provider through
-// `core_llm::load_for_model_with` and never names another candle-llm symbol.
-use candle_llm as _;
-
 /// The JoyCaption captioner descriptor (candle backend; not mac-only).
 pub fn descriptor() -> CaptionerDescriptor {
     CaptionerDescriptor {
@@ -83,7 +78,9 @@ pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaptioner> {
 
     // Model-first resolution: the `candle-llava` vision provider's weightless `can_load` claims the
     // LLaVA snapshot; `with_vision()` disambiguates it from any text-only provider.
-    let provider = core_llm::load_for_model_with(
+    let provider = candle_llm::text_registry()
+        .map_err(map_core_err)?
+        .load_for_model_with(
         &CoreLoadSpec {
             source: root.to_string_lossy().into_owned(),
             quantize: None,

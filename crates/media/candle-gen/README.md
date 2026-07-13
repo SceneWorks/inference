@@ -2,15 +2,15 @@
 
 Rust-native generative image (and, later, video) model inference on
 [candle](https://github.com/huggingface/candle) — the **Windows/CUDA sibling** of
-[`mlx-gen`](https://github.com/michaeltrefry/mlx-gen) (Apple MLX). Both crates implement the **same**
-backend-neutral [`gen_core`](https://github.com/michaeltrefry/mlx-gen/tree/main/gen-core) contract
-(SceneWorks epic 3720), so a consumer pins one backend by git SHA, links its provider crates, and
-calls the identical `Generator` / registry API regardless of which tensor backend is underneath.
+[`mlx-gen`](../mlx-gen/README.md) (Apple MLX). Both crates implement the **same** backend-neutral
+[`gen_core`](../../contracts/gen-core) contract (SceneWorks epic 3720), so a consumer selects one
+named runtime bundle and calls the identical `Generator` / registry API regardless of which tensor
+backend is underneath.
 
 > **Status: a maturing multi-family engine on the Candle/CUDA lane.** candle-gen now hosts **20+
-> registered model families** across image and video, plus a captioner, text/image embedders, and
-> host-side conditioning utilities — every provider self-registers into the shared `gen_core` inventory
-> registry (`candle_gen::register_*!`), keeps the deterministic CPU-seeded-noise contract
+> cataloged model families** across image and video, plus a captioner, text/image embedders, and
+> host-side conditioning utilities — every provider publishes an ordinary registration value that
+> `candle-gen-catalog` composes explicitly, keeps the deterministic CPU-seeded-noise contract
 > (launch-portable per seed), and rides the `CandleError → gen_core::Error` bridge. The families below
 > are GPU-validated on an RTX PRO 6000 (Blackwell **sm_120**). The core `candle-gen` crate supplies the
 > shared device/dtype seam, weight loaders, seeded noise, the unified sampler/scheduler framework (epic
@@ -117,10 +117,11 @@ candle-gen/                 # workspace root
   .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test; manual Windows/CUDA lane
 ```
 
-A provider crate self-registers just by being linked (`candle_gen::register_*!` → `inventory::submit!`),
-so adding a model is purely additive — there is no central match statement to edit. Each crate submits
-one or more `ModelDescriptor`s under a stable engine id (e.g. `candle-gen-sdxl` registers `"sdxl"`, which
-the SceneWorks worker maps both `sdxl` and `realvisxl` onto), all with `backend: "candle"`.
+A provider crate publishes one or more named registration constants and a `register_providers`
+builder function. `candle-gen-catalog` intentionally enumerates every family in the supported
+Candle surface, making platform inclusion visible in review and exact-surface tests. Stable engine
+ids are unchanged (e.g. `candle-gen-sdxl` exposes `"sdxl"`, which the SceneWorks worker maps both
+`sdxl` and `realvisxl` onto), and every descriptor reports `backend: "candle"`.
 
 ## Backends / features
 
@@ -238,11 +239,10 @@ the driver requirement.
 
 ## gen-core pinning (read before bumping)
 
-`sceneworks-gen-core` is pinned by **git SHA** in the root `Cargo.toml`
-(`[workspace.dependencies]`) to the **same rev the SceneWorks worker pins**. Everything is
-SHA-pinned: if candle-gen resolves gen-core at rev A while the worker resolves rev B, cargo silently
-builds **both**, the provider crate registers into one `inventory` registry while the worker queries
-the other, and the symptom is **"engine not found" at runtime** (not a compile error). Run the gate:
+`sceneworks-gen-core` is a path dependency in the canonical workspace and must resolve exactly once
+in every product graph. Two releases silently create two contract type identities and two copies of
+host policy; explicit registries prevent hidden discovery, but duplicated contracts remain an
+unsupported and drift-prone graph. Run the gate:
 
 ```bash
 bash scripts/check-gen-core-skew.sh            # checks candle-gen's build graph

@@ -8,7 +8,7 @@
 //!
 //! # Usage
 //! A backend's tests dev-depend on this crate and hand the entrypoint a closure that loads a
-//! registered provider:
+//! provider:
 //!
 //! ```ignore
 //! core_llm_testkit::textllm_conformance(
@@ -22,8 +22,8 @@
 //! with a combined message.
 
 use core_llm::{
-    load_for_model, prepare_snapshot, Channel, Content, Error, FinishReason, ImageRef, LoadSpec,
-    Message, PrepareSpec, Quantize, Role, Sampling, StreamEvent, TextLlm, TextLlmRequest,
+    Channel, Content, Error, FinishReason, ImageRef, LoadSpec, Message, PrepareSpec, Quantize, Role,
+    Sampling, SnapshotPreparerRegistry, StreamEvent, TextLlm, TextLlmRegistry, TextLlmRequest,
     ThinkingMode, ToolSpec, VideoRef, VERSION,
 };
 use std::path::PathBuf;
@@ -169,7 +169,7 @@ pub fn textllm_conformance(make: impl Fn() -> Box<dyn TextLlm>, profile: &TextLl
             failures.push(e);
         }
     }
-    for r in [check_descriptor(p), check_cancellation(p, profile), check_registry(p)] {
+    for r in [check_descriptor(p), check_cancellation(p, profile)] {
         if let Err(e) = r {
             failures.push(e);
         }
@@ -194,19 +194,6 @@ pub fn check_descriptor(p: &dyn TextLlm) -> Result<(), String> {
         return Err(format!("check_descriptor[{}]: backend is empty", d.id));
     }
     Ok(())
-}
-
-/// The provider's id is discoverable through the registry (i.e. it was registered + linked).
-pub fn check_registry(p: &dyn TextLlm) -> Result<(), String> {
-    let id = &p.descriptor().id;
-    if core_llm::textllms().any(|r| &(r.descriptor)().id == id) {
-        Ok(())
-    } else {
-        Err(format!(
-            "check_registry[{id}]: id not discoverable via core_llm::textllms() — was the provider \
-             registered with inventory::submit! and linked into the test binary? (core-llm {VERSION})"
-        ))
-    }
 }
 
 /// `validate` is honest: it accepts the base request and rejects things outside declared caps.
@@ -633,9 +620,10 @@ pub fn check_tools(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), Stri
     Ok(())
 }
 
-/// Profile for the snapshot-preparer conformance check: a real model `source` the linked backend can
-/// prepare and then load, a writable `out_dir` the test owns, and the `quantize` scheme to exercise
-/// (`None` covers the dense / passthrough path; `Some(_)` exercises persisted re-quantization).
+/// Profile for the snapshot-preparer conformance check: a real model `source` the selected backend
+/// can prepare and then load, a writable `out_dir` the test owns, and the `quantize` scheme to
+/// exercise (`None` covers the dense / passthrough path; `Some(_)` exercises persisted
+/// re-quantization).
 #[derive(Clone, Debug)]
 pub struct SnapshotPreparerProfile {
     /// A downloaded model the linked backend can prepare (an HF-safetensors dir or a `*.gguf`).
@@ -646,23 +634,27 @@ pub struct SnapshotPreparerProfile {
     pub quantize: Option<Quantize>,
 }
 
-/// Drive the registered snapshot preparer through the contract's guarantees end-to-end on a real
-/// fixture: [`prepare_snapshot`](core_llm::prepare_snapshot) materializes a persisted snapshot from
+/// Drive an explicit snapshot-preparer and text-provider registry through the contract's guarantees
+/// end-to-end on a real fixture. The preparer materializes a persisted snapshot from
 /// `profile.source` whose [`PrepareReport`](core_llm::PrepareReport) is self-consistent and whose
-/// `out_dir` [`load_for_model`](core_llm::load_for_model) can load, and an unrecognized source is a
-/// typed [`Error::Unsupported`] rather than a panic.
+/// `out_dir` the text registry can load; an unrecognized source is a typed [`Error::Unsupported`]
+/// rather than a panic.
 ///
 /// This is **not** part of the always-on [`textllm_conformance`] run — it needs a model on disk and
 /// both a preparer and a provider linked, so a backend's tests call it directly behind their
 /// gated-real-model fixture.
-pub fn check_snapshot_preparer(profile: &SnapshotPreparerProfile) -> Result<(), String> {
+pub fn check_snapshot_preparer(
+    profile: &SnapshotPreparerProfile,
+    preparers: &SnapshotPreparerRegistry,
+    text: &TextLlmRegistry,
+) -> Result<(), String> {
     let spec = PrepareSpec {
         source: profile.source.clone(),
         out_dir: profile.out_dir.clone(),
         quantize: profile.quantize,
     };
 
-    let report = prepare_snapshot(&spec).map_err(|e| {
+    let report = preparers.prepare_snapshot(&spec).map_err(|e| {
         format!(
             "check_snapshot_preparer: prepare_snapshot('{}') failed: {e}",
             profile.source.display()
@@ -688,7 +680,7 @@ pub fn check_snapshot_preparer(profile: &SnapshotPreparerProfile) -> Result<(), 
     }
 
     // The headline guarantee: the prepared snapshot is loadable through the contract.
-    load_for_model(&LoadSpec::dense(report.out_dir.to_string_lossy().to_string())).map_err(|e| {
+    text.load_for_model(&LoadSpec::dense(report.out_dir.to_string_lossy().to_string())).map_err(|e| {
         format!(
             "check_snapshot_preparer: prepared snapshot '{}' not loadable via load_for_model: {e}",
             report.out_dir.display()
@@ -698,7 +690,7 @@ pub fn check_snapshot_preparer(profile: &SnapshotPreparerProfile) -> Result<(), 
     // An unrecognized source is a typed Unsupported, not a panic or a generic error.
     let bogus = profile.out_dir.join("core-llm-testkit-not-a-model");
     let bogus_out = profile.out_dir.join("core-llm-testkit-bogus-out");
-    match prepare_snapshot(&PrepareSpec::dense(bogus, bogus_out)) {
+    match preparers.prepare_snapshot(&PrepareSpec::dense(bogus, bogus_out)) {
         Err(Error::Unsupported(_)) => {}
         Err(other) => {
             return Err(format!(

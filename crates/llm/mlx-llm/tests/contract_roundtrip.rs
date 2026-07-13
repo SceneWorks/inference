@@ -1,7 +1,7 @@
 //! Round-trips a streaming generation through the backend-neutral `core-llm` contract (story 7154).
 //!
 //! Builds a tiny on-disk snapshot (config.json + model.safetensors + tokenizer.json), loads it both
-//! directly (`LlamaProvider::load`) and through the registry (`core_llm::load_textllm`), and streams
+//! directly (`LlamaProvider::load`) and through the MLX registry (`mlx_llm::load_textllm`), and streams
 //! a generation entirely via the `core_llm::TextLlm` trait — no model weights needed, runs in CI.
 
 use std::path::{Path, PathBuf};
@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 use mlx_rs::Array;
 
 use core_llm::{
-    load_textllm, Content, Error as CoreError, ImageRef, LoadSpec, Message, Sampling, StreamEvent,
+    Content, Error as CoreError, ImageRef, LoadSpec, Message, Sampling, StreamEvent,
     TextLlm, TextLlmRequest,
 };
+use mlx_llm::load_textllm;
 use mlx_llm::primitives::sampler::{SplitMix64, TokenRng};
 use mlx_llm::provider::PROVIDER_ID;
 use mlx_llm::LlamaProvider;
@@ -141,7 +142,7 @@ fn provider_loads_and_streams_through_the_contract() {
 #[test]
 fn registry_routes_to_the_provider() {
     let dir = write_tiny_snapshot();
-    // Go through core-llm's registry by id — exercises the inventory registration.
+    // Go through the explicit MLX catalog by id.
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(dir.to_str().unwrap())).unwrap();
     assert_eq!(provider.descriptor().id, PROVIDER_ID);
 

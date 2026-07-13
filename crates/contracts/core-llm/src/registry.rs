@@ -1,14 +1,13 @@
-//! Link-time provider registry, id-based routing, and **model-first** resolution.
+//! Explicit provider registry, id-based routing, and **model-first** resolution.
 //!
-//! Backends register a provider with [`inventory::submit!`]; consumers discover and load providers
-//! by id ([`load_textllm`]) without a central match statement (additive, like the mlx-gen
-//! registries). A registration stores the descriptor constructor separately from `load`, so the
-//! registry can be introspected cheaply without loading any weights.
+//! Backends expose registrations that platform bundles compose into a [`TextLlmRegistry`]. A
+//! registration stores the descriptor constructor separately from `load`, so the registry can be
+//! introspected cheaply without loading any weights.
 //!
-//! On top of id-based routing this module adds **[`load_for_model`]**: a caller hands over a
-//! [`LoadSpec`] (a snapshot path) and gets a working [`TextLlm`] back, naming no provider id,
-//! family, or backend. The resolver does NOT match on [`TextLlmDescriptor::family`] — a generic
-//! backend provider serves many architectures behind one registration whose *static* family is just
+//! On top of id-based routing [`TextLlmRegistry::load_for_model`] lets a caller hand over a
+//! [`LoadSpec`] (a snapshot path) and get a working [`TextLlm`] back, naming no provider id, family,
+//! or backend. The resolver does NOT match on [`TextLlmDescriptor::family`] — a generic backend
+//! provider serves many architectures behind one registration whose *static* family is just
 //! `"llama"` (the true family is only known post-load). Instead each registration carries a cheap,
 //! **weightless** [`can_load`](TextLlmRegistration::can_load) probe that reads only the snapshot's
 //! `config.json`; the resolver picks the first registered provider whose probe accepts the model and
@@ -31,7 +30,8 @@ pub struct TextLlmRegistration {
     /// **Weightless** probe: can this provider serve the model at `spec.source`? Implemented by the
     /// backend by running its own architecture dispatch (`Architecture::from_config` or equivalent)
     /// over the snapshot's `config.json` — it MUST NOT read safetensors / weight shards. Drives
-    /// [`load_for_model`]; the architecture knowledge stays in the backend, never in `core-llm`.
+    /// [`TextLlmRegistry::load_for_model`]; the architecture knowledge stays in the backend, never
+    /// in `core-llm`.
     pub can_load: fn(&LoadSpec) -> bool,
     /// **Weightless** per-snapshot vision probe: does this provider serve the model at `spec.source`
     /// *with* vision (image) support? Like [`can_load`](Self::can_load), it reads only `config.json`
@@ -48,20 +48,18 @@ pub struct TextLlmRegistration {
     /// gate recognizes that snapshot as vision-capable without loading weights.
     ///
     /// `None` ⇒ the provider has no per-snapshot vision distinction; the gate falls back to the
-    /// static descriptor's [`supports_vision`](TextLlmCapabilities::supports_vision) (the prior
+    /// static descriptor's
+    /// [`supports_vision`](crate::capabilities::TextLlmCapabilities::supports_vision) (the prior
     /// behavior, so a registration that does not set this field is unchanged). A `Some(_)` that
     /// returns `false` for a snapshot likewise defers to the static descriptor — the probe only ever
     /// *adds* vision capability for a snapshot, never revokes the statically-declared one.
     pub weightless_vision: Option<fn(&LoadSpec) -> bool>,
 }
 
-inventory::collect!(TextLlmRegistration);
-
 /// Builder for an ordinary, explicit LLM provider registry.
 ///
-/// Unlike the process-global [`inventory`] registry, this value contains exactly the providers a
-/// caller adds, in a deterministic order. Platform bundle crates use it to make provider ownership
-/// visible and testable while the existing global APIs remain available as compatibility adapters.
+/// This value contains exactly the providers a caller adds, in deterministic order. Platform bundle
+/// crates use it to make provider ownership visible and testable.
 #[derive(Default)]
 pub struct TextLlmRegistryBuilder {
     registrations: Vec<TextLlmRegistration>,
@@ -87,8 +85,7 @@ impl TextLlmRegistryBuilder {
 
     /// Validate uniqueness and produce the immutable registry.
     ///
-    /// Duplicate ids fail here in every build profile; an explicit bundle never inherits the
-    /// inventory registry's historical debug-only, first-wins behavior.
+    /// Duplicate ids fail here in every build profile.
     pub fn build(self) -> Result<TextLlmRegistry> {
         let mut ids = std::collections::BTreeSet::new();
         for registration in &self.registrations {
@@ -102,14 +99,6 @@ impl TextLlmRegistryBuilder {
         Ok(TextLlmRegistry {
             registrations: self.registrations.into_boxed_slice(),
         })
-    }
-
-    /// Copy every currently linked inventory registration into an explicit registry.
-    ///
-    /// This is the compatibility bridge used to compare old and new catalog snapshots during the
-    /// incremental migration. New platform bundles should list their registrations directly.
-    pub fn from_inventory() -> Self {
-        Self::new().extend(textllms().copied())
     }
 }
 
@@ -209,58 +198,10 @@ impl ModelRequirements {
     }
 }
 
-/// Iterate every registered provider (link-time collected).
-pub fn textllms() -> impl Iterator<Item = &'static TextLlmRegistration> {
-    inventory::iter::<TextLlmRegistration>.into_iter()
-}
-
-/// Look up a registered provider by its descriptor id.
-pub fn find(id: &str) -> Option<&'static TextLlmRegistration> {
-    textllms().find(|r| (r.descriptor)().id == id)
-}
-
-/// Load a provider by id. First-wins on duplicate ids (a `debug_assert!` flags the collision).
-pub fn load_textllm(id: &str, spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
-    let mut matches = textllms().filter(|r| (r.descriptor)().id == id);
-    let reg = matches
-        .next()
-        .ok_or_else(|| Error::Msg(format!("no textllm registered for id '{id}'")))?;
-    debug_assert!(
-        matches.next().is_none(),
-        "duplicate textllm id '{id}' registered (first-wins shadows the rest)"
-    );
-    (reg.load)(spec)
-}
-
-/// **Model-first** load: select the registered provider that can serve the model at `spec.source`
-/// and load it — naming no provider id, family, or backend. Equivalent to
-/// [`load_for_model_with`] with default (no-special-needs) requirements.
-///
-/// Resolution reads only `config.json` (tensor-free) via each provider's weightless
-/// [`can_load`](TextLlmRegistration::can_load) probe; an unknown / unsupported architecture yields a
-/// clear [`Error::Unsupported`] naming the model and the linked providers — never a panic, never a
-/// silent default.
-///
-/// ```ignore
-/// // The caller links exactly one backend crate (e.g. mlx-llm) and switches models by path alone:
-/// let llm = core_llm::load_for_model(&core_llm::LoadSpec::dense("/models/qwen3-0.6b"))?;
-/// ```
-pub fn load_for_model(spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
-    load_for_model_with(spec, &ModelRequirements::default())
-}
-
-/// [`load_for_model`] with explicit capability requirements used to break ties when more than one
-/// registered provider accepts the model (vision requested ⇒ the vision-capable provider; a JSON
-/// constraint requested ⇒ a provider whose `supported_constraints` includes it).
-pub fn load_for_model_with(spec: &LoadSpec, reqs: &ModelRequirements) -> Result<Box<dyn TextLlm>> {
-    let reg = select(textllms(), spec, reqs)?;
-    (reg.load)(spec)
-}
-
 /// Resolve the registration to load: architecture match (`can_load`) first, then a capability
 /// filter, then a deterministic tie-break (prefer a non-vision provider when vision is not
 /// requested; otherwise first-registered). Pure over the supplied registrations so it is unit
-/// testable without the global inventory.
+/// testable without loading a backend.
 fn select<'a>(
     regs: impl Iterator<Item = &'a TextLlmRegistration>,
     spec: &LoadSpec,
@@ -382,7 +323,7 @@ fn no_provider_msg(spec: &LoadSpec, all: &[&TextLlmRegistration]) -> String {
         .map(|a| format!(" ({a})"))
         .unwrap_or_default();
     format!(
-        "no registered provider can serve model '{}'{arch}; linked providers: {}",
+        "no registered provider can serve model '{}'{arch}; available providers: {}",
         spec.source,
         summary(all),
     )
@@ -394,7 +335,7 @@ fn unmet_caps_msg(
     accepting: &[&TextLlmRegistration],
 ) -> String {
     format!(
-        "model '{}' is loadable, but no linked provider meets the requested capabilities \
+        "model '{}' is loadable, but no available provider meets the requested capabilities \
          (vision={}, constraints={:?}); providers that match the architecture: {}",
         spec.source,
         reqs.vision,
@@ -580,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_registry_routes_without_global_inventory() {
+    fn explicit_registry_routes_without_global_state() {
         let registry = TextLlmRegistryBuilder::new()
             .register(reg(text_desc, yes))
             .register(reg(vision_desc, no))
@@ -627,7 +568,7 @@ mod tests {
         match err {
             Error::Unsupported(m) => {
                 assert!(m.contains("no registered provider can serve"), "{m}");
-                // The linked providers are surfaced so the caller sees what IS available.
+                // The available providers are surfaced so the caller sees what IS present.
                 assert!(m.contains("text (test)") && m.contains("vision (test)"), "{m}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
@@ -721,7 +662,7 @@ mod tests {
         let err = picked(&[&text, &vision], &reqs).unwrap_err();
         match err {
             Error::Unsupported(m) => {
-                assert!(m.contains("is loadable, but no linked provider meets"), "{m}");
+                assert!(m.contains("is loadable, but no available provider meets"), "{m}");
                 assert!(m.contains("vision (test)"), "{m}");
             }
             other => panic!("expected Unsupported, got {other:?}"),

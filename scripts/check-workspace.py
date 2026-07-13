@@ -40,6 +40,11 @@ DEFAULT_GRAPH_PINNED_PACKAGES = {
     for dependency_name, (package_name, revision) in PINNED_WORKSPACE_DEPENDENCIES.items()
     if dependency_name != "candle-flash-attn"
 }
+FORBIDDEN_GRAPH_PACKAGES = {
+    # Provider composition is ordinary, value-scoped source code. Reintroducing this crate would
+    # make linker participation part of the supported runtime graph again.
+    "inventory",
+}
 
 
 def fail(message: str) -> None:
@@ -122,6 +127,11 @@ def check_graph(metadata: dict) -> None:
         if matches[0]["source"] is not None:
             fail(f"internal package {name} is not a path source: {matches[0]['source']}")
 
+    resolved_names = {package["name"] for package in packages}
+    forbidden = sorted(FORBIDDEN_GRAPH_PACKAGES & resolved_names)
+    if forbidden:
+        fail(f"explicit composition forbids these graph packages: {forbidden}")
+
     for package in members:
         for dependency in package["dependencies"]:
             if dependency["name"] not in INTERNAL_PACKAGES:
@@ -167,7 +177,8 @@ def main() -> int:
 
     print(
         "workspace gate: OK "
-        f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, pinned backends, intentional tokenizer split)"
+        f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
+        "intentional tokenizer split)"
     )
     return 0
 

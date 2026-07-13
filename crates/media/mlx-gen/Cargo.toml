@@ -50,14 +50,12 @@ sceneworks-gen-core-testkit = { path = "../../contracts/gen-core-testkit" }
 # The independent LLM-serving contract (epic 7153). The dependency is INVERTED: gen-core CONSUMES
 # core-llm (gen-core re-exports it as `gen_core::core_llm`, mirroring how mlx-gen re-exports gen-core),
 # so the gen-ai side runs its LLM providers through the unified `core_llm::TextLlm` engine instead of
-# the duplicate `gen_core::TextLlm`. core-llm is tensor-free (thiserror/inventory/tokenizers/serde_json/
+# the duplicate `gen_core::TextLlm`. core-llm is tensor-free (thiserror/tokenizers/serde_json/
 # minijinja) so this preserves gen-core's zero-tensor invariant. Deliberately `branch = "main"`, NOT
 # a rev pin (F-048): mlx-llm (pinned just below) declares core-llm at `branch = "main"`, and cargo
 # treats `?branch=main` and `?rev=…` as DISTINCT source ids even at the identical commit — a rev pin
-# here would put TWO core-llm packages in the lock, splitting the `inventory` registry statics so
-# mlx-llm's providers register into one core-llm instance while gen-core resolves through the other
-# (JoyCaption provider lookup breaks at runtime; the exact two-builds failure mode the mlx-llm pin
-# below exists to prevent). The commit is frozen by Cargo.lock + `--locked` in CI instead, so a
+# here would put TWO core-llm packages in the lock, splitting contract type identity between the
+# engine and consumer. The commit is frozen by Cargo.lock + `--locked` in CI instead, so a
 # changed core-llm is still a deliberate, reviewed re-lock rather than silent drift. True rev-pinning
 # requires mlx-llm's own core-llm dep to move off `branch = "main"` upstream first; until then both
 # must stay on the branch source id. See sc-7189 / sc-9109.
@@ -72,8 +70,6 @@ core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 # two-Array-builds class. Bump in lockstep with core-llm + the worker.
 mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }
 thiserror = "2"
-# Retained for the independent core-llm link-time provider registry.
-inventory = "0.3"
 # HF tokenizers (same Rust core `transformers` wraps) — loads tokenizer.json directly.
 # onig only (no progressbar/http): byte-level BPE for Qwen/CLIP/T5 needs just the regex.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

@@ -5,10 +5,9 @@ cancellable, multimodal text + vision), host-side policy (chat templates, sampli
 text ↔ ids, constrained decoding), and the provider registry — with **no tensor dependencies**.
 
 `core-llm` builds standalone on Linux, Windows, and macOS and depends on nothing from any tensor
-backend or image-generation stack. Backends implement the [`TextLlm`] contract and register through
-the registry: [`mlx-llm`](https://github.com/SceneWorks/mlx-llm) (Apple MLX) and
-[`candle-llm`](https://github.com/SceneWorks/candle-llm) (Candle, cross-platform). Consumers select a
-provider and stream a generation entirely through this contract.
+backend or image-generation stack. Backends implement the [`TextLlm`] contract and expose ordinary
+registration values. Platform bundles compose exactly the providers they ship into a deterministic
+registry; consumers select one and stream a generation entirely through this contract.
 
 The contract is **extracted from the working mlx-llm engine**, not designed in a vacuum, and is
 provisional until `candle-llm` validates it.
@@ -23,12 +22,13 @@ provisional until `candle-llm` validates it.
 - **`Constraint` + `JsonState`** — constrained-decoding policy (a pure, incremental JSON grammar).
 - **`Tokenizer` + `ChatTemplate`** — host-side text policy (HF tokenizers; typed Llama-3 / ChatML
   templates, with a Jinja renderer to follow).
-- **`registry`** — link-time provider registration and id-based routing.
+- **`TextLlmRegistry`** — explicit provider composition, id-based routing, and model-first loading.
 
 ```rust
-use core_llm::{load_textllm, LoadSpec, Message, TextLlmRequest, StreamEvent};
+use core_llm::{LoadSpec, Message, StreamEvent, TextLlmRegistry, TextLlmRequest};
 
-let provider = load_textllm("mlx-llama", &LoadSpec::dense("/path/to/snapshot"))?;
+fn generate(registry: &TextLlmRegistry) -> core_llm::Result<()> {
+let provider = registry.load_textllm("mlx-llama", &LoadSpec::dense("/path/to/snapshot"))?;
 let req = TextLlmRequest {
     messages: vec![Message::user("Hello!")],
     max_new_tokens: 64,
@@ -37,6 +37,8 @@ let req = TextLlmRequest {
 provider.generate(&req, &mut |ev| {
     if let StreamEvent::Token { text, .. } = ev { print!("{text}"); }
 })?;
+Ok(())
+}
 ```
 
 [`TextLlm`]: https://docs.rs/core-llm

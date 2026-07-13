@@ -1053,7 +1053,7 @@ impl TextLlm for LlamaProvider {
 }
 
 /// The descriptor for the `candle-llama` provider (constructible without loading weights; used for
-/// link-time registration and registry discovery).
+/// explicit catalog composition and inspection).
 pub fn provider_descriptor() -> TextLlmDescriptor {
     TextLlmDescriptor {
         id: PROVIDER_ID.to_string(),
@@ -1184,9 +1184,6 @@ pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistr
     // vision-required model-first load resolve it without reading weights.
     weightless_vision: Some(can_load_vision),
 };
-
-// Compatibility registration for consumers that still use link-time discovery.
-inventory::submit! { REGISTRATION }
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(LlamaProvider::load(spec)?))

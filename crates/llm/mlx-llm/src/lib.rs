@@ -21,7 +21,7 @@
 //!    draft-model speculative decoding (story 7172), both driven by `core_llm`'s backend-neutral
 //!    proposer + distribution-preserving acceptance sampler.
 //! 4. [`provider`] — implements the backend-neutral [`core_llm::TextLlm`] contract over the engine
-//!    and registers it (`mlx-llama`), so consumers stream a generation entirely through `core-llm`.
+//!    and exposes it (`mlx-llama`) for explicit runtime composition.
 //!
 //! [`gguf`] is a side door into step 2: it converts a llama.cpp `*.gguf` (incl. k-quants) into the
 //! `{config.json, model.safetensors}` snapshot the loader consumes (story 7165), optionally
@@ -94,22 +94,44 @@ pub fn snapshot_preparer_registry() -> core_llm::Result<core_llm::SnapshotPrepar
     register_snapshot_preparers(core_llm::SnapshotPreparerRegistryBuilder::new()).build()
 }
 
+/// Load a bundled MLX provider by descriptor id.
+pub fn load_textllm(
+    id: &str,
+    spec: &core_llm::LoadSpec,
+) -> core_llm::Result<Box<dyn core_llm::TextLlm>> {
+    text_registry()?.load_textllm(id, spec)
+}
+
+/// Select and load the bundled MLX provider that accepts `spec`.
+pub fn load_for_model(
+    spec: &core_llm::LoadSpec,
+) -> core_llm::Result<Box<dyn core_llm::TextLlm>> {
+    text_registry()?.load_for_model(spec)
+}
+
+/// Select and load a bundled MLX provider with explicit capability requirements.
+pub fn load_for_model_with(
+    spec: &core_llm::LoadSpec,
+    requirements: &core_llm::ModelRequirements,
+) -> core_llm::Result<Box<dyn core_llm::TextLlm>> {
+    text_registry()?.load_for_model_with(spec, requirements)
+}
+
+/// Prepare a snapshot through the bundled MLX preparer.
+pub fn prepare_snapshot(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::PrepareReport> {
+    snapshot_preparer_registry()?.prepare_snapshot(spec)
+}
+
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_link_time_compatibility_catalog() {
-        let mut explicit: Vec<String> = super::text_registry()
+    fn explicit_catalog_is_complete_and_stable() {
+        let explicit: Vec<String> = super::text_registry()
             .unwrap()
             .registrations()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        let mut compatibility: Vec<String> = core_llm::textllms()
-            .map(|registration| (registration.descriptor)().id)
-            .collect();
-        explicit.sort();
-        compatibility.sort();
-        assert_eq!(explicit, compatibility);
-        assert_eq!(explicit, ["mlx-joycaption", "mlx-llama"]);
+        assert_eq!(explicit, ["mlx-llama", "mlx-joycaption"]);
 
         let preparers = super::snapshot_preparer_registry().unwrap();
         assert_eq!(

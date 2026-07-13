@@ -3,9 +3,9 @@
 #
 # THE TRAP: everything is git-SHA-pinned. If `mlx-gen` (macOS) resolves `sceneworks-gen-core`
 # at rev A while the worker's direct dep resolves rev B, cargo silently builds BOTH. The
-# provider crates (linked `as _`, no type contact with worker code) register into rev A's
-# `inventory` registry while the worker queries rev B's. The symptom is "engine not found" at
-# RUNTIME, not a compile error.
+# provider crates expose rev A's contract types while the worker composes rev B's. Depending on the
+# graph shape this produces incompatible registry values, duplicate policy implementations, or
+# behavior drift hidden behind otherwise-identical package names.
 #
 # This gate fails the build if more than one distinct `sceneworks-gen-core` resolution exists in
 # the root package's dependency graph. It is reusable: pass the root package as $1 (default
@@ -47,11 +47,10 @@ evaluate() {
     printf '  %s\n' "${lines[@]}"
     cat <<'MSG'
 
-Two gen-core revs => provider crates register into ONE inventory registry while the worker
-queries ANOTHER => the engine is "not found" at RUNTIME (not a compile error, because provider
-crates link `as _` and their types never meet the worker). Align the pins: the `mlx-gen` git rev
-and the direct `sceneworks-gen-core` git rev in crates/sceneworks-worker/Cargo.toml MUST be
-identical (and any candle-gen pin must match too). Bump them together.
+Two gen-core revs => two contract type identities and two copies of host policy in one product
+graph. Explicit registries prevent silent provider discovery, but they do not make duplicated
+contracts a supported configuration. Align the runtime release and any direct contract edge so
+every provider and consumer resolves the same `sceneworks-gen-core` package.
 MSG
   } >&2
   return 1

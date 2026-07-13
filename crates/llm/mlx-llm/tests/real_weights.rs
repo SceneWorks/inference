@@ -11,8 +11,9 @@
 //! reproducible, and that a mid-stream cancel stops promptly with a partial result.
 
 use core_llm::{
-    load_textllm, LoadSpec, Message, Sampling, StreamEvent as CoreEvent, TextLlmRequest, Tokenizer,
+    LoadSpec, Message, Sampling, StreamEvent as CoreEvent, TextLlmRequest, Tokenizer,
 };
+use mlx_llm::load_textllm;
 
 use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{generate, CancelFlag, FinishReason, GenerationConfig, StreamEvent};

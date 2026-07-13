@@ -514,9 +514,6 @@ pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistr
     weightless_vision: None,
 };
 
-// Compatibility registration for consumers that still use link-time discovery.
-inventory::submit! { REGISTRATION }
-
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(JoyCaptionProvider::load(spec)?))
 }

@@ -3,14 +3,15 @@
 //! Turning a downloaded model into something the engine can load has two parts: *deciding* what to
 //! do (which format is this? does it need converting? quantize or not?) and *doing the tensor work*
 //! (dequantize, re-quantize, serialize). This module owns the first part and **delegates the second
-//! to the linked backend**, exactly as [`registry`](crate::registry) owns provider routing while the
-//! backend owns the decode.
+//! to an explicitly selected backend**, exactly as [`registry`](crate::registry) owns provider
+//! routing while the backend owns the decode.
 //!
-//! A caller hands [`prepare_snapshot`] a [`PrepareSpec`] — an already-downloaded source (an
-//! HF-safetensors snapshot directory or a `*.gguf` file; fetching it is the caller's job, this crate
-//! has no network), an output directory, and one quantization knob — and gets back a persisted,
-//! loadable snapshot that [`load_for_model`](crate::load_for_model) consumes. The backend that does
-//! the work is selected from the link-time registry by a cheap, weightless probe, mirroring
+//! A caller hands [`SnapshotPreparerRegistry::prepare_snapshot`] a [`PrepareSpec`] — an
+//! already-downloaded source (an HF-safetensors snapshot directory or a `*.gguf` file; fetching it
+//! is the caller's job, this crate has no network), an output directory, and one quantization knob —
+//! and gets back a persisted, loadable snapshot that
+//! [`TextLlmRegistry::load_for_model`](crate::registry::TextLlmRegistry::load_for_model) consumes.
+//! The backend is selected from the registry by a cheap, weightless probe, mirroring
 //! [`can_load`](crate::registry::TextLlmRegistration::can_load).
 //!
 //! `core-llm` stays **tensor-free**: it detects the on-disk format, routes to a backend, validates,
@@ -116,8 +117,9 @@ fn dir_contains_gguf(dir: &Path) -> bool {
 /// `source` is an already-downloaded model directory or file (fetching it is the caller's
 /// responsibility — `core-llm` has no network). `out_dir` receives the prepared snapshot
 /// (`config.json` + `model.safetensors` + tokenizer files) that
-/// [`load_for_model`](crate::load_for_model) consumes. `quantize` is the single knob: `None` ⇒ a
-/// dense snapshot, `Some(_)` ⇒ projections re-quantized to that scheme on the way out.
+/// [`TextLlmRegistry::load_for_model`](crate::registry::TextLlmRegistry::load_for_model) consumes.
+/// `quantize` is the single knob: `None` ⇒ a dense snapshot, `Some(_)` ⇒ projections re-quantized to
+/// that scheme on the way out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrepareSpec {
     /// The downloaded model: an HF-safetensors snapshot directory or a `*.gguf` file/dir.
@@ -144,8 +146,8 @@ impl PrepareSpec {
     }
 }
 
-/// What a [`prepare_snapshot`] call produced — reported honestly so a caller (or the conformance
-/// suite) sees exactly what was done, including a no-rewrite passthrough.
+/// What a [`SnapshotPreparerRegistry::prepare_snapshot`] call produced — reported honestly so a
+/// caller (or the conformance suite) sees exactly what was done, including a no-rewrite passthrough.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrepareReport {
     /// The detected format of the input.
@@ -163,8 +165,8 @@ pub struct PrepareReport {
 }
 
 /// A registered backend snapshot preparer: which sources it can handle (a cheap, weightless probe)
-/// and how to materialize the snapshot (the tensor work). Backends register one with
-/// [`inventory::submit!`], exactly as they register a
+/// and how to materialize the snapshot (the tensor work). Backends expose one for platform bundles
+/// to compose, exactly as they expose a
 /// [`TextLlmRegistration`](crate::registry::TextLlmRegistration). Stored as `fn` pointers (not a
 /// trait object) because preparation is a stateless one-shot — there is no instance to hold.
 #[derive(Clone, Copy)]
@@ -178,12 +180,9 @@ pub struct SnapshotPreparerRegistration {
     pub prepare: fn(&PrepareSpec) -> Result<PrepareReport>,
 }
 
-inventory::collect!(SnapshotPreparerRegistration);
-
 /// Builder for an ordinary, explicit snapshot-preparer registry.
 ///
-/// Runtime bundles add exactly the backend preparers they ship. The process-global inventory
-/// remains only as a compatibility source for consumers that have not yet adopted a bundle.
+/// Runtime bundles add exactly the backend preparers they ship.
 #[derive(Default)]
 pub struct SnapshotPreparerRegistryBuilder {
     registrations: Vec<SnapshotPreparerRegistration>,
@@ -225,11 +224,6 @@ impl SnapshotPreparerRegistryBuilder {
             registrations: self.registrations.into_boxed_slice(),
         })
     }
-
-    /// Copy every currently linked inventory registration into an explicit registry.
-    pub fn from_inventory() -> Self {
-        Self::new().extend(snapshot_preparers().copied())
-    }
 }
 
 /// An immutable, explicit collection of snapshot preparers.
@@ -252,33 +246,8 @@ impl SnapshotPreparerRegistry {
     }
 }
 
-/// Iterate every registered snapshot preparer (link-time collected).
-pub fn snapshot_preparers() -> impl Iterator<Item = &'static SnapshotPreparerRegistration> {
-    inventory::iter::<SnapshotPreparerRegistration>.into_iter()
-}
-
-/// Materialize a loadable, persisted snapshot per `spec`, selecting the linked backend that can
-/// prepare the source — naming no backend. The selected backend does all tensor work; this function
-/// only routes and reports.
-///
-/// Returns [`Error::Unsupported`] when no registered preparer accepts the source (naming the detected
-/// format and the linked preparers), mirroring [`load_for_model`](crate::load_for_model)'s
-/// no-provider path — never a panic, never a silent default.
-///
-/// ```ignore
-/// // The app downloads the repo, then prepares a Q4 snapshot and loads it — backend-agnostic:
-/// let report = core_llm::prepare_snapshot(
-///     &core_llm::PrepareSpec::quantized("/dl/qwen3-0.6b", "/snap/qwen3-q4", core_llm::Quantize::Q4),
-/// )?;
-/// let llm = core_llm::load_for_model(&core_llm::LoadSpec::dense(report.out_dir.to_string_lossy()))?;
-/// ```
-pub fn prepare_snapshot(spec: &PrepareSpec) -> Result<PrepareReport> {
-    let reg = select_preparer(snapshot_preparers(), spec)?;
-    (reg.prepare)(spec)
-}
-
 /// Resolve the preparer to run: the first registered backend whose weightless probe accepts the
-/// source. Pure over the supplied registrations so it is unit-testable without the global inventory.
+/// source. Pure over the supplied registrations so it is unit-testable without loading a backend.
 fn select_preparer<'a>(
     regs: impl Iterator<Item = &'a SnapshotPreparerRegistration>,
     spec: &PrepareSpec,
@@ -401,7 +370,7 @@ mod tests {
         }
     }
 
-    // --- select_preparer over throwaway registrations (no global inventory, no tensor work) ---
+    // --- select_preparer over throwaway registrations (no global state, no tensor work) ---
 
     fn mlx_tag() -> &'static str {
         "mlx"
@@ -457,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_registry_routes_without_global_inventory() {
+    fn explicit_registry_routes_without_global_state() {
         let registry = SnapshotPreparerRegistryBuilder::new()
             .register(reg(mlx_tag, no))
             .register(reg(candle_tag, yes))

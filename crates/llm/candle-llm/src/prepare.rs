@@ -1,7 +1,7 @@
 //! Persisted, backend-neutral model-snapshot preparation (story 7662): the candle backend's
 //! [`core_llm::SnapshotPreparerRegistration`].
 //!
-//! `core-llm` owns format detection, the link-time preparer registry, and dispatch (story 7659); a
+//! `core-llm` owns format detection, the explicit preparer registry, and dispatch (story 7659); a
 //! backend supplies the *tensor work* — turn a downloaded model (an HF-safetensors snapshot directory
 //! or a `*.gguf` container) into a persisted, loadable snapshot, optionally re-quantizing the
 //! projections on the way out. This is candle's peer of the mlx-llm impl: candle already passes
@@ -9,7 +9,7 @@
 //! across a second backend.
 //!
 //! # What it writes
-//! A prepared snapshot is the HF shape [`load_for_model`](core_llm::load_for_model) already consumes:
+//! A prepared snapshot is the HF shape [`TextLlmRegistry::load_for_model`](core_llm::TextLlmRegistry::load_for_model) already consumes:
 //! `config.json` + `model.safetensors` (via [`candle_core::safetensors::save`]) + `tokenizer.json`
 //! (and `tokenizer_config.json` when there is a chat template). Reading the dense tensors reuses the
 //! loaders candle already has — HF via [`Weights::from_dir`], GGUF via [`GgufCheckpoint::open`]
@@ -358,9 +358,6 @@ pub const REGISTRATION: SnapshotPreparerRegistration = SnapshotPreparerRegistrat
     can_prepare,
     prepare,
 };
-
-// Compatibility registration for consumers that have not adopted an explicit runtime bundle.
-inventory::submit! { REGISTRATION }
 
 #[cfg(test)]
 mod tests {

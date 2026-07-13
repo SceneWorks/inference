@@ -148,8 +148,6 @@ pub const REGISTRATION: core_llm::SnapshotPreparerRegistration =
         prepare,
     };
 
-inventory::submit! { REGISTRATION }
-
 #[cfg(test)]
 mod tests {
     use super::*;

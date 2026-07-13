@@ -23,10 +23,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use candle_core::{DType, Device, Tensor};
 
 use candle_llm::primitives::sampler::{SplitMix64, TokenRng};
-use candle_llm::LlamaProvider;
+use candle_llm::{load_for_model, prepare_snapshot, LlamaProvider};
 use core_llm::{
-    detect_format, load_for_model, prepare_snapshot, LoadSpec, Message, ModelFormat, PrepareReport,
-    PrepareSpec, Quantize, TextLlmRequest,
+    detect_format, LoadSpec, Message, ModelFormat, PrepareReport, PrepareSpec, Quantize,
+    TextLlmRequest,
 };
 use core_llm_testkit::{check_snapshot_preparer, SnapshotPreparerProfile};
 
@@ -124,11 +124,15 @@ fn synthetic_dense_passthrough_and_loads() {
 
     // The full contract helper: prepare -> report self-consistency -> load_for_model, plus the
     // unknown-source Unsupported path.
-    check_snapshot_preparer(&SnapshotPreparerProfile {
-        source: src.clone(),
-        out_dir: unique_dir("dense-check"),
-        quantize: None,
-    })
+    check_snapshot_preparer(
+        &SnapshotPreparerProfile {
+            source: src.clone(),
+            out_dir: unique_dir("dense-check"),
+            quantize: None,
+        },
+        &candle_llm::snapshot_preparer_registry().unwrap(),
+        &candle_llm::text_registry().unwrap(),
+    )
     .unwrap();
 
     let _ = std::fs::remove_dir_all(&src);
@@ -176,11 +180,15 @@ fn quant_round_trip(tag: &str, hidden: usize, inter: usize, quant: Quantize) {
         "{tag}: persisted block must load quantized"
     );
 
-    check_snapshot_preparer(&SnapshotPreparerProfile {
-        source: src.clone(),
-        out_dir: unique_dir(&format!("{tag}-check")),
-        quantize: Some(quant),
-    })
+    check_snapshot_preparer(
+        &SnapshotPreparerProfile {
+            source: src.clone(),
+            out_dir: unique_dir(&format!("{tag}-check")),
+            quantize: Some(quant),
+        },
+        &candle_llm::snapshot_preparer_registry().unwrap(),
+        &candle_llm::text_registry().unwrap(),
+    )
     .unwrap();
 
     let _ = std::fs::remove_dir_all(&src);
@@ -222,11 +230,15 @@ fn real_check(source: PathBuf, quant: Option<Quantize>, tag: &str) {
     .unwrap_or_else(|e| panic!("{tag}: prepare failed: {e}"));
     assert_eq!(report.quantized, quant);
 
-    check_snapshot_preparer(&SnapshotPreparerProfile {
-        source,
-        out_dir: unique_dir(&format!("real-{tag}-check")),
-        quantize: quant,
-    })
+    check_snapshot_preparer(
+        &SnapshotPreparerProfile {
+            source,
+            out_dir: unique_dir(&format!("real-{tag}-check")),
+            quantize: quant,
+        },
+        &candle_llm::snapshot_preparer_registry().unwrap(),
+        &candle_llm::text_registry().unwrap(),
+    )
     .unwrap_or_else(|e| panic!("{tag}: {e}"));
 
     // The prepared snapshot generates coherently (acceptance: candle loader generates).

@@ -5,10 +5,8 @@
 //! ```
 //!
 //! Serves `POST /v1/chat/completions` (streaming SSE or buffered JSON), `GET /v1/models`, and a
-//! health check, for a single model loaded through the **backend-neutral** `core_llm` contract
-//! (`load_textllm` routing → a `TextLlm` provider). It speaks only that contract, so it would serve
-//! a `candle-llm` provider unchanged — the dependency on `mlx-llm` is just to link its provider
-//! registration in.
+//! health check, for a single model loaded through the **backend-neutral** `core_llm` contract and
+//! the explicit MLX provider catalog. The HTTP serving path speaks only the `TextLlm` contract.
 //!
 //! This is a *reference*, deliberately minimal: one model, one request at a time (MLX's Metal device
 //! is single-threaded — see the engine's `.cargo/config.toml`), `Connection: close`, no auth. A
@@ -86,14 +84,15 @@ fn parse_args() -> Result<Args, String> {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
+    let registry = mlx_llm::text_registry()?;
 
-    // Backend-neutral routing: use the requested provider id, else default to a registered *text*
-    // (non-vision) provider — several may be registered (e.g. a VLM captioner alongside the generic
-    // text model), so don't just grab the first. Stays backend-agnostic: no hard-coded id.
+    // Use the requested provider id, else default to a bundled *text* (non-vision) provider. Several
+    // may be present (e.g. a VLM captioner alongside the generic text model), so don't just grab the
+    // first. The catalog is explicit and contains no process-global discovery state.
     let provider_id = match args.provider {
         Some(id) => id,
         None => {
-            let descriptors = || core_llm::textllms().map(|r| (r.descriptor)());
+            let descriptors = || registry.registrations().map(|r| (r.descriptor)());
             descriptors()
                 .find(|d| !d.capabilities.supports_vision)
                 .or_else(|| descriptors().next())
@@ -103,7 +102,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("loading model from {} via provider '{provider_id}' …", args.model);
     let spec = LoadSpec { source: args.model.clone(), quantize: args.quantize };
-    let provider = core_llm::load_textllm(&provider_id, &spec)?;
+    let provider = registry.load_textllm(&provider_id, &spec)?;
 
     // A friendly default model name for responses (the snapshot dir's basename).
     let default_model = std::path::Path::new(&args.model)

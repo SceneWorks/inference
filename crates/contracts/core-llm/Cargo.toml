@@ -6,7 +6,7 @@ version = "0.0.0"
 edition = "2021"
 description = "Backend-neutral contract + host policy + provider registry for an on-device LLM serving engine (no tensors)."
 license = "Apache-2.0"
-repository = "https://github.com/SceneWorks/core-llm"
+repository = "https://github.com/SceneWorks/inference"
 readme = "README.md"
 keywords = ["llm", "inference", "serving", "contract", "multimodal"]
 categories = ["science"]
@@ -14,8 +14,6 @@ categories = ["science"]
 [dependencies]
 # Error plumbing.
 thiserror = "2"
-# Link-time provider registration (the DI-container stand-in), matching the mlx-gen convention.
-inventory = "0.3"
 # HF tokenizers (the same Rust core `transformers` wraps) — host-side text<->ids. `onig` only (no
 # http/progressbar): byte-level BPE needs just the regex. Builds tensor-free on Linux/Windows/Mac.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

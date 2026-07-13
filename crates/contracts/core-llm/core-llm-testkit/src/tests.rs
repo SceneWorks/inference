@@ -4,9 +4,8 @@
 use super::*;
 
 use core_llm::{
-    Channel, Error, FinishReason, LoadSpec, Result as CoreResult, StreamEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRegistration, TextLlmRequest,
-    Usage,
+    Channel, Error, FinishReason, Result as CoreResult, StreamEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Usage,
 };
 
 #[derive(Clone)]
@@ -165,25 +164,6 @@ impl TextLlm for StubTextLlm {
     }
 }
 
-// Register the good stub so the registry check has something to resolve.
-fn stub_descriptor() -> TextLlmDescriptor {
-    descriptor_with("stub-llm")
-}
-fn load_stub(_spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
-    Ok(Box::new(good()))
-}
-fn can_load_stub(_spec: &LoadSpec) -> bool {
-    true
-}
-inventory::submit! {
-    TextLlmRegistration {
-        descriptor: stub_descriptor,
-        load: load_stub,
-        can_load: can_load_stub,
-        weightless_vision: None,
-    }
-}
-
 #[test]
 fn good_stub_passes_full_conformance() {
     textllm_conformance(|| Box::new(good()), &TextLlmProfile::cheap());
@@ -195,7 +175,6 @@ fn each_check_passes_for_good_stub() {
     let p: &dyn TextLlm = &g;
     let pr = TextLlmProfile::cheap();
     check_descriptor(p).unwrap();
-    check_registry(p).unwrap();
     check_validate(p, &pr).unwrap();
     check_streaming(p, &pr).unwrap();
     check_mid_stream_cancel(p, &pr).unwrap();
@@ -301,15 +280,9 @@ fn ignored_seed_is_caught() {
 }
 
 #[test]
-fn unregistered_id_fails_registry() {
-    let s = stub("not-registered", Behavior::good());
-    assert!(check_registry(&s).is_err());
-}
-
-#[test]
 #[should_panic(expected = "conformance FAILED")]
 fn aggregator_panics_on_any_failure() {
-    // Unregistered + non-streaming -> at least two checks fail -> aggregated panic.
+    // Non-streaming behavior is aggregated into one conformance failure.
     textllm_conformance(
         || {
             Box::new(stub(

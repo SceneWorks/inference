@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 description = "Conformance suite for the core-llm TextLlm contract — drives any provider through streaming, cancellation, seed-determinism, capability, and multimodal checks. Tensor-free."
 license = "Apache-2.0"
-repository = "https://github.com/SceneWorks/core-llm"
+repository = "https://github.com/SceneWorks/inference"
 readme = "README.md"
 # Internal dev-harness, not a standalone published crate: backends dev-depend on it through the
 # workspace / a git dependency, never from crates.io (sc-7201 decision). `publish = false` documents
@@ -21,7 +21,3 @@ name = "core_llm_testkit"
 core-llm = { path = ".." }
 # Build the JSON-Schema for the tool-calling check's sample tool (`ToolSpec::parameters`). Tensor-free.
 serde_json = "1"
-
-[dev-dependencies]
-# The self-tests register an in-crate stub provider to exercise the registry round-trip check.
-inventory = "0.3"

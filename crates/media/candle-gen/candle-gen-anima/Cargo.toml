@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 description = "Anima (Cosmos-Predict2 DiT + AnimaTextConditioner) anime T2I provider crate for candle-gen (the CUDA/Windows sibling of mlx-gen-anima)."
 license = "Apache-2.0"
-repository = "https://github.com/SceneWorks/candle-gen"
+repository = "https://github.com/SceneWorks/inference"
 keywords = ["candle", "cuda", "diffusion", "anima", "cosmos"]
 categories = ["science"]
 

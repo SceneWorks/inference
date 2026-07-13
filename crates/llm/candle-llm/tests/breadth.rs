@@ -9,7 +9,8 @@
 //!   cargo test --features cuda --test breadth -- --ignored --nocapture
 //! ```
 
-use core_llm::{load_for_model, LoadSpec, Message, Sampling, StreamEvent, TextLlmRequest};
+use candle_llm::load_for_model;
+use core_llm::{LoadSpec, Message, Sampling, StreamEvent, TextLlmRequest};
 
 /// Load the snapshot at `$env` **by model** (story 7406: `load_for_model`, naming no provider id /
 /// family / backend), check its reported family tag, and assert it streams coherent, word-bearing

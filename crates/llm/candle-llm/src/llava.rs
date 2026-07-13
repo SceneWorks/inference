@@ -601,7 +601,7 @@ impl TextLlm for LlavaProvider {
     }
 }
 
-/// The LLaVA provider descriptor (constructible without weights; used for link-time registration).
+/// The LLaVA provider descriptor (constructible without weights; used for catalog composition).
 pub fn descriptor() -> TextLlmDescriptor {
     TextLlmDescriptor {
         id: PROVIDER_ID.to_string(),
@@ -668,9 +668,6 @@ pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistr
     // The static descriptor already declares `supports_vision=true`; no per-snapshot probe needed.
     weightless_vision: None,
 };
-
-// Compatibility registration for consumers that still use link-time discovery.
-inventory::submit! { REGISTRATION }
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(LlavaProvider::load(spec)?))

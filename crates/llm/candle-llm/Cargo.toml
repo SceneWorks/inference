@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 description = "On-device text LLM serving engine for the Candle backend (cross-platform incl. Windows/CUDA); validates the core-llm contract. Work in progress."
 license = "Apache-2.0"
-repository = "https://github.com/SceneWorks/candle-llm"
+repository = "https://github.com/SceneWorks/inference"
 readme = "README.md"
 keywords = ["candle", "cuda", "llm", "inference", "serving"]
 categories = ["science"]
@@ -23,13 +23,9 @@ candle-nn = { workspace = true }
 # ONLY by the `flash-attn` feature (it compiles a large CUDA/CUTLASS kernel set and needs the CUDA
 # toolkit). Pinned to the SAME candle git rev so it links against one candle build.
 candle-flash-attn = { workspace = true, optional = true }
-# The backend-neutral contract this crate implements. The root workspace path is
-# load-bearing: Candle and MLX providers must share one package, type identity,
-# and link-time registry.
+# The backend-neutral contract this crate implements. The root workspace path keeps Candle and MLX
+# providers on one contract package and type identity.
 core-llm = { workspace = true }
-# Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
-# inventory so the distributed slice links.
-inventory = { workspace = true }
 # Error plumbing for the engine surface.
 thiserror = { workspace = true }
 # config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-llm convention.

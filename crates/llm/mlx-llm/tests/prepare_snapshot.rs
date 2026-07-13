@@ -1,7 +1,8 @@
 use core_llm::{
-    load_for_model, prepare_snapshot, LoadSpec, Message, PrepareSpec, Quantize, Sampling,
+    LoadSpec, Message, PrepareSpec, Quantize, Sampling,
     TextLlmRequest,
 };
+use mlx_llm::{load_for_model, prepare_snapshot};
 use mlx_llm::provider::PROVIDER_ID;
 
 const PROMPT: &str = "The capital of France is";

@@ -13,9 +13,10 @@
 //! sit mid-output — proving generation would have continued past it.
 
 use core_llm::{
-    load_textllm, FinishReason as CoreFinish, LoadSpec, Message, Sampling,
+    FinishReason as CoreFinish, LoadSpec, Message, Sampling,
     StreamEvent as CoreEvent, TextLlmRequest,
 };
+use mlx_llm::load_textllm;
 use mlx_llm::provider::PROVIDER_ID;
 
 fn model_dir() -> Option<String> {

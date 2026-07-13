@@ -8,13 +8,13 @@ use std::path::PathBuf;
 
 use mlx_rs::Array;
 
-use core_llm::{load_for_model, LoadSpec, Message, TextLlmRequest};
+use core_llm::{LoadSpec, Message, TextLlmRequest};
 use core_llm_testkit::{
     check_snapshot_preparer, textllm_conformance, SnapshotPreparerProfile, TextLlmProfile,
 };
 use mlx_llm::primitives::sampler::{SplitMix64, TokenRng};
 use mlx_llm::provider::PROVIDER_ID;
-use mlx_llm::LlamaProvider;
+use mlx_llm::{load_for_model, LlamaProvider};
 
 const VOCAB: usize = 32;
 
@@ -106,11 +106,15 @@ fn real_snapshot_preparer_passes_core_llm_conformance() {
     let source = std::env::var("MLX_LLM_PREPARE_SOURCE").expect("set MLX_LLM_PREPARE_SOURCE");
     let out_dir = std::env::temp_dir().join(format!("mlx-llm-prepare-conformance-{}", std::process::id()));
     std::fs::remove_dir_all(&out_dir).ok();
-    check_snapshot_preparer(&SnapshotPreparerProfile {
-        source: PathBuf::from(source),
-        out_dir: out_dir.clone(),
-        quantize: Some(core_llm::Quantize::Q4),
-    })
+    check_snapshot_preparer(
+        &SnapshotPreparerProfile {
+            source: PathBuf::from(source),
+            out_dir: out_dir.clone(),
+            quantize: Some(core_llm::Quantize::Q4),
+        },
+        &mlx_llm::snapshot_preparer_registry().expect("MLX preparer registry"),
+        &mlx_llm::text_registry().expect("MLX text registry"),
+    )
     .expect("snapshot preparer conformance");
     std::fs::remove_dir_all(&out_dir).ok();
 }

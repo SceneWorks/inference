@@ -1,8 +1,8 @@
 # Phase 4 Explicit Composition Checkpoint
 
-> **Status:** Named runtime bundles and explicit media/LLM composition are implemented and locally
-> validated. Consumer cutover, hosted CUDA/NAX execution, and removal of the LLM compatibility
-> inventory remain open exit gates.
+> **Status:** Named runtime bundles, explicit media/LLM composition, consumer cutover, and removal
+> of the LLM compatibility inventory are implemented and locally validated. Hosted CUDA/NAX
+> execution remains an open release gate.
 
 ## Result
 
@@ -35,10 +35,10 @@ dependency exceptions.
 snapshot preparation. Snapshot preparation has the same immutable registry model as model-first
 loading; bundle callers do not depend on which crates the linker happens to retain.
 
-The old process-global `core-llm` functions remain as compatibility adapters while SceneWorks and
-ChatWorks are cut over. They are no longer the supported composition boundary. Their
-`inventory` submissions can be removed after both consumers construct a named runtime catalog and
-no rollback path depends on the old calls.
+SceneWorks and ChatWorks now construct named runtime catalogs. The old process-global `core-llm`
+functions, linker submissions, and `inventory` dependency have been removed. Backend-scoped
+convenience loaders remain, but each constructs a deterministic registry solely from that backend's
+ordinary registration constants.
 
 ## CI ownership
 
@@ -66,13 +66,11 @@ authority for that named configuration.
 ## Rollback
 
 The contract relocation and bundle introduction are separate commits. Either can be reverted
-without reverting the imported histories or workspace normalization. Until consumer cutover, the
-global LLM compatibility functions retain the prior routing behavior.
+without reverting the imported histories or workspace normalization. The last pre-removal commit is
+the source-level compatibility rollback point; the release itself has no hidden link-time fallback.
 
 ## Remaining Phase 4 exit gates
 
 1. Run `runtime-macos` on the hosted macOS lane and the macOS 26.2+ NAX runner.
 2. Build and test `runtime-cuda` on the self-hosted CUDA runner.
-3. Cut SceneWorks and ChatWorks to named runtime catalogs and compare their provider snapshots.
-4. Remove the LLM `inventory` compatibility layer after the immutable release rollback point no
-   longer requires it.
+3. Publish the immutable runtime release and validate the final SceneWorks and ChatWorks pins.

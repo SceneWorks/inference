@@ -44,7 +44,7 @@ mlx-gen              THE CORE (abstractions + shared runtime; NO model-specific 
   ├─ generator.rs    Generator trait, GenerationRequest, GenerationOutput, ModelDescriptor,
   │                  Capabilities, GenerationError
   ├─ transform.rs    Transform trait (non-prompt media→media; see §3.3)
-  ├─ registry.rs     model registration + lookup by id (inventory-style, see §4)
+  ├─ registry.rs     explicit model registration + lookup by id (see §4)
   ├─ nn/             shared primitives: attention, rope, rms_norm, swiglu, conv2d, group_norm,
   │                  linear, silu   (today under models/z_image — these MOVE here)
   ├─ adapters/       LoRA + LoKr: Adapter, AdaptableLinear (Vec of mixed adapters),
@@ -177,7 +177,7 @@ pub enum TargetSize {
 ```
 
 `TransformCapabilities`: supported `TargetSize` modes, max scale, `is_diffusion` (uses seed),
-`supports_strength`, quantization, `mac_only`. Same `LoadSpec` + `inventory` registry as
+`supports_strength`, quantization, `mac_only`. Same `LoadSpec` + explicit registry as
 `Generator`, into a parallel transform registry.
 
 **Scope now = image→image** (SeedVR2 is single-image in this port; the existing worker upscale
@@ -218,30 +218,29 @@ pub struct ModelRegistration {                 // ≈ services.AddKeyedSingleton
     pub descriptor: fn() -> ModelDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn Generator>, GenerationError>,
 }
-inventory::submit! { ModelRegistration { descriptor: z_image::descriptor, load: z_image::load } }
+pub const REGISTRATION: ModelRegistration = ModelRegistration {
+    descriptor: z_image::descriptor,
+    load: z_image::load,
+};
+
+pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+    registry.register_generator(REGISTRATION)
+}
 ```
 
-`mlx-gen` exposes `registry()` and `load(model_id, &LoadSpec) -> Box<dyn Generator>` via an
-`inventory`/`linkme` link-time collection: **a provider crate self-registers just by being
-linked** — `mlx-gen` has no central match to edit (additive). A third party linking one provider
-sees exactly one registration. (`Transform`s register the same way into a parallel registry.)
-Maps onto the worker's `payload.model` → `MODEL_TARGETS` → load.
-
-> **Linkage nuance (verified in the z-image split):** "linked" means the provider's objects are
-> actually pulled into the final binary. A dependency that is declared but *never referenced*
-> can have its link-section statics dropped by the linker, so its `inventory::submit!` never
-> runs. A consumer that uses the provider (constructs requests, names a type, etc.) links it
-> automatically; to depend on a provider purely for its registration side-effect, force the link
-> with `use mlx_gen_z_image as _;`. This is the "the DI container has to know about the assembly"
-> detail — in Rust it's a link-time, not runtime, fact.
+Each family registry contains exactly the registrations named by its builder. `mlx-gen-catalog`
+calls every supported family's builder in stable order and exposes the complete platform registry;
+tests pin that exact surface. (`Transform`s and other provider kinds use parallel builder methods.)
+This maps onto the worker's `payload.model` → `MODEL_TARGETS` → explicit registry load without
+depending on linker retention or side effects.
 
 ---
 
 ## 5. How consumers use it
 
-**SceneWorks worker** (all models): depend on every provider crate → registry is populated → on a
-job, map the `ImageRequest`/`VideoRequest` payload → `GenerationRequest`,
-`load(payload.model, spec)`, `generate`, map `GenerationOutput` → asset writes.
+**SceneWorks worker** (all models): consume `runtime-macos`, construct its catalog once, then on a
+job map the `ImageRequest`/`VideoRequest` payload → `GenerationRequest`, load through that registry,
+generate, and map `GenerationOutput` → asset writes.
 
 **Third party** (one model):
 ```rust
@@ -256,9 +255,11 @@ let out = model.generate(&GenerationRequest { prompt: "a fox".into(), ..Default:
 1. `cargo new --lib mlx-gen-<x>`, depend on `mlx-gen`.
 2. Build with `mlx-gen`'s `nn`/`weights`/`quant`/`tokenizer`/`adapters` primitives.
 3. `impl Generator` (or `Transform`) + `descriptor()`/`Capabilities` + `load()`;
-   `inventory::submit!` it.
+   publish a named registration constant and `register_providers` builder.
+4. Add the family builder to `mlx-gen-catalog` if it belongs in the supported platform surface,
+   then update the exact-catalog test.
 
-No edits to `mlx-gen` or any other provider crate.
+No edits to `mlx-gen` or any other provider crate are required.
 
 ---
 
@@ -369,7 +370,7 @@ scope.** Concretely:
 - Categorize by interaction: one **`Generator`** for all prompt→media (multi-modal via output
   enum + `modality`); a separate **`Transform`** for non-prompt image→image, designed around
   SeedVR2 (image→image, §3.3).
-- Registry via `inventory`/`linkme` link-time auto-registration (the DI-container equivalent).
+- Registry via ordinary registration values and explicit family/platform builders.
 - Adapters: LoRA + LoKr, multiples + mixed, are core + already built; per-model only asks whether
   injection points are wired.
 - `Conditioning` is a **typed enum**.

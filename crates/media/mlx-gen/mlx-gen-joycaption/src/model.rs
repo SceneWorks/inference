@@ -22,11 +22,6 @@ use mlx_gen::{
     Progress, WeightsSource,
 };
 
-// Force-link the mlx-llm engine so the `mlx-joycaption` provider's `inventory::submit!` into
-// core-llm's registry survives the linker — this crate resolves the provider through
-// `core_llm::load_for_model` and never names another mlx-llm symbol.
-use mlx_llm as _;
-
 pub fn descriptor() -> CaptionerDescriptor {
     CaptionerDescriptor {
         id: JOY_CAPTION_MODEL_ID,
@@ -56,7 +51,9 @@ pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaption> {
 
     // Model-first resolution: the `mlx-joycaption` vision provider's weightless `can_load` claims the
     // LLaVA snapshot; `with_vision()` disambiguates it from the text-only `mlx-llama` provider.
-    let provider = core_llm::load_for_model_with(
+    let provider = mlx_llm::text_registry()
+        .map_err(map_core_err)?
+        .load_for_model_with(
         &CoreLoadSpec {
             source: root.to_string_lossy().into_owned(),
             quantize: None,

@@ -13,10 +13,10 @@
 //! 3. [`decode`] — the streaming, cancellable decode loop ([`generate`]) that drives any
 //!    [`Decode`](decode::Decode) model, emitting a [`StreamEvent`] per token.
 //! 4. [`provider`] — implements the backend-neutral [`core_llm::TextLlm`] contract over the engine
-//!    and registers it (`candle-llama`), so consumers stream a generation entirely through
-//!    `core-llm`. Passing the `core-llm-testkit` conformance suite as a second backend is what
+//!    and exposes it (`candle-llama`) for explicit runtime composition. Passing the
+//!    `core-llm-testkit` conformance suite as a second backend is what
 //!    de-provisionalizes the contract (story 7237).
-//! 5. [`prepare`] — registers a [`core_llm::SnapshotPreparerRegistration`]: convert an HF snapshot
+//! 5. [`prepare`] — exposes a [`core_llm::SnapshotPreparerRegistration`]: convert an HF snapshot
 //!    or a `*.gguf` into a persisted, loadable snapshot, optionally baking in Q4/Q8 (story 7662).
 //!
 //! Compute runs in `bf16` on the GPU backends (CUDA / Metal) and `f32` on CPU. Candle `Tensor`s are
@@ -75,21 +75,43 @@ pub fn snapshot_preparer_registry() -> core_llm::Result<core_llm::SnapshotPrepar
     register_snapshot_preparers(core_llm::SnapshotPreparerRegistryBuilder::new()).build()
 }
 
+/// Load a bundled Candle provider by descriptor id.
+pub fn load_textllm(
+    id: &str,
+    spec: &core_llm::LoadSpec,
+) -> core_llm::Result<Box<dyn core_llm::TextLlm>> {
+    text_registry()?.load_textllm(id, spec)
+}
+
+/// Select and load the bundled Candle provider that accepts `spec`.
+pub fn load_for_model(
+    spec: &core_llm::LoadSpec,
+) -> core_llm::Result<Box<dyn core_llm::TextLlm>> {
+    text_registry()?.load_for_model(spec)
+}
+
+/// Select and load a bundled Candle provider with explicit capability requirements.
+pub fn load_for_model_with(
+    spec: &core_llm::LoadSpec,
+    requirements: &core_llm::ModelRequirements,
+) -> core_llm::Result<Box<dyn core_llm::TextLlm>> {
+    text_registry()?.load_for_model_with(spec, requirements)
+}
+
+/// Prepare a snapshot through the bundled Candle preparer.
+pub fn prepare_snapshot(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::PrepareReport> {
+    snapshot_preparer_registry()?.prepare_snapshot(spec)
+}
+
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_matches_link_time_compatibility_catalog() {
-        let mut explicit: Vec<String> = super::text_registry()
+    fn explicit_catalog_is_complete_and_stable() {
+        let explicit: Vec<String> = super::text_registry()
             .unwrap()
             .registrations()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        let mut compatibility: Vec<String> = core_llm::textllms()
-            .map(|registration| (registration.descriptor)().id)
-            .collect();
-        explicit.sort();
-        compatibility.sort();
-        assert_eq!(explicit, compatibility);
         assert_eq!(explicit, ["candle-llama", "candle-llava"]);
 
         let preparers = super::snapshot_preparer_registry().unwrap();

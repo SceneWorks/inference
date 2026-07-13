@@ -11,14 +11,14 @@ Read `ARCHITECTURE.md` (design stance) and `docs/MODEL_ARCHITECTURE.md` (the `Ge
 ## Workspace layout
 
 - **`mlx-gen`** (root `src/`) — THE CORE: shared `nn` primitives, `adapters` (LoRA/LoKr `AdaptableLinear`), `weights`, `quant`, `sampler`/`scheduler`, `image`, `tokenizer`, `train` kernels. Re-exports `gen-core` at the historical `mlx_gen::…` paths. **No model-specific code.**
-- **`gen-core`** — backend-neutral contract layer (epic 3720) with **zero tensor deps**: the `Generator`/`Trainer`/`Captioner`/`Transform` traits, request/output/conditioning/progress/cancel/error types, the link-time registry, and pure host-side policy math (tokenization, PIL-compatible resize, tiling, LR schedule). The LLM contract is re-exported from `core-llm` as `gen_core::core_llm::TextLlm` (the local `gen_core::TextLlm` trait was removed in sc-7189); gen-core consumes core-llm rather than declaring it. Numeric types restricted to `f32`/`f64`/`Vec<f32>`/`&[u8]` — never an `Array`. Builds/tests on Linux.
+- **`gen-core`** — backend-neutral contract layer (epic 3720) with **zero tensor deps**: the `Generator`/`Trainer`/`Captioner`/`Transform` traits, request/output/conditioning/progress/cancel/error types, the explicit registry builders, and pure host-side policy math (tokenization, PIL-compatible resize, tiling, LR schedule). The LLM contract is re-exported from `core-llm` as `gen_core::core_llm::TextLlm` (the local `gen_core::TextLlm` trait was removed in sc-7189); gen-core consumes core-llm rather than declaring it. Numeric types restricted to `f32`/`f64`/`Vec<f32>`/`&[u8]` — never an `Array`. Builds/tests on Linux.
 - **`gen-core-testkit`** — conformance suite (also zero tensor deps); family crates dev-depend on it to run their real model through cancel/progress/seed/capabilities checks.
-- **`mlx-gen-<family>`** (29 crates) — provider crates: `-z-image`, `-flux`, `-flux2`, `-chroma`, `-qwen-image`, `-krea`, `-sdxl`, `-kolors`, `-sensenova`, `-wan`, `-ltx`, `-svd`, `-seedvr2`, `-pulid`, `-instantid`, `-face`, `-joycaption`, `-sam2`, `-sam3`, `-bernini`, `-scail2`, `-lens`, `-boogu`, `-ideogram`, `-sd3`, `-sana`, `-depth`, `-pid`, `-clip`. Most depend **only on `mlx-gen`** and self-register a model via `inventory`. The reuse map (sibling crate deps, NOT core-only) is now extensive — keep it straight before editing a reused crate:
+- **`mlx-gen-<family>`** (29 crates) — provider crates: `-z-image`, `-flux`, `-flux2`, `-chroma`, `-qwen-image`, `-krea`, `-sdxl`, `-kolors`, `-sensenova`, `-wan`, `-ltx`, `-svd`, `-seedvr2`, `-pulid`, `-instantid`, `-face`, `-joycaption`, `-sam2`, `-sam3`, `-bernini`, `-scail2`, `-lens`, `-boogu`, `-ideogram`, `-sd3`, `-sana`, `-depth`, `-pid`, `-clip`. Most depend **only on `mlx-gen`** and publish named registrations through a `register_providers` builder. The reuse map (sibling crate deps, NOT core-only) is now extensive — keep it straight before editing a reused crate:
   - `-pid` (the PiD super-resolving latent decoder overlay) is a near-universal dep: `boogu`, `chroma`, `flux`, `flux2`, `ideogram`, `instantid`, `kolors`, `krea`, `lens`, `qwen-image`, `sana`, `sdxl`, `z-image` all reuse it.
   - `-sdxl` is reused by `clip`, `flux`, `instantid`, `kolors`, `sd3`, `svd`.
   - `-flux` is reused by `chroma`, `pulid`, `sd3`. `-z-image` is reused by `boogu`, `chroma`, `flux`, `sd3`. `-sd3` builds on `-sdxl` + `-flux` + `-z-image`.
   - `-kolors` and `-instantid` build on `-sdxl`; `-pulid` is **FLUX-family** (builds on `-flux`, NOT `-sdxl`); both identity crates also use `-face`.
-  - `-instantid` is a **struct API** (`InstantId`/`InstantIdRequest`, composing SDXL UNet/ControlNet/Resampler parts) — it does **not** `inventory::submit!` a registered `Generator`.
+  - `-instantid` is a **struct API** (`InstantId`/`InstantIdRequest`, composing SDXL UNet/ControlNet/Resampler parts) — it does **not** publish a registered `Generator`.
 
 ## Build / lint / test
 
@@ -72,9 +72,11 @@ The split is deliberate — see `ARCHITECTURE.md`:
 
 1. `cargo new --lib mlx-gen-<x>`; depend on `mlx-gen`; add to root `Cargo.toml` `members`.
 2. Build on `mlx-gen`'s `nn`/`weights`/`quant`/`tokenizer`/`adapters` primitives.
-3. `impl Generator` (or `Transform`/`Captioner`/`Trainer`); provide `descriptor()` + `Capabilities`; `inventory::submit! { ModelRegistration { descriptor, load: load_registered } }`.
+3. `impl Generator` (or `Transform`/`Captioner`/`Trainer`); provide `descriptor()` + `Capabilities`, publish a named registration constant, and expose `register_providers`.
+4. If it ships on the platform, add that builder to `mlx-gen-catalog` and update its exact-surface test.
 
-**Linkage gotcha:** a provider self-registers only when actually linked. A declared-but-unreferenced dependency has its `inventory::submit!` statics dropped by the linker. A consumer that depends on a provider purely for the registration side-effect must force the link with `use mlx_gen_<x> as _;` (this is why the worker needs one such line per model crate, else "no generator registered").
+**Composition rule:** depending on a provider crate does not add it to a catalog. A family or platform
+catalog must call its builder explicitly; this is the reviewable source of truth for what ships.
 
 ## Testing philosophy
 

@@ -25,7 +25,8 @@ use candle_core::{DType, Device, Tensor};
 use candle_llm::primitives::sampler::{SplitMix64, TokenRng};
 use candle_llm::provider::PROVIDER_ID;
 use candle_llm::LlamaProvider;
-use core_llm::{load_for_model, LoadSpec, Message, Quantize, TextLlmRequest};
+use candle_llm::load_for_model;
+use core_llm::{LoadSpec, Message, Quantize, TextLlmRequest};
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 
 const VOCAB: usize = 32;

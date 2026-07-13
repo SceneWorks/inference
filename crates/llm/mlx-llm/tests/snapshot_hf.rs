@@ -96,7 +96,7 @@ fn hf_prepare_dense_q4_q8_loads_and_generates() {
         }
 
         // Also confirm the registry route resolves to the same provider id.
-        let routed = core_llm::load_textllm(PROVIDER_ID, &LoadSpec::dense(out.to_str().unwrap())).unwrap();
+        let routed = mlx_llm::load_textllm(PROVIDER_ID, &LoadSpec::dense(out.to_str().unwrap())).unwrap();
         assert_eq!(routed.descriptor().id, PROVIDER_ID, "{label}: registry routes to mlx provider");
 
         std::fs::remove_dir_all(&out).ok();

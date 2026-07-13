@@ -27,10 +27,11 @@
 use std::path::PathBuf;
 
 use core_llm::{
-    load_for_model_with, load_textllm, Channel, Content, ImageRef, LoadSpec, Message,
+    Channel, Content, ImageRef, LoadSpec, Message,
     ModelRequirements, Quantize, Role, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmRequest,
     ThinkingMode, Tokenizer, VideoRef,
 };
+use mlx_llm::{load_for_model_with, load_textllm};
 
 use mlx_llm::config::{Architecture, ModelConfig};
 use mlx_llm::decode::{generate, CancelFlag, GenerationConfig};
