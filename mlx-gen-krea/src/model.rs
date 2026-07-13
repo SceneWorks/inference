@@ -10,6 +10,7 @@
 //! end-to-end Turbo t2i [`crate::pipeline`] in sc-7571. [`Krea::generate`] now renders real images
 //! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
+use mlx_gen::img2img::init_time_step;
 use mlx_gen::media::Image;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
@@ -68,6 +69,9 @@ pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 /// manifest `default_steps` / `defaults.guidanceScale` mirror these (sc-9999 / sc-10003).
 const DEFAULT_RAW_STEPS: u32 = 52;
 const DEFAULT_RAW_GUIDANCE: f32 = 3.5;
+/// img2img reference fidelity default when neither the `Reference`'s own `strength` nor the
+/// request-level `strength` is set — the full-range slider's midpoint (epic 8588 A2/A3).
+const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
 
 /// Registry id for the **image-edit** variant (epic 10871). The Kontext-style edit surface shares the
 /// undistilled Raw pipeline (full-CFG, denoise-from-noise) but routes a single `Reference` — the SOURCE
@@ -511,7 +515,6 @@ impl Krea {
         } else {
             turbo_schedule(steps, req.scheduler.as_deref())
         };
-        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
         // Edit extracts its own ordered source list (a single `Reference` or a `MultiReference`
         // scene+person pair, epic 10871 P1.3); img2img/t2i use the single-`Reference` helper. Kept
         // separate so an edit's `MultiReference` never trips `single_reference`'s "exactly one
@@ -526,18 +529,24 @@ impl Krea {
         } else {
             single_reference(self.descriptor.id, req)?
         };
-        // A PiD `from_ldm` early-stop CAPTURE is not wired for img2img yet (sc-10121): reject THAT combo
-        // rather than silently desync the decoder's σ from the img2img-sliced schedule. A capture is
-        // active only when `keep` lands BEFORE the end of the schedule; the no-capture path reports
-        // `keep == sigmas.len()` and is fine with img2img (`flow_capture_for_request` returns
-        // `sigmas.len()`, NOT `usize::MAX`, for no-capture).
-        if img2img_conflicts_with_capture(reference.is_some(), keep, sigmas.len()) {
-            return Err(Error::Msg(format!(
-                "{}: PiD from_ldm early-stop is not supported with img2img reference conditioning \
-                 (tracked in sc-10121)",
-                self.descriptor.id
-            )));
-        }
+        // img2img resolves the PiD `from_ldm` capture against the SLICED window it actually denoises
+        // (sc-10121). An img2img job seeds the denoise at `start = init_time_step(strength)` and runs
+        // `sigmas[start..]`, so the capture index and its degrade σ MUST be resolved with that `start`
+        // or the decoder's σ desyncs from the truncated latent. `flow_capture_for_request`'s
+        // `start_step` does exactly that: it drops a capture whose ceiling would land at/before `start`
+        // (no benefit) and otherwise returns a `keep` (into the full schedule) whose `sigmas[keep-1]`
+        // matches the `render_*_img2img_from` truncation `sigmas[start..keep]` — so `capture_sigma`
+        // always names the σ of the latent actually handed to PiD. t2i / edit / control denoise the
+        // whole schedule from pure noise → `start = 0` (the reference-less default).
+        let img2img_strength = reference.map(|(_, ref_strength)| {
+            ref_strength
+                .or(req.strength)
+                .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
+        });
+        let start_step = img2img_strength
+            .map(|s| init_time_step(steps, Some(s)).min(sigmas.len().saturating_sub(1)))
+            .unwrap_or(0);
+        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
         // Raw CFG knobs: guidance defaults to the reference Raw preset, an empty/absent negative → ""
         // (reference `negative_prompts = [""] * n`). Inert on the Turbo (CFG-free) t2i/img2img path.
         // FORCED to 0 for `krea_2_turbo_edit` so the edit runs a single conditional forward — its
@@ -613,10 +622,12 @@ impl Krea {
                         req.width,
                         req.height,
                     )?)
-                } else if let Some((init, ref_strength)) = reference {
-                    // Reference fidelity: the Reference's own strength wins, else the request-level
-                    // img2img strength, else the 0.5 mid default (the full-range slider's default; A2/A3).
-                    let strength = ref_strength.or(req.strength).unwrap_or(0.5);
+                } else if let Some((init, _)) = reference {
+                    // Reference fidelity strength — resolved ONCE above (sc-10121) so the `start` the
+                    // capture `keep` was resolved against equals the one `render_*_img2img_from`
+                    // truncates on. `Some` here exactly when a reference is present.
+                    let strength = img2img_strength
+                        .expect("img2img_strength is Some whenever a reference is present");
                     let img2img = heavy.heavy.prepare_img2img(
                         &ctx.pos,
                         ctx.neg.as_ref(),
@@ -689,6 +700,10 @@ impl Krea {
                                 *strength,
                                 &opts,
                                 decoder,
+                                // from_ldm early-stop (sc-10121): `keep` truncates the img2img-sliced
+                                // schedule so the decoder built at `capture_sigma` gets the matching
+                                // partially-denoised latent; `sigmas.len()` (no capture) runs the tail.
+                                keep,
                                 &req.cancel,
                                 on_progress,
                             )?
@@ -699,6 +714,8 @@ impl Krea {
                                 *strength,
                                 &opts,
                                 decoder,
+                                // from_ldm early-stop (sc-10121): see the Raw arm above.
+                                keep,
                                 &req.cancel,
                                 on_progress,
                             )?
@@ -822,17 +839,6 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
     Ok(sources)
 }
 
-/// Whether an img2img reference conflicts with an ACTIVE PiD `from_ldm` early-stop capture — the combo
-/// deferred to sc-10121. A capture is active ONLY when [`flow_capture_for_request`]'s truncation `keep`
-/// lands strictly before the end of the schedule (`keep < num_sigmas`); the no-capture full-denoise path
-/// reports `keep == num_sigmas` (the PiD super-res decoder / native VAE then decodes the clean final
-/// latent — fine with img2img). Extracted + tested because the original inline guard compared `keep`
-/// against `usize::MAX`, a sentinel `flow_capture_for_request` never returns, so it rejected EVERY
-/// img2img generation (the on-device break this fixes).
-fn img2img_conflicts_with_capture(has_reference: bool, keep: usize, num_sigmas: usize) -> bool {
-    has_reference && keep < num_sigmas
-}
-
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Four variants register
 // here — `krea_2_turbo` (distilled t2i, CFG-free), `krea_2_raw` (undistilled t2i, full-CFG; epic 9992),
@@ -903,31 +909,50 @@ mod tests {
     }
 
     #[test]
-    fn img2img_conflicts_only_with_an_active_capture() {
-        // sc-10121 sentinel regression: the no-capture full-denoise path reports `keep == num_sigmas`
-        // (NOT usize::MAX). Plain img2img (no PiD capture) must be ACCEPTED; only a real from_ldm capture
-        // (`keep < num_sigmas`) conflicts.
-        let num_sigmas = 9; // an 8-step Turbo schedule has 9 sigmas.
-                            // No reference → never a conflict (plain txt2img, any keep).
-        assert!(!img2img_conflicts_with_capture(false, 5, num_sigmas));
-        assert!(!img2img_conflicts_with_capture(
-            false, num_sigmas, num_sigmas
-        ));
-        // Reference + NO capture (keep == num_sigmas) → allowed (the on-device break; must NOT conflict).
-        assert!(!img2img_conflicts_with_capture(
-            true, num_sigmas, num_sigmas
-        ));
-        // Reference + an ACTIVE from_ldm capture (keep truncates early) → the sc-10121 conflict.
-        assert!(img2img_conflicts_with_capture(true, 5, num_sigmas));
-        assert!(img2img_conflicts_with_capture(true, 0, num_sigmas));
-        // The old bug: `keep == usize::MAX` was the (wrong) allowed sentinel; the real allowed sentinel
-        // is `num_sigmas`. A capture value of usize::MAX (never produced) would be treated as no-conflict
-        // here only because it is not < num_sigmas — but the point is num_sigmas itself is now allowed.
-        assert!(!img2img_conflicts_with_capture(
-            true,
-            usize::MAX,
-            num_sigmas
-        ));
+    fn img2img_capture_window_agrees_with_decoder_sigma() {
+        // The sc-10121 core invariant, as pure host math (synthetic schedule + `init_time_step` +
+        // `flow_capture_for_request`, no weights): an img2img `from_ldm` capture is resolved against the
+        // SLICED window the denoise actually runs (`start = init_time_step(strength)`), so the decoder's
+        // degrade σ (`capture_sigma`) is EXACTLY the last σ of `full[start..keep]` — never desynced from
+        // the truncated latent — and a ceiling that would stop at/before `start` collapses to the clean
+        // σ=0 tail instead of a negative/empty window.
+        let full: [f32; 9] = [1.0, 0.9, 0.78, 0.64, 0.5, 0.36, 0.22, 0.1, 0.0];
+        let steps = full.len() - 1; // 8-step flow-match schedule (len = steps + 1).
+        let start_of = |strength: f32| init_time_step(steps, Some(strength)).min(full.len() - 1);
+        let capture_req = |ceiling: f32| GenerationRequest {
+            use_pid: true,
+            pid_capture_sigma: Some(ceiling),
+            ..Default::default()
+        };
+
+        // strength 0.5 → start = floor(8·0.5) = 4 (σ_start = 0.5); ceiling 0.25 → first σ ≤ 0.25 is
+        // full[6] = 0.22 → an ACTIVE capture that still denoises ≥ 1 img2img step.
+        let start = start_of(0.5);
+        assert_eq!(start, 4);
+        let (capture_sigma, keep) = flow_capture_for_request(&capture_req(0.25), &full, start);
+        assert!(keep < full.len(), "expected an active early stop");
+        assert!(keep > start, "must denoise at least one img2img step");
+        // No σ desync: the decoder's σ is exactly the sliced window's terminal σ.
+        let window = &full[start..keep];
+        assert_eq!(*window.last().unwrap(), capture_sigma);
+        assert_eq!(capture_sigma, full[keep - 1]);
+
+        // strength 0.9 → start = 7 (σ_start = 0.1), already below the 0.25 ceiling, so the capture would
+        // stop at/before the img2img start → NO benefit → collapse to the clean σ=0 full tail.
+        let late = start_of(0.9);
+        assert_eq!(late, 7);
+        let (late_sigma, late_keep) = flow_capture_for_request(&capture_req(0.25), &full, late);
+        assert_eq!(
+            late_keep,
+            full.len(),
+            "no-benefit capture runs the clean tail"
+        );
+        assert_eq!(late_sigma, 0.0);
+
+        // The reference-less t2i path (start = 0) is unaffected — the same ceiling still resolves.
+        let (t2i_sigma, t2i_keep) = flow_capture_for_request(&capture_req(0.25), &full, 0);
+        assert!(t2i_keep < full.len());
+        assert_eq!(t2i_sigma, full[t2i_keep - 1]);
     }
 
     #[test]
