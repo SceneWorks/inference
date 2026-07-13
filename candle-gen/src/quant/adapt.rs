@@ -232,14 +232,24 @@ impl LokrFactors {
         let dims = x.dims();
         let lead = &dims[..dims.len() - 1];
         let n: usize = lead.iter().product::<usize>().max(1);
-        // Collapse every leading dim into ONE batch axis, then reshape `[N, in] → [N, c, d]` and batch-
-        // matmul against explicit `[1, …]` factors that broadcast over `N`. Mirrors the mlx-gen
-        // vec-trick and sidesteps any matmul-rank ambiguity when a leading dim happens to equal `a`/`b`.
-        let xr = x.contiguous()?.reshape((n, self.c, self.d))?;
+        // Vec-trick `Y = w1 · X · w2ᵀ`, ordered so the **expensive** contraction (over `d`, the big
+        // inner factor) is ONE large-`M` GEMM rather than `N` tiny-`M` batched GEMMs. The prior form
+        // `w1b.broadcast_matmul(xr).broadcast_matmul(w2tb)` ran the `·w2ᵀ` leg as a batch of `N`
+        // `[a,d]·[d,b]` products with `M = a` — for a factor-4 LoKr `a = 4`, and `N` = the token count.
+        // On CUDA that batch of tiny-`M` GEMMs is pathologically slow at long sequences (a Krea
+        // image-edit's `N ≈ 6.6k` tokens turned an 8-step turbo edit into a multi-minute grind, and it
+        // inflated VRAM), while the flop count barely rises. Fold the `N·c` rows into the GEMM's `M`:
+        //   T = X · w2ᵀ : `[N·c, d] · [d, b] → [N·c, b]`  (single GEMM, `M = N·c`),
+        // then apply the tiny outer `w1` (contraction over `c` — cheap however it batches). Associativity
+        // makes this bit-equal (to f32 rounding) to the old order, so the `structured_lokr_*` deltas hold.
+        let t = x
+            .contiguous()?
+            .reshape((n * self.c, self.d))?
+            .matmul(&w2t)? // [N·c, b]
+            .reshape((n, self.c, self.b))?;
         let w1b = w1.reshape((1, self.a, self.c))?;
-        let w2tb = w2t.reshape((1, self.d, self.b))?;
-        // Y = w1 · X · w2ᵀ  → [N, a, b].
-        let y = w1b.broadcast_matmul(&xr)?.broadcast_matmul(&w2tb)?;
+        // Y = w1 · T  → [N, a, b] (batch `N`, but `M = a` / `K = c` are the tiny outer factor ⇒ cheap).
+        let y = w1b.broadcast_matmul(&t)?;
         // [N, a, b] → [.., out] (out = a·b), restoring the original leading dims (row-major flatten).
         let mut ys = lead.to_vec();
         ys.push(self.a * self.b);
