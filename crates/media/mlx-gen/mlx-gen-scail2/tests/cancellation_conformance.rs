@@ -12,11 +12,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::{
-    registry, Conditioning, GenerationRequest, Image, LoadSpec, ReplacementMode, WeightsSource,
-};
-// Force-link the provider so its `inventory::submit!` registration survives the linker; otherwise
-// `mlx_gen::load` reports "no generator registered". The worker does the same per model crate.
+use mlx_gen::{Conditioning, GenerationRequest, Image, LoadSpec, ReplacementMode, WeightsSource};
 use mlx_gen_scail2::pipeline::MODEL_ID;
 
 fn snapshot_dir() -> PathBuf {
@@ -112,8 +108,10 @@ fn scail2_honors_typed_cancellation() {
         ..Default::default()
     };
 
-    let gen =
-        registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(root))).expect("load scail2");
+    let gen = mlx_gen_scail2::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(root)))
+        .expect("load scail2");
 
     gen_core_testkit::check_cancellation_with(gen.as_ref(), &req)
         .expect("scail2_14b must honor the typed-cancellation contract");

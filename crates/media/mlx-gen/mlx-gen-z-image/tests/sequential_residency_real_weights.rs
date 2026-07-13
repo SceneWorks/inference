@@ -11,10 +11,6 @@
 
 mod common;
 
-// Force-link the provider crate so its `inventory` generator registration runs (this test only
-// calls `mlx_gen::load("z_image_turbo", …)`).
-use mlx_gen_z_image as _;
-
 use common::snapshot;
 use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Quant, WeightsSource,
@@ -97,7 +93,10 @@ fn render_measured_id(
     req: &GenerationRequest,
 ) -> (Vec<u8>, usize) {
     let spec = spec.with_offload_policy(policy);
-    let model = mlx_gen::load(model_id, &spec).expect("load model");
+    let model = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load(model_id, &spec)
+        .expect("load model");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

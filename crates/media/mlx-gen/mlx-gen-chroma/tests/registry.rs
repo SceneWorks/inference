@@ -1,16 +1,18 @@
-//! sc-3835: the three Chroma variants self-register through the core registry with the expected
+//! sc-3835: the explicit Chroma provider catalog exposes all three variants with the expected
 //! family + capability surface, and the loader rejects a single-file spec (it wants a diffusers
 //! snapshot directory).
 
 use mlx_gen::{GenerationRequest, LoadSpec, WeightsSource};
-use mlx_gen_chroma as _;
 
 #[test]
-fn chroma_variants_resolve_through_core_registry() {
+fn chroma_variants_resolve_through_provider_catalog() {
     for id in ["chroma1_hd", "chroma1_base", "chroma1_flash"] {
-        let reg = mlx_gen::registry::generators()
+        let reg = mlx_gen_chroma::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
             .find(|r| (r.descriptor)().id == id)
-            .unwrap_or_else(|| panic!("{id} provider should self-register"));
+            .unwrap_or_else(|| panic!("provider catalog should export {id}"));
         let d = (reg.descriptor)();
         assert_eq!(d.family, "chroma");
         // Chroma uses true CFG with a real negative prompt; no distilled guidance scalar.
@@ -23,7 +25,9 @@ fn chroma_variants_resolve_through_core_registry() {
         assert!(d.capabilities.conditioning.is_empty());
 
         let spec = LoadSpec::new(WeightsSource::File("/unused.safetensors".into()));
-        let err = mlx_gen::load(id, &spec)
+        let err = mlx_gen_chroma::provider_registry()
+            .unwrap()
+            .load(id, &spec)
             .err()
             .expect("single-file spec is rejected by the loader")
             .to_string();
@@ -36,7 +40,10 @@ fn chroma_variants_resolve_through_core_registry() {
 
 #[test]
 fn chroma_validate_rejects_unsupported_surface() {
-    let reg = mlx_gen::registry::generators()
+    let reg = mlx_gen_chroma::provider_registry()
+        .unwrap()
+        .generators()
+        .copied()
         .find(|r| (r.descriptor)().id == "chroma1_hd")
         .expect("chroma1_hd registered");
     let d = (reg.descriptor)();

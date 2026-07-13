@@ -247,7 +247,7 @@ fn e2e_vae_and_image_matches_golden() {
 }
 
 /// The integration proof: the full prompt→image pipeline through the **public** Generator API
-/// (`mlx_gen::load("z_image_turbo", …).generate(req)`), compared to the fork's golden render.
+/// (`provider_registry().load("z_image_turbo", …).generate(req)`), compared to the fork's golden render.
 #[test]
 #[ignore = "needs real Z-Image weights + local golden"]
 fn e2e_full_pipeline_generates_fox() {
@@ -282,7 +282,10 @@ fn e2e_full_pipeline_generates_fox() {
 
     // Full pipeline through the public API: load(id, spec) -> generate(req).
     let spec = LoadSpec::new(WeightsSource::Dir(snap));
-    let generator = mlx_gen::load("z_image_turbo", &spec).unwrap();
+    let generator = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image_turbo", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: prompt.clone(),
         width: w,
@@ -561,7 +564,10 @@ fn q_full_generate_renders(golden_path: &str, quant: mlx_gen::Quant, bits: i32, 
     assert_golden_schedule_is_production(&g, steps, w, h, seed, &prompt);
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_quant(quant);
-    let generator = mlx_gen::load("z_image_turbo", &spec).unwrap();
+    let generator = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image_turbo", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width: w,

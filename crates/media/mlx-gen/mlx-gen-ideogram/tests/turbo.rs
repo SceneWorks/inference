@@ -103,7 +103,10 @@ fn turbo_host_map_covers_turbotime_targets() {
 fn turbo_generates_single_dit_8step() {
     // Full production path: registry load applies the bundled TurboTime LoRA onto a single DiT.
     let spec = LoadSpec::new(WeightsSource::Dir(turbo_snapshot_dir()));
-    let gen = mlx_gen::load(MODEL_ID_TURBO, &spec).expect("ideogram_4_turbo loads via registry");
+    let gen = mlx_gen_ideogram::provider_registry()
+        .unwrap()
+        .load(MODEL_ID_TURBO, &spec)
+        .expect("ideogram_4_turbo loads via registry");
 
     let envn = |k: &str, d: u32| {
         std::env::var(k)

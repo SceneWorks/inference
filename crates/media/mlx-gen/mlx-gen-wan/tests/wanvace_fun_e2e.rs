@@ -25,7 +25,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    registry, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant,
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant,
     ReplacementMode, WeightsSource,
 };
 use mlx_gen_wan::convert::assemble_wan_vace_fun_snapshot;
@@ -104,11 +104,13 @@ fn wan_vace_fun_dual_expert_generate_smoke() {
 
     // Q4 keeps the dual-14B steady-state safe on 128 GB. The engine loads both experts, switches at
     // boundary 0.875 across the schedule, and decodes.
-    let g = registry::load(
-        MODEL_ID_VACE_FUN,
-        &LoadSpec::new(WeightsSource::Dir(dir)).with_quant(Quant::Q4),
-    )
-    .expect("load wan2_2_vace_fun_14b");
+    let g = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_VACE_FUN,
+            &LoadSpec::new(WeightsSource::Dir(dir)).with_quant(Quant::Q4),
+        )
+        .expect("load wan2_2_vace_fun_14b");
 
     let (w, h, n) = (256u32, 256u32, 13usize); // n=13 = 1 + 4·3 → t_lat = 4
     let req = GenerationRequest {

@@ -5,7 +5,6 @@
 use std::path::PathBuf;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
-use mlx_gen_flux as _;
 
 #[test]
 #[ignore = "evaluates the full FLUX.1 transformer/VAE; set MLX_GEN_FLUX_SNAPSHOT"]
@@ -15,7 +14,10 @@ fn flux1_schnell_generates_one_image_smoke() {
             .expect("set MLX_GEN_FLUX_SNAPSHOT to a FLUX.1-schnell snapshot directory"),
     );
     let spec = LoadSpec::new(WeightsSource::Dir(root));
-    let model = mlx_gen::load("flux1_schnell", &spec).unwrap();
+    let model = mlx_gen_flux::provider_registry()
+        .unwrap()
+        .load("flux1_schnell", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: "a red fox".into(),
         width: 256,

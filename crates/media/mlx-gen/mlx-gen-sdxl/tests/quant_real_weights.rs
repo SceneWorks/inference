@@ -18,7 +18,6 @@ use std::path::PathBuf;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, WeightsSource};
-use mlx_gen_sdxl as _;
 use mlx_gen_sdxl::load_unet;
 use mlx_rs::ops::eq;
 use mlx_rs::{Array, Dtype};
@@ -78,7 +77,10 @@ fn q8_q4_scales_byte_match() {
 
 fn render_quant(q: Quant, g: &Weights) -> Image {
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_quant(q);
-    let model = mlx_gen::load("sdxl", &spec).unwrap();
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load("sdxl", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: g.metadata("prompt").unwrap().to_string(),
         negative_prompt: Some(g.metadata("negative").unwrap().to_string()),

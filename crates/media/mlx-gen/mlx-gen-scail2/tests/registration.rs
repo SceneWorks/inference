@@ -22,19 +22,25 @@ fn descriptor_is_scail2() {
 }
 
 #[test]
-fn registered_in_inventory() {
+fn registered_in_provider_catalog() {
     assert!(
-        mlx_gen::registry::generators().any(|r| (r.descriptor)().id == "scail2_14b"),
-        "scail2_14b should self-register via inventory::submit!"
+        mlx_gen_scail2::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
+            .any(|r| (r.descriptor)().id == "scail2_14b"),
+        "provider catalog should export scail2_14b"
     );
 }
 
 #[test]
 fn load_by_id_reaches_our_loader() {
-    // Registered → `registry::load` resolves us → our loader errors on the missing dir (NOT the
+    // Registered → `provider_registry().load` resolves us → our loader errors on the missing dir (NOT the
     // registry's "no generator registered" miss). Proves both registration and the load path.
     let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/scail2".into()));
-    let err = mlx_gen::registry::load("scail2_14b", &spec)
+    let err = mlx_gen_scail2::provider_registry()
+        .unwrap()
+        .load("scail2_14b", &spec)
         .err()
         .expect("loading from a nonexistent dir must fail");
     let msg = format!("{err}");

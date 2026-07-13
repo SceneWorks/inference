@@ -42,8 +42,6 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_rs::{Array, Dtype};
 
-// Force the linker to keep `mlx-gen-sd3`'s `inventory::submit!` registration static (reached only via
-// the `mlx_gen::load` registry — the CLAUDE.md "Linkage gotcha").
 use mlx_gen_sd3 as sd3;
 
 /// The render prompt — must match `PROMPT` in `tools/dump_sd3_empty_negative_e2e_golden.py`.
@@ -145,7 +143,6 @@ fn rel(a: &Array, b: &Array) -> (f32, f32) {
 #[test]
 #[ignore = "needs the SD3.5-Large snapshot (SD3_LARGE_SNAPSHOT) + tools/golden/sd3_5_large_empty_negative_e2e.safetensors + Metal"]
 fn default_empty_negative_matches_diffusers() {
-    // Reference a crate symbol so the generator's `inventory::submit!` static is linked.
     assert_eq!(sd3::MODEL_ID, "sd3_5_large");
 
     let Some(g) = try_golden() else {
@@ -192,7 +189,9 @@ fn default_empty_negative_matches_diffusers() {
     );
 
     // ---- SECONDARY: end-to-end coherence smoke (NOT a cross-backend pixel gate) ----
-    let gen = mlx_gen::load(sd3::MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir)))
+    let gen = mlx_gen_sd3::provider_registry()
+        .unwrap()
+        .load(sd3::MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir)))
         .expect("load sd3_5_large");
     let req = GenerationRequest {
         prompt: PROMPT.into(),

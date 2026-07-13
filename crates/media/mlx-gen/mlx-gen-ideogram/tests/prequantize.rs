@@ -11,7 +11,6 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::CAPTION_JSON;
-use mlx_gen::gen_core::registry;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_ideogram::{convert, MODEL_ID};
 use mlx_rs::memory::{get_peak_memory, reset_peak_memory};
@@ -71,7 +70,10 @@ fn prequantize_loads_and_generates() {
     //    weights and build quantized linears directly (no dense bf16 ever materialized).
     reset_peak_memory();
     let spec = LoadSpec::new(WeightsSource::Dir(dst.clone()));
-    let g = registry::load(MODEL_ID, &spec).expect("load packed Q4 snapshot");
+    let g = mlx_gen_ideogram::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load packed Q4 snapshot");
     assert_eq!(g.descriptor().id, "ideogram_4");
 
     // 3. Generate + measure the peak (should be ~Q4 runtime levels, never the 53 GB dense source).

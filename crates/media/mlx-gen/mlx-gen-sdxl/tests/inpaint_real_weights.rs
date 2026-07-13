@@ -14,8 +14,7 @@
 mod common;
 
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-use mlx_gen_sdxl as _;
-use mlx_gen_sdxl::{decode_image, encode_init_latents, load_vae}; // force-link the provider so `inventory` registers "sdxl"
+use mlx_gen_sdxl::{decode_image, encode_init_latents, load_vae};
 
 use common::snapshot;
 

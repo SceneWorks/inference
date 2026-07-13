@@ -11,7 +11,6 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::gen_core::registry;
 use mlx_gen::{
     CancelFlag, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
     WeightsSource,
@@ -89,7 +88,9 @@ fn base_generates_via_registry() {
         eprintln!("skipping: set BOOGU_BASE_DIR");
         return;
     };
-    let g = registry::load(BOOGU_IMAGE_ID, &LoadSpec::new(WeightsSource::Dir(root)))
+    let g = mlx_gen_boogu::provider_registry()
+        .unwrap()
+        .load(BOOGU_IMAGE_ID, &LoadSpec::new(WeightsSource::Dir(root)))
         .expect("registry load boogu_image");
     assert_eq!(g.descriptor().id, "boogu_image");
 
@@ -135,11 +136,13 @@ fn turbo_generates_via_registry() {
         eprintln!("skipping: set BOOGU_TURBO_DIR");
         return;
     };
-    let g = registry::load(
-        BOOGU_IMAGE_TURBO_ID,
-        &LoadSpec::new(WeightsSource::Dir(root)),
-    )
-    .expect("registry load boogu_image_turbo");
+    let g = mlx_gen_boogu::provider_registry()
+        .unwrap()
+        .load(
+            BOOGU_IMAGE_TURBO_ID,
+            &LoadSpec::new(WeightsSource::Dir(root)),
+        )
+        .expect("registry load boogu_image_turbo");
     assert_eq!(g.descriptor().id, "boogu_image_turbo");
     assert!(
         !g.descriptor().capabilities.supports_guidance,
@@ -168,11 +171,13 @@ fn edit_generates_via_registry() {
         eprintln!("skipping: set BOOGU_EDIT_DIR");
         return;
     };
-    let g = registry::load(
-        BOOGU_IMAGE_EDIT_ID,
-        &LoadSpec::new(WeightsSource::Dir(root)),
-    )
-    .expect("registry load boogu_image_edit");
+    let g = mlx_gen_boogu::provider_registry()
+        .unwrap()
+        .load(
+            BOOGU_IMAGE_EDIT_ID,
+            &LoadSpec::new(WeightsSource::Dir(root)),
+        )
+        .expect("registry load boogu_image_edit");
     assert_eq!(g.descriptor().id, "boogu_image_edit");
 
     // Edit with no reference must error (the source is required).

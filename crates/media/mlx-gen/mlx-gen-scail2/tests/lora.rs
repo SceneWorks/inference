@@ -209,7 +209,10 @@ fn lora_apply_smoke() {
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }
-    let gen = mlx_gen::registry::load(MODEL_ID, &spec).expect("load scail2 provider with LoRA");
+    let gen = mlx_gen_scail2::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load scail2 provider with LoRA");
 
     let mut last_step = 0u32;
     let out = gen
@@ -351,7 +354,10 @@ fn diff_patch_rejected_on_prequantized() {
         1.0,
         AdapterKind::Lora,
     )]);
-    let gen = mlx_gen::registry::load(MODEL_ID, &spec).expect("load scail2 provider");
+    let gen = mlx_gen_scail2::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load scail2 provider");
     let err = gen
         .generate(&req, &mut |_| {})
         .expect_err("a diff-patch LoRA on a pre-quantized snapshot must be rejected");

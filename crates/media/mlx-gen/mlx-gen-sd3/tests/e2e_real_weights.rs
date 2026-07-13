@@ -7,7 +7,7 @@
 //! (or `SD3_LARGE_SNAPSHOT`) and Metal. Run with:
 //!   cargo test -p mlx-gen-sd3 --release --test e2e_real_weights -- --ignored --nocapture
 //!
-//! The smoke drives the PUBLIC registry path (`mlx_gen::load("sd3_5_large", spec).generate(req)`),
+//! The smoke drives the PUBLIC registry path (`provider_registry().load("sd3_5_large", spec).generate(req)`),
 //! saves the PNG, and reports sanity signals (the coordinator can't view the image): per-channel
 //! mean/std (NOT constant, NOT pure-noise), a histogram spread, and a crude spatial-coherence signal
 //! (mean absolute neighbor gradient — low-but-nonzero = structured content, not white noise).
@@ -16,8 +16,6 @@ use std::path::PathBuf;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 
-// Force the linker to keep `mlx-gen-sd3`'s `inventory::submit!` registration static (it is otherwise
-// dropped as unreferenced, since this test reaches the generator only through the `mlx_gen::load`
 // registry — the CLAUDE.md "Linkage gotcha"). Asserting the id keeps the import honest.
 use mlx_gen_sd3 as sd3;
 
@@ -96,13 +94,14 @@ fn run_smoke(label: &str, w: u32, h: u32, steps: u32, quant: Quant, guidance: f3
          guidance={guidance} ===\nsnapshot: {snap:?}"
     );
 
-    // Reference a crate symbol so the generator's `inventory::submit!` static is linked (see the
-    // `use mlx_gen_sd3 as sd3` note above).
     assert_eq!(sd3::MODEL_ID, "sd3_5_large");
 
     let spec = LoadSpec::new(WeightsSource::Dir(snap)).with_quant(quant);
     let t_load = std::time::Instant::now();
-    let generator = mlx_gen::load(sd3::MODEL_ID, &spec).expect("load sd3_5_large");
+    let generator = mlx_gen_sd3::provider_registry()
+        .unwrap()
+        .load(sd3::MODEL_ID, &spec)
+        .expect("load sd3_5_large");
     eprintln!("loaded in {:.1}s", t_load.elapsed().as_secs_f32());
 
     let req = GenerationRequest {

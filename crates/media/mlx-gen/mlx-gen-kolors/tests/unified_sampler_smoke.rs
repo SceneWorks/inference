@@ -19,7 +19,6 @@
 mod common;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Reference the provider crate so its `inventory` registration links (`mlx_gen::load` resolves it).
 use mlx_gen_kolors::MODEL_ID;
 
 const W: u32 = 512;
@@ -77,7 +76,10 @@ fn assert_coherent(img: &Image, label: &str) {
 fn render(sampler: Option<&str>, scheduler: Option<&str>) -> Option<Image> {
     let root = snapshot()?;
     let spec = LoadSpec::new(WeightsSource::Dir(root));
-    let generator = mlx_gen::load(MODEL_ID, &spec).expect("load kolors");
+    let generator = mlx_gen_kolors::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load kolors");
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: W,

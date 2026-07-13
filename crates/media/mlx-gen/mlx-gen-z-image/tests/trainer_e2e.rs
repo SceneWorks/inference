@@ -1,5 +1,5 @@
 //! sc-3044 e2e — the production `ZImageTurboTrainer` (the `Trainer` contract realized on Z-Image),
-//! driven through the core registry exactly as the SceneWorks worker will.
+//! driven through the explicit provider registry.
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` weights in the HF cache (or
 //! `ZIMAGE_SNAPSHOT`). Run:
@@ -49,17 +49,16 @@ fn z_image_trainer_trains_and_writes_adapter() {
     let tmp = std::env::temp_dir().join("z_image_trainer_e2e");
     let items = make_dataset(&tmp);
 
-    // Reference the provider crate so its `inventory::submit!` registration is linked into this
-    // test binary (a consumer that links the crate — like the worker — gets this for free; an
-    // integration test that names nothing from the crate would otherwise have it dead-stripped).
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
 
-    // Load the trainer through the registry (validates self-registration), exactly like the worker.
-    let mut trainer = mlx_gen::load_trainer(
-        "z_image_turbo",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .expect("z_image_turbo trainer should be registered");
+    // Load the trainer through the explicit provider registry.
+    let mut trainer = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "z_image_turbo",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .expect("z_image_turbo trainer should be registered");
 
     let config = TrainingConfig {
         rank: 8,
@@ -190,11 +189,13 @@ fn z_image_trainer_lokr_trains_and_reloads() {
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
 
-    let mut trainer = mlx_gen::load_trainer(
-        "z_image_turbo",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .expect("z_image_turbo trainer should be registered");
+    let mut trainer = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "z_image_turbo",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .expect("z_image_turbo trainer should be registered");
 
     let config = TrainingConfig {
         rank: 8,
@@ -318,11 +319,13 @@ fn z_image_trainer_emits_preview_samples() {
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
 
-    let mut trainer = mlx_gen::load_trainer(
-        "z_image_turbo",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .expect("z_image_turbo trainer should be registered");
+    let mut trainer = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load_trainer(
+            "z_image_turbo",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .expect("z_image_turbo trainer should be registered");
 
     let config = TrainingConfig {
         rank: 8,

@@ -117,11 +117,13 @@ fn step0_velocity_matches_fork() {
 #[ignore = "needs real FLUX.2-klein-9b snapshot + tools/golden/flux2_e2e.safetensors"]
 fn full_generate_matches_fork_composition() {
     let g = golden();
-    let gen = mlx_gen::load(
-        "flux2_klein_9b",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .unwrap();
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load(
+            "flux2_klein_9b",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .unwrap();
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: 256,

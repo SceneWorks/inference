@@ -21,10 +21,6 @@
 
 mod common;
 
-// Force-link the provider crate so its `inventory` generator registration runs — this test only
-// calls `mlx_gen::load("sdxl", …)` and would otherwise dead-strip `mlx_gen_sdxl` (cf. sibling tests).
-use mlx_gen_sdxl as _;
-
 use common::snapshot;
 use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Quant, WeightsSource,
@@ -70,7 +66,10 @@ fn base_spec() -> LoadSpec {
 /// before returning so the NEXT measurement starts from a clean allocator.
 fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, usize) {
     let spec = base_spec().with_offload_policy(policy);
-    let model = mlx_gen::load("sdxl", &spec).expect("load sdxl");
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load("sdxl", &spec)
+        .expect("load sdxl");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

@@ -1,5 +1,5 @@
 //! sc-5148 e2e — the production [`LensTrainer`] (the `Trainer` contract realized on the base
-//! `microsoft/Lens` DiT), driven through the core registry exactly as the SceneWorks worker will.
+//! `microsoft/Lens` DiT), driven through the explicit provider registry.
 //!
 //! `#[ignore]`d — needs the real `SceneWorks/Lens` weights in the HF cache (or `LENS_SNAPSHOT`). Run:
 //!   cargo test -p mlx-gen-lens --release --test trainer_e2e -- --ignored --nocapture
@@ -140,13 +140,13 @@ fn lens_trainer_trains_and_writes_lora() {
     let tmp = std::env::temp_dir().join("lens_trainer_lora_e2e");
     let items = make_dataset(&tmp);
 
-    // Reference the crate so its `inventory::submit!` registration links into this binary.
     assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
 
-    // Load the trainer through the registry (validates self-registration), exactly like the worker.
-    let mut trainer =
-        mlx_gen::load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
-            .expect("lens trainer should be registered");
+    // Load the trainer through the explicit provider registry.
+    let mut trainer = mlx_gen_lens::provider_registry()
+        .unwrap()
+        .load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
+        .expect("lens trainer should be registered");
 
     let config = TrainingConfig {
         rank: 8,
@@ -253,9 +253,10 @@ fn lens_trainer_trains_with_gradient_checkpointing() {
     let tmp = std::env::temp_dir().join("lens_trainer_ckpt_e2e");
     let items = make_dataset(&tmp);
 
-    let mut trainer =
-        mlx_gen::load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
-            .expect("lens trainer should be registered");
+    let mut trainer = mlx_gen_lens::provider_registry()
+        .unwrap()
+        .load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
+        .expect("lens trainer should be registered");
 
     let config = TrainingConfig {
         rank: 8,
@@ -338,9 +339,10 @@ fn lens_trainer_trains_and_reloads_lokr() {
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
 
-    let mut trainer =
-        mlx_gen::load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
-            .expect("lens trainer should be registered");
+    let mut trainer = mlx_gen_lens::provider_registry()
+        .unwrap()
+        .load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
+        .expect("lens trainer should be registered");
 
     let config = TrainingConfig {
         rank: 8,
@@ -445,9 +447,10 @@ fn lens_trainer_emits_preview_samples() {
     let tmp = std::env::temp_dir().join("lens_trainer_samples_e2e");
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
-    let mut trainer =
-        mlx_gen::load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
-            .expect("lens trainer should be registered");
+    let mut trainer = mlx_gen_lens::provider_registry()
+        .unwrap()
+        .load_trainer("lens", &LoadSpec::new(WeightsSource::Dir(root.clone())))
+        .expect("lens trainer should be registered");
 
     let config = TrainingConfig {
         rank: 8,

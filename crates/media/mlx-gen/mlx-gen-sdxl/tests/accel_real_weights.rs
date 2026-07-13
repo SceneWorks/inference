@@ -27,7 +27,6 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
-use mlx_gen_sdxl as _;
 
 use common::snapshot;
 
@@ -114,7 +113,9 @@ fn few_step_renders_are_coherent() {
         assert!(lora.exists(), "{sampler} LoRA missing: {}", lora.display());
         let spec =
             LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![lora_spec(lora, 1.0)]);
-        let model = mlx_gen::load("sdxl", &spec)
+        let model = mlx_gen_sdxl::provider_registry()
+            .unwrap()
+            .load("sdxl", &spec)
             .unwrap_or_else(|e| panic!("load sdxl + {sampler} LoRA: {e}"));
         let req = GenerationRequest {
             prompt: prompt.clone(),

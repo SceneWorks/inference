@@ -20,9 +20,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Force the linker to keep this crate's `inventory::submit!` model registrations (the CLAUDE.md
-// linkage gotcha) so `mlx_gen::load("ideogram_4", …)` resolves from the test binary.
-use mlx_gen_ideogram as _;
 
 const MODEL_ID: &str = "ideogram_4";
 
@@ -119,7 +116,10 @@ fn ideogram_4_pid_decode_vs_vae() {
 
     eprintln!("loading ideogram-4-mlx (+PiD overlay), size={size} ...");
     let t = Instant::now();
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load ideogram-4 + PiD");
+    let model = mlx_gen_ideogram::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load ideogram-4 + PiD");
     eprintln!("loaded in {:.1}s", t.elapsed().as_secs_f32());
 
     // Ideogram 4 expects a JSON-caption prompt; a short structured caption is enough for the smoke

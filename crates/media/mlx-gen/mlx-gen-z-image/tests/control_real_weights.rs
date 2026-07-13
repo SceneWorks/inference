@@ -688,7 +688,10 @@ fn full_pipeline(golden_path: &str, quant: Option<Quant>, bits_label: &str, max_
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }
-    let generator = mlx_gen::load("z_image_turbo_control", &spec).unwrap();
+    let generator = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image_turbo_control", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width: w,

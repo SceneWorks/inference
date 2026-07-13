@@ -92,7 +92,10 @@ fn prequantize_turnkey_loads_packed_and_renders() {
     // Load DIRECTLY from the packed dir (packed-detect). `with_quant` is honored but the packed
     // weights are already quantized, so the post-load `.quantize` calls no-op.
     let spec = LoadSpec::new(WeightsSource::Dir(out.clone())).with_quant(quant);
-    let generator = mlx_gen::load("flux1_dev", &spec).expect("packed flux1_dev loads");
+    let generator = mlx_gen_flux::provider_registry()
+        .unwrap()
+        .load("flux1_dev", &spec)
+        .expect("packed flux1_dev loads");
 
     // Small/short — packed load-path proof, not a quality bench (the 12B DiT is slow). FLUX.1-dev is
     // guidance-distilled (embedded guidance, single forward/step).

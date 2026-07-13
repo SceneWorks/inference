@@ -1,5 +1,5 @@
 //! sc-4568 e2e — the production `KolorsTrainer` (the `Trainer` contract realized on the Kolors
-//! U-Net), driven through the core registry exactly as the SceneWorks worker will.
+//! U-Net), driven through the explicit provider registry.
 //!
 //! `#[ignore]`d — needs the real `Kwai-Kolors/Kolors-diffusers` snapshot in the HF cache (or
 //! `KOLORS_SNAPSHOT`), with the materialized `tokenizer/tokenizer.json`. Run:
@@ -88,14 +88,12 @@ fn run_cfg(
     gradient_checkpointing: bool,
 ) -> (Vec<f32>, u32, PathBuf) {
     let items = make_dataset(tmp);
-    // Reference the provider crate so its `inventory::submit!` registration is linked into this test
-    // binary (a consumer that links the crate gets it for free; an integration test that names
-    // nothing from the crate would otherwise have it dead-stripped).
     assert_eq!(mlx_gen_kolors::MODEL_ID, "kolors");
 
-    let mut trainer =
-        mlx_gen::load_trainer("kolors", &LoadSpec::new(WeightsSource::Dir(snapshot())))
-            .expect("kolors trainer should be registered");
+    let mut trainer = mlx_gen_kolors::provider_registry()
+        .unwrap()
+        .load_trainer("kolors", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("kolors trainer should be registered");
 
     let req = TrainingRequest {
         items,
@@ -289,9 +287,10 @@ fn kolors_trainer_emits_preview_samples() {
     let tmp = std::env::temp_dir().join("kolors_trainer_samples_e2e");
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_kolors::MODEL_ID, "kolors");
-    let mut trainer =
-        mlx_gen::load_trainer("kolors", &LoadSpec::new(WeightsSource::Dir(snapshot())))
-            .expect("kolors trainer should be registered");
+    let mut trainer = mlx_gen_kolors::provider_registry()
+        .unwrap()
+        .load_trainer("kolors", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("kolors trainer should be registered");
 
     let mut cfg = config(NetworkType::Lora, false);
     cfg.steps = 8;

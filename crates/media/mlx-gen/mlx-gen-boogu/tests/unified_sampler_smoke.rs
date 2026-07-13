@@ -17,7 +17,6 @@
 use std::path::{Path, PathBuf};
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Reference the provider crate so its `inventory` registration links (`mlx_gen::load` resolves it).
 use mlx_gen_boogu::BOOGU_IMAGE_ID;
 
 const W: u32 = 256;
@@ -77,7 +76,10 @@ fn assert_coherent(img: &Image, label: &str) {
 
 fn render(root: &Path, sampler: Option<&str>, scheduler: Option<&str>) -> Image {
     let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
-    let generator = mlx_gen::load(BOOGU_IMAGE_ID, &spec).expect("load boogu_image");
+    let generator = mlx_gen_boogu::provider_registry()
+        .unwrap()
+        .load(BOOGU_IMAGE_ID, &spec)
+        .expect("load boogu_image");
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: W,

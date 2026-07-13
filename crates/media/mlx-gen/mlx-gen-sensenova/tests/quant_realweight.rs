@@ -9,8 +9,6 @@
 
 use std::path::PathBuf;
 
-use mlx_gen_sensenova as _; // force-link the inventory registration for mlx_gen::load.
-
 use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant, WeightsSource,
 };
@@ -28,7 +26,10 @@ fn snapshot_dir() -> PathBuf {
 }
 
 fn render(spec: &LoadSpec) -> Image {
-    let model = mlx_gen::load("sensenova_u1_8b", spec).expect("load");
+    let model = mlx_gen_sensenova::provider_registry()
+        .unwrap()
+        .load("sensenova_u1_8b", spec)
+        .expect("load");
     let req = GenerationRequest {
         prompt: "a red apple on a wooden table, studio lighting".into(),
         width: 256,

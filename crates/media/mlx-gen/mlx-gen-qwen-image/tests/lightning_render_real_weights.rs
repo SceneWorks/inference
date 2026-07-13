@@ -4,7 +4,7 @@
 //! loads cleanly (`adapter_real_weights::lightning_loras_apply_cleanly`, 840/840 modules), and the
 //! transformer + VAE + denoise loop are the SAME pixel-parity components as the production base path
 //! (`e2e_real_weights`, 0.000% px>8 vs the fork — itself a diffusers port). What this gate adds is the
-//! **integration** proof: `mlx_gen::load("qwen_image", spec.with_adapters([lightning])).generate(req
+//! **integration** proof: `provider_registry().load("qwen_image", spec.with_adapters([lightning])).generate(req
 //! { sampler: "lightning", steps: 8 })` runs end-to-end and renders a coherent natural image (not
 //! flat, not pure noise, all-finite). It writes the Rust render and — if present — the diffusers
 //! reference (`tools/dump_qwen_lightning_golden.py render`) as PPMs for a side-by-side visual check.
@@ -19,8 +19,6 @@ use mlx_gen::{
     AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
     Quant, WeightsSource,
 };
-// Referencing the provider crate links its `inventory` registration so `mlx_gen::load(MODEL_ID, …)`
-// resolves (the test otherwise touches only the `mlx_gen` core and the crate would be dropped).
 use mlx_gen_qwen_image::{model_edit, MODEL_ID};
 
 const W: u32 = 512;
@@ -103,7 +101,10 @@ fn lightning_render_is_coherent() {
         1.0,
         AdapterKind::Lora,
     )]);
-    let generator = mlx_gen::load(MODEL_ID, &spec).unwrap();
+    let generator = mlx_gen_qwen_image::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: W,

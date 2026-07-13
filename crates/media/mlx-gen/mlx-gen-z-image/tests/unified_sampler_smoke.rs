@@ -14,7 +14,6 @@
 use std::path::PathBuf;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Reference the provider crate so its `inventory` registration links (`mlx_gen::load` resolves it).
 use mlx_gen_z_image::MODEL_ID;
 
 const W: u32 = 256;
@@ -90,7 +89,10 @@ fn render(sampler: Option<&str>) -> Image {
 
 fn render_with(sampler: Option<&str>, scheduler: Option<&str>) -> Image {
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-    let generator = mlx_gen::load(MODEL_ID, &spec).expect("load z_image_turbo");
+    let generator = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load z_image_turbo");
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: W,

@@ -117,7 +117,10 @@ fn render_with_adapter(adapter: Option<(&str, AdapterKind, f32)>, golden_kind: &
             moe_expert: None,
         }]);
     }
-    let generator = mlx_gen::load("z_image_turbo", &spec).unwrap();
+    let generator = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image_turbo", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width: w,

@@ -126,7 +126,10 @@ fn prequantize_turnkey_loads_packed_and_renders() {
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }
-    let generator = mlx_gen::load("sdxl", &spec).expect("packed sdxl loads");
+    let generator = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load("sdxl", &spec)
+        .expect("packed sdxl loads");
 
     // 768² / few-step — packed load-path proof, not a quality bench. RealVisXL renders well at
     // guidance 5–7, 20+ steps; keep it short for CI-adjacent runtime.

@@ -1,6 +1,6 @@
 //! sc-5145: the **full Bernini** pipeline — registry wiring (CI) + real-weight end-to-end coherence
 //! smokes (`#[ignore]`). The smokes assemble the combined planner+renderer snapshot from the cached
-//! `ByteDance/Bernini-Diffusers` package and drive `mlx_gen::load("bernini")` through the whole stack:
+//! `ByteDance/Bernini-Diffusers` package and drive `provider_registry().load("bernini")` through the whole stack:
 //! preprocess → 3 planner streams → MAR semantic-planning loop → 4 renderer prompt streams (+T5) →
 //! ViT-conditioned dual-expert APG denoise → z16 VAE decode.
 //!
@@ -14,9 +14,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::media::Image;
-use mlx_gen::{
-    registry, Conditioning, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource,
-};
+use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_bernini::convert::assemble_bernini_snapshot;
 
 const MODEL_ID: &str = "bernini";
@@ -80,12 +78,14 @@ fn assert_coherent_image(img: &Image, w: u32, h: u32) {
     );
 }
 
-/// The full pipeline self-registers under `bernini`: a registry `load` with a bad dir dispatches to
+/// The provider catalog exposes `bernini`: a bad-directory load dispatches to
 /// the Bernini loader (which fails on the missing snapshot), proving it is wired — not "unknown model".
 #[test]
 fn registers_in_model_registry() {
     let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/bernini".into()));
-    let err = registry::load(MODEL_ID, &spec)
+    let err = mlx_gen_bernini::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
         .err()
         .expect("load of a missing dir must error");
     let msg = format!("{err}").to_lowercase();

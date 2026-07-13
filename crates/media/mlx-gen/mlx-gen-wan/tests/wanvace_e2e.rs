@@ -28,8 +28,8 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    registry, Conditioning, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Progress, Quant, ReplacementMode, WeightsSource,
+    Conditioning, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Progress, Quant,
+    ReplacementMode, WeightsSource,
 };
 use mlx_gen_wan::convert::assemble_wan_vace_snapshot;
 use mlx_gen_wan::MODEL_ID_VACE;
@@ -158,7 +158,9 @@ fn wan_vace_generate_smoke() {
         );
         return;
     };
-    let g = registry::load(MODEL_ID_VACE, &LoadSpec::new(WeightsSource::Dir(dir)))
+    let g = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(MODEL_ID_VACE, &LoadSpec::new(WeightsSource::Dir(dir)))
         .expect("load wan_vace");
     run_vace_smoke(g.as_ref(), "dense-bf16");
 }
@@ -174,10 +176,12 @@ fn wan_vace_quantized_generate_smoke() {
         );
         return;
     };
-    let g = registry::load(
-        MODEL_ID_VACE,
-        &LoadSpec::new(WeightsSource::Dir(dir)).with_quant(Quant::Q8),
-    )
-    .expect("load wan_vace Q8");
+    let g = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_VACE,
+            &LoadSpec::new(WeightsSource::Dir(dir)).with_quant(Quant::Q8),
+        )
+        .expect("load wan_vace Q8");
     run_vace_smoke(g.as_ref(), "q8");
 }

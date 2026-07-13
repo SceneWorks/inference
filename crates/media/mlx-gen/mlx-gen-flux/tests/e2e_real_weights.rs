@@ -122,7 +122,10 @@ fn verify_quant(quant: Quant, bits: i32) {
 
     // (b) full public quantized generate — coherence + save PNG
     let spec = LoadSpec::new(WeightsSource::Dir(snap)).with_quant(quant);
-    let gen = mlx_gen::load(variant().id(), &spec).unwrap();
+    let gen = mlx_gen_flux::provider_registry()
+        .unwrap()
+        .load(variant().id(), &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: g.metadata("prompt").unwrap().to_string(),
         width: w,
@@ -652,7 +655,10 @@ fn e2e_full_pipeline_matches_fork() {
     let h: u32 = g.metadata("h").unwrap().parse().unwrap();
 
     let spec = LoadSpec::new(WeightsSource::Dir(snap));
-    let generator = mlx_gen::load(variant().id(), &spec).unwrap();
+    let generator = mlx_gen_flux::provider_registry()
+        .unwrap()
+        .load(variant().id(), &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width: w,

@@ -13,7 +13,6 @@ mod common;
 use std::path::PathBuf;
 
 use common::CAPTION_JSON;
-use mlx_gen::gen_core::registry;
 use mlx_gen::{CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
 use mlx_gen_ideogram::MODEL_ID;
 
@@ -28,9 +27,12 @@ fn snapshot_dir() -> PathBuf {
 #[test]
 #[ignore = "needs converted weights (~53 GB)"]
 fn generates_via_registry() {
-    // Resolve by id through the registry (proves link-time self-registration on real weights).
+    // Resolve by id through the explicit provider registry.
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot_dir()));
-    let g = registry::load(MODEL_ID, &spec).expect("registry load ideogram_4");
+    let g = mlx_gen_ideogram::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("registry load ideogram_4");
     assert_eq!(g.descriptor().id, "ideogram_4");
 
     // Cooperative cancellation: a pre-cancelled request bails out (no full denoise).

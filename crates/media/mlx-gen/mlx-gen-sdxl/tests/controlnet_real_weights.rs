@@ -15,7 +15,6 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
-use mlx_gen_sdxl as _; // force-link the provider so `inventory` registers "sdxl"
 use mlx_gen_sdxl::config::UNetConfig;
 use mlx_gen_sdxl::ControlNet;
 use mlx_rs::{Array, Dtype};

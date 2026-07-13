@@ -1,5 +1,5 @@
-//! Kolors dispatch-path validation (sc-3874) — exercises the model **through the engine registry**
-//! (`mlx_gen::load("kolors", spec).generate(req)`), the SceneWorks worker's in-process entry, rather
+//! Kolors dispatch-path validation (sc-3874) — exercises the model through the explicit provider
+//! catalog (`provider_registry().load("kolors", spec).generate(req)`) rather
 //! than the `Kolors` struct API the per-mode parity tests use. Proves the `LoadSpec` → `load` and
 //! `GenerationRequest` → `generate` mapping (incl. the count loop + per-conditioning routing) for
 //! every wired mode. The per-mode numeric parity is already covered by the dedicated `*_parity`
@@ -12,10 +12,6 @@
 
 use std::path::PathBuf;
 
-// Force-link the provider crate so its `inventory::submit!` registration is included in this test
-// binary. Without a reference to *some* symbol of `mlx-gen-kolors`, the linker dead-strips the whole
-// crate and `mlx_gen::load("kolors", …)` finds no registration. The same applies to the SceneWorks
-// worker — the consumer must `use mlx_gen_kolors as _;` (or otherwise reference it) to register it.
 use mlx_gen_kolors::Kolors;
 
 use mlx_gen::{
@@ -119,7 +115,10 @@ fn assert_coherent(out: GenerationOutput, expect: usize) {
 }
 
 fn run(spec: &LoadSpec, req: &GenerationRequest) -> GenerationOutput {
-    let gen = mlx_gen::load("kolors", spec).expect("registry load");
+    let gen = mlx_gen_kolors::provider_registry()
+        .unwrap()
+        .load("kolors", spec)
+        .expect("registry load");
     gen.generate(req, &mut |_p: Progress| {}).expect("generate")
 }
 
@@ -130,7 +129,7 @@ fn registry_t2i_and_count() {
     let mut req = t2i_req();
     req.count = 2;
     assert_coherent(run(&base_spec(), &req), 2);
-    println!("✓ mlx_gen::load(\"kolors\").generate T2I (count=2) renders coherently");
+    println!("✓ mlx_gen_kolors::provider_registry().unwrap().load(\"kolors\").generate T2I (count=2) renders coherently");
 }
 
 #[test]

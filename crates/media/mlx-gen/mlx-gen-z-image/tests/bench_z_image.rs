@@ -92,11 +92,13 @@ fn bench_ops_micro() {
 #[test]
 #[ignore = "needs real Z-Image weights"]
 fn bench_generate_wall_clock() {
-    let g = mlx_gen::load(
-        "z_image_turbo",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .unwrap();
+    let g = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load(
+            "z_image_turbo",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .unwrap();
     println!(
         "\n# Z-Image-turbo end-to-end generate() wall-clock — {STEPS} steps, bf16, median of {RUNS} runs (after 1 warmup)"
     );

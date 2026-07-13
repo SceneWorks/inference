@@ -18,7 +18,6 @@
 use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
-use mlx_gen_z_image as _;
 use std::path::PathBuf;
 
 /// Resolve the **base** `Tongyi-MAI/Z-Image` snapshot: the `BASE_ZIMAGE_SNAPSHOT` override if set, else
@@ -99,8 +98,10 @@ fn synthetic_control(width: u32, height: u32, shift: u32) -> Image {
 
 /// Render `req` through the public base control generator → one image, asserting size + non-degeneracy.
 fn render(spec: &LoadSpec, req: &GenerationRequest) -> Image {
-    let generator =
-        mlx_gen::load("z_image_control", spec).expect("z_image_control loads from base + control");
+    let generator = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image_control", spec)
+        .expect("z_image_control loads from base + control");
     let out = generator
         .generate(req, &mut |_| {})
         .expect("base control generate succeeds");

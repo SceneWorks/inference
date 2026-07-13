@@ -24,7 +24,6 @@ use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Precision,
     WeightsSource,
 };
-// Force-link the provider crate so its `inventory::submit!` registration is in this test binary.
 use mlx_gen_kolors::MODEL_ID;
 
 const SIZE: u32 = 512;
@@ -145,7 +144,10 @@ fn base_txt2img_cfg_off_runs() {
         eprintln!("skipping: no Kolors snapshot (set KOLORS_SNAPSHOT)");
         return;
     };
-    let generator = mlx_gen::load(MODEL_ID, &spec(base, None)).expect("load kolors");
+    let generator = mlx_gen_kolors::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec(base, None))
+        .expect("load kolors");
     let out = generator
         .generate(&cfg_off_req(vec![]), &mut |_| {})
         .expect("CFG-off base txt2img must not error mid-denoise (F-005)");
@@ -164,8 +166,10 @@ fn controlnet_pose_cfg_off_runs() {
         eprintln!("skipping: need KOLORS_SNAPSHOT + KOLORS_CONTROLNET");
         return;
     };
-    let generator =
-        mlx_gen::load(MODEL_ID, &spec(base, Some(cn))).expect("load kolors + controlnet");
+    let generator = mlx_gen_kolors::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec(base, Some(cn)))
+        .expect("load kolors + controlnet");
     let req = cfg_off_req(vec![Conditioning::Control {
         image: synthetic_image(),
         kind: ControlKind::Pose,

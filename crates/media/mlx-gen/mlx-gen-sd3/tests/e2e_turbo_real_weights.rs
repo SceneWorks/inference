@@ -8,7 +8,7 @@
 //! cache (or `SD3_LARGE_TURBO_SNAPSHOT`) and Metal. Run with:
 //!   cargo test -p mlx-gen-sd3 --release --test e2e_turbo_real_weights -- --ignored --nocapture
 //!
-//! The smoke drives the PUBLIC registry path (`mlx_gen::load("sd3_5_large_turbo", spec).generate`),
+//! The smoke drives the PUBLIC registry path (`provider_registry().load("sd3_5_large_turbo", spec).generate`),
 //! saves the PNG, and reports sanity signals (the coordinator can't view the image): per-channel
 //! mean/std (NOT constant, NOT pure-noise) and a crude spatial-coherence signal (mean absolute
 //! neighbor gradient — low-but-nonzero = structured content, not white noise).
@@ -17,8 +17,6 @@ use std::path::PathBuf;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 
-// Force the linker to keep `mlx-gen-sd3`'s `inventory::submit!` registration static (it is otherwise
-// dropped as unreferenced, since this test reaches the generator only through the `mlx_gen::load`
 // registry — the CLAUDE.md "Linkage gotcha"). Asserting the id keeps the import honest.
 use mlx_gen_sd3 as sd3;
 
@@ -99,13 +97,14 @@ fn run_turbo_smoke(label: &str, w: u32, h: u32, steps: u32, quant: Quant) {
          CFG=off (guidance 1.0, no uncond forward) ===\nsnapshot: {snap:?}"
     );
 
-    // Reference a crate symbol so the generator's `inventory::submit!` static is linked (see the
-    // `use mlx_gen_sd3 as sd3` note above).
     assert_eq!(sd3::TURBO_MODEL_ID, "sd3_5_large_turbo");
 
     let spec = LoadSpec::new(WeightsSource::Dir(snap)).with_quant(quant);
     let t_load = std::time::Instant::now();
-    let generator = mlx_gen::load(sd3::TURBO_MODEL_ID, &spec).expect("load sd3_5_large_turbo");
+    let generator = mlx_gen_sd3::provider_registry()
+        .unwrap()
+        .load(sd3::TURBO_MODEL_ID, &spec)
+        .expect("load sd3_5_large_turbo");
     eprintln!("loaded in {:.1}s", t_load.elapsed().as_secs_f32());
 
     // CFG-off: NO guidance override (defaults to 1.0) and NO negative prompt (the distilled Turbo

@@ -16,10 +16,6 @@
 //! re-host tiers in the HF cache. Set `QWEN_SEQ_Q8=1` for the T2I Q8 case; `QWEN_SEQ_STEPS`/
 //! `QWEN_SEQ_SIZE` tune all three.
 
-// Force-link the provider crate so its `inventory` generator registration runs (this test only
-// calls `mlx_gen::load(…)`).
-use mlx_gen_qwen_image as _;
-
 use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy,
     Quant, WeightsSource,
@@ -76,7 +72,10 @@ fn base_spec() -> LoadSpec {
 
 fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, usize) {
     let spec = base_spec().with_offload_policy(policy);
-    let model = mlx_gen::load("qwen_image", &spec).expect("load qwen_image");
+    let model = mlx_gen_qwen_image::provider_registry()
+        .unwrap()
+        .load("qwen_image", &spec)
+        .expect("load qwen_image");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();
@@ -191,8 +190,10 @@ fn synthetic_image(w: u32, h: u32) -> Image {
 /// Load `engine_id` from `spec` (already carrying its offload policy), reset the MLX peak counter,
 /// render one image, and return its pixels + the measured peak (mirrors [`render_measured`]).
 fn render_with(engine_id: &str, spec: &LoadSpec, req: &GenerationRequest) -> (Vec<u8>, usize) {
-    let model =
-        mlx_gen::load(engine_id, spec).unwrap_or_else(|e| panic!("load {engine_id}: {e:?}"));
+    let model = mlx_gen_qwen_image::provider_registry()
+        .unwrap()
+        .load(engine_id, spec)
+        .unwrap_or_else(|e| panic!("load {engine_id}: {e:?}"));
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

@@ -9,10 +9,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::{registry, Conditioning, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Force-link the provider so its `inventory::submit!` registration survives the linker (this test
-// references no other svd symbol but `MODEL_ID`); otherwise `mlx_gen::load` reports "no generator
-// registered". The worker does the same per model crate.
+use mlx_gen::{Conditioning, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_svd::MODEL_ID;
 
 /// The cached SVD checkpoint snapshot dir (mirrors `tests/registration.rs`).
@@ -55,7 +52,10 @@ fn gradient_image(w: u32, h: u32) -> Image {
 #[ignore = "needs the SVD checkpoint in the HF cache (loads the full f32 model)"]
 fn svd_xt_honors_typed_cancellation() {
     let snap = svd_snapshot_dir();
-    let gen = registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap))).expect("load svd");
+    let gen = mlx_gen_svd::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap)))
+        .expect("load svd");
 
     // Reference-only image→video request at the descriptor's minimum size (256², ÷16), with step
     // headroom so a honoring provider visibly stops before completion.

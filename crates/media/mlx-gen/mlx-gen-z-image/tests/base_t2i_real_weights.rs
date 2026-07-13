@@ -11,7 +11,6 @@
 //! PNG for quality. A second pass with `guidance = 1.0` confirms the CFG-off (single-forward) path.
 
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
-use mlx_gen_z_image as _;
 use std::path::PathBuf;
 
 /// Resolve the **base** `Tongyi-MAI/Z-Image` snapshot: the `BASE_ZIMAGE_SNAPSHOT` override if set, else
@@ -33,7 +32,10 @@ fn base_snapshot() -> Option<PathBuf> {
 /// Render `req` through the public base generator and assert the image is the requested size and is
 /// non-degenerate (some spread in the pixel values — neither a flat fill nor pure noise).
 fn render_and_check(spec: &LoadSpec, req: &GenerationRequest, tag: &str) {
-    let generator = mlx_gen::load("z_image", spec).expect("base z_image loads from the snapshot");
+    let generator = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image", spec)
+        .expect("base z_image loads from the snapshot");
     let out = generator
         .generate(req, &mut |_| {})
         .expect("base generate succeeds");

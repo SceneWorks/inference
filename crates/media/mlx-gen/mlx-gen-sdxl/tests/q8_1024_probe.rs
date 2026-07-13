@@ -14,7 +14,6 @@
 mod common;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, WeightsSource};
-use mlx_gen_sdxl as _;
 
 use common::snapshot;
 
@@ -32,7 +31,10 @@ fn std_dev(img: &Image) -> f32 {
 
 fn render(q: Quant, size: u32, steps: u32) -> Image {
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_quant(q);
-    let model = mlx_gen::load("sdxl", &spec).unwrap();
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load("sdxl", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: "a portrait photo of a man, sharp focus, high detail".to_string(),
         negative_prompt: Some("lowres, blurry".to_string()),

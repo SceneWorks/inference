@@ -18,9 +18,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, WeightsSource};
-// Force the linker to keep this crate's `inventory::submit!` model registrations (the CLAUDE.md
-// linkage gotcha) so `mlx_gen::load("lens_turbo", …)` resolves from the test binary.
-use mlx_gen_lens as _;
 
 const MODEL_ID: &str = "lens_turbo";
 
@@ -121,7 +118,10 @@ fn lens_turbo_pid_decode_vs_vae() {
 
     eprintln!("loading Lens-Turbo (+PiD overlay), size={size} ...");
     let t = Instant::now();
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load Lens-Turbo + PiD");
+    let model = mlx_gen_lens::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load Lens-Turbo + PiD");
     eprintln!("loaded in {:.1}s", t.elapsed().as_secs_f32());
 
     let base = GenerationRequest {

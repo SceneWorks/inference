@@ -5,7 +5,7 @@
 //!
 //! Proves the whole dev vertical end to end: assemble a pre-quantized Q4 snapshot (sc-5917 convert
 //! for DiT + TE, VAE/tokenizer symlinked from the source), load it through the registry
-//! (`mlx_gen::load("flux2_dev", …)` → `load_dev`), and render an image. This exercises the Mistral3
+//! (`provider_registry().load("flux2_dev", …)` → `load_dev`), and render an image. This exercises the Mistral3
 //! TE → the **embedded guidance** embedder (the one genuinely new dev piece) → the dev DiT denoise →
 //! the (klein-shared) VAE decode. Rust runs f32 activations vs the BFL bf16 reference, so — like the
 //! klein e2e — this is a coherence/quality floor (finite + non-degenerate render at the dev
@@ -109,7 +109,9 @@ fn dev_txt2img_renders_coherent_image() {
         .unwrap_or_else(|_| "a red fox resting in fresh snow under soft winter light".into());
 
     let dst = prequantized_dev_snapshot();
-    let gen = mlx_gen::load("flux2_dev", &LoadSpec::new(WeightsSource::Dir(dst)))
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load("flux2_dev", &LoadSpec::new(WeightsSource::Dir(dst)))
         .expect("dev loads through the registry");
 
     let req = GenerationRequest {
@@ -190,7 +192,9 @@ fn synthetic_reference(size: u32, idx: u8) -> Image {
 /// `Reference`, ≥2 ⇒ `MultiReference`). Returns the decoded image.
 fn render_dev_edit(size: u32, steps: Option<u32>, n_refs: usize, prompt: &str) -> Image {
     let dst = prequantized_dev_snapshot();
-    let gen = mlx_gen::load("flux2_dev_edit", &LoadSpec::new(WeightsSource::Dir(dst)))
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load("flux2_dev_edit", &LoadSpec::new(WeightsSource::Dir(dst)))
         .expect("dev-edit loads through the registry");
 
     let refs: Vec<Image> = (0..n_refs)

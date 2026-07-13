@@ -71,7 +71,6 @@ fn flux2_klein_edit_image_guidance_sweep() {
     let image = load_ref(&ref_png);
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     spec.quantize = Some(Quant::Q8);
-    // Direct loader (not the registry `load(id)`) so the binary force-links mlx-gen-flux2.
     let gen = mlx_gen_flux2::load_klein_9b_edit(&spec).expect("load klein edit");
 
     for (pi, prompt) in prompts.iter().enumerate() {

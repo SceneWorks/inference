@@ -202,7 +202,10 @@ fn render(adapter: Option<(&Path, AdapterKind, f32)>, size: u32, steps: u32, see
             moe_expert: None,
         }]);
     }
-    let gen = mlx_gen::load("flux2_dev", &spec).expect("dev loads through the registry");
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load("flux2_dev", &spec)
+        .expect("dev loads through the registry");
     let req = GenerationRequest {
         prompt: "a red fox resting in fresh snow under soft winter light".into(),
         width: size,

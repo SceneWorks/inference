@@ -25,9 +25,6 @@
 //! now measures at bf16 AND Q4/Q8 (sc-11727): the quantized A/B packs the same TE+DiT set, activations
 //! stay bf16, and the pose branch stays on the heavy side (its bf16 overlay is never packed).
 
-// Force-link the provider crate so its `inventory` generator registrations run.
-use mlx_gen_krea as _;
-
 use mlx_gen::{
     AdapterKind, AdapterSpec, Conditioning, ControlKind, GenerationOutput, GenerationRequest,
     Image, LoadSpec, OffloadPolicy, Quant, WeightsSource,
@@ -100,7 +97,10 @@ fn fixed_image(w: u32, h: u32) -> Image {
 
 /// Render one image under `spec`, measuring the process peak unified memory (`get_peak_memory`).
 fn render_measured(spec: LoadSpec, model_id: &str, req: &GenerationRequest) -> (Vec<u8>, usize) {
-    let model = mlx_gen::load(model_id, &spec).unwrap_or_else(|e| panic!("load {model_id}: {e}"));
+    let model = mlx_gen_krea::provider_registry()
+        .unwrap()
+        .load(model_id, &spec)
+        .unwrap_or_else(|e| panic!("load {model_id}: {e}"));
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

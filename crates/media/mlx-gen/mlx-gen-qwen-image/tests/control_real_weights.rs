@@ -262,7 +262,10 @@ fn public_generate_runs() {
         pixels: (0..(w * h * 3)).map(|i| (i % 256) as u8).collect(),
     };
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_control(control_source());
-    let gen = mlx_gen::load("qwen_image_control", &spec).expect("load qwen_image_control");
+    let gen = mlx_gen_qwen_image::provider_registry()
+        .unwrap()
+        .load("qwen_image_control", &spec)
+        .expect("load qwen_image_control");
     let req = GenerationRequest {
         prompt: "a person standing, photorealistic".into(),
         seed: Some(7),

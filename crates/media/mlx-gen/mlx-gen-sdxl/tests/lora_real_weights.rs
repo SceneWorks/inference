@@ -26,8 +26,6 @@ use mlx_gen::{
     WeightsSource,
 };
 use mlx_gen_sdxl::{apply_sdxl_adapters, load_unet};
-// Force-link the provider so its `inventory::submit!` registers `"sdxl"`.
-use mlx_gen_sdxl as _;
 
 // Production runs fp16 (sc-2721); the render gate uses the `float16=True` vendored-merge golden,
 // dumped on MLX 0.31.2. Build: FLOAT16=1 <mlx-0.31.2 python> tools/dump_sdxl_lora_golden.py
@@ -52,7 +50,10 @@ fn lora_spec(g: &Weights, scale: f32) -> AdapterSpec {
 fn render(spec: &LoadSpec, g: &Weights) -> Image {
     let w: u32 = g.metadata("w").unwrap().parse().unwrap();
     let h: u32 = g.metadata("h").unwrap().parse().unwrap();
-    let model = mlx_gen::load("sdxl", spec).unwrap();
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load("sdxl", spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: g.metadata("prompt").unwrap().to_string(),
         negative_prompt: Some(g.metadata("negative").unwrap().to_string()),
@@ -268,7 +269,9 @@ fn lora_applies_on_quantized_q8_base() {
         if !adapters.is_empty() {
             spec = spec.with_adapters(adapters);
         }
-        let model = mlx_gen::load("sdxl", &spec)
+        let model = mlx_gen_sdxl::provider_registry()
+            .unwrap()
+            .load("sdxl", &spec)
             .expect("load sdxl (Q8) — the fix: no merge on a packed base");
         let req = GenerationRequest {
             prompt: "1girl, solo, silver hair, anime portrait, masterpiece".to_string(),

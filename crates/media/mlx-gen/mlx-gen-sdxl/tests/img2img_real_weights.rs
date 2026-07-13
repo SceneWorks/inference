@@ -28,8 +28,6 @@ use mlx_rs::{Array, Dtype};
 /// Production dtype (sc-2721): U-Net + both CLIP TEs run fp16 (VAE stays f32). The component gate
 /// loads the conditioning at fp16 so it matches the `float16=True` golden's f16 conditioning.
 const DT: Dtype = Dtype::Float16;
-// Force-link the provider so its `inventory::submit!` registers `"sdxl"` (MODEL_ARCHITECTURE.md §4).
-use mlx_gen_sdxl as _;
 
 // Production runs fp16 (sc-2721); the render gate (`load("sdxl")`) uses the `float16=True` golden,
 // dumped on MLX 0.31.2. The component gate's compute is f32 either way (the VAE is always f32 and
@@ -147,7 +145,10 @@ fn img2img_matches_vendored() {
     let image = init_image(&g, w, h);
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-    let model = mlx_gen::load("sdxl", &spec).unwrap();
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load("sdxl", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: g.metadata("prompt").unwrap().to_string(),
         negative_prompt: Some(g.metadata("negative").unwrap().to_string()),
@@ -220,7 +221,10 @@ fn img2img_strength_zero_returns_clean_init() {
     let image = init_image(&g, w, h);
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-    let model = mlx_gen::load("sdxl", &spec).unwrap();
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load("sdxl", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: g.metadata("prompt").unwrap().to_string(),
         negative_prompt: Some(g.metadata("negative").unwrap().to_string()),

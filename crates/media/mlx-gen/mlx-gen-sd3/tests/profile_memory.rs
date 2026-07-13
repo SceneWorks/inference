@@ -55,8 +55,6 @@ use std::time::Instant;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource};
 use mlx_rs::memory::{get_peak_memory, reset_peak_memory};
 
-// Keep the SD3.5 generator registrations linked (the CLAUDE.md "Linkage gotcha"): this test reaches
-// the generator through the `mlx_gen::load` registry only.
 use mlx_gen_sd3 as sd3;
 
 const GB: f64 = 1e9;
@@ -162,7 +160,7 @@ fn prequant_overlay(src: &std::path::Path, v: Variant, bits: i32) -> PathBuf {
 /// One profiled run: load (load-time-quant OR pre-quantized-on-disk) + a 1024² generation, reporting
 /// the MLX-allocator peak (`get_peak_memory`) for load and for generate.
 fn profile_one(v: Variant, quant: Quant, prequant: bool, size: u32) {
-    // Force the registration link + keep the id honest.
+    // Keep the profiled id honest.
     assert_eq!(sd3::MODEL_ID, "sd3_5_large");
 
     let src = snapshot(v);
@@ -192,7 +190,10 @@ fn profile_one(v: Variant, quant: Quant, prequant: bool, size: u32) {
 
     reset_peak_memory();
     let t_load = Instant::now();
-    let generator = mlx_gen::load(v.id(), &spec).unwrap_or_else(|e| panic!("load {}: {e}", v.id()));
+    let generator = mlx_gen_sd3::provider_registry()
+        .unwrap()
+        .load(v.id(), &spec)
+        .unwrap_or_else(|e| panic!("load {}: {e}", v.id()));
     let load_s = t_load.elapsed().as_secs_f32();
     let load_peak = get_peak_memory() as f64 / GB;
     eprintln!("  loaded in {load_s:.1}s — MLX peak after load: {load_peak:.2} GB");

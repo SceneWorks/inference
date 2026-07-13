@@ -27,8 +27,6 @@ use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Precision,
     WeightsSource,
 };
-// Force-link the provider crate so its `inventory::submit!` registration is included in this test
-// binary (else the linker dead-strips it and `mlx_gen::load("kolors", …)` finds no registration).
 use mlx_gen_kolors::MODEL_ID;
 
 const SIZE: u32 = 512;
@@ -198,7 +196,10 @@ fn one_image(out: GenerationOutput) -> Image {
 /// Load once, render the bespoke default + each curated solver over the SAME conditioning, and gate
 /// each curated render on coherence + distinctness from the default.
 fn run_mode(label: &str, spec: LoadSpec, conditioning: impl Fn() -> Vec<Conditioning>) {
-    let gen = mlx_gen::load(MODEL_ID, &spec).expect("registry load");
+    let gen = mlx_gen_kolors::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("registry load");
     let default = one_image(
         gen.generate(&req(conditioning(), None, None), &mut |_| {})
             .expect("default generate"),

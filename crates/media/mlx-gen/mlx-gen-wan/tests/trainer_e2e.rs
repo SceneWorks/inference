@@ -1,5 +1,5 @@
-//! Wan2.2 trainer e2e — the production `WanMoeTrainer` driven through the core registry exactly as
-//! the SceneWorks worker will, across all three Wan trainers:
+//! Wan2.2 trainer e2e — the production `WanMoeTrainer` driven through the explicit provider registry
+//! across all three Wan trainers:
 //!   * `wan2_2_t2v_14b` — dual-expert MoE (sc-3046).
 //!   * `wan2_2_i2v_14b` — dual-expert MoE, channel-concat in_dim 36 / zero-`y` pad (sc-3279).
 //!   * `wan2_2_ti2v_5b` — dense single-expert, z48 vae22 (sc-3279).
@@ -115,11 +115,13 @@ fn run_trainer_e2e_cfg(
     let tmp = std::env::temp_dir().join(format!("{model_id}_{tag}_trainer_e2e"));
     let items = make_dataset(&tmp);
 
-    let mut trainer = mlx_gen::load_trainer(
-        model_id,
-        &LoadSpec::new(WeightsSource::Dir(snapshot.clone())),
-    )
-    .unwrap_or_else(|e| panic!("{model_id} trainer should load: {e}"));
+    let mut trainer = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load_trainer(
+            model_id,
+            &LoadSpec::new(WeightsSource::Dir(snapshot.clone())),
+        )
+        .unwrap_or_else(|e| panic!("{model_id} trainer should load: {e}"));
 
     let config = TrainingConfig {
         rank: 8,
@@ -346,7 +348,9 @@ fn wan_ti2v_5b_trainer_prodigy_optimizer() {
 fn run_sample_smoke(model_id: &str, snapshot: PathBuf) {
     let tmp = std::env::temp_dir().join(format!("{model_id}_samples_e2e"));
     let items = make_dataset(&tmp);
-    let mut trainer = mlx_gen::load_trainer(model_id, &LoadSpec::new(WeightsSource::Dir(snapshot)))
+    let mut trainer = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load_trainer(model_id, &LoadSpec::new(WeightsSource::Dir(snapshot)))
         .unwrap_or_else(|e| panic!("{model_id} trainer should load: {e}"));
 
     let config = TrainingConfig {

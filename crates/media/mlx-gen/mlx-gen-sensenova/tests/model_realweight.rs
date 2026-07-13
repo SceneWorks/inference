@@ -1,6 +1,6 @@
 //! sc-3194: real-weight (35GB) registry wiring — `#[ignore]`, run locally.
 //!
-//! Loads `sensenova_u1_8b` through the **core registry** (`mlx_gen::load`) and runs the
+//! Loads `sensenova_u1_8b` through the explicit provider registry and runs the
 //! `Generator::generate` dispatch for T2I (no conditioning) and image-edit (a `Reference`), asserting
 //! the contract holds end to end: `GenerationOutput::Images` of the requested size, finite pixels.
 //! The per-mode numerics are pinned by the t2i/it2i/vqa/interleave parity + real-weight tests; this
@@ -9,10 +9,6 @@
 //! Run: `cargo test -p mlx-gen-sensenova --test model_realweight -- --ignored --nocapture`
 
 use std::path::PathBuf;
-
-// Force-link the provider crate so its `inventory::submit!` registers `sensenova_u1_8b` for
-// `mlx_gen::load` (an integration test binary only links crates it references).
-use mlx_gen_sensenova as _;
 
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
@@ -40,7 +36,10 @@ fn registry_load_and_generate() {
     }
 
     let spec = LoadSpec::new(WeightsSource::Dir(snap));
-    let model = mlx_gen::load("sensenova_u1_8b", &spec).expect("load sensenova_u1_8b via registry");
+    let model = mlx_gen_sensenova::provider_registry()
+        .unwrap()
+        .load("sensenova_u1_8b", &spec)
+        .expect("load sensenova_u1_8b via registry");
 
     let mut noop = |_: Progress| {};
     let (w, h) = (256u32, 256u32);

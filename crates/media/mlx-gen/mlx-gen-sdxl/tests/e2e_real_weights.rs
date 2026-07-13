@@ -245,7 +245,10 @@ fn full_pipeline_generates_fox() {
     let h: u32 = g.metadata("h").unwrap().parse().unwrap();
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-    let model = mlx_gen::load("sdxl", &spec).unwrap();
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load("sdxl", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         negative_prompt: Some(negative),

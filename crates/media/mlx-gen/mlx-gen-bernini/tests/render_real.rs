@@ -6,9 +6,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::media::Image;
-use mlx_gen::{
-    registry, Conditioning, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource,
-};
+use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_wan::convert::assemble_bernini_renderer_snapshot;
 
 const MODEL_ID: &str = "bernini_renderer";
@@ -69,12 +67,14 @@ fn assert_coherent_image(img: &Image, w: u32, h: u32) {
     );
 }
 
-/// The provider self-registers under `bernini_renderer`: a registry `load` with a bad dir dispatches
+/// The provider catalog exposes `bernini_renderer`: a bad-directory load dispatches
 /// to the Bernini loader (fails on the missing snapshot), proving it is wired — not "unknown model".
 #[test]
 fn registers_in_model_registry() {
     let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/bernini".into()));
-    let err = registry::load(MODEL_ID, &spec)
+    let err = mlx_gen_bernini::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
         .err()
         .expect("load of a missing dir must error");
     let msg = format!("{err}").to_lowercase();

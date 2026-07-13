@@ -43,8 +43,6 @@ use mlx_gen_sdxl::{
     apply_sdxl_adapters, apply_sdxl_adapters_with, load_unet, lora_delta, LoraCoverage,
     UNet2DConditionModel,
 };
-// Force-link the provider so its `inventory::submit!` registers `"sdxl"`.
-use mlx_gen_sdxl as _;
 
 use common::snapshot;
 
@@ -419,7 +417,10 @@ fn complete_render_differs_from_vendored_and_is_sane() {
         }
         let spec =
             LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![lora_spec(1.0)]);
-        let model = mlx_gen::load("sdxl", &spec).unwrap();
+        let model = mlx_gen_sdxl::provider_registry()
+            .unwrap()
+            .load("sdxl", &spec)
+            .unwrap();
         let img = match model.generate(&req, &mut |_| {}).unwrap() {
             GenerationOutput::Images(mut v) => v.pop().unwrap(),
             other => panic!("expected Images, got {other:?}"),
@@ -489,7 +490,10 @@ fn dump_vendored_vs_complete_pngs() {
         }
         let spec =
             LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![lora_spec(1.0)]);
-        let model = mlx_gen::load("sdxl", &spec).unwrap();
+        let model = mlx_gen_sdxl::provider_registry()
+            .unwrap()
+            .load("sdxl", &spec)
+            .unwrap();
         let img = match model.generate(&req, &mut |_| {}).unwrap() {
             GenerationOutput::Images(mut v) => v.pop().unwrap(),
             other => panic!("expected Images, got {other:?}"),

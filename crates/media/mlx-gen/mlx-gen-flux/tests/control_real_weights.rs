@@ -232,7 +232,10 @@ fn assert_mode_steers(label: &str, control: Image, kind: ControlKind, min_steer:
 
     // (1) The matched control-FREE FLUX.1-dev render (same prompt + seed + dims) — the steer baseline.
     let base_spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
-    let base_gen = mlx_gen::load("flux1_dev", &base_spec).expect("flux1_dev loads");
+    let base_gen = mlx_gen_flux::provider_registry()
+        .unwrap()
+        .load("flux1_dev", &base_spec)
+        .expect("flux1_dev loads");
     let base_req = GenerationRequest {
         prompt: prompt.clone(),
         width: size,
@@ -248,7 +251,9 @@ fn assert_mode_steers(label: &str, control: Image, kind: ControlKind, min_steer:
     let ctrl_spec = LoadSpec::new(WeightsSource::Dir(root))
         .with_control(control_checkpoint())
         .with_quant(Quant::Q4);
-    let ctrl_gen = mlx_gen::load("flux1_dev_control", &ctrl_spec)
+    let ctrl_gen = mlx_gen_flux::provider_registry()
+        .unwrap()
+        .load("flux1_dev_control", &ctrl_spec)
         .expect("flux1_dev_control loads via registry");
     let ctrl_req = GenerationRequest {
         conditioning: vec![Conditioning::Control {

@@ -78,7 +78,10 @@ fn render(adapter: Option<(PathBuf, AdapterKind, f32)>) -> Vec<u8> {
             moe_expert: None,
         }]);
     }
-    let generator = mlx_gen::load("flux1_dev", &spec).unwrap();
+    let generator = mlx_gen_flux::provider_registry()
+        .unwrap()
+        .load("flux1_dev", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width: w,

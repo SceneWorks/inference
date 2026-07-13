@@ -1,17 +1,20 @@
-//! Registry wiring for `svd_xt` (epic 3040 / sc-3375): the model self-registers into the `mlx-gen`
-//! model registry with the right descriptor, advertises image→video via `Reference`-only
+//! Registry wiring for `svd_xt` (epic 3040 / sc-3375): the provider catalog exposes the model with
+//! the right descriptor, advertises image→video via `Reference`-only
 //! conditioning, and `load` rejects a single-file source (it needs the multi-component snapshot dir).
 //! The full-model load + generate is exercised by the deterministic `pipeline_parity` gate.
 
 use mlx_gen::{
-    registry, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Image, LoadSpec,
-    Modality, WeightsSource,
+    Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Modality,
+    WeightsSource,
 };
 use mlx_gen_svd::MODEL_ID;
 
 #[test]
 fn svd_is_registered() {
-    let reg = registry::generators()
+    let reg = mlx_gen_svd::provider_registry()
+        .unwrap()
+        .generators()
+        .copied()
         .find(|r| (r.descriptor)().id == MODEL_ID)
         .expect("svd_xt not registered");
     let d = (reg.descriptor)();
@@ -33,7 +36,10 @@ fn load_rejects_single_file() {
     let f = dir.join("model.safetensors");
     std::fs::write(&f, b"not a real checkpoint").unwrap();
     assert!(
-        registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::File(f))).is_err(),
+        mlx_gen_svd::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &LoadSpec::new(WeightsSource::File(f)))
+            .is_err(),
         "svd_xt must require a checkpoint directory, not a single file"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -61,7 +67,10 @@ fn svd_provider_generates_video() {
         .unwrap()
         .path();
 
-    let gen = registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap))).expect("load svd");
+    let gen = mlx_gen_svd::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap)))
+        .expect("load svd");
 
     // A 48×48 RGB gradient reference image.
     let (iw, ih) = (48u32, 48u32);
@@ -155,7 +164,10 @@ fn gradient_image(w: u32, h: u32) -> Image {
 #[ignore = "needs the SVD checkpoint in the HF cache (loads the full f32 model)"]
 fn svd_request_knobs_drive_generation() {
     let snap = svd_snapshot_dir();
-    let gen = registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap))).expect("load svd");
+    let gen = mlx_gen_svd::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap)))
+        .expect("load svd");
 
     let base = |motion: f32, chunk: Option<u32>| GenerationRequest {
         width: 256,
@@ -206,7 +218,10 @@ fn svd_request_knobs_drive_generation() {
 #[ignore = "needs the SVD checkpoint in the HF cache (loads the full f32 model)"]
 fn svd_output_fps_decoupled_from_conditioning_fps() {
     let snap = svd_snapshot_dir();
-    let gen = registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap))).expect("load svd");
+    let gen = mlx_gen_svd::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap)))
+        .expect("load svd");
 
     let run = |cond_fps: u32| {
         let req = GenerationRequest {

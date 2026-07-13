@@ -1,13 +1,12 @@
-//! sc-7780 dead-strip gate: the PuLID-FLUX provider self-registers through the core registry once
-//! the crate is linked (`use mlx_gen_pulid as _;`). This proves the macro-emitted
-//! `inventory::submit!` (register_generators!) still fires; it needs no weights.
-
-use mlx_gen_pulid as _;
+//! Explicit provider-catalog coverage for the PuLID-FLUX variant. No weights required.
 
 #[test]
-fn pulid_flux_resolves_through_core_registry() {
-    let reg = mlx_gen::registry::generators()
+fn pulid_flux_is_exported_by_provider_catalog() {
+    let reg = mlx_gen_pulid::provider_registry()
+        .unwrap()
+        .generators()
+        .copied()
         .find(|r| (r.descriptor)().id == "pulid_flux")
-        .expect("pulid_flux provider should self-register");
+        .expect("provider catalog should export pulid_flux");
     assert_eq!((reg.descriptor)().family, "pulid");
 }

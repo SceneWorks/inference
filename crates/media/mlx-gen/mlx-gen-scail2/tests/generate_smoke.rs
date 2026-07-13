@@ -20,7 +20,6 @@ use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, ReplacementMode,
     WeightsSource,
 };
-// Referencing the crate forces the linker to include its `inventory::submit!` registration.
 use mlx_gen_scail2::pipeline::MODEL_ID;
 
 fn snapshot_dir() -> PathBuf {
@@ -82,7 +81,10 @@ fn missing_reference_errors() {
     // load() only needs an existing dir (config.json is optional → defaults). The conditioning
     // extraction runs before any weight load, so an empty request fails fast.
     let spec = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()));
-    let gen = mlx_gen::registry::load(MODEL_ID, &spec).expect("load scail2 provider");
+    let gen = mlx_gen_scail2::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load scail2 provider");
     let req = GenerationRequest {
         prompt: "a person dancing".into(),
         ..Default::default()
@@ -155,7 +157,10 @@ fn run_mode(label: &str, replace: bool, quant: Option<Quant>) {
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }
-    let gen = mlx_gen::registry::load(MODEL_ID, &spec).expect("load scail2 provider");
+    let gen = mlx_gen_scail2::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load scail2 provider");
 
     let mut last_step = 0u32;
     let out = gen

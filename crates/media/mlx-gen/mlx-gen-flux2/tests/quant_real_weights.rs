@@ -177,7 +177,10 @@ fn q4_v0_matches_fork() {
 fn render(quant: Option<Quant>, size: u32) -> Image {
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     spec.quantize = quant;
-    let gen = mlx_gen::load("flux2_klein_9b", &spec).unwrap();
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load("flux2_klein_9b", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: size,

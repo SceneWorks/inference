@@ -11,11 +11,9 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::{registry, GenerationRequest, LoadSpec, WeightsSource};
-use mlx_gen_wan::convert::assemble_bernini_renderer_snapshot;
-// Force-link the provider so its `inventory::submit!` registration survives the linker; otherwise
-// `mlx_gen::load` reports "no generator registered". The worker does the same per model crate.
+use mlx_gen::{GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_bernini::pipeline::MODEL_ID;
+use mlx_gen_wan::convert::assemble_bernini_renderer_snapshot;
 
 fn hf_snapshot(repo: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -51,11 +49,13 @@ fn ensure_snapshot() -> PathBuf {
 #[test]
 #[ignore = "real weights: assembles + loads the ~56 GB Bernini renderer snapshot, runs a denoise"]
 fn bernini_renderer_honors_typed_cancellation() {
-    let gen = registry::load(
-        MODEL_ID,
-        &LoadSpec::new(WeightsSource::Dir(ensure_snapshot())),
-    )
-    .expect("load bernini_renderer");
+    let gen = mlx_gen_bernini::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(ensure_snapshot())),
+        )
+        .expect("load bernini_renderer");
 
     // Minimal valid t2i (text-only) request: 1 frame, 256² (within 16..=1280), `t2v_apg` guidance,
     // with step headroom so a honoring provider visibly stops before completion.

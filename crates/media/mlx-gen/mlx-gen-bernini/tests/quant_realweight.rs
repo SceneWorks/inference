@@ -12,8 +12,6 @@
 
 use std::path::PathBuf;
 
-use mlx_gen_bernini as _; // force-link the inventory registration for `mlx_gen::load("bernini")`.
-
 use mlx_gen::media::Image;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
@@ -28,7 +26,10 @@ fn snapshot() -> PathBuf {
 fn render(spec: &LoadSpec) -> (Image, f64) {
     clear_cache();
     reset_peak_memory();
-    let model = mlx_gen::load("bernini", spec).expect("load bernini");
+    let model = mlx_gen_bernini::provider_registry()
+        .unwrap()
+        .load("bernini", spec)
+        .expect("load bernini");
     let req = GenerationRequest {
         prompt: "a red apple on a wooden table, studio lighting".into(),
         width: 256,

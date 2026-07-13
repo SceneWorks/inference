@@ -176,7 +176,10 @@ fn full_pipeline_matches_fork(golden_path: &str, quant: Option<Quant>, max_px_fr
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }
-    let generator = mlx_gen::load("qwen_image", &spec).unwrap();
+    let generator = mlx_gen_qwen_image::provider_registry()
+        .unwrap()
+        .load("qwen_image", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width: w,

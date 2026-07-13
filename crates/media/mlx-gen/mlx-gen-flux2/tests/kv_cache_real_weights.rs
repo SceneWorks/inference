@@ -24,9 +24,6 @@ use std::time::Instant;
 
 use mlx_gen::media::Image;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource};
-// Link the provider crate so its `inventory::submit!` registrations run (the variants self-register
-// through the core registry; without this the test binary can't resolve the flux2 ids).
-use mlx_gen_flux2 as _;
 
 const PROMPT: &str = "make it look like a cold winter morning";
 
@@ -114,7 +111,10 @@ fn render(id: &str, size: u32, nref: usize) -> Image {
 fn render_quant(id: &str, size: u32, nref: usize, quant: Option<Quant>) -> Image {
     let mut spec = LoadSpec::new(WeightsSource::Dir(kv_snapshot()));
     spec.quantize = quant;
-    let gen = mlx_gen::load(id, &spec).unwrap();
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load(id, &spec)
+        .unwrap();
     let req = edit_request(size, nref);
     let GenerationOutput::Images(mut images) = gen.generate(&req, &mut |_| {}).unwrap() else {
         panic!("expected images");
@@ -125,7 +125,10 @@ fn render_quant(id: &str, size: u32, nref: usize, quant: Option<Quant>) -> Image
 /// Wall-clock of a single warm generate for `id` (load + one warmup generate, then the timed one).
 /// The model is dropped before returning so only one ~30 GB model is resident at a time.
 fn time_generate(id: &str, size: u32, nref: usize) -> f64 {
-    let gen = mlx_gen::load(id, &LoadSpec::new(WeightsSource::Dir(kv_snapshot()))).unwrap();
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load(id, &LoadSpec::new(WeightsSource::Dir(kv_snapshot())))
+        .unwrap();
     let req = edit_request(size, nref);
     // Warmup: first call pays kernel compilation / lazy graph setup.
     let _ = gen.generate(&req, &mut |_| {}).unwrap();

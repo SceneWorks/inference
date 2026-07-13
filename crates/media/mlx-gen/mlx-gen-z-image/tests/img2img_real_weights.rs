@@ -161,7 +161,10 @@ fn img2img_full_pipeline_matches_fork() {
     let expected_progress = steps - init_step as u32;
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-    let generator = mlx_gen::load("z_image_turbo", &spec).unwrap();
+    let generator = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image_turbo", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width: w,

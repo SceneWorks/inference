@@ -30,9 +30,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Force the linker to keep this crate's `inventory::submit!` model registration (the CLAUDE.md
-// linkage gotcha) so `mlx_gen::load("sdxl", …)` resolves from the test binary.
-use mlx_gen_sdxl as _;
 
 const MODEL_ID: &str = "sdxl";
 
@@ -128,7 +125,10 @@ fn sdxl_pid_decode_vs_vae() {
         sdxl_dir().display()
     );
     let t = Instant::now();
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load sdxl + PiD");
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load sdxl + PiD");
     eprintln!("loaded in {:.1}s", t.elapsed().as_secs_f32());
 
     let base = GenerationRequest {
@@ -208,7 +208,10 @@ fn sdxl_pid_from_ldm_early_stop() {
         WeightsSource::File(pid_checkpoint()),
         WeightsSource::Dir(gemma_dir()),
     );
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load sdxl + PiD");
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load sdxl + PiD");
 
     let base = GenerationRequest {
         prompt: "a red fox in a snowy pine forest at dawn, photorealistic".into(),
@@ -272,7 +275,10 @@ fn sdxl_pid_from_ldm_early_stop() {
 fn use_pid_without_loaded_pid_errors() {
     // Loading WITHOUT spec.pid, then requesting use_pid, must error clearly (not silently VAE-decode).
     let spec = LoadSpec::new(WeightsSource::Dir(sdxl_dir()));
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load sdxl");
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load sdxl");
     let req = GenerationRequest {
         prompt: "a fox".into(),
         width: 512,

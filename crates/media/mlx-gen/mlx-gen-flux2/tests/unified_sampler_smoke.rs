@@ -14,7 +14,6 @@
 use std::path::PathBuf;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Reference the provider crate so its `inventory` registration links (`mlx_gen::load` resolves it).
 use mlx_gen_flux2::FLUX2_KLEIN_9B_ID;
 
 const W: u32 = 256;
@@ -86,7 +85,10 @@ fn assert_coherent(img: &Image, label: &str) {
 
 fn render(sampler: Option<&str>) -> Image {
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-    let generator = mlx_gen::load(FLUX2_KLEIN_9B_ID, &spec).expect("load flux2_klein_9b");
+    let generator = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load(FLUX2_KLEIN_9B_ID, &spec)
+        .expect("load flux2_klein_9b");
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: W,

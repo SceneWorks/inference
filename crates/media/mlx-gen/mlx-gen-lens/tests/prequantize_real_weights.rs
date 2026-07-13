@@ -131,7 +131,10 @@ fn prequantize_turnkey_loads_packed_and_renders() {
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }
-    let generator = mlx_gen::load(&id, &spec).expect("packed lens loads");
+    let generator = mlx_gen_lens::provider_registry()
+        .unwrap()
+        .load(&id, &spec)
+        .expect("packed lens loads");
 
     // 512² / few-step — packed load-path proof, not a quality bench.
     let req = GenerationRequest {

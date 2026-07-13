@@ -114,7 +114,10 @@ fn prequantize_turnkey_loads_packed_and_renders() {
     // transformer Linears are already quantized, so the post-load `quantize` calls no-op — this
     // proves the packed path, not an in-app quantize.
     let spec = LoadSpec::new(WeightsSource::Dir(out.clone())).with_quant(quant);
-    let generator = mlx_gen::load("qwen_image", &spec).expect("packed qwen_image loads");
+    let generator = mlx_gen_qwen_image::provider_registry()
+        .unwrap()
+        .load("qwen_image", &spec)
+        .expect("packed qwen_image loads");
 
     // Small/short — this is a packed load-path proof, not a quality bench (the 20B MMDiT is slow).
     let req = GenerationRequest {

@@ -16,7 +16,6 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
-use mlx_gen_sdxl as _;
 use mlx_gen_sdxl::{apply_sdxl_adapters, load_unet};
 
 fn golden(name: &str) -> Weights {
@@ -39,7 +38,10 @@ fn spec(g: &Weights, key: &str, scale: f32, kind: AdapterKind) -> AdapterSpec {
 }
 
 fn render(spec: &LoadSpec, g: &Weights) -> Image {
-    let model = mlx_gen::load("sdxl", spec).unwrap();
+    let model = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load("sdxl", spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: g.metadata("prompt").unwrap().to_string(),
         negative_prompt: Some(g.metadata("negative").unwrap().to_string()),

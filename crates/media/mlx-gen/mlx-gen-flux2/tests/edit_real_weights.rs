@@ -124,11 +124,13 @@ fn reference_encoding_matches_fork() {
 #[ignore = "needs real FLUX.2-klein-9b snapshot + tools/golden/flux2_edit.safetensors"]
 fn full_edit_generate_matches_fork() {
     let g = golden();
-    let gen = mlx_gen::load(
-        "flux2_klein_9b_edit",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .unwrap();
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load(
+            "flux2_klein_9b_edit",
+            &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        )
+        .unwrap();
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: 256,
@@ -228,7 +230,10 @@ fn multi_reference_encoding_matches_fork() {
 fn render_multi_edit(quant: Option<Quant>, images: Vec<Image>) -> Image {
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     spec.quantize = quant;
-    let gen = mlx_gen::load("flux2_klein_9b_edit", &spec).unwrap();
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load("flux2_klein_9b_edit", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: "blend the two scenes into a single dreamlike landscape".into(),
         width: 256,
@@ -296,7 +301,10 @@ fn single_reference_does_not_regress() {
     let g = golden(); // the original single-ref edit golden
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     spec.quantize = None;
-    let gen = mlx_gen::load("flux2_klein_9b_edit", &spec).unwrap();
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load("flux2_klein_9b_edit", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: 256,

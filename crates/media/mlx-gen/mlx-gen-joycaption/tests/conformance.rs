@@ -2,17 +2,13 @@
 //!
 //! The captioner half of the "one real provider per contract" AC: it drives the actual JoyCaption
 //! MLX engine through the backend-neutral checks (capability honesty, progress monotonicity, typed
-//! cancellation, registry round-trip) — the guarantees a candle captioner will be held to
+//! cancellation) — the guarantees a candle captioner will be held to
 //! identically. `#[ignore]` because it needs the real
 //! `fancyfeast/llama-joycaption-beta-one-hf-llava` snapshot; run on the self-hosted Apple-Silicon
 //! runner or a populated dev box:
 //!   cargo test -p mlx-gen-joycaption --test conformance -- --ignored --nocapture
 
 use std::path::PathBuf;
-
-// Force-link the provider so its `inventory::submit!` registration survives the linker (this test
-// references no other joycaption symbol) — the registry round-trip check would otherwise fail.
-use mlx_gen_joycaption as _;
 
 use gen_core_testkit::CaptionerProfile;
 use mlx_gen::{LoadSpec, WeightsSource};
@@ -28,7 +24,10 @@ fn joy_caption_satisfies_gen_core_contract() {
     gen_core_testkit::captioner_conformance(
         || {
             let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
-            mlx_gen::load_captioner(id, &spec).expect("load joy_caption")
+            mlx_gen_joycaption::provider_registry()
+                .unwrap()
+                .load_captioner(id, &spec)
+                .expect("load joy_caption")
         },
         // 64² image / 16 greedy tokens — the cheapest valid caption (min_image_size 1, greedy is
         // seed-free and fast).

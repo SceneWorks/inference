@@ -7,7 +7,6 @@ use std::path::PathBuf;
 
 use mlx_gen::media::Image;
 use mlx_gen::{CaptionRequest, CaptionSampling, LoadSpec, WeightsSource};
-use mlx_gen_joycaption as _;
 
 #[test]
 #[ignore = "needs the JoyCaption HF snapshot; set MLX_GEN_JOYCAPTION_SNAPSHOT"]
@@ -17,7 +16,10 @@ fn joycaption_generates_short_caption_from_real_weights() {
             .expect("set MLX_GEN_JOYCAPTION_SNAPSHOT to a JoyCaption snapshot directory"),
     );
     let id = mlx_gen::caption::joycaption::JOY_CAPTION_MODEL_ID;
-    let model = mlx_gen::load_captioner(id, &LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+    let model = mlx_gen_joycaption::provider_registry()
+        .unwrap()
+        .load_captioner(id, &LoadSpec::new(WeightsSource::Dir(root)))
+        .unwrap();
     let req = CaptionRequest {
         image: Image {
             width: 384,

@@ -1,6 +1,6 @@
 //! S6 product-path smoke (`#[ignore]` — needs the 54 GB converted A14B checkpoint).
 //!
-//! Drives the **public** product entry point end-to-end — `mlx_gen::load("wan2_2_t2v_14b", spec)`
+//! Drives the **public** product entry point end-to-end — `provider_registry().load("wan2_2_t2v_14b", spec)`
 //! then `Generator::generate` — to confirm the registry → staged-load → seeded-noise →
 //! `denoise_moe` → z16 VAE decode → `Vec<Image>` path runs and yields a *coherent* video (not noise,
 //! not a flat frame). This complements `s6_real_parity` (which drives the pipeline directly against
@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::{registry, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
+use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_wan::MODEL_ID_T2V_14B;
 
 fn env_path(var: &str) -> Option<PathBuf> {
@@ -49,11 +49,13 @@ fn wan_a14b_generate_produces_coherent_video() {
         }
     };
 
-    let gen = registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(model_dir)),
-    )
-    .expect("load wan2_2_t2v_14b");
+    let gen = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(model_dir)),
+        )
+        .expect("load wan2_2_t2v_14b");
     assert_eq!(gen.descriptor().id, MODEL_ID_T2V_14B);
 
     let req = GenerationRequest {

@@ -29,9 +29,6 @@ use common::snapshot;
 
 /// Train a tiny real LoRA (the sc-4568 path) and return its adapter file.
 fn train_lora(tmp: &Path) -> PathBuf {
-    // Force-link mlx-gen-kolors so its `inventory::submit!` trainer registration isn't dead-stripped
-    // (this test reaches the trainer only via the generic `mlx_gen::load_trainer`, naming no
-    // `mlx_gen_kolors::` symbol otherwise → "no trainer registered for id 'kolors'").
     assert_eq!(mlx_gen_kolors::MODEL_ID, "kolors");
     std::fs::create_dir_all(tmp).unwrap();
     let mut items = Vec::new();
@@ -48,8 +45,10 @@ fn train_lora(tmp: &Path) -> PathBuf {
             control_image_path: None,
         });
     }
-    let mut trainer =
-        mlx_gen::load_trainer("kolors", &LoadSpec::new(WeightsSource::Dir(snapshot()))).unwrap();
+    let mut trainer = mlx_gen_kolors::provider_registry()
+        .unwrap()
+        .load_trainer("kolors", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .unwrap();
     let req = TrainingRequest {
         items,
         config: TrainingConfig {

@@ -15,7 +15,6 @@
 use std::path::PathBuf;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Reference the provider crate so its `inventory` registration links (`mlx_gen::load` resolves it).
 use mlx_gen_qwen_image::MODEL_ID;
 
 const W: u32 = 256;
@@ -87,7 +86,10 @@ fn assert_coherent(img: &Image, label: &str) {
 
 fn render(sampler: Option<&str>) -> Image {
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-    let generator = mlx_gen::load(MODEL_ID, &spec).expect("load qwen_image");
+    let generator = mlx_gen_qwen_image::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load qwen_image");
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: W,

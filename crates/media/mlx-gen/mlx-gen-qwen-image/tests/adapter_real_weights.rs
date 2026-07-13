@@ -174,7 +174,10 @@ fn render(adapter: Option<(&str, AdapterKind, f32)>, golden_kind: &str) -> Vec<u
             moe_expert: None,
         }]);
     }
-    let generator = mlx_gen::load("qwen_image", &spec).unwrap();
+    let generator = mlx_gen_qwen_image::provider_registry()
+        .unwrap()
+        .load("qwen_image", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width: w,

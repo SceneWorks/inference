@@ -1,5 +1,5 @@
 //! sc-3047 e2e — the production `LtxTrainer` (the `Trainer` contract realized on the LTX-2.3 video
-//! DiT), driven through the core registry exactly as the SceneWorks worker will.
+//! DiT), driven through the explicit provider registry.
 //!
 //! `#[ignore]`d — needs a real LTX-2.3 split-weight snapshot (`$LTX_BASE_DIR` or the SceneWorks
 //! `ltx_2_3_base_q8` cache) AND the Gemma-3-12B text-encoder snapshot (`$LTX_GEMMA_DIR` or the HF
@@ -59,13 +59,12 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 fn ltx_trainer_trains_and_writes_lora_that_reloads() {
     let tmp = std::env::temp_dir().join("ltx_trainer_e2e");
     let items = make_dataset(&tmp);
-    // Reference the provider crate so its `inventory::submit!` registration is linked into this test
-    // binary (a consumer that links the crate gets it for free).
     assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
 
-    let mut trainer =
-        mlx_gen::load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
-            .expect("ltx_2_3 trainer should be registered");
+    let mut trainer = mlx_gen_ltx::provider_registry()
+        .unwrap()
+        .load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("ltx_2_3 trainer should be registered");
 
     // LTX is a deep 48-block DiT with the full attention surface adapted (384 residuals stacked
     // sequentially), so it is far more LR-sensitive than the shallower image DiTs — the reference LTX
@@ -186,9 +185,10 @@ fn ltx_trainer_trains_with_gradient_checkpointing() {
     let tmp = std::env::temp_dir().join("ltx_trainer_e2e_ckpt");
     let items = make_dataset(&tmp);
 
-    let mut trainer =
-        mlx_gen::load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
-            .expect("ltx_2_3 trainer should be registered");
+    let mut trainer = mlx_gen_ltx::provider_registry()
+        .unwrap()
+        .load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("ltx_2_3 trainer should be registered");
 
     let config = TrainingConfig {
         rank: 8,
@@ -254,9 +254,10 @@ fn ltx_trainer_emits_preview_samples() {
     let tmp = std::env::temp_dir().join("ltx_trainer_samples_e2e");
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
-    let mut trainer =
-        mlx_gen::load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
-            .expect("ltx_2_3 trainer should be registered");
+    let mut trainer = mlx_gen_ltx::provider_registry()
+        .unwrap()
+        .load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("ltx_2_3 trainer should be registered");
 
     let config = TrainingConfig {
         rank: 8,

@@ -279,7 +279,10 @@ fn hyper_flux_public_render_differs_from_base() {
         ..Default::default()
     };
     let pixels = |spec: LoadSpec, sampler: Option<&str>| -> Vec<u8> {
-        let gen = mlx_gen::load("flux1_dev", &spec).unwrap();
+        let gen = mlx_gen_flux::provider_registry()
+            .unwrap()
+            .load("flux1_dev", &spec)
+            .unwrap();
         match gen.generate(&req(sampler), &mut |_| {}).unwrap() {
             GenerationOutput::Images(mut v) => v.pop().unwrap().pixels,
             other => panic!("expected Images, got {other:?}"),

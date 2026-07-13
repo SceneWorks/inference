@@ -169,7 +169,10 @@ fn img2img_latent_prep_matches_fork() {
 fn render_img2img(quant: Option<Quant>, image: Image) -> Image {
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     spec.quantize = quant;
-    let gen = mlx_gen::load("flux2_klein_9b", &spec).unwrap();
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load("flux2_klein_9b", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt: PROMPT.into(),
         width: SIZE,

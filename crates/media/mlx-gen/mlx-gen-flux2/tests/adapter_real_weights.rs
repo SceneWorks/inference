@@ -130,7 +130,10 @@ fn render(adapter: Option<(&str, AdapterKind, f32)>, golden_kind: &str) -> Vec<u
             moe_expert: None,
         }]);
     }
-    let generator = mlx_gen::load("flux2_klein_9b", &spec).unwrap();
+    let generator = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load("flux2_klein_9b", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width: w,

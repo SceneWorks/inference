@@ -72,7 +72,10 @@ fn prequantize_turnkey_loads_packed_and_renders() {
     // Linears are already quantized, so the post-load `quantize` calls no-op — this proves the
     // packed path, not an in-app quantize.
     let spec = LoadSpec::new(WeightsSource::Dir(out.clone())).with_quant(quant);
-    let generator = mlx_gen::load("z_image_turbo", &spec).expect("packed z_image_turbo loads");
+    let generator = mlx_gen_z_image::provider_registry()
+        .unwrap()
+        .load("z_image_turbo", &spec)
+        .expect("packed z_image_turbo loads");
 
     // Turbo is guidance-distilled: 4 steps, no guidance / negative prompt.
     let req = GenerationRequest {

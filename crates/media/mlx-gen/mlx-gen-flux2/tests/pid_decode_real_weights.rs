@@ -20,9 +20,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, WeightsSource};
-// Force the linker to keep this crate's `inventory::submit!` model registrations (the CLAUDE.md
-// linkage gotcha) so `mlx_gen::load("flux2_klein_9b", …)` resolves from the test binary.
-use mlx_gen_flux2 as _;
 
 const MODEL_ID: &str = "flux2_klein_9b";
 
@@ -128,7 +125,10 @@ fn flux2_klein_pid_decode_vs_vae() {
 
     eprintln!("loading FLUX.2-klein-9b (+PiD overlay), size={size} ...");
     let t = Instant::now();
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load FLUX.2-klein-9b + PiD");
+    let model = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load FLUX.2-klein-9b + PiD");
     eprintln!("loaded in {:.1}s", t.elapsed().as_secs_f32());
 
     let base = GenerationRequest {
@@ -213,7 +213,10 @@ fn flux2_pid_from_ldm_early_stop() {
         WeightsSource::File(pid_checkpoint()),
         WeightsSource::Dir(gemma_dir()),
     );
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load FLUX.2-klein-9b + PiD");
+    let model = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load FLUX.2-klein-9b + PiD");
 
     let base = GenerationRequest {
         prompt: "a mountain valley landscape at golden hour with a winding river and pine forest"
@@ -284,7 +287,10 @@ fn use_pid_without_loaded_pid_errors() {
     if let Some(q) = quant_from_env() {
         spec = spec.with_quant(q);
     }
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load FLUX.2-klein-9b");
+    let model = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load FLUX.2-klein-9b");
     let req = GenerationRequest {
         prompt: "a fox".into(),
         width: 512,

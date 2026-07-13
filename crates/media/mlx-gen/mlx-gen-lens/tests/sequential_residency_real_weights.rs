@@ -27,9 +27,7 @@
 //! Q4, `LENS_SEQ_BF16=1` for the (non-winning) dense case, `LENS_SEQ_STEPS`/`LENS_SEQ_SIZE`/
 //! `LENS_SEQ_GUIDANCE` to tune.
 
-// Force-link the provider crate so its `inventory` generator registration runs (this test only calls
-// `mlx_gen::load("lens_turbo", …)`).
-use mlx_gen_lens as _;
+// `provider_registry().load("lens_turbo", …)`).
 
 use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Quant, WeightsSource,
@@ -102,7 +100,10 @@ fn base_spec() -> LoadSpec {
 
 fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, usize) {
     let spec = base_spec().with_offload_policy(policy);
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load lens_turbo");
+    let model = mlx_gen_lens::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load lens_turbo");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

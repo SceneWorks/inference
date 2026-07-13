@@ -31,7 +31,6 @@
 //! SC8771_KEEP (retain the tier).
 
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
-use mlx_gen_sensenova as _; // force-link the inventory registration for mlx_gen::load.
 use std::path::PathBuf;
 
 const DEFAULT_SNAPSHOT: &str = concat!(
@@ -167,7 +166,10 @@ fn prequantize_turnkey_loads_packed_and_renders() {
     // transient, no in-app re-quantize), so we load with `Quant::None`; the dense bf16 tier loads
     // dense the same way.
     let spec = LoadSpec::new(WeightsSource::Dir(load_root));
-    let generator = mlx_gen::load(&id, &spec).expect("packed sensenova loads");
+    let generator = mlx_gen_sensenova::provider_registry()
+        .unwrap()
+        .load(&id, &spec)
+        .expect("packed sensenova loads");
 
     // 256² / few-step — packed load-path proof, not a quality bench (an 8B multi-minute run).
     let req = GenerationRequest {

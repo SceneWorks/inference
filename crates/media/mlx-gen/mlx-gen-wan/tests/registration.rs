@@ -2,7 +2,7 @@
 //!
 //! Verifies that `wan2_2_ti2v_5b` (dense 5B, `generate` fully wired — sc-2680),
 //! `wan2_2_t2v_14b` (dual-expert MoE T2V, `generate` fully wired) and `wan2_2_i2v_14b` (dual-expert
-//! MoE channel-concat I2V, `generate` fully wired) each self-register with the right descriptor, that
+//! MoE channel-concat I2V, `generate` fully wired) each export the right descriptor, that
 //! `load` reads the model's `config.json` (5B preset / dual-expert / i2v detection), that the 14B
 //! loaders reject a mismatched config, that Q4/Q8 + LoRA/LoKr are accepted at load (applied in
 //! generate), and that an invalid source / precision override is rejected for all.
@@ -10,8 +10,8 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    registry, AdapterKind, AdapterSpec, Conditioning, ConditioningKind, GenerationRequest, Image,
-    LoadSpec, Modality, Precision, Quant, ReplacementMode, WeightsSource,
+    AdapterKind, AdapterSpec, Conditioning, ConditioningKind, GenerationRequest, Image, LoadSpec,
+    Modality, Precision, Quant, ReplacementMode, WeightsSource,
 };
 
 use mlx_gen_wan::{MODEL_ID, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, MODEL_ID_VACE};
@@ -125,7 +125,10 @@ fn temp_model_dir_with(tag: &str, config: &str) -> PathBuf {
 
 #[test]
 fn wan_is_registered() {
-    let reg = registry::generators()
+    let reg = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .generators()
+        .copied()
         .find(|r| (r.descriptor)().id == MODEL_ID)
         .expect("wan2_2_ti2v_5b not registered");
     let d = (reg.descriptor)();
@@ -159,7 +162,9 @@ fn wan_is_registered() {
 #[test]
 fn load_reads_config_and_wires_generate() {
     let dir = temp_model_dir("load");
-    let g = registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+    let g = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
         .expect("load should succeed (reads config.json)");
     assert_eq!(g.descriptor().id, MODEL_ID);
 
@@ -201,15 +206,20 @@ fn load_reads_config_and_wires_generate() {
 fn load_rejects_bad_source_and_precision() {
     let dir = temp_model_dir("reject");
     // Single-file source.
-    assert!(registry::load(
-        MODEL_ID,
-        &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
-    )
-    .is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
+        )
+        .is_err());
     // Precision override (the DiT runs bf16 GEMMs over an f32 residual — the parity regime).
     let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
     spec.precision = Precision::Fp32;
-    assert!(registry::load(MODEL_ID, &spec).is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .is_err());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -219,11 +229,13 @@ fn load_accepts_quant_and_adapters() {
     // Q4/Q8 (sc-2682) is now WIRED at load (the DiT is quantized lazily in generate); the e2e
     // numerics ride the shared WanTransformer::quantize path.
     let dir = temp_model_dir("quant");
-    assert!(registry::load(
-        MODEL_ID,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
+        )
+        .is_ok());
     // LoRA/LoKr (sc-2683 / sc-2393) are accepted at load — the file is read + merged in generate
     // (which needs the real model weights), so load itself succeeds.
     let adapters = vec![AdapterSpec {
@@ -233,18 +245,23 @@ fn load_accepts_quant_and_adapters() {
         pass_scales: None,
         moe_expert: None,
     }];
-    assert!(registry::load(
-        MODEL_ID,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(adapters)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(adapters)
+        )
+        .is_ok());
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn wan_t2v_14b_is_registered() {
-    let reg = registry::generators()
+    let reg = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .generators()
+        .copied()
         .find(|r| (r.descriptor)().id == MODEL_ID_T2V_14B)
         .expect("wan2_2_t2v_14b not registered");
     let d = (reg.descriptor)();
@@ -271,11 +288,13 @@ fn wan_t2v_14b_is_registered() {
 #[test]
 fn load_t2v_14b_reads_dual_config_and_wires_generate() {
     let dir = temp_model_dir_with("t2v14b", T2V_14B_CONFIG);
-    let g = registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())),
-    )
-    .expect("load should succeed (reads dual config.json)");
+    let g = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())),
+        )
+        .expect("load should succeed (reads dual config.json)");
     assert_eq!(g.descriptor().id, MODEL_ID_T2V_14B);
 
     // validate accepts a 16-aligned 1+4k-frame request; rejects sub-tile + bad frame counts.
@@ -330,31 +349,40 @@ fn load_t2v_14b_reads_dual_config_and_wires_generate() {
 fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
     // A single-model (Wan2.1) config is rejected by the dual-expert loader.
     let single = temp_model_dir_with("t2v14b_single", TI2V_5B_CONFIG);
-    assert!(registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(single.clone()))
-    )
-    .is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(single.clone()))
+        )
+        .is_err());
     std::fs::remove_dir_all(&single).ok();
 
     let dir = temp_model_dir_with("t2v14b_reject", T2V_14B_CONFIG);
     // Single-file source.
-    assert!(registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
-    )
-    .is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
+        )
+        .is_err());
     // Quantization (sc-2682) is now WIRED: Q4/Q8 is accepted at load (each expert is quantized
     // lazily in generate). The e2e numerics are gated by tests/quant_e2e_parity.rs.
-    assert!(registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
+        )
+        .is_ok());
     // Precision override (the experts run bf16 GEMMs over an f32 residual) is still rejected.
     let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
     spec.precision = Precision::Fp32;
-    assert!(registry::load(MODEL_ID_T2V_14B, &spec).is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(MODEL_ID_T2V_14B, &spec)
+        .is_err());
     // LoKr (sc-2393) is now ACCEPTED at load — merged per expert at generate (the file is read then).
     let lokr = vec![AdapterSpec {
         path: dir.join("x.safetensors"),
@@ -363,11 +391,13 @@ fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
         pass_scales: None,
         moe_expert: None,
     }];
-    assert!(registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lokr)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lokr)
+        )
+        .is_ok());
     // A LoRA adapter (incl. an MoE-expert-tagged one) is ACCEPTED at load (sc-2683); the per-expert
     // merge is deferred to generate (which needs the real expert weights), so load itself succeeds.
     let lora = vec![AdapterSpec {
@@ -377,11 +407,13 @@ fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
         pass_scales: None,
         moe_expert: Some(mlx_gen::MoeExpert::High),
     }];
-    assert!(registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lora)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lora)
+        )
+        .is_ok());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -391,31 +423,40 @@ fn load_t2v_14b_accepts_prequantized_snapshot_and_reconciles_spec() {
     // A pre-quantized snapshot (config.json carries a `quantization` block) loads WITHOUT a
     // spec.quantize override — `from_weights` builds the experts from the on-disk packed weights.
     let dir = temp_model_dir_with("t2v14b_q4", T2V_14B_Q4_CONFIG);
-    assert!(registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone()))
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone()))
+        )
+        .is_ok());
     // A matching spec.quantize is fine (redundant with the manifest).
-    assert!(registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q4)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q4)
+        )
+        .is_ok());
     // A conflicting spec.quantize (Q8 vs the manifest's Q4) is rejected — the on-disk manifest is
     // authoritative; we never silently re-quantize at a different width.
-    assert!(registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
-    )
-    .is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
+        )
+        .is_err());
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn wan_i2v_14b_is_registered() {
-    let reg = registry::generators()
+    let reg = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .generators()
+        .copied()
         .find(|r| (r.descriptor)().id == MODEL_ID_I2V_14B)
         .expect("wan2_2_i2v_14b not registered");
     let d = (reg.descriptor)();
@@ -449,11 +490,13 @@ fn dummy_image() -> Image {
 #[test]
 fn load_i2v_14b_reads_config_validates_and_wires_generate() {
     let dir = temp_model_dir_with("i2v14b", I2V_14B_CONFIG);
-    let g = registry::load(
-        MODEL_ID_I2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())),
-    )
-    .expect("load should succeed (reads i2v config.json)");
+    let g = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_I2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())),
+        )
+        .expect("load should succeed (reads i2v config.json)");
     assert_eq!(g.descriptor().id, MODEL_ID_I2V_14B);
 
     let with_ref = |extra: fn(&mut GenerationRequest)| {
@@ -508,31 +551,40 @@ fn load_i2v_14b_reads_config_validates_and_wires_generate() {
 fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
     // A T2V (non-channel-concat) config is rejected by the i2v loader.
     let t2v = temp_model_dir_with("i2v14b_t2v", T2V_14B_CONFIG);
-    assert!(registry::load(
-        MODEL_ID_I2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(t2v.clone()))
-    )
-    .is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_I2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(t2v.clone()))
+        )
+        .is_err());
     std::fs::remove_dir_all(&t2v).ok();
 
     let dir = temp_model_dir_with("i2v14b_reject", I2V_14B_CONFIG);
     // Single-file source.
-    assert!(registry::load(
-        MODEL_ID_I2V_14B,
-        &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
-    )
-    .is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_I2V_14B,
+            &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
+        )
+        .is_err());
     // Quantization (sc-2682) is now WIRED: Q4/Q8 is accepted at load (each expert is quantized
     // lazily in generate). The e2e numerics are gated by tests/quant_e2e_parity.rs.
-    assert!(registry::load(
-        MODEL_ID_I2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_I2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
+        )
+        .is_ok());
     // Precision override (the experts run bf16 GEMMs over an f32 residual) is still rejected.
     let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
     spec.precision = Precision::Fp32;
-    assert!(registry::load(MODEL_ID_I2V_14B, &spec).is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(MODEL_ID_I2V_14B, &spec)
+        .is_err());
     // LoKr (sc-2393) is now ACCEPTED at load — merged per expert at generate (the file is read then).
     let lokr = vec![AdapterSpec {
         path: dir.join("x.safetensors"),
@@ -541,11 +593,13 @@ fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
         pass_scales: None,
         moe_expert: None,
     }];
-    assert!(registry::load(
-        MODEL_ID_I2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lokr)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_I2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lokr)
+        )
+        .is_ok());
     // A LoRA adapter is ACCEPTED at load (sc-2683); the per-expert merge is deferred to generate.
     let lora = vec![AdapterSpec {
         path: dir.join("x.safetensors"),
@@ -554,11 +608,13 @@ fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
         pass_scales: None,
         moe_expert: Some(mlx_gen::MoeExpert::Low),
     }];
-    assert!(registry::load(
-        MODEL_ID_I2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lora)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_I2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lora)
+        )
+        .is_ok());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -610,7 +666,10 @@ fn control_clip_request(num_frames: usize) -> GenerationRequest {
 
 #[test]
 fn wan_vace_is_registered() {
-    let reg = registry::generators()
+    let reg = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .generators()
+        .copied()
         .find(|r| (r.descriptor)().id == MODEL_ID_VACE)
         .expect("wan_vace not registered");
     let d = (reg.descriptor)();
@@ -641,11 +700,13 @@ fn wan_vace_is_registered() {
 #[test]
 fn wan_vace_load_reads_config_and_validates() {
     let dir = temp_model_dir_with("vace", VACE_CONFIG);
-    let g = registry::load(
-        MODEL_ID_VACE,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())),
-    )
-    .expect("load wan_vace");
+    let g = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_VACE,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())),
+        )
+        .expect("load wan_vace");
     assert_eq!(g.descriptor().id, MODEL_ID_VACE);
 
     // A 5-frame (1 + 4·1) control clip validates; a control clip with no control errors; a frame
@@ -680,11 +741,13 @@ fn wan_vace_load_reads_config_and_validates() {
 fn wan_vace_rejects_bad_source_accepts_adapters() {
     let dir = temp_model_dir_with("vace_bad", VACE_CONFIG);
     // A single-file source is rejected (expects a converted snapshot dir).
-    assert!(registry::load(
-        MODEL_ID_VACE,
-        &LoadSpec::new(WeightsSource::File(dir.join("model.safetensors")))
-    )
-    .is_err());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_VACE,
+            &LoadSpec::new(WeightsSource::File(dir.join("model.safetensors")))
+        )
+        .is_err());
     // LoRA/LoKr adapters are now ACCEPTED at load (sc-3439, diffusers-name routing); the merge is
     // deferred to generate (which reads the file + the real DiT weights), so load itself succeeds.
     let lora = vec![AdapterSpec {
@@ -694,11 +757,13 @@ fn wan_vace_rejects_bad_source_accepts_adapters() {
         pass_scales: None,
         moe_expert: None,
     }];
-    assert!(registry::load(
-        MODEL_ID_VACE,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lora)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_VACE,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lora)
+        )
+        .is_ok());
     let lokr = vec![AdapterSpec {
         path: dir.join("x.safetensors"),
         scale: 1.0,
@@ -706,10 +771,12 @@ fn wan_vace_rejects_bad_source_accepts_adapters() {
         pass_scales: None,
         moe_expert: None,
     }];
-    assert!(registry::load(
-        MODEL_ID_VACE,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lokr)
-    )
-    .is_ok());
+    assert!(mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_VACE,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lokr)
+        )
+        .is_ok());
     std::fs::remove_dir_all(&dir).ok();
 }

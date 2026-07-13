@@ -1,5 +1,5 @@
 //! sc-3045 e2e — the production `SdxlTrainer` (the `Trainer` contract realized on the SDXL U-Net),
-//! driven through the core registry exactly as the SceneWorks worker will.
+//! driven through the explicit provider registry.
 //!
 //! `#[ignore]`d — needs the real `stabilityai/stable-diffusion-xl-base-1.0` snapshot in the HF cache
 //! (or `SDXL_SNAPSHOT`). Run:
@@ -74,12 +74,11 @@ fn run_cfg(
     gradient_checkpointing: bool,
 ) -> (Vec<f32>, u32, PathBuf) {
     let items = make_dataset(tmp);
-    // Reference the provider crate so its `inventory::submit!` registration is linked into this test
-    // binary (a consumer that links the crate gets it for free; an integration test that names
-    // nothing from the crate would otherwise have it dead-stripped).
     assert_eq!(mlx_gen_sdxl::MODEL_ID, "sdxl");
 
-    let mut trainer = mlx_gen::load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+    let mut trainer = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
         .expect("sdxl trainer should be registered");
 
     let req = TrainingRequest {
@@ -129,7 +128,9 @@ fn run_cfg(
 /// Unlike [`run_cfg`] it asserts nothing about the loss curve — the resume test compares two runs.
 fn train_to(out_dir: &Path, cfg: TrainingConfig) -> PathBuf {
     let items = make_dataset(&out_dir.join("ds"));
-    let mut trainer = mlx_gen::load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+    let mut trainer = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
         .expect("sdxl trainer registered");
     let req = TrainingRequest {
         items,
@@ -352,7 +353,9 @@ fn sdxl_trainer_emits_preview_samples() {
     let tmp = std::env::temp_dir().join("sdxl_trainer_samples_e2e");
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_sdxl::MODEL_ID, "sdxl");
-    let mut trainer = mlx_gen::load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+    let mut trainer = mlx_gen_sdxl::provider_registry()
+        .unwrap()
+        .load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
         .expect("sdxl trainer should be registered");
 
     let mut cfg = config(NetworkType::Lora, false);

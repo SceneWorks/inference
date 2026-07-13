@@ -3,7 +3,7 @@
 //! Drives the assembled MLX engine (tokenizer + Qwen3-VL-4B TE + single-stream DiT + Qwen-Image VAE)
 //! through the backend-neutral checks — capability honesty, progress monotonicity, typed cancellation
 //! ([`mlx_gen::Error::Canceled`] round-tripping to `gen_core::Error::Canceled`), seed determinism,
-//! registry round-trip — the same guarantees a candle provider will be held to (sc-7580). `#[ignore]`
+//! and seed determinism — the same guarantees a candle provider will be held to (sc-7580). `#[ignore]`
 //! because it needs the real `krea/Krea-2-Turbo` weights; run on the macos-mlx lane / a dev box:
 //! ```sh
 //! KREA_TURBO_DIR=~/.cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots/<rev> \
@@ -11,10 +11,6 @@
 //! ```
 
 use std::path::PathBuf;
-
-// Force-link the provider so its `inventory::submit!` registration survives the linker (this test
-// references no other krea symbol); the worker does the same `as _` import per model crate.
-use mlx_gen_krea as _;
 
 use gen_core_testkit::Profile;
 use mlx_gen::{LoadSpec, WeightsSource};
@@ -46,7 +42,10 @@ fn krea_2_turbo_satisfies_gen_core_contract() {
         || {
             // Dense bf16 — the cheapest load; the suite exercises the contract, not quantization.
             let spec = LoadSpec::new(WeightsSource::Dir(snap.clone()));
-            mlx_gen::load("krea_2_turbo", &spec).expect("load krea_2_turbo")
+            mlx_gen_krea::provider_registry()
+                .unwrap()
+                .load("krea_2_turbo", &spec)
+                .expect("load krea_2_turbo")
         },
         // 256² / few-step — the minimum valid Krea config (min_size 256, multiple-of-16).
         &Profile::cheap(),

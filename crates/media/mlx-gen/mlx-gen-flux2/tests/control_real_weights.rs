@@ -174,8 +174,10 @@ fn dev_control_renders_coherent_pose_image() {
     let spec = LoadSpec::new(WeightsSource::Dir(dst))
         .with_control(WeightsSource::File(control_checkpoint()))
         .with_quant(Quant::Q4);
-    let gen =
-        mlx_gen::load("flux2_dev_control", &spec).expect("dev-control loads through the registry");
+    let gen = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load("flux2_dev_control", &spec)
+        .expect("dev-control loads through the registry");
 
     let req = GenerationRequest {
         prompt: prompt.clone(),

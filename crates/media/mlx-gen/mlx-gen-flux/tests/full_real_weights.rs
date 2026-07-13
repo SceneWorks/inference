@@ -10,7 +10,6 @@
 use std::path::PathBuf;
 
 use mlx_gen::{LoadSpec, WeightsSource};
-use mlx_gen_flux as _;
 
 #[test]
 #[ignore = "loads the full multi-component FLUX.1 snapshot; set MLX_GEN_FLUX_SNAPSHOT"]
@@ -20,6 +19,9 @@ fn flux1_provider_loads_full_snapshot() {
             .expect("set MLX_GEN_FLUX_SNAPSHOT to a FLUX.1 snapshot directory"),
     );
     let spec = LoadSpec::new(WeightsSource::Dir(root));
-    let model = mlx_gen::load("flux1_schnell", &spec).unwrap();
+    let model = mlx_gen_flux::provider_registry()
+        .unwrap()
+        .load("flux1_schnell", &spec)
+        .unwrap();
     assert_eq!(model.descriptor().id, "flux1_schnell");
 }

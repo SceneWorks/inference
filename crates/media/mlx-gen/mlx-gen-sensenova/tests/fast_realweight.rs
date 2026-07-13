@@ -7,7 +7,7 @@
 //!     image (dumped by `tools/dump_sensenova_fast_realweight.py`). e2e is cross-build (MLX-Metal
 //!     bf16 vs torch bf16 over the denoise), so the gate is cosine + a loose peak-rel, not bit
 //!     parity — same regime as `t2i_realweight`.
-//!  2. **Registry wiring** — `mlx_gen::load("sensenova_u1_8b_fast", spec)` loads (which itself
+//!  2. **Registry wiring** — `provider_registry().load("sensenova_u1_8b_fast", spec)` loads (which itself
 //!     asserts the merge coverage in `load_fast`) and renders a coherent image through the
 //!     `Generator` path with the distilled defaults.
 //!
@@ -138,7 +138,10 @@ fn fast_registry_renders_coherently() {
     // `load_fast` resolves + merges the distill LoRA (asserting coverage) and applies the distilled
     // defaults. A bare request (no steps/guidance) exercises those defaults.
     let spec = LoadSpec::new(WeightsSource::Dir(snap));
-    let gen = mlx_gen::load("sensenova_u1_8b_fast", &spec).expect("registry load fast");
+    let gen = mlx_gen_sensenova::provider_registry()
+        .unwrap()
+        .load("sensenova_u1_8b_fast", &spec)
+        .expect("registry load fast");
     let req = GenerationRequest {
         prompt: "a red apple on a wooden table, studio lighting".into(),
         width: 256,

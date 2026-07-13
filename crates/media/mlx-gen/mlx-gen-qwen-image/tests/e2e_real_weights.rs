@@ -249,7 +249,7 @@ fn transformer_q4_pipeline_matches_fork() {
 }
 
 /// sc-2565: the **headline** parity gate — the full public product path
-/// `mlx_gen::load("qwen_image", spec.with_quant(Q)).generate()`, end-to-end at the golden's
+/// `provider_registry().load("qwen_image", spec.with_quant(Q)).generate()`, end-to-end at the golden's
 /// (prompt, seed, size, steps, guidance), vs the fork's `quantize=N` render. Unlike the cap-fed
 /// diagnostic above, this runs the Rust tokenizer + **dense** text encoder + transformer (Q) + VAE
 /// — the same component set the fork quantizes (`text_encoder` is `skip_quantization=True`, the VAE
@@ -268,7 +268,10 @@ fn q_full_generate_renders(golden_path: &str, quant: Quant, bits: i32, max_px_fr
     // Full pipeline through the public registry API. The dump's NEGATIVE="" maps to the fork's
     // single-space fallback, which `generate()` reproduces for `negative_prompt: None`.
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_quant(quant);
-    let generator = mlx_gen::load("qwen_image", &spec).unwrap();
+    let generator = mlx_gen_qwen_image::provider_registry()
+        .unwrap()
+        .load("qwen_image", &spec)
+        .unwrap();
     let req = GenerationRequest {
         prompt,
         width,

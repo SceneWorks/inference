@@ -11,9 +11,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::{registry, Conditioning, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Force-link the provider so its `inventory::submit!` registration survives the linker; otherwise
-// `mlx_gen::load` reports "no generator registered". The worker does the same per model crate.
+use mlx_gen::{Conditioning, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_seedvr2::registry::MODEL_ID;
 
 /// The raw `numz/SeedVR2_comfyUI` checkpoint snapshot dir (mirrors `registry_e2e.rs::raw_dir`):
@@ -42,8 +40,10 @@ fn seedvr2_honors_typed_cancellation() {
         eprintln!("SKIP: raw SeedVR2 3B checkpoint absent");
         return;
     };
-    let gen =
-        registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap))).expect("load seedvr2");
+    let gen = mlx_gen_seedvr2::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(snap)))
+        .expect("load seedvr2");
 
     // Image upscale: a low-res Reference image → a 128×128 (÷16) target. `steps` is overridden for
     // headroom though SeedVR2 is a 1-step model — the helper trips on whatever step it emits.

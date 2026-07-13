@@ -14,7 +14,6 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-use mlx_gen_sdxl as _; // force-link the provider so `inventory` registers "sdxl"
 use mlx_gen_sdxl::{load_ip_kv_pairs, load_unet_dtype, text_time_ids};
 use mlx_rs::{Array, Dtype};
 

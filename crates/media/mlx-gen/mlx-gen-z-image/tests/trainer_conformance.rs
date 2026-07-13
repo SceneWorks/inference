@@ -2,7 +2,7 @@
 //!
 //! The trainer half of the "one real provider per contract" AC: it drives the actual
 //! `ZImageTurboTrainer` through the backend-neutral checks (capability honesty, `TrainingProgress`
-//! monotonicity, typed cancellation before any step, registry round-trip) — the guarantees a candle
+//! monotonicity and typed cancellation before any step) — the guarantees a candle
 //! trainer will be held to identically. `#[ignore]` because it needs the real
 //! `Tongyi-MAI/Z-Image-Turbo` weights (`ZIMAGE_SNAPSHOT` or the HF cache); run on the self-hosted
 //! Apple-Silicon runner or a populated dev box:
@@ -14,10 +14,6 @@
 //! 64px dataset, 2 steps.
 
 use std::path::Path;
-
-// Force-link the provider so its `inventory::submit!` trainer registration survives (this test
-// references `MODEL_ID`, but keep the `as _` discipline explicit for the registry round-trip).
-use mlx_gen_z_image as _;
 
 use gen_core_testkit::TrainerProfile;
 use mlx_gen::{LoadSpec, TrainingItem, WeightsSource};
@@ -58,7 +54,10 @@ fn z_image_turbo_trainer_satisfies_gen_core_contract() {
     gen_core_testkit::trainer_conformance(
         || {
             let spec = LoadSpec::new(WeightsSource::Dir(snap.clone()));
-            mlx_gen::load_trainer("z_image_turbo", &spec).expect("load z_image_turbo trainer")
+            mlx_gen_z_image::provider_registry()
+                .unwrap()
+                .load_trainer("z_image_turbo", &spec)
+                .expect("load z_image_turbo trainer")
         },
         &profile,
     );

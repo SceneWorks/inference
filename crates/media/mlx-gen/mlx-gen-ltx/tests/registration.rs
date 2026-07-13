@@ -1,6 +1,6 @@
 //! Registry wiring + `load` rejection paths (sc-2679 S0 → S6).
 //!
-//! Verifies `ltx_2_3` self-registers into the `mlx-gen` model registry with the right descriptor,
+//! Verifies the provider catalog exposes `ltx_2_3` with the right descriptor,
 //! that `load` rejects the not-yet-wired sibling features (quant / adapters / single-file source)
 //! and an incomplete snapshot (S6 `load` assembles the full model — Gemma TE + transformer + VAE —
 //! so a config-only dir no longer loads). The request-validation logic is unit-tested weight-free in
@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::{registry, LoadSpec, Modality, Quant, WeightsSource};
+use mlx_gen::{LoadSpec, Modality, Quant, WeightsSource};
 
 use mlx_gen_ltx::MODEL_ID;
 
@@ -58,7 +58,10 @@ fn temp_model_dir(tag: &str) -> PathBuf {
 
 #[test]
 fn ltx_is_registered() {
-    let reg = registry::generators()
+    let reg = mlx_gen_ltx::provider_registry()
+        .unwrap()
+        .generators()
+        .copied()
         .find(|r| (r.descriptor)().id == MODEL_ID)
         .expect("ltx_2_3 not registered");
     let d = (reg.descriptor)();
@@ -81,7 +84,10 @@ fn load_requires_full_model() {
     // unit-tested weight-free in `model.rs`.)
     let dir = temp_model_dir("load");
     assert!(
-        registry::load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone()))).is_err(),
+        mlx_gen_ltx::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+            .is_err(),
         "config-only dir must not load (the full model's weight files are required)"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -91,17 +97,21 @@ fn load_requires_full_model() {
 fn load_rejects_unwired_features() {
     let dir = temp_model_dir("reject");
     // Single-file source.
-    assert!(registry::load(
-        MODEL_ID,
-        &LoadSpec::new(WeightsSource::File(dir.join("embedded_config.json")))
-    )
-    .is_err());
+    assert!(mlx_gen_ltx::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::File(dir.join("embedded_config.json")))
+        )
+        .is_err());
     // Quantization (sibling slice — the transformer ships Q8 already).
-    assert!(registry::load(
-        MODEL_ID,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
-    )
-    .is_err());
+    assert!(mlx_gen_ltx::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
+        )
+        .is_err());
     // (LoRA adapters are NO LONGER rejected — sc-2687 wires them; a LoKr file is rejected at apply
     // time, after the transformer loads, so it can't be exercised weight-free here. The full adapter
     // surface — routing, parity, per-pass, LoKr rejection — is gated by `lora_real_weights`.)

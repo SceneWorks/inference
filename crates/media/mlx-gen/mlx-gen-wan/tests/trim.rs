@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::{registry, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_wan::pipeline::latent_shape;
 use mlx_gen_wan::MODEL_ID_T2V_14B;
 
@@ -47,11 +47,13 @@ fn env_dir(var: &str) -> Option<PathBuf> {
 }
 
 fn gen_frame_count(model_dir: &std::path::Path, trim: Option<u32>) -> usize {
-    let g = registry::load(
-        MODEL_ID_T2V_14B,
-        &LoadSpec::new(WeightsSource::Dir(model_dir.to_path_buf())),
-    )
-    .expect("load wan2_2_t2v_14b");
+    let g = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(
+            MODEL_ID_T2V_14B,
+            &LoadSpec::new(WeightsSource::Dir(model_dir.to_path_buf())),
+        )
+        .expect("load wan2_2_t2v_14b");
     let req = GenerationRequest {
         prompt: "a red fox trotting across a snowy meadow at sunrise, cinematic".into(),
         width: 128,

@@ -14,7 +14,6 @@ mod common;
 use std::path::PathBuf;
 
 use common::CAPTION_JSON;
-use mlx_gen::gen_core::registry;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource};
 use mlx_gen_ideogram::MODEL_ID;
 use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
@@ -64,7 +63,10 @@ fn profile_footprint() {
     // is ~0. The real dense→quant transient (if any) is captured by the generate peak below, because
     // the quantize evaluates per-weight during the first forward (after the reset). ──
     reset_peak_memory();
-    let g = registry::load(MODEL_ID, &spec).expect("registry load ideogram_4");
+    let g = mlx_gen_ideogram::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("registry load ideogram_4");
     println!(
         "[{label}] post-load active {:.2} GB (lazy mmap — materializes on first forward)",
         gb(get_active_memory())

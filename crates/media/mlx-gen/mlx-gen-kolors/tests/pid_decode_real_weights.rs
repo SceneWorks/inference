@@ -21,9 +21,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
-// Force the linker to keep this crate's `inventory::submit!` model registration (the CLAUDE.md
-// linkage gotcha) so `mlx_gen::load("kolors", …)` resolves from the test binary.
-use mlx_gen_kolors as _;
 
 const MODEL_ID: &str = "kolors";
 
@@ -113,7 +110,10 @@ fn kolors_pid_decode_vs_vae() {
 
     eprintln!("loading Kolors-diffusers (+PiD overlay), size={size} ...");
     let t = Instant::now();
-    let model = mlx_gen::load(MODEL_ID, &spec).expect("load kolors + PiD");
+    let model = mlx_gen_kolors::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &spec)
+        .expect("load kolors + PiD");
     eprintln!("loaded in {:.1}s", t.elapsed().as_secs_f32());
 
     let base = GenerationRequest {
