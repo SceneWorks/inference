@@ -110,7 +110,12 @@ pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> R
     RunParams {
         is_lightning,
         steps,
-        guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
+        // Qwen's CFG scale is real classifier-free guidance (an uncond/negative branch runs — see
+        // `negative_or_fallback`), so `true_cfg` and `guidance` name the same knob here. The three
+        // descriptors advertise `supports_true_cfg`, so honor a caller-supplied `true_cfg`, falling
+        // back to `guidance`, then the default — instead of silently dropping `true_cfg` (F-103). The
+        // default path (both unset → `DEFAULT_GUIDANCE`) is unchanged.
+        guidance: req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_GUIDANCE),
         base_seed: req.seed.unwrap_or_else(default_seed),
         sampler_name: req.sampler.clone(),
         sigmas,
@@ -672,6 +677,59 @@ mod tests {
         assert!(v.iter().all(|&x| (-1.0..=1.0).contains(&x)));
         // first pixel (0,0,0) → -1 across channels; channel-planar NCHW so index 0,4,8 are R,G,B@(0,0).
         assert!((v[0] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_run_params_true_cfg_consumption() {
+        // F-103: `true_cfg` and `guidance` name the same real-CFG knob for Qwen, so a caller-supplied
+        // `true_cfg` must reach `RunParams.guidance` (wins), fall back to `guidance` when absent, and
+        // land on `DEFAULT_GUIDANCE` only when both are unset — never silently dropped.
+        let base = GenerationRequest {
+            prompt: "x".into(),
+            ..Default::default()
+        };
+
+        // true_cfg present → wins, even alongside a different `guidance`.
+        let rp = resolve_run_params(
+            &GenerationRequest {
+                true_cfg: Some(7.5),
+                guidance: Some(2.0),
+                ..base.clone()
+            },
+            1024,
+            1024,
+        );
+        assert_eq!(rp.guidance, 7.5, "true_cfg must win over guidance");
+
+        // true_cfg absent → guidance fallback.
+        let rp = resolve_run_params(
+            &GenerationRequest {
+                true_cfg: None,
+                guidance: Some(2.0),
+                ..base.clone()
+            },
+            1024,
+            1024,
+        );
+        assert_eq!(
+            rp.guidance, 2.0,
+            "guidance is the fallback when true_cfg is absent"
+        );
+
+        // both absent → default.
+        let rp = resolve_run_params(
+            &GenerationRequest {
+                true_cfg: None,
+                guidance: None,
+                ..base.clone()
+            },
+            1024,
+            1024,
+        );
+        assert_eq!(
+            rp.guidance, DEFAULT_GUIDANCE,
+            "both unset falls back to DEFAULT_GUIDANCE"
+        );
     }
 
     #[test]
