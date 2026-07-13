@@ -8,5 +8,11 @@ repository = "https://github.com/SceneWorks/inference"
 
 [dependencies]
 runtime-catalog = { workspace = true }
-mlx-gen-catalog = { workspace = true }
+mlx-gen-catalog = { workspace = true, optional = true }
 mlx-llm = { workspace = true }
+
+[features]
+default = ["media"]
+# SceneWorks consumes the complete bundle. LLM-only products can disable default features without
+# falling back to separate backend dependencies or linker-driven provider discovery.
+media = ["dep:mlx-gen-catalog"]

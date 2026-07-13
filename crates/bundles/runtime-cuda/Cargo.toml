@@ -8,9 +8,12 @@ repository = "https://github.com/SceneWorks/inference"
 
 [dependencies]
 runtime-catalog = { workspace = true }
-candle-gen-catalog = { workspace = true, features = ["cuda"] }
+candle-gen-catalog = { workspace = true, features = ["cuda"], optional = true }
 candle-llm = { workspace = true, features = ["cuda"] }
 
 [features]
-default = []
+default = ["media"]
+# SceneWorks consumes the complete bundle. LLM-only products can disable default features while
+# retaining the explicitly composed CUDA LLM catalog.
+media = ["dep:candle-gen-catalog"]
 flash-attn = ["candle-llm/flash-attn"]

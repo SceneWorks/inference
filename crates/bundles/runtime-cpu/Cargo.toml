@@ -8,5 +8,11 @@ repository = "https://github.com/SceneWorks/inference"
 
 [dependencies]
 runtime-catalog = { workspace = true }
-candle-gen-catalog = { workspace = true }
+candle-gen-catalog = { workspace = true, optional = true }
 candle-llm = { workspace = true }
+
+[features]
+default = ["media"]
+# SceneWorks consumes the complete bundle. LLM-only products can disable default features without
+# compiling the Candle media-provider graph.
+media = ["dep:candle-gen-catalog"]

@@ -115,6 +115,8 @@ jobs:
         # Clippy above still checks all targets; this step executes the actual lib/integration tests
         # without exhausting the hosted runner's disk while linking unrelated smoke binaries.
         run: cargo test --locked --lib --tests -p candle-llm -p 'candle-gen*' -p runtime-cpu
+      - name: Test LLM-only CPU bundle
+        run: cargo test --locked --no-default-features --lib -p runtime-cpu
       - name: Guard poison-tolerant shared locks
         run: bash crates/media/candle-gen/scripts/check-lock-poison.sh
       - name: Self-test the gen-core skew verdict
@@ -160,6 +162,8 @@ jobs:
         run: >-
           cargo test --locked --lib --tests
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
+      - name: Test LLM-only macOS bundle
+        run: cargo test --locked --no-default-features --lib -p runtime-macos
       - name: Check Candle Metal packages
         run: >-
           cargo check --locked
@@ -191,6 +195,11 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
+      - name: Test LLM-only CUDA bundle
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --no-default-features --lib -p runtime-cuda
 
   supply-chain:
     name: dependency policy + advisories

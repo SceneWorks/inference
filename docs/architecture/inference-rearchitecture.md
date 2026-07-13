@@ -183,6 +183,13 @@ registry, and one snapshot-preparer registry. `runtime-catalog` validates that
 every descriptor and preparer belongs to the bundle's declared backend, then
 exposes a stable machine-readable snapshot.
 
+Media providers are a default bundle component rather than an unconditional one.
+SceneWorks consumes each complete bundle with its default `media` feature; an
+LLM-only product such as ChatWorks disables default features and receives the same
+explicit LLM and snapshot-preparer catalog without compiling an unrelated media
+provider graph. This is a composition profile of the same platform release, not a
+return to separately pinned backend crates.
+
 The LLM engines export ordinary builder functions for provider and preparer
 registrations. This gives model-first loading and snapshot preparation the same
 explicit ownership model as media generation. The older process-global LLM APIs
