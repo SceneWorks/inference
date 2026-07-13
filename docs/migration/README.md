@@ -18,3 +18,8 @@ The source repositories are never history-rewritten or force-pushed.
 - [`PHASE_1_CHECKPOINT.md`](PHASE_1_CHECKPOINT.md): history import and exact tree equivalence
 - [`PHASE_2_CHECKPOINT.md`](PHASE_2_CHECKPOINT.md): ownership layout and unified workspace
 - [`PHASE_3_CHECKPOINT.md`](PHASE_3_CHECKPOINT.md): CI selection and release-train tooling
+
+The checkpoints record how the migration was executed and validated. The reasons
+for the repository and explicit media-registry decisions are recorded separately
+in
+[`../architecture/inference-rearchitecture.md`](../architecture/inference-rearchitecture.md).

@@ -30,6 +30,11 @@ for normalization invariants and
 [`docs/migration/PHASE_3_CHECKPOINT.md`](docs/migration/PHASE_3_CHECKPOINT.md) for
 the local release-train validation record.
 
+The architectural rationale—including why the repositories were consolidated,
+why media provider discovery is explicit, the alternatives considered, and the
+tradeoffs accepted—is recorded in
+[`docs/architecture/inference-rearchitecture.md`](docs/architecture/inference-rearchitecture.md).
+
 Validate the normalized graph with:
 
 ```sh
