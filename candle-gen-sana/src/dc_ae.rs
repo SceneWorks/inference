@@ -28,8 +28,8 @@
 //!    SiLU → conv_point(1×1 no-bias) → trms2d → + residual`.
 //!  - [`UpBlock`] (`DCUpBlock2d`, interpolate): `nearest-upsample → conv`, + a channel shortcut
 //!    `repeat_interleave → pixel_shuffle`.
-//!  - [`DownBlock`] (`DCDownBlock2d`, the encoder mirror): `pixel_unshuffle → conv`, + a channel
-//!    shortcut `pixel_unshuffle → channel-average`.
+//!  - [`DownBlock`] (`DCDownBlock2d`, the encoder mirror, `downsample_block_type = Conv`): a
+//!    `stride-2 conv`, + a channel shortcut `pixel_unshuffle → channel-average`.
 
 // The pure tensor helpers + `forward` methods return candle-core's `Result` (candle ops' native
 // error). The weight-loaders return `candle_gen::Result` (its `CandleError` is what `Weights::require`
@@ -470,7 +470,7 @@ impl UpBlock {
     }
 }
 
-/// `DCDownBlock2d` (the encoder mirror): `pixel_unshuffle → conv`, + the `pixel_unshuffle →
+/// `DCDownBlock2d` (the encoder mirror): a **stride-2 3×3 conv**, + the `pixel_unshuffle →
 /// channel-average` shortcut. `in_ch` = this stage's channels, `out_ch` = deeper stage's.
 struct DownBlock {
     conv: Conv2d,
@@ -480,16 +480,20 @@ struct DownBlock {
 impl DownBlock {
     fn load(w: &Weights, prefix: &str, out_ch: usize) -> candle_gen::Result<Self> {
         Ok(Self {
-            // Consumes the space→channel unshuffled `in_ch·4` map (padding 1 keeps the 3×3 same-size).
-            conv: conv(w, &format!("{prefix}.conv"), 1, 1, 1, true)?,
+            // SANA-1.0 sets `downsample_block_type = "Conv"`, so diffusers `DCDownBlock2d` runs a plain
+            // **stride-2** 3×3 conv (in_ch → out_ch, padding 1) — the on-disk weight is `[out_ch, in_ch,
+            // 3, 3]`, and the stride is what halves the spatial dims (no pixel_unshuffle on this path).
+            conv: conv(w, &format!("{prefix}.conv"), 2, 1, 1, true)?,
             out_ch,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let unshuffled = pixel_unshuffle(x, 2)?; // [B, in·4, H/2, W/2]
-        let down = self.conv.forward(&unshuffled)?;
-        let shortcut = channel_average(&unshuffled, self.out_ch)?;
+        // main path: stride-2 3×3 conv (in→out) halves H,W.
+        let down = self.conv.forward(x)?;
+        // shortcut: pixel_unshuffle(x) folds the 2×2 spatial into channels (`in·4` at H/2), then
+        // channel-average of contiguous groups reduces to `out_ch` — the diffusers residual.
+        let shortcut = channel_average(&pixel_unshuffle(x, 2)?, self.out_ch)?;
         down + shortcut
     }
 }
@@ -585,14 +589,16 @@ impl DcAeDecoder {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Encoder (round-trip only — the spike's secondary check)
+// Encoder
 // ---------------------------------------------------------------------------------------------------
 
-/// A compact **encoder** — the structural mirror of [`DcAeDecoder`] built from the same primitives
-/// (`ResBlock` / `EfficientVitBlock` / `DownBlock` ConvPixelUnshuffle). It exists only "as far as the
-/// spike needs" for a round-trip reconstruction check; the decoder is the parity deliverable. Reads
-/// `encoder.*` keys so the diffusers checkpoint layout would load, but the spike only smoke-tests its
-/// composition (shape/finite), since there is no encoder in the mlx reference to parity against.
+/// The DC-AE **encoder** — the structural counterpart of [`DcAeDecoder`] built from the same
+/// primitives (`ResBlock` / `EfficientVitBlock` / stride-2 [`DownBlock`]), reading `encoder.*` keys.
+/// The encoder is NOT symmetric with the decoder: it carries fewer blocks in the shallow stages
+/// (`encoder_layers_per_block` `[2,2,2,3,3,3]` vs the decoder's `[3,3,3,3,3,3]`) and downsamples with a
+/// stride-2 conv (`downsample_block_type = Conv`). The mlx-gen reference (sc-8486) ported only the
+/// decoder, so this was originally a shape-only smoke; sc-11803 sources a real diffusers encoder golden
+/// and holds it to numeric parity (`tests/encode_parity.rs`).
 pub struct DcAeEncoder {
     conv_in: Conv2d,
     stages: Vec<Stage>, // shallow(0)→deep(n-1); encode iterates shallow→deep
@@ -607,8 +613,9 @@ impl DcAeEncoder {
         let mut stages = Vec::with_capacity(n);
         for i in 0..n {
             let ch = cfg.block_out_channels[i] as usize;
+            let layers = cfg.encoder_layers_per_block[i];
             let mut blocks = Vec::new();
-            for j in 0..cfg.layers_per_block[i] {
+            for j in 0..layers {
                 let prefix = format!("encoder.down_blocks.{i}.{j}");
                 blocks.push(Block::load(w, &prefix, cfg, cfg.block_types[i], ch)?);
             }
@@ -616,7 +623,7 @@ impl DcAeEncoder {
             let downsample = if i + 1 < n {
                 Some(DownBlock::load(
                     w,
-                    &format!("encoder.down_blocks.{i}.{}", cfg.layers_per_block[i]),
+                    &format!("encoder.down_blocks.{i}.{layers}"),
                     cfg.block_out_channels[i + 1] as usize,
                 )?)
             } else {
@@ -1046,7 +1053,8 @@ mod tests {
             );
             for i in 0..n {
                 let ch = cfg.block_out_channels[i] as usize;
-                for j in 0..cfg.layers_per_block[i] {
+                let layers = cfg.encoder_layers_per_block[i];
+                for j in 0..layers {
                     e.block(
                         cfg,
                         &format!("encoder.down_blocks.{i}.{j}"),
@@ -1056,11 +1064,12 @@ mod tests {
                 }
                 if i + 1 < n {
                     let out_ch = cfg.block_out_channels[i + 1] as usize;
-                    // DownBlock conv consumes the space→channel unshuffled ch·4 map → out_ch.
+                    // DownBlock is a stride-2 3×3 conv on the raw `ch` map → `out_ch` (diffusers
+                    // `downsample_block_type = Conv`); the on-disk weight is `[out_ch, ch, 3, 3]`.
                     e.conv(
-                        &format!("encoder.down_blocks.{i}.{}.conv", cfg.layers_per_block[i]),
+                        &format!("encoder.down_blocks.{i}.{layers}.conv"),
                         out_ch,
-                        ch * 4,
+                        ch,
                         3,
                         true,
                     );
