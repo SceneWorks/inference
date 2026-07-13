@@ -1,0 +1,66 @@
+schema_version = 1
+status = "locally imported; remote publication pending"
+captured_at = "2026-07-12"
+filter_tool = "git-filter-repo 2.47.0"
+filter_operation = "--to-subdirectory-filter imports/<repository>"
+
+[[imports]]
+name = "core-llm"
+source_url = "https://github.com/SceneWorks/core-llm.git"
+source_commit = "54cbac806304e823470ce3ded08f78589acdbb62"
+source_tree = "e115397e83414217c3384698318522f6f4e8593a"
+filtered_commit = "d4ab32bb6996246f12f9d7e97fd958f7554b1bf8"
+filtered_subtree = "e115397e83414217c3384698318522f6f4e8593a"
+destination = "imports/core-llm"
+tree_match = true
+
+[[imports]]
+name = "mlx-llm"
+source_url = "https://github.com/SceneWorks/mlx-llm.git"
+source_commit = "af5d0e83f4afb921241b7e965076e22f23c107fb"
+source_tree = "4e19df11b186c864879ed871b55e55eeb147335b"
+filtered_commit = "a316e2adacc2649b458ed99d194e823d76caf4e6"
+filtered_subtree = "4e19df11b186c864879ed871b55e55eeb147335b"
+destination = "imports/mlx-llm"
+tree_match = true
+
+[[imports]]
+name = "candle-llm"
+source_url = "https://github.com/SceneWorks/candle-llm.git"
+source_commit = "482ba5e5e99770967dd0c912f7f87b31c6f08576"
+source_tree = "40ec531d2d6735930227a1e84175e8c894726add"
+filtered_commit = "4d594cab36841dd069586f3dd8b9e36543de73b8"
+filtered_subtree = "40ec531d2d6735930227a1e84175e8c894726add"
+destination = "imports/candle-llm"
+tree_match = true
+
+[[imports]]
+name = "mlx-gen"
+source_url = "https://github.com/SceneWorks/mlx-gen.git"
+source_commit = "b568fdbfd7cfe3cc6c93dc836c2bd92b348ab2b7"
+source_tree = "a8cf8de2713df6ff9a426ee40018fedfb64b3809"
+filtered_commit = "2745e1ee2c987f7474966740c9699414dbca9754"
+filtered_subtree = "a8cf8de2713df6ff9a426ee40018fedfb64b3809"
+destination = "imports/mlx-gen"
+tree_match = true
+
+[[imports]]
+name = "candle-gen"
+source_url = "https://github.com/SceneWorks/candle-gen.git"
+source_commit = "102436012b24072c9cfc58b1b88e1c95655872e5"
+source_tree = "b610bdf1565ceb810e7b938122473cca8b785b83"
+filtered_commit = "fe4341f38709b980d8ecd37625f1393e35096195"
+filtered_subtree = "b610bdf1565ceb810e7b938122473cca8b785b83"
+destination = "imports/candle-gen"
+tree_match = true
+
+[[preserved_history]]
+name = "candle-gen tracking main"
+source_commit = "b0fc60a3c39fa7c15a563e26453a2bde123c3413"
+source_tree = "26790038397b8c45c55a56dd612e52a97847c965"
+filtered_commit = "dc101876ca9dfd69b5df9aca73af85ccea707fbd"
+filtered_subtree = "26790038397b8c45c55a56dd612e52a97847c965"
+tag = "history/candle-gen-tracking-main"
+tree_match = true
+note = "Preserved but not merged into the compatibility baseline main tree."
+
