@@ -77,6 +77,13 @@ carrying `.sceneworks-model-revision`, and checks required files before any
 expensive test begins. Model bytes stay outside the Actions workspace and are
 reused by later self-hosted runs.
 
+The repository variables are the runner contract: `MLX_LLM_TEST_MODEL`,
+`MLX_LLM_QWEN3_MODEL`, and `ZIMAGE_SNAPSHOT` locate persistent macOS caches;
+`CANDLE_LLM_TEST_MODEL`, `CANDLE_LLM_QWEN3_MODEL`, and `Z_IMAGE_SNAPSHOT` locate
+the Windows caches. `WINDOWS_CARGO_HOME` and `WINDOWS_RUSTUP_HOME` identify the
+installed Windows toolchain independently of the account running the Actions
+service, so a service restart cannot silently drop Rust from `PATH`.
+
 ## Local validation
 
 The following pass from the repository root:

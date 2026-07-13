@@ -67,6 +67,8 @@ jobs:
     env:
       CANDLE_LLM_TEST_MODEL: ${{ vars.CANDLE_LLM_TEST_MODEL }}
       CANDLE_LLM_QWEN3_MODEL: ${{ vars.CANDLE_LLM_QWEN3_MODEL }}
+      CARGO_HOME: ${{ vars.WINDOWS_CARGO_HOME }}
+      RUSTUP_HOME: ${{ vars.WINDOWS_RUSTUP_HOME }}
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -75,8 +77,11 @@ jobs:
       - name: Expose installed Rust toolchain
         shell: cmd
         run: |
-          echo %USERPROFILE%\.cargo\bin>>"%GITHUB_PATH%"
-          set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+          if not defined CARGO_HOME exit /b 1
+          if not defined RUSTUP_HOME exit /b 1
+          if not exist "%CARGO_HOME%\bin\cargo.exe" exit /b 1
+          echo %CARGO_HOME%\bin>>"%GITHUB_PATH%"
+          set "PATH=%CARGO_HOME%\bin;%PATH%"
           rustc --version
           cargo --version
       - name: Materialize and verify immutable snapshots
@@ -99,6 +104,8 @@ jobs:
     runs-on: [self-hosted, windows, cuda, real-weights]
     env:
       Z_IMAGE_SNAPSHOT: ${{ vars.Z_IMAGE_SNAPSHOT }}
+      CARGO_HOME: ${{ vars.WINDOWS_CARGO_HOME }}
+      RUSTUP_HOME: ${{ vars.WINDOWS_RUSTUP_HOME }}
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -107,8 +114,11 @@ jobs:
       - name: Expose installed Rust toolchain
         shell: cmd
         run: |
-          echo %USERPROFILE%\.cargo\bin>>"%GITHUB_PATH%"
-          set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+          if not defined CARGO_HOME exit /b 1
+          if not defined RUSTUP_HOME exit /b 1
+          if not exist "%CARGO_HOME%\bin\cargo.exe" exit /b 1
+          echo %CARGO_HOME%\bin>>"%GITHUB_PATH%"
+          set "PATH=%CARGO_HOME%\bin;%PATH%"
           rustc --version
           cargo --version
       - name: Materialize and verify immutable snapshot
