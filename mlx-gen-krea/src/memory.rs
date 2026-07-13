@@ -197,13 +197,13 @@ const QWEN_DECODE_SPATIAL_PX: [i32; 7] = [768, 640, 512, 448, 384, 320, 256];
 /// **Budget-gated** tiling for the Krea control-lane Qwen-VAE decode (sc-11747) — the still-image
 /// analogue of Wan's `auto_tiling_budgeted_z16`. Estimates the decode peak from the render shape and
 /// returns the tiling the render-time decode should use:
-///   * `Ok(None)`    — the single-pass decode already fits `safe_gib` (small image / large-memory Mac);
+///   • `Ok(None)`    — the single-pass decode already fits `safe_gib` (small image / large-memory Mac);
 ///                     the caller runs [`QwenVae::decode`](mlx_gen_qwen_image::vae::QwenVae::decode), so
 ///                     single-pass is reached ONLY when safe and a machine with headroom pays ZERO
 ///                     tiling overhead (the sc-11750 guarantee).
-///   * `Ok(Some(c))` — tiling is required; `c` sizes the LARGEST tile whose estimated peak ≤ `safe_gib`
+///   • `Ok(Some(c))` — tiling is required; `c` sizes the LARGEST tile whose estimated peak ≤ `safe_gib`
 ///                     (largest ⇒ fewest tiles ⇒ least overlap recompute ⇒ fastest within budget).
-///   * `Err(..)`     — infeasible even tiled (the resident weights + output buffers alone, or every
+///   • `Err(..)`     — infeasible even tiled (the resident weights + output buffers alone, or every
 ///                     candidate tile, exceed `safe_gib`): a **catchable** error surfaced BEFORE the
 ///                     decode, so the caller reports it rather than the OS/GPU killing the process
 ///                     mid-decode. On the control lane the cheaper residency / branch-quant levers
