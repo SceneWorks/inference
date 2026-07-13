@@ -1,9 +1,14 @@
 [workspace]
 resolver = "2"
 members = []
-exclude = ["imports/*"]
+exclude = [
+    "imports/core-llm",
+    "imports/mlx-llm",
+    "imports/candle-llm",
+    "imports/mlx-gen",
+    "imports/candle-gen",
+]
 
 # Phase 1 deliberately excludes the byte-preserving source imports. Phase 2 moves
 # packages into their final ownership layout and converts internal Git dependencies
 # to workspace paths before adding them as members.
-
