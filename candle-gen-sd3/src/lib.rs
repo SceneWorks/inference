@@ -36,21 +36,29 @@ pub mod quant;
 pub mod transformer;
 pub mod vae;
 
+// SD3.5 img2img/`Reference` real-weight GPU validation (sc-11784) — env-driven, `#[ignore]`d
+// integration tests driving the REGISTERED Large/Medium (true-CFG) + Turbo (distilled) generators
+// through a `Conditioning::Reference` (strength ablation + the strength-1.0 source round-trip + prompt
+// divergence). The candle/CUDA parity of the mlx-gen-sd3 `denoise_img2img_cfg` lane (sc-10189).
+#[cfg(test)]
+mod img2img_validate;
+
 pub use adapters::{install_additive, merge_adapters, AdditiveReport, MergeReport};
 pub use config::Sd3Config;
 pub use memory::{min_memory_gb, MemoryProfile, ParamCounts, Precision};
 pub use pipeline::Variant;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
+use vae::VaeEncoder;
 
 /// Registry id for SD3.5 **Large** — matches the SceneWorks worker's `payload.model` and the macOS
 /// `mlx-gen-sd3` SD3.5-Large descriptor.
@@ -86,6 +94,11 @@ pub struct Sd3Generator {
     /// Cached components. `Mutex` because `Generator` is shared and `generate` takes `&self`; the lock
     /// is held only to read/populate the cache, never across the denoise.
     components: Mutex<Option<Components>>,
+    /// Lazily-built, cached f32 VAE **encoder** for the img2img / `Reference` path (sc-11784). Built on
+    /// the first request that carries a reference AND yields a structure-preserving denoise
+    /// (`start_step > 0`), so a txt2img-only workload never builds it. Cached here (not in `Components`)
+    /// because it loads in f32 for the deterministic mean-encode while `Components` is bf16.
+    vae_encoder: Mutex<Option<Arc<VaeEncoder>>>,
 }
 
 impl Sd3Generator {
@@ -104,6 +117,14 @@ impl Sd3Generator {
         Ok(candle_gen::cached(&self.components, || {
             pipe.load_components()
         })?)
+    }
+
+    /// Get the cached f32 VAE encoder for the img2img / `Reference` path (sc-11784), building it on a
+    /// miss. Only reached when a request carries a reference that yields a structure-preserving denoise
+    /// (`start_step > 0`), so a txt2img-only workload never builds it.
+    fn vae_encoder(&self, pipe: &Pipeline) -> gen_core::Result<Arc<VaeEncoder>> {
+        // The inner `?` bridges the candle-side `load_vae_encoder` error into `gen_core::Error`.
+        candle_gen::cached(&self.vae_encoder, || Ok(Arc::new(pipe.load_vae_encoder()?)))
     }
 }
 
@@ -151,14 +172,39 @@ impl Generator for Sd3Generator {
             &self.adapters,
         );
         let components = self.components(&pipe)?;
-        let images = pipe.render(req, &components, on_progress)?;
+
+        // img2img / `Reference` (sc-11784): resolve the single reference + its effective strength, and —
+        // when the strength yields a non-empty structure-preserving denoise (`start_step > 0`) — VAE-encode
+        // it to the clean init latent. `resolve_reference` errors on >1 reference; the capability floor in
+        // `validate` already rejects any non-`Reference` conditioning. The fork `start_step` is computed
+        // against the SAME step count `render` uses (`req.steps` or the variant default), so the strength
+        // knob maps to the intended σ node. Mirrors the mlx-gen-sd3 `denoise_img2img_cfg` lane (sc-10189).
+        let reference = pipeline::resolve_reference(req)?;
+        let steps = req
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or_else(|| self.variant.default_steps());
+        let start_step = match &reference {
+            Some((_, strength)) => pipeline::init_time_step(steps, *strength),
+            None => 0,
+        };
+        let clean = if start_step > 0 {
+            let (image, _) = reference.expect("start_step > 0 implies a reference");
+            let encoder = self.vae_encoder(&pipe)?;
+            Some(pipe.encode_reference(&encoder, image, req.width, req.height)?)
+        } else {
+            None
+        };
+
+        let images = pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?;
         Ok(GenerationOutput::Images(images))
     }
 }
 
 /// SD3.5 **Large**'s identity + the wired surface: txt2img with CFG + negative prompt (SD3.5 Large is
-/// NOT guidance-distilled — it uses classifier-free guidance, unlike Turbo), Q4/Q8 quant (sc-7879), and
-/// LoRA/LoKr adapter merge (sc-7881). Conditioning (img2img / control) stays off until its own story.
+/// NOT guidance-distilled — it uses classifier-free guidance, unlike Turbo), img2img reference-guided
+/// latent-init (sc-11784), Q4/Q8 quant (sc-7879), and LoRA/LoKr adapter merge (sc-7881). Control /
+/// IP-adapter overlays stay off until their own story.
 pub fn descriptor() -> ModelDescriptor {
     descriptor_for(Variant::Large)
 }
@@ -198,9 +244,11 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_negative_prompt: cfg,
             supports_guidance: cfg,
             supports_true_cfg: false,
-            // txt2img only for now (img2img / control land later); empty list ⇒ shared
-            // `validate_request` rejects any conditioning.
-            conditioning: vec![],
+            // img2img reference-guided latent-init (sc-11784): a single `Conditioning::Reference` seeds
+            // the denoise from the VAE-encoded reference (`render` + `encode_reference`) — real CFG
+            // (Large/Medium) or the distilled loop (Turbo) over the reduced `start_step..` σ tail. NOT
+            // `MultiReference` (single init image); control / IP-adapter overlays stay refused at load.
+            conditioning: vec![ConditioningKind::Reference],
             // LoRA/LoKr merged into the MMDiT at load (sc-7881) — kohya `lora_sd3` (fused QKV) +
             // diffusers-named adapters, folded into the dense weights then quantized.
             supports_lora: true,
@@ -284,6 +332,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         quant,
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        vae_encoder: Mutex::new(None),
     }))
 }
 
@@ -320,7 +369,11 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.mac_only);
-        assert!(d.capabilities.conditioning.is_empty());
+        // sc-11784: img2img reference-guided latent-init is now advertised (single-ref, NOT MultiReference).
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         // sc-7881: LoRA/LoKr are now wired (merged into the MMDiT at load).
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
@@ -335,7 +388,8 @@ mod tests {
         assert_eq!(d.capabilities.min_size, 256);
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(d.capabilities.samplers, candle_gen::curated_sampler_names());
-        assert!(!descriptor()
+        // sc-11784: the img2img `Reference` conditioning is now accepted.
+        assert!(descriptor()
             .capabilities
             .accepts(ConditioningKind::Reference));
     }
@@ -351,6 +405,17 @@ mod tests {
         };
         assert!(g.validate(&ok).is_ok());
 
+        // sc-11784: an img2img `Reference` request now validates (the capability floor accepts it).
+        let img2img = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.6),
+            }],
+            ..Default::default()
+        };
+        assert!(g.validate(&img2img).is_ok());
+
         for bad in [
             GenerationRequest::default(), // empty prompt
             GenerationRequest {
@@ -361,14 +426,6 @@ mod tests {
             GenerationRequest {
                 prompt: "x".into(),
                 steps: Some(0),
-                ..Default::default()
-            },
-            GenerationRequest {
-                prompt: "x".into(),
-                conditioning: vec![Conditioning::Reference {
-                    image: Image::default(),
-                    strength: None,
-                }],
                 ..Default::default()
             },
         ] {
@@ -447,12 +504,13 @@ mod tests {
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.mac_only);
 
-        // A txt2img request validates; img2img conditioning is still refused.
+        // A txt2img request validates; sc-11784 also accepts an img2img `Reference` (single init image).
         let ok = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
             ..Default::default()
         };
         assert!(g.validate(&ok).is_ok());
+        assert!(d.capabilities.accepts(ConditioningKind::Reference));
     }
 
     #[test]

@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress, Quant};
+use candle_gen::gen_core::{
+    self, AdapterSpec, Conditioning, GenerationRequest, Image, Progress, Quant,
+};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, Result};
 use rand::{rngs::StdRng, SeedableRng};
@@ -38,7 +40,10 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::conditioning::{aggregate, Sd3Conditioning, Sd3TextEncoders};
 use crate::config::Sd3Config;
 use crate::transformer::Sd3Transformer;
-use crate::vae::{load_vae, AutoEncoderKL, LATENT_CHANNELS, SPATIAL_SCALE};
+use crate::vae::{
+    encode_mean, load_vae, load_vae_encoder, preprocess_reference, AutoEncoderKL, VaeEncoder,
+    ENC_DTYPE, LATENT_CHANNELS, SPATIAL_SCALE,
+};
 
 /// The two wired SD3.5 variants. They share the MMDiT/VAE architecture + encoders; they differ in the
 /// default schedule (CFG-on 28-step vs distilled 4-step), the CFG default, and whether the negative
@@ -130,6 +135,45 @@ pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
         .collect();
     out.push(0.0);
     out
+}
+
+/// The img2img **fork step** (sc-11784) — how many σ-schedule nodes to SKIP before the denoise starts,
+/// mirroring `mlx-gen`'s shared `img2img::init_time_step` (the same convention the Krea / Z-Image
+/// candle lanes use): for a reference with `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`;
+/// otherwise `0` (pure txt2img, no reference blend). **Higher strength → later start → fewer denoise
+/// steps → output stays CLOSER to the reference** — the INVERSE of the SDXL knob, matched here so the
+/// strength knob behaves identically on the Mac (MLX) and Windows (candle) SD3.5 lanes. `floor` because
+/// Python `int(steps · strength)` truncates toward zero for `s ≥ 0`. Pure function so the
+/// cross-backend-parity law is unit-testable without a GPU.
+pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+    match strength {
+        Some(s) if s > 0.0 => {
+            let s = s.clamp(0.0, 1.0);
+            ((num_steps as f32 * s) as usize).max(1)
+        }
+        _ => 0,
+    }
+}
+
+/// Resolve the single img2img init image + its effective strength from the request's conditioning
+/// (sc-11784), mirroring `mlx-gen-sd3`'s reference resolution. A per-reference `strength` overrides
+/// `req.strength`. SD3.5 img2img conditions on exactly one init image, so more than one
+/// [`Conditioning::Reference`] is an error (multi-image would be `MultiReference`, unadvertised here);
+/// non-`Reference` conditioning kinds are already rejected by the capability floor in `validate`.
+pub(crate) fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
+    let mut reference = None;
+    for c in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = c {
+            if reference.is_some() {
+                return Err(CandleError::Msg(
+                    "sd3: multiple reference images are not supported (single img2img init only)"
+                        .into(),
+                ));
+            }
+            reference = Some((image, strength.or(req.strength)));
+        }
+    }
+    Ok(reference)
 }
 
 /// A txt2img pipeline handle: the snapshot `root` + compute device/dtype (bf16) + the variant. Loading
@@ -308,6 +352,32 @@ impl Pipeline {
         candle_gen::mmap_var_builder(&files, self.dtype, device)
     }
 
+    /// Build the raw f32 VAE **encoder** for the img2img / `Reference` path (sc-11784) from the `vae/`
+    /// component. The encoder loads in [`ENC_DTYPE`] (f32) — not the pipeline's bf16 — because the
+    /// deterministic mean-encode ([`encode_reference`](Self::encode_reference)) runs in full precision,
+    /// then casts the latent to bf16. Only built on the first img2img request (cached by the generator),
+    /// so a txt2img-only workload never pays for it.
+    pub(crate) fn load_vae_encoder(&self) -> Result<VaeEncoder> {
+        let files = self.component_files("vae")?;
+        let vb = candle_gen::mmap_var_builder(&files, ENC_DTYPE, &self.device)?;
+        Ok(load_vae_encoder(vb)?)
+    }
+
+    /// VAE-encode `source` (LANCZOS-fit to the render size, normalized to `[-1, 1]` NCHW) to the
+    /// deterministic clean init latent `(1, 16, H/8, W/8)` at the compute dtype (bf16) — the
+    /// distribution **mean** mapped as `(mean − shift) · scale` (sc-11784). `encoder` is the f32 encoder
+    /// from [`load_vae_encoder`](Self::load_vae_encoder).
+    pub(crate) fn encode_reference(
+        &self,
+        encoder: &VaeEncoder,
+        source: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Tensor> {
+        let img = preprocess_reference(source, width, height, &self.device)?; // f32 (1,3,H,W) [-1,1]
+        encode_mean(encoder, &img, self.dtype)
+    }
+
     /// The `transformer/` component's parsed [`candle_gen::quant::PackedConfig`] when it is a
     /// **pre-quantized MLX-packed tier** — its `config.json` carries a `quantization` block, which the
     /// `sd3.5-*-mlx` convert job writes for the packed DiT. On a packed tier the loader builds each Linear
@@ -353,10 +423,20 @@ impl Pipeline {
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
     /// `req.cancel`. One `gen_core::Image` per `req.count` (each at seed `base_seed + index`).
+    ///
+    /// **img2img / `Reference` (sc-11784).** When `clean` is `Some` (the caller VAE-encoded a reference
+    /// image via [`encode_reference`](Self::encode_reference)) and `start_step > 0`, each image blends the
+    /// pre-encoded clean latent with the seeded noise at `σ_start` (the flow-match interpolation
+    /// `x_t = (1 − σ)·clean + σ·noise`) and denoises the **reduced** `start_step..` tail of the σ schedule
+    /// — real CFG (Large/Medium) or the distilled single-eval (Turbo) applies to the img2img tail exactly
+    /// as to txt2img. `start_step == 0` (`clean` is `None`) is pure txt2img: `x_t = noise`, full schedule
+    /// — byte-identical to the pre-sc-11784 path.
     pub(crate) fn render(
         &self,
         req: &GenerationRequest,
         components: &Components,
+        clean: Option<&Tensor>,
+        start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let steps = req
@@ -391,6 +471,8 @@ impl Pipeline {
                 self.dtype,
                 req.sampler.as_deref(),
                 req.scheduler.as_deref(),
+                clean,
+                start_step,
                 &req.cancel,
                 on_progress,
             )
@@ -417,6 +499,8 @@ pub(crate) fn render_core(
     dtype: DType,
     sampler: Option<&str>,
     scheduler: Option<&str>,
+    clean: Option<&Tensor>,
+    start_step: usize,
     cancel: &gen_core::CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Image> {
@@ -431,14 +515,31 @@ pub(crate) fn render_core(
     let n = LATENT_CHANNELS * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(seed);
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
-    let latents = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
+    let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
         .to_device(&device)?
         .to_dtype(dtype)?;
+
+    // img2img / `Reference` (sc-11784): blend the pre-encoded clean latent with the seeded noise at
+    // `σ_start = sigmas[start]` and denoise the reduced `start..` schedule tail. `start` is clamped to
+    // the schedule because a curated scheduler may return a length ≠ `steps + 1`. For txt2img (`clean`
+    // is `None`, `start_step == 0`) this is `x_t = noise` over the full schedule — byte-identical to
+    // the pre-sc-11784 path. The flow-match interpolation matches diffusers' `scale_noise`
+    // (`x_t = (1 − σ)·clean + σ·noise`). Max strength (start == steps) ⇒ σ_start = 0 ⇒ x_t = clean and
+    // a single-node (0-step) tail: the source's VAE round-trip.
+    let start = start_step.min(sigmas.len().saturating_sub(1));
+    let latents = match clean {
+        Some(clean) => {
+            let sigma_start = sigmas[start] as f64;
+            (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
+        }
+        None => noise,
+    };
+    let run_sigmas = &sigmas[start..];
 
     let latents = candle_gen::run_flow_sampler(
         sampler,
         TimestepConvention::Sigma,
-        &sigmas,
+        run_sigmas,
         latents,
         seed,
         cancel,
@@ -607,6 +708,87 @@ mod tests {
         assert!(s[4].abs() < 1e-9);
     }
 
+    /// The img2img fork start-step law (sc-11784, the fork's `init_time_step` over `Option<f32>`):
+    /// `max(1, floor(steps·strength))` for a strength in `(0, 1]`, else `0` (pure txt2img). Higher
+    /// strength → later start → fewer denoise steps (structure preservation). Pure, no GPU — the
+    /// cross-backend-parity contract with `mlx-gen`'s shared `img2img::init_time_step`.
+    #[test]
+    fn init_time_step_is_the_fork_convention() {
+        // None / non-positive strength ⇒ pure txt2img (start 0, reference ignored).
+        assert_eq!(init_time_step(28, None), 0);
+        assert_eq!(init_time_step(28, Some(0.0)), 0);
+        assert_eq!(init_time_step(28, Some(-1.0)), 0);
+        // floor(steps·strength), min 1.
+        assert_eq!(init_time_step(28, Some(0.5)), 14); // floor(14.0)
+        assert_eq!(init_time_step(28, Some(0.01)), 1); // floor(0.28)=0 → max(1,0)=1
+        assert_eq!(init_time_step(4, Some(0.6)), 2); // floor(2.4) — the Turbo few-step case
+        assert_eq!(init_time_step(28, Some(1.0)), 28); // == steps ⇒ empty loop, source round-trip
+        assert_eq!(init_time_step(28, Some(2.0)), 28); // clamped above 1
+                                                       // Monotone: higher strength ⇒ later (or equal) start.
+        let starts: Vec<usize> = [0.1, 0.3, 0.5, 0.7, 0.9]
+            .iter()
+            .map(|&s| init_time_step(28, Some(s)))
+            .collect();
+        assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+    }
+
+    /// `resolve_reference` pulls the single img2img init image + its effective strength from the
+    /// request's conditioning (sc-11784): the per-reference strength wins over `req.strength`, a bare
+    /// `Reference` falls back to `req.strength`, no `Reference` is `None`, and >1 `Reference` errors.
+    /// Pure, no GPU.
+    #[test]
+    fn resolve_reference_picks_single_ref_and_strength() {
+        use candle_gen::gen_core::{Conditioning, Image};
+        let img = || Image {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 8 * 8 * 3],
+        };
+
+        // No conditioning ⇒ txt2img.
+        assert!(resolve_reference(&GenerationRequest::default())
+            .unwrap()
+            .is_none());
+
+        // Per-reference strength wins over req.strength.
+        let per_ref = GenerationRequest {
+            strength: Some(0.2),
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: Some(0.75),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_reference(&per_ref).unwrap().unwrap().1, Some(0.75));
+
+        // A bare Reference falls back to req.strength.
+        let fallback = GenerationRequest {
+            strength: Some(0.3),
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_reference(&fallback).unwrap().unwrap().1, Some(0.3));
+
+        // More than one Reference is an error (single img2img init only).
+        let two = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: img(),
+                    strength: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(resolve_reference(&two).is_err());
+    }
+
     // ---- structural end-to-end tests (random weights) ---------------------------------------------
     //
     // These exercise the FULL render core — sampler + CFG/Turbo dispatch + VAE decode — on CPU with a
@@ -733,6 +915,8 @@ mod tests {
             DType::F32,
             None,
             None,
+            None, // clean: txt2img (no reference)
+            0,    // start_step: full schedule
             &cancel,
             &mut progress,
         )
@@ -794,6 +978,8 @@ mod tests {
                 DType::F32,
                 None,
                 None,
+                None, // clean: txt2img (no reference)
+                0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
             )
@@ -840,6 +1026,8 @@ mod tests {
                 DType::F32,
                 None,
                 None,
+                None, // clean: txt2img (no reference)
+                0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
             )
@@ -865,6 +1053,75 @@ mod tests {
             "cfg_scale 1.0 blend must equal cond-only (skipping the uncond branch is a no-op); \
              max per-pixel abs diff was {max_abs_diff} (>1 u8 => not just FP non-associativity)"
         );
+    }
+
+    /// **img2img blend invariants (sc-11784), CPU structural.** With a tiny random-weight MMDiT + the
+    /// real 16-ch VAE, drive the img2img `clean`/`start_step` path and pin the three flow-match
+    /// interpolation edges:
+    ///  - `start_step == 0` with a `clean` latent is **byte-identical** to txt2img (`clean = None`),
+    ///    because `σ_start = sigmas[0] = 1.0` ⇒ `x_t = 0·clean + 1·noise = noise` (the reference is a
+    ///    no-op at the max-σ prior — the guard that a strength-0 reference never perturbs txt2img);
+    ///  - `start_step == steps` (max strength) is the **source VAE round-trip**: `σ_start = 0` ⇒
+    ///    `x_t = clean`, an empty (0-step) tail ⇒ the decode is exactly `vae.decode(clean)`;
+    ///  - an interior `start_step` decodes a finite, right-shaped image (the path is wired).
+    #[test]
+    fn img2img_blend_edges_on_cpu() {
+        let device = Device::Cpu;
+        let cfg = tiny_cfg();
+        let (transformer, vae, cond, _uncond) = harness(&cfg, &device);
+        let cancel = CancelFlag::default();
+        let steps = 4usize;
+        let lat = 4usize;
+        // A deterministic "clean" init latent (as if VAE-encoded from a reference).
+        let clean = Tensor::randn(0f32, 1f32, (1, LATENT_CHANNELS, lat, lat), &device).unwrap();
+        let render = |clean: Option<&Tensor>, start: usize| {
+            render_core(
+                &transformer,
+                &vae,
+                &cond,
+                None,
+                1.0,
+                steps,
+                3.0,
+                (lat, lat),
+                7,
+                device.clone(),
+                DType::F32,
+                None,
+                None,
+                clean,
+                start,
+                &cancel,
+                &mut |_p: Progress| {},
+            )
+            .unwrap()
+        };
+
+        // Edge 1: clean at start 0 (σ_start = 1.0) is a no-op ⇒ byte-identical to txt2img.
+        let txt2img = render(None, 0);
+        let img2img_start0 = render(Some(&clean), 0);
+        assert_eq!(
+            txt2img.pixels, img2img_start0.pixels,
+            "start_step 0 must ignore the reference (σ_start = 1.0 ⇒ x_t = noise)"
+        );
+
+        // Edge 2: max strength (start == steps) ⇒ the source VAE round-trip (empty denoise loop).
+        let roundtrip = render(Some(&clean), steps);
+        let direct = decode_image(&vae, &clean).unwrap();
+        assert_eq!(
+            roundtrip.pixels, direct.pixels,
+            "start_step == steps must decode exactly vae.decode(clean) (empty tail, x_t = clean)"
+        );
+
+        // Edge 3: an interior strength decodes a finite, right-shaped image (the blend path is wired)
+        // and differs from both the txt2img and the round-trip (it is a genuine partial denoise).
+        let mid = render(Some(&clean), 2);
+        assert_eq!(
+            mid.pixels.len(),
+            (lat as u32 * SPATIAL_SCALE).pow(2) as usize * 3
+        );
+        assert_ne!(mid.pixels, txt2img.pixels);
+        assert_ne!(mid.pixels, roundtrip.pixels);
     }
 
     /// **CUDA random-weight smoke (sc-7877).** Asserts the tiny MMDiT + VAE render core compiles, runs
@@ -994,6 +1251,8 @@ mod tests {
                 DType::F32,
                 None,
                 None,
+                None, // clean: txt2img (no reference)
+                0,    // start_step: full schedule
                 &cancel,
                 &mut |_p: Progress| {},
             )
