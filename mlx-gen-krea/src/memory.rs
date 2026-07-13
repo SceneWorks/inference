@@ -14,12 +14,23 @@
 //!
 //! The weight terms are **first-principles** param counts (validated against the published Krea shapes:
 //! ~11.1 B base @ 28×6144, ~3.0 B branch @ N=7 → ~6.1 GB bf16, matching the candle #480 profile's
-//! ~6.6 GB). The activation/decode-spike coefficients are seeded from that candle #480 CUDA profile
-//! (~11 GB denoise activations, ~30 GB decode peak, both @ q4/1024²) and rounded **up** so the estimate
-//! over-predicts rather than under-shoots (an under-shoot is an OOM; an over-shoot only tiles/adapts
-//! slightly sooner — the Wan/PiD guard convention). The **MLX on-device recalibration of these
-//! coefficients is the story's true e2e gate** (a real 32 GB-Mac Krea-control render); until then they
-//! are conservative CUDA-seeded priors, not measured MLX constants.
+//! ~6.6 GB), padded by a measured [`RESIDENT_OVERHEAD_GIB`] for the terms the block count omits (the
+//! VAE, the DiT's non-block params, and the MLX Metal-allocator resident floor).
+//!
+//! **Measured-MLX calibration (sc-11847).** The activation + decode-spike coefficients and the resident
+//! overhead were RE-FIT on real weights on a 128 GB M-series Metal Mac — the story's e2e gate — via
+//! `tests/control_memory_calibration_real_weights.rs`, which measures the isolated denoise and decode
+//! `mlx_rs::memory::get_peak_memory` high-water of a real `krea_2_turbo_control` render (base tier ∈
+//! {bf16, q4}, resolution ∈ {512², 768², 1024²}, pose branch bf16, `Sequential` residency so the peaks
+//! are ex-text). The candle #480 CUDA priors it replaced were **wrong for MLX in both directions**: the
+//! coefficients ~8–10× (denoise) / ~4× (decode) too high, yet the estimate still UNDER-shot the real
+//! peak at 512² because MLX's materialized-weight + framework resident floor (~33.4 GB bf16 / ~15.9 GB
+//! q4) is ~4 GB above the bare param count — the CUDA activation coefficient had merely masked that gap
+//! at 1024². The measured slopes are ~44 (bf16) / ~61 (q4) B/(token·hidden) for denoise and ~5211 B/px
+//! for decode (tier-independent — the VAE decode is the same at every base tier). The constants below
+//! keep the **over-predict / never-under-shoot** convention (an under-shoot is an OOM; an over-shoot
+//! only tiles/adapts slightly sooner — the Wan sc-4998 / PiD sc-10087 guard): each is rounded up so the
+//! estimate stays ≥ the measured peak (within ≤ ~1.16× at every tested point).
 
 use mlx_gen::gen_core::mempolicy::{plan_memory_adaptation, LaneLevers, MemoryPlan, StagePeaks};
 use mlx_gen::Quant;
@@ -71,10 +82,16 @@ fn branch_bytes(cfg: &Krea2Config, n: usize, tier: Option<Quant>) -> f64 {
     params * bytes_per_param(tier)
 }
 
-/// Resident weight bytes of the Qwen-Image VAE (`AutoencoderKLQwenImage`, f32, ~few-hundred-MB conv
-/// stack). A fixed conservative estimate — the VAE stays dense (the published `vae/` is f32) and is tiny
-/// beside the DiT, so a coarse constant is sufficient. Rounded up.
-const VAE_RESIDENT_GIB: f64 = 0.4;
+/// Fixed resident **overhead** (GiB) the first-principles block count does NOT capture, added to both
+/// stage peaks: the Qwen-Image VAE (`AutoencoderKLQwenImage`, f32), the DiT's non-block params
+/// (`img_in`/`time_embed`/text-fusion aggregator/`final_layer`/modulation), AND the MLX Metal-allocator
+/// resident floor (materialized-weight buffers + the retained working set). **Measured-MLX (sc-11847),
+/// not the old ~0.4 GiB VAE-only guess:** the real ex-text resident floor is ~33.4 GiB (bf16) / ~15.9
+/// GiB (q4), ~4 GiB above `base_dit + branch` alone; `5.5` covers that residual at every tested point
+/// (the bf16 decode-512² point binds it) with a small over-predict margin. Tier-independent to first
+/// order (the VAE stays f32; the uncounted DiT params + allocator floor barely move with the base tier —
+/// bf16 needs ~4.5, q4 ~4.1), so a single constant is both simpler and conservative.
+const RESIDENT_OVERHEAD_GIB: f64 = 5.5;
 
 /// Text/vision-encoder (Qwen3-VL-4B, ~4 B params) resident bytes at `tier` — the phase-A footprint the
 /// residency lever frees. Packs with the base tier (sc-11727 `load_krea_text`).
@@ -83,17 +100,20 @@ fn text_resident_gib(tier: Option<Quant>) -> f64 {
     TEXT_PARAMS * bytes_per_param(tier) / GIB
 }
 
-/// Per-step denoise **activation** bytes per (token · hidden) element — a conservative fold of the
-/// concatenated-stream activations, the attention working set, and the N-block branch forward. Seeded
-/// from the candle #480 ~11 GB @ 1024² anchor (tokens = (1024/16)² = 4096, hidden = 6144): 11·1024³ /
-/// (4096·6144) ≈ 470 B/elem. **MLX recalibration pending** (the e2e gate).
-const DENOISE_ACT_BYTES_PER_TOKEN_HIDDEN: f64 = 470.0;
+/// Per-step denoise **activation** bytes per (token · hidden) element — the concatenated-stream
+/// activations + the (fused-SDPA) attention working set + the N-block branch forward, on top of the
+/// resident weights. **Measured-MLX (sc-11847):** the real slope is ~44 (bf16) / ~61 (q4)
+/// B/(token·hidden) — MLX's fused SDPA + the CFG-free single forward keep the denoise peak
+/// resident-weight-dominated, far below the candle #480 CUDA prior (470, from ~11 GB @ 1024²). `80`
+/// rounds up over the larger (q4) measured slope with headroom for higher resolutions.
+const DENOISE_ACT_BYTES_PER_TOKEN_HIDDEN: f64 = 80.0;
 
 /// Decode **spike** bytes per output pixel through the Qwen-VAE decoder conv stack — the transient that
-/// tiling (sc-11747) shrinks. Seeded from the candle #480 ~30 GB @ 1024² decode peak minus the ~8 GB
-/// resident heavy weights ⇒ ~22 GB spike: 22·1024³ / 1024² ≈ 22500 B/px. Rounded up; **MLX
-/// recalibration pending**.
-const DECODE_SPIKE_BYTES_PER_PIXEL: f64 = 22_500.0;
+/// tiling (sc-11747) shrinks. **Measured-MLX (sc-11847):** the real slope is ~5211 B/px, tier-independent
+/// (the VAE decode is the same at every base tier), far below the candle #480 CUDA prior (22500, from
+/// ~22 GB @ 1024²). `6500` rounds up over the measured slope; the fixed VAE-materialization part of the
+/// decode peak lives in [`RESIDENT_OVERHEAD_GIB`], so this term is the pure per-pixel conv growth.
+const DECODE_SPIKE_BYTES_PER_PIXEL: f64 = 6_500.0;
 
 /// The assembled full-resolution RGB output buffers held across a tiled decode (`output [1,3,H,W]` +
 /// blend `weights`), f32 — the term tiling can NOT shrink. ~16 B/px (12 for the 3-channel output + a
@@ -102,8 +122,11 @@ const DECODE_ACCUM_BYTES_PER_PIXEL: f64 = 16.0;
 
 /// The working set of ONE minimal decode tile — the least the tiled decode can spike to, on top of the
 /// resident weights + output buffers. Resolution-independent (a fixed tile), so it is the decode floor's
-/// only non-buffer term. Seeded from a ~256²-tile forward at [`DECODE_SPIKE_BYTES_PER_PIXEL`]
-/// (22500·256² ≈ 1.4 GiB); rounded up.
+/// only non-buffer term. At the measured [`DECODE_SPIKE_BYTES_PER_PIXEL`] a ~256²-tile conv forward is
+/// only ~0.4 GiB, so `1.5` is deliberately conservative; the tiled floor is NOT exercised until the
+/// decode-tiling lever lands (sc-11747), so a precise re-fit of this floor is deferred to that story
+/// (which drives a real tiled decode). Over-predicting the floor is the safe direction (it only makes
+/// the policy prefer resolution reduction slightly sooner, never OOM).
 const DECODE_MIN_TILE_GIB: f64 = 1.5;
 
 /// Denoise-forward token count for a `width × height` render: the latent is `[16, H/8, W/8]`,
@@ -125,7 +148,7 @@ pub fn control_denoise_peak_ex_text_gib(
     let heavy = base_dit_bytes(cfg, base_tier) + branch_bytes(cfg, branch_blocks, branch_tier);
     let act =
         DENOISE_ACT_BYTES_PER_TOKEN_HIDDEN * denoise_tokens(width, height) * cfg.hidden_size as f64;
-    (heavy / GIB) + VAE_RESIDENT_GIB + act / GIB
+    (heavy / GIB) + RESIDENT_OVERHEAD_GIB + act / GIB
 }
 
 /// The single-pass **Qwen-VAE decode** stage peak (GiB, ex-text): resident heavy weights + the
@@ -140,7 +163,7 @@ pub fn qwen_vae_decode_peak_ex_text_gib(
 ) -> f64 {
     let heavy = base_dit_bytes(cfg, base_tier) + branch_bytes(cfg, branch_blocks, branch_tier);
     let px = width as f64 * height as f64;
-    (heavy / GIB) + VAE_RESIDENT_GIB + (DECODE_SPIKE_BYTES_PER_PIXEL * px) / GIB
+    (heavy / GIB) + RESIDENT_OVERHEAD_GIB + (DECODE_SPIKE_BYTES_PER_PIXEL * px) / GIB
 }
 
 /// The **tiled** Qwen-VAE decode floor (GiB, ex-text): resident heavy weights + the un-shrinkable
@@ -157,7 +180,7 @@ pub fn qwen_vae_decode_tiled_floor_ex_text_gib(
     let heavy = base_dit_bytes(cfg, base_tier) + branch_bytes(cfg, branch_blocks, branch_tier);
     let px = width as f64 * height as f64;
     (heavy / GIB)
-        + VAE_RESIDENT_GIB
+        + RESIDENT_OVERHEAD_GIB
         + (DECODE_ACCUM_BYTES_PER_PIXEL * px) / GIB
         + DECODE_MIN_TILE_GIB
 }
@@ -300,12 +323,15 @@ mod tests {
         let dc_512 = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 512, 512);
         let dc_1024 = qwen_vae_decode_peak_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
         assert!(dc_1024 > dc_512);
-        // The single-pass decode peak dwarfs its tiled floor (tiling's whole point).
+        // The single-pass decode peak exceeds its tiled floor (tiling's whole point). Note: on measured
+        // MLX (sc-11847) the decode spike is only ~6 GiB @ 1024² — far smaller than the candle #480 CUDA
+        // ~22 GiB — so tiling shaves ~5 GiB (~20%) off the peak, NOT the ~50% the CUDA prior implied. The
+        // resident weights + overhead dominate the decode peak on Metal, so tiling is a modest lever here.
         let floor =
             qwen_vae_decode_tiled_floor_ex_text_gib(&cfg, 7, Some(Quant::Q4), None, 1024, 1024);
         assert!(
-            floor < dc_1024 * 0.5,
-            "floor {floor:.1} vs single {dc_1024:.1}"
+            floor < dc_1024 && (dc_1024 - floor) > 3.0,
+            "tiled floor {floor:.1} must be a real reduction below single-pass {dc_1024:.1}"
         );
     }
 
@@ -323,7 +349,8 @@ mod tests {
     }
 
     /// A 32 GB Mac (~24 GiB usable) with a q4 base: levers engage in cost order and the render fits.
-    /// The decode spike (~30 GB single-pass) is the first thing over budget → tiling must engage.
+    /// The single-pass decode peak (~24.5 GiB ex-text on measured MLX, sc-11847) is over budget once the
+    /// text phase is dropped → residency then decode tiling must engage.
     #[test]
     fn constrained_mac_engages_levers_in_cost_order_and_fits() {
         let plan = plan_control_adaptation(24.0, inputs(Some(Quant::Q4)));
@@ -342,7 +369,7 @@ mod tests {
             plan.engaged, sorted,
             "levers must be cost-ordered: {plan:?}"
         );
-        // The decode spike is the dominant peak → decode tiling is engaged.
+        // The single-pass decode peak is the binding peak over budget → decode tiling is engaged.
         assert!(
             plan.tile_decode,
             "decode tiling must engage on a 32GB Mac: {plan:?}"
