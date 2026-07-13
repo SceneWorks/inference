@@ -83,7 +83,7 @@ pub use text_encoder::{KreaTeConfig, KreaTextEncoder};
 pub use tokenizer::KreaTokenizer;
 // The composable trainable DiT, exposed for the sc-8460 control-branch spike binaries (the branch
 // injects into its block stack; its forward is the spike's inference surface).
-pub use train_dit::KreaTrainDit;
+pub use train_dit::{KreaTrainDit, KREA_ATTN_CHUNK_BUDGET};
 pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae, QwenVaeEncoder};
 

@@ -85,15 +85,39 @@ pub(crate) fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
         .reshape((b, s, hkv * groups, hd))
 }
 
+/// The attention-scores element budget the Krea control **activation-chunking rung** (sc-11745) uses
+/// once the fit-gate engages it ([`Krea2ControlPaths::chunk_attention`](crate::control_provider)). At
+/// `128 Mi` elements each per-block joint `[ctx; img]` scores (and probs) block is ≤ ~256 MiB in bf16 —
+/// ~8× under the i32 guard ([`candle_gen::ATTN_SCORES_BUDGET`], `1e9`) — so a 1024² render (per-block
+/// scores ~8.9e8 elems: 48 heads × ~4.3k joint tokens²) splits into ~7 query-row chunks, trading a
+/// small speed cost for the bounded activation peak. **Only** applied when the fit-gate flips the knob;
+/// on a card with headroom the forward runs unchunked at the i32-guard budget (full speed). Set via
+/// [`KreaTrainDit::set_attention_budget`] / [`crate::control::ControlBranch::set_attention_budget`] and
+/// consumed by [`sdpa_diff_budgeted`].
+pub const KREA_ATTN_CHUNK_BUDGET: usize = 128 * 1024 * 1024;
+
 /// Bidirectional, unmasked scaled-dot-product attention with a **composable** softmax (the inference
-/// `sdpa` uses the no-backward fused `softmax_last_dim`). `q`/`k`/`v`: `[b, h, s, hd]`.
-pub(crate) fn sdpa_diff(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    let q = q.contiguous()?;
-    let k = k.contiguous()?;
-    let v = v.contiguous()?;
-    let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
-    let probs = softmax(&scores, D::Minus1)?;
-    probs.matmul(&v)
+/// `sdpa` uses the no-backward fused `softmax_last_dim`), with **query-row chunking bounded by
+/// `budget`** — the Krea control activation-peak lever (sc-11745). Delegates to the shared
+/// i32-overflow-safe [`candle_gen::sdpa_budgeted_bhsd`] with the grad-carrying composable
+/// `softmax(_, D::Minus1)`, so:
+/// - below `budget` it is a **single un-chunked pass** — the plain `q·kᵀ·scale → softmax → ·v` (the
+///   ≤1024² default, [`candle_gen::ATTN_SCORES_BUDGET`] — that guard only ever engages past the i32
+///   element limit);
+/// - above `budget` it chunks over query rows (each row's softmax is over all keys and independent of
+///   the others, so the result is numerically identical up to the associativity-free `cat`).
+///
+/// The Krea control fit-ladder (sc-11754) lowers `budget` from the i32 guard to
+/// [`KREA_ATTN_CHUNK_BUDGET`] to bound the per-block joint-attention scratch on a constrained card.
+/// `q`/`k`/`v`: `[b, h, s, hd]`.
+pub(crate) fn sdpa_diff_budgeted(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    budget: usize,
+) -> Result<Tensor> {
+    candle_gen::sdpa_budgeted_bhsd(q, k, v, scale, None, |s| softmax(s, D::Minus1), budget)
 }
 
 /// Build a frozen base `Linear` (no bias) from the mmap'd `Weights` and wrap it as a trainable
@@ -175,6 +199,10 @@ struct TrainAttention {
     head_dim: usize,
     eps: f64,
     scale: f64,
+    /// Query-row chunking budget for the joint `[ctx; img]` attention (sc-11745). Defaults to the i32
+    /// guard ([`candle_gen::ATTN_SCORES_BUDGET`]) — unchunked at ≤1024²; the Krea control fit-gate
+    /// lowers it to [`KREA_ATTN_CHUNK_BUDGET`] via [`KreaTrainDit::set_attention_budget`].
+    attn_budget: usize,
 }
 
 impl TrainAttention {
@@ -201,6 +229,7 @@ impl TrainAttention {
             head_dim,
             eps,
             scale: (head_dim as f64).powf(-0.5),
+            attn_budget: candle_gen::ATTN_SCORES_BUDGET,
         })
     }
 
@@ -242,7 +271,7 @@ impl TrainAttention {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        let o = sdpa_diff(&q, &k, &v, self.scale)?;
+        let o = sdpa_diff_budgeted(&q, &k, &v, self.scale, self.attn_budget)?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
 
         let gated = (o * sigmoid(&gate)?)?;
@@ -558,6 +587,19 @@ impl KreaTrainDit {
         let p = self.cfg.patch_size;
         self.img_in
             .forward(&patchify(&latent.to_dtype(self.dtype)?, p)?)
+    }
+
+    /// Set the per-block joint-attention scores budget on the single-stream stack — the Krea control
+    /// **activation-chunking rung** (sc-11745). The load default (`ATTN_SCORES_BUDGET`) leaves the
+    /// forward unchunked at ≤1024² (full speed); the fit-gate lowers it to [`KREA_ATTN_CHUNK_BUDGET`]
+    /// to bound the activation peak on a constrained card, forcing sc-6217-style query-row chunking
+    /// (numerically identical). Only the main single-stream blocks are affected — the tiny text-fusion
+    /// attention (≤ caption tokens) is never a peak, so it is left at its default. Idempotent; call
+    /// before the sampler loop.
+    pub fn set_attention_budget(&mut self, budget: usize) {
+        for blk in &mut self.blocks {
+            blk.attn.attn_budget = budget;
+        }
     }
 }
 

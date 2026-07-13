@@ -41,7 +41,7 @@ use candle_gen::{CandleError, Result};
 
 use crate::config::Krea2Config;
 use crate::loader::{rms_scale_weight, Weights};
-use crate::train_dit::{repeat_kv, rms_scale_diff, sdpa_diff, KreaTrainDit, MainCtx};
+use crate::train_dit::{repeat_kv, rms_scale_diff, sdpa_diff_budgeted, KreaTrainDit, MainCtx};
 use crate::transformer::rope::apply_interleaved_rope;
 
 /// Default residual RMS clamp τ. The run-3 probe showed `τ = 1.0` is destruction-permissive: the
@@ -194,6 +194,11 @@ struct ControlAttention {
     head_dim: usize,
     eps: f64,
     scale: f64,
+    /// Query-row chunking budget for the branch's joint `[ctx; img]` attention (sc-11745). Defaults to
+    /// the i32 guard ([`candle_gen::ATTN_SCORES_BUDGET`]) — unchunked at ≤1024²; the Krea control
+    /// fit-gate lowers it via [`ControlBranch::set_attention_budget`] (the branch twin of the base
+    /// [`KreaTrainDit::set_attention_budget`]).
+    attn_budget: usize,
 }
 
 impl ControlAttention {
@@ -212,6 +217,7 @@ impl ControlAttention {
             head_dim: cfg.attention_head_dim,
             eps: cfg.norm_eps,
             scale: (cfg.attention_head_dim as f64).powf(-0.5),
+            attn_budget: candle_gen::ATTN_SCORES_BUDGET,
         })
     }
 
@@ -237,7 +243,7 @@ impl ControlAttention {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        let o = sdpa_diff(&q, &k, &v, self.scale)?;
+        let o = sdpa_diff_budgeted(&q, &k, &v, self.scale, self.attn_budget)?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
 
         let gated = (o * sigmoid(&gate)?)?;
@@ -492,6 +498,17 @@ impl ControlBranch {
     /// A/B-ing checkpoints trained without the clamp). See the field docs for why the default is on.
     pub fn set_residual_clamp(&mut self, tau: Option<f64>) {
         self.clamp_tau = tau;
+    }
+
+    /// Set the per-block joint-attention scores budget on the branch blocks — the Krea control
+    /// **activation-chunking rung** (sc-11745), the branch twin of
+    /// [`KreaTrainDit::set_attention_budget`]. Load default (`ATTN_SCORES_BUDGET`) = unchunked at
+    /// ≤1024²; the fit-gate lowers it to [`crate::train_dit::KREA_ATTN_CHUNK_BUDGET`] to bound the
+    /// branch's per-block attention scratch alongside the base stack. Idempotent.
+    pub fn set_attention_budget(&mut self, budget: usize) {
+        for blk in &mut self.blocks {
+            blk.attn.attn_budget = budget;
+        }
     }
 
     /// Clamp an (already `control_scale`-scaled) residual so its RMS is at most
@@ -884,6 +901,45 @@ mod tests {
         let a = base.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = with.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(a, b, "zero-init projections must be a step-0 identity");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Activation-chunking parity (sc-11745): forcing the smallest possible scores budget (`1` →
+    /// per-query-row chunks) on **both** the base single-stream stack and the control branch must
+    /// reproduce the un-chunked forward — the sc-6217 query-row-independence invariant, at the Krea
+    /// control forward level. This is the correctness gate for the fit-ladder's chunking rung (the
+    /// fit-gate only ever LOWERS the budget from the i32-guard default, so unchunked == chunked).
+    #[test]
+    fn attention_chunking_matches_unchunked() {
+        let dev = Device::Cpu;
+        // ≥2 main blocks + a nudged branch so both the base attention and the injected branch
+        // attention actually contribute (a zero-init branch would leave only the base to compare).
+        let (mut dit, c, path) = tiny_dit_layers(2);
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+        let mut branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
+        nudge_vars(&branch, &dev);
+
+        let (x0, cap, _) = tiny_batch(&c);
+        let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+        let ctxt = cap.unsqueeze(0).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+
+        let unchunked = forward_with_control(&dit, &branch, &x0, &t, &ctxt, &ctrl, 0.7).unwrap();
+        // Budget 1 → block length 1 → single-row chunks over the joint 7-token sequence (multi-chunk
+        // + remainder), the maximal exercise of the chunked path.
+        dit.set_attention_budget(1);
+        branch.set_attention_budget(1);
+        let chunked = forward_with_control(&dit, &branch, &x0, &t, &ctxt, &ctrl, 0.7).unwrap();
+
+        let a = unchunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert!(
+                (x - y).abs() < 1e-5,
+                "chunked krea control forward diverged from un-chunked: {x} vs {y}"
+            );
+        }
         let _ = std::fs::remove_file(path);
     }
 
