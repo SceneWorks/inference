@@ -1,0 +1,13 @@
+old                                      new                                      ref
+ae85bd1910e5a4c800906ae9accca505f7d3c2d7 ce9b40bece46bd3e4e4cc2b37b5415c4aa797d13 refs/heads/claude/awesome-elgamal-7e20fa
+93d9335fb30b59f41db016b99281d43a93ee3707 628088d9622b7c78690b244e13f8908c073cda4b refs/heads/claude/sc-7170-paged-metal-kernel
+0a0074bb4290f858562e512c9683d2ce8ed70d3d 3beb89a69bc4ea94eaf0869641b4c809efc89bd7 refs/heads/claude/sc-7250-gguf-iq-dequant
+a80d4148a790c336ff17d42abfeae9110ddb7686 d9773c62bfc8ef983346eddea71581c47b7d2e6b refs/heads/claude/sc-7301-flash-kernel
+4cad866f7fa09f24bb933f0b5b7d2a2b583c7e0f e43eee06a409ea77e4763479e8159f08206a03aa refs/heads/claude/sc-7629-qwen35-27b-e2e
+588dc8ae598124fa9aff7faaa97c641e3aba6ec0 cd1e1e5b4dfe3b2184d56762328b1a4accfe31c0 refs/heads/claude/sc-7630-qwen35-moe
+d2445385d952824b4a8515ef740d3b3588dd0228 8f7d8ca788a36da4b71390e7cd09586ee7bdd435 refs/heads/claude/sc-7700-qwen35-mrope-splice
+af5d0e83f4afb921241b7e965076e22f23c107fb a316e2adacc2649b458ed99d194e823d76caf4e6 refs/heads/main
+c6a26fd9e20f5f6069d7ceb3f6826dc26baaf0dc 43b41886a106c673671ccfd989a26b653906d4fe refs/heads/michaeltrefry1818/sc-8531/c-mlx-llm-foundational-q
+4d3d70045e47b9ac5cdbd15a00389a369fec9aa3 778ec3d28b48333e76f1dddef5713067d12ded6b refs/heads/michaeltrefry1818/sc-8532/d-mlx-llm-rvq-turboquant
+ad7c0e3d8059ef2c9bf4de556b0e20372d7349c5 33504efc03fd0330396910ab131d9f66dc815d4f refs/heads/michaeltrefry1818/sc-8534/f-mlx-llm-kv-quant-bench
+af5d0e83f4afb921241b7e965076e22f23c107fb a316e2adacc2649b458ed99d194e823d76caf4e6 refs/heads/migration-baseline
