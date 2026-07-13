@@ -1,0 +1,181 @@
+schema_version = 1
+status = "complete through the observed legacy main heads"
+reconciled_at = "2026-07-13"
+method = "first-parent semantic replay into normalized paths; explicit-catalog seams adapted in place"
+
+[observed_heads]
+core_llm = "54cbac806304e823470ce3ded08f78589acdbb62"
+mlx_llm = "af5d0e83f4afb921241b7e965076e22f23c107fb"
+candle_llm = "482ba5e5e99770967dd0c912f7f87b31c6f08576"
+mlx_gen = "b237abdbb4157b588be7e93ebcefb91820acd0a0"
+candle_gen = "f572005c5cf009e6f025568b6acf6b2e075b9940"
+
+[[repositories]]
+name = "core-llm"
+import_baseline = "54cbac806304e823470ce3ded08f78589acdbb62"
+observed_head = "54cbac806304e823470ce3ded08f78589acdbb62"
+drift_commits = 0
+
+[[repositories]]
+name = "mlx-llm"
+import_baseline = "af5d0e83f4afb921241b7e965076e22f23c107fb"
+observed_head = "af5d0e83f4afb921241b7e965076e22f23c107fb"
+drift_commits = 0
+
+[[repositories]]
+name = "candle-llm"
+import_baseline = "482ba5e5e99770967dd0c912f7f87b31c6f08576"
+observed_head = "482ba5e5e99770967dd0c912f7f87b31c6f08576"
+drift_commits = 0
+
+[[repositories]]
+name = "mlx-gen"
+import_baseline = "b568fdbfd7cfe3cc6c93dc836c2bd92b348ab2b7"
+observed_head = "b237abdbb4157b588be7e93ebcefb91820acd0a0"
+drift_commits = 7
+
+[[repositories]]
+name = "candle-gen"
+import_baseline = "102436012b24072c9cfc58b1b88e1c95655872e5"
+observed_head = "f572005c5cf009e6f025568b6acf6b2e075b9940"
+drift_commits = 29
+
+# Each entry maps one legacy first-parent effect to the canonical inference commit
+# that preserves it. Merge commits are represented by their first-parent effect.
+
+[[ports]]
+repository = "mlx-gen"
+source = "f55b077921612844f4f55fd523e6318f8078f28f"
+destination = "27ab3abca2c7fe2cd2576b2047b797825239c77b"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "mlx-gen"
+source = "95af873670013036f89618957e91907b24936838"
+destination = "695bb29faefed76903011a46e7dc0b127d4c2f22"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "mlx-gen"
+source = "314557da97ee15d444b94e1527c17a1ab43f24e8"
+destination = "8326fe90c405d5006e6f82af0c951bf3dc4ce175"
+kind = "first-parent replay with explicit-registry seam adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "b3015bc613f6bf8f41bde3db66bd315ac8ae88e7"
+destination = "ed67205bd8827b93e13072da4fcfbb78ec303958"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "mlx-gen"
+source = "3311cbea180d6beb0d510d52836d16d962d306a0"
+destination = "82c75c12e2fd1d0a2dcb47f9b692e57bde389e87"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "mlx-gen"
+source = "b237abdbb4157b588be7e93ebcefb91820acd0a0"
+destination = "ff97f1009881795269b8e0bdf185858574e13ce7"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "candle-gen"
+source = "38ba765671efa64456b93f4203b7972ce4fd6331"
+destination = "b40ddc568ce33d218a2c29c3a697e1a271bab2a0"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "candle-gen"
+source = "bf50c8b09bdb8cb0200fbcdd2e51df1b99c5d934"
+destination = "4ed9906103031869256bfaa28322eddcae24b4e6"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "candle-gen"
+source = "b0fc60a3c39fa7c15a563e26453a2bde123c3413"
+destination = "3ba029db2b1454cdc8ab9764f1cd6222263089e1"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "candle-gen"
+source = "a264811bb5bb587a54995e31908085623429eef8"
+destination = "a79341a8698f4cc0f545723801275568d8d3a551"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "candle-gen"
+source = "b80603fa9c550a9e7632130f8b5720b5b9a74096"
+destination = "e17f5cc9dd07dbf6af938c9f1f99aeec5b10c87c"
+kind = "first-parent replay with explicit-registry seam adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "0cf90d1d8c59f1a5731610680e3ed03320b72e34"
+destination = "3ef9fa3924157c1e2d299f6c0c6f8e379dab6f06"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "candle-gen"
+source = "8cc9fc1f295f890659eddf39f0c1c67afc42c7a8"
+destination = "cf5b10f5f7e2a3724a6a3b773507cdeccd4d7e15"
+kind = "first-parent replay with explicit-registry seam adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "5a53cb9d75be73b32ea4005a05a16ae99cc035f8"
+destination = "bed290d06afd1cb05e1315f42d469fac571a4a8d"
+kind = "already represented by unified contract normalization"
+
+[[ports]]
+repository = "candle-gen"
+source = "27a29b08012535ee24117c82707415ee5daadd45"
+destination = "dfd964a1e16800faeb62ef1639e3d24cf9b5b4e0"
+kind = "first-parent replay with unified root lockfile"
+
+[[ports]]
+repository = "candle-gen"
+source = "cda3425867f216761a90d2290382275c6aaba95f"
+destination = "ad9c46ab39c0af73352a6689ed45947862eb5c92"
+kind = "first-parent replay with explicit-registry seam adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "367f0fa1e9d742d6f579a303c7dd4d01c5963ec4"
+destination = "1e551f8bf237883135c969637aacede71c029332"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "candle-gen"
+source = "195be766ea480f154f0b38b68c11bf8c1c354ad1"
+destination = "3940f284acf538f3a4f53aa2af2ab2f381c0a3d9"
+kind = "first-parent replay with unified root lockfile"
+
+[[ports]]
+repository = "candle-gen"
+source = "9b49022e76d3ae39dc07692a513ab8d58556eab1"
+destination = "b43318d4b1226f2d84b8155d9497695d5f5e5c9c"
+kind = "first-parent replay with explicit-registry seam adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "cc0b801eb87f2d3b9ccaaa11c9be40388e4984d9"
+destination = "62749ca33b16953c62a0335b4dcf2a52be83f9cf"
+kind = "first-parent replay with explicit-registry seam adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "e7673887d638581ced0b6b469dc0e70881deee48"
+destination = "a71a58f5b1860f1562d9e406e732cd1acd215fab"
+kind = "first-parent replay"
+
+[[ports]]
+repository = "candle-gen"
+source = "f572005c5cf009e6f025568b6acf6b2e075b9940"
+destination = "e486d24068cc2a64ca96c432529e594b67d2e7bf"
+kind = "first-parent replay with explicit family/platform catalog integration"
+
+[[compatibility_bridges]]
+source = "mlx-gen:95af873670013036f89618957e91907b24936838"
+destination = "2dc9495d5a59fb362e1b21a6cae704618bff4208"
+reason = "Candle trainer literals were updated for the shared supports_control contract added by the MLX source commit."

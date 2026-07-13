@@ -13,6 +13,11 @@ old                                      new
 
 The source repositories are never history-rewritten or force-pushed.
 
+Post-import source activity is mapped separately in
+[`post-import-reconciliation.toml`](post-import-reconciliation.toml). It records
+the observed legacy heads and the canonical commit preserving each first-parent
+effect after workspace normalization.
+
 ## Checkpoints
 
 - [`PHASE_1_CHECKPOINT.md`](PHASE_1_CHECKPOINT.md): history import and exact tree equivalence
