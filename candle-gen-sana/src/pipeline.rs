@@ -145,8 +145,12 @@ pub fn denoise_cfg(
 /// divides by `vae.config.scaling_factor` before decode; the decoder emits NCHW `[1, 3, H, W]` in
 /// `[-1, 1]`, mapped to `[0, 255]` u8.
 pub fn decode_to_image(decoder: &DcAeDecoder, cfg: &DcAeConfig, latents: &Tensor) -> Result<Image> {
-    let unscaled = (latents / cfg.scaling_factor as f64)?; // diffusers: latents / scaling_factor
-    let decoded = decoder.decode(&unscaled)?; // [1, 3, H, W] NCHW, f32 in [-1, 1]
+    // diffusers: latents / scaling_factor.
+    let unscaled = (latents / cfg.scaling_factor as f64)?;
+    // VRAM-fit gate (sc-11804): single-pass on a card with headroom (the Blackwell target), tiled tail
+    // on a small card whose f32 decode peak (~17.7 GB at 1024²) would OOM. Byte-identical to `decode`
+    // when it fits; seam-free when it tiles.
+    let decoded = decoder.decode_fit(&unscaled)?; // [1, 3, H, W] NCHW, f32 in [-1, 1]
     let rgb = (((decoded * 0.5)? + 0.5)?.clamp(0f32, 1f32)? * 255.0)?;
     let rgb = rgb
         .round()?
