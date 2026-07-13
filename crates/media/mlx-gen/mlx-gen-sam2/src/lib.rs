@@ -17,7 +17,7 @@
 //!
 //! Reference: the MLX-native `avbiswas/sam2-mlx` (`mlx_sam`) and `eisneim/sam2.1_mlx`. SAM2 is a
 //! utility segmenter (not a generation provider), so the crate exposes a plain API rather than
-//! self-registering into the model registry.
+//! participating in the provider catalog.
 
 pub mod config;
 pub mod hiera;

@@ -459,9 +459,6 @@ candle_gen::register_generators! {
     pub(crate) const TI2V_REGISTRATION = descriptor => load
 }
 
-/// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
-pub fn force_link() {}
-
 /// Add all Candle Wan generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,

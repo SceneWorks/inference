@@ -1,5 +1,5 @@
 //! `QwenImageEdit` — the Qwen-Image-**Edit** implementation of [`mlx_gen::Generator`] (id
-//! `qwen_image_edit`), plus its [`descriptor`]/[`load`] entry points and `inventory` registration.
+//! `qwen_image_edit`), plus its [`descriptor`]/[`load`] entry points and registration constant.
 //!
 //! [`load`] assembles the model from a `Qwen/Qwen-Image-Edit` snapshot (the validated reference is
 //! `-2511`; `-2509` is superseded — same architecture, sc-2782/sc-2997) — tokenizer + Qwen2-VL
@@ -530,8 +530,8 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
     Ok(())
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The `impl
 // Generator` above stays hand-written because `validate` adds a reference-image check beyond the
 // shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! {

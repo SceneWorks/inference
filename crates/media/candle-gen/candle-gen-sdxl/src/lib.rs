@@ -2,8 +2,8 @@
 //!
 //! The **Stable Diffusion XL** provider crate for [`candle-gen`](candle_gen) — the candle
 //! (Windows/CUDA) sibling of `mlx-gen-sdxl`. It implements the backend-neutral
-//! [`gen_core::Generator`] contract and self-registers via `inventory`, so linking this crate
-//! makes `gen_core::load("sdxl", …)` resolve the candle SDXL generator.
+//! [`gen_core::Generator`] contract and exposes the candle SDXL generator through its explicit
+//! family catalog.
 //!
 //! **txt2img (sc-3675 + sc-3673):** [`SdxlGenerator::generate`] runs the GO-validated epic-3494
 //! prototype ([`pipeline`]) through the contract: dual CLIP → UNet (real CFG) → f16 VAE, emitting
@@ -159,9 +159,8 @@ mod unet;
 // crate composes it; also the SDXL ControlNet building block sc-5489 reuses.
 pub use unet::{ControlNet, ControlNetConfig, ControlResiduals};
 
-// The native candle SDXL LoRA/LoKr trainer (sc-5165) — implements `gen_core::Trainer` and
-// self-registers via `inventory` (kept linked by `force_link`), so `gen_core::load_trainer("sdxl", …)`
-// resolves the candle trainer.
+// The native candle SDXL LoRA/LoKr trainer (sc-5165) implements `gen_core::Trainer` and is included
+// in the explicit family catalog.
 mod training;
 pub use training::{load_trainer, trainer_descriptor, SdxlTrainer};
 
@@ -487,18 +486,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
-// `gen_core::load("sdxl", …)` resolve the candle generator — no central match statement to edit.
+// the explicit family and platform catalogs resolve the candle generator.
 candle_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
-
-/// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
-/// references nothing in this crate directly, so the linker (MSVC in particular, on a release
-/// build) discards the whole rlib — taking the `inventory::submit!` registration above with it, and
-/// `gen_core::load("sdxl", …)` then fails with "no generator registered". Referencing this no-op
-/// from the consumer keeps the crate linked so the registration survives. The SceneWorks worker
-/// force-links each provider crate for exactly this reason (e.g. `sensenova_jobs`).
-pub fn force_link() {}
 
 /// Add the Candle SDXL generator and trainer to an explicit media registry builder.
 pub fn register_providers(
@@ -538,8 +529,8 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
 
-    /// The seam under test: this provider's `inventory::submit!` is linked into the test binary,
-    /// so resolving `"sdxl"` through gen-core's registry returns OUR candle generator. `load` is
+    /// The seam under test: resolving `"sdxl"` through the family registry returns this candle
+    /// generator. `load` is
     /// lazy, so a nonexistent weights dir still resolves (no file I/O until `generate`).
     #[test]
     fn sdxl_registers_and_resolves_as_candle() {

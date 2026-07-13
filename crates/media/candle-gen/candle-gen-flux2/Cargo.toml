@@ -16,8 +16,6 @@ candle-gen = { path = "../candle-gen" }
 # student (4× SR) that consumes the packed 128-ch BN-normalized latent directly. Wired behind
 # `req.use_pid` (default off → the byte-exact native Flux2Vae `decode_packed`).
 candle-gen-pid = { path = "../candle-gen-pid" }
-# Link-time self-registration into gen-core's model registry (the `inventory::submit!` below).
-inventory = { workspace = true }
 # FLUX.2 has NO candle-transformers reference impl (unlike FLUX.1's `flux`): the MMDiT, the 32-ch
 # 2×2-patchify VAE, and the Qwen3 prompt-embeds path are all written here on candle-core/candle-nn.
 # candle-transformers is still pulled (transitively, same build) but no FLUX.2 model is reused.

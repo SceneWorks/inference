@@ -1,4 +1,4 @@
-//! sc-5145: the **full Bernini** Generator (`mlx_gen::load("bernini")`) — the registered pipeline that
+//! sc-5145: the **full Bernini** Generator (provider id `"bernini"`) — the registered pipeline that
 //! finally strings the whole planner → renderer stack together, mirroring `BerniniPipeline.__call__`
 //! (`pipeline.py` 887-1181).
 //!
@@ -590,8 +590,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const FULL_REGISTRATION = descriptor => load
 }

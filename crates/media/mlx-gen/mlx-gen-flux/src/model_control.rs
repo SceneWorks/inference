@@ -23,7 +23,7 @@
 //! [`descriptor_dev_control`] now mirrors FLUX.2's `flux2_dev_control` shape, the [`ControlBranch`] impl
 //! pins the accepted control kinds to pose/canny/depth (input-agnostic — no mode index, S0 sc-8237), and
 //! `tests/control_real_weights.rs` carries one `#[ignore]` real-weight Metal smoke per mode. The model
-//! resolves through the core registry as `flux1_dev_control` (`mlx_gen::load`); the SceneWorks worker
+//! resolves through the explicit registry as `flux1_dev_control`; the SceneWorks worker
 //! exposure + manifest re-pin are the driver/manifest stories (sc-8243/sc-8244), not this crate.
 
 use mlx_gen::gen_core;
@@ -370,8 +370,8 @@ impl Generator for Flux1DevControl {
     }
 }
 
-// Link-time registration (epic 3720): the `inventory::submit!` so E2's worker can resolve the
-// `flux1_dev_control` generator by id. The `impl Generator` above stays hand-written because `validate`
+// Explicit registration lets the platform catalog resolve `flux1_dev_control` by id. The
+// `impl Generator` above stays hand-written because `validate`
 // adds a control-conditioning check beyond the plain capability floor.
 mlx_gen::register_generators! {
     pub(crate) const DEV_CONTROL_REGISTRATION = descriptor_dev_control => load_dev_control

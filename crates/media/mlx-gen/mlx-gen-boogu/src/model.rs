@@ -1,8 +1,8 @@
 //! `Boogu` — the [`mlx_gen::Generator`] implementation for Boogu-Image-0.1, plus its
-//! [`descriptor`]/[`load`] entry points and the `inventory` registration that wires the three
-//! variants into `mlx_gen`'s registry under ids `"boogu_image"` (Base, true-CFG T2I),
+//! [`descriptor`]/[`load`] entry points and registration constants for the three variants:
+//! `"boogu_image"` (Base, true-CFG T2I),
 //! `"boogu_image_turbo"` (DMD few-step, CFG-free), and `"boogu_image_edit"` (instruction
-//! image-edit). Linking this crate is all the worker needs to resolve a model by id.
+//! image-edit).
 //!
 //! All three variants share one architecture/loader ([`crate::pipeline::BooguPipeline`]); they
 //! differ only in which snapshot they load (Base / Turbo / Edit checkpoint) and which sampler
@@ -492,8 +492,8 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
-// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor => load
 }

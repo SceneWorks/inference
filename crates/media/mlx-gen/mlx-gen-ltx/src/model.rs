@@ -68,7 +68,7 @@ use crate::upsampler::LatentUpsampler;
 use crate::vae::LtxVideoVae;
 use crate::vocoder::LtxVocoder;
 
-/// Public registry id: `mlx_gen::load("ltx_2_3", spec)`.
+/// Public provider id: `"ltx_2_3"`.
 pub const MODEL_ID: &str = "ltx_2_3";
 
 /// Neutral gray the replace_person mask blends toward (reference `_apply_replacement_mask`).
@@ -985,8 +985,8 @@ impl Ltx {
     }
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }

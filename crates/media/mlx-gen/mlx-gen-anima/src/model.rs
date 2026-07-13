@@ -1,6 +1,6 @@
 //! The three Anima generators (`anima_base`, `anima_aesthetic`, `anima_turbo`) — [`Generator`]
-//! implementations + descriptors + [`load`] entry points + the `inventory` registration. Linking this
-//! crate is all the worker needs to resolve any Anima variant by id. All three share the same
+//! implementations + descriptors + [`load`] entry points + explicit registration constants. All
+//! three share the same
 //! architecture (Cosmos-Predict2 DiT + `AnimaTextConditioner` + Qwen3-0.6B TE + Qwen-Image VAE) and
 //! differ only in the DiT weights file + default steps/CFG.
 
@@ -196,7 +196,7 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
-// Link-time registration of all three variants.
+// Explicit registration constants for all three variants.
 mlx_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
 }

@@ -314,9 +314,6 @@ candle_gen::register_generators! {
     pub(crate) const SEVEN_B_REGISTRATION = descriptor_7b => load_registered_7b
 }
 
-/// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
-pub fn force_link() {}
-
 /// Add all Candle SeedVR2 generators to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,

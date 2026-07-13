@@ -2,8 +2,7 @@
 //!
 //! The **Kolors** provider crate for [`candle-gen`](candle_gen) — the candle (Windows/CUDA) sibling
 //! of `mlx-gen-kolors`. It implements the backend-neutral [`gen_core::Generator`] contract and
-//! self-registers via `inventory`, so linking this crate makes `gen_core::load("kolors", …)` resolve
-//! the candle Kolors generator.
+//! exposes the candle Kolors generator through its explicit family catalog.
 //!
 //! **txt2img:** Kolors is a bilingual (Chinese/English) SDXL-family T2I model — the SDXL UNet + SDXL
 //! VAE with a **ChatGLM3-6B** text encoder in place of dual CLIP. [`pipeline`] runs it through the
@@ -184,16 +183,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
-// `gen_core::load("kolors", …)` resolve the candle generator — no central match statement to edit.
+// the explicit family and platform catalogs resolve the candle generator.
 candle_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
-
-/// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
-/// references nothing in this crate directly, so the linker (MSVC on a release build in particular)
-/// can discard the whole rlib — taking the `inventory::submit!` registration with it. Referencing this
-/// no-op from the consumer keeps the crate linked. (Same pattern as `candle_gen_chroma::force_link`.)
-pub fn force_link() {}
 
 /// Add the Candle Kolors provider to an explicit media registry builder.
 pub fn register_providers(

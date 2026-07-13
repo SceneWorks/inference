@@ -22,8 +22,6 @@ candle-gen-flux2 = { path = "../candle-gen-flux2" }
 # shares the `flux2` PiD latent-space student. Wired behind `req.use_pid` (default off → the byte-exact
 # native `Flux2Vae::decode_packed`).
 candle-gen-pid = { path = "../candle-gen-pid" }
-# Link-time self-registration into gen-core's model registry (`inventory::submit!`, sc-5115).
-inventory = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 pattern) — NOT candle's CUDA `randn`.
 rand = { workspace = true }
 rand_distr = { workspace = true }

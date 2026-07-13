@@ -1,6 +1,6 @@
 //! `Sdxl` — the Stable Diffusion XL implementation of [`mlx_gen::Generator`], plus its
-//! [`descriptor`]/[`load`] entry points and the `inventory` registration that wires it into
-//! `mlx_gen`'s registry under the id `"sdxl"` (the SceneWorks worker's `payload.model`).
+//! [`descriptor`]/[`load`] entry points and explicit registration under the id `"sdxl"` (the
+//! SceneWorks worker's `payload.model`).
 //!
 //! SDXL is the in-process Apple `mlx-examples/stable_diffusion` path (vendored at
 //! `_vendor/mlx_sd/`) brought into Rust — a **U-Net** generator (conv ResBlocks + spatial/cross
@@ -1118,8 +1118,8 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[test]
     fn registered_in_core_registry() {
-        // Linking this crate must self-register the model (inventory link-time collection).
+        // The family catalog must expose the model registration.
         assert!(
             crate::provider_registry()
                 .unwrap()

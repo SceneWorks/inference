@@ -12,8 +12,6 @@ categories = ["science"]
 # Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
 # build (single resolution; see scripts/check-gen-core-skew.sh).
 candle-gen = { path = "../candle-gen" }
-# Link-time self-registration into gen-core's model registry (the `inventory::submit!`).
-inventory = { workspace = true }
 # Qwen2/3 byte-level BPE tokenizer with the NEO-Unify added tokens. The fast `tokenizer.json` is
 # loaded from the snapshot (materialized by SenseNova's `tools/build_sensenova_tokenizer.py`,
 # mirroring the mlx provider); this crate builds the neo1_0 prompt strings itself.

@@ -19,7 +19,6 @@ mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration of the three anima generators into the `mlx_gen` registry.
-inventory = { workspace = true }
 # Encode the e2e real-weight smoke output to PNG (real-weights generate test); mirrors mlx-gen-krea.
 image = { workspace = true }
 

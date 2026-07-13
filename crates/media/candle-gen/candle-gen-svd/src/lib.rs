@@ -540,9 +540,6 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
 }
 
-/// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
-pub fn force_link() {}
-
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]

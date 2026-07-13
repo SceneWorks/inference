@@ -42,8 +42,7 @@ use crate::pipeline::{
 use crate::text_encoder::TextEncoder;
 
 /// Registry id for the **base** (non-Turbo) Z-Image Fun-Controlnet-Union variant. Coexists with
-/// `z_image`, `z_image_turbo`, and `z_image_turbo_control` — distinct id, separate `inventory`
-/// registration, no clash.
+/// `z_image`, `z_image_turbo`, and `z_image_turbo_control` — distinct id and registration, no clash.
 pub const MODEL_ID: &str = "z_image_control";
 
 /// The base control variant's identity + capabilities. Same undistilled base (real CFG + a negative
@@ -314,8 +313,8 @@ impl Generator for ZImageControl {
     }
 }
 
-// Link-time registration (epic 3720): emits the `inventory::submit!` and bridges the crate's rich
-// `Result` into the registry's backend-neutral `gen_core::Result`. The `impl Generator` above stays
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The `impl Generator` above stays
 // hand-written because `validate` adds a control-specific check beyond the shared `validate_request`,
 // so it is not the plain delegation `impl_generator!` expresses. A distinct id (`z_image_control`) →
 // no clash with the base / turbo / turbo-control submissions in the same crate.

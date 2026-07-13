@@ -296,11 +296,6 @@ candle_gen::register_generators! {
     pub(crate) const MEDIUM_REGISTRATION = descriptor_medium => load_medium
 }
 
-/// Force-link hook (see `candle_gen_z_image::force_link`): a consumer that reaches this provider only
-/// through the registry references nothing here directly, so the linker can drop the rlib and its
-/// `inventory::submit!`. Referencing this no-op keeps it linked.
-pub fn force_link() {}
-
 /// Add all Candle SD3 providers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,

@@ -1,17 +1,14 @@
 //! `KolorsGenerator` — the [`mlx_gen::Generator`] impl for Kolors, plus its [`descriptor`]/[`load`]
-//! entry points and the `inventory` registration that wires it into `mlx_gen`'s registry under the
-//! id `"kolors"` (sc-3874).
+//! entry points and explicit registration under the id `"kolors"` (sc-3874).
 //!
 //! The epic-3090 ports (sc-3091–3098) gave [`crate::Kolors`] the full capability surface but only as
 //! a direct struct API (which the parity tests call). This module makes Kolors **dispatchable** —
-//! `mlx_gen::load("kolors", spec).generate(req)`, the SceneWorks worker's in-process entry — by
+//! the SceneWorks worker's in-process registry entry — by
 //! mapping [`LoadSpec`]/[`GenerationRequest`] onto that API and looping `req.count` with per-image
 //! seeds + cancel + streamed progress, mirroring `mlx-gen-sdxl/src/model.rs`.
 //!
-//! **Registration mechanism:** `inventory::submit!` here is collected by `mlx_gen`'s
-//! `inventory::collect!` at *link* time — so the registration activates whenever a consumer (the
-//! worker, or this crate's own test binary) links `mlx-gen-kolors`. The core `mlx-gen` crate does
-//! **not** depend on the model crates (by design); there is no root-crate dependency to add.
+//! **Registration mechanism:** the named constant below is composed by the family registry, which
+//! is in turn composed by the MLX platform catalog.
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -737,8 +734,8 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
@@ -766,11 +763,8 @@ mod tests {
     }
 
     #[test]
-    fn registered_in_inventory() {
-        // The `inventory::submit!` above is linked into this test binary, so `mlx_gen::load`
-        // resolves "kolors" (and fails on the bogus weights dir) — proving registration without
-        // needing the real snapshot. A wrong/missing registration yields the registry's
-        // "no generator registered for id" error instead.
+    fn registered_in_family_catalog() {
+        // The family catalog resolves "kolors" and reaches the loader without real weights.
         let spec = LoadSpec {
             weights: WeightsSource::Dir("/nonexistent/kolors".into()),
             quantize: None,

@@ -2,8 +2,7 @@
 //!
 //! The **Z-Image** (Tongyi `Z-Image-Turbo`) provider crate for [`candle-gen`](candle_gen) — the
 //! candle (Windows/CUDA) sibling of `mlx-gen-z-image`. It implements the backend-neutral
-//! [`gen_core::Generator`] contract and self-registers via `inventory`, so linking this crate makes
-//! `gen_core::load("z_image_turbo", …)` resolve the candle Z-Image generator.
+//! [`gen_core::Generator`] contract and exposes its variants through an explicit family catalog.
 //!
 //! **txt2img (sc-3693):** [`ZImageGenerator::generate`] adapts the `candle-transformers` `z_image`
 //! reference model ([`pipeline`]) through the contract: Qwen3 text encoder → DiT (flow-match Euler,
@@ -43,7 +42,7 @@ mod quant;
 mod training;
 
 // Base (non-Turbo) `z_image` text-to-image generator (sc-8414, the candle sibling of mlx sc-8320).
-// Registers its own engine id `z_image` via `inventory` alongside the Turbo `z_image_turbo` below; it
+// Registers its own engine id `z_image` alongside the Turbo `z_image_turbo` below; it
 // reuses the identical DiT/VAE/encoder + [`pipeline`] components, differing only in the render path —
 // real classifier-free guidance over the static **shift=6.0** flow-match schedule (vs Turbo's
 // CFG-free 4-step shift-3.0 distillation). The Turbo path is completely untouched (additive).
@@ -385,22 +384,16 @@ pub fn load_from_comfyui_components(
 }
 
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
-// `gen_core::load("z_image_turbo", …)` resolve the candle generator — no central match to edit.
+// the explicit family and platform catalogs resolve the candle generator.
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
-
-/// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
-/// references nothing in this crate directly, so the linker (MSVC on a release build in particular)
-/// can discard the whole rlib — taking the `inventory::submit!` registration with it. Referencing
-/// this no-op from the consumer keeps the crate linked. (Same pattern as `candle_gen_sdxl::force_link`.)
-pub fn force_link() {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
 
-    /// The seam under test: this provider's `inventory::submit!` is linked into the test binary, so
-    /// resolving `"z_image_turbo"` through gen-core's registry returns OUR candle generator. `load`
+    /// The seam under test: resolving `"z_image_turbo"` through the family registry returns this
+    /// candle generator. `load`
     /// is lazy, so a nonexistent weights dir still resolves (no file I/O until `generate`).
     #[test]
     fn z_image_registers_and_resolves_as_candle() {

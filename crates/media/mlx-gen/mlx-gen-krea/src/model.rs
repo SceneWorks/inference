@@ -1,7 +1,5 @@
 //! `Krea` — the [`mlx_gen::Generator`] implementation for Krea 2 Turbo, plus its [`descriptor`] /
-//! [`load`] entry points and the `inventory` registration that wires the engine into `mlx_gen`'s
-//! registry under id `"krea_2_turbo"`. Linking this crate is all the worker needs to resolve the
-//! model by id.
+//! [`load`] entry points and explicit registrations exposed through the family catalog.
 //!
 //! **Status (P1 complete):** the provider crate + `krea_2_turbo` registration + architecture-validated
 //! [`load`] + offline Q4/Q8 converter ([`crate::convert`]) landed in sc-7567; the DiT forward in
@@ -759,8 +757,8 @@ fn img2img_conflicts_with_capture(has_reference: bool, keep: usize, num_sigmas: 
     has_reference && keep < num_sigmas
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Four variants register
+// The registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. Four variants register
 // here — `krea_2_turbo` (distilled t2i, CFG-free), `krea_2_raw` (undistilled t2i, full-CFG; epic 9992),
 // `krea_2_edit` (the Raw pipeline routed to the Kontext edit entrypoint; epic 10871), and
 // `krea_2_turbo_edit` (that edit surface on the distilled few-step CFG-free schedule; sc-11640).

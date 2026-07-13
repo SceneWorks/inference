@@ -14,9 +14,8 @@ name = "gen_core"
 
 [dependencies]
 # Shared pins live in the workspace root [workspace.dependencies] (F-151). gen-core deliberately
-# depends on NOTHING tensor-related — thiserror (error), inventory (registry), tokenizers (text).
+# depends on NOTHING tensor-related — thiserror (error), tokenizers (text), and core-llm.
 thiserror = { workspace = true }
-inventory = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # Neutral safetensors header/byte-view reader for the weights-metadata layer (sc-3722). NOT a tensor
 # dep — exposes keys/dtypes/shapes/raw bytes only.

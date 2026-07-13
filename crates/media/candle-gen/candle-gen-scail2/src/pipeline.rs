@@ -222,9 +222,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
-/// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
-pub fn force_link() {}
-
 impl Generator for Scail2 {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor

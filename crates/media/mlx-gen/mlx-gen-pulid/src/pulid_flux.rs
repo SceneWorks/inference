@@ -435,8 +435,8 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(PulidFlux::new(flux, eva, pulid, face)?))
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The `impl
 // Generator` above stays hand-written because `validate` adds a reference-face check beyond the
 // FLUX backbone's, so it is not the plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! {

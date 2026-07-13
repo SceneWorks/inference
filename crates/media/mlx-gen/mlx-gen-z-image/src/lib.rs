@@ -1,9 +1,8 @@
 //! # mlx-gen-z-image
 //!
 //! The **Z-Image** (Tongyi Z-Image-turbo) provider crate for [`mlx-gen`](mlx_gen). Depends only
-//! on the `mlx-gen` core (nn primitives, adapters, weights, quant, the `Generator` contract,
-//! the registry) and self-registers via `inventory` — linking this crate makes
-//! `mlx_gen::load("z_image_turbo", …)` resolve. See `docs/MODEL_ARCHITECTURE.md`.
+//! on the `mlx-gen` core (nn primitives, adapters, weights, quant, the `Generator` contract, and
+//! the explicit registry). See `docs/MODEL_ARCHITECTURE.md`.
 //!
 //! Ported & parity-proven against the frozen Python mflux fork (tolerance 1e-2 — Metal runs
 //! fp32 matmul in reduced precision) and validated end-to-end on real bf16 weights (sc-2352):
@@ -47,12 +46,12 @@ pub use loader::{
 };
 pub use model::{descriptor, load, ZImageTurbo, MODEL_ID};
 // The base (`z_image`, sc-8320) and control (`z_image_turbo_control`) variants each register
-// themselves via `inventory`; their `descriptor`/`load`/`MODEL_ID` items share the names of the
+// publish their own registration constants; their `descriptor`/`load`/`MODEL_ID` items share the names of the
 // turbo model's, so reach them through their module paths (consumers use the registry ids
 // `"z_image"` / `"z_image_turbo_control"`). The base reuses the identical `ZImageTransformer` — only
 // the scheduler shift (6.0 vs 3.0), default steps (50 vs 4), and the CFG path differ.
 pub use model_base::ZImage;
-// The base control variant (`z_image_control`, sc-8251) registers itself via `inventory`; its
+// The base control variant (`z_image_control`, sc-8251) publishes its own registration constant; its
 // `descriptor`/`load`/`MODEL_ID` share the names of the turbo control model's, so reach them through
 // the module path (consumers use the registry id `"z_image_control"`). It reuses the identical
 // `ZImageControlTransformer` as the turbo control variant — only the base descriptor (CFG) + the base

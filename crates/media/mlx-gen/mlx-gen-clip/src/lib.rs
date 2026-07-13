@@ -218,9 +218,8 @@ pub fn load_text(spec: &LoadSpec) -> Result<Box<dyn TextEmbedder>> {
     Ok(Box::new(ClipTextEmbedder::from_weights_dir(root)?))
 }
 
-// Link-time registration (epic 3720): the macros emit the `inventory::submit!`s and bridge the
-// crate `Result` into the neutral `gen_core::Result` via `Into::into`, so no hand-written adapter
-// is needed (sc-7970).
+// The registration macros bridge the crate `Result` into the neutral `gen_core::Result` via
+// `Into::into`, so no hand-written adapter is needed.
 mlx_gen::register_image_embedder! {
     pub(crate) const IMAGE_REGISTRATION = descriptor => load
 }
@@ -286,11 +285,12 @@ mod tests {
 
     #[test]
     fn registered_and_discoverable_by_id() {
-        // The `inventory::submit!` registration is linked in this crate's test binary, so the registry
-        // must find `clip_vit_l14` by id and route to our loader — the error is the weights complaint,
-        // NOT "no image embedder registered" (which would mean the registration didn't link).
+        // The family catalog must find `clip_vit_l14` by id and route to our loader — the error is
+        // the weights complaint, not "no image embedder registered".
         let spec = LoadSpec::new(WeightsSource::File(std::path::PathBuf::from("x")));
-        let err = mlx_gen::gen_core::load_image_embedder(MODEL_ID, &spec)
+        let err = crate::provider_registry()
+            .unwrap()
+            .load_image_embedder(MODEL_ID, &spec)
             .err()
             .expect("bogus weights should fail to load");
         assert!(
@@ -313,7 +313,9 @@ mod tests {
     #[test]
     fn text_registered_and_discoverable_by_id() {
         let spec = LoadSpec::new(WeightsSource::File(std::path::PathBuf::from("x")));
-        let err = mlx_gen::gen_core::load_text_embedder(TEXT_MODEL_ID, &spec)
+        let err = crate::provider_registry()
+            .unwrap()
+            .load_text_embedder(TEXT_MODEL_ID, &spec)
             .err()
             .expect("bogus weights should fail to load");
         assert!(

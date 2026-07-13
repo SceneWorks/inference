@@ -16,16 +16,18 @@
 //!
 //! ```ignore
 //! // macOS lane, real family — generator, trainer, captioner:
+//! let registry = mlx_gen_z_image::provider_registry().unwrap();
 //! gen_core_testkit::conformance(
-//!     || mlx_gen::load("z_image_turbo", &spec).unwrap(),
+//!     || registry.load("z_image_turbo", &spec).unwrap(),
 //!     &gen_core_testkit::Profile::cheap(),
 //! );
 //! gen_core_testkit::trainer_conformance(
-//!     || mlx_gen::load_trainer("z_image_turbo", &spec).unwrap(),
+//!     || registry.load_trainer("z_image_turbo", &spec).unwrap(),
 //!     &gen_core_testkit::TrainerProfile::cheap(items, out_dir),
 //! );
+//! let registry = mlx_gen_joycaption::provider_registry().unwrap();
 //! gen_core_testkit::captioner_conformance(
-//!     || mlx_gen::load_captioner("joy_caption", &spec).unwrap(),
+//!     || registry.load_captioner("joy_caption", &spec).unwrap(),
 //!     &gen_core_testkit::CaptionerProfile::cheap(),
 //! );
 //! ```
@@ -446,8 +448,8 @@ pub fn registry_conformance(registry: &gen_core::ProviderRegistry) {
 /// Run the full conformance suite against a freshly-`make`d generator. Panics with every failure
 /// aggregated (one bullet per failed guarantee) — the test-helper idiom, like a fat `assert`.
 ///
-/// `make` is `Fn` so callers may hand it a registry loader (`|| mlx_gen::load(id, &spec).unwrap()`)
-/// or an in-crate stub; it is invoked once. The generator is shared across checks (`generate` is
+/// `make` is `Fn` so callers may hand it an explicit registry loader
+/// (`|| registry.load(id, &spec).unwrap()`) or an in-crate stub; it is invoked once. The generator is shared across checks (`generate` is
 /// `&self` and stateless across calls), so the whole suite is one model load.
 pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
     let g = make();

@@ -27,9 +27,6 @@ mlx-gen-boogu = { path = "../mlx-gen-boogu" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration of the `krea_2_turbo` generator into the `mlx_gen` registry
-# (`model.rs::inventory::submit!`); discovered by `gen_core::registry::load(id, …)` when the worker
-# force-links this crate.
-inventory = { workspace = true }
 # Parse the diffusers `transformer/config.json` + `model_index.json` (architecture + quant manifest).
 serde_json = { workspace = true }
 # Decode training-dataset images (sc-7577 Raw LoRA trainer) + encode the e2e real-weight smoke output to

@@ -15,8 +15,7 @@ candle-gen = { path = "../candle-gen" }
 # Direct candle deps: the DINOv2 ViT backbone + DPT neck/head are a from-scratch port of the HF
 # `transformers` `DepthAnythingForDepthEstimation` reference, built on candle-core / candle-nn
 # primitives — the same workspace pin candle-gen uses → one candle build (no skew). This is a plain
-# utility preprocessor (like candle-gen-face / candle-gen-sam3), NOT an inventory-registered generator,
-# so it needs no `inventory` dep.
+# utility preprocessor (like candle-gen-face / candle-gen-sam3), not a cataloged generator.
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 

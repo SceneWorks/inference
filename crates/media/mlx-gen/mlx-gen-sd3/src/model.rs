@@ -1,6 +1,6 @@
 //! `Sd3Large` — the SD3.5-Large / Large-Turbo implementation of [`mlx_gen::Generator`], plus its
-//! [`descriptor`]/[`load`] entry points and the `inventory` registration that wires it into
-//! `mlx_gen`'s registry (E5 sc-7864 = Large; E6 sc-7865 = Large-Turbo).
+//! [`descriptor`]/[`load`] entry points and explicit registration constants
+//! (E5 sc-7864 = Large; E6 sc-7865 = Large-Turbo).
 //!
 //! [`load`] / [`load_turbo`] assemble the full model from a `stabilityai/stable-diffusion-3.5-large`
 //! (resp. `-large-turbo`) snapshot directory (see [`crate::loader`]) — CLIP BPE + T5 tokenizers, the
@@ -364,8 +364,8 @@ fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f3
     }
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Both the true-CFG
+// The registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. Both the true-CFG
 // Large (E5) and the distilled CFG-off Large-Turbo (E6) register here on the shared backbone.
 mlx_gen::register_generators! {
     pub(crate) const LARGE_REGISTRATION = descriptor => load

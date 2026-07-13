@@ -10,7 +10,6 @@ categories = ["science"]
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }
-inventory = { workspace = true }
 # Force-link the unified Candle LLM engine so its `candle-llava` core-llm
 # provider registration is available to this JoyCaption shim. The workspace
 # path guarantees one Candle tensor type and one core-llm registry.

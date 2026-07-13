@@ -429,8 +429,8 @@ impl Generator for ZImageTurboControl {
     }
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The `impl
 // Generator` above stays hand-written because `validate` adds a control-specific check beyond the
 // shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }

@@ -18,7 +18,7 @@
 //! Weights are provisioned offline by `tools/convert_ideogram4_to_mlx.py` (fp8 weight-only →
 //! bf16 MLX safetensors). Runtime is pure Rust/MLX.
 //!
-//! Slice status: engine **complete** and self-registered — converter (sc-5984), text encoder
+//! Slice status: engine **complete** and explicitly registered — converter (sc-5984), text encoder
 //! (sc-5985), transformer (sc-5986), VAE (sc-5987), native tokenizer + `generate` pipeline +
 //! [`Generator`](mlx_gen::Generator) registry registration under id `"ideogram_4"` (sc-5988, see
 //! [`model`]). Follow-ons: Q4/Q8 quantization (sc-5989) and the gated turnkey publish (sc-5990).

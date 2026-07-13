@@ -15,7 +15,6 @@ mlx-rs = { workspace = true }
 # config.json parsing (matches the sdxl/wan/ltx/flux2 provider convention: serde_json::Value, no derive).
 serde_json = { workspace = true }
 # Link-time self-registration of the `Generator` into the core registry (sc-3194).
-inventory = { workspace = true }
 # The shared on-device decode primitives (KV cache + sampler + RoPE). The dual-path AR runtime
 # (sc-3187) + denoise loop consume mlx-llm's `ContiguousKvCache` / `sample` / `Rope` instead of
 # hand-rolled copies (sc-7159); the bespoke dual-path / multimodal-MRoPE / think-interleave runtime

@@ -11,7 +11,7 @@
 //! external LoRA factor map, re-injected as `Adapter::Lora`, stepped with `keyed_value_and_grad` +
 //! AdamW). This module is the family-agnostic glue around it: the config/progress/request shapes,
 //! the [`schedule`] LR helpers, dataset bucketing, and checkpointing. Each family crate implements
-//! [`Trainer`] (Z-Image in sc-3044) and self-registers via [`crate::registry::TrainerRegistration`].
+//! [`Trainer`] (Z-Image in sc-3044) and publishes a [`crate::registry::TrainerRegistration`].
 
 // The pure LR-schedule policy lives here (gen-core); the MLX training kernels
 // (checkpoint/dataset/lora/optim, incl. `TrainOptimizer`) stay in mlx-gen's `train` module.

@@ -310,8 +310,8 @@ pub fn load_text(spec: &LoadSpec) -> Result<Box<dyn TextEmbedder>> {
     Ok(Box::new(ClipTextEmbedder::from_snapshot(root)?))
 }
 
-// Link-time registration: the macros emit `gen_core`'s `inventory::submit!`s and bridge the crate
-// `Result` into `gen_core::Result` via `Into::into`, so no hand-written adapter is needed (sc-7786).
+// The registration macros bridge the crate `Result` into `gen_core::Result` via `Into::into`, so no
+// hand-written adapter is needed.
 candle_gen::register_image_embedder! {
     pub(crate) const IMAGE_REGISTRATION = descriptor => load
 }
@@ -390,9 +390,8 @@ mod tests {
 
     #[test]
     fn registered_and_discoverable_by_id() {
-        // The `inventory::submit!` registration is linked in this crate's test binary, so the registry
-        // must find `clip_vit_l14` by id and route to our loader — the error is the weights complaint,
-        // NOT "no image embedder registered" (which would mean the registration didn't link).
+        // The family catalog must find `clip_vit_l14` by id and route to our loader — the error is
+        // the weights complaint, not "no image embedder registered".
         let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/nonexistent")));
         let err = crate::provider_registry()
             .unwrap()

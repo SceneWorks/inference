@@ -18,7 +18,6 @@ candle-gen-flux2 = { path = "../candle-gen-flux2" }
 # `(ph,pw,c)` order, so the decode branch reconstructs the FLUX.2-canonical packed latent). Wired
 # behind `req.use_pid` (default off → the byte-exact native `Flux2Vae::decode_latent`).
 candle-gen-pid = { path = "../candle-gen-pid" }
-inventory = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity).
 rand = { workspace = true }
 rand_distr = { workspace = true }

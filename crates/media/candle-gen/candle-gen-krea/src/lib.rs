@@ -40,8 +40,7 @@ pub mod vae;
 pub mod vision;
 
 // The candle Krea LoRA/LoKr trainer (sc-7577) + its vendored composable-op trainable DiT. Private
-// (reached through gen-core's trainer registry by id, like the SDXL/Z-Image trainers); the
-// `inventory::submit!` in `training` is kept linked by [`force_link`].
+// (reached through the explicit family registry by id, like the SDXL/Z-Image trainers).
 mod train_dit;
 mod training;
 
@@ -57,8 +56,7 @@ pub mod control_train;
 
 // The gen_core `Trainer` adapter for Krea pose-ControlNet (sc-10163, epic 10159 B2): registers
 // `krea_2_control` so the studio drives control-branch training through the same `load_trainer` path
-// LoRA uses. Private (reached via the registry by id); its `register_trainer!` is kept linked by
-// [`force_link`], like the LoRA trainer in `training`.
+// LoRA uses. Private and reached through the explicit family registry by id.
 mod control_trainer;
 
 // The Krea 2 Turbo pose-ControlNet **inference** provider (sc-8464, epic 8459): loads a trained
@@ -486,10 +484,6 @@ candle_gen::register_generators! {
 candle_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit
 }
-
-/// Force-link hook (keeps the `inventory::submit!` registrations — the `krea_2_turbo`, `krea_2_raw`,
-/// and `krea_2_edit` generators and the `krea_2_raw` trainer — from being dead-stripped).
-pub fn force_link() {}
 
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
 pub fn register_providers(

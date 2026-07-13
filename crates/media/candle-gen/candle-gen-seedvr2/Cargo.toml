@@ -10,7 +10,6 @@ categories = ["science"]
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }
-inventory = { workspace = true }
 # Fixed-algorithm CPU RNG for deterministic, launch-portable one-step noise (matches the svd/wan
 # convention) — NOT candle's CUDA set_seed. `StdRng` (ChaCha) is reproducible across launches.
 rand = { workspace = true }

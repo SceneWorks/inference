@@ -16,7 +16,6 @@ mlx-gen-wan = { path = "../mlx-gen-wan" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.
-inventory = { workspace = true }
 # bernini_renderer.json knob sidecar reading.
 serde_json = { workspace = true }
 # Source-media decode (i2i/v2v/r2v/rv2v conditioning). PNG + JPEG cover the still inputs.

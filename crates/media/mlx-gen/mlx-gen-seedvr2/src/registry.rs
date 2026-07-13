@@ -230,7 +230,7 @@ impl Seedvr2Generator {
 
 // Thin id-binding loaders over `load_with` (each pins the variant id), so they can't be a plain
 // `load` path. They return the crate's rich `Result`; `register_generators!` adds the
-// `gen_core::Result` bridge (epic 3720) and emits each `inventory::submit!`.
+// `gen_core::Result` bridge.
 fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_with(spec, MODEL_ID)
 }

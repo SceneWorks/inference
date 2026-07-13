@@ -10,7 +10,6 @@ categories = ["science"]
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }
-inventory = { workspace = true }
 # SVD has NO candle-transformers reference: the UNetSpatioTemporalConditionModel, the
 # AutoencoderKLTemporalDecoder temporal VAE (candle ships no conv3d — the temporal taps are written
 # here on candle-core/candle-nn), the OpenCLIP ViT-H CLIPVisionModelWithProjection image encoder, and

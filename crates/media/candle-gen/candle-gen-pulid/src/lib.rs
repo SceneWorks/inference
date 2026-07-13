@@ -29,7 +29,3 @@ pub use pulid_flux::{PulidFlux, PulidFluxPaths, PulidFluxRequest, DEFAULT_ID_WEI
 /// analog of the InstantID / IP-Adapter Phase-5 harnesses).
 #[cfg(test)]
 mod validate;
-
-/// Force-link hook so a consumer reaching this provider only indirectly keeps the rlib (and any future
-/// registrations) linked — the same pattern as `candle_gen_flux::force_link`.
-pub fn force_link() {}

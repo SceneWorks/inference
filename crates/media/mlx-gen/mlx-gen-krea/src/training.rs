@@ -196,8 +196,8 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }))
 }
 
-// Link-time trainer registration (epic 3720): the macro emits the `inventory::submit!` and bridges
-// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`.
+// The trainer registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_trainer! {
     pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
 }
@@ -1103,8 +1103,7 @@ mod tests {
 
     #[test]
     fn reachable_via_trainer_registry_by_id() {
-        // The `inventory::submit!` registration is discoverable through the gen-core trainer registry
-        // (what the worker's `gen_core::load_trainer(id, spec)` resolves) — no weights needed.
+        // The trainer registration is discoverable through the explicit family catalog.
         assert!(
             crate::provider_registry()
                 .unwrap()

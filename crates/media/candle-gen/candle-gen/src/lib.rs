@@ -3,9 +3,8 @@
 //! The **candle** tensor-backend core for SceneWorks generative inference — the Windows/CUDA
 //! sibling of [`mlx-gen`](https://github.com/michaeltrefry/mlx-gen) (Apple MLX). Both crates
 //! implement the **same** backend-neutral [`gen_core`] contract (epic 3720): the `Generator` /
-//! `Trainer` / `Captioner` / `Transform` traits, the request/output types, and the link-time
-//! model registry. A consumer pins one backend by SHA and links its provider crates; the provider
-//! crates self-register via `inventory`, so adding a model is purely additive (no central match).
+//! `Trainer` / `Captioner` / `Transform` traits, the request/output types, and the explicit
+//! provider registry. A platform catalog selects and registers the provider crates it ships.
 //!
 //! This crate owns the candle-specific seam: device/dtype selection across the CPU (default),
 //! Metal (`metal` feature, Mac), and CUDA (`cuda` feature, Windows) backends, plus the
@@ -41,9 +40,8 @@
 // through `candle_gen::gen_core` (single gen-core resolution — see the skew gate). Mirrors how
 // mlx-gen re-exports gen_core for mlx-gen-sdxl.
 pub use gen_core;
-// Re-export the link-time registration macros so provider crates call `candle_gen::register_*!`
-// (the candle twin of `mlx_gen::register_generators!`). They emit `gen_core`'s `inventory::submit!`
-// + the `Into::into` error bridge, so providers drop their hand-written `_registered` adapters.
+// Re-export the registration-constant macros so provider crates call `candle_gen::register_*!`
+// (the candle twin of `mlx_gen::register_generators!`). They include the `Into::into` error bridge.
 pub use gen_core::{
     register_captioner, register_generators, register_image_embedder, register_text_embedder,
     register_trainer,

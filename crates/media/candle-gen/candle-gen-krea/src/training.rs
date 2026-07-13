@@ -270,9 +270,8 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }))
 }
 
-// Link-time self-registration into gen-core's trainer registry (parallel to the generator's
-// registration in `lib.rs`). Kept linked by `crate::force_link`. `register_trainer!` bridges the
-// crate's rich `Result` into the registry's `gen_core::Result` via `Into::into`.
+// `register_trainer!` defines the explicit trainer constant and bridges the crate's rich `Result`
+// into `gen_core::Result` via `Into::into`.
 candle_gen::register_trainer! {
     pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
 }
@@ -730,7 +729,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// The trainer self-registers and resolves through gen-core's trainer registry as the candle Krea
+    /// The trainer resolves through the explicit family registry as the candle Krea
     /// trainer; `load_trainer` is lazy, so a nonexistent weights dir still resolves.
     #[test]
     fn trainer_registers_and_resolves_as_candle() {

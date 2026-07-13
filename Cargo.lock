@@ -246,7 +246,6 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-qwen-image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "sceneworks-gen-core-testkit",
@@ -260,7 +259,6 @@ dependencies = [
  "candle-gen",
  "candle-gen-wan",
  "image",
- "inventory",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
@@ -275,7 +273,6 @@ dependencies = [
  "candle-gen-pid",
  "candle-transformers",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "serde_json",
@@ -318,7 +315,6 @@ dependencies = [
  "candle-gen-pid",
  "candle-transformers",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "sceneworks-gen-core-testkit",
@@ -335,7 +331,6 @@ dependencies = [
  "candle-gen-sdxl",
  "candle-nn",
  "candle-transformers",
- "inventory",
  "tokenizers 0.22.2",
 ]
 
@@ -369,7 +364,6 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "sceneworks-gen-core-testkit",
@@ -385,7 +379,6 @@ dependencies = [
  "candle-gen-pid",
  "candle-transformers",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "sceneworks-gen-core-testkit",
@@ -401,7 +394,6 @@ dependencies = [
  "candle-gen-flux2",
  "candle-gen-pid",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "safetensors 0.7.0",
@@ -428,7 +420,6 @@ dependencies = [
  "candle-gen",
  "candle-llm",
  "image",
- "inventory",
  "sceneworks-gen-core-testkit",
 ]
 
@@ -441,7 +432,6 @@ dependencies = [
  "candle-gen-sdxl",
  "candle-transformers",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "sceneworks-gen-core-testkit",
@@ -458,7 +448,6 @@ dependencies = [
  "candle-gen-pid",
  "candle-gen-qwen-image",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "safetensors 0.7.0",
@@ -473,7 +462,6 @@ dependencies = [
  "candle-gen-flux2",
  "candle-gen-pid",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "safetensors 0.7.0",
@@ -487,7 +475,6 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "sceneworks-gen-core-testkit",
@@ -528,7 +515,6 @@ dependencies = [
  "candle-gen",
  "candle-gen-pid",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "safetensors 0.7.0",
@@ -553,7 +539,6 @@ dependencies = [
  "candle-gen",
  "candle-gen-wan",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "safetensors 0.7.0",
@@ -571,7 +556,6 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "safetensors 0.7.0",
@@ -591,7 +575,6 @@ dependencies = [
  "candle-transformers",
  "hf-hub",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "safetensors 0.7.0",
@@ -607,7 +590,6 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "rayon",
@@ -620,7 +602,6 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "sceneworks-gen-core-testkit",
@@ -634,7 +615,6 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "sceneworks-gen-core-testkit",
@@ -646,7 +626,6 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "safetensors 0.7.0",
@@ -664,7 +643,6 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "image",
- "inventory",
  "rand 0.9.5",
  "rand_distr",
  "safetensors 0.7.0",
@@ -2269,7 +2247,6 @@ dependencies = [
 name = "mlx-gen"
 version = "0.0.0"
 dependencies = [
- "inventory",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "sceneworks-gen-core",
@@ -2283,7 +2260,6 @@ name = "mlx-gen-anima"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-qwen-image",
  "mlx-gen-z-image",
@@ -2297,7 +2273,6 @@ name = "mlx-gen-bernini"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
@@ -2311,7 +2286,6 @@ name = "mlx-gen-boogu"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-pid",
  "mlx-gen-z-image",
@@ -2356,7 +2330,6 @@ name = "mlx-gen-chroma"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-flux",
  "mlx-gen-pid",
@@ -2369,7 +2342,6 @@ dependencies = [
 name = "mlx-gen-clip"
 version = "0.0.0"
 dependencies = [
- "inventory",
  "mlx-gen",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
@@ -2397,7 +2369,6 @@ name = "mlx-gen-flux"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-pid",
  "mlx-gen-sdxl",
@@ -2411,7 +2382,6 @@ name = "mlx-gen-flux2"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-pid",
  "mlx-llm",
@@ -2424,7 +2394,6 @@ name = "mlx-gen-ideogram"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-flux2",
  "mlx-gen-pid",
@@ -2448,7 +2417,6 @@ dependencies = [
 name = "mlx-gen-joycaption"
 version = "0.0.0"
 dependencies = [
- "inventory",
  "mlx-gen",
  "mlx-llm",
  "sceneworks-gen-core-testkit",
@@ -2459,7 +2427,6 @@ name = "mlx-gen-kolors"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-pid",
  "mlx-gen-sdxl",
@@ -2471,7 +2438,6 @@ name = "mlx-gen-krea"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-boogu",
  "mlx-gen-pid",
@@ -2486,7 +2452,6 @@ name = "mlx-gen-lens"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-flux2",
  "mlx-gen-pid",
@@ -2499,7 +2464,6 @@ name = "mlx-gen-ltx"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",
  "serde_json",
@@ -2519,7 +2483,6 @@ dependencies = [
 name = "mlx-gen-pulid"
 version = "0.0.0"
 dependencies = [
- "inventory",
  "mlx-gen",
  "mlx-gen-face",
  "mlx-gen-flux",
@@ -2531,7 +2494,6 @@ name = "mlx-gen-qwen-image"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
@@ -2567,7 +2529,6 @@ dependencies = [
 name = "mlx-gen-scail2"
 version = "0.0.0"
 dependencies = [
- "inventory",
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
@@ -2580,7 +2541,6 @@ name = "mlx-gen-sd3"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-flux",
  "mlx-gen-sdxl",
@@ -2594,7 +2554,6 @@ name = "mlx-gen-sdxl"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
@@ -2606,7 +2565,6 @@ dependencies = [
 name = "mlx-gen-seedvr2"
 version = "0.0.0"
 dependencies = [
- "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
@@ -2617,7 +2575,6 @@ dependencies = [
 name = "mlx-gen-sensenova"
 version = "0.0.0"
 dependencies = [
- "inventory",
  "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
@@ -2629,7 +2586,6 @@ name = "mlx-gen-svd"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
@@ -2641,7 +2597,6 @@ name = "mlx-gen-wan"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",
  "serde_json",
@@ -2654,7 +2609,6 @@ name = "mlx-gen-z-image"
 version = "0.0.0"
 dependencies = [
  "image",
- "inventory",
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
@@ -3539,7 +3493,6 @@ name = "sceneworks-gen-core"
 version = "0.1.0"
 dependencies = [
  "core-llm",
- "inventory",
  "safetensors 0.4.5",
  "serde_json",
  "thiserror 2.0.18",

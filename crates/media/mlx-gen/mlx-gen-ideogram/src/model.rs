@@ -1,7 +1,6 @@
 //! `Ideogram4` — the [`mlx_gen::Generator`] implementation for Ideogram 4.0, plus its
-//! [`descriptor`]/[`load`] entry points and the `inventory` registration that wires it into
-//! `mlx_gen`'s registry under id `"ideogram_4"` (sc-5988). Linking this crate is all the worker
-//! needs to resolve the model by id.
+//! [`descriptor`]/[`load`] entry points and explicit registration under id `"ideogram_4"`
+//! (sc-5988).
 //!
 //! [`load`] assembles the pipeline (2 DiTs + Qwen3-VL TE + VAE + tokenizer) from a converted
 //! snapshot directory ([`crate::pipeline::Ideogram4Pipeline`]); [`Ideogram4::generate`] runs the
@@ -431,8 +430,8 @@ fn array_to_image(img: &Array) -> Result<Image> {
     })
 }
 
-// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The turbo variant
+// The registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The turbo variant
 // (issue #488) registers under `ideogram_4_turbo`.
 mlx_gen::register_generators! {
     pub(crate) const QUALITY_REGISTRATION = descriptor => load
@@ -689,8 +688,8 @@ mod tests {
 
     #[test]
     fn reachable_via_registry_by_id() {
-        // Linking this crate self-registers ideogram_4; it must be discoverable and resolve to OUR
-        // loader (a nonexistent dir fails inside load, NOT with "no generator registered").
+        // The family catalog must resolve ideogram_4 to this loader; a nonexistent dir fails inside
+        // load, not with "no generator registered".
         assert!(crate::provider_registry()
             .unwrap()
             .generators()

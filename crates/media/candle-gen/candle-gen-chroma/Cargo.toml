@@ -16,8 +16,6 @@ candle-gen = { path = "../candle-gen" }
 # over the FLUX.1 16-ch VAE, so it shares the `flux` PiD latent-space student. Wired behind
 # `req.use_pid` (default off → the byte-exact native VAE decode).
 candle-gen-pid = { path = "../candle-gen-pid" }
-# Link-time self-registration into gen-core's model registry (the three `inventory::submit!`).
-inventory = { workspace = true }
 # T5-XXL encoder (`t5::T5EncoderModel`) for the prompt conditioning, plus `flux::sampling::unpack`
 # for the 2x2 latent unpack (Chroma packs latents exactly like FLUX). Backend features are passed
 # through below so it shares candle-gen's exact candle build.

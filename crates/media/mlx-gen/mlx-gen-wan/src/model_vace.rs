@@ -48,7 +48,7 @@ use crate::vace::{
 };
 use crate::vae::WanVae;
 
-/// Public registry id: `mlx_gen::load("wan_vace", spec)`.
+/// Public provider id: `"wan_vace"`.
 pub const MODEL_ID_VACE: &str = "wan_vace";
 
 /// The Wan z16 VAE strides (the VACE checkpoints are Wan2.1-based): temporal 4, spatial 8, patch 2.
@@ -308,7 +308,7 @@ impl WanVace {
     }
 }
 
-/// `mlx_gen::load("wan_vace", spec)` — resolve the VACE config from the snapshot dir.
+/// Resolve the `"wan_vace"` configuration from the snapshot directory.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -438,8 +438,8 @@ fn load_vace_transformer_weights(root: &std::path::Path) -> Result<Weights> {
     )))
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const VACE_REGISTRATION = descriptor_vace => load
 }
@@ -457,7 +457,7 @@ mlx_gen::register_generators! {
 // dual-expert. Reuses every host-side helper from the single-expert path verbatim.
 // ============================================================================================
 
-/// Public registry id: `mlx_gen::load("wan2_2_vace_fun_14b", spec)`.
+/// Public provider id: `"wan2_2_vace_fun_14b"`.
 pub const MODEL_ID_VACE_FUN: &str = "wan2_2_vace_fun_14b";
 
 /// Stable identity + advertised capabilities for `wan2_2_vace_fun_14b` (same surface as `wan_vace`:
@@ -500,7 +500,7 @@ impl WanVaceFun {
     }
 }
 
-/// `mlx_gen::load("wan2_2_vace_fun_14b", spec)` — resolve the dual-expert VACE-Fun config.
+/// Resolve the `"wan2_2_vace_fun_14b"` dual-expert VACE-Fun configuration.
 pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -665,7 +665,7 @@ fn validate_vace_clip(
     Ok(())
 }
 
-// Link-time registration for the dual-expert VACE-Fun variant (epic 3720).
+// Explicit registration for the dual-expert VACE-Fun variant.
 mlx_gen::register_generators! {
     pub(crate) const VACE_FUN_REGISTRATION = descriptor_vace_fun => load_vace_fun
 }

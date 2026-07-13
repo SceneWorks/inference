@@ -12,8 +12,6 @@ categories = ["science"]
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
-# Link-time generator registration (`inventory::submit!` collected by mlx_gen's `inventory::collect!`).
-inventory = { workspace = true }
 # config parsing (matches the sdxl/wan/ltx/flux2/lens provider convention).
 serde_json = { workspace = true }
 

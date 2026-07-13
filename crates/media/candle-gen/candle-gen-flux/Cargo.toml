@@ -16,8 +16,6 @@ candle-gen = { path = "../candle-gen" }
 # latent-space student (4× SR). Wired behind `req.use_pid` (default off → the byte-exact native FLUX
 # AutoEncoder decode).
 candle-gen-pid = { path = "../candle-gen-pid" }
-# Link-time self-registration into gen-core's model registry (the two `inventory::submit!` below).
-inventory = { workspace = true }
 # FLUX building blocks: the `flux` model (DiT) + `autoencoder` (VAE) read the original
 # black-forest-labs checkpoint layout directly; `t5` (T5-XXL) and `clip` (CLIP-L) are the dual text
 # encoders. Backend features are passed through below so it shares candle-gen's exact candle build.

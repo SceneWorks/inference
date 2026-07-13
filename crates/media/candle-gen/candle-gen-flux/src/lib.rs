@@ -2,9 +2,7 @@
 //!
 //! The **FLUX.1** provider crate for [`candle-gen`](candle_gen) — the candle (Windows/CUDA) sibling
 //! of `mlx-gen-flux`. It implements the backend-neutral [`gen_core::Generator`] contract and
-//! self-registers via `inventory` for **both** FLUX.1 variants, so linking this crate makes
-//! `gen_core::load("flux1_schnell", …)` / `gen_core::load("flux1_dev", …)` resolve the candle FLUX
-//! generators.
+//! exposes both FLUX.1 variants through its explicit family catalog.
 //!
 //! **txt2img (sc-3694):** [`FluxGenerator::generate`] adapts the `candle-transformers` `flux`
 //! reference model ([`pipeline`]) through the contract: dual **CLIP-L + T5-XXL** text encoders → the
@@ -397,7 +395,7 @@ pub fn load_dev(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 // Link-time self-registration into gen-core's model registry — one descriptor per variant. Linking
-// this crate makes `gen_core::load("flux1_schnell"/"flux1_dev", …)` resolve the candle generators
+// the explicit family and platform catalogs resolve both candle generators
 // with no central match to edit.
 candle_gen::register_generators! {
     pub(crate) const SCHNELL_REGISTRATION = descriptor_schnell => load_schnell
@@ -405,12 +403,6 @@ candle_gen::register_generators! {
 candle_gen::register_generators! {
     pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
 }
-
-/// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
-/// references nothing in this crate directly, so the linker (MSVC on a release build in particular)
-/// can discard the whole rlib — taking the `inventory::submit!` registrations with it. Referencing
-/// this no-op from the consumer keeps the crate linked. (Same pattern as `candle_gen_sdxl::force_link`.)
-pub fn force_link() {}
 
 /// Add all Candle FLUX.1 providers to an explicit media registry builder.
 pub fn register_providers(
@@ -445,8 +437,7 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
 
-    /// Both variants register and resolve as candle generators through gen-core's registry (their
-    /// `inventory::submit!`s are linked into the test binary). `load` is lazy, so a nonexistent
+    /// Both variants resolve as candle generators through the family registry. `load` is lazy, so a nonexistent
     /// weights dir still resolves (no file I/O until `generate`).
     #[test]
     fn both_variants_register_and_resolve_as_candle() {

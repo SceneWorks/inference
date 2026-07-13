@@ -1,7 +1,7 @@
 //! `ZImageBaseGenerator` — the **base** (non-distilled, full-CFG) candle Z-Image generator (sc-8414,
 //! the candle sibling of `mlx-gen-z-image::model_base`, mlx sc-8320). Registered as its own engine id
 //! `z_image`, coexisting in the same crate with the distilled `z_image_turbo` ([`crate`]'s top-level
-//! descriptor/load) — a distinct id + a separate `inventory` registration, no clash.
+//! descriptor/load) — a distinct id and registration, no clash.
 //!
 //! The base and Turbo share the **identical** `ZImageTransformer2DModel` architecture (n_layers=30,
 //! dim=3840, n_heads=30, cap_feat_dim=2560, qk_norm, rope_theta=256, t_scale=1000), so this generator
@@ -38,7 +38,7 @@ use crate::SIZE_MULTIPLE;
 
 /// Registry id for the **base** Z-Image (non-Turbo). Matches the SceneWorks catalog `z_image` entry
 /// (added by mlx sc-8320) and the macOS `mlx-gen-z-image::model_base` descriptor. Coexists with
-/// `z_image_turbo` — a distinct id, a separate `inventory` registration, no clash.
+/// `z_image_turbo` — a distinct id and registration, no clash.
 pub const MODEL_ID: &str = "z_image";
 
 /// A loaded candle **base** Z-Image generator. Loading is **lazy** (no file I/O in [`load`]); the heavy
@@ -253,9 +253,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
-// Link-time self-registration into gen-core's model registry. A distinct id (`z_image`) → no clash
-// with the `z_image_turbo` submission in this same crate (`inventory::submit!` emits anonymous
-// statics). Linking this crate makes `gen_core::load("z_image", …)` resolve the candle base generator.
+// The explicit `z_image` registration has a distinct id from `z_image_turbo`.
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 #[cfg(test)]
@@ -263,8 +261,8 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image};
 
-    /// The seam under test: this provider's base `inventory::submit!` is linked into the test binary,
-    /// so resolving `"z_image"` through gen-core's registry returns OUR candle base generator. `load`
+    /// The seam under test: resolving `"z_image"` through the family registry returns this candle
+    /// base generator. `load`
     /// is lazy, so a nonexistent weights dir still resolves (no file I/O until `generate`).
     #[test]
     fn base_registers_and_resolves_as_candle() {

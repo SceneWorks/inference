@@ -942,10 +942,6 @@ candle_gen::register_generators! {
     pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
 }
 
-/// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped when the
-/// crate is reached only through the registry). Same pattern as the other providers.
-pub fn force_link() {}
-
 /// Add all Candle FLUX.2 providers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,

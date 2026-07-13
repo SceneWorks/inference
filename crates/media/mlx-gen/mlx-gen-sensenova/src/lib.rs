@@ -35,7 +35,7 @@
 //! [`runtime`] AR text-generation layer — the [`KvCache`](qwen3::KvCache) + cached forward, token
 //! [`Sampler`], greedy/sampled `generate`, and the `_generate_think` rollout — the runtime the
 //! generation modes build on. The generation modes (T2I / edit / interleave / VQA) and the
-//! `Generator` impl + `inventory` registration land in the following stories (sc-3188 … sc-3194).
+//! `Generator` implementation and explicit registration land in the following stories.
 
 pub mod config;
 pub mod convert;

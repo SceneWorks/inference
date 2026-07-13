@@ -14,10 +14,8 @@
 //! precision override is honored. **Q4/Q8** quantize the gpt-oss encoder's MoE experts (sc-3172 —
 //! the ~38 GB / 20 B-param bulk → ~12 GB) **and** the DiT's linears (sc-3175) at load.
 //!
-//! **Registration mechanism:** the two `inventory::submit!`s below are collected by `mlx_gen`'s
-//! `inventory::collect!` at *link* time, so they activate whenever a consumer (the worker, or this
-//! crate's own test binary) links `mlx-gen-lens`. The core `mlx-gen` crate does **not** depend on the
-//! model crates (by design); there is no root-crate dependency to add.
+//! **Registration mechanism:** the two named constants below are composed by the family registry,
+//! which is in turn composed by the MLX platform catalog.
 
 use std::path::Path;
 
@@ -417,7 +415,7 @@ pub(crate) fn validate_request(
 
 // Thin id-binding loaders: each pins the variant defaults onto `load_with`, so they can't be a
 // plain `load` path. They return the crate's rich `Result`; `register_generators!` adds the
-// `gen_core::Result` bridge (epic 3720) and emits each `inventory::submit!`.
+// `gen_core::Result` bridge.
 fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_with(spec, TURBO_DEFAULTS)
 }
@@ -475,8 +473,7 @@ mod tests {
 
     #[test]
     fn both_ids_resolve_in_registry() {
-        // The `inventory::submit!`s are linked into this test binary, so `mlx_gen::load` resolves
-        // both ids (and fails on the bogus weights dir) — proving registration without the snapshot.
+        // The family catalog resolves both ids and fails on the bogus weights directory.
         for id in [MODEL_ID_TURBO, MODEL_ID_BASE] {
             let spec = LoadSpec {
                 weights: WeightsSource::Dir("/nonexistent/lens".into()),

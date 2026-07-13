@@ -1,6 +1,5 @@
 //! `ZImageTurbo` — the Z-Image-turbo implementation of [`mlx_gen::Generator`], plus its
-//! [`descriptor`]/[`load`] entry points and the `inventory` registration that wires it into
-//! `mlx_gen`'s registry.
+//! [`descriptor`]/[`load`] entry points and explicit registration constant.
 //!
 //! [`load`] assembles the full model from a `Tongyi-MAI/Z-Image-Turbo` snapshot directory (see
 //! [`crate::loader`]) — tokenizer, Qwen text encoder, DiT transformer, VAE decoder — and
@@ -468,8 +467,8 @@ pub(crate) fn validate_request(
     Ok(())
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 #[cfg(test)]

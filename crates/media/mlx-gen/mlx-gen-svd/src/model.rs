@@ -33,7 +33,7 @@ use crate::scheduler::EdmSchedule;
 use crate::unet::SvdUnet;
 use crate::vae::SvdVae;
 
-/// Public registry id: `mlx_gen::load("svd_xt", spec)`.
+/// Public provider id: `"svd_xt"`.
 pub const MODEL_ID: &str = "svd_xt";
 
 /// OpenCLIP ViT-H image-normalization mean/std (the SVD `feature_extractor`). The canonical CLIP
@@ -497,8 +497,8 @@ fn frames_to_images(decoded: &Array) -> Result<Vec<Image>> {
     Ok(frames)
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 #[cfg(test)]

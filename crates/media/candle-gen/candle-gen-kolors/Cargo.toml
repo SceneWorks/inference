@@ -16,8 +16,6 @@ candle-gen = { path = "../candle-gen" }
 # shares the `sdxl` PiD latent-space student. Wired behind `req.use_pid` (default off → byte-exact
 # native SDXL VAE decode).
 candle-gen-pid = { path = "../candle-gen-pid" }
-# Link-time self-registration into gen-core's model registry (the `inventory::submit!`).
-inventory = { workspace = true }
 # SDXL building blocks: the public `stable_diffusion::{unet_2d_blocks, embeddings, vae}` modules.
 # Kolors keeps the SDXL UNet skeleton + SDXL VAE; this crate composes those blocks and adds only the
 # Kolors deltas (the `encoder_hid_proj` context projection + the 5632-wide `text_time` add-embedding).

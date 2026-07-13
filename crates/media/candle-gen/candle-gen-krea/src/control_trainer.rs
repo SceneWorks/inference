@@ -1,7 +1,7 @@
 //! Krea 2 pose-**ControlNet** trainer — the gen_core [`Trainer`] adapter (sc-10163, epic 10159 B2).
 //!
 //! The ControlNet Training Studio drives control-branch training through the *same*
-//! `gen_core::load_trainer(id, spec).train(req)` path LoRA uses. This registers a
+//! explicit `ProviderRegistry::load_trainer(id, spec).train(req)` path LoRA uses. This registers a
 //! [`KreaControlTrainer`] under [`KREA_2_CONTROL_ID`] that:
 //!
 //! 1. encodes each `(target, control_image, caption)` [`TrainingItem`](gen_core::train::TrainingItem)
@@ -91,7 +91,7 @@ pub fn load_control_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }))
 }
 
-// Link-time self-registration into gen-core's trainer registry (kept linked by `crate::force_link`).
+// Explicit control-trainer registration constant.
 candle_gen::register_trainer! {
     pub(crate) const CONTROL_TRAINER_REGISTRATION =
         control_trainer_descriptor => load_control_trainer
@@ -297,7 +297,7 @@ mod tests {
     use candle_gen::gen_core::runtime::CancelFlag;
     use candle_gen::gen_core::train::{TrainingConfig, TrainingItem};
 
-    /// The control trainer self-registers and resolves through gen-core's registry as the candle Krea
+    /// The control trainer resolves through the explicit family registry as the candle Krea
     /// control trainer (distinct id from the LoRA `krea_2_raw`); `load` is lazy so a nonexistent dir
     /// still resolves.
     #[test]

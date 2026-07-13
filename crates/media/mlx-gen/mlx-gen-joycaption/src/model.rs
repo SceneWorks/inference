@@ -256,8 +256,7 @@ fn map_finish(f: core_llm::FinishReason) -> CaptionFinishReason {
     }
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!`; `load` already
-// returns `gen_core::Result`, so the macro's `Into::into` bridge is the identity here (sc-7970).
+// `load` already returns `gen_core::Result`, so the macro's `Into::into` bridge is the identity.
 mlx_gen::register_captioner! { pub(crate) const REGISTRATION = descriptor => load }
 
 #[cfg(test)]

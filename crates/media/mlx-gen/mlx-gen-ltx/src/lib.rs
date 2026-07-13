@@ -10,8 +10,7 @@
 //! (sc-2686) + **LoRA in generate** (sc-2687 — forward-time residuals + per-pass strength over the
 //! full video+audio+cross-modal surface; see [`adapters`]). LoKr (sc-2393) is a sibling story.
 //!
-//! This crate self-registers `ltx_2_3` into the `mlx-gen` model registry; load it with
-//! `mlx_gen::load("ltx_2_3", spec)`.
+//! This crate publishes `ltx_2_3` through its explicit provider registry.
 //!
 //! ## Status (S0–S6 complete)
 //! The full text-to-video path is wired and pixel-parity vs the reference `generate_av.py`: Gemma-3

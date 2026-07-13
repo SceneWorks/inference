@@ -72,7 +72,7 @@ core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 # two-Array-builds class. Bump in lockstep with core-llm + the worker.
 mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }
 thiserror = "2"
-# Link-time model registration (the DI-container stand-in; see docs/MODEL_ARCHITECTURE.md §4).
+# Retained for the independent core-llm link-time provider registry.
 inventory = "0.3"
 # HF tokenizers (same Rust core `transformers` wraps) — loads tokenizer.json directly.
 # onig only (no progressbar/http): byte-level BPE for Qwen/CLIP/T5 needs just the regex.
@@ -109,7 +109,6 @@ mlx-rs = { workspace = true }
 mlx-sys = { workspace = true }
 sceneworks-gen-core = { workspace = true }
 thiserror = { workspace = true }
-inventory = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # The hoisted turnkey converter glue (quant::write_quantized_config, F-045) writes the packed
 # snapshot's config.json `"quantization"` marker; the per-crate converters already used serde_json,

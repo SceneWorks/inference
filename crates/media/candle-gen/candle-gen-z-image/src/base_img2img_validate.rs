@@ -1,6 +1,6 @@
 //! Base (non-Turbo) `z_image` **img2img / `Reference`** real-weight GPU validation (sc-8646) — an
 //! env-driven, `#[ignore]`d integration test that drives the REGISTERED candle base generator
-//! (`gen_core::registry::load("z_image", …)`) through a [`Conditioning::Reference`] against the deployed
+//! (provider id `"z_image"`) through a [`Conditioning::Reference`] against the deployed
 //! hardware (a `Tongyi-MAI/Z-Image` base snapshot + a source image). The base sibling of the Turbo
 //! [`crate::edit_validate`] harness — except this exercises the img2img path the base descriptor now
 //! advertises (real CFG + shift-6.0), all the way through the gen-core `Generator` contract.

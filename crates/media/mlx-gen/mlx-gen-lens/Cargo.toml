@@ -20,8 +20,6 @@ mlx-gen-pid = { path = "../mlx-gen-pid" }
 mlx-rs = { workspace = true }
 # config.json parsing (matches the sdxl/wan/ltx/flux2 provider convention: serde_json::Value, no derive).
 serde_json = { workspace = true }
-# Link-time generator registration (`inventory::submit!` collected by mlx_gen's `inventory::collect!`).
-inventory = { workspace = true }
 # Decode training-dataset images (LoRA/LoKr training, sc-5148) — the trainer center-crops + hands the
 # Image to the Flux.2 VAE preprocess. PNG + JPEG cover the SceneWorks dataset formats (mirrors z-image).
 image = { workspace = true }

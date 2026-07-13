@@ -371,8 +371,8 @@ fn image_to_chw01(img: &Image) -> Result<Array> {
     divide(&chw, Array::from_f32(255.0)).map_err(Error::from)
 }
 
-// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The 8-step
+// The registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The 8-step
 // distilled variant (sc-3192) registers under `descriptor_fast`. `impl Generator` stays
 // hand-written because `validate` attributes rejections to the per-variant descriptor id (F-143).
 mlx_gen::register_generators! {
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn registered_in_registry() {
-        // The `inventory::submit!`s are linked into the test binary, so the registry finds both ids.
+        // The explicit family catalog contains both ids.
         let ids: Vec<&str> = crate::provider_registry()
             .unwrap()
             .generators()

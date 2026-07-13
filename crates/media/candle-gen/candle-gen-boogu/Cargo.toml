@@ -18,7 +18,6 @@ candle-gen-pid = { path = "../candle-gen-pid" }
 # byte-identical to the VAE Z-Image ships, so reuse `candle-transformers`' `z_image::vae` verbatim
 # exactly as `mlx-gen-boogu` reuses `mlx-gen-z-image`'s `Vae`.
 candle-transformers = { workspace = true }
-inventory = { workspace = true }
 # Qwen3-VL `tokenizer.json` loading is via gen-core's `TextTokenizer` (re-exported through
 # `candle_gen::gen_core`); the Boogu chat templates are rendered here, like the mlx provider.
 # Deterministic CPU-seeded initial noise (sc-3673 parity, shared with z-image/ideogram).

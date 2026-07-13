@@ -1,27 +1,4 @@
-/// Internal: expand each `$desc => $load` arm into an `inventory::submit!` of the given
-/// registration struct `$reg`, bridging the loader's `Result` into `gen_core::Result` via
-/// `Into::into` (identity when the loader already returns `gen_core::Result`).
-///
-/// The public `register_*!` macros below are thin wrappers that fix `$reg` to a specific
-/// `*Registration` struct. Sharing one rule keeps the link-time wiring identical across every
-/// registration kind (generators, trainers, captioners, image/text embedders) and mirrors what
-/// candle-gen needs — the sc-7779 cross-backend note anticipated folding all kinds onto one rule.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __register_kind {
-    ( $reg:path, $( $desc:path => $load:path ),+ $(,)? ) => {
-        $(
-            $crate::inventory::submit! {
-                $reg {
-                    descriptor: $desc,
-                    load: |spec| $load(spec).map_err(::core::convert::Into::into),
-                }
-            }
-        )+
-    };
-}
-
-/// Register one or more generator descriptors and loaders with the link-time registry.
+/// Define a generator registration constant for an explicit provider catalog.
 #[macro_export]
 macro_rules! register_generators {
     ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
@@ -30,14 +7,10 @@ macro_rules! register_generators {
                 descriptor: $desc,
                 load: |spec| $load(spec).map_err(::core::convert::Into::into),
             };
-        $crate::inventory::submit! { $name }
-    };
-    ( $( $desc:path => $load:path ),+ $(,)? ) => {
-        $crate::__register_kind! { $crate::registry::ModelRegistration, $( $desc => $load ),+ }
     };
 }
 
-/// Register one or more trainer descriptors and loaders with the link-time registry.
+/// Define a trainer registration constant for an explicit provider catalog.
 #[macro_export]
 macro_rules! register_trainer {
     ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
@@ -46,14 +19,10 @@ macro_rules! register_trainer {
                 descriptor: $desc,
                 load: |spec| $load(spec).map_err(::core::convert::Into::into),
             };
-        $crate::inventory::submit! { $name }
-    };
-    ( $( $desc:path => $load:path ),+ $(,)? ) => {
-        $crate::__register_kind! { $crate::registry::TrainerRegistration, $( $desc => $load ),+ }
     };
 }
 
-/// Register one or more captioner descriptors and loaders with the link-time registry.
+/// Define a captioner registration constant for an explicit provider catalog.
 #[macro_export]
 macro_rules! register_captioner {
     ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
@@ -62,14 +31,10 @@ macro_rules! register_captioner {
                 descriptor: $desc,
                 load: |spec| $load(spec).map_err(::core::convert::Into::into),
             };
-        $crate::inventory::submit! { $name }
-    };
-    ( $( $desc:path => $load:path ),+ $(,)? ) => {
-        $crate::__register_kind! { $crate::registry::CaptionerRegistration, $( $desc => $load ),+ }
     };
 }
 
-/// Register one or more image-embedder descriptors and loaders with the link-time registry.
+/// Define an image-embedder registration constant for an explicit provider catalog.
 #[macro_export]
 macro_rules! register_image_embedder {
     ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
@@ -78,16 +43,10 @@ macro_rules! register_image_embedder {
                 descriptor: $desc,
                 load: |spec| $load(spec).map_err(::core::convert::Into::into),
             };
-        $crate::inventory::submit! { $name }
-    };
-    ( $( $desc:path => $load:path ),+ $(,)? ) => {
-        $crate::__register_kind! {
-            $crate::registry::ImageEmbedderRegistration, $( $desc => $load ),+
-        }
     };
 }
 
-/// Register one or more text-embedder descriptors and loaders with the link-time registry.
+/// Define a text-embedder registration constant for an explicit provider catalog.
 #[macro_export]
 macro_rules! register_text_embedder {
     ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
@@ -96,12 +55,6 @@ macro_rules! register_text_embedder {
                 descriptor: $desc,
                 load: |spec| $load(spec).map_err(::core::convert::Into::into),
             };
-        $crate::inventory::submit! { $name }
-    };
-    ( $( $desc:path => $load:path ),+ $(,)? ) => {
-        $crate::__register_kind! {
-            $crate::registry::TextEmbedderRegistration, $( $desc => $load ),+
-        }
     };
 }
 

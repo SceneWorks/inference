@@ -13,7 +13,6 @@ categories = ["science"]
 # build (single resolution; see scripts/check-gen-core-skew.sh).
 candle-gen = { path = "../candle-gen" }
 # Link-time self-registration into gen-core's model registry (the `register_generators!` below).
-inventory = { workspace = true }
 # SD3.5 building blocks reused from candle-transformers: the dual CLIP text encoders (CLIP-L +
 # OpenCLIP bigG via `stable_diffusion::clip`), the T5-XXL encoder (`t5::T5EncoderModel`), and the
 # 16-channel AutoencoderKL VAE (`z_image::vae`, parameterized scale/shift). Backend features pass

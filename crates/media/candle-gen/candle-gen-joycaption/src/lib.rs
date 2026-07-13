@@ -317,9 +317,6 @@ fn map_finish(f: core_llm::FinishReason) -> CaptionFinishReason {
 
 candle_gen::register_captioner! { pub(crate) const REGISTRATION = descriptor => load }
 
-/// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
-pub fn force_link() {}
-
 /// Add the Candle JoyCaption provider to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,

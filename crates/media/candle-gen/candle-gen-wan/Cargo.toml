@@ -10,7 +10,6 @@ categories = ["science"]
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }
-inventory = { workspace = true }
 # Wan has NO candle-transformers reference: the WanTransformer3DModel DiT, the causal-Conv3d
 # AutoencoderKLWan temporal VAE, the UMT5-XXL text encoder, and the UniPC flow-match scheduler are
 # all written here on candle-core/candle-nn (candle ships no conv3d — see `conv3d`).

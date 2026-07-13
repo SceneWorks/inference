@@ -325,9 +325,6 @@ candle_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = descriptor_edit => load_edit
 }
 
-/// Force-link hook (keeps the `inventory::submit!` registrations from being dead-stripped).
-pub fn force_link() {}
-
 /// Add all Candle Boogu providers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,

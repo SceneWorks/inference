@@ -2,7 +2,7 @@
 //!
 //! The **backend-neutral contract layer** for SceneWorks generative inference. gen-core has
 //! **zero tensor dependencies**: it owns the `Generator` / `Trainer` / `Captioner` / `Transform`
-//! contracts, the request/output/conditioning/progress/cancel/error types, the link-time model
+//! contracts, the request/output/conditioning/progress/cancel/error types, the explicit provider
 //! registry, and the pure host-side policy math (tokenization, PIL-compatible resize, tiling,
 //! LR schedule). The tensor backends — `mlx-gen` (Apple MLX) and the forthcoming `candle-gen`
 //! (Windows/CUDA) — implement these contracts and re-export this crate at their own paths.
@@ -46,12 +46,11 @@ pub use generator::{
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
 pub use media::{AudioTrack, Image};
+pub use registry::TrainerRegistration;
 pub use registry::{
-    load, load_captioner, load_image_embedder, load_text_embedder, load_transform,
     CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, ProviderRegistry,
     ProviderRegistryBuilder, TextEmbedderRegistration, TransformRegistration,
 };
-pub use registry::{load_trainer, TrainerRegistration};
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec, MoeExpert,
     OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
@@ -71,8 +70,6 @@ pub use tiling::{TilingConfig, VaeTiling};
 // sc-7692). All text-LLM serving — including model-first resolution via `core_llm::load_for_model` —
 // goes through this path.
 pub use ::core_llm;
-#[doc(hidden)]
-pub use inventory;
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
 pub use train::{

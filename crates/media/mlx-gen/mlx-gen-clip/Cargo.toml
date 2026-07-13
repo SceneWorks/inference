@@ -14,4 +14,3 @@ mlx-gen = { path = ".." }
 # no dependency cycle). The visual_projection head is local (it's the only piece that differs).
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
 mlx-rs = { workspace = true }
-inventory = { workspace = true }

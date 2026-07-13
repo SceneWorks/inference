@@ -10,7 +10,7 @@
 //! Phase-5 keypoint-extract surface (epic 5482) — depend on the `gen_core` trait, not this crate's
 //! concrete types, so the worker stays backend-neutral. macOS keeps the MLX implementation.
 //!
-//! Unlike the Generator providers this crate is **not** an `inventory`-registered model: a face
+//! Unlike the Generator providers this crate is not part of a provider catalog: a face
 //! embedder is a composed utility, so consumers construct it directly via [`load`] / [`load_on`].
 
 pub mod align;

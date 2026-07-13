@@ -48,7 +48,7 @@ pub(crate) const SCHEDULE_SHIFT: f32 = 6.0;
 pub(crate) const DEFAULT_GUIDANCE: f32 = 4.0;
 
 /// Registry id for the **base** Z-Image (non-Turbo). Coexists with `z_image_turbo` +
-/// `z_image_turbo_control` — distinct id, separate `inventory` registration, no clash.
+/// `z_image_turbo_control` — distinct id and registration, no clash.
 pub const MODEL_ID: &str = "z_image";
 
 /// PiD backbone tag for the base Z-Image (epic 7840). Identical VAE latent space to Turbo (Flux1-dev's
@@ -281,9 +281,8 @@ impl ZImage {
     }
 }
 
-// Link-time registration (epic 3720): emits `inventory::submit!` and bridges the rich `Result` into
-// the registry's backend-neutral `gen_core::Result`. A distinct id (`z_image`) → no clash with the
-// turbo / control submissions in the same crate.
+// The registration constant bridges the rich `Result` into backend-neutral `gen_core::Result`. A
+// distinct id (`z_image`) avoids clashes with the turbo and control registrations in this crate.
 mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 #[cfg(test)]

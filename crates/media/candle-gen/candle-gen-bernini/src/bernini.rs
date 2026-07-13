@@ -1,4 +1,4 @@
-//! sc-10995 (capstone): the **full Bernini** Generator (`gen_core::load("bernini")`) — the registered
+//! sc-10995 (capstone): the **full Bernini** Generator (provider id `"bernini"`) — the registered
 //! pipeline that strings the whole planner → renderer stack together, the candle sibling of
 //! `mlx-gen-bernini/src/bernini.rs` (sc-5145). Mirrors `BerniniPipeline.__call__`:
 //!
@@ -687,13 +687,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
-// Link-time self-registration into candle-gen's model registry (epic 3720).
 candle_gen::register_generators! {
     pub(crate) const FULL_REGISTRATION = descriptor => load
 }
-
-/// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
-pub fn force_link() {}
 
 impl Generator for Bernini {
     fn descriptor(&self) -> &ModelDescriptor {
@@ -1308,7 +1304,6 @@ mod tests {
     /// a missing dir; the descriptor identity is what we pin).
     #[test]
     fn registers_and_resolves() {
-        force_link();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
             .unwrap()
@@ -1456,7 +1451,6 @@ mod tests {
     /// off-grid size / over-area / bad frame count) and rejects a conditioning-mode name with no source.
     #[test]
     fn validate_geometry_and_mode_conditioning() {
-        force_link();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
             .unwrap()

@@ -83,7 +83,7 @@ fn is_wan_curated(name: Option<&str>) -> bool {
     matches!(name, Some(n) if WAN_CURATED_SAMPLERS.contains(&n))
 }
 
-/// Public registry id: `mlx_gen::load("wan2_2_ti2v_5b", spec)`.
+/// Public provider id: `"wan2_2_ti2v_5b"`.
 pub const MODEL_ID: &str = "wan2_2_ti2v_5b";
 
 /// Stable identity + advertised capabilities for the Wan2.2 TI2V-5B (dense text+image→video).
@@ -565,8 +565,8 @@ impl Wan {
     }
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const TI2V_REGISTRATION = descriptor => load
 }
@@ -575,7 +575,7 @@ mlx_gen::register_generators! {
 // Wan2.2 T2V-A14B — dual-expert MoE text→video (the S1–S5 core, fully wired)
 // ===========================================================================================
 
-/// Public registry id for the dual-expert MoE T2V model: `mlx_gen::load("wan2_2_t2v_14b", spec)`.
+/// Public provider id for the dual-expert MoE T2V model: `"wan2_2_t2v_14b"`.
 pub const MODEL_ID_T2V_14B: &str = "wan2_2_t2v_14b";
 
 /// Stable identity + advertised capabilities for the Wan2.2 T2V-A14B (dual-expert MoE text→video).
@@ -1028,7 +1028,7 @@ mlx_gen::register_generators! {
 // Wan2.2 I2V-A14B — dual-expert MoE image→video (channel-concat conditioning, in_dim 36)
 // ===========================================================================================
 
-/// Public registry id for the channel-concat I2V model: `mlx_gen::load("wan2_2_i2v_14b", spec)`.
+/// Public provider id for the channel-concat I2V model: `"wan2_2_i2v_14b"`.
 pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
 
 /// Estimated resident transformer bytes for the sc-4986 [`preflight_denoise_memory_guard`]: the

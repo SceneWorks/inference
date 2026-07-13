@@ -2,9 +2,7 @@
 //!
 //! The **Chroma** provider crate for [`candle-gen`](candle_gen) — the candle (Windows/CUDA) sibling
 //! of `mlx-gen-chroma`. It implements the backend-neutral [`gen_core::Generator`] contract and
-//! self-registers via `inventory` for all three Chroma variants, so linking this crate makes
-//! `gen_core::load("chroma1_hd" | "chroma1_base" | "chroma1_flash", …)` resolve the candle Chroma
-//! generators.
+//! explicitly registers all three Chroma variants in its family catalog.
 //!
 //! **txt2img (sc-5484):** Chroma is a FLUX.1-schnell-derived DiT — the MMDiT skeleton with a
 //! distilled-guidance **Approximator** replacing FLUX's modulation stack, **T5-XXL-only**
@@ -191,12 +189,6 @@ candle_gen::register_generators! {
 candle_gen::register_generators! {
     pub(crate) const FLASH_REGISTRATION = descriptor_flash => load_flash
 }
-
-/// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
-/// references nothing in this crate directly, so the linker (MSVC on a release build in particular)
-/// can discard the whole rlib — taking the `inventory::submit!` registrations with it. Referencing
-/// this no-op from the consumer keeps the crate linked. (Same pattern as `candle_gen_flux::force_link`.)
-pub fn force_link() {}
 
 /// Add all Candle Chroma providers to an explicit media registry builder.
 pub fn register_providers(

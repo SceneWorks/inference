@@ -25,7 +25,7 @@
 //! ## Status / scope
 //! **sc-10994 (renderer):** the **caption→pixel renderer** (t2v / t2v_apg), Q4/Q8 packed streaming load
 //! of the two experts, and the candle turnkey tier [`convert`]er are implemented; `bernini_renderer`
-//! self-registers.
+//! is included in the explicit family catalog.
 //!
 //! **sc-10995 (planner slice):** the framework-independent planner seams are ported + CPU-golden
 //! parity-tested against the same fixtures the MLX lane asserts (`tests/*_parity.rs`): the Qwen2.5-VL
@@ -80,7 +80,7 @@ pub use mar::{
     feat_to_renderer, four_streams, mar_schedule, post_process_input_embeds, sample_vit_embed,
     FourStreams, RendererFeat, SampledStreams, StreamState, VitCfg,
 };
-pub use pipeline::{descriptor, force_link, load, MODEL_ID};
+pub use pipeline::{descriptor, load, MODEL_ID};
 pub use preprocess::{encode_image, encode_videoclip};
 pub use process::{
     build_attention_mask_4d, generate_unified_inputs, mrope_position_ids, MRopeConfig,

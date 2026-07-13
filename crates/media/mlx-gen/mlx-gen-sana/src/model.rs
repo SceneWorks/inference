@@ -1,11 +1,10 @@
 //! `Sana` — the [`mlx_gen::Generator`] implementation for SANA-1.6B 1024px, plus its
-//! [`descriptor`]/[`load`] entry points and the `inventory` registration that wires it into
-//! `mlx_gen`'s registry under the id `"sana_1600m"` (epic 8485, story sc-8489 **Phase B**).
+//! [`descriptor`]/[`load`] entry points and explicit registration under the id `"sana_1600m"`
+//! (epic 8485, story sc-8489 **Phase B**).
 //!
 //! Phase A (sc-8486..8489 on mlx-gen) built the three native components and the composed
 //! [`crate::pipeline::SanaPipeline`]; this module is the thin gen-core `Generator` adapter the
-//! SceneWorks worker links and drives end-to-end. Linking this crate is all the worker needs to
-//! resolve the model by id (the `inventory::submit!` below registers `descriptor`/[`load`]).
+//! SceneWorks worker drives end-to-end through the explicit MLX platform catalog.
 //!
 //! ## Snapshot layout
 //!
@@ -378,8 +377,8 @@ impl Sana {
     }
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor => load
 }
@@ -561,9 +560,7 @@ mod tests {
 
     #[test]
     fn registry_resolves_sana_descriptor() {
-        // The `register_generators!` submission must surface in the gen-core registry so
-        // `gen_core::load("sana_1600m")` resolves on the worker (the dead-strip trap that bit Kolors
-        // — covered here by asserting the descriptor is present in the linked registry).
+        // The registration constants must surface in the family catalog.
         let found = crate::provider_registry()
             .unwrap()
             .generators()

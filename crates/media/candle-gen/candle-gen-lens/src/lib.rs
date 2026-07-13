@@ -790,9 +790,6 @@ candle_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
 }
 
-/// Force-link hook (keeps the `inventory::submit!` registrations from being dead-stripped).
-pub fn force_link() {}
-
 /// Add all Candle Lens generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
@@ -909,9 +906,8 @@ mod integration_tests {
 
     #[test]
     fn both_ids_resolve_in_registry() {
-        // The two `inventory::submit!`s link into this test binary, so the registry resolves both
-        // ids. Loading is **lazy** (weights are read on first `generate`), so construction succeeds
-        // even with a bogus dir — proving registration without needing the ~50 GB snapshot.
+        // The family catalog resolves both ids. Loading is **lazy** (weights are read on first
+        // `generate`), so construction succeeds even with a bogus directory.
         for id in [MODEL_ID_TURBO, MODEL_ID_BASE] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
             assert!(

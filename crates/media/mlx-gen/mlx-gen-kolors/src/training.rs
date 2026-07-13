@@ -228,8 +228,8 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }))
 }
 
-// Link-time trainer registration (epic 3720): the macro emits the `inventory::submit!` and bridges
-// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`.
+// The trainer registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_trainer! {
     pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
 }

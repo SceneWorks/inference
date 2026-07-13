@@ -15,8 +15,6 @@ candle-gen = { path = "../candle-gen" }
 # NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853): SDXL's own `sdxl` latent-space
 # student (4× SR). Wired behind `req.use_pid` (default off → the byte-exact native SDXL VAE decode).
 candle-gen-pid = { path = "../candle-gen-pid" }
-# Link-time self-registration into gen-core's model registry (the `inventory::submit!` below).
-inventory = { workspace = true }
 # SDXL pipeline building blocks (dual CLIP / UNet / VAE / schedulers). Backend features are passed
 # through from this crate's features below so it shares candle-gen's exact candle build.
 candle-transformers = { workspace = true }

@@ -1,6 +1,5 @@
 //! `QwenImage` — the Qwen-Image T2I implementation of [`mlx_gen::Generator`], plus its
-//! [`descriptor`]/[`load`] entry points and the `inventory` registration that wires it into
-//! `mlx_gen`'s registry.
+//! [`descriptor`]/[`load`] entry points and explicit registration constant.
 //!
 //! [`load`] assembles the model from a `Qwen/Qwen-Image` snapshot directory (see [`crate::loader`])
 //! — tokenizer, Qwen2.5-VL text encoder, 60-layer MMDiT, causal-Conv3d VAE — and
@@ -492,8 +491,8 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
-// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+// The registration constant bridges the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }

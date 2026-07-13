@@ -16,7 +16,6 @@ candle-gen = { path = "../candle-gen" }
 # shifts, Wan-I2V image cross-attn, the open-CLIP ViT-H/14 visual encoder, 28-ch masks) layer on top.
 # This is the first vertical candle-gen → candle-gen-wan dependency (mirrors mlx-gen-scail2 → mlx-gen-wan).
 candle-gen-wan = { path = "../candle-gen-wan" }
-inventory = { workspace = true }
 # UMT5 tokenizer.json (reused via candle-gen-wan's text path).
 tokenizers = { workspace = true }
 # Deterministic CPU-seeded per-segment initial noise (sc-3673 parity).

@@ -1,9 +1,8 @@
 //! # mlx-gen-qwen-image
 //!
 //! The **Qwen-Image** (+ Qwen-Image-Edit) provider crate for [`mlx-gen`](mlx_gen). Depends only on
-//! the `mlx-gen` core (nn primitives, adapters, weights, quant, the `Generator` contract, the
-//! registry) and — once the model lands — self-registers via `inventory` so that
-//! `mlx_gen::load("qwen_image", …)` resolves. See `docs/MODEL_ARCHITECTURE.md`.
+//! the `mlx-gen` core (nn primitives, adapters, weights, quant, the `Generator` contract, and the
+//! explicit registry). See `docs/MODEL_ARCHITECTURE.md`.
 //!
 //! Ported from the frozen Python mflux fork (`~/repos/mflux/src/mflux/models/qwen/`) and
 //! parity-proven against it on real bf16 weights. Shipped: **Qwen-Image T2I** (`qwen_image`,

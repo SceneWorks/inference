@@ -113,7 +113,7 @@ impl Default for SchedulerConfig {
     }
 }
 
-/// Public registry id: `candle_gen::load("svd_xt", spec)`.
+/// Public provider id: `"svd_xt"`.
 pub const MODEL_ID: &str = "svd_xt";
 
 /// SVD-XT default denoise steps / frame count — the canonical defaults [`crate::pipeline::SvdParams`]

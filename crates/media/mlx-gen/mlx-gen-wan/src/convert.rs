@@ -495,7 +495,7 @@ pub fn convert_t2v_14b(
 ///   - `base_wan_snapshot/{t5_encoder.safetensors, vae.safetensors, tokenizer.json}` (a
 ///     [`convert_i2v_14b`]/[`convert_t2v_14b`] output) → `<out_dir>/`,
 ///
-/// producing the dir layout `mlx_gen::load("wan_vace", WeightsSource::Dir(..))` expects
+/// producing the directory layout the `"wan_vace"` provider expects
 /// (`WanVaceConfig::from_model_dir` reads `transformer/config.json`; `model_vace` reads the three
 /// shared files from the dir root).
 ///
@@ -565,7 +565,7 @@ pub fn assemble_wan_vace_snapshot(
 ///   - `low_transformer_dir` (the diffusers repo's `transformer_2/`) → `<out_dir>/transformer_2/`, and
 ///   - `base_wan_snapshot/{t5_encoder.safetensors, vae.safetensors, tokenizer.json}` → `<out_dir>/`,
 ///
-/// producing the dir `mlx_gen::load("wan2_2_vace_fun_14b", WeightsSource::Dir(..))` expects
+/// producing the directory layout the `"wan2_2_vace_fun_14b"` provider expects
 /// ([`crate::config::WanVaceConfig::vace_fun_from_model_dir`] reads `transformer/config.json` +
 /// `model_index.json`; [`crate::model_vace`]'s `WanVaceFun` loads the two transformer dirs + the three
 /// shared files from the root). `link`/replace semantics match [`assemble_wan_vace_snapshot`].

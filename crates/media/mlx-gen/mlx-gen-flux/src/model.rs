@@ -565,8 +565,8 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
     Ok(())
 }
 
-// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl Generator`
+// The registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. The `impl Generator`
 // above stays hand-written because `generate` is bespoke (IP-adapter / true-CFG branching), not the
 // plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! {

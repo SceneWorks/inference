@@ -2,7 +2,7 @@
 name = "candle-gen-sam3"
 version = "0.0.0"
 edition = "2021"
-description = "Native-candle SAM3 (Segment Anything 3) concept segmenter for candle-gen — the Windows/CUDA sibling of mlx-gen-sam3 (epic 5482, sc-5062). The off-Mac person-track PCS path: a plain utility segmenter (like candle-gen-face), NOT an inventory-registered generator."
+description = "Native-candle SAM3 (Segment Anything 3) concept segmenter for candle-gen — the Windows/CUDA sibling of mlx-gen-sam3 (epic 5482, sc-5062). The off-Mac person-track PCS path: a plain utility segmenter (like candle-gen-face), not a cataloged generator."
 license = "Apache-2.0"
 repository = "https://github.com/michaeltrefry/candle-gen"
 keywords = ["candle", "cuda", "sam3", "segmentation"]

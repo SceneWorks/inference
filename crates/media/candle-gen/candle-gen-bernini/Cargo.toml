@@ -17,7 +17,6 @@ candle-gen = { path = "../candle-gen" }
 # (dual-expert switch boundary + APG guidance + the Bernini knobs) layer on top.
 candle-gen-wan = { path = "../candle-gen-wan" }
 # Link-time self-registration into candle-gen's model registry.
-inventory = { workspace = true }
 # bernini_renderer.json knob sidecar reading + the converter's config emit.
 serde_json = { workspace = true }
 # The candle turnkey tier converter reads the ByteDance/Bernini-Diffusers combined `bernini/` index.

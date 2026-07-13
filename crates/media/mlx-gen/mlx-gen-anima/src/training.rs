@@ -375,7 +375,7 @@ fn load_variant_trainer(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Tra
     }))
 }
 
-// Link-time trainer registration (epic 3720) for all three variants, mirroring the generator side.
+// Explicit trainer registration constants for all three variants.
 mlx_gen::register_trainer! {
     pub(crate) const BASE_TRAINER_REGISTRATION = trainer_descriptor_base => load_trainer_base
 }

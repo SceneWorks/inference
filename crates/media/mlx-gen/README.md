@@ -36,14 +36,11 @@ mlx-gen-z-image = { git = "https://github.com/michaeltrefry/mlx-gen" }
 ```rust
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
 
-// A provider crate registers itself only when it is actually linked. Reference it once
-// so the linker keeps its `inventory::submit!` registration.
-use mlx_gen_z_image as _;
-
-fn main() -> mlx_gen::Result<()> {
+fn main() -> mlx_gen::gen_core::Result<()> {
     // Load a model by id from a Hugging Face snapshot directory.
     let spec = LoadSpec::new(WeightsSource::Dir("/path/to/Z-Image-Turbo".into()));
-    let model = mlx_gen::load("z_image_turbo", &spec)?;
+    let registry = mlx_gen_z_image::provider_registry()?;
+    let model = registry.load("z_image_turbo", &spec)?;
 
     let req = GenerationRequest {
         prompt: "a red fox in a snowy forest".into(),
@@ -69,10 +66,10 @@ fn main() -> mlx_gen::Result<()> {
 }
 ```
 
-Discover what is registered at runtime with `mlx_gen::registry::generators()` (SeedVR2 is
-registered here as a `Generator`). The same link-time pattern backs the other entry points:
-`load_trainer` (LoRA/LoKr fine-tuning) and `load_captioner` (JoyCaption). The SAM2 / SAM3
-segmenters are plain utility APIs used directly, not through the registry. (Prompt-refine —
+Inspect a family registry with `registry.generators()`, `registry.trainers()`, and
+`registry.captioners()`, or use `mlx-gen-catalog` for the complete shipped MLX platform surface.
+The SAM2 / SAM3 segmenters are plain utility APIs used directly, not through the registry.
+(Prompt-refine —
 Llama-3.2-3B-Instruct rewriting — is served through the `core-llm` LLM contract and lives in the
 worker / candle-gen; mlx-gen's own `mlx-gen-prompt-refine` crate was retired by the mlx-llm
 engine in sc-7158, and the `load_textllm` registry entry point was removed in sc-7189.)

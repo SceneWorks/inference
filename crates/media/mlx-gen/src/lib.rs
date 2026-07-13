@@ -89,10 +89,9 @@ pub use generator::{
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{
-    load, load_captioner, load_transform, CaptionerRegistration, ModelRegistration,
-    TransformRegistration,
+    CaptionerRegistration, ModelRegistration, ProviderRegistry, ProviderRegistryBuilder,
+    TrainerRegistration, TransformRegistration,
 };
-pub use registry::{load_trainer, TrainerRegistration};
 pub use residency::Residency;
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec, MoeExpert,

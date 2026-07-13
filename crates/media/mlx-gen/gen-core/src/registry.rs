@@ -1,10 +1,6 @@
-//! Model + transform discovery — the link-time registry, i.e. the Rust stand-in for a DI
-//! container's resolve-by-id. See `docs/MODEL_ARCHITECTURE.md` §4.
-//!
-//! A provider crate self-registers just by being linked (`inventory::submit!`); `mlx-gen` has
-//! no central match statement to edit, so adding a model is purely additive. A consumer that
-//! links one provider sees exactly one registration. Mirrors the worker's `payload.model` →
-//! `MODEL_TARGETS` → load.
+//! Explicit model + transform discovery: provider crates publish registration constants, family
+//! crates add them to a [`ProviderRegistryBuilder`], and platform catalogs select the families they
+//! ship. This is the Rust equivalent of an ordinary DI composition root with resolve-by-id.
 
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
@@ -23,16 +19,12 @@ pub struct ModelRegistration {
     pub load: fn(&LoadSpec) -> Result<Box<dyn Generator>>,
 }
 
-inventory::collect!(ModelRegistration);
-
 /// A transform provider's registration (parallel to [`ModelRegistration`]).
 #[derive(Clone, Copy)]
 pub struct TransformRegistration {
     pub descriptor: fn() -> TransformDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn Transform>>,
 }
-
-inventory::collect!(TransformRegistration);
 
 /// A trainer provider's registration (parallel to [`ModelRegistration`]) — `descriptor` for
 /// introspection, `load` to construct the trainer with its (frozen) base model from a [`LoadSpec`].
@@ -42,8 +34,6 @@ pub struct TrainerRegistration {
     pub load: fn(&LoadSpec) -> Result<Box<dyn Trainer>>,
 }
 
-inventory::collect!(TrainerRegistration);
-
 /// A captioner provider's registration (parallel to [`ModelRegistration`]).
 #[derive(Clone, Copy)]
 pub struct CaptionerRegistration {
@@ -51,18 +41,12 @@ pub struct CaptionerRegistration {
     pub load: fn(&LoadSpec) -> Result<Box<dyn Captioner>>,
 }
 
-inventory::collect!(CaptionerRegistration);
-
-/// An image-embedder provider's registration (parallel to [`ModelRegistration`]). Unlike
-/// `FaceEmbedder` — a directly-constructed utility — image embedders self-register so the worker's
-/// `dataset_analysis` job can `load_image_embedder(id, spec)` by id, exactly like captioners.
+/// An image-embedder provider's registration (parallel to [`ModelRegistration`]).
 #[derive(Clone, Copy)]
 pub struct ImageEmbedderRegistration {
     pub descriptor: fn() -> ImageEmbedderDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn ImageEmbedder>>,
 }
-
-inventory::collect!(ImageEmbedderRegistration);
 
 /// A text-embedder provider's registration (parallel to [`ImageEmbedderRegistration`]). Used by the
 /// worker's `dataset_analysis` job for caption/image alignment in CLIP's joint space.
@@ -72,13 +56,9 @@ pub struct TextEmbedderRegistration {
     pub load: fn(&LoadSpec) -> Result<Box<dyn TextEmbedder>>,
 }
 
-inventory::collect!(TextEmbedderRegistration);
-
 /// Builder for an ordinary, explicit generative-media provider registry.
 ///
-/// Platform bundles add exactly the registrations they ship. The inventory-backed global
-/// functions below remain available during cutover, and [`from_inventory`](Self::from_inventory)
-/// provides a parity bridge without making link-time discovery the long-term source of truth.
+/// Platform bundles add exactly the registrations they ship.
 #[derive(Default)]
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
@@ -118,18 +98,6 @@ impl ProviderRegistryBuilder {
         text_embedders,
         TextEmbedderRegistration
     );
-
-    /// Copy every currently linked inventory registration into an explicit registry.
-    pub fn from_inventory() -> Self {
-        Self {
-            generators: generators().copied().collect(),
-            transforms: transforms().copied().collect(),
-            trainers: trainers().copied().collect(),
-            captioners: captioners().copied().collect(),
-            image_embedders: image_embedders().copied().collect(),
-            text_embedders: text_embedders().copied().collect(),
-        }
-    }
 
     /// Validate per-kind id uniqueness and produce the immutable registry.
     pub fn build(self) -> Result<ProviderRegistry> {
@@ -262,98 +230,6 @@ impl ProviderRegistry {
     }
 }
 
-/// All registered generators (one per linked provider crate).
-pub fn generators() -> impl Iterator<Item = &'static ModelRegistration> {
-    inventory::iter::<ModelRegistration>.into_iter()
-}
-
-/// All registered transforms.
-pub fn transforms() -> impl Iterator<Item = &'static TransformRegistration> {
-    inventory::iter::<TransformRegistration>.into_iter()
-}
-
-/// All registered trainers (one per linked provider crate that supports training).
-pub fn trainers() -> impl Iterator<Item = &'static TrainerRegistration> {
-    inventory::iter::<TrainerRegistration>.into_iter()
-}
-
-/// All registered captioners (one per linked provider crate that supports image-to-text captioning).
-pub fn captioners() -> impl Iterator<Item = &'static CaptionerRegistration> {
-    inventory::iter::<CaptionerRegistration>.into_iter()
-}
-
-/// All registered image embedders (one per linked provider crate).
-pub fn image_embedders() -> impl Iterator<Item = &'static ImageEmbedderRegistration> {
-    inventory::iter::<ImageEmbedderRegistration>.into_iter()
-}
-
-/// All registered text embedders (one per linked provider crate).
-pub fn text_embedders() -> impl Iterator<Item = &'static TextEmbedderRegistration> {
-    inventory::iter::<TextEmbedderRegistration>.into_iter()
-}
-
-/// Define a first-wins `load_*` resolver over a registration iterator (F-056). The six load fns were
-/// byte-identical modulo the iterator, the returned trait-object type, and the `$kind` label that
-/// appears in both the "no {kind} registered" error and the duplicate-id debug assertion — so they
-/// share one body here. **The generated behavior (first-wins, the debug-build duplicate assertion,
-/// and the EXACT per-kind error text) is unchanged** — the worker/tests match on the error string.
-macro_rules! define_load {
-    (
-        $(#[$meta:meta])*
-        $vis:vis fn $name:ident via $iter:ident as $kind:literal => $trait:ty
-    ) => {
-        $(#[$meta])*
-        $vis fn $name(id: &str, spec: &LoadSpec) -> Result<Box<$trait>> {
-            let mut matches = $iter().filter(|r| (r.descriptor)().id == id);
-            let reg = matches.next().ok_or_else(|| {
-                Error::Msg(format!(
-                    concat!("no ", $kind, " registered for id '{id}'"),
-                    id = id
-                ))
-            })?;
-            debug_assert!(
-                matches.next().is_none(),
-                concat!("duplicate ", $kind, " id '{id}' registered (first-wins shadows the rest)"),
-                id = id
-            );
-            (reg.load)(spec)
-        }
-    };
-}
-
-define_load! {
-    /// Load a generator by model id (e.g. `"z_image_turbo"`).
-    ///
-    /// The link-time registry is **first-wins** on duplicate ids; a debug-build assertion surfaces a
-    /// duplicate registration (a provider-crate mistake) instead of silently shadowing one (sc-6983).
-    pub fn load via generators as "generator" => dyn Generator
-}
-
-define_load! {
-    /// Load a transform by id.
-    pub fn load_transform via transforms as "transform" => dyn Transform
-}
-
-define_load! {
-    /// Load a trainer by model id (e.g. `"z_image_turbo"`) with its (frozen) base model.
-    pub fn load_trainer via trainers as "trainer" => dyn Trainer
-}
-
-define_load! {
-    /// Load a captioner by model id (e.g. `"joy_caption"`).
-    pub fn load_captioner via captioners as "captioner" => dyn Captioner
-}
-
-define_load! {
-    /// Load an image embedder by id (e.g. `"clip_vit_l14"`).
-    pub fn load_image_embedder via image_embedders as "image embedder" => dyn ImageEmbedder
-}
-
-define_load! {
-    /// Load a text embedder by id (e.g. `"clip_vit_l14_text"`).
-    pub fn load_text_embedder via text_embedders as "text embedder" => dyn TextEmbedder
-}
-
 // ---------------------------------------------------------------------------------------------
 // Descriptor-level conformance sweep (sc-9098, F-009)
 // ---------------------------------------------------------------------------------------------
@@ -412,7 +288,7 @@ fn check_name_list(errs: &mut Vec<String>, ctx: &str, list_name: &str, names: &[
 ///   models — an `Image` model cannot consume a clip.
 ///
 /// Returns one message per violation (empty = conformant). Public so a provider's own tests can
-/// target a single descriptor; [`descriptor_conformance_errors`] sweeps every linked registration.
+/// target a single descriptor; [`ProviderRegistry::descriptor_conformance_errors`] sweeps a catalog.
 pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
     let mut errs = Vec::new();
     let ctx = format!("generator '{}'", d.id);
@@ -465,8 +341,7 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
     errs
 }
 
-/// Push duplicate-id errors for one registry kind (the link-time registry is first-wins, so a
-/// duplicate silently shadows a registration — sc-6983's debug assertion, surfaced for every kind).
+/// Push duplicate-id errors for one registry kind.
 fn check_unique_ids(errs: &mut Vec<String>, kind: &str, ids: &[&str]) {
     for (i, id) in ids.iter().enumerate() {
         if ids[..i].contains(id) {
@@ -477,17 +352,15 @@ fn check_unique_ids(errs: &mut Vec<String>, kind: &str, ids: &[&str]) {
     }
 }
 
-/// Weights-free descriptor-level conformance sweep over **every registration linked into the
-/// current binary** (sc-9098, F-009): generators through [`model_descriptor_errors`], plus identity
+/// Weights-free descriptor-level conformance sweep over one explicit provider catalog (sc-9098,
+/// F-009): generators through [`model_descriptor_errors`], plus identity
 /// and capability-bound checks and per-kind id uniqueness for trainers, captioners, transforms and
 /// image/text embedders. No `load` is ever called, so it runs by default (no weights, no Metal) —
-/// each provider crate invokes it from a default test, giving every registered id at least
+/// each provider crate invokes it from a default test, giving every cataloged id at least
 /// descriptor-level coverage; behavioral conformance (progress/cancel/seed) stays weights-gated in
 /// the `gen-core-testkit` suite.
 ///
-/// Returns one message per violation (empty = conformant). The sweep sees exactly the registrations
-/// the calling binary links — the same visibility rule as [`load`] (the sc-4482 dead-strip trap),
-/// so a caller must force-link its providers (`use mlx_gen_<x> as _;`).
+/// Returns one message per violation (empty = conformant).
 fn descriptor_conformance_errors_for(
     generator_registrations: &[ModelRegistration],
     transform_registrations: &[TransformRegistration],
@@ -617,24 +490,6 @@ fn descriptor_conformance_errors_for(
     errs
 }
 
-/// Compatibility conformance sweep over every currently linked inventory registration.
-pub fn descriptor_conformance_errors() -> Vec<String> {
-    let generators: Vec<ModelRegistration> = generators().copied().collect();
-    let transforms: Vec<TransformRegistration> = transforms().copied().collect();
-    let trainers: Vec<TrainerRegistration> = trainers().copied().collect();
-    let captioners: Vec<CaptionerRegistration> = captioners().copied().collect();
-    let image_embedders: Vec<ImageEmbedderRegistration> = image_embedders().copied().collect();
-    let text_embedders: Vec<TextEmbedderRegistration> = text_embedders().copied().collect();
-    descriptor_conformance_errors_for(
-        &generators,
-        &transforms,
-        &trainers,
-        &captioners,
-        &image_embedders,
-        &text_embedders,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,10 +528,9 @@ mod tests {
         }
     }
 
-    /// Small-but-coherent capabilities for the dummy registrations: the descriptor sweep
-    /// ([`descriptor_conformance_errors`]) runs over everything this test binary registers, so the
-    /// dummies must carry real bounds (a `Capabilities::default()` has the F-084 all-zero bounds
-    /// the sweep exists to reject).
+    /// Small-but-coherent capabilities for the dummy registrations: the descriptor sweep runs over
+    /// the explicit fixture catalog, so the dummies must carry real bounds (a
+    /// `Capabilities::default()` has the F-084 all-zero bounds the sweep exists to reject).
     fn dummy_caps() -> Capabilities {
         Capabilities {
             min_size: 64,
@@ -702,7 +556,9 @@ mod tests {
         }))
     }
 
-    crate::register_generators! { dummy_descriptor => dummy_load }
+    crate::register_generators! {
+        const DUMMY_GENERATOR_REGISTRATION = dummy_descriptor => dummy_load
+    }
 
     struct DummyDelegatedGen {
         descriptor: ModelDescriptor,
@@ -739,7 +595,10 @@ mod tests {
         }))
     }
 
-    crate::register_generators! { dummy_delegated_descriptor => dummy_delegated_load }
+    crate::register_generators! {
+        const DUMMY_DELEGATED_GENERATOR_REGISTRATION =
+            dummy_delegated_descriptor => dummy_delegated_load
+    }
 
     struct DummyTrainer {
         desc: TrainerDescriptor,
@@ -784,11 +643,11 @@ mod tests {
         }))
     }
 
-    crate::register_trainer! { dummy_trainer_descriptor => dummy_trainer_load }
+    crate::register_trainer! {
+        const DUMMY_TRAINER_REGISTRATION = dummy_trainer_descriptor => dummy_trainer_load
+    }
 
-    // Multi-arm fixtures: a single `register_generators!` / `register_trainer!` invocation with two
-    // `desc => load` arms exercises the `,+` repetition that single-arm callers never reach. This is
-    // the path the provider migration sweep (sc-7780) leans on for multi-variant crates like boogu.
+    // Multi-provider fixtures verify that independently named constants compose into one catalog.
     fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
         ModelDescriptor {
             id: "dummy_multi_gen_a",
@@ -822,8 +681,12 @@ mod tests {
     }
 
     crate::register_generators! {
-        dummy_multi_gen_a_descriptor => dummy_multi_gen_a_load,
-        dummy_multi_gen_b_descriptor => dummy_multi_gen_b_load,
+        const DUMMY_MULTI_GENERATOR_A_REGISTRATION =
+            dummy_multi_gen_a_descriptor => dummy_multi_gen_a_load
+    }
+    crate::register_generators! {
+        const DUMMY_MULTI_GENERATOR_B_REGISTRATION =
+            dummy_multi_gen_b_descriptor => dummy_multi_gen_b_load
     }
 
     fn dummy_multi_trainer_a_descriptor() -> TrainerDescriptor {
@@ -861,8 +724,12 @@ mod tests {
     }
 
     crate::register_trainer! {
-        dummy_multi_trainer_a_descriptor => dummy_multi_trainer_a_load,
-        dummy_multi_trainer_b_descriptor => dummy_multi_trainer_b_load,
+        const DUMMY_MULTI_TRAINER_A_REGISTRATION =
+            dummy_multi_trainer_a_descriptor => dummy_multi_trainer_a_load
+    }
+    crate::register_trainer! {
+        const DUMMY_MULTI_TRAINER_B_REGISTRATION =
+            dummy_multi_trainer_b_descriptor => dummy_multi_trainer_b_load
     }
 
     struct DummyCaptioner {
@@ -915,18 +782,39 @@ mod tests {
         }))
     }
 
-    crate::register_captioner! { dummy_captioner_descriptor => dummy_captioner_load }
+    crate::register_captioner! {
+        const DUMMY_CAPTIONER_REGISTRATION = dummy_captioner_descriptor => dummy_captioner_load
+    }
+
+    fn dummy_registry() -> ProviderRegistry {
+        ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_generator(DUMMY_DELEGATED_GENERATOR_REGISTRATION)
+            .register_generator(DUMMY_MULTI_GENERATOR_A_REGISTRATION)
+            .register_generator(DUMMY_MULTI_GENERATOR_B_REGISTRATION)
+            .register_trainer(DUMMY_TRAINER_REGISTRATION)
+            .register_trainer(DUMMY_MULTI_TRAINER_A_REGISTRATION)
+            .register_trainer(DUMMY_MULTI_TRAINER_B_REGISTRATION)
+            .register_captioner(DUMMY_CAPTIONER_REGISTRATION)
+            .register_text_embedder(DUMMY_TEXT_EMBEDDER_REGISTRATION)
+            .register_image_embedder(DUMMY_IMAGE_EMBEDDER_REGISTRATION)
+            .build()
+            .unwrap()
+    }
 
     #[test]
     fn registry_resolves_by_id() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = load("dummy_test_model", &spec).expect("dummy is registered");
+        let g = registry
+            .load("dummy_test_model", &spec)
+            .expect("dummy is registered");
         assert_eq!(g.descriptor().id, "dummy_test_model");
         assert_eq!(g.descriptor().modality, Modality::Image);
     }
 
     #[test]
-    fn explicit_registry_resolves_without_global_inventory() {
+    fn explicit_registry_resolves_minimal_catalog() {
         let registry = ProviderRegistryBuilder::new()
             .register_generator(ModelRegistration {
                 descriptor: dummy_descriptor,
@@ -967,66 +855,88 @@ mod tests {
 
     #[test]
     fn unknown_id_errors() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        assert!(load("no_such_model", &spec).is_err());
+        assert!(registry.load("no_such_model", &spec).is_err());
     }
 
     #[test]
     fn dummy_appears_in_iteration() {
-        assert!(generators().any(|r| (r.descriptor)().id == "dummy_test_model"));
+        assert!(dummy_registry()
+            .generators()
+            .any(|r| (r.descriptor)().id == "dummy_test_model"));
     }
 
     #[test]
     fn macro_delegated_generator_resolves_by_id() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = load("dummy_delegated_test_model", &spec).expect("dummy is registered");
+        let g = registry
+            .load("dummy_delegated_test_model", &spec)
+            .expect("dummy is registered");
         assert_eq!(g.descriptor().id, "dummy_delegated_test_model");
         g.validate(&GenerationRequest::default()).unwrap();
     }
 
     #[test]
     fn macro_registered_trainer_resolves_by_id() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let t = load_trainer("dummy_test_trainer", &spec).expect("dummy trainer is registered");
+        let t = registry
+            .load_trainer("dummy_test_trainer", &spec)
+            .expect("dummy trainer is registered");
         assert_eq!(t.descriptor().id, "dummy_test_trainer");
-        assert!(trainers().any(|r| (r.descriptor)().id == "dummy_test_trainer"));
+        assert!(registry
+            .trainers()
+            .any(|r| (r.descriptor)().id == "dummy_test_trainer"));
     }
 
     #[test]
-    fn multi_arm_register_generators_registers_each() {
+    fn multiple_generator_constants_compose() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         for id in ["dummy_multi_gen_a", "dummy_multi_gen_b"] {
-            let g = load(id, &spec).unwrap_or_else(|_| panic!("{id} is registered"));
+            let g = registry
+                .load(id, &spec)
+                .unwrap_or_else(|_| panic!("{id} is registered"));
             assert_eq!(g.descriptor().id, id);
         }
     }
 
     #[test]
-    fn multi_arm_register_trainer_registers_each() {
+    fn multiple_trainer_constants_compose() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         for id in ["dummy_multi_trainer_a", "dummy_multi_trainer_b"] {
-            let t = load_trainer(id, &spec).unwrap_or_else(|_| panic!("{id} is registered"));
+            let t = registry
+                .load_trainer(id, &spec)
+                .unwrap_or_else(|_| panic!("{id} is registered"));
             assert_eq!(t.descriptor().id, id);
         }
     }
 
     #[test]
     fn captioner_registry_resolves_by_id() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let c =
-            load_captioner("dummy_test_captioner", &spec).expect("dummy captioner is registered");
+        let c = registry
+            .load_captioner("dummy_test_captioner", &spec)
+            .expect("dummy captioner is registered");
         assert_eq!(c.descriptor().id, "dummy_test_captioner");
     }
 
     #[test]
     fn unknown_captioner_id_errors() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        assert!(load_captioner("no_such_captioner", &spec).is_err());
+        assert!(registry.load_captioner("no_such_captioner", &spec).is_err());
     }
 
     #[test]
     fn dummy_captioner_appears_in_iteration() {
-        assert!(captioners().any(|r| (r.descriptor)().id == "dummy_test_captioner"));
+        assert!(dummy_registry()
+            .captioners()
+            .any(|r| (r.descriptor)().id == "dummy_test_captioner"));
     }
 
     struct DummyTextEmbedder {
@@ -1060,12 +970,17 @@ mod tests {
         }))
     }
 
-    crate::register_text_embedder! { dummy_text_embedder_descriptor => dummy_text_embedder_load }
+    crate::register_text_embedder! {
+        const DUMMY_TEXT_EMBEDDER_REGISTRATION =
+            dummy_text_embedder_descriptor => dummy_text_embedder_load
+    }
 
     #[test]
     fn text_embedder_registry_resolves_by_id() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let e = load_text_embedder("dummy_test_text_embedder", &spec)
+        let e = registry
+            .load_text_embedder("dummy_test_text_embedder", &spec)
             .expect("dummy text embedder is registered");
         assert_eq!(e.descriptor().id, "dummy_test_text_embedder");
         assert_eq!(e.embed_text("clip").unwrap(), vec![4.0, 1.0]);
@@ -1077,13 +992,18 @@ mod tests {
 
     #[test]
     fn unknown_text_embedder_id_errors() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        assert!(load_text_embedder("no_such_text_embedder", &spec).is_err());
+        assert!(registry
+            .load_text_embedder("no_such_text_embedder", &spec)
+            .is_err());
     }
 
     #[test]
     fn dummy_text_embedder_appears_in_iteration() {
-        assert!(text_embedders().any(|r| (r.descriptor)().id == "dummy_test_text_embedder"));
+        assert!(dummy_registry()
+            .text_embedders()
+            .any(|r| (r.descriptor)().id == "dummy_test_text_embedder"));
     }
 
     struct DummyImageEmbedder {
@@ -1117,12 +1037,17 @@ mod tests {
         }))
     }
 
-    crate::register_image_embedder! { dummy_image_embedder_descriptor => dummy_image_embedder_load }
+    crate::register_image_embedder! {
+        const DUMMY_IMAGE_EMBEDDER_REGISTRATION =
+            dummy_image_embedder_descriptor => dummy_image_embedder_load
+    }
 
     #[test]
     fn image_embedder_registry_resolves_by_id() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let e = load_image_embedder("dummy_test_image_embedder", &spec)
+        let e = registry
+            .load_image_embedder("dummy_test_image_embedder", &spec)
             .expect("dummy image embedder is registered");
         assert_eq!(e.descriptor().id, "dummy_test_image_embedder");
         let img = Image {
@@ -1135,20 +1060,24 @@ mod tests {
 
     #[test]
     fn unknown_image_embedder_id_errors() {
+        let registry = dummy_registry();
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        assert!(load_image_embedder("no_such_image_embedder", &spec).is_err());
+        assert!(registry
+            .load_image_embedder("no_such_image_embedder", &spec)
+            .is_err());
     }
 
     #[test]
     fn dummy_image_embedder_appears_in_iteration() {
-        assert!(image_embedders().any(|r| (r.descriptor)().id == "dummy_test_image_embedder"));
+        assert!(dummy_registry()
+            .image_embedders()
+            .any(|r| (r.descriptor)().id == "dummy_test_image_embedder"));
     }
 
-    /// The sweep (sc-9098, F-009) is clean over everything this test binary registers — the dummy
-    /// generators/trainers/captioner/embedders all carry coherent descriptors.
+    /// The sweep (sc-9098, F-009) is clean over the explicit dummy catalog.
     #[test]
-    fn descriptor_sweep_is_clean_over_registered_dummies() {
-        let errs = descriptor_conformance_errors();
+    fn descriptor_sweep_is_clean_over_dummy_catalog() {
+        let errs = dummy_registry().descriptor_conformance_errors();
         assert!(
             errs.is_empty(),
             "descriptor conformance FAILED:\n  - {}",

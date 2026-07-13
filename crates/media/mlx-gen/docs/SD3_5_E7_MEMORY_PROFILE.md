@@ -7,7 +7,7 @@ for each variant. (SD3.5-Medium's numbers were derived in M3 / sc-7869 and are o
 ## Method
 
 - **Harness:** `mlx-gen-sd3/tests/profile_memory.rs` (`#[ignore]`, env-gated; needs the real
-  snapshots + Metal). Drives the public registry path (`mlx_gen::load(id, spec).generate(req)`) for a
+  snapshots + Metal). Drives the public registry path (`registry.load(id, spec).generate(req)`) for a
   real **1024² text-to-image generation** at the variant's reference recipe (Large = 28-step true-CFG
   guidance 3.5; Turbo = 4-step CFG-off).
 - **Two peak figures, both reported:**

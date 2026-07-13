@@ -2,8 +2,7 @@
 //!
 //! The **SenseNova-U1** (NEO-Unify) provider crate for [`candle-gen`](candle_gen) — the candle
 //! (Windows/CUDA) sibling of `mlx-gen-sensenova`. It implements the backend-neutral
-//! [`gen_core::Generator`] contract and self-registers via `inventory`, so linking this crate makes
-//! `gen_core::load("sensenova_u1_8b", …)` (and `…_fast`) resolve the candle generator.
+//! [`gen_core::Generator`] contract and exposes both variants through its explicit family catalog.
 //!
 //! **txt2img:** SenseNova-U1 is a *unified* multimodal model — a dense dual-path Qwen3 "MoT" backbone
 //! (understanding + generation paths) with a flow-matching image head; there is no separate VAE or
@@ -372,12 +371,6 @@ candle_gen::register_generators! {
 candle_gen::register_generators! {
     pub(crate) const FAST_REGISTRATION = descriptor_fast => load_fast
 }
-
-/// Force-link hook. A consumer that only reaches this provider *through* the `gen_core` registry
-/// references nothing here directly, so the linker (MSVC on a release build in particular) can discard
-/// the whole rlib — taking the `inventory::submit!` registrations with it. Referencing this no-op from
-/// the consumer keeps the crate linked. (Same pattern as `candle_gen_chroma::force_link`.)
-pub fn force_link() {}
 
 /// Add all Candle SenseNova providers to an explicit media registry builder.
 pub fn register_providers(

@@ -6,8 +6,8 @@
 //! last Python image-inference path (sc-2400, epic 2337).
 //!
 //! Depends only on the `mlx-gen` core (nn primitives, adapters, weights, quant, the `Generator`
-//! contract, the registry) and self-registers via `inventory` — linking this crate makes
-//! `mlx_gen::load("sdxl", …)` resolve. The port reuses the core conv primitives already built for
+//! contract, and the registry). Its registration constant is included by this crate's explicit
+//! family catalog. The port reuses the core conv primitives already built for
 //! the Z-Image VAE (`conv2d`, pytorch-compatible `group_norm`, `silu`, `upsample_nearest`) and the
 //! shared `image`/`weights`/`quant`/`adapters` layers; it adds the SDXL-specific surfaces: the
 //! `UNet2DConditionModel` (down/mid/up cross-attention blocks + time/`text_time` micro-conditioning

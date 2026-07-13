@@ -16,8 +16,6 @@ candle-gen = { path = "../candle-gen" }
 # VAE, so it aliases the `flux` PiD latent-space student (via the `zimage-turbo` tag). Wired behind
 # `req.use_pid` (default off → the byte-exact native VAE decode).
 candle-gen-pid = { path = "../candle-gen-pid" }
-# Link-time self-registration into gen-core's model registry (the `inventory::submit!` below).
-inventory = { workspace = true }
 # Z-Image building blocks (Qwen3 text encoder / DiT transformer / AutoencoderKL VAE / flow-match
 # scheduler). Backend features are passed through from this crate's features below so it shares
 # candle-gen's exact candle build.

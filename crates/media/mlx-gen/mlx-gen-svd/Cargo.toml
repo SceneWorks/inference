@@ -15,7 +15,6 @@ mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.
-inventory = { workspace = true }
 
 [dev-dependencies]
 # Save the e2e render frames for inspection (matches the workspace `image` version).

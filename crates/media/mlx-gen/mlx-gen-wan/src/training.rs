@@ -346,8 +346,8 @@ pub fn load_trainer_ti2v_5b(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     build_trainer(spec, descriptor_ti2v_5b())
 }
 
-// Link-time trainer registration (epic 3720): the macro emits each `inventory::submit!` and bridges
-// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`.
+// The trainer registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`.
 mlx_gen::register_trainer! {
     pub(crate) const T2V_14B_TRAINER_REGISTRATION = descriptor_t2v_14b => load_trainer
 }

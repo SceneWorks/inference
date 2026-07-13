@@ -277,8 +277,8 @@ pub fn load_trainer_medium(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     load_trainer_for(spec, Sd3Variant::Medium)
 }
 
-// Link-time trainer registration (epic 3720): the macro emits the `inventory::submit!` and bridges
-// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`. Both
+// The trainer registration constants bridge the crate's rich `Result` into backend-neutral
+// `gen_core::Result`. Both
 // LoRA-training bases register here — Large (plain MMDiT) and Medium (MMDiT-X dual-attention).
 mlx_gen::register_trainer! {
     pub(crate) const LARGE_TRAINER_REGISTRATION = trainer_descriptor => load_trainer
@@ -1026,8 +1026,7 @@ mod tests {
 
     #[test]
     fn both_training_bases_reachable_via_registry() {
-        // T4: both the Large and Medium trainers self-register at link time (multi-arm
-        // `register_trainer!`). The Medium id must resolve to a registered trainer.
+        // Both the Large and Medium trainer constants compose into the family catalog.
         let ids: Vec<&str> = crate::provider_registry()
             .unwrap()
             .trainers()

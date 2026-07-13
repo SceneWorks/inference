@@ -10,7 +10,6 @@ categories = ["science"]
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }
-inventory = { workspace = true }
 # LTX-2.3 has NO candle-transformers reference: the AVTransformer3DModel video DiT, the
 # CausalVideoAutoencoder temporal VAE, the Gemma-3-12B text encoder + per-token-RMS aggregation +
 # 8-layer learnable-register connector, and the rectified-flow distilled scheduler are all written

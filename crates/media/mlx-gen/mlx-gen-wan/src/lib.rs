@@ -9,8 +9,8 @@
 //! patchify, the flow-match solvers, the T2V pipeline) is the Wan core (sc-2678); the dense/MoE
 //! 14B variants reuse it via additional configs + dual-expert routing.
 //!
-//! This crate self-registers three models into the `mlx-gen` registry: **`wan2_2_t2v_14b`** (the
-//! dual-expert MoE T2V, fully wired — `mlx_gen::load("wan2_2_t2v_14b", spec)` runs the complete
+//! This crate publishes three models through its explicit provider registry:
+//! **`wan2_2_t2v_14b`** (the dual-expert MoE T2V, fully wired — the catalog loader runs the complete
 //! pipeline), **`wan2_2_i2v_14b`** (the dual-expert MoE channel-concat image→video, fully wired —
 //! shares the T2V pipeline with the 20-channel `y` conditioning + in_dim-36 patch-embed, sc-2681) and
 //! **`wan2_2_ti2v_5b`** (the dense 5B, fully wired — sc-2680: text→video plus native image-conditioned
