@@ -111,7 +111,10 @@ jobs:
           -p candle-llm -p 'candle-gen*' -p runtime-cpu
           --all-targets -- -D warnings
       - name: Test Candle packages
-        run: cargo test --locked -p candle-llm -p 'candle-gen*' -p runtime-cpu
+        # `cargo test` without target selection also links every heavyweight real-weight example.
+        # Clippy above still checks all targets; this step executes the actual lib/integration tests
+        # without exhausting the hosted runner's disk while linking unrelated smoke binaries.
+        run: cargo test --locked --lib --tests -p candle-llm -p 'candle-gen*' -p runtime-cpu
       - name: Guard poison-tolerant shared locks
         run: bash crates/media/candle-gen/scripts/check-lock-poison.sh
       - name: Self-test the gen-core skew verdict
@@ -155,7 +158,7 @@ jobs:
           --all-targets -- -D warnings
       - name: Test MLX packages
         run: >-
-          cargo test --locked
+          cargo test --locked --lib --tests
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
       - name: Check Candle Metal packages
         run: >-
@@ -187,7 +190,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
+          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
 
   supply-chain:
     name: dependency policy + advisories
