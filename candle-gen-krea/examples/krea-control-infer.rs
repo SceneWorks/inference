@@ -209,10 +209,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    // Native Qwen-Image VAE decode -> PNG.
-    eprintln!("decoding…");
+    // Native Qwen-Image VAE decode -> PNG. `KREA_TILE_VAE=1` forces the seam-free tiled tail even below
+    // the im2col threshold (sc-11744) — the A/B lever for measuring the decode-phase VRAM Δsaving/Δcost
+    // that the worker's fit-ladder trades off (`Krea2ControlRequest::tile_vae_decode`).
+    let tile_vae = std::env::var("KREA_TILE_VAE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    eprintln!("decoding… (tile_vae_decode={tile_vae})");
     let vae = load_vae(&a.snapshot, &device)?;
-    let decoded = vae.decode(&lat)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
+    let decoded = vae.decode_with(&lat, tile_vae)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
     let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
     let img = img
         .squeeze(0)?

@@ -86,6 +86,12 @@ pub struct Krea2ControlRequest {
     /// (byte-identical to un-branched generation at the same seed).
     pub control_scale: f32,
     pub seed: u64,
+    /// Route the final latent→pixel VAE decode through the seam-free **tiled tail** even below the
+    /// im2col-overflow threshold (sc-11744). `false` (the default) is the monolithic decode — full speed,
+    /// the ~30 GB end-of-render spike. The worker's Krea control fit-ladder (sc-11754) flips this to
+    /// `true` **only** when the predicted decode-phase peak exceeds free VRAM — the cheapest rung (a speed
+    /// cost, no quality cost) ahead of branch-quant. On a card with headroom it stays `false`.
+    pub tile_vae_decode: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -99,6 +105,7 @@ impl Default for Krea2ControlRequest {
             steps: TURBO_STEPS,
             control_scale: DEFAULT_CONTROL_SCALE,
             seed: 0,
+            tile_vae_decode: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -244,7 +251,14 @@ impl Krea2Control {
         )?;
 
         on_progress(Progress::Decoding);
-        let decoded = self.vae.decode(&latent)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
+        // Final latent→pixel decode. `tile_vae_decode` (the fit-ladder's cheapest rung, sc-11744) routes
+        // the tail through the seam-free tiled path to cap the end-of-render VRAM spike on a constrained
+        // card; the big-card default (`false`) is the monolithic full-speed decode. Above the im2col
+        // threshold `decode_with` tiles regardless (sc-10023 correctness), so this never regresses hi-res.
+        let decoded = self
+            .vae
+            .decode_with(&latent, req.tile_vae_decode)?
+            .to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
         to_image(&decoded)
     }
 }
@@ -317,6 +331,9 @@ mod tests {
         assert_eq!((r.width, r.height), (1024, 1024));
         assert_eq!(r.steps, TURBO_STEPS);
         assert_eq!(r.control_scale, DEFAULT_CONTROL_SCALE);
+        // Untiled by default (sc-11744): the monolithic full-speed decode — the fit-ladder flips it on
+        // only when the decode-phase peak won't fit.
+        assert!(!r.tile_vae_decode);
         assert!(!r.cancel.is_cancelled());
     }
 

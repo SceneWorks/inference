@@ -216,6 +216,18 @@ impl UpBlock {
 /// monolithic decode and only larger targets pay the (seam-free) tiled path.
 const DECODE_TILE_ABOVE_PX: usize = 1536;
 
+/// Whether [`QwenVae::decode_with`] tiles the upsampling tail for an output whose larger side is
+/// `out_px_max` pixels. Two independent reasons to tile, OR'd:
+///  - **correctness** (sc-10023): above [`DECODE_TILE_ABOVE_PX`] a monolithic tail conv overflows
+///    candle's im2col launch and must tile regardless of the caller — so this fires even when
+///    `force_tile` is false;
+///  - **VRAM** (sc-11744): `force_tile` engages the seam-free tiled tail *below* the threshold to cap the
+///    end-of-render decode spike on a constrained card. It is a pure *speed* trade (no quality cost), so
+///    the default caller keeps it false and a card with headroom decodes monolithically at full speed.
+fn should_tile_tail(out_px_max: usize, force_tile: bool) -> bool {
+    force_tile || out_px_max > DECODE_TILE_ABOVE_PX
+}
+
 /// Tail-decode tiling geometry (sc-10023): the decoder tail upsamples ×8 spatially, an image VAE has no
 /// temporal axis (`f = 1`, non-causal). Matches SDXL's `SDXL_VAE_TILING`.
 const TAIL_TILING: VaeTiling = VaeTiling {
@@ -299,12 +311,25 @@ impl QwenVae {
     /// **once on the full latent** (so the mid-block self-attention still sees the whole field) and only
     /// the resolution-growing tail is tiled with a trapezoidal seam blend.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        self.decode_with(latents, false)
+    }
+
+    /// Decode with the tail-tiling policy under caller control (sc-11744). `force_tile = false` is
+    /// [`Self::decode`] exactly (monolithic at/below [`DECODE_TILE_ABOVE_PX`], tiled above it — the
+    /// im2col-overflow correctness gate, unchanged). `force_tile = true` runs the seam-free tiled tail
+    /// even *below* the threshold: the tail's peak activation is the ~full-resolution upsampler conv, so
+    /// tiling it caps the end-of-render VRAM spike that OOMs a constrained card at a resolution the
+    /// denoise loop itself fits (the Krea pose-ControlNet fit-ladder's cheapest rung — a *speed* cost,
+    /// **no quality cost**, since the [`Self::tile_blend_tail`] trapezoidal blend is attention-free and a
+    /// partition of unity over the overlap). The default caller keeps `force_tile = false` so nothing
+    /// tiles on a card with headroom.
+    pub fn decode_with(&self, latents: &Tensor, force_tile: bool) -> Result<Tensor> {
         let (_, _, lh, lw) = latents.dims4()?;
         let mid = self.decode_mid(latents)?;
-        if (lh * 8).max(lw * 8) <= DECODE_TILE_ABOVE_PX {
-            self.decode_tail(&mid)
-        } else {
+        if should_tile_tail((lh * 8).max(lw * 8), force_tile) {
             self.tile_blend_tail(&mid)
+        } else {
+            self.decode_tail(&mid)
         }
     }
 
@@ -534,5 +559,30 @@ impl QwenVaeEncoder {
         let e = self.quant_conv.forward(&h)?; // [1, 32, H/8, W/8]
         let e16 = e.narrow(1, 0, 16)?; // keep the mean (first 16 of 32)
         e16.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_tile_tail, DECODE_TILE_ABOVE_PX};
+
+    #[test]
+    fn default_decode_preserves_the_im2col_correctness_gate() {
+        // force_tile = false (the `decode()` default, every non-control caller): monolithic at/below the
+        // sc-10023 threshold, tiled only strictly above it. This is byte-for-byte the pre-sc-11744 gate.
+        assert!(!should_tile_tail(1024, false));
+        assert!(!should_tile_tail(DECODE_TILE_ABOVE_PX, false));
+        assert!(should_tile_tail(DECODE_TILE_ABOVE_PX + 8, false));
+        assert!(should_tile_tail(2048, false));
+    }
+
+    #[test]
+    fn force_tile_engages_below_the_threshold() {
+        // sc-11744: the Krea control fit-ladder's VAE-tiling rung forces the seam-free tiled tail even at
+        // a sub-threshold resolution (the ~30 GB decode spike OOMs a constrained card at 1024²).
+        assert!(should_tile_tail(1024, true));
+        assert!(should_tile_tail(512, true));
+        // Above the threshold it stays tiled (correctness never regresses when VRAM tiling is also asked).
+        assert!(should_tile_tail(2048, true));
     }
 }
