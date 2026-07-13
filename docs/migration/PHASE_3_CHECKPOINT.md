@@ -80,9 +80,9 @@ reused by later self-hosted runs.
 The repository variables are the runner contract: `MLX_LLM_TEST_MODEL`,
 `MLX_LLM_QWEN3_MODEL`, and `ZIMAGE_SNAPSHOT` locate persistent macOS caches;
 `CANDLE_LLM_TEST_MODEL`, `CANDLE_LLM_QWEN3_MODEL`, and `Z_IMAGE_SNAPSHOT` locate
-the Windows caches. `WINDOWS_CARGO_HOME` and `WINDOWS_RUSTUP_HOME` identify the
-installed Windows toolchain independently of the account running the Actions
-service, so a service restart cannot silently drop Rust from `PATH`.
+the Windows caches. Self-hosted Windows jobs bootstrap the repository's pinned
+Rust toolchain through a commit-pinned setup action into the Actions service
+account, so service restarts do not depend on an interactive user's `PATH`.
 
 ## Local validation
 
