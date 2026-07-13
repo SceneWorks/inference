@@ -673,6 +673,10 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[] as &[Quant],
             supports_kv_cache: false,
             requires_sigma_shift: true,
+            // `generate` routes through `render_sequential` under `OffloadPolicy::Sequential`
+            // (load→encode→drop the ~8 GB Qwen2.5-VL encoder before the DiT), so requesting Sequential
+            // genuinely bounds peak VRAM here rather than being a no-op fallback (sc-11126, sc-10867).
+            supports_sequential_offload: true,
         },
     }
 }

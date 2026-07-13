@@ -88,6 +88,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             mac_only: false,
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // No candle `render_sequential` residency seam wired (sc-11126); Sequential falls back to
+            // Resident (no-op) here, so don't over-advertise it.
+            supports_sequential_offload: false,
             supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5927)
         },
     }

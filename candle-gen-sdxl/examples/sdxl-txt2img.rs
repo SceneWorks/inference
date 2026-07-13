@@ -179,6 +179,8 @@ fn main() -> Result<()> {
                 let _ = std::io::stdout().flush();
             }
             Progress::Decoding => println!("\n[smoke] call {}/{repeat} decoding", call + 1),
+            // Additive Sequential-residency load signal (sc-11126); no-op in this smoke example.
+            Progress::Loading(_) => {}
         };
         let t_call = std::time::Instant::now();
         let gen_phase = probe.as_ref().map(|p| p.phase());

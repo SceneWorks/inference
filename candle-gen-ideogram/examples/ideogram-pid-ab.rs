@@ -46,6 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut op = |p: Progress| match p {
         Progress::Step { current, total } => eprintln!("  step {current}/{total}"),
         Progress::Decoding => eprintln!("  decoding…"),
+        // Additive Sequential-residency load signal (sc-11126); no-op in this smoke example.
+        Progress::Loading(_) => {}
     };
     let req = GenerationRequest {
         prompt,

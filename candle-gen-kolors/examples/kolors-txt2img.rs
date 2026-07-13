@@ -97,6 +97,8 @@ fn main() -> Result<()> {
             let _ = std::io::stdout().flush();
         }
         Progress::Decoding => println!("\n[smoke] decoding"),
+        // Additive Sequential-residency load signal (sc-11126); no-op in this smoke example.
+        Progress::Loading(_) => {}
     };
     let t_call = std::time::Instant::now();
     let output = gen.generate(&req, &mut on_progress)?;
