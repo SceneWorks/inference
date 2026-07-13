@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::{GenerationRequest, Image};
-use candle_gen_krea::pipeline::{load_components, render_img2img};
+use candle_gen_krea::pipeline::{load_components, render_base_img2img, render_img2img};
 use candle_gen_krea::vae::load_vae_encoder;
 
 /// (std, distinct-level-count, mean horizontal-adjacent-|Δ|) — a coherent natural image has a broad
@@ -234,6 +234,114 @@ fn img2img_is_coherent_and_monotone_in_reference_fidelity() {
         );
         // Monotone reference fidelity: a higher strength must not move FARTHER from the reference. Small
         // slack for sampler noise between adjacent rungs.
+        assert!(
+            m <= prev_mae + 2.0,
+            "MAE→ref must be non-increasing as strength rises (strength {s}: MAE {m:.2} > prev {prev_mae:.2})"
+        );
+        prev_mae = m;
+    }
+}
+
+/// The **Raw CFG** img2img AC on the real GPU (sc-10226, epic 8588) — the full-CFG twin of the Turbo test
+/// above, driving `render_base_img2img` against a real Krea 2 **Raw** snapshot. Same two assertions: a
+/// coherent image at every strength, and monotone reference fidelity (MAE→reference falls as strength
+/// rises). The Raw path runs the undistilled two-forward CFG denoise (`KREA_RAW_GUIDANCE` ~3.5 default,
+/// resolution-dynamic `base_schedule`, ~52 steps) — a broken start-step / blend / schedule-slice / CFG
+/// combine would break the ordering or yield noise. `#[ignore]` — needs a real Krea 2 Raw snapshot, a
+/// source image, and a CUDA GPU:
+/// ```sh
+/// KREA_RAW_DIR=D:\models\Krea-2-Raw \
+/// KREA_IMG2IMG_SOURCE=D:\fixtures\photo.png \
+///   cargo test -p candle-gen-krea --release --features cuda --test img2img_real_weights -- --ignored --nocapture
+/// ```
+/// `KREA_IMG2IMG_SIZE=WxH` (multiples of 16) overrides the resolution; `KREA_IMG2IMG_STEPS` the ~52-step
+/// Raw budget; `KREA_IMG2IMG_GUIDANCE` the CFG scale; `KREA_IMG2IMG_PROMPT` / `KREA_IMG2IMG_NEGATIVE` the
+/// prompts.
+#[test]
+#[ignore = "needs KREA_RAW_DIR + KREA_IMG2IMG_SOURCE; --features cuda"]
+fn raw_img2img_is_coherent_and_monotone_in_reference_fidelity() {
+    candle_gen_krea::force_link();
+    let (Ok(root), Ok(source)) = (
+        std::env::var("KREA_RAW_DIR"),
+        std::env::var("KREA_IMG2IMG_SOURCE"),
+    ) else {
+        eprintln!("skipping: set KREA_RAW_DIR + KREA_IMG2IMG_SOURCE");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let device = candle_gen::default_device().expect("device");
+
+    let reference = read_source(&PathBuf::from(&source));
+    let (w, h) = std::env::var("KREA_IMG2IMG_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('x')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+        .unwrap_or((reference.width / 16 * 16, reference.height / 16 * 16));
+    assert!(w >= 256 && h >= 256, "target {w}x{h} too small");
+    // Raw is undistilled — default to a real ~52-step CFG budget (the Turbo test defaults to 8).
+    let steps: u32 = std::env::var("KREA_IMG2IMG_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(52);
+    let guidance: f32 = std::env::var("KREA_IMG2IMG_GUIDANCE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3.5);
+    let prompt = std::env::var("KREA_IMG2IMG_PROMPT")
+        .unwrap_or_else(|_| "a highly detailed photograph, sharp focus, natural light".into());
+    let negative = std::env::var("KREA_IMG2IMG_NEGATIVE").ok();
+
+    let t_load = Instant::now();
+    let comps = load_components(&root, &device, &[], None).expect("load Krea Raw components");
+    let vae_encoder = load_vae_encoder(&root, &device).expect("load VAE encoder");
+    let load_s = t_load.elapsed().as_secs_f32();
+
+    let ref_at_target = resize_ref(&reference, w, h);
+
+    let strengths = [0.35f32, 0.6, 0.85];
+    let mut prev_mae = f32::INFINITY;
+    for &s in &strengths {
+        let req = GenerationRequest {
+            prompt: prompt.clone(),
+            negative_prompt: negative.clone(),
+            width: w,
+            height: h,
+            count: 1,
+            seed: Some(0),
+            steps: Some(steps),
+            guidance: Some(guidance),
+            ..Default::default()
+        };
+        let t_gen = Instant::now();
+        let imgs = render_base_img2img(
+            &comps,
+            &vae_encoder,
+            &req,
+            &reference,
+            Some(s),
+            &device,
+            &mut |_| {},
+        )
+        .expect("render_base_img2img");
+        let gen_s = t_gen.elapsed().as_secs_f32();
+
+        assert_eq!(imgs.len(), 1);
+        let img = &imgs[0];
+        assert_eq!((img.width, img.height), (w, h), "output dims");
+        let (std, distinct, adj) = image_stats(&img.pixels, img.width);
+        let m = mae(&img.pixels, &ref_at_target);
+        eprintln!(
+            "[krea RAW img2img {w}x{h} strength={s} steps={steps} g={guidance}] load {load_s:.1}s · \
+             render {gen_s:.1}s · std={std:.1} distinct={distinct} adjΔ={adj:.1} MAE→ref={m:.2} coherent={}",
+            is_coherent(img)
+        );
+        save(img, &format!("raw_img2img_{w}x{h}_s{}", (s * 100.0) as u32));
+        assert!(
+            is_coherent(img),
+            "strength {s}: Raw img2img render must be coherent, not noise (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
+        );
         assert!(
             m <= prev_mae + 2.0,
             "MAE→ref must be non-increasing as strength rises (strength {s}: MAE {m:.2} > prev {prev_mae:.2})"

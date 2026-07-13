@@ -472,6 +472,124 @@ pub fn render_base(
     })
 }
 
+/// Render the **Raw img2img** (reference-guided latent-init under full classifier-free guidance) path
+/// (sc-10226, epic 8588) — the img2img sibling of [`render_base`] seeded from a VAE-encoded reference
+/// instead of pure noise, and the full-CFG sibling of the CFG-free Turbo [`render_img2img`]. The
+/// candle/CUDA twin of mlx-gen-krea's `generate_base_img2img_with_progress` (mlx A5a, sc-10224). It is
+/// exactly [`render_base`]'s undistilled two-forward CFG denoise (resolution-dynamic [`base_schedule`],
+/// the reference [`krea_cfg_combine`] combine, an optional user negative prompt) run over the
+/// reference-seeded init latent + reduced schedule of [`render_img2img`]:
+/// 1. LANCZOS-resize the reference to the target resolution ([`preprocess_img2img_init`]), VAE-encode it
+///    to the normalized `[1,16,H/8,W/8]` **clean** latent (the same space as the init noise).
+/// 2. `start = init_time_step(steps, strength)` (the fork's reference-fidelity convention: higher
+///    strength → later start → closer to the reference — NOT SDXL's).
+/// 3. Blend `x_start = (1−σ_start)·clean + σ_start·noise` at `σ_start = sigmas[start]`
+///    ([`add_noise_by_interpolation`]).
+/// 4. Run the Raw CFG rectified-flow Euler loop over `sigmas[start..]` from `x_start` — two DiT forwards
+///    per step when `guidance > 0` (cond vs uncond, combined by [`krea_cfg_combine`]), one otherwise,
+///    exactly as [`render_base`].
+///
+/// The condition/uncondition encode, dynamic schedule, and PiD/native decode seam are identical to
+/// [`render_base`]; img2img changes only the initial latent and the schedule start. `strength == 1.0`
+/// (start == steps) leaves a single trailing `σ = 0.0` — the clean reference decoded verbatim (no
+/// denoise), matching [`render_img2img`].
+#[allow(clippy::too_many_arguments)]
+pub fn render_base_img2img(
+    comps: &Components,
+    vae_encoder: &QwenVaeEncoder,
+    req: &GenerationRequest,
+    reference: &Image,
+    strength: Option<f32>,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+
+    // Positive (conditional) condition encoding (seed-independent), identical to `render_base`: img2img
+    // changes only the init latent + schedule start, not the conditioning.
+    let context = comps
+        .te
+        .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+
+    // Unconditional context, encoded ONLY when CFG is active (reference `cfg = guidance > 0`). An
+    // absent / empty negative prompt defaults to `""` (reference `negative_prompts = [""] * n`).
+    let neg_context = if guidance > 0.0 {
+        let negative = req.negative_prompt.as_deref().unwrap_or_default();
+        Some(
+            comps
+                .te
+                .forward(&comps.tok.encode_prompt(negative, MAX_TEXT_TOKENS)?)?,
+        )
+    } else {
+        None
+    };
+
+    // Resolution-dynamic Raw sigma schedule (mu from the image-token count), identical to `render_base`.
+    let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
+
+    // The img2img start step + the σ that seeds the blend (the fork's leaves, shared with the Turbo
+    // `render_img2img`). Clamp `start` to the last schedule index defensively so `sigmas[start]` is always
+    // valid (a curated scheduler may re-stride the schedule to a length other than `steps + 1`).
+    let start = init_time_step(steps, strength).min(sigmas.len().saturating_sub(1));
+    let sigma_start = sigmas[start];
+
+    // The clean reference latent (seed-independent): LANCZOS-resize → `[-1,1]` pixels → the normalized
+    // 16-ch latent (f32, the noise's dtype for the blend + sampler).
+    let init_pixels = preprocess_img2img_init(reference, req.width, req.height, device)?;
+    let clean = vae_encoder.encode(&init_pixels)?.to_dtype(DType::F32)?;
+
+    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+        comps.pid.as_deref(),
+        req,
+        base_seed,
+        crate::KREA_2_RAW_ID,
+    )?;
+
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let noise = init_noise(req.height, req.width, seed, device)?;
+        let x_start = add_noise_by_interpolation(&clean, &noise, sigma_start)?;
+        // `sigmas[start..]` seeds the sampler at `sigma_start` (= its first element, the state x_start is
+        // at). A single-element tail (strength == 1.0) has no Euler step — decode x_start (= clean) as-is.
+        let sub = &sigmas[start..];
+        let lat = if sub.len() < 2 {
+            x_start
+        } else {
+            candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::Sigma,
+                sub,
+                x_start,
+                seed,
+                &req.cancel,
+                on_progress,
+                |x, timestep| -> Result<Tensor> {
+                    let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                    let cond = comps.dit.forward(x, &t, &context)?;
+                    // Two-forward CFG when a negative context was prepared (guidance > 0); else the bare
+                    // conditional velocity. Combined by the shared reference formula (`krea_cfg_combine`),
+                    // exactly as `render_base`.
+                    let v = match &neg_context {
+                        Some(nc) => {
+                            let uncond = comps.dit.forward(x, &t, nc)?;
+                            krea_cfg_combine(&cond, &uncond, guidance)?
+                        }
+                        None => cond,
+                    };
+                    Ok(v.to_dtype(DType::F32)?)
+                },
+            )?
+        };
+        on_progress(Progress::Decoding);
+        let decoded = match &pid_decoder {
+            Some(pid) => pid.decode(&lat)?,
+            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
+        };
+        to_image(&decoded)
+    })
+}
+
 /// The image-edit-only components (epic 10871), loaded lazily on the first edit so the txt2img paths
 /// keep their footprint. Holds the two extra wires the edit LoRA's dual-conditioning contract needs:
 /// the Qwen-Image VAE **encoder** (source references → in-context VAE tokens, sc-10877) and the
