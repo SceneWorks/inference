@@ -22,6 +22,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_lens::register_providers(registry);
     let registry = candle_gen_ltx::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
+    let registry = candle_gen_sana::register_providers(registry);
     let registry = candle_gen_scail2::register_providers(registry);
     let registry = candle_gen_sd3::register_providers(registry);
     let registry = candle_gen_sdxl::register_providers(registry);
@@ -102,6 +103,7 @@ mod tests {
                 "lens",
                 "ltx_2_3_distilled",
                 "qwen_image",
+                "sana_1600m",
                 "scail2_14b",
                 "sd3_5_large",
                 "sd3_5_large_turbo",

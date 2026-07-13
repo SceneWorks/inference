@@ -31,15 +31,33 @@
 //! last-hidden caption embedding feeding the trunk's `attn2` cross-attention. Mirrors mlx-gen-sana's
 //! sc-8488 (mlx-gen #614).
 //!
-//! The remaining native-SANA pipeline (flow / SCM schedulers, e2e wiring, gen-core registration)
-//! lands in the sibling stories of epic 11776, mirroring mlx-gen-sana's sc-8489..8490.
+//! **sc-11780** assembles the end-to-end base txt2img [`pipeline`] (TE → trunk → DC-AE, driven by
+//! candle's unified flow scheduler, static shift 3.0, true CFG) and the gen-core [`model`] adapter
+//! (exposed under `sana_1600m` through the explicit family catalog), mirroring mlx-gen-sana's sc-8489. The CFG-free SCM/Sprint distill
+//! (mlx sc-8490) is not ported on the candle side.
 
 pub mod config;
 pub mod dc_ae;
+pub mod model;
+pub mod pipeline;
 pub mod text_encoder;
 pub mod transformer;
 
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::{DcAeDecoder, DcAeEncoder};
+pub use model::{descriptor, load, MODEL_ID};
+pub use pipeline::{SanaGenerateRequest, SanaPipeline};
 pub use text_encoder::{SanaTextEncoder, MAX_SEQUENCE_LENGTH, SANA_CHI_PROMPT};
 pub use transformer::SanaTransformer;
+
+/// Add the Candle SANA generator to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_generator(model::REGISTRATION)
+}
+
+/// Build the complete explicit Candle SANA provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}

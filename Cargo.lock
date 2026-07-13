@@ -297,6 +297,7 @@ dependencies = [
  "candle-gen-lens",
  "candle-gen-ltx",
  "candle-gen-qwen-image",
+ "candle-gen-sana",
  "candle-gen-scail2",
  "candle-gen-sd3",
  "candle-gen-sdxl",
@@ -538,7 +539,9 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-pid",
+ "hf-hub",
  "image",
+ "rand 0.9.5",
 ]
 
 [[package]]
