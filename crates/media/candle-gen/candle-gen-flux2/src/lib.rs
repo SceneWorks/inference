@@ -936,13 +936,54 @@ pub fn load_dev(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 // Link-time self-registration into gen-core's model registry — one per txt2img variant.
 candle_gen::register_generators! {
-    descriptor_klein => load_klein,
-    descriptor_dev => load_dev,
+    pub(crate) const KLEIN_REGISTRATION = descriptor_klein => load_klein
+}
+candle_gen::register_generators! {
+    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped when the
 /// crate is reached only through the registry). Same pattern as the other providers.
 pub fn force_link() {}
+
+/// Add all Candle FLUX.2 providers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(KLEIN_REGISTRATION)
+        .register_generator(DEV_REGISTRATION)
+}
+
+/// Build the complete explicit Candle FLUX.2 provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility: Vec<String> = candle_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "flux2" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit = explicit.clone();
+        sorted_explicit.sort();
+        compatibility.sort();
+
+        assert_eq!(sorted_explicit, compatibility);
+        assert_eq!(explicit, ["flux2_klein_9b", "flux2_dev"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {
