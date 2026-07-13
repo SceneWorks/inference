@@ -567,7 +567,9 @@ impl Wan {
 
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
-mlx_gen::register_generators! { descriptor => load }
+mlx_gen::register_generators! {
+    pub(crate) const TI2V_REGISTRATION = descriptor => load
+}
 
 // ===========================================================================================
 // Wan2.2 T2V-A14B — dual-expert MoE text→video (the S1–S5 core, fully wired)
@@ -1018,7 +1020,9 @@ impl Wan14b {
     }
 }
 
-mlx_gen::register_generators! { descriptor_t2v_14b => load_t2v_14b }
+mlx_gen::register_generators! {
+    pub(crate) const T2V_14B_REGISTRATION = descriptor_t2v_14b => load_t2v_14b
+}
 
 // ===========================================================================================
 // Wan2.2 I2V-A14B — dual-expert MoE image→video (channel-concat conditioning, in_dim 36)
@@ -1159,7 +1163,9 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-mlx_gen::register_generators! { descriptor_i2v_14b => load_i2v_14b }
+mlx_gen::register_generators! {
+    pub(crate) const I2V_14B_REGISTRATION = descriptor_i2v_14b => load_i2v_14b
+}
 
 #[cfg(test)]
 mod tests {

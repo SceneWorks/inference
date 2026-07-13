@@ -455,10 +455,76 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
-candle_gen::register_generators! { descriptor => load }
+candle_gen::register_generators! {
+    pub(crate) const TI2V_REGISTRATION = descriptor => load
+}
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
 pub fn force_link() {}
+
+/// Add all Candle Wan generators and trainers to an explicit media registry builder.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(TI2V_REGISTRATION)
+        .register_generator(wan14b::T2V_14B_REGISTRATION)
+        .register_generator(wan14b::I2V_14B_REGISTRATION)
+        .register_generator(model_vace::VACE_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit Candle Wan provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_generators: Vec<String> =
+            candle_gen::gen_core::registry::generators()
+                .filter_map(|registration| {
+                    let descriptor = (registration.descriptor)();
+                    (descriptor.family == "wan" && descriptor.backend == "candle")
+                        .then(|| descriptor.id.to_string())
+                })
+                .collect();
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let compatibility_trainers: Vec<String> = candle_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "wan" && descriptor.backend == "candle")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit_generators = explicit_generators.clone();
+        sorted_explicit_generators.sort();
+        compatibility_generators.sort();
+
+        assert_eq!(sorted_explicit_generators, compatibility_generators);
+        assert_eq!(
+            explicit_generators,
+            [
+                "wan2_2_ti2v_5b",
+                "wan2_2_t2v_14b",
+                "wan2_2_i2v_14b",
+                "wan_vace",
+            ]
+        );
+        assert_eq!(explicit_trainers, compatibility_trainers);
+        assert_eq!(explicit_trainers, ["wan2_2_t2v_14b"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

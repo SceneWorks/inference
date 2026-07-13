@@ -440,7 +440,9 @@ fn load_vace_transformer_weights(root: &std::path::Path) -> Result<Weights> {
 
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
-mlx_gen::register_generators! { descriptor_vace => load }
+mlx_gen::register_generators! {
+    pub(crate) const VACE_REGISTRATION = descriptor_vace => load
+}
 
 // ============================================================================================
 // Wan2.2 VACE-Fun A14B — dual-expert (MoE) controllable video (sc-6604, epic 3456).
@@ -664,4 +666,6 @@ fn validate_vace_clip(
 }
 
 // Link-time registration for the dual-expert VACE-Fun variant (epic 3720).
-mlx_gen::register_generators! { descriptor_vace_fun => load_vace_fun }
+mlx_gen::register_generators! {
+    pub(crate) const VACE_FUN_REGISTRATION = descriptor_vace_fun => load_vace_fun
+}

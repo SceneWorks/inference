@@ -100,3 +100,76 @@ pub use vace::{
 };
 pub use vae::WanVae;
 pub use vae22::Wan22Vae;
+
+/// Add all MLX Wan generators and trainers to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::TI2V_REGISTRATION)
+        .register_generator(model::T2V_14B_REGISTRATION)
+        .register_generator(model::I2V_14B_REGISTRATION)
+        .register_generator(model_vace::VACE_REGISTRATION)
+        .register_generator(model_vace::VACE_FUN_REGISTRATION)
+        .register_trainer(training::T2V_14B_TRAINER_REGISTRATION)
+        .register_trainer(training::I2V_14B_TRAINER_REGISTRATION)
+        .register_trainer(training::TI2V_5B_TRAINER_REGISTRATION)
+}
+
+/// Build the complete explicit MLX Wan provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_matches_inventory_compatibility_catalog() {
+        let registry = super::provider_registry().unwrap();
+        let explicit_generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_generators: Vec<String> = mlx_gen::gen_core::registry::generators()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "wan" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let explicit_trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        let mut compatibility_trainers: Vec<String> = mlx_gen::gen_core::registry::trainers()
+            .filter_map(|registration| {
+                let descriptor = (registration.descriptor)();
+                (descriptor.family == "wan" && descriptor.backend == "mlx")
+                    .then(|| descriptor.id.to_string())
+            })
+            .collect();
+        let mut sorted_explicit_generators = explicit_generators.clone();
+        sorted_explicit_generators.sort();
+        compatibility_generators.sort();
+        let mut sorted_explicit_trainers = explicit_trainers.clone();
+        sorted_explicit_trainers.sort();
+        compatibility_trainers.sort();
+
+        assert_eq!(sorted_explicit_generators, compatibility_generators);
+        assert_eq!(
+            explicit_generators,
+            [
+                "wan2_2_ti2v_5b",
+                "wan2_2_t2v_14b",
+                "wan2_2_i2v_14b",
+                "wan_vace",
+                "wan2_2_vace_fun_14b",
+            ]
+        );
+        assert_eq!(sorted_explicit_trainers, compatibility_trainers);
+        assert_eq!(
+            explicit_trainers,
+            ["wan2_2_t2v_14b", "wan2_2_i2v_14b", "wan2_2_ti2v_5b",]
+        );
+    }
+}

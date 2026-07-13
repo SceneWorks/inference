@@ -374,7 +374,9 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
 
 // Link-time self-registration into gen-core's trainer registry (kept linked by `crate::force_link`).
 // `register_trainer!` bridges the crate's rich `Result` into `gen_core::Result` via `Into::into`.
-candle_gen::register_trainer! { trainer_descriptor => load_trainer }
+candle_gen::register_trainer! {
+    pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
+}
 
 impl Trainer for WanMoeTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {

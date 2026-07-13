@@ -824,8 +824,10 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 candle_gen::register_generators! {
-    descriptor_t2v_14b => load_t2v_14b,
-    descriptor_i2v_14b => load_i2v_14b,
+    pub(crate) const T2V_14B_REGISTRATION = descriptor_t2v_14b => load_t2v_14b
+}
+candle_gen::register_generators! {
+    pub(crate) const I2V_14B_REGISTRATION = descriptor_i2v_14b => load_i2v_14b
 }
 
 #[cfg(test)]

@@ -422,7 +422,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
-candle_gen::register_generators! { descriptor => load }
+candle_gen::register_generators! {
+    pub(crate) const VACE_REGISTRATION = descriptor => load
+}
 
 #[cfg(test)]
 mod tests {
