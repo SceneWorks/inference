@@ -597,10 +597,19 @@ impl Pipeline {
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
     /// `req.cancel`. Returns one `gen_core::Image` per `req.count` (each with seed `base_seed + index`).
+    ///
+    /// **img2img / `Reference` (sc-11783).** When `clean` is `Some` (the caller VAE-encoded a reference
+    /// image via [`encode_reference`](Self::encode_reference)) and `start_step > 0`, each image blends the
+    /// pre-encoded clean latent with the seeded noise at `σ_start` (`x_t = (1 − σ)·clean + σ·noise`) and
+    /// denoises the **reduced** `start_step..` tail of the σ schedule — the CFG-free Turbo sibling of
+    /// [`render_base`](Self::render_base)'s img2img (sc-8646). `start_step == 0` (`clean` is `None`) is
+    /// pure txt2img: `x_t = noise`, full schedule — byte-identical to the pre-sc-11783 path.
     pub(crate) fn render(
         &self,
         req: &GenerationRequest,
         components: &Components,
+        clean: Option<&Tensor>,
+        start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
@@ -660,16 +669,31 @@ impl Pipeline {
             let sigmas =
                 candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
 
+            // img2img / `Reference` (sc-11783): blend the pre-encoded clean latent with the seeded noise
+            // at `σ_start = sigmas[start]` and denoise the reduced `start..` schedule tail. `start` is
+            // clamped to the schedule because a curated scheduler may return a length ≠ `steps + 1`. For
+            // txt2img (`clean` is `None`, `start_step == 0`) this is `x_t = noise` over the full schedule —
+            // byte-identical to the pre-sc-11783 path. The CFG-free Turbo mirror of `render_base`'s img2img.
+            let start = start_step.min(sigmas.len().saturating_sub(1));
+            let x_t = match clean {
+                Some(clean) => {
+                    let sigma_start = sigmas[start] as f64;
+                    (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
+                }
+                None => noise,
+            };
+            let run_sigmas = &sigmas[start..];
+
             // `prepare_inputs` pads cap_feats to SEQ_MULTI_OF (+ attention mask) and adds the
             // singleton frame axis to the latents → (1, 16, 1, lat_h, lat_w).
-            let prepared = prepare_inputs(&noise, std::slice::from_ref(&cap), &self.device)?;
+            let prepared = prepare_inputs(&x_t, std::slice::from_ref(&cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
 
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
-                &sigmas,
+                run_sigmas,
                 prepared.latents,
                 seed,
                 &req.cancel,
