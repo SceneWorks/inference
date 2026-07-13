@@ -1,0 +1,38 @@
+# 2-member workspace (story 7201): the lean, tensor-free contract crate `core-llm` (this root
+# package) plus the conformance suite `core-llm-testkit` (a separate crate so its harness deps stay
+# out of core-llm's graph). Both are published and co-versioned.
+[workspace]
+members = ["core-llm-testkit"]
+
+[package]
+name = "core-llm"
+version = "0.0.0"
+edition = "2021"
+description = "Backend-neutral contract + host policy + provider registry for an on-device LLM serving engine (no tensors)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/core-llm"
+readme = "README.md"
+keywords = ["llm", "inference", "serving", "contract", "multimodal"]
+categories = ["science"]
+
+[dependencies]
+# Error plumbing.
+thiserror = "2"
+# Link-time provider registration (the DI-container stand-in), matching the mlx-gen convention.
+inventory = "0.3"
+# HF tokenizers (the same Rust core `transformers` wraps) — host-side text<->ids. `onig` only (no
+# http/progressbar): byte-level BPE needs just the regex. Builds tensor-free on Linux/Windows/Mac.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# config.json / tokenizer.json parsing and the JSON-constraint cross-check. `preserve_order` keeps
+# tool-spec/tool-call argument key order insertion-faithful (matching transformers) through the
+# chat-template render and tool-call round-trip (story 7636).
+serde_json = { version = "1", features = ["preserve_order"] }
+# Jinja chat-template rendering (story 7164): HF models ship a Jinja `chat_template`. minijinja is
+# the same engine semantics transformers uses (sandboxed Jinja2). Pure Rust, cross-platform.
+# `json` enables the `tojson` filter the tool-calling templates use to render the `tools` section
+# (story 7636); `preserve_order` keeps that render's key order insertion-faithful.
+minijinja = { version = "2", features = ["json", "preserve_order"] }
+# Python-compatible str methods (.strip()/.startswith()/…) that HF templates rely on.
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+
+# NO tensor dependency and NO gen-ai dependency — this crate must build standalone on any platform.
