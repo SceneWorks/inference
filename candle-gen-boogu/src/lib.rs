@@ -31,15 +31,23 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod vision;
 
+// Boogu Base + Turbo img2img / `Reference` real-weight GPU validation (sc-11786) — env-driven,
+// `#[ignore]`d integration tests driving the REGISTERED Base/Turbo generators through a
+// `Conditioning::Reference` (strength ablation + monotone reference fidelity + prompt divergence),
+// the candle mirror of `mlx-gen-boogu`'s sc-10191 validation.
+#[cfg(test)]
+mod img2img_validate;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::Device;
+use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
     WeightsSource,
 };
+use candle_transformers::models::z_image::vae::Encoder;
 
 use pipeline::{Components, EditComponents};
 
@@ -90,6 +98,12 @@ pub struct BooguGenerator {
     pid_spec: Option<PidWeights>,
     components: Mutex<Option<Arc<Components>>>,
     edit_components: Mutex<Option<Arc<EditComponents>>>,
+    /// Lazily-built, cached f32 VAE **encoder** for the Base/Turbo img2img latent-init path (sc-11786).
+    /// Built on the **first img2img request only** — a pure txt2img (or Edit) workload never populates
+    /// it. Distinct from [`EditComponents`]'s encoder so a plain img2img never loads the Edit vision
+    /// tower. Accel-independent (no attention-dispatch toggle), so one cached instance serves every
+    /// request. Mirrors Z-Image's `vae_encoder` cache.
+    img2img_encoder: Mutex<Option<Arc<Encoder>>>,
 }
 
 impl BooguGenerator {
@@ -110,6 +124,49 @@ impl BooguGenerator {
                 &self.device,
             )?))
         })
+    }
+
+    /// The cached f32 VAE encoder for the img2img latent-init path (sc-11786), built on a miss. Only
+    /// ever called when a Base/Turbo request carries a `Reference` at a strength yielding a non-empty
+    /// denoise (`start_step > 0`), so a txt2img-only workload never builds it.
+    fn img2img_encoder(&self) -> gen_core::Result<Arc<Encoder>> {
+        candle_gen::cached(&self.img2img_encoder, || {
+            Ok(Arc::new(pipeline::load_vae_encoder(
+                &self.root,
+                &self.device,
+            )?))
+        })
+    }
+
+    /// Resolve the Base/Turbo img2img latent-init (sc-11786): the single [`Conditioning::Reference`] +
+    /// its strength-derived `start_step` (via [`pipeline::init_time_step`] over `default_steps`, which
+    /// differs Base vs Turbo), VAE-encoding the reference to the clean init latent only when the strength
+    /// yields a non-empty structure-preserving denoise (`start_step > 0`). Returns `(None, 0)` for a
+    /// pure txt2img request — the render paths then stay byte-identical to the pre-sc-11786 path.
+    fn img2img_init(
+        &self,
+        req: &GenerationRequest,
+        default_steps: usize,
+    ) -> gen_core::Result<(Option<Tensor>, usize)> {
+        let reference = pipeline::resolve_reference(req, self.descriptor.id)?;
+        let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
+        let start_step = reference
+            .map(|(_, strength)| pipeline::init_time_step(steps, strength))
+            .unwrap_or(0);
+        let clean = if start_step > 0 {
+            let (image, _) = reference.expect("start_step > 0 implies a reference");
+            let encoder = self.img2img_encoder()?;
+            Some(pipeline::encode_reference(
+                &encoder,
+                image,
+                req.width,
+                req.height,
+                &self.device,
+            )?)
+        } else {
+            None
+        };
+        Ok((clean, start_step))
     }
 }
 
@@ -135,10 +192,16 @@ impl Generator for BooguGenerator {
                 req.width, req.height
             )));
         }
-        // The Edit variant needs 1..=5 source references; the capability floor already rejects any
-        // Reference/MultiReference on Base/Turbo (their `conditioning` surface is empty).
-        if self.variant == Variant::Edit {
-            resolve_edit_references(req)?;
+        // The Edit variant needs 1..=5 source references; Base/Turbo take at most one (img2img
+        // latent-init, sc-11786) — `resolve_reference` fails fast on a second reference. The capability
+        // floor already rejects a `MultiReference` on Base/Turbo (only `Reference` is advertised there).
+        match self.variant {
+            Variant::Edit => {
+                resolve_edit_references(req)?;
+            }
+            Variant::Base | Variant::Turbo => {
+                pipeline::resolve_reference(req, self.descriptor.id)?;
+            }
         }
         Ok(())
     }
@@ -151,8 +214,32 @@ impl Generator for BooguGenerator {
         self.validate(req)?;
         let comps = self.components()?;
         let images = match self.variant {
-            Variant::Turbo => pipeline::render_turbo(&comps, req, &self.device, on_progress)?,
-            Variant::Base => pipeline::render_base(&comps, req, &self.device, on_progress)?,
+            Variant::Turbo => {
+                // img2img latent-init (sc-11786): a single `Reference` seeds the few-step DMD denoise
+                // from the VAE-encoded reference; no reference (or strength→start 0) stays pure txt2img.
+                let (clean, start_step) = self.img2img_init(req, pipeline::DEFAULT_TURBO_STEPS)?;
+                pipeline::render_turbo(
+                    &comps,
+                    req,
+                    clean.as_ref(),
+                    start_step,
+                    &self.device,
+                    on_progress,
+                )?
+            }
+            Variant::Base => {
+                // img2img latent-init (sc-11786): a single `Reference` seeds the true-CFG denoise from
+                // the VAE-encoded reference; no reference (or strength→start 0) stays pure txt2img.
+                let (clean, start_step) = self.img2img_init(req, pipeline::DEFAULT_STEPS)?;
+                pipeline::render_base(
+                    &comps,
+                    req,
+                    clean.as_ref(),
+                    start_step,
+                    &self.device,
+                    on_progress,
+                )?
+            }
             Variant::Edit => {
                 let references = resolve_edit_references(req)?;
                 let edit = self.edit_components()?;
@@ -192,7 +279,10 @@ fn resolve_edit_references(req: &GenerationRequest) -> gen_core::Result<Vec<&Ima
 }
 
 /// Boogu Base descriptor — true-CFG text-to-image; no user negative prompt (the CFG-negative is the
-/// model's own fixed empty/drop instruction); no img2img/control conditioning on the Base checkpoint.
+/// model's own fixed empty/drop instruction). A single [`ConditioningKind::Reference`] opts into
+/// img2img latent-init (sc-11786): VAE-encode the reference + noise-blend at a strength-derived start
+/// step. The instruction-edit `MultiReference` (Qwen3-VL semantic edit) is the Edit checkpoint's alone
+/// (`descriptor_edit`); Turbo inherits this img2img surface via `descriptor()`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: BOOGU_IMAGE_ID,
@@ -203,7 +293,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: true,
             supports_true_cfg: false,
-            conditioning: Vec::new(),
+            // Base/Turbo are text-to-image, and a single `Reference` opts them into img2img latent-init
+            // (sc-11786): VAE-encode the reference + noise-blend at a strength-derived start step. The
+            // multi-image instruction-edit path is the Edit checkpoint's (`descriptor_edit`).
+            conditioning: vec![ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
             // Base is rectified-flow Euler over the static-shift schedule, routed through the unified
@@ -295,6 +388,7 @@ fn build(
         pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
         edit_components: Mutex::new(None),
+        img2img_encoder: Mutex::new(None),
     }))
 }
 
@@ -345,7 +439,11 @@ mod tests {
         let b = descriptor();
         assert!(b.capabilities.supports_guidance);
         assert!(!b.capabilities.supports_negative_prompt);
-        assert!(b.capabilities.conditioning.is_empty());
+        // sc-11786: Base advertises a single-`Reference` img2img surface (no MultiReference).
+        assert_eq!(
+            b.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         // sc-9607: packed tiers advertised so the worker A-B toggle engages; turbo + edit inherit it.
         assert_eq!(b.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         let t = descriptor_turbo();
@@ -393,9 +491,18 @@ mod tests {
             .capabilities
             .conditioning
             .contains(&ConditioningKind::MultiReference));
-        // Base/Turbo keep an empty conditioning surface (only Edit advertises references).
-        assert!(descriptor().capabilities.conditioning.is_empty());
-        assert!(descriptor_turbo().capabilities.conditioning.is_empty());
+        // Base/Turbo advertise the single-`Reference` img2img surface (sc-11786) but NOT the
+        // multi-image edit path — that stays the Edit checkpoint's alone.
+        for t2i in [descriptor(), descriptor_turbo()] {
+            assert_eq!(
+                t2i.capabilities.conditioning,
+                vec![ConditioningKind::Reference]
+            );
+            assert!(!t2i
+                .capabilities
+                .conditioning
+                .contains(&ConditioningKind::MultiReference));
+        }
     }
 
     #[test]
@@ -450,25 +557,83 @@ mod tests {
     }
 
     #[test]
-    fn base_rejects_reference_conditioning() {
-        // Base has no conditioning surface, so the capability floor rejects a Reference.
+    fn base_and_turbo_accept_a_single_img2img_reference() {
+        // sc-11786: Base/Turbo advertise a single-`Reference` img2img surface, so the capability floor
+        // accepts one reference (with or without a strength) but a second reference on the t2i path is
+        // rejected (single img2img init only; multi-image is the Edit checkpoint's path).
+        let img = |w: u32, h: u32| Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        };
+        let one_ref = || Conditioning::Reference {
+            image: img(512, 512),
+            strength: Some(0.6),
+        };
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
-        let g = registry::load(BOOGU_IMAGE_ID, &spec).unwrap();
-        let r = GenerationRequest {
-            prompt: "x".into(),
+        for id in [BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID] {
+            let g = registry::load(id, &spec).unwrap();
+            let one = GenerationRequest {
+                prompt: "make it autumn".into(),
+                width: 512,
+                height: 512,
+                conditioning: vec![one_ref()],
+                ..Default::default()
+            };
+            assert!(
+                g.validate(&one).is_ok(),
+                "{id}: single Reference is img2img"
+            );
+            // Two references on the t2i path → error (single img2img init only).
+            let two = GenerationRequest {
+                conditioning: vec![one_ref(), one_ref()],
+                ..one
+            };
+            assert!(g.validate(&two).is_err(), "{id}: two references rejected");
+            // A `MultiReference` is not advertised on Base/Turbo → floor rejects it.
+            let multi = GenerationRequest {
+                prompt: "x".into(),
+                width: 512,
+                height: 512,
+                conditioning: vec![Conditioning::MultiReference {
+                    images: vec![img(512, 512), img(512, 512)],
+                }],
+                ..Default::default()
+            };
+            assert!(g.validate(&multi).is_err(), "{id}: MultiReference rejected");
+        }
+    }
+
+    #[test]
+    fn resolve_reference_strength_falls_back_to_request() {
+        // sc-11786: a per-reference `strength` overrides `req.strength`; an unset one falls back to it.
+        let img = Image {
             width: 512,
             height: 512,
+            pixels: vec![0u8; 512 * 512 * 3],
+        };
+        let fallback = GenerationRequest {
+            prompt: "x".into(),
+            strength: Some(0.4),
             conditioning: vec![Conditioning::Reference {
-                image: Image {
-                    width: 512,
-                    height: 512,
-                    pixels: vec![0u8; 512 * 512 * 3],
-                },
+                image: img.clone(),
                 strength: None,
             }],
             ..Default::default()
         };
-        assert!(g.validate(&r).is_err());
+        assert_eq!(
+            pipeline::resolve_reference(&fallback, BOOGU_IMAGE_ID)
+                .unwrap()
+                .unwrap()
+                .1,
+            Some(0.4)
+        );
+        // No reference → None (pure txt2img).
+        assert!(
+            pipeline::resolve_reference(&GenerationRequest::default(), BOOGU_IMAGE_ID)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
