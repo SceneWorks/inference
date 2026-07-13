@@ -507,7 +507,6 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::gen_core;
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -804,11 +803,17 @@ mod tests {
     fn all_three_reachable_via_registry_by_id() {
         for id in [BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID, BOOGU_IMAGE_EDIT_ID] {
             assert!(
-                gen_core::registry::generators().any(|r| (r.descriptor)().id == id),
+                crate::provider_registry()
+                    .unwrap()
+                    .generators()
+                    .copied()
+                    .any(|r| (r.descriptor)().id == id),
                 "id {id} not registered"
             );
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-boogu".into()));
-            let e = gen_core::registry::load(id, &spec)
+            let e = crate::provider_registry()
+                .unwrap()
+                .load(id, &spec)
                 .err()
                 .expect("missing weights → err")
                 .to_string();

@@ -1142,7 +1142,11 @@ mod tests {
     fn registered_in_core_registry() {
         // Linking this crate must self-register the model (inventory link-time collection).
         assert!(
-            mlx_gen::registry::generators().any(|r| (r.descriptor)().id == "sdxl"),
+            crate::provider_registry()
+                .unwrap()
+                .generators()
+                .copied()
+                .any(|r| (r.descriptor)().id == "sdxl"),
             "sdxl is not registered in mlx_gen's generator registry"
         );
     }

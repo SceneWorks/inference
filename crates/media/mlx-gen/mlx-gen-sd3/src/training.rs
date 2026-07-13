@@ -1028,7 +1028,10 @@ mod tests {
     fn both_training_bases_reachable_via_registry() {
         // T4: both the Large and Medium trainers self-register at link time (multi-arm
         // `register_trainer!`). The Medium id must resolve to a registered trainer.
-        let ids: Vec<&str> = gen_core::registry::trainers()
+        let ids: Vec<&str> = crate::provider_registry()
+            .unwrap()
+            .trainers()
+            .copied()
             .map(|r| (r.descriptor)().id)
             .collect();
         assert!(
@@ -1247,7 +1250,11 @@ mod tests {
     #[test]
     fn reachable_via_trainer_registry_by_id() {
         assert!(
-            gen_core::registry::trainers().any(|r| (r.descriptor)().id == SD3_5_LARGE_TRAINER_ID),
+            crate::provider_registry()
+                .unwrap()
+                .trainers()
+                .copied()
+                .any(|r| (r.descriptor)().id == SD3_5_LARGE_TRAINER_ID),
             "trainer id {SD3_5_LARGE_TRAINER_ID} not registered"
         );
     }

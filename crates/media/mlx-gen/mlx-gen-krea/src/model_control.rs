@@ -369,13 +369,18 @@ mod tests {
     #[test]
     fn reachable_via_registry_by_id() {
         assert!(
-            gen_core::registry::generators()
+            crate::provider_registry()
+                .unwrap()
+                .generators()
+                .copied()
                 .any(|r| (r.descriptor)().id == KREA_2_TURBO_CONTROL_ID),
             "id {KREA_2_TURBO_CONTROL_ID} not registered"
         );
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()))
             .with_control(WeightsSource::File("/tmp/control.safetensors".into()));
-        let err = gen_core::registry::load(KREA_2_TURBO_CONTROL_ID, &spec)
+        let err = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_TURBO_CONTROL_ID, &spec)
             .err()
             .expect("missing weights → err")
             .to_string();

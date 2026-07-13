@@ -47,7 +47,10 @@ fn real_weight_base_img2img() {
 
     let spec = LoadSpec::new(WeightsSource::Dir(env_path("ZIMG_BASE_SNAPSHOT")));
     let t0 = std::time::Instant::now();
-    let model = gen_core::registry::load("z_image", &spec).expect("load base z_image");
+    let model = crate::provider_registry()
+        .unwrap()
+        .load("z_image", &spec)
+        .expect("load base z_image");
     println!(
         "resolved id={} backend={} accepts(Reference)={} in {:?}",
         model.descriptor().id,

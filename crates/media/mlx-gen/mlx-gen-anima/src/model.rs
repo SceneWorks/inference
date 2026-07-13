@@ -210,7 +210,6 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::gen_core;
     use mlx_gen::WeightsSource;
 
     fn req(w: u32, h: u32) -> GenerationRequest {
@@ -226,7 +225,11 @@ mod tests {
     fn three_variants_registered() {
         for id in ["anima_base", "anima_aesthetic", "anima_turbo"] {
             assert!(
-                gen_core::registry::generators().any(|r| (r.descriptor)().id == id),
+                crate::provider_registry()
+                    .unwrap()
+                    .generators()
+                    .copied()
+                    .any(|r| (r.descriptor)().id == id),
                 "id {id} not registered"
             );
         }

@@ -1106,7 +1106,11 @@ mod tests {
         // The `inventory::submit!` registration is discoverable through the gen-core trainer registry
         // (what the worker's `gen_core::load_trainer(id, spec)` resolves) — no weights needed.
         assert!(
-            gen_core::registry::trainers().any(|r| (r.descriptor)().id == KREA_2_RAW_TRAINER_ID),
+            crate::provider_registry()
+                .unwrap()
+                .trainers()
+                .copied()
+                .any(|r| (r.descriptor)().id == KREA_2_RAW_TRAINER_ID),
             "trainer id {KREA_2_RAW_TRAINER_ID} not registered"
         );
     }

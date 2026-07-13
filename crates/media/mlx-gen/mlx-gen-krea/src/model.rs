@@ -780,7 +780,6 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::gen_core;
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
 
     fn req(w: u32, h: u32) -> GenerationRequest {
@@ -1017,11 +1016,17 @@ mod tests {
     #[test]
     fn reachable_via_registry_by_id() {
         assert!(
-            gen_core::registry::generators().any(|r| (r.descriptor)().id == KREA_2_TURBO_ID),
+            crate::provider_registry()
+                .unwrap()
+                .generators()
+                .copied()
+                .any(|r| (r.descriptor)().id == KREA_2_TURBO_ID),
             "id {KREA_2_TURBO_ID} not registered"
         );
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()));
-        let e = gen_core::registry::load(KREA_2_TURBO_ID, &spec)
+        let e = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_TURBO_ID, &spec)
             .err()
             .expect("missing weights → err")
             .to_string();
@@ -1073,7 +1078,11 @@ mod tests {
     #[test]
     fn raw_reachable_via_registry_by_id() {
         assert!(
-            gen_core::registry::generators().any(|r| (r.descriptor)().id == KREA_2_RAW_ID),
+            crate::provider_registry()
+                .unwrap()
+                .generators()
+                .copied()
+                .any(|r| (r.descriptor)().id == KREA_2_RAW_ID),
             "id {KREA_2_RAW_ID} not registered"
         );
         // Same snapshot loader as Turbo — a single-file weights source is rejected the same way.
@@ -1122,7 +1131,11 @@ mod tests {
     #[test]
     fn edit_reachable_via_registry_by_id() {
         assert!(
-            gen_core::registry::generators().any(|r| (r.descriptor)().id == KREA_2_EDIT_ID),
+            crate::provider_registry()
+                .unwrap()
+                .generators()
+                .copied()
+                .any(|r| (r.descriptor)().id == KREA_2_EDIT_ID),
             "id {KREA_2_EDIT_ID} not registered"
         );
         // Same snapshot loader as Raw/Turbo — a single-file weights source is rejected the same way.
@@ -1178,7 +1191,11 @@ mod tests {
     #[test]
     fn turbo_edit_reachable_via_registry_by_id() {
         assert!(
-            gen_core::registry::generators().any(|r| (r.descriptor)().id == KREA_2_TURBO_EDIT_ID),
+            crate::provider_registry()
+                .unwrap()
+                .generators()
+                .copied()
+                .any(|r| (r.descriptor)().id == KREA_2_TURBO_EDIT_ID),
             "id {KREA_2_TURBO_EDIT_ID} not registered"
         );
         // Same snapshot loader as the other variants — a single-file weights source is rejected.

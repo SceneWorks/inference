@@ -1127,7 +1127,11 @@ mod tests {
     fn three_trainer_variants_registered() {
         for id in ["anima_base", "anima_aesthetic", "anima_turbo"] {
             assert!(
-                gen_core::registry::trainers().any(|r| (r.descriptor)().id == id),
+                crate::provider_registry()
+                    .unwrap()
+                    .trainers()
+                    .copied()
+                    .any(|r| (r.descriptor)().id == id),
                 "trainer id {id} not registered"
             );
         }

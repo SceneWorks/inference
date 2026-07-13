@@ -410,7 +410,9 @@ mod tests {
         // must find `clip_vit_l14` by id and route to our loader — the error is the weights complaint,
         // NOT "no image embedder registered" (which would mean the registration didn't link).
         let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/nonexistent")));
-        let err = candle_gen::gen_core::load_image_embedder(MODEL_ID, &spec)
+        let err = crate::provider_registry()
+            .unwrap()
+            .load_image_embedder(MODEL_ID, &spec)
             .err()
             .expect("bogus weights should fail to load");
         assert!(
@@ -433,7 +435,9 @@ mod tests {
     #[test]
     fn text_registered_and_discoverable_by_id() {
         let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/nonexistent")));
-        let err = candle_gen::gen_core::load_text_embedder(TEXT_MODEL_ID, &spec)
+        let err = crate::provider_registry()
+            .unwrap()
+            .load_text_embedder(TEXT_MODEL_ID, &spec)
             .err()
             .expect("bogus weights should fail to load");
         assert!(

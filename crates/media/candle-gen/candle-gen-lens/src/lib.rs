@@ -938,7 +938,7 @@ mod integration_tests {
         for id in [MODEL_ID_TURBO, MODEL_ID_BASE] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
             assert!(
-                candle_gen::gen_core::registry::load(id, &spec).is_ok(),
+                crate::provider_registry().unwrap().load(id, &spec).is_ok(),
                 "{id} should resolve + lazily construct in the registry"
             );
         }

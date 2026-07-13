@@ -444,7 +444,6 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::gen_core;
 
     fn caps() -> Capabilities {
         descriptor().capabilities
@@ -692,9 +691,15 @@ mod tests {
     fn reachable_via_registry_by_id() {
         // Linking this crate self-registers ideogram_4; it must be discoverable and resolve to OUR
         // loader (a nonexistent dir fails inside load, NOT with "no generator registered").
-        assert!(gen_core::registry::generators().any(|r| (r.descriptor)().id == MODEL_ID));
+        assert!(crate::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
+            .any(|r| (r.descriptor)().id == MODEL_ID));
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ideogram".into()));
-        let e = gen_core::registry::load(MODEL_ID, &spec)
+        let e = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
             .err()
             .expect("missing weights → err")
             .to_string();
@@ -780,9 +785,15 @@ mod tests {
 
     #[test]
     fn turbo_reachable_via_registry_by_id() {
-        assert!(gen_core::registry::generators().any(|r| (r.descriptor)().id == MODEL_ID_TURBO));
+        assert!(crate::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
+            .any(|r| (r.descriptor)().id == MODEL_ID_TURBO));
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ideogram-turbo".into()));
-        let e = gen_core::registry::load(MODEL_ID_TURBO, &spec)
+        let e = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_TURBO, &spec)
             .err()
             .expect("missing weights → err")
             .to_string();

@@ -391,7 +391,7 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use crate::pipeline::{DEFAULT_GUIDANCE, DEFAULT_STEPS};
-    use mlx_gen::{gen_core, Quant};
+    use mlx_gen::Quant;
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -564,7 +564,10 @@ mod tests {
         // The `register_generators!` submission must surface in the gen-core registry so
         // `gen_core::load("sana_1600m")` resolves on the worker (the dead-strip trap that bit Kolors
         // — covered here by asserting the descriptor is present in the linked registry).
-        let found = gen_core::registry::generators()
+        let found = crate::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
             .map(|reg| (reg.descriptor)())
             .any(|d| d.id == MODEL_ID);
         assert!(
@@ -576,7 +579,10 @@ mod tests {
     #[test]
     fn registry_resolves_sana_sprint_descriptor() {
         // The Sprint variant (sc-8490) must register alongside the base under its own id.
-        let found = gen_core::registry::generators()
+        let found = crate::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
             .map(|reg| (reg.descriptor)())
             .any(|d| d.id == SPRINT_MODEL_ID);
         assert!(

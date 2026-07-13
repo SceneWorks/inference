@@ -423,7 +423,10 @@ mod tests {
     #[test]
     fn registered_in_registry() {
         // The `inventory::submit!`s are linked into the test binary, so the registry finds both ids.
-        let ids: Vec<&str> = mlx_gen::registry::generators()
+        let ids: Vec<&str> = crate::provider_registry()
+            .unwrap()
+            .generators()
+            .copied()
             .map(|r| (r.descriptor)().id)
             .collect();
         assert!(ids.contains(&MODEL_ID), "{MODEL_ID} not registered");

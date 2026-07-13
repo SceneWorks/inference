@@ -290,7 +290,7 @@ mod tests {
                 text_encoder: None,
                 offload_policy: Default::default(),
             };
-            let err = match mlx_gen::load(id, &spec) {
+            let err = match crate::provider_registry().unwrap().load(id, &spec) {
                 Ok(_) => panic!("bogus weights dir must fail to load"),
                 Err(e) => e.to_string(),
             };
