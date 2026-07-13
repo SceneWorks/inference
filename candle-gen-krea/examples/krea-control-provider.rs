@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, Progress, Quant};
 use candle_gen_krea::{
     Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
 };
@@ -35,6 +35,19 @@ struct Args {
     steps: usize,
     size: u32,
     out: PathBuf,
+    /// Quantize the control-branch overlay for the small-card load (sc-11743): `q4` / `q8` keep it
+    /// packed in VRAM (dequant-on-forward), `bf16` (default) is the full-precision branch.
+    branch_quant: Option<Quant>,
+}
+
+/// `q4` / `q8` → the packed branch load; `bf16` → dense. Any other value panics (example CLI).
+fn parse_branch_quant(v: &str) -> Option<Quant> {
+    match v {
+        "q4" | "Q4" => Some(Quant::Q4),
+        "q8" | "Q8" => Some(Quant::Q8),
+        "bf16" | "none" => None,
+        other => panic!("--branch-quant must be q4|q8|bf16 (got {other})"),
+    }
 }
 
 fn parse_args() -> Args {
@@ -48,6 +61,7 @@ fn parse_args() -> Args {
         steps: 8,
         size: 1024,
         out: PathBuf::from("krea_control_provider.png"),
+        branch_quant: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -68,6 +82,7 @@ fn parse_args() -> Args {
             "--steps" => a.steps = val().parse().expect("--steps"),
             "--size" => a.size = val().parse().expect("--size"),
             "--out" => a.out = val().into(),
+            "--branch-quant" => a.branch_quant = parse_branch_quant(&val()),
             other => panic!("unknown flag {other}"),
         }
         i += 2;
@@ -98,10 +113,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         root: a.snapshot,
         control: a.ckpt,
         adapters: Vec::new(),
+        branch_quant: a.branch_quant,
     })?;
     eprintln!(
-        "loaded Krea2Control; rendering {}x{} @ scale {}",
-        a.size, a.size, a.scale
+        "loaded Krea2Control (branch_quant {:?}); rendering {}x{} @ scale {}",
+        a.branch_quant, a.size, a.size, a.scale
     );
 
     let req = Krea2ControlRequest {
