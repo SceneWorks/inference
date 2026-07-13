@@ -826,6 +826,7 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             supports_kv_cache: false,
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
+            supports_sequential_offload: true,
         },
     }
 }

@@ -128,6 +128,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_kv_cache: true,
             // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
             requires_sigma_shift: true,
+            supports_sequential_offload: false,
         },
     }
 }

@@ -118,6 +118,7 @@ impl ChromaVariant {
                 // The static-shift / beta sigma schedule is applied inside the candle pipeline, so the
                 // worker needs no sigma-shift loader hint (matches the candle FLUX/Z-Image slices).
                 requires_sigma_shift: false,
+                supports_sequential_offload: false,
             },
         }
     }

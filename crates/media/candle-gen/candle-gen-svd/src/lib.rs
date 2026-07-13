@@ -180,6 +180,7 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: false,
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            supports_sequential_offload: false,
             supported_quants: &[],
         },
     }

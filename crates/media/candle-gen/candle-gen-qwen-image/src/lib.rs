@@ -673,6 +673,7 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[] as &[Quant],
             supports_kv_cache: false,
             requires_sigma_shift: true,
+            supports_sequential_offload: true,
         },
     }
 }

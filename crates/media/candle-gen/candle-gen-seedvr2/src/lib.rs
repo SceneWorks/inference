@@ -88,6 +88,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             mac_only: false,
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            supports_sequential_offload: false,
             supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5927)
         },
     }

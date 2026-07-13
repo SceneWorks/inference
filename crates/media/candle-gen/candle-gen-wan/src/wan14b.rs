@@ -724,6 +724,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            supports_sequential_offload: false,
         },
     }
 }

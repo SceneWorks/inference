@@ -274,6 +274,7 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            supports_sequential_offload: false,
         },
     }
 }

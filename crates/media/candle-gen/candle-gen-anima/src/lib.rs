@@ -106,6 +106,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supported_quants: ANIMA_QUANTS,
             supports_kv_cache: false,
             requires_sigma_shift: true,
+            supports_sequential_offload: false,
         },
     }
 }

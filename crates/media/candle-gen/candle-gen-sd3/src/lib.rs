@@ -219,6 +219,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // SD3.5 is a flow-match model; the resolution-independent σ-shift is applied by the
             // pipeline, so it does not require the loader to pre-shift.
             requires_sigma_shift: false,
+            supports_sequential_offload: false,
         },
     }
 }

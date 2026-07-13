@@ -695,6 +695,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
+            supports_sequential_offload: false,
         },
     }
 }
