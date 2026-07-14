@@ -289,7 +289,7 @@ def main() -> int:
 
     snap = _snapshot_dir()
     print(f"loading MochiPipeline from {snap} (device={DEVICE}, dtype={DTYPE})")
-    pipe = MochiPipeline.from_pretrained(snap, torch_dtype=DTYPE)
+    pipe = MochiPipeline.from_pretrained(snap, torch_dtype=DTYPE, variant="bf16")
     pipe.to(DEVICE)
 
     # TE embeds are needed to drive e2e/dit_block; compute them if any of those run.
