@@ -76,3 +76,12 @@ repositories or recreate their global discovery behavior in application code.
 Once the SceneWorks cutover is green, future inference changes land in this
 repository and follow its release train. The legacy product cutoffs above remain
 historical provenance only.
+
+> **Superseded 2026-07-14:** the expectation in the paragraph above did not hold
+> immediately. Epic 10834 (sequential component residency) continued and completed
+> in the legacy repositories the day after this release, advancing `mlx-gen` to
+> `45428fa` and `candle-gen` to `ef84441`. That drift was reconciled into the
+> monorepo as `runtime-2026.07.2`; see
+> [`RUNTIME_2026_07_2_CHECKPOINT.md`](RUNTIME_2026_07_2_CHECKPOINT.md). Legacy
+> development is now halted pending the durable decision on whether the monorepo is
+> the sole live development line.

@@ -18,6 +18,10 @@ Post-import source activity is mapped separately in
 the observed legacy heads and the canonical commit preserving each first-parent
 effect after workspace normalization.
 
+Legacy activity that landed *after* the `runtime-2026.07.1` cutover is mapped in
+[`post-cutover-reconciliation-epic-10834.toml`](post-cutover-reconciliation-epic-10834.toml)
+(the sequential-residency epic, reconciled as `runtime-2026.07.2`).
+
 ## Checkpoints
 
 - [`PHASE_1_CHECKPOINT.md`](PHASE_1_CHECKPOINT.md): history import and exact tree equivalence
@@ -25,6 +29,7 @@ effect after workspace normalization.
 - [`PHASE_3_CHECKPOINT.md`](PHASE_3_CHECKPOINT.md): CI selection and release-train tooling
 - [`PHASE_4_CHECKPOINT.md`](PHASE_4_CHECKPOINT.md): explicit LLM/media composition and named runtime bundles
 - [`RUNTIME_2026_07_1_CHECKPOINT.md`](RUNTIME_2026_07_1_CHECKPOINT.md): final product-cutoff reconciliation and consumer cutover boundary
+- [`RUNTIME_2026_07_2_CHECKPOINT.md`](RUNTIME_2026_07_2_CHECKPOINT.md): post-cutover reconciliation of legacy epic 10834 (sequential component residency) into the monorepo
 
 The checkpoints record how the migration was executed and validated. The reasons
 for the repository and explicit registry/bundle decisions are recorded separately

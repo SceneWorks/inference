@@ -18,6 +18,13 @@ have been removed. Phase 5 published immutable release `runtime-2026.07.0` and c
 and ChatWorks lockfiles over to its exact commit. Local product validation is complete; hosted
 SceneWorks validation requires its scoped credential for this private repository.
 
+After the cutover, the legacy MLX generation repository received one further epic
+(10834, sequential component residency). That post-cutover drift was reconciled into
+the monorepo and published as `runtime-2026.07.2`; see
+[`docs/migration/RUNTIME_2026_07_2_CHECKPOINT.md`](docs/migration/RUNTIME_2026_07_2_CHECKPOINT.md).
+Legacy development is halted pending the durable decision on whether the monorepo is
+the sole live development line.
+
 The current authoritative migration plan and release-set baseline live in the
 SceneWorks repository under `documents/rearchitecture/`.
 
