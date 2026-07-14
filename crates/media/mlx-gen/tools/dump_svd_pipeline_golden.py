@@ -24,6 +24,17 @@ from safetensors.numpy import save_file
 
 from _paths import fixture, hf_hub_cache
 
+
+def _f32(t: torch.Tensor) -> np.ndarray:
+    # `.contiguous()` before `.numpy()` is REQUIRED. `pipe.decode_latents` returns a channels-last /
+    # non-contiguous tensor (stride[C] == 1); `safetensors.numpy.save_file` serializes the raw buffer
+    # against the declared C-contiguous shape, so a strided array is SILENTLY mis-stored — the reloaded
+    # golden then differs from the in-memory tensor by O(1). `.contiguous()` is a harmless no-op for the
+    # already-contiguous tensors here. Same bug as sc-11985 (Mochi A2, dump_mochi_golden.py); see memory
+    # `safetensors_numpy_noncontiguous_silent_corruption`.
+    return t.detach().to("cpu", torch.float32).contiguous().numpy()
+
+
 SNAP = (
     hf_hub_cache()
     / "models--stabilityai--stable-video-diffusion-img2vid-xt"
@@ -82,12 +93,12 @@ with torch.no_grad():
     frames = pipe.decode_latents(final_latents, F, decode_chunk_size=F)  # [1,3,F,64,64]
 
 tensors = {
-    "image_embeds": image_embeds.numpy().astype(np.float32),
-    "image_latents": image_latents.numpy().astype(np.float32),
-    "added_time_ids": added_time_ids.numpy().astype(np.float32),
-    "init_latents": init_latents.numpy().astype(np.float32),
-    "final_latents": final_latents.numpy().astype(np.float32),
-    "frames": frames.numpy().astype(np.float32),  # [1,3,F,64,64]
+    "image_embeds": _f32(image_embeds),
+    "image_latents": _f32(image_latents),
+    "added_time_ids": _f32(added_time_ids),
+    "init_latents": _f32(init_latents),
+    "final_latents": _f32(final_latents),
+    "frames": _f32(frames),  # [1,3,F,64,64] — channels-last decode output; _f32 makes it contiguous
     "meta": np.array([F, steps], dtype=np.int32),
     "guidance": np.array([min_g, max_g], dtype=np.float32),
 }

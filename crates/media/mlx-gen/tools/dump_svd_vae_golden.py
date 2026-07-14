@@ -21,6 +21,17 @@ from safetensors.numpy import save_file
 
 from _paths import fixture, hf_hub_cache
 
+
+def _f32(t: torch.Tensor) -> np.ndarray:
+    # `.contiguous()` before `.numpy()` is REQUIRED. The `AutoencoderKLTemporalDecoder` decode output
+    # is channels-last / non-contiguous (stride[C] == 1). `safetensors.numpy.save_file` serializes the
+    # raw buffer against the declared C-contiguous shape, so a strided array is SILENTLY mis-stored —
+    # the reloaded golden then differs from the in-memory tensor by O(1). `.contiguous()` is a harmless
+    # no-op for already-contiguous tensors (the encode `mode` here). Same bug as sc-11985 (Mochi A2,
+    # dump_mochi_golden.py); see memory `safetensors_numpy_noncontiguous_silent_corruption`.
+    return t.detach().to("cpu", torch.float32).contiguous().numpy()
+
+
 SNAP = (
     hf_hub_cache()
     / "models--stabilityai--stable-video-diffusion-img2vid-xt"
@@ -41,9 +52,9 @@ z = rng.standard_normal((num_frames, 4, 8, 8)).astype(np.float32)
 
 with torch.no_grad():
     mode = vae.encode(torch.from_numpy(image)).latent_dist.mode()
-    mode = mode.cpu().numpy().astype(np.float32)  # [1,4,8,8]
+    mode = _f32(mode)  # [1,4,8,8]
     frames = vae.decode(torch.from_numpy(z), num_frames=num_frames).sample
-    frames = frames.cpu().numpy().astype(np.float32)  # [F,3,64,64]
+    frames = _f32(frames)  # [F,3,64,64] — channels-last decode output; _f32 makes it contiguous
 
 tensors = {
     "image": image,  # NCHW
