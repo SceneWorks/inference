@@ -475,7 +475,15 @@ impl Krea {
             // Ground on ALL edit sources (scene + person), not just the first (F-071); run the vision
             // tower ONCE and reuse it for both the positive and (CFG) negative grounded encode (F-073).
             let gv = text.run_vision(edit_sources)?;
-            let pos = text.encode_grounded_from_vision(&gv, &req.prompt)?;
+            // The optional "text style" tap-reweight gain (sc-12009) applies to the POSITIVE grounded
+            // context — the grounded encode returns the SAME `[b, n_tok, 12, hidden]` tap structure the
+            // plain encode does, so `apply_tap_weights` is shape-safe. The CFG-negative grounded context
+            // is left untouched so the knob steers only the conditional prediction (mirrors the plain
+            // Raw branch below); `None`/g≈1 is a no-op.
+            let pos = maybe_apply_style_gain(
+                text.encode_grounded_from_vision(&gv, &req.prompt)?,
+                req.text_style_gain,
+            )?;
             let neg = if guidance > 0.0 {
                 Some(text.encode_grounded_from_vision(&gv, negative)?)
             } else {

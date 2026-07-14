@@ -25,7 +25,7 @@ use std::path::Path;
 
 use crate::config::Krea2Config;
 use crate::control::Krea2ControlBranch;
-use crate::pipeline::{KreaHeavy, KreaText, TurboOptions};
+use crate::pipeline::{maybe_apply_style_gain, KreaHeavy, KreaText, TurboOptions};
 
 /// Registry id for the Krea 2 Turbo pose-ControlNet variant. Matches the SceneWorks worker's
 /// `STRICT_CONTROL_ENGINES` `krea_2_turbo_control` id and the candle lane, so one id serves both
@@ -292,13 +292,15 @@ impl KreaTurboControl {
         let text_co_resident = !self.residency.is_sequential();
 
         // Phase A: prompt → context (sc-11101; sc-11125). Pose control is CFG-free (one context, no
-        // negative). Under `Sequential` the shared seam loads the text phase, encodes, materializes,
-        // then DROPS it + `clear_cache()` before the DiT/VAE/branch load below.
+        // negative), so the optional "text style" tap-reweight gain (sc-12009) applies to this single
+        // conditional context — the same tap structure the txt2img/img2img encode carries (`None`/g≈1 is
+        // a no-op). Under `Sequential` the shared seam loads the text phase, encodes, materializes, then
+        // DROPS it + `clear_cache()` before the DiT/VAE/branch load below.
         self.residency.run(
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text: &KreaText| text.encode(&req.prompt),
+            |text: &KreaText| maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain),
             // Materialize the context while the text phase is still alive (Sequential only).
             |ctx: &Array| Ok(mlx_rs::transforms::eval([ctx])?),
             // Phase B: heavy render components (DiT + VAE + the pose branch). The render loop below runs
