@@ -15,7 +15,7 @@ use mlx_gen::gen_core;
 use mlx_gen::{
     require_base_dir, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
     Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Precision,
-    Progress, Residency, Result,
+    Progress, Quant, Residency, Result,
 };
 
 use mlx_gen::default_seed;
@@ -75,6 +75,15 @@ pub struct KreaTurboControl {
 struct ControlHeavyOwned {
     heavy: KreaHeavy,
     branch: Krea2ControlBranch,
+    /// The effective base-DiT quant tier (`None` = dense bf16). Captured at load so the render-time
+    /// decode-tiling budget gate (sc-11747) can weigh the resident-weight footprint without re-deriving
+    /// it from the (post-quant) modules.
+    base_tier: Option<Quant>,
+    /// The tier the pose branch was actually packed to at load (sc-11748) — `Some` only when the
+    /// branch-quant lever engaged, else `None` (bf16). Feeds the same decode-tiling gate.
+    branch_tier: Option<Quant>,
+    /// Architecture config, retained for the decode-tiling cost model (block/hidden/FFN widths).
+    cfg: Krea2Config,
 }
 
 /// A borrow of the pose-control heavy components, so the render loop runs identically whether they are
@@ -183,8 +192,13 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 /// Quant order mirrors the txt2img lane (sc-11727): install adapters, THEN quantize, so the residual
 /// stacks over the (possibly already-packed) base. A pre-packed snapshot needs no `spec.quantize` — the
 /// auto-detecting loader already built packed Linears in [`KreaHeavy::from_snapshot`], and
-/// [`crate::model::load_time_quant_bits`] returns `None` (or errors on a bit mismatch). The pose branch
-/// stays bf16: its overlay carries no `.scales`, and [`KreaHeavy::quantize`] only touches the base DiT.
+/// [`crate::model::load_time_quant_bits`] returns `None` (or errors on a bit mismatch).
+///
+/// The pose branch loads bf16 from its overlay (it carries no `.scales`), then is budget-gated to the
+/// base tier at load (sc-11748): [`crate::memory::should_quantize_control_branch`] packs it only when the
+/// base is itself packed AND the device budget won't fit the bf16 branch — otherwise the branch stays
+/// bf16 (a large-memory Mac pays no dequant-on-forward tax, per sc-11750). It is a LOAD-TIME decision (a
+/// resident weight can't be re-packed mid-render).
 fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned> {
     let mut heavy = KreaHeavy::from_snapshot(root)?;
     if !spec.adapters.is_empty() {
@@ -195,8 +209,46 @@ fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned>
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let cfg = Krea2Config::from_snapshot(root)?;
-    let branch = Krea2ControlBranch::from_source(control, &cfg)?;
-    Ok(ControlHeavyOwned { heavy, branch })
+    let mut branch = Krea2ControlBranch::from_source(control, &cfg)?;
+    // sc-11748 — budget-gated branch quant. The pose overlay always loads bf16; pack it to the base tier
+    // ONLY when the base is itself packed AND the device budget won't fit the bf16 branch at the lane's
+    // worst-case resolution. This is a LOAD-TIME gate: the branch is a resident weight that cannot be
+    // re-packed mid-render, so the decision is made once here (matching whichever tier the base runs at,
+    // whether packed at load or a pre-packed turnkey). A large-memory Mac keeps the branch bf16 — no
+    // dequant-on-forward — per sc-11750; `control_scale == 0` stays bit-exact to the base at any tier.
+    let base_bits = crate::model::effective_base_quant_bits(spec, root, KREA_2_TURBO_CONTROL_ID)?;
+    let base_tier = tier_from_bits(base_bits);
+    let mut branch_tier = None;
+    if let Some(bits) = base_bits {
+        if crate::memory::should_quantize_control_branch(
+            mlx_gen::memory::safe_budget_gib(),
+            &cfg,
+            branch.num_blocks(),
+            base_bits,
+            crate::model::RES_MAX,
+        ) {
+            branch.quantize(bits)?;
+            branch_tier = tier_from_bits(Some(bits));
+        }
+    }
+    Ok(ControlHeavyOwned {
+        heavy,
+        branch,
+        base_tier,
+        branch_tier,
+        cfg,
+    })
+}
+
+/// Map an effective quant width (`4`/`8`) to the [`Quant`] tier the decode-tiling cost model weighs; any
+/// other width (or dense bf16) has no tier. Mirrors `crate::memory::tier_from_bits`, which is private to
+/// that module.
+fn tier_from_bits(bits: Option<i32>) -> Option<Quant> {
+    match bits {
+        Some(4) => Some(Quant::Q4),
+        Some(8) => Some(Quant::Q8),
+        _ => None,
+    }
 }
 
 /// The pose branch is pose-only (`Only([Pose])`) and defaults an unset `control_scale` to the S0 mid
@@ -233,6 +285,12 @@ impl KreaTurboControl {
         // The required pose skeleton + its resolved scale (unset → the 0.6 default; Some(0.0) inert).
         let (control_image, control_scale) = self.resolve_control(req)?;
 
+        // Under `Resident` the phase-A Qwen3-VL encoder stays warm through the decode, so its footprint
+        // co-resides in the decode peak; under `Sequential` it was dropped before the heavy phase. The
+        // decode-tiling budget gate (sc-11747) needs to know which, so capture it here (before the
+        // `residency.run` borrow) to avoid capturing `self` in the heavy closure below.
+        let text_co_resident = !self.residency.is_sequential();
+
         // Phase A: prompt → context (sc-11101; sc-11125). Pose control is CFG-free (one context, no
         // negative). Under `Sequential` the shared seam loads the text phase, encodes, materializes,
         // then DROPS it + `clear_cache()` before the DiT/VAE/branch load below.
@@ -248,6 +306,31 @@ impl KreaTurboControl {
             |heavy_owned, context, on_progress| {
                 let heavy = heavy_owned.as_ref();
 
+                // Budget-gated decode tiling (sc-11747): estimate the Qwen-VAE decode peak from this
+                // render's shape + the resident-weight footprint (base tier + pose branch tier) and, if it
+                // exceeds this machine's `safe_budget_gib()`, size the largest tile that fits — else run
+                // single-pass (a machine with headroom pays zero tiling overhead). Count-invariant (shape
+                // + tiers only), so it is decided ONCE here and reused for every seed. An infeasible
+                // decode surfaces here as a catchable error, before the render, rather than an OOM mid-run.
+                let decode_tiling = crate::memory::plan_control_decode_tiling(
+                    mlx_gen::memory::safe_budget_gib(),
+                    &heavy_owned.cfg,
+                    heavy.branch.num_blocks(),
+                    heavy_owned.base_tier,
+                    heavy_owned.branch_tier,
+                    req.width,
+                    req.height,
+                    text_co_resident,
+                )?;
+
+                // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
+                // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
+                // noise. Build the plan ONCE; each seed reuses it via `render_control_from`.
+                let plan =
+                    heavy
+                        .heavy
+                        .prepare_control(&context, control_image, req.width, req.height)?;
+
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let opts = TurboOptions {
@@ -258,11 +341,11 @@ impl KreaTurboControl {
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
                     };
-                    let img = heavy.heavy.render_turbo_control(
-                        &context,
+                    let img = heavy.heavy.render_control_from(
+                        &plan,
                         heavy.branch,
-                        control_image,
                         control_scale,
+                        decode_tiling.as_ref(),
                         &opts,
                         &req.cancel,
                         on_progress,
@@ -301,7 +384,8 @@ impl Generator for KreaTurboControl {
 // because `validate` adds the control-present check beyond the shared `validate_request`, so it is not
 // the plain delegation `impl_generator!` expresses (the z-image control precedent).
 mlx_gen::register_generators! {
-    pub(crate) const CONTROL_REGISTRATION = descriptor => load
+    pub(crate) const CONTROL_REGISTRATION = descriptor => load;
+    footprint = crate::model::component_footprint
 }
 
 #[cfg(test)]

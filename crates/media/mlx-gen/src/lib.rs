@@ -69,6 +69,10 @@ pub mod tiling {
 pub mod transform {
     pub use gen_core::transform::*;
 }
+// Array-level tiled-decode blend loop (sc-11747): the MLX half of the gen-core tiling seam, shared by
+// every VAE that tiles a decode (Wan z16/z48, Qwen-Image). gen-core carries the pure geometry
+// ([`tiling::TilePlan`]); this carries the tensor loop.
+pub mod vae_tiling;
 
 pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
@@ -82,6 +86,7 @@ pub use gen_core::sampling::{
     DiscreteModelSampling, EdmModelSampling, ModelSampling, PredictionType, Scheduler, Solver,
     TimestepConvention, VpCapturePlan,
 };
+pub use gen_core::weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
     GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
@@ -89,8 +94,8 @@ pub use generator::{
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{
-    CaptionerRegistration, ModelRegistration, ProviderRegistry, ProviderRegistryBuilder,
-    TrainerRegistration, TransformRegistration,
+    CaptionerRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
+    ProviderRegistryBuilder, TrainerRegistration, TransformRegistration,
 };
 pub use residency::Residency;
 pub use runtime::{

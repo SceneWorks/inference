@@ -1,4 +1,7 @@
 /// Define a generator registration constant for an explicit provider catalog.
+///
+/// The optional `footprint` form keeps provider-owned component accounting attached to the same
+/// explicit registration that owns loading; no process-global inventory is involved.
 #[macro_export]
 macro_rules! register_generators {
     ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
@@ -6,6 +9,17 @@ macro_rules! register_generators {
             $crate::registry::ModelRegistration {
                 descriptor: $desc,
                 load: |spec| $load(spec).map_err(::core::convert::Into::into),
+                footprint: ::core::option::Option::None,
+            };
+    };
+    ( $vis:vis const $name:ident = $desc:path => $load:path ; footprint = $fp:path $(,)? ) => {
+        $vis const $name: $crate::registry::ModelRegistration =
+            $crate::registry::ModelRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+                footprint: ::core::option::Option::Some(
+                    |spec| $fp(spec).map_err(::core::convert::Into::into)
+                ),
             };
     };
 }

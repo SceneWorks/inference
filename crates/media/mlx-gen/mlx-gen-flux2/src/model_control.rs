@@ -372,7 +372,8 @@ impl Generator for Flux2DevControl {
 // above stays hand-written because `validate` adds a control-conditioning check beyond the shared
 // `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! {
-    pub(crate) const DEV_CONTROL_REGISTRATION = descriptor_dev_control => load_dev_control
+    pub(crate) const DEV_CONTROL_REGISTRATION = descriptor_dev_control => load_dev_control;
+    footprint = crate::model::component_footprint
 }
 
 #[cfg(test)]

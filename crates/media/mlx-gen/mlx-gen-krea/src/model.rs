@@ -8,6 +8,7 @@
 //! end-to-end Turbo t2i [`crate::pipeline`] in sc-7571. [`Krea::generate`] now renders real images
 //! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
+use mlx_gen::img2img::init_time_step;
 use mlx_gen::media::Image;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
@@ -21,7 +22,10 @@ use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
 use mlx_rs::Array;
 use std::path::Path;
 
-use crate::pipeline::{base_schedule, turbo_schedule, KreaHeavy, KreaText, TurboOptions};
+use crate::pipeline::{
+    base_schedule, maybe_apply_style_gain, turbo_schedule, EditPlan, Img2ImgPlan, KreaHeavy,
+    KreaText, T2iPlan, TurboOptions,
+};
 
 /// Read the on-disk packed-quantization bits from `transformer/config.json` for a pre-quantized
 /// (Group-B packed) Krea turnkey (`"quantization": {"bits", "group_size"}`); `None` for dense.
@@ -42,7 +46,9 @@ pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
 const MAX_COUNT: u32 = 8;
 /// Resolution bounds (W/H). Turbo renders up to 2048²; the catalog/worker gate the UI options tighter.
 const RES_MIN: u32 = 256;
-const RES_MAX: u32 = 2048;
+/// `pub(crate)` so the pose-control lane's load-time branch-quant gate (sc-11748) can size its
+/// worst-case-resolution estimate against the largest render the model can serve.
+pub(crate) const RES_MAX: u32 = 2048;
 /// patch_size(2)·vae_downsample(8) = 16 — patchify requires W/H divisible by this.
 const RES_MULTIPLE: u32 = 16;
 
@@ -63,6 +69,9 @@ pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 /// manifest `default_steps` / `defaults.guidanceScale` mirror these (sc-9999 / sc-10003).
 const DEFAULT_RAW_STEPS: u32 = 52;
 const DEFAULT_RAW_GUIDANCE: f32 = 3.5;
+/// img2img reference fidelity default when neither the `Reference`'s own `strength` nor the
+/// request-level `strength` is set — the full-range slider's midpoint (epic 8588 A2/A3).
+const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
 
 /// Registry id for the **image-edit** variant (epic 10871). The Kontext-style edit surface shares the
 /// undistilled Raw pipeline (full-CFG, denoise-from-noise) but routes a single `Reference` — the SOURCE
@@ -365,6 +374,27 @@ pub(crate) fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Re
     }
 }
 
+/// The base DiT's **effective** quant bits for the pose-control branch gate (sc-11748): the tier the base
+/// actually runs at, whether packed AT LOAD (a dense snapshot + `spec.quantize`) or ALREADY packed on
+/// disk (a Q4/Q8 turnkey). Distinct from [`load_time_quant_bits`], which returns `None` for a pre-packed
+/// turnkey (there is nothing to quantize *at load*) — but a pre-packed base still has a tier the pose
+/// branch should match. `None` ⇒ a dense bf16 base (no tier). Surfaces the same packed-vs-requested
+/// mismatch error as [`load_time_quant_bits`].
+pub(crate) fn effective_base_quant_bits(
+    spec: &LoadSpec,
+    root: &Path,
+    id: &str,
+) -> Result<Option<i32>> {
+    if let Some(packed) = packed_quant_bits(root) {
+        // Pre-packed turnkey: run load_time_quant_bits for its packed-vs-requested mismatch guard (e.g. a
+        // Q4 request over a Q8 turnkey), then report the on-disk tier (load_time_quant_bits itself
+        // returns None here).
+        load_time_quant_bits(spec, root, id)?;
+        return Ok(Some(packed));
+    }
+    load_time_quant_bits(spec, root, id)
+}
+
 /// Load the Krea text phase (tokenizer + Qwen3-VL-4B condition encoder + vision tower) — the component
 /// dropped first under `Sequential`. Applies the optional (F-076-guarded) text-encoder quantize; the
 /// VAE + vision tower stay dense (the monolithic `KreaPipeline::quantize` quantized `te` + `dit`, not
@@ -433,24 +463,30 @@ impl Krea {
         is_edit: bool,
         guidance: f32,
         negative: &str,
-        edit_source: Option<&Image>,
+        edit_sources: &[&Image],
     ) -> Result<KreaContexts> {
         if is_edit {
-            let src = edit_source.ok_or_else(|| {
-                Error::Msg(format!(
+            if edit_sources.is_empty() {
+                return Err(Error::Msg(format!(
                     "{}: edit requires a source image",
                     self.descriptor.id
-                ))
-            })?;
-            let pos = text.encode_grounded(src, &req.prompt)?;
+                )));
+            }
+            // Ground on ALL edit sources (scene + person), not just the first (F-071); run the vision
+            // tower ONCE and reuse it for both the positive and (CFG) negative grounded encode (F-073).
+            let gv = text.run_vision(edit_sources)?;
+            let pos = text.encode_grounded_from_vision(&gv, &req.prompt)?;
             let neg = if guidance > 0.0 {
-                Some(text.encode_grounded(src, negative)?)
+                Some(text.encode_grounded_from_vision(&gv, negative)?)
             } else {
                 None
             };
             Ok(KreaContexts { pos, neg })
         } else if is_raw {
-            let pos = text.encode(&req.prompt)?;
+            // POSITIVE context carries the Krea "text style" tap-reweight gain (sc-11878); the
+            // CFG-negative context is encoded WITHOUT it so the knob steers only the conditional
+            // prediction (mirrors candle-gen-krea `encode_prompt_context`). `None`/g≈1 is a no-op.
+            let pos = maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
             let neg = if guidance > 0.0 {
                 Some(text.encode(negative)?)
             } else {
@@ -458,8 +494,9 @@ impl Krea {
             };
             Ok(KreaContexts { pos, neg })
         } else {
+            // Turbo (CFG-free) t2i/img2img: single conditional context, gain applied (no negative).
             Ok(KreaContexts {
-                pos: text.encode(&req.prompt)?,
+                pos: maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?,
                 neg: None,
             })
         }
@@ -503,7 +540,6 @@ impl Krea {
         } else {
             turbo_schedule(steps, req.scheduler.as_deref())
         };
-        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
         // Edit extracts its own ordered source list (a single `Reference` or a `MultiReference`
         // scene+person pair, epic 10871 P1.3); img2img/t2i use the single-`Reference` helper. Kept
         // separate so an edit's `MultiReference` never trips `single_reference`'s "exactly one
@@ -516,20 +552,26 @@ impl Krea {
         let reference = if is_edit {
             None
         } else {
-            single_reference(req)?
+            single_reference(self.descriptor.id, req)?
         };
-        // A PiD `from_ldm` early-stop CAPTURE is not wired for img2img yet (sc-10121): reject THAT combo
-        // rather than silently desync the decoder's σ from the img2img-sliced schedule. A capture is
-        // active only when `keep` lands BEFORE the end of the schedule; the no-capture path reports
-        // `keep == sigmas.len()` and is fine with img2img (`flow_capture_for_request` returns
-        // `sigmas.len()`, NOT `usize::MAX`, for no-capture).
-        if img2img_conflicts_with_capture(reference.is_some(), keep, sigmas.len()) {
-            return Err(Error::Msg(format!(
-                "{}: PiD from_ldm early-stop is not supported with img2img reference conditioning \
-                 (tracked in sc-10121)",
-                self.descriptor.id
-            )));
-        }
+        // img2img resolves the PiD `from_ldm` capture against the SLICED window it actually denoises
+        // (sc-10121). An img2img job seeds the denoise at `start = init_time_step(strength)` and runs
+        // `sigmas[start..]`, so the capture index and its degrade σ MUST be resolved with that `start`
+        // or the decoder's σ desyncs from the truncated latent. `flow_capture_for_request`'s
+        // `start_step` does exactly that: it drops a capture whose ceiling would land at/before `start`
+        // (no benefit) and otherwise returns a `keep` (into the full schedule) whose `sigmas[keep-1]`
+        // matches the `render_*_img2img_from` truncation `sigmas[start..keep]` — so `capture_sigma`
+        // always names the σ of the latent actually handed to PiD. t2i / edit / control denoise the
+        // whole schedule from pure noise → `start = 0` (the reference-less default).
+        let img2img_strength = reference.map(|(_, ref_strength)| {
+            ref_strength
+                .or(req.strength)
+                .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
+        });
+        let start_step = img2img_strength
+            .map(|s| init_time_step(steps, Some(s)).min(sigmas.len().saturating_sub(1)))
+            .unwrap_or(0);
+        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
         // Raw CFG knobs: guidance defaults to the reference Raw preset, an empty/absent negative → ""
         // (reference `negative_prompts = [""] * n`). Inert on the Turbo (CFG-free) t2i/img2img path.
         // FORCED to 0 for `krea_2_turbo_edit` so the edit runs a single conditional forward — its
@@ -545,14 +587,21 @@ impl Krea {
         // Phase A: prompt → context(s) (sc-11101; sc-11125). Under `Sequential` the shared seam loads
         // the Qwen3-VL-4B text phase, encodes, materializes, then DROPS it + `clear_cache()` so its
         // ~4 GB frees before the DiT/VAE load below — the peak-bounding win. Under `Resident` it borrows
-        // the warm text phase. Edit grounds on the first source image.
-        let edit_source = edit_sources.first().copied();
+        // the warm text phase. Edit grounds on ALL source images (scene + person), F-071.
         self.residency.run(
             &req.cancel,
             req.use_pid,
             on_progress,
             |text: &KreaText| {
-                self.encode_contexts(text, req, is_raw, is_edit, guidance, &negative, edit_source)
+                self.encode_contexts(
+                    text,
+                    req,
+                    is_raw,
+                    is_edit,
+                    guidance,
+                    &negative,
+                    &edit_sources,
+                )
             },
             // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
@@ -580,6 +629,66 @@ impl Krea {
                 )?;
                 let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
+                // Hoist the count-invariant work OUT of the per-image loop (F-073): the reference/pose
+                // VAE encodes and the step-invariant text-fusion + host-RoPE prep depend only on the
+                // (shared) context + target geometry, NOT the per-seed noise. Build the plan ONCE here;
+                // each seed below reuses it via the `render_*_from` seam (byte-identical to the pre-hoist
+                // per-seed build — the prep only ever read the latent *shape*). An 8-count two-source
+                // edit thus does 2 VAE encodes + 2 preps total, not 16 + 16.
+                let plan = if is_edit {
+                    // Kontext-style edit (epic 10871): the source image(s) are kept as in-context
+                    // conditioning (VAE tokens + the Qwen3-VL grounding baked into `ctx`) — NOT a noised
+                    // img2img init. `edit_sources` is the ordered slice the pipeline VAE-encodes at
+                    // successive RoPE frames; the `krea2_identity_edit` LoRA in `spec.adapters` steers it.
+                    KreaRenderPlan::Edit(heavy.heavy.prepare_edit_plan(
+                        &ctx.pos,
+                        ctx.neg.as_ref(),
+                        &edit_sources,
+                        req.width,
+                        req.height,
+                    )?)
+                } else if let Some((init, _)) = reference {
+                    // Reference fidelity strength — resolved ONCE above (sc-10121) so the `start` the
+                    // capture `keep` was resolved against equals the one `render_*_img2img_from`
+                    // truncates on. `Some` here exactly when a reference is present.
+                    let strength = img2img_strength
+                        .expect("img2img_strength is Some whenever a reference is present");
+                    let img2img = heavy.heavy.prepare_img2img(
+                        &ctx.pos,
+                        ctx.neg.as_ref(),
+                        init,
+                        req.width,
+                        req.height,
+                    )?;
+                    // img2img dispatch splits by variant: Raw takes the true-CFG entrypoint (guidance +
+                    // negative prompt honored, sc-10224); Turbo the CFG-free distilled one (sc-10135).
+                    if is_raw {
+                        KreaRenderPlan::Img2ImgRaw {
+                            plan: img2img,
+                            strength,
+                        }
+                    } else {
+                        KreaRenderPlan::Img2ImgTurbo {
+                            plan: img2img,
+                            strength,
+                        }
+                    }
+                } else if is_raw {
+                    KreaRenderPlan::BaseCfg(heavy.heavy.prepare_t2i(
+                        &ctx.pos,
+                        ctx.neg.as_ref(),
+                        req.width,
+                        req.height,
+                    )?)
+                } else {
+                    // Turbo t2i is CFG-free (`ctx.neg` is always `None` here).
+                    KreaRenderPlan::Turbo(
+                        heavy
+                            .heavy
+                            .prepare_t2i(&ctx.pos, None, req.width, req.height)?,
+                    )
+                };
+
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let opts = TurboOptions {
@@ -590,76 +699,69 @@ impl Krea {
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
                     };
-                    // The one render body per path (sc-11101): the same `KreaHeavy::render_*` for both
-                    // residencies, so a Sequential job (text phase already dropped) is byte-identical to Resident.
-                    let img = if is_edit {
-                        // Kontext-style edit (epic 10871): the source image(s) are kept as in-context
-                        // conditioning (VAE tokens + the Qwen3-VL grounding baked into `ctx`) — NOT a noised
-                        // img2img init. Denoises from PURE NOISE under full CFG, so a reference's strength is
-                        // ignored; `edit_sources` is the ordered slice the pipeline VAE-encodes at successive
-                        // RoPE frames. The `krea2_identity_edit` LoRA in `spec.adapters` steers the edit.
-                        heavy.heavy.render_edit(
-                            &ctx.pos,
-                            ctx.neg.as_ref(),
+                    // The one render body per path (sc-11101): the same `KreaHeavy::render_*_from` for
+                    // both residencies, so a Sequential job (text phase already dropped) is byte-identical
+                    // to Resident.
+                    let img = match &plan {
+                        KreaRenderPlan::Edit(p) => heavy.heavy.render_edit_from(
+                            p,
                             guidance,
                             // Distilled Turbo edit → few-step `turbo_schedule`; Raw edit → dynamic-mu
                             // `base_schedule`. Matches the capture-σ `sigmas` selector above (`is_raw`).
                             is_turbo_edit,
-                            &edit_sources,
                             &opts,
                             decoder,
+                            // Honor the PiD `from_ldm` early-stop on the edit path (F-069): `keep`
+                            // truncates the schedule so the decoder built at `capture_sigma` receives the
+                            // partially-denoised latent it expects, instead of the σ=0 clean one.
+                            keep,
                             &req.cancel,
                             on_progress,
-                        )?
-                    } else if let Some((init, ref_strength)) = reference {
-                        // Reference fidelity: the Reference's own strength wins, else the request-level img2img
-                        // strength, else the 0.5 mid default (the full-range slider's default; A2/A3).
-                        let strength = ref_strength.or(req.strength).unwrap_or(0.5);
-                        // img2img dispatch splits by variant: Raw takes the true-CFG entrypoint (guidance +
-                        // negative prompt honored, sc-10224); Turbo takes the CFG-free distilled one (sc-10135).
-                        if is_raw {
-                            heavy.heavy.render_base_img2img(
-                                &ctx.pos,
-                                ctx.neg.as_ref(),
+                        )?,
+                        KreaRenderPlan::Img2ImgRaw { plan, strength } => {
+                            heavy.heavy.render_base_img2img_from(
+                                plan,
                                 guidance,
-                                init,
-                                strength,
+                                *strength,
                                 &opts,
                                 decoder,
-                                &req.cancel,
-                                on_progress,
-                            )?
-                        } else {
-                            heavy.heavy.render_turbo_img2img(
-                                &ctx.pos,
-                                init,
-                                strength,
-                                &opts,
-                                decoder,
+                                // from_ldm early-stop (sc-10121): `keep` truncates the img2img-sliced
+                                // schedule so the decoder built at `capture_sigma` gets the matching
+                                // partially-denoised latent; `sigmas.len()` (no capture) runs the tail.
+                                keep,
                                 &req.cancel,
                                 on_progress,
                             )?
                         }
-                    } else if is_raw {
-                        heavy.heavy.render_base(
-                            &ctx.pos,
-                            ctx.neg.as_ref(),
+                        KreaRenderPlan::Img2ImgTurbo { plan, strength } => {
+                            heavy.heavy.render_turbo_img2img_from(
+                                plan,
+                                *strength,
+                                &opts,
+                                decoder,
+                                // from_ldm early-stop (sc-10121): see the Raw arm above.
+                                keep,
+                                &req.cancel,
+                                on_progress,
+                            )?
+                        }
+                        KreaRenderPlan::BaseCfg(p) => heavy.heavy.render_base_from(
+                            p,
                             guidance,
                             &opts,
                             decoder,
                             keep,
                             &req.cancel,
                             on_progress,
-                        )?
-                    } else {
-                        heavy.heavy.render_turbo(
-                            &ctx.pos,
+                        )?,
+                        KreaRenderPlan::Turbo(p) => heavy.heavy.render_turbo_from(
+                            p,
                             &opts,
                             decoder,
                             keep,
                             &req.cancel,
                             on_progress,
-                        )?
+                        )?,
                     };
                     images.push(img);
                 }
@@ -696,14 +798,30 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 /// than one `Reference` errors. Both variants advertise `Reference` (Turbo → CFG-free img2img sc-10135,
 /// Raw → CFG img2img sc-10224), so this is reached on either path; the `generate_impl` dispatch then
 /// picks the matching entrypoint by `is_raw`. Mirrors the FLUX single-reference idiom.
-fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
+fn single_reference<'a>(
+    id: &str,
+    req: &'a GenerationRequest,
+) -> Result<Option<(&'a Image, Option<f32>)>> {
     match req.conditioning.as_slice() {
         [] => Ok(None),
         [Conditioning::Reference { image, strength }] => Ok(Some((image, *strength))),
-        _ => Err(Error::Msg(
-            "krea_2_turbo: img2img supports exactly one Reference image".into(),
-        )),
+        // F-076: name the actual variant (`krea_2_raw` reaches this too), not a hardcoded `krea_2_turbo`.
+        _ => Err(Error::Msg(format!(
+            "{id}: img2img supports exactly one Reference image"
+        ))),
     }
+}
+
+/// The per-request, count-invariant render plan (F-073), built ONCE from the shared context + target
+/// geometry before the count loop and reused for every seed via the `KreaHeavy::render_*_from` seam. It
+/// carries the hoisted heavy work (reference/pose VAE encodes + the step-invariant DiT prep(s)); only
+/// the per-seed noise varies across the loop. The variant mirrors `generate_impl`'s path dispatch.
+enum KreaRenderPlan {
+    Edit(EditPlan),
+    Img2ImgRaw { plan: Img2ImgPlan, strength: f32 },
+    Img2ImgTurbo { plan: Img2ImgPlan, strength: f32 },
+    BaseCfg(T2iPlan),
+    Turbo(T2iPlan),
 }
 
 /// The most reference images a Krea edit accepts (epic 10871 P1.3): scene = image 1, person = image 2.
@@ -746,33 +864,41 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
     Ok(sources)
 }
 
-/// Whether an img2img reference conflicts with an ACTIVE PiD `from_ldm` early-stop capture — the combo
-/// deferred to sc-10121. A capture is active ONLY when [`flow_capture_for_request`]'s truncation `keep`
-/// lands strictly before the end of the schedule (`keep < num_sigmas`); the no-capture full-denoise path
-/// reports `keep == num_sigmas` (the PiD super-res decoder / native VAE then decodes the clean final
-/// latent — fine with img2img). Extracted + tested because the original inline guard compared `keep`
-/// against `usize::MAX`, a sentinel `flow_capture_for_request` never returns, so it rejected EVERY
-/// img2img generation (the on-device break this fixes).
-fn img2img_conflicts_with_capture(has_reference: bool, keep: usize, num_sigmas: usize) -> bool {
-    has_reference && keep < num_sigmas
-}
-
 // The registration constants bridge the crate's rich `Result` into backend-neutral
 // `gen_core::Result`. Four variants register
 // here — `krea_2_turbo` (distilled t2i, CFG-free), `krea_2_raw` (undistilled t2i, full-CFG; epic 9992),
 // `krea_2_edit` (the Raw pipeline routed to the Kontext edit entrypoint; epic 10871), and
 // `krea_2_turbo_edit` (that edit surface on the distilled few-step CFG-free schedule; sc-11640).
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// Qwen3-VL text/vision encoder (`text_encoder/`), the DiT (`transformer/`), and the Qwen-Image VAE
+/// (`vae/`), summed from the exact snapshot subdirs [`crate::loader`] loads. Shared by every krea_2 id
+/// (turbo/raw/edit/turbo_edit + turbo_control); the control checkpoint is folded by the worker.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor => load
+    pub(crate) const TURBO_REGISTRATION = descriptor => load;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw
+    pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit
+    pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit
+    pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit;
+    footprint = component_footprint
 }
 
 #[cfg(test)]
@@ -832,43 +958,76 @@ mod tests {
     }
 
     #[test]
-    fn img2img_conflicts_only_with_an_active_capture() {
-        // sc-10121 sentinel regression: the no-capture full-denoise path reports `keep == num_sigmas`
-        // (NOT usize::MAX). Plain img2img (no PiD capture) must be ACCEPTED; only a real from_ldm capture
-        // (`keep < num_sigmas`) conflicts.
-        let num_sigmas = 9; // an 8-step Turbo schedule has 9 sigmas.
-                            // No reference → never a conflict (plain txt2img, any keep).
-        assert!(!img2img_conflicts_with_capture(false, 5, num_sigmas));
-        assert!(!img2img_conflicts_with_capture(
-            false, num_sigmas, num_sigmas
-        ));
-        // Reference + NO capture (keep == num_sigmas) → allowed (the on-device break; must NOT conflict).
-        assert!(!img2img_conflicts_with_capture(
-            true, num_sigmas, num_sigmas
-        ));
-        // Reference + an ACTIVE from_ldm capture (keep truncates early) → the sc-10121 conflict.
-        assert!(img2img_conflicts_with_capture(true, 5, num_sigmas));
-        assert!(img2img_conflicts_with_capture(true, 0, num_sigmas));
-        // The old bug: `keep == usize::MAX` was the (wrong) allowed sentinel; the real allowed sentinel
-        // is `num_sigmas`. A capture value of usize::MAX (never produced) would be treated as no-conflict
-        // here only because it is not < num_sigmas — but the point is num_sigmas itself is now allowed.
-        assert!(!img2img_conflicts_with_capture(
-            true,
-            usize::MAX,
-            num_sigmas
-        ));
+    fn img2img_capture_window_agrees_with_decoder_sigma() {
+        // The sc-10121 core invariant, as pure host math (synthetic schedule + `init_time_step` +
+        // `flow_capture_for_request`, no weights): an img2img `from_ldm` capture is resolved against the
+        // SLICED window the denoise actually runs (`start = init_time_step(strength)`), so the decoder's
+        // degrade σ (`capture_sigma`) is EXACTLY the last σ of `full[start..keep]` — never desynced from
+        // the truncated latent — and a ceiling that would stop at/before `start` collapses to the clean
+        // σ=0 tail instead of a negative/empty window.
+        let full: [f32; 9] = [1.0, 0.9, 0.78, 0.64, 0.5, 0.36, 0.22, 0.1, 0.0];
+        let steps = full.len() - 1; // 8-step flow-match schedule (len = steps + 1).
+        let start_of = |strength: f32| init_time_step(steps, Some(strength)).min(full.len() - 1);
+        let capture_req = |ceiling: f32| GenerationRequest {
+            use_pid: true,
+            pid_capture_sigma: Some(ceiling),
+            ..Default::default()
+        };
+
+        // strength 0.5 → start = floor(8·0.5) = 4 (σ_start = 0.5); ceiling 0.25 → first σ ≤ 0.25 is
+        // full[6] = 0.22 → an ACTIVE capture that still denoises ≥ 1 img2img step.
+        let start = start_of(0.5);
+        assert_eq!(start, 4);
+        let (capture_sigma, keep) = flow_capture_for_request(&capture_req(0.25), &full, start);
+        assert!(keep < full.len(), "expected an active early stop");
+        assert!(keep > start, "must denoise at least one img2img step");
+        // No σ desync: the decoder's σ is exactly the sliced window's terminal σ.
+        let window = &full[start..keep];
+        assert_eq!(*window.last().unwrap(), capture_sigma);
+        assert_eq!(capture_sigma, full[keep - 1]);
+
+        // strength 0.9 → start = 7 (σ_start = 0.1), already below the 0.25 ceiling, so the capture would
+        // stop at/before the img2img start → NO benefit → collapse to the clean σ=0 full tail.
+        let late = start_of(0.9);
+        assert_eq!(late, 7);
+        let (late_sigma, late_keep) = flow_capture_for_request(&capture_req(0.25), &full, late);
+        assert_eq!(
+            late_keep,
+            full.len(),
+            "no-benefit capture runs the clean tail"
+        );
+        assert_eq!(late_sigma, 0.0);
+
+        // The reference-less t2i path (start = 0) is unaffected — the same ceiling still resolves.
+        let (t2i_sigma, t2i_keep) = flow_capture_for_request(&capture_req(0.25), &full, 0);
+        assert!(t2i_keep < full.len());
+        assert_eq!(t2i_sigma, full[t2i_keep - 1]);
     }
 
     #[test]
     fn single_reference_extracts_one_or_errors() {
         // No conditioning → plain txt2img.
-        assert!(single_reference(&req(1024, 1024)).unwrap().is_none());
+        assert!(single_reference(KREA_2_TURBO_ID, &req(1024, 1024))
+            .unwrap()
+            .is_none());
         // Exactly one → the image + its strength.
         let r1 = ref_req(1, Some(0.4));
-        let one = single_reference(&r1).unwrap();
+        let one = single_reference(KREA_2_TURBO_ID, &r1).unwrap();
         assert_eq!(one.map(|(_, s)| s), Some(Some(0.4)));
         // More than one → error (Krea conditions on a single reference).
-        assert!(single_reference(&ref_req(2, None)).is_err());
+        assert!(single_reference(KREA_2_TURBO_ID, &ref_req(2, None)).is_err());
+    }
+
+    /// F-076: the img2img single-reference error names the ACTUAL descriptor id — `krea_2_raw` reaches
+    /// this path too (both variants advertise `Reference`), so a hardcoded `krea_2_turbo` misled Raw
+    /// img2img diagnostics.
+    #[test]
+    fn single_reference_error_uses_the_descriptor_id() {
+        let err = single_reference(KREA_2_RAW_ID, &ref_req(2, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(KREA_2_RAW_ID), "{err}");
+        assert!(!err.contains(KREA_2_TURBO_ID), "{err}");
     }
 
     #[test]

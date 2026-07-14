@@ -456,7 +456,8 @@ impl QwenImageControl {
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
 mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
+    pub(crate) const REGISTRATION = descriptor => load;
+    footprint = crate::model::component_footprint
 }
 
 #[cfg(test)]

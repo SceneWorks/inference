@@ -595,11 +595,28 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
 // `gen_core::Result`. The `impl Generator`
 // above stays hand-written because `generate` is bespoke (IP-adapter / true-CFG branching), not the
 // plain delegation `impl_generator!` expresses.
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the CLIP
+/// and T5 text encoders (`text_encoder/`, `text_encoder_2/`), the DiT (`transformer/`), and the VAE
+/// (`vae/`), summed from the exact snapshot subdirs [`crate::loader`] loads. Shared by schnell / dev /
+/// dev-control (the control checkpoint is folded by the worker).
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder", "text_encoder_2"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
-    pub(crate) const SCHNELL_REGISTRATION = descriptor_schnell => load_schnell
+    pub(crate) const SCHNELL_REGISTRATION = descriptor_schnell => load_schnell;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
+    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev;
+    footprint = component_footprint
 }
 
 #[cfg(test)]

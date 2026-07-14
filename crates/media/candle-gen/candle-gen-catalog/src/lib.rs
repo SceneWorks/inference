@@ -43,6 +43,10 @@ pub mod providers {
     pub use candle_gen_z_image as z_image;
 }
 
+/// Platform-owned crates consumed through provider-specific APIs rather than the registry
+/// `load(id, spec)` path (depth maps, face analysis, segmentation, identity conditioning,
+/// the PiD latent decoder). Listed here so their platform membership is as explicit as a
+/// registered generator. Note `pulid` is bespoke here, whereas MLX ships it as `pulid_flux`.
 pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "pulid", "sam3"];
 
 /// Add every provider shipped by the Candle media platform to an explicit registry builder.
@@ -143,6 +147,7 @@ mod tests {
                 "ltx_2_3_distilled",
                 "qwen_image",
                 "sana_1600m",
+                "sana_sprint_1600m",
                 "scail2_14b",
                 "sd3_5_large",
                 "sd3_5_large_turbo",

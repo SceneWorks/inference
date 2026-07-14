@@ -198,13 +198,16 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 
 // Explicit registration constants for all three variants.
 mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base;
+    footprint = crate::loader::component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const AESTHETIC_REGISTRATION = descriptor_aesthetic => load_aesthetic
+    pub(crate) const AESTHETIC_REGISTRATION = descriptor_aesthetic => load_aesthetic;
+    footprint = crate::loader::component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
+    footprint = crate::loader::component_footprint
 }
 
 #[cfg(test)]

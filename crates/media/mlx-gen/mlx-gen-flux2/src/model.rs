@@ -946,21 +946,38 @@ pub(crate) fn validate_request(
 
 // The registration constants bridge the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
+/// Per-component on-disk footprint for the staged-residency split. Shared by every FLUX.2 id.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
-    pub(crate) const KLEIN_REGISTRATION = descriptor_klein_9b => load_klein_9b
+    pub(crate) const KLEIN_REGISTRATION = descriptor_klein_9b => load_klein_9b;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const KLEIN_EDIT_REGISTRATION = descriptor_klein_9b_edit => load_klein_9b_edit
+    pub(crate) const KLEIN_EDIT_REGISTRATION = descriptor_klein_9b_edit => load_klein_9b_edit;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
     pub(crate) const KLEIN_KV_EDIT_REGISTRATION =
-        descriptor_klein_9b_kv_edit => load_klein_9b_kv_edit
+        descriptor_klein_9b_kv_edit => load_klein_9b_kv_edit;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
+    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const DEV_EDIT_REGISTRATION = descriptor_dev_edit => load_dev_edit
+    pub(crate) const DEV_EDIT_REGISTRATION = descriptor_dev_edit => load_dev_edit;
+    footprint = component_footprint
 }
 
 #[cfg(test)]

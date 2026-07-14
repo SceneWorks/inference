@@ -336,6 +336,13 @@ impl LensGenerator {
                         .resolve_sigmas(latent_h, latent_w, steps, req.scheduler.as_deref());
                 let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
                 let keep = (keep < sigmas.len()).then_some(keep);
+                // F-030 (sc-11133): the PiD `from_ldm` early-stop truncates the descending schedule to
+                // `keep` σ nodes, so `render` (→ `run_curated_sampler`) runs and reports exactly
+                // `sigmas[..keep].len() - 1 == keep - 1` steps — NOT the requested `steps`. Deriving the
+                // emitted `total` from `keep` keeps the bar monotone AND lets it reach its total, so the
+                // `cur >= total` Decoding trigger below fires on the shortened schedule (without this the
+                // job froze at `(keep-1)/steps` and the 4×-SR decode was invisible).
+                let effective_total = effective_step_total(keep, total);
                 let pid_decoder = resolve_pid_decoder_at_sigma(
                     heavy.pid,
                     req,
@@ -369,22 +376,76 @@ impl LensGenerator {
                         &mut |cur| {
                             on_progress(Progress::Step {
                                 current: cur as u32,
-                                total,
+                                total: effective_total,
                             });
                             // F-106: `render` decodes immediately after the final step (it exposes only a step
                             // callback, not a Progress sink), so emit `Decoding` when the last step lands —
-                            // BEFORE the VAE/PiD decode.
-                            if cur as u32 >= total {
+                            // BEFORE the VAE/PiD decode. F-030: gate on `effective_total` so the truncated
+                            // early-stop schedule still trips it exactly once.
+                            if cur as u32 >= effective_total {
                                 on_progress(Progress::Decoding);
                             }
                         },
                     )?;
                     images.push(image);
+                    // F-030 residual (sc-11133): a `keep == 1` early-stop runs 0 real steps, so the
+                    // per-step callback above never fires — the bar stalls at 0/1 and `Decoding` never
+                    // trips. Synthesize the terminal `Step` + one `Decoding` in that case (no-op for a
+                    // schedule that ran ≥ 1 real step and drove its own terminal above).
+                    emit_terminal_if_no_steps(keep, total, on_progress);
                 }
                 Ok(GenerationOutput::Images(images))
             },
         )
     }
+}
+
+/// The number of denoise steps the sampler actually runs — and therefore the `Progress::Step.total`
+/// and the `Decoding` trigger (F-030, sc-11133). With no PiD early-stop (`keep == None`) it is the
+/// requested `steps`; under a `from_ldm` early-stop that truncates the schedule to `keep` σ nodes,
+/// `run_curated_sampler` reports exactly `sigmas[..keep].len() - 1 == keep - 1` steps, so the bar
+/// must be sized to that (never below 1) or it freezes below its stale `steps` total and never trips
+/// `Decoding`.
+fn effective_step_total(keep: Option<usize>, steps: u32) -> u32 {
+    match keep {
+        Some(k) => (k.saturating_sub(1) as u32).max(1),
+        None => steps,
+    }
+}
+
+/// The number of real denoise transitions a schedule actually runs: `keep - 1` σ steps under a PiD
+/// early-stop (0 when `keep <= 1`), else the full `steps`. Distinct from [`effective_step_total`],
+/// which floors the *bar size* at 1 — a `keep == 1` schedule sizes the bar to 1 yet runs ZERO
+/// transitions, so `run_curated_sampler` never invokes the per-step callback (sc-11133).
+fn real_step_count(keep: Option<usize>, steps: u32) -> u32 {
+    match keep {
+        Some(k) => k.saturating_sub(1) as u32,
+        None => steps,
+    }
+}
+
+/// F-030 residual (sc-11133): a `keep == 1` PiD early-stop truncates the schedule to a single σ
+/// node, so `run_curated_sampler` runs zero transitions and `render`'s per-step callback never
+/// fires — the bar would freeze at `0/total` and the `cur >= total` `Decoding` trigger never trip.
+/// When no real step runs, synthesize the terminal `Step{total,total}` + one `Decoding` so the bar
+/// reaches its total and `Decoding` fires exactly once. A schedule with ≥ 1 real step drives the
+/// bar (and its own `Decoding`) through the per-step callback and needs no synthetic terminal.
+/// Returns whether a terminal was emitted (weight-free unit-testable).
+fn emit_terminal_if_no_steps(
+    keep: Option<usize>,
+    steps: u32,
+    on_progress: &mut dyn FnMut(Progress),
+) -> bool {
+    if real_step_count(keep, steps) != 0 {
+        return false;
+    }
+    let total = effective_step_total(keep, steps);
+    on_progress(Progress::Step {
+        current: total,
+        total,
+    });
+    on_progress(Progress::Decoding);
+    true
 }
 
 /// Capability-driven request validation (unit-testable without loaded weights).
@@ -423,16 +484,102 @@ fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_with(spec, BASE_DEFAULTS)
 }
 
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// gpt-oss MoE text encoder (`text_encoder/`), the DiT (`transformer/`), and the Flux.2 VAE (`vae/`),
+/// summed from the exact snapshot subdirs [`crate::pipeline`] loads. The text encoder is the ~38 GB /
+/// 20B-param bulk the `Sequential` schedule drops before the DiT loads, so an accurate split here is
+/// what lets the fit-gate select staged residency for `lens` / `lens_turbo`.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base;
+    footprint = component_footprint
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-030 (sc-11133): the emitted `total` tracks the (possibly truncated) schedule so the bar
+    /// reaches its total and the `cur >= total` Decoding trigger fires. Full schedule → `steps`;
+    /// PiD early-stop (`keep` σ nodes) → `keep - 1`; degenerate `keep` floors at 1 (never 0).
+    #[test]
+    fn effective_step_total_tracks_pid_early_stop() {
+        assert_eq!(effective_step_total(None, 20), 20, "full schedule = steps");
+        // keep=13 σ nodes → 12 steps run and reported (not the requested 20).
+        assert_eq!(effective_step_total(Some(13), 20), 12);
+        // Degenerate: keep=1 (or 0) must still leave a 1-step bar the Decoding trigger can reach.
+        assert_eq!(effective_step_total(Some(1), 20), 1);
+        assert_eq!(effective_step_total(Some(0), 20), 1);
+    }
+
+    /// F-030 residual (sc-11133): a `keep == 1` schedule runs ZERO real steps (`real_step_count`),
+    /// so `render`'s per-step callback never fires. `emit_terminal_if_no_steps` must synthesize a
+    /// terminal `Step` reaching total plus exactly one `Decoding`, so the bar completes and Decoding
+    /// trips once. A multi-step or full schedule drives its own bar and must emit nothing.
+    #[test]
+    fn zero_step_schedule_fills_bar_and_fires_decoding_once() {
+        // Real transitions actually run: keep-1 (0 for keep<=1), else the full steps.
+        assert_eq!(real_step_count(None, 20), 20);
+        assert_eq!(real_step_count(Some(13), 20), 12);
+        assert_eq!(real_step_count(Some(1), 20), 0, "keep==1 runs 0 real steps");
+        assert_eq!(real_step_count(Some(0), 20), 0);
+
+        // keep == 1 (0-step): synthesize the terminal so the bar reaches total and Decoding fires once.
+        let mut events: Vec<Progress> = Vec::new();
+        let emitted = {
+            let mut sink = |p: Progress| events.push(p);
+            emit_terminal_if_no_steps(Some(1), 20, &mut sink)
+        };
+        assert!(emitted, "a 0-step schedule must synthesize a terminal");
+        let steps: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|p| match p {
+                Progress::Step { current, total } => Some((*current, *total)),
+                _ => None,
+            })
+            .collect();
+        let decodings = events
+            .iter()
+            .filter(|p| matches!(p, Progress::Decoding))
+            .count();
+        assert_eq!(
+            steps,
+            vec![(1, 1)],
+            "the bar must reach its total so it does not freeze at 0/1"
+        );
+        assert_eq!(decodings, 1, "Decoding must fire exactly once");
+
+        // A multi-step (keep=13) schedule drives its own bar — no synthetic terminal.
+        let mut multi: Vec<Progress> = Vec::new();
+        let emitted_multi = {
+            let mut sink = |p: Progress| multi.push(p);
+            emit_terminal_if_no_steps(Some(13), 20, &mut sink)
+        };
+        assert!(!emitted_multi, "a multi-step schedule needs no terminal");
+        assert!(multi.is_empty());
+
+        // A full schedule (keep == None) likewise drives its own bar.
+        let mut full: Vec<Progress> = Vec::new();
+        {
+            let mut sink = |p: Progress| full.push(p);
+            assert!(!emit_terminal_if_no_steps(None, 20, &mut sink));
+        }
+        assert!(full.is_empty());
+    }
 
     #[test]
     fn descriptors_are_lens() {

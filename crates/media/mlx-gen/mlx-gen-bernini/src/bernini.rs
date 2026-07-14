@@ -593,7 +593,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
 mlx_gen::register_generators! {
-    pub(crate) const FULL_REGISTRATION = descriptor => load
+    pub(crate) const FULL_REGISTRATION = descriptor => load;
+    footprint = crate::pipeline::component_footprint
 }
 
 mlx_gen::impl_generator!(Bernini {

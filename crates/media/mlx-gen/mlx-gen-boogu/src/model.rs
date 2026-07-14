@@ -494,14 +494,25 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 
 // The registration constants bridge the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
+/// Per-component on-disk footprint for staged residency. Boogu's text encoder is under `mllm/`,
+/// which is precisely why the provider owns this split rather than a consumer guessing names.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(spec, &["mllm"], &["transformer"], &["vae"])
+}
+
 mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor => load
+    pub(crate) const BASE_REGISTRATION = descriptor => load;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const EDIT_REGISTRATION = descriptor_edit => load_edit
+    pub(crate) const EDIT_REGISTRATION = descriptor_edit => load_edit;
+    footprint = component_footprint
 }
 
 #[cfg(test)]

@@ -114,8 +114,23 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["t5_encoder.safetensors"],
+        &[
+            "low_noise_model.safetensors",
+            "high_noise_model.safetensors",
+        ],
+        &["vae.safetensors"],
+    )
+}
+
 mlx_gen::register_generators! {
-    pub(crate) const RENDERER_REGISTRATION = descriptor => load
+    pub(crate) const RENDERER_REGISTRATION = descriptor => load;
+    footprint = component_footprint
 }
 
 /// One expert (high or low) with its prepared per-expert cross-attention K/V for the cond / empty-neg

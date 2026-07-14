@@ -433,7 +433,10 @@ impl Generator for ZImageTurboControl {
 // `gen_core::Result`. The `impl
 // Generator` above stays hand-written because `validate` adds a control-specific check beyond the
 // shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
-mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
+mlx_gen::register_generators! {
+    pub(crate) const REGISTRATION = descriptor => load;
+    footprint = crate::model::component_footprint
+}
 
 #[cfg(test)]
 mod tests {

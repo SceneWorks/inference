@@ -21,6 +21,7 @@ pub mod imageops;
 pub mod json_constraint;
 mod macros;
 pub mod media;
+pub mod mempolicy;
 pub mod registry;
 pub mod runtime;
 pub mod sampling;
@@ -46,10 +47,11 @@ pub use generator::{
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
 pub use media::{AudioTrack, Image};
-pub use registry::TrainerRegistration;
+pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{
-    CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, ProviderRegistry,
-    ProviderRegistryBuilder, TextEmbedderRegistration, TransformRegistration,
+    CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, PerComponentBytes,
+    ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    TransformRegistration,
 };
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec, MoeExpert,
@@ -57,6 +59,7 @@ pub use runtime::{
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tiling::{TilingConfig, VaeTiling};
+pub use weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The
 // dependency is INVERTED: gen-core CONSUMES `core-llm` — the same way mlx-gen re-exports gen-core via

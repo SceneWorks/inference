@@ -61,6 +61,8 @@ pub fn control_trainer_descriptor() -> TrainerDescriptor {
         modality: Modality::Image,
         supports_lora: false,
         supports_lokr: false,
+        // sc-10894 lockstep catch-up: gen-core gained `TrainerDescriptor.supports_control`. This IS the
+        // Krea ControlNet-branch trainer, so it advertises control training (`true`).
         supports_control: true,
     }
 }

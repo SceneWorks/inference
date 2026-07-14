@@ -338,14 +338,33 @@ fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f3
 // The registration constants bridge the crate's rich `Result` into backend-neutral
 // `gen_core::Result`. Both the true-CFG
 // Large (E5) and the distilled CFG-off Large-Turbo (E6) register here on the shared backbone.
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the THREE
+/// text encoders (CLIP-L `text_encoder/`, CLIP-G `text_encoder_2/`, T5-XXL `text_encoder_3/`), the MMDiT
+/// (`transformer/`), and the VAE (`vae/`), summed from the exact snapshot subdirs [`crate::loader`]
+/// loads. (`text_encoder_3/` ships f32 + fp16 shards side by side; the on-disk sum counts both, matching
+/// the worker's whole-model total — a conservative over-count on the encoder side, the safe direction.)
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder", "text_encoder_2", "text_encoder_3"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
-    pub(crate) const LARGE_REGISTRATION = descriptor => load
+    pub(crate) const LARGE_REGISTRATION = descriptor => load;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = turbo_descriptor => load_turbo
+    pub(crate) const TURBO_REGISTRATION = turbo_descriptor => load_turbo;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const MEDIUM_REGISTRATION = medium_descriptor => load_medium
+    pub(crate) const MEDIUM_REGISTRATION = medium_descriptor => load_medium;
+    footprint = component_footprint
 }
 
 #[cfg(test)]

@@ -379,11 +379,24 @@ impl Sana {
 
 // The registration constants bridge the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor => load
+    pub(crate) const BASE_REGISTRATION = descriptor => load;
+    footprint = component_footprint
 }
 mlx_gen::register_generators! {
-    pub(crate) const SPRINT_REGISTRATION = sprint_descriptor => load_sprint
+    pub(crate) const SPRINT_REGISTRATION = sprint_descriptor => load_sprint;
+    footprint = component_footprint
 }
 
 #[cfg(test)]

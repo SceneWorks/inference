@@ -239,6 +239,9 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,
+        // sc-10894 lockstep catch-up: gen-core gained `TrainerDescriptor.supports_control` on mlx-gen
+        // main between this crate's prior gen-core pin and the footprint-seam re-pin; the base LoRA/LoKr
+        // trainer does not train a control branch (mirrors mlx-gen-krea's `false`).
         supports_control: false,
     }
 }

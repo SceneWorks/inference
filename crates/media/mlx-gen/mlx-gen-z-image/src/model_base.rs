@@ -283,7 +283,10 @@ impl ZImage {
 
 // The registration constant bridges the rich `Result` into backend-neutral `gen_core::Result`. A
 // distinct id (`z_image`) avoids clashes with the turbo and control registrations in this crate.
-mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
+mlx_gen::register_generators! {
+    pub(crate) const REGISTRATION = descriptor => load;
+    footprint = crate::model::component_footprint
+}
 
 #[cfg(test)]
 mod tests {

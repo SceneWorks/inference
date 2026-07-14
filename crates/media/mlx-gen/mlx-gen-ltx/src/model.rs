@@ -43,8 +43,11 @@
 //! I2V+Audio. The VAE **encoder** is loaded **lazily** on first encode, so pure-T2V runs never pay
 //! its resident cost (F-048). LoRA/LoKr are sibling slices.
 
+use std::path::PathBuf;
+
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
     curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
@@ -59,6 +62,7 @@ use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 use crate::pipeline::{
     decode_audio_track, decode_to_frames, generate_av_latents, generate_av_latents_iclora,
     preprocess_conditioning_clip, preprocess_conditioning_image, StageClip, StageKeyframe,
+    STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
@@ -131,6 +135,56 @@ const TEMPORAL_SCALE: u32 = 8;
 const MAX_FRAMES: u32 = 1025;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
 const SPATIAL_SCALE: u32 = 32;
+/// The folded denoise-step total surfaced as `Progress::Step.total` (F-050): stage-1 (`STAGE1_SIGMAS`,
+/// 8 steps) + stage-2 (`STAGE2_SIGMAS`, 3 steps) of the baked distilled schedule.
+const TOTAL_STEPS: u32 = (STAGE1_SIGMAS.len() + STAGE2_SIGMAS.len() - 2) as u32;
+
+/// Folds the LTX two-stage distilled denoise into one monotone `1..=TOTAL_STEPS` progress bar
+/// (F-050, sc-11133). Each stage forwards a **per-stage** 1-based `current` (the σ-derived value from
+/// `step_gate` on the curated path, or `i+1` on the native path) that restarts at 1 when the next
+/// stage begins; a curated 2nd-order solver (`heun`/`dpmpp_sde`) also forwards the same `current`
+/// twice per step (predictor + corrector). [`observe`](StageProgressFold::observe) maps that raw
+/// stream to an absolute, deduplicated, clamped `current`: it returns `Some(current)` only when the
+/// global bar strictly advances, so the emitted sequence is monotone non-decreasing, reaches `total`,
+/// and never overruns it.
+struct StageProgressFold {
+    total: u32,
+    /// Steps completed in prior stages (added to the current stage's forwarded value).
+    stage_offset: u32,
+    /// The last per-stage value observed (a drop below it signals a new stage).
+    last_fwd: u32,
+    /// The last absolute `current` emitted (dedupe / monotonicity anchor).
+    emitted: u32,
+}
+
+impl StageProgressFold {
+    fn new(total: u32) -> Self {
+        Self {
+            total,
+            stage_offset: 0,
+            last_fwd: 0,
+            emitted: 0,
+        }
+    }
+
+    /// Observe one forwarded per-stage `current`; returns the absolute bar position to emit, or
+    /// `None` if the bar did not advance (a multi-eval repeat).
+    fn observe(&mut self, fwd: u32) -> Option<u32> {
+        if fwd < self.last_fwd {
+            // The forwarded value dropped — the next stage restarted its counter at 1. Fold the
+            // completed stages in so this stage's steps stack on top rather than overwriting.
+            self.stage_offset = self.emitted;
+        }
+        self.last_fwd = fwd;
+        let abs = (self.stage_offset + fwd).min(self.total);
+        if abs > self.emitted {
+            self.emitted = abs;
+            Some(abs)
+        } else {
+            None
+        }
+    }
+}
 /// I2V conditioning strength when neither the `Reference` nor `req.strength` supplies one (reference
 /// CLI `--image-strength` default): `1.0` = full denoise, fully pinning the conditioned frame.
 const DEFAULT_IMAGE_STRENGTH: f32 = 1.0;
@@ -200,8 +254,18 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct Ltx {
     descriptor: ModelDescriptor,
     tokenizer: LtxTokenizer,
-    text_encoder: LtxTextEncoder,
-    transformer: AvDiT,
+    // sc-10976 (epic 10975): the two GIANTS — the ~24 GB Gemma-3-12B text encoder and the AvDiT — are
+    // NOT held resident. They are built on demand inside `generate` (load → use → drop), mirroring
+    // Wan's `root`-only struct (`mlx-gen-wan/src/model.rs`): the TE is freed (+ `clear_cache()`) before
+    // the DiT materializes, so peak ≈ max(TE, DiT) instead of the sum. The lazy-build inputs live here.
+    root: PathBuf,
+    config: LtxConfig,
+    dit_prec: Precision,
+    adapters: Vec<AdapterSpec>,
+    gemma_dir: PathBuf,
+    gemma_quant: Option<GemmaQuant>,
+    // The small components (each ≪ the TE / DiT) stay resident — the AvDiT is the denoise peak and the
+    // Gemma drop is the win (sc-10976). Staging these too would add parity risk for ~no memory gain.
     upsampler: LatentUpsampler,
     vae: LtxVideoVae,
     audio_decoder: AudioDecoder,
@@ -367,42 +431,31 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let audio_vae_config = AudioVaeConfig::from_model_dir(root)?;
     let vocoder_config = VocoderConfig::from_model_dir(root)?;
 
+    // Resolve the Gemma TE location + its quant (cheap — a path lookup + one `config.json` read). The
+    // ~24 GB Gemma backbone and the `connector`/`transformer` weights are deliberately NOT loaded here:
+    // sc-10976 defers them to `build_text_encoder`/`build_transformer`, built per-generate so the TE is
+    // dropped (+ `clear_cache()`) before the DiT materializes (mirroring Wan). Fail-fast on a missing
+    // component is preserved by a cheap existence check, so a broken tree still errors at load rather
+    // than at first generate.
     let gemma_dir = resolve_gemma_dir(spec.text_encoder.as_ref())?;
-    let gemma_w = Weights::from_dir(&gemma_dir)?;
     // Selectively quantize the Gemma backbone iff the snapshot's `config.json` says so (the reference
     // `apply_quantization` path; sc-2686). The default `…-bf16` snapshot ⇒ `None` ⇒ dense bf16 TE.
     let gemma_quant = resolve_gemma_quant(&gemma_dir)?;
-    let connector_w = Weights::from_file(root.join("connector.safetensors"))?;
-    let transformer_w = Weights::from_file(root.join("transformer.safetensors"))?;
+    for f in ["connector.safetensors", "transformer.safetensors"] {
+        if !root.join(f).exists() {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: missing {f} in the model dir {}",
+                root.display()
+            )));
+        }
+    }
+
+    // The small components (each ≪ the TE / DiT) stay resident. The VAE *decoder* + audio VAE + vocoder
+    // load here; the VAE *encoder* is still lazy on first I2V encode (F-048).
     let upsampler_w = Weights::from_file(root.join("upsampler.safetensors"))?;
     let vae_w = Weights::from_file(root.join("vae_decoder.safetensors"))?;
     let audio_vae_w = Weights::from_file(root.join("audio_vae.safetensors"))?;
     let vocoder_w = Weights::from_file(root.join("vocoder.safetensors"))?;
-
-    // The AudioVideo text encoder runs **bf16** activations (the reference TE dtype; S1-validated) —
-    // dense for the default `…-bf16` Gemma or selectively quantized per the snapshot — producing both
-    // the video (4096) and audio (2048) embeddings. Its bf16 embeddings enter the DiT, which upcasts
-    // the cross-attn context as the reference transformer does.
-    let text_encoder = LtxTextEncoder::from_weights_av(
-        &gemma_w,
-        &connector_w,
-        GemmaConfig::gemma_3_12b(),
-        gemma_quant,
-        &config,
-        Dtype::Bfloat16,
-    )?;
-    let mut transformer = AvDiT::from_weights(&transformer_w, &config, dit_prec)?;
-    // LoRA (sc-2687) + LoKr (sc-2393) in generate: forward-time residuals over the (quantized/dense)
-    // base, applied on the still-mutable transformer — the load-time seam. Routes the full
-    // video+audio+cross-modal surface. `pass_scales` (per-adapter) carries one strength per distilled
-    // denoise pass; the pipeline selects the active pass per stage. No-op when `spec.adapters` empty.
-    if !spec.adapters.is_empty() {
-        crate::adapters::apply_ltx_adapters(
-            &mut transformer,
-            &spec.adapters,
-            crate::pipeline::NUM_DENOISE_PASSES,
-        )?;
-    }
 
     let upsampler = LatentUpsampler::from_weights(&upsampler_w)?;
     // The VAE encoder serves I2V conditioning (sc-2685) but pure-T2V+A requests never touch it, so it
@@ -420,12 +473,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // The VAE `per_channel_statistics` double as the upsampler's latent norm, at the path dtype.
     let latent_mean = to_dtype(vae_w.require("per_channel_statistics.mean")?, stat_dt)?;
     let latent_std = to_dtype(vae_w.require("per_channel_statistics.std")?, stat_dt)?;
+    let tokenizer = LtxTokenizer::from_dir(&gemma_dir)?;
 
     Ok(Box::new(Ltx {
         descriptor: descriptor(),
-        tokenizer: LtxTokenizer::from_dir(&gemma_dir)?,
-        text_encoder,
-        transformer,
+        tokenizer,
+        root: root.clone(),
+        config,
+        dit_prec,
+        adapters: spec.adapters.clone(),
+        gemma_dir,
+        gemma_quant,
         upsampler,
         vae,
         audio_decoder,
@@ -438,6 +496,60 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 impl Ltx {
+    /// Build the AudioVideo Gemma-3-12B text encoder from the resolved `gemma_dir` + the snapshot's
+    /// `connector.safetensors` (sc-10976). Called per-generate and dropped (+ `clear_cache()`) before
+    /// [`build_transformer`](Self::build_transformer) — mirroring Wan's `encode_text_staged` — so the
+    /// ~24 GB TE and the DiT never co-reside. bf16 activations (the reference TE dtype); the backbone is
+    /// selectively quantized iff `gemma_quant` is set (`None` ⇒ dense bf16, the default `…-bf16`
+    /// snapshot). Identical construction to the pre-sc-10976 `load()`, only deferred.
+    fn build_text_encoder(&self) -> Result<LtxTextEncoder> {
+        let gemma_w = Weights::from_dir(&self.gemma_dir)?;
+        let connector_w = Weights::from_file(self.root.join("connector.safetensors"))?;
+        LtxTextEncoder::from_weights_av(
+            &gemma_w,
+            &connector_w,
+            GemmaConfig::gemma_3_12b(),
+            self.gemma_quant,
+            &self.config,
+            Dtype::Bfloat16,
+        )
+    }
+
+    /// Build the AvDiT from the snapshot's `transformer.safetensors` at the load-time precision,
+    /// applying any LoRA/LoKr adapters (sc-2687/sc-2393). Called per-generate AFTER the text encoder is
+    /// freed (sc-10976), so the 24 GB TE and the DiT never co-reside. LoRA is a forward-time residual
+    /// over the (quantized/dense) base; `pass_scales` carries one strength per distilled denoise pass.
+    fn build_transformer(&self) -> Result<AvDiT> {
+        let transformer_w = Weights::from_file(self.root.join("transformer.safetensors"))?;
+        let mut transformer = AvDiT::from_weights(&transformer_w, &self.config, self.dit_prec)?;
+        if !self.adapters.is_empty() {
+            crate::adapters::apply_ltx_adapters(
+                &mut transformer,
+                &self.adapters,
+                crate::pipeline::NUM_DENOISE_PASSES,
+            )?;
+        }
+        Ok(transformer)
+    }
+
+    /// Stage the text phase (sc-10976): build the Gemma TE, run the optional prompt enhancer + the
+    /// video/audio encode inside its scope, `eval` so the encode completes, then let the TE drop at
+    /// end of scope. Returns the (optional) enhanced prompt + the `(video_ctx, audio_ctx)` embeddings.
+    /// The caller `clear_cache()`s and proceeds to the DiT, which now loads into the freed footprint.
+    fn stage_text_phase(&self, req: &GenerationRequest) -> Result<(Option<String>, Array, Array)> {
+        let te = self.build_text_encoder()?;
+        // Prompt enhancement (sc-2845) reuses the just-built Gemma backbone (the censored path); the
+        // uncensored path loads its own. Running it here keeps BOTH TE uses inside one staged load.
+        let enhanced = self.maybe_enhance(&te, req);
+        let prompt = enhanced.as_deref().unwrap_or(req.prompt.as_str());
+        let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
+        let (video_ctx, audio_ctx) = te.encode_av(&ids, &mask)?;
+        // Force the encode to complete before `te` (the ~24 GB Gemma) drops at end of scope — otherwise
+        // the lazy graph would keep the TE weights alive into the DiT phase, defeating the staging.
+        mlx_rs::transforms::eval([&video_ctx, &audio_ctx])?;
+        Ok((enhanced, video_ctx, audio_ctx))
+    }
+
     /// Latent dims `(frames, stage1_h, stage1_w, stage2_h, stage2_w)` for a request.
     pub(crate) fn latent_dims(req: &GenerationRequest) -> (usize, usize, usize, usize, usize) {
         // Precondition: `validate_request`'s 64-divisibility check runs before any generate, so the
@@ -479,30 +591,30 @@ impl Ltx {
         )
     }
 
-    /// The full A/V path with **injected** stage noise (the deterministic seam `generate` calls with
-    /// RNG-drawn noise and the e2e parity test calls with the reference samples). Encodes the prompt
-    /// to both video + audio embeddings, resolves an optional I2V conditioning image (VAE-encoded at
-    /// both stage resolutions — the video is image-conditioned, the audio stays pure-noise, matching
-    /// `generate_av.py`'s I2V+Audio), then defers to
+    /// The A/V path from **staged** text embeddings + injected stage noise (the deterministic seam
+    /// `generate` calls with RNG-drawn noise). The Gemma encode has already run and its ~24 GB weights
+    /// dropped (sc-10976 — see [`stage_text_phase`](Self::stage_text_phase)); this resolves any optional
+    /// I2V conditioning image (VAE-encoded at both stage resolutions — the video is image-conditioned,
+    /// the audio stays pure-noise, matching `generate_av.py`'s I2V+Audio), then defers to
     /// [`generate_av_from_embeddings`](Self::generate_av_from_embeddings).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_with_noise(
         &self,
         req: &GenerationRequest,
+        video_ctx: &Array,
+        audio_ctx: &Array,
         video_s1: &Array,
         video_s2: &Array,
         audio_s1: &Array,
         audio_s2: &Array,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        // F-051: honor a cancel before the (unbounded) pre-denoise conditioning stage — the Gemma TE
-        // encode plus up-to-N per-keyframe/per-clip VAE encodes all run here, ahead of the first
-        // denoise-loop check.
+        // F-051: honor a cancel before the (unbounded) per-keyframe/per-clip VAE conditioning encodes,
+        // ahead of the first denoise-loop check. (The Gemma TE encode already ran + dropped in the
+        // staged text phase.)
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let (ids, mask) = self.tokenizer.encode(&req.prompt, MAX_PROMPT_TOKENS)?;
-        let (video_ctx, audio_ctx) = self.text_encoder.encode_av(&ids, &mask)?;
         // Replace-latent conditioning: VAE-encode each keyframe at both stage resolutions (half/full).
         // I2V = a single `Reference` at frame 0; first_last_frame / multi-keyframe = `Keyframe`s.
         let kf_owned = self.build_keyframes(req)?;
@@ -528,8 +640,8 @@ impl Ltx {
             .collect();
         self.generate_av_from_embeddings(
             req,
-            &video_ctx,
-            &audio_ctx,
+            video_ctx,
+            audio_ctx,
             video_s1,
             video_s2,
             audio_s1,
@@ -584,19 +696,31 @@ impl Ltx {
             ));
         }
 
-        let mut step = 0usize;
-        let mut on_step = |_: usize| {
-            step += 1;
-            on_progress(Progress::Step {
-                current: step as u32,
-                total: 11,
-            });
+        // F-050 (sc-11133): fold the two-stage (8 + 3 step) distilled schedule into one monotone
+        // `1..=11` bar from the σ-DERIVED `current` each stage forwards — NOT a blind per-call counter.
+        // The curated 2nd-order solvers LTX advertises (`heun`, `dpmpp_sde`) evaluate the model twice
+        // per step, so `on_step` fires twice per step; the old counter reached 22 against `total: 11`
+        // (>100% overrun). `StageProgressFold` detects the per-stage restart, folds prior stages in,
+        // dedupes the multi-eval repeats, and clamps — so the bar stays monotone non-decreasing,
+        // reaches `total`, and never overruns.
+        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let mut on_step = |cur: usize| {
+            if let Some(current) = fold.observe(cur as u32) {
+                on_progress(Progress::Step {
+                    current,
+                    total: TOTAL_STEPS,
+                });
+            }
         };
         // extend_clip / video_bridge ride the IC-LoRA keyframe-append path (stage-1 in-context tokens);
         // everything else (T2V / I2V / first_last_frame) is the replace-latent path.
+        // sc-10976: build the AvDiT now — AFTER the staged text phase freed the ~24 GB Gemma — so the
+        // TE and the DiT never co-reside. Built past the curated-sampler validation above so a rejected
+        // request doesn't pay the DiT load. Dropped + `clear_cache()`d below before the VAE decode.
+        let transformer = self.build_transformer()?;
         let (video_latents, audio_latents) = if !video_clips.is_empty() {
             generate_av_latents_iclora(
-                &self.transformer,
+                &transformer,
                 &self.upsampler,
                 video_s1,
                 &pos1,
@@ -616,7 +740,7 @@ impl Ltx {
             )?
         } else {
             generate_av_latents(
-                &self.transformer,
+                &transformer,
                 &self.upsampler,
                 video_s1,
                 &pos1,
@@ -636,6 +760,13 @@ impl Ltx {
                 &mut on_step,
             )?
         };
+
+        // sc-10976: force the denoise output to materialize, then drop the DiT + free the allocator
+        // cache so the VAE + audio decode run in the freed footprint (the AvDiT is the denoise peak and
+        // nothing downstream needs it). Mirrors Wan's scope-block release before the VAE decode.
+        mlx_rs::transforms::eval([&video_latents, &audio_latents])?;
+        drop(transformer);
+        mlx_rs::memory::clear_cache();
 
         on_progress(Progress::Decoding);
         let frames = decode_to_frames(&self.vae, &video_latents, &req.cancel)?;
@@ -822,11 +953,11 @@ impl Ltx {
     /// the enhancer produces non-empty output; `None` (use the original prompt) when off, or — matching
     /// `generate_av.py`'s try/except — on **any** enhancer failure or empty output. Failures are logged
     /// to stderr with the reference's `ENHANCER_FALLBACK:` token; success with `ENHANCED_PROMPT:`.
-    fn maybe_enhance(&self, req: &GenerationRequest) -> Option<String> {
+    fn maybe_enhance(&self, te: &LtxTextEncoder, req: &GenerationRequest) -> Option<String> {
         if !req.enhance_prompt {
             return None;
         }
-        match self.run_enhance(req) {
+        match self.run_enhance(te, req) {
             Ok(p) if !p.trim().is_empty() => {
                 eprintln!("ENHANCED_PROMPT:{p}");
                 Some(p)
@@ -846,7 +977,7 @@ impl Ltx {
     /// already-loaded text-encoder backbone. I2V (a `Reference` image present) selects the I2V system
     /// prompt **only on the uncensored path** — the reference's censored `enhance_t2v` always uses the
     /// T2V system prompt (`generate_av.py` never calls `enhance_i2v` there), which we match.
-    fn run_enhance(&self, req: &GenerationRequest) -> Result<String> {
+    fn run_enhance(&self, te: &LtxTextEncoder, req: &GenerationRequest) -> Result<String> {
         let is_i2v = req
             .conditioning
             .iter()
@@ -878,7 +1009,7 @@ impl Ltx {
             )
         } else {
             enhance::enhance(
-                self.text_encoder.gemma(),
+                te.gemma(),
                 &self.tokenizer,
                 enhance::T2V_SYSTEM_PROMPT,
                 &req.prompt,
@@ -994,10 +1125,17 @@ impl Ltx {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        // Prompt enhancement (sc-2845): rewrite `req.prompt` before any encoding. Default off; on any
-        // enhancer failure / empty output it falls back to the original prompt (reference-faithful), so
-        // the e2e parity seams (which build requests with `enhance_prompt = false`) are untouched.
-        let enhanced = self.maybe_enhance(req);
+        // sc-10976 staged text phase: build the Gemma TE, run the optional prompt enhancer (sc-2845 —
+        // rewrites `req.prompt` before encoding; default off, falls back to the original prompt on any
+        // failure, so the `enhance_prompt = false` parity seams are untouched) + the video/audio encode
+        // inside one TE scope, then drop the ~24 GB Gemma before the DiT loads. Honor a cancel before
+        // this (unbounded) text stage.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let (enhanced, video_ctx, audio_ctx) = self.stage_text_phase(req)?;
+        // The TE is dropped; free the allocator cache so the DiT loads into the low-water footprint.
+        mlx_rs::memory::clear_cache();
         let owned;
         let req = match enhanced {
             Some(prompt) => {
@@ -1033,7 +1171,16 @@ impl Ltx {
             seed.wrapping_add(3),
             &[1, AUDIO_LATENT_CHANNELS, af, AUDIO_MEL_BINS],
         )?;
-        self.generate_with_noise(req, &video_s1, &video_s2, &audio_s1, &audio_s2, on_progress)
+        self.generate_with_noise(
+            req,
+            &video_ctx,
+            &audio_ctx,
+            &video_s1,
+            &video_s2,
+            &audio_s1,
+            &audio_s2,
+            on_progress,
+        )
     }
 }
 
@@ -1046,6 +1193,45 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-050 (sc-11133): drive `StageProgressFold` over the exact event stream a curated 2nd-order
+    /// solver produces — each stage's σ-derived `current` forwarded TWICE per step (predictor +
+    /// corrector) — and assert the folded bar is monotone, reaches `TOTAL_STEPS`, and never overruns.
+    /// Before the fix the blind counter reached 22 against `total: 11`.
+    #[test]
+    fn stage_progress_fold_dedupes_multi_eval_and_reaches_total() {
+        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let mut emitted = Vec::new();
+        // Stage 1: 8 steps, each forwarded value seen twice (heun predictor+corrector), monotone
+        // per-stage 1..=8. Stage 2: 3 steps, restarts at 1, forwarded 1..=3 twice each.
+        let stage1: Vec<u32> = (1..=8).flat_map(|c| [c, c]).collect();
+        let stage2: Vec<u32> = (1..=3).flat_map(|c| [c, c]).collect();
+        for fwd in stage1.into_iter().chain(stage2) {
+            if let Some(cur) = fold.observe(fwd) {
+                emitted.push(cur);
+            }
+        }
+        assert_eq!(
+            emitted,
+            (1..=11).collect::<Vec<_>>(),
+            "the folded bar must be exactly 1..=11 (monotone, complete, no overrun)"
+        );
+    }
+
+    /// The native distilled path forwards `i+1` once per step (no multi-eval); the fold must still
+    /// produce the same clean `1..=11` sequence.
+    #[test]
+    fn stage_progress_fold_handles_single_eval_native_path() {
+        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let mut emitted = Vec::new();
+        for fwd in (1..=8).chain(1..=3) {
+            if let Some(cur) = fold.observe(fwd) {
+                emitted.push(cur);
+            }
+        }
+        assert_eq!(emitted, (1..=11).collect::<Vec<_>>());
+        assert_eq!(TOTAL_STEPS, 11);
+    }
 
     #[test]
     fn descriptor_advertises_curated_samplers_no_scheduler() {

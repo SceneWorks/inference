@@ -32,6 +32,7 @@ use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler, CancelFlag, LatentDecoder, Progress, Result,
     TimestepConvention,
@@ -39,11 +40,16 @@ use mlx_gen::{
 
 use std::path::Path;
 
+use std::cell::RefCell;
+use std::path::PathBuf;
+
 use crate::control::Krea2ControlBranch;
 use crate::loader::{load_text_encoder, load_transformer, load_vision_tower};
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
-use crate::text_encoder::{encode_grounded, KreaTextEncoder, KreaTokenizer};
-use crate::transformer::Krea2Transformer;
+use crate::text_encoder::{
+    encode_grounded_from_vision, run_vision, GroundedVision, KreaTextEncoder, KreaTokenizer,
+};
+use crate::transformer::{EditPrep, JointPrep, Krea2Transformer};
 use crate::vae::{load_vae, QwenVae};
 use mlx_gen_boogu::VisionTower;
 
@@ -68,21 +74,28 @@ pub struct TurboOptions {
 pub struct KreaText {
     tok: KreaTokenizer,
     te: KreaTextEncoder,
-    /// Qwen3-VL vision tower for image-grounded (edit) encoding (epic 10871 P2). NB loaded eagerly by
-    /// [`Self::from_snapshot`] for the P2.3 validation; production should load it lazily / edit-only so
-    /// text-to-image doesn't pay the ~0.6 GB (tracked for P3).
-    vision: VisionTower,
+    /// Snapshot root, retained so the vision tower can be loaded lazily on the first grounded encode
+    /// (F-072) rather than eagerly for every variant.
+    root: PathBuf,
+    /// Qwen3-VL vision tower for image-grounded (edit) encoding (epic 10871 P2). LAZY (F-072): `None`
+    /// until the first `encode_grounded`/`run_vision`, so the Turbo/Raw t2i, img2img, and pose-control
+    /// paths — which never ground on an image — pay neither its ~0.6 GB residency nor its load time,
+    /// and a vision-less snapshot stays loadable for those paths. `RefCell` because grounding happens
+    /// behind `&self` (the `Resident` borrow + the `Sequential` re-load), mirroring boogu's pattern.
+    vision: RefCell<Option<VisionTower>>,
 }
 
 impl KreaText {
-    /// Load the tokenizer + Qwen3-VL-4B condition encoder + vision tower from a Krea 2 snapshot's
-    /// `tokenizer/` + `text_encoder/` dirs.
+    /// Load the tokenizer + Qwen3-VL-4B condition encoder from a Krea 2 snapshot's `tokenizer/` +
+    /// `text_encoder/` dirs. The vision tower is NOT loaded here (F-072) — it is loaded lazily on the
+    /// first grounded (edit) encode via [`Self::ensure_vision`].
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         Ok(Self {
             tok: KreaTokenizer::from_snapshot(root)?,
             te: load_text_encoder(root)?,
-            vision: load_vision_tower(root)?,
+            root: root.to_path_buf(),
+            vision: RefCell::new(None),
         })
     }
 
@@ -102,10 +115,47 @@ impl KreaText {
         self.te.forward(&ids, &attn)
     }
 
-    /// Image-grounded edit context (epic 10871 P2.3): the `source` image feeds the Qwen3-VL vision
+    /// Ensure the Qwen3-VL vision tower is loaded (lazy, cached — F-072). Loaded from the snapshot's
+    /// `text_encoder/` (f32) only on the first image-grounded edit, so the T2I / img2img / control paths
+    /// never pay for it. Idempotent.
+    pub fn ensure_vision(&self) -> Result<()> {
+        if self.vision.borrow().is_none() {
+            let tower = load_vision_tower(&self.root)?;
+            *self.vision.borrow_mut() = Some(tower);
+        }
+        Ok(())
+    }
+
+    /// Run the vision tower over every edit source ONCE (F-071/F-073), returning the shared
+    /// [`GroundedVision`] the positive/negative grounded encodes both consume. Lazily loads the tower.
+    pub fn run_vision(&self, sources: &[&Image]) -> Result<GroundedVision> {
+        self.ensure_vision()?;
+        let vision = self.vision.borrow();
+        let tower = vision
+            .as_ref()
+            .expect("vision tower loaded by ensure_vision");
+        run_vision(tower, sources)
+    }
+
+    /// Build a grounded edit context for one instruction from a pre-computed [`GroundedVision`]
+    /// (F-073) — the vision-independent half, so a CFG edit runs the tower once and calls this for both
+    /// the positive and negative instruction.
+    pub fn encode_grounded_from_vision(
+        &self,
+        gv: &GroundedVision,
+        instruction: &str,
+    ) -> Result<Array> {
+        encode_grounded_from_vision(gv, &self.tok, &self.te, instruction)
+    }
+
+    /// Image-grounded edit context (epic 10871 P2.3, F-071): the `sources` feed the Qwen3-VL vision
     /// tower alongside the instruction text, replacing the text-only encode for the Kontext edit path.
-    pub fn encode_grounded(&self, source: &Image, prompt: &str) -> Result<Array> {
-        encode_grounded(&self.vision, &self.tok, &self.te, source, prompt)
+    /// Grounds on ALL sources (scene + person), not just the first. Convenience for a single grounded
+    /// context; a CFG edit should prefer [`run_vision`](Self::run_vision) +
+    /// [`encode_grounded_from_vision`](Self::encode_grounded_from_vision) to share the tower forward.
+    pub fn encode_grounded(&self, sources: &[&Image], prompt: &str) -> Result<Array> {
+        let gv = self.run_vision(sources)?;
+        self.encode_grounded_from_vision(&gv, prompt)
     }
 }
 
@@ -116,6 +166,37 @@ impl KreaText {
 pub struct KreaHeavy {
     dit: Krea2Transformer,
     vae: QwenVae,
+}
+
+/// Count-invariant t2i render state (F-073): the step-invariant prep(s) — the positive prep and, on the
+/// Raw CFG path, the unconditional one. Built once per request by [`KreaHeavy::prepare_t2i`], reused for
+/// every seed in the count loop.
+pub struct T2iPlan {
+    prep_pos: JointPrep,
+    prep_neg: Option<JointPrep>,
+}
+
+/// Count-invariant img2img render state (F-073): the seed-independent clean reference latent (VAE-encoded
+/// once) plus the step-invariant prep(s). Built once by [`KreaHeavy::prepare_img2img`].
+pub struct Img2ImgPlan {
+    prep_pos: JointPrep,
+    prep_neg: Option<JointPrep>,
+    clean: Array,
+}
+
+/// Count-invariant Kontext-edit render state (F-073): the grounded prep(s), which already embed the
+/// VAE-encoded in-context reference tokens + the reference-frame RoPE. Built once by
+/// [`KreaHeavy::prepare_edit_plan`].
+pub struct EditPlan {
+    prep_pos: EditPrep,
+    prep_neg: Option<EditPrep>,
+}
+
+/// Count-invariant pose-control render state (F-073): the step-invariant text prep + the pose skeleton
+/// embedded once through the frozen base `img_in`. Built once by [`KreaHeavy::prepare_control`].
+pub struct ControlPlan {
+    prep: JointPrep,
+    ctrl_tokens: Array,
 }
 
 impl KreaHeavy {
@@ -148,6 +229,70 @@ impl KreaHeavy {
         Ok(())
     }
 
+    /// A **geometry-only** target latent `[1, 16, H/8, W/8]` of zeros (F-073). The step-invariant
+    /// `prepare`/`prepare_edit` read only the latent's *shape* (never its values — see their docs), so a
+    /// plan can be built once per request from this cheap zeros latent instead of from a per-seed noise
+    /// draw. Byte-identical to building the prep from the real noise, and shape-identical to
+    /// [`init_noise`] (pinned by [`tests::geom_latent_shape_matches_init_noise`]).
+    fn geom_latent(width: u32, height: u32) -> Result<Array> {
+        let (hl, wl) = ((height / 8) as i32, (width / 8) as i32);
+        Ok(Array::zeros::<f32>(&[1, 16, hl, wl])?)
+    }
+
+    /// Build the **count-invariant** t2i plan (F-073): the step-invariant prep(s) — positive, plus the
+    /// unconditional prep when `ctx_neg` is `Some` (Raw CFG). Built ONCE per request from the geometry
+    /// latent; every seed in the count loop reuses it via [`Self::render_turbo_from`] /
+    /// [`Self::render_base_from`], hoisting the 12-layer text fusion + host RoPE out of the per-image
+    /// loop as well as the per-step loop.
+    pub fn prepare_t2i(
+        &self,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        width: u32,
+        height: u32,
+    ) -> Result<T2iPlan> {
+        let geom = Self::geom_latent(width, height)?;
+        let prep_pos = self.dit.prepare(ctx_pos, None, &geom)?;
+        let prep_neg = match ctx_neg {
+            Some(nc) => Some(self.dit.prepare(nc, None, &geom)?),
+            None => None,
+        };
+        Ok(T2iPlan { prep_pos, prep_neg })
+    }
+
+    /// **Turbo t2i render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
+    /// [`T2iPlan`] built once per request. Byte-identical to the pre-hoist [`Self::render_turbo`] (the
+    /// prep only depended on the latent geometry, not the noise values).
+    pub fn render_turbo_from(
+        &self,
+        plan: &T2iPlan,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let noise = init_noise(opts.height, opts.width, opts.seed)?;
+        let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
+        let sigmas = &full[..keep.min(full.len())];
+        let lat = run_flow_sampler(
+            opts.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            sigmas,
+            noise,
+            opts.seed,
+            cancel,
+            on_progress,
+            |x, timestep| {
+                let t = Array::from_slice(&[timestep], &[1]);
+                let v = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                Ok(v.as_dtype(Dtype::Float32)?)
+            },
+        )?;
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder)
+    }
+
     /// **Turbo t2i render** — the denoise/decode body of [`KreaPipeline::generate_turbo_with_progress`]
     /// with the text encode hoisted out (`context`, pre-encoded by [`KreaText::encode`]). CFG-free, B=1
     /// → mask = None. `keep` (from_ldm early-stop) truncates the schedule; `usize::MAX` runs it all.
@@ -160,37 +305,12 @@ impl KreaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Single-image convenience: build the count-invariant plan (F-073) then render one seed. The
+        // count loop in [`crate::model`] calls `prepare_t2i` + `render_turbo_from` directly so the plan
+        // is shared across seeds.
         validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo")?;
-
-        // Initial latent noise [1, 16, H/8, W/8] (f32; the DiT casts to its compute dtype).
-        let noise = init_noise(opts.height, opts.width, opts.seed)?;
-
-        // Native exponential-mu Turbo sigmas are the byte-exact default; a curated scheduler reshapes
-        // over the same mu. Raw sigma → DiT timestep, raw velocity → Euler `x + v·(σ_{i+1} − σ_i)`.
-        // `from_ldm` early-stop (sc-7993): truncate to `keep` entries (σ=0 clean path runs them all).
-        let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
-        let sigmas = &full[..keep.min(full.len())];
-        // Hoist the step-invariant text fusion + joint RoPE out of the per-step closure (F-079): the
-        // context (and the latent geometry) are fixed across the denoise, so `prepare` runs ONCE and
-        // every step reuses `prep` via `forward_prepared` (bit-identical to the per-step `forward`).
-        let prep = self.dit.prepare(context, None, &noise)?;
-        let lat = run_flow_sampler(
-            opts.sampler.as_deref(),
-            TimestepConvention::Sigma,
-            sigmas,
-            noise,
-            opts.seed,
-            cancel,
-            on_progress,
-            |x, timestep| {
-                let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward_prepared(x, &t, &prep)?;
-                Ok(v.as_dtype(Dtype::Float32)?)
-            },
-        )?;
-
-        on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        let plan = self.prepare_t2i(context, None, opts.width, opts.height)?;
+        self.render_turbo_from(&plan, opts, decoder, keep, cancel, on_progress)
     }
 
     /// **Pose-ControlNet Turbo render** (sc-8465, epic 8459 S5) — the denoise/decode body of
@@ -211,19 +331,67 @@ impl KreaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo_control")?;
+        // Single-image convenience; the count loop in [`crate::model_control`] calls `prepare_control`
+        // + `render_control_from` directly so the pose encode + prep are shared across seeds (F-073).
+        // This convenience path (KreaPipeline delegator + weight-gated tests) always decodes single-pass
+        // (`None`); the budget-gated tiled decode is threaded by the `Generator` seam (`model_control`).
+        let plan = self.prepare_control(context, control_image, opts.width, opts.height)?;
+        self.render_control_from(
+            &plan,
+            branch,
+            control_scale,
+            None,
+            opts,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Build the **count-invariant** pose-control plan (F-073): the step-invariant text prep AND the
+    /// pose skeleton VAE-encoded + embedded once through the frozen base `img_in` (`ctrl_tokens`).
+    /// Neither depends on the seed, so an N-image control job builds this ONCE.
+    pub fn prepare_control(
+        &self,
+        context: &Array,
+        control_image: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<ControlPlan> {
+        validate_multiple_of_16(width, height, "krea_2_turbo_control")?;
 
         // Pose skeleton → control latent [1, 16, H/8, W/8] (`QwenVae::encode` returns the normalized
         // `(e − mean)/std` latent, the same space as `init_noise`; drop the singleton temporal axis).
-        // Embed once through the frozen base `img_in` — the pose is fixed across steps (step-invariant).
-        let image_nchw = preprocess_init_image(control_image, opts.width, opts.height)?;
+        // Embed once through the frozen base `img_in` — the pose is fixed across steps AND seeds.
+        let image_nchw = preprocess_init_image(control_image, width, height)?;
         let ctrl_latent = self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?;
         let ctrl_tokens = self.dit.embed_latent(&ctrl_latent)?;
 
+        // Hoist the step-invariant text fusion + joint RoPE (F-079), as the plain Turbo path.
+        let prep = self
+            .dit
+            .prepare(context, None, &Self::geom_latent(width, height)?)?;
+        Ok(ControlPlan { prep, ctrl_tokens })
+    }
+
+    /// **Pose-control render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
+    /// [`ControlPlan`]. Byte-identical to the pre-hoist [`Self::render_turbo_control`] on the denoise
+    /// path; `decode_tiling` (sc-11747) selects the decode: `Some(cfg)` runs the memory-bounded tiled
+    /// Qwen-VAE decode (the 32 GB-Mac lever), `None` the single-pass decode (a machine with headroom, or
+    /// the convenience/test path). The tiled decode reconstructs the untiled image within blend
+    /// tolerance, so the pose-locked output is unchanged — only the decode peak drops.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_control_from(
+        &self,
+        plan: &ControlPlan,
+        branch: &Krea2ControlBranch,
+        control_scale: f32,
+        decode_tiling: Option<&TilingConfig>,
+        opts: &TurboOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         let sigmas = turbo_schedule(opts.steps, opts.scheduler.as_deref());
-        // Hoist the step-invariant text fusion + joint RoPE (F-079), as the plain Turbo path.
-        let prep = self.dit.prepare(context, None, &noise)?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -234,13 +402,20 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = branch.forward(&self.dit, x, &t, &prep, &ctrl_tokens, control_scale)?;
+                let v = branch.forward(
+                    &self.dit,
+                    x,
+                    &t,
+                    &plan.prep,
+                    &plan.ctrl_tokens,
+                    control_scale,
+                )?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat, None)
+        self.decode_latents_native_tiled(&lat, decode_tiling, cancel)
     }
 
     /// **img2img latent-init Turbo render** (epic 8588 slice A; sc-8589/sc-8590) — the denoise/decode
@@ -259,22 +434,80 @@ impl KreaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Single-image convenience; the count loop calls `prepare_img2img` + `render_turbo_img2img_from`
+        // directly so the clean-latent VAE encode + prep are shared across seeds (F-073).
         validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo")?;
+        let plan = self.prepare_img2img(context, None, init, opts.width, opts.height)?;
+        // `usize::MAX` = the clean σ=0 default (no from_ldm capture); the Generator (`model.rs`) resolves
+        // and threads a real `keep` when a PiD capture is requested (sc-10121).
+        self.render_turbo_img2img_from(
+            &plan,
+            strength,
+            opts,
+            decoder,
+            usize::MAX,
+            cancel,
+            on_progress,
+        )
+    }
 
+    /// Build the **count-invariant** img2img plan (F-073): the seed-independent clean reference latent
+    /// (VAE-encoded once) + the step-invariant prep(s). Neither depends on the seed (the prep only reads
+    /// the latent geometry), so an N-image img2img job builds this ONCE. `ctx_neg` is `Some` for the Raw
+    /// CFG path, `None` for CFG-free Turbo.
+    pub fn prepare_img2img(
+        &self,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        init: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Img2ImgPlan> {
         // Reference → clean latent [1, 16, H/8, W/8]. `QwenVae::encode` already returns the normalized
         // `(e − mean)/std` latent (the same space as `init_noise`); drop the singleton temporal axis.
-        let image_nchw = preprocess_init_image(init, opts.width, opts.height)?;
+        let image_nchw = preprocess_init_image(init, width, height)?;
         let clean = self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?;
+        // Preps built from the geometry latent (shape-identical to the per-seed blended `x_start`).
+        let geom = Self::geom_latent(width, height)?;
+        let prep_pos = self.dit.prepare(ctx_pos, None, &geom)?;
+        let prep_neg = match ctx_neg {
+            Some(nc) => Some(self.dit.prepare(nc, None, &geom)?),
+            None => None,
+        };
+        Ok(Img2ImgPlan {
+            prep_pos,
+            prep_neg,
+            clean,
+        })
+    }
 
+    /// **CFG-free Turbo img2img render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing
+    /// the [`Img2ImgPlan`]. `keep` (sc-10121) is the PiD `from_ldm` early-stop truncation resolved by the
+    /// caller against the full schedule + this img2img `start` (`usize::MAX` = the clean σ=0 default).
+    /// With `keep == full.len()` it is byte-identical to the pre-sc-10121 [`Self::render_turbo_img2img`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_turbo_img2img_from(
+        &self,
+        plan: &Img2ImgPlan,
+        strength: f32,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
-
-        // Start step from strength; blend the clean latent with noise at σ_k, then denoise sigmas[k..].
+        // Start step from strength; blend the clean latent with noise at σ_k, then denoise the window.
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
-        let sigmas = &full[start..];
-        let x_start = add_noise_by_interpolation(&clean, &noise, full[start])?;
-
-        let prep = self.dit.prepare(context, None, &x_start)?;
+        // PiD `from_ldm` early-stop (sc-10121): the caller resolved `keep` against THIS full schedule
+        // with THIS `start` (via `flow_capture_for_request`'s `start_step`), so truncating the img2img
+        // window to `full[start..keep]` exits at exactly `full[keep-1]` — the degrade σ the PiD decoder
+        // was built at. `keep == full.len()` (the clean default / no capture) runs the whole `[start..]`
+        // tail to σ=0, byte-identical to the pre-sc-10121 img2img path.
+        let end = keep.min(full.len());
+        let sigmas = &full[start..end];
+        let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -285,7 +518,7 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward_prepared(x, &t, &prep)?;
+                let v = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
@@ -312,18 +545,28 @@ impl KreaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Single-image convenience; the count loop in [`crate::model`] calls `prepare_t2i` +
+        // `render_base_from` directly so the preps are shared across seeds (F-073).
         validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
+        let plan = self.prepare_t2i(ctx_pos, ctx_neg, opts.width, opts.height)?;
+        self.render_base_from(&plan, guidance, opts, decoder, keep, cancel, on_progress)
+    }
 
-        // Initial latent noise [1, 16, H/8, W/8] — shared by both prep branches (same geometry).
+    /// **Raw true-CFG t2i render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
+    /// [`T2iPlan`]. Byte-identical to the pre-hoist [`Self::render_base`]. `plan.prep_neg` is `Some` iff
+    /// CFG is active (the caller passed `ctx_neg`), collapsing to a single conditional forward otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_base_from(
+        &self,
+        plan: &T2iPlan,
+        guidance: f32,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
-        let prep_pos = self.dit.prepare(ctx_pos, None, &noise)?;
-
-        // Unconditional branch prepared ONLY when CFG is active (the caller passes `Some` iff
-        // `guidance > 0` — reference `cfg = guidance > 0`; the negative prompt defaulted to `""`).
-        let prep_neg = match ctx_neg {
-            Some(nc) => Some(self.dit.prepare(nc, None, &noise)?),
-            None => None,
-        };
 
         // Resolution-dynamic Raw schedule (mu from image-token count), truncated to `keep` for a PiD
         // `from_ldm` early-stop (σ=0 clean path runs them all).
@@ -344,8 +587,8 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = self.dit.forward_prepared(x, &t, &prep_pos)?;
-                let v = match &prep_neg {
+                let cond = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let v = match &plan.prep_neg {
                     Some(neg) => {
                         let uncond = self.dit.forward_prepared(x, &t, neg)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
@@ -378,17 +621,44 @@ impl KreaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Single-image convenience; the count loop calls `prepare_img2img` + `render_base_img2img_from`
+        // directly so the clean-latent VAE encode + preps are shared across seeds (F-073).
         validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
+        let plan = self.prepare_img2img(ctx_pos, ctx_neg, init, opts.width, opts.height)?;
+        // `usize::MAX` = the clean σ=0 default (no from_ldm capture); the Generator (`model.rs`) resolves
+        // and threads a real `keep` when a PiD capture is requested (sc-10121).
+        self.render_base_img2img_from(
+            &plan,
+            guidance,
+            strength,
+            opts,
+            decoder,
+            usize::MAX,
+            cancel,
+            on_progress,
+        )
+    }
 
-        // Reference → clean latent [1, 16, H/8, W/8]. `QwenVae::encode` already returns the normalized
-        // `(e − mean)/std` latent (the same space as `init_noise`); drop the singleton temporal axis.
-        let image_nchw = preprocess_init_image(init, opts.width, opts.height)?;
-        let clean = self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?;
-
+    /// **Raw true-CFG img2img render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing
+    /// the [`Img2ImgPlan`]. `keep` (sc-10121) is the PiD `from_ldm` early-stop truncation resolved by the
+    /// caller against the full [`base_schedule`] + this img2img `start` (`usize::MAX` = the clean σ=0
+    /// default). With `keep == full.len()` it is byte-identical to the pre-sc-10121 img2img path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_base_img2img_from(
+        &self,
+        plan: &Img2ImgPlan,
+        guidance: f32,
+        strength: f32,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
 
         // Start step from strength on the resolution-dynamic Raw schedule; blend the clean latent with
-        // noise at σ_k, then denoise sigmas[k..]. (Turbo uses `turbo_schedule`; Raw's mu is dynamic.)
+        // noise at σ_k, then denoise the window. (Turbo uses `turbo_schedule`; Raw's mu is dynamic.)
         let full = base_schedule(
             opts.steps,
             opts.width,
@@ -396,15 +666,12 @@ impl KreaHeavy {
             opts.scheduler.as_deref(),
         );
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
-        let sigmas = &full[start..];
-        let x_start = add_noise_by_interpolation(&clean, &noise, full[start])?;
-
-        // Positive + (CFG-active) unconditional preps, hoisted once against the blended start latent.
-        let prep_pos = self.dit.prepare(ctx_pos, None, &x_start)?;
-        let prep_neg = match ctx_neg {
-            Some(nc) => Some(self.dit.prepare(nc, None, &x_start)?),
-            None => None,
-        };
+        // PiD `from_ldm` early-stop (sc-10121): `keep` was resolved against THIS schedule + `start`, so
+        // `full[start..keep]` exits at `full[keep-1]` — the decoder's degrade σ. `keep == full.len()`
+        // (the clean default / no capture) runs the whole `[start..]` tail to σ=0.
+        let end = keep.min(full.len());
+        let sigmas = &full[start..end];
+        let x_start = add_noise_by_interpolation(&plan.clean, &noise, full[start])?;
 
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
@@ -416,8 +683,8 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = self.dit.forward_prepared(x, &t, &prep_pos)?;
-                let v = match &prep_neg {
+                let cond = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let v = match &plan.prep_neg {
                     Some(neg) => {
                         let uncond = self.dit.forward_prepared(x, &t, neg)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
@@ -432,11 +699,13 @@ impl KreaHeavy {
         self.decode_latents(&lat, decoder)
     }
 
-    /// **Kontext-style edit render** on the Krea 2 Raw (true-CFG) path (epic 10871, sc-10876) — the
-    /// denoise/decode body of [`KreaPipeline::generate_edit_with_progress`] with the grounded text
-    /// encodes hoisted out. `ctx_pos` / `ctx_neg` are the *grounded* contexts (source image + text)
-    /// from [`KreaText::encode_grounded`]; `sources` are the reference image(s) VAE-encoded here at the
-    /// TARGET resolution as in-context tokens (`prepare_edit`). Denoises from PURE NOISE under full CFG.
+    /// **Kontext-style edit render** on the Krea 2 (true-CFG Raw or CFG-free Turbo) path (epic 10871,
+    /// sc-10876) — the denoise/decode body of [`KreaPipeline::generate_edit_with_progress`] with the
+    /// grounded text encodes hoisted out. `ctx_pos` / `ctx_neg` are the *grounded* contexts (source
+    /// image + text) from [`KreaText::encode_grounded`]; `sources` are the reference image(s) VAE-encoded
+    /// here at the TARGET resolution as in-context tokens (`prepare_edit`). Denoises from PURE NOISE.
+    /// `keep` (F-069) truncates the schedule for a PiD `from_ldm` early-stop capture — `usize::MAX` runs
+    /// the whole schedule (the σ=0 clean-decode default).
     #[allow(clippy::too_many_arguments)]
     pub fn render_edit(
         &self,
@@ -452,10 +721,40 @@ impl KreaHeavy {
         sources: &[&Image],
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Single-image convenience; the count loop in [`crate::model`] calls `prepare_edit_plan` +
+        // `render_edit_from` directly so the reference VAE encodes + preps are shared across seeds
+        // (F-073).
         validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
+        let plan = self.prepare_edit_plan(ctx_pos, ctx_neg, sources, opts.width, opts.height)?;
+        self.render_edit_from(
+            &plan,
+            guidance,
+            distilled,
+            opts,
+            decoder,
+            keep,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Build the **count-invariant** edit plan (F-073): VAE-encode every reference ONCE into in-context
+    /// clean latents, then build the grounded prep(s) — which embed those reference tokens + the
+    /// reference-frame RoPE. Neither depends on the seed (the prep reads only the target geometry), so a
+    /// two-source, N-image edit builds this ONCE instead of `N × (2 VAE encodes + 2 preps)`.
+    pub fn prepare_edit_plan(
+        &self,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        sources: &[&Image],
+        width: u32,
+        height: u32,
+    ) -> Result<EditPlan> {
+        validate_multiple_of_16(width, height, "krea_2_raw")?;
         if sources.is_empty() {
             return Err(mlx_gen::Error::Msg(
                 "krea_2 edit: at least one source image is required".into(),
@@ -467,26 +766,47 @@ impl KreaHeavy {
         // the singleton temporal axis (same front matter as img2img).
         let mut ref_latents: Vec<Array> = Vec::with_capacity(sources.len());
         for &src in sources {
-            let image_nchw = preprocess_init_image(src, opts.width, opts.height)?;
+            let image_nchw = preprocess_init_image(src, width, height)?;
             ref_latents.push(self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?);
         }
 
+        // DUAL CONDITIONING (epic 10871 P2.3): the source images feed BOTH the in-context VAE tokens
+        // (`ref_latents`) AND the Qwen3-VL grounded context (`ctx_pos`/`ctx_neg`, hoisted by the
+        // caller). Each prep carries the clean reference tokens + the reference-frame RoPE; built from
+        // the geometry latent (shape-identical to the per-seed noise — the edit denoises from noise).
+        let geom = Self::geom_latent(width, height)?;
+        let prep_pos = self.dit.prepare_edit(ctx_pos, None, &geom, &ref_latents)?;
+        let prep_neg = match ctx_neg {
+            Some(nc) => Some(self.dit.prepare_edit(nc, None, &geom, &ref_latents)?),
+            None => None,
+        };
+        Ok(EditPlan { prep_pos, prep_neg })
+    }
+
+    /// **Kontext edit render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
+    /// [`EditPlan`]. Byte-identical to the pre-hoist per-seed build. `keep` (F-069) truncates the
+    /// schedule for a PiD `from_ldm` early-stop, exactly as the t2i paths do.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_edit_from(
+        &self,
+        plan: &EditPlan,
+        guidance: f32,
+        distilled: bool,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         // Edit denoises from PURE NOISE — the source is in-context conditioning, not a noised init.
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
 
-        // DUAL CONDITIONING (epic 10871 P2.3): the source image feeds BOTH the in-context VAE tokens
-        // (`ref_latents`, above) AND the Qwen3-VL grounded context (`ctx_pos`/`ctx_neg`, hoisted by the
-        // caller). Each prep carries the clean reference tokens + the reference-frame RoPE.
-        let prep_pos = self.dit.prepare_edit(ctx_pos, None, &noise, &ref_latents)?;
-        let prep_neg = match ctx_neg {
-            Some(nc) => Some(self.dit.prepare_edit(nc, None, &noise, &ref_latents)?),
-            None => None,
-        };
-
-        // The edit runs the whole schedule from noise (like t2i). Turbo edit uses the distilled few-step
+        // The edit runs the schedule from noise (like t2i). Turbo edit uses the distilled few-step
         // `turbo_schedule` (fixed mu) the CFG-free student expects; Raw edit uses the resolution-dynamic
         // `base_schedule`. This must match `generate_impl`'s capture-σ schedule selector (`is_raw`).
-        let sigmas = if distilled {
+        // `keep` truncates it for a PiD `from_ldm` early-stop capture (F-069) — the σ=0 clean path runs
+        // them all (`keep == full.len()`, or `usize::MAX`).
+        let full = if distilled {
             turbo_schedule(opts.steps, opts.scheduler.as_deref())
         } else {
             base_schedule(
@@ -496,18 +816,19 @@ impl KreaHeavy {
                 opts.scheduler.as_deref(),
             )
         };
+        let sigmas = &full[..keep.min(full.len())];
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
-            &sigmas,
+            sigmas,
             noise,
             opts.seed,
             cancel,
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let cond = self.dit.forward_prepared_edit(x, &t, &prep_pos)?;
-                let v = match &prep_neg {
+                let cond = self.dit.forward_prepared_edit(x, &t, &plan.prep_pos)?;
+                let v = match &plan.prep_neg {
                     Some(neg) => {
                         let uncond = self.dit.forward_prepared_edit(x, &t, neg)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
@@ -529,6 +850,27 @@ impl KreaHeavy {
     fn decode_latents(&self, lat: &Array, decoder: Option<&dyn LatentDecoder>) -> Result<Image> {
         let dec: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
         let decoded = dec.decode(lat)?.as_dtype(Dtype::Float32)?;
+        decoded_to_image(&decoded)
+    }
+
+    /// Decode a latent through the **native Qwen-VAE**, memory-bounded by tiling when `decode_tiling` is
+    /// `Some` (sc-11747). The control lane never routes a PiD decoder (the pose lane is native-VAE only),
+    /// so this is the control decode seam: `Some(cfg)` runs [`QwenVae::decode_tiled`] (the tiled decode
+    /// selected by the budget gate), `None` the single-pass [`QwenVae::decode`]. Same
+    /// `decoded_to_image` post-step (`clip(x·0.5 + 0.5, 0, 1)`, dropping the singleton temporal axis) as
+    /// [`Self::decode_latents`], so a tiled and an untiled decode yield the same image up to the blend
+    /// tolerance. `cancel` lets the tiled decode abort between tiles.
+    fn decode_latents_native_tiled(
+        &self,
+        lat: &Array,
+        decode_tiling: Option<&TilingConfig>,
+        cancel: &CancelFlag,
+    ) -> Result<Image> {
+        let decoded = match decode_tiling {
+            Some(cfg) => self.vae.decode_tiled(lat, cfg, Some(cancel))?,
+            None => self.vae.decode(lat)?,
+        }
+        .as_dtype(Dtype::Float32)?;
         decoded_to_image(&decoded)
     }
 }
@@ -809,8 +1151,9 @@ impl KreaPipeline {
     }
 
     /// **Kontext-style image edit** on the Krea 2 Raw (true-CFG) path (epic 10871, sc-10876). See
-    /// [`KreaHeavy::render_edit`]. The grounded context (`encode_grounded` over `sources[0]`) replaces
-    /// the text-only encode; the unconditional grounded context is built ONLY when `guidance > 0`.
+    /// [`KreaHeavy::render_edit`]. The grounded context (`encode_grounded` over ALL `sources`, F-071)
+    /// replaces the text-only encode; the unconditional grounded context is built ONLY when
+    /// `guidance > 0`, reusing the single shared vision-tower forward (F-073).
     #[allow(clippy::too_many_arguments)]
     pub fn generate_edit_with_progress(
         &self,
@@ -828,11 +1171,16 @@ impl KreaPipeline {
                 "krea_2 edit: at least one source image is required".into(),
             ));
         }
-        // Single-reference grounding for now (the VAE-token side already takes N sources); the grounded
-        // context sits in both CFG branches (only the instruction text differs).
-        let ctx_pos = self.text.encode_grounded(sources[0], prompt)?;
+        // Ground on ALL sources (scene + person), not just the first (F-071), and run the vision tower
+        // ONCE — the grounded context sits in both CFG branches, only the instruction text differs
+        // (F-073).
+        let gv = self.text.run_vision(sources)?;
+        let ctx_pos = self.text.encode_grounded_from_vision(&gv, prompt)?;
         let ctx_neg = if guidance > 0.0 {
-            Some(self.text.encode_grounded(sources[0], negative_prompt)?)
+            Some(
+                self.text
+                    .encode_grounded_from_vision(&gv, negative_prompt)?,
+            )
         } else {
             None
         };
@@ -846,6 +1194,9 @@ impl KreaPipeline {
             sources,
             opts,
             decoder,
+            // The delegator has no `from_ldm` capture resolution — run the whole schedule (σ=0 clean
+            // decode). The request-reachable early-stop is wired on the `generate_impl` edit path (F-069).
+            usize::MAX,
             cancel,
             on_progress,
         )
@@ -888,6 +1239,65 @@ pub(crate) fn krea_cfg_combine(v_cond: &Array, v_uncond: &Array, guidance: f32) 
     )?)
 }
 
+/// The GPU-validated-safe range for [`gen_core::GenerationRequest::text_style_gain`] — the sc-8596 A/B
+/// swept `[0.25, 1.75]` and every point stayed coherent. The engine clamps to this rather than trusting a
+/// caller/UI to bound it. Mirrors candle-gen-krea's `TEXT_STYLE_GAIN_RANGE` (sc-11878 Mac parity); the
+/// SceneWorks worker also clamps to the same range, so this is defense-in-depth, not the only guard.
+const TEXT_STYLE_GAIN_RANGE: (f32, f32) = (0.25, 1.75);
+
+/// SPIKE (sc-8596) — scale each of the stacked Qwen3-VL select-layer taps of a Krea text context
+/// `[b, n_tok, num_layers, hidden]` by `weights[i]` along the layer axis (axis 2): a
+/// `[1, 1, num_layers, 1]` broadcast multiply applied **before** the DiT's `TextFusionTransformer`
+/// aggregates the taps (layerwise-attn → `projector` num_layers→1 → refiner). An "IP-Adapter-LIKE"
+/// steering knob on the *text-only* weights — no new model weights. All-ones reproduces the input
+/// bit-for-bit; a mis-sized vector is rejected loudly so a bad sweep fails rather than silently
+/// broadcasting/truncating. Krea/Qwen-Image-family specific (depends on the multi-tap structure); it does
+/// NOT generalize to CLIP/T5 encoders. The candle-gen-krea twin of the same name (sc-11878).
+pub fn apply_tap_weights(context: &Array, weights: &[f32]) -> Result<Array> {
+    let n = context.shape()[2] as usize;
+    if weights.len() != n {
+        return Err(mlx_gen::Error::Msg(format!(
+            "krea tap reweight: {} weights but the context has {n} select layers",
+            weights.len()
+        )));
+    }
+    let w = Array::from_slice(weights, &[1, 1, n as i32, 1]).as_dtype(context.dtype())?;
+    Ok(multiply(context, &w)?)
+}
+
+/// Map the single "text style" gain scalar `g` to the per-layer tap ramp `w[i] = g + (2−2g)·i/(n−1)`
+/// (sc-11878 — the shipped control over the sc-8596 spike mechanism). `g` is clamped to
+/// [`TEXT_STYLE_GAIN_RANGE`]. `g = 1` yields all-ones (a no-op); `g > 1` emphasizes the early (low-level)
+/// taps (`w[0] = g`, tapering to `w[n−1] = 2−g`), `g < 1` biases the late (semantic) taps. At `g = 1.75`
+/// this reproduces the spike's `early_ramp` (1.75→0.25). `n = 1` degenerates to `[g]`. Byte-for-byte the
+/// candle-gen-krea `tap_gain_weights` (same clamp, same ramp) so the two backends agree at every `g`.
+fn tap_gain_weights(gain: f32, n: usize) -> Vec<f32> {
+    let g = gain.clamp(TEXT_STYLE_GAIN_RANGE.0, TEXT_STYLE_GAIN_RANGE.1);
+    if n <= 1 {
+        return vec![g; n];
+    }
+    (0..n)
+        .map(|i| g + (2.0 - 2.0 * g) * (i as f32) / ((n - 1) as f32))
+        .collect()
+}
+
+/// Apply the request's optional [`gen_core::GenerationRequest::text_style_gain`] to a freshly-encoded
+/// **positive** Krea text context (sc-11878). `None` — or a gain within 1e-4 of 1.0 — returns the context
+/// untouched (the no-op fast path), so a plain request pays nothing. The caller encodes the CFG-negative
+/// context WITHOUT the gain, so the knob steers only the conditional prediction (matching the sc-8596
+/// spike and candle-gen-krea's `maybe_apply_style_gain`). Reached only from the txt2img/img2img encode
+/// seam ([`crate::model::Krea::encode_contexts`]); the grounded-edit and pose-control paths do not pass a
+/// gain (the worker only wires it through the generic Turbo/Raw entry point).
+pub(crate) fn maybe_apply_style_gain(context: Array, gain: Option<f32>) -> Result<Array> {
+    match gain {
+        Some(g) if (g - 1.0).abs() > 1e-4 => {
+            let n = context.shape()[2] as usize;
+            apply_tap_weights(&context, &tap_gain_weights(g, n))
+        }
+        _ => Ok(context),
+    }
+}
+
 /// Seeded initial Gaussian latent noise `[1, 16, H/8, W/8]` (f32; the VAE's 8× spatial compression).
 /// The model layer offsets `seed` per image in a batch, mirroring the reference `seed + i`.
 fn init_noise(height: u32, width: u32, seed: u64) -> Result<Array> {
@@ -919,6 +1329,113 @@ mod tests {
                 (v.item::<f32>() - want).abs() < 1e-5,
                 "g={g}: got {}, want {want}",
                 v.item::<f32>()
+            );
+        }
+    }
+
+    /// SPIKE (sc-8596): all-ones tap weights are an identity reweight (byte-exact), and a per-layer
+    /// scalar scales exactly its select-layer slice along axis 2 (a `[1,1,num_layers,1]` broadcast).
+    #[test]
+    fn apply_tap_weights_scales_layer_axis() {
+        // context [b=1, n_tok=2, num_layers=3, hidden=2], all ones.
+        let ctx = Array::ones::<f32>(&[1, 2, 3, 2]).unwrap();
+
+        // Identity: all-ones weights reproduce the input.
+        let id = apply_tap_weights(&ctx, &[1.0, 1.0, 1.0]).unwrap();
+        assert_eq!(id.as_slice::<f32>(), ctx.as_slice::<f32>());
+
+        // Per-layer scale: layer 0 → 2, layer 1 → 0, layer 2 → 0.5, along axis 2 only. Row-major layout
+        // is [b, n_tok, layer, hidden]; for all-ones input each element equals its layer's weight.
+        let out = apply_tap_weights(&ctx, &[2.0, 0.0, 0.5]).unwrap();
+        let v = out.as_slice::<f32>();
+        // Two n_tok rows, each: layer0 (2 elems) | layer1 (2) | layer2 (2).
+        let want = [2.0, 2.0, 0.0, 0.0, 0.5, 0.5, 2.0, 2.0, 0.0, 0.0, 0.5, 0.5];
+        assert_eq!(v.len(), want.len());
+        for (got, w) in v.iter().zip(want.iter()) {
+            assert!((got - w).abs() < 1e-6, "got {got}, want {w}");
+        }
+    }
+
+    /// sc-11878: the single "text style" gain scalar maps to the validated tap ramp — g=1 is a no-op
+    /// (all ones), g=1.75 reproduces the spike's early_ramp (1.75→0.25), and out-of-range clamps.
+    /// Byte-identical mapping to candle-gen-krea's `tap_gain_weights`.
+    #[test]
+    fn tap_gain_weights_maps_scalar_to_ramp() {
+        // g = 1 → all ones (no-op).
+        assert_eq!(tap_gain_weights(1.0, 12), vec![1.0; 12]);
+
+        // g = 1.75 → linear ramp 1.75 → 0.25 across 12 taps (the spike's early_ramp).
+        let w = tap_gain_weights(1.75, 12);
+        assert!((w[0] - 1.75).abs() < 1e-6);
+        assert!((w[11] - 0.25).abs() < 1e-6);
+        // Monotonically decreasing, symmetric about 1.0 at the midpoint.
+        assert!(w.windows(2).all(|p| p[0] > p[1]));
+        assert!((w[0] + w[11] - 2.0).abs() < 1e-6);
+
+        // g = 0.5 → mirror ramp 0.5 → 1.5 (late emphasis).
+        let lo = tap_gain_weights(0.5, 12);
+        assert!((lo[0] - 0.5).abs() < 1e-6);
+        assert!((lo[11] - 1.5).abs() < 1e-6);
+
+        // Clamp: 3.0 → 1.75, 0.0 → 0.25.
+        assert!((tap_gain_weights(3.0, 12)[0] - 1.75).abs() < 1e-6);
+        assert!((tap_gain_weights(0.0, 12)[0] - 0.25).abs() < 1e-6);
+
+        // Degenerate n.
+        assert_eq!(tap_gain_weights(1.5, 1), vec![1.5]);
+    }
+
+    /// `maybe_apply_style_gain` is a no-op for `None` and for a gain within 1e-4 of 1.0, and reweights
+    /// otherwise (byte-identical to the explicit `apply_tap_weights` with the mapped ramp).
+    #[test]
+    fn maybe_apply_style_gain_noop_and_apply() {
+        let ctx = Array::ones::<f32>(&[1, 2, 12, 4]).unwrap();
+
+        // None → untouched.
+        assert_eq!(
+            maybe_apply_style_gain(ctx.clone(), None)
+                .unwrap()
+                .as_slice::<f32>(),
+            ctx.as_slice::<f32>()
+        );
+
+        // g ≈ 1 → untouched (no-op fast path).
+        assert_eq!(
+            maybe_apply_style_gain(ctx.clone(), Some(1.00005))
+                .unwrap()
+                .as_slice::<f32>(),
+            ctx.as_slice::<f32>()
+        );
+
+        // g = 1.5 → equals the explicit ramp apply.
+        let got = maybe_apply_style_gain(ctx.clone(), Some(1.5)).unwrap();
+        let want = apply_tap_weights(&ctx, &tap_gain_weights(1.5, 12)).unwrap();
+        assert_eq!(got.as_slice::<f32>(), want.as_slice::<f32>());
+    }
+
+    /// A mis-sized weight vector must fail loudly (not silently truncate/broadcast).
+    #[test]
+    fn apply_tap_weights_rejects_wrong_len() {
+        let ctx = Array::ones::<f32>(&[1, 2, 3, 2]).unwrap();
+        assert!(apply_tap_weights(&ctx, &[1.0, 1.0]).is_err());
+        assert!(apply_tap_weights(&ctx, &[1.0; 4]).is_err());
+    }
+
+    /// F-073 parity invariant: the count-invariant plan is built from [`KreaHeavy::geom_latent`], which
+    /// MUST be shape-identical to the per-seed [`init_noise`] the render then draws. The whole
+    /// "byte-identical after the hoist" argument rests on `dit.prepare*` reading only the latent *shape*
+    /// — so if these shapes ever diverged, the hoisted prep would silently differ from the per-step one.
+    #[test]
+    fn geom_latent_shape_matches_init_noise() {
+        for (w, h) in [(1024u32, 1024u32), (1536, 1024), (512, 768)] {
+            let geom = KreaHeavy::geom_latent(w, h).unwrap();
+            let noise = init_noise(h, w, 7).unwrap();
+            assert_eq!(
+                geom.shape(),
+                noise.shape(),
+                "{w}x{h}: geom {:?} != noise {:?}",
+                geom.shape(),
+                noise.shape()
             );
         }
     }

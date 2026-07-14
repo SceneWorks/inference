@@ -28,16 +28,17 @@
 //!    SiLU → conv_point(1×1 no-bias) → trms2d → + residual`.
 //!  - [`UpBlock`] (`DCUpBlock2d`, interpolate): `nearest-upsample → conv`, + a channel shortcut
 //!    `repeat_interleave → pixel_shuffle`.
-//!  - [`DownBlock`] (`DCDownBlock2d`, the encoder mirror): `pixel_unshuffle → conv`, + a channel
-//!    shortcut `pixel_unshuffle → channel-average`.
+//!  - [`DownBlock`] (`DCDownBlock2d`, the encoder mirror, `downsample_block_type = Conv`): a
+//!    `stride-2 conv`, + a channel shortcut `pixel_unshuffle → channel-average`.
 
 // The pure tensor helpers + `forward` methods return candle-core's `Result` (candle ops' native
 // error). The weight-loaders return `candle_gen::Result` (its `CandleError` is what `Weights::require`
 // yields, and candle-core errors `?`-convert into it); those are annotated `candle_gen::Result`
 // explicitly.
-use candle_gen::candle_core::{DType, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Error, Result, Tensor, D};
 use candle_gen::candle_nn::ops::silu;
 use candle_gen::candle_nn::{Conv2d, Conv2dConfig, Module};
+use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::Weights;
 
 use crate::config::{BlockType, DcAeConfig};
@@ -470,7 +471,7 @@ impl UpBlock {
     }
 }
 
-/// `DCDownBlock2d` (the encoder mirror): `pixel_unshuffle → conv`, + the `pixel_unshuffle →
+/// `DCDownBlock2d` (the encoder mirror): a **stride-2 3×3 conv**, + the `pixel_unshuffle →
 /// channel-average` shortcut. `in_ch` = this stage's channels, `out_ch` = deeper stage's.
 struct DownBlock {
     conv: Conv2d,
@@ -480,16 +481,20 @@ struct DownBlock {
 impl DownBlock {
     fn load(w: &Weights, prefix: &str, out_ch: usize) -> candle_gen::Result<Self> {
         Ok(Self {
-            // Consumes the space→channel unshuffled `in_ch·4` map (padding 1 keeps the 3×3 same-size).
-            conv: conv(w, &format!("{prefix}.conv"), 1, 1, 1, true)?,
+            // SANA-1.0 sets `downsample_block_type = "Conv"`, so diffusers `DCDownBlock2d` runs a plain
+            // **stride-2** 3×3 conv (in_ch → out_ch, padding 1) — the on-disk weight is `[out_ch, in_ch,
+            // 3, 3]`, and the stride is what halves the spatial dims (no pixel_unshuffle on this path).
+            conv: conv(w, &format!("{prefix}.conv"), 2, 1, 1, true)?,
             out_ch,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let unshuffled = pixel_unshuffle(x, 2)?; // [B, in·4, H/2, W/2]
-        let down = self.conv.forward(&unshuffled)?;
-        let shortcut = channel_average(&unshuffled, self.out_ch)?;
+        // main path: stride-2 3×3 conv (in→out) halves H,W.
+        let down = self.conv.forward(x)?;
+        // shortcut: pixel_unshuffle(x) folds the 2×2 spatial into channels (`in·4` at H/2), then
+        // channel-average of contiguous groups reduces to `out_ch` — the diffusers residual.
+        let shortcut = channel_average(&pixel_unshuffle(x, 2)?, self.out_ch)?;
         down + shortcut
     }
 }
@@ -561,12 +566,106 @@ impl DcAeDecoder {
     }
 
     /// Decode a latent `[B, latent_channels, h, w]` (NCHW, diffusers-native; **already un-scaled** by
-    /// the caller) into an image `[B, 3, H=32·h, W=32·w]` (NCHW, f32).
+    /// the caller) into an image `[B, 3, H=32·h, W=32·w]` (NCHW, f32). The plain **single-pass** decode
+    /// (bit-exact: `decode_tail(decode_head(latent))` is the identical op sequence as the fused loop, so
+    /// the sc-11803 diffusers parity gate is unchanged). Small-VRAM callers route through
+    /// [`Self::decode_fit`] (the VRAM-fit gate) or ask for the tiled tail explicitly via
+    /// [`Self::decode_with`].
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
+        self.decode_tail(&self.decode_head(latent)?)
+    }
+
+    /// Decode choosing single-pass vs a tiled tail by a **VRAM-fit gate** (sc-11804). The single-pass
+    /// f32 decode peaks at ~[`PEAK_GIB_1024`] GB at 1024² (measured by `gpu_decode_1024_memory_profile`,
+    /// sc-11777) — fine on the Blackwell target (RTX PRO 6000, 96 GB) but an OOM on smaller CUDA cards.
+    /// The peak is activation-bound and scales with the output pixel count, so this estimates
+    /// `PEAK_GIB_1024 · out_px / 1024²` and, when it exceeds the safe VRAM budget resolved by
+    /// [`candle_gen::vae_tiling::safe_budget_gib`] (`SANA_VAE_BUDGET_GIB` env override → `nvidia-smi`
+    /// total × 0.85 → 16 GiB default — the same convention the video-VAE tilers use), tiles the tail via
+    /// [`Self::decode_with`]. On a card with headroom the estimate is under budget ⇒ full-speed
+    /// single-pass, byte-identical to [`Self::decode`].
+    pub fn decode_fit(&self, latent: &Tensor) -> Result<Tensor> {
+        let (_, _, lh, lw) = latent.dims4()?;
+        let comp = self.cfg.spatial_compression() as usize;
+        let out_px = (lh * comp) as f64 * (lw * comp) as f64;
+        let est_peak_gib = PEAK_GIB_1024 * out_px / (1024.0 * 1024.0);
+        let safe_gib = candle_gen::vae_tiling::safe_budget_gib("SANA_VAE_BUDGET_GIB", 0.85, 16.0);
+        self.decode_with(latent, est_peak_gib > safe_gib)
+    }
+
+    /// Decode with the tail-tiling policy under caller control (sc-11804). `force_tile = false` is
+    /// [`Self::decode`] exactly (single-pass, bit-exact). `force_tile = true` runs the deep
+    /// `EfficientVit` **head** whole — so the global ReLU-linear attention still sees the full spatial
+    /// field (the source of a naive-tiling seam) — and tiles only the shallow, attention-free
+    /// upsampling **tail** ([`ResBlock`]s + `norm_out` + `conv_out`, purely conv/upsample-local) with a
+    /// trapezoidal seam blend. The tail carries the f32 activation peak (its convs run at the full
+    /// output resolution), so tiling it is what caps the OOM; it is a pure *speed* trade with **no
+    /// quality cost** (the [`Self::tile_blend_tail`] masks are a partition of unity over the overlap).
+    /// If the config has no attention-free shallow tail (`num_tail_stages == 0`) this is always the
+    /// single-pass decode.
+    pub fn decode_with(&self, latent: &Tensor, force_tile: bool) -> Result<Tensor> {
+        let head = self.decode_head(latent)?;
+        if force_tile && self.num_tail_stages() > 0 {
+            self.tile_blend_tail(&head, &TilingConfig::spatial_only(512, 128))
+        } else {
+            self.decode_tail(&head)
+        }
+    }
+
+    /// Number of shallow (high-res) decoder stages that are attention-free [`BlockType::Res`] stages —
+    /// the tileable **tail**. The stored stage order is shallow→deep, and the SANA-1.0 autoencoder is
+    /// `[R,R,R,E,E,E]`, so this counts the leading `Res` run (3): the deep `EfficientVit` stages (global
+    /// linear attention, run at ≤128²) are the **head**, always decoded whole. Robust to any
+    /// shallow-`Res` / deep-`EfficientVit` split (the DC-AE family invariant).
+    fn num_tail_stages(&self) -> usize {
+        self.cfg
+            .block_types
+            .iter()
+            .take_while(|&&t| t == BlockType::Res)
+            .count()
+    }
+
+    /// The spatial upsample factor of the tail (`2^{number of tail stages that upsample}`): each tail
+    /// stage that is not the deepest carries a ×2 [`UpBlock`], so for the `[R,R,R,…]` tail every tail
+    /// stage upsamples ⇒ ×8. This is the tail's latent→pixel scale for the tile plan.
+    fn tail_scale(&self) -> usize {
+        let tail = self.num_tail_stages();
+        let ups = self.stages[..tail]
+            .iter()
+            .filter(|s| s.upsample.is_some())
+            .count();
+        1usize << ups
+    }
+
+    /// The **head**: `conv_in` + the deepest-stage channel shortcut, then the deep `EfficientVit` stages
+    /// (linear attention) down to — but not including — the shallow `Res` tail. Runs at ≤128² so the
+    /// whole spatial field is present for every attention block. Output is the tail's input feature map
+    /// `[B, block_out_channels[num_tail_stages], h, w]`.
+    fn decode_head(&self, latent: &Tensor) -> Result<Tensor> {
         let latent = latent.to_dtype(DType::F32)?;
         let shortcut = repeat_interleave_channel(&latent, self.in_shortcut_repeats)?;
         let mut h = (self.conv_in.forward(&latent)? + shortcut)?;
-        for stage in self.stages.iter().rev() {
+        let tail = self.num_tail_stages();
+        // deep→shallow, stopping before the shallow attention-free tail (stages `..tail`).
+        for stage in self.stages[tail..].iter().rev() {
+            if let Some(up) = &stage.upsample {
+                h = up.forward(&h)?;
+            }
+            for block in &stage.blocks {
+                h = block.forward(&h)?;
+            }
+        }
+        Ok(h)
+    }
+
+    /// The **tail**: the shallow `Res` stages (each a ×2 upsample + [`ResBlock`]s) then `norm_out → ReLU
+    /// → conv_out`. Purely spatially-local (convs + nearest upsample + per-pixel channel norm, no
+    /// attention), so it tiles cleanly with an overlap. Input the head feature map `[B, C, h, w]`;
+    /// output `[B, 3, tail_scale·h, tail_scale·w]`.
+    fn decode_tail(&self, head: &Tensor) -> Result<Tensor> {
+        let mut h = head.clone();
+        let tail = self.num_tail_stages();
+        for stage in self.stages[..tail].iter().rev() {
             if let Some(up) = &stage.upsample {
                 h = up.forward(&h)?;
             }
@@ -579,20 +678,102 @@ impl DcAeDecoder {
         self.conv_out.forward(&h)
     }
 
+    /// Tiled [`Self::decode_tail`] with trapezoidal seam blending (sc-11804) — the shared image-VAE
+    /// tiling policy ([`candle_gen::gen_core::tiling`] + the Qwen tail blender), specialized to the DC-AE
+    /// tail. Splits the head feature map `[B, C, h, w]` into overlapping tiles (`cfg` in **output** px),
+    /// decodes each tail tile, and accumulates `Σ(maskᵢ·decodeᵢ) / Σ maskᵢ`. Because the tail is
+    /// attention-free and the per-axis trapezoidal masks are a partition of unity over the overlap, the
+    /// blend is **seam-free** vs the whole-head [`Self::decode_tail`] — an *approximation*, not bit-exact
+    /// (each tile's padded convs get their own zero-pad boundary, so the residual is a few sub-pixel seam
+    /// values the ramp smooths; ~63 dB PSNR at the tiny-config CPU seam test, well past the "no
+    /// measurable seam" bar). When `cfg` does not fire for these dims the whole head is decoded in one
+    /// pass.
+    fn tile_blend_tail(&self, head: &Tensor, cfg: &TilingConfig) -> Result<Tensor> {
+        let device = head.device();
+        let (_b, _c, h, w) = head.dims4()?;
+        let vae = VaeTiling {
+            spatial_scale: self.tail_scale() as i32,
+            temporal_scale: 1,
+            causal_temporal: false,
+        };
+        if !cfg.needs_tiling(vae, 1, h as i32, w as i32) {
+            return self.decode_tail(head);
+        }
+        let plan = cfg.plan(vae, 1, h as i32, w as i32);
+        let (out_h, out_w) = (plan.out_h as usize, plan.out_w as usize);
+
+        let mut output: Option<Tensor> = None; // [B, 3, out_h, out_w] f32
+        let mut weights: Option<Tensor> = None; // [1, 1, out_h, out_w] f32
+        for hh in &plan.h {
+            for ww in &plan.w {
+                let tile = head
+                    .narrow(2, hh.start as usize, (hh.end - hh.start) as usize)?
+                    .narrow(3, ww.start as usize, (ww.end - ww.start) as usize)?;
+                let dec = self.decode_tail(&tile)?;
+
+                // Clip the decoded tile + masks to the planned output span (the exact ×`tail_scale`
+                // makes this a no-op, but it guards a decoder returning a pixel over/under).
+                let (_, _, dh, dw) = dec.dims4()?;
+                let ah = dh.min((hh.out_stop - hh.out_start) as usize);
+                let aw = dw.min((ww.out_stop - ww.out_start) as usize);
+                let dec = dec.narrow(2, 0, ah)?.narrow(3, 0, aw)?;
+
+                let hm = Tensor::from_slice(&hh.mask[..ah], (1, 1, ah, 1), device)?;
+                let wm = Tensor::from_slice(&ww.mask[..aw], (1, 1, 1, aw), device)?;
+                let blend = hm.broadcast_mul(&wm)?; // [1, 1, ah, aw]
+                let weighted = dec.broadcast_mul(&blend)?; // [B, 3, ah, aw]
+
+                let (pad_top, pad_bottom) =
+                    (hh.out_start as usize, out_h - (hh.out_start as usize + ah));
+                let (pad_left, pad_right) =
+                    (ww.out_start as usize, out_w - (ww.out_start as usize + aw));
+                let pad = |x: &Tensor| -> Result<Tensor> {
+                    x.pad_with_zeros(2, pad_top, pad_bottom)?
+                        .pad_with_zeros(3, pad_left, pad_right)
+                };
+                let weighted_full = pad(&weighted)?;
+                let blend_full = pad(&blend)?;
+
+                output = Some(match output {
+                    None => weighted_full,
+                    Some(acc) => (acc + weighted_full)?,
+                });
+                weights = Some(match weights {
+                    None => blend_full,
+                    Some(acc) => (acc + blend_full)?,
+                });
+            }
+        }
+        let output =
+            output.ok_or_else(|| Error::Msg("dc-ae tail tiling produced no tiles".into()))?;
+        let weights =
+            weights.ok_or_else(|| Error::Msg("dc-ae tail tiling produced no tiles".into()))?;
+        // Floor the divisor to avoid a divide-by-zero at any coverage gap (the plan guarantees > 0),
+        // broadcasting the [1,1,H,W] weight over the channel axis.
+        output.broadcast_div(&weights.clamp(1e-8f32, f32::MAX)?)
+    }
+
     pub fn config(&self) -> &DcAeConfig {
         &self.cfg
     }
 }
 
+/// The f32 activation peak of a single-pass 1024² DC-AE decode, measured by
+/// `gpu_decode_1024_memory_profile` (sc-11777): ~17.7 GB. Activation-bound, so it scales with the
+/// output pixel count — the [`DcAeDecoder::decode_fit`] gate estimates `PEAK_GIB_1024 · out_px / 1024²`.
+const PEAK_GIB_1024: f64 = 17.7;
+
 // ---------------------------------------------------------------------------------------------------
-// Encoder (round-trip only — the spike's secondary check)
+// Encoder
 // ---------------------------------------------------------------------------------------------------
 
-/// A compact **encoder** — the structural mirror of [`DcAeDecoder`] built from the same primitives
-/// (`ResBlock` / `EfficientVitBlock` / `DownBlock` ConvPixelUnshuffle). It exists only "as far as the
-/// spike needs" for a round-trip reconstruction check; the decoder is the parity deliverable. Reads
-/// `encoder.*` keys so the diffusers checkpoint layout would load, but the spike only smoke-tests its
-/// composition (shape/finite), since there is no encoder in the mlx reference to parity against.
+/// The DC-AE **encoder** — the structural counterpart of [`DcAeDecoder`] built from the same
+/// primitives (`ResBlock` / `EfficientVitBlock` / stride-2 [`DownBlock`]), reading `encoder.*` keys.
+/// The encoder is NOT symmetric with the decoder: it carries fewer blocks in the shallow stages
+/// (`encoder_layers_per_block` `[2,2,2,3,3,3]` vs the decoder's `[3,3,3,3,3,3]`) and downsamples with a
+/// stride-2 conv (`downsample_block_type = Conv`). The mlx-gen reference (sc-8486) ported only the
+/// decoder, so this was originally a shape-only smoke; sc-11803 sources a real diffusers encoder golden
+/// and holds it to numeric parity (`tests/encode_parity.rs`).
 pub struct DcAeEncoder {
     conv_in: Conv2d,
     stages: Vec<Stage>, // shallow(0)→deep(n-1); encode iterates shallow→deep
@@ -607,8 +788,9 @@ impl DcAeEncoder {
         let mut stages = Vec::with_capacity(n);
         for i in 0..n {
             let ch = cfg.block_out_channels[i] as usize;
+            let layers = cfg.encoder_layers_per_block[i];
             let mut blocks = Vec::new();
-            for j in 0..cfg.layers_per_block[i] {
+            for j in 0..layers {
                 let prefix = format!("encoder.down_blocks.{i}.{j}");
                 blocks.push(Block::load(w, &prefix, cfg, cfg.block_types[i], ch)?);
             }
@@ -616,7 +798,7 @@ impl DcAeEncoder {
             let downsample = if i + 1 < n {
                 Some(DownBlock::load(
                     w,
-                    &format!("encoder.down_blocks.{i}.{}", cfg.layers_per_block[i]),
+                    &format!("encoder.down_blocks.{i}.{layers}"),
                     cfg.block_out_channels[i + 1] as usize,
                 )?)
             } else {
@@ -916,6 +1098,191 @@ mod tests {
         );
     }
 
+    /// PSNR (dB) of `b` against reference `a`, peak = `a`'s dynamic range. The codebase's seam metric:
+    /// PiD's tiled-vs-whole A/B (sc-10087) called ≥~34.75 dB "no measurable seam". `INFINITY` when equal.
+    fn psnr_db(a: &Tensor, b: &Tensor) -> f64 {
+        let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let (lo, hi) = av
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+        let peak = (hi - lo).max(1e-6) as f64;
+        let mse: f64 = av
+            .iter()
+            .zip(&bv)
+            .map(|(x, y)| ((x - y) as f64).powi(2))
+            .sum::<f64>()
+            / av.len().max(1) as f64;
+        if mse <= 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (peak * peak / mse).log10()
+    }
+
+    #[test]
+    fn tail_split_matches_config() {
+        // The head/tail split must land exactly on the shallow-Res / deep-EfficientViT boundary of the
+        // real autoencoder (`[R,R,R,E,E,E]`): 3 tileable Res tail stages, each a ×2 upsample ⇒ ×8 tail.
+        let dev = Device::Cpu;
+        let cfg = DcAeConfig::sana_f32c32();
+        let w = synthetic_weights(&cfg, /*decoder*/ true, /*encoder*/ false, &dev);
+        let dec = DcAeDecoder::from_weights(&w, cfg).unwrap();
+        assert_eq!(
+            dec.num_tail_stages(),
+            3,
+            "3 leading Res stages are the tail"
+        );
+        assert_eq!(dec.tail_scale(), 8, "tail upsamples ×2 per stage ⇒ ×8");
+    }
+
+    #[test]
+    fn tiled_tail_matches_single_pass_cpu() {
+        // The sc-11804 seam gate on CPU: the tiled tail must reproduce the single-pass tail **seam-free**.
+        // Decode a latent through the shared (whole) head, then compare the whole-tail decode against the
+        // overlapping-tile trapezoidal blend. The blend is an *approximation* (the padded convs give each
+        // tile its own zero-pad boundary, so it is NOT bit-exact vs the monolith — the residual is a
+        // handful of sub-pixel seam values that the trapezoidal partition-of-unity smooths), so the metric
+        // is PSNR, not max|Δ| — the same bar PiD's tiled-vs-whole A/B used (sc-10087, ≥~34.75 dB = "no
+        // measurable seam"). Here the production 4:1 tile:overlap ratio clears it by ~30 dB.
+        let dev = Device::Cpu;
+        let cfg = DcAeConfig::tiny_test();
+        let w = synthetic_weights(&cfg, true, false, &dev);
+        let dec = DcAeDecoder::from_weights(&w, cfg.clone()).unwrap();
+        assert_eq!(dec.num_tail_stages(), 3);
+        assert_eq!(dec.tail_scale(), 8);
+
+        let latent = det(&[1, cfg.latent_channels as usize, 48, 48], 77, &dev);
+        let head = dec.decode_head(&latent).unwrap();
+        let (hh, hw) = (head.dim(2).unwrap() as i32, head.dim(3).unwrap() as i32);
+
+        // A tile config that actually splits at this CPU resolution (384² output): 256-out-px tiles,
+        // 64-out-px overlap — the production 4:1 tile:overlap ratio (`spatial_only(512, 128)`), scaled to
+        // fire on a small head. Assert it splits, else the test would prove nothing.
+        let tile_cfg = TilingConfig::spatial_only(256, 64);
+        let vae = VaeTiling {
+            spatial_scale: dec.tail_scale() as i32,
+            temporal_scale: 1,
+            causal_temporal: false,
+        };
+        assert!(
+            tile_cfg.plan(vae, 1, hh, hw).h.len() > 1,
+            "tile plan must split (≥2 tiles/axis) for a real seam test"
+        );
+
+        let whole = dec.decode_tail(&head).unwrap();
+        let tiled = dec.tile_blend_tail(&head, &tile_cfg).unwrap();
+        assert_eq!(whole.dims(), tiled.dims());
+        let psnr = psnr_db(&whole, &tiled);
+        assert!(
+            psnr >= 40.0,
+            "tiled tail must be seam-free vs single-pass; PSNR={psnr:.2} dB (< 40)"
+        );
+    }
+
+    #[test]
+    fn decode_fit_gate_selects_by_budget() {
+        // The VRAM-fit gate wires through: with a tiny `SANA_VAE_BUDGET_GIB` the estimated peak exceeds
+        // budget ⇒ the tiled tail runs, and it must still equal the single-pass `decode` (seam-free). A
+        // huge budget takes the single-pass branch (byte-identical). One test owns the env var so the
+        // set/remove can't race another reader.
+        let dev = Device::Cpu;
+        let cfg = DcAeConfig::tiny_test();
+        let w = synthetic_weights(&cfg, true, false, &dev);
+        let dec = DcAeDecoder::from_weights(&w, cfg.clone()).unwrap();
+        // 80²-head so the production `spatial_only(512, 128)` gate (s_tile = 64 head-px) genuinely
+        // splits when the budget forces tiling — a smaller head would fall through to a single pass.
+        let latent = det(&[1, cfg.latent_channels as usize, 80, 80], 51, &dev);
+        let vae = VaeTiling {
+            spatial_scale: dec.tail_scale() as i32,
+            temporal_scale: 1,
+            causal_temporal: false,
+        };
+        assert!(
+            TilingConfig::spatial_only(512, 128).needs_tiling(vae, 1, 80, 80),
+            "the production gate must tile an 80²-head so the tiled branch is exercised"
+        );
+        let single = dec.decode(&latent).unwrap();
+
+        std::env::set_var("SANA_VAE_BUDGET_GIB", "0.0001"); // force the tiled branch
+        let tiled = dec.decode_fit(&latent).unwrap();
+        std::env::set_var("SANA_VAE_BUDGET_GIB", "100000"); // force single-pass
+        let fit_whole = dec.decode_fit(&latent).unwrap();
+        std::env::remove_var("SANA_VAE_BUDGET_GIB");
+
+        assert_eq!(single.dims(), tiled.dims());
+        // Tiny budget ⇒ the tiled tail ran and must be seam-free vs single-pass (PSNR bar, per PiD).
+        let psnr = psnr_db(&single, &tiled);
+        assert!(
+            psnr >= 40.0,
+            "tiled-gate decode must be seam-free vs single-pass; PSNR={psnr:.2} dB"
+        );
+        // Huge budget ⇒ the single-pass branch, byte-identical to `decode`.
+        let dmax = (&single - &fit_whole)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            dmax < 1e-6,
+            "huge-budget fit must be the single-pass decode; max|Δ|={dmax}"
+        );
+    }
+
+    /// The **GPU 1024² tiled-vs-single-pass seam gate** (sc-11804): builds the full `sana_f32c32`
+    /// decoder (synthetic weights) on CUDA sm_120, decodes a `[1,32,32,32]` latent to `[1,3,1024,1024]`
+    /// both single-pass and with the forced tiled tail, asserts the two match (seam-free), and prints
+    /// both device-VRAM peaks so the run records the tiling saving. cuda-gated; needs `--release`.
+    ///
+    /// Run:
+    ///   cargo test -p candle-gen-sana --lib --features cuda --release -- --ignored --nocapture \
+    ///       gpu_decode_1024_tiled_matches_single_pass
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU 1024² tiled-vs-single-pass seam gate — run on CUDA sm_120 with --release"]
+    fn gpu_decode_1024_tiled_matches_single_pass() {
+        use candle_gen::testkit::VramProbe;
+        let dev = Device::new_cuda(0).expect("cuda device");
+        let cfg = DcAeConfig::sana_f32c32();
+        let w = synthetic_weights(&cfg, /*decoder*/ true, /*encoder*/ false, &dev);
+        let dec = DcAeDecoder::from_weights(&w, cfg.clone()).unwrap();
+        let latent = det(&[1, cfg.latent_channels as usize, 32, 32], 1234, &dev);
+
+        let mut probe = VramProbe::start(0);
+        let ph_single = probe.phase();
+        let single = dec.decode(&latent).unwrap();
+        let _ = single.sum_all().unwrap().to_scalar::<f32>().unwrap(); // force eval before sampling
+        probe.end_gen(ph_single);
+        let single_peak = probe.report().peak_gb;
+
+        let mut probe2 = VramProbe::start(0);
+        let ph_tiled = probe2.phase();
+        let tiled = dec.decode_with(&latent, /*force_tile*/ true).unwrap();
+        let _ = tiled.sum_all().unwrap().to_scalar::<f32>().unwrap();
+        probe2.end_gen(ph_tiled);
+        let tiled_peak = probe2.report().peak_gb;
+
+        assert_eq!(single.dims(), &[1, 3, 1024, 1024]);
+        assert_eq!(tiled.dims(), &[1, 3, 1024, 1024]);
+        // Seam-free by the codebase's PSNR bar (PiD sc-10087 called ≥~34.75 dB "no measurable seam");
+        // the trapezoidal blend is an approximation, not bit-exact vs the monolith (padded-conv tile
+        // boundaries), so PSNR — not max|Δ| — is the metric.
+        let psnr = psnr_db(&single, &tiled);
+        println!(
+            "DC-AE 1024² tiled-vs-single-pass: PSNR={psnr:.2} dB  single-pass peak={single_peak:.2} GB  tiled peak={tiled_peak:.2} GB"
+        );
+        assert!(
+            psnr >= 30.0,
+            "1024² tiled decode must be seam-free vs single-pass; PSNR={psnr:.2} dB (< 30)"
+        );
+        assert!(
+            tiled_peak < single_peak,
+            "the tiled tail must lower the decode VRAM peak ({tiled_peak:.2} vs {single_peak:.2} GB)"
+        );
+    }
+
     // -- synthetic weight-map builders (deterministic; cover every key `from_weights` requires) -----
 
     struct Emit<'a> {
@@ -1046,7 +1413,8 @@ mod tests {
             );
             for i in 0..n {
                 let ch = cfg.block_out_channels[i] as usize;
-                for j in 0..cfg.layers_per_block[i] {
+                let layers = cfg.encoder_layers_per_block[i];
+                for j in 0..layers {
                     e.block(
                         cfg,
                         &format!("encoder.down_blocks.{i}.{j}"),
@@ -1056,11 +1424,12 @@ mod tests {
                 }
                 if i + 1 < n {
                     let out_ch = cfg.block_out_channels[i + 1] as usize;
-                    // DownBlock conv consumes the space→channel unshuffled ch·4 map → out_ch.
+                    // DownBlock is a stride-2 3×3 conv on the raw `ch` map → `out_ch` (diffusers
+                    // `downsample_block_type = Conv`); the on-disk weight is `[out_ch, ch, 3, 3]`.
                     e.conv(
-                        &format!("encoder.down_blocks.{i}.{}.conv", cfg.layers_per_block[i]),
+                        &format!("encoder.down_blocks.{i}.{layers}.conv"),
                         out_ch,
-                        ch * 4,
+                        ch,
                         3,
                         true,
                     );

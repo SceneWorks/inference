@@ -472,7 +472,21 @@ pub(crate) fn validate_request(
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
-mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
+mlx_gen::register_generators! {
+    pub(crate) const REGISTRATION = descriptor => load;
+    footprint = component_footprint
+}
 
 #[cfg(test)]
 mod tests {

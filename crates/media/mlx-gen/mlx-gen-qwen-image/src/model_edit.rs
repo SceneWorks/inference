@@ -535,7 +535,8 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
 // Generator` above stays hand-written because `validate` adds a reference-image check beyond the
 // shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
+    pub(crate) const REGISTRATION = descriptor => load;
+    footprint = crate::model::component_footprint
 }
 
 #[cfg(test)]
