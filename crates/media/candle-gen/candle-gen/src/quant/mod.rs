@@ -62,6 +62,13 @@ pub mod cublaslt;
 #[cfg(feature = "cuda")]
 pub mod eight_bit_linear;
 
+// The NVFP4 FP4 linear layer (sc-11041, epic 11037): `Nvfp4Linear` serves a packed [`nvfp4::Nvfp4Tensor`]
+// weight, forwarding through the sc-11039 cuBLASLt `matmul_nvfp4_staged` (W4A4) on Blackwell sm_120, with
+// a transparent dequant→bf16 fallback (W4A16 outlier override / <sm_120 / CPU / non-cuda). Unlike
+// `eight_bit_linear`, this module compiles WITHOUT the `cuda` feature (the fallback is pure candle ops);
+// the FP4 compute leg is cfg-gated internally.
+pub mod nvfp4_linear;
+
 pub use adapt::{AdaptLinear, LokrFactors};
 pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
 pub use nvfp4::{
@@ -83,6 +90,8 @@ pub use cublaslt::{
 };
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
+
+pub use nvfp4_linear::{ActPrecision, Nvfp4Linear, Nvfp4Regime, NVFP4_M_ALIGN};
 
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
@@ -141,6 +150,34 @@ impl PackedConfig {
             .unwrap_or(MLX_GROUP_SIZE as i32);
         Some(Self { bits, group_size })
     }
+
+    /// True when a component's `quantization` block declares the **NVFP4 FP4** format
+    /// (`quantization.format == "nvfp4"`, case-insensitive) — the tier is served by [`Nvfp4Linear`]
+    /// (the FP4 tensor-core path on sm_120) rather than the MLX affine repack path. NVFP4 tiers are
+    /// produced by the offline packer (sc-11040); the on-disk classifier that *writes* this marker
+    /// lives in the SceneWorks worker (sc-11042/sc-11043, the two-repo split), so this is the
+    /// inference-side detect half — a config carrying `format: "nvfp4"` routes here.
+    pub fn is_nvfp4(cfg: &serde_json::Value) -> bool {
+        cfg.get("quantization")
+            .and_then(|q| q.get("format"))
+            .and_then(|f| f.as_str())
+            .map(|s| s.eq_ignore_ascii_case("nvfp4"))
+            .unwrap_or(false)
+    }
+
+    /// The [`MatmulStrategy`] a component's `config.json` selects — the routing/selection seam
+    /// (sc-11041): [`MatmulStrategy::Nvfp4`] for an NVFP4-format packed tier (→ [`Nvfp4Linear`]),
+    /// [`MatmulStrategy::DequantDense`] for any *other* packed tier (the MLX affine `.scales` tiers →
+    /// [`QLinear`]'s sc-7702-safe path), and `None` for a dense component (no `quantization` block).
+    /// `is_nvfp4` is checked first so an NVFP4 tier that *also* carries `bits`/`group_size` still
+    /// routes to the FP4 path.
+    pub fn detect_strategy(cfg: &serde_json::Value) -> Option<MatmulStrategy> {
+        if Self::is_nvfp4(cfg) {
+            Some(MatmulStrategy::Nvfp4)
+        } else {
+            Self::from_config(cfg).map(|_| MatmulStrategy::DequantDense)
+        }
+    }
 }
 
 /// How a [`QLinear::Quantized`] arm computes its matmul — the **load-bearing** knob unified out of the
@@ -165,6 +202,15 @@ pub enum MatmulStrategy {
     DequantDense,
     /// candle's int8 `QMatMul::forward` fast path (activation-quant; unsafe under outliers).
     Int8Fast,
+    /// Route to the **NVFP4 FP4 tensor-core** GEMM ([`Nvfp4Linear`], sc-11041, epic 11037) — a packed
+    /// [`nvfp4::Nvfp4Tensor`] weight served on consumer Blackwell `sm_120` via the sc-11039 cuBLASLt
+    /// `matmul_nvfp4_staged`. **W4A4** (both operands FP4) lights up the FP4 cores (~2×, the SC#1 win);
+    /// the outlier layer class and any `<sm_120` / CPU / non-cuda device fall back to a dequant→bf16
+    /// dense matmul (no FP4 compute — a storage-parity tier). Unlike the other two arms this is **not**
+    /// a [`QuantWeight`]/GGUF `QTensor` variant: NVFP4 has its own container + linear and is produced by
+    /// the offline packer (sc-11040), never the in-place GGUF fold (`QLinear::fold` rejects it). The
+    /// detect/select seam that reaches it is [`PackedConfig::detect_strategy`].
+    Nvfp4,
 }
 
 /// A dense `[out, in]` projection stored in one of two equivalent layouts — the second **load-bearing**
@@ -593,6 +639,13 @@ impl QLinear {
         let weight = match strategy {
             MatmulStrategy::DequantDense => QuantWeight::Dequant(std::sync::Arc::new(qtensor)),
             MatmulStrategy::Int8Fast => QuantWeight::Matmul(QMatMul::from_qtensor(qtensor)?),
+            // NVFP4 is not a GGUF `QTensor` fold target — its weight comes from the offline packer
+            // ([`nvfp4::Nvfp4Tensor`]) and is served by [`Nvfp4Linear`], not [`QLinear`]. No caller
+            // passes this to `fold`; reject loudly rather than silently mis-quantize to `Q4_0`/`Q8_0`.
+            MatmulStrategy::Nvfp4 => candle_core::bail!(
+                "MatmulStrategy::Nvfp4 is not produced by the in-place GGUF fold; build an \
+                 Nvfp4Linear from a packed Nvfp4Tensor (Nvfp4Linear::from_packed / from_dense, sc-11041)"
+            ),
         };
         // The bias follows the weight's device and is promoted to f32 for the post-matmul add.
         let bias = match bias {
@@ -1206,6 +1259,62 @@ mod tests {
         assert_eq!(
             PackedConfig::from_config(&serde_json::json!({ "quantization": { "group_size": 64 } })),
             None
+        );
+    }
+
+    /// NVFP4 detect/select seam (sc-11041): a `quantization.format == "nvfp4"` config routes to
+    /// [`MatmulStrategy::Nvfp4`]; any other packed tier to `DequantDense`; a dense component to `None`.
+    #[test]
+    fn detect_strategy_routes_nvfp4_vs_affine_vs_dense() {
+        let nvfp4 =
+            serde_json::json!({ "quantization": { "bits": 4, "format": "nvfp4" } });
+        assert!(PackedConfig::is_nvfp4(&nvfp4));
+        assert_eq!(
+            PackedConfig::detect_strategy(&nvfp4),
+            Some(MatmulStrategy::Nvfp4),
+            "an nvfp4-format packed tier must route to the FP4 strategy"
+        );
+        // Case-insensitive marker.
+        assert!(PackedConfig::is_nvfp4(
+            &serde_json::json!({ "quantization": { "format": "NVFP4" } })
+        ));
+
+        // A plain MLX affine packed tier (bits/group_size, no format) → dequant-dense QLinear path.
+        let affine = serde_json::json!({ "quantization": { "bits": 4, "group_size": 64 } });
+        assert!(!PackedConfig::is_nvfp4(&affine));
+        assert_eq!(
+            PackedConfig::detect_strategy(&affine),
+            Some(MatmulStrategy::DequantDense)
+        );
+
+        // A dense component (no quantization block) selects no strategy.
+        let dense = serde_json::json!({ "hidden_size": 2048 });
+        assert_eq!(PackedConfig::detect_strategy(&dense), None);
+    }
+
+    /// The in-place GGUF fold refuses [`MatmulStrategy::Nvfp4`] — NVFP4 weights come from the offline
+    /// packer, not a `Q4_0`/`Q8_0` fold (sc-11041). A dense fold call that somehow selected it errors
+    /// rather than silently mis-quantizing.
+    #[test]
+    fn fold_rejects_nvfp4_strategy() {
+        let dev = Device::Cpu;
+        let w = Tensor::randn(0f32, 1f32, (64, 32), &dev).unwrap();
+        let mut lin = QLinear::Dense(DenseLinear::Linear(Linear::new(w, None)));
+        let err = lin
+            .fold(
+                Quant::Q4,
+                None,
+                MatmulStrategy::Nvfp4,
+                QuantForward {
+                    flatten_leading: false,
+                    cast_back: true,
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("Nvfp4"),
+            "fold must reject MatmulStrategy::Nvfp4 with a clear message, got: {err}"
         );
     }
 
