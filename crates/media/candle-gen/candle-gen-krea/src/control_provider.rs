@@ -35,6 +35,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::config::Krea2Config;
 use crate::control::{forward_with_control, ControlBranch, DEFAULT_RESIDUAL_CLAMP};
 use crate::loader::Weights;
+use crate::pipeline::maybe_apply_style_gain;
 use crate::pipeline::to_image;
 use crate::pipeline::MAX_TEXT_TOKENS;
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
@@ -86,7 +87,7 @@ pub struct Krea2ControlPaths {
 }
 
 /// One Krea 2 strict-pose control request. Krea 2 Turbo is CFG-free (no guidance / negative pass) —
-/// the only conditioning knob beyond the prompt is `control_scale`.
+/// the conditioning knobs beyond the prompt are `control_scale` and the optional `text_style_gain`.
 #[derive(Clone)]
 pub struct Krea2ControlRequest {
     pub prompt: String,
@@ -96,6 +97,10 @@ pub struct Krea2ControlRequest {
     /// How strongly the control branch locks the base (S0 usable ~0.5–0.85). `0.0` ⇒ base passthrough
     /// (byte-identical to un-branched generation at the same seed).
     pub control_scale: f32,
+    /// Optional "text style" tap-reweight gain (sc-12009): reweights the 12 stacked Qwen3-VL taps of the
+    /// single CFG-free conditional context before the DiT's TextFusion. `None`/g≈1 is a byte-exact no-op;
+    /// the worker clamps to the GPU-validated `[0.25, 1.75]`. Mirrors the txt2img/img2img knob.
+    pub text_style_gain: Option<f32>,
     pub seed: u64,
     /// Route the final latent→pixel VAE decode through the seam-free **tiled tail** even below the
     /// im2col-overflow threshold (sc-11744). `false` (the default) is the monolithic decode — full speed,
@@ -115,6 +120,7 @@ impl Default for Krea2ControlRequest {
             height: 1024,
             steps: TURBO_STEPS,
             control_scale: DEFAULT_CONTROL_SCALE,
+            text_style_gain: None,
             seed: 0,
             tile_vae_decode: false,
             cancel: CancelFlag::default(),
@@ -229,10 +235,14 @@ impl Krea2Control {
         }
         validate_request(req)?;
 
-        // Prompt embeds + control latent are seed-independent: encode once.
-        let context = self
-            .te
-            .forward(&self.tokenizer.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+        // Prompt embeds + control latent are seed-independent: encode once. The optional "text style"
+        // tap-reweight gain (sc-12009) reweights the taps of this single CFG-free context; `None`/g≈1
+        // is a no-op, so a plain control render is byte-identical.
+        let context = maybe_apply_style_gain(
+            self.te
+                .forward(&self.tokenizer.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?,
+            req.text_style_gain,
+        )?;
         let ctrl_nchw = control_image_to_nchw(control_image, req.width, req.height, &self.device)?;
         let ctrl_latent = self.vae_encoder.encode(&ctrl_nchw)?;
         let scale = req.control_scale as f64;

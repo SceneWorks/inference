@@ -138,6 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         height: a.size,
         steps: a.steps,
         control_scale: a.scale,
+        text_style_gain: None,
         seed: a.seed,
         tile_vae_decode,
         cancel: CancelFlag::new(),

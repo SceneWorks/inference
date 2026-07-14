@@ -295,12 +295,13 @@ fn tap_gain_weights(gain: f32, n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Apply the request's optional [`GenerationRequest::text_style_gain`] to a freshly-encoded positive
-/// context (sc-11878). `None` — or a gain within 1e-4 of 1.0 — returns the context untouched (the
-/// no-op fast path), so plain requests pay nothing. Krea-only: this seam is reached only from the
-/// candle-gen-krea render paths.
-fn maybe_apply_style_gain(context: Tensor, req: &GenerationRequest) -> Result<Tensor> {
-    match req.text_style_gain {
+/// Apply the optional "text style" tap-reweight `gain` to a freshly-encoded positive context
+/// (sc-11878; extended to control/edit in sc-12009). `None` — or a gain within 1e-4 of 1.0 — returns
+/// the context untouched (the no-op fast path), so plain requests pay nothing. Takes the raw
+/// `Option<f32>` (not a `GenerationRequest`) so the bespoke pose-control request can share it. Krea-
+/// only: reached only from the candle-gen-krea render paths.
+pub(crate) fn maybe_apply_style_gain(context: Tensor, gain: Option<f32>) -> Result<Tensor> {
+    match gain {
         Some(g) if (g - 1.0).abs() > 1e-4 => {
             let n = context.dim(2)?;
             apply_tap_weights(&context, &tap_gain_weights(g, n))
@@ -316,7 +317,7 @@ fn encode_prompt_context(comps: &Components, req: &GenerationRequest) -> Result<
     let context = comps
         .te
         .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
-    maybe_apply_style_gain(context, req)
+    maybe_apply_style_gain(context, req.text_style_gain)
 }
 
 /// The seed-loop + schedule + decode tail shared by [`render`] and the [`render_tap_reweight`] spike:
@@ -734,8 +735,14 @@ pub fn render_edit(
     let grounding = encode_vision(&edit.vision, references, device)?;
 
     // Positive (+ optional unconditional) image-grounded conditioning: the instruction is tokenized with
-    // the vision blocks, and the tower's merged embeds + deepstack features are spliced in.
-    let context = grounding.condition(&comps.tok, &comps.te, &req.prompt)?;
+    // the vision blocks, and the tower's merged embeds + deepstack features are spliced in. The optional
+    // "text style" tap-reweight gain (sc-12009) applies to the POSITIVE grounded context — it carries the
+    // same 12-tap structure the plain encode does, so `apply_tap_weights` is shape-safe. The negative
+    // (CFG-uncond) grounded context is left untouched so the knob steers only the conditional prediction.
+    let context = maybe_apply_style_gain(
+        grounding.condition(&comps.tok, &comps.te, &req.prompt)?,
+        req.text_style_gain,
+    )?;
     let neg_context = if guidance > 0.0 {
         let negative = req.negative_prompt.as_deref().unwrap_or_default();
         Some(grounding.condition(&comps.tok, &comps.te, negative)?)
@@ -1157,31 +1164,19 @@ mod tests {
         let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
         // None → untouched.
-        let none = GenerationRequest {
-            text_style_gain: None,
-            ..Default::default()
-        };
         assert_eq!(
-            flat(&maybe_apply_style_gain(ctx.clone(), &none).unwrap()),
+            flat(&maybe_apply_style_gain(ctx.clone(), None).unwrap()),
             flat(&ctx)
         );
 
         // g ≈ 1 → untouched (no-op fast path).
-        let unit = GenerationRequest {
-            text_style_gain: Some(1.00005),
-            ..Default::default()
-        };
         assert_eq!(
-            flat(&maybe_apply_style_gain(ctx.clone(), &unit).unwrap()),
+            flat(&maybe_apply_style_gain(ctx.clone(), Some(1.00005)).unwrap()),
             flat(&ctx)
         );
 
         // g = 1.5 → equals the explicit ramp apply.
-        let g = GenerationRequest {
-            text_style_gain: Some(1.5),
-            ..Default::default()
-        };
-        let got = maybe_apply_style_gain(ctx.clone(), &g).unwrap();
+        let got = maybe_apply_style_gain(ctx.clone(), Some(1.5)).unwrap();
         let want = apply_tap_weights(&ctx, &tap_gain_weights(1.5, 12)).unwrap();
         assert_eq!(flat(&got), flat(&want));
     }
