@@ -947,6 +947,20 @@ mod cuda_impl {
     }
 
     impl DevNvfp4 {
+        /// Total **resident device** bytes of this staged NVFP4 operand — the E2M1 nibble buffer plus
+        /// the UE4M3 block-scale buffer (the FP32 per-tensor scale is a host scalar). This is the honest
+        /// VRAM footprint of a resident NVFP4 weight, used by the SC#6 packed-forward gate (sc-11041) to
+        /// assert a resident `Nvfp4Linear` weight stays at the ~4.5-eff-bit NVFP4 footprint and never
+        /// expands to bf16. Both buffers are `u8`, so `len()` is the byte count directly.
+        pub fn resident_bytes(&self) -> usize {
+            self.packed.len() + self.scales.len()
+        }
+
+        /// The logical `[rows, cols_padded]` shape of the staged operand (padding included).
+        pub fn shape_padded(&self) -> (usize, usize) {
+            (self.rows, self.cols_padded)
+        }
+
         fn stage(lt: &CublasLt, t: &Nvfp4Tensor) -> Result<Self> {
             // Sanity: the packer's buffers must match its declared shape (guards a malformed handoff).
             let expect_packed = t.rows * (t.cols_padded / 2);
