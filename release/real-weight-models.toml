@@ -49,5 +49,9 @@ expected_files = [
     "tokenizer/spiece.model",
     "text_encoder/model.safetensors.index.json",
     "transformer/config.json",
-    "vae/diffusion_pytorch_model.safetensors",
+    "transformer/diffusion_pytorch_model.safetensors.index.bf16.json",
+    "transformer/diffusion_pytorch_model.bf16-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model.bf16-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model.bf16-00003-of-00003.safetensors",
+    "vae/diffusion_pytorch_model.bf16.safetensors",
 ]
