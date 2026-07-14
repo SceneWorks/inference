@@ -838,7 +838,7 @@ mod cuda_impl {
             // On an sm_120 device the heuristic returns the FP4 tensor-core algos (the spike saw 6); an
             // empty result surfaces as a cuBLASLt error (the caller reads that as "cuBLASLt did not
             // deliver an FP4 kernel" → the MMQ fallback would be needed).
-            let cached = self.nvfp4_algos.lock().unwrap().get(&(m, k, n)).copied();
+            let cached = crate::lock_recover(&self.nvfp4_algos).get(&(m, k, n)).copied();
             let algo = match cached {
                 Some(a) => a,
                 None => {
@@ -870,7 +870,7 @@ mod cuda_impl {
                             return Err(cublas_err(e));
                         }
                     };
-                    self.nvfp4_algos.lock().unwrap().insert((m, k, n), algo);
+                    crate::lock_recover(&self.nvfp4_algos).insert((m, k, n), algo);
                     algo
                 }
             };
