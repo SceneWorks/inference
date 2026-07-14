@@ -103,3 +103,10 @@ SceneWorks and ChatWorks consume `runtime-2026.07.2` by immutable tag through th
 named runtime bundle. Whether future inference changes originate here rather than in
 the legacy repositories is the open cutover decision this checkpoint documents but
 does not itself resolve; legacy development is halted until it is made.
+
+## Post-release resolution
+
+The source-of-truth decision is resolved on canonical `main` by
+[`PHASE_5_CONSUMER_CUTOVER.md`](PHASE_5_CONSUMER_CUTOVER.md). This release-tag checkpoint remains a
+historical record of the decision state at tag time; the closeout records the final consumer,
+authority, published-ref, and rollback outcomes without moving this immutable release tag.

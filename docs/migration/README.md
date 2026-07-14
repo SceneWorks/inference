@@ -30,6 +30,7 @@ Legacy activity that landed *after* the `runtime-2026.07.1` cutover is mapped in
 - [`PHASE_4_CHECKPOINT.md`](PHASE_4_CHECKPOINT.md): explicit LLM/media composition and named runtime bundles
 - [`RUNTIME_2026_07_1_CHECKPOINT.md`](RUNTIME_2026_07_1_CHECKPOINT.md): final product-cutoff reconciliation and consumer cutover boundary
 - [`RUNTIME_2026_07_2_CHECKPOINT.md`](RUNTIME_2026_07_2_CHECKPOINT.md): post-cutover reconciliation of legacy epic 10834 (sequential component residency) into the monorepo
+- [`PHASE_5_CONSUMER_CUTOVER.md`](PHASE_5_CONSUMER_CUTOVER.md): canonical release, product cutover, source-of-truth, published-ref, and rollback closeout
 
 The checkpoints record how the migration was executed and validated. The reasons
 for the repository and explicit registry/bundle decisions are recorded separately
