@@ -130,18 +130,29 @@ impl MochiVaeConfig {
         let d = Self::default();
 
         let usize_at = |key: &str, dflt: usize| -> usize {
-            json.get(key).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(dflt)
+            json.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(dflt)
         };
         let usize_vec = |key: &str, dflt: &[usize]| -> Vec<usize> {
             json.get(key)
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64().map(|v| v as usize))
+                        .collect()
+                })
                 .unwrap_or_else(|| dflt.to_vec())
         };
         let f32_vec = |key: &str, dflt: &[f32]| -> Vec<f32> {
             json.get(key)
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_f64().map(|v| v as f32)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_f64().map(|v| v as f32))
+                        .collect()
+                })
                 .unwrap_or_else(|| dflt.to_vec())
         };
 
@@ -196,6 +207,9 @@ mod tests {
         assert_eq!(v.latents_std.len(), v.latent_channels);
         // decoder up-stage count == block_out_channels - 1.
         assert_eq!(v.decoder_block_out_channels.len(), 4);
-        assert_eq!(v.temporal_expansions.len(), v.decoder_block_out_channels.len() - 1);
+        assert_eq!(
+            v.temporal_expansions.len(),
+            v.decoder_block_out_channels.len() - 1
+        );
     }
 }
