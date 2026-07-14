@@ -24,6 +24,7 @@ effect after workspace normalization.
 - [`PHASE_2_CHECKPOINT.md`](PHASE_2_CHECKPOINT.md): ownership layout and unified workspace
 - [`PHASE_3_CHECKPOINT.md`](PHASE_3_CHECKPOINT.md): CI selection and release-train tooling
 - [`PHASE_4_CHECKPOINT.md`](PHASE_4_CHECKPOINT.md): explicit LLM/media composition and named runtime bundles
+- [`RUNTIME_2026_07_1_CHECKPOINT.md`](RUNTIME_2026_07_1_CHECKPOINT.md): final product-cutoff reconciliation and consumer cutover boundary
 
 The checkpoints record how the migration was executed and validated. The reasons
 for the repository and explicit registry/bundle decisions are recorded separately

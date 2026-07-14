@@ -1,14 +1,14 @@
 schema_version = 1
-status = "complete through the observed legacy main heads"
+status = "complete through the SceneWorks product cutoffs"
 reconciled_at = "2026-07-13"
-method = "first-parent semantic replay into normalized paths; explicit-catalog seams adapted in place"
+method = "first-parent semantic replay through the exact product cutoffs into normalized paths; explicit-catalog seams adapted in place"
 
 [observed_heads]
 core_llm = "54cbac806304e823470ce3ded08f78589acdbb62"
 mlx_llm = "af5d0e83f4afb921241b7e965076e22f23c107fb"
 candle_llm = "482ba5e5e99770967dd0c912f7f87b31c6f08576"
-mlx_gen = "b237abdbb4157b588be7e93ebcefb91820acd0a0"
-candle_gen = "f572005c5cf009e6f025568b6acf6b2e075b9940"
+mlx_gen = "c9faefc5d2e0650dd5679745089f2c03be51ba7a"
+candle_gen = "6709463b8b13e076dd6c499575d47188e8546c07"
 
 [[repositories]]
 name = "core-llm"
@@ -31,14 +31,14 @@ drift_commits = 0
 [[repositories]]
 name = "mlx-gen"
 import_baseline = "b568fdbfd7cfe3cc6c93dc836c2bd92b348ab2b7"
-observed_head = "b237abdbb4157b588be7e93ebcefb91820acd0a0"
-drift_commits = 7
+observed_head = "c9faefc5d2e0650dd5679745089f2c03be51ba7a"
+drift_commits = 37
 
 [[repositories]]
 name = "candle-gen"
 import_baseline = "102436012b24072c9cfc58b1b88e1c95655872e5"
-observed_head = "f572005c5cf009e6f025568b6acf6b2e075b9940"
-drift_commits = 29
+observed_head = "6709463b8b13e076dd6c499575d47188e8546c07"
+drift_commits = 44
 
 # Each entry maps one legacy first-parent effect to the canonical inference commit
 # that preserves it. Merge commits are represented by their first-parent effect.
@@ -174,6 +174,131 @@ repository = "candle-gen"
 source = "f572005c5cf009e6f025568b6acf6b2e075b9940"
 destination = "e486d24068cc2a64ca96c432529e594b67d2e7bf"
 kind = "first-parent replay with explicit family/platform catalog integration"
+
+# The following post-cutover product deltas were reconciled as one reviewed
+# aggregate because their legacy repositories had continued to advance in
+# lockstep. The destination preserves every first-parent effect while adapting
+# provider discovery to the canonical explicit-catalog architecture.
+
+[[ports]]
+repository = "mlx-gen"
+source = "aa31ed6af9eb9c31e138b5ea78afc0a95ba7d1cd"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "05e51cbd3d4334db6ae876d206437f76b99de4ef"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "6082e7f2c92053ae4ad7b0354f10b6c0054cc66f"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "db1f025d132829088650d4e841b0d7d5193d15ac"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "0f15caa16e3279a62f657f25c98cdf54a976f97e"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "bf0594b6554da67d7d2bc233530334ca0768c36a"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "d5e4e9ddcc39c6ad71d7bdd876c3ff36e62fcf75"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "b61ec6e9416d8df41a2d14f7f237dc5799bef386"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "e6ad04a30a73da21015337cb00e197a50726a541"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "19a95a2e7d33ed75cfdec90a1228ff1ce49fc30d"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "fdb8182af1ece1f1402096e6beac6ec2c816a079"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "mlx-gen"
+source = "c9faefc5d2e0650dd5679745089f2c03be51ba7a"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "573aa78bbda3e644da7070bb2183e40424dbb2f3"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "64bcff80e11ef3d72ed11e5bcdff6e5f2ba66467"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "a71772f0952f5c25f0a445a97960d9e60d9e95df"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "7a16611a707f940d56fc0ec599a31904f2c369bf"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "48114e2da24116b8c6fbe202df5d1c5635ae3a58"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "d7f5e2c33680bd3e3498591f4c1e5b12608f2c4f"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "5f0a0bc2657f7679bf46ddc225bd9cf656a823d0"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "6709463b8b13e076dd6c499575d47188e8546c07"
+destination = "592f373f2d37278b8799aa7e0482dabb9f5c68c1"
+kind = "aggregate first-parent replay with explicit-catalog adaptation"
 
 [[compatibility_bridges]]
 source = "mlx-gen:95af873670013036f89618957e91907b24936838"
