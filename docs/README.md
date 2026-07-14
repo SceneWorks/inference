@@ -9,6 +9,8 @@ Documentation for the SceneWorks inference workspace.
   consumer *how-to*.
 - **[Model Catalog Reference](reference/model-catalog.md)** — every shipped provider id, per
   platform, with the MLX/Candle deltas. Built from the committed exact-surface tests.
+- **[Mochi 1 tier strategy](reference/mochi-1-tier-strategy.md)** — the accepted quantization
+  packaging decision for the native Mochi 1 port (pre-quantized per-tier artifacts, default q4).
 
 ## Architecture
 

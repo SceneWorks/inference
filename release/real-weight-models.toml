@@ -35,3 +35,19 @@ expected_files = [
     "transformer/diffusion_pytorch_model.safetensors.index.json",
     "vae/diffusion_pytorch_model.safetensors",
 ]
+
+[[models]]
+key = "mochi-1-preview"
+repository = "genmo/mochi-1-preview"
+revision = "14be5fcea23095ed330cb214647916a451e38b6e"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MOCHI_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "tokenizer/spiece.model",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
