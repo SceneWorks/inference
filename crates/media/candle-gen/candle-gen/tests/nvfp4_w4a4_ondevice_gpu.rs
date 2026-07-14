@@ -99,7 +99,7 @@ fn to_vec_f32(t: &Tensor) -> Vec<f32> {
 /// from the CPU-packed activation within a tiny rel-RMS — proving the W4A4 forward is fully on-device
 /// (no host round-trip) without changing the numerics. Also checks both track the CPU dequant math.
 #[test]
-fn ondevice_activation_quant_matches_cpu_pack_ref() {
+fn nvfp4_w4a4_ondevice_activation_quant_matches_cpu_pack_ref() {
     let Some(dev) = nvfp4_device() else { return };
     let lt = CublasLt::new(&dev).unwrap();
     let (m, k, n) = (256usize, 256usize, 128usize); // K%32==0, N%16==0, M%16==0
@@ -137,7 +137,7 @@ fn ondevice_activation_quant_matches_cpu_pack_ref() {
 /// repeated forwards (a denoise-step stand-in), and stays within NVFP4 tolerance of a bf16-dense
 /// reference. Exercises the `forward_checked` NaN/inf guard.
 #[test]
-fn w4a4_forward_ondevice_no_nan_vs_bf16() {
+fn nvfp4_w4a4_forward_ondevice_no_nan_vs_bf16() {
     let Some(dev) = nvfp4_device() else { return };
     let (m, k, n) = (512usize, 512usize, 512usize);
     let x_f32 = pseudo_random(m * k, 7);
@@ -170,7 +170,7 @@ fn w4a4_forward_ondevice_no_nan_vs_bf16() {
 /// hardware-dependent, so it is reported, not asserted (the correctness/no-NaN gates above are the
 /// hard checks).
 #[test]
-fn w4a4_vs_w4a16_throughput() {
+fn nvfp4_w4a4_vs_w4a16_throughput() {
     let Some(dev) = nvfp4_device() else { return };
     // (M tokens, K in, N out): Sana-1.6B-ish attn proj (2240²) and FF up-proj (2240→5600).
     let shapes = [(1024usize, 2240usize, 2240usize), (1024, 2240, 5600)];
@@ -286,7 +286,7 @@ fn w4a4_vs_w4a16_throughput() {
 /// dense classify as expected on-device, confirming the metric that governs the benign→W4A4 /
 /// dense→W4A16 partition.
 #[test]
-fn outlier_sparsity_capture_confirms_partition() {
+fn nvfp4_w4a4_outlier_sparsity_capture_confirms_partition() {
     let Some(dev) = nvfp4_device() else { return };
     let (m, k) = (256usize, 512usize);
 
@@ -333,7 +333,7 @@ fn outlier_sparsity_capture_confirms_partition() {
 /// per-step denoise activation capture is deferred to sc-11045.
 #[test]
 #[ignore = "real-weight test: set SC11044_SANA_DIT_SAFETENSORS to a Sana DiT shard"]
-fn real_sana_dit_weight_w4a4() {
+fn nvfp4_w4a4_real_sana_dit_weight() {
     let Some(dev) = nvfp4_device() else { return };
     let path = match std::env::var("SC11044_SANA_DIT_SAFETENSORS") {
         Ok(p) => p,
