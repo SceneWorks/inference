@@ -38,8 +38,8 @@ fn snapshot_dir() -> std::path::PathBuf {
 fn peak_rel(got: &Array, want: &Array) -> f32 {
     let got = got.as_dtype(Dtype::Float32).unwrap();
     let want = want.as_dtype(Dtype::Float32).unwrap();
-    let diff = abs(&subtract(&got, &want).unwrap()).unwrap();
-    let denom = max(&abs(&want).unwrap(), None).unwrap().item::<f32>();
+    let diff = abs(subtract(&got, &want).unwrap()).unwrap();
+    let denom = max(abs(&want).unwrap(), None).unwrap().item::<f32>();
     max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 

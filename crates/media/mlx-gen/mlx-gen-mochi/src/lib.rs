@@ -16,7 +16,9 @@
 pub mod config;
 pub mod text_encoder;
 pub mod tokenizer;
+pub mod vae;
 
 pub use config::{MochiConfig, MochiVaeConfig};
 pub use text_encoder::{encode_prompt, load_t5_encoder, MochiTextConditioning};
 pub use tokenizer::{load_tokenizer, load_tokenizer_with_max_len};
+pub use vae::{load_vae_decoder, MochiVaeDecoder};
