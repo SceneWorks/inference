@@ -110,7 +110,12 @@ def _snapshot_dir() -> str:
 
 
 def _f32(t: torch.Tensor) -> np.ndarray:
-    return t.detach().to("cpu", torch.float32).numpy()
+    # `.contiguous()` is REQUIRED before `.numpy()`: several reference outputs are non-contiguous —
+    # notably the AsymmVAE decode, whose tensor carries a channels-last internal layout
+    # (stride[C] == 1). `safetensors.save_file` serializes the raw buffer against the declared
+    # C-contiguous shape, so a strided array is SILENTLY mis-stored and the reloaded golden differs
+    # from the in-memory tensor by O(1) (sc-11985). Force C-order here so every dumped tensor is faithful.
+    return t.detach().to("cpu", torch.float32).contiguous().numpy()
 
 
 def _meta() -> dict[str, np.ndarray]:
@@ -179,9 +184,11 @@ def dump_vae(pipe: MochiPipeline) -> None:
     lat_h = HEIGHT // pipe.vae_spatial_scale_factor
     lat_w = WIDTH // pipe.vae_spatial_scale_factor
     gen = torch.Generator(device="cpu").manual_seed(SEED + 1)
+    # Keep the latent (and hence the de-normalization + decode) in f32: the Mochi VAE is f32-only
+    # (see `main`), so the golden must be a faithful f32 decode, not a bf16 one.
     latents = torch.randn(
         (1, channels, lat_t, lat_h, lat_w), generator=gen, dtype=torch.float32
-    ).to(DEVICE, DTYPE)
+    ).to(DEVICE)
     with torch.no_grad():
         denorm = _denormalize_latents(pipe, latents)
         video = pipe.vae.decode(denorm, return_dict=False)[0]  # [1, 3, F, H, W], ~[-1, 1]
@@ -258,7 +265,9 @@ def dump_e2e_and_block(
         )
     final_latents = result.frames  # raw denoised latent when output_type == "latent"
     with torch.no_grad():
-        denorm = _denormalize_latents(pipe, final_latents)
+        # The DiT denoise runs bf16, so `final_latents` is bf16; upcast for the f32 VAE decode
+        # (the Mochi VAE is f32-only — see `main`).
+        denorm = _denormalize_latents(pipe, final_latents.float())
         video = pipe.vae.decode(denorm, return_dict=False)[0]
 
     tensors = {
@@ -291,6 +300,13 @@ def main() -> int:
     print(f"loading MochiPipeline from {snap} (device={DEVICE}, dtype={DTYPE})")
     pipe = MochiPipeline.from_pretrained(snap, torch_dtype=DTYPE, variant="bf16")
     pipe.to(DEVICE)
+
+    # The Mochi AsymmVAE is numerically UNSTABLE in bf16: its decoder applies no output normalization
+    # and its intermediate activations reach O(100), outside bf16's precise range. A bf16 decode yields
+    # a video far outside [-1, 1] (observed range ~[-8, 6]); the f32 decode is the correct [-1, 1]
+    # output. So decode the VAE in f32 regardless of the pipeline dtype — the DiT still runs bf16
+    # (its shipped precision). Without this the `vae`/`e2e` golden videos are garbage (sc-11985).
+    pipe.vae.to(torch.float32)
 
     # TE embeds are needed to drive e2e/dit_block; compute them if any of those run.
     embeds = None
