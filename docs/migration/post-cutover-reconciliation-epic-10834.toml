@@ -1,0 +1,41 @@
+schema_version = 1
+status = "reconciled into runtime-2026.07.2; legacy development halted pending cutover decision"
+reconciled_at = "2026-07-14"
+method = "3-way merge of the legacy residency fan-out onto the monorepo's explicit-catalog files (git merge-file; base = product cutoff, ours = monorepo, theirs = legacy head); registration seam kept explicit, no inventory/force-link reintroduced"
+supersedes_observed_heads = "post-import-reconciliation.toml (2026-07-13) recorded mlx_gen=c9faefc, candle_gen=6709463 as the product cutoffs; epic 10834 advanced both after runtime-2026.07.1"
+
+# Epic 10834 ("MLX unified-memory fit-gate + sequential component residency")
+# completed in the legacy repositories on 2026-07-14, one day after runtime-2026.07.1.
+[observed_heads]
+mlx_gen = "45428fa9727c569f3f3723c7343c96b0944f9007"
+candle_gen = "ef84441c82222df8f63701e761c0834c1699ceb0"
+
+[[repositories]]
+name = "mlx-gen"
+import_baseline = "c9faefc5d2e0650dd5679745089f2c03be51ba7a"
+observed_head = "45428fa9727c569f3f3723c7343c96b0944f9007"
+drift_commits = 18
+effect = "sequential component residency fan-out (flux/flux2/chroma/sd3/sana/boogu/bernini/anima/ideogram/kolors) + scail2 staged-residency test gate + krea render-time resolution lever (sc-11749)"
+
+[[repositories]]
+name = "candle-gen"
+import_baseline = "6709463b8b13e076dd6c499575d47188e8546c07"
+observed_head = "ef84441c82222df8f63701e761c0834c1699ceb0"
+drift_commits = 1
+effect = "gen-core SHA re-pin only (Cargo.toml/Cargo.lock); a no-op under the monorepo's workspace-path dependencies — no functional change ported"
+
+# The 18 mlx-gen first-parent effects were reconciled as one reviewed aggregate:
+# their bases are the product cutoff and their destination is the canonical port
+# commit. gen-core was untouched by the delta (OffloadPolicy + supports_sequential_offload
+# predate the cutoff via epic 10765/sc-10821), so the contract crate needed no change.
+[[ports]]
+repository = "mlx-gen"
+source_range = "c9faefc..45428fa"
+destination = "757dbe6f"
+kind = "aggregate 3-way merge with explicit-registration-seam adaptation"
+
+[[ports]]
+repository = "candle-gen"
+source = "ef84441c82222df8f63701e761c0834c1699ceb0"
+destination = "n/a"
+kind = "no-op — workspace-path dependency graph does not carry SHA pins"
