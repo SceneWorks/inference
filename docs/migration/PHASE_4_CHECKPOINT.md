@@ -1,8 +1,8 @@
 # Phase 4 Explicit Composition Checkpoint
 
-> **Status:** Named runtime bundles, explicit media/LLM composition, consumer cutover, and removal
-> of the LLM compatibility inventory are implemented and locally validated. Hosted CUDA/NAX
-> execution remains an open release gate.
+> **Status:** Complete. Named runtime bundles, explicit media/LLM composition, consumer cutover,
+> inventory removal, hosted validation, self-hosted CUDA/NAX, and real-weight execution pass at
+> immutable release `runtime-2026.07.0`.
 
 ## Result
 
@@ -67,9 +67,10 @@ The following passed from the repository root:
 - the complete pre-bundle Candle CPU lane and contract suites recorded in the post-import
   reconciliation checkpoint.
 
-`runtime-cuda` resolves in the unified Cargo graph but is not compiled on this host because its
-manifest deliberately enables the CUDA backend. The self-hosted CUDA lane is the compile/test
-authority for that named configuration.
+`runtime-cuda` resolves in the unified Cargo graph and passed on the self-hosted Windows/CUDA runner.
+The self-hosted NAX runner passed the macOS/MLX configuration, and the four real-weight jobs passed
+the pinned LLM/media conformance cases. The exact-commit and real-weight evidence is linked from the
+Phase 3 checkpoint.
 
 ## Rollback
 
@@ -77,9 +78,12 @@ The contract relocation and bundle introduction are separate commits. Either can
 without reverting the imported histories or workspace normalization. The last pre-removal commit is
 the source-level compatibility rollback point; the release itself has no hidden link-time fallback.
 
-## Remaining Phase 4 exit gates
+## Phase 4 exit outcome
 
-1. Run the checked-in workflow on the macOS 26.2+ NAX runner; the hosted macOS lane and the exact
-   local NAX command already pass.
-2. Build and test `runtime-cuda` on the self-hosted CUDA runner.
-3. Publish the immutable runtime release and validate the final SceneWorks and ChatWorks pins.
+1. The checked-in workflow passed on the macOS NAX runner.
+2. `runtime-cuda` built and tested on the self-hosted Windows/CUDA runner.
+3. Immutable release `runtime-2026.07.0` was published at exact commit
+   `48cc2d87e14de0189ac4f7763fddc0a8581c2e68`.
+4. SceneWorks and ChatWorks resolve their selected bundles from that tag and exact commit; their
+   local product gates pass. Hosted SceneWorks validation requires its scoped private-repository
+   read secret and does not weaken the release identity.

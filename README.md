@@ -9,12 +9,14 @@ bundles.
 This repository was assembled from the existing `core-llm`, `mlx-llm`,
 `candle-llm`, `mlx-gen`, and `candle-gen` histories. Phase 1 preserved and
 verified those histories; Phase 2 moved the imported packages into their ownership
-paths and normalized them under one Cargo workspace and lockfile. Phase 3 now
+paths and normalized them under one Cargo workspace and lockfile. Phase 3
 provides dependency-aware CI selection, supply-chain policy, immutable real-weight
 fixture pins, and deterministic source/SBOM release tooling.
 Phase 4 adds validated `runtime-macos`, `runtime-cuda`, and `runtime-cpu` composition boundaries for
 explicit media, LLM, and snapshot-preparation catalogs; the former link-time provider registries
-have been removed. Phase 5 is the immutable release and final product-pin validation.
+have been removed. Phase 5 published immutable release `runtime-2026.07.0` and cut the SceneWorks
+and ChatWorks lockfiles over to its exact commit. Local product validation is complete; hosted
+SceneWorks validation requires its scoped credential for this private repository.
 
 The current authoritative migration plan and release-set baseline live in the
 SceneWorks repository under `documents/rearchitecture/`.
@@ -32,9 +34,9 @@ docs/              Migration maps, architecture, compatibility, and release reco
 See [`docs/migration/PHASE_2_CHECKPOINT.md`](docs/migration/PHASE_2_CHECKPOINT.md)
 for normalization invariants and
 [`docs/migration/PHASE_3_CHECKPOINT.md`](docs/migration/PHASE_3_CHECKPOINT.md) for
-the local release-train validation record, and
+the published release-train evidence, and
 [`docs/migration/PHASE_4_CHECKPOINT.md`](docs/migration/PHASE_4_CHECKPOINT.md) for
-the bundle composition and remaining platform gates.
+the explicit bundle composition and platform results.
 
 The architectural rationale—including why the repositories were consolidated,
 why provider discovery is explicit, the alternatives considered, and the

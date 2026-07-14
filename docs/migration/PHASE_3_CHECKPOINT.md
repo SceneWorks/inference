@@ -1,8 +1,8 @@
 # Phase 3 Release Train Checkpoint
 
-> **Status:** Implemented and published. Hosted Linux/macOS execution is active;
-> the immutable runtime tag and self-hosted CUDA/NAX/real-weight evidence remain
-> release gates.
+> **Status:** Complete. Immutable release `runtime-2026.07.0`, hosted Linux/macOS,
+> self-hosted CUDA/NAX, real-weight execution, tagged artifacts, SBOM, and external-consumer
+> validation are published.
 
 ## Result
 
@@ -103,13 +103,22 @@ passed the complete hosted matrix at `05584c6b13e08f653fe9896422ca22dd618ede98`:
 documentation, contracts, Linux Candle CPU, macOS MLX/Candle Metal, dependency policy, workspace
 invariants, and release metadata/SBOM.
 
-## Publication outcome and remaining release gates
+## Publication outcome
 
-1. Repository publication and hosted Linux/macOS execution are complete.
-2. Configure the self-hosted Windows/CUDA and real-weight runner variables, then
-   execute those matrices against the pinned, self-materializing snapshots.
-3. Create the immutable runtime tag only after those jobs pass.
-4. Rebuild and upload the tagged source/SBOM bundle, then verify its hashes.
+- Exact-commit CI run
+  [`29284987010`](https://github.com/SceneWorks/inference/actions/runs/29284987010) passed hosted
+  Linux/macOS plus the self-hosted NAX and Windows/CUDA suites at
+  `48cc2d87e14de0189ac4f7763fddc0a8581c2e68`.
+- Real-weight run
+  [`29285222380`](https://github.com/SceneWorks/inference/actions/runs/29285222380) passed MLX and
+  Candle LLM/media execution against all three pinned snapshots.
+- Tag CI run
+  [`29293208430`](https://github.com/SceneWorks/inference/actions/runs/29293208430) passed the hosted
+  matrix, deterministic tagged archive, checksums, SPDX SBOM, and extracted external consumer.
+- GitHub Release
+  [`runtime-2026.07.0`](https://github.com/SceneWorks/inference/releases/tag/runtime-2026.07.0)
+  contains the four exact CI-produced assets. Downloaded `SHA256SUMS` verification passes, and the
+  tag dereferences to the exact commit above.
 
-Product cutover and provider-registry refactoring remain later phases; this phase
-does not change any consumer dependency.
+Product cutover is recorded in the SceneWorks Phase 5 checkpoint. Provider-registry refactoring is
+complete in the explicit runtime bundles; no link-time inference inventory remains.
