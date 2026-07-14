@@ -175,9 +175,9 @@ def _denormalize_latents(pipe: MochiPipeline, latents: torch.Tensor) -> torch.Te
 def dump_vae(pipe: MochiPipeline) -> None:
     """VAE-decode golden on a seeded latent (isolates `AutoencoderKLMochi.decode`)."""
     channels = pipe.vae.config.latent_channels
-    lat_t = (FRAMES - 1) // pipe.vae_temporal_compression_ratio + 1
-    lat_h = HEIGHT // pipe.vae_spatial_compression_ratio
-    lat_w = WIDTH // pipe.vae_spatial_compression_ratio
+    lat_t = (FRAMES - 1) // pipe.vae_temporal_scale_factor + 1
+    lat_h = HEIGHT // pipe.vae_spatial_scale_factor
+    lat_w = WIDTH // pipe.vae_spatial_scale_factor
     gen = torch.Generator(device="cpu").manual_seed(SEED + 1)
     latents = torch.randn(
         (1, channels, lat_t, lat_h, lat_w), generator=gen, dtype=torch.float32
