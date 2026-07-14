@@ -35,6 +35,13 @@
 
 pub mod repack;
 
+// The NVFP4 (FP4) weight container + offline packer + CPU dequant reference (sc-11040, epic 11037):
+// E2M1 4-bit elements over 16-element blocks, one FP8-E4M3 micro-scale per block, plus a second-level
+// FP32 per-tensor scale (~4.5 effective bits/weight). Emits the canonical cuBLASLt-consumable byte /
+// 128×4-swizzled-scale layout the sc-11039 NVFP4 GEMM reads. Pure CPU numerics — builds everywhere
+// (no `cuda` feature), consumed on Blackwell sm_120 by the cuBLASLt path.
+pub mod nvfp4;
+
 // The shared forward-time additive (unmerged) LoRA/LoKr seam (sc-11091, epic 10765): [`AdaptLinear`]
 // — a frozen dense/packed base plus stacked residuals `y = base(x) + Σ scale·((x·A)·B)`, memory-free
 // on a packed q4/q8 tier. The one core that candle-gen-wan (sc-10094) + candle-gen-anima (sc-10640)
@@ -57,6 +64,10 @@ pub mod eight_bit_linear;
 
 pub use adapt::{AdaptLinear, LokrFactors};
 pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
+pub use nvfp4::{
+    e2m1_from_f32, e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor, E2M1_LUT, E2M1_MAX, E4M3_MAX,
+    NVFP4_BLOCK,
+};
 pub use repack::{
     dequant_mlx_q4_reference, dequant_mlx_q4_reference_gs, dequant_mlx_q8, dequant_mlx_q8_gs,
     f16_exact, mlx_packed_bits, mlx_packed_bits_gs, pack_mlx_affine, repack_mlx_q4_to_q4_1,
