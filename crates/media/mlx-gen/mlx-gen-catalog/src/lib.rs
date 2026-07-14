@@ -44,6 +44,9 @@ pub mod providers {
     pub use mlx_gen_z_image as z_image;
 }
 
+/// Platform-owned crates consumed through provider-specific APIs rather than the registry
+/// `load(id, spec)` path (depth maps, face analysis, segmentation, the PiD latent decoder).
+/// Listed here so their platform membership is as explicit as a registered generator.
 pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "sam2", "sam3"];
 
 /// Add every provider shipped by the MLX media platform to an explicit registry builder.

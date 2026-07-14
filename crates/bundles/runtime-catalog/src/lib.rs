@@ -69,22 +69,29 @@ impl RuntimeCatalog {
         Ok(catalog)
     }
 
+    /// The bundle's platform label, e.g. `"macos"`, `"cuda"`, `"cpu"`.
     pub fn platform(&self) -> &'static str {
         self.platform
     }
 
+    /// The single tensor backend every provider in this catalog belongs to, e.g. `"mlx"`
+    /// or `"candle"`. Enforced by `try_new`.
     pub fn backend(&self) -> &'static str {
         self.backend
     }
 
+    /// The validated media provider registry — generators, trainers, captioners, and
+    /// image/text embedders. Load by id through the registry's `load_*` methods.
     pub fn media(&self) -> &ProviderRegistry {
         &self.media
     }
 
+    /// The validated text-LLM provider registry (streaming, cancellable, multimodal).
     pub fn text(&self) -> &TextLlmRegistry {
         &self.text
     }
 
+    /// The validated snapshot-preparer registry for this backend.
     pub fn preparers(&self) -> &SnapshotPreparerRegistry {
         &self.preparers
     }
@@ -207,15 +214,25 @@ impl RuntimeCatalog {
 /// Stable, machine-readable provider inventory for release and product compatibility checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeCatalogSnapshot {
+    /// The bundle's platform label (`"macos"` / `"cuda"` / `"cpu"`).
     pub platform: String,
+    /// The single backend every provider belongs to (`"mlx"` / `"candle"`).
     pub backend: String,
+    /// Generator ids, in stable catalog order — each a `load` key.
     pub generator_ids: Vec<String>,
+    /// Standalone transform ids (empty at this release).
     pub transform_ids: Vec<String>,
+    /// Trainer ids — each a `load_trainer` key.
     pub trainer_ids: Vec<String>,
+    /// Captioner ids — each a `load_captioner` key.
     pub captioner_ids: Vec<String>,
+    /// Image-embedder ids — each a `load_image_embedder` key.
     pub image_embedder_ids: Vec<String>,
+    /// Text-embedder ids — each a `load_text_embedder` key.
     pub text_embedder_ids: Vec<String>,
+    /// Text-LLM ids — each a `load_textllm` key on the text registry.
     pub text_llm_ids: Vec<String>,
+    /// The backend of each registered snapshot preparer (all equal to `backend`).
     pub snapshot_preparer_backends: Vec<String>,
 }
 

@@ -38,17 +38,25 @@ crates/media/      MLX and Candle media engines and provider families
 docs/              Migration maps, architecture, compatibility, and release records
 ```
 
+## Documentation
+
+Start in [`docs/`](docs/README.md). The essentials:
+
+- **[Getting Started](docs/guide/getting-started.md)** — how a product depends on a runtime
+  bundle, builds its validated registries, and loads/runs media generators, LLMs, and
+  snapshot preparers.
+- **[Model Catalog Reference](docs/reference/model-catalog.md)** — every shipped provider id
+  per platform, with the MLX/Candle deltas.
+- **[Architecture Rationale](docs/architecture/inference-rearchitecture.md)** — why the
+  repositories were consolidated, why provider discovery is explicit, the alternatives
+  considered, and the tradeoffs accepted.
+
 See [`docs/migration/PHASE_2_CHECKPOINT.md`](docs/migration/PHASE_2_CHECKPOINT.md)
 for normalization invariants and
 [`docs/migration/PHASE_3_CHECKPOINT.md`](docs/migration/PHASE_3_CHECKPOINT.md) for
 the published release-train evidence, and
 [`docs/migration/PHASE_4_CHECKPOINT.md`](docs/migration/PHASE_4_CHECKPOINT.md) for
 the explicit bundle composition and platform results.
-
-The architectural rationale—including why the repositories were consolidated,
-why provider discovery is explicit, the alternatives considered, and the
-tradeoffs accepted—is recorded in
-[`docs/architecture/inference-rearchitecture.md`](docs/architecture/inference-rearchitecture.md).
 
 Contribution boundaries and security reporting are documented in
 [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md).

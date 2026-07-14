@@ -5,18 +5,24 @@ pub use candle_gen_catalog::media;
 pub use candle_llm as llm;
 pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
 
+/// The Candle backend crates this platform owns, re-exported from the media catalog
+/// (available under the default `media` feature).
 #[cfg(feature = "media")]
 pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
 
+/// Platform label for this bundle; matches `RuntimeCatalog::platform`.
 pub const PLATFORM: &str = "cpu";
+/// The single tensor backend every provider in this bundle uses.
 pub const BACKEND: &str = "candle";
+/// Target triples this bundle is supported on.
 pub const SUPPORTED_TARGET_TRIPLES: &[&str] = &[
     "x86_64-unknown-linux-gnu",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
 ];
+/// Native (non-Cargo) prerequisites required to build and run this bundle (none for CPU).
 pub const NATIVE_PREREQUISITES: &[&str] = &[];
 
 fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {

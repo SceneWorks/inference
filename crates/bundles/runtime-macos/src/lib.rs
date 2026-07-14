@@ -5,14 +5,20 @@ pub use mlx_gen_catalog::media;
 pub use mlx_llm as llm;
 pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
 
+/// The MLX backend crates this platform owns, re-exported from the media catalog
+/// (available under the default `media` feature).
 #[cfg(feature = "media")]
 pub mod providers {
     pub use mlx_gen_catalog::providers::*;
 }
 
+/// Platform label for this bundle; matches `RuntimeCatalog::platform`.
 pub const PLATFORM: &str = "macos";
+/// The single tensor backend every provider in this bundle uses.
 pub const BACKEND: &str = "mlx";
+/// Target triples this bundle is supported on.
 pub const SUPPORTED_TARGET_TRIPLES: &[&str] = &["aarch64-apple-darwin"];
+/// Native (non-Cargo) prerequisites required to build and run this bundle.
 pub const NATIVE_PREREQUISITES: &[&str] = &["macOS 26.2+", "Xcode Metal toolchain"];
 
 fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
