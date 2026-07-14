@@ -110,7 +110,12 @@ def _snapshot_dir() -> str:
 
 
 def _f32(t: torch.Tensor) -> np.ndarray:
-    return t.detach().to("cpu", torch.float32).numpy()
+    # `.contiguous()` is REQUIRED before `.numpy()`: several reference outputs are non-contiguous —
+    # notably the AsymmVAE decode, whose tensor carries a channels-last internal layout
+    # (stride[C] == 1). `safetensors.save_file` serializes the raw buffer against the declared
+    # C-contiguous shape, so a strided array is SILENTLY mis-stored and the reloaded golden differs
+    # from the in-memory tensor by O(1) (sc-11985). Force C-order here so every dumped tensor is faithful.
+    return t.detach().to("cpu", torch.float32).contiguous().numpy()
 
 
 def _meta() -> dict[str, np.ndarray]:
