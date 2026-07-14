@@ -135,6 +135,7 @@ pub fn quantize_weight_int8_per_channel(w: &Tensor) -> Result<PerChannelInt8Weig
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
+    use super::super::nvfp4::{Nvfp4Tensor, SF_ATOM_COLS, SF_ATOM_ROWS};
     use super::*;
     use candle_core::cuda_backend::cudarc;
     use candle_core::cuda_backend::CudaStorageSlice;
@@ -154,6 +155,14 @@ mod cuda_impl {
         device: candle_core::CudaDevice,
         workspace: cudarc::driver::CudaSlice<u8>,
         workspace_size: usize,
+        /// Cached NVFP4 algo per `(m, k, n)` — the cuBLASLt heuristic search is a host-side cost that
+        /// dominates a small FP4 GEMM; picking the algo once per shape and reusing it is what makes the
+        /// resident-weight forward (and the throughput probe) reflect real FP4 tensor-core speed rather
+        /// than repeated heuristic searches. The fp8/int8 paths do not cache (they were spike/bench
+        /// scaffolding); the NVFP4 path is a shipping compute lane so it does.
+        nvfp4_algos: std::sync::Mutex<
+            std::collections::HashMap<(usize, usize, usize), sys::cublasLtMatmulAlgo_t>,
+        >,
     }
 
     // The Lt handle is an opaque device-side object; guarded by the owning stream/device.
@@ -186,6 +195,7 @@ mod cuda_impl {
                 device,
                 workspace,
                 workspace_size: Self::WORKSPACE,
+                nvfp4_algos: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         }
 
@@ -210,6 +220,17 @@ mod cuda_impl {
             Ok(maj > 8 || (maj == 8 && min >= 9))
         }
 
+        /// True iff the device can run the NVFP4 block-scaled FP4 GEMM (sc-11039). The master-gate
+        /// spike (sc-11038) confirmed cuBLASLt dispatches a real `CUDA_R_4F_E2M1` + `VEC16_UE4M3`
+        /// tensor-core kernel on **consumer** Blackwell `sm_120` (cap 12.0) — plain `sm_120`, not
+        /// `sm_120a`. Datacenter `sm_100` is out of epic scope; the floor is cap ≥ 12.0. Below this the
+        /// caller falls back to the dequant→bf16 dense path (the same fallback the non-cuda build takes
+        /// by construction — this whole handle is `#[cfg(feature = "cuda")]`).
+        pub fn meets_nvfp4_floor(&self) -> Result<bool> {
+            let (maj, _min) = self.compute_cap()?;
+            Ok(maj >= 12)
+        }
+
         /// **fp8 E4M3 GEMM**: `D = (scale_w·scale_x) · (X · Wᵀ)` → bf16 `(M, N)`.
         /// `w_fp8` is `(N, K)` `F8E4M3`, `x_fp8` is `(M, K)` `F8E4M3`, both contiguous. Stages both
         /// operands then delegates to [`Self::matmul_fp8_staged`].
@@ -223,6 +244,72 @@ mod cuda_impl {
             let a = DevFp8::stage(self, w_fp8)?;
             let b = DevFp8::stage(self, x_fp8)?;
             self.matmul_fp8_staged(&a, scale_w, &b, scale_x)
+        }
+
+        /// **NVFP4 block-scaled FP4 GEMM** (sc-11039, epic 11037) — the primary FP4 compute path.
+        /// `D = (α)·(X · Wᵀ)` → bf16 `(M, N)`, where `α = w.global_scale · x.global_scale` and the two
+        /// operands are packed NVFP4 ([`super::super::nvfp4::Nvfp4Tensor`], sc-11040): E2M1 nibbles +
+        /// per-16-block UE4M3 micro-scales (in cuBLASLt's `VEC16_UE4M3` 128×4-swizzled layout) + the
+        /// FP32 per-tensor scale folded into `alpha`.
+        ///
+        /// `w` is the packed weight `[N=out, K=in]`; `x` is the packed activation `[M=tokens, K=in]`
+        /// (W4A4). Both must share the padded contraction width `cols_padded`. Delegates to
+        /// [`Self::matmul_nvfp4_staged`] after uploading both operands.
+        ///
+        /// This is the recipe the master-gate spike (sc-11038) proved dispatches a real FP4
+        /// tensor-core kernel on `sm_120`: `CUDA_R_4F_E2M1` A/B operands, `CUBLAS_COMPUTE_32F`
+        /// accumulate, `CUDA_R_32F` scale type, `VEC16_UE4M3` A/B block-scale mode, bf16 output, the
+        /// per-tensor scale in `alpha` (`D_SCALE_POINTER` is `NOT_SUPPORTED` for a bf16 D there).
+        pub fn matmul_nvfp4(&self, w: &Nvfp4Tensor, x: &Nvfp4Tensor) -> Result<Tensor> {
+            let a = DevNvfp4::stage(self, w)?;
+            let b = DevNvfp4::stage(self, x)?;
+            self.matmul_nvfp4_staged(&a, &b)
+        }
+
+        /// NVFP4 FP4 GEMM over **pre-staged** device operands (weight staged at load, activation per
+        /// forward) — the honest resident-weight compute path the throughput probe times. Returns the
+        /// bf16 `(M, N)` product. See [`Self::matmul_nvfp4`] for the recipe.
+        pub fn matmul_nvfp4_staged(&self, w: &DevNvfp4, x: &DevNvfp4) -> Result<Tensor> {
+            let (m, n) = (x.rows, w.rows);
+            let k = w.cols_padded;
+            if x.cols_padded != w.cols_padded {
+                candle_core::bail!(
+                    "nvfp4 staged K mismatch: x.cols_padded={} w.cols_padded={}",
+                    x.cols_padded,
+                    w.cols_padded
+                );
+            }
+            check_nvfp4_alignment(k, n)?;
+            // The FP32 per-tensor scales of both operands fold into a single `alpha` (the master-gate
+            // spike wrinkle: `D_SCALE_POINTER` is `NOT_SUPPORTED` for a bf16 output).
+            let alpha = w.global_scale * x.global_scale;
+            let mut out = unsafe { self.stream.alloc::<half::bf16>(m * n) }.map_err(drv_err)?;
+            {
+                let (a_ptr, _ga) = w.packed.device_ptr(&self.stream);
+                let (b_ptr, _gb) = x.packed.device_ptr(&self.stream);
+                let (sa_ptr, _gsa) = w.scales.device_ptr(&self.stream);
+                let (sb_ptr, _gsb) = x.scales.device_ptr(&self.stream);
+                let (d_ptr, _gd) = out.device_ptr_mut(&self.stream);
+                unsafe {
+                    self.run_nvfp4(m, k, n, a_ptr, b_ptr, sa_ptr, sb_ptr, d_ptr, alpha)?;
+                }
+            }
+            let storage = CudaStorage {
+                slice: CudaStorageSlice::BF16(out),
+                device: self.device.clone(),
+            };
+            Ok(Tensor::from_storage(
+                Storage::Cuda(storage),
+                (m, n),
+                BackpropOp::none(),
+                false,
+            ))
+        }
+
+        /// Stage a packed [`Nvfp4Tensor`] (host) as owned device buffers (nibbles + swizzled UE4M3
+        /// scales) for repeated FP4 GEMMs — the load-time twin for a resident NVFP4 weight.
+        pub fn stage_nvfp4(&self, t: &Nvfp4Tensor) -> Result<DevNvfp4> {
+            DevNvfp4::stage(self, t)
         }
 
         /// **int8 IGEMM**: raw `int32 = X_i8 · W_i8ᵀ` (no scale folded — caller multiplies by
@@ -666,6 +753,156 @@ mod cuda_impl {
         fn upload_scalar(&self, v: f32) -> Result<cudarc::driver::CudaSlice<f32>> {
             self.stream.clone_htod(&[v]).map_err(drv_err)
         }
+
+        /// The NVFP4 block-scaled FP4 matmul (sc-11039). Same TN col-major layout identity as
+        /// [`Self::run`] (A=W `(K,N)` ld=K, B=X `(K,M)` ld=K, D `(N,M)` ld=N) — only the operand dtype
+        /// (`CUDA_R_4F_E2M1`), the per-operand **block-scale mode** (`VEC16_UE4M3` + block-scale
+        /// pointers, in place of the fp8 per-tensor SCALAR scale pointers), and `alpha` (the folded
+        /// FP32 per-tensor scales) differ. Output bf16, `CUBLAS_COMPUTE_32F` / `CUDA_R_32F` scale.
+        ///
+        /// `sa_ptr` / `sb_ptr` are the A/B UE4M3 block-scale tensors in the CUTLASS
+        /// `Sm1xxBlockScaledConfig` 128×4 swizzle the sc-11040 packer emits — cuBLASLt's `VEC16`
+        /// UE4M3 mode consumes them directly (handoff item (a): the packer's column-major atom tiling
+        /// is what this descriptor expects; validated on the live GPU by the round-trip test).
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn run_nvfp4(
+            &self,
+            m: usize,
+            k: usize,
+            n: usize,
+            a_ptr: cudarc::driver::sys::CUdeviceptr,
+            b_ptr: cudarc::driver::sys::CUdeviceptr,
+            sa_ptr: cudarc::driver::sys::CUdeviceptr,
+            sb_ptr: cudarc::driver::sys::CUdeviceptr,
+            d_ptr: cudarc::driver::sys::CUdeviceptr,
+            alpha: f32,
+        ) -> Result<()> {
+            let io_dtype = sys::cudaDataType_t::CUDA_R_4F_E2M1;
+            let out_dtype = sys::cudaDataType_t::CUDA_R_16BF;
+            let desc = lt::create_matmul_desc(
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                sys::cudaDataType_t::CUDA_R_32F,
+            )
+            .map_err(cublas_err)?;
+
+            let transa: i32 = 1; // CUBLAS_OP_T  (A = W declared (K,N) col-major == our row-major (N,K))
+            let transb: i32 = 0; // CUBLAS_OP_N  (B = X declared (K,M) col-major == our row-major (M,K))
+            set_attr(
+                desc,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                &transa,
+            )?;
+            set_attr(
+                desc,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                &transb,
+            )?;
+
+            // Per-operand VEC16 UE4M3 block-scale mode + the swizzled scale tensors. The scale mode is
+            // a `cublasLtMatmulMatrixScale_t` (u32); `VEC16_UE4M3` is what the sc-11040 packer emits.
+            let scale_mode =
+                sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+            set_attr(
+                desc,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                &scale_mode,
+            )?;
+            set_attr(
+                desc,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                &scale_mode,
+            )?;
+            set_attr(
+                desc,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                &sa_ptr,
+            )?;
+            set_attr(
+                desc,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                &sb_ptr,
+            )?;
+
+            // Layouts (see [`Self::run`] doc): A=(K,N) ld=K, B=(K,M) ld=K, D=(N,M) ld=N. For FP4 the
+            // leading dim is in *elements* (K / N), not bytes — cuBLASLt handles the 2-nibbles/byte
+            // packing internally from the `CUDA_R_4F_E2M1` dtype.
+            let a_layout = lt::create_matrix_layout(io_dtype, k as u64, n as u64, k as i64)
+                .map_err(cublas_err)?;
+            let b_layout = lt::create_matrix_layout(io_dtype, k as u64, m as u64, k as i64)
+                .map_err(cublas_err)?;
+            let d_layout = lt::create_matrix_layout(out_dtype, n as u64, m as u64, n as i64)
+                .map_err(cublas_err)?;
+
+            // Algo: reuse the cached pick for this shape if present (the heuristic search is a host-side
+            // cost that otherwise dominates a small FP4 GEMM); else run the heuristic once and cache it.
+            // On an sm_120 device the heuristic returns the FP4 tensor-core algos (the spike saw 6); an
+            // empty result surfaces as a cuBLASLt error (the caller reads that as "cuBLASLt did not
+            // deliver an FP4 kernel" → the MMQ fallback would be needed).
+            let cached = crate::lock_recover(&self.nvfp4_algos).get(&(m, k, n)).copied();
+            let algo = match cached {
+                Some(a) => a,
+                None => {
+                    let pref = lt::create_matmul_pref().map_err(cublas_err)?;
+                    lt::set_matmul_pref_attribute(
+                        pref,
+                        sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                        &self.workspace_size as *const _ as *const c_void,
+                        size_of::<usize>(),
+                    )
+                    .map_err(cublas_err)?;
+                    let heuristic = lt::get_matmul_algo_heuristic(
+                        self.handle,
+                        desc,
+                        a_layout,
+                        b_layout,
+                        d_layout,
+                        d_layout,
+                        pref,
+                    );
+                    let _ = lt::destroy_matmul_pref(pref);
+                    let algo = match heuristic {
+                        Ok(h) => h.algo,
+                        Err(e) => {
+                            let _ = lt::destroy_matrix_layout(a_layout);
+                            let _ = lt::destroy_matrix_layout(b_layout);
+                            let _ = lt::destroy_matrix_layout(d_layout);
+                            let _ = lt::destroy_matmul_desc(desc);
+                            return Err(cublas_err(e));
+                        }
+                    };
+                    crate::lock_recover(&self.nvfp4_algos).insert((m, k, n), algo);
+                    algo
+                }
+            };
+
+            let beta = F32_ZERO;
+            // Hold the workspace device-ptr guard alive across the whole matmul call.
+            let (ws_ptr, _gw) = self.workspace.device_ptr(&self.stream);
+            let res = lt::matmul(
+                self.handle,
+                desc,
+                &alpha as *const f32 as *const c_void,
+                &beta as *const f32 as *const c_void,
+                a_ptr as *const c_void,
+                a_layout,
+                b_ptr as *const c_void,
+                b_layout,
+                d_ptr as *const c_void,
+                d_layout,
+                d_ptr as *mut c_void,
+                d_layout,
+                &algo as *const _,
+                ws_ptr as *mut c_void,
+                self.workspace_size,
+                self.stream.cu_stream() as sys::cudaStream_t,
+            );
+
+            let _ = lt::destroy_matrix_layout(a_layout);
+            let _ = lt::destroy_matrix_layout(b_layout);
+            let _ = lt::destroy_matrix_layout(d_layout);
+            let _ = lt::destroy_matmul_desc(desc);
+            res.map_err(cublas_err)
+        }
     }
 
     /// A `(rows, cols)` fp8 weight/activation staged as an owned, contiguous, offset-0 device
@@ -694,6 +931,96 @@ mod cuda_impl {
             let _ = lt;
             Ok(Self { buf, rows, cols })
         }
+    }
+
+    /// A packed NVFP4 operand staged on-device: the E2M1 nibble bytes + the UE4M3 128×4-swizzled
+    /// block-scale bytes + the FP32 per-tensor scale, plus the logical shape. Built from a host
+    /// [`Nvfp4Tensor`] (the sc-11040 offline packer output); the two byte buffers upload once so a
+    /// resident FP4 weight is not re-uploaded per forward. cuBLASLt reads `packed` as
+    /// `CUDA_R_4F_E2M1` and `scales` as the `VEC16_UE4M3` block-scale tensor.
+    pub struct DevNvfp4 {
+        packed: cudarc::driver::CudaSlice<u8>,
+        scales: cudarc::driver::CudaSlice<u8>,
+        rows: usize,
+        cols_padded: usize,
+        global_scale: f32,
+    }
+
+    impl DevNvfp4 {
+        /// Total **resident device** bytes of this staged NVFP4 operand — the E2M1 nibble buffer plus
+        /// the UE4M3 block-scale buffer (the FP32 per-tensor scale is a host scalar). This is the honest
+        /// VRAM footprint of a resident NVFP4 weight, used by the SC#6 packed-forward gate (sc-11041) to
+        /// assert a resident `Nvfp4Linear` weight stays at the ~4.5-eff-bit NVFP4 footprint and never
+        /// expands to bf16. Both buffers are `u8`, so `len()` is the byte count directly.
+        pub fn resident_bytes(&self) -> usize {
+            self.packed.len() + self.scales.len()
+        }
+
+        /// The logical `[rows, cols_padded]` shape of the staged operand (padding included).
+        pub fn shape_padded(&self) -> (usize, usize) {
+            (self.rows, self.cols_padded)
+        }
+
+        fn stage(lt: &CublasLt, t: &Nvfp4Tensor) -> Result<Self> {
+            // Sanity: the packer's buffers must match its declared shape (guards a malformed handoff).
+            let expect_packed = t.rows * (t.cols_padded / 2);
+            if t.packed.len() != expect_packed {
+                candle_core::bail!(
+                    "DevNvfp4::stage: packed len {} != rows*cols_padded/2 {}",
+                    t.packed.len(),
+                    expect_packed
+                );
+            }
+            if t.scales.len() != t.sf_rows * t.sf_cols {
+                candle_core::bail!(
+                    "DevNvfp4::stage: scales len {} != sf_rows*sf_cols {}",
+                    t.scales.len(),
+                    t.sf_rows * t.sf_cols
+                );
+            }
+            let packed = lt.stream.clone_htod(&t.packed).map_err(drv_err)?;
+            // Re-tile the UE4M3 block scales into the **row-major scale-factor-atom** order cuBLASLt's
+            // matrix-scale descriptor expects (sc-11039 handoff item (a), GPU-confirmed). The sc-11040
+            // packer emits the scales in *column-major* atom order (m-atom fastest); the two coincide
+            // when the operand has a single 128-row atom, but for >128 rows cuBLASLt reads the wrong
+            // atoms (round-trip rel-RMS jumps ~0.002 → ~0.082). We rebuild the buffer here by reading
+            // each logical `(row, block)` scale through the packer's own `scale_offset` (so this stays
+            // correct even if sc-11040 later flips its internal swizzle) and writing it at the
+            // row-major-atom offset. Follow-up (sc-11040): emit row-major natively and drop this shim.
+            let scales_dev = cublaslt_scale_layout(t);
+            let scales = lt.stream.clone_htod(&scales_dev).map_err(drv_err)?;
+            Ok(Self {
+                packed,
+                scales,
+                rows: t.rows,
+                cols_padded: t.cols_padded,
+                global_scale: t.global_scale,
+            })
+        }
+    }
+
+    /// Rebuild a packed [`Nvfp4Tensor`]'s UE4M3 block scales into the **row-major scale-factor-atom**
+    /// layout cuBLASLt's `VEC16_UE4M3` block-scale mode consumes (sc-11039 handoff (a)). The intra-atom
+    /// swizzle `((32,4),4):((16,4),1)` (CUTLASS `Sm1xxBlockScaledConfig` SF atom) is unchanged — only
+    /// the tiling **across** atoms flips from the packer's column-major (m-atom fastest) to row-major
+    /// (k-atom fastest: `atom_index = k_atom + num_k_atoms * m_atom`). Reads logical scales through
+    /// [`Nvfp4Tensor::scale_offset`] so it is agnostic to the packer's internal order.
+    fn cublaslt_scale_layout(t: &Nvfp4Tensor) -> Vec<u8> {
+        let mut out = vec![0u8; t.scales.len()];
+        let num_k_atoms = t.sf_cols / SF_ATOM_COLS;
+        for r in 0..t.sf_rows {
+            for blk in 0..t.sf_cols {
+                let v = t.scales[t.scale_offset(r, blk)];
+                let m_atom = r / SF_ATOM_ROWS;
+                let k_atom = blk / SF_ATOM_COLS;
+                let atom_index = k_atom + num_k_atoms * m_atom;
+                let mr = r % SF_ATOM_ROWS;
+                let kc = blk % SF_ATOM_COLS;
+                let intra = (mr % 32) * 16 + (mr / 32) * 4 + kc;
+                out[atom_index * (SF_ATOM_ROWS * SF_ATOM_COLS) + intra] = v;
+            }
+        }
+        out
     }
 
     /// A `(rows, cols)` int8-code operand as an owned device **byte** buffer. candle has no `i8` dtype,
@@ -765,6 +1092,37 @@ mod cuda_impl {
         Ok(())
     }
 
+    /// NVFP4 operand-K / N alignment (sc-11039 handoff item (b)). The NVFP4 block is 16 elements and
+    /// cuBLASLt's FP4 block-scaled path requires the contraction dim `K` a multiple of the scale-factor
+    /// atom's K-extent. The sc-11040 packer pads its **scale tensor** to 4 blocks (`SF_ATOM_COLS`) =
+    /// **64 elements** along K, so a K that is a multiple of 64 always has a fully-populated scale atom
+    /// and is unconditionally safe; the live-GPU probe (`nvfp4_k_alignment_probe`) reports the actual
+    /// minimum cuBLASLt accepts. `N` (out) must be a multiple of 16. Enforced at K a multiple of 64 —
+    /// the conservative bound that matches the packer's padded scale-atom width and never trips
+    /// `CUBLAS_STATUS_NOT_SUPPORTED` on a partial scale atom.
+    /// The required padded-K multiple for the NVFP4 cuBLASLt path (sc-11039 handoff item (b),
+    /// GPU-confirmed on the RTX PRO 6000). The `nvfp4_k_alignment_probe` swept K on live hardware:
+    /// K∈{32,64,128} are ACCEPTED (bit-accurate), K∈{16,48} return `CUBLAS_STATUS_NOT_SUPPORTED` — so
+    /// cuBLASLt's FP4 block-scaled path requires **K a multiple of 32** (two NVFP4 blocks), *not* the
+    /// single 16-element block and *not* the 64-element 4-block scale atom. The sc-11040 packer pads
+    /// `cols_padded` only to a multiple of 16, so an `in_features` in e.g. `[33,47]` packs to K=48 and
+    /// is rejected here with a clear message (follow-up: have the packer pad K to 32).
+    pub const NVFP4_K_ALIGN: usize = 32;
+
+    fn check_nvfp4_alignment(k: usize, n: usize) -> Result<()> {
+        if !k.is_multiple_of(NVFP4_K_ALIGN) {
+            candle_core::bail!(
+                "cuBLASLt NVFP4: padded K ({k}) must be a multiple of {NVFP4_K_ALIGN} (two NVFP4 \
+                 blocks — cuBLASLt returns NOT_SUPPORTED otherwise, e.g. K=16 or K=48); pack with an \
+                 in_features that rounds to a multiple of {NVFP4_K_ALIGN}"
+            );
+        }
+        if !n.is_multiple_of(16) {
+            candle_core::bail!("cuBLASLt NVFP4: N ({n}) must be a multiple of 16");
+        }
+        Ok(())
+    }
+
     fn expect_dtype(t: &Tensor, want: DType) -> Result<()> {
         if t.dtype() != want {
             candle_core::bail!("expected {want:?}, got {:?}", t.dtype());
@@ -781,4 +1139,4 @@ mod cuda_impl {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{CublasLt, DevFp8, DevInt8};
+pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, NVFP4_K_ALIGN};
