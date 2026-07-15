@@ -129,12 +129,24 @@ fn t5_encode_matches_golden() {
     // (the fp32 shards are bf16-trained, so bf16-resident weights are bit-identical to the golden's)
     // with f32 activations, so what remains is kernel/device noise — not a code delta.
     //
-    // `mean_rel` is therefore the PRIMARY correctness signal: any *systematic* encoder bug (wrong
-    // mask, transposed weight, wrong bucket) moves the whole tensor and blows past 3e-3, while kernel
-    // noise leaves it ~5× lower. `peak_rel` is kept only as a COARSE guard against a gross
-    // single-element blowup: a bare peak bar over 90,112 real elements is decided by one outlier and
-    // flips on any unrelated kernel change (the 6e-2 MLX-Metal bar sits 0.7% under this CUDA run's
-    // 6.04e-2, with mean_rel 100× inside it). See sc-11989 #12112/#12115/#12116.
+    // BOTH bars are load-bearing, and each catches what the other misses — measured, not assumed:
+    //
+    //                            peak_rel    mean_rel     verdict
+    //   this regime (bf16 w/f32 acts)  6.044e-2    6.007e-4    pass
+    //   all-bf16 (the A5 dtype bug)    1.444e-1    8.751e-4    FAIL on peak only
+    //
+    //  - `peak_rel < 8e-2` DISCRIMINATES the dtype regime. Note the all-bf16 bug slips *under* the
+    //    3e-3 mean bar (8.75e-4) — mean_rel alone would have shipped it. 8e-2 sits in the real gap
+    //    between 6.04e-2 (correct) and 1.444e-1 (broken), with margin on both sides; it is NOT the
+    //    6e-2 MLX bar nudged to accommodate this run.
+    //  - `mean_rel < 3e-3` catches *systematic* drift (wrong mask, transposed weight, wrong bucket)
+    //    that a peak bar could miss, and is the signal that says this encoder is correct: 100× inside,
+    //    on 90,112 real elements.
+    //
+    // Why not the 6e-2 MLX bar: it was blessed under MLX-Metal, and this is candle-CUDA. We are in the
+    // reference's exact weight regime, so the 6.04e-2 is cross-backend kernel noise decided by ONE
+    // element in 90,112 — a bare peak bar at 6e-2 has no cross-backend headroom and flips on any
+    // unrelated kernel change. See sc-11989 #12112/#12115/#12116/#12119.
     let pos_rel = masked_peak_rel(
         &pos.prompt_embeds,
         &g.require("prompt_embeds").unwrap(),
