@@ -30,10 +30,10 @@ INTERNAL_PACKAGES = {
 PINNED_WORKSPACE_DEPENDENCIES = {
     "mlx-rs": ("pmetal-mlx-rs", "38e1cc1730a11b1e40c2c8ecda01606763a12d51"),
     "mlx-sys": ("pmetal-mlx-sys", "38e1cc1730a11b1e40c2c8ecda01606763a12d51"),
-    "candle-core": ("candle-core", "c1e6756a89faefa888ea57b056394a0619925b87"),
-    "candle-nn": ("candle-nn", "c1e6756a89faefa888ea57b056394a0619925b87"),
-    "candle-transformers": ("candle-transformers", "c1e6756a89faefa888ea57b056394a0619925b87"),
-    "candle-flash-attn": ("candle-flash-attn", "c1e6756a89faefa888ea57b056394a0619925b87"),
+    "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
+    "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
+    "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
+    "candle-flash-attn": ("candle-flash-attn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
 }
 DEFAULT_GRAPH_PINNED_PACKAGES = {
     package_name: revision
