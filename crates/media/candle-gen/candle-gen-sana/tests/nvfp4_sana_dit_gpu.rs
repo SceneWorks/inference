@@ -269,15 +269,24 @@ fn nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense() {
             SanaTransformer::from_weights_planned(&w, cfg.clone(), &plan).expect("build trunk");
         let r = model.nvfp4_report();
         if plan.is_nvfp4() {
+            // Report RESIDENT bytes next to the ratio, not the packed host container. This line is
+            // where the sc-11045 review caught MAJOR 3: it used to print the format's 437.56 MiB and
+            // "ratio 0.2822" for THIS leg — the one reporting 163/163 dequant→bf16, with nothing
+            // packed on-device. Resident and packed are different questions; print both, labelled.
+            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
             eprintln!(
                 "[sc-11045] {label}: {} projections quantized — {} FP4-lit (W4A4), {} dequant→bf16 \
-                 (W4A16); footprint {:.2} MiB vs bf16 {:.2} MiB (ratio {:.4}, {:.2} eff bits/wt)",
+                 (W4A16); RESIDENT {:.2} MiB (= {:.2} FP4 + {:.2} bf16) vs dense bf16 {:.2} MiB \
+                 → ratio {:.4}. [packed NVFP4 format: {:.2} MiB, {:.2} eff bits/wt]",
                 r.n_quantized,
                 r.fp4_lit,
                 r.dequant_bf16,
-                r.nvfp4_bytes as f64 / (1024.0 * 1024.0),
-                r.bf16_bytes as f64 / (1024.0 * 1024.0),
+                mib(r.resident_bytes()),
+                mib(r.resident_fp4_bytes),
+                mib(r.dequant_bf16_bytes),
+                mib(r.bf16_bytes),
                 r.footprint_ratio(),
+                mib(r.nvfp4_bytes),
                 r.effective_bits(),
             );
         }
