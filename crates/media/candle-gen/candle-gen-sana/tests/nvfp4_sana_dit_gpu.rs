@@ -11,10 +11,9 @@
 //!    trunk → DC-AE decode) with the NaN guard armed on **every** projection at **every** step, then
 //!    the same seed/prompt through the dense f32 trunk. Asserts no NaN/inf anywhere, output coherence,
 //!    and quality parity (latent rel-RMS / cosine, decoded-image PSNR).
-//! 2. [`nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4`] — **NOT SC#1** (Sana cannot settle it —
-//!    a candle grouped-conv defect is ~93% of the step; see the test's docs and sc-12110). ms/step for
-//!    the dense baseline vs NVFP4 W4A16 vs W4A4; its real finding is W4A4's unfused activation-quantize
-//!    overhead — the sc-12078 evidence.
+//! 2. [`nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4`] — **NOT SC#1** (Sana has no bf16
+//!    baseline or Q4 tier; see the test's docs and sc-12110). Post-sc-12111 ms/step for the dense
+//!    baseline vs NVFP4 W4A16 vs W4A4, after removing Candle's launch-bound depthwise-conv defect.
 //! 3. [`nvfp4_sana_dit_real_model_vram_footprint`] — **SC#6, scoped to blanket W4A4.** Model-level
 //!    resident weight bytes == the NVFP4 footprint under the packed path, by contention-immune tensor
 //!    byte-accounting — and the honest per-regime cost (mixed 0.70×, blanket W4A16 1.00×) alongside it.
@@ -422,24 +421,22 @@ fn nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense() {
 ///
 /// # Do NOT quote the vs-dense ratios as SC#1
 ///
-/// **Sana cannot settle SC#1** (sc-11045 review; now tracked as
-/// [sc-12110](https://app.shortcut.com/trefry/story/12110)). The ratios this prints are real, but ~93%
-/// of their denominator is an unrelated **candle-core defect**, so they measure that defect, not NVFP4:
+/// **Sana cannot settle SC#1** (sc-11045 review; tracked as
+/// [sc-12110](https://app.shortcut.com/trefry/story/12110)) because it has no bf16 path (the trunk is
+/// f32-only) and no Q4 tier, so neither SC#1's specified baseline nor SC#2's honest comparison exists.
 ///
-/// * SANA's Mix-FFN `conv_depth` (3×3 depthwise, `groups = 2·hidden = 11200`) costs **982 ms/call**
-///   because `candle-core/src/conv.rs:331-338` decomposes a grouped conv into one kernel launch per
-///   group plus a `cat` of 11200 tensors → **19.65 s of the 21.05 s step** (×20 blocks), at 0–1% GPU
-///   utilization (host-launch-bound).
-/// * All 163 NVFP4-eligible linears total **~80 ms/step — 0.4%**. Per block: linears 1.99 ms (0.20%)
-///   vs convs 984.8 ms (99.80%). **The end-to-end ceiling here is ~1.002× even with a free FP4 lane.**
-/// * Sana also has **no bf16 path** (f32-only trunk) and **no Q4 tier**, so neither SC#1's specified
-///   baseline nor SC#2's honest one exists on this model.
+/// Before sc-12111, SANA's Mix-FFN `conv_depth` (3×3 depthwise, `groups = 2·hidden = 11200`) cost
+/// **982 ms/call**: Candle launched one convolution per group and concatenated 11,200 tensors. Across
+/// 20 blocks that was **19.65 s of a 21.05 s step**, so the old end-to-end ratios were not useful.
+/// The pinned Candle PR #3531 removes that launch-bound path. This benchmark is now the post-fix
+/// number of record for SANA and re-exposes the linear/activation-quantization work, while SC#1/SC#2
+/// remain settled on a Flux-family DiT under sc-12110.
 ///
-/// **What this test does establish** is the one signal that survives, because it is a *marginal* cost
-/// against an otherwise-identical leg: **W4A4 adds ~9.1 s/step of unfused activation-quantizer
-/// overhead** (≈28 ms/fwd/CFG-branch, matching sc-11044's ~25.8 ms/fwd). That is the real evidence for
-/// **[sc-12078](https://app.shortcut.com/trefry/story/12078)** (the fused quantize kernel), and it is
-/// this gate's honest finding. SC#1/SC#2 are settled on a Flux-family DiT under sc-12110.
+/// Post-fix record on the exclusive RTX PRO 6000 rig: **4.042 ms/call** for the isolated realistic
+/// `conv_depth` shape, **315.1 ms/step dense f32**, and **316.7 ms/step W4A16** (down from
+/// 982 ms/call and 21.05 s/step). With the convolution bottleneck gone, the unfused activation
+/// quantizer tracked by sc-12078 is explicit: **8.42 s/step blanket W4A4** and **4.34 s/step mixed
+/// W4A4/W4A16**.
 #[test]
 #[ignore = "real-weight GPU bench: needs the Sana-1.6B snapshot + an exclusive sm_120 device"]
 fn nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4() {
@@ -493,7 +490,7 @@ fn nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4() {
     );
 
     eprintln!(
-        "\n[sc-11045] ===== SC#1 THROUGHPUT (real SANA-1.6B trunk, {EDGE}px, {bench_steps} steps, \
+        "\n[sc-12111] ===== POST-FIX SANA THROUGHPUT, NOT SC#1 (real SANA-1.6B trunk, {EDGE}px, {bench_steps} steps, \
          true CFG, EXCLUSIVE GPU) =====\n\
          [sc-11045]   dense f32 baseline : {:8.1} ms/step   (1.00×)\n\
          [sc-11045]   NVFP4 W4A16        : {:8.1} ms/step   ({:.2}× vs dense)\n\
