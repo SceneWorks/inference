@@ -990,7 +990,7 @@ fn render_base_img2img_from_contexts(
 }
 
 /// The resident image-edit-only component (epic 10871), loaded lazily on the first edit so the txt2img
-/// paths keep their footprint. The Qwen3-VL vision tower moved into [`KreaText`] in sc-12129 so grounded
+/// paths keep their footprint. The Qwen3-VL vision tower moved into the `KreaText` phase in sc-12129 so grounded
 /// conditioning completes inside the droppable text phase; only the Qwen-Image VAE encoder remains
 /// here for the resident path.
 pub struct EditComponents {
@@ -998,7 +998,7 @@ pub struct EditComponents {
 }
 
 /// Load the resident image-edit-only VAE encoder from a Krea 2 snapshot. The vision tower is lazy on
-/// [`KreaText`] and loads only when grounded conditioning is first requested.
+/// `KreaText` and loads only when grounded conditioning is first requested.
 pub fn load_edit_components(root: &Path, device: &Device) -> Result<EditComponents> {
     Ok(EditComponents {
         vae_encoder: load_vae_encoder(root, device)?,
