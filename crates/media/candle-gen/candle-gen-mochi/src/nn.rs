@@ -16,21 +16,27 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
 /// `y = x · Wᵀ` for a stored `[out, in]` weight, no bias, over the **last** axis of `x` (any leading
 /// dims). Flattens the leading dims to one matmul then restores them — candle's `Linear::forward` only
 /// special-cases ranks ≤ 4, so this covers the rank-5 NCTHW→channel-last projections the VAE uses.
+///
+/// The weight is upcast to `x`'s dtype at use. The AsymmDiT stores weights at bf16 but runs **f32**
+/// activations (the MLX parity regime), so this lets an f32 activation stream flow through bf16-stored
+/// projections with a transient per-matmul f32 weight view (freed after the matmul); when weight and
+/// activation already share a dtype (the f32 VAE), it is a no-op.
 pub fn linear_nb(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     let dims = x.dims().to_vec();
     let in_dim = *dims.last().expect("linear_nb: x has no axes");
     let out_dim = w.dim(0)?;
     let rows = x.elem_count() / in_dim;
     let flat = x.reshape((rows, in_dim))?;
+    let w = w.to_dtype(x.dtype())?;
     let y = flat.matmul(&w.t()?)?;
     let mut out_dims = dims;
     *out_dims.last_mut().unwrap() = out_dim;
     Ok(y.reshape(out_dims)?)
 }
 
-/// `y = x · Wᵀ + b` over the last axis (see [`linear_nb`]). `b` is `[out]`.
+/// `y = x · Wᵀ + b` over the last axis (see [`linear_nb`]). `b` is `[out]`, upcast to `x`'s dtype.
 pub fn linear_b(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
-    Ok(linear_nb(x, w)?.broadcast_add(b)?)
+    Ok(linear_nb(x, w)?.broadcast_add(&b.to_dtype(x.dtype())?)?)
 }
 
 /// **Weightless** RMS norm over the last axis, computed in f32 and returned in f32

@@ -26,6 +26,7 @@ pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
 pub mod tokenizer;
+pub mod transformer;
 pub mod vae;
 
 use candle_gen::candle_core::DType;
@@ -35,6 +36,10 @@ pub use rope::{get_positions, MochiRope};
 pub use scheduler::{cfg_combine, linear_quadratic_schedule, MochiScheduler};
 pub use text_encoder::{encode_prompt, load_indexed_var_builder, MochiT5, MochiTextConditioning};
 pub use tokenizer::{load_tokenizer, MAX_SEQUENCE_LENGTH, PAD_TOKEN_ID};
+pub use transformer::{
+    load_transformer_var_builder, MochiAttention, MochiDitConfig, MochiTransformer3DModel,
+    MochiTransformerBlock,
+};
 pub use vae::MochiVaeDecoder;
 
 /// Public provider id: `"mochi_1"`.
