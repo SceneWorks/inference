@@ -441,8 +441,17 @@ impl T5Attention {
     }
 
     /// Encoder self-attention. `position_bias` is threaded from block 0 (only block 0 owns
-    /// `relative_attention_bias`), matching the stock encoder.
-    fn forward(&self, xs: &Tensor, position_bias: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+    /// `relative_attention_bias`), matching the stock encoder. `mask` is an **optional** additive
+    /// key-padding mask (broadcastable to the scores `[B, heads, q_len, kv_len]`, e.g. `[1, 1, 1, L]`
+    /// with a large negative at padded keys), added after the position bias — Mochi's masked encode
+    /// (`_get_t5_prompt_embeds`) supplies it; the FLUX dense path passes `None` (byte-identical to the
+    /// pre-mask behavior).
+    fn forward(
+        &self,
+        xs: &Tensor,
+        position_bias: Option<&Tensor>,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
         let (b_sz, q_len) = (xs.dim(0)?, xs.dim(1)?);
         let kv_len = q_len;
         let q = self.q.forward(xs)?;
@@ -471,6 +480,11 @@ impl T5Attention {
             }
         };
         let scores = scores.broadcast_add(&position_bias)?;
+        // Additive key-padding mask (Mochi's masked encode); `None` = the FLUX byte-exact path.
+        let scores = match mask {
+            Some(m) => scores.broadcast_add(&m.to_dtype(scores.dtype())?)?,
+            None => scores,
+        };
         let attn = candle_gen::candle_nn::ops::softmax_last_dim(&scores)?;
         let out = attn.matmul(&v)?;
         let out = out
@@ -493,9 +507,14 @@ impl T5LayerSelfAttention {
         })
     }
 
-    fn forward(&self, xs: &Tensor, position_bias: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        position_bias: Option<&Tensor>,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
         let normed = self.layer_norm.forward(xs)?;
-        let (ys, pb) = self.self_attention.forward(&normed, position_bias)?;
+        let (ys, pb) = self.self_attention.forward(&normed, position_bias, mask)?;
         Ok(((xs + ys)?, pb))
     }
 }
@@ -514,8 +533,13 @@ impl T5Block {
         })
     }
 
-    fn forward(&self, xs: &Tensor, position_bias: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
-        let (xs, pb) = self.self_attn.forward(xs, position_bias)?;
+    fn forward(
+        &self,
+        xs: &Tensor,
+        position_bias: Option<&Tensor>,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (xs, pb) = self.self_attn.forward(xs, position_bias, mask)?;
         Ok((self.ff.forward(&xs)?, pb))
     }
 }
@@ -553,12 +577,27 @@ impl PackedT5Encoder {
     }
 
     /// Encode `input_ids` `[B, L]` → `[B, L, 4096]`. `out_dtype` casts the token embedding to the
-    /// compute dtype (bf16) before the encoder, as the stock `forward_dt` does.
+    /// compute dtype (bf16) before the encoder, as the stock `forward_dt` does. Unmasked (FLUX runs T5
+    /// unmasked); byte-identical to `forward_masked(input_ids, out_dtype, None)`.
     pub fn forward(&self, input_ids: &Tensor, out_dtype: DType) -> Result<Tensor> {
+        self.forward_masked(input_ids, out_dtype, None)
+    }
+
+    /// As [`forward`](Self::forward), but with an optional **additive** key-padding mask
+    /// (broadcastable to the per-block attention scores `[B, heads, L, L]`, e.g. `[1, 1, 1, L]` with a
+    /// large negative at padded keys). Mochi's `_get_t5_prompt_embeds` runs T5 **with** the tokenizer
+    /// padding mask (unlike FLUX, which runs it unmasked), so padded tokens don't pollute the real-token
+    /// embeddings. `mask = None` is byte-identical to [`forward`](Self::forward).
+    pub fn forward_masked(
+        &self,
+        input_ids: &Tensor,
+        out_dtype: DType,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let mut hidden = self.shared.forward(input_ids)?.to_dtype(out_dtype)?;
         let mut position_bias: Option<Tensor> = None;
         for block in &self.blocks {
-            let (h, pb) = block.forward(&hidden, position_bias.as_ref())?;
+            let (h, pb) = block.forward(&hidden, position_bias.as_ref(), mask)?;
             hidden = h;
             position_bias = Some(pb);
         }
@@ -691,6 +730,38 @@ mod tests {
         assert_eq!(v.dims(), s.dims());
         let d = max_abs_diff(&v, &s);
         assert!(d < 1e-4, "vendored T5 encoder vs stock max|Δ| = {d}");
+        Ok(())
+    }
+
+    /// The masked forward (added for Mochi's `_get_t5_prompt_embeds`) is **inert** with an all-zero
+    /// additive key-padding mask: `forward_masked(ids, dt, Some(zeros))` is byte-identical to the
+    /// unmasked `forward(ids, dt)`. This guards the FLUX dense path's byte-exactness — the added
+    /// `Some(mask)` branch must not perturb the computation when the mask is all-zero. (The mask's
+    /// *numeric* effect on padded keys needs non-trivial weights, so it is validated with real weights
+    /// in the Mochi `te_parity` gate, not here — this test's `VarMap` zero-inits every projection.)
+    #[test]
+    fn masked_forward_zero_mask_is_byte_identical_to_unmasked() -> Result<()> {
+        let dev = Device::Cpu;
+        let cfg = T5Config {
+            vocab_size: 64,
+            d_model: 32,
+            d_kv: 8,
+            d_ff: 64,
+            num_layers: 2,
+            num_heads: 4,
+            relative_attention_num_buckets: 8,
+            relative_attention_max_distance: 128,
+            layer_norm_epsilon: 1e-6,
+        };
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let enc = PackedT5Encoder::new(&cfg, vb)?;
+
+        let ids = Tensor::from_vec(vec![3u32, 8, 15, 2, 7, 1], (1, 6), &dev)?;
+        let unmasked = enc.forward(&ids, DType::F32)?;
+        let zeros = Tensor::zeros((1, 1, 1, 6), DType::F32, &dev)?;
+        let masked_zero = enc.forward_masked(&ids, DType::F32, Some(&zeros))?;
+        assert_eq!(max_abs_diff(&unmasked, &masked_zero), 0.0);
         Ok(())
     }
 }

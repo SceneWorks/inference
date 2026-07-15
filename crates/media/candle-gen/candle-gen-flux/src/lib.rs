@@ -44,7 +44,10 @@ mod flux1_load;
 // encoders that build every projection through it, so q4/q8 load straight from the packed parts (no
 // dense bf16 staging). The dense BFL snapshot path (stock `candle-transformers`) is unchanged.
 mod packed_dit;
-mod packed_te;
+// `packed_te` is `pub` so the Mochi provider (`candle-gen-mochi`) can reuse the vendored T5-XXL encoder
+// stack (`PackedT5Encoder` / `T5Config::xxl`) — the same google/t5-v1.1-xxl geometry Mochi conditions
+// on — through its masked-forward path (`forward_masked`, added for Mochi's padded/masked encode).
+pub mod packed_te;
 mod quant;
 
 // XLabs FLUX IP-Adapter (sc-5872, epic 5480) — reference-image (identity) conditioning. `ip_dit` is the
