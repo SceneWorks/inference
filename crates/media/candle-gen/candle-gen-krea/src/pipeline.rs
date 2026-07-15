@@ -86,15 +86,43 @@ pub const MAX_TEXT_TOKENS: usize = 1024;
 /// against a pathologically large reference set. (The t2i cap stays 1024 — short prompts only.)
 pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 
-/// The loaded Krea 2 Turbo components, `Arc`-shared so the generator caches them across `generate`.
-pub struct Components {
+/// The **text-phase** components (epic 10765 Phase 1c, sc-12089): the tokenizer + the Qwen3-VL-4B text
+/// encoder — everything [`encode_prompt_context`] reads, and nothing the denoise/decode tail touches.
+/// Split out of [`Components`] so the `Sequential` residency path can load→encode→**drop** it before the
+/// 12B DiT materializes. The MLX twin is mlx-gen-krea's `KreaText` (sc-11101).
+///
+/// Krea's TE (Qwen3-VL-4B) is *smaller* than its DiT — the qwen-image pattern (TE < DiT), not the lens
+/// pattern — so dropping it is a real but modest weight-side win (~2.9 GB at Q4); the larger effect is
+/// that the denoise activations no longer stack on top of a resident encoder.
+pub struct KreaText {
     tok: crate::tokenizer::KreaTokenizer,
     te: KreaTextEncoder,
+}
+
+/// The **heavy-phase** components (epic 10765 Phase 1c, sc-12089): the single-stream DiT + the
+/// Qwen-Image VAE (+ the optional PiD decoder) — everything downstream of the encoded context. Loaded
+/// after [`KreaText`] is dropped on the `Sequential` path, so it reuses the encoder's freed allocator
+/// pool. The MLX twin is mlx-gen-krea's `KreaHeavy` (sc-11101).
+///
+/// The VAE stays co-resident with the DiT through decode (it is small relative to the 12B DiT, so
+/// splitting them further buys ~nothing) — the qwen-image `load_vae_seq` precedent (sc-10867).
+pub struct KreaHeavy {
     dit: Krea2Transformer,
     vae: Arc<QwenVae>,
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
     /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `QwenVae` decode (the default path).
     pid: Option<Arc<PidEngine>>,
+}
+
+/// The loaded Krea 2 Turbo components, `Arc`-shared so the generator caches them across `generate`.
+///
+/// The **`Resident`** aggregate of both phases ([`KreaText`] + [`KreaHeavy`]), held co-resident for the
+/// whole job and across jobs via the generator's cache — exactly as before the sc-12089 phase split. The
+/// split is an internal seam: every public `render*` entry point still takes `&Components` and runs the
+/// same encode→denoise→decode body, so the resident path is byte-untouched (zero parity risk).
+pub struct Components {
+    text: KreaText,
+    heavy: KreaHeavy,
 }
 
 /// Load all Turbo components from a Krea 2 snapshot (`tokenizer/ text_encoder/ transformer/ vae/`).
@@ -110,12 +138,38 @@ pub fn load_components(
     adapters: &[AdapterSpec],
     pid_spec: Option<&PidWeights>,
 ) -> Result<Components> {
+    // Both phases, in the SAME order the pre-split loader used (tokenizer + TE, then DiT + VAE + PiD),
+    // so the resident load is byte-identical — the phase fns below are just the two halves named.
+    let text = load_text(root, device)?;
+    let heavy = load_heavy(root, device, adapters, pid_spec)?;
+    Ok(Components { text, heavy })
+}
+
+/// Load ONLY the text phase — the tokenizer + the Qwen3-VL-4B text encoder (epic 10765 Phase 1c,
+/// sc-12089). The same two loads [`load_components`] runs first; factored out so the `Sequential` path
+/// can scope them to the encode and drop them before the DiT loads. Mirrors qwen-image's `load_te_seq`
+/// (sc-10867).
+pub fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
     let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
 
     let te_cfg = KreaTeConfig::from_snapshot(root)?;
     let te_w = Weights::from_dir(&root.join("text_encoder"), device, TE_DTYPE)?;
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
 
+    Ok(KreaText { tok, te })
+}
+
+/// Load ONLY the heavy phase — the single-stream DiT (+ additive adapters) + the Qwen-Image VAE + the
+/// optional PiD decoder (epic 10765 Phase 1c, sc-12089). The same loads [`load_components`] runs after
+/// the text phase, with the identical adapter/PiD handling; factored out so the `Sequential` path can
+/// load it AFTER the text phase was dropped, reusing that freed pool. Mirrors qwen-image's
+/// `load_transformer_seq` / `load_vae_seq` / `load_pid_seq` (sc-10867).
+pub fn load_heavy(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+) -> Result<KreaHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
     let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
     crate::convert::validate_transformer(&dit_w, &cfg)?;
@@ -141,9 +195,7 @@ pub fn load_components(
         None => None,
     };
 
-    Ok(Components {
-        tok,
-        te,
+    Ok(KreaHeavy {
         dit,
         vae: Arc::new(vae),
         pid,
@@ -174,11 +226,7 @@ pub fn load_components_convrot(
 ) -> Result<Components> {
     ensure_int8_floor(device)?;
 
-    let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
-
-    let te_cfg = KreaTeConfig::from_snapshot(root)?;
-    let te_w = Weights::from_dir(&root.join("text_encoder"), device, TE_DTYPE)?;
-    let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
+    let text = load_text(root, device)?;
 
     let cfg = Krea2Config::from_snapshot(root)?;
     let dit_w = Weights::from_convrot_file(convrot_dit, device, DIT_DTYPE)?;
@@ -188,13 +236,14 @@ pub fn load_components_convrot(
     let vae = load_vae(root, device)?;
 
     Ok(Components {
-        tok,
-        te,
-        dit,
-        vae: Arc::new(vae),
-        // The INT8-ConvRot path is a deferred non-shipping variant (see the fn docs); PiD is not wired
-        // through it. The shipping `load_components` path carries the optional decoder.
-        pid: None,
+        text,
+        heavy: KreaHeavy {
+            dit,
+            vae: Arc::new(vae),
+            // The INT8-ConvRot path is a deferred non-shipping variant (see the fn docs); PiD is not
+            // wired through it. The shipping `load_components` path carries the optional decoder.
+            pid: None,
+        },
     })
 }
 
@@ -236,8 +285,49 @@ pub fn render(
 ) -> Result<Vec<Image>> {
     // Condition encoding (seed-independent): the 12 selected Qwen3-VL hidden layers, stacked +
     // prefix-dropped → the DiT's text_fusion context [1, n_tok, 12, 2560]. CFG-free, B=1.
-    let context = encode_prompt_context(comps, req)?;
-    render_from_context(comps, req, device, &context, on_progress)
+    let context = encode_prompt_context(&comps.text, req)?;
+    render_from_context(&comps.heavy, req, device, &context, on_progress)
+}
+
+/// Render the **Turbo** path under `Sequential` component residency (epic 10765 Phase 1c, sc-12089):
+/// load the text phase → encode → **DROP** it → load the DiT + VAE (+ optional PiD) → denoise/decode.
+/// Peak allocation demand is bounded to max(TE, DiT+VAE+activations) instead of their sum, reclaiming
+/// the ~2.9 GB (Q4) Qwen3-VL-4B encoder before the 12B DiT materializes.
+///
+/// Output is **byte-identical** to [`render`] — the SAME [`encode_prompt_context`] and the SAME
+/// [`render_from_context`] tail run, in the same order; only the load/free schedule differs. That is the
+/// zero-parity-risk property the split was built for.
+///
+/// Selected by the generator from `LoadSpec::offload_policy` (the worker fit-gate sets `Sequential`) or
+/// the `CANDLE_GEN_OFFLOAD=sequential` env override (the two-process A/B harness). Because it drops what
+/// it loads, it does NOT populate the generator's `Components` cache — repeat requests reload from the
+/// (page-cached) snapshot. That reload cost is the deliberate trade for the lower peak, which is why it
+/// is opt-in per the fit-gate rather than the default.
+///
+/// **cudarc caveat (epic 10765).** candle's CUDA allocator has no `empty_cache`, and
+/// `Device::synchronize()` does not reclaim: dropping the text phase frees back into candle's in-process
+/// pool, so the *peak allocation demand* falls but `nvidia-smi` resident VRAM will NOT. A/B therefore
+/// only reads true across two SEPARATE processes, and any worker gate math must key off predicted
+/// allocations, not observed RSS.
+pub fn render_sequential(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    // Phase 1 — text encode, scoped so the Qwen3-VL-4B encoder drops at the brace before the DiT loads.
+    let context = {
+        let text = load_text(root, device)?;
+        encode_prompt_context(&text, req)?
+    };
+
+    // Phase 2 — the heavy set, loaded into the pool the text phase just freed.
+    let heavy = load_heavy(root, device, adapters, pid_spec)?;
+
+    // Phase 3 — the shared denoise + decode tail, identical to `render`'s.
+    render_from_context(&heavy, req, device, &context, on_progress)
 }
 
 /// SPIKE (sc-8596, HELD) — the ComfyUI-Conditioning-Rebalance trick ported to candle: reweight the 12
@@ -253,9 +343,9 @@ pub fn render_tap_reweight(
     weights: &[f32],
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    let context = encode_prompt_context(comps, req)?;
+    let context = encode_prompt_context(&comps.text, req)?;
     let context = apply_tap_weights(&context, weights)?;
-    render_from_context(comps, req, device, &context, on_progress)
+    render_from_context(&comps.heavy, req, device, &context, on_progress)
 }
 
 /// SPIKE (sc-8596) — scale each of the stacked select-layer taps of a Krea text context
@@ -313,17 +403,33 @@ pub(crate) fn maybe_apply_style_gain(context: Tensor, gain: Option<f32>) -> Resu
 /// Encode the positive prompt to the DiT context and apply the optional text-style gain — the single
 /// seam every txt2img / img2img entry point shares (sc-11878). The negative (CFG-uncond) context is
 /// encoded without the gain, so the knob steers only the conditional prediction (matching the spike).
-fn encode_prompt_context(comps: &Components, req: &GenerationRequest) -> Result<Tensor> {
-    let context = comps
+fn encode_prompt_context(text: &KreaText, req: &GenerationRequest) -> Result<Tensor> {
+    let context = text
         .te
-        .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+        .forward(&text.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
     maybe_apply_style_gain(context, req.text_style_gain)
 }
 
-/// The seed-loop + schedule + decode tail shared by [`render`] and the [`render_tap_reweight`] spike:
-/// everything downstream of the (possibly reweighted) `context` `[1, n_tok, 12, 2560]`.
+/// Encode the **unconditional** (CFG negative) context for the Raw/Edit full-CFG paths — the plain
+/// encode with NO style gain, so the knob steers only the conditional prediction (sc-11878). An absent /
+/// empty negative prompt is the reference's `""`. Split out alongside [`encode_prompt_context`] so both
+/// the resident and `Sequential` Raw paths encode both branches from the SAME text phase before it is
+/// dropped (sc-12089).
+fn encode_negative_context(text: &KreaText, negative: &str) -> Result<Tensor> {
+    Ok(text
+        .te
+        .forward(&text.tok.encode_prompt(negative, MAX_TEXT_TOKENS)?)?)
+}
+
+/// The seed-loop + schedule + decode tail shared by [`render`], [`render_sequential`] and the
+/// [`render_tap_reweight`] spike: everything downstream of the (possibly reweighted) `context`
+/// `[1, n_tok, 12, 2560]`.
+///
+/// Takes [`KreaHeavy`] rather than [`Components`] (sc-12089) — the whole point of the phase split is
+/// that this body cannot observe whether the text phase is still resident or was already dropped, so
+/// the `Resident` and `Sequential` paths run the SAME code and produce byte-identical output.
 fn render_from_context(
-    comps: &Components,
+    comps: &KreaHeavy,
     req: &GenerationRequest,
     device: &Device,
     context: &Tensor,
@@ -407,11 +513,87 @@ pub fn render_img2img(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    // Condition encoding (seed-independent), identical to `render`: img2img changes only the init latent.
+    let context = encode_prompt_context(&comps.text, req)?;
+    render_img2img_from_context(
+        &comps.heavy,
+        vae_encoder,
+        req,
+        reference,
+        strength,
+        device,
+        &context,
+        on_progress,
+    )
+}
+
+/// Render the **Turbo img2img** path under `Sequential` component residency (epic 10765 Phase 1c,
+/// sc-12089) — the reference-guided sibling of [`render_sequential`]. Load the text phase → encode →
+/// **DROP** it → load the DiT + VAE (+ optional PiD) AND the VAE *encoder* → reference-encode →
+/// denoise/decode.
+///
+/// The VAE encoder loads on the heavy side (after the drop) rather than alongside the text phase: it is
+/// small, and the reference encode is not needed until the init latent is built, so keeping it heavy-side
+/// preserves the max(TE, heavy) peak. Output is **byte-identical** to [`render_img2img`] — the same
+/// encode and the same [`render_img2img_from_context`] tail, in the same order.
+///
+/// Wired because `krea_2_turbo` advertises BOTH `ConditioningKind::Reference` and
+/// `supports_sequential_offload` — unlike flux/flux2/qwen-image, whose sequential engines take no
+/// conditioning at all. The capability bit is per-**engine**, so a consumer's fit-gate predicts the
+/// staged peak for every request this id accepts; leaving img2img on the resident path would make that
+/// prediction a lie for reference requests and OOM the job it admitted (the sc-10840 contract). See
+/// [`render_sequential`] for the selection contract and the cudarc measurement caveat.
+#[allow(clippy::too_many_arguments)]
+pub fn render_img2img_sequential(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+    req: &GenerationRequest,
+    reference: &Image,
+    strength: Option<f32>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    // Phase 1 — text encode, scoped so the Qwen3-VL-4B encoder drops before the DiT loads.
+    let context = {
+        let text = load_text(root, device)?;
+        encode_prompt_context(&text, req)?
+    };
+
+    // Phase 2 — the heavy set + the VAE encoder, into the pool the text phase just freed.
+    let heavy = load_heavy(root, device, adapters, pid_spec)?;
+    let vae_encoder = load_vae_encoder(root, device)?;
+
+    // Phase 3 — the shared reference-encode + denoise + decode tail, identical to `render_img2img`'s.
+    render_img2img_from_context(
+        &heavy,
+        &vae_encoder,
+        req,
+        reference,
+        strength,
+        device,
+        &context,
+        on_progress,
+    )
+}
+
+/// The Turbo img2img reference-encode + seed-loop + decode tail (sc-12089): everything downstream of the
+/// encoded context, shared by [`render_img2img`] and [`render_img2img_sequential`]. Takes [`KreaHeavy`],
+/// so it cannot observe whether the text phase is still resident — both residency paths are
+/// byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn render_img2img_from_context(
+    comps: &KreaHeavy,
+    vae_encoder: &QwenVaeEncoder,
+    req: &GenerationRequest,
+    reference: &Image,
+    strength: Option<f32>,
+    device: &Device,
+    context: &Tensor,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
     let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-
-    // Condition encoding (seed-independent), identical to `render`: img2img changes only the init latent.
-    let context = encode_prompt_context(comps, req)?;
 
     let native = turbo_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule(
@@ -458,7 +640,7 @@ pub fn render_img2img(
                 on_progress,
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let v = comps.dit.forward(x, &t, &context)?;
+                    let v = comps.dit.forward(x, &t, context)?;
                     Ok(v.to_dtype(DType::F32)?)
                 },
             )?
@@ -487,26 +669,104 @@ pub fn render_base(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+    let (context, neg_context) = encode_base_contexts(&comps.text, req, guidance)?;
+    render_base_from_contexts(
+        &comps.heavy,
+        req,
+        device,
+        &context,
+        neg_context.as_ref(),
+        guidance,
+        on_progress,
+    )
+}
+
+/// Render the **Raw** path under `Sequential` component residency (epic 10765 Phase 1c, sc-12089) — the
+/// full-CFG sibling of [`render_sequential`]. Load the text phase → encode BOTH the conditional and
+/// (when CFG is active) the unconditional context → **DROP** it → load the DiT + VAE (+ optional PiD) →
+/// two-forward CFG denoise/decode.
+///
+/// Both branches must be encoded before the drop — the denoise consumes the uncond context every step,
+/// so a text phase dropped after only the positive encode would have to reload. Output is
+/// **byte-identical** to [`render_base`]: the SAME [`encode_base_contexts`] and the SAME
+/// [`render_base_from_contexts`] tail, only the load/free schedule differs. See [`render_sequential`]
+/// for the selection contract and the cudarc measurement caveat.
+pub fn render_base_sequential(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
 
+    // Phase 1 — encode both CFG branches, scoped so the Qwen3-VL-4B encoder drops before the DiT loads.
+    let (context, neg_context) = {
+        let text = load_text(root, device)?;
+        encode_base_contexts(&text, req, guidance)?
+    };
+
+    // Phase 2 — the heavy set, loaded into the pool the text phase just freed.
+    let heavy = load_heavy(root, device, adapters, pid_spec)?;
+
+    // Phase 3 — the shared CFG denoise + decode tail, identical to `render_base`'s.
+    render_base_from_contexts(
+        &heavy,
+        req,
+        device,
+        &context,
+        neg_context.as_ref(),
+        guidance,
+        on_progress,
+    )
+}
+
+/// Encode the Raw path's conditional + unconditional contexts from one text phase (sc-12089) — the
+/// single seam both [`render_base`] and [`render_base_sequential`] share, so the `Sequential` path
+/// cannot drift from the resident encode.
+///
+/// The unconditional branch is built ONLY when CFG is active (reference `cfg = guidance > 0`); an
+/// absent / empty negative prompt defaults to `""` (reference `negative_prompts = [""] * n`). `guidance
+/// ≤ 0` returns `None` and the uncond context is never encoded.
+fn encode_base_contexts(
+    text: &KreaText,
+    req: &GenerationRequest,
+    guidance: f32,
+) -> Result<(Tensor, Option<Tensor>)> {
     // Positive (conditional) condition encoding (seed-independent): the 12 selected Qwen3-VL hidden
     // layers → the DiT's text_fusion context [1, n_tok, 12, 2560].
-    let context = encode_prompt_context(comps, req)?;
+    let context = encode_prompt_context(text, req)?;
 
-    // Unconditional context, encoded ONLY when CFG is active (reference `cfg = guidance > 0`). An
-    // absent / empty negative prompt defaults to `""` (reference `negative_prompts = [""] * n`).
     let neg_context = if guidance > 0.0 {
         let negative = req.negative_prompt.as_deref().unwrap_or_default();
-        Some(
-            comps
-                .te
-                .forward(&comps.tok.encode_prompt(negative, MAX_TEXT_TOKENS)?)?,
-        )
+        Some(encode_negative_context(text, negative)?)
     } else {
         None
     };
+
+    Ok((context, neg_context))
+}
+
+/// The Raw seed-loop + dynamic schedule + two-forward CFG denoise + decode tail (sc-12089): everything
+/// downstream of the encoded contexts, shared by [`render_base`] and [`render_base_sequential`].
+///
+/// Takes [`KreaHeavy`] rather than [`Components`] — like [`render_from_context`], this body cannot
+/// observe whether the text phase is still resident, so both residency paths produce byte-identical
+/// output.
+#[allow(clippy::too_many_arguments)]
+fn render_base_from_contexts(
+    comps: &KreaHeavy,
+    req: &GenerationRequest,
+    device: &Device,
+    context: &Tensor,
+    neg_context: Option<&Tensor>,
+    guidance: f32,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Resolution-dynamic Raw sigma schedule (mu from the image-token count); a curated scheduler
     // reshapes over the same dynamic mu. Raw sigma → DiT timestep, raw velocity → Euler
@@ -535,10 +795,10 @@ pub fn render_base(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond = comps.dit.forward(x, &t, &context)?;
+                let cond = comps.dit.forward(x, &t, context)?;
                 // Two-forward CFG when a negative context was prepared (guidance > 0); else the bare
                 // conditional velocity. Combined by the shared reference formula (`krea_cfg_combine`).
-                let v = match &neg_context {
+                let v = match neg_context {
                     Some(nc) => {
                         let uncond = comps.dit.forward(x, &t, nc)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
@@ -588,26 +848,92 @@ pub fn render_base_img2img(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
 
-    // Positive (conditional) condition encoding (seed-independent), identical to `render_base`: img2img
-    // changes only the init latent + schedule start, not the conditioning.
-    let context = encode_prompt_context(comps, req)?;
+    // The conditional + unconditional condition encoding (seed-independent), identical to `render_base`
+    // (the shared `encode_base_contexts` seam): img2img changes only the init latent + schedule start,
+    // not the conditioning.
+    let (context, neg_context) = encode_base_contexts(&comps.text, req, guidance)?;
+    render_base_img2img_from_contexts(
+        &comps.heavy,
+        vae_encoder,
+        req,
+        reference,
+        strength,
+        device,
+        &context,
+        neg_context.as_ref(),
+        guidance,
+        on_progress,
+    )
+}
 
-    // Unconditional context, encoded ONLY when CFG is active (reference `cfg = guidance > 0`). An
-    // absent / empty negative prompt defaults to `""` (reference `negative_prompts = [""] * n`).
-    let neg_context = if guidance > 0.0 {
-        let negative = req.negative_prompt.as_deref().unwrap_or_default();
-        Some(
-            comps
-                .te
-                .forward(&comps.tok.encode_prompt(negative, MAX_TEXT_TOKENS)?)?,
-        )
-    } else {
-        None
+/// Render the **Raw img2img** path under `Sequential` component residency (epic 10765 Phase 1c,
+/// sc-12089) — the full-CFG sibling of [`render_img2img_sequential`]. Load the text phase → encode BOTH
+/// CFG branches → **DROP** it → load the DiT + VAE (+ optional PiD) AND the VAE *encoder* →
+/// reference-encode → two-forward CFG denoise/decode.
+///
+/// Output is **byte-identical** to [`render_base_img2img`]: the same [`encode_base_contexts`] and the
+/// same [`render_base_img2img_from_contexts`] tail. Wired for the same reason as
+/// [`render_img2img_sequential`] — `krea_2_raw` advertises both `Reference` and
+/// `supports_sequential_offload`, so every request it accepts must honor the staged peak the fit-gate
+/// predicts.
+#[allow(clippy::too_many_arguments)]
+pub fn render_base_img2img_sequential(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+    req: &GenerationRequest,
+    reference: &Image,
+    strength: Option<f32>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+
+    // Phase 1 — encode both CFG branches, scoped so the encoder drops before the DiT loads.
+    let (context, neg_context) = {
+        let text = load_text(root, device)?;
+        encode_base_contexts(&text, req, guidance)?
     };
+
+    // Phase 2 — the heavy set + the VAE encoder, into the pool the text phase just freed.
+    let heavy = load_heavy(root, device, adapters, pid_spec)?;
+    let vae_encoder = load_vae_encoder(root, device)?;
+
+    // Phase 3 — the shared tail, identical to `render_base_img2img`'s.
+    render_base_img2img_from_contexts(
+        &heavy,
+        &vae_encoder,
+        req,
+        reference,
+        strength,
+        device,
+        &context,
+        neg_context.as_ref(),
+        guidance,
+        on_progress,
+    )
+}
+
+/// The Raw img2img reference-encode + seed-loop + CFG denoise + decode tail (sc-12089): everything
+/// downstream of the encoded contexts, shared by [`render_base_img2img`] and
+/// [`render_base_img2img_sequential`]. Takes [`KreaHeavy`], so both residency paths are byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn render_base_img2img_from_contexts(
+    comps: &KreaHeavy,
+    vae_encoder: &QwenVaeEncoder,
+    req: &GenerationRequest,
+    reference: &Image,
+    strength: Option<f32>,
+    device: &Device,
+    context: &Tensor,
+    neg_context: Option<&Tensor>,
+    guidance: f32,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Resolution-dynamic Raw sigma schedule (mu from the image-token count), identical to `render_base`.
     let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
@@ -649,11 +975,11 @@ pub fn render_base_img2img(
                 on_progress,
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let cond = comps.dit.forward(x, &t, &context)?;
+                    let cond = comps.dit.forward(x, &t, context)?;
                     // Two-forward CFG when a negative context was prepared (guidance > 0); else the bare
                     // conditional velocity. Combined by the shared reference formula (`krea_cfg_combine`),
                     // exactly as `render_base`.
-                    let v = match &neg_context {
+                    let v = match neg_context {
                         Some(nc) => {
                             let uncond = comps.dit.forward(x, &t, nc)?;
                             krea_cfg_combine(&cond, &uncond, guidance)?
@@ -740,12 +1066,12 @@ pub fn render_edit(
     // same 12-tap structure the plain encode does, so `apply_tap_weights` is shape-safe. The negative
     // (CFG-uncond) grounded context is left untouched so the knob steers only the conditional prediction.
     let context = maybe_apply_style_gain(
-        grounding.condition(&comps.tok, &comps.te, &req.prompt)?,
+        grounding.condition(&comps.text.tok, &comps.text.te, &req.prompt)?,
         req.text_style_gain,
     )?;
     let neg_context = if guidance > 0.0 {
         let negative = req.negative_prompt.as_deref().unwrap_or_default();
-        Some(grounding.condition(&comps.tok, &comps.te, negative)?)
+        Some(grounding.condition(&comps.text.tok, &comps.text.te, negative)?)
     } else {
         None
     };
@@ -769,7 +1095,7 @@ pub fn render_edit(
     // `render_base` txt2img siblings — an edit generator loaded with a PiD engine (`spec.pid`) is no
     // longer a dead wire. `model_id` names the surface for the error message (Raw vs distilled Turbo edit).
     let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-        comps.pid.as_deref(),
+        comps.heavy.pid.as_deref(),
         req,
         base_seed,
         edit_pid_model_id(distilled),
@@ -787,10 +1113,13 @@ pub fn render_edit(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond = comps.dit.forward_edit(x, &t, &context, &ref_latents)?;
+                let cond = comps
+                    .heavy
+                    .dit
+                    .forward_edit(x, &t, &context, &ref_latents)?;
                 let v = match &neg_context {
                     Some(nc) => {
-                        let uncond = comps.dit.forward_edit(x, &t, nc, &ref_latents)?;
+                        let uncond = comps.heavy.dit.forward_edit(x, &t, nc, &ref_latents)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
@@ -804,7 +1133,7 @@ pub fn render_edit(
         // `[1,3,4H,4W]` tensor and `to_image` reads the size from it — matching `render` / `render_base`.
         let decoded = match &pid_decoder {
             Some(pid) => pid.decode(&lat)?,
-            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
+            None => comps.heavy.vae.decode(&lat)?.to_dtype(DType::F32)?,
         };
         to_image(&decoded)
     })
