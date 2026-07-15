@@ -109,7 +109,7 @@ use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, WeightsSource,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 use candle_gen::gen_core::OffloadPolicy;
 
 use pipeline::{Pipeline, SeqHeavy, SeqTextEncoders};
