@@ -56,15 +56,24 @@ impl PidEngine {
                 "pid: unknown/out-of-scope backbone {backbone:?} (no PiD latent-space mapping)"
             ))
         })?;
+        let weights = Weights::from_file(checkpoint)?;
+
         // The released students share the sr4x PixDiT topology; only the LQ latent-channel count and
         // the latent grid's spatial compression differ per latent space: 16-ch / 8× for qwen/flux/sd3,
         // 4-ch / 8× for sdxl, and **128-ch / 16×** for flux2 (the packed BN latent — see the registry
         // `FLUX2` note, sc-7847). Both fields drive the LQ adapter geometry + `PidDecoder` output size.
-        let mut cfg = PidConfig::sr4x();
+        //
+        // PiD v1.5 (sc-12142) ships a different LQ topology (wider trunk, per-token scalar gate,
+        // replicate padding, PiT injection, 2048 RoPE ref) under the SAME per-space checkpoint slot, so
+        // the worker may hand us either a v1.0 or v1.5 file (and fall back v1.5→v1.0 when v1.5 isn't
+        // downloaded — sc-12145). Pick the config by sniffing the WEIGHTS, not the filename.
+        let mut cfg = if detect_v1pt5(&weights)? {
+            PidConfig::sr4x_v1pt5()
+        } else {
+            PidConfig::sr4x()
+        };
         cfg.lq_latent_channels = spec.latent_channels;
         cfg.latent_spatial_down_factor = spec.latent_spatial_down_factor;
-
-        let weights = Weights::from_file(checkpoint)?;
 
         // Gemma: prefer the merged single-file checkpoint, else load the snapshot dir's shards.
         let merged = gemma_dir.join(GEMMA_MERGED_FILE);
@@ -270,6 +279,30 @@ pub fn flow_capture_for_request(
     }
 }
 
+/// Sniff whether a loaded PiD checkpoint is a **v1.5** student (sc-12141/sc-12142) vs a base `sr4x`
+/// v1.0 student, so [`PidEngine::load`] can pick the right [`PidConfig`] from the same per-space slot.
+///
+/// Two independent signals must agree: the first LQ gate's `content_proj` output width (**1** = v1.5's
+/// per-token scalar gate; `hidden_size` = v1.0's per-token-per-dim gate) and the presence of the
+/// top-level **`pit_lq_gate`** (v1.5-only). The converted EMA export pre-strips the `net.` nesting, so
+/// keys are bare. Errors if the gate is missing (not a PiD student) or the signals disagree (a
+/// malformed / version-mixed checkpoint) rather than guessing.
+fn detect_v1pt5(w: &Weights) -> Result<bool> {
+    let gate_rows = w
+        .require("lq_proj.gate_modules.0.content_proj.weight")?
+        .shape()[0];
+    let scalar_gate = gate_rows == 1;
+    let has_pit_gate = w.get("pit_lq_gate.content_proj.weight").is_some();
+    if scalar_gate != has_pit_gate {
+        return Err(Error::Msg(format!(
+            "pid: inconsistent v1.5 checkpoint signals — scalar gate (content_proj rows={gate_rows}) = \
+             {scalar_gate}, but pit_lq_gate present = {has_pit_gate}; the checkpoint is malformed or \
+             mixes versions"
+        )));
+    }
+    Ok(scalar_gate)
+}
+
 /// Extract the single-file path from a [`WeightsSource`], rejecting a directory.
 fn file_path(src: &WeightsSource, what: &str) -> Result<PathBuf> {
     match src {
@@ -364,6 +397,19 @@ mod tests {
         assert!(
             err.contains("not wired for this latent space"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the converted PiD v1.5 flux safetensors (PID_V1PT5_CKPT)"]
+    fn detect_v1pt5_true_on_real_v1pt5_checkpoint() {
+        // sc-12142: the sniff picks v1.5 for a real v1.5 student (scalar gate + pit_lq_gate present).
+        let path = std::env::var("PID_V1PT5_CKPT")
+            .expect("set PID_V1PT5_CKPT to the converted v1.5 flux safetensors");
+        let w = Weights::from_file(&path).unwrap();
+        assert!(
+            detect_v1pt5(&w).unwrap(),
+            "v1.5 checkpoint should sniff as v1.5"
         );
     }
 

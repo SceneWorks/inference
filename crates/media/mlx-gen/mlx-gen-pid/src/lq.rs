@@ -9,7 +9,7 @@
 //! ever ships an image-conditioned student); the latent `z_to_patch_ratio<1` fold branch likewise
 //! never occurs for the 16-/4-channel catalog spaces.
 
-use mlx_rs::ops::{add, concatenate_axis, exp, multiply, sigmoid, subtract};
+use mlx_rs::ops::{add, concatenate_axis, exp, multiply, pad, sigmoid, subtract, PadMode};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -18,7 +18,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use crate::backbone::{PatchInjector, PixDiT};
-use crate::config::PidConfig;
+use crate::config::{ConvPadding, PidConfig};
 
 const GN_EPS: f32 = 1e-5; // torch nn.GroupNorm default
 const GN_GROUPS: i32 = 4; // ResBlock default num_groups
@@ -31,15 +31,22 @@ fn lin(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
 }
 
 /// A Conv2d that stores its weight in mlx NHWC `[out, kH, kW, in]` (transposed from the torch
-/// `[out, in, kH, kW]` at load) and runs over NHWC activations.
+/// `[out, in, kH, kW]` at load) and runs over NHWC activations. `padding_mode` selects zero (torch
+/// default) vs replicate/edge padding — the latter for the PiD v1.5 students (`lq_projection_2d.py`).
 struct Conv2d {
     weight: Array,
     bias: Option<Array>,
     padding: i32,
+    padding_mode: ConvPadding,
 }
 
 impl Conv2d {
-    fn from_weights(w: &Weights, prefix: &str, padding: i32) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        padding: i32,
+        padding_mode: ConvPadding,
+    ) -> Result<Self> {
         let weight = w
             .require(&format!("{prefix}.weight"))?
             .transpose_axes(&[0, 2, 3, 1])?; // [out,in,kH,kW] -> [out,kH,kW,in]
@@ -47,11 +54,29 @@ impl Conv2d {
             weight,
             bias: w.get(&format!("{prefix}.bias")).cloned(),
             padding,
+            padding_mode,
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        conv2d(x, &self.weight, self.bias.as_ref(), 1, self.padding)
+        match self.padding_mode {
+            // Zero padding (torch default): let the conv op pad.
+            ConvPadding::Zeros => conv2d(x, &self.weight, self.bias.as_ref(), 1, self.padding),
+            // Replicate/edge padding (v1.5): edge-pad H/W on the NHWC activation, then conv `valid`
+            // (padding 0). NHWC axes 1=H, 2=W. Mirrors `nn.Conv2d(padding_mode="replicate")` and the
+            // mlx-gen-mochi VAE's edge-pad precedent.
+            ConvPadding::Replicate if self.padding > 0 => {
+                let p = self.padding;
+                let x = pad(
+                    x,
+                    &[(0, 0), (p, p), (p, p), (0, 0)][..],
+                    None,
+                    Some(PadMode::Edge),
+                )?;
+                conv2d(&x, &self.weight, self.bias.as_ref(), 1, 0)
+            }
+            ConvPadding::Replicate => conv2d(x, &self.weight, self.bias.as_ref(), 1, 0),
+        }
     }
 }
 
@@ -84,12 +109,12 @@ struct ResBlock {
 }
 
 impl ResBlock {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, padding_mode: ConvPadding) -> Result<Self> {
         Ok(Self {
             gn0: GroupNorm::from_weights(w, &format!("{prefix}.block.0"))?,
-            conv2: Conv2d::from_weights(w, &format!("{prefix}.block.2"), 1)?,
+            conv2: Conv2d::from_weights(w, &format!("{prefix}.block.2"), 1, padding_mode)?,
             gn3: GroupNorm::from_weights(w, &format!("{prefix}.block.3"))?,
-            conv5: Conv2d::from_weights(w, &format!("{prefix}.block.5"), 1)?,
+            conv5: Conv2d::from_weights(w, &format!("{prefix}.block.5"), 1, padding_mode)?,
         })
     }
 
@@ -108,12 +133,17 @@ struct ConvStack {
 }
 
 impl ConvStack {
-    fn from_weights(w: &Weights, prefix: &str, num_res_blocks: i32) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        num_res_blocks: i32,
+        padding_mode: ConvPadding,
+    ) -> Result<Self> {
         Ok(Self {
-            conv0: Conv2d::from_weights(w, &format!("{prefix}.0"), 1)?,
-            conv2: Conv2d::from_weights(w, &format!("{prefix}.2"), 1)?,
+            conv0: Conv2d::from_weights(w, &format!("{prefix}.0"), 1, padding_mode)?,
+            conv2: Conv2d::from_weights(w, &format!("{prefix}.2"), 1, padding_mode)?,
             res: (0..num_res_blocks)
-                .map(|i| ResBlock::from_weights(w, &format!("{prefix}.{}", i + 3)))
+                .map(|i| ResBlock::from_weights(w, &format!("{prefix}.{}", i + 3), padding_mode))
                 .collect::<Result<_>>()?,
         })
     }
@@ -127,7 +157,13 @@ impl ConvStack {
     }
 }
 
-/// `SigmaAwareGatePerTokenPerDim`: `out = x + sigmoid(content_proj([x;lq]) − exp(log_alpha)·σ)·lq`.
+/// Sigma-aware LQ gate: `out = x + sigmoid(content_proj([x;lq]) − exp(log_alpha)·σ)·lq`.
+///
+/// One implementation covers both released variants — the difference is purely the loaded
+/// `content_proj` output width, which broadcasts against `lq`:
+/// - v1 `SigmaAwarePerTokenAndDim`: `content_proj` is `[D, 2·D]` → gate `[B,N,D]` (per-channel);
+/// - v1.5 `SigmaAwarePerToken`: `content_proj` is `[1, 2·D]` → gate `[B,N,1]` (per-token scalar),
+///   broadcast-multiplied across the `D` channels of `lq`.
 struct SigmaGate {
     content_proj: AdaptableLinear,
     log_alpha: Array,
@@ -158,6 +194,9 @@ impl SigmaGate {
 pub struct LqAdapter {
     latent_proj: ConvStack,
     output_heads: Vec<AdaptableLinear>,
+    /// PiD v1.5 only (`lq_proj.pit_head`): a dedicated head that projects the shared LQ tokens for the
+    /// PiT pixel-stream injection. `None` for the base students.
+    pit_head: Option<AdaptableLinear>,
     gates: Vec<SigmaGate>,
     interval: i32,
     upsample_ratio: i32,
@@ -172,10 +211,15 @@ impl LqAdapter {
                 w,
                 &format!("{prefix}.latent_proj"),
                 cfg.lq_num_res_blocks,
+                cfg.lq_conv_padding,
             )?,
             output_heads: (0..num_outputs)
                 .map(|i| lin(w, &format!("{prefix}.output_heads.{i}")))
                 .collect::<Result<_>>()?,
+            pit_head: cfg
+                .pit_lq_inject
+                .then(|| lin(w, &format!("{prefix}.pit_head")))
+                .transpose()?,
             gates: (0..num_outputs)
                 .map(|i| SigmaGate::from_weights(w, &format!("{prefix}.gate_modules.{i}")))
                 .collect::<Result<_>>()?,
@@ -184,9 +228,14 @@ impl LqAdapter {
         })
     }
 
-    /// Project an LQ latent `[B, z_dim, zH, zW]` to `num_outputs` token feature sets `[B, N, out_dim]`
-    /// (`N = pH·pW`).
-    pub fn forward(&self, lq_latent: &Array, p_h: i32, p_w: i32) -> Result<Vec<Array>> {
+    /// Project an LQ latent `[B, z_dim, zH, zW]` to `num_outputs` per-patch-block token feature sets
+    /// `[B, N, out_dim]` (`N = pH·pW`), plus (v1.5) the single PiT-stream feature from `pit_head`.
+    pub fn forward(
+        &self,
+        lq_latent: &Array,
+        p_h: i32,
+        p_w: i32,
+    ) -> Result<(Vec<Array>, Option<Array>)> {
         let b = lq_latent.shape()[0];
         let mut x = lq_latent.transpose_axes(&[0, 2, 3, 1])?; // NCHW -> NHWC
         if self.upsample_ratio > 1 {
@@ -195,10 +244,17 @@ impl LqAdapter {
         let x = self.latent_proj.forward(&x)?; // [B, pH, pW, hidden]
         let hidden = x.shape()[3];
         let tokens = x.reshape(&[b, p_h * p_w, hidden])?;
-        self.output_heads
+        let feats = self
+            .output_heads
             .iter()
             .map(|h| h.forward(&tokens))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let pit = self
+            .pit_head
+            .as_ref()
+            .map(|h| h.forward(&tokens))
+            .transpose()?;
+        Ok((feats, pit))
     }
 
     /// Whether the gate fires at this patch-block index (`interval>1` → every `interval`-th block).
@@ -225,6 +281,9 @@ impl LqAdapter {
 pub struct PidNet {
     backbone: PixDiT,
     lq: LqAdapter,
+    /// PiD v1.5 only (top-level `pit_lq_gate`): the sigma gate applied to the pixel-stream conditioning
+    /// (`silu(t_emb + s_main)`) before the PiT blocks, fed by [`LqAdapter::pit_head`]. `None` for base.
+    pit_lq_gate: Option<SigmaGate>,
     patch_size: i32,
     lq_latent_channels: i32,
 }
@@ -235,6 +294,10 @@ impl PidNet {
         Ok(Self {
             backbone: PixDiT::from_weights(w, prefix, cfg)?,
             lq: LqAdapter::from_weights(w, &format!("{prefix}lq_proj"), cfg)?,
+            pit_lq_gate: cfg
+                .pit_lq_inject
+                .then(|| SigmaGate::from_weights(w, &format!("{prefix}pit_lq_gate")))
+                .transpose()?,
             patch_size: cfg.patch_size,
             lq_latent_channels: cfg.lq_latent_channels,
         })
@@ -258,11 +321,13 @@ impl PidNet {
     ) -> Result<Array> {
         let sh = x.shape();
         let (p_h, p_w) = (sh[2] / self.patch_size, sh[3] / self.patch_size);
-        let feats = self.lq.forward(lq_latent, p_h, p_w)?;
+        let (feats, pit_feat) = self.lq.forward(lq_latent, p_h, p_w)?;
         let inj = LqInjection {
             lq: &self.lq,
             feats,
             sigma: sigma.clone(),
+            pit_gate: self.pit_lq_gate.as_ref(),
+            pit_feat,
         };
         self.backbone.forward_with(x, t, y, &inj)
     }
@@ -273,11 +338,15 @@ impl PidNet {
     }
 }
 
-/// Binds the LQ adapter + this generation's precomputed features + sigma into the patch-block hook.
+/// Binds the LQ adapter + this generation's precomputed features + sigma into the backbone's injection
+/// hooks: the per-patch-block gate (`inject`) and (v1.5) the PiT pixel-stream gate (`inject_pit`).
 struct LqInjection<'a> {
     lq: &'a LqAdapter,
     feats: Vec<Array>,
     sigma: Array,
+    /// PiD v1.5 only: the top-level `pit_lq_gate` + its precomputed feature. `None`/`None` for base.
+    pit_gate: Option<&'a SigmaGate>,
+    pit_feat: Option<Array>,
 }
 
 impl PatchInjector for LqInjection<'_> {
@@ -291,5 +360,15 @@ impl PatchInjector for LqInjection<'_> {
             }
         }
         Ok(s_main.clone())
+    }
+
+    /// PiD v1.5: gate the pixel-stream conditioning `s = silu(t_emb + s_main)` with `pit_lq_gate` before
+    /// the PiT blocks (ref `pid_net.py`: `s_cond_tokens = pit_lq_gate(s, pit_lq_feature, σ)`). No-op for
+    /// the base students (no `pit_gate`/`pit_feat`).
+    fn inject_pit(&self, s: &Array) -> Result<Array> {
+        match (self.pit_gate, &self.pit_feat) {
+            (Some(gate), Some(feat)) => gate.forward(s, feat, &self.sigma),
+            _ => Ok(s.clone()),
+        }
     }
 }

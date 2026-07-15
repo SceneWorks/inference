@@ -11,7 +11,7 @@
 
 use mlx_gen::weights::Weights;
 use mlx_gen_pid::backbone::{image_rope_table, sincos_2d_pos, text_rope_table};
-use mlx_gen_pid::{PidConfig, PixDiT, RopeMode};
+use mlx_gen_pid::{ConvPadding, PidConfig, PixDiT, RopeMode};
 use mlx_rs::ops::{abs, max, split, subtract};
 use mlx_rs::Array;
 
@@ -48,6 +48,8 @@ fn tiny_cfg() -> PidConfig {
         lq_hidden_dim: 512,
         lq_num_res_blocks: 4,
         lq_interval: 2,
+        lq_conv_padding: ConvPadding::Zeros,
+        pit_lq_inject: false,
         sr_scale: 4,
         latent_spatial_down_factor: 8,
     }
