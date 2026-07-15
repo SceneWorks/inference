@@ -1,5 +1,5 @@
 //! Mochi 1 **MLX pre-quantized tier** resolver (sc-11990, A6 candle-ingest) — the split-file / shared-
-//! component layer that lets the packed-detect seam ([`crate::transformer`]'s [`QLinear::linear_detect`]
+//! component layer that lets the packed-detect seam ([`crate::transformer`]'s `QLinear::linear_detect`
 //! (candle_gen::quant::QLinear::linear_detect) calls) fire on the REAL `SceneWorks/mochi-1-mlx` q4/q8/bf16
 //! tier weights, with **no dense staging** and **no key remap**.
 //!
@@ -21,7 +21,7 @@
 //! The converter keeps the transformer in the **raw HF-diffusers naming** (no renames, no conv
 //! transpose on disk), which is **exactly** the spelling [`crate::transformer`] already reads
 //! (`transformer_blocks.N.attn1.to_q.weight`, `…ff.net.0.proj.weight`, …). So the `.scales`/`.biases`
-//! siblings land at the keys the crate asks for and the packed-detect fires directly — no [`Rename`]
+//! siblings land at the keys the crate asks for and the packed-detect fires directly — no `Rename`
 //! backend is needed (the LTX tier remapped `to_out.0`→`to_out`, `net.0.proj`→`proj_in`, etc.; the
 //! Mochi tier does not).
 //!

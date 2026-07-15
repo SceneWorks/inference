@@ -107,7 +107,7 @@ fn tanh_gate_seq(gate: &Tensor) -> Result<Tensor> {
 /// SwiGLU feed-forward (`FeedForward(activation="swiglu", bias=False)`): `proj` (`d → 2·ff_inner`),
 /// split into `(value, gate)`, `value · silu(gate)`, then `out` (`ff_inner → d`). Both projections are
 /// [`MOCHI_QUANT_SUFFIXES`](../../mlx-gen/mlx-gen-mochi/src/convert.rs) targets, so each **packed-detects**
-/// on its `.scales` sibling (a pre-quantized q4/q8 tier) via [`QLinear::linear_detect`], else stays dense.
+/// on its `.scales` sibling (a pre-quantized q4/q8 tier) via `QLinear::linear_detect`, else stays dense.
 struct SwiGlu {
     proj: QLinear, // [2·ff_inner, d]
     out: QLinear,  // [d, ff_inner]
@@ -136,9 +136,9 @@ impl SwiGlu {
 // ---------------------------------------------------------------------------- attention
 
 /// Mochi joint attention (`MochiAttention` + `MochiAttnProcessor2_0`). The `to_q/k/v`, added
-/// `add_{q,k,v}_proj`, `to_out.0`, and `to_add_out` projections are [`MOCHI_QUANT_SUFFIXES`] targets, so
+/// `add_{q,k,v}_proj`, `to_out.0`, and `to_add_out` projections are `MOCHI_QUANT_SUFFIXES` targets, so
 /// each **packed-detects** on its `.scales` sibling (a pre-quantized q4/q8 tier) via
-/// [`QLinear::linear_detect`], else loads dense unchanged. The per-head `qk_norm` weights stay dense.
+/// `QLinear::linear_detect`, else loads dense unchanged. The per-head `qk_norm` weights stay dense.
 pub struct MochiAttention {
     to_q: QLinear,
     to_k: QLinear,
