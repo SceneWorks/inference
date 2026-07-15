@@ -207,3 +207,46 @@ fn q4_tier_transformer_residual() {
 fn q8_tier_transformer_residual() {
     tier_transformer_residual(8);
 }
+
+// -------------------------------------------------------------- full tier load (#[ignore]d, heavy)
+
+/// End-to-end load of a built `q4` tier through the public [`mlx_gen_mochi::load`] seam: exercises the
+/// `split_model.json` manifest read, the `spec.quantize` assert-against-manifest, the packed-DiT
+/// consume path, AND the shared T5/VAE resolution from the tier dir's parent. Heavy (materializes the
+/// shared fp32 T5-XXL); `#[ignore]`d.
+#[test]
+#[ignore = "loads the whole q4 tier (packed DiT + shared T5/VAE) — needs a built tier tree"]
+fn q4_tier_loads_end_to_end() {
+    let dir = tier_dir(4);
+    if !dir.join("transformer").is_dir() {
+        eprintln!("skip: no built q4 tier at {} (MOCHI_Q4_DIR)", dir.display());
+        return;
+    }
+    // `.with_quant(Q4)` also validates the assert-against-manifest matches the tier's bits.
+    let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(dir.clone()))
+        .with_quant(mlx_gen::Quant::Q4);
+    let _model = mlx_gen_mochi::load(&spec)
+        .unwrap_or_else(|e| panic!("load q4 tier {} failed: {e}", dir.display()));
+    eprintln!(
+        "OK: q4 tier loaded end-to-end (packed DiT + shared T5/VAE) from {}",
+        dir.display()
+    );
+}
+
+/// The `spec.quantize` assertion is checked before any heavy load, so a bits mismatch errors fast:
+/// asking for Q8 against the `q4` tier must be a hard error (never a silent wrong-tier run).
+#[test]
+#[ignore = "needs a built q4 tier dir (MOCHI_Q4_DIR)"]
+fn tier_quant_bits_mismatch_errors() {
+    let dir = tier_dir(4);
+    if !dir.join("split_model.json").is_file() {
+        eprintln!("skip: no built q4 tier at {} (MOCHI_Q4_DIR)", dir.display());
+        return;
+    }
+    let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(dir.clone()))
+        .with_quant(mlx_gen::Quant::Q8);
+    assert!(
+        mlx_gen_mochi::load(&spec).is_err(),
+        "Q8 against the q4 tier must error (assert-against-manifest)"
+    );
+}
