@@ -44,10 +44,12 @@
 use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::candle_nn::ops::{silu, softmax_last_dim};
 use candle_gen::candle_nn::{Conv2d, Linear, Module};
+use candle_gen::quant::{ActPrecision, Nvfp4Linear};
 use candle_gen::Weights;
 
 use crate::config::SanaTransformerConfig;
 use crate::dc_ae::{conv, glu_mbconv_core, relu_linear_attention};
+use crate::nvfp4_dit::{report_over, DitPlan, Nvfp4Report, Proj, SanaProj};
 
 // ----------------------------------------------------------------------------------------------
 // Shared scalar / norm primitives (f32).
@@ -65,6 +67,47 @@ fn linear(w: &Weights, prefix: &str, bias: bool) -> candle_gen::Result<Linear> {
         None
     };
     Ok(Linear::new(weight, b))
+}
+
+/// Load one trunk **projection** under a [`DitPlan`] (sc-11045): dense f32 [`Linear`] by default, or an
+/// [`Nvfp4Linear`] serving the same weight packed NVFP4 when the plan asks for it.
+///
+/// `is_edge_block` marks SANA's first/last transformer block, whose projections the spike sc-11038
+/// policy keeps on bf16 activation (the shared substring policy can name `blocks.0.` but not SANA's
+/// last block — see [`DitPlan`]).
+///
+/// The NVFP4 arm never fails on an ineligible device or shape: [`Nvfp4Linear`] resolves the capability
+/// gate itself and transparently serves dequant→bf16 (sc-11041), so this loader is safe to call on any
+/// backend.
+fn proj(
+    w: &Weights,
+    prefix: &str,
+    bias: bool,
+    plan: &DitPlan,
+    is_edge_block: bool,
+) -> candle_gen::Result<Proj> {
+    let dense = linear(w, prefix, bias)?;
+    if !plan.is_nvfp4() {
+        // Dense f32 — the byte-unchanged baseline path.
+        return Ok(Proj::new(
+            SanaProj::Dense(dense),
+            prefix,
+            plan,
+            ActPrecision::W4A16,
+        ));
+    }
+    let act = plan.act_for(prefix, is_edge_block);
+    let weight = w
+        .require(&format!("{prefix}.weight"))?
+        .to_dtype(DType::F32)?;
+    let b = if bias {
+        Some(w.require(&format!("{prefix}.bias"))?.to_dtype(DType::F32)?)
+    } else {
+        None
+    };
+    let device = weight.device().clone();
+    let lin = Nvfp4Linear::from_dense(&weight, b, &device, act)?;
+    Ok(Proj::new(SanaProj::Nvfp4(Box::new(lin)), prefix, plan, act))
 }
 
 /// Affine-free LayerNorm over the last axis, f32 (diffusers `norm1`/`norm2`/`norm_out` are all
@@ -124,10 +167,10 @@ fn timestep_sincos(
 
 /// `SanaLinearAttnProcessor2_0`: ReLU linear attention over the token axis. Input/output `[B, N, C]`.
 struct LinearSelfAttn {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: Proj,
+    to_k: Proj,
+    to_v: Proj,
+    to_out: Proj,
     /// Sprint `qk_norm = "rms_norm_across_heads"`: RMSNorm over the full projected query / key (the
     /// whole `inner_dim`), applied BEFORE the head split and the ReLU. `None` for base SANA.
     norm_q: Option<Tensor>,
@@ -138,7 +181,13 @@ struct LinearSelfAttn {
 }
 
 impl LinearSelfAttn {
-    fn load(w: &Weights, prefix: &str, cfg: &SanaTransformerConfig) -> candle_gen::Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        cfg: &SanaTransformerConfig,
+        plan: &DitPlan,
+        edge: bool,
+    ) -> candle_gen::Result<Self> {
         let (norm_q, norm_k) = if cfg.qk_norm {
             (
                 Some(
@@ -155,10 +204,10 @@ impl LinearSelfAttn {
         };
         Ok(Self {
             // attention_bias=false → q/k/v bias-free; to_out.0 carries a bias.
-            to_q: linear(w, &format!("{prefix}.to_q"), false)?,
-            to_k: linear(w, &format!("{prefix}.to_k"), false)?,
-            to_v: linear(w, &format!("{prefix}.to_v"), false)?,
-            to_out: linear(w, &format!("{prefix}.to_out.0"), true)?,
+            to_q: proj(w, &format!("{prefix}.to_q"), false, plan, edge)?,
+            to_k: proj(w, &format!("{prefix}.to_k"), false, plan, edge)?,
+            to_v: proj(w, &format!("{prefix}.to_v"), false, plan, edge)?,
+            to_out: proj(w, &format!("{prefix}.to_out.0"), true, plan, edge)?,
             norm_q,
             norm_k,
             heads: cfg.num_attention_heads as usize,
@@ -220,10 +269,10 @@ impl LinearSelfAttn {
 // ----------------------------------------------------------------------------------------------
 
 struct CrossAttn {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: Proj,
+    to_k: Proj,
+    to_v: Proj,
+    to_out: Proj,
     norm_q: Option<Tensor>,
     norm_k: Option<Tensor>,
     heads: usize,
@@ -231,7 +280,13 @@ struct CrossAttn {
 }
 
 impl CrossAttn {
-    fn load(w: &Weights, prefix: &str, cfg: &SanaTransformerConfig) -> candle_gen::Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        cfg: &SanaTransformerConfig,
+        plan: &DitPlan,
+        edge: bool,
+    ) -> candle_gen::Result<Self> {
         let (norm_q, norm_k) = if cfg.qk_norm {
             (
                 Some(
@@ -247,10 +302,10 @@ impl CrossAttn {
             (None, None)
         };
         Ok(Self {
-            to_q: linear(w, &format!("{prefix}.to_q"), true)?,
-            to_k: linear(w, &format!("{prefix}.to_k"), true)?,
-            to_v: linear(w, &format!("{prefix}.to_v"), true)?,
-            to_out: linear(w, &format!("{prefix}.to_out.0"), true)?,
+            to_q: proj(w, &format!("{prefix}.to_q"), true, plan, edge)?,
+            to_k: proj(w, &format!("{prefix}.to_k"), true, plan, edge)?,
+            to_v: proj(w, &format!("{prefix}.to_v"), true, plan, edge)?,
+            to_out: proj(w, &format!("{prefix}.to_out.0"), true, plan, edge)?,
             norm_q,
             norm_k,
             heads: cfg.num_cross_attention_heads as usize,
@@ -348,13 +403,21 @@ struct SanaBlock {
 }
 
 impl SanaBlock {
-    fn load(w: &Weights, prefix: &str, cfg: &SanaTransformerConfig) -> candle_gen::Result<Self> {
+    /// `edge` marks the first/last block, whose projections the sc-11038 mixed policy keeps on bf16
+    /// activation (W4A16) under [`crate::nvfp4_dit::Nvfp4Quant::Mixed`].
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        cfg: &SanaTransformerConfig,
+        plan: &DitPlan,
+        edge: bool,
+    ) -> candle_gen::Result<Self> {
         Ok(Self {
             scale_shift_table: w
                 .require(&format!("{prefix}.scale_shift_table"))?
                 .to_dtype(DType::F32)?,
-            attn1: LinearSelfAttn::load(w, &format!("{prefix}.attn1"), cfg)?,
-            attn2: CrossAttn::load(w, &format!("{prefix}.attn2"), cfg)?,
+            attn1: LinearSelfAttn::load(w, &format!("{prefix}.attn1"), cfg, plan, edge)?,
+            attn2: CrossAttn::load(w, &format!("{prefix}.attn2"), cfg, plan, edge)?,
             ff: MixFfn::load(w, &format!("{prefix}.ff"), cfg)?,
             norm_eps: cfg.norm_eps as f64,
         })
@@ -419,24 +482,48 @@ pub struct SanaTransformer {
     /// Sprint: the extra guidance embedder (`SanaCombinedTimestepGuidanceEmbeddings`). `None` for base.
     guidance_embedder: Option<(Linear, Linear)>,
     // caption path
-    caption_proj_1: Linear,
-    caption_proj_2: Linear,
+    caption_proj_1: Proj,
+    caption_proj_2: Proj,
     caption_norm: Tensor, // RMSNorm weight [inner]
     blocks: Vec<SanaBlock>,
     scale_shift_table: Tensor, // [2, inner] (output modulated norm)
-    proj_out: Linear,
+    proj_out: Proj,
 }
 
 impl SanaTransformer {
+    /// Load the trunk with every projection **dense f32** — the original, byte-unchanged path.
     pub fn from_weights(w: &Weights, cfg: SanaTransformerConfig) -> candle_gen::Result<Self> {
+        Self::from_weights_planned(w, cfg, &DitPlan::dense())
+    }
+
+    /// Load the trunk under a [`DitPlan`] (sc-11045) — dense f32, or with the q/k/v/out,
+    /// `caption_projection` and `proj_out` projections served through the NVFP4 packed-forward path.
+    ///
+    /// `DitPlan::dense()` is exactly [`Self::from_weights`]. An NVFP4 plan on a non-`sm_120` device (or
+    /// a non-cuda build) still loads and runs — each [`Nvfp4Linear`] falls back to dequant→bf16 on its
+    /// own — so this entry point is backend-safe; [`Self::nvfp4_report`] reports whether the FP4 cores
+    /// were actually lit.
+    pub fn from_weights_planned(
+        w: &Weights,
+        cfg: SanaTransformerConfig,
+        plan: &DitPlan,
+    ) -> candle_gen::Result<Self> {
         let p = cfg.patch_size as usize;
         let patch_embed = conv(w, "patch_embed.proj", p, 0, 1, true)?;
         let mut blocks = Vec::with_capacity(cfg.num_layers as usize);
+        let last = cfg.num_layers - 1;
         for i in 0..cfg.num_layers {
+            // The spike sc-11038 outlier class includes the FIRST and LAST DiT blocks. sc-11045's real
+            // activation capture showed block **1**'s self-attention also measures Dense-outlier on a
+            // live Sana-1.6B denoise (min benign fraction 0.969, crush 176×) — the residual stream is
+            // still outlier-carrying two blocks in — so the leading edge covers blocks 0 AND 1.
+            let edge = i <= 1 || i == last;
             blocks.push(SanaBlock::load(
                 w,
                 &format!("transformer_blocks.{i}"),
                 &cfg,
+                plan,
+                edge,
             )?);
         }
         // The Sprint guidance variant (`SanaCombinedTimestepGuidanceEmbeddings`) drops the `.emb.`
@@ -463,14 +550,40 @@ impl SanaTransformer {
             ts_embedder_2: linear(w, ts2_key, true)?,
             time_linear: linear(w, "time_embed.linear", true)?,
             guidance_embedder,
-            caption_proj_1: linear(w, "caption_projection.linear_1", true)?,
-            caption_proj_2: linear(w, "caption_projection.linear_2", true)?,
+            caption_proj_1: proj(w, "caption_projection.linear_1", true, plan, false)?,
+            caption_proj_2: proj(w, "caption_projection.linear_2", true, plan, false)?,
             caption_norm: w.require("caption_norm.weight")?.to_dtype(DType::F32)?,
             blocks,
             scale_shift_table: w.require("scale_shift_table")?.to_dtype(DType::F32)?,
-            proj_out: linear(w, "proj_out", true)?,
+            proj_out: proj(w, "proj_out", true, plan, false)?,
             cfg,
         })
+    }
+
+    /// Every quantizable projection in the trunk, in a stable order.
+    fn projections(&self) -> impl Iterator<Item = &Proj> {
+        self.blocks
+            .iter()
+            .flat_map(|b| {
+                [
+                    &b.attn1.to_q,
+                    &b.attn1.to_k,
+                    &b.attn1.to_v,
+                    &b.attn1.to_out,
+                    &b.attn2.to_q,
+                    &b.attn2.to_k,
+                    &b.attn2.to_v,
+                    &b.attn2.to_out,
+                ]
+            })
+            .chain([&self.caption_proj_1, &self.caption_proj_2, &self.proj_out])
+    }
+
+    /// Model-level NVFP4 accounting (sc-11045): how many projections are quantized, how many actually
+    /// light the FP4 tensor cores (the SC#4 gate, observed), and the resident NVFP4 vs dense-bf16
+    /// weight footprint (the SC#6 gate). All-zero for a dense trunk.
+    pub fn nvfp4_report(&self) -> Nvfp4Report {
+        report_over(self.projections())
     }
 
     /// Forward one denoise step.
@@ -569,6 +682,7 @@ impl SanaTransformer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nvfp4_dit::{ActProbe, Nvfp4Quant};
     use candle_gen::candle_core::Device;
     use std::collections::HashMap;
 
@@ -768,6 +882,113 @@ mod tests {
             hi - lo > 1e-5,
             "trunk output is constant — graph degenerate: [{lo}, {hi}]"
         );
+    }
+
+    /// NVFP4-eligible small config: `inner = 64` (K % 32 == 0, N % 16 == 0 — the cuBLASLt FP4 shape
+    /// gate), 3 blocks so block 1 is a non-edge block the mixed policy sends to W4A4.
+    fn nvfp4_eligible_cfg() -> SanaTransformerConfig {
+        SanaTransformerConfig {
+            num_attention_heads: 8,
+            attention_head_dim: 8, // inner = 64
+            num_layers: 3,
+            num_cross_attention_heads: 8,
+            cross_attention_head_dim: 8, // cross inner = 64
+            caption_channels: 64,
+            ..small_cfg()
+        }
+    }
+
+    /// **SC#4 Blackwell-only gate, observed at model level (sc-11045).** An `nvfp4` trunk loaded on a
+    /// non-`sm_120` device (here CPU) must still load and forward — every projection transparently
+    /// serving the dequant→bf16 fallback, with **zero** FP4 tensor-core layers lit. This is the
+    /// negative half of the capability gate and runs on the CPU lane (no CUDA required); the positive
+    /// half (`fp4_lit > 0` on real sm_120) is asserted by `tests/nvfp4_sana_dit_gpu.rs`.
+    #[test]
+    fn nvfp4_plan_falls_back_cleanly_off_blackwell() {
+        let dev = Device::Cpu;
+        let cfg = nvfp4_eligible_cfg();
+        let w = synthetic_trunk_weights(&cfg, &dev);
+        let model = SanaTransformer::from_weights_planned(
+            &w,
+            cfg.clone(),
+            &DitPlan::nvfp4(Nvfp4Quant::Mixed),
+        )
+        .expect("an NVFP4 plan must load on a non-Blackwell device");
+
+        let report = model.nvfp4_report();
+        // Every eligible projection is quantized: 3 blocks × 8 + caption_proj_1/2 + proj_out.
+        assert_eq!(report.n_quantized, 3 * 8 + 3);
+        // ...but NONE lights the FP4 cores off sm_120 — the SC#4 gate.
+        assert_eq!(
+            report.fp4_lit, 0,
+            "no FP4 tensor-core layer may be lit on a non-sm_120 device"
+        );
+        assert_eq!(report.dequant_bf16, report.n_quantized);
+        // The weights are still carried at the NVFP4 footprint even in fallback.
+        assert!(
+            report.footprint_ratio() < 0.35,
+            "packed NVFP4 footprint ratio {} should stay ~0.28",
+            report.footprint_ratio()
+        );
+
+        // And it still produces a finite, correctly-shaped, non-degenerate forward.
+        let (h, wd) = (4usize, 4usize);
+        let latent = det(&[1, cfg.in_channels as usize, h, wd], 101, &dev);
+        let caption = det(&[1, 3, cfg.caption_channels as usize], 202, &dev);
+        let timestep = Tensor::from_vec(vec![0.7f32], (1,), &dev).unwrap();
+        let out = model.forward(&latent, &caption, &timestep).unwrap();
+        assert_eq!(out.dims(), &[1, cfg.out_channels as usize, h, wd]);
+        let flat = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            flat.iter().all(|v| v.is_finite()),
+            "non-finite NVFP4-fallback trunk forward"
+        );
+        let (lo, hi) = flat
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        assert!(
+            hi - lo > 1e-5,
+            "NVFP4-fallback trunk output constant: [{lo}, {hi}]"
+        );
+    }
+
+    /// The activation probe records one measurement per quantizable projection per forward, stamped
+    /// with the step the caller set — the mechanism the sc-11045 residual gate reads on a real denoise.
+    #[test]
+    fn nvfp4_act_probe_records_every_projection_per_step() {
+        use std::sync::Arc;
+        let dev = Device::Cpu;
+        let cfg = nvfp4_eligible_cfg();
+        let w = synthetic_trunk_weights(&cfg, &dev);
+        let probe = Arc::new(ActProbe::new());
+        // Probe the DENSE trunk — the unperturbed activations the gate wants.
+        let model = SanaTransformer::from_weights_planned(
+            &w,
+            cfg.clone(),
+            &DitPlan::dense().with_probe(probe.clone()),
+        )
+        .unwrap();
+
+        let latent = det(&[1, cfg.in_channels as usize, 4, 4], 101, &dev);
+        let caption = det(&[1, 3, cfg.caption_channels as usize], 202, &dev);
+        for step in 0..2 {
+            probe.set_step(step);
+            let t = Tensor::from_vec(vec![0.7f32], (1,), &dev).unwrap();
+            model.forward(&latent, &caption, &t).unwrap();
+        }
+        let records = probe.records();
+        let per_step = 3 * 8 + 3;
+        assert_eq!(
+            records.len(),
+            per_step * 2,
+            "one record per projection per step"
+        );
+        assert_eq!(records.iter().filter(|r| r.step == 0).count(), per_step);
+        assert_eq!(records.iter().filter(|r| r.step == 1).count(), per_step);
+        // Summaries aggregate to one row per layer across both steps.
+        let summary = crate::nvfp4_dit::summarize(&records);
+        assert_eq!(summary.len(), per_step);
+        assert!(summary.iter().all(|s| s.steps == 2));
     }
 
     /// **GPU full-trunk forward at SANA-1.6B config and latent resolution** (32×32 latent = 1024px).

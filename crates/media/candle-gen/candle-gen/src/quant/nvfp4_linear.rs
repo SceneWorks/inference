@@ -73,19 +73,39 @@ pub enum ActPrecision {
 }
 
 impl ActPrecision {
-    /// The **default per-layer policy** (spike sc-11038): the outlier-carrying layer class runs
-    /// **W4A16** (bf16 activation), everything else **W4A4**. The outlier class — where a dense
-    /// activation outlier collapses W4A4 — is the text→DiT `caption_projection`, the cross-attention
-    /// K/V projections, and the first & last DiT blocks. Matched by substring on the layer path so a
-    /// provider can thread its own dotted key names; callers wanting a blanket regime pass
-    /// [`ActPrecision::W4A4`] / [`ActPrecision::W4A16`] directly instead of consulting this.
+    /// The **default per-layer policy**: the outlier-carrying layer class runs **W4A16** (bf16
+    /// activation), everything else **W4A4**. Matched by substring on the layer path so a provider can
+    /// thread its own dotted key names; callers wanting a blanket regime pass [`ActPrecision::W4A4`] /
+    /// [`ActPrecision::W4A16`] directly instead of consulting this.
+    ///
+    /// The outlier class — where a dense activation outlier collapses W4A4 (the sc-7702 mechanism) — is
+    /// the text→DiT `caption_projection`, **the whole cross-attention block** (`attn2`), the final
+    /// `proj_out`, and the first & last DiT blocks.
+    ///
+    /// **Widened in sc-11045 from real measurements — read before narrowing it again.** The spike
+    /// (sc-11038) specified "W4A4 on the compute-bulk benign layers (**self-attn** + FF); bf16
+    /// activation on the outlier class", and named that class "cross-attn K/V". This function
+    /// originally took the K/V wording literally, leaving cross-attn **Q** and **`to_out`** on W4A4.
+    /// Capturing per-layer activation-outlier sparsity across a **real Sana-1.6B denoise** (sc-11045's
+    /// `ActProbe`) refuted that reading: of 109 projections the old policy sent to W4A4, **27 measured
+    /// [`OutlierClass::Dense`](super::OutlierClass::Dense)** — 17 × `attn2.to_out.0`, 6 × `attn2.to_q`
+    /// (per-block crush ratios up to **5124×**), plus `proj_out` (438×). The whole cross-attention block
+    /// consumes caption-derived context, so it carries the caption's massive activations regardless of
+    /// which projection you name. Guarding `attn2` wholesale restores the spike's actual intent (W4A4 ==
+    /// self-attn + FF) and is strictly the safe direction: it only ever moves a layer W4A4 → W4A16, and
+    /// W4A16 is already the shipping throughput default (sc-12078).
     pub fn for_outlier_layer(layer_name: &str) -> Self {
         let l = layer_name.to_ascii_lowercase();
         let is_outlier = l.contains("caption_projection")
             || l.contains("caption_proj")
-            // cross-attention K/V (attn2 = cross-attn in the diffusers DiT naming); guard K/V only.
-            || (l.contains("attn2") && (l.contains(".to_k") || l.contains(".to_v")))
-            || (l.contains("cross") && (l.contains("_k") || l.contains("_v") || l.contains(".k") || l.contains(".v")))
+            // The ENTIRE cross-attention block (attn2 = cross-attn in the diffusers DiT naming), not
+            // just K/V — Q and to_out read caption-derived context and measure Dense on real
+            // activations (sc-11045).
+            || l.contains("attn2")
+            || l.contains("cross_attn")
+            || l.contains("crossattn")
+            // The final output projection (measured Dense, crush 438× — sc-11045).
+            || l.contains("proj_out")
             // first & last DiT blocks (blocks.0 / block_0 and an explicit last-block marker).
             || l.contains("blocks.0.")
             || l.contains("block_0.")
@@ -555,6 +575,10 @@ mod tests {
     }
 
     /// The per-layer policy defaults the outlier class to W4A16 and everything else to W4A4.
+    ///
+    /// The cross-attn / `proj_out` cases are pinned from **real measured activations** (sc-11045), not
+    /// the spike's prose: `attn2.to_q`, `attn2.to_out.0` and `proj_out` all measured Dense-outlier on a
+    /// live Sana-1.6B denoise. See [`ActPrecision::for_outlier_layer`].
     #[test]
     fn outlier_policy_classification() {
         for name in [
@@ -562,6 +586,9 @@ mod tests {
             "blocks.0.attn.to_q",
             "transformer_blocks.12.attn2.to_k", // cross-attn K
             "transformer_blocks.7.attn2.to_v",  // cross-attn V
+            "transformer_blocks.7.attn2.to_q",  // cross-attn Q — measured Dense (sc-11045)
+            "blocks.12.attn2.to_out.0",         // cross-attn OUT — measured Dense (sc-11045)
+            "proj_out",                         // final output proj — measured Dense (sc-11045)
             "dit.final_block.proj",
         ] {
             assert_eq!(
@@ -572,8 +599,8 @@ mod tests {
         }
         for name in [
             "transformer_blocks.7.attn1.to_q", // self-attn
+            "transformer_blocks.7.attn1.to_out.0", // self-attn OUTPUT proj stays benign
             "transformer_blocks.7.ff.net.0.proj",
-            "blocks.12.attn2.to_out.0", // cross-attn OUTPUT proj is not K/V → benign
         ] {
             assert_eq!(
                 ActPrecision::for_outlier_layer(name),
@@ -584,36 +611,34 @@ mod tests {
     }
 
     /// The explicit mixed-precision partition (sc-11044 AC 2) over a Sana-1.6B-DiT-style layer list:
-    /// self-attn + FF (the compute bulk) → W4A4; caption_projection, cross-attn K/V, first & last
-    /// blocks → W4A16. The partition is countable and the benign class dominates.
+    /// **self-attn + FF** (the compute bulk) → W4A4; caption_projection, the **whole cross-attention
+    /// block**, `proj_out`, and the first & last blocks → W4A16.
+    ///
+    /// The cross-attn assignments were widened in sc-11045 from real measured activations — see
+    /// [`ActPrecision::for_outlier_layer`].
     #[test]
     fn partition_layers_matches_spike_policy() {
         let layers = [
-            // benign compute bulk (W4A4)
+            // benign compute bulk (W4A4) — self-attn + FF, exactly what the spike specified.
             "transformer_blocks.4.attn1.to_q",
             "transformer_blocks.4.attn1.to_k",
             "transformer_blocks.4.attn1.to_v",
             "transformer_blocks.4.attn1.to_out.0",
             "transformer_blocks.4.ff.net.0.proj",
             "transformer_blocks.4.ff.net.2",
-            "transformer_blocks.4.attn2.to_q",   // cross-attn Q is benign (not K/V)
-            "transformer_blocks.4.attn2.to_out.0", // cross-attn output proj is benign
             // outlier class (W4A16)
             "transformer.caption_projection.linear_1",
+            "transformer_blocks.4.attn2.to_q", // cross-attn Q — Dense on real activations
             "transformer_blocks.4.attn2.to_k", // cross-attn K
             "transformer_blocks.4.attn2.to_v", // cross-attn V
+            "transformer_blocks.4.attn2.to_out.0", // cross-attn OUT — Dense on real activations
             "transformer_blocks.0.attn1.to_q", // first block
             "final_block.proj",                // last block
         ];
         let part = ActPrecision::partition_layers(layers);
-        assert_eq!(part.n_w4a16, 5, "5 outlier-class projections must be W4A16");
-        assert_eq!(part.n_w4a4, 8, "8 benign projections must be W4A4");
-        assert!(
-            part.w4a4_fraction() > 0.6,
-            "the FP4 compute bulk must dominate (got {:.2})",
-            part.w4a4_fraction()
-        );
-        // Spot-check a couple assignments.
+        assert_eq!(part.n_w4a16, 7, "7 outlier-class projections must be W4A16");
+        assert_eq!(part.n_w4a4, 6, "6 benign projections must be W4A4");
+        // Spot-check assignments across both classes.
         let by_name: std::collections::HashMap<_, _> = part
             .assignments
             .iter()
@@ -621,6 +646,11 @@ mod tests {
             .collect();
         assert_eq!(by_name["transformer_blocks.4.attn1.to_q"], ActPrecision::W4A4);
         assert_eq!(by_name["transformer_blocks.4.attn2.to_k"], ActPrecision::W4A16);
+        assert_eq!(by_name["transformer_blocks.4.attn2.to_q"], ActPrecision::W4A16);
+        assert_eq!(
+            by_name["transformer_blocks.4.attn2.to_out.0"],
+            ActPrecision::W4A16
+        );
         assert_eq!(by_name["transformer.caption_projection.linear_1"], ActPrecision::W4A16);
     }
 

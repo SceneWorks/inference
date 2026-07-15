@@ -138,6 +138,102 @@ The default build is **CPU** (`candle-core`'s default) and works on macOS with n
 forwarded crate-to-crate) that wired no fused kernels; it was removed in sc-9032. When the
 `candle-flash-attn` slice is scheduled, reintroduce it behind real gated code, not a bare alias.
 
+## The NVFP4 lane (Blackwell `sm_120` only) — epic 11037
+
+**NVFP4** = 4-bit float **E2M1** elements + an **FP8 (E4M3)** micro-scale per **16-element block** + a
+second-level **FP32 per-tensor** scale ⇒ **~4.5 effective bits/weight**. It is a *compute* lane, not
+just a storage format: the cuBLASLt FP4 GEMM (`CUDA_R_4F_E2M1` operands + `VEC16_UE4M3` block scales)
+runs on the Blackwell FP4 tensor cores. Everything lives in `candle-gen/src/quant/`
+(`nvfp4.rs` packer/container, `cublaslt.rs` GEMM + on-device activation quantizer, `nvfp4_linear.rs`
+the `Nvfp4Linear` layer + policy, `nvfp4_outlier.rs` the sparsity metric).
+
+### Hardware scope: `sm_120` only — `sm_100` is explicitly out of scope
+
+| target | status |
+|---|---|
+| **consumer Blackwell `sm_120`** (RTX PRO 6000 / RTX 50-series) | **the only supported NVFP4 target.** Validated on the 2× RTX PRO 6000 rig (CUDA 12.9, MSVC 14.44). Plain `sm_120` — `sm_120a` is *not* required. |
+| datacenter Blackwell `sm_100` (B100/B200) | **explicitly out of scope for this epic.** Not built, not gated on, not validated. A separate effort. |
+| pre-Blackwell CUDA, CPU, Metal | no FP4 hardware → transparent fallback (below). |
+
+**The gate is capability-probed, not assumed** (`CublasLt::meets_nvfp4_floor`). Below the floor — or on
+CPU, a non-`cuda` build, or an FP4-ineligible shape (padded-K not a multiple of `NVFP4_K_ALIGN`, or
+N % 16 ≠ 0) — `Nvfp4Linear` **transparently serves a dequant→bf16 dense matmul instead and never
+panics**. An NVFP4 model therefore loads and runs everywhere; it just doesn't light the FP4 cores off
+Blackwell. That is SC#4, and it is asserted both at layer level
+(`quant::nvfp4_linear::tests::cpu_selects_dequant_fallback_and_forwards`) and at model level
+(`candle-gen-sana`'s `transformer::tests::nvfp4_plan_falls_back_cleanly_off_blackwell`).
+
+### W4A4 vs W4A16 — two regimes, and which one you actually want today
+
+The FP4 tensor-core MMA needs **both** operands in E2M1. So:
+
+* **W4A4** (FP4 weight × FP4 activation) — the only regime that lights the FP4 cores. The FP4 GEMM
+  core measures **1.35–1.98×** over bf16 on real Sana shapes (sc-11044; SC#1's GEMM-level target).
+* **W4A16** (FP4 weight × bf16 activation) — the weight is dequantized to bf16 and run dense. A
+  **storage tier: no FP4 compute win**. It is the outlier-class override and the capability fallback.
+
+**Current perf reality (read before quoting a multiple).** The W4A4 activation quantizer is **unfused**
+— a chain of candle ops rather than one kernel — and that overhead currently **swamps the FP4 GEMM
+win** end-to-end (sc-11044 measured ~25.8 ms/fwd for W4A4 vs ~0.05 ms for W4A16 at layer level). So:
+
+> **W4A16 is the throughput default; W4A4 ships opt-in** (correctness + the ~4.5-bit footprint are
+> real today). Making W4A4 a net end-to-end win is gated on **[sc-12078](https://app.shortcut.com/trefry/story/12078)**
+> — a fused CUDA activation-quantize kernel. Until that lands, the ~2× is a **GEMM-core** number, not
+> an end-to-end one.
+
+### The mixed-precision policy (why not blanket W4A4)
+
+NVFP4 W4A4 reproduces the sc-7702 collapse: an activation **outlier** sharing a 16-block crushes its
+co-located channels to E2M1 zero. Damage scales with outlier **sparsity** (spike sc-11038: benign 0.991
+cosine → ~2 sparse outliers 0.984 → 8 → 0.966 → dense → 0.000). So the default is **not** blanket W4A4:
+
+* **benign compute-bulk** — **self-attention** (`attn1`) + FF projections → **W4A4**;
+* **outlier class** → **W4A16** (bf16 activation): the text→DiT `caption_projection`, **the whole
+  cross-attention block** (`attn2` — Q and `to_out` as well as K/V), the final `proj_out`, and the
+  **first two & last** DiT blocks.
+
+`ActPrecision::for_outlier_layer` carries this as a substring policy over dotted layer keys;
+`ActPrecision::partition_layers` is its explicit, testable form.
+
+> **The outlier class was WIDENED in sc-11045 by real measurement — do not narrow it back to the
+> spike's prose.** The spike named the class "cross-attn K/V", and the original policy took that
+> literally, leaving cross-attn **Q** and **`to_out`** on W4A4. Capturing per-layer activation-outlier
+> sparsity across a **real Sana-1.6B denoise** (`candle-gen-sana`'s `ActProbe`) refuted that reading: of
+> the 109 projections the old policy sent to W4A4, **27 measured `OutlierClass::Dense`** — 17 ×
+> `attn2.to_out.0`, 6 × `attn2.to_q` (per-block crush ratios up to **5124×**), `proj_out` (438×), and
+> block **1**'s self-attention (176×). The entire cross-attention block reads caption-derived context,
+> so it carries the caption's massive activations regardless of which projection you name. Guarding
+> `attn2` wholesale restores the spike's *actual* intent (W4A4 == self-attn + FF) and is strictly the
+> safe direction — it only moves layers W4A4 → W4A16, and W4A16 is already the throughput default. This
+> is the empirical gate synthetic activations could not close.
+
+### Native packed serving (SC#6)
+
+The point of the format is the footprint, so the serving path **must not** full-dequant to bf16 in
+VRAM. `Nvfp4Linear` in the W4A4 regime stages the packed weight to the device **once** and never
+allocates a dense bf16 copy; resident device bytes == the packed NVFP4 footprint (**0.281×** the bf16
+size, ~4.5 eff bits/wt), proven by contention-immune tensor byte-accounting at layer level (sc-11041)
+and at whole-model level (sc-11045, `SanaTransformer::nvfp4_report`).
+
+### The tier is a distinct `Quant::Nvfp4` — a deliberate creative choice
+
+NVFP4 is surfaced as its **own** `gen_core::Quant::Nvfp4` tier (sc-11042), *not* as a silent Blackwell
+backend for the existing `Quant::Q4`. Its numerics differ from the int4 tier, and per the epic's SC#5 a
+quant tier is a **creative** decision: NVFP4 must never silently replace an existing tier's numerics
+without an explicit, user-visible choice. Selecting it is an act of intent, and it is only honored on
+`sm_120`.
+
+### Driving a real model: the Sana NVFP4 seam
+
+`candle-gen-sana` carries the reference wiring (`nvfp4_dit.rs`): `SanaTransformer::from_weights_planned`
+serves the trunk's q/k/v/out, `caption_projection` and `proj_out` projections through `Nvfp4Linear`
+under a `DitPlan` (mixed policy, or blanket W4A4/W4A16 for a controlled bench), with an optional
+`ActProbe` capturing per-layer activation sparsity across denoise steps. **Note what is not covered:**
+SANA's Mix-FFN is a `GLUMBConv` built from *convolutions*, not linears, so a real slice of the trunk's
+FLOPs sits outside the NVFP4 lane by construction — an honest ceiling on any end-to-end multiple.
+End-to-end validation lives in `candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs` (cuda-gated, `#[ignore]`d,
+real-weight).
+
 ## Packaging (Windows / CUDA) — sc-3676
 
 The goal is **one distributable CUDA worker that runs on every NVIDIA GPU we support, not just the

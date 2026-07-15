@@ -316,7 +316,11 @@ impl SanaPipeline {
 /// `text_encoder/` (fp32 shards) and the gemma **tokenizer** in `tokenizer/tokenizer.json` (the
 /// `Sana_1600M_1024px_diffusers` layout), so we build [`SanaTextEncoder`] directly rather than via
 /// [`SanaTextEncoder::from_snapshot`] (which expects the tokenizer co-located under the weights dir).
-fn load_text_encoder(root: &Path, device: &Device) -> Result<SanaTextEncoder> {
+///
+/// Public so a harness can encode a prompt and **drop the ~10 GB f32 encoder** before materializing the
+/// trunk — the sc-11045 NVFP4 validation builds several trunk variants against one set of conditioning
+/// embeddings and cannot afford to hold the encoder resident alongside them.
+pub fn load_text_encoder(root: &Path, device: &Device) -> Result<SanaTextEncoder> {
     let te_files = resolve_component_files(&root.join("text_encoder"))?;
     let gw = Weights::from_files(&te_files, device, DType::F32)?;
     // The diffusers SANA `text_encoder/` saves the Gemma2Model UN-prefixed (`embed_tokens.weight`,
