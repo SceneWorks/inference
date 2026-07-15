@@ -662,8 +662,9 @@ impl Pipeline {
     /// / [`encode_negative`]), the shared [`sample`](Self::sample) denoise+decode loop; only the load/free
     /// schedule differs.
     ///
-    /// Selected by the generator when [`sequential_offload_enabled`] (`CANDLE_GEN_OFFLOAD=sequential`) or
-    /// `LoadSpec::offload_policy == Sequential` (the worker fit-gate sets it). Because it drops components,
+    /// Selected by the generator when [`candle_gen::sequential_offload_enabled`]
+    /// (`CANDLE_GEN_OFFLOAD=sequential`) or `LoadSpec::offload_policy == Sequential` (the worker fit-gate
+    /// sets it). Because it drops components,
     /// it does NOT populate the generator's `Components` cache — repeat requests reload from the (page-
     /// cached) snapshot; that reload cost is the deliberate trade for the lower peak, which is why it is
     /// opt-in per the fit-gate rather than the default.

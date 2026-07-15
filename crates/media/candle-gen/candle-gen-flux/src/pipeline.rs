@@ -229,17 +229,27 @@ pub(crate) struct SeqHeavy {
 /// win). Mirrors the tier split of [`Components`]; encoding delegates to the SAME shared encode
 /// functions the resident path uses (`encode_text` / [`Pipeline::encode_text_packed`]), so tokenization
 /// and outputs are byte-identical.
+/// Both arms are boxed so the enum isn't dominated by the larger packed arm (clippy
+/// `large_enum_variant`, which fires only under `--features cuda` — `candle_core::Device` carries a CUDA
+/// payload there, inflating both arms past the asymmetry threshold). Same reasoning as [`LoadedVae`]: it
+/// holds exactly one encoder set for a render, so the extra indirection is free.
 pub(crate) enum SeqTextEncoders {
-    Stock {
-        clip: ClipTextTransformer,
-        t5: Mutex<T5EncoderModel>,
-        toks: FluxTokenizers,
-    },
-    Packed {
-        clip: PackedClipText,
-        t5: PackedT5Encoder,
-        toks: FluxTokenizers,
-    },
+    Stock(Box<StockTextEncoders>),
+    Packed(Box<PackedTextEncoders>),
+}
+
+/// The dense-tier arm of [`SeqTextEncoders`].
+pub(crate) struct StockTextEncoders {
+    clip: ClipTextTransformer,
+    t5: Mutex<T5EncoderModel>,
+    toks: FluxTokenizers,
+}
+
+/// The packed (q4/q8) arm of [`SeqTextEncoders`].
+pub(crate) struct PackedTextEncoders {
+    clip: PackedClipText,
+    t5: PackedT5Encoder,
+    toks: FluxTokenizers,
 }
 
 impl Pipeline {
@@ -841,19 +851,19 @@ impl Pipeline {
             let clip = PackedClipText::new(&ClipConfig::flux(), clip_vb.pp("text_model"))?;
             let t5_vb = self.component_vb("text_encoder_2")?;
             let t5 = PackedT5Encoder::new(&PackedT5Config::xxl(), t5_vb)?;
-            Ok(SeqTextEncoders::Packed {
+            Ok(SeqTextEncoders::Packed(Box::new(PackedTextEncoders {
                 clip,
                 t5,
                 toks: FluxTokenizers::load(&self.root)?,
-            })
+            })))
         } else {
             let (clip, t5) =
                 crate::flux1_load::text_encoders(&self.root, self.dtype, &self.device, "flux")?;
-            Ok(SeqTextEncoders::Stock {
+            Ok(SeqTextEncoders::Stock(Box::new(StockTextEncoders {
                 clip,
                 t5: Mutex::new(t5),
                 toks: FluxTokenizers::load(&self.root)?,
-            })
+            })))
         }
     }
 
@@ -862,17 +872,17 @@ impl Pipeline {
     /// tokenization + conditioning tensors are byte-identical to [`render`](Self::render).
     fn encode_seq(&self, tes: &SeqTextEncoders, prompt: &str) -> Result<(Tensor, Tensor)> {
         match tes {
-            SeqTextEncoders::Stock { clip, t5, toks } => encode_text(
+            SeqTextEncoders::Stock(te) => encode_text(
                 self.variant,
-                toks,
+                &te.toks,
                 &self.device,
                 self.dtype,
-                clip,
-                t5,
+                &te.clip,
+                &te.t5,
                 prompt,
             ),
-            SeqTextEncoders::Packed { clip, t5, toks } => {
-                self.encode_text_packed(clip, t5, toks, prompt)
+            SeqTextEncoders::Packed(te) => {
+                self.encode_text_packed(&te.clip, &te.t5, &te.toks, prompt)
             }
         }
     }
