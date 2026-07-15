@@ -17,6 +17,29 @@ fn temp_model_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// A throwaway **synthetic q4 tier dir** (no weights) — `<root>/q4/` with `transformer/` +
+/// `split_model.json` (the tier marker) + `quantize_config.json` (bits 4, group 64), plus a
+/// `<root>/text_encoder/` so the shared-root resolves to the parent. Enough for the lazy `load` seam to
+/// detect the tier and run the assert-against-manifest, without any model weights. Returns the tier dir.
+fn synthetic_q4_tier(tag: &str) -> PathBuf {
+    let root =
+        std::env::temp_dir().join(format!("mochi_candle_tier_{}_{}", std::process::id(), tag));
+    let tier = root.join("q4");
+    std::fs::create_dir_all(tier.join("transformer")).unwrap();
+    std::fs::create_dir_all(root.join("text_encoder")).unwrap();
+    std::fs::write(
+        tier.join("split_model.json"),
+        r#"{"quantized": true, "quantization_bits": 4, "quantization_group_size": 64}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tier.join("quantize_config.json"),
+        r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+    )
+    .unwrap();
+    tier
+}
+
 #[test]
 fn mochi_is_registered_as_candle_video() {
     let reg = candle_gen_mochi::provider_registry()
@@ -73,6 +96,48 @@ fn load_rejects_on_the_fly_quant() {
         "on-the-fly quant is not the Mochi tier mechanism — must reject"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A pre-quantized tier dir IS the quant selection: pointing `WeightsSource` at a q4 tier loads with no
+/// `spec.quantize`, and a `spec.quantize` that AGREES with the tier's manifest is honoured (the
+/// assert-against-manifest, A6 sc-11990) — the blanket on-the-fly-requant reject no longer blocks a tier.
+#[test]
+fn load_accepts_tier_dir_and_matching_quant() {
+    let tier = synthetic_q4_tier("match");
+    let reg = candle_gen_mochi::provider_registry().unwrap();
+    // The dir alone (no quant knob) is a valid tier selection.
+    assert!(
+        reg.load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(tier.clone())))
+            .is_ok(),
+        "a q4 tier dir must load with no spec.quantize (the dir is the selection)"
+    );
+    // A matching `spec.quantize` (Q4) agrees with the manifest → accepted.
+    assert!(
+        reg.load(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(tier.clone())).with_quant(Quant::Q4)
+        )
+        .is_ok(),
+        "spec.quantize=Q4 matches the q4 tier manifest → accepted"
+    );
+    std::fs::remove_dir_all(tier.parent().unwrap()).ok();
+}
+
+/// A `spec.quantize` that DISAGREES with the tier's manifest is a hard error (never a silent wrong-tier
+/// run) — Q8 requested against a q4 tier fails the assert-against-manifest.
+#[test]
+fn load_rejects_tier_quant_bits_mismatch() {
+    let tier = synthetic_q4_tier("mismatch");
+    let reg = candle_gen_mochi::provider_registry().unwrap();
+    assert!(
+        reg.load(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(tier.clone())).with_quant(Quant::Q8)
+        )
+        .is_err(),
+        "spec.quantize=Q8 against the q4 tier must error (assert-against-manifest)"
+    );
+    std::fs::remove_dir_all(tier.parent().unwrap()).ok();
 }
 
 /// `load` is lazy (components load on first `generate`), so an incomplete snapshot is caught at
