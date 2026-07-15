@@ -1348,17 +1348,30 @@ mod tests {
     /// caching allocator has no `empty_cache` and `Device::synchronize()` does not reclaim, so a second
     /// in-process run would reuse the first run's pool and read the same peak. For the same reason
     /// `nvidia-smi` resident VRAM will NOT fall within a process; what moves is peak *allocation demand*,
-    /// which is what `PeakSampler` reads and what any gate math must key off.
+    /// which is what the probe reads and what any gate math must key off.
+    ///
+    /// Reports through [`testkit::VramProbe`] (sc-9094) rather than a bare `PeakSampler`: it separates
+    /// load-peak / steady / overall-peak and states each as a delta over a recorded **idle baseline** —
+    /// which is what makes the number trustworthy here. The probe is device-level (`nvidia-smi
+    /// memory.used`; WDDM reports per-process as `[N/A]`), so anything else resident on the sampled GPU
+    /// lands in the measurement. The printed `baseline` is the tell — it must be ~0, else the run shared
+    /// the card and the A/B delta is noise. `overall-peak` is also exactly the quantity the manifest's
+    /// `candle.vramGbByTier` / `sequentialPeakGb` are derived from (sc-9094 / sc-10856), so this harness
+    /// feeds the re-measure directly.
+    ///
+    /// **Multi-GPU:** the compute device is candle's `cuda:0`, but `nvidia-smi -i` takes a PHYSICAL
+    /// ordinal and ignores `CUDA_VISIBLE_DEVICES` — so on a box where you pin the run to a free card with
+    /// `CUDA_VISIBLE_DEVICES=1`, a hardcoded `start(0)` would sample the OTHER (busy) card and silently
+    /// report its residency as this run's peak. [`ab_probe_gpu`] derives the physical ordinal from
+    /// `CUDA_VISIBLE_DEVICES` so the sampled card is always the one being rendered on.
     ///
     /// `KREA_SEQ_RAW=1` measures `krea_2_raw` (full-CFG, two forwards/step) instead of `krea_2_turbo`.
-    /// Ignored by default; needs a real-file (hardlink-staged, not raw-HF-symlink) Krea 2 snapshot in
-    /// `KREA_TURBO_DIR` + a CUDA device.
+    /// Ignored by default; needs a Krea 2 snapshot dir in `KREA_TURBO_DIR` + a CUDA device.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
     fn krea_probed_generate_for_offload_ab() {
-        let dir = std::env::var("KREA_TURBO_DIR")
-            .expect("set KREA_TURBO_DIR to a real-file (hardlink-staged) Krea 2 snapshot");
+        let dir = std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR to a Krea 2 snapshot");
         let out = std::env::var("KREA_OUT").expect("set KREA_OUT to the pixel-dump path");
         let raw = std::env::var("KREA_SEQ_RAW").is_ok();
 
@@ -1367,10 +1380,19 @@ mod tests {
         if spec_mode == "spec-sequential" {
             spec = spec.with_offload_policy(OffloadPolicy::Sequential);
         }
+        // Square edge (default 768, the sc-11101 MLX A/B's resolution so the two backends compare).
+        // Set `KREA_AB_RES=1024` to match the condition the manifest's `candle.vramGbByTier` q4 was
+        // measured at (RTX PRO 6000, 1024²/8-step) — the activation transient scales with pixel count and
+        // is the epic's dominant unknown (sc-11925: it was only ever calibrated at 1024²), so the tier
+        // re-measure must be taken at the SAME resolution as the number it replaces.
+        let res: u32 = std::env::var("KREA_AB_RES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(768);
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
-            width: 768,
-            height: 768,
+            width: res,
+            height: res,
             // Turbo is the 8-step distilled student; Raw is undistilled, so hold it to a short schedule
             // (the A/B measures PEAK, which is step-count-independent — not sample quality).
             steps: Some(8),
@@ -1379,14 +1401,23 @@ mod tests {
             ..Default::default()
         };
 
-        let sampler = candle_gen::testkit::PeakSampler::start(0);
+        // Load and generate are sampled as SEPARATE phases so the report separates the load transient
+        // (weights → device) from the denoise/decode activation spike — the epic's open question is which
+        // dominates, and a single fused peak can't say (sc-11925 notes the transient was only calibrated
+        // at 1024²).
+        let mut probe = candle_gen::testkit::VramProbe::start(ab_probe_gpu());
+        let load_phase = probe.phase();
         let g = if raw {
             load_raw(&spec).expect("load krea_2_raw")
         } else {
             load(&spec).expect("load krea_2_turbo")
         };
+        probe.end_load(load_phase);
+        let gen_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
-        let peak_mib = sampler.stop();
+        probe.end_gen(gen_phase);
+        let report = probe.report();
+
         let img = match output {
             GenerationOutput::Images(mut v) => v.remove(0),
             other => panic!("expected images, got {other:?}"),
@@ -1403,11 +1434,42 @@ mod tests {
         };
         let id = if raw { KREA_2_RAW_ID } else { KREA_2_TURBO_ID };
         eprintln!(
-            "SEQ_AB id={id} mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
+            "SEQ_AB id={id} mode={mode} gpu={} {}x{} steps={:?} | {report} | bytes={} out={out}",
+            ab_probe_gpu(),
+            req.width,
+            req.height,
+            req.steps,
             img.pixels.len(),
-            img.width,
-            img.height
         );
+        // A non-trivial baseline means something else was resident on the sampled card, so the peaks are
+        // that job's residency plus ours and the A/B delta is noise. Fail loudly rather than publishing a
+        // contaminated number into the manifest (this harness feeds `vramGbByTier`).
+        assert!(
+            report.baseline_gb < 1.0,
+            "sampled GPU {} was not idle (baseline {:.1} GB) — the peak is contaminated; \
+             pin the run to a free card with CUDA_VISIBLE_DEVICES",
+            ab_probe_gpu(),
+            report.baseline_gb
+        );
+    }
+
+    /// The PHYSICAL GPU ordinal the VRAM probe should sample, derived from `CUDA_VISIBLE_DEVICES`.
+    ///
+    /// candle renders on `cuda:0`, but `cuda:0` is whatever `CUDA_VISIBLE_DEVICES` maps it to, while
+    /// `nvidia-smi -i` (what the probe shells out to) always takes a physical ordinal and ignores that
+    /// variable. On a multi-GPU box the repo's convention is to pin a real-weights run to a free card
+    /// (`set CUDA_VISIBLE_DEVICES=1`), and a hardcoded `start(0)` would then sample the *other* card —
+    /// reporting a neighbouring job's residency as this run's peak, or reading ~idle while the real
+    /// render peaks unobserved. Deriving the ordinal from the same variable keeps the sampled card and
+    /// the rendered card in agreement by construction.
+    ///
+    /// Takes the FIRST entry (candle's `cuda:0`); unset / unparseable ⇒ 0, the single-GPU default.
+    #[cfg(feature = "cuda")]
+    fn ab_probe_gpu() -> usize {
+        std::env::var("CUDA_VISIBLE_DEVICES")
+            .ok()
+            .and_then(|v| v.split(',').next()?.trim().parse().ok())
+            .unwrap_or(0)
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).
