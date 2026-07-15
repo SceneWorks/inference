@@ -23,8 +23,15 @@ TOOL_NAME = "SceneWorks inference release builder"
 
 
 def run(*args: str, cwd: Path, binary: bool = False) -> bytes | str:
+    # git and cargo emit UTF-8 on every platform; decoding with the locale encoding instead
+    # fails on a non-UTF-8 host such as Windows (cp1252) over non-ASCII package metadata.
     result = subprocess.run(
-        list(args), check=True, cwd=cwd, capture_output=True, text=not binary
+        list(args),
+        check=True,
+        cwd=cwd,
+        capture_output=True,
+        text=not binary,
+        encoding=None if binary else "utf-8",
     )
     return result.stdout
 
