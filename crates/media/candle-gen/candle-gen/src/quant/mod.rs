@@ -288,6 +288,29 @@ impl DenseLinear {
             }
         }
     }
+
+    /// [`Self::forward`] with the weight/bias **upcast to `x`'s dtype per call** — the
+    /// storage-dtype ≠ compute-dtype regime (bf16 weights, f32 activations).
+    ///
+    /// Only the one weight being multiplied is transiently materialized at the compute dtype, so the
+    /// resident footprint stays at the storage dtype's. When the weight already matches `x`'s dtype
+    /// this is **inert**: `Tensor::to_dtype` short-circuits to an `Arc` clone, so the arithmetic is
+    /// byte-identical to [`Self::forward`] and no copy is made.
+    fn forward_upcast(&self, x: &Tensor) -> Result<Tensor> {
+        let dt = x.dtype();
+        match self {
+            Self::Linear(l) => {
+                let w = l.weight().to_dtype(dt)?;
+                let b = l.bias().map(|b| b.to_dtype(dt)).transpose()?;
+                Self::Linear(Linear::new(w, b)).forward(x)
+            }
+            Self::Transposed { weight_t, bias } => {
+                let weight_t = weight_t.to_dtype(dt)?;
+                let bias = bias.as_ref().map(|b| b.to_dtype(dt)).transpose()?;
+                Self::Transposed { weight_t, bias }.forward(x)
+            }
+        }
+    }
 }
 
 /// The stored quantized weight. `QTensor` is not `Clone` and `QMatMul::from_qtensor` consumes it, so
@@ -520,6 +543,24 @@ impl QLinear {
                 }
                 Ok(y)
             }
+        }
+    }
+
+    /// [`Self::forward`] for a **storage-dtype ≠ compute-dtype** site: the weight is upcast to `x`'s
+    /// dtype per call, so bf16-resident weights can be multiplied against f32 activations without
+    /// materializing the whole projection at f32 (only the one weight in flight is transient).
+    ///
+    /// **Inert unless the dtypes actually differ.** `Tensor::to_dtype` short-circuits to an `Arc`
+    /// clone when they match, so any caller whose activations are already at the storage dtype gets
+    /// arithmetic byte-identical to [`Self::forward`], with no extra copy. The `Quantized` arms
+    /// already dequantize to the activation dtype, so they delegate to [`Self::forward`] unchanged.
+    ///
+    /// Used by the Mochi T5 encode (bf16 weights, f32 activations — the regime the `te_parity` golden
+    /// was blessed in, at bf16's footprint); see `candle-gen-mochi::text_encoder`.
+    pub fn forward_upcast(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(l) => l.forward_upcast(x),
+            Self::Quantized { .. } => self.forward(x),
         }
     }
 
@@ -1482,6 +1523,79 @@ mod tests {
             .max_all()?
             .to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "Dense(Linear) must equal plain Linear");
+        Ok(())
+    }
+
+    /// [`QLinear::forward_upcast`] is **byte-identical** to [`QLinear::forward`] when the weight
+    /// already matches the activation dtype — the inertness guarantee every existing call site relies
+    /// on (FLUX / Chroma / SDXL / Lens / SAM3 …). Covers both dense layouts, biased and bias-less.
+    #[test]
+    fn forward_upcast_is_inert_at_matching_dtype() -> Result<()> {
+        let dev = Device::Cpu;
+        let (in_dim, out_dim) = (32, 48);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
+        let b = Tensor::randn(0f32, 1f32, out_dim, &dev)?;
+        let x = Tensor::randn(0f32, 1f32, (2, 5, in_dim), &dev)?;
+
+        let cases = vec![
+            (
+                "Linear+bias",
+                QLinear::Dense(DenseLinear::Linear(Linear::new(w.clone(), Some(b.clone())))),
+            ),
+            (
+                "Linear no-bias",
+                QLinear::Dense(DenseLinear::Linear(Linear::new(w.clone(), None))),
+            ),
+            (
+                "Transposed+bias",
+                QLinear::Dense(DenseLinear::Transposed {
+                    weight_t: w.t()?.contiguous()?,
+                    bias: Some(b.clone()),
+                }),
+            ),
+        ];
+        for (name, ql) in cases {
+            let dev_max = (ql.forward_upcast(&x)?.sub(&ql.forward(&x)?)?)
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert_eq!(dev_max, 0.0, "{name}: forward_upcast must be inert at matching dtype");
+        }
+        Ok(())
+    }
+
+    /// [`QLinear::forward_upcast`] runs f32 activations against **bf16-resident** weights (the Mochi
+    /// T5 regime) — where plain `forward` would fail on the dtype mismatch — and agrees with the
+    /// all-f32 result to bf16's own rounding.
+    #[test]
+    fn forward_upcast_runs_f32_acts_over_bf16_weights() -> Result<()> {
+        let dev = Device::Cpu;
+        let (in_dim, out_dim) = (32, 48);
+        let w32 = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
+        let x = Tensor::randn(0f32, 1f32, (2, 5, in_dim), &dev)?;
+
+        let bf16 = QLinear::Dense(DenseLinear::Linear(Linear::new(
+            w32.to_dtype(DType::BF16)?,
+            None,
+        )));
+        // Plain forward can't mix f32 activations with bf16 weights; upcast can.
+        assert!(bf16.forward(&x).is_err(), "sanity: mismatch must fail");
+        let got = bf16.forward_upcast(&x)?;
+        assert_eq!(got.dtype(), DType::F32, "output follows the activation dtype");
+
+        // Reference: the same bf16-rounded weight, materialized at f32.
+        let ref_lin = QLinear::Dense(DenseLinear::Linear(Linear::new(
+            w32.to_dtype(DType::BF16)?.to_dtype(DType::F32)?,
+            None,
+        )));
+        let dev_max = (got.sub(&ref_lin.forward(&x)?)?)
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(
+            dev_max, 0.0,
+            "bf16-resident + f32-compute must equal the bf16-rounded weight materialized at f32"
+        );
         Ok(())
     }
 
