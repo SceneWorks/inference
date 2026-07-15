@@ -66,6 +66,7 @@ impl MochiT5 {
     ///     either diverges from exact f32 (measured `te_parity` `peak_rel`: 1.444e-1 vs 6.044e-2);
     ///   - all-**f32** is numerically right (the fp32 shards are bf16-trained, so an f32 load carries
     ///     the reference's exact weights) but doubles the resident T5 from ~9.5 GB to ~19 GB.
+    ///
     /// Loading bf16 and upcasting per matmul ([`candle_gen::QLinear::forward_upcast`]) is numerically
     /// identical to the f32 load at bf16's footprint — only the one weight in flight is transient.
     pub fn load_reference_regime(dir: &Path, device: &Device) -> Result<Self> {
