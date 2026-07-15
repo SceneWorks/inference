@@ -14,6 +14,7 @@
 //! edges so each component is parity-gated in isolation against the A1 goldens.
 
 pub mod config;
+pub mod convert;
 pub mod model;
 pub mod pipeline;
 pub mod positions;
@@ -25,6 +26,9 @@ pub mod transformer;
 pub mod vae;
 
 pub use config::{MochiConfig, MochiSplitModel, MochiVaeConfig};
+pub use convert::{
+    convert_and_assemble, stage_shared_components, MochiConvertOpts, MOCHI_QUANT_SUFFIXES,
+};
 pub use model::{descriptor, load, Mochi, MODEL_ID};
 pub use pipeline::{decode_to_frames, denoise, frames_to_images};
 pub use positions::get_positions;

@@ -134,12 +134,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )));
         }
     }
-    let quant = split
-        .quantized
-        .then_some(MochiQuant {
-            bits: split.bits,
-            group: split.group,
-        });
+    let quant = split.quantized.then_some(MochiQuant {
+        bits: split.bits,
+        group: split.group,
+    });
 
     // The T5-XXL text encoder + AsymmVAE are **shared** across tiers (sibling dirs, not duplicated
     // per tier — the A6 layout). Resolve them from the tier dir, falling back to its parent when the
