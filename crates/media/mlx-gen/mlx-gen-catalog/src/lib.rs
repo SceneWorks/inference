@@ -77,9 +77,30 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     mlx_gen_z_image::register_providers(registry)
 }
 
+/// Why this platform refuses [`mlx_gen::Quant::Nvfp4`] — the reason reported by every rejected load.
+///
+/// NVFP4 (epic 11037, sc-11042 **Option A**) is a *distinct* quant tier: E2M1 4-bit elements with
+/// FP8-E4M3 block scales, served by candle-gen's packed FP4 path on consumer Blackwell `sm_120`. MLX
+/// has no FP4 hardware and no FP4 quantizer, so there is nothing here to serve it with.
+pub const NVFP4_UNSUPPORTED_REASON: &str =
+    "NVFP4 is a Blackwell/CUDA-only FP4 tier (E2M1 elements + FP8 block scales) with no MLX \
+     quantizer; MLX would otherwise int4-affine quantize it, which is a different tier's numerics";
+
 /// Build the complete explicit MLX media provider catalog.
+///
+/// The catalog declares NVFP4 unimplemented on this platform, so a [`LoadSpec`](mlx_gen::LoadSpec)
+/// requesting it fails loudly here rather than reaching a provider (epic 11037 SC#5: *a quant tier is
+/// a creative choice* — never silently substituted). This is **defense in depth**: no MLX catalog
+/// surface offers the tier today, so nothing can request it, but the guard is what keeps that true
+/// once a caller can pick tiers. It matters because the coercion would otherwise be *silent* rather
+/// than a crash — every mlx-gen provider quantizes via `quantize(q.bits())`, and `Quant::Nvfp4.bits()`
+/// is `4`, indistinguishable from `Q4` by the time it reaches the quantizer. Rejecting on the `Quant`
+/// itself, at the one boundary every provider's load routes through, is the only place that
+/// information still exists.
 pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
-    register_providers(ProviderRegistryBuilder::new()).build()
+    register_providers(ProviderRegistryBuilder::new())
+        .reject_quant(mlx_gen::Quant::Nvfp4, NVFP4_UNSUPPORTED_REASON)
+        .build()
 }
 
 #[cfg(test)]
@@ -206,5 +227,26 @@ mod tests {
         );
         assert_eq!(image_embedders, ["clip_vit_l14"]);
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
+    }
+
+    /// Defense in depth for epic 11037 SC#5: the MLX platform **rejects** the NVFP4 tier instead of
+    /// silently int4-affine quantizing it (`Quant::Nvfp4.bits() == 4`, so a provider's
+    /// `quantize(q.bits())` could not tell it from `Q4`). Weights-free — the guard fires at the
+    /// catalog boundary, ahead of the provider's loader, so no snapshot is touched.
+    #[test]
+    fn mlx_catalog_rejects_nvfp4_quant_tier() {
+        use super::media::{LoadSpec, Quant, WeightsSource};
+
+        let registry = super::provider_registry().unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        spec.quantize = Some(Quant::Nvfp4);
+
+        let error = registry
+            .load("flux1_dev", &spec)
+            .err()
+            .expect("NVFP4 must not reach an MLX provider")
+            .to_string();
+        assert!(error.contains("Nvfp4"), "{error}");
+        assert!(error.contains(super::NVFP4_UNSUPPORTED_REASON), "{error}");
     }
 }

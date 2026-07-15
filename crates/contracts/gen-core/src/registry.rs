@@ -5,7 +5,7 @@
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
-use crate::runtime::{LoadSpec, WeightsSource};
+use crate::runtime::{LoadSpec, Quant, WeightsSource};
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
 use crate::transform::{Transform, TransformDescriptor};
@@ -164,6 +164,7 @@ pub struct ProviderRegistryBuilder {
     captioners: Vec<CaptionerRegistration>,
     image_embedders: Vec<ImageEmbedderRegistration>,
     text_embedders: Vec<TextEmbedderRegistration>,
+    rejected_quants: Vec<(Quant, &'static str)>,
 }
 
 macro_rules! builder_registration_method {
@@ -196,6 +197,25 @@ impl ProviderRegistryBuilder {
         TextEmbedderRegistration
     );
 
+    /// Declare that this platform's backend has **no implementation** of quant tier `quant`, so every
+    /// `load*` through the built registry rejects a [`LoadSpec`] requesting it with `reason`.
+    ///
+    /// A defense-in-depth guard for the rule that **a quant tier is a creative choice** (epic 11037
+    /// SC#5): a tier a backend cannot actually serve must fail loudly at the composition boundary, and
+    /// must never be quietly coerced into whatever the backend *can* do. That coercion is a live hazard
+    /// wherever the tier's element width collides with a tier the backend does implement — e.g.
+    /// [`Quant::Nvfp4`](crate::runtime::Quant::Nvfp4) reports 4 bits, so a backend that keys its
+    /// quantizer off [`Quant::bits`](crate::runtime::Quant::bits) alone would silently int4-affine
+    /// quantize an NVFP4 request and hand back different numerics under the tier the caller picked.
+    ///
+    /// This is a *platform capability* statement, not a tensor concern: the mechanism stays
+    /// backend-neutral and each catalog names the tiers its own backend leaves unimplemented (the MLX
+    /// catalog rejects `Nvfp4`; the CUDA candle catalog, which implements it, does not).
+    pub fn reject_quant(mut self, quant: Quant, reason: &'static str) -> Self {
+        self.rejected_quants.push((quant, reason));
+        self
+    }
+
     /// Validate per-kind id uniqueness and produce the immutable registry.
     pub fn build(self) -> Result<ProviderRegistry> {
         macro_rules! ensure_unique {
@@ -226,6 +246,7 @@ impl ProviderRegistryBuilder {
             captioners: self.captioners.into_boxed_slice(),
             image_embedders: self.image_embedders.into_boxed_slice(),
             text_embedders: self.text_embedders.into_boxed_slice(),
+            rejected_quants: self.rejected_quants.into_boxed_slice(),
         })
     }
 }
@@ -238,6 +259,7 @@ pub struct ProviderRegistry {
     captioners: Box<[CaptionerRegistration]>,
     image_embedders: Box<[ImageEmbedderRegistration]>,
     text_embedders: Box<[TextEmbedderRegistration]>,
+    rejected_quants: Box<[(Quant, &'static str)]>,
 }
 
 macro_rules! explicit_registry_kind {
@@ -259,12 +281,34 @@ macro_rules! explicit_registry_kind {
                         id = id
                     ))
                 })?;
+            self.ensure_quant_supported(id, spec)?;
             (registration.load)(spec)
         }
     };
 }
 
 impl ProviderRegistry {
+    /// Reject a [`LoadSpec`] whose requested quant tier this platform's backend does not implement,
+    /// as declared by [`ProviderRegistryBuilder::reject_quant`].
+    ///
+    /// The single boundary every registry-routed load of every provider kind passes through, so one
+    /// check covers the whole catalog — the composition root states the platform's tier support once
+    /// instead of each provider re-deriving it. Runs *after* id resolution so an unknown id still
+    /// reports as an unknown id.
+    fn ensure_quant_supported(&self, id: &str, spec: &LoadSpec) -> Result<()> {
+        let Some(quant) = spec.quantize else {
+            return Ok(());
+        };
+        match self.rejected_quants.iter().find(|(q, _)| *q == quant) {
+            Some((_, reason)) => Err(Error::Msg(format!(
+                "quant tier {quant:?} is not implemented by this runtime's backend \
+                 (requested for '{id}'): {reason}. Refusing to load rather than silently \
+                 serving a different tier's numerics."
+            ))),
+            None => Ok(()),
+        }
+    }
+
     explicit_registry_kind!(
         generators,
         load,
@@ -981,6 +1025,96 @@ mod tests {
             "dummy_test_model"
         );
         assert!(registry.trainers().next().is_none());
+    }
+
+    /// A tier the platform declared unimplemented is rejected at the load boundary — loudly, naming
+    /// the tier, the id, and the platform's reason (epic 11037 SC#5: a quant tier is a creative
+    /// choice, never silently substituted). `dummy_load` would otherwise *succeed*, so this pins that
+    /// the guard fires ahead of the provider rather than leaving the coercion to the backend.
+    #[test]
+    fn rejected_quant_tier_fails_loudly_at_load() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: dummy_descriptor,
+                load: dummy_load,
+                footprint: None,
+            })
+            .reject_quant(Quant::Nvfp4, "no FP4 quantizer on this backend")
+            .build()
+            .unwrap();
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        spec.quantize = Some(Quant::Nvfp4);
+        let error = registry
+            .load("dummy_test_model", &spec)
+            .err()
+            .expect("a rejected tier must not reach the provider");
+        let error = error.to_string();
+        assert!(error.contains("Nvfp4"), "{error}");
+        assert!(error.contains("dummy_test_model"), "{error}");
+        assert!(
+            error.contains("no FP4 quantizer on this backend"),
+            "{error}"
+        );
+    }
+
+    /// The guard is scoped to the declared tiers: an unrejected tier (and a dense, `None` load) still
+    /// reaches the provider untouched, and a catalog that declares nothing rejects nothing.
+    #[test]
+    fn unrejected_quant_tiers_still_load() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: dummy_descriptor,
+                load: dummy_load,
+                footprint: None,
+            })
+            .reject_quant(Quant::Nvfp4, "no FP4 quantizer on this backend")
+            .build()
+            .unwrap();
+
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+            spec.quantize = quant;
+            assert!(
+                registry.load("dummy_test_model", &spec).is_ok(),
+                "{quant:?} must still load"
+            );
+        }
+
+        // A catalog whose backend implements every tier (the CUDA candle catalog) declares no
+        // rejection and is unaffected.
+        let permissive = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: dummy_descriptor,
+                load: dummy_load,
+                footprint: None,
+            })
+            .build()
+            .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        spec.quantize = Some(Quant::Nvfp4);
+        assert!(permissive.load("dummy_test_model", &spec).is_ok());
+    }
+
+    /// An unknown id reports as an unknown id even when the spec also carries a rejected tier — the
+    /// guard runs after id resolution so the caller sees the primary fault.
+    #[test]
+    fn unknown_id_wins_over_rejected_quant() {
+        let registry = ProviderRegistryBuilder::new()
+            .reject_quant(Quant::Nvfp4, "no FP4 quantizer on this backend")
+            .build()
+            .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        spec.quantize = Some(Quant::Nvfp4);
+        let error = registry
+            .load("nope", &spec)
+            .err()
+            .expect("unknown id must fail")
+            .to_string();
+        assert!(
+            error.contains("no generator registered for id 'nope'"),
+            "{error}"
+        );
     }
 
     #[test]

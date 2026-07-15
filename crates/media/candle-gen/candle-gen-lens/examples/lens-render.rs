@@ -60,6 +60,7 @@ fn main() -> Result<()> {
     let qtag = match &quant {
         Some(Quant::Q4) => "q4",
         Some(Quant::Q8) => "q8",
+        Some(Quant::Nvfp4) => "nvfp4",
         _ => "dense",
     };
     let steps: Option<u32> = arg(&args, "--steps").and_then(|s| s.parse().ok());

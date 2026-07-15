@@ -50,7 +50,8 @@ pub use candle_gen::quant::QLinear;
 /// The GGUF block type a [`Quant`] level maps to — `Q4_0` / `Q8_0` (block size 32). Every dev TE/DiT
 /// projection's `in_features` is divisible by 32 (128 / 256 / 4096 / 5120 / 6144 / 15360 / 24576 /
 /// 32768), so the last-dim block check always passes. Shared mapping with the Lens DiT quant (sc-5117).
-pub fn ggml_dtype(quant: Quant) -> GgmlDType {
+/// `Err` for [`Quant::Nvfp4`] (no GGUF block type — NVFP4 is served by `Nvfp4Linear`, sc-11042).
+pub fn ggml_dtype(quant: Quant) -> Result<GgmlDType> {
     candle_gen::quant::ggml_dtype(quant)
 }
 

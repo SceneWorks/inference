@@ -81,6 +81,47 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
 }
 
+/// The **advanced** quant tiers this Candle catalog surfaces beyond the universal group-wise affine
+/// `Q4`/`Q8` (which every provider advertises via `Capabilities::supported_quants`).
+///
+/// The NVFP4 FP4 tensor-core tier ([`media::gen_core::Quant::Nvfp4`], epic 11037, sc-11042 **Option A**
+/// — a *distinct* creative-choice tier, never an auto-swap of `q4`) is surfaced **only** when the
+/// catalog is compiled with the `cuda` feature, i.e. on the consumer Blackwell (`sm_120`) runtime where
+/// the FP4 cores exist and the sc-11039 cuBLASLt FP4 GEMM / [`media::quant::Nvfp4Linear`] serve it
+/// natively packed (epic 11037 SC#6). The CPU candle bundle (dequant→bf16 fallback, no FP4 compute win)
+/// and the MLX/macOS runtime (no FP4 hardware, a separate `mlx-gen-catalog`) do **not** surface it — a
+/// deliberate, pinned platform difference (CONTRIBUTING: pin catalog-surface differences rather than
+/// paper over them; see `nvfp4_tier_surface_is_cuda_only`).
+///
+/// This is the inference-repo registration point per the 2026-07-14 epic replan: an NVFP4 tier reaches
+/// the SceneWorks worker only through this catalog, shipped by runtime-tag (sc-12006); the worker-side
+/// tier-select that *requests* it is deferred to the post-tag phase.
+pub fn nvfp4_quant_tiers() -> &'static [media::gen_core::Quant] {
+    #[cfg(feature = "cuda")]
+    {
+        &[media::gen_core::Quant::Nvfp4]
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        &[]
+    }
+}
+
+/// Whether **this compilation** of the catalog surfaces the NVFP4 tier — i.e. whether it resolved with
+/// the `cuda` feature. Equivalent to `!nvfp4_quant_tiers().is_empty()`, exposed as a `const` because a
+/// *dependent* crate cannot ask that question with `cfg!`.
+///
+/// `cfg!(feature = "cuda")` only ever reads the features of the crate it is written in, so a bundle
+/// such as `runtime-cpu` — which has no `cuda` feature of its own — cannot mirror the rule pinned by
+/// `nvfp4_tier_surface_is_cuda_only` by writing the same `cfg`. It has to read the catalog's resolved
+/// answer, and this is it. That matters because Cargo **feature unification** makes the answer a
+/// property of the *resolved graph*, not of the bundle: any build that pulls in `runtime-cpu` and
+/// `runtime-cuda` together enables `candle-gen-catalog/cuda` once, for every consumer, so a CPU bundle
+/// can legitimately observe the tier surfaced. That resolution is not a supported lane (CLAUDE.md: CPU,
+/// CUDA, and MLX are mutually exclusive platform targets, never additive features), but a bundle-side
+/// assertion should stay honest under it rather than fail spuriously.
+pub const SURFACES_NVFP4_TIER: bool = cfg!(feature = "cuda");
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -184,5 +225,32 @@ mod tests {
         );
         assert_eq!(image_embedders, ["clip_vit_l14"]);
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
+    }
+
+    /// Pin the NVFP4 tier's catalog surface (epic 11037, sc-11042 Option A): the FP4 tier is exposed
+    /// **only** under the `cuda` feature (consumer Blackwell `sm_120`); the CPU candle bundle surfaces
+    /// no advanced tier. The MLX/macOS runtime uses a separate `mlx-gen-catalog` with no such surface —
+    /// the third leg of the pinned platform difference.
+    #[test]
+    fn nvfp4_tier_surface_is_cuda_only() {
+        #[cfg(feature = "cuda")]
+        assert_eq!(
+            super::nvfp4_quant_tiers(),
+            &[super::media::gen_core::Quant::Nvfp4],
+            "NVFP4 must be surfaced on the cuda catalog"
+        );
+        #[cfg(not(feature = "cuda"))]
+        assert!(
+            super::nvfp4_quant_tiers().is_empty(),
+            "NVFP4 must NOT be surfaced on a non-cuda (CPU) candle catalog"
+        );
+
+        // `SURFACES_NVFP4_TIER` is what dependent bundles read instead of a `cfg!` they cannot write;
+        // it must never drift from the tier list itself.
+        assert_eq!(
+            super::SURFACES_NVFP4_TIER,
+            !super::nvfp4_quant_tiers().is_empty(),
+            "SURFACES_NVFP4_TIER must agree with nvfp4_quant_tiers()"
+        );
     }
 }
