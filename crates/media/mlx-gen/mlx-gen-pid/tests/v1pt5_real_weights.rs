@@ -24,12 +24,18 @@ fn ckpt_path() -> String {
         .expect("set PID_V1PT5_CKPT to the converted v1.5 flux safetensors")
 }
 
-/// The flux latent-space v1.5 config: the shared v1.5 topology + flux's 16-ch / 8× LQ geometry (exactly
-/// what `PidEngine::load` builds after sniffing v1.5 — see `engine.rs`).
-fn flux_v1pt5_cfg() -> PidConfig {
+/// The v1.5 config for the backbone under test (`PID_V1PT5_BACKBONE`, default `flux`): the shared v1.5
+/// topology + the space's LQ latent geometry — what `PidEngine::load` builds after sniffing v1.5.
+/// flux/qwenimage are 16-ch / 8×; flux2 feeds the packed 128-ch / 16× latent (un-patchified in-adapter).
+fn v1pt5_cfg() -> PidConfig {
     let mut cfg = PidConfig::sr4x_v1pt5();
-    cfg.lq_latent_channels = 16;
-    cfg.latent_spatial_down_factor = 8;
+    if std::env::var("PID_V1PT5_BACKBONE").as_deref() == Ok("flux2") {
+        cfg.lq_latent_channels = 128;
+        cfg.latent_spatial_down_factor = 16;
+    } else {
+        cfg.lq_latent_channels = 16;
+        cfg.latent_spatial_down_factor = 8;
+    }
     cfg
 }
 
@@ -37,7 +43,7 @@ fn flux_v1pt5_cfg() -> PidConfig {
 #[ignore = "needs the converted PiD v1.5 flux safetensors (PID_V1PT5_CKPT)"]
 fn v1pt5_flux_loads_and_forwards() {
     let w = Weights::from_file(ckpt_path()).unwrap();
-    let cfg = flux_v1pt5_cfg();
+    let cfg = v1pt5_cfg();
 
     // Building the v1.5 net REQUIRES the v1.5-only keys: `lq_proj.pit_head` and the top-level
     // `pit_lq_gate` (pit_lq_inject=true → `.transpose()?` errors if absent). So a clean build already
@@ -84,7 +90,7 @@ fn v1pt5_flux_loads_and_forwards() {
 #[ignore = "needs PID_V1PT5_CKPT + PID_V1PT5_REF_DUMP (reference forward dump)"]
 fn v1pt5_flux_forward_matches_reference() {
     let w = Weights::from_file(ckpt_path()).unwrap();
-    let net = PidNet::from_weights(&w, "", &flux_v1pt5_cfg()).unwrap();
+    let net = PidNet::from_weights(&w, "", &v1pt5_cfg()).unwrap();
 
     let dump = std::env::var("PID_V1PT5_REF_DUMP")
         .expect("set PID_V1PT5_REF_DUMP to the reference forward-dump safetensors");

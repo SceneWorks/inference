@@ -31,6 +31,13 @@ const ROPE_SCALE: f32 = 16.0;
 /// between patch blocks; the base T2I forward passes none.
 pub trait PatchInjector {
     fn inject(&self, block_idx: i32, s_main: &Tensor) -> Result<Tensor>;
+
+    /// Called once on the pixel-stream conditioning `s = silu(s_main + t_emb)` after the patch blocks
+    /// and before the PiT pixel blocks. PiD v1.5's LQ adapter gates `s` with its `pit_lq_gate` here; the
+    /// default is the identity, so base students (and the plain T2I forward) are byte-unchanged.
+    fn inject_pit(&self, s: &Tensor) -> Result<Tensor> {
+        Ok(s.clone())
+    }
 }
 
 /// The `PixDiT_T2I` backbone.
@@ -165,6 +172,12 @@ impl PixDiT {
             y_emb = sy;
         }
         let s = s_main.broadcast_add(&t_emb)?.silu()?;
+        // PiD v1.5 PiT LQ injection: gate the pixel-stream conditioning before the pixel blocks (no-op
+        // for base students / plain T2I forward — the default `inject_pit` is the identity).
+        let s = match injector {
+            Some(inj) => inj.inject_pit(&s)?,
+            None => s,
+        };
         let s_cond = s.reshape((b * l, cfg.hidden_size as usize))?;
 
         let mut x_pixels = self.pixel_embedder.forward(x, h as i32, w as i32, patch)?;

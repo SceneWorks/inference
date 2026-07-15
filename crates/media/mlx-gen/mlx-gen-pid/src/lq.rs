@@ -189,6 +189,39 @@ impl SigmaGate {
     }
 }
 
+/// Infer the LQ un-patchify factor `f` from the shape gap between the registry's advertised LQ latent
+/// channel count and the first conv's actual input width: `latent_channels = proj_in · f²`. Returns 1
+/// when they match (every student except flux2 v1.5). Errors if the ratio isn't a perfect square.
+fn infer_unpatchify(latent_channels: i32, proj_in: i32) -> Result<i32> {
+    if proj_in == latent_channels {
+        return Ok(1);
+    }
+    if proj_in <= 0 || latent_channels % proj_in != 0 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "pid: LQ latent channels ({latent_channels}) not a square multiple of the conv input ({proj_in})"
+        )));
+    }
+    let sq = latent_channels / proj_in;
+    let f = (f64::from(sq)).sqrt().round() as i32;
+    if f * f != sq {
+        return Err(mlx_gen::Error::Msg(format!(
+            "pid: LQ un-patchify ratio {sq} (= {latent_channels}/{proj_in}) is not a perfect square"
+        )));
+    }
+    Ok(f)
+}
+
+/// Un-patchify a packed NCHW latent: `[B, C, H, W] → [B, C/f², H·f, W·f]` (the reference's
+/// `LQProjection2D._unpatchify_latent_if_needed`, factor `f`). No BN inverse-norm — a pure reshuffle.
+fn unpatchify_nchw(x: &Array, f: i32) -> Result<Array> {
+    let sh = x.shape();
+    let (b, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
+    let cc = c / (f * f);
+    Ok(x.reshape(&[b, cc, f, f, h, w])?
+        .transpose_axes(&[0, 1, 4, 2, 5, 3])?
+        .reshape(&[b, cc, h * f, w * f])?)
+}
+
 /// `LQProjection2D` (latent-only): nearest-upsample the latent to the patch grid, run the conv stack,
 /// then project to `num_outputs` per-block token feature sets; plus the per-block sigma gates.
 pub struct LqAdapter {
@@ -199,13 +232,27 @@ pub struct LqAdapter {
     pit_head: Option<AdaptableLinear>,
     gates: Vec<SigmaGate>,
     interval: i32,
+    /// Channel-unpatchify factor for a packed latent (`lq_projection_2d.py::latent_unpatchify_factor`):
+    /// the released **flux2 v1.5** student consumes the 128-ch packed latent but its first LQ conv takes
+    /// **32** channels, so the adapter must un-patchify `[B,128,H,W] → [B,32,2H,2W]` before the conv.
+    /// `1` for every other student (flux/qwen 16→16; flux2 **v1.0** feeds the 128-ch latent directly).
+    unpatchify_factor: i32,
     upsample_ratio: i32,
 }
 
 impl LqAdapter {
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &PidConfig) -> Result<Self> {
         let num_outputs = cfg.num_lq_outputs();
-        let z_to_patch = (cfg.sr_scale * cfg.latent_spatial_down_factor) / cfg.patch_size;
+        // Infer the un-patchify factor from the shape gap between the registry's advertised LQ latent
+        // channel count and the first conv's actual input width (weights are the truth, same principle as
+        // the version sniff): f = isqrt(lq_latent_channels / proj_in). f>1 only for flux2 v1.5.
+        let proj_in = w
+            .require(&format!("{prefix}.latent_proj.0.weight"))?
+            .shape()[1];
+        let unpatchify_factor = infer_unpatchify(cfg.lq_latent_channels, proj_in)?;
+        // After un-patchify the latent grid is `f×` finer, so the upsample to the patch grid drops by f.
+        let z_to_patch =
+            (cfg.sr_scale * cfg.latent_spatial_down_factor) / (cfg.patch_size * unpatchify_factor);
         Ok(Self {
             latent_proj: ConvStack::from_weights(
                 w,
@@ -224,6 +271,7 @@ impl LqAdapter {
                 .map(|i| SigmaGate::from_weights(w, &format!("{prefix}.gate_modules.{i}")))
                 .collect::<Result<_>>()?,
             interval: cfg.lq_interval,
+            unpatchify_factor,
             upsample_ratio: z_to_patch.max(1),
         })
     }
@@ -237,7 +285,13 @@ impl LqAdapter {
         p_w: i32,
     ) -> Result<(Vec<Array>, Option<Array>)> {
         let b = lq_latent.shape()[0];
-        let mut x = lq_latent.transpose_axes(&[0, 2, 3, 1])?; // NCHW -> NHWC
+        // flux2 v1.5: un-patchify the packed latent (128→32 ch, spatial ×f) before the conv stack.
+        let lq = if self.unpatchify_factor > 1 {
+            unpatchify_nchw(lq_latent, self.unpatchify_factor)?
+        } else {
+            lq_latent.clone()
+        };
+        let mut x = lq.transpose_axes(&[0, 2, 3, 1])?; // NCHW -> NHWC
         if self.upsample_ratio > 1 {
             x = upsample_nearest(&x, self.upsample_ratio)?;
         }

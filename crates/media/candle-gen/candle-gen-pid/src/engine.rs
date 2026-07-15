@@ -62,10 +62,15 @@ impl PidEngine {
                 "pid: unknown/out-of-scope backbone {backbone:?} (no PiD latent-space mapping)"
             ))
         })?;
-        let cfg = config_for_spec(&spec);
 
         // The PiD net runs f32 (the parity target + the dense-GEMM-safe path).
         let weights = Weights::from_file(checkpoint, device, DType::F32)?;
+
+        // PiD v1.5 (sc-12143) ships a different LQ topology (wider trunk, per-token scalar gate,
+        // replicate padding, PiT injection, 2048 RoPE ref) under the SAME per-space checkpoint slot, so
+        // the worker may hand us either file (and falls back v1.5→v1.0 when v1.5 isn't downloaded —
+        // sc-12145). Pick the config by sniffing the WEIGHTS, not the filename.
+        let cfg = config_for_spec(&spec, detect_v1pt5(&weights)?);
 
         // Gemma: prefer the merged single-file checkpoint, else load the snapshot dir's shards.
         let merged = gemma_dir.join(GEMMA_MERGED_FILE);
@@ -298,12 +303,38 @@ pub fn flow_capture_for_request(
 /// an 8× student would otherwise silently size its noise, output geometry, and the budget guard for 4×
 /// (a wrong-resolution decode, not a load error). `sr_scale` flows into the decoder's output resolution
 /// (`zH·vae_compression·scale`) and the LQ upsample ratio (`(sr_scale·lsdf)/patch`).
-fn config_for_spec(spec: &BackboneSpec) -> PidConfig {
-    let mut cfg = PidConfig::sr4x();
+fn config_for_spec(spec: &BackboneSpec, v1pt5: bool) -> PidConfig {
+    let mut cfg = if v1pt5 {
+        PidConfig::sr4x_v1pt5()
+    } else {
+        PidConfig::sr4x()
+    };
     cfg.lq_latent_channels = spec.latent_channels;
     cfg.latent_spatial_down_factor = spec.latent_spatial_down_factor;
     cfg.sr_scale = spec.pid_scale;
     cfg
+}
+
+/// Sniff whether a loaded PiD checkpoint is a **v1.5** student (sc-12142/sc-12143) vs base `sr4x` v1.0,
+/// so [`PidEngine::load`] picks the right [`PidConfig`] from the same per-space slot. Two independent
+/// signals must agree: the first LQ gate's `content_proj` output width (**1** = v1.5 per-token scalar;
+/// `hidden_size` = v1.0 per-dim) and the presence of the top-level **`pit_lq_gate`** (v1.5-only). The
+/// converted EMA export pre-strips the `net.` nesting, so keys are bare. Errors on a missing gate (not a
+/// PiD student) or disagreeing signals (a malformed / version-mixed checkpoint).
+fn detect_v1pt5(w: &Weights) -> Result<bool> {
+    let gate_rows = w
+        .require("lq_proj.gate_modules.0.content_proj.weight")?
+        .dim(0)?;
+    let scalar_gate = gate_rows == 1;
+    let has_pit_gate = w.contains("pit_lq_gate.content_proj.weight");
+    if scalar_gate != has_pit_gate {
+        return Err(CandleError::Msg(format!(
+            "pid: inconsistent v1.5 checkpoint signals — scalar gate (content_proj rows={gate_rows}) = \
+             {scalar_gate}, but pit_lq_gate present = {has_pit_gate}; the checkpoint is malformed or \
+             mixes versions"
+        )));
+    }
+    Ok(scalar_gate)
 }
 
 /// Extract the single-file path from a [`WeightsSource`], rejecting a directory.
@@ -347,7 +378,7 @@ mod tests {
         let baseline = PidConfig::sr4x();
         for backbone in ["qwenimage", "flux", "sd3", "sdxl", "flux2"] {
             let spec = lookup(backbone).unwrap();
-            let cfg = config_for_spec(&spec);
+            let cfg = config_for_spec(&spec, false);
             assert_eq!(
                 cfg.sr_scale, spec.pid_scale,
                 "{backbone}: sr_scale must come from the spec, not the hard-coded 4"
@@ -372,14 +403,14 @@ mod tests {
         // decode — proven here on the geometry those consumers compute from sr_scale.
         let mut spec = lookup("flux").unwrap();
         spec.pid_scale = 8;
-        let cfg8 = config_for_spec(&spec);
+        let cfg8 = config_for_spec(&spec, false);
         assert_eq!(
             cfg8.sr_scale, 8,
             "non-default pid_scale must be threaded through"
         );
 
         spec.pid_scale = 4;
-        let cfg4 = config_for_spec(&spec);
+        let cfg4 = config_for_spec(&spec, false);
         assert_ne!(
             cfg8.sr_scale, cfg4.sr_scale,
             "a non-default pid_scale yields a different sr_scale"
