@@ -129,6 +129,19 @@ struct Components {
     pid: Option<Arc<PidEngine>>,
 }
 
+/// The just-loaded heavy phase owned by the sequential path — the DiT + VAE + the optional PiD engine,
+/// loaded together AFTER the text encoder was dropped so they reuse that freed pool. Bundled into one
+/// value because it is the `Heavy` of [`candle_gen::run_sequential`] (sc-12089), which loads the phase
+/// through a single closure. Not `Arc`-shared: the sequential path deliberately drops each component
+/// after its phase rather than keeping the cross-request cache.
+struct SeqHeavy {
+    transformer: QwenTransformer,
+    vae: QwenVae,
+    /// The optional PiD engine — `None` both when the caller never opted in via `LoadSpec::pid` and when
+    /// THIS request will not decode through it (F-177, [`Pipeline::pid_to_load`]).
+    pid: Option<Arc<PidEngine>>,
+}
+
 struct Pipeline {
     te_cfg: TextEncoderConfig,
     dit_cfg: TransformerConfig,
@@ -240,14 +253,9 @@ impl Pipeline {
         let tokenizer = control_common::load_tokenizer(&self.root, &self.te_cfg, "qwen-image")?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; otherwise `None` and the render path uses the native QwenVae.
-        let pid = match &self.pid_spec {
-            Some(spec) => Some(Arc::new(PidEngine::from_spec(
-                spec,
-                PID_BACKBONE,
-                &self.device,
-            )?)),
-            None => None,
-        };
+        // Resident: this set is cached across requests, so the overlay must be loaded for whichever later
+        // request asks for it (F-177 — only the `Sequential` path gates this on `req.use_pid`).
+        let pid = self.load_pid(true)?;
         Ok(Components {
             te: Arc::new(te),
             transformer: Arc::new(transformer),
@@ -421,18 +429,53 @@ impl Pipeline {
         Ok(QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?)
     }
 
-    /// Load the optional PiD super-resolving decoder for the sequential path (sc-10867) when the caller
-    /// opted in via `LoadSpec::pid`; else `None` (the native QwenVae decode). Same load as
-    /// [`load_components`](Self::load_components).
-    fn load_pid_seq(&self) -> CResult<Option<PidEngine>> {
-        match &self.pid_spec {
-            Some(spec) => Ok(Some(PidEngine::from_spec(
+    /// Which PiD spec [`load_pid`](Self::load_pid) should actually load: the spec the caller opted into
+    /// via `LoadSpec::pid`, but only when this load will use it (F-177).
+    ///
+    /// [`resolve_pid_decoder`](candle_gen_pid::resolve_pid_decoder) already gates the *decode* on
+    /// `req.use_pid`, so an engine loaded for a request that did not ask for it is never read — under
+    /// `Resident` that is a harmless one-time cost amortized across every later request, but under
+    /// `Sequential` it is paid on EVERY generate and sits resident through the whole denoise, inside the
+    /// very peak that path exists to bound.
+    ///
+    /// Pure, so the rule is unit-testable without weights or a GPU (krea's `pid_to_load` idiom).
+    fn pid_to_load(&self, use_pid: bool) -> Option<&PidWeights> {
+        self.pid_spec.as_ref().filter(|_| use_pid)
+    }
+
+    /// Load the optional PiD super-resolving decoder (epic 7840 / sc-7853) when the caller opted in via
+    /// `LoadSpec::pid` AND this load will actually use it ([`pid_to_load`](Self::pid_to_load)); else
+    /// `None` (the native [`QwenVae`] decode).
+    ///
+    /// **`use_pid` (F-177).** [`load_components`](Self::load_components) passes `true` — the resident set
+    /// is cached across requests, so the overlay must be there for whichever later request wants it. The
+    /// `Sequential` path passes `req.use_pid`, because there this load runs on EVERY generate.
+    fn load_pid(&self, use_pid: bool) -> CResult<Option<Arc<PidEngine>>> {
+        Ok(match self.pid_to_load(use_pid) {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
                 spec,
                 PID_BACKBONE,
                 &self.device,
             )?)),
-            None => Ok(None),
-        }
+            None => None,
+        })
+    }
+
+    /// Load the whole heavy phase for the sequential path (sc-12089) — the DiT, then the VAE, then the
+    /// optional PiD engine, in that order (the order the pre-seam code loaded them, kept so the tier
+    /// routing and any load-time error surface identically). Runs AFTER the text encoder was dropped, so
+    /// it reuses that freed allocator pool.
+    ///
+    /// **`use_pid` (F-177).** Threaded straight to [`load_pid`](Self::load_pid): this whole fn runs per
+    /// generate, so a PiD engine loaded for a request that never asked for it would sit inside the peak
+    /// this path exists to bound — while `resolve_pid_decoder` goes on to return `None` for it, so not a
+    /// byte of it is read.
+    fn load_heavy_seq(&self, use_pid: bool) -> CResult<SeqHeavy> {
+        Ok(SeqHeavy {
+            transformer: self.load_transformer_seq()?,
+            vae: self.load_vae_seq()?,
+            pid: self.load_pid(use_pid)?,
+        })
     }
 
     /// Sequential-residency render (epic 10765 Phase 1c, sc-10867): load the Qwen2.5-VL text encoder →
@@ -447,6 +490,11 @@ impl Pipeline {
     /// components, it does NOT populate the generator's `Components` cache — repeat requests reload from
     /// the (page-cached) snapshot; that reload cost is the deliberate trade for the lower peak, which is
     /// why it is opt-in per the fit-gate rather than the default.
+    ///
+    /// The schedule itself — the cancel checks at each stage boundary (F-173), the `Progress::Loading`
+    /// emits (F-179), and the drop-before-load ordering — lives in [`candle_gen::run_sequential`], shared
+    /// with every other wired candle engine (sc-12089). Only the two loaders and the encode/render bodies
+    /// are Qwen-Image's.
     fn render_sequential(
         &self,
         req: &GenerationRequest,
@@ -454,37 +502,40 @@ impl Pipeline {
     ) -> CResult<Vec<Image>> {
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
 
-        // Phase 1 — text encode, then DROP the encoder (scoped) so the ~8 GB Qwen2.5-VL frees before the
-        // DiT loads. Delegates to the SAME `encode` the resident path uses, so tokenization + the
-        // conditioning tensors are byte-identical.
-        let (pos_embeds, neg_embeds) = {
-            let (te, tok) = self.load_te_seq()?;
-            let pos = self.encode(&te, &tok, &req.prompt)?;
-            // True CFG: build the negative branch unless guidance is a no-op (≤ 1.0).
-            let neg = if guidance > 1.0 {
-                let neg = Self::resolve_negative(req.negative_prompt.as_deref());
-                Some(self.encode(&te, &tok, neg)?)
-            } else {
-                None
-            };
-            (pos, neg)
-        };
-
-        // Phase 2 — load the DiT (reusing the encoder's freed pool) + the VAE + the optional PiD decoder.
-        let transformer = self.load_transformer_seq()?;
-        let vae = self.load_vae_seq()?;
-        let pid = self.load_pid_seq()?;
-
-        // Phase 3 — the shared denoise + decode tail, identical to `render`'s.
-        self.denoise_and_decode(
-            req,
-            &transformer,
-            &vae,
-            pid.as_ref(),
-            &pos_embeds,
-            neg_embeds.as_ref(),
-            guidance,
+        candle_gen::run_sequential(
+            &req.cancel,
             on_progress,
+            // The text phase is the ~8 GB Qwen2.5-VL encoder + its cheap tokenizer; both drop after the
+            // encode so the encoder frees before the DiT loads.
+            || self.load_te_seq(),
+            // Delegates to the SAME `encode` the resident path uses, so tokenization + the conditioning
+            // tensors are byte-identical to `render`.
+            |(te, tok)| {
+                let pos = self.encode(te, tok, &req.prompt)?;
+                // True CFG: build the negative branch unless guidance is a no-op (≤ 1.0).
+                let neg = if guidance > 1.0 {
+                    let neg = Self::resolve_negative(req.negative_prompt.as_deref());
+                    Some(self.encode(te, tok, neg)?)
+                } else {
+                    None
+                };
+                Ok((pos, neg))
+            },
+            // F-177: skip the PiD student unless THIS request decodes through it.
+            || self.load_heavy_seq(req.use_pid),
+            // The shared denoise + decode tail, identical to `render`'s.
+            |heavy, (pos_embeds, neg_embeds), on_progress| {
+                self.denoise_and_decode(
+                    req,
+                    &heavy.transformer,
+                    &heavy.vae,
+                    heavy.pid.as_deref(),
+                    &pos_embeds,
+                    neg_embeds.as_ref(),
+                    guidance,
+                    on_progress,
+                )
+            },
         )
     }
 }
@@ -781,6 +832,35 @@ mod explicit_registry_tests {
 mod tests {
     use super::*;
     use candle_gen::gen_core::ConditioningKind;
+
+    /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through it,
+    /// so a `Sequential` generate that never asked for PiD does not pay for it — per generate, resident
+    /// through the whole denoise, inside the peak the path exists to bound.
+    ///
+    /// `load_components` passes `use_pid = true` unconditionally and that is correct, not an oversight:
+    /// it builds one cached set BEFORE any request exists, so the overlay has to be there for whichever
+    /// later request wants it. GPU- and weights-free (`Pipeline::load` does no I/O).
+    #[test]
+    fn pid_loads_only_when_the_request_uses_it() {
+        let spec = PidWeights {
+            checkpoint: WeightsSource::File("/pid.safetensors".into()),
+            gemma: WeightsSource::Dir("/gemma".into()),
+        };
+        let root = Path::new("/nonexistent");
+        let with = Pipeline::load(root, &Device::Cpu, Some(spec));
+        let without = Pipeline::load(root, &Device::Cpu, None);
+
+        // Opted in at load AND wanted by this request → load it.
+        assert!(with.pid_to_load(true).is_some());
+        // Opted in at load but NOT wanted by this request → skip it. This is the F-177 arm: before the
+        // fix the sequential path loaded the engine and `resolve_pid_decoder` then returned `None` for it,
+        // so not a byte was ever read.
+        assert!(with.pid_to_load(false).is_none());
+        // Never opted in → nothing to load, whatever the request asked for. (`use_pid` with no `pid` spec
+        // is `resolve_pid_decoder`'s error to report, not a reason to load anything here.)
+        assert!(without.pid_to_load(true).is_none());
+        assert!(without.pid_to_load(false).is_none());
+    }
 
     /// sc-11187 / F-085: the CFG negative must never reach `tokenize("")`. An absent, empty, or
     /// whitespace-only negative — including the `Some("")` a cleared UI field serializes to, which used
