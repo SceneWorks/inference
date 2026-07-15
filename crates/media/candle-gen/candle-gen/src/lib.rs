@@ -154,7 +154,10 @@ pub use sync::{cached, lock_recover};
 // instead of being re-derived per engine; flux, flux2 and qwen-image had each open-coded the
 // schedule and each omitted the same two things.
 pub mod residency;
-pub use residency::{check_cancel, run_sequential, sequential_offload_enabled, OFFLOAD_ENV};
+pub use residency::{
+    check_cancel, effective_offload_policy, run_sequential, sequential_offload_enabled, Residency,
+    OFFLOAD_ENV,
+};
 
 // Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, GPU peak-VRAM,
 // and HF-Hub-cache resolution helpers that had been hand-copied — and had drifted — across ~16

@@ -255,36 +255,25 @@ fn tokenizer_json_path(root: &Path) -> Result<PathBuf> {
     )))
 }
 
-/// The loaded Qwen-Image-Edit model. Under the default `Resident` policy all four heavy components (the
-/// VL conditioning encoder, the MMDiT, and the VAE decoder + encoder) load once at [`Self::load`] and
-/// live in [`ResidentComponents`]. Under the `Sequential` policy (epic 10765 Phase 1c follow-up,
-/// sc-10968) none are pre-loaded — [`Self::generate`] loads them per phase and DROPS the VL encoder
-/// before the DiT loads, so peak VRAM is `max(VL+VAE-enc, DiT+VAE-dec)` instead of the resident sum;
-/// `root` + `adapters` are retained for the per-phase reloads. The image processor, tokenizer, and
+/// The loaded Qwen-Image-Edit model. [`candle_gen::Residency`] exclusively owns either the warm
+/// component pair or the two deferred phase loaders. The image processor, tokenizer, and
 /// `zero_cond_t` flag are cheap and always resident.
 pub struct QwenEdit {
     device: Device,
-    /// Snapshot dir — retained for the `Sequential` per-phase reloads (`text_encoder/`, `transformer/`,
-    /// `vae/`, `tokenizer/`).
-    root: PathBuf,
-    /// The MMDiT adapters (sc-6220) — retained so the `Sequential` path re-folds the SAME LoRA/LoKr
-    /// overlay on every transformer reload, keeping the DiT bit-identical to the resident path.
-    adapters: Vec<AdapterSpec>,
-    /// The heavy components: `Some` under `Resident` (loaded once, reused across requests), `None` under
-    /// `Sequential` (loaded + dropped per phase inside [`Self::generate_sequential`]) — this `Option`
-    /// encodes the residency policy after [`Self::load`] resolves it.
-    resident: Option<ResidentComponents>,
+    residency: candle_gen::Residency<EditText, EditHeavy>,
     processor: QwenImageProcessor,
     tokenizer: TextTokenizer,
     zero_cond_t: bool,
 }
 
-/// The four heavy Qwen-Image-Edit components, co-resident under the default `Resident` policy.
-struct ResidentComponents {
+struct EditText {
     vl_encoder: QwenVisionLanguageEncoder,
+    vae_encoder: QwenVaeEncoder,
+}
+
+struct EditHeavy {
     transformer: QwenTransformer,
     vae: QwenVae,
-    vae_encoder: QwenVaeEncoder,
 }
 
 impl QwenEdit {
@@ -306,30 +295,80 @@ impl QwenEdit {
         )
         .map_err(|e| CandleError::Msg(format!("qwen edit: load tokenizer: {e}")))?;
 
-        // Sequential residency (sc-10968): defer the four heavy components to `generate_sequential`'s
-        // phased loads, keeping only `root` + `adapters` for the reloads. Resident (default): load all
-        // four now and hold them across requests, byte-identical to the pre-sc-10968 path. Selected by the
-        // worker fit-gate via `offload_policy`, or forced by the `CANDLE_GEN_OFFLOAD=sequential` env the
-        // GPU A/B harness drives (the shared txt2img override, sc-10867).
-        let sequential = paths.offload_policy == OffloadPolicy::Sequential
-            || candle_gen::sequential_offload_enabled();
-        let resident = if sequential {
-            None
-        } else {
-            Some(ResidentComponents {
-                vl_encoder: load_vision_language_encoder(&root, &device)?,
-                transformer: load_transformer(&root, &paths.adapters, DIT_DTYPE, &device)?,
-                vae: QwenVae::new(component_vb(&root, "vae", ENC_DTYPE, &device)?)?,
-                vae_encoder: QwenVaeEncoder::new(component_vb(&root, "vae", ENC_DTYPE, &device)?)?,
-            })
-        };
+        let policy = candle_gen::effective_offload_policy(paths.offload_policy);
+        let resident_root = root.clone();
+        let resident_device = device.clone();
+        let resident_adapters = paths.adapters.clone();
+        let text_root = root.clone();
+        let text_device = device.clone();
+        let heavy_root = root.clone();
+        let heavy_device = device.clone();
+        let heavy_adapters = paths.adapters.clone();
+        let residency = candle_gen::Residency::from_policy_with_resident(
+            policy,
+            move || {
+                Ok((
+                    EditText {
+                        vl_encoder: load_vision_language_encoder(
+                            &resident_root,
+                            &resident_device,
+                        )?,
+                        vae_encoder: QwenVaeEncoder::new(component_vb(
+                            &resident_root,
+                            "vae",
+                            ENC_DTYPE,
+                            &resident_device,
+                        )?)?,
+                    },
+                    EditHeavy {
+                        transformer: load_transformer(
+                            &resident_root,
+                            &resident_adapters,
+                            DIT_DTYPE,
+                            &resident_device,
+                        )?,
+                        vae: QwenVae::new(component_vb(
+                            &resident_root,
+                            "vae",
+                            ENC_DTYPE,
+                            &resident_device,
+                        )?)?,
+                    },
+                ))
+            },
+            move || {
+                Ok(EditText {
+                    vl_encoder: load_vision_language_encoder(&text_root, &text_device)?,
+                    vae_encoder: QwenVaeEncoder::new(component_vb(
+                        &text_root,
+                        "vae",
+                        ENC_DTYPE,
+                        &text_device,
+                    )?)?,
+                })
+            },
+            move |_| {
+                Ok(EditHeavy {
+                    transformer: load_transformer(
+                        &heavy_root,
+                        &heavy_adapters,
+                        DIT_DTYPE,
+                        &heavy_device,
+                    )?,
+                    vae: QwenVae::new(component_vb(
+                        &heavy_root,
+                        "vae",
+                        ENC_DTYPE,
+                        &heavy_device,
+                    )?)?,
+                })
+            },
+        )?;
 
         Ok(Self {
             zero_cond_t: read_zero_cond_t(&root)?,
             device,
-            root,
-            adapters: paths.adapters.clone(),
-            resident,
+            residency,
             processor: QwenImageProcessor::default(),
             tokenizer,
         })
@@ -350,44 +389,6 @@ impl QwenEdit {
         let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
         let embeds = vl_encoder.encode_with_vision(&input_ids, vision)?;
         Ok(embeds.to_dtype(DIT_DTYPE)?)
-    }
-
-    /// Load ONLY the VL conditioning encoder (Qwen2.5-VL LM + vision tower) for the sequential path
-    /// (sc-10968) — the big component dropped before the DiT loads. Same load as [`Self::load`]'s.
-    fn load_vl_seq(&self) -> Result<QwenVisionLanguageEncoder> {
-        load_vision_language_encoder(&self.root, &self.device)
-    }
-
-    /// Load ONLY the VAE encoder (reference dual-latent) for the sequential path (sc-10968). Needed
-    /// DURING the encode phase (before the VL drop), unlike the txt2img path — the references are
-    /// VAE-encoded there, so this is co-resident with the VL encoder, not the DiT.
-    fn load_vae_encoder_seq(&self) -> Result<QwenVaeEncoder> {
-        Ok(QwenVaeEncoder::new(component_vb(
-            &self.root,
-            "vae",
-            ENC_DTYPE,
-            &self.device,
-        )?)?)
-    }
-
-    /// Load ONLY the MMDiT for the sequential path (sc-10968) — loaded after the VL encoder was dropped,
-    /// reusing its freed allocator pool. Re-applies the SAME `adapters` by the SAME route as the resident
-    /// path ([`load_transformer`]: additive for LoRA/LoKr, fold for LoHa/untagged-LoKr) so the DiT is
-    /// identical to it. With the additive route (sc-11684) the base loads via the streamable mmap fast
-    /// path here rather than the eager whole-DiT fold.
-    fn load_transformer_seq(&self) -> Result<QwenTransformer> {
-        load_transformer(&self.root, &self.adapters, DIT_DTYPE, &self.device)
-    }
-
-    /// Load ONLY the VAE decoder for the sequential path (sc-10968) — co-resident with the DiT through
-    /// decode. Small relative to the DiT, so splitting it further buys ~nothing.
-    fn load_vae_seq(&self) -> Result<QwenVae> {
-        Ok(QwenVae::new(component_vb(
-            &self.root,
-            "vae",
-            ENC_DTYPE,
-            &self.device,
-        )?)?)
     }
 
     /// The shared conditioning head (sc-10968): VL-encode the vision tower + prompt(s) and VAE-encode the
@@ -545,78 +546,30 @@ impl QwenEdit {
 
     /// Reference-conditioned edit. `references` is the (validated non-empty) reference image set: the
     /// **first** drives the VL prompt embeds, **all** are VAE-encoded into the dual-latent sequence,
-    /// and the **last** sets the condition resolution (the fork's `_compute_dimensions`). Dispatches on
-    /// the residency policy (sc-10968): `Resident` borrows the cached components; `Sequential` loads them
-    /// per phase, dropping the VL encoder before the DiT — bit-identical output, lower peak.
+    /// and the **last** sets the condition resolution (the fork's `_compute_dimensions`). The residency
+    /// owner supplies either warm components or phased loads to these same encode/render bodies.
     pub fn generate(
         &self,
         req: &QwenEditRequest,
         references: &[Image],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        if req.cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
-        match &self.resident {
-            Some(r) => {
-                let (pos, neg, static_latents, cond_grids) =
-                    self.encode_conditioning(&r.vl_encoder, &r.vae_encoder, req, references)?;
-                self.denoise_and_decode(
-                    &r.transformer,
-                    &r.vae,
-                    req,
-                    &pos,
-                    neg.as_ref(),
-                    &static_latents,
-                    &cond_grids,
-                    on_progress,
-                )
-            }
-            None => self.generate_sequential(req, references, on_progress),
-        }
-    }
-
-    /// Sequential-residency edit (epic 10765 Phase 1c follow-up, sc-10968): load the VL encoder + VAE
-    /// encoder → encode the vision/prompt conditioning + VAE-encode the references → DROP the VL encoder
-    /// (and VAE encoder) → load the DiT + VAE decoder → denoise/decode. Peak VRAM is
-    /// `max(VL+VAE-enc, DiT+VAE-dec)`, reclaiming the big Qwen2.5-VL encoder before the DiT so a card that
-    /// OOMs the resident path can still render. Output is bit-identical to the resident path — the SAME
-    /// [`encode_conditioning`](Self::encode_conditioning) head and
-    /// [`denoise_and_decode`](Self::denoise_and_decode) tail run; only the load/free schedule differs.
-    ///
-    /// Unlike the txt2img path (drop the TE → load DiT+VAE), the encode phase here holds TWO components:
-    /// the VL encoder AND the VAE encoder (the references are VAE-encoded into the dual-latent sequence
-    /// there). Both drop together at the end of the text phase; the VAE **decoder** loads fresh in the
-    /// heavy phase. The surviving state — `pos`/`neg` embeds, `static_latents`, `cond_grids` — is small
-    /// (no model weights).
-    ///
-    /// The schedule itself — the cancel checks at each stage boundary (F-173), the `Progress::Loading`
-    /// emits (F-179), and the drop-before-load ordering — lives in [`candle_gen::run_sequential`], shared
-    /// with every other wired candle engine (sc-12089). Only the two loaders and the encode/render bodies
-    /// are the edit lane's. The seam's two-phase `Text`/`Heavy` split takes tuples here: this lane's text
-    /// phase is the VL + VAE encoders, and its heavy phase the DiT + VAE decoder. There is no PiD overlay
-    /// on this lane, so it has no F-177 arm to gate.
-    fn generate_sequential(
-        &self,
-        req: &QwenEditRequest,
-        references: &[Image],
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
-        candle_gen::run_sequential(
+        self.residency.run(
             &req.cancel,
+            false,
             on_progress,
-            // The text phase holds BOTH encoders — the references are VAE-encoded during the conditioning
-            // head, so the VAE encoder is co-resident with the VL encoder rather than with the DiT.
-            || Ok((self.load_vl_seq()?, self.load_vae_encoder_seq()?)),
-            |(vl_encoder, vae_encoder)| {
-                self.encode_conditioning(vl_encoder, vae_encoder, req, references)
+            |text| {
+                self.encode_conditioning(
+                    &text.vl_encoder,
+                    &text.vae_encoder,
+                    req,
+                    references,
+                )
             },
-            || Ok((self.load_transformer_seq()?, self.load_vae_seq()?)),
-            // The shared denoise + decode tail, identical to the resident path's.
-            |(transformer, vae), (pos, neg, static_latents, cond_grids), on_progress| {
+            |heavy, (pos, neg, static_latents, cond_grids), on_progress| {
                 self.denoise_and_decode(
-                    transformer,
-                    vae,
+                    &heavy.transformer,
+                    &heavy.vae,
                     req,
                     &pos,
                     neg.as_ref(),

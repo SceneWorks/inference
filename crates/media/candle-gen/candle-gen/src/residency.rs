@@ -32,14 +32,13 @@
 //! pool, epic 10765's cudarc caveat) and candle evaluates eagerly, so Rust's own scope-based drop is
 //! the whole cleanup story and it already runs on the `?` early-return path.
 //!
-//! **Still open:** this seam covers the `Sequential` schedule only. mlx-gen's [`Residency<Text, Heavy>`]
-//! also unifies the `Resident` path into one type, so a provider drives both policies through a single
-//! `run`. Candle's providers still branch (`if sequential { … } else { … }`) and hold their own
-//! `Mutex<Option<Components>>` cache. Unifying that is the natural follow-on; it wants its own story,
-//! since it touches every wired engine's cache handling.
+//! [`Residency<Text, Heavy>`] also owns the warm `Resident` pair (sc-12128), so providers construct one
+//! policy at load and drive both through the same [`Residency::run`] call. A provider can no longer
+//! leave a stale component cache beside the sequential path: the residency value is the sole owner.
 
 use gen_core::runtime::{CancelFlag, LoadPhase};
-use gen_core::Progress;
+use gen_core::{OffloadPolicy, Progress};
+use std::sync::{Mutex, OnceLock};
 
 use crate::{CandleError, Result};
 
@@ -75,6 +74,158 @@ pub fn check_cancel(cancel: &CancelFlag) -> Result<()> {
         return Err(CandleError::Canceled);
     }
     Ok(())
+}
+
+/// Resolve the load-spec policy together with the family-wide A/B override.
+pub fn effective_offload_policy(requested: OffloadPolicy) -> OffloadPolicy {
+    if requested == OffloadPolicy::Sequential || sequential_offload_enabled() {
+        OffloadPolicy::Sequential
+    } else {
+        OffloadPolicy::Resident
+    }
+}
+
+type TextLoader<Text> = Box<dyn Fn() -> Result<Text> + Send + Sync>;
+type HeavyLoader<Heavy> = Box<dyn Fn(bool) -> Result<Heavy> + Send + Sync>;
+type ResidentLoader<Text, Heavy> = Box<dyn Fn() -> Result<(Text, Heavy)> + Send + Sync>;
+
+struct ResidentPair<Text, Heavy> {
+    text: Text,
+    heavy: Heavy,
+}
+
+struct SequentialLoaders<Text, Heavy> {
+    load_text: TextLoader<Text>,
+    load_heavy: HeavyLoader<Heavy>,
+}
+
+struct LazyResident<Text, Heavy> {
+    pair: OnceLock<ResidentPair<Text, Heavy>>,
+    loader: ResidentLoader<Text, Heavy>,
+    load_lock: Mutex<()>,
+}
+
+impl<Text, Heavy> LazyResident<Text, Heavy> {
+    fn get(&self) -> Result<&ResidentPair<Text, Heavy>> {
+        if self.pair.get().is_none() {
+            let _guard = crate::lock_recover(&self.load_lock);
+            if self.pair.get().is_none() {
+                let (text, heavy) = (self.loader)()?;
+                let _ = self.pair.set(ResidentPair { text, heavy });
+            }
+        }
+        Ok(self
+            .pair
+            .get()
+            .expect("resident pair is initialized while holding the load lock"))
+    }
+}
+
+enum Inner<Text, Heavy> {
+    Resident(Box<ResidentPair<Text, Heavy>>),
+    LazyResident(Box<LazyResident<Text, Heavy>>),
+    Sequential(Box<SequentialLoaders<Text, Heavy>>),
+}
+
+/// Shared ownership and scheduling for a provider's phase-A text component and heavy render bundle.
+/// The resident arm holds both warm; the sequential arm holds only loaders and rebuilds each phase per
+/// generation. Both variants drive the same encode/render closures through [`run`](Self::run).
+pub struct Residency<Text, Heavy> {
+    inner: Inner<Text, Heavy>,
+}
+
+impl<Text, Heavy> Residency<Text, Heavy> {
+    pub fn resident(text: Text, heavy: Heavy) -> Self {
+        Self {
+            inner: Inner::Resident(Box::new(ResidentPair { text, heavy })),
+        }
+    }
+
+    pub fn sequential(
+        load_text: impl Fn() -> Result<Text> + Send + Sync + 'static,
+        load_heavy: impl Fn(bool) -> Result<Heavy> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Inner::Sequential(Box::new(SequentialLoaders {
+                load_text: Box::new(load_text),
+                load_heavy: Box::new(load_heavy),
+            })),
+        }
+    }
+
+    /// Build the selected policy once. Resident loads eagerly and asks for request-optional heavy
+    /// components (`use_pid = true`) so later warm-cache requests can use them; Sequential defers both
+    /// loaders and threads the current request's `use_pid` at [`run`](Self::run).
+    pub fn from_policy(
+        policy: OffloadPolicy,
+        load_text: impl Fn() -> Result<Text> + Send + Sync + 'static,
+        load_heavy: impl Fn(bool) -> Result<Heavy> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        match policy {
+            OffloadPolicy::Resident => {
+                let text = load_text()?;
+                let heavy = load_heavy(true)?;
+                Ok(Self::resident(text, heavy))
+            }
+            OffloadPolicy::Sequential => Ok(Self::sequential(load_text, load_heavy)),
+        }
+    }
+
+    /// Variant of [`from_policy`](Self::from_policy) for providers whose historical resident loader
+    /// builds a shared aggregate that cannot be produced by the two independent sequential loaders.
+    pub fn from_policy_with_resident(
+        policy: OffloadPolicy,
+        load_resident: impl Fn() -> Result<(Text, Heavy)> + Send + Sync + 'static,
+        load_text: impl Fn() -> Result<Text> + Send + Sync + 'static,
+        load_heavy: impl Fn(bool) -> Result<Heavy> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        match policy {
+            OffloadPolicy::Resident => Ok(Self {
+                inner: Inner::LazyResident(Box::new(LazyResident {
+                    pair: OnceLock::new(),
+                    loader: Box::new(load_resident),
+                    load_lock: Mutex::new(()),
+                })),
+            }),
+            OffloadPolicy::Sequential => Ok(Self::sequential(load_text, load_heavy)),
+        }
+    }
+
+    pub fn is_sequential(&self) -> bool {
+        matches!(self.inner, Inner::Sequential(_))
+    }
+
+    pub fn run<Enc, Out>(
+        &self,
+        cancel: &CancelFlag,
+        use_pid: bool,
+        on_progress: &mut dyn FnMut(Progress),
+        encode: impl FnOnce(&Text) -> Result<Enc>,
+        render: impl FnOnce(&Heavy, Enc, &mut dyn FnMut(Progress)) -> Result<Out>,
+    ) -> Result<Out> {
+        check_cancel(cancel)?;
+        match &self.inner {
+            Inner::Resident(pair) => {
+                let enc = encode(&pair.text)?;
+                check_cancel(cancel)?;
+                render(&pair.heavy, enc, on_progress)
+            }
+            Inner::LazyResident(lazy) => {
+                let pair = lazy.get()?;
+                let enc = encode(&pair.text)?;
+                check_cancel(cancel)?;
+                render(&pair.heavy, enc, on_progress)
+            }
+            Inner::Sequential(loaders) => run_sequential(
+                cancel,
+                on_progress,
+                || (loaders.load_text)(),
+                encode,
+                || (loaders.load_heavy)(use_pid),
+                render,
+            ),
+        }
+    }
 }
 
 /// Drive one generation through the `Sequential` residency lifecycle: **load text → encode → drop text
@@ -133,6 +284,7 @@ pub fn run_sequential<Text, Heavy, Enc, Out>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
 
     /// A tripped flag short-circuits before ANY loader runs — the F-173 property that makes a
     /// cancelled staged request cheap.
@@ -239,6 +391,111 @@ mod tests {
 
         assert!(out.is_ok());
         assert_eq!(*log.borrow(), vec!["text-dropped", "heavy-load"]);
+    }
+
+    #[test]
+    fn from_policy_sequential_defers_and_reloads_each_run() {
+        let loads = Arc::new(Mutex::new(Vec::new()));
+        let text_loads = Arc::clone(&loads);
+        let heavy_loads = Arc::clone(&loads);
+        let residency = Residency::from_policy(
+            OffloadPolicy::Sequential,
+            move || {
+                text_loads.lock().unwrap().push("text");
+                Ok(2u8)
+            },
+            move |use_pid| {
+                heavy_loads
+                    .lock()
+                    .unwrap()
+                    .push(if use_pid { "heavy+pid" } else { "heavy" });
+                Ok(3u8)
+            },
+        )
+        .unwrap();
+
+        assert!(residency.is_sequential());
+        assert!(loads.lock().unwrap().is_empty());
+        let out = residency
+            .run(
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                |text| Ok(*text + 1),
+                |heavy, encoded, _| Ok(*heavy + encoded),
+            )
+            .unwrap();
+        assert_eq!(out, 6);
+        assert_eq!(*loads.lock().unwrap(), vec!["text", "heavy"]);
+    }
+
+    #[test]
+    fn from_policy_resident_loads_once_with_pid_and_reuses_pair() {
+        let loads = Arc::new(Mutex::new(Vec::new()));
+        let text_loads = Arc::clone(&loads);
+        let heavy_loads = Arc::clone(&loads);
+        let residency = Residency::from_policy(
+            OffloadPolicy::Resident,
+            move || {
+                text_loads.lock().unwrap().push("text");
+                Ok(4u8)
+            },
+            move |use_pid| {
+                heavy_loads
+                    .lock()
+                    .unwrap()
+                    .push(if use_pid { "heavy+pid" } else { "heavy" });
+                Ok(5u8)
+            },
+        )
+        .unwrap();
+
+        assert!(!residency.is_sequential());
+        assert_eq!(*loads.lock().unwrap(), vec!["text", "heavy+pid"]);
+        for _ in 0..2 {
+            let out = residency
+                .run(
+                    &CancelFlag::new(),
+                    false,
+                    &mut |_| {},
+                    |text| Ok(*text),
+                    |heavy, encoded, _| Ok(*heavy + encoded),
+                )
+                .unwrap();
+            assert_eq!(out, 9);
+        }
+        assert_eq!(*loads.lock().unwrap(), vec!["text", "heavy+pid"]);
+    }
+
+    #[test]
+    fn custom_resident_loader_is_lazy_and_cached() {
+        let loads = Arc::new(Mutex::new(0usize));
+        let resident_loads = Arc::clone(&loads);
+        let residency = Residency::from_policy_with_resident(
+            OffloadPolicy::Resident,
+            move || {
+                *resident_loads.lock().unwrap() += 1;
+                Ok((7u8, 8u8))
+            },
+            || Ok(0u8),
+            |_| Ok(0u8),
+        )
+        .unwrap();
+
+        assert_eq!(*loads.lock().unwrap(), 0);
+        for _ in 0..2 {
+            let out = residency
+                .run(
+                    &CancelFlag::new(),
+                    false,
+                    &mut |_| {},
+                    |text| Ok(*text),
+                    |heavy, encoded, _| Ok(*heavy + encoded),
+                )
+                .unwrap();
+            assert_eq!(out, 15);
+        }
+        assert_eq!(*loads.lock().unwrap(), 1);
     }
 
     /// The env reader: case- and whitespace-insensitive on `sequential`, false for everything else.

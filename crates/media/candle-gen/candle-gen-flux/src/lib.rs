@@ -104,16 +104,15 @@ pub use ref_backbone::FluxRefBackbone;
 #[cfg(test)]
 mod ip_validate;
 
-use std::path::PathBuf;
-use std::sync::Mutex;
-
-use candle_gen::candle_core::{DType, Device};
+use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, PidWeights, Progress, WeightsSource,
+    ModelDescriptor, Progress, WeightsSource,
 };
+#[cfg(test)]
+use candle_gen::gen_core::OffloadPolicy;
 
-use pipeline::{Components, Pipeline};
+use pipeline::{Pipeline, SeqHeavy, SeqTextEncoders};
 
 /// Registry id for FLUX.1 [schnell] — matches the SceneWorks worker's engine id and the macOS
 /// `mlx-gen-flux` descriptor.
@@ -185,38 +184,13 @@ impl Variant {
     }
 }
 
-/// A loaded candle FLUX generator (one per variant). Loading is **lazy**: `load` does no file I/O,
-/// and the heavy components (CLIP + T5 + DiT + VAE) are built on the first
-/// [`generate`](Generator::generate) call and then **cached** in `components` so back-to-back
-/// requests skip the disk re-read.
+/// A loaded candle FLUX generator (one per variant). The shared residency owner holds either the
+/// warm phase pair or the deferred per-request loaders.
 pub struct FluxGenerator {
     variant: Variant,
     descriptor: ModelDescriptor,
-    root: PathBuf,
-    device: Device,
-    dtype: DType,
-    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
-    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
-    pid_spec: Option<PidWeights>,
-    /// Component-residency policy captured from `LoadSpec::offload_policy` (epic 10765 Phase 1b,
-    /// sc-10821). `Sequential` routes `generate` through `render_sequential` (load→encode→drop the text
-    /// encoders before the DiT), capping peak VRAM at the cost of the components cache; `Resident`
-    /// (default) keeps the cached path. The worker's fit-gate sets this when it predicts the resident
-    /// sum won't fit but the DiT+VAE working set will.
-    offload_policy: OffloadPolicy,
-    /// Cached components. `Mutex` because `Generator` is shared and `generate` takes `&self`; the lock
-    /// is held only to read/populate the cache, never across the denoise.
-    components: Mutex<Option<Components>>,
-}
-
-impl FluxGenerator {
-    /// Get the cached components, loading (and caching) them on a miss.
-    fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
-        Ok(candle_gen::cached(&self.components, || {
-            pipe.load_components()
-        })?)
-    }
+    pipe: Pipeline,
+    residency: candle_gen::Residency<SeqTextEncoders, SeqHeavy>,
 }
 
 impl Generator for FluxGenerator {
@@ -257,30 +231,16 @@ impl Generator for FluxGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
-        // `gen_core::Error` via `?`. The light `Pipeline` handle carries the snapshot/device; the
-        // heavy components come from the cache.
-        let pipe = Pipeline::load(
-            self.variant,
-            &self.root,
-            &self.device,
-            self.dtype,
-            self.pid_spec.clone(),
-        );
-        // Sequential-residency offload (epic 10765, sc-10769/sc-10821): when selected, load→encode→drop
-        // the text encoders before loading the DiT so peak VRAM is DiT+VAE, not TE+DiT+VAE — letting a
-        // card that OOMs the resident path render. Output is bit-identical; it bypasses the components
-        // cache (it drops what it loads). Driven by `LoadSpec::offload_policy` (the worker fit-gate sets
-        // `Sequential`); `CANDLE_GEN_OFFLOAD=sequential` is an env override kept for the GPU A/B harness.
-        // The default stays the resident, cross-request-cached path.
-        let sequential = self.offload_policy == OffloadPolicy::Sequential
-            || candle_gen::sequential_offload_enabled();
-        let images = if sequential {
-            pipe.render_sequential(req, on_progress)?
-        } else {
-            let components = self.components(&pipe)?;
-            pipe.render(req, &components, on_progress)?
-        };
+        let images = self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text| self.pipe.encode_residency(text, &req.prompt),
+            |heavy, encoded, on_progress| {
+                self.pipe
+                    .render_residency(req, heavy, encoded, on_progress)
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -374,20 +334,33 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
     // FLUX is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
+    let pipe = Pipeline::load(
+        variant,
+        &root,
+        &device,
+        DType::BF16,
+        spec.pid.clone(),
+    );
+    let policy = candle_gen::effective_offload_policy(spec.offload_policy);
+    let resident_pipe = pipe.clone();
+    let text_pipe = pipe.clone();
+    let heavy_pipe = pipe.clone();
+    let residency = candle_gen::Residency::from_policy_with_resident(
+        policy,
+        move || {
+            Ok((
+                resident_pipe.load_text_residency()?,
+                resident_pipe.load_heavy_residency(true)?,
+            ))
+        },
+        move || text_pipe.load_text_residency(),
+        move |use_pid| heavy_pipe.load_heavy_residency(use_pid),
+    )?;
     Ok(Box::new(FluxGenerator {
         variant,
         descriptor: descriptor_for(variant),
-        root,
-        device,
-        dtype: DType::BF16,
-        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
-        // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
-        // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
-        pid_spec: spec.pid.clone(),
-        // Component-residency policy (epic 10765 Phase 1b, sc-10821) — `Sequential` routes generate
-        // through `render_sequential`. Captured at load; ignored by every other candle family.
-        offload_policy: spec.offload_policy,
-        components: Mutex::new(None),
+        pipe,
+        residency,
     }))
 }
 

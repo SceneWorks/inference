@@ -56,7 +56,7 @@ pub use transformer::{
 };
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -111,8 +111,21 @@ struct SeqHeavy {
     pid: Option<Arc<PidEngine>>,
 }
 
+enum TextPhase {
+    Resident(Components),
+    Sequential(Box<(Flux2PromptEncoder, TextTokenizer)>),
+}
+
+enum HeavyPhase {
+    Resident(Components),
+    Sequential(Box<SeqHeavy>),
+}
+
+type Flux2Residency = candle_gen::Residency<TextPhase, HeavyPhase>;
+
 /// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype. `pub(crate)` so the
 /// edit provider ([`edit_provider`]) reuses the snapshot mmap + prompt-encode scaffolding.
+#[derive(Clone)]
 pub(crate) struct Pipeline {
     pub(crate) variant: Flux2Variant,
     pub(crate) cfg: Flux2Config,
@@ -494,6 +507,7 @@ impl Pipeline {
         Ok(te.prompt_embeds(&input_ids, &attn_mask)?)
     }
 
+    #[allow(dead_code)]
     fn render(
         &self,
         req: &GenerationRequest,
@@ -541,8 +555,7 @@ impl Pipeline {
     /// Encode the optional classifier-free **negative** prompt for the klein CFG blend: `Some` only on a
     /// non-embedded-guidance variant with `guidance > 1` (klein runs CFG-free at 1.0; dev is embedded-
     /// guidance, single-forward, so always `None`). Takes the TE + tokenizer directly so both the
-    /// resident [`render`] (cached components) and the sequential [`render_sequential`] (a just-loaded,
-    /// about-to-be-dropped TE) share the exact CFG condition — the conditioning stays byte-identical.
+    /// resident and sequential residency phases share the exact CFG condition.
     fn encode_negative(
         &self,
         te: &Flux2PromptEncoder,
@@ -558,8 +571,72 @@ impl Pipeline {
         }
     }
 
-    /// The per-image denoise + decode loop shared by the resident [`render`] and the sequential
-    /// [`render_sequential`] (epic 10765 Phase 1c, sc-10868). Given the already-encoded `prompt_embeds`
+    fn encode_phase(
+        &self,
+        phase: &TextPhase,
+        req: &GenerationRequest,
+    ) -> CResult<(Tensor, Option<Tensor>, f32)> {
+        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+        let encode = |te: &Flux2PromptEncoder, tok: &TextTokenizer| -> CResult<_> {
+            Ok((
+                self.encode(te, tok, &req.prompt)?,
+                self.encode_negative(te, tok, req, guidance)?,
+                guidance,
+            ))
+        };
+        match phase {
+            TextPhase::Resident(comps) => encode(&comps.te, &comps.tokenizer),
+            TextPhase::Sequential(text) => {
+                let (te, tokenizer) = text.as_ref();
+                encode(te, tokenizer)
+            }
+        }
+    }
+
+    fn render_phase(
+        &self,
+        phase: &HeavyPhase,
+        req: &GenerationRequest,
+        encoded: (Tensor, Option<Tensor>, f32),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<Vec<Image>> {
+        let steps = req
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or(self.variant.default_steps() as usize);
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let (prompt_embeds, negative, guidance) = encoded;
+        let (transformer, vae, pid) = match phase {
+            HeavyPhase::Resident(comps) => (
+                comps.transformer.as_ref(),
+                comps.vae.as_ref(),
+                comps.pid.as_deref(),
+            ),
+            HeavyPhase::Sequential(heavy) => {
+                (&heavy.transformer, &heavy.vae, heavy.pid.as_deref())
+            }
+        };
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            pid,
+            req,
+            base_seed,
+            self.variant.id(),
+        )?;
+        self.sample(
+            req,
+            transformer,
+            vae,
+            &prompt_embeds,
+            negative.as_ref(),
+            pid_decoder.as_ref(),
+            guidance,
+            steps,
+            base_seed,
+            on_progress,
+        )
+    }
+
+    /// The per-image denoise + decode loop shared by both residency modes. Given `prompt_embeds`
     /// (+ optional klein CFG `negative`), a borrowed DiT + VAE, and the resolved PiD seam, the sampled
     /// output is **byte-identical** across both residency modes — only the load/free schedule of the
     /// components handed in differs.
@@ -654,75 +731,6 @@ impl Pipeline {
         })
     }
 
-    /// Sequential-residency render (epic 10765 Phase 1c, sc-10868): load the text encoder → encode the
-    /// prompt(s) → DROP it → load the DiT + VAE → denoise/decode. Peak VRAM is bounded to the DiT+VAE
-    /// working set instead of TE+DiT+VAE (reclaiming the decoder-LM TE — the largest such win off-Mac on
-    /// the 32B **dev**, where the Mistral TE is multiple GB), so a card that OOMs the resident path can
-    /// still render. Output is **bit-identical** to [`render`](Self::render) — the SAME encode ([`encode`]
-    /// / [`encode_negative`]), the shared [`sample`](Self::sample) denoise+decode loop; only the load/free
-    /// schedule differs.
-    ///
-    /// Selected by the generator when [`candle_gen::sequential_offload_enabled`]
-    /// (`CANDLE_GEN_OFFLOAD=sequential`) or `LoadSpec::offload_policy == Sequential` (the worker fit-gate
-    /// sets it). Because it drops components,
-    /// it does NOT populate the generator's `Components` cache — repeat requests reload from the (page-
-    /// cached) snapshot; that reload cost is the deliberate trade for the lower peak, which is why it is
-    /// opt-in per the fit-gate rather than the default.
-    ///
-    /// The schedule itself — the cancel checks at each stage boundary (F-173), the `Progress::Loading`
-    /// emits (F-179), and the drop-before-load ordering — lives in [`candle_gen::run_sequential`], shared
-    /// with every other wired candle engine (sc-12089). Only the two loaders and the encode/render bodies
-    /// are FLUX.2's.
-    fn render_sequential(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> CResult<Vec<Image>> {
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(self.variant.default_steps() as usize);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
-
-        candle_gen::run_sequential(
-            &req.cancel,
-            on_progress,
-            // The text phase is the decoder-LM TE + its cheap tokenizer; both drop after the encode so
-            // the TE frees before the DiT loads.
-            || Ok((self.load_te_seq()?, self.build_tokenizer()?)),
-            // Delegates to the SAME `encode`/`encode_negative` the resident path uses, so the
-            // conditioning tensors are byte-identical to `render`.
-            |(te, tokenizer)| {
-                let prompt_embeds = self.encode(te, tokenizer, &req.prompt)?;
-                let negative = self.encode_negative(te, tokenizer, req, guidance)?;
-                Ok((prompt_embeds, negative))
-            },
-            // F-177: skip the PiD student unless THIS request decodes through it.
-            || self.load_heavy_seq(req.use_pid),
-            |heavy, (prompt_embeds, negative), on_progress| {
-                let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-                    heavy.pid.as_deref(),
-                    req,
-                    base_seed,
-                    self.variant.id(),
-                )?;
-                // The shared per-image denoise + decode loop, identical to `render`'s.
-                self.sample(
-                    req,
-                    &heavy.transformer,
-                    &heavy.vae,
-                    &prompt_embeds,
-                    negative.as_ref(),
-                    pid_decoder.as_ref(),
-                    guidance,
-                    steps,
-                    base_seed,
-                    on_progress,
-                )
-            },
-        )
-    }
 }
 
 /// Map a decoded `[1, 3, H, W]` tensor in `[-1, 1]` to an RGB8 [`Image`].
@@ -741,39 +749,12 @@ pub(crate) fn to_image(decoded: &Tensor) -> CResult<Image> {
     })
 }
 
-/// A loaded candle FLUX.2 generator. Loading is lazy; components build on the first `generate` and
-/// are cached. `variant` selects klein vs dev (config, text encoder, tokenizer, guidance regime).
+/// A loaded candle FLUX.2 generator. The shared residency owner holds either the warm phase pair or
+/// the deferred per-request loaders.
 pub struct Flux2Generator {
-    variant: Flux2Variant,
     descriptor: ModelDescriptor,
-    root: PathBuf,
-    device: Device,
-    /// `Some` ⇒ CPU-stage → quantize-onto-GPU at load (dev Q4/Q8); `None` ⇒ dense.
-    quant: Option<Quant>,
-    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
-    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
-    pid_spec: Option<PidWeights>,
-    /// Component-residency policy captured from `LoadSpec::offload_policy` (epic 10765 Phase 1c,
-    /// sc-10868). `Sequential` routes `generate` through [`Pipeline::render_sequential`] (load→encode→drop
-    /// the text encoder before the DiT), capping peak VRAM at the cost of the components cache; `Resident`
-    /// (default) keeps the cached path. The worker's fit-gate sets this when it predicts the resident sum
-    /// won't fit but the DiT+VAE working set will.
-    offload_policy: OffloadPolicy,
-    /// An in-place ComfyUI FLUX.2-dev fp8-mixed DiT single-file (epic 10451 Phase 2e, sc-10680), set
-    /// only by [`load_from_comfyui_dit`]. When `Some`, the lazy component build sources the transformer
-    /// from this file (inline-scale fp8 dequant + BFL→diffusers remap) and the TE / VAE / tokenizer from
-    /// [`Self::root`] (a resident FLUX.2-dev snapshot); `None` on the registry path.
-    comfyui_dit: Option<PathBuf>,
-    components: Mutex<Option<Components>>,
-}
-
-impl Flux2Generator {
-    fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
-        Ok(candle_gen::cached(&self.components, || {
-            pipe.load_components()
-        })?)
-    }
+    pipe: Pipeline,
+    residency: Flux2Residency,
 }
 
 impl Generator for Flux2Generator {
@@ -809,35 +790,15 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = match &self.comfyui_dit {
-            Some(dit_file) => {
-                Pipeline::load_comfyui(self.quant, &self.root, &self.device, dit_file.clone())
-            }
-            None => Pipeline::load(
-                self.variant,
-                self.quant,
-                &self.root,
-                &self.device,
-                self.pid_spec.clone(),
-            ),
-        };
-        // Sequential-residency offload (epic 10765, sc-10868): when selected, load→encode→drop the text
-        // encoder before loading the DiT so peak VRAM is DiT+VAE, not TE+DiT+VAE — letting a card that
-        // OOMs the resident path render. Output is bit-identical; it bypasses the components cache (it
-        // drops what it loads). Driven by `LoadSpec::offload_policy` (the worker fit-gate sets
-        // `Sequential`); `CANDLE_GEN_OFFLOAD=sequential` is an env override kept for the GPU A/B harness.
-        // Never taken on the in-place ComfyUI DiT lane — that transformer is a single file, not
-        // `root/transformer/`, so the sequential per-phase loaders can't source it (falls back to
-        // resident). The default stays the resident, cross-request-cached path.
-        let sequential = self.comfyui_dit.is_none()
-            && (self.offload_policy == OffloadPolicy::Sequential
-                || candle_gen::sequential_offload_enabled());
-        let images = if sequential {
-            pipe.render_sequential(req, on_progress)?
-        } else {
-            let components = self.components(&pipe)?;
-            pipe.render(req, &components, on_progress)?
-        };
+        let images = self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text| self.pipe.encode_phase(text, req),
+            |heavy, encoded, on_progress| {
+                self.pipe.render_phase(heavy, req, encoded, on_progress)
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -896,6 +857,42 @@ pub fn descriptor_dev() -> ModelDescriptor {
     descriptor(Flux2Variant::Dev)
 }
 
+fn generator_from_pipeline(
+    pipe: Pipeline,
+    policy: OffloadPolicy,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let variant = pipe.variant;
+    let resident_pipe = pipe.clone();
+    let text_pipe = pipe.clone();
+    let heavy_pipe = pipe.clone();
+    let residency = Flux2Residency::from_policy_with_resident(
+        policy,
+        move || {
+            let comps = resident_pipe.load_components()?;
+            Ok((
+                TextPhase::Resident(comps.clone()),
+                HeavyPhase::Resident(comps),
+            ))
+        },
+        move || {
+            Ok(TextPhase::Sequential(Box::new((
+                text_pipe.load_te_seq()?,
+                text_pipe.build_tokenizer()?,
+            ))))
+        },
+        move |use_pid| {
+            Ok(HeavyPhase::Sequential(Box::new(
+                heavy_pipe.load_heavy_seq(use_pid)?,
+            )))
+        },
+    )?;
+    Ok(Box::new(Flux2Generator {
+        descriptor: descriptor(variant),
+        pipe,
+        residency,
+    }))
+}
+
 /// Construct a lazy candle FLUX.2 generator for `variant`. `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
 /// `tokenizer/`) — klein at `black-forest-labs/FLUX.2-klein-9B`, dev at `black-forest-labs/FLUX.2-dev`
@@ -931,22 +928,9 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
         )));
     }
     let device = candle_gen::default_device()?;
-    Ok(Box::new(Flux2Generator {
-        variant,
-        descriptor: descriptor(variant),
-        root,
-        device,
-        quant,
-        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
-        // any) so the lazy component build loads the engine once. Unlike adapters/control above, it is
-        // not rejected — `None` simply keeps the byte-exact native-VAE path.
-        pid_spec: spec.pid.clone(),
-        // Component-residency policy (epic 10765 Phase 1c, sc-10868) — `Sequential` routes generate
-        // through `render_sequential`. Captured at load; the resident default is unchanged.
-        offload_policy: spec.offload_policy,
-        comfyui_dit: None,
-        components: Mutex::new(None),
-    }))
+    let pipe = Pipeline::load(variant, quant, &root, &device, spec.pid.clone());
+    let policy = candle_gen::effective_offload_policy(spec.offload_policy);
+    generator_from_pipeline(pipe, policy)
 }
 
 /// Construct a lazy candle FLUX.2-**dev** generator that reads its **DiT** in place from an existing
@@ -964,19 +948,9 @@ pub fn load_from_comfyui_dit(
     quant: Option<Quant>,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let device = candle_gen::default_device()?;
-    Ok(Box::new(Flux2Generator {
-        variant: Flux2Variant::Dev,
-        descriptor: descriptor(Flux2Variant::Dev),
-        root: snapshot_dir.into(),
-        device,
-        quant,
-        pid_spec: None,
-        // The in-place ComfyUI DiT lane keeps everything resident (its transformer is a single file, not
-        // `root/transformer/`, so the sequential per-phase loaders don't apply).
-        offload_policy: OffloadPolicy::Resident,
-        comfyui_dit: Some(transformer_file.into()),
-        components: Mutex::new(None),
-    }))
+    let root = snapshot_dir.into();
+    let pipe = Pipeline::load_comfyui(quant, &root, &device, transformer_file.into());
+    generator_from_pipeline(pipe, OffloadPolicy::Resident)
 }
 
 /// Registry load hook for `flux2_klein_9b`.
@@ -1386,7 +1360,7 @@ mod tests {
     /// The sequential-residency offload contract (epic 10765 Phase 1c, sc-10868): `with_offload_policy`
     /// is captured at load (not rejected), and the env override + spec policy select the phased path.
     /// Loading stays lazy, so this asserts the plumbing on CPU without any weights or a GPU: a
-    /// `Sequential` spec builds a generator (the `render_sequential` route is selected inside `generate`,
+    /// `Sequential` spec builds a generator (the shared residency route is selected at load,
     /// exercised end-to-end by the cuda A/B below), and the default spec stays `Resident`.
     #[test]
     fn offload_policy_is_captured_not_rejected() {
