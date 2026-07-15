@@ -82,7 +82,9 @@ pub fn load_indexed_var_builder(
     let map = json
         .get("weight_map")
         .and_then(|m| m.as_object())
-        .ok_or_else(|| CandleError::Msg(format!("mochi t5 index {}: no weight_map", index.display())))?;
+        .ok_or_else(|| {
+            CandleError::Msg(format!("mochi t5 index {}: no weight_map", index.display()))
+        })?;
 
     // Unique shard filenames (BTreeSet → sorted + deduped), resolved under `dir`.
     let shard_files: BTreeSet<String> = map
@@ -102,7 +104,11 @@ pub fn load_indexed_var_builder(
 /// Tokenize `prompt` (`padding="max_length"`, `max_length=256`, `truncation`, `add_special_tokens`) →
 /// `(input_ids [1, 256] u32, mask01 [256] 0/1)`. Real tokens (content + the appended EOS `</s>`) are a
 /// contiguous prefix; the tail is right-padded with pad id `0` and `mask01 = 0`.
-pub fn tokenize(tokenizer: &Tokenizer, prompt: &str, device: &Device) -> Result<(Tensor, Vec<u32>)> {
+pub fn tokenize(
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    device: &Device,
+) -> Result<(Tensor, Vec<u32>)> {
     let enc = tokenizer
         .encode(prompt, true)
         .map_err(|e| CandleError::Msg(format!("mochi: T5 tokenize: {e}")))?;

@@ -80,7 +80,7 @@ impl CausalConv3d {
             .reshape((b, t, o, hp, wp))?
             .permute((0, 2, 1, 3, 4))?
             .contiguous()?; // [B, O, T, H, W]
-        Ok(y.broadcast_add(&self.bias)?)
+        y.broadcast_add(&self.bias)
     }
 }
 

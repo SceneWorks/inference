@@ -126,7 +126,9 @@ pub struct MochiGenerator {
 
 impl MochiGenerator {
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        Ok(candle_gen::cached(&self.components, || pipe.load_components())?)
+        Ok(candle_gen::cached(&self.components, || {
+            pipe.load_components()
+        })?)
     }
 }
 
@@ -184,15 +186,14 @@ impl Generator for MochiGenerator {
 /// (a split-weight diffusers layout). Adapters / on-the-fly quantization / conditioning are rejected
 /// (not wired — Mochi ships pre-quantized per-tier checkpoints).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(
+    let root =
+        match &spec.weights {
+            WeightsSource::Dir(p) => p.clone(),
+            WeightsSource::File(_) => return Err(gen_core::Error::Msg(
                 "mochi_1: expected a model directory (split-weight snapshot), not a single file"
                     .into(),
-            ))
-        }
-    };
+            )),
+        };
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(
             "candle mochi does not support LoRA/LoKr".into(),

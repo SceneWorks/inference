@@ -40,8 +40,8 @@ pub fn linear_quadratic_schedule(num_steps: usize, threshold_noise: f64) -> Vec<
     let threshold_noise_step_diff = ls - threshold_noise * n;
     let quadratic_steps = (num_steps - linear_steps) as f64;
     let quadratic_coef = threshold_noise_step_diff / (ls * quadratic_steps * quadratic_steps);
-    let linear_coef =
-        threshold_noise / ls - 2.0 * threshold_noise_step_diff / (quadratic_steps * quadratic_steps);
+    let linear_coef = threshold_noise / ls
+        - 2.0 * threshold_noise_step_diff / (quadratic_steps * quadratic_steps);
     let konst = quadratic_coef * (ls * ls);
     for i in linear_steps..num_steps {
         let i = i as f64;

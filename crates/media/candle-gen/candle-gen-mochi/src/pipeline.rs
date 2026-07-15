@@ -101,10 +101,7 @@ impl Pipeline {
         let neg = encode_prompt(&comps.tokenizer, &comps.t5, neg_prompt, &self.device)?;
         // CFG batch order [neg, pos] — matches `scheduler::cfg_combine` (uncond = half 0, cond = half 1).
         let enc = Tensor::cat(&[&neg.prompt_embeds, &pos.prompt_embeds], 0)?;
-        let enc_mask = Tensor::cat(
-            &[&neg.prompt_attention_mask, &pos.prompt_attention_mask],
-            0,
-        )?;
+        let enc_mask = Tensor::cat(&[&neg.prompt_attention_mask, &pos.prompt_attention_mask], 0)?;
 
         // Geometry: AsymmVAE 6× temporal / 8× spatial; the DiT sees the `[1, 12, F_lat, H/8, W/8]`
         // latent (frames already gated to `1 + 6·k`, size to multiple-of-16 by `validate`).
@@ -148,7 +145,11 @@ fn seeded_latents(seed: u64, lf: usize, lh: usize, lw: usize, device: &Device) -
     let n = LATENT_CHANNELS * lf * lh * lw;
     let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
-    Ok(Tensor::from_vec(data, (1, LATENT_CHANNELS, lf, lh, lw), device)?)
+    Ok(Tensor::from_vec(
+        data,
+        (1, LATENT_CHANNELS, lf, lh, lw),
+        device,
+    )?)
 }
 
 /// N-step 1st-order Euler **true-CFG** denoise (Mochi is not distilled).

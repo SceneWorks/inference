@@ -43,10 +43,23 @@ fn centers(start: f64, stop: f64, num: usize) -> Vec<f64> {
 /// The per-token `(t, h, w)` positions for a `(num_frames, height, width)` visual grid, row-major over
 /// `(t, h, w)` → `[seq, 3]` f32 (`seq = num_frames·height·width`). `height`/`width` are the
 /// **post-patch** latent dims.
-pub fn get_positions(num_frames: usize, height: usize, width: usize, device: &Device) -> Result<Tensor> {
+pub fn get_positions(
+    num_frames: usize,
+    height: usize,
+    width: usize,
+    device: &Device,
+) -> Result<Tensor> {
     let scale = (BASE_AREA / (height as f64 * width as f64)).sqrt();
-    let h_centers = centers(-(height as f64) * scale / 2.0, height as f64 * scale / 2.0, height);
-    let w_centers = centers(-(width as f64) * scale / 2.0, width as f64 * scale / 2.0, width);
+    let h_centers = centers(
+        -(height as f64) * scale / 2.0,
+        height as f64 * scale / 2.0,
+        height,
+    );
+    let w_centers = centers(
+        -(width as f64) * scale / 2.0,
+        width as f64 * scale / 2.0,
+        width,
+    );
 
     let seq = num_frames * height * width;
     let mut data = Vec::with_capacity(seq * 3);
@@ -129,8 +142,14 @@ impl MochiRope {
 
         // Interleaved split: [B, seq, heads, half, 2] → even = [..,0], odd = [..,1].
         let x5 = x.to_dtype(DType::F32)?.reshape((b, s, n, half, 2))?;
-        let x_even = x5.narrow(D::Minus1, 0, 1)?.squeeze(D::Minus1)?.contiguous()?;
-        let x_odd = x5.narrow(D::Minus1, 1, 1)?.squeeze(D::Minus1)?.contiguous()?;
+        let x_even = x5
+            .narrow(D::Minus1, 0, 1)?
+            .squeeze(D::Minus1)?
+            .contiguous()?;
+        let x_odd = x5
+            .narrow(D::Minus1, 1, 1)?
+            .squeeze(D::Minus1)?
+            .contiguous()?;
 
         // cos/sin [seq, heads, half] → [1, seq, heads, half] to broadcast over the batch.
         let cos = self.cos.unsqueeze(0)?;
@@ -185,7 +204,12 @@ mod tests {
         let ys = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let want_even = 2.0 * cos - 5.0 * sin;
         let want_odd = 2.0 * sin + 5.0 * cos;
-        assert!((ys[0] - want_even).abs() < 1e-5, "{} vs {}", ys[0], want_even);
+        assert!(
+            (ys[0] - want_even).abs() < 1e-5,
+            "{} vs {}",
+            ys[0],
+            want_even
+        );
         assert!((ys[1] - want_odd).abs() < 1e-5, "{} vs {}", ys[1], want_odd);
     }
 
@@ -201,15 +225,23 @@ mod tests {
         assert_eq!(rope.sin.dims(), &[32, 24, 64]);
 
         // RoPE is an orthogonal per-pair rotation → preserves the L2 norm of q/k.
-        let xn: usize = 1 * 32 * 24 * 128;
+        let xn: usize = 32 * 24 * 128;
         let xdata: Vec<f32> = (0..xn).map(|i| ((i as f32) * 0.017).sin()).collect();
         let x = Tensor::from_vec(xdata, (1, 32, 24, 128), &dev).unwrap();
         let y = rope.apply(&x).unwrap();
         assert_eq!(y.dims(), x.dims());
         let norm = |t: &Tensor| -> f32 {
-            t.sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap()
+            t.sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
         };
         let (xnorm, ynorm) = (norm(&x), norm(&y));
-        assert!((xnorm - ynorm).abs() / xnorm < 1e-4, "norm changed: {xnorm} vs {ynorm}");
+        assert!(
+            (xnorm - ynorm).abs() / xnorm < 1e-4,
+            "norm changed: {xnorm} vs {ynorm}"
+        );
     }
 }

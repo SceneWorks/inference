@@ -87,7 +87,13 @@ pub fn timestep_sincos(t: &Tensor, dim: usize, max_period: f64, device: &Device)
 /// Scaled-dot-product attention over `[B, H, S, D]` q/k/v with an optional additive mask, routed
 /// through the shared i32-overflow-safe budgeted helper (sc-9116) with the fused `softmax_last_dim`.
 /// `scale` multiplies the scores before softmax. The additive `mask` broadcasts over `[B, H, Sq, Sk]`.
-pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, mask: Option<&Tensor>) -> Result<Tensor> {
+pub fn sdpa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+) -> Result<Tensor> {
     Ok(candle_gen::sdpa_budgeted_bhsd(
         q,
         k,

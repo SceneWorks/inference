@@ -26,7 +26,9 @@ use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::{CandleError, Result};
 
-use crate::nn::{layer_norm_no_affine, linear_b, linear_nb, rms_weightless, rms_weighted, silu, timestep_sincos};
+use crate::nn::{
+    layer_norm_no_affine, linear_b, linear_nb, rms_weighted, rms_weightless, silu, timestep_sincos,
+};
 use crate::rope::MochiRope;
 
 /// AsymmDiT geometry (`transformer/config.json`). `inner_dim = num_heads · head_dim = 3072`.
@@ -209,7 +211,7 @@ impl MochiAttention {
 
         // → [B, Sv+St, inner]; split back to visual / text.
         let (b, _, _, _) = out.dims4()?;
-        let inner = (self.num_heads * self.head_dim) as usize;
+        let inner = self.num_heads * self.head_dim;
         let out = out
             .transpose(1, 2)?
             .contiguous()?
@@ -321,12 +323,14 @@ impl MochiTransformerBlock {
             NormContext::Zero { lin_w, lin_b } => {
                 let emb_c = linear_b(&silu_temb, lin_w, lin_b)?;
                 let cc = chunk_last(&emb_c, 4)?;
-                let norm_e = rms_weightless(enc, eps)?.broadcast_mul(&scale_plus_one_seq(&cc[0])?)?;
+                let norm_e =
+                    rms_weightless(enc, eps)?.broadcast_mul(&scale_plus_one_seq(&cc[0])?)?;
                 (norm_e, Some((cc[1].clone(), cc[2].clone(), cc[3].clone())))
             }
             NormContext::Continuous { lin_w, lin_b } => {
                 let scale_c = linear_b(&silu_temb, lin_w, lin_b)?;
-                let norm_e = rms_weightless(enc, eps)?.broadcast_mul(&scale_plus_one_seq(&scale_c)?)?;
+                let norm_e =
+                    rms_weightless(enc, eps)?.broadcast_mul(&scale_plus_one_seq(&scale_c)?)?;
                 (norm_e, None)
             }
         };
@@ -335,18 +339,20 @@ impl MochiTransformerBlock {
         let (attn_h, attn_e) = self.attn.forward(&norm_h, &norm_e, rope, enc_mask)?;
 
         // Visual residuals: tanh-gated attn, SwiGLU FFN with (1+scale_mlp) mod, tanh-gated ff.
-        let hidden = (hidden
-            + rms_weightless(&attn_h, eps)?.broadcast_mul(&tanh_gate_seq(gate_msa)?)?)?;
-        let norm_h2 = rms_weightless(&hidden, eps)?.broadcast_mul(&scale_plus_one_seq(scale_mlp)?)?;
+        let hidden =
+            (hidden + rms_weightless(&attn_h, eps)?.broadcast_mul(&tanh_gate_seq(gate_msa)?)?)?;
+        let norm_h2 =
+            rms_weightless(&hidden, eps)?.broadcast_mul(&scale_plus_one_seq(scale_mlp)?)?;
         let ff_out = self.ff.forward(&norm_h2)?;
-        let hidden = (&hidden
-            + rms_weightless(&ff_out, eps)?.broadcast_mul(&tanh_gate_seq(gate_mlp)?)?)?;
+        let hidden =
+            (&hidden + rms_weightless(&ff_out, eps)?.broadcast_mul(&tanh_gate_seq(gate_mlp)?)?)?;
 
         // Text residuals (skipped on the final context_pre_only block).
         let enc = match (ctx_gates, attn_e, &self.ff_context) {
             (Some((e_gate_msa, e_scale_mlp, e_gate_mlp)), Some(attn_e), Some(ff_ctx)) => {
                 let enc = (enc
-                    + rms_weightless(&attn_e, eps)?.broadcast_mul(&tanh_gate_seq(&e_gate_msa)?)?)?;
+                    + rms_weightless(&attn_e, eps)?
+                        .broadcast_mul(&tanh_gate_seq(&e_gate_msa)?)?)?;
                 let norm_e2 =
                     rms_weightless(&enc, eps)?.broadcast_mul(&scale_plus_one_seq(&e_scale_mlp)?)?;
                 let ff_e = ff_ctx.forward(&norm_e2)?;
@@ -466,7 +472,12 @@ impl TimeEmbed {
         })
     }
 
-    fn forward(&self, timestep: &Tensor, enc: &Tensor, enc_mask: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        timestep: &Tensor,
+        enc: &Tensor,
+        enc_mask: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         // Timesteps(flip_sin_to_cos=True, downscale_freq_shift=0.0) → [B, time_embed_dim] (f32).
         let time_proj = timestep_sincos(
             &timestep.to_dtype(DType::F32)?,
@@ -599,15 +610,29 @@ impl MochiTransformer3DModel {
 /// Load the AsymmDiT transformer VarBuilder from `<root>/transformer/` — the **bf16** variant shards
 /// referenced by `diffusion_pytorch_model.safetensors.index.bf16.json` (index-filtered so the overlapping
 /// shard sets don't collide, like the T5 loader), at `dtype`.
-pub fn load_transformer_var_builder(root: &std::path::Path, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
+pub fn load_transformer_var_builder(
+    root: &std::path::Path,
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'static>> {
     let dir = root.join("transformer");
     let bf16_index = dir.join("diffusion_pytorch_model.safetensors.index.bf16.json");
     if bf16_index.exists() {
-        return load_index_named(&dir, "diffusion_pytorch_model.safetensors.index.bf16.json", dtype, device);
+        return load_index_named(
+            &dir,
+            "diffusion_pytorch_model.safetensors.index.bf16.json",
+            dtype,
+            device,
+        );
     }
     let index = dir.join("diffusion_pytorch_model.safetensors.index.json");
     if index.exists() {
-        return load_index_named(&dir, "diffusion_pytorch_model.safetensors.index.json", dtype, device);
+        return load_index_named(
+            &dir,
+            "diffusion_pytorch_model.safetensors.index.json",
+            dtype,
+            device,
+        );
     }
     candle_gen::load_sorted_mmap(&dir, dtype, device, "mochi dit")
 }
@@ -627,7 +652,12 @@ fn load_index_named(
     let map = json
         .get("weight_map")
         .and_then(|m| m.as_object())
-        .ok_or_else(|| CandleError::Msg(format!("mochi dit index {}: no weight_map", index.display())))?;
+        .ok_or_else(|| {
+            CandleError::Msg(format!(
+                "mochi dit index {}: no weight_map",
+                index.display()
+            ))
+        })?;
     let shard_files: std::collections::BTreeSet<String> = map
         .values()
         .filter_map(|v| v.as_str().map(String::from))
@@ -670,7 +700,12 @@ mod tests {
         }
     }
 
-    fn insert_block(w: &mut HashMap<String, Tensor>, cfg: &MochiDitConfig, prefix: &str, dev: &Device) {
+    fn insert_block(
+        w: &mut HashMap<String, Tensor>,
+        cfg: &MochiDitConfig,
+        prefix: &str,
+        dev: &Device,
+    ) {
         let inner = cfg.inner_dim();
         let pooled = cfg.pooled_dim;
         let hd = cfg.head_dim;
@@ -682,7 +717,10 @@ mod tests {
         };
         put(p("norm1.linear.weight"), rnd(&[4 * inner, inner], 1, dev));
         put(p("norm1.linear.bias"), rnd(&[4 * inner], 2, dev));
-        put(p("norm1_context.linear.weight"), rnd(&[4 * pooled, inner], 3, dev));
+        put(
+            p("norm1_context.linear.weight"),
+            rnd(&[4 * pooled, inner], 3, dev),
+        );
         put(p("norm1_context.linear.bias"), rnd(&[4 * pooled], 4, dev));
         put(p("attn1.to_q.weight"), rnd(&[inner, inner], 5, dev));
         put(p("attn1.to_k.weight"), rnd(&[inner, inner], 6, dev));
@@ -698,10 +736,19 @@ mod tests {
         put(p("attn1.to_out.0.bias"), rnd(&[inner], 16, dev));
         put(p("attn1.to_add_out.weight"), rnd(&[pooled, inner], 17, dev));
         put(p("attn1.to_add_out.bias"), rnd(&[pooled], 18, dev));
-        put(p("ff.net.0.proj.weight"), rnd(&[2 * ff_inner, inner], 19, dev));
+        put(
+            p("ff.net.0.proj.weight"),
+            rnd(&[2 * ff_inner, inner], 19, dev),
+        );
         put(p("ff.net.2.weight"), rnd(&[inner, ff_inner], 20, dev));
-        put(p("ff_context.net.0.proj.weight"), rnd(&[2 * ff_ctx_inner, pooled], 21, dev));
-        put(p("ff_context.net.2.weight"), rnd(&[pooled, ff_ctx_inner], 22, dev));
+        put(
+            p("ff_context.net.0.proj.weight"),
+            rnd(&[2 * ff_ctx_inner, pooled], 21, dev),
+        );
+        put(
+            p("ff_context.net.2.weight"),
+            rnd(&[pooled, ff_ctx_inner], 22, dev),
+        );
     }
 
     fn tiny_full_weights(cfg: &MochiDitConfig, dev: &Device) -> HashMap<String, Tensor> {
@@ -714,22 +761,64 @@ mod tests {
         let out_dims = cfg.patch_size * cfg.patch_size * cfg.in_channels;
 
         let mut w = HashMap::new();
-        w.insert("patch_embed.proj.weight".into(), rnd(&[inner, in_ch, 2, 2], 200, dev));
+        w.insert(
+            "patch_embed.proj.weight".into(),
+            rnd(&[inner, in_ch, 2, 2], 200, dev),
+        );
         w.insert("patch_embed.proj.bias".into(), rnd(&[inner], 201, dev));
-        w.insert("pos_frequencies".into(), rnd(&[3, cfg.num_heads, half], 202, dev));
-        w.insert("time_embed.timestep_embedder.linear_1.weight".into(), rnd(&[inner, ted], 203, dev));
-        w.insert("time_embed.timestep_embedder.linear_1.bias".into(), rnd(&[inner], 204, dev));
-        w.insert("time_embed.timestep_embedder.linear_2.weight".into(), rnd(&[inner, inner], 205, dev));
-        w.insert("time_embed.timestep_embedder.linear_2.bias".into(), rnd(&[inner], 206, dev));
-        w.insert("time_embed.pooler.to_kv.weight".into(), rnd(&[2 * te, te], 207, dev));
-        w.insert("time_embed.pooler.to_kv.bias".into(), rnd(&[2 * te], 208, dev));
-        w.insert("time_embed.pooler.to_q.weight".into(), rnd(&[te, te], 209, dev));
+        w.insert(
+            "pos_frequencies".into(),
+            rnd(&[3, cfg.num_heads, half], 202, dev),
+        );
+        w.insert(
+            "time_embed.timestep_embedder.linear_1.weight".into(),
+            rnd(&[inner, ted], 203, dev),
+        );
+        w.insert(
+            "time_embed.timestep_embedder.linear_1.bias".into(),
+            rnd(&[inner], 204, dev),
+        );
+        w.insert(
+            "time_embed.timestep_embedder.linear_2.weight".into(),
+            rnd(&[inner, inner], 205, dev),
+        );
+        w.insert(
+            "time_embed.timestep_embedder.linear_2.bias".into(),
+            rnd(&[inner], 206, dev),
+        );
+        w.insert(
+            "time_embed.pooler.to_kv.weight".into(),
+            rnd(&[2 * te, te], 207, dev),
+        );
+        w.insert(
+            "time_embed.pooler.to_kv.bias".into(),
+            rnd(&[2 * te], 208, dev),
+        );
+        w.insert(
+            "time_embed.pooler.to_q.weight".into(),
+            rnd(&[te, te], 209, dev),
+        );
         w.insert("time_embed.pooler.to_q.bias".into(), rnd(&[te], 210, dev));
-        w.insert("time_embed.pooler.to_out.weight".into(), rnd(&[inner, te], 211, dev));
-        w.insert("time_embed.pooler.to_out.bias".into(), rnd(&[inner], 212, dev));
-        w.insert("time_embed.caption_proj.weight".into(), rnd(&[pooled, te], 213, dev));
-        w.insert("time_embed.caption_proj.bias".into(), rnd(&[pooled], 214, dev));
-        w.insert("norm_out.linear.weight".into(), rnd(&[2 * inner, inner], 215, dev));
+        w.insert(
+            "time_embed.pooler.to_out.weight".into(),
+            rnd(&[inner, te], 211, dev),
+        );
+        w.insert(
+            "time_embed.pooler.to_out.bias".into(),
+            rnd(&[inner], 212, dev),
+        );
+        w.insert(
+            "time_embed.caption_proj.weight".into(),
+            rnd(&[pooled, te], 213, dev),
+        );
+        w.insert(
+            "time_embed.caption_proj.bias".into(),
+            rnd(&[pooled], 214, dev),
+        );
+        w.insert(
+            "norm_out.linear.weight".into(),
+            rnd(&[2 * inner, inner], 215, dev),
+        );
         w.insert("norm_out.linear.bias".into(), rnd(&[2 * inner], 216, dev));
         w.insert("proj_out.weight".into(), rnd(&[out_dims, inner], 217, dev));
         w.insert("proj_out.bias".into(), rnd(&[out_dims], 218, dev));
@@ -737,8 +826,14 @@ mod tests {
         insert_block(&mut w, cfg, "transformer_blocks.0", dev);
         insert_block(&mut w, cfg, "transformer_blocks.1", dev);
         // Block 1 is the final context_pre_only block → needs norm1_context.linear_1.
-        w.insert("transformer_blocks.1.norm1_context.linear_1.weight".into(), rnd(&[pooled, inner], 219, dev));
-        w.insert("transformer_blocks.1.norm1_context.linear_1.bias".into(), rnd(&[pooled], 220, dev));
+        w.insert(
+            "transformer_blocks.1.norm1_context.linear_1.weight".into(),
+            rnd(&[pooled, inner], 219, dev),
+        );
+        w.insert(
+            "transformer_blocks.1.norm1_context.linear_1.bias".into(),
+            rnd(&[pooled], 220, dev),
+        );
         w
     }
 
@@ -747,11 +842,15 @@ mod tests {
     #[test]
     fn block_forward_shapes_and_determinism() {
         let dev = Device::Cpu;
-        let cfg = MochiDitConfig { num_layers: 1, ..tiny_full_cfg() };
+        let cfg = MochiDitConfig {
+            num_layers: 1,
+            ..tiny_full_cfg()
+        };
         let mut wmap = HashMap::new();
         insert_block(&mut wmap, &cfg, "transformer_blocks.0", &dev);
         let vb = VarBuilder::from_tensors(wmap, DType::F32, &dev);
-        let block = MochiTransformerBlock::load(&vb.pp("transformer_blocks").pp(0), &cfg, false).unwrap();
+        let block =
+            MochiTransformerBlock::load(&vb.pp("transformer_blocks").pp(0), &cfg, false).unwrap();
 
         // 1 frame × 2 × 2 = 4 visual tokens, 3 text tokens (2 valid, 1 pad), inner 16, pooled 8.
         let hidden = rnd(&[1, 4, 16], 100, &dev);
@@ -761,16 +860,34 @@ mod tests {
         let pf = rnd(&[3, 2, 4], 103, &dev);
         let rope = MochiRope::new(&pf, 1, 2, 2, &dev).unwrap();
 
-        let (h1, e1) = block.forward(&hidden, &enc, &temb, &rope, &enc_mask).unwrap();
+        let (h1, e1) = block
+            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .unwrap();
         assert_eq!(h1.dims(), &[1, 4, 16]);
         assert_eq!(e1.dims(), &[1, 3, 8]);
 
-        let (h2, e2) = block.forward(&hidden, &enc, &temb, &rope, &enc_mask).unwrap();
+        let (h2, e2) = block
+            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .unwrap();
         let close = |a: &Tensor, b: &Tensor| {
-            (a - b).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap() < 1e-6
+            (a - b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                < 1e-6
         };
         assert!(close(&h1, &h2) && close(&e1, &e2));
-        assert!(h1.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().all(|x| x.is_finite()));
+        assert!(h1
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|x| x.is_finite()));
     }
 
     /// The full model forwards a `[neg, pos]` batch to a velocity of the latent shape, is
@@ -786,14 +903,32 @@ mod tests {
         let hidden = rnd(&[2, 4, 1, 4, 4], 300, &dev);
         let enc = rnd(&[2, 3, 16], 301, &dev);
         let timestep = Tensor::from_vec(vec![0.0f32, 25.0], 2, &dev).unwrap();
-        let enc_mask = Tensor::from_vec(vec![1.0f32, 1.0, 0.0, 1.0, 0.0, 0.0], (2, 3), &dev).unwrap();
+        let enc_mask =
+            Tensor::from_vec(vec![1.0f32, 1.0, 0.0, 1.0, 0.0, 0.0], (2, 3), &dev).unwrap();
 
         let out = model.forward(&hidden, &enc, &timestep, &enc_mask).unwrap();
-        assert_eq!(out.dims(), &[2, 4, 1, 4, 4], "noise_pred matches latent shape");
-        assert!(out.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().all(|x| x.is_finite()));
+        assert_eq!(
+            out.dims(),
+            &[2, 4, 1, 4, 4],
+            "noise_pred matches latent shape"
+        );
+        assert!(out
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|x| x.is_finite()));
 
         let out2 = model.forward(&hidden, &enc, &timestep, &enc_mask).unwrap();
-        let d = (&out - &out2).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+        let d = (&out - &out2)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
         assert_eq!(d, 0.0, "forward is deterministic");
     }
 
@@ -801,14 +936,24 @@ mod tests {
     #[test]
     fn context_pre_only_block_returns_enc_unchanged() {
         let dev = Device::Cpu;
-        let cfg = MochiDitConfig { num_layers: 1, ..tiny_full_cfg() };
+        let cfg = MochiDitConfig {
+            num_layers: 1,
+            ..tiny_full_cfg()
+        };
         let mut wmap = HashMap::new();
         insert_block(&mut wmap, &cfg, "transformer_blocks.0", &dev);
         // Final block: continuous norm1_context; the Zero linear + text-only weights are ignored.
-        wmap.insert("transformer_blocks.0.norm1_context.linear_1.weight".into(), rnd(&[cfg.pooled_dim, cfg.inner_dim()], 30, &dev));
-        wmap.insert("transformer_blocks.0.norm1_context.linear_1.bias".into(), rnd(&[cfg.pooled_dim], 31, &dev));
+        wmap.insert(
+            "transformer_blocks.0.norm1_context.linear_1.weight".into(),
+            rnd(&[cfg.pooled_dim, cfg.inner_dim()], 30, &dev),
+        );
+        wmap.insert(
+            "transformer_blocks.0.norm1_context.linear_1.bias".into(),
+            rnd(&[cfg.pooled_dim], 31, &dev),
+        );
         let vb = VarBuilder::from_tensors(wmap, DType::F32, &dev);
-        let block = MochiTransformerBlock::load(&vb.pp("transformer_blocks").pp(0), &cfg, true).unwrap();
+        let block =
+            MochiTransformerBlock::load(&vb.pp("transformer_blocks").pp(0), &cfg, true).unwrap();
 
         let hidden = rnd(&[1, 4, 16], 100, &dev);
         let enc = rnd(&[1, 3, 8], 101, &dev);
@@ -816,10 +961,19 @@ mod tests {
         let enc_mask = Tensor::from_vec(vec![1.0f32, 1.0, 0.0], (1, 3), &dev).unwrap();
         let pf = rnd(&[3, 2, 4], 103, &dev);
         let rope = MochiRope::new(&pf, 1, 2, 2, &dev).unwrap();
-        let (h, e) = block.forward(&hidden, &enc, &temb, &rope, &enc_mask).unwrap();
+        let (h, e) = block
+            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .unwrap();
         assert_eq!(h.dims(), &[1, 4, 16]);
         // enc is bit-identical to the input (no context update on the final block).
-        let same = (&e - &enc).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+        let same = (&e - &enc)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
         assert_eq!(same, 0.0);
     }
 }

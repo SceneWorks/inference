@@ -25,8 +25,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{GroupNorm, Module, VarBuilder};
 use candle_gen::{CandleError, Result};
 
-use crate::conv3d::CausalConv3d;
 use crate::config::MochiVaeConfig;
+use crate::conv3d::CausalConv3d;
 use crate::nn::{linear_b, silu};
 
 /// `torch.nn.GroupNorm` default epsilon.
@@ -197,7 +197,12 @@ pub struct MochiVaeDecoder {
 impl MochiVaeDecoder {
     /// Build the decoder from `dec_vb` (a VarBuilder rooted at `decoder`, i.e. `conv_in.weight`,
     /// `block_in.resnets.0…`) + the config. `dtype` is the compute dtype (f32 for a clean decode).
-    pub fn new(dec_vb: VarBuilder, cfg: &MochiVaeConfig, dtype: DType, device: &Device) -> Result<Self> {
+    pub fn new(
+        dec_vb: VarBuilder,
+        cfg: &MochiVaeConfig,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
         let n_blocks = cfg.decoder_block_out_channels.len();
         let n_layers = cfg.layers_per_block.len();
         if n_blocks < 2 || n_layers < 2 || cfg.temporal_expansions.len() != n_blocks - 1 {
@@ -230,10 +235,10 @@ impl MochiVaeDecoder {
         let block_out = MidBlock::load(&dec_vb.pp("block_out"), cfg.layers_per_block[0])?;
 
         let c = cfg.latent_channels;
-        let latents_mean = Tensor::from_vec(cfg.latents_mean.clone(), (1, c, 1, 1, 1), device)?
-            .to_dtype(dtype)?;
-        let latents_std = Tensor::from_vec(cfg.latents_std.clone(), (1, c, 1, 1, 1), device)?
-            .to_dtype(dtype)?;
+        let latents_mean =
+            Tensor::from_vec(cfg.latents_mean.clone(), (1, c, 1, 1, 1), device)?.to_dtype(dtype)?;
+        let latents_std =
+            Tensor::from_vec(cfg.latents_std.clone(), (1, c, 1, 1, 1), device)?.to_dtype(dtype)?;
 
         Ok(Self {
             conv_in,
@@ -337,7 +342,13 @@ mod tests {
     }
 
     /// Insert a `MochiResnetBlock3D`'s weights (identity-ish norms, small random convs) at `pfx`.
-    fn insert_resnet(w: &mut HashMap<String, Tensor>, pfx: &str, ch: usize, seed: u64, dev: &Device) {
+    fn insert_resnet(
+        w: &mut HashMap<String, Tensor>,
+        pfx: &str,
+        ch: usize,
+        seed: u64,
+        dev: &Device,
+    ) {
         for norm in ["norm1", "norm2"] {
             w.insert(
                 format!("{pfx}.{norm}.norm_layer.weight"),
@@ -366,8 +377,14 @@ mod tests {
         let c_first = cfg.decoder_block_out_channels[0];
         let lat = cfg.latent_channels;
 
-        w.insert("conv_in.weight".into(), rnd(&[c_last, lat, 1, 1, 1], 10, dev));
-        w.insert("conv_in.bias".into(), Tensor::zeros(c_last, DType::F32, dev).unwrap());
+        w.insert(
+            "conv_in.weight".into(),
+            rnd(&[c_last, lat, 1, 1, 1], 10, dev),
+        );
+        w.insert(
+            "conv_in.bias".into(),
+            Tensor::zeros(c_last, DType::F32, dev).unwrap(),
+        );
         insert_resnet(&mut w, "block_in.resnets.0", c_last, 100, dev);
 
         let n = cfg.decoder_block_out_channels.len();
@@ -378,15 +395,33 @@ mod tests {
             let t = cfg.temporal_expansions[k - 1 - i];
             let s = cfg.spatial_expansions[k - 1 - i];
             let pfx = format!("up_blocks.{i}");
-            insert_resnet(&mut w, &format!("{pfx}.resnets.0"), in_ch, 200 + i as u64 * 13, dev);
+            insert_resnet(
+                &mut w,
+                &format!("{pfx}.resnets.0"),
+                in_ch,
+                200 + i as u64 * 13,
+                dev,
+            );
             let proj_out = out_ch * t * s * s;
-            w.insert(format!("{pfx}.proj.weight"), rnd(&[proj_out, in_ch], 300 + i as u64 * 13, dev));
-            w.insert(format!("{pfx}.proj.bias"), Tensor::zeros(proj_out, DType::F32, dev).unwrap());
+            w.insert(
+                format!("{pfx}.proj.weight"),
+                rnd(&[proj_out, in_ch], 300 + i as u64 * 13, dev),
+            );
+            w.insert(
+                format!("{pfx}.proj.bias"),
+                Tensor::zeros(proj_out, DType::F32, dev).unwrap(),
+            );
         }
 
         insert_resnet(&mut w, "block_out.resnets.0", c_first, 400, dev);
-        w.insert("proj_out.weight".into(), rnd(&[cfg.out_channels, c_first], 500, dev));
-        w.insert("proj_out.bias".into(), Tensor::zeros(cfg.out_channels, DType::F32, dev).unwrap());
+        w.insert(
+            "proj_out.weight".into(),
+            rnd(&[cfg.out_channels, c_first], 500, dev),
+        );
+        w.insert(
+            "proj_out.bias".into(),
+            Tensor::zeros(cfg.out_channels, DType::F32, dev).unwrap(),
+        );
         w
     }
 
@@ -397,7 +432,8 @@ mod tests {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let vb = VarBuilder::from_tensors(synthetic_weights(&cfg, &dev), DType::F32, &dev);
-        let dec = MochiVaeDecoder::new(vb, &cfg, DType::F32, &dev).expect("build synthetic decoder");
+        let dec =
+            MochiVaeDecoder::new(vb, &cfg, DType::F32, &dev).expect("build synthetic decoder");
 
         // Teacher-forced latent [B=1, C=12, T_lat=2, H_lat=4, W_lat=4].
         let latent = rnd(&[1, 12, 2, 4, 4], 42, &dev);
@@ -416,7 +452,12 @@ mod tests {
             .unwrap();
         assert_eq!(d, 0.0, "decode must be deterministic");
         assert!(
-            v1.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().all(|x| x.is_finite()),
+            v1.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .all(|x| x.is_finite()),
             "decode produced non-finite values"
         );
     }
