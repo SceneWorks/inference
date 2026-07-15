@@ -21,6 +21,8 @@ candle-gen-flux = { path = "../candle-gen-flux" }
 tokenizers = { workspace = true }
 # Read the T5 `model.safetensors.index.json` weight_map (the index-filtered shard load) + `vae/config.json`.
 serde_json = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity; the same StdRng draw the LTX/wan crates use).
+rand = { workspace = true }
 # Frame → RGB `Image` conversion at the pipeline tail.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
