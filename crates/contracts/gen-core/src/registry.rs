@@ -1052,7 +1052,10 @@ mod tests {
         let error = error.to_string();
         assert!(error.contains("Nvfp4"), "{error}");
         assert!(error.contains("dummy_test_model"), "{error}");
-        assert!(error.contains("no FP4 quantizer on this backend"), "{error}");
+        assert!(
+            error.contains("no FP4 quantizer on this backend"),
+            "{error}"
+        );
     }
 
     /// The guard is scoped to the declared tiers: an unrejected tier (and a dense, `None` load) still
