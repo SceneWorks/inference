@@ -28,6 +28,7 @@ pub mod providers {
     pub use candle_gen_krea as krea;
     pub use candle_gen_lens as lens;
     pub use candle_gen_ltx as ltx;
+    pub use candle_gen_mochi as mochi;
     pub use candle_gen_pid as pid;
     pub use candle_gen_pulid as pulid;
     pub use candle_gen_qwen_image as qwen_image;
@@ -64,6 +65,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_krea::register_providers(registry);
     let registry = candle_gen_lens::register_providers(registry);
     let registry = candle_gen_ltx::register_providers(registry);
+    let registry = candle_gen_mochi::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
     let registry = candle_gen_scail2::register_providers(registry);
@@ -186,6 +188,7 @@ mod tests {
                 "lens_turbo",
                 "lens",
                 "ltx_2_3_distilled",
+                "mochi_1",
                 "qwen_image",
                 "sana_1600m",
                 "sana_sprint_1600m",

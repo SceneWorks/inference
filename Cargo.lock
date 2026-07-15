@@ -299,6 +299,7 @@ dependencies = [
  "candle-gen-krea",
  "candle-gen-lens",
  "candle-gen-ltx",
+ "candle-gen-mochi",
  "candle-gen-pid",
  "candle-gen-pulid",
  "candle-gen-qwen-image",
@@ -485,6 +486,18 @@ dependencies = [
  "rand 0.9.5",
  "rand_distr",
  "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-mochi"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-flux",
+ "image",
+ "rand 0.9.5",
  "serde_json",
  "tokenizers 0.22.2",
 ]
