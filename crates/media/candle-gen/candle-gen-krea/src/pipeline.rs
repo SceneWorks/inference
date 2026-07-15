@@ -127,7 +127,7 @@ pub(crate) struct KreaHeavy {
 
 /// The loaded Krea 2 Turbo components, `Arc`-shared so the generator caches them across `generate`.
 ///
-/// The **`Resident`** aggregate of both phases ([`KreaText`] + [`KreaHeavy`]), held co-resident for the
+/// The **`Resident`** aggregate of both phases (`KreaText` + `KreaHeavy`), held co-resident for the
 /// whole job and across jobs via the generator's cache — exactly as before the sc-12089 phase split. The
 /// split is an internal seam: every public `render*` entry point still takes `&Components` and runs the
 /// same encode→denoise→decode body, so the resident path is byte-untouched (zero parity risk).
@@ -335,8 +335,8 @@ pub fn render(
 /// Peak allocation demand is bounded to max(TE, DiT+VAE+activations) instead of their sum, reclaiming
 /// the ~2.9 GB (Q4) Qwen3-VL-4B encoder before the 12B DiT materializes.
 ///
-/// Output is **byte-identical** to [`render`] — the SAME [`encode_prompt_context`] and the SAME
-/// [`render_from_context`] tail run, in the same order; only the load/free schedule differs. That is the
+/// Output is **byte-identical** to [`render`] — the SAME `encode_prompt_context` and the SAME
+/// `render_from_context` tail run, in the same order; only the load/free schedule differs. That is the
 /// zero-parity-risk property the split was built for.
 ///
 /// Selected by the generator from `LoadSpec::offload_policy` (the worker fit-gate sets `Sequential`) or
@@ -578,7 +578,7 @@ pub fn render_img2img(
 /// The VAE encoder loads on the heavy side (after the drop) rather than alongside the text phase: it is
 /// small, and the reference encode is not needed until the init latent is built, so keeping it heavy-side
 /// preserves the max(TE, heavy) peak. Output is **byte-identical** to [`render_img2img`] — the same
-/// encode and the same [`render_img2img_from_context`] tail, in the same order.
+/// encode and the same `render_img2img_from_context` tail, in the same order.
 ///
 /// Wired because `krea_2_turbo` advertises BOTH `ConditioningKind::Reference` and
 /// `supports_sequential_offload` — unlike flux/flux2/qwen-image, whose sequential engines take no
@@ -737,8 +737,8 @@ pub fn render_base(
 ///
 /// Both branches must be encoded before the drop — the denoise consumes the uncond context every step,
 /// so a text phase dropped after only the positive encode would have to reload. Output is
-/// **byte-identical** to [`render_base`]: the SAME [`encode_base_contexts`] and the SAME
-/// [`render_base_from_contexts`] tail, only the load/free schedule differs. See [`render_sequential`]
+/// **byte-identical** to [`render_base`]: the SAME `encode_base_contexts` and the SAME
+/// `render_base_from_contexts` tail, only the load/free schedule differs. See [`render_sequential`]
 /// for the selection contract and the cudarc measurement caveat.
 pub fn render_base_sequential(
     root: &Path,
@@ -923,8 +923,8 @@ pub fn render_base_img2img(
 /// CFG branches → **DROP** it → load the DiT + VAE (+ optional PiD) AND the VAE *encoder* →
 /// reference-encode → two-forward CFG denoise/decode.
 ///
-/// Output is **byte-identical** to [`render_base_img2img`]: the same [`encode_base_contexts`] and the
-/// same [`render_base_img2img_from_contexts`] tail. Wired for the same reason as
+/// Output is **byte-identical** to [`render_base_img2img`]: the same `encode_base_contexts` and the
+/// same `render_base_img2img_from_contexts` tail. Wired for the same reason as
 /// [`render_img2img_sequential`] — `krea_2_raw` advertises both `Reference` and
 /// `supports_sequential_offload`, so every request it accepts must honor the staged peak the fit-gate
 /// predicts.
