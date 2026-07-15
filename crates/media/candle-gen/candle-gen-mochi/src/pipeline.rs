@@ -62,17 +62,33 @@ impl Pipeline {
     /// Assemble the full Mochi model from a snapshot directory: the reused T5-XXL encoder + tokenizer
     /// (bf16), the AsymmDiT transformer (bf16-stored, f32-activation), and the AsymmVAE decoder (f32).
     pub fn load_components(&self) -> CResult<Components> {
+        // A pre-quantized tier dir (`.../q4|q8|bf16`) holds only the packed/dense transformer +
+        // `split_model.json`; its shared T5-XXL / AsymmVAE live in the parent (the `convert.rs` staged
+        // layout). A raw diffusers snapshot has them all under one root (`detect` ⇒ `None`). Resolve the
+        // DiT root and the shared (T5/VAE) root up front so both layouts load from the right place.
+        let tier = crate::tier::MochiTierPaths::detect(&self.root);
+        let (dit_root, shared_root) = match &tier {
+            Some(t) => {
+                // Fail loudly if a quantized tier ever ships a non-64 group (the repack would mis-align).
+                t.validate_group_size()?;
+                (t.tier_dir.clone(), t.shared_root.clone())
+            }
+            None => (self.root.clone(), self.root.clone()),
+        };
+
         // MochiConfig is currently config-as-code (the T5 geometry is fixed by the reused encoder); the
         // call keeps the snapshot-driven seam for symmetry with the VAE config.
-        let _cfg = MochiConfig::from_model_dir(&self.root)?;
-        let vae_cfg = MochiVaeConfig::from_model_dir(&self.root)?;
+        let _cfg = MochiConfig::from_model_dir(&shared_root)?;
+        let vae_cfg = MochiVaeConfig::from_model_dir(&shared_root)?;
         let dit_cfg = MochiDitConfig::default();
 
         let tokenizer = crate::tokenizer::load_tokenizer()?;
-        let t5 = MochiT5::load_reference_regime(&self.root.join("text_encoder"), &self.device)?;
-        let dit_vb = load_transformer_var_builder(&self.root, DIT_DTYPE, &self.device)?;
+        let t5 = MochiT5::load_reference_regime(&shared_root.join("text_encoder"), &self.device)?;
+        // The DiT root is the tier dir (packed/dense `transformer/`) or the raw snapshot root; the packed
+        // attn/ff Linears self-detect on their `.scales` siblings (`transformer::QLinear::linear_detect`).
+        let dit_vb = load_transformer_var_builder(&dit_root, DIT_DTYPE, &self.device)?;
         let transformer = MochiTransformer3DModel::new(dit_vb, &dit_cfg, &self.device)?;
-        let vae = MochiVaeDecoder::load(&self.root, &self.device)?;
+        let vae = MochiVaeDecoder::load(&shared_root, &self.device)?;
 
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
