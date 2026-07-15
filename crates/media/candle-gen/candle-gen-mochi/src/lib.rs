@@ -20,15 +20,18 @@
 //! per-tier checkpoints (epic 1788 / A6), *not* on-the-fly requant, so `supported_quants` is empty.
 
 pub mod config;
+pub mod conv3d;
 pub mod nn;
 pub mod text_encoder;
 pub mod tokenizer;
+pub mod vae;
 
 use candle_gen::candle_core::DType;
 
 pub use config::{MochiConfig, MochiVaeConfig};
 pub use text_encoder::{encode_prompt, load_indexed_var_builder, MochiT5, MochiTextConditioning};
 pub use tokenizer::{load_tokenizer, MAX_SEQUENCE_LENGTH, PAD_TOKEN_ID};
+pub use vae::MochiVaeDecoder;
 
 /// Public provider id: `"mochi_1"`.
 pub const MODEL_ID: &str = "mochi_1";

@@ -13,6 +13,26 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
     Ok((x * sigmoid(x)?)?)
 }
 
+/// `y = x · Wᵀ` for a stored `[out, in]` weight, no bias, over the **last** axis of `x` (any leading
+/// dims). Flattens the leading dims to one matmul then restores them — candle's `Linear::forward` only
+/// special-cases ranks ≤ 4, so this covers the rank-5 NCTHW→channel-last projections the VAE uses.
+pub fn linear_nb(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let in_dim = *dims.last().expect("linear_nb: x has no axes");
+    let out_dim = w.dim(0)?;
+    let rows = x.elem_count() / in_dim;
+    let flat = x.reshape((rows, in_dim))?;
+    let y = flat.matmul(&w.t()?)?;
+    let mut out_dims = dims;
+    *out_dims.last_mut().unwrap() = out_dim;
+    Ok(y.reshape(out_dims)?)
+}
+
+/// `y = x · Wᵀ + b` over the last axis (see [`linear_nb`]). `b` is `[out]`.
+pub fn linear_b(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
+    Ok(linear_nb(x, w)?.broadcast_add(b)?)
+}
+
 /// **Weightless** RMS norm over the last axis, computed in f32 and returned in f32
 /// (`RMSNorm(0, eps, False)` — Mochi's `MochiRMSNormZero.norm` / `MochiModulatedRMSNorm.norm`):
 /// `x / sqrt(mean(x²) + eps)`.
