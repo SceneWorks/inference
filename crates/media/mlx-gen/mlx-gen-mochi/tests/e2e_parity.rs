@@ -64,27 +64,27 @@ fn max_abs(a: &Array) -> f32 {
 
 /// `max|got − want| / max|want|` — peak relative error (the repo convention).
 fn peak_rel(got: &Array, want: &Array) -> f32 {
-    max_abs(&subtract(&f32(got), &f32(want)).unwrap()) / max_abs(&f32(want)).max(1e-12)
+    max_abs(&subtract(f32(got), f32(want)).unwrap()) / max_abs(&f32(want)).max(1e-12)
 }
 
 /// `mean|got − want| / mean|want|` — mean relative error.
 fn mean_rel(got: &Array, want: &Array) -> f32 {
-    let num = mean(abs(subtract(&f32(got), &f32(want)).unwrap()).unwrap(), None)
+    let num = mean(abs(subtract(f32(got), f32(want)).unwrap()).unwrap(), None)
         .unwrap()
         .item::<f32>();
-    let den = mean(abs(&f32(want)).unwrap(), None).unwrap().item::<f32>();
+    let den = mean(abs(f32(want)).unwrap(), None).unwrap().item::<f32>();
     num / den.max(1e-12)
 }
 
 fn mean_abs(a: &Array) -> f32 {
-    mean(abs(&f32(a)).unwrap(), None).unwrap().item::<f32>()
+    mean(abs(f32(a)).unwrap(), None).unwrap().item::<f32>()
 }
 
 /// Fraction of uint8 pixels differing by > 8.
 fn px_gt8(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(&f32(got), &f32(want)).unwrap()).unwrap();
+    let diff = abs(subtract(f32(got), f32(want)).unwrap()).unwrap();
     let over = mlx_rs::ops::gt(&diff, Array::from_int(8)).unwrap();
-    mlx_rs::ops::sum(&f32(&over), None).unwrap().item::<f32>() / (got.size() as f32)
+    mlx_rs::ops::sum(f32(&over), None).unwrap().item::<f32>() / (got.size() as f32)
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn e2e_final_latents_match_golden() {
     let hidden = dit_g.require("hidden_states").unwrap();
     assert_eq!(hidden.shape(), &[2, 12, 2, 8, 8], "dit hidden_states shape");
     let halves = split(hidden, 2, 0).unwrap();
-    let branch_delta = max_abs(&subtract(&f32(&halves[0]), &f32(&halves[1])).unwrap());
+    let branch_delta = max_abs(&subtract(f32(&halves[0]), f32(&halves[1])).unwrap());
     eprintln!("init-latent assumption: max|branch0 - branch1| = {branch_delta:.3e} (must be 0)");
     assert!(
         branch_delta == 0.0,
@@ -159,7 +159,9 @@ fn e2e_final_latents_match_golden() {
     // --- TIGHT regression guard: the per-forward (the reducible quantity) is at the dit_parity floor.
     // This is what actually protects against a real structural bug (the chaos-amplified final gate
     // below cannot). Runs the transformer through the pipeline's inputs at step 0.
-    let np0 = f32(&dit.forward(hidden, enc, dit_g.require("timestep").unwrap(), enc_mask).unwrap());
+    let np0 = f32(&dit
+        .forward(hidden, enc, dit_g.require("timestep").unwrap(), enc_mask)
+        .unwrap());
     let np0_pr = peak_rel(&np0, dit_g.require("noise_pred").unwrap());
     eprintln!("step-0 per-forward noise_pred peak_rel = {np0_pr:.3e} (dit_parity floor)");
     assert!(
@@ -204,16 +206,24 @@ fn e2e_final_latents_match_golden() {
     // fixture. The port's f32-vs-bf16 golden divergence must sit within a small multiple of it.
     let n = init.size() as i32;
     let noise: Vec<f32> = (0..n)
-        .map(|i| ((i as f32 * 12.9898).sin() * 43758.5453).fract() * 2.0 - 1.0)
+        .map(|i| ((i as f32 * 12.9898).sin() * 43_758.547).fract() * 2.0 - 1.0)
         .collect();
     let noise = Array::from_slice(&noise, init.shape());
     let pert = add(
         &init,
-        &multiply(&noise, Array::from_f32(3e-3 * mean_abs(&init))).unwrap(),
+        multiply(&noise, Array::from_f32(3e-3 * mean_abs(&init))).unwrap(),
     )
     .unwrap();
     let latents_pert = denoise(
-        &dit, &pert, enc, enc_mask, steps, guidance, 1.0, &CancelFlag::default(), &mut |_| {},
+        &dit,
+        &pert,
+        enc,
+        enc_mask,
+        steps,
+        guidance,
+        1.0,
+        &CancelFlag::default(),
+        &mut |_| {},
     )
     .expect("denoise (perturbed)");
     let chaos_band = mean_rel(&latents_pert, &latents);
@@ -243,6 +253,13 @@ fn e2e_final_latents_match_golden() {
     let want_frames = to_uint8_frames(e2e_g.require("video").unwrap()).expect("golden video -> u8");
     assert_eq!(got_frames.shape(), want_frames.shape(), "frame shape");
     let px = px_gt8(&got_frames, &want_frames);
-    eprintln!("E2E decoded frames px>8 = {:.2}%  (informational; chaos-driven)", px * 100.0);
-    assert!(px < 0.9, "decoded frames are near-total garbage (px>8 = {:.1}%)", px * 100.0);
+    eprintln!(
+        "E2E decoded frames px>8 = {:.2}%  (informational; chaos-driven)",
+        px * 100.0
+    );
+    assert!(
+        px < 0.9,
+        "decoded frames are near-total garbage (px>8 = {:.1}%)",
+        px * 100.0
+    );
 }

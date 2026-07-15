@@ -81,7 +81,11 @@ pub fn denoise(
 
 /// De-normalize + AsymmVAE-decode the final latents into `(F, H, W, 3)` uint8 frames. Honors a cancel
 /// issued after `Progress::Decoding` but before the decode begins.
-pub fn decode_to_frames(vae: &MochiVaeDecoder, latents: &Array, cancel: &CancelFlag) -> Result<Array> {
+pub fn decode_to_frames(
+    vae: &MochiVaeDecoder,
+    latents: &Array,
+    cancel: &CancelFlag,
+) -> Result<Array> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
@@ -101,7 +105,9 @@ pub fn to_uint8_frames(video: &Array) -> Result<Array> {
     }
     let (c, f, h, w) = (sh[1], sh[2], sh[3], sh[4]);
     let dt = video.dtype();
-    let chw = video.reshape(&[c, f, h, w])?.transpose_axes(&[1, 2, 3, 0])?; // (F, H, W, 3)
+    let chw = video
+        .reshape(&[c, f, h, w])?
+        .transpose_axes(&[1, 2, 3, 0])?; // (F, H, W, 3)
     let half = divide(
         &add(&chw, &scalar(1.0).as_dtype(dt)?)?,
         &scalar(2.0).as_dtype(dt)?,

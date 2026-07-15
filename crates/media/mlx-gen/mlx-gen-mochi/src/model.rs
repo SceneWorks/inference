@@ -98,15 +98,14 @@ pub struct Mochi {
 /// transformer + AsymmVAE decoder). The DiT is loaded at f32 compute precision (its on-disk shards are
 /// bf16; the port upcasts them — the parity-verified regime, see `tests/dit_parity.rs`).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(Error::Msg(
+    let root =
+        match &spec.weights {
+            WeightsSource::Dir(p) => p.clone(),
+            WeightsSource::File(_) => return Err(Error::Msg(
                 "mochi_1: expected a model directory (split-weight snapshot), not a single file"
                     .into(),
-            ))
-        }
-    };
+            )),
+        };
     // On-the-fly requant is not the Mochi tier mechanism (epic 1788: self-contained pre-quantized
     // q4/q8/bf16 tier dirs, A6 sc-11990). Reject a stray `spec.quantize` rather than silently ignore
     // it — a mismatch would otherwise run bf16 while the caller believed it asked for Q4.
@@ -187,10 +186,8 @@ impl Mochi {
         // CFG batch order [neg, pos] — matches `scheduler::cfg_combine` (uncond = half 0, cond = half 1)
         // and the reference `torch.cat([negative_prompt_embeds, prompt_embeds])`.
         let enc = concatenate_axis(&[&neg.prompt_embeds, &pos.prompt_embeds], 0)?;
-        let enc_mask = concatenate_axis(
-            &[&neg.prompt_attention_mask, &pos.prompt_attention_mask],
-            0,
-        )?;
+        let enc_mask =
+            concatenate_axis(&[&neg.prompt_attention_mask, &pos.prompt_attention_mask], 0)?;
 
         // Geometry: AsymmVAE 6× temporal / 8× spatial; the DiT sees the `[1, 12, F_lat, H/8, W/8]`
         // latent (frames already gated to `1 + 6·k`, size to multiple-of-16 by `validate`).
@@ -337,7 +334,9 @@ mod tests {
 
     #[test]
     fn load_rejects_single_file_source() {
-        let spec = LoadSpec::new(WeightsSource::File("/tmp/does-not-exist.safetensors".into()));
+        let spec = LoadSpec::new(WeightsSource::File(
+            "/tmp/does-not-exist.safetensors".into(),
+        ));
         assert!(load(&spec).is_err(), "single-file source must be rejected");
     }
 
