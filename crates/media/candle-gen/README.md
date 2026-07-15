@@ -176,13 +176,17 @@ The FP4 tensor-core MMA needs **both** operands in E2M1. So:
   fallback.
 
 **Current perf reality (read before quoting a multiple).** The W4A4 activation quantizer is **unfused**
-— a chain of candle ops rather than one kernel — and that overhead currently **swamps the FP4 GEMM
-win** end-to-end (sc-11044 measured ~25.8 ms/fwd for W4A4 vs ~0.05 ms for W4A16 at layer level). So:
+— a chain of ~20 candle ops plus a host sync, rather than one kernel — and that overhead does not merely
+reduce the FP4 GEMM win, it **dwarfs it by ~100×**. Measured end-to-end on the all-linear Krea 2 Turbo
+DiT (sc-12110, the vehicle of record — see [below](#sc1sc2-on-krea-2-turbo-the-vehicle-of-record)):
+**343 ms to quantize one projection's activation, feeding a GEMM whose entire per-layer step budget is
+~3.5 ms.** W4A4 comes in at **0.01×** — a hundred times *slower* than the bf16 baseline.
 
-> **W4A16 is the throughput default; W4A4 ships opt-in** (correctness + the ~4.5-bit footprint are
-> real today). Making W4A4 a net end-to-end win is gated on **[sc-12078](https://app.shortcut.com/trefry/story/12078)**
-> — a fused CUDA activation-quantize kernel. Until that lands, the ~2× is a **GEMM-core** number, not
-> an end-to-end one.
+> **W4A16 is the throughput default; W4A4 must not be shipped for throughput at all today** (its
+> correctness and the ~4.5-bit packed footprint are real — its speed is not). Making W4A4 a net win is
+> gated on **[sc-12078](https://app.shortcut.com/trefry/story/12078)** — a fused CUDA activation-quantize
+> kernel — and sc-12110 resized that gate: it is not a ~1.4× gap to close (as Sana suggested), it is a
+> **~100×** one. Until it lands, the ~2× is a **GEMM-core** number and nothing more.
 
 ### SC#1 — what Sana can and cannot tell you (read before quoting an end-to-end ratio)
 
@@ -212,11 +216,61 @@ sc-12078 evidence, and it is the honest sc-11045 throughput finding.
 > **Sana cannot settle SC#1 or SC#2**, on three independent counts: the conv-dominated FFN above; **no
 > bf16 path** (the trunk is f32-only, so the epic's "vs the bf16 compute path" baseline does not exist
 > here); and **no Q4 tier** wired for Sana (so SC#2's honest baseline — the int4 tier NVFP4 would
-> *replace* — cannot be measured either). SC#1/SC#2 are retargeted to a **Flux-family DiT**
-> (linear FFN + `QLinear` Q4 already wired) under
+> *replace* — cannot be measured either). SC#1/SC#2 are settled on **Krea 2 Turbo** instead — see
+> [the section below](#sc1sc2-on-krea-2-turbo-the-vehicle-of-record) — under
 > **[sc-12110](https://app.shortcut.com/trefry/story/12110)**, which is the vehicle of record for both.
 > What sc-11045 *does* settle is SC#3 (stability), SC#4 (the Blackwell gate), SC#6 (packed serving, see
-> below), and the spike's residual activation-outlier partition gate.
+> below), and the spike's residual activation-outlier partition gate **as far as SANA's layer naming
+> reaches** — which, as Krea then showed, is not as far as it looked.
+
+### SC#1/SC#2 on Krea 2 Turbo — the vehicle of record
+
+**[sc-12110](https://app.shortcut.com/trefry/story/12110) settled SC#1 on the model that can actually
+answer it.** Michael redirected the epic here ("Why did we pick Sana? It's the smallest model we have
+and any benefit would be very small") and Krea 2 Turbo is Sana's inverse on every axis that matters: a
+**~12.5B single-stream DiT** (hidden 6144 × 28 blocks × intermediate 16384), **100% linear GEMM with
+zero `Conv2d`** — so the NVFP4 lane reaches essentially *all* parameterized compute — with **both** epic
+baselines wired and on disk (dense bf16; the Q4 dequant-on-forward tier).
+
+**The lane's reach on Krea is total, and it still does not deliver.** Real weights, 1024², CFG-free
+(Turbo = one DiT forward/step), exclusive GPU verified idle (`nvidia-smi` 19 MiB / 0%) before the run:
+
+| regime | ms/step | vs bf16 | FP4-lit |
+|---|---:|---:|---:|
+| **dense bf16** — the epic's specified SC#1 baseline | **907.9** | 1.00× | — |
+| **NVFP4 W4A16** | 897.3 | **1.01×** | 0/260 |
+| **NVFP4 W4A4 (mixed, shipping policy)** | 45 992.4 | **0.02×** | 139/260 |
+| **NVFP4 W4A4 (blanket)** | 90 109.8 | **0.01×** | 260/260 |
+
+> ## **SC#1 (~2×) is NOT MET.** The best NVFP4 regime is **W4A16 at 1.01×** — i.e. statistical noise
+> around the bf16 baseline, exactly as the epic's own [Correction 2](https://app.shortcut.com/trefry/epic/11037#activity-11088)
+> predicted for a storage tier. The regime that *does* light the FP4 cores is **~100× slower** than the
+> baseline it was supposed to double.
+
+**The 1/N amortization prediction failed — and the reason retires the argument, not just the number.**
+sc-12110 predicted that because quantizer cost scales ~O(M·K) and the GEMM ~O(M·K·N), overhead/GEMM ≈
+1/N; Krea's N=16384 being ~8× Sana's should have amortized the quantizer that made Sana 0.69×. The
+measurements say:
+
+* **The O(M·K) model is exactly right.** Krea's activation is 11.0× Sana's `M·K` (4118×6144 vs
+  1024×2240); the measured per-projection quantizer cost is **12.3×** Sana's (343 ms vs ~28 ms). The
+  two W4A4 regimes agree independently (343 ms/projection blanket over 260; 324 ms/projection mixed over
+  139).
+* **The conclusion drawn from it was wrong, because Sana's 0.69× was never a quantizer measurement.**
+  On Sana the *denominator* was a conv defect — linears were **0.4%** of the step — so the quantizer's
+  9.1 s was hiding inside a ~20 s conv-dominated step. It looked like "the quantizer costs ~45% extra".
+  On Krea there is no conv to hide behind: linears are ~100% of the step, and the quantizer's true size
+  relative to the GEMM it feeds is exposed at **~100×**.
+
+**⟹ sc-12078 is still a hard GATE on SC#1, and a much bigger one than Sana implied.** It is not a ~1.4×
+gap; a fused kernel must make the activation quantize essentially *free* (~100× faster, i.e. fused into
+the GEMM epilogue) for W4A4 merely to **break even** with bf16 — before it can start earning the FP4
+core's 1.35–1.98×. Any plan that treats sc-12078 as an incremental optimization is working from Sana's
+diluted number.
+
+**What NVFP4 is today, stated plainly:** a **storage/packaging format** (a real ~4.5-bit packed
+footprint on the W4A4 serving path — SC#6 below) with **no throughput benefit on any shipping regime**.
+SC#3 (stability) and SC#4 (the Blackwell gate) hold. SC#1 does not.
 
 ### The mixed-precision policy (why not blanket W4A4)
 
@@ -247,12 +301,51 @@ cosine → ~2 sparse outliers 0.984 → 8 → 0.966 → dense → 0.000). So the
   provider** (`LayerRole::final_proj()`, the same seam as `is_edge_block`), with a conservative
   name anchor as the fallback — never a bare substring.
 
-Both defects are **latent, not live**: `candle-gen-sana` is the policy's only consumer today, and
-neither defect changes its partition (Sana spells cross-attention `attn2`, and its only `proj_out` *is*
-the trunk head — it measures 68 W4A4 / 95 W4A16 either way). They are traps armed for whichever crate
-wires up NVFP4 next — which, per [sc-12110](https://app.shortcut.com/trefry/story/12110), is a
-Flux-family DiT, i.e. exactly the naming that trips them. That is why they are fixed here, before the
-retarget, rather than after.
+Both defects were **latent when written** — `candle-gen-sana` was the policy's only consumer, and
+neither defect changed its partition (Sana spells cross-attention `attn2`, and its only `proj_out` *is*
+the trunk head — it measures 68 W4A4 / 95 W4A16 either way). They were traps armed for whichever crate
+wired up NVFP4 next. **[sc-12110](https://app.shortcut.com/trefry/story/12110) then wired up Krea 2 and
+sprang them** — see the next subsection: on Krea the substring policy misses *every* anchor, and the
+`final_layer.linear` head really does measure Dense (crush **909×**), guarded only because the loader
+states `LayerRole::final_proj()`.
+
+### The policy does not transfer between models — Krea proved it twice over (sc-12110)
+
+Wiring the same policy into `candle-gen-krea` and measuring real activations produced **209 layers at
+W4A4, of which 59 measured `OutlierClass::Dense`**. Two independent lessons:
+
+**1. The naming anchors all miss on Krea** — and every miss fails *unsafely*. Krea is a **single-stream**
+DiT: there is no `attn2` (the text context is concatenated onto the image sequence and read by ordinary
+self-attention), no `caption_projection` (the ingest is `txt_in.linear_{1,2}` fed by a `text_fusion`
+stack), and no `proj_out` (the head is `final_layer.linear`). Krea states these through `LayerRole`
+instead — `is_edge_block`, `is_final_proj`, `is_context_read` — rather than sharpening substrings until
+they fit a second provider. Measured vindication: `text_fusion.…attn.to_out.0` crushes at **40145×**.
+
+**2. The bigger lesson — the policy's *model* of where outliers live is wrong, independent of naming.**
+It assumes massive activations arrive with the **caption** and can be contained by guarding a named
+block. On Krea the violations were in the **compute bulk**, and their shape was structural:
+
+| leaf | reads | Dense blocks | worst crush |
+|---|---|---:|---:|
+| `ff.down` | `silu(gate(x)) · up(x)` — a post-nonlinearity intermediate | **28 / 28** | 3107× |
+| `attn.to_out.0` | `attn_out · sigmoid(gate(x))` — ditto | 21 / 28 | 686× |
+| `ff.gate` / `ff.up` | `RMSNorm(x)` — a normalized **block input** | 6 / 56 | — |
+| `attn.to_{q,k,v,gate}` | `RMSNorm(x)` — ditto | 3 / 28 each | — |
+
+**Normalized block inputs are benign; products of two unbounded nonlinear branches are not.** A SwiGLU
+intermediate multiplies two learned projections with no normalization before the next GEMM, so its
+dynamic range is the *product* of two heavy tails — precisely the sc-7702 crush mechanism. This is
+orthogonal to captions, and **invisible on Sana** because Sana's FFN is a `GLUMBConv` and never entered
+the linear lane at all. It is now `LayerRole::is_post_nonlinearity`.
+
+Krea's measured partition (blocks 0–3 and the last held at W4A16 — the leading edge is **4** blocks
+wide, not the spike's "first two"; plus the post-nonlinearity and context classes) re-measures green:
+**139 W4A4 — 71 Benign, 68 Sparse, 0 Dense.** Conveniently, the guarded leaves are the *low-N* ones, so
+the layers that stay on W4A4 include `ff.gate`/`ff.up` at **N=16384**, the widest GEMMs in the trunk.
+
+> **Generalize the process, not the substrings.** Two providers, two different failures, both caught
+> only by probing real activations. Treat `ActPrecision::for_outlier_layer*` as a *default hypothesis*
+> that every new provider must re-measure with an `ActProbe`, not as a policy that transfers.
 
 > **The outlier class was WIDENED in sc-11045 by real measurement — do not narrow it back to the
 > spike's prose.** The spike named the class "cross-attn K/V", and the original policy took that
@@ -307,6 +400,26 @@ Read that honestly:
 * **Blanket W4A16 — the regime the throughput guidance above tells you to use — saves nothing at all in
   VRAM** (1.00×). There, NVFP4 buys stability and on-disk/load-time storage only.
 
+**Re-measured on the Krea 2 Turbo trunk (sc-12110, 260 projections, 23 942.5 MiB dense bf16 —
+`nvfp4_krea_dit_sc6_resident_vram_per_regime`)** — the same shape, on a 12.5B model:
+
+| regime | FP4-lit | resident | ratio | eff bits/wt |
+|---|---:|---:|---:|---:|
+| **blanket W4A4** — bench only | 260/260 | **6 733.9 MiB** | **0.2813×** | 4.50 |
+| **mixed** — the shipping policy | 139/260 | 14 618.3 MiB | **0.6106×** | 4.50 |
+| **blanket W4A16** — the throughput default | 0/260 | 23 942.5 MiB | **1.0000×** | 4.50 |
+
+Blanket W4A4's resident bytes equal the packed footprint **exactly** (asserted, not approximated) —
+SC#6's packed-forward claim holds on a real 12.5B trunk. Krea's mixed regime fares a little better than
+Sana's (0.61× vs 0.70×) simply because more of its layers stay on W4A4 (53% vs 42%).
+
+> **The regime table is the whole point.** SC#6 is met *only* where SC#1 is worst: blanket W4A4 gives the
+> 0.28× footprint and is ~100× slower; blanket W4A16 is the only throughput-viable regime and gives
+> **no VRAM win at all**. Today NVFP4 cannot deliver the footprint and competitive speed at the same
+> time. The mixed regime's 0.61× is dominated by `Nvfp4Linear::new_dequant` materializing a dense bf16
+> weight for every W4A16 layer — that is **[sc-12121](https://app.shortcut.com/trefry/story/12121)**,
+> not a property of the format.
+
 `Nvfp4Report::footprint_ratio()` is regime-aware and reports exactly the table above;
 `packed_footprint_ratio()` is the format's ~0.28× and is **not** a residency claim. (Before sc-11045's
 review these were the same number: the ratio divided the *host* packed container by bf16, so a W4A16 leg
@@ -320,12 +433,21 @@ quant tier is a **creative** decision: NVFP4 must never silently replace an exis
 without an explicit, user-visible choice. Selecting it is an act of intent, and it is only honored on
 `sm_120`.
 
-### Driving a real model: the Sana NVFP4 seam
+### Driving a real model: the NVFP4 seams
 
-`candle-gen-sana` carries the reference wiring (`nvfp4_dit.rs`): `SanaTransformer::from_weights_planned`
-serves the trunk's q/k/v/out, `caption_projection` and `proj_out` projections through `Nvfp4Linear`
-under a `DitPlan` (mixed policy, or blanket W4A4/W4A16 for a controlled bench), with an optional
-`ActProbe` capturing per-layer activation sparsity across denoise steps.
+**Two crates carry the wiring, and they share a pattern rather than code.** Each exposes `DitPlan` /
+`LayerRole` / `ActProbe` / `Nvfp4Report` and a `*_planned` loader that serves the trunk's projections
+through `Nvfp4Linear` under a mixed policy or a blanket W4A4/W4A16 bench regime:
+
+| crate | entry point | lane | role |
+|---|---|---:|---|
+| **`candle-gen-krea`** (`nvfp4_dit.rs`) | `Krea2Transformer::load_planned` | **260** projections, 100% GEMM | **the SC#1/SC#2 vehicle of record** (sc-12110) |
+| `candle-gen-sana` (`nvfp4_dit.rs`) | `SanaTransformer::from_weights_planned` | 163 projections, 0.4% of the step | the original reference wiring (sc-11045); settles SC#3/SC#4 only |
+
+The duplication is deliberate for now — the two `nvfp4_dit.rs` modules share a shape but not a crate,
+and hoisting the model-agnostic half (`ActProbe`, `Nvfp4Report`, `summarize`) into `candle-gen` is
+tracked separately. What is **not** shareable is exactly the interesting part: `LayerRole` is
+per-provider by design, because the partition does not transfer (see above).
 
 **Note what is not covered.** SANA's Mix-FFN is a `GLUMBConv` built from *convolutions*, not linears, so
 a real slice of the trunk's FLOPs sits outside the **current seam** — an honest ceiling on any
@@ -335,8 +457,19 @@ ms/block vs the linears' 1.99 ms/block) and could be routed through `Nvfp4Linear
 roughly **doubling the lane's reachable coverage**. Only `conv_depth` (3×3 **depthwise**) genuinely
 cannot be a GEMM. Extending the seam to the 1×1s is not wired today.
 
-End-to-end validation lives in `candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs` (cuda-gated, `#[ignore]`d,
-real-weight).
+End-to-end validation lives in `candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs` (the numbers of record) and
+`candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs` — both cuda-gated, `#[ignore]`d and weight-env-gated. The
+Krea suite needs `KREA_TURBO_BF16_DIR` + `KREA_TURBO_Q4_DIR`:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 CUDA_COMPUTE_CAP=120 \
+KREA_TURBO_BF16_DIR=…/krea-2-turbo-mlx/snapshots/<rev>/bf16 \
+KREA_TURBO_Q4_DIR=…/krea-2-turbo-mlx/snapshots/<rev>/q4 \
+  cargo test -p candle-gen-krea --release --features cuda --test nvfp4_krea_dit_gpu -- --ignored --nocapture
+```
+
+**Budget ~10 minutes per NVFP4 trunk build**: `Nvfp4Tensor::pack` runs single-threaded on the CPU, and
+Krea's DiT is ~12.5B parameters. Bench the regimes you need, not all of them.
 
 ## Packaging (Windows / CUDA) — sc-3676
 

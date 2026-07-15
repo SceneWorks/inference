@@ -12,7 +12,8 @@ use candle_gen::candle_core::{Result, Tensor, D};
 use candle_gen::candle_nn::ops::{sigmoid, softmax_last_dim};
 
 use super::rope::apply_interleaved_rope;
-use crate::loader::{linear_detect, rms_scale, rms_scale_weight, Weights};
+use crate::loader::{linear_detect, linear_detect_planned, rms_scale, rms_scale_weight, Weights};
+use crate::nvfp4_dit::DitPlan;
 use crate::quant::QLinear;
 use candle_gen::quant::AdaptLinear;
 
@@ -101,12 +102,42 @@ impl GatedAttention {
         head_dim: usize,
         eps: f64,
     ) -> Result<Self> {
+        Self::load_planned(
+            w,
+            prefix,
+            heads,
+            kv_heads,
+            head_dim,
+            eps,
+            &DitPlan::baseline(),
+        )
+    }
+
+    /// [`Self::load`] under a [`DitPlan`] (sc-12110) — every one of the five projections is served
+    /// through the plan's leg (NVFP4, probed, or the byte-unchanged baseline).
+    ///
+    /// All five share **one** input activation (`x`), so `to_gate` — the projection with no SANA
+    /// analogue — necessarily measures the same outlier sparsity as `to_q`/`to_k`/`to_v`. That is a
+    /// property of the topology, not an assumption: the probe records each projection's *input*, and the
+    /// gate reads the same `x` the QKV trio does. `to_out.0` is the one distinct site (it reads the
+    /// sigmoid-gated attention output).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_planned(
+        w: &Weights,
+        prefix: &str,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        eps: f64,
+        plan: &DitPlan,
+    ) -> Result<Self> {
+        let p = |leaf: &str| linear_detect_planned(w, &join(prefix, leaf), false, plan);
         Ok(Self {
-            q: linear_detect(w, &join(prefix, "to_q"), false)?,
-            k: linear_detect(w, &join(prefix, "to_k"), false)?,
-            v: linear_detect(w, &join(prefix, "to_v"), false)?,
-            gate: linear_detect(w, &join(prefix, "to_gate"), false)?,
-            o: linear_detect(w, &join(prefix, "to_out.0"), false)?,
+            q: p("to_q")?,
+            k: p("to_k")?,
+            v: p("to_v")?,
+            gate: p("to_gate")?,
+            o: p("to_out.0")?,
             norm_q: RmsScale::load(w, &join(prefix, "norm_q.weight"), eps)?,
             norm_k: RmsScale::load(w, &join(prefix, "norm_k.weight"), eps)?,
             heads,
@@ -114,6 +145,24 @@ impl GatedAttention {
             head_dim,
             scale: (head_dim as f64).powf(-0.5),
         })
+    }
+
+    /// Every projection in this attention module, paired with its dotted key — the walk
+    /// [`crate::transformer::Krea2Transformer::nvfp4_report`] uses for SC#6/SC#4 accounting.
+    pub(crate) fn projections<'a>(
+        &'a self,
+        prefix: &str,
+    ) -> Vec<(String, &'a crate::quant::QLinear)> {
+        [
+            ("to_q", &self.q),
+            ("to_k", &self.k),
+            ("to_v", &self.v),
+            ("to_gate", &self.gate),
+            ("to_out.0", &self.o),
+        ]
+        .into_iter()
+        .map(|(leaf, p)| (join(prefix, leaf), p))
+        .collect()
     }
 
     /// `x`: `[b, s, hidden]`. `rope`: `Some((cos, sin))` (`[1, s, head_dim/2]`) for the single-stream
@@ -184,11 +233,31 @@ pub struct SwiGlu {
 
 impl SwiGlu {
     pub fn load(w: &Weights, prefix: &str) -> Result<Self> {
+        Self::load_planned(w, prefix, &DitPlan::baseline())
+    }
+
+    /// [`Self::load`] under a [`DitPlan`] (sc-12110). On Krea's single-stream blocks these three are the
+    /// **largest GEMMs in the trunk** (`[16384, 6144]` ×2 + `[6144, 16384]`) and ~62% of a block's linear
+    /// FLOPs — the layers SC#1's ~2× has to come from, and the reason the `N = 16384` amortization
+    /// prediction is testable here at all (sc-12110).
+    pub fn load_planned(w: &Weights, prefix: &str, plan: &DitPlan) -> Result<Self> {
+        let p = |leaf: &str| linear_detect_planned(w, &join(prefix, leaf), false, plan);
         Ok(Self {
-            gate: linear_detect(w, &join(prefix, "gate"), false)?,
-            up: linear_detect(w, &join(prefix, "up"), false)?,
-            down: linear_detect(w, &join(prefix, "down"), false)?,
+            gate: p("gate")?,
+            up: p("up")?,
+            down: p("down")?,
         })
+    }
+
+    /// Every projection in this SwiGLU, paired with its dotted key (SC#6/SC#4 accounting walk).
+    pub(crate) fn projections<'a>(
+        &'a self,
+        prefix: &str,
+    ) -> Vec<(String, &'a crate::quant::QLinear)> {
+        [("gate", &self.gate), ("up", &self.up), ("down", &self.down)]
+            .into_iter()
+            .map(|(leaf, p)| (join(prefix, leaf), p))
+            .collect()
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -233,12 +302,56 @@ impl TextFusionBlock {
         head_dim: usize,
         eps: f64,
     ) -> Result<Self> {
+        Self::load_planned(
+            w,
+            prefix,
+            heads,
+            kv_heads,
+            head_dim,
+            eps,
+            &DitPlan::baseline(),
+        )
+    }
+
+    /// [`Self::load`] under a [`DitPlan`] (sc-12110). These blocks consume the **raw stacked Qwen3-VL
+    /// hidden states** — the massive-activation source — so under the mixed policy they resolve to the
+    /// guarded `is_context_read` class (Krea's analogue of SANA's `caption_projection` + `attn2`; see
+    /// [`crate::nvfp4_dit`]). The guard is nearly free for SC#1: 4 blocks at width 2560 against 28 at
+    /// width 6144.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_planned(
+        w: &Weights,
+        prefix: &str,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        eps: f64,
+        plan: &DitPlan,
+    ) -> Result<Self> {
         Ok(Self {
             prenorm: RmsScale::load(w, &join(prefix, "norm1.weight"), eps)?,
             postnorm: RmsScale::load(w, &join(prefix, "norm2.weight"), eps)?,
-            attn: GatedAttention::load(w, &join(prefix, "attn"), heads, kv_heads, head_dim, eps)?,
-            mlp: SwiGlu::load(w, &join(prefix, "ff"))?,
+            attn: GatedAttention::load_planned(
+                w,
+                &join(prefix, "attn"),
+                heads,
+                kv_heads,
+                head_dim,
+                eps,
+                plan,
+            )?,
+            mlp: SwiGlu::load_planned(w, &join(prefix, "ff"), plan)?,
         })
+    }
+
+    /// Every projection in this block, paired with its dotted key (SC#6/SC#4 accounting walk).
+    pub(crate) fn projections<'a>(
+        &'a self,
+        prefix: &str,
+    ) -> Vec<(String, &'a crate::quant::QLinear)> {
+        let mut v = self.attn.projections(&join(prefix, "attn"));
+        v.extend(self.mlp.projections(&join(prefix, "ff")));
+        v
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -272,6 +385,7 @@ pub struct SingleStreamBlock {
 }
 
 impl SingleStreamBlock {
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         w: &Weights,
         prefix: &str,
@@ -280,6 +394,37 @@ impl SingleStreamBlock {
         head_dim: usize,
         hidden: usize,
         eps: f64,
+    ) -> Result<Self> {
+        Self::load_planned(
+            w,
+            prefix,
+            heads,
+            kv_heads,
+            head_dim,
+            hidden,
+            eps,
+            &DitPlan::baseline(),
+        )
+    }
+
+    /// [`Self::load`] under a [`DitPlan`] (sc-12110). **This is the compute bulk SC#1 rides on** — 28 of
+    /// these at hidden 6144 / intermediate 16384, ~491M params each, 100% linear GEMM and zero `Conv2d`.
+    ///
+    /// Note the attention here reads the **combined `[ctx ; img]`** sequence: Krea is a single-stream
+    /// DiT, so caption-derived tokens flow through the same self-attention as image tokens rather than
+    /// through a separate cross-attention block. Whether that puts the caption's massive activations
+    /// into the compute bulk's quantization blocks is exactly the question
+    /// `nvfp4_krea_dit_real_activation_outlier_sparsity` measures rather than assumes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_planned(
+        w: &Weights,
+        prefix: &str,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        hidden: usize,
+        eps: f64,
+        plan: &DitPlan,
     ) -> Result<Self> {
         // Stored `[6, hidden]`; flatten row-major to `[1, 1, 6·hidden]` so a single broadcast-add onto
         // `tvec` (`[b, 1, 6·hidden]`) and a 6-way split reproduce the reference's `chunk(6, -1)` order.
@@ -290,9 +435,27 @@ impl SingleStreamBlock {
             scale_shift_table: sst,
             prenorm: RmsScale::load(w, &join(prefix, "norm1.weight"), eps)?,
             postnorm: RmsScale::load(w, &join(prefix, "norm2.weight"), eps)?,
-            attn: GatedAttention::load(w, &join(prefix, "attn"), heads, kv_heads, head_dim, eps)?,
-            mlp: SwiGlu::load(w, &join(prefix, "ff"))?,
+            attn: GatedAttention::load_planned(
+                w,
+                &join(prefix, "attn"),
+                heads,
+                kv_heads,
+                head_dim,
+                eps,
+                plan,
+            )?,
+            mlp: SwiGlu::load_planned(w, &join(prefix, "ff"), plan)?,
         })
+    }
+
+    /// Every projection in this block, paired with its dotted key (SC#6/SC#4 accounting walk).
+    pub(crate) fn projections<'a>(
+        &'a self,
+        prefix: &str,
+    ) -> Vec<(String, &'a crate::quant::QLinear)> {
+        let mut v = self.attn.projections(&join(prefix, "attn"));
+        v.extend(self.mlp.projections(&join(prefix, "ff")));
+        v
     }
 
     /// `x`: `[b, s, hidden]`, `tvec`: `[b, 1, 6·hidden]` (shared `time_mod_proj` output), `cos`/`sin`:
@@ -353,14 +516,45 @@ impl TextFusionTransformer {
         head_dim: usize,
         eps: f64,
     ) -> Result<Self> {
+        Self::load_planned(
+            w,
+            num_layerwise,
+            num_refiner,
+            heads,
+            kv_heads,
+            head_dim,
+            eps,
+            &DitPlan::baseline(),
+        )
+    }
+
+    /// [`Self::load`] under a [`DitPlan`] (sc-12110).
+    ///
+    /// The `projector` stays on the **baseline** leg in every plan: it is a `[1, num_layers]` collapse,
+    /// so `N = 1` is ineligible for the cuBLASLt FP4 path (which needs `N % 16 == 0`) and an
+    /// [`crate::quant::QLinear::Nvfp4`] there would silently resolve to the dequant→bf16 fallback and
+    /// pad the report's `n_quantized` with a layer that never lights up. Excluding it keeps
+    /// [`crate::nvfp4_dit::Nvfp4Report::fp4_lit_fraction`] an honest statement about the lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_planned(
+        w: &Weights,
+        num_layerwise: usize,
+        num_refiner: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        eps: f64,
+        plan: &DitPlan,
+    ) -> Result<Self> {
         let block = |i: usize, kind: &str| {
-            TextFusionBlock::load(
+            TextFusionBlock::load_planned(
                 w,
                 &format!("text_fusion.{kind}.{i}"),
                 heads,
                 kv_heads,
                 head_dim,
                 eps,
+                plan,
             )
         };
         Ok(Self {
@@ -372,6 +566,19 @@ impl TextFusionTransformer {
                 .map(|i| block(i, "refiner_blocks"))
                 .collect::<Result<_>>()?,
         })
+    }
+
+    /// Every quantizable projection in the text-fusion stack, paired with its dotted key (SC#6/SC#4
+    /// accounting walk). The `projector` is excluded for the reason [`Self::load_planned`] documents.
+    pub(crate) fn projections(&self) -> Vec<(String, &crate::quant::QLinear)> {
+        let mut v = Vec::new();
+        for (i, b) in self.layerwise.iter().enumerate() {
+            v.extend(b.projections(&format!("text_fusion.layerwise_blocks.{i}")));
+        }
+        for (i, b) in self.refiner.iter().enumerate() {
+            v.extend(b.projections(&format!("text_fusion.refiner_blocks.{i}")));
+        }
+        v
     }
 
     /// `x`: `[b, n_tokens, num_layers, txt_dim]` (the stacked select-layer hidden states). Returns the

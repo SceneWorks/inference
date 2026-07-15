@@ -22,7 +22,8 @@ pub mod rope;
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 
 use crate::config::Krea2Config;
-use crate::loader::{linear_detect, Weights};
+use crate::loader::{linear_detect, linear_detect_planned, Weights};
+use crate::nvfp4_dit::{DitPlan, Nvfp4Report};
 use crate::quant::QLinear;
 use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
 use rope::RopeTables;
@@ -96,6 +97,37 @@ impl<K: PartialEq, V: Clone> RopeCache<K, V> {
 impl Krea2Transformer {
     /// Build from a loaded `transformer/` weight set.
     pub fn load(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        Self::load_planned(w, cfg, &DitPlan::baseline())
+    }
+
+    /// [`Self::load`] under an NVFP4 [`DitPlan`] (sc-12110, epic 11037) — the seam that serves the
+    /// trunk's linear projections through [`candle_gen::quant::Nvfp4Linear`], so Krea 2 Turbo can settle
+    /// SC#1 (throughput vs the dense bf16 path) and SC#2 (parity vs the Q4 tier) on real weights.
+    ///
+    /// `DitPlan::baseline()` reproduces [`Self::load`] byte-for-byte — the plan is inert unless it asks
+    /// for NVFP4 or attaches a probe.
+    ///
+    /// # What is served through the plan, and what is not
+    ///
+    /// **In the lane** (260 projections): the 28 single-stream blocks' attention + SwiGLU, the
+    /// `text_fusion` layerwise/refiner blocks', `img_in`, `txt_in.linear_{1,2}`, and
+    /// `final_layer.linear`.
+    ///
+    /// **Out of the lane, deliberately** — `time_embed.linear_{1,2}` and `time_mod_proj`. These are
+    /// batch-1 `[B, 256] → [B, …]` embedders: the FP4 GEMM has nothing to win at `M = 1`, while padding
+    /// M to [`candle_gen::quant::NVFP4_M_ALIGN`] would dominate the call. SANA drew the same line
+    /// (sc-11045). `text_fusion.projector` is excluded too — see `TextFusionTransformer::load_planned`.
+    ///
+    /// # `final_layer.linear` is stated, not inferred
+    ///
+    /// The trunk head is threaded as [`crate::nvfp4_dit::LayerRole::final_proj`] via
+    /// [`DitPlan::act_for_layer`]. The shared policy's name-only fallback anchors on a trailing
+    /// `proj_out` segment and **will not fire** on `final_layer.linear` — relying on it would silently
+    /// leave the head (measured Dense on SANA, crush 438×) on W4A4. That is the sc-12140 defect class,
+    /// pinned by `final_head_is_only_guarded_because_the_loader_states_it`.
+    pub fn load_planned(w: &Weights, cfg: &Krea2Config, plan: &DitPlan) -> Result<Self> {
+        // Bind the plan to THIS trunk's block count so `is_edge_block` names the right last block.
+        let plan = &plan.clone().with_num_layers(cfg.num_layers);
         let (heads, kv, hd, eps) = (
             cfg.num_attention_heads,
             cfg.num_kv_heads,
@@ -113,14 +145,15 @@ impl Krea2Transformer {
             cfg: cfg.clone(),
             device: w.device().clone(),
             dtype: w.dtype(),
-            img_in: linear_detect(w, "img_in", true)?,
+            img_in: linear_detect_planned(w, "img_in", true, plan)?,
+            // Batch-1 embedders: out of the NVFP4 lane by design (see the fn docs).
             time_embed_l1: linear_detect(w, "time_embed.linear_1", true)?,
             time_embed_l2: linear_detect(w, "time_embed.linear_2", true)?,
             time_mod_proj: linear_detect(w, "time_mod_proj", true)?,
             txt_in_norm: RmsScale::load(w, "txt_in.norm.weight", eps)?,
-            txt_in_l1: linear_detect(w, "txt_in.linear_1", true)?,
-            txt_in_l2: linear_detect(w, "txt_in.linear_2", true)?,
-            text_fusion: TextFusionTransformer::load(
+            txt_in_l1: linear_detect_planned(w, "txt_in.linear_1", true, plan)?,
+            txt_in_l2: linear_detect_planned(w, "txt_in.linear_2", true, plan)?,
+            text_fusion: TextFusionTransformer::load_planned(
                 w,
                 cfg.num_layerwise_text_blocks,
                 cfg.num_refiner_text_blocks,
@@ -128,10 +161,11 @@ impl Krea2Transformer {
                 tkv,
                 hd,
                 eps,
+                plan,
             )?,
             blocks: (0..cfg.num_layers)
                 .map(|i| {
-                    SingleStreamBlock::load(
+                    SingleStreamBlock::load_planned(
                         w,
                         &format!("transformer_blocks.{i}"),
                         heads,
@@ -139,11 +173,12 @@ impl Krea2Transformer {
                         hd,
                         hidden,
                         eps,
+                        plan,
                     )
                 })
                 .collect::<Result<_>>()?,
             final_norm: RmsScale::load(w, "final_layer.norm.weight", eps)?,
-            final_linear: linear_detect(w, "final_layer.linear", true)?,
+            final_linear: linear_detect_planned(w, "final_layer.linear", true, plan)?,
             final_sstable,
             rope_cache: RopeCache::new(ROPE_CACHE_CAP),
         })
@@ -153,6 +188,47 @@ impl Krea2Transformer {
     /// moved here at install (else the residual matmul is a device mismatch). sc-11105.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Every projection the NVFP4 plan covers, paired with its canonical dotted key — the walk
+    /// [`Self::nvfp4_report`] accounts over. Ordered front-end → text-fusion → blocks → head.
+    fn planned_projections(&self) -> Vec<(String, &QLinear)> {
+        let mut v: Vec<(String, &QLinear)> = vec![
+            ("img_in".to_string(), &self.img_in),
+            ("txt_in.linear_1".to_string(), &self.txt_in_l1),
+            ("txt_in.linear_2".to_string(), &self.txt_in_l2),
+        ];
+        v.extend(self.text_fusion.projections());
+        for (i, b) in self.blocks.iter().enumerate() {
+            v.extend(b.projections(&format!("transformer_blocks.{i}")));
+        }
+        v.push(("final_layer.linear".to_string(), &self.final_linear));
+        v
+    }
+
+    /// **Model-level NVFP4 accounting** over the built trunk (sc-12110 SC#6 / SC#4).
+    ///
+    /// Byte-accounting over the actual resident weight buffers — not an `nvidia-smi` free-memory delta —
+    /// so it is immune to GPU contention and allocator/workspace noise. Returns a zeroed report on a
+    /// baseline trunk (nothing quantized), which is itself the SC#4 negative observation off Blackwell:
+    /// an NVFP4 plan on a non-`sm_120` device reports `n_quantized > 0` with `fp4_lit == 0`.
+    pub fn nvfp4_report(&self) -> Nvfp4Report {
+        let mut r = Nvfp4Report::default();
+        for (_, p) in self.planned_projections() {
+            if let Some(l) = p.nvfp4() {
+                r.add(l);
+            }
+        }
+        r
+    }
+
+    /// The canonical dotted keys of every projection the NVFP4 plan covers — so a harness can assert the
+    /// lane's surface (and its size) without reaching into the trunk's private structure.
+    pub fn nvfp4_layer_names(&self) -> Vec<String> {
+        self.planned_projections()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
     }
 
     /// Walk every adaptable projection, invoking `f(path, &mut AdaptLinear)` once each with the

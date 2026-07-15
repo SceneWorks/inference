@@ -49,6 +49,17 @@ use candle_gen::quant::{self as shared, AdaptLinear};
 pub enum QLinear {
     /// Dense or MLX-packed base + optional forward-time additive residuals (sc-11105).
     Adapt(AdaptLinear),
+    /// An **NVFP4** projection (sc-12110, epic 11037): the weight packed to NVFP4 (E2M1 block-16 +
+    /// UE4M3 scales) and served through [`candle_gen::quant::Nvfp4Linear`] — the FP4 tensor-core W4A4
+    /// GEMM on `sm_120`, or a transparent dequant→bf16 fallback for the W4A16 outlier override and off
+    /// Blackwell. Built only when a [`crate::nvfp4_dit::DitPlan`] asks for it
+    /// ([`crate::loader::linear_detect_planned`]); the shipping `linear_detect` path never produces one.
+    Nvfp4(crate::nvfp4_dit::Nvfp4Proj),
+    /// A **probe-wrapped** baseline projection (sc-12110): records its input activation's outlier
+    /// sparsity, then delegates to the wrapped [`Self::Adapt`] / [`Self::ConvRotInt8`] leg. This is how
+    /// the partition gate measures the trunk's *unperturbed* real activations. Instrumentation only —
+    /// never on a timed or shipping path.
+    Probed(crate::nvfp4_dit::ProbedProj),
     /// A community **INT8-ConvRot** projection (sc-9300 loader + sc-9601 online rotation): the checkpoint
     /// ships `(N, K)` int8 codes for the **rotated** weight `RHT(W) = W·R` + a `[N]` per-output-row
     /// `weight_scale`, where `R` is the regular-Hadamard transform applied block-diagonally in groups of
@@ -249,6 +260,17 @@ impl QLinear {
         match self {
             Self::Adapt(l) => l.forward(x),
             Self::ConvRotInt8(l) => l.forward(x),
+            Self::Nvfp4(l) => l.forward(x),
+            Self::Probed(l) => l.forward(x),
+        }
+    }
+
+    /// The NVFP4 leg, when this projection is served through [`candle_gen::quant::Nvfp4Linear`] — the
+    /// accounting seam [`crate::transformer::Krea2Transformer::nvfp4_report`] walks for SC#6/SC#4.
+    pub(crate) fn nvfp4(&self) -> Option<&candle_gen::quant::Nvfp4Linear> {
+        match self {
+            Self::Nvfp4(p) => Some(p.linear()),
+            _ => None,
         }
     }
 
@@ -269,11 +291,12 @@ impl QLinear {
 
     /// The inner residual-capable [`AdaptLinear`] (for the additive install to push a forward-time LoRA/
     /// LoKr residual — sc-11105), or `None` on an int8-ConvRot projection (never adaptable — the ConvRot
-    /// lane rejects adapters). The `visit_adaptable_mut` walk yields this to the installer.
+    /// lane rejects adapters) and on the NVFP4 / probed validation legs (sc-12110), which are bench-only
+    /// and never carry an adapter. The `visit_adaptable_mut` walk yields this to the installer.
     pub fn as_adapt_mut(&mut self) -> Option<&mut AdaptLinear> {
         match self {
             Self::Adapt(a) => Some(a),
-            Self::ConvRotInt8(_) => None,
+            Self::ConvRotInt8(_) | Self::Nvfp4(_) | Self::Probed(_) => None,
         }
     }
 }
