@@ -18,8 +18,8 @@
 //! ([`crate::schedule::turbo_sigmas`]) is the byte-exact default; a per-generation curated
 //! sampler/scheduler (epic 7114) reshapes over the same mu.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::imageops::{resize_bicubic_u8, resize_lanczos_u8};
@@ -103,6 +103,22 @@ pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 pub(crate) struct KreaText {
     tok: crate::tokenizer::KreaTokenizer,
     te: KreaTextEncoder,
+    root: PathBuf,
+    device: Device,
+    /// Qwen3-VL vision tower for grounded edit conditioning (sc-12129). Kept lazy so ordinary
+    /// txt2img/img2img/control requests neither load nor require the `visual.*` subtree.
+    vision: Mutex<Option<Arc<crate::vision::VisionTower>>>,
+}
+
+impl KreaText {
+    fn vision(&self) -> Result<Arc<crate::vision::VisionTower>> {
+        candle_gen::cached(&self.vision, || {
+            Ok(Arc::new(crate::vision::load_vision_tower(
+                &self.root,
+                &self.device,
+            )?))
+        })
+    }
 }
 
 /// The **heavy-phase** components (epic 10765 Phase 1c, sc-12089): the single-stream DiT + the
@@ -293,7 +309,13 @@ pub(crate) fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
     let te_w = Weights::from_dir(&root.join("text_encoder"), device, TE_DTYPE)?;
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
 
-    Ok(KreaText { tok, te })
+    Ok(KreaText {
+        tok,
+        te,
+        root: root.to_path_buf(),
+        device: device.clone(),
+        vision: Mutex::new(None),
+    })
 }
 
 /// Load ONLY the heavy phase — the single-stream DiT (+ additive adapters) + the Qwen-Image VAE + the
@@ -967,22 +989,19 @@ fn render_base_img2img_from_contexts(
     })
 }
 
-/// The image-edit-only components (epic 10871), loaded lazily on the first edit so the txt2img paths
-/// keep their footprint. Holds the two extra wires the edit LoRA's dual-conditioning contract needs:
-/// the Qwen-Image VAE **encoder** (source references → in-context VAE tokens, sc-10877) and the
-/// Qwen3-VL **vision tower** (source references → image-grounded conditioning, sc-10880).
+/// The resident image-edit-only component (epic 10871), loaded lazily on the first edit so the txt2img
+/// paths keep their footprint. The Qwen3-VL vision tower moved into the `KreaText` phase in sc-12129 so grounded
+/// conditioning completes inside the droppable text phase; only the Qwen-Image VAE encoder remains
+/// here for the resident path.
 pub struct EditComponents {
     vae_encoder: QwenVaeEncoder,
-    vision: crate::vision::VisionTower,
 }
 
-/// Load the image-edit-only components from a Krea 2 snapshot (epic 10871). Both read weights that
-/// already ship in the snapshot — the VAE encoder from `vae/`, the vision tower from the `visual.*`
-/// subtree of `text_encoder/`.
+/// Load the resident image-edit-only VAE encoder from a Krea 2 snapshot. The vision tower is lazy on
+/// `KreaText` and loads only when grounded conditioning is first requested.
 pub fn load_edit_components(root: &Path, device: &Device) -> Result<EditComponents> {
     Ok(EditComponents {
         vae_encoder: load_vae_encoder(root, device)?,
-        vision: crate::vision::load_vision_tower(root, device)?,
     })
 }
 
@@ -1011,6 +1030,41 @@ pub fn render_edit(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    let encoded = encode_edit_context(&comps.text, req, references, distilled, device)?;
+    render_edit_from_context(
+        &comps.heavy,
+        &edit.vae_encoder,
+        encoded,
+        req,
+        references,
+        device,
+        on_progress,
+    )
+}
+
+/// The complete Qwen3-VL-grounded edit conditioning produced while [`KreaText`] is resident. It owns
+/// its tensors so the text encoder and lazily loaded vision tower can drop before the DiT/VAE bundle
+/// loads under sequential residency.
+pub(crate) struct EditContext {
+    context: Tensor,
+    neg_context: Option<Tensor>,
+    steps: usize,
+    base_seed: u64,
+    guidance: f32,
+    distilled: bool,
+}
+
+/// Run the full grounded Qwen3-VL encode inside the text phase (sc-12129). The vision tower is loaded
+/// lazily by [`KreaText::vision`], used for every reference, and retained only as part of the text
+/// phase. The returned tensors do not borrow it, so sequential residency can drop the entire phase
+/// before loading the DiT and VAE.
+pub(crate) fn encode_edit_context(
+    text: &KreaText,
+    req: &GenerationRequest,
+    references: &[Image],
+    distilled: bool,
+    device: &Device,
+) -> Result<EditContext> {
     check_reference_count(references.len())?;
     let steps =
         req.steps
@@ -1026,7 +1080,8 @@ pub fn render_edit(
     };
 
     // Wire (b): run the vision tower ONCE per reference (shared across the pos/neg instruction encodings).
-    let grounding = encode_vision(&edit.vision, references, device)?;
+    let vision = text.vision()?;
+    let grounding = encode_vision(&vision, references, device)?;
 
     // Positive (+ optional unconditional) image-grounded conditioning: the instruction is tokenized with
     // the vision blocks, and the tower's merged embeds + deepstack features are spliced in. The optional
@@ -1034,20 +1089,68 @@ pub fn render_edit(
     // same 12-tap structure the plain encode does, so `apply_tap_weights` is shape-safe. The negative
     // (CFG-uncond) grounded context is left untouched so the knob steers only the conditional prediction.
     let context = maybe_apply_style_gain(
-        grounding.condition(&comps.text.tok, &comps.text.te, &req.prompt)?,
+        grounding.condition(&text.tok, &text.te, &req.prompt)?,
         req.text_style_gain,
     )?;
     let neg_context = if guidance > 0.0 {
         let negative = req.negative_prompt.as_deref().unwrap_or_default();
-        Some(grounding.condition(&comps.text.tok, &comps.text.te, negative)?)
+        Some(grounding.condition(&text.tok, &text.te, negative)?)
     } else {
         None
     };
 
+    Ok(EditContext {
+        context,
+        neg_context,
+        steps,
+        base_seed,
+        guidance,
+        distilled,
+    })
+}
+
+/// Render a sequential edit after its grounded context escaped the text phase. [`ResidencyHeavy`]
+/// supplies the same DiT/VAE/PiD bundle and VAE encoder used by the existing img2img residency path.
+pub(crate) fn render_edit_residency(
+    heavy: &ResidencyHeavy,
+    encoded: EditContext,
+    req: &GenerationRequest,
+    references: &[Image],
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    render_edit_from_context(
+        &heavy.heavy,
+        &heavy.vae_encoder,
+        encoded,
+        req,
+        references,
+        device,
+        on_progress,
+    )
+}
+
+fn render_edit_from_context(
+    heavy: &KreaHeavy,
+    vae_encoder: &QwenVaeEncoder,
+    encoded: EditContext,
+    req: &GenerationRequest,
+    references: &[Image],
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let EditContext {
+        context,
+        neg_context,
+        steps,
+        base_seed,
+        guidance,
+        distilled,
+    } = encoded;
+
     // Wire (a): VAE-encode each reference at the TARGET resolution → the normalized 16-ch latent (static
     // across steps). Fixed order preserved (image 1, then image 2 — sc-10878).
-    let ref_latents =
-        encode_references(&edit.vae_encoder, references, req.width, req.height, device)?;
+    let ref_latents = encode_references(vae_encoder, references, req.width, req.height, device)?;
 
     // Turbo edit runs the distilled few-step `turbo_schedule` (fixed mu) the CFG-free student expects;
     // Raw edit runs the resolution-dynamic `base_schedule` (undistilled, like `render_base`).
@@ -1063,7 +1166,7 @@ pub fn render_edit(
     // `render_base` txt2img siblings — an edit generator loaded with a PiD engine (`spec.pid`) is no
     // longer a dead wire. `model_id` names the surface for the error message (Raw vs distilled Turbo edit).
     let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-        comps.heavy.pid.as_deref(),
+        heavy.pid.as_deref(),
         req,
         base_seed,
         edit_pid_model_id(distilled),
@@ -1081,13 +1184,10 @@ pub fn render_edit(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond = comps
-                    .heavy
-                    .dit
-                    .forward_edit(x, &t, &context, &ref_latents)?;
+                let cond = heavy.dit.forward_edit(x, &t, &context, &ref_latents)?;
                 let v = match &neg_context {
                     Some(nc) => {
-                        let uncond = comps.heavy.dit.forward_edit(x, &t, nc, &ref_latents)?;
+                        let uncond = heavy.dit.forward_edit(x, &t, nc, &ref_latents)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
@@ -1101,7 +1201,7 @@ pub fn render_edit(
         // `[1,3,4H,4W]` tensor and `to_image` reads the size from it — matching `render` / `render_base`.
         let decoded = match &pid_decoder {
             Some(pid) => pid.decode(&lat)?,
-            None => comps.heavy.vae.decode(&lat)?.to_dtype(DType::F32)?,
+            None => heavy.vae.decode(&lat)?.to_dtype(DType::F32)?,
         };
         to_image(&decoded)
     })
