@@ -69,7 +69,7 @@ impl Pipeline {
         let dit_cfg = MochiDitConfig::default();
 
         let tokenizer = crate::tokenizer::load_tokenizer()?;
-        let t5 = MochiT5::load(&self.root.join("text_encoder"), DIT_DTYPE, &self.device)?;
+        let t5 = MochiT5::load_reference_regime(&self.root.join("text_encoder"), &self.device)?;
         let dit_vb = load_transformer_var_builder(&self.root, DIT_DTYPE, &self.device)?;
         let transformer = MochiTransformer3DModel::new(dit_vb, &dit_cfg, &self.device)?;
         let vae = MochiVaeDecoder::load(&self.root, &self.device)?;

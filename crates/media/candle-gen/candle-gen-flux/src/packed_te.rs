@@ -337,9 +337,13 @@ impl T5DenseGatedActDense {
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         // T5 v1.1 uses the "new"/tanh GELU (NewGelu) — candle `gelu` is the tanh approximation.
-        let hidden_gelu = self.wi_0.forward(xs)?.gelu()?;
-        let hidden_linear = self.wi_1.forward(xs)?;
-        self.wo.forward(&hidden_gelu.broadcast_mul(&hidden_linear)?)
+        // `forward_upcast` so a bf16-weight encoder can run f32 activations (Mochi's regime); it is
+        // inert (byte-identical, no copy) when the weights already match `xs`'s dtype — the FLUX /
+        // Chroma path.
+        let hidden_gelu = self.wi_0.forward_upcast(xs)?.gelu()?;
+        let hidden_linear = self.wi_1.forward_upcast(xs)?;
+        self.wo
+            .forward_upcast(&hidden_gelu.broadcast_mul(&hidden_linear)?)
     }
 }
 
@@ -454,9 +458,11 @@ impl T5Attention {
     ) -> Result<(Tensor, Tensor)> {
         let (b_sz, q_len) = (xs.dim(0)?, xs.dim(1)?);
         let kv_len = q_len;
-        let q = self.q.forward(xs)?;
-        let k = self.k.forward(xs)?;
-        let v = self.v.forward(xs)?;
+        // `forward_upcast`: inert (byte-identical) when weights already match `xs`'s dtype — the FLUX /
+        // Chroma path — and lets Mochi run f32 activations over bf16-resident weights.
+        let q = self.q.forward_upcast(xs)?;
+        let k = self.k.forward_upcast(xs)?;
+        let v = self.v.forward_upcast(xs)?;
         let to_heads = |t: Tensor| -> Result<Tensor> {
             t.reshape((b_sz, q_len, self.n_heads, self.d_kv))?
                 .transpose(1, 2)?
@@ -490,7 +496,7 @@ impl T5Attention {
         let out = out
             .transpose(1, 2)?
             .reshape((b_sz, q_len, self.inner_dim))?;
-        Ok((self.o.forward(&out)?, position_bias))
+        Ok((self.o.forward_upcast(&out)?, position_bias))
     }
 }
 

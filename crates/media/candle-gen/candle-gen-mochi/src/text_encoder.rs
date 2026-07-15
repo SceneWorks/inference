@@ -7,10 +7,13 @@
 //! heads, gated-GELU FFN) through its `forward_masked` seam, feeding an additive key-padding mask built
 //! from the tokenizer's 0/1 mask.
 //!
-//! The reference loads the pipeline at `torch_dtype=bfloat16`, so the T5 runs bf16; we mirror that by
-//! loading the T5 shards at [`crate::DIT_DTYPE`] and encoding at that dtype (attention upcasts to f32
-//! inside the block). The `te_parity` 6e-2 residual reflects the reference's bf16 rounding, not a code
-//! delta.
+//! **Dtype regime.** The reference loads the pipeline at `torch_dtype=bfloat16`, and `text_encoder/`
+//! ships no bf16 variant — so diffusers reads the fp32 shards and rounds them to bf16. Those shards
+//! are already bf16-trained (verified: 0 of 806k sampled fp32 weights carry sub-bf16 mantissa bits),
+//! so the *weights* are the same either way; only the **activation** precision is a choice. We run
+//! **bf16 weights + f32 activations** ([`MochiT5::load_reference_regime`]) — MLX's T5 regime and this
+//! crate's own DiT regime. The residual `te_parity` gap reflects cross-backend kernel noise against a
+//! Metal-blessed golden, not a code delta.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -45,11 +48,33 @@ pub struct MochiT5 {
 
 impl MochiT5 {
     /// Load the T5-XXL encoder from the snapshot's `text_encoder/` shards (index-filtered — see
-    /// [`load_indexed_var_builder`]) at `dtype`.
+    /// [`load_indexed_var_builder`]) at `dtype` — weights **and** activations at `dtype`.
     pub fn load(dir: &Path, dtype: DType, device: &Device) -> Result<Self> {
         let vb = load_indexed_var_builder(dir, dtype, device)?;
         let enc = PackedT5Encoder::new(&T5Config::xxl(), vb)?;
         Ok(Self { enc, dtype })
+    }
+
+    /// Load in the **reference regime**: weights resident at **bf16**, activations computed at
+    /// **f32**. This is what the `te_parity` golden was blessed in and what `mlx-gen-mochi` runs
+    /// (bf16 weights, f32 activations), and it matches this crate's own DiT (bf16 storage / f32
+    /// compute, [`crate::DIT_DTYPE`] + the `nn::linear_*` helpers).
+    ///
+    /// Both halves matter, and neither naive load gets it:
+    ///   - all-**bf16** computes activations in bf16 too, stacking our own independent bf16 rounding
+    ///     on the reference's — two independent bf16 impls diverge from each other by *more* than
+    ///     either diverges from exact f32 (measured `te_parity` `peak_rel`: 1.444e-1 vs 6.044e-2);
+    ///   - all-**f32** is numerically right (the fp32 shards are bf16-trained, so an f32 load carries
+    ///     the reference's exact weights) but doubles the resident T5 from ~9.5 GB to ~19 GB.
+    /// Loading bf16 and upcasting per matmul ([`candle_gen::QLinear::forward_upcast`]) is numerically
+    /// identical to the f32 load at bf16's footprint — only the one weight in flight is transient.
+    pub fn load_reference_regime(dir: &Path, device: &Device) -> Result<Self> {
+        let vb = load_indexed_var_builder(dir, DType::BF16, device)?;
+        let enc = PackedT5Encoder::new(&T5Config::xxl(), vb)?;
+        Ok(Self {
+            enc,
+            dtype: DType::F32,
+        })
     }
 
     /// Encode `input_ids` `[1, L]` with the additive key-padding `mask` `[1, 1, 1, L]` → `[1, L, 4096]`.
