@@ -1430,7 +1430,7 @@ mod tests {
         let generate_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
         probe.end_gen(generate_phase);
-        let report = probe.report().assert_trustworthy(1.0);
+        let report = probe.report();
         let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
         let img = match output {
             GenerationOutput::Images(mut v) => v.remove(0),
@@ -1452,6 +1452,7 @@ mod tests {
             img.width,
             img.height
         );
+        report.assert_trustworthy(1.0);
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10868) for FLUX.2-**dev** (Mistral

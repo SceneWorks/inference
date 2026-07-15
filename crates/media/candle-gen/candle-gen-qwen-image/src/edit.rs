@@ -757,7 +757,7 @@ mod tests {
             .generate(&req, &[reference], &mut |_| {})
             .expect("generate");
         probe.end_gen(generate_phase);
-        let report = probe.report().assert_trustworthy(1.0);
+        let report = probe.report();
         let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
@@ -777,5 +777,6 @@ mod tests {
             img.width,
             img.height
         );
+        report.assert_trustworthy(1.0);
     }
 }

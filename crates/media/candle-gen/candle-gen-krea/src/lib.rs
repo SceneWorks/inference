@@ -1528,7 +1528,7 @@ mod tests {
         let gen_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
         probe.end_gen(gen_phase);
-        let report = probe.report().assert_trustworthy(1.0);
+        let report = probe.report();
 
         let img = match output {
             GenerationOutput::Images(mut v) => v.remove(0),
@@ -1559,6 +1559,7 @@ mod tests {
             req.steps,
             img.pixels.len(),
         );
+        report.assert_trustworthy(1.0);
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).
