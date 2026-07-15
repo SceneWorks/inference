@@ -18,12 +18,16 @@ existing diffusers-reference dumps in this directory (see `dump_svd_pipeline_gol
 | `te`        | `mochi_te_golden.safetensors`     | T5-XXL text encoder (`encode_prompt`)        | A2 `te_parity`       |
 | `vae`       | `mochi_vae_golden.safetensors`    | `AutoencoderKLMochi` decode                  | A2 `vae_parity`      |
 | `dit_block` | `mochi_dit_block_golden.safetensors` | one `MochiTransformerBlock` forward       | A3 `block_parity`    |
+| `dit`       | `mochi_dit_golden.safetensors`    | whole `MochiTransformer3DModel` forward      | A3 `dit_parity`      |
 | `e2e`       | `mochi_e2e_golden.safetensors`    | full txt2v denoise + decode                  | A4 `e2e_parity`      |
 
-The `dit_block` golden is captured **for free** during the `e2e` denoise: a forward hook on
-`transformer.transformer_blocks[0]` records that block's real (post patch-embed / time-embed /
-RoPE) inputs and output at the first sampler step. This avoids hand-replicating the transformer's
-internal pre-block wiring, so the block fixture stays faithful to the reference forward.
+The `dit_block` and `dit` goldens are captured **for free** during the `e2e` denoise: forward hooks
+on `transformer.transformer_blocks[0]` (block) and the whole `transformer` (DiT) record their real
+inputs + output at the first sampler step. The `dit` golden's `noise_pred` is the **pre-CFG**
+velocity for BOTH batch branches (`[neg, pos]`) exactly as the transformer emits it — the CFG combine
+happens downstream in the pipeline, so the Rust `dit_parity` gate reproduces the raw model output.
+This avoids hand-replicating the transformer's internal patchify / time-embed / RoPE wiring, so both
+fixtures stay faithful to the reference forward.
 
 ## Determinism
 
@@ -42,8 +46,8 @@ Needs `torch` + `diffusers` (with `MochiPipeline`) + `safetensors`, and the pinn
     MOCHI_SNAPSHOT=/path/to/mochi-1-preview \
       python tools/dump_mochi_golden.py --stage all
 
-`--stage {te,vae,dit_block,e2e,all}` selects which goldens to write (default `all`); the pipeline
-is loaded once regardless. `dit_block` implies `e2e` (it is captured during that run).
+`--stage {te,vae,dit_block,dit,e2e,all}` selects which goldens to write (default `all`); the pipeline
+is loaded once regardless. `dit_block` / `dit` imply `e2e` (both are captured during that run).
 
 Env overrides (small deterministic defaults keep the deep model cheap):
 `MOCHI_SEED`, `MOCHI_PROMPT`, `MOCHI_NEGATIVE`, `MOCHI_H`, `MOCHI_W`, `MOCHI_FRAMES`,
@@ -201,7 +205,20 @@ def dump_vae(pipe: MochiPipeline) -> None:
     _write("mochi_vae_golden.safetensors", tensors)
 
 
-# --------------------------------------------------------------- stage: e2e + block
+# --------------------------------------------------------------- stage: e2e + block + dit
+
+
+def _flatten(prefix: str, value: object, out: dict[str, np.ndarray]) -> None:
+    """Recursively store tensors under `prefix`, indexing into tuples/lists (`prefix.0`, ...).
+
+    Non-tensor kwargs (e.g. `attention_kwargs=None`, `return_dict=False`) are skipped, so a hook
+    can hand this its full `kwargs` and only the tensors survive.
+    """
+    if isinstance(value, torch.Tensor):
+        out[prefix] = _f32(value)
+    elif isinstance(value, (tuple, list)):
+        for i, item in enumerate(value):
+            _flatten(f"{prefix}.{i}", item, out)
 
 
 class _BlockCapture:
@@ -211,28 +228,58 @@ class _BlockCapture:
         self.captured: dict[str, np.ndarray] | None = None
         self.handle = None
 
-    def _flatten(self, prefix: str, value: object, out: dict[str, np.ndarray]) -> None:
-        if isinstance(value, torch.Tensor):
-            out[prefix] = _f32(value)
-        elif isinstance(value, (tuple, list)):
-            for i, item in enumerate(value):
-                self._flatten(f"{prefix}.{i}", item, out)
-
     def hook(self, _module, args, kwargs, output):  # torch forward hook (with_kwargs=True)
         if self.captured is not None:
             return
         rec: dict[str, np.ndarray] = {}
         for i, item in enumerate(args):
-            self._flatten(f"block_in.arg{i}", item, rec)
+            _flatten(f"block_in.arg{i}", item, rec)
         for name, item in kwargs.items():
-            self._flatten(f"block_in.{name}", item, rec)
-        self._flatten("block_out", output, rec)
+            _flatten(f"block_in.{name}", item, rec)
+        _flatten("block_out", output, rec)
         self.captured = rec
         if self.handle is not None:
             self.handle.remove()
 
     def register(self, block: torch.nn.Module) -> None:
         self.handle = block.register_forward_hook(self.hook, with_kwargs=True)
+
+
+class _TransformerCapture:
+    """Records the first whole-`MochiTransformer3DModel` forward (inputs + PRE-CFG output).
+
+    Reuses the same `register_forward_hook(with_kwargs=True)` mechanism as [`_BlockCapture`], but on
+    the top-level transformer instead of block[0], firing at e2e sampler step 0. The transformer is
+    called entirely by keyword (`hidden_states=`, `encoder_hidden_states=`, `timestep=`,
+    `encoder_attention_mask=`, `attention_kwargs=`, `return_dict=`), so each tensor kwarg is stored
+    under its bare name; the `(output,)` 1-tuple returned when `return_dict=False` is unwrapped to
+    `noise_pred` (the raw velocity for BOTH CFG branches — de-CFG'd by the caller downstream). This
+    fixes the A3 `dit_parity` oracle to the reference forward without hand-replicating patchify /
+    time-embed / RoPE wiring in the Rust test.
+    """
+
+    _TENSOR_KWARGS = ("hidden_states", "encoder_hidden_states", "timestep", "encoder_attention_mask")
+
+    def __init__(self) -> None:
+        self.captured: dict[str, np.ndarray] | None = None
+        self.handle = None
+
+    def hook(self, _module, args, kwargs, output):  # torch forward hook (with_kwargs=True)
+        if self.captured is not None:
+            return
+        rec: dict[str, np.ndarray] = {}
+        for name in self._TENSOR_KWARGS:
+            if name in kwargs and isinstance(kwargs[name], torch.Tensor):
+                rec[name] = _f32(kwargs[name])
+        # `return_dict=False` → a `(sample,)` tuple; unwrap to the bare velocity tensor.
+        noise_pred = output[0] if isinstance(output, (tuple, list)) else output
+        rec["noise_pred"] = _f32(noise_pred)
+        self.captured = rec
+        if self.handle is not None:
+            self.handle.remove()
+
+    def register(self, transformer: torch.nn.Module) -> None:
+        self.handle = transformer.register_forward_hook(self.hook, with_kwargs=True)
 
 
 def dump_e2e_and_block(
@@ -242,11 +289,15 @@ def dump_e2e_and_block(
     neg_embeds: torch.Tensor,
     neg_mask: torch.Tensor,
     want_block: bool,
+    want_dit: bool,
 ) -> None:
-    """Full txt2v e2e golden (final latent + decoded frame). Captures the DiT-block golden en route."""
-    capture = _BlockCapture()
+    """Full txt2v e2e golden (final latent + decoded frame). Captures the DiT-block/DiT goldens en route."""
+    block_capture = _BlockCapture()
     if want_block:
-        capture.register(pipe.transformer.transformer_blocks[0])
+        block_capture.register(pipe.transformer.transformer_blocks[0])
+    dit_capture = _TransformerCapture()
+    if want_dit:
+        dit_capture.register(pipe.transformer)
 
     gen = torch.Generator(device="cpu").manual_seed(SEED)
     with torch.no_grad():
@@ -278,9 +329,14 @@ def dump_e2e_and_block(
     _write("mochi_e2e_golden.safetensors", tensors)
 
     if want_block:
-        if capture.captured is None:
+        if block_capture.captured is None:
             raise RuntimeError("block[0] forward hook never fired — cannot emit the DiT-block golden")
-        _write("mochi_dit_block_golden.safetensors", {**capture.captured, **_meta()})
+        _write("mochi_dit_block_golden.safetensors", {**block_capture.captured, **_meta()})
+
+    if want_dit:
+        if dit_capture.captured is None:
+            raise RuntimeError("transformer forward hook never fired — cannot emit the DiT golden")
+        _write("mochi_dit_golden.safetensors", {**dit_capture.captured, **_meta()})
 
 
 # ------------------------------------------------------------------------------ main
@@ -290,11 +346,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--stage",
-        choices=["te", "vae", "dit_block", "e2e", "all"],
+        choices=["te", "vae", "dit_block", "dit", "e2e", "all"],
         default="all",
     )
     args = parser.parse_args()
-    stages = {"te", "vae", "dit_block", "e2e"} if args.stage == "all" else {args.stage}
+    stages = {"te", "vae", "dit_block", "dit", "e2e"} if args.stage == "all" else {args.stage}
 
     snap = _snapshot_dir()
     print(f"loading MochiPipeline from {snap} (device={DEVICE}, dtype={DTYPE})")
@@ -308,17 +364,19 @@ def main() -> int:
     # (its shipped precision). Without this the `vae`/`e2e` golden videos are garbage (sc-11985).
     pipe.vae.to(torch.float32)
 
-    # TE embeds are needed to drive e2e/dit_block; compute them if any of those run.
+    # TE embeds are needed to drive e2e/dit_block/dit; compute them if any of those run.
     embeds = None
-    if stages & {"te", "e2e", "dit_block"}:
+    if stages & {"te", "e2e", "dit_block", "dit"}:
         embeds = dump_te(pipe) if "te" in stages else _encode_only(pipe)
 
     if "vae" in stages:
         dump_vae(pipe)
 
-    if stages & {"e2e", "dit_block"}:
+    if stages & {"e2e", "dit_block", "dit"}:
         assert embeds is not None
-        dump_e2e_and_block(pipe, *embeds, want_block="dit_block" in stages)
+        dump_e2e_and_block(
+            pipe, *embeds, want_block="dit_block" in stages, want_dit="dit" in stages
+        )
 
     print("done.")
     return 0

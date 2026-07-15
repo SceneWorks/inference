@@ -192,17 +192,19 @@ Stable-Video-Diffusion goldens, dumped from the diffusers `StableVideoDiffusionP
 ### Mochi 1 video (`mlx-gen-mochi` / `candle-gen-mochi`, sc-11984 / epic A1)
 
 Native Mochi 1 (`genmo/mochi-1-preview`, Apache-2.0) parity oracle. Dumped from the diffusers
-`MochiPipeline` reference by a **single** harness (`dump_mochi_golden.py --stage {te,vae,dit_block,e2e,all}`)
+`MochiPipeline` reference by a **single** harness (`dump_mochi_golden.py --stage {te,vae,dit_block,dit,e2e,all}`)
 that loads the pipeline once at a fixed seed/prompt/geometry (bf16 reference precision). The
-`dit_block` golden is captured via a forward hook on `transformer_blocks[0]` during the `e2e`
-denoise. Weights are pinned in `release/real-weight-models.toml` (`mochi-1-preview`, env `MOCHI_SNAPSHOT`).
-The consuming crates + `#[ignore]`d parity tests land in stories A2–A4.
+`dit_block` and `dit` goldens are captured via forward hooks on `transformer_blocks[0]` and the whole
+`transformer` during the `e2e` denoise. Weights are pinned in `release/real-weight-models.toml`
+(`mochi-1-preview`, env `MOCHI_SNAPSHOT`). The consuming crates + `#[ignore]`d parity tests land in
+stories A2–A4.
 
 | golden | dump script | consumed by (A2–A4) | notes |
 |---|---|---|---|
 | `mochi_te_golden.safetensors` | `dump_mochi_golden.py --stage te` | Mochi `te_parity` (A2) | T5-XXL `encode_prompt` — prompt/negative embeds + attention masks. |
 | `mochi_vae_golden.safetensors` | `dump_mochi_golden.py --stage vae` | Mochi `vae_parity` (A2) | `AutoencoderKLMochi` decode of a seeded 12-ch latent (per-channel mean/std de-norm). |
 | `mochi_dit_block_golden.safetensors` | `dump_mochi_golden.py --stage dit_block` | Mochi `block_parity` (A3) | one `MochiTransformerBlock` forward — real (post patch-embed/time-embed/RoPE) inputs + output, hook-captured at e2e step 0. |
+| `mochi_dit_golden.safetensors` | `dump_mochi_golden.py --stage dit` | Mochi `dit_parity` (A3) | whole `MochiTransformer3DModel` forward — raw `hidden_states`/`encoder_hidden_states`/`timestep`/`encoder_attention_mask` inputs + **pre-CFG** `noise_pred` (both `[neg, pos]` branches), hook-captured at e2e step 0. |
 | `mochi_e2e_golden.safetensors` | `dump_mochi_golden.py --stage e2e` | Mochi `e2e_parity` (A4) | full txt2v denoise → final latent + VAE-decoded frame. |
 
 ### SenseNova-U1 unified AR + image gen (`mlx-gen-sensenova`, epic 3180)
