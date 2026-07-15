@@ -268,9 +268,43 @@ the GEMM epilogue) for W4A4 merely to **break even** with bf16 — before it can
 core's 1.35–1.98×. Any plan that treats sc-12078 as an incremental optimization is working from Sana's
 diluted number.
 
+#### SC#2 — NVFP4 is *less* faithful than the Q4 tier it would replace
+
+The right SC#2 question is not "does a 4-bit tier match bf16" (none does — an 8-step flow-match denoise
+is chaotic, so any ~4.5-bit tier walks the sampler onto a different-but-valid trajectory, and cosine
+vs bf16 measures **divergence**, not quality). It is: **is NVFP4 at least as good as the int4 tier it
+replaces?** Krea is the first model with both tiers on disk, so it can be asked. Same seed, prompt and
+schedule; dense bf16 as the common reference:
+
+| tier (vs dense bf16) | rel-RMS | cosine | PSNR |
+|---|---:|---:|---:|
+| **Q4 weight-only** — the incumbent | **0.20193** | **0.97963** | **31.28 dB** |
+| **NVFP4 W4A16 weight-only** — like-for-like | 0.22850 | 0.97362 | 30.20 dB |
+| **NVFP4 W4A4 mixed** — weights *and* activations | 0.26869 | 0.96381 | 28.79 dB |
+
+Q4 is weight-only, so the honest comparison is the **W4A16** row (both 4-bit weights, full-precision
+activations); scoring Q4 against W4A4-mixed would conflate the weight format with activation quant.
+
+> **SC#2 is NOT met.** NVFP4's weight format is **less faithful than int4** (cosine 0.97362 vs 0.97963;
+> −1.08 dB PSNR), and FP4 activations cost a further −0.0098 cosine on top.
+
+**And the two tiers cost exactly the same 4.5 bits/weight**, which is what makes this a clean result
+rather than a budget artifact:
+
+* **MLX Q4**, group-64 affine: `4 + (f16 scale + f16 bias)/64` = **4.5 bits**
+* **NVFP4**, group-16: `4 (E2M1) + 8 (E4M3 scale)/16` = **4.5 bits** (+ a negligible per-tensor f32)
+
+So NVFP4 spends its 4.5 bits on **finer blocks (16 vs 64) but symmetric-only** quantization, while Q4
+spends them on **coarser blocks with a zero-point** (scale *and* bias, i.e. asymmetric). On Krea's real
+weight distributions the zero-point wins. The epic's premise — that NVFP4's block-16 + real FP8 scale
+buys near-FP8 accuracy *relative to int4* — does not reproduce end-to-end at equal bits. (The spike
+sc-11038's "NVFP4 ≈ int4, ~2× better than MXFP4" still holds as far as it went: NVFP4 beats **MXFP4**,
+whose block-32 power-of-two scale is genuinely coarser. It was never a win over *affine* int4.)
+
 **What NVFP4 is today, stated plainly:** a **storage/packaging format** (a real ~4.5-bit packed
-footprint on the W4A4 serving path — SC#6 below) with **no throughput benefit on any shipping regime**.
-SC#3 (stability) and SC#4 (the Blackwell gate) hold. SC#1 does not.
+footprint on the W4A4 serving path — SC#6 below) with **no throughput benefit on any shipping regime**
+and **slightly worse quality than the int4 tier it would replace, at identical bits**. SC#3 (stability)
+and SC#4 (the Blackwell gate) hold. **SC#1 and SC#2 do not.**
 
 ### The mixed-precision policy (why not blanket W4A4)
 
