@@ -138,6 +138,206 @@ The default build is **CPU** (`candle-core`'s default) and works on macOS with n
 forwarded crate-to-crate) that wired no fused kernels; it was removed in sc-9032. When the
 `candle-flash-attn` slice is scheduled, reintroduce it behind real gated code, not a bare alias.
 
+## The NVFP4 lane (Blackwell `sm_120` only) — epic 11037
+
+**NVFP4** = 4-bit float **E2M1** elements + an **FP8 (E4M3)** micro-scale per **16-element block** + a
+second-level **FP32 per-tensor** scale ⇒ **~4.5 effective bits/weight**. It is a *compute* lane, not
+just a storage format: the cuBLASLt FP4 GEMM (`CUDA_R_4F_E2M1` operands + `VEC16_UE4M3` block scales)
+runs on the Blackwell FP4 tensor cores. Everything lives in `candle-gen/src/quant/`
+(`nvfp4.rs` packer/container, `cublaslt.rs` GEMM + on-device activation quantizer, `nvfp4_linear.rs`
+the `Nvfp4Linear` layer + policy, `nvfp4_outlier.rs` the sparsity metric).
+
+### Hardware scope: `sm_120` only — `sm_100` is explicitly out of scope
+
+| target | status |
+|---|---|
+| **consumer Blackwell `sm_120`** (RTX PRO 6000 / RTX 50-series) | **the only supported NVFP4 target.** Validated on the 2× RTX PRO 6000 rig (CUDA 12.9, MSVC 14.44). Plain `sm_120` — `sm_120a` is *not* required. |
+| datacenter Blackwell `sm_100` (B100/B200) | **explicitly out of scope for this epic.** Not built, not gated on, not validated. A separate effort. |
+| pre-Blackwell CUDA, CPU, Metal | no FP4 hardware → transparent fallback (below). |
+
+**The gate is capability-probed, not assumed** (`CublasLt::meets_nvfp4_floor`). Below the floor — or on
+CPU, a non-`cuda` build, or an FP4-ineligible shape (padded-K not a multiple of `NVFP4_K_ALIGN`, or
+N % 16 ≠ 0) — `Nvfp4Linear` **transparently serves a dequant→bf16 dense matmul instead and never
+panics**. An NVFP4 model therefore loads and runs everywhere; it just doesn't light the FP4 cores off
+Blackwell. That is SC#4, and it is asserted both at layer level
+(`quant::nvfp4_linear::tests::cpu_selects_dequant_fallback_and_forwards`) and at model level
+(`candle-gen-sana`'s `transformer::tests::nvfp4_plan_falls_back_cleanly_off_blackwell`).
+
+### W4A4 vs W4A16 — two regimes, and which one you actually want today
+
+The FP4 tensor-core MMA needs **both** operands in E2M1. So:
+
+* **W4A4** (FP4 weight × FP4 activation) — the only regime that lights the FP4 cores. The FP4 GEMM
+  core measures **1.35–1.98×** over bf16 on real Sana shapes (sc-11044; SC#1's GEMM-level target).
+* **W4A16** (FP4 weight × bf16 activation) — the weight is dequantized to bf16 **once at load and then
+  held resident**, and run dense. **No FP4 compute win — and no VRAM win either**: a W4A16 layer costs
+  the full dense bf16 footprint (see [Native packed serving](#native-packed-serving-sc6)). What it buys
+  is *numerical stability* on the outlier class. It is the outlier-class override and the capability
+  fallback.
+
+**Current perf reality (read before quoting a multiple).** The W4A4 activation quantizer is **unfused**
+— a chain of candle ops rather than one kernel — and that overhead currently **swamps the FP4 GEMM
+win** end-to-end (sc-11044 measured ~25.8 ms/fwd for W4A4 vs ~0.05 ms for W4A16 at layer level). So:
+
+> **W4A16 is the throughput default; W4A4 ships opt-in** (correctness + the ~4.5-bit footprint are
+> real today). Making W4A4 a net end-to-end win is gated on **[sc-12078](https://app.shortcut.com/trefry/story/12078)**
+> — a fused CUDA activation-quantize kernel. Until that lands, the ~2× is a **GEMM-core** number, not
+> an end-to-end one.
+
+### SC#1 — what Sana can and cannot tell you (read before quoting an end-to-end ratio)
+
+sc-11045 benched the real SANA-1.6B trunk end-to-end. **Do not quote its vs-dense ratios as SC#1's
+number of record.** They are real measurements, but ~93% of their denominator is an unrelated
+**candle-core defect**, so they say almost nothing about NVFP4:
+
+| per denoise step, SANA-1.6B @ 1024px, sm_120 | time | share |
+|---|---:|---:|
+| `conv_depth` — the Mix-FFN 3×3 **depthwise** conv (`groups = 2·hidden = 11200`), ×20 blocks | **19.65 s** | **93.4%** |
+| all other convs | ~1.32 s | 6.3% |
+| **all 163 NVFP4-eligible linears** | **~0.08 s** | **0.4%** |
+| total | 21.05 s | |
+
+The cause is `candle-core/src/conv.rs:331-338`: a grouped conv is decomposed into **one kernel launch
+per group**, then a `cat` of **11200** tensors — 982 ms/call, GPU utilization 0–1% (host-launch-bound,
+not compute-bound). Per block: linears **1.99 ms (0.20%)** vs convs **984.8 ms (99.80%)**, of which the
+depthwise alone is **982.5 ms**. **The NVFP4 lane touches 0.4% of the step, so SC#1's end-to-end ceiling
+on Sana as it runs today is ~1.002× even if the FP4 lane were infinitely fast.** A vs-dense ratio
+measured against that denominator is an artifact of the conv defect, not a property of NVFP4.
+
+**The one signal that does survive** the conv noise, because it is a *marginal* cost measured against
+an otherwise-identical leg: **W4A4 adds ~9.1 s/step of unfused activation-quantizer overhead**
+(≈28 ms/forward/CFG-branch — consistent with sc-11044's ~25.8 ms/fwd layer-level number). That is real
+sc-12078 evidence, and it is the honest sc-11045 throughput finding.
+
+> **Sana cannot settle SC#1 or SC#2**, on three independent counts: the conv-dominated FFN above; **no
+> bf16 path** (the trunk is f32-only, so the epic's "vs the bf16 compute path" baseline does not exist
+> here); and **no Q4 tier** wired for Sana (so SC#2's honest baseline — the int4 tier NVFP4 would
+> *replace* — cannot be measured either). SC#1/SC#2 are retargeted to a **Flux-family DiT**
+> (linear FFN + `QLinear` Q4 already wired) under
+> **[sc-12110](https://app.shortcut.com/trefry/story/12110)**, which is the vehicle of record for both.
+> What sc-11045 *does* settle is SC#3 (stability), SC#4 (the Blackwell gate), SC#6 (packed serving, see
+> below), and the spike's residual activation-outlier partition gate.
+
+### The mixed-precision policy (why not blanket W4A4)
+
+NVFP4 W4A4 reproduces the sc-7702 collapse: an activation **outlier** sharing a 16-block crushes its
+co-located channels to E2M1 zero. Damage scales with outlier **sparsity** (spike sc-11038: benign 0.991
+cosine → ~2 sparse outliers 0.984 → 8 → 0.966 → dense → 0.000). So the default is **not** blanket W4A4:
+
+* **benign compute-bulk** — **self-attention** (`attn1`) + FF projections → **W4A4**;
+* **outlier class** → **W4A16** (bf16 activation): the text→DiT `caption_projection`, **the whole
+  cross-attention block** (`attn2` / `cross_att*` — Q and `to_out` as well as K/V), the trunk's
+  **final** `proj_out` head, and the **first two & last** DiT blocks.
+
+`ActPrecision::for_outlier_layer` carries this as a substring policy over dotted layer keys;
+`ActPrecision::partition_layers` is its explicit, testable form.
+
+**Two things the substring form gets wrong if you are careless, both fixed in sc-11045's review:**
+
+* **Spelling.** `contains("cross_attn")` does **not** match `cross_attention` (position 10 is `e`, not
+  `n`). The policy matches `cross_att`/`crossatt` — covering `cross_attn`, `cross_attention`,
+  `crossattn`, `crossattention` — *and* retains the pre-sc-11045 `cross` + K/V clause verbatim, so the
+  widening is a provable superset rather than an accidental narrowing.
+* **Scope.** `contains("proj_out")` over-fires. The 438× measurement is SANA's single **top-level**
+  head, but the bare substring also matches per-block layers that are the spike's explicitly *benign*
+  W4A4 class — `candle-gen-ltx` remaps `ff.net.2` → `ff.proj_out` (the FF output of all 48 blocks), and
+  `candle-gen-flux`/`candle-gen-chroma` name `single_transformer_blocks.{i}.proj_out` (the fused
+  attn+MLP output `[5·hidden → hidden]`, the largest GEMM in each of 38 single blocks). Firing there
+  would pull the compute bulk out of the FP4 lane. The final head is therefore **stated by the
+  provider** (`LayerRole::final_proj()`, the same seam as `is_edge_block`), with a conservative
+  name anchor as the fallback — never a bare substring.
+
+Both defects are **latent, not live**: `candle-gen-sana` is the policy's only consumer today, and
+neither defect changes its partition (Sana spells cross-attention `attn2`, and its only `proj_out` *is*
+the trunk head — it measures 68 W4A4 / 95 W4A16 either way). They are traps armed for whichever crate
+wires up NVFP4 next — which, per [sc-12110](https://app.shortcut.com/trefry/story/12110), is a
+Flux-family DiT, i.e. exactly the naming that trips them. That is why they are fixed here, before the
+retarget, rather than after.
+
+> **The outlier class was WIDENED in sc-11045 by real measurement — do not narrow it back to the
+> spike's prose.** The spike named the class "cross-attn K/V", and the original policy took that
+> literally, leaving cross-attn **Q** and **`to_out`** on W4A4. Capturing per-layer activation-outlier
+> sparsity across a **real Sana-1.6B denoise** (`candle-gen-sana`'s `ActProbe`) refuted that reading: of
+> the 109 projections the old policy sent to W4A4, **27 measured `OutlierClass::Dense`** — 17 ×
+> `attn2.to_out.0`, 6 × `attn2.to_q` (per-block crush ratios up to **5124×**), `proj_out` (438×), and
+> block **1**'s self-attention (176×). The entire cross-attention block reads caption-derived context,
+> so it carries the caption's massive activations regardless of which projection you name. Guarding
+> `attn2` wholesale restores the spike's *actual* intent (W4A4 == self-attn + FF). This is the empirical
+> gate synthetic activations could not close.
+>
+> **The widening is strictly the safe direction — relative to the pre-sc-11045 rule, and proven, not
+> asserted.** Every clause that rule guarded is still guarded verbatim, so the policy can only ever move
+> a layer **W4A4 → W4A16** (and W4A16 is already the throughput default). That property is a test:
+> `differential_widening_is_strictly_safe` re-implements the old rule and asserts the superset over a
+> cross-provider name corpus. It is what caught the `cross_attn`/`cross_attention` narrowing described
+> above — which, before the fix, made this very claim false in the collapse-prone direction.
+>
+> **The widening is not free — it is paid in VRAM.** On SANA it moved the mixed policy from **109 W4A4 /
+> 54 W4A16** to **68 W4A4 / 95 W4A16**: 41 more projections now hold a dense bf16 weight, which is most
+> of the gap between the 0.28× packed ratio and the mixed policy's measured **0.70×** (SC#6 table
+> above). Re-measured on a live denoise, the partition now holds — **68 W4A4: 47 Benign, 21 Sparse, 0
+> Dense** — and 35 of the 95 W4A16 layers do measure Dense, i.e. the override is earning its keep.
+
+### Native packed serving (SC#6)
+
+The point of the format is the footprint, so the serving path **must not** full-dequant to bf16 in
+VRAM. `Nvfp4Linear` **in the W4A4 regime** stages the packed weight to the device **once** and never
+allocates a dense bf16 copy; resident device bytes == the packed NVFP4 footprint (**0.281×** the bf16
+size, ~4.5 eff bits/wt), proven by contention-immune tensor byte-accounting at layer level (sc-11041)
+and at whole-model level (sc-11045, `SanaTransformer::nvfp4_report`).
+
+**Scope that claim to W4A4, because resident VRAM is regime-dependent.** W4A16 is realized by
+dequantizing the weight to bf16 at construction and holding it resident, so *only* the packed W4A4 path
+delivers the footprint. Measured on the real SANA-1.6B trunk on `sm_120` (163 projections, **1550.8 MiB**
+dense bf16 — `nvfp4_sana_dit_real_model_vram_footprint`):
+
+| regime | FP4-lit | resident FP4 | resident bf16 | resident total | ratio |
+|---|---:|---:|---:|---:|---:|
+| **blanket W4A4** — bench only, *not* shipping | 163/163 | 437.6 MiB | 0.0 MiB | **437.6 MiB** | **0.28×** |
+| **mixed** — the shipping policy | 68/163 | 183.6 MiB | 900.0 MiB | **1083.6 MiB** | **0.70×** |
+| **blanket W4A16** — the throughput default above | 0/163 | 0.0 MiB | 1550.8 MiB | **1550.8 MiB** | **1.00×** |
+
+Read that honestly:
+
+* **SC#6 is satisfied — and its claim is scoped to the packed W4A4 serving path**, which is a *bench*
+  regime, not what ships. That is a real proof of the packed-forward path (0.2822×, 4.51 effective
+  bits/weight), not a claim about the shipping product's VRAM.
+* **The shipping mixed policy costs 1083.6 MiB — a ~30% saving vs dense bf16, not ~72%.** 95 of its 163
+  projections (58%) are outlier-class and hold a full dense bf16 weight.
+* **Blanket W4A16 — the regime the throughput guidance above tells you to use — saves nothing at all in
+  VRAM** (1.00×). There, NVFP4 buys stability and on-disk/load-time storage only.
+
+`Nvfp4Report::footprint_ratio()` is regime-aware and reports exactly the table above;
+`packed_footprint_ratio()` is the format's ~0.28× and is **not** a residency claim. (Before sc-11045's
+review these were the same number: the ratio divided the *host* packed container by bf16, so a W4A16 leg
+reporting 163/163 dequant→bf16 still printed "0.2822".)
+
+### The tier is a distinct `Quant::Nvfp4` — a deliberate creative choice
+
+NVFP4 is surfaced as its **own** `gen_core::Quant::Nvfp4` tier (sc-11042), *not* as a silent Blackwell
+backend for the existing `Quant::Q4`. Its numerics differ from the int4 tier, and per the epic's SC#5 a
+quant tier is a **creative** decision: NVFP4 must never silently replace an existing tier's numerics
+without an explicit, user-visible choice. Selecting it is an act of intent, and it is only honored on
+`sm_120`.
+
+### Driving a real model: the Sana NVFP4 seam
+
+`candle-gen-sana` carries the reference wiring (`nvfp4_dit.rs`): `SanaTransformer::from_weights_planned`
+serves the trunk's q/k/v/out, `caption_projection` and `proj_out` projections through `Nvfp4Linear`
+under a `DitPlan` (mixed policy, or blanket W4A4/W4A16 for a controlled bench), with an optional
+`ActProbe` capturing per-layer activation sparsity across denoise steps.
+
+**Note what is not covered.** SANA's Mix-FFN is a `GLUMBConv` built from *convolutions*, not linears, so
+a real slice of the trunk's FLOPs sits outside the **current seam** — an honest ceiling on any
+end-to-end multiple. "Outside the seam" is not "outside the lane by construction", though: **2 of the 3
+GLUMBConv convs are 1×1 — i.e. GEMMs in disguise** (`conv_inverted` and `conv_point`, measured 2.37
+ms/block vs the linears' 1.99 ms/block) and could be routed through `Nvfp4Linear` with a reshape,
+roughly **doubling the lane's reachable coverage**. Only `conv_depth` (3×3 **depthwise**) genuinely
+cannot be a GEMM. Extending the seam to the 1×1s is not wired today.
+
+End-to-end validation lives in `candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs` (cuda-gated, `#[ignore]`d,
+real-weight).
+
 ## Packaging (Windows / CUDA) — sc-3676
 
 The goal is **one distributable CUDA worker that runs on every NVIDIA GPU we support, not just the

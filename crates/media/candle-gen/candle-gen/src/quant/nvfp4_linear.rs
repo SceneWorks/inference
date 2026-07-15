@@ -19,11 +19,18 @@
 //! - **W4A16** (the per-layer override for the outlier class): FP4 weight × bf16 activation. W4A4
 //!   collapses on layers with dense activation outliers (the sc-7702 mechanism: an outlier sharing a
 //!   16-block crushes its co-located channels to E2M1 zero), so the spike keeps bf16 activation on the
-//!   outlier class — text→DiT `caption_projection`, cross-attn K/V, first & last DiT blocks
+//!   outlier class — text→DiT `caption_projection`, the cross-attention block, first & last DiT blocks
 //!   ([`ActPrecision::for_outlier_layer`]). There is no FP4-weight×bf16-activation tensor-core MMA, so
-//!   W4A16 is realized by **dequantizing the FP4 weight to bf16 and running a dense bf16 matmul** — a
-//!   storage-parity tier with **no FP4 compute win** (throughput class of the existing dequant-dense
-//!   path). Reports [`Nvfp4Regime::DequantBf16`].
+//!   W4A16 is realized by **dequantizing the FP4 weight to bf16 and running a dense bf16 matmul** —
+//!   **no FP4 compute win, and no footprint win either**: the dequantized bf16 weight is materialized
+//!   once at construction and stays resident, so a W4A16 layer costs the **full dense bf16 footprint**
+//!   in VRAM (`Nvfp4Linear::resident_dequant_bf16_bytes`). It buys *numerical stability* on the outlier
+//!   class, nothing else. Reports [`Nvfp4Regime::DequantBf16`].
+//!
+//! **Read the footprint accounting regime-aware.** `nvfp4_footprint_bytes` is a property of the packed
+//! *format* (the host container, present in every regime); `resident_weight_bytes` is a property of the
+//! *run*. Only W4A4 makes them equal. A W4A16 run holds dense bf16 — never report it as an NVFP4
+//! footprint.
 //!
 //! # Capability gate + fallback (sc-11041 AC)
 //!
@@ -72,20 +79,110 @@ pub enum ActPrecision {
     W4A16,
 }
 
+/// Conservative name anchor for the trunk's **final** output projection — the fallback
+/// [`ActPrecision::for_outlier_layer`] uses when the provider does not thread an explicit
+/// `is_final_proj` (see [`ActPrecision::for_outlier_layer_with`], which is the authoritative form).
+///
+/// True iff `l` (already lowercased) names a `proj_out` that is **not nested inside a transformer
+/// block** — i.e. its last dotted segment is `proj_out` (tolerating a trailing `.weight`/`.bias`
+/// tensor suffix) and it carries no block-nesting marker. That keeps SANA's top-level `proj_out`
+/// classified while leaving LTX's `transformer_blocks.{i}.ff.proj_out` and Flux/Chroma's
+/// `single_transformer_blocks.{i}.proj_out` — per-block, benign, W4A4 — alone.
+fn names_final_proj(l: &str) -> bool {
+    // Nested under a transformer block ⇒ a per-block projection, never the trunk head.
+    if l.contains("blocks.") || l.contains("block_") {
+        return false;
+    }
+    let mut segs = l.rsplit('.');
+    let last = segs.next().unwrap_or("");
+    // Tolerate a trailing tensor-param suffix (`proj_out.weight`) as well as a bare prefix key.
+    let tail = if matches!(last, "weight" | "bias") {
+        segs.next().unwrap_or("")
+    } else {
+        last
+    };
+    tail == "proj_out"
+}
+
 impl ActPrecision {
-    /// The **default per-layer policy** (spike sc-11038): the outlier-carrying layer class runs
-    /// **W4A16** (bf16 activation), everything else **W4A4**. The outlier class — where a dense
-    /// activation outlier collapses W4A4 — is the text→DiT `caption_projection`, the cross-attention
-    /// K/V projections, and the first & last DiT blocks. Matched by substring on the layer path so a
-    /// provider can thread its own dotted key names; callers wanting a blanket regime pass
-    /// [`ActPrecision::W4A4`] / [`ActPrecision::W4A16`] directly instead of consulting this.
+    /// The **default per-layer policy**: the outlier-carrying layer class runs **W4A16** (bf16
+    /// activation), everything else **W4A4**. Matched by substring on the layer path so a provider can
+    /// thread its own dotted key names; callers wanting a blanket regime pass [`ActPrecision::W4A4`] /
+    /// [`ActPrecision::W4A16`] directly instead of consulting this.
+    ///
+    /// The outlier class — where a dense activation outlier collapses W4A4 (the sc-7702 mechanism) — is
+    /// the text→DiT `caption_projection`, **the whole cross-attention block** (`attn2` / `cross_att*`),
+    /// the trunk's **final** `proj_out` head, and the first & last DiT blocks.
+    ///
+    /// **Widened in sc-11045 from real measurements — read before narrowing it again.** The spike
+    /// (sc-11038) specified "W4A4 on the compute-bulk benign layers (**self-attn** + FF); bf16
+    /// activation on the outlier class", and named that class "cross-attn K/V". This function
+    /// originally took the K/V wording literally, leaving cross-attn **Q** and **`to_out`** on W4A4.
+    /// Capturing per-layer activation-outlier sparsity across a **real Sana-1.6B denoise** (sc-11045's
+    /// `ActProbe`) refuted that reading: of 109 projections the old policy sent to W4A4, **27 measured
+    /// [`OutlierClass::Dense`](super::OutlierClass::Dense)** — 17 × `attn2.to_out.0`, 6 × `attn2.to_q`
+    /// (per-block crush ratios up to **5124×**), plus `proj_out` (438×). The whole cross-attention block
+    /// consumes caption-derived context, so it carries the caption's massive activations regardless of
+    /// which projection you name. Guarding `attn2` wholesale restores the spike's actual intent (W4A4 ==
+    /// self-attn + FF).
+    ///
+    /// # The widening is a strict superset of the pre-sc-11045 rule — and is tested as one
+    ///
+    /// Every clause the pre-sc-11045 policy guarded is still guarded here **verbatim** (including its
+    /// `cross` + K/V clause, retained below), so this rule can only ever move a layer
+    /// **W4A4 → W4A16** — the safe direction, since W4A16 is already the shipping throughput default
+    /// (sc-12078). That is not a claim, it is a property: `differential_widening_is_strictly_safe`
+    /// re-implements the old rule and asserts the superset over a cross-provider name corpus.
+    ///
+    /// The retained `cross` + K/V clause matters because the token clauses alone are **not** a
+    /// superset: `cross_attn` does not match `cross_attention` (position 10 is `e`, not `n`), so
+    /// matching only `cross_attn`/`crossattn` would silently regress `cross_attention.to_k` from
+    /// W4A16 back to W4A4 — the collapse-prone direction, on the exact K/V layers the spike named.
+    /// Match `cross_att`/`crossatt` (both spellings) *and* keep the old clause.
     pub fn for_outlier_layer(layer_name: &str) -> Self {
+        Self::for_outlier_layer_with(layer_name, false)
+    }
+
+    /// [`Self::for_outlier_layer`] with the provider's **explicit** structural knowledge threaded in.
+    ///
+    /// `is_final_proj` marks the trunk's **final output projection** (the head). This is the same seam
+    /// as `candle-gen-sana`'s `is_edge_block`: a dotted key alone cannot distinguish the trunk's final
+    /// `proj_out` from a *per-block* layer that merely spells itself `proj_out`, so the provider — which
+    /// knows — says so. When it does not, [`Self::for_outlier_layer`] falls back to
+    /// `names_final_proj`, a conservative name anchor.
+    ///
+    /// **Why this is not a bare `contains("proj_out")`.** The measurement behind the `proj_out` clause
+    /// (Dense, crush 438× — sc-11045) is SANA's single *top-level* head. A bare substring also matches
+    /// per-block layers elsewhere in this workspace that are the spike's explicitly **benign** W4A4
+    /// class:
+    ///
+    /// * `candle-gen-ltx` remaps `ff.net.2` → `ff.proj_out` (its `tier.rs`), i.e. the **FF output
+    ///   projection** of all 48 blocks — the compute bulk W4A4 exists to capture;
+    /// * `candle-gen-flux` / `candle-gen-chroma` name `single_transformer_blocks.{i}.proj_out` — the
+    ///   fused attn+MLP output `[5·hidden → hidden]`, the largest GEMM in each of 38 single blocks.
+    ///
+    /// Firing on those would be the same doc-says-"final"/code-says-"any" mis-encoding this policy was
+    /// corrected to remove. Pinned by `final_proj_anchor_does_not_fire_on_per_block_names`.
+    pub fn for_outlier_layer_with(layer_name: &str, is_final_proj: bool) -> Self {
         let l = layer_name.to_ascii_lowercase();
         let is_outlier = l.contains("caption_projection")
             || l.contains("caption_proj")
-            // cross-attention K/V (attn2 = cross-attn in the diffusers DiT naming); guard K/V only.
-            || (l.contains("attn2") && (l.contains(".to_k") || l.contains(".to_v")))
-            || (l.contains("cross") && (l.contains("_k") || l.contains("_v") || l.contains(".k") || l.contains(".v")))
+            // The ENTIRE cross-attention block (attn2 = cross-attn in the diffusers DiT naming), not
+            // just K/V — Q and to_out read caption-derived context and measure Dense on real
+            // activations (sc-11045).
+            || l.contains("attn2")
+            // Both underscore spellings (cross_attn, cross_attention) and both unseparated ones
+            // (crossattn, crossattention).
+            || l.contains("cross_att")
+            || l.contains("crossatt")
+            // Retained VERBATIM from the pre-sc-11045 rule so the widening is provably a superset:
+            // any `cross*` K/V spelling the old policy guarded stays guarded, whatever its separator.
+            || (l.contains("cross")
+                && (l.contains("_k") || l.contains("_v") || l.contains(".k") || l.contains(".v")))
+            // The FINAL output projection (measured Dense, crush 438× — sc-11045) — anchored to the
+            // trunk head, never a per-block layer that merely spells itself `proj_out`.
+            || is_final_proj
+            || names_final_proj(&l)
             // first & last DiT blocks (blocks.0 / block_0 and an explicit last-block marker).
             || l.contains("blocks.0.")
             || l.contains("block_0.")
@@ -176,8 +273,10 @@ struct Fp4Resident {
 /// `sm_120` with the default W4A4 regime it serves the weight resident-packed and runs the cuBLASLt FP4
 /// GEMM (the SC#6 packed-forward path); otherwise it transparently falls back to a dequant→bf16 dense
 /// matmul (see the [module docs](self)). The packed [`Nvfp4Tensor`] is always retained (the source of
-/// truth for the footprint accounting + a re-stage), so [`Self::nvfp4_footprint_bytes`] /
-/// `resident_device_bytes` reports the NVFP4 footprint regardless of regime.
+/// truth for the *format* accounting + a re-stage), so [`Self::nvfp4_footprint_bytes`] reports the
+/// packed NVFP4 size regardless of regime — **which is exactly why it is not the SC#6 number**. What a
+/// run actually holds in VRAM is [`Self::resident_weight_bytes`]: the packed buffers under W4A4, but a
+/// full dense **bf16** weight under [`Nvfp4Regime::DequantBf16`].
 pub struct Nvfp4Linear {
     /// The packed NVFP4 weight (host container — the canonical ~4.5-bit representation). Retained in
     /// every regime for footprint accounting and to (re)stage the FP4 device weight.
@@ -463,6 +562,35 @@ impl Nvfp4Linear {
     pub fn resident_device_bytes(&self) -> Option<usize> {
         self.fp4.as_ref().map(|f| f.w_staged.resident_bytes())
     }
+
+    /// Resident **device** bytes of the dequantized **bf16** weight when in the
+    /// [`Nvfp4Regime::DequantBf16`] path — the dense `[out, in]` bf16 tensor `new_dequant` materialized
+    /// and holds for the layer's whole life. `None` in the FP4 regime (nothing is dequantized there).
+    ///
+    /// **This is the honest cost of W4A16** and the reason the footprint accounting must be
+    /// regime-aware: a W4A16 layer's packed container is a *host* container: what sits in VRAM is a
+    /// full dense bf16 weight, i.e. **1.0× the bf16 baseline, not 0.28×**. Reporting the packed size as
+    /// though it were the device footprint would let a run with nothing packed on-device still claim an
+    /// NVFP4 footprint (the sc-11045 review's MAJOR 3).
+    pub fn resident_dequant_bf16_bytes(&self) -> Option<usize> {
+        self.dequant_w
+            .as_ref()
+            .map(|w| w.elem_count() * w.dtype().size_in_bytes())
+    }
+
+    /// Total bytes this layer actually holds **resident on-device for its weight**, whatever regime it
+    /// resolved to: the staged E2M1 + UE4M3 buffers under [`Nvfp4Regime::Fp4W4A4`], or the dense bf16
+    /// tensor under [`Nvfp4Regime::DequantBf16`].
+    ///
+    /// Unlike [`Self::nvfp4_footprint_bytes`] (a property of the *format*), this is a property of the
+    /// **run** — it is what SC#6 is actually about.
+    pub fn resident_weight_bytes(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Some(b) = self.resident_device_bytes() {
+            return b;
+        }
+        self.resident_dequant_bf16_bytes().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -555,6 +683,10 @@ mod tests {
     }
 
     /// The per-layer policy defaults the outlier class to W4A16 and everything else to W4A4.
+    ///
+    /// The cross-attn / `proj_out` cases are pinned from **real measured activations** (sc-11045), not
+    /// the spike's prose: `attn2.to_q`, `attn2.to_out.0` and `proj_out` all measured Dense-outlier on a
+    /// live Sana-1.6B denoise. See [`ActPrecision::for_outlier_layer`].
     #[test]
     fn outlier_policy_classification() {
         for name in [
@@ -562,6 +694,9 @@ mod tests {
             "blocks.0.attn.to_q",
             "transformer_blocks.12.attn2.to_k", // cross-attn K
             "transformer_blocks.7.attn2.to_v",  // cross-attn V
+            "transformer_blocks.7.attn2.to_q",  // cross-attn Q — measured Dense (sc-11045)
+            "blocks.12.attn2.to_out.0",         // cross-attn OUT — measured Dense (sc-11045)
+            "proj_out",                         // final output proj — measured Dense (sc-11045)
             "dit.final_block.proj",
         ] {
             assert_eq!(
@@ -572,8 +707,8 @@ mod tests {
         }
         for name in [
             "transformer_blocks.7.attn1.to_q", // self-attn
+            "transformer_blocks.7.attn1.to_out.0", // self-attn OUTPUT proj stays benign
             "transformer_blocks.7.ff.net.0.proj",
-            "blocks.12.attn2.to_out.0", // cross-attn OUTPUT proj is not K/V → benign
         ] {
             assert_eq!(
                 ActPrecision::for_outlier_layer(name),
@@ -583,37 +718,193 @@ mod tests {
         }
     }
 
+    /// The **pre-sc-11045 policy**, re-implemented verbatim as the differential baseline for
+    /// [`differential_widening_is_strictly_safe`]. Do not "fix" this — it is a frozen historical
+    /// record of what shipped before the widening, and the test's whole value is that it is exact.
+    fn old_rule_pre_sc11045(layer_name: &str) -> ActPrecision {
+        let l = layer_name.to_ascii_lowercase();
+        let is_outlier = l.contains("caption_projection")
+            || l.contains("caption_proj")
+            || (l.contains("attn2") && (l.contains(".to_k") || l.contains(".to_v")))
+            || (l.contains("cross")
+                && (l.contains("_k") || l.contains("_v") || l.contains(".k") || l.contains(".v")))
+            || l.contains("blocks.0.")
+            || l.contains("block_0.")
+            || l.contains("last_block")
+            || l.contains("final_block");
+        if is_outlier {
+            ActPrecision::W4A16
+        } else {
+            ActPrecision::W4A4
+        }
+    }
+
+    /// A cross-provider layer-name corpus: every naming convention in this workspace that the shared
+    /// substring policy can plausibly be handed, including the ones that motivated sc-11045's
+    /// corrections. Used by the differential and anchor tests below.
+    const NAME_CORPUS: &[&str] = &[
+        // --- cross-attention, every spelling in the wild -------------------------------------
+        "transformer_blocks.7.attn2.to_q",
+        "transformer_blocks.7.attn2.to_k",
+        "transformer_blocks.7.attn2.to_v",
+        "transformer_blocks.7.attn2.to_out.0",
+        "transformer_blocks.7.cross_attn.to_k",
+        "transformer_blocks.7.cross_attn.to_v",
+        "transformer_blocks.7.cross_attention.to_k", // `cross_attn` does NOT match this
+        "transformer_blocks.7.cross_attention.to_v",
+        "transformer_blocks.7.crossattn.to_k",
+        "transformer_blocks.7.crossattention.to_v",
+        "blocks.7.cross.k", // the old rule's bare `cross` + `.k` shape
+        "blocks.7.cross.v",
+        "blocks.7.cross_q_k",
+        // --- caption / text→DiT ---------------------------------------------------------------
+        "transformer.caption_projection.linear_1",
+        "transformer.caption_projection.linear_2",
+        "caption_proj.linear_1",
+        // --- self-attention + FF: the benign compute bulk ------------------------------------
+        "transformer_blocks.7.attn1.to_q",
+        "transformer_blocks.7.attn1.to_k",
+        "transformer_blocks.7.attn1.to_v",
+        "transformer_blocks.7.attn1.to_out.0",
+        "transformer_blocks.7.ff.net.0.proj",
+        "transformer_blocks.7.ff.net.2",
+        // --- `proj_out` spellings: final head vs per-block (MAJOR 1) --------------------------
+        "proj_out",        // SANA's top-level head — measured Dense (438×)
+        "proj_out.weight", // ...with a tensor suffix
+        "transformer.proj_out",
+        "transformer_blocks.5.ff.proj_out", // LTX: `ff.net.2` remapped — benign FF output
+        "transformer_blocks.5.ff.proj_out.weight",
+        "transformer_blocks.5.audio_ff.proj_out", // LTX audio stream, same shape
+        "single_transformer_blocks.3.proj_out",   // Flux/Chroma fused attn+MLP output
+        "single_transformer_blocks.37.proj_out.weight",
+        // --- edge blocks ----------------------------------------------------------------------
+        "transformer_blocks.0.attn1.to_q",
+        "block_0.attn.to_q",
+        "dit.final_block.proj",
+        "dit.last_block.proj",
+    ];
+
+    /// **The safe-direction property, proven rather than asserted (sc-11045).**
+    ///
+    /// The PR/README/commit claim that the sc-11045 widening "only ever moves a layer W4A4 → W4A16"
+    /// is a *falsifiable* statement about two functions, so test it as one: for every name in the
+    /// corpus, whatever the pre-sc-11045 rule sent to **W4A16** must still be **W4A16** today. A
+    /// regression in the other direction (W4A16 → W4A4) is the collapse-prone one — it would put a
+    /// measured-Dense layer back on FP4 activations — and this test is what makes that impossible to
+    /// land silently.
+    ///
+    /// This is exactly what caught the `cross_attn`/`cross_attention` narrowing: matching the token
+    /// `cross_attn` alone regressed `cross_attention.to_k` W4A16 → W4A4 while the surrounding prose
+    /// claimed the opposite.
+    #[test]
+    fn differential_widening_is_strictly_safe() {
+        let mut widened = Vec::new();
+        for name in NAME_CORPUS {
+            let old = old_rule_pre_sc11045(name);
+            let new = ActPrecision::for_outlier_layer(name);
+            assert!(
+                !(old == ActPrecision::W4A16 && new == ActPrecision::W4A4),
+                "UNSAFE DIRECTION: {name} regressed W4A16 → W4A4. The sc-11045 policy must only ever \
+                 widen the outlier class; moving a layer back onto FP4 activations is the \
+                 collapse-prone direction (sc-7702)."
+            );
+            if old == ActPrecision::W4A4 && new == ActPrecision::W4A16 {
+                widened.push(*name);
+            }
+        }
+        // ...and the widening is real, not vacuous: the layers sc-11045 measured Dense moved.
+        for name in [
+            "transformer_blocks.7.attn2.to_q",
+            "transformer_blocks.7.attn2.to_out.0",
+            "proj_out",
+        ] {
+            assert!(
+                widened.contains(&name),
+                "{name} measured Dense on real activations (sc-11045) and must have widened to W4A16"
+            );
+        }
+    }
+
+    /// **MAJOR 1 (sc-11045 review): the `proj_out` clause is anchored to the trunk's FINAL head.**
+    ///
+    /// The 438× Dense measurement behind the clause is SANA's single top-level `proj_out`. A bare
+    /// `contains("proj_out")` also matches per-block layers that are the spike's *explicitly benign*
+    /// W4A4 class — LTX's remapped `ff.proj_out` (its FF output, ×48 blocks) and Flux/Chroma's
+    /// `single_transformer_blocks.{i}.proj_out` (fused attn+MLP output, ×38). Those must stay W4A4.
+    #[test]
+    fn final_proj_anchor_does_not_fire_on_per_block_names() {
+        // The trunk head — fires (measured Dense, 438×).
+        for name in ["proj_out", "proj_out.weight", "transformer.proj_out"] {
+            assert_eq!(
+                ActPrecision::for_outlier_layer(name),
+                ActPrecision::W4A16,
+                "{name} is the trunk's final output projection → W4A16"
+            );
+        }
+        // Per-block `proj_out` spellings — the benign compute bulk, must NOT fire.
+        for name in [
+            "transformer_blocks.5.ff.proj_out", // LTX FF output (ff.net.2 remapped)
+            "transformer_blocks.5.ff.proj_out.weight",
+            "transformer_blocks.5.audio_ff.proj_out",
+            "single_transformer_blocks.3.proj_out", // Flux/Chroma fused attn+MLP output
+            "single_transformer_blocks.37.proj_out.weight",
+        ] {
+            assert_eq!(
+                ActPrecision::for_outlier_layer(name),
+                ActPrecision::W4A4,
+                "{name} is a PER-BLOCK projection (the spike's benign W4A4 compute bulk), not the \
+                 final head — the `proj_out` clause must not fire on it"
+            );
+        }
+        // The same semantic layer under two spellings must classify the same way. This is the
+        // concrete bug: LTX renames `ff.net.2` → `ff.proj_out`, and the bare substring made an
+        // identical FF output projection flip class on spelling alone.
+        assert_eq!(
+            ActPrecision::for_outlier_layer("transformer_blocks.4.ff.net.2"),
+            ActPrecision::for_outlier_layer("transformer_blocks.4.ff.proj_out"),
+            "LTX's `ff.proj_out` IS `ff.net.2` renamed — the policy must not classify it differently"
+        );
+        // The explicit provider flag is authoritative: a provider that knows a name is its head says
+        // so, and is believed even when the name anchor cannot tell.
+        assert_eq!(
+            ActPrecision::for_outlier_layer_with("some_head.out_layer", true),
+            ActPrecision::W4A16
+        );
+        assert_eq!(
+            ActPrecision::for_outlier_layer_with("some_head.out_layer", false),
+            ActPrecision::W4A4
+        );
+    }
+
     /// The explicit mixed-precision partition (sc-11044 AC 2) over a Sana-1.6B-DiT-style layer list:
-    /// self-attn + FF (the compute bulk) → W4A4; caption_projection, cross-attn K/V, first & last
-    /// blocks → W4A16. The partition is countable and the benign class dominates.
+    /// **self-attn + FF** (the compute bulk) → W4A4; caption_projection, the **whole cross-attention
+    /// block**, `proj_out`, and the first & last blocks → W4A16.
+    ///
+    /// The cross-attn assignments were widened in sc-11045 from real measured activations — see
+    /// [`ActPrecision::for_outlier_layer`].
     #[test]
     fn partition_layers_matches_spike_policy() {
         let layers = [
-            // benign compute bulk (W4A4)
+            // benign compute bulk (W4A4) — self-attn + FF, exactly what the spike specified.
             "transformer_blocks.4.attn1.to_q",
             "transformer_blocks.4.attn1.to_k",
             "transformer_blocks.4.attn1.to_v",
             "transformer_blocks.4.attn1.to_out.0",
             "transformer_blocks.4.ff.net.0.proj",
             "transformer_blocks.4.ff.net.2",
-            "transformer_blocks.4.attn2.to_q",   // cross-attn Q is benign (not K/V)
-            "transformer_blocks.4.attn2.to_out.0", // cross-attn output proj is benign
             // outlier class (W4A16)
             "transformer.caption_projection.linear_1",
+            "transformer_blocks.4.attn2.to_q", // cross-attn Q — Dense on real activations
             "transformer_blocks.4.attn2.to_k", // cross-attn K
             "transformer_blocks.4.attn2.to_v", // cross-attn V
+            "transformer_blocks.4.attn2.to_out.0", // cross-attn OUT — Dense on real activations
             "transformer_blocks.0.attn1.to_q", // first block
             "final_block.proj",                // last block
         ];
         let part = ActPrecision::partition_layers(layers);
-        assert_eq!(part.n_w4a16, 5, "5 outlier-class projections must be W4A16");
-        assert_eq!(part.n_w4a4, 8, "8 benign projections must be W4A4");
-        assert!(
-            part.w4a4_fraction() > 0.6,
-            "the FP4 compute bulk must dominate (got {:.2})",
-            part.w4a4_fraction()
-        );
-        // Spot-check a couple assignments.
+        assert_eq!(part.n_w4a16, 7, "7 outlier-class projections must be W4A16");
+        assert_eq!(part.n_w4a4, 6, "6 benign projections must be W4A4");
+        // Spot-check assignments across both classes.
         let by_name: std::collections::HashMap<_, _> = part
             .assignments
             .iter()
@@ -621,6 +912,11 @@ mod tests {
             .collect();
         assert_eq!(by_name["transformer_blocks.4.attn1.to_q"], ActPrecision::W4A4);
         assert_eq!(by_name["transformer_blocks.4.attn2.to_k"], ActPrecision::W4A16);
+        assert_eq!(by_name["transformer_blocks.4.attn2.to_q"], ActPrecision::W4A16);
+        assert_eq!(
+            by_name["transformer_blocks.4.attn2.to_out.0"],
+            ActPrecision::W4A16
+        );
         assert_eq!(by_name["transformer.caption_projection.linear_1"], ActPrecision::W4A16);
     }
 
