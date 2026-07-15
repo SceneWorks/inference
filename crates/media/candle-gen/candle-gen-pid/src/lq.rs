@@ -162,6 +162,40 @@ impl SigmaGate {
     }
 }
 
+/// Infer the LQ un-patchify factor `f` from the shape gap between the registry's advertised LQ latent
+/// channel count and the first conv's actual input width: `latent_channels = proj_in · f²`. Returns 1
+/// when they match (every student except flux2 v1.5). Errors if the ratio isn't a perfect square.
+fn infer_unpatchify(latent_channels: i32, proj_in: i32) -> Result<i32> {
+    if proj_in == latent_channels {
+        return Ok(1);
+    }
+    if proj_in <= 0 || latent_channels % proj_in != 0 {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "pid: LQ latent channels ({latent_channels}) not a square multiple of the conv input ({proj_in})"
+        )));
+    }
+    let sq = latent_channels / proj_in;
+    let f = (f64::from(sq)).sqrt().round() as i32;
+    if f * f != sq {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "pid: LQ un-patchify ratio {sq} (= {latent_channels}/{proj_in}) is not a perfect square"
+        )));
+    }
+    Ok(f)
+}
+
+/// Un-patchify a packed NCHW latent: `[B, C, H, W] → [B, C/f², H·f, W·f]` (the reference's
+/// `LQProjection2D._unpatchify_latent_if_needed`, factor `f`). No BN inverse-norm — a pure reshuffle.
+fn unpatchify_nchw(x: &Tensor, f: i32) -> Result<Tensor> {
+    let (b, c, h, wd) = x.dims4()?;
+    let f = f as usize;
+    let cc = c / (f * f);
+    Ok(x.reshape((b, cc, f, f, h, wd))?
+        .permute((0, 1, 4, 2, 5, 3))?
+        .contiguous()?
+        .reshape((b, cc, h * f, wd * f))?)
+}
+
 /// `LQProjection2D` (latent-only): nearest-upsample the latent to the patch grid, run the conv stack,
 /// then project to `num_outputs` per-block token feature sets; plus the per-block sigma gates.
 pub struct LqAdapter {
@@ -171,13 +205,26 @@ pub struct LqAdapter {
     pit_head: Option<Linear>,
     gates: Vec<SigmaGate>,
     interval: i32,
+    /// Channel-unpatchify factor for a packed latent (`lq_projection_2d.py::latent_unpatchify_factor`):
+    /// flux2 **v1.5** feeds the 128-ch packed latent but its first conv takes **32**, so the adapter must
+    /// un-patchify `[B,128,H,W] → [B,32,2H,2W]` first. `1` for every other student (flux2 v1.0 feeds 128
+    /// directly; flux/qwen are 16→16).
+    unpatchify_factor: i32,
     upsample_ratio: i32,
 }
 
 impl LqAdapter {
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &PidConfig) -> Result<Self> {
         let num_outputs = cfg.num_lq_outputs();
-        let z_to_patch = (cfg.sr_scale * cfg.latent_spatial_down_factor) / cfg.patch_size;
+        // Infer the un-patchify factor from the shape gap (weights are the truth, like the version
+        // sniff): f = isqrt(lq_latent_channels / proj_in). f>1 only for flux2 v1.5.
+        let proj_in = w
+            .require(&format!("{prefix}.latent_proj.0.weight"))?
+            .dim(1)? as i32;
+        let unpatchify_factor = infer_unpatchify(cfg.lq_latent_channels, proj_in)?;
+        // After un-patchify the latent grid is `f×` finer, so the upsample to the patch grid drops by f.
+        let z_to_patch =
+            (cfg.sr_scale * cfg.latent_spatial_down_factor) / (cfg.patch_size * unpatchify_factor);
         Ok(Self {
             latent_proj: ConvStack::from_weights(
                 w,
@@ -197,6 +244,7 @@ impl LqAdapter {
                 .map(|i| SigmaGate::from_weights(w, &format!("{prefix}.gate_modules.{i}")))
                 .collect::<Result<_>>()?,
             interval: cfg.lq_interval,
+            unpatchify_factor,
             upsample_ratio: z_to_patch.max(1),
         })
     }
@@ -210,11 +258,17 @@ impl LqAdapter {
         _p_h: i32,
         _p_w: i32,
     ) -> Result<(Vec<Tensor>, Option<Tensor>)> {
-        let (b, _c, zh, zw) = lq_latent.dims4()?;
-        let mut x = lq_latent.clone();
+        let (b, _c, _zh, _zw) = lq_latent.dims4()?;
+        // flux2 v1.5: un-patchify the packed latent (128→32 ch, spatial ×f) before the conv stack.
+        let mut x = if self.unpatchify_factor > 1 {
+            unpatchify_nchw(lq_latent, self.unpatchify_factor)?
+        } else {
+            lq_latent.clone()
+        };
         if self.upsample_ratio > 1 {
+            let (_b, _c, h, wd) = x.dims4()?;
             let r = self.upsample_ratio as usize;
-            x = x.upsample_nearest2d(zh * r, zw * r)?;
+            x = x.upsample_nearest2d(h * r, wd * r)?;
         }
         let x = self.latent_proj.forward(&x)?; // [B, hidden, pH, pW]
         let (_b, hidden, ph, pw) = x.dims4()?;

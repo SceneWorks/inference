@@ -22,12 +22,17 @@ fn env_path(var: &str) -> std::path::PathBuf {
         .into()
 }
 
-/// The flux latent-space v1.5 config (shared v1.5 topology + flux's 16-ch / 8× LQ geometry) — exactly
-/// what `PidEngine::load` builds after sniffing v1.5.
-fn flux_v1pt5_cfg() -> PidConfig {
+/// The v1.5 config for the backbone under test (`PID_V1PT5_BACKBONE`, default `flux`). flux/qwenimage
+/// are 16-ch / 8×; flux2 feeds the packed 128-ch / 16× latent (un-patchified in-adapter).
+fn v1pt5_cfg() -> PidConfig {
     let mut cfg = PidConfig::sr4x_v1pt5();
-    cfg.lq_latent_channels = 16;
-    cfg.latent_spatial_down_factor = 8;
+    if std::env::var("PID_V1PT5_BACKBONE").as_deref() == Ok("flux2") {
+        cfg.lq_latent_channels = 128;
+        cfg.latent_spatial_down_factor = 16;
+    } else {
+        cfg.lq_latent_channels = 16;
+        cfg.latent_spatial_down_factor = 8;
+    }
     cfg
 }
 
@@ -49,7 +54,7 @@ fn v1pt5_flux_loads_and_forwards() {
     let w = Weights::from_file(&env_path("PID_V1PT5_CKPT"), &dev, DType::F32).unwrap();
     // Building the v1.5 net REQUIRES the v1.5-only keys (`lq_proj.pit_head`, top-level `pit_lq_gate`),
     // so a clean build already proves the new modules are present + wired.
-    let net = PidNet::from_weights(&w, "", &flux_v1pt5_cfg()).unwrap();
+    let net = PidNet::from_weights(&w, "", &v1pt5_cfg()).unwrap();
 
     // Output pixels [1,3,64,64] (pH=pW=4 over patch 16); LQ latent [1,16,2,2] (upsample 4·8/16 = 2).
     let x = Tensor::randn(0f32, 1., (1, 3, 64, 64), &dev).unwrap();
@@ -73,7 +78,7 @@ fn v1pt5_flux_loads_and_forwards() {
 fn v1pt5_flux_forward_matches_reference() {
     let dev = Device::Cpu;
     let w = Weights::from_file(&env_path("PID_V1PT5_CKPT"), &dev, DType::F32).unwrap();
-    let net = PidNet::from_weights(&w, "", &flux_v1pt5_cfg()).unwrap();
+    let net = PidNet::from_weights(&w, "", &v1pt5_cfg()).unwrap();
 
     let d = Weights::from_file(&env_path("PID_V1PT5_REF_DUMP"), &dev, DType::F32).unwrap();
     let get = |k: &str| d.require(k).unwrap();
