@@ -118,13 +118,14 @@ jobs:
       - name: Rustdoc Candle generation packages
         # Public provider docs are link-heavy API surface. Keep their intra-doc graph valid on the
         # same CPU-only package set as this lane; CUDA/Metal-specific docs remain platform-gated.
+        # No reclaim step follows on purpose: unlike Clippy's --all-targets tree, this --no-deps doc
+        # build's dependency artifacts are exactly the ones the lib/test profile below reuses (so the
+        # test step skips recompiling the provider graph), and they stay well under the reclaimed
+        # Clippy high-water mark this runner already tolerates. The -j 1 below is what bounds the lld
+        # memory limit; leftover doc artifacts add no concurrent-link pressure.
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --locked --no-deps -p 'candle-gen*'
-      - name: Reclaim rustdoc artifacts before linking tests
-        # Rustdoc compiles the whole provider graph. Discard its artifacts before the constrained
-        # one-at-a-time test links below, matching the Clippy reclamation above.
-        run: cargo clean
       - name: Test Candle packages
         # All-target Clippy above checks every integration and real-weight target. Execute the
         # package unit/catalog suites one linker at a time: concurrently linking several provider
