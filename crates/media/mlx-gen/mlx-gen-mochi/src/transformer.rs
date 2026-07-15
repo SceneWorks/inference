@@ -50,7 +50,12 @@ pub fn load_transformer_weights(root: &Path) -> Result<Weights> {
     let map = json
         .get("weight_map")
         .and_then(|m| m.as_object())
-        .ok_or_else(|| Error::Msg(format!("mochi dit index {}: no weight_map", index.display())))?;
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "mochi dit index {}: no weight_map",
+                index.display()
+            ))
+        })?;
 
     let mut shard_files: Vec<String> = map
         .values()
@@ -117,7 +122,7 @@ const QK_NORM_EPS: f32 = 1e-5;
 
 /// `y = x · Wᵀ` for a stored `[out, in]` weight, no bias. Batched over any leading dims.
 fn linear_nb(x: &Array, w: &Array) -> Result<Array> {
-    Ok(matmul(x, &w.t())?)
+    Ok(matmul(x, w.t())?)
 }
 
 /// `y = x · Wᵀ + b` (mlx-gen core fused `addmm`).
@@ -211,9 +216,8 @@ impl MochiAttention {
         context_pre_only: bool,
         dtype: Dtype,
     ) -> Result<Self> {
-        let g = |name: &str| -> Result<Array> {
-            Ok(w.require(&join(prefix, name))?.as_dtype(dtype)?)
-        };
+        let g =
+            |name: &str| -> Result<Array> { Ok(w.require(&join(prefix, name))?.as_dtype(dtype)?) };
         let to_add_out = if context_pre_only {
             None
         } else {
@@ -283,9 +287,11 @@ impl MochiAttention {
         let out = scaled_dot_product_attention(&full_q, &full_k, &full_v, scale, &mask, None)?;
 
         // → [B, Sv+St, inner]; split back to visual / text.
-        let out = out
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[out.shape()[0], sv + st, (self.num_heads * self.head_dim) as i32])?;
+        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            out.shape()[0],
+            sv + st,
+            (self.num_heads * self.head_dim) as i32,
+        ])?;
         let vis_idx = Array::from_slice(&(0..sv).collect::<Vec<i32>>(), &[sv]);
         let txt_idx = Array::from_slice(&(sv..sv + st).collect::<Vec<i32>>(), &[st]);
         let vis = out.take_axis(&vis_idx, 1)?;
@@ -313,7 +319,10 @@ fn build_joint_mask(enc_mask: &Array, num_visual: i32) -> Result<Array> {
         )));
     }
     let (b, st) = (sh[0], sh[1]);
-    let m: Vec<f32> = enc_mask.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+    let m: Vec<f32> = enc_mask
+        .as_dtype(Dtype::Float32)?
+        .as_slice::<f32>()
+        .to_vec();
     let total = num_visual + st;
     let mut data = vec![0f32; (b * total) as usize];
     for bi in 0..b {
@@ -384,11 +393,7 @@ impl MochiTransformerBlock {
         let ff_context = if context_pre_only {
             None
         } else {
-            Some(SwiGlu::from_weights(
-                w,
-                &join(prefix, "ff_context"),
-                dtype,
-            )?)
+            Some(SwiGlu::from_weights(w, &join(prefix, "ff_context"), dtype)?)
         };
         Ok(Self {
             norm1_w: w
@@ -473,7 +478,10 @@ impl MochiTransformerBlock {
         let ff_out = self.ff.forward(&norm_h2)?;
         let hidden = add(
             &hidden,
-            &multiply(&rms_weightless(&ff_out, eps)?, &unsqueeze1(&tanh(gate_mlp)?)?)?,
+            &multiply(
+                &rms_weightless(&ff_out, eps)?,
+                &unsqueeze1(&tanh(gate_mlp)?)?,
+            )?,
         )?;
 
         // Text residuals (skipped on the final context_pre_only block).
@@ -494,7 +502,10 @@ impl MochiTransformerBlock {
             let ff_e = ff_ctx.forward(&norm_e2)?;
             add(
                 &enc,
-                &multiply(&rms_weightless(&ff_e, eps)?, &unsqueeze1(&tanh(&e_gate_mlp)?)?)?,
+                &multiply(
+                    &rms_weightless(&ff_e, eps)?,
+                    &unsqueeze1(&tanh(&e_gate_mlp)?)?,
+                )?,
             )?
         } else {
             enc.clone()
@@ -522,9 +533,8 @@ struct AttentionPool {
 
 impl AttentionPool {
     fn from_weights(w: &Weights, prefix: &str, num_heads: usize, dtype: Dtype) -> Result<Self> {
-        let g = |name: &str| -> Result<Array> {
-            Ok(w.require(&join(prefix, name))?.as_dtype(dtype)?)
-        };
+        let g =
+            |name: &str| -> Result<Array> { Ok(w.require(&join(prefix, name))?.as_dtype(dtype)?) };
         let to_kv_w = g("to_kv.weight")?;
         let embed_dim = to_kv_w.shape()[1] as usize; // to_kv: [2·embed, embed]
         Ok(Self {
@@ -564,8 +574,7 @@ impl AttentionPool {
         let parts = split(&kv, 2, 2)?;
         let k = parts[0].reshape(&[b, self.num_heads as i32, lk, head_dim as i32])?;
         let v = parts[1].reshape(&[b, self.num_heads as i32, lk, head_dim as i32])?;
-        let q = q
-            .reshape(&[b, self.num_heads as i32, 1, head_dim as i32])?; // [B, H, 1, hd]
+        let q = q.reshape(&[b, self.num_heads as i32, 1, head_dim as i32])?; // [B, H, 1, hd]
 
         // Additive mask [B, 1, 1, 1+L]: key 0 (pooled) always valid; text keys 0/−inf per `mask`.
         let mvals: Vec<f32> = mask.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
@@ -603,9 +612,8 @@ struct TimeEmbed {
 
 impl TimeEmbed {
     fn from_weights(w: &Weights, prefix: &str, cfg: &MochiDitConfig, dtype: Dtype) -> Result<Self> {
-        let g = |name: &str| -> Result<Array> {
-            Ok(w.require(&join(prefix, name))?.as_dtype(dtype)?)
-        };
+        let g =
+            |name: &str| -> Result<Array> { Ok(w.require(&join(prefix, name))?.as_dtype(dtype)?) };
         Ok(Self {
             ts_lin1_w: g("timestep_embedder.linear_1.weight")?,
             ts_lin1_b: g("timestep_embedder.linear_1.bias")?,
@@ -793,7 +801,10 @@ mod tests {
         let p = |s: &str| format!("{prefix}.{s}");
         put(p("norm1.linear.weight"), rnd(&[4 * inner, inner], 1));
         put(p("norm1.linear.bias"), rnd(&[4 * inner], 2));
-        put(p("norm1_context.linear.weight"), rnd(&[4 * pooled, inner], 3));
+        put(
+            p("norm1_context.linear.weight"),
+            rnd(&[4 * pooled, inner], 3),
+        );
         put(p("norm1_context.linear.bias"), rnd(&[4 * pooled], 4));
         put(p("attn1.to_q.weight"), rnd(&[inner, inner], 5));
         put(p("attn1.to_k.weight"), rnd(&[inner, inner], 6));
@@ -811,8 +822,14 @@ mod tests {
         put(p("attn1.to_add_out.bias"), rnd(&[pooled], 18));
         put(p("ff.net.0.proj.weight"), rnd(&[2 * ff_inner, inner], 19));
         put(p("ff.net.2.weight"), rnd(&[inner, ff_inner], 20));
-        put(p("ff_context.net.0.proj.weight"), rnd(&[2 * ff_ctx_inner, pooled], 21));
-        put(p("ff_context.net.2.weight"), rnd(&[pooled, ff_ctx_inner], 22));
+        put(
+            p("ff_context.net.0.proj.weight"),
+            rnd(&[2 * ff_ctx_inner, pooled], 21),
+        );
+        put(
+            p("ff_context.net.2.weight"),
+            rnd(&[pooled, ff_ctx_inner], 22),
+        );
         w
     }
 
@@ -820,9 +837,14 @@ mod tests {
     fn block_forward_shapes_and_determinism() {
         let cfg = tiny_cfg();
         let w = tiny_block_weights(&cfg, "transformer_blocks.0");
-        let block =
-            MochiTransformerBlock::from_weights(&w, "transformer_blocks.0", &cfg, false, Dtype::Float32)
-                .unwrap();
+        let block = MochiTransformerBlock::from_weights(
+            &w,
+            "transformer_blocks.0",
+            &cfg,
+            false,
+            Dtype::Float32,
+        )
+        .unwrap();
 
         // 1 frame × 2 × 2 = 4 visual tokens, 3 text tokens (2 valid, 1 pad), inner 16, pooled 8.
         let hidden = rnd(&[1, 4, 16], 100);
@@ -832,14 +854,18 @@ mod tests {
         let pf = rnd(&[3, 2, 4], 103); // [3, heads, head_dim/2]
         let rope = MochiRope::new(&pf, 1, 2, 2).unwrap();
 
-        let (h1, e1) = block.forward(&hidden, &enc, &temb, &rope, &enc_mask).unwrap();
+        let (h1, e1) = block
+            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .unwrap();
         assert_eq!(h1.shape(), &[1, 4, 16]);
         assert_eq!(e1.shape(), &[1, 3, 8]);
 
         // Determinism.
-        let (h2, e2) = block.forward(&hidden, &enc, &temb, &rope, &enc_mask).unwrap();
+        let (h2, e2) = block
+            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .unwrap();
         let close = |a: &Array, b: &Array| {
-            mlx_rs::ops::max(mlx_rs::ops::abs(&subtract(a, b).unwrap()).unwrap(), None)
+            mlx_rs::ops::max(mlx_rs::ops::abs(subtract(a, b).unwrap()).unwrap(), None)
                 .unwrap()
                 .item::<f32>()
                 < 1e-6
@@ -887,17 +913,26 @@ mod tests {
         let mut w = Weights::empty();
         w.insert("patch_embed.proj.weight", rnd(&[inner, in_ch, 2, 2], 200));
         w.insert("patch_embed.proj.bias", rnd(&[inner], 201));
-        w.insert("pos_frequencies", rnd(&[3, cfg.num_heads as i32, half], 202));
+        w.insert(
+            "pos_frequencies",
+            rnd(&[3, cfg.num_heads as i32, half], 202),
+        );
         w.insert(
             "time_embed.timestep_embedder.linear_1.weight",
             rnd(&[inner, ted], 203),
         );
-        w.insert("time_embed.timestep_embedder.linear_1.bias", rnd(&[inner], 204));
+        w.insert(
+            "time_embed.timestep_embedder.linear_1.bias",
+            rnd(&[inner], 204),
+        );
         w.insert(
             "time_embed.timestep_embedder.linear_2.weight",
             rnd(&[inner, inner], 205),
         );
-        w.insert("time_embed.timestep_embedder.linear_2.bias", rnd(&[inner], 206));
+        w.insert(
+            "time_embed.timestep_embedder.linear_2.bias",
+            rnd(&[inner], 206),
+        );
         w.insert("time_embed.pooler.to_kv.weight", rnd(&[2 * te, te], 207));
         w.insert("time_embed.pooler.to_kv.bias", rnd(&[2 * te], 208));
         w.insert("time_embed.pooler.to_q.weight", rnd(&[te, te], 209));
@@ -938,13 +973,20 @@ mod tests {
         let enc_mask = Array::from_slice(&[1.0f32, 1.0, 0.0, 1.0, 0.0, 0.0], &[2, 3]);
 
         let out = model.forward(&hidden, &enc, &timestep, &enc_mask).unwrap();
-        assert_eq!(out.shape(), &[2, 4, 1, 4, 4], "noise_pred matches latent shape");
+        assert_eq!(
+            out.shape(),
+            &[2, 4, 1, 4, 4],
+            "noise_pred matches latent shape"
+        );
         assert!(out.as_slice::<f32>().iter().all(|x| x.is_finite()));
 
         let out2 = model.forward(&hidden, &enc, &timestep, &enc_mask).unwrap();
-        let d = mlx_rs::ops::max(mlx_rs::ops::abs(&subtract(&out, &out2).unwrap()).unwrap(), None)
-            .unwrap()
-            .item::<f32>();
+        let d = mlx_rs::ops::max(
+            mlx_rs::ops::abs(subtract(&out, &out2).unwrap()).unwrap(),
+            None,
+        )
+        .unwrap()
+        .item::<f32>();
         assert_eq!(d, 0.0, "forward is deterministic");
     }
 
@@ -966,19 +1008,26 @@ mod tests {
             "transformer_blocks.0.norm1_context.linear_1.bias".to_string(),
             rnd(&[pooled], 31),
         );
-        let block =
-            MochiTransformerBlock::from_weights(&w, "transformer_blocks.0", &cfg, true, Dtype::Float32)
-                .unwrap();
+        let block = MochiTransformerBlock::from_weights(
+            &w,
+            "transformer_blocks.0",
+            &cfg,
+            true,
+            Dtype::Float32,
+        )
+        .unwrap();
         let hidden = rnd(&[1, 4, 16], 100);
         let enc = rnd(&[1, 3, 8], 101);
         let temb = rnd(&[1, 16], 102);
         let enc_mask = Array::from_slice(&[1.0f32, 1.0, 0.0], &[1, 3]);
         let pf = rnd(&[3, 2, 4], 103);
         let rope = MochiRope::new(&pf, 1, 2, 2).unwrap();
-        let (h, e) = block.forward(&hidden, &enc, &temb, &rope, &enc_mask).unwrap();
+        let (h, e) = block
+            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .unwrap();
         assert_eq!(h.shape(), &[1, 4, 16]);
         // enc is bit-identical to the input (no context update on the final block).
-        let same = mlx_rs::ops::max(mlx_rs::ops::abs(&subtract(&e, &enc).unwrap()).unwrap(), None)
+        let same = mlx_rs::ops::max(mlx_rs::ops::abs(subtract(&e, &enc).unwrap()).unwrap(), None)
             .unwrap()
             .item::<f32>();
         assert_eq!(same, 0.0);

@@ -40,17 +40,25 @@ fn centers(start: f64, stop: f64, num: usize) -> Vec<f64> {
 pub fn get_positions(num_frames: usize, height: usize, width: usize) -> Array {
     // scale = sqrt(target_area / (H·W)); spatial extent is ±(dim·scale/2), centers evenly inside.
     let scale = (BASE_AREA / (height as f64 * width as f64)).sqrt();
-    let h_centers = centers(-(height as f64) * scale / 2.0, height as f64 * scale / 2.0, height);
-    let w_centers = centers(-(width as f64) * scale / 2.0, width as f64 * scale / 2.0, width);
+    let h_centers = centers(
+        -(height as f64) * scale / 2.0,
+        height as f64 * scale / 2.0,
+        height,
+    );
+    let w_centers = centers(
+        -(width as f64) * scale / 2.0,
+        width as f64 * scale / 2.0,
+        width,
+    );
 
     let seq = num_frames * height * width;
     let mut data = Vec::with_capacity(seq * 3);
     for t in 0..num_frames {
-        for h in 0..height {
-            for w in 0..width {
+        for &hc in &h_centers {
+            for &wc in &w_centers {
                 data.push(t as f32); // temporal axis = raw frame index
-                data.push(h_centers[h] as f32);
-                data.push(w_centers[w] as f32);
+                data.push(hc as f32);
+                data.push(wc as f32);
             }
         }
     }

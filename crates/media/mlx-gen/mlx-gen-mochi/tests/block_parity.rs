@@ -56,8 +56,8 @@ fn masked_peak_rel(got: &Array, want: &Array, mask: &Array) -> f32 {
         .unwrap()
         .reshape(&[b, l, 1])
         .unwrap();
-    let got = multiply(&got.as_dtype(Dtype::Float32).unwrap(), &m).unwrap();
-    let want = multiply(&want.as_dtype(Dtype::Float32).unwrap(), &m).unwrap();
+    let got = multiply(got.as_dtype(Dtype::Float32).unwrap(), &m).unwrap();
+    let want = multiply(want.as_dtype(Dtype::Float32).unwrap(), &m).unwrap();
     peak_rel(&got, &want)
 }
 
@@ -70,9 +70,14 @@ fn block0_forward_matches_golden() {
 
     // Block 0 is a normal (non-final) block. Load its weights as f32.
     let w = load_transformer_weights(&root).expect("load DiT transformer weights");
-    let block =
-        MochiTransformerBlock::from_weights(&w, "transformer_blocks.0", &cfg, false, Dtype::Float32)
-            .expect("build block 0");
+    let block = MochiTransformerBlock::from_weights(
+        &w,
+        "transformer_blocks.0",
+        &cfg,
+        false,
+        Dtype::Float32,
+    )
+    .expect("build block 0");
 
     // Golden inputs.
     let hidden = g.require("block_in.hidden_states").unwrap(); // [2, 32, 3072]
@@ -103,6 +108,12 @@ fn block0_forward_matches_golden() {
     // The residual reflects the reference's bf16 rounding, not a structural delta — a real bug (wrong
     // mask, wrong norm/gate, wrong RoPE wiring) diverges orders of magnitude. 5e-2 is the T5-family
     // cross-bf16 precedent (te_parity 6e-2).
-    assert!(vis_rel < 5e-2, "block_out.0 visual peak_rel {vis_rel:.3e} too high");
-    assert!(txt_rel < 5e-2, "block_out.1 text valid-row peak_rel {txt_rel:.3e} too high");
+    assert!(
+        vis_rel < 5e-2,
+        "block_out.0 visual peak_rel {vis_rel:.3e} too high"
+    );
+    assert!(
+        txt_rel < 5e-2,
+        "block_out.1 text valid-row peak_rel {txt_rel:.3e} too high"
+    );
 }

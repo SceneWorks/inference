@@ -42,10 +42,10 @@ fn peak_rel(got: &Array, want: &Array) -> f32 {
 fn mean_rel(got: &Array, want: &Array) -> f32 {
     let got = got.as_dtype(Dtype::Float32).unwrap();
     let want = want.as_dtype(Dtype::Float32).unwrap();
-    let num = mean(&abs(&subtract(&got, &want).unwrap()).unwrap(), None)
+    let num = mean(abs(subtract(&got, &want).unwrap()).unwrap(), None)
         .unwrap()
         .item::<f32>();
-    let den = mean(&abs(&want).unwrap(), None).unwrap().item::<f32>();
+    let den = mean(abs(&want).unwrap(), None).unwrap().item::<f32>();
     num / den.max(1e-12)
 }
 

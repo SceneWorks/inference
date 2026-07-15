@@ -120,16 +120,16 @@ mod tests {
         let pf: Vec<f32> = (0..3 * heads * half)
             .map(|i| 0.01 * (i as f32 + 1.0))
             .collect();
-        let pf = Array::from_slice(&pf, &[3, heads as i32, half as i32]);
+        let pf = Array::from_slice(&pf, &[3, heads, half]);
         let rope = MochiRope::new(&pf, 1, 2, 2).unwrap();
-        assert_eq!(rope.cos.shape(), &[4, heads as i32, half as i32]);
+        assert_eq!(rope.cos.shape(), &[4, heads, half]);
 
         // RoPE is an orthogonal per-pair rotation → preserves the L2 norm of q/k.
         let x = Array::from_slice(
-            &(0..1 * 4 * heads * (2 * half))
+            &(0..4 * heads * (2 * half))
                 .map(|i| ((i as f32) * 0.017).sin())
                 .collect::<Vec<_>>(),
-            &[1, 4, heads as i32, (2 * half) as i32],
+            &[1, 4, heads, 2 * half],
         );
         let y = rope.apply(&x).unwrap();
         assert_eq!(y.shape(), x.shape());
@@ -160,16 +160,21 @@ mod tests {
     fn matches_golden_geometry_shape() {
         // The dit_block golden geometry: 2 frames × 4 × 4 = 32 tokens, 24 heads, head_dim/2 = 64.
         let pf = Array::from_slice(
-            &(0..3 * 24 * 64).map(|i| (i as f32 * 1e-4).sin()).collect::<Vec<_>>(),
+            &(0..3 * 24 * 64)
+                .map(|i| (i as f32 * 1e-4).sin())
+                .collect::<Vec<_>>(),
             &[3, 24, 64],
         );
         let rope = MochiRope::new(&pf, 2, 4, 4).unwrap();
         assert_eq!(rope.cos.shape(), &[32, 24, 64]);
         assert_eq!(rope.sin.shape(), &[32, 24, 64]);
         // cos ∈ [−1, 1].
-        let m: f32 = max(abs(subtract(&rope.cos, &Array::from_f32(0.0)).unwrap()).unwrap(), None)
-            .unwrap()
-            .item();
+        let m: f32 = max(
+            abs(subtract(&rope.cos, Array::from_f32(0.0)).unwrap()).unwrap(),
+            None,
+        )
+        .unwrap()
+        .item();
         assert!(m <= 1.0 + 1e-6);
     }
 }
