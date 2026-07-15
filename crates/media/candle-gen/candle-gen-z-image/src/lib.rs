@@ -5,10 +5,10 @@
 //! [`gen_core::Generator`] contract and exposes its variants through an explicit family catalog.
 //!
 //! **txt2img (sc-3693):** [`ZImageGenerator::generate`] adapts the `candle-transformers` `z_image`
-//! reference model ([`pipeline`]) through the contract: Qwen3 text encoder → DiT (flow-match Euler,
+//! reference model (`pipeline`) through the contract: Qwen3 text encoder → DiT (flow-match Euler,
 //! distilled 4-step, **no CFG**) → AutoencoderKL VAE, emitting `Progress` and honoring `req.cancel`,
 //! with **deterministic CPU-seeded noise** (sc-3673) so output is launch-portable per seed. The
-//! prompt's Qwen chat-template wrapping reuses gen-core's [`TextTokenizer`] — the same template the
+//! prompt's Qwen chat-template wrapping reuses gen-core's `TextTokenizer` — the same template the
 //! mlx provider uses (the epic-3692 "carries over via gen-core" reuse).
 //!
 //! The descriptor advertises the wired surface — txt2img, LoRA/LoKr (sc-5166), and reference-guided
@@ -19,7 +19,7 @@
 //! `backend` is `"candle"` and `mac_only` is `false`.
 //!
 //! Z-Image-Turbo is guidance-distilled: no classifier-free guidance, no negative prompt; the wired
-//! sampler is the model's static-shift-3.0 flow-match Euler schedule. See [`pipeline`] for the parity
+//! sampler is the model's static-shift-3.0 flow-match Euler schedule. See `pipeline` for the parity
 //! choices reconciled against the macOS `mlx-gen-z-image` provider.
 
 mod adapters;
@@ -402,7 +402,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// Construct an in-place **ComfyUI** Z-Image generator (epic 10451 Phase 2, sc-10668) from the three
 /// separate ComfyUI component files + the directory holding our shipped `tokenizer/tokenizer.json` (the
 /// one tiny file a ComfyUI tree does not ship). The DiT and VAE are key-remapped in memory at first
-/// `generate` ([`comfyui`]) and the Qwen3 encoder loads verbatim — read in place, no copy, no
+/// `generate` (`comfyui`) and the Qwen3 encoder loads verbatim — read in place, no copy, no
 /// re-download. Dense bf16 only (the fp8/scaled-fp8/GGUF tiers are later slices).
 ///
 /// Invoked **directly by the SceneWorks worker** (like [`edit`] / [`control`]), not through the

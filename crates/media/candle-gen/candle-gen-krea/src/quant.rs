@@ -55,7 +55,7 @@ pub enum QLinear {
     /// `group_size` (256) along `K`. The forward applies the matching **online activation rotation**
     /// `RHT(x) = x·R` ([`candle_gen::quant::convrot_rotate`]) *before* the int8 GEMM, so
     /// `RHT(x)·RHT(W)ᵀ = x·Wᵀ` (`R` orthogonal). On CUDA that GEMM is a cuBLASLt IGEMM + per-row dequant
-    /// ([`candle_gen::quant::Int8Linear`]); off-CUDA (CPU tests / Metal) it dequantizes the stored rotated
+    /// (`Int8Linear`); off-CUDA (CPU tests / Metal) it dequantizes the stored rotated
     /// weight to a dense matmul.
     ///
     /// **The rotation is the sc-9300 → sc-9601 fix.** Without `RHT(x)` the GEMM reconstructs
@@ -185,7 +185,7 @@ impl QLinear {
     ///
     /// **`device` is the compute device, not `w_i8.device()` (F-121 / sc-11208).** The loader
     /// materializes the int8 codes on the CPU to avoid holding them at 8× the size on the GPU
-    /// ([`crate::loader::Weights::get_int8_codes`]), so `w_i8` is CPU-resident on a real CUDA render.
+    /// (`Weights::get_int8_codes`), so `w_i8` is CPU-resident on a real CUDA render.
     /// The cuBLASLt IGEMM leg must therefore be built on the passed-in CUDA compute device — not gated on
     /// the CPU-resident codes' device — so a normal CUDA render takes the int8 IGEMM path (byte-identical
     /// to the pre-eager lazy build, which staged onto the activation's device);

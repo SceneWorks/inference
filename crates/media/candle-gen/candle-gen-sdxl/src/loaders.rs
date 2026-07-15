@@ -1,5 +1,5 @@
 //! SDXL component loaders for the InstantID provider (sc-5491, epic 5480) — the candle twins of
-//! `mlx-gen-sdxl`'s `load_unet_dtype` / `load_vae` / `load_controlnet`. The txt2img [`crate::pipeline`]
+//! `mlx-gen-sdxl`'s `load_unet_dtype` / `load_vae` / `load_controlnet`. The txt2img `crate::pipeline`
 //! loads the **stock** candle-transformers UNet internally; InstantID needs the **vendored** UNet (the
 //! one carrying the `add_embedding` micro-conditioning + the decoupled IP-Adapter cross-attention from
 //! phase 2c), so these build that stack from an SDXL snapshot + a diffusers ControlNet checkpoint.
@@ -34,7 +34,7 @@ const PROJECTION_INPUT_DIM: usize = 2816;
 /// vendored flash path is a stub; perf tuning is later. The caller installs the IP-Adapter K/V pairs.
 ///
 /// sc-10813: packed-detect the tier the SAME way the base txt2img load does. When `root` is a packed
-/// MLX q4/q8 tier ([`crate::pipeline::detect_packed_unet`] — a `quantization` block in
+/// MLX q4/q8 tier (`crate::pipeline::detect_packed_unet` — a `quantization` block in
 /// `unet/config.json` at group 64), feed the packed `unet/diffusion_pytorch_model.safetensors`; the
 /// vendored UNet body + `add_embedding` head packed-detect per-Linear off the `.scales` siblings (their
 /// `linear_detect_gs` seams take the packed path automatically), so the edit / inpaint / IP-Adapter
@@ -67,7 +67,7 @@ fn instantid_unet_file(root: &Path) -> Result<PathBuf> {
 
 /// As [`load_instantid_unet`], but apply user LoRA/LoKr `adapters` to the UNet at load (sc-6038).
 /// InstantID runs on a stock SDXL (RealVisXL) UNet, so SDXL-family LoRAs apply on top of the IdentityNet
-/// and face IP-Adapter. Mirrors the SDXL generator's adapter path ([`crate::pipeline`]'s
+/// and face IP-Adapter. Mirrors the SDXL generator's adapter path (`crate::pipeline`'s
 /// `load_dense_vendored_unet_with_adapters` / `load_packed_unet_with_adapters`).
 ///
 /// sc-11176 (F-084): fork on the packed tier the SAME way the non-adapter [`load_instantid_unet`]
@@ -75,15 +75,15 @@ fn instantid_unet_file(root: &Path) -> Result<PathBuf> {
 /// an InstantID/edit/IP-Adapter LoRA job against a packed MLX q4/q8 tier hard-failed with a misleading
 /// "snapshot is missing …fp16.safetensors" even though the packed tier was present.
 ///
-/// - **Packed tier** ([`crate::pipeline::detect_packed_unet`] ⇒ `Some`, sc-11103): the distill LoRA rides
+/// - **Packed tier** (`crate::pipeline::detect_packed_unet` ⇒ `Some`, sc-11103): the distill LoRA rides
 ///   the packed Linears **additively** (`y = base(x) + Σ scale·((x·A)·B)`,
-///   [`crate::adapters::install_additive`]) — the u32 codes are never dequantized, so the q4/q8 footprint
+///   `crate::adapters::install_additive`) — the u32 codes are never dequantized, so the q4/q8 footprint
 ///   survives — and any conv LoRA **folds** into the dense convs
-///   ([`crate::adapters::fold_conv_adapters`]) before the UNet body + `add_embedding` head are built. The
+///   (`crate::adapters::fold_conv_adapters`) before the UNet body + `add_embedding` head are built. The
 ///   additive residual equals the dense fold to f32 tolerance.
 /// - **Dense snapshot** (`None`, sc-11682): keep the `.fp16` base a **pristine mmap** (evictable —
 ///   epic 10765) and apply the adapter **additively** on both the Linear
-///   ([`crate::adapters::install_additive`]) and conv ([`crate::adapters::install_additive_conv`])
+///   (`crate::adapters::install_additive`) and conv (`crate::adapters::install_additive_conv`)
 ///   surfaces, instead of folding into a host `from_tensors` map. Additive equals the old fold to f32
 ///   tolerance (~1-ULP golden shift).
 ///
@@ -139,8 +139,8 @@ pub fn load_sdxl_vae(device: &Device, dtype: DType) -> Result<AutoEncoderKL> {
 /// Load the **deterministic VAE moments-encoder** for the SDXL edit path (sc-6037) — the encode
 /// counterpart of [`load_sdxl_vae`], built from the SAME f16-stable VAE checkpoint
 /// (`madebyollin/sdxl-vae-fp16-fix`). candle's stock `AutoEncoderKL` exposes only `decode` plus a
-/// device-RNG `sample` (non-portable; the very thing sc-3673 banned), so [`VaeMomentsEncoder`]
-/// (vendored for the trainer, sc-5165) is reused to take the clean latent **mean** × [`VAE_SCALE`]
+/// device-RNG `sample` (non-portable; the very thing sc-3673 banned), so `VaeMomentsEncoder`
+/// (vendored for the trainer, sc-5165) is reused to take the clean latent **mean** × `VAE_SCALE`
 /// (0.13025) — the launch-portable img2img/inpaint init latent (no sampling, no device RNG).
 pub fn load_sdxl_vae_encoder(device: &Device, dtype: DType) -> Result<VaeMomentsEncoder> {
     let vae_file = hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?;

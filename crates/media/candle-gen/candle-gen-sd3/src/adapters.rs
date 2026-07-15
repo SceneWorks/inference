@@ -1,7 +1,7 @@
 //! SD3.5 inference-side adapter merge (sc-7881, epic 7982) — load a community / trained LoRA/LoKr
 //! `.safetensors` and fold its delta into the dense **MMDiT** (`transformer/`) weights **before** the
 //! [`crate::transformer::Sd3Transformer`] is built. The SD3.5 sibling of the well-exercised Z-Image
-//! ([`candle_gen_z_image::merge_adapters`]) / Krea inference-merge seam, re-homed onto the SD3.5 key
+//! (`candle_gen_z_image::merge_adapters`) / Krea inference-merge seam, re-homed onto the SD3.5 key
 //! namespace.
 //!
 //! **Merge, don't residual** (same rationale as Z-Image / Krea / SDXL): inference has no need to keep
@@ -10,7 +10,7 @@
 //! so a live residual would drift. The delta is reconstructed with the **same** f32 math the trainer's
 //! forward uses ([`reconstruct_lora_delta`] / [`reconstruct_lokr_delta`]), so a candle-trained adapter
 //! round-trips. The merge runs at the safetensors-key level on a CPU map; quantization (Q4/Q8) folds
-//! the merged dense weights **afterwards** in [`crate::pipeline::Pipeline::load_components`].
+//! the merged dense weights **afterwards** in `crate::pipeline::Pipeline::load_components`.
 //!
 //! ## The SD3.5 naming gap (the hard part)
 //!

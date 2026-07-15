@@ -2,14 +2,14 @@
 //! [`Generator`] entrypoint — the candle (Windows/CUDA) sibling of `mlx-gen-scail2`'s pipeline.
 //!
 //! [`Generator::generate`] maps the [`GenerationRequest`] conditioning onto the SCAIL-2 inputs and runs
-//! the live [`crate::generate`] denoise pipeline: the primary **reference character** is a
+//! the live `crate::generate` denoise pipeline: the primary **reference character** is a
 //! [`Conditioning::Reference`] image paired with its color-coded [`Conditioning::Mask`]; the **driving
 //! video + per-frame color masks** are a `ControlClip`; `video_mode == "replacement"` toggles the
 //! cross-identity `replace_flag` (else animation). Inference adapters (`spec.adapters`) — LoRA / LoKr /
 //! LoHa, the lightx2v lightning diff-patch, and the Bias-Aware DPO refinement LoRA — are folded into the
 //! dense DiT before build ([`crate::adapters`], sc-6838). Multi-reference awaits the worker request
 //! contract (sc-5583: gen-core has no way to pair an extra reference image with its color-coded mask —
-//! `Conditioning::MultiReference` carries images only); [`crate::generate`] already supports extra
+//! `Conditioning::MultiReference` carries images only); `crate::generate` already supports extra
 //! characters via [`crate::generate::CharacterRef`], so until that contract lands `MultiReference` is
 //! deliberately NOT advertised and [`Generator::validate`] rejects it loudly (sc-8985).
 

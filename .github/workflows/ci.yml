@@ -115,6 +115,16 @@ jobs:
         # hosted Linux runner. Clippy has already succeeded, so discard its target artifacts before
         # rebuilding the narrower lib/test profile below.
         run: cargo clean
+      - name: Rustdoc Candle generation packages
+        # Public provider docs are link-heavy API surface. Keep their intra-doc graph valid on the
+        # same CPU-only package set as this lane; CUDA/Metal-specific docs remain platform-gated.
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked --no-deps -p 'candle-gen*'
+      - name: Reclaim rustdoc artifacts before linking tests
+        # Rustdoc compiles the whole provider graph. Discard its artifacts before the constrained
+        # one-at-a-time test links below, matching the Clippy reclamation above.
+        run: cargo clean
       - name: Test Candle packages
         # All-target Clippy above checks every integration and real-weight target. Execute the
         # package unit/catalog suites one linker at a time: concurrently linking several provider

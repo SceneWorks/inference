@@ -13,7 +13,7 @@
 //!
 //! Each expert is written to a diffusers-layout component dir (`transformer/` + `transformer_2/`) with
 //! every rank-2 `.weight` MLX-affine-packed at `bits` / group 64 via
-//! [`pack_transformer_component`](candle_gen_wan::candle_tier_build::pack_transformer_component) (the
+//! `pack_transformer_component` (the
 //! exact shape the sc-10025 packed-detect seam consumes) — or dense bf16 when `bits == 0`. The stock
 //! Wan2.2 UMT5 (`text_encoder/`), z16 VAE (`vae/`), tokenizer (`tokenizer/`), scheduler, and
 //! `model_index.json` are copied verbatim from a base Wan2.2-T2V-A14B diffusers snapshot (the reference
@@ -22,7 +22,7 @@
 //!
 //! In addition to the two renderer experts, this converter also extracts the **semantic-planner**
 //! components — the candle sibling of `mlx-gen-bernini/src/convert.rs` (sc-5144) — into the exact
-//! candle turnkey layout [`crate::bernini::BerniniPlanner::load`] reads (sc-11061), so a single
+//! candle turnkey layout `crate::bernini::BerniniPlanner::load` reads (sc-11061), so a single
 //! converted directory is a complete full-`bernini` snapshot the whole planner→renderer pipeline can
 //! load real weights from:
 //!

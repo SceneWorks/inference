@@ -145,7 +145,7 @@ impl Flux2Control {
 
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
     /// as the registry FLUX.2 provider; control composes the FLUX.2 VAE so it loads the **same**
-    /// [`PID_BACKBONE`] (`flux2`) student. A `use_pid = true` request then decodes through it (4× SR)
+    /// `PID_BACKBONE` (`flux2`) student. A `use_pid = true` request then decodes through it (4× SR)
     /// instead of the native VAE; without it, `use_pid` errors loudly. Call after [`load`](Self::load).
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
         self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.pipe.device)?);

@@ -1,7 +1,7 @@
 //! The SD3.5 **MMDiT** (joint / double-stream) transformer (sc-7876, epic 7982).
 //!
 //! Port of the public diffusers `SD3Transformer2DModel` to candle, in f32. Adapted from the
-//! candle-gen-flux2 MMDiT template ([`candle_gen_flux2`]'s `transformer.rs`) with the FLUX-specific
+//! candle-gen-flux2 MMDiT template (`candle_gen_flux2`'s `transformer.rs`) with the FLUX-specific
 //! pieces swapped for SD3.5's:
 //!  - **NO RoPE.** This is the #1 parity risk vs FLUX. SD3.5 adds a **learned 2D positional
 //!    embedding** to the image tokens at patchify (cropped from a `pos_embed_max_size` grid) and the
@@ -15,7 +15,7 @@
 //!    unlike the shift-first 6-chunk AdaLN-Zero (sc-8981).
 //!  - **Modulation application order** (the mlx-port bug magnet, epic 7841): the AdaLN-Zero chunk
 //!    split is `chunk(6) -> [shift, scale, gate_msa, shift, scale, gate_mlp]` and the apply is
-//!    `x * (1 + scale) + shift` then `x + gate * sublayer(...)`. Pinned by [`tests`].
+//!    `x * (1 + scale) + shift` then `x + gate * sublayer(...)`. Pinned by `tests`.
 //!
 //! Shape anchors (Large): `inner_dim = 2432`, `num_heads = 38`, `head_dim = 64`, 38 joint blocks,
 //! `in/out_channels = 16`, `patch_size = 2`, `joint_attention_dim = 4096`. The joint attention runs
@@ -1027,7 +1027,7 @@ impl Sd3Transformer {
     }
 
     /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the projection's
-    /// canonical diffusers dotted path — the same paths [`crate::adapters::resolve_targets`] resolves an
+    /// canonical diffusers dotted path — the same paths `crate::adapters::resolve_targets` resolves an
     /// adapter module to: `context_embedder`, `proj_out`, the `time_text_embed.{timestep,text}_embedder.
     /// linear_{1,2}` + `norm_out.linear` dense-kept leaves, and each `transformer_blocks.{i}` joint/dual
     /// attention + GELU-MLP + AdaLN projection. The additive installer

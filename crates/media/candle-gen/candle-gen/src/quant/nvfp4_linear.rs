@@ -177,7 +177,7 @@ struct Fp4Resident {
 /// GEMM (the SC#6 packed-forward path); otherwise it transparently falls back to a dequant→bf16 dense
 /// matmul (see the [module docs](self)). The packed [`Nvfp4Tensor`] is always retained (the source of
 /// truth for the footprint accounting + a re-stage), so [`Self::nvfp4_footprint_bytes`] /
-/// [`Self::resident_device_bytes`] report the NVFP4 footprint regardless of regime.
+/// `resident_device_bytes` reports the NVFP4 footprint regardless of regime.
 pub struct Nvfp4Linear {
     /// The packed NVFP4 weight (host container — the canonical ~4.5-bit representation). Retained in
     /// every regime for footprint accounting and to (re)stage the FP4 device weight.
@@ -434,7 +434,7 @@ impl Nvfp4Linear {
 
     /// The **NVFP4 footprint** in bytes of the weight — E2M1 nibble bytes + UE4M3 block-scale bytes
     /// (the packed host container's actual size). The resident device weight in the FP4 regime matches
-    /// this (see [`Self::resident_device_bytes`]); the SC#6 gate asserts this is ≈ the ~4.5-bit
+    /// this (see `resident_device_bytes`); the SC#6 gate asserts this is ≈ the ~4.5-bit
     /// footprint and far below the bf16 size.
     pub fn nvfp4_footprint_bytes(&self) -> usize {
         self.weight.packed.len() + self.weight.scales.len()

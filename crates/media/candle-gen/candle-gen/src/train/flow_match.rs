@@ -412,7 +412,7 @@ pub trait FlowMatchTrainer {
     fn default_targets(&self) -> &'static [&'static str];
 
     /// Cache the dataset: encode each item's latent + conditioning (reporting
-    /// [`TrainingProgress::Caching`]) and return the per-sample cache plus any run-derived [`Aux`] and a
+    /// [`TrainingProgress::Caching`]) and return the per-sample cache plus any run-derived `Aux` and a
     /// [`SamplePlan`]. Honors `req.cancel` (a cancel mid-cache yields a short/empty cache; the driver maps
     /// an empty cache to `Canceled`). The heavy encoders are loaded and dropped inside this call.
     ///

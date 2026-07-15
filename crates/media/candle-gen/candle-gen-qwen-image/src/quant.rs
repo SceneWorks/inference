@@ -30,7 +30,7 @@
 //!
 //! **The packed forward dequantizes the weight into a dense matmul (sc-7702)** — it does *not* take
 //! candle's int8 `QMatMul` fast path (`fast_mmq`), so a Q4 denoise stays coherent. That behavior lives
-//! in the shared [`candle_gen::quant::QLinear`] that [`AdaptLinear`]'s packed arm wraps.
+//! in the shared [`candle_gen::quant::QLinear`] that `AdaptLinear`'s packed arm wraps.
 
 use candle_gen::candle_core::Result;
 use candle_gen::candle_nn::VarBuilder;

@@ -483,9 +483,9 @@ fn unpatchify(x: &Tensor) -> Result<Tensor> {
         .reshape((b, c4, h * 2, w * 2))
 }
 
-/// 2×2 patchify (NCHW): `[B, 32, 2h, 2w] → [B, 128, h, w]`, the exact inverse of [`unpatchify`]. Each
+/// 2×2 patchify (NCHW): `[B, 32, 2h, 2w] → [B, 128, h, w]`, the exact inverse of `unpatchify`. Each
 /// 2×2 spatial block folds into the channel axis as `c·4 + ph·2 + pw` (c outermost) — the channel
-/// order [`unpatchify`] / [`Flux2Vae::decode_packed`] expect.
+/// order `unpatchify` / [`Flux2Vae::decode_packed`] expect.
 pub fn patchify(x: &Tensor) -> Result<Tensor> {
     let (b, c, h2, w2) = x.dims4()?;
     let (h, w) = (h2 / 2, w2 / 2);

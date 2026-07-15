@@ -5,19 +5,19 @@
 //! ([`ControlBranch`]), driven by the same frozen pre-main front-end the base uses. The branch input
 //! is the base's joint `[ctx; img]` sequence with the **control latent embedding** (the VAE-encoded
 //! pose skeleton, patch-embedded through the *frozen* base `img_in` —
-//! [`KreaTrainDit::embed_latent`]) added onto the image-token slice. After each branch block `i` a
+//! `KreaTrainDit::embed_latent` added onto the image-token slice. After each branch block `i` a
 //! **zero-initialized** output projection produces a per-block residual that is added (scaled by
 //! `control_scale`) onto the frozen main stream's **image tokens** entering main block `i` — so at
 //! step 0 the branch is an exact identity over the base model (the ControlNet zero-init property).
 //!
 //! Everything in the branch trains (attention, gate, SwiGLU, norms, modulation table, and the output
 //! projections); the entire base (DiT + text encoder + VAE) stays frozen. The branch reuses the
-//! composable (differentiable) ops of [`crate::train_dit`] — the fused `softmax_last_dim` /
+//! composable (differentiable) ops of `crate::train_dit` — the fused `softmax_last_dim` /
 //! `ops::rms_norm` kernels have no backward.
 //!
 //! **Dtype.** Branch matmul weights live in a configurable dtype (bf16 default — full f32 master
 //! weights for a ~3B-param branch triple the optimizer footprint; see the trainer CLI's
-//! `--branch-dtype`); the `+1`-folded RMSNorm scales stay f32 (tiny, and [`rms_scale_diff`] reduces
+//! `--branch-dtype`); the `+1`-folded RMSNorm scales stay f32 (tiny, and `rms_scale_diff` reduces
 //! in f32 anyway). Weights are cast to the activation dtype inside the forward when they differ —
 //! the cast is differentiable, so f32 master-weight training works through the same code path.
 //!
@@ -577,7 +577,7 @@ impl ControlBranch {
             .sum()
     }
 
-    /// Write the branch to a flat `.safetensors` (the spike checkpoint [`from_checkpoint`] reads),
+    /// Write the branch to a flat `.safetensors` (the spike checkpoint `from_checkpoint` reads),
     /// including the injection-offset meta tensor.
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut map: HashMap<String, Tensor> = self

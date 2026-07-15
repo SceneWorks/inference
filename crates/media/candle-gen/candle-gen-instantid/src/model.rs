@@ -273,7 +273,7 @@ impl InstantId {
         Ok(self)
     }
 
-    /// Attach the native face-analysis stack (SCRFD detector + ArcFace embedder) so [`generate`] can
+    /// Attach the native face-analysis stack (SCRFD detector + ArcFace embedder) so `generate` can
     /// take a raw reference image. `dir` holds `scrfd_10g.safetensors` + `arcface_iresnet100.safetensors`
     /// (the [`candle_gen_face`] layout). The stack loads onto this model's device.
     pub fn with_face(mut self, dir: &Path) -> Result<Self> {
@@ -718,7 +718,7 @@ impl InstantId {
 
     /// **Face-restoration pass** (sc-3380): ADetailer-style identity recovery at full-body framing.
     /// Detect the largest face in `base`, crop it with `1.9×` padding, re-render that crop through the
-    /// single-control [`generate_with`] path with the reference `embedding`, then paste it back with a
+    /// single-control `generate_with` path with the reference `embedding`, then paste it back with a
     /// feathered elliptical mask. A no-op (returns `base`) when no face is found or the crop is
     /// degenerate. Requires [`with_face`](Self::with_face).
     pub fn restore_face(

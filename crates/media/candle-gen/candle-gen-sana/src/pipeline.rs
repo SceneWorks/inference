@@ -10,7 +10,7 @@
 //! ```
 //!
 //! driven by the **unified flow-matching scheduler** (epic 7114): the σ schedule is built by
-//! [`gen_core::sampling::build_flow_sigmas`] and integrated by [`candle_gen::run_flow_sampler`] — the
+//! `gen_core::sampling::build_flow_sigmas` and integrated by [`candle_gen::run_flow_sampler`] — the
 //! SAME machinery the sibling candle flow-match families use (`candle-gen-z-image`, `candle-gen-sd3`).
 //! No bespoke scheduler.
 //!

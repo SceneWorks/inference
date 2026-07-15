@@ -4,7 +4,7 @@
 //! A conv stem; sinusoidal timestep + `added_time_ids` micro-conditioning → a 1280-wide `emb`; a down
 //! (3× `CrossAttnDownBlockSpatioTemporal` + 1× `DownBlockSpatioTemporal`) / mid
 //! (`UNetMidBlockSpatioTemporal`) / up (`UpBlockSpatioTemporal` + 3× `CrossAttnUpBlockSpatioTemporal`)
-//! stack of [`SpatioTemporalResBlock`]s and [`TransformerSpatioTemporal`]s; a conv head. Predicts the
+//! stack of `SpatioTemporalResBlock`s and [`TransformerSpatioTemporal`]s; a conv head. Predicts the
 //! per-frame `v` for one denoise step. NCHW spatial (`[B·F, C, H, W]`), NCDHW temporal (`[B, C, F, H, W]`).
 //!
 //! Per-block GroupNorm eps matches diffusers: **1e-6** for the `CrossAttnDownBlockSpatioTemporal`

@@ -5,7 +5,7 @@
 //! exposes both FLUX.1 variants through its explicit family catalog.
 //!
 //! **txt2img (sc-3694):** [`FluxGenerator::generate`] adapts the `candle-transformers` `flux`
-//! reference model ([`pipeline`]) through the contract: dual **CLIP-L + T5-XXL** text encoders → the
+//! reference model (`pipeline`) through the contract: dual **CLIP-L + T5-XXL** text encoders → the
 //! FLUX **DiT** (flow-match Euler) → FLUX **AutoEncoder** VAE, emitting `Progress` and honoring
 //! `req.cancel`, with **deterministic CPU-seeded noise** (sc-3673) so output is launch-portable per
 //! seed. The two variants:
@@ -13,7 +13,7 @@
 //! - **`flux1_schnell`** — Apache-2.0, timestep-distilled: a fixed **4-step** schedule, **no
 //!   guidance** (the DiT has no guidance embedding), no negative prompt.
 //! - **`flux1_dev`** — guidance-distilled: **25 steps** by default with a resolution-dependent
-//!   time-shifted schedule and an embedded **guidance** scale (default 3.5, mlx parity). FLUX.1[dev]
+//!   time-shifted schedule and an embedded **guidance** scale (default 3.5, mlx parity). FLUX.1`dev`
 //!   is a **gated** model (a non-commercial license + an accepted HF license agreement); the engine
 //!   consumes already-staged weights and does not itself perform credential/license gating — that
 //!   stays upstream in the worker's weight-staging layer, **consistent with the mlx provider** (which
@@ -115,10 +115,10 @@ use candle_gen::gen_core::{
 
 use pipeline::{Components, Pipeline};
 
-/// Registry id for FLUX.1 [schnell] — matches the SceneWorks worker's engine id and the macOS
+/// Registry id for FLUX.1 `schnell` — matches the SceneWorks worker's engine id and the macOS
 /// `mlx-gen-flux` descriptor.
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
-/// Registry id for FLUX.1 [dev].
+/// Registry id for FLUX.1 `dev`.
 pub const FLUX1_DEV_ID: &str = "flux1_dev";
 
 /// FLUX works in the VAE's /8 latent and the DiT packs that 2×2, so both image dims must be multiples
@@ -329,12 +329,12 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
     }
 }
 
-/// FLUX.1 [schnell] descriptor (registry).
+/// FLUX.1 `schnell` descriptor (registry).
 pub fn descriptor_schnell() -> ModelDescriptor {
     descriptor_for(Variant::Schnell)
 }
 
-/// FLUX.1 [dev] descriptor (registry).
+/// FLUX.1 `dev` descriptor (registry).
 pub fn descriptor_dev() -> ModelDescriptor {
     descriptor_for(Variant::Dev)
 }
@@ -391,12 +391,12 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
     }))
 }
 
-/// Registry entry point for FLUX.1 [schnell].
+/// Registry entry point for FLUX.1 `schnell`.
 pub fn load_schnell(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(Variant::Schnell, spec)
 }
 
-/// Registry entry point for FLUX.1 [dev].
+/// Registry entry point for FLUX.1 `dev`.
 pub fn load_dev(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(Variant::Dev, spec)
 }

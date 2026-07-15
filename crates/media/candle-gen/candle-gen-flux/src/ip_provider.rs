@@ -1,5 +1,5 @@
 //! The XLabs FLUX **IP-Adapter** provider (sc-5872, epic 5480) — reference-image (identity)
-//! conditioning on FLUX.1 [dev]/[schnell], the candle (Windows/CUDA) sibling of `mlx-gen-flux`'s XLabs
+//! conditioning on FLUX.1 `dev`/`schnell`, the candle (Windows/CUDA) sibling of `mlx-gen-flux`'s XLabs
 //! IP path. It composes the reused FLUX text encoders / VAE / flow-match schedule with the forked DiT
 //! ([`crate::ip_dit::IpFlux`], the only FLUX DiT with an IP seam) + the XLabs adapter
 //! ([`crate::ip_adapter`]) + the pooled CLIP-ViT-L image encoder ([`crate::ip_image_encoder`]).
@@ -9,10 +9,10 @@
 //! schnell ignores it), with the XLabs IP residual injected per double block. The reference's identity
 //! tokens are computed **once** (constant across the denoise) and bound into a [`FluxIpInjector`] at
 //! `ip_adapter_scale`; at `scale = 0` the forked DiT is byte-identical to the stock FLUX path — the
-//! no-IP arm of the validation ablation ([`crate::ip_validate`]).
+//! no-IP arm of the validation ablation (`crate::ip_validate`).
 //!
 //! The provider is a plain struct driven **directly** by the worker (a bespoke reference stream, like
-//! `candle_gen_sdxl::IpAdapterSdxl`), not a gen-core-registered [`Generator`](gen_core::Generator) — the
+//! `candle_gen_sdxl::IpAdapterSdxl`), not a gen-core-registered `Generator` — the
 //! registered `flux1_*` descriptors stay txt2img-only.
 
 use std::path::{Path, PathBuf};

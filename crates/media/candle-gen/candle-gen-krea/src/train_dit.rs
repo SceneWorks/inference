@@ -93,7 +93,7 @@ pub(crate) fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 /// small speed cost for the bounded activation peak. **Only** applied when the fit-gate flips the knob;
 /// on a card with headroom the forward runs unchunked at the i32-guard budget (full speed). Set via
 /// [`KreaTrainDit::set_attention_budget`] / [`crate::control::ControlBranch::set_attention_budget`] and
-/// consumed by [`sdpa_diff_budgeted`].
+/// consumed by `sdpa_diff_budgeted`.
 pub const KREA_ATTN_CHUNK_BUDGET: usize = 128 * 1024 * 1024;
 
 /// Bidirectional, unmasked scaled-dot-product attention with a **composable** softmax (the inference
@@ -404,7 +404,7 @@ impl KreaTrainDit {
     }
 
     /// Build the composable DiT for the **control-inference** lane: on a packed q4/q8 tier the attention
-    /// and front-end projections load as **packed** [`QLinear`] bases (dequant-on-forward, codes stay in
+    /// and front-end projections load as **packed** [`candle_gen::quant::QLinear`] bases (dequant-on-forward, codes stay in
     /// VRAM — a q4 DiT keeps its ~¼ footprint instead of ballooning to dense bf16), the FFN / text-fusion
     /// leaves already packed-detect, and a USER LoRA still rides additively. The frozen base is never
     /// trained, so nothing needs `Var` master weights. On a dense (bf16) tier this is identical to
@@ -472,7 +472,7 @@ impl KreaTrainDit {
 
     /// Run the frozen front-end: patch-embed the latent, build the shared modulation, aggregate +
     /// project the text conditioning, and fuse to the joint `[ctx; img]` sequence. Returns that joint
-    /// sequence (the differentiable boundary entering block 0) plus the [`MainCtx`] the stack/final
+    /// sequence (the differentiable boundary entering block 0) plus the `MainCtx` the stack/final
     /// need. `latent`: `[b, 16, H, W]`; `timestep`: `[b]` (the raw flow σ); `context`:
     /// `[b, n_tok, num_text_layers, text_hidden]` (the stacked Qwen3-VL select layers).
     pub fn forward_pre_main(

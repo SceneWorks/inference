@@ -52,7 +52,7 @@ pub fn is_power_of_four(n: usize) -> bool {
 }
 
 /// Build the normalized regular Hadamard `R = H_{N₀} / √N₀` (`[N₀, N₀]`, f32) on `device`, where
-/// `H_{N₀}` is the Kronecker power of [`H4`]. `group_size` must be a power of four (the RHT construction;
+/// `H_{N₀}` is the Kronecker power of `H4`. `group_size` must be a power of four (the RHT construction;
 /// the checkpoint uses 256). `R` is symmetric and orthogonal (`R·Rᵀ = I`), so applying it to the
 /// activation online inverts the same rotation folded into the stored weight.
 ///

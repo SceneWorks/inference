@@ -15,7 +15,7 @@
 //! Dequantizing the weight to the activation dtype and running a plain matmul keeps the activation
 //! full-precision, so uniform Q4 renders coherently. The resident footprint stays the small
 //! quantized [`QTensor`]; the dequant is per-forward. This mirrors the Lens DiT quant (sc-5117) and
-//! is regression-tested in [`tests`] (`q4_packed_forward_survives_outlier_activations`, CUDA-gated).
+//! is regression-tested in `tests` (`q4_packed_forward_survives_outlier_activations`, CUDA-gated).
 //!
 //! **Idempotent [`QLinear::quantize`].** Crates call `quantize(bits)` after a dense load today; on a
 //! QLinear that already loaded packed (`Quantized`) that call is a **no-op** — it does not

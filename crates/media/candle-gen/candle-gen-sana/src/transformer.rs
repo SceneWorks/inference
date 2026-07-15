@@ -13,14 +13,14 @@
 //!    `ReLU(Q),ReLU(K)`, then the reference's `value`-padded-ones-row normalizer collapsed to the
 //!    algebraically identical numerator/denominator split `num = (V·Kᵀ)·Q`, `den = (Σ_n K)·Q`,
 //!    divided with a `1/(·+1e-15)` normalizer. This is the **same shared hard primitive the DC-AE
-//!    spike wrote once** — [`crate::dc_ae::relu_linear_attention`] — reused verbatim here (the trunk's
+//!    spike wrote once** — `crate::dc_ae::relu_linear_attention` — reused verbatim here (the trunk's
 //!    `attn1` is the plain single-scale case: no multiscale QKV projections). `attention_bias=false`
 //!    for SANA-1.6B → `to_q/k/v` bias-free; `to_out.0` carries a bias.
 //!  - **Cross-attention** (`attn2`, standard softmax SDPA) to the caption embeddings — `to_q/k/v` all
 //!    bias-carrying, KV from the projected+normed caption.
 //!  - **Mix-FFN** (`ff`, `GLUMBConv`) — `conv_inverted(1×1) → SiLU → conv_depth(3×3 depthwise) →
 //!    gated SiLU → conv_point(1×1, no bias)`. The 3×3 depthwise conv is the token-mixer. This reuses
-//!    the spike's shared [`crate::dc_ae::glu_mbconv_core`] (the DC-AE `GLUMBConv` and this Mix-FFN are
+//!    the spike's shared `crate::dc_ae::glu_mbconv_core` (the DC-AE `GLUMBConv` and this Mix-FFN are
 //!    the same gated inverted-bottleneck; the block here owns its own residual + modulation-gate, so
 //!    it uses the bare core with `norm_type=None, residual_connection=False`).
 //!  - **NoPE** — `interpolation_scale=None` ⇒ `patch_embed` carries no `pos_embed`; the conv patchify

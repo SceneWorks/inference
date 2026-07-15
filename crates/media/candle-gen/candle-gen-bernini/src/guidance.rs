@@ -3,7 +3,7 @@
 //!
 //! Like the mlx seam, the math lives once in the backend-neutral
 //! [`gen_core::guidance`](candle_gen::gen_core::guidance); this module only injects candle's
-//! [`CandleLatentOps`](candle_gen::sampler::CandleLatentOps) backend and Bernini's reduction geometry.
+//! `CandleLatentOps` backend and Bernini's reduction geometry.
 //!
 //! **Reduction geometry.** The candle DiT latent is `[B, C, T, H, W]` (5-D, batch-first). The reference
 //! reduces the x-space L2 norm + projection over `dim=[-1,-2,-4]` = channels + spatial, *excluding* the
@@ -20,7 +20,7 @@ use candle_gen::Result as CResult;
 pub const APG_DIMS: &[i32] = &[1, 3, 4];
 
 /// Persistent momentum accumulator for one APG stream (`running = diff + momentum·running`) — the
-/// shared [`gen_core::guidance::MomentumBuffer`] over a candle [`Tensor`]. One per guidance term,
+/// shared `gen_core::guidance::MomentumBuffer` over a candle [`Tensor`]. One per guidance term,
 /// allocated **before** the denoise loop so the running average carries across steps.
 pub type MomentumBuffer = core::MomentumBuffer<Tensor>;
 

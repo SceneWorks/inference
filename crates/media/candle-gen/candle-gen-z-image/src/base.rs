@@ -5,18 +5,18 @@
 //!
 //! The base and Turbo share the **identical** `ZImageTransformer2DModel` architecture (n_layers=30,
 //! dim=3840, n_heads=30, cap_feat_dim=2560, qk_norm, rope_theta=256, t_scale=1000), so this generator
-//! reuses [`crate::pipeline`]'s components, loader, VAE, and text encoder unchanged — even the DiT
+//! reuses `crate::pipeline`'s components, loader, VAE, and text encoder unchanged — even the DiT
 //! config (`Config::z_image_turbo()`) is shared. The deltas (all from the base model card /
 //! `scheduler/scheduler_config.json`) are:
 //!
 //! * **Scheduler shift = 6.0** (Turbo = 3.0) — static, resolution-independent. See
-//!   [`crate::pipeline::base_scheduler_config`].
+//!   `crate::pipeline::base_scheduler_config`.
 //! * **Default steps = 50** (Turbo = 4) — the base is undistilled.
 //! * **Real classifier-free guidance** (Turbo is guidance-distilled → CFG-free). The base supports
 //!   full CFG (`guidance` 3.0–5.0, default 4.0) + a negative prompt: each step runs the DiT twice
 //!   (cond + uncond) and combines `v = v_uncond + guidance·(v_cond − v_uncond)`. `guidance == 1.0`
 //!   collapses to a single cond forward (Turbo-equivalent cost). See
-//!   [`crate::pipeline::Pipeline::render_base`].
+//!   `crate::pipeline::Pipeline::render_base`.
 //!
 //! [`load`] assembles the model from a `Tongyi-MAI/Z-Image` snapshot directory (the same diffusers
 //! multi-component tree the Turbo loader consumes; the base weights repo is `Tongyi-MAI/Z-Image`, the
@@ -44,7 +44,7 @@ pub const MODEL_ID: &str = "z_image";
 /// A loaded candle **base** Z-Image generator. Loading is **lazy** (no file I/O in [`load`]); the heavy
 /// components (Qwen3 encoder + DiT + VAE) are built on the first [`generate`](Generator::generate) call
 /// and cached (keyed by the accelerated-attention setting), exactly as the Turbo generator. The base
-/// reuses the Turbo's [`Pipeline`] + [`Components`] verbatim — only the render path (real CFG, shift
+/// reuses the Turbo's `Pipeline` + `Components` verbatim — only the render path (real CFG, shift
 /// 6.0) differs.
 pub struct ZImageBaseGenerator {
     descriptor: ModelDescriptor,

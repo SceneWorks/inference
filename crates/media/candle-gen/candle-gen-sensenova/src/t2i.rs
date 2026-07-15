@@ -894,7 +894,7 @@ impl T2iModel {
     /// image generation: text streams until the model emits `<img>`, an image is generated (3-cache
     /// CFG: condition / text-uncondition / image-uncondition) and re-encoded back into the text
     /// caches, then text resumes. `input_images` are optional source images (`[3,H,W]` in `[0,1]`,
-    /// 32-aligned); `system_message` is normally [`INTERLEAVE_SYSTEM_MESSAGE`]. Returns the composed
+    /// 32-aligned); `system_message` is normally `INTERLEAVE_SYSTEM_MESSAGE`. Returns the composed
     /// text (with `<image>` placeholders) and the generated images in order.
     #[allow(clippy::too_many_arguments)]
     pub fn interleave_gen(

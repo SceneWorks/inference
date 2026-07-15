@@ -11,7 +11,7 @@
 //!  - encode: `latent = (z - shift_factor) * scaling_factor` (`AutoEncoderKL::encode`);
 //!  - decode: `z = latent / scaling_factor + shift_factor` (`AutoEncoderKL::decode`).
 //!
-//! This module just provides the SD3.5 [`Sd3VaeConfig`] preset + a thin loader so the pipeline (C2)
+//! This module just provides the SD3.5 `Sd3VaeConfig` preset + a thin loader so the pipeline (C2)
 //! and any test can construct the VAE with the right constants. We re-export the reused VAE type so
 //! downstream code does not reach into candle-transformers directly.
 

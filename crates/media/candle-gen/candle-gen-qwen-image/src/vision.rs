@@ -9,7 +9,7 @@
 //! 1280-wide, ~750 patches) so f32 is cheap and more accurate.
 //!
 //! The RoPE here is the **non-interleaved** `rotate_half` form, which is exactly
-//! [`candle_nn::rotary_emb::rope`] (NeoX half-split) — distinct from the MMDiT's interleaved RoPE.
+//! `candle_nn::rotary_emb::rope` (NeoX half-split) — distinct from the MMDiT's interleaved RoPE.
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;

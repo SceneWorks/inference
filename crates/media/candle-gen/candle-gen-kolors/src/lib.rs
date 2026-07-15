@@ -5,7 +5,7 @@
 //! exposes the candle Kolors generator through its explicit family catalog.
 //!
 //! **txt2img:** Kolors is a bilingual (Chinese/English) SDXL-family T2I model — the SDXL UNet + SDXL
-//! VAE with a **ChatGLM3-6B** text encoder in place of dual CLIP. [`pipeline`] runs it through the
+//! VAE with a **ChatGLM3-6B** text encoder in place of dual CLIP. `pipeline` runs it through the
 //! contract: ChatGLM3 encode (penultimate hidden state → cross-attention context, last-token
 //! last-layer state → pooled add-embedding) → the Kolors UNet (real CFG over the leading-Euler
 //! 1100-step schedule) → the SDXL VAE, emitting `Progress`, honoring `req.cancel`, with

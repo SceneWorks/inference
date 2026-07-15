@@ -10,7 +10,7 @@
 //!
 //! ## Architecture (port of the HF `transformers` `DepthAnythingForDepthEstimation`)
 //! * [`backbone::Dinov2Backbone`] — DINOv2 ViT-S/14 encoder; returns the four `out_indices`
-//!   ([3,6,9,12], captured at layer-output [2,5,8,11]) hidden states.
+//!   (`3,6,9,12`, captured at layer-output `2,5,8,11`) hidden states.
 //! * [`neck::DptNeck`] — DPT reassemble (per-level 1×1 projection + factor resize) + 3×3 projection
 //!   (`convs`) + RefineNet feature-fusion stage.
 //! * [`head::DepthHead`] — `conv1` → bilinear upsample → `conv2`+ReLU → `conv3`+ReLU → `[B,H,W]`.

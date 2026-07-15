@@ -3,7 +3,7 @@
 //! explicit registration constant that wires it into a provider catalog under the id `"sana_1600m"`
 //! (epic 11776, story sc-11780 — the candle-gen half; the mlx sibling is `mlx-gen-sana::model`).
 //!
-//! The family and platform catalogs compose [`REGISTRATION`], so a registry load for
+//! The family and platform catalogs compose `REGISTRATION`, so a registry load for
 //! `"sana_1600m"` returns this Candle generator.
 //!
 //! ## Snapshot layout

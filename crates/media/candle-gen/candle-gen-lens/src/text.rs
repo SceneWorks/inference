@@ -3,7 +3,7 @@
 //! Reproduces `LensPipeline._build_chat_inputs`: wrap the prompt in the harmony chat format (a fixed
 //! `system` preamble + the `developer` instruction + the `user` prompt + an `assistant`/`analysis`
 //! thinking turn + the `assistant`/`final` scaffold), then tokenize the rendered text via the model's
-//! `tokenizer.json` (through the shared [`gen_core::tokenizer`] seam — the same HF `tokenizers` core
+//! `tokenizer.json` (through the shared `gen_core::tokenizer` seam — the same HF `tokenizers` core
 //! `transformers` wraps, so the ids are byte-identical). Backend-neutral; ported verbatim from
 //! `mlx-gen-lens/src/text.rs` (epic 3164).
 //!
@@ -59,7 +59,7 @@ pub struct LensTokenizer {
 
 impl LensTokenizer {
     /// Load from the snapshot's `tokenizer/tokenizer.json`. The harmony wrapping is done here in
-    /// [`render`]; the core tokenizer encodes the rendered text verbatim.
+    /// `render`; the core tokenizer encodes the rendered text verbatim.
     pub fn from_file(tokenizer_json: impl AsRef<Path>) -> CResult<Self> {
         let cfg = TokenizerConfig {
             max_length: 512,

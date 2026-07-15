@@ -7,7 +7,7 @@
 //! `after_proj(c)` hint added (scaled) into the base DiT at fixed places — refiner `[0,1]`, main
 //! `[0,2,…,28]`.
 //!
-//! Built on the **vendored** [`crate::dit::ZImageTransformer2DModel`] (NOT the stock candle-transformers
+//! Built on the **vendored** `crate::dit::ZImageTransformer2DModel` (NOT the stock candle-transformers
 //! DiT the txt2img pipeline uses): the vendored copy exposes the embed → refiner → main phases + the
 //! `pub` block forward, so the wrapper can interleave the base loops with the control stack. With no
 //! control context the base forward is bit-identical to stock (the `dit.rs` parity gate); with
@@ -22,8 +22,8 @@
 //! * **Base** (`base = true`, sc-8680): the **undistilled** `Tongyi-MAI/Z-Image` + the base
 //!   `alibaba-pai/Z-Image-Fun-Controlnet-Union-2.1` overlay — the candle sibling of the MLX base control
 //!   variant (`mlx-gen-z-image::model_base_control`, sc-8251). It reuses the identical control transformer
-//!   but drives it with the **base** treatment (mirroring [`crate::pipeline::Pipeline::render_base`]):
-//!   the static **shift = 6.0** scheduler ([`crate::pipeline::base_scheduler_config`]), a ~**50-step**
+//!   but drives it with the **base** treatment (mirroring `crate::pipeline::Pipeline::render_base`):
+//!   the static **shift = 6.0** scheduler (`crate::pipeline::base_scheduler_config`), a ~**50-step**
 //!   default, and **real classifier-free guidance** (`v = v_uncond + guidance·(v_cond − v_uncond)`,
 //!   guidance 3–5 default 4, + a negative prompt). Following the MLX base control loop
 //!   (`denoise_control_cfg_with_progress`), the constant control context threads through **both** the
@@ -497,11 +497,11 @@ impl ZImageControl {
     /// Strict-pose generation: condition the Z-Image generation on `skeleton` (a rendered OpenPose /
     /// canny / depth image at the request size) via the Fun-ControlNet. The worker renders the control
     /// image; this VAE-encodes it into the 33ch control context once, then runs the dual-injection
-    /// denoise. Dispatches on the load-time [`base`](ZImageControl::base) flag (sc-8680):
+    /// denoise. Dispatches on the load-time `base` flag (sc-8680):
     ///
-    /// * **Turbo** ([`generate_turbo`](Self::generate_turbo)): distilled 4-step shift-3.0 schedule, no
+    /// * **Turbo** (`generate_turbo`): distilled 4-step shift-3.0 schedule, no
     ///   CFG — byte-unchanged from the original path.
-    /// * **Base** ([`generate_base`](Self::generate_base)): undistilled shift-6.0 ~50-step schedule with
+    /// * **Base** (`generate_base`): undistilled shift-6.0 ~50-step schedule with
     ///   real classifier-free guidance (the candle sibling of `mlx-gen-z-image::model_base_control`).
     pub fn generate(
         &self,

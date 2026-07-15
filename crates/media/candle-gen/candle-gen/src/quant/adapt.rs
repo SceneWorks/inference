@@ -108,7 +108,7 @@ impl Adapter {
 /// the factor shapes — never `[out, in]` — so a LoKr applies on a packed q4/q8 base at the same memory
 /// profile as a plain LoRA. The row-major kron ordering here matches [`crate::train::lora`]'s `kron2d`
 /// (`out[i·b+k, j·d+l] = w1[i,j]·w2[k,l]`), so the structured residual equals the folded delta. The
-/// full `(alpha/rank)·strength` scale is baked into [`w2`](Self::w2) at build time.
+/// full `(alpha/rank)·strength` scale is baked into `w2` at build time.
 ///
 /// `Clone`/`Debug` so a caller that stacks these residuals on its own adaptable seam (the SDXL
 /// [`crate::train::lora::LoraLinear`] additive channel, sc-11103) can hold them in a `#[derive(Clone,
@@ -217,7 +217,7 @@ impl LokrFactors {
     }
 
     /// The deferred, allocation-free LoKr residual via the Kronecker–vector identity (`scale` already
-    /// baked into [`w2`](Self::w2)). For an activation `x` of shape `[.., in]` (`in = c·d`): reshape to
+    /// baked into `w2`). For an activation `x` of shape `[.., in]` (`in = c·d`): reshape to
     /// `[.., c, d]`, compute `Y = w1 · X · w2ᵀ` (`[.., a, b]`), and flatten row-major to `[.., out]`
     /// (`out = a·b`). The two matmuls touch only the small factor shapes — the full `[out, in]` delta
     /// is NEVER materialized, so this holds the same memory profile on a packed q4/q8 base as a plain
@@ -326,7 +326,7 @@ impl AdaptLinear {
     }
 
     /// **Packed-detecting** `[out, in]` loader at an explicit MLX `group_size`: if `{base}.scales` is
-    /// present under `vb` (a pre-quantized MLX tier), build a [`Base::Packed`] straight from the packed
+    /// present under `vb` (a pre-quantized MLX tier), build a `Base::Packed` straight from the packed
     /// parts on `vb`'s device via the shared [`super::lin_gs`] — **no dense weight is materialized**.
     /// Otherwise the **dense** path is taken unchanged (`{base}.weight` [+ `{base}.bias`], shape-
     /// checked).

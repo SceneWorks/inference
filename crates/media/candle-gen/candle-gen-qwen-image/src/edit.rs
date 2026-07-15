@@ -257,7 +257,7 @@ fn tokenizer_json_path(root: &Path) -> Result<PathBuf> {
 
 /// The loaded Qwen-Image-Edit model. Under the default `Resident` policy all four heavy components (the
 /// VL conditioning encoder, the MMDiT, and the VAE decoder + encoder) load once at [`Self::load`] and
-/// live in [`ResidentComponents`]. Under the `Sequential` policy (epic 10765 Phase 1c follow-up,
+/// live in `ResidentComponents`. Under the `Sequential` policy (epic 10765 Phase 1c follow-up,
 /// sc-10968) none are pre-loaded — [`Self::generate`] loads them per phase and DROPS the VL encoder
 /// before the DiT loads, so peak VRAM is `max(VL+VAE-enc, DiT+VAE-dec)` instead of the resident sum;
 /// `root` + `adapters` are retained for the per-phase reloads. The image processor, tokenizer, and
@@ -290,7 +290,7 @@ struct ResidentComponents {
 impl QwenEdit {
     /// Load the Qwen-Image-Edit components from a snapshot dir. Under the default `Resident` policy all
     /// four heavy components load now; under `Sequential` (sc-10968) they are deferred to the per-phase
-    /// loads in [`Self::generate_sequential`], and only the cheap tokenizer / processor / `zero_cond_t`
+    /// loads in `Self::generate_sequential`, and only the cheap tokenizer / processor / `zero_cond_t`
     /// load here.
     pub fn load(paths: &QwenEditPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;

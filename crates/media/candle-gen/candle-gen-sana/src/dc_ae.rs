@@ -18,17 +18,17 @@
 //!
 //! Block fidelity (component-for-component vs the mlx-gen-sana reference, which is itself the faithful
 //! diffusers port):
-//!  - [`ResBlock`]: `conv1 → SiLU → conv2(no-bias) → trms2d(channel) → + residual`.
-//!  - [`EfficientVitBlock`]: `LinearAttn → GluMbConv`.
-//!  - [`LinearAttn`] (`SanaMultiscaleLinearAttention`): per-pixel `to_q/k/v`(no bias) → multiscale
+//!  - `ResBlock`: `conv1 → SiLU → conv2(no-bias) → trms2d(channel) → + residual`.
+//!  - `EfficientVitBlock`: `LinearAttn → GluMbConv`.
+//!  - `LinearAttn` (`SanaMultiscaleLinearAttention`): per-pixel `to_q/k/v`(no bias) → multiscale
 //!    depthwise+grouped QKV projections → per-head `ReLU(Q),ReLU(K)` linear attention with a
 //!    `1/(Σ+eps)` normalizer (the algebraically-identical numerator/denominator split of the
 //!    reference's ones-row `F.pad`, same f32 sums) → `to_out`(no bias) → trms2d → + residual.
-//!  - [`GluMbConv`] (`GLUMBConv`): `conv_inverted(1×1) → SiLU → conv_depth(3×3 depthwise) → gated
+//!  - `GluMbConv` (`GLUMBConv`): `conv_inverted(1×1) → SiLU → conv_depth(3×3 depthwise) → gated
 //!    SiLU → conv_point(1×1 no-bias) → trms2d → + residual`.
-//!  - [`UpBlock`] (`DCUpBlock2d`, interpolate): `nearest-upsample → conv`, + a channel shortcut
+//!  - `UpBlock` (`DCUpBlock2d`, interpolate): `nearest-upsample → conv`, + a channel shortcut
 //!    `repeat_interleave → pixel_shuffle`.
-//!  - [`DownBlock`] (`DCDownBlock2d`, the encoder mirror, `downsample_block_type = Conv`): a
+//!  - `DownBlock` (`DCDownBlock2d`, the encoder mirror, `downsample_block_type = Conv`): a
 //!    `stride-2 conv`, + a channel shortcut `pixel_unshuffle → channel-average`.
 
 // The pure tensor helpers + `forward` methods return candle-core's `Result` (candle ops' native
@@ -576,7 +576,7 @@ impl DcAeDecoder {
     }
 
     /// Decode choosing single-pass vs a tiled tail by a **VRAM-fit gate** (sc-11804). The single-pass
-    /// f32 decode peaks at ~[`PEAK_GIB_1024`] GB at 1024² (measured by `gpu_decode_1024_memory_profile`,
+    /// f32 decode peaks at ~`PEAK_GIB_1024` GB at 1024² (measured by `gpu_decode_1024_memory_profile`,
     /// sc-11777) — fine on the Blackwell target (RTX PRO 6000, 96 GB) but an OOM on smaller CUDA cards.
     /// The peak is activation-bound and scales with the output pixel count, so this estimates
     /// `PEAK_GIB_1024 · out_px / 1024²` and, when it exceeds the safe VRAM budget resolved by
@@ -597,10 +597,10 @@ impl DcAeDecoder {
     /// [`Self::decode`] exactly (single-pass, bit-exact). `force_tile = true` runs the deep
     /// `EfficientVit` **head** whole — so the global ReLU-linear attention still sees the full spatial
     /// field (the source of a naive-tiling seam) — and tiles only the shallow, attention-free
-    /// upsampling **tail** ([`ResBlock`]s + `norm_out` + `conv_out`, purely conv/upsample-local) with a
+    /// upsampling **tail** (`ResBlock`s + `norm_out` + `conv_out`, purely conv/upsample-local) with a
     /// trapezoidal seam blend. The tail carries the f32 activation peak (its convs run at the full
     /// output resolution), so tiling it is what caps the OOM; it is a pure *speed* trade with **no
-    /// quality cost** (the [`Self::tile_blend_tail`] masks are a partition of unity over the overlap).
+    /// quality cost** (the `Self::tile_blend_tail` masks are a partition of unity over the overlap).
     /// If the config has no attention-free shallow tail (`num_tail_stages == 0`) this is always the
     /// single-pass decode.
     pub fn decode_with(&self, latent: &Tensor, force_tile: bool) -> Result<Tensor> {
@@ -768,7 +768,7 @@ const PEAK_GIB_1024: f64 = 17.7;
 // ---------------------------------------------------------------------------------------------------
 
 /// The DC-AE **encoder** — the structural counterpart of [`DcAeDecoder`] built from the same
-/// primitives (`ResBlock` / `EfficientVitBlock` / stride-2 [`DownBlock`]), reading `encoder.*` keys.
+/// primitives (`ResBlock` / `EfficientVitBlock` / stride-2 `DownBlock`), reading `encoder.*` keys.
 /// The encoder is NOT symmetric with the decoder: it carries fewer blocks in the shallow stages
 /// (`encoder_layers_per_block` `[2,2,2,3,3,3]` vs the decoder's `[3,3,3,3,3,3]`) and downsamples with a
 /// stride-2 conv (`downsample_block_type = Conv`). The mlx-gen reference (sc-8486) ported only the

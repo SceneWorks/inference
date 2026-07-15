@@ -12,9 +12,9 @@
 //! **Three deviations, all forced by candle autograd** (the epic-5164 fused-ops trap, see
 //! [[candle-fused-ops-no-backward]] / `candle-gen-wan::dit_train`). The stock DiT uses three fused
 //! `CustomOp`s with **no backward** that silently zero every upstream adapter gradient:
-//! `softmax_last_dim` → the composable [`softmax`](candle_nn::ops::softmax) (f32); `RmsNorm::forward`
+//! `softmax_last_dim` → the composable `softmax` (f32); `RmsNorm::forward`
 //! (the QK norms + the four block norms) → [`RmsNorm::forward_diff`] (the numerically-identical
-//! composable LayerNorm path); and `apply_rope` (candle's fused `rope_i`) → [`apply_rope_diff`] (the
+//! composable LayerNorm path); and `apply_rope` (candle's fused `rope_i`) → `apply_rope_diff` (the
 //! same interleaved rotation in plain ops — the Wan lesson, its `rope_i` on the q/k path zeroed every
 //! attention factor's grad).
 //! The frozen front-end (`img_in` / `txt_in` / the per-layer text norms / `time_embed`) and the head

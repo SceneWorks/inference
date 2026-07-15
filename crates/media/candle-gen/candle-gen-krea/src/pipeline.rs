@@ -71,7 +71,7 @@ pub const MAX_EDIT_REFERENCES: usize = 2;
 /// in the condition encoder (sc-9047).
 ///
 /// The **single** canonical cap for the whole crate (sc-11205 / F-120): the inference pipeline, the LoRA
-/// trainer ([`crate::training`]), the ControlNet provider/trainer, and the `krea-control-*` example
+/// trainer (`crate::training`), the ControlNet provider/trainer, and the `krea-control-*` example
 /// binaries all import THIS constant. Keeping one definition means raising the cap can never leave the
 /// inference and training/control lanes sized differently — a mismatch that surfaced only as the opaque
 /// `narrow` error sc-9047 eliminated. `pub` (not `pub(crate)`) so the example crates — compiled as
@@ -533,12 +533,12 @@ fn render_from_context(
 /// sibling of [`render`] seeded from a VAE-encoded reference instead of pure noise. The candle/CUDA twin
 /// of mlx-gen-krea's `generate_turbo_img2img` (mlx A1, sc-8590). The mechanism (the fork's `LatentCreator`
 /// img2img leaves, ported byte-for-byte from `mlx_gen::img2img`):
-/// 1. LANCZOS-resize the reference to the target resolution ([`preprocess_img2img_init`]), VAE-encode it
+/// 1. LANCZOS-resize the reference to the target resolution (`preprocess_img2img_init`), VAE-encode it
 ///    to the normalized `[1,16,H/8,W/8]` **clean** latent — the same space as the init noise.
 /// 2. `start = init_time_step(steps, strength)` = `max(1, floor(steps·strength))` (reference fidelity:
 ///    higher strength → later start → closer to the reference — the fork's convention, NOT SDXL's).
 /// 3. Blend `x_start = (1−σ_start)·clean + σ_start·noise` at `σ_start = sigmas[start]`
-///    ([`add_noise_by_interpolation`]).
+///    (`add_noise_by_interpolation`).
 /// 4. Run the CFG-free rectified-flow Euler loop over `sigmas[start..]` from `x_start` (one DiT
 ///    forward/step, exactly as [`render`]).
 ///
@@ -705,7 +705,7 @@ fn render_img2img_from_context(
 /// Render the **Raw** (undistilled, full classifier-free-guidance) rectified-flow text-to-image path
 /// for `req` (`krea_2_raw`, epic 9992 / sc-9994) — the CFG sibling of [`render`]. Two DiT forwards per
 /// step, the conditional (positive prompt) and the unconditional (the user negative prompt, or `""`
-/// when none), combined by the **reference** `sampling.py:129` formula via [`krea_cfg_combine`]
+/// when none), combined by the **reference** `sampling.py:129` formula via `krea_cfg_combine`
 /// (`v = cond + guidance·(cond − uncond)`, NOT the textbook `uncond + g·Δ`: Krea's guidance is offset by
 /// one). `guidance ≤ 0` short-circuits to a single conditional forward (the uncond context is never
 /// encoded), matching the reference `cfg = guidance > 0`. Unlike Turbo's fixed `mu = 1.15`, the schedule
@@ -872,16 +872,16 @@ fn render_base_from_contexts(
 /// instead of pure noise, and the full-CFG sibling of the CFG-free Turbo [`render_img2img`]. The
 /// candle/CUDA twin of mlx-gen-krea's `generate_base_img2img_with_progress` (mlx A5a, sc-10224). It is
 /// exactly [`render_base`]'s undistilled two-forward CFG denoise (resolution-dynamic [`base_schedule`],
-/// the reference [`krea_cfg_combine`] combine, an optional user negative prompt) run over the
+/// the reference `krea_cfg_combine` combine, an optional user negative prompt) run over the
 /// reference-seeded init latent + reduced schedule of [`render_img2img`]:
-/// 1. LANCZOS-resize the reference to the target resolution ([`preprocess_img2img_init`]), VAE-encode it
+/// 1. LANCZOS-resize the reference to the target resolution (`preprocess_img2img_init`), VAE-encode it
 ///    to the normalized `[1,16,H/8,W/8]` **clean** latent (the same space as the init noise).
 /// 2. `start = init_time_step(steps, strength)` (the fork's reference-fidelity convention: higher
 ///    strength → later start → closer to the reference — NOT SDXL's).
 /// 3. Blend `x_start = (1−σ_start)·clean + σ_start·noise` at `σ_start = sigmas[start]`
-///    ([`add_noise_by_interpolation`]).
+///    (`add_noise_by_interpolation`).
 /// 4. Run the Raw CFG rectified-flow Euler loop over `sigmas[start..]` from `x_start` — two DiT forwards
-///    per step when `guidance > 0` (cond vs uncond, combined by [`krea_cfg_combine`]), one otherwise,
+///    per step when `guidance > 0` (cond vs uncond, combined by `krea_cfg_combine`), one otherwise,
 ///    exactly as [`render_base`].
 ///
 /// The condition/uncondition encode, dynamic schedule, and PiD/native decode seam are identical to

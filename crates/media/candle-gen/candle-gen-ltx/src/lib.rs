@@ -6,14 +6,14 @@
 //! ([`vae`], on a from-scratch [`conv3d`]), the **Gemma-3-12B** text encoder ([`gemma`]) +
 //! per-token-RMS aggregation + 8-layer learnable-register connector ([`text_encoder`], [`connector`])
 //! are all ported here. The distilled rectified-flow denoise runs through the unified
-//! `candle_gen::run_av_curated_sampler` over the fixed [`STAGE1_SIGMAS`](config::STAGE1_SIGMAS)
+//! `candle_gen::run_av_curated_sampler` over the fixed `STAGE1_SIGMAS`
 //! schedule (epic 7114), so no per-crate scheduler module is needed.
 //!
 //! **txt2video+audio (sc-3698 / sc-5495):** [`LtxGenerator::generate`] runs Gemma-3-12B → video +
-//! audio text projections → connectors → the 48-layer dual-modal [`AvDiT`](transformer::AvDiT) (split
+//! audio text projections → connectors → the 48-layer dual-modal `AvDiT` (split
 //! 3-D RoPE, per-head gated attention, adaLN-single, bidirectional cross-modal attention) joint
-//! denoise → the temporal VAE decoder (frames) **plus** the [`AudioDecoder`](audio_vae::AudioDecoder)
-//! → [`LtxVocoder`](vocoder::LtxVocoder) → a synchronized 48 kHz stereo `AudioTrack`. Registered under
+//! denoise → the temporal VAE decoder (frames) **plus** the `AudioDecoder`
+//! → `LtxVocoder` → a synchronized 48 kHz stereo `AudioTrack`. Registered under
 //! `"ltx_2_3_distilled"`; single-stage distilled denoise (no CFG). **Deferred** to follow-up stories:
 //! the 2-stage latent upsampler, I2V conditioning, prompt-enhance, LoRA/IC-LoRA, and fp8/quant.
 //!

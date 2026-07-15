@@ -385,7 +385,7 @@ impl ClipTextTransformer {
         mask.broadcast_as((bsz, seq_len, seq_len))
     }
 
-    /// Last-hidden-state forward (post-`final_layer_norm`) — the txt2img [`crate::pipeline`] path.
+    /// Last-hidden-state forward (post-`final_layer_norm`) — the txt2img `crate::pipeline` path.
     pub fn forward_with_mask(&self, xs: &Tensor, mask_after: usize) -> Result<Tensor> {
         let (bsz, seq_len) = xs.dims2()?;
         let xs = self.embeddings.forward(xs)?;

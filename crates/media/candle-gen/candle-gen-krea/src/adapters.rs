@@ -2,9 +2,9 @@
 //! `.safetensors` and fold its delta into the dense single-stream DiT (`transformer/`) weights
 //! **before** [`crate::transformer::Krea2Transformer`] is built. The candle twin of the MLX
 //! inference-merge seam (sc-7578's *engine* half) and the closing half of the native-trainer loop: a
-//! LoRA produced by [`crate::training`]'s `krea_2_raw` trainer now actually loads in candle `krea_2_turbo`
-//! inference. Structurally identical to [`candle_gen_z_image::merge_adapters`] (the same DiT key
-//! namespace), so the well-exercised z-image classify/merge core carries over verbatim.
+//! LoRA produced by the private `training` module's `krea_2_raw` trainer now actually loads in candle
+//! `krea_2_turbo` inference. It uses the shared [`candle_gen::train::merge`] primitives (the same DiT
+//! key namespace), so the well-exercised classify/merge core carries over verbatim.
 //!
 //! **Merge, don't residual** (same rationale as Z-Image / SDXL): inference has no need to keep the
 //! factors trainable, so it folds `W += δ` into the dense weight and reproduces the merged-weight
@@ -16,14 +16,14 @@
 //! **Merge at the safetensors-key level.** The DiT reads its `transformer/` keys 1:1, so `{path}.weight`
 //! is a valid base key for every Linear an adapter targets. The candle `krea_2_raw` trainer's own
 //! default surface is the single-stream blocks' attention projections
-//! (`to_q`/`to_k`/`to_v`/`to_out.0`, [`crate::train_dit::KREA_ATTN_TARGETS`]), but the *merge* surface is
+//! (`to_q`/`to_k`/`to_v`/`to_out.0`, `KREA_ATTN_TARGETS`), but the *merge* surface is
 //! wider — the full set of adaptable Linears MLX's host exposes (attention incl. `to_gate` + the SwiGLU
 //! FFN `ff.<gate|up|down>`, across the single-stream `transformer_blocks` **and** the `text_fusion`
 //! blocks, `merge_surface_keys`) — so an ai-toolkit LoKr that adapts gate + FFN folds in fully
 //! (sc-8776). The Krea trainer writes **bare dotted** PEFT keys (`save_lora_peft(set, "", …)` — no
 //! `base_model.model.unet.` prefix); on read we also tolerate the common community prefixes
-//! ([`PEFT_PREFIXES`]), the ai-toolkit native `diffusion_model.blocks…`/`wq`/`mlp` naming
-//! ([`normalize_native_krea_path`]), and a kohya `lora_transformer_<flat>` flattening resolved against
+//! (`PEFT_PREFIXES`), the ai-toolkit native `diffusion_model.blocks…`/`wq`/`mlp` naming
+//! (`normalize_native_krea_path`), and a kohya `lora_transformer_<flat>` flattening resolved against
 //! the base key set.
 //!
 //! **Family-match policy:** a `family: krea_2` adapter (`baseModel: krea_2_raw`) applies on
@@ -672,7 +672,7 @@ impl AdditiveProj for LoraLinear {
 }
 
 /// A Krea DiT that exposes its adaptable projection surface to [`install_additive`]. Both the txt2img
-/// [`Krea2Transformer`] and the control [`KreaTrainDit`] implement it; the closure is invoked once per
+/// [`crate::Krea2Transformer`] and the control [`crate::KreaTrainDit`] implement it; the closure is invoked once per
 /// leaf with its canonical dotted path (the key a PEFT/kohya adapter targets) and the projection as a
 /// `&mut dyn AdditiveProj`, so one resolve+attach body drives either DiT regardless of its leaf type.
 pub trait AdditiveDit {

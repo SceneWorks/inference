@@ -17,7 +17,7 @@
 //! - **Dense → quantize-onto (the legacy path, unchanged).** When the snapshot is a dense bf16/f32 tier
 //!   (`.scales` absent — klein, or a dev fixture, or the pre-tier dev weights), the loader stages the
 //!   dense weights in **system RAM** and [`QLinear::quantize_onto`] folds each projection **onto** the
-//!   GPU via [`QTensor::quantize_onto`] (which needs a CPU source). This is the ~105 GB peak the packed
+//!   GPU via `QTensor::quantize_onto` (which needs a CPU source). This is the ~105 GB peak the packed
 //!   path replaces; it is retained for dense tiers and small fixtures.
 //!
 //! [`QLinear::quantize_onto`] is a **no-op** on an already-packed projection (idempotent), so a loader

@@ -775,7 +775,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
 /// Construct a lazy candle Wan2.2 A14B generator that reads its **two DiT experts in place** from an
 /// existing ComfyUI install (epic 10451 Phase 2c, sc-10671) — no copy, no re-download. `high_file` /
 /// `low_file` are the user's ComfyUI high/low-noise expert files (native-Wan keys, companion scaled-fp8);
-/// each is remapped + dequant'd to bf16 in memory ([`crate::comfyui`]) at component build.
+/// each is remapped + dequant'd to bf16 in memory (`crate::comfyui`) at component build.
 ///
 /// `te_file` / `vae_file` optionally read the UMT5 text encoder + Wan VAE in place too (sc-10909): the
 /// UMT5 (`umt5_xxl_fp8_e4m3fn_scaled`) is the same scaled-fp8 convention (dequant, no key remap), and

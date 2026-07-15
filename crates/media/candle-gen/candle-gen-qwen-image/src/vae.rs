@@ -305,7 +305,7 @@ impl QwenVae {
 
     /// Decode VAE latents `[1, 16, H/8, W/8]` (NCHW) → RGB `[1, 3, H, W]` in `[-1, 1]`.
     ///
-    /// At or below [`DECODE_TILE_ABOVE_PX`] this is the plain monolithic decode (bit-exact:
+    /// At or below `DECODE_TILE_ABOVE_PX` this is the plain monolithic decode (bit-exact:
     /// [`Self::decode_mid`] ∘ [`Self::decode_tail`] is the identical op sequence). Above it — where a
     /// single decoder conv would overflow candle's im2col launch (sc-10023) — the global-context head runs
     /// **once on the full latent** (so the mid-block self-attention still sees the whole field) and only
@@ -315,12 +315,12 @@ impl QwenVae {
     }
 
     /// Decode with the tail-tiling policy under caller control (sc-11744). `force_tile = false` is
-    /// [`Self::decode`] exactly (monolithic at/below [`DECODE_TILE_ABOVE_PX`], tiled above it — the
+    /// [`Self::decode`] exactly (monolithic at/below `DECODE_TILE_ABOVE_PX`, tiled above it — the
     /// im2col-overflow correctness gate, unchanged). `force_tile = true` runs the seam-free tiled tail
     /// even *below* the threshold: the tail's peak activation is the ~full-resolution upsampler conv, so
     /// tiling it caps the end-of-render VRAM spike that OOMs a constrained card at a resolution the
     /// denoise loop itself fits (the Krea pose-ControlNet fit-ladder's cheapest rung — a *speed* cost,
-    /// **no quality cost**, since the [`Self::tile_blend_tail`] trapezoidal blend is attention-free and a
+    /// **no quality cost**, since the `Self::tile_blend_tail` trapezoidal blend is attention-free and a
     /// partition of unity over the overlap). The default caller keeps `force_tile = false` so nothing
     /// tiles on a card with headroom.
     pub fn decode_with(&self, latents: &Tensor, force_tile: bool) -> Result<Tensor> {
@@ -475,8 +475,8 @@ impl DownModule {
 /// [`QwenVae::decode`]. Needed by the ControlNet path (the pose skeleton is VAE-encoded + packed before
 /// the control branch sees it). The on-disk `encoder.down_blocks` is a **flat** list of 11 modules —
 /// `[res, res, ↓, res(+sc), res, ↓, res(+sc), res, ↓, res, res]` (3 spatial downsamples → /8, channels
-/// 96→192→384) — unlike the nested decoder `up_blocks`. Reuses the decoder's [`Resnet`]/[`MidAttention`]/
-/// [`ChanNorm`]/`causal_conv2d`. Loaded separately from [`QwenVae`] so the txt2img path stays decode-only.
+/// 96→192→384) — unlike the nested decoder `up_blocks`. Reuses the decoder's `Resnet`/`MidAttention`/
+/// `ChanNorm`/`causal_conv2d`. Loaded separately from [`QwenVae`] so the txt2img path stays decode-only.
 pub struct QwenVaeEncoder {
     conv_in: Conv2d,
     down: Vec<DownModule>,
