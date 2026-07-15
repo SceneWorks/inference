@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::Weights;
-use candle_gen_pid::config::PidConfig;
+use candle_gen_pid::config::{ConvPadding, PidConfig};
 use candle_gen_pid::gemma2::{Gemma2, Gemma2Config};
 use candle_gen_pid::lq::PidNet;
 
@@ -35,6 +35,8 @@ fn tiny_cfg() -> PidConfig {
         lq_hidden_dim: 8, // divisible by the ResBlock GroupNorm's 4 groups
         lq_num_res_blocks: 1,
         lq_interval: 2,
+        lq_conv_padding: ConvPadding::Zeros,
+        pit_lq_inject: false,
         sr_scale: 2,
         latent_spatial_down_factor: 2,
     }

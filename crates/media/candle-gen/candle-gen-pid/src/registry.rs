@@ -83,8 +83,10 @@ const QWENIMAGE: BackboneSpec = BackboneSpec {
     pid_scale: 4,
     vp_frame: false,
     ckpt_2k: None, // qwenimage ships 2kto4k only
+    // PiD v1.5 (sc-12143): the default 2kto4k student is the v1.5 res2kto4k student. The engine sniffs
+    // v1.0-vs-v1.5 from the weights (`detect_v1pt5`), so a pinned v1.0 file still loads.
     ckpt_2kto4k: Some(
-        "checkpoints/PiD_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth",
+        "checkpoints/PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth",
     ),
 };
 
@@ -100,8 +102,9 @@ const FLUX: BackboneSpec = BackboneSpec {
     pid_scale: 4,
     vp_frame: false,
     ckpt_2k: Some("checkpoints/PiD_res2k_sr4x_official_flux_distill_4step/model_ema_bf16.pth"),
+    // PiD v1.5 (sc-12143) is the default 2kto4k student; engine sniffs the version from the weights.
     ckpt_2kto4k: Some(
-        "checkpoints/PiD_res2kto4k_sr4x_official_flux_distill_4step/model_ema_bf16.pth",
+        "checkpoints/PiD_v1pt5_res2kto4k_sr4x_official_flux_distill_4step/model_ema_bf16.pth",
     ),
 };
 
@@ -152,10 +155,11 @@ const FLUX2: BackboneSpec = BackboneSpec {
     pid_scale: 4,
     vp_frame: false,
     ckpt_2k: Some("checkpoints/PiD_res2k_sr4x_official_flux2_distill_4step/model_ema_bf16.pth"),
-    // NOTE the `_2606` suffix: the un-suffixed 2kto4k flux2 checkpoint has a color-drift bug and must
-    // NOT be used (model card warning). The registry intentionally points at the fixed one.
+    // PiD v1.5 (sc-12143) is the default 2kto4k student. This **retires the `_2606` workaround**: the
+    // v1.0 un-suffixed 2kto4k flux2 checkpoint had a color-drift bug (fixed downstream by `_2606`);
+    // v1.5 fixes color fidelity at the source, so the default points straight at the v1.5 student.
     ckpt_2kto4k: Some(
-        "checkpoints/PiD_res2kto4k_sr4x_official_flux2_distill_4step_2606/model_ema_bf16.pth",
+        "checkpoints/PiD_v1pt5_res2kto4k_sr4x_official_flux2_distill_4step/model_ema_bf16.pth",
     ),
 };
 
@@ -241,12 +245,21 @@ mod tests {
     }
 
     #[test]
-    fn flux2_klein_aliases_flux2_with_2606_fix() {
+    fn flux2_klein_aliases_flux2_v1pt5_default() {
         let k = lookup("flux2-klein-9b").unwrap();
         assert_eq!(k.latent_space, "flux2");
         assert_eq!(k.latent_channels, 128);
         assert_eq!(k.latent_spatial_down_factor, 16);
-        assert!(k.checkpoint(CkptType::Res2kTo4k).unwrap().contains("_2606"));
+        // PiD v1.5 (sc-12143) is the default 2kto4k student — this retired the v1.0 `_2606` workaround.
+        let ckpt = k.checkpoint(CkptType::Res2kTo4k).unwrap();
+        assert!(
+            ckpt.contains("v1pt5"),
+            "flux2 default should be v1.5: {ckpt}"
+        );
+        assert!(
+            !ckpt.contains("_2606"),
+            "the _2606 workaround is retired: {ckpt}"
+        );
     }
 
     #[test]

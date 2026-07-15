@@ -12,6 +12,18 @@
 //! students run with **`lq_interval = 2`** (every other patch block), not the base `1`
 //! (`_common_model_overrides.net.lq_interval = 2`). [`PidConfig::lq_interval`] therefore defaults to 2.
 
+/// Padding mode for the LQ adapter's Conv2d layers (`lq_projection_2d.py::conv_padding_mode`). Base
+/// students use `zeros`; the PiD v1.5 students use `replicate` (edge) padding to kill the grid
+/// artifacts zero-padding produced in the image corners. Scoped to the LQ conv stack only. Byte-mirror
+/// of `mlx-gen-pid`'s `ConvPadding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvPadding {
+    /// Zero padding (torch default) — every base `sr4x` student.
+    Zeros,
+    /// Edge/replicate padding — the PiD v1.5 students.
+    Replicate,
+}
+
 /// Backbone (`PixDiT_T2I` + `PidNet` LQ extension) hyperparameters. Dimension-parametric so the same
 /// code runs the real 1.36 B model and tiny parity fixtures.
 ///
@@ -61,6 +73,11 @@ pub struct PidConfig {
     pub lq_num_res_blocks: i32,
     /// Inject the LQ gate every `lq_interval` patch blocks. **2 for the distilled students.**
     pub lq_interval: i32,
+    /// Padding mode for the LQ conv stack (`zeros` base / `replicate` for v1.5). See [`ConvPadding`].
+    pub lq_conv_padding: ConvPadding,
+    /// PiD v1.5: inject an extra LQ feature into the PiT pixel stream (`lq_proj.pit_head` gated by a
+    /// top-level `pit_lq_gate` applied to the pixel-stream conditioning before the pixel blocks).
+    pub pit_lq_inject: bool,
     /// Super-resolution factor baked into the network (4× or 8×).
     pub sr_scale: i32,
     /// VAE spatial compression (latent grid → pixel grid factor).
@@ -118,8 +135,27 @@ impl PidConfig {
             lq_hidden_dim: 512,
             lq_num_res_blocks: 4,
             lq_interval: 2,
+            lq_conv_padding: ConvPadding::Zeros,
+            pit_lq_inject: false,
             sr_scale: 4,
             latent_spatial_down_factor: 8,
+        }
+    }
+
+    /// The **PiD v1.5** `res2kto4k` student topology (`net.py::PID_SR4X_V1PT5`, flux / flux2 / qwenimage).
+    /// Same PixDiT backbone as [`Self::sr4x`]; the LQ adapter differs: wider trunk (`lq_hidden_dim`
+    /// 512→1024), per-token **scalar** sigma gate (weight-shape transparent — `content_proj` loads as
+    /// `[1, 2·D]` and `broadcast_mul`s), **replicate** conv padding, a **2048** RoPE reference grid, and
+    /// **PiT LQ injection** (`pit_head` + `pit_lq_gate`). The aux RGB head is training-only and absent
+    /// from the EMA export. Byte-mirror of `mlx-gen-pid::PidConfig::sr4x_v1pt5` (sc-12142).
+    pub fn sr4x_v1pt5() -> Self {
+        Self {
+            rope_ref_h: 2048,
+            rope_ref_w: 2048,
+            lq_hidden_dim: 1024,
+            lq_conv_padding: ConvPadding::Replicate,
+            pit_lq_inject: true,
+            ..Self::sr4x()
         }
     }
 }

@@ -17,26 +17,52 @@ use candle_gen::candle_nn::{Conv2d, Conv2dConfig, GroupNorm, Linear, Module};
 use candle_gen::{Result, Weights};
 
 use crate::backbone::{PatchInjector, PixDiT};
-use crate::config::PidConfig;
+use crate::config::{ConvPadding, PidConfig};
 use crate::nn::linear;
 
 const GN_EPS: f64 = 1e-5; // torch nn.GroupNorm default
 const GN_GROUPS: usize = 4; // ResBlock default num_groups
 
-/// Load a same-padding (stride 1, padding `p`) NCHW Conv2d with `[out,in,kH,kW]` weight + optional bias.
-fn conv2d(w: &Weights, prefix: &str, padding: usize) -> Result<Conv2d> {
-    let weight = w.require(&format!("{prefix}.weight"))?;
-    let bias_key = format!("{prefix}.bias");
-    let bias = if w.contains(&bias_key) {
-        Some(w.require(&bias_key)?)
-    } else {
-        None
-    };
-    let cfg = Conv2dConfig {
-        padding,
-        ..Default::default()
-    };
-    Ok(Conv2d::new(weight, bias, cfg))
+/// A same-padding (stride 1) NCHW conv with a selectable padding mode. `Zeros` lets candle's `Conv2d`
+/// pad; `Replicate` (PiD v1.5) edge-pads H/W via `pad_with_same` then convs `valid` — candle's `Conv2d`
+/// only zero-pads, mirroring `nn.Conv2d(padding_mode="replicate")`.
+struct Conv {
+    conv: Conv2d,
+    /// `Some(p)` → replicate-pad H/W by `p` before a padding-0 conv; `None` → the conv zero-pads.
+    replicate_pad: Option<usize>,
+}
+
+impl Conv {
+    fn from_weights(w: &Weights, prefix: &str, padding: usize, mode: ConvPadding) -> Result<Self> {
+        let weight = w.require(&format!("{prefix}.weight"))?;
+        let bias_key = format!("{prefix}.bias");
+        let bias = if w.contains(&bias_key) {
+            Some(w.require(&bias_key)?)
+        } else {
+            None
+        };
+        let (conv_pad, replicate_pad) = match mode {
+            ConvPadding::Zeros => (padding, None),
+            ConvPadding::Replicate => (0, Some(padding)),
+        };
+        let cfg = Conv2dConfig {
+            padding: conv_pad,
+            ..Default::default()
+        };
+        Ok(Self {
+            conv: Conv2d::new(weight, bias, cfg),
+            replicate_pad,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = match self.replicate_pad {
+            // NCHW axes 2=H, 3=W.
+            Some(p) => x.pad_with_same(2, p, p)?.pad_with_same(3, p, p)?,
+            None => x.clone(),
+        };
+        Ok(self.conv.forward(&x)?)
+    }
 }
 
 /// Per-channel GroupNorm (NCHW), 4 groups, eps 1e-5.
@@ -50,18 +76,18 @@ fn group_norm(w: &Weights, prefix: &str, channels: usize) -> Result<GroupNorm> {
 /// `nn.Sequential` (0 GN, 2 Conv, 3 GN, 5 Conv).
 struct ResBlock {
     gn0: GroupNorm,
-    conv2: Conv2d,
+    conv2: Conv,
     gn3: GroupNorm,
-    conv5: Conv2d,
+    conv5: Conv,
 }
 
 impl ResBlock {
-    fn from_weights(w: &Weights, prefix: &str, channels: usize) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, channels: usize, mode: ConvPadding) -> Result<Self> {
         Ok(Self {
             gn0: group_norm(w, &format!("{prefix}.block.0"), channels)?,
-            conv2: conv2d(w, &format!("{prefix}.block.2"), 1)?,
+            conv2: Conv::from_weights(w, &format!("{prefix}.block.2"), 1, mode)?,
             gn3: group_norm(w, &format!("{prefix}.block.3"), channels)?,
-            conv5: conv2d(w, &format!("{prefix}.block.5"), 1)?,
+            conv5: Conv::from_weights(w, &format!("{prefix}.block.5"), 1, mode)?,
         })
     }
 
@@ -74,18 +100,24 @@ impl ResBlock {
 
 /// `Conv(in→hidden) → SiLU → Conv(hidden→hidden) → ResBlock×N` over NCHW.
 struct ConvStack {
-    conv0: Conv2d,
-    conv2: Conv2d,
+    conv0: Conv,
+    conv2: Conv,
     res: Vec<ResBlock>,
 }
 
 impl ConvStack {
-    fn from_weights(w: &Weights, prefix: &str, hidden: usize, num_res_blocks: i32) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        hidden: usize,
+        num_res_blocks: i32,
+        mode: ConvPadding,
+    ) -> Result<Self> {
         Ok(Self {
-            conv0: conv2d(w, &format!("{prefix}.0"), 1)?,
-            conv2: conv2d(w, &format!("{prefix}.2"), 1)?,
+            conv0: Conv::from_weights(w, &format!("{prefix}.0"), 1, mode)?,
+            conv2: Conv::from_weights(w, &format!("{prefix}.2"), 1, mode)?,
             res: (0..num_res_blocks)
-                .map(|i| ResBlock::from_weights(w, &format!("{prefix}.{}", i + 3), hidden))
+                .map(|i| ResBlock::from_weights(w, &format!("{prefix}.{}", i + 3), hidden, mode))
                 .collect::<Result<_>>()?,
         })
     }
@@ -99,7 +131,10 @@ impl ConvStack {
     }
 }
 
-/// `SigmaAwareGatePerTokenPerDim`: `out = x + sigmoid(content_proj([x;lq]) − exp(log_alpha)·σ)·lq`.
+/// Sigma-aware LQ gate: `out = x + sigmoid(content_proj([x;lq]) − exp(log_alpha)·σ)·lq`. One impl covers
+/// both released variants — the difference is the loaded `content_proj` output width, which
+/// `broadcast_mul`s against `lq`: v1 per-dim (`content_proj` `[D,2D]` → gate `[B,N,D]`) and v1.5
+/// per-token scalar (`content_proj` `[1,2D]` → gate `[B,N,1]`, broadcast across `D`).
 struct SigmaGate {
     content_proj: Linear,
     log_alpha: Tensor,
@@ -122,7 +157,8 @@ impl SigmaGate {
         let alpha = self.log_alpha.exp()?;
         let sigma_off = sigma.reshape((b, 1, 1))?.broadcast_mul(&alpha)?;
         let gate = sigmoid(&logit.broadcast_sub(&sigma_off)?)?;
-        Ok((x + gate.mul(lq)?)?)
+        // broadcast_mul (not mul): v1.5's scalar gate is [B,N,1] and must broadcast across lq's D.
+        Ok((x + gate.broadcast_mul(lq)?)?)
     }
 }
 
@@ -131,6 +167,8 @@ impl SigmaGate {
 pub struct LqAdapter {
     latent_proj: ConvStack,
     output_heads: Vec<Linear>,
+    /// PiD v1.5 only (`lq_proj.pit_head`): projects the shared LQ tokens for the PiT-stream injection.
+    pit_head: Option<Linear>,
     gates: Vec<SigmaGate>,
     interval: i32,
     upsample_ratio: i32,
@@ -146,10 +184,15 @@ impl LqAdapter {
                 &format!("{prefix}.latent_proj"),
                 cfg.lq_hidden_dim as usize,
                 cfg.lq_num_res_blocks,
+                cfg.lq_conv_padding,
             )?,
             output_heads: (0..num_outputs)
                 .map(|i| linear(w, &format!("{prefix}.output_heads.{i}")))
                 .collect::<Result<_>>()?,
+            pit_head: cfg
+                .pit_lq_inject
+                .then(|| linear(w, &format!("{prefix}.pit_head")))
+                .transpose()?,
             gates: (0..num_outputs)
                 .map(|i| SigmaGate::from_weights(w, &format!("{prefix}.gate_modules.{i}")))
                 .collect::<Result<_>>()?,
@@ -158,9 +201,15 @@ impl LqAdapter {
         })
     }
 
-    /// Project an LQ latent `[B, z_dim, zH, zW]` to `num_outputs` token feature sets `[B, N, out_dim]`
-    /// (`N = pH·pW`). Stays NCHW through the conv stack, then flattens to tokens.
-    pub fn forward(&self, lq_latent: &Tensor, _p_h: i32, _p_w: i32) -> Result<Vec<Tensor>> {
+    /// Project an LQ latent `[B, z_dim, zH, zW]` to `num_outputs` per-patch-block token feature sets
+    /// `[B, N, out_dim]` (`N = pH·pW`), plus (v1.5) the single PiT-stream feature from `pit_head`.
+    /// Stays NCHW through the conv stack, then flattens to tokens.
+    pub fn forward(
+        &self,
+        lq_latent: &Tensor,
+        _p_h: i32,
+        _p_w: i32,
+    ) -> Result<(Vec<Tensor>, Option<Tensor>)> {
         let (b, _c, zh, zw) = lq_latent.dims4()?;
         let mut x = lq_latent.clone();
         if self.upsample_ratio > 1 {
@@ -174,10 +223,17 @@ impl LqAdapter {
             .permute((0, 2, 3, 1))?
             .contiguous()?
             .reshape((b, ph * pw, hidden))?;
-        self.output_heads
+        let feats = self
+            .output_heads
             .iter()
             .map(|h| Ok(h.forward(&tokens)?))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let pit = self
+            .pit_head
+            .as_ref()
+            .map(|h| h.forward(&tokens))
+            .transpose()?;
+        Ok((feats, pit))
     }
 
     /// Whether the gate fires at this patch-block index (`interval>1` → every `interval`-th block).
@@ -204,6 +260,9 @@ impl LqAdapter {
 pub struct PidNet {
     backbone: PixDiT,
     lq: LqAdapter,
+    /// PiD v1.5 only (top-level `pit_lq_gate`): gates the pixel-stream conditioning before the PiT
+    /// blocks, fed by [`LqAdapter::pit_head`]. `None` for base students.
+    pit_lq_gate: Option<SigmaGate>,
     patch_size: i32,
 }
 
@@ -213,6 +272,10 @@ impl PidNet {
         Ok(Self {
             backbone: PixDiT::from_weights(w, prefix, cfg)?,
             lq: LqAdapter::from_weights(w, &format!("{prefix}lq_proj"), cfg)?,
+            pit_lq_gate: cfg
+                .pit_lq_inject
+                .then(|| SigmaGate::from_weights(w, &format!("{prefix}pit_lq_gate")))
+                .transpose()?,
             patch_size: cfg.patch_size,
         })
     }
@@ -229,11 +292,13 @@ impl PidNet {
     ) -> Result<Tensor> {
         let (_b, _c, h, w) = x.dims4()?;
         let (p_h, p_w) = (h as i32 / self.patch_size, w as i32 / self.patch_size);
-        let feats = self.lq.forward(lq_latent, p_h, p_w)?;
+        let (feats, pit_feat) = self.lq.forward(lq_latent, p_h, p_w)?;
         let inj = LqInjection {
             lq: &self.lq,
             feats,
             sigma: sigma.clone(),
+            pit_gate: self.pit_lq_gate.as_ref(),
+            pit_feat,
         };
         self.backbone.forward_with(x, t, y, &inj)
     }
@@ -244,11 +309,15 @@ impl PidNet {
     }
 }
 
-/// Binds the LQ adapter + this generation's precomputed features + sigma into the patch-block hook.
+/// Binds the LQ adapter + this generation's precomputed features + sigma into the backbone's injection
+/// hooks: the per-patch-block gate (`inject`) and (v1.5) the PiT pixel-stream gate (`inject_pit`).
 struct LqInjection<'a> {
     lq: &'a LqAdapter,
     feats: Vec<Tensor>,
     sigma: Tensor,
+    /// PiD v1.5 only: the top-level `pit_lq_gate` + its precomputed feature. `None`/`None` for base.
+    pit_gate: Option<&'a SigmaGate>,
+    pit_feat: Option<Tensor>,
 }
 
 impl PatchInjector for LqInjection<'_> {
@@ -262,5 +331,14 @@ impl PatchInjector for LqInjection<'_> {
             }
         }
         Ok(s_main.clone())
+    }
+
+    /// PiD v1.5: gate the pixel-stream conditioning `s = silu(s_main + t_emb)` with `pit_lq_gate` before
+    /// the PiT blocks. No-op for base students (no `pit_gate`/`pit_feat`).
+    fn inject_pit(&self, s: &Tensor) -> Result<Tensor> {
+        match (self.pit_gate, &self.pit_feat) {
+            (Some(gate), Some(feat)) => gate.forward(s, feat, &self.sigma),
+            _ => Ok(s.clone()),
+        }
     }
 }
