@@ -126,7 +126,7 @@ impl BooguTokenizer {
     /// image's `num_image_tokens` (= merged vision tokens) `<|image_pad|>` placeholders spliced into
     /// the user turn. The text encoder then replaces those placeholder embeddings with the vision
     /// tower's output ([`crate::text_encoder::BooguTextEncoder::last_hidden_with_image`]). `max_tokens`
-    /// is the image-grounded cap ([`crate::pipeline::MAX_EDIT_TOKENS`]), not the t2i RoPE-table cap.
+    /// is the image-grounded cap (`crate::pipeline::MAX_EDIT_TOKENS`), not the t2i RoPE-table cap.
     pub fn encode_edit_with_image(
         &self,
         instruction: &str,
@@ -141,7 +141,7 @@ impl BooguTokenizer {
     /// order). The text encoder splices each reference's vision-tower output into its block
     /// ([`crate::text_encoder::BooguTextEncoder::last_hidden_with_images`]).
     ///
-    /// `max_tokens` is the image-grounded cap ([`crate::pipeline::MAX_EDIT_TOKENS`]) — far larger than
+    /// `max_tokens` is the image-grounded cap (`crate::pipeline::MAX_EDIT_TOKENS`) — far larger than
     /// the t2i RoPE-table cap, since one `<|image_pad|>` is emitted per merged vision token (sc-11193 /
     /// F-087). The grounded encoder builds a fresh MRoPE table sized to the sequence, so this is a guard
     /// against a pathologically large reference set, not a RoPE-table bound. An over-cap set is rejected

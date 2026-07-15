@@ -14,14 +14,14 @@
 //!
 //! **Two on-disk expert formats, three load modes.** The stock diffusers snapshot (`SceneWorks/Lens`)
 //! ships the experts fused + **MXFP4** (`gate_up_proj` / `down_proj` as `_blocks` + `_scales`, one e8m0
-//! exponent per 32-value block; unpacked by [`dequant_mxfp4`], gate/up interleaved on the output dim).
+//! exponent per 32-value block; unpacked by `dequant_mxfp4`, gate/up interleaved on the output dim).
 //! The hosted **packed** tier (`SceneWorks/lens-mlx` / `lens-turbo-mlx` q4/q8) instead ships each fused
 //! projection as the *3-D per-expert MLX affine triple* `experts.{gate_up_proj,down_proj}` = `.weight`
 //! (u32 codes) + `.scales` + `.biases` (group 64) — the same affine packing the DiT tier uses
 //! (sc-9413), batched over the 32 experts. Everything else (attention, router, embeddings, norms) is
 //! bf16 in both.
 //!
-//! [`GptOssTextEncoder::new_quant`] picks the mode by **detecting the on-disk format** ([`SparseMoe::new`]):
+//! [`GptOssTextEncoder::new_quant`] picks the mode by **detecting the on-disk format** (`SparseMoe::new`):
 //! 1. **Packed tier** (`experts.gate_up_proj.scales` present, sc-9457 / sc-9089): each expert-slice is
 //!    repacked straight to a resident GGUF `Q4_1` (q4) / `Q8_0` (q8) `QMatMul` via the shared
 //!    [`candle_gen::quant::repack_packed_weight`] seam — no MXFP4 dependency, no dense staging — so a
@@ -32,7 +32,7 @@
 //! 3. **MXFP4 → dense bf16** (`quant = None`): the sc-5108 bring-up path (~40 GB resident).
 //!
 //! At inference the quantized weight (modes 1 & 2) is dequantized to an f16 tile and run through the
-//! *standard* matmul ([`ExpertProj`]) — candle's GGUF mat-vec/mat-mul CUDA kernels miscompute on
+//! *standard* matmul (`ExpertProj`) — candle's GGUF mat-vec/mat-mul CUDA kernels miscompute on
 //! Blackwell sm_120 at our pin (sc-7702). The quant is lossy (Q4 "coherent", Q8 near-lossless); both
 //! are parity-gated against the bf16 floor.
 
@@ -913,7 +913,7 @@ impl GptOssTextEncoder {
     /// Attention / router / embeddings / norms stay bf16. `quant = None` is the dense path.
     ///
     /// **Packed tier auto-detect (sc-9457).** If the snapshot is a packed `SceneWorks/lens-mlx` tier
-    /// ([`SparseMoe::new`] finds the `experts.gate_up_proj.scales` sibling), the experts load straight
+    /// (`SparseMoe::new` finds the `experts.gate_up_proj.scales` sibling), the experts load straight
     /// from the packed parts at the tier's own bit-width and `quant` is ignored for them — so a pure
     /// `lens-mlx` snapshot loads packed end-to-end regardless of the `quant` argument.
     pub fn new_quant(cfg: &Config, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {

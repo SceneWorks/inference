@@ -8,7 +8,7 @@
 //!
 //! Since sc-7787 the cache → loop → save scaffolding lives in the shared single-model flow-match
 //! driver ([`candle_gen::train::flow_match`]); this module supplies the Lens-specific hooks via
-//! [`FlowMatchTrainer`] — caching, DiT construction, and the parity-critical [`compute_loss_grads`].
+//! [`FlowMatchTrainer`] — caching, DiT construction, and the parity-critical `compute_loss_grads`.
 //!
 //! Registered under `"lens"` — the **non-distilled** `microsoft/Lens` base (the de-distill lesson,
 //! sc-1583; a LoRA trained here applies cleanly to `lens_turbo`, same architecture).
@@ -20,7 +20,7 @@
 //!    velocity is regressed toward it (Lens feeds the transformer output to the scheduler *without*
 //!    negation — opposite of Z-Image). The timestep `t ∈ (0, 1)` is fed to the DiT **directly** (no
 //!    `1 − σ`, no `·1000`) — which (with the gradient-checkpoint split below) is why
-//!    [`compute_loss_grads`] stays per-crate rather than collapsing into the shared driver.
+//!    `compute_loss_grads` stays per-crate rather than collapsing into the shared driver.
 //!  - **gpt-oss text front-end, cached + frozen.** Each caption is gpt-oss-encoded and its 4 selected
 //!    layers ([`DEFAULT_SELECTED_LAYERS`] = 5/11/17/23) captured + cropped at [`TXT_OFFSET`] (the
 //!    harmony-preamble offset) — exactly the inference `encode_one`. Cached once; the encoder is dropped
@@ -187,7 +187,7 @@ struct LensPromptCond {
 ///
 ///  * `conds` — the per-prompt joint CFG conditioning (positive + the shared empty-negative
 ///    unconditional branch), 1:1 with [`SamplePlan::prompts`]. Encoded with the same
-///    [`encode_caption`] the cache loop uses (train/infer conditioning parity), then assembled into the
+///    `encode_caption` the cache loop uses (train/infer conditioning parity), then assembled into the
 ///    `[2, S, 2880]` / `[2, S]` joint batch exactly like the inference `Pipeline::encode_prompt`.
 ///  * `vae` — the resident [`Flux2Vae`] **decoder** (`Arc` as inference holds it); the cache pass loads
 ///    only the encoder, so the decoder is loaded here for the preview path.

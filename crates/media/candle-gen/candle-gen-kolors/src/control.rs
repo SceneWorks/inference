@@ -7,11 +7,11 @@
 //!   and embedded ONCE by the ControlNet's `controlnet_cond_embedding` conv stack
 //!   ([`ControlNet::embed_cond`], step-invariant);
 //! - each denoise step the Kolors ControlNet — an SDXL-family encoder copy ([`ControlNet`], built from
-//!   [`ControlNetConfig::kolors`]) — emits the per-down-block + mid [`ControlResiduals`] (scaled by
+//!   [`ControlNetConfig::kolors`]) — emits the per-down-block + mid `ControlResiduals` (scaled by
 //!   `control_scale`), which the vendored SDXL [`UNet2DConditionModel::forward_instantid`] adds into its
 //!   skip connections + mid output (the same residual seam InstantID rides on);
 //! - the text path is **ChatGLM3-6B** (the Kolors encoder); the denoise runs the Kolors **leading-Euler**
-//!   sampler ([`KolorsEulerSampler`]) — NOT the SDXL EulerAncestral — so the numerics match Kolors txt2img.
+//!   sampler (`KolorsEulerSampler`) — NOT the SDXL EulerAncestral — so the numerics match Kolors txt2img.
 //!
 //! The Kolors `ControlNetModel` carries its **own** `encoder_hid_proj` (4096→2048), trained separately
 //! from the UNet's — so the raw ChatGLM3 context is projected **twice**: once by the UNet's
@@ -92,9 +92,9 @@ pub struct KolorsControlRequest {
     /// Curated unified-sampler selection (epic 7114, sc-7297). `None` (or `euler_discrete`) keeps the
     /// bespoke leading-Euler default byte-exact (N1); a curated
     /// [`Solver`](candle_gen::gen_core::sampling::Solver) name routes the pose-control
-    /// denoise through [`denoise_curated`] over the Kolors [`DiscreteModelSampling`].
+    /// denoise through [`denoise_curated`] over the Kolors `DiscreteModelSampling`.
     pub sampler: Option<String>,
-    /// Curated σ-schedule selection (epic 7114). `None` ⇒ the native leading schedule; a [`Scheduler`]
+    /// Curated σ-schedule selection (epic 7114). `None` ⇒ the native leading schedule; a `Scheduler`
     /// name re-shapes σ. A non-default scheduler alone also engages the curated path.
     pub scheduler: Option<String>,
     pub seed: u64,

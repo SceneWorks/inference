@@ -6,7 +6,7 @@
 //!
 //! sc-9417 wired [`crate::quant::qlinear`] / [`crate::quant::qembedding`] to packed-DETECT on a
 //! `{key}.scales` sibling, validated with SYNTHETIC fixtures on the crate's own key layout. But the
-//! crate's dense loader ([`crate::Pipeline::load_components`]) consumes a **single bundled** Lightricks
+//! crate's dense loader (`crate::Pipeline::load_components`) consumes a **single bundled** Lightricks
 //! checkpoint (`ltx-2.3-22b-distilled.safetensors`, keys under `model.diffusion_model.*` with the dense
 //! Lightricks spelling), whereas the hosted MLX tier ships **split per-component** safetensors in a
 //! `q4/` (or `q8/`) subfolder whose `transformer.safetensors` uses **remapped** keys. So the packed
@@ -72,7 +72,7 @@ pub struct TierPaths {
 impl TierPaths {
     /// Detect a packed tier at `dir`: a directory that directly holds `transformer.safetensors` **and**
     /// `quantize_config.json` (the MLX split-tier marker). Returns `None` for the dense single-bundle
-    /// layout so [`crate::Pipeline`] keeps the legacy path unchanged.
+    /// layout so `crate::Pipeline` keeps the legacy path unchanged.
     ///
     /// `gemma_override` (from `LoadSpec::text_encoder` / `$LTX_GEMMA_DIR`) wins for the Gemma dir; else
     /// the tier's sibling `gemma/` (one level up from the `q4/` subdir) is used.
@@ -167,7 +167,7 @@ impl TierPaths {
     /// [`crate::vae::LtxVideoVae::new`] (which asks for `vae.decoder.<X>` and `vae.per_channel_statistics.
     /// {mean-of-means,std-of-means}`) resolves the tier's rootless `<X>` / `per_channel_statistics.{mean,
     /// std}`. Conv weights are additionally **permuted** from the tier's channels-last `[O,kt,kh,kw,I]` to
-    /// the crate's PyTorch `[O,I,kt,kh,kw]` on load (see [`VaeRemapBackend`]).
+    /// the crate's PyTorch `[O,I,kt,kh,kw]` on load (see `VaeRemapBackend`).
     pub fn vae_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
         let inner =
             candle_gen::mmap_var_builder(&[self.file("vae_decoder.safetensors")?], dtype, device)?;

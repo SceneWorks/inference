@@ -6,7 +6,7 @@
 //!
 //! Application is **interleaved** (GPT-J style): lanes `2i` / `2i+1` of each head are the real /
 //! imaginary parts rotated together by `(cos[i], sin[i])` — `out0 = r·cos − i·sin`,
-//! `out1 = i·cos + r·cos`. candle's [`candle_nn::rotary_emb::rope_i`] implements exactly this
+//! `out1 = i·cos + r·cos`. candle's `candle_nn::rotary_emb::rope_i` implements exactly this
 //! interleaved rotation for `cos`/`sin` of width `head_dim/2`, so it is reused for the apply.
 
 use candle_gen::candle_core::{Device, Result, Tensor};

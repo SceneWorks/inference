@@ -20,7 +20,7 @@
 //! per-step residual op. candle loads the DiT dense (f32), so — unlike MLX (which splits a residual-
 //! over-Q4 path from a pre-build merge) — **all** of LoRA, LoKr, LoHa, and the diff-patch fold through
 //! this one pre-build merge. The low-rank delta is reconstructed with the same f32 math the trainer's
-//! forward uses ([`reconstruct_lora_delta`] / [`reconstruct_lokr_delta`] / [`reconstruct_loha_delta`]),
+//! forward uses ([`reconstruct_lora_delta`] / [`reconstruct_lokr_delta`] / `reconstruct_loha_delta`),
 //! so a candle-trained adapter round-trips.
 //!
 //! **Merge surface = the raw `SCAIL2Model` keys** the [`Scail2Dit`](crate::model) reads 1:1:

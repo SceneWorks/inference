@@ -339,7 +339,7 @@ pub struct Nvfp4Report {
     /// Summed bf16 footprint those same weights would occupy dense — the SC#6 comparison baseline.
     pub bf16_bytes: usize,
     /// Summed bytes resident on-device for the **W4A4 (FP4-regime)** weights
-    /// ([`Nvfp4Linear::resident_device_bytes`]). Only populated on a cuda build; zero when no layer
+    /// (`Nvfp4Linear::resident_device_bytes`). Only populated on a cuda build; zero when no layer
     /// resolved to the packed FP4 path.
     pub resident_fp4_bytes: usize,
     /// Summed bytes resident on-device for the **W4A16 / fallback (dequant→bf16)** weights

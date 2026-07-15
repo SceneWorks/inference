@@ -32,7 +32,7 @@
 //! pool, epic 10765's cudarc caveat) and candle evaluates eagerly, so Rust's own scope-based drop is
 //! the whole cleanup story and it already runs on the `?` early-return path.
 //!
-//! **Still open:** this seam covers the `Sequential` schedule only. mlx-gen's [`Residency<Text, Heavy>`]
+//! **Still open:** this seam covers the `Sequential` schedule only. mlx-gen's `Residency<Text, Heavy>`
 //! also unifies the `Resident` path into one type, so a provider drives both policies through a single
 //! `run`. Candle's providers still branch (`if sequential { … } else { … }`) and hold their own
 //! `Mutex<Option<Components>>` cache. Unifying that is the natural follow-on; it wants its own story,

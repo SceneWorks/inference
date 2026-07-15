@@ -1,5 +1,5 @@
 //! SDXL dual-CLIP conditioning (sc-5491, epic 5480) — the candle twin of
-//! `mlx-gen-sdxl::pipeline::encode_conditioning`, the piece the txt2img [`crate::pipeline`] does NOT
+//! `mlx-gen-sdxl::pipeline::encode_conditioning`, the piece the txt2img `crate::pipeline` does NOT
 //! build (it uses only the final CLIP hidden state and no pooled text-embeds, relying on the stock
 //! candle UNet). The InstantID UNet ([`crate::UNet2DConditionModel::forward_instantid`]) needs the real
 //! SDXL micro-conditioning, so this assembles it exactly as diffusers does:

@@ -1,10 +1,10 @@
 //! Shared **budgeted video-VAE tiling machinery** (sc-9006 / F-026) — the single home for the
 //! tile/narrow/blend/pad-accumulate/normalize DRIVER and the VRAM-budget selector that were copied
-//! byte-near-identically between [`candle-gen-wan`]'s z48 vae22 decode and [`candle-gen-ltx`]'s LTX
-//! decode (and echoed in [`candle-gen-seedvr2`]).
+//! byte-near-identically between `candle-gen-wan`'s z48 vae22 decode and `candle-gen-ltx`'s LTX
+//! decode (and echoed in `candle-gen-seedvr2`).
 //!
 //! The tile **geometry** already lives in the pure [`gen_core::tiling`] module ([`budgeted_plan`],
-//! [`TilePlan`], [`AxisTile`], [`VaeTiling`]) and is shared verbatim by every backend. What was still
+//! [`TilePlan`], `AxisTile`, [`VaeTiling`]) and is shared verbatim by every backend. What was still
 //! duplicated is the candle-side *execution* of a plan:
 //!
 //!  - [`decode_tiled`] — split a latent into the plan's overlapping tiles, decode each through a

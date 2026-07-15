@@ -85,7 +85,7 @@ enum Variant {
     Edit,
 }
 
-/// A lazily-loaded Boogu generator. [`Variant`] selects the sampler path. The shared T2I components
+/// A lazily-loaded Boogu generator. `Variant` selects the sampler path. The shared T2I components
 /// load on the first `generate`; the Edit-only components (vision tower + VAE encoder) load lazily on
 /// the first edit, so the T2I paths keep their footprint.
 pub struct BooguGenerator {
@@ -321,7 +321,7 @@ pub fn descriptor() -> ModelDescriptor {
 }
 
 /// Boogu Turbo descriptor — same base, CFG-free DMD few-step; guidance is inert. The advertised
-/// sampler menu is the DMD-compatible stochastic subset ([`TURBO_SAMPLERS`]); a selected sampler or
+/// sampler menu is the DMD-compatible stochastic subset (`TURBO_SAMPLERS`); a selected sampler or
 /// scheduler routes the few-step denoise through the unified curated framework over the DMD σ grid
 /// (sc-9009), while unset keeps the byte-exact native DMD student loop.
 pub fn descriptor_turbo() -> ModelDescriptor {
@@ -334,7 +334,7 @@ pub fn descriptor_turbo() -> ModelDescriptor {
 
 /// Boogu Edit descriptor — same true-CFG surface as the Base path plus one or more img2img/instruction
 /// -edit source images ([`ConditioningKind::Reference`] for a single source, or
-/// [`ConditioningKind::MultiReference`] for up to [`MAX_EDIT_REFERENCES`]): each source is read by the
+/// [`ConditioningKind::MultiReference`] for up to `MAX_EDIT_REFERENCES`): each source is read by the
 /// Qwen3-VL vision tower (semantic edit) and VAE-encoded into the DiT's spatial reference sequence.
 pub fn descriptor_edit() -> ModelDescriptor {
     let mut d = descriptor();

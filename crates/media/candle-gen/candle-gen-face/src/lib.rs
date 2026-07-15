@@ -4,7 +4,7 @@
 //! [`mlx-gen-face`](https://github.com/michaeltrefry/mlx-gen). A SCRFD-10g 5-point detector
 //! ([`scrfd`]) + an ArcFace `glintr100` (iresnet100) 512-d embedder ([`iresnet`]) + the
 //! insightface-faithful 5-point alignment ([`align`]), orchestrated by [`face::FaceAnalysis`] and
-//! exposed through the backend-neutral [`gen_core::FaceEmbedder`] contract (epic 5480, sc-5490).
+//! exposed through the backend-neutral `gen_core::FaceEmbedder` contract (epic 5480, sc-5490).
 //!
 //! Consumers — the candle InstantID (sc-5491) and PuLID-FLUX (sc-5492) identity providers, and the
 //! Phase-5 keypoint-extract surface (epic 5482) — depend on the `gen_core` trait, not this crate's
@@ -45,7 +45,7 @@ const ARCFACE_FILE: &str = "arcface_iresnet100.safetensors";
 /// with the MLX `convert_bisenet.py` output).
 const BISENET_FILE: &str = "bisenet_parsing.safetensors";
 
-/// The candle face embedder: a thin [`gen_core::FaceEmbedder`] adapter over [`FaceAnalysis`].
+/// The candle face embedder: a thin `gen_core::FaceEmbedder` adapter over [`FaceAnalysis`].
 pub struct CandleFaceAnalysis {
     inner: FaceAnalysis,
     descriptor: FaceEmbedderDescriptor,

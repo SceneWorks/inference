@@ -1,13 +1,13 @@
 //! Z-Image **img2img / edit** provider (sc-6595, epic 5480) — pixel-conditioned editing on
 //! Z-Image-Turbo, the candle (Windows/CUDA) sibling of the `mlx-gen-z-image` img2img path (on Mac the
-//! registered `z_image_turbo` generator's `Conditioning::Reference` route, [`mlx_gen_z_image`]). The
+//! registered `z_image_turbo` generator's `Conditioning::Reference` route, `mlx_gen_z_image`). The
 //! candle `z_image_turbo` descriptor advertises **txt2img only**, so — exactly like the strict-pose
 //! Fun-ControlNet ([`crate::control`]) — this is a **bespoke provider driven directly by the worker**
 //! (`generate_candle_zimage_edit_stream`), NOT gen-core-registered. The registered descriptor stays
 //! honest (no img2img promise it can't serve through the registry path).
 //!
 //! It reuses the validated txt2img machinery (the **stock** candle-transformers Z-Image DiT + Qwen3
-//! encoder + AutoencoderKL VAE + the flow-match Euler schedule, [`crate::pipeline`]) with a
+//! encoder + AutoencoderKL VAE + the flow-match Euler schedule, `crate::pipeline`) with a
 //! strength-derived img2img init:
 //!  1. **VAE-encode** the source to its clean latent **mean** — deterministic. candle's
 //!     `AutoEncoderKL::encode` runs `DiagonalGaussian{sample:true}`, i.e. it draws `randn` from the
@@ -23,12 +23,12 @@
 //! and the init is noised to `sigma[init_time_step]`. **Higher strength → later start → fewer steps →
 //! output stays CLOSER to the source.** Default [`DEFAULT_EDIT_STRENGTH`] (0.6), matching the worker's
 //! `advanced.strength` default. (The candle txt2img schedule is linear — `set_timesteps(steps, Some(mu))`,
-//! see [`crate::pipeline`] — so the *image* won't be bit-identical to the MLX static-shift-3.0 path, but
+//! see `crate::pipeline` — so the *image* won't be bit-identical to the MLX static-shift-3.0 path, but
 //! the strength knob means the same thing on both backends, and strength→0 reduces to candle txt2img.)
 //!
 //! **Distilled, no CFG** (Z-Image-Turbo): a single DiT forward per step, no negative prompt / guidance;
 //! the predicted velocity is negated before the Euler step (the Z-Image sign convention, see
-//! [`crate::pipeline`]). **Deterministic** (sc-3673): the init noise is drawn from a seeded CPU `StdRng`
+//! `crate::pipeline`). **Deterministic** (sc-3673): the init noise is drawn from a seeded CPU `StdRng`
 //! then moved to the device; the flow-match Euler step injects no per-step noise, so generation is a pure
 //! function of `(seed, request, source)`. `generate` takes `&self` and returns one [`Image`] (the worker
 //! loops `count`), so one loaded model serves many edits.
@@ -99,7 +99,7 @@ pub struct ZImageEditRequest {
     pub height: u32,
     pub steps: usize,
     /// Denoise strength in `[0, 1]` — the Z-Image structure-preservation knob (higher ⇒ closer to the
-    /// source; see [`init_time_step`]).
+    /// source; see `init_time_step`).
     pub strength: f32,
     pub seed: u64,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).

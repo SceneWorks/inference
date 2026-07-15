@@ -180,7 +180,7 @@ fn pixel_pos_axis_scale(n: i32) -> f64 {
 /// matching `get_2d_sincos_pos_embed_from_grid`. Computed in f64, cast f32. First half encodes the
 /// **w** coordinate, second half the **h** coordinate (the reference's swapped `emb_h`/`emb_w`).
 ///
-/// Each axis's coordinates are scaled by [`pixel_pos_axis_scale`] first so a super-resolved decode
+/// Each axis's coordinates are scaled by `pixel_pos_axis_scale` first so a super-resolved decode
 /// whose height (or width) exceeds the trained pixel extent stays in distribution (fixes the
 /// tall-image bottom color cast) without disturbing an in-range axis; a no-op for any axis that
 /// already fits, preserving reference/golden parity.

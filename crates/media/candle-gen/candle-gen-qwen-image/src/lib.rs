@@ -770,7 +770,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// place from existing ComfyUI single-files (epic 10451 Phase 2b, sc-10670 / sc-10830) — no copy, no
 /// re-download. `transformer_file` is the user's ComfyUI Qwen-Image DiT
 /// (`diffusion_models/qwen_image_*_fp8_e4m3fn.safetensors`, keyed `model.diffusion_model.*`, plain
-/// fp8); its keys are prefix-stripped and its weights upcast to bf16 in memory ([`comfyui`]) at
+/// fp8); its keys are prefix-stripped and its weights upcast to bf16 in memory (`comfyui`) at
 /// component build.
 ///
 /// `vae_file`, when `Some`, is the tree's `vae/qwen_image_vae.safetensors` (native WAN-VAE keys,

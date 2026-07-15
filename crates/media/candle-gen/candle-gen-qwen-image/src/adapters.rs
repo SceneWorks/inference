@@ -17,8 +17,8 @@
 //! footprint and stays streamable under sequential residency. The ~1-ULP additive/fold difference is
 //! accepted uniformly across tiers. The **fold** ([`merge_adapters`]) survives ONLY as the dense fallback
 //! for adapter types with no deferred form (**LoHa**, untagged LyCORIS LoKr); the router
-//! [`adapters_additive_capable`] picks the route. Both paths reconstruct with the same f32 trainer math
-//! ([`reconstruct_lora_delta`] / [`reconstruct_lokr_delta`] / [`reconstruct_loha_delta`]) so a
+//! `adapters_additive_capable` picks the route. Both paths reconstruct with the same f32 trainer math
+//! ([`reconstruct_lora_delta`] / [`reconstruct_lokr_delta`] / `reconstruct_loha_delta`) so a
 //! candle-trained adapter round-trips, and additive == folded to f32 tolerance (`resolve_lora_matches_fold_on_dense`).
 //!
 //! **Merge at the safetensors-key level.** The candle MMDiT reads the diffusers transformer keys 1:1

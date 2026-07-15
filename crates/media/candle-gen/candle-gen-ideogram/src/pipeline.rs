@@ -570,7 +570,7 @@ fn create_noise(seed: u64, num_img: usize, ch: usize, device: &Device) -> CResul
 }
 
 /// Edit (img2img / mask inpaint) conditioning prepared **once per request** (seed-independent) by
-/// [`Components::prepare_edit`]: the bn-normalized packed source latent `[1, num_img, 128]`, an
+/// `Components::prepare_edit`: the bn-normalized packed source latent `[1, num_img, 128]`, an
 /// optional latent-grid inpaint mask `[1, num_img, 1]` (1 = repaint, 0 = keep), and the strength.
 pub struct EditInit {
     /// bn-normalized packed source latent `[1, num_img, 128]` (same space as the running `z`).

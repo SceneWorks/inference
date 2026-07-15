@@ -15,7 +15,7 @@
 //! ## Why this can't be a thin wrapper over `loss.backward()`
 //!
 //! There is no extension point in candle's autograd to say "recompute this subgraph during backward":
-//! `backward()` walks a graph that already exists, and the only custom-op hook ([`CustomOp1::bwd`] et
+//! `backward()` walks a graph that already exists, and the only custom-op hook (`CustomOp1::bwd` et
 //! al.) returns a gradient for its tensor *input* only — it can't surface gradients for the adapter
 //! `Var`s used *inside* a recomputed block, which are exactly what we train. So checkpointing here is
 //! a **manual segmented vector-Jacobian product**: we drive the chain rule segment-by-segment

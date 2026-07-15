@@ -208,7 +208,7 @@ impl LtxVideoVae {
     /// spatial/temporal tiles via the shared pure `gen_core::tiling` geometry (`VaeTiling::LTX`: ×32
     /// spatial, ×8 **causal** temporal), decodes each tile through [`decode`](Self::decode), and
     /// trapezoidally blends them into the full video by pad-and-accumulate (bounded peak = one tile's
-    /// decode + the full-output `output`/`weights` buffers). Falls back to single-pass [`decode`] when
+    /// decode + the full-output `output`/`weights` buffers). Falls back to single-pass `decode` when
     /// `cfg` does not fire for these dims.
     ///
     /// Numerically mirrors the parity-validated mlx version op-for-op; candle's eager evaluation makes
@@ -309,9 +309,9 @@ fn estimated_ltx_decode_peak_gib(
 
 /// The safe peak-GiB budget for the LTX decode tiler. Resolved in order: `LTX_VAE_BUDGET_GIB` env
 /// override (positive float — the deterministic injection point for the worker/tests) → total VRAM ×
-/// [`LTX_VAE_BUDGET_SAFE_FRAC`] (via the shared trusted-path `nvidia-smi` probe
+/// `LTX_VAE_BUDGET_SAFE_FRAC` (via the shared trusted-path `nvidia-smi` probe
 /// [`candle_gen::gpu::nvidia_smi_min_total_gib`] — an absolute System32/CUDA_PATH binary, never a bare
-/// `PATH` lookup; sc-9014 / F-030) → [`LTX_VAE_DEFAULT_BUDGET_GIB`].
+/// `PATH` lookup; sc-9014 / F-030) → `LTX_VAE_DEFAULT_BUDGET_GIB`.
 pub fn ltx_vae_safe_budget_gib() -> f64 {
     vae_tiling::safe_budget_gib(
         LTX_VAE_BUDGET_ENV,
@@ -320,7 +320,7 @@ pub fn ltx_vae_safe_budget_gib() -> f64 {
     )
 }
 
-/// **Memory-budgeted** tiling for the LTX VAE decode — routes the shared [`budgeted_plan`] selector
+/// **Memory-budgeted** tiling for the LTX VAE decode — routes the shared `budgeted_plan` selector
 /// through the LTX cost model. Caller passes the **output** dims. `Ok(None)` → single-pass already
 /// fits; `Err` → a catchable over-budget signal returned before the decode (not an OOM).
 pub fn auto_tiling_budgeted_ltx(

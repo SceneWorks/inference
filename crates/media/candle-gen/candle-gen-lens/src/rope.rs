@@ -1,7 +1,7 @@
 //! Lens complex axial RoPE (`LensEmbedRope`) — the DiT positional embedding (sc-5112).
 //!
 //! A 3-axis (frame / height / width) interleaved RoPE, architecturally a twin of
-//! `candle-gen-qwen-image`'s [`crate`](crate)-sibling `QwenRope`: only the axis widths differ
+//! `candle-gen-qwen-image`'s `crate`-sibling `QwenRope`: only the axis widths differ
 //! (`axes_dims_rope = (8, 28, 28)`, Σ = 64 = `head_dim`, Σ/2 = 32 complex pairs vs Qwen's 16/56/56).
 //! θ = 10000, `scale_rope = True` (height/width positions are centered). Frequencies and angles are
 //! computed **host-side** in f32; application is **interleaved** (lanes `2i`/`2i+1` are the real/imag

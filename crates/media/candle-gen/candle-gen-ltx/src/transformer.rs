@@ -3,7 +3,7 @@
 //! (→2·dim) → 48 gated blocks → affine-false LayerNorm output head + 2-row scale-shift → proj_out
 //! (→128) velocity.
 //!
-//! Per-block (gated 9-row `scale_shift_table` + adaLN-single timestep; rows [shift,scale,gate] ×
+//! Per-block (gated 9-row `scale_shift_table` + adaLN-single timestep; rows `shift,scale,gate` ×
 //! {MSA 0:3, FF 3:6, text-cross-attn 6:9}): MSA self-attn (q/k RMSNorm over full inner, split 3-D
 //! RoPE, **2·sigmoid** per-head gate) → prompt-modulated text cross-attn (no RoPE) → tanh-gelu FFN,
 //! each adaLN-modulated (`x·(1+scale)+shift`) and gated (`x + out·gate`). Our checkpoint is dense

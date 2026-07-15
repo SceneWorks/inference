@@ -6,12 +6,12 @@
 //! family catalog.
 //!
 //! **txt2img (sc-3675 + sc-3673):** [`SdxlGenerator::generate`] runs the GO-validated epic-3494
-//! prototype ([`pipeline`]) through the contract: dual CLIP → UNet (real CFG) → f16 VAE, emitting
+//! prototype (`pipeline`) through the contract: dual CLIP → UNet (real CFG) → f16 VAE, emitting
 //! `Progress` and honoring `req.cancel`, with **deterministic CPU-seeded noise + the non-ancestral
 //! DDIM sampler** (sc-3673) so output is launch-portable per seed.
 //!
 //! **LoRA/LoKr (sc-5165):** [`load`] accepts `spec.adapters` and merges a trained adapter's delta into
-//! the UNet weights at component load ([`adapters`] + [`pipeline`]) — the inference half of the native
+//! the UNet weights at component load (`adapters` + `pipeline`) — the inference half of the native
 //! candle trainer, closing the train→infer loop. The descriptor advertises the wired surface
 //! (txt2img, negative prompt, guidance, `ddim`, the few-step `lightning` sampler, **LoRA/LoKr**) — NOT
 //! the full mlx-gen-sdxl conditioning / accel-sampler surface — so the worker routes the rest to the
@@ -19,7 +19,7 @@
 //! descriptor's `backend` is `"candle"` and `mac_only` is `false` (Windows/CUDA target).
 //!
 //! **Lightning (sc-6128):** a `req.sampler == "lightning"` request runs the few-step Euler-trailing
-//! denoise ([`pipeline`]) — diffusers `EulerDiscreteScheduler(timestep_spacing="trailing")`, ε-pred,
+//! denoise (`pipeline`) — diffusers `EulerDiscreteScheduler(timestep_spacing="trailing")`, ε-pred,
 //! `final_sigmas_type="zero"`, **CFG-off** — reusing the backend-neutral `gen_core::sampling`
 //! `LightningPolicy` (the same schedule `mlx-gen-sdxl`'s `LightningSampler` drives). This makes the
 //! `realvisxl_lightning` model id renderable on the candle (Windows) lane at ~5 steps; base SDXL is
@@ -37,7 +37,7 @@
 //! diffusers tree with the *same* `.fp16.safetensors` component filenames as SDXL-base, so it loads
 //! through this identical path unmodified (no single-file loader needed); parity with the Python
 //! `SdxlDiffusersAdapter` is locked by the CPU parity tests here + `tests/conformance.rs`
-//! (`sdxl_conformance` / `realvisxl_conformance` on the CUDA lane). See [`pipeline`] for the layout
+//! (`sdxl_conformance` / `realvisxl_conformance` on the CUDA lane). See `pipeline` for the layout
 //! finding and the one accepted sampler difference (DDIM vs euler_ancestral, sc-3673).
 
 mod pipeline;
@@ -229,7 +229,7 @@ pub fn vae_tiling_enabled() -> bool {
 
 /// A loaded candle SDXL generator. Loading is **lazy**: `load` does no file I/O (registry
 /// introspection against a missing path still resolves), and the heavy UNet/VAE are built on the
-/// first [`generate`](Generator::generate) call. sc-5037: those [`Components`] are then **cached** in
+/// first [`generate`](Generator::generate) call. sc-5037: those `Components` are then **cached** in
 /// `components` and reused across subsequent calls (keyed by the flash-attn setting), so back-to-back
 /// requests skip the ~7 GiB UNet/VAE disk re-read. CLIP is intentionally not cached — it stays
 /// load-on-demand-and-free (the sc-4987 peak-VRAM lever), so the cache is a latency win that does not
@@ -385,7 +385,7 @@ impl Generator for SdxlGenerator {
 /// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
 /// scale), txt2img, `ddim`, the few-step **`lightning`** sampler (sc-6128 — Euler-trailing, CFG-off,
 /// for distilled Lightning checkpoints), and **LoRA/LoKr** (sc-5165 — load-time merge of a trained
-/// adapter into the UNet weights, see [`load`] + [`pipeline`]). No conditioning is advertised, and the
+/// adapter into the UNet weights, see [`load`] + `pipeline`). No conditioning is advertised, and the
 /// other acceleration samplers (lcm/hyper) remain the Python fallback's job (sc-3678) until candle
 /// wires them — so the descriptor never promises a path `generate` can't serve (the false-capability
 /// trap). Two backend-correct deviations from `mlx-gen-sdxl`: `backend = "candle"` and
@@ -453,7 +453,7 @@ pub fn descriptor() -> ModelDescriptor {
 ///
 /// `spec.adapters` (sc-5165) are LoRA/LoKr adapters to **merge into the UNet weights** — folded in at
 /// the first `generate`'s component load (this `load` stays lazy: no file I/O here), via
-/// [`adapters::merge_adapters`](crate::pipeline). PEFT (the candle trainer's format) + kohya LoRA and
+/// `adapters::merge_adapters`. PEFT (the candle trainer's format) + kohya LoRA and
 /// PEFT/kohya LoKr are supported; an adapter that matches no UNet target errors at that first
 /// `generate` rather than rendering an unadapted image silently.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {

@@ -8,7 +8,7 @@
 //! (understanding + generation paths) with a flow-matching image head; there is no separate VAE or
 //! text encoder. This slice wires the **non-think T2I** path the `Generator` contract drives: build
 //! the `neo1_0` query, prefill it on the understanding path, then run the flow-matching denoise loop
-//! on the generation path ([`crate::t2i`]) and unpatchify to RGB. Deterministic CPU-seeded noise
+//! on the generation path (`crate::t2i`) and unpatchify to RGB. Deterministic CPU-seeded noise
 //! (sc-3673) makes output launch-portable per seed.
 //!
 //! Two registered ids share the loader: **`sensenova_u1_8b`** (50 NFE, CFG 4.0) and
@@ -19,7 +19,7 @@
 //!
 //! **Understanding surface (VQA + interleave, sc-5501):** SenseNova-U1's text / text+image modes
 //! ([`T2iModel::vqa`], [`T2iModel::interleave_gen`]) output what the neutral
-//! [`GenerationOutput`](gen_core::GenerationOutput) contract can't express, so they are exposed as
+//! `GenerationOutput` contract can't express, so they are exposed as
 //! direct methods on the concrete [`T2iModel`] (built via [`load_understanding`]) and driven by the
 //! worker off-registry — the candle sibling of `mlx-gen-sensenova`'s `T2iModel::{vqa, interleave_gen}`
 //! carve-outs. This retires the `sensenova_u1` VQA / interleave torch paths off-Mac.

@@ -178,7 +178,7 @@ pub struct FaceAnalysis {
 
 impl FaceAnalysis {
     /// Build the detection + recognition stack from already-loaded sub-models on `device`. For the
-    /// PuLID crop path, add the BiSeNet parser with [`FaceAnalysis::with_parser`].
+    /// PuLID crop path, add the BiSeNet parser with `FaceAnalysis::with_parser`.
     pub fn new(scrfd: Scrfd, arcface: ArcFace, device: Device) -> Self {
         Self {
             scrfd,
@@ -266,7 +266,7 @@ impl FaceAnalysis {
 
     /// PuLID `face_features_image`: facexlib 512² align of `face` → BiSeNet parse → background
     /// whitened, foreground grayscale. Returns NCHW `[1,3,512,512]` f32 in `[0,1]` on the stack's
-    /// device. Requires [`FaceAnalysis::with_parser`].
+    /// device. Requires `FaceAnalysis::with_parser`.
     pub fn face_features_image(
         &self,
         img: &[u8],

@@ -572,7 +572,7 @@ impl QwenTransformer {
         )
     }
 
-    /// [`forward`] with optional ControlNet residual injection (sc-5489): after base block `i` the
+    /// `forward` with optional ControlNet residual injection (sc-5489): after base block `i` the
     /// residual `residuals[i / interval]` (pre-scaled by `control_scale`) is added to the image stream,
     /// where `interval = ceil(num_blocks / num_residuals)` (60 base blocks, 5 control residuals →
     /// interval 12) — the diffusers `QwenImageTransformer2DModel` `index_block // interval_control`
@@ -734,14 +734,14 @@ fn build_modulate_index(
 /// `controlnet_x_embedder` ADDed onto `img_in(x)`, emitting per-block residuals the base ADDs at a
 /// fixed interval), the 2512-Fun branch is **VACE-style**: a `control_img_in` patch embedder
 /// (`132 → inner`) feeds a control state `c` threaded through `N` control blocks that reuse the base
-/// [`Block`] math (and the base modulation / RoPE / timestep), seeded at block 0 by
+/// `Block` math (and the base modulation / RoPE / timestep), seeded at block 0 by
 /// `c = before_proj(c) + img_embed`. Each control block emits a hint via a zero-init `after_proj`; the
 /// base transformer adds `hints[n]·control_scale` into its image stream **after** the base block at
 /// `control_layers[n]` (`[0, 12, 24, 36, 48]` — 5 hints across the 60-layer MMDiT). `control_scale = 0`
 /// is byte-identical to the base forward (`+0`).
 ///
-/// The control blocks are the *same* [`Block`] as the base (identical on-disk keys), so the loader
-/// reuses [`Block::new`].
+/// The control blocks are the *same* `Block` as the base (identical on-disk keys), so the loader
+/// reuses `Block::new`.
 pub struct QwenFunControlBranch {
     /// `control_img_in`: 132 → inner. Biased patch embedder for the packed 132-ch control context.
     control_img_in: QLinear,

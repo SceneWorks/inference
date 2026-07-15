@@ -1,7 +1,7 @@
 //! Kolors **IP-Adapter-Plus** provider (sc-5488, epic 5480) — reference-image (identity) conditioning
 //! on Kolors, the candle (Windows/CUDA) sibling of the `mlx-gen-kolors` IP-Adapter path. It reuses the
 //! vendored SDXL IP stack the InstantID/IP-Adapter slices built ([`candle_gen_sdxl`]) with the Kolors
-//! conditioning the txt2img [`crate::pipeline`] already speaks:
+//! conditioning the txt2img `crate::pipeline` already speaks:
 //!
 //! - the reference image's identity tokens come from the **CLIP ViT-L/14-336** image encoder
 //!   ([`ClipVisionEncoder`] at [`VisionConfig::vit_l_14_336`]) → the IP-Adapter "plus"
@@ -11,10 +11,10 @@
 //!   SDXL [`UNet2DConditionModel`]** exactly as for SDXL/InstantID;
 //! - the text path is **ChatGLM3-6B** (the Kolors encoder) projected to the cross-attention width by the
 //!   Kolors `encoder_hid_proj` (4096→2048), and the denoise runs the Kolors **leading-Euler** sampler
-//!   ([`KolorsEulerSampler`]) — NOT the SDXL EulerAncestral — so the output matches the Kolors txt2img
+//!   (`KolorsEulerSampler`) — NOT the SDXL EulerAncestral — so the output matches the Kolors txt2img
 //!   numerics; the IP tokens are merely injected at `ip_scale` alongside the projected text context.
 //!
-//! Why the vendored SDXL UNet (not [`crate::unet::KolorsUNet`])? The txt2img Kolors UNet composes the
+//! Why the vendored SDXL UNet (not `crate::unet::KolorsUNet`)? The txt2img Kolors UNet composes the
 //! *stock* candle-transformers cross-attn blocks, which expose no decoupled-cross-attention seam. The
 //! vendored SDXL stack is the only candle UNet carrying the IP install; since Kolors is an SDXL-family
 //! UNet, its checkpoint loads into it 1:1 — the two Kolors deltas are handled outside the block stack:
@@ -101,9 +101,9 @@ pub struct IpAdapterKolorsRequest {
     /// Curated unified-sampler selection (epic 7114, sc-7297). `None` (or `euler_discrete`) keeps the
     /// bespoke leading-Euler default byte-exact (N1); a curated
     /// [`Solver`](candle_gen::gen_core::sampling::Solver) name routes the IP denoise
-    /// through [`denoise_curated`] over the Kolors [`DiscreteModelSampling`].
+    /// through [`denoise_curated`] over the Kolors `DiscreteModelSampling`.
     pub sampler: Option<String>,
-    /// Curated σ-schedule selection (epic 7114). `None` ⇒ the native leading schedule; a [`Scheduler`]
+    /// Curated σ-schedule selection (epic 7114). `None` ⇒ the native leading schedule; a `Scheduler`
     /// name re-shapes σ. A non-default scheduler alone also engages the curated path.
     pub scheduler: Option<String>,
     pub seed: u64,

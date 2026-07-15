@@ -1138,7 +1138,7 @@ impl MemoryAttention {
 // --- single-frame tracker -----------------------------------------------------------------------
 
 /// SAM3 single-frame box-prompt tracker (PVS path) + the video memory primitives. Reuses the shared
-/// PE [`Backbone`]; loads the tracker neck + prompt encoder + mask decoder from `tracker_neck.*` /
+/// PE `Backbone`; loads the tracker neck + prompt encoder + mask decoder from `tracker_neck.*` /
 /// `tracker_model.*`.
 pub struct Sam3Tracker {
     backbone: Arc<Backbone>,

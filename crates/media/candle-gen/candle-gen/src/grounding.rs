@@ -52,7 +52,7 @@ impl Rotary {
     }
 }
 
-/// Repeat each kv head `groups` times along the head axis ([B,nkv,S,D] → [B,nkv·groups,S,D]) — the GQA
+/// Repeat each kv head `groups` times along the head axis (`[B,nkv,S,D] → [B,nkv·groups,S,D]`) — the GQA
 /// key/value broadcast the Qwen3-VL text tower's attention needs (32 query / 8 kv heads).
 pub fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
     if groups == 1 {

@@ -10,7 +10,7 @@
 //!
 //! Weights are the MLX-converted `convert_eva_clip.py` safetensors (bare names, no prefix) — shared
 //! with the MLX sibling. The only layout fix vs MLX: the patch-embed conv is stored OHWI and candle's
-//! `conv2d` is OIHW, so [`patch_embed`] transposes it at load (the candle face-stack convention). The
+//! `conv2d` is OIHW, so `patch_embed` transposes it at load (the candle face-stack convention). The
 //! Linear/LayerNorm weights are `[out,in]`/`[C]` in both, so they load unchanged. This checkpoint has
 //! `use_mean_pooling=False` (`visual.norm.*`, no `visual.fc_norm.*`) ⇒ the pooled feature is
 //! `norm(x)[:, 0]` (CLS).

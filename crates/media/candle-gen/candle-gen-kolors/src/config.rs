@@ -43,7 +43,7 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// curated ε/DDPM sampler menu (euler / euler_ancestral / heun / dpmpp_2m / dpmpp_sde / uni_pc / lcm /
 /// ddim) + the curated σ-schedule axis (normal / karras / sgm_uniform / …) are ADDED over
 /// `DiscreteModelSampling`; a curated solver name OR a curated scheduler (sc-8984) routes the new EPS
-/// path while the default request keeps the native leading-Euler loop (see [`crate::pipeline`]). The
+/// path while the default request keeps the native leading-Euler loop (see `crate::pipeline`). The
 /// `discrete` scheduler alias is retained.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {

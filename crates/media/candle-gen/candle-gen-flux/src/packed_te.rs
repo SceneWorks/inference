@@ -7,7 +7,7 @@
 //! packed triples. The stock `candle-transformers` `ClipTextTransformer` / `T5EncoderModel` build their
 //! projections through the plain `candle_nn::{linear, embedding}`, with no seam to load from packed
 //! parts. So the packed path vendors minimal **encoder-only** copies here, building every `Linear` /
-//! embedding through the packed-detecting [`crate::quant::QLinear`] / [`crate::quant::QEmbedding`]:
+//! embedding through the packed-detecting [`crate::quant::QLinear`] / `crate::quant::QEmbedding`:
 //! q4/q8 load straight from the packed parts (no dense staging), and a dense bf16 diffusers snapshot
 //! (no `.scales`) loads through the same code unchanged.
 //!

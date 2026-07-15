@@ -19,7 +19,7 @@
 //! [`TextTokenizer`]: klein with [`ChatTemplate::QwenInstructNoThink`], dev with
 //! [`ChatTemplate::Flux2DevMistral`].
 //!
-//! **Sampling (epic 7114 P4, sc-7123):** both denoise loops (txt2img [`Pipeline::render`] and the edit
+//! **Sampling (epic 7114 P4, sc-7123):** both denoise loops (txt2img `Pipeline::render` and the edit
 //! path [`Flux2Edit`]) route through the unified curated sampler/scheduler driver
 //! (`candle_gen::run_flow_sampler` / `resolve_flow_schedule`). FLUX.2 is a rectified-flow engine using
 //! the `Sigma` convention but embeds σ×1000, so the predict closure feeds `sigma * 1000.0` to the
@@ -953,7 +953,7 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
 /// ComfyUI fp8-mixed single-file (epic 10451 Phase 2e, sc-10680) — no copy, no re-download.
 /// `transformer_file` is the user's `diffusion_models/flux2_dev_fp8mixed.safetensors` (BFL-native keys,
 /// inline-scale fp8 MLPs); its keys are remapped + its fp8 weights dequanted (`w = w_fp8·weight_scale`)
-/// in memory at component build ([`convert::build_comfyui_dit_map`]). `snapshot_dir` is a resident
+/// in memory at component build (`convert::build_comfyui_dit_map`). `snapshot_dir` is a resident
 /// FLUX.2-dev diffusers snapshot supplying the Mistral text encoder, VAE, and tokenizer (none of which
 /// are in the single DiT file). `quant` (Q4/Q8) folds the dequanted DiT + the Mistral TE onto the GPU —
 /// the 32B dev does not fit dense — matching the resident dev path; `None` is fixture-only. txt2img

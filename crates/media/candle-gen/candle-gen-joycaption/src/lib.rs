@@ -8,7 +8,7 @@
 //! `candle-llava` [`core_llm::TextLlm`] vision provider (story 7634). This crate is the thin consumer
 //! seam (story 7692, the candle twin of mlx's sc-7265): it keeps the SceneWorks caption **product
 //! policy** (caption types / length templates / capability bounds / the default system prompt, in
-//! [`prompt`]) and adapts the backend-neutral [`gen_core::Captioner`] contract the worker calls onto
+//! [`prompt`]) and adapts the backend-neutral `gen_core::Captioner` contract the worker calls onto
 //! the unified engine — building the prompt text + image request and streaming the provider's tokens
 //! back.
 //!
@@ -95,7 +95,7 @@ pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaptioner> {
     })
 }
 
-/// The JoyCaption captioner: a thin adapter from the [`gen_core::Captioner`] contract onto the
+/// The JoyCaption captioner: a thin adapter from the `gen_core::Captioner` contract onto the
 /// candle-llm `candle-llava` vision provider.
 pub struct JoyCaptioner {
     descriptor: CaptionerDescriptor,

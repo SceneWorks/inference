@@ -149,7 +149,7 @@ impl ActPrecision {
     /// as `candle-gen-sana`'s `is_edge_block`: a dotted key alone cannot distinguish the trunk's final
     /// `proj_out` from a *per-block* layer that merely spells itself `proj_out`, so the provider — which
     /// knows — says so. When it does not, [`Self::for_outlier_layer`] falls back to
-    /// [`names_final_proj`], a conservative name anchor.
+    /// `names_final_proj`, a conservative name anchor.
     ///
     /// **Why this is not a bare `contains("proj_out")`.** The measurement behind the `proj_out` clause
     /// (Dense, crush 438× — sc-11045) is SANA's single *top-level* head. A bare substring also matches
@@ -533,7 +533,7 @@ impl Nvfp4Linear {
 
     /// The **NVFP4 footprint** in bytes of the weight — E2M1 nibble bytes + UE4M3 block-scale bytes
     /// (the packed host container's actual size). The resident device weight in the FP4 regime matches
-    /// this (see [`Self::resident_device_bytes`]); the SC#6 gate asserts this is ≈ the ~4.5-bit
+    /// this (see `resident_device_bytes`); the SC#6 gate asserts this is ≈ the ~4.5-bit
     /// footprint and far below the bf16 size.
     pub fn nvfp4_footprint_bytes(&self) -> usize {
         self.weight.packed.len() + self.weight.scales.len()

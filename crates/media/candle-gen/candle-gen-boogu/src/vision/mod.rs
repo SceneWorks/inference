@@ -12,7 +12,7 @@
 //!     (`linear_fc1`/`linear_fc2`, bias). No windowing (unlike Qwen2.5-VL).
 //!   - **Patch merger** — pre-shuffle `LayerNorm` → concat `merge²` (=4) group → `linear_fc1 →
 //!     GELU(exact) → linear_fc2` → `out_hidden`.
-//!   - **Deepstack** — at vision layers `deepstack_visual_indexes` ([8,16,24]), a post-shuffle-norm
+//!   - **Deepstack** — at vision layers `deepstack_visual_indexes` (`8,16,24`), a post-shuffle-norm
 //!     merger produces a feature the LM later injects into its early layers.
 //!
 //! The grid-derived host-side math (rope table, bilinear pos-embed indices/weights) mirrors the

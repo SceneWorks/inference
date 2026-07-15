@@ -18,7 +18,7 @@
 //!     `Linear → GELU → Linear` → `out_hidden`; then the window permutation is undone (`argsort`).
 //!
 //! All the integer index gymnastics depend only on `grid_thw`, so they are computed host-side in
-//! [`VisionTower::build_plan`] — mirroring the reference — and the resulting permutation / rope table /
+//! `VisionTower::build_plan` — mirroring the reference — and the resulting permutation / rope table /
 //! block masks are handed to the candle graph. Validated near-bit (f32) against the same synthetic
 //! `tests/fixtures/vision_tower_golden.safetensors` the MLX lane asserts.
 

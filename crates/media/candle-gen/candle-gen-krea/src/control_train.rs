@@ -5,8 +5,7 @@
 //! loop into a reusable [`ControlTrainer`] so a caller other than the example binary — the SceneWorks
 //! ControlNet Training Studio worker driver (epic 10159 B2 / sc-10163) — can drive a run and stream
 //! its progress. The numerics are unchanged: every step still routes through
-//! [`control_loss_grads`](crate::control::control_loss_grads) and
-//! [`probe_forward`](crate::control::probe_forward), so a run built here is bit-for-bit the run the
+//! [`control_loss_grads`] and [`probe_forward`], so a run built here is bit-for-bit the run the
 //! `krea-control-train` example produced (which now wraps this).
 //!
 //! **Seam.** The trainer owns the *optimization* concern only — the two optimizer groups (the run-3

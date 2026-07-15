@@ -84,7 +84,7 @@ impl Default for Flux2EditRequest {
 }
 
 /// Loaded FLUX.2-klein edit model: the Qwen3 text encoder + the MMDiT + the VAE **with the encoder**
-/// (the reference encode), plus the txt2img [`Pipeline`] handle (snapshot mmap + prompt encode + the
+/// (the reference encode), plus the txt2img `Pipeline` handle (snapshot mmap + prompt encode + the
 /// latent geometry/dtype). `generate` takes `&self` (no per-call mutation), so one load serves many
 /// edits.
 pub struct Flux2Edit {
@@ -148,7 +148,7 @@ impl Flux2Edit {
 
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
     /// as the registry FLUX.2 provider; edit composes the FLUX.2 VAE so it loads the **same**
-    /// [`PID_BACKBONE`] (`flux2`) student. A `use_pid = true` request then decodes through it (4× SR)
+    /// `PID_BACKBONE` (`flux2`) student. A `use_pid = true` request then decodes through it (4× SR)
     /// instead of the native VAE; without it, `use_pid` errors loudly. Call after [`load`](Self::load).
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
         self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.pipe.device)?);

@@ -1,7 +1,7 @@
 //! The Lens denoising **DiT** (`LensTransformer2DModel`, sc-5112) — a 48-layer dual-stream MMDiT with
 //! joint image+text attention, complex axial RoPE on both streams, and SwiGLU MLPs. A from-scratch
 //! candle port of the vendor `LensTransformer2DModel`, architecturally a near-twin of
-//! [`candle-gen-qwen-image`]'s MMDiT (the RoPE, joint attention, AdaLN modulation and
+//! `candle-gen-qwen-image`'s MMDiT (the RoPE, joint attention, AdaLN modulation and
 //! `AdaLayerNormContinuous` all follow that seam). The Lens-specific pieces are:
 //!
 //! - a **multi-layer text front-end** — the 4 captured gpt-oss layers (each `[B, txt, 2880]`) get a
@@ -648,7 +648,7 @@ impl LensTransformer {
     }
 
     /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the projection's
-    /// canonical DiT dotted path — the same paths [`crate::adapters::classify_lora_key`] resolves a LoRA
+    /// canonical DiT dotted path — the same paths `crate::adapters::classify_lora_key` resolves a LoRA
     /// key to (`img_in`, `txt_in`, `proj_out`, and each `transformer_blocks.{i}` attention + SwiGLU
     /// projection). The additive installer ([`crate::adapters::install_additive`]) pushes a resolved
     /// LoRA/LoKr residual onto each matched projection so a user adapter applies on a packed q4/q8 tier

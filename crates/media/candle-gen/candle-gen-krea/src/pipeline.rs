@@ -71,7 +71,7 @@ pub const MAX_EDIT_REFERENCES: usize = 2;
 /// in the condition encoder (sc-9047).
 ///
 /// The **single** canonical cap for the whole crate (sc-11205 / F-120): the inference pipeline, the LoRA
-/// trainer ([`crate::training`]), the ControlNet provider/trainer, and the `krea-control-*` example
+/// trainer (`crate::training`), the ControlNet provider/trainer, and the `krea-control-*` example
 /// binaries all import THIS constant. Keeping one definition means raising the cap can never leave the
 /// inference and training/control lanes sized differently — a mismatch that surfaced only as the opaque
 /// `narrow` error sc-9047 eliminated. `pub` (not `pub(crate)`) so the example crates — compiled as
@@ -127,7 +127,7 @@ pub(crate) struct KreaHeavy {
 
 /// The loaded Krea 2 Turbo components, `Arc`-shared so the generator caches them across `generate`.
 ///
-/// The **`Resident`** aggregate of both phases ([`KreaText`] + [`KreaHeavy`]), held co-resident for the
+/// The **`Resident`** aggregate of both phases (`KreaText` + `KreaHeavy`), held co-resident for the
 /// whole job and across jobs via the generator's cache — exactly as before the sc-12089 phase split. The
 /// split is an internal seam: every public `render*` entry point still takes `&Components` and runs the
 /// same encode→denoise→decode body, so the resident path is byte-untouched (zero parity risk).
@@ -335,8 +335,8 @@ pub fn render(
 /// Peak allocation demand is bounded to max(TE, DiT+VAE+activations) instead of their sum, reclaiming
 /// the ~2.9 GB (Q4) Qwen3-VL-4B encoder before the 12B DiT materializes.
 ///
-/// Output is **byte-identical** to [`render`] — the SAME [`encode_prompt_context`] and the SAME
-/// [`render_from_context`] tail run, in the same order; only the load/free schedule differs. That is the
+/// Output is **byte-identical** to [`render`] — the SAME `encode_prompt_context` and the SAME
+/// `render_from_context` tail run, in the same order; only the load/free schedule differs. That is the
 /// zero-parity-risk property the split was built for.
 ///
 /// Selected by the generator from `LoadSpec::offload_policy` (the worker fit-gate sets `Sequential`) or
@@ -533,12 +533,12 @@ fn render_from_context(
 /// sibling of [`render`] seeded from a VAE-encoded reference instead of pure noise. The candle/CUDA twin
 /// of mlx-gen-krea's `generate_turbo_img2img` (mlx A1, sc-8590). The mechanism (the fork's `LatentCreator`
 /// img2img leaves, ported byte-for-byte from `mlx_gen::img2img`):
-/// 1. LANCZOS-resize the reference to the target resolution ([`preprocess_img2img_init`]), VAE-encode it
+/// 1. LANCZOS-resize the reference to the target resolution (`preprocess_img2img_init`), VAE-encode it
 ///    to the normalized `[1,16,H/8,W/8]` **clean** latent — the same space as the init noise.
 /// 2. `start = init_time_step(steps, strength)` = `max(1, floor(steps·strength))` (reference fidelity:
 ///    higher strength → later start → closer to the reference — the fork's convention, NOT SDXL's).
 /// 3. Blend `x_start = (1−σ_start)·clean + σ_start·noise` at `σ_start = sigmas[start]`
-///    ([`add_noise_by_interpolation`]).
+///    (`add_noise_by_interpolation`).
 /// 4. Run the CFG-free rectified-flow Euler loop over `sigmas[start..]` from `x_start` (one DiT
 ///    forward/step, exactly as [`render`]).
 ///
@@ -578,7 +578,7 @@ pub fn render_img2img(
 /// The VAE encoder loads on the heavy side (after the drop) rather than alongside the text phase: it is
 /// small, and the reference encode is not needed until the init latent is built, so keeping it heavy-side
 /// preserves the max(TE, heavy) peak. Output is **byte-identical** to [`render_img2img`] — the same
-/// encode and the same [`render_img2img_from_context`] tail, in the same order.
+/// encode and the same `render_img2img_from_context` tail, in the same order.
 ///
 /// Wired because `krea_2_turbo` advertises BOTH `ConditioningKind::Reference` and
 /// `supports_sequential_offload` — unlike flux/flux2/qwen-image, whose sequential engines take no
@@ -705,7 +705,7 @@ fn render_img2img_from_context(
 /// Render the **Raw** (undistilled, full classifier-free-guidance) rectified-flow text-to-image path
 /// for `req` (`krea_2_raw`, epic 9992 / sc-9994) — the CFG sibling of [`render`]. Two DiT forwards per
 /// step, the conditional (positive prompt) and the unconditional (the user negative prompt, or `""`
-/// when none), combined by the **reference** `sampling.py:129` formula via [`krea_cfg_combine`]
+/// when none), combined by the **reference** `sampling.py:129` formula via `krea_cfg_combine`
 /// (`v = cond + guidance·(cond − uncond)`, NOT the textbook `uncond + g·Δ`: Krea's guidance is offset by
 /// one). `guidance ≤ 0` short-circuits to a single conditional forward (the uncond context is never
 /// encoded), matching the reference `cfg = guidance > 0`. Unlike Turbo's fixed `mu = 1.15`, the schedule
@@ -737,8 +737,8 @@ pub fn render_base(
 ///
 /// Both branches must be encoded before the drop — the denoise consumes the uncond context every step,
 /// so a text phase dropped after only the positive encode would have to reload. Output is
-/// **byte-identical** to [`render_base`]: the SAME [`encode_base_contexts`] and the SAME
-/// [`render_base_from_contexts`] tail, only the load/free schedule differs. See [`render_sequential`]
+/// **byte-identical** to [`render_base`]: the SAME `encode_base_contexts` and the SAME
+/// `render_base_from_contexts` tail, only the load/free schedule differs. See [`render_sequential`]
 /// for the selection contract and the cudarc measurement caveat.
 pub fn render_base_sequential(
     root: &Path,
@@ -872,16 +872,16 @@ fn render_base_from_contexts(
 /// instead of pure noise, and the full-CFG sibling of the CFG-free Turbo [`render_img2img`]. The
 /// candle/CUDA twin of mlx-gen-krea's `generate_base_img2img_with_progress` (mlx A5a, sc-10224). It is
 /// exactly [`render_base`]'s undistilled two-forward CFG denoise (resolution-dynamic [`base_schedule`],
-/// the reference [`krea_cfg_combine`] combine, an optional user negative prompt) run over the
+/// the reference `krea_cfg_combine` combine, an optional user negative prompt) run over the
 /// reference-seeded init latent + reduced schedule of [`render_img2img`]:
-/// 1. LANCZOS-resize the reference to the target resolution ([`preprocess_img2img_init`]), VAE-encode it
+/// 1. LANCZOS-resize the reference to the target resolution (`preprocess_img2img_init`), VAE-encode it
 ///    to the normalized `[1,16,H/8,W/8]` **clean** latent (the same space as the init noise).
 /// 2. `start = init_time_step(steps, strength)` (the fork's reference-fidelity convention: higher
 ///    strength → later start → closer to the reference — NOT SDXL's).
 /// 3. Blend `x_start = (1−σ_start)·clean + σ_start·noise` at `σ_start = sigmas[start]`
-///    ([`add_noise_by_interpolation`]).
+///    (`add_noise_by_interpolation`).
 /// 4. Run the Raw CFG rectified-flow Euler loop over `sigmas[start..]` from `x_start` — two DiT forwards
-///    per step when `guidance > 0` (cond vs uncond, combined by [`krea_cfg_combine`]), one otherwise,
+///    per step when `guidance > 0` (cond vs uncond, combined by `krea_cfg_combine`), one otherwise,
 ///    exactly as [`render_base`].
 ///
 /// The condition/uncondition encode, dynamic schedule, and PiD/native decode seam are identical to
@@ -923,8 +923,8 @@ pub fn render_base_img2img(
 /// CFG branches → **DROP** it → load the DiT + VAE (+ optional PiD) AND the VAE *encoder* →
 /// reference-encode → two-forward CFG denoise/decode.
 ///
-/// Output is **byte-identical** to [`render_base_img2img`]: the same [`encode_base_contexts`] and the
-/// same [`render_base_img2img_from_contexts`] tail. Wired for the same reason as
+/// Output is **byte-identical** to [`render_base_img2img`]: the same `encode_base_contexts` and the
+/// same `render_base_img2img_from_contexts` tail. Wired for the same reason as
 /// [`render_img2img_sequential`] — `krea_2_raw` advertises both `Reference` and
 /// `supports_sequential_offload`, so every request it accepts must honor the staged peak the fit-gate
 /// predicts.

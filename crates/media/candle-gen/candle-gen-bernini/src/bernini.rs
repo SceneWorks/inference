@@ -11,7 +11,7 @@
 //!     → z16 VAE decode → image (1 frame) / video
 //! ```
 //!
-//! The planner ([`BerniniPlanner`]) is Qwen2.5-VL-7B (penultimate extractor) + [`MlpConnector`] +
+//! The planner (`BerniniPlanner`) is Qwen2.5-VL-7B (penultimate extractor) + [`MlpConnector`] +
 //! [`DiffLossFm`] clip-diff head + the MAR mask token; the renderer is the existing dual-expert
 //! [`WanTransformer`] MoE + UMT5 + z16 VAE. This assembles the `*_wapg` / `v2v_apg` ViT-conditioned
 //! guidance modes ([`crate::forward::vit_one_step`]) that sc-11004 flagged as pending — the planner's
@@ -20,7 +20,7 @@
 //! **Weights.** The renderer tier (`transformer/` `transformer_2/` `text_encoder/` `vae/` `tokenizer/`)
 //! is produced by [`crate::convert::build_bernini_candle_tier`]; the planner components (`mllm/`
 //! `connector/` `vit_decoder/` `mask_tokens.safetensors` + `qwen2_5_vl_config.json`) are the additional
-//! candle turnkey layout this loader reads (see [`BerniniPlanner::load`]). The full 168 GB
+//! candle turnkey layout this loader reads (see `BerniniPlanner::load`). The full 168 GB
 //! `ByteDance/Bernini-Diffusers` weights are NOT downloaded here; real-weight semantic GPU-val is sc-11003.
 //!
 //! **Validation without real weights.** The registered generator loads lazily, so registration, the
@@ -603,7 +603,7 @@ struct Components {
 }
 
 /// The loaded full Bernini pipeline: the snapshot dir + the resolved renderer knobs, with the heavy
-/// renderer components ([`Components`]) loaded lazily on the first `generate` and cached (F-097). The
+/// renderer components (`Components`) loaded lazily on the first `generate` and cached (F-097). The
 /// planner is intentionally **not** cached — it is loaded, used, and dropped per request (peak VRAM).
 pub struct Bernini {
     descriptor: ModelDescriptor,

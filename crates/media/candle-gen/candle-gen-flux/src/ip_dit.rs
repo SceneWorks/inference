@@ -612,7 +612,7 @@ impl IpFlux {
     /// The upstream FLUX `forward`, plus the optional XLabs IP injector threaded into every double
     /// block. `ip = None` is byte-identical to candle-transformers `Flux::forward`.
     ///
-    /// A thin wrapper over the shared [`forward_core`](Self::forward_core): the XLabs IP seam is the
+    /// A thin wrapper over the shared `forward_core`: the XLabs IP seam is the
     /// mid-block one (threaded into `block.forward`), so this engages ONLY `ip` — no post-block
     /// [`DitImageInjector`] and no control residuals. Byte-identical to the pre-consolidation body: with
     /// `injector = None` / `control = None` every post-block `if let Some(..)` is skipped and the loop
@@ -644,7 +644,7 @@ impl IpFlux {
     /// `flux/model.py` PuLID injection points (every 2nd double, every 4th single). The XLabs IP seam is
     /// NOT engaged here (`ip = None` into the blocks) — PuLID uses only the post-block residuals.
     ///
-    /// A thin wrapper over [`forward_core`](Self::forward_core) engaging only the post-block `injector`
+    /// A thin wrapper over `forward_core` engaging only the post-block `injector`
     /// (`ip = None`, `control = None`).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_injected(
@@ -663,22 +663,22 @@ impl IpFlux {
         )
     }
 
-    /// As [`forward_injected`], but ALSO threading the Fun-Controlnet-Union per-double-block residuals
+    /// As `forward_injected`, but ALSO threading the Fun-Controlnet-Union per-double-block residuals
     /// (sc-8412) — the Shakker `FLUX.1-dev-ControlNet-Union-Pro-2.0` path. `control = (residuals,
     /// scale)` is the (already-computed, pre-injection) control-branch output: one residual per control
     /// double block, added to the base **image** stream after base double block `i` at the diffusers
     /// interval `ceil(num_double_blocks / num_residuals)`, scaled by `scale`. With `control = None` this
-    /// is byte-identical to [`forward_injected`] (and so, with `injector = None` too, to the plain
+    /// is byte-identical to `forward_injected` (and so, with `injector = None` too, to the plain
     /// [`forward`](Self::forward)).
     ///
     /// **Compose-ready** (the candle twin of the mlx `forward_control` seam): the per-block `injector`
-    /// (PuLID / XLabs IP-Adapter) is consulted at the SAME points as in [`forward_injected`], so a
+    /// (PuLID / XLabs IP-Adapter) is consulted at the SAME points as in `forward_injected`, so a
     /// future epic can stack identity + control in one denoise (`injector = Some(..)` AND
     /// `control = Some(..)`). The control residual is added AFTER the injector's `after_double` residual,
     /// matching diffusers' FLUX ControlNet order (the controlnet sample is added to the post-block
     /// hidden state).
     ///
-    /// A thin wrapper over [`forward_core`](Self::forward_core) engaging the post-block `injector` and
+    /// A thin wrapper over `forward_core` engaging the post-block `injector` and
     /// `control` (the XLabs mid-block `ip` seam is `None` here).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_control(

@@ -502,7 +502,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// Krea 2 **Raw** identity + capabilities (sc-9994 / epic 9992) — the undistilled 12B DiT run with
 /// **true classifier-free guidance** (two DiT forwards/step: cond vs uncond) at 52 steps, unlike the
 /// CFG-free distilled Turbo. Same architecture / snapshot layout as Turbo (only the DiT weights differ,
-/// distilled vs base), so it shares [`build`] + the whole [`pipeline`]. Exposes a real guidance scale
+/// distilled vs base), so it shares `build` + the whole [`pipeline`]. Exposes a real guidance scale
 /// AND a user negative prompt (unlike Turbo / Boogu base, which fixes the uncond to the empty prompt).
 /// NOT guidance-distilled, so `supports_true_cfg` stays false — the two-forward CFG IS the guidance
 /// (the Boogu-base precedent). Derived from [`descriptor`] so the shared surface (family / backend /
@@ -525,7 +525,7 @@ pub fn raw_descriptor() -> ModelDescriptor {
 /// variant. Derived from [`raw_descriptor`] (the edit runs the undistilled **full-CFG** loop from pure
 /// noise, with the references as in-context conditioning), so it inherits the Raw surface — real
 /// guidance + a user negative prompt, packed quants, LoRA/LoKr (the edit LoRA merges through the shared
-/// [`build`] adapter path) — and additionally advertises the source-reference conditioning:
+/// `build` adapter path) — and additionally advertises the source-reference conditioning:
 /// [`ConditioningKind::Reference`] for a single source and [`ConditioningKind::MultiReference`] for two
 /// (image 1, then image 2; [`pipeline::MAX_EDIT_REFERENCES`]).
 pub fn edit_descriptor() -> ModelDescriptor {
@@ -693,7 +693,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 /// Construct a lazy candle Krea 2 **Raw** generator (`krea_2_raw`, sc-9994 / epic 9992). Identical
 /// snapshot assembly to [`load`] — the Raw + Turbo turnkeys share the exact architecture / weight layout
-/// (only distilled-vs-base DiT weights differ), so one [`build`] serves both — but stores the CFG-capable
+/// (only distilled-vs-base DiT weights differ), so one `build` serves both — but stores the CFG-capable
 /// [`raw_descriptor`] so `generate` runs the full-CFG [`pipeline::render_base`] path. Accepts the same
 /// LoRA/LoKr, PiD, and packed-quant surface as Turbo; the ConvRot / ControlNet rejections are shared.
 pub fn load_raw(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
@@ -701,7 +701,7 @@ pub fn load_raw(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 /// Construct a lazy candle Krea 2 **Edit** generator (`krea_2_edit`, epic 10871 / sc-11085). Identical
-/// snapshot assembly to [`load`] / [`load_raw`] — one [`build`] serves all three ids — but stores the
+/// snapshot assembly to [`load`] / [`load_raw`] — one `build` serves all three ids — but stores the
 /// [`edit_descriptor`] so `generate` routes the reference-conditioned [`pipeline::render_edit`] path and
 /// lazily loads the edit-only components (VAE encoder + vision tower). The edit LoRA rides the shared
 /// `spec.adapters` merge path, exactly like a Raw-trained adapter on the txt2img ids.

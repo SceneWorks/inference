@@ -146,15 +146,15 @@ pub fn preprocess_control_image(
 /// post-process), reading the output size from the decoded tensor (never `latent·8`, since PiD emits a
 /// larger `[1, 3, 4H, 4W]`).
 ///
-/// **Latent convention (sc-7848 parity):** the native VAE path un-scales by [`VAE_SCALE`] (candle
+/// **Latent convention (sc-7848 parity):** the native VAE path un-scales by `VAE_SCALE` (candle
 /// de-scales in the pipeline, not inside `vae.decode`), while the PiD `sdxl` student was trained on the
 /// **0.13025-normalized** latent — the scaled sampler output — so it receives `latents` unchanged.
-/// This mirrors [`crate::pipeline::Pipeline::decode`] exactly.
+/// This mirrors `crate::pipeline::Pipeline::decode` exactly.
 ///
-/// The native VAE decode routes through the shared [`crate::pipeline::tiled_vae_decode`] (F-061 /
+/// The native VAE decode routes through the shared `crate::pipeline::tiled_vae_decode` (F-061 /
 /// sc-9045), so every bespoke lane that calls this — the trainer preview, the IP / edit / InstantID
 /// providers — gets the same sc-4987 budgeted VAE tiling the registered
-/// [`crate::pipeline::Pipeline::decode`] path uses. The tiling only bounds peak VRAM on large latents
+/// `crate::pipeline::Pipeline::decode` path uses. The tiling only bounds peak VRAM on large latents
 /// (>512² output); ≤512² decodes are byte-identical to the prior monolithic path. `pid = None` is
 /// byte-identical to the pre-sc-8373 signature.
 pub fn decode_image(
@@ -358,7 +358,7 @@ pub fn denoise_ip_control(
 
 /// Curated unified-sampler **conditioned** denoise (epic 7114, sc-7297) — the **additive** k-diffusion
 /// alternative to InstantID's bespoke ancestral default and Kolors' bespoke leading-Euler default, the
-/// candle twin of `mlx-gen-sdxl::denoise_curated`. Drives any curated [`gen_core::sampling::Solver`]
+/// candle twin of `mlx-gen-sdxl::denoise_curated`. Drives any curated `gen_core::sampling::Solver`
 /// (`euler` / `euler_ancestral` / `heun` / `dpmpp_2m` / `dpmpp_sde` / `uni_pc` / `lcm` / `ddim`) over a
 /// [`DiscreteModelSampling`] (ε-prediction) + a resolved σ schedule through the shared
 /// [`candle_gen::run_curated_sampler`], threading the SAME dual conditioning the bespoke loops carry:
@@ -370,9 +370,9 @@ pub fn denoise_ip_control(
 /// context is set, so one function serves ControlNet-only, IP-only, dual (InstantID), and plain modes.
 ///
 /// The latents live in raw k-diffusion VE σ-space (`x = ε·σ_max` at the start — built by the caller);
-/// the UNet input is `x/√(σ²+1)` ([`DiscreteModelSampling::input_scale`]), cast to `dtype` (f16 for
+/// the UNet input is `x/√(σ²+1)` (`DiscreteModelSampling::input_scale`), cast to `dtype` (f16 for
 /// InstantID, f32 for Kolors) inside the predict closure. The conditioning `timestep` is the nearest
-/// training index ([`DiscreteModelSampling::timestep`]) — ComfyUI's behaviour for a discrete model under
+/// training index (`DiscreteModelSampling::timestep`) — ComfyUI's behaviour for a discrete model under
 /// a curated solver. The output is returned in `dtype`, ready for the caller's decode.
 ///
 /// `conditioning` / `pooled` / `time_ids` / `controlnet_encoder` are already **CFG-batched** by the
