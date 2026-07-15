@@ -157,8 +157,11 @@ fn linear_b(x: &Array, w: &Array, b: &Array) -> Result<Array> {
 /// (they carry `.scales` on disk); every other tensor (norms, adaLN modulation, patchify, pooler,
 /// caption/time embed, proj_out) stays dense. `.scales` presence is the per-Linear signal, exactly as
 /// the Wan packed-load path and mirroring the reference `nn.quantize` predicate.
+///
+/// Public so the quant-parity gate (`tests/quant_parity.rs`) can drive the exact packed-load compute
+/// path (`.scales` probe → `quantized_matmul`) on a single Linear slice.
 #[derive(Clone)]
-enum MochiLinear {
+pub enum MochiLinear {
     /// Dense base — `matmul(x, Wᵀ)` (`+ b` fused via `addmm` when biased). Bit-identical to the
     /// previous raw-`Array` path (f32 activations make `addmm == matmul + add`).
     Dense { w: Array, b: Option<Array> },
@@ -179,7 +182,7 @@ impl MochiLinear {
     /// Linear carries a `{prefix}.scales` pack on disk, consume the packed parts directly (the
     /// pre-quantized tier / `convert.rs` output). Otherwise load dense at `dtype`. The `.scales` probe
     /// is what makes a single tier dir mix packed attention/FFN Linears with dense norms/embeds.
-    fn load(
+    pub fn load(
         w: &Weights,
         prefix: &str,
         bias: bool,
@@ -215,7 +218,7 @@ impl MochiLinear {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    pub fn forward(&self, x: &Array) -> Result<Array> {
         match self {
             MochiLinear::Dense { w, b } => match b {
                 Some(b) => linear_b(x, w, b),
@@ -883,7 +886,69 @@ impl MochiTransformer3DModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::subtract;
+    use mlx_rs::ops::{max as mx_max, quantize, subtract};
+
+    /// Weightless packer round-trip: quantize a synthetic bf16 Linear, consume it through
+    /// [`MochiLinear::load`] (the `.scales` probe), and check the packed forward is finite,
+    /// deterministic, and a bounded perturbation of the dense forward. No golden / real weights — the
+    /// CI-green counterpart to the fixture bit-exact gate (`tests/quant_parity.rs`).
+    #[test]
+    fn packed_linear_round_trip_matches_dense_within_quant_error() {
+        // `[out, in]` weight (in divisible by group 64) + f32 activations, the Mochi compute regime.
+        let (out_f, in_f, b) = (128i32, 256i32, 5i32);
+        let w = rnd(&[out_f, in_f], 7).as_dtype(Dtype::Bfloat16).unwrap();
+        let x = rnd(&[b, in_f], 8); // f32
+
+        let dense = MochiLinear::Dense {
+            w: w.as_dtype(Dtype::Float32).unwrap(),
+            b: None,
+        };
+        let y_dense = dense.forward(&x).unwrap();
+
+        for bits in [4, 8] {
+            let (wq, scales, biases) = quantize(&w, 64, bits).unwrap();
+            let mut packed = Weights::empty();
+            packed.insert("slice.weight".to_string(), wq);
+            packed.insert("slice.scales".to_string(), scales);
+            packed.insert("slice.biases".to_string(), biases);
+            let quant = Some(MochiQuant { bits, group: 64 });
+            let lin = MochiLinear::load(&packed, "slice", false, quant, Dtype::Float32).unwrap();
+            assert!(
+                matches!(lin, MochiLinear::Quant { .. }),
+                "scales ⇒ quantized"
+            );
+
+            let y = lin.forward(&x).unwrap();
+            assert_eq!(y.shape(), y_dense.shape());
+            assert!(y.as_slice::<f32>().iter().all(|v| v.is_finite()));
+
+            // Determinism.
+            let y2 = lin.forward(&x).unwrap();
+            let ddet = mx_max(mlx_rs::ops::abs(subtract(&y, &y2).unwrap()).unwrap(), None)
+                .unwrap()
+                .item::<f32>();
+            assert_eq!(ddet, 0.0, "packed forward is deterministic");
+
+            // Bounded quant perturbation vs dense (relative). Q8 tighter than Q4; both far below a
+            // structural break.
+            let num = mx_max(
+                mlx_rs::ops::abs(subtract(&y, &y_dense).unwrap()).unwrap(),
+                None,
+            )
+            .unwrap()
+            .item::<f32>();
+            let den = mx_max(mlx_rs::ops::abs(&y_dense).unwrap(), None)
+                .unwrap()
+                .item::<f32>()
+                .max(1e-6);
+            let rel = num / den;
+            let bound = if bits == 4 { 0.5 } else { 0.2 };
+            assert!(
+                rel < bound,
+                "Q{bits} round-trip rel {rel:.3e} exceeds {bound}"
+            );
+        }
+    }
 
     /// Deterministic small "random" fill, bounded so the block stays well-conditioned.
     fn rnd(shape: &[i32], seed: u64) -> Array {

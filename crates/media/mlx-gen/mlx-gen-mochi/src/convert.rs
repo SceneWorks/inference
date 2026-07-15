@@ -129,10 +129,12 @@ fn cast_floats_bf16(map: &mut HashMap<String, Array>) -> Result<()> {
     Ok(())
 }
 
-/// Selectively quantize the [`MOCHI_QUANT_SUFFIXES`] Linears in place: each matched `{base}.weight`
-/// (bf16) becomes `{base}.weight`(u32 packed) + `{base}.scales` + `{base}.biases` via MLX `quantize`.
-/// Non-matching tensors (norms, adaLN, biases, embeds, `proj_out`) pass through untouched.
-fn quantize_transformer(
+/// Selectively quantize the [`MOCHI_QUANT_SUFFIXES`] Linears in a transformer weight map: each matched
+/// `{base}.weight` (bf16) becomes `{base}.weight`(u32 packed) + `{base}.scales` + `{base}.biases` via
+/// MLX `quantize`. Non-matching tensors (norms, adaLN, biases, embeds, `proj_out`) pass through
+/// untouched. This is the packing `convert_and_assemble` applies; exposed for the quant-parity gate
+/// (`tests/quant_parity.rs`, the convert-then-load route).
+pub fn quantize_transformer_map(
     m: HashMap<String, Array>,
     bits: i32,
     group_size: i32,
@@ -219,7 +221,7 @@ pub fn convert_and_assemble(
     cast_floats_bf16(&mut transformer)?;
     let n_quant = if opts.quantize {
         let before = transformer.keys().filter(|k| is_quant_target(k)).count();
-        transformer = quantize_transformer(transformer, opts.bits, opts.group_size)?;
+        transformer = quantize_transformer_map(transformer, opts.bits, opts.group_size)?;
         before
     } else {
         0

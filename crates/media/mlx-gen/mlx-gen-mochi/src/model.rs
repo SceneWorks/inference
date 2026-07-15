@@ -6,8 +6,10 @@
 //! follow-ons sc-11998/sc-11997). It is **not** distilled, so it exposes **true CFG**
 //! (negative prompt + `guidance` scale). Quant tiers ship as **pre-quantized per-tier checkpoints**
 //! (epic 1788 architecture / A6 sc-11990), *not* on-the-fly requant, so [`Capabilities::supported_quants`]
-//! is empty and `load` rejects a stray `spec.quantize` rather than silently ignoring it. The
-//! denoise/decode itself lives in [`crate::pipeline`].
+//! is empty: the tier dir's `split_model.json` *is* the quant selection. `load` reads that manifest
+//! and, when a caller does pass `spec.quantize`, only *asserts* it against the manifest (a mismatch is
+//! a hard error — never a silent bf16 run or an on-the-fly requant). The denoise/decode itself lives
+//! in [`crate::pipeline`].
 
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Dtype};
