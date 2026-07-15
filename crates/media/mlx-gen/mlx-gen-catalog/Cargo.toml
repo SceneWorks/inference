@@ -23,6 +23,7 @@ mlx-gen-kolors = { path = "../mlx-gen-kolors" }
 mlx-gen-krea = { path = "../mlx-gen-krea" }
 mlx-gen-lens = { path = "../mlx-gen-lens" }
 mlx-gen-ltx = { path = "../mlx-gen-ltx" }
+mlx-gen-mochi = { path = "../mlx-gen-mochi" }
 mlx-gen-pid = { path = "../mlx-gen-pid" }
 mlx-gen-pulid = { path = "../mlx-gen-pulid" }
 mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }

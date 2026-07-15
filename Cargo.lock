@@ -2321,6 +2321,7 @@ dependencies = [
  "mlx-gen-krea",
  "mlx-gen-lens",
  "mlx-gen-ltx",
+ "mlx-gen-mochi",
  "mlx-gen-pid",
  "mlx-gen-pulid",
  "mlx-gen-qwen-image",

@@ -28,6 +28,7 @@ pub mod providers {
     pub use mlx_gen_krea as krea;
     pub use mlx_gen_lens as lens;
     pub use mlx_gen_ltx as ltx;
+    pub use mlx_gen_mochi as mochi;
     pub use mlx_gen_pid as pid;
     pub use mlx_gen_pulid as pulid;
     pub use mlx_gen_qwen_image as qwen_image;
@@ -64,6 +65,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_krea::register_providers(registry);
     let registry = mlx_gen_lens::register_providers(registry);
     let registry = mlx_gen_ltx::register_providers(registry);
+    let registry = mlx_gen_mochi::register_providers(registry);
     let registry = mlx_gen_pulid::register_providers(registry);
     let registry = mlx_gen_qwen_image::register_providers(registry);
     let registry = mlx_gen_sana::register_providers(registry);
@@ -174,6 +176,7 @@ mod tests {
                 "lens_turbo",
                 "lens",
                 "ltx_2_3",
+                "mochi_1",
                 "pulid_flux",
                 "qwen_image",
                 "qwen_image_control",
