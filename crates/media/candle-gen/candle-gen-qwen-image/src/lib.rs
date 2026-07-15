@@ -342,9 +342,7 @@ impl Pipeline {
                 comps.vae.as_ref(),
                 comps.pid.as_deref(),
             ),
-            HeavyPhase::Sequential(heavy) => {
-                (&heavy.transformer, &heavy.vae, heavy.pid.as_deref())
-            }
+            HeavyPhase::Sequential(heavy) => (&heavy.transformer, &heavy.vae, heavy.pid.as_deref()),
         };
         self.denoise_and_decode(
             req,
@@ -511,7 +509,6 @@ impl Pipeline {
             pid: self.load_pid(use_pid)?,
         })
     }
-
 }
 
 /// The MLX packed `group_size` for the DiT, read from `transformer/config.json`'s `quantization`
@@ -589,9 +586,7 @@ impl Generator for QwenImageGenerator {
             req.use_pid,
             on_progress,
             |text| self.pipe.encode_phase(text, req),
-            |heavy, encoded, on_progress| {
-                self.pipe.render_phase(heavy, req, encoded, on_progress)
-            },
+            |heavy, encoded, on_progress| self.pipe.render_phase(heavy, req, encoded, on_progress),
         )?;
         Ok(GenerationOutput::Images(images))
     }
@@ -859,10 +854,15 @@ mod tests {
             count: 1,
             ..Default::default()
         };
-        let sampler = candle_gen::testkit::PeakSampler::start(0);
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
+        let load_phase = probe.phase();
         let g = load(&spec).expect("load qwen_image");
+        probe.end_load(load_phase);
+        let generate_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
-        let peak_mib = sampler.stop();
+        probe.end_gen(generate_phase);
+        let report = probe.report().assert_trustworthy(1.0);
+        let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
         let img = match output {
             GenerationOutput::Images(mut v) => v.remove(0),
             other => panic!("expected images, got {other:?}"),
@@ -877,7 +877,8 @@ mod tests {
             "resident"
         };
         eprintln!(
-            "SEQ_AB mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
+            "SEQ_AB mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
+            candle_gen::testkit::probe_gpu(),
             img.pixels.len(),
             img.width,
             img.height

@@ -308,10 +308,7 @@ impl QwenEdit {
             move || {
                 Ok((
                     EditText {
-                        vl_encoder: load_vision_language_encoder(
-                            &resident_root,
-                            &resident_device,
-                        )?,
+                        vl_encoder: load_vision_language_encoder(&resident_root, &resident_device)?,
                         vae_encoder: QwenVaeEncoder::new(component_vb(
                             &resident_root,
                             "vae",
@@ -354,12 +351,7 @@ impl QwenEdit {
                         DIT_DTYPE,
                         &heavy_device,
                     )?,
-                    vae: QwenVae::new(component_vb(
-                        &heavy_root,
-                        "vae",
-                        ENC_DTYPE,
-                        &heavy_device,
-                    )?)?,
+                    vae: QwenVae::new(component_vb(&heavy_root, "vae", ENC_DTYPE, &heavy_device)?)?,
                 })
             },
         )?;
@@ -557,14 +549,7 @@ impl QwenEdit {
             &req.cancel,
             false,
             on_progress,
-            |text| {
-                self.encode_conditioning(
-                    &text.vl_encoder,
-                    &text.vae_encoder,
-                    req,
-                    references,
-                )
-            },
+            |text| self.encode_conditioning(&text.vl_encoder, &text.vae_encoder, req, references),
             |heavy, (pos, neg, static_latents, cond_grids), on_progress| {
                 self.denoise_and_decode(
                     &heavy.transformer,
@@ -716,7 +701,7 @@ mod tests {
     #[ignore = "needs QWEN_EDIT_SNAPSHOT + QWEN_EDIT_REF (a reference PPM) + a CUDA GPU"]
     fn qwen_edit_probed_generate_for_offload_ab() {
         use candle_gen::gen_core::AdapterKind;
-        use candle_gen::testkit::{env_path, read_ppm, PeakSampler};
+        use candle_gen::testkit::{env_path, probe_gpu, read_ppm, VramProbe};
 
         let root = env_path("QWEN_EDIT_SNAPSHOT");
         let out = std::env::var("QWEN_OUT").expect("set QWEN_OUT to the pixel-dump path");
@@ -758,17 +743,22 @@ mod tests {
             ..Default::default()
         };
 
-        let sampler = PeakSampler::start(0);
+        let mut probe = VramProbe::start_rendered();
+        let load_phase = probe.phase();
         let model = QwenEdit::load(&QwenEditPaths {
             root,
             adapters,
             offload_policy,
         })
         .expect("load QwenEdit");
+        probe.end_load(load_phase);
+        let generate_phase = probe.phase();
         let img = model
             .generate(&req, &[reference], &mut |_| {})
             .expect("generate");
-        let peak_mib = sampler.stop();
+        probe.end_gen(generate_phase);
+        let report = probe.report().assert_trustworthy(1.0);
+        let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
         let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
@@ -781,7 +771,8 @@ mod tests {
         };
         let path = if lightning { "lightning" } else { "base" };
         eprintln!(
-            "SEQ_AB path={path} mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
+            "SEQ_AB path={path} mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
+            probe_gpu(),
             img.pixels.len(),
             img.width,
             img.height

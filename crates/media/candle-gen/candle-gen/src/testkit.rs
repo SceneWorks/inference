@@ -195,7 +195,7 @@ pub fn require_hf_snapshot_dir(repo: &str) -> PathBuf {
 // GPU peak-VRAM sampler (device-level `nvidia-smi memory.used`) — used by the video-VAE decode sweeps
 // ---------------------------------------------------------------------------------------------------
 
-pub use gpu_peak::{used_mib, PeakSampler};
+pub use gpu_peak::{probe_gpu, used_mib, PeakSampler};
 pub use vram_probe::{VramProbe, VramReport};
 
 mod vram_probe {
@@ -220,7 +220,7 @@ mod vram_probe {
     //!
     //! Usage from a provider example (load and generate are separate phases, so their peaks separate):
     //! ```ignore
-    //! let mut probe = VramProbe::start(0);          // records the idle baseline
+    //! let mut probe = VramProbe::start_rendered(); // records the rendered GPU's idle baseline
     //! let load = probe.phase();                     // sample across load
     //! let gen = provider_registry.load(id, &spec)?; //   ... weights → device ...
     //! probe.end_load(load);                         // load peak recorded; steady sampled now
@@ -230,7 +230,7 @@ mod vram_probe {
     //! println!("{}", probe.report());               // load-peak / steady / overall-peak (GB)
     //! ```
 
-    use super::gpu_peak::{used_mib, PeakSampler};
+    use super::gpu_peak::{probe_gpu, used_mib, PeakSampler};
 
     /// MiB → GB (10⁹ bytes — the manifest's `minMemoryGb` is base-10 GB, matching the MLX footprint
     /// numbers). `1 MiB = 2²⁰ bytes`.
@@ -261,6 +261,24 @@ mod vram_probe {
         }
     }
 
+    impl VramReport {
+        /// Fail rather than publish a peak sampled from a busy or unreadable GPU. Returns `self` so a
+        /// harness can validate and then print/use the same report value.
+        pub fn assert_trustworthy(self, max_baseline_gb: f64) -> Self {
+            assert!(
+                self.baseline_gb < max_baseline_gb,
+                "sampled GPU was not idle (baseline {:.1} GB, required < {:.1} GB); the peak is contaminated",
+                self.baseline_gb,
+                max_baseline_gb
+            );
+            assert!(
+                self.peak_gb > 0.0,
+                "probe reported a 0.0 GB peak; nvidia-smi is unavailable or the query failed"
+            );
+            self
+        }
+    }
+
     /// A phase-scoped [`PeakSampler`] the caller starts around a load or generate call and hands back
     /// to the matching `end_*` to fold its peak into the report.
     pub struct Phase(PeakSampler);
@@ -276,10 +294,23 @@ mod vram_probe {
     }
 
     impl VramProbe {
-        /// Record the idle device baseline (used MiB) for GPU ordinal `gpu`. A missing `nvidia-smi`
-        /// yields a 0 baseline (the deltas then read as absolute used, still monotonically useful).
+        /// Record the idle baseline on the physical GPU that Candle's logical `cuda:0` renders on.
+        /// This derives the ordinal from `CUDA_VISIBLE_DEVICES` via [`probe_gpu`] so a multi-GPU run
+        /// cannot silently render on one card while sampling another (sc-12107).
+        pub fn start_rendered() -> Self {
+            Self::start(probe_gpu())
+        }
+
+        /// Record the idle device baseline (used MiB) for GPU ordinal `gpu`.
+        ///
+        /// A failed query is fatal: treating it as a zero baseline would turn the absence of a
+        /// measurement into a plausible low peak that could understate a manifest requirement.
         pub fn start(gpu: usize) -> Self {
-            let baseline = used_mib(gpu).unwrap_or(0);
+            let baseline = used_mib(gpu).unwrap_or_else(|| {
+                panic!(
+                    "cannot read VRAM for physical GPU {gpu} with nvidia-smi; refusing to record an untrustworthy peak"
+                )
+            });
             Self {
                 gpu,
                 baseline_mib: baseline,
@@ -287,6 +318,18 @@ mod vram_probe {
                 steady_mib: baseline,
                 overall_peak_mib: baseline,
             }
+        }
+
+        /// Fail if the recorded baseline is not approximately idle. Returns `self` so callers that
+        /// need phase-relative measurements after a deliberate resident load can retain the trusted
+        /// pre-run baseline as provenance.
+        pub fn assert_idle(self, max_baseline_gb: f64) -> Self {
+            let baseline_gb = mib_to_gb(self.baseline_mib);
+            assert!(
+                baseline_gb < max_baseline_gb,
+                "sampled GPU was not idle (baseline {baseline_gb:.1} GB, required < {max_baseline_gb:.1} GB); the peak is contaminated"
+            );
+            self
         }
 
         /// Begin sampling a phase (load or generate). Keep the returned [`Phase`] alive across the work
@@ -356,6 +399,43 @@ mod vram_probe {
             p.steady_mib = 500;
             assert_eq!(p.report().steady_gb, 0.0);
         }
+
+        #[test]
+        fn trustworthy_report_rejects_busy_and_zero_peak_samples() {
+            let good = VramReport {
+                baseline_gb: 0.2,
+                load_peak_gb: 2.0,
+                steady_gb: 1.5,
+                peak_gb: 3.0,
+            };
+            assert_eq!(good.assert_trustworthy(1.0).peak_gb, 3.0);
+
+            let busy = VramReport {
+                baseline_gb: 2.0,
+                ..good
+            };
+            assert!(std::panic::catch_unwind(|| busy.assert_trustworthy(1.0)).is_err());
+
+            let unreadable = VramReport {
+                peak_gb: 0.0,
+                ..good
+            };
+            assert!(std::panic::catch_unwind(|| unreadable.assert_trustworthy(1.0)).is_err());
+        }
+
+        #[test]
+        fn idle_probe_rejects_a_contaminated_baseline() {
+            let probe = |baseline_mib| VramProbe {
+                gpu: 0,
+                baseline_mib,
+                load_peak_mib: baseline_mib,
+                steady_mib: baseline_mib,
+                overall_peak_mib: baseline_mib,
+            };
+
+            assert_eq!(probe(200).assert_idle(1.0).baseline_mib, 200);
+            assert!(std::panic::catch_unwind(|| probe(2_000).assert_idle(1.0)).is_err());
+        }
     }
 }
 
@@ -378,6 +458,33 @@ mod gpu_peak {
     /// nvidia-smi poll cadence. ~40 ms is well under a multi-second VAE decode (so the peak is
     /// captured) while keeping the subprocess-spawn overhead negligible.
     const POLL: Duration = Duration::from_millis(40);
+
+    fn parse_probe_gpu(raw: Option<&str>) -> Result<usize, String> {
+        let Some(raw) = raw else {
+            return Ok(0);
+        };
+        let first = raw.split(',').next().unwrap_or_default().trim();
+        if first.is_empty() {
+            return Err("CUDA_VISIBLE_DEVICES is set but its first entry is empty".into());
+        }
+        first.parse::<usize>().map_err(|_| {
+            format!(
+                "CUDA_VISIBLE_DEVICES={raw:?} does not start with a physical GPU ordinal; \
+                 nvidia-smi cannot safely map UUID/MIG handles here"
+            )
+        })
+    }
+
+    /// Physical GPU ordinal sampled by `nvidia-smi` for Candle's rendered `cuda:0`.
+    ///
+    /// `CUDA_VISIBLE_DEVICES` remaps Candle's logical device indices but is ignored by `nvidia-smi`.
+    /// Deriving the first visible physical ordinal here keeps render and probe on the same card by
+    /// construction. Unset defaults to physical GPU 0. An empty, UUID, MIG handle, or otherwise
+    /// non-numeric first entry panics instead of silently sampling the wrong card.
+    pub fn probe_gpu() -> usize {
+        let raw = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+        parse_probe_gpu(raw.as_deref()).unwrap_or_else(|message| panic!("{message}"))
+    }
 
     /// Device-level used VRAM (MiB) for GPU ordinal `gpu` via `nvidia-smi`, or `None` if the query
     /// fails.
@@ -411,6 +518,13 @@ mod gpu_peak {
     }
 
     impl PeakSampler {
+        /// Start sampling the physical GPU that Candle's logical `cuda:0` renders on. Prefer this for
+        /// generation harnesses; explicit [`start`](Self::start) remains for sweep tools with their own
+        /// GPU-selection environment variables.
+        pub fn start_rendered() -> Self {
+            Self::start(probe_gpu())
+        }
+
         pub fn start(gpu: usize) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let peak = Arc::new(AtomicU64::new(0));
@@ -441,6 +555,29 @@ mod gpu_peak {
                 let _ = h.join();
             }
             self.peak.load(Ordering::Relaxed)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_probe_gpu;
+
+        #[test]
+        fn probe_gpu_defaults_to_zero_when_visibility_is_unset() {
+            assert_eq!(parse_probe_gpu(None), Ok(0));
+        }
+
+        #[test]
+        fn probe_gpu_uses_the_first_visible_physical_ordinal() {
+            assert_eq!(parse_probe_gpu(Some(" 1,0 ")), Ok(1));
+            assert_eq!(parse_probe_gpu(Some("7")), Ok(7));
+        }
+
+        #[test]
+        fn probe_gpu_rejects_empty_uuid_mig_and_junk_without_guessing() {
+            for raw in ["", " ,1", "GPU-a1b2", "MIG-GPU-a/b/c", "wat"] {
+                assert!(parse_probe_gpu(Some(raw)).is_err(), "{raw:?} must fail");
+            }
         }
     }
 }

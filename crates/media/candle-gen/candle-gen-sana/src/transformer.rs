@@ -1043,7 +1043,7 @@ mod tests {
         let dev = Device::new_cuda(0).expect("cuda device");
         let cfg = SanaTransformerConfig::sana_1600m();
 
-        let mut probe = VramProbe::start(0);
+        let mut probe = VramProbe::start_rendered();
         let load = probe.phase();
         let w = synthetic_trunk_weights(&cfg, &dev);
         let model = SanaTransformer::from_weights(&w, cfg.clone()).unwrap();
@@ -1071,9 +1071,10 @@ mod tests {
             hi - lo > 1e-4,
             "degenerate SANA-res trunk output: [{lo}, {hi}]"
         );
+        let report = probe.report().assert_trustworthy(1.0);
         println!(
-            "SANA-1.6B f32 32² trunk forward OK on CUDA: range=[{lo:.4}, {hi:.4}]  VRAM: {}",
-            probe.report()
+            "SANA-1.6B f32 32² trunk forward OK on physical GPU {}: range=[{lo:.4}, {hi:.4}]  VRAM: {report}",
+            candle_gen::testkit::probe_gpu()
         );
     }
 }

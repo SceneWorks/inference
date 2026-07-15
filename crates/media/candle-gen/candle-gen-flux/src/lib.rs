@@ -105,12 +105,12 @@ pub use ref_backbone::FluxRefBackbone;
 mod ip_validate;
 
 use candle_gen::candle_core::DType;
+#[cfg(all(test, feature = "cuda"))]
+use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, WeightsSource,
 };
-#[cfg(all(test, feature = "cuda"))]
-use candle_gen::gen_core::OffloadPolicy;
 
 use pipeline::{Pipeline, SeqHeavy, SeqTextEncoders};
 
@@ -237,8 +237,7 @@ impl Generator for FluxGenerator {
             on_progress,
             |text| self.pipe.encode_residency(text, &req.prompt),
             |heavy, encoded, on_progress| {
-                self.pipe
-                    .render_residency(req, heavy, encoded, on_progress)
+                self.pipe.render_residency(req, heavy, encoded, on_progress)
             },
         )?;
         Ok(GenerationOutput::Images(images))
@@ -334,13 +333,7 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
     // FLUX is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
-    let pipe = Pipeline::load(
-        variant,
-        &root,
-        &device,
-        DType::BF16,
-        spec.pid.clone(),
-    );
+    let pipe = Pipeline::load(variant, &root, &device, DType::BF16, spec.pid.clone());
     let policy = candle_gen::effective_offload_policy(spec.offload_policy);
     let resident_pipe = pipe.clone();
     let text_pipe = pipe.clone();
@@ -615,10 +608,15 @@ mod tests {
             count: 1,
             ..Default::default()
         };
-        let sampler = candle_gen::testkit::PeakSampler::start(0);
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
+        let load_phase = probe.phase();
         let g = load_dev(&spec).expect("load flux1_dev");
+        probe.end_load(load_phase);
+        let generate_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
-        let peak_mib = sampler.stop();
+        probe.end_gen(generate_phase);
+        let report = probe.report().assert_trustworthy(1.0);
+        let peak_mib = (report.peak_gb * 1.0e9 / (1024.0 * 1024.0)).round() as u64;
         let img = match output {
             GenerationOutput::Images(mut v) => v.remove(0),
             other => panic!("expected images, got {other:?}"),
@@ -633,7 +631,8 @@ mod tests {
             "resident"
         };
         eprintln!(
-            "SEQ_AB mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
+            "SEQ_AB mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
+            candle_gen::testkit::probe_gpu(),
             img.pixels.len(),
             img.width,
             img.height
