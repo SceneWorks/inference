@@ -26,7 +26,7 @@
 //! The engine (sc-6836/sc-7078) is GPU-validated: the per-chunk [`rope::ScailRope`], the open-CLIP
 //! [`clip::ScailClip`] image encoder, the 28-channel
 //! [`preprocess::extract_and_compress_mask_to_latent`] mask build, the PyTorch-faithful [`resize`]
-//! kernels, the [`model`] DiT forward, the [`generate`] denoise pipeline, and the provider
+//! kernels, the [`model`] DiT forward, the `generate` denoise pipeline, and the provider
 //! registration. Inference adapters — LoRA / LoKr / LoHa, the lightx2v lightning diff-patch, and the
 //! Bias-Aware DPO refinement LoRA — fold into the dense DiT via [`adapters::merge_adapters`] (sc-6838).
 

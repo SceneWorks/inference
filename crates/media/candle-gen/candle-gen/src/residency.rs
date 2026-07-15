@@ -401,7 +401,7 @@ mod tests {
         let residency = Residency::from_policy(
             OffloadPolicy::Sequential,
             move || {
-                text_loads.lock().unwrap().push("text");
+                crate::lock_recover(&text_loads).push("text");
                 Ok(2u8)
             },
             move |use_pid| {
@@ -415,7 +415,7 @@ mod tests {
         .unwrap();
 
         assert!(residency.is_sequential());
-        assert!(loads.lock().unwrap().is_empty());
+        assert!(crate::lock_recover(&loads).is_empty());
         let out = residency
             .run(
                 &CancelFlag::new(),
@@ -426,7 +426,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, 6);
-        assert_eq!(*loads.lock().unwrap(), vec!["text", "heavy"]);
+        assert_eq!(*crate::lock_recover(&loads), vec!["text", "heavy"]);
     }
 
     #[test]
@@ -437,7 +437,7 @@ mod tests {
         let residency = Residency::from_policy(
             OffloadPolicy::Resident,
             move || {
-                text_loads.lock().unwrap().push("text");
+                crate::lock_recover(&text_loads).push("text");
                 Ok(4u8)
             },
             move |use_pid| {
@@ -451,7 +451,7 @@ mod tests {
         .unwrap();
 
         assert!(!residency.is_sequential());
-        assert_eq!(*loads.lock().unwrap(), vec!["text", "heavy+pid"]);
+        assert_eq!(*crate::lock_recover(&loads), vec!["text", "heavy+pid"]);
         for _ in 0..2 {
             let out = residency
                 .run(
@@ -464,7 +464,7 @@ mod tests {
                 .unwrap();
             assert_eq!(out, 9);
         }
-        assert_eq!(*loads.lock().unwrap(), vec!["text", "heavy+pid"]);
+        assert_eq!(*crate::lock_recover(&loads), vec!["text", "heavy+pid"]);
     }
 
     #[test]
@@ -474,7 +474,7 @@ mod tests {
         let residency = Residency::from_policy_with_resident(
             OffloadPolicy::Resident,
             move || {
-                *resident_loads.lock().unwrap() += 1;
+                *crate::lock_recover(&resident_loads) += 1;
                 Ok((7u8, 8u8))
             },
             || Ok(0u8),
@@ -482,7 +482,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(*loads.lock().unwrap(), 0);
+        assert_eq!(*crate::lock_recover(&loads), 0);
         for _ in 0..2 {
             let out = residency
                 .run(
@@ -495,7 +495,7 @@ mod tests {
                 .unwrap();
             assert_eq!(out, 15);
         }
-        assert_eq!(*loads.lock().unwrap(), 1);
+        assert_eq!(*crate::lock_recover(&loads), 1);
     }
 
     /// The env reader: case- and whitespace-insensitive on `sequential`, false for everything else.

@@ -180,8 +180,8 @@ impl LoraBase {
     }
 }
 
-/// A frozen base projection (dense or packed — [`LoraBase`]) with an optional trainable LoRA/LoKr
-/// residual. Implements [`Module`](candle_nn::Module) so it drops into a vendored model exactly where an
+/// A frozen base projection (dense or packed — `LoraBase`) with an optional trainable LoRA/LoKr
+/// residual. Implements [`Module`] so it drops into a vendored model exactly where an
 /// `nn::Linear` was, and carries its own PEFT-style `path` (captured from the `VarBuilder` prefix at
 /// construction) so a [`LoraHost`] visitor can route adapters without threading prefixes through the
 /// module tree.
@@ -801,7 +801,7 @@ pub fn reconstruct_lora_delta(
 
 /// Reconstruct the LoKr weight delta `ΔW = (alpha/rank)·scale·kron(w1, w2)` reshaped to `base_shape`
 /// (`[out, in]`), as **f32** — the inference-side merge counterpart to [`LoraLinear`]'s LoKr forward,
-/// using the *same* [`kron2d`] reconstruction. Each Kronecker leg is either a full factor (`w1`/`w2`)
+/// using the *same* `kron2d` reconstruction. Each Kronecker leg is either a full factor (`w1`/`w2`)
 /// or a low-rank product (`w1_a·w1_b` / `w2_a·w2_b`, e.g. the trainer's zero-init `w2_a`/`w2_b` form).
 /// Errors if a leg is missing. Linear-only: pass 2-D factors (the SDXL trainer adapts Linears; Tucker /
 /// conv reconstruction is not handled here).

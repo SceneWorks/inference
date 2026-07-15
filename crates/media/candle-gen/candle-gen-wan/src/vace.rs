@@ -2,15 +2,15 @@
 //! (Windows/CUDA) sibling of `mlx-gen-wan`'s `vace.rs`. Ported from the diffusers
 //! `transformer_wan_vace.py` + `WanVACEPipeline` (Wan2.1-VACE-14B).
 //!
-//! **VACE is purely additive on the base Wan DiT.** The base block math ([`crate::transformer::Block`]
+//! **VACE is purely additive on the base Wan DiT.** The base block math (`crate::transformer::Block`
 //! — AdaLN self-attn with 3-axis RoPE + qk-RMSNorm, cross-attn to UMT5, gated-GELU FFN) is unchanged;
 //! VACE adds (a) a `vace_patch_embedding` (a 96-ch patchify→linear), (b) `len(vace_layers)`
-//! [`VaceBlock`]s that produce per-layer "hints" from the control latent, and (c) hint injection
+//! `VaceBlock`s that produce per-layer "hints" from the control latent, and (c) hint injection
 //! `hidden += proj_out(control)·scale` at each main layer in `vace_layers`. The control latent is the
 //! 96-channel `cat([video_latents(32), mask_latents(64)], C)` the host builds from the masked control
 //! clip + reference images ([`prepare_video_latents`] / [`prepare_masks`] / [`build_vace_control`]).
 //!
-//! **Dtypes:** the DiT runs **bf16** (norms / modulation / RoPE upcast to f32 inside [`Block`]) — the
+//! **Dtypes:** the DiT runs **bf16** (norms / modulation / RoPE upcast to f32 inside `Block`) — the
 //! candle Wan regime; the z16 VAE runs f32. This mirrors the validated candle base Wan 14B path
 //! (`wan2_2_t2v_14b`), not the mlx f32-residual stream (the candle base keeps the inter-block stream in
 //! bf16; VACE follows it).

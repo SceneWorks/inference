@@ -22,7 +22,7 @@
 //! `transformer_blocks.{i}.attn.{img_qkv,txt_qkv,to_out.0,to_add_out}.weight` is a valid base key for
 //! every Linear an adapter targets. The DiT family writes **bare dotted** PEFT keys (no
 //! `base_model.model.transformer.` prefix — that is SDXL-specific); on read we also tolerate the common
-//! community prefixes ([`PEFT_PREFIXES`]) and a kohya `lora_transformer_<flat>` flattening resolved
+//! community prefixes (`PEFT_PREFIXES`) and a kohya `lora_transformer_<flat>` flattening resolved
 //! against the base key set.
 //!
 //! LoRA/LoKr are **DiT-only** for Lens (the gpt-oss text encoder and Flux.2 VAE are not adapter

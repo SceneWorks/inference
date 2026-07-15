@@ -15,7 +15,7 @@ use candle_core::Tensor;
 use crate::Result;
 
 /// Decodes a model's final **unpacked** latent into a decoded image tensor — the input a provider's
-/// tensor→[`gen_core::Image`](gen_core::Image) step then turns into an image.
+/// tensor→[`gen_core::Image`] step then turns into an image.
 ///
 /// Contract:
 /// - The input is the engine's unpacked latent in its latent space's native layout (e.g. Qwen/FLUX

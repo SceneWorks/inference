@@ -38,7 +38,7 @@ pub mod tiling;
 
 pub use backbone::PixDiT;
 pub use caption::CaptionEncoder;
-pub use config::{CaptionConfig, PidConfig, RopeMode, SampleType, SamplerConfig};
+pub use config::{CaptionConfig, ConvPadding, PidConfig, RopeMode, SampleType, SamplerConfig};
 pub use decoder::PidDecoder;
 pub use engine::{
     flow_capture_for_request, mint_planned_decoder, resolve_pid_decoder,

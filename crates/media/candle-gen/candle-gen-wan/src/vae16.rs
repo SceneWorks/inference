@@ -10,8 +10,8 @@
 //!    so the spatial scale is **8×** (3 up/down stages), not 16×.
 //!  - diffusers names the up-sampler `up_blocks.N.upsamplers.0.…` (plural) vs the z48's `upsampler.…`.
 //!
-//! It reuses the proven z48 building blocks ([`ChanNorm`], [`Conv2dW`], [`Resnet`], [`MidAttn`],
-//! [`Upsampler`], [`causal`]) and the from-scratch [`CausalConv3d`](crate::conv3d) — only the encoder's
+//! It reuses the proven z48 building blocks (`ChanNorm`, `Conv2dW`, `Resnet`, `MidAttn`,
+//! `Upsampler`, `causal`) and the from-scratch [`CausalConv3d`](crate::conv3d) — only the encoder's
 //! stride-2 spatial/temporal downsamplers are new here. Decode **streams one latent frame at a time**
 //! (the sc-5176 fix, bit-equivalent to a single pass via the causal `feat_cache`); encode mirrors the
 //! diffusers **chunked** causal encode (frame 0 alone, then 4-frame chunks). Everything runs **f32**.

@@ -19,7 +19,7 @@
 //!
 //! ## Memory budget
 //! Peak per chunk ≈ `weights + GB_PER_MPX_FRAME · (out_megapixels · frames_in_chunk)`. The sizer picks
-//! the largest valid chunk under the device VRAM × [`SAFE_FRAC`], falls back to per-frame (`T=1`) when
+//! the largest valid chunk under the device VRAM × `SAFE_FRAC`, falls back to per-frame (`T=1`) when
 //! even 8 frames won't fit, and reports an over-budget condition catchably when a single frame won't
 //! fit (extreme HD → routes to the spatial tiler). On CUDA the budget is the device's total VRAM
 //! (read from `nvidia-smi`, the SceneWorks worker convention) — overridable via `SEEDVR2_BUDGET_GIB`.
@@ -70,10 +70,10 @@ pub const VAE_SAFE_DECODE_EDGE_PX: i32 = 1536;
 /// The safe peak-GB budget for the chunk/tile sizers. Resolved in order:
 ///   1. `SEEDVR2_BUDGET_GIB` env override (a positive float) — the deterministic injection point the
 ///      worker and tests use to pin a per-GPU budget;
-///   2. the device's total VRAM × [`SAFE_FRAC`] (read via the shared trusted-path `nvidia-smi`
+///   2. the device's total VRAM × `SAFE_FRAC` (read via the shared trusted-path `nvidia-smi`
 ///      probe [`candle_gen::gpu::nvidia_smi_min_total_gib`] — an absolute System32/CUDA_PATH binary,
 ///      never a bare `PATH` lookup; sc-9014 / F-030);
-///   3. [`DEFAULT_BUDGET_GIB`] when neither is available.
+///   3. `DEFAULT_BUDGET_GIB` when neither is available.
 pub fn safe_budget_gib() -> f64 {
     if let Ok(raw) = std::env::var("SEEDVR2_BUDGET_GIB") {
         if let Ok(gib) = raw.trim().parse::<f64>() {

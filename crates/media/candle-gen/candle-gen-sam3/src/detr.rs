@@ -4,7 +4,7 @@
 //!
 //! Consumes the finest FPN vision feature (72²) + the projected text features (sc-6241) and produces,
 //! for 200 object queries: open-vocabulary concept logits (`pred_logits`), refined boxes
-//! (`pred_boxes`, xyxy ∈ [0,1]), and the global `presence_logits`. All standard attention — no
+//! (`pred_boxes`, xyxy ∈ `0,1`), and the global `presence_logits`. All standard attention — no
 //! deformable attention, no NMS, no Hungarian. The decoder's vision cross-attention is biased by a
 //! **BoxRPB** relative-position bias (log-scale-encoded box↔grid deltas), and boxes are refined
 //! iteratively across the 6 layers. Token layout `[B, seq, C]` — plain row-major, no NHWC/conv (only
@@ -491,7 +491,7 @@ impl Sam3Detector {
 
     /// Affine-quantize the detector's projections to Q4/Q8 (the encoder/decoder attentions + FFNs,
     /// the box / presence / ref-point heads, and the dot-product scoring). The BoxRPB embedders
-    /// (in=2) and any other sub-block-width projection auto-skip and stay dense ([`Linear::quantize`]).
+    /// (in=2) and any other sub-block-width projection auto-skip and stay dense (`Linear::quantize`).
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
         for l in &mut self.enc_layers {
             l.quantize(quant)?;

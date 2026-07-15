@@ -3,12 +3,12 @@
 //! `Resampler` over penultimate CLIP features), the XLabs FLUX adapter is the **classic** IP-Adapter
 //! shape:
 //!
-//! - an [`FluxImageProjModel`] — a single `Linear(768 → 4·4096)` + `LayerNorm` projecting the **pooled**
+//! - an `FluxImageProjModel` — a single `Linear(768 → 4·4096)` + `LayerNorm` projecting the **pooled**
 //!   CLIP image embedding `[B, 768]` into **4** image-prompt tokens of width 4096 ([`crate::ip_image_encoder`]
 //!   produces the pooled embed);
 //! - **19** per-double-block decoupled K/V projectors (`Linear(4096 → 3072)`) — one pair per FLUX
 //!   double block, applied as a decoupled cross-attention whose residual is injected into the image
-//!   stream ([`crate::ip_dit`]).
+//!   stream (`crate::ip_dit`).
 //!
 //! [`FluxIpInjector`] precomputes the 4 image tokens once (constant across the denoise) and exposes
 //! [`double_block_residual`](FluxIpInjector::double_block_residual) — the per-block residual the forked
@@ -73,7 +73,7 @@ impl FluxImageProjModel {
     }
 }
 
-/// The XLabs FLUX IP-Adapter weights: the [`FluxImageProjModel`] + the 19 per-double-block decoupled
+/// The XLabs FLUX IP-Adapter weights: the `FluxImageProjModel` + the 19 per-double-block decoupled
 /// K/V projectors (`Linear(cross_attn_dim → hidden_size)` each). Loaded from the
 /// `XLabs-AI/flux-ip-adapter` `ip_adapter.safetensors`.
 pub struct FluxIpAdapter {

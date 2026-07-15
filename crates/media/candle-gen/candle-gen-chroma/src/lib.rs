@@ -6,7 +6,7 @@
 //!
 //! **txt2img (sc-5484):** Chroma is a FLUX.1-schnell-derived DiT — the MMDiT skeleton with a
 //! distilled-guidance **Approximator** replacing FLUX's modulation stack, **T5-XXL-only**
-//! conditioning, and **true CFG** (a real negative prompt). [`pipeline`] adapts it through the
+//! conditioning, and **true CFG** (a real negative prompt). `pipeline` adapts it through the
 //! contract: T5-XXL encode → the Chroma DiT (flow-match Euler, static-shift / beta sigmas) → the
 //! FLUX 16-ch AutoencoderKL, emitting `Progress` and honoring `req.cancel`, with **deterministic
 //! CPU-seeded noise** (sc-3673) so output is launch-portable per seed. The three variants:

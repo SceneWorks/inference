@@ -279,8 +279,7 @@ struct EditHeavy {
 impl QwenEdit {
     /// Load the Qwen-Image-Edit components from a snapshot dir. Under the default `Resident` policy all
     /// four heavy components load now; under `Sequential` (sc-10968) they are deferred to the per-phase
-    /// loads in [`Self::generate_sequential`], and only the cheap tokenizer / processor / `zero_cond_t`
-    /// load here.
+    /// residency loaders, and only the cheap tokenizer / processor / `zero_cond_t` load here.
     pub fn load(paths: &QwenEditPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let root = paths.root.clone();

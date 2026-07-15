@@ -4,7 +4,7 @@
 //!
 //! The backbone is an isotropic windowed ViT (NOT SAM2's hierarchical Hiera): patch-embed (conv
 //! stride 14, no bias) → tiled absolute position embedding → a front LayerNorm → 32 pre-norm
-//! transformer layers. Most layers run **windowed** attention (window 24); layers [7,15,23,31] run
+//! transformer layers. Most layers run **windowed** attention (window 24); layers `7,15,23,31` run
 //! **global** attention. Every layer applies **2D axial RoPE** to q/k (the rotary table is fixed per
 //! layer: window-sized for windowed layers, grid-sized + down-scaled for global layers). No
 //! LayerScale (`layer_scale_init_value` is None in the shipped config).

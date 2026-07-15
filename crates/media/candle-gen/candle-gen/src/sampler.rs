@@ -85,7 +85,7 @@ fn candle_dims(x: &Tensor, axes: &[i32]) -> Vec<usize> {
 /// The reductions return the **keepdim** tensor (reduced shape); candle has NO implicit broadcasting,
 /// so `mul`/`div` use `broadcast_mul`/`broadcast_div` to let the library's mixed full×reduced combines
 /// broadcast (equal shapes broadcast to themselves). Negative `axes` are normalized via
-/// [`candle_dims`]; `shape` is unused (the `Tensor` carries its own).
+/// `candle_dims`; `shape` is unused (the `Tensor` carries its own).
 impl GuidanceOps for CandleLatentOps {
     fn mul(&self, a: &Tensor, b: &Tensor) -> gen_core::Result<Tensor> {
         ge(a.broadcast_mul(b))

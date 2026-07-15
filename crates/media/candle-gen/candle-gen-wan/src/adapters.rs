@@ -1,6 +1,6 @@
 //! Wan inference-side adapter merge (sc-5167) — load a trained LoRA/LoKr `.safetensors` and fold its
 //! delta into the dense DiT-expert weights **before** the stock [`WanTransformer`](crate::transformer)
-//! is built. The Wan twin of [`candle-gen-sdxl::adapters`] / `candle-gen-z-image::adapters`, and the
+//! is built. The Wan twin of `candle-gen-sdxl::adapters` / `candle-gen-z-image::adapters`, and the
 //! closing half of the native-trainer loop: a LoRA/LoKr produced by [`crate::training`]'s Wan MoE
 //! trainer now actually loads in candle inference.
 //!
@@ -10,13 +10,13 @@
 //! stock Wan DiT reads diffusers keys 1:1, so `{path}.weight` is a valid base key for every attention
 //! projection an adapter targets (`blocks.{i}.attn1/attn2.{to_q,to_k,to_v,to_out.0}`). The delta is
 //! reconstructed with the **same** f32 math the trainer's forward uses
-//! ([`reconstruct_lora_delta`](candle_gen::train::lora::reconstruct_lora_delta) /
-//! [`reconstruct_lokr_delta`](candle_gen::train::lora::reconstruct_lokr_delta)), so a candle-trained
+//! (`reconstruct_lora_delta` /
+//! `reconstruct_lokr_delta`), so a candle-trained
 //! adapter round-trips exactly.
 //!
 //! **MoE.** The A14B is two experts (`transformer/` high-noise, `transformer_2/` low-noise). A trained
 //! Wan MoE LoRA ships as a `{stem}.high_noise` / `{stem}.low_noise` pair; the worker tags each
-//! [`AdapterSpec`] with [`MoeExpert`](candle_gen::gen_core::MoeExpert) so the high file merges onto the
+//! [`AdapterSpec`] with `MoeExpert` so the high file merges onto the
 //! high expert and the low onto the low. This module merges whatever specs it is handed into one map;
 //! the per-expert routing (filter by `moe_expert`) lives in [`crate::wan14b`].
 //!

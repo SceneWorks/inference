@@ -106,7 +106,7 @@ impl Variant {
 /// VAE spatial downscale (image/8 per side) — re-exported from [`crate::vae`] for the latent geometry.
 const VAE_SCALE: u32 = SPATIAL_SCALE;
 
-/// The SD3.5 [`FlowMatchEulerDiscreteScheduler`] σ ramp for `steps` inference steps with the given
+/// The SD3.5 `FlowMatchEulerDiscreteScheduler` σ ramp for `steps` inference steps with the given
 /// `shift`, matching diffusers `set_timesteps`:
 ///
 /// 1. `sigmas = linspace(1.0, 1/num_train, steps)` (the σ table the timesteps map to, σ_max = 1.0);

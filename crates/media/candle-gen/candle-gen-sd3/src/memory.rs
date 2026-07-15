@@ -47,7 +47,7 @@
 //! ```
 //!
 //! Every gate is >= the measured peak with >= 3.2 GiB / >= 8.4 % margin — a safe ceiling, re-validated
-//! on the CUDA box, not silently raised. The [`tests::min_memory_gate_exceeds_measured_peaks`] test
+//! on the CUDA box, not silently raised. The `tests::min_memory_gate_exceeds_measured_peaks` test
 //! pins this so a future tweak to the constants can't quietly drop the gate below a measured peak.
 //!
 //! **NOTE — the load transient is no longer the binding peak (and never was).** `Pipeline::load_components`
@@ -279,7 +279,7 @@ impl MemoryProfile {
     /// rounded up to one decimal so the worker gate has a clean, conservative threshold. The additive
     /// [`ACTIVATION_OVERHEAD_GIB`] models the resolution-bound dual-CFG working set (which does NOT
     /// scale with weights); [`FRAG_MARGIN`] is the allocator slack on the whole footprint. Validated
-    /// >= the C6 measured peaks (sc-7881) by [`tests::min_memory_gate_exceeds_measured_peaks`].
+    /// >= the C6 measured peaks (sc-7881) by `tests::min_memory_gate_exceeds_measured_peaks`.
     pub fn min_memory_gb(&self) -> f64 {
         let footprint = self.weight_bytes() + ACTIVATION_OVERHEAD_GIB * GIB;
         let gib = footprint * (1.0 + FRAG_MARGIN) / GIB;

@@ -6,8 +6,10 @@
 //! follow-ons sc-11998/sc-11997). It is **not** distilled, so it exposes **true CFG**
 //! (negative prompt + `guidance` scale). Quant tiers ship as **pre-quantized per-tier checkpoints**
 //! (epic 1788 architecture / A6 sc-11990), *not* on-the-fly requant, so [`Capabilities::supported_quants`]
-//! is empty and `load` rejects a stray `spec.quantize` rather than silently ignoring it. The
-//! denoise/decode itself lives in [`crate::pipeline`].
+//! is empty: the tier dir's `split_model.json` *is* the quant selection. `load` reads that manifest
+//! and, when a caller does pass `spec.quantize`, only *asserts* it against the manifest (a mismatch is
+//! a hard error — never a silent bf16 run or an on-the-fly requant). The denoise/decode itself lives
+//! in [`crate::pipeline`].
 
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Dtype};
@@ -19,10 +21,14 @@ use mlx_gen::{
 };
 use mlx_gen_flux::T5TextEncoder;
 
-use crate::config::{MochiConfig, MochiVaeConfig};
+use std::path::{Path, PathBuf};
+
+use crate::config::{MochiConfig, MochiSplitModel, MochiVaeConfig};
 use crate::text_encoder::{encode_prompt, load_t5_encoder};
 use crate::tokenizer::load_tokenizer;
-use crate::transformer::{load_transformer_weights, MochiDitConfig, MochiTransformer3DModel};
+use crate::transformer::{
+    load_transformer_weights, MochiDitConfig, MochiQuant, MochiTransformer3DModel,
+};
 use crate::vae::{load_vae_decoder, MochiVaeDecoder};
 
 /// Public provider id: `"mochi_1"`.
@@ -106,25 +112,54 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    // On-the-fly requant is not the Mochi tier mechanism (epic 1788: self-contained pre-quantized
-    // q4/q8/bf16 tier dirs, A6 sc-11990). Reject a stray `spec.quantize` rather than silently ignore
-    // it — a mismatch would otherwise run bf16 while the caller believed it asked for Q4.
+    // The quant geometry rides on the tier dir's `split_model.json` (epic 1788: self-contained
+    // pre-quantized q4/q8/bf16 tier dirs, A6 sc-11990) — a tier dir *is* the quant selection, so
+    // on-the-fly requant is never done. The raw snapshot / `bf16/` tier carries no manifest → dense.
+    let split = MochiSplitModel::from_model_dir(&root)?;
+    // `spec.quantize`, when set, only *asserts* the expected level (LTX behavior). Mochi can't
+    // re-quantize a dense checkpoint — it ships pre-packed from `convert.rs` — so a mismatch is a hard
+    // load error rather than a silent bf16 run while the caller believed it asked for Q4.
     if let Some(q) = spec.quantize {
-        return Err(Error::Msg(format!(
-            "mochi_1: spec.quantize={q:?} unsupported — Mochi ships pre-quantized per-tier \
-             checkpoints; point WeightsSource at the q4/q8/bf16 tier dir (no on-the-fly requant)"
-        )));
+        if !split.quantized {
+            return Err(Error::Msg(format!(
+                "mochi_1: spec.quantize={q:?} but {} carries no split_model.json quant manifest — \
+                 Mochi quant is tier-dir-driven; point WeightsSource at the q4/q8 tier dir",
+                root.display()
+            )));
+        }
+        if q.bits() != split.bits {
+            return Err(Error::Msg(format!(
+                "mochi_1: spec.quantize={q:?} (bits {}) disagrees with the tier's split_model.json \
+                 (bits {})",
+                q.bits(),
+                split.bits
+            )));
+        }
     }
+    let quant = split.quantized.then_some(MochiQuant {
+        bits: split.bits,
+        group: split.group,
+    });
+
+    // The T5-XXL text encoder + AsymmVAE are **shared** across tiers (sibling dirs, not duplicated
+    // per tier — the A6 layout). Resolve them from the tier dir, falling back to its parent when the
+    // tier dir carries only `transformer/` + the manifest. A fully self-contained dir (the raw
+    // snapshot) resolves to itself, so the parity suites are unaffected.
+    let vae_root = resolve_component_root(&root, "vae");
+    let te_root = resolve_component_root(&root, "text_encoder");
 
     let config = MochiConfig::from_model_dir(&root)?;
-    let vae_config = MochiVaeConfig::from_model_dir(&root)?;
-    let dit_cfg = MochiDitConfig::default();
+    let vae_config = MochiVaeConfig::from_model_dir(&vae_root)?;
+    let dit_cfg = MochiDitConfig {
+        quantization: quant,
+        ..Default::default()
+    };
 
     let tokenizer = load_tokenizer()?;
-    let t5 = load_t5_encoder(&root)?;
+    let t5 = load_t5_encoder(&te_root)?;
     let dit_w = load_transformer_weights(&root)?;
     let transformer = MochiTransformer3DModel::from_weights(&dit_w, &dit_cfg, Dtype::Float32)?;
-    let vae = load_vae_decoder(&root)?;
+    let vae = load_vae_decoder(&vae_root)?;
 
     Ok(Box::new(Mochi {
         descriptor: descriptor(),
@@ -135,6 +170,21 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         config,
         vae_config,
     }))
+}
+
+/// Resolve the directory that actually holds a shared component (`vae` / `text_encoder`): the tier
+/// `root` when it contains `<root>/<component>`, else its parent when that does (the A6 shared-sibling
+/// tier layout), else `root` (let the downstream loader emit the specific missing-file error).
+fn resolve_component_root(root: &Path, component: &str) -> PathBuf {
+    if root.join(component).is_dir() {
+        return root.to_path_buf();
+    }
+    if let Some(parent) = root.parent() {
+        if parent.join(component).is_dir() {
+            return parent.to_path_buf();
+        }
+    }
+    root.to_path_buf()
 }
 
 /// Reject a request Mochi cannot serve: the shared capability floor (size range, count,
@@ -341,13 +391,16 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_on_the_fly_quant() {
+    fn load_rejects_quant_against_dense_manifest() {
+        // `spec.quantize` only *asserts* the tier's level; a dir with no `split_model.json` quant
+        // manifest is dense, so asking for Q4 there is a hard error (never a silent bf16 run / an
+        // on-the-fly requant — that is not the Mochi tier mechanism).
         let dir = std::env::temp_dir().join(format!("mochi_load_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(mlx_gen::Quant::Q4);
         assert!(
             load(&spec).is_err(),
-            "on-the-fly quant is not the Mochi tier mechanism — must reject"
+            "Q4 against a dense (manifest-less) dir must error"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

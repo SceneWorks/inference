@@ -11,7 +11,7 @@
 //!
 //! The DiT runs in **f32** end-to-end: bf16 overflows to NaN at high token length (sc-5446 finding), and
 //! the f32 14B params (~28 GiB) fit the 96 GiB `minMemoryGb` budget. The `Conv3d` patch weights
-//! `[out, in, 1, 2, 2]` are read as `[out, in·4]` Linears via [`crate::common::conv_as_linear`].
+//! `[out, in, 1, 2, 2]` are read as `[out, in·4]` Linears via `crate::common::conv_as_linear`.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Linear, Module, VarBuilder};

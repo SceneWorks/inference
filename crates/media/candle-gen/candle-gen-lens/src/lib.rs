@@ -572,7 +572,7 @@ pub struct LensGenerator {
 
 impl LensGenerator {
     /// Test/parity constructor: a generator over a snapshot dir with the turbo defaults (lazy
-    /// components). The sampling defaults are irrelevant to [`denoise_for_parity`] (which takes
+    /// components). The sampling defaults are irrelevant to `denoise_for_parity` (which takes
     /// explicit `steps`/`guidance`); this just gives the e2e gate a concrete generator to drive.
     pub fn for_parity(root: impl AsRef<Path>) -> CResult<Self> {
         let device = candle_gen::default_device()?;

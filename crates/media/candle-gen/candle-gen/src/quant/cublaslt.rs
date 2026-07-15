@@ -110,7 +110,7 @@ pub struct PerChannelInt8Weight {
 
 /// Dynamic **per-output-channel** int8 weight quant — `scale[o] = absmax(row o) / 127`,
 /// `q[o, :] = round(w[o, :] / scale[o])` clamped to `[-127, 127]`. The candle-side dequant fold in
-/// [`CublasLt::matmul_int8_per_channel`] applies this `[out]` vector to the int32 accumulator.
+/// `CublasLt::matmul_int8_per_channel` applies this `[out]` vector to the int32 accumulator.
 ///
 /// This is the load-time twin of a ConvRot checkpoint's stored per-row weight scale; a loader that
 /// already has the on-disk `{base}.weight_scale` and int8 `{base}.weight` skips this and builds the

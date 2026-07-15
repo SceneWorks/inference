@@ -1,5 +1,5 @@
 //! EVA-CLIP input transform: the `face_features_image` (512² aligned, background-whitened grayscale,
-//! NCHW f32 in [0,1] from `candle-gen-face`) is resized to 336² and normalized with the OpenAI/EVA
+//! NCHW f32 in `0,1` from `candle-gen-face`) is resized to 336² and normalized with the OpenAI/EVA
 //! mean/std before the ViT.
 //!
 //! The reference is torchvision `resize(t, 336, BICUBIC)` on a **float** tensor — antialiased
@@ -98,7 +98,7 @@ pub fn resize_bicubic_f32(
     out
 }
 
-/// Full EVA transform: NCHW `[1, 3, H, W]` f32 in [0,1] → resized to `size²` (float bicubic) and
+/// Full EVA transform: NCHW `[1, 3, H, W]` f32 in `0,1` → resized to `size²` (float bicubic) and
 /// normalized `(x - mean) / std` per channel. Returns NCHW `[1, 3, size, size]` on the input's device.
 pub fn eva_transform(ffi_nchw: &Tensor, size: usize) -> Result<Tensor> {
     let (b, _c, in_h, in_w) = ffi_nchw.dims4()?;

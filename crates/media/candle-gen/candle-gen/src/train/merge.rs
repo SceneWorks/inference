@@ -5,30 +5,30 @@
 //! weight delta at f32, and **fold it into the dense base weights** (`W += δ`) *before* the stock
 //! model is built — a merge, not a forward-time residual, because the chaos-sensitive samplers make
 //! `(W+δ)·x` and `W·x + δ·x` diverge by ~1 ULP into a visibly different image (see
-//! [`reconstruct_lora_delta`](super::lora::reconstruct_lora_delta)). Eight crates hand-copied the
+//! `reconstruct_lora_delta`). Eight crates hand-copied the
 //! same format-parsing / merge-report skeleton around that reconstruction; this module is its single
-//! home (the delta reconstruction itself already lives in [`super::lora`]).
+//! home (the delta reconstruction itself already lives in `train::lora`).
 //!
 //! ## What is shared here (byte-identical across the families)
 //!
-//! - [`MergeReport`] — merged / skipped-key tally, and its zero-match loud-error contract (a
+//! - `MergeReport` — merged / skipped-key tally, and its zero-match loud-error contract (a
 //!   non-empty spec list that matches *nothing* is a format/prefix misconfiguration, surfaced loudly
-//!   via [`no_target_matched`] rather than silently rendering an unadapted image).
-//! - [`Role`] / [`LoraTriple`] — the `(down, up, alpha)` grouping of a LoRA target's factors.
-//! - [`AdapterFile`] + [`read_adapter`] — read a `.safetensors` once (tensors via candle's loader,
+//!   via `no_target_matched` rather than silently rendering an unadapted image).
+//! - `Role` / `LoraTriple` — the `(down, up, alpha)` grouping of a LoRA target's factors.
+//! - `AdapterFile` + `read_adapter` — read a `.safetensors` once (tensors via candle's loader,
 //!   header `__metadata__` via the safetensors reader, which candle's `load` drops but LoKr's
-//!   `rank`/`alpha` live in), plus [`AdapterFile::declares_lokr`].
-//! - [`merge_into`] — fold one `[out,in]` f32 delta into `{key}` (`W += δ` in f32), a missing or
+//!   `rank`/`alpha` live in), plus `AdapterFile::declares_lokr`.
+//! - `merge_into` — fold one `[out,in]` f32 delta into `{key}` (`W += δ` in f32), a missing or
 //!   shape-mismatched base surfaced as skipped.
-//! - [`read_scalar`] / [`read_scalar_opt`] — a per-target scalar (a LoRA `.alpha`, or any other
+//! - `read_scalar` / `read_scalar_opt` — a per-target scalar (a LoRA `.alpha`, or any other
 //!   1-element meta tensor), hardened against malformed third-party files (F-009 / sc-8989): a bad
 //!   tensor is a typed `Err` naming the key and a caller-supplied `field` label (F-119 / sc-11208, so
 //!   a non-`.alpha` scalar like `inject_offset` is not mislabelled), never a panic; `read_scalar_opt`
 //!   additionally tolerates a size-0 tensor as `None`.
-//! - [`build_kohya_table`] — the `flattened → dotted` disambiguation table from the base key set.
-//! - The whole **third-party LyCORIS** engine: [`ThirdPartyLokr`] / [`ThirdPartyLoha`] (per-module
-//!   lycoris-scale reconstruction) + [`parse_lokr_thirdparty`] / [`parse_loha_thirdparty`] +
-//!   [`merge_one_thirdparty`]. Untagged `lokr_*` / `hada_*` files carry no `networkType` stamp and
+//! - `build_kohya_table` — the `flattened → dotted` disambiguation table from the base key set.
+//! - The whole **third-party LyCORIS** engine: `ThirdPartyLokr` / `ThirdPartyLoha` (per-module
+//!   lycoris-scale reconstruction) + `parse_lokr_thirdparty` / `parse_loha_thirdparty` +
+//!   `merge_one_thirdparty`. Untagged `lokr_*` / `hada_*` files carry no `networkType` stamp and
 //!   derive rank/alpha/scale *per module*; SDXL, Qwen-Image and SCAIL2 share this verbatim.
 //!
 //! ## What stays per-family (the load-bearing drift the finding warns about)

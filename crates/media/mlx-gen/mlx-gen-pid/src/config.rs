@@ -60,6 +60,12 @@ pub struct PidConfig {
     pub lq_num_res_blocks: i32,
     /// Inject the LQ gate every `lq_interval` patch blocks. **2 for the distilled students.**
     pub lq_interval: i32,
+    /// Padding mode for the LQ conv stack (`zeros` base / `replicate` for v1.5). See [`ConvPadding`].
+    pub lq_conv_padding: ConvPadding,
+    /// PiD v1.5: inject an extra LQ feature into the PiT pixel stream (a dedicated `lq_proj.pit_head`
+    /// output gated by a top-level `pit_lq_gate` applied to the pixel-stream conditioning before the
+    /// pixel blocks). `false` for the base students (no `pit_head` / `pit_lq_gate` in the checkpoint).
+    pub pit_lq_inject: bool,
     /// Super-resolution factor baked into the network (4× or 8×).
     pub sr_scale: i32,
     /// VAE spatial compression (latent grid → pixel grid factor).
@@ -71,6 +77,18 @@ pub struct PidConfig {
 pub enum RopeMode {
     /// NTK-aware per-axis θ scaling (identity when the sampled grid == the reference grid).
     NtkAware,
+}
+
+/// Padding mode for the LQ adapter's Conv2d layers (`lq_projection_2d.py::conv_padding_mode`). The base
+/// students use `zeros`; the PiD v1.5 students use `replicate` (edge) padding to kill the grid artifacts
+/// zero-padding produced in the image corners. Scoped to the LQ conv stack only — the backbone convs are
+/// unaffected (they never take a padding_mode in the reference).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvPadding {
+    /// Zero padding (torch default) — every base `sr4x` student.
+    Zeros,
+    /// Edge/replicate padding — the PiD v1.5 students.
+    Replicate,
 }
 
 impl PidConfig {
@@ -127,8 +145,29 @@ impl PidConfig {
             lq_hidden_dim: 512,
             lq_num_res_blocks: 4,
             lq_interval: 2,
+            lq_conv_padding: ConvPadding::Zeros,
+            pit_lq_inject: false,
             sr_scale: 4,
             latent_spatial_down_factor: 8,
+        }
+    }
+
+    /// The **PiD v1.5** `res2kto4k` student topology (`net.py::PID_SR4X_V1PT5`, released 2026-07 for the
+    /// flux / flux2 / qwenimage latent spaces). Same PixDiT backbone as [`Self::sr4x`]; the LQ adapter
+    /// differs: a wider trunk (`lq_hidden_dim` 512→1024), a **per-token scalar** sigma gate (weight-shape
+    /// transparent — the loaded `content_proj` is `[1, 2·D]` and broadcasts), **replicate** conv padding,
+    /// a **2048** RoPE reference grid (the operating resolution), and **PiT LQ injection** (`pit_head` +
+    /// `pit_lq_gate`). The aux RGB head is training-only and absent from the EMA export, so nothing loads
+    /// it. Per-space `lq_latent_channels` / `latent_spatial_down_factor` overrides are applied on top by
+    /// the engine, exactly as for [`Self::sr4x`] (sc-12141 verified this against the real flux checkpoint).
+    pub fn sr4x_v1pt5() -> Self {
+        Self {
+            rope_ref_h: 2048,
+            rope_ref_w: 2048,
+            lq_hidden_dim: 1024,
+            lq_conv_padding: ConvPadding::Replicate,
+            pit_lq_inject: true,
+            ..Self::sr4x()
         }
     }
 }
@@ -193,5 +232,43 @@ impl Default for CaptionConfig {
             y_norm_scale_factor: 0.01,
             use_chi_prompt: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_base_topology_is_unchanged() {
+        // Guard the base students: zero padding, no PiT injection, 1024 RoPE ref, 512 LQ trunk.
+        let c = PidConfig::sr4x();
+        assert_eq!(c.lq_conv_padding, ConvPadding::Zeros);
+        assert!(!c.pit_lq_inject);
+        assert_eq!((c.rope_ref_h, c.rope_ref_w), (1024, 1024));
+        assert_eq!(c.lq_hidden_dim, 512);
+    }
+
+    #[test]
+    fn v1pt5_overrides_only_the_lq_and_rope_knobs() {
+        // sc-12141-confirmed deltas: replicate padding, PiT injection, 2048 RoPE ref, 1024 LQ trunk.
+        let c = PidConfig::sr4x_v1pt5();
+        assert_eq!(c.lq_conv_padding, ConvPadding::Replicate);
+        assert!(c.pit_lq_inject);
+        assert_eq!((c.rope_ref_h, c.rope_ref_w), (2048, 2048));
+        assert_eq!(c.lq_hidden_dim, 1024);
+
+        // Everything else — the PixDiT backbone + the shared LQ geometry — matches the base student, so
+        // the same backbone forward + the same 7 gate/output-head count are reused (num_lq_outputs=7).
+        let b = PidConfig::sr4x();
+        assert_eq!(c.hidden_size, b.hidden_size);
+        assert_eq!(c.num_groups, b.num_groups);
+        assert_eq!(c.patch_depth, b.patch_depth);
+        assert_eq!(c.pixel_depth, b.pixel_depth);
+        assert_eq!(c.patch_size, b.patch_size);
+        assert_eq!(c.lq_interval, b.lq_interval);
+        assert_eq!(c.lq_num_res_blocks, b.lq_num_res_blocks);
+        assert_eq!(c.num_lq_outputs(), 7);
+        assert_eq!(c.num_lq_outputs(), b.num_lq_outputs());
     }
 }

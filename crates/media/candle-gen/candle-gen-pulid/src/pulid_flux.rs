@@ -9,7 +9,7 @@
 //!   3. **IDFormer** ([`crate::idformer`]): `id_cond = cat(arcface 512, id_cond_vit 768)` + hidden →
 //!      `id_embedding` `[1,32,2048]`.
 //!   4. **CA injection** ([`crate::ca`]): build a [`PulidCa`] bound to the id_embedding and run the FLUX
-//!      flow-match denoise through [`IpFlux::forward_injected`] → AutoEncoder decode.
+//!      flow-match denoise through `IpFlux::forward_injected` → AutoEncoder decode.
 //!
 //! The conditioning path (EVA tower + IDFormer + the 20 CA modules) runs in **f32** for identity
 //! fidelity; the candle FLUX DiT image stream is bf16, so the CA residual is cast to the image dtype at

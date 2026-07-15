@@ -122,7 +122,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 /// Build one candle packed tier from a `Wan-AI/Wan2.2-*-Diffusers` snapshot at `diffusers_dir` into
 /// `out_dir` at `bits` (4 or 8). Packs each transformer component (`transformer/`, plus `transformer_2/`
-/// for the A14B dual-expert MoE) via [`pack_component_dir`]; copies every other component/file
+/// for the A14B dual-expert MoE) via `pack_component_dir`; copies every other component/file
 /// (`text_encoder/`, `vae/`, `tokenizer/`, `scheduler/`, `model_index.json`, …) verbatim so the tier is
 /// a complete, self-contained diffusers-layout snapshot the sc-10025 seam loads unchanged. Host the
 /// result at `SceneWorks/wan2.2-*-candle`.

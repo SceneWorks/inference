@@ -12,8 +12,8 @@
 //!
 //! What lives here:
 //! - [`kps`] — the 5-point facial-landmark control-image renderer (a bit-exact OpenCV-4.13 port of the
-//!   vendored `draw_kps`) + [`letterbox`](kps::letterbox) (the sc-2009 aspect rule) + the canonical
-//!   multi-view [`VIEW_ANGLE_KPS`](kps::VIEW_ANGLE_KPS) landmark sets.
+//!   vendored `draw_kps`) + `letterbox` (the sc-2009 aspect rule) + the canonical
+//!   multi-view `VIEW_ANGLE_KPS` landmark sets.
 //! - [`openpose`] — the COCO-18 body-skeleton control-image renderer for pose mode (a bit-exact port of
 //!   the worker's `draw_bodypose`), sharing the OpenCV primitives in [`kps`].
 //! - [`restore`] — the face-restoration compositing primitives (feathered elliptical mask + alpha

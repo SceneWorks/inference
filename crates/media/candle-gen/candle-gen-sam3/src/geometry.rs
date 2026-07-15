@@ -131,7 +131,7 @@ impl Sam3GeometryEncoder {
 
     /// Affine-quantize the geometry encoder's projections to Q4/Q8 (the `final_proj` + the 3 layers'
     /// attention/FFN). The `boxes_direct` (4→256) and `boxes_pos` (258→256) projections auto-skip and
-    /// stay dense ([`Linear::quantize`]); the ROI-pool conv + embeddings are dense.
+    /// stay dense (`Linear::quantize`); the ROI-pool conv + embeddings are dense.
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
         self.boxes_direct.quantize(quant)?;
         self.boxes_pos.quantize(quant)?;

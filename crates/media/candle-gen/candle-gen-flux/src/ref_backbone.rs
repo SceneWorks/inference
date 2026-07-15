@@ -35,8 +35,8 @@ use crate::pipeline::{Components, Pipeline};
 use crate::Variant;
 
 /// A loaded, tier-detected FLUX.1 backbone (CLIP + T5 + DiT + VAE + tokenizers) for the reference
-/// lanes. Holds the light [`Pipeline`] handle (variant/root/device/dtype) plus the loaded
-/// [`Components`] — the SAME pair the txt2img generator caches — so every op delegates to the shared,
+/// lanes. Holds the light `Pipeline` handle (variant/root/device/dtype) plus the loaded
+/// `Components` — the SAME pair the txt2img generator caches — so every op delegates to the shared,
 /// already-validated pipeline code.
 pub struct FluxRefBackbone {
     pipeline: Pipeline,
@@ -69,7 +69,7 @@ impl FluxRefBackbone {
     /// The FLUX DiT velocity forward with the optional **post-block** image-stream residual injector —
     /// the PuLID id cross-attn seam. Dispatches to the loaded tier's DiT: the BFL
     /// [`IpFlux::forward_injected`](crate::ip_dit::IpFlux::forward_injected) (dense snapshot) or the
-    /// diffusers [`PackedFluxDit::forward_injected`](crate::packed_dit::PackedFluxDit::forward_injected)
+    /// diffusers `PackedFluxDit::forward_injected`
     /// (packed/dense turnkey tier). `injector = None` is the plain FLUX forward. `guidance` is the dev
     /// per-batch embedded guidance (`None` for schnell). The two DiTs take the same argument shapes and
     /// inject at the same layout-agnostic block indices, so the caller's [`DitImageInjector`] is

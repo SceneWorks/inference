@@ -5,7 +5,7 @@
 //! NMS) is plain host math, identical to MLX.
 //!
 //! **Layout note:** MLX runs NHWC; candle's `conv2d` is NCHW (weights transposed OHWI→OIHW at load,
-//! see [`crate::common`]). The two spots where layout is load-bearing are handled explicitly: the
+//! see `crate::common`). The two spots where layout is load-bearing are handled explicitly: the
 //! 2×2 pool reshapes the NCHW size-2 axes (3,5), and each head output is permuted back to NHWC
 //! before the `[-1, K]` reshape so the `(h, w, anchor)` row order matches the onnx graph (and the
 //! anchor-centre decode below).

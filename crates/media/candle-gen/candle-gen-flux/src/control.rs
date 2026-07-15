@@ -18,9 +18,9 @@
 //! control checkpoint is the **diffusers** layout (`x_embedder`/`context_embedder`, split `attn.to_q`/
 //! `to_k`/`to_v` + `add_*_proj`, `norm1.linear` AdaLN-Zero, `ff.net.0.proj`). The two are
 //! computationally equivalent but key-incompatible, so the control branch ports the diffusers
-//! [`JointBlock`] here rather than reusing the BFL [`crate::ip_dit`] block — matching the mlx port
+//! `JointBlock` here rather than reusing the BFL `crate::ip_dit` block — matching the mlx port
 //! (where base + control happen to *share* the diffusers block because the mlx base is diffusers-layout
-//! too). The control RoPE is the **same** FLUX RoPE the base uses ([`crate::ip_dit::EmbedNd`] over
+//! too). The control RoPE is the **same** FLUX RoPE the base uses (`crate::ip_dit::EmbedNd` over
 //! `cat(txt_ids, img_ids)`), so the residuals align 1:1 with the base image tokens.
 //!
 //! Adapters (LoRA/LoKr) target the **base** transformer only — the control branch is never an adapter

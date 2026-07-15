@@ -1104,7 +1104,7 @@ impl FluxTokenizers {
 
 /// Encode `prompt` into FLUX's two conditioning tensors for `variant`: the T5 sequence `(1, L, 4096)`
 /// and the CLIP pooled vector `(1, 768)`, both at `dtype`. Shared by the txt2img
-/// [`Pipeline::text_embeddings`] and the IP-Adapter provider ([`crate::ip_provider`]) so the two never
+/// `Pipeline::text_embeddings` and the IP-Adapter provider ([`crate::ip_provider`]) so the two never
 /// drift on the parity-critical tokenization (T5 padded to the variant length; the vendored CLIP
 /// tokenizer). `toks` is the cached [`FluxTokenizers`] (sc-8991 / F-011). `t5` is locked only for the
 /// once-per-request encode.
@@ -1151,11 +1151,11 @@ pub fn encode_text(
 }
 
 /// Unpack the denoised latents `(1, h·w, 64)` back to `(1, 16, H/8, W/8)` and decode to an RGB8
-/// [`Image`]. Shared by the txt2img [`Pipeline::decode`] and the IP-Adapter provider (which passes
+/// [`Image`]. Shared by the txt2img `Pipeline::decode` and the IP-Adapter provider (which passes
 /// `pid = None`). The native path uses the FLUX `AutoEncoder` (its own `(z / scale) + shift` un-scale is
 /// applied inside `decode`); when a PiD decoder resolved (epic 7840 / sc-7853) the super-resolving
 /// `flux`-student consumes the SAME unpacked latent the VAE receives (a zero-transform seam) and emits a
-/// larger `[1,3,4H,4W]` tensor. Both yield `[-1, 1]` pixels; [`to_image`] reads the size from the tensor.
+/// larger `[1,3,4H,4W]` tensor. Both yield `[-1, 1]` pixels; `to_image` reads the size from the tensor.
 pub fn decode_latents(
     vae: &AutoEncoder,
     pid: Option<&PidDecoder>,

@@ -1,6 +1,6 @@
 //! Shared leaf helpers for the candle Depth Anything V2 port: a safetensors weight map
-//! ([`Weights`]), a per-last-dim [`Linear`], NHWC↔NCHW conv / transposed-conv wrappers, a small
-//! no-mask [`sdpa`] / [`layer_norm`], and a separable NHWC [`bilinear_resize`] (both `align_corners`
+//! ([`Weights`]), a per-last-dim `Linear`, NHWC↔NCHW conv / transposed-conv wrappers, a small
+//! no-mask `sdpa` / `layer_norm`, and a separable NHWC `bilinear_resize` (both `align_corners`
 //! conventions the DPT neck/head need). The candle twin of `mlx-gen-depth`'s `util.rs` (which mirrors
 //! `mlx-gen-sam3`'s `util`).
 //!

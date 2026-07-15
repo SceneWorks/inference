@@ -39,7 +39,7 @@ const OPTIMIZER_ALIASES: [(&str, &str); 8] = [
 
 /// Collapse a recognized optimizer alias to its canonical form (`"AdamW"`/`"adamw8bit"` → `"adamw"`,
 /// `"prodigy-opt"` → `"prodigy"`, `"rose_opt"` → `"rose"`) via **exact** (separator-insensitive,
-/// case-insensitive) matching against [`OPTIMIZER_ALIASES`].
+/// case-insensitive) matching against `OPTIMIZER_ALIASES`.
 ///
 /// Unknown names pass through **unchanged** (the separator-stripped, lowercased form) so they fail
 /// [`TrainOptimizer::from_config`] with a clear error listing the supported set — unlike the previous

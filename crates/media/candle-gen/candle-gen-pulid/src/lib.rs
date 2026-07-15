@@ -10,7 +10,7 @@
 //!     32-token `id_embedding`.
 //!   * [`ca`] — the 20 `PerceiverAttentionCA` modules injected into the FLUX DiT image stream via
 //!     `candle-gen-flux`'s post-block [`DitImageInjector`](candle_gen_flux::DitImageInjector) seam.
-//!   * [`pulid_flux`] — the end-to-end [`PulidFlux`](pulid_flux::PulidFlux) provider composing the
+//!   * [`pulid_flux`] — the end-to-end `PulidFlux` provider composing the
 //!     above with the candle FLUX.1-dev backbone + the `gen-core` `FaceEmbedder`.
 //!
 //! Like the other candle identity providers (InstantID, the IP-Adapters), [`PulidFlux`] is a plain

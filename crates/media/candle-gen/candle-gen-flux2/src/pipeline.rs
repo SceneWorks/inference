@@ -115,7 +115,7 @@ fn time_shift_exponential(mu: f32, sigma: f32) -> f32 {
 }
 
 /// Build the descending sigma schedule of length `num_steps + 1`: `num_steps` linspace points from
-/// `1.0` to `1/num_steps` warped by [`time_shift_exponential`], then a trailing `0.0`.
+/// `1.0` to `1/num_steps` warped by `time_shift_exponential`, then a trailing `0.0`.
 pub fn build_sigmas(num_steps: usize, mu: f32) -> Vec<f32> {
     let n = num_steps as f32;
     let (start, end) = (1.0f32, 1.0f32 / n);

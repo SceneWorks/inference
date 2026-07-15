@@ -14,6 +14,7 @@
 //! edges so each component is parity-gated in isolation against the A1 goldens.
 
 pub mod config;
+pub mod convert;
 pub mod model;
 pub mod pipeline;
 pub mod positions;
@@ -24,7 +25,11 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
 
-pub use config::{MochiConfig, MochiVaeConfig};
+pub use config::{MochiConfig, MochiSplitModel, MochiVaeConfig};
+pub use convert::{
+    convert_and_assemble, quantize_transformer_map, stage_shared_components, MochiConvertOpts,
+    MOCHI_QUANT_SUFFIXES,
+};
 pub use model::{descriptor, load, Mochi, MODEL_ID};
 pub use pipeline::{decode_to_frames, denoise, frames_to_images};
 pub use positions::get_positions;
@@ -33,8 +38,8 @@ pub use scheduler::{cfg_combine, linear_quadratic_schedule, MochiScheduler};
 pub use text_encoder::{encode_prompt, load_t5_encoder, MochiTextConditioning};
 pub use tokenizer::{load_tokenizer, load_tokenizer_with_max_len};
 pub use transformer::{
-    load_transformer_weights, MochiAttention, MochiDitConfig, MochiTransformer3DModel,
-    MochiTransformerBlock,
+    load_transformer_weights, MochiAttention, MochiDitConfig, MochiLinear, MochiQuant,
+    MochiTransformer3DModel, MochiTransformerBlock,
 };
 pub use vae::{load_vae_decoder, MochiVaeDecoder};
 

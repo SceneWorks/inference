@@ -11,7 +11,7 @@
 
 use mlx_gen::decoder::LatentDecoder;
 use mlx_gen::weights::Weights;
-use mlx_gen_pid::{PidConfig, PidDecoder, PidNet, RopeMode, Sampler, SamplerConfig};
+use mlx_gen_pid::{ConvPadding, PidConfig, PidDecoder, PidNet, RopeMode, Sampler, SamplerConfig};
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;
 
@@ -39,6 +39,8 @@ fn tiny_cfg() -> PidConfig {
         lq_hidden_dim: 8,
         lq_num_res_blocks: 2,
         lq_interval: 2,
+        lq_conv_padding: ConvPadding::Zeros,
+        pit_lq_inject: false,
         sr_scale: 2,
         latent_spatial_down_factor: 2,
     }

@@ -488,16 +488,16 @@ impl WanVae {
     /// whole clip). The only remaining spike is a single **high-resolution frame** decoded through the
     /// z48 vae22 decoder; spatial tiling caps that. So this tiles **only the spatial axes** and keeps
     /// the streaming temporal bound: each spatial tile is itself decoded via the per-frame streaming
-    /// [`decode`], preserving the causal feat-cache semantics.
+    /// `decode`, preserving the causal feat-cache semantics.
     ///
     /// Shares the pure [`gen_core::tiling`](candle_gen::gen_core::tiling) geometry verbatim with the LTX
     /// half ([`VaeTiling::WAN22`]: ×16 spatial, ×4 **causal** temporal): splits the latent into
-    /// overlapping spatial tiles, decodes each through the streaming [`decode`], and trapezoidally
+    /// overlapping spatial tiles, decodes each through the streaming `decode`, and trapezoidally
     /// blends them into the full video by pad-and-accumulate (bounded peak = one tile's streaming decode
-    /// plus the full-output `output`/`weights` buffers). Falls back to single-pass [`decode`] when `cfg`
+    /// plus the full-output `output`/`weights` buffers). Falls back to single-pass `decode` when `cfg`
     /// does not fire for these dims. `cfg` is expected to carry **spatial** tiling only (the budgeted
     /// selector never tiles the temporal axis here); a temporal `cfg` would split the causal stream at
-    /// tile boundaries and is not bit-exact vs. the streaming [`decode`].
+    /// tile boundaries and is not bit-exact vs. the streaming `decode`.
     pub fn decode_tiled(&self, z: &Tensor, cfg: &TilingConfig) -> Result<Tensor> {
         // The tile/narrow/blend/pad-accumulate/normalize DRIVER is shared with the LTX half in
         // `candle_gen::vae_tiling::decode_tiled` (sc-9006 / F-026). What stays wan-specific: the
@@ -650,9 +650,9 @@ fn estimated_wan22_decode_peak_gib(
 
 /// The safe peak-GiB budget for the z48 vae22 decode tiler. Resolved in order: `WAN_VAE_BUDGET_GIB`
 /// env override (positive float — the deterministic injection point for the worker/tests) → total VRAM
-/// × [`WAN22_VAE_BUDGET_SAFE_FRAC`] (via the shared trusted-path `nvidia-smi` probe
+/// × `WAN22_VAE_BUDGET_SAFE_FRAC` (via the shared trusted-path `nvidia-smi` probe
 /// [`candle_gen::gpu::nvidia_smi_min_total_gib`] — an absolute System32/CUDA_PATH binary, never a bare
-/// `PATH` lookup; sc-9014 / F-030) → [`WAN22_VAE_DEFAULT_BUDGET_GIB`].
+/// `PATH` lookup; sc-9014 / F-030) → `WAN22_VAE_DEFAULT_BUDGET_GIB`.
 pub fn wan22_vae_safe_budget_gib() -> f64 {
     vae_tiling::safe_budget_gib(
         WAN22_VAE_BUDGET_ENV,
@@ -661,7 +661,7 @@ pub fn wan22_vae_safe_budget_gib() -> f64 {
     )
 }
 
-/// **Memory-budgeted** spatial tiling for the z48 vae22 decode — routes the shared [`budgeted_plan`]
+/// **Memory-budgeted** spatial tiling for the z48 vae22 decode — routes the shared `budgeted_plan`
 /// selector through the vae22 cost model. Caller passes the **output** dims. `Ok(None)` → a single
 /// high-res frame already fits (streaming single-pass); `Ok(Some)` → the largest spatial tile that
 /// fits; `Err` → a catchable over-budget signal returned before the decode (not an OOM).

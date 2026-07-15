@@ -5,7 +5,7 @@
 //! sigma-gate I/O (exp(log_alpha)·σ broadcast + sigmoid), (3) the full gate-injected forward.
 
 use mlx_gen::weights::Weights;
-use mlx_gen_pid::{PidConfig, PidNet, RopeMode};
+use mlx_gen_pid::{ConvPadding, PidConfig, PidNet, RopeMode};
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;
 
@@ -40,6 +40,8 @@ fn tiny_cfg() -> PidConfig {
         lq_hidden_dim: 8,
         lq_num_res_blocks: 2,
         lq_interval: 2,
+        lq_conv_padding: ConvPadding::Zeros,
+        pit_lq_inject: false,
         sr_scale: 2,
         latent_spatial_down_factor: 2,
     }
@@ -57,7 +59,8 @@ fn lq_projection_features_match() {
     let net = PidNet::from_weights(&w, "", &tiny_cfg()).unwrap();
 
     // patch grid pH=4, pW=6 (H8/W12 over patch 2)
-    let feats = net.lq().forward(&lq_latent, 4, 6).unwrap();
+    // v1 tiny fixture has no PiT head, so the second tuple element (pit feature) is None.
+    let (feats, _pit) = net.lq().forward(&lq_latent, 4, 6).unwrap();
     assert_eq!(feats.len(), 2, "num lq output heads");
     for (i, f) in feats.iter().enumerate() {
         let golden = w.require(&format!("__io__.lq_feat_{i}")).unwrap();

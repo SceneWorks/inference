@@ -35,7 +35,7 @@ use crate::quant::{QEmbedding, QLinear};
 
 /// An mmaped component-directory of `.safetensors`, loading tensors at a fixed compute dtype.
 ///
-/// An optional in-memory `overlay` (installed by [`set_overlay`](Weights::set_overlay)) takes priority
+/// An optional in-memory `overlay` (installed by `set_overlay`) takes priority
 /// over the mmap for the keys it holds — the inference-side LoRA/LoKr adapter merge (sc-7836) folds its
 /// deltas into the targeted dense weights on the CPU in f32, then installs them here so
 /// [`crate::transformer::Krea2Transformer::load`] reads the **merged** weight without re-mmapping or
@@ -123,7 +123,7 @@ impl Weights {
         }
     }
 
-    /// Load `name` at the component dtype — from the [`overlay`](Weights::set_overlay) if present
+    /// Load `name` at the component dtype — from the `overlay` if present
     /// (adapter-merged weight), else the mmap (native-key-resolved for a ConvRot checkpoint).
     pub fn get(&self, name: &str) -> Result<Tensor> {
         if let Some(t) = self.overlay.get(name) {

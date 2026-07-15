@@ -432,7 +432,7 @@ pub struct AdditiveReport {
     /// so this fires only on a genuinely-absent target. Surfaced, never silently dropped.
     pub skipped_targets: Vec<String>,
     /// Adapter-file keys outside the LoRA/LoKr surface, half-pairs, 4-D conv pairs (folded separately by
-    /// [`fold_conv_adapters`], not additive), or shape-mismatched factors.
+    /// `fold_conv_adapters`, not additive), or shape-mismatched factors.
     pub skipped_keys: usize,
 }
 

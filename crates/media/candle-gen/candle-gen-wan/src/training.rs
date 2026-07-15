@@ -25,7 +25,7 @@
 //!  1. **No velocity negation.** Wan feeds the transformer output to the flow-match step *without*
 //!     negation (opposite of Z-Image's `noise_pred.neg()`), so the trainer regresses the **raw** DiT
 //!     velocity toward `noise − x0` (`target = noise − x0`). The timestep fed to the DiT is `t · 1000`
-//!     (the `[0, NUM_TRAIN_TIMESTEPS]` integer convention), not `1 − σ` — see [`compute_loss_grads`].
+//!     (the `[0, NUM_TRAIN_TIMESTEPS]` integer convention), not `1 − σ` — see `compute_loss_grads`.
 //!  2. **MoE dual-expert.** The A14B denoises with a **high-noise** expert (`transformer/`, timestep
 //!     ≥ `boundary·1000`) and a **low-noise** expert (`transformer_2/`, below it). Each gets its **own**
 //!     LoRA/LoKr (separate factor map + optimizer + LR schedule + timestep band). Training **alternates**

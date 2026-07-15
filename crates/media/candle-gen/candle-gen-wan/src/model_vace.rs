@@ -7,8 +7,8 @@
 //! neutralized clip + the person mask; extend/bridge = the source frames at the kept positions + a
 //! generated-span mask) and passes them as one [`Conditioning::ControlClip`]. This provider
 //! VAE-encodes the inactive/reactive split + unfolds the mask into the 96-channel control latent
-//! ([`crate::vace::prepare_video_latents`] / [`prepare_masks`](crate::vace::prepare_masks)) and runs
-//! the CFG VACE denoise loop ([`denoise_vace`](crate::vace::denoise_vace)). Reference images (from
+//! ([`crate::vace::prepare_video_latents`] / `prepare_masks`) and runs
+//! the CFG VACE denoise loop (`denoise_vace`). Reference images (from
 //! [`Conditioning::Reference`]) become leading latent frames and are dropped after denoise (diffusers
 //! `latents[:, :, num_reference_images:]`).
 //!

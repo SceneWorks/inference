@@ -2,7 +2,7 @@
 //! images ⇒ `fps=None`) — the candle transcription of `mlx-gen-anima`'s `rope.rs`. Builds the
 //! `(cos, sin)` tables for a `(pe_t, pe_h, pe_w)` post-patch latent grid over `head_dim` channels,
 //! split `dim_t | dim_h | dim_w` and duplicated (`[t,h,w]·2`) so the half-split rotate
-//! ([`crate::transformer::apply_rope_half`]) rotates matching frequency pairs.
+//! (`crate::transformer::apply_rope_half`) rotates matching frequency pairs.
 //!
 //! **Per-axis OOD reject (VERIFIED trap, same class as the PiD sincos-pos-embed bug).** The reference
 //! indexes `seq = arange(max(max_size))` per spatial axis; a request whose post-patch extent exceeds
@@ -17,7 +17,7 @@ use candle_gen::{CandleError, Result};
 use crate::config::DitConfig;
 
 /// Precomputed RoPE tables for a specific latent grid: `cos`/`sin` are `[1, seq_len, head_dim]`,
-/// ready for [`crate::transformer::apply_rope_half`] (broadcast over heads).
+/// ready for `crate::transformer::apply_rope_half` (broadcast over heads).
 pub struct CosmosRope {
     pub cos: Tensor,
     pub sin: Tensor,

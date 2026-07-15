@@ -16,7 +16,7 @@
 //!
 //! **Dtypes:** every component defaults to **f32** — the VAE always (`force_upcast=True`), and the
 //! UNet + image encoder too, because fp16 overflows to NaN in the deep spatio-temporal UNet and bf16's
-//! coarse mantissa collapses the wide-σ EDM denoise (see [`Components::load`] for the full rationale).
+//! coarse mantissa collapses the wide-σ EDM denoise (see `Components::load` for the full rationale).
 //! The experimental fp16/bf16 paths are reachable only via the `SVD_FORCE_F16` / `SVD_FORCE_BF16` env
 //! vars (the sc-5493 GPU follow-up). `backend = "candle"`, `mac_only = false`.
 

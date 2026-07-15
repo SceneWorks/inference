@@ -661,7 +661,7 @@ impl UNet2DConditionModel {
     /// InstantID inference forward: the SDXL UNet with the `add_embedding` micro-conditioning
     /// (`text_emb` pooled + `time_ids`), the decoupled IP-Adapter cross-attention (active once
     /// [`set_ip_context`](Self::set_ip_context) has set the face tokens), and the optional IdentityNet /
-    /// OpenPose ControlNet residuals. Reuses the shared [`run_blocks`](Self::run_blocks).
+    /// OpenPose ControlNet residuals. Reuses the shared `run_blocks`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_instantid(
         &self,
@@ -685,7 +685,7 @@ impl UNet2DConditionModel {
     }
 
     /// Install the IP-Adapter decoupled K/V `pairs` into the cross-attentions in the diffusers
-    /// `attn_processors` order (down → up → mid; see [`visit_cross_attn_mut`](Self::visit_cross_attn_mut))
+    /// `attn_processors` order (down → up → mid; see `visit_cross_attn_mut`)
     /// — 70 pairs for SDXL. Errors on a count mismatch (too few or too many) rather than silently
     /// leaving cross-attentions un-/over-installed.
     pub fn install_ip_adapter(&mut self, pairs: Vec<(Tensor, Tensor)>) -> Result<()> {

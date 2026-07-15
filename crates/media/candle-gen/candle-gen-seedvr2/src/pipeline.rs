@@ -335,7 +335,7 @@ impl Seedvr2Pipeline {
     // -----------------------------------------------------------------------
 
     /// Decode latents and crop spatially to `(true_h, true_w)`, **keeping all `T` frames** →
-    /// `(B,3,T,true_h,true_w)`. The 5-D analog of [`Self::decode_crop`] (which keeps only frame 0).
+    /// `(B,3,T,true_h,true_w)`. The 5-D analog of `Self::decode_crop` (which keeps only frame 0).
     pub fn decode_crop_5d(&self, latents: &Tensor, true_h: usize, true_w: usize) -> Result<Tensor> {
         let decoded = self.vae.decode(latents)?; // (B,3,T,H,W)
         decoded
