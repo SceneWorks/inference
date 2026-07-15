@@ -22,6 +22,7 @@
 pub mod config;
 pub mod conv3d;
 pub mod nn;
+pub mod rope;
 pub mod text_encoder;
 pub mod tokenizer;
 pub mod vae;
@@ -29,6 +30,7 @@ pub mod vae;
 use candle_gen::candle_core::DType;
 
 pub use config::{MochiConfig, MochiVaeConfig};
+pub use rope::{get_positions, MochiRope};
 pub use text_encoder::{encode_prompt, load_indexed_var_builder, MochiT5, MochiTextConditioning};
 pub use tokenizer::{load_tokenizer, MAX_SEQUENCE_LENGTH, PAD_TOKEN_ID};
 pub use vae::MochiVaeDecoder;
