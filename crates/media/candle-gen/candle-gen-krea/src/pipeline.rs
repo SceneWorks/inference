@@ -94,7 +94,13 @@ pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 /// Krea's TE (Qwen3-VL-4B) is *smaller* than its DiT — the qwen-image pattern (TE < DiT), not the lens
 /// pattern — so dropping it is a real but modest weight-side win (~2.9 GB at Q4); the larger effect is
 /// that the denoise activations no longer stack on top of a resident encoder.
-pub struct KreaText {
+///
+/// `pub(crate)`, not `pub`: every operation on it ([`encode_prompt_context`], [`encode_base_contexts`])
+/// is crate-private, so an exported `KreaText` would be an opaque value a caller could obtain and do
+/// nothing with — public surface this crate would then owe compatibility on (`CONTRIBUTING.md`) for a
+/// seam the module docs call internal. The mlx-gen twin exports its `KreaText` because that one carries
+/// public `from_snapshot` / `quantize` methods; this one carries none.
+pub(crate) struct KreaText {
     tok: crate::tokenizer::KreaTokenizer,
     te: KreaTextEncoder,
 }
@@ -106,11 +112,16 @@ pub struct KreaText {
 ///
 /// The VAE stays co-resident with the DiT through decode (it is small relative to the 12B DiT, so
 /// splitting them further buys ~nothing) — the qwen-image `load_vae_seq` precedent (sc-10867).
-pub struct KreaHeavy {
+///
+/// `pub(crate)` for the same reason as [`KreaText`]: [`render_from_context`] and its siblings are all
+/// crate-private, so there is nothing an external holder of this type could do with it.
+pub(crate) struct KreaHeavy {
     dit: Krea2Transformer,
     vae: Arc<QwenVae>,
-    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
-    /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `QwenVae` decode (the default path).
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853). Under `Resident` it is loaded
+    /// once with the cached components whenever `LoadSpec::pid` was set. Under `Sequential` it is loaded
+    /// per generate, so [`load_heavy`] takes `use_pid` and leaves this `None` for a request that never
+    /// asked for it (F-177). `None` ⇒ the native `QwenVae` decode (the default path).
     pid: Option<Arc<PidEngine>>,
 }
 
@@ -140,16 +151,35 @@ pub fn load_components(
 ) -> Result<Components> {
     // Both phases, in the SAME order the pre-split loader used (tokenizer + TE, then DiT + VAE + PiD),
     // so the resident load is byte-identical — the phase fns below are just the two halves named.
+    //
+    // `use_pid = true`: the resident set is built ONCE and cached across every request, before any
+    // `GenerationRequest` exists, so the PiD overlay must be there for whichever later request asks for
+    // it. That is the opposite of the `Sequential` path's calculus (see [`load_heavy`]), where the load
+    // is per-generate and the request IS in hand.
     let text = load_text(root, device)?;
-    let heavy = load_heavy(root, device, adapters, pid_spec)?;
+    let heavy = load_heavy(root, device, adapters, pid_spec, true)?;
     Ok(Components { text, heavy })
+}
+
+/// Which PiD spec [`load_heavy`] should actually load: the opted-in spec, but only when this load will
+/// use it (F-177).
+///
+/// `resolve_pid_decoder` already gates the *decode* on `req.use_pid`, so a PiD engine loaded for a
+/// request that did not ask for it is never read — under `Resident` that is a harmless one-time cost
+/// amortized across every later request, but under `Sequential` it is paid on EVERY generate and the
+/// student plus its multi-GB gemma-2-2b caption encoder sit resident through the whole denoise, inside
+/// the very peak the path exists to bound.
+///
+/// Pure so the rule is unit-testable without weights or a GPU (the `img2img_reference` idiom).
+fn pid_to_load(pid_spec: Option<&PidWeights>, use_pid: bool) -> Option<&PidWeights> {
+    pid_spec.filter(|_| use_pid)
 }
 
 /// Load ONLY the text phase — the tokenizer + the Qwen3-VL-4B text encoder (epic 10765 Phase 1c,
 /// sc-12089). The same two loads [`load_components`] runs first; factored out so the `Sequential` path
 /// can scope them to the encode and drop them before the DiT loads. Mirrors qwen-image's `load_te_seq`
 /// (sc-10867).
-pub fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
+pub(crate) fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
     let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
 
     let te_cfg = KreaTeConfig::from_snapshot(root)?;
@@ -164,11 +194,20 @@ pub fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
 /// the text phase, with the identical adapter/PiD handling; factored out so the `Sequential` path can
 /// load it AFTER the text phase was dropped, reusing that freed pool. Mirrors qwen-image's
 /// `load_transformer_seq` / `load_vae_seq` / `load_pid_seq` (sc-10867).
-pub fn load_heavy(
+///
+/// **`use_pid` (F-177).** Whether to load the optional PiD student. `load_components` passes `true` (the
+/// resident set is cached across requests, so the overlay must be there for whichever request wants it);
+/// the `Sequential` paths pass `req.use_pid`, because there the load runs on EVERY generate and the
+/// engine stays resident through the whole denoise. Loading it for a request that never asked would add
+/// the student **and** its multi-GB gemma-2-2b caption encoder to exactly the peak this path exists to
+/// bound — while `resolve_pid_decoder` goes on to return `None` for it, so not a byte of it is read.
+/// The mlx-gen twin threads the same flag (`load_krea_heavy(spec, root, id, load_pid)`).
+pub(crate) fn load_heavy(
     root: &Path,
     device: &Device,
     adapters: &[AdapterSpec],
     pid_spec: Option<&PidWeights>,
+    use_pid: bool,
 ) -> Result<KreaHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
     let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
@@ -188,9 +227,11 @@ pub fn load_heavy(
 
     let vae = load_vae(root, device)?;
 
-    // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller opted
-    // in via `LoadSpec::pid`; Krea shares the Qwen-Image VAE latent space (`qwenimage` student).
-    let pid = match pid_spec {
+    // The optional PiD super-resolving decoder (epic 7840 / sc-7853), loaded when the caller opted in via
+    // `LoadSpec::pid` AND this load will actually use it (F-177 — see the `use_pid` doc above; under
+    // `Sequential` this whole fn runs per generate). Krea shares the Qwen-Image VAE latent space
+    // (`qwenimage` student).
+    let pid = match pid_to_load(pid_spec, use_pid) {
         Some(spec) => Some(Arc::new(PidEngine::from_spec(spec, PID_BACKBONE, device)?)),
         None => None,
     };
@@ -304,6 +345,10 @@ pub fn render(
 /// (page-cached) snapshot. That reload cost is the deliberate trade for the lower peak, which is why it
 /// is opt-in per the fit-gate rather than the default.
 ///
+/// The schedule itself — the cancel checks at each stage boundary (F-173), the `Progress::Loading` emits
+/// (F-179), and the drop-before-load ordering — lives in [`candle_gen::run_sequential`], shared with
+/// every other wired candle engine. Only the two loaders and the encode/render bodies are krea's.
+///
 /// **cudarc caveat (epic 10765).** candle's CUDA allocator has no `empty_cache`, and
 /// `Device::synchronize()` does not reclaim: dropping the text phase frees back into candle's in-process
 /// pool, so the *peak allocation demand* falls but `nvidia-smi` resident VRAM will NOT. A/B therefore
@@ -317,17 +362,15 @@ pub fn render_sequential(
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    // Phase 1 — text encode, scoped so the Qwen3-VL-4B encoder drops at the brace before the DiT loads.
-    let context = {
-        let text = load_text(root, device)?;
-        encode_prompt_context(&text, req)?
-    };
-
-    // Phase 2 — the heavy set, loaded into the pool the text phase just freed.
-    let heavy = load_heavy(root, device, adapters, pid_spec)?;
-
-    // Phase 3 — the shared denoise + decode tail, identical to `render`'s.
-    render_from_context(&heavy, req, device, &context, on_progress)
+    candle_gen::run_sequential(
+        &req.cancel,
+        on_progress,
+        || load_text(root, device),
+        |text| encode_prompt_context(text, req),
+        // F-177: skip the PiD student + its caption encoder unless THIS request decodes through it.
+        || load_heavy(root, device, adapters, pid_spec, req.use_pid),
+        |heavy, context, on_progress| render_from_context(heavy, req, device, &context, on_progress),
+    )
 }
 
 /// SPIKE (sc-8596, HELD) — the ComfyUI-Conditioning-Rebalance trick ported to candle: reweight the 12
@@ -554,26 +597,31 @@ pub fn render_img2img_sequential(
     strength: Option<f32>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    // Phase 1 — text encode, scoped so the Qwen3-VL-4B encoder drops before the DiT loads.
-    let context = {
-        let text = load_text(root, device)?;
-        encode_prompt_context(&text, req)?
-    };
-
-    // Phase 2 — the heavy set + the VAE encoder, into the pool the text phase just freed.
-    let heavy = load_heavy(root, device, adapters, pid_spec)?;
-    let vae_encoder = load_vae_encoder(root, device)?;
-
-    // Phase 3 — the shared reference-encode + denoise + decode tail, identical to `render_img2img`'s.
-    render_img2img_from_context(
-        &heavy,
-        &vae_encoder,
-        req,
-        reference,
-        strength,
-        device,
-        &context,
+    candle_gen::run_sequential(
+        &req.cancel,
         on_progress,
+        || load_text(root, device),
+        |text| encode_prompt_context(text, req),
+        // The VAE encoder rides the heavy phase: it is small, and the reference encode is not needed
+        // until the init latent is built, so loading it here keeps peak at max(TE, heavy).
+        // F-177: no PiD student unless this request decodes through it.
+        || {
+            let heavy = load_heavy(root, device, adapters, pid_spec, req.use_pid)?;
+            let vae_encoder = load_vae_encoder(root, device)?;
+            Ok((heavy, vae_encoder))
+        },
+        |(heavy, vae_encoder), context, on_progress| {
+            render_img2img_from_context(
+                heavy,
+                vae_encoder,
+                req,
+                reference,
+                strength,
+                device,
+                &context,
+                on_progress,
+            )
+        },
     )
 }
 
@@ -702,24 +750,26 @@ pub fn render_base_sequential(
 ) -> Result<Vec<Image>> {
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
 
-    // Phase 1 — encode both CFG branches, scoped so the Qwen3-VL-4B encoder drops before the DiT loads.
-    let (context, neg_context) = {
-        let text = load_text(root, device)?;
-        encode_base_contexts(&text, req, guidance)?
-    };
-
-    // Phase 2 — the heavy set, loaded into the pool the text phase just freed.
-    let heavy = load_heavy(root, device, adapters, pid_spec)?;
-
-    // Phase 3 — the shared CFG denoise + decode tail, identical to `render_base`'s.
-    render_base_from_contexts(
-        &heavy,
-        req,
-        device,
-        &context,
-        neg_context.as_ref(),
-        guidance,
+    candle_gen::run_sequential(
+        &req.cancel,
         on_progress,
+        || load_text(root, device),
+        // Both CFG branches encode before the drop — the denoise consumes the uncond context every step,
+        // so a text phase dropped after only the positive encode would have to reload it.
+        |text| encode_base_contexts(text, req, guidance),
+        // F-177: no PiD student unless this request decodes through it.
+        || load_heavy(root, device, adapters, pid_spec, req.use_pid),
+        |heavy, (context, neg_context), on_progress| {
+            render_base_from_contexts(
+                heavy,
+                req,
+                device,
+                &context,
+                neg_context.as_ref(),
+                guidance,
+                on_progress,
+            )
+        },
     )
 }
 
@@ -891,28 +941,31 @@ pub fn render_base_img2img_sequential(
 ) -> Result<Vec<Image>> {
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
 
-    // Phase 1 — encode both CFG branches, scoped so the encoder drops before the DiT loads.
-    let (context, neg_context) = {
-        let text = load_text(root, device)?;
-        encode_base_contexts(&text, req, guidance)?
-    };
-
-    // Phase 2 — the heavy set + the VAE encoder, into the pool the text phase just freed.
-    let heavy = load_heavy(root, device, adapters, pid_spec)?;
-    let vae_encoder = load_vae_encoder(root, device)?;
-
-    // Phase 3 — the shared tail, identical to `render_base_img2img`'s.
-    render_base_img2img_from_contexts(
-        &heavy,
-        &vae_encoder,
-        req,
-        reference,
-        strength,
-        device,
-        &context,
-        neg_context.as_ref(),
-        guidance,
+    candle_gen::run_sequential(
+        &req.cancel,
         on_progress,
+        || load_text(root, device),
+        |text| encode_base_contexts(text, req, guidance),
+        // VAE encoder heavy-side (see `render_img2img_sequential`); F-177 on the PiD student.
+        || {
+            let heavy = load_heavy(root, device, adapters, pid_spec, req.use_pid)?;
+            let vae_encoder = load_vae_encoder(root, device)?;
+            Ok((heavy, vae_encoder))
+        },
+        |(heavy, vae_encoder), (context, neg_context), on_progress| {
+            render_base_img2img_from_contexts(
+                heavy,
+                vae_encoder,
+                req,
+                reference,
+                strength,
+                device,
+                &context,
+                neg_context.as_ref(),
+                guidance,
+                on_progress,
+            )
+        },
     )
 }
 
@@ -1413,6 +1466,33 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through
+    /// it, so a `Sequential` generate that never asked for PiD does not pay for the student + its
+    /// gemma-2-2b caption encoder — per generate, resident through the whole denoise, inside the peak
+    /// the path exists to bound.
+    ///
+    /// The resident loader passes `use_pid = true` unconditionally and that is correct, not an
+    /// oversight: it builds one cached set BEFORE any request exists, so the overlay has to be there for
+    /// whichever later request wants it.
+    #[test]
+    fn pid_loads_only_when_the_request_uses_it() {
+        let spec = PidWeights {
+            checkpoint: gen_core::WeightsSource::File("/pid.safetensors".into()),
+            gemma: gen_core::WeightsSource::Dir("/gemma".into()),
+        };
+
+        // Opted in at load AND wanted by this request → load it.
+        assert!(pid_to_load(Some(&spec), true).is_some());
+        // Opted in at load but NOT wanted by this request → skip it. This is the F-177 arm: before the
+        // fix this loaded the engine and `resolve_pid_decoder` then returned `None` for it, so not a byte
+        // was ever read.
+        assert!(pid_to_load(Some(&spec), false).is_none());
+        // Never opted in → nothing to load, whatever the request asked for. (`use_pid` with no `pid`
+        // spec is `resolve_pid_decoder`'s error to report, not a reason to load anything here.)
+        assert!(pid_to_load(None, true).is_none());
+        assert!(pid_to_load(None, false).is_none());
+    }
 
     /// SPIKE (sc-8596): all-ones tap weights are an identity reweight (byte-exact), and a per-layer
     /// scalar scales exactly its select-layer slice along axis 2.

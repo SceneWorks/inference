@@ -519,17 +519,6 @@ pub(crate) fn transformer_is_packed(dit_dir: &Path) -> bool {
         .is_some()
 }
 
-/// Whether the sequential-residency offload path is force-enabled by env (epic 10765 Phase 1c,
-/// sc-10867). Reads `CANDLE_GEN_OFFLOAD`: `sequential` (case-insensitive) selects the phased
-/// load→encode→drop path regardless of `LoadSpec::offload_policy`; unset or any other value defers to
-/// the spec (the worker fit-gate sets the policy in production). Kept as the override the two-process
-/// GPU A/B harness drives, mirroring the candle-gen-flux toggle (sc-10769/sc-10821).
-fn sequential_offload_enabled() -> bool {
-    std::env::var("CANDLE_GEN_OFFLOAD")
-        .map(|value| value.trim().eq_ignore_ascii_case("sequential"))
-        .unwrap_or(false)
-}
-
 pub struct QwenImageGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
@@ -617,7 +606,8 @@ impl Generator for QwenImageGenerator {
         // file, not `root/transformer/`, so the per-phase loaders can't source it (advisory: falls back
         // to resident). The default stays the resident, cross-request-cached path.
         let sequential = self.comfyui_dit.is_none()
-            && (self.offload_policy == OffloadPolicy::Sequential || sequential_offload_enabled());
+            && (self.offload_policy == OffloadPolicy::Sequential
+                || candle_gen::sequential_offload_enabled());
         let images = if sequential {
             // F-132 (sc-11190): evict any resident component set a prior *resident* request populated
             // before we phase-load. `CANDLE_GEN_OFFLOAD` / the offload policy are re-read every

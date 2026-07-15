@@ -660,17 +660,6 @@ impl Pipeline {
     }
 }
 
-/// Whether the sequential-residency offload path is enabled (epic 10765 Phase 1c, sc-10868). Reads the
-/// process-wide `CANDLE_GEN_OFFLOAD` env (shared with the candle FLUX.1 lane, sc-10769): `sequential`
-/// (case-insensitive) selects the phased load/free path; unset or any other value keeps the resident,
-/// cross-request-cached default. The worker's fit-gate drives the same choice per-load via
-/// `LoadSpec::offload_policy`; this env toggle is the GPU A/B harness seam.
-pub(crate) fn sequential_offload_enabled() -> bool {
-    std::env::var("CANDLE_GEN_OFFLOAD")
-        .map(|value| value.trim().eq_ignore_ascii_case("sequential"))
-        .unwrap_or(false)
-}
-
 /// Map a decoded `[1, 3, H, W]` tensor in `[-1, 1]` to an RGB8 [`Image`].
 pub(crate) fn to_image(decoded: &Tensor) -> CResult<Image> {
     let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
@@ -776,7 +765,8 @@ impl Generator for Flux2Generator {
         // `root/transformer/`, so the sequential per-phase loaders can't source it (falls back to
         // resident). The default stays the resident, cross-request-cached path.
         let sequential = self.comfyui_dit.is_none()
-            && (self.offload_policy == OffloadPolicy::Sequential || sequential_offload_enabled());
+            && (self.offload_policy == OffloadPolicy::Sequential
+                || candle_gen::sequential_offload_enabled());
         let images = if sequential {
             pipe.render_sequential(req, on_progress)?
         } else {
@@ -1314,13 +1304,11 @@ mod tests {
         assert!(load_dev(&seq).is_ok());
         assert!(load_klein(&seq).is_ok());
 
-        // The env override is read independently of the spec (the GPU A/B harness seam).
-        std::env::set_var("CANDLE_GEN_OFFLOAD", "SeQuEnTiAl");
-        assert!(super::sequential_offload_enabled());
-        std::env::set_var("CANDLE_GEN_OFFLOAD", "resident");
-        assert!(!super::sequential_offload_enabled());
-        std::env::remove_var("CANDLE_GEN_OFFLOAD");
-        assert!(!super::sequential_offload_enabled());
+        // The `CANDLE_GEN_OFFLOAD` override's semantics (spelling / case / whitespace) are asserted where
+        // the reader lives — `candle_gen::residency` — rather than re-tested per engine (sc-12089). This
+        // block used to set the process-global var here and `remove_var` it on the way out, which silently
+        // clobbered an ambient export rather than restoring it; the assertions moved, so the mutation goes
+        // with them.
     }
 
     /// Shared body for the FLUX.2 offload A/B harnesses (epic 10765 Phase 1c, sc-10868 dev / sc-11008

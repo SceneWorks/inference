@@ -894,7 +894,8 @@ impl Pipeline {
     /// over a [`DitRef`], and [`decode`](Self::decode)/[`decode_packed`](Self::decode_packed)); only the
     /// load/free schedule differs.
     ///
-    /// Selected by the generator when [`sequential_offload_enabled`] (`CANDLE_GEN_OFFLOAD=sequential`).
+    /// Selected by the generator when [`candle_gen::sequential_offload_enabled`]
+    /// (`CANDLE_GEN_OFFLOAD=sequential`) or `LoadSpec::offload_policy` is `Sequential`.
     /// Because it drops components, it does NOT populate the generator's `Components` cache — repeat
     /// requests reload from the (page-cached) snapshot; that reload cost is the deliberate trade for the
     /// lower peak, which is why it is opt-in per the fit-gate rather than the default.
@@ -978,17 +979,6 @@ impl Pipeline {
             }
         })
     }
-}
-
-/// Whether the sequential-residency offload path is enabled (epic 10765 Phase 1, sc-10769). Reads
-/// `CANDLE_GEN_OFFLOAD`: `sequential` (case-insensitive) selects the phased load/free path; unset or any
-/// other value keeps the resident, cross-request-cached default. The worker's fit-gate sets this when it
-/// predicts the resident TE+DiT+VAE sum won't fit but the DiT+VAE working set will (Slice 1b wires a
-/// per-load `LoadSpec::offload_policy`; this env toggle is the first-slice mechanism + the test seam).
-pub(crate) fn sequential_offload_enabled() -> bool {
-    std::env::var("CANDLE_GEN_OFFLOAD")
-        .map(|value| value.trim().eq_ignore_ascii_case("sequential"))
-        .unwrap_or(false)
 }
 
 /// Convert a decoded pixel tensor `(1, 3, H, W)` in `[-1, 1]` (f32) → RGB8 [`Image`] (`(x+1)·127.5`).

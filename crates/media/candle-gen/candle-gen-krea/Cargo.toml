@@ -47,5 +47,8 @@ cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda", "candle-gen-boogu/cuda"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Shared test-support helpers (sc-9055 / F-069: `candle_gen::testkit`). The sequential-residency offload
 # A/B (sc-12089, `krea_probed_generate_for_offload_ab`) reads the device VRAM high-water through
-# `testkit::PeakSampler` — the same seam the flux / flux2 A/B harnesses use.
+# `testkit::VramProbe` (sc-9094), which separates load-peak / steady / overall-peak and states each as a
+# delta over a recorded idle baseline. NOT the bare `testkit::PeakSampler` the flux / flux2 A/Bs use:
+# those hardcode the sampled GPU ordinal to 0 while `nvidia-smi -i` ignores `CUDA_VISIBLE_DEVICES`, so on
+# a multi-GPU box they can sample the wrong card (sc-12107 tracks the 8 sites).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }

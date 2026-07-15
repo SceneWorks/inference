@@ -312,7 +312,7 @@ impl QwenEdit {
         // worker fit-gate via `offload_policy`, or forced by the `CANDLE_GEN_OFFLOAD=sequential` env the
         // GPU A/B harness drives (the shared txt2img override, sc-10867).
         let sequential = paths.offload_policy == OffloadPolicy::Sequential
-            || crate::sequential_offload_enabled();
+            || candle_gen::sequential_offload_enabled();
         let resident = if sequential {
             None
         } else {
