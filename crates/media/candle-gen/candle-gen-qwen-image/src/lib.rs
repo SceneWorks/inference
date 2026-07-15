@@ -88,7 +88,7 @@ mod edit_validate;
 mod comfyui_vae_validate;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -142,6 +142,19 @@ struct SeqHeavy {
     pid: Option<Arc<PidEngine>>,
 }
 
+enum TextPhase {
+    Resident(Components),
+    Sequential(Box<(QwenTextEncoder, TextTokenizer)>),
+}
+
+enum HeavyPhase {
+    Resident(Components),
+    Sequential(Box<SeqHeavy>),
+}
+
+type QwenResidency = candle_gen::Residency<TextPhase, HeavyPhase>;
+
+#[derive(Clone)]
 struct Pipeline {
     te_cfg: TextEncoderConfig,
     dit_cfg: TransformerConfig,
@@ -290,32 +303,56 @@ impl Pipeline {
         }
     }
 
-    fn render(
+    fn encode_phase(
         &self,
+        phase: &TextPhase,
         req: &GenerationRequest,
-        comps: &Components,
+    ) -> CResult<(Tensor, Option<Tensor>, f32)> {
+        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let encode = |te: &QwenTextEncoder, tok: &TextTokenizer| -> CResult<_> {
+            let pos = self.encode(te, tok, &req.prompt)?;
+            let neg = if guidance > 1.0 {
+                let negative = Self::resolve_negative(req.negative_prompt.as_deref());
+                Some(self.encode(te, tok, negative)?)
+            } else {
+                None
+            };
+            Ok((pos, neg, guidance))
+        };
+        match phase {
+            TextPhase::Resident(comps) => encode(&comps.te, &comps.tokenizer),
+            TextPhase::Sequential(text) => {
+                let (te, tok) = text.as_ref();
+                encode(te, tok)
+            }
+        }
+    }
+
+    fn render_phase(
+        &self,
+        phase: &HeavyPhase,
+        req: &GenerationRequest,
+        encoded: (Tensor, Option<Tensor>, f32),
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Vec<Image>> {
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-
-        let pos_embeds = self.encode(&comps.te, &comps.tokenizer, &req.prompt)?;
-        // True CFG: build the negative branch unless guidance is a no-op (≤ 1.0).
-        let neg_embeds = if guidance > 1.0 {
-            let neg = Self::resolve_negative(req.negative_prompt.as_deref());
-            Some(self.encode(&comps.te, &comps.tokenizer, neg)?)
-        } else {
-            None
+        let (pos, neg, guidance) = encoded;
+        let (transformer, vae, pid) = match phase {
+            HeavyPhase::Resident(comps) => (
+                comps.transformer.as_ref(),
+                comps.vae.as_ref(),
+                comps.pid.as_deref(),
+            ),
+            HeavyPhase::Sequential(heavy) => {
+                (&heavy.transformer, &heavy.vae, heavy.pid.as_deref())
+            }
         };
-
-        // The DiT / VAE / optional PiD are already resident in the cross-request-cached `comps`; run the
-        // shared denoise + decode tail (byte-identical to the sequential path).
         self.denoise_and_decode(
             req,
-            &comps.transformer,
-            &comps.vae,
-            comps.pid.as_deref(),
-            &pos_embeds,
-            neg_embeds.as_ref(),
+            transformer,
+            vae,
+            pid,
+            &pos,
+            neg.as_ref(),
             guidance,
             on_progress,
         )
@@ -323,12 +360,9 @@ impl Pipeline {
 
     /// The shared denoise + decode tail (epic 10765 Phase 1c, sc-10867): given already-encoded prompt
     /// embeds and the just-resident DiT / VAE / optional PiD decoder, run the per-image flow sampler and
-    /// decode. Called by BOTH the resident [`render`](Self::render) (which borrows the components out of
-    /// the cross-request-cached [`Components`]) and the sequential
-    /// [`render_sequential`](Self::render_sequential) (which owns just-loaded components after the text
-    /// encoder was dropped). Byte-identical between the two paths — only the load/free schedule of the
-    /// components differs, not this code. The borrows (`&QwenTransformer` / `&QwenVae` /
-    /// `Option<&PidEngine>`) let both an `Arc`-cached and an owned component feed the same loop.
+    /// decode. Both residency variants feed this same tail; only the load/free schedule differs. The
+    /// borrows (`&QwenTransformer` / `&QwenVae` / `Option<&PidEngine>`) let both an `Arc`-resident and
+    /// an owned sequential component feed the same loop.
     #[allow(clippy::too_many_arguments)]
     fn denoise_and_decode(
         &self,
@@ -478,66 +512,6 @@ impl Pipeline {
         })
     }
 
-    /// Sequential-residency render (epic 10765 Phase 1c, sc-10867): load the Qwen2.5-VL text encoder →
-    /// encode → DROP it → load the DiT + VAE (+ optional PiD) → denoise/decode. Peak VRAM is bounded to
-    /// the DiT+VAE working set instead of TE+DiT+VAE, reclaiming the ~8 GB Qwen2.5-VL encoder, so a card
-    /// that OOMs the resident path can still render. Output is **bit-identical** to
-    /// [`render`](Self::render) — the SAME [`encode`](Self::encode) and the SAME shared
-    /// [`denoise_and_decode`](Self::denoise_and_decode) tail run; only the load/free schedule differs.
-    ///
-    /// Selected by the generator from `LoadSpec::offload_policy` (the worker fit-gate sets `Sequential`)
-    /// or the `CANDLE_GEN_OFFLOAD=sequential` env override (the GPU A/B harness). Because it drops the
-    /// components, it does NOT populate the generator's `Components` cache — repeat requests reload from
-    /// the (page-cached) snapshot; that reload cost is the deliberate trade for the lower peak, which is
-    /// why it is opt-in per the fit-gate rather than the default.
-    ///
-    /// The schedule itself — the cancel checks at each stage boundary (F-173), the `Progress::Loading`
-    /// emits (F-179), and the drop-before-load ordering — lives in [`candle_gen::run_sequential`], shared
-    /// with every other wired candle engine (sc-12089). Only the two loaders and the encode/render bodies
-    /// are Qwen-Image's.
-    fn render_sequential(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> CResult<Vec<Image>> {
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-
-        candle_gen::run_sequential(
-            &req.cancel,
-            on_progress,
-            // The text phase is the ~8 GB Qwen2.5-VL encoder + its cheap tokenizer; both drop after the
-            // encode so the encoder frees before the DiT loads.
-            || self.load_te_seq(),
-            // Delegates to the SAME `encode` the resident path uses, so tokenization + the conditioning
-            // tensors are byte-identical to `render`.
-            |(te, tok)| {
-                let pos = self.encode(te, tok, &req.prompt)?;
-                // True CFG: build the negative branch unless guidance is a no-op (≤ 1.0).
-                let neg = if guidance > 1.0 {
-                    let neg = Self::resolve_negative(req.negative_prompt.as_deref());
-                    Some(self.encode(te, tok, neg)?)
-                } else {
-                    None
-                };
-                Ok((pos, neg))
-            },
-            // F-177: skip the PiD student unless THIS request decodes through it.
-            || self.load_heavy_seq(req.use_pid),
-            // The shared denoise + decode tail, identical to `render`'s.
-            |heavy, (pos_embeds, neg_embeds), on_progress| {
-                self.denoise_and_decode(
-                    req,
-                    &heavy.transformer,
-                    &heavy.vae,
-                    heavy.pid.as_deref(),
-                    &pos_embeds,
-                    neg_embeds.as_ref(),
-                    guidance,
-                    on_progress,
-                )
-            },
-        )
-    }
 }
 
 /// The MLX packed `group_size` for the DiT, read from `transformer/config.json`'s `quantization`
@@ -572,37 +546,8 @@ pub(crate) fn transformer_is_packed(dit_dir: &Path) -> bool {
 
 pub struct QwenImageGenerator {
     descriptor: ModelDescriptor,
-    root: PathBuf,
-    device: Device,
-    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
-    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
-    pid_spec: Option<PidWeights>,
-    /// Component-residency policy captured from `LoadSpec::offload_policy` (epic 10765 Phase 1c,
-    /// sc-10867). `Sequential` routes `generate` through `render_sequential` (load→encode→drop the
-    /// Qwen2.5-VL text encoder before the DiT), capping peak VRAM at the cost of the components cache;
-    /// `Resident` (default) keeps the cached path. The worker's fit-gate sets this when it predicts the
-    /// resident TE+DiT+VAE sum won't fit but the DiT+VAE working set will. Inert on the in-place ComfyUI
-    /// DiT lane (that transformer is a single file, not `root/transformer/` — sequential defers there).
-    offload_policy: OffloadPolicy,
-    /// An in-place ComfyUI Qwen-Image DiT single-file (epic 10451 Phase 2b, sc-10670), set only by
-    /// [`load_from_comfyui_dit`]. When present, the lazy component build sources the transformer from
-    /// this file (prefix-strip + fp8→bf16) and the TE/tokenizer from [`Self::root`]; `None` on the
-    /// registry path.
-    comfyui_dit: Option<PathBuf>,
-    /// An in-place ComfyUI Qwen-Image VAE single-file (epic 10451 Phase 2b, sc-10830), set only by
-    /// [`load_from_comfyui_dit`]. When present the VAE is read from this file (native WAN-VAE keys
-    /// remapped); `None` ⇒ the snapshot's `vae/`.
-    comfyui_vae: Option<PathBuf>,
-    components: Mutex<Option<Components>>,
-}
-
-impl QwenImageGenerator {
-    fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
-        Ok(candle_gen::cached(&self.components, || {
-            pipe.load_components()
-        })?)
-    }
+    pipe: Pipeline,
+    residency: QwenResidency,
 }
 
 impl Generator for QwenImageGenerator {
@@ -639,39 +584,15 @@ impl Generator for QwenImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = match &self.comfyui_dit {
-            Some(dit_file) => Pipeline::load_comfyui(
-                &self.root,
-                &self.device,
-                dit_file.clone(),
-                self.comfyui_vae.clone(),
-            ),
-            None => Pipeline::load(&self.root, &self.device, self.pid_spec.clone()),
-        };
-        // Sequential-residency offload (epic 10765 Phase 1c, sc-10867): when selected, load→encode→drop
-        // the ~8 GB Qwen2.5-VL text encoder before the DiT so peak VRAM is DiT+VAE, not TE+DiT+VAE —
-        // letting a card that OOMs the resident path render. Output is bit-identical; it bypasses the
-        // components cache (it drops what it loads). Driven by `LoadSpec::offload_policy` (the worker
-        // fit-gate sets `Sequential`); `CANDLE_GEN_OFFLOAD=sequential` is an env override kept for the
-        // GPU A/B harness. Never taken on the in-place ComfyUI DiT lane — that transformer is a single
-        // file, not `root/transformer/`, so the per-phase loaders can't source it (advisory: falls back
-        // to resident). The default stays the resident, cross-request-cached path.
-        let sequential = self.comfyui_dit.is_none()
-            && (self.offload_policy == OffloadPolicy::Sequential
-                || candle_gen::sequential_offload_enabled());
-        let images = if sequential {
-            // F-132 (sc-11190): evict any resident component set a prior *resident* request populated
-            // before we phase-load. `CANDLE_GEN_OFFLOAD` / the offload policy are re-read every
-            // `generate`, so a resident request can leave `self.components` holding a live TE+DiT+VAE
-            // Arc set; without this take, a later sequential request would load its phased copies on
-            // top of that, peaking at resident + sequential — the opposite of the flag's purpose.
-            // Dropping the cached Arc set here frees the resident residency first. Poison-tolerant.
-            *candle_gen::lock_recover(&self.components) = None;
-            pipe.render_sequential(req, on_progress)?
-        } else {
-            let components = self.components(&pipe)?;
-            pipe.render(req, &components, on_progress)?
-        };
+        let images = self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text| self.pipe.encode_phase(text, req),
+            |heavy, encoded, on_progress| {
+                self.pipe.render_phase(heavy, req, encoded, on_progress)
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -719,6 +640,36 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+fn generator_from_pipeline(
+    pipe: Pipeline,
+    policy: OffloadPolicy,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let resident_pipe = pipe.clone();
+    let text_pipe = pipe.clone();
+    let heavy_pipe = pipe.clone();
+    let residency = QwenResidency::from_policy_with_resident(
+        policy,
+        move || {
+            let comps = resident_pipe.load_components()?;
+            Ok((
+                TextPhase::Resident(comps.clone()),
+                HeavyPhase::Resident(comps),
+            ))
+        },
+        move || Ok(TextPhase::Sequential(Box::new(text_pipe.load_te_seq()?))),
+        move |use_pid| {
+            Ok(HeavyPhase::Sequential(Box::new(
+                heavy_pipe.load_heavy_seq(use_pid)?,
+            )))
+        },
+    )?;
+    Ok(Box::new(QwenImageGenerator {
+        descriptor: descriptor(),
+        pipe,
+        residency,
+    }))
+}
+
 /// Construct a lazy candle Qwen-Image generator. `spec.weights` must be a [`WeightsSource::Dir`]
 /// pointing at a `Qwen/Qwen-Image` diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
 /// `tokenizer/`). Adapters / quantization / control overlays are rejected (not wired).
@@ -749,21 +700,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let device = candle_gen::default_device()?;
-    Ok(Box::new(QwenImageGenerator {
-        descriptor: descriptor(),
-        root,
-        device,
-        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
-        // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
-        // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
-        pid_spec: spec.pid.clone(),
-        // Component-residency policy (epic 10765 Phase 1c, sc-10867) — `Sequential` routes generate
-        // through `render_sequential`. Captured at load; defaults to `Resident`.
-        offload_policy: spec.offload_policy,
-        comfyui_dit: None,
-        comfyui_vae: None,
-        components: Mutex::new(None),
-    }))
+    let pipe = Pipeline::load(&root, &device, spec.pid.clone());
+    let policy = candle_gen::effective_offload_policy(spec.offload_policy);
+    generator_from_pipeline(pipe, policy)
 }
 
 /// Construct a lazy candle Qwen-Image generator that reads its **DiT** (and optionally its **VAE**) in
@@ -784,18 +723,13 @@ pub fn load_from_comfyui_dit(
     vae_file: Option<PathBuf>,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let device = candle_gen::default_device()?;
-    Ok(Box::new(QwenImageGenerator {
-        descriptor: descriptor(),
-        root: snapshot_dir.into(),
-        device,
-        pid_spec: None,
-        // The in-place ComfyUI DiT lane keeps everything resident (its transformer is a single file,
-        // not `root/transformer/`, so the sequential per-phase loaders don't apply).
-        offload_policy: OffloadPolicy::Resident,
-        comfyui_dit: Some(transformer_file.into()),
-        comfyui_vae: vae_file,
-        components: Mutex::new(None),
-    }))
+    let pipe = Pipeline::load_comfyui(
+        &snapshot_dir.into(),
+        &device,
+        transformer_file.into(),
+        vae_file,
+    );
+    generator_from_pipeline(pipe, OffloadPolicy::Resident)
 }
 
 candle_gen::register_generators! {

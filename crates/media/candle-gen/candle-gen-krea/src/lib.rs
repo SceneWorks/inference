@@ -96,9 +96,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
+    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy,
-    PidWeights, Progress, Quant, WeightsSource,
+    Progress, Quant, WeightsSource,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -134,77 +134,31 @@ const RES_MAX: u32 = 2048;
 /// Max images per request (the image-model standard, shared with the other families).
 const MAX_COUNT: u32 = 8;
 
-/// A lazily-loaded Krea 2 Turbo generator. The components (tokenizer + Qwen3-VL-4B TE + single-stream
-/// DiT + Qwen-Image VAE) load on the first `generate` and are cached.
-pub struct KreaGenerator {
-    descriptor: ModelDescriptor,
+enum KreaTextPhase {
+    Resident,
+    Sequential(Box<pipeline::KreaText>),
+}
+
+enum KreaHeavyPhase {
+    Resident(Box<ResidentKrea>),
+    Sequential(Box<pipeline::ResidencyHeavy>),
+}
+
+enum KreaEncoded {
+    Resident,
+    Sequential(pipeline::ResidencyContext),
+}
+
+struct ResidentKrea {
+    components: Arc<Components>,
     root: PathBuf,
     device: Device,
-    /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-7836). Fixed for this
-    /// generator instance; empty ⇒ the stock unadapted build.
-    adapters: Vec<AdapterSpec>,
-    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
-    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
-    pid_spec: Option<PidWeights>,
-    /// The community **INT8-ConvRot** DiT single-file checkpoint (sc-9300), captured at load when the
-    /// spec selected the ConvRot consume path (a `WeightsSource::File` on `LoadSpec::text_encoder` — see
-    /// [`build`]). `Some` ⇒ the lazy component build takes the DiT from this int8 checkpoint
-    /// ([`pipeline::load_components_convrot`]) and the tokenizer / Qwen3-VL TE / Qwen-Image VAE from the
-    /// canonical `root` snapshot; `None` ⇒ the dense/packed `transformer/` snapshot path (unchanged).
-    convrot_dit: Option<PathBuf>,
-    /// Component-residency policy captured from `LoadSpec::offload_policy` (epic 10765 Phase 1c,
-    /// sc-12089). `Sequential` routes `generate` through the phased load→encode→drop path, bounding peak
-    /// allocation demand at the cost of the components cache; `Resident` (default) keeps the cached path.
-    /// The worker's fit-gate sets this when it predicts the resident TE+DiT+VAE sum won't fit but the
-    /// DiT+VAE working set will.
-    ///
-    /// Honored on **every** request shape an advertising id accepts — txt2img
-    /// ([`pipeline::render_sequential`] / [`pipeline::render_base_sequential`]) **and** reference-guided
-    /// img2img ([`pipeline::render_img2img_sequential`] / [`pipeline::render_base_img2img_sequential`]).
-    /// That totality is load-bearing, not incidental: the capability bit is per-engine, so honoring the
-    /// policy for only some of an id's request shapes would make the fit-gate's staged-peak prediction
-    /// wrong exactly where it admits the job. Inert only on the lanes that do not advertise (Edit) or
-    /// that are load-spec-selected (ConvRot) — see [`Self::sequential`].
-    offload_policy: OffloadPolicy,
-    components: Mutex<Option<Arc<Components>>>,
-    /// The image-edit-only components (Qwen-Image VAE **encoder** + Qwen3-VL **vision tower**), loaded
-    /// lazily on the first edit so the txt2img (Turbo/Raw) paths keep their footprint (epic 10871).
-    /// Only ever populated for the `krea_2_edit` id.
     edit_components: Mutex<Option<Arc<pipeline::EditComponents>>>,
-    /// The Qwen-Image VAE **encoder**, loaded lazily on the first Turbo img2img request (sc-10134) — the
-    /// only extra wire reference-guided latent-init needs (it VAE-encodes the reference into the clean
-    /// init latent). Kept separate from `edit_components` so a plain img2img never pulls the Qwen3-VL
-    /// vision tower the Kontext edit path also loads. Only ever populated for the `krea_2_turbo` id.
     img2img_encoder: Mutex<Option<Arc<QwenVaeEncoder>>>,
 }
 
-impl KreaGenerator {
-    fn components(&self) -> gen_core::Result<Arc<Components>> {
-        candle_gen::cached(&self.components, || {
-            // ConvRot consume path (sc-9300): when a ConvRot DiT was selected, the DiT is taken from
-            // the int8 single-file checkpoint while everything else loads from the canonical snapshot.
-            // The sm_89 compute-capability floor is enforced inside `load_components_convrot` (locked
-            // decision 7). LoRA/LoKr and PiD overlays are not wired through the ConvRot variant
-            // (rejected at `build`).
-            Ok(match self.convrot_dit.as_ref() {
-                Some(convrot_dit) => Arc::new(pipeline::load_components_convrot(
-                    &self.root,
-                    convrot_dit,
-                    &self.device,
-                )?),
-                None => Arc::new(pipeline::load_components(
-                    &self.root,
-                    &self.device,
-                    &self.adapters,
-                    self.pid_spec.as_ref(),
-                )?),
-            })
-        })
-    }
-
-    /// The image-edit-only components (VAE encoder + Qwen3-VL vision tower), loaded once on the first
-    /// edit and cached (epic 10871). Both read weights that already ship in the Krea 2 snapshot.
-    fn edit_components(&self) -> gen_core::Result<Arc<pipeline::EditComponents>> {
+impl ResidentKrea {
+    fn edit_components(&self) -> candle_gen::Result<Arc<pipeline::EditComponents>> {
         candle_gen::cached(&self.edit_components, || {
             Ok(Arc::new(pipeline::load_edit_components(
                 &self.root,
@@ -213,10 +167,7 @@ impl KreaGenerator {
         })
     }
 
-    /// The Qwen-Image VAE encoder, loaded once on the first Turbo img2img request and cached (sc-10134).
-    /// Reads the `vae/` encoder weights that already ship in the Krea 2 snapshot — no vision tower, unlike
-    /// [`Self::edit_components`].
-    fn img2img_encoder(&self) -> gen_core::Result<Arc<QwenVaeEncoder>> {
+    fn img2img_encoder(&self) -> candle_gen::Result<Arc<QwenVaeEncoder>> {
         candle_gen::cached(&self.img2img_encoder, || {
             Ok(Arc::new(crate::vae::load_vae_encoder(
                 &self.root,
@@ -224,45 +175,14 @@ impl KreaGenerator {
             )?))
         })
     }
+}
 
-    /// Whether THIS request runs the `Sequential` phased-residency path (epic 10765 Phase 1c, sc-12089).
-    ///
-    /// Selected by `LoadSpec::offload_policy` (the worker fit-gate) or the `CANDLE_GEN_OFFLOAD=sequential`
-    /// env override (the two-process A/B harness). Both txt2img AND img2img are wired on the Turbo/Raw
-    /// ids; the two lanes that defer to resident are:
-    ///
-    /// * **ConvRot** (`convrot_dit`) — the DiT is a single int8 file, not `root/transformer/`, so
-    ///   [`pipeline::load_heavy`] cannot source it. (A deferred non-shipping variant anyway, and it is
-    ///   selected by the load spec rather than the request, so it cannot vary per request under one id.)
-    /// * **Edit** (`krea_2_edit`) — the Kontext path grounds the text encode on the Qwen3-VL vision tower
-    ///   (`Grounding::condition`), and candle keeps that tower in `edit_components`, OUTSIDE the
-    ///   [`pipeline::KreaText`] phase — so as this crate's split is drawn there is no point at which the
-    ///   text phase is droppable before the DiT. `edit_descriptor` therefore does NOT advertise the
-    ///   capability, and must not until the lane is wired.
-    ///
-    ///   This is a property of **where candle drew the split**, not of the model: mlx-gen-krea's
-    ///   `KreaText` carries the vision tower (lazily), so its grounded encode completes inside the text
-    ///   phase and MLX stages edit — its `edit_descriptor` advertises `true`. The candle port of that
-    ///   (move the tower into `KreaText`, load it lazily on the first grounded encode) is the qwen
-    ///   sc-10867 → sc-10968 follow-up. Until it lands the two backends genuinely differ on this id
-    ///   (Mac stages `krea_2_edit`, Windows/CUDA does not), which is a real implementation difference and
-    ///   is pinned as such by `sequential_is_advertised_only_where_wired`.
-    ///
-    /// **Why img2img is wired rather than deferred.** `supports_sequential_offload` is a per-**engine**
-    /// bit, but Turbo/Raw serve both txt2img and reference-guided img2img under ONE id (unlike
-    /// flux/flux2/qwen-image, whose sequential engines take `conditioning: vec![]`). A consumer's
-    /// fit-gate reads the bit per engine id, so it predicts the staged peak for EVERY request the id
-    /// accepts. Deferring img2img to resident while advertising the id sequential would make that
-    /// prediction wrong exactly where it is load-bearing — the gate admits on a card that fits the staged
-    /// set, the job runs resident, and it OOMs (the sc-10840 contract). So every request an advertising
-    /// id accepts must honor the policy; the only deferrals left are load-spec-level (ConvRot) or
-    /// non-advertising (Edit).
-    fn sequential(&self, _req: &GenerationRequest) -> bool {
-        self.convrot_dit.is_none()
-            && self.descriptor.id != KREA_2_EDIT_ID
-            && (self.offload_policy == OffloadPolicy::Sequential
-                || candle_gen::sequential_offload_enabled())
-    }
+/// A Krea 2 generator whose shared residency value exclusively owns the warm components or deferred
+/// phase loaders.
+pub struct KreaGenerator {
+    descriptor: ModelDescriptor,
+    device: Device,
+    residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
 }
 
 impl Generator for KreaGenerator {
@@ -303,141 +223,80 @@ impl Generator for KreaGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
 
-        // Sequential-residency offload (epic 10765 Phase 1c, sc-12089): load→encode→DROP the Qwen3-VL-4B
-        // text phase before the 12B DiT loads, so peak allocation demand is max(TE, DiT+VAE+activations)
-        // rather than their sum — letting a card that OOMs the resident path render. Output is
-        // byte-identical (the phased path runs the same encode + denoise/decode bodies). Taken BEFORE
-        // `self.components()` on purpose: that cache load is exactly the co-resident TE+DiT+VAE set this
-        // path exists to avoid. Driven by `LoadSpec::offload_policy` (the worker fit-gate sets
-        // `Sequential`); `CANDLE_GEN_OFFLOAD=sequential` is the A/B override. See `Self::sequential` for
-        // the lanes that defer to resident.
-        if self.sequential(req) {
-            // Cancel before the eviction, not just before the loads (F-173): the phased path's first
-            // side effect is dropping the warm resident set, and a cancelled request has no business
-            // costing the NEXT resident request a multi-GB reload. `run_sequential` re-checks at each
-            // load boundary; this one covers the boundary that precedes it.
-            candle_gen::check_cancel(&req.cancel)?;
-            // F-132 (the qwen-image sc-11190 fix): evict EVERY resident cache a prior resident request
-            // populated. The policy + env are re-read every `generate`, so these can be holding live Arc
-            // sets; without the take, a sequential request would phase-load its copies on top of them and
-            // peak at resident + sequential — the opposite of the flag's purpose. Dropping the cached Arcs
-            // frees the resident residency first. Poison-tolerant.
-            //
-            // Both caches, not just `components`: a prior resident **img2img** leaves `img2img_encoder`
-            // holding a VAE encoder, and the sequential img2img path loads its own copy heavy-side — so
-            // skipping this one would leave a stale encoder resident for the rest of the process and break
-            // the max(TE, heavy) bound these paths document. (`edit_components` is unreachable here: the
-            // guard below defers `krea_2_edit` to resident, and only that id ever populates it.)
-            *candle_gen::lock_recover(&self.components) = None;
-            *candle_gen::lock_recover(&self.img2img_encoder) = None;
-            // The same Raw-vs-Turbo × txt2img-vs-img2img fork the resident path below takes, against the
-            // phased twins. Every arm the resident path can reach for an advertising id has one here —
-            // that total coverage is the point (see `Self::sequential`).
-            let raw = self.descriptor.id == KREA_2_RAW_ID;
-            let images = match (raw, img2img_reference(req)) {
-                (true, Some((reference, strength))) => pipeline::render_base_img2img_sequential(
-                    &self.root,
-                    &self.device,
-                    &self.adapters,
-                    self.pid_spec.as_ref(),
-                    req,
-                    reference,
-                    strength,
-                    on_progress,
-                )?,
-                (true, None) => pipeline::render_base_sequential(
-                    &self.root,
-                    &self.device,
-                    &self.adapters,
-                    self.pid_spec.as_ref(),
-                    req,
-                    on_progress,
-                )?,
-                (false, Some((reference, strength))) => pipeline::render_img2img_sequential(
-                    &self.root,
-                    &self.device,
-                    &self.adapters,
-                    self.pid_spec.as_ref(),
-                    req,
-                    reference,
-                    strength,
-                    on_progress,
-                )?,
-                (false, None) => pipeline::render_sequential(
-                    &self.root,
-                    &self.device,
-                    &self.adapters,
-                    self.pid_spec.as_ref(),
-                    req,
-                    on_progress,
-                )?,
-            };
-            return Ok(GenerationOutput::Images(images));
-        }
-
-        let comps = self.components()?;
-        // Variant read off the descriptor id (the mlx-gen-krea `generate_impl` branch): Edit = Kontext
-        // instruction edit over 1-2 references on the full-CFG base; Raw = full-CFG undistilled txt2img
-        // (52-step, dynamic-mu, two forwards/step); Turbo = CFG-free distilled (8-step, one forward).
-        // One generator struct, three render paths.
-        let images = if self.descriptor.id == KREA_2_EDIT_ID {
-            // Extract the fixed-order source set (image 1, then image 2) from the request
-            // conditioning, load the edit-only components lazily, and run the Kontext edit path.
-            let references: Vec<Image> =
-                resolve_edit_references(req)?.into_iter().cloned().collect();
-            let edit = self.edit_components()?;
-            // The registered `krea_2_edit` seam is the undistilled full-CFG edit (`distilled = false`);
-            // the CFG-free distilled Turbo edit (sc-11640) is driven through the worker's bespoke
-            // `generate_candle_krea_edit_stream` lane (which calls `render_edit(distilled = true)`
-            // directly), matching how every candle edit lane bypasses the registered seam.
-            pipeline::render_edit(
-                &comps,
-                &edit,
-                req,
-                &references,
-                false,
-                &self.device,
-                on_progress,
-            )?
-        } else if self.descriptor.id == KREA_2_RAW_ID {
-            if let Some((reference, strength)) = img2img_reference(req) {
-                // Raw img2img (reference-guided latent-init under full CFG, sc-10226): a single
-                // `Conditioning::Reference` seeds the undistilled two-forward CFG denoise from the
-                // VAE-encoded reference — the full-CFG sibling of the Turbo `render_img2img` below. Reuses
-                // the same lazily-loaded VAE encoder (no vision tower, unlike the edit path). Raw advertises
-                // `Reference` in `raw_descriptor`, so the capability floor accepts it (a MultiReference is
-                // still the `krea_2_edit` surface).
-                let vae_encoder = self.img2img_encoder()?;
-                pipeline::render_base_img2img(
-                    &comps,
-                    &vae_encoder,
-                    req,
-                    reference,
-                    strength,
-                    &self.device,
-                    on_progress,
-                )?
-            } else {
-                pipeline::render_base(&comps, req, &self.device, on_progress)?
-            }
-        } else if let Some((reference, strength)) = img2img_reference(req) {
-            // Turbo img2img (reference-guided latent-init, sc-10134): a single `Conditioning::Reference`
-            // seeds the CFG-free denoise from the VAE-encoded reference. The capability floor accepts only
-            // `Reference` on `krea_2_turbo` (a MultiReference is already rejected); the VAE encoder loads
-            // lazily on this first img2img request (no vision tower, unlike the edit path).
-            let vae_encoder = self.img2img_encoder()?;
-            pipeline::render_img2img(
-                &comps,
-                &vae_encoder,
-                req,
-                reference,
-                strength,
-                &self.device,
-                on_progress,
-            )?
+        let raw = self.descriptor.id == KREA_2_RAW_ID;
+        let edit_references: Vec<Image> = if self.descriptor.id == KREA_2_EDIT_ID {
+            resolve_edit_references(req)?.into_iter().cloned().collect()
         } else {
-            pipeline::render(&comps, req, &self.device, on_progress)?
+            Vec::new()
         };
+        let reference = img2img_reference(req);
+        let images = self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text| match text {
+                KreaTextPhase::Resident => Ok(KreaEncoded::Resident),
+                KreaTextPhase::Sequential(text) => Ok(KreaEncoded::Sequential(
+                    pipeline::encode_residency(text, raw, req)?,
+                )),
+            },
+            |heavy, encoded, on_progress| match (heavy, encoded) {
+                (KreaHeavyPhase::Sequential(heavy), KreaEncoded::Sequential(context)) => {
+                    pipeline::render_residency(
+                        heavy,
+                        context,
+                        req,
+                        reference,
+                        &self.device,
+                        on_progress,
+                    )
+                }
+                (KreaHeavyPhase::Resident(resident), KreaEncoded::Resident) => {
+                    let comps = &resident.components;
+                    if self.descriptor.id == KREA_2_EDIT_ID {
+                        let edit = resident.edit_components()?;
+                        pipeline::render_edit(
+                            comps,
+                            &edit,
+                            req,
+                            &edit_references,
+                            false,
+                            &self.device,
+                            on_progress,
+                        )
+                    } else if raw {
+                        if let Some((reference, strength)) = reference {
+                            let vae_encoder = resident.img2img_encoder()?;
+                            pipeline::render_base_img2img(
+                                comps,
+                                &vae_encoder,
+                                req,
+                                reference,
+                                strength,
+                                &self.device,
+                                on_progress,
+                            )
+                        } else {
+                            pipeline::render_base(comps, req, &self.device, on_progress)
+                        }
+                    } else if let Some((reference, strength)) = reference {
+                        let vae_encoder = resident.img2img_encoder()?;
+                        pipeline::render_img2img(
+                            comps,
+                            &vae_encoder,
+                            req,
+                            reference,
+                            strength,
+                            &self.device,
+                            on_progress,
+                        )
+                    } else {
+                        pipeline::render(comps, req, &self.device, on_progress)
+                    }
+                }
+                _ => unreachable!("residency phase variants are constructed in matching pairs"),
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -658,24 +517,84 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         )));
     }
     let device = candle_gen::default_device()?;
+    let policy = effective_residency_policy(
+        spec.offload_policy,
+        descriptor.id,
+        convrot_dit.is_some(),
+    );
+    let resident_root = root.clone();
+    let resident_device = device.clone();
+    let resident_adapters = spec.adapters.clone();
+    let resident_pid = spec.pid.clone();
+    let resident_convrot = convrot_dit.clone();
+    let text_root = root.clone();
+    let text_device = device.clone();
+    let heavy_root = root.clone();
+    let heavy_device = device.clone();
+    let heavy_adapters = spec.adapters.clone();
+    let heavy_pid = spec.pid.clone();
+    let residency = candle_gen::Residency::from_policy_with_resident(
+        policy,
+        move || {
+            let components = match resident_convrot.as_ref() {
+                Some(convrot_dit) => pipeline::load_components_convrot(
+                    &resident_root,
+                    convrot_dit,
+                    &resident_device,
+                )?,
+                None => pipeline::load_components(
+                    &resident_root,
+                    &resident_device,
+                    &resident_adapters,
+                    resident_pid.as_ref(),
+                )?,
+            };
+            Ok((
+                KreaTextPhase::Resident,
+                KreaHeavyPhase::Resident(Box::new(ResidentKrea {
+                    components: Arc::new(components),
+                    root: resident_root.clone(),
+                    device: resident_device.clone(),
+                    edit_components: Mutex::new(None),
+                    img2img_encoder: Mutex::new(None),
+                })),
+            ))
+        },
+        move || {
+            Ok(KreaTextPhase::Sequential(Box::new(pipeline::load_text(
+                &text_root,
+                &text_device,
+            )?)))
+        },
+        move |use_pid| {
+            Ok(KreaHeavyPhase::Sequential(Box::new(
+                pipeline::load_residency_heavy(
+                    &heavy_root,
+                    &heavy_device,
+                    &heavy_adapters,
+                    heavy_pid.as_ref(),
+                    use_pid,
+                )?,
+            )))
+        },
+    )?;
     Ok(Box::new(KreaGenerator {
         descriptor,
-        root,
         device,
-        adapters: spec.adapters.clone(),
-        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if any)
-        // so the lazy component build loads the engine once. `None` keeps the byte-exact native path.
-        pid_spec: spec.pid.clone(),
-        convrot_dit,
-        // Component residency (epic 10765 Phase 1c, sc-12089): captured, never rejected. `Sequential` is
-        // advisory by contract — the ids that advertise it (Turbo/Raw) phase their loads for every
-        // request shape they accept, txt2img and img2img alike; the lanes that do not advertise (Edit) or
-        // that this spec selects (ConvRot) silently stay resident. `Resident` is the default.
-        offload_policy: spec.offload_policy,
-        components: Mutex::new(None),
-        edit_components: Mutex::new(None),
-        img2img_encoder: Mutex::new(None),
+        residency,
     }))
+}
+
+fn effective_residency_policy(
+    requested: OffloadPolicy,
+    id: &str,
+    has_convrot: bool,
+) -> OffloadPolicy {
+    if !has_convrot && id != KREA_2_EDIT_ID {
+        candle_gen::effective_offload_policy(requested)
+    } else {
+        OffloadPolicy::Resident
+    }
 }
 
 /// Construct a lazy candle Krea 2 **Turbo** generator. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -1266,7 +1185,7 @@ mod tests {
     fn offload_policy_is_captured_not_rejected() {
         let _env = OffloadEnvGuard::set(None);
 
-        // Default (no policy set) → Resident: the generator builds and keeps the cached `render` path.
+        // Resident remains lazy, but its cache now lives inside the shared residency owner.
         let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
         assert_eq!(spec.offload_policy, OffloadPolicy::Resident);
         assert!(load(&spec).is_ok());
@@ -1278,7 +1197,7 @@ mod tests {
         assert_eq!(seq.offload_policy, OffloadPolicy::Sequential);
         assert!(load(&seq).is_ok());
         assert!(load_raw(&seq).is_ok());
-        // Edit accepts the spec too — it simply defers to resident (advisory contract), never errors.
+        // Edit accepts the advisory spec and stays on the lazy resident policy.
         assert!(load_edit(&seq).is_ok());
     }
 
@@ -1288,28 +1207,22 @@ mod tests {
     /// `Resident`-specced generator onto the phased path.
     #[test]
     fn env_override_selects_the_phased_route_on_a_resident_spec() {
-        let plain = GenerationRequest {
-            prompt: "a rusty robot holding a lit candle".into(),
-            width: 1024,
-            height: 1024,
-            ..Default::default()
-        };
-        let resident = || generator_with(descriptor(), OffloadPolicy::Resident, None);
-
         // One scope per guard: a second `let _env` would SHADOW the first rather than replace it, and
         // both would then live to the end of the body — restoring correctly only by accident of LIFO drop
         // order. Explicit scopes make each pin end where it is meant to.
         {
             let _env = OffloadEnvGuard::set(Some("sequential"));
             assert!(
-                resident().sequential(&plain),
+                effective_residency_policy(OffloadPolicy::Resident, KREA_2_TURBO_ID, false)
+                    == OffloadPolicy::Sequential,
                 "CANDLE_GEN_OFFLOAD=sequential must select the phased path regardless of the spec"
             );
         }
         {
             let _env = OffloadEnvGuard::set(None);
             assert!(
-                !resident().sequential(&plain),
+                effective_residency_policy(OffloadPolicy::Resident, KREA_2_TURBO_ID, false)
+                    == OffloadPolicy::Resident,
                 "with the override unset, a Resident spec stays resident"
             );
         }
@@ -1333,24 +1246,22 @@ mod tests {
         assert!(!edit_descriptor().capabilities.supports_sequential_offload);
     }
 
-    /// Test helper: a lazily-built generator with an explicit residency policy + optional ConvRot DiT,
-    /// so the `sequential` route guard can be asserted without weights or a GPU (the build is lazy).
-    fn generator_with(
-        descriptor: ModelDescriptor,
-        offload_policy: OffloadPolicy,
-        convrot_dit: Option<PathBuf>,
-    ) -> KreaGenerator {
+    fn sequential_generator(descriptor: ModelDescriptor) -> KreaGenerator {
         KreaGenerator {
             descriptor,
-            root: "/snap".into(),
             device: candle_gen::default_device().expect("a default device"),
-            adapters: vec![],
-            pid_spec: None,
-            convrot_dit,
-            offload_policy,
-            components: Mutex::new(None),
-            edit_components: Mutex::new(None),
-            img2img_encoder: Mutex::new(None),
+            residency: candle_gen::Residency::sequential(
+                || {
+                    Err(candle_gen::CandleError::Msg(
+                        "test text loader must not run".into(),
+                    ))
+                },
+                |_| {
+                    Err(candle_gen::CandleError::Msg(
+                        "test heavy loader must not run".into(),
+                    ))
+                },
+            ),
         }
     }
 
@@ -1381,7 +1292,7 @@ mod tests {
         };
 
         for descriptor in [descriptor(), raw_descriptor()] {
-            let g = generator_with(descriptor.clone(), OffloadPolicy::Sequential, None);
+            let g = sequential_generator(descriptor.clone());
             let err = g
                 .generate(&req, &mut |_| {})
                 .expect_err("a cancelled request must not produce images");
@@ -1428,10 +1339,13 @@ mod tests {
         // silently falls back to resident while the descriptor claims otherwise.
         for descriptor in [descriptor(), raw_descriptor()] {
             assert!(descriptor.capabilities.supports_sequential_offload);
-            for req in [&plain, &img2img] {
-                let g = generator_with(descriptor.clone(), OffloadPolicy::Sequential, None);
+            for _req in [&plain, &img2img] {
                 assert!(
-                    g.sequential(req),
+                    effective_residency_policy(
+                        OffloadPolicy::Sequential,
+                        descriptor.id,
+                        false,
+                    ) == OffloadPolicy::Sequential,
                     "{} must honor Sequential for every request it accepts",
                     descriptor.id
                 );
@@ -1439,21 +1353,25 @@ mod tests {
         }
 
         // `Resident` (the default) never takes it — that is the whole opt-in contract.
-        assert!(!generator_with(descriptor(), OffloadPolicy::Resident, None).sequential(&plain));
+        assert_eq!(
+            effective_residency_policy(OffloadPolicy::Resident, KREA_2_TURBO_ID, false),
+            OffloadPolicy::Resident
+        );
 
         // Edit defers: the grounded encode interleaves the vision tower with the text phase. Safe only
         // because `edit_descriptor` does not advertise — the two must stay in lockstep.
         assert!(!edit_descriptor().capabilities.supports_sequential_offload);
-        assert!(
-            !generator_with(edit_descriptor(), OffloadPolicy::Sequential, None).sequential(&plain)
+        assert_eq!(
+            effective_residency_policy(OffloadPolicy::Sequential, KREA_2_EDIT_ID, false),
+            OffloadPolicy::Resident
         );
 
         // ConvRot defers: the DiT is a single int8 file, not `root/transformer/`, so `load_heavy` can't
         // source it. Safe because it is selected by the LOAD SPEC, not the request — a ConvRot generator
         // defers uniformly, so the gate can't be fooled per-request.
-        let convrot = Some(PathBuf::from("/krea2_int8_convrot.safetensors"));
-        assert!(
-            !generator_with(descriptor(), OffloadPolicy::Sequential, convrot).sequential(&plain)
+        assert_eq!(
+            effective_residency_policy(OffloadPolicy::Sequential, KREA_2_TURBO_ID, true),
+            OffloadPolicy::Resident
         );
     }
 

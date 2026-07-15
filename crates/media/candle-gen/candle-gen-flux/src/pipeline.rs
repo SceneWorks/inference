@@ -128,6 +128,7 @@ pub fn flow_mu(variant: Variant, seq_len: usize) -> f32 {
 /// A txt2img pipeline handle: the snapshot `root`, the variant, and the compute device/dtype (bf16).
 /// Loading the heavy components is done by [`load_components`](Self::load_components) and owned/cached
 /// by the generator, mirroring the SDXL/Z-Image providers' lazy split.
+#[derive(Clone)]
 pub(crate) struct Pipeline {
     variant: Variant,
     root: PathBuf,
@@ -163,6 +164,7 @@ pub(crate) enum Components {
         /// (sc-8991 / F-011) instead of re-parsing per prompt/branch.
         toks: Arc<FluxTokenizers>,
         /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
+        #[allow(dead_code)]
         pid: Option<Arc<PidEngine>>,
     },
     Packed {
@@ -173,14 +175,14 @@ pub(crate) enum Components {
         /// T5 + CLIP tokenizers, loaded+parsed **once** at component load (sc-8991 / F-011).
         toks: Arc<FluxTokenizers>,
         /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
+        #[allow(dead_code)]
         pid: Option<Arc<PidEngine>>,
     },
 }
 
 /// A borrowed reference to just the DiT of either tier — the only component the denoise loop touches.
-/// Lets [`Pipeline::denoise`] be shared by the resident [`render`](Pipeline::render) (which borrows the
-/// DiT out of the cached [`Components`]) and the sequential [`render_sequential`](Pipeline::render_sequential)
-/// (which owns a just-loaded DiT after the text encoders were dropped). `Copy` — it is two thin refs.
+/// Lets [`Pipeline::denoise`] be shared by the legacy resident backbone and the unified residency
+/// render (which owns a just-loaded DiT after the text encoders were dropped).
 #[derive(Clone, Copy)]
 pub(crate) enum DitRef<'a> {
     Stock(&'a IpFlux),
@@ -614,6 +616,7 @@ impl Pipeline {
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
     /// `req.cancel`. Returns one `gen_core::Image` per `req.count` (each with seed `base_seed + index`).
+    #[allow(dead_code)]
     pub(crate) fn render(
         &self,
         req: &GenerationRequest,
@@ -870,7 +873,11 @@ impl Pipeline {
     /// Encode `prompt` through the sequential text encoders, delegating to the SAME shared encode path
     /// as the resident tier ([`encode_text`] / [`encode_text_packed`](Self::encode_text_packed)) so the
     /// tokenization + conditioning tensors are byte-identical to [`render`](Self::render).
-    fn encode_seq(&self, tes: &SeqTextEncoders, prompt: &str) -> Result<(Tensor, Tensor)> {
+    pub(crate) fn encode_residency(
+        &self,
+        tes: &SeqTextEncoders,
+        prompt: &str,
+    ) -> Result<(Tensor, Tensor)> {
         match tes {
             SeqTextEncoders::Stock(te) => encode_text(
                 self.variant,
@@ -960,16 +967,22 @@ impl Pipeline {
     /// requests reload from the (page-cached) snapshot; that reload cost is the deliberate trade for the
     /// lower peak, which is why it is opt-in per the fit-gate rather than the default.
     ///
-    /// The schedule itself — the cancel checks at each stage boundary (F-173), the `Progress::Loading`
-    /// emits (F-179), and the drop-before-load ordering — lives in [`candle_gen::run_sequential`], shared
-    /// with every other wired candle engine (sc-12089). Only the two loaders and the encode/render bodies
-    /// are FLUX's.
-    pub(crate) fn render_sequential(
+    /// The shared [`candle_gen::Residency`] owner supplies these already-loaded phase values.
+    pub(crate) fn load_text_residency(&self) -> Result<SeqTextEncoders> {
+        self.load_text_encoders_seq(self.uses_diffusers_layout()?)
+    }
+
+    pub(crate) fn load_heavy_residency(&self, use_pid: bool) -> Result<SeqHeavy> {
+        self.load_heavy_seq(self.uses_diffusers_layout()?, use_pid)
+    }
+
+    pub(crate) fn render_residency(
         &self,
         req: &GenerationRequest,
+        heavy: &SeqHeavy,
+        encoded: (Tensor, Tensor),
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
-        let diffusers = self.uses_diffusers_layout()?;
         let steps = req
             .steps
             .map(|s| s as usize)
@@ -983,67 +996,58 @@ impl Pipeline {
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
 
-        candle_gen::run_sequential(
-            &req.cancel,
-            on_progress,
-            || self.load_text_encoders_seq(diffusers),
-            |tes| self.encode_seq(tes, &req.prompt),
-            // F-177: skip the PiD student unless THIS request decodes through it.
-            || self.load_heavy_seq(diffusers, req.use_pid),
-            |heavy, (t5_emb, clip_emb), on_progress| {
-                // Resolve the decode seam once for the whole batch, exactly as `render` does.
-                let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-                    heavy.pid.as_deref(),
-                    req,
-                    base_seed,
-                    self.variant.model_id(),
-                )?;
+        let (t5_emb, clip_emb) = encoded;
+        // Resolve the decode seam once for the whole batch, exactly as `render` does.
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            heavy.pid.as_deref(),
+            req,
+            base_seed,
+            self.variant.model_id(),
+        )?;
 
-                // Per-image denoise + decode, identical to `render`'s loop.
-                candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-                    let noise = crate::flux1_load::seeded_noise(
-                        seed,
-                        LATENT_CHANNELS,
-                        lat_h,
-                        lat_w,
-                        &self.device,
-                        self.dtype,
-                    )?;
-                    let state = State::new(&t5_emb, &clip_emb, &noise)?;
-                    let timesteps = if self.variant.is_dev() {
-                        get_schedule(steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)))
-                    } else {
-                        get_schedule(steps, None)
-                    };
-                    let latents = self.denoise(
-                        heavy.dit.as_ref(),
-                        &state,
-                        &timesteps,
-                        guidance,
-                        seed,
-                        req,
-                        on_progress,
-                    )?;
-                    on_progress(Progress::Decoding);
-                    match &heavy.vae {
-                        LoadedVae::Stock(vae) => self.decode(
-                            vae,
-                            pid_decoder.as_ref(),
-                            &latents,
-                            req.height as usize,
-                            req.width as usize,
-                        ),
-                        LoadedVae::Packed(vae) => self.decode_packed(
-                            vae,
-                            pid_decoder.as_ref(),
-                            &latents,
-                            req.height as usize,
-                            req.width as usize,
-                        ),
-                    }
-                })
-            },
-        )
+        // Per-image denoise + decode, identical to `render`'s loop.
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let noise = crate::flux1_load::seeded_noise(
+                seed,
+                LATENT_CHANNELS,
+                lat_h,
+                lat_w,
+                &self.device,
+                self.dtype,
+            )?;
+            let state = State::new(&t5_emb, &clip_emb, &noise)?;
+            let timesteps = if self.variant.is_dev() {
+                get_schedule(steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)))
+            } else {
+                get_schedule(steps, None)
+            };
+            let latents = self.denoise(
+                heavy.dit.as_ref(),
+                &state,
+                &timesteps,
+                guidance,
+                seed,
+                req,
+                on_progress,
+            )?;
+            on_progress(Progress::Decoding);
+            match &heavy.vae {
+                LoadedVae::Stock(vae) => self.decode(
+                    vae,
+                    pid_decoder.as_ref(),
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                ),
+                LoadedVae::Packed(vae) => self.decode_packed(
+                    vae,
+                    pid_decoder.as_ref(),
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                ),
+            }
+        })
     }
 }
 
