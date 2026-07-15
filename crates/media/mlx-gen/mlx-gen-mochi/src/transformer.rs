@@ -20,11 +20,13 @@
 
 use std::path::Path;
 
-use mlx_rs::fast::scaled_dot_product_attention;
-use mlx_rs::ops::{add, concatenate_axis, matmul, mean_axis, multiply, rsqrt, split, tanh};
+use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
+use mlx_rs::ops::{
+    add, concatenate_axis, matmul, maximum, mean_axis, multiply, rsqrt, split, sum_axis, tanh,
+};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::nn::silu;
+use mlx_gen::nn::{conv2d, silu, timestep_sincos};
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::{Error, Result};
 
@@ -502,6 +504,251 @@ impl MochiTransformerBlock {
     }
 }
 
+// ---------------------------------------------------------------------- time embedding
+
+/// `MochiAttentionPool` — a single learned query (the masked-mean "class" token) attends over the raw
+/// T5 tokens to pool them into one `[B, output_dim]` conditioning vector.
+#[derive(Clone)]
+struct AttentionPool {
+    to_kv_w: Array,
+    to_kv_b: Array,
+    to_q_w: Array,
+    to_q_b: Array,
+    to_out_w: Array,
+    to_out_b: Array,
+    num_heads: usize,
+    embed_dim: usize,
+}
+
+impl AttentionPool {
+    fn from_weights(w: &Weights, prefix: &str, num_heads: usize, dtype: Dtype) -> Result<Self> {
+        let g = |name: &str| -> Result<Array> {
+            Ok(w.require(&join(prefix, name))?.as_dtype(dtype)?)
+        };
+        let to_kv_w = g("to_kv.weight")?;
+        let embed_dim = to_kv_w.shape()[1] as usize; // to_kv: [2·embed, embed]
+        Ok(Self {
+            to_kv_w,
+            to_kv_b: g("to_kv.bias")?,
+            to_q_w: g("to_q.weight")?,
+            to_q_b: g("to_q.bias")?,
+            to_out_w: g("to_out.weight")?,
+            to_out_b: g("to_out.bias")?,
+            num_heads,
+            embed_dim,
+        })
+    }
+
+    /// `x [B, L, D]`, `mask [B, L]` (0/1) → pooled `[B, output_dim]`.
+    fn forward(&self, x: &Array, mask: &Array) -> Result<Array> {
+        let sh = x.shape();
+        let (b, l, d) = (sh[0], sh[1], sh[2]);
+        let head_dim = self.embed_dim / self.num_heads;
+
+        // pool_tokens: weighted mean over valid tokens → the query "class" token.
+        let m = mask.as_dtype(Dtype::Float32)?.reshape(&[b, l, 1])?;
+        let denom = maximum(&sum_axis(&m, 1, true)?, Array::from_f32(1.0))?; // [B,1,1] clamp≥1
+        let mnorm = mlx_rs::ops::divide(&m, &denom)?;
+        let x_pool = sum_axis(&multiply(x, &mnorm)?, 1, true)?; // [B, 1, D]
+
+        // Concat pooled + tokens; KV over all, Q from the pooled token only.
+        let xcat = concatenate_axis(&[&x_pool, x], 1)?; // [B, 1+L, D]
+        let kv = linear_b(&xcat, &self.to_kv_w, &self.to_kv_b)?; // [B, 1+L, 2D]
+        let q = linear_b(&x_pool.reshape(&[b, d])?, &self.to_q_w, &self.to_q_b)?; // [B, D]
+
+        // Heads: kv [B, 1+L, 2, H, hd] → [B, H, 2, 1+L, hd] → k, v.
+        let lk = l + 1;
+        let kv = kv
+            .reshape(&[b, lk, 2, self.num_heads as i32, head_dim as i32])?
+            .transpose_axes(&[0, 3, 2, 1, 4])?; // [B, H, 2, 1+L, hd]
+        let parts = split(&kv, 2, 2)?;
+        let k = parts[0].reshape(&[b, self.num_heads as i32, lk, head_dim as i32])?;
+        let v = parts[1].reshape(&[b, self.num_heads as i32, lk, head_dim as i32])?;
+        let q = q
+            .reshape(&[b, self.num_heads as i32, 1, head_dim as i32])?; // [B, H, 1, hd]
+
+        // Additive mask [B, 1, 1, 1+L]: key 0 (pooled) always valid; text keys 0/−inf per `mask`.
+        let mvals: Vec<f32> = mask.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+        let mut mdata = vec![0f32; (b * lk) as usize];
+        for bi in 0..b {
+            for j in 0..l {
+                if mvals[(bi * l + j) as usize] == 0.0 {
+                    mdata[(bi * lk + 1 + j) as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let attn_mask = Array::from_slice(&mdata, &[b, 1, 1, lk]);
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale, &attn_mask, None)?; // [B,H,1,hd]
+        let out = out.reshape(&[b, self.embed_dim as i32])?; // squeeze(2).flatten(1,2)
+        linear_b(&out, &self.to_out_w, &self.to_out_b)
+    }
+}
+
+/// `MochiCombinedTimestepCaptionEmbedding` — sinusoidal-timestep MLP + masked attention-pool of the
+/// raw T5 tokens (summed into `temb`), plus the `caption_proj` that projects the raw T5 tokens into
+/// the 1536-dim text stream. Returns `(temb [B, inner], caption [B, L, pooled])`.
+#[derive(Clone)]
+struct TimeEmbed {
+    ts_lin1_w: Array,
+    ts_lin1_b: Array,
+    ts_lin2_w: Array,
+    ts_lin2_b: Array,
+    pooler: AttentionPool,
+    caption_w: Array,
+    caption_b: Array,
+    time_embed_dim: usize,
+}
+
+impl TimeEmbed {
+    fn from_weights(w: &Weights, prefix: &str, cfg: &MochiDitConfig, dtype: Dtype) -> Result<Self> {
+        let g = |name: &str| -> Result<Array> {
+            Ok(w.require(&join(prefix, name))?.as_dtype(dtype)?)
+        };
+        Ok(Self {
+            ts_lin1_w: g("timestep_embedder.linear_1.weight")?,
+            ts_lin1_b: g("timestep_embedder.linear_1.bias")?,
+            ts_lin2_w: g("timestep_embedder.linear_2.weight")?,
+            ts_lin2_b: g("timestep_embedder.linear_2.bias")?,
+            // The reference builds the pooler with num_attention_heads=8.
+            pooler: AttentionPool::from_weights(w, &join(prefix, "pooler"), 8, dtype)?,
+            caption_w: g("caption_proj.weight")?,
+            caption_b: g("caption_proj.bias")?,
+            time_embed_dim: cfg.time_embed_dim,
+        })
+    }
+
+    fn forward(&self, timestep: &Array, enc: &Array, enc_mask: &Array) -> Result<(Array, Array)> {
+        // Timesteps(flip_sin_to_cos=True, downscale_freq_shift=0.0) → [B, time_embed_dim].
+        let time_proj = timestep_sincos(
+            &timestep.as_dtype(Dtype::Float32)?,
+            self.time_embed_dim,
+            10000.0,
+            0.0,
+        )?;
+        let te = linear_b(&time_proj, &self.ts_lin1_w, &self.ts_lin1_b)?;
+        let te = silu(&te)?;
+        let te = linear_b(&te, &self.ts_lin2_w, &self.ts_lin2_b)?; // [B, inner]
+
+        let pooled = self.pooler.forward(enc, enc_mask)?; // [B, inner]
+        let caption = linear_b(enc, &self.caption_w, &self.caption_b)?; // [B, L, pooled]
+        let temb = add(&te, &pooled)?;
+        Ok((temb, caption))
+    }
+}
+
+// ---------------------------------------------------------------------- full model
+
+/// The full Mochi 1 AsymmDiT — `MochiTransformer3DModel`. One `forward` = one CFG-branch velocity
+/// prediction (call with the `[neg, pos]` batch for a full CFG step; combine downstream via
+/// [`crate::scheduler::cfg_combine`]).
+pub struct MochiTransformer3DModel {
+    patch_w: Array, // mlx [out, kh, kw, in]
+    patch_b: Array,
+    pos_frequencies: Array, // [3, heads, head_dim/2]
+    time_embed: TimeEmbed,
+    blocks: Vec<MochiTransformerBlock>,
+    norm_out_w: Array, // [2·inner, inner]
+    norm_out_b: Array,
+    proj_out_w: Array, // [patch²·out_ch, inner]
+    proj_out_b: Array,
+    cfg: MochiDitConfig,
+}
+
+impl MochiTransformer3DModel {
+    /// Build the full model from the transformer weights (see [`load_transformer_weights`]).
+    pub fn from_weights(w: &Weights, cfg: &MochiDitConfig, dtype: Dtype) -> Result<Self> {
+        // PatchEmbed Conv2d weight [out, in, kh, kw] → mlx NHWC [out, kh, kw, in].
+        let patch_w = w
+            .require("patch_embed.proj.weight")?
+            .transpose_axes(&[0, 2, 3, 1])?
+            .as_dtype(dtype)?;
+        let blocks = (0..cfg.num_layers)
+            .map(|i| {
+                MochiTransformerBlock::from_weights(
+                    w,
+                    &format!("transformer_blocks.{i}"),
+                    cfg,
+                    i == cfg.num_layers - 1, // final block is context_pre_only
+                    dtype,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            patch_w,
+            patch_b: w.require("patch_embed.proj.bias")?.as_dtype(dtype)?,
+            pos_frequencies: w.require("pos_frequencies")?.as_dtype(dtype)?,
+            time_embed: TimeEmbed::from_weights(w, "time_embed", cfg, dtype)?,
+            blocks,
+            norm_out_w: w.require("norm_out.linear.weight")?.as_dtype(dtype)?,
+            norm_out_b: w.require("norm_out.linear.bias")?.as_dtype(dtype)?,
+            proj_out_w: w.require("proj_out.weight")?.as_dtype(dtype)?,
+            proj_out_b: w.require("proj_out.bias")?.as_dtype(dtype)?,
+            cfg: *cfg,
+        })
+    }
+
+    /// Forward. `hidden [B, in_ch, F, H, W]` (latent), `enc [B, L, text_embed]` (raw T5), `timestep
+    /// [B]`, `enc_mask [B, L]` (0/1). Returns the velocity `noise_pred [B, in_ch, F, H, W]`.
+    pub fn forward(
+        &self,
+        hidden: &Array,
+        enc: &Array,
+        timestep: &Array,
+        enc_mask: &Array,
+    ) -> Result<Array> {
+        let sh = hidden.shape();
+        let (b, c, f, h, wd) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
+        let p = self.cfg.patch_size as i32;
+        let ph = h / p;
+        let pw = wd / p;
+        let inner = self.cfg.inner_dim() as i32;
+
+        // Time / caption embedding (raw T5 → temb + 1536-dim text stream).
+        let (temb, mut enc_stream) = self.time_embed.forward(timestep, enc, enc_mask)?;
+
+        // Patchify: [B, C, F, H, W] → [B·F, H, W, C] (NHWC) → Conv2d(patch) → [B, F·ph·pw, inner].
+        let x = hidden
+            .as_dtype(Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3, 4])? // [B, F, C, H, W]
+            .reshape(&[b * f, c, h, wd])?
+            .transpose_axes(&[0, 2, 3, 1])?; // NHWC
+        let x = conv2d(&x, &self.patch_w, Some(&self.patch_b), p, 0)?; // [B·F, ph, pw, inner]
+        let mut hs = x
+            .reshape(&[b * f, ph * pw, inner])?
+            .reshape(&[b, f * ph * pw, inner])?;
+
+        // Learned 3-D RoPE over the post-patch grid.
+        let rope = MochiRope::new(&self.pos_frequencies, f as usize, ph as usize, pw as usize)?;
+
+        for block in &self.blocks {
+            let (h_new, e_new) = block.forward(&hs, &enc_stream, &temb, &rope, enc_mask)?;
+            hs = h_new;
+            enc_stream = e_new;
+        }
+
+        // AdaLayerNormContinuous (layer_norm, no affine) → proj_out.
+        let emb = linear_b(&silu(&temb)?, &self.norm_out_w, &self.norm_out_b)?;
+        let so = chunk_last(&emb, 2)?;
+        let (scale, shift) = (&so[0], &so[1]);
+        let normed = layer_norm(&hs, None, None, 1e-6)?;
+        let hs = add(
+            &multiply(&normed, &add(&unsqueeze1(scale)?, Array::from_f32(1.0))?)?,
+            &unsqueeze1(shift)?,
+        )?;
+        let hs = linear_b(&hs, &self.proj_out_w, &self.proj_out_b)?; // [B, seq, p²·out_ch]
+
+        // Unpatchify: [B, F, ph, pw, p, p, out_ch] → [B, out_ch, F, H, W].
+        let out_ch = c; // out_channels == in_channels (12)
+        let hs = hs
+            .reshape(&[b, f, ph, pw, p, p, out_ch])?
+            .transpose_axes(&[0, 6, 1, 2, 4, 3, 5])? // [B, out_ch, F, ph, p, pw, p]
+            .reshape(&[b, out_ch, f, ph * p, pw * p])?;
+        Ok(hs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +847,105 @@ mod tests {
         assert!(close(&h1, &h2));
         assert!(close(&e1, &e2));
         assert!(h1.as_slice::<f32>().iter().all(|x| x.is_finite()));
+    }
+
+    /// A tiny full-model config: 2 heads × 8 head-dim → inner 16, pooled 8, 4 latent channels, 2
+    /// layers (so block 0 is normal and block 1 is `context_pre_only`).
+    fn tiny_full_cfg() -> MochiDitConfig {
+        MochiDitConfig {
+            patch_size: 2,
+            num_heads: 2,
+            head_dim: 8,
+            num_layers: 2,
+            pooled_dim: 8,
+            in_channels: 4,
+            text_embed_dim: 16,
+            time_embed_dim: 8,
+            eps: 1e-6,
+        }
+    }
+
+    /// Merge `src`'s tensors into `dst`.
+    fn merge(dst: &mut Weights, src: Weights) {
+        let keys: Vec<String> = src.keys().map(String::from).collect();
+        for k in keys {
+            if let Some(t) = src.get(&k) {
+                dst.insert(k, t.clone());
+            }
+        }
+    }
+
+    fn tiny_full_weights(cfg: &MochiDitConfig) -> Weights {
+        let inner = cfg.inner_dim() as i32; // 16
+        let pooled = cfg.pooled_dim as i32; // 8
+        let te = cfg.text_embed_dim as i32; // 16
+        let ted = cfg.time_embed_dim as i32; // 8
+        let in_ch = cfg.in_channels as i32; // 4
+        let half = (cfg.head_dim / 2) as i32; // 4
+        let out_dims = (cfg.patch_size * cfg.patch_size * cfg.in_channels) as i32; // 16
+
+        let mut w = Weights::empty();
+        w.insert("patch_embed.proj.weight", rnd(&[inner, in_ch, 2, 2], 200));
+        w.insert("patch_embed.proj.bias", rnd(&[inner], 201));
+        w.insert("pos_frequencies", rnd(&[3, cfg.num_heads as i32, half], 202));
+        w.insert(
+            "time_embed.timestep_embedder.linear_1.weight",
+            rnd(&[inner, ted], 203),
+        );
+        w.insert("time_embed.timestep_embedder.linear_1.bias", rnd(&[inner], 204));
+        w.insert(
+            "time_embed.timestep_embedder.linear_2.weight",
+            rnd(&[inner, inner], 205),
+        );
+        w.insert("time_embed.timestep_embedder.linear_2.bias", rnd(&[inner], 206));
+        w.insert("time_embed.pooler.to_kv.weight", rnd(&[2 * te, te], 207));
+        w.insert("time_embed.pooler.to_kv.bias", rnd(&[2 * te], 208));
+        w.insert("time_embed.pooler.to_q.weight", rnd(&[te, te], 209));
+        w.insert("time_embed.pooler.to_q.bias", rnd(&[te], 210));
+        w.insert("time_embed.pooler.to_out.weight", rnd(&[inner, te], 211));
+        w.insert("time_embed.pooler.to_out.bias", rnd(&[inner], 212));
+        w.insert("time_embed.caption_proj.weight", rnd(&[pooled, te], 213));
+        w.insert("time_embed.caption_proj.bias", rnd(&[pooled], 214));
+        w.insert("norm_out.linear.weight", rnd(&[2 * inner, inner], 215));
+        w.insert("norm_out.linear.bias", rnd(&[2 * inner], 216));
+        w.insert("proj_out.weight", rnd(&[out_dims, inner], 217));
+        w.insert("proj_out.bias", rnd(&[out_dims], 218));
+
+        merge(&mut w, tiny_block_weights(cfg, "transformer_blocks.0"));
+        merge(&mut w, tiny_block_weights(cfg, "transformer_blocks.1"));
+        // Block 1 is the final context_pre_only block → needs norm1_context.linear_1.
+        w.insert(
+            "transformer_blocks.1.norm1_context.linear_1.weight",
+            rnd(&[pooled, inner], 219),
+        );
+        w.insert(
+            "transformer_blocks.1.norm1_context.linear_1.bias",
+            rnd(&[pooled], 220),
+        );
+        w
+    }
+
+    #[test]
+    fn full_model_forward_shapes_and_determinism() {
+        let cfg = tiny_full_cfg();
+        let w = tiny_full_weights(&cfg);
+        let model = MochiTransformer3DModel::from_weights(&w, &cfg, Dtype::Float32).unwrap();
+
+        // [B=2, C=4, F=1, H=4, W=4] latent, 3 text tokens (2 valid), timestep per batch element.
+        let hidden = rnd(&[2, 4, 1, 4, 4], 300);
+        let enc = rnd(&[2, 3, 16], 301);
+        let timestep = Array::from_slice(&[0.0f32, 25.0], &[2]);
+        let enc_mask = Array::from_slice(&[1.0f32, 1.0, 0.0, 1.0, 0.0, 0.0], &[2, 3]);
+
+        let out = model.forward(&hidden, &enc, &timestep, &enc_mask).unwrap();
+        assert_eq!(out.shape(), &[2, 4, 1, 4, 4], "noise_pred matches latent shape");
+        assert!(out.as_slice::<f32>().iter().all(|x| x.is_finite()));
+
+        let out2 = model.forward(&hidden, &enc, &timestep, &enc_mask).unwrap();
+        let d = mlx_rs::ops::max(mlx_rs::ops::abs(&subtract(&out, &out2).unwrap()).unwrap(), None)
+            .unwrap()
+            .item::<f32>();
+        assert_eq!(d, 0.0, "forward is deterministic");
     }
 
     #[test]
