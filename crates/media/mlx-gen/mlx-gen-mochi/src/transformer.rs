@@ -22,7 +22,8 @@ use std::path::Path;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, concatenate_axis, matmul, maximum, mean_axis, multiply, rsqrt, split, sum_axis, tanh,
+    add, concatenate_axis, matmul, maximum, mean_axis, multiply, quantized_matmul, rsqrt, split,
+    sum_axis, tanh,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -77,6 +78,20 @@ pub fn load_transformer_weights(root: &Path) -> Result<Weights> {
     Ok(combined)
 }
 
+/// A pre-quantized tier's affine-quant geometry, read from the tier dir's `split_model.json` (the
+/// [`crate::config::MochiSplitModel`] manifest). When present on [`MochiDitConfig`], the packed-load
+/// path ([`MochiLinear::load`]) consumes the on-disk `.weight`(u32)/`.scales`/`.biases` packs for the
+/// [`MOCHI_QUANT_SUFFIXES`](crate::convert::MOCHI_QUANT_SUFFIXES) Linears instead of loading dense
+/// weights. `bits` (4 → Q4, 8 → Q8) and `group` (the group-scale width, 64) must match the packing
+/// `convert.rs` emitted — they are read from the manifest, never hardcoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MochiQuant {
+    /// Quantization bits (4 → Q4, 8 → Q8).
+    pub bits: i32,
+    /// Affine-quant group size (the reference/mflux default 64).
+    pub group: i32,
+}
+
 /// AsymmDiT geometry (`transformer/config.json`). `inner_dim = num_heads · head_dim = 3072`.
 #[derive(Debug, Clone, Copy)]
 pub struct MochiDitConfig {
@@ -90,6 +105,11 @@ pub struct MochiDitConfig {
     pub time_embed_dim: usize,
     /// Normalization epsilon for the block's weightless norms (`1e-6`).
     pub eps: f32,
+    /// `Some` iff the transformer weights are a pre-quantized tier (the tier dir's `split_model.json`
+    /// carries `quantized:true`). Drives the packed-load path; `None` = dense (the default / the raw
+    /// bf16 snapshot). Rides on the config so the parity-tested `from_weights(w, cfg, dtype)` seam is
+    /// unchanged — mirrors `WanModelConfig.quantization`.
+    pub quantization: Option<MochiQuant>,
 }
 
 impl Default for MochiDitConfig {
@@ -104,6 +124,7 @@ impl Default for MochiDitConfig {
             text_embed_dim: 4096,
             time_embed_dim: 256,
             eps: 1e-6,
+            quantization: None,
         }
     }
 }
@@ -128,6 +149,94 @@ fn linear_nb(x: &Array, w: &Array) -> Result<Array> {
 /// `y = x · Wᵀ + b` (mlx-gen core fused `addmm`).
 fn linear_b(x: &Array, w: &Array, b: &Array) -> Result<Array> {
     mlx_gen::nn::linear(x, w, b)
+}
+
+/// A DiT projection Linear that is **dense** (raw `[out, in]` weight) or **quantized** (group-wise
+/// affine `.weight`(u32)/`.scales`/`.biases` packs). The visual/text attention `to_q/k/v` +
+/// `to_out.0`/`to_add_out` and the SwiGLU `net.0.proj`/`net.2` are quantized in a pre-quantized tier
+/// (they carry `.scales` on disk); every other tensor (norms, adaLN modulation, patchify, pooler,
+/// caption/time embed, proj_out) stays dense. `.scales` presence is the per-Linear signal, exactly as
+/// the Wan packed-load path and mirroring the reference `nn.quantize` predicate.
+#[derive(Clone)]
+enum MochiLinear {
+    /// Dense base — `matmul(x, Wᵀ)` (`+ b` fused via `addmm` when biased). Bit-identical to the
+    /// previous raw-`Array` path (f32 activations make `addmm == matmul + add`).
+    Dense { w: Array, b: Option<Array> },
+    /// Quantized base — `quantized_matmul` (fp32-accumulate) over the packed weight, then optional
+    /// dense-bias add. Activations feed in AS-IS (Mochi's f32 compute), matching the Wan path.
+    Quant {
+        wq: Array,
+        scales: Array,
+        biases: Array,
+        b: Option<Array>,
+        group: i32,
+        bits: i32,
+    },
+}
+
+impl MochiLinear {
+    /// Load `{prefix}.weight` (+ `{prefix}.bias` when `bias`). When `quant` is `Some` **and** this
+    /// Linear carries a `{prefix}.scales` pack on disk, consume the packed parts directly (the
+    /// pre-quantized tier / `convert.rs` output). Otherwise load dense at `dtype`. The `.scales` probe
+    /// is what makes a single tier dir mix packed attention/FFN Linears with dense norms/embeds.
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        bias: bool,
+        quant: Option<MochiQuant>,
+        dtype: Dtype,
+    ) -> Result<Self> {
+        let wkey = format!("{prefix}.weight");
+        let bkey = format!("{prefix}.bias");
+        if let (Some(q), Some(scales)) = (quant, w.get(&format!("{prefix}.scales"))) {
+            // Packed parts are consumed as-is (u32 codes + bf16 scales/biases) — no re-quantize.
+            let b = if bias {
+                Some(w.require(&bkey)?.clone())
+            } else {
+                w.get(&bkey).cloned()
+            };
+            return Ok(MochiLinear::Quant {
+                wq: w.require(&wkey)?.clone(),
+                scales: scales.clone(),
+                biases: w.require(&format!("{prefix}.biases"))?.clone(),
+                b,
+                group: q.group,
+                bits: q.bits,
+            });
+        }
+        let b = if bias {
+            Some(w.require(&bkey)?.as_dtype(dtype)?)
+        } else {
+            None
+        };
+        Ok(MochiLinear::Dense {
+            w: w.require(&wkey)?.as_dtype(dtype)?,
+            b,
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        match self {
+            MochiLinear::Dense { w, b } => match b {
+                Some(b) => linear_b(x, w, b),
+                None => linear_nb(x, w),
+            },
+            MochiLinear::Quant {
+                wq,
+                scales,
+                biases,
+                b,
+                group,
+                bits,
+            } => {
+                let mut y = quantized_matmul(x, wq, scales, biases, true, *group, *bits)?;
+                if let Some(b) = b {
+                    y = add(&y, b)?;
+                }
+                Ok(y)
+            }
+        }
+    }
 }
 
 /// Weightless RMS norm over the last axis, computed in f32 (`RMSNorm(0, eps, False)` —
@@ -160,50 +269,56 @@ fn unsqueeze1(x: &Array) -> Result<Array> {
 // ---------------------------------------------------------------------------- SwiGLU FFN
 
 /// SwiGLU feed-forward (`FeedForward(activation="swiglu", bias=False)`): `proj` (`d → 2·inner`),
-/// split into `(value, gate)`, `value · silu(gate)`, then `out` (`inner → d`).
+/// split into `(value, gate)`, `value · silu(gate)`, then `out` (`inner → d`). Both projections are
+/// quantized in a pre-quantized tier (`net.0.proj` / `net.2` — see [`MochiLinear`]).
 #[derive(Clone)]
 struct SwiGlu {
-    proj_w: Array, // [2·inner, d]
-    out_w: Array,  // [d, inner]
+    proj: MochiLinear, // [2·inner, d]
+    out: MochiLinear,  // [d, inner]
 }
 
 impl SwiGlu {
-    fn from_weights(w: &Weights, prefix: &str, dtype: Dtype) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        quant: Option<MochiQuant>,
+        dtype: Dtype,
+    ) -> Result<Self> {
         Ok(Self {
-            proj_w: w
-                .require(&join(prefix, "net.0.proj.weight"))?
-                .as_dtype(dtype)?,
-            out_w: w.require(&join(prefix, "net.2.weight"))?.as_dtype(dtype)?,
+            proj: MochiLinear::load(w, &join(prefix, "net.0.proj"), false, quant, dtype)?,
+            out: MochiLinear::load(w, &join(prefix, "net.2"), false, quant, dtype)?,
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let h = linear_nb(x, &self.proj_w)?;
+        let h = self.proj.forward(x)?;
         let parts = chunk_last(&h, 2)?;
         let gated = multiply(&parts[0], &silu(&parts[1])?)?;
-        linear_nb(&gated, &self.out_w)
+        self.out.forward(&gated)
     }
 }
 
 // ---------------------------------------------------------------------------- attention
 
-/// Mochi joint attention (`MochiAttention` + `MochiAttnProcessor2_0`).
+/// Mochi joint attention (`MochiAttention` + `MochiAttnProcessor2_0`). The `to_q/k/v`, added
+/// `add_{q,k,v}_proj`, `to_out.0`, and `to_add_out` projections are quantized in a pre-quantized tier
+/// (they carry `.scales` on disk); the per-head `qk_norm` weights stay dense.
 #[derive(Clone)]
 pub struct MochiAttention {
-    to_q: Array,
-    to_k: Array,
-    to_v: Array,
-    add_q: Array,
-    add_k: Array,
-    add_v: Array,
+    to_q: MochiLinear,
+    to_k: MochiLinear,
+    to_v: MochiLinear,
+    add_q: MochiLinear,
+    add_k: MochiLinear,
+    add_v: MochiLinear,
     norm_q: Array,
     norm_k: Array,
     norm_added_q: Array,
     norm_added_k: Array,
-    to_out_w: Array,
-    to_out_b: Array,
-    /// `(weight, bias)` for `to_add_out` — absent when `context_pre_only`.
-    to_add_out: Option<(Array, Array)>,
+    /// `to_out.0` (biased).
+    to_out: MochiLinear,
+    /// `to_add_out` (biased) — absent when `context_pre_only`.
+    to_add_out: Option<MochiLinear>,
     num_heads: usize,
     head_dim: usize,
 }
@@ -216,26 +331,29 @@ impl MochiAttention {
         context_pre_only: bool,
         dtype: Dtype,
     ) -> Result<Self> {
-        let g =
+        let q = cfg.quantization;
+        let lin = |name: &str, bias: bool| -> Result<MochiLinear> {
+            MochiLinear::load(w, &join(prefix, name), bias, q, dtype)
+        };
+        let arr =
             |name: &str| -> Result<Array> { Ok(w.require(&join(prefix, name))?.as_dtype(dtype)?) };
         let to_add_out = if context_pre_only {
             None
         } else {
-            Some((g("to_add_out.weight")?, g("to_add_out.bias")?))
+            Some(lin("to_add_out", true)?)
         };
         Ok(Self {
-            to_q: g("to_q.weight")?,
-            to_k: g("to_k.weight")?,
-            to_v: g("to_v.weight")?,
-            add_q: g("add_q_proj.weight")?,
-            add_k: g("add_k_proj.weight")?,
-            add_v: g("add_v_proj.weight")?,
-            norm_q: g("norm_q.weight")?,
-            norm_k: g("norm_k.weight")?,
-            norm_added_q: g("norm_added_q.weight")?,
-            norm_added_k: g("norm_added_k.weight")?,
-            to_out_w: g("to_out.0.weight")?,
-            to_out_b: g("to_out.0.bias")?,
+            to_q: lin("to_q", false)?,
+            to_k: lin("to_k", false)?,
+            to_v: lin("to_v", false)?,
+            add_q: lin("add_q_proj", false)?,
+            add_k: lin("add_k_proj", false)?,
+            add_v: lin("add_v_proj", false)?,
+            norm_q: arr("norm_q.weight")?,
+            norm_k: arr("norm_k.weight")?,
+            norm_added_q: arr("norm_added_q.weight")?,
+            norm_added_k: arr("norm_added_k.weight")?,
+            to_out: lin("to_out.0", true)?,
             to_add_out,
             num_heads: cfg.num_heads,
             head_dim: cfg.head_dim,
@@ -262,16 +380,16 @@ impl MochiAttention {
         let st = text.shape()[1];
 
         // Visual q/k/v (+ per-head qk_norm) with RoPE on q/k.
-        let q = self.to_heads(&linear_nb(visual, &self.to_q)?)?;
-        let k = self.to_heads(&linear_nb(visual, &self.to_k)?)?;
-        let v = self.to_heads(&linear_nb(visual, &self.to_v)?)?;
+        let q = self.to_heads(&self.to_q.forward(visual)?)?;
+        let k = self.to_heads(&self.to_k.forward(visual)?)?;
+        let v = self.to_heads(&self.to_v.forward(visual)?)?;
         let q = rope.apply(&rms_weighted(&q, &self.norm_q, QK_NORM_EPS)?)?;
         let k = rope.apply(&rms_weighted(&k, &self.norm_k, QK_NORM_EPS)?)?;
 
         // Text q/k/v (+ per-head qk_norm), no RoPE.
-        let eq = self.to_heads(&linear_nb(text, &self.add_q)?)?;
-        let ek = self.to_heads(&linear_nb(text, &self.add_k)?)?;
-        let ev = self.to_heads(&linear_nb(text, &self.add_v)?)?;
+        let eq = self.to_heads(&self.add_q.forward(text)?)?;
+        let ek = self.to_heads(&self.add_k.forward(text)?)?;
+        let ev = self.to_heads(&self.add_v.forward(text)?)?;
         let eq = rms_weighted(&eq, &self.norm_added_q, QK_NORM_EPS)?;
         let ek = rms_weighted(&ek, &self.norm_added_k, QK_NORM_EPS)?;
 
@@ -297,9 +415,9 @@ impl MochiAttention {
         let vis = out.take_axis(&vis_idx, 1)?;
         let txt = out.take_axis(&txt_idx, 1)?;
 
-        let hidden = linear_b(&vis, &self.to_out_w, &self.to_out_b)?;
+        let hidden = self.to_out.forward(&vis)?;
         let enc = match &self.to_add_out {
-            Some((w, b)) => Some(linear_b(&txt, w, b)?),
+            Some(l) => Some(l.forward(&txt)?),
             None => None,
         };
         Ok((hidden, enc))
@@ -393,7 +511,12 @@ impl MochiTransformerBlock {
         let ff_context = if context_pre_only {
             None
         } else {
-            Some(SwiGlu::from_weights(w, &join(prefix, "ff_context"), dtype)?)
+            Some(SwiGlu::from_weights(
+                w,
+                &join(prefix, "ff_context"),
+                cfg.quantization,
+                dtype,
+            )?)
         };
         Ok(Self {
             norm1_w: w
@@ -410,7 +533,7 @@ impl MochiTransformerBlock {
                 context_pre_only,
                 dtype,
             )?,
-            ff: SwiGlu::from_weights(w, &join(prefix, "ff"), dtype)?,
+            ff: SwiGlu::from_weights(w, &join(prefix, "ff"), cfg.quantization, dtype)?,
             ff_context,
             eps: cfg.eps,
         })
@@ -786,6 +909,7 @@ mod tests {
             text_embed_dim: 4096,
             time_embed_dim: 256,
             eps: 1e-6,
+            quantization: None,
         }
     }
 
@@ -888,6 +1012,7 @@ mod tests {
             text_embed_dim: 16,
             time_embed_dim: 8,
             eps: 1e-6,
+            quantization: None,
         }
     }
 

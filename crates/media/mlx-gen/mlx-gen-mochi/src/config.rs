@@ -188,9 +188,93 @@ impl MochiVaeConfig {
     }
 }
 
+/// The tier `split_model.json` manifest's quantization fields — the Mochi analog of LTX's
+/// `SplitModel` (sc-2686). A pre-quantized tier dir (`q4/`, `q8/`) carries `quantized:true` plus
+/// `quantization_bits` (4 → Q4, 8 → Q8) and `quantization_group_size` (64); the `bf16/` tier is dense
+/// (`quantized:false`). The quant geometry is **read from the manifest, never hardcoded** — a tier dir
+/// *is* the quant selection — and the per-Linear `.scales` probe (in [`crate::transformer`]) picks
+/// which Linears consume packed weights. `convert.rs` (story A6) writes this file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MochiSplitModel {
+    /// `quantized` — whether the transformer ships selectively-quantized Linears.
+    pub quantized: bool,
+    /// `quantization_bits` (default 4): 4 → Q4, 8 → Q8.
+    pub bits: i32,
+    /// `quantization_group_size` (default 64): the affine-quant group width.
+    pub group: i32,
+}
+
+impl MochiSplitModel {
+    /// A non-quantized manifest (file absent or `quantized:false`) — the raw bf16 snapshot / `bf16/`
+    /// tier. Bits/group hold the reference defaults so a downstream quant geometry is well-defined.
+    pub fn dense() -> Self {
+        Self {
+            quantized: false,
+            bits: 4,
+            group: 64,
+        }
+    }
+
+    /// Parse `<root>/split_model.json`. Absent → [`dense`](Self::dense) (the raw snapshot has no
+    /// manifest), mirroring the LTX loader (only quantize when the manifest sets `quantized:true`).
+    pub fn from_model_dir(root: &Path) -> Result<Self> {
+        let path = root.join("split_model.json");
+        if !path.exists() {
+            return Ok(Self::dense());
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| Error::Msg(format!("mochi split_model {}: {e}", path.display())))?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Msg(format!("mochi split_model {}: {e}", path.display())))?;
+        Ok(Self::from_value(&v))
+    }
+
+    /// Parse the manifest fields from a parsed `split_model.json` value.
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        let i32_at = |key: &str, dflt: i32| -> i32 {
+            v.get(key)
+                .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f as i64)))
+                .map(|x| x as i32)
+                .unwrap_or(dflt)
+        };
+        Self {
+            quantized: v
+                .get("quantized")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            bits: i32_at("quantization_bits", 4),
+            group: i32_at("quantization_group_size", 64),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_model_defaults_and_parse() {
+        // Absent manifest → dense.
+        let d = MochiSplitModel::dense();
+        assert!(!d.quantized);
+        assert_eq!((d.bits, d.group), (4, 64));
+
+        // Quantized manifest parses bits/group.
+        let v = serde_json::json!({
+            "quantized": true,
+            "quantization_bits": 4,
+            "quantization_group_size": 64,
+        });
+        let q = MochiSplitModel::from_value(&v);
+        assert!(q.quantized);
+        assert_eq!((q.bits, q.group), (4, 64));
+
+        // A dense manifest (bf16 tier) stays dense; missing bits fall back to defaults.
+        let vb = serde_json::json!({ "quantized": false });
+        let b = MochiSplitModel::from_value(&vb);
+        assert!(!b.quantized);
+        assert_eq!((b.bits, b.group), (4, 64));
+    }
 
     #[test]
     fn defaults_match_mochi_geometry() {
