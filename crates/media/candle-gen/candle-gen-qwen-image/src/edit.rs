@@ -312,7 +312,7 @@ impl QwenEdit {
         // worker fit-gate via `offload_policy`, or forced by the `CANDLE_GEN_OFFLOAD=sequential` env the
         // GPU A/B harness drives (the shared txt2img override, sc-10867).
         let sequential = paths.offload_policy == OffloadPolicy::Sequential
-            || crate::sequential_offload_enabled();
+            || candle_gen::sequential_offload_enabled();
         let resident = if sequential {
             None
         } else {
@@ -586,40 +586,45 @@ impl QwenEdit {
     ///
     /// Unlike the txt2img path (drop the TE → load DiT+VAE), the encode phase here holds TWO components:
     /// the VL encoder AND the VAE encoder (the references are VAE-encoded into the dual-latent sequence
-    /// there). Both drop together at the end of Phase 1; the VAE **decoder** loads fresh in Phase 2. The
-    /// surviving state — `pos`/`neg` embeds, `static_latents`, `cond_grids` — is small (no model weights).
+    /// there). Both drop together at the end of the text phase; the VAE **decoder** loads fresh in the
+    /// heavy phase. The surviving state — `pos`/`neg` embeds, `static_latents`, `cond_grids` — is small
+    /// (no model weights).
+    ///
+    /// The schedule itself — the cancel checks at each stage boundary (F-173), the `Progress::Loading`
+    /// emits (F-179), and the drop-before-load ordering — lives in [`candle_gen::run_sequential`], shared
+    /// with every other wired candle engine (sc-12089). Only the two loaders and the encode/render bodies
+    /// are the edit lane's. The seam's two-phase `Text`/`Heavy` split takes tuples here: this lane's text
+    /// phase is the VL + VAE encoders, and its heavy phase the DiT + VAE decoder. There is no PiD overlay
+    /// on this lane, so it has no F-177 arm to gate.
     fn generate_sequential(
         &self,
         req: &QwenEditRequest,
         references: &[Image],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        // Phase 1 — load the VL encoder + VAE encoder, encode the conditioning + VAE-encode the
-        // references, then DROP both (scoped) so the ~8 GB Qwen2.5-VL frees before the DiT loads.
-        let (pos, neg, static_latents, cond_grids) = {
-            let vl_encoder = self.load_vl_seq()?;
-            let vae_encoder = self.load_vae_encoder_seq()?;
-            self.encode_conditioning(&vl_encoder, &vae_encoder, req, references)?
-        };
-
-        // A reload is expensive — bail before Phase 2 if the request was cancelled during encode.
-        if req.cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
-
-        // Phase 2 — load the DiT (reusing the encoder's freed pool) + the VAE decoder, then run the shared
-        // denoise + decode tail.
-        let transformer = self.load_transformer_seq()?;
-        let vae = self.load_vae_seq()?;
-        self.denoise_and_decode(
-            &transformer,
-            &vae,
-            req,
-            &pos,
-            neg.as_ref(),
-            &static_latents,
-            &cond_grids,
+        candle_gen::run_sequential(
+            &req.cancel,
             on_progress,
+            // The text phase holds BOTH encoders — the references are VAE-encoded during the conditioning
+            // head, so the VAE encoder is co-resident with the VL encoder rather than with the DiT.
+            || Ok((self.load_vl_seq()?, self.load_vae_encoder_seq()?)),
+            |(vl_encoder, vae_encoder)| {
+                self.encode_conditioning(vl_encoder, vae_encoder, req, references)
+            },
+            || Ok((self.load_transformer_seq()?, self.load_vae_seq()?)),
+            // The shared denoise + decode tail, identical to the resident path's.
+            |(transformer, vae), (pos, neg, static_latents, cond_grids), on_progress| {
+                self.denoise_and_decode(
+                    transformer,
+                    vae,
+                    req,
+                    &pos,
+                    neg.as_ref(),
+                    &static_latents,
+                    &cond_grids,
+                    on_progress,
+                )
+            },
         )
     }
 }

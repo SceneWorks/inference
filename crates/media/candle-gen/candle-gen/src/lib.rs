@@ -148,6 +148,14 @@ pub use comfyui_vae::remap_vae_wan_to_diffusers;
 pub mod sync;
 pub use sync::{cached, lock_recover};
 
+// Shared component-residency seam (epic 10765 Phase 1c, sc-12089) — the candle counterpart of
+// mlx-gen's `residency` module (sc-11125). The `Sequential` load→encode→drop→load schedule, the
+// stage-boundary cancel checks (F-173) and the `Progress::Loading` emits (F-179) live here once
+// instead of being re-derived per engine; flux, flux2 and qwen-image had each open-coded the
+// schedule and each omitted the same two things.
+pub mod residency;
+pub use residency::{check_cancel, run_sequential, sequential_offload_enabled, OFFLOAD_ENV};
+
 // Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, GPU peak-VRAM,
 // and HF-Hub-cache resolution helpers that had been hand-copied — and had drifted — across ~16
 // `#[cfg(test)]` validation modules in the provider crates. Also folds the F-071/sc-9057 `$HF_HOME`

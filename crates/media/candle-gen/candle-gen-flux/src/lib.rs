@@ -274,7 +274,7 @@ impl Generator for FluxGenerator {
         // `Sequential`); `CANDLE_GEN_OFFLOAD=sequential` is an env override kept for the GPU A/B harness.
         // The default stays the resident, cross-request-cached path.
         let sequential = self.offload_policy == OffloadPolicy::Sequential
-            || pipeline::sequential_offload_enabled();
+            || candle_gen::sequential_offload_enabled();
         let images = if sequential {
             pipe.render_sequential(req, on_progress)?
         } else {

@@ -98,6 +98,19 @@ struct Components {
     pid: Option<Arc<PidEngine>>,
 }
 
+/// The just-loaded heavy phase owned by the sequential path — the DiT + VAE + the optional PiD engine,
+/// loaded together AFTER the text encoder was dropped so they reuse that freed pool. Bundled into one
+/// value because it is the `Heavy` of [`candle_gen::run_sequential`] (sc-12089), which loads the phase
+/// through a single closure. Not `Arc`-shared: the sequential path deliberately drops each component
+/// after its phase rather than keeping the cross-request cache.
+struct SeqHeavy {
+    transformer: Flux2Transformer,
+    vae: Flux2Vae,
+    /// The optional PiD engine — `None` both when the caller never opted in via `LoadSpec::pid` and when
+    /// THIS request will not decode through it (F-177, [`Pipeline::pid_to_load`]).
+    pid: Option<Arc<PidEngine>>,
+}
+
 /// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype. `pub(crate)` so the
 /// edit provider ([`edit_provider`]) reuses the snapshot mmap + prompt-encode scaffolding.
 pub(crate) struct Pipeline {
@@ -274,6 +287,55 @@ impl Pipeline {
         )
     }
 
+    /// Which PiD spec [`load_pid`](Self::load_pid) should actually load: the spec the caller opted into
+    /// via `LoadSpec::pid`, but only when this load will use it (F-177).
+    ///
+    /// [`resolve_pid_decoder`](candle_gen_pid::resolve_pid_decoder) already gates the *decode* on
+    /// `req.use_pid`, so an engine loaded for a request that did not ask for it is never read — under
+    /// `Resident` that is a harmless one-time cost amortized across every later request, but under
+    /// `Sequential` it is paid on EVERY generate and sits resident through the whole denoise, inside the
+    /// very peak that path exists to bound.
+    ///
+    /// Pure, so the rule is unit-testable without weights or a GPU (krea's `pid_to_load` idiom).
+    fn pid_to_load(&self, use_pid: bool) -> Option<&PidWeights> {
+        self.pid_spec.as_ref().filter(|_| use_pid)
+    }
+
+    /// Load the optional PiD super-resolving decoder (epic 7840 / sc-7853) when the caller opted in via
+    /// `LoadSpec::pid` AND this load will actually use it ([`pid_to_load`](Self::pid_to_load)); FLUX.2's
+    /// `flux2` latent-space student. `None` ⇒ the native [`Flux2Vae`] decode.
+    ///
+    /// **`use_pid` (F-177).** [`load_components`](Self::load_components) passes `true` — the resident set
+    /// is cached across requests, so the overlay must be there for whichever later request wants it. The
+    /// `Sequential` path passes `req.use_pid`, because there this load runs on EVERY generate.
+    fn load_pid(&self, use_pid: bool) -> CResult<Option<Arc<PidEngine>>> {
+        Ok(match self.pid_to_load(use_pid) {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        })
+    }
+
+    /// Load the whole heavy phase for the sequential path (sc-12089) — the DiT, then the VAE, then the
+    /// optional PiD engine, in that order (the order the pre-seam code loaded them, kept so the tier
+    /// routing and any load-time error surface identically). Runs AFTER the text encoder was dropped, so
+    /// it reuses that freed allocator pool.
+    ///
+    /// **`use_pid` (F-177).** Threaded straight to [`load_pid`](Self::load_pid): this whole fn runs per
+    /// generate, so a PiD engine loaded for a request that never asked for it would sit inside the peak
+    /// this path exists to bound — while `resolve_pid_decoder` goes on to return `None` for it, so not a
+    /// byte of it is read.
+    fn load_heavy_seq(&self, use_pid: bool) -> CResult<SeqHeavy> {
+        Ok(SeqHeavy {
+            transformer: self.load_dit_seq()?,
+            vae: Flux2Vae::new(self.component_vb("vae")?)?,
+            pid: self.load_pid(use_pid)?,
+        })
+    }
+
     /// Load the TE + DiT, routing each through the **packed** path (build straight from an MLX-packed
     /// tier on the GPU — sc-9087, no ~105 GB dense CPU staging) or the legacy **dense** path (stage
     /// dense in system RAM, then quantize each projection onto the GPU) per [`Self::component_is_packed`]
@@ -379,14 +441,9 @@ impl Pipeline {
         let tokenizer = self.build_tokenizer()?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; otherwise `None` and the render path uses the native Flux2Vae.
-        let pid = match self.pid_spec.as_ref() {
-            Some(spec) => Some(Arc::new(PidEngine::from_spec(
-                spec,
-                PID_BACKBONE,
-                &self.device,
-            )?)),
-            None => None,
-        };
+        // Resident: this set is cached across requests, so the overlay must be loaded for whichever later
+        // request asks for it (F-177 — only the `Sequential` path gates this on `req.use_pid`).
+        let pid = self.load_pid(true)?;
         Ok(Components {
             te: Arc::new(te),
             transformer: Arc::new(transformer),
@@ -605,11 +662,17 @@ impl Pipeline {
     /// / [`encode_negative`]), the shared [`sample`](Self::sample) denoise+decode loop; only the load/free
     /// schedule differs.
     ///
-    /// Selected by the generator when [`sequential_offload_enabled`] (`CANDLE_GEN_OFFLOAD=sequential`) or
-    /// `LoadSpec::offload_policy == Sequential` (the worker fit-gate sets it). Because it drops components,
+    /// Selected by the generator when [`candle_gen::sequential_offload_enabled`]
+    /// (`CANDLE_GEN_OFFLOAD=sequential`) or `LoadSpec::offload_policy == Sequential` (the worker fit-gate
+    /// sets it). Because it drops components,
     /// it does NOT populate the generator's `Components` cache — repeat requests reload from the (page-
     /// cached) snapshot; that reload cost is the deliberate trade for the lower peak, which is why it is
     /// opt-in per the fit-gate rather than the default.
+    ///
+    /// The schedule itself — the cancel checks at each stage boundary (F-173), the `Progress::Loading`
+    /// emits (F-179), and the drop-before-load ordering — lives in [`candle_gen::run_sequential`], shared
+    /// with every other wired candle engine (sc-12089). Only the two loaders and the encode/render bodies
+    /// are FLUX.2's.
     fn render_sequential(
         &self,
         req: &GenerationRequest,
@@ -622,53 +685,44 @@ impl Pipeline {
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
 
-        // Phase 1 — load ONLY the text encoder (+ its cheap tokenizer), encode the prompt (+ the klein
-        // CFG negative), then DROP both (scoped) so the decoder-LM TE frees before the DiT loads. The
-        // encode delegates to the SAME `encode`/`encode_negative` the resident path uses, so the
-        // conditioning tensors are byte-identical to `render`.
-        let (prompt_embeds, negative) = {
-            let te = self.load_te_seq()?;
-            let tokenizer = self.build_tokenizer()?;
-            let prompt_embeds = self.encode(&te, &tokenizer, &req.prompt)?;
-            let negative = self.encode_negative(&te, &tokenizer, req, guidance)?;
-            (prompt_embeds, negative)
-        };
-
-        // Phase 2 — load the DiT (reusing the TE's freed pool) + the VAE + the optional PiD decoder.
-        let transformer = self.load_dit_seq()?;
-        let vae = Flux2Vae::new(self.component_vb("vae")?)?;
-        let pid = match self.pid_spec.as_ref() {
-            Some(spec) => Some(PidEngine::from_spec(spec, PID_BACKBONE, &self.device)?),
-            None => None,
-        };
-        let pid_decoder =
-            candle_gen_pid::resolve_pid_decoder(pid.as_ref(), req, base_seed, self.variant.id())?;
-
-        // Phase 3 — per-image denoise + decode, identical to `render`'s loop.
-        self.sample(
-            req,
-            &transformer,
-            &vae,
-            &prompt_embeds,
-            negative.as_ref(),
-            pid_decoder.as_ref(),
-            guidance,
-            steps,
-            base_seed,
+        candle_gen::run_sequential(
+            &req.cancel,
             on_progress,
+            // The text phase is the decoder-LM TE + its cheap tokenizer; both drop after the encode so
+            // the TE frees before the DiT loads.
+            || Ok((self.load_te_seq()?, self.build_tokenizer()?)),
+            // Delegates to the SAME `encode`/`encode_negative` the resident path uses, so the
+            // conditioning tensors are byte-identical to `render`.
+            |(te, tokenizer)| {
+                let prompt_embeds = self.encode(te, tokenizer, &req.prompt)?;
+                let negative = self.encode_negative(te, tokenizer, req, guidance)?;
+                Ok((prompt_embeds, negative))
+            },
+            // F-177: skip the PiD student unless THIS request decodes through it.
+            || self.load_heavy_seq(req.use_pid),
+            |heavy, (prompt_embeds, negative), on_progress| {
+                let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+                    heavy.pid.as_deref(),
+                    req,
+                    base_seed,
+                    self.variant.id(),
+                )?;
+                // The shared per-image denoise + decode loop, identical to `render`'s.
+                self.sample(
+                    req,
+                    &heavy.transformer,
+                    &heavy.vae,
+                    &prompt_embeds,
+                    negative.as_ref(),
+                    pid_decoder.as_ref(),
+                    guidance,
+                    steps,
+                    base_seed,
+                    on_progress,
+                )
+            },
         )
     }
-}
-
-/// Whether the sequential-residency offload path is enabled (epic 10765 Phase 1c, sc-10868). Reads the
-/// process-wide `CANDLE_GEN_OFFLOAD` env (shared with the candle FLUX.1 lane, sc-10769): `sequential`
-/// (case-insensitive) selects the phased load/free path; unset or any other value keeps the resident,
-/// cross-request-cached default. The worker's fit-gate drives the same choice per-load via
-/// `LoadSpec::offload_policy`; this env toggle is the GPU A/B harness seam.
-pub(crate) fn sequential_offload_enabled() -> bool {
-    std::env::var("CANDLE_GEN_OFFLOAD")
-        .map(|value| value.trim().eq_ignore_ascii_case("sequential"))
-        .unwrap_or(false)
 }
 
 /// Map a decoded `[1, 3, H, W]` tensor in `[-1, 1]` to an RGB8 [`Image`].
@@ -776,7 +830,8 @@ impl Generator for Flux2Generator {
         // `root/transformer/`, so the sequential per-phase loaders can't source it (falls back to
         // resident). The default stays the resident, cross-request-cached path.
         let sequential = self.comfyui_dit.is_none()
-            && (self.offload_policy == OffloadPolicy::Sequential || sequential_offload_enabled());
+            && (self.offload_policy == OffloadPolicy::Sequential
+                || candle_gen::sequential_offload_enabled());
         let images = if sequential {
             pipe.render_sequential(req, on_progress)?
         } else {
@@ -975,6 +1030,41 @@ mod tests {
     use super::*;
     use crate::config::{FLUX2_DEV_ID, FLUX2_KLEIN_9B_ID};
     use candle_gen::gen_core::ConditioningKind;
+
+    /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through it,
+    /// so a `Sequential` generate that never asked for PiD does not pay for it — per generate, resident
+    /// through the whole denoise, inside the peak the path exists to bound.
+    ///
+    /// `load_components` passes `use_pid = true` unconditionally and that is correct, not an oversight:
+    /// it builds one cached set BEFORE any request exists, so the overlay has to be there for whichever
+    /// later request wants it. GPU- and weights-free (`Pipeline::load` does no I/O).
+    #[test]
+    fn pid_loads_only_when_the_request_uses_it() {
+        let spec = PidWeights {
+            checkpoint: WeightsSource::File("/pid.safetensors".into()),
+            gemma: WeightsSource::Dir("/gemma".into()),
+        };
+        let root = Path::new("/nonexistent");
+        let with = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            root,
+            &Device::Cpu,
+            Some(spec),
+        );
+        let without = Pipeline::load(Flux2Variant::Klein9b, None, root, &Device::Cpu, None);
+
+        // Opted in at load AND wanted by this request → load it.
+        assert!(with.pid_to_load(true).is_some());
+        // Opted in at load but NOT wanted by this request → skip it. This is the F-177 arm: before the
+        // fix the sequential path loaded the engine and `resolve_pid_decoder` then returned `None` for it,
+        // so not a byte was ever read.
+        assert!(with.pid_to_load(false).is_none());
+        // Never opted in → nothing to load, whatever the request asked for. (`use_pid` with no `pid` spec
+        // is `resolve_pid_decoder`'s error to report, not a reason to load anything here.)
+        assert!(without.pid_to_load(true).is_none());
+        assert!(without.pid_to_load(false).is_none());
+    }
 
     #[test]
     fn registers_and_resolves_as_candle() {
@@ -1314,13 +1404,11 @@ mod tests {
         assert!(load_dev(&seq).is_ok());
         assert!(load_klein(&seq).is_ok());
 
-        // The env override is read independently of the spec (the GPU A/B harness seam).
-        std::env::set_var("CANDLE_GEN_OFFLOAD", "SeQuEnTiAl");
-        assert!(super::sequential_offload_enabled());
-        std::env::set_var("CANDLE_GEN_OFFLOAD", "resident");
-        assert!(!super::sequential_offload_enabled());
-        std::env::remove_var("CANDLE_GEN_OFFLOAD");
-        assert!(!super::sequential_offload_enabled());
+        // The `CANDLE_GEN_OFFLOAD` override's semantics (spelling / case / whitespace) are asserted where
+        // the reader lives — `candle_gen::residency` — rather than re-tested per engine (sc-12089). This
+        // block used to set the process-global var here and `remove_var` it on the way out, which silently
+        // clobbered an ambient export rather than restoring it; the assertions moved, so the mutation goes
+        // with them.
     }
 
     /// Shared body for the FLUX.2 offload A/B harnesses (epic 10765 Phase 1c, sc-10868 dev / sc-11008

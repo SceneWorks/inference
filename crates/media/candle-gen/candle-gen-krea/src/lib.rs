@@ -75,6 +75,12 @@ pub use config::Krea2Config;
 pub use control_provider::{
     Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
 };
+// The resident aggregate. It splits internally into `pipeline::KreaText` (tokenizer + Qwen3-VL-4B TE)
+// and `pipeline::KreaHeavy` (DiT + VAE + optional PiD) so the `Sequential` path can drop the first
+// before the second loads (epic 10765 Phase 1c, sc-12089) — but both halves stay `pub(crate)`: every
+// operation on them is crate-private, so exporting them would add two opaque, unusable types to this
+// crate's compatibility surface. (The mlx-gen-krea twins are exported because those carry public
+// methods; ours carry none.)
 pub use pipeline::Components;
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder};
@@ -91,8 +97,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress,
-    Quant, WeightsSource,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy,
+    PidWeights, Progress, Quant, WeightsSource,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -146,6 +152,20 @@ pub struct KreaGenerator {
     /// ([`pipeline::load_components_convrot`]) and the tokenizer / Qwen3-VL TE / Qwen-Image VAE from the
     /// canonical `root` snapshot; `None` ⇒ the dense/packed `transformer/` snapshot path (unchanged).
     convrot_dit: Option<PathBuf>,
+    /// Component-residency policy captured from `LoadSpec::offload_policy` (epic 10765 Phase 1c,
+    /// sc-12089). `Sequential` routes `generate` through the phased load→encode→drop path, bounding peak
+    /// allocation demand at the cost of the components cache; `Resident` (default) keeps the cached path.
+    /// The worker's fit-gate sets this when it predicts the resident TE+DiT+VAE sum won't fit but the
+    /// DiT+VAE working set will.
+    ///
+    /// Honored on **every** request shape an advertising id accepts — txt2img
+    /// ([`pipeline::render_sequential`] / [`pipeline::render_base_sequential`]) **and** reference-guided
+    /// img2img ([`pipeline::render_img2img_sequential`] / [`pipeline::render_base_img2img_sequential`]).
+    /// That totality is load-bearing, not incidental: the capability bit is per-engine, so honoring the
+    /// policy for only some of an id's request shapes would make the fit-gate's staged-peak prediction
+    /// wrong exactly where it admits the job. Inert only on the lanes that do not advertise (Edit) or
+    /// that are load-spec-selected (ConvRot) — see [`Self::sequential`].
+    offload_policy: OffloadPolicy,
     components: Mutex<Option<Arc<Components>>>,
     /// The image-edit-only components (Qwen-Image VAE **encoder** + Qwen3-VL **vision tower**), loaded
     /// lazily on the first edit so the txt2img (Turbo/Raw) paths keep their footprint (epic 10871).
@@ -204,6 +224,45 @@ impl KreaGenerator {
             )?))
         })
     }
+
+    /// Whether THIS request runs the `Sequential` phased-residency path (epic 10765 Phase 1c, sc-12089).
+    ///
+    /// Selected by `LoadSpec::offload_policy` (the worker fit-gate) or the `CANDLE_GEN_OFFLOAD=sequential`
+    /// env override (the two-process A/B harness). Both txt2img AND img2img are wired on the Turbo/Raw
+    /// ids; the two lanes that defer to resident are:
+    ///
+    /// * **ConvRot** (`convrot_dit`) — the DiT is a single int8 file, not `root/transformer/`, so
+    ///   [`pipeline::load_heavy`] cannot source it. (A deferred non-shipping variant anyway, and it is
+    ///   selected by the load spec rather than the request, so it cannot vary per request under one id.)
+    /// * **Edit** (`krea_2_edit`) — the Kontext path grounds the text encode on the Qwen3-VL vision tower
+    ///   (`Grounding::condition`), and candle keeps that tower in `edit_components`, OUTSIDE the
+    ///   [`pipeline::KreaText`] phase — so as this crate's split is drawn there is no point at which the
+    ///   text phase is droppable before the DiT. `edit_descriptor` therefore does NOT advertise the
+    ///   capability, and must not until the lane is wired.
+    ///
+    ///   This is a property of **where candle drew the split**, not of the model: mlx-gen-krea's
+    ///   `KreaText` carries the vision tower (lazily), so its grounded encode completes inside the text
+    ///   phase and MLX stages edit — its `edit_descriptor` advertises `true`. The candle port of that
+    ///   (move the tower into `KreaText`, load it lazily on the first grounded encode) is the qwen
+    ///   sc-10867 → sc-10968 follow-up. Until it lands the two backends genuinely differ on this id
+    ///   (Mac stages `krea_2_edit`, Windows/CUDA does not), which is a real implementation difference and
+    ///   is pinned as such by `sequential_is_advertised_only_where_wired`.
+    ///
+    /// **Why img2img is wired rather than deferred.** `supports_sequential_offload` is a per-**engine**
+    /// bit, but Turbo/Raw serve both txt2img and reference-guided img2img under ONE id (unlike
+    /// flux/flux2/qwen-image, whose sequential engines take `conditioning: vec![]`). A consumer's
+    /// fit-gate reads the bit per engine id, so it predicts the staged peak for EVERY request the id
+    /// accepts. Deferring img2img to resident while advertising the id sequential would make that
+    /// prediction wrong exactly where it is load-bearing — the gate admits on a card that fits the staged
+    /// set, the job runs resident, and it OOMs (the sc-10840 contract). So every request an advertising
+    /// id accepts must honor the policy; the only deferrals left are load-spec-level (ConvRot) or
+    /// non-advertising (Edit).
+    fn sequential(&self, _req: &GenerationRequest) -> bool {
+        self.convrot_dit.is_none()
+            && self.descriptor.id != KREA_2_EDIT_ID
+            && (self.offload_policy == OffloadPolicy::Sequential
+                || candle_gen::sequential_offload_enabled())
+    }
 }
 
 impl Generator for KreaGenerator {
@@ -243,6 +302,79 @@ impl Generator for KreaGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+
+        // Sequential-residency offload (epic 10765 Phase 1c, sc-12089): load→encode→DROP the Qwen3-VL-4B
+        // text phase before the 12B DiT loads, so peak allocation demand is max(TE, DiT+VAE+activations)
+        // rather than their sum — letting a card that OOMs the resident path render. Output is
+        // byte-identical (the phased path runs the same encode + denoise/decode bodies). Taken BEFORE
+        // `self.components()` on purpose: that cache load is exactly the co-resident TE+DiT+VAE set this
+        // path exists to avoid. Driven by `LoadSpec::offload_policy` (the worker fit-gate sets
+        // `Sequential`); `CANDLE_GEN_OFFLOAD=sequential` is the A/B override. See `Self::sequential` for
+        // the lanes that defer to resident.
+        if self.sequential(req) {
+            // Cancel before the eviction, not just before the loads (F-173): the phased path's first
+            // side effect is dropping the warm resident set, and a cancelled request has no business
+            // costing the NEXT resident request a multi-GB reload. `run_sequential` re-checks at each
+            // load boundary; this one covers the boundary that precedes it.
+            candle_gen::check_cancel(&req.cancel)?;
+            // F-132 (the qwen-image sc-11190 fix): evict EVERY resident cache a prior resident request
+            // populated. The policy + env are re-read every `generate`, so these can be holding live Arc
+            // sets; without the take, a sequential request would phase-load its copies on top of them and
+            // peak at resident + sequential — the opposite of the flag's purpose. Dropping the cached Arcs
+            // frees the resident residency first. Poison-tolerant.
+            //
+            // Both caches, not just `components`: a prior resident **img2img** leaves `img2img_encoder`
+            // holding a VAE encoder, and the sequential img2img path loads its own copy heavy-side — so
+            // skipping this one would leave a stale encoder resident for the rest of the process and break
+            // the max(TE, heavy) bound these paths document. (`edit_components` is unreachable here: the
+            // guard below defers `krea_2_edit` to resident, and only that id ever populates it.)
+            *candle_gen::lock_recover(&self.components) = None;
+            *candle_gen::lock_recover(&self.img2img_encoder) = None;
+            // The same Raw-vs-Turbo × txt2img-vs-img2img fork the resident path below takes, against the
+            // phased twins. Every arm the resident path can reach for an advertising id has one here —
+            // that total coverage is the point (see `Self::sequential`).
+            let raw = self.descriptor.id == KREA_2_RAW_ID;
+            let images = match (raw, img2img_reference(req)) {
+                (true, Some((reference, strength))) => pipeline::render_base_img2img_sequential(
+                    &self.root,
+                    &self.device,
+                    &self.adapters,
+                    self.pid_spec.as_ref(),
+                    req,
+                    reference,
+                    strength,
+                    on_progress,
+                )?,
+                (true, None) => pipeline::render_base_sequential(
+                    &self.root,
+                    &self.device,
+                    &self.adapters,
+                    self.pid_spec.as_ref(),
+                    req,
+                    on_progress,
+                )?,
+                (false, Some((reference, strength))) => pipeline::render_img2img_sequential(
+                    &self.root,
+                    &self.device,
+                    &self.adapters,
+                    self.pid_spec.as_ref(),
+                    req,
+                    reference,
+                    strength,
+                    on_progress,
+                )?,
+                (false, None) => pipeline::render_sequential(
+                    &self.root,
+                    &self.device,
+                    &self.adapters,
+                    self.pid_spec.as_ref(),
+                    req,
+                    on_progress,
+                )?,
+            };
+            return Ok(GenerationOutput::Images(images));
+        }
+
         let comps = self.components()?;
         // Variant read off the descriptor id (the mlx-gen-krea `generate_impl` branch): Edit = Kontext
         // instruction edit over 1-2 references on the full-CFG base; Raw = full-CFG undistilled txt2img
@@ -352,7 +484,17 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            supports_sequential_offload: false,
+            // sc-12089 (epic 10765 Phase 1c): the Turbo txt2img lane wires the load→encode→drop
+            // residency lifecycle (`pipeline::render_sequential`), so it advertises the discovery bit
+            // the worker's fit-gate reads. `raw_descriptor` INHERITS this (Raw wires the CFG twin,
+            // `render_base_sequential`); `edit_descriptor` explicitly clears it — see there.
+            //
+            // Provider + advertisement move in LOCKSTEP (the sc-10840 correctness contract): this bit
+            // going true is what lets a consumer predict the staged peak, and `OffloadPolicy::Sequential`
+            // is advisory (an unwired engine silently stays resident). Advertising a lane that would
+            // actually run resident makes the gate under-predict its real peak — an admitted job that
+            // then OOMs. Never flip this on ahead of the wiring.
+            supports_sequential_offload: true,
         },
     }
 }
@@ -393,6 +535,20 @@ pub fn edit_descriptor() -> ModelDescriptor {
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
     ];
+    // Clear the `Sequential` residency bit inherited from `raw_descriptor` (sc-12089). `KreaGenerator::
+    // sequential` defers this id to the resident path, so the advertisement must say so.
+    //
+    // This is the LOCKSTEP contract, and the reason this line exists at all: the flag is inherited down
+    // `descriptor` → `raw_descriptor` → `edit_descriptor`, so wiring Turbo/Raw silently turns it on for
+    // Edit too. Left true, the worker's fit-gate would predict Edit's staged (ex-text) peak, admit the
+    // job on a card that only fits the staged set, and then run it RESIDENT — an OOM/SIGKILL.
+    //
+    // NOT a claim that the edit lane cannot stage — mlx-gen-krea stages it and advertises `true`, by
+    // keeping the Qwen3-VL vision tower inside its `KreaText` phase so the grounded encode finishes
+    // before the drop. Candle keeps that tower in `EditComponents`, outside the text phase, so the lane
+    // is simply not wired here yet; see `KreaGenerator::sequential`. Wiring it (the qwen sc-10867 →
+    // sc-10968 precedent) means moving the tower into `KreaText` AND flipping this line — in that order.
+    d.capabilities.supports_sequential_offload = false;
     d
 }
 
@@ -511,6 +667,11 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         // so the lazy component build loads the engine once. `None` keeps the byte-exact native path.
         pid_spec: spec.pid.clone(),
         convrot_dit,
+        // Component residency (epic 10765 Phase 1c, sc-12089): captured, never rejected. `Sequential` is
+        // advisory by contract — the ids that advertise it (Turbo/Raw) phase their loads for every
+        // request shape they accept, txt2img and img2img alike; the lanes that do not advertise (Edit) or
+        // that this spec selects (ConvRot) silently stay resident. `Resident` is the default.
+        offload_policy: spec.offload_policy,
         components: Mutex::new(None),
         edit_components: Mutex::new(None),
         img2img_encoder: Mutex::new(None),
@@ -1052,6 +1213,426 @@ mod tests {
             ..Default::default()
         };
         assert!(g.validate(&multi).is_err(), "MultiReference not on Turbo");
+    }
+
+    // --- Sequential component residency — sc-12089 / epic 10765 Phase 1c ---
+
+    /// Pin `CANDLE_GEN_OFFLOAD` to a known value for the duration of a test, restoring the prior value
+    /// on drop.
+    ///
+    /// Both properties matter and neither is optional here:
+    ///
+    /// * **Pinning.** `candle_gen::sequential_offload_enabled` reads a process-global var, and the route
+    ///   assertions below turn on the `Resident` default reaching `sequential() == false`. An ambient
+    ///   `CANDLE_GEN_OFFLOAD=sequential` — which is exactly what a developer running the two-process A/B
+    ///   has exported in that shell — would otherwise turn them red for a reason that has nothing to do
+    ///   with the code under test.
+    /// * **Restoring on `Drop`, not at the end of the body.** A failing assertion unwinds; a restore
+    ///   written as the last statement would be skipped, leaking the mutation into every later test in
+    ///   the binary (they run in-process and single-threaded — `.cargo/config.toml` force-pins
+    ///   `RUST_TEST_THREADS=1`, F-160). One red test would then cascade into several.
+    struct OffloadEnvGuard(Option<String>);
+
+    impl OffloadEnvGuard {
+        /// Pin the var to `value` (`None` ⇒ unset) until the guard drops.
+        fn set(value: Option<&str>) -> Self {
+            let prior = std::env::var(candle_gen::OFFLOAD_ENV).ok();
+            match value {
+                Some(v) => std::env::set_var(candle_gen::OFFLOAD_ENV, v),
+                None => std::env::remove_var(candle_gen::OFFLOAD_ENV),
+            }
+            Self(prior)
+        }
+    }
+
+    impl Drop for OffloadEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(candle_gen::OFFLOAD_ENV, v),
+                None => std::env::remove_var(candle_gen::OFFLOAD_ENV),
+            }
+        }
+    }
+
+    /// The offload contract (sc-12089): `with_offload_policy` is CAPTURED at load and never rejected —
+    /// on every id, including the ones that defer. Loading stays lazy, so this asserts the plumbing on
+    /// CPU with no weights and no GPU; the phased route itself is selected inside `generate` and
+    /// exercised end-to-end by the cuda A/B harness below.
+    ///
+    /// The env override's own semantics (spelling, case, whitespace) are asserted where the reader now
+    /// lives — `candle_gen::residency`'s `offload_env_reads_sequential_case_insensitively` — rather than
+    /// re-tested per engine.
+    #[test]
+    fn offload_policy_is_captured_not_rejected() {
+        let _env = OffloadEnvGuard::set(None);
+
+        // Default (no policy set) → Resident: the generator builds and keeps the cached `render` path.
+        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        assert_eq!(spec.offload_policy, OffloadPolicy::Resident);
+        assert!(load(&spec).is_ok());
+        assert!(load_raw(&spec).is_ok());
+
+        // `Sequential` is honored, not rejected — for both txt2img variants. Weights are never touched.
+        let seq = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        assert_eq!(seq.offload_policy, OffloadPolicy::Sequential);
+        assert!(load(&seq).is_ok());
+        assert!(load_raw(&seq).is_ok());
+        // Edit accepts the spec too — it simply defers to resident (advisory contract), never errors.
+        assert!(load_edit(&seq).is_ok());
+    }
+
+    /// The env override reaches THIS engine's route decision (sc-12089) — the seam the two-process A/B
+    /// harness drives when it cannot set a `LoadSpec`. The reader's own parsing is asserted in
+    /// `candle_gen::residency`; what this pins is that krea consults it at all, and that it can flip a
+    /// `Resident`-specced generator onto the phased path.
+    #[test]
+    fn env_override_selects_the_phased_route_on_a_resident_spec() {
+        let plain = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+        let resident = || generator_with(descriptor(), OffloadPolicy::Resident, None);
+
+        // One scope per guard: a second `let _env` would SHADOW the first rather than replace it, and
+        // both would then live to the end of the body — restoring correctly only by accident of LIFO drop
+        // order. Explicit scopes make each pin end where it is meant to.
+        {
+            let _env = OffloadEnvGuard::set(Some("sequential"));
+            assert!(
+                resident().sequential(&plain),
+                "CANDLE_GEN_OFFLOAD=sequential must select the phased path regardless of the spec"
+            );
+        }
+        {
+            let _env = OffloadEnvGuard::set(None);
+            assert!(
+                !resident().sequential(&plain),
+                "with the override unset, a Resident spec stays resident"
+            );
+        }
+    }
+
+    /// **The lockstep contract (sc-10840 / sc-12089).** `supports_sequential_offload` must be true on
+    /// exactly the ids whose provider actually wires the phased path — no more.
+    ///
+    /// This is the load-bearing assertion of the story: the bit is what a consumer's fit-gate reads to
+    /// predict a staged (ex-text) peak, while `OffloadPolicy::Sequential` is *advisory* — an unwired lane
+    /// silently runs resident. So an id that advertises but defers would be admitted on a card that only
+    /// fits the staged set and then OOM. The flag is inherited `descriptor` → `raw_descriptor` →
+    /// `edit_descriptor`, so Edit's false is an EXPLICIT clear that a future refactor must not lose.
+    #[test]
+    fn sequential_is_advertised_only_where_wired() {
+        // Wired: both plain-txt2img lanes phase their loads (`render_sequential` / `render_base_sequential`).
+        assert!(descriptor().capabilities.supports_sequential_offload);
+        assert!(raw_descriptor().capabilities.supports_sequential_offload);
+        // NOT wired: the Kontext edit interleaves the vision tower with the text encode, so it defers to
+        // resident — and must not advertise. (Staging it is the qwen sc-10867 → sc-10968 follow-up.)
+        assert!(!edit_descriptor().capabilities.supports_sequential_offload);
+    }
+
+    /// Test helper: a lazily-built generator with an explicit residency policy + optional ConvRot DiT,
+    /// so the `sequential` route guard can be asserted without weights or a GPU (the build is lazy).
+    fn generator_with(
+        descriptor: ModelDescriptor,
+        offload_policy: OffloadPolicy,
+        convrot_dit: Option<PathBuf>,
+    ) -> KreaGenerator {
+        KreaGenerator {
+            descriptor,
+            root: "/snap".into(),
+            device: candle_gen::default_device().expect("a default device"),
+            adapters: vec![],
+            pid_spec: None,
+            convrot_dit,
+            offload_policy,
+            components: Mutex::new(None),
+            edit_components: Mutex::new(None),
+            img2img_encoder: Mutex::new(None),
+        }
+    }
+
+    /// F-173 (sc-12089): a request cancelled before `generate` returns `Canceled` without loading a
+    /// thing.
+    ///
+    /// That this passes with `root = /snap` — a path holding no weights — IS the assertion. The
+    /// `Sequential` path's first act used to be `load_text`, which would fail here with a missing-file
+    /// error; reaching the cancel check first is what makes the error `Canceled`. On a real snapshot the
+    /// difference is a cancelled job returning immediately instead of streaming the Qwen3-VL-4B encoder
+    /// and then the 12B DiT from disk before noticing.
+    ///
+    /// The `Resident` path is not measured here: it loads behind the cross-request components cache, so
+    /// a cancelled request reaches the sampler's per-step gate almost at once. Staging is what put a
+    /// multi-GB load inside `generate`, ahead of the first cancellable step.
+    #[test]
+    fn cancelled_sequential_request_returns_before_loading_anything() {
+        let _env = OffloadEnvGuard::set(None);
+
+        let cancel = gen_core::runtime::CancelFlag::new();
+        cancel.cancel();
+        let req = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            width: 1024,
+            height: 1024,
+            cancel: cancel.clone(),
+            ..Default::default()
+        };
+
+        for descriptor in [descriptor(), raw_descriptor()] {
+            let g = generator_with(descriptor.clone(), OffloadPolicy::Sequential, None);
+            let err = g
+                .generate(&req, &mut |_| {})
+                .expect_err("a cancelled request must not produce images");
+            assert!(
+                matches!(err, gen_core::Error::Canceled),
+                "{}: expected Canceled, got {err:?} — the stage-boundary check must precede the load",
+                descriptor.id
+            );
+        }
+    }
+
+    /// The route guard (sc-12089). Two properties, and the second is the load-bearing one:
+    ///
+    /// 1. `Sequential` selects the phased path on Turbo/Raw; `Resident` (the default) never does.
+    /// 2. **An advertising id takes the phased path for EVERY request it accepts** — txt2img *and*
+    ///    img2img. Because `supports_sequential_offload` is per-engine and Turbo/Raw serve both surfaces
+    ///    under one id, a request-shape-dependent deferral would silently break the fit-gate's staged-peak
+    ///    prediction and OOM the job it admitted. Deferrals are only allowed where the id does not
+    ///    advertise (Edit) or where the lane is load-spec-selected (ConvRot).
+    #[test]
+    fn sequential_route_covers_every_request_an_advertising_id_accepts() {
+        // The `Resident` assertions below read the process-global override through `sequential()`; pin it
+        // off so an A/B runner's ambient export cannot turn them red (see `OffloadEnvGuard`).
+        let _env = OffloadEnvGuard::set(None);
+
+        let plain = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+        let img2img = GenerationRequest {
+            prompt: "a red apple".into(),
+            width: 1024,
+            height: 1024,
+            conditioning: vec![Conditioning::Reference {
+                image: ref_image(64, 64),
+                strength: Some(0.5),
+            }],
+            ..Default::default()
+        };
+
+        // Every (id, request-shape) pair the advertising ids accept takes the phased path — no shape
+        // silently falls back to resident while the descriptor claims otherwise.
+        for descriptor in [descriptor(), raw_descriptor()] {
+            assert!(descriptor.capabilities.supports_sequential_offload);
+            for req in [&plain, &img2img] {
+                let g = generator_with(descriptor.clone(), OffloadPolicy::Sequential, None);
+                assert!(
+                    g.sequential(req),
+                    "{} must honor Sequential for every request it accepts",
+                    descriptor.id
+                );
+            }
+        }
+
+        // `Resident` (the default) never takes it — that is the whole opt-in contract.
+        assert!(!generator_with(descriptor(), OffloadPolicy::Resident, None).sequential(&plain));
+
+        // Edit defers: the grounded encode interleaves the vision tower with the text phase. Safe only
+        // because `edit_descriptor` does not advertise — the two must stay in lockstep.
+        assert!(!edit_descriptor().capabilities.supports_sequential_offload);
+        assert!(
+            !generator_with(edit_descriptor(), OffloadPolicy::Sequential, None).sequential(&plain)
+        );
+
+        // ConvRot defers: the DiT is a single int8 file, not `root/transformer/`, so `load_heavy` can't
+        // source it. Safe because it is selected by the LOAD SPEC, not the request — a ConvRot generator
+        // defers uniformly, so the gate can't be fooled per-request.
+        let convrot = Some(PathBuf::from("/krea2_int8_convrot.safetensors"));
+        assert!(
+            !generator_with(descriptor(), OffloadPolicy::Sequential, convrot).sequential(&plain)
+        );
+    }
+
+    /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-12089) — the candle twin of the MLX
+    /// krea A/B (sc-11101), mirroring the candle-gen-flux harness (sc-10769).
+    ///
+    /// ONE probed generation whose residency mode is chosen by the same two seams `generate` reads:
+    /// `CANDLE_GEN_OFFLOAD=sequential` (the env override) or `KREA_OFFLOAD_MODE=spec-sequential` →
+    /// `LoadSpec::offload_policy` (the worker-facing contract, with `CANDLE_GEN_OFFLOAD` unset). Prints
+    /// the device peak VRAM and writes the raw RGB pixels to `KREA_OUT`.
+    ///
+    /// **Run it TWICE in SEPARATE processes** (resident vs sequential) and compare: the pixel files must
+    /// be byte-identical (parity) and the sequential peak materially lower (the Qwen3-VL-4B TE dropped
+    /// before the 12B DiT loads). Two processes are REQUIRED — this is the epic's cudarc caveat: candle's
+    /// caching allocator has no `empty_cache` and `Device::synchronize()` does not reclaim, so a second
+    /// in-process run would reuse the first run's pool and read the same peak. For the same reason
+    /// `nvidia-smi` resident VRAM will NOT fall within a process; what moves is peak *allocation demand*,
+    /// which is what the probe reads and what any gate math must key off.
+    ///
+    /// Reports through [`testkit::VramProbe`] (sc-9094) rather than a bare `PeakSampler`: it separates
+    /// load-peak / steady / overall-peak and states each as a delta over a recorded **idle baseline** —
+    /// which is what makes the number trustworthy here. The probe is device-level (`nvidia-smi
+    /// memory.used`; WDDM reports per-process as `[N/A]`), so anything else resident on the sampled GPU
+    /// lands in the measurement. The printed `baseline` is the tell — it must be ~0, else the run shared
+    /// the card and the A/B delta is noise. `overall-peak` is also exactly the quantity the manifest's
+    /// `candle.vramGbByTier` / `sequentialPeakGb` are derived from (sc-9094 / sc-10856), so this harness
+    /// feeds the re-measure directly.
+    ///
+    /// **Multi-GPU:** the compute device is candle's `cuda:0`, but `nvidia-smi -i` takes a PHYSICAL
+    /// ordinal and ignores `CUDA_VISIBLE_DEVICES` — so on a box where you pin the run to a free card with
+    /// `CUDA_VISIBLE_DEVICES=1`, a hardcoded `start(0)` would sample the OTHER (busy) card and silently
+    /// report its residency as this run's peak. [`ab_probe_gpu`] derives the physical ordinal from
+    /// `CUDA_VISIBLE_DEVICES` so the sampled card is always the one being rendered on.
+    ///
+    /// `KREA_SEQ_RAW=1` measures `krea_2_raw` (full-CFG, two forwards/step) instead of `krea_2_turbo`.
+    /// Ignored by default; needs a Krea 2 snapshot dir in `KREA_TURBO_DIR` + a CUDA device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn krea_probed_generate_for_offload_ab() {
+        let out = std::env::var("KREA_OUT").expect("set KREA_OUT to the pixel-dump path");
+        let raw = std::env::var("KREA_SEQ_RAW").is_ok();
+        // `krea_2_raw` is a DIFFERENT CHECKPOINT (the undistilled base DiT), not a mode of the Turbo
+        // snapshot — so it reads its own dir (the mlx-gen-krea `KREA_RAW_DIR` convention, sc-11101).
+        // Sharing `KREA_TURBO_DIR` across both would silently load the DISTILLED DiT and run it under
+        // the full-CFG loop: same architecture, so it would "work" and report a plausible peak, but the
+        // number would not belong to the model it was published against.
+        let dir = if raw {
+            std::env::var("KREA_RAW_DIR")
+                .expect("set KREA_RAW_DIR to a Krea 2 RAW snapshot (KREA_SEQ_RAW=1)")
+        } else {
+            std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR to a Krea 2 Turbo snapshot")
+        };
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
+        let spec_mode = std::env::var("KREA_OFFLOAD_MODE").unwrap_or_default();
+        if spec_mode == "spec-sequential" {
+            spec = spec.with_offload_policy(OffloadPolicy::Sequential);
+        }
+        // Square edge (default 768, the sc-11101 MLX A/B's resolution so the two backends compare).
+        // Set `KREA_AB_RES=1024` to match the condition the manifest's `candle.vramGbByTier` q4 was
+        // measured at (RTX PRO 6000, 1024²/8-step) — the activation transient scales with pixel count and
+        // is the epic's dominant unknown (sc-11925: it was only ever calibrated at 1024²), so the tier
+        // re-measure must be taken at the SAME resolution as the number it replaces.
+        let res: u32 = std::env::var("KREA_AB_RES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(768);
+        let req = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle, studio lighting".into(),
+            width: res,
+            height: res,
+            // Turbo is the 8-step distilled student; Raw is undistilled, so hold it to a short schedule
+            // (the A/B measures PEAK, which is step-count-independent — not sample quality).
+            steps: Some(8),
+            seed: Some(42),
+            count: 1,
+            ..Default::default()
+        };
+
+        // Load and generate are sampled as SEPARATE phases so the report separates the load transient
+        // (weights → device) from the denoise/decode activation spike — the epic's open question is which
+        // dominates, and a single fused peak can't say (sc-11925 notes the transient was only calibrated
+        // at 1024²).
+        let mut probe = candle_gen::testkit::VramProbe::start(ab_probe_gpu());
+        let load_phase = probe.phase();
+        let g = if raw {
+            load_raw(&spec).expect("load krea_2_raw")
+        } else {
+            load(&spec).expect("load krea_2_turbo")
+        };
+        probe.end_load(load_phase);
+        let gen_phase = probe.phase();
+        let output = g.generate(&req, &mut |_| {}).expect("generate");
+        probe.end_gen(gen_phase);
+        let report = probe.report();
+
+        let img = match output {
+            GenerationOutput::Images(mut v) => v.remove(0),
+            other => panic!("expected images, got {other:?}"),
+        };
+        std::fs::write(&out, &img.pixels).expect("write pixels");
+
+        let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
+        let mode = if spec_mode == "spec-sequential" {
+            "spec-sequential"
+        } else if env_mode.eq_ignore_ascii_case("sequential") {
+            "env-sequential"
+        } else {
+            "resident"
+        };
+        let id = if raw { KREA_2_RAW_ID } else { KREA_2_TURBO_ID };
+        eprintln!(
+            "SEQ_AB id={id} mode={mode} gpu={} {}x{} steps={:?} | {report} | bytes={} out={out}",
+            ab_probe_gpu(),
+            req.width,
+            req.height,
+            req.steps,
+            img.pixels.len(),
+        );
+        // A non-trivial baseline means something else was resident on the sampled card, so the peaks are
+        // that job's residency plus ours and the A/B delta is noise. Fail loudly rather than publishing a
+        // contaminated number into the manifest (this harness feeds `vramGbByTier`).
+        assert!(
+            report.baseline_gb < 1.0,
+            "sampled GPU {} was not idle (baseline {:.1} GB) — the peak is contaminated; \
+             pin the run to a free card with CUDA_VISIBLE_DEVICES",
+            ab_probe_gpu(),
+            report.baseline_gb
+        );
+        // ...and a peak of ZERO means the probe never read the card at all. `VramProbe::start` maps a
+        // failed `nvidia-smi` query to a 0 baseline (a missing binary, a driver hiccup, a bad ordinal),
+        // and every later sample then folds in as 0 too — so the run reports `overall-peak 0.0 GB
+        // (baseline 0.0 GB)` and the idle assertion above passes with maximum apparent confidence. That
+        // is the same failure shape as the two harness bugs this story already fixed (a plausible number
+        // instead of a red test), so pin the floor: a real krea render cannot peak at nothing.
+        assert!(
+            report.peak_gb > 0.0,
+            "probe read a 0.0 GB peak on GPU {} — nvidia-smi is unavailable or the query failed, so \
+             this number is not a measurement; it is the absence of one",
+            ab_probe_gpu()
+        );
+    }
+
+    /// The PHYSICAL GPU ordinal the VRAM probe should sample, derived from `CUDA_VISIBLE_DEVICES`.
+    ///
+    /// candle renders on `cuda:0`, but `cuda:0` is whatever `CUDA_VISIBLE_DEVICES` maps it to, while
+    /// `nvidia-smi -i` (what the probe shells out to) always takes a physical ordinal and ignores that
+    /// variable. On a multi-GPU box the repo's convention is to pin a real-weights run to a free card
+    /// (`set CUDA_VISIBLE_DEVICES=1`), and a hardcoded `start(0)` would then sample the *other* card —
+    /// reporting a neighbouring job's residency as this run's peak, or reading ~idle while the real
+    /// render peaks unobserved. Deriving the ordinal from the same variable keeps the sampled card and
+    /// the rendered card in agreement by construction.
+    ///
+    /// Takes the FIRST entry (candle's `cuda:0`). **Unset** ⇒ 0, the single-GPU default. **Set but not a
+    /// bare integer** ⇒ panic, NOT a fallback: `CUDA_VISIBLE_DEVICES` also accepts GPU UUIDs
+    /// (`GPU-a1b2c3d4-…`) and MIG handles, which no `usize` parse can map to a physical ordinal. Silently
+    /// falling back to 0 there would reintroduce the exact bug this function exists to fix — the operator
+    /// pinned a card, and a probe that cannot tell which one must say so rather than sample a guess and
+    /// publish it as a measurement.
+    #[cfg(feature = "cuda")]
+    fn ab_probe_gpu() -> usize {
+        let Ok(raw) = std::env::var("CUDA_VISIBLE_DEVICES") else {
+            return 0;
+        };
+        let first = raw.split(',').next().unwrap_or_default().trim();
+        // An empty value means "no devices visible" — candle would not have a device to render on, so
+        // reaching here with one is a broken invocation, not a single-GPU default.
+        assert!(
+            !first.is_empty(),
+            "CUDA_VISIBLE_DEVICES is set but empty — no GPU is visible to render on"
+        );
+        first.parse().unwrap_or_else(|_| {
+            panic!(
+                "CUDA_VISIBLE_DEVICES={raw:?} is not a physical ordinal, so the probe cannot tell which \
+                 card to sample (nvidia-smi -i takes an ordinal and ignores this variable). Re-run with \
+                 the numeric form, e.g. CUDA_VISIBLE_DEVICES=1"
+            )
+        })
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).
