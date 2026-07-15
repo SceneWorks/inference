@@ -163,6 +163,13 @@ mod cuda_impl {
         nvfp4_algos: std::sync::Mutex<
             std::collections::HashMap<(usize, usize, usize), sys::cublasLtMatmulAlgo_t>,
         >,
+        /// Cached device-resident **scatter index** (`U32`) for the on-device NVFP4 activation
+        /// quantizer (sc-11044), keyed by `(rows, n_blocks)`. Maps each logical `(row, 16-block)`
+        /// scale to its byte offset in cuBLASLt's row-major scale-factor-atom layout — the same
+        /// permutation `cublaslt_scale_layout` applies on the host for a staged weight. Built once per
+        /// activation shape (a small host loop) and reused so the per-forward activation quantize is
+        /// pure on-device tensor math + one cached gather, never a host round-trip.
+        nvfp4_act_scale_idx: std::sync::Mutex<std::collections::HashMap<(usize, usize), Tensor>>,
     }
 
     // The Lt handle is an opaque device-side object; guarded by the owning stream/device.
@@ -196,6 +203,7 @@ mod cuda_impl {
                 workspace,
                 workspace_size: Self::WORKSPACE,
                 nvfp4_algos: std::sync::Mutex::new(std::collections::HashMap::new()),
+                nvfp4_act_scale_idx: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         }
 
@@ -310,6 +318,133 @@ mod cuda_impl {
         /// scales) for repeated FP4 GEMMs — the load-time twin for a resident NVFP4 weight.
         pub fn stage_nvfp4(&self, t: &Nvfp4Tensor) -> Result<DevNvfp4> {
             DevNvfp4::stage(self, t)
+        }
+
+        /// **On-device NVFP4 activation quantize (sc-11044)** — the W4A4 net-new compute deliverable.
+        ///
+        /// Quantizes a device activation `x = [M, K]` (bf16/f32, already M-row-padded by the caller)
+        /// to a packed [`DevNvfp4`] operand — E2M1 nibbles + per-16-block UE4M3 scales (in cuBLASLt's
+        /// row-major scale-factor-atom layout) + the FP32 per-tensor scale — **entirely on the GPU**,
+        /// feeding [`Self::matmul_nvfp4_staged`] directly. This replaces sc-11041's per-forward CPU
+        /// round-trip (`Nvfp4Tensor::pack`, which copied the activation host-side, quantized in a scalar
+        /// loop, and re-uploaded); here the only host transfer is the single per-tensor amax scalar
+        /// (needed as the GEMM `alpha`), not the activation data.
+        ///
+        /// `cols_padded` is the weight's padded contraction width (a multiple of 16, and of
+        /// [`NVFP4_K_ALIGN`]); `K` is padded up to it with zero columns so the staged operand matches
+        /// the resident weight. The numeric recipe mirrors [`Nvfp4Tensor::pack_from_slice`] exactly
+        /// (per-tensor `amax/(6·448)` global scale; per-block UE4M3 micro-scale; nearest-E2M1 element
+        /// codes) so the on-device result tracks the CPU packer within a tiny rel-RMS. The quantizer is
+        /// **NaN-free by construction**: E2M1 saturates at ±6 and every divisor is clamped positive, so
+        /// an all-zero or outlier-carrying block yields finite codes (the W4A4 risk is signal collapse
+        /// over steps, not a quantizer NaN — spike sc-11038).
+        pub fn quantize_nvfp4_activation(&self, x: &Tensor, cols_padded: usize) -> Result<DevNvfp4> {
+            use super::super::nvfp4::{E2M1_MAX, E4M3_MAX, NVFP4_BLOCK};
+            let dev = Device::Cuda(self.device.clone());
+            let (m, k) = x.dims2()?;
+            if !cols_padded.is_multiple_of(NVFP4_BLOCK) || cols_padded < k {
+                candle_core::bail!(
+                    "quantize_nvfp4_activation: cols_padded ({cols_padded}) must be >= K ({k}) and a \
+                     multiple of {NVFP4_BLOCK}"
+                );
+            }
+            let x = x.to_dtype(DType::F32)?.contiguous()?;
+            // Pad K -> cols_padded with zero columns (they carry no signal and don't perturb any
+            // block amax; matches the packer's K-padding policy).
+            let x = if cols_padded > k {
+                x.pad_with_zeros(1, 0, cols_padded - k)?
+            } else {
+                x
+            };
+            let kp = cols_padded;
+            let n_blocks = kp / NVFP4_BLOCK;
+
+            // Per-tensor amax -> global scale. One scalar leaves the device (the GEMM alpha needs it on
+            // the host); the activation tensor itself never does.
+            let amax = x.abs()?.max_all()?.to_scalar::<f32>()?;
+            let global_scale = if amax > 0.0 {
+                amax / (E2M1_MAX * E4M3_MAX)
+            } else {
+                1.0
+            };
+
+            // Per-block amax over the 16-element blocks along K.
+            let xb = x.reshape((m, n_blocks, NVFP4_BLOCK))?;
+            let block_amax = xb.abs()?.max_keepdim(2)?; // [m, n_blocks, 1]
+
+            // UE4M3 block micro-scale that maps the block amax -> 6.0 relative to the per-tensor scale,
+            // then round it onto the E4M3 grid (arithmetic, matching OCP E4M3 nearest).
+            let sf_real = block_amax.affine(1.0 / (E2M1_MAX * global_scale) as f64, 0.0)?;
+            let sf_dec = e4m3_round_tensor(&sf_real)?; // decoded E4M3 block scale (on-grid), [m,n_blocks,1]
+
+            // Per-element E2M1 codes: value / (block_scale · global_scale), nearest E2M1, sign in bit 3.
+            let elem_scale = sf_dec.affine(global_scale as f64, 0.0)?;
+            let elem_scale = elem_scale.clamp(f32::MIN_POSITIVE as f64, f64::INFINITY)?; // all-zero block -> 0/eps = 0
+            let ratio = xb.broadcast_div(&elem_scale)?; // [m, n_blocks, 16]
+            let code = e2m1_code_tensor(&ratio)?; // f32 codes 0..15, [m, n_blocks, 16]
+
+            // Pack two E2M1 codes per byte, little-endian nibble order (col 2j -> low, 2j+1 -> high).
+            let code = code.reshape((m, kp))?.reshape((m, kp / 2, 2))?;
+            let low = code.narrow(2, 0, 1)?;
+            let high = code.narrow(2, 1, 1)?;
+            let byte = low.add(&high.affine(16.0, 0.0)?)?.reshape((m, kp / 2))?;
+            let packed = extract_u8_slice(&byte)?; // CudaSlice<u8>, len m*kp/2
+
+            // UE4M3 scale BYTES from the on-grid decoded value (exact inverse of the E4M3 decode), then
+            // scatter into cuBLASLt's row-major scale-factor-atom layout via the cached index.
+            let sf_byte = e4m3_byte_from_decoded(&sf_dec)?.reshape((m * n_blocks,))?;
+            let sf_rows = round_up_usize(m, SF_ATOM_ROWS);
+            let sf_cols = round_up_usize(n_blocks, SF_ATOM_COLS);
+            let scales_len = sf_rows * sf_cols;
+            let dst_idx = self.nvfp4_act_scale_index(m, n_blocks, sf_cols, &dev)?;
+            let swz = Tensor::zeros(scales_len, DType::F32, &dev)?
+                .scatter_add(&dst_idx, &sf_byte, 0)?;
+            let scales = extract_u8_slice(&swz)?;
+
+            Ok(DevNvfp4 {
+                packed,
+                scales,
+                rows: m,
+                cols_padded: kp,
+                global_scale,
+            })
+        }
+
+        /// Build (or fetch the cached) device `U32` scatter index mapping each logical `(row, 16-block)`
+        /// activation scale — in row-major `row*n_blocks + blk` source order — to its byte offset in
+        /// cuBLASLt's row-major scale-factor-atom layout. Identical permutation to the host-side
+        /// [`cublaslt_scale_layout`] (intra-atom `((32,4),4):((16,4),1)` swizzle, **row-major** atom
+        /// tiling: `atom = k_atom + num_k_atoms · m_atom`). Cached per `(rows, n_blocks)`.
+        fn nvfp4_act_scale_index(
+            &self,
+            rows: usize,
+            n_blocks: usize,
+            sf_cols: usize,
+            dev: &Device,
+        ) -> Result<Tensor> {
+            if let Some(t) = crate::lock_recover(&self.nvfp4_act_scale_idx)
+                .get(&(rows, n_blocks))
+                .cloned()
+            {
+                return Ok(t);
+            }
+            let num_k_atoms = sf_cols / SF_ATOM_COLS;
+            let mut idx = vec![0u32; rows * n_blocks];
+            for r in 0..rows {
+                let m_atom = r / SF_ATOM_ROWS;
+                let mr = r % SF_ATOM_ROWS;
+                for blk in 0..n_blocks {
+                    let k_atom = blk / SF_ATOM_COLS;
+                    let kc = blk % SF_ATOM_COLS;
+                    let atom_index = k_atom + num_k_atoms * m_atom;
+                    let intra = (mr % 32) * 16 + (mr / 32) * 4 + kc;
+                    idx[r * n_blocks + blk] =
+                        (atom_index * (SF_ATOM_ROWS * SF_ATOM_COLS) + intra) as u32;
+                }
+            }
+            let t = Tensor::from_vec(idx, rows * n_blocks, dev)?;
+            crate::lock_recover(&self.nvfp4_act_scale_idx).insert((rows, n_blocks), t.clone());
+            Ok(t)
         }
 
         /// **int8 IGEMM**: raw `int32 = X_i8 · W_i8ᵀ` (no scale folded — caller multiplies by
@@ -1021,6 +1156,94 @@ mod cuda_impl {
             }
         }
         out
+    }
+
+    // ---- on-device NVFP4 activation-quantize primitives (sc-11044) ------------------------------
+    //
+    // All operate on candle CUDA tensors so the W4A4 activation quantize is one on-device dataflow
+    // (no host round-trip). The arithmetic mirrors the CPU packer's `e2m1_from_f32` / `e4m3_from_f32`
+    // closely enough that the staged operand tracks the CPU reference within a small rel-RMS.
+
+    #[inline]
+    fn round_up_usize(x: usize, m: usize) -> usize {
+        x.div_ceil(m) * m
+    }
+
+    /// Extract an owned device `CudaSlice<u8>` from a candle tensor of non-negative integer values in
+    /// `[0, 255]` (cast to `U8` on-device, same idiom as `DevInt8::stage`'s CUDA leg). The values are
+    /// exact integers so the `f32 -> u8` cast is lossless.
+    fn extract_u8_slice(t: &Tensor) -> Result<cudarc::driver::CudaSlice<u8>> {
+        let u8t = t.to_dtype(DType::U8)?.flatten_all()?.contiguous()?;
+        let (storage, _l) = u8t.storage_and_layout();
+        match &*storage {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U8(s) => s.try_clone().map_err(drv_err),
+                _ => candle_core::bail!("extract_u8_slice: expected U8 CUDA storage"),
+            },
+            _ => candle_core::bail!("extract_u8_slice: tensor is not on CUDA"),
+        }
+    }
+
+    const LN2: f64 = std::f64::consts::LN_2;
+    const E4M3_MIN_NORMAL: f64 = 0.015_625; // 2^-6
+    const E4M3_MIN_SUBNORMAL: f64 = 1.0 / 512.0; // 2^-9
+    const E4M3_MAXV: f64 = 448.0;
+
+    /// Round a non-negative tensor onto the OCP E4M3 grid, returning the **decoded** value (nearest
+    /// representable E4M3, saturating at 448). `q = round(v / ulp) · ulp` with `ulp = 2^(e-3)` and
+    /// `e = floor(log2(max(v, 2^-6)))` — a single formula that covers both the normal grid (ULP
+    /// `2^e/8` in `[2^e, 2^{e+1}]`) and the subnormal grid (`e` clamped to `-6` -> ULP `2^-9`).
+    fn e4m3_round_tensor(v: &Tensor) -> Result<Tensor> {
+        let v = v.clamp(0.0, E4M3_MAXV)?;
+        // Exponent from a floor of clamped v (avoid log2(0); subnormals floor to -6).
+        let vc = v.clamp(E4M3_MIN_NORMAL, E4M3_MAXV)?;
+        let e = vc.log()?.affine(1.0 / LN2, 0.0)?.floor()?; // floor(log2(vc)) in [-6, 8]
+        let ulp = e.affine(1.0, -3.0)?.affine(LN2, 0.0)?.exp()?; // 2^(e-3)
+        let q = v
+            .broadcast_div(&ulp)?
+            .round()?
+            .broadcast_mul(&ulp)?
+            .clamp(0.0, E4M3_MAXV)?;
+        Ok(q)
+    }
+
+    /// The OCP E4M3 **byte** (0..=254) whose decode equals the on-grid value `q` (as produced by
+    /// [`e4m3_round_tensor`]). Because `q` already sits exactly on the E4M3 grid this inversion is exact
+    /// (the `round`s only clean float noise): normals -> `((e+7)<<3) | (round(q/2^e·8) - 8)` (mantissa
+    /// overflow to `2^{e+1}` folds into the next exponent automatically), subnormals -> `round(q·512)`,
+    /// zero -> 0.
+    fn e4m3_byte_from_decoded(q: &Tensor) -> Result<Tensor> {
+        let is_zero = q.lt(E4M3_MIN_SUBNORMAL / 2.0)?; // q >= 0; below half the min subnormal == 0
+        let is_sub = q.lt(E4M3_MIN_NORMAL)?;
+        let qc = q.clamp(E4M3_MIN_SUBNORMAL, E4M3_MAXV)?;
+        let e = qc.log()?.affine(1.0 / LN2, 0.0)?.floor()?; // floor(log2 q)
+        let pow_e = e.affine(LN2, 0.0)?.exp()?; // 2^e
+        // Normal: E = e + 7, M = round(q / 2^e · 8) - 8  -> byte = E·8 + M = (e+7)·8 + round(...) - 8.
+        let mant = q.broadcast_div(&pow_e)?.affine(8.0, 0.0)?.round()?; // round(q/2^e·8), 8..16
+        let byte_normal = e.affine(8.0, 8.0 * 7.0 - 8.0)?.add(&mant)?; // (e·8) + (56-8) + mant
+        // Subnormal: byte = round(q · 512).
+        let byte_sub = q.affine(512.0, 0.0)?.round()?;
+        let zeros = q.zeros_like()?;
+        let byte = is_sub.where_cond(&byte_sub, &byte_normal)?;
+        let byte = is_zero.where_cond(&zeros, &byte)?;
+        byte.clamp(0.0, 254.0)
+    }
+
+    /// Nearest-E2M1 codes (0..=15, sign in bit 3) for a signed ratio tensor `value / block_scale`.
+    /// Magnitude index = count of the 7 grid midpoints the magnitude reaches (`{0,.5,1,1.5,2,3,4,6}`
+    /// -> midpoints `{.25,.75,1.25,1.75,2.5,3.5,5}`); saturates at index 7 (±6). Matches
+    /// `e2m1_from_f32`'s nearest-magnitude choice (ties, a measure-zero event on real activations,
+    /// round up here vs the packer's round-to-even — negligible for rel-RMS).
+    fn e2m1_code_tensor(ratio: &Tensor) -> Result<Tensor> {
+        let mag = ratio.abs()?;
+        let mids = [0.25f64, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
+        let mut idx = mag.ge(mids[0])?.to_dtype(DType::F32)?;
+        for &t in &mids[1..] {
+            idx = idx.add(&mag.ge(t)?.to_dtype(DType::F32)?)?;
+        }
+        // sign bit (8) where negative; -0.0 (sign set, magnitude 0) decodes to 0.0 so is harmless.
+        let sign = ratio.lt(0.0)?.to_dtype(DType::F32)?.affine(8.0, 0.0)?;
+        idx.add(&sign)
     }
 
     /// A `(rows, cols)` int8-code operand as an owned device **byte** buffer. candle has no `i8` dtype,

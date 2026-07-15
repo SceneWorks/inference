@@ -97,6 +97,57 @@ impl ActPrecision {
             ActPrecision::W4A4
         }
     }
+
+    /// Partition a set of layer names into the W4A4 (benign, FP4 activation) and W4A16 (outlier class,
+    /// bf16 activation) classes per [`Self::for_outlier_layer`] — the **explicit, testable** form of
+    /// the spike sc-11038 mixed-precision policy (sc-11044 AC 2). Returns each name paired with its
+    /// regime plus the partition counts, so a loader/report can show exactly which projections light
+    /// the FP4 cores and which stay bf16-activation.
+    pub fn partition_layers<'a, I>(names: I) -> Nvfp4Partition
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut assignments = Vec::new();
+        let (mut n_w4a4, mut n_w4a16) = (0usize, 0usize);
+        for name in names {
+            let p = Self::for_outlier_layer(name);
+            match p {
+                ActPrecision::W4A4 => n_w4a4 += 1,
+                ActPrecision::W4A16 => n_w4a16 += 1,
+            }
+            assignments.push((name.to_string(), p));
+        }
+        Nvfp4Partition {
+            assignments,
+            n_w4a4,
+            n_w4a16,
+        }
+    }
+}
+
+/// The result of [`ActPrecision::partition_layers`] — the mixed-precision policy applied to a concrete
+/// set of layers (sc-11044). `n_w4a4` benign projections run the FP4 W4A4 compute path; `n_w4a16`
+/// outlier-class projections keep bf16 activation (W4A16).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Nvfp4Partition {
+    /// Each layer name paired with the regime the policy assigns it.
+    pub assignments: Vec<(String, ActPrecision)>,
+    /// Count assigned W4A4 (benign, FP4 activation).
+    pub n_w4a4: usize,
+    /// Count assigned W4A16 (outlier class, bf16 activation).
+    pub n_w4a16: usize,
+}
+
+impl Nvfp4Partition {
+    /// Fraction of layers on the FP4 W4A4 compute path (the compute-bulk the ~2× win rides).
+    pub fn w4a4_fraction(&self) -> f64 {
+        let total = self.n_w4a4 + self.n_w4a16;
+        if total == 0 {
+            0.0
+        } else {
+            self.n_w4a4 as f64 / total as f64
+        }
+    }
 }
 
 /// Which compute path an [`Nvfp4Linear`] actually runs — surfaced so a bench/report can state whether
@@ -326,9 +377,12 @@ impl Nvfp4Linear {
             x2
         };
 
-        // W4A4: pack the activation to NVFP4 and run the FP4 GEMM against the resident weight.
-        let x_pk = Nvfp4Tensor::pack(&x_pad)?;
-        let x_stg = fp4.lt.stage_nvfp4(&x_pk)?;
+        // W4A4 (sc-11044): quantize the activation to NVFP4 **on-device** — no CPU round-trip — and run
+        // the FP4 GEMM against the resident weight. `cols_padded` matches the resident weight so the two
+        // operands share the padded contraction width.
+        let x_stg = fp4
+            .lt
+            .quantize_nvfp4_activation(&x_pad, fp4.w_staged.shape_padded().1)?;
         let y = fp4.lt.matmul_nvfp4_staged(&fp4.w_staged, &x_stg)?; // [m_pad, N] bf16
         let y = if m_pad != m { y.narrow(0, 0, m)? } else { y };
 
@@ -340,6 +394,26 @@ impl Nvfp4Linear {
             y = y.broadcast_add(&b.to_dtype(y.dtype())?)?;
         }
         y.to_dtype(x.dtype())
+    }
+
+    /// [`Self::forward`] plus a **NaN/inf guard** (sc-11044 AC): asserts the output is finite and
+    /// **fails loud** rather than letting a collapsed/garbage tensor propagate silently through the
+    /// denoise. The W4A4 quantizer itself is NaN-free by construction (E2M1 saturates, divisors are
+    /// clamped positive — spike sc-11038), so this guards the *accuracy* failure mode (signal collapse
+    /// over steps surfacing as an inf/NaN downstream), not the quantizer. Uses a single sum-of-squares
+    /// scalar reduction (a NaN/inf in any element makes the sum non-finite), so it is cheap enough to
+    /// leave on around a denoise step. Callers wanting max throughput use [`Self::forward`] directly.
+    pub fn forward_checked(&self, x: &Tensor) -> Result<Tensor> {
+        let y = self.forward(x)?;
+        let energy = y.to_dtype(DType::F32)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        if !energy.is_finite() {
+            candle_core::bail!(
+                "Nvfp4Linear::forward_checked: non-finite output (NaN/inf) from the {:?} regime — \
+                 W4A4 signal collapse or a bad activation; failing loud (sc-11044 NaN guard)",
+                self.regime
+            );
+        }
+        Ok(y)
     }
 
     /// The active compute path (whether the FP4 cores are lit) — for a bench/report.
@@ -507,6 +581,47 @@ mod tests {
                 "{name} must be classified benign → W4A4"
             );
         }
+    }
+
+    /// The explicit mixed-precision partition (sc-11044 AC 2) over a Sana-1.6B-DiT-style layer list:
+    /// self-attn + FF (the compute bulk) → W4A4; caption_projection, cross-attn K/V, first & last
+    /// blocks → W4A16. The partition is countable and the benign class dominates.
+    #[test]
+    fn partition_layers_matches_spike_policy() {
+        let layers = [
+            // benign compute bulk (W4A4)
+            "transformer_blocks.4.attn1.to_q",
+            "transformer_blocks.4.attn1.to_k",
+            "transformer_blocks.4.attn1.to_v",
+            "transformer_blocks.4.attn1.to_out.0",
+            "transformer_blocks.4.ff.net.0.proj",
+            "transformer_blocks.4.ff.net.2",
+            "transformer_blocks.4.attn2.to_q",   // cross-attn Q is benign (not K/V)
+            "transformer_blocks.4.attn2.to_out.0", // cross-attn output proj is benign
+            // outlier class (W4A16)
+            "transformer.caption_projection.linear_1",
+            "transformer_blocks.4.attn2.to_k", // cross-attn K
+            "transformer_blocks.4.attn2.to_v", // cross-attn V
+            "transformer_blocks.0.attn1.to_q", // first block
+            "final_block.proj",                // last block
+        ];
+        let part = ActPrecision::partition_layers(layers);
+        assert_eq!(part.n_w4a16, 5, "5 outlier-class projections must be W4A16");
+        assert_eq!(part.n_w4a4, 8, "8 benign projections must be W4A4");
+        assert!(
+            part.w4a4_fraction() > 0.6,
+            "the FP4 compute bulk must dominate (got {:.2})",
+            part.w4a4_fraction()
+        );
+        // Spot-check a couple assignments.
+        let by_name: std::collections::HashMap<_, _> = part
+            .assignments
+            .iter()
+            .map(|(n, p)| (n.as_str(), *p))
+            .collect();
+        assert_eq!(by_name["transformer_blocks.4.attn1.to_q"], ActPrecision::W4A4);
+        assert_eq!(by_name["transformer_blocks.4.attn2.to_k"], ActPrecision::W4A16);
+        assert_eq!(by_name["transformer.caption_projection.linear_1"], ActPrecision::W4A16);
     }
 
     /// Footprint accounting: the NVFP4 footprint is far below the bf16 size (~4.5 vs 16 bits/weight).

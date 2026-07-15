@@ -69,6 +69,12 @@ pub mod eight_bit_linear;
 // the FP4 compute leg is cfg-gated internally.
 pub mod nvfp4_linear;
 
+// Activation-outlier sparsity instrumentation (sc-11044): the spike sc-11038 "residual gate" metric —
+// per-layer, how many NVFP4 16-blocks carry a massive-activation outlier — used to confirm the
+// benign→W4A4 / outlier→W4A16 partition. Backend-neutral (pure host math over a materialized slice),
+// so it compiles and tests on the CPU lane.
+pub mod nvfp4_outlier;
+
 pub use adapt::{AdaptLinear, LokrFactors};
 pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
 pub use nvfp4::{
@@ -91,7 +97,8 @@ pub use cublaslt::{
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
-pub use nvfp4_linear::{ActPrecision, Nvfp4Linear, Nvfp4Regime, NVFP4_M_ALIGN};
+pub use nvfp4_linear::{ActPrecision, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime, NVFP4_M_ALIGN};
+pub use nvfp4_outlier::{OutlierClass, OutlierSparsity};
 
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
