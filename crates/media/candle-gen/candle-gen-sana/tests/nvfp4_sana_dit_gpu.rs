@@ -11,10 +11,13 @@
 //!    trunk → DC-AE decode) with the NaN guard armed on **every** projection at **every** step, then
 //!    the same seed/prompt through the dense f32 trunk. Asserts no NaN/inf anywhere, output coherence,
 //!    and quality parity (latent rel-RMS / cosine, decoded-image PSNR).
-//! 2. [`nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4`] — **SC#1.** ms/step for the dense
-//!    baseline vs NVFP4 W4A16 vs NVFP4 W4A4 on the real trunk, exclusive GPU.
-//! 3. [`nvfp4_sana_dit_real_model_vram_footprint`] — **SC#6.** Model-level resident weight bytes ==
-//!    the NVFP4 footprint, not bf16, by contention-immune tensor byte-accounting.
+//! 2. [`nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4`] — **NOT SC#1** (Sana cannot settle it —
+//!    a candle grouped-conv defect is ~93% of the step; see the test's docs and sc-12110). ms/step for
+//!    the dense baseline vs NVFP4 W4A16 vs W4A4; its real finding is W4A4's unfused activation-quantize
+//!    overhead — the sc-12078 evidence.
+//! 3. [`nvfp4_sana_dit_real_model_vram_footprint`] — **SC#6, scoped to blanket W4A4.** Model-level
+//!    resident weight bytes == the NVFP4 footprint under the packed path, by contention-immune tensor
+//!    byte-accounting — and the honest per-regime cost (mixed 0.70×, blanket W4A16 1.00×) alongside it.
 //! 4. [`nvfp4_sana_dit_real_activation_outlier_sparsity`] — **the spike's residual empirical gate.**
 //!    Real per-layer activation-outlier sparsity captured across real denoise steps, checked against
 //!    the assumed benign→W4A4 / outlier→W4A16 partition. Emulation could not close this; a live model
@@ -50,7 +53,7 @@ use candle_gen_sana::pipeline::{
     sana_sigmas, DEFAULT_GUIDANCE,
 };
 use candle_gen_sana::{
-    summarize, ActProbe, DcAeConfig, DcAeDecoder, DitPlan, Nvfp4Quant, SanaTransformer,
+    summarize, ActProbe, DcAeConfig, DcAeDecoder, DitPlan, LayerRole, Nvfp4Quant, SanaTransformer,
     SanaTransformerConfig,
 };
 
@@ -372,8 +375,15 @@ fn nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense() {
     // the sc-7702 collapse mechanism the mixed policy exists to prevent.
 
     // GATE 1: W4A4 on the benign class must cost no meaningful quality over W4A16. If the partition
-    // were wrong, the collapsing layers would show up here as a clear drop; sc-11045's original
-    // (too-permissive) partition is what this catches.
+    // were wrong, collapsing layers would show up here as a quality drop.
+    //
+    // Scope this honestly: this gate is an end-to-end *quality* check, and it is **not** the evidence
+    // that sc-11045's original partition was too permissive — that finding comes from the direct
+    // per-layer measurement in `nvfp4_sana_dit_real_activation_outlier_sparsity` (27 of 109 W4A4-
+    // assigned projections measured `OutlierClass::Dense`, crush up to 5124×), which is the gate that
+    // actually re-partitions. Whether a given Dense layer's damage survives 20 denoise steps into a
+    // measurable cosine drop here is a separate question this test does not answer, and asserting it
+    // does would be claiming a demonstration we have not run.
     assert!(
         cos_m >= cos_a - 0.02,
         "NVFP4 W4A4 on the benign class costs {:.5} cosine vs the W4A16 storage tier ({cos_m:.5} vs \
@@ -393,19 +403,34 @@ fn nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense() {
 }
 
 // ==============================================================================================
-// (2) SC#1 throughput — the number of record.
+// (2) Throughput — informational. NOT SC#1's number of record; see the doc comment.
 // ==============================================================================================
 
-/// **SC#1: throughput of the real trunk — dense f32 baseline vs NVFP4 W4A16 vs NVFP4 W4A4.**
+/// **Throughput of the real trunk — dense f32 baseline vs NVFP4 W4A16 vs NVFP4 W4A4.**
 ///
 /// Times whole denoise steps (both CFG branches) on the real SANA-1.6B trunk at the real serving shape,
-/// on the exclusive GPU. Reports ms/step and the multiple; informational assertions only (the hardware
-/// multiple is not a correctness property), but this is the epic's headline number.
+/// on the exclusive GPU. Informational assertions only.
 ///
-/// Read it with sc-11044's finding in hand: the W4A4 activation quantizer is **unfused** (a chain of
-/// candle ops, not one kernel), so the layer-level W4A4 win is currently negated by quantize overhead —
-/// tracked as **sc-12078**. The FP4 GEMM core itself is the real win; the end-to-end step is what this
-/// reports.
+/// # Do NOT quote the vs-dense ratios as SC#1
+///
+/// **Sana cannot settle SC#1** (sc-11045 review; now tracked as
+/// [sc-12110](https://app.shortcut.com/trefry/story/12110)). The ratios this prints are real, but ~93%
+/// of their denominator is an unrelated **candle-core defect**, so they measure that defect, not NVFP4:
+///
+/// * SANA's Mix-FFN `conv_depth` (3×3 depthwise, `groups = 2·hidden = 11200`) costs **982 ms/call**
+///   because `candle-core/src/conv.rs:331-338` decomposes a grouped conv into one kernel launch per
+///   group plus a `cat` of 11200 tensors → **19.65 s of the 21.05 s step** (×20 blocks), at 0–1% GPU
+///   utilization (host-launch-bound).
+/// * All 163 NVFP4-eligible linears total **~80 ms/step — 0.4%**. Per block: linears 1.99 ms (0.20%)
+///   vs convs 984.8 ms (99.80%). **The end-to-end ceiling here is ~1.002× even with a free FP4 lane.**
+/// * Sana also has **no bf16 path** (f32-only trunk) and **no Q4 tier**, so neither SC#1's specified
+///   baseline nor SC#2's honest one exists on this model.
+///
+/// **What this test does establish** is the one signal that survives, because it is a *marginal* cost
+/// against an otherwise-identical leg: **W4A4 adds ~9.1 s/step of unfused activation-quantizer
+/// overhead** (≈28 ms/fwd/CFG-branch, matching sc-11044's ~25.8 ms/fwd). That is the real evidence for
+/// **[sc-12078](https://app.shortcut.com/trefry/story/12078)** (the fused quantize kernel), and it is
+/// this gate's honest finding. SC#1/SC#2 are settled on a Flux-family DiT under sc-12110.
 #[test]
 #[ignore = "real-weight GPU bench: needs the Sana-1.6B snapshot + an exclusive sm_120 device"]
 fn nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4() {
@@ -481,13 +506,26 @@ fn nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4() {
 // (3) SC#6 — model-level resident VRAM == the NVFP4 footprint.
 // ==============================================================================================
 
-/// **SC#6: the NVFP4-loaded model is served natively packed** — its resident weight bytes equal the
-/// NVFP4 footprint (~4.5 effective bits/weight), never a bf16 expansion.
+/// **SC#6 — scoped to what it actually proves: under BLANKET W4A4, the NVFP4-loaded trunk is served
+/// natively packed**, its resident weight bytes equal the NVFP4 footprint (~4.5 effective
+/// bits/weight), never a bf16 expansion.
 ///
-/// Lifted from sc-11041's layer-level proof to the whole model, and measured the same contention-immune
-/// way: sum the actual resident buffers the trunk holds ([`candle_gen::quant::Nvfp4Linear`]'s staged
-/// E2M1 + UE4M3 device buffers), rather than reading `nvidia-smi`/`mem_get_info` (which any other
-/// workload, allocator slack, or cuBLASLt workspace would contaminate).
+/// **Read the scope.** Blanket W4A4 is *not* a shipping regime ([`Nvfp4Quant::BlanketW4A4`]'s own
+/// docs say so) — it is the controlled bench that isolates the packed path. SC#6's claim is therefore
+/// a claim about **the packed serving path**, not about what SceneWorks ships. This test now measures
+/// and prints **all three regimes** so the shipping cost is on the record next to the claim
+/// (sc-11045 review, MAJOR 3):
+///
+/// * **blanket W4A4** — every projection packed on-device. ~0.28× bf16. This is the SC#6 gate.
+/// * **mixed (the shipping policy)** — the outlier class holds *dense bf16*, so resident VRAM sits
+///   well above the NVFP4 footprint, in proportion to how much of the trunk the outlier class covers.
+/// * **blanket W4A16 (the README's throughput default)** — **nothing** is packed on-device and every
+///   weight is resident dense bf16: **1.0×, i.e. no footprint win at all.** The NVFP4 packing buys
+///   numerical stability and load-time storage here, not VRAM.
+///
+/// Measured the contention-immune way (as sc-11041 did at layer level): sum the actual resident
+/// buffers the trunk holds, rather than reading `nvidia-smi`/`mem_get_info` (which any other workload,
+/// allocator slack, or cuBLASLt workspace would contaminate).
 #[test]
 #[ignore = "real-weight GPU test: needs the Sana-1.6B snapshot + an sm_120 device"]
 fn nvfp4_sana_dit_real_model_vram_footprint() {
@@ -496,31 +534,50 @@ fn nvfp4_sana_dit_real_model_vram_footprint() {
 
     let w = trunk_weights(&root, &dev);
     let cfg = SanaTransformerConfig::sana_1600m();
-    // Blanket W4A4 so every quantized projection is on the packed FP4 path (the W4A16 outlier class
-    // deliberately holds a dequantized bf16 weight — that is the policy, not a footprint failure).
-    let model =
-        SanaTransformer::from_weights_planned(&w, cfg, &DitPlan::nvfp4(Nvfp4Quant::BlanketW4A4))
-            .expect("build blanket-W4A4 trunk");
-    let r = model.nvfp4_report();
-
     let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+
+    // ---- Report the truth for EVERY regime, not just the flattering one. --------------------
     eprintln!(
-        "\n[sc-11045] ===== SC#6 MODEL-LEVEL FOOTPRINT (real SANA-1.6B trunk, blanket W4A4) =====\n\
-         [sc-11045]   projections quantized : {}\n\
-         [sc-11045]   FP4 tensor-core lit   : {}\n\
-         [sc-11045]   NVFP4 footprint       : {:10.2} MiB\n\
-         [sc-11045]   resident on-device FP4: {:10.2} MiB\n\
-         [sc-11045]   dense bf16 equivalent : {:10.2} MiB\n\
-         [sc-11045]   ratio                 : {:.4}  ({:.2} effective bits/weight)\n",
-        r.n_quantized,
-        r.fp4_lit,
-        mib(r.nvfp4_bytes),
-        mib(r.resident_fp4_bytes),
-        mib(r.bf16_bytes),
-        r.footprint_ratio(),
-        r.effective_bits(),
+        "\n[sc-11045] ===== MODEL-LEVEL RESIDENT VRAM by regime (real SANA-1.6B trunk) =====\n\
+         [sc-11045] {:<22} {:>6} {:>7} {:>12} {:>12} {:>12} {:>8}",
+        "regime", "lit", "dequant", "resid FP4", "resid bf16", "resid total", "ratio"
+    );
+    let mut measured = Vec::new();
+    for (label, quant) in [
+        ("blanket W4A4", Nvfp4Quant::BlanketW4A4),
+        ("mixed (shipping)", Nvfp4Quant::Mixed),
+        ("blanket W4A16", Nvfp4Quant::BlanketW4A16),
+    ] {
+        let m = SanaTransformer::from_weights_planned(&w, cfg.clone(), &DitPlan::nvfp4(quant))
+            .unwrap_or_else(|e| panic!("build {label} trunk: {e}"));
+        let r = m.nvfp4_report();
+        eprintln!(
+            "[sc-11045] {:<22} {:>6} {:>7} {:>9.2} MiB {:>8.2} MiB {:>8.2} MiB {:>8.4}",
+            label,
+            r.fp4_lit,
+            r.dequant_bf16,
+            mib(r.resident_fp4_bytes),
+            mib(r.dequant_bf16_bytes),
+            mib(r.resident_bytes()),
+            r.footprint_ratio(),
+        );
+        measured.push((label, r));
+        drop(m);
+    }
+    let bf16_total = measured[0].1.bf16_bytes;
+    eprintln!(
+        "[sc-11045]\n\
+         [sc-11045]   dense bf16 equivalent : {:10.2} MiB  (the 1.0× baseline)\n\
+         [sc-11045]   packed NVFP4 format   : {:10.2} MiB  ({:.4}× — the FORMAT's size, resident only \
+         under W4A4; {:.2} effective bits/weight)\n",
+        mib(bf16_total),
+        mib(measured[0].1.nvfp4_bytes),
+        measured[0].1.packed_footprint_ratio(),
+        measured[0].1.effective_bits(),
     );
 
+    // ---- The SC#6 gate itself: the BLANKET W4A4 packed path. --------------------------------
+    let r = &measured[0].1;
     assert!(
         r.fp4_lit > 0,
         "blanket W4A4 must light the FP4 cores on sm_120"
@@ -528,6 +585,10 @@ fn nvfp4_sana_dit_real_model_vram_footprint() {
     assert_eq!(
         r.fp4_lit, r.n_quantized,
         "every quantized projection should be FP4-resident under blanket W4A4"
+    );
+    assert_eq!(
+        r.dequant_bf16_bytes, 0,
+        "blanket W4A4 must not hold a single dequantized bf16 weight (SC#6)"
     );
     // The gate: resident device bytes == the packed NVFP4 footprint, ~0.28× bf16 (never ~1.0).
     assert_eq!(
@@ -543,6 +604,35 @@ fn nvfp4_sana_dit_real_model_vram_footprint() {
         r.effective_bits() < 5.0,
         "{:.2} effective bits/weight exceeds the ~4.5-bit NVFP4 budget (SC#6)",
         r.effective_bits()
+    );
+
+    // ---- ...and pin the honest converse, so the SC#6 claim can never be over-read. -----------
+    // Blanket W4A16 lights NOTHING and holds every weight dense bf16. If `footprint_ratio()` ever
+    // reports an NVFP4-scale number here again, the report has gone regime-blind (the exact defect
+    // the sc-11045 review caught: it printed "ratio 0.2822" for a leg that was 163/163 dequant→bf16).
+    let (_, w4a16) = &measured[2];
+    assert_eq!(w4a16.fp4_lit, 0, "blanket W4A16 must light no FP4 core");
+    assert_eq!(
+        w4a16.resident_fp4_bytes, 0,
+        "blanket W4A16 stages nothing to the packed path"
+    );
+    assert!(
+        w4a16.footprint_ratio() >= 0.99,
+        "blanket W4A16 holds dense bf16 — its resident ratio must be ~1.0, got {:.4}. An NVFP4-scale \
+         number here means the report is counting the host packed container, not VRAM.",
+        w4a16.footprint_ratio()
+    );
+
+    // The shipping mixed policy sits strictly between the two — and that cost is real, not a rounding
+    // error: every outlier-class projection holds a full dense bf16 weight.
+    let (_, mixed) = &measured[1];
+    assert!(
+        mixed.footprint_ratio() > r.footprint_ratio()
+            && mixed.footprint_ratio() < w4a16.footprint_ratio(),
+        "mixed resident ratio {:.4} must sit between blanket W4A4 ({:.4}) and blanket W4A16 ({:.4})",
+        mixed.footprint_ratio(),
+        r.footprint_ratio(),
+        w4a16.footprint_ratio(),
     );
 }
 
@@ -617,13 +707,19 @@ fn nvfp4_sana_dit_real_activation_outlier_sparsity() {
     let mut outlier_layers = 0usize;
 
     for s in &summaries {
-        // What the shipping mixed policy WOULD assign this layer. Mirrors the loader's edge rule in
-        // `SanaTransformer::from_weights_planned`: the leading edge is blocks 0 AND 1, plus the last.
-        let is_edge = s.layer.contains("transformer_blocks.0.")
-            || s.layer.contains("transformer_blocks.1.")
-            || s.layer
-                .contains(&format!("transformer_blocks.{}.", cfg.num_layers - 1));
-        let assigned = DitPlan::nvfp4(Nvfp4Quant::Mixed).act_for(&s.layer, is_edge);
+        // What the shipping mixed policy WOULD assign this layer. Mirrors the loader's `LayerRole` in
+        // `SanaTransformer::from_weights_planned`: the leading edge is blocks 0 AND 1, plus the last;
+        // and SANA's top-level `proj_out` is the trunk's final head, which the loader states
+        // explicitly (`LayerRole::final_proj()`) rather than letting a substring infer it —
+        // sc-11045 review, MAJOR 1.
+        let role = LayerRole {
+            is_edge_block: s.layer.contains("transformer_blocks.0.")
+                || s.layer.contains("transformer_blocks.1.")
+                || s.layer
+                    .contains(&format!("transformer_blocks.{}.", cfg.num_layers - 1)),
+            is_final_proj: s.layer == "proj_out",
+        };
+        let assigned = DitPlan::nvfp4(Nvfp4Quant::Mixed).act_for(&s.layer, role);
         eprintln!(
             "[sc-11045] {:<44} {:>8} {:>10.5} {:>10.5} {:>9} {:>10.1}",
             s.layer,

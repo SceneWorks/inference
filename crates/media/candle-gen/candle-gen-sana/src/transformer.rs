@@ -49,7 +49,7 @@ use candle_gen::Weights;
 
 use crate::config::SanaTransformerConfig;
 use crate::dc_ae::{conv, glu_mbconv_core, relu_linear_attention};
-use crate::nvfp4_dit::{report_over, DitPlan, Nvfp4Report, Proj, SanaProj};
+use crate::nvfp4_dit::{report_over, DitPlan, LayerRole, Nvfp4Report, Proj, SanaProj};
 
 // ----------------------------------------------------------------------------------------------
 // Shared scalar / norm primitives (f32).
@@ -72,9 +72,9 @@ fn linear(w: &Weights, prefix: &str, bias: bool) -> candle_gen::Result<Linear> {
 /// Load one trunk **projection** under a [`DitPlan`] (sc-11045): dense f32 [`Linear`] by default, or an
 /// [`Nvfp4Linear`] serving the same weight packed NVFP4 when the plan asks for it.
 ///
-/// `is_edge_block` marks SANA's first/last transformer block, whose projections the spike sc-11038
-/// policy keeps on bf16 activation (the shared substring policy can name `blocks.0.` but not SANA's
-/// last block — see [`DitPlan`]).
+/// `role` carries what the dotted key cannot: SANA's first/last transformer block, and its final
+/// output projection. Both are policy-relevant and neither is inferable from the name alone — see
+/// [`LayerRole`] and [`DitPlan::act_for`].
 ///
 /// The NVFP4 arm never fails on an ineligible device or shape: [`Nvfp4Linear`] resolves the capability
 /// gate itself and transparently serves dequant→bf16 (sc-11041), so this loader is safe to call on any
@@ -84,19 +84,21 @@ fn proj(
     prefix: &str,
     bias: bool,
     plan: &DitPlan,
-    is_edge_block: bool,
+    role: LayerRole,
 ) -> candle_gen::Result<Proj> {
-    let dense = linear(w, prefix, bias)?;
     if !plan.is_nvfp4() {
-        // Dense f32 — the byte-unchanged baseline path.
+        // Dense f32 — the byte-unchanged baseline path. Loaded ONLY inside this branch: on the NVFP4
+        // path the dense `Linear` is never used, and building it up front held a dense f32 weight live
+        // alongside the packed one across `Nvfp4Linear::from_dense` — a redundant device alloc + copy
+        // per projection, ×163 at peak load (sc-11045 review, MINOR 5).
         return Ok(Proj::new(
-            SanaProj::Dense(dense),
+            SanaProj::Dense(linear(w, prefix, bias)?),
             prefix,
             plan,
             ActPrecision::W4A16,
         ));
     }
-    let act = plan.act_for(prefix, is_edge_block);
+    let act = plan.act_for(prefix, role);
     let weight = w
         .require(&format!("{prefix}.weight"))?
         .to_dtype(DType::F32)?;
@@ -202,12 +204,13 @@ impl LinearSelfAttn {
         } else {
             (None, None)
         };
+        let role = LayerRole::edge_block(edge);
         Ok(Self {
             // attention_bias=false → q/k/v bias-free; to_out.0 carries a bias.
-            to_q: proj(w, &format!("{prefix}.to_q"), false, plan, edge)?,
-            to_k: proj(w, &format!("{prefix}.to_k"), false, plan, edge)?,
-            to_v: proj(w, &format!("{prefix}.to_v"), false, plan, edge)?,
-            to_out: proj(w, &format!("{prefix}.to_out.0"), true, plan, edge)?,
+            to_q: proj(w, &format!("{prefix}.to_q"), false, plan, role)?,
+            to_k: proj(w, &format!("{prefix}.to_k"), false, plan, role)?,
+            to_v: proj(w, &format!("{prefix}.to_v"), false, plan, role)?,
+            to_out: proj(w, &format!("{prefix}.to_out.0"), true, plan, role)?,
             norm_q,
             norm_k,
             heads: cfg.num_attention_heads as usize,
@@ -301,11 +304,12 @@ impl CrossAttn {
         } else {
             (None, None)
         };
+        let role = LayerRole::edge_block(edge);
         Ok(Self {
-            to_q: proj(w, &format!("{prefix}.to_q"), true, plan, edge)?,
-            to_k: proj(w, &format!("{prefix}.to_k"), true, plan, edge)?,
-            to_v: proj(w, &format!("{prefix}.to_v"), true, plan, edge)?,
-            to_out: proj(w, &format!("{prefix}.to_out.0"), true, plan, edge)?,
+            to_q: proj(w, &format!("{prefix}.to_q"), true, plan, role)?,
+            to_k: proj(w, &format!("{prefix}.to_k"), true, plan, role)?,
+            to_v: proj(w, &format!("{prefix}.to_v"), true, plan, role)?,
+            to_out: proj(w, &format!("{prefix}.to_out.0"), true, plan, role)?,
             norm_q,
             norm_k,
             heads: cfg.num_cross_attention_heads as usize,
@@ -544,18 +548,21 @@ impl SanaTransformer {
                 None,
             )
         };
+        // `caption_projection` is classified by the shared policy on its name alone; `proj_out` is the
+        // trunk's final head and states so explicitly (sc-11045 review, MAJOR 1).
+        let interior = LayerRole::interior();
         Ok(Self {
             patch_embed,
             ts_embedder_1: linear(w, ts1_key, true)?,
             ts_embedder_2: linear(w, ts2_key, true)?,
             time_linear: linear(w, "time_embed.linear", true)?,
             guidance_embedder,
-            caption_proj_1: proj(w, "caption_projection.linear_1", true, plan, false)?,
-            caption_proj_2: proj(w, "caption_projection.linear_2", true, plan, false)?,
+            caption_proj_1: proj(w, "caption_projection.linear_1", true, plan, interior)?,
+            caption_proj_2: proj(w, "caption_projection.linear_2", true, plan, interior)?,
             caption_norm: w.require("caption_norm.weight")?.to_dtype(DType::F32)?,
             blocks,
             scale_shift_table: w.require("scale_shift_table")?.to_dtype(DType::F32)?,
-            proj_out: proj(w, "proj_out", true, plan, false)?,
+            proj_out: proj(w, "proj_out", true, plan, LayerRole::final_proj())?,
             cfg,
         })
     }
@@ -924,11 +931,39 @@ mod tests {
             "no FP4 tensor-core layer may be lit on a non-sm_120 device"
         );
         assert_eq!(report.dequant_bf16, report.n_quantized);
-        // The weights are still carried at the NVFP4 footprint even in fallback.
+
+        // What fallback ACTUALLY costs in VRAM: nothing is packed on-device, and every projection
+        // holds a full dense bf16 dequant. So the resident footprint is the bf16 one — 1.0×, NOT the
+        // ~0.28× NVFP4 ratio.
+        //
+        // This assertion used to read `footprint_ratio() < 0.35` with the comment "the weights are
+        // still carried at the NVFP4 footprint even in fallback". That comment was false for device
+        // residency, and the assertion was vacuous: `footprint_ratio()` divided the *host* packed
+        // container by bf16, which is regime-independent by construction and could not fail. Both are
+        // fixed by the regime-aware report (sc-11045 review, MAJOR 3 / MINOR 6) — and this now
+        // genuinely CAN fail: were `footprint_ratio()` still regime-blind it would return ~0.28 here
+        // and trip the lower bound below.
+        assert_eq!(
+            report.resident_fp4_bytes, 0,
+            "no FP4 bytes may be resident off sm_120 — nothing was staged to the packed path"
+        );
+        assert_eq!(
+            report.dequant_bf16_bytes, report.bf16_bytes,
+            "every fallback projection holds a full dense bf16 weight resident"
+        );
         assert!(
-            report.footprint_ratio() < 0.35,
-            "packed NVFP4 footprint ratio {} should stay ~0.28",
+            report.footprint_ratio() >= 0.99,
+            "fallback resident footprint ratio {:.4} must be ~1.0 (dense bf16 resident) — a value \
+             near 0.28 would mean the report is still counting the host packed container instead of \
+             what the run actually holds in VRAM",
             report.footprint_ratio()
+        );
+        // The *format* is still ~4.5 bits/weight — that claim is about the packed container and stays
+        // true in fallback. It is simply not a claim about residency.
+        assert!(
+            report.packed_footprint_ratio() < 0.35,
+            "packed NVFP4 format ratio {:.4} should stay ~0.28",
+            report.packed_footprint_ratio()
         );
 
         // And it still produces a finite, correctly-shaped, non-degenerate forward.

@@ -55,7 +55,8 @@ pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::{DcAeDecoder, DcAeEncoder};
 pub use model::{descriptor, load, load_sprint, sprint_descriptor, MODEL_ID, SPRINT_MODEL_ID};
 pub use nvfp4_dit::{
-    summarize, ActProbe, ActRecord, DitPlan, LayerSparsitySummary, Nvfp4Quant, Nvfp4Report,
+    summarize, ActProbe, ActRecord, DitPlan, LayerRole, LayerSparsitySummary, Nvfp4Quant,
+    Nvfp4Report,
 };
 pub use pipeline::{
     denoise_sprint, SanaGenerateRequest, SanaPipeline, SanaSprintPipeline, SPRINT_DEFAULT_GUIDANCE,

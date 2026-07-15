@@ -57,6 +57,48 @@ pub enum Nvfp4Quant {
     BlanketW4A16,
 }
 
+/// The **structural facts** about a projection that its dotted key cannot carry, threaded from the
+/// loader — which knows the trunk's topology — into the shared substring policy (sc-11045).
+///
+/// This is the seam that keeps the policy honest. A name like `proj_out` is ambiguous across the
+/// workspace (SANA's trunk head vs LTX's per-block `ff.proj_out`); rather than sharpen the substring
+/// until it happens to fit SANA, the provider states the fact. Both flags default to `false`, i.e.
+/// "an ordinary interior projection".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayerRole {
+    /// This projection lives in SANA's **first or last** transformer block — the edges the spike
+    /// sc-11038 policy keeps on bf16 activation. Not nameable by the shared policy, whose
+    /// `last_block`/`final_block` markers do not match SANA's `transformer_blocks.{i}` keys.
+    pub is_edge_block: bool,
+    /// This projection is the trunk's **final output projection** (the head) — SANA's top-level
+    /// `proj_out`, measured Dense (crush 438×) on real activations, *not* a per-block layer that
+    /// merely spells itself `proj_out`.
+    pub is_final_proj: bool,
+}
+
+impl LayerRole {
+    /// An interior projection: neither an edge block nor the final head.
+    pub fn interior() -> Self {
+        Self::default()
+    }
+
+    /// An interior projection in SANA's first/last transformer block.
+    pub fn edge_block(is_edge_block: bool) -> Self {
+        Self {
+            is_edge_block,
+            is_final_proj: false,
+        }
+    }
+
+    /// The trunk's final output projection.
+    pub fn final_proj() -> Self {
+        Self {
+            is_edge_block: false,
+            is_final_proj: true,
+        }
+    }
+}
+
 /// How to serve the trunk's projections (sc-11045). Default: dense f32 — the byte-unchanged baseline.
 #[derive(Clone, Default)]
 pub struct DitPlan {
@@ -102,26 +144,34 @@ impl DitPlan {
         self.quant.is_some()
     }
 
-    /// The activation precision this plan assigns `name`, given SANA's block index bounds.
+    /// The activation precision this plan assigns `name`, given the structural facts SANA's loader
+    /// knows and a dotted key cannot carry.
     ///
-    /// [`ActPrecision::for_outlier_layer`] carries the shared substring policy (caption_projection,
-    /// cross-attn K/V, `blocks.0.`). It cannot name SANA's **last** block — the policy matches literal
-    /// `last_block`/`final_block` markers, while SANA keys are `transformer_blocks.{i}` — so the
-    /// last-block half of the spike's first/last rule is applied here, where the block count is known.
+    /// [`ActPrecision::for_outlier_layer_with`] carries the shared substring policy
+    /// (caption_projection, the cross-attention block, `blocks.0.`). Two facts are threaded in here
+    /// instead, because only the provider knows them:
+    ///
+    /// * `is_edge_block` — SANA's **last** block. The shared policy matches literal
+    ///   `last_block`/`final_block` markers, while SANA keys are `transformer_blocks.{i}`, so the
+    ///   last-block half of the spike's first/last rule is applied here, where the block count is known.
+    /// * `is_final_proj` — SANA's **final output projection**. The shared policy will not fire on a
+    ///   per-block layer that merely spells itself `proj_out` (LTX's `ff.proj_out`, Flux/Chroma's
+    ///   `single_transformer_blocks.{i}.proj_out` — the benign W4A4 compute bulk), so the trunk head
+    ///   is named explicitly rather than inferred from a substring (sc-11045 review, MAJOR 1).
     ///
     /// Public so a validation harness can ask what the shipping policy *would* assign a layer while
     /// probing a **dense** trunk (sc-11045's residual gate measures unquantized activations, then
     /// crosses the measured class against this assumed one).
-    pub fn act_for(&self, name: &str, is_edge_block: bool) -> ActPrecision {
+    pub fn act_for(&self, name: &str, role: LayerRole) -> ActPrecision {
         match self.quant {
             Some(Nvfp4Quant::BlanketW4A4) => ActPrecision::W4A4,
             Some(Nvfp4Quant::BlanketW4A16) => ActPrecision::W4A16,
-            // Mixed: the shared policy, plus the first/last-block rule resolved against SANA's naming.
+            // Mixed: the shared policy, plus the structural facts only the loader knows.
             Some(Nvfp4Quant::Mixed) => {
-                if is_edge_block {
+                if role.is_edge_block {
                     ActPrecision::W4A16
                 } else {
-                    ActPrecision::for_outlier_layer(name)
+                    ActPrecision::for_outlier_layer_with(name, role.is_final_proj)
                 }
             }
             None => ActPrecision::W4A16,
@@ -280,19 +330,62 @@ pub struct Nvfp4Report {
     pub fp4_lit: usize,
     /// Of those, how many serve the dequant→bf16 path (W4A16 override, or the capability fallback).
     pub dequant_bf16: usize,
-    /// Summed NVFP4 footprint (E2M1 nibbles + UE4M3 block scales) of the quantized weights.
+    /// Summed **packed NVFP4 footprint** (E2M1 nibbles + UE4M3 block scales) of the quantized weights.
+    ///
+    /// A property of the **format**, not of the run: the packed host container is retained in every
+    /// regime, so this is identical whether or not anything is packed on-device. Use
+    /// [`Self::resident_bytes`] for what the run actually costs in VRAM (sc-11045 review, MAJOR 3).
     pub nvfp4_bytes: usize,
     /// Summed bf16 footprint those same weights would occupy dense — the SC#6 comparison baseline.
     pub bf16_bytes: usize,
-    /// Summed bytes actually resident on-device for the FP4-regime weights
-    /// ([`Nvfp4Linear::resident_device_bytes`]). Only populated on a cuda build.
+    /// Summed bytes resident on-device for the **W4A4 (FP4-regime)** weights
+    /// ([`Nvfp4Linear::resident_device_bytes`]). Only populated on a cuda build; zero when no layer
+    /// resolved to the packed FP4 path.
     pub resident_fp4_bytes: usize,
+    /// Summed bytes resident on-device for the **W4A16 / fallback (dequant→bf16)** weights
+    /// ([`Nvfp4Linear::resident_dequant_bf16_bytes`]) — dense bf16, i.e. **no footprint win at all**.
+    ///
+    /// This is the field that makes the report regime-aware. Every `DequantBf16` layer materializes a
+    /// full dense bf16 weight at construction and holds it for life; counting only `nvfp4_bytes` let a
+    /// W4A16 run — with *nothing* packed on device — report a 0.28× "NVFP4 footprint".
+    pub dequant_bf16_bytes: usize,
 }
 
 impl Nvfp4Report {
-    /// Resident NVFP4 bytes as a fraction of the dense bf16 footprint. SC#6 wants this ≈ the NVFP4
-    /// footprint ratio (~0.28 at 4.5 effective bits/weight), **not** 1.0.
+    /// Bytes the trunk's quantized projections **actually hold resident on-device** for their weights:
+    /// packed FP4 buffers for the W4A4 layers **plus dense bf16** for every W4A16 / fallback layer.
+    ///
+    /// This is the honest SC#6 number, and it is **regime-aware** — a run with nothing on the packed
+    /// path reports the full bf16 residency, as it should.
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_fp4_bytes + self.dequant_bf16_bytes
+    }
+
+    /// **The SC#6 number: resident on-device weight bytes as a fraction of the dense bf16 footprint.**
+    ///
+    /// ~0.28 only when every projection is on the packed W4A4 path; **1.0** for a blanket-W4A16 run
+    /// (dense bf16 resident, nothing packed on-device); in between under the mixed policy, in
+    /// proportion to how much of the trunk the outlier class holds at bf16.
+    ///
+    /// **Regime-aware since the sc-11045 review (MAJOR 3).** This previously divided
+    /// [`Self::nvfp4_bytes`] — the *host* packed container, accumulated for every layer regardless of
+    /// regime — by `bf16_bytes`, so it returned ~0.2822 **even for a W4A16 leg that reported 163/163
+    /// dequant→bf16 and had not packed a single byte on-device**. It could not fail, and it reported an
+    /// NVFP4 footprint for a run that had none.
     pub fn footprint_ratio(&self) -> f64 {
+        if self.bf16_bytes == 0 {
+            0.0
+        } else {
+            self.resident_bytes() as f64 / self.bf16_bytes as f64
+        }
+    }
+
+    /// The **packed format's** footprint ratio (~0.28 at ~4.5 eff bits/wt) — a property of the NVFP4
+    /// container, independent of which regime the layers resolved to.
+    ///
+    /// Correct for "is the packing ~4.5 bits/weight?"; **wrong** for "what does this run cost in
+    /// VRAM?" — that is [`Self::footprint_ratio`].
+    pub fn packed_footprint_ratio(&self) -> f64 {
         if self.bf16_bytes == 0 {
             0.0
         } else {
@@ -300,7 +393,8 @@ impl Nvfp4Report {
         }
     }
 
-    /// Effective bits per weight implied by the NVFP4 footprint (target ≈ 4.5).
+    /// Effective bits per weight implied by the **packed NVFP4 format** (target ≈ 4.5). Like
+    /// [`Self::packed_footprint_ratio`], a statement about the container, not about residency.
     pub fn effective_bits(&self) -> f64 {
         // bf16_bytes / 2 == weight count.
         let weights = self.bf16_bytes / 2;
@@ -308,6 +402,15 @@ impl Nvfp4Report {
             0.0
         } else {
             self.nvfp4_bytes as f64 * 8.0 / weights as f64
+        }
+    }
+
+    /// Fraction of the quantized projections actually serving the packed FP4 path.
+    pub fn fp4_lit_fraction(&self) -> f64 {
+        if self.n_quantized == 0 {
+            0.0
+        } else {
+            self.fp4_lit as f64 / self.n_quantized as f64
         }
     }
 
@@ -319,10 +422,14 @@ impl Nvfp4Report {
         }
         self.nvfp4_bytes += l.nvfp4_footprint_bytes();
         self.bf16_bytes += l.bf16_footprint_bytes();
+        // Regime-aware residency: each layer contributes ONLY what its resolved regime actually holds
+        // on-device — packed FP4 buffers, or the dense bf16 dequant. Never both, never the host
+        // container (sc-11045 review, MAJOR 3).
         #[cfg(feature = "cuda")]
         {
             self.resident_fp4_bytes += l.resident_device_bytes().unwrap_or(0);
         }
+        self.dequant_bf16_bytes += l.resident_dequant_bf16_bytes().unwrap_or(0);
     }
 }
 
@@ -419,12 +526,12 @@ mod tests {
         assert!(w4a4.is_nvfp4());
         // A blanket plan ignores the outlier policy — even for a name the policy would flag.
         assert_eq!(
-            w4a4.act_for("transformer_blocks.3.attn2.to_k", false),
+            w4a4.act_for("transformer_blocks.3.attn2.to_k", LayerRole::interior()),
             ActPrecision::W4A4
         );
         assert_eq!(
             DitPlan::nvfp4(Nvfp4Quant::BlanketW4A16)
-                .act_for("transformer_blocks.3.attn1.to_q", false),
+                .act_for("transformer_blocks.3.attn1.to_q", LayerRole::interior()),
             ActPrecision::W4A16
         );
     }
@@ -434,44 +541,108 @@ mod tests {
         let p = DitPlan::nvfp4(Nvfp4Quant::Mixed);
         // Benign compute-bulk → W4A4.
         assert_eq!(
-            p.act_for("transformer_blocks.7.attn1.to_q", false),
+            p.act_for("transformer_blocks.7.attn1.to_q", LayerRole::interior()),
             ActPrecision::W4A4
         );
         // Outlier class by the shared substring policy: cross-attn K/V + caption projection.
         assert_eq!(
-            p.act_for("transformer_blocks.7.attn2.to_k", false),
+            p.act_for("transformer_blocks.7.attn2.to_k", LayerRole::interior()),
             ActPrecision::W4A16
         );
         assert_eq!(
-            p.act_for("transformer_blocks.7.attn2.to_v", false),
+            p.act_for("transformer_blocks.7.attn2.to_v", LayerRole::interior()),
             ActPrecision::W4A16
         );
         assert_eq!(
-            p.act_for("caption_projection.linear_1", false),
+            p.act_for("caption_projection.linear_1", LayerRole::interior()),
             ActPrecision::W4A16
         );
         // First block via the shared policy's `blocks.0.` rule.
         assert_eq!(
-            p.act_for("transformer_blocks.0.attn1.to_q", false),
+            p.act_for("transformer_blocks.0.attn1.to_q", LayerRole::interior()),
             ActPrecision::W4A16
         );
         // SANA's LAST block — which the shared substring policy cannot name — via `is_edge_block`.
         assert_eq!(
-            p.act_for("transformer_blocks.19.attn1.to_q", true),
+            p.act_for(
+                "transformer_blocks.19.attn1.to_q",
+                LayerRole::edge_block(true)
+            ),
+            ActPrecision::W4A16
+        );
+        // SANA's final head — which the shared policy deliberately will NOT infer from the substring
+        // (it would also match LTX/Flux/Chroma per-block `proj_out` layers) — via `is_final_proj`.
+        assert_eq!(
+            p.act_for("proj_out", LayerRole::final_proj()),
             ActPrecision::W4A16
         );
     }
 
+    /// The **packed-format** ratio: a property of the NVFP4 container, true in every regime.
     #[test]
-    fn report_footprint_ratio_and_effective_bits_are_nvfp4_scale() {
+    fn report_packed_ratio_and_effective_bits_are_nvfp4_scale() {
         // 4096×4096 weight: bf16 = 33_554_432 B; NVFP4 ≈ nibbles (8_388_608) + scales (1_048_576).
         let r = Nvfp4Report {
             nvfp4_bytes: 9_437_184,
             bf16_bytes: 33_554_432,
             ..Default::default()
         };
-        assert!((r.footprint_ratio() - 0.28125).abs() < 1e-6);
+        assert!((r.packed_footprint_ratio() - 0.28125).abs() < 1e-6);
         assert!((r.effective_bits() - 4.5).abs() < 1e-6);
+    }
+
+    /// **The SC#6 ratio is regime-aware** (sc-11045 review, MAJOR 3): it reports what the run holds in
+    /// VRAM, not what the packed container weighs.
+    ///
+    /// The bug this pins: `footprint_ratio()` used to be `nvfp4_bytes / bf16_bytes`, and `nvfp4_bytes`
+    /// accumulates the *host* packed container for every layer regardless of regime. So a W4A16 leg
+    /// reporting 163/163 dequant→bf16 — nothing packed on-device, every weight resident as dense bf16
+    /// — still printed "footprint 437.56 MiB … ratio 0.2822". The ratio could not fail, and it claimed
+    /// an NVFP4 footprint for a run that had none.
+    #[test]
+    fn footprint_ratio_is_regime_aware_and_never_claims_fp4_for_a_bf16_run() {
+        let bf16 = 33_554_432usize;
+        let packed = 9_437_184usize;
+
+        // (a) Blanket W4A4: everything staged packed on-device, nothing dequantized. ~0.28×.
+        let w4a4 = Nvfp4Report {
+            nvfp4_bytes: packed,
+            bf16_bytes: bf16,
+            resident_fp4_bytes: packed,
+            dequant_bf16_bytes: 0,
+            ..Default::default()
+        };
+        assert!((w4a4.footprint_ratio() - 0.28125).abs() < 1e-6);
+
+        // (b) Blanket W4A16 / capability fallback: NOTHING packed on-device; every weight resident as
+        // dense bf16. The honest answer is 1.0 — the regime buys stability, not footprint.
+        let w4a16 = Nvfp4Report {
+            nvfp4_bytes: packed, // the host container is still there — and still irrelevant to VRAM
+            bf16_bytes: bf16,
+            resident_fp4_bytes: 0,
+            dequant_bf16_bytes: bf16,
+            ..Default::default()
+        };
+        assert!(
+            (w4a16.footprint_ratio() - 1.0).abs() < 1e-6,
+            "a W4A16 run holds dense bf16 — it must NEVER report an NVFP4 footprint (got {:.4})",
+            w4a16.footprint_ratio()
+        );
+        // The old regime-blind formula is still available, correctly labelled as a format claim.
+        assert!((w4a16.packed_footprint_ratio() - 0.28125).abs() < 1e-6);
+
+        // (c) Mixed: half the bytes packed, half held dense bf16 → between the two.
+        let mixed = Nvfp4Report {
+            nvfp4_bytes: packed,
+            bf16_bytes: bf16,
+            resident_fp4_bytes: packed / 2,
+            dequant_bf16_bytes: bf16 / 2,
+            ..Default::default()
+        };
+        let expected = (packed / 2 + bf16 / 2) as f64 / bf16 as f64;
+        assert!((mixed.footprint_ratio() - expected).abs() < 1e-6);
+        assert!(mixed.footprint_ratio() > w4a4.footprint_ratio());
+        assert!(mixed.footprint_ratio() < w4a16.footprint_ratio());
     }
 
     #[test]
