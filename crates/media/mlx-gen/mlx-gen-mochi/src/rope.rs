@@ -69,6 +69,13 @@ impl MochiRope {
         })
     }
 
+    /// Build directly from precomputed `(cos, sin)` tables (each `[seq, heads, head_dim/2]`) — the
+    /// parity path that feeds a golden's captured `image_rotary_emb` so `block_parity` isolates the
+    /// block from the RoPE construction (validated separately to f32-epsilon).
+    pub fn from_parts(cos: Array, sin: Array) -> Self {
+        Self { cos, sin }
+    }
+
     /// Apply interleaved RoPE to a visual `[B, seq, heads, head_dim]` tensor (query or key). `cos`/`sin`
     /// `[seq, heads, head_dim/2]` broadcast over the batch. Mirrors `apply_rotary_emb`.
     pub fn apply(&self, x: &Array) -> Result<Array> {
