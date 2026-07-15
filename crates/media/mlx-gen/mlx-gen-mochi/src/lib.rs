@@ -14,11 +14,15 @@
 //! edges so each component is parity-gated in isolation against the A1 goldens.
 
 pub mod config;
+pub mod positions;
+pub mod rope;
 pub mod text_encoder;
 pub mod tokenizer;
 pub mod vae;
 
 pub use config::{MochiConfig, MochiVaeConfig};
+pub use positions::get_positions;
+pub use rope::MochiRope;
 pub use text_encoder::{encode_prompt, load_t5_encoder, MochiTextConditioning};
 pub use tokenizer::{load_tokenizer, load_tokenizer_with_max_len};
 pub use vae::{load_vae_decoder, MochiVaeDecoder};
