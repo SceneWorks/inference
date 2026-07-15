@@ -1371,9 +1371,19 @@ mod tests {
     #[test]
     #[ignore]
     fn krea_probed_generate_for_offload_ab() {
-        let dir = std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR to a Krea 2 snapshot");
         let out = std::env::var("KREA_OUT").expect("set KREA_OUT to the pixel-dump path");
         let raw = std::env::var("KREA_SEQ_RAW").is_ok();
+        // `krea_2_raw` is a DIFFERENT CHECKPOINT (the undistilled base DiT), not a mode of the Turbo
+        // snapshot — so it reads its own dir (the mlx-gen-krea `KREA_RAW_DIR` convention, sc-11101).
+        // Sharing `KREA_TURBO_DIR` across both would silently load the DISTILLED DiT and run it under
+        // the full-CFG loop: same architecture, so it would "work" and report a plausible peak, but the
+        // number would not belong to the model it was published against.
+        let dir = if raw {
+            std::env::var("KREA_RAW_DIR")
+                .expect("set KREA_RAW_DIR to a Krea 2 RAW snapshot (KREA_SEQ_RAW=1)")
+        } else {
+            std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR to a Krea 2 Turbo snapshot")
+        };
 
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
         let spec_mode = std::env::var("KREA_OFFLOAD_MODE").unwrap_or_default();
