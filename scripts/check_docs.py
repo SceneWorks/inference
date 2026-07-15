@@ -19,6 +19,7 @@ def markdown_files(root: Path) -> list[Path]:
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     return [root / path for path in result.stdout.splitlines()]
 

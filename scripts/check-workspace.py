@@ -55,17 +55,19 @@ def cargo_metadata(offline: bool) -> dict:
     command = ["cargo", "metadata", "--locked", "--format-version", "1"]
     if offline:
         command.append("--offline")
+    # cargo emits UTF-8 on every platform, so decode explicitly. text=True would decode with
+    # the locale encoding instead, which fails on Windows (cp1252) as soon as any package in
+    # the resolved graph carries non-ASCII metadata -- today a dependency author name.
     result = subprocess.run(
         command,
         cwd=ROOT,
         check=False,
         capture_output=True,
-        text=True,
     )
     if result.returncode:
-        sys.stderr.write(result.stderr)
+        sys.stderr.write(result.stderr.decode("utf-8", errors="replace"))
         fail(f"cargo metadata failed with exit code {result.returncode}")
-    return json.loads(result.stdout)
+    return json.loads(result.stdout.decode("utf-8"))
 
 
 def check_filesystem() -> None:
@@ -81,7 +83,10 @@ def check_filesystem() -> None:
     for manifest in ROOT.rglob("Cargo.toml"):
         if ".git" in manifest.parts or "target" in manifest.parts:
             continue
-        if any(line.strip() == "[workspace]" for line in manifest.read_text().splitlines()):
+        if any(
+            line.strip() == "[workspace]"
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+        ):
             workspace_manifests.append(manifest.relative_to(ROOT))
     if workspace_manifests != [Path("Cargo.toml")]:
         fail(f"expected one active root workspace manifest, found: {workspace_manifests}")
@@ -90,7 +95,7 @@ def check_filesystem() -> None:
         if not (ROOT / required).is_file():
             fail(f"missing root-owned configuration: {required}")
 
-    root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+    root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     dependencies = root_manifest["workspace"]["dependencies"]
     for dependency_name, (package_name, revision) in PINNED_WORKSPACE_DEPENDENCIES.items():
         dependency = dependencies.get(dependency_name)
