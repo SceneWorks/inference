@@ -3,7 +3,7 @@
 //! [`crate::transformer::Krea2Transformer`] loads its projections through
 //! [`crate::loader::linear_detect`] by default — dense bf16, or the MLX-packed q4/q8 dequant-on-forward
 //! [`crate::quant::QLinear`]. This module adds the seam that lets the SAME trunk serve those projections
-//! through [`Nvfp4Linear`] instead — the sc-11041 packed-forward NVFP4 path — so a **real Krea 2 Turbo
+//! through [`candle_gen::quant::Nvfp4Linear`] instead — the sc-11041 packed-forward NVFP4 path — so a **real Krea 2 Turbo
 //! denoise** can be run end-to-end on the FP4 tensor cores and compared against both epic baselines.
 //!
 //! This is a direct port of `candle-gen-sana`'s `nvfp4_dit` (sc-11045), which established the pattern.
@@ -25,7 +25,7 @@
 //!
 //! # Why Krea needs [`LayerRole`] more than SANA did
 //!
-//! The shared policy ([`ActPrecision::for_outlier_layer_with`]) is substring-based and was tuned on
+//! The shared policy ([`candle_gen::quant::ActPrecision::for_outlier_layer_with`]) is substring-based and was tuned on
 //! SANA's diffusers naming. **Three of its anchors do not exist in Krea's checkpoint**, and every gap
 //! fails in the *unsafe* direction (an outlier-carrying layer silently landing on W4A4):
 //!
@@ -34,14 +34,14 @@
 //!   and read by ordinary self-attention. There is no projection named `attn2` to guard.
 //! * **`caption_projection`** — Krea's text→DiT ingest is named `txt_in.linear_{1,2}`, fed by the
 //!   `text_fusion` stack that aggregates the raw Qwen3-VL hidden states. Neither matches.
-//! * **`proj_out`** — Krea's trunk head is `final_layer.linear`. [`names_final_proj`] cannot fire on it.
+//! * **`proj_out`** — Krea's trunk head is `final_layer.linear`. `names_final_proj` cannot fire on it.
 //!   (Krea's *only* `proj_out` is a control-branch layer nested under `blocks.{i}`, which the anchor
 //!   correctly declines — verified, and the reason the anchor is safe to leave alone here.)
 //!
 //! So Krea states these facts explicitly through [`LayerRole`] rather than sharpening substrings
 //! until they happen to fit a second provider — the seam sc-11045 built for exactly this, and the lesson
 //! sc-12140 records. **Measured vindication:** `final_layer.linear` really does measure
-//! [`OutlierClass::Dense`] on real activations (crush **909×**). It is guarded *only* because the loader
+//! [`candle_gen::quant::OutlierClass::Dense`] on real activations (crush **909×**). It is guarded *only* because the loader
 //! states [`LayerRole::final_proj`]; the name-only anchor would have left it on W4A4.
 //!
 //! # The finding that is not about naming at all (sc-12110)
@@ -74,7 +74,7 @@
 //! * `text_fusion.projector`, a `[1, num_layers]` collapse whose `N = 1` is ineligible for the cuBLASLt
 //!   FP4 path anyway (it would fall back at runtime; excluding it keeps the report honest).
 //!
-//! Everything degrades cleanly: an [`Nvfp4Linear`] on a non-`sm_120` device, on CPU, or on a non-cuda
+//! Everything degrades cleanly: an [`candle_gen::quant::Nvfp4Linear`] on a non-`sm_120` device, on CPU, or on a non-cuda
 //! build transparently serves the dequant→bf16 fallback (sc-11041), so a `DitPlan::nvfp4(..)` trunk
 //! still *runs* everywhere — it just does not light the FP4 cores. That is the SC#4 Blackwell-only
 //! gate, observed at model level by [`Nvfp4Report::fp4_lit`].
@@ -119,7 +119,7 @@ pub struct LayerRole {
     /// This projection is the trunk's **final output projection** (the head) — Krea's
     /// `final_layer.linear` `[6144 → 64]`.
     ///
-    /// **Krea cannot rely on the name-only fallback here** ([`names_final_proj`] anchors on a trailing
+    /// **Krea cannot rely on the name-only fallback here** (`names_final_proj` anchors on a trailing
     /// `proj_out` segment, and Krea's head is not spelled that way), so the loader threads this
     /// explicitly. That is precisely the defect class sc-12140 records: a name-only anchor that silently
     /// does not fire leaves the trunk head — measured Dense on SANA, crush 438× — on W4A4.
@@ -301,7 +301,7 @@ impl DitPlan {
 
     /// Bind the plan to a trunk of `num_layers` single-stream blocks (so `is_edge_block` names the right
     /// last block). Called by the loader from the config; a harness building a plan by hand for the
-    /// shipping Turbo trunk can rely on the [`DEFAULT_NUM_LAYERS`] default.
+    /// shipping Turbo trunk can rely on the `DEFAULT_NUM_LAYERS` default.
     pub fn with_num_layers(mut self, num_layers: usize) -> Self {
         self.num_layers = num_layers;
         self
@@ -368,7 +368,7 @@ impl DitPlan {
     ///
     /// * `is_edge_block` — Krea's **last** block (`transformer_blocks.27.`), which the shared policy's
     ///   `last_block`/`final_block` markers do not match.
-    /// * `is_final_proj` — Krea's head is `final_layer.linear`; [`names_final_proj`] anchors on a
+    /// * `is_final_proj` — Krea's head is `final_layer.linear`; `names_final_proj` anchors on a
     ///   trailing `proj_out` segment and will **not** fire (sc-12140).
     /// * `is_context_read` — Krea's `text_fusion.*` / `txt_in.*`; the shared policy's `caption_projection`
     ///   and `attn2` / `cross_att*` anchors have no Krea counterpart (it is a single-stream DiT with no
@@ -575,7 +575,7 @@ pub struct Nvfp4Report {
     /// Summed bf16 footprint those same weights would occupy dense — the SC#6 comparison baseline.
     pub bf16_bytes: usize,
     /// Summed bytes resident on-device for the **W4A4 (FP4-regime)** weights
-    /// ([`Nvfp4Linear::resident_device_bytes`]). Only populated on a cuda build; zero when no layer
+    /// (`Nvfp4Linear::resident_device_bytes`). Only populated on a cuda build; zero when no layer
     /// resolved to the packed FP4 path.
     pub resident_fp4_bytes: usize,
     /// Summed bytes resident on-device for the **W4A16 / fallback (dequant→bf16)** weights
