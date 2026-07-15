@@ -60,7 +60,7 @@ fn vae_decode_matches_golden() {
     // A valid (f32) golden video is ~[-1, 1]; if the provisioned golden is out of range it was dumped
     // in bf16 (the Mochi AsymmVAE is numerically f32-only) and is NOT a valid parity target — surface
     // that rather than gate against it (the MLX vae_parity finding).
-    let want_range = max_abs(want);
+    let want_range = max_abs(&want);
     assert!(
         want_range < 1.1,
         "golden `video` range is ±{want_range:.2} — this is a bf16 decode (the Mochi AsymmVAE is \
