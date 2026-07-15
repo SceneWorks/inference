@@ -16,19 +16,43 @@ pub enum WeightsSource {
     File(PathBuf),
 }
 
-/// On-the-fly quantization level — group-wise affine Q4/Q8 (see [`crate::quant`]).
+/// Quantization tier a load may request. [`Q4`](Self::Q4)/[`Q8`](Self::Q8) are the group-wise
+/// affine int tiers (see [`crate::quant`]); [`Nvfp4`](Self::Nvfp4) is the NVFP4 FP4 tensor-core tier
+/// (epic 11037).
+///
+/// **A quant tier is a creative choice — a distinct, additive tier, never a silent numerics swap
+/// (epic 11037 SC#5).** [`Nvfp4`](Self::Nvfp4) was added under the **Option A** packaging decision of
+/// sc-11042: NVFP4 is exposed as its *own* user-selectable tier, **not** a Blackwell execution backend
+/// auto-substituted for [`Q4`](Self::Q4). NVFP4's numerics differ from int4-affine `q4` (E2M1 4-bit
+/// elements + FP8-E4M3 block scales, W4A4 regime), so auto-swapping `q4` → NVFP4 on `sm_120` would
+/// silently change a picked tier's output — the SC#5 violation Option A avoids. Adding this variant
+/// changes **no** existing tier's numerics or behavior; each of `Q4`/`Q8` maps exactly as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quant {
     Q4,
     Q8,
+    /// The **NVFP4 FP4** tier (epic 11037, sc-11042 Option A) — E2M1 4-bit elements over 16-element
+    /// blocks with FP8-E4M3 micro-scales + an FP32 per-tensor scale (~4.5 effective bits/weight). A
+    /// *distinct* creative-choice tier, not an int4-affine equivalent. Served **natively packed** by
+    /// candle-gen's `Nvfp4Linear` (the packed-forward path, resident at the NVFP4 footprint — never a
+    /// dequant→bf16 dense expansion, epic 11037 SC#6) through the sc-11039 cuBLASLt FP4 GEMM on
+    /// consumer Blackwell `sm_120`; on other hardware it falls back cleanly. Surfaced through the
+    /// candle-gen catalog only under the `cuda` feature — the MLX/macOS runtime (no FP4 hardware) and
+    /// the CPU candle bundle (no FP4 compute) do not offer it.
+    Nvfp4,
 }
 
 impl Quant {
-    /// Bit-width passed to the MLX quantizer.
+    /// Element bit-width of the tier. For [`Q4`](Self::Q4)/[`Q8`](Self::Q8) this is the width passed to
+    /// the MLX affine quantizer. [`Nvfp4`](Self::Nvfp4) reports `4` (its E2M1 elements are 4-bit) but is
+    /// **not** an MLX-quantizer tier — it carries FP8 block scales + an FP32 per-tensor scale
+    /// (~4.5 *effective* bits/weight) and is served by candle-gen's NVFP4 packed path, not the MLX
+    /// affine quantizer; do not route `Nvfp4` through an MLX `quantize(bits)` call on this width alone.
     pub fn bits(self) -> i32 {
         match self {
             Quant::Q4 => 4,
             Quant::Q8 => 8,
+            Quant::Nvfp4 => 4,
         }
     }
 }

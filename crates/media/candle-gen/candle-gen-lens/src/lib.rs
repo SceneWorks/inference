@@ -198,7 +198,9 @@ impl Pipeline {
         let encoder = GptOssTextEncoder::new_quant(
             &EncoderConfig::gpt_oss_20b(),
             self.component_vb("text_encoder", ENC_DTYPE)?,
-            self.quant.map(quant::ggml_dtype),
+            // `ggml_dtype` is `Err` for `Quant::Nvfp4` (no GGUF block type — NVFP4 is served by
+            // `Nvfp4Linear`, sc-11042); `transpose()?` surfaces that instead of the GGUF fold path.
+            self.quant.map(quant::ggml_dtype).transpose()?,
         )?;
         // Adapters ride as **forward-time additive residuals** on the DiT's projections — on BOTH the
         // packed and the dense tier (sc-11105, additive-everywhere for epic 10765). The base weight is

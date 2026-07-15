@@ -65,4 +65,12 @@ mod tests {
         assert_eq!(candle_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);
         assert_eq!(snapshot.to_json()["platform"], "cpu");
     }
+
+    /// The CPU candle bundle does **not** surface the NVFP4 FP4 tier (no FP4 compute win off Blackwell)
+    /// — the pinned platform difference vs. the CUDA bundle (epic 11037, sc-11042 Option A).
+    #[cfg(feature = "media")]
+    #[test]
+    fn cpu_bundle_does_not_surface_nvfp4_tier() {
+        assert!(candle_gen_catalog::nvfp4_quant_tiers().is_empty());
+    }
 }

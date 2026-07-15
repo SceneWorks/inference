@@ -49,6 +49,11 @@ fn bytes_per_param(tier: Option<Quant>) -> f64 {
         None => 2.0,                     // bf16 dense
         Some(Quant::Q8) => 1.0 + 0.0625, // 8-bit + group scale/bias
         Some(Quant::Q4) => 0.5 + 0.0625, // 4-bit + group scale/bias
+        // NVFP4 (epic 11037, sc-11042) — ~4.5 effective bits/weight (E2M1 4-bit + FP8 block scale).
+        // NVFP4 is a candle/Blackwell tier, NOT served by this MLX pose overlay; the arm exists only to
+        // keep the match total over the shared `gen_core::Quant`. The MLX/macOS runtime has no FP4
+        // hardware and does not surface NVFP4, so `tier` is never `Some(Nvfp4)` on this path.
+        Some(Quant::Nvfp4) => 4.5 / 8.0,
     }
 }
 

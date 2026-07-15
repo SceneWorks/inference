@@ -79,6 +79,11 @@ pub fn bytes_per_param(quant: Quant) -> f64 {
         Quant::Q4 => 18.0 / 32.0,
         // 34 bytes / 32 weights.
         Quant::Q8 => 34.0 / 32.0,
+        // NVFP4 (epic 11037, sc-11042): ~4.5 effective bits/weight — E2M1 4-bit elements + one
+        // FP8-E4M3 scale per 16-block (0.5 bit/weight) + a negligible FP32 per-tensor scale ⇒
+        // 4.5/8 B/param. NVFP4 is served by `Nvfp4Linear` (its own packed container), not this crate's
+        // GGUF fold, so this feeds only the `minMemoryGb` footprint estimate for an NVFP4 tier.
+        Quant::Nvfp4 => 4.5 / 8.0,
     }
 }
 
@@ -256,7 +261,7 @@ mod tests {
         let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
         for (quant, max_rel) in [(Quant::Q8, 0.05f32), (Quant::Q4, 0.30f32)] {
             let w_cpu = w.to_dtype(DType::F32).unwrap();
-            let qt = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), &dev).unwrap();
+            let qt = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant).unwrap(), &dev).unwrap();
             let recon = qt.dequantize(&dev).unwrap();
             let num = (&w - &recon)
                 .unwrap()

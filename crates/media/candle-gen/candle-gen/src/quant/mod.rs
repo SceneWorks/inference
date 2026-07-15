@@ -109,10 +109,20 @@ use gen_core::Quant;
 /// — `Q4_0` / `Q8_0` (block size 32). Shared with the per-crate seams (Lens sc-5117, FLUX.2 sc-5917):
 /// the single source of truth for the family's `Quant → GgmlDType` mapping. The **packed** path uses
 /// `Q4_1` instead (the affine container the MLX tiers repack into losslessly — [`repack`]).
-pub fn ggml_dtype(quant: Quant) -> GgmlDType {
+///
+/// **`Err` for [`Quant::Nvfp4`]** (epic 11037, sc-11042): NVFP4 has no GGUF block type — it is not an
+/// in-place GGUF fold target. Its weight comes from the offline packer ([`nvfp4::Nvfp4Tensor`]) and is
+/// served by [`Nvfp4Linear`], selected via [`PackedConfig::detect_strategy`], never through this
+/// `Quant → GgmlDType` map. Returning an error (rather than a wrong `Q4_0`/`Q8_0`) makes a stray
+/// `quantize(Nvfp4)` fail loudly instead of silently mis-quantizing the tier.
+pub fn ggml_dtype(quant: Quant) -> Result<GgmlDType> {
     match quant {
-        Quant::Q4 => GgmlDType::Q4_0,
-        Quant::Q8 => GgmlDType::Q8_0,
+        Quant::Q4 => Ok(GgmlDType::Q4_0),
+        Quant::Q8 => Ok(GgmlDType::Q8_0),
+        Quant::Nvfp4 => candle_core::bail!(
+            "Quant::Nvfp4 has no GGUF block type; NVFP4 is served by Nvfp4Linear from a packed \
+             Nvfp4Tensor (sc-11041), not the in-place GGUF fold"
+        ),
     }
 }
 
@@ -642,10 +652,18 @@ impl QLinear {
         } else {
             w_cpu.force_contiguous()?
         };
-        let qtensor = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), &device)?;
         let weight = match strategy {
-            MatmulStrategy::DequantDense => QuantWeight::Dequant(std::sync::Arc::new(qtensor)),
-            MatmulStrategy::Int8Fast => QuantWeight::Matmul(QMatMul::from_qtensor(qtensor)?),
+            // The GGUF fold arms map the `Quant` tier to a block type; `ggml_dtype` is `Err` for
+            // `Quant::Nvfp4` (no GGUF representation), so a stray `quantize(Nvfp4)` bails here rather
+            // than mis-quantizing to `Q4_0`/`Q8_0`.
+            MatmulStrategy::DequantDense => {
+                let qtensor = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant)?, &device)?;
+                QuantWeight::Dequant(std::sync::Arc::new(qtensor))
+            }
+            MatmulStrategy::Int8Fast => {
+                let qtensor = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant)?, &device)?;
+                QuantWeight::Matmul(QMatMul::from_qtensor(qtensor)?)
+            }
             // NVFP4 is not a GGUF `QTensor` fold target — its weight comes from the offline packer
             // ([`nvfp4::Nvfp4Tensor`]) and is served by [`Nvfp4Linear`], not [`QLinear`]. No caller
             // passes this to `fold`; reject loudly rather than silently mis-quantize to `Q4_0`/`Q8_0`.

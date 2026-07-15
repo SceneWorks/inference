@@ -12,6 +12,13 @@ pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
 
+/// The advanced quant tiers this CUDA runtime surfaces beyond affine `Q4`/`Q8` — the NVFP4 FP4
+/// tensor-core tier (epic 11037, sc-11042 Option A) on consumer Blackwell `sm_120`. Re-exported from
+/// the media catalog so a product/worker reads the served tier off the runtime bundle; empty when the
+/// bundle is built without the media graph. See [`candle_gen_catalog::nvfp4_quant_tiers`].
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::nvfp4_quant_tiers;
+
 /// Platform label for this bundle; matches `RuntimeCatalog::platform`.
 pub const PLATFORM: &str = "cuda";
 /// The single tensor backend every provider in this bundle uses.
@@ -61,5 +68,14 @@ mod tests {
         #[cfg(feature = "media")]
         assert_eq!(candle_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);
         assert_eq!(snapshot.to_json()["platform"], "cuda");
+    }
+
+    /// The CUDA bundle surfaces the NVFP4 FP4 tier (epic 11037, sc-11042 Option A). Pins the
+    /// platform difference vs. the CPU/MLX runtimes, which do not (no FP4 hardware / no compute win).
+    #[cfg(feature = "media")]
+    #[test]
+    fn cuda_bundle_surfaces_nvfp4_tier() {
+        use super::gen_core::Quant;
+        assert_eq!(super::nvfp4_quant_tiers(), &[Quant::Nvfp4]);
     }
 }
