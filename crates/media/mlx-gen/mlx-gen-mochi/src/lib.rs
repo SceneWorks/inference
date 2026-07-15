@@ -14,6 +14,8 @@
 //! edges so each component is parity-gated in isolation against the A1 goldens.
 
 pub mod config;
+pub mod model;
+pub mod pipeline;
 pub mod positions;
 pub mod rope;
 pub mod scheduler;
@@ -23,6 +25,8 @@ pub mod transformer;
 pub mod vae;
 
 pub use config::{MochiConfig, MochiVaeConfig};
+pub use model::{descriptor, load, Mochi, MODEL_ID};
+pub use pipeline::{decode_to_frames, denoise, frames_to_images};
 pub use positions::get_positions;
 pub use rope::MochiRope;
 pub use scheduler::{cfg_combine, linear_quadratic_schedule, MochiScheduler};
@@ -33,3 +37,38 @@ pub use transformer::{
     MochiTransformerBlock,
 };
 pub use vae::{load_vae_decoder, MochiVaeDecoder};
+
+/// Add the MLX Mochi 1 generator to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_generator(model::REGISTRATION)
+}
+
+/// Build the complete explicit MLX Mochi 1 provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().unwrap();
+        let generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(generators, ["mochi_1"]);
+    }
+
+    #[test]
+    fn registered_descriptor_conforms() {
+        let registry = super::provider_registry().unwrap();
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "mochi descriptor conformance violations: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
+}
