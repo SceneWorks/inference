@@ -68,9 +68,34 @@ mod tests {
 
     /// The CPU candle bundle does **not** surface the NVFP4 FP4 tier (no FP4 compute win off Blackwell)
     /// — the pinned platform difference vs. the CUDA bundle (epic 11037, sc-11042 Option A).
+    ///
+    /// Asserted against the catalog's own compile-time answer rather than unconditionally, mirroring
+    /// `nvfp4_tier_surface_is_cuda_only`: the tier is surfaced **iff** the catalog resolved with `cuda`.
+    /// A bare `is_empty()` is the right claim for a supported CPU build but is not resolution-proof —
+    /// Cargo feature unification enables `candle-gen-catalog/cuda` for *every* consumer in any graph
+    /// that also resolves `runtime-cuda`, which would fail this test through no fault of the bundle.
+    /// That combination is not a supported lane (CLAUDE.md: CPU/CUDA/MLX are mutually exclusive
+    /// platform targets, not additive features), so the point is only to keep the assertion honest
+    /// under either resolution instead of latently fragile. `cfg!(feature = "cuda")` cannot express
+    /// this here — this bundle has no `cuda` feature, so the cfg would read as `false` and still fail.
     #[cfg(feature = "media")]
     #[test]
     fn cpu_bundle_does_not_surface_nvfp4_tier() {
-        assert!(candle_gen_catalog::nvfp4_quant_tiers().is_empty());
+        use super::gen_core::Quant;
+
+        if candle_gen_catalog::SURFACES_NVFP4_TIER {
+            // Unified CPU+CUDA resolution: the catalog compiled with FP4 support, so the tier is
+            // surfaced through every consumer of it, this bundle included.
+            assert_eq!(
+                candle_gen_catalog::nvfp4_quant_tiers(),
+                &[Quant::Nvfp4],
+                "a cuda-resolved catalog must surface exactly the NVFP4 tier"
+            );
+        } else {
+            assert!(
+                candle_gen_catalog::nvfp4_quant_tiers().is_empty(),
+                "the supported CPU-only resolution must NOT surface the NVFP4 tier"
+            );
+        }
     }
 }

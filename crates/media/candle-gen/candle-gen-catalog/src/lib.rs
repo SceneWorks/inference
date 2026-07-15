@@ -107,6 +107,21 @@ pub fn nvfp4_quant_tiers() -> &'static [media::gen_core::Quant] {
     }
 }
 
+/// Whether **this compilation** of the catalog surfaces the NVFP4 tier — i.e. whether it resolved with
+/// the `cuda` feature. Equivalent to `!nvfp4_quant_tiers().is_empty()`, exposed as a `const` because a
+/// *dependent* crate cannot ask that question with `cfg!`.
+///
+/// `cfg!(feature = "cuda")` only ever reads the features of the crate it is written in, so a bundle
+/// such as `runtime-cpu` — which has no `cuda` feature of its own — cannot mirror the rule pinned by
+/// `nvfp4_tier_surface_is_cuda_only` by writing the same `cfg`. It has to read the catalog's resolved
+/// answer, and this is it. That matters because Cargo **feature unification** makes the answer a
+/// property of the *resolved graph*, not of the bundle: any build that pulls in `runtime-cpu` and
+/// `runtime-cuda` together enables `candle-gen-catalog/cuda` once, for every consumer, so a CPU bundle
+/// can legitimately observe the tier surfaced. That resolution is not a supported lane (CLAUDE.md: CPU,
+/// CUDA, and MLX are mutually exclusive platform targets, never additive features), but a bundle-side
+/// assertion should stay honest under it rather than fail spuriously.
+pub const SURFACES_NVFP4_TIER: bool = cfg!(feature = "cuda");
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -228,6 +243,14 @@ mod tests {
         assert!(
             super::nvfp4_quant_tiers().is_empty(),
             "NVFP4 must NOT be surfaced on a non-cuda (CPU) candle catalog"
+        );
+
+        // `SURFACES_NVFP4_TIER` is what dependent bundles read instead of a `cfg!` they cannot write;
+        // it must never drift from the tier list itself.
+        assert_eq!(
+            super::SURFACES_NVFP4_TIER,
+            !super::nvfp4_quant_tiers().is_empty(),
+            "SURFACES_NVFP4_TIER must agree with nvfp4_quant_tiers()"
         );
     }
 }
