@@ -367,16 +367,35 @@ fn time_steps(
 ///
 /// **What was unsound is the inference from it.** `overhead/GEMM ≈ 1/N` silently assumes the two
 /// constants are comparable. They are not: an FP4 tensor-core GEMM is orders of magnitude more
-/// efficient per element than a ~20-op candle elementwise chain with a host sync, so `c_quant/c_gemm`
-/// is enormous and dividing it by N=16384 still leaves ~100×. Worse, **SANA's 0.69× was never a
-/// quantizer measurement at all** — its denominator was a conv defect (linears were 0.4% of the step),
-/// so the quantizer's 9.1 s was hiding inside a ~20 s conv-dominated step and *looked* like a ~45%
-/// overhead. Krea has no conv to hide behind, so the real ratio is visible: **343 ms of activation
-/// quantize to feed a GEMM whose entire per-layer step budget is ~3.5 ms.**
+/// efficient per element than a multi-op candle elementwise chain with a host sync. And **SANA's 0.69×
+/// was never a quantizer measurement at all** — its denominator was a conv defect (linears were 0.4% of
+/// the step), so the quantizer's 9.1 s was hiding inside a ~20 s conv-dominated step and *looked* like a
+/// ~45% overhead. Krea has no conv to hide behind, so the real ratio is visible for the first time.
 ///
-/// ⟹ **sc-12078 is a hard gate on SC#1, and ~70× larger than SANA implied.** A fused kernel must make
-/// the quantize essentially free for W4A4 to *break even* with bf16, before it can earn the FP4 core's
-/// 1.35–1.98×.
+/// # ⚠ RETRACTED conclusion — read before quoting the W4A4 rows (sc-12110 adversarial review)
+///
+/// An earlier revision of this doc concluded: *"sc-12078 is a hard gate on SC#1, and **~70× larger than
+/// SANA implied**; a fused kernel must make the quantize **essentially free** for W4A4 to break even."*
+/// **That conclusion is withdrawn.** It attributed the whole 343 ms/projection to being *unfused*. It is
+/// not: decomposing the shipping `quantize_nvfp4_activation` on real Krea shapes found **76% of it is a
+/// single fixable defect** — `cublaslt.rs:400-401` swizzles the UE4M3 block scales with `scatter_add`
+/// **atomics** for what the packer's own test proves is a **pure bijection**. That is
+/// **sc-12207** (a ~7,000–14,000× pathology; `index_select` does the identical permutation for free).
+///
+/// | per projection | M=4118, K=6144 | K=16384 |
+/// |---|---:|---:|
+/// | total quantizer | 328.10 ms | 879.42 ms |
+/// | **`scatter_add`** | **250.04 ms (76%)** | **666.29 ms (76%)** |
+/// | `index_select`, same permutation | 0.04 ms | 0.05 ms |
+/// | bandwidth reference | 20.49 ms | 59.05 ms |
+///
+/// **The SC#1 verdict is unaffected — NOT MET stands.** True unfused cost is **~95 ms/projection, not
+/// 343**; post-sc-12207 blanket W4A4 is **~21.4 s/step (0.043×)** — still ~23× slower than bf16, still
+/// not viable. **But the residual ~78 ms is only ~4× the 20 ms bandwidth reference for ~30 ops**, so a
+/// genuinely fused single-pass kernel plausibly reaches **~1–3 ms/projection (~390–780 ms/step)** —
+/// competitive with bf16's 908 ms. ⟹ **sc-12078 is still a GATE, but is sized ~4× too large**; sc-12207
+/// blocks it and the sizing must be re-derived from the corrected residual. The rows below are *today's*
+/// measurement, not the intrinsic cost of W4A4.
 #[test]
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
@@ -505,10 +524,37 @@ fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
 /// schedule; bf16 is the common reference; Q4 and NVFP4 are each scored against it, and against each
 /// other.
 ///
-/// * **NVFP4 ≥ Q4 ⟹ SC#2 satisfied** — a like-for-like ~4-bit comparison, won.
-/// * **NVFP4 materially worse than Q4 ⟹ that challenges the epic's premise** and is reported plainly,
-///   not smoothed. The gate below asserts only the direction, at a tolerance derived from the
-///   comparison itself (Q4's own divergence), never a hand-picked constant.
+/// # ⚠ This test CANNOT rank the two weight formats — do not use it for that (sc-12110 review)
+///
+/// An earlier revision of this test's docs concluded from the numbers below that **"NVFP4's weight
+/// format is less faithful than int4 at identical 4.5 bits."** **That conclusion was false and is
+/// withdrawn.** The metric here is an end-to-end 8-step denoise cosine — which the paragraph above
+/// already calls a measure of *divergence, not quality* — and it **disagrees in direction with every
+/// direct measurement of weight fidelity**:
+///
+/// * **weight rel-RMS** via `Nvfp4Tensor::pack` vs `dequant_mlx_q4_reference_gs` on 6 real Krea
+///   tensors: **NVFP4 0.0939 vs MLX q4 0.1006 — NVFP4 wins 6/6**;
+/// * **per-layer output error** `y = x·Wᵀ`: **NVFP4 wins 8/8** (Gaussian, Student-t(3), 1%×30 outliers,
+///   massive-channel activations).
+///
+/// Two further confounds polluted this leg specifically:
+///
+/// 1. **Surface mismatch.** The MLX q4 tier leaves `final_layer.linear`, `img_in` and
+///    `txt_in.linear_{1,2}` **dense at F32** (no `.scales` in the snapshot header; 54.26M params). This
+///    test's NVFP4 leg quantizes **all 260** — including the head that
+///    `nvfp4_krea_dit_real_activation_outlier_sparsity` measures as Dense (crush 909×). Surface-matched
+///    at 256 quantized, the gap narrows **38%**: rel-RMS 0.22850 → **0.21837**, cosine gap 0.00601 →
+///    **0.00371** (NVFP4 0.21837/0.97592/30.60 dB vs Q4 0.20193/0.97963/31.28 dB). **Those numbers still
+///    do not rank the formats** — a residual gap in a chaotic metric that points opposite to 6/6 and 8/8
+///    direct measurements is evidence about the *metric*.
+/// 2. **Equal per-projection bits ≠ equal tier bits.** Both are exactly 4.5 bits/weight per projection
+///    (q4 `group_size=64` + BF16 scale+bias at `[out, in/64]` → 4 + 32/64; NVFP4 → 4 + 8/16), but the
+///    **tiers** spend **59.19 (Q4) vs 57.68 (NVFP4) Gbit — +2.6%**, concentrated on the 4 most
+///    sensitivity-critical projections.
+///
+/// **What this test is for:** confirming that both ~4.5-bit tiers diverge from bf16 by a *similar*
+/// amount, and catching a regression that changes their ordering. Rank the formats with the direct
+/// weight/per-layer measurements, not with this.
 #[test]
 #[ignore = "real-weight GPU test: needs BOTH the Krea 2 Turbo bf16 and q4 snapshots + an sm_120 device"]
 fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
@@ -599,32 +645,33 @@ fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
         psnr_latent(&lat_w4a16, &lat_q4)
     );
 
-    // The like-for-like verdict: NVFP4's WEIGHT format vs int4's, both with full-precision activations.
-    let w16_wins = w16_cos >= q4_cos;
+    // Report the ordering, but NOT as a ranking of the two weight formats — this metric cannot do that
+    // (see the retraction in this test's docs). Direct measurement says NVFP4's weight format WINS:
+    // rel-RMS 0.0939 vs q4's 0.1006 (6/6 real tensors), and 8/8 on per-layer output error.
+    let w16_ahead = w16_cos >= q4_cos;
     eprintln!(
-        "\n[sc-12110] SC#2 VERDICT (like-for-like, weight-only): NVFP4 W4A16 cosine {w16_cos:.5} {} \
-         Q4's {q4_cos:.5} ⟹ the NVFP4 weight format is {}.",
-        if w16_wins { "≥" } else { "<" },
-        if w16_wins {
-            "at least as faithful as the int4 tier it would replace"
-        } else {
-            "LESS faithful than the int4 tier it would replace"
-        }
+        "\n[sc-12110] SC#2 (end-to-end DIVERGENCE, not a fidelity ranking): NVFP4 W4A16 cosine \
+         {w16_cos:.5} {} Q4's {q4_cos:.5} (gap {:.5}).",
+        if w16_ahead { "≥" } else { "<" },
+        (q4_cos - w16_cos).abs()
     );
-    // And the shipping-policy verdict, which additionally pays for FP4 activations.
+    eprintln!(
+        "[sc-12110] Both are ~4.5-bit tiers walking an 8-step flow-match denoise onto \
+         different-but-valid trajectories. This number does NOT rank the weight formats — direct \
+         measurement (weight rel-RMS 0.0939 vs 0.1006, 6/6; per-layer output error 8/8) says NVFP4's \
+         format is MORE faithful than int4 at equal bits. Confounds here: the q4 tier leaves 4 layers \
+         dense at F32 while this leg quantizes all 260, and the tiers spend 59.19 vs 57.68 Gbit (+2.6%)."
+    );
+    // And the shipping-policy leg, which additionally pays for FP4 activations.
     eprintln!(
         "[sc-12110] SC#2 (shipping mixed W4A4): cosine {fp4_cos:.5} vs Q4 {q4_cos:.5} — FP4 activations \
-         cost a further {:.5} cosine on top of the weight format.",
+         cost a further {:.5} cosine on top of the weight-only leg.",
         w16_cos - fp4_cos
     );
     eprintln!(
-        "[sc-12110] ⟹ SC#2 is {}",
-        if w16_wins {
-            "MET for the weight format (the regime that could ship); see the W4A4 line for the compute tier"
-        } else {
-            "NOT MET — NVFP4 is worse than Q4 on the like-for-like weight-only comparison. Reported as \
-             a finding, not smoothed: this challenges the epic's premise that NVFP4 can replace Q4"
-        }
+        "[sc-12110] ⟹ SC#2's accuracy premise HOLDS (NVFP4's weight format beats int4 at equal bits). \
+         What blocks the lane is SC#1 (throughput), not fidelity — see \
+         nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4."
     );
     assert!(
         lat_nvfp4.iter().all(|v| v.is_finite())
@@ -633,15 +680,42 @@ fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
         "a tier produced a non-finite latent"
     );
 
-    // The bar is **Q4's own divergence**, never a hand-picked constant: NVFP4 must not be *materially*
-    // worse than the tier it replaces. The 5% slack absorbs sampler chaos between two ~4-bit
-    // trajectories (an 8-step flow-match denoise is chaotic — a ~4.5-bit tier necessarily walks it onto
-    // a different-but-valid path) without letting a real regression through. The exact ordering is
-    // reported above either way; this only fails on a *material* loss.
+    // ==========================================================================================
+    // The bar: PIN the measured ordering, two-sided.
+    //
+    // The previous bar was `w16_cos >= q4_cos - 0.05 * q4_cos` — with Q4 at 0.97963 that is a bar of
+    // **0.9306**, i.e. ~8x looser than the gap it was meant to police (0.00601). A real regression
+    // sailed through it silently and the actual finding lived only in an `eprintln`. Worse, it was
+    // **one-sided**: it could only ever fire if NVFP4 got worse.
+    //
+    // This asserts the *reported* relationship instead, as a two-sided band on the cosine gap, so it
+    // fails if the ordering moves in EITHER direction:
+    //   * gap grows  => NVFP4's divergence regressed;
+    //   * gap shrinks/inverts => something changed for the better (a packer improvement, a surface fix,
+    //     or the q4 reference moved). That is NOT a free pass — the recorded conclusion is derived from
+    //     these numbers, so it must be re-derived, not silently absorbed.
+    //
+    // If this fires, RE-MEASURE AND RE-WRITE THE RECORD. Do not widen the band to make it green — that
+    // is precisely how the retracted "NVFP4 is less faithful than int4" conclusion survived review.
+    // ==========================================================================================
+    // Q4 − NVFP4-W4A16 cosine gap measured 2026-07-15 on real weights (this leg quantizes all 260
+    // projections; the q4 tier leaves 4 dense — see the surface-mismatch confound in the docs).
+    const MEASURED_COS_GAP: f32 = 0.00601;
+    // Absorbs GEMM/library nondeterminism only. The seed, prompt and schedule are fixed, so this is
+    // NOT a chaos budget — chaos is *between* the tiers, and it is exactly what the band pins.
+    const COS_GAP_TOL: f32 = 0.004;
+
+    let cos_gap = q4_cos - w16_cos;
     assert!(
-        w16_cos >= q4_cos - 0.05 * q4_cos.abs(),
-        "NVFP4 W4A16 is materially worse than the Q4 tier it replaces (cosine {w16_cos:.5} vs Q4 \
-         {q4_cos:.5}) — SC#2 fails and the epic's premise needs revisiting"
+        (cos_gap - MEASURED_COS_GAP).abs() <= COS_GAP_TOL,
+        "the SC#2 cosine ordering moved: Q4 {q4_cos:.5} − NVFP4 W4A16 {w16_cos:.5} = gap {cos_gap:.5}, \
+         outside the measured {MEASURED_COS_GAP:.5} ± {COS_GAP_TOL:.5}. This test pins the ordering the \
+         repo's record is written from — RE-MEASURE and update the record (README's NVFP4 section + this \
+         test's docs). Do NOT widen the band to make this green.\n\
+         NOTE: this end-to-end metric measures trajectory DIVERGENCE, not weight fidelity, and must not \
+         be used to rank the two formats — direct measurement (weight rel-RMS 0.0939 vs 0.1006, 6/6 \
+         tensors; per-layer output error 8/8) says NVFP4's format is MORE faithful than int4 at equal \
+         bits."
     );
 }
 

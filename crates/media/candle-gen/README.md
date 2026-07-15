@@ -175,18 +175,27 @@ The FP4 tensor-core MMA needs **both** operands in E2M1. So:
   is *numerical stability* on the outlier class. It is the outlier-class override and the capability
   fallback.
 
-**Current perf reality (read before quoting a multiple).** The W4A4 activation quantizer is **unfused**
-— a chain of ~20 candle ops plus a host sync, rather than one kernel — and that overhead does not merely
-reduce the FP4 GEMM win, it **dwarfs it by ~100×**. Measured end-to-end on the all-linear Krea 2 Turbo
-DiT (sc-12110, the vehicle of record — see [below](#sc1sc2-on-krea-2-turbo-the-vehicle-of-record)):
-**343 ms to quantize one projection's activation, feeding a GEMM whose entire per-layer step budget is
-~3.5 ms.** W4A4 comes in at **0.01×** — a hundred times *slower* than the bf16 baseline.
+**Current perf reality (read before quoting a multiple).** The W4A4 activation quantizer costs **343 ms
+per projection** as it stands, feeding a GEMM whose entire per-layer step budget is ~3.5 ms. W4A4
+measures **0.01×** end-to-end on the all-linear Krea 2 Turbo DiT (sc-12110, the vehicle of record — see
+[below](#sc1sc2-on-krea-2-turbo-the-vehicle-of-record)) — a hundred times *slower* than the bf16
+baseline. That measurement is real and current.
+
+**But do not read that 343 ms as the cost of being unfused.** Decomposing the quantizer (sc-12110's
+adversarial review) found **76% of it is a single fixable defect**, not intrinsic overhead:
+`cublaslt.rs:400-401` scatters the UE4M3 block scales into cuBLASLt's SF-atom layout with
+**`scatter_add` atomics** — for a swizzle the packer's own test proves is a **pure bijection**. A
+bijection needs a permutation, not atomic accumulation; `index_select` does the identical permutation in
+**0.04 ms** instead of 250.04 ms. That is **[sc-12207](https://app.shortcut.com/trefry/story/12207)** — a
+~7,000–14,000× pathology of the same class as sc-12111's grouped conv.
 
 > **W4A16 is the throughput default; W4A4 must not be shipped for throughput at all today** (its
-> correctness and the ~4.5-bit packed footprint are real — its speed is not). Making W4A4 a net win is
-> gated on **[sc-12078](https://app.shortcut.com/trefry/story/12078)** — a fused CUDA activation-quantize
-> kernel — and sc-12110 resized that gate: it is not a ~1.4× gap to close (as Sana suggested), it is a
-> **~100×** one. Until it lands, the ~2× is a **GEMM-core** number and nothing more.
+> correctness and the ~4.5-bit packed footprint are real — its speed is not). **Even with sc-12207 fixed
+> W4A4 stays non-viable** — ~21.4 s/step, **0.043×** — so this is not a "one bug and it ships" story.
+> Making W4A4 a net win is still gated on **[sc-12078](https://app.shortcut.com/trefry/story/12078)** (a
+> fused CUDA activation-quantize kernel), but **sc-12078's sizing is currently derived from the polluted
+> 343 ms and is ~4× too large**; sc-12207 blocks it and must be landed and re-measured first. Until
+> then, the ~2× is a **GEMM-core** number and nothing more.
 
 ### SC#1 — what Sana can and cannot tell you (read before quoting an end-to-end ratio)
 
@@ -246,65 +255,125 @@ baselines wired and on disk (dense bf16; the Q4 dequant-on-forward tier).
 > around the bf16 baseline, exactly as the epic's own [Correction 2](https://app.shortcut.com/trefry/epic/11037#activity-11088)
 > predicted for a storage tier. The regime that *does* light the FP4 cores is **~100× slower** than the
 > baseline it was supposed to double.
+>
+> **The verdict survives the sc-12207 correction; the W4A4 rows' *magnitude* does not.** 76% of the
+> W4A4 cost is one fixable `scatter_add` defect
+> ([sc-12207](https://app.shortcut.com/trefry/story/12207) — see the decomposition below). Post-fix,
+> blanket W4A4 is ~**21.4 s/step (0.043×)** — **still ~23× slower than bf16, still not viable**. Quote
+> these rows as *today's* measurement, not as the intrinsic cost of W4A4.
 
-**The 1/N amortization prediction failed — and the reason retires the argument, not just the number.**
-sc-12110 predicted that because quantizer cost scales ~O(M·K) and the GEMM ~O(M·K·N), overhead/GEMM ≈
-1/N; Krea's N=16384 being ~8× Sana's should have amortized the quantizer that made Sana 0.69×. The
-measurements say:
+**The 1/N amortization prediction failed.** sc-12110 predicted that because quantizer cost scales
+~O(M·K) and the GEMM ~O(M·K·N), overhead/GEMM ≈ 1/N; Krea's N=16384 being ~8× Sana's should have
+amortized the quantizer that made Sana 0.69×. It did not: W4A4 is 0.01–0.02×.
 
 * **The O(M·K) model is exactly right.** Krea's activation is 11.0× Sana's `M·K` (4118×6144 vs
   1024×2240); the measured per-projection quantizer cost is **12.3×** Sana's (343 ms vs ~28 ms). The
   two W4A4 regimes agree independently (343 ms/projection blanket over 260; 324 ms/projection mixed over
   139).
-* **The conclusion drawn from it was wrong, because Sana's 0.69× was never a quantizer measurement.**
-  On Sana the *denominator* was a conv defect — linears were **0.4%** of the step — so the quantizer's
-  9.1 s was hiding inside a ~20 s conv-dominated step. It looked like "the quantizer costs ~45% extra".
-  On Krea there is no conv to hide behind: linears are ~100% of the step, and the quantizer's true size
-  relative to the GEMM it feeds is exposed at **~100×**.
+* **Sana's 0.69× was never a quantizer measurement.** Its *denominator* was a conv defect — linears were
+  **0.4%** of the step — so the quantizer's 9.1 s hid inside a ~20 s conv-dominated step and looked like
+  "~45% extra". Krea has no conv to hide behind, so the quantizer's size relative to the GEMM it feeds
+  is visible for the first time.
 
-**⟹ sc-12078 is still a hard GATE on SC#1, and a much bigger one than Sana implied.** It is not a ~1.4×
-gap; a fused kernel must make the activation quantize essentially *free* (~100× faster, i.e. fused into
-the GEMM epilogue) for W4A4 merely to **break even** with bf16 — before it can start earning the FP4
-core's 1.35–1.98×. Any plan that treats sc-12078 as an incremental optimization is working from Sana's
-diluted number.
+> **⚠ RETRACTED (sc-12110 adversarial review):** an earlier revision concluded here that **"sc-12078 is
+> ~70× larger than Sana implied, and a fused kernel must make the quantize essentially *free* for W4A4
+> merely to break even."** **That conclusion is withdrawn** — it attributed the entire 343 ms to being
+> unfused, when **76% of it is one `scatter_add` defect** ([sc-12207](https://app.shortcut.com/trefry/story/12207),
+> above). It is wrong in the *conservative* direction: it oversizes the fused-kernel problem and would
+> have justified abandoning W4A4 for a reason that is not true.
 
-#### SC#2 — NVFP4 is *less* faithful than the Q4 tier it would replace
+**What the decomposition actually supports.** Measured per projection (M=4118, K=6144 / K=16384):
+`scatter_add` **250.04 / 666.29 ms** of a **328.10 / 879.42 ms** total; the same permutation by
+`index_select` is **0.04 / 0.05 ms**; host sync 11.94 / 36.28 ms; the pure-bandwidth reference is
+**20.49 / 59.05 ms**.
 
-The right SC#2 question is not "does a 4-bit tier match bf16" (none does — an 8-step flow-match denoise
-is chaotic, so any ~4.5-bit tier walks the sampler onto a different-but-valid trajectory, and cosine
-vs bf16 measures **divergence**, not quality). It is: **is NVFP4 at least as good as the int4 tier it
-replaces?** Krea is the first model with both tiers on disk, so it can be asked. Same seed, prompt and
-schedule; dense bf16 as the common reference:
+* **True unfused cost ≈ 95 ms/projection, not 343.**
+* **Post-sc-12207 blanket W4A4 ≈ 21.4 s/step = 0.043×** (from ~90.1 s). **Still ~23× slower than bf16 —
+  SC#1 stays NOT MET and W4A4 stays non-shippable.** Fixing the defect does not rescue the regime.
+* **But the residual ~78 ms is only ~4× the 20 ms bandwidth reference for ~30 ops.** A genuinely fused
+  single-pass kernel plausibly reaches **~1–3 ms/projection (~390–780 ms/step)** — i.e. *competitive
+  with bf16's 908 ms/step*, before the FP4 core's 1.35–1.98× is counted. That is a fundamentally
+  different sc-12078 than the retracted framing described.
 
-| tier (vs dense bf16) | rel-RMS | cosine | PSNR |
+**⟹ sc-12078 remains a hard GATE on SC#1 — but it is sized ~4× too large today** and its estimate is
+derived from a polluted number. **sc-12207 blocks it**: land the gather fix, re-measure, then re-derive
+sc-12078 from the corrected residual.
+
+#### SC#2 — the weight format is *more* faithful than int4; the end-to-end number does not rank formats
+
+> **⚠ RETRACTED (sc-12110 adversarial review).** An earlier revision of this section — and the commit
+> message that introduced it — concluded: **"NVFP4's weight format is less faithful than int4 at
+> identical 4.5 bits."** **That conclusion is false and is withdrawn. Do not cite it.** It ranked two
+> weight formats using an end-to-end denoise cosine that this very section already declares a measure of
+> *divergence, not quality* — and it disagrees in direction with **every** direct measurement of the
+> thing it claimed to be about. Three confounds, below.
+
+**Measured directly, with our own shipping packer** (`Nvfp4Tensor::pack` vs
+`dequant_mlx_q4_reference_gs`, on real Krea tensors — this is weight fidelity, not a trajectory):
+
+| direct weight-fidelity measurement | NVFP4 | MLX q4 | winner |
+|---|---:|---:|---|
+| **weight rel-RMS**, 6 real Krea tensors | **0.0939** | 0.1006 | **NVFP4, 6/6** |
+| **per-layer output error** `y = x·Wᵀ` — Gaussian, Student-t(3), 1%×30 outliers, massive-channel | — | — | **NVFP4, 8/8** |
+
+**NVFP4's weight format is more faithful than int4 at equal bits, on the model of record.** The epic's
+accuracy premise — *finer block-16 + a real FP8 scale beats int4 at equal bits* — **is vindicated**.
+
+**Why the end-to-end number said otherwise — three confounds:**
+
+**1. Surface mismatch (the largest).** The two tiers were not quantizing the same set of layers. The
+MLX q4 tier leaves `final_layer.linear`, `img_in` and `txt_in.linear_{1,2}` **dense at F32** (verified in
+the snapshot header: no `.scales`, **54.26M** params). The NVFP4 leg quantized **all 260** — including
+the head that this very PR measures as Dense-outlier (**crush 909×**). Q4 was being handed a
+four-layer, sensitivity-concentrated head start. Surface-matched at **256 quantized**, the gap narrows
+**38%**:
+
+| like-for-like, **surface-matched** (256 quantized) | rel-RMS | cosine | PSNR |
 |---|---:|---:|---:|
 | **Q4 weight-only** — the incumbent | **0.20193** | **0.97963** | **31.28 dB** |
-| **NVFP4 W4A16 weight-only** — like-for-like | 0.22850 | 0.97362 | 30.20 dB |
-| **NVFP4 W4A4 mixed** — weights *and* activations | 0.26869 | 0.96381 | 28.79 dB |
+| **NVFP4 W4A16 weight-only** | 0.21837 | 0.97592 | 30.60 dB |
+| *(unmatched, all 260 — the original leg)* | *0.22850* | *0.97362* | *30.20 dB* |
 
-Q4 is weight-only, so the honest comparison is the **W4A16** row (both 4-bit weights, full-precision
-activations); scoring Q4 against W4A4-mixed would conflate the weight format with activation quant.
+rel-RMS 0.22850 → **0.21837**; cosine gap 0.00601 → **0.00371**.
 
-> **SC#2 is NOT met.** NVFP4's weight format is **less faithful than int4** (cosine 0.97362 vs 0.97963;
-> −1.08 dB PSNR), and FP4 activations cost a further −0.0098 cosine on top.
+**These surface-matched numbers still do not rank the formats, and must not be quoted as if they do.**
+A residual gap in a *chaotic* metric, pointing the *opposite* way to 6/6 weight and 8/8 per-layer
+measurements, is evidence that the metric is not measuring format fidelity — not evidence that NVFP4 is
+worse. An 8-step flow-match denoise amplifies any perturbation onto a different-but-valid trajectory;
+which trajectory lands closer to bf16 is substantially luck. **Use the direct measurements to rank
+formats; use this table only to say "both ~4.5-bit tiers diverge from bf16 by a similar amount."**
 
-**And the two tiers cost exactly the same 4.5 bits/weight**, which is what makes this a clean result
-rather than a budget artifact:
+**2. "EXACTLY 4.5 bits ⇒ a clean result" is false at tier level.** The per-projection arithmetic is
+right and verified (MLX q4 `group_size=64`, BF16 scale+bias at `[out, in/64]` → `4 + 32/64` = **4.5**;
+NVFP4 group-16 → `4 + 8/16` = **4.5**). But the *tiers* do not spend the same total: **Q4 spends 59.19
+Gbit vs NVFP4's 57.68 — +2.6%** — and that surplus is concentrated on the **4 most sensitivity-critical
+projections** (confound 1). Equal per-projection bits did not make the comparison budget-neutral.
 
-* **MLX Q4**, group-64 affine: `4 + (f16 scale + f16 bias)/64` = **4.5 bits**
-* **NVFP4**, group-16: `4 (E2M1) + 8 (E4M3 scale)/16` = **4.5 bits** (+ a negligible per-tensor f32)
+**3. The symmetric-vs-affine explanation was fitted after the fact — and is refuted.** The retracted
+text argued NVFP4 spends its budget on finer blocks while Q4 buys a **zero-point**, and that "on Krea's
+real weight distributions the zero-point wins." Measured over 20 real tensors: **|skew| ≤ 0.060,
+|mean/std| ≤ 0.041.** Krea's weights are **zero-centred**, so the zero-point has essentially nothing to
+buy. The mechanism was invented to explain a result that was itself an artifact.
 
-So NVFP4 spends its 4.5 bits on **finer blocks (16 vs 64) but symmetric-only** quantization, while Q4
-spends them on **coarser blocks with a zero-point** (scale *and* bias, i.e. asymmetric). On Krea's real
-weight distributions the zero-point wins. The epic's premise — that NVFP4's block-16 + real FP8 scale
-buys near-FP8 accuracy *relative to int4* — does not reproduce end-to-end at equal bits. (The spike
-sc-11038's "NVFP4 ≈ int4, ~2× better than MXFP4" still holds as far as it went: NVFP4 beats **MXFP4**,
-whose block-32 power-of-two scale is genuinely coarser. It was never a win over *affine* int4.)
+**The real, measured E2M1 weakness** (worth knowing, and it does not overturn the ranking): NVFP4 is
+**~35–50% worse on the top-1% magnitude weights**, because the E2M1 grid is **non-uniform** — the 4→6
+step is a 50% gap, so the largest-magnitude weights land on a coarse part of the grid. It is better
+*overall* (0.0939 vs 0.1006) and worse in that tail. That is a real trade, stated in the right
+direction.
+
+**Also worth recording:** MLX's q4 is plain **min-max RTN** — our packer already beats it, and an
+**MSE-optimal block scale** would take NVFP4 further still (**0.0877** vs the current 0.0939). The
+format has headroom the incumbent does not.
 
 **What NVFP4 is today, stated plainly:** a **storage/packaging format** (a real ~4.5-bit packed
-footprint on the W4A4 serving path — SC#6 below) with **no throughput benefit on any shipping regime**
-and **slightly worse quality than the int4 tier it would replace, at identical bits**. SC#3 (stability)
-and SC#4 (the Blackwell gate) hold. **SC#1 and SC#2 do not.**
+footprint on the W4A4 serving path — SC#6 below) with a **weight format that is genuinely more faithful
+than the int4 tier at equal bits**, but **no throughput benefit on any shipping regime**. SC#2's
+accuracy premise holds; **SC#1 does not, and that is what blocks the lane** — see above. SC#3
+(stability) and SC#4 (the Blackwell gate) hold.
+
+*(The spike sc-11038's "NVFP4 ≈ int4, ~2× better than MXFP4" is unchanged and consistent: NVFP4 beats
+MXFP4's coarser block-32 power-of-two scale, and — per the direct measurements above — edges affine int4
+as well.)*
 
 ### The mixed-precision policy (why not blanket W4A4)
 
