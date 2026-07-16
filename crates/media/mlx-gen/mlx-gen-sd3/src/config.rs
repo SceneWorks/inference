@@ -47,7 +47,7 @@ pub const DEFAULT_SAMPLER: &str = "flow_match";
 // SD3.5-Large / Large-Turbo MMDiT architecture (sc-7850, real-weight confirmed)
 // ----------------------------------------------------------------------------------------------
 
-/// `SD3Transformer2DModel.num_layers` — the count of all-double-stream [`JointTransformerBlock`]s.
+/// `SD3Transformer2DModel.num_layers` — the count of all-double-stream `JointTransformerBlock`s.
 pub const LARGE_NUM_LAYERS: usize = 38;
 /// `attention_head_dim` — per-head channel width (qk_norm RMSNorm `weight` is `[HEAD_DIM]`).
 pub const LARGE_HEAD_DIM: usize = 64;

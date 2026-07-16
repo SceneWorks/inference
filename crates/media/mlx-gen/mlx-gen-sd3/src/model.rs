@@ -28,7 +28,7 @@
 //! Registered engine ids: **`sd3_5_large`** + **`sd3_5_large_turbo`** + **`sd3_5_medium`** (the
 //! SceneWorks worker's `payload.model`). Medium (M3, sc-7869) reuses ALL of this scaffolding — the
 //! same [`Sd3Large`] generator struct, loader, and pipeline — but is driven by the MMDiT-X arch
-//! ([`Sd3Variant::Medium`](crate::config::Sd3Variant::Medium) →
+//! ([`Sd3Variant::Medium`] →
 //! [`Sd3Arch::medium`](crate::config::Sd3Arch::medium): 24 blocks,
 //! hidden 1536, `pos_embed_max_size` 384, dual-attention blocks `0..=12`) and the Medium
 //! true-CFG recipe (40 steps / guidance 5.0). The struct keeps the historical `Sd3Large` name; it is
