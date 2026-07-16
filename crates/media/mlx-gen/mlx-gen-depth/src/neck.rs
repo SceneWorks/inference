@@ -15,7 +15,7 @@
 //! Stage 3 — **feature fusion** (`fusion_stage`), processed deepest→shallowest: a pre-activation
 //! residual unit refines each level; from the second level on the running fused map is bilinearly
 //! resized to the incoming residual, summed, refined again, ×2 bilinearly upsampled, and 1×1
-//! projected. The shallowest fused map (×2 upsampled to 2·grid·factor[0]) is the head input.
+//! projected. The shallowest fused map (×2 upsampled to `2·grid·factor[0]`) is the head input.
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{add, conv_transpose2d};
