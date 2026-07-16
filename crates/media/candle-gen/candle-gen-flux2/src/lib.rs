@@ -584,13 +584,21 @@ impl Pipeline {
                 guidance,
             ))
         };
-        match phase {
+        let encoded = match phase {
             TextPhase::Resident(comps) => encode(&comps.te, &comps.tokenizer),
             TextPhase::Sequential(text) => {
                 let (te, tokenizer) = text.as_ref();
                 encode(te, tokenizer)
             }
-        }
+        }?;
+        // The sequential residency seam drops `TextPhase` as soon as this closure returns, then the
+        // heavy loader reuses its CUDA allocations. Candle launches the Mistral/Qwen encode
+        // asynchronously, so the weights must stay alive until that work is complete. Without this
+        // boundary sync FLUX.2-dev Q4 deterministically produced different pixels in resident and
+        // sequential modes; `CUDA_LAUNCH_BLOCKING=1` restored parity and isolated this lifetime race
+        // (sc-12195). CPU and Metal synchronize through the same backend-neutral device operation.
+        self.device.synchronize()?;
+        Ok(encoded)
     }
 
     fn render_phase(
