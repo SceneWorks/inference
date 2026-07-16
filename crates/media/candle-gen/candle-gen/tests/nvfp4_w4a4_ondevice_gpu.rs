@@ -23,7 +23,7 @@
 #![cfg(feature = "cuda")]
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::quant::nvfp4::Nvfp4Tensor;
+use candle_gen::quant::nvfp4::{e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor};
 use candle_gen::quant::{
     ActPrecision, CublasLt, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity,
 };
@@ -134,10 +134,16 @@ fn nvfp4_w4a4_ondevice_activation_quant_matches_cpu_pack_ref() {
 }
 
 /// (1b) **sc-12078 bit-faithfulness gate:** the FUSED activation quantizer produces the same FP4 GEMM
-/// output as (a) the CPU `Nvfp4Tensor::pack` reference and (b) the unfused on-device candle path. The
-/// fused kernel mirrors the exact numeric recipe (`pack_from_slice`), so it must track the CPU pack
-/// within the same tolerance as the unfused path, and match the unfused path near-exactly (both are the
-/// same recipe; only the last-bit float ops of the E4M3/E2M1 arithmetic can differ).
+/// output as (a) the CPU `Nvfp4Tensor::pack` reference and (b) the unfused on-device candle path.
+///
+/// ⚠ **This test cannot see an E4M3 rounding tie** — exact midpoints are measure-zero under random
+/// activations, so it reported 0.000000 while the kernel was emitting the wrong byte for every tie. The
+/// byte-level gate is [`nvfp4_fused_e4m3_block_scale_bytes_match_cpu_at_exact_ties`]; keep both.
+///
+/// Note the fused/unfused leg is only exact *away from ties*: the fused kernel now rounds RN-**even**
+/// (matching the canonical `e4m3_from_f32`), while the unfused candle path rounds via `.round()`
+/// (half-away-from-zero) and so is itself wrong at exact midpoints — a latent pre-existing defect in the
+/// sc-11044 path, which now survives only as the fused kernel's fallback.
 #[test]
 fn nvfp4_fused_activation_quant_matches_cpu_pack_ref() {
     let Some(dev) = nvfp4_device() else { return };
@@ -170,7 +176,90 @@ fn nvfp4_fused_activation_quant_matches_cpu_pack_ref() {
     assert!(rr_cpu < 0.02, "fused activation quant diverges from the CPU pack ref (rel-RMS {rr_cpu:.6})");
     assert!(
         rr_candle < 0.001,
-        "fused must match the unfused on-device recipe near-exactly (rel-RMS {rr_candle:.6})"
+        "fused must match the unfused on-device recipe away from E4M3 ties (rel-RMS {rr_candle:.6})"
+    );
+}
+
+/// Byte offset of a logical `(row, 16-block)` UE4M3 scale within the **row-major 128×4 SF-atom** layout
+/// cuBLASLt consumes — mirrors `cublaslt_scale_layout` and the quantizer's gather index.
+fn rowmajor_scale_offset(r: usize, blk: usize, sf_cols: usize) -> usize {
+    let (m_atom, mr) = (r / 128, r % 128);
+    let num_k_atoms = sf_cols / 4;
+    let (k_atom, kc) = (blk / 4, blk % 4);
+    (k_atom + num_k_atoms * m_atom) * 512 + (mr % 32) * 16 + (mr / 32) * 4 + kc
+}
+
+/// (1c) **sc-12078 byte-exactness at E4M3 rounding TIES — the case a GEMM rel-RMS test cannot see.**
+///
+/// [`e4m3_from_f32`] is round-to-nearest **ties-to-even**: its scan tie-breaks on
+/// `code.is_multiple_of(2)`, and an even E4M3 byte *is* an even mantissa LSB. A kernel that rounds with
+/// `roundf` / candle's `.round()` instead rounds halves **away from zero**, so it emits the wrong byte for
+/// every block whose scale lands exactly on a grid midpoint — changing the dequant scale of all 16 values
+/// in that block.
+///
+/// Random activations never land on an exact midpoint (measure zero), so
+/// [`nvfp4_fused_activation_quant_matches_cpu_pack_ref`] happily reports rel-RMS 0.000000 while this is
+/// broken. **Byte-exactness has to be tested at the bytes, on crafted inputs.**
+///
+/// Construction: a per-tensor amax of exactly **448** gives `global_scale = 448/(6·448) = 1/6`, hence
+/// `sf_real = block_amax / (6·global_scale) = block_amax` exactly — so each block's amax *is* the value
+/// handed to the E4M3 rounder and can be placed precisely on a midpoint. Covers the normal grid at
+/// several exponents and one subnormal.
+#[test]
+fn nvfp4_fused_e4m3_block_scale_bytes_match_cpu_at_exact_ties() {
+    let Some(dev) = nvfp4_device() else { return };
+    let lt = CublasLt::new(&dev).unwrap();
+
+    // Exact midpoints. e.g. 8.5 sits between 8.0 (mantissa 0 → even) and 9.0 (mantissa 1 → odd), so
+    // ties-to-even must yield 8.0 (0x50), NOT 9.0 (0x51).
+    let ties: [f32; 6] = [
+        8.5,          // e=3, between 8.0 (even) and 9.0 (odd)      -> 8.0
+        9.5,          // e=3, between 9.0 (odd)  and 10.0 (even)    -> 10.0
+        17.0,         // e=4, between 16.0 (even) and 18.0 (odd)    -> 16.0
+        19.0,         // e=4, between 18.0 (odd)  and 20.0 (even)   -> 20.0
+        0.097_656_25, // e=-4 (12.5 ULPs), between 12 and 13 ULPs   -> 12 ULPs
+        0.004_882_812_5, // subnormal, between 2 and 3 ULPs of 2^-9 -> 2 ULPs
+    ];
+    let n_blocks = 1 + ties.len();
+    let cols = 16 * n_blocks;
+
+    let mut data = vec![0f32; cols];
+    data[0] = 448.0; // block 0 carries the per-tensor amax => global_scale = 1/6
+    for (i, &t) in ties.iter().enumerate() {
+        data[16 * (i + 1)] = t; // block i+1 has amax == t
+    }
+    let x = Tensor::from_vec(data, (1, cols), &dev).unwrap();
+    let stg = lt.quantize_nvfp4_activation_fused(&x, cols).unwrap();
+    assert_eq!(
+        stg.global_scale(),
+        448.0f32 / (6.0f32 * 448.0f32),
+        "the construction relies on global_scale == 1/6 so that sf_real == block_amax"
+    );
+
+    let scales = stg.scales_to_host(&lt).unwrap();
+    let sf_cols = n_blocks.div_ceil(4) * 4;
+    let mut bad = Vec::new();
+    for (i, &t) in ties.iter().enumerate() {
+        let off = rowmajor_scale_offset(0, i + 1, sf_cols);
+        let got = scales[off];
+        let want = e4m3_from_f32(t); // the canonical encoder: RN, ties-to-even
+        eprintln!(
+            "[sc-12078] tie sf_real={t}: kernel 0x{got:02X} ({}) | CPU e4m3_from_f32 0x{want:02X} ({})",
+            e4m3_to_f32(got),
+            e4m3_to_f32(want)
+        );
+        if got != want {
+            bad.push(format!(
+                "sf_real={t}: kernel 0x{got:02X} ({}) != CPU 0x{want:02X} ({})",
+                e4m3_to_f32(got),
+                e4m3_to_f32(want)
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "fused kernel E4M3 block-scale bytes disagree with the canonical ties-to-even encoder at exact \
+         midpoints — each wrong byte rescales an entire 16-element block: {bad:?}"
     );
 }
 

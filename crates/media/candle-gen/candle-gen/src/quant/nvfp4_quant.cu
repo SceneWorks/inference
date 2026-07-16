@@ -37,15 +37,22 @@ __device__ __forceinline__ unsigned int e2m1_code(float v) {
 }
 
 // ---- OCP E4M3: round a non-negative value onto the E4M3 grid, returning the DECODED on-grid value.
-// Mirrors the candle `e4m3_round_tensor` arithmetic (which matches the CPU `e4m3_from_f32` scan to
-// rel-RMS 0.000000): single ULP formula covering the normal grid (ULP 2^(e-3)) and, via e clamped to
-// -6, the subnormal grid (ULP 2^-9). Saturates at 448.
+// Single ULP formula covering the normal grid (ULP 2^(e-3)) and, via e clamped to -6, the subnormal
+// grid (ULP 2^-9). Saturates at 448.
+//
+// **Ties MUST round to even** — `e4m3_from_f32` (the canonical encoder) tie-breaks on
+// `code.is_multiple_of(2)`, and an even E4M3 byte is an even mantissa LSB. `roundf` rounds halves AWAY
+// from zero and is therefore WRONG here: it emitted 0x51 (9.0) for sf_real 8.5 where the CPU emits 0x50
+// (8.0), rescaling the whole 16-element block. `__float2int_rn` is IEEE round-to-nearest-even.
+// `v/ulp` is bounded by ~16 (v ∈ [2^e, 2^{e+1}) ⟹ v/ulp ∈ [8,16); subnormals ⟹ [0,8]), so the int
+// conversion cannot overflow. Guarded by `nvfp4_fused_e4m3_block_scale_bytes_match_cpu_at_exact_ties` —
+// a GEMM rel-RMS test cannot see this (exact midpoints are measure-zero under random activations).
 __device__ __forceinline__ float e4m3_round(float v) {
     v = fminf(fmaxf(v, 0.0f), 448.0f);
     float vc = fminf(fmaxf(v, 0.015625f /* 2^-6 */), 448.0f);
     float e = floorf(logf(vc) * NVFP4_INV_LN2); // floor(log2 vc) in [-6, 8], candle's ln-based log2
     float ulp = expf((e - 3.0f) * NVFP4_LN2);   // 2^(e-3)
-    float q = roundf(v / ulp) * ulp;
+    float q = (float)__float2int_rn(v / ulp) * ulp; // RN-even, NOT roundf (half-away-from-zero)
     return fminf(fmaxf(q, 0.0f), 448.0f);
 }
 

@@ -1270,6 +1270,28 @@ mod cuda_impl {
             (self.rows, self.cols_padded)
         }
 
+        /// The per-tensor FP32 scale cuBLASLt consumes via `alpha`.
+        pub fn global_scale(&self) -> f32 {
+            self.global_scale
+        }
+
+        /// Copy the staged **UE4M3 block-scale bytes** back to the host — the swizzled buffer exactly as
+        /// cuBLASLt reads it (see [`cublaslt_scale_layout`] for the offset of a logical `(row, block)`).
+        ///
+        /// Byte-level test/debug support, deliberately not on any hot path. It exists because an
+        /// end-to-end GEMM rel-RMS check **cannot** see a single wrong scale byte at an exact E4M3
+        /// rounding tie: ties are measure-zero under random activations, so only a crafted input
+        /// inspected at the byte level catches them (sc-12078 review).
+        pub fn scales_to_host(&self, lt: &CublasLt) -> Result<Vec<u8>> {
+            lt.stream.clone_dtoh(&self.scales).map_err(drv_err)
+        }
+
+        /// Copy the staged **E2M1 nibble bytes** back to the host (row-major `[rows, cols_padded/2]`,
+        /// low nibble = even column). Byte-level test/debug support; see [`Self::scales_to_host`].
+        pub fn packed_to_host(&self, lt: &CublasLt) -> Result<Vec<u8>> {
+            lt.stream.clone_dtoh(&self.packed).map_err(drv_err)
+        }
+
         fn stage(lt: &CublasLt, t: &Nvfp4Tensor) -> Result<Self> {
             // Sanity: the packer's buffers must match its declared shape (guards a malformed handoff).
             let expect_packed = t.rows * (t.cols_padded / 2);
