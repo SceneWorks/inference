@@ -364,7 +364,7 @@ impl Seedvr2Pipeline {
     }
 
     /// Preprocess one LR `Image` to a single-frame clip `(1,3,1,height,width)` in `[-1,1]` at the model
-    /// dtype (the [`Self::preprocess`] image + a temporal axis). Public for the tiling gate.
+    /// dtype (the `preprocess` image + a temporal axis). Public for the tiling gate.
     pub fn preprocess_frame(
         &self,
         image: &Image,
