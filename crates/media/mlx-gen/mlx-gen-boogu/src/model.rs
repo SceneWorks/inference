@@ -124,7 +124,7 @@ const TURBO_SAMPLERS: &[&str] = &["lcm", "euler_ancestral", "dpmpp_sde"];
 
 /// Boogu **Turbo** identity + capabilities. Same surface as [`descriptor`] except it is **CFG-free**
 /// — the DMD student distilled the guided velocity into the weights, so `guidance` is not offered
-/// (no unconditional branch). Few-step ([`DEFAULT_TURBO_STEPS`]).
+/// (no unconditional branch). Few-step (`DEFAULT_TURBO_STEPS`).
 pub fn descriptor_turbo() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_TURBO_ID;
@@ -141,7 +141,7 @@ pub fn descriptor_turbo() -> ModelDescriptor {
 }
 
 /// Boogu **Edit** identity + capabilities. Same true-CFG surface as [`descriptor`] plus instruction-edit
-/// source images: one [`ConditioningKind::Reference`] or up to [`MAX_EDIT_REFS`] via
+/// source images: one [`ConditioningKind::Reference`] or up to `MAX_EDIT_REFS` via
 /// [`ConditioningKind::MultiReference`]. Each source image is read by the Qwen3-VL vision tower
 /// (semantic edit) and VAE-encoded into the DiT's spatial reference sequence (`image_index_embedding`
 /// has 5 per-image slots, so 2–5 references compose into one edit, e.g. subject-from-A in scene-from-B).
