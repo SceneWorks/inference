@@ -4,7 +4,7 @@
 //! the CLIP image encode resizes to 224² with `mode='bicubic'` (upstream `CLIPModel.visual`), and the
 //! pose video + driving mask are 0.5×-downsampled with `mode='bilinear'`. These are PyTorch's own
 //! kernels (bicubic Keys **a = −0.75**, 4-tap, *no* antialias; bilinear 2-tap) — distinct from the
-//! antialiased torchvision/PIL `resize` ([`mlx_gen_pulid`]'s `resize_bicubic_f32`, Keys a = −0.5), so
+//! antialiased torchvision/PIL `resize` (`mlx_gen_pulid`'s `resize_bicubic_f32`, Keys a = −0.5), so
 //! they live here. Separable, accumulated in f64, host-side (the conditioning tensors are small and
 //! this is precompute-friendly).
 

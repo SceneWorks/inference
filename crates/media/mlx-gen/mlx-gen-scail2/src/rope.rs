@@ -14,7 +14,7 @@
 //! The 3-axis factorization (temporal / height / width frequency lanes) and the inverse-frequency
 //! formula are byte-identical to [`mlx_gen_wan::rope::RopeTable`] (which mirrors upstream `rope_params`
 //! exactly: head_dim 128 → 22 temporal + 21 height + 21 width = 64 half-lanes, θ = 10000). We build our
-//! own tables here because [`RopeTable`] exposes neither per-axis shifts nor the pose downsample. The
+//! own tables here because [`mlx_gen_wan::rope::RopeTable`] exposes neither per-axis shifts nor the
 //! emitted `(cos, sin)` are shaped `[seq, 1, half_d]`, directly consumable by
 //! [`mlx_gen_wan::rope::rope_apply`].
 
