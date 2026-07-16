@@ -575,20 +575,22 @@ mod tests {
         }
     }
 
-    /// Sequential-residency GPU validation (epic 10765 Phase 1, sc-10769). ONE probed generation whose
-    /// mode is the `CANDLE_GEN_OFFLOAD` env the generator reads; prints the device peak VRAM and writes
-    /// the raw RGB pixels to `FLUX_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and
-    /// compare: the pixel files must be byte-identical (parity) and the sequential peak materially lower
-    /// (the ~9 GB T5-XXL dropped before the DiT loads). Two processes are REQUIRED — candle's cudarc
-    /// caching allocator never returns pages to the driver, so a second in-process run would reuse the
-    /// first run's pool and read the same peak. Ignored by default; needs a real-file (hardlink-staged,
-    /// not raw-HF-symlink) FLUX.1-dev snapshot in `FLUX_DEV_DIR` + a CUDA device.
+    /// Shared real-weight sequential-residency A/B body for FLUX.1 dev and schnell (sc-12138). Runs ONE
+    /// probed generation whose mode is the `CANDLE_GEN_OFFLOAD` env the generator reads, writes raw RGB
+    /// pixels to `FLUX_OUT`, and prints the device peak. Run it TWICE in SEPARATE processes (resident vs
+    /// sequential): pixels must be byte-identical and the sequential peak materially lower because the
+    /// ~9 GB T5-XXL drops before the DiT loads. Separate processes are required because candle's cudarc
+    /// caching allocator never returns pages to the driver.
     #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore]
-    fn flux_dev_probed_generate_for_offload_ab() {
-        let dir = std::env::var("FLUX_DEV_DIR")
-            .expect("set FLUX_DEV_DIR to a real-file (hardlink-staged) FLUX.1-dev snapshot");
+    fn run_probed_offload_ab(
+        label: &str,
+        dir_env: &str,
+        load: fn(&LoadSpec) -> gen_core::Result<Box<dyn Generator>>,
+        steps: u32,
+    ) {
+        let dir = std::env::var(dir_env).unwrap_or_else(|_| {
+            panic!("set {dir_env} to a real-file (hardlink-staged) {label} snapshot")
+        });
         let out = std::env::var("FLUX_OUT").expect("set FLUX_OUT to the pixel-dump path");
         // Two ways to select sequential residency, both exercised by the A/B runner:
         //   - env `CANDLE_GEN_OFFLOAD=sequential` (the override, sc-10769), OR
@@ -603,14 +605,14 @@ mod tests {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,
             height: 1024,
-            steps: Some(8),
+            steps: Some(steps),
             seed: Some(42),
             count: 1,
             ..Default::default()
         };
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
-        let g = load_dev(&spec).expect("load flux1_dev");
+        let g = load(&spec).unwrap_or_else(|e| panic!("load {label}: {e}"));
         probe.end_load(load_phase);
         let generate_phase = probe.phase();
         let output = g.generate(&req, &mut |_| {}).expect("generate");
@@ -631,12 +633,30 @@ mod tests {
             "resident"
         };
         eprintln!(
-            "SEQ_AB mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
+            "SEQ_AB model={label} mode={mode} gpu={} peak_mib={peak_mib} | {report} | bytes={} {}x{} out={out}",
             candle_gen::testkit::probe_gpu(),
             img.pixels.len(),
             img.width,
             img.height
         );
         report.assert_trustworthy(1.0);
+    }
+
+    /// FLUX.1-dev real-weight A/B (epic 10765 Phase 1, sc-10769/sc-12138). Needs a real-file snapshot
+    /// in `FLUX_DEV_DIR` and a CUDA device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn flux_dev_probed_generate_for_offload_ab() {
+        run_probed_offload_ab("flux1_dev", "FLUX_DEV_DIR", load_dev, 8);
+    }
+
+    /// FLUX.1-schnell sibling required by the live worker gate (sc-12138). Needs a real-file snapshot
+    /// in `FLUX_SCHNELL_DIR` and a CUDA device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn flux_schnell_probed_generate_for_offload_ab() {
+        run_probed_offload_ab("flux1_schnell", "FLUX_SCHNELL_DIR", load_schnell, 4);
     }
 }
