@@ -4,10 +4,10 @@
 //! cache), this decoder interleaves two mixer types on a fixed schedule (`full_attention_interval`,
 //! default 4 → **3 Gated DeltaNet linear-attention layers : 1 gated full-attention layer**):
 //!
-//! - [`GatedDeltaNet`] — linear attention carrying a fixed-size recurrent state (the verified
+//! - `GatedDeltaNet` — linear attention carrying a fixed-size recurrent state (the verified
 //!   primitives in [`crate::primitives::gated_delta`]): in-proj → short conv → q/k RMS-norm →
 //!   gated delta recurrence → gated RMS-norm → out-proj.
-//! - [`Qwen35Attention`] — grouped-query attention with **partial RoPE** (`partial_rotary_factor`,
+//! - `Qwen35Attention` — grouped-query attention with **partial RoPE** (`partial_rotary_factor`,
 //!   reusing the [`Rope::partial`] path), per-head q/k RMS-norm, and an **output gate** (the queries
 //!   projection is doubled into `[queries ‖ gate]`, and the attended output is multiplied by
 //!   `sigmoid(gate)` before the output projection).

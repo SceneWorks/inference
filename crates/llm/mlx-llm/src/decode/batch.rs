@@ -8,7 +8,8 @@
 //! The host-side policy (admission, per-sequence stop/length retirement) is the backend-neutral
 //! [`core_llm::Scheduler`]; this module owns only the MLX tensors that policy drives. The batch is
 //! assembled, **left-padded** to a common width, prefilled together, and decoded in lockstep;
-//! finished sequences are retired and the cache compacted ([`KvCache::retain_sequences`]) so the next
+//! finished sequences are retired and the cache compacted
+//! ([`crate::primitives::KvCache::retain_sequences`]) so the next
 //! step runs a smaller batch.
 //!
 //! ## Why outputs match batch-1
