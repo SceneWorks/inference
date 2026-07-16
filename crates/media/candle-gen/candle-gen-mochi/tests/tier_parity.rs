@@ -99,13 +99,12 @@ fn tier_forward_parity(tier: &str, expect_bits: Option<i32>, peak_bar: f32, mean
     let vb = load_transformer_var_builder(&tier_dir, DIT_DTYPE, &device).expect("load tier DiT");
     let model = MochiTransformer3DModel::new(vb, &cfg, &device).expect("build tier DiT");
 
+    let hidden = g.require("hidden_states").unwrap(); // [2, 12, 2, 8, 8]
+    let enc = g.require("encoder_hidden_states").unwrap(); // [2, 256, 4096] raw T5
+    let timestep = g.require("timestep").unwrap(); // [2]
+    let enc_mask = g.require("encoder_attention_mask").unwrap(); // [2, 256]
     let got = model
-        .forward(
-            g.require("hidden_states").unwrap(),          // [2, 12, 2, 8, 8]
-            g.require("encoder_hidden_states").unwrap(),  // [2, 256, 4096] raw T5
-            g.require("timestep").unwrap(),               // [2]
-            g.require("encoder_attention_mask").unwrap(), // [2, 256]
-        )
+        .forward(&hidden, &enc, &timestep, &enc_mask)
         .expect("tier DiT forward");
     let want = g.require("noise_pred").unwrap();
     assert_eq!(got.dims(), want.dims(), "noise_pred shape");
@@ -119,8 +118,8 @@ fn tier_forward_parity(tier: &str, expect_bits: Option<i32>, peak_bar: f32, mean
         "{tier}: non-finite velocity (a structural break, not quant loss)"
     );
 
-    let pr = peak_rel(&got, want);
-    let mr = mean_rel(&got, want);
+    let pr = peak_rel(&got, &want);
+    let mr = mean_rel(&got, &want);
     eprintln!("[{tier} tier] noise_pred vs bf16 golden — peak_rel={pr:.3e} mean_rel={mr:.3e}");
     assert!(
         pr < peak_bar,
