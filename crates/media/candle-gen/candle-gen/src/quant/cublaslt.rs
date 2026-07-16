@@ -1665,7 +1665,9 @@ pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, NVFP4_K_ALIGN};
 ///    catastrophically slow, and silently so. F-121 / sc-11208 settled that this must surface as a typed
 ///    error at **load** (where `?` is available) instead of an `.expect()` panic — or, worse, a silent
 ///    collapse — on the first sampler forward. So [`Self::new`] propagates a handle failure and
-///    [`handle_for`](Self::handle_for) returns a `Result`.
+///    `handle_for` returns a `Result`. (Plain backticks, not an intra-doc link: `handle_for` is
+///    cuda-gated, and this type is not — a link would break the non-cuda rustdoc lane, the sc-12275
+///    class of rot.)
 ///
 /// # Contract
 ///
