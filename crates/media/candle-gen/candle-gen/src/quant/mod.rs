@@ -91,8 +91,8 @@ pub use repack::{
 pub use cublaslt::{CublasLt, DevNvfp4, NVFP4_K_ALIGN};
 pub use cublaslt::{
     quantize_activation_fp8, quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
-    quantize_weight_int8_per_channel, PerChannelInt8Weight, QuantizedActivation, F8E4M3_MAX,
-    I8_MAX,
+    quantize_weight_int8_per_channel, Int8Context, PerChannelInt8Weight, QuantizedActivation,
+    F8E4M3_MAX, I8_MAX,
 };
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};

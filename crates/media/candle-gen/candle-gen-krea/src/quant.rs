@@ -32,7 +32,7 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
-use candle_gen::quant::{self as shared, AdaptLinear};
+use candle_gen::quant::{self as shared, AdaptLinear, Int8Context};
 
 /// A Linear projection that is **residual-capable** (dense or MLX-packed base + optional forward-time
 /// additive LoRA/LoKr residuals — the shared [`candle_gen::quant::AdaptLinear`], sc-11105) or
@@ -201,12 +201,40 @@ impl QLinear {
     /// the CPU-resident codes' device — so a normal CUDA render takes the int8 IGEMM path (byte-identical
     /// to the pre-eager lazy build, which staged onto the activation's device);
     /// `Int8Linear::from_per_channel_parts` stages the CPU codes onto that device.
+    ///
+    /// **Builds a private cuBLASLt handle for this one projection** — and its eager 32 MiB workspace.
+    /// Correct for a one-off projection or a test; **a trunk loader must use [`Self::convrot_int8_in`]**
+    /// with one shared [`Int8Context`], or it pays 32 MiB *per projection* — the sc-12301 defect
+    /// (~224 int8 projections on a ConvRot DiT ⇒ ~7 GiB of duplicated scratch, none of it weight bytes).
     pub fn convrot_int8(
         w_i8: Tensor,
         scale: Vec<f32>,
         group_size: usize,
         bias: Option<Tensor>,
         device: &Device,
+    ) -> Result<Self> {
+        // A private context for this one projection: `Int8Context::new` is `none()` off CUDA and
+        // propagates a handle failure as the F-121 typed error on it — exactly what the bare
+        // `CublasLt::new(device)?` here used to do.
+        let ctx = Int8Context::new(device)?;
+        Self::convrot_int8_in(w_i8, scale, group_size, bias, device, &ctx)
+    }
+
+    /// [`Self::convrot_int8`] sharing an existing per-device [`Int8Context`] — **the constructor a trunk
+    /// loader wants** (sc-12301). Every projection built against one context shares its single cuBLASLt
+    /// handle, so the eager 32 MiB workspace is paid once per device instead of once per projection.
+    ///
+    /// `ctx` must be bound to `device` (guarded by `Int8Context::handle_for` — a hazard new to sharing,
+    /// since a per-layer handle could never be bound to the wrong device), and must be non-empty when
+    /// `device` is CUDA. Both violations are typed errors at load, preserving F-121 / sc-11208: the int8
+    /// lane has no fallback worth taking silently.
+    pub fn convrot_int8_in(
+        w_i8: Tensor,
+        scale: Vec<f32>,
+        group_size: usize,
+        bias: Option<Tensor>,
+        device: &Device,
+        ctx: &Int8Context,
     ) -> Result<Self> {
         let (n, k) = w_i8.dims2()?;
         if scale.len() != n {
@@ -222,26 +250,32 @@ impl QLinear {
         }
         // Build the cuBLASLt IGEMM leg eagerly on the model's resident COMPUTE device (F-121 /
         // sc-11208) so a cublasLt init failure is this typed error (where `?` is available), not an
-        // `.expect()` panic on the first sampler forward. Gated on `device.is_cuda()`, NOT
-        // `w_i8.device().is_cuda()`: the loader keeps the int8 codes on the CPU (VRAM), so gating on the
-        // codes' device would leave `lt` None on every real CUDA render and drop into a cross-device
-        // dequant-dense matmul. `from_per_channel_parts` stages the CPU codes onto `device`.
+        // `.expect()` panic on the first sampler forward. Eagerness is deliberate and preserved; what
+        // sc-12301 removed is the *per-projection* handle this used to build here (`CublasLt::new`, an
+        // eager 32 MiB workspace × ~224 projections). The handle now arrives from the caller's shared
+        // `Int8Context` — bound to one device, resolved once per trunk.
+        //
+        // Gated on `device.is_cuda()`, NOT `w_i8.device().is_cuda()`: the loader keeps the int8 codes on
+        // the CPU (VRAM), so gating on the codes' device would leave `lt` None on every real CUDA render
+        // and drop into a cross-device dequant-dense matmul. `from_per_channel_parts` stages the CPU
+        // codes onto `device`.
         #[cfg(feature = "cuda")]
         let lt = if device.is_cuda() {
-            let cublas = std::sync::Arc::new(candle_gen::quant::CublasLt::new(device)?);
             Some(std::sync::Arc::new(
                 candle_gen::quant::Int8Linear::from_per_channel_parts(
                     w_i8.clone(),
                     scale.clone(),
                     bias.clone(),
-                    cublas,
+                    ctx.handle_for(device)?.clone(),
                 )?,
             ))
         } else {
             None
         };
+        // Off cuda there is no IGEMM leg to build, so neither the compute device nor the (always empty)
+        // shared context is read — the forward takes its dequant-dense fallback.
         #[cfg(not(feature = "cuda"))]
-        let _ = device;
+        let (_, _) = (device, ctx);
         Ok(Self::ConvRotInt8(ConvRotInt8 {
             w_i8,
             scale,

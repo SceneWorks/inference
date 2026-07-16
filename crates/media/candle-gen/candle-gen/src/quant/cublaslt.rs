@@ -1637,3 +1637,135 @@ mod cuda_impl {
 
 #[cfg(feature = "cuda")]
 pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, NVFP4_K_ALIGN};
+
+/// **One `CublasLt` handle per device**, shared by every INT8 projection built against it (sc-12301)
+/// — the int8 twin of [`Nvfp4Context`](super::nvfp4_linear::Nvfp4Context).
+///
+/// # Why this exists
+///
+/// `CublasLt::new` eagerly allocates a `CublasLt::WORKSPACE` (32 MiB) buffer it holds for life, and
+/// nothing on the handle is per-layer (its caches are keyed by shape, or not at all — this module's own
+/// docs say *"a real integration caches one per device"*). `QLinear::convrot_int8` nevertheless built one
+/// **per projection**, so a ConvRot DiT's ~224 int8 projections carried ~7 GiB of duplicated scratch that
+/// a weights-only byte accounting cannot see. sc-12274 measured the identical defect on the NVFP4 lane at
+/// 32.00 MiB/handle and recovered 7.5 GiB by sharing; this is that fix for int8.
+///
+/// # Why it is not `Nvfp4Context`
+///
+/// Two deliberate differences, either of which would be a bug if copied across:
+///
+/// 1. **No capability floor here.** `Nvfp4Context::new` gates on `meets_nvfp4_floor` (sm_120) and drops
+///    the handle below it. The int8 lane's floor is **sm_89** (locked decision 7), enforced once at load
+///    by `candle_gen_krea::pipeline`'s `ensure_int8_floor` — which builds *this* context and reads the cap
+///    off its handle rather than discarding a throwaway probe. Gating on sm_120 here would wrongly deny
+///    int8 on every sm_89..sm_120 card.
+/// 2. **A missing handle is an error, not a fallback.** An absent NVFP4 handle simply means dequant→bf16,
+///    so `Nvfp4Context` returns [`none`](Self::none) rather than failing. INT8-ConvRot has no such lane:
+///    without the handle the forward drops to a cross-device dequant-dense matmul — correct but
+///    catastrophically slow, and silently so. F-121 / sc-11208 settled that this must surface as a typed
+///    error at **load** (where `?` is available) instead of an `.expect()` panic — or, worse, a silent
+///    collapse — on the first sampler forward. So [`Self::new`] propagates a handle failure and
+///    [`handle_for`](Self::handle_for) returns a `Result`.
+///
+/// # Contract
+///
+/// Cfg-neutral **by design** — a zero-sized type on a non-cuda build, so the `*_in` constructors have one
+/// signature everywhere. It lives here rather than beside `Int8Linear` because that module is cuda-only
+/// as a whole, while this one compiles everywhere with the handle gated
+/// inside. An **empty** context is the honest and correct state on a non-CUDA device (the CPU/Metal
+/// dequant-dense fallback is test-only); it is only an error to hand one to a projection *on CUDA*.
+///
+/// Safe to share across layers: every handle on a device already resolves to the same stream
+/// (`CublasLt::new` takes `device.cuda_stream()`), so sharing introduces no stream coupling that did not
+/// already exist. The one genuinely shared mutable resource is the 32 MiB workspace scratch, and a
+/// denoise is sequential on that one stream, so cuBLASLt serializes access to it — pinned bit-exact by
+/// `int8_linear_shares_one_cublaslt_workspace_across_layers`.
+#[derive(Clone, Default)]
+pub struct Int8Context {
+    #[cfg(feature = "cuda")]
+    inner: Option<Int8Ctx>,
+}
+
+/// The live half of an [`Int8Context`]: the shared handle + the device it is bound to (the binding is
+/// what [`Int8Context::handle_for`] checks — a hazard that only exists once handles are shared).
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+struct Int8Ctx {
+    lt: std::sync::Arc<CublasLt>,
+    device: Device,
+}
+
+impl Int8Context {
+    /// The **empty** context: no shared handle. Correct on any non-CUDA device, where the int8 legs are
+    /// `None` and the forward takes its dequant-dense fallback. What [`Self::new`] returns there.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Build **one** cuBLASLt handle for `device`, to be shared by every INT8 projection on it.
+    ///
+    /// A non-CUDA device (or a non-cuda build) yields [`Self::none`] — the fallback is the honest answer
+    /// there, not a failure. On a CUDA device a handle failure is propagated as a **typed error**
+    /// (F-121 / sc-11208): the int8 lane cannot run without it, and load time is where that must be said.
+    ///
+    /// Deliberately does **not** probe the sm_89 floor — see the [type docs](Self).
+    pub fn new(device: &Device) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        {
+            if device.is_cuda() {
+                return Ok(Self {
+                    inner: Some(Int8Ctx {
+                        lt: std::sync::Arc::new(CublasLt::new(device)?),
+                        device: device.clone(),
+                    }),
+                });
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = device;
+        Ok(Self::none())
+    }
+
+    /// True iff this context carries a live handle (i.e. projections built with it take the int8 IGEMM).
+    pub fn is_int8(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            return self.inner.is_some();
+        }
+        #[allow(unreachable_code)]
+        false
+    }
+
+    /// The shared handle, **iff** it is bound to `device`. Call only for a CUDA `device` — a projection
+    /// off CUDA has no int8 leg to build and must not ask.
+    ///
+    /// Both failures are typed errors rather than a silent `None`, because neither has a fallback worth
+    /// taking quietly (see the [type docs](Self)):
+    ///
+    /// * **No handle** — an empty context reached a CUDA projection.
+    /// * **Wrong device** — a context built on `cuda:0` handed to a projection on `cuda:1` would stage
+    ///   the int8 codes through the wrong device's stream. This hazard is **new to sharing**: a
+    ///   per-layer handle could never be bound to the wrong device.
+    #[cfg(feature = "cuda")]
+    pub fn handle_for(&self, device: &Device) -> Result<&std::sync::Arc<CublasLt>> {
+        let c = self.inner.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "[sc-12301] Int8Context: an empty context reached an int8 projection on {:?}. The int8 \
+                 lane has no fallback worth taking silently, so this is a typed error at load rather \
+                 than a quiet collapse to a cross-device dequant-dense matmul mid-render (F-121).",
+                device.location()
+            ))
+        })?;
+        if c.device.same_device(device) {
+            Ok(&c.lt)
+        } else {
+            Err(candle_core::Error::Msg(format!(
+                "[sc-12301] Int8Context: the shared cuBLASLt handle is bound to {:?} but this int8 \
+                 projection is on {:?}; staging its codes through the wrong device's stream would \
+                 corrupt the layer.",
+                c.device.location(),
+                device.location()
+            )))
+        }
+    }
+}
