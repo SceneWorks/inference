@@ -30,6 +30,9 @@ pub mod adapters;
 pub mod config;
 pub mod convert;
 pub mod loader;
+/// The NVFP4 precision seam for the Krea 2 DiT trunk (sc-12110, epic 11037) — the epic's SC#1/SC#2
+/// validation vehicle. See [`nvfp4_dit`].
+pub mod nvfp4_dit;
 pub mod pipeline;
 pub mod quant;
 pub mod schedule;
@@ -81,6 +84,11 @@ pub use control_provider::{
 // operation on them is crate-private, so exporting them would add two opaque, unusable types to this
 // crate's compatibility surface. (The mlx-gen-krea twins are exported because those carry public
 // methods; ours carry none.)
+// The NVFP4 seam (sc-12110): the plan/probe/report surface a validation harness drives.
+pub use nvfp4_dit::{
+    summarize, ActProbe, ActRecord, DitPlan, LayerRole, LayerSparsitySummary, Nvfp4Quant,
+    Nvfp4Report,
+};
 pub use pipeline::Components;
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder};

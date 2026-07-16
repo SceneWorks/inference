@@ -28,9 +28,10 @@ use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::quant::{
-    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, PackedConfig,
+    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Nvfp4Linear, PackedConfig,
 };
 
+use crate::nvfp4_dit::{DitPlan, Nvfp4Proj, Nvfp4Quant, ProbedProj};
 use crate::quant::{QEmbedding, QLinear};
 
 /// An mmaped component-directory of `.safetensors`, loading tensors at a fixed compute dtype.
@@ -552,6 +553,71 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     }
     // (3) Dense path unchanged.
     Ok(QLinear::dense(linear(w, base, bias)?))
+}
+
+/// [`linear_detect`] under an NVFP4 [`DitPlan`] (sc-12110, epic 11037) — the seam that lets the Krea
+/// trunk serve one projection through [`candle_gen::quant::Nvfp4Linear`] instead of its dense/packed
+/// baseline leg.
+///
+/// Three outcomes, in order:
+///
+/// 1. **NVFP4** (`plan.is_nvfp4()`): pack `{base}.weight` to NVFP4 and build an [`Nvfp4Linear`] at the
+///    activation precision the plan assigns this layer ([`DitPlan::act_for_layer`], which derives the
+///    [`crate::nvfp4_dit::LayerRole`] from the dotted key + the trunk's block count). Never fails on an
+///    ineligible device or shape — [`Nvfp4Linear`] resolves the `sm_120` capability gate itself and
+///    transparently serves dequant→bf16 (sc-11041), so this is safe to call on any backend.
+/// 2. **Probed baseline** (a probe attached, no NVFP4): the exact [`linear_detect`] leg, wrapped to
+///    record its input activation's outlier sparsity. This is how the partition gate measures the
+///    trunk's *unperturbed* real activations; the stamped precision is what the **shipping mixed policy
+///    would assign**, so a summary can cross measured-vs-assumed without re-deriving roles.
+/// 3. **Baseline**: [`linear_detect`], byte-unchanged.
+///
+/// # The NVFP4 arm requires a dense (bf16) tier — by design
+///
+/// NVFP4 is packed from the **bf16 master weight**, exactly as the offline packer (sc-11040) would.
+/// Packing from an already-quantized q4/q8 tier would measure NVFP4-of-Q4 — a double quantization whose
+/// error is not the format's, and which would quietly corrupt SC#2's like-for-like comparison (NVFP4 vs
+/// Q4, both from the same master). So a packed tier is a hard error here rather than a silent
+/// `get_dense_or_dequant` round-trip.
+pub fn linear_detect_planned(
+    w: &Weights,
+    base: &str,
+    bias: bool,
+    plan: &DitPlan,
+) -> Result<QLinear> {
+    if !plan.is_nvfp4() {
+        let inner = linear_detect(w, base, bias)?;
+        return Ok(match plan.probe() {
+            // The stamped precision is the SHIPPING policy's verdict, not this (baseline) plan's — the
+            // gate asks "does the class the policy assumed match the class the live model measures?".
+            Some(probe) => QLinear::Probed(ProbedProj::new(
+                inner,
+                base,
+                probe.clone(),
+                DitPlan::nvfp4(Nvfp4Quant::Mixed)
+                    .with_num_layers(plan.num_layers())
+                    .act_for_layer(base),
+            )),
+            None => inner,
+        });
+    }
+    if w.packed().is_some() {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "krea nvfp4: refusing to pack `{base}` from an already-quantized tier — NVFP4 must be \
+             packed from the bf16 master (else SC#2 compares NVFP4-of-Q4 against Q4). Load the bf16 \
+             snapshot for the NVFP4 lane."
+        )));
+    }
+    let act = plan.act_for_layer(base);
+    let weight = w.get(&format!("{base}.weight"))?;
+    let dense_bias = if bias {
+        Some(w.get(&format!("{base}.bias"))?)
+    } else {
+        None
+    };
+    let device = weight.device().clone();
+    let lin = Nvfp4Linear::from_dense(&weight, dense_bias, &device, act)?;
+    Ok(QLinear::Nvfp4(Nvfp4Proj::new(lin, base, plan, act)))
 }
 
 /// **Packed-detecting** [`QEmbedding`] loader (sc-9411): packed straight from the MLX triple when the
