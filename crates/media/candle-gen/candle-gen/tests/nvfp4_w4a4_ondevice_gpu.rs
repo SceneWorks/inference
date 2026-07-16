@@ -19,13 +19,19 @@
 //!    the benign→W4A4 / dense→W4A16 partition holds.
 //! 5. **Real Sana-1.6B DiT weight (`#[ignore]`, env-gated)** — if `SC11044_SANA_DIT_SAFETENSORS`
 //!    points at a Sana transformer shard, a real projection weight is quantized and run W4A4 vs bf16.
+//!
+//! Alongside (1), and deliberately **not** folded into it, sit the sc-12078 **byte-level tie gates**
+//! (`*_at_exact_ties`): crafted E4M3/E2M1 midpoints asserted at the raw emitted scale bytes / element
+//! nibbles against the canonical `e4m3_from_f32` / `e2m1_from_f32`, on both the fused and unfused
+//! quantize routes. Every rel-RMS gate above is blind to these — exact midpoints are measure-zero
+//! under random activations, so (1) reads 0.000000 while every tie is encoded wrong.
 
 #![cfg(feature = "cuda")]
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::quant::nvfp4::{e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor};
+use candle_gen::quant::nvfp4::{e2m1_from_f32, e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor, E2M1_LUT};
 use candle_gen::quant::{
-    ActPrecision, CublasLt, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity,
+    ActPrecision, CublasLt, DevNvfp4, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity,
 };
 use std::time::Instant;
 
@@ -136,14 +142,12 @@ fn nvfp4_w4a4_ondevice_activation_quant_matches_cpu_pack_ref() {
 /// (1b) **sc-12078 bit-faithfulness gate:** the FUSED activation quantizer produces the same FP4 GEMM
 /// output as (a) the CPU `Nvfp4Tensor::pack` reference and (b) the unfused on-device candle path.
 ///
-/// ⚠ **This test cannot see an E4M3 rounding tie** — exact midpoints are measure-zero under random
-/// activations, so it reported 0.000000 while the kernel was emitting the wrong byte for every tie. The
-/// byte-level gate is [`nvfp4_fused_e4m3_block_scale_bytes_match_cpu_at_exact_ties`]; keep both.
-///
-/// Note the fused/unfused leg is only exact *away from ties*: the fused kernel now rounds RN-**even**
-/// (matching the canonical `e4m3_from_f32`), while the unfused candle path rounds via `.round()`
-/// (half-away-from-zero) and so is itself wrong at exact midpoints — a latent pre-existing defect in the
-/// sc-11044 path, which now survives only as the fused kernel's fallback.
+/// ⚠ **This test cannot see an E4M3 or E2M1 rounding tie** — exact midpoints are measure-zero under
+/// random activations, so it reported 0.000000 while both routes were emitting the wrong byte for every
+/// tie. The byte-level gates are [`nvfp4_fused_e4m3_block_scale_bytes_match_cpu_at_exact_ties`],
+/// [`nvfp4_unfused_e4m3_block_scale_bytes_match_cpu_at_exact_ties`] and
+/// [`nvfp4_e2m1_element_nibbles_match_cpu_at_exact_ties`]; keep all of them. This gate covers the bulk
+/// (non-tie) numerics that the crafted byte gates deliberately do not exercise.
 #[test]
 fn nvfp4_fused_activation_quant_matches_cpu_pack_ref() {
     let Some(dev) = nvfp4_device() else { return };
@@ -176,7 +180,7 @@ fn nvfp4_fused_activation_quant_matches_cpu_pack_ref() {
     assert!(rr_cpu < 0.02, "fused activation quant diverges from the CPU pack ref (rel-RMS {rr_cpu:.6})");
     assert!(
         rr_candle < 0.001,
-        "fused must match the unfused on-device recipe away from E4M3 ties (rel-RMS {rr_candle:.6})"
+        "fused must match the unfused on-device recipe (rel-RMS {rr_candle:.6})"
     );
 }
 
@@ -187,6 +191,68 @@ fn rowmajor_scale_offset(r: usize, blk: usize, sf_cols: usize) -> usize {
     let num_k_atoms = sf_cols / 4;
     let (k_atom, kc) = (blk / 4, blk % 4);
     (k_atom + num_k_atoms * m_atom) * 512 + (mr % 32) * 16 + (mr / 32) * 4 + kc
+}
+
+/// Exact E4M3 grid midpoints. e.g. 8.5 sits between 8.0 (mantissa 0 → even) and 9.0 (mantissa 1 →
+/// odd), so ties-to-even must yield 8.0 (0x50), NOT 9.0 (0x51). Covers the normal grid at several
+/// exponents and one subnormal.
+const E4M3_TIES: [f32; 6] = [
+    8.5,             // e=3, between 8.0 (even) and 9.0 (odd)      -> 8.0
+    9.5,             // e=3, between 9.0 (odd)  and 10.0 (even)    -> 10.0
+    17.0,            // e=4, between 16.0 (even) and 18.0 (odd)    -> 16.0
+    19.0,            // e=4, between 18.0 (odd)  and 20.0 (even)   -> 20.0
+    0.097_656_25,    // e=-4 (12.5 ULPs), between 12 and 13 ULPs   -> 12 ULPs
+    0.004_882_812_5, // subnormal, between 2 and 3 ULPs of 2^-9    -> 2 ULPs
+];
+
+/// The crafted E4M3-tie activation `[1, 16·(1+E4M3_TIES.len())]` + its `cols`.
+///
+/// A per-tensor amax of exactly **448** gives `global_scale = 448/(6·448) = 1/6`, hence `sf_real =
+/// block_amax / (6·global_scale) = block_amax` exactly — so each block's amax *is* the value handed to
+/// the E4M3 rounder and can be placed precisely on a midpoint. Block 0 carries the amax; block `i+1`
+/// carries tie `i`.
+fn e4m3_tie_activation(dev: &Device) -> (Tensor, usize) {
+    let cols = 16 * (1 + E4M3_TIES.len());
+    let mut data = vec![0f32; cols];
+    data[0] = 448.0; // block 0 carries the per-tensor amax => global_scale = 1/6
+    for (i, &t) in E4M3_TIES.iter().enumerate() {
+        data[16 * (i + 1)] = t; // block i+1 has amax == t
+    }
+    (Tensor::from_vec(data, (1, cols), dev).unwrap(), cols)
+}
+
+/// Assert a quantize route's emitted UE4M3 block-scale bytes equal the canonical ties-to-even
+/// [`e4m3_from_f32`] at every crafted midpoint. `route` labels the path in the failure output.
+fn assert_e4m3_tie_scale_bytes(lt: &CublasLt, stg: &DevNvfp4, route: &str) {
+    assert_eq!(
+        stg.global_scale(),
+        448.0f32 / (6.0f32 * 448.0f32),
+        "the construction relies on global_scale == 1/6 so that sf_real == block_amax"
+    );
+    let scales = stg.scales_to_host(lt).unwrap();
+    let sf_cols = (1 + E4M3_TIES.len()).div_ceil(4) * 4;
+    let mut bad = Vec::new();
+    for (i, &t) in E4M3_TIES.iter().enumerate() {
+        let got = scales[rowmajor_scale_offset(0, i + 1, sf_cols)];
+        let want = e4m3_from_f32(t); // the canonical encoder: RN, ties-to-even
+        eprintln!(
+            "[sc-12078] {route}: tie sf_real={t} -> 0x{got:02X} ({}) | CPU e4m3_from_f32 0x{want:02X} ({})",
+            e4m3_to_f32(got),
+            e4m3_to_f32(want)
+        );
+        if got != want {
+            bad.push(format!(
+                "sf_real={t}: {route} 0x{got:02X} ({}) != CPU 0x{want:02X} ({})",
+                e4m3_to_f32(got),
+                e4m3_to_f32(want)
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{route}: E4M3 block-scale bytes disagree with the canonical ties-to-even encoder at exact \
+         midpoints — each wrong byte rescales an entire 16-element block: {bad:?}"
+    );
 }
 
 /// (1c) **sc-12078 byte-exactness at E4M3 rounding TIES — the case a GEMM rel-RMS test cannot see.**
@@ -200,66 +266,131 @@ fn rowmajor_scale_offset(r: usize, blk: usize, sf_cols: usize) -> usize {
 /// Random activations never land on an exact midpoint (measure zero), so
 /// [`nvfp4_fused_activation_quant_matches_cpu_pack_ref`] happily reports rel-RMS 0.000000 while this is
 /// broken. **Byte-exactness has to be tested at the bytes, on crafted inputs.**
-///
-/// Construction: a per-tensor amax of exactly **448** gives `global_scale = 448/(6·448) = 1/6`, hence
-/// `sf_real = block_amax / (6·global_scale) = block_amax` exactly — so each block's amax *is* the value
-/// handed to the E4M3 rounder and can be placed precisely on a midpoint. Covers the normal grid at
-/// several exponents and one subnormal.
 #[test]
 fn nvfp4_fused_e4m3_block_scale_bytes_match_cpu_at_exact_ties() {
     let Some(dev) = nvfp4_device() else { return };
     let lt = CublasLt::new(&dev).unwrap();
-
-    // Exact midpoints. e.g. 8.5 sits between 8.0 (mantissa 0 → even) and 9.0 (mantissa 1 → odd), so
-    // ties-to-even must yield 8.0 (0x50), NOT 9.0 (0x51).
-    let ties: [f32; 6] = [
-        8.5,          // e=3, between 8.0 (even) and 9.0 (odd)      -> 8.0
-        9.5,          // e=3, between 9.0 (odd)  and 10.0 (even)    -> 10.0
-        17.0,         // e=4, between 16.0 (even) and 18.0 (odd)    -> 16.0
-        19.0,         // e=4, between 18.0 (odd)  and 20.0 (even)   -> 20.0
-        0.097_656_25, // e=-4 (12.5 ULPs), between 12 and 13 ULPs   -> 12 ULPs
-        0.004_882_812_5, // subnormal, between 2 and 3 ULPs of 2^-9 -> 2 ULPs
-    ];
-    let n_blocks = 1 + ties.len();
-    let cols = 16 * n_blocks;
-
-    let mut data = vec![0f32; cols];
-    data[0] = 448.0; // block 0 carries the per-tensor amax => global_scale = 1/6
-    for (i, &t) in ties.iter().enumerate() {
-        data[16 * (i + 1)] = t; // block i+1 has amax == t
-    }
-    let x = Tensor::from_vec(data, (1, cols), &dev).unwrap();
+    let (x, cols) = e4m3_tie_activation(&dev);
     let stg = lt.quantize_nvfp4_activation_fused(&x, cols).unwrap();
+    assert_e4m3_tie_scale_bytes(&lt, &stg, "fused kernel");
+}
+
+/// (1d) The **unfused** twin of [`nvfp4_fused_e4m3_block_scale_bytes_match_cpu_at_exact_ties`]
+/// (sc-12078 follow-up). The candle path had the identical defect: `e4m3_round_tensor` rounded
+/// `v/ulp` with candle's `.round()` (half-away-from-zero), so it emitted 0x51 (9.0) for `sf_real` 8.5
+/// where the canonical encoder emits 0x50 (8.0) — wrong at 4 of these 6 ties. candle has no RN-even
+/// round, so the tie is now derived explicitly; this gate pins that it agrees with `e4m3_from_f32` at
+/// the bytes. The unfused path is the fused kernel's nvrtc-unavailable fallback and must be *exactly*
+/// as correct — a fallback that silently rescales blocks is worse than no fallback.
+#[test]
+fn nvfp4_unfused_e4m3_block_scale_bytes_match_cpu_at_exact_ties() {
+    let Some(dev) = nvfp4_device() else { return };
+    let lt = CublasLt::new(&dev).unwrap();
+    let (x, cols) = e4m3_tie_activation(&dev);
+    let stg = lt.quantize_nvfp4_activation(&x, cols).unwrap();
+    assert_e4m3_tie_scale_bytes(&lt, &stg, "unfused candle path");
+}
+
+/// The exact E2M1 grid midpoints — the 7 gaps in `{0,.5,1,1.5,2,3,4,6}`. Ties-to-even sends each to
+/// its **even**-index neighbour: 0.25→0.0, 0.75→1.0, 1.25→1.0, 1.75→2.0, 2.5→2.0, 3.5→4.0, 5.0→4.0.
+const E2M1_TIES: [f32; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
+
+/// `global_scale` this construction pins: `336/(6·448) = 1/8`, an exact power of two.
+const E2M1_TIE_GLOBAL_SCALE: f32 = 0.125;
+
+/// The crafted E2M1-tie activation `[1, 32]` + its `cols`.
+///
+/// A tie only fires if `ratio = value / elem_scale` lands **exactly** on a midpoint, so `elem_scale`
+/// must be exactly a power of two — otherwise every crafted value drifts a few ULPs off the midpoint
+/// and the test silently measures nothing (it reads as "ties round up" whatever the code does).
+///
+/// The recipe's factor of 6 makes that delicate: `sf_real = block_amax / (6·global_scale)` and
+/// `elem_scale = block_scale · global_scale` cannot *both* be exact for an arbitrary amax. The way
+/// through is to let `sf_real` be inexact but land solidly inside one E4M3 grid cell, and pick a
+/// power-of-two `global_scale` so the *rounded* block scale times it is exact:
+///
+/// - per-tensor amax **336** ⟹ `global_scale = 336/(6·448) = 1/8` exactly (336·8 = 2688);
+/// - block 1's amax **6.0** ⟹ `sf_real = 6/(6·⅛) = 8.0` — mid-cell, nowhere near the 8.5 tie, so the
+///   E4M3 rounder returns the block scale **8.0 exactly** regardless of the last bit of its `log`/`exp`;
+/// - hence `elem_scale = 8.0 · ⅛ = 1.0` exactly, and `ratio == value`.
+///
+/// Block 0 just carries the per-tensor amax. All ties are < 6.0, so block 1's amax stays 6.0.
+fn e2m1_tie_activation(dev: &Device) -> (Tensor, usize) {
+    let cols = 32; // 2 blocks
+    let mut data = vec![0f32; cols];
+    data[0] = 336.0; // per-tensor amax -> global_scale = 1/8 exactly
+    data[16] = 6.0; // block 1 amax -> sf_real 8.0 -> block scale 8.0 -> elem_scale 1.0
+    for (i, &t) in E2M1_TIES.iter().enumerate() {
+        data[17 + i] = t; // +tie
+        data[24 + i] = -t; // -tie (sign in bit 3; magnitude rounds the same)
+    }
+    (Tensor::from_vec(data, (1, cols), dev).unwrap(), cols)
+}
+
+/// Assert a quantize route's emitted E2M1 nibbles equal the canonical ties-to-even [`e2m1_from_f32`]
+/// at every crafted midpoint, both signs.
+fn assert_e2m1_tie_nibbles(lt: &CublasLt, stg: &DevNvfp4, route: &str) {
+    // Both halves of `elem_scale = block_scale · global_scale == 1.0` are checked, not assumed. If
+    // either drifts, `ratio != value`, no crafted value sits on a midpoint any more, and the tie
+    // assertions below would quietly pass (or fail) for the wrong reason — which is exactly how the
+    // first cut of this test fooled itself.
     assert_eq!(
         stg.global_scale(),
-        448.0f32 / (6.0f32 * 448.0f32),
-        "the construction relies on global_scale == 1/6 so that sf_real == block_amax"
+        E2M1_TIE_GLOBAL_SCALE,
+        "{route}: the construction relies on global_scale == 1/8 so that elem_scale is exact"
     );
-
-    let scales = stg.scales_to_host(&lt).unwrap();
-    let sf_cols = n_blocks.div_ceil(4) * 4;
+    let sf_cols = 4; // 2 blocks padded to the 4-block SF atom
+    let block1_scale = stg.scales_to_host(lt).unwrap()[rowmajor_scale_offset(0, 1, sf_cols)];
+    assert_eq!(
+        (e4m3_to_f32(block1_scale) * E2M1_TIE_GLOBAL_SCALE, block1_scale),
+        (1.0, e4m3_from_f32(8.0)),
+        "{route}: the construction relies on block 1's scale being exactly 8.0 (0x50) so that \
+         elem_scale == 1.0 and ratio == value"
+    );
+    let packed = stg.packed_to_host(lt).unwrap();
+    // Row 0, row-major `[1, cols/2]`: even column = low nibble, odd column = high nibble.
+    let nibble = |c: usize| if c.is_multiple_of(2) { packed[c / 2] & 0x0F } else { packed[c / 2] >> 4 };
     let mut bad = Vec::new();
-    for (i, &t) in ties.iter().enumerate() {
-        let off = rowmajor_scale_offset(0, i + 1, sf_cols);
-        let got = scales[off];
-        let want = e4m3_from_f32(t); // the canonical encoder: RN, ties-to-even
-        eprintln!(
-            "[sc-12078] tie sf_real={t}: kernel 0x{got:02X} ({}) | CPU e4m3_from_f32 0x{want:02X} ({})",
-            e4m3_to_f32(got),
-            e4m3_to_f32(want)
-        );
-        if got != want {
-            bad.push(format!(
-                "sf_real={t}: kernel 0x{got:02X} ({}) != CPU 0x{want:02X} ({})",
-                e4m3_to_f32(got),
-                e4m3_to_f32(want)
-            ));
+    for (i, &t) in E2M1_TIES.iter().enumerate() {
+        for (c, v) in [(17 + i, t), (24 + i, -t)] {
+            let got = nibble(c);
+            let want = e2m1_from_f32(v); // the canonical encoder: RN, ties-to-even
+            eprintln!(
+                "[sc-12078] {route}: E2M1 tie ratio={v} -> 0x{got:X} ({}) | CPU e2m1_from_f32 0x{want:X} ({})",
+                E2M1_LUT[got as usize], E2M1_LUT[want as usize]
+            );
+            if got != want {
+                bad.push(format!(
+                    "ratio={v}: {route} 0x{got:X} ({}) != CPU 0x{want:X} ({})",
+                    E2M1_LUT[got as usize], E2M1_LUT[want as usize]
+                ));
+            }
         }
     }
     assert!(
         bad.is_empty(),
-        "fused kernel E4M3 block-scale bytes disagree with the canonical ties-to-even encoder at exact \
-         midpoints — each wrong byte rescales an entire 16-element block: {bad:?}"
+        "{route}: E2M1 element nibbles disagree with the canonical ties-to-even encoder at exact \
+         midpoints: {bad:?}"
+    );
+}
+
+/// (1e) The E2M1 analogue of the E4M3 tie gate (sc-12078 follow-up), for **both** quantize routes.
+///
+/// `e2m1_code_tensor` counted `mag.ge(mid)` at all 7 midpoints, which rounds every tie **UP**, whereas
+/// the canonical [`e2m1_from_f32`] is ties-to-even — wrong at 4 of the 7 (0.25, 1.25, 2.5, 5.0). Same
+/// measure-zero invisibility as the E4M3 defect: a GEMM rel-RMS gate never sees it. The fused kernel's
+/// `e2m1_code` already spells the thresholds out (`<=`/`<`) and is the reference; running both routes
+/// through one assertion pins them to the same encoder and to each other.
+#[test]
+fn nvfp4_e2m1_element_nibbles_match_cpu_at_exact_ties() {
+    let Some(dev) = nvfp4_device() else { return };
+    let lt = CublasLt::new(&dev).unwrap();
+    let (x, cols) = e2m1_tie_activation(&dev);
+    assert_e2m1_tie_nibbles(&lt, &lt.quantize_nvfp4_activation(&x, cols).unwrap(), "unfused candle path");
+    assert_e2m1_tie_nibbles(
+        &lt,
+        &lt.quantize_nvfp4_activation_fused(&x, cols).unwrap(),
+        "fused kernel",
     );
 }
 

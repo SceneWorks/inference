@@ -1386,21 +1386,36 @@ mod cuda_impl {
     const E4M3_MAXV: f64 = 448.0;
 
     /// Round a non-negative tensor onto the OCP E4M3 grid, returning the **decoded** value (nearest
-    /// representable E4M3, saturating at 448). `q = round(v / ulp) · ulp` with `ulp = 2^(e-3)` and
+    /// representable E4M3, saturating at 448). `q = rn_even(v / ulp) · ulp` with `ulp = 2^(e-3)` and
     /// `e = floor(log2(max(v, 2^-6)))` — a single formula that covers both the normal grid (ULP
     /// `2^e/8` in `[2^e, 2^{e+1}]`) and the subnormal grid (`e` clamped to `-6` -> ULP `2^-9`).
+    ///
+    /// **Ties MUST round to even.** The canonical encoder
+    /// [`e4m3_from_f32`](super::super::nvfp4::e4m3_from_f32) tie-breaks on
+    /// `code.is_multiple_of(2)`, and an even E4M3 byte is an even mantissa LSB. candle's `.round()`
+    /// rounds halves **away from zero** and is therefore wrong here: it emitted 0x51 (9.0) for
+    /// `sf_real` 8.5 where the CPU emits 0x50 (8.0), rescaling that whole 16-element block. candle's
+    /// tensor API has no RN-even round, so the tie is derived explicitly — `t.round()` away from a
+    /// tie, and `floor(t) + (floor(t) mod 2)` on one (which is `floor(t)` when it is already even and
+    /// `floor(t)+1`, also even, when it is odd). This is exactly the fused kernel's `__float2int_rn`
+    /// ([`NVFP4_QUANT_CU`], sc-12078) expressed in candle ops. Guarded by
+    /// `nvfp4_unfused_e4m3_block_scale_bytes_match_cpu_at_exact_ties` — the GEMM rel-RMS gate cannot
+    /// see this (exact midpoints are measure-zero under random activations, so it reads 0.000000
+    /// throughout).
     fn e4m3_round_tensor(v: &Tensor) -> Result<Tensor> {
         let v = v.clamp(0.0, E4M3_MAXV)?;
         // Exponent from a floor of clamped v (avoid log2(0); subnormals floor to -6).
         let vc = v.clamp(E4M3_MIN_NORMAL, E4M3_MAXV)?;
         let e = vc.log()?.affine(1.0 / LN2, 0.0)?.floor()?; // floor(log2(vc)) in [-6, 8]
         let ulp = e.affine(1.0, -3.0)?.affine(LN2, 0.0)?.exp()?; // 2^(e-3)
-        let q = v
-            .broadcast_div(&ulp)?
-            .round()?
-            .broadcast_mul(&ulp)?
-            .clamp(0.0, E4M3_MAXV)?;
-        Ok(q)
+        let t = v.broadcast_div(&ulp)?; // v ≥ 0 ⟹ t ∈ [0, 16); ulp is a power of two, so a tie is exact
+        let fl = t.floor()?;
+        let is_tie = t.sub(&fl)?.eq(0.5)?;
+        // floor(t) mod 2, as `fl - 2·floor(fl/2)`: 0 when fl is even, 1 when odd. `fl ≤ 15` here, so
+        // every step is exact in f32.
+        let parity = fl.sub(&fl.affine(0.5, 0.0)?.floor()?.affine(2.0, 0.0)?)?;
+        let rn_even = is_tie.where_cond(&fl.add(&parity)?, &t.round()?)?;
+        rn_even.broadcast_mul(&ulp)?.clamp(0.0, E4M3_MAXV)
     }
 
     /// The OCP E4M3 **byte** (0..=254) whose decode equals the on-grid value `q` (as produced by
@@ -1426,16 +1441,28 @@ mod cuda_impl {
     }
 
     /// Nearest-E2M1 codes (0..=15, sign in bit 3) for a signed ratio tensor `value / block_scale`.
-    /// Magnitude index = count of the 7 grid midpoints the magnitude reaches (`{0,.5,1,1.5,2,3,4,6}`
-    /// -> midpoints `{.25,.75,1.25,1.75,2.5,3.5,5}`); saturates at index 7 (±6). Matches
-    /// `e2m1_from_f32`'s nearest-magnitude choice (ties, a measure-zero event on real activations,
-    /// round up here vs the packer's round-to-even — negligible for rel-RMS).
+    /// Magnitude index = count of the 7 grid midpoints the magnitude passes (`{0,.5,1,1.5,2,3,4,6}`
+    /// -> midpoints `{.25,.75,1.25,1.75,2.5,3.5,5}`); saturates at index 7 (±6).
+    ///
+    /// **Ties round to even**, matching the canonical
+    /// [`e2m1_from_f32`](super::super::nvfp4::e2m1_from_f32) (which tie-breaks on
+    /// `i.is_multiple_of(2)` over the magnitude table — an even index is an even mantissa LSB). This
+    /// is why the comparison alternates: midpoint `i` sits between magnitude index `i` and `i+1`, so
+    /// for an **even** `i` the tie keeps the lower index and the magnitude must be *strictly* past the
+    /// midpoint to advance (`>`), while for an **odd** `i` the tie advances onto the even index `i+1`
+    /// (`>=`). A uniform `>=` — as this used before — rounds every tie UP, which is wrong at 4 of the
+    /// 7 midpoints (0.25, 1.25, 2.5, 5.0) and rescales the affected element. Same thresholds as the
+    /// fused kernel's `e2m1_code` ([`NVFP4_QUANT_CU`], sc-12078), which spells them as `<=`/`<`.
+    /// Guarded by `nvfp4_e2m1_element_nibbles_match_cpu_at_exact_ties` (which runs both routes through
+    /// one assertion); like the E4M3 tie defect this is invisible to a GEMM rel-RMS gate (exact
+    /// midpoints are measure-zero).
     fn e2m1_code_tensor(ratio: &Tensor) -> Result<Tensor> {
         let mag = ratio.abs()?;
-        let mids = [0.25f64, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
-        let mut idx = mag.ge(mids[0])?.to_dtype(DType::F32)?;
-        for &t in &mids[1..] {
-            idx = idx.add(&mag.ge(t)?.to_dtype(DType::F32)?)?;
+        const MIDS: [f64; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
+        let mut idx = mag.zeros_like()?;
+        for (i, &mid) in MIDS.iter().enumerate() {
+            let past = if i.is_multiple_of(2) { mag.gt(mid)? } else { mag.ge(mid)? };
+            idx = idx.add(&past.to_dtype(DType::F32)?)?;
         }
         // sign bit (8) where negative; -0.0 (sign set, magnitude 0) decodes to 0.0 so is harmless.
         let sign = ratio.lt(0.0)?.to_dtype(DType::F32)?.affine(8.0, 0.0)?;
