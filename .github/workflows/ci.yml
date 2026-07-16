@@ -117,7 +117,10 @@ jobs:
         run: cargo clean
       - name: Rustdoc Candle generation packages
         # Public provider docs are link-heavy API surface. Keep their intra-doc graph valid on the
-        # same CPU-only package set as this lane; CUDA/Metal-specific docs remain platform-gated.
+        # same CPU-only package set as this lane. This runner has no CUDA toolkit, so it cannot pass
+        # --features cuda and does not check `#[cfg(feature = "cuda")]` docs; the `windows-cuda-check`
+        # lane runs this same package set WITH the feature to cover them (sc-12275 — they had rotted
+        # while nothing checked them). Metal/MLX docs remain genuinely ungated: no lane documents them.
         # No reclaim step follows on purpose: unlike Clippy's --all-targets tree, this --no-deps doc
         # build's dependency artifacts are exactly the ones the lib/test profile below reuses (so the
         # test step skips recompiling the provider graph), and they stay well under the reclaimed
@@ -250,6 +253,30 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda --no-run
+      # The doc twin of the compile check above, and it exists for the same reason (sc-12275). The
+      # hosted rustdoc gate runs the identical package set but CANNOT pass --features cuda (no CUDA
+      # toolkit), so `#[cfg(feature = "cuda")]` doc comments — the whole cuBLASLt/NVFP4 surface — were
+      # documented by nothing. They rotted exactly as you would predict: two broken intra-doc links
+      # accrued in `quant/cublaslt.rs` (a `super::` that needed `super::super::` from inside the nested
+      # `cuda_impl`, and a public doc linking a private item), both invisible to every lane until
+      # someone ran the doc build by hand. Same `-p "candle-gen*"` set as the hosted gate on purpose:
+      # the two together cover that doc graph in BOTH feature configurations, which is the property
+      # worth having.
+      #
+      # NOT extended to `candle-llm`/`runtime-cuda` despite the compile step above covering them:
+      # candle-llm currently has 24 rustdoc errors on a plain CPU build — it has never been
+      # rustdoc-gated at all, since the hosted gate is `candle-gen*`-only — so adding it here would
+      # gate on a red build. Filed separately rather than fixed as a rider on this (sc-12275).
+      #
+      # No GPU required, same as the compile step: rustdoc builds the dep graph (hence vcvars + nvcc)
+      # but creates no CUDA context and allocates no VRAM, so it is safe on the shared self-hosted rig.
+      - name: Rustdoc Candle CUDA packages (no GPU required)
+        shell: cmd
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          call "%VCVARS%"
+          cargo doc --locked --no-deps -p "candle-gen*" --features cuda
 
   windows-cuda:
     name: Candle CUDA packages (Windows, manual)

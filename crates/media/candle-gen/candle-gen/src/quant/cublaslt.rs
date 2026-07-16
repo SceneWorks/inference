@@ -882,7 +882,7 @@ mod cuda_impl {
         ///
         /// This is the exact `X·Wᵀ` compute for a per-channel-quantized int8 weight. For a ConvRot
         /// checkpoint the stored `W_i8` is the *rotated* weight `W·R`, so the consume path applies the
-        /// matching online activation rotation `RHT(x)` ([`super::convrot`], sc-9601) before this call,
+        /// matching online activation rotation `RHT(x)` ([`super::super::convrot`], sc-9601) before this call,
         /// making `RHT(x)·(W·R)ᵀ = x·Wᵀ`. The compute here is rotation-agnostic and correct either way.
         pub fn matmul_int8_per_channel(
             &self,
@@ -1326,7 +1326,8 @@ mod cuda_impl {
         }
 
         /// Copy the staged **UE4M3 block-scale bytes** back to the host — the swizzled buffer exactly as
-        /// cuBLASLt reads it (see [`cublaslt_scale_layout`] for the offset of a logical `(row, block)`).
+        /// cuBLASLt reads it (see `cublaslt_scale_layout`, private to this module, for the offset of a
+        /// logical `(row, block)`).
         ///
         /// Byte-level test/debug support, deliberately not on any hot path. It exists because an
         /// end-to-end GEMM rel-RMS check **cannot** see a single wrong scale byte at an exact E4M3
