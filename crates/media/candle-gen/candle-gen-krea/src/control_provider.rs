@@ -21,12 +21,12 @@
 //! bf16. `generate` takes `&self` so one load serves many poses; the residual clamp is a fixed recipe
 //! constant set at load, not a knob.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{AdapterSpec, Image, Progress, Quant};
+use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, Progress, Quant};
 use candle_gen::train::flow_match::component_vb;
 use candle_gen::{CandleError, Result};
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
@@ -84,6 +84,12 @@ pub struct Krea2ControlPaths {
     /// sharper lever the worker owns by choosing smaller render dims; it needs no knob here. On a card
     /// with headroom this stays `false`.
     pub chunk_attention: bool,
+    /// Component residency for this bespoke provider. [`OffloadPolicy::Resident`] keeps Qwen3-VL,
+    /// DiT, control branch, and both VAE halves warm. [`OffloadPolicy::Sequential`] loads and encodes
+    /// Qwen3-VL first, drops it, then loads the DiT + control branch + VAE bundle for the render. The
+    /// worker selects this directly from the control-lane fit gate; this provider is intentionally not
+    /// registered, so there is no capability bit to consult.
+    pub offload_policy: OffloadPolicy,
 }
 
 /// One Krea 2 strict-pose control request. Krea 2 Turbo is CFG-free (no guidance / negative pass) —
@@ -128,126 +134,158 @@ impl Default for Krea2ControlRequest {
     }
 }
 
-/// A loaded Krea 2 control model: the Qwen3-VL text encoder + the frozen composable Turbo DiT + the
-/// trained control branch + the Qwen-Image VAE (decode) with its encoder (control-image encode). The
-/// DiT and (on request) the control branch keep a packed q4/q8 footprint in VRAM (dequant-on-forward);
-/// one load serves many poses.
-pub struct Krea2Control {
-    device: Device,
+/// The phase-A Qwen3-VL prompt encoder. Under sequential residency this value drops before any heavy
+/// component is loaded.
+struct Krea2ControlText {
     tokenizer: KreaTokenizer,
     te: KreaTextEncoder,
+}
+
+impl Krea2ControlText {
+    fn encode(&self, req: &Krea2ControlRequest) -> Result<Tensor> {
+        maybe_apply_style_gain(
+            self.te
+                .forward(&self.tokenizer.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?,
+            req.text_style_gain,
+        )
+    }
+}
+
+/// The heavy render phase: composable Turbo DiT + pose-control branch + both Qwen-Image VAE halves.
+/// The control branch deliberately stays beside the DiT rather than spanning the two phases.
+struct Krea2ControlHeavy {
     dit: KreaTrainDit,
     branch: ControlBranch,
     vae: QwenVae,
     vae_encoder: QwenVaeEncoder,
 }
 
+/// A loaded Krea 2 control model whose residency value exclusively owns either the warm text/heavy pair
+/// or the deferred phase loaders. Sequential bounds peak at `max(Qwen3-VL, DiT + branch + VAE)`.
+pub struct Krea2Control {
+    device: Device,
+    residency: candle_gen::Residency<Krea2ControlText, Krea2ControlHeavy>,
+}
+
 impl Krea2Control {
-    /// Load the frozen Turbo base (bf16 composable DiT + f32 TE), the trained control-branch overlay
-    /// (frozen, RMS-clamped at the recipe τ), and the Qwen-Image VAE with its encoder. The TE/DiT
-    /// weight readers are dropped after construction; the model holds only the built components.
+    /// Build the selected component residency. Both policies use the same phase loaders; Resident loads
+    /// both now, while Sequential defers them until the shared seam runs inside `generate`.
     pub fn load(paths: &Krea2ControlPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let cfg = Krea2Config::from_snapshot(&paths.root)?;
-
-        // Text encoder (f32, exactly the pipeline's) — Qwen3-VL language tower.
-        let tokenizer = KreaTokenizer::from_snapshot(&paths.root, &device)?;
-        let te_cfg = KreaTeConfig::from_snapshot(&paths.root)?;
-        let te_w = Weights::from_dir(&paths.root.join("text_encoder"), &device, DType::F32)?;
-        let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
-        drop(te_w);
-
-        // Frozen base DiT (bf16, composable — the train-time forward the branch was trained against).
-        let dit_w = Weights::from_dir(&paths.root.join("transformer"), &device, DType::BF16)?;
-        // Control INFERENCE: keep a packed q4/q8 base packed in VRAM (dequant-on-forward) so a small-card
-        // user gets the footprint they installed the tier for, not a dense-bf16 balloon (sc-11727). On a
-        // dense/bf16 tier this is identical to `load`.
-        let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
-        drop(dit_w);
-        // User LoRA/LoKr adapters ride additively on the frozen base DiT (sc-11720): the base stays an
-        // unmutated mmap and each adapter is pushed as a forward-time residual, so pose lock (the control
-        // branch, untouched below) is preserved while a character/style LoRA reshapes the subject. Empty
-        // ⇒ the stock build — no residual, so control_scale=0 stays byte-identical to base.
-        if !paths.adapters.is_empty() {
-            crate::adapters::install_additive(&mut dit, &paths.adapters)?;
-        }
-
-        // Trained control branch. When a branch quant is requested (small-card load, sc-11743) each
-        // matmul leaf is folded to a packed q4/q8 QLinear straight onto the GPU (dequant-on-forward) so
-        // the ~6.6 GB dense branch never lands in VRAM; otherwise the bf16 branch loads as before.
-        // Freeze (detach weight reads so the sampler builds no autograd graph — a no-op for the
-        // already-frozen quantized load) and set the fixed recipe residual clamp, identical to train
-        // time (S0: τ = 0.15) — the clamp bounds each injection regardless of projection quant.
-        let mut branch = match paths.branch_quant {
-            Some(quant) => {
-                ControlBranch::from_checkpoint_quantized(&paths.control, &cfg, &device, quant)?
-            }
-            None => ControlBranch::from_checkpoint(&paths.control, &cfg, &device)?,
-        };
-        branch.freeze();
-        branch.set_residual_clamp(Some(DEFAULT_RESIDUAL_CLAMP));
-
-        // Activation-chunking rung (sc-11745): the fit-gate flips this on only when the predicted
-        // *denoise* peak exceeds free VRAM. It bounds each single-stream block's joint `[ctx; img]`
-        // attention scratch by lowering the scores budget from the i32 guard to KREA_ATTN_CHUNK_BUDGET,
-        // forcing sc-6217-style query-row chunking (numerically identical, a small speed cost) on both
-        // the base stack and the branch. Off (the default) = unchunked at the i32 guard, full speed —
-        // the big-card path. Applied at load, uniformly to this model's denoise (the load-time twin of
-        // the branch_quant rung); a resolution cap is the worker's separate lever (smaller render dims).
-        if paths.chunk_attention {
-            dit.set_attention_budget(KREA_ATTN_CHUNK_BUDGET);
-            branch.set_attention_budget(KREA_ATTN_CHUNK_BUDGET);
-        }
-
-        // VAE decode (final latent → pixels) + encoder (pose skeleton → control latent).
-        let vae = load_vae(&paths.root, &device)?;
-        let vae_encoder = QwenVaeEncoder::new(component_vb(
-            &paths.root,
-            "vae",
-            &device,
-            DType::F32,
-            "krea control infer",
-        )?)?;
-
-        Ok(Self {
-            device,
-            tokenizer,
-            te,
-            dit,
-            branch,
-            vae,
-            vae_encoder,
-        })
+        let policy = candle_gen::effective_offload_policy(paths.offload_policy);
+        let text_root = paths.root.clone();
+        let text_device = device.clone();
+        let heavy_root = paths.root.clone();
+        let heavy_control = paths.control.clone();
+        let heavy_adapters = paths.adapters.clone();
+        let heavy_branch_quant = paths.branch_quant;
+        let heavy_chunk_attention = paths.chunk_attention;
+        let heavy_device = device.clone();
+        let residency = candle_gen::Residency::from_policy(
+            policy,
+            move || load_control_text(&text_root, &text_device),
+            move |_use_pid| {
+                load_control_heavy(
+                    &heavy_root,
+                    &heavy_control,
+                    &heavy_adapters,
+                    heavy_branch_quant,
+                    heavy_chunk_attention,
+                    &heavy_device,
+                )
+            },
+        )?;
+        Ok(Self { device, residency })
     }
 
-    /// Generate one strict-pose-conditioned image from a rendered OpenPose skeleton. The `control_image`
-    /// must already be at the request's `width`×`height` — the worker driver renders the skeleton
-    /// (square-canonical, the same `openpose_skeleton` renderer training used) at exactly the provider's
-    /// output dims, so no resize happens here.
+    /// Generate one strict-pose-conditioned image from a rendered OpenPose skeleton. The control image
+    /// must already match the request dimensions; the worker renders it at those exact dimensions.
     pub fn generate(
         &self,
         req: &Krea2ControlRequest,
         control_image: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        if req.cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
         validate_request(req)?;
+        self.residency.run(
+            &req.cancel,
+            false,
+            on_progress,
+            |text| text.encode(req),
+            |heavy, context, on_progress| {
+                heavy.render(&self.device, req, control_image, context, on_progress)
+            },
+        )
+    }
+}
 
-        // Prompt embeds + control latent are seed-independent: encode once. The optional "text style"
-        // tap-reweight gain (sc-12009) reweights the taps of this single CFG-free context; `None`/g≈1
-        // is a no-op, so a plain control render is byte-identical.
-        let context = maybe_apply_style_gain(
-            self.te
-                .forward(&self.tokenizer.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?,
-            req.text_style_gain,
-        )?;
-        let ctrl_nchw = control_image_to_nchw(control_image, req.width, req.height, &self.device)?;
+/// Load the Qwen3-VL text phase exactly once per resident model or once per sequential generation.
+fn load_control_text(root: &Path, device: &Device) -> Result<Krea2ControlText> {
+    let tokenizer = KreaTokenizer::from_snapshot(root, device)?;
+    let te_cfg = KreaTeConfig::from_snapshot(root)?;
+    let te_w = Weights::from_dir(&root.join("text_encoder"), device, DType::F32)?;
+    let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
+    drop(te_w);
+    Ok(Krea2ControlText { tokenizer, te })
+}
+
+/// Load the render phase after the text value has dropped on the sequential path.
+fn load_control_heavy(
+    root: &Path,
+    control: &Path,
+    adapters: &[AdapterSpec],
+    branch_quant: Option<Quant>,
+    chunk_attention: bool,
+    device: &Device,
+) -> Result<Krea2ControlHeavy> {
+    let cfg = Krea2Config::from_snapshot(root)?;
+    let dit_w = Weights::from_dir(&root.join("transformer"), device, DType::BF16)?;
+    let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
+    drop(dit_w);
+    if !adapters.is_empty() {
+        crate::adapters::install_additive(&mut dit, adapters)?;
+    }
+
+    let mut branch = match branch_quant {
+        Some(quant) => ControlBranch::from_checkpoint_quantized(control, &cfg, device, quant)?,
+        None => ControlBranch::from_checkpoint(control, &cfg, device)?,
+    };
+    branch.freeze();
+    branch.set_residual_clamp(Some(DEFAULT_RESIDUAL_CLAMP));
+    if chunk_attention {
+        dit.set_attention_budget(KREA_ATTN_CHUNK_BUDGET);
+        branch.set_attention_budget(KREA_ATTN_CHUNK_BUDGET);
+    }
+
+    let vae = load_vae(root, device)?;
+    let vae_encoder = QwenVaeEncoder::new(component_vb(
+        root,
+        "vae",
+        device,
+        DType::F32,
+        "krea control infer",
+    )?)?;
+    Ok(Krea2ControlHeavy {
+        dit,
+        branch,
+        vae,
+        vae_encoder,
+    })
+}
+
+impl Krea2ControlHeavy {
+    fn render(
+        &self,
+        device: &Device,
+        req: &Krea2ControlRequest,
+        control_image: &Image,
+        context: Tensor,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let ctrl_nchw = control_image_to_nchw(control_image, req.width, req.height, device)?;
         let ctrl_latent = self.vae_encoder.encode(&ctrl_nchw)?;
         let scale = req.control_scale as f64;
 
-        // Seeded initial noise — the pipeline's CPU-RNG discipline (sc-3673).
         let (lat_h, lat_w) = (
             (req.height / SPATIAL_SCALE) as usize,
             (req.width / SPATIAL_SCALE) as usize,
@@ -255,10 +293,8 @@ impl Krea2Control {
         let mut rng = StdRng::seed_from_u64(req.seed);
         let noise = candle_gen::seeded_normal_vec(&mut rng, LATENT_CHANNELS * lat_h * lat_w);
         let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-            .to_device(&self.device)?;
+            .to_device(device)?;
 
-        // 8-step CFG-free Turbo denoise (raw sigma timestep, Euler `x + v·Δσ`). The control forward is a
-        // drop-in for `dit.forward`; `scale == 0` short-circuits to the base forward inside it.
         let sigmas = turbo_sigmas(req.steps);
         let latent = candle_gen::run_flow_sampler(
             None,
@@ -269,7 +305,7 @@ impl Krea2Control {
             &req.cancel,
             on_progress,
             |x, timestep| -> Result<Tensor> {
-                let t = Tensor::from_vec(vec![timestep], (1,), &self.device)?;
+                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v = forward_with_control(
                     &self.dit,
                     &self.branch,
@@ -284,14 +320,10 @@ impl Krea2Control {
         )?;
 
         on_progress(Progress::Decoding);
-        // Final latent→pixel decode. `tile_vae_decode` (the fit-ladder's cheapest rung, sc-11744) routes
-        // the tail through the seam-free tiled path to cap the end-of-render VRAM spike on a constrained
-        // card; the big-card default (`false`) is the monolithic full-speed decode. Above the im2col
-        // threshold `decode_with` tiles regardless (sc-10023 correctness), so this never regresses hi-res.
         let decoded = self
             .vae
             .decode_with(&latent, req.tile_vae_decode)?
-            .to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
+            .to_dtype(DType::F32)?;
         to_image(&decoded)
     }
 }
@@ -356,6 +388,53 @@ fn control_image_to_nchw(
 mod tests {
     use super::*;
 
+    struct OffloadEnvGuard(Option<String>);
+
+    impl OffloadEnvGuard {
+        fn unset() -> Self {
+            let prior = std::env::var(candle_gen::OFFLOAD_ENV).ok();
+            std::env::remove_var(candle_gen::OFFLOAD_ENV);
+            Self(prior)
+        }
+    }
+
+    impl Drop for OffloadEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(candle_gen::OFFLOAD_ENV, value),
+                None => std::env::remove_var(candle_gen::OFFLOAD_ENV),
+            }
+        }
+    }
+
+    fn missing_paths(offload_policy: OffloadPolicy) -> Krea2ControlPaths {
+        Krea2ControlPaths {
+            root: PathBuf::from("/nonexistent/krea-control-residency-test-snapshot"),
+            control: PathBuf::from("/nonexistent/krea-control-residency-test-overlay.safetensors"),
+            adapters: Vec::new(),
+            branch_quant: None,
+            chunk_attention: false,
+            offload_policy,
+        }
+    }
+
+    /// Weight-free proof that this bespoke lane honors its direct policy even though it has no registry
+    /// descriptor/capability bit: Sequential captures loaders and touches no component weights.
+    #[test]
+    fn sequential_policy_defers_all_component_loads() {
+        let _env = OffloadEnvGuard::unset();
+        let model = Krea2Control::load(&missing_paths(OffloadPolicy::Sequential))
+            .expect("Sequential must not touch the missing snapshot at provider construction");
+        assert!(model.residency.is_sequential());
+    }
+
+    /// The resident twin uses the same phase loaders eagerly, so the missing snapshot fails at load.
+    #[test]
+    fn resident_policy_eager_loads_components() {
+        let _env = OffloadEnvGuard::unset();
+        assert!(Krea2Control::load(&missing_paths(OffloadPolicy::Resident)).is_err());
+    }
+
     /// The request defaults match the Turbo control production knobs (1024², 8 CFG-free steps,
     /// control scale 0.6).
     #[test]
@@ -418,5 +497,113 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("steps"));
+    }
+
+    /// Real-weight two-process resident/sequential parity + peak harness for the bespoke control lane.
+    /// Run once per mode in separate processes because candle's CUDA allocator retains its pool:
+    ///
+    /// ```text
+    /// KREA_TURBO_DIR=<tier> KREA_CONTROL_CKPT=<overlay> KREA_CONTROL_POSE=<png> \
+    /// KREA_OUT=resident.rgb cargo test -p candle-gen-krea --features cuda \
+    ///   control_probed_generate_for_offload_ab -- --ignored --nocapture
+    /// CANDLE_GEN_OFFLOAD=sequential KREA_TURBO_DIR=<tier> KREA_CONTROL_CKPT=<overlay> \
+    /// KREA_CONTROL_POSE=<png> KREA_OUT=sequential.rgb cargo test -p candle-gen-krea \
+    ///   --features cuda control_probed_generate_for_offload_ab -- --ignored --nocapture
+    /// ```
+    ///
+    /// Compare the raw pixel files byte-for-byte and use the printed rendered-device `overall-peak`
+    /// deltas as the resident/sequential calibration. `KREA_CONTROL_BRANCH_QUANT=q8|q4` selects the
+    /// branch tier; omitted means bf16. `KREA_AB_RES` defaults to 768 and `KREA_AB_STEPS` defaults to
+    /// eight. One step is sufficient for packed-tier peak calibration because the same denoise working
+    /// set is reused at every step, but both processes in a parity pair must use the same value.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn control_probed_generate_for_offload_ab() {
+        let root = PathBuf::from(std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR"));
+        let control =
+            PathBuf::from(std::env::var("KREA_CONTROL_CKPT").expect("set KREA_CONTROL_CKPT"));
+        let pose_path =
+            std::env::var("KREA_CONTROL_POSE").expect("set KREA_CONTROL_POSE to a pose PNG");
+        let out = std::env::var("KREA_OUT").expect("set KREA_OUT to the raw pixel-dump path");
+        let res = std::env::var("KREA_AB_RES")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(768u32);
+        let steps = std::env::var("KREA_AB_STEPS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(TURBO_STEPS);
+        let branch_quant = match std::env::var("KREA_CONTROL_BRANCH_QUANT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "bf16" | "none" => None,
+            "q8" => Some(Quant::Q8),
+            "q4" => Some(Quant::Q4),
+            other => panic!("KREA_CONTROL_BRANCH_QUANT must be bf16|q8|q4, got {other}"),
+        };
+        let spec_mode = std::env::var("KREA_OFFLOAD_MODE").unwrap_or_default();
+        let offload_policy = if spec_mode == "spec-sequential" {
+            OffloadPolicy::Sequential
+        } else {
+            OffloadPolicy::Resident
+        };
+
+        let pose = image::open(pose_path).expect("decode pose PNG").to_rgb8();
+        let pose = image::imageops::resize(&pose, res, res, image::imageops::FilterType::Lanczos3);
+        let pose = Image {
+            width: res,
+            height: res,
+            pixels: pose.into_raw(),
+        };
+        let paths = Krea2ControlPaths {
+            root,
+            control,
+            adapters: Vec::new(),
+            branch_quant,
+            chunk_attention: false,
+            offload_policy,
+        };
+        let request = Krea2ControlRequest {
+            prompt: "a dancer in a colorful studio, cinematic lighting".into(),
+            width: res,
+            height: res,
+            steps,
+            control_scale: DEFAULT_CONTROL_SCALE,
+            seed: 42,
+            ..Default::default()
+        };
+
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
+        let load_phase = probe.phase();
+        let model = Krea2Control::load(&paths).expect("load Krea control provider");
+        probe.end_load(load_phase);
+        let gen_phase = probe.phase();
+        let image = model
+            .generate(&request, &pose, &mut |_| {})
+            .expect("generate Krea control image");
+        probe.end_gen(gen_phase);
+        let report = probe.report();
+        std::fs::write(&out, &image.pixels).expect("write raw pixels");
+
+        let env_mode = std::env::var(candle_gen::OFFLOAD_ENV).unwrap_or_default();
+        let mode = if spec_mode == "spec-sequential" {
+            "spec-sequential"
+        } else if env_mode.eq_ignore_ascii_case("sequential") {
+            "env-sequential"
+        } else {
+            "resident"
+        };
+        eprintln!(
+            "SEQ_AB id=krea_2_turbo_control mode={mode} gpu={} {}x{} steps={} branch_quant={branch_quant:?} | {report} | bytes={} out={out}",
+            candle_gen::testkit::probe_gpu(),
+            image.width,
+            image.height,
+            request.steps,
+            image.pixels.len(),
+        );
     }
 }

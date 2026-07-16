@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress, Quant};
+use candle_gen::gen_core::{Image, OffloadPolicy, Progress, Quant};
 use candle_gen_krea::{
     Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
 };
@@ -121,6 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         adapters: Vec::new(),
         branch_quant: a.branch_quant,
         chunk_attention,
+        // `CANDLE_GEN_OFFLOAD=sequential` overrides this resident default for the two-process peak A/B.
+        offload_policy: OffloadPolicy::Resident,
     })?;
     eprintln!(
         "loaded Krea2Control (branch_quant {:?}, chunk_attention {chunk_attention}); rendering {}x{} @ scale {}",
