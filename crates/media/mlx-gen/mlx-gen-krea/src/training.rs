@@ -3,8 +3,8 @@
 //! apply at `krea_2_turbo` inference (the Lens / Z-Image precedent: same architecture, no base-model
 //! gating, family-match suffices — sc-7578).
 //!
-//! [`KreaRawTrainer`] realizes the core [`Trainer`](mlx_gen::Trainer) contract on the real 28-block
-//! single-stream Krea DiT, mirroring [`LensTrainer`](mlx_gen_lens) / `ZImageTurboTrainer` — the model
+//! [`KreaRawTrainer`] realizes the core [`Trainer`] contract on the real 28-block
+//! single-stream Krea DiT, mirroring `LensTrainer` / `mlx_gen_lens` and `ZImageTurboTrainer` — the model
 //! crates don't use mlx-rs's `Module` system (hand-rolled `&self` forwards over raw `Array`s), so
 //! training uses the **functional autograd**: the trainable factors live OUTSIDE the model in a
 //! [`LoraParams`] map, re-injected each step into the target
@@ -28,7 +28,7 @@
 //!   bf16) — frozen, used only to cache caption features, then dropped before the train loop (the 32
 //!   GB-Mac free pattern); Q8 also matches the published Turbo TE.
 //! - **Targets** default to the single-stream block attention `to_q`/`to_k`/`to_v`/`to_out.0` (the
-//!   `AdaptableHost for Krea2Transformer` paths, sc-7577); LoKr reconstructs at [`LOKR_DTYPE`].
+//!   `AdaptableHost for Krea2Transformer` paths, sc-7577); LoKr reconstructs at `LOKR_DTYPE`.
 //!
 //! Registered under the **`krea_2_raw`** id (the LoRA-training base; arch-identical to `krea_2_turbo`,
 //! so the adapter applies to Turbo inference — sc-7578).
@@ -43,7 +43,7 @@
 //!   [`Krea2Transformer::forward_with_blocks_checkpointed`](crate::transformer::Krea2Transformer::forward_with_blocks_checkpointed),
 //!   threading the per-block LoRA factors as explicit checkpoint inputs so the adapter graph survives
 //!   the recompute. LoKr keeps the dense path (caught by the guard) — mirroring z-image / Lens.
-//! - **Fail-fast OOM preflight guard** — [`preflight_memory_guard`] projects the dense first-step peak
+//! - **Fail-fast OOM preflight guard** — `preflight_memory_guard` projects the dense first-step peak
 //!   from resolution and, when checkpointing is off and the run would exceed this machine's memory
 //!   budget, returns a catchable, actionable error BEFORE the (minutes-long) latent caching — converting
 //!   the otherwise-uncatchable SIGKILL into a recommendation to enable the toggle.

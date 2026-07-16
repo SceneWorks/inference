@@ -594,7 +594,7 @@ pub(crate) struct JointInputs {
     pub(crate) p: i32,
 }
 
-/// The **step-invariant** conditioning built once per denoise ([`KreaTransformer::prepare`]): the
+/// The **step-invariant** conditioning built once per denoise ([`Krea2Transformer::prepare`]): the
 /// fused + projected text stream (`ctx`), the joint RoPE tables, and the patchify/slice geometry.
 /// None of it depends on the noise-latent values or the timestep, so it is reused across every step
 /// (F-079).

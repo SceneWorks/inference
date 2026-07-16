@@ -233,7 +233,7 @@ impl KreaHeavy {
     /// `prepare`/`prepare_edit` read only the latent's *shape* (never its values — see their docs), so a
     /// plan can be built once per request from this cheap zeros latent instead of from a per-seed noise
     /// draw. Byte-identical to building the prep from the real noise, and shape-identical to
-    /// [`init_noise`] (pinned by [`tests::geom_latent_shape_matches_init_noise`]).
+    /// `init_noise` (pinned by [`tests::geom_latent_shape_matches_init_noise`]).
     fn geom_latent(width: u32, height: u32) -> Result<Array> {
         let (hl, wl) = ((height / 8) as i32, (width / 8) as i32);
         Ok(Array::zeros::<f32>(&[1, 16, hl, wl])?)
@@ -420,7 +420,7 @@ impl KreaHeavy {
 
     /// **img2img latent-init Turbo render** (epic 8588 slice A; sc-8589/sc-8590) — the denoise/decode
     /// body of [`KreaPipeline::generate_turbo_img2img_with_progress`] with the text encode hoisted out.
-    /// VAE-encode the reference into the same normalized latent space as [`init_noise`], blend
+    /// VAE-encode the reference into the same normalized latent space as `init_noise`, blend
     /// `(1 − σ_k)·clean + σ_k·noise` at the start sigma `σ_k = sigmas[k]`, and run the rectified-flow
     /// Euler sampler over `sigmas[k..]`. Distilled Turbo is CFG-free → one DiT forward per step.
     #[allow(clippy::too_many_arguments)]
@@ -531,7 +531,7 @@ impl KreaHeavy {
     /// [`KreaPipeline::generate_base_with_progress`] with the text encodes hoisted out. `ctx_pos` is the
     /// conditional context; `ctx_neg` (`Some` only when `guidance > 0`) the unconditional one. Two DiT
     /// forwards/step combined by the reference `v = cond + guidance·(cond − uncond)`
-    /// ([`krea_cfg_combine`]); `ctx_neg == None` collapses to a single conditional forward. Both preps
+    /// (`krea_cfg_combine`); `ctx_neg == None` collapses to a single conditional forward. Both preps
     /// are hoisted ONCE (the F-079 hoist) against the shared noise.
     #[allow(clippy::too_many_arguments)]
     pub fn render_base(

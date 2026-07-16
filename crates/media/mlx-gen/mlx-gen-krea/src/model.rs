@@ -75,7 +75,7 @@ const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
 
 /// Registry id for the **image-edit** variant (epic 10871). The Kontext-style edit surface shares the
 /// undistilled Raw pipeline (full-CFG, denoise-from-noise) but routes a single `Reference` — the SOURCE
-/// image — through [`KreaPipeline::generate_edit_with_progress`] (in-context VAE tokens + Qwen3-VL
+/// image — through [`crate::pipeline::KreaPipeline::generate_edit_with_progress`] (in-context VAE tokens + Qwen3-VL
 /// grounding) instead of the img2img latent-init. A DISTINCT engine id (the Qwen-Image-Edit /
 /// FLUX.2-Klein-Edit pattern) is what disambiguates edit from img2img: the SAME source `Reference` means
 /// "edit" or "img2img" purely by which generator the worker loaded. The community `krea2_identity_edit`
@@ -85,7 +85,7 @@ pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 /// Registry id for the **CFG-free Turbo image-edit** variant (sc-11640, follow-on to epic 10871). Same
 /// Kontext edit surface as [`KREA_2_EDIT_ID`] — a source image (or scene+person pair) drives the dual
 /// conditioning (in-context VAE tokens + Qwen3-VL grounding) through
-/// [`KreaPipeline::render_edit`] — but on the **distilled Turbo** checkpoint: the few-step
+/// [`crate::pipeline::KreaPipeline::render_edit`] — but on the **distilled Turbo** checkpoint: the few-step
 /// `turbo_schedule` run **CFG-free** (`guidance = 0`, a single conditional forward, no cond/uncond
 /// split), the fast-path alternative to the ~52-step full-CFG Raw edit. The `krea2_identity_edit` LoRA
 /// (trained on the Raw DiT, family-compatible with Turbo) folds in via `spec.adapters` exactly as on
@@ -143,7 +143,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// Krea 2 **Raw** identity + capabilities — the undistilled 12B DiT run with **true classifier-free
 /// guidance** (two DiT forwards/step: cond vs uncond) at 52 steps, unlike the CFG-free distilled Turbo.
 /// Same architecture / snapshot layout as Turbo (only the DiT weights differ, distilled vs base), so it
-/// shares [`load_variant`] + the whole [`KreaPipeline`]. Exposes a real guidance scale AND a user
+/// shares `load_variant` + the whole [`crate::pipeline::KreaPipeline`]. Exposes a real guidance scale AND a user
 /// negative prompt — the reference `sample()` accepts `negative_prompts` (richer than Boogu's base,
 /// which fixes the uncond to the empty prompt). NOT guidance-distilled, so `supports_true_cfg` stays
 /// false: there is no separate embedded-guidance axis to layer a `true_cfg_scale` over — the two-forward
@@ -842,7 +842,8 @@ const MAX_EDIT_REFERENCES: usize = 2;
 /// order). At least one is required; at most [`MAX_EDIT_REFERENCES`]. Distinct from [`single_reference`]
 /// (img2img), which rejects `MultiReference` and any count > 1 — the edit surface is the only one that
 /// advertises `MultiReference` ([`edit_descriptor`]). The returned slice is passed straight to
-/// [`KreaPipeline::generate_edit_with_progress`], which VAE-encodes each at successive RoPE frames.
+/// [`crate::pipeline::KreaPipeline::generate_edit_with_progress`], which VAE-encodes each at
+/// successive RoPE frames.
 fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
     let sources: Vec<&Image> = match req.conditioning.as_slice() {
         [Conditioning::Reference { image, .. }] => vec![image],
