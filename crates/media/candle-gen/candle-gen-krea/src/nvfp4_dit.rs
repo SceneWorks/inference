@@ -84,7 +84,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::lock_recover;
-use candle_gen::quant::{ActPrecision, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity};
+use candle_gen::quant::{
+    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity,
+};
 
 /// How the trunk should serve one projection's activations when running NVFP4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,6 +282,18 @@ pub struct DitPlan {
     /// The trunk's single-stream block count, used to name the **last** edge block. Set from the config
     /// by [`crate::transformer::Krea2Transformer::load_planned`] so the loader and any harness agree.
     num_layers: usize,
+    /// The **one** cuBLASLt handle every NVFP4 projection in this trunk shares (sc-12274).
+    ///
+    /// Set once by [`crate::transformer::Krea2Transformer::load_planned`], which is also where
+    /// `num_layers` is bound — the plan is already the value threaded to every
+    /// [`crate::loader::linear_detect_planned`] call, so it is the natural carrier and no intermediate
+    /// signature changes.
+    ///
+    /// Empty ([`Nvfp4Context::none`]) on the baseline plan, on CPU, and below `sm_120` — all of which
+    /// simply take the dequant→bf16 fallback. Before this, every W4A4 layer built its own handle and
+    /// its own eager 32 MiB workspace: **6.6 GiB across the 260-projection blanket-W4A4 trunk**, none of
+    /// it visible to the weights-only SC#6 sum (measured — the real footprint was 0.603×, not 0.2813×).
+    ctx: Nvfp4Context,
 }
 
 impl Default for DitPlan {
@@ -289,6 +303,7 @@ impl Default for DitPlan {
             probe: None,
             checked: false,
             num_layers: DEFAULT_NUM_LAYERS,
+            ctx: Nvfp4Context::none(),
         }
     }
 }
@@ -310,6 +325,21 @@ impl DitPlan {
     /// The trunk block count this plan is bound to (see [`Self::with_num_layers`]).
     pub fn num_layers(&self) -> usize {
         self.num_layers
+    }
+
+    /// Bind the **one shared** cuBLASLt context every NVFP4 projection of this trunk will use
+    /// (sc-12274). Called by [`crate::transformer::Krea2Transformer::load_planned`] with a context
+    /// built once from the weights' device; without it each layer would build its own handle and pay
+    /// its own 32 MiB workspace.
+    pub fn with_nvfp4_context(mut self, ctx: Nvfp4Context) -> Self {
+        self.ctx = ctx;
+        self
+    }
+
+    /// The shared cuBLASLt context (see [`Self::with_nvfp4_context`]) — what the loader hands to
+    /// [`candle_gen::quant::Nvfp4Linear::from_dense_in`].
+    pub fn nvfp4_context(&self) -> &Nvfp4Context {
+        &self.ctx
     }
 
     /// The [`LayerRole`] this plan assigns `name`, derived from the trunk topology it is bound to.

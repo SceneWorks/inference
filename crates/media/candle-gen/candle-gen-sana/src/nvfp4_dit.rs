@@ -38,7 +38,9 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::{Linear, Module};
 use candle_gen::lock_recover;
-use candle_gen::quant::{ActPrecision, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity};
+use candle_gen::quant::{
+    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity,
+};
 
 /// How the trunk should serve one projection's activations when running NVFP4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,12 +107,34 @@ pub struct DitPlan {
     quant: Option<Nvfp4Quant>,
     probe: Option<Arc<ActProbe>>,
     checked: bool,
+    /// The **one** cuBLASLt handle every NVFP4 projection in this trunk shares (sc-12274).
+    ///
+    /// Set once by [`crate::transformer::SanaTransformer::from_weights_planned`]. Empty
+    /// ([`Nvfp4Context::none`]) on the dense plan, on CPU, and below `sm_120` — all of which take the
+    /// dequant→bf16 fallback. Before this, every W4A4 layer built its own handle with its own eager
+    /// 32 MiB workspace; SANA's 163 projections meant ~5.1 GiB of duplicated scratch, invisible to the
+    /// weights-only SC#6 sum. Measured on Krea's 260-projection trunk: real footprint 0.603×, reported
+    /// 0.2813×.
+    ctx: Nvfp4Context,
 }
 
 impl DitPlan {
     /// The dense f32 trunk — exactly what [`crate::transformer::SanaTransformer::from_weights`] builds.
     pub fn dense() -> Self {
         Self::default()
+    }
+
+    /// Bind the **one shared** cuBLASLt context every NVFP4 projection of this trunk will use
+    /// (sc-12274). Called by [`crate::transformer::SanaTransformer::from_weights_planned`].
+    pub fn with_nvfp4_context(mut self, ctx: Nvfp4Context) -> Self {
+        self.ctx = ctx;
+        self
+    }
+
+    /// The shared cuBLASLt context — what the loader hands to
+    /// [`candle_gen::quant::Nvfp4Linear::from_dense_in`].
+    pub fn nvfp4_context(&self) -> &Nvfp4Context {
+        &self.ctx
     }
 
     /// Serve every eligible projection through [`Nvfp4Linear`] under `quant`.

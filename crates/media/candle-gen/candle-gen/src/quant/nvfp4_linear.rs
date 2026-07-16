@@ -267,6 +267,133 @@ struct Fp4Resident {
     w_staged: super::cublaslt::DevNvfp4,
 }
 
+/// The shared handle + the device it is bound to (sc-12274). Cuda-only.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+struct Fp4Ctx {
+    lt: std::sync::Arc<super::cublaslt::CublasLt>,
+    device: Device,
+}
+
+/// A **shared, per-device cuBLASLt compute context** for [`Nvfp4Linear`] (sc-12274).
+///
+/// # Why this type exists
+///
+/// `CublasLt::new` eagerly allocates a **32 MiB workspace** and holds it for the handle's life, and
+/// the handle's three caches (`nvfp4_algos` by `(m,k,n)`, `nvfp4_act_scale_gather_idx` by
+/// `(rows, n_blocks)`, `nvfp4_quant_kernels` by nothing) are keyed **by shape or not at all** —
+/// nothing on it is per-layer. Its own module doc says so: *"a real integration caches one per
+/// device."* Building one per layer was therefore never a design choice, just an oversight — and it
+/// cost, **measured on a 260-projection blanket-W4A4 Krea trunk** (sc-12274):
+///
+/// | | |
+/// |---|---:|
+/// | real resident VRAM | 15.41 GiB |
+/// | dense bf16 baseline | 25.56 GiB |
+/// | **real footprint ratio** | **0.603×** |
+/// | SC#6 weights-only reported | 0.2813× |
+///
+/// i.e. the headline SC#6 figure was **2.14× optimistic** on the exact regime it was claimed for,
+/// because ~6.6 GiB of duplicated workspace is not weight bytes and so is invisible to
+/// `resident_weight_bytes`. One handle per device makes that ~32 MiB total, and lets the shape-keyed
+/// caches actually hit across layers (with a handle per layer they never saw a second layer at all).
+///
+/// # Contract
+///
+/// Cfg-neutral **by design** — a zero-sized type on a non-cuda build, so `*_in` constructors have one
+/// signature everywhere. An **empty** context is always valid and always safe: every layer built with
+/// it takes the transparent dequant→bf16 fallback, exactly as [`Nvfp4Linear`] already does on a CPU
+/// device, a `<sm_120` GPU, or an ineligible shape. [`Self::new`] therefore returns an empty context
+/// rather than an error for all of those cases — it never fails just because FP4 is unavailable.
+///
+/// Safe to share across layers: all handles on a device already resolve to the **same** stream
+/// (`CublasLt::new` takes `device.cuda_stream()`), so sharing introduces no stream coupling that did
+/// not already exist. The one genuinely shared mutable resource is the 32 MiB workspace scratch; a
+/// denoise is sequential on that one stream, so cuBLASLt serializes access to it.
+#[derive(Clone, Default)]
+pub struct Nvfp4Context {
+    #[cfg(feature = "cuda")]
+    inner: Option<Fp4Ctx>,
+}
+
+impl Nvfp4Context {
+    /// The **empty** context: no shared handle, so every layer built with it serves dequant→bf16.
+    /// The honest choice on any non-FP4 device — and what [`Self::new`] returns there.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Build **one** cuBLASLt handle for `device`, to be shared by every [`Nvfp4Linear`] on it.
+    ///
+    /// Resolves the whole capability gate **once** instead of per layer: a non-CUDA device, a
+    /// `<sm_120` GPU, a non-cuda build, or a handle-creation failure all yield [`Self::none`] (not an
+    /// error), and the caller's layers then fall back transparently. Below the NVFP4 floor the probe
+    /// handle is **dropped**, so a non-Blackwell box does not hold 32 MiB for a path it cannot take.
+    pub fn new(device: &Device) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        {
+            if matches!(device, Device::Cuda(_)) {
+                match super::cublaslt::CublasLt::new(device) {
+                    Ok(lt) => match lt.meets_nvfp4_floor() {
+                        Ok(true) => {
+                            return Ok(Self {
+                                inner: Some(Fp4Ctx {
+                                    lt: std::sync::Arc::new(lt),
+                                    device: device.clone(),
+                                }),
+                            })
+                        }
+                        // <sm_120 → FP4 is unavailable; drop the probe handle rather than pay its
+                        // workspace for a path no layer will take.
+                        _ => return Ok(Self::none()),
+                    },
+                    Err(e) => {
+                        eprintln!(
+                            "[sc-12274] Nvfp4Context: cuBLASLt handle unavailable ({e}); every layer \
+                             built with this context takes the bf16 fallback"
+                        );
+                        return Ok(Self::none());
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = device;
+        Ok(Self::none())
+    }
+
+    /// True iff this context carries a live FP4 handle (i.e. layers built with it can light the cores).
+    pub fn is_fp4(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            return self.inner.is_some();
+        }
+        #[allow(unreachable_code)]
+        false
+    }
+
+    /// The shared handle, **iff** it is bound to `device`.
+    ///
+    /// The device check is the one hazard sharing introduces that per-layer handles could not have: a
+    /// context built on `cuda:0` handed to a layer on `cuda:1` would stage the weight through the
+    /// wrong device's stream. Mismatch is loud and falls back rather than corrupting the layer.
+    #[cfg(feature = "cuda")]
+    fn handle_for(&self, device: &Device) -> Option<&std::sync::Arc<super::cublaslt::CublasLt>> {
+        let c = self.inner.as_ref()?;
+        if c.device.same_device(device) {
+            Some(&c.lt)
+        } else {
+            eprintln!(
+                "[sc-12274] Nvfp4Linear: shared cuBLASLt context is bound to {:?} but this layer is on \
+                 {:?}; using bf16 fallback rather than staging through the wrong device",
+                c.device.location(),
+                device.location()
+            );
+            None
+        }
+    }
+}
+
 /// An NVFP4 linear projection `y = x·Wᵀ (+ b)` over a packed [`Nvfp4Tensor`] weight (sc-11041).
 ///
 /// Built from packed weights ([`Self::from_packed`]) or a dense weight ([`Self::from_dense`]). On
@@ -299,25 +426,56 @@ impl Nvfp4Linear {
     ///
     /// W4A4 on a `sm_120` CUDA device with an eligible shape → the FP4 packed-forward path; anything
     /// else → the transparent dequant→bf16 fallback. Never panics on an ineligible device/shape.
+    /// **Builds a private cuBLASLt handle for this one layer** (a 32 MiB workspace). Correct for a
+    /// one-off layer or a test; **a trunk must use [`Self::from_packed_in`]** with one shared
+    /// [`Nvfp4Context`], or it pays 32 MiB *per projection* — the sc-12274 defect (measured: 6.6 GiB
+    /// across a 260-projection Krea trunk, which took the reported SC#6 footprint from 0.2813× to a
+    /// real 0.603×).
     pub fn from_packed(
         weight: Nvfp4Tensor,
         bias: Option<Tensor>,
         device: &Device,
         act: ActPrecision,
     ) -> Result<Self> {
+        // Only pay for a handle at all if this layer could actually use one.
+        let ctx = if act == ActPrecision::W4A4 {
+            Nvfp4Context::new(device)?
+        } else {
+            Nvfp4Context::none()
+        };
+        Self::from_packed_in(weight, bias, device, act, &ctx)
+    }
+
+    /// [`Self::from_packed`] sharing an existing per-device [`Nvfp4Context`] — **the constructor a
+    /// trunk loader wants** (sc-12274). Every layer built with one context shares its single cuBLASLt
+    /// handle, so the 32 MiB workspace and the shape-keyed algo / kernel caches are paid once per
+    /// device instead of once per layer.
+    ///
+    /// An empty context (CPU, `<sm_120`, non-cuda build, handle failure) simply means every layer
+    /// takes the dequant→bf16 fallback — never an error.
+    pub fn from_packed_in(
+        weight: Nvfp4Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        act: ActPrecision,
+        ctx: &Nvfp4Context,
+    ) -> Result<Self> {
         #[cfg(feature = "cuda")]
         {
             if act == ActPrecision::W4A4 {
-                if let Some(built) = Self::try_build_fp4(&weight, &bias, device)? {
+                if let Some(built) = Self::try_build_fp4(&weight, &bias, device, ctx)? {
                     return Ok(built);
                 }
             }
         }
+        #[cfg(not(feature = "cuda"))]
+        let _ = ctx;
         // W4A16 override, or the <sm_120 / CPU / non-cuda / ineligible-shape fallback.
         Self::new_dequant(weight, bias, device, act)
     }
 
     /// Pack a dense `[out, in]` weight (bf16/f32, any device) to NVFP4 and build (see [`Self::from_packed`]).
+    /// **Builds a private handle** — a trunk wants [`Self::from_dense_in`].
     pub fn from_dense(
         weight: &Tensor,
         bias: Option<Tensor>,
@@ -326,6 +484,19 @@ impl Nvfp4Linear {
     ) -> Result<Self> {
         let packed = Nvfp4Tensor::pack(weight)?;
         Self::from_packed(packed, bias, device, act)
+    }
+
+    /// [`Self::from_dense`] sharing an existing per-device [`Nvfp4Context`] (sc-12274) — the
+    /// from-dense twin of [`Self::from_packed_in`].
+    pub fn from_dense_in(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        act: ActPrecision,
+        ctx: &Nvfp4Context,
+    ) -> Result<Self> {
+        let packed = Nvfp4Tensor::pack(weight)?;
+        Self::from_packed_in(packed, bias, device, act, ctx)
     }
 
     /// Build applying the **default per-layer policy** ([`ActPrecision::for_outlier_layer`]): the
@@ -340,16 +511,22 @@ impl Nvfp4Linear {
         Self::from_dense(weight, bias, device, ActPrecision::for_outlier_layer(layer_name))
     }
 
-    /// Attempt to build the resident FP4 (W4A4) compute leg. `Ok(None)` when the device is not
-    /// `sm_120`+, not CUDA, or the shape is ineligible for the cuBLASLt FP4 path (→ caller falls back).
-    /// A hard cuBLASLt/allocation failure also degrades to `Ok(None)` (transparent fallback) with a note.
+    /// Attempt to build the resident FP4 (W4A4) compute leg **against a shared handle**. `Ok(None)`
+    /// when the device is not CUDA, the shape is ineligible for the cuBLASLt FP4 path, or `ctx` carries
+    /// no handle for this device (not `sm_120`+, or handle creation failed) → caller falls back.
+    /// A weight-staging failure also degrades to `Ok(None)` (transparent fallback) with a note.
+    ///
+    /// **sc-12274:** this used to call `CublasLt::new(device)` itself, giving every W4A4 layer its own
+    /// 32 MiB workspace. The handle now arrives from [`Nvfp4Context`], which resolved the CUDA +
+    /// `sm_120` capability gate once — so here an absent handle simply *is* the fallback signal.
     #[cfg(feature = "cuda")]
     fn try_build_fp4(
         weight: &Nvfp4Tensor,
         bias: &Option<Tensor>,
         device: &Device,
+        ctx: &Nvfp4Context,
     ) -> Result<Option<Self>> {
-        use super::cublaslt::{CublasLt, NVFP4_K_ALIGN};
+        use super::cublaslt::NVFP4_K_ALIGN;
         if !matches!(device, Device::Cuda(_)) {
             return Ok(None);
         }
@@ -363,17 +540,9 @@ impl Nvfp4Linear {
             );
             return Ok(None);
         }
-        let lt = match CublasLt::new(device) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("[sc-11041] Nvfp4Linear: cuBLASLt handle unavailable ({e}); bf16 fallback");
-                return Ok(None);
-            }
+        let Some(lt) = ctx.handle_for(device) else {
+            return Ok(None); // no shared handle for this device (<sm_120 / unavailable) → fallback
         };
-        match lt.meets_nvfp4_floor() {
-            Ok(true) => {}
-            _ => return Ok(None), // <sm_120 → fallback
-        }
         let w_staged = match lt.stage_nvfp4(weight) {
             Ok(s) => s,
             Err(e) => {
@@ -389,7 +558,8 @@ impl Nvfp4Linear {
             regime: Nvfp4Regime::Fp4W4A4,
             dequant_w: None,
             fp4: Some(Fp4Resident {
-                lt: std::sync::Arc::new(lt),
+                // The Arc was always here — it just never had a second owner (sc-12274).
+                lt: std::sync::Arc::clone(lt),
                 w_staged,
             }),
         }))

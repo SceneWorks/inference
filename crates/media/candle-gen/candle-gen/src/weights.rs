@@ -43,6 +43,16 @@ pub struct Weights {
 }
 
 impl Weights {
+    /// The device this weight set is resident on — every constructor loads all tensors onto one
+    /// `device`, so any tensor's device answers for the set. `None` only for an empty map.
+    ///
+    /// Added for sc-12274: a loader that wants **one** shared per-device resource for the whole trunk
+    /// (e.g. `candle_gen::quant::Nvfp4Context`, one cuBLASLt handle instead of one per projection)
+    /// needs the device up front, before it starts fetching individual weights.
+    pub fn device(&self) -> Option<&Device> {
+        self.map.values().next().map(|t| t.device())
+    }
+
     /// Load every tensor from a `.safetensors` file onto `device`, casting to `dtype` (f16 in
     /// production, f32 for CPU parity), matching how `mlx-gen-sdxl` casts the IP-Adapter bundle to the
     /// UNet dtype before building.
