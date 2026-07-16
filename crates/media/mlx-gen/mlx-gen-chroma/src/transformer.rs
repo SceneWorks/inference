@@ -670,7 +670,7 @@ impl ChromaTransformer {
     /// Returns the predicted velocity `[B, Si, out_channels]`.
     ///
     /// Convenience wrapper that builds the step-invariant tensors (`pooled_temb`, the RoPE table, the
-    /// `[B,1,S,S]` mask) and calls [`Self::forward_prepared`]. The denoise loop prefers the prepared
+    /// `[B,1,S,S]` mask) and calls `forward_prepared`. The denoise loop prefers the prepared
     /// form so those tensors are computed once per step / per branch rather than per call (F-102).
     pub fn forward(
         &self,
