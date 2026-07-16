@@ -1061,7 +1061,7 @@ mod tests {
         let dev = Device::new_cuda(0).expect("cuda device");
         let cfg = DcAeConfig::sana_f32c32();
 
-        let mut probe = VramProbe::start(0);
+        let mut probe = VramProbe::start_rendered();
         let load = probe.phase();
         let w = synthetic_weights(&cfg, /*decoder*/ true, /*encoder*/ false, &dev);
         let dec = DcAeDecoder::from_weights(&w, cfg.clone()).unwrap();
@@ -1092,9 +1092,10 @@ mod tests {
             hi - lo > 1e-3,
             "1024² decode is constant — graph degenerate: [{lo}, {hi}]"
         );
+        let report = probe.report().assert_trustworthy(1.0);
         println!(
-            "DC-AE f32 1024² single-pass decode OK on CUDA: range=[{lo:.4}, {hi:.4}]  VRAM: {}",
-            probe.report()
+            "DC-AE f32 1024² single-pass decode OK on physical GPU {}: range=[{lo:.4}, {hi:.4}]  VRAM: {report}",
+            candle_gen::testkit::probe_gpu()
         );
     }
 
@@ -1244,20 +1245,22 @@ mod tests {
     #[ignore = "GPU 1024² tiled-vs-single-pass seam gate — run on CUDA sm_120 with --release"]
     fn gpu_decode_1024_tiled_matches_single_pass() {
         use candle_gen::testkit::VramProbe;
+        let idle = VramProbe::start_rendered().assert_idle(1.0);
+        let idle_baseline_gb = idle.report().baseline_gb;
         let dev = Device::new_cuda(0).expect("cuda device");
         let cfg = DcAeConfig::sana_f32c32();
         let w = synthetic_weights(&cfg, /*decoder*/ true, /*encoder*/ false, &dev);
         let dec = DcAeDecoder::from_weights(&w, cfg.clone()).unwrap();
         let latent = det(&[1, cfg.latent_channels as usize, 32, 32], 1234, &dev);
 
-        let mut probe = VramProbe::start(0);
+        let mut probe = VramProbe::start_rendered();
         let ph_single = probe.phase();
         let single = dec.decode(&latent).unwrap();
         let _ = single.sum_all().unwrap().to_scalar::<f32>().unwrap(); // force eval before sampling
         probe.end_gen(ph_single);
         let single_peak = probe.report().peak_gb;
 
-        let mut probe2 = VramProbe::start(0);
+        let mut probe2 = VramProbe::start_rendered();
         let ph_tiled = probe2.phase();
         let tiled = dec.decode_with(&latent, /*force_tile*/ true).unwrap();
         let _ = tiled.sum_all().unwrap().to_scalar::<f32>().unwrap();
@@ -1271,7 +1274,8 @@ mod tests {
         // boundaries), so PSNR — not max|Δ| — is the metric.
         let psnr = psnr_db(&single, &tiled);
         println!(
-            "DC-AE 1024² tiled-vs-single-pass: PSNR={psnr:.2} dB  single-pass peak={single_peak:.2} GB  tiled peak={tiled_peak:.2} GB"
+            "DC-AE 1024² tiled-vs-single-pass on physical GPU {} (idle baseline {idle_baseline_gb:.2} GB): PSNR={psnr:.2} dB  single-pass peak={single_peak:.2} GB  tiled peak={tiled_peak:.2} GB",
+            candle_gen::testkit::probe_gpu()
         );
         assert!(
             psnr >= 30.0,

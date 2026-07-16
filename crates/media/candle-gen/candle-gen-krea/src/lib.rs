@@ -1438,8 +1438,8 @@ mod tests {
     /// **Multi-GPU:** the compute device is candle's `cuda:0`, but `nvidia-smi -i` takes a PHYSICAL
     /// ordinal and ignores `CUDA_VISIBLE_DEVICES` — so on a box where you pin the run to a free card with
     /// `CUDA_VISIBLE_DEVICES=1`, a hardcoded `start(0)` would sample the OTHER (busy) card and silently
-    /// report its residency as this run's peak. [`ab_probe_gpu`] derives the physical ordinal from
-    /// `CUDA_VISIBLE_DEVICES` so the sampled card is always the one being rendered on.
+    /// report its residency as this run's peak. [`candle_gen::testkit::probe_gpu`] derives the physical
+    /// ordinal from `CUDA_VISIBLE_DEVICES` so the sampled card is always the one being rendered on.
     ///
     /// `KREA_SEQ_RAW=1` measures `krea_2_raw` (full-CFG, two forwards/step) instead of `krea_2_turbo`.
     /// `KREA_SEQ_EDIT=1` measures the sc-12129 grounded edit path and additionally requires
@@ -1523,7 +1523,7 @@ mod tests {
         // (weights → device) from the denoise/decode activation spike — the epic's open question is which
         // dominates, and a single fused peak can't say (sc-11925 notes the transient was only calibrated
         // at 1024²).
-        let mut probe = candle_gen::testkit::VramProbe::start(ab_probe_gpu());
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
         let g = if edit {
             load_edit(&spec).expect("load krea_2_edit")
@@ -1561,71 +1561,13 @@ mod tests {
         };
         eprintln!(
             "SEQ_AB id={id} mode={mode} gpu={} {}x{} steps={:?} | {report} | bytes={} out={out}",
-            ab_probe_gpu(),
+            candle_gen::testkit::probe_gpu(),
             req.width,
             req.height,
             req.steps,
             img.pixels.len(),
         );
-        // A non-trivial baseline means something else was resident on the sampled card, so the peaks are
-        // that job's residency plus ours and the A/B delta is noise. Fail loudly rather than publishing a
-        // contaminated number into the manifest (this harness feeds `vramGbByTier`).
-        assert!(
-            report.baseline_gb < 1.0,
-            "sampled GPU {} was not idle (baseline {:.1} GB) — the peak is contaminated; \
-             pin the run to a free card with CUDA_VISIBLE_DEVICES",
-            ab_probe_gpu(),
-            report.baseline_gb
-        );
-        // ...and a peak of ZERO means the probe never read the card at all. `VramProbe::start` maps a
-        // failed `nvidia-smi` query to a 0 baseline (a missing binary, a driver hiccup, a bad ordinal),
-        // and every later sample then folds in as 0 too — so the run reports `overall-peak 0.0 GB
-        // (baseline 0.0 GB)` and the idle assertion above passes with maximum apparent confidence. That
-        // is the same failure shape as the two harness bugs this story already fixed (a plausible number
-        // instead of a red test), so pin the floor: a real krea render cannot peak at nothing.
-        assert!(
-            report.peak_gb > 0.0,
-            "probe read a 0.0 GB peak on GPU {} — nvidia-smi is unavailable or the query failed, so \
-             this number is not a measurement; it is the absence of one",
-            ab_probe_gpu()
-        );
-    }
-
-    /// The PHYSICAL GPU ordinal the VRAM probe should sample, derived from `CUDA_VISIBLE_DEVICES`.
-    ///
-    /// candle renders on `cuda:0`, but `cuda:0` is whatever `CUDA_VISIBLE_DEVICES` maps it to, while
-    /// `nvidia-smi -i` (what the probe shells out to) always takes a physical ordinal and ignores that
-    /// variable. On a multi-GPU box the repo's convention is to pin a real-weights run to a free card
-    /// (`set CUDA_VISIBLE_DEVICES=1`), and a hardcoded `start(0)` would then sample the *other* card —
-    /// reporting a neighbouring job's residency as this run's peak, or reading ~idle while the real
-    /// render peaks unobserved. Deriving the ordinal from the same variable keeps the sampled card and
-    /// the rendered card in agreement by construction.
-    ///
-    /// Takes the FIRST entry (candle's `cuda:0`). **Unset** ⇒ 0, the single-GPU default. **Set but not a
-    /// bare integer** ⇒ panic, NOT a fallback: `CUDA_VISIBLE_DEVICES` also accepts GPU UUIDs
-    /// (`GPU-a1b2c3d4-…`) and MIG handles, which no `usize` parse can map to a physical ordinal. Silently
-    /// falling back to 0 there would reintroduce the exact bug this function exists to fix — the operator
-    /// pinned a card, and a probe that cannot tell which one must say so rather than sample a guess and
-    /// publish it as a measurement.
-    #[cfg(feature = "cuda")]
-    fn ab_probe_gpu() -> usize {
-        let Ok(raw) = std::env::var("CUDA_VISIBLE_DEVICES") else {
-            return 0;
-        };
-        let first = raw.split(',').next().unwrap_or_default().trim();
-        // An empty value means "no devices visible" — candle would not have a device to render on, so
-        // reaching here with one is a broken invocation, not a single-GPU default.
-        assert!(
-            !first.is_empty(),
-            "CUDA_VISIBLE_DEVICES is set but empty — no GPU is visible to render on"
-        );
-        first.parse().unwrap_or_else(|_| {
-            panic!(
-                "CUDA_VISIBLE_DEVICES={raw:?} is not a physical ordinal, so the probe cannot tell which \
-                 card to sample (nvidia-smi -i takes an ordinal and ignores this variable). Re-run with \
-                 the numeric form, e.g. CUDA_VISIBLE_DEVICES=1"
-            )
-        })
+        report.assert_trustworthy(1.0);
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).
