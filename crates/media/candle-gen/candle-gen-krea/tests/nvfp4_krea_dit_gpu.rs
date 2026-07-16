@@ -18,13 +18,12 @@
 //!
 //! 1. [`nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4`] — **SC#1, the number of record.** ms/step
 //!    for dense bf16 vs NVFP4 W4A16 vs W4A4-mixed vs W4A4-blanket, on the real trunk under an exclusive
-//!    GPU. The same four measurements are then decomposed into FP4-GEMM vs unfused-activation-quantizer
-//!    share (one test, not two: the decomposition is arithmetic on this table, and a second test would
-//!    re-pack the same three 12.5B trunks for ~20 min of duplicate work). This tests sc-12110's central
-//!    prediction: quantizer cost ~O(M·K), GEMM ~O(M·K·N) ⟹ overhead/GEMM ≈ 1/N, and Krea's N=16384 is
-//!    ~8× SANA's — so the quantizer that swamped SANA (0.69×) may amortize away.
-//!    **Measured answer: it does not. SC#1 is NOT met** — best NVFP4 regime is W4A16 at **1.01×**, and
-//!    W4A4 is **0.01×** (~100× *slower*). See the test's docs for why the 1/N argument was unsound.
+//!    GPU, decomposed into FP4-GEMM vs activation-quantizer share (one test, not two: the decomposition
+//!    is arithmetic on this table, and a second test would re-pack the same three 12.5B trunks).
+//!    **Measured answer (2026-07-16, after sc-12207 + sc-12078): W4A4 is a net WIN — blanket 1.25×,
+//!    mixed 1.10× vs dense bf16 — but SC#1's ~2× is still NOT met.** The earlier 0.01× reading was an
+//!    artefact of two now-fixed quantizer defects, not of W4A4; the residual gap to 2× is structural (a
+//!    denoise step is not all GEMM). See the test's docs for the full measured history.
 //! 2. [`nvfp4_krea_dit_sc2_parity_vs_q4_tier`] — **SC#2.** NVFP4 vs the **Q4 tier**, all against a bf16
 //!    reference. sc-11045 explicitly deferred this: cosine vs bf16 measures *divergence*, not quality,
 //!    and no 4-bit tier passes a "cosine > 0.95 vs bf16" bar. The question SC#2 actually asks is
@@ -352,50 +351,52 @@ fn time_steps(
 /// The test reports the multiple and the quantizer share; it does **not** assert a 2× bar. SC#1 is a
 /// question, and the honest answer is whatever the rig says.
 ///
-/// # The measured answer (2026-07-15, exclusive rig): SC#1 is NOT met, and the prediction was unsound
+/// # The measured answer (2026-07-16, exclusive rig, after sc-12207 + sc-12078)
 ///
-/// | regime | ms/step | vs bf16 | FP4-lit |
-/// |---|---:|---:|---:|
-/// | dense bf16 | 907.9 | 1.00× | — |
-/// | NVFP4 W4A16 | 897.3 | **1.01×** | 0/260 |
-/// | NVFP4 W4A4 mixed | 45 992.4 | **0.02×** | 139/260 |
-/// | NVFP4 W4A4 blanket | 90 109.8 | **0.01×** | 260/260 |
+/// | regime | ms/step | vs bf16 | FP4-lit | *(2026-07-15, pre-fix)* |
+/// |---|---:|---:|---:|---:|
+/// | dense bf16 | 893.7 | 1.00× | — | *907.9* |
+/// | NVFP4 W4A16 | 895.7 | 1.00× | 0/260 | *897.3 (1.01×)* |
+/// | NVFP4 W4A4 mixed | 810.6 | **1.10×** | 139/260 | *45 992.4 (**0.02×**)* |
+/// | NVFP4 W4A4 blanket | 716.3 | **1.25×** | 260/260 | *90 109.8 (**0.01×**)* |
 ///
-/// The **O(M·K) quantizer model is exactly right**: Krea's `M·K` is 11.0× SANA's (4118×6144 vs
-/// 1024×2240) and the measured per-projection cost is 12.3× SANA's (343 ms vs ~28 ms). The two W4A4
-/// regimes corroborate each other independently (343 ms/projection over 260; 324 ms over 139).
+/// **W4A4 is a net win — and SC#1's ~2× is still NOT met.** Both halves of that sentence matter.
 ///
-/// **What was unsound is the inference from it.** `overhead/GEMM ≈ 1/N` silently assumes the two
-/// constants are comparable. They are not: an FP4 tensor-core GEMM is orders of magnitude more
-/// efficient per element than a multi-op candle elementwise chain with a host sync. And **SANA's 0.69×
-/// was never a quantizer measurement at all** — its denominator was a conv defect (linears were 0.4% of
-/// the step), so the quantizer's 9.1 s was hiding inside a ~20 s conv-dominated step and *looked* like a
-/// ~45% overhead. Krea has no conv to hide behind, so the real ratio is visible for the first time.
+/// The `W4A4 − W4A16` delta flipped sign: **+89 212 ms → −179.4 ms**. The FP4 GEMM's speedup now
+/// *exceeds* the activation-quantizer cost, instead of being buried under it by two orders of magnitude.
 ///
-/// # ⚠ RETRACTED conclusion — read before quoting the W4A4 rows (sc-12110 adversarial review)
+/// # Why the old 0.01× was an artefact, not a property of W4A4
 ///
-/// An earlier revision of this doc concluded: *"sc-12078 is a hard gate on SC#1, and **~70× larger than
-/// SANA implied**; a fused kernel must make the quantize **essentially free** for W4A4 to break even."*
-/// **That conclusion is withdrawn.** It attributed the whole 343 ms/projection to being *unfused*. It is
-/// not: decomposing the shipping `quantize_nvfp4_activation` on real Krea shapes found **76% of it is a
-/// single fixable defect** — `cublaslt.rs:400-401` swizzles the UE4M3 block scales with `scatter_add`
-/// **atomics** for what the packer's own test proves is a **pure bijection**. That is
-/// **sc-12207** (a ~7,000–14,000× pathology; `index_select` does the identical permutation for free).
+/// The 2026-07-15 rows measured two defects in the *quantizer*, not the cost of FP4 activations. Both are
+/// fixed; the per-projection cost fell **~860–914×**:
 ///
-/// | per projection | M=4118, K=6144 | K=16384 |
+/// | per projection (M=4118) | K=6144 | K=16384 |
 /// |---|---:|---:|
-/// | total quantizer | 328.10 ms | 879.42 ms |
-/// | **`scatter_add`** | **250.04 ms (76%)** | **666.29 ms (76%)** |
-/// | `index_select`, same permutation | 0.04 ms | 0.05 ms |
-/// | bandwidth reference | 20.49 ms | 59.05 ms |
+/// | 2026-07-15 (`scatter_add` swizzle) | 328.10 ms | 879.42 ms |
+/// | after **sc-12207** (bijection → `index_select` gather) | 19.08 ms | 55.30 ms |
+/// | after **sc-12078** (fused two-pass CUDA kernel) | **0.382 ms** | **0.962 ms** |
+/// | FP4 GEMM at the same shape, for scale | 0.366 ms | 2.253 ms |
 ///
-/// **The SC#1 verdict is unaffected — NOT MET stands.** True unfused cost is **~95 ms/projection, not
-/// 343**; post-sc-12207 blanket W4A4 is **~21.4 s/step (0.043×)** — still ~23× slower than bf16, still
-/// not viable. **But the residual ~78 ms is only ~4× the 20 ms bandwidth reference for ~30 ops**, so a
-/// genuinely fused single-pass kernel plausibly reaches **~1–3 ms/projection (~390–780 ms/step)** —
-/// competitive with bf16's 908 ms. ⟹ **sc-12078 is still a GATE, but is sized ~4× too large**; sc-12207
-/// blocks it and the sizing must be re-derived from the corrected residual. The rows below are *today's*
-/// measurement, not the intrinsic cost of W4A4.
+/// 1. **sc-12207** — the UE4M3 scale swizzle is a *pure bijection* (the packer's own
+///    `scale_swizzle_padding_and_bijection` test proves it) but was implemented with `scatter_add`
+///    **atomics**: 76% of the quantizer, and `index_select` does the identical permutation ~7 000× faster.
+/// 2. **sc-12078** — the remaining ~19 ms was ~40 unfused candle ops plus a host sync, now one fused
+///    kernel (block+tensor amax → E4M3 scale → E2M1 codes → nibble pack → swizzle) that is **bit-exact**
+///    (rel-RMS 0.000000 vs the CPU packer). The quantizer is now *smaller than the GEMM it feeds*.
+///
+/// Two superseded conclusions, recorded so they are not re-derived: (a) *"a fused kernel must make
+/// quantize essentially free for W4A4 to break even"* — withdrawn; the true unfused residual was 19 ms,
+/// not 343. (b) *"post-sc-12207 blanket W4A4 ≈ 21.4 s/step (0.043×), still not viable"* — that estimate
+/// assumed a ~78 ms residual by naive subtraction; the warm, index-cached residual measured 19 ms, and
+/// with sc-12078 the real answer is **716 ms/step (1.25×)**.
+///
+/// # Why ~2× is still not reached — and why no quantizer work will get there
+///
+/// The FP4 tensor-core GEMM *does* deliver ~2× (measured **1.95–2.24×** core-vs-core, sc-11044). But a
+/// denoise step is not all GEMM: attention, norms and modulation are untouched by NVFP4 and dilute the
+/// GEMM win to 1.25× end-to-end. With the quantizer now at ~0.4 ms against a ~0.37 ms GEMM, there is no
+/// meaningful quantizer cost left to remove — **the residual gap to 2× is structural, not a defect.**
+/// Reaching it would require accelerating the non-GEMM step work, which is outside this epic.
 #[test]
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
@@ -456,11 +457,14 @@ fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
 
     // ---- The quantizer-share decomposition, derived from the SAME four measurements ----------
     //
-    // A W4A4 step is (FP4 GEMM) + (unfused activation quantize). W4A16 holds the same packed weights but
-    // dequantizes them once at construction and runs a dense bf16 GEMM — so it is the "no FP4 compute,
-    // NO act-quant" leg. The W4A4 − W4A16 delta therefore bounds the activation-quantizer cost, with one
-    // honest caveat stated below rather than papered over: the delta also absorbs the GEMM's own change
-    // (FP4 vs bf16), which is a *speedup*, so the delta UNDER-states the quantizer's gross cost.
+    // A W4A4 step is (FP4 GEMM) + (fused activation quantize, sc-12078). W4A16 holds the same packed
+    // weights but dequantizes them once at construction and runs a dense bf16 GEMM — so it is the "no FP4
+    // compute, NO act-quant" leg. The W4A4 − W4A16 delta is therefore the NET of two opposing terms: the
+    // FP4 GEMM's speedup (negative) and the activation-quantizer's cost (positive). Pre-sc-12207 the
+    // quantizer term dominated so utterly (+89 212 ms) that the delta read as a pure quantizer bound;
+    // post-sc-12078 the sign has flipped (−179.4 ms), i.e. the GEMM speedup now exceeds the quantizer.
+    // The delta is consequently a LOWER bound on the GEMM win, not a bound on the quantizer cost — read
+    // the per-projection quantizer numbers in this test's docs for that.
     let (ms_w4a16, ms_w4a4) = (rows[1].1, rows[3].1);
     let delta = ms_w4a4 - ms_w4a16;
     let w4a4_mult = base / ms_w4a4;
@@ -468,32 +472,44 @@ fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
     eprintln!("[sc-12110] dense bf16         : {base:>10.1} ms/step");
     eprintln!("[sc-12110] NVFP4 W4A16        : {ms_w4a16:>10.1} ms/step  (packed weights, bf16 act, no FP4 compute, no act-quant)");
     eprintln!(
-        "[sc-12110] NVFP4 W4A4 blanket : {ms_w4a4:>10.1} ms/step  (FP4 GEMM + unfused act-quant)"
+        "[sc-12110] NVFP4 W4A4 blanket : {ms_w4a4:>10.1} ms/step  (FP4 GEMM + FUSED act-quant, sc-12078)"
     );
     eprintln!(
-        "[sc-12110] W4A4 − W4A16 delta : {delta:>+10.1} ms/step ({:+.1}% of the W4A16 step) — the \
-         act-quant bound (under-stated: it nets off the FP4 GEMM's own speedup)",
-        100.0 * delta / ms_w4a16
-    );
-    eprintln!(
-        "[sc-12110] PREDICTION (overhead/GEMM ≈ 1/N): on SANA the unfused quantizer made W4A4 **0.69×** \
-         — SLOWER than baseline. On Krea, N is ~8× larger and W4A4 measures **{w4a4_mult:.2}×** vs dense \
-         bf16 ⟹ the ~1/N amortization {}.",
-        if w4a4_mult > 1.0 {
-            "HELD — W4A4 is a net win here, which it never was on SANA"
+        "[sc-12110] W4A4 − W4A16 delta : {delta:>+10.1} ms/step ({:+.1}% of the W4A16 step) — net of the \
+         FP4 GEMM speedup (−) and the fused act-quant cost (+); {}",
+        100.0 * delta / ms_w4a16,
+        if delta < 0.0 {
+            "NEGATIVE ⟹ the FP4 GEMM win now exceeds the quantizer cost (was +89 212 ms pre-sc-12207)"
         } else {
-            "did NOT rescue W4A4 — it remains a net loss even at N=16384"
+            "POSITIVE ⟹ the quantizer still costs more than the FP4 GEMM saves"
         }
     );
     eprintln!(
-        "[sc-12110] ⟹ sc-12078 (fused activation-quantize kernel) is {}",
-        if best.1 >= 2.0 {
-            "an OPTIMIZATION, not a gate: SC#1's ~2× is already met without it"
-        } else if w4a4_mult > 1.0 {
-            "still worth landing — W4A4 wins but has not reached ~2×; the residual quantizer cost is \
-             the gap"
+        "[sc-12110] HISTORY: pre-sc-12207 this table read W4A4 blanket **0.01×** (90 109.8 ms/step). That \
+         was an artefact of the quantizer, not of FP4 activations: a `scatter_add`-atomics bijection \
+         (sc-12207) plus ~40 unfused candle ops (sc-12078). Per-projection quantizer at K=6144 fell \
+         328.10 → 19.08 → **0.382 ms** (~859×), and is now smaller than the 0.366 ms GEMM it feeds. W4A4 \
+         measures **{w4a4_mult:.2}×** vs dense bf16 ⟹ {}.",
+        if w4a4_mult > 1.0 {
+            "W4A4 is a net WIN — which it never was before the quantizer was fixed"
         } else {
-            "still a GATE on reaching SC#1 through W4A4"
+            "W4A4 is STILL a net loss — investigate before quoting the fused kernel as effective"
+        }
+    );
+    eprintln!(
+        "[sc-12110] ⟹ sc-12078 (fused activation-quantize kernel) is LANDED and wired into \
+         `Nvfp4Linear::forward_fp4`. SC#1's ~2× is {}",
+        if best.1 >= 2.0 {
+            "MET.".to_string()
+        } else {
+            format!(
+                "NOT met (best {:.2}×) — and no further quantizer work will reach it. The FP4 GEMM core \
+                 does deliver ~2× (1.95–2.24× core-vs-core, sc-11044), but attention/norms/modulation are \
+                 untouched by NVFP4 and dilute it end-to-end. With the quantizer at ~0.4 ms against a \
+                 ~0.37 ms GEMM there is no quantizer cost left to remove: the residual gap is STRUCTURAL. \
+                 Closing it means accelerating the non-GEMM step work, which is outside this epic.",
+                best.1
+            )
         }
     );
 
@@ -700,10 +716,10 @@ fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
     // ==========================================================================================
     // Q4 − NVFP4-W4A16 cosine gap measured 2026-07-15 on real weights (this leg quantizes all 260
     // projections; the q4 tier leaves 4 dense — see the surface-mismatch confound in the docs).
-    const MEASURED_COS_GAP: f32 = 0.00601;
+    const MEASURED_COS_GAP: f64 = 0.00601;
     // Absorbs GEMM/library nondeterminism only. The seed, prompt and schedule are fixed, so this is
     // NOT a chaos budget — chaos is *between* the tiers, and it is exactly what the band pins.
-    const COS_GAP_TOL: f32 = 0.004;
+    const COS_GAP_TOL: f64 = 0.004;
 
     let cos_gap = q4_cos - w16_cos;
     assert!(

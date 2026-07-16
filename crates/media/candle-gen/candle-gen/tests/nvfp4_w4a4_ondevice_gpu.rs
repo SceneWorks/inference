@@ -133,6 +133,47 @@ fn nvfp4_w4a4_ondevice_activation_quant_matches_cpu_pack_ref() {
     assert!(rr_dq < 0.03, "on-device W4A4 does not track the dequant reference (rel-RMS {rr_dq:.5})");
 }
 
+/// (1b) **sc-12078 bit-faithfulness gate:** the FUSED activation quantizer produces the same FP4 GEMM
+/// output as (a) the CPU `Nvfp4Tensor::pack` reference and (b) the unfused on-device candle path. The
+/// fused kernel mirrors the exact numeric recipe (`pack_from_slice`), so it must track the CPU pack
+/// within the same tolerance as the unfused path, and match the unfused path near-exactly (both are the
+/// same recipe; only the last-bit float ops of the E4M3/E2M1 arithmetic can differ).
+#[test]
+fn nvfp4_fused_activation_quant_matches_cpu_pack_ref() {
+    let Some(dev) = nvfp4_device() else { return };
+    let lt = CublasLt::new(&dev).unwrap();
+    let (m, k, n) = (256usize, 256usize, 128usize); // K%32==0, N%16==0, M%16==0
+
+    let x_f32 = pseudo_random(m * k, 101);
+    let w_f32 = pseudo_random(n * k, 202);
+    let x = Tensor::from_vec(x_f32, (m, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let w = Tensor::from_vec(w_f32, (n, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+
+    let w_pk = Nvfp4Tensor::pack(&w).unwrap();
+    let w_stg = lt.stage_nvfp4(&w_pk).unwrap();
+
+    // Three activation-quantize routes against the same resident weight.
+    let x_fused = lt.quantize_nvfp4_activation_fused(&x, w_pk.cols_padded).unwrap();
+    let x_candle = lt.quantize_nvfp4_activation(&x, w_pk.cols_padded).unwrap();
+    let x_cpu = lt.stage_nvfp4(&Nvfp4Tensor::pack(&x).unwrap()).unwrap();
+
+    let y_fused = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_fused).unwrap());
+    let y_candle = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_candle).unwrap());
+    let y_cpu = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_cpu).unwrap());
+    assert!(y_fused.iter().all(|v| v.is_finite()), "fused quant produced NaN/Inf");
+
+    let rr_cpu = rel_rms(&y_fused, &y_cpu);
+    let rr_candle = rel_rms(&y_fused, &y_candle);
+    eprintln!(
+        "[sc-12078] fused vs CPU-pack GEMM rel-RMS = {rr_cpu:.6}; fused vs unfused on-device = {rr_candle:.6}"
+    );
+    assert!(rr_cpu < 0.02, "fused activation quant diverges from the CPU pack ref (rel-RMS {rr_cpu:.6})");
+    assert!(
+        rr_candle < 0.001,
+        "fused must match the unfused on-device recipe near-exactly (rel-RMS {rr_candle:.6})"
+    );
+}
+
 /// (2) The full `Nvfp4Linear` W4A4 forward runs the on-device quantize end-to-end, is finite across
 /// repeated forwards (a denoise-step stand-in), and stays within NVFP4 tolerance of a bf16-dense
 /// reference. Exercises the `forward_checked` NaN/inf guard.
@@ -280,6 +321,97 @@ fn nvfp4_w4a4_vs_w4a16_throughput() {
         );
         assert!(t_w4a4.is_finite() && t_w4a4 > 0.0 && t_fp4g > 0.0);
     }
+}
+
+/// (3b) **sc-12207 re-measurement — per-projection activation-quantizer cost on the real Krea 2 Turbo
+/// GEMM shapes.** The sc-12110 review decomposed `quantize_nvfp4_activation` here and found **76% of it
+/// was a `scatter_add` atomic bijection** (250.04 ms of 328.10 ms at K=6144; 666.29 ms of 879.42 ms at
+/// K=16384). sc-12207 turned that swizzle into an `index_select` gather over a cached inverse
+/// permutation; this reports the **corrected** per-projection quantizer cost — the residual sc-12078's
+/// fused-kernel target must be re-derived from. It also times the FP4 GEMM at the same shapes so the
+/// implied W4A4 per-projection (quantize + GEMM) and Krea step time can be reconstructed **without
+/// loading the 12.5 B trunk**.
+///
+/// Krea 2 Turbo at 1024²: M ≈ 4118 tokens (image seq + text context); K = 6144 (hidden) and 16384
+/// (SwiGLU intermediate); the DiT is ~260 quantized projections/step. Throughput → run EXCLUSIVE GPU.
+#[test]
+#[ignore = "GPU perf measurement (sc-12207): needs an sm_120 device; run on an EXCLUSIVE GPU"]
+fn nvfp4_quantize_activation_perf_krea_shapes() {
+    let Some(dev) = nvfp4_device() else { return };
+    let lt = CublasLt::new(&dev).unwrap();
+    let m = 4118usize;
+    let iters = 30usize;
+
+    eprintln!(
+        "\n[sc-12207] ===== per-projection activation-quantizer cost, Krea shapes, exclusive GPU ====="
+    );
+    for k in [6144usize, 16384usize] {
+        // cols_padded == K: both 6144 and 16384 are multiples of NVFP4_BLOCK and NVFP4_K_ALIGN.
+        let x = Tensor::from_vec(pseudo_random(m * k, 0x5C1_2207 ^ k as u64), (m, k), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        // The unfused quantizer (the sc-12207 target). First call also builds+caches the gather index,
+        // so warm up before timing.
+        for _ in 0..5 {
+            std::hint::black_box(lt.quantize_nvfp4_activation(&x, k).unwrap());
+        }
+        dev.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(lt.quantize_nvfp4_activation(&x, k).unwrap());
+        }
+        dev.synchronize().unwrap();
+        let ms_quant = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // The FUSED quantizer (sc-12078). First call also nvrtc-compiles the module, so warm up first.
+        for _ in 0..5 {
+            std::hint::black_box(lt.quantize_nvfp4_activation_fused(&x, k).unwrap());
+        }
+        dev.synchronize().unwrap();
+        let tf = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(lt.quantize_nvfp4_activation_fused(&x, k).unwrap());
+        }
+        dev.synchronize().unwrap();
+        let ms_fused = tf.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // FP4 GEMM at a representative N (pre-staged operands) — N does not affect the quantizer, this is
+        // just the compute leg to reconstruct a full W4A4 projection cost.
+        let n = k;
+        let w = Tensor::from_vec(pseudo_random(n * k, 2), (n, k), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let w_pk = Nvfp4Tensor::pack(&w).unwrap();
+        let w_stg = lt.stage_nvfp4(&w_pk).unwrap();
+        let x_stg = lt.quantize_nvfp4_activation(&x, w_pk.cols_padded).unwrap();
+        for _ in 0..5 {
+            std::hint::black_box(lt.matmul_nvfp4_staged(&w_stg, &x_stg).unwrap());
+        }
+        dev.synchronize().unwrap();
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(lt.matmul_nvfp4_staged(&w_stg, &x_stg).unwrap());
+        }
+        dev.synchronize().unwrap();
+        let ms_gemm = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        eprintln!(
+            "[sc-12207] M={m} K={k:>5}: unfused {ms_quant:>8.3} ms | FUSED {ms_fused:>7.3} ms \
+             ({:>5.1}× vs unfused) | FP4 GEMM (N={n}) {ms_gemm:>7.3} ms | W4A4 proj: unfused {:>8.3} \
+             / fused {:>6.3} ms",
+            ms_quant / ms_fused,
+            ms_quant + ms_gemm,
+            ms_fused + ms_gemm
+        );
+        assert!(ms_quant.is_finite() && ms_quant > 0.0 && ms_gemm > 0.0 && ms_fused > 0.0);
+    }
+    eprintln!(
+        "[sc-12207/12078] pre-fix ref (sc-12110): 328.10 ms (K=6144) / 879.42 ms (K=16384). sc-12207 \
+         (scatter→gather) → the 'unfused' column; sc-12078 (fused kernel) → the 'FUSED' column."
+    );
 }
 
 /// (4) Outlier-sparsity capture (the spike residual gate) on synthetic activations: benign / sparse /
