@@ -133,7 +133,7 @@ pub fn compile_glue() -> bool {
 }
 
 /// RAII guard that enables the compiled elementwise glue for its lifetime and **restores the prior
-/// [`COMPILE_GLUE`] value on drop** — even on an early `?` return. This is the one shared guard the
+/// `COMPILE_GLUE` value on drop** — even on an early `?` return. This is the one shared guard the
 /// per-family transformers were each hand-rolling (F-007); bind one at the top of a denoise loop
 /// (`let _g = CompileGlueGuard::enable();`) so the process-global toggle is scoped to the render and
 /// code that runs afterward — notably the reference-parity gates, which must run eager — sees the

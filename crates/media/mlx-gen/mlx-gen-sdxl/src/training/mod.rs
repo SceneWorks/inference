@@ -208,7 +208,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// Construct the trainer from an SDXL snapshot directory (the diffusers multi-component tree:
 /// `tokenizer/ text_encoder/ text_encoder_2/ unet/ vae/`). Loads the base at **f32** (training needs
 /// the dense, high-precision base for clean autograd; inference runs fp16). Registered via
-/// [`TrainerRegistration`].
+/// [`mlx_gen::TrainerRegistration`].
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,

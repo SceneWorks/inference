@@ -51,7 +51,7 @@ impl QwenRope3d {
     }
 
     /// Single-image RoPE (T2I). `(img_cos, img_sin, txt_cos, txt_sin)`: image tables
-    /// `(latent_h·latent_w, 64)`, text `(txt_seq, 64)`. Equivalent to [`forward_multi`] with one shape.
+    /// `(latent_h·latent_w, 64)`, text `(txt_seq, 64)`. Equivalent to [`Self::forward_multi`] with one shape.
     pub fn forward(
         &self,
         latent_h: usize,

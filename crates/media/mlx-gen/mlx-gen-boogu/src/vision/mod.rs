@@ -10,12 +10,12 @@
 //!     rotary, per-image `cu_seqlens` blocks — single-image ⇒ full unmasked) → `proj`; pre-LayerNorm →
 //!     **GELU-tanh** 2-linear MLP (`linear_fc1`/`linear_fc2`, bias). No windowing (unlike Qwen2.5-VL).
 //!   - **Patch merger** — `LayerNorm` → concat `merge²` (=4) group → `Linear → GELU → Linear` → `out`.
-//!   - **Deepstack** — at vision layers `deepstack_visual_indexes` ([8,16,24]), a post-shuffle-norm
+//!   - **Deepstack** — at vision layers `deepstack_visual_indexes` (`[8,16,24]`), a post-shuffle-norm
 //!     merger produces a feature the LM later injects into its early layers.
 //!
 //! The grid-derived host-side math (rope table, bilinear pos-embed indices/weights) mirrors the
 //! reference `get_vision_position_ids` / `get_vision_bilinear_indices_and_weights` and is computed in
-//! [`VisionTower::build_plan`]. Linears are [`AdaptableLinear`]s so they quantize at load.
+//! `VisionTower::build_plan`. Linears are [`AdaptableLinear`]s so they quantize at load.
 
 pub mod preprocess;
 

@@ -458,7 +458,7 @@ impl CosmosDiT {
 
     /// Toggle SDPA-segment gradient checkpointing (sc-10576) on every DiT block's self- + cross-attn.
     /// Training-only: the trainer turns it ON when whole-block checkpointing is OFF (the dense / LoKr
-    /// path) and OFF when [`forward_with_main_checkpointed`](Self::forward_with_main_checkpointed) is
+    /// path) and OFF when `forward_with_main_checkpointed` is
     /// used (the block recompute already covers attention). Numerically identical to the retained
     /// backward; inference never calls it.
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
@@ -512,7 +512,7 @@ impl CosmosDiT {
         )
     }
 
-    /// The shared body behind [`forward_with_main_checkpointed`](Self::forward_with_main_checkpointed).
+    /// The shared body behind `forward_with_main_checkpointed`.
     /// `thread_encoder` gates the sc-10522 trap: `true` threads `encoder` as an explicit checkpoint
     /// input (the production path); `false` CAPTURES it as a constant (the deliberately-wrong path the
     /// grad-parity mutation test drives to prove the conditioner grads collapse to zero when captured).
@@ -632,7 +632,7 @@ impl CosmosDiT {
         self.unpatchify(&hidden, pe_t, pe_h, pe_w)
     }
 
-    /// Test-only sibling of [`forward_with_main_checkpointed`](Self::forward_with_main_checkpointed)
+    /// Test-only sibling of `forward_with_main_checkpointed`
     /// that deliberately CAPTURES `encoder` instead of threading it — the sc-10522 inert-conditioner
     /// bug. Used only by the grad-parity mutation test to prove the conditioner factors receive zero
     /// gradient on the wrong path (so the correct path's non-zero conditioner grads are meaningful).

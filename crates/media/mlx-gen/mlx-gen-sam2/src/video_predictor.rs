@@ -11,12 +11,12 @@
 //! the previous mask back in as a dense prompt, exactly like the reference's `prev_low` path).
 //!
 //! The model-level methods ported here (the heavy lifting the predictor delegates to the model):
-//!   * [`Sam2VideoModel::predict_from_encoded`] — prompt encode + mask decode, returning the low-res
+//!   * `Sam2VideoModel::predict_from_encoded` — prompt encode + mask decode, returning the low-res
 //!     masks, IoUs, the **object pointer** (a 256-vec summary of the tracked object, gated by the
 //!     object-score) and the object score itself.
-//!   * [`Sam2VideoModel::encode_memory`] — turn a frame's `(features, predicted mask)` into the
+//!   * `Sam2VideoModel::encode_memory` — turn a frame's `(features, predicted mask)` into the
 //!     64-channel memory feature map stored in the bank.
-//!   * [`Sam2VideoModel::condition_with_memories`] — assemble the memory bank (spatial memories with
+//!   * `Sam2VideoModel::condition_with_memories` — assemble the memory bank (spatial memories with
 //!     temporal-position encodings + object-pointer tokens) and run memory attention, producing the
 //!     memory-conditioned features the decoder consumes on a tracked frame.
 //!
@@ -29,7 +29,7 @@
 //! tracks *backward* toward frame 0 and records every frame as reverse (`frames_tracked` ← `true`).
 //! Both mirror the reference's single method, `propagate_in_video(reverse=…)`. The reverse path drives
 //! the same plumbing the `track_in_reverse` flag threads — the reverse arms in `maskmem_prev_frame`
-//! and the in-past / strided-frame arithmetic of [`Sam2VideoModel::condition_with_memories`] — so the
+//! and the in-past / strided-frame arithmetic of `Sam2VideoModel::condition_with_memories` — so the
 //! `frames_tracked` reverse bool is genuinely reachable. Parity for both directions is verified by the
 //! real-weights `tests/video_parity.rs` (`#[ignore]`) against goldens dumped by
 //! `tools/dump_sam2_video_golden.py` (forward, and `--reverse`).
@@ -491,7 +491,7 @@ fn upsample_mask_1024(low: &Array) -> Result<Array> {
 }
 
 /// SAM2 single-object video predictor: prompt a frame with a box, then propagate masks across the
-/// clip using the memory bank ([`mlx_sam.video_predictor.SAM2VideoPredictor`], single-object path).
+/// clip using the memory bank (`mlx_sam.video_predictor.SAM2VideoPredictor`, single-object path).
 pub struct Sam2VideoPredictor {
     model: Sam2VideoModel,
 }
@@ -845,7 +845,7 @@ impl Sam2VideoPredictor {
     ///     reverse order is **empty** — there is nothing behind frame 0 to track — and this returns an
     ///     empty `Vec`.
     ///   * Each tracked frame is conditioned with `track_in_reverse = true`, exercising the reverse
-    ///     arms of [`Sam2VideoModel::condition_with_memories`] / [`maskmem_prev_frame`] (the bank is
+    ///     arms of `Sam2VideoModel::condition_with_memories` / `maskmem_prev_frame` (the bank is
     ///     pulled from the frames immediately *ahead*), and recorded `frames_tracked` ← `true`.
     pub fn propagate_reverse(
         &self,

@@ -9,9 +9,9 @@
 //! Mirrors `transformers` `sam3_video/modeling_sam3_video.py` `_det_track_one_frame`. The reference's
 //! optional `kernels` post-processing is ported natively (sc-4995), since the `cv-utils` kernel is
 //! GPU-only and unavailable on this Mac: detection mask-NMS dedup (`det_nms_thresh`) replicates
-//! `generic_nms` with a host greedy mask-IoU pass ([`nms_dedup`]), and hole-fill + sprinkle removal
+//! `generic_nms` with a host greedy mask-IoU pass (`nms_dedup`), and hole-fill + sprinkle removal
 //! (`fill_holes_in_mask_scores`) replicates the 8-connected `cc_torch`/skimage path with a host flood
-//! fill ([`fill_holes_in_mask`]). Masks flow as 288² logits (the processor sigmoids for display).
+//! fill (`fill_holes_in_mask`). Masks flow as 288² logits (the processor sigmoids for display).
 
 use std::collections::BTreeMap;
 use std::rc::Rc;

@@ -10,7 +10,7 @@
 //!
 //! * The transformer's own `x_embedder` / `context_embedder` / top-level `proj_out` and the entire
 //!   distilled-guidance **Approximator** (`distilled_guidance_layer.*`, which drives all per-block
-//!   modulation) — small / precision-sensitive, kept dense to match [`is_transformer_target`].
+//!   modulation) — small / precision-sensitive, kept dense to match `is_transformer_target`.
 //! * The T5-XXL **text encoder** (`text_encoder/`) and the FLUX.1 16-ch **VAE** (`vae/`) — never
 //!   quantized (a measurably-0% memory-only win, and not wired in the loader), so both are mirrored
 //!   verbatim (deref symlinks) into every tier.

@@ -19,7 +19,7 @@
 //!     `Linear → GELU → Linear` → `out_hidden`; then the window permutation is undone (`argsort`).
 //!
 //! All the integer index gymnastics (`rot_pos_emb`, `get_window_index`, `cu_seqlens`) depend only on
-//! `grid_thw`, so they are computed host-side in [`VisionTower::build_plan`] — exactly mirroring the
+//! `grid_thw`, so they are computed host-side in `VisionTower::build_plan` — exactly mirroring the
 //! reference — and the resulting permutation / rope table / block masks are handed to the MLX graph.
 //! Linears are [`AdaptableLinear`]s so sc-5146 can quantize them Q4/Q8 at load.
 

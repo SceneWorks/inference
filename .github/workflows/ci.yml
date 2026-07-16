@@ -185,6 +185,17 @@ jobs:
           cargo clippy --locked
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
           --all-targets -- -D warnings
+      - name: Rustdoc macOS MLX packages
+        # This is the complete macOS/MLX package set the lane already builds. Keep its public
+        # intra-doc graph under the same warnings-as-errors policy as the Linux and CUDA package
+        # sets; NAX-specific docs remain on the separate macos-nax feature/platform lane.
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: >-
+          cargo doc --locked --no-deps
+          -p mlx-llm -p mlx-llm-server
+          -p mlx-gen -p 'mlx-gen-*'
+          -p runtime-macos
       - name: Test MLX packages
         run: >-
           cargo test --locked --lib --tests

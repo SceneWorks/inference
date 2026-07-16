@@ -4,7 +4,8 @@
 //!
 //! This is the **E1 engine** story: the control branch struct, its weight load, the control-latent
 //! encode, the residual computation, and the injection into the FLUX.1-dev denoise. The transformer is a
-//! [`FluxControlTransformer`] (the parity-proven dev DiT + a diffusers-style [`FluxControlNet`] residual
+//! [`FluxControlTransformer`] (the parity-proven dev DiT + a diffusers-style
+//! [`crate::control_transformer::FluxControlNet`] residual
 //! branch); `generate` threads a VAE-encoded control latent through it under the embedded-guidance
 //! denoise (dev is guidance-distilled — a single forward, no true-CFG). [`load_dev_control`] needs the
 //! dev snapshot (`spec.weights`) **and** the control checkpoint (`spec.control`).

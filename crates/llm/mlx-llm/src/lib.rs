@@ -7,17 +7,17 @@
 //!    [`Rope`](primitives::Rope) family, GQA attention helpers, quantization, the `nn` leaves,
 //!    and a safetensors [`Weights`](primitives::Weights) loader. These own MLX `Array`s directly
 //!    and deliberately depend on nothing from the gen-ai side.
-//! 2. [`config`] + [`models`] — model configuration ([`ModelConfig`](config::ModelConfig)) and the
-//!    generic Llama decoder ([`CausalLm`](models::CausalLm)), `&self` forward + `from_weights`.
-//! 3. [`decode`] — the streaming, cancellable decode loop ([`generate`](decode::generate)) that
-//!    drives any [`Decode`](decode::Decode) model, emitting a [`StreamEvent`](decode::StreamEvent)
+//! 2. [`config`] + [`models`] — model configuration ([`ModelConfig`]) and the
+//!    generic Llama decoder ([`CausalLm`]), `&self` forward + `from_weights`.
+//! 3. [`decode`] — the streaming, cancellable decode loop ([`generate`]) that
+//!    drives any [`Decode`](decode::Decode) model, emitting a [`StreamEvent`]
 //!    per token. This internal streaming API is what the backend-neutral `core-llm` contract
-//!    (story 7154) is extracted from. [`generate_batch`](decode::generate_batch) packs many requests
+//!    (story 7154) is extracted from. [`generate_batch`] packs many requests
 //!    into one forward step (story 7167), driven by `core_llm`'s backend-neutral scheduler policy;
-//!    [`generate_cached`](decode::generate_cached) reuses a shared prompt prefix's KV across requests
+//!    [`generate_cached`] reuses a shared prompt prefix's KV across requests
 //!    (story 7168), driven by `core_llm`'s backend-neutral prefix-index policy;
-//!    [`generate_prompt_lookup`](decode::generate_prompt_lookup) is n-gram speculative decoding
-//!    (story 7171) and [`generate_draft_speculative`](decode::generate_draft_speculative) is
+//!    [`generate_prompt_lookup`] is n-gram speculative decoding
+//!    (story 7171) and [`generate_draft_speculative`] is
 //!    draft-model speculative decoding (story 7172), both driven by `core_llm`'s backend-neutral
 //!    proposer + distribution-preserving acceptance sampler.
 //! 4. [`provider`] — implements the backend-neutral [`core_llm::TextLlm`] contract over the engine

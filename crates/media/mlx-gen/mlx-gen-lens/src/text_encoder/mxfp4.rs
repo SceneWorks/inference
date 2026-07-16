@@ -1,7 +1,7 @@
 //! MXFP4 dequantization for the gpt-oss MoE experts (the only MXFP4 tensors in the checkpoint).
 //!
 //! Faithful port of `transformers.integrations.mxfp4.convert_moe_packed_tensors`: each `uint8` byte
-//! packs two FP4 (e2m1) nibbles (low then high) looked up in [`FP4_VALUES`], and every block of 32
+//! packs two FP4 (e2m1) nibbles (low then high) looked up in `FP4_VALUES`, and every block of 32
 //! values (16 bytes) shares one `e8m0` scale (`exponent = scale − 127`, applied via `·2^exponent`).
 //! The dequantized rows are then transposed (`[E, out, G·32]` → `[E, G·32, out]`) to land in the
 //! `[E, in, out]` layout the eager `GptOssExperts` uses (`x · gate_up_proj[e]`).

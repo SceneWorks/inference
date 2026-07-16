@@ -8,10 +8,10 @@
 //! worker builds the per-mode control video + mask (replace_person = the person-region-neutralized
 //! clip + the person mask; pose/depth control = the render + an all-active mask; extend/bridge = the
 //! source frames at the kept positions + a generated-span mask) and passes them as one
-//! [`Conditioning::ControlClip`]. The provider VAE-encodes the inactive/reactive split + unfolds the
+//! [`mlx_gen::Conditioning::ControlClip`]. The provider VAE-encodes the inactive/reactive split + unfolds the
 //! mask into the 96-ch control latent ([`crate::vace::prepare_video_latents`] /
-//! [`prepare_masks`](crate::vace::prepare_masks)) and runs the CFG VACE denoise loop
-//! ([`denoise_vace`](crate::vace::denoise_vace)). Reference images (from [`Conditioning::Reference`])
+//! [`prepare_masks`]) and runs the CFG VACE denoise loop
+//! ([`denoise_vace`]). Reference images (from [`mlx_gen::Conditioning::Reference`])
 //! are encoded to leading latent frames and dropped after denoise (diffusers
 //! `latents[:, :, num_reference_images:]`).
 //!

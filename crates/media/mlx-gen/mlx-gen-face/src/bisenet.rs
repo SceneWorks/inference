@@ -277,7 +277,7 @@ pub fn to_parse_input(rgb01: &Array) -> Result<Array> {
 }
 
 /// PuLID `face_features_image`: `where(mask ∈ BG_LABELS, white(1.0), gray(rgb01))`, NHWC `[B,H,W,3]`.
-/// `rgb01` is the un-normalized `[0,1]` aligned crop; `mask` is [`parse_mask`] output.
+/// `rgb01` is the un-normalized `[0,1]` aligned crop; `mask` is `parse_mask` output.
 pub fn face_features_image(rgb01: &Array, mask: &Array) -> Result<Array> {
     let sh = rgb01.shape();
     let (b, h, w) = (sh[0] as usize, sh[1] as usize, sh[2] as usize);

@@ -1,6 +1,6 @@
 //! # mlx-gen-wan
 //!
-//! Wan2.2 **video** provider crate for [`mlx-gen`]. Port of the `mlx-video-with-audio` package's
+//! Wan2.2 **video** provider crate for [`mlx_gen`]. Port of the `mlx-video-with-audio` package's
 //! Wan path (`generate_wan.py`, `models/wan/*`) onto Rust + `mlx-rs`.
 //!
 //! **First-class target:** the **Wan2.2 TI2V-5B** — the dense 5B (dim 3072, 30 layers, in/out 48)
@@ -35,7 +35,7 @@
 //! swap (`t ≥ boundary·num_train`) between the high/low-noise experts, each with its own contexts,
 //! cross-KV, and guidance. Parity-gated e2e on two tiny seeded experts (both fired across the
 //! boundary).
-//! S6 — the live `wan2_2_t2v_14b` [`Generator::generate`] ([`model::Wan14b`]): the staged product
+//! S6 — the live `wan2_2_t2v_14b` [`mlx_gen::Generator::generate`] ([`model::Wan14b`]): the staged product
 //! pipeline (UMT5 encode → two real 40-layer experts → `denoise_moe` → z16 VAE decode → RGB8
 //! frames), verified end-to-end on the **real converted Wan2.2-T2V-A14B checkpoint** against a
 //! `mlx_video`-reference golden on matched injected noise (`tests/s6_real_parity.rs`, `#[ignore]` —
@@ -43,7 +43,7 @@
 //!
 //! sc-2680 — the dense **TI2V-5B** ([`model::Wan`]): the z48 [`Wan22Vae`] (`vae22`: channels-last
 //! causal-conv decoder/encoder, spatial 2×2 patchify, `DupUp3D`/`AvgDown3D`, RMS-L2 norm; gated by
-//! `tests/vae22_parity.rs`) + the dense [`Generator::generate`] — **T2V** ([`denoise`]) and
+//! `tests/vae22_parity.rs`) + the dense [`mlx_gen::Generator::generate`] — **T2V** ([`denoise`]) and
 //! **image-conditioned TI2V** mask-blend ([`denoise_ti2v`] + the DiT's per-token-timestep
 //! [`WanTransformer::forward_tokens`], gated by `tests/ti2v_parity.rs`). Q4/Q8 (`spec.quantize`) +
 //! LoRA/LoKr merge onto the single dense model. The full e2e on the real converted 5B checkpoint is

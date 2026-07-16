@@ -463,19 +463,20 @@ fn denoise_core(
 /// Curated unified-sampler denoise (epic 7114, sc-7121) — the **additive** k-diffusion alternative to
 /// SDXL's bespoke ancestral default. Drives any [`mlx_gen::Solver`] over a `DiscreteModelSampling`
 /// (ε-prediction) and an [`mlx_gen::Scheduler`]-built σ schedule, through the shared
-/// [`mlx_gen::run_curated_sampler`]. The ancestral default path ([`denoise_core`]) is left untouched —
+/// [`mlx_gen::run_curated_sampler`]. The ancestral default path (`denoise_core`) is left untouched —
 /// this is selected only when the request names a curated sampler/scheduler, so the N1 default-parity
 /// gate is byte-exact (the legacy loop is not entered).
 ///
 /// Supports txt2img / img2img / ControlNet / IP-Adapter (the `controls` / `ip` dispatch mirrors
-/// [`denoise_core`]). Inpaint is **not** offered here: its per-step mask blend has no post-step hook in
+/// `denoise_core`). Inpaint is **not** offered here: its per-step mask blend has no post-step hook in
 /// the callback-form `Sampler`, so it stays on the ancestral path (the same architectural boundary that
 /// keeps Ideogram's interleaved inpaint bespoke).
 ///
 /// The latents live in RAW k-diffusion σ-space (`x = ε·σ_max` at the start, `x₀ + ε·σ_start` for
-/// img2img — built by the caller), and the U-Net input is `x/√(σ²+1)` ([`DiscreteModelSampling`]'s
+/// img2img — built by the caller), and the U-Net input is `x/√(σ²+1)`
+/// ([`mlx_gen::DiscreteModelSampling`]'s
 /// `input_scale`), cast to the fp16 compute dtype inside the predict closure. The conditioning timestep
-/// is the nearest training index ([`DiscreteModelSampling::timestep`]) — ComfyUI's behaviour for a
+/// is the nearest training index (`mlx_gen::DiscreteModelSampling::timestep`) — ComfyUI's behaviour for a
 /// discrete model under a curated solver.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_curated(

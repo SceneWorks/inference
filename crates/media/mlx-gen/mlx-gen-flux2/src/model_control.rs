@@ -443,7 +443,7 @@ impl Flux2DevControl {
 }
 
 /// The Fun-Controlnet-Union is a *union* ControlNet (pose / canny / depth / … share one VAE-encoded
-/// control path), so the input-agnostic default [`AcceptedControlKinds::Any`] applies and all the
+/// control path), so the input-agnostic default [`mlx_gen::AcceptedControlKinds::Any`] applies and all the
 /// control boilerplate (resolve/validate-present + the load helpers above) comes from the shared
 /// trait (sc-8241). The default message bodies already match this variant's wording, so no override
 /// is needed.

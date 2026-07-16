@@ -2,13 +2,13 @@
 //! [`Generator`] entrypoint.
 //!
 //! [`Generator::generate`] maps the [`GenerationRequest`] conditioning onto the SCAIL-2 inputs and
-//! runs the live [`crate::generate`] denoise pipeline: the primary **reference character** is a
+//! runs the live [`crate::generate()`] denoise pipeline: the primary **reference character** is a
 //! [`Conditioning::Reference`] image paired with its color-coded [`Conditioning::Mask`]; the
 //! **driving video + per-frame color masks** are a [`Conditioning::ControlClip`]; `video_mode ==
 //! "replacement"` toggles the cross-identity `replace_flag` (else animation). Inference LoRA(s) from
 //! [`LoadSpec::adapters`] (the Bias-Aware DPO refinement LoRA + a lightx2v step-distill lightning
 //! LoRA, sc-5451) install onto the DiT as forward-time residuals. Multi-reference (extra characters,
-//! each needing its own paired mask) awaits the sc-5583 request contract; the [`crate::generate`]
+//! each needing its own paired mask) awaits the sc-5583 request contract; the [`crate::generate()`]
 //! core already supports extra characters via [`crate::CharacterRef`].
 
 use std::path::PathBuf;
@@ -80,7 +80,7 @@ pub fn descriptor() -> ModelDescriptor {
 }
 
 /// The loaded SCAIL-2 model: resolved config + snapshot dir + optional load-time quant. The heavy
-/// components (DiT / VAE / UMT5 / CLIP) are staged per-stage inside [`crate::generate`].
+/// components (DiT / VAE / UMT5 / CLIP) are staged per-stage inside [`crate::generate()`].
 pub struct Scail2 {
     descriptor: ModelDescriptor,
     config: Scail2Config,

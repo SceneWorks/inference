@@ -15,7 +15,7 @@
 //! The Qwen3-0.6B text encoder and the Qwen-Image VAE are SEPARATE files this converter never touches;
 //! they stay dense bf16 in every tier. The SceneWorks worker's install-time converter runs the same
 //! transformation via the shared [`mlx_gen::quant`] primitives — this crate-owned entry point (mirrors
-//! [`mlx_gen_flux2::quantize_flux2_dit`]) is what the rev-bump lockstep (sc-10523) lets the worker call
+//! `mlx_gen_flux2::quantize_flux2_dit`) is what the rev-bump lockstep (sc-10523) lets the worker call
 //! directly, so the two never drift.
 
 use std::collections::HashMap;

@@ -1,7 +1,7 @@
 //! Packed (pre-quantized) weight loading — the consume side of [`crate::convert`].
 //!
 //! A pre-quantized Q4/Q8 snapshot stores each quantized Linear as the packed triple
-//! `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`. The [`lin`] loader
+//! `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`. The `lin` loader
 //! **auto-detects** it by the presence of `{base}.scales` and builds the quantized module directly —
 //! so a published Q4 snapshot loads packed with no dense fp16/f32 transient. A dense snapshot (no
 //! `.scales`) loads dense exactly as before, so the same loader serves both.
@@ -17,7 +17,7 @@
 //! so all three tiers ship a dense VAE.
 //!
 //! This is the Group-B per-crate template (sc-8669), a thin wrapper over `mlx_gen::quant::lin` — plus
-//! [`lin_geglu_half`], the one SDXL-specific twist: the GEGLU `ff.net.0.proj` is stored on disk as a
+//! `lin_geglu_half`, the one SDXL-specific twist: the GEGLU `ff.net.0.proj` is stored on disk as a
 //! single `[2·hidden, D]` tensor and row-split into the value/gate halves at load. Because
 //! group-wise affine quantization is per-row independent, packing the whole `[2·hidden, D]` and
 //! row-slicing the packed triple `[lo:hi]` on load is byte-identical to the load-time split-then-

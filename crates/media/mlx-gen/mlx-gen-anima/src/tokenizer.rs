@@ -102,7 +102,7 @@ impl AnimaTokenizers {
     /// per-token weight vector (length `S`) aligned 1:1 with those ids. The emphasis syntax is
     /// stripped from the *text* — only the T5 **weights** carry it (the Qwen tower is weight-blind).
     /// The trailing EOS (id 1) gets weight `1.0`, matching ComfyUI, which forces special-token weights
-    /// to `1.0`. A prompt with no emphasis returns the same ids as [`encode_t5`] with an all-`1.0`
+    /// to `1.0`. A prompt with no emphasis returns the same ids as [`Self::encode_t5`] with an all-`1.0`
     /// weight vector (a strict no-op).
     ///
     /// Per ComfyUI (`AnimaTokenizer.tokenize_with_weights`), each span is tokenized independently and

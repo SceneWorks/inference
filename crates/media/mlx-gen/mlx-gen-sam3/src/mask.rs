@@ -277,7 +277,7 @@ pub struct Instance {
 }
 
 /// `post_process_instance_segmentation`: keep queries whose `σ(logits)·σ(presence) > threshold`,
-/// binarize `σ(mask) > mask_threshold`. Boxes (xyxy∈[0,1]) are scaled to `target_wh`. Masks are
+/// binarize `σ(mask) > mask_threshold`. Boxes (xyxy∈`[0,1]`) are scaled to `target_wh`. Masks are
 /// returned at the native 288² resolution (resize-to-image is the caller's concern).
 pub fn post_process_instances(
     pred_logits: &Array,     // [1, Q]

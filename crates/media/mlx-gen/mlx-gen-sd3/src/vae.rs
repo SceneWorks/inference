@@ -7,10 +7,10 @@
 //! to Z-Image's — 16-ch latents, `block_out_channels [128,256,512,512]`, `layers_per_block 2`,
 //! `norm_num_groups 32`, mid-block attention, no quant/post-quant conv — differing **only** in the
 //! two latent-normalization constants (`scaling_factor 1.5305` vs Z-Image's `0.3611`; `shift_factor
-//! 0.0609` vs `0.1159`). So this crate **reuses** the Z-Image 16-ch [`Vae`](mlx_gen_z_image::vae::Vae)
+//! 0.0609` vs `0.1159`). So this crate **reuses** the Z-Image 16-ch [`Vae`]
 //! (AutoencoderKL: GroupNorm-32 conv encoder/decoder + spatial mid-attention, with an
 //! already-parameterized scale/shift de-norm) and its diffusers→MLX VAE key remap, plugging SD3.5's
-//! own factors via [`Vae::from_weights_with_factors`](mlx_gen_z_image::vae::Vae::from_weights_with_factors).
+//! own factors via [`Vae::from_weights_with_factors`].
 //!
 //! Z-Image's VAE itself derives from the FLUX 16-ch VAE; the flux2 *32-ch packed* VAE (hardcoded
 //! `scale=1.0`/`shift=0.0`) is a **different family** and is deliberately NOT used here.

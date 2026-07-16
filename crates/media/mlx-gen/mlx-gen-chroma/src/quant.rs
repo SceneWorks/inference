@@ -5,7 +5,7 @@
 //! The shared [`mlx_gen::quant::lin`] **auto-detects** it by the presence of `{base}.scales` and
 //! builds the quantized module directly — so a published Q4 turnkey loads packed with no dense
 //! bf16/f32 transient. A dense snapshot (no `.scales`) loads dense exactly as before, so the same
-//! [`crate::transformer::Lin::load`] serves both.
+//! `crate::transformer::Lin::load` serves both.
 //!
 //! Chroma quantizes a **single** component: the DiT transformer's matmul-heavy block Linears (the
 //! double blocks' attention + FFN and the single blocks' attention + `proj_mlp`/`proj_out`). The
@@ -14,7 +14,7 @@
 //! tier, and so do the shared T5 text encoder and FLUX.1 VAE (never quantized here; their quant is a
 //! measurably-0% memory-only win and not wired). This matches
 //! [`crate::transformer::ChromaTransformer::quantize`] exactly. Because every Chroma `Lin::load`
-//! routes through [`lin`] below, a packed tier loads its block Linears as already-quantized bases and
+//! routes through `lin` below, a packed tier loads its block Linears as already-quantized bases and
 //! the in-app `.quantize()` becomes a no-op (`AdaptableLinear::quantize` no-ops on a quantized base);
 //! the dense embedders/Approximator load dense (no `.scales`), matching the load-time scope.
 //!

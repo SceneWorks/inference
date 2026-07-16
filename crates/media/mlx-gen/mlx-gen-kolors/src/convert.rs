@@ -14,9 +14,9 @@
 //!   any other Linear. The SDXL loader already **packed-detects** (`is_packed` guard → `quant::lin`),
 //!   so no engine change — this converter just has to pack the raw diffusers `unet/`.
 //! * **ChatGLM3-6B text encoder** — pack the four GLM-block projections
-//!   ([`is_chatglm_target`]); the token **embedding** and every `*_layernorm` stay dense (matching
+//!   (`is_chatglm_target`); the token **embedding** and every `*_layernorm` stay dense (matching
 //!   [`crate::chatglm3::ChatGlmModel::quantize`], which leaves the embedding dense and never touches
-//!   the norms). [`crate::chatglm3::ChatGlmLinear::load`] packed-detects the result.
+//!   the norms). `crate::chatglm3::ChatGlmLinear::load` packed-detects the result.
 //!
 //! The **VAE is never quantized** (the SDXL VAE runs f32 — fp16/int8-unstable), so every tier ships a
 //! dense VAE (mirror the source `vae/`). The **tokenizer** is baked: ChatGLM3 ships only a *slow*

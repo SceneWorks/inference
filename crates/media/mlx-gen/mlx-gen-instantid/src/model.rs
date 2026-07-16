@@ -262,7 +262,7 @@ impl InstantId {
         Ok(self)
     }
 
-    /// Attach the native face-analysis stack (SCRFD detector + ArcFace embedder) so [`generate`] can
+    /// Attach the native face-analysis stack (SCRFD detector + ArcFace embedder) so [`Self::generate`] can
     /// take a raw reference image. Weights come from `tools/convert_scrfd.py` / `convert_glintr100.py`.
     pub fn with_face(mut self, scrfd: &Weights, arcface: &Weights) -> Result<Self> {
         self.face = Some(FaceAnalysis::load(scrfd, arcface)?);
@@ -399,7 +399,7 @@ impl InstantId {
     }
 
     /// **Multi-view angle generation from caller-supplied landmarks** (sc-4425): the data-driven
-    /// sibling of [`generate_angle`]. Identical pipeline and square-canvas contract, but the 5-point
+    /// sibling of [`Self::generate_angle`]. Identical pipeline and square-canvas contract, but the 5-point
     /// kps come from the caller (`kps_norm`, normalized to a square `0.0..=1.0`) instead of the
     /// canonical [`kps::VIEW_ANGLE_KPS`] table. This lets SceneWorks own the angle/framing presets
     /// (built-in plus user-defined) so the engine no longer needs a hardcoded angle table. The
@@ -822,7 +822,7 @@ impl InstantId {
     /// **Face-restoration pass** (sc-3380): ADetailer-style identity recovery at full-body framing.
     /// Detect the largest face in `base`, crop it with `1.9×` padding, re-render that crop through the
     /// InstantID pipe (IdentityNet only — the OpenPose branch is a no-op at restore time, so this is
-    /// the single-control [`generate_with`] path) with the reference `embedding`, then paste it back
+    /// the single-control [`Self::generate_with`] path) with the reference `embedding`, then paste it back
     /// with a feathered elliptical mask. Recovers ArcFace identity from ~0.38 to ~0.88 at full-body
     /// framing. A no-op (returns `base` unchanged) when no face is found or the crop is degenerate.
     ///

@@ -179,7 +179,7 @@ pub fn resolve_pid_decoder(
 /// at an explicit degrade `capture_sigma` (the **achieved** σ of a partially-denoised `x_k`, in the
 /// flow-match frame). `0.0` reproduces the clean-latent decode. The caller is responsible for actually
 /// truncating its denoise schedule to the matching step (see [`mlx_gen::flow_capture_plan`]),
-/// so the latent it later hands to [`PidDecoder::decode`] really sits at this σ — this function only
+/// so the latent it later hands to `PidDecoder::decode` really sits at this σ — this function only
 /// binds σ into the decoder. Same `use_pid`/loaded-engine contract as [`resolve_pid_decoder`].
 pub fn resolve_pid_decoder_at_sigma(
     pid: Option<&PidEngine>,

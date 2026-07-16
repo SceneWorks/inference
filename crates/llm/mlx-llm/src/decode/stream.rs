@@ -7,7 +7,7 @@
 //! through a callback.
 //!
 //! Cancellation follows the established contract: a request that is *already cancelled* before any
-//! work returns the typed [`Error::Canceled`](crate::error::Error::Canceled); a cancel that trips
+//! work returns the typed [`Error::Canceled`]; a cancel that trips
 //! *mid-stream* stops promptly and returns the partial output marked
 //! [`FinishReason::Cancelled`].
 

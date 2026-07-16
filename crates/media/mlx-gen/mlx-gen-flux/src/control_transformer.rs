@@ -13,7 +13,7 @@
 //! a zero-init `controlnet_blocks[i]` Linear into a residual. The N residuals are returned (pre-scale)
 //! for the base transformer to add. It is NOT the VACE-style threaded control branch FLUX.2 uses
 //! (`Flux2ControlBranch`) — the Shakker FLUX.1 checkpoint is the diffusers residual-emitter shape, which
-//! is why the block math is the *same* [`JointBlock`] as the base (identical on-disk keys).
+//! is why the block math is the *same* `JointBlock` as the base (identical on-disk keys).
 //!
 //! Adapters (the character-identity LoRA) target the **base** transformer only — the control branch is
 //! never an adapter target (mirrors the FLUX.2 / Z-Image / Qwen control ports, and the fork, which

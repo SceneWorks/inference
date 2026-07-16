@@ -71,7 +71,7 @@ struct Combos {
 }
 
 /// A source conditioning segment's patch-embedded `(tokens, cos, sin)` with its source-id RoPE folded
-/// in — the reusable output of [`PackedForward::embed_sources`] (F-097 per-combo embedding cache).
+/// in — the reusable output of `PackedForward::embed_sources` (F-097 per-combo embedding cache).
 pub struct Segment {
     tokens: Array,
     cos: Array,
@@ -150,7 +150,7 @@ impl PackedForward {
         self.velocity_pre(dit, target, &embedded, t, cross_kv)
     }
 
-    /// [`Self::velocity`] over pre-embedded source [`Segment`]s (from [`Self::embed_sources`]) — the
+    /// [`Self::velocity`] over pre-embedded source [`Segment`]s (from `Self::embed_sources`) — the
     /// hot path when the same sources feed multiple combos/branches in one step.
     pub fn velocity_pre(
         &self,

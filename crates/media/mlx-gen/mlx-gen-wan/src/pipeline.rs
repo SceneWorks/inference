@@ -256,7 +256,7 @@ const VAE22_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 24), (48, 16), (32, 8
 
 /// **Memory-budgeted** tiling for the z48 `vae22` decode (sc-4998). Derives a safe peak-GB ceiling
 /// from this machine's MLX memory limit (× 0.85, matching [`preflight_denoise_memory_guard`]) and
-/// returns the *largest* tile that fits — see [`plan_vae22_tiling`] for the cases and the catchable
+/// returns the *largest* tile that fits — see `plan_vae22_tiling` for the cases and the catchable
 /// over-budget error. Caller passes the **output** dimensions (the decoded video size).
 pub fn auto_tiling_budgeted(
     height: i32,
@@ -635,7 +635,7 @@ fn predict_tokens(
 /// `is_i2v_mask_blend` path, sc-2680). The first latent temporal frame is pinned to the encoded
 /// image `z_img` and *frozen*: every step (1) builds the per-token timestep vector `t_tokens =
 /// mask_tokens · t` (`0` for the first-frame tokens, so they carry timestep 0), (2) predicts the
-/// noise with [`predict_tokens`], (3) scheduler-steps, then (4) re-blends `latents = (1−mask)·z_img +
+/// noise with `predict_tokens`, (3) scheduler-steps, then (4) re-blends `latents = (1−mask)·z_img +
 /// mask·latents` so the first frame stays the conditioning image while the rest denoise.
 ///
 /// `init_latents` is the pre-blended `[C,F,H,W]` start `(1−mask)·z_img + mask·noise`; `z_img` is the
@@ -716,7 +716,7 @@ pub struct Expert<'a> {
 /// experts are the same model.
 ///
 /// `y` is the optional I2V-14B channel-concat conditioning `[20, F, H, W]` ([`build_i2v_y`]),
-/// concatenated onto each forward's noise latent (see [`predict`]); `None` for T2V. It is constant
+/// concatenated onto each forward's noise latent (see `predict`); `None` for T2V. It is constant
 /// across steps and shared by both experts (the conditioning doesn't change with the noise level).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_moe(
@@ -899,7 +899,7 @@ pub fn decode_to_frames_22(
 /// Split a `[F, H, W, 3]` `uint8` video tensor (the [`decode_to_frames`] output) into one
 /// [`Image`] per frame. The tensor is transpose-strided, so a raw `as_slice` would read the
 /// physical (pre-transpose) buffer — `reshape` first re-materializes it in logical C-order, then we
-/// chunk the contiguous bytes `H·W·3` at a time (see [[mlx_rs_as_slice_physical_buffer]]).
+/// chunk the contiguous bytes `H·W·3` at a time (see `mlx_rs_as_slice_physical_buffer`).
 pub fn frames_to_images(frames_u8: &Array) -> Result<Vec<Image>> {
     let sh = frames_u8.shape(); // [F, H, W, 3]
     let (f, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);

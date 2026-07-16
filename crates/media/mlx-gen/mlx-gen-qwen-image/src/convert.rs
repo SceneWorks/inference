@@ -95,7 +95,7 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
 /// scope exactly: every control-block joint-attention / gated-FFN / adaLN Linear plus each block's
 /// `after_proj` and block-0's `before_proj` pack group-64; the `control_img_in` patch embedder (132
 /// in-features → `% 64 != 0`) and the 1-D per-head attn RMSNorms stay **dense** — both shape-guarded
-/// by [`quantize_map`], so reusing the base [`is_transformer_target`] predicate (the control blocks
+/// by [`quantize_map`], so reusing the base `is_transformer_target` predicate (the control blocks
 /// share the base block key layout 1:1) is faithfulness + documentation, not the only net.
 ///
 /// The packed keys keep their raw diffusers spelling; [`crate::loader::load_controlnet`] applies the

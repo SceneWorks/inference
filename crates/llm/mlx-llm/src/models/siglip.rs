@@ -3,7 +3,8 @@
 //! JoyCaption's LLaVA stack uses `google/siglip2-so400m-patch14-384` as its image encoder: a patch
 //! conv embedding + learned position embedding, a stack of pre-norm transformer encoder layers
 //! (bias-ful QKV, `gelu_pytorch_tanh` MLP), and a final post-layernorm. The decoder reads a chosen
-//! intermediate hidden state (JoyCaption: layer `-2`, all 729 patch tokens), so [`forward`] returns
+//! intermediate hidden state (JoyCaption: layer `-2`, all 729 patch tokens), so
+//! [`SiglipVisionTower::forward`] returns
 //! the HF-style `hidden_states` list (embeddings + one per layer) in addition to the post-normed
 //! `last_hidden_state`.
 //!
@@ -12,7 +13,7 @@
 //! projector casts them into the decoder.
 //!
 //! [`SiglipVisionConfig::default`] is the so400m-patch14-384 geometry; nothing here is
-//! JoyCaption-specific (the feature-layer choice lives with the VLM in [`super::joycaption`]).
+//! JoyCaption-specific (the feature-layer choice lives with the VLM in [`crate::joycaption`]).
 
 use mlx_rs::ops::add;
 use mlx_rs::Array;

@@ -122,7 +122,7 @@ impl VisionTransformer {
     /// Debug: same as [`forward`](Self::forward) but returns per-stage intermediates for parity
     /// bisection against the fork (`conv_input`, `patch_embed`, `reordered`, `block0`,
     /// `blocks_all`, `merger`, `final`). Not used in production — only the `*_real_weights` tests.
-    /// Delegates to the same [`forward_impl`](Self::forward_impl) as [`forward`](Self::forward), so
+    /// Delegates to the same `forward_impl` as [`forward`](Self::forward), so
     /// it can no longer silently drift from the real forward path.
     pub fn forward_capture(
         &self,

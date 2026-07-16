@@ -8,8 +8,8 @@
 //! SDPA) → LayerScale; (b) LN → MLP (fc1 → GELU → fc2) → LayerScale.
 //!
 //! For the DPT neck this backbone returns the **per-layer output hidden states** of the
-//! four `out_indices` layers ([3,6,9,12], 1-based → captured at layer-output indices
-//! [2,5,8,11]). Each is `[B, grid²+1, hidden]` *including* the CLS token; the neck drops
+//! four `out_indices` layers (`[3,6,9,12]`, 1-based → captured at layer-output indices
+//! `[2,5,8,11]`). Each is `[B, grid²+1, hidden]` *including* the CLS token; the neck drops
 //! the CLS token itself (matching `transformers`).
 //!
 //! Fixed-size note: the host preprocessor always feeds the default 518² square, so the

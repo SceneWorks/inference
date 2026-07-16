@@ -9,7 +9,7 @@
 //! (mlx convs are channels-last); conv weights are the on-disk `[O, kH, kW, I]` layout (no transpose).
 //!
 //! **`mid_block_add_attention` is `false`** for the shipped checkpoint (no `mid.attn_1` weights), so
-//! the mid block is `ResnetBlock → ResnetBlock`. The [`AttnBlock`] is implemented + config-gated for a
+//! the mid block is `ResnetBlock → ResnetBlock`. The `AttnBlock` is implemented + config-gated for a
 //! future `true`-with-weights checkpoint; see [`crate::config::AudioVaeConfig`] for the reference-bug
 //! note (its `load_audio_decoder` builds a random-weight mid attention).
 

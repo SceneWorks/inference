@@ -7,8 +7,8 @@
 //!   * **Trainable LoRA injection** — the model crates do NOT use mlx-rs's `Module`/`ModuleParameters`
 //!     system (hand-rolled `&self` forwards over raw `Array`s, `src/adapters.rs:6`), so training uses
 //!     the *functional* autograd: the trainable factors live OUTSIDE the model in a [`LoraParams`],
-//!     and each step they are re-injected into the target [`AdaptableLinear`]s as a single
-//!     `Adapter::Lora` via [`AdaptableLinear::set_adapters`]. The injection mirrors the inference
+//!     and each step they are re-injected into the target [`mlx_gen::adapters::AdaptableLinear`]s as a single
+//!     `Adapter::Lora` via [`mlx_gen::adapters::AdaptableLinear::set_adapters`]. The injection mirrors the inference
 //!     reload (`adapters::loader::install_lora_groups`) op-for-op, so the trained adapter round-trips
 //!     through the normal inference path bit-for-bit. The host-generic factor machinery lives in core
 //!     [`mlx_gen::train::lora`] (hoisted in sc-3045 so every family trainer shares it); this module
@@ -115,7 +115,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
 }
 
 /// Construct the trainer from a snapshot directory (the diffusers multi-component tree). No
-/// quantization — training needs the dense base. Registered via [`TrainerRegistration`].
+/// quantization — training needs the dense base. Registered via [`mlx_gen::TrainerRegistration`].
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,

@@ -279,7 +279,7 @@ impl WanScheduler for FlowDpmpp2m {
 // =====================================================================================
 
 /// UniPC predictor-corrector (B(h)=expm1(−h) / bh2 variant), `solver_order` (=2 for all Wan
-/// configs). The order-2 corrector solves a 2×2 system via [`solve_linear`] (the reference's
+/// configs). The order-2 corrector solves a 2×2 system via `solve_linear` (the reference's
 /// `np.linalg.solve`), assembled with the f64 factorial / `h_phi` recurrence.
 pub struct FlowUniPC {
     num_train_timesteps: usize,

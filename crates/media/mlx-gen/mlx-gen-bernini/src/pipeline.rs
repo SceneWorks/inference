@@ -3,7 +3,7 @@
 //! denoise in **spatial latent space**, decoding to an image (1 frame) or video.
 //!
 //! Mirrors `mlx_gen_wan::model::Wan14b`'s staging (UMT5 → experts → VAE) to bound peak memory, with
-//! the dual-expert CFG `denoise_moe` replaced by [`denoise_bernini`] (per-step
+//! the dual-expert CFG `denoise_moe` replaced by `denoise_bernini` (per-step
 //! [`crate::forward::guided_velocity`] over the resolved [`Mode`]).
 
 use std::path::PathBuf;
@@ -82,7 +82,7 @@ pub fn descriptor() -> ModelDescriptor {
 }
 
 /// The loaded Bernini renderer: resolved Wan2.2 config + Bernini knobs + the snapshot dir. The heavy
-/// components are staged inside [`generate`](BerniniRenderer::generate_impl).
+/// components are staged inside `generate_impl`.
 pub struct BerniniRenderer {
     descriptor: ModelDescriptor,
     config: WanModelConfig,
@@ -293,7 +293,7 @@ impl<'a> BVitExpert<'a> {
 
 /// The full-Bernini ViT-conditioned denoise loop (`sample_bernini_wvitcfg`, `wan_diffusion.py`
 /// 571-793) — the renderer-side compute that consumes the planner's 4 prompt streams. The boundary-
-/// switched, [`vit_one_step`]-guided analog of [`denoise_bernini`]: each step picks the expert by the
+/// switched, [`vit_one_step`]-guided analog of `denoise_bernini`: each step picks the expert by the
 /// `switch_dit_boundary`, multiplies **all four** omegas (incl. `omega_tgt`) by `omega_scale` once on
 /// the first low-noise step, and applies the UniPC flow step. Runs in spatial latent space
 /// `[16, T, H8, W8]`. The full end-to-end string-up (planner MAR loop → these 4 streams → here →

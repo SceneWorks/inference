@@ -5,7 +5,7 @@
 //! backend-neutral [`gen_core::sampling`] crate; this module keeps only the thin **tensor
 //! application**. Each sampler type below is a wrapper holding a [`gen_core::sampling::SamplerPolicy`]
 //! plus the MLX compute dtype, so the family-crate call sites are unchanged (D5). The neutral
-//! coefficients (`a_x`/`a_out`/`a_noise`/`c_in`) are applied by one shared [`apply_step`]; a candle
+//! coefficients (`a_x`/`a_out`/`a_noise`/`c_in`) are applied by one shared `apply_step`; a candle
 //! backend implements the same ~5 lines against the same policies.
 //!
 //! A [`DiffusionSampler`] owns a model's **denoise schedule**: the per-step conditioning timestep,
@@ -157,7 +157,7 @@ fn apply_step(
 
 /// The mlx-gen backend impl of [`gen_core::sampling::LatentOps`] — the tensor primitives the unified
 /// curated samplers (Euler / Heun / DPM++ 2M·SDE / UniPC / ancestral / LCM / DDIM, sc-7117) are
-/// written against. Carries the same byte-parity rules as the legacy [`apply_step`] so an engine's
+/// written against. Carries the same byte-parity rules as the legacy `apply_step` so an engine's
 /// DEFAULT sampler stays bit-identical after it migrates onto the unified framework (the N1 gate):
 /// `scale(x, 1.0)` and `axpy(1.0, x, b, y) = x + y·b` elide the multiply-by-one, and `randn_like`
 /// reuses the seed-derived [`StepRng`] subkey so a stochastic sampler is deterministic per request
@@ -307,8 +307,8 @@ impl GuidanceOps for MlxLatentOps {
 /// - `sigmas`: the descending schedule, length `num_steps + 1`, trailing `0.0`.
 /// - `predict(x_in, timestep)`: the engine's model forward returning the RAW (already CFG-combined)
 ///   output the prediction type expects — velocity for FLOW, ε for EPS, v for V. `x_in` is the
-///   `c_in`-scaled latent ([`ModelSampling::input_scale`]; identity for FLOW) and `timestep` is the
-///   conditioning value the model embeds at this σ ([`ModelSampling::timestep`]).
+///   `c_in`-scaled latent (`crate::ModelSampling::input_scale`; identity for FLOW) and `timestep` is the
+///   conditioning value the model embeds at this σ (`crate::ModelSampling::timestep`).
 ///
 /// Cancellation, the per-step `eval` (so a mid-render cancel lands within ~1 model eval instead of at
 /// VAE decode, and peak graph memory stays bounded — the sc-5399 rationale), and progress all route

@@ -256,7 +256,7 @@ const PRECISION_MSG: &str =
 ///
 /// Component residency (sc-11124, F-172): `Resident` (default) holds every heavy component warm;
 /// `Sequential` re-loads per generate in phase order to bound peak memory — routed through the shared
-/// [`load_control_residency`] builder.
+/// `load_control_residency` builder.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
     Ok(Box::new(ZImageTurboControl {

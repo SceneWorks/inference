@@ -5,7 +5,7 @@
 //! which physical blocks hold its tokens, and blocks are allocated on demand. Before attention the
 //! sequence's blocks are **gathered** back into a contiguous tensor and fed to the stock
 //! [`scaled_dot_product_attention`](mlx_rs::fast::scaled_dot_product_attention) — so the cache is a
-//! drop-in behind the [`KvCache`](crate::primitives::KvCache) trait and the decoder never changes.
+//! drop-in behind the [`KvCache`] trait and the decoder never changes.
 //! The custom Metal kernel that reads scattered blocks directly (removing the gather) is the perf
 //! follow-up, story 7170.
 //!

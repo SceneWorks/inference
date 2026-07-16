@@ -3,8 +3,8 @@
 //! MMDiT and apply back at `sd3_5_large` (and family-arch-identical Large-Turbo) inference (the
 //! Lens / Z-Image / Krea precedent: same architecture, no base-model gating, family-match suffices).
 //!
-//! [`Sd3LoraTrainer`] realizes the core [`Trainer`](mlx_gen::Trainer) contract on the real 38-block
-//! joint MMDiT, mirroring [`KreaRawTrainer`](mlx_gen_krea) — the model crates don't use mlx-rs's
+//! [`Sd3LoraTrainer`] realizes the core [`Trainer`] contract on the real 38-block
+//! joint MMDiT, mirroring `KreaRawTrainer` / `mlx_gen_krea` — the model crates don't use mlx-rs's
 //! `Module` system (hand-rolled `&self` forwards over raw `Array`s), so training uses the **functional
 //! autograd**: the trainable factors live OUTSIDE the model in a [`LoraParams`] map, re-injected each
 //! step into the target [`AdaptableLinear`](mlx_gen::adapters::AdaptableLinear)s via the shared core

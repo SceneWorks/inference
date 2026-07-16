@@ -5,13 +5,15 @@
 //! FLUX key layout and that it packs **four** components.
 //!
 //! FLUX.1 quantizes all three model parts (the fork's whole-model `nn.quantize`, wired in
-//! [`crate::model::load`]): the DiT transformer, the CLIP + T5 text encoders, and the (shared
+//! [`crate::model::load_schnell`] / [`crate::model::load_dev`]): the DiT transformer, the CLIP + T5
+//! text encoders, and the (shared
 //! Z-Image) VAE's mid-block attention. The transformer / CLIP / T5 fork predicates quantize **every**
 //! quantizable Linear + embedding, so the shared [`quantize_map`] shape guard (2-D, `in % gs == 0`,
 //! `in >= gs`) exactly selects them — the 1-D LayerNorm / RMSNorm scales pass through dense. The VAE
 //! packs only its attention projections (convs are 4-D, GroupNorms 1-D — both shape-guarded dense),
 //! matching the Z-Image VAE quant scope; the loader's prefix-drop + conv-transpose remap leaves the
-//! packed attn `{weight,scales,biases}` untouched. The result loads via [`crate::model::load`] with
+//! packed attn `{weight,scales,biases}` untouched. The result loads via
+//! [`crate::model::load_schnell`] / [`crate::model::load_dev`] with
 //! no dense bf16 transient (sc-8670). Group-B per-crate converter template (sc-8669).
 
 use std::path::Path;
@@ -62,7 +64,8 @@ fn quantize_component(
 
 /// Assemble a full pre-quantized turnkey snapshot in `dst_root`: pack the transformer, CLIP text
 /// encoder (`text_encoder/`), T5 text encoder (`text_encoder_2/`), and VAE, and copy the dense
-/// tokenizers / scheduler / `model_index.json` verbatim. The result loads via [`crate::model::load`]
+/// tokenizers / scheduler / `model_index.json` verbatim. The result loads via
+/// [`crate::model::load_schnell`] / [`crate::model::load_dev`]
 /// (packed weights auto-detect) with no dense transient. `bits` = 4 (Q4 tier) or 8 (Q8 tier). The
 /// bf16 tier is the dense source itself (no conversion — mirror it).
 pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {

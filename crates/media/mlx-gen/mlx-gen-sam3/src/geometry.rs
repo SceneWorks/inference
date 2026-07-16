@@ -140,7 +140,7 @@ impl Sam3GeometryEncoder {
     /// Quantize the geometry encoder's transformer-layer attention + FFN and the `final_proj`
     /// (Q8/Q4). The `boxes_direct_project` (4→C), `boxes_pos_enc_project` (258→C), the ROI-pool conv,
     /// embeddings, and norms stay dense (the small/odd projections aren't group-quantizable; see
-    /// [`crate::quantize_linear`]) (sc-4925).
+    /// `crate::quantize_linear`) (sc-4925).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         for layer in &mut self.layers {
             layer.quantize(bits)?;

@@ -590,7 +590,7 @@ fn dense_gather(x: &Array, w: &Array, b: &Array, idx: &Array, sorted: bool) -> R
 /// weighted by its router score.
 ///
 /// F-021 (sc-9500): routing runs **on device** (top-`k` via iterated `argmax`, no per-layer host
-/// sync) and the expert math is a **grouped GEMM** over the stacked [`ExpertBank`] — two `gather_qmm`
+/// sync) and the expert math is a **grouped GEMM** over the stacked `ExpertBank` — two `gather_qmm`
 /// (Q4/Q8) / `gather_mm` (dense) calls that touch only the `top_k` selected experts per token
 /// (mlx-lm's gpt-oss `SwitchGLU` construction, with `gate_up` kept fused → one gather). This drops
 /// the per-token expert FLOPs from `E`→`top_k` (32→4) and removes the ×24-per-reasoner-token host
@@ -598,7 +598,7 @@ fn dense_gather(x: &Array, w: &Array, b: &Array, idx: &Array, sorted: bool) -> R
 /// via `gather_qmm`'s `rhs_indices` — no dequant, so the memory footprint is unchanged.
 ///
 /// Two dispatch shapes (mlx-lm SwitchGLU): for small token counts (decode / short prompts) the direct
-/// broadcast gather; for `n·k ≥` [`GATHER_SORT_THRESHOLD`] (long prefill) the `(token, expert)` pairs
+/// broadcast gather; for `n·k ≥` `GATHER_SORT_THRESHOLD` (long prefill) the `(token, expert)` pairs
 /// are argsort-ed by expert so `gather_qmm`'s `sorted_indices` fast path runs contiguous per-expert
 /// GEMM, then scatter-unsorted back — without it the gathered path regresses vs dense at long prompts.
 pub struct GptOssMoe {
@@ -618,10 +618,10 @@ impl GptOssMoe {
     /// * **packed turnkey** (sc-8763) — `experts.{gate_up,down}_proj.{weight,scales,biases}` already
     ///   stored stacked Q4/Q8; loaded as-is with no dequant transient (the on-disk memory win).
     /// * **MXFP4 + load-time quant** (`quant = Some`, the ~12 GB path, sc-3172) — each projection is
-    ///   dequantized then re-quantized to MLX Q4/Q8 via [`prequantize_expert_proj`], which `eval`s the
+    ///   dequantized then re-quantized to MLX Q4/Q8 via `prequantize_expert_proj`, which `eval`s the
     ///   pack and frees the per-layer bf16 transient before the next layer loads (the full `~38 GB`
     ///   bf16 expert stack across 24 layers never co-resides).
-    /// * **MXFP4 dense** (`quant = None`) — dequantized to a stacked bf16 [`ExpertBank::Dense`].
+    /// * **MXFP4 dense** (`quant = None`) — dequantized to a stacked bf16 `ExpertBank::Dense`.
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
