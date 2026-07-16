@@ -28,6 +28,7 @@ pub mod pipeline;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod tier;
 pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
@@ -80,8 +81,9 @@ pub(crate) const DEFAULT_FPS: u32 = 30;
 ///
 /// Mochi is **text-to-video only** in the base preview (no audio, no I2V). It is **not** distilled, so
 /// it exposes **true CFG** (negative prompt + `guidance` scale). Quant tiers ship as pre-quantized
-/// per-tier checkpoints (epic 1788 / A6), *not* on-the-fly requant, so [`Capabilities::supported_quants`]
-/// is empty and `load` rejects a stray `spec.quantize`.
+/// per-tier checkpoints (epic 1788 / A6) — the tier dir IS the quant selection — *not* on-the-fly
+/// requant, so [`Capabilities::supported_quants`] is empty and `load` rejects an on-the-fly
+/// `spec.quantize` (honouring one only when it matches the tier dir's manifest, [`tier`]).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -199,13 +201,42 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "candle mochi does not support LoRA/LoKr".into(),
         ));
     }
-    // On-the-fly requant is not the Mochi tier mechanism (epic 1788: self-contained pre-quantized
-    // q4/q8/bf16 tier dirs, A6). Reject a stray `spec.quantize` rather than silently ignore it.
+    // Mochi ships **pre-quantized per-tier** dirs (epic 1788 / A6): the tier dir IS the quant selection
+    // (point WeightsSource at q4/q8/bf16), NOT on-the-fly requant. A stray `spec.quantize` is honoured
+    // only when it AGREES with the tier the dir already is (assert-against-manifest, LTX-style); a raw
+    // snapshot + `spec.quantize` stays rejected (there is no on-the-fly requant path).
     if let Some(q) = spec.quantize {
-        return Err(gen_core::Error::Unsupported(format!(
-            "mochi_1: spec.quantize={q:?} unsupported — Mochi ships pre-quantized per-tier \
-             checkpoints; point WeightsSource at the q4/q8/bf16 tier dir (no on-the-fly requant)"
-        )));
+        match tier::MochiTierPaths::detect(&root) {
+            Some(t) => {
+                // A quantized tier at a non-64 group would mis-align the MLX→GGML repack — fail loudly.
+                t.validate_group_size()?;
+                let want_bits = match q {
+                    Quant::Q4 => Some(4),
+                    Quant::Q8 => Some(8),
+                    other => {
+                        return Err(gen_core::Error::Unsupported(format!(
+                        "mochi_1: spec.quantize={other:?} has no Mochi tier (tiers are q4/q8/bf16)"
+                    )))
+                    }
+                };
+                let have_bits = t.manifest_bits()?;
+                if want_bits != have_bits {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "mochi_1: spec.quantize={q:?} (bits {want_bits:?}) disagrees with the tier at {} \
+                         (manifest bits {have_bits:?}). The tier dir IS the quant selection — point \
+                         WeightsSource at the matching q4/q8/bf16 dir instead of requesting a requant.",
+                        root.display()
+                    )));
+                }
+            }
+            None => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "mochi_1: spec.quantize={q:?} unsupported on a raw snapshot — Mochi ships \
+                     pre-quantized per-tier checkpoints; point WeightsSource at the q4/q8/bf16 tier dir \
+                     (no on-the-fly requant)"
+                )));
+            }
+        }
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(

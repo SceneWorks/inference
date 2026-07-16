@@ -24,10 +24,11 @@
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::quant::QLinear;
 use candle_gen::{CandleError, Result};
 
 use crate::nn::{
-    layer_norm_no_affine, linear_b, linear_nb, rms_weighted, rms_weightless, silu, timestep_sincos,
+    layer_norm_no_affine, linear_b, rms_weighted, rms_weightless, silu, timestep_sincos,
 };
 use crate::rope::MochiRope;
 
@@ -67,6 +68,18 @@ impl MochiDitConfig {
     pub fn inner_dim(&self) -> usize {
         self.num_heads * self.head_dim
     }
+
+    /// Visual SwiGLU hidden width (`FeedForward(mult=4)` × swiglu `2/3`): `inner·4·2/3` (= 8192). The
+    /// `ff.net.0.proj` maps `inner → 2·ff_inner`, `ff.net.2` maps `ff_inner → inner`. Matches the
+    /// crate's own block-fixture arithmetic and the real snapshot shapes.
+    pub fn ff_inner(&self) -> usize {
+        (self.inner_dim() * 4 * 2) / 3
+    }
+
+    /// Text (`ff_context`) SwiGLU hidden width: `pooled·4·2/3` (= 4096).
+    pub fn ff_ctx_inner(&self) -> usize {
+        (self.pooled_dim * 4 * 2) / 3
+    }
 }
 
 /// Per-head `qk_norm` epsilon (`MochiAttention(eps=1e-5)`), distinct from the block's `1e-6`.
@@ -91,72 +104,90 @@ fn tanh_gate_seq(gate: &Tensor) -> Result<Tensor> {
 
 // ---------------------------------------------------------------------------- SwiGLU FFN
 
-/// SwiGLU feed-forward (`FeedForward(activation="swiglu", bias=False)`): `proj` (`d → 2·inner`),
-/// split into `(value, gate)`, `value · silu(gate)`, then `out` (`inner → d`).
+/// SwiGLU feed-forward (`FeedForward(activation="swiglu", bias=False)`): `proj` (`d → 2·ff_inner`),
+/// split into `(value, gate)`, `value · silu(gate)`, then `out` (`ff_inner → d`). Both projections are
+/// [`MOCHI_QUANT_SUFFIXES`](../../mlx-gen/mlx-gen-mochi/src/convert.rs) targets, so each **packed-detects**
+/// on its `.scales` sibling (a pre-quantized q4/q8 tier) via `QLinear::linear_detect`, else stays dense.
 struct SwiGlu {
-    proj_w: Tensor, // [2·inner, d]
-    out_w: Tensor,  // [d, inner]
+    proj: QLinear, // [2·ff_inner, d]
+    out: QLinear,  // [d, ff_inner]
 }
 
 impl SwiGlu {
-    fn load(vb: &VarBuilder) -> Result<Self> {
+    /// `d` is the stream width (visual `inner`, text `pooled`); `ff_inner` the SwiGLU hidden width. The
+    /// dense fallback shapes off `(d, ff_inner)`; the packed path ignores them (dims come from the pack).
+    fn load(vb: &VarBuilder, d: usize, ff_inner: usize) -> Result<Self> {
         Ok(Self {
-            proj_w: vb.get_unchecked("net.0.proj.weight")?,
-            out_w: vb.get_unchecked("net.2.weight")?,
+            proj: QLinear::linear_detect(d, 2 * ff_inner, vb, "net.0.proj", false)?,
+            out: QLinear::linear_detect(ff_inner, d, vb, "net.2", false)?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = linear_nb(x, &self.proj_w)?;
+        // `forward_upcast`: the dense arm upcasts the bf16 weight to the f32 activation dtype per matmul
+        // (byte-identical to the old `linear_nb`); the packed arm dequantizes to f32 and matmuls (sc-7702).
+        let h = self.proj.forward_upcast(x)?;
         let parts = chunk_last(&h, 2)?;
         let gated = (&parts[0] * silu(&parts[1])?)?;
-        linear_nb(&gated, &self.out_w)
+        Ok(self.out.forward_upcast(&gated)?)
     }
 }
 
 // ---------------------------------------------------------------------------- attention
 
-/// Mochi joint attention (`MochiAttention` + `MochiAttnProcessor2_0`).
+/// Mochi joint attention (`MochiAttention` + `MochiAttnProcessor2_0`). The `to_q/k/v`, added
+/// `add_{q,k,v}_proj`, `to_out.0`, and `to_add_out` projections are `MOCHI_QUANT_SUFFIXES` targets, so
+/// each **packed-detects** on its `.scales` sibling (a pre-quantized q4/q8 tier) via
+/// `QLinear::linear_detect`, else loads dense unchanged. The per-head `qk_norm` weights stay dense.
 pub struct MochiAttention {
-    to_q: Tensor,
-    to_k: Tensor,
-    to_v: Tensor,
-    add_q: Tensor,
-    add_k: Tensor,
-    add_v: Tensor,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    add_q: QLinear,
+    add_k: QLinear,
+    add_v: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     norm_added_q: Tensor,
     norm_added_k: Tensor,
-    to_out_w: Tensor,
-    to_out_b: Tensor,
-    /// `(weight, bias)` for `to_add_out` — absent when `context_pre_only`.
-    to_add_out: Option<(Tensor, Tensor)>,
+    /// `to_out.0` (biased).
+    to_out: QLinear,
+    /// `to_add_out` (biased) — absent when `context_pre_only`.
+    to_add_out: Option<QLinear>,
     num_heads: usize,
     head_dim: usize,
 }
 
 impl MochiAttention {
     fn load(vb: &VarBuilder, cfg: &MochiDitConfig, context_pre_only: bool) -> Result<Self> {
+        let inner = cfg.inner_dim();
+        let pooled = cfg.pooled_dim;
         let g = |n: &str| vb.get_unchecked(n);
         let to_add_out = if context_pre_only {
             None
         } else {
-            Some((g("to_add_out.weight")?, g("to_add_out.bias")?))
+            // to_add_out: [pooled, inner] — the visual→text output projection (biased).
+            Some(QLinear::linear_detect(
+                inner,
+                pooled,
+                vb,
+                "to_add_out",
+                true,
+            )?)
         };
         Ok(Self {
-            to_q: g("to_q.weight")?,
-            to_k: g("to_k.weight")?,
-            to_v: g("to_v.weight")?,
-            add_q: g("add_q_proj.weight")?,
-            add_k: g("add_k_proj.weight")?,
-            add_v: g("add_v_proj.weight")?,
+            to_q: QLinear::linear_detect(inner, inner, vb, "to_q", false)?,
+            to_k: QLinear::linear_detect(inner, inner, vb, "to_k", false)?,
+            to_v: QLinear::linear_detect(inner, inner, vb, "to_v", false)?,
+            // add_{q,k,v}_proj: [inner, pooled] — the text stream is projected pooled → inner.
+            add_q: QLinear::linear_detect(pooled, inner, vb, "add_q_proj", false)?,
+            add_k: QLinear::linear_detect(pooled, inner, vb, "add_k_proj", false)?,
+            add_v: QLinear::linear_detect(pooled, inner, vb, "add_v_proj", false)?,
             norm_q: g("norm_q.weight")?,
             norm_k: g("norm_k.weight")?,
             norm_added_q: g("norm_added_q.weight")?,
             norm_added_k: g("norm_added_k.weight")?,
-            to_out_w: g("to_out.0.weight")?,
-            to_out_b: g("to_out.0.bias")?,
+            to_out: QLinear::linear_detect(inner, inner, vb, "to_out.0", true)?,
             to_add_out,
             num_heads: cfg.num_heads,
             head_dim: cfg.head_dim,
@@ -182,17 +213,18 @@ impl MochiAttention {
         let sv = visual.dim(1)?;
         let st = text.dim(1)?;
 
-        // Visual q/k/v (+ per-head qk_norm) with RoPE on q/k.
-        let q = self.to_heads(&linear_nb(visual, &self.to_q)?)?;
-        let k = self.to_heads(&linear_nb(visual, &self.to_k)?)?;
-        let v = self.to_heads(&linear_nb(visual, &self.to_v)?)?;
+        // Visual q/k/v (+ per-head qk_norm) with RoPE on q/k. `forward_upcast`: dense arm upcasts the
+        // bf16 weight to the f32 activation dtype (== the old `linear_nb`); packed arm dequantizes to f32.
+        let q = self.to_heads(&self.to_q.forward_upcast(visual)?)?;
+        let k = self.to_heads(&self.to_k.forward_upcast(visual)?)?;
+        let v = self.to_heads(&self.to_v.forward_upcast(visual)?)?;
         let q = rope.apply(&rms_weighted(&q, &self.norm_q, QK_NORM_EPS)?)?;
         let k = rope.apply(&rms_weighted(&k, &self.norm_k, QK_NORM_EPS)?)?;
 
         // Text q/k/v (+ per-head qk_norm), no RoPE.
-        let eq = self.to_heads(&linear_nb(text, &self.add_q)?)?;
-        let ek = self.to_heads(&linear_nb(text, &self.add_k)?)?;
-        let ev = self.to_heads(&linear_nb(text, &self.add_v)?)?;
+        let eq = self.to_heads(&self.add_q.forward_upcast(text)?)?;
+        let ek = self.to_heads(&self.add_k.forward_upcast(text)?)?;
+        let ev = self.to_heads(&self.add_v.forward_upcast(text)?)?;
         let eq = rms_weighted(&eq, &self.norm_added_q, QK_NORM_EPS)?;
         let ek = rms_weighted(&ek, &self.norm_added_k, QK_NORM_EPS)?;
         // v/ev come from bf16-stored projections; upcast to f32 to match q/k (rms/rope already f32).
@@ -219,9 +251,9 @@ impl MochiAttention {
         let vis = out.narrow(1, 0, sv)?;
         let txt = out.narrow(1, sv, st)?;
 
-        let hidden = linear_b(&vis, &self.to_out_w, &self.to_out_b)?;
+        let hidden = self.to_out.forward_upcast(&vis)?;
         let enc = match &self.to_add_out {
-            Some((w, b)) => Some(linear_b(&txt, w, b)?),
+            Some(l) => Some(l.forward_upcast(&txt)?),
             None => None,
         };
         Ok((hidden, enc))
@@ -286,14 +318,18 @@ impl MochiTransformerBlock {
         let ff_context = if context_pre_only {
             None
         } else {
-            Some(SwiGlu::load(&vb.pp("ff_context"))?)
+            Some(SwiGlu::load(
+                &vb.pp("ff_context"),
+                cfg.pooled_dim,
+                cfg.ff_ctx_inner(),
+            )?)
         };
         Ok(Self {
             norm1_w: vb.get_unchecked("norm1.linear.weight")?,
             norm1_b: vb.get_unchecked("norm1.linear.bias")?,
             norm1_context,
             attn: MochiAttention::load(&vb.pp("attn1"), cfg, context_pre_only)?,
-            ff: SwiGlu::load(&vb.pp("ff"))?,
+            ff: SwiGlu::load(&vb.pp("ff"), cfg.inner_dim(), cfg.ff_inner())?,
             ff_context,
             eps: cfg.eps,
         })
