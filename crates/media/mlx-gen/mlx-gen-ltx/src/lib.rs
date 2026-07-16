@@ -1,6 +1,6 @@
 //! # mlx-gen-ltx
 //!
-//! LTX-2.3 **video** (text-to-video) provider crate for [`mlx-gen`]. Port of the
+//! LTX-2.3 **video** (text-to-video) provider crate for [`mlx_gen`]. Port of the
 //! `mlx-video-with-audio` package's LTX video path (`generate_av.py`, `models/ltx/*`,
 //! `models/ltx/video_vae/*`) onto Rust + `mlx-rs`.
 //!

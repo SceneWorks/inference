@@ -7,8 +7,8 @@
 //! `apply_loras_to_model` (dequant Q8 → merge → dense bf16); residual is chosen because the shipped
 //! transformer is **Q8-only** at 22B — merging a full attn+ff LoRA would dequantize ~15 GB to bf16,
 //! and the net-new per-pass strength would double it — and because residual leaves the bit-exact base
-//! forward (sc-2842) untouched. Installed onto the model tree's [`Linear`]s via
-//! [`LtxDiT::adaptable_mut`](crate::transformer::LtxDiT::adaptable_mut).
+//! forward (sc-2842) untouched. Installed onto the model tree's [`crate::transformer::Linear`]s via
+//! `LtxDiT::adaptable_mut`.
 //!
 //! **Format.** PEFT `lora_A`/`lora_B` (`.default` infix tolerated) and kohya `lora_down`/`lora_up`,
 //! per-module `.alpha` (default = rank); real LTX-2.3 files ship PEFT, bf16, `diffusion_model.`-prefixed.

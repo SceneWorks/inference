@@ -32,7 +32,7 @@
 //! The foundation tier (sc-3181 … sc-3186) ships the crate scaffold, the [`config`] parser, the
 //! [`loader`] weight-map foundation, the [`qwen3`] backbone, the [`vision`] embedder, the [`fm`]
 //! flow-matching head, and the [`text`] tokenizer/template. sc-3187 (this slice) adds the
-//! [`runtime`] AR text-generation layer — the [`KvCache`](qwen3::KvCache) + cached forward, token
+//! [`runtime`] AR text-generation layer — the [`KvCache`] + cached forward, token
 //! [`Sampler`], greedy/sampled `generate`, and the `_generate_think` rollout — the runtime the
 //! generation modes build on. The generation modes (T2I / edit / interleave / VQA) and the
 //! `Generator` implementation and explicit registration land in the following stories.

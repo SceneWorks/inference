@@ -2,7 +2,7 @@
 //! sampling, and the `_generate_think` think/no-think rollout.
 //!
 //! SenseNova-U1 is a *generating* LLM, so beyond a forward pass it needs an AR runtime: a prefix is
-//! prefilled into a [`KvCache`](crate::qwen3::KvCache), then tokens are decoded one at a time —
+//! prefilled into a [`KvCache`], then tokens are decoded one at a time —
 //! each new token forwarded through the cached backbone at the next temporal position to produce
 //! the logits for the token after it. This module ports the reference's three pieces
 //! (`modeling_neo_chat.py`):
@@ -121,7 +121,7 @@ impl Qwen3Backbone {
 
     /// Like [`decode_logits`](Self::decode_logits) but reduces to the greedy next token **on device**
     /// — only the single argmax index is copied to host, not the whole `[vocab]` f32 row (~600 KB).
-    /// MLX `argmax` breaks ties to the lowest index, matching the host [`argmax`] (`torch.argmax`), so
+    /// MLX `argmax` breaks ties to the lowest index, matching the host `argmax` (`torch.argmax`), so
     /// the greedy stream is bit-identical (F-140).
     pub fn decode_argmax(&self, token: i32, pos_t: i32, cache: &mut KvCache) -> Result<i32> {
         let ids = Array::from_slice(&[token], &[1, 1]);

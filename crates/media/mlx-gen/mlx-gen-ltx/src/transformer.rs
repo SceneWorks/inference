@@ -323,7 +323,7 @@ struct LoraStack {
     pass: Cell<usize>,
 }
 
-/// A Linear: a base weight ([`LinearKind`]) plus an optional forward-time LoRA overlay. With no
+/// A Linear: a base weight (`LinearKind`) plus an optional forward-time LoRA overlay. With no
 /// adapters the forward is byte-identical to the pre-sc-2687 path (the Q8/dense base only).
 #[derive(Clone)]
 pub struct Linear {
@@ -1018,7 +1018,7 @@ impl RopeMemo {
 
 /// A per-block trainable LoRA target threaded into the gradient-checkpoint closure (sc-4942): the
 /// block-local resolution path (e.g. `["attn1", "to_q"]`) and the factor-map keys for its A/B, so
-/// [`LtxDiT::forward_with_main_checkpointed`] can pull each block's live factors out of the traced
+/// `LtxDiT::forward_with_main_checkpointed` can pull each block's live factors out of the traced
 /// `LoraParams` and re-install them inside the recompute segment. Built by the trainer from its
 /// resolved targets.
 pub struct BlockLoraRef {
@@ -1067,7 +1067,7 @@ impl LtxDiT {
 
     /// Issue a fresh per-stage RoPE epoch token (sc-7141). Call once at the top of a denoise loop and
     /// pass the returned token as `Some(epoch)` to every [`Self::forward`] in that loop: the per-stage
-    /// SPLIT-RoPE tables then compute on the first step and hit the [`RopeMemo`] for the rest. The
+    /// SPLIT-RoPE tables then compute on the first step and hit the `RopeMemo` for the rest. The
     /// counter is monotonic and never reused, so a later stage's token can't collide with an earlier
     /// stage's cached tables (which would silently corrupt RoPE).
     pub fn next_rope_epoch(&self) -> u64 {
@@ -1122,7 +1122,7 @@ impl LtxDiT {
 
     /// Cast the DiT to the `dtype` training compute precision in place — the sc-4942 bf16 lever. Casts
     /// every frozen leaf (patchify/adaLN/blocks/output) AND flips the activation mode via
-    /// [`Precision::with_compute_dtype`], so [`preprocess`](Self::preprocess) (which keys off
+    /// `Precision::with_compute_dtype`, so `preprocess` (which keys off
     /// `self.prec.dtype()`) runs the whole forward at the new dtype: bf16 halves the retained-activation
     /// working set (the dominant first-step cost on this Q-packed base) and matches the reference's own
     /// `quant_bf16` production-speed path. The trainable factors / loss / grads / optimizer stay f32
@@ -1945,7 +1945,7 @@ impl AvDiT {
 
     /// Issue a fresh per-stage RoPE epoch token (sc-7141). Call once at the top of a joint denoise loop
     /// and pass the returned token as `Some(epoch)` to every [`Self::forward`] in that loop, so all four
-    /// stream RoPE tables compute on the first step and hit the [`RopeMemo`]s for the rest. Monotonic
+    /// stream RoPE tables compute on the first step and hit the `RopeMemo`s for the rest. Monotonic
     /// and never reused, so a later stage can't collide with an earlier stage's cached tables.
     pub fn next_rope_epoch(&self) -> u64 {
         let e = self.rope_epoch.get();

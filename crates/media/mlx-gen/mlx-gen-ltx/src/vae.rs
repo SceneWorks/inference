@@ -563,7 +563,7 @@ impl LtxVideoVae {
         })
     }
 
-    /// Like [`from_weights`] but **defers** loading the encoder until the first [`encode`]:
+    /// Like [`Self::from_weights`] but **defers** loading the encoder until the first [`Self::encode`]:
     /// `vae_encoder.safetensors` (hundreds of MB) is never read for pure-T2V runs, which never encode
     /// (F-048). The decoder is built eagerly (every mode decodes). A missing encoder file surfaces as
     /// a clear error on the first `encode`, not at load.

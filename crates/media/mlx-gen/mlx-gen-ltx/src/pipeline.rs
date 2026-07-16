@@ -13,7 +13,7 @@
 //! `(x+1)/2·255` uint8 frames `[F, H, W, 3]` (the consuming app muxes these to MP4 — matching the
 //! Wan sibling, MP4 encoding is out of the crate).
 //!
-//! **Precision (S5 gate).** Run in the **f32** regime (latents f32, transformer [`Precision::quant_f32`],
+//! **Precision (S5 gate).** Run in the **f32** regime (latents f32, transformer `Precision::quant_f32`,
 //! upsampler/VAE f32) to gate the pipeline *math* — the 2-stage orchestration, the legacy Euler, the
 //! re-noise, the flatten/unflatten — bit-tight, isolated from bf16 rounding (consistent with the S3b
 //! DiT gate). The bf16-**production** end-to-end px>8 verdict is S6, which wires the real text encoder

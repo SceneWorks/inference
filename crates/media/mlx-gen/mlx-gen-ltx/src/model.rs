@@ -16,7 +16,7 @@
 //! matching how MP4 video muxing already lives outside the crate (the Wan sibling).
 //!
 //! The Gemma text-encoder weights are a **separate** snapshot (the base model dir holds only the
-//! `connector`/transformer/vae); [`resolve_gemma_dir`] locates them via `$LTX_GEMMA_DIR` or the HF
+//! `connector`/transformer/vae); `resolve_gemma_dir` locates them via `$LTX_GEMMA_DIR` or the HF
 //! cache (`mlx-community/gemma-3-12b-it-bf16`).
 //!
 //! **Quantization (sc-2686).** The transformer ships **selectively quantized** (attn/ff Linears
