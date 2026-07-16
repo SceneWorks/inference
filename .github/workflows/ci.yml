@@ -220,11 +220,13 @@ jobs:
       - name: Exercise LLM-only runtime catalog on NAX
         run: cargo test --locked --no-default-features --lib -p runtime-macos
 
-  # Compile-only gate for the CUDA feature — runs on every PR/push that touches the lane.
+  # Non-executing gate for the CUDA feature (compile, lint, docs) — runs on every PR/push that touches
+  # the lane.
   #
   # This exists because `--features cuda` code is invisible to every other lane: macOS cannot build it
   # (no CUDA toolkit) and the CPU/Linux lanes do not enable the feature, so a `#[cfg(feature = "cuda")]`
-  # file can be merged in a state that does not compile and nothing notices. That is not hypothetical —
+  # file can be merged in a state that does not compile, does not lint, or has broken docs, and nothing
+  # notices. That is not hypothetical —
   # `candle-gen-mochi`'s `tier_parity.rs` shipped with three E0308s and was only caught by hand on the
   # CUDA box (sc-11990). `--tests` is load-bearing here: the break was in a test target, so a bare
   # `cargo build` would still have missed it.
@@ -251,6 +253,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
+          components: clippy
       - name: Cache Cargo and CUDA objects
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Compile Candle CUDA packages and test binaries (no GPU required)
@@ -258,6 +261,20 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda --no-run
+      # The lint twin of the compile check above. The `candle-cpu` lane already Clippies this same
+      # package set with --all-targets, but it has no CUDA toolkit and so cannot pass --features cuda:
+      # every `#[cfg(feature = "cuda")]` target is invisible to it and reaches main unlinted. That is
+      # not hypothetical either — a `print_literal` in candle-gen-krea's cuda-gated
+      # `nvfp4_krea_dit_gpu.rs` sat red on main until it was found by hand (sc-12379). Keep this Clippy
+      # package set aligned with the compile check above.
+      #
+      # No GPU required, same as the steps around it: Clippy type-checks the crate graph (hence vcvars
+      # + nvcc for the candle-kernels build script) but creates no CUDA context and allocates no VRAM.
+      - name: Clippy Candle CUDA packages (no GPU required)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo clippy --locked --all-targets -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda -- -D warnings
       # The doc twin of the compile check above. The hosted rustdoc gate cannot pass --features cuda
       # (no CUDA toolkit), so `#[cfg(feature = "cuda")]` docs need this lane. Keep this doc package
       # set aligned with the compile check above; together with the hosted gate, the CPU and CUDA

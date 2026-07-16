@@ -432,8 +432,8 @@ fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
         "\n[sc-12110] ===== SC#1 THROUGHPUT — Krea 2 Turbo, 1024², CFG-free, exclusive GPU ====="
     );
     eprintln!(
-        "[sc-12110] {:<28} {:>12} {:>10}   {}",
-        "regime", "ms/step", "vs bf16", "lane"
+        "[sc-12110] {:<28} {:>12} {:>10}   lane",
+        "regime", "ms/step", "vs bf16"
     );
     for (tag, ms, lane) in &rows {
         eprintln!(

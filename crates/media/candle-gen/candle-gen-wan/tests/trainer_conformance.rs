@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::gen_core::{self, LoadSpec, TrainingItem, WeightsSource};
+use candle_gen::gen_core::{LoadSpec, TrainingItem, WeightsSource};
 use gen_core_testkit::TrainerProfile;
 
 /// The Wan A14B (T2V) base snapshot dir — `WAN_T2V_14B_SNAPSHOT` or the first HF-cache snapshot.
