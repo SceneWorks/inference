@@ -31,10 +31,10 @@ use crate::adapters::{
 };
 use crate::config::WanModelConfig;
 use crate::pipeline::{
-    align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, best_output_size, build_i2v_y,
-    build_ti2v_keyframe_z, build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames,
-    decode_to_frames_22, denoise, denoise_curated, denoise_moe, denoise_moe_curated, denoise_ti2v,
-    frames_to_images, latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image,
+    align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z,
+    build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames, decode_to_frames_22, denoise,
+    denoise_curated, denoise_moe, denoise_moe_curated, denoise_ti2v, frames_to_images,
+    latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image, reject_over_area,
     resolve_sampler_knobs, seq_len, ti2v_blend_init, Expert,
 };
 use crate::text_encoder::encode_text_staged;
@@ -271,6 +271,10 @@ impl Wan {
                 )));
             }
         }
+        // sc-12308: reject over-area rather than silently refitting it. The 5B keeps its OWN
+        // 901 120 budget — its 32-px grid makes 1280×704 the geometry it genuinely renders.
+        let (dw, dh) = grid(&self.config);
+        reject_over_area(MODEL_ID, req, dw, dh, self.config.max_area)?;
         // The TI2V mask-blend path (the `ti2v = Some(_)` branch of `generate_impl`) is entered by
         // Keyframe conditioning OR a Reference image — the contract checks below must cover both.
         let image_conditioned = !req.keyframes().is_empty() || i2v_reference(req).is_some();
@@ -792,6 +796,10 @@ impl Wan14b {
                 )));
             }
         }
+        // sc-12308: reject over-area rather than silently refitting it (T2V was uncapped entirely;
+        // I2V refit 1280×720 → 1264×704). Both A14B variants share the 14B family's 921 600 budget.
+        let (dw, dh) = grid(&self.config);
+        reject_over_area(id, req, dw, dh, self.config.max_area)?;
         // I2V channel-concat requires a single reference image (the first conditioning frame), and
         // does not support `trim_first_frames` (the reference builds `y` from `num_frames`, so an
         // extended noise length would mismatch the conditioning's temporal dim).
@@ -1064,19 +1072,25 @@ fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
 }
 
 /// Resolve the output `(width, height)` for a **dense** Wan path (5B TI2V, A14B): round the requested
-/// dims down to the `patch · vae_stride` grid, then enforce the model's `max_area` cap (I2V-14B /
-/// TI2V-5B: 704×1280) with an aspect-preserving, grid-aligned fit (`generate_wan.py`'s
-/// `_best_output_size`). A no-op cap for T2V (`max_area == 0`). Byte-identical block shared by the two
-/// dense `generate_impl` bodies (F-010); the VACE paths align differently (no cap) and don't use this.
+/// dims down to the `patch · vae_stride` grid. Byte-identical block shared by the two dense
+/// `generate_impl` bodies (F-010); the VACE paths align the same way inline and don't use this.
+///
+/// **sc-12308:** this used to also refit an over-`max_area` request via `best_output_size`, silently
+/// handing back a geometry the caller never asked for. The cap is now enforced in `validate_impl` by
+/// rejecting instead, so by the time this runs the area is already within budget — and since the
+/// alignment here only ever rounds *down*, it cannot push a validated request back over.
 fn resolve_capped_dims(req: &GenerationRequest, cfg: &WanModelConfig) -> (u32, u32) {
-    let mut width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
-    let mut height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
-    if cfg.max_area > 0 && (width as usize) * (height as usize) > cfg.max_area {
-        let dw = (cfg.patch_size.2 * cfg.vae_stride.2) as u32;
-        let dh = (cfg.patch_size.1 * cfg.vae_stride.1) as u32;
-        (width, height) = best_output_size(width, height, dw, dh, cfg.max_area);
-    }
+    let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
+    let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
     (width, height)
+}
+
+/// The model's `(dw, dh)` pixel grid = `patch · vae_stride` — the lattice every Wan geometry sits on.
+fn grid(cfg: &WanModelConfig) -> (u32, u32) {
+    (
+        (cfg.patch_size.2 * cfg.vae_stride.2) as u32,
+        (cfg.patch_size.1 * cfg.vae_stride.1) as u32,
+    )
 }
 
 /// Stable identity + advertised capabilities for the Wan2.2 I2V-A14B (dual-expert MoE image→video).
@@ -1181,36 +1195,37 @@ mod tests {
     }
 
     #[test]
-    fn resolve_capped_dims_aligns_down_without_cap() {
-        // T2V config has max_area == 0 (no cap): only the grid round-down applies. 14B aligns to
-        // patch.{1,2}·vae_stride.{1,2} = 2·8 = 16, so 130 → 128 on both axes.
+    fn resolve_capped_dims_aligns_down_only() {
+        // 14B aligns to patch.{1,2}·vae_stride.{1,2} = 2·8 = 16, so 130 → 128 on both axes.
         let cfg = WanModelConfig::wan22_t2v_14b();
-        assert_eq!(cfg.max_area, 0);
         assert_eq!(resolve_capped_dims(&req(130, 130), &cfg), (128, 128));
-        // Already on-grid + under any area → unchanged.
+        // Already on-grid → unchanged.
         assert_eq!(resolve_capped_dims(&req(128, 256), &cfg), (128, 256));
+        // The 5B's z48 VAE gives a 32-px grid instead.
+        let five_b = WanModelConfig::wan22_ti2v_5b();
+        assert_eq!(resolve_capped_dims(&req(720, 720), &five_b), (704, 704));
+        assert_eq!(resolve_capped_dims(&req(512, 512), &five_b), (512, 512));
     }
 
+    /// sc-12308 — this replaces `resolve_capped_dims_enforces_max_area_cap`, which asserted that an
+    /// over-area request SHRINKS. It no longer does: the cap is enforced by rejecting in
+    /// `validate_impl`, so this function only aligns. Alignment rounds *down*, so it can never push
+    /// a validated request back over budget — which is why the cap check can live at validate time.
     #[test]
-    fn resolve_capped_dims_enforces_max_area_cap() {
-        // The 5B (704×1280 cap, align 2·16 = 32) shrinks an over-area request, preserving aspect and
-        // the 32-grid; a request already under the cap is only aligned, never enlarged.
+    fn resolve_capped_dims_never_refits_over_area() {
         let cfg = WanModelConfig::wan22_ti2v_5b();
-        let align = (cfg.patch_size.1 * cfg.vae_stride.1) as u32; // 32
-        let (w, h) = resolve_capped_dims(&req(2048, 2048), &cfg);
+        // The geometry `validate_impl` would have rejected passes through UNCHANGED (bar alignment)
+        // rather than being silently refit to something the caller never asked for.
+        assert_eq!(resolve_capped_dims(&req(2048, 2048), &cfg), (2048, 2048));
         assert!(
-            (w as usize) * (h as usize) <= cfg.max_area,
-            "capped {w}x{h} must fit max_area {}",
-            cfg.max_area
+            2048 * 2048 > cfg.max_area,
+            "the guard belongs to validate, not to this function"
         );
-        assert_eq!(
-            (w % align, h % align),
-            (0, 0),
-            "capped dims stay grid-aligned"
-        );
-        assert!(w < 2048 && h < 2048, "over-area request must shrink");
-        // Under-cap request: align-only, no enlargement.
-        assert_eq!(resolve_capped_dims(&req(512, 512), &cfg), (512, 512));
+
+        // The 14B family's canonical 720p is at its cap and is a fixed point of the alignment.
+        let a14b = WanModelConfig::wan22_i2v_14b();
+        assert_eq!(resolve_capped_dims(&req(1280, 720), &a14b), (1280, 720));
+        assert_eq!(1280 * 720, a14b.max_area);
     }
 
     // ---- sc-10045: adapter routing at the two merge_adapters SITES (5B `Wan` + A14B `Wan14b`) ------

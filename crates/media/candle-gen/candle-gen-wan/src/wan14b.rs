@@ -645,7 +645,7 @@ impl Generator for Wan14bGenerator {
         if area > MAX_AREA_14B {
             return Err(gen_core::Error::Msg(format!(
                 "{id}: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
-                 (704×1280); reduce the resolution",
+                 (1280×720); reduce the resolution",
                 req.width, req.height
             )));
         }
@@ -947,7 +947,7 @@ mod tests {
                 sampler: Some("dpmpp2m".into()),
                 ..Default::default()
             },
-            // over the MAX_AREA_14B envelope — 1280×1280 (both grid-aligned) is 2.2× the cap (sc-9028)
+            // over the MAX_AREA_14B envelope — 1280×1280 (both grid-aligned) is 1.8× the cap (sc-9028)
             GenerationRequest {
                 prompt: "x".into(),
                 width: 1280,
@@ -984,12 +984,29 @@ mod tests {
             ..Default::default()
         };
 
-        // Exactly at the cap (704×1280 = 901 120 px, both multiples of 16) is accepted.
-        assert_eq!(704 * 1280, MAX_AREA_14B);
+        // Exactly at the cap (1280×720 = 921 600 px, both multiples of 16) is accepted.
+        assert_eq!(1280 * 720, MAX_AREA_14B);
         assert!(t2v
             .validate(&GenerationRequest {
                 width: 1280,
-                height: 704,
+                height: 720,
+                ..base.clone()
+            })
+            .is_ok());
+
+        // sc-12308 regression: `1280×720` is the 14B family's CANONICAL 720p (upstream
+        // `SUPPORTED_SIZES[t2v-A14B]`), and 720 = 45·16 is on the family's grid. It was rejected
+        // while this cap wrongly carried the TI2V-5B's `MAX_AREA_5B` (901 120) — a 5B number whose
+        // 704 comes from the 5B's 32-px grid. Both orientations must validate.
+        assert_ne!(
+            MAX_AREA_14B,
+            crate::config::MAX_AREA_5B,
+            "the 14B family must not reuse the 5B's area budget (sc-12308)"
+        );
+        assert!(t2v
+            .validate(&GenerationRequest {
+                width: 720,
+                height: 1280,
                 ..base.clone()
             })
             .is_ok());

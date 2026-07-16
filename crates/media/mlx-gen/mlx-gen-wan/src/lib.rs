@@ -82,8 +82,8 @@ pub use model_vace::{
     descriptor_vace, descriptor_vace_fun, WanVace, WanVaceFun, MODEL_ID_VACE, MODEL_ID_VACE_FUN,
 };
 pub use pipeline::{
-    best_output_size, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask, build_ti2v_multi_mask,
-    decode_to_frames, decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images,
+    build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames,
+    decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images,
     preprocess_i2v_image, preprocess_ti2v_image, ti2v_blend_init, Expert,
 };
 pub use rope::{rope_apply, RopeTable};

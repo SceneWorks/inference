@@ -144,9 +144,11 @@ pub(crate) fn read_optional_json(path: &Path, who: &str) -> CResult<Option<serde
 /// Shared request-geometry validation for **both** Bernini entry points (the full `bernini` pipeline and
 /// the `bernini_renderer`), hoisted so the full pipeline can't drift from the renderer's guards (F-095):
 /// reject an explicit `steps == 0`, a `width`/`height` that is not a multiple of [`SIZE_MULTIPLE_14B`],
-/// an area over [`MAX_AREA_14B`], and a `num_frames` that is not `1 + 4·k`. `id` prefixes the message so
-/// each provider names itself. Without these, a 328-px request dies with an opaque shape error at the
-/// first denoise step and `steps: Some(0)` is silently promoted to 1.
+/// a **multi-frame** area over [`MAX_AREA_14B`], and a `num_frames` that is not `1 + 4·k`. `id` prefixes
+/// the message so each provider names itself. Without these, a 328-px request dies with an opaque shape
+/// error at the first denoise step and `steps: Some(0)` is silently promoted to 1.
+///
+/// The area cap is deliberately **video-only** (`frames != Some(1)`) — see the comment at the check.
 pub fn validate_bernini_geometry(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
     if req.steps == Some(0) {
         return Err(gen_core::Error::Msg(format!(
@@ -160,11 +162,20 @@ pub fn validate_bernini_geometry(id: &str, req: &GenerationRequest) -> gen_core:
             req.width, req.height
         )));
     }
+    // sc-12308: [`MAX_AREA_14B`] is a **video** envelope — it bounds the denoise/decode peak of a
+    // multi-frame run (81 frames → 21 latent frames on the z16 VAE). The still-image lane
+    // (`bernini_image`, which the worker maps onto this same `bernini` engine with `frames: Some(1)`)
+    // renders ONE frame, ~21× less latent volume than an at-cap clip, so the video area budget does
+    // not describe it and must not gate it. Applying it anyway rejected `bernini_image`'s own
+    // manifest default of 1024×1024 (1 048 576 px) on candle (windows/linux) before any weights
+    // loaded — while macOS/mlx, which never capped, rendered it. The image lane stays bounded by the
+    // descriptor's `max_size` (1280 per edge), which the capability check enforces.
+    let is_still_image = req.frames == Some(1);
     let area = req.width as usize * req.height as usize;
-    if area > MAX_AREA_14B {
+    if !is_still_image && area > MAX_AREA_14B {
         return Err(gen_core::Error::Msg(format!(
             "{id}: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
-             (704×1280); reduce the resolution",
+             (1280×720); reduce the resolution",
             req.width, req.height
         )));
     }
@@ -404,5 +415,40 @@ mod tests {
             }
         )
         .is_ok());
+    }
+
+    /// sc-12308: the area cap is a VIDEO envelope and must not gate the still-image lane.
+    /// `bernini_image` is mapped onto this same `bernini` engine by the worker with `frames: Some(1)`,
+    /// and its manifest default is 1024×1024 — over even the corrected 14B video budget. It was
+    /// rejected on candle (windows/linux) before any weights loaded, while macOS/mlx rendered it.
+    #[test]
+    fn area_cap_is_video_only_and_admits_the_image_lane() {
+        let still = |w, h| GenerationRequest {
+            prompt: "x".into(),
+            width: w,
+            height: h,
+            frames: Some(1),
+            ..Default::default()
+        };
+
+        // The `bernini_image` manifest default (1 048 576 px) and its 720p buckets — all over the
+        // 921 600 video cap — must validate on the 1-frame lane.
+        const { assert!(1024 * 1024 > MAX_AREA_14B) };
+        assert!(validate_bernini_geometry("bernini_image", &still(1024, 1024)).is_ok());
+        assert!(validate_bernini_geometry("bernini_image", &still(1280, 720)).is_ok());
+        assert!(validate_bernini_geometry("bernini_image", &still(720, 1280)).is_ok());
+
+        // The image lane is still bound by the OTHER geometry guards — the 16-px grid in particular.
+        assert!(validate_bernini_geometry("bernini_image", &still(1000, 1000)).is_err());
+
+        // …and the video lane keeps its cap: the same geometry with a real frame count is rejected.
+        assert!(validate_bernini_geometry(
+            "bernini",
+            &GenerationRequest {
+                frames: Some(81),
+                ..still(1024, 1024)
+            }
+        )
+        .is_err());
     }
 }

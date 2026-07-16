@@ -36,6 +36,14 @@ pub const NEGATIVE_FALLBACK: &str =
 /// Spatial size must be a multiple of `vae_stride_spatial (16) × patch (2) = 32` so the latent
 /// (`H/16`) is even for the DiT 2×2 spatial patch.
 pub const SIZE_MULTIPLE: u32 = 32;
+/// Resolution envelope for the **TI2V-5B**: `width × height` must not exceed `1280·704`
+/// (901 120 px). This is upstream's own budget for the 5B and only the 5B — `Wan2.2`'s
+/// `wan/configs/__init__.py` gives `ti2v-5B` exactly two supported sizes, `1280*704` / `704*1280`
+/// (`MAX_AREA_CONFIGS` = 901 120). The 5B's z48 VAE has `vae_stride 16`, so its grid is
+/// [`SIZE_MULTIPLE`] = 32 and 720 is **off** that lattice — upstream therefore ships the 5B's 720p
+/// as `1280×704 (= 32·22)`. Do **not** reuse this for the 14B family, whose grid is 16 and whose
+/// budget is the larger [`MAX_AREA_14B`]; conflating the two is what sc-12308 fixes.
+pub const MAX_AREA_5B: usize = 1280 * 704;
 /// Minimum spatial size **per side** (px) for a coherent 5B render — the descriptor `min_size`,
 /// enforced by `gen_core::Capabilities::validate_request`. The z48 vae22 gives an effective
 /// pixel→DiT-token stride of `VAE_STRIDE_SPATIAL (16) × patch (2) = 32`, so the DiT denoises over a
@@ -226,11 +234,25 @@ pub const I2V_14B_BOUNDARY: f64 = 0.900;
 pub const I2V_14B_FLOW_SHIFT: f64 = 5.0;
 pub const I2V_14B_GUIDANCE_LOW: f32 = 3.5;
 pub const I2V_14B_GUIDANCE_HIGH: f32 = 3.5;
-/// Resolution envelope for the A14B MoE (both T2V and I2V): `width × height` must not exceed
-/// `704·1280` (901 120 px). Both variants keep two resident 14B experts, so an over-area request is a
-/// far-over-envelope run that would otherwise fail opaquely (OOM). Enforced in
-/// [`crate::wan14b`]'s `validate` — a request past the cap is rejected with an actionable message.
-pub const MAX_AREA_14B: usize = 704 * 1280;
+/// Resolution envelope for the **14B family** (A14B T2V + I2V, Wan2.1-VACE-14B, SCAIL-2, Bernini):
+/// `width × height` must not exceed `1280·720` (921 600 px). Enforced in [`crate::wan14b`]'s
+/// `validate` — a request past the cap is rejected with an actionable message.
+///
+/// This is upstream's own budget: `Wan2.2`'s `wan/configs/__init__.py` gives `t2v-A14B` and
+/// `i2v-A14B` the sizes `1280*720` / `720*1280` / `832*480` / `480*832` (`MAX_AREA_CONFIGS`
+/// = 921 600), and `Wan2.1` gives `vace-14B` the same set. The 14B rides the z16 VAE, so its grid is
+/// [`SIZE_MULTIPLE_14B`] = 16 and **720 = 45·16 is on-lattice**: `1280×720` is the family's canonical
+/// 720p and must render as asked.
+///
+/// **sc-12308 — do not "borrow" the 5B's number again.** This constant previously read
+/// `704 * 1280` (901 120), which is [`MAX_AREA_5B`] — the *TI2V-5B's* budget, whose 704 comes from
+/// the 5B's 32-px grid, not from any 14B limit. Being 2.3 % low, it excluded exactly the canonical
+/// `1280×720 = 921 600` bucket: candle hard-errored on it, mlx's I2V silently refit it to
+/// `1264×704`, and the manifest was walked down to the 5B's `1280x704` to accommodate the mistake
+/// (sc-12294) — so the flagship 14B models could not render their own 720p. The OOM concern that
+/// first enforced this cap (sc-9028) is preserved: that finding was `1280×1280` (1 638 400 px,
+/// 1.8× this cap), which is still rejected.
+pub const MAX_AREA_14B: usize = 1280 * 720;
 
 // ===========================================================================================
 // Wan-VACE (Wan2.1-VACE-14B) — controllable video (replace_person / extend / bridge)
