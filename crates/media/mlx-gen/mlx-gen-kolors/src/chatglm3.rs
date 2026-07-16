@@ -3,7 +3,7 @@
 //! (`diffusers/pipelines/kolors/text_encoder.py`, `ChatGLMModel`), driven by `encode_prompt`
 //! with `output_hidden_states=True`.
 //!
-//! Patterned on [`mlx_gen_ltx::gemma`] (Config / Quant / Linear-enum / Layer / Model, a
+//! Patterned on `mlx_gen_ltx::gemma` (Config / Quant / Linear-enum / Layer / Model, a
 //! `forward → Vec<Array>` of hidden states), with the ChatGLM3-specific pieces:
 //!
 //!  - **Half-dim interleaved RoPE.** Rotary applies to the **first `rotary_dim` (64)** of the
@@ -388,7 +388,7 @@ impl ChatGlmModel {
     /// `all_hidden_states` exposes: `[embedding, out(layer 0), …, out(layer 27)]`, each `[B,S,hidden]`,
     /// the last entry **pre**-`final_layernorm`. `input_ids` / `attention_mask` are `[B, S]` (i32);
     /// `attention_mask` is 1 for valid tokens, 0 for padding. RoPE positions are a plain `0..S` arange
-    /// (the reference default when `position_ids=None`); use [`forward_with_positions`] for Kolors'
+    /// (the reference default when `position_ids=None`); use [`Self::forward_with_positions`] for Kolors'
     /// left-padded `position_ids`.
     pub fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<Vec<Array>> {
         self.forward_with_positions(input_ids, attention_mask, None)

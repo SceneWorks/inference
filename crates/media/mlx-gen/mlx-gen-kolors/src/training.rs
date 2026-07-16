@@ -17,7 +17,7 @@
 //!     (4096→2048) and the 5632-wide add-embedding from the Kolors checkpoint (sc-3093), so its
 //!     `forward` consumes the ChatGLM `(context, pooled)` directly.
 //!   * **Micro-conditioning `time_ids` = `(H, W, 0, 0, H, W)`.** Kolors inference feeds the real
-//!     resolution ([`crate::model::kolors_time_ids`], the diffusers `_get_add_time_ids`), unlike the
+//!     resolution (`crate::model::kolors_time_ids`, the diffusers `_get_add_time_ids`), unlike the
 //!     SDXL engine which hardcodes `[512,512,0,0,512,512]`. Training feeds the **same** real-resolution
 //!     ids at the bucketed training edge so the LoRA learns under the conditioning inference applies it
 //!     under.
@@ -197,7 +197,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// Construct the trainer from a `Kwai-Kolors/Kolors-diffusers` snapshot directory (the multi-component
 /// tree: `tokenizer/ text_encoder/ unet/ vae/`, with the materialized `tokenizer/tokenizer.json`).
 /// Loads the base at **f32** (training needs the dense, high-precision base for clean autograd;
-/// inference runs fp16). Registered via [`TrainerRegistration`].
+/// inference runs fp16). Registered via [`mlx_gen::TrainerRegistration`].
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,

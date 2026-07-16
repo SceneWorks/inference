@@ -1,7 +1,7 @@
 //! Packed (pre-quantized) weight loading — the consume side of [`crate::convert`].
 //!
 //! A pre-quantized Q4/Q8 snapshot stores each quantized Linear as the packed triple
-//! `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`. The [`lin`] loader
+//! `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`. The `lin` loader
 //! **auto-detects** it by the presence of `{base}.scales` and builds the quantized module directly —
 //! so a published Q4 snapshot loads packed with no dense bf16 transient. A dense snapshot (no
 //! `.scales`) loads dense exactly as before, so the same loader serves both.
