@@ -473,7 +473,7 @@ fn conditioner_forward(cond: &AnimaTextConditioner, inp: &AnimaCondInputs) -> Re
 
 /// The conditioner's INPUTS produced by phase A (sc-10840) — materializable before the Qwen3 TE is
 /// dropped under `Sequential`: the masked Qwen3 `source` states `[1, S, 1024]`, the T5 query ids
-/// `[1, St]`, and the per-token T5 weights (host data). The heavy phase's [`conditioner_forward`]
+/// `[1, St]`, and the per-token T5 weights (host data). The heavy phase's `conditioner_forward`
 /// consumes these.
 pub struct AnimaCondInputs {
     /// Masked Qwen3 states `[1, S, 1024]`, in the TE's compute dtype (bf16 production).
@@ -550,7 +550,7 @@ impl AnimaHeavy {
 
     /// Render one image from PRE-COMPUTED conditioner outputs (sc-10840): seed → noise → flow denoise
     /// (`dit`, bf16) → VAE decode → RGB. The single render body shared by both residencies — the same
-    /// [`denoise_loop`] + decode the resident `AnimaPipeline::generate` runs, so a `Sequential` job
+    /// `denoise_loop` + decode the resident `AnimaPipeline::generate` runs, so a `Sequential` job
     /// (Qwen3 TE already dropped) is byte-identical to `Resident`. `cond`/`uncond` are the conditioner
     /// outputs (not inputs); `uncond` is `Some` only for CFG variants.
     #[allow(clippy::too_many_arguments)]

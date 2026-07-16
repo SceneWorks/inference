@@ -3,7 +3,7 @@
 //!
 //! Consumes the finest FPN vision feature (72²) + the projected text features (SAM3-B) and produces,
 //! for 200 object queries: open-vocabulary concept logits (`pred_logits`), refined boxes
-//! (`pred_boxes`, xyxy∈[0,1]), and the global `presence_logits`. All standard attention — no
+//! (`pred_boxes`, xyxy∈`[0,1]`), and the global `presence_logits`. All standard attention — no
 //! deformable attention, no NMS, no Hungarian (set prediction). The decoder's vision cross-attention
 //! is biased by a **BoxRPB** relative-position bias (log-scale-encoded box↔grid deltas), and boxes
 //! are refined iteratively across the 6 layers. Token layout `[B, seq, C]`.
@@ -506,7 +506,7 @@ impl Sam3Detector {
 
     /// Quantize the DETR encoder/decoder attention + FFN, the box/presence/ref-point heads, and the
     /// dot-product scoring (Q8/Q4). The BoxRPB `2→256` embedders, embeddings, and norms stay dense
-    /// (the `2→256` projections are not group-quantizable; see [`crate::quantize_linear`]) (sc-4925).
+    /// (the `2→256` projections are not group-quantizable; see `crate::quantize_linear`) (sc-4925).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         for layer in &mut self.enc_layers {
             layer.quantize(bits)?;

@@ -99,7 +99,7 @@ pub const MODEL_ID: &str = "sdxl";
 
 /// PiD latent-space backbone tag (epic 7840, sc-7848): the `sdxl` student in
 /// [`mlx_gen_pid::registry`] (SDXL's 4-ch, `0.13025`-affine VAE latent). The whole SDXL family
-/// shares this latent space, so [`mlx-gen-kolors`](mlx_gen_kolors) (and the RealVisXL variants,
+/// shares this latent space, so `mlx-gen-kolors` (and the RealVisXL variants,
 /// which register under this same `"sdxl"` generator) reuse this tag rather than redeclaring it.
 pub const PID_BACKBONE: &str = "sdxl";
 

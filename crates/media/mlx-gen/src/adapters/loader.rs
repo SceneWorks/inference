@@ -13,7 +13,7 @@
 //!   sc-2618): the flattened module path can't be re-split blindly, so it resolves through a
 //!   `flattened → dotted` table built from [`AdaptableHost::adaptable_paths`]
 //!   ([`apply_lora_kohya`]). kohya `lora_down`/`lora_up` == PEFT `lora_A`/`lora_B`, so both feed the
-//!   shared [`install_lora_groups`] and a kohya file yields the identical adapter to its PEFT twin.
+//!   shared `install_lora_groups` and a kohya file yields the identical adapter to its PEFT twin.
 //!
 //! - **BFL / ComfyUI** (`lora_unet_double_blocks_*` / `diffusion_model.…` / `base_model.model.…`,
 //!   sc-2743): a *fused* source linear (`…img_attn.qkv`, `…linear1`) is row-sliced into the model's
@@ -765,7 +765,7 @@ pub fn parse_loha_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyL
 /// Install a third-party LyCORIS **LoHa** file onto `host`. Reconstructs each module's Hadamard delta
 /// and stacks it as an [`Adapter::Lokr`] residual (the reconstructed `ΔW` applies through the same
 /// `scale · x·ΔWᵀ` forward path — no distinct adapter variant needed). Module-key resolution
-/// (flattened-prefixed → dotted via [`kohya_table`]) and unmatched-path surfacing mirror
+/// (flattened-prefixed → dotted via `kohya_table`) and unmatched-path surfacing mirror
 /// [`apply_lokr_thirdparty`].
 ///
 /// The Hadamard product has **no deferred (unmaterialized) form** — unlike LoKr's Kronecker vec-trick —
@@ -980,7 +980,7 @@ fn kohya_table(paths: &[String]) -> BTreeMap<String, String> {
 /// onto `host`. The flattened stem is resolved against `table` (built from
 /// [`AdaptableHost::adaptable_paths`]) — blind `_`→`.` splitting is impossible because module names
 /// contain underscores (`to_out.0`, `feed_forward.w1`, `img_mlp.net.0.proj`). Resolved factors are
-/// installed through the same [`install_lora_groups`] path as PEFT, so a kohya file produces the
+/// installed through the same `install_lora_groups` path as PEFT, so a kohya file produces the
 /// identical adapter to the equivalent PEFT file.
 ///
 /// `lora_unet_` keys whose stem is NOT in the table (off-surface) are surfaced in `unmatched_paths`
@@ -1184,7 +1184,7 @@ const LORA_FACTOR_SUFFIXES: [&str; 5] = [
 /// Install a BFL / ComfyUI fused→split LoRA onto `host` (sc-2743). Each file key is matched against
 /// the inverted [`BflTarget`] index; a matched *fused* source is row-sliced per destination and fanned
 /// into the diffusers split targets (`…img_attn.qkv` → `attn.to_q/to_k/to_v`), a plain rename is copied
-/// through. Resolved factors feed the same [`install_lora_groups`] path as PEFT/kohya (transpose +
+/// through. Resolved factors feed the same `install_lora_groups` path as PEFT/kohya (transpose +
 /// `alpha/rank` fold), so a BFL file yields the byte-identical adapter to the equivalent diffusers
 /// split-target LoRA.
 ///

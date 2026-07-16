@@ -61,7 +61,7 @@ impl BooguTextEncoder {
         })
     }
 
-    /// Quantize every decoder-layer projection in place (group-wise Q4/Q8 at [`crate::quant::GROUP_SIZE`]
+    /// Quantize every decoder-layer projection in place (group-wise Q4/Q8 at `crate::quant::GROUP_SIZE`
     /// = 32). The **token embedding stays dense**: its only quantizer (`TokenEmbedding::quantize`)
     /// hardcodes group 64 in shared gen-core, which would clash with the group-32 Linears under the
     /// single-group-size packed loader — and the embedding is a precision-sensitive lookup table

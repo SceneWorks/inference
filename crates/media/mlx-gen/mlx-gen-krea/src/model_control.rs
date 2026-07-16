@@ -43,7 +43,8 @@ const DEFAULT_STEPS: u32 = 8;
 /// Q4/Q8 base (sc-11727, candle-gen PR #471): the earlier "dense-only" gate assumed a packed base would
 /// desync the main-stream activations the residual was trained against. That assumption was refuted — a
 /// q8 base is visually indistinguishable from bf16 and q4 keeps the pose-lock fully intact (GPU-proven on
-/// the candle twin). mlx-gen's control lane reuses the same packed-capable [`Krea2Transformer`] as txt2img,
+/// the candle twin). mlx-gen's control lane reuses the same packed-capable
+/// [`crate::transformer::Krea2Transformer`] as txt2img,
 /// so a packed snapshot runs a **true packed forward** (real memory savings), not candle's dequant-to-bf16
 /// VRAM overlay — so we inherit the base Turbo `&[Q4, Q8]` rather than blanking it.
 pub fn descriptor() -> ModelDescriptor {
@@ -104,7 +105,7 @@ impl ControlHeavyOwned {
 
 /// Construct a [`KreaTurboControl`] from a [`LoadSpec`].
 ///
-/// `spec.weights` must be a [`WeightsSource::Dir`] `krea/Krea-2-Turbo` snapshot (`transformer/
+/// `spec.weights` must be a [`mlx_gen::WeightsSource::Dir`] `krea/Krea-2-Turbo` snapshot (`transformer/
 /// text_encoder/ vae/ tokenizer/`) — a dense bf16 tier OR a pre-packed Q4/Q8 turnkey — and `spec.control`
 /// (required) the converted MLX pose overlay (`control_step5000` — a single `.safetensors` `File`, or a
 /// `Dir` of shards). Raw-trained LoRA/LoKr in `spec.adapters` install onto the base DiT (the branch is

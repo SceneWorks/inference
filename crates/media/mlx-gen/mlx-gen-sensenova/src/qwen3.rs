@@ -48,7 +48,7 @@ fn mll<E: std::fmt::Display>(e: E) -> Error {
 /// Re-export the shared KV cache under the crate's historical name so the AR runtime + denoise loops
 /// (`runtime.rs`, `t2i.rs`) keep naming one type. The persisting `update_cache=True` append is the
 /// trait's [`ContiguousKvCache::update`]; the non-persisting `update_cache=False` denoise read is
-/// [`extend_use_only`].
+/// `extend_use_only`.
 pub type KvCache = ContiguousKvCache;
 
 /// Non-persisting cache use (`update_cache=False`): concat the cached prefix with this step's K/V for
@@ -481,7 +481,7 @@ impl Qwen3Backbone {
     }
 
     /// Build the tri-axis RoPE tables + block mask for `(temporal, height, width)` position indexes
-    /// at cache prefix length `past`. Hoisted out of [`forward_cached`] so the denoise loops can
+    /// at cache prefix length `past`. Hoisted out of [`Self::forward_cached`] so the denoise loops can
     /// build it once per cache and reuse it across all steps (F-139); see [`RopeMask`].
     pub fn prepare_rope_mask(
         &self,
@@ -507,7 +507,7 @@ impl Qwen3Backbone {
         })
     }
 
-    /// The decoder stack over `embeds` using a prebuilt [`RopeMask`]. Identical to [`forward_cached`]
+    /// The decoder stack over `embeds` using a prebuilt [`RopeMask`]. Identical to [`Self::forward_cached`]
     /// once the RoPE/mask are built; split out so the per-step builds can be hoisted (F-139). The
     /// `RopeMask`'s `past` must match `cache.offset()` — true within a denoise run (use-only `append =
     /// false` leaves the cache length fixed).

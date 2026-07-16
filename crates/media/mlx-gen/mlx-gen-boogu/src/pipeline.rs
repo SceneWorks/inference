@@ -14,10 +14,10 @@
 //! The assembled model splits into two component bundles so a `Sequential`-offload generate can drop
 //! the ~17.5 GB Qwen3-VL `mllm/` encoder before the ~20.6 GB DiT loads:
 //!
-//! * [`BooguEncoders`] — the phase-A **mllm** (Qwen3-VL condition encoder + its lazily-loaded vision
+//! * `BooguEncoders` — the phase-A **mllm** (Qwen3-VL condition encoder + its lazily-loaded vision
 //!   tower). Turns a prompt/instruction (+ optional reference images) into DiT conditioning; dropped
 //!   first under `Sequential`.
-//! * [`BooguHeavy`] — the phase-B **render** bundle (mixed-stream DiT + FLUX.1 16-ch VAE). Loaded after
+//! * `BooguHeavy` — the phase-B **render** bundle (mixed-stream DiT + FLUX.1 16-ch VAE). Loaded after
 //!   the mllm is dropped; also VAE-encodes reference/init images (edit / img2img) and decodes the final
 //!   latent — so the reference *latents* are produced in the render phase (like qwen-image's
 //!   `encode_init_latents`, F-118), and only the mllm-derived conditioning has to persist across the
@@ -752,8 +752,8 @@ impl BooguHeavy {
     }
 }
 
-/// The assembled Boogu pipeline holding both component bundles resident: tokenizer + [`BooguEncoders`]
-/// (Qwen3-VL condition encoder + lazy vision tower) + [`BooguHeavy`] (DiT + FLUX.1 VAE). This is the
+/// The assembled Boogu pipeline holding both component bundles resident: tokenizer + `BooguEncoders`
+/// (Qwen3-VL condition encoder + lazy vision tower) + `BooguHeavy` (DiT + FLUX.1 VAE). This is the
 /// byte-exact warm path the real-weight tests drive directly; the [`crate::model`] generator stages the
 /// same two bundles onto the shared [`mlx_gen::Residency`] seam for `Sequential` offload.
 pub struct BooguPipeline {
@@ -806,7 +806,7 @@ impl BooguPipeline {
 
     /// **img2img latent-init on the Base (true-CFG) path** (epic 8588 A4.3, sc-10191). Seed the
     /// flow-match denoise from a VAE-encoded `init` reference instead of pure noise. See
-    /// [`BooguHeavy::render_base_img2img`] for the noise-blend detail; `sigmas` is the model layer's
+    /// `BooguHeavy::render_base_img2img` for the noise-blend detail; `sigmas` is the model layer's
     /// schedule already truncated for the PiD `from_ldm` early-stop (`[..keep]`).
     #[allow(clippy::too_many_arguments)]
     pub fn generate_base_img2img_with_progress(

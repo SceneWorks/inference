@@ -118,7 +118,7 @@ impl KreaTokenizer {
     /// Encode the image-grounded (edit) template → `(input_ids, attention_mask)` `[1, L]` int32
     /// (mask all-ones). `num_image_tokens[k]` is reference `k`'s merged vision-token count (from
     /// [`mlx_gen_boogu::VisionTower::forward`]) — the number of `<|image_pad|>` placeholders the encoder
-    /// then fills with vision features (epic 10871 P2). See [`render_with_images`] for the template caveat.
+    /// then fills with vision features (epic 10871 P2). See `render_with_images` for the template caveat.
     pub fn encode_with_images(
         &self,
         instruction: &str,

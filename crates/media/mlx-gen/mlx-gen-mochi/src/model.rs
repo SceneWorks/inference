@@ -1,6 +1,6 @@
 //! Mochi 1 provider — the `Generator` seam: stable identity + advertised [`Capabilities`],
-//! request [`validate`](validate_request), model [`load`], and the explicit
-//! [`REGISTRATION`]/[`register_providers`] the MLX catalog enumerates.
+//! request `validate_request`, model [`load`], and the explicit `REGISTRATION` that
+//! [`crate::register_providers`] exposes to the MLX catalog.
 //!
 //! Mochi is **text-to-video only** in the base preview (no audio, no I2V — those are epic 1788
 //! follow-ons sc-11998/sc-11997). It is **not** distilled, so it exposes **true CFG**

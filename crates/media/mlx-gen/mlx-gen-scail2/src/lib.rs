@@ -19,7 +19,7 @@
 //! / CLIP). Plain single-scale CFG; macOS-only.
 //!
 //! Status (sc-5443): the registration + capability surface, the [`model::Scail2Dit`] DiT forward, the
-//! per-chunk [`rope::ScailRope`], the CLIP/VAE/mask preprocessing, and the live [`generate`] denoise
+//! per-chunk [`rope::ScailRope`], the CLIP/VAE/mask preprocessing, and the live [`generate()`] denoise
 //! loop all land here (each parity-gated against upstream on tiny seeded fixtures). Real-weight 40-layer
 //! + end-to-end parity is sc-5446; Q4/Q8 load-time quant is sc-5445.
 

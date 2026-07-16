@@ -5,7 +5,7 @@
 //! `mlx-joycaption` [`core_llm::TextLlm`] vision provider (story 7157). This crate is the thin
 //! consumer seam (story 7265): it keeps the SceneWorks caption **product policy** (caption types /
 //! length templates / capability bounds, in [`mlx_gen::caption::joycaption`]) and adapts the
-//! backend-neutral [`gen_core::Captioner`] contract the worker calls onto the unified engine —
+//! backend-neutral [`mlx_gen::Captioner`] contract the worker calls onto the unified engine —
 //! building the prompt text + image request and streaming the provider's tokens back.
 
 use mlx_gen::caption::joycaption::{self, JOY_CAPTION_FAMILY, JOY_CAPTION_MODEL_ID};
@@ -99,7 +99,7 @@ fn validate_load_spec(spec: &LoadSpec) -> Result<()> {
     Ok(())
 }
 
-/// The JoyCaption captioner: a thin adapter from the [`gen_core::Captioner`] contract onto the
+/// The JoyCaption captioner: a thin adapter from the [`mlx_gen::Captioner`] contract onto the
 /// mlx-llm `mlx-joycaption` vision provider.
 pub struct JoyCaption {
     descriptor: CaptionerDescriptor,

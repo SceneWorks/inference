@@ -11,7 +11,7 @@
 //!     → z16 VAE decode → image (1 frame) / video
 //! ```
 //!
-//! The planner ([`BerniniPlanner`]) is Qwen2.5-VL-7B (penultimate extractor) + `MLPConnector` +
+//! The planner (`BerniniPlanner`) is Qwen2.5-VL-7B (penultimate extractor) + `MLPConnector` +
 //! `DiffLoss_FM` clip-diff head + the MAR mask token; the renderer is the existing
 //! [`crate::pipeline`] dual-expert MoE + UMT5 + z16 VAE. Both load from one full-snapshot dir
 //! ([`crate::convert::assemble_bernini_snapshot`]).

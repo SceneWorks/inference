@@ -1,23 +1,23 @@
 //! Offline pre-quantization (sc-8763): read a dense Lens snapshot and write a packed Q4/Q8 snapshot
-//! that [`crate::quant`] (via [`crate::pipeline::LensPipeline::load_quant`]) loads with no dense
+//! that `crate::quant` (via [`crate::pipeline::LensPipeline::load_quant`]) loads with no dense
 //! transient. Mirrors `mlx_gen_sdxl::convert` / `mlx_gen_z_image::convert` (same `mlx_rs::ops::quantize`
 //! seam, byte-equal to the load-time `.quantize`), differing in the Lens two-component quant scope and
 //! the **encoder's MXFP4→MLX-affine** re-quant.
 //!
 //! Lens quantizes **two** components at load (the fork's `nn.quantize`, wired in
-//! [`crate::pipeline::LensPipeline::load_quant`] + [`quantize_dit`](crate::pipeline::LensPipeline::quantize_dit)):
+//! [`crate::pipeline::LensPipeline::load_quant`] + [`crate::pipeline::LensHeavy::quantize_dit`]):
 //!
 //! * **DiT** ([`quantize_lens_transformer_dir`]) — the compute-heavy diffusers `[out, in]` Linears
 //!   `img_in`, `txt_in`, `proj_out` and every block's fused-QKV attention (`img_qkv`/`txt_qkv`/
 //!   `to_out.0`/`to_add_out`) + bias-less SwiGLU MLPs (`img_mlp`/`txt_mlp` `w1`/`w2`/`w3`). The
 //!   timestep embedder (`time_text_embed.*`), the AdaLN modulations (`img_mod`/`txt_mod`/
-//!   `norm_out.linear`), and every RMSNorm/QK-norm stay full precision — [`is_transformer_target`]
+//!   `norm_out.linear`), and every RMSNorm/QK-norm stay full precision — `is_transformer_target`
 //!   matches that scope exactly (a missed site = codes loaded as dense floats = a garbage render, the
 //!   completeness gate being the real-weight render in `tests/prequantize_real_weights.rs`).
 //! * **gpt-oss encoder MoE experts** ([`quantize_lens_text_encoder_dir`]) — the 20 B-param bulk. In the
 //!   DENSE source they are **MXFP4** (`experts.{gate_up,down}_proj_{blocks,scales}`); here they are
 //!   dequantized then re-quantized to MLX group-64 affine Q4/Q8 (reusing the *exact* load path via
-//!   [`crate::text_encoder::gpt_oss::prequantize_expert_proj`], so the pack is byte-identical to the
+//!   `crate::text_encoder::gpt_oss::prequantize_expert_proj`, so the pack is byte-identical to the
 //!   load-time dequant-then-quantize) and stored **stacked** as `experts.{gate_up,down}_proj.{weight,
 //!   scales,biases}`. The router / attention / embedding / norms / `lm_head` pass through **dense**
 //!   verbatim.
@@ -59,8 +59,8 @@ fn is_transformer_target(base: &str) -> bool {
 
 /// Pre-quantize the DiT `transformer/` dir → a packed `diffusion_pytorch_model.safetensors` +
 /// annotated `config.json` in `dst`. Uses the shared [`quantize_map`] (2-D + `in % gs == 0` shape
-/// guard skips the 1-D norms) with [`is_transformer_target`] excluding the full-precision linears.
-/// `bits` = 4 (Q4) or 8 (Q8) at group size [`GROUP_SIZE`].
+/// guard skips the 1-D norms) with `is_transformer_target` excluding the full-precision linears.
+/// `bits` = 4 (Q4) or 8 (Q8) at group size `GROUP_SIZE`.
 pub fn quantize_lens_transformer_dir(src: &Path, dst: &Path, bits: i32) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     let map = quantize_map(load_dir_map(src)?, bits, GROUP_SIZE, is_transformer_target)?;
@@ -75,13 +75,13 @@ pub fn quantize_lens_transformer_dir(src: &Path, dst: &Path, bits: i32) -> Resul
 /// Pre-quantize the gpt-oss `text_encoder/` dir → a packed `model.safetensors` + annotated
 /// `config.json` in `dst`. For each layer's MoE, the MXFP4 experts
 /// (`experts.{gate_up,down}_proj_{blocks,scales}` + `_bias`) are dequantized then re-quantized to MLX
-/// group-64 affine Q4/Q8 via the *exact* load path ([`prequantize_expert_proj`]) and written **stacked**
+/// group-64 affine Q4/Q8 via the *exact* load path (`prequantize_expert_proj`) and written **stacked**
 /// as `experts.{gate_up,down}_proj.{weight,scales,biases}` (dropping the MXFP4 source tensors). Every
 /// other tensor — `embed_tokens`, `self_attn.*`, `router.*`, `*_layernorm`, `model.norm`, `lm_head` —
 /// passes through **dense** unchanged. `bits` = 4 / 8.
 ///
 /// One layer is packed at a time and the dense bf16 dequant transient is `eval`'d + freed inside
-/// [`prequantize_expert_proj`] before the next, so the full 20 B bf16 stack never co-resides (the
+/// `prequantize_expert_proj` before the next, so the full 20 B bf16 stack never co-resides (the
 /// converter runs in the same memory envelope as the load-time quant path).
 pub fn quantize_lens_text_encoder_dir(src: &Path, dst: &Path, bits: i32) -> Result<()> {
     std::fs::create_dir_all(dst)?;

@@ -56,7 +56,7 @@ const SAMPLER: &str = "euler_discrete";
 /// introspection). Advertises **only** the wired + parity-proven surface (the false-capability
 /// guard): T2I + img2img (`Reference`) + ControlNet-pose (`Control`) + IP-Adapter (`Reference` in
 /// IP mode) + Q8/Q4 + **LoRA/LoKr** (sc-4733 — merged into the SDXL-family U-Net at load via
-/// [`Kolors::apply_lora`], the inference complement to the Kolors trainer sc-4568).
+/// [`crate::model::Kolors::apply_lora`], the inference complement to the Kolors trainer sc-4568).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,

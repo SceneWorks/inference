@@ -18,7 +18,7 @@
 //! Each loads dense via `from_weights` and can be affine-quantized in place to Q8 (near-lossless) or
 //! Q4 (coherent) with `quantize(bits)` — the attention/FFN/projection linears are quantized at the
 //! MLX default group size, while convs, GroupNorms, embeddings, and the few small/odd projections
-//! stay dense (sc-4925; see [`quantize_linear`]).
+//! stay dense (sc-4925; see `quantize_linear`).
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;

@@ -7,7 +7,7 @@
 //!
 //! The transformer body is `mlx-gen-sdxl`'s [`ClipVisionEncoder`] parameterised to ViT-L/14
 //! ([`VisionConfig::vit_l_14`]) — the same crate-reuse pattern `mlx-gen-svd` uses for its ViT-H
-//! tower. Only the projection head differs from [`mlx_gen_svd`]: `pooled = post_layernorm(
+//! tower. Only the projection head differs from `mlx_gen_svd`: `pooled = post_layernorm(
 //! last_hidden_state[:, 0])`, `image_embeds = visual_projection(pooled)` (Linear 1024→768, no
 //! bias) — diffusers `CLIPVisionTransformer` pooling + `CLIPVisionModelWithProjection`.
 

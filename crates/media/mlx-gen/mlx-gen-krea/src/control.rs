@@ -45,7 +45,7 @@ pub const DEFAULT_RESIDUAL_CLAMP: f32 = 0.15;
 
 /// Injection offset (candle `DEFAULT_INJECT_OFFSET`): branch residual `i` feeds the INPUT of main block
 /// `i + offset`. Offset `1` skips main block 0 (its degeneracy-preferred overwrite site; the standard
-/// "feed the next block" layout). Persisted in the overlay as the [`META_INJECT_OFFSET`] tensor.
+/// "feed the next block" layout). Persisted in the overlay as the `META_INJECT_OFFSET` tensor.
 pub const DEFAULT_INJECT_OFFSET: usize = 1;
 
 /// Default `control_scale` when a request leaves it unset (candle `DEFAULT_CONTROL_SCALE`): a comfortable
@@ -140,7 +140,7 @@ impl Krea2ControlBranch {
 
     /// Pack the branch's Linear projections to Q4/Q8 in place (sc-11748) — each copied
     /// [`SingleStreamBlock`]'s attention + SwiGLU (through its own `quantize`) plus the zero-init
-    /// `proj_out`, all at the Krea [`crate::quant::GROUP_SIZE`]. The MLX twin of
+    /// `proj_out`, all at the Krea `crate::quant::GROUP_SIZE`. The MLX twin of
     /// [`crate::pipeline::KreaHeavy::quantize`] over the base DiT: the SAME group-wise affine packer and
     /// dequant-on-forward math, so a branch packed to the base tier carries the base's numerics (candle
     /// #480 GPU-proof: q8 ≈ bf16 pose-lock, q4 keeps pose-lock with mild haze). The RMSNorm scales,

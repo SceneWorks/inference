@@ -247,7 +247,8 @@ impl AnimaTextConditioner {
     /// exactly ComfyUI's `out = self.llm_adapter(...); out = out * t5xxl_weights`
     /// (`comfy/ldm/anima/model.py:198-206`, with `t5xxl_weights` reshaped to `[1, St, 1]` in
     /// `comfy/model_base.py:1470`). The Qwen source path is untouched (its weights are pinned to
-    /// `1.0` upstream), and an all-`1.0` weight vector is a strict no-op (identical to [`forward`]).
+    /// `1.0` upstream), and an all-`1.0` weight vector is a strict no-op (identical to
+    /// [`Self::forward`]).
     pub fn forward_weighted(
         &self,
         source_hidden: &Array,

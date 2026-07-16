@@ -1,5 +1,6 @@
 //! The OpenAI chat-completions wire format: request parsing → the backend-neutral
-//! [`core_llm::TextLlmRequest`], and response/SSE-chunk construction from the contract's events.
+//! [`mlx_llm::core_llm::TextLlmRequest`], and response/SSE-chunk construction from the contract's
+//! events.
 //!
 //! These are pure data transforms (no model, no I/O), so they're unit-tested directly. The server
 //! ([`crate::main`]) wires them to a TCP socket + a loaded `core_llm::TextLlm` provider.

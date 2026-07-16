@@ -14,7 +14,7 @@
 //!
 //! The weight terms are **first-principles** param counts (validated against the published Krea shapes:
 //! ~11.1 B base @ 28×6144, ~3.0 B branch @ N=7 → ~6.1 GB bf16, matching the candle #480 profile's
-//! ~6.6 GB), padded by a measured [`RESIDENT_OVERHEAD_GIB`] for the terms the block count omits (the
+//! ~6.6 GB), padded by a measured `RESIDENT_OVERHEAD_GIB` for the terms the block count omits (the
 //! VAE, the DiT's non-block params, and the MLX Metal-allocator resident floor).
 //!
 //! **Measured-MLX calibration (sc-11847).** The activation + decode-spike coefficients and the resident
@@ -118,7 +118,7 @@ const DENOISE_ACT_BYTES_PER_TOKEN_HIDDEN: f64 = 80.0;
 /// tiling (sc-11747) shrinks. **Measured-MLX (sc-11847):** the real slope is ~5211 B/px, tier-independent
 /// (the VAE decode is the same at every base tier), far below the candle #480 CUDA prior (22500, from
 /// ~22 GB @ 1024²). `6500` rounds up over the measured slope; the fixed VAE-materialization part of the
-/// decode peak lives in [`RESIDENT_OVERHEAD_GIB`], so this term is the pure per-pixel conv growth.
+/// decode peak lives in `RESIDENT_OVERHEAD_GIB`, so this term is the pure per-pixel conv growth.
 const DECODE_SPIKE_BYTES_PER_PIXEL: f64 = 6_500.0;
 
 /// The assembled full-resolution RGB output buffers held across a tiled decode (`output [1,3,H,W]` +

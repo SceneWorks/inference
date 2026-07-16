@@ -1,8 +1,8 @@
 //! The end-to-end Lens-Turbo / Lens T2I pipeline (sc-3173) — wires the four ported components into a
-//! single `generate`: [`LensTokenizer`](crate::text::LensTokenizer) → the gpt-oss
-//! [`LensTextEncoder`](crate::text_encoder::encoder::LensTextEncoder) (multi-layer capture + the
-//! `txt_offset = 97` slice) → the [`LensTransformer`](crate::dit::LensTransformer) denoising DiT (with
-//! the [`schedule`](crate::schedule) flow-match sigmas + norm-rescaled CFG) → the Flux.2
+//! single `generate`: [`LensTokenizer`] → the gpt-oss
+//! [`LensTextEncoder`] (multi-layer capture + the
+//! `txt_offset = 97` slice) → the [`LensTransformer`] denoising DiT (with
+//! the [`schedule`] flow-match sigmas + norm-rescaled CFG) → the Flux.2
 //! [`vae::decode`](crate::vae) shim.
 //!
 //! A faithful port of `_vendor/lens/pipeline.py::LensPipeline.__call__`. The two model variants

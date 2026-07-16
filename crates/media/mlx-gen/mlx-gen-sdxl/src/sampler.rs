@@ -100,7 +100,7 @@ impl EulerSampler {
     }
 
     /// Linearly interpolate the sigma table at the (float) time `t` (the vendored `_interp`), host
-    /// f32. Used in tests; the denoise math uses [`Self::sigma_arr`] so the
+    /// f32. Used in tests; the denoise math uses `sigma_arr` so the
     /// interp runs through MLX (bit-exact to the reference at non-integer `t` — sc-2400 S6).
     pub fn sigma(&self, t: f32) -> f32 {
         let last = self.sigmas.len() - 1;

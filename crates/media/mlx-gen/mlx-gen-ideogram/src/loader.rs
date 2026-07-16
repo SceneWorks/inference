@@ -59,7 +59,8 @@ pub fn load_vae(root: &Path) -> Result<Flux2Vae> {
 /// wraps the prompt in a single user turn (`apply_chat_template(..., add_generation_prompt=True)`,
 /// which collapses to [`ChatTemplate::QwenInstruct`]) and encodes with `add_special_tokens=False`
 /// and no padding — the pipeline packs/left-pads the sequence later. `max_length` is unused by the
-/// `encode_chat_ids` path (no truncation); the 2048 guard lives in [`Ideogram4Pipeline::tokenize`].
+/// `encode_chat_ids` path (no truncation); the 2048 guard lives in
+/// [`crate::pipeline::Ideogram4Pipeline::tokenize`].
 pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
     TextTokenizer::from_file(
         root.join("tokenizer/tokenizer.json"),

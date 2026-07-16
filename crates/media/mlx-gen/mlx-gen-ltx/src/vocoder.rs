@@ -5,10 +5,10 @@
 //!   ConvTranspose1d → mean of dilated `ResBlock1`/`ResBlock2` outputs] → leaky-ReLU(0.01) →
 //!   `conv_post` → tanh.
 //! - [`Generator`] in BigVGAN mode (`BigVGANVocoder`): `conv_pre` → per-upsample [ConvTranspose1d →
-//!   mean of `AMPBlock1` outputs] → [`SnakeBeta`] `act_post` → `conv_post` → tanh/clip. `AMPBlock1`
+//!   mean of `AMPBlock1` outputs] → `SnakeBeta` `act_post` → `conv_post` → tanh/clip. `AMPBlock1`
 //!   uses **anti-aliased SnakeBeta**: 2× upsample (zero-insert conv-transpose + kaiser-sinc filter) →
 //!   `x + sin²(αx)/(β+eps)` → kaiser-sinc low-pass + 2× downsample.
-//! - [`VocoderWithBWE`] (the shipped 2.3 path → 48 kHz): the BigVGAN core → `_compute_mel` (a
+//! - [`VocoderWithBwe`] (the shipped 2.3 path → 48 kHz): the BigVGAN core → `_compute_mel` (a
 //!   windowed-STFT via the checkpoint's stored `forward_basis`/`mel_basis` matmuls, win 512 / hop 80)
 //!   → a BigVGAN bandwidth-extension generator → linear-interp skip-upsample of the core output, sum,
 //!   clip.

@@ -366,10 +366,11 @@ fn l2_over_channels(x: &Array) -> Result<Array> {
     Ok(add(&sq, scalar(1e-12))?.sqrt()?)
 }
 
-/// Flow-match denoise loop driven by a [`DiffusionSampler`] (the production [`FlowMatchSampler`]
+/// Flow-match denoise loop driven by a [`mlx_gen::DiffusionSampler`] (the production
+/// [`mlx_gen::FlowMatchSampler`]
 /// wrapping `qwen_scheduler`, or the few-step Lightning schedule — sc-2909), with progress and
 /// cooperative cancellation. The sampler owns the schedule (`num_steps`/`timestep`/`step`); Qwen
-/// feeds the **raw sigma** ([`DiffusionSampler::timestep`]) as the transformer timestep. Returns
+/// feeds the **raw sigma** ([`mlx_gen::DiffusionSampler::timestep`]) as the transformer timestep. Returns
 /// the final packed latents.
 ///
 /// `neg_embeds` selects the guidance mode:
@@ -509,7 +510,7 @@ pub fn denoise_control_with_progress(
     )
 }
 
-/// Qwen-Image-**Edit** dual-latent denoise loop, driven by a [`DiffusionSampler`] (sc-2909). Each
+/// Qwen-Image-**Edit** dual-latent denoise loop, driven by a [`mlx_gen::DiffusionSampler`] (sc-2909). Each
 /// step concatenates the noise latents with the (static) packed reference latents over the sequence
 /// axis, runs the transformer with the reference `cond_grids` so the RoPE spans `[noise] +
 /// references`, slices the velocity back to the noise prefix, then takes an Euler step. Port of

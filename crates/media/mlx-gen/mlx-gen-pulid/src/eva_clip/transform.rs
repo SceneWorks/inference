@@ -1,5 +1,5 @@
 //! EVA-CLIP input transform (sc-3073 durable nugget, folded here): the `face_features_image`
-//! (512² aligned, background-whitened grayscale, NHWC f32 in [0,1] from `mlx-gen-face`) is resized
+//! (512² aligned, background-whitened grayscale, NHWC f32 in `[0,1]` from `mlx-gen-face`) is resized
 //! to 336² and normalized with the OpenAI/EVA mean/std before the ViT.
 //!
 //! The reference is torchvision `resize(t, 336, BICUBIC)` on a **float** tensor — antialiased
@@ -99,7 +99,7 @@ pub fn resize_bicubic_f32(
     out
 }
 
-/// Full EVA transform: NHWC `[1, H, W, 3]` f32 in [0,1] → resized to `size²` (bicubic) and
+/// Full EVA transform: NHWC `[1, H, W, 3]` f32 in `[0,1]` → resized to `size²` (bicubic) and
 /// normalized `(x - mean) / std` per channel. Returns NHWC `[1, size, size, 3]`.
 pub fn eva_transform(ffi_nhwc: &Array, size: i32) -> Result<Array> {
     let sh = ffi_nhwc.shape();

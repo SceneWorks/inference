@@ -140,7 +140,7 @@ pub fn denoise(
 /// on the negative/uncond conditioning (`neg_cap_feats`) — and combines the two velocities as
 /// `v = v_uncond + guidance·(v_cond − v_uncond)` before the Euler step (the diffusers `ZImagePipeline`
 /// CFG combine; `cfg_normalization=False` default, so no per-step rescale). The cond + uncond
-/// conditionings are loop-constant, so each gets its own cached [`Prepared`] built once.
+/// conditionings are loop-constant, so each gets its own cached `Prepared` built once.
 ///
 /// `guidance == 1.0` (or `neg_cap_feats == None`) collapses to a single cond forward — identical to the
 /// Turbo loop — so a base request with `guidance=1` costs the same as Turbo. `start_step` mirrors the
@@ -257,7 +257,7 @@ pub fn denoise_control_with_progress(
 /// CFG combine; `cfg_normalization=False` default, so no per-step rescale).
 ///
 /// The control embedding (`c_emb`) is derived from `control_context` independently of the caption, so
-/// each branch gets its own cached [`ControlPrepared`] (cond + uncond captions, identical control
+/// each branch gets its own cached `ControlPrepared` (cond + uncond captions, identical control
 /// context) built once and reused every step (F-042). `guidance == 1.0` (or `neg_cap_feats == None`)
 /// collapses to a single cond forward — byte-identical to [`denoise_control_with_progress`] — so a base
 /// control request with `guidance=1` costs exactly what the Turbo control loop does. `start_step` is `0`

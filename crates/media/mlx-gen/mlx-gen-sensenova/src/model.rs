@@ -3,7 +3,7 @@
 //!
 //! The `Generator` contract emits images, so the image-producing modes route through one
 //! [`Generator::generate`] dispatch: **T2I** (no conditioning → [`T2iModel::generate`]) and
-//! **image-edit / Character Studio** (a [`Conditioning::Reference`]/[`MultiReference`] →
+//! **image-edit / Character Studio** (a [`Conditioning::Reference`]/[`Conditioning::MultiReference`] →
 //! [`T2iModel::it2i_generate`]). The generic request maps as: `guidance` → text `cfg_scale`,
 //! `true_cfg` → image `img_cfg_scale` (edit ≈ 1.0, character ≈ 1.5), `scheduler_shift` →
 //! `timestep_shift`, `steps`/`seed`/`width`/`height` as given.
@@ -61,7 +61,7 @@ pub fn descriptor() -> ModelDescriptor {
 }
 
 /// The descriptor for the 8-step distilled variant. Identical capabilities to the base — only the
-/// id and the generation defaults (applied in [`SenseNova::options`]) differ.
+/// id and the generation defaults (applied in `SenseNova::options`) differ.
 pub fn descriptor_fast() -> ModelDescriptor {
     descriptor_for(MODEL_ID_FAST)
 }

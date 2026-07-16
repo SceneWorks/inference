@@ -6,7 +6,7 @@
 //! Built on the same functional-autograd mechanism the Z-Image spike proved (sc-3042) and the
 //! sc-3043 runtime glue, but LTX has its **own** adapter seam: its [`crate::transformer::Linear`]
 //! carries a per-pass [`LoraStack`](crate::transformer) (not the core `AdaptableLinear`), so this
-//! module uses the LTX-local [`Linear::set_train_lora`] training seam and its own target
+//! module uses the LTX-local `Linear::set_train_lora` training seam and its own target
 //! enumeration / save, while reusing the core [`LoraParams`] + grad-accumulation helpers and the
 //! runtime (schedule / dataset / checkpoint).
 //!
@@ -121,7 +121,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
 /// Construct the trainer from an LTX-2.3 split-weight snapshot directory (transformer / VAE /
 /// connector + the Gemma-3-12B text-encoder snapshot resolved like inference). The transformer loads
 /// at **f32 activations × quantized weights** (`quant_f32`) for clean autograd — the base is frozen,
-/// gradients flow only through the trainable LoRA factors. Registered via [`TrainerRegistration`].
+/// gradients flow only through the trainable LoRA factors. Registered via [`mlx_gen::TrainerRegistration`].
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,

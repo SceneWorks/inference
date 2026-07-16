@@ -1100,7 +1100,7 @@ pub struct Sd3Transformer {
 
 impl Sd3Transformer {
     /// Load from a weight map (diffusers `SD3Transformer2DModel` keys, the identity-converted MLX
-    /// set). Every Linear is loaded via [`lin`], which auto-detects a pre-quantized packed snapshot
+    /// set). Every Linear is loaded via `lin`, which auto-detects a pre-quantized packed snapshot
     /// (`{key}.scales` present → [`AdaptableLinear::from_quantized_parts`]) vs a dense bf16 one.
     pub fn from_weights(w: &Weights, arch: &Sd3Arch) -> Result<Self> {
         let heads = arch.num_heads as i32;

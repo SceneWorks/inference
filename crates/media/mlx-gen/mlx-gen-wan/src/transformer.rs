@@ -985,7 +985,7 @@ impl WanTransformer {
     }
 
     /// Patch-embed one latent `[C, F, H, W]` (f32) into the DiT token stream `[1, L, dim]` (bf16) +
-    /// its patch grid `(f, h, w)` — the embedding half of [`forward_cached`] exposed as a seam for the
+    /// its patch grid `(f, h, w)` — the embedding half of [`Self::forward_cached`] exposed as a seam for the
     /// Bernini renderer (sc-4706), which patch-embeds the noisy target **and** each conditioning source
     /// separately (each with its own source-id RoPE) and concatenates them on the token axis before a
     /// single packed forward. `L = f·h·w`.
@@ -1000,7 +1000,7 @@ impl WanTransformer {
     /// Run the block stack + output head over a **pre-embedded, pre-packed** token sequence
     /// `tokens` `[1, L, dim]` (bf16) with caller-supplied RoPE `cos`/`sin` `[L, 1, half_d]` and the
     /// (scalar-timestep) cross-attention K/V cache — returning the per-token velocity
-    /// `[1, L, out_dim·∏patch]` (f32) **without** unpatchifying. This is [`forward_cached`]'s body
+    /// `[1, L, out_dim·∏patch]` (f32) **without** unpatchifying. This is [`Self::forward_cached`]'s body
     /// minus the (single-latent) patchify in / unpatchify out, the seam the Bernini renderer (sc-4706)
     /// uses: at batch 1 the packed `[sources…, target]` sequence is plain full self-attention (the
     /// reference's varlen attention with a single `cu_seqlens` segment), so the caller assembles the
@@ -1042,7 +1042,7 @@ impl WanTransformer {
         self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch)
     }
 
-    /// B=1 per-token convenience wrapper (builds the caches on the fly + runs [`forward_tokens_cached`]
+    /// B=1 per-token convenience wrapper (builds the caches on the fly + runs [`Self::forward_tokens_cached`]
     /// for a single branch) — bit-identical to the cached TI2V denoise loop for one branch. Used by the
     /// parity probes; the denoise loop ([`denoise_ti2v`](crate::pipeline::denoise_ti2v)) builds the
     /// caches once per generate.

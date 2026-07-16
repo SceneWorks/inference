@@ -32,7 +32,7 @@ fn mul3(a: &Array, b: &Array, c: &Array) -> Result<Array> {
 /// 28-channel binary mask latent `(28, T_latent, H/8, W/8)` the DiT's `patch_embedding_mask` consumes
 /// — **no VAE**, matching upstream `extract_and_compress_mask_to_latent(additional_spatial_downsample=1)`.
 ///
-/// Pipeline: threshold each channel at [`ON_THRESH`] → the **7 exclusive color classes**
+/// Pipeline: threshold each channel at `ON_THRESH` → the **7 exclusive color classes**
 /// (white/red/green/blue/yellow/magenta/cyan as R/G/B AND-products) → **8× area downsample** (exact
 /// 8×8 average pool; `H` and `W` must be divisible by 8) → **temporal pack** by `temporal_stride`
 /// (frame 0 repeated `stride` times for the lead latent frame; the `stride` frames of each latent step

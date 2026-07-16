@@ -201,9 +201,9 @@ impl FluxTransformer {
         )
     }
 
-    /// As [`forward`], but with an optional per-block image-stream residual injector — the seam the
+    /// As [`Self::forward`], but with an optional per-block image-stream residual injector — the seam the
     /// PuLID-FLUX id cross-attn (sc-3072) hooks into. `injector = None` is byte-identical to
-    /// [`forward`] (it IS the same path), so the plain FLUX render carries zero overhead.
+    /// [`Self::forward`] (it IS the same path), so the plain FLUX render carries zero overhead.
     ///
     /// The injector is consulted after every double block (the image stream `hidden`) and after the
     /// single blocks it opts into (the image-token tail of `joint = cat(encoder, hidden)`), matching
@@ -233,15 +233,15 @@ impl FluxTransformer {
         )
     }
 
-    /// As [`forward_injected`], but ALSO threading the Fun-Controlnet-Union per-double-block residuals
+    /// As [`Self::forward_injected`], but ALSO threading the Fun-Controlnet-Union per-double-block residuals
     /// (sc-8238) — the Shakker FLUX.1-dev ControlNet-Union-Pro-2.0 path. `control = (residuals, scale)`
     /// is the (already-computed, pre-injection) control-branch output: one residual per control double
     /// block, added to the base **image** stream after base double block `i` at the diffusers interval
     /// `ceil(num_double_blocks / num_residuals)`, scaled by `scale`. With `control = None` this is
-    /// byte-identical to [`forward_injected`].
+    /// byte-identical to [`Self::forward_injected`].
     ///
     /// Crucially this is **compose-ready** (constraint 2): the per-block `injector` seam (PuLID /
-    /// XLabs IP-Adapter) is consulted at the SAME points it is in [`forward_injected`], so a future
+    /// XLabs IP-Adapter) is consulted at the SAME points it is in [`Self::forward_injected`], so a future
     /// epic can stack identity + control in one denoise (`injector = Some(..)` AND `control = Some(..)`).
     /// The control residual is added AFTER the injector's `after_double` residual, matching the
     /// diffusers FLUX ControlNet order (the controlnet sample is added to the post-block hidden state).

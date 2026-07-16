@@ -3,7 +3,7 @@
 //!
 //! A *snapshot* is the `{config.json, model.safetensors, tokenizer.json, tokenizer_config.json}`
 //! directory the engine loads ([`crate::models::CausalLm::from_weights`]). Two producers feed it:
-//! the GGUF converter ([`crate::gguf::convert`], story 7165) and — added here — a Hugging Face
+//! the GGUF converter ([`mod@crate::gguf::convert`], story 7165) and — added here — a Hugging Face
 //! safetensors directory. Both funnel their dense tensor set through one sink, [`write_snapshot`],
 //! so the requant + write logic lives in a single place.
 //!

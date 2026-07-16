@@ -16,7 +16,7 @@
 //!   `Z-Image-Fun-Controlnet-Union-2.1.safetensors` is **byte-structurally identical** to the Turbo
 //!   control checkpoint (verified vs the cached Turbo ckpt: 295 keys, identical `control_all_x_embedder`
 //!   / `control_layers` / `control_noise_refiner` prefixes, zero shape/dtype mismatches), so the shared
-//!   [`loader::load_control_transformer`] + [`ZImageControlTransformer::from_weights`] loader is reused
+//!   [`crate::load_control_transformer`] + [`crate::ZImageControlTransformer::from_weights`] loader is reused
 //!   unchanged — no remap, no loader adaptation.
 //!
 //! [`load`] needs the base snapshot (`spec.weights`) **and** the base control checkpoint
@@ -102,14 +102,14 @@ const PRECISION_MSG: &str = "z_image_control: only dense bf16 is wired (the text
 
 /// Construct a [`ZImageControl`] from a [`LoadSpec`].
 ///
-/// `spec.weights` must be a [`WeightsSource::Dir`] base `Tongyi-MAI/Z-Image` snapshot, and
+/// `spec.weights` must be a [`mlx_gen::WeightsSource::Dir`] base `Tongyi-MAI/Z-Image` snapshot, and
 /// `spec.control` (required) the base Fun-Controlnet-Union checkpoint
 /// (`alibaba-pai/Z-Image-Fun-Controlnet-Union-2.1` — a single `.safetensors` `File`, or a `Dir` of
 /// them). Weights load dense (bf16); `spec.quantize` (Q4/Q8) then quantizes the whole transformer
 /// (base + control, group_size 64) plus the text encoder + VAE — the fork's whole-model quant, with the
 /// control patch embedder left dense (its in-features is not a multiple of 64). Byte-identical load path
 /// to [`crate::model_control::load`] (the control branch shape is identical — see the module doc) — it
-/// shares the same [`load_control_residency`] builder, so `offload_policy` is honored identically
+/// shares the same `load_control_residency` builder, so `offload_policy` is honored identically
 /// (sc-11124, F-172); only the generate-time schedule + CFG differ.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
