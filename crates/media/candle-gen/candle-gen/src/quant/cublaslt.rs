@@ -163,14 +163,36 @@ mod cuda_impl {
         nvfp4_algos: std::sync::Mutex<
             std::collections::HashMap<(usize, usize, usize), sys::cublasLtMatmulAlgo_t>,
         >,
-        /// Cached device-resident **scatter index** (`U32`) for the on-device NVFP4 activation
-        /// quantizer (sc-11044), keyed by `(rows, n_blocks)`. Maps each logical `(row, 16-block)`
-        /// scale to its byte offset in cuBLASLt's row-major scale-factor-atom layout — the same
-        /// permutation `cublaslt_scale_layout` applies on the host for a staged weight. Built once per
-        /// activation shape (a small host loop) and reused so the per-forward activation quantize is
-        /// pure on-device tensor math + one cached gather, never a host round-trip.
-        nvfp4_act_scale_idx: std::sync::Mutex<std::collections::HashMap<(usize, usize), Tensor>>,
+        /// Cached device-resident **gather index** (`U32`) for the on-device NVFP4 activation
+        /// quantizer (sc-11044), keyed by `(rows, n_blocks)`. For each byte offset in cuBLASLt's
+        /// row-major scale-factor-atom layout it holds the source index into the row-major
+        /// `(row, 16-block)` scales — the inverse of the permutation `cublaslt_scale_layout` applies on
+        /// the host for a staged weight. Built once per activation shape (a small host loop) and reused so
+        /// the per-forward activation quantize is pure on-device tensor math + one cached gather
+        /// (`index_select`), never a host round-trip or an atomic scatter (sc-12207).
+        nvfp4_act_scale_gather_idx:
+            std::sync::Mutex<std::collections::HashMap<(usize, usize), Tensor>>,
+        /// Compiled + cached fused NVFP4 activation-quantize kernels (sc-12078). The outer `Option` is
+        /// "have we tried to compile?"; the inner is `Some(functions)` on success or `None` on a compile
+        /// failure. nvrtc compilation is a one-time host cost, so success is held for the handle's life —
+        /// **and a failure is cached too**, so the `forward_fp4` fused→unfused fallback does not
+        /// re-attempt (and re-fail) nvrtc on every projection of every denoise step.
+        nvfp4_quant_kernels: std::sync::Mutex<Option<Option<Arc<Nvfp4QuantKernels>>>>,
     }
+
+    /// The fused NVFP4 activation-quantize CUDA source (sc-12078), compiled once via nvrtc. Uses only
+    /// standard device intrinsics (no fp8/fp4 headers) so nvrtc needs no extra include path.
+    const NVFP4_QUANT_CU: &str = include_str!("nvfp4_quant.cu");
+
+    /// The two nvrtc-compiled kernels of the fused activation quantizer, cached on the handle. The
+    /// `CudaFunction`s keep their owning module alive. Force `Send`/`Sync` to match [`CublasLt`]'s own
+    /// contract (the handle is used single-threaded per `RUST_TEST_THREADS=1`).
+    struct Nvfp4QuantKernels {
+        amax: cudarc::driver::CudaFunction,
+        pack: cudarc::driver::CudaFunction,
+    }
+    unsafe impl Send for Nvfp4QuantKernels {}
+    unsafe impl Sync for Nvfp4QuantKernels {}
 
     // The Lt handle is an opaque device-side object; guarded by the owning stream/device.
     unsafe impl Send for CublasLt {}
@@ -203,7 +225,8 @@ mod cuda_impl {
                 workspace,
                 workspace_size: Self::WORKSPACE,
                 nvfp4_algos: std::sync::Mutex::new(std::collections::HashMap::new()),
-                nvfp4_act_scale_idx: std::sync::Mutex::new(std::collections::HashMap::new()),
+                nvfp4_act_scale_gather_idx: std::sync::Mutex::new(std::collections::HashMap::new()),
+                nvfp4_quant_kernels: std::sync::Mutex::new(None),
             })
         }
 
@@ -390,15 +413,15 @@ mod cuda_impl {
             let byte = low.add(&high.affine(16.0, 0.0)?)?.reshape((m, kp / 2))?;
             let packed = extract_u8_slice(&byte)?; // CudaSlice<u8>, len m*kp/2
 
-            // UE4M3 scale BYTES from the on-grid decoded value (exact inverse of the E4M3 decode), then
-            // scatter into cuBLASLt's row-major scale-factor-atom layout via the cached index.
+            // UE4M3 scale BYTES from the on-grid decoded value (exact inverse of the E4M3 decode). Gather
+            // them into cuBLASLt's row-major scale-factor-atom layout via the cached inverse-permutation
+            // index. A single zero is appended to the source so padding atoms gather 0 (matching the CPU
+            // packer's zeroed padding). This swizzle is a pure bijection — the former `scatter_add` did it
+            // with atomic accumulation (250 ms vs 0.04 ms on Krea shapes; sc-12207).
             let sf_byte = e4m3_byte_from_decoded(&sf_dec)?.reshape((m * n_blocks,))?;
-            let sf_rows = round_up_usize(m, SF_ATOM_ROWS);
-            let sf_cols = round_up_usize(n_blocks, SF_ATOM_COLS);
-            let scales_len = sf_rows * sf_cols;
-            let dst_idx = self.nvfp4_act_scale_index(m, n_blocks, sf_cols, &dev)?;
-            let swz = Tensor::zeros(scales_len, DType::F32, &dev)?
-                .scatter_add(&dst_idx, &sf_byte, 0)?;
+            let sf_byte = Tensor::cat(&[&sf_byte, &Tensor::zeros(1, DType::F32, &dev)?], 0)?;
+            let gather_idx = self.nvfp4_act_scale_gather_index(m, n_blocks, &dev)?;
+            let swz = sf_byte.index_select(&gather_idx, 0)?;
             let scales = extract_u8_slice(&swz)?;
 
             Ok(DevNvfp4 {
@@ -410,26 +433,35 @@ mod cuda_impl {
             })
         }
 
-        /// Build (or fetch the cached) device `U32` scatter index mapping each logical `(row, 16-block)`
-        /// activation scale — in row-major `row*n_blocks + blk` source order — to its byte offset in
-        /// cuBLASLt's row-major scale-factor-atom layout. Identical permutation to the host-side
-        /// [`cublaslt_scale_layout`] (intra-atom `((32,4),4):((16,4),1)` swizzle, **row-major** atom
-        /// tiling: `atom = k_atom + num_k_atoms · m_atom`). Cached per `(rows, n_blocks)`.
-        fn nvfp4_act_scale_index(
+        /// Build (or fetch the cached) device `U32` **gather** index that permutes the row-major
+        /// activation block scales into cuBLASLt's row-major scale-factor-atom layout, i.e.
+        /// `out[dst] = sf_byte_padded[idx[dst]]`. `sf_byte_padded` is the logical `(row, 16-block)` scale
+        /// in `row*n_blocks + blk` source order with a single zero appended at index `rows*n_blocks`.
+        /// This is the **inverse** of the host-side [`cublaslt_scale_layout`] swizzle (intra-atom
+        /// `((32,4),4):((16,4),1)`, **row-major** atom tiling `atom = k_atom + num_k_atoms · m_atom`);
+        /// padding atoms (rows ≥ M or blocks ≥ n_blocks) index the appended zero so they decode to 0,
+        /// matching the packer's zeroed padding. A gather over this permutation replaces the former
+        /// `scatter_add` — a bijection wrongly implemented with atomic accumulation (sc-12207). Cached per
+        /// `(rows, n_blocks)`.
+        fn nvfp4_act_scale_gather_index(
             &self,
             rows: usize,
             n_blocks: usize,
-            sf_cols: usize,
             dev: &Device,
         ) -> Result<Tensor> {
-            if let Some(t) = crate::lock_recover(&self.nvfp4_act_scale_idx)
+            if let Some(t) = crate::lock_recover(&self.nvfp4_act_scale_gather_idx)
                 .get(&(rows, n_blocks))
                 .cloned()
             {
                 return Ok(t);
             }
+            let sf_rows = round_up_usize(rows, SF_ATOM_ROWS);
+            let sf_cols = round_up_usize(n_blocks, SF_ATOM_COLS);
+            let scales_len = sf_rows * sf_cols;
             let num_k_atoms = sf_cols / SF_ATOM_COLS;
-            let mut idx = vec![0u32; rows * n_blocks];
+            // Padding atoms gather the appended zero at source index `rows*n_blocks`.
+            let sentinel = (rows * n_blocks) as u32;
+            let mut idx = vec![sentinel; scales_len];
             for r in 0..rows {
                 let m_atom = r / SF_ATOM_ROWS;
                 let mr = r % SF_ATOM_ROWS;
@@ -438,13 +470,155 @@ mod cuda_impl {
                     let kc = blk % SF_ATOM_COLS;
                     let atom_index = k_atom + num_k_atoms * m_atom;
                     let intra = (mr % 32) * 16 + (mr / 32) * 4 + kc;
-                    idx[r * n_blocks + blk] =
-                        (atom_index * (SF_ATOM_ROWS * SF_ATOM_COLS) + intra) as u32;
+                    let dst = atom_index * (SF_ATOM_ROWS * SF_ATOM_COLS) + intra;
+                    idx[dst] = (r * n_blocks + blk) as u32;
                 }
             }
-            let t = Tensor::from_vec(idx, rows * n_blocks, dev)?;
-            crate::lock_recover(&self.nvfp4_act_scale_idx).insert((rows, n_blocks), t.clone());
+            let t = Tensor::from_vec(idx, scales_len, dev)?;
+            crate::lock_recover(&self.nvfp4_act_scale_gather_idx).insert((rows, n_blocks), t.clone());
             Ok(t)
+        }
+
+        /// Compile (once) and fetch the fused NVFP4 activation-quantize kernels (sc-12078). nvrtc turns
+        /// [`NVFP4_QUANT_CU`] into a module JITed for the live device; the two functions are cached so
+        /// the compile is paid once per handle, not per forward.
+        fn nvfp4_quant_kernels(&self) -> Result<Arc<Nvfp4QuantKernels>> {
+            let mut guard = crate::lock_recover(&self.nvfp4_quant_kernels);
+            match guard.as_ref() {
+                Some(Some(k)) => return Ok(k.clone()),
+                Some(None) => {
+                    candle_core::bail!("sc-12078 fused NVFP4 quant kernels previously failed to compile")
+                }
+                None => {}
+            }
+            let compiled = (|| -> Result<Arc<Nvfp4QuantKernels>> {
+                let ctx = self.stream.context();
+                let ptx = cudarc::nvrtc::compile_ptx(NVFP4_QUANT_CU).map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "sc-12078 nvrtc compile of nvfp4_quant.cu failed: {e}"
+                    ))
+                })?;
+                let module = ctx.load_module(ptx).map_err(drv_err)?;
+                let amax = module
+                    .load_function("nvfp4_block_amax_f32")
+                    .map_err(drv_err)?;
+                let pack = module.load_function("nvfp4_pack_f32").map_err(drv_err)?;
+                Ok(Arc::new(Nvfp4QuantKernels { amax, pack }))
+            })();
+            // Cache the outcome either way — a failed compile must not be retried per forward.
+            *guard = Some(compiled.as_ref().ok().cloned());
+            compiled
+        }
+
+        /// **Fused** on-device NVFP4 activation quantize (sc-12078) — the throughput replacement for
+        /// [`Self::quantize_nvfp4_activation`]'s ~40-op candle chain. Two nvrtc kernels over the
+        /// activation — (1) per-16-block amax + per-tensor amax, (2) E4M3 block scale + E2M1 codes +
+        /// nibble pack + swizzle into the row-major 128×4 UE4M3 SF-atom layout — produce byte-identical
+        /// [`DevNvfp4`] to the CPU packer, with the **single** unavoidable host sync (the per-tensor amax
+        /// scalar that becomes the GEMM `alpha`). Same numeric recipe as [`Nvfp4Tensor::pack_from_slice`]
+        /// and [`Self::quantize_nvfp4_activation`]; `cols_padded` matches the resident weight.
+        pub fn quantize_nvfp4_activation_fused(
+            &self,
+            x: &Tensor,
+            cols_padded: usize,
+        ) -> Result<DevNvfp4> {
+            use super::super::nvfp4::{E2M1_MAX, E4M3_MAX, NVFP4_BLOCK};
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+            let (m, k) = x.dims2()?;
+            if !cols_padded.is_multiple_of(NVFP4_BLOCK) || cols_padded < k {
+                candle_core::bail!(
+                    "quantize_nvfp4_activation_fused: cols_padded ({cols_padded}) must be >= K ({k}) \
+                     and a multiple of {NVFP4_BLOCK}"
+                );
+            }
+            let kernels = self.nvfp4_quant_kernels()?;
+            let n_blocks = cols_padded / NVFP4_BLOCK;
+            let sf_rows = round_up_usize(m, SF_ATOM_ROWS);
+            let sf_cols = round_up_usize(n_blocks, SF_ATOM_COLS);
+            let total = m * n_blocks;
+
+            // The activation as a contiguous f32 device slice — the kernels read it directly (K padding
+            // is handled in-kernel by bounds-checking against the real K, so no `pad_with_zeros`).
+            let xf = x.to_dtype(DType::F32)?.contiguous()?;
+            let (x_storage, _xl) = xf.storage_and_layout();
+            let x_slice = match &*x_storage {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::F32(s) => s,
+                    _ => candle_core::bail!("fused quantize: expected F32 CUDA storage"),
+                },
+                _ => candle_core::bail!("fused quantize: activation is not on CUDA"),
+            };
+
+            // Outputs + scratch. `packed`/`scales` are zeroed so K-padding nibbles and padding scale
+            // atoms (rows ≥ m or blocks ≥ n_blocks, up to the 128×4 atom) stay 0 — matching the packer.
+            let mut block_amax = self.stream.alloc_zeros::<f32>(total).map_err(drv_err)?;
+            let mut g_amax = self.stream.alloc_zeros::<f32>(1).map_err(drv_err)?;
+            let mut packed = self
+                .stream
+                .alloc_zeros::<u8>(m * (cols_padded / 2))
+                .map_err(drv_err)?;
+            let mut scales = self.stream.alloc_zeros::<u8>(sf_rows * sf_cols).map_err(drv_err)?;
+
+            let (mi, ki, nbi) = (m as i32, k as i32, n_blocks as i32);
+            let (cpi, sci) = (cols_padded as i32, sf_cols as i32);
+            let block = 256u32;
+            let grid = (total as u32).div_ceil(block);
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            // Pass 1: per-block amax + per-tensor amax (atomicMax into a pre-zeroed scalar).
+            unsafe {
+                self.stream
+                    .launch_builder(&kernels.amax)
+                    .arg(x_slice)
+                    .arg(&mut block_amax)
+                    .arg(&mut g_amax)
+                    .arg(&mi)
+                    .arg(&ki)
+                    .arg(&nbi)
+                    .launch(cfg)
+                    .map_err(drv_err)?;
+            }
+
+            // The one host sync: read the per-tensor amax scalar for the GEMM alpha (same global scale
+            // recipe as the CPU packer). `clone_dtoh` orders after pass 1 on the stream.
+            let amax = self.stream.clone_dtoh(&g_amax).map_err(drv_err)?[0];
+            let global_scale = if amax > 0.0 {
+                amax / (E2M1_MAX * E4M3_MAX)
+            } else {
+                1.0
+            };
+
+            // Pass 2: E4M3 block scale + E2M1 element codes + nibble pack + swizzled scale scatter.
+            let gs = global_scale;
+            unsafe {
+                self.stream
+                    .launch_builder(&kernels.pack)
+                    .arg(x_slice)
+                    .arg(&block_amax)
+                    .arg(&mut packed)
+                    .arg(&mut scales)
+                    .arg(&mi)
+                    .arg(&ki)
+                    .arg(&nbi)
+                    .arg(&cpi)
+                    .arg(&sci)
+                    .arg(&gs)
+                    .launch(cfg)
+                    .map_err(drv_err)?;
+            }
+
+            Ok(DevNvfp4 {
+                packed,
+                scales,
+                rows: m,
+                cols_padded,
+                global_scale,
+            })
         }
 
         /// **int8 IGEMM**: raw `int32 = X_i8 · W_i8ᵀ` (no scale folded — caller multiplies by
@@ -1094,6 +1268,28 @@ mod cuda_impl {
         /// The logical `[rows, cols_padded]` shape of the staged operand (padding included).
         pub fn shape_padded(&self) -> (usize, usize) {
             (self.rows, self.cols_padded)
+        }
+
+        /// The per-tensor FP32 scale cuBLASLt consumes via `alpha`.
+        pub fn global_scale(&self) -> f32 {
+            self.global_scale
+        }
+
+        /// Copy the staged **UE4M3 block-scale bytes** back to the host — the swizzled buffer exactly as
+        /// cuBLASLt reads it (see [`cublaslt_scale_layout`] for the offset of a logical `(row, block)`).
+        ///
+        /// Byte-level test/debug support, deliberately not on any hot path. It exists because an
+        /// end-to-end GEMM rel-RMS check **cannot** see a single wrong scale byte at an exact E4M3
+        /// rounding tie: ties are measure-zero under random activations, so only a crafted input
+        /// inspected at the byte level catches them (sc-12078 review).
+        pub fn scales_to_host(&self, lt: &CublasLt) -> Result<Vec<u8>> {
+            lt.stream.clone_dtoh(&self.scales).map_err(drv_err)
+        }
+
+        /// Copy the staged **E2M1 nibble bytes** back to the host (row-major `[rows, cols_padded/2]`,
+        /// low nibble = even column). Byte-level test/debug support; see [`Self::scales_to_host`].
+        pub fn packed_to_host(&self, lt: &CublasLt) -> Result<Vec<u8>> {
+            lt.stream.clone_dtoh(&self.packed).map_err(drv_err)
         }
 
         fn stage(lt: &CublasLt, t: &Nvfp4Tensor) -> Result<Self> {

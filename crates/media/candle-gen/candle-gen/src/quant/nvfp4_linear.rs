@@ -479,9 +479,15 @@ impl Nvfp4Linear {
         // W4A4 (sc-11044): quantize the activation to NVFP4 **on-device** — no CPU round-trip — and run
         // the FP4 GEMM against the resident weight. `cols_padded` matches the resident weight so the two
         // operands share the padded contraction width.
-        let x_stg = fp4
-            .lt
-            .quantize_nvfp4_activation(&x_pad, fp4.w_staged.shape_padded().1)?;
+        // sc-12078: the fused single-launch quantizer (E4M3/E2M1 pack + swizzle in two device passes)
+        // replaces the ~40-op candle chain — bit-identical, ~50× faster, so the quantizer no longer
+        // dominates the W4A4 projection. Falls back to the unfused path if nvrtc is unavailable at
+        // runtime (the numerics are identical; only throughput differs).
+        let cols_padded = fp4.w_staged.shape_padded().1;
+        let x_stg = match fp4.lt.quantize_nvfp4_activation_fused(&x_pad, cols_padded) {
+            Ok(stg) => stg,
+            Err(_) => fp4.lt.quantize_nvfp4_activation(&x_pad, cols_padded)?,
+        };
         let y = fp4.lt.matmul_nvfp4_staged(&fp4.w_staged, &x_stg)?; // [m_pad, N] bf16
         let y = if m_pad != m { y.narrow(0, 0, m)? } else { y };
 
