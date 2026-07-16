@@ -32,14 +32,22 @@
 //! *run*. Only W4A4 makes them equal. A W4A16 run holds dense bf16 — never report it as an NVFP4
 //! footprint.
 //!
-//! # Capability gate + fallback (sc-11041 AC)
+//! # Capability gate + fallback (sc-11041 AC, sc-12078 policy)
 //!
-//! W4A4 requires the `cuda` feature, a CUDA device, `sm_120`+ (`CublasLt::meets_nvfp4_floor`), and a
-//! shape the cuBLASLt FP4 path accepts (padded K a multiple of `NVFP4_K_ALIGN`, N a multiple of 16).
-//! When any of these do not hold — a `<sm_120` GPU, a CPU device, a non-cuda build, an ineligible
-//! shape, or an explicit W4A16 override — the layer **transparently falls back** to the
+//! W4A4 requires the `cuda` feature, a CUDA device, `sm_120`+ (`CublasLt::meets_nvfp4_floor`), a shape
+//! the cuBLASLt FP4 path accepts (padded K a multiple of `NVFP4_K_ALIGN`, N a multiple of 16), **and
+//! the fused activation quantizer to compile** (`CublasLt::nvfp4_fused_quantizer_available`). When any
+//! of these do not hold — a `<sm_120` GPU, a CPU device, a non-cuda build, an ineligible shape, no
+//! fused quantizer, or an explicit W4A16 override — the layer **transparently falls back** to the
 //! [`Nvfp4Regime::DequantBf16`] dense path (no crash). The non-cuda build compiles this whole module
 //! (the FP4 compute leg is cfg-gated); it only ever takes the fallback.
+//!
+//! **Every gate is settled at construction, and the regime is then fixed for the layer's life.** A
+//! forward never re-decides and never silently downgrades: `regime()` is what actually ran. This is
+//! why the fused-quantizer probe lives in the gate rather than in `forward_fp4` — a per-forward
+//! `Err(_) => unfused` would have made `lights_up_fp4() == true` while serving a regime measured at
+//! **0.01× vs bf16**, with no log line and nothing in the reported footprint to show for it. Once the
+//! gate passes, a fused-quantizer error is a genuine fault and propagates.
 //!
 //! # M (token-row) alignment (sc-11039 handoff)
 //!
@@ -255,9 +263,54 @@ pub enum Nvfp4Regime {
     /// compute win, weight resident at the NVFP4 footprint (the SC#6 packed-forward path).
     Fp4W4A4,
     /// Weight dequantized to bf16, dense bf16 matmul (full-precision activation) — the W4A16 outlier
-    /// override **or** the `<sm_120` / CPU / non-cuda / ineligible-shape capability fallback. **No FP4
-    /// compute** (storage/parity tier).
+    /// override **or** the `<sm_120` / CPU / non-cuda / ineligible-shape / no-fused-quantizer
+    /// capability fallback. **No FP4 compute** (storage/parity tier).
+    ///
+    /// # Why an unavailable fused quantizer lands here (sc-12078 fallback policy)
+    ///
+    /// W4A4 needs to quantize the activation every projection, and there are two implementations: the
+    /// fused nvrtc kernel (~0.38 ms/projection at K=6144, M=4118) and the unfused candle reference
+    /// chain (~19 ms). Those are not two speeds of the same regime — they are different products:
+    ///
+    /// | regime | ms/step (Krea 2 Turbo, 1024², exclusive rig) | vs bf16 |
+    /// |---|---:|---:|
+    /// | dense bf16 | 893.7 | 1.00× |
+    /// | W4A16 (this regime) | 895.7 | 1.00× |
+    /// | W4A4, fused quantizer | 716.3 | **1.25×** |
+    /// | W4A4, unfused quantizer | ~90 000 | **0.01×** |
+    ///
+    /// So when the fused kernel is unavailable, W4A4-via-unfused is ~100× *worse than never having
+    /// used NVFP4*, while W4A16 costs ~nothing. Routing the gate here is not a compromise; it is
+    /// ~100× the better answer, and the only thing it gives up is the packed footprint (0.28× → 1.00×,
+    /// itself a defect tracked by sc-12121, which makes W4A16 packed-resident). Correctness and
+    /// quality are identical in both fallbacks — this is purely about not shipping a 100× cliff behind
+    /// a silent `Err(_)`.
     DequantBf16,
+}
+
+/// Emit the "fused quantizer unavailable → W4A16" note **once per process** (sc-12078).
+///
+/// Deliberately not per layer: every [`Nvfp4Linear`] builds its own `CublasLt`, and the compile
+/// failure is cached per *handle*, so an unloud version of this would print once per projection —
+/// 260× on a Krea trunk. One block that explains the whole run beats 260 that bury it.
+#[cfg(feature = "cuda")]
+fn warn_fused_quantizer_unavailable() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[sc-12078] Nvfp4Linear: the fused NVFP4 activation quantizer is UNAVAILABLE on this \
+             device (nvrtc failed to compile it). W4A4 is disabled for this process: every layer that \
+             asked for it now runs W4A16 (dequant→bf16, ~1.00× vs dense bf16) instead.\n\
+             \x20 This run loses BOTH NVFP4 wins — the FP4 compute win (1.10× mixed / 1.25× blanket) \
+             and the packed VRAM footprint (0.28× → 1.00×, i.e. dense bf16 resident). Output quality \
+             is unaffected.\n\
+             \x20 W4A4 is gated on this kernel rather than falling back to the unfused reference \
+             quantizer because that path costs ~19 ms/projection vs ~0.38 ms fused, and measured 0.01× \
+             vs dense bf16 end-to-end — ~100× slower than not using NVFP4 at all. Degrading to W4A16 \
+             is ~100× better than degrading to unfused W4A4.\n\
+             \x20 Restore nvrtc to get the FP4 lane back."
+        );
+    });
 }
 
 /// The FP4 compute leg — a resident on-device NVFP4 weight + a shared cuBLASLt handle. Cuda-only.
@@ -341,7 +394,8 @@ impl Nvfp4Linear {
     }
 
     /// Attempt to build the resident FP4 (W4A4) compute leg. `Ok(None)` when the device is not
-    /// `sm_120`+, not CUDA, or the shape is ineligible for the cuBLASLt FP4 path (→ caller falls back).
+    /// `sm_120`+, not CUDA, the fused activation quantizer will not compile (sc-12078), or the shape is
+    /// ineligible for the cuBLASLt FP4 path (→ caller falls back).
     /// A hard cuBLASLt/allocation failure also degrades to `Ok(None)` (transparent fallback) with a note.
     #[cfg(feature = "cuda")]
     fn try_build_fp4(
@@ -373,6 +427,17 @@ impl Nvfp4Linear {
         match lt.meets_nvfp4_floor() {
             Ok(true) => {}
             _ => return Ok(None), // <sm_120 → fallback
+        }
+        // Fused-quantizer gate (sc-12078 fallback policy). W4A4 needs an activation quantizer, and the
+        // fused kernel is the only one fast enough to make the regime worth running: the unfused
+        // reference chain costs ~19 ms/projection against its ~0.38 ms, which measured 0.01× vs dense
+        // bf16 end-to-end. So "nvrtc cannot compile the fused kernel" is a capability miss exactly like
+        // <sm_120 — the honest response is the same one, W4A16 — and it is settled HERE, once, rather
+        // than per forward. Probing now costs nothing: the compile is cached on the handle, so the first
+        // forward would have paid it anyway.
+        if !lt.nvfp4_fused_quantizer_available() {
+            warn_fused_quantizer_unavailable();
+            return Ok(None);
         }
         let w_staged = match lt.stage_nvfp4(weight) {
             Ok(s) => s,
@@ -479,15 +544,15 @@ impl Nvfp4Linear {
         // W4A4 (sc-11044): quantize the activation to NVFP4 **on-device** — no CPU round-trip — and run
         // the FP4 GEMM against the resident weight. `cols_padded` matches the resident weight so the two
         // operands share the padded contraction width.
-        // sc-12078: the fused single-launch quantizer (E4M3/E2M1 pack + swizzle in two device passes)
-        // replaces the ~40-op candle chain — bit-identical, ~50× faster, so the quantizer no longer
-        // dominates the W4A4 projection. Falls back to the unfused path if nvrtc is unavailable at
-        // runtime (the numerics are identical; only throughput differs).
+        //
+        // The fused quantizer (sc-12078) is called UNCONDITIONALLY, and its errors propagate. This
+        // regime only exists because `try_build_fp4` already proved the kernel compiles on this handle,
+        // so there is no "nvrtc is missing" case left to catch here. What remains — a shape/storage
+        // mismatch, an OOM, a launch failure — is a real fault, and rerouting it to the unfused
+        // reference chain would answer a bug with a ~50×-slower projection while hiding the bug
+        // (the unfused path allocates too, so it would not survive an OOM either). Fail loud instead.
         let cols_padded = fp4.w_staged.shape_padded().1;
-        let x_stg = match fp4.lt.quantize_nvfp4_activation_fused(&x_pad, cols_padded) {
-            Ok(stg) => stg,
-            Err(_) => fp4.lt.quantize_nvfp4_activation(&x_pad, cols_padded)?,
-        };
+        let x_stg = fp4.lt.quantize_nvfp4_activation_fused(&x_pad, cols_padded)?;
         let y = fp4.lt.matmul_nvfp4_staged(&fp4.w_staged, &x_stg)?; // [m_pad, N] bf16
         let y = if m_pad != m { y.narrow(0, 0, m)? } else { y };
 
@@ -620,6 +685,37 @@ mod tests {
             den += (*x as f64).powi(2);
         }
         (num / (den + 1e-30)).sqrt() as f32
+    }
+
+    /// **The sc-12078 fallback policy, as a gate the CPU lane can run.**
+    ///
+    /// The W4A4 forward must never reach the unfused reference quantizer. It once did, via an
+    /// `Err(_) => quantize_nvfp4_activation(..)` arm that silently served W4A4 at ~19 ms/projection
+    /// (0.01× vs dense bf16 — ~100× slower than not using NVFP4) whenever nvrtc failed. That is now a
+    /// construction-time capability gate that falls back to W4A16 (~1.00×) instead.
+    ///
+    /// This is a source-level assertion on purpose. The regression it guards is **invisible to every
+    /// numeric gate we have** — the unfused path is bit-identical to the fused one, so rel-RMS reports
+    /// 0.000000 either way and only the clock knows. The behavioural tests that *can* see it are
+    /// `#[ignore]`d and need an exclusive sm_120 rig, so nothing in a normal CI run would notice the
+    /// arm coming back as a well-meaning "robustness" fix. Cheap guard, expensive silence.
+    #[test]
+    fn w4a4_forward_never_routes_to_the_unfused_quantizer() {
+        // Production source only: split at the test module, whose own text contains these needles.
+        let src = include_str!("nvfp4_linear.rs");
+        let production = src.split("#[cfg(test)]").next().expect("split yields a prefix");
+        assert!(
+            !production.contains(".quantize_nvfp4_activation("),
+            "the W4A4 forward calls the UNFUSED quantizer. It must not: that path measured 0.01× vs \
+             dense bf16 end-to-end (~19 ms/projection vs ~0.38 ms fused), so reaching it is ~100× \
+             worse than the W4A16 fallback the capability gate is supposed to select. If the fused \
+             kernel is unavailable, gate W4A4 off in `try_build_fp4` — do not reroute the forward."
+        );
+        // ...and not vacuously: the fused call must actually be there, so a rename can't pass this.
+        assert!(
+            production.contains(".quantize_nvfp4_activation_fused("),
+            "the W4A4 forward no longer calls the fused quantizer — the assertion above is vacuous"
+        );
     }
 
     /// On a CPU device (no cuda / not sm_120) `from_packed` always selects the dequant→bf16 fallback,

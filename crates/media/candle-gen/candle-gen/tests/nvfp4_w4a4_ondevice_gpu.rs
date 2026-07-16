@@ -426,6 +426,79 @@ fn nvfp4_w4a4_forward_ondevice_no_nan_vs_bf16() {
     assert!(rr < 0.2, "on-device W4A4 vs bf16 {rr:.5} exceeds NVFP4 tolerance");
 }
 
+/// (2b) **sc-12078 fallback policy: no fused quantizer ⇒ W4A16, never W4A4-via-unfused.**
+///
+/// The branch a healthy rig can never reach by itself. `SC12078_DISABLE_FUSED_QUANT` makes the fused
+/// kernel report uncompilable — the same `Err` the compile closure produces for a broken nvrtc, cached
+/// on the handle the same way — so the real capability gate in `Nvfp4Linear::from_packed` executes
+/// here rather than shipping unexecuted.
+///
+/// The policy under test: an FP4-eligible sm_120 W4A4 request whose fused quantizer is unavailable
+/// resolves to [`Nvfp4Regime::DequantBf16`] — it does **not** error, and it does **not** stay
+/// `Fp4W4A4` and route the forward through the unfused reference chain. That last option is what this
+/// gate exists to forbid: it is numerically identical (so no rel-RMS gate can see it) but costs ~19 ms
+/// per projection against ~0.38 ms fused, which measured **0.01× vs dense bf16** end-to-end — ~100×
+/// worse than the W4A16 this now selects (~1.00×).
+///
+/// Also asserts the reported accounting stays honest through the fallback: a layer that fell back must
+/// not claim the packed NVFP4 footprint it no longer has.
+///
+/// Env-var mutation is safe here: `.cargo/config.toml` forces `RUST_TEST_THREADS=1`, so no concurrent
+/// test can observe the window, and the var is removed before any assertion can unwind past it.
+#[test]
+fn nvfp4_fused_unavailable_forces_w4a16() {
+    let Some(dev) = nvfp4_device() else { return };
+    let (n, k) = (256usize, 512usize);
+    let w_f32 = pseudo_random(n * k, 0x1_2078);
+    let w = Tensor::from_vec(w_f32.clone(), (n, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+
+    // Baseline: with the fused kernel available, this exact weight lights the FP4 cores. Without this
+    // the test could pass for the boring reason that the shape/device was never eligible.
+    let lit = Nvfp4Linear::from_dense(&w, None, &dev, ActPrecision::W4A4).unwrap();
+    assert_eq!(
+        lit.regime(),
+        Nvfp4Regime::Fp4W4A4,
+        "precondition: this shape must be FP4-eligible, or the gate below proves nothing"
+    );
+    assert!(lit.lights_up_fp4());
+
+    // Now build the same layer with the fused quantizer forced unavailable. Each `Nvfp4Linear` builds
+    // its own `CublasLt`, so this one re-probes and sees the failure.
+    std::env::set_var(CublasLt::NVFP4_FORCE_NO_FUSED_QUANT_ENV, "1");
+    let gated = Nvfp4Linear::from_dense(&w, None, &dev, ActPrecision::W4A4);
+    std::env::remove_var(CublasLt::NVFP4_FORCE_NO_FUSED_QUANT_ENV);
+    let gated = gated.expect("no fused quantizer must DEGRADE to W4A16, not fail the build");
+
+    assert_eq!(
+        gated.regime(),
+        Nvfp4Regime::DequantBf16,
+        "with no fused quantizer, W4A4 must fall back to W4A16 — staying Fp4W4A4 means the forward \
+         is serving the unfused chain at 0.01× vs bf16 (~100× worse than this fallback)"
+    );
+    assert!(!gated.lights_up_fp4(), "a fallback layer must not report the FP4 cores as lit");
+
+    // The probe is a capability gate, not a numerics change: the fallback still computes.
+    let m = 64usize;
+    let x_f32 = pseudo_random(m * k, 0x2_2078);
+    let x = Tensor::from_vec(x_f32.clone(), (m, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let y = gated.forward_checked(&x).expect("W4A16 fallback must forward");
+    assert_eq!(y.dims(), &[m, n]);
+    let got = to_vec_f32(&y);
+    assert!(got.iter().all(|v| v.is_finite()));
+    let rr = rel_rms(&got, &ref_matmul(&x_f32, &w_f32, m, k, n));
+    eprintln!("[sc-12078] no-fused-quantizer W4A16 fallback vs bf16-dense rel-RMS = {rr:.5}");
+    assert!(rr < 0.2, "W4A16 fallback vs bf16 {rr:.5} exceeds NVFP4 tolerance");
+
+    // Honest accounting through the fallback (the sc-11045 MAJOR-3 shape): this layer holds a dense
+    // bf16 weight now, and must say so rather than reporting its packed host container's size.
+    assert_eq!(
+        gated.resident_weight_bytes(),
+        gated.bf16_footprint_bytes(),
+        "a W4A16 fallback holds dense bf16 resident — it must not report the packed NVFP4 footprint"
+    );
+    assert_eq!(gated.resident_device_bytes(), None, "nothing is staged packed on-device in W4A16");
+}
+
 /// (3) Throughput: on-device **W4A4** vs **W4A16** (and a bf16-dense baseline) layer forwards on
 /// representative Sana-DiT GEMM shapes, on the (now exclusive) GPU. Informational — the multiple is
 /// hardware-dependent, so it is reported, not asserted (the correctness/no-NaN gates above are the
