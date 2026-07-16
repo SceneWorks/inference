@@ -258,7 +258,7 @@ pub fn check_progress(g: &dyn Generator, profile: &Profile) -> Result<(), String
 }
 
 /// **Progress (request-supplied).** The general form of [`check_progress`] for providers whose
-/// `generate` needs a request the text-only [`base_request`] cannot express — image→video (SVD),
+/// `generate` needs a request the text-only `base_request` cannot express — image→video (SVD),
 /// super-resolution (SeedVR2), and the renderer families (Bernini, scail2), the same shape as
 /// [`check_cancellation_with`]. Asserts `Progress::Step{current,total}` is monotone and complete
 /// (`current` runs exactly `1..=total`, `total` constant); when `expected_total` is `Some`, `total`
@@ -326,13 +326,13 @@ pub fn check_progress_with(
 /// that fold N outputs into one bar (`total = N × steps`) satisfy it; providers that restart the bar
 /// per output, overrun it, or skip `Decoding` fail it. Use [`check_progress_contract_with`] for the
 /// image→video / super-resolution / renderer families whose `generate` needs a request the text-only
-/// [`base_request`] cannot express.
+/// `base_request` cannot express.
 pub fn check_progress_contract(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
     check_progress_contract_with(g, &base_request(profile))
 }
 
 /// **Progress contract (request-supplied).** The general form of [`check_progress_contract`] for
-/// providers whose `generate` needs conditioning the text-only [`base_request`] cannot supply
+/// providers whose `generate` needs conditioning the text-only `base_request` cannot supply
 /// (image→video, super-resolution, the renderer families) — the same shape as
 /// [`check_cancellation_with`]. Asserts the same three invariants: monotone in-bounds `Step`, the bar
 /// reaches `total`, and `Progress::Decoding` is emitted exactly once.
@@ -407,7 +407,7 @@ pub fn check_cancellation(g: &dyn Generator, profile: &Profile) -> Result<(), St
 }
 
 /// **Cancellation (request-supplied).** The general form of [`check_cancellation`] for providers
-/// whose `generate` needs conditioning the text-only [`base_request`] cannot supply — image→video
+/// whose `generate` needs conditioning the text-only `base_request` cannot supply — image→video
 /// (SVD), super-resolution (SeedVR2), and the renderer families (Bernini, scail2). The caller builds
 /// a model-appropriate request (its own conditioning + a step count with headroom, ≥ 3, so a
 /// honoring provider visibly stops before completion); this helper trips `req.cancel` at the first
@@ -479,7 +479,7 @@ pub fn check_precancellation(g: &dyn Generator, profile: &Profile) -> Result<(),
 }
 
 /// **Pre-generate cancellation (request-supplied).** The general form of [`check_precancellation`]
-/// for providers whose `generate` needs conditioning the text-only [`base_request`] cannot supply
+/// for providers whose `generate` needs conditioning the text-only `base_request` cannot supply
 /// (image→video, super-resolution, the renderer families) — the same shape as
 /// [`check_cancellation_with`]. Trips `req.cancel` up front, then asserts the typed
 /// `Err(Error::Canceled)` with no partial output.

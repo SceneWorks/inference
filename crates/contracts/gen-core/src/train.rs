@@ -301,10 +301,11 @@ pub struct TrainerDescriptor {
 ///
 /// - `control_type` unset ⇒ the plain LoRA/LoKr path: no-op.
 /// - `control_type` set on a trainer that does **not** advertise
-///   [`supports_control`](TrainerDescriptor::supports_control) ⇒ typed [`Error::Unsupported`] (the
+///   [`supports_control`](TrainerDescriptor::supports_control) ⇒ typed
+///   [`crate::Error::Unsupported`] (the
 ///   LoRA-only trainers must reject a control request, not silently produce a non-control adapter).
 /// - `control_type` set on a control-capable trainer ⇒ every [`TrainingItem`] must carry a
-///   `control_image_path`, else [`Error::Msg`].
+///   `control_image_path`, else [`crate::Error::Msg`].
 pub fn validate_control_request(
     desc: &TrainerDescriptor,
     req: &TrainingRequest,

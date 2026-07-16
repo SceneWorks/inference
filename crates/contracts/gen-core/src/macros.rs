@@ -72,7 +72,7 @@ macro_rules! register_text_embedder {
     };
 }
 
-/// Implement the standard delegation-pattern [`Generator`] wrapper for provider structs.
+/// Implement the standard delegation-pattern [`crate::Generator`] wrapper for provider structs.
 #[macro_export]
 macro_rules! impl_generator {
     (

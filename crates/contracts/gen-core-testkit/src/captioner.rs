@@ -5,7 +5,8 @@
 //! ## Captioner cancellation semantics
 //!
 //! Like a trainer, a captioner that has already emitted tokens when cancel trips may return a
-//! **partial** `Ok` (a truncated caption marked [`CaptionFinishReason::Cancelled`]). The **typed
+//! **partial** `Ok` (a truncated caption marked
+//! [`gen_core::CaptionFinishReason::Cancelled`]). The **typed
 //! `Err(Error::Canceled)`** contract covers cancellation *before inference starts*: a captioner
 //! handed an already-cancelled request must check the flag up front and return `Canceled` rather
 //! than running the vision/text stack to produce a caption nobody asked for. The check drives that

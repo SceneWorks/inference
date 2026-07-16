@@ -10,11 +10,11 @@
 //!
 //! - **Patch embed** is a `Conv3d` over `[temporal_patch_size, patch_size, patch_size]` with kernel ==
 //!   stride == the patch, i.e. a per-patch linear projection — loaded as a reshaped `[hidden, C·T·P·P]`
-//!   matmul ([`PatchEmbed`]).
+//!   matmul (`PatchEmbed`).
 //! - **Position embedding** is a learned `num_position_embeddings` (a `side×side`) grid **bilinearly
-//!   resampled** to each image's patch grid ([`vision_bilinear`]) — not a fixed per-index add.
+//!   resampled** to each image's patch grid (`vision_bilinear`) — not a fixed per-index add.
 //! - **2-D rotary** in attention: each patch's `(row, col)` grid position drives a NeoX rotary table
-//!   ([`vision_rotary`]), the row half over the first `head_dim/4` frequencies and the col half over
+//!   (`vision_rotary`), the row half over the first `head_dim/4` frequencies and the col half over
 //!   the next, doubled into the full `head_dim` (`cat(freqs, freqs)`).
 //! - **Patch merger**: a per-patch LayerNorm, then `spatial_merge_size²` adjacent patches are
 //!   concatenated and projected (`fc1 → GELU(exact) → fc2`) to `out_hidden_size` — this `pooler`
@@ -22,7 +22,7 @@
 //!   merger already outputs the text hidden size).
 //!
 //! Attention is per **frame** (`grid_t × grid_h·grid_w` patches): a single image is one fully
-//! bidirectional block; multiple images/frames get a block-diagonal mask from [`vision_cu_seqlens`].
+//! bidirectional block; multiple images/frames get a block-diagonal mask from `vision_cu_seqlens`.
 //! Compute follows the SigLIP path — the bf16 checkpoint weights are promoted to **f32** on load and
 //! the tower runs in f32 against the f32-preprocessed patches.
 

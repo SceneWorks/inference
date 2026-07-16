@@ -408,7 +408,7 @@ impl LoraAdapterMeta {
     /// factor rank) as the numerator; `rank` is honored as the scaling denominator (a well-formed PEFT
     /// file stores `A` as `[r, in]`, so the factor's leading dim already equals this — the metadata
     /// value is used for faithfulness and as the source of truth PEFT itself scales by). Any returned
-    /// `rank` is `> 0` ([`from_metadata`] drops non-positive ranks).
+    /// `rank` is `> 0` ([`Self::from_metadata`] drops non-positive ranks).
     pub fn effective(&self, module_path: &str) -> (Option<f32>, Option<f32>) {
         let key = self.target_name_key(module_path);
         let alpha = key
@@ -550,8 +550,8 @@ const SDXL_LEAF_MAP: [(&str, &str); 7] = [
 /// Translate a flattened **original-SD / A1111** SDXL UNet stem (the kohya `lora_unet_` prefix already
 /// stripped) to its **diffusers-block** equivalent, or `None` if `stem` is not original-SD naming
 /// (already diffusers, a text-encoder key, or unknown). Block prefix via
-/// [`SDXL_ORIGINAL_TO_DIFFUSERS_BLOCK`] (longest match — `input_blocks_4_1` over any shorter prefix),
-/// then the resnet/sampler leaf remap ([`SDXL_LEAF_MAP`]). The attention sub-path is carried through
+/// `SDXL_ORIGINAL_TO_DIFFUSERS_BLOCK` (longest match — `input_blocks_4_1` over any shorter prefix),
+/// then the resnet/sampler leaf remap (`SDXL_LEAF_MAP`). The attention sub-path is carried through
 /// unchanged (identical in both layouts), so the result resolves against the same diffusers
 /// `flattened → dotted` table the diffusers-named LoRAs use (sc-6051).
 pub fn original_sd_to_diffusers_stem(stem: &str) -> Option<String> {
