@@ -8,7 +8,7 @@
 //!
 //! Three reference quirks carried over verbatim:
 //!  - The VAE "RMS_norm" is a **channel-L2 normalization** — `x / max(‖x‖₂ over C, 1e-12) · √C · γ`
-//!    over axis 1 (not feature-RMS over the last axis). See [`rms_norm_channels`].
+//!    over axis 1 (not feature-RMS over the last axis). See `rms_norm_channels`.
 //!  - `CausalConv3d` pads time on the **left only** by `kt − st` (causal), with an optional
 //!    `cache_x` left-context for the chunked encode. Spatial padding is symmetric `(kh−1)/2`.
 //!  - Encode is **chunked** (frame 0 alone, then 4-frame chunks) with a persistent per-conv
@@ -560,7 +560,7 @@ impl WanVae {
 
     /// Decode with **tiling** for memory-bounded large/long-video decode (`cfg`): split the latent
     /// into overlapping spatial/temporal tiles, decode each (conv2 + decoder + clamp), and
-    /// trapezoidally blend them into the full video. Falls back to the single-pass [`decode`] when
+    /// trapezoidally blend them into the full video. Falls back to the single-pass [`Self::decode`] when
     /// `cfg` doesn't fire for these dims. The Wan z16 VAE is **non-causal** in time (`T → 4·T`) and
     /// upsamples 8× spatially — [`VaeTiling::WAN`].
     ///
@@ -639,7 +639,7 @@ impl WanVae {
     /// exp(0.5·clamp(logvar, −30, 20))·eps`, then latent-normalize. `eps` is standard-normal noise of
     /// the latent shape `[B, z, T_lat, H/8, W/8]`, taken as an argument so the result is deterministic
     /// (the reference draws it from the request seed). Bernini's `get_vae_features` uses this for
-    /// **video** source conditioning; images use [`encode`] (`.mode()`).
+    /// **video** source conditioning; images use [`Self::encode`] (`.mode()`).
     pub fn encode_sample(&self, video: &Array, eps: &Array) -> Result<Array> {
         let (mean, logvar) = self.encode_moments(video)?;
         self.normalize_latent(&reparameterize(&mean, &logvar, eps)?)

@@ -5,7 +5,7 @@
 //! unchanged (self-attn with qk-RMSNorm + 3-axis RoPE, text cross-attn, adaLN-6vec modulation,
 //! gated-GELU FFN, modulated head — all already validated in [`crate::transformer`]); VACE adds
 //! (a) one `vace_patch_embedding` (a 96-ch patchify→linear), (b) `len(vace_layers)`
-//! [`WanVaceBlock`]s that produce per-layer "hints" from the control latent, and (c) hint injection
+//! `WanVaceBlock`s that produce per-layer "hints" from the control latent, and (c) hint injection
 //! `hidden_states += proj_out(control)·scale` at each main layer in `vace_layers`.
 //!
 //! ## Why a self-contained module (not a reuse of `WanTransformer`)
@@ -21,7 +21,7 @@
 //! rather than threading a dtype through the validated bf16-only [`crate::transformer`].
 //!
 //! **Numerics (must match diffusers):** non-affine `FP32LayerNorm` on the f32 residual (`norm1`/
-//! `norm3` → [`ln`]); affine `FP32LayerNorm` for the cross-attn input (`norm2`); `qk_norm =
+//! `norm3` → `ln`); affine `FP32LayerNorm` for the cross-attn input (`norm2`); `qk_norm =
 //! "rms_norm_across_heads"` (RMSNorm over the full `dim` before the head split); `eps` from config;
 //! gelu-tanh FFN ([`crate::text_encoder::gelu_tanh`], NOT `gelu_approximate` — the mlx-rs f64-const
 //! note); the sinusoidal time embedding is `flip_sin_to_cos` ([cos|sin]) with `10000^(-j/half)`.

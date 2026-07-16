@@ -952,7 +952,7 @@ impl Wan22Vae {
 
     /// Decode with **tiling** for memory-bounded large/long video. Splits the channels-last latent
     /// `[1,T,H,W,z]` into overlapping tiles, decodes each (denorm + conv2 + decoder + unpatchify +
-    /// clamp), and trapezoidally blends. Falls back to single-pass [`decode`] when `cfg` doesn't fire.
+    /// clamp), and trapezoidally blends. Falls back to single-pass [`Self::decode`] when `cfg` doesn't fire.
     /// vae22 upsamples 16× spatially, 4× temporally, **causally** ([`VaeTiling::WAN22`]).
     pub fn decode_tiled(
         &self,
