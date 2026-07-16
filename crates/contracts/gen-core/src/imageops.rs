@@ -3,7 +3,7 @@
 //! `scale_to_dimensions` and the Qwen2-VL image processor). Pure host code (no tensors), so it lives
 //! in gen-core and every backend reuses one copy.
 //!
-//! [`resize_u8`] bit-matches PIL's `ImagingResample` 8-bit path: float filter coefficients
+//! `resize_u8` bit-matches PIL's `ImagingResample` 8-bit path: float filter coefficients
 //! quantized to `PRECISION_BITS` fixed-point, an integer multiply-accumulate seeded with the
 //! rounding bias, then `clip8` (`>>PRECISION_BITS` + clamp). Reproducing PIL's *fixed-point*
 //! arithmetic (not just "a bicubic") is what gives the edit/img2img conditioning images

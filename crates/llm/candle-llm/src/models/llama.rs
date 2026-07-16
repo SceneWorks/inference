@@ -440,7 +440,7 @@ impl CausalLm {
 
     /// Replace every row of `embeds` `[1, S, hidden]` whose id is any of `placeholder_tokens` with the
     /// next `vision_features` row, in sequence order — the mixed image+video splice (delegates to the
-    /// shared [`crate::models::deepstack::splice_vision_features`]).
+    /// shared `deepstack::splice_vision_features`).
     pub fn splice_vision_features(
         &self,
         embeds: &Tensor,
@@ -471,7 +471,7 @@ impl CausalLm {
     }
 
     /// The full image **and** video interleaved-M-RoPE entry (see the shared
-    /// [`crate::models::deepstack::mrope_positions_mm`]).
+    /// `deepstack::mrope_positions_mm`).
     #[allow(clippy::too_many_arguments)]
     pub fn mrope_positions_mm(
         &self,
@@ -733,7 +733,7 @@ fn shard_for_layer(layer: usize, num_shards: usize, num_layers: usize) -> usize 
 }
 
 /// A key→device placement that splits a plain decoder's `num_layers` transformer blocks contiguously
-/// across `devices` (see [`shard_for_layer`]), with the token embeddings (and any other non-layer
+/// across `devices` (see `shard_for_layer`), with the token embeddings (and any other non-layer
 /// weight) on `devices[0]` and the final norm + LM head on the last device. This is the layout
 /// [`CausalLm::from_dir_sharded`] feeds to [`Weights::from_dir_sharded`]. `devices` must be non-empty.
 pub fn shard_plan(devices: &[Device], num_layers: usize) -> impl Fn(&str) -> Device + '_ {

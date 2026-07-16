@@ -343,7 +343,24 @@ mod cuda_impl {
             DevNvfp4::stage(self, t)
         }
 
-        /// **On-device NVFP4 activation quantize (sc-11044)** — the W4A4 net-new compute deliverable.
+        /// **On-device NVFP4 activation quantize (sc-11044)** — the unfused **reference** quantizer.
+        ///
+        /// # Not a production path (sc-12078 fallback policy)
+        ///
+        /// This is the readable candle-op spelling of the NVFP4 activation recipe, and it is the
+        /// **parity oracle** [`Self::quantize_nvfp4_activation_fused`] is gated against — the fused
+        /// kernel is a hand-written two-pass CUDA reimplementation of exactly this, and the only thing
+        /// keeping it honest is that the two agree bit-for-bit. That is what this function is for now.
+        ///
+        /// It is **not** the W4A4 forward's fallback and must not be reinstated as one. At ~19 ms per
+        /// projection against the fused kernel's ~0.38 ms (K=6144, M=4118), serving W4A4 through it
+        /// measured **0.01× vs dense bf16** end-to-end — ~100× slower than simply not using NVFP4.
+        /// `Nvfp4Linear` therefore gates W4A4 on the fused kernel compiling and falls back to W4A16
+        /// (~1.00×) when it does not, rather than routing here. See [`Nvfp4Regime::DequantBf16`].
+        ///
+        /// [`Nvfp4Regime::DequantBf16`]: super::super::nvfp4_linear::Nvfp4Regime::DequantBf16
+        ///
+        /// # Recipe
         ///
         /// Quantizes a device activation `x = [M, K]` (bf16/f32, already M-row-padded by the caller)
         /// to a packed [`DevNvfp4`] operand — E2M1 nibbles + per-16-block UE4M3 scales (in cuBLASLt's
@@ -479,6 +496,17 @@ mod cuda_impl {
             Ok(t)
         }
 
+        /// Set (to anything) to make [`Self::nvfp4_fused_quantizer_available`] report `false` without
+        /// breaking the real nvrtc install — the fused kernel is then treated as uncompilable.
+        ///
+        /// **This exists so the fallback policy is testable.** A genuine nvrtc failure cannot be
+        /// induced on a healthy rig, so the W4A4→W4A16 capability gate would otherwise be a branch
+        /// that ships having never once been executed — the same class of defect (an unobserved
+        /// fallback) that the gate itself was written to remove. `nvfp4_fused_unavailable_forces_w4a16`
+        /// drives the gate through this. It is read inside the compile closure, so a forced failure is
+        /// cached exactly like a real one and exercises the same code path.
+        pub const NVFP4_FORCE_NO_FUSED_QUANT_ENV: &str = "SC12078_DISABLE_FUSED_QUANT";
+
         /// Compile (once) and fetch the fused NVFP4 activation-quantize kernels (sc-12078). nvrtc turns
         /// [`NVFP4_QUANT_CU`] into a module JITed for the live device; the two functions are cached so
         /// the compile is paid once per handle, not per forward.
@@ -492,6 +520,12 @@ mod cuda_impl {
                 None => {}
             }
             let compiled = (|| -> Result<Arc<Nvfp4QuantKernels>> {
+                if std::env::var_os(Self::NVFP4_FORCE_NO_FUSED_QUANT_ENV).is_some() {
+                    candle_core::bail!(
+                        "sc-12078 fused NVFP4 quant kernels disabled by ${} (test seam)",
+                        Self::NVFP4_FORCE_NO_FUSED_QUANT_ENV
+                    );
+                }
                 let ctx = self.stream.context();
                 let ptx = cudarc::nvrtc::compile_ptx(NVFP4_QUANT_CU).map_err(|e| {
                     candle_core::Error::Msg(format!(
@@ -508,6 +542,22 @@ mod cuda_impl {
             // Cache the outcome either way — a failed compile must not be retried per forward.
             *guard = Some(compiled.as_ref().ok().cloned());
             compiled
+        }
+
+        /// True iff the **fused** NVFP4 activation quantizer (sc-12078) is usable on this handle —
+        /// i.e. its nvrtc compile succeeds, or already did. Compiles on first call and caches the
+        /// outcome (success *and* failure), so repeat queries are free and calling it early costs
+        /// nothing the first forward would not have paid anyway.
+        ///
+        /// **A capability gate, not a diagnostic.** [`Nvfp4Linear::from_packed`] consults this before
+        /// selecting W4A4, alongside [`Self::meets_nvfp4_floor`], because W4A4 *without* the fused
+        /// quantizer is not a regime worth running — see [`Nvfp4Regime::DequantBf16`] for the
+        /// measurements behind that.
+        ///
+        /// [`Nvfp4Linear::from_packed`]: super::super::nvfp4_linear::Nvfp4Linear::from_packed
+        /// [`Nvfp4Regime::DequantBf16`]: super::super::nvfp4_linear::Nvfp4Regime::DequantBf16
+        pub fn nvfp4_fused_quantizer_available(&self) -> bool {
+            self.nvfp4_quant_kernels().is_ok()
         }
 
         /// **Fused** on-device NVFP4 activation quantize (sc-12078) — the throughput replacement for
@@ -832,7 +882,7 @@ mod cuda_impl {
         ///
         /// This is the exact `X·Wᵀ` compute for a per-channel-quantized int8 weight. For a ConvRot
         /// checkpoint the stored `W_i8` is the *rotated* weight `W·R`, so the consume path applies the
-        /// matching online activation rotation `RHT(x)` ([`super::convrot`], sc-9601) before this call,
+        /// matching online activation rotation `RHT(x)` ([`super::super::convrot`], sc-9601) before this call,
         /// making `RHT(x)·(W·R)ᵀ = x·Wᵀ`. The compute here is rotation-agnostic and correct either way.
         pub fn matmul_int8_per_channel(
             &self,
@@ -1276,7 +1326,8 @@ mod cuda_impl {
         }
 
         /// Copy the staged **UE4M3 block-scale bytes** back to the host — the swizzled buffer exactly as
-        /// cuBLASLt reads it (see [`cublaslt_scale_layout`] for the offset of a logical `(row, block)`).
+        /// cuBLASLt reads it (see `cublaslt_scale_layout`, private to this module, for the offset of a
+        /// logical `(row, block)`).
         ///
         /// Byte-level test/debug support, deliberately not on any hot path. It exists because an
         /// end-to-end GEMM rel-RMS check **cannot** see a single wrong scale byte at an exact E4M3

@@ -477,7 +477,8 @@ pub enum Conditioning {
     MultiReference { images: Vec<Image> },
     /// FLUX.1-Redux references, each with its own strength.
     ReduxRefs { refs: Vec<(Image, f32)> },
-    /// ControlNet / pose conditioning. `scale` mirrors [`Reference::strength`]: `None` means "use the
+    /// ControlNet / pose conditioning. `scale` mirrors the strength on
+    /// [`Conditioning::Reference`]: `None` means "use the
     /// per-model default control scale" and `Some(x)` is an explicit override — including `Some(0.0)`,
     /// a deliberately inert control branch. The `Option` is what distinguishes explicit-inert from
     /// unset (the old bare `f32` could not; F-085).
@@ -633,7 +634,8 @@ pub struct Capabilities {
     pub supports_kv_cache: bool,
     pub requires_sigma_shift: bool,
     /// Whether this engine honors [`OffloadPolicy::Sequential`](crate::runtime::OffloadPolicy)
-    /// (epic 10765, sc-11126). [`OffloadPolicy::Sequential`] is *advisory* — a provider that has not
+    /// (epic 10765, sc-11126). [`crate::OffloadPolicy::Sequential`] is *advisory* — a provider that
+    /// has not
     /// wired the load→use→drop residency lifecycle silently treats it as `Resident` (never an error),
     /// which makes the fallback undiscoverable from the outside. This bit is the discovery signal: a
     /// consumer (worker / UI) reads it to know whether requesting `Sequential` will actually bound peak

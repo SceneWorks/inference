@@ -11,18 +11,18 @@
 //! is correct without threading an offset through every call.
 //!
 //! With the `flash-attn` feature, [`sdpa`] first tries the fused FlashAttention-2 kernel
-//! ([`candle_flash_attn::flash_attn`]) for the dense causal/bidirectional path and falls back to the
+//! (`candle_flash_attn::flash_attn`) for the dense causal/bidirectional path and falls back to the
 //! eager kernel for everything it cannot serve — Gemma-2 score soft-cap, MLA's mismatched q/v head
 //! dims, an explicit additive (padded-batch) mask, or a non-f16/bf16 dtype. FlashAttention's causal
-//! masking is bottom-right aligned (`window_size_right = 0`), matching [`causal_mask`]'s convention,
+//! masking is bottom-right aligned (`window_size_right = 0`), matching `causal_mask`'s convention,
 //! so cached decode stays correct. Numerics differ by a few half-precision ULPs from the eager path
 //! (different reduction order), the same tolerance the batched / prefix-reuse GPU paths carry.
 //!
 //! The continuous-batching `Throughput` path (story 7347) decodes many sequences at once over
 //! per-sequence paged caches; its attention used to be an N-call per-sequence SDPA loop, which
 //! flatlined throughput at occupancy (the cost is N kernel launches + N gathers, not per-kernel
-//! speed). [`try_flash_attn_varlen`] (story 7351) folds that loop into **one**
-//! [`candle_flash_attn::flash_attn_varlen`] call over the ragged (gathered) KV of all active
+//! speed). `try_flash_attn_varlen` (story 7351) folds that loop into **one**
+//! `candle_flash_attn::flash_attn_varlen` call over the ragged (gathered) KV of all active
 //! sequences — no padding mask, no per-sequence launch — packed via cumulative `cu_seqlens` offsets.
 //! It is grouped-query-native (K/V passed un-expanded) and bottom-right causal; the eager per-sequence
 //! loop stays the fallback for the cases varlen cannot serve (soft-cap, f32/CPU, no `flash-attn`).

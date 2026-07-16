@@ -571,6 +571,24 @@ fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
 /// **What this test is for:** confirming that both ~4.5-bit tiers diverge from bf16 by a *similar*
 /// amount, and catching a regression that changes their ordering. Rank the formats with the direct
 /// weight/per-layer measurements, not with this.
+///
+/// # Measured values of record (2026-07-16, exclusive `sm_120`, post-sc-12274)
+///
+/// | leg | cosine vs dense bf16 |
+/// |---|---:|
+/// | Q4 weight-only (the incumbent) | 0.97963 |
+/// | NVFP4 **W4A16** weight-only (all 260) | 0.97362 |
+/// | NVFP4 **mixed W4A4** (the shipping policy) | **0.96280** |
+///
+/// **The mixed-W4A4 figure is written down here because sc-12274 needed it and it did not exist.**
+/// That story shared one `CublasLt` across all W4A4 layers, which made every FP4 projection write the
+/// *same* 32 MiB cuBLASLt scratch. To show that changed nothing, you need a before/after on a leg that
+/// actually runs FP4 — and only this one does: the W4A16 leg dequantizes to bf16 and **never
+/// constructs a handle at all**, so its cosine is invariant to that class of change and proves nothing
+/// about it. No pre-change value for the mixed leg was recorded anywhere, so the comparison was
+/// impossible; sc-12274 fell back to a layer-level bit-identity gate
+/// (`nvfp4_linear_shares_one_cublaslt_workspace_across_layers`) plus SC#3's 4160 finite guarded
+/// forwards. Keep this table current so the next change to the FP4 path is not in that position.
 #[test]
 #[ignore = "real-weight GPU test: needs BOTH the Krea 2 Turbo bf16 and q4 snapshots + an sm_120 device"]
 fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
@@ -971,9 +989,11 @@ fn nvfp4_krea_dit_sc6_resident_vram_per_regime() {
 /// shared handle, and this test is the gate that it stays one.
 ///
 /// The warm probe was worth running and came back **negative**: only **0.031 MiB/handle** (the nvrtc
-/// module). The gather index never materializes because `forward_fp4` takes the *fused* quantizer
-/// (sc-12078) and `nvfp4_act_scale_gather_idx` belongs to the unfused path. Kept measuring it anyway —
-/// a fused-path fallback would put it back.
+/// module). The gather index never materializes because `nvfp4_act_scale_gather_idx` belongs to the
+/// *unfused* quantizer, and since sc-12266 `forward_fp4` calls the fused kernel unconditionally — W4A4
+/// is now gated on that kernel compiling, so a layer that would need the unfused path is never in this
+/// regime at all. The warm leg is kept because it is cheap and it is the only thing that would notice
+/// if a per-handle device-side cache were reintroduced.
 ///
 /// # The natural experiment
 ///

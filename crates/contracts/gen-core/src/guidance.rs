@@ -12,7 +12,7 @@
 //!    reductions take an explicit `(shape, axes)` and return a FULL-shape broadcast result, keeping the
 //!    guidance library itself purely elementwise. gen-core keeps its zero-tensor-dep invariant: the
 //!    reference impl is over `Vec<f32>`; real backends supply MLX/candle impls (sc-7439/7440).
-//! 3. The guidance library — [`cfg`], [`cfg_rescale`], and the full APG surface ([`MomentumBuffer`],
+//! 3. The guidance library — [`cfg()`], [`cfg_rescale`], and the full APG surface ([`MomentumBuffer`],
 //!    [`normalized_guidance`], [`normalized_guidance_chain`], [`apg_delta`]) lifted backend-neutrally
 //!    from Lens (`mlx-gen-lens/src/schedule.rs`) and Bernini (`mlx-gen-bernini/src/guidance.rs`)
 //!    (sc-7438). CFG++ (`cfg_pp`) is realized at the sampler layer ([`crate::sampling::cfgpp`]), not
@@ -226,7 +226,7 @@ fn normalize_diff<G: GuidanceOps>(
 }
 
 /// Single-condition APG: `uncond + scale · normalize_diff(cond − uncond, base = cond)`. With
-/// `eta = 1`, `norm_threshold = 0`, and no momentum this is exactly plain [`cfg`].
+/// `eta = 1`, `norm_threshold = 0`, and no momentum this is exactly plain [`cfg()`].
 #[allow(clippy::too_many_arguments)]
 pub fn normalized_guidance<G: GuidanceOps>(
     g: &G,

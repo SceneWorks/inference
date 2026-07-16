@@ -17,7 +17,7 @@ pub enum WeightsSource {
 }
 
 /// Quantization tier a load may request. [`Q4`](Self::Q4)/[`Q8`](Self::Q8) are the group-wise
-/// affine int tiers (see [`crate::quant`]); [`Nvfp4`](Self::Nvfp4) is the NVFP4 FP4 tensor-core tier
+/// affine int tiers; [`Nvfp4`](Self::Nvfp4) is the NVFP4 FP4 tensor-core tier
 /// (epic 11037).
 ///
 /// **A quant tier is a creative choice — a distinct, additive tier, never a silent numerics swap
@@ -124,9 +124,9 @@ pub struct LoadSpec {
     /// cross-attention), distinct from forward-time [`adapters`](Self::adapters).
     pub ip_adapter: Option<WeightsSource>,
     /// LoRA/LoKr adapters baked onto the model at load time. Multiples + mixed LoRA/LoKr stack by
-    /// construction (see [`crate::adapters`]). Applied during `load` on the still-mutable model —
-    /// the seam, since `Generator::generate`/`Transform::apply` take `&self` and the frozen fork
-    /// likewise applies adapters in its initializer. Changing the adapter set means reloading.
+    /// construction (see the provider `adapters` modules). Applied during `load` on the still-mutable
+    /// model — the seam, since `Generator::generate`/`Transform::apply` take `&self` and the frozen
+    /// fork likewise applies adapters in its initializer. Changing the adapter set means reloading.
     pub adapters: Vec<AdapterSpec>,
     /// Auxiliary **PiD** (NVIDIA Pixel-Diffusion) decoder weights overlaid at load time (epic 7840) —
     /// the optional super-resolving replacement for the model's VAE decode step. `None` for the plain
@@ -258,7 +258,7 @@ impl LoadSpec {
 }
 
 /// A single adapter to stack at load time. Multiples + mixed LoRA/LoKr are supported by
-/// construction — see [`crate::adapters`]. Carried by [`LoadSpec::adapters`].
+/// construction — see the provider `adapters` modules. Carried by [`LoadSpec::adapters`].
 #[derive(Clone, Debug)]
 pub struct AdapterSpec {
     pub path: PathBuf,

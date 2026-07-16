@@ -115,9 +115,12 @@ jobs:
         # hosted Linux runner. Clippy has already succeeded, so discard its target artifacts before
         # rebuilding the narrower lib/test profile below.
         run: cargo clean
-      - name: Rustdoc Candle generation packages
-        # Public provider docs are link-heavy API surface. Keep their intra-doc graph valid on the
-        # same CPU-only package set as this lane; CUDA/Metal-specific docs remain platform-gated.
+      - name: Rustdoc Linux CPU packages
+        # Public contracts and provider docs are link-heavy API surface. Keep their intra-doc graph
+        # valid on the complete CPU-buildable package set. This runner has no CUDA toolkit, so it
+        # cannot pass --features cuda and does not check `#[cfg(feature = "cuda")]` docs; the
+        # `windows-cuda-check` lane covers that feature configuration. Metal/MLX docs remain
+        # genuinely ungated: no lane documents them.
         # No reclaim step follows on purpose: unlike Clippy's --all-targets tree, this --no-deps doc
         # build's dependency artifacts are exactly the ones the lib/test profile below reuses (so the
         # test step skips recompiling the provider graph), and they stay well under the reclaimed
@@ -125,7 +128,12 @@ jobs:
         # memory limit; leftover doc artifacts add no concurrent-link pressure.
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --locked --no-deps -p 'candle-gen*'
+        run: >-
+          cargo doc --locked --no-deps
+          -p core-llm -p core-llm-testkit
+          -p sceneworks-gen-core -p sceneworks-gen-core-testkit
+          -p candle-llm -p 'candle-gen*'
+          -p runtime-cpu -p runtime-catalog
       - name: Test Candle packages
         # All-target Clippy above checks every integration and real-weight target. Execute the
         # package unit/catalog suites one linker at a time: concurrently linking several provider
@@ -250,6 +258,20 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda --no-run
+      # The doc twin of the compile check above. The hosted rustdoc gate cannot pass --features cuda
+      # (no CUDA toolkit), so `#[cfg(feature = "cuda")]` docs need this lane. Keep this doc package
+      # set aligned with the compile check above; together with the hosted gate, the CPU and CUDA
+      # doc graphs are each covered (sc-12275, sc-12284).
+      #
+      # No GPU required, same as the compile step: rustdoc builds the dep graph (hence vcvars + nvcc)
+      # but creates no CUDA context and allocates no VRAM, so it is safe on the shared self-hosted rig.
+      - name: Rustdoc Candle CUDA packages (no GPU required)
+        shell: cmd
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          call "%VCVARS%"
+          cargo doc --locked --no-deps -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
 
   windows-cuda:
     name: Candle CUDA packages (Windows, manual)

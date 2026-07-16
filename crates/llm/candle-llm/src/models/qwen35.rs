@@ -5,16 +5,16 @@
 //! cache), this decoder interleaves two mixer types on a fixed schedule (`full_attention_interval`,
 //! default 4 → **3 Gated DeltaNet linear-attention layers : 1 gated full-attention layer**):
 //!
-//! - [`GatedDeltaNet`] — linear attention carrying a fixed-size recurrent state (the verified
+//! - `GatedDeltaNet` — linear attention carrying a fixed-size recurrent state (the verified
 //!   primitives in [`crate::primitives::gated_delta`]): a 4-way in-projection → short conv → q/k
 //!   L2-norm → gated delta recurrence → gated RMS-norm → out-proj.
-//! - [`Qwen35Attention`] — grouped-query attention with **partial RoPE** (`partial_rotary_factor`,
+//! - `Qwen35Attention` — grouped-query attention with **partial RoPE** (`partial_rotary_factor`,
 //!   reusing the [`Rope::partial`] path), per-head q/k RMSNorm, and an **output gate** (the queries
 //!   projection is doubled into `[queries ‖ gate]`, and the attended output is multiplied by
 //!   `sigmoid(gate)` before the output projection).
 //!
 //! Each decoder layer is `input_layernorm → mixer → residual → post_attention_layernorm → MLP →
-//! residual`. The MLP is a dense SwiGLU (the 27B) or a sparse Mixture-of-Experts bank ([`MoeFfn`], the
+//! residual`. The MLP is a dense SwiGLU (the 27B) or a sparse Mixture-of-Experts bank (`MoeFfn`, the
 //! 35B-A3B). The KV cache (full-attn layers) and the recurrent [`DeltaNetCache`] (linear
 //! layers) live side by side in a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next
 //! `(1 + weight)` convention; the recurrence accumulates in f32 (matching the reference GPU kernel)
@@ -42,7 +42,7 @@ use crate::primitives::{KvCache, Weights};
 pub type MropePositions = (Vec<i32>, Vec<i32>, Vec<i32>, i32);
 
 /// Mixture-of-Experts FFN parameters (`qwen3_5_moe`, the 35B-A3B): the routed-expert count / top-k
-/// and the per-expert + shared-expert FFN widths that drive the un-fused [`MoeFfn`].
+/// and the per-expert + shared-expert FFN widths that drive the un-fused `MoeFfn`.
 #[derive(Clone, Copy, Debug)]
 pub struct MoeParams {
     pub num_experts: i32,
