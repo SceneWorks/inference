@@ -54,9 +54,9 @@ fn packed_quant_bits(root: &Path) -> Option<i32> {
 }
 
 /// Tier guard mirroring `mlx_gen_qwen_image::loader::needs_load_time_quant`: if the snapshot is
-/// already a pre-quantized packed turnkey, the loaders detect the packed weights ([`is_packed`] /
+/// already a pre-quantized packed turnkey, the loaders detect the packed weights (`is_packed` /
 /// `{base}.scales`) and skip `quantize()`, so a load-time (re)quant never happens. Compares the
-/// requested bits against the [`packed_quant_bits`] marker: errors on a tier mismatch; returns
+/// requested bits against the `packed_quant_bits` marker: errors on a tier mismatch; returns
 /// `false` (no load-time quant) when the turnkey is already packed at the requested bits; and returns
 /// `true` (load-time quantize needed) for a dense snapshot, where the request stands.
 pub fn needs_load_time_quant(root: &Path, requested_bits: i32, model_id: &str) -> Result<bool> {

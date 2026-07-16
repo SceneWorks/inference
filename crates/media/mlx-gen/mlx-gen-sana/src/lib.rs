@@ -1,6 +1,6 @@
 //! # mlx-gen-sana
 //!
-//! SANA (NVlabs) provider crate for [`mlx-gen`], epic 8485. **Spike sc-8486** delivers the DC-AE
+//! SANA (NVlabs) provider crate for [`mlx_gen`], epic 8485. **Spike sc-8486** delivers the DC-AE
 //! deep-compression **decoder** (the one piece of the native-SANA port whose Metal feasibility was
 //! unproven — the trunk is proven by the Clark Labs 2-bit MLX drop, and the Gemma-2 CHI text encoder
 //! already ships in `mlx-gen-pid`). The full pipeline (Linear DiT trunk, flow scheduler, e2e wiring)
