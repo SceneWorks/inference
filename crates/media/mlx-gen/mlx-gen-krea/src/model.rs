@@ -85,8 +85,8 @@ pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 /// Registry id for the **CFG-free Turbo image-edit** variant (sc-11640, follow-on to epic 10871). Same
 /// Kontext edit surface as [`KREA_2_EDIT_ID`] — a source image (or scene+person pair) drives the dual
 /// conditioning (in-context VAE tokens + Qwen3-VL grounding) through
-/// [`crate::pipeline::KreaPipeline::render_edit`] — but on the **distilled Turbo** checkpoint: the few-step
-/// `turbo_schedule` run **CFG-free** (`guidance = 0`, a single conditional forward, no cond/uncond
+/// [`crate::pipeline::KreaHeavy::render_edit`] — but on the **distilled Turbo** checkpoint: the
+/// few-step `turbo_schedule` run **CFG-free** (`guidance = 0`, a single conditional forward, no cond/uncond
 /// split), the fast-path alternative to the ~52-step full-CFG Raw edit. The `krea2_identity_edit` LoRA
 /// (trained on the Raw DiT, family-compatible with Turbo) folds in via `spec.adapters` exactly as on
 /// Raw. A DISTINCT id so the worker's edit lane can select the fast tier by model, the same way

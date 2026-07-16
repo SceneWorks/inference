@@ -40,7 +40,7 @@
 //! continues from `step + 1`. On restore it **asserts the full 448 DiT + 60 `llm_adapter` = 508 target
 //! surface** against the live model (never inferred from the file) — a checkpoint that had dropped the
 //! 60 conditioner targets would resume an inert conditioner while every structural check still passed
-//! (the sc-10522 trap), so [`assert_resume_surface_matches`] fails it loudly.
+//! (the sc-10522 trap), so `assert_resume_surface_matches` fails it loudly.
 //!
 //! ## Round-trip
 //! The trained adapter round-trips through the sc-10521 inference loader: LoRA is saved with the
