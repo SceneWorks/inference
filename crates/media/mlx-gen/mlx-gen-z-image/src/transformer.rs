@@ -458,9 +458,9 @@ impl ZImageTransformer {
         Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
     }
 
-    /// `x`: latent `(C, F, H, W)`; `cap_feats`: `(cap_len, cap_feat_dim)`; `timestep` in [0,1].
+    /// `x`: latent `(C, F, H, W)`; `cap_feats`: `(cap_len, cap_feat_dim)`; `timestep` in `[0,1]`.
     /// Returns the latent-shaped velocity `(C, F, H, W)`. Single-shot convenience: builds the
-    /// [`Prepared`] and runs one [`forward_with`](Self::forward_with) — bit-identical to caching
+    /// `Prepared` and runs one `forward_with` — bit-identical to caching
     /// `prepare` across steps, since the prep depends only on the (loop-constant) dims + caption.
     pub fn forward(&self, x: &Array, timestep: f32, cap_feats: &Array) -> Result<Array> {
         let sh = x.shape();

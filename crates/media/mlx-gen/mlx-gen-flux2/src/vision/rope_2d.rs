@@ -28,7 +28,7 @@ pub fn cu_seqlens(grids: &[(i32, i32)]) -> Vec<i32> {
 
 /// 2-D RoPE `(cos, sin)`, each `[seq, head_dim]`, over the concatenated image patch grids in
 /// row-major (h-major) order. `seq = Σ gh·gw`. Built in f32 (exact integer-driven math); the
-/// rotation itself runs in f32 too (see [`super::attention::apply_rope`]).
+/// rotation itself runs in f32 too (see `super::attention::apply_rope`).
 pub fn rope_2d(grids: &[(i32, i32)], head_dim: i32, theta: f32) -> (Array, Array) {
     let dim = head_dim as usize;
     let half = dim / 2; // head_dim/2 base freqs

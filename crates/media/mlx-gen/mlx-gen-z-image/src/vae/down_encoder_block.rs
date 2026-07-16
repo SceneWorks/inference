@@ -1,5 +1,5 @@
 //! VAE `DownEncoderBlock`: a run of resnet blocks then an optional stride-2 downsampler. The
-//! encoder mirror of [`crate::vae::UpDecoderBlock`]. NCHW I/O.
+//! encoder mirror of `crate::vae::UpDecoderBlock`. NCHW I/O.
 
 use mlx_rs::Array;
 

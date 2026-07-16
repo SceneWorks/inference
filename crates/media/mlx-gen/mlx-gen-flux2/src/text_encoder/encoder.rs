@@ -135,7 +135,7 @@ impl Qwen3TextEncoder {
     /// `generate()` loop (sc-6030), in addition to the `prompt_embeds` extraction it already does.
     /// `parent_prefix` is the `Mistral3ForConditionalGeneration` language-model root (`language_model`):
     /// the final norm is `{parent}.model.norm.weight` and the LM head is `{parent}.lm_head.weight`.
-    /// The LM head is dense bf16 in the dev snapshot (no packed `.scales`), so [`lin`] returns the
+    /// The LM head is dense bf16 in the dev snapshot (no packed `.scales`), so `lin` returns the
     /// dense path even with `quant = Some`; the final norm stays full precision. Idempotent-ish: a
     /// second call reloads.
     pub fn load_generation_head(

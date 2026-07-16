@@ -52,7 +52,7 @@ pub fn pack_latents(latents: &Array) -> Result<Array> {
 /// Build the packed **FLUX.2-dev Fun-Controlnet-Union** 260-ch control context from an already
 /// BN-normalized, 2×2-patchified control latent `[1, in_channels, h, w]` (`h = height/16`,
 /// `w = width/16`) — the pack + channel-fill tail of
-/// [`crate::model_control::Flux2DevControl::encode_control_context`], split out so the sc-8978
+/// `crate::model_control::Flux2DevControl::encode_control_context`, split out so the sc-8978
 /// numeric golden can byte-confirm it against the fork's `pipeline_flux2_control` with a synthetic
 /// latent (no VAE). Pose/union-only: the control latent is `pack_latents`-flattened to
 /// `[1, seq, in_channels]`, then a zero **mask** (`in_channels / num_latent_channels` = the 2×2 patch

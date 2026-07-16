@@ -49,7 +49,7 @@ pub const DEFAULT_GUIDANCE_DEV: f32 = 4.0;
 /// directly from packed Q4/Q8 parts — so no dense bf16 weight is ever materialized, which is
 /// what keeps the dev load-time memory floor under the 128 GB ceiling (60 GB DiT + 45 GB TE bf16
 /// would peak ~105 GB dense *before* any in-place quantization). The consume-side mirror of
-/// [`mlx_gen_wan::config::WanQuant`].
+/// `mlx_gen_wan::config::WanQuant`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Flux2Quant {
     pub bits: i32,

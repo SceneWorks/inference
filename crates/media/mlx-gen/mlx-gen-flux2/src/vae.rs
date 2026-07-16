@@ -380,7 +380,7 @@ impl Flux2Vae {
     /// The packed-space BatchNorm de-normalization stats `(bn_std, bn_mean)` (each `[128]`, in the
     /// packed-channel order). For engines that reuse this VAE but unpatchify the packed latent
     /// themselves (e.g. Ideogram 4, whose reference does `z * bn_std + bn_mean` before its own
-    /// unpatchify) rather than going through [`decode_packed_latents`].
+    /// unpatchify) rather than going through [`Self::decode_packed_latents`].
     pub fn bn_stats(&self) -> (&Array, &Array) {
         (&self.bn_std, &self.bn_mean)
     }
