@@ -212,8 +212,48 @@ jobs:
       - name: Exercise LLM-only runtime catalog on NAX
         run: cargo test --locked --no-default-features --lib -p runtime-macos
 
+  windows-cuda-build:
+    # Compile-check the CUDA feature on every PR/push that selects this lane — NOT manual-only. This is
+    # the guard that a cuda-gated (`#![cfg(feature = "cuda")]`), `#[ignore]`d GPU test still *compiles*.
+    # The candle-cpu lane's `--all-targets` never sees cuda-gated code (the feature is off there), and
+    # the full GPU lane below is `workflow_dispatch`-only — so before this job a non-compiling cuda test
+    # could reach main unchecked, and one did (sc-12110's `nvfp4_krea_dit_gpu` cos-gap band declared its
+    # constants `f32` while `cosine()` is `f64`). `--no-run --lib --tests` builds every lib + test binary
+    # under `--features cuda` WITHOUT executing anything, so it needs the CUDA toolchain but does not
+    # touch the GPU and does not contend with an exclusive throughput run.
+    name: Candle CUDA compile check (Windows)
+    needs: changes
+    if: needs.changes.outputs.windows_cuda == 'true'
+    runs-on: [self-hosted, windows, cuda]
+    env:
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Cache Cargo and CUDA objects
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Compile Candle CUDA lib + test binaries (no GPU run)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --no-run --lib --tests -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
+
   windows-cuda:
-    name: Candle CUDA packages (Windows, manual)
+    # Full GPU-executing lane: builds AND runs the non-`#[ignore]`d CUDA suites (the `#[ignore]`d
+    # real-weight GPU tests still only run under `-- --ignored`, exercised out-of-band). Kept
+    # `workflow_dispatch`-only because it needs an exclusive GPU; compile coverage of the test targets
+    # is provided on the PR path by `windows-cuda-build` above.
+    name: Candle CUDA packages (Windows, manual GPU run)
     needs: changes
     if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true'
     runs-on: [self-hosted, windows, cuda]

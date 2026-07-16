@@ -114,7 +114,7 @@ candle-gen/                 # workspace root
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)
     package-cuda.ps1        # bundle a CUDA build + redist DLLs into dist/ (sc-3676; see Packaging)
-  .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test; manual Windows/CUDA lane
+  .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test; PR CUDA compile-check + manual GPU lane
 ```
 
 A provider crate publishes one or more named registration constants and a `register_providers`
@@ -632,10 +632,21 @@ pwsh scripts/check-cuda.ps1            # build + test
 pwsh scripts/check-cuda.ps1 -SkipTests # build-only smoke check
 ```
 
-The `windows-cuda` lane in `.github/workflows/ci.yml` runs the same recipe but is **manual-only**
-(`workflow_dispatch`) — it needs no standing runner. To run it in CI you must first register a
-self-hosted `[self-hosted, windows, cuda]` runner, then dispatch the workflow by hand. (GitHub's
-hosted GPU larger-runners are Tesla T4 / sm_75, below our sm_80 baseline, so they can't run it.)
+Two lanes in `.github/workflows/ci.yml` mirror this in CI, both on a self-hosted
+`[self-hosted, windows, cuda]` runner:
+
+* **`windows-cuda-build`** — the automated CI backstop for the `check-cuda.ps1` gate. It runs
+  `cargo test --no-run --lib --tests --features cuda` on every PR/push that selects the CUDA lane, so
+  it *compiles* every cuda-gated (`#![cfg(feature = "cuda")]`) lib and test binary — including the
+  `#[ignore]`d GPU tests — without touching the GPU. This is what stops a non-compiling cuda test from
+  reaching main (it was added after sc-12110's `nvfp4_krea_dit_gpu` merged with an `f32`/`f64` cos-gap
+  band that only a `--features cuda` build sees). It still needs the self-hosted runner *online* for
+  the PR to receive the check.
+* **`windows-cuda`** — the full build-**and-run** recipe. It stays **manual-only**
+  (`workflow_dispatch`) because running the suites needs an exclusive GPU; dispatch it by hand.
+
+(GitHub's hosted GPU larger-runners are Tesla T4 / sm_75, below our sm_80 baseline, so they can't run
+the GPU lane.)
 
 ### Bundle the runtime DLLs
 
