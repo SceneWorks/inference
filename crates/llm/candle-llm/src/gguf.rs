@@ -5,7 +5,7 @@
 //! the container and dequantizes every GGML block type (legacy `Q*_0/_1`, the `Q*_K` k-quants, and
 //! the `IQ*` i-quants) for free. So this module is a *direct loader*, not a converter: it
 //!
-//! 1. reads the container ([`gguf_file::Content`]),
+//! 1. reads the container ([`candle_core::quantized::gguf_file::Content`]),
 //! 2. dequantizes each tensor to dense and **remaps** its llama.cpp name (`blk.0.attn_q.weight`) to
 //!    the transformer key the decoder loads (`model.layers.0.self_attn.q_proj.weight`),
 //! 3. **un-permutes** the Llama/Mistral q/k projections (llama.cpp interleaves their rows for its
@@ -14,7 +14,8 @@
 //! 5. optionally re-quantizes the projections on load (the same quantize-on-load path as a
 //!    safetensors load, story 7163).
 //!
-//! The result is a [`Weights`] map + [`ModelConfig`] the existing [`CausalLm::from_weights_with`]
+//! The result is a [`Weights`] map + [`ModelConfig`] the existing
+//! [`crate::CausalLm::from_weights_with`]
 //! consumes unchanged, so a GGUF load and a safetensors load converge on one decoder. The tokenizer
 //! is taken from a sibling `tokenizer.json` when present, else reconstructed from the GGUF's embedded
 //! tokenizer metadata ([`GgufCheckpoint::tokenizer_from_metadata`]).
@@ -58,7 +59,8 @@ pub struct GgufCheckpoint {
 impl GgufCheckpoint {
     /// Open and load a `.gguf` file onto `device`: dequantize every tensor to dense, remap keys, and
     /// un-permute the Llama/Mistral q/k projections. Load-time re-quantization (`spec.quantize`) is
-    /// applied by the caller via [`CausalLm::from_weights_with`], exactly as for a safetensors load.
+    /// applied by the caller via [`crate::CausalLm::from_weights_with`], exactly as for a
+    /// safetensors load.
     pub fn open(path: impl AsRef<Path>, device: &Device) -> Result<Self> {
         let path = path.as_ref();
         let mut file = std::fs::File::open(path)

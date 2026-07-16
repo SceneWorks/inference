@@ -6,8 +6,8 @@
 //! which physical blocks hold its tokens, and blocks are allocated on demand. Before attention the
 //! sequence's blocks are **gathered** back into a contiguous tensor and fed to the stock
 //! [`sdpa`](crate::primitives::sdpa) (single-sequence) or to one
-//! [`flash_attn_varlen`](candle_flash_attn::flash_attn_varlen) over the whole batch (the continuous
-//! `Throughput` path) — so the cache is a drop-in behind the [`KvCache`](crate::primitives::KvCache)
+//! `candle_flash_attn::flash_attn_varlen` over the whole batch (the continuous
+//! `Throughput` path) — so the cache is a drop-in behind the [`KvCache`]
 //! trait and the decoder never changes.
 //!
 //! ## Pooled storage (stories 7453, 7467)
@@ -258,7 +258,7 @@ impl BlockPool {
 
     /// **Batched fused write (story 7467).** Scatter this step's new keys/values for `layer` into the
     /// pool with **one** in-place [`Tensor::scatter_set`] per side, replacing the continuous
-    /// `Throughput` path's `O(N)` per-sequence [`BlockPool::write_run`]/`slice_set` loop. `k`/`v` are
+    /// `Throughput` path's `O(N)` per-sequence `BlockPool::write_run`/`slice_set` loop. `k`/`v` are
     /// the whole batch's new tokens token-major `[Σ rows, n_kv_heads, head_dim]` (sequence order), and
     /// `index` is the matching `[Σ rows, n_kv_heads, head_dim]` u32 target-slot tensor — element
     /// `(t, ·, ·)` is token `t`'s physical pool row, broadcast across the head/dim columns the scatter
@@ -289,7 +289,7 @@ impl BlockPool {
 /// One cache holds one sequence (`batch_size == 1`); pack concurrency as separate caches over a
 /// shared pool. Implements [`KvCache`] so it drops into the streaming decode loop unchanged; the
 /// continuous `Throughput` step batches the gather across caches via [`PagedKvCache::reserve_step`] +
-/// [`PagedKvCache::write_step`] + [`BlockPool`]'s gather (see `models::llama`).
+/// `PagedKvCache::write_step` + [`BlockPool`]'s gather (see `models::llama`).
 #[derive(Debug)]
 pub struct PagedKvCache {
     num_layers: usize,
@@ -526,7 +526,7 @@ impl PagedKvCache {
 
     /// **Continuous `Throughput` step, part 1.** Reserve `s` new positions: allocate blocks, extend the
     /// block table, and record `new_slots` — without writing data (that is per-layer
-    /// [`write_step`](PagedKvCache::write_step)). The pool store must already be initialized — every
+    /// `write_step`). The pool store must already be initialized — every
     /// continuous lane prefills first (through [`KvCache::update`], or, for a batched-prefill wave,
     /// [`ensure_pool_store`](PagedKvCache::ensure_pool_store)).
     pub fn reserve_step(&mut self, s: usize) -> Result<()> {

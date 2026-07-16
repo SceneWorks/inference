@@ -30,7 +30,7 @@ use std::path::Path;
 /// collapsing the staged peak back to the resident peak so no saving is ever selected. Each provider,
 /// by contrast, computes the split from the exact subdir paths its own loader resolves.
 ///
-/// All three are tensor-free on-disk sums ([`safetensors_dir_bytes`]) — **zero** MLX allocation, no
+/// All three are tensor-free on-disk sums ([`crate::safetensors_dir_bytes`]) — **zero** MLX allocation, no
 /// whole-file reads — so this is safe to call from a pre-load admission gate. A component a model does
 /// not have (or cannot separate) is `0`.
 ///
@@ -53,7 +53,7 @@ impl PerComponentBytes {
     /// named component subdir of the spec's weights DIRECTORY. Each list is the exact subdir(s) the
     /// caller's own loader resolves — `["text_encoder", "text_encoder_2"]` for the two SDXL CLIPs,
     /// `["unet"]` / `["transformer"]` for the DiT, `["vae"]` — so the paths are always correct per
-    /// engine. A subdir that is absent contributes `0` ([`safetensors_dir_bytes`]).
+    /// engine. A subdir that is absent contributes `0` ([`crate::safetensors_dir_bytes`]).
     ///
     /// Each name may be a component *subdir* OR a flat component *file* ([`safetensors_path_bytes`]),
     /// so this also covers the bernini / anima flat-file layouts. Errors only when `spec.weights` is a
@@ -111,8 +111,8 @@ pub struct ModelRegistration {
     /// Optional per-component on-disk footprint (sc-10894) — `Some` for a provider that has declared its
     /// [`PerComponentBytes`] split (via `register_generators! { … ; footprint = … }`), `None` otherwise.
     /// `None` is the default so **every** provider that does not set it registers unchanged; a consumer
-    /// reaching [`footprint`] then gets `Ok(None)` and falls back to its own accounting. Mirrors the
-    /// [`load`](Self::load) fn-pointer shape (a spec in, a `Result` out).
+    /// reaching [`footprint`](Self::footprint) then gets `Ok(None)` and falls back to its own
+    /// accounting. Mirrors the [`load`](Self::load) fn-pointer shape (a spec in, a `Result` out).
     pub footprint: Option<fn(&LoadSpec) -> Result<PerComponentBytes>>,
 }
 
@@ -204,7 +204,7 @@ impl ProviderRegistryBuilder {
     /// SC#5): a tier a backend cannot actually serve must fail loudly at the composition boundary, and
     /// must never be quietly coerced into whatever the backend *can* do. That coercion is a live hazard
     /// wherever the tier's element width collides with a tier the backend does implement — e.g.
-    /// [`Quant::Nvfp4`](crate::runtime::Quant::Nvfp4) reports 4 bits, so a backend that keys its
+    /// [`Quant::Nvfp4`] reports 4 bits, so a backend that keys its
     /// quantizer off [`Quant::bits`](crate::runtime::Quant::bits) alone would silently int4-affine
     /// quantize an NVFP4 request and hand back different numerics under the tier the caller picked.
     ///

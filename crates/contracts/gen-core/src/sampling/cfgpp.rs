@@ -1,5 +1,5 @@
 //! CFG++ solver variants (epic 7434, sc-8255): the sampler-layer half of CFG++ (Chung et al., ICLR
-//! 2025 — https://github.com/CFGpp-diffusion/CFGpp; no upstream LICENSE, the *formula* is reimplemented
+//! 2025 — <https://github.com/CFGpp-diffusion/CFGpp>; no upstream LICENSE, the *formula* is reimplemented
 //! here, nothing is vendored).
 //!
 //! ## Why this is a separate module, not a flag on the existing solvers

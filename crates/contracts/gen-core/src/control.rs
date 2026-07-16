@@ -16,7 +16,8 @@
 //! - the `validate()` tail that requires a `Control` conditioning be present.
 //!
 //! This trait is **tensor-free** (it touches only gen-core contract types), so it lives in gen-core
-//! alongside [`Generator`] and is implemented by each provider's loaded control struct. The default
+//! alongside [`crate::Generator`] and is implemented by each provider's loaded control struct. The
+//! default
 //! message bodies match the canonical Z-Image port; FLUX.2 / Qwen override only the few methods
 //! whose wording legitimately differs, so the user-facing error text stays **byte-identical** to the
 //! hand-written originals (the `#[ignore]` smokes assert on the substrings these produce).
@@ -33,8 +34,9 @@ use crate::runtime::{LoadSpec, WeightsSource};
 use std::path::Path;
 
 /// Which [`ControlKind`]s a control branch accepts. The Fun-Controlnet-Union checkpoints are a
-/// *union* of pose/canny/depth over one VAE-encoded path, so most branches accept [`Any`]; a branch
-/// wired for a single signal (e.g. Qwen v1 = pose-only) restricts to [`Only`].
+/// *union* of pose/canny/depth over one VAE-encoded path, so most branches accept
+/// [`AcceptedControlKinds::Any`]; a branch wired for a single signal (e.g. Qwen v1 = pose-only)
+/// restricts to [`AcceptedControlKinds::Only`].
 ///
 /// This is the *acceptance policy* for the request-side [`Conditioning::Control`] `kind`, kept on the
 /// trait so the validation collapses into the shared [`ControlBranch::resolve_control`] helper rather
@@ -62,7 +64,8 @@ impl AcceptedControlKinds {
 /// The shared engine seam for a ControlNet / Fun-Controlnet-Union variant.
 ///
 /// A provider's loaded control struct (`ZImageTurboControl`, `Flux2DevControl`, `QwenImageControl`,
-/// future `Flux1DevControl`) implements this **in addition to** [`Generator`]. The required methods
+/// future `Flux1DevControl`) implements this **in addition to** [`crate::Generator`]. The required
+/// methods
 /// supply the per-model identity (id, accepted kinds); the **provided methods** supply all the
 /// boilerplate that used to be copy-pasted across the crates, plus override points for the few
 /// message bodies that legitimately differ per model. Nothing here touches tensors — the per-model
@@ -83,8 +86,9 @@ pub trait ControlBranch: crate::Generator {
         AcceptedControlKinds::Any
     }
 
-    /// The "requires a `Control` conditioning" message (used by both [`resolve_control`] when none is
-    /// present and [`require_control_present`]). Defaults to the Z-Image/FLUX.2 wording; Qwen
+    /// The "requires a `Control` conditioning" message (used by both
+    /// [`ControlBranch::resolve_control`] when none is present and
+    /// [`ControlBranch::require_control_present`]). Defaults to the Z-Image/FLUX.2 wording; Qwen
     /// overrides to its "(pose skeleton)" phrasing.
     fn missing_control_message(&self) -> String {
         format!(
