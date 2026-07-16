@@ -114,7 +114,7 @@ candle-gen/                 # workspace root
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)
     package-cuda.ps1        # bundle a CUDA build + redist DLLs into dist/ (sc-3676; see Packaging)
-  .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test; manual Windows/CUDA lane
+  .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test; PR CUDA compile gate + manual GPU lane
 ```
 
 A provider crate publishes one or more named registration constants and a `register_providers`
@@ -624,18 +624,28 @@ cargo build --release -p candle-gen-sdxl --example sdxl-txt2img --features cuda
 
 The scripted, reproducible form of this — sources vcvars, sets the env, runs `cargo build/test
 --workspace --features cuda` — is `scripts/check-cuda.ps1`. **Run it before pushing CUDA-touching
-changes**: the CPU/Metal CI lanes are blind to `#[cfg(feature = "cuda")]` code, so this is the real
-cuda gate.
+changes**: the CPU/Metal CI lanes are blind to `#[cfg(feature = "cuda")]` code, and this *executes*
+the CUDA tests, which CI's compile-only gate below deliberately does not.
 
 ```powershell
 pwsh scripts/check-cuda.ps1            # build + test
 pwsh scripts/check-cuda.ps1 -SkipTests # build-only smoke check
 ```
 
-The `windows-cuda` lane in `.github/workflows/ci.yml` runs the same recipe but is **manual-only**
-(`workflow_dispatch`) — it needs no standing runner. To run it in CI you must first register a
-self-hosted `[self-hosted, windows, cuda]` runner, then dispatch the workflow by hand. (GitHub's
-hosted GPU larger-runners are Tesla T4 / sm_75, below our sm_80 baseline, so they can't run it.)
+Two lanes in `.github/workflows/ci.yml` cover CUDA, both on a self-hosted
+`[self-hosted, windows, cuda]` runner you must register first (GitHub's hosted GPU larger-runners are
+Tesla T4 / sm_75, below our sm_80 baseline, so they can't serve either lane):
+
+* **`windows-cuda-check`** — compile-only (`cargo test … --features cuda --no-run`), and the only
+  *automated* CUDA gate: it runs on every PR/push where `select_lanes` marks `windows_cuda` (candle,
+  contracts, runtime-cuda, workspace-wide changes; MLX-only and docs PRs never wake the runner).
+  `--tests` is load-bearing — the breaks it catches live in test targets, which a bare `cargo build`
+  misses. `--no-run` needs nvcc + MSVC but never creates a CUDA context or allocates VRAM, so it is
+  safe on the shared rig and never competes for the GPU. Added (sc-11990) after `candle-gen-mochi`'s
+  `tier_parity.rs` and `candle-gen-krea`'s `nvfp4_krea_dit_gpu.rs` each merged in a state that did not
+  compile, because no lane built the cuda feature.
+* **`windows-cuda`** — the full build-**and-run** recipe. Still **manual-only** (`workflow_dispatch`),
+  because executing the CUDA suites needs the GPU; dispatch it by hand.
 
 ### Bundle the runtime DLLs
 
