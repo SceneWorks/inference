@@ -571,6 +571,24 @@ fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
 /// **What this test is for:** confirming that both ~4.5-bit tiers diverge from bf16 by a *similar*
 /// amount, and catching a regression that changes their ordering. Rank the formats with the direct
 /// weight/per-layer measurements, not with this.
+///
+/// # Measured values of record (2026-07-16, exclusive `sm_120`, post-sc-12274)
+///
+/// | leg | cosine vs dense bf16 |
+/// |---|---:|
+/// | Q4 weight-only (the incumbent) | 0.97963 |
+/// | NVFP4 **W4A16** weight-only (all 260) | 0.97362 |
+/// | NVFP4 **mixed W4A4** (the shipping policy) | **0.96280** |
+///
+/// **The mixed-W4A4 figure is written down here because sc-12274 needed it and it did not exist.**
+/// That story shared one `CublasLt` across all W4A4 layers, which made every FP4 projection write the
+/// *same* 32 MiB cuBLASLt scratch. To show that changed nothing, you need a before/after on a leg that
+/// actually runs FP4 — and only this one does: the W4A16 leg dequantizes to bf16 and **never
+/// constructs a handle at all**, so its cosine is invariant to that class of change and proves nothing
+/// about it. No pre-change value for the mixed leg was recorded anywhere, so the comparison was
+/// impossible; sc-12274 fell back to a layer-level bit-identity gate
+/// (`nvfp4_linear_shares_one_cublaslt_workspace_across_layers`) plus SC#3's 4160 finite guarded
+/// forwards. Keep this table current so the next change to the FP4 path is not in that position.
 #[test]
 #[ignore = "real-weight GPU test: needs BOTH the Krea 2 Turbo bf16 and q4 snapshots + an sm_120 device"]
 fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
@@ -946,6 +964,305 @@ fn nvfp4_krea_dit_sc6_resident_vram_per_regime() {
     eprintln!(
         "[sc-12110] NOTE: the mixed regime's ratio is dominated by `Nvfp4Linear::new_dequant` \
          materializing dense bf16 for every W4A16 layer — that is sc-12121, not sc-12110."
+    );
+}
+
+/// **sc-12274: what the SC#6 number does NOT count — the per-layer cuBLASLt workspace, measured.**
+///
+/// [`nvfp4_krea_dit_sc6_resident_vram_per_regime`] proves SC#6 by summing `resident_weight_bytes` over
+/// the lane's projections. That is deliberate and contention-immune — but it is **weights-only**, and
+/// `Nvfp4Linear::try_build_fp4` used to build a *fresh* `CublasLt` per W4A4 layer, each eagerly
+/// allocating a 32 MiB workspace held for life. Those bytes are real resident VRAM and invisible to
+/// that sum.
+///
+/// # Measured before the fix (2026-07-16, exclusive sm_120, this test)
+///
+/// | regime | handles | real VRAM | SC#6 says | excess |
+/// |---|---:|---:|---:|---:|
+/// | blanket W4A16 (= dense bf16) | 0 | 25.56 GiB | 23.38 | 2.18 |
+/// | mixed (shipping) | 139 | 19.69 GiB | 14.28 | 5.42 |
+/// | blanket W4A4 | 260 | **15.41 GiB** | **6.58** | **8.84** |
+///
+/// Fitted **26.1 MiB/handle** (intercept 2.13 GiB) ⇒ ~6.6 GiB of duplicated workspace. The real
+/// footprint was **0.603×**, not the reported **0.2813×** — the headline SC#6 figure was **2.14×
+/// optimistic on the exact regime it was claimed for**. `Krea2Transformer::load_planned` now builds one
+/// shared handle, and this test is the gate that it stays one.
+///
+/// The warm probe was worth running and came back **negative**: only **0.031 MiB/handle** (the nvrtc
+/// module). The gather index never materializes because `nvfp4_act_scale_gather_idx` belongs to the
+/// *unfused* quantizer, and since sc-12266 `forward_fp4` calls the fused kernel unconditionally — W4A4
+/// is now gated on that kernel compiling, so a layer that would need the unfused path is never in this
+/// regime at all. The warm leg is kept because it is cheap and it is the only thing that would notice
+/// if a per-handle device-side cache were reintroduced.
+///
+/// # The natural experiment
+///
+/// `from_packed` only calls `try_build_fp4` for **W4A4**, so the handle count is exactly
+/// [`Nvfp4Report::fp4_lit`] — and the three regimes give three points on an *otherwise identical*
+/// trunk:
+///
+/// | regime | fp4-lit → handles |
+/// |---|---:|
+/// | blanket W4A16 | 0 |
+/// | mixed (shipping) | ~139 |
+/// | blanket W4A4 | 260 |
+///
+/// Everything else the trunk holds that `resident_bytes` does not count — norms, the batch-1 embedders,
+/// `text_fusion.projector`, allocator rounding — is **identical across all three**. So regressing
+/// `measured_vram − resident_bytes` on `fp4_lit` isolates the workspace as the **slope** and dumps every
+/// confound into the **intercept**. The slope is predicted to be `CublasLt::WORKSPACE` = 32 MiB/handle.
+///
+/// That makes this a real refutation test, not a demo: if the slope came back ~0, the per-layer handle
+/// would cost nothing and sc-12274 would be wrong.
+///
+/// # Measured COLD **and WARM** — the cold number is a floor, not the answer
+///
+/// The 32 MiB workspace is allocated eagerly in `CublasLt::new`, so a probe around construction sees
+/// it. But two of the handle's three caches only populate on the **first forward**, and one of them
+/// holds **device** memory:
+///
+/// * `nvfp4_act_scale_gather_idx` — a `Tensor` (the sc-12207 inverse-permutation index), built per
+///   activation shape. Per-handle ⇒ one per *layer* instead of one per shape.
+/// * `nvfp4_quant_kernels` — the nvrtc-compiled fused quantizer module, held for the handle's life.
+///
+/// So a construction-only probe **understates** the per-layer cost, and quoting it would repeat this
+/// epic's own recurring mistake (sc-12207's residual was mis-sized ~4× by a cold micro-decomposition).
+/// This test therefore probes each regime twice — after `load_planned` (cold) and after one real
+/// forward (warm) — and regresses **both**. The warm slope is the honest per-layer cost.
+///
+/// Pairs with `candle-gen`'s weights-free `nvfp4_linear_builds_one_32mib_cublaslt_workspace_per_layer`,
+/// which pins the same 32 MiB/handle in isolation.
+#[test]
+#[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
+fn nvfp4_krea_dit_sc6_cublaslt_workspace_gap() {
+    use candle_gen::candle_core::cuda_backend::cudarc::driver::result as cuda;
+    let Some(dev) = nvfp4_device() else { return };
+    let Some(root) = bf16_root() else { return };
+
+    /// `CublasLt::WORKSPACE` — the predicted per-handle cost this regression must recover as its slope.
+    const WORKSPACE: usize = 32 * 1024 * 1024;
+    // A VRAM delta is exactly the measurement a background process corrupts — say what else is resident.
+    assert_exclusive_gpu("sc-12274 workspace gap");
+    let cfg = Krea2Config::from_snapshot(&root).expect("krea config");
+    let gib = |b: f64| b / (1024.0 * 1024.0 * 1024.0);
+    let mib = |b: f64| b / (1024.0 * 1024.0);
+    let free_now = |d: &Device| {
+        d.synchronize().unwrap();
+        let (free, _total) = cuda::mem_get_info().unwrap();
+        free as f64
+    };
+
+    // The real caption-derived context — the warm forward must be the real activation shape, since the
+    // gather index is keyed by `(rows, n_blocks)`. Encoded once, before any trunk is resident.
+    let ctx = encode_context(&root, &dev);
+    let sigmas = turbo_sigmas(TURBO_STEPS);
+
+    eprintln!("\n[sc-12274] ===== SC#6 vs REAL VRAM — the cuBLASLt workspace gap (Krea 2 Turbo trunk) =====");
+    eprintln!(
+        "[sc-12274] {:<20} {:>8} {:>11} {:>11} {:>10} {:>11} {:>11} {:>11}",
+        "regime", "fp4-lit", "cold GiB", "warm GiB", "SC#6 GiB", "cold exc", "warm exc", "pred ws"
+    );
+
+    /// One regime's VRAM measurement — a point in the excess-vs-handles regression (sc-12274).
+    struct RegimePoint {
+        /// Handles this regime built. Exactly `Nvfp4Report::fp4_lit`: only a W4A4 layer reaches
+        /// `try_build_fp4`, so this IS the handle count — the regression's x.
+        handles: f64,
+        /// Real VRAM minus `resident_bytes`, probed after construction — what SC#6 cannot see.
+        cold_excess: f64,
+        /// ...and probed again after one real forward, since the handle's caches populate lazily.
+        warm_excess: f64,
+        /// Real VRAM the whole trunk holds, warm.
+        warm_measured: f64,
+        /// Dense bf16 weight bytes — SC#6's denominator (regime-invariant).
+        bf16_bytes: f64,
+    }
+    let mut pts: Vec<RegimePoint> = Vec::new();
+    for (tag, quant) in [
+        ("blanket W4A16", Nvfp4Quant::BlanketW4A16),
+        ("mixed (shipping)", Nvfp4Quant::Mixed),
+        ("blanket W4A4", Nvfp4Quant::BlanketW4A4),
+    ] {
+        // Load the tier FIRST and probe around `load_planned` only, so the measurement is the trunk's
+        // own construction — not the transient bf16 source tensors, which are identical per regime and
+        // would otherwise swamp the signal.
+        let w = trunk_weights(&root, &dev, DType::BF16);
+        let plan = DitPlan::nvfp4(quant).with_num_layers(cfg.num_layers);
+
+        let before = free_now(&dev);
+        let m = Krea2Transformer::load_planned(&w, &cfg, &plan).expect("build trunk");
+        let cold = before - free_now(&dev);
+
+        // One real forward at the real activation shape, then drop every transient it produced: what
+        // stays is the handle-resident caches (gather index + nvrtc module), which cold cannot see.
+        {
+            let x = init_latent(&dev, EDGE);
+            let t = Tensor::from_vec(vec![sigmas[0]], (1,), &dev).expect("timestep");
+            let v = m.forward(&x, &t, &ctx).expect("warm DiT forward");
+            drop(v);
+        }
+        let warm = before - free_now(&dev);
+
+        let r = m.nvfp4_report();
+        let resident = r.resident_bytes() as f64;
+        let predicted_ws = (r.fp4_lit * WORKSPACE) as f64;
+        eprintln!(
+            "[sc-12274] {:<20} {:>4}/{:<3} {:>11.3} {:>11.3} {:>10.3} {:>11.3} {:>11.3} {:>11.3}",
+            tag,
+            r.fp4_lit,
+            r.n_quantized,
+            gib(cold),
+            gib(warm),
+            gib(resident),
+            gib(cold - resident),
+            gib(warm - resident),
+            gib(predicted_ws)
+        );
+        pts.push(RegimePoint {
+            handles: r.fp4_lit as f64,
+            cold_excess: cold - resident,
+            warm_excess: warm - resident,
+            warm_measured: warm,
+            bf16_bytes: r.bf16_bytes as f64,
+        });
+        drop(m);
+        drop(w);
+        // Confirm the trunk's VRAM actually came back, else the next regime's baseline is a lie.
+        let _ = free_now(&dev);
+    }
+
+    // --- Least-squares slope of excess-vs-handles: per-layer cost, isolated from every constant ------
+    // Everything the trunk holds that `resident_bytes` does not count — norms, batch-1 embedders,
+    // `text_fusion.projector`, allocator rounding — is IDENTICAL across regimes, so it lands in the
+    // intercept and the slope is the per-handle cost alone.
+    let fit = |sel: &dyn Fn(&RegimePoint) -> f64| -> (f64, f64) {
+        let n = pts.len() as f64;
+        let xbar = pts.iter().map(|p| p.handles).sum::<f64>() / n;
+        let ybar = pts.iter().map(sel).sum::<f64>() / n;
+        let sxy: f64 = pts
+            .iter()
+            .map(|p| (p.handles - xbar) * (sel(p) - ybar))
+            .sum();
+        let sxx: f64 = pts.iter().map(|p| (p.handles - xbar).powi(2)).sum();
+        let slope = sxy / sxx;
+        (slope, ybar - slope * xbar)
+    };
+    let (cold_slope, cold_int) = fit(&|p| p.cold_excess);
+    let (warm_slope, warm_int) = fit(&|p| p.warm_excess);
+
+    eprintln!(
+        "\n[sc-12274] REGRESSION excess = slope·fp4_lit + intercept over {} regimes:",
+        pts.len()
+    );
+    eprintln!(
+        "[sc-12274]   COLD slope = {:>9.3} MiB/handle  intercept {:>9.3} MiB  (predicted {:.3} = CublasLt::WORKSPACE)",
+        mib(cold_slope),
+        mib(cold_int),
+        mib(WORKSPACE as f64)
+    );
+    eprintln!(
+        "[sc-12274]   WARM slope = {:>9.3} MiB/handle  intercept {:>9.3} MiB  (workspace + per-handle caches)",
+        mib(warm_slope),
+        mib(warm_int)
+    );
+    eprintln!(
+        "[sc-12274]   cache-only (warm − cold) = {:.3} MiB/handle — gather index + nvrtc module, \
+         duplicated per layer instead of per shape",
+        mib(warm_slope - cold_slope)
+    );
+    eprintln!(
+        "[sc-12274]   ⇒ blanket W4A4 (260 handles): COLD {:.3} GiB / WARM {:.3} GiB of per-handle VRAM \
+         that the SC#6 weights-only sum does not count.",
+        gib(cold_slope * 260.0),
+        gib(warm_slope * 260.0)
+    );
+
+    // --- SC#6 RESTATED against a MEASURED baseline, with no attribution ---------------------------
+    // The cleanest restatement needs no model of what the workspace costs: blanket W4A16 IS the
+    // dense-bf16-resident trunk (nothing packed on-device, 1.00× by construction — asserted by
+    // `nvfp4_krea_dit_sc6_resident_vram_per_regime`). So measured(W4A4) / measured(W4A16) is the real
+    // footprint ratio, whole-trunk, including every byte both regimes actually hold.
+    let w4a4 = pts.last().expect("blanket W4A4 measured last");
+    let (warm_exc_w4a4, w4a4_measured, bf16_bytes) =
+        (w4a4.warm_excess, w4a4.warm_measured, w4a4.bf16_bytes);
+    let w4a16_measured = pts[0].warm_measured;
+    assert_eq!(w4a4.handles, 260.0, "blanket W4A4 must light all 260 lane projections");
+    assert_eq!(
+        pts[0].handles, 0.0,
+        "blanket W4A16 lights nothing — it is the dense-bf16 baseline"
+    );
+
+    // The SHIPPED SC#6 figure, recomputed exactly as `Nvfp4Report::footprint_ratio` does it
+    // (resident weight bytes / dense bf16 weight bytes) — this is the ~0.2813× the epic headlines.
+    let w4a4_resident = w4a4_measured - warm_exc_w4a4;
+    let sc6_shipped = w4a4_resident / bf16_bytes;
+    // ...and what the same run actually costs: measured W4A4 trunk / measured dense-bf16 trunk. Both
+    // are "a W4A4 run vs dense bf16", which is precisely the claim SC#6 makes — one accounted on
+    // weights only, one measured whole-trunk.
+    let sc6_real = w4a4_measured / w4a16_measured;
+    eprintln!("\n[sc-12274] ===== SC#6 RESTATED (blanket W4A4, measured — no attribution) =====");
+    eprintln!(
+        "[sc-12274]   real resident, whole trunk : {:.3} GiB (W4A4) vs {:.3} GiB (dense bf16 = blanket W4A16)",
+        gib(w4a4_measured),
+        gib(w4a16_measured)
+    );
+    eprintln!(
+        "[sc-12274]   REAL footprint ratio       : {:.4}×   <-- what a blanket-W4A4 run actually costs",
+        sc6_real
+    );
+    eprintln!(
+        "[sc-12274]   SC#6 weights-only reports  : {:.4}×   ({:.3} GiB packed / {:.3} GiB bf16)",
+        sc6_shipped,
+        gib(w4a4_resident),
+        gib(bf16_bytes)
+    );
+    eprintln!(
+        "[sc-12274]   ⇒ the shipped SC#6 figure is {:.2}× optimistic on the very regime it is claimed for.",
+        sc6_real / sc6_shipped
+    );
+    // sc-12274's sharpest line, scored: is the workspace really bigger than the weights it serves?
+    eprintln!(
+        "[sc-12274]   workspace ({:.3} GiB @ measured slope) vs the packed weights it serves ({:.3} GiB) = {:.2}×",
+        gib(warm_slope * 260.0),
+        gib(w4a4_resident),
+        (warm_slope * 260.0) / w4a4_resident
+    );
+    eprintln!(
+        "[sc-12274]   weights-only excludes {:.3} GiB (warm). Report SC#6 as weights-only EXPLICITLY, \
+         or report weights+handles — silence is not an option (sc-12274 scope 4).",
+        gib(warm_exc_w4a4)
+    );
+
+    // --- THE GATE: the per-layer handle must not come back ---------------------------------------
+    // Post-fix the trunk shares ONE handle via `DitPlan::with_nvfp4_context`, so per-layer VRAM beyond
+    // the weights must be ~0 — the slope, not the intercept, is what regresses. Any reintroduced
+    // `CublasLt::new` per layer puts ~26–32 MiB back on this slope and trips here.
+    //
+    // Scale note: this bounds the slope at 4 MiB/handle, i.e. <1.0 GiB across 260 — an eighth of the
+    // ~6.6 GiB the defect cost. It is deliberately not tighter: the regression's premise (everything
+    // `resident_bytes` misses is regime-invariant) is imperfect, because the ALLOCATION PATTERN
+    // differs — blanket W4A16 allocates 260 large ~92 MiB dense tensors while blanket W4A4 allocates
+    // 260 small packed buffers, so allocator rounding leaks into the fit. That imprecision is also why
+    // the pre-fix slope measured ~26 MiB here but exactly 32.00 MiB in the isolated, nothing-else-
+    // allocating `nvfp4_linear_shares_one_cublaslt_workspace_across_layers`. Trust that test for the
+    // intrinsic per-handle cost, this one for trunk-scale behaviour, and `sc6_real` for the SC#6
+    // restatement — it is measured and needs no attribution at all.
+    assert!(
+        cold_slope < 4.0 * 1024.0 * 1024.0,
+        "{:.2} MiB of resident VRAM per fp4-lit layer beyond its weights — the trunk is building a \
+         cuBLASLt handle PER LAYER again (sc-12274 regression). One shared handle should make this \
+         ~0; a full per-layer {:.2} MiB workspace costs ~6.6 GiB across this trunk and is invisible \
+         to the weights-only SC#6 sum.",
+        mib(cold_slope),
+        mib(WORKSPACE as f64)
+    );
+    // Warm can only be worse than cold: the handle's caches are additive and never freed.
+    assert!(
+        warm_slope >= cold_slope - 1024.0 * 1024.0,
+        "warm per-handle cost {:.2} MiB < cold {:.2} MiB — impossible if the handle's caches are \
+         retained for life; the probe is measuring something other than steady-state residency.",
+        mib(warm_slope),
+        mib(cold_slope)
     );
 }
 

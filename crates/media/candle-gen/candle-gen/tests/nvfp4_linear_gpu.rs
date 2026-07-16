@@ -18,7 +18,7 @@
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::quant::nvfp4::Nvfp4Tensor;
-use candle_gen::quant::{ActPrecision, Nvfp4Linear, Nvfp4Regime};
+use candle_gen::quant::{ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Regime};
 
 /// splitmix64-hashed deterministic pseudo-random in ~[-1, 1] (launch-portable; no device RNG).
 fn pseudo_random(n: usize, seed: u64) -> Vec<f32> {
@@ -276,4 +276,271 @@ fn nvfp4_linear_w4a16_override_forces_dequant_on_sm120() {
         .unwrap()
         .iter()
         .all(|v| v.is_finite()));
+}
+
+// ==============================================================================================
+// (5) sc-12274 — the per-layer cuBLASLt workspace, measured in isolation.
+// ==============================================================================================
+
+/// **sc-12274 measurement: one `CublasLt` handle costs 32 MiB of VRAM, and `Nvfp4Linear` builds one
+/// per layer.**
+///
+/// sc-12274 asserts, from the code alone, that `Nvfp4Linear::try_build_fp4` calls `CublasLt::new` per
+/// layer and that each handle eagerly allocates a `CublasLt::WORKSPACE` (32 MiB) buffer it holds for
+/// life — so a blanket-W4A4 Krea trunk's 260 W4A4 projections carry ~8.1 GiB of duplicated workspace
+/// that the SC#6 byte-accounting (`resident_weight_bytes`, weights only) cannot see.
+///
+/// That is arithmetic off a code read. **This test is the reading**, isolated from any model: it grows
+/// the handle count on a fixed, tiny weight and measures the driver's free-memory response. Two legs:
+///
+/// 1. **Bare handles** — `N × CublasLt::new` with no layers at all. Isolates the handle's own cost
+///    from anything weight-related; the per-handle slope is the quantity sc-12274 multiplies by 260.
+/// 2. **`Nvfp4Linear` layers** — the real construction path. Each layer's *weight* is deliberately
+///    small (`[512, 512]` → ~144 KiB packed) so that if the per-layer VRAM cost lands near 32 MiB, the
+///    only thing it can be is the workspace: the weight is ~0.4% of it.
+///
+/// 3. **The fix** — the same layers built through `from_dense_in` against **one** shared
+///    [`Nvfp4Context`]. Per-layer VRAM must collapse to the packed weight alone, with a single 32 MiB
+///    workspace for the whole set however many layers there are.
+///
+/// Weights-free (a fixed pseudo-random weight, no snapshot), so it runs in the normal CUDA lane. Legs
+/// 2 and 3 together are the sc-12274 regression gate: leg 2 pins what the private-handle convenience
+/// constructor still costs (by design — it is for one-off layers and tests), leg 3 pins that the
+/// constructor a trunk loader uses does not.
+#[test]
+fn nvfp4_linear_shares_one_cublaslt_workspace_across_layers() {
+    use candle_gen::candle_core::cuda_backend::cudarc::driver::result as cuda;
+    use candle_gen::quant::cublaslt::CublasLt;
+    let Some(dev) = nvfp4_device() else { return };
+
+    /// `CublasLt::WORKSPACE` — private to the handle, restated here as the *predicted* per-handle cost
+    /// this test exists to confirm or refute against the driver.
+    const WORKSPACE: usize = 32 * 1024 * 1024;
+    const N: usize = 32;
+    let mib = |b: f64| b / (1024.0 * 1024.0);
+
+    let free_at = || {
+        dev.synchronize().unwrap();
+        let (free, _total) = cuda::mem_get_info().unwrap();
+        free
+    };
+
+    eprintln!("\n[sc-12274] ===== PER-LAYER cuBLASLt WORKSPACE (isolated, weights-free) =====");
+    eprintln!("[sc-12274] predicted CublasLt::WORKSPACE = {} B (32 MiB)", WORKSPACE);
+
+    // --- Leg 1: bare handles ------------------------------------------------------------------
+    let base = free_at();
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        handles.push(CublasLt::new(&dev).expect("cuBLASLt handle"));
+        if i == 0 || i == N - 1 {
+            let used = base.saturating_sub(free_at()) as f64;
+            eprintln!(
+                "[sc-12274] leg1 bare handles: {:>3} handle(s) → {:>9.2} MiB used ({:>7.2} MiB/handle)",
+                i + 1,
+                mib(used),
+                mib(used) / (i + 1) as f64
+            );
+        }
+    }
+    let leg1_used = base.saturating_sub(free_at()) as f64;
+    let leg1_per_handle = leg1_used / N as f64;
+    drop(handles);
+    let leg1_reclaimed = free_at() >= base.saturating_sub(WORKSPACE);
+    eprintln!(
+        "[sc-12274] leg1 TOTAL: {N} bare handles = {:.2} MiB → {:.2} MiB/handle (predicted {:.2}); \
+         freed-on-drop = {leg1_reclaimed}",
+        mib(leg1_used),
+        mib(leg1_per_handle),
+        mib(WORKSPACE as f64)
+    );
+
+    // --- Leg 2: Nvfp4Linear layers (the real path) --------------------------------------------
+    // A deliberately TINY weight: [512, 512] bf16 packs to ~144 KiB (0.5625 B/wt). If the measured
+    // per-layer cost is ~32 MiB, the weight cannot account for it — the workspace is the only
+    // candidate. K=512 and N=512 clear the FP4 shape gate (K_pad % 32 == 0, N % 16 == 0).
+    let (out_dim, in_dim) = (512usize, 512usize);
+    let w_bf16 = Tensor::from_vec(pseudo_random(out_dim * in_dim, 77), (out_dim, in_dim), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+
+    let base2 = free_at();
+    let mut layers = Vec::with_capacity(N);
+    for _ in 0..N {
+        let lin = Nvfp4Linear::from_dense(&w_bf16, None, &dev, ActPrecision::W4A4).unwrap();
+        assert_eq!(
+            lin.regime(),
+            Nvfp4Regime::Fp4W4A4,
+            "the measurement is only meaningful if the layers actually take the FP4 path"
+        );
+        layers.push(lin);
+    }
+    let leg2_used = base2.saturating_sub(free_at()) as f64;
+    let leg2_per_layer = leg2_used / N as f64;
+
+    let packed_per_layer = layers[0].resident_device_bytes().expect("W4A4 stages a packed weight");
+    let accounted = (packed_per_layer * N) as f64; // what SC#6's `resident_weight_bytes` would sum
+    let unaccounted = leg2_used - accounted;
+
+    eprintln!(
+        "[sc-12274] leg2 Nvfp4Linear x{N} ([{out_dim},{in_dim}] each): {:.2} MiB used → {:.2} MiB/layer",
+        mib(leg2_used),
+        mib(leg2_per_layer)
+    );
+    eprintln!(
+        "[sc-12274] leg2   of which SC#6 byte-accounting SEES (packed weights): {:.2} MiB ({:.2} MiB/layer)",
+        mib(accounted),
+        mib(packed_per_layer as f64)
+    );
+    eprintln!(
+        "[sc-12274] leg2   of which SC#6 byte-accounting MISSES:               {:.2} MiB ({:.2} MiB/layer)",
+        mib(unaccounted),
+        mib(unaccounted / N as f64)
+    );
+    eprintln!(
+        "[sc-12274] leg2   workspace share of resident VRAM = {:.1}% — the SC#6 number counts the other {:.1}%",
+        100.0 * unaccounted / leg2_used,
+        100.0 * accounted / leg2_used
+    );
+
+    // --- The sc-12274 extrapolation, stated with the measured slope ---------------------------
+    let krea_blanket = leg2_per_layer * 260.0 - (packed_per_layer * 260) as f64;
+    eprintln!(
+        "[sc-12274] EXTRAPOLATION: at this per-layer overhead, a 260-projection blanket-W4A4 Krea \
+         trunk would carry {:.2} GiB of workspace invisible to SC#6 (story asserts ~8.12 GiB; the \
+         real trunk measures ~6.6 GiB — see nvfp4_krea_dit_sc6_cublaslt_workspace_gap)",
+        krea_blanket / (1024.0 * 1024.0 * 1024.0)
+    );
+    drop(layers);
+
+    // --- Leg 3: THE FIX — the same N layers against ONE shared context -------------------------
+    let base3 = free_at();
+    let ctx = Nvfp4Context::new(&dev).expect("shared cuBLASLt context");
+    assert!(
+        ctx.is_fp4(),
+        "an sm_120 device must yield a live FP4 context, else leg 3 proves nothing"
+    );
+    let mut shared: Vec<Nvfp4Linear> = Vec::with_capacity(N);
+    for _ in 0..N {
+        let lin = Nvfp4Linear::from_dense_in(&w_bf16, None, &dev, ActPrecision::W4A4, &ctx).unwrap();
+        assert_eq!(
+            lin.regime(),
+            Nvfp4Regime::Fp4W4A4,
+            "the shared-context layers must still light the FP4 cores — a fix that silently dropped \
+             every layer to the bf16 fallback would also 'save' the workspace"
+        );
+        shared.push(lin);
+    }
+    let leg3_used = base3.saturating_sub(free_at()) as f64;
+    let leg3_per_layer = leg3_used / N as f64;
+    // One handle for the whole set, not one each.
+    let leg3_workspace = leg3_used - accounted;
+
+    eprintln!(
+        "[sc-12274] leg3 SHARED ctx x{N}: {:.2} MiB used → {:.2} MiB/layer (vs {:.2} MiB/layer private)",
+        mib(leg3_used),
+        mib(leg3_per_layer),
+        mib(leg2_per_layer)
+    );
+    eprintln!(
+        "[sc-12274] leg3   non-weight VRAM for ALL {N} layers: {:.2} MiB (one shared workspace; \
+         private-handle path would be {:.2} MiB)",
+        mib(leg3_workspace),
+        mib(unaccounted)
+    );
+    eprintln!(
+        "[sc-12274] leg3   SAVED: {:.2} MiB over {N} layers ({:.1}× less non-weight VRAM)",
+        mib(leg2_used - leg3_used),
+        unaccounted / leg3_workspace.max(1.0)
+    );
+
+    // --- Assertions: the mechanism, not the exact byte count -----------------------------------
+    // Leg 1 pins the handle's own cost at ~WORKSPACE. Tolerance is generous (±25%) because the handle
+    // also allocates cuBLASLt-internal state and the driver rounds allocations; the claim under test is
+    // "each handle costs a 32 MiB-scale buffer", not a byte-exact figure.
+    assert!(
+        leg1_per_handle > 0.75 * WORKSPACE as f64 && leg1_per_handle < 1.25 * WORKSPACE as f64,
+        "a bare CublasLt handle measured {:.2} MiB, expected ~{:.2} MiB (CublasLt::WORKSPACE). \
+         sc-12274's arithmetic rests on this being ~32 MiB — if it is not, the story's headline is wrong.",
+        mib(leg1_per_handle),
+        mib(WORKSPACE as f64)
+    );
+    // Leg 2: the private-handle constructor still costs a whole workspace per layer. That is BY DESIGN
+    // (`from_dense` is for a one-off layer / a test) — pinned so the cost stays visible and nobody
+    // reaches for it in a loader.
+    assert!(
+        leg2_per_layer > 0.75 * WORKSPACE as f64,
+        "`from_dense` builds a private handle per layer, so it should still measure ~32 MiB/layer; \
+         got {:.2} MiB. If this dropped, the private/shared distinction has been lost.",
+        mib(leg2_per_layer)
+    );
+    assert!(
+        unaccounted > 10.0 * accounted,
+        "sc-12274's claim is that a per-layer workspace DWARFS the packed weights it serves; measured \
+         unaccounted {:.2} MiB vs accounted {:.2} MiB",
+        mib(unaccounted),
+        mib(accounted)
+    );
+    // Leg 3: THE FIX. `from_dense_in` must add at most ONE workspace for the whole set, however many
+    // layers — so total non-weight VRAM stays ~32 MiB rather than N × 32 MiB. This is the assertion
+    // that fails if anyone reintroduces a per-layer `CublasLt::new`.
+    assert!(
+        leg3_workspace < 1.5 * WORKSPACE as f64,
+        "a shared Nvfp4Context must cost ONE {:.2} MiB workspace for all {N} layers, but the \
+         non-weight VRAM was {:.2} MiB (≈{:.1} workspaces) — the handle is not actually being shared \
+         (sc-12274 regression).",
+        mib(WORKSPACE as f64),
+        mib(leg3_workspace),
+        leg3_workspace / WORKSPACE as f64
+    );
+    assert!(
+        leg3_per_layer < 0.25 * leg2_per_layer,
+        "sharing the handle must collapse per-layer VRAM toward the weight alone: shared \
+         {:.2} MiB/layer vs private {:.2} MiB/layer is not a real saving",
+        mib(leg3_per_layer),
+        mib(leg2_per_layer)
+    );
+
+    // --- Leg 4: sharing must not change a single bit --------------------------------------------
+    // The one genuinely shared MUTABLE resource is the 32 MiB scratch that every matmul on the handle
+    // writes. Every handle on a device already resolves to the same stream (`CublasLt::new` takes
+    // `device.cuda_stream()`), and a stream serializes its kernels, so reuse *should* be safe — but
+    // that is a reasoning chain, and this is the check. Drive all N shared layers through a forward so
+    // the scratch is genuinely reused across layers, and require every output to be bit-identical to a
+    // fresh private-handle layer holding the same weight.
+    let x = Tensor::from_vec(pseudo_random(64 * in_dim, 5150), (64, in_dim), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let bits = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let private = Nvfp4Linear::from_dense(&w_bf16, None, &dev, ActPrecision::W4A4).unwrap();
+    assert_eq!(private.regime(), Nvfp4Regime::Fp4W4A4);
+    let reference = bits(&private.forward(&x).unwrap());
+    assert!(
+        reference.iter().all(|v| v.is_finite()) && reference.iter().any(|v| *v != 0.0),
+        "the reference forward must produce real finite output, else bit-equality is vacuous"
+    );
+    for (i, lin) in shared.iter().enumerate() {
+        let got = bits(&lin.forward(&x).unwrap());
+        assert_eq!(
+            got, reference,
+            "shared-workspace layer {i}/{N} diverged from the private-handle reference. Identical \
+             weight + identical input MUST give identical output; a difference here means the shared \
+             32 MiB cuBLASLt scratch is being clobbered across layers (sc-12274)."
+        );
+    }
+    eprintln!(
+        "[sc-12274] leg4 NUMERICS: all {N} shared-workspace layers bit-identical to the \
+         private-handle reference ({} elems) — scratch reuse across layers is safe on one stream",
+        reference.len()
+    );
+    drop(shared);
 }

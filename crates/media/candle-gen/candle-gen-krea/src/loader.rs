@@ -616,7 +616,10 @@ pub fn linear_detect_planned(
         None
     };
     let device = weight.device().clone();
-    let lin = Nvfp4Linear::from_dense(&weight, dense_bias, &device, act)?;
+    // sc-12274: build against the plan's ONE shared per-device cuBLASLt handle. `from_dense` would
+    // construct a private handle here — and its eager 32 MiB workspace — for every one of the trunk's
+    // 260 projections.
+    let lin = Nvfp4Linear::from_dense_in(&weight, dense_bias, &device, act, plan.nvfp4_context())?;
     Ok(QLinear::Nvfp4(Nvfp4Proj::new(lin, base, plan, act)))
 }
 

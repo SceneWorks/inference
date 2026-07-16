@@ -20,6 +20,7 @@ pub mod block;
 pub mod rope;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::quant::Nvfp4Context;
 
 use crate::config::Krea2Config;
 use crate::loader::{linear_detect, linear_detect_planned, Weights};
@@ -128,6 +129,18 @@ impl Krea2Transformer {
     pub fn load_planned(w: &Weights, cfg: &Krea2Config, plan: &DitPlan) -> Result<Self> {
         // Bind the plan to THIS trunk's block count so `is_edge_block` names the right last block.
         let plan = &plan.clone().with_num_layers(cfg.num_layers);
+        // sc-12274: build ONE cuBLASLt handle for this trunk and thread it to every NVFP4 projection.
+        // A handle eagerly allocates a 32 MiB workspace and holds it for life, and nothing on it is
+        // per-layer (its caches are keyed by shape, and every handle on a device already resolves to
+        // the same stream), so one per layer meant 260 × 32 MiB ≈ 6.6 GiB of duplicated scratch that
+        // the weights-only SC#6 sum cannot see. Skipped for a baseline plan, which builds no
+        // `Nvfp4Linear` at all and must stay byte-identical to `load`.
+        let plan = &if plan.is_nvfp4() {
+            plan.clone()
+                .with_nvfp4_context(Nvfp4Context::new(w.device())?)
+        } else {
+            plan.clone()
+        };
         let (heads, kv, hd, eps) = (
             cfg.num_attention_heads,
             cfg.num_kv_heads,

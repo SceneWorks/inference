@@ -523,6 +523,34 @@ Sana's (0.61× vs 0.70×) simply because more of its layers stay on W4A4 (53% vs
 > weight for every W4A16 layer — that is **[sc-12121](https://app.shortcut.com/trefry/story/12121)**,
 > not a property of the format.
 
+#### Every ratio above is WEIGHTS-ONLY — and for most of this epic that was not the whole truth
+
+`Nvfp4Report::resident_bytes` sums the **lane projections' weight buffers** and nothing else. That is a
+deliberate choice (contention-immune byte-accounting rather than an `nvidia-smi` delta) and it is the
+right way to prove the *packed-forward* claim — but it is not what a run costs, and the difference was
+not a rounding error. Until **[sc-12274](https://app.shortcut.com/trefry/story/12274)** every W4A4 layer
+built its **own** `CublasLt`, each eagerly allocating a 32 MiB workspace held for life, so a
+blanket-W4A4 Krea trunk carried **~6.6 GiB of duplicated scratch that the sum above cannot see**.
+Measured on the real trunk (`nvfp4_krea_dit_sc6_cublaslt_workspace_gap`, exclusive `sm_120`):
+
+| blanket W4A4, whole trunk | before sc-12274 | after sc-12274 |
+|---|---:|---:|
+| real resident VRAM | 15.41 GiB | **7.91 GiB** |
+| dense bf16 trunk (= blanket W4A16, measured) | 25.56 GiB | 25.56 GiB |
+| **real footprint ratio** | **0.603×** | **0.309×** |
+| weights-only ratio reported above | 0.2813× | 0.2813× |
+| **optimism of the weights-only figure** | **2.14×** | **1.10×** |
+
+One shared `Nvfp4Context` per device recovered **7.5 GiB**. The residual 1.10× is *not* a defect: it is
+the non-lane params (norms, the batch-1 embedders, `text_fusion.projector`) that do not shrink under
+quantization, and that a **weights** accounting is entitled to exclude.
+
+So read `resident_bytes` as what it is — a proof about the packed format, not a VRAM budget. **The
+SANA table above carries the same caveat** (163 projections × 32 MiB ≈ 5.1 GiB of workspace against
+437.6 MiB of packed weights, pre-fix); it shares the fix but the whole-trunk figure has not been
+re-measured, so no number is quoted for it here. Both figures are honest — quoting only the first one
+is not.
+
 `Nvfp4Report::footprint_ratio()` is regime-aware and reports exactly the table above;
 `packed_footprint_ratio()` is the format's ~0.28× and is **not** a residency claim. (Before sc-11045's
 review these were the same number: the ratio divided the *host* packed container by bf16, so a W4A16 leg

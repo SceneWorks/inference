@@ -97,7 +97,9 @@ pub use cublaslt::{
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
-pub use nvfp4_linear::{ActPrecision, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime, NVFP4_M_ALIGN};
+pub use nvfp4_linear::{
+    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime, NVFP4_M_ALIGN,
+};
 pub use nvfp4_outlier::{OutlierClass, OutlierSparsity};
 
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};

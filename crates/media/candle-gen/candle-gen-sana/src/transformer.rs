@@ -44,7 +44,7 @@
 use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::candle_nn::ops::{silu, softmax_last_dim};
 use candle_gen::candle_nn::{Conv2d, Linear, Module};
-use candle_gen::quant::{ActPrecision, Nvfp4Linear};
+use candle_gen::quant::{ActPrecision, Nvfp4Context, Nvfp4Linear};
 use candle_gen::Weights;
 
 use crate::config::SanaTransformerConfig;
@@ -108,7 +108,9 @@ fn proj(
         None
     };
     let device = weight.device().clone();
-    let lin = Nvfp4Linear::from_dense(&weight, b, &device, act)?;
+    // sc-12274: build against the plan's ONE shared per-device cuBLASLt handle — `from_dense` would
+    // construct a private handle, and its eager 32 MiB workspace, per projection (×163 on SANA).
+    let lin = Nvfp4Linear::from_dense_in(&weight, b, &device, act, plan.nvfp4_context())?;
     Ok(Proj::new(SanaProj::Nvfp4(Box::new(lin)), prefix, plan, act))
 }
 
@@ -512,6 +514,14 @@ impl SanaTransformer {
         cfg: SanaTransformerConfig,
         plan: &DitPlan,
     ) -> candle_gen::Result<Self> {
+        // sc-12274: build ONE cuBLASLt handle for this trunk and thread it to every NVFP4 projection
+        // via the plan. A handle eagerly allocates a 32 MiB workspace held for life and nothing on it
+        // is per-layer, so one per layer meant 163 × 32 MiB ≈ 5.1 GiB of duplicated scratch — invisible
+        // to the weights-only SC#6 sum. Skipped for a dense plan, which builds no `Nvfp4Linear`.
+        let plan = &match (plan.is_nvfp4(), w.device()) {
+            (true, Some(d)) => plan.clone().with_nvfp4_context(Nvfp4Context::new(d)?),
+            _ => plan.clone(),
+        };
         let p = cfg.patch_size as usize;
         let patch_embed = conv(w, "patch_embed.proj", p, 0, 1, true)?;
         let mut blocks = Vec::with_capacity(cfg.num_layers as usize);
