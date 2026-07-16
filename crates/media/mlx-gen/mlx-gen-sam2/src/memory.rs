@@ -506,7 +506,7 @@ impl MemoryAttentionLayer {
     }
 }
 
-/// `MemoryAttention`: 4 [`MemoryAttentionLayer`]s + a final norm. Conditions the current frame's
+/// `MemoryAttention`: 4 `MemoryAttentionLayer`s + a final norm. Conditions the current frame's
 /// image tokens on the assembled memory bank, producing the memory-conditioned image embeddings the
 /// mask decoder consumes on a video frame.
 pub struct MemoryAttention {

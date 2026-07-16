@@ -476,7 +476,7 @@ fn denoise_core(
 /// img2img — built by the caller), and the U-Net input is `x/√(σ²+1)`
 /// ([`mlx_gen::DiscreteModelSampling`]'s
 /// `input_scale`), cast to the fp16 compute dtype inside the predict closure. The conditioning timestep
-/// is the nearest training index ([`mlx_gen::DiscreteModelSampling::timestep`]) — ComfyUI's behaviour for a
+/// is the nearest training index (`mlx_gen::DiscreteModelSampling::timestep`) — ComfyUI's behaviour for a
 /// discrete model under a curated solver.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_curated(
