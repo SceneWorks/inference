@@ -700,10 +700,10 @@ fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
     // ==========================================================================================
     // Q4 − NVFP4-W4A16 cosine gap measured 2026-07-15 on real weights (this leg quantizes all 260
     // projections; the q4 tier leaves 4 dense — see the surface-mismatch confound in the docs).
-    const MEASURED_COS_GAP: f32 = 0.00601;
+    const MEASURED_COS_GAP: f64 = 0.00601;
     // Absorbs GEMM/library nondeterminism only. The seed, prompt and schedule are fixed, so this is
     // NOT a chaos budget — chaos is *between* the tiers, and it is exactly what the band pins.
-    const COS_GAP_TOL: f32 = 0.004;
+    const COS_GAP_TOL: f64 = 0.004;
 
     let cos_gap = q4_cos - w16_cos;
     assert!(

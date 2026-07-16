@@ -212,6 +212,45 @@ jobs:
       - name: Exercise LLM-only runtime catalog on NAX
         run: cargo test --locked --no-default-features --lib -p runtime-macos
 
+  # Compile-only gate for the CUDA feature — runs on every PR/push that touches the lane.
+  #
+  # This exists because `--features cuda` code is invisible to every other lane: macOS cannot build it
+  # (no CUDA toolkit) and the CPU/Linux lanes do not enable the feature, so a `#[cfg(feature = "cuda")]`
+  # file can be merged in a state that does not compile and nothing notices. That is not hypothetical —
+  # `candle-gen-mochi`'s `tier_parity.rs` shipped with three E0308s and was only caught by hand on the
+  # CUDA box (sc-11990). `--tests` is load-bearing here: the break was in a test target, so a bare
+  # `cargo build` would still have missed it.
+  #
+  # Deliberately `--no-run`: compiling needs nvcc + MSVC but never creates a CUDA context or allocates
+  # VRAM, so this is safe to run on every PR on the shared self-hosted rig without competing for the GPU.
+  # Executing the CUDA tests stays in the manual `windows-cuda` lane below.
+  windows-cuda-check:
+    name: Candle CUDA compile check (Windows)
+    needs: changes
+    if: needs.changes.outputs.windows_cuda == 'true'
+    runs-on: [self-hosted, windows, cuda]
+    env:
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Cache Cargo and CUDA objects
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Compile Candle CUDA packages and test binaries (no GPU required)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda --no-run
+
   windows-cuda:
     name: Candle CUDA packages (Windows, manual)
     needs: changes
