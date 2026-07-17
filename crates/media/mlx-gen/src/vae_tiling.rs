@@ -14,15 +14,11 @@
 //! story bounds). Lifting it here removes the divergence hazard of a per-crate copy of this subtle
 //! slice/blend/pad/accumulate loop (the Wan sc-4998/sc-5690 seam-artifact history).
 
+use crate::array::scalar;
 use crate::tiling::TilePlan;
 use crate::{CancelFlag, Error, Result};
 use mlx_rs::ops::{add, divide, maximum, multiply, pad};
 use mlx_rs::Array;
-
-/// A length-1 `f32` array, used as a broadcastable scalar operand in MLX ops.
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// Force a logically-contiguous copy. mlx-rs host reads (`as_slice`) return the *physical* buffer, so
 /// an array left strided by a `transpose` is read scrambled; a reshape round-trip materializes logical

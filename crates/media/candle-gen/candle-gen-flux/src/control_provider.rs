@@ -48,7 +48,9 @@ use crate::control::{
 };
 use crate::flux1_load;
 use crate::ip_dit::{DitImageInjector, IpFlux};
-use crate::pipeline::{ae_config, decode_latents, encode_text, flow_mu, flux_config};
+use crate::pipeline::{
+    ae_config, decode_latents, encode_text, flow_mu, flux_config, BASE_SHIFT, MAX_SHIFT,
+};
 use crate::Variant;
 
 /// The provider-specific error label for the shared [`crate::flux1_load`] diagnostics.
@@ -57,10 +59,6 @@ const LABEL: &str = "flux1 control";
 const DTYPE: DType = DType::BF16;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
 const LATENT_CHANNELS: usize = 16;
-/// FLUX dev's resolution-dependent flow-match time-shift endpoints (matching the txt2img pipeline).
-const BASE_SHIFT: f64 = 0.5;
-const MAX_SHIFT: f64 = 1.15;
-
 /// FLUX latent geometry requires both image dims to be multiples of 16 for a clean 2×2 pack.
 const SIZE_MULTIPLE: u32 = 16;
 

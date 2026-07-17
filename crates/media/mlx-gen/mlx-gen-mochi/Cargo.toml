@@ -2,7 +2,7 @@
 name = "mlx-gen-mochi"
 version = "0.0.0"
 edition = "2021"
-description = "Mochi 1 (genmo/mochi-1-preview, Apache-2.0) provider crate for mlx-gen — a T5-XXL-conditioned MMDiT text-to-video model with an asymmetric 3-D causal-conv (AsymmVAE) decoder (6× temporal, 8× spatial). A2 scaffolds the I/O edges: the reused T5-XXL text encoder + tokenizer and the AsymmVAE decode path."
+description = "Complete Mochi 1 provider for mlx-gen: masked T5-XXL conditioning, MMDiT denoising, scheduling, AsymmVAE decoding, snapshot conversion, and explicit registration."
 license = "Apache-2.0"
 repository = "https://github.com/michaeltrefry/mlx-gen"
 keywords = ["mlx", "apple-silicon", "mochi", "video", "inference"]
