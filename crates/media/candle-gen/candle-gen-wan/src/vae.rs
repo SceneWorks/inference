@@ -612,6 +612,9 @@ const WAN22_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 // blend) and the per-frame term (≈50 000 B/px for a full frame, rising to ≈90 000 B/px for the smaller
 // tiles whose per-px decoder overhead amortizes worse) are rounded to the **conservative**
 // (over-predicting) side; the model reproduces every anchor at ratio 1.12–1.88× (never under).
+// sc-12474 removed the pad-to-full tile transients. We intentionally retain these pre-change
+// constants as conservative upper bounds: slice accumulation cannot raise the measured peak, and the
+// anchor regression below still proves that the selector does not under-predict any calibrated row.
 //
 // **The old placeholders (40 / 12 000) badly UNDER-predicted** — they forecast ~18 GiB for the 1280²
 // single-frame spike that really peaks 76 GiB, so the selector could have OK'd a single-pass / large

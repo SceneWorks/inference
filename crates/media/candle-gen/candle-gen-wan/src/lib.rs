@@ -329,7 +329,7 @@ impl Generator for WanGenerator {
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
-        if req.prompt.is_empty() {
+        if req.prompt.trim().is_empty() {
             return Err(gen_core::Error::Msg("wan: prompt must not be empty".into()));
         }
         if req.steps == Some(0) {
@@ -666,6 +666,21 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_prompt() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+        let req = GenerationRequest {
+            prompt: " \t\n ".into(),
+            frames: Some(17),
+            ..Default::default()
+        };
+        assert!(g.validate(&req).is_err());
     }
 
     #[test]

@@ -221,13 +221,14 @@ pub fn clean_reasoner_output(raw: &str) -> String {
 /// (case-insensitive), mirroring the vendor `THINK_BLOCK_RE` + the `</think>` split.
 fn strip_think(text: &str) -> String {
     let mut out = text.to_string();
-    let lower = out.to_lowercase();
+    // The tags are ASCII, so ASCII-only folding keeps byte offsets aligned with `out`.
+    let lower = out.to_ascii_lowercase();
     if let (Some(s), Some(e)) = (lower.find("<think>"), lower.find("</think>")) {
         if e >= s {
             out = format!("{}{}", &out[..s], &out[e + "</think>".len()..]);
         }
     }
-    let lower = out.to_lowercase();
+    let lower = out.to_ascii_lowercase();
     if let Some(pos) = lower.rfind("</think>") {
         out = out[pos + "</think>".len()..].to_string();
     }
@@ -279,6 +280,15 @@ mod tests {
             clean_reasoner_output("a   cat   on\na  mat"),
             "a cat on a mat"
         );
+    }
+
+    #[test]
+    fn strip_think_keeps_offsets_aligned_after_length_changing_unicode() {
+        assert_eq!(
+            strip_think("İ before <THINK>hidden</THINK> after"),
+            "İ before  after"
+        );
+        assert_eq!(strip_think("İ stale</THINK>kept"), "kept");
     }
 
     #[test]

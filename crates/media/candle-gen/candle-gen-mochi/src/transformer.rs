@@ -200,7 +200,8 @@ impl MochiAttention {
         Ok(x.reshape((b, s, self.num_heads, self.head_dim))?)
     }
 
-    /// Joint attention. `visual [B, Sv, inner]`, `text [B, St, pooled]`, `enc_mask [B, St]` (0/1).
+    /// Joint attention. `visual [B, Sv, inner]`, `text [B, St, pooled]`, and `joint_mask` is the
+    /// prebuilt additive mask `[B, 1, 1, Sv+St]` shared by every transformer block.
     /// Returns `(visual_out [B, Sv, inner], Some(text_out [B, St, pooled]))` (text `None` when
     /// `context_pre_only`). All-f32.
     pub fn forward(
@@ -208,7 +209,7 @@ impl MochiAttention {
         visual: &Tensor,
         text: &Tensor,
         rope: &MochiRope,
-        enc_mask: &Tensor,
+        joint_mask: &Tensor,
     ) -> Result<(Tensor, Option<Tensor>)> {
         let sv = visual.dim(1)?;
         let st = text.dim(1)?;
@@ -237,9 +238,8 @@ impl MochiAttention {
         let full_k = Tensor::cat(&[&t(&k)?, &t(&ek)?], 2)?.contiguous()?;
         let full_v = Tensor::cat(&[&t(&v)?, &t(&ev)?], 2)?.contiguous()?;
 
-        let mask = build_joint_mask(enc_mask, sv)?;
         let scale = 1.0f64 / (self.head_dim as f64).sqrt();
-        let out = crate::nn::sdpa(&full_q, &full_k, &full_v, scale, Some(&mask))?;
+        let out = crate::nn::sdpa(&full_q, &full_k, &full_v, scale, Some(joint_mask))?;
 
         // → [B, Sv+St, inner]; split back to visual / text.
         let (b, _, _, _) = out.dims4()?;
@@ -336,14 +336,14 @@ impl MochiTransformerBlock {
     }
 
     /// Forward the block. `hidden [B, Sv, inner]`, `enc [B, St, pooled]`, `temb [B, inner]`,
-    /// `enc_mask [B, St]`. Returns the updated `(hidden, enc)`. All-f32.
+    /// `joint_mask [B, 1, 1, Sv+St]`. Returns the updated `(hidden, enc)`. All-f32.
     pub fn forward(
         &self,
         hidden: &Tensor,
         enc: &Tensor,
         temb: &Tensor,
         rope: &MochiRope,
-        enc_mask: &Tensor,
+        joint_mask: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
         let eps = self.eps;
         let silu_temb = silu(&temb.to_dtype(DType::F32)?)?;
@@ -372,7 +372,7 @@ impl MochiTransformerBlock {
         };
 
         // Joint attention.
-        let (attn_h, attn_e) = self.attn.forward(&norm_h, &norm_e, rope, enc_mask)?;
+        let (attn_h, attn_e) = self.attn.forward(&norm_h, &norm_e, rope, joint_mask)?;
 
         // Visual residuals: tanh-gated attn, SwiGLU FFN with (1+scale_mlp) mod, tanh-gated ff.
         let hidden =
@@ -615,9 +615,12 @@ impl MochiTransformer3DModel {
 
         // Learned 3-D RoPE over the post-patch grid.
         let rope = MochiRope::new(&self.pos_frequencies, f, ph, pw, &self.device)?;
+        // Geometry and text validity are constant across all blocks, so the host read and device
+        // upload happen once per transformer forward.
+        let joint_mask = build_joint_mask(&enc_mask, hs.dim(1)?)?;
 
         for block in &self.blocks {
-            let (h_new, e_new) = block.forward(&hs, &enc_stream, &temb, &rope, &enc_mask)?;
+            let (h_new, e_new) = block.forward(&hs, &enc_stream, &temb, &rope, &joint_mask)?;
             hs = h_new;
             enc_stream = e_new;
         }
@@ -893,17 +896,18 @@ mod tests {
         let enc = rnd(&[1, 3, 8], 101, &dev);
         let temb = rnd(&[1, 16], 102, &dev);
         let enc_mask = Tensor::from_vec(vec![1.0f32, 1.0, 0.0], (1, 3), &dev).unwrap();
+        let joint_mask = build_joint_mask(&enc_mask, 4).unwrap();
         let pf = rnd(&[3, 2, 4], 103, &dev);
         let rope = MochiRope::new(&pf, 1, 2, 2, &dev).unwrap();
 
         let (h1, e1) = block
-            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .forward(&hidden, &enc, &temb, &rope, &joint_mask)
             .unwrap();
         assert_eq!(h1.dims(), &[1, 4, 16]);
         assert_eq!(e1.dims(), &[1, 3, 8]);
 
         let (h2, e2) = block
-            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .forward(&hidden, &enc, &temb, &rope, &joint_mask)
             .unwrap();
         let close = |a: &Tensor, b: &Tensor| {
             (a - b)
@@ -995,10 +999,11 @@ mod tests {
         let enc = rnd(&[1, 3, 8], 101, &dev);
         let temb = rnd(&[1, 16], 102, &dev);
         let enc_mask = Tensor::from_vec(vec![1.0f32, 1.0, 0.0], (1, 3), &dev).unwrap();
+        let joint_mask = build_joint_mask(&enc_mask, 4).unwrap();
         let pf = rnd(&[3, 2, 4], 103, &dev);
         let rope = MochiRope::new(&pf, 1, 2, 2, &dev).unwrap();
         let (h, e) = block
-            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .forward(&hidden, &enc, &temb, &rope, &joint_mask)
             .unwrap();
         assert_eq!(h.dims(), &[1, 4, 16]);
         // enc is bit-identical to the input (no context update on the final block).

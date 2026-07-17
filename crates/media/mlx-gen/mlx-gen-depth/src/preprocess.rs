@@ -28,27 +28,9 @@ pub const IMAGE_STD: [f32; 3] = [0.229, 0.224, 0.225];
 /// (the torch/PIL pixel-center convention DA-V2's `BICUBIC`-tier resize approximates; bilinear is a
 /// faithful, cheaper preprocessing resize for a depth hint).
 fn resize_rgb8_to_unit(rgb: &[u8], in_h: usize, in_w: usize, out: usize) -> Vec<f32> {
-    let mut buf = vec![0.0f32; out * out * 3];
-    let sx = in_w as f32 / out as f32;
-    let sy = in_h as f32 / out as f32;
-    for oy in 0..out {
-        let fy = ((oy as f32 + 0.5) * sy - 0.5).max(0.0);
-        let y0 = (fy.floor() as usize).min(in_h - 1);
-        let y1 = (y0 + 1).min(in_h - 1);
-        let wy = fy - y0 as f32;
-        for ox in 0..out {
-            let fx = ((ox as f32 + 0.5) * sx - 0.5).max(0.0);
-            let x0 = (fx.floor() as usize).min(in_w - 1);
-            let x1 = (x0 + 1).min(in_w - 1);
-            let wx = fx - x0 as f32;
-            for c in 0..3 {
-                let p = |y: usize, x: usize| rgb[(y * in_w + x) * 3 + c] as f32;
-                let top = p(y0, x0) * (1.0 - wx) + p(y0, x1) * wx;
-                let bot = p(y1, x0) * (1.0 - wx) + p(y1, x1) * wx;
-                let v = (top * (1.0 - wy) + bot * wy) / 255.0;
-                buf[(oy * out + ox) * 3 + c] = v;
-            }
-        }
+    let mut buf = crate::util::bilinear_resize_rgb8_f32(rgb, in_h, in_w, out, out);
+    for value in &mut buf {
+        *value /= 255.0;
     }
     buf
 }

@@ -59,7 +59,7 @@ pub struct Krea2Transformer {
 /// alternate across the render. A single-entry cache thrashed — evicting + rebuilding the host trig
 /// tables (plus an H2D upload) on every forward (sc-11201 / F-089). Holding a few entries keeps both
 /// legs resident; the small headroom absorbs any incidental extra geometry.
-const ROPE_CACHE_CAP: usize = 4;
+pub(crate) const ROPE_CACHE_CAP: usize = 4;
 
 /// A tiny bounded, geometry-keyed cache for the per-render RoPE tables (sc-8992 / F-012, sc-11201 /
 /// F-089). Holds up to [`ROPE_CACHE_CAP`] distinct geometries so both true-CFG legs stay resident
@@ -67,13 +67,13 @@ const ROPE_CACHE_CAP: usize = 4;
 /// built and inserted; on overflow the oldest entry is evicted (FIFO — with two alternating keys and
 /// `cap ≥ 2` no eviction ever happens once both are cached). Hits clone the (Arc-backed) `V`.
 /// `Mutex` (not `RefCell`): the DiT is shared as `Arc<…>` (`Send + Sync`).
-struct RopeCache<K, V> {
+pub(crate) struct RopeCache<K, V> {
     entries: std::sync::Mutex<Vec<(K, V)>>,
     cap: usize,
 }
 
 impl<K: PartialEq, V: Clone> RopeCache<K, V> {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             entries: std::sync::Mutex::new(Vec::new()),
             cap,
@@ -81,7 +81,7 @@ impl<K: PartialEq, V: Clone> RopeCache<K, V> {
     }
 
     /// Return the cached value for `key`, building + inserting it on a miss.
-    fn get_or_build(&self, key: K, build: impl FnOnce() -> Result<V>) -> Result<V> {
+    pub(crate) fn get_or_build(&self, key: K, build: impl FnOnce() -> Result<V>) -> Result<V> {
         let mut guard = candle_gen::lock_recover(&self.entries);
         if let Some((_, v)) = guard.iter().find(|(k, _)| *k == key) {
             return Ok(v.clone());

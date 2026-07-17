@@ -275,7 +275,7 @@ impl Generator for WanVaceGenerator {
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID_VACE, req)?;
-        if req.prompt.is_empty() {
+        if req.prompt.trim().is_empty() {
             return Err(gen_core::Error::Msg(
                 "wan-vace: prompt must not be empty".into(),
             ));
@@ -525,6 +525,18 @@ mod tests {
         let mut bad_size = control_req();
         bad_size.width = 70;
         assert!(g.validate(&bad_size).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_prompt() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_VACE, &spec)
+            .unwrap();
+        let mut req = control_req();
+        req.prompt = " \t\n ".into();
+        assert!(g.validate(&req).is_err());
     }
 
     /// F-124 (sc-11220): the VACE output length is driven solely by the ControlClip. A `req.frames`

@@ -623,7 +623,7 @@ impl Generator for Wan14bGenerator {
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         let id = self.variant.id();
         self.descriptor.capabilities.validate_request(id, req)?;
-        if req.prompt.is_empty() {
+        if req.prompt.trim().is_empty() {
             return Err(gen_core::Error::Msg(format!(
                 "{id}: prompt must not be empty"
             )));
@@ -966,6 +966,22 @@ mod tests {
             .load(MODEL_ID_I2V_14B, &spec)
             .unwrap();
         assert!(i2v.validate(&ok).is_err(), "i2v needs a reference image");
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_prompt() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_T2V_14B, &spec)
+            .unwrap();
+        let req = GenerationRequest {
+            prompt: " \t\n ".into(),
+            frames: Some(17),
+            sampler: Some("uni_pc".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&req).is_err());
     }
 
     /// The documented `MAX_AREA_14B` cap is actually enforced: an at-cap request passes and a

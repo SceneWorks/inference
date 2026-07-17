@@ -489,7 +489,8 @@ mod gpu_peak {
     /// Device-level used VRAM (MiB) for GPU ordinal `gpu` via `nvidia-smi`, or `None` if the query
     /// fails.
     pub fn used_mib(gpu: usize) -> Option<u64> {
-        let out = Command::new("nvidia-smi")
+        let exe = crate::gpu::resolve_nvidia_smi()?;
+        let out = Command::new(exe)
             .args([
                 "--query-gpu=memory.used",
                 "--format=csv,noheader,nounits",
@@ -578,6 +579,13 @@ mod gpu_peak {
             for raw in ["", " ,1", "GPU-a1b2", "MIG-GPU-a/b/c", "wat"] {
                 assert!(parse_probe_gpu(Some(raw)).is_err(), "{raw:?} must fail");
             }
+        }
+
+        #[test]
+        fn sampler_has_no_bare_nvidia_smi_spawn() {
+            let source = include_str!("testkit.rs");
+            let bare_spawn = ["Command", "::new(\"", "nvidia-smi", "\")"].concat();
+            assert!(!source.contains(&bare_spawn));
         }
     }
 }
