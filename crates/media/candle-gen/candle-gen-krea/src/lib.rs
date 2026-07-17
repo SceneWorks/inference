@@ -550,6 +550,11 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     let heavy_device = device.clone();
     let heavy_adapters = spec.adapters.clone();
     let heavy_pid = spec.pid.clone();
+    // sc-12425: the sequential heavy phase must know whether to load the int8-ConvRot DiT (from the
+    // single file) or the snapshot's dense/packed `transformer/`. Absent this the sequential path loaded
+    // `root/transformer` unconditionally — the wrong DiT for a ConvRot request — which is why ConvRot
+    // was pinned Resident (`effective_residency_policy`) rather than dropping its 15.6 GB f32 TE.
+    let heavy_convrot = convrot_dit.clone();
     let residency = candle_gen::Residency::from_policy_with_resident(
         policy,
         move || {
@@ -584,15 +589,22 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             )?)))
         },
         move |use_pid| {
-            Ok(KreaHeavyPhase::Sequential(Box::new(
-                pipeline::load_residency_heavy(
+            let heavy = match heavy_convrot.as_ref() {
+                // ConvRot: the int8 DiT from the single file + VAE (no adapters/PiD — the lane rejects
+                // both, sc-9300). The TE was already loaded, encoded, and dropped by the text phase, so
+                // this loads into that freed pool — the whole point of going sequential here.
+                Some(convrot_dit) => {
+                    pipeline::load_residency_heavy_convrot(&heavy_root, convrot_dit, &heavy_device)?
+                }
+                None => pipeline::load_residency_heavy(
                     &heavy_root,
                     &heavy_device,
                     &heavy_adapters,
                     heavy_pid.as_ref(),
                     use_pid,
                 )?,
-            )))
+            };
+            Ok(KreaHeavyPhase::Sequential(Box::new(heavy)))
         },
     )?;
     Ok(Box::new(KreaGenerator {
@@ -602,12 +614,19 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     }))
 }
 
-fn effective_residency_policy(requested: OffloadPolicy, has_convrot: bool) -> OffloadPolicy {
-    if !has_convrot {
-        candle_gen::effective_offload_policy(requested)
-    } else {
-        OffloadPolicy::Resident
-    }
+/// The residency policy this generator runs — the request's `offload_policy` after the
+/// `CANDLE_GEN_OFFLOAD` override (`candle_gen::effective_offload_policy`).
+///
+/// `_has_convrot` is taken but no longer changes the answer (sc-12425). ConvRot USED to be forced
+/// `Resident` here, because the sequential heavy loader read `root/transformer/` and could not source
+/// the int8 single-file DiT; [`pipeline::load_residency_heavy_convrot`] now sources it, so ConvRot drops
+/// its 15.6 GB f32 text encoder after encoding like every other Turbo request (measured 42.9 → ~29 GB
+/// peak, sc-12381). The parameter (and the test pinning it no longer matters) stays so a future reader
+/// cannot quietly re-add the special-case: the Turbo descriptor advertises `supports_sequential_offload`,
+/// so a ConvRot generator that silently ran `Resident` would make the worker's fit-gate predict a staged
+/// peak it never achieves — the sc-10840 lockstep violation the descriptor's own comment warns against.
+fn effective_residency_policy(requested: OffloadPolicy, _has_convrot: bool) -> OffloadPolicy {
+    candle_gen::effective_offload_policy(requested)
 }
 
 /// Construct a lazy candle Krea 2 **Turbo** generator. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -1402,12 +1421,14 @@ mod tests {
             OffloadPolicy::Resident
         );
 
-        // ConvRot defers: the DiT is a single int8 file, not `root/transformer/`, so `load_heavy` can't
-        // source it. Safe because it is selected by the LOAD SPEC, not the request — a ConvRot generator
-        // defers uniformly, so the gate can't be fooled per-request.
+        // ConvRot NO LONGER defers (sc-12425): `load_residency_heavy_convrot` sources the int8 single
+        // file on the sequential path, so a ConvRot request drops its 15.6 GB f32 TE like every other
+        // Turbo request. It MUST follow the policy — the Turbo descriptor advertises
+        // `supports_sequential_offload`, and a ConvRot generator silently running Resident would make the
+        // fit-gate under-predict its peak (the sc-10840 lockstep violation).
         assert_eq!(
             effective_residency_policy(OffloadPolicy::Sequential, true),
-            OffloadPolicy::Resident
+            OffloadPolicy::Sequential
         );
     }
 
@@ -1471,6 +1492,17 @@ mod tests {
             let lora =
                 std::env::var("KREA_EDIT_LORA").expect("set KREA_EDIT_LORA for KREA_SEQ_EDIT=1");
             spec = spec.with_adapters(vec![AdapterSpec::new(lora.into(), 1.0, AdapterKind::Lora)]);
+        }
+        // sc-12425: `KREA_CONVROT_DIT` measures the community INT8-ConvRot lane by riding the DiT single
+        // file on `text_encoder` (the `convrot_selector` seam). Run resident vs spec-sequential in two
+        // processes: sequential must drop the 15.6 GB f32 Qwen3-VL TE before the int8 DiT loads, taking
+        // the ~42.9 GB resident peak (sc-12381) down toward the DiT phase alone.
+        if let Ok(convrot) = std::env::var("KREA_CONVROT_DIT") {
+            assert!(
+                !raw && !edit,
+                "KREA_CONVROT_DIT is the Turbo-only community checkpoint; unset KREA_SEQ_RAW/EDIT"
+            );
+            spec.text_encoder = Some(WeightsSource::File(convrot.into()));
         }
         let spec_mode = std::env::var("KREA_OFFLOAD_MODE").unwrap_or_default();
         if spec_mode == "spec-sequential" {
