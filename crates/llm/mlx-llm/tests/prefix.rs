@@ -241,8 +241,8 @@ fn greedy(max_new_tokens: usize) -> GenerationConfig {
 /// used to claim `prompt + n` tokens. A follow-up prompt that **extends** the stored sequence (the
 /// module's multi-turn use case) then matched one position past the stored tensors' sequence dim.
 /// On MLX this was *worse* than an error: `slice_layers` used an unchecked `take_axis` gather, so
-/// the seeded KV was silent garbage — the bit-exact assertion against the cold baseline below is
-/// what catches it.
+/// the seeded KV was silent garbage — the `reused_prefix_tokens` stats pin below is what catches
+/// it deterministically (the tiny model's greedy outputs can coincide even with a clamped gather).
 #[test]
 fn budget_finished_entry_supports_extension() {
     let cfg = tiny_config();

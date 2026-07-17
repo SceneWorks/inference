@@ -147,7 +147,7 @@ impl PrefixCache {
 /// stored entry excludes that token). The output is **token-for-token identical** to a cold
 /// [`generate`](crate::decode::generate) of the same prompt.
 ///
-/// Returns [`Error::Canceled`](crate::error::Error::Canceled) if `cancel` is already set before any
+/// Returns [`Error::Canceled`] if `cancel` is already set before any
 /// inference.
 pub fn generate_cached(
     model: &CausalLm,
