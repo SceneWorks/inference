@@ -202,6 +202,8 @@ const SDXL_VAE_TILING: VaeTiling = VaeTiling {
     spatial_scale: 8,
     temporal_scale: 1,
     causal_temporal: false,
+    // 128 ch at full resolution (block_out_channels[0]). At T=1 the write bound is ~4096x4096.
+    full_res_channels: 128,
 };
 
 /// The SDXL VAE tiling policy (sc-4987) — diffusers' `enable_vae_tiling` defaults: **512² output
@@ -1399,6 +1401,7 @@ mod tests {
             spatial_scale: 1,
             temporal_scale: 1,
             causal_temporal: false,
+            full_res_channels: 1, // synthetic geometry — the write bound is not under test here
         };
         // A small grid with overlapping tiles: 4-wide tiles, 2 overlap, over a 10×10 field → 4 tiles
         // per axis, exercising left/right ramps and the interior all-ones region.

@@ -692,6 +692,7 @@ fn plan_wan22_tiling(
     };
     vae_tiling::plan_tiling(
         "wan z48 vae22 decode",
+        VaeTiling::WAN22,
         height,
         width,
         out_frames,

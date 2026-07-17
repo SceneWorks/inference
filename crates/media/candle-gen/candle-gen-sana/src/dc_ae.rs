@@ -695,6 +695,9 @@ impl DcAeDecoder {
             spatial_scale: self.tail_scale() as i32,
             temporal_scale: 1,
             causal_temporal: false,
+            // DC-AE tail: 128 ch at full output resolution. A still image at T=1 cannot approach
+            // MAX_WRITABLE_ELEMS below ~4096², so this never binds at any shipped size.
+            full_res_channels: 128,
         };
         if !cfg.needs_tiling(vae, 1, h as i32, w as i32) {
             return self.decode_tail(head);
@@ -1164,6 +1167,7 @@ mod tests {
             spatial_scale: dec.tail_scale() as i32,
             temporal_scale: 1,
             causal_temporal: false,
+            full_res_channels: 128, // mirrors the production tail; the write bound is not under test
         };
         assert!(
             tile_cfg.plan(vae, 1, hh, hw).h.len() > 1,
@@ -1197,6 +1201,7 @@ mod tests {
             spatial_scale: dec.tail_scale() as i32,
             temporal_scale: 1,
             causal_temporal: false,
+            full_res_channels: 128, // mirrors the production tail; the write bound is not under test
         };
         assert!(
             TilingConfig::spatial_only(512, 128).needs_tiling(vae, 1, 80, 80),

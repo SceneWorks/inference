@@ -26,7 +26,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
-use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
+use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling};
 use mlx_gen::{AvLatents, CancelFlag, Error, Image, Progress, Result};
 
 use crate::audio_vae::AudioDecoder;
@@ -288,6 +288,7 @@ fn plan_ltx_tiling(
         temporal: &LTX_VAE_TEMPORAL_FR,
     };
     budgeted_plan(
+        VaeTiling::LTX,
         height,
         width,
         out_frames,

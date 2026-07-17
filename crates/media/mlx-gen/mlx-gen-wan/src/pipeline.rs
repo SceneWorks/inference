@@ -19,7 +19,7 @@ use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
+use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling};
 use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Progress, Result};
 
 use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind};
@@ -298,6 +298,7 @@ fn plan_vae22_tiling(
         temporal: &VAE22_TEMPORAL_FR,
     };
     budgeted_plan(
+        VaeTiling::WAN22,
         height,
         width,
         out_frames,
@@ -410,6 +411,7 @@ fn plan_z16_tiling(
         temporal: &VAE16_TEMPORAL_FR,
     };
     budgeted_plan(
+        VaeTiling::WAN,
         height,
         width,
         out_frames,
@@ -1176,6 +1178,52 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **sc-12349: the z16 decode must never take the single pass past the write bound**, no matter how
+    /// much memory the machine has. Wan z16 writes 96 channels at full output resolution, so at 720p
+    /// only 24 output frames fit under `MAX_WRITABLE_ELEMS` — while the shipped `frame_num` is 81.
+    ///
+    /// This previously depended on the machine: the selector decided purely on memory, so a large
+    /// enough Mac (the audit put the crossover near ~161 GB) would have chosen the single pass and
+    /// decoded silently-wrong pixels. An unlimited budget is the sharpest form of that test.
+    #[test]
+    fn z16_tiles_past_the_write_bound_on_an_unlimited_budget() {
+        let (h, w, f) = (720i32, 1280i32, 81i32);
+        assert!(
+            (f as i64) > VaeTiling::WAN.writable_frame_cap(h, w),
+            "test precondition: 81 frames at 720p must exceed the z16 write cap ({})",
+            VaeTiling::WAN.writable_frame_cap(h, w)
+        );
+
+        let cfg = plan_z16_tiling(h, w, f, f64::INFINITY)
+            .expect("an unlimited budget must still yield a plan, not a budget error")
+            .expect(
+                "past the write bound the z16 decode MUST tile even with infinite memory — None here \
+                 is the silently-wrong single pass sc-12349 exists to prevent",
+            );
+
+        // The chosen tile must itself be writable. z16's smallest temporal candidate is 32 frames,
+        // above the 24-frame cap, so spatial tiling has to carry it — which is exactly why the bound
+        // is checked against the whole tile volume rather than the frame count alone.
+        let tf = cfg
+            .temporal
+            .map(|t| t.tile_frames as i64)
+            .unwrap_or(f as i64);
+        let (th, tw) = cfg
+            .spatial
+            .map(|s| {
+                (
+                    (s.tile_px as i64).min(h as i64),
+                    (s.tile_px as i64).min(w as i64),
+                )
+            })
+            .unwrap_or((h as i64, w as i64));
+        let write = VaeTiling::WAN.full_res_channels as i64 * tf * th * tw;
+        assert!(
+            write <= mlx_gen::tiling::MAX_WRITABLE_ELEMS,
+            "the selected z16 tile writes {write} elements, past the bound — plan {cfg:?}"
+        );
+    }
 
     #[test]
     fn denoise_peak_estimate_matches_5b_measurements() {

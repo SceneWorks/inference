@@ -347,6 +347,7 @@ fn plan_ltx_tiling(
     };
     vae_tiling::plan_tiling(
         "ltx vae decode",
+        VaeTiling::LTX,
         height,
         width,
         out_frames,

@@ -33,7 +33,7 @@
 //! estimate stays ≥ the measured peak (within ≤ ~1.16× at every tested point).
 
 use mlx_gen::gen_core::mempolicy::{plan_memory_adaptation, LaneLevers, MemoryPlan, StagePeaks};
-use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingConfig};
+use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingConfig, VaeTiling};
 use mlx_gen::{Error, Quant, Result};
 
 use crate::config::Krea2Config;
@@ -261,6 +261,7 @@ pub fn plan_control_decode_tiling(
         temporal: &[], // still image — no temporal axis to tile
     };
     budgeted_plan(
+        VaeTiling::QWEN_IMAGE,
         height as i32,
         width as i32,
         1, // out_frames

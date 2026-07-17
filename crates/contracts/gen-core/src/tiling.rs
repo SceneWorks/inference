@@ -16,46 +16,111 @@
 //!  - **Wan 2.1** ([`VaeTiling::WAN`]): spatial ×8, temporal ×4, **non-causal** (`out_f = f·4`) — the
 //!    temporal axis tiles exactly like a spatial axis.
 
-/// A VAE's tiling parameters: the decoder's spatial/temporal upsample factors and whether its
-/// temporal decode is causal (`out_f = 1 + (f−1)·scale`) or non-causal (`out_f = f·scale`).
+/// The largest tensor MLX can **write** correctly, in elements.
+///
+/// **Measured (sc-12349) on synthetic tensors — an MLX property, not any one model's.** An op whose
+/// *output* exceeds `i32::MAX` elements silently produces wrong values: no error, deterministic, two
+/// runs byte-identical. It is the **write** side that matters — reading a larger tensor is fine.
+/// Isolated by holding one side over the line and the other under, at `128×42×480×848` =
+/// 2,188,247,040 (1.019×):
+///
+/// | op | input | output | result |
+/// |---|---|---|---|
+/// | `conv3d` 128→8 | 2.19e9 (1.019×) | 1.37e8 | **correct** |
+/// | `conv3d` 8→128 | 1.37e8 | 2.19e9 (1.019×) | **WRONG** |
+/// | elementwise `2x+1` | 2.19e9 | 2.19e9 | **WRONG** |
+///
+/// Correct at 2,136,145,920 (0.995×), wrong at 2,188,247,040 (1.019×) — bracketing 2^31. Holds for both
+/// lazy-broadcast and materialized inputs, and across ops (conv and elementwise alike), so it is the
+/// output allocation's indexing, not any single kernel.
+///
+/// **Why it hides.** Reductions have tiny outputs and stay correct, so a checksum notices nothing; and
+/// any verification computed *over* an oversized tensor is itself an oversized write, so it silently
+/// reports agreement. Detecting it needs **position-dependent** data (a constant fill cannot reveal
+/// index scrambling) and a comparison that never writes past this bound.
+///
+/// Found via Mochi's AsymmVAE decode (sc-12291), which writes 128-channel full-resolution tensors: its
+/// untiled decode is exact through 31 frames at 848×480 and returns ±2.67 — where a valid video is
+/// ~[-1, 1] — from 37 frames on.
+pub const MAX_WRITABLE_ELEMS: i64 = i32::MAX as i64;
+
+/// A VAE's tiling parameters: the decoder's spatial/temporal upsample factors, whether its temporal
+/// decode is causal (`out_f = 1 + (f−1)·scale`) or non-causal (`out_f = f·scale`), and the channel
+/// width of its widest full-resolution stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VaeTiling {
     pub spatial_scale: i32,
     pub temporal_scale: i32,
     pub causal_temporal: bool,
+    /// Channels in the widest stage that runs at **full output resolution** — the width that sizes the
+    /// largest tensor the decoder writes (`full_res_channels × out_f × out_h × out_w`). Keeps that
+    /// write under [`MAX_WRITABLE_ELEMS`]; see [`VaeTiling::writable_frame_cap`].
+    ///
+    /// This is a *correctness* input, not a memory estimate — the memory estimator stays with each
+    /// crate's `peak_cost`. Err high if unsure: over-stating it costs an unnecessary tile, understating
+    /// it admits a silently-wrong decode.
+    pub full_res_channels: i32,
 }
 
 impl VaeTiling {
     /// LTX-2 video VAE: spatial ×32 (8× upsample × 4× unpatchify), temporal ×8, causal.
+    ///
+    /// `full_res_channels: 8` — its 128-channel stage runs at H/4 and W/4 (the ×4 unpatchify is last),
+    /// so per *output* voxel the decoder writes 128/16 = 8 channels' worth.
     pub const LTX: Self = Self {
         spatial_scale: 32,
         temporal_scale: 8,
         causal_temporal: true,
+        full_res_channels: 8,
     };
     /// Wan 2.1 z16 VAE: spatial ×8, temporal ×4, non-causal (`T → T·4`).
+    ///
+    /// `full_res_channels: 96` — `dim × 1` at full resolution, before `head_conv` drops 96 → 3.
     pub const WAN: Self = Self {
         spatial_scale: 8,
         temporal_scale: 4,
         causal_temporal: false,
+        full_res_channels: 96,
     };
     /// Wan 2.2 z48 `vae22` VAE: spatial ×16 (8× conv upsample × 2× unpatchify), temporal ×4,
     /// **causal** (`out_f = 1 + (f−1)·4` — the decoder runs `first_chunk=True`, so the leading
     /// temporal-padding frames are trimmed). The 5B's TI2V-5B VAE (sc-2680).
+    ///
+    /// `full_res_channels: 64` — 256 channels at H/2 (`dec_dim = 256`, ×2 unpatchify last) = 256/4.
     pub const WAN22: Self = Self {
         spatial_scale: 16,
         temporal_scale: 4,
         causal_temporal: true,
+        full_res_channels: 64,
     };
     /// Qwen-Image `AutoencoderKLQwenImage` VAE (sc-11747): a still-image VAE — spatial ×8, and the
     /// temporal axis is a **singleton** (T=1), so `temporal_scale: 1` non-causal makes the temporal
     /// axis a no-op (`out_f = f = 1`) while the spatial ×8 upsample drives the H/W tiling. Used by the
     /// Krea 2 pose-control decode (and reusable by the Qwen txt2img/edit lanes) to bound the
     /// end-of-generation decode spike on a 32 GB Mac.
+    ///
+    /// `full_res_channels: 96` — at T=1 and its 2048² cap this cannot approach
+    /// [`MAX_WRITABLE_ELEMS`] (96 × 2048² = 4.0e8, 0.19×), so the cap never binds here.
     pub const QWEN_IMAGE: Self = Self {
         spatial_scale: 8,
         temporal_scale: 1,
         causal_temporal: false,
+        full_res_channels: 96,
     };
+
+    /// The most **output frames** this VAE can decode in one pass at `out_h × out_w` while keeping its
+    /// widest full-resolution write under [`MAX_WRITABLE_ELEMS`]. 0 when a single frame already
+    /// exceeds it (only reachable at resolutions far beyond any shipped bucket).
+    ///
+    /// Past this, the decode does not merely run out of memory — it returns **wrong pixels, silently**.
+    /// So this is a correctness bound and binds *in addition to* the memory budget, never instead of.
+    pub fn writable_frame_cap(&self, out_h: i32, out_w: i32) -> i64 {
+        let per_frame = self.full_res_channels as i64 * out_h as i64 * out_w as i64;
+        if per_frame <= 0 {
+            return i64::MAX;
+        }
+        MAX_WRITABLE_ELEMS / per_frame
+    }
 }
 
 /// Per-frame spatial tiling (tile + overlap in **output pixels**).
@@ -476,7 +541,14 @@ impl std::error::Error for TilingBudgetError {}
 /// single-pass case is `tile_* == out_*`; a **zero tile** `(out_f, out_h, out_w, 0, 0, 0)` must yield
 /// the accumulator-only floor (the unavoidable cost of holding the assembled output). The estimator
 /// owns every model/dtype constant, so this selector carries none.
+///
+/// `vae` supplies the **correctness** bound that memory cannot see: past
+/// [`VaeTiling::writable_frame_cap`] a single pass does not OOM, it returns wrong pixels silently
+/// (sc-12349). Without it this selector had an inverted safety property — the tiling decision was
+/// purely a memory test while the write bound is fixed, so **a bigger machine was more likely to pick
+/// the silently-wrong single pass**. Both bounds now apply; neither substitutes for the other.
 pub fn budgeted_plan(
+    vae: VaeTiling,
     out_height: i32,
     out_width: i32,
     out_frames: i32,
@@ -486,9 +558,19 @@ pub fn budgeted_plan(
 ) -> Result<Option<TilingConfig>, TilingBudgetError> {
     let (h, w, f) = (out_height as i64, out_width as i64, out_frames as i64);
 
-    // 1. Single-pass (the whole output as one tile) already fits → no tiling.
+    // 0. The write bound: how many output frames one pass may span before the decoder's widest
+    //    full-resolution write exceeds what MLX can address. Independent of memory, and of the machine.
+    let frame_cap = vae.writable_frame_cap(out_height, out_width);
+    if frame_cap == 0 {
+        return Err(TilingBudgetError::AccumulatorsExceedBudget {
+            projected_gib: peak_cost(f, h, w, 0, 0, 0),
+            safe_gib,
+        });
+    }
+
+    // 1. Single-pass (the whole output as one tile) fits the budget AND stays writable → no tiling.
     let single = peak_cost(f, h, w, f, h, w);
-    if single <= safe_gib {
+    if single <= safe_gib && f <= frame_cap {
         return Ok(None);
     }
 
@@ -530,6 +612,12 @@ pub fn budgeted_plan(
             let tile_f = (t as i64).min(f);
             // Skip the single-pass cell (handled in step 1; it does not fit here by construction).
             if tile_h == h && tile_w == w && tile_f == f {
+                continue;
+            }
+            // A tile must be writable as well as affordable: the decoder materializes it at full
+            // resolution and `full_res_channels` wide, and past MAX_WRITABLE_ELEMS that write is
+            // silently wrong rather than merely expensive. Fitting the budget is not enough.
+            if vae.full_res_channels as i64 * tile_f * tile_h * tile_w > MAX_WRITABLE_ELEMS {
                 continue;
             }
             let peak = peak_cost(f, h, w, tile_f, tile_h, tile_w);
@@ -775,10 +863,84 @@ mod tests {
     fn budgeted_single_pass_when_it_fits() {
         // A generous budget → the whole decode fits in one pass, no tiling.
         let cost = lin_cost(4e-8, 4e-6);
-        let plan = budgeted_plan(512, 512, 64, 1_000.0, t_cands(), &cost).unwrap();
+        let plan = budgeted_plan(VaeTiling::WAN, 512, 512, 64, 1_000.0, t_cands(), &cost).unwrap();
         assert!(
             plan.is_none(),
             "should not tile under a huge budget: {plan:?}"
+        );
+    }
+
+    /// `writable_frame_cap` is the correctness bound: how many output frames fit under
+    /// [`MAX_WRITABLE_ELEMS`] at a given resolution, given the VAE's full-res width.
+    #[test]
+    fn writable_frame_cap_tracks_full_res_width() {
+        // Wan z16 at 720p: 96 ch × 1280 × 720 = 88,473,600 per frame → 24 frames fit under 2^31.
+        assert_eq!(VaeTiling::WAN.writable_frame_cap(720, 1280), 24);
+        // LTX is 12× narrower per output voxel (8 ch), so it reaches far more frames at the same size.
+        assert_eq!(VaeTiling::LTX.writable_frame_cap(720, 1280), 291);
+        // A still-image VAE at its 2048² cap is nowhere near the bound.
+        assert!(VaeTiling::QWEN_IMAGE.writable_frame_cap(2048, 2048) > 1);
+        // The cap must scale with the declared width: doubling channels halves the frames.
+        let narrow = VaeTiling {
+            full_res_channels: 48,
+            ..VaeTiling::WAN
+        };
+        assert_eq!(
+            narrow.writable_frame_cap(720, 1280),
+            2 * VaeTiling::WAN.writable_frame_cap(720, 1280),
+            "the cap must be driven by full_res_channels, not hardcoded"
+        );
+    }
+
+    /// **The inversion this fixes** (sc-12349): the tiling decision used to be a pure memory test, so a
+    /// machine with a big enough budget would choose the single pass at a geometry where the decode is
+    /// silently WRONG. An unlimited budget must still tile once the write bound is crossed.
+    #[test]
+    fn budgeted_tiles_past_the_write_bound_even_with_an_infinite_budget() {
+        // Free memory: without the write bound this returns Ok(None) — a single pass — always.
+        let free = |_: i64, _: i64, _: i64, _: i64, _: i64, _: i64| 0.0;
+        let (h, w) = (720i32, 1280i32);
+        let cap = VaeTiling::WAN.writable_frame_cap(h, w); // 24
+
+        // At the cap: writable, budget is free → single pass is correct and allowed.
+        let at = budgeted_plan(
+            VaeTiling::WAN,
+            h,
+            w,
+            cap as i32,
+            f64::INFINITY,
+            t_cands(),
+            free,
+        )
+        .unwrap();
+        assert!(
+            at.is_none(),
+            "at the write bound a single pass is fine: {at:?}"
+        );
+
+        // One frame past it: memory still says "free", but the decode would write past what MLX can
+        // address, so the selector MUST tile rather than return None.
+        let past = budgeted_plan(
+            VaeTiling::WAN,
+            h,
+            w,
+            cap as i32 + 1,
+            f64::INFINITY,
+            t_cands(),
+            free,
+        )
+        .unwrap();
+        let cfg = past.expect(
+            "past the write bound the selector must tile even on an unlimited budget — returning \
+             None here is the silently-wrong single pass this bound exists to prevent",
+        );
+        let t = cfg
+            .temporal
+            .expect("crossing the write bound must tile the TEMPORAL axis (frames are what grew)");
+        assert!(
+            (t.tile_frames as i64) <= cap,
+            "the chosen tile must itself be writable: {} frames > cap {cap}",
+            t.tile_frames
         );
     }
 
@@ -794,9 +956,17 @@ mod tests {
             single > safe,
             "test precondition: single-pass must exceed budget"
         );
-        let cfg = budgeted_plan(h as i32, w as i32, f as i32, safe, t_cands(), &cost)
-            .unwrap()
-            .expect("must tile when single-pass is over budget");
+        let cfg = budgeted_plan(
+            VaeTiling::WAN,
+            h as i32,
+            w as i32,
+            f as i32,
+            safe,
+            t_cands(),
+            &cost,
+        )
+        .unwrap()
+        .expect("must tile when single-pass is over budget");
         let peak = chosen_peak(&cfg, h, w, f, &cost);
         assert!(peak <= safe, "chosen peak {peak:.2} over safe {safe}");
         assert!(
@@ -810,7 +980,7 @@ mod tests {
         // Absurd per-output-voxel accum cost: even a zero tile (the unavoidable output buffers) blows
         // the budget, so no tiling can help → AccumulatorsExceedBudget.
         let cost = lin_cost(1.0, 1e-3);
-        let err = budgeted_plan(512, 512, 64, 5.0, t_cands(), &cost).unwrap_err();
+        let err = budgeted_plan(VaeTiling::WAN, 512, 512, 64, 5.0, t_cands(), &cost).unwrap_err();
         assert!(
             matches!(err, TilingBudgetError::AccumulatorsExceedBudget { .. }),
             "expected AccumulatorsExceedBudget, got {err:?}"
@@ -822,7 +992,7 @@ mod tests {
         // Tiny accumulators (output fits) but an enormous per-tile-voxel cost: every candidate tile,
         // even the smallest, peaks over budget → SmallestTileExceedsBudget (catchable, not OOM).
         let cost = lin_cost(1e-9, 1e-3);
-        let err = budgeted_plan(512, 512, 64, 5.0, t_cands(), &cost).unwrap_err();
+        let err = budgeted_plan(VaeTiling::WAN, 512, 512, 64, 5.0, t_cands(), &cost).unwrap_err();
         match err {
             TilingBudgetError::SmallestTileExceedsBudget {
                 projected_gib,
@@ -840,7 +1010,7 @@ mod tests {
         // Output is small spatially (every candidate ≥ the full spatial extent, so spatial can't tile)
         // but long in frames → the winning plan tiles only the temporal axis.
         let cost = lin_cost(4e-8, 4e-6);
-        let cfg = budgeted_plan(128, 128, 200, 8.0, t_cands(), &cost)
+        let cfg = budgeted_plan(VaeTiling::WAN, 128, 128, 200, 8.0, t_cands(), &cost)
             .unwrap()
             .expect("a 200-frame clip must tile");
         assert!(

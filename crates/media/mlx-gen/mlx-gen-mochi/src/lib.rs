@@ -41,7 +41,7 @@ pub use transformer::{
     load_transformer_weights, MochiAttention, MochiDitConfig, MochiLinear, MochiQuant,
     MochiTransformer3DModel, MochiTransformerBlock,
 };
-pub use vae::{load_vae_decoder, MochiVaeDecoder};
+pub use vae::{load_vae_decoder, MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
 
 /// Add the MLX Mochi 1 generator to an explicit media registry builder.
 pub fn register_providers(
