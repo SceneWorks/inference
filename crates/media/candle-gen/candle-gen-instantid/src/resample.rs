@@ -9,8 +9,10 @@ use image::{imageops::FilterType, ImageBuffer, Rgb};
 
 /// Lanczos-resample an `src_h × src_w` RGB8 image (`src`, HWC, `len == src_h·src_w·3`) to
 /// `dst_h × dst_w`, returning HWC bytes as f32 (integer-valued `[0,255]`) — the candle twin of
-/// `mlx_gen::image::resize_lanczos_u8`. Panics on a too-small `src` buffer (caller guarantees the size,
-/// matching the MLX helper's contract).
+/// `mlx_gen::image::resize_lanczos_u8`. Panics on a too-small `src` buffer — an **internal**
+/// invariant: caller-supplied images are validated upstream at the `kps::letterbox` boundary
+/// (F-014, sc-12466), and the only other caller (`InstantId::restore_face`) resamples its own
+/// exactly-sized re-render.
 pub(crate) fn resize_lanczos_u8(
     src: &[u8],
     src_h: usize,

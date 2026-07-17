@@ -336,7 +336,7 @@ impl InstantId {
         reference: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let canvas = kps::letterbox(reference, req.width, req.height);
+        let canvas = kps::letterbox(reference, req.width, req.height)?;
         let face = self.largest_face(&canvas)?;
         let kps: Vec<(f32, f32)> = face.kps.iter().map(|p| (p[0], p[1])).collect();
         self.generate_with(req, &face.embedding, &kps, on_progress)
@@ -358,7 +358,7 @@ impl InstantId {
                 "instantid: unknown view angle {view_angle:?} (see VIEW_ANGLE_KPS)"
             ))
         })?;
-        let canvas = kps::letterbox(reference, side, side);
+        let canvas = kps::letterbox(reference, side, side)?;
         let face = self.largest_face(&canvas)?;
         let kps: Vec<(f32, f32)> = view.to_vec();
         let sq = InstantIdRequest {
@@ -385,7 +385,7 @@ impl InstantId {
             .iter()
             .map(|(x, y)| (x * side as f32, y * side as f32))
             .collect();
-        let canvas = kps::letterbox(reference, side, side);
+        let canvas = kps::letterbox(reference, side, side)?;
         let face = self.largest_face(&canvas)?;
         let sq = InstantIdRequest {
             width: side,
@@ -598,7 +598,7 @@ impl InstantId {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let side = req.width;
-        let canvas = kps::letterbox(reference, side, side);
+        let canvas = kps::letterbox(reference, side, side)?;
         let face = self.largest_face(&canvas)?;
         // Place the reference's 5 face landmarks at the pose's head box (when the head is visible).
         let face_kps = openpose::face_box_from_keypoints(keypoints)

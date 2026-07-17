@@ -16,6 +16,7 @@
 //! canonical [`VIEW_ANGLE_KPS`] multi-view landmark sets.
 
 use candle_gen::gen_core::Image;
+use candle_gen::{CandleError, Result};
 
 use crate::resample::resize_lanczos_u8;
 
@@ -557,11 +558,30 @@ pub fn draw_kps(width: u32, height: u32, kps: &[(f32, f32)]) -> Image {
 /// Resize `image` keeping aspect (PIL LANCZOS) and center-pad onto a black `width × height` canvas —
 /// the sc-2009 kps-distortion rule (the control image must share the output aspect). Mirrors the
 /// vendored `_letterbox`.
-pub fn letterbox(image: &Image, width: u32, height: u32) -> Image {
+pub fn letterbox(image: &Image, width: u32, height: u32) -> Result<Image> {
     let (iw, ih) = (image.width, image.height);
+    // Caller-supplied image ([`gen_core::Image`] has fully-pub fields and no invariant-enforcing
+    // constructor): a zero dimension divides by zero in `ratio` / underflows the unsigned pad offsets
+    // below, and a buffer that isn't exactly `w·h·3` panics inside `resize_lanczos_u8` — turn both
+    // into the typed error every worker-facing `generate*` entry surfaces (F-014, sc-12466; mirrors
+    // the mlx-gen-instantid `letterbox` guard, F-084).
+    if iw == 0 || ih == 0 || width == 0 || height == 0 {
+        return Err(CandleError::Msg(format!(
+            "instantid letterbox: image has a zero dimension ({iw}x{ih} -> {width}x{height})"
+        )));
+    }
+    if image.pixels.len() != iw as usize * ih as usize * 3 {
+        return Err(CandleError::Msg(format!(
+            "instantid letterbox: image pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
     let ratio = (width as f64 / iw as f64).min(height as f64 / ih as f64);
-    let new_w = ((iw as f64 * ratio).round() as u32).max(1);
-    let new_h = ((ih as f64 * ratio).round() as u32).max(1);
+    // Clamp to the canvas: fp round-up of `i*ratio` could exceed width/height, underflowing the
+    // unsigned `width - new_w` / `height - new_h` offsets below (the mlx twin's F-020 clamp).
+    // `.min(..)` is inert whenever the resize already fits (the normal case).
+    let new_w = ((iw as f64 * ratio).round() as u32).min(width).max(1);
+    let new_h = ((ih as f64 * ratio).round() as u32).min(height).max(1);
     let resized = resize_lanczos_u8(
         &image.pixels,
         ih as usize,
@@ -581,11 +601,11 @@ pub fn letterbox(image: &Image, width: u32, height: u32) -> Image {
             canvas[dst + 2] = resized[src + 2] as u8;
         }
     }
-    Image {
+    Ok(Image {
         width,
         height,
         pixels: canvas,
-    }
+    })
 }
 
 /// Canonical view-angle landmark sets (sc-2009), normalized `[0,1]` to a square canvas, order
@@ -764,5 +784,74 @@ mod tests {
         let before = img.clone();
         hline(&mut img, w, 2, 4, 1, [99, 99, 99]);
         assert_eq!(img, before);
+    }
+
+    /// F-014 (sc-12466): a zero-dimension reference image (or target) must be a typed error instead
+    /// of an underflowed pad offset / resampler panic.
+    #[test]
+    fn letterbox_rejects_zero_dims() {
+        let zero = Image {
+            width: 0,
+            height: 0,
+            pixels: vec![],
+        };
+        let e = letterbox(&zero, 64, 64).unwrap_err().to_string();
+        assert!(e.contains("zero dimension"), "unexpected error: {e}");
+
+        let ok = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 4 * 4 * 3],
+        };
+        assert!(letterbox(&ok, 0, 64).is_err(), "zero target width");
+        assert!(letterbox(&ok, 64, 0).is_err(), "zero target height");
+
+        let zero_w = Image {
+            width: 0,
+            height: 4,
+            pixels: vec![],
+        };
+        assert!(letterbox(&zero_w, 64, 64).is_err(), "zero source width");
+        let zero_h = Image {
+            width: 4,
+            height: 0,
+            pixels: vec![],
+        };
+        assert!(letterbox(&zero_h, 64, 64).is_err(), "zero source height");
+    }
+
+    /// F-014 (sc-12466): a pixel buffer that isn't exactly `w·h·3` must be a typed error, not the
+    /// `resize_lanczos_u8` panic (undersized) or a silently truncated read (oversized).
+    #[test]
+    fn letterbox_rejects_wrong_size_buffer() {
+        let short = Image {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 10], // not 8·8·3
+        };
+        let e = letterbox(&short, 64, 64).unwrap_err().to_string();
+        assert!(e.contains("pixel buffer"), "unexpected error: {e}");
+
+        let long = Image {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 8 * 8 * 3 + 1],
+        };
+        assert!(letterbox(&long, 64, 64).is_err(), "oversized buffer");
+    }
+
+    /// The valid path still resizes keep-aspect and center-pads onto the black canvas.
+    #[test]
+    fn letterbox_valid_path_centers_on_canvas() {
+        // 2×2 white → 4×4 target: ratio 2, fills the whole canvas.
+        let src = Image {
+            width: 2,
+            height: 2,
+            pixels: vec![255u8; 2 * 2 * 3],
+        };
+        let out = letterbox(&src, 4, 4).unwrap();
+        assert_eq!((out.width, out.height), (4, 4));
+        assert_eq!(out.pixels.len(), 4 * 4 * 3);
+        assert!(out.pixels.iter().all(|&b| b > 200), "canvas fully covered");
     }
 }

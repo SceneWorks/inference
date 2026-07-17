@@ -70,7 +70,7 @@ fn curated_samplers_preserve_identity() {
 
     // Reference identity (its ArcFace embedding drives the IP path).
     let ref_img = read_ppm(&env_path("IID_REF"));
-    let canvas = letterbox(&ref_img, size, size);
+    let canvas = letterbox(&ref_img, size, size).expect("letterbox reference");
     let ref_face = model.largest_face(&canvas).expect("detect reference face");
     let kps: Vec<(f32, f32)> = ref_face.kps.iter().map(|p| (p[0], p[1])).collect();
     println!(
