@@ -106,6 +106,25 @@ fn check_canceled(cancel: Option<&CancelFlag>) -> CResult<()> {
     Ok(())
 }
 
+/// Drive the spatial-tile loop over `plan`: honor the engine cancellation contract at the **top of
+/// every tile iteration** (sc-12465 / F-013 — each tile is a full seconds-to-minutes
+/// VAE-encode → DiT → VAE-decode pass, the per-unit granularity of the cancel contract on the tiled
+/// paths), then run `f` on the tile. This is the production driver for
+/// [`Seedvr2Pipeline::run_frame_tiled`] — extracted so the per-tile check placement is unit-testable
+/// without weights (`tests::spatial_tile_loop_cancels_between_tiles` exercises this exact
+/// function, not a re-implementation).
+fn for_each_tile(
+    plan: &[video::SpatialTile],
+    cancel: Option<&CancelFlag>,
+    mut f: impl FnMut(&video::SpatialTile) -> CResult<()>,
+) -> CResult<()> {
+    for t in plan {
+        check_canceled(cancel)?;
+        f(t)?;
+    }
+    Ok(())
+}
+
 impl Seedvr2Pipeline {
     /// Build from already-converted candle-layout VAE + DiT weights + a neg-embed (parity tests).
     pub fn from_parts(
@@ -589,9 +608,8 @@ impl Seedvr2Pipeline {
         let plan = video::plan_spatial_tiles(h_i, w_i, tile, overlap);
         let mut acc: Option<Tensor> = None; // (1,3,1,H,W)
         let mut wsum: Option<Tensor> = None; // (1,1,1,H,W)
-        for t in &plan {
-            // Honor the engine cancellation contract before each (seconds-to-minutes) tile.
-            check_canceled(cancel)?;
+                                             // `for_each_tile` checks the cancel flag before each (seconds-to-minutes) tile.
+        for_each_tile(&plan, cancel, |t| {
             let (th, tw) = ((t.y1 - t.y0) as usize, (t.x1 - t.x0) as usize);
             let (y0, x0) = (t.y0 as usize, t.x0 as usize);
             let tile_clip = processed.narrow(3, y0, th)?.narrow(4, x0, tw)?; // (1,3,1,th,tw)
@@ -624,15 +642,16 @@ impl Seedvr2Pipeline {
             let wpad = weight
                 .pad_with_zeros(3, y0, pad_b)?
                 .pad_with_zeros(4, x0, pad_r)?;
-            acc = Some(match acc {
+            acc = Some(match acc.take() {
                 Some(a) => a.add(&wdec)?,
                 None => wdec,
             });
-            wsum = Some(match wsum {
+            wsum = Some(match wsum.take() {
                 Some(a) => a.add(&wpad)?,
                 None => wpad,
             });
-        }
+            Ok(())
+        })?;
         Ok(acc
             .expect("≥1 tile")
             .broadcast_div(&wsum.expect("≥1 tile"))?)
@@ -659,14 +678,16 @@ mod tests {
         );
     }
 
-    /// sc-12465 / F-013: the spatial-tile loop ([`Seedvr2Pipeline::run_frame_tiled`]) checks
-    /// `check_canceled` at the **top of every tile iteration** — the per-unit cancel contract's unit
-    /// on the tiled paths is one tile (a full VAE-encode → DiT → VAE-decode, seconds-to-minutes), not
-    /// one frame/image. This mirrors the loop exactly (`for t in &plan { check_canceled(cancel)?;
-    /// <tile work> }`) over a real multi-tile plan and pins that a flag tripped after N completed
-    /// tiles stops the loop before tile N+1, and a pre-tripped flag stops it before any tile.
-    /// Weight-free like the other cancel tests (candle is eager, so check placement is the whole
-    /// contract); the real-weight path is exercised by `cuda_video_smoke::cuda_tiled_cancel_*`.
+    /// sc-12465 / F-013: the spatial-tile loop checks `check_canceled` at the **top of every tile
+    /// iteration** — the per-unit cancel contract's unit on the tiled paths is one tile (a full
+    /// VAE-encode → DiT → VAE-decode, seconds-to-minutes), not one frame/image. This exercises
+    /// [`for_each_tile`] itself — the production driver [`Seedvr2Pipeline::run_frame_tiled`] runs
+    /// its tile work through (full-pipeline construction needs a complete fixed-arch checkpoint, so
+    /// the driver is extracted to make the real loop weight-free-testable; deleting the driver's
+    /// `check_canceled` fails this test). Pins that a flag tripped after N completed tiles stops
+    /// the loop before tile N+1, a pre-tripped flag stops it before any tile, and an untripped flag
+    /// runs the full plan. The real-weight path is exercised by
+    /// `cuda_video_smoke::cuda_tiled_cancel_*`.
     #[test]
     fn spatial_tile_loop_cancels_between_tiles() {
         // The F-013 descriptor-max case: a 4096² still at the VAE-cap tile edge (1536) with the
@@ -679,24 +700,31 @@ mod tests {
             video::SPATIAL_OVERLAP,
         );
         assert_eq!(plan.len(), 9, "4096² @ tile 1536 must be a 3×3 plan");
+
+        // Untripped flag → every tile runs, Ok.
+        let flag = CancelFlag::new();
+        let mut tiles_done = 0usize;
+        let result = for_each_tile(&plan, Some(&flag), |_t| {
+            tiles_done += 1;
+            Ok(())
+        });
+        assert!(result.is_ok(), "untripped flag must not abort the loop");
+        assert_eq!(tiles_done, plan.len(), "untripped flag runs the full plan");
+
         for trip_after in [0usize, 1, 3] {
             let flag = CancelFlag::new();
             if trip_after == 0 {
                 flag.cancel(); // pre-cancelled before the loop starts
             }
             let mut tiles_done = 0usize;
-            let result = (|| -> CResult<()> {
-                for _t in &plan {
-                    // run_frame_tiled's per-tile check, at the top of the iteration.
-                    check_canceled(Some(&flag))?;
-                    // The tile's encode→DiT→decode work; the cancel lands mid-run here.
-                    tiles_done += 1;
-                    if tiles_done == trip_after {
-                        flag.cancel();
-                    }
+            // The closure is the tile's encode→DiT→decode work; the cancel lands mid-run here.
+            let result = for_each_tile(&plan, Some(&flag), |_t| {
+                tiles_done += 1;
+                if tiles_done == trip_after {
+                    flag.cancel();
                 }
                 Ok(())
-            })();
+            });
             assert!(
                 matches!(result, Err(CandleError::Canceled)),
                 "tripped flag must surface the typed Canceled (trip_after={trip_after})"
