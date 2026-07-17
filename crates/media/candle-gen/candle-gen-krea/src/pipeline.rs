@@ -398,9 +398,27 @@ pub fn load_components_convrot(
     // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
     // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
     // building 32 MiB of workspace, reading two integers off it, and dropping it.
-    let int8 = ensure_int8_floor(device)?;
-
     let text = load_text(root, device)?;
+    let heavy = load_heavy_convrot(root, convrot_dit, device)?;
+    Ok(Components { text, heavy })
+}
+
+/// The heavy half of an INT8-ConvRot load — the int8 DiT (from `convrot_dit`) + the Qwen-Image VAE (from
+/// `root`). Shared by the **resident** path ([`load_components_convrot`], which pairs it with a co-loaded
+/// TE) and the **sequential** path ([`load_residency_heavy_convrot`], which loads it only after the TE
+/// has been encoded and dropped — sc-12089 / epic 10765). Both must build the DiT identically, so the
+/// int8-vs-bf16 choice lives in exactly one place.
+///
+/// PiD is always `None`: the ConvRot lane does not combine with the super-resolving decoder (sc-9300).
+pub(crate) fn load_heavy_convrot(
+    root: &Path,
+    convrot_dit: &Path,
+    device: &Device,
+) -> Result<KreaHeavy> {
+    // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
+    // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
+    // building 32 MiB of workspace, reading two integers off it, and dropping it.
+    let int8 = ensure_int8_floor(device)?;
 
     let cfg = Krea2Config::from_snapshot(root)?;
     // Seeded with the floor probe's handle: every int8 projection `Krea2Transformer::load` detects below
@@ -411,15 +429,25 @@ pub fn load_components_convrot(
 
     let vae = load_vae(root, device)?;
 
-    Ok(Components {
-        text,
-        heavy: KreaHeavy {
-            dit,
-            vae: Arc::new(vae),
-            // The INT8-ConvRot path is a deferred non-shipping variant (see the fn docs); PiD is not
-            // wired through it. The shipping `load_components` path carries the optional decoder.
-            pid: None,
-        },
+    Ok(KreaHeavy {
+        dit,
+        vae: Arc::new(vae),
+        pid: None,
+    })
+}
+
+/// The **sequential** twin of [`load_heavy_convrot`] (sc-12089 / epic 10765 Phase 1c): the int8 DiT +
+/// VAE **plus** the VAE encoder, loaded only after [`KreaText`] has been dropped so it reuses the
+/// encoder's freed pool. The int8-ConvRot sibling of [`load_residency_heavy`]; the difference is only
+/// which checkpoint the DiT comes from (the int8 single-file vs `root/transformer`).
+pub(crate) fn load_residency_heavy_convrot(
+    root: &Path,
+    convrot_dit: &Path,
+    device: &Device,
+) -> Result<ResidencyHeavy> {
+    Ok(ResidencyHeavy {
+        heavy: load_heavy_convrot(root, convrot_dit, device)?,
+        vae_encoder: load_vae_encoder(root, device)?,
     })
 }
 
