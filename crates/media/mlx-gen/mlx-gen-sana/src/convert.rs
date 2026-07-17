@@ -1,16 +1,16 @@
 //! Offline pre-quantization: read a dense SANA MLX snapshot (`transformer/ text_encoder/ vae/`) and
-//! write a packed Q4/Q8 turnkey that [`crate::quant`] (via [`crate::model::load`] /
+//! write a packed Q4/Q8 turnkey that `crate::quant` (via [`crate::model::load`] /
 //! [`crate::model::load_sprint`]) loads with no dense bf16/f32 transient. Mirrors the other Group-B
 //! converters (`mlx_gen_chroma::convert` / `mlx_gen_sdxl::convert`) — the same
 //! `mlx_gen::quant::quantize_map`, byte-equal to the load-time `.quantize` seam — differing in the
 //! SANA key layout and the **two** quantized components.
 //!
 //! SANA quantizes:
-//!  * the Linear-DiT `transformer/` — every trunk Linear ([`is_transformer_target`]): the self /
+//!  * the Linear-DiT `transformer/` — every trunk Linear (`is_transformer_target`): the self /
 //!    cross attention `to_q/k/v` + `to_out.0`, the timestep / (Sprint) guidance / modulation MLPs, the
 //!    caption-projection MLP, and `proj_out`. The `patch_embed` conv and the GLUMBConv depth/point/
 //!    inverted convs stay dense (they are conv weights, not a quant target).
-//!  * the Gemma-2 CHI `text_encoder/` — every decoder projection ([`is_te_target`]): `self_attn`
+//!  * the Gemma-2 CHI `text_encoder/` — every decoder projection (`is_te_target`): `self_attn`
 //!    `q/k/v/o_proj` and the `mlp` `gate/up/down_proj`. `embed_tokens` + all RMSNorms stay dense.
 //!    (This is the biggest component, so packing it is where the low-RAM win is.)
 //!
@@ -146,7 +146,7 @@ fn copy_sidecars(src: &Path, dst: &Path) -> Result<()> {
 /// Assemble a full pre-quantized turnkey SANA snapshot in `dst_root`: pack the Linear-DiT
 /// `transformer/` and the Gemma-2 `text_encoder/`, mirror the dense DC-AE `vae/`, and copy the
 /// tokenizer + any root license/notice verbatim (deref symlinks). The result loads via
-/// [`crate::model::load`] / [`load_sprint`] (packed weights auto-detect) with no dense transient.
+/// [`crate::model::load`] / [`crate::model::load_sprint`] (packed weights auto-detect) with no dense transient.
 /// `bits` = 4 (Q4 tier) or 8 (Q8 tier). The **bf16 tier** is the dense source itself (no conversion —
 /// mirror it; see the tier builder in `tests/prequantize_real_weights.rs`).
 pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {

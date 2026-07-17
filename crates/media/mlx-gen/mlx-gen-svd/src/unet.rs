@@ -4,7 +4,7 @@
 //! Structure: a conv stem; sinusoidal timestep + `added_time_ids` micro-conditioning → a 1280-wide
 //! `emb`; a down (3× `CrossAttnDownBlockSpatioTemporal` + 1× `DownBlockSpatioTemporal`) / mid
 //! (`UNetMidBlockSpatioTemporal`) / up (`UpBlockSpatioTemporal` + 3× `CrossAttnUpBlockSpatioTemporal`)
-//! stack of [`SpatioTemporalResBlock`]s and [`TransformerSpatioTemporal`]s; a conv head. Predicts the
+//! stack of `SpatioTemporalResBlock`s and [`TransformerSpatioTemporal`]s; a conv head. Predicts the
 //! per-frame `v` for one denoise step. Runs NHWC for the spatial parts (`[B·F, H, W, C]`) and NDHWC
 //! (`[B, F, H, W, C]`) for the temporal resnet path.
 //!

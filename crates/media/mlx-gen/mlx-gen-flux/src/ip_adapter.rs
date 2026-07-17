@@ -2,7 +2,7 @@
 //!
 //! Two pieces, both loaded from `XLabs-AI/flux-ip-adapter` `ip_adapter.safetensors`:
 //!
-//! 1. [`FluxImageProjModel`] (`ip_adapter_proj_model.*`) — XLabs' `ImageProjModel`: projects the
+//! 1. `FluxImageProjModel` (`ip_adapter_proj_model.*`) — XLabs' `ImageProjModel`: projects the
 //!    CLIP-ViT-L/14 `image_embeds` `[B, 768]` (sc-3622) → `num_tokens=4` image-prompt tokens of
 //!    width `cross_attention_dim=4096` (`Linear(768→4·4096)` → reshape → `LayerNorm(4096)`).
 //! 2. [`FluxIpAdapter`] — the per-double-block decoupled cross-attention K/V projections

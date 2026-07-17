@@ -13,7 +13,7 @@
 //! (`.pth` → [`sanitize_wan_t5`], bf16), the VAE (f32), and `config.json`.
 //!
 //! **sc-3239: the A14B dual-expert converters.** [`convert_i2v_14b`] (in_dim 36) and
-//! [`convert_t2v_14b`] (in_dim 16) share [`convert_dual_a14b`] — both `low_noise_model` +
+//! [`convert_t2v_14b`] (in_dim 16) share `convert_dual_a14b` — both `low_noise_model` +
 //! `high_noise_model` experts (optionally Q4/Q8 via [`quantize_wan_transformer`]), the z16 Wan2.1 VAE
 //! ([`sanitize_wan_vae_weights`]), the T5, and the respective `config.json` — differing only in that
 //! config. Byte-parity validated end-to-end against a Python `convert_wan` reference on the real
@@ -330,7 +330,7 @@ pub fn sanitize_wan_vae_weights(raw: &HashMap<String, Array>) -> Result<HashMap<
 }
 
 /// Selectively Q4/Q8-quantize a (sanitized) Wan transformer expert in place: each
-/// [`WAN_QUANT_SUFFIXES`]-matched Linear `{base}.weight` (bf16) becomes the packed triple
+/// `WAN_QUANT_SUFFIXES`-matched Linear `{base}.weight` (bf16) becomes the packed triple
 /// `{base}.weight` (u32), `{base}.scales`, `{base}.biases` via MLX `quantize` (byte-identical to
 /// `nn.quantize`); the bias and all other tensors pass through.
 pub fn quantize_wan_transformer(
@@ -679,7 +679,8 @@ const BERNINI_RENDERER_SIDECAR: &str = "bernini_renderer.json";
 /// `patch_embedding` conv→Linear reshape that [`sanitize_wan_transformer`] already applies. It lets a
 /// diffusers-layout Wan2.2 transformer (here: a Bernini renderer DiT, shipped diffusers-named in the
 /// combined `bernini/` index) load through the validated dual-expert [`crate::pipeline`] /
-/// [`WanTransformer::from_weights`] path — the same path the native `convert_t2v_14b` output uses.
+/// [`crate::transformer::WanTransformer::from_weights`] path — the same path the native
+/// `convert_t2v_14b` output uses.
 ///
 /// The map is a verified 1:1 bijection (1095 tensors / 42 key patterns) against a native-converted
 /// `wan2_2_t2v_a14b` expert:

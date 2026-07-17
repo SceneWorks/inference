@@ -60,7 +60,7 @@ pub fn load_flash(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 /// Construct a [`Chroma`] generator from a [`LoadSpec`], honoring [`LoadSpec::offload_policy`]
-/// (sc-10840). `Resident` (default) builds the T5 encoder + DiT + VAE now via [`build_residency`]
+/// (sc-10840). `Resident` (default) builds the T5 encoder + DiT + VAE now via `build_residency`
 /// and holds them warm; `Sequential` keeps only the per-phase loader closures and re-loads per
 /// generate in phase order (encode → drop the T5 encoder → denoise/decode) to bound peak memory to
 /// `max(T5, DiT+VAE)`. Both use the same per-phase loaders, so the components are byte-identical.
@@ -277,14 +277,14 @@ impl Chroma {
     /// Run the true-CFG flow-match denoise from a given **packed** initial latent `[1, Si, 64]` →
     /// final packed latent with the **Euler** sampler. Public so the e2e parity test can inject the
     /// reference's initial latents (mlx and torch RNG differ); [`generate`](Self::generate) seeds it
-    /// via `create_noise` and selects the sampler per [`resolve_sampler_name`].
+    /// via `create_noise` and selects the sampler per `resolve_sampler_name`.
     ///
-    /// Thin wrapper over [`Self::denoise_with_sampler`] (the single source of truth for the
+    /// Thin wrapper over `denoise_with_sampler` (the single source of truth for the
     /// encode/sigma/RoPE/mask/CFG setup) forcing Euler — the diffusers reference and every committed
     /// parity golden step with flow-match Euler. The production Flash **Heun** default (sc-5392) is
     /// gated same-backend via [`Self::denoise_with_sampler_name`] (no torch Heun reference exists;
     /// `ChromaPipeline` has no Heun scheduler). Drives the default `Resident` policy (the components are
-    /// borrowed warm); a `Sequential`-loaded model errors in [`Self::parts`].
+    /// borrowed warm); a `Sequential`-loaded model errors in `parts`.
     #[allow(clippy::too_many_arguments)]
     pub fn denoise(
         &self,
@@ -543,7 +543,7 @@ impl Chroma {
     }
 
     /// Test accessors (real-weight e2e, sc-3839). Reach the warm-resident components (the e2e suite
-    /// drives the default `Resident` policy); a `Sequential`-loaded model errors in [`Self::parts`].
+    /// drives the default `Resident` policy); a `Sequential`-loaded model errors in `parts`.
     #[doc(hidden)]
     pub fn transformer_ref(&self) -> &ChromaTransformer {
         self.parts().expect("components resident").2
@@ -558,7 +558,7 @@ impl Chroma {
     }
 
     /// Test accessor (real-weight e2e, sc-6903): run the denoise with an explicit sampler **name**,
-    /// routed through the production [`resolve_sampler_name`] selection. Lets the e2e gate
+    /// routed through the production `resolve_sampler_name` selection. Lets the e2e gate
     /// drive the Flash **Heun** path that `generate` runs by default (sc-5392) but the Euler-forced
     /// [`Self::denoise`] goldens never exercise. `sampler = None` reproduces the variant default
     /// (Heun for Flash, Euler otherwise).
@@ -597,7 +597,7 @@ impl Chroma {
     /// Unpack + decode a packed latent `[1, Si, 64]` → an [`Image`]. `decoder` overrides the native
     /// FLUX.1 VAE when `Some` — a PiD super-resolving decode (epic 7840, sc-7846) that consumes the
     /// same normalized latent and 4× upscales; `None` is the byte-exact VAE default (the warm-resident
-    /// VAE, reached through [`Self::parts`] — the parity/test helper path).
+    /// VAE, reached through `parts` — the parity/test helper path).
     pub fn decode(
         &self,
         latents: &Array,

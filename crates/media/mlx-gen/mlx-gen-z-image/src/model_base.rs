@@ -111,7 +111,7 @@ pub struct ZImage {
 
 /// Construct a [`ZImage`] from a [`LoadSpec`].
 ///
-/// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a `Tongyi-MAI/Z-Image` snapshot (the
+/// `spec.weights` must be a [`mlx_gen::WeightsSource::Dir`] pointing at a `Tongyi-MAI/Z-Image` snapshot (the
 /// diffusers multi-component tree — `tokenizer/ text_encoder/ transformer/ vae/`). The load is
 /// byte-identical to the Turbo loader (the transformer architecture is the same); only the generate-time
 /// schedule + CFG differ. `spec.quantize` (Q4/Q8) quantizes the **whole model** after the dense bf16

@@ -23,12 +23,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::quant::{
-    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Nvfp4Linear, PackedConfig,
+    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Int8Context, Nvfp4Linear,
+    PackedConfig,
 };
 
 use crate::nvfp4_dit::{DitPlan, Nvfp4Proj, Nvfp4Quant, ProbedProj};
@@ -54,6 +56,16 @@ pub struct Weights {
     /// every diffusers-key lookup is translated to its native counterpart ([`convrot_diffusers_to_native`])
     /// at read time, and quantized projections carry a `{native_base}.weight_scale` + int8 `.weight`.
     convrot: bool,
+    /// **One** cuBLASLt handle shared by every INT8-ConvRot projection loaded from this weight set
+    /// (sc-12301) — see [`Weights::int8_context`]. `OnceLock` because [`linear_detect`] takes `&Weights`
+    /// and the handle must be built at most once for the whole trunk, on first int8 projection.
+    ///
+    /// This weight set is the right owner and the right *lifetime*: the handle is a per-device compute
+    /// resource for exactly these weights, so it dies when they do — no process-global outliving an
+    /// unloaded model. `pipeline::load_components_convrot` seeds it up front via
+    /// [`with_int8_context`](Weights::with_int8_context) so the sm_89 floor probe's handle *becomes* the
+    /// trunk's shared handle instead of being built and thrown away.
+    int8: OnceLock<Int8Context>,
 }
 
 impl Weights {
@@ -71,6 +83,7 @@ impl Weights {
             overlay: HashMap::new(),
             packed: read_packed_config(dir)?,
             convrot: false,
+            int8: OnceLock::new(),
         })
     }
 
@@ -86,6 +99,7 @@ impl Weights {
             overlay: HashMap::new(),
             packed: None,
             convrot: false,
+            int8: OnceLock::new(),
         })
     }
 
@@ -104,7 +118,47 @@ impl Weights {
             overlay: HashMap::new(),
             packed: None,
             convrot: true,
+            int8: OnceLock::new(),
         })
+    }
+
+    /// Install a pre-built [`Int8Context`] as this weight set's shared handle (sc-12301).
+    ///
+    /// The seam for scope 5 of the story: `pipeline::ensure_int8_floor` must build a cuBLASLt handle
+    /// anyway to read the device's compute capability against the sm_89 floor, so it hands that handle
+    /// here instead of dropping it — the probe *becomes* the trunk's shared handle. Absent this call,
+    /// [`int8_context`](Self::int8_context) simply builds one lazily on the first int8 projection.
+    ///
+    /// Takes `self` by value (called at construction, before any projection reads the cell), so seeding
+    /// a fresh `OnceLock` cannot lose a race with a lazy build.
+    pub fn with_int8_context(mut self, ctx: Int8Context) -> Self {
+        let cell = OnceLock::new();
+        // Infallible: the cell was created one line above and nothing else holds it.
+        let _ = cell.set(ctx);
+        self.int8 = cell;
+        self
+    }
+
+    /// The **one** [`Int8Context`] every INT8-ConvRot projection from this weight set shares (sc-12301),
+    /// built on first use if [`with_int8_context`](Self::with_int8_context) did not seed it.
+    ///
+    /// This is the fix for the defect the story names: `QLinear::convrot_int8` built a fresh cuBLASLt
+    /// handle — and its eager 32 MiB workspace — for *every* int8 projection, so a ConvRot DiT's ~224 of
+    /// them carried ~7 GiB of duplicated scratch that a weights-only footprint sum cannot see.
+    ///
+    /// Errors (rather than caching a failure) if the handle cannot be built on a CUDA device, so the
+    /// F-121 / sc-11208 typed-error-at-load property survives the move to a shared handle: the error
+    /// surfaces from the first `linear_detect` that reaches an int8 projection, still inside load, where
+    /// `?` is available.
+    pub fn int8_context(&self) -> Result<&Int8Context> {
+        if let Some(ctx) = self.int8.get() {
+            return Ok(ctx);
+        }
+        // Built OUTSIDE the cell so a failure propagates instead of being cached as a poisoned context
+        // (`OnceLock` has no stable `get_or_try_init`). A lost race here just drops the loser's handle;
+        // the winner's is the one every projection then shares.
+        let ctx = Int8Context::new(&self.device)?;
+        Ok(self.int8.get_or_init(|| ctx))
     }
 
     /// Whether this is an INT8-ConvRot checkpoint (native-mmdit-keyed, sc-9300).
@@ -534,7 +588,19 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
                     // Pass the model's resident COMPUTE device (where activations live), NOT
                     // `w_i8.device()` — the codes are CPU-materialized here to save VRAM, but the int8
                     // IGEMM leg must be built on the CUDA compute device (F-121 / sc-11208).
-                    return QLinear::convrot_int8(w_i8, scale, group_size, dense_bias, w.device());
+                    //
+                    // `convrot_int8_in`, NOT `convrot_int8` (sc-12301): this runs once per int8
+                    // projection (~224 on a ConvRot DiT), and the private-handle constructor would give
+                    // each its own eager 32 MiB cuBLASLt workspace — ~7 GiB of duplicated scratch. The
+                    // weight set owns one shared handle for the whole trunk.
+                    return QLinear::convrot_int8_in(
+                        w_i8,
+                        scale,
+                        group_size,
+                        dense_bias,
+                        w.device(),
+                        w.int8_context()?,
+                    );
                 }
             }
         }

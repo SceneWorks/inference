@@ -10,8 +10,9 @@
 //! `Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K`, the non-linear 4-bit `IQ4_NL`/`IQ4_XS` (a fixed 16-entry
 //! codebook — common in real `Q2_K`/`Q3_K_M`/`IQ4_XS` builds, which mix it in), and the sub-4-bit
 //! importance-matrix grid-codebook types `IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ1_S`/`IQ1_M`
-//! (story 7250). The IQ grid/sign tables live in [`super::iq_grids`]; the imatrix only shaped the
-//! original quantization, so dequant is self-contained — no importance matrix is needed to decode.
+//! (story 7250). The IQ grid/sign tables live in the private `iq_grids` module; the imatrix only
+//! shaped the original quantization, so dequant is self-contained — no importance matrix is needed
+//! to decode.
 //! Every quant type a standard Llama/Qwen GGUF is built from now converts.
 
 use crate::error::{Error, Result};

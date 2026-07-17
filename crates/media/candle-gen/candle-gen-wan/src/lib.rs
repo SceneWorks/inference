@@ -57,7 +57,7 @@ use candle_gen::{CandleError, Result as CResult};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
     TextEncoderConfig, TransformerConfig, VaeConfig, DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_GUIDANCE,
-    DEFAULT_STEPS, MIN_SIZE, MODEL_ID, NEGATIVE_FALLBACK, SIZE_MULTIPLE,
+    DEFAULT_STEPS, MAX_AREA_5B, MIN_SIZE, MODEL_ID, NEGATIVE_FALLBACK, SIZE_MULTIPLE,
 };
 use rope::WanRope;
 use scheduler::{flow_shift, FlowScheduler, Sampler};
@@ -341,6 +341,19 @@ impl Generator for WanGenerator {
                 req.width, req.height
             )));
         }
+        // sc-12308: the 5B carries an area budget too (upstream `ti2v-5B` supports only `1280*704` /
+        // `704*1280`), but this lane checked only the per-edge range and the multiple — so a
+        // grid-aligned 1280×1280 validated and ran to an opaque OOM, exactly the sc-9028 hole the
+        // 14B lane already closed. mlx's 5B did cap (it silently refit instead); rejecting here is
+        // what makes the two backends agree on one geometry per request.
+        let area = req.width as usize * req.height as usize;
+        if area > MAX_AREA_5B {
+            return Err(gen_core::Error::Msg(format!(
+                "wan: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_5B} px \
+                 (1280×704); reduce the resolution",
+                req.width, req.height
+            )));
+        }
         if let Some(f) = req.frames {
             if f == 0 || f % 4 != 1 {
                 return Err(gen_core::Error::Msg(format!(
@@ -534,6 +547,59 @@ mod tests {
         assert!(d.capabilities.samplers.contains(&"uni_pc")); // curated spelling (sc-7296)
         assert!(d.capabilities.samplers.contains(&"unipc")); // legacy alias retained
         assert!(d.capabilities.samplers.contains(&"euler"));
+    }
+
+    /// sc-12308: the 5B's own area budget is enforced here. `validate` previously checked only the
+    /// per-edge range and the ÷32 multiple, so a grid-aligned far-over-envelope request reached the
+    /// DiT and died on an opaque OOM — while mlx's 5B capped (by silently refitting). The 5B keeps
+    /// the 901 120 budget upstream gives `ti2v-5B`; it must NOT inherit the 14B family's larger one.
+    #[test]
+    fn validate_enforces_max_area_5b() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+        let base = GenerationRequest {
+            prompt: "a cat walking across a sunny garden".into(),
+            frames: Some(17),
+            ..Default::default()
+        };
+
+        // The 5B's grid is 32, so its 720p IS `1280×704` — exactly at the cap, and accepted.
+        assert_eq!(1280 * 704, MAX_AREA_5B);
+        assert!(g
+            .validate(&GenerationRequest {
+                width: 1280,
+                height: 704,
+                ..base.clone()
+            })
+            .is_ok());
+
+        // Over the cap with both edges grid-aligned and within the per-edge range: rejected by the
+        // area check specifically, with a message naming the cap.
+        let err = g
+            .validate(&GenerationRequest {
+                width: 1280,
+                height: 1280,
+                ..base.clone()
+            })
+            .expect_err("over-area request must be rejected");
+        assert!(
+            err.to_string().contains("max area"),
+            "actionable message: {err}"
+        );
+
+        // The 5B must not drift onto the 14B family's budget: `1280×720` is 921 600 px, over the
+        // 5B's cap AND off its 32-px grid, so it stays rejected on this lane.
+        const { assert!(config::MAX_AREA_14B > MAX_AREA_5B) };
+        assert!(g
+            .validate(&GenerationRequest {
+                width: 1280,
+                height: 720,
+                ..base
+            })
+            .is_err());
     }
 
     #[test]

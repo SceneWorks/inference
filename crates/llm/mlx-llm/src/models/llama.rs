@@ -417,7 +417,8 @@ impl CausalLm {
 
     /// Compute the interleaved M-RoPE 3-D position rows (`get_rope_index`, B=1) for `input_ids`
     /// containing `image_grid_thw`-described `image_token_id` runs, plus the `mrope_delta`. The
-    /// image-only entry point; see [`crate::models::deepstack::mrope_positions_mm`] for image+video.
+    /// image-only entry point; see the private `deepstack::mrope_positions_mm` helper for
+    /// image+video.
     pub fn mrope_positions(
         &self,
         input_ids: &[i32],
@@ -438,7 +439,7 @@ impl CausalLm {
     /// The full image **and** video interleaved-M-RoPE entry: `input_ids` with `image_token_id` runs
     /// (one per `image_grid_thw` entry) and `video_token_id` runs (one per frame; each `[t, h, w]`
     /// video grid is split into `t` per-frame `[1, h, w]` blocks by the synthetic time axis). See
-    /// [`crate::models::deepstack::mrope_positions_mm`].
+    /// the private `deepstack::mrope_positions_mm` helper.
     #[allow(clippy::too_many_arguments)]
     pub fn mrope_positions_mm(
         &self,

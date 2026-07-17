@@ -2,7 +2,7 @@
 //!
 //! The fidelity-critical core of the face stack (sc-3081): PuLID-FLUX and InstantID were trained on
 //! *this exact checkpoint's* 512-d embeddings, so the port must reproduce the onnx output numerically
-//! (embedding cosine ≈ 1.0). Weights come from [`tools/convert_glintr100.py`], which walks the onnx
+//! (embedding cosine ≈ 1.0). Weights come from `tools/convert_glintr100.py`, which walks the onnx
 //! graph and emits canonical keys.
 //!
 //! ## Architecture (verified from the onnx graph)

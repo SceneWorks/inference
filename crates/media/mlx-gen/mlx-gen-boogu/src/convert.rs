@@ -263,7 +263,7 @@ use mlx_rs::Array;
 
 use crate::text_encoder::BooguTextEncoderConfig;
 
-/// Group size the packing uses — Boogu's [`crate::quant::GROUP_SIZE`], deliberately **32** (NOT the
+/// Group size the packing uses — Boogu's `crate::quant::GROUP_SIZE`, deliberately **32** (NOT the
 /// codebase-wide default of 64: 3360 % 64 ≠ 0, so a 64-group packing would build snapshots the DiT
 /// rejects at load). The auto-detecting loader infers this same value from the packed shapes.
 pub const QUANT_GROUP_SIZE: i32 = crate::quant::GROUP_SIZE;

@@ -16,7 +16,8 @@
 //!
 //! The token layout these consume (vision_start + pad·N + vision_end, indexed pads remapped to the
 //! plain image/video pad ids, the `token_type` 0/2/3 + `token_segment_ids` tagging) is produced by the
-//! templating sub-piece ([`BerniniTemplate::encode_messages`], a later sc-5136 commit).
+//! templating sub-piece ([`crate::template::BerniniTemplate::encode_messages`], a later sc-5136
+//! commit).
 
 use mlx_rs::Array;
 use serde_json::{json, Value};

@@ -2,8 +2,8 @@
 //! native-MLX replacement for the Python `lens_train_runner.py` (torch in `/opt/lens-venv`), the last
 //! Python holdout for Lens (zero-Python north star, epic 3482).
 //!
-//! [`LensTrainer`] realizes the core [`Trainer`](mlx_gen::Trainer) contract on the real 48-block Lens
-//! MMDiT, mirroring [`ZImageTurboTrainer`](mlx_gen_z_image) — the model crates don't use mlx-rs's
+//! [`LensTrainer`] realizes the core [`Trainer`] contract on the real 48-block Lens
+//! MMDiT, mirroring `ZImageTurboTrainer` / `mlx_gen_z_image` — the model crates don't use mlx-rs's
 //! `Module` system (hand-rolled `&self` forwards over raw `Array`s), so training uses the **functional
 //! autograd**: the trainable factors live OUTSIDE the model in a [`LoraParams`] map, re-injected each
 //! step into the target [`AdaptableLinear`](mlx_gen::adapters::AdaptableLinear)s via the shared core
@@ -31,7 +31,7 @@
 //!     [`encode`](crate::text_encoder::encoder::LensTextEncoder::encode) (4 captured layers) → slice
 //!     at [`TXT_OFFSET`] → a ones mask. Single-conditional (no CFG), matching the Python.
 //!   * **Targets** default to `img_qkv`/`txt_qkv`/`to_out.0`/`to_add_out` (the `AdaptableHost for
-//!     LensTransformer` paths, sc-3174); LoKr reconstructs at [`LOKR_DTYPE`] (what the lens adapter
+//!     LensTransformer` paths, sc-3174); LoKr reconstructs at `LOKR_DTYPE` (what the lens adapter
 //!     loader uses, so the trained LoKr round-trips). The gpt-oss encoder loads **Q8** (~12 GB vs
 //!     ~40 GB dense bf16) — frozen, used only to cache caption features, then dropped before the train
 //!     loop (the 32 GB-Mac free pattern); Q8 also matches the Q8 inference default (sc-3172/sc-5105).
@@ -50,7 +50,7 @@
 //!     [`LensTransformer::forward_with_main_checkpointed`](crate::dit::LensTransformer::forward_with_main_checkpointed),
 //!     threading the per-block LoRA factors as explicit checkpoint inputs so the adapter graph
 //!     survives the recompute. LoKr keeps the dense path (caught by the guard) — mirroring z-image.
-//!   * **Fail-fast OOM preflight guard** — [`preflight_memory_guard`] projects the dense first-step
+//!   * **Fail-fast OOM preflight guard** — `preflight_memory_guard` projects the dense first-step
 //!     peak from resolution (a fitted curve) and, when checkpointing is off and the run would exceed
 //!     this machine's memory budget, returns a catchable, actionable error BEFORE the (minutes-long)
 //!     latent caching — converting the otherwise-uncatchable SIGKILL into a recommendation to enable

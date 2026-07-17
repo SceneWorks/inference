@@ -1,6 +1,6 @@
 //! The three Anima generators (`anima_base`, `anima_aesthetic`, `anima_turbo`) — [`Generator`]
-//! implementations + descriptors + [`load`] entry points + explicit registration constants. All
-//! three share the same
+//! implementations + descriptors + [`load_base`], [`load_aesthetic`], and [`load_turbo`] entry points,
+//! plus explicit registration constants. All three share the same
 //! architecture (Cosmos-Predict2 DiT + `AnimaTextConditioner` + Qwen3-0.6B TE + Qwen-Image VAE) and
 //! differ only in the DiT weights file + default steps/CFG.
 

@@ -325,7 +325,7 @@ impl Ideogram4Heavy {
     }
 
     /// VAE-encode a source image into the BN-normalized packed latent `[1, num_img, 128]` the
-    /// denoise operates on — the exact inverse of [`decode`](Self::decode)'s de-normalize +
+    /// denoise operates on — the exact inverse of `decode`'s de-normalize +
     /// unpatchify: resize → `encode_mean` → 2×2 patchify (Ideogram's `(ph,pw,c)` c-innermost order)
     /// → BN-normalize `(x − mean)/std`. Seed-independent; encode once per request.
     pub fn encode_init_latents(&self, image: &Image, height: u32, width: u32) -> Result<Array> {
@@ -369,13 +369,14 @@ impl Ideogram4Heavy {
     /// PiD `from_ldm` early-stop (sc-8048) capture plan for one Ideogram generation.
     ///
     /// **Frame conversion.** Ideogram's [`LogitNormalSchedule`] is *inverted* from the usual flow-match
-    /// σ (see [`add_noise_by_interpolation`]): `eval(si)` returns the **clean weight** (`eval(si[0])≈0.999`
+    /// σ (see `add_noise_by_interpolation`): `eval(si)` returns the **clean weight** (`eval(si[0])≈0.999`
     /// clean, `eval(si[num_run])≈0.0001` pure noise). PiD's [`flow_capture_plan`] wants the standard
     /// degrade σ (`0` = clean, `1` = noise) on a strictly *descending* schedule, so the executed-step
     /// trajectory maps to `σ_std = 1 − eval(si)`. The denoise runs `i = num_run−1 … 0`; the latent at the
     /// **start** of executed step `e` (`i = num_run−1−e`) sits at `σ_std = 1 − eval(si[num_run−e])`, so
     /// the descending schedule handed to the plan is `[1 − eval(si[num_run]), …, 1 − eval(si[0])]`
-    /// (length `num_run + 1`, trailing ≈0). This is the exact σ trajectory [`run_denoise`] traverses.
+    /// (length `num_run + 1`, trailing ≈0). This is the exact σ trajectory
+    /// [`Self::run_denoise_from_embeds`] traverses.
     ///
     /// Returns `Some((capture_sigma, run_from))` when an early stop is warranted: `capture_sigma` is the
     /// achieved standard-frame degrade σ to mint the PiD decoder at, and `run_from` is the loop's new

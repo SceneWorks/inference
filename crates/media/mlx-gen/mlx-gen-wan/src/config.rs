@@ -21,6 +21,17 @@ use mlx_gen::{Error, Result};
 /// Used when a T2V/TI2V request omits its own negative prompt and CFG is active.
 pub const SAMPLE_NEG_PROMPT: &str = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 
+/// Resolution envelope for the **14B family** (T2V/I2V-A14B, SCAIL-2, VACE, Bernini): `1280·720`
+/// = 921 600 px. Upstream's `MAX_AREA_CONFIGS` for `t2v-A14B` / `i2v-A14B` (Wan2.2) and `vace-14B`
+/// (Wan2.1). These ride the z16 VAE → a 16-px grid, so `720 = 45·16` is on-lattice and `1280×720`
+/// is the family's canonical 720p. Mirrors candle's `candle_gen_wan::config::MAX_AREA_14B`.
+pub const MAX_AREA_14B: usize = 1280 * 720;
+/// Resolution envelope for the **TI2V-5B**: `1280·704` = 901 120 px — upstream gives `ti2v-5B`
+/// exactly two sizes, `1280*704` / `704*1280`. Its z48 VAE forces a 32-px grid, which 720 misses, so
+/// the 5B's 720p genuinely IS 704-tall. **This is the 5B's number and only the 5B's**: it was once
+/// applied to the whole 14B family, silently costing them their real 720p (sc-12308).
+pub const MAX_AREA_5B: usize = 1280 * 704;
+
 /// CFG guidance scale. Dense models (5B, Wan2.1) use a single scalar; the Wan2.2 dual-expert MoE
 /// models select `low` below the timestep boundary and `high` at/above it (`generate_wan.py`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -109,7 +120,11 @@ pub struct WanModelConfig {
     pub frame_num: usize,
     pub sample_neg_prompt: String,
 
-    // Resolution constraints (0 = no limit; e.g. 704*1280 for TI2V-5B).
+    /// Resolution envelope in px (0 = no limit). Upstream's own per-task budget from
+    /// `wan/configs/__init__.py`'s `MAX_AREA_CONFIGS`: **921 600** (`1280*720`) for the 14B family
+    /// (T2V/I2V-A14B, SCAIL-2, VACE, Bernini — z16 VAE, 16-px grid, so 720 is on-lattice) and
+    /// **901 120** (`1280*704`) for the TI2V-5B, whose z48 VAE forces a 32-px grid that 720 misses.
+    /// A request over the cap is **rejected** in `validate_impl`, never silently refit (sc-12308).
     pub max_area: usize,
 
     // UMT5-XXL text encoder.
@@ -180,7 +195,10 @@ impl WanModelConfig {
             sample_fps: 16,
             frame_num: 81,
             sample_neg_prompt: SAMPLE_NEG_PROMPT.into(),
-            max_area: 0,
+            // sc-12308: was `0` (no cap), so T2V-A14B alone accepted any area its `max_size` allowed
+            // — the same request candle hard-rejected and mlx's I2V silently refit. The 14B family
+            // shares one budget; `wan22_ti2v_5b` overrides it with the 5B's own.
+            max_area: MAX_AREA_14B,
             t5_vocab_size: 256384,
             t5_dim: 4096,
             t5_dim_attn: 4096,
@@ -266,7 +284,9 @@ impl WanModelConfig {
                 low: 3.5,
                 high: 3.5,
             },
-            max_area: 704 * 1280,
+            // Inherited from `base()`; stated explicitly because this preset previously carried the
+            // 5B's `704 * 1280`, which silently refit `1280×720` → `1264×704` (sc-12308).
+            max_area: MAX_AREA_14B,
             ..Self::base()
         }
     }
@@ -290,7 +310,9 @@ impl WanModelConfig {
             sample_steps: 40,
             sample_guide_scale: GuideScale::Single(5.0),
             sample_fps: 24,
-            max_area: 704 * 1280,
+            // The 5B's OWN budget — overrides `base()`'s 14B-family value. Correct here: the z48 VAE's
+            // 32-px grid makes `1280×704` this model's genuine 720p (sc-12308).
+            max_area: MAX_AREA_5B,
             ..Self::base()
         }
     }
@@ -389,7 +411,15 @@ impl WanModelConfig {
         if let Some(s) = v.get("sample_neg_prompt").and_then(Value::as_str) {
             self.sample_neg_prompt = s.to_string();
         }
-        set_usize(v, "max_area", &mut self.max_area);
+        // `max_area` is deliberately NOT overlaid (sc-12308). It is an **engine-owned policy
+        // constant**, not a property of the weights: nothing in a tensor snapshot determines a
+        // resolution budget, so — unlike `dim`/`vae_stride`/`in_dim`, which describe the checkpoint —
+        // it must come from the preset alone. Reading it back from `config.json` turned it into a
+        // constant distributed across every converted snapshot, and they drifted: the shipped
+        // `wan2.2-i2v-a14b-mlx` bakes `901120` (the TI2V-5B's budget), and `wan2.2-t2v-a14b-mlx` and
+        // `bernini-mlx` bake `0` (no cap). Overlaying those would silently re-impose the very values
+        // this fix removes, on every already-installed model, and no re-host could be trusted to
+        // dislodge them. The preset is the single source of truth; a stale baked key is now ignored.
         set_usize(v, "t5_vocab_size", &mut self.t5_vocab_size);
         set_usize(v, "t5_dim", &mut self.t5_dim);
         set_usize(v, "t5_dim_attn", &mut self.t5_dim_attn);
@@ -448,7 +478,8 @@ impl WanModelConfig {
             "sample_fps": self.sample_fps,
             "frame_num": self.frame_num,
             "sample_neg_prompt": self.sample_neg_prompt,
-            "max_area": self.max_area,
+            // No `max_area` key: the loader no longer reads one (see `overlay_json`), so emitting it
+            // would only re-seed the stale-constant drift this fix removes (sc-12308).
             "t5_vocab_size": self.t5_vocab_size,
             "t5_dim": self.t5_dim,
             "t5_dim_attn": self.t5_dim_attn,
@@ -764,11 +795,50 @@ mod tests {
         assert_eq!(c.sample_steps, 40);
         assert_eq!(c.sample_guide_scale, GuideScale::Single(5.0));
         assert_eq!(c.sample_fps, 24);
-        assert_eq!(c.max_area, 704 * 1280);
+        // The 5B keeps its own 901 120 budget (its 32-px grid makes 1280×704 its real 720p).
+        assert_eq!(c.max_area, MAX_AREA_5B);
+        assert_eq!(c.max_area, 1280 * 704);
         assert!(c.is_ti2v());
         assert!(c.is_wan22_vae());
         assert_eq!(c.patch_size, (1, 2, 2));
         assert!(c.qk_norm && c.cross_attn_norm);
+    }
+
+    /// sc-12308: `max_area` is engine-owned and a snapshot's baked value must NOT override it.
+    ///
+    /// The shipped snapshots really do carry stale values — `SceneWorks/wan2.2-i2v-a14b-mlx`'s
+    /// `config.json` bakes `901120` (the TI2V-5B's budget) and `wan2.2-t2v-a14b-mlx` / `bernini-mlx`
+    /// bake `0` (no cap). While the loader overlaid this key, correcting the presets alone was a
+    /// no-op on every already-installed model.
+    #[test]
+    fn baked_max_area_does_not_override_the_preset() {
+        // The exact stale key the shipped I2V snapshot carries, on an otherwise-I2V config.
+        let mut v = WanModelConfig::wan22_i2v_14b().to_json();
+        v["max_area"] = serde_json::json!(901_120);
+        let cfg = WanModelConfig::from_config_json(&v);
+        assert_eq!(
+            cfg.max_area, MAX_AREA_14B,
+            "a baked max_area must be ignored — the preset owns the envelope"
+        );
+
+        // The shipped T2V/bernini snapshots bake `0`; that must not re-open the cap either.
+        let mut t = WanModelConfig::wan22_t2v_14b().to_json();
+        t["max_area"] = serde_json::json!(0);
+        assert_eq!(WanModelConfig::from_config_json(&t).max_area, MAX_AREA_14B);
+
+        // …and the 5B still resolves to its OWN budget, not the 14B family's.
+        let mut f = WanModelConfig::wan22_ti2v_5b().to_json();
+        f["max_area"] = serde_json::json!(0);
+        assert_eq!(WanModelConfig::from_config_json(&f).max_area, MAX_AREA_5B);
+
+        // `to_json` must not re-seed the drift by emitting the key at all.
+        assert!(
+            WanModelConfig::wan22_i2v_14b()
+                .to_json()
+                .get("max_area")
+                .is_none(),
+            "to_json must not bake max_area into new snapshots (sc-12308)"
+        );
     }
 
     #[test]

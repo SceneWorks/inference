@@ -1219,7 +1219,7 @@ impl MemoryAttention {
 
 // --- single-frame tracker -----------------------------------------------------------------------
 
-/// SAM3 single-frame box-prompt tracker (PVS path). Reuses the shared PE [`Backbone`]; loads the
+/// SAM3 single-frame box-prompt tracker (PVS path). Reuses the shared PE `Backbone`; loads the
 /// tracker neck + prompt encoder + mask decoder from `tracker_neck.*` / `tracker_model.*`.
 pub struct Sam3Tracker {
     backbone: Rc<Backbone>,
@@ -1300,7 +1300,7 @@ impl Sam3Tracker {
     /// Load from a `facebook/sam3` weight map (PE backbone + `tracker_neck` + `tracker_model`). The
     /// backbone is loaded from `detector_model.vision_encoder.backbone` — the **same** keys the
     /// detector's vision encoder uses. In the video pipeline use
-    /// [`Self::from_weights_with_backbone`] to share one backbone with the detector instead of
+    /// `from_weights_with_backbone` to share one backbone with the detector instead of
     /// loading a second copy (F-028).
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let cfg = Sam3VisionConfig::sam3();

@@ -4,9 +4,9 @@
 //!
 //! The schedule is a `linspace(1, 1/n, n)` run through an exponential **time-shift**, with a
 //! trailing `0` appended to mark the final step. The shift's `mu` comes from one of two sources:
-//! [`for_image`] fits it empirically from the latent sequence length (the fork's
+//! [`FlowMatchEuler::for_image`] fits it empirically from the latent sequence length (the fork's
 //! `requires_sigma_shift` path, used by FLUX / Qwen / the full Z-Image model), while
-//! [`for_static_shift`] uses a fixed `shift` pinned by a model's `scheduler_config.json`
+//! [`FlowMatchEuler::for_static_shift`] uses a fixed `shift` pinned by a model's `scheduler_config.json`
 //! (e.g. Z-Image-Turbo's `shift=3.0`) — `exp(mu) = shift`, equivalent to diffusers'
 //! `use_dynamic_shifting=false`. Each denoise step is the Euler update
 //! `x_{t+1} = x_t + (sigma[t+1] - sigma[t]) * v`, where `v` is the model's (already sign-flipped)
@@ -74,7 +74,8 @@ impl FlowMatchEuler {
     /// algebraic form when `exp(mu) = shift`, so this is just `new(num_steps, ln(shift))`.
     ///
     /// Used by models whose published `scheduler_config.json` pins a fixed `shift` (e.g.
-    /// Z-Image-Turbo's `shift=3.0`) rather than the empirical per-resolution `mu` of [`for_image`].
+    /// Z-Image-Turbo's `shift=3.0`) rather than the empirical per-resolution `mu` of
+    /// [`Self::for_image`].
     pub fn for_static_shift(num_steps: usize, shift: f32) -> Self {
         Self::new(num_steps, shift.ln())
     }
@@ -110,7 +111,7 @@ impl FlowMatchEuler {
     }
 
     /// One Euler step: `x_{t+1} = x_t + (sigma[t+1] - sigma[t]) * velocity`. Delegates to the shared
-    /// [`flow_match_euler_step`] (the same update [`crate::sampler::FlowMatchSampler`] uses).
+    /// `flow_match_euler_step` (the same update [`crate::sampler::FlowMatchSampler`] uses).
     pub fn step(&self, latents: &Array, velocity: &Array, t: usize) -> Result<Array> {
         flow_match_euler_step(&self.sigmas, latents, velocity, t)
     }

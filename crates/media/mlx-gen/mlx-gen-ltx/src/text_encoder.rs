@@ -11,8 +11,8 @@
 //!
 //! The **AudioVideo** path (sc-2684) reuses the shared Gemma hiddens + per-token-RMS `normed_hidden`
 //! and adds a parallel **audio** head: `text_embedding_projection.audio_aggregate_embed` (→ 2048) +
-//! `audio_embeddings_connector` (8 layers, dim 2048 = 32×64). Built only by [`from_weights_av`];
-//! the video-only [`from_weights`] leaves it `None`.
+//! `audio_embeddings_connector` (8 layers, dim 2048 = 32×64). Built only by `from_weights_av`;
+//! the video-only `from_weights` leaves it `None`.
 
 use mlx_rs::ops::{add, mean_axes, multiply, rsqrt, stack_axis};
 use mlx_rs::{Array, Dtype};
@@ -207,7 +207,7 @@ impl LtxTextEncoder {
     }
 
     /// AudioVideo encode (sc-2684): `(video_embeddings (1,L,4096), audio_embeddings (1,L,2048))`.
-    /// Errors if this encoder was not built with [`from_weights_av`].
+    /// Errors if this encoder was not built with [`Self::from_weights_av`].
     pub fn encode_av(&self, input_ids: &Array, attention_mask: &Array) -> Result<(Array, Array)> {
         let (_, _, ve, ae) = self.encode_av_with_features(input_ids, attention_mask)?;
         Ok((ve, ae))

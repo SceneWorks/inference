@@ -432,7 +432,7 @@ impl T2iModel {
     }
 
     /// Diagnostic (sc-3192 parity): the full per-step denoise **trajectory** for a T2I run — every
-    /// step's decoded image, not just the final. Identical setup to [`generate`]; lets a test compare
+    /// step's decoded image, not just the final. Identical setup to [`Self::generate`]; lets a test compare
     /// the port's trajectory to the reference step by step (e.g. to show that a distilled few-step
     /// run agrees early and diverges only on the big decisive final steps, i.e. compounding precision
     /// chaos rather than a per-step bug).
@@ -1197,7 +1197,7 @@ impl T2iModel {
     /// CFG: condition / text-uncondition / image-uncondition) and re-encoded back into the text
     /// caches, then text resumes — all as **single-path** forwards over growing caches (the upstream
     /// mixed-token attention is never issued). `input_images` are optional source images;
-    /// `system_message` is normally [`INTERLEAVE_SYSTEM_MESSAGE`]; `init_noises`, when supplied, are
+    /// `system_message` is normally [`crate::INTERLEAVE_SYSTEM_MESSAGE`]; `init_noises`, when supplied, are
     /// per-image standard-normal `[1,3,H,W]` tensors for cross-build parity. Returns the composed text
     /// (with `<image>` placeholders) and the generated images in order.
     /// `cancel` is the request's cooperative cancellation handle (F-037): the AR text rollout checks it

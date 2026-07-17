@@ -38,6 +38,42 @@ pub fn align_dim(value: u32, patch: usize, stride: usize) -> u32 {
     (value / align) * align
 }
 
+/// Reject a request whose **grid-aligned** geometry exceeds `max_area` (`0` = uncapped). `dw`/`dh`
+/// are the model's `patch · vae_stride` grid. Measures the geometry the pipeline would actually
+/// render — i.e. the same dims `resolve_capped_dims` returns — so an off-grid request is judged on
+/// what it becomes, not on what was typed.
+///
+/// **sc-12308 — this replaces a silent aspect-preserving refit** (`best_output_size`). SceneWorks
+/// always supplies an explicit `width`/`height`, so refitting overrode a geometry the user chose and
+/// delivered one on no advertised bucket (`1280×720` → `1264×704`, off every menu entry). Upstream's
+/// i2v derives its geometry from the source image + `max_area` and so has no stated geometry to
+/// violate; ours does. candle rejects the same request, so rejecting here is what makes one manifest
+/// entry mean one thing on both backends — the sc-6983 precedent (surface an adjustment, never apply
+/// it silently), taken to its conclusion.
+pub fn reject_over_area(
+    id: &str,
+    req: &GenerationRequest,
+    dw: u32,
+    dh: u32,
+    max_area: usize,
+) -> Result<()> {
+    if max_area == 0 {
+        return Ok(());
+    }
+    let (w, h) = (
+        align_dim(req.width, 1, dw as usize),
+        align_dim(req.height, 1, dh as usize),
+    );
+    let area = w as usize * h as usize;
+    if area > max_area {
+        return Err(Error::Msg(format!(
+            "{id}: width×height ({w}×{h} = {area} px) exceeds the max area {max_area} px; \
+             reduce the resolution"
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve the sampler-loop knobs shared **byte-identically** by every Wan generate path (dense 5B,
 /// A14B MoE, single- and dual-expert VACE): the step count, scheduler shift, solver kind, and seed
 /// (F-010). Each falls back to the config default when the request leaves it unset; an unset sampler
@@ -84,41 +120,6 @@ pub fn seq_len(latent: [i32; 4], patch_size: (usize, usize, usize)) -> usize {
     // up to 2^24 and could go off-by-one beyond it (F-089).
     let tokens = h_lat as usize * w_lat as usize * t_lat as usize;
     tokens.div_ceil(patch_size.1 * patch_size.2)
-}
-
-/// The largest `(width, height)` that fits within `max_area` while preserving the input aspect ratio
-/// and staying aligned to the `(dw, dh)` grid (= `patch · vae_stride`). Port of `generate_wan.py`'s
-/// `_best_output_size`: it derives the ideal `(ow, oh)` from `√(max_area·ratio)`, then tries
-/// width-first and height-first alignment and keeps whichever distorts the aspect ratio less. Applied
-/// only when `config.max_area > 0` and the requested area exceeds it (I2V-14B / TI2V-5B cap, 704×1280).
-pub fn best_output_size(width: u32, height: u32, dw: u32, dh: u32, max_area: usize) -> (u32, u32) {
-    let (w, h, dw_f, dh_f) = (width as f64, height as f64, dw as f64, dh as f64);
-    let area = max_area as f64;
-    let ratio = w / h;
-    let ow = (area * ratio).sqrt();
-    let oh = area / ow;
-
-    // Each grid-aligned dimension is clamped to at least one cell (F-030): for a degenerate `max_area`
-    // (or an extreme aspect ratio) the `floor(.. / d) * d` could otherwise hit 0, making `area / 0`
-    // produce Inf/NaN — a NaN ratio comparison then silently picks a branch or a `(0, …)` size that
-    // blows up later in a reshape. For every production input (dims ≫ grid) the clamp is a no-op.
-    // Option 1: align width first, derive height from the remaining area. (`int(x // d * d)`.)
-    let ow1 = ((ow / dw_f).floor() * dw_f).max(dw_f);
-    let oh1 = ((area / ow1 / dh_f).floor() * dh_f).max(dh_f);
-    let ratio1 = ow1 / oh1;
-
-    // Option 2: align height first, derive width.
-    let oh2 = ((oh / dh_f).floor() * dh_f).max(dh_f);
-    let ow2 = ((area / oh2 / dw_f).floor() * dw_f).max(dw_f);
-    let ratio2 = ow2 / oh2;
-
-    let dist1 = (ratio / ratio1).max(ratio1 / ratio);
-    let dist2 = (ratio / ratio2).max(ratio2 / ratio);
-    if dist1 < dist2 {
-        (ow1 as u32, oh1 as u32)
-    } else {
-        (ow2 as u32, oh2 as u32)
-    }
 }
 
 /// sc-4986 — **pre-flight denoise memory guard.** Estimate the concurrent GPU peak of the
@@ -256,7 +257,7 @@ const VAE22_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 24), (48, 16), (32, 8
 
 /// **Memory-budgeted** tiling for the z48 `vae22` decode (sc-4998). Derives a safe peak-GB ceiling
 /// from this machine's MLX memory limit (× 0.85, matching [`preflight_denoise_memory_guard`]) and
-/// returns the *largest* tile that fits — see [`plan_vae22_tiling`] for the cases and the catchable
+/// returns the *largest* tile that fits — see `plan_vae22_tiling` for the cases and the catchable
 /// over-budget error. Caller passes the **output** dimensions (the decoded video size).
 pub fn auto_tiling_budgeted(
     height: i32,
@@ -637,7 +638,7 @@ fn predict_tokens(
 /// `is_i2v_mask_blend` path, sc-2680). The first latent temporal frame is pinned to the encoded
 /// image `z_img` and *frozen*: every step (1) builds the per-token timestep vector `t_tokens =
 /// mask_tokens · t` (`0` for the first-frame tokens, so they carry timestep 0), (2) predicts the
-/// noise with [`predict_tokens`], (3) scheduler-steps, then (4) re-blends `latents = (1−mask)·z_img +
+/// noise with `predict_tokens`, (3) scheduler-steps, then (4) re-blends `latents = (1−mask)·z_img +
 /// mask·latents` so the first frame stays the conditioning image while the rest denoise.
 ///
 /// `init_latents` is the pre-blended `[C,F,H,W]` start `(1−mask)·z_img + mask·noise`; `z_img` is the
@@ -718,7 +719,7 @@ pub struct Expert<'a> {
 /// experts are the same model.
 ///
 /// `y` is the optional I2V-14B channel-concat conditioning `[20, F, H, W]` ([`build_i2v_y`]),
-/// concatenated onto each forward's noise latent (see [`predict`]); `None` for T2V. It is constant
+/// concatenated onto each forward's noise latent (see `predict`); `None` for T2V. It is constant
 /// across steps and shared by both experts (the conditioning doesn't change with the noise level).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_moe(
@@ -901,7 +902,7 @@ pub fn decode_to_frames_22(
 /// Split a `[F, H, W, 3]` `uint8` video tensor (the [`decode_to_frames`] output) into one
 /// [`Image`] per frame. The tensor is transpose-strided, so a raw `as_slice` would read the
 /// physical (pre-transpose) buffer — `reshape` first re-materializes it in logical C-order, then we
-/// chunk the contiguous bytes `H·W·3` at a time (see [[mlx_rs_as_slice_physical_buffer]]).
+/// chunk the contiguous bytes `H·W·3` at a time (see `mlx_rs_as_slice_physical_buffer`).
 pub fn frames_to_images(frames_u8: &Array) -> Result<Vec<Image>> {
     let sh = frames_u8.shape(); // [F, H, W, 3]
     let (f, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
@@ -1554,26 +1555,69 @@ mod tests {
         assert_eq!(py_round(2.500001), 3); // just over half → up
     }
 
+    /// sc-12308 — these two tests replace `best_output_size_caps_area_and_aligns`, which pinned the
+    /// silent refit `best_output_size(1280, 720, 16, 16, 704*1280) == (1264, 704)`. Both the
+    /// function and that behaviour are gone: an over-cap request is now rejected, and `1280×720` is
+    /// not over the 14B family's real cap at all.
     #[test]
-    fn best_output_size_caps_area_and_aligns() {
-        // 1280×720 over the I2V/TI2V 704×1280 cap, 16-px grid → width-first wins (less distortion).
-        let (w, h) = best_output_size(1280, 720, 16, 16, 704 * 1280);
-        assert_eq!((w, h), (1264, 704));
-        assert!((w * h) as usize <= 704 * 1280, "must fit within max_area");
-        assert_eq!(w % 16, 0);
-        assert_eq!(h % 16, 0);
+    fn over_area_is_rejected_not_refit() {
+        let req = |w, h| GenerationRequest {
+            prompt: "x".into(),
+            width: w,
+            height: h,
+            ..Default::default()
+        };
+
+        // The canonical 720p is AT the 14B cap (`>` check) and must pass untouched — this is the
+        // exact geometry the old refit turned into 1264×704, off every advertised bucket.
+        assert!(
+            reject_over_area("t2v", &req(1280, 720), 16, 16, crate::config::MAX_AREA_14B).is_ok()
+        );
+        assert!(
+            reject_over_area("t2v", &req(720, 1280), 16, 16, crate::config::MAX_AREA_14B).is_ok()
+        );
+
+        // Genuinely over-envelope (sc-9028's 1280×1280) is rejected, with a message naming the cap.
+        let err = reject_over_area("t2v", &req(1280, 1280), 16, 16, crate::config::MAX_AREA_14B)
+            .expect_err("over-area must be rejected");
+        assert!(err.to_string().contains("max area"), "actionable: {err}");
+
+        // The 5B's own budget is smaller, and ITS 720p is 704-tall: 1280×704 is exactly at cap.
+        assert!(
+            reject_over_area("5b", &req(1280, 704), 32, 32, crate::config::MAX_AREA_5B).is_ok()
+        );
+        // A 1280×720 ask does NOT trip the 5B's area cap — its 32-px grid aligns 720 down to 704
+        // first, landing at 901,120. That silent 720→704 is the STRIDE floor, a separate constraint
+        // the manifest handles by advertising 1280x704 for this model; it is not an area rejection.
+        assert!(
+            reject_over_area("5b", &req(1280, 720), 32, 32, crate::config::MAX_AREA_5B).is_ok()
+        );
+        // What the 5B's cap does catch is genuinely over-envelope geometry.
+        assert!(
+            reject_over_area("5b", &req(1280, 1280), 32, 32, crate::config::MAX_AREA_5B).is_err()
+        );
+        // …and the 5B must not silently inherit the 14B family's larger budget.
+        const { assert!(crate::config::MAX_AREA_5B < crate::config::MAX_AREA_14B) };
+
+        // `max_area == 0` means uncapped.
+        assert!(reject_over_area("x", &req(4096, 4096), 16, 16, 0).is_ok());
     }
 
     #[test]
-    fn best_output_size_clamps_degenerate_area_to_one_grid_cell() {
-        // F-030: a `max_area` smaller than one grid cell would floor a dimension to 0 and divide by
-        // it (Inf/NaN, a silent (0, …) result). The guard clamps every dimension to ≥ one cell.
-        let (w, h) = best_output_size(8, 8, 16, 16, 100); // ideal ≈ 10×10 < the 16-px cell
-        assert!(w >= 16 && h >= 16, "got {w}x{h}");
-        assert_eq!((w % 16, h % 16), (0, 0));
-        // An extreme aspect ratio (one side floors to 0) is also clamped, not Inf/NaN.
-        let (w2, h2) = best_output_size(4096, 1, 16, 16, 16 * 16);
-        assert!(w2 >= 16 && h2 >= 16, "got {w2}x{h2}");
+    fn over_area_is_judged_on_the_aligned_geometry() {
+        let req = |w, h| GenerationRequest {
+            prompt: "x".into(),
+            width: w,
+            height: h,
+            ..Default::default()
+        };
+        // An off-grid request is aligned DOWN before rendering, so it must be judged on what it
+        // becomes, not what was typed: 1288×724 → 1280×720 = 921,600, exactly at the cap. Judging
+        // the raw 932,512 would reject a request that renders perfectly legally.
+        assert_eq!((align_dim(1288, 1, 16), align_dim(724, 1, 16)), (1280, 720));
+        assert!(
+            reject_over_area("t2v", &req(1288, 724), 16, 16, crate::config::MAX_AREA_14B).is_ok()
+        );
     }
 
     #[test]

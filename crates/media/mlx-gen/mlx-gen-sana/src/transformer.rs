@@ -12,7 +12,7 @@
 //!    `ReLU(Q),ReLU(K)`, then the `value`-padded-with-a-ones-row trick collapsed to the algebraically
 //!    identical numerator/denominator split `num = (Vᵀ·K)·Q`, `den = (Σ_n K)·Q`, divided with a
 //!    `1/(·+1e-15)` normalizer — the SAME f32 linear-attention kernel the DC-AE spike
-//!    ([`crate::dc_ae::LinearAttn`]) uses, minus the multiscale QKV projections (the trunk's `attn1`
+//!    (`crate::dc_ae::LinearAttn`) uses, minus the multiscale QKV projections (the trunk's `attn1`
 //!    is plain single-scale). `attention_bias=false` for SANA-1.6B → `to_q/k/v` have no bias;
 //!    `to_out.0` carries a bias.
 //!  - **Cross-attention** (`attn2`, standard softmax SDPA) to the caption embeddings — `to_q/k/v` all

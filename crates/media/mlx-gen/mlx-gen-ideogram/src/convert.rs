@@ -1,5 +1,5 @@
 //! Offline pre-quantization: read the dense bf16 converted snapshot and write a packed Q4/Q8
-//! snapshot that [`crate::quant`] loads with no dense transient. Mirrors `mlx_gen_flux2::convert` /
+//! snapshot that `crate::quant` loads with no dense transient. Mirrors `mlx_gen_flux2::convert` /
 //! `mlx_gen_scail2::convert` (same `mlx_rs::ops::quantize`, byte-equal to the load-time
 //! [`Ideogram4Pipeline::quantize`](crate::Ideogram4Pipeline::quantize) / `nn.quantize(bf16)`).
 //!

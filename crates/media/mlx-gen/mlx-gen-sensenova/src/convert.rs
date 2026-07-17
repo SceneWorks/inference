@@ -1,5 +1,5 @@
 //! Offline pre-quantization: read a dense SenseNova-U1 snapshot and write a packed Q4/Q8 turnkey that
-//! [`crate::quant`] (via [`crate::model::load`]) loads with no dense bf16/f32 transient. Mirrors
+//! `crate::quant` (via [`crate::model::load`]) loads with no dense bf16/f32 transient. Mirrors
 //! `mlx_gen_sdxl::convert` / `mlx_gen_lens::convert` (same `mlx_gen::quant::quantize_map`, byte-equal
 //! to the load-time `.quantize` seam), differing in SenseNova's **flat** checkpoint layout and its
 //! backbone-only quant scope.
@@ -13,7 +13,7 @@
 //! the token embedding + `lm_head` (2-D but gather/output matmuls the backbone keeps dense), all
 //! RMSNorms + QK-norms (1-D, shape-guarded out anyway), the two Conv vision embedders (4-D, shape-
 //! guarded out), and the flow-matching `fm_head` + timestep/noise-scale embedder Linears (2-D, kept
-//! dense — precision-sensitive flow head). [`is_backbone_linear`] names the decoder-stack projections
+//! dense — precision-sensitive flow head). `is_backbone_linear` names the decoder-stack projections
 //! exactly, so a 2-D dense target (`embed_tokens` / `lm_head` / `fm_head`) is never packed.
 //!
 //! "MoT" is Mixture of **Transformers** (two *dense* parallel stacks with distinct `_mot_gen`-suffixed
@@ -137,7 +137,7 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
 /// gen-path `*_mot_gen` projections and the two `fm_modules.fm_head.{0,2}` Linears carry the distilled
 /// deltas; everything else is byte-identical to the base.
 ///
-/// `bits`: `4`/`8` → merge then [`quantize_map`] the backbone (same [`is_backbone_linear`] scope as the
+/// `bits`: `4`/`8` → merge then [`quantize_map`] the backbone (same `is_backbone_linear` scope as the
 /// base converter) → one packed `model.safetensors`. `0` → merge then save the **dense** map (a merged
 /// bf16 checkpoint — NOT a verbatim source mirror like the base bf16 tier, since the merge changes
 /// weights). Every tier gets the [`DISTILL_MERGED_MARKER`] so [`crate::model::load_fast`] skips the

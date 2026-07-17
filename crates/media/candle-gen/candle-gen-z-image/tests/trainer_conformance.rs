@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::gen_core::{self, LoadSpec, TrainingItem, WeightsSource};
+use candle_gen::gen_core::{LoadSpec, TrainingItem, WeightsSource};
 use gen_core_testkit::TrainerProfile;
 
 /// The Z-Image base snapshot dir — `Z_IMAGE_SNAPSHOT` or the first HF-cache snapshot.

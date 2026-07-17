@@ -3,7 +3,7 @@
 //! `pulid/encoders_transformer.py IDFormer`.
 //!
 //! Structure (dim=1024, depth=10, heads=16, dim_head=64, 5 id tokens, 32 queries, out 2048):
-//!   * `latents` [1,32,1024] learned queries; `proj_out` [1024,2048] learned param (raw matmul).
+//!   * `latents` `[1,32,1024]` learned queries; `proj_out` `[1024,2048]` learned param (raw matmul).
 //!   * `id_embedding_mapping`: 1280→1024→(LN,LeakyReLU)→1024→(LN,LeakyReLU)→1024×5  (the 5 id tokens).
 //!   * `mapping_0..4`: 1024→1024→(LN,LeakyReLU)→1024→(LN,LeakyReLU)→1024  (projects each EVA scale).
 //!   * 10 × (PerceiverAttention + FeedForward), grouped 5 scales × 2 layers.

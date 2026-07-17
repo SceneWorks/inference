@@ -14,7 +14,7 @@
 //! 3. **Projection**: split `diff` into the component parallel to the conditional prediction `base`
 //!    and the orthogonal remainder, and recombine as `orthogonal + eta·parallel`.
 //!
-//! The x-space L2 norm and projection reduce over **channels + spatial** ([`APG_DIMS`] `[0,2,3]` on a
+//! The x-space L2 norm and projection reduce over **channels + spatial** (`APG_DIMS` `[0,2,3]` on a
 //! `[C,T,H,W]` velocity — the reference's `dim=[-1,-2,-4]` on `[B,C,T,H,W]`, i.e. per frame, excluding
 //! time). `apg_delta` reduces over the whole flattened tensor per batch element (every axis but 0).
 //!
@@ -38,7 +38,7 @@ const APG_DIMS: &[i32] = &[0, 2, 3];
 pub type MomentumBuffer = core::MomentumBuffer<Array>;
 
 /// Single-condition APG: `uncond + scale · normalize_diff(cond − uncond, base = cond)`
-/// (`normalized_guidance`), over Bernini's per-frame [`APG_DIMS`] geometry. With `eta = 1`,
+/// (`normalized_guidance`), over Bernini's per-frame `APG_DIMS` geometry. With `eta = 1`,
 /// `norm_threshold = 0`, and no momentum this is exactly plain CFG `uncond + scale·(cond − uncond)`.
 /// Delegates to [`gen_core::guidance::normalized_guidance`](mlx_gen::gen_core::guidance::normalized_guidance).
 pub fn normalized_guidance(
@@ -126,7 +126,7 @@ mod tests {
             .item::<f32>()
     }
 
-    /// L2 norm over Bernini's per-frame [`APG_DIMS`], keepdims (test helper / clamp inspector).
+    /// L2 norm over Bernini's per-frame `APG_DIMS`, keepdims (test helper / clamp inspector).
     fn l2_norm(a: &Array) -> Array {
         sqrt(multiply(a, a).unwrap().sum_axes(APG_DIMS, true).unwrap()).unwrap()
     }

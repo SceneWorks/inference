@@ -144,7 +144,7 @@ impl QwenEditHeavyOwned {
 ///
 /// Component residency (epic 10834 Phase 1, sc-11006; hoisted to the shared [`Residency::from_policy`]
 /// seam in sc-11126, F-180): `Resident` (default) builds every heavy component now via
-/// [`build_residency`] and holds it warm; `Sequential` keeps only the spec and re-loads per generate in
+/// `build_residency` and holds it warm; `Sequential` keeps only the spec and re-loads per generate in
 /// phase order (VL-encode → drop the VL encoder → dual-latent/denoise/decode) to bound peak memory to
 /// `max(VL-encoder, DiT+VAE)`. Both use the same per-phase loaders, so the components are
 /// byte-identical.

@@ -528,7 +528,7 @@ pub fn merge_wan_adapters(
 /// pass fires; a `moe_expert`-tagged spec is a misconfiguration the caller
 /// ([`crate::model_vace`]) rejects before calling here. Identical merge math + format dispatch as
 /// [`merge_wan_adapters`] (PEFT/kohya LoRA, peft LoKr, third-party LyCORIS LoKr/LoHa), differing only
-/// in the key→module map: [`normalize_vace_key`] targets the diffusers `attn1/attn2.{to_*}` +
+/// in the key→module map: `normalize_vace_key` targets the diffusers `attn1/attn2.{to_*}` +
 /// `ffn.net.0.proj`/`net.2` + `vace_blocks.*` host instead of the native Wan layout.
 pub fn merge_vace_adapters(w: &mut Weights, specs: &[AdapterSpec]) -> Result<WanLoraReport> {
     merge_adapters_into(w, specs, MoeExpert::High, normalize_vace_key)
@@ -537,7 +537,7 @@ pub fn merge_vace_adapters(w: &mut Weights, specs: &[AdapterSpec]) -> Result<Wan
 /// Per-expert VACE adapter merge for the **dual-expert (Wan2.2-A14B) VACE-Fun** — the high/low sibling
 /// of [`merge_vace_adapters`]. Shared (untagged) specs merge onto this `expert`'s weight map and a spec
 /// tagged for the *other* expert is skipped, exactly like [`merge_wan_adapters`]'s `MoeExpert` routing,
-/// but on the diffusers-named VACE key surface ([`normalize_vace_key`]). The caller
+/// but on the diffusers-named VACE key surface (`normalize_vace_key`). The caller
 /// ([`crate::model_vace`]) merges once per expert (`MoeExpert::High` onto `transformer/`, `Low` onto
 /// `transformer_2/`) and enforces the "matched nothing across both experts" error.
 pub fn merge_vace_adapters_expert(
@@ -600,7 +600,7 @@ fn merge_adapters_into(
 // fatal — matching the fold path's `skipped` reporting.
 
 /// The adapter family a file resolves to, for the packed-snapshot routing (sc-10045/sc-10050).
-/// `classify` reads the file's keys/metadata exactly as [`install_one_additive`] does, so a spec
+/// `classify` reads the file's keys/metadata exactly as `install_one_additive` does, so a spec
 /// routes the same way it will install: plain LoRA and **LoKr** both apply additively on a packed tier
 /// (LoRA via low-rank factors, LoKr via the structured vec-trick, sc-10050); **LoHa** on a packed tier
 /// is still deferred (sc-10051), so the loader rejects only LoHa up front rather than dequantizing.
@@ -635,14 +635,14 @@ fn classify_family(lw: &Weights, kind: AdapterKind) -> WanAdapterFamily {
 /// with an explicit, actionable **typed** error (sc-10045; narrowed by sc-10050; finalized by
 /// sc-10051, Option A). Plain LoRA AND LoKr now install additively onto a packed base with no dequant
 /// — LoRA via its low-rank factors, LoKr via the structured deferred-Kronecker vec-trick
-/// ([`install_one_lokr_additive`], sc-10050). LoHa is the **only** family that cannot: its delta is
+/// (`install_one_lokr_additive`, sc-10050). LoHa is the **only** family that cannot: its delta is
 /// `ΔW = (B₁A₁) ⊙ (B₂A₂)`, and the element-wise (Hadamard) product entangles the two low-rank
 /// branches so there is **no allocation-free deferred form** — evaluating it requires materializing
 /// the full `[out,in]` bf16 delta (~dense-weight-sized, ~28 GB/expert on a 14B Wan tier). On a packed
 /// tier that means holding packed-W (~7 GB/expert) **plus** that dense delta, negating the whole
 /// low-memory point of the quantized tier. So rather than silently OOM or silently dequantize, the
 /// loader **steers the user to the bf16 tier** (where LoHa folds into the dense weight in place) via a
-/// typed [`Error::Unsupported`] — which bridges 1:1 to [`gen_core::Error::Unsupported`] so the worker
+/// typed [`Error::Unsupported`] — which bridges 1:1 to [`mlx_gen::Error::Unsupported`] so the worker
 /// can surface actionable guidance instead of an opaque failure (epic 3720, F-008).
 ///
 /// `model_id` is the registry id for the message. Scans every non-empty spec (each file loaded once)
@@ -679,7 +679,7 @@ pub fn reject_loha_on_packed(model_id: &str, specs: &[AdapterSpec]) -> Result<()
 ///
 /// **Packed-snapshot routing (sc-10045 / sc-10050):** on a pre-quantized base the caller first calls
 /// [`reject_loha_on_packed`] so only plain LoRA and LoKr reach here; LoRA installs via its low-rank
-/// factors and LoKr via the **structured deferred-Kronecker** vec-trick ([`install_one_lokr_additive`],
+/// factors and LoKr via the **structured deferred-Kronecker** vec-trick (`install_one_lokr_additive`,
 /// sc-10050) — both with the base staying packed, no `[out,in]` delta materialized. LoHa on a packed
 /// tier stays deferred (sc-10051). On a dense base the fold path ([`merge_wan_adapters`]) is used
 /// instead, so LoKr/LoHa keep working there unchanged.

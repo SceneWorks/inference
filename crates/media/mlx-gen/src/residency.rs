@@ -25,7 +25,7 @@
 //!   running the whole preamble. The denoise loop keeps its own per-step gate; this covers the seams
 //!   between stages the loop never sees.
 //! * **F-174 (leak on early exit):** under `Sequential` the text encoder and the heavy bundle are each
-//!   freed by an RAII [`ClearCacheGuard`], so `clear_cache()` runs on the error/cancel `?`-return path
+//!   freed by an RAII `ClearCacheGuard`, so `clear_cache()` runs on the error/cancel `?`-return path
 //!   too — not only on the success tail the copies covered. A cancelled/failed job no longer idles
 //!   holding a DiT-sized cache.
 //! * **F-177 (wasted PiD load):** the heavy loader closure receives `use_pid`, so a `Sequential`

@@ -183,12 +183,12 @@ impl KreaTextEncoder {
     }
 
     /// **Multi-image-grounded** condition encoding (epic 10871 P1.3/P2.3, F-071) — the scene+person (or
-    /// N-source) generalization of [`forward_with_image`]. Splices each reference's `image_embeds[j]`
+    /// N-source) generalization of [`Self::forward_with_image`]. Splices each reference's `image_embeds[j]`
     /// (`[nⱼ, hidden]`) at its own contiguous `<|image_pad|>` run, runs the decoder under the 3-D
-    /// interleaved MRoPE (positions advance `max(hⱼ, wⱼ)/merge` per image, [`mrope_positions_multi`]),
+    /// interleaved MRoPE (positions advance `max(hⱼ, wⱼ)/merge` per image, `mrope_positions_multi`),
     /// and additively injects each image's `deepstack[j][i]` feature at that image's run for the first
     /// `deepstack.len()` layers. `grids[j]` is image `j`'s `[t, h, w]` patch grid, in the same order the
-    /// runs appear in `input_ids`. `b = 1`. Mirrors [`mlx_gen_boogu::…::last_hidden_with_image_multi`],
+    /// runs appear in `input_ids`. `b = 1`. Mirrors `mlx_gen_boogu::…::last_hidden_with_image_multi`,
     /// so BOTH edit sources reach the grounded encode — not just the first (the prior single-source gap).
     pub fn forward_with_images(
         &self,

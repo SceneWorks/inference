@@ -3,7 +3,7 @@
 //! Produces, per face, a bounding box + 5-point landmarks (the kps that drive both the ArcFace
 //! `norm_crop` alignment and InstantID's `draw_kps`). The network is a ResNet-style backbone + a
 //! PAFPN neck + per-stride detection heads; the decode (anchor centres + `distance2bbox` /
-//! `distance2kps` + NMS) is plain host math. Weights come from [`tools/convert_scrfd.py`].
+//! `distance2kps` + NMS) is plain host math. Weights come from `tools/convert_scrfd.py`.
 //!
 //! ## Architecture (verified from the onnx graph; BatchNorm folded into biased convs)
 //! - **stem**: `Conv(3→28,3×3,s2)+Relu → Conv(28→28)+Relu → Conv(28→56)+Relu → MaxPool2×2 s2`.

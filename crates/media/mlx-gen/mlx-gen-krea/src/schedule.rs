@@ -59,7 +59,8 @@ pub fn dynamic_mu(seq_len: f64) -> f64 {
 /// schedule (descending, length `steps+1`, endpoints `1.0 … 0.0`). Computed in f64 then narrowed to
 /// the `f32` the core sampler stores (the reference computes in f32; the f64 intermediate only tightens
 /// the rounding, well within the flow-match tolerance). The `t = 0` node maps to exactly `0.0`
-/// (`1/0 → ∞ → exp(mu)/∞ = 0`), giving the trailing terminal `0.0` [`FlowMatchSampler`] expects.
+/// (`1/0 → ∞ → exp(mu)/∞ = 0`), giving the trailing terminal `0.0`
+/// [`mlx_gen::FlowMatchSampler`] expects.
 pub fn krea_sigmas(steps: usize, mu: f64) -> Vec<f32> {
     let n = steps.max(1);
     let e = mu.exp();

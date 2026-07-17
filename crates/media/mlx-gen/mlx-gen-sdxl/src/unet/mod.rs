@@ -1,6 +1,6 @@
 //! `UNet2DConditionModel` — the SDXL denoising U-Net. Port of the vendored `unet.UNetModel`: a
 //! conv stem, sinusoidal timestep + SDXL `text_time` micro-conditioning embeddings, a down /
-//! mid / up stack of [`UNetBlock2D`]s with cross-attention to the dual-CLIP text conditioning, and
+//! mid / up stack of `UNetBlock2D`s with cross-attention to the dual-CLIP text conditioning, and
 //! a conv head. Runs entirely in NHWC. Predicts the noise (`eps`) for one denoise step.
 
 mod block;

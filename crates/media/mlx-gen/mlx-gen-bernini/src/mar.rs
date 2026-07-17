@@ -17,7 +17,8 @@
 //!   - [`feat_to_renderer`] (inference) — `connector.for_gen` over *all* tokens (`cond_embed_mask =
 //!     ¬gen | gen = all`), plus the txt (`¬gen`) / vit (`gen`) position sub-masks.
 //!   - [`four_streams`] — `feature_type = masked_tgt_embed_with_qwen_txt_vit_tokens`: `wtxt_wvit` =
-//!     cond contexts; `wtxt_wovit` = cond[txt]; `wotxt_wvit` = cond[vit]; `wotxt_wovit` = uncond[txt].
+//!     cond contexts; `wtxt_wovit` = `cond[txt]`; `wotxt_wvit` = `cond[vit]`; `wotxt_wovit` =
+//!     `uncond[txt]`.
 //!     These feed the renderer's ViT-conditioned APG guidance (sc-5142).
 //!
 //! Sequence-axis gather is `take_axis`; scatter (write a few rows back into the buffer) is the

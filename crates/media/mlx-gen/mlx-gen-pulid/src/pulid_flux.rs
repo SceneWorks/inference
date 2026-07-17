@@ -7,7 +7,7 @@
 //!   2. **EVA-CLIP** (sc-3070): `face_features_image` → resize/normalize → `id_cond_vit` (768-d,
 //!      L2-normalized) + 5 hidden states.
 //!   3. **IDFormer** (sc-3071): `id_cond = cat(arcface 512, id_cond_vit 768)` + hidden → `id_embedding`
-//!      [1,32,2048].
+//!      `[1,32,2048]`.
 //!   4. **CA injection** (sc-3072): build `PulidCa` and run the FLUX flow-match denoise through
 //!      `Flux1::generate_with_injector` (fake-CFG, true_cfg=1.0) → AE decode.
 //!

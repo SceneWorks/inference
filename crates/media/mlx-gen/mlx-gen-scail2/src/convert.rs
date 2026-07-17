@@ -6,7 +6,7 @@
 //! materialize the full ~33 GB bf16 DiT before packing, so the load-time peak (and therefore
 //! `minMemoryGb`) is the *bf16* footprint. Quantizing **on disk** here moves that bf16 transient to a
 //! one-off offline convert; the shipped snapshot is already packed, so the consume side
-//! ([`crate::model::load_lin_q`]) never builds a dense weight — the resident set is the Q4 packs.
+//! (`model::load_lin_q`) never builds a dense weight — the resident set is the Q4 packs.
 //!
 //! Mirrors `mlx_gen_wan::convert::quantize_wan_transformer` (same `mlx_rs::ops::quantize`, byte-equal
 //! to `nn.quantize`), differing only in the SCAIL-2 key layout (the FFN is `ffn.0` / `ffn.2`, and the
@@ -55,7 +55,7 @@ fn is_quant_target(weight_key: &str) -> bool {
 /// `{base}.weight` (cast to bf16 for fork parity, matching [`AdaptableLinear::quantize`]) becomes the
 /// packed triple `{base}.weight` (u32 codes), `{base}.scales`, `{base}.biases` via MLX `quantize`; the
 /// Linear's dense `{base}.bias` and every other tensor pass through unchanged. The result is the exact
-/// key layout [`crate::model::load_lin_q`] reads back.
+/// key layout `model::load_lin_q` reads back.
 ///
 /// [`AdaptableLinear::quantize`]: mlx_gen::adapters::AdaptableLinear::quantize
 pub fn quantize_scail2_transformer(

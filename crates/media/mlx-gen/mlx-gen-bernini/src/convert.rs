@@ -186,7 +186,7 @@ const QWEN_PLANNER_QUANT_SUFFIXES: &[&str] = &[
 ];
 
 /// Pre-bake the sc-5146 load-time planner quantization into an on-disk `qwen2_5_vl.safetensors` map:
-/// each [`QWEN_PLANNER_QUANT_SUFFIXES`]-matched decoder Linear `{base}.weight` (bf16) under the
+/// each `QWEN_PLANNER_QUANT_SUFFIXES`-matched decoder Linear `{base}.weight` (bf16) under the
 /// `model.layers.` prefix becomes the packed triple `{base}.weight` (u32) + `{base}.scales` +
 /// `{base}.biases` via MLX `quantize` (byte-identical to `AdaptableLinear::quantize`, which packs the
 /// same bf16-native weights at the same group size). Everything else — the `visual.*` vision tower,
@@ -324,7 +324,7 @@ fn planner_knobs(pkg: &Path) -> serde_json::Value {
 ///   - `vit_decoder.safetensors` ← `vit_decoder.*` → bf16            (140)
 ///   - `mask_tokens.safetensors` ← `mask_tokens` → bf16              (1)
 ///   - `qwen2_5_vl_config.json`  ← copy of `mllm/config.json`
-///   - `bernini_planner.json`    ← distilled planner knobs ([`planner_knobs`])
+///   - `bernini_planner.json`    ← distilled planner knobs (`planner_knobs`)
 ///   - `transformer_config.json` / `transformer_2_config.json` ← copied (the renderer DiT configs)
 ///   - `t5_text_encoder/`, `t5_tokenizer/`, `vae/`, `scheduler/`, `mllm/` ← linked or copied verbatim
 ///

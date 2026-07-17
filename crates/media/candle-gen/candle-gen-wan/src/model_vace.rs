@@ -298,7 +298,7 @@ impl Generator for WanVaceGenerator {
         if area > MAX_AREA_14B {
             return Err(gen_core::Error::Msg(format!(
                 "wan-vace: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
-                 (704×1280); reduce the resolution",
+                 (1280×720); reduce the resolution",
                 req.width, req.height
             )));
         }
@@ -567,11 +567,13 @@ mod tests {
             .load(MODEL_ID_VACE, &spec)
             .unwrap();
 
-        // Exactly at the cap (1280×704 = 901 120 px, both multiples of 16) is accepted.
-        assert_eq!(704 * 1280, MAX_AREA_14B);
+        // Exactly at the cap (1280×720 = 921 600 px, both multiples of 16) is accepted. sc-12308:
+        // upstream `Wan2.1` gives `vace-14B` the same `1280*720` bucket as the T2V/I2V 14B, so this
+        // lane must render the canonical 720p rather than the TI2V-5B's `1280×704`.
+        assert_eq!(1280 * 720, MAX_AREA_14B);
         let mut at_cap = control_req();
         at_cap.width = 1280;
-        at_cap.height = 704;
+        at_cap.height = 720;
         assert!(g.validate(&at_cap).is_ok());
 
         // Over the cap while both edges stay within `max_size` (1280×1280 = 1 638 400 px, both

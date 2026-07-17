@@ -125,11 +125,11 @@ impl QwenHeavyOwned {
 /// diffusers multi-component tree). Weights load dense at their on-disk dtype (bf16); the text
 /// encoder promotes to f32 internally. `spec.quantize` (Q4/Q8) quantizes the transformer only
 /// (group_size 64) — the fork's full `quantize=N` scope (sc-2565; see the inline note in
-/// [`load_heavy`]). An fp32 precision override is not wired (the validated dense path is bf16) and
+/// `load_heavy`). An fp32 precision override is not wired (the validated dense path is bf16) and
 /// is rejected rather than silently ignored.
 ///
 /// Component residency (epic 10834 Phase 1, sc-11000; hoisted to the shared [`Residency::from_policy`]
-/// seam in sc-11126): `Resident` (default) builds every heavy component now via [`build_residency`]
+/// seam in sc-11126): `Resident` (default) builds every heavy component now via `build_residency`
 /// and holds it warm; `Sequential` keeps only the spec and re-loads per generate in phase order
 /// (encode → drop the text encoder → denoise/decode) to bound peak memory to `max(text-encoder,
 /// DiT+VAE)`. Both use the same per-phase loaders, so the components are byte-identical.
