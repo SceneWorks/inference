@@ -31,7 +31,7 @@ pub enum FinishReason {
 
 /// Which channel a streamed token belongs to: the model's reasoning trace or its final answer.
 ///
-/// Only reasoning ("thinking") models emit [`Thinking`](Channel::Content) spans; every token from a
+/// Only reasoning ("thinking") models emit [`Thinking`](Channel::Thinking) spans; every token from a
 /// non-thinking model — and every token outside a `<think>…</think>` block — is
 /// [`Content`](Channel::Content). The provider classifies tokens with a
 /// [`ThinkingSegmenter`](crate::ThinkingSegmenter).
