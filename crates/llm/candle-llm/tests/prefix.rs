@@ -229,6 +229,58 @@ fn prefix_reuse_is_bit_exact_cpu() {
     run_suite(&model, &sys, &q1, &q2, 12);
 }
 
+/// Regression (sc-12455): on a `MaxTokens` finish `decode_loop` breaks *before* feeding the last
+/// generated token's KV, so the cache holds `prompt + n - 1` positions while the stored index entry
+/// used to claim `prompt + n` tokens. A follow-up prompt that **extends** the stored sequence (the
+/// module's multi-turn use case) then matched one position past the stored tensors' sequence dim and
+/// the whole request failed with a bounds error. The `.min(prompt_len - 1)` clamp only bounds by the
+/// *query* length, which is a no-op for an extending prompt — re-issuing the same prompt (what the
+/// other tests do) masks the bug.
+#[test]
+fn budget_finished_entry_supports_extension() {
+    let model = build_tiny_llama();
+    let prompt: Vec<i32> = vec![1, 2, 3, 4, 5];
+    let max_new = 6;
+
+    let mut pc = PrefixCache::new(16);
+    let out1 = generate_cached(
+        &model,
+        &prompt,
+        &config(max_new),
+        &CancelFlag::new(),
+        &mut |_| {},
+        &mut pc,
+    )
+    .unwrap();
+    assert_eq!(
+        out1.finish_reason,
+        candle_llm::decode::FinishReason::MaxTokens,
+        "the priming run must finish on the token budget"
+    );
+    assert_eq!(out1.tokens.len(), max_new);
+
+    // Multi-turn continuation: previous prompt + everything generated + the next user turn.
+    let mut extended = prompt.clone();
+    extended.extend_from_slice(&out1.tokens);
+    extended.extend_from_slice(&[9, 8, 7]);
+
+    let base = cold(&model, &extended, 4);
+    let out2 = cached(&model, &extended, 4, &mut pc);
+    assert_eq!(
+        out2, base,
+        "extending a budget-finished entry must reuse the prefix bit-exactly"
+    );
+    let s = pc.stats();
+    assert_eq!(s.hits, 1, "the extension must hit the stored entry");
+    // The budget finish never fed the last generated token's KV, so the reusable span is exactly
+    // one short of `prompt + generated`.
+    assert_eq!(s.reused_prefix_tokens, prompt.len() + max_new - 1);
+    assert_eq!(
+        s.computed_prefill_tokens,
+        prompt.len() + (extended.len() - (prompt.len() + max_new - 1))
+    );
+}
+
 // ---- Real-weights variants (#[ignore]) -----------------------------------------------------------
 //
 // On a GPU the reuse is numerically *near*-exact rather than bit-exact: the reused `sys` KV is

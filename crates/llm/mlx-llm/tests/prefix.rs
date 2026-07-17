@@ -1,4 +1,5 @@
-//! Real-weights prefix-cache tests (`#[ignore]` — needs a model on disk), story 7168.
+//! Prefix-cache tests, story 7168: real-weights suites (`#[ignore]` — needs a model on disk) plus
+//! a synthetic no-download regression test for the budget-finish off-by-one (sc-12455).
 //!
 //! Point `MLX_LLM_TEST_MODEL` (Llama-family) and/or `MLX_LLM_QWEN3_MODEL` (Qwen3) at a Hugging Face
 //! snapshot and run:
@@ -149,4 +150,159 @@ fn prefix_reuse_is_bit_exact_qwen3() {
         return;
     };
     run_suite(fx);
+}
+
+// ---- Synthetic no-download regression (sc-12455) -------------------------------------------------
+//
+// Same tiny deterministic Llama as `tests/streaming.rs` — runs in CI with no weights.
+
+use std::collections::HashMap;
+
+use mlx_rs::Array;
+
+use mlx_llm::decode::FinishReason;
+use mlx_llm::primitives::sampler::{SplitMix64, TokenRng};
+
+fn tiny_config() -> ModelConfig {
+    ModelConfig {
+        hidden_size: 8,
+        intermediate_size: 16,
+        num_layers: 2,
+        num_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 4,
+        vocab_size: 32,
+        rms_norm_eps: 1e-5,
+        rope_theta: 10000.0,
+        rope_scaling: None,
+        tie_word_embeddings: false,
+        architecture: mlx_llm::config::Architecture::Llama,
+        max_position_embeddings: 0,
+        quantization: None,
+        moe: None,
+        attn_logit_softcap: None,
+        final_logit_softcap: None,
+        query_pre_attn_scalar: None,
+        partial_rotary_factor: 1.0,
+        mla: None,
+        yarn: None,
+        mrope_section: None,
+    }
+}
+
+fn randn(shape: &[i32], rng: &mut SplitMix64) -> Array {
+    let n: i32 = shape.iter().product();
+    let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+    Array::from_slice(&data, shape)
+}
+
+fn tiny_model(cfg: &ModelConfig) -> CausalLm {
+    let mut rng = SplitMix64::new(0xC0FFEE);
+    let h = cfg.hidden_size;
+    let v = cfg.vocab_size;
+    let inter = cfg.intermediate_size;
+    let qd = cfg.num_heads * cfg.head_dim;
+    let kvd = cfg.num_kv_heads * cfg.head_dim;
+
+    let mut m: HashMap<String, Array> = HashMap::new();
+    m.insert("model.embed_tokens.weight".into(), randn(&[v, h], &mut rng));
+    m.insert("model.norm.weight".into(), Array::ones::<f32>(&[h]).unwrap());
+    m.insert("lm_head.weight".into(), randn(&[v, h], &mut rng));
+    for i in 0..cfg.num_layers {
+        let p = |s: &str| format!("model.layers.{i}.{s}");
+        m.insert(p("input_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap());
+        m.insert(
+            p("post_attention_layernorm.weight"),
+            Array::ones::<f32>(&[h]).unwrap(),
+        );
+        m.insert(p("self_attn.q_proj.weight"), randn(&[qd, h], &mut rng));
+        m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, h], &mut rng));
+        m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, h], &mut rng));
+        m.insert(p("self_attn.o_proj.weight"), randn(&[h, qd], &mut rng));
+        m.insert(p("mlp.gate_proj.weight"), randn(&[inter, h], &mut rng));
+        m.insert(p("mlp.up_proj.weight"), randn(&[inter, h], &mut rng));
+        m.insert(p("mlp.down_proj.weight"), randn(&[h, inter], &mut rng));
+    }
+
+    CausalLm::from_weights(&Weights::from_map(m), "", cfg.clone()).unwrap()
+}
+
+fn greedy(max_new_tokens: usize) -> GenerationConfig {
+    GenerationConfig {
+        max_new_tokens,
+        sampling: SamplingParams::default(), // greedy ⇒ deterministic
+        seed: Some(0),
+        stop_tokens: Vec::new(),
+    }
+}
+
+/// Regression (sc-12455): on a `MaxTokens` finish `decode_loop` breaks *before* feeding the last
+/// generated token's KV, so the cache holds `prompt + n - 1` positions while the stored index entry
+/// used to claim `prompt + n` tokens. A follow-up prompt that **extends** the stored sequence (the
+/// module's multi-turn use case) then matched one position past the stored tensors' sequence dim.
+/// On MLX this was *worse* than an error: `slice_layers` used an unchecked `take_axis` gather, so
+/// the seeded KV was silent garbage — the `reused_prefix_tokens` stats pin below is what catches
+/// it deterministically (the tiny model's greedy outputs can coincide even with a clamped gather).
+#[test]
+fn budget_finished_entry_supports_extension() {
+    let cfg = tiny_config();
+    let model = tiny_model(&cfg);
+    let prompt: Vec<i32> = vec![1, 2, 3, 4, 5];
+    let max_new = 6;
+
+    let mut pc = PrefixCache::new(16);
+    let out1 = generate_cached(
+        &model,
+        &prompt,
+        &greedy(max_new),
+        &CancelFlag::new(),
+        &mut |_| {},
+        &mut pc,
+    )
+    .unwrap();
+    assert_eq!(
+        out1.finish_reason,
+        FinishReason::MaxTokens,
+        "the priming run must finish on the token budget"
+    );
+    assert_eq!(out1.tokens.len(), max_new);
+
+    // Multi-turn continuation: previous prompt + everything generated + the next user turn.
+    let mut extended = prompt.clone();
+    extended.extend_from_slice(&out1.tokens);
+    extended.extend_from_slice(&[9, 8, 7]);
+
+    let base = generate(
+        &model,
+        &extended,
+        &greedy(4),
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .tokens;
+    let out2 = generate_cached(
+        &model,
+        &extended,
+        &greedy(4),
+        &CancelFlag::new(),
+        &mut |_| {},
+        &mut pc,
+    )
+    .unwrap()
+    .tokens;
+    assert_eq!(
+        out2, base,
+        "extending a budget-finished entry must reuse the prefix bit-exactly (garbage KV from an \
+         out-of-range gather would diverge here)"
+    );
+    let s = pc.stats();
+    assert_eq!(s.hits, 1, "the extension must hit the stored entry");
+    // The budget finish never fed the last generated token's KV, so the reusable span is exactly
+    // one short of `prompt + generated`.
+    assert_eq!(s.reused_prefix_tokens, prompt.len() + max_new - 1);
+    assert_eq!(
+        s.computed_prefill_tokens,
+        prompt.len() + (extended.len() - (prompt.len() + max_new - 1))
+    );
 }
