@@ -17,6 +17,25 @@ class SelectLanesTests(unittest.TestCase):
             self.assertTrue(lanes[lane], lane)
         self.assertFalse(lanes["docs"])
 
+    def test_gen_core_testkit_uses_the_contract_lane_set(self) -> None:
+        lanes = select_lanes(["crates/contracts/gen-core-testkit/src/lib.rs"])
+        selected = {
+            lane
+            for lane, enabled in lanes.items()
+            if enabled
+        }
+        self.assertEqual(
+            selected,
+            {
+                "workspace",
+                "contracts",
+                "candle_cpu",
+                "macos_metal",
+                "windows_cuda",
+                "real_weights",
+            },
+        )
+
     def test_mlx_provider_change_stays_on_macos(self) -> None:
         lanes = select_lanes(["crates/media/mlx-gen/mlx-gen-flux/src/lib.rs"])
         self.assertTrue(lanes["workspace"])
@@ -62,6 +81,19 @@ class SelectLanesTests(unittest.TestCase):
         self.assertTrue(lanes["docs"])
         self.assertFalse(lanes["macos_metal"])
         self.assertFalse(lanes["candle_cpu"])
+
+    def test_root_doc_and_meta_files_are_docs_only(self) -> None:
+        for path in (
+            ".github/CODEOWNERS",
+            ".gitignore",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "SECURITY.md",
+        ):
+            with self.subTest(path=path):
+                lanes = select_lanes([path])
+                selected = {lane for lane, enabled in lanes.items() if enabled}
+                self.assertEqual(selected, {"workspace", "docs"})
 
     def test_root_manifest_and_unknown_paths_fail_safe(self) -> None:
         for path in ("Cargo.toml", "new-build-system/config.json"):
