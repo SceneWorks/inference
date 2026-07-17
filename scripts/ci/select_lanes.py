@@ -64,7 +64,15 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
         return lanes
 
     for path in normalized:
-        if path.startswith("docs/") or path in {"README.md", "CONTRIBUTING.md"}:
+        if path.startswith("docs/") or path in {
+            ".github/CODEOWNERS",
+            ".gitignore",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "CONTRIBUTING.md",
+            "README.md",
+            "SECURITY.md",
+        }:
             lanes["docs"] = True
             continue
 

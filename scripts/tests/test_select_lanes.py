@@ -82,6 +82,19 @@ class SelectLanesTests(unittest.TestCase):
         self.assertFalse(lanes["macos_metal"])
         self.assertFalse(lanes["candle_cpu"])
 
+    def test_root_doc_and_meta_files_are_docs_only(self) -> None:
+        for path in (
+            ".github/CODEOWNERS",
+            ".gitignore",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "SECURITY.md",
+        ):
+            with self.subTest(path=path):
+                lanes = select_lanes([path])
+                selected = {lane for lane, enabled in lanes.items() if enabled}
+                self.assertEqual(selected, {"workspace", "docs"})
+
     def test_root_manifest_and_unknown_paths_fail_safe(self) -> None:
         for path in ("Cargo.toml", "new-build-system/config.json"):
             with self.subTest(path=path):
