@@ -955,7 +955,9 @@ impl Bernini {
                 f32c(&streams.wotxt_wovit)?,
             );
             out
-            // planner dropped here (freed before the renderer experts load).
+            // Only planner-local state is dropped here. The renderer components in `comps`, loaded
+            // through `self.components()` above, remain cached and resident for the whole request
+            // (F-097).
         };
 
         // --- Stage 2: UMT5 text encode + concat_with_zero_init for the 4 renderer streams ---
