@@ -648,6 +648,23 @@ impl LtxVideoVae {
                     let dec = self.decoder.decode(&tile)?; // [b, 3, td, hd, wd]
 
                     let ds = dec.shape();
+
+                    // sc-12438: on the first tile, refuse before building the accumulators if the full
+                    // `[b, 3, out_f, out_h, out_w]` output would cross the write bound. No tiling shrinks
+                    // it, and past the bound the `pad`/`add` below silently corrupt — a catchable error
+                    // instead of wrong pixels. Shared with the Wan/Qwen loop
+                    // ([`mlx_gen::vae_tiling::check_output_writable`]).
+                    if output.is_none() {
+                        let full_elems = ds[0] as i64
+                            * ds[1] as i64
+                            * plan.out_f as i64
+                            * plan.out_h as i64
+                            * plan.out_w as i64;
+                        mlx_gen::vae_tiling::check_output_writable(
+                            full_elems, plan.out_f, plan.out_h, plan.out_w,
+                        )?;
+                    }
+
                     let at = ds[2].min(t.out_stop - t.out_start);
                     let ah = ds[3].min(hh.out_stop - hh.out_start);
                     let aw = ds[4].min(ww.out_stop - ww.out_start);

@@ -153,6 +153,12 @@ fn render_wan_sample(
             &mut |_| {},
         )?
     };
+    // sc-12438 (Req 3 audit): `None` = single-pass decode, which bypasses `budgeted_plan`'s write
+    // guards. Safe here by a proven-unreachable bound: a training preview decodes ONE still latent
+    // frame (`T = 1`) at the training edge (≤ ~1024²), so the decoder-stage write
+    // (`full_res_channels · 1 · H · W` ≤ 96·1024² = 1.0e8, ~0.05×) and the RGB output stay far under
+    // `MAX_WRITABLE_ELEMS`. The tiled/large paths (production render) route through
+    // `decode_to_frames` → `budgeted_plan` + the accumulator guard instead.
     let frames = match vae {
         WanTrainVae::Z16(v) => decode_to_frames(v, &latents, None, Some(cancel))?,
         WanTrainVae::Z48(v) => decode_to_frames_22(v, &latents, None, Some(cancel))?,

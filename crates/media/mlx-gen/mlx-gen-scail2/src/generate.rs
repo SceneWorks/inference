@@ -22,7 +22,7 @@
 use std::path::Path;
 
 use mlx_gen::array::scalar;
-use mlx_gen::tiling::TilingConfig;
+use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
 use mlx_gen_wan::{
@@ -635,8 +635,17 @@ pub fn generate(
             // buckets; ≥8 output frames (2 latent frames for temporal-conv context), snapped to the
             // z16 ×4 temporal stride.
             let px_per_frame = (th as i64) * (tw as i64);
-            let budget_frames = (DECODE_TILE_BUDGET_PXFRAMES / px_per_frame.max(1)) as i32;
-            let tile_frames = (budget_frames / 4 * 4).clamp(8, out_frames.max(8));
+            let budget_frames = DECODE_TILE_BUDGET_PXFRAMES / px_per_frame.max(1);
+            // sc-12438 (Req 3): also bound the window by the z16 **write** cap. This scail2 path sizes
+            // tiles from a memory budget and bypasses the Wan pipeline's `budgeted_plan`, so route it
+            // through the same write-safety contract explicitly: the memory budget already keeps
+            // `96 · frames · th · tw` under MAX_WRITABLE_ELEMS at every shipped bucket (a comfortable
+            // margin — 3.5e6·96 = 3.4e8 ≪ 2^31), but capping by `writable_frame_cap` makes that safety a
+            // guarantee rather than an incidental one if the budget or a bucket ever grows. (The
+            // assembled output is separately guarded inside `tiled_decode`.)
+            let write_cap = VaeTiling::WAN.writable_frame_cap(th as i32, tw as i32);
+            let win = budget_frames.min(write_cap) as i32;
+            let tile_frames = (win / 4 * 4).clamp(8, out_frames.max(8));
             let overlap = (tile_frames / 4).max(1);
             let cfg = TilingConfig::temporal_only(tile_frames, overlap);
             vae.decode_tiled(&z, &cfg, Some(cancel))? // [1,3,T_out,H,W]; single-pass fallback if it doesn't tile

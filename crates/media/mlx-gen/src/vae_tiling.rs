@@ -15,10 +15,35 @@
 //! slice/blend/pad/accumulate loop (the Wan sc-4998/sc-5690 seam-artifact history).
 
 use crate::array::scalar;
-use crate::tiling::TilePlan;
+use crate::tiling::{TilePlan, MAX_WRITABLE_ELEMS};
 use crate::{CancelFlag, Error, Result};
 use mlx_rs::ops::{add, divide, maximum, multiply, pad};
 use mlx_rs::Array;
+
+/// Refuse — with a catchable error — a tiled decode whose **assembled full output** would exceed
+/// [`MAX_WRITABLE_ELEMS`]. `full_elems` is the element count of the `output` accumulator this decode
+/// must build (`batch × out_channels × out_f × out_h × out_w`); `out_*` are for the message.
+///
+/// Why refuse rather than tile smaller (sc-12438): no tiling shrinks the *full* output — every tile is
+/// `pad`-ed to it and added — and on the pinned MLX 0.31.2 an `output`/`pad` write past this bound
+/// silently returns wrong pixels (measured: `pad` at `128×42×480×848` corrupts from ~1.003× the bound;
+/// `conv3d` likewise, fixed upstream only for convolution by MLX PR #3524 in 0.32.0 — **`pad` still
+/// corrupts on 0.32.0**). The binding compounds it: `from_slice` and `reshape(-1)` compute the flat size
+/// in `i32` and overflow past the bound (MLX issue #3327), so an over-bound result cannot even be
+/// materialized or normalized. There is therefore no way to *produce* a correct output over the bound on
+/// this stack; a decode that would has to be refused up front, not tiled. The blend-weight accumulator
+/// (`batch × 1 × out_f × out_h × out_w`) is strictly smaller, so this single check covers both.
+pub fn check_output_writable(full_elems: i64, out_f: i32, out_h: i32, out_w: i32) -> Result<()> {
+    if full_elems > MAX_WRITABLE_ELEMS {
+        return Err(Error::Msg(format!(
+            "vae tiled decode: the assembled {out_f}×{out_h}×{out_w} output is a {full_elems}-element \
+             buffer, over the {MAX_WRITABLE_ELEMS}-element ceiling above which MLX silently returns \
+             wrong pixels and the array cannot be materialized. No tiling shrinks the full output — \
+             reduce the resolution or frame count."
+        )));
+    }
+    Ok(())
+}
 
 /// Force a logically-contiguous copy. mlx-rs host reads (`as_slice`) return the *physical* buffer, so
 /// an array left strided by a `transpose` is read scrambled; a reshape round-trip materializes logical
@@ -78,6 +103,20 @@ pub fn tiled_decode(
                 let dec = decode_tile(&tile)?;
 
                 let ds = dec.shape();
+
+                // On the first tile, refuse before allocating if the full output accumulator (dec's
+                // non-tiled dims with the tiled axes at their full output extent) would cross the write
+                // bound — no tiling shrinks it, and past the bound the `pad`/`add` below silently
+                // corrupt (sc-12438). Catchable, so the caller errors instead of returning wrong pixels.
+                if output.is_none() {
+                    let mut full = ds.to_vec();
+                    full[t_ax as usize] = plan.out_f;
+                    full[h_ax as usize] = plan.out_h;
+                    full[w_ax as usize] = plan.out_w;
+                    let full_elems: i64 = full.iter().map(|&d| d as i64).product();
+                    check_output_writable(full_elems, plan.out_f, plan.out_h, plan.out_w)?;
+                }
+
                 let at = ds[t_ax as usize].min(t.out_stop - t.out_start);
                 let ah = ds[h_ax as usize].min(hh.out_stop - hh.out_start);
                 let aw = ds[w_ax as usize].min(ww.out_stop - ww.out_start);
@@ -255,6 +294,65 @@ mod tests {
         assert!(
             max < 1e-4,
             "image tiled blend did not reconstruct: max|Δ|={max:.3e}"
+        );
+    }
+
+    /// sc-12438: `check_output_writable` allows an output exactly AT the bound and refuses the first
+    /// element past it — the sharp `> MAX_WRITABLE_ELEMS` boundary, not `>=`. Mutation-discriminating:
+    /// flipping the comparison, the constant, or an off-by-one turns one of these two assertions red.
+    #[test]
+    fn check_output_writable_boundary_is_sharp() {
+        assert!(
+            check_output_writable(MAX_WRITABLE_ELEMS, 1, 1, 1).is_ok(),
+            "an output exactly at the bound must be allowed"
+        );
+        assert!(
+            check_output_writable(MAX_WRITABLE_ELEMS + 1, 1, 1, 1).is_err(),
+            "one element past the bound must be refused"
+        );
+        // A realistic RGB video geometry just over the bound (LTX 1280²·441f class): 3·441·1280·1280.
+        let over = 3i64 * 441 * 1280 * 1280;
+        assert!(over > MAX_WRITABLE_ELEMS);
+        assert!(check_output_writable(over, 441, 1280, 1280).is_err());
+    }
+
+    /// sc-12438: a tiled decode whose assembled output would cross the write bound is REFUSED at the
+    /// first tile — before any full-size accumulator is allocated — with a catchable error, rather than
+    /// building a silently-corrupt `pad`-and-add accumulator. Drives the real loop with a tiny latent
+    /// but an over-bound output geometry (`out_h·out_w·3 > i32::MAX`) and an identity decode.
+    #[test]
+    fn tiled_decode_refuses_over_bound_output() {
+        // Small NCTHW latent, channel axis 1, tiled axes [2,3,4]; a single tile per axis.
+        let denorm = Array::from_slice(&[0f32; 3 * 4 * 4], &[1, 3, 1, 4, 4]);
+        let axis = |out_stop: i32| AxisTile {
+            start: 0,
+            end: 4,
+            out_start: 0,
+            out_stop,
+            mask: vec![1.0; out_stop as usize],
+        };
+        // out_f=1, out_h=out_w=40_000 → 3·1·40000·40000 = 4.8e9 > i32::MAX. The h/w tiles slice the
+        // 4-wide latent; only the FULL output extent is over-bound.
+        let plan = TilePlan {
+            t: vec![AxisTile {
+                start: 0,
+                end: 1,
+                out_start: 0,
+                out_stop: 1,
+                mask: vec![1.0; 1],
+            }],
+            h: vec![axis(40_000)],
+            w: vec![axis(40_000)],
+            out_f: 1,
+            out_h: 40_000,
+            out_w: 40_000,
+        };
+        let res = tiled_decode(&denorm, &plan, [2, 3, 4], None, |tile| Ok(tile.clone()));
+        let err = res.expect_err("an over-bound output must be refused, not assembled");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("over the") && msg.contains("ceiling"),
+            "refusal must explain the write-bound ceiling, got: {msg}"
         );
     }
 }
