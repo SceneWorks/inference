@@ -25,11 +25,11 @@
 //!
 //! ## Mask handling
 //! `_get_gemma_prompt_embeds` returns `(prompt_embeds, prompt_attention_mask)` and `encode_prompt`
-//! gathers the **same** `select_index` from both. But the SANA *transformer*
-//! ([`crate::transformer::SanaTransformer::forward`]) consumes only the `[1, 300, 2304]` embedding —
-//! its `attn2` cross-attention is plain full softmax over all 300 caption tokens with **no** mask
-//! (same as PiD's inference net, which discards `emb_masks`). So the 300-token attention mask is
-//! exposed here for completeness/parity ([`SanaTextEncoder::token_ids`]) but is not fed to the trunk.
+//! gathers the **same** `select_index` from both. [`SanaTextEncoder::encode_with_mask`] returns both
+//! gathered arrays; the pipeline threads `caption_mask` through
+//! [`crate::transformer::SanaTransformer::forward`] into every block's `attn2` cross-attention.
+//! This is required for correctness: short captions leave most of the 300 positions padded, and
+//! attending to those padding embeddings would swamp the real conditioning.
 
 use std::path::Path;
 
