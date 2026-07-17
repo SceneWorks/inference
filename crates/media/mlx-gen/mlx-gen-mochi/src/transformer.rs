@@ -398,7 +398,8 @@ impl MochiAttention {
         Ok(x.reshape(&[sh[0], sh[1], self.num_heads as i32, self.head_dim as i32])?)
     }
 
-    /// Joint attention. `visual [B, Sv, inner]`, `text [B, St, pooled]`, `enc_mask [B, St]` (0/1).
+    /// Joint attention. `visual [B, Sv, inner]`, `text [B, St, pooled]`, and `joint_mask` is the
+    /// prebuilt additive mask `[B, 1, 1, Sv+St]` shared by every transformer block.
     /// Returns `(visual_out [B, Sv, inner], Some(text_out [B, St, pooled]))` (text `None` when
     /// `context_pre_only`).
     pub fn forward(
@@ -406,7 +407,7 @@ impl MochiAttention {
         visual: &Array,
         text: &Array,
         rope: &MochiRope,
-        enc_mask: &Array,
+        joint_mask: &Array,
     ) -> Result<(Array, Option<Array>)> {
         let sv = visual.shape()[1];
         let st = text.shape()[1];
@@ -434,10 +435,8 @@ impl MochiAttention {
         let full_k = concatenate_axis(&[&t(&k)?, &t(&ek)?], 2)?;
         let full_v = concatenate_axis(&[&t(&v)?, &t(&ev)?], 2)?;
 
-        // Additive key-padding mask [B, 1, 1, Sv+St]: 0 for visual + valid text, −inf for padded text.
-        let mask = build_joint_mask(enc_mask, sv, cd)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let out = scaled_dot_product_attention(&full_q, &full_k, &full_v, scale, &mask, None)?;
+        let out = scaled_dot_product_attention(&full_q, &full_k, &full_v, scale, joint_mask, None)?;
 
         // → [B, Sv+St, inner]; split back to visual / text.
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
@@ -467,8 +466,8 @@ impl MochiAttention {
 ///
 /// Built **on-device** (no host `as_slice` round-trip): the text-key additive term is `log(enc_mask)`,
 /// which maps `1 → 0` and `0 → −∞` exactly (bit-identical additive mask to the old host loop), and the
-/// visual keys are a zero pad. Called per attention block, so keeping it lazy/on-device avoids a
-/// per-block pipeline stall.
+/// visual keys are a zero pad. Called once per transformer forward, then shared by every attention
+/// block at the model's compute dtype.
 fn build_joint_mask(enc_mask: &Array, num_visual: i32, cd: Dtype) -> Result<Array> {
     let sh = enc_mask.shape();
     if sh.len() != 2 {
@@ -571,14 +570,14 @@ impl MochiTransformerBlock {
     }
 
     /// Forward the block. `hidden [B, Sv, inner]`, `enc [B, St, pooled]`, `temb [B, inner]`,
-    /// `enc_mask [B, St]`. Returns the updated `(hidden, enc)`.
+    /// `joint_mask [B, 1, 1, Sv+St]`. Returns the updated `(hidden, enc)`.
     pub fn forward(
         &self,
         hidden: &Array,
         enc: &Array,
         temb: &Array,
         rope: &MochiRope,
-        enc_mask: &Array,
+        joint_mask: &Array,
     ) -> Result<(Array, Array)> {
         let eps = self.eps;
         let silu_temb = silu(&temb.as_dtype(Dtype::Float32)?)?;
@@ -619,7 +618,7 @@ impl MochiTransformerBlock {
         };
 
         // Joint attention.
-        let (attn_h, attn_e) = self.attn.forward(&norm_h, &norm_e, rope, enc_mask)?;
+        let (attn_h, attn_e) = self.attn.forward(&norm_h, &norm_e, rope, joint_mask)?;
 
         // Visual residuals: tanh-gated attn (norm2), SwiGLU FFN with (1+scale_mlp) mod (norm3),
         // tanh-gated ff (norm4).
@@ -893,9 +892,12 @@ impl MochiTransformer3DModel {
 
         // Learned 3-D RoPE over the post-patch grid.
         let rope = MochiRope::new(&self.pos_frequencies, f as usize, ph as usize, pw as usize)?;
+        // Geometry and text validity are constant across all blocks, so build the additive
+        // key-padding mask once per transformer forward.
+        let joint_mask = build_joint_mask(enc_mask, hs.shape()[1], cd)?;
 
         for block in &self.blocks {
-            let (h_new, e_new) = block.forward(&hs, &enc_stream, &temb, &rope, enc_mask)?;
+            let (h_new, e_new) = block.forward(&hs, &enc_stream, &temb, &rope, &joint_mask)?;
             hs = h_new;
             enc_stream = e_new;
         }
@@ -1087,18 +1089,19 @@ mod tests {
         let enc = rnd(&[1, 3, 8], 101);
         let temb = rnd(&[1, 16], 102);
         let enc_mask = Array::from_slice(&[1.0f32, 1.0, 0.0], &[1, 3]);
+        let joint_mask = build_joint_mask(&enc_mask, 4, Dtype::Float32).unwrap();
         let pf = rnd(&[3, 2, 4], 103); // [3, heads, head_dim/2]
         let rope = MochiRope::new(&pf, 1, 2, 2).unwrap();
 
         let (h1, e1) = block
-            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .forward(&hidden, &enc, &temb, &rope, &joint_mask)
             .unwrap();
         assert_eq!(h1.shape(), &[1, 4, 16]);
         assert_eq!(e1.shape(), &[1, 3, 8]);
 
         // Determinism.
         let (h2, e2) = block
-            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .forward(&hidden, &enc, &temb, &rope, &joint_mask)
             .unwrap();
         let close = |a: &Array, b: &Array| {
             mlx_rs::ops::max(mlx_rs::ops::abs(subtract(a, b).unwrap()).unwrap(), None)
@@ -1305,10 +1308,11 @@ mod tests {
         let enc = rnd(&[1, 3, 8], 101);
         let temb = rnd(&[1, 16], 102);
         let enc_mask = Array::from_slice(&[1.0f32, 1.0, 0.0], &[1, 3]);
+        let joint_mask = build_joint_mask(&enc_mask, 4, Dtype::Float32).unwrap();
         let pf = rnd(&[3, 2, 4], 103);
         let rope = MochiRope::new(&pf, 1, 2, 2).unwrap();
         let (h, e) = block
-            .forward(&hidden, &enc, &temb, &rope, &enc_mask)
+            .forward(&hidden, &enc, &temb, &rope, &joint_mask)
             .unwrap();
         assert_eq!(h.shape(), &[1, 4, 16]);
         // enc is bit-identical to the input (no context update on the final block).
