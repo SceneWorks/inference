@@ -283,6 +283,12 @@ impl PulidFlux {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // Self-validate first, like every sibling generate_impl (chroma/svd/ideogram) — against
+        // PuLID's OWN descriptor floor (F-026), so a caller that skips `validate` still gets the
+        // typed `Unsupported` (e.g. `sampler: "hyper"`, which PuLID deliberately doesn't advertise
+        // because it never loads the dev Hyper-FLUX LoRA) instead of a silently degraded render
+        // (F-011). The `?` bridges `gen_core::Error` → `Error` with `Unsupported` kept typed.
+        self.validate(req)?;
         // F-108: the identity stack (face analysis + EVA tower + IDFormer + CA build + the backbone
         // T5/CLIP encodes) is the priciest pre-denoise work and previously ran with zero cancel
         // checks. Bail up front, and `compute_id_embedding` checks between its own stages.
@@ -587,6 +593,46 @@ mod tests {
             caps.validate_request(descriptor().id, &ok).is_ok(),
             "curated sampler + real-CFG should pass PuLID's floor"
         );
+    }
+
+    /// F-011 (sc-12463): `generate_impl` now self-validates first (`self.validate(req)?`, sibling
+    /// convention — chroma/svd/ideogram), so a caller that invokes `generate` WITHOUT a prior
+    /// `validate` gets the typed `Unsupported` for a `hyper` request instead of a silently degraded
+    /// render (the FLUX-dev backbone would happily render WITHOUT the Hyper-FLUX LoRA PuLID never
+    /// loads). A weight-free `generate()` call is not constructible here — unlike Chroma's
+    /// closure-based `Residency` weightless test instance, `PulidFlux` holds materialized sub-models
+    /// (Flux1 + EVA tower + IdFormer + FaceAnalysis) — so this mirrors the descriptor-floor setup
+    /// above and asserts the exact check-and-bridge sequence `generate_impl` performs: on an
+    /// otherwise generate-able request (valid reference face attached), the floor rejects `hyper`,
+    /// and the rejection stays a typed `Unsupported` through the `gen_core::Error → Error` lift that
+    /// `generate_impl`'s `?` applies and the `Into` bridge `generate` returns through.
+    #[test]
+    fn generate_path_hyper_rejection_stays_typed_unsupported() {
+        let desc = descriptor();
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 1024,
+            height: 1024,
+            sampler: Some("hyper".into()),
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        // The reference-face half of `validate` accepts this request, so the sampler floor is the
+        // ONLY thing `validate` rejects — `generate` now fails fast on exactly that, before any
+        // weights are touched.
+        assert!(select_reference_face(&req.conditioning).is_ok());
+        // The floor half — the first check `validate` composes — rejects `hyper`, typed.
+        let floor = desc.capabilities.validate_request(desc.id, &req).unwrap_err();
+        assert!(matches!(floor, gen_core::Error::Unsupported(_)), "got: {floor:?}");
+        // `generate_impl`'s `?` lifts the gen_core error into the crate error…
+        let lifted: Error = floor.into();
+        assert!(matches!(lifted, Error::Unsupported(_)), "got: {lifted:?}");
+        // …and the `generate` trait wrapper bridges the tail back — still typed `Unsupported`.
+        let back: gen_core::Error = lifted.into();
+        assert!(matches!(back, gen_core::Error::Unsupported(_)), "got: {back:?}");
     }
 
     /// Two reference faces are rejected, and an empty request is rejected as missing.
