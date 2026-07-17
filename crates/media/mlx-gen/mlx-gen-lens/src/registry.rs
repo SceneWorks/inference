@@ -189,7 +189,16 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
 /// eager-load and fail the "Sequential defers" unit test.
 pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<LensText, LensHeavyOwned>> {
     // Up-front fail-fast for both policies (mirrors the pre-seam load order).
-    resolve_root(spec)?;
+    let (root, _) = resolve_root(spec)?;
+    // F-010 (sc-12462): fail-fast requested-vs-packed tier guard for BOTH policies — `Sequential`
+    // defers the phase loaders to the first generate, so without this an e.g. Q4 request over a Q8
+    // turnkey would only surface mid-job (Resident re-checks inside the phase loaders below). Both
+    // quantized components carry the converter's marker; check both so a half-converted snapshot
+    // still errors.
+    if let Some(q) = spec.quantize {
+        crate::quant::needs_load_time_quant(&root, "text_encoder", q.bits(), "lens")?;
+        crate::quant::needs_load_time_quant(&root, "transformer", q.bits(), "lens")?;
+    }
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
     Residency::from_policy(
@@ -232,6 +241,14 @@ fn resolve_root(spec: &LoadSpec) -> Result<(std::path::PathBuf, Dtype)> {
 /// Load the text-encode phase — the gpt-oss encoder dropped first under `Sequential`. `spec.quantize`
 /// quantizes the encoder's MoE experts at load (sc-3172).
 fn load_text_phase(spec: &LoadSpec, root: &Path, dtype: Dtype) -> Result<LensText> {
+    // F-010 (sc-12462): reject a requested-vs-packed tier mismatch BEFORE any weights load — a
+    // packed turnkey's experts build `ExpertBank::Quant` from the on-disk shapes, so e.g. a Q4
+    // request over a Q8 turnkey would otherwise silently serve Q8. The returned bool is unused:
+    // `from_weights_quant` auto-detects packed vs dense itself ("lens" — the snapshot tree is
+    // shared by both registry ids).
+    if let Some(q) = spec.quantize {
+        crate::quant::needs_load_time_quant(root, "text_encoder", q.bits(), "lens")?;
+    }
     LensText::load(root, dtype, spec.quantize)
 }
 
@@ -245,12 +262,23 @@ fn load_heavy_phase(
     dtype: Dtype,
     load_pid: bool,
 ) -> Result<LensHeavyOwned> {
+    // F-010 (sc-12462): reject a requested-vs-packed tier mismatch BEFORE any weights load — the
+    // DiT projections load packed via `quant::lin` (a Quantized base on which
+    // `AdaptableLinear::quantize` no-ops), so e.g. a Q4 request over a Q8 turnkey would otherwise
+    // silently serve Q8. `false` (already packed at the requested bits) also skips the no-op
+    // `quantize_dit` below.
+    let needs_quant = match spec.quantize {
+        Some(q) => crate::quant::needs_load_time_quant(root, "transformer", q.bits(), "lens")?,
+        None => false,
+    };
     let mut heavy = LensHeavy::load(root, dtype)?;
     if !spec.adapters.is_empty() {
         heavy.apply_adapters(&spec.adapters)?;
     }
     if let Some(q) = spec.quantize {
-        heavy.quantize_dit(q)?;
+        if needs_quant {
+            heavy.quantize_dit(q)?;
+        }
     }
     // PiD decoder overlay (epic 7840, sc-7847): load the shared `flux2` student + Gemma once when the
     // spec carries it AND this generate uses it (`load_pid`, F-177) — Resident passes `true` (loaded
@@ -732,6 +760,131 @@ mod tests {
             "/nonexistent/lens-residency-test-snapshot".into(),
         ))
         .with_offload_policy(policy)
+    }
+
+    // ── F-010 (sc-12462): requested-vs-packed quant-tier guard. Lens ships pre-quantized packed
+    // turnkeys (sc-8763) whose converter writes the `"quantization": {"bits"}` marker into BOTH
+    // quantized component dirs (`transformer/`, `text_encoder/`); the packed load paths infer bits
+    // from the on-disk shapes and the load-time `quantize` no-ops, so a Q4 request over a Q8
+    // turnkey would silently serve Q8 in both components, on both policies. Weight-free fixtures:
+    // only the component `config.json` markers are written.
+
+    /// Temp snapshot root with a Q8 marker in each of `components` (others absent = dense).
+    fn tier_fixture(components: &[&str], bits: i32) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "lens-registry-tier-{}-{}-{:?}",
+            components.join("-"),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        for c in components {
+            let dir = root.join(c);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.json"),
+                format!(r#"{{"quantization": {{"bits": {bits}, "group_size": 64}}}}"#),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn q4_spec(root: &std::path::Path, policy: mlx_gen::OffloadPolicy) -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.into()));
+        spec.quantize = Some(Quant::Q4);
+        spec.with_offload_policy(policy)
+    }
+
+    /// Q4-over-Q8 must hard-error for the **DiT**: `load_heavy_phase` checks the `transformer/`
+    /// marker BEFORE any weights load (the projections would otherwise load packed Q8 and
+    /// `quantize_dit` no-op).
+    #[test]
+    fn heavy_phase_rejects_q4_over_q8_turnkey() {
+        let root = tier_fixture(&["transformer"], 8);
+        let spec = q4_spec(&root, mlx_gen::OffloadPolicy::Resident);
+        let err = load_heavy_phase(&spec, &root, Dtype::Bfloat16, false)
+            .err()
+            .expect("Q4 over a packed Q8 DiT must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pre-quantized Q8") && msg.contains("transformer"),
+            "expected the DiT tier-mismatch error, got: {msg}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Q4-over-Q8 must hard-error for the **gpt-oss encoder**: `load_text_phase` checks the
+    /// `text_encoder/` marker BEFORE any weights load (`from_weights_quant` would otherwise build
+    /// `ExpertBank::Quant` at the on-disk Q8, never consulting the request).
+    #[test]
+    fn text_phase_rejects_q4_over_q8_turnkey() {
+        let root = tier_fixture(&["text_encoder"], 8);
+        let spec = q4_spec(&root, mlx_gen::OffloadPolicy::Resident);
+        let err = load_text_phase(&spec, &root, Dtype::Bfloat16)
+            .err()
+            .expect("Q4 over a packed Q8 encoder must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pre-quantized Q8") && msg.contains("text_encoder"),
+            "expected the encoder tier-mismatch error, got: {msg}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The guard covers BOTH registry ids end-to-end: a `lens` / `lens_turbo` load of a Q8 turnkey
+    /// with Q4 requested fails with the tier-mismatch error (not a missing-weights error).
+    #[test]
+    fn both_ids_reject_q4_over_q8_turnkey() {
+        for id in [MODEL_ID_TURBO, MODEL_ID_BASE] {
+            let root = tier_fixture(&["transformer", "text_encoder"], 8);
+            let spec = q4_spec(&root, mlx_gen::OffloadPolicy::Resident);
+            let err = match crate::provider_registry().unwrap().load(id, &spec) {
+                Ok(_) => panic!("{id}: Q4 over a packed Q8 turnkey must fail to load"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("pre-quantized Q8"),
+                "{id}: expected the tier-mismatch error, got: {err}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// `Sequential` defers the phase loaders to the first generate, so the mismatch must be caught
+    /// by the up-front `build_residency` check — at LOAD time, not mid-job.
+    #[test]
+    fn sequential_fails_fast_on_tier_mismatch() {
+        let root = tier_fixture(&["transformer", "text_encoder"], 8);
+        let err = build_residency(&q4_spec(&root, mlx_gen::OffloadPolicy::Sequential))
+            .err()
+            .expect("Sequential must fail-fast on a tier mismatch at load, not at first generate");
+        assert!(
+            err.to_string().contains("pre-quantized Q8"),
+            "got: {err}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Pinned per sibling semantics: a matching request (Q8 over a Q8 turnkey) and a no-quantize
+    /// request over a packed turnkey both pass the guard (the turnkey loads packed at its shipped
+    /// tier). Weight-free via `Sequential`, which runs only the up-front checks.
+    #[test]
+    fn matching_or_absent_request_passes_the_guard() {
+        // Q8 over Q8: no tier error (build succeeds — Sequential touches no weights).
+        let root = tier_fixture(&["transformer", "text_encoder"], 8);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        spec.quantize = Some(Quant::Q8);
+        build_residency(&spec).expect("Q8 over a packed Q8 turnkey must pass the tier guard");
+
+        // No quantize requested over a packed turnkey: guard not consulted, load proceeds.
+        spec.quantize = None;
+        build_residency(&spec)
+            .expect("a packed turnkey with no quantize requested must load at its shipped tier");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
