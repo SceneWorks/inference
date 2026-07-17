@@ -30,7 +30,7 @@ pub use convert::{
     convert_and_assemble, quantize_transformer_map, stage_shared_components, MochiConvertOpts,
     MOCHI_QUANT_SUFFIXES,
 };
-pub use model::{descriptor, load, Mochi, MODEL_ID};
+pub use model::{descriptor, load, Mochi, MODEL_ID, SIZE_MULTIPLE};
 pub use pipeline::{decode_to_frames, denoise, frames_to_images};
 pub use positions::get_positions;
 pub use rope::MochiRope;

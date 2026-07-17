@@ -62,8 +62,10 @@ pub const DIT_DTYPE: DType = DType::BF16;
 /// The AsymmVAE compute dtype (the decoder is numerically f32-only — bf16 intermediates reach O(100)).
 pub const VAE_DTYPE: DType = DType::F32;
 
-/// Width/height must be divisible by 16 (VAE 8× spatial × DiT patch 2).
-const SIZE_MULTIPLE: u32 = 16;
+/// Width/height must be divisible by 16 (VAE 8× spatial × DiT patch 2). Exposed as the pinned-engine
+/// stride SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors mlx's
+/// `mlx_gen_mochi::SIZE_MULTIPLE` and `wan::config::SIZE_MULTIPLE_14B`.
+pub const SIZE_MULTIPLE: u32 = 16;
 /// The AsymmVAE temporal ratio: a valid clip length is `1 + 6·k`.
 const TEMPORAL_RATIO: u32 = 6;
 
@@ -103,7 +105,7 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: Vec::new(),
             schedulers: Vec::new(),
             supported_guidance_methods: Vec::new(),
-            // Width/height must be divisible by 16 (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
+            // Width/height must be divisible by SIZE_MULTIPLE (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
             min_size: SIZE_MULTIPLE,
             max_size: 1280,
             max_count: 1,
@@ -307,5 +309,29 @@ mod explicit_registry_tests {
         assert_eq!(c.max_count, 1);
         assert!(c.conditioning.is_empty(), "t2v-only: no conditioning kinds");
         assert!(c.supported_quants.is_empty(), "no on-the-fly requant");
+    }
+
+    #[test]
+    fn stride_is_the_pinned_size_multiple() {
+        // sc-12587: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties `requiresDimensionsMultipleOf`
+        // to. Pin the value and prove a multiple of 8 that is not a multiple of SIZE_MULTIPLE (16) is
+        // rejected with the stride error — matching mlx's `mlx_gen_mochi::SIZE_MULTIPLE`.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = provider_registry().unwrap().load(MODEL_ID, &spec).unwrap();
+        let base = GenerationRequest {
+            prompt: "a calico kitten".into(),
+            width: 64,
+            height: 64,
+            frames: Some(7),
+            ..Default::default()
+        };
+        assert!(g.validate(&base).is_ok());
+        let off = GenerationRequest {
+            width: 72, // 9×8 — a multiple of 8 but not SIZE_MULTIPLE
+            ..base.clone()
+        };
+        let err = g.validate(&off).unwrap_err().to_string();
+        assert!(err.contains("divisible by 16"), "got: {err}");
     }
 }

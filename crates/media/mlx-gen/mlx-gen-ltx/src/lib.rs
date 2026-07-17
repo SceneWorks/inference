@@ -61,7 +61,7 @@ pub use config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use convert::{convert_and_assemble, LtxConvertOpts};
 pub use enhance::{clean_response, EnhanceConfig, SampleParams};
-pub use model::{apply_replacement_mask, descriptor, load, Ltx, MODEL_ID};
+pub use model::{apply_replacement_mask, descriptor, load, Ltx, MODEL_ID, SIZE_MULTIPLE};
 pub use pipeline::{
     decode_audio_track, decode_to_frames, denoise, denoise_av, denoise_av_tokens,
     generate_av_latents, generate_av_latents_iclora, generate_i2v_latents, generate_t2v,
