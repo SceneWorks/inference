@@ -38,7 +38,7 @@ use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skip
 use crate::config::{WanModelConfig, WanVaceConfig};
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, preprocess_i2v_image,
-    resolve_sampler_knobs,
+    reject_over_area, resolve_sampler_knobs,
 };
 use crate::scheduler::SolverKind;
 use crate::text_encoder::encode_text_staged;
@@ -104,7 +104,9 @@ fn vace_prep(
     let clip = req.control_clip().expect("validated present");
 
     // --- Resolve knobs ---
-    // VACE aligns to patch · VAE_S with no max-area cap (the dense paths' `resolve_capped_dims`).
+    // VACE aligns to patch · VAE_S, matching the dense paths' `resolve_capped_dims`. The max-area
+    // cap is enforced (by rejection) in `validate_vace_clip`, so the alignment here only rounds down
+    // and cannot push a validated request back over budget (sc-12308).
     let width = align_dim(req.width, base.patch_size.2, VAE_S);
     let height = align_dim(req.height, base.patch_size.1, VAE_S);
     let (steps, shift, kind, seed) =
@@ -353,7 +355,7 @@ fn preprocess_clip(frames: &[Image], width: u32, height: u32) -> Result<Array> {
 // F-072: `WanVace`'s validate body was byte-identical to the documented-shared `validate_vace_clip`
 // (with `id = MODEL_ID_VACE`), which the dual-expert `WanVaceFun` already uses — so point both at it.
 mlx_gen::impl_generator!(WanVace {
-    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE, req),
+    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE, &s.config, req),
     generate: generate_impl,
 });
 
@@ -529,7 +531,7 @@ pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 // Identical control-clip contract as single-expert VACE.
 mlx_gen::impl_generator!(WanVaceFun {
-    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE_FUN, req),
+    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE_FUN, &s.config, req),
     generate: generate_impl,
 });
 
@@ -640,9 +642,15 @@ fn load_vace_fun_expert_weights(root: &std::path::Path, expert: MoeExpert) -> Re
 fn validate_vace_clip(
     descriptor: &ModelDescriptor,
     id: &'static str,
+    config: &WanVaceConfig,
     req: &GenerationRequest,
 ) -> Result<()> {
     descriptor.capabilities.validate_request(id, req)?;
+    // sc-12308: the VACE lanes had NO area cap on mlx while candle hard-errored on the same request
+    // — the widest of the three backend behaviours. Wan2.1's `vace-14B` shares the 14B family's
+    // `1280*720` budget, and VACE aligns to `patch · VAE_S` = 16 like the rest of the family.
+    let grid = (config.base.patch_size.2 * VAE_S) as u32;
+    reject_over_area(id, req, grid, grid, config.base.max_area)?;
     let clip = req.control_clip().ok_or_else(|| {
         Error::Msg(format!(
             "{id}: needs a ControlClip (the masked control video — the worker builds it per mode: \

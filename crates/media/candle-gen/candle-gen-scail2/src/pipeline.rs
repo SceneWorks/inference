@@ -294,7 +294,7 @@ fn reject_over_area(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
     if area > MAX_AREA_14B {
         return Err(gen_core::Error::Msg(format!(
             "{id}: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
-             (704×1280); reduce the resolution",
+             (1280×720); reduce the resolution",
             req.width, req.height
         )));
     }
@@ -502,7 +502,7 @@ mod tests {
         // A far-over-envelope request (1280×1280, both edges ≤ `max_size` so `max_size` alone lets it
         // through) must be a fast, actionable rejection — NOT minutes of the f32 14B DiT running to an
         // opaque CUDA OOM (F-090 / sc-11215, mirroring the A14B MoE lane's sc-9028 guard).
-        assert_eq!(704 * 1280, MAX_AREA_14B);
+        assert_eq!(1280 * 720, MAX_AREA_14B);
         let over = GenerationRequest {
             prompt: "a character".into(),
             width: 1280,
@@ -512,10 +512,13 @@ mod tests {
         let err = reject_over_area(MODEL_ID, &over).expect_err("over-area must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("max area"), "message names the cap: {msg}");
-        // Exactly at the cap (1280×704 = 901 120 px) and a small in-bounds request both pass the guard.
+        // Exactly at the cap (1280×720 = 921 600 px) and a small in-bounds request both pass the
+        // guard. SCAIL-2 is a Wan2.1-14B I2V derivative on the z16 VAE (grid 16), so 720 is
+        // on-lattice and the canonical 720p must pass — it did not while this cap carried the
+        // TI2V-5B's 901 120 (sc-12308).
         let at_cap = GenerationRequest {
             width: 1280,
-            height: 704,
+            height: 720,
             ..over.clone()
         };
         assert!(reject_over_area(MODEL_ID, &at_cap).is_ok());
