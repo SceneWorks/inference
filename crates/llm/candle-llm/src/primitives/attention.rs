@@ -8,7 +8,10 @@
 //! crate), so [`sdpa`] is the eager path — `softmax(scale · QKᵀ + mask) · V` — with the causal mask
 //! built explicitly. The mask aligns the `q_len` queries to the bottom-right of the `k_len` cached
 //! keys (query row `r` attends keys `0..=offset+r`, where `offset = k_len - q_len`), so cached decode
-//! is correct without threading an offset through every call.
+//! is correct without threading an offset through every call. The mask is cheap to *ask* for but not
+//! to build (host vec fill + upload), so the eager path skips it entirely for the all-zeros decode
+//! shape (`q_len == 1`) and memoizes the prefill mask per `(q_len, k_len, dtype, device)` — one build
+//! per forward instead of one per decoder layer (sc-12458).
 //!
 //! With the `flash-attn` feature, [`sdpa`] first tries the fused FlashAttention-2 kernel
 //! (`candle_flash_attn::flash_attn`) for the dense causal/bidirectional path and falls back to the
@@ -26,6 +29,8 @@
 //! sequences — no padding mask, no per-sequence launch — packed via cumulative `cu_seqlens` offsets.
 //! It is grouped-query-native (K/V passed un-expanded) and bottom-right causal; the eager per-sequence
 //! loop stays the fallback for the cases varlen cannot serve (soft-cap, f32/CPU, no `flash-attn`).
+
+use std::sync::Mutex;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::softmax_last_dim;
@@ -65,6 +70,8 @@ pub fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 /// Build the additive causal mask `[1, 1, q_len, k_len]` (`0` keep / [`MASK_NEG`] block) for keys
 /// that include `offset = k_len - q_len` cached positions before the new queries.
 fn causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+    #[cfg(test)]
+    CAUSAL_MASK_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let offset = k_len - q_len;
     let mut data = vec![0f32; q_len * k_len];
     for r in 0..q_len {
@@ -75,6 +82,49 @@ fn causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device) -> Res
         }
     }
     Ok(Tensor::from_vec(data, (1, 1, q_len, k_len), device)?.to_dtype(dtype)?)
+}
+
+/// Number of host-side [`causal_mask`] builds — lets tests pin "decode builds no mask" and "prefill
+/// builds the mask once per forward, not once per layer" (sc-12458).
+#[cfg(test)]
+static CAUSAL_MASK_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The one memoized causal mask (sc-12458). Every decoder layer of a forward asks [`sdpa_eager`] for
+/// the identical `AttnMask::Causal` mask, so without memoization the host-side vec fill + upload in
+/// [`causal_mask`] ran once **per layer** per forward. A single entry suffices: within one forward
+/// the key `(q_len, k_len, dtype, device)` is constant across layers (it changes at most at a shard
+/// boundary on a multi-device model), so a prefill builds the mask once and every later layer clones
+/// the cached handle. Decode steps (`q_len == 1`) never reach this — see [`sdpa_eager`].
+struct CausalMaskEntry {
+    q_len: usize,
+    k_len: usize,
+    dtype: DType,
+    device: Device,
+    mask: Tensor,
+}
+
+static CAUSAL_MASK_CACHE: Mutex<Option<CausalMaskEntry>> = Mutex::new(None);
+
+/// [`causal_mask`] behind the single-entry memo: returns the cached tensor when the key matches,
+/// else builds (bit-identical values — same builder) and replaces the entry.
+fn cached_causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+    let mut guard = CAUSAL_MASK_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(e) = guard.as_ref() {
+        if e.q_len == q_len && e.k_len == k_len && e.dtype == dtype && e.device.same_device(device) {
+            return Ok(e.mask.clone());
+        }
+    }
+    let mask = causal_mask(q_len, k_len, dtype, device)?;
+    *guard = Some(CausalMaskEntry {
+        q_len,
+        k_len,
+        dtype,
+        device: device.clone(),
+        mask: mask.clone(),
+    });
+    Ok(mask)
 }
 
 /// Eager scaled-dot-product attention over `[batch, heads, seq, head_dim]` tensors.
@@ -119,8 +169,13 @@ fn sdpa_eager(
     }
     let scores = match mask {
         AttnMask::None => scores,
+        // A single-query bottom-right-aligned causal mask is provably all zeros (its one row `r = 0`
+        // blocks `j > (k_len - 1) + 0`, unsatisfiable for `j < k_len`), so the decode step skips the
+        // mask build entirely — no host allocation, no upload, no broadcast_add of zeros (sc-12458).
+        // Softmax is invariant to adding exact zeros, so this is bit-identical to the masked path.
+        AttnMask::Causal if q_len == 1 => scores,
         AttnMask::Causal => {
-            let m = causal_mask(q_len, k_len, scores.dtype(), scores.device())?;
+            let m = cached_causal_mask(q_len, k_len, scores.dtype(), scores.device())?;
             scores.broadcast_add(&m)?
         }
         AttnMask::Additive(a) => scores.broadcast_add(a)?,
@@ -286,6 +341,107 @@ mod tests {
         let q = arange4(1, 1, 2, 4);
         let out = sdpa_causal(&q, &q, &q, 0.5).unwrap();
         assert_eq!(out.dims(), &[1, 1, 2, 4]);
+    }
+
+    /// Reset the sc-12458 memo + build counter so a test observes only its own builds. Tests run
+    /// single-threaded here (`RUST_TEST_THREADS=1` is forced), so this is race-free.
+    fn reset_mask_accounting() {
+        *CAUSAL_MASK_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        CAUSAL_MASK_BUILDS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn mask_builds() -> usize {
+        CAUSAL_MASK_BUILDS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Bounded, varied f32 CPU tensor (cos keeps values in [-1, 1] so the softmax is well-behaved).
+    fn varied4(b: usize, h: usize, s: usize, d: usize, phase: f64) -> Tensor {
+        let n = (b * h * s * d) as f32;
+        Tensor::arange(0f32, n, &Device::Cpu)
+            .unwrap()
+            .reshape((b, h, s, d))
+            .unwrap()
+            .affine(0.013, phase)
+            .unwrap()
+            .cos()
+            .unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// sc-12458: the decode shape (`q_len == 1`, bottom-right causal) must build **no** mask — and be
+    /// bit-identical to the old always-mask path (the mask it skips is provably all zeros).
+    #[test]
+    fn decode_step_builds_no_mask_and_matches_masked_path() {
+        let (b, h, s, d) = (2, 3, 1, 4);
+        let k_len = 9;
+        let q = varied4(b, h, s, d, 0.0);
+        let k = varied4(b, h, k_len, d, 1.7);
+        let v = varied4(b, h, k_len, d, 3.1);
+
+        reset_mask_accounting();
+        let got = sdpa_eager(&q, &k, &v, 0.5, None, AttnMask::Causal).unwrap();
+        assert_eq!(mask_builds(), 0, "decode step must not build a causal mask");
+
+        // Old path: the explicitly built mask, applied via the untouched Additive branch.
+        let m = causal_mask(s, k_len, DType::F32, &Device::Cpu).unwrap();
+        let want = sdpa_eager(&q, &k, &v, 0.5, None, AttnMask::Additive(&m)).unwrap();
+        assert_eq!(bits(&got), bits(&want), "decode skip must be bit-identical");
+    }
+
+    /// sc-12458: repeated same-shape causal SDPA calls (the per-layer loop of one prefill forward)
+    /// build the mask **once**, and every call is bit-identical to the explicitly masked path.
+    #[test]
+    fn prefill_builds_mask_once_across_layers() {
+        let (b, h, q_len, d) = (1, 2, 5, 4);
+        let k_len = 8; // chunked/continuation prefill: cached positions ahead of the new queries
+        let q = varied4(b, h, q_len, d, 0.4);
+        let k = varied4(b, h, k_len, d, 2.2);
+        let v = varied4(b, h, k_len, d, 4.9);
+
+        let m = causal_mask(q_len, k_len, DType::F32, &Device::Cpu).unwrap();
+        let want = bits(&sdpa_eager(&q, &k, &v, 0.5, None, AttnMask::Additive(&m)).unwrap());
+
+        reset_mask_accounting();
+        for layer in 0..4 {
+            let got = sdpa_eager(&q, &k, &v, 0.5, None, AttnMask::Causal).unwrap();
+            assert_eq!(bits(&got), want, "layer {layer} must match the masked path");
+        }
+        assert_eq!(mask_builds(), 1, "one mask build for the whole forward");
+    }
+
+    /// sc-12458: a different `(q_len, k_len)` (e.g. the next request's prefill, or a speculative
+    /// `q_len > 1` continuation at a moved offset) must rebuild rather than reuse a stale mask.
+    #[test]
+    fn cached_mask_rebuilds_on_shape_change() {
+        reset_mask_accounting();
+        let a = cached_causal_mask(3, 3, DType::F32, &Device::Cpu).unwrap();
+        let _ = cached_causal_mask(3, 3, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(mask_builds(), 1, "same key is served from the memo");
+
+        let b = cached_causal_mask(3, 7, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(mask_builds(), 2, "new key must rebuild");
+        assert_eq!(a.dims(), &[1, 1, 3, 3]);
+        assert_eq!(b.dims(), &[1, 1, 3, 7]);
+        // And the rebuilt mask carries the correct bottom-right alignment (offset = 4).
+        let rows = b.reshape((3, 7)).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(rows[0][4], 0.0); // j == offset + r: attended
+        assert_eq!(rows[0][5], MASK_NEG); // j > offset + r: blocked
+        assert_eq!(rows[2][6], 0.0); // last row attends everything
+
+        let c = cached_causal_mask(3, 7, DType::F16, &Device::Cpu).unwrap();
+        assert_eq!(mask_builds(), 3, "dtype is part of the key");
+        assert_eq!(c.dtype(), DType::F16);
     }
 
     #[test]
