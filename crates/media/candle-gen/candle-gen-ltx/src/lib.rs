@@ -62,7 +62,11 @@ use vocoder::LtxVocoder;
 
 const DIT_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
-const SIZE_MULTIPLE: u32 = config::SPATIAL_SCALE as u32;
+/// The request width/height multiple `validate` enforces (= `config::SPATIAL_SCALE` = 32): candle's
+/// single-stage `ltx_2_3_distilled` renders on the 32× VAE grid. Exposed as the pinned-engine stride
+/// SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors `wan::config::SIZE_MULTIPLE_14B`.
+/// Divergent by backend on purpose: mlx's two-stage `ltx_2_3` uses `SIZE_MULTIPLE = 2×SPATIAL_SCALE` (= 64).
+pub const SIZE_MULTIPLE: u32 = config::SPATIAL_SCALE as u32;
 
 #[derive(Clone)]
 struct Components {
@@ -822,6 +826,22 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+        // sc-12587: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties `requiresDimensionsMultipleOf`
+        // to — candle's distilled ltx renders single-stage on the 32× VAE grid. Pin the value and prove
+        // a multiple of 16 that is not a multiple of SIZE_MULTIPLE is rejected with the stride error.
+        assert_eq!(SIZE_MULTIPLE, config::SPATIAL_SCALE as u32);
+        assert_eq!(SIZE_MULTIPLE, 32);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                width: 48, // 3×16 — a multiple of 16 but not SIZE_MULTIPLE
+                ..ok.clone()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 32"),
+            "expected the stride error, got: {off_stride}"
+        );
     }
 
     /// sc-9027 / F-043: the distilled schedule is fixed, so `render` runs exactly `NATIVE_STEPS`

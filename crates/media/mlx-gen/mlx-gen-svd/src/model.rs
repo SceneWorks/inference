@@ -45,7 +45,7 @@ const CLIP_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
 const CLIP_SIZE: usize = 224;
 /// VAE spatial compression (8×).
-const VAE_SCALE: u32 = 8;
+pub const VAE_SCALE: u32 = 8;
 /// Upper bound on a `Reference` image's dimensions. The reference is resized to the output size, but
 /// the source buffer (and the resize's intermediate f32 work) scale with the *input* dims, so an
 /// unbounded reference drives multi-GB host allocations (F-164). 8192 is far above any real photo
@@ -53,8 +53,10 @@ const VAE_SCALE: u32 = 8;
 const MAX_REFERENCE_DIM: u32 = 8192;
 /// Output `width`/`height` must be divisible by this: VAE 8× spatial compression then the UNet's 3
 /// stride-2 downsamples / nearest-2× upsamples (another 8×). An unaligned size fails deep in
-/// `UpBlock::forward` on a skip-concat shape mismatch instead of at validation (F-165).
-const SIZE_ALIGN: u32 = VAE_SCALE * 8;
+/// `UpBlock::forward` on a skip-concat shape mismatch instead of at validation (F-165). Exposed as
+/// the pinned-engine stride SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors
+/// candle's `candle_gen_svd::config::SIZE_ALIGN` (same `= 64` on both backends).
+pub const SIZE_ALIGN: u32 = VAE_SCALE * 8;
 /// Upper bound on requested output `frames`. SVD-XT is the 25-frame variant; the per-frame latents +
 /// `added_time_ids` scale linearly, so an unbounded count drives a giant allocation. 64 leaves
 /// generous headroom over the default without letting the request balloon memory.
@@ -170,7 +172,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// (size alignment + the allocation/compute knob bounds) — F-165. Pulled out so it is unit-testable
 /// without a loaded model.
 fn validate_output_params(req: &GenerationRequest) -> Result<()> {
-    // The SVD UNet needs `width`/`height` divisible by 64; an unaligned size fails deep in
+    // The SVD UNet needs `width`/`height` divisible by `SIZE_ALIGN`; an unaligned size fails deep in
     // `UpBlock::forward` on a skip-concat shape mismatch mid-denoise instead of at validation.
     if !req.width.is_multiple_of(SIZE_ALIGN) || !req.height.is_multiple_of(SIZE_ALIGN) {
         return Err(Error::Msg(format!(
@@ -569,6 +571,16 @@ mod tests {
             .to_string();
         assert!(err.contains("multiple of 64"), "got: {err}");
         assert!(validate_output_params(&req(704, 700, None, None)).is_err()); // height unaligned
+
+        // The stride is `SIZE_ALIGN` (VAE 8× × UNet 8× = 64), NOT the bare VAE scale: a multiple of
+        // 32 that is not a multiple of SIZE_ALIGN is still rejected. Pin the value SceneWorks ties
+        // `requiresDimensionsMultipleOf` to (sc-12587) and mutation-check it.
+        assert_eq!(SIZE_ALIGN, 64);
+        // 736 = 23×32 — a multiple of 32 but not SIZE_ALIGN (64).
+        let off_align = validate_output_params(&req(736, 704, None, None))
+            .unwrap_err()
+            .to_string();
+        assert!(off_align.contains("multiple of 64"), "got: {off_align}");
 
         // frames / steps bounds.
         assert!(validate_output_params(&req(512, 512, Some(MAX_FRAMES), None)).is_ok());

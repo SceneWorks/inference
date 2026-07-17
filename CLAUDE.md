@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-SceneWorks Inference is a history-preserving Cargo **workspace** (74 members, one lockfile)
+SceneWorks Inference is a history-preserving Cargo **workspace** (one lockfile; its member count is
+enforced by `scripts/check-workspace.py`)
 assembled from five former repositories: `core-llm`, `mlx-llm`, `candle-llm`, `mlx-gen`, and
 `candle-gen`. It holds backend-neutral inference contracts, the MLX and Candle engines, media/LLM
 provider families, weights-free conformance suites, and named platform runtime bundles. Rust
@@ -53,8 +54,8 @@ python3 scripts/check_docs.py                         # local doc-link check
 cargo deny --locked check advisories bans licenses sources   # supply-chain policy (deny.toml)
 ```
 
-`check-workspace.py` is the enforcement point for the architecture: it asserts exactly 74 path
-members, one root `Cargo.lock`, one `[workspace]` manifest, that all internal deps are path edges
+`check-workspace.py` is the enforcement point for the architecture: it asserts the
+`EXPECTED_MEMBER_COUNT` of path members, one root `Cargo.lock`, one `[workspace]` manifest, that all internal deps are path edges
 (not SHA pins), that pinned MLX/Candle backend revisions are unchanged, that `inventory` is absent
 from the resolved graph, and that the intentional `tokenizers` 0.21/0.22 split is preserved. If you
 add or remove a crate, update `EXPECTED_MEMBER_COUNT`.
