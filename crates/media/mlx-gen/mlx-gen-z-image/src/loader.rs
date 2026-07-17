@@ -272,6 +272,29 @@ mod vae_remap_tests {
     }
 }
 
+/// Test-only fixture shared by the tier-guard tests here and in `model`/`model_control` (F-009,
+/// sc-12461): a fresh temp snapshot root whose `transformer/config.json` carries the Group-B packed
+/// quantization marker at `bits` — the turnkey shape `needs_load_time_quant` reads — and nothing
+/// else (weight-free). `tag` disambiguates the per-test temp dirs. Callers remove the dir.
+#[cfg(test)]
+pub(crate) fn packed_snapshot_fixture(tag: &str, bits: i32) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "zimage-packed-{tag}-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+    ));
+    let td = root.join("transformer");
+    std::fs::create_dir_all(&td).unwrap();
+    std::fs::write(
+        td.join("config.json"),
+        format!(r#"{{"quantization": {{"bits": {bits}, "group_size": 64}}}}"#),
+    )
+    .unwrap();
+    root
+}
+
 /// F-181: the `Sequential` re-quant warn (and the `needs_load_time_quant` tier guard) must fire only
 /// when a load-time (re)quant over a **dense** snapshot will actually happen — an already-packed
 /// turnkey loads packed and must NOT warn. Weight-free: writes only a `transformer/config.json`.

@@ -155,7 +155,19 @@ pub(crate) fn load_control_heavy(
     spec: &LoadSpec,
     root: &Path,
     control: &WeightsSource,
+    model_id: &str,
 ) -> Result<ZImageControlHeavyOwned> {
+    // F-009 (sc-12461): the tier guard runs here too, BEFORE the component loads, so it fires on
+    // both residency policies — `Resident` eager-loads through here at load time and `Sequential`
+    // re-loads through here on every generate. A requested-vs-packed mismatch on the BASE snapshot
+    // (e.g. Q4 over a pre-quantized Q8 turnkey) hard-errors instead of falling through to the
+    // no-op base `quantize()` below and silently serving the packed tier. Do NOT gate the quantize
+    // calls on the guard's bool: over a matching packed base the composed transformer still holds
+    // the DENSE control branch, which needs the load-time quantize (`quantize()` no-ops on the
+    // packed base Linears but packs the dense control ones).
+    if let Some(q) = spec.quantize {
+        loader::needs_load_time_quant(root, q.bits(), model_id)?;
+    }
     // Base + control applied dense first, THEN quantize together (the fork's ordering): quantizing
     // before the overlay would replace the control Linears with QuantizedLinear that can't accept
     // the raw bf16 control weights.
@@ -194,12 +206,16 @@ pub(crate) fn load_control_residency(
     // BOTH policies); then the always-warm tokenizer, then the shared [`build_control_residency`]
     // dispatch.
     let (root, _control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
-    // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate; only
-    // that combination pays the repeated cost, so gate the warning on it.
     if let Some(q) = spec.quantize {
-        if matches!(spec.offload_policy, OffloadPolicy::Sequential)
-            && loader::needs_load_time_quant(root, q.bits(), model_id)?
-        {
+        // F-009 (sc-12461): run the tier guard for BOTH residency policies, before any component
+        // load — a Q4 request over a pre-quantized Q8 base turnkey hard-errors here instead of
+        // silently serving Q8 (`quantize()` is a no-op on packed weights). Before this fix only the
+        // Sequential warn gate below evaluated it, so the DEFAULT `Resident` load skipped the guard
+        // entirely; `load_control_heavy` re-checks for the Sequential per-generate reload path.
+        let load_time_quant = loader::needs_load_time_quant(root, q.bits(), model_id)?;
+        // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate;
+        // only that combination pays the repeated cost, so gate the warning on it.
+        if load_time_quant && matches!(spec.offload_policy, OffloadPolicy::Sequential) {
             mlx_gen::residency::warn_sequential_requantize(model_id, q.bits());
         }
     }
@@ -235,7 +251,7 @@ pub(crate) fn build_control_residency(
         move |_use_pid| {
             let (root, control) =
                 resolve_control_base_and_control(&spec_heavy, model_id, precision_msg)?;
-            load_control_heavy(&spec_heavy, root, control)
+            load_control_heavy(&spec_heavy, root, control, model_id)
         },
     )
 }
@@ -506,6 +522,54 @@ mod tests {
             "/nonexistent/z-image-control-overlay.safetensors".into(),
         ))
         .with_offload_policy(policy)
+    }
+
+    // ── F-009 (sc-12461): the control lane's tier-mismatch guard must fire on the DEFAULT
+    // `Resident` policy too, not just behind the Sequential F-181 warn gate. Weight-free: the
+    // fixture is only the packed `transformer/config.json` marker on the BASE snapshot, and the
+    // guard errors before any base/control weights load (the nonexistent control file would
+    // otherwise produce a missing-weights error, not the tier message).
+    #[test]
+    fn control_tier_mismatch_errors_on_resident_and_sequential_load() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let root = loader::packed_snapshot_fixture("control-load", 8);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_control(WeightsSource::File(
+                    "/nonexistent/z-image-control-overlay.safetensors".into(),
+                ))
+                .with_quant(mlx_gen::Quant::Q4)
+                .with_offload_policy(policy);
+            let err = load(&spec).err().expect("expected an error").to_string();
+            assert!(
+                err.contains("pre-quantized Q8"),
+                "policy {policy:?}: Q4 over a packed Q8 base turnkey must hard-error, got: {err}"
+            );
+            assert!(
+                err.contains(MODEL_ID),
+                "policy {policy:?}: the error must name the model id, got: {err}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn load_control_heavy_runs_tier_guard_before_weights() {
+        // F-009 (sc-12461): the heavy control loader itself re-checks the tier guard — the seam the
+        // Sequential path re-loads through on every generate. The fixture has no weights, so
+        // reaching the base/control load would fail with a missing-weights error instead —
+        // asserting on the tier message proves the guard runs first.
+        let root = loader::packed_snapshot_fixture("control-heavy", 8);
+        let control =
+            WeightsSource::File("/nonexistent/z-image-control-overlay.safetensors".into());
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_control(control.clone())
+            .with_quant(mlx_gen::Quant::Q4);
+        let err = load_control_heavy(&spec, &root, &control, MODEL_ID)
+            .err()
+            .expect("expected a tier-mismatch error")
+            .to_string();
+        assert!(err.contains("pre-quantized Q8"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
