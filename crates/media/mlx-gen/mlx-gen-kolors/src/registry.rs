@@ -51,6 +51,11 @@ const DEFAULT_CONTROLNET_SCALE: f32 = 1.0;
 const POSE_IMG2IMG_STRENGTH: f32 = 1.0;
 /// The single Kolors sampler — diffusers `EulerDiscreteScheduler` (leading), see [`KolorsEulerSampler`].
 const SAMPLER: &str = "euler_discrete";
+/// Kolors' VAE downsamples by 8, so both image dims must be multiples of **8** for a clean latent
+/// shape. Exposed as the pinned-engine stride SceneWorks ties each advertised Kolors image bucket to
+/// (sc-12612). `validate_request` enforces exactly this value, so the const cannot drift from the
+/// check. (Distinct from the `i32` `model::SPATIAL_SCALE`, which is the same 8 in latent math.)
+pub const SIZE_MULTIPLE: u32 = 8;
 
 /// Kolors' identity + capabilities — constructible without loading weights (registry
 /// introspection). Advertises **only** the wired + parity-proven surface (the false-capability
@@ -813,9 +818,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         }
     }
     // Kolors VAE downsamples by 8; non-multiple-of-8 dims would mismatch latent shapes.
-    if !req.width.is_multiple_of(8) || !req.height.is_multiple_of(8) {
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
-            "kolors: width/height must be multiples of 8 (got {}x{})",
+            "kolors: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
             req.width, req.height
         )));
     }
@@ -917,6 +922,41 @@ mod tests {
             };
             assert!(validate_request(&caps, &req).is_ok(), "steps={ok:?}");
         }
+    }
+
+    #[test]
+    fn validate_ties_size_multiple_to_pinned_stride() {
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Kolors
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 4 but not
+        // SIZE_MULTIPLE (8) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 8);
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a fox".into(),
+            height: 1024,
+            ..Default::default()
+        };
+        let off_stride = validate_request(
+            &caps,
+            &GenerationRequest {
+                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                ..base.clone()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            off_stride.contains("multiples of 8"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                width: 1024, // 128×8 — on-stride
+                ..base.clone()
+            },
+        )
+        .is_ok());
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub use final_layer::FinalLayer;
 pub use loader::{
     load_control_transformer, load_text_encoder, load_tokenizer, load_transformer, load_vae,
 };
-pub use model::{descriptor, load, ZImageTurbo, MODEL_ID};
+pub use model::{descriptor, load, ZImageTurbo, MODEL_ID, SIZE_MULTIPLE};
 // The base (`z_image`, sc-8320) and control (`z_image_turbo_control`) variants each register
 // publish their own registration constants; their `descriptor`/`load`/`MODEL_ID` items share the names of the
 // turbo model's, so reach them through their module paths (consumers use the registry ids

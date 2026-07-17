@@ -58,8 +58,11 @@ pub const BOOGU_IMAGE_TURBO_ID: &str = "boogu_image_turbo";
 /// Registry id for the instruction image-edit variant (single- or multi-reference TI2I).
 pub const BOOGU_IMAGE_EDIT_ID: &str = "boogu_image_edit";
 
-/// Patch(2)·ae_scale(8) = 16 — `patchify` requires latent dims divisible by this.
-const SIZE_MULTIPLE: u32 = 16;
+/// Patch(2)·ae_scale(8) = 16 — `patchify` requires latent dims divisible by this. Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised Boogu image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`. `validate` enforces exactly this value, so the const cannot
+/// drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
 
 /// Maximum reference images the Edit lane accepts — the DiT's `image_index_embedding` row count (the
 /// OmniGen2-lineage `[5, hidden]` parameter supports up to 5 distinct reference index slots).
@@ -703,6 +706,30 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Boogu bucket
+        // to. Pin the value and mutation-check that an in-range size which is a multiple of 8 (the VAE
+        // scale) but not SIZE_MULTIPLE (16) is still rejected with the stride error, and on-stride passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     /// F-154 (sc-11210): the empty-prompt guard rejects a whitespace-only prompt (`trim().is_empty()`),

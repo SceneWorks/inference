@@ -60,7 +60,9 @@ pub use fm::{
     apply_time_schedule, euler_step, patchify, unpatchify, velocity, FmHead, TimestepEmbedder,
 };
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
-pub use model::{descriptor, descriptor_fast, load, load_fast, SenseNova, MODEL_ID, MODEL_ID_FAST};
+pub use model::{
+    descriptor, descriptor_fast, load, load_fast, SenseNova, CELL, MODEL_ID, MODEL_ID_FAST,
+};
 pub use qwen3::{KvCache, Path, Qwen3Backbone};
 pub use runtime::{Sampler, ThinkRollout};
 pub use t2i::{

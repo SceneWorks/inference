@@ -53,7 +53,9 @@ pub mod transformer;
 
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::{DcAeDecoder, DcAeEncoder};
-pub use model::{descriptor, load, load_sprint, sprint_descriptor, MODEL_ID, SPRINT_MODEL_ID};
+pub use model::{
+    descriptor, load, load_sprint, sprint_descriptor, MODEL_ID, RES_MULTIPLE, SPRINT_MODEL_ID,
+};
 pub use nvfp4_dit::{
     summarize, ActProbe, ActRecord, DitPlan, LayerRole, LayerSparsitySummary, Nvfp4Quant,
     Nvfp4Report,

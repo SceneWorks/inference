@@ -38,7 +38,7 @@ pub use loader::{
     load_controlnet, load_text_encoder, load_tokenizer, load_transformer, load_transformer_edit,
     load_vae, load_vision_encoder, load_vision_language_encoder,
 };
-pub use model::{descriptor, load, QwenImage, MODEL_ID};
+pub use model::{descriptor, load, QwenImage, MODEL_ID, SIZE_MULTIPLE};
 pub use model_control::QwenImageControl;
 pub use model_edit::QwenImageEdit;
 pub use pipeline::{

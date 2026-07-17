@@ -939,5 +939,34 @@ mod integration_tests {
             ..ok.clone()
         };
         assert!(validate_request(MODEL_ID_TURBO, &caps, &bad_dims).is_err());
+
+        // sc-12612: `VAE_SCALE_FACTOR` is the pinned stride SceneWorks ties every advertised Lens
+        // image bucket to. Pin the value and mutation-check that a size which is a multiple of 8 (a
+        // lower divisor) but not VAE_SCALE_FACTOR (16) is still rejected with the stride error, and
+        // an on-stride in-range size passes.
+        assert_eq!(VAE_SCALE_FACTOR, 16);
+        let off_stride = validate_request(
+            MODEL_ID_TURBO,
+            &caps,
+            &GenerationRequest {
+                width: 1000, // 125×8 — a multiple of 8 but not VAE_SCALE_FACTOR
+                ..ok.clone()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(validate_request(
+            MODEL_ID_TURBO,
+            &caps,
+            &GenerationRequest {
+                width: 1024, // 64×16 — on-stride
+                ..ok.clone()
+            }
+        )
+        .is_ok());
     }
 }

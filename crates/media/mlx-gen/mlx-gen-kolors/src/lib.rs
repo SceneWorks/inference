@@ -21,7 +21,7 @@ pub mod training;
 pub mod unet;
 
 pub use model::Kolors;
-pub use registry::{descriptor, KolorsGenerator, MODEL_ID};
+pub use registry::{descriptor, KolorsGenerator, MODEL_ID, SIZE_MULTIPLE};
 pub use training::{load_trainer, KolorsTrainer};
 
 /// Add the MLX Kolors generator and trainer to an explicit media registry builder.

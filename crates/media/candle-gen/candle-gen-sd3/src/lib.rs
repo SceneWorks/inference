@@ -72,8 +72,10 @@ pub const MODEL_ID_TURBO: &str = "sd3_5_large_turbo";
 pub const MODEL_ID_MEDIUM: &str = "sd3_5_medium";
 
 /// SD3.5 works in latent space at /8 and the MMDiT patchifies that at /2, so both image dims must be
-/// multiples of **16** for a clean patchify.
-const SIZE_MULTIPLE: u32 = 16;
+/// multiples of **16** for a clean patchify. Exposed as the pinned-engine stride SceneWorks ties each
+/// advertised SD3.5 image bucket to (sc-12612), mirroring `wan::config::SIZE_MULTIPLE_14B`. `validate`
+/// enforces exactly this value, so the const cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
 
 /// A loaded candle SD3.5 generator. Loading is **lazy**: `load` does no file I/O, and the heavy
 /// components (triple text encoders + MMDiT + VAE) are built on the first
@@ -467,6 +469,30 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SD3.5 bucket
+        // to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE scale) but
+        // not SIZE_MULTIPLE (16) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     /// C2 wires `generate`, so it now passes validation and proceeds to component load. Against a

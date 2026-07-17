@@ -68,7 +68,7 @@ pub use memory::{plan_control_adaptation, ControlLaneInputs};
 pub use model::{
     descriptor, edit_descriptor, load, load_edit, load_raw, load_turbo_edit, raw_descriptor,
     turbo_edit_descriptor, Krea, KREA_2_EDIT_ID, KREA_2_RAW_ID, KREA_2_TURBO_EDIT_ID,
-    KREA_2_TURBO_ID,
+    KREA_2_TURBO_ID, RES_MULTIPLE,
 };
 pub use model_control::{KreaTurboControl, KREA_2_TURBO_CONTROL_ID};
 pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, TurboOptions};

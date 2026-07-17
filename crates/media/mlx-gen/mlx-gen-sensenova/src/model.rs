@@ -50,8 +50,10 @@ const DEFAULT_GUIDANCE: f32 = 4.0;
 const DEFAULT_STEPS_FAST: u32 = 8;
 const DEFAULT_GUIDANCE_FAST: f32 = 1.0;
 const DEFAULT_TIMESTEP_SHIFT: f32 = 3.0;
-/// Cell = patch·merge: every side must be a multiple of this (the patchify grid).
-const CELL: u32 = 32;
+/// Cell = patch·merge: every side must be a multiple of this (the patchify grid). Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised SenseNova image bucket to (sc-12612).
+/// `validate_dims_and_steps` enforces exactly this value, so the const cannot drift from the check.
+pub const CELL: u32 = 32;
 /// Source-image preprocessing bounds (the reference `it2i_generate` `load_image_native`).
 const REF_MIN_PIXELS: i64 = 512 * 512;
 const REF_MAX_PIXELS: i64 = 2048 * 2048;
@@ -512,6 +514,34 @@ mod tests {
             fast_err.contains(MODEL_ID_FAST),
             "fast id should appear: {fast_err}"
         );
+
+        // sc-12612: `CELL` is the pinned stride SceneWorks ties every advertised SenseNova bucket to.
+        // Pin the value and mutation-check that a size which is a multiple of 16 but not CELL (32) is
+        // still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(CELL, 32);
+        let off_stride = validate_dims_and_steps(
+            MODEL_ID,
+            &GenerationRequest {
+                width: 1040, // 65×16 — a multiple of 16 but not CELL
+                height: 512,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            off_stride.contains("multiple of 32"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(validate_dims_and_steps(
+            MODEL_ID,
+            &GenerationRequest {
+                width: 1024, // 32×32 — on-stride
+                height: 512,
+                ..Default::default()
+            },
+        )
+        .is_ok());
     }
 
     #[test]

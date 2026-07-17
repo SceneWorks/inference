@@ -134,8 +134,11 @@ pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 /// surface for the Turbo edit vs the Raw [`KREA_2_EDIT_ID`].
 pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
 
-/// patch_size(2)·vae_downsample(8) = 16 — patchify requires latent dims divisible by this.
-const SIZE_MULTIPLE: u32 = 16;
+/// patch_size(2)·vae_downsample(8) = 16 — patchify requires latent dims divisible by this. Exposed as
+/// the pinned-engine stride SceneWorks ties each advertised Krea image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`; the control provider imports this same crate-root const so no copy
+/// can drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
 /// Resolution bounds (W/H). Turbo renders up to 2048²; the catalog/worker gate the UI options tighter.
 const RES_MIN: u32 = 256;
 const RES_MAX: u32 = 2048;
@@ -784,6 +787,40 @@ mod tests {
             ..Default::default()
         };
         assert!(g.validate(&ok).is_ok());
+    }
+
+    /// sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Krea bucket to.
+    /// Pin the value and mutation-check that a multiple of 8 which is not SIZE_MULTIPLE (16) is rejected
+    /// with the stride error, and an on-stride size passes.
+    #[test]
+    fn size_multiple_is_the_pinned_stride() {
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(KREA_2_TURBO_ID, &spec)
+            .unwrap();
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                height: 1024,
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024,
+                height: 1024,
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     #[test]

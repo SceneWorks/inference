@@ -37,6 +37,10 @@ pub const DEFAULT_HEIGHT: u32 = 1024;
 /// Native resolution range: 256–2048, multiples of 16, aspect up to 6:1.
 pub const RES_MIN: u32 = 256;
 pub const RES_MAX: u32 = 2048;
+/// Both image dims must be multiples of 16 (VAE /8 then the DiT 2×2 patch). Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised Ideogram image bucket to (sc-12612),
+/// mirroring `wan::config::SIZE_MULTIPLE_14B`. `validate` enforces exactly this value, so the const
+/// cannot drift from the check.
 pub const RES_MULTIPLE: u32 = 16;
 /// Euler flow-matching with asymmetric CFG. The reference `__call__` default is **128** steps;
 /// the SceneWorks default is the `V4_QUALITY_48` quality preset (48 steps), a sanctioned

@@ -38,7 +38,12 @@ use candle_gen::gen_core::{
     Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 
-use config::{MODEL_ID, MODEL_ID_TURBO, RES_MAX, RES_MIN, SIZE_MULTIPLE};
+/// Re-export the pinned width/height stride at the crate root so SceneWorks can tie each advertised
+/// Ideogram image bucket to `candle_gen_ideogram::SIZE_MULTIPLE` (sc-12612) instead of a hand-copied
+/// literal.
+pub use config::SIZE_MULTIPLE;
+
+use config::{MODEL_ID, MODEL_ID_TURBO, RES_MAX, RES_MIN};
 use pipeline::Components;
 
 /// A lazily-loaded Ideogram 4 generator. `turbo` selects the CFG-free single-DiT + TurboTime LoRA
@@ -341,6 +346,31 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Ideogram
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE
+        // scale) but not SIZE_MULTIPLE (16) is still rejected with the stride error, and an on-stride
+        // size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     #[test]

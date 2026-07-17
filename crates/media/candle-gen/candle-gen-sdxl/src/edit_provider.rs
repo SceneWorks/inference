@@ -56,8 +56,10 @@ pub const DEFAULT_EDIT_STRENGTH: f32 = 0.8;
 /// (the torch adapter's `use_inpaint` / `outpaint` value).
 pub const DEFAULT_INPAINT_STRENGTH: f32 = 0.85;
 
-/// SDXL works in latent space at /8: both render dims must be multiples of 8.
-const SIZE_MULTIPLE: u32 = 8;
+/// SDXL works in latent space at /8: both render dims must be multiples of 8. Single source of truth
+/// is the crate-root [`crate::SIZE_MULTIPLE`] (sc-12612), so this bespoke edit path can never drift
+/// from the main provider's stride.
+use crate::SIZE_MULTIPLE;
 
 /// Reject `steps == 0` loudly instead of building an empty schedule: with `steps: 0` the
 /// `round(steps·strength)` effective count is 0, so the strength-noised source is decoded and returned

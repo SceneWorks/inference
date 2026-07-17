@@ -31,6 +31,12 @@ use crate::vae::QwenVae;
 /// Registry id for Qwen-Image (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "qwen_image";
 
+/// Both image dims must be multiples of **16** per side: the Qwen-Image VAE downsamples /8 and the
+/// DiT patchifies that 2×2. Exposed as the pinned-engine stride SceneWorks ties each advertised
+/// Qwen-Image image bucket to (sc-12612), shared by the base T2I, Edit-2511, and control lanes.
+/// `validate_request` enforces exactly this value, so the const cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
+
 /// Qwen-Image's identity + capabilities — constructible without loading weights (registry
 /// introspection). This is the **T2I** variant (`qwen_image`), which also accepts a single init
 /// `Reference` image for **img2img** (sc-2530); Qwen-Image-Edit ships as a separate `qwen_image_edit`
@@ -443,9 +449,9 @@ pub(crate) fn validate_request(
     // non-finite guidance/true_cfg (NaN rendered garbage). `?` keeps the typed `Unsupported` for gaps.
     caps.validate_request(id, req)?;
     // Qwen-Image latents pack 2×2; sizes must be a multiple of 16 per side (VAE/8 then patch/2).
-    if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
-            "{}x{} must be a multiple of 16 per side",
+            "{}x{} must be a multiple of {SIZE_MULTIPLE} per side",
             req.width, req.height
         )));
     }
@@ -657,6 +663,38 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &caps, &req).is_ok());
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Qwen-Image
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 8 (a lower
+        // divisor) but not SIZE_MULTIPLE (16) is still rejected with the stride error, and an
+        // on-stride in-range size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = validate_request(
+            MODEL_ID,
+            &caps,
+            &GenerationRequest {
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                height: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            off_stride.contains("multiple of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(validate_request(
+            MODEL_ID,
+            &caps,
+            &GenerationRequest {
+                prompt: "a fox".into(),
+                width: 1024, // 64×16 — on-stride
+                height: 1024,
+                ..Default::default()
+            }
+        )
+        .is_ok());
     }
 
     #[test]

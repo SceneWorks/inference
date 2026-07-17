@@ -1105,6 +1105,12 @@ impl Sdxl {
     }
 }
 
+/// SDXL works in latent space at /8, so both request dims must be multiples of 8. Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised SDXL image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`. `validate_request` enforces exactly this value, so the const
+/// cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 8;
+
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Rejects unsupported guidance / negative prompt / conditioning / size / count.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
@@ -1120,10 +1126,10 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     if req.prompt.is_empty() {
         return Err(Error::Msg("sdxl: prompt must not be empty".into()));
     }
-    // SDXL works in latent space at /8; both dims must be multiples of 8.
-    if !req.width.is_multiple_of(8) || !req.height.is_multiple_of(8) {
+    // SDXL works in latent space at /8; both dims must be multiples of SIZE_MULTIPLE.
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
-            "sdxl: width/height must be multiples of 8 (got {}x{})",
+            "sdxl: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
             req.width, req.height
         )));
     }
@@ -1181,6 +1187,37 @@ mod tests {
         let req = GenerationRequest::default(); // default prompt is empty
         let err = validate_request(&caps, &req).unwrap_err().to_string();
         assert!(err.contains("empty"), "got: {err}");
+    }
+
+    /// sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SDXL bucket to.
+    /// Pin the value and mutation-check that a multiple of 4 which is not SIZE_MULTIPLE (8) is rejected
+    /// with the stride error, and an on-stride size passes.
+    #[test]
+    fn size_multiple_is_the_pinned_stride() {
+        assert_eq!(SIZE_MULTIPLE, 8);
+        let caps = descriptor().capabilities;
+        let off = validate_request(
+            &caps,
+            &GenerationRequest {
+                prompt: "a fox".into(),
+                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                height: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(off.contains("multiples of 8"), "got: {off}");
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                prompt: "a fox".into(),
+                width: 1024,
+                height: 1024,
+                ..Default::default()
+            }
+        )
+        .is_ok());
     }
 
     #[test]

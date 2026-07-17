@@ -23,7 +23,7 @@ pub mod eva_clip;
 pub mod idformer;
 pub mod pulid_flux;
 
-pub use pulid_flux::{PulidFlux, PulidFluxPaths, PulidFluxRequest, DEFAULT_ID_WEIGHT};
+pub use pulid_flux::{PulidFlux, PulidFluxPaths, PulidFluxRequest, DEFAULT_ID_WEIGHT, SIZE_MULTIPLE};
 
 /// PuLID-FLUX real-weight GPU validation (sc-5492) — env-driven, `#[ignore]`d integration test (the
 /// analog of the InstantID / IP-Adapter Phase-5 harnesses).

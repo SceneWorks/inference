@@ -21,7 +21,7 @@ pub mod restore;
 pub use kps::{draw_kps, letterbox, view_angle_kps, ANGLE_SET_ORDER, VIEW_ANGLE_KPS};
 pub use model::{
     InstantId, InstantIdPaths, InstantIdRequest, DEFAULT_CONTROLNET_SCALE, DEFAULT_IP_SCALE,
-    DEFAULT_OPENPOSE_SCALE, FACE_RESTORE_PROMPT,
+    DEFAULT_OPENPOSE_SCALE, FACE_RESTORE_PROMPT, SIZE_MULTIPLE,
 };
 pub use openpose::{
     draw_bodypose, face_box_from_keypoints, normalize_keypoints, square_fit, BodyPoint,

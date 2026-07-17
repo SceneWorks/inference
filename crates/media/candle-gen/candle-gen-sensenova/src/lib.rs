@@ -498,6 +498,32 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SenseNova
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 16 but not
+        // SIZE_MULTIPLE (32) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 32);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1040, // 65×16 — a multiple of 16 but not SIZE_MULTIPLE
+                height: 512,
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 32"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 32×32 — on-stride
+                height: 512,
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     /// sc-9029 / F-045: `options` must route the timestep shift through the checkpoint config, not a

@@ -54,8 +54,10 @@ pub const SPRINT_MODEL_ID: &str = "sana_sprint_1600m";
 const RES_MIN: u32 = 256;
 const RES_MAX: u32 = 1024;
 /// DC-AE 32× spatial compression — requested dims must be a multiple of this so the latent edge
-/// (`image / 32`) is integral.
-const RES_MULTIPLE: u32 = crate::pipeline::SPATIAL_SCALE;
+/// (`image / 32`) is integral. Exposed as the pinned-engine stride SceneWorks ties each advertised
+/// SANA image bucket to (sc-12612), mirroring `wan::config::SIZE_MULTIPLE_14B`. `validate_request`
+/// enforces exactly this value, so the const cannot drift from the check.
+pub const RES_MULTIPLE: u32 = crate::pipeline::SPATIAL_SCALE;
 /// Max images per request (the image-model standard, shared with the other candle families).
 const MAX_COUNT: u32 = 8;
 
@@ -456,6 +458,19 @@ mod tests {
         let mut r = req(1024, 1024);
         r.steps = Some(0);
         assert!(validate_request(&d, &r).is_err());
+
+        // sc-12612: `RES_MULTIPLE` is the pinned stride SceneWorks ties every advertised SANA bucket
+        // to. Pin the value and mutation-check that an in-range size which is a multiple of 16 but
+        // not RES_MULTIPLE (32) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(RES_MULTIPLE, 32);
+        let off_stride = validate_request(&d, &req(1008, 1024)) // 63×16 — a multiple of 16, not 32
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiple of 32"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(validate_request(&d, &req(1024, 1024)).is_ok());
     }
 
     #[test]

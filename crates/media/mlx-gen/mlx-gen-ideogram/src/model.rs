@@ -617,12 +617,18 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_multiple_of_16() {
+        // sc-12612: `RES_MULTIPLE` is the pinned stride SceneWorks ties every advertised Ideogram
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE
+        // scale) but not RES_MULTIPLE (16) — e.g. 1000×1000 = 125×8 — is rejected with the stride error.
+        assert_eq!(RES_MULTIPLE, 16);
         for (w, h) in [(1000, 1000), (257, 256), (512, 520)] {
             let e = validate_request(&caps(), &req(w, h))
                 .unwrap_err()
                 .to_string();
             assert!(e.contains("multiple of 16"), "{w}x{h} got: {e}");
         }
+        // An on-stride, in-range size passes.
+        assert!(validate_request(&caps(), &req(1024, 1024)).is_ok());
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
 
+/// Re-export the pinned width/height stride at the crate root so SceneWorks can tie each advertised
+/// FLUX.2 image bucket to `candle_gen_flux2::SIZE_MULTIPLE` (sc-12612) instead of a hand-copied literal.
+pub use config::SIZE_MULTIPLE;
 pub use control_provider::{Flux2Control, Flux2ControlPaths, Flux2ControlRequest};
 pub use convert::convert_and_assemble;
 pub use edit_provider::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
@@ -69,7 +72,7 @@ use candle_gen::gen_core::{
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
-use config::{Flux2Config, Flux2Variant, SIZE_MULTIPLE};
+use config::{Flux2Config, Flux2Variant};
 use text_encoder::Flux2PromptEncoder;
 use vae::Flux2Vae;
 
@@ -1119,6 +1122,30 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised FLUX.2 bucket
+        // to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE scale) but
+        // not SIZE_MULTIPLE (16) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     #[test]

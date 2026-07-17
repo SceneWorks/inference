@@ -408,10 +408,14 @@ pub(crate) fn render_edit(
     // Each reference is VAE-encoded at its own dimensions; the latent must be patchify-able (p=2 over
     // an /8 latent ⇒ multiple of 16), matching the mlx twin's `validate_multiple_of_16(reference)`.
     for (i, r) in references.iter().enumerate() {
-        if !r.width.is_multiple_of(16) || !r.height.is_multiple_of(16) {
+        if !r.width.is_multiple_of(crate::SIZE_MULTIPLE)
+            || !r.height.is_multiple_of(crate::SIZE_MULTIPLE)
+        {
             return Err(CandleError::Msg(format!(
-                "boogu_image_edit: reference {i} dims must be multiples of 16 (got {}x{})",
-                r.width, r.height
+                "boogu_image_edit: reference {i} dims must be multiples of {} (got {}x{})",
+                crate::SIZE_MULTIPLE,
+                r.width,
+                r.height
             )));
         }
     }

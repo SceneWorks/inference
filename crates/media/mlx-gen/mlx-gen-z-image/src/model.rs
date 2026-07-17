@@ -458,8 +458,11 @@ impl ZImageTurbo {
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Rejects unsupported guidance / negative prompt / conditioning / size / count.
-/// Required divisor for requested image dims: VAE downsample (8) × transformer patch (2).
-const SIZE_MULTIPLE: u32 = 16;
+/// Required divisor for requested image dims: VAE downsample (8) × transformer patch (2). Exposed as
+/// the pinned-engine stride SceneWorks ties each advertised Z-Image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`. `validate_request` enforces exactly this value, so the const
+/// cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
 
 pub(crate) fn validate_request(
     id: &str,
@@ -611,6 +614,8 @@ mod tests {
     fn validate_rejects_non_multiple_of_16_size() {
         // F-033: in-range dims that aren't a multiple of 16 must be rejected at the boundary, not
         // crash in patchify (1000×1000) or silently truncate (257×257).
+        // sc-12612: pin the exported stride so it cannot drift from the check SceneWorks ties to.
+        assert_eq!(SIZE_MULTIPLE, 16);
         let caps = descriptor().capabilities;
         for (w, h) in [(1000, 1000), (257, 257), (512, 520)] {
             let req = GenerationRequest {

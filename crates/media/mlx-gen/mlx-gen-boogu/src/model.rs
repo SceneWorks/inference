@@ -50,8 +50,11 @@ const MAX_COUNT: u32 = 8;
 /// tighter; this is the engine validation ceiling.
 const RES_MIN: u32 = 256;
 const RES_MAX: u32 = 2048;
-/// Patch(2)·ae_scale(8) = 16 — `patchify` requires dims divisible by this.
-const RES_MULTIPLE: u32 = 16;
+/// Patch(2)·ae_scale(8) = 16 — `patchify` requires dims divisible by this. Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised Boogu image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`. `validate_request` enforces exactly this value, so the const
+/// cannot drift from the check.
+pub const RES_MULTIPLE: u32 = 16;
 
 /// Max reference images the Edit checkpoint supports — the DiT's `image_index_embedding` carries 5
 /// per-image index slots (`[5, hidden]`, OmniGen2 lineage), so `N ∈ [1, 5]` references can be packed.
@@ -842,6 +845,19 @@ mod tests {
         }
         assert!(validate_request(&descriptor(), &req(128, 128)).is_err()); // below min
         assert!(validate_request(&descriptor(), &req(2064, 256)).is_err()); // above max
+
+        // sc-12612: `RES_MULTIPLE` is the pinned stride SceneWorks ties every advertised Boogu bucket
+        // to. Pin the value and mutation-check that an in-range size which is a multiple of 8 (the VAE
+        // scale) but not RES_MULTIPLE (16) is still rejected with the stride error, and on-stride passes.
+        assert_eq!(RES_MULTIPLE, 16);
+        let off_stride = validate_request(&descriptor(), &req(1000, 1024)) // 125×8 — mult of 8, not 16
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiple of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(validate_request(&descriptor(), &req(1024, 1024)).is_ok());
     }
 
     #[test]

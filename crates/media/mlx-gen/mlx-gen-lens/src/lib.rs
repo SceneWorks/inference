@@ -103,6 +103,11 @@ pub mod text_encoder;
 pub mod training;
 pub mod vae;
 
+/// The pinned image-lane stride (`vae_scale_factor` = 16), re-exported at the crate root so the
+/// SceneWorks worker can tie each advertised Lens image bucket to the real engine stride instead of
+/// a hand-copied literal (sc-12612). `registry::validate_request` enforces exactly this value.
+pub use pipeline::VAE_SCALE_FACTOR;
+
 /// Add all MLX Lens generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
