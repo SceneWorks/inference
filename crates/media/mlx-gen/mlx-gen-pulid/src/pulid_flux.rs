@@ -595,20 +595,124 @@ mod tests {
         );
     }
 
-    /// F-011 (sc-12463): `generate_impl` now self-validates first (`self.validate(req)?`, sibling
+    /// Zero *scalar* arrays for every listed key — the EVA/IdFormer constructors only clone the
+    /// required arrays (no shape validation at load), so scalars suffice for a tower that exists
+    /// but is never forwarded.
+    fn zero_weights(keys: Vec<String>) -> Weights {
+        let mut w = Weights::empty();
+        for k in keys {
+            w.insert(k, Array::from_f32(0.0));
+        }
+        w
+    }
+
+    /// A fully weight-free `PulidFlux`: the weightless FLUX-dev backbone
+    /// (`Flux1::new_for_tests`), a tiny zero-weight EVA tower + IdFormer, and the degenerate
+    /// `FaceAnalysis::new_for_tests` fixture. Constructible via struct literal because this tests
+    /// module is a child of `pulid_flux` (private fields in scope). Only the pre-weight `generate`
+    /// prefix (validate-first) may run — any forward would error on the zero-weight shapes.
+    fn weightless_pulid() -> PulidFlux {
+        // Tiny EVA tower (depth 1, 4-wide) — the constructor honors any EvaConfig (F-082).
+        let cfg = EvaConfig {
+            image_size: 2,
+            patch: 1,
+            embed_dim: 4,
+            depth: 1,
+            num_heads: 1,
+            proj_dim: 1,
+            pt_seq_len: 2,
+            rope_theta: 10000.0,
+            hidden_capture: vec![0],
+        };
+        let mut keys: Vec<String> = [
+            "patch_embed.proj.weight",
+            "patch_embed.proj.bias",
+            "cls_token",
+            "pos_embed",
+            "norm.weight",
+            "norm.bias",
+            "head.weight",
+            "head.bias",
+        ]
+        .map(String::from)
+        .to_vec();
+        keys.extend(
+            [
+                "norm1.weight",
+                "norm1.bias",
+                "norm2.weight",
+                "norm2.bias",
+                "attn.q_proj.weight",
+                "attn.q_bias",
+                "attn.k_proj.weight",
+                "attn.v_proj.weight",
+                "attn.v_bias",
+                "attn.inner_attn_ln.weight",
+                "attn.inner_attn_ln.bias",
+                "attn.proj.weight",
+                "attn.proj.bias",
+                "mlp.w1.weight",
+                "mlp.w1.bias",
+                "mlp.w2.weight",
+                "mlp.w2.bias",
+                "mlp.ffn_ln.weight",
+                "mlp.ffn_ln.bias",
+                "mlp.w3.weight",
+                "mlp.w3.bias",
+            ]
+            .iter()
+            .map(|l| format!("blocks.0.{l}")),
+        );
+        let eva = EvaVisionTransformer::from_weights(&zero_weights(keys), "", cfg).unwrap();
+
+        // IdFormer with depth 0 — no perceiver layers; just latents/proj_out + the 6 mapping MLPs.
+        let mlp = [
+            "0.weight", "0.bias", "1.weight", "1.bias", "3.weight", "3.bias", "4.weight",
+            "4.bias", "6.weight", "6.bias",
+        ];
+        let mut ikeys: Vec<String> = vec!["enc.latents".into(), "enc.proj_out".into()];
+        for m in [
+            "id_embedding_mapping",
+            "mapping_0",
+            "mapping_1",
+            "mapping_2",
+            "mapping_3",
+            "mapping_4",
+        ] {
+            ikeys.extend(mlp.iter().map(|l| format!("enc.{m}.{l}")));
+        }
+        let idformer = IdFormer::from_weights(
+            &zero_weights(ikeys),
+            "enc",
+            IdFormerConfig {
+                depth: 0,
+                ..IdFormerConfig::default()
+            },
+        )
+        .unwrap();
+
+        PulidFlux {
+            descriptor: descriptor(),
+            flux: Flux1::new_for_tests(FluxVariant::Dev),
+            eva,
+            idformer,
+            pulid: Weights::empty(),
+            face: FaceAnalysis::new_for_tests().unwrap(),
+        }
+    }
+
+    /// F-011 (sc-12463): `generate_impl` self-validates FIRST (`self.validate(req)?`, the sibling
     /// convention — chroma/svd/ideogram), so a caller that invokes `generate` WITHOUT a prior
-    /// `validate` gets the typed `Unsupported` for a `hyper` request instead of a silently degraded
-    /// render (the FLUX-dev backbone would happily render WITHOUT the Hyper-FLUX LoRA PuLID never
-    /// loads). A weight-free `generate()` call is not constructible here — unlike Chroma's
-    /// closure-based `Residency` weightless test instance, `PulidFlux` holds materialized sub-models
-    /// (Flux1 + EVA tower + IdFormer + FaceAnalysis) — so this mirrors the descriptor-floor setup
-    /// above and asserts the exact check-and-bridge sequence `generate_impl` performs: on an
-    /// otherwise generate-able request (valid reference face attached), the floor rejects `hyper`,
-    /// and the rejection stays a typed `Unsupported` through the `gen_core::Error → Error` lift that
-    /// `generate_impl`'s `?` applies and the `Into` bridge `generate` returns through.
+    /// `validate` still gets the typed `Unsupported` for a `hyper` request instead of a silently
+    /// degraded render (the FLUX-dev backbone would happily render WITHOUT the Hyper-FLUX LoRA
+    /// PuLID never loads). Driven end-to-end through `Generator::generate` on a weight-free
+    /// instance: the capability floor rejects the request before any face/EVA/backbone work, so no
+    /// weights are ever touched. Mutation-pins the regression — with the `self.validate(req)?` line
+    /// deleted, `generate` falls through into the zero-weight identity stack and fails with a
+    /// non-`Unsupported` error, so this test FAILS.
     #[test]
-    fn generate_path_hyper_rejection_stays_typed_unsupported() {
-        let desc = descriptor();
+    fn generate_without_prior_validate_rejects_hyper_typed_unsupported() {
+        let model = weightless_pulid();
         let req = GenerationRequest {
             prompt: "a portrait".into(),
             width: 1024,
@@ -621,18 +725,10 @@ mod tests {
             ..Default::default()
         };
         // The reference-face half of `validate` accepts this request, so the sampler floor is the
-        // ONLY thing `validate` rejects — `generate` now fails fast on exactly that, before any
-        // weights are touched.
+        // ONLY rejection — and it must arrive through `generate` itself, typed.
         assert!(select_reference_face(&req.conditioning).is_ok());
-        // The floor half — the first check `validate` composes — rejects `hyper`, typed.
-        let floor = desc.capabilities.validate_request(desc.id, &req).unwrap_err();
-        assert!(matches!(floor, gen_core::Error::Unsupported(_)), "got: {floor:?}");
-        // `generate_impl`'s `?` lifts the gen_core error into the crate error…
-        let lifted: Error = floor.into();
-        assert!(matches!(lifted, Error::Unsupported(_)), "got: {lifted:?}");
-        // …and the `generate` trait wrapper bridges the tail back — still typed `Unsupported`.
-        let back: gen_core::Error = lifted.into();
-        assert!(matches!(back, gen_core::Error::Unsupported(_)), "got: {back:?}");
+        let err = Generator::generate(&model, &req, &mut |_| {}).unwrap_err();
+        assert!(matches!(err, gen_core::Error::Unsupported(_)), "got: {err:?}");
     }
 
     /// Two reference faces are rejected, and an empty request is rejected as missing.
