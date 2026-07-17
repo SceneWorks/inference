@@ -94,13 +94,33 @@ fn decoded_to_image(decoded: &Tensor) -> Result<Image> {
 }
 
 /// Bail with the typed [`CandleError::Canceled`] when the caller's cooperative cancel flag has
-/// tripped — the video loops check it before each (seconds-to-minutes) chunk/frame (the gen-core
-/// video per-step cancel contract, sc-8972/sc-11227; mirrors `Sam3VideoModel::propagate`). An
-/// absent flag is a no-op. The typed variant (never a stringified `Msg`) bridges to
-/// `gen_core::Error::Canceled` so the worker keys off the variant to map a user cancel.
+/// tripped — the upscale loops check it before each (seconds-to-minutes) unit of work: video
+/// chunk, video frame, and spatial tile (the gen-core per-step cancel contract, sc-8972/sc-11227;
+/// mirrors `Sam3VideoModel::propagate`; per-tile checks on both the still and video tiled paths,
+/// sc-12465/F-013). An absent flag is a no-op. The typed variant (never a stringified `Msg`)
+/// bridges to `gen_core::Error::Canceled` so the worker keys off the variant to map a user cancel.
 fn check_canceled(cancel: Option<&CancelFlag>) -> CResult<()> {
     if cancel.is_some_and(CancelFlag::is_cancelled) {
         return Err(CandleError::Canceled);
+    }
+    Ok(())
+}
+
+/// Drive the spatial-tile loop over `plan`: honor the engine cancellation contract at the **top of
+/// every tile iteration** (sc-12465 / F-013 — each tile is a full seconds-to-minutes
+/// VAE-encode → DiT → VAE-decode pass, the per-unit granularity of the cancel contract on the tiled
+/// paths), then run `f` on the tile. This is the production driver for
+/// [`Seedvr2Pipeline::run_frame_tiled`] — extracted so the per-tile check placement is unit-testable
+/// without weights (`tests::spatial_tile_loop_cancels_between_tiles` exercises this exact
+/// function, not a re-implementation).
+fn for_each_tile(
+    plan: &[video::SpatialTile],
+    cancel: Option<&CancelFlag>,
+    mut f: impl FnMut(&video::SpatialTile) -> CResult<()>,
+) -> CResult<()> {
+    for t in plan {
+        check_canceled(cancel)?;
+        f(t)?;
     }
     Ok(())
 }
@@ -209,6 +229,11 @@ impl Seedvr2Pipeline {
     ///
     /// Spatial-tiles when a single full-resolution pass would exceed the memory budget (sc-6225) — the
     /// image analog of the video path's HD-tiling fallback (sc-5926). See [`Self::generate_budgeted`].
+    ///
+    /// `cancel` is the caller's cooperative cancel flag, checked before each spatial tile on the
+    /// tiled path (sc-12465/F-013 — a tiled 4096² still is up to 9 full encode→DiT→decode passes,
+    /// so a mid-image cancel must not wait for the whole image); the one-pass path is a single unit
+    /// and relies on the caller's per-image check (the gen-core per-step cancel contract).
     pub fn generate(
         &self,
         image: &Image,
@@ -216,6 +241,7 @@ impl Seedvr2Pipeline {
         height: usize,
         seed: u64,
         softness: f32,
+        cancel: Option<&CancelFlag>,
     ) -> CResult<Image> {
         self.generate_budgeted(
             image,
@@ -224,6 +250,7 @@ impl Seedvr2Pipeline {
             seed,
             softness,
             video::safe_budget_gib(),
+            cancel,
         )
     }
 
@@ -233,6 +260,8 @@ impl Seedvr2Pipeline {
     /// feather-blended spatial tiling ([`Self::run_frame_tiled`], the parity-gated sc-5926 tiler)
     /// rather than one allocation that would blow past the device's free VRAM and OOM the worker
     /// (sc-6225); otherwise the one-pass still path runs (numerically unchanged from before).
+    /// `cancel` is threaded to the per-tile check on the tiled path (sc-12465).
+    #[allow(clippy::too_many_arguments)] // size/seed/budget + the threaded cancel flag
     pub fn generate_budgeted(
         &self,
         image: &Image,
@@ -241,6 +270,7 @@ impl Seedvr2Pipeline {
         seed: u64,
         softness: f32,
         safe_gib: f64,
+        cancel: Option<&CancelFlag>,
     ) -> CResult<Image> {
         // Tile when EITHER the memory budget is exceeded (sc-6225) OR the output edge is past the VAE
         // decoder's correctness limit (sc-8228/sc-8261): above ~1536² the decoder corrupts its output
@@ -252,7 +282,7 @@ impl Seedvr2Pipeline {
         );
         let over_vae_cap = width.max(height) as i32 > video::VAE_SAFE_DECODE_EDGE_PX;
         if over_budget || over_vae_cap {
-            return self.generate_tiled(image, width, height, seed, softness, safe_gib);
+            return self.generate_tiled(image, width, height, seed, softness, safe_gib, cancel);
         }
 
         let processed = self.preprocess(image, width, height, softness)?; // (1,3,H,W)
@@ -274,7 +304,8 @@ impl Seedvr2Pipeline {
     /// tiling — the image analog of the [`Self::generate_video_tiled`] per-frame branch. Reuses the
     /// budget tile sizer + parity-gated [`Self::run_frame_tiled`] + per-frame color correction, so peak
     /// stays bounded at any resolution (no single allocation exceeds the budget-sized tile). `safe_gib`
-    /// sizes the tile.
+    /// sizes the tile. Honors `cancel` before each spatial tile (sc-12465).
+    #[allow(clippy::too_many_arguments)] // size/seed/budget + the threaded cancel flag
     fn generate_tiled(
         &self,
         image: &Image,
@@ -283,13 +314,14 @@ impl Seedvr2Pipeline {
         seed: u64,
         softness: f32,
         safe_gib: f64,
+        cancel: Option<&CancelFlag>,
     ) -> CResult<Image> {
         let tile = video::plan_spatial_tile_px(self.weights_bytes, safe_gib);
         let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
         let processed = self
             .preprocess(image, width, height, softness)?
             .unsqueeze(2)?; // (1,3,1,H,W)
-        let decoded = self.run_frame_tiled(&processed, seed, tile, overlap)?;
+        let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, cancel)?;
         Ok(self
             .frames_from_decoded(&decoded, &processed, 1)?
             .into_iter()
@@ -416,7 +448,8 @@ impl Seedvr2Pipeline {
     ///
     /// `cancel` is the caller's cooperative cancel flag (the gen-core video per-step cancel contract,
     /// sc-8972/sc-11227; mirrors `Sam3VideoModel::propagate`): checked before each (seconds-to-minutes)
-    /// chunk/frame so a mid-clip cancel is honored promptly instead of after the whole upscale, surfacing
+    /// chunk/frame — and before each spatial tile within a tiled frame (sc-12465) — so a mid-clip
+    /// cancel is honored promptly instead of after the whole upscale, surfacing
     /// the typed [`CandleError::Canceled`]. `progress` is invoked `(units_done, units_total)` after each
     /// completed chunk/frame (real per-unit progress, 1-based `units_done`), replacing the old
     /// fixed-placeholder single step; `units_total` is the number of chunks (chunked path) or frames
@@ -513,7 +546,7 @@ impl Seedvr2Pipeline {
         let mut out = Vec::with_capacity(total);
         for (i, f) in frames.iter().enumerate() {
             check_canceled(cancel)?;
-            out.push(self.generate(f, width, height, seed, softness)?);
+            out.push(self.generate(f, width, height, seed, softness, cancel)?);
             if let Some(cb) = progress.as_deref_mut() {
                 cb(i + 1, total);
             }
@@ -524,8 +557,9 @@ impl Seedvr2Pipeline {
     /// HD spatial-tiling video path (sc-5201): each frame is upscaled per-frame (`T=1`) but **spatially
     /// tiled** — the budget sizer picks the largest square tile that fits, and the decoded tiles are
     /// feather-blended. Used when even one full-resolution frame exceeds the memory budget; bounds peak
-    /// at any resolution. Honors `cancel` before each frame and reports `(frame+1, total)` real
-    /// progress (sc-11227).
+    /// at any resolution. Honors `cancel` before each frame **and before each spatial tile within a
+    /// frame** (sc-12465 — a single 4096-wide frame spans ~9 tiles, each a full encode→DiT→decode),
+    /// and reports `(frame+1, total)` real progress (sc-11227).
     #[allow(clippy::too_many_arguments)] // size/seed + cancel + progress threaded from generate_video
     fn generate_video_tiled(
         &self,
@@ -544,7 +578,7 @@ impl Seedvr2Pipeline {
         for (i, f) in frames.iter().enumerate() {
             check_canceled(cancel)?;
             let processed = self.preprocess(f, width, height, softness)?.unsqueeze(2)?; // (1,3,1,H,W)
-            let decoded = self.run_frame_tiled(&processed, seed, tile, overlap)?;
+            let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, cancel)?;
             let imgs = self.frames_from_decoded(&decoded, &processed, 1)?;
             out.push(imgs.into_iter().next().expect("one frame"));
             if let Some(cb) = progress.as_deref_mut() {
@@ -558,20 +592,24 @@ impl Seedvr2Pipeline {
     /// decode path on each overlapping `tile`-px tile (one-step Euler, same-seed noise) and feather-
     /// blend the decoded tiles into a full `(1,3,1,H,W)` frame. candle is eager, so only one tile's
     /// activations are resident at a time (the memory bound); the two full-frame accumulators are the
-    /// only persistent allocations. Public for the harness.
+    /// only persistent allocations. Honors `cancel` before each tile (sc-12465 — each tile is a full
+    /// seconds-to-minutes encode→DiT→decode pass, the per-unit granularity of the cancel contract on
+    /// this path). Public for the harness.
     pub fn run_frame_tiled(
         &self,
         processed: &Tensor,
         seed: u64,
         tile: i32,
         overlap: i32,
+        cancel: Option<&CancelFlag>,
     ) -> CResult<Tensor> {
         let (_b, _c, _t, height, width) = processed.dims5()?; // (1,3,1,H,W)
         let (h_i, w_i) = (height as i32, width as i32);
         let plan = video::plan_spatial_tiles(h_i, w_i, tile, overlap);
         let mut acc: Option<Tensor> = None; // (1,3,1,H,W)
         let mut wsum: Option<Tensor> = None; // (1,1,1,H,W)
-        for t in &plan {
+                                             // `for_each_tile` checks the cancel flag before each (seconds-to-minutes) tile.
+        for_each_tile(&plan, cancel, |t| {
             let (th, tw) = ((t.y1 - t.y0) as usize, (t.x1 - t.x0) as usize);
             let (y0, x0) = (t.y0 as usize, t.x0 as usize);
             let tile_clip = processed.narrow(3, y0, th)?.narrow(4, x0, tw)?; // (1,3,1,th,tw)
@@ -604,15 +642,16 @@ impl Seedvr2Pipeline {
             let wpad = weight
                 .pad_with_zeros(3, y0, pad_b)?
                 .pad_with_zeros(4, x0, pad_r)?;
-            acc = Some(match acc {
+            acc = Some(match acc.take() {
                 Some(a) => a.add(&wdec)?,
                 None => wdec,
             });
-            wsum = Some(match wsum {
+            wsum = Some(match wsum.take() {
                 Some(a) => a.add(&wpad)?,
                 None => wpad,
             });
-        }
+            Ok(())
+        })?;
         Ok(acc
             .expect("≥1 tile")
             .broadcast_div(&wsum.expect("≥1 tile"))?)
@@ -623,8 +662,8 @@ impl Seedvr2Pipeline {
 mod tests {
     use super::*;
 
-    /// sc-11227 / F-092: the video upscale loops check `check_canceled` before each
-    /// (seconds-to-minutes) chunk/frame and surface the **typed** [`CandleError::Canceled`] (never a
+    /// sc-11227 / F-092: the upscale loops check `check_canceled` before each
+    /// (seconds-to-minutes) chunk/frame/tile and surface the **typed** [`CandleError::Canceled`] (never a
     /// stringified `Msg` — the worker keys off the variant to map a user cancel). An absent or
     /// untripped flag is a no-op. Mirrors `Sam3VideoModel`'s `check_canceled` (sc-8972).
     #[test]
@@ -637,6 +676,64 @@ mod tests {
             matches!(check_canceled(Some(&flag)), Err(CandleError::Canceled)),
             "tripped → typed Canceled"
         );
+    }
+
+    /// sc-12465 / F-013: the spatial-tile loop checks `check_canceled` at the **top of every tile
+    /// iteration** — the per-unit cancel contract's unit on the tiled paths is one tile (a full
+    /// VAE-encode → DiT → VAE-decode, seconds-to-minutes), not one frame/image. This exercises
+    /// [`for_each_tile`] itself — the production driver [`Seedvr2Pipeline::run_frame_tiled`] runs
+    /// its tile work through (full-pipeline construction needs a complete fixed-arch checkpoint, so
+    /// the driver is extracted to make the real loop weight-free-testable; deleting the driver's
+    /// `check_canceled` fails this test). Pins that a flag tripped after N completed tiles stops
+    /// the loop before tile N+1, a pre-tripped flag stops it before any tile, and an untripped flag
+    /// runs the full plan. The real-weight path is exercised by
+    /// `cuda_video_smoke::cuda_tiled_cancel_*`.
+    #[test]
+    fn spatial_tile_loop_cancels_between_tiles() {
+        // The F-013 descriptor-max case: a 4096² still at the VAE-cap tile edge (1536) with the
+        // standard overlap → a 3×3 = 9-tile plan, so a cancel-free tiled still would run 9 full
+        // encode→DiT→decode passes after the last pre-`generate` check.
+        let plan = video::plan_spatial_tiles(
+            4096,
+            4096,
+            video::VAE_SAFE_DECODE_EDGE_PX,
+            video::SPATIAL_OVERLAP,
+        );
+        assert_eq!(plan.len(), 9, "4096² @ tile 1536 must be a 3×3 plan");
+
+        // Untripped flag → every tile runs, Ok.
+        let flag = CancelFlag::new();
+        let mut tiles_done = 0usize;
+        let result = for_each_tile(&plan, Some(&flag), |_t| {
+            tiles_done += 1;
+            Ok(())
+        });
+        assert!(result.is_ok(), "untripped flag must not abort the loop");
+        assert_eq!(tiles_done, plan.len(), "untripped flag runs the full plan");
+
+        for trip_after in [0usize, 1, 3] {
+            let flag = CancelFlag::new();
+            if trip_after == 0 {
+                flag.cancel(); // pre-cancelled before the loop starts
+            }
+            let mut tiles_done = 0usize;
+            // The closure is the tile's encode→DiT→decode work; the cancel lands mid-run here.
+            let result = for_each_tile(&plan, Some(&flag), |_t| {
+                tiles_done += 1;
+                if tiles_done == trip_after {
+                    flag.cancel();
+                }
+                Ok(())
+            });
+            assert!(
+                matches!(result, Err(CandleError::Canceled)),
+                "tripped flag must surface the typed Canceled (trip_after={trip_after})"
+            );
+            assert_eq!(
+                tiles_done, trip_after,
+                "no tile may run after the flag trips (trip_after={trip_after})"
+            );
+        }
     }
 
     /// The per-unit progress contract (sc-11227): the loops report `(done, total)` with `done`
