@@ -10,9 +10,24 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded PR runs, but never cancel a push to main or a release tag.
+# github.ref is refs/heads/main for every merge, so a shared main group meant each
+# merge cancelled the previous merge's in-flight run: 24 of 60 main runs cancelled
+# over the sampled window, i.e. 40% of main commits carried no verdict at all
+# (sc-12399, filed against the sibling SceneWorks lane — same root cause here).
+# That matters most for windows-cuda-check and the macOS lanes: platform targets are
+# mutually exclusive, so each lane is the ONLY thing compiling its cfg, and a killed
+# run misattributes the break to the next commit and makes bisect over main useless.
+#
+# Main keys on github.sha, not just cancel-in-progress: GitHub allows at most ONE
+# pending run per concurrency group and evicts it when a newer run queues, so a
+# shared main group still drops the middle commit of a 3+ merge burst even with
+# cancel-in-progress off. Per-SHA groups cannot evict each other; runs serialize on
+# the runner instead. Tag builds likewise never cancel (tags are immutable — see
+# CONTRIBUTING). Do NOT collapse this back to `group: ...${{ github.ref }}`.
 concurrency:
-  group: inference-ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: inference-ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
