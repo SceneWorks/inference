@@ -43,10 +43,45 @@ pub(crate) fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 /// Scaled-dot-product attention. `q,k,v`: `[B, H, S*, d]`; softmax upcast to f32.
+///
+/// Delegates to the shared i32-overflow-safe [`candle_gen::sdpa_budgeted_bhsd`] — the sc-6217 /
+/// sc-9116 query-row chunking Qwen and Krea already carry, ported to Wan here (sc-12434). It chunks
+/// over the query rows once the `[B, H, Sq, Sk]` score block would exceed
+/// [`candle_gen::ATTN_SCORES_BUDGET`], so the full `[B, H, S, S]` matrix is never materialized. Both
+/// A14B experts and the 5B share this one attention; at every advertised A14B geometry the un-chunked
+/// score block (S ≈ 33k tokens at 480p, up to ≈ 76k at the 720p `MAX_AREA_14B` ceiling; 40 heads) is
+/// hundreds of GiB and OOMs a 96 GB card before the first denoise step — chunking caps each block's
+/// transient near the budget instead. Each query row's softmax is over all keys and independent of the
+/// others, so the chunked result equals the single pass; the chunking engages only on the over-budget
+/// denoise self-attention and stays a no-op single pass for the small cross-attention (S_kv = text
+/// tokens) and every in-budget size.
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
-    let attn = softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
-    attn.matmul(&v.contiguous()?)
+    let dtype = q.dtype();
+    sdpa_budgeted(
+        q,
+        k,
+        v,
+        scale,
+        candle_gen::ATTN_SCORES_BUDGET,
+        |scores: &Tensor| softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(dtype),
+    )
+}
+
+/// [`sdpa`] with an explicit scores-element `budget` (the query-row chunk threshold) and `softmax`
+/// closure — the shared budgeted attention both production and the tests route through, so the test's
+/// call-counting proof exercises the same chunking the render uses. Production fixes the budget at
+/// [`candle_gen::ATTN_SCORES_BUDGET`] and passes the f32-upcast softmax; the test drives a tiny budget
+/// and a counting wrapper of that same softmax. Wan self- and cross-attention carry no mask, so `mask`
+/// is always `None`.
+fn sdpa_budgeted(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    budget: usize,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    candle_gen::sdpa_budgeted_bhsd(q, k, v, scale, None, softmax, budget)
 }
 
 struct Attention {
@@ -703,6 +738,70 @@ mod tests {
         assert!(
             max_abs(&vel, &vel0) > 1e-6,
             "source-id RoPE (id 1 vs id 0) must change the coupled velocity"
+        );
+    }
+
+    /// The ported sc-6217 query-row chunking (sc-12434): forcing a tiny scores budget must split the
+    /// query rows yet reproduce the single un-chunked pass — byte-for-byte (exact `0.0`), since each
+    /// query row's softmax is independent. This is the guarantee that stops the A14B self-attention
+    /// from materializing the whole `[B,H,S,S]` block. Counting softmax invocations **through the
+    /// production `sdpa_budgeted`** proves the render's own path chunks (one call per query block), so
+    /// a regression back to a single materialized pass fails here, not just a silently-slower one.
+    #[test]
+    fn sdpa_chunks_query_rows_and_matches_single_pass() {
+        use std::cell::Cell;
+        let dev = Device::Cpu;
+        let (b, h, s, d) = (1usize, 2usize, 7usize, 4usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let scale = (d as f64).powf(-0.5);
+        let dtype = q.dtype();
+
+        // Production default budget (ATTN_SCORES_BUDGET ≫ this size) is a single un-chunked pass.
+        let single = sdpa(&q, &k, &v, scale).unwrap();
+
+        // Drive the PRODUCTION `sdpa_budgeted` with a call-counting wrapper of the exact f32-upcast
+        // softmax and tiny budgets. budget 42 → block = 42/(b·h·sk) = 42/14 = 3 → blocks 3,3,1 over
+        // S=7 (3 calls); budget 1 → 7 single-row blocks (7 more calls). A regression that stopped
+        // chunking would report 1 and fail. Each chunked result is byte-identical to the single pass.
+        let calls = Cell::new(0usize);
+        let counting = |scores: &Tensor| {
+            calls.set(calls.get() + 1);
+            softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(dtype)
+        };
+        let chunked = sdpa_budgeted(&q, &k, &v, scale, 42, counting).unwrap();
+        assert_eq!(
+            calls.get(),
+            3,
+            "budget 42 must split S=7 into 3 query-row blocks (3,3,1)"
+        );
+        assert_eq!(
+            max_abs(&single, &chunked),
+            0.0,
+            "chunked attention must be byte-identical to the single pass"
+        );
+        let block1 = sdpa_budgeted(&q, &k, &v, scale, 1, counting).unwrap();
+        assert_eq!(calls.get(), 10, "budget 1 adds 7 single-row blocks (3 + 7)");
+        assert_eq!(
+            max_abs(&single, &block1),
+            0.0,
+            "single-row chunks must be byte-identical to the single pass"
+        );
+
+        // The production budget genuinely engages at the story's 832x480 A14B proof geometry
+        // (h = 40, S ≈ 32,760, b = 1 under Lightning CFG-off): one query row's score contribution
+        // already exceeds the budget, so `sdpa`'s fixed ATTN_SCORES_BUDGET forces chunking there, and
+        // each resulting block stays under candle's CUDA i32 element ceiling.
+        let rows_per_query = 40 * 32_760usize;
+        assert!(
+            rows_per_query * 32_760 > candle_gen::ATTN_SCORES_BUDGET,
+            "A14B 480p self-attention must be over budget (chunking engages)"
+        );
+        let block = candle_gen::ATTN_SCORES_BUDGET / rows_per_query;
+        assert!(
+            rows_per_query * block <= i32::MAX as usize,
+            "each chunk's score block must stay under the CUDA i32 element ceiling"
         );
     }
 }

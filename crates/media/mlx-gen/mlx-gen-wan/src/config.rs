@@ -35,6 +35,14 @@ pub const SIZE_MULTIPLE_14B: u32 = 16;
 /// the 5B's 720p genuinely IS 704-tall. **This is the 5B's number and only the 5B's**: it was once
 /// applied to the whole 14B family, silently costing them their real 720p (sc-12308).
 pub const MAX_AREA_5B: usize = 1280 * 704;
+/// Spatial size grid for the **TI2V-5B**: `vae_stride_spatial (16) × patch (2) = 32` px per side —
+/// the z48 VAE's lattice, coarser than the 14B family's [`SIZE_MULTIPLE_14B`] = 16. Mirrors candle's
+/// `candle_gen_wan::config::SIZE_MULTIPLE` (both = 32). Equals `grid(&wan22_ti2v_5b())` — pinned by a
+/// test — so it faithfully mirrors the lattice `validate` actually enforces: an off-grid request is
+/// **rejected**, not silently align-down refit (sc-12607). Exposed as a `pub const` so the worker's
+/// `pinned_engine_geometry` tie (sc-12587) can anchor the 5B stride on the macos lane, the same way
+/// [`SIZE_MULTIPLE_14B`] anchors the 14B family (sc-12409).
+pub const SIZE_MULTIPLE: u32 = 32;
 
 /// CFG guidance scale. Dense models (5B, Wan2.1) use a single scalar; the Wan2.2 dual-expert MoE
 /// models select `low` below the timestep boundary and `high` at/above it (`generate_wan.py`).

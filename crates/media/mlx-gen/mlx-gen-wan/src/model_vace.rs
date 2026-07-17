@@ -39,8 +39,8 @@ use crate::config::{WanModelConfig, WanVaceConfig};
 use crate::model::dit_resident_bytes;
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, latent_shape,
-    preflight_denoise_memory_guard, preprocess_i2v_image, reject_over_area, resolve_sampler_knobs,
-    seq_len,
+    preflight_denoise_memory_guard, preprocess_i2v_image, reject_off_grid, reject_over_area,
+    resolve_sampler_knobs, seq_len,
 };
 use crate::scheduler::SolverKind;
 use crate::text_encoder::encode_text_staged;
@@ -763,10 +763,12 @@ fn validate_vace_clip(
     req: &GenerationRequest,
 ) -> Result<()> {
     descriptor.capabilities.validate_request(id, req)?;
-    // sc-12308: the VACE lanes had NO area cap on mlx while candle hard-errored on the same request
-    // — the widest of the three backend behaviours. Wan2.1's `vace-14B` shares the 14B family's
-    // `1280*720` budget, and VACE aligns to `patch · VAE_S` = 16 like the rest of the family.
+    // sc-12607/sc-12308: reject an off-grid or over-area geometry rather than silently align-down
+    // refitting it — candle hard-errors both on the same request (the widest of the three backend
+    // behaviours was mlx's silent refit). Wan2.1's `vace-14B` aligns to `patch · VAE_S` = 16 like the
+    // rest of the family and shares its `1280*720` budget.
     let grid = (config.base.patch_size.2 * VAE_S) as u32;
+    reject_off_grid(id, req, grid, grid)?;
     reject_over_area(id, req, grid, grid, config.base.max_area)?;
     let clip = req.control_clip().ok_or_else(|| {
         Error::Msg(format!(
@@ -886,5 +888,22 @@ mod tests {
         let err = validate_vace_clip(&descriptor_vace_fun(), MODEL_ID_VACE_FUN, &cfg, &req)
             .expect_err("dual-expert: 1029 frames must be rejected");
         assert!(err.to_string().contains("exceeds the maximum 1025"));
+    }
+
+    /// sc-12607 — VACE renders on the 14B family's `patch(2)·VAE_S(8)` = 16-px grid; candle rejects an
+    /// off-16 request, so mlx must too (it used to only `align_dim` it down in `vace_prep`). The reject
+    /// fires before the ControlClip/frame checks, so an off-grid size is refused even with a valid clip.
+    #[test]
+    fn validate_vace_rejects_off_grid_size() {
+        let cfg = test_config();
+        let d = descriptor_vace();
+        let v = |w, h| validate_vace_clip(&d, MODEL_ID_VACE, &cfg, &clip_request(5, w, h, 0));
+        // 72 is off the 16-px grid (72 = 4.5·16) — rejected, not snapped to 64.
+        let err = v(72, 64).expect_err("72 is off the 16-px grid").to_string();
+        assert!(err.contains("multiples of 16"), "unexpected: {err}");
+        // Off-grid on the height axis too.
+        assert!(v(64, 72).is_err());
+        // On-grid 64×64 still validates.
+        assert!(v(64, 64).is_ok());
     }
 }
