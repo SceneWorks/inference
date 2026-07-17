@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, PerComponentBytes, Progress, Quant, WeightsSource,
 };
 use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResult};
 
@@ -120,69 +120,13 @@ impl Pipeline {
     /// may carry several `.safetensors` (bf16 + fp8 variants), so prefer `distilled`, then a `bf16`
     /// dense file, then the largest remaining — fp8/mixed are skipped (candle loads the bf16 weights).
     fn ltx_checkpoint(&self) -> CResult<PathBuf> {
-        let lname = |p: &Path| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-        };
-        let mut cands: Vec<PathBuf> = std::fs::read_dir(&self.root)
-            .map_err(|e| CandleError::Msg(format!("ltx: read snapshot dir: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                let name = lname(p);
-                name.ends_with(".safetensors")
-                    && !name.contains("lora")
-                    && !name.contains("upscaler")
-                    && !name.contains("fp8")
-                    && !name.contains("mixed")
-            })
-            .collect();
-        cands.sort();
-        if cands.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "ltx: no dense LTX-2.3 `.safetensors` checkpoint in {} (expected e.g. \
-                 `ltx-2.3-22b-distilled.safetensors` or a `*_bf16.safetensors` full-model fine-tune)",
-                self.root.display()
-            )));
-        }
-        if let Some(p) = cands.iter().find(|p| lname(p).contains("distilled")) {
-            return Ok(p.clone());
-        }
-        if let Some(p) = cands.iter().find(|p| lname(p).contains("bf16")) {
-            return Ok(p.clone());
-        }
-        // No name hint — the full dense model dwarfs any aux file, so take the largest.
-        Ok(cands
-            .into_iter()
-            .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-            .expect("cands non-empty"))
+        ltx_checkpoint_in(&self.root)
     }
 
     /// The Gemma-3-12B encoder snapshot dir. A `LoadSpec::text_encoder` override (sc-8827) wins; then
     /// `$LTX_GEMMA_DIR`; then `<root>/text_encoder`.
     fn gemma_dir(&self) -> CResult<PathBuf> {
-        if let Some(p) = &self.gemma_override {
-            if !p.is_dir() {
-                return Err(CandleError::Msg(format!(
-                    "ltx: LoadSpec text_encoder path is not a directory: {}",
-                    p.display()
-                )));
-            }
-            return Ok(p.clone());
-        }
-        if let Ok(p) = std::env::var("LTX_GEMMA_DIR") {
-            return Ok(PathBuf::from(p));
-        }
-        let fallback = self.root.join("text_encoder");
-        if fallback.is_dir() {
-            return Ok(fallback);
-        }
-        Err(CandleError::Msg(
-            "ltx: set LTX_GEMMA_DIR to a google/gemma-3-12b-it snapshot (or place it at \
-             <root>/text_encoder)"
-                .into(),
-        ))
+        gemma_dir_for(&self.root, self.gemma_override.as_deref())
     }
 
     fn safetensors_in(dir: &Path) -> CResult<Vec<PathBuf>> {
@@ -529,6 +473,152 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// The single full **dense bf16** LTX-2.3 checkpoint in `root` — the 22B model bundling DiT + VAE +
+/// audio-VAE + vocoder + projection (not a LoRA / upscaler / fp8 variant). Handles both the base
+/// `Lightricks/LTX-2.3` (`ltx-2.3-22b-distilled*.safetensors`) and full-model fine-tunes whose file is
+/// named differently (e.g. the eros merge's `10Eros_v1_bf16.safetensors`, sc-5495): the snapshot may
+/// carry several `.safetensors` (bf16 + fp8 variants), so prefer `distilled`, then a `bf16` dense file,
+/// then the largest remaining — fp8/mixed are skipped (candle loads the bf16 weights).
+///
+/// **The single source of truth for which file the dense path loads** — [`Pipeline::ltx_checkpoint`]
+/// mmaps it and [`component_footprint`] sizes it (sc-12397). Keeping the selection in one free function
+/// is the whole point: the hosted `Lightricks/LTX-2.3` snapshot is ~146 GiB on disk against a ONE-file
+/// load, so a consumer that sums the directory would over-predict by ~7x and refuse LTX on every GPU in
+/// existence. Only this crate knows which file wins.
+fn ltx_checkpoint_in(root: &Path) -> CResult<PathBuf> {
+    let lname = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let mut cands: Vec<PathBuf> = std::fs::read_dir(root)
+        .map_err(|e| CandleError::Msg(format!("ltx: read snapshot dir: {e}")))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let name = lname(p);
+            name.ends_with(".safetensors")
+                && !name.contains("lora")
+                && !name.contains("upscaler")
+                && !name.contains("fp8")
+                && !name.contains("mixed")
+        })
+        .collect();
+    cands.sort();
+    if cands.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "ltx: no dense LTX-2.3 `.safetensors` checkpoint in {} (expected e.g. \
+             `ltx-2.3-22b-distilled.safetensors` or a `*_bf16.safetensors` full-model fine-tune)",
+            root.display()
+        )));
+    }
+    if let Some(p) = cands.iter().find(|p| lname(p).contains("distilled")) {
+        return Ok(p.clone());
+    }
+    if let Some(p) = cands.iter().find(|p| lname(p).contains("bf16")) {
+        return Ok(p.clone());
+    }
+    // No name hint — the full dense model dwarfs any aux file, so take the largest.
+    Ok(cands
+        .into_iter()
+        .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .expect("cands non-empty"))
+}
+
+/// The Gemma-3-12B encoder snapshot dir for a `root` + optional `LoadSpec::text_encoder` override
+/// (sc-8827): the override wins; then `$LTX_GEMMA_DIR`; then `<root>/text_encoder`.
+///
+/// Shared by [`Pipeline::gemma_dir`] and [`component_footprint`] so the gate sizes the encoder the load
+/// will actually read. Note this is the DENSE path's precedence; the packed tier resolves its Gemma via
+/// [`tier::TierPaths::detect`] (override, else the tier's sibling `gemma/`) and does not consult
+/// `$LTX_GEMMA_DIR` — [`component_footprint`] mirrors that split rather than assuming one rule.
+fn gemma_dir_for(root: &Path, gemma_override: Option<&Path>) -> CResult<PathBuf> {
+    if let Some(p) = gemma_override {
+        if !p.is_dir() {
+            return Err(CandleError::Msg(format!(
+                "ltx: LoadSpec text_encoder path is not a directory: {}",
+                p.display()
+            )));
+        }
+        return Ok(p.to_path_buf());
+    }
+    if let Ok(p) = std::env::var("LTX_GEMMA_DIR") {
+        return Ok(PathBuf::from(p));
+    }
+    let fallback = root.join("text_encoder");
+    if fallback.is_dir() {
+        return Ok(fallback);
+    }
+    Err(CandleError::Msg(
+        "ltx: set LTX_GEMMA_DIR to a google/gemma-3-12b-it snapshot (or place it at \
+         <root>/text_encoder)"
+            .into(),
+    ))
+}
+
+/// The snapshot root a `spec` loads from — a `Dir` as-is, a `File`'s parent (LTX is the one video
+/// provider that accepts a single-file source). Mirrors [`load`].
+fn spec_root(spec: &LoadSpec) -> PathBuf {
+    match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(p) => p
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| p.clone()),
+    }
+}
+
+/// The provider-owned per-component on-disk footprint (sc-12397, epic 1788) — the size of the exact
+/// files a load will mmap, NOT a directory sum.
+///
+/// Lets a pre-load fit gate size an LTX job honestly. The consumer (`sceneworks-worker`'s candle video
+/// VRAM gate) cannot compute this itself, and the gap is not marginal:
+///  * **dense** — [`ltx_checkpoint_in`] picks ONE root file out of a snapshot that also ships
+///    `fp8`/`mixed`/lora/upscaler siblings. Hosted `Lightricks/LTX-2.3` is ~146 GiB on disk against that
+///    single-file load, so a directory sum refuses LTX on every GPU that exists.
+///  * **packed tier** — the load reads 3 files (`transformer` + `connector` + `vae_decoder`) while the
+///    tier dir also ships `vae_encoder` + `audio_vae` + `vocoder` + `upsampler`, which the T2V render
+///    never loads (see [`tier`]'s note).
+///
+/// Mapping onto [`PerComponentBytes`]' three slots: `text_encoder` = the Gemma-3-12B encoder (a
+/// SEPARATE ~24 GB snapshot that is not under the weights root — omitting it would under-count by more
+/// than the DiT). `dit` = the transformer, plus the connector on the tier path. `vae` = the tier's
+/// `vae_decoder`; on the dense path it is **0** because the VAE is bundled inside the one checkpoint
+/// already counted in `dit` — the slots are a partition of the load, never double-counted.
+///
+/// A component that cannot be resolved contributes `0` rather than erroring: the footprint is a pre-load
+/// ADMISSION signal, and reporting no signal (⇒ the caller admits) is safer than refusing a job over an
+/// unreadable path. `load_components` reports the real error moments later. In particular a dense
+/// snapshot with no resolvable checkpoint, or a Gemma dir that is absent (the `$LTX_GEMMA_DIR` env is
+/// read here, but a bare unset env with no `<root>/text_encoder` is not an error at gate time), simply
+/// reads 0.
+pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerComponentBytes> {
+    let root = spec_root(spec);
+    let gemma_override = spec.text_encoder.as_ref().map(|src| match src {
+        WeightsSource::Dir(p) | WeightsSource::File(p) => p.clone(),
+    });
+    // The tier path resolves Gemma through `TierPaths` (override, else the sibling `gemma/`); the dense
+    // path through `gemma_dir_for` (override, env, `<root>/text_encoder`). Follow whichever applies.
+    if let Some(paths) = tier::TierPaths::detect(&root, gemma_override.as_deref()) {
+        let tier_file = |name: &str| gen_core::safetensors_path_bytes(paths.tier_dir.join(name));
+        return Ok(PerComponentBytes {
+            text_encoder: gen_core::safetensors_path_bytes(&paths.gemma_dir),
+            dit: tier_file("transformer.safetensors") + tier_file("connector.safetensors"),
+            vae: tier_file("vae_decoder.safetensors"),
+        });
+    }
+    Ok(PerComponentBytes {
+        text_encoder: gemma_dir_for(&root, gemma_override.as_deref())
+            .map(gen_core::safetensors_path_bytes)
+            .unwrap_or(0),
+        // The one dense checkpoint bundles DiT + VAE + audio-VAE + vocoder + projection.
+        dit: ltx_checkpoint_in(&root)
+            .map(gen_core::safetensors_path_bytes)
+            .unwrap_or(0),
+        vae: 0,
+    })
+}
+
 /// Construct a lazy candle LTX-2.3 generator. `spec.weights` is an LTX-2.3 snapshot dir (the
 /// `ltx-2.3-22b-distilled.safetensors` checkpoint); the Gemma encoder is located via `LTX_GEMMA_DIR`.
 /// Adapters / quantization / conditioning are rejected (not wired).
@@ -572,7 +662,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
+    pub(crate) const REGISTRATION = descriptor => load;
+    footprint = component_footprint
 }
 
 /// Add the Candle LTX generator to an explicit media registry builder.
@@ -832,6 +923,130 @@ mod tests {
         assert!(
             g.validate(&ok).is_ok(),
             "an in-bounds long clip must pass: {ok:?}"
+        );
+    }
+
+    /// sc-12397 — the DENSE layout: the footprint must size the ONE checkpoint `ltx_checkpoint_in`
+    /// picks, plus the Gemma encoder. NOT the directory.
+    ///
+    /// This is why LTX owns its own footprint. The hosted `Lightricks/LTX-2.3` is ~146 GiB on disk
+    /// (`estimatedSizeBytes: 157004895813`) against a SINGLE-file load, because the snapshot also ships
+    /// fp8/mixed/lora/upscaler siblings. A consumer summing the dir would over-predict by ~7x and refuse
+    /// LTX on every GPU in existence — a wall-reject, the worst failure a fit gate has.
+    ///
+    /// Kills the mutation: swapping `ltx_checkpoint_in` for `safetensors_dir_bytes(root)` makes `dit`
+    /// read 12_400 instead of 9_000.
+    #[test]
+    fn component_footprint_dense_sizes_one_checkpoint_plus_gemma() {
+        let root = std::env::temp_dir().join(format!(
+            "sc12397_ltx_dense_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, len) in [
+            ("ltx-2.3-22b-distilled.safetensors", 9_000_u64), // the one that loads
+            ("ltx-2.3-22b-fp8.safetensors", 2_000),           // skipped: fp8
+            ("ltx-2.3-22b-mixed.safetensors", 1_000),         // skipped: mixed
+            ("some-upscaler.safetensors", 300),               // skipped: upscaler
+            ("a-lora.safetensors", 100),                      // skipped: lora
+        ] {
+            std::fs::File::create(root.join(name))
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        }
+        // The Gemma encoder is a SEPARATE snapshot threaded via `LoadSpec::text_encoder` — omitting it
+        // would under-count by more than the DiT on the real model (~24 GB).
+        let gemma = root.join("gemma-snapshot");
+        std::fs::create_dir_all(&gemma).unwrap();
+        std::fs::File::create(gemma.join("model.safetensors"))
+            .unwrap()
+            .set_len(4_000)
+            .unwrap();
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        spec.text_encoder = Some(WeightsSource::Dir(gemma.clone()));
+        let fp = component_footprint(&spec).expect("footprint");
+
+        assert_eq!(fp.dit, 9_000, "the distilled checkpoint alone, not the dir");
+        assert_eq!(fp.text_encoder, 4_000, "the Gemma snapshot must be counted");
+        assert_eq!(
+            fp.vae, 0,
+            "the dense checkpoint bundles the VAE — counting it again would double-count"
+        );
+        // The slots partition the load: 13_000, not the 12_400-in-root dir sum + gemma.
+        assert_eq!(fp.text_encoder + fp.dit + fp.vae, 13_000);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// sc-12397 — the PACKED TIER layout: exactly the 3 files the T2V render loads, plus the sibling
+    /// Gemma. The tier dir also ships `vae_encoder` + `audio_vae` + `vocoder` + `upsampler`, which
+    /// `load_components_tier` never reads — summing the dir would over-count them.
+    #[test]
+    fn component_footprint_tier_sizes_the_three_loaded_files_plus_gemma() {
+        let snapshot = std::env::temp_dir().join(format!(
+            "sc12397_ltx_tier_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&snapshot);
+        let tier = snapshot.join("q4");
+        std::fs::create_dir_all(&tier).unwrap();
+        // `TierPaths::detect` needs BOTH markers: transformer.safetensors + quantize_config.json.
+        std::fs::write(tier.join("quantize_config.json"), "{}").unwrap();
+        for (name, len) in [
+            ("transformer.safetensors", 5_000_u64), // loaded
+            ("connector.safetensors", 700),         // loaded
+            ("vae_decoder.safetensors", 300),       // loaded
+            ("vae_encoder.safetensors", 9_000),     // NOT loaded by the T2V render
+            ("audio_vae.safetensors", 8_000),       // NOT loaded
+            ("vocoder.safetensors", 7_000),         // NOT loaded
+            ("upsampler.safetensors", 6_000),       // NOT loaded
+        ] {
+            std::fs::File::create(tier.join(name))
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        }
+        // The tier's Gemma is its SIBLING (`<snapshot>/gemma`), not an override.
+        let gemma = snapshot.join("gemma");
+        std::fs::create_dir_all(&gemma).unwrap();
+        std::fs::File::create(gemma.join("model.safetensors"))
+            .unwrap()
+            .set_len(4_000)
+            .unwrap();
+
+        let spec = LoadSpec::new(WeightsSource::Dir(tier.clone()));
+        let fp = component_footprint(&spec).expect("footprint");
+
+        assert_eq!(fp.dit, 5_700, "transformer + connector");
+        assert_eq!(fp.vae, 300, "the DECODER only — the encoder is not loaded");
+        assert_eq!(fp.text_encoder, 4_000, "the sibling gemma/ dir");
+        // 10_000 — where a dir sum would read 36_000 + gemma and refuse a card that runs this fine.
+        assert_eq!(fp.text_encoder + fp.dit + fp.vae, 10_000);
+
+        std::fs::remove_dir_all(&snapshot).ok();
+    }
+
+    /// An unresolvable snapshot reports NO SIGNAL rather than erroring: the footprint is a pre-load
+    /// ADMISSION signal, so "no signal" (⇒ the caller admits) beats refusing a job over an unreadable
+    /// path. `load_components` surfaces the real error moments later.
+    ///
+    /// Asserts only the weights-root slots. `text_encoder` is deliberately NOT asserted: `gemma_dir_for`
+    /// consults `$LTX_GEMMA_DIR` when there is no override, so on a machine that has it set (a real LTX
+    /// box) this would legitimately read non-zero. Pinning it would make the test pass or fail on the
+    /// runner's environment rather than on the code.
+    #[test]
+    fn component_footprint_reports_no_signal_rather_than_failing() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ltx-snapshot".into()));
+        let fp = component_footprint(&spec).expect("a missing snapshot is not a footprint error");
+        assert_eq!(
+            (fp.dit, fp.vae),
+            (0, 0),
+            "an unreadable snapshot must read as no signal, not an error"
         );
     }
 }
