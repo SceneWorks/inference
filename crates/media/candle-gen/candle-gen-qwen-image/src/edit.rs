@@ -547,6 +547,7 @@ impl QwenEdit {
     ) -> Result<Image> {
         self.residency.run(
             &req.cancel,
+            &self.device,
             false,
             on_progress,
             |text| self.encode_conditioning(&text.vl_encoder, &text.vae_encoder, req, references),

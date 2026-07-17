@@ -591,13 +591,13 @@ impl Pipeline {
                 encode(te, tokenizer)
             }
         }?;
-        // The sequential residency seam drops `TextPhase` as soon as this closure returns, then the
-        // heavy loader reuses its CUDA allocations. Candle launches the Mistral/Qwen encode
-        // asynchronously, so the weights must stay alive until that work is complete. Without this
-        // boundary sync FLUX.2-dev Q4 deterministically produced different pixels in resident and
-        // sequential modes; `CUDA_LAUNCH_BLOCKING=1` restored parity and isolated this lifetime race
-        // (sc-12195). CPU and Metal synchronize through the same backend-neutral device operation.
-        self.device.synchronize()?;
+        // The sc-12195 post-encode boundary sync used to live here as a local `device.synchronize()`:
+        // the sequential seam drops `TextPhase` as soon as this closure returns while candle's
+        // Mistral/Qwen encode kernels are still in flight, and the heavy loader reuses the freed CUDA
+        // allocations (deterministically corrupting FLUX.2-dev Q4 pixels). The sync now lives in the
+        // shared seam — `candle_gen::run_sequential` synchronizes the device after the encode returns
+        // and before the text phase drops, so every sequential consumer inherits it (sc-12453). Do
+        // not re-add a local sync here; the seam is the single point of enforcement.
         Ok(encoded)
     }
 
@@ -793,6 +793,7 @@ impl Generator for Flux2Generator {
         self.validate(req)?;
         let images = self.residency.run(
             &req.cancel,
+            &self.pipe.device,
             req.use_pid,
             on_progress,
             |text| self.pipe.encode_phase(text, req),

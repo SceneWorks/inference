@@ -233,6 +233,7 @@ impl Generator for FluxGenerator {
         self.validate(req)?;
         let images = self.residency.run(
             &req.cancel,
+            self.pipe.device(),
             req.use_pid,
             on_progress,
             |text| self.pipe.encode_residency(text, &req.prompt),

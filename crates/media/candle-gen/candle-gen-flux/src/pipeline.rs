@@ -273,6 +273,13 @@ impl Pipeline {
         }
     }
 
+    /// The compute device this pipeline loads and runs on — threaded into
+    /// [`candle_gen::Residency::run`] so the sequential seam can perform the sc-12195 post-encode
+    /// eviction sync (sc-12453).
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Which PiD spec [`load_pid`](Self::load_pid) should actually load: the spec the caller opted into
     /// via `LoadSpec::pid`, but only when this load will use it (F-177).
     ///
