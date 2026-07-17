@@ -411,6 +411,14 @@ impl WanVace {
         // preflight the dense lanes run (model.rs). Batch factor 1 (`cfg_enabled: false`): VACE CFG
         // runs cond/uncond as two sequential B=1 forwards (vace.rs F-073), not the dense lanes'
         // batched B=2, so one forward's working set is the activation peak.
+        //
+        // Known under-fit: the 72 B/token/dim activation coefficient was fit on the DENSE forward
+        // (real TI2V-5B measurements, sc-4986). A VACE forward additionally materializes the
+        // per-vace-layer hint stack and the 96-ch control patch-embed, so this likely
+        // under-estimates a VACE forward's working set by ~20-30% (partially offset by the guard's
+        // 0.85 headroom): near-budget passes are optimistic, not guaranteed. Recalibrating the
+        // coefficient requires real-weight VACE runs on hardware and is deliberately not attempted
+        // here.
         preflight_denoise_memory_guard(
             self.descriptor.id,
             dit_resident_bytes(&[vace_transformer_weights_path(&self.root)], self.quantize),
@@ -614,6 +622,12 @@ impl WanVaceFun {
         // Both experts stay resident through the denoise (mirroring the dense A14B, model.rs), so
         // their weight files are summed. Batch factor 1 (`cfg_enabled: false`): VACE CFG runs
         // cond/uncond as two sequential B=1 forwards (vace.rs F-073), not the dense lanes' B=2.
+        //
+        // Known under-fit: the 72 B/token/dim activation coefficient was fit on the DENSE forward
+        // (sc-4986); the VACE forward's extra hint stack + 96-ch control patch-embed likely push a
+        // forward's working set ~20-30% above this estimate (partially offset by the 0.85
+        // headroom) — see the fuller note at the single-expert call site
+        // (`WanVace::generate_impl`). Recalibration is hardware-gated and not attempted here.
         preflight_denoise_memory_guard(
             self.descriptor.id,
             dit_resident_bytes(
