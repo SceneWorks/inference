@@ -25,9 +25,16 @@ mod openai;
 use std::io::{self, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mlx_llm::core_llm::{self, CancelFlag, Error as CoreError, LoadSpec, Quantize, StreamEvent, TextLlm};
+
+/// How long a connected peer may stay silent before its connection is dropped (F-022). The server
+/// is single-threaded, so a peer that connects and sends nothing (a stray `nc`) would otherwise
+/// block `read_line` forever and wedge every subsequent client. 10 seconds is generous for any
+/// legitimate client writing a request (even by hand over a slow link) while bounding how long one
+/// idle connection can monopolise the serving thread.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() {
     if let Err(e) = run() {
@@ -114,17 +121,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let addr = listener.local_addr()?;
     eprintln!("mlx-llm-server listening on http://{addr}  (model: {default_model})");
 
+    serve(&listener, provider.as_ref(), &default_model, READ_TIMEOUT);
+    Ok(())
+}
+
+/// The serial accept loop. A per-connection error (including a read timeout) drops that connection
+/// only — the loop always continues serving subsequent clients.
+fn serve(listener: &TcpListener, provider: &dyn TextLlm, default_model: &str, read_timeout: Duration) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(e) = handle_connection(stream, provider.as_ref(), &default_model) {
+                // F-022: bound how long a silent peer can hold the single serving thread.
+                if let Err(e) = stream.set_read_timeout(Some(read_timeout)) {
+                    eprintln!("connection error: {e}");
+                    continue;
+                }
+                if let Err(e) = handle_connection(stream, provider, default_model) {
                     eprintln!("connection error: {e}");
                 }
             }
             Err(e) => eprintln!("accept error: {e}"),
         }
     }
-    Ok(())
 }
 
 /// Serve one request on a connection, then close it (`Connection: close`).
@@ -137,8 +155,14 @@ fn handle_connection(
     let req = match http::read_request(&mut reader) {
         Ok(Some(req)) => req,
         Ok(None) => return Ok(()), // idle disconnect
+        // Read timeout (F-022): the peer went silent mid-request — treat it as a dropped
+        // connection, not an error worth replying to (the peer isn't reading anyway).
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            return Ok(());
+        }
         Err(e) => {
-            return write_json(&mut stream, 400, &openai::error_body(&e.to_string(), "invalid_request"));
+            let status = http::error_status(&e);
+            return write_json(&mut stream, status, &openai::error_body(&e.to_string(), "invalid_request"));
         }
     };
 
@@ -287,6 +311,7 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         _ => "OK",
     };
@@ -308,4 +333,100 @@ fn unix_secs() -> u64 {
 fn completion_id() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
     format!("chatcmpl-{:012}", N.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::SocketAddr;
+
+    /// The tests below only exercise routes that never touch the provider (`/health`, parse
+    /// errors), so every method is unreachable.
+    struct StubLlm;
+    impl TextLlm for StubLlm {
+        fn descriptor(&self) -> &core_llm::TextLlmDescriptor {
+            unreachable!("tests never invoke the provider")
+        }
+        fn validate(&self, _: &core_llm::TextLlmRequest) -> core_llm::Result<()> {
+            unreachable!("tests never invoke the provider")
+        }
+        fn generate(
+            &self,
+            _: &core_llm::TextLlmRequest,
+            _: &mut dyn FnMut(StreamEvent),
+        ) -> core_llm::Result<core_llm::TextLlmOutput> {
+            unreachable!("tests never invoke the provider")
+        }
+    }
+
+    /// Run the real [`serve`] loop on an ephemeral port; returns the address to connect to.
+    fn spawn_server(read_timeout: Duration) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let stub = StubLlm;
+            serve(&listener, &stub, "test-model", read_timeout);
+        });
+        addr
+    }
+
+    /// Issue `GET /health` and return the whole response. The generous-but-bounded client read
+    /// timeout keeps a regression from hanging the test binary.
+    fn get_health(addr: SocketAddr) -> String {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s.write_all(b"GET /health HTTP/1.1\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        resp
+    }
+
+    /// F-022: a peer that connects and sends nothing must not wedge the single-threaded server —
+    /// it times out, is dropped without a response, and the next client is served.
+    #[test]
+    fn silent_connection_times_out_and_next_client_is_served() {
+        let addr = spawn_server(Duration::from_millis(200));
+        let mut silent = TcpStream::connect(addr).unwrap();
+        silent.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+
+        // Served only after the silent peer times out (the server is strictly serial).
+        let resp = get_health(addr);
+        assert!(resp.starts_with("HTTP/1.1 200"), "unexpected response: {resp:?}");
+        assert!(resp.ends_with("ok"), "unexpected response: {resp:?}");
+
+        // The silent connection was dropped (clean EOF), not answered.
+        let mut buf = [0u8; 16];
+        assert_eq!(silent.read(&mut buf).unwrap(), 0);
+    }
+
+    /// F-022: silence *mid-request* (partial headers, then nothing) is also treated as a dropped
+    /// connection, and the loop continues serving subsequent clients.
+    #[test]
+    fn mid_request_silence_times_out_and_next_client_is_served() {
+        let addr = spawn_server(Duration::from_millis(200));
+        let mut stalled = TcpStream::connect(addr).unwrap();
+        // A valid request line and a header fragment with no terminator, then silence.
+        stalled.write_all(b"GET /health HTTP/1.1\r\nHost: x").unwrap();
+
+        let resp = get_health(addr);
+        assert!(resp.starts_with("HTTP/1.1 200"), "unexpected response: {resp:?}");
+    }
+
+    /// F-006, end to end: a no-newline flood gets a 431 response (not OOM), and the server keeps
+    /// serving. Exactly `MAX_LINE + 1` bytes so the server consumes the whole flood before
+    /// responding — no unread bytes to turn the close into a RST.
+    #[test]
+    fn request_line_flood_gets_431_and_server_keeps_serving() {
+        let addr = spawn_server(Duration::from_secs(30));
+        let mut flood = TcpStream::connect(addr).unwrap();
+        flood.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        flood.write_all(&vec![b'A'; http::MAX_LINE as usize + 1]).unwrap();
+        let mut resp = String::new();
+        flood.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 431"), "unexpected response: {resp:?}");
+
+        let resp2 = get_health(addr);
+        assert!(resp2.starts_with("HTTP/1.1 200"), "unexpected response: {resp2:?}");
+    }
 }
