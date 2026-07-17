@@ -48,7 +48,10 @@ fn cast_weights(w: &Weights, dt: Dtype) -> Result<Weights> {
 /// Estimate resident weight bytes for the video memory budget: the raw `fp16` checkpoint file sizes
 /// scaled by the load `dtype` (`Bfloat16` keeps the 2 B/param footprint, `Float32` doubles it). File
 /// sizes (vs summing per-tensor) match the wan `dit_resident_bytes` convention; the safetensors header
-/// overhead is negligible.
+/// overhead is negligible. The raw file stores each shared-block attention tensor once (under
+/// `.all`), and since [`Seedvr2Pipeline::load`] casts before duplicating the `_vid`/`_txt` handles
+/// (F-012) the resident model holds one buffer per source tensor too — so this file-size estimate
+/// matches the actual resident bytes (it previously under-counted the duplicated ~1.15 GB on 3B).
 fn resident_weight_bytes(files: &[&std::path::Path], dt: Dtype) -> usize {
     let raw: u64 = files
         .iter()
@@ -107,7 +110,15 @@ impl Seedvr2Pipeline {
         let dit_path = dir.join(dit_file);
         let weights_bytes = resident_weight_bytes(&[&vae_path, &dit_path], dt);
         let vae_w = cast_weights(&convert::convert_vae(&Weights::from_file(&vae_path)?)?, dt)?;
-        let dit_w = cast_weights(&convert::convert_dit(&Weights::from_file(&dit_path)?)?, dt)?;
+        // DiT: cast BEFORE converting (F-012). `convert_dit` duplicates each shared-block
+        // `.attn.{proj_qkv,proj_out,norm_q,norm_k}.all` tensor into `_vid`/`_txt` keys as two
+        // refcounted handles of ONE array; casting after the duplication gave each key its own
+        // `as_dtype` node, materializing two identical buffers per shared tensor (~1.15 GB extra
+        // on the 3B at bf16 — MLX does not CSE across arrays). Casting first makes both keys
+        // share the single cast buffer. The reorder is exact for every key: `cast_weights` is
+        // key-independent and `convert_dit` is dtype-independent (renames + handle clones only).
+        // The VAE has no duplicated keys, so its order stays as-is.
+        let dit_w = convert::convert_dit(&cast_weights(&Weights::from_file(&dit_path)?, dt)?)?;
         let mut p = Self::from_weights(&vae_w, &dit_w, cfg)?;
         p.neg_embed = Some(load_neg_embed(dt)?);
         p.dtype = dt;
@@ -788,5 +799,138 @@ impl Seedvr2Pipeline {
             on_step(tile_idx + 1, n_tiles);
         }
         Ok(divide(acc.expect("≥1 tile"), wsum.expect("≥1 tile"))?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The raw checkpoint keys of one shared block's attention (stored once under `.all`), at the
+    /// given shapes, in fp16 (the dtype the real file stores). Values are random so buffers are
+    /// genuinely materialized (MLX `full`/broadcast outputs can be stride-0 views); the RNG is
+    /// explicitly keyed — the process-global RNG state binds to the first test thread's Metal
+    /// stream and panics later tests with "There is no Stream(gpu, 0) in current thread".
+    fn synth_shared_attn_block(w: &mut Weights, idx: i32, dim: i32, heads: i32, head_dim: i32) {
+        let qkv = 3 * heads * head_dim;
+        for (i, (name, shape)) in [
+            ("proj_qkv.all.weight", vec![qkv, dim]),
+            ("proj_out.all.weight", vec![dim, dim]),
+            ("proj_out.all.bias", vec![dim]),
+            ("norm_q.all.weight", vec![head_dim]),
+            ("norm_k.all.weight", vec![head_dim]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = random::key((idx as u64) << 8 | i as u64).unwrap();
+            let a = random::normal::<f32>(&shape, None, None, Some(&key))
+                .unwrap()
+                .as_dtype(Dtype::Float16)
+                .unwrap();
+            a.eval().unwrap();
+            w.insert(format!("blocks.{idx}.attn.{name}"), a);
+        }
+    }
+
+    /// F-012 pin: `Seedvr2Pipeline::load`'s cast-then-convert order makes the duplicated
+    /// `_vid`/`_txt` keys of a shared block share ONE materialized buffer, where the previous
+    /// convert-then-cast order materialized two (each key got its own `as_dtype` node).
+    #[test]
+    fn cast_then_convert_shares_one_buffer_for_duplicated_keys() {
+        let mut raw = Weights::empty();
+        synth_shared_attn_block(&mut raw, 10, 64, 2, 32);
+
+        // the `load` order: cast the raw (fp16 → f32, a real cast) BEFORE duplicating keys.
+        let shared = convert::convert_dit(&cast_weights(&raw, Dtype::Float32).unwrap()).unwrap();
+        for sub in ["proj_qkv", "proj_out"] {
+            let v = shared
+                .require(&format!("blocks.10.attn.{sub}_vid.weight"))
+                .unwrap();
+            let t = shared
+                .require(&format!("blocks.10.attn.{sub}_txt.weight"))
+                .unwrap();
+            assert_eq!(
+                v.as_slice::<f32>().as_ptr(),
+                t.as_slice::<f32>().as_ptr(),
+                "{sub}: _vid/_txt must share one buffer after cast-then-convert"
+            );
+        }
+
+        // the pre-F-012 order (convert, then per-key cast) demonstrably duplicates the buffer —
+        // this is the waste the reorder removes; if MLX ever starts CSE-ing identical cast nodes
+        // this assertion (not the fix) is what becomes stale.
+        let dup = cast_weights(&convert::convert_dit(&raw).unwrap(), Dtype::Float32).unwrap();
+        let v = dup.require("blocks.10.attn.proj_qkv_vid.weight").unwrap();
+        let t = dup.require("blocks.10.attn.proj_qkv_txt.weight").unwrap();
+        assert_ne!(
+            v.as_slice::<f32>().as_ptr(),
+            t.as_slice::<f32>().as_ptr(),
+            "convert-then-cast materializes two buffers (the F-012 waste)"
+        );
+    }
+
+    /// F-012 measurement harness (synthetic tensors at the real 3B shapes — the real weights are
+    /// multi-GB and not fetched in CI): resident bytes of the 22 shared blocks' attention tensors
+    /// under the old (convert→cast) vs new (cast→convert) order, at bf16 (the default load dtype).
+    /// Expected: old ≈ 2.31 GB, new ≈ 1.15 GB, delta ≈ 1.15 GB. `#[ignore]`: allocates ~3.5 GB
+    /// transiently; run manually with
+    /// `cargo test --locked -p mlx-gen-seedvr2 --lib f012 -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "multi-GB measurement harness; run manually with --ignored"]
+    fn f012_measure_3b_shared_attn_resident_bytes() {
+        use mlx_rs::memory::{clear_cache, get_active_memory};
+
+        // The 3B config: vid_dim 2560, 20 heads × 128, layers 10..32 shared (22 blocks).
+        let mut raw = Weights::empty();
+        for idx in 10..32 {
+            synth_shared_attn_block(&mut raw, idx, 2560, 20, 128);
+        }
+        // one shared-block attn set = qkv (3·2560·2560) + out (2560²+2560) + 2 norms (128 each)
+        let per_block_params: usize = 3 * 2560 * 2560 + 2560 * 2560 + 2560 + 128 + 128;
+        let shared_bytes_bf16 = 22 * per_block_params * 2; // 1_153_557_504 ≈ 1.15 GB
+
+        let eval_all = |w: &Weights| {
+            let arrays: Vec<&Array> = w.keys().map(|k| w.get(k).unwrap()).collect();
+            eval(arrays).unwrap();
+        };
+
+        clear_cache();
+        let base = get_active_memory();
+        let old = cast_weights(
+            &convert::convert_dit(&raw).unwrap(),
+            Dtype::Bfloat16,
+        )
+        .unwrap();
+        eval_all(&old);
+        clear_cache();
+        let old_bytes = get_active_memory().saturating_sub(base);
+        drop(old);
+        clear_cache();
+
+        let base = get_active_memory();
+        let new = convert::convert_dit(&cast_weights(&raw, Dtype::Bfloat16).unwrap()).unwrap();
+        eval_all(&new);
+        clear_cache();
+        let new_bytes = get_active_memory().saturating_sub(base);
+
+        eprintln!(
+            "[F-012] shared-attn resident: old(convert→cast)={old_bytes} B ({:.3} GB)  \
+             new(cast→convert)={new_bytes} B ({:.3} GB)  delta={} B ({:.3} GB)  \
+             expected shared set={shared_bytes_bf16} B",
+            old_bytes as f64 / 1e9,
+            new_bytes as f64 / 1e9,
+            old_bytes.saturating_sub(new_bytes),
+            old_bytes.saturating_sub(new_bytes) as f64 / 1e9,
+        );
+        let tol = shared_bytes_bf16 / 20; // 5% allocator-granularity slack
+        assert!(
+            new_bytes.abs_diff(shared_bytes_bf16) < tol,
+            "new order must hold ~one bf16 copy: {new_bytes} vs {shared_bytes_bf16}"
+        );
+        assert!(
+            old_bytes.saturating_sub(new_bytes).abs_diff(shared_bytes_bf16) < tol,
+            "reorder must save ~one bf16 copy (~1.15 GB): old {old_bytes} new {new_bytes}"
+        );
     }
 }
