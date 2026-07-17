@@ -40,11 +40,9 @@ pub enum Architecture {
     DeepseekV2,
     /// Qwen3.5/3.6 family (`model_type` `qwen3_5` / `qwen3_5_text`): a VLM-wrapped **hybrid
     /// linear-attention** decoder — 3-of-4 layers are Gated DeltaNet (linear attention) and 1-of-4 is
-    /// gated full attention with partial RoPE; the 35B variant is MoE. **Dispatch + routing only
-    /// today** (sc-7626) so it no longer misroutes to the JoyCaption vision provider; the hybrid
-    /// decoder itself is built in sc-7627 (DeltaNet primitive + recurrent cache), sc-7628 (decoder),
-    /// sc-7629 (27B), and sc-7630 (35B MoE). The decoder-shape predicates below stay at their
-    /// defaults until then.
+    /// gated full attention with partial RoPE; the 35B variant is MoE. The provider routes this
+    /// family through [`crate::models::Qwen35Config`] and [`crate::models::Qwen35Model`], rather
+    /// than the generic full-attention [`ModelConfig`].
     Qwen35,
     /// Qwen3-VL family (`model_type` `qwen3_vl` / `text_config.model_type` `qwen3_vl_text`): a
     /// VLM-wrapped **standard full-attention** Qwen3 decoder (GQA + per-head q/k RMSNorm + SwiGLU)
@@ -314,14 +312,13 @@ impl ModelConfig {
     /// Parse from an already-decoded `config.json` value.
     pub fn from_json(v: &Value) -> Result<Self> {
         let architecture = Architecture::from_config(v)?;
-        // Recognized for routing (so it no longer misroutes to the JoyCaption vision provider —
-        // sc-7626), but the hybrid Gated-DeltaNet / gated-full-attention decoder is not built yet.
-        // Fail clearly rather than mis-parsing the VLM-wrapped config as a dense decoder.
+        // The hybrid Qwen3.6 decoder has its own config/weights path in the provider. Do not
+        // mis-parse its VLM-wrapped config as a generic full-attention decoder here.
         if architecture == Architecture::Qwen35 {
             return Err(Error::Unsupported(
                 "Qwen3.6 (model_type `qwen3_5`) is a hybrid linear-attention (Gated DeltaNet + gated \
-                 full attention) decoder; text generation is not yet implemented (tracked: sc-7627 \
-                 DeltaNet primitive, sc-7628 decoder, sc-7629 27B, sc-7630 35B MoE)"
+                 full attention) decoder; it is routed through Qwen35Config rather than the generic \
+                 ModelConfig"
                     .to_string(),
             ));
         }
@@ -969,9 +966,9 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_modelconfig_fails_clearly_until_decoder_lands() {
-        // Recognized for routing, but generation isn't implemented yet — the parse must fail with a
-        // clear Unsupported message (NOT a cryptic missing-field error, NOT the JoyCaption error).
+    fn qwen35_modelconfig_declines_the_provider_routed_decoder() {
+        // ModelConfig deliberately declines the hybrid decoder instead of producing a cryptic
+        // missing-field error; the provider routes it through Qwen35Config.
         let v = json!({
             "architectures": ["Qwen3_5ForConditionalGeneration"],
             "model_type": "qwen3_5",
@@ -981,7 +978,8 @@ mod tests {
         match ModelConfig::from_json(&v) {
             Err(Error::Unsupported(m)) => {
                 assert!(m.contains("qwen3_5"), "{m}");
-                assert!(m.contains("sc-7627") || m.contains("not yet implemented"), "{m}");
+                assert!(m.contains("Qwen35Config"), "{m}");
+                assert!(!m.contains("not yet implemented"), "{m}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
