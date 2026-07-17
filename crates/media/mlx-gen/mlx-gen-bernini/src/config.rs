@@ -3,9 +3,65 @@
 
 use std::path::Path;
 
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, GenerationRequest, Result};
+use mlx_gen_wan::config::{MAX_AREA_14B, SIZE_MULTIPLE_14B};
 
 use crate::forward::Mode;
+
+/// Shared request-geometry validation for **both** mlx Bernini entry points (the full `bernini`
+/// pipeline and the `bernini_renderer`), mirroring candle's
+/// `candle_gen_bernini::config::validate_bernini_geometry` so one manifest entry means one thing on
+/// both backends: reject an explicit `steps == 0`, a `width`/`height` that is not a multiple of
+/// [`SIZE_MULTIPLE_14B`], a **multi-frame** area over [`MAX_AREA_14B`], and a `num_frames` that is
+/// not `1 + 4·k`. `id` prefixes the message so each provider names itself.
+///
+/// sc-12454 (F-003): commit 83b512e9 (sc-12308) added the 14B video area cap to every candle Wan
+/// lane, both candle Bernini entry points, and every mlx Wan lane — but mlx Bernini was untouched,
+/// so a multi-frame 1280×1280 request (1.78× the envelope, the exact sc-9028 OOM geometry) validated
+/// here while candle hard-rejected it.
+///
+/// sc-12500 (F-040): the off-grid rejection replaces the silent `align_dim` refit — 1000×1000 used
+/// to render 992×992 on mlx with no diagnostic while candle errored. Both `generate_impl`s keep
+/// `align_dim` only as a no-op assert.
+///
+/// The area cap is deliberately **video-only** (`frames != Some(1)`) — see the comment at the check.
+pub fn validate_bernini_geometry(id: &str, req: &GenerationRequest) -> Result<()> {
+    if req.steps == Some(0) {
+        return Err(Error::Msg(format!(
+            "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE_14B) || !req.height.is_multiple_of(SIZE_MULTIPLE_14B)
+    {
+        return Err(Error::Msg(format!(
+            "{id}: width/height must be multiples of {SIZE_MULTIPLE_14B} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    // sc-12308: [`MAX_AREA_14B`] is a **video** envelope — it bounds the denoise/decode peak of a
+    // multi-frame run (81 frames → 21 latent frames on the z16 VAE). The still-image lane
+    // (`bernini_image`, which the worker maps onto this same `bernini` engine with `frames: Some(1)`)
+    // renders ONE frame, ~21× less latent volume than an at-cap clip, so the video area budget does
+    // not describe it and must not gate it. The image lane stays bounded by the descriptor's
+    // `max_size` (1280 per edge), which the capability check enforces. Mirrors candle's carve-out.
+    let is_still_image = req.frames == Some(1);
+    let area = req.width as usize * req.height as usize;
+    if !is_still_image && area > MAX_AREA_14B {
+        return Err(Error::Msg(format!(
+            "{id}: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
+             (1280×720); reduce the resolution",
+            req.width, req.height
+        )));
+    }
+    if let Some(f) = req.frames {
+        if f == 0 || f % 4 != 1 {
+            return Err(Error::Msg(format!(
+                "{id}: num_frames must be 1 + 4·k (got {f})"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Read a knob sidecar JSON, distinguishing "absent" from "corrupt" (F-097). An **absent** file is a
 /// valid state — the loader falls back to the built-in defaults — and returns `Value::Null`. A
@@ -173,5 +229,120 @@ mod tests {
         let r = BerniniKnobs::from_dir(&dir);
         std::fs::remove_dir_all(&dir).ok();
         assert!(r.is_err(), "corrupt sidecar must be an error");
+    }
+
+    /// sc-12454 (F-003) + sc-12500 (F-040): the shared geometry guard, mirroring candle's
+    /// `geometry_guard_rejects_bad_requests` — zero steps, off-grid sizes, over-area video, and bad
+    /// frame counts all reject before any weights load.
+    #[test]
+    fn geometry_guard_rejects_bad_requests() {
+        let base = GenerationRequest {
+            prompt: "x".into(),
+            width: 256,
+            height: 256,
+            ..Default::default()
+        };
+        assert!(validate_bernini_geometry("id", &base).is_ok());
+        // explicit zero steps
+        assert!(validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                steps: Some(0),
+                ..base.clone()
+            }
+        )
+        .is_err());
+        // sc-12500 (F-040): an off-grid size is REJECTED, not silently `align_dim`-refit — 1000×1000
+        // used to render 992×992 on mlx with no diagnostic while candle errored on the same payload.
+        let err = validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                width: 1000,
+                height: 1000,
+                ..base.clone()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("multiples of 16") && err.contains("1000x1000"),
+            "{err}"
+        );
+        // sc-12454 (F-003): a multi-frame 1280×1280 request — 1.78× the envelope, the exact sc-9028
+        // OOM geometry — is rejected like candle rejects it, instead of validating into an OOM.
+        let err = validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                width: 1280,
+                height: 1280,
+                frames: Some(81),
+                ..base.clone()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exceeds the max area 921600"), "{err}");
+        // `frames: None` defaults to a multi-frame video render, so it gets the cap too.
+        assert!(validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                width: 1280,
+                height: 1024,
+                ..base.clone()
+            }
+        )
+        .is_err());
+        // frames not ≡ 1 (mod 4)
+        assert!(validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                frames: Some(16),
+                ..base.clone()
+            }
+        )
+        .is_err());
+        assert!(validate_bernini_geometry(
+            "id",
+            &GenerationRequest {
+                frames: Some(17),
+                ..base.clone()
+            }
+        )
+        .is_ok());
+    }
+
+    /// sc-12308 / sc-12454: the area cap is a VIDEO envelope and must not gate the still-image lane.
+    /// `bernini_image` is mapped onto the same `bernini` engine by the worker with `frames: Some(1)`,
+    /// and its manifest default is 1024×1024 — over the 14B video budget. Mirrors candle's
+    /// `area_cap_is_video_only_and_admits_the_image_lane` so the carve-out cannot drift per backend.
+    #[test]
+    fn area_cap_is_video_only_and_admits_the_image_lane() {
+        let still = |w, h| GenerationRequest {
+            prompt: "x".into(),
+            width: w,
+            height: h,
+            frames: Some(1),
+            ..Default::default()
+        };
+
+        // The `bernini_image` manifest default (1 048 576 px) and its 720p buckets — all over the
+        // 921 600 video cap — must validate on the 1-frame lane.
+        const { assert!(1024 * 1024 > MAX_AREA_14B) };
+        assert!(validate_bernini_geometry("bernini_image", &still(1024, 1024)).is_ok());
+        assert!(validate_bernini_geometry("bernini_image", &still(1280, 720)).is_ok());
+        assert!(validate_bernini_geometry("bernini_image", &still(720, 1280)).is_ok());
+
+        // The image lane is still bound by the OTHER geometry guards — the 16-px grid in particular.
+        assert!(validate_bernini_geometry("bernini_image", &still(1000, 1000)).is_err());
+
+        // …and the video lane keeps its cap: the same geometry with a real frame count is rejected.
+        assert!(validate_bernini_geometry(
+            "bernini",
+            &GenerationRequest {
+                frames: Some(81),
+                ..still(1024, 1024)
+            }
+        )
+        .is_err());
     }
 }
