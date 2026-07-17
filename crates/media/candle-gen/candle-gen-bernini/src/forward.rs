@@ -121,20 +121,14 @@ impl PackedForward {
         let key: PatchKey = (dit as *const WanTransformer as usize, latent.id());
         // Scope the read guard so it is dropped before `patch_embed_tokens` + the re-lock on a miss —
         // `std::sync::Mutex` is not reentrant, so holding the guard across the insert would deadlock.
-        let hit = self
-            .patch_cache
-            .lock()
-            .unwrap()
+        let hit = candle_gen::lock_recover(&self.patch_cache)
             .get(&key)
             .map(|(tokens, grid)| (tokens.clone(), *grid));
         let (tokens, grid) = match hit {
             Some(entry) => entry,
             None => {
                 let (tokens, grid) = dit.patch_embed_tokens(latent)?;
-                self.patch_cache
-                    .lock()
-                    .unwrap()
-                    .insert(key, (tokens.clone(), grid));
+                candle_gen::lock_recover(&self.patch_cache).insert(key, (tokens.clone(), grid));
                 (tokens, grid)
             }
         };
@@ -767,6 +761,31 @@ mod tests {
             max_abs(&warm, &id2) > 0.0,
             "distinct source-ids must differ"
         );
+    }
+
+    #[test]
+    fn poisoned_patch_cache_recovers_on_next_embed() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let pf = PackedForward::new(cfg, 5.0, true);
+        let source = Tensor::randn(0f32, 1f32, (1, 16, 1, 4, 4), &dev).unwrap();
+        let before = pf.embed_segment(&dit, &source, 1.0).unwrap();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pf
+                .patch_cache
+                .lock()
+                .expect("test must acquire the healthy cache before poisoning it");
+            panic!("poison patch cache");
+        }));
+        assert!(poisoned.is_err());
+
+        let after = pf.embed_segment(&dit, &source, 1.0).unwrap();
+        assert_eq!(before.3, after.3);
+        assert_eq!(max_abs(&before.0, &after.0), 0.0);
+        assert_eq!(max_abs(&before.1, &after.1), 0.0);
+        assert_eq!(max_abs(&before.2, &after.2), 0.0);
     }
 
     /// A conditioning image extends the packed sequence but the sliced target velocity keeps the target's
