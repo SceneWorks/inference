@@ -7,7 +7,9 @@
 //! Each block: plain-RMSNorm → AdaLN-in → windowed joint attention (QK-norm + 3-D axial RoPE) →
 //! AdaLN-out → residual → RMSNorm → AdaLN-in → SwiGLU → AdaLN-out → residual (txt frozen on the
 //! last layer when `last_layer_vid_only`). Layers ≥ `mm_layers` share the MLP/AdaLN (`.all`); the
-//! attention always keeps separate `_vid`/`_txt` projections.
+//! attention always keeps separate `_vid`/`_txt` projection *fields*, but on shared layers those
+//! fields hold handles to the checkpoint's single `.all` tensor set — one buffer dense (F-012, see
+//! `Seedvr2Pipeline::load`) and one packed tensor set after quantization (`MMAttention::quantize`).
 //!
 //! Window attention: the partition is data-independent (depends only on the patch grid + window +
 //! shift), so the forward/reverse permutations and per-window shapes are computed on the host.
@@ -36,6 +38,9 @@ use crate::config::DitConfig;
 /// A dense or group-wise-affine-quantized `[out,in]` weight (sc-5198). Quantization is **Linear-only**
 /// (the VAE convs stay dense) and skips any Linear whose `in_features` is not a multiple of the group
 /// size — matching the reference predicate (which leaves e.g. `vid_in.proj`, in=132, dense).
+/// `Clone` clones the refcounted `Array` handles (not the buffers) — shared-block attention uses it
+/// to re-share one packed tensor set across the `_vid`/`_txt` fields after quantization (F-012).
+#[derive(Clone)]
 enum LinearWeight {
     Dense(Array),
     Quant {
@@ -659,9 +664,14 @@ struct MMAttention {
     window: (i32, i32, i32),
     rope_on_text: bool,
     rope_pixel: bool,
+    /// True for shared blocks (`idx >= mm_layers`): the checkpoint stores the attention projections
+    /// once under `.attn.*.all`, and `convert_dit` duplicates that single tensor into the `_vid`/
+    /// `_txt` keys — so the vid/txt fields hold identical weights by construction. `quantize` uses
+    /// this to pack the shared weights once and re-share the handles (F-012).
+    shared: bool,
 }
 impl MMAttention {
-    fn load(w: &Weights, prefix: &str, cfg: &DitConfig) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, cfg: &DitConfig, shared: bool) -> Result<Self> {
         Ok(Self {
             qkv_vid: Linear::load(w, &format!("{prefix}.proj_qkv_vid"), false)?,
             out_vid: Linear::load(w, &format!("{prefix}.proj_out_vid"), true)?,
@@ -679,6 +689,7 @@ impl MMAttention {
             window: cfg.window,
             rope_on_text: cfg.rope_on_text,
             rope_pixel: cfg.rope_pixel,
+            shared,
         })
     }
 
@@ -808,8 +819,21 @@ impl MMAttention {
     fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
         self.qkv_vid.quantize(bits, group)?;
         self.out_vid.quantize(bits, group)?;
-        self.qkv_txt.quantize(bits, group)?;
-        self.out_txt.quantize(bits, group) // norm_q/k are RMSNorm weights, not Linear
+        if self.shared {
+            // Shared blocks (F-012): `_vid`/`_txt` hold the checkpoint's single `.attn.*.all`
+            // tensor (identical values; one shared buffer on the `Seedvr2Pipeline::load` path).
+            // Quantizing each field separately would materialize two identical packed tensor sets
+            // (MLX does not CSE across arrays), re-duplicating ~0.6 GB (Q8) / ~0.3 GB (Q4) on the
+            // 3B — so pack once and re-share the handles. Bit-identical to quantizing both:
+            // `quantize_affine` is deterministic on identical inputs. Biases and the norm weights
+            // are not quantized and keep their (shared) handles.
+            self.qkv_txt.w = self.qkv_vid.w.clone();
+            self.out_txt.w = self.out_vid.w.clone();
+            Ok(())
+        } else {
+            self.qkv_txt.quantize(bits, group)?;
+            self.out_txt.quantize(bits, group) // norm_q/k are RMSNorm weights, not Linear
+        }
     }
 }
 
@@ -834,7 +858,7 @@ impl Block {
         let prefix = format!("blocks.{idx}");
         let shared = idx >= cfg.mm_layers;
         let is_last = cfg.last_layer_vid_only && idx == cfg.num_layers - 1;
-        let attn = MMAttention::load(w, &format!("{prefix}.attn"), cfg)?;
+        let attn = MMAttention::load(w, &format!("{prefix}.attn"), cfg, shared)?;
         // Shared blocks (`idx >= mm_layers`) route both streams through `.mlp.all`/`.ada.params_all`
         // (see `mlp_v`/`mlp_t`/`ada_v`/`ada_t`), so only load that single copy — the previous code
         // also loaded a dead `mlp_vid`/`ada_vid` copy of the same `.all` weights (and quantized the
@@ -1214,5 +1238,71 @@ mod stage_tests {
             .unwrap();
         let cos = cmp("dit_out", &out, io.require("dit_out").unwrap());
         assert!(cos > 0.999, "dit_out cosine {cos} too low");
+    }
+
+    /// F-012 pin, quantized path: a shared block's attention `_vid`/`_txt` fields hold ONE dense
+    /// buffer after `convert_dit` (handles of the `.all` tensor), and `quantize` packs that buffer
+    /// once, re-sharing the packed handles — not two identical, separately-materialized Q8 sets.
+    #[test]
+    fn shared_attention_shares_buffers_dense_and_quantized() {
+        let (dim, heads, hd) = (64, 2, 32);
+        let mut raw = Weights::empty();
+        for (i, (name, shape)) in [
+            ("proj_qkv.all.weight", vec![3 * heads * hd, dim]),
+            ("proj_out.all.weight", vec![dim, dim]),
+            ("proj_out.all.bias", vec![dim]),
+            ("norm_q.all.weight", vec![hd]),
+            ("norm_k.all.weight", vec![hd]),
+            ("rope.rope.freqs", vec![hd / 2]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // explicitly keyed RNG: the global RNG state binds to the first test thread's Metal
+            // stream and panics later same-binary tests ("There is no Stream(gpu, 0)").
+            let key = mlx_rs::random::key(i as u64).unwrap();
+            raw.insert(
+                format!("blocks.10.attn.{name}"),
+                mlx_rs::random::normal::<f32>(&shape, None, None, Some(&key)).unwrap(),
+            );
+        }
+        let w = crate::convert::convert_dit(&raw).unwrap();
+
+        let mut cfg = DitConfig::seedvr2_3b();
+        cfg.heads = heads;
+        cfg.head_dim = hd;
+        let mut attn = MMAttention::load(&w, "blocks.10.attn", &cfg, true).unwrap();
+
+        // dense: both streams hold the same buffer (convert duplicates handles, not arrays).
+        for (label, v, t) in [
+            ("qkv", &attn.qkv_vid.w, &attn.qkv_txt.w),
+            ("out", &attn.out_vid.w, &attn.out_txt.w),
+        ] {
+            let (LinearWeight::Dense(v), LinearWeight::Dense(t)) = (v, t) else {
+                panic!("{label}: expected dense before quantize");
+            };
+            assert_eq!(
+                v.as_slice::<f32>().as_ptr(),
+                t.as_slice::<f32>().as_ptr(),
+                "{label}: dense _vid/_txt must share one buffer"
+            );
+        }
+
+        // quantized: one packed tensor set shared across both streams.
+        attn.quantize(8, mlx_gen::quant::DEFAULT_GROUP_SIZE).unwrap();
+        for (label, v, t) in [
+            ("qkv", &attn.qkv_vid.w, &attn.qkv_txt.w),
+            ("out", &attn.out_vid.w, &attn.out_txt.w),
+        ] {
+            let (LinearWeight::Quant { wq: a, .. }, LinearWeight::Quant { wq: b, .. }) = (v, t)
+            else {
+                panic!("{label}: expected quantized after quantize");
+            };
+            assert_eq!(
+                a.as_slice::<u32>().as_ptr(),
+                b.as_slice::<u32>().as_ptr(),
+                "{label}: packed _vid/_txt must share one tensor set"
+            );
+        }
     }
 }

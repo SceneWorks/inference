@@ -68,6 +68,12 @@ fn dit_targets(k: &str) -> Vec<String> {
 }
 
 /// Convert the raw DiT checkpoint (key renames; no transposes — all weights are 2-D).
+///
+/// Shared-layer `.attn.*.all` tensors are duplicated into `_vid`/`_txt` keys as two refcounted
+/// **handles of one array** — no extra buffer. Keep it that way: any caller-side per-key transform
+/// applied *after* this (e.g. a dtype cast) turns each handle into its own lazy node and
+/// materializes two buffers (MLX does not CSE across arrays), which is why
+/// `Seedvr2Pipeline::load` casts **before** converting (F-012).
 pub fn convert_dit(raw: &Weights) -> Result<Weights> {
     let mut out = Weights::empty();
     let keys: Vec<String> = raw.keys().map(String::from).collect();
