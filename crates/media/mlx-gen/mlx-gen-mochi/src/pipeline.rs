@@ -17,7 +17,7 @@ use mlx_gen::{CancelFlag, Error, Image, Progress, Result};
 
 use crate::scheduler::{cfg_combine, MochiScheduler};
 use crate::transformer::MochiTransformer3DModel;
-use crate::vae::MochiVaeDecoder;
+use crate::vae::{MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
 
 /// `[v]` as a length-1 `Array` (small scalar helper for the uint8 conversion).
 fn scalar(v: f32) -> Array {
@@ -79,8 +79,12 @@ pub fn denoise(
     Ok(latents)
 }
 
-/// De-normalize + AsymmVAE-decode the final latents into `(F, H, W, 3)` uint8 frames. Honors a cancel
-/// issued after `Progress::Decoding` but before the decode begins.
+/// De-normalize + AsymmVAE-decode the final latents into `(F, H, W, 3)` uint8 frames.
+///
+/// The decode is **chunked** ([`MochiVaeDecoder::decode_chunked`]): an untiled decode holds the
+/// 128-channel `block_out` stage at full output resolution for the whole clip, which is what gated
+/// Mochi to 96 GB-class Macs (sc-12291). Chunking is exact here — not a blended tiling — so the
+/// decoded video is unchanged. `cancel` is honored before the decode and once per chunk.
 pub fn decode_to_frames(
     vae: &MochiVaeDecoder,
     latents: &Array,
@@ -89,7 +93,10 @@ pub fn decode_to_frames(
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    let video = vae.decode(latents)?; // [1, 3, F, H, W], ~[-1, 1]
+    // Drop whatever the denoise loop left in MLX's caching allocator before the decode's own peak
+    // (the scail2 precedent — retained cache otherwise stacks on top of the decode high-water).
+    mlx_rs::memory::clear_cache();
+    let video = vae.decode_chunked(latents, DEFAULT_DECODE_CHUNK_FRAMES, Some(cancel))?;
     to_uint8_frames(&video)
 }
 

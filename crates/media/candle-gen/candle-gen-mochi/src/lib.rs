@@ -52,7 +52,7 @@ pub use transformer::{
     load_transformer_var_builder, MochiAttention, MochiDitConfig, MochiTransformer3DModel,
     MochiTransformerBlock,
 };
-pub use vae::MochiVaeDecoder;
+pub use vae::{MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
 
 /// Public provider id: `"mochi_1"`.
 pub const MODEL_ID: &str = "mochi_1";

@@ -22,12 +22,12 @@
 
 use std::path::Path;
 
-use mlx_rs::ops::{add, pad, PadMode};
+use mlx_rs::ops::{add, concatenate_axis, pad, PadMode};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{group_norm, linear, silu};
 use mlx_gen::weights::{join, Weights};
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::MochiVaeConfig;
 
@@ -35,6 +35,72 @@ use crate::config::MochiVaeConfig;
 const GROUP_NORM_EPS: f32 = 1e-5;
 /// `MochiChunkedGroupNorm3D` group count.
 const NUM_GROUPS: i32 = 32;
+
+/// The element-count ceiling for a single decode intermediate.
+///
+/// **Measured (sc-12291), not assumed:** on real AsymmVAE weights at 848×480 an untiled decode is exact
+/// through `T_lat = 6` (`block_out` = 1.88e9 elements) and silently returns *wrong values* — no error,
+/// deterministically — from `T_lat = 7` (2.19e9) on. The break sits exactly on `i32::MAX`, so MLX is
+/// evidently indexing these tensors with 32-bit arithmetic somewhere below the Rust API. The failure is
+/// invisible to the `vae_parity` golden, which is dumped at 64×64/7 frames (6.3e6 elements, ~340× under
+/// the ceiling); the shipped 848×480/151-frame default is 8.13e9 elements, ~3.8× **over** it.
+///
+/// Chunking keeps every intermediate far below this line ([`DEFAULT_DECODE_CHUNK_FRAMES`] → 4.2e8 at
+/// 848×480, ~5× under), which is why the chunked decode is not merely cheaper but *correct where the
+/// untiled one is not*. The guards built on this constant make the failure an error, not a silent one.
+const MAX_TENSOR_ELEMS: i64 = i32::MAX as i64;
+
+/// Latent frames per chunk for [`MochiVaeDecoder::decode_chunked`].
+///
+/// The decode peak is dominated by `block_out`, which runs 128 channels at the **full** output
+/// resolution, so the working set scales with the chunk. **Measured** (848×480/151 frames, real
+/// weights, `get_peak_memory`, VAE weights included):
+///
+/// | chunk | decode peak |
+/// |---|---|
+/// | **1** | **24.70 GiB** |
+/// | 2 | 37.69 GiB |
+/// | 4 | 65.62 GiB |
+///
+/// 1 is the floor, and this knob exists to lower the floor: ~13 GiB below chunk=2 is the difference
+/// between Mochi fitting a 64 GB Mac with room and fitting it barely. A larger chunk trades that back
+/// for fewer per-chunk syncs; raise it if decode wall-clock ever matters more than reach. Whatever the
+/// value, the peak stays ~flat in clip length (37.08→37.75 GiB over 19→163 frames at chunk=2) — that
+/// flatness, not the absolute number, is what [`decode_denormalized_chunked`] buys.
+///
+/// `decode_denormalized_chunked` clamps this to [`MochiVaeDecoder::max_safe_chunk_frames`] (6 at
+/// 848×480), above which MLX silently corrupts — see [`MAX_TENSOR_ELEMS`].
+pub const DEFAULT_DECODE_CHUNK_FRAMES: usize = 1;
+
+/// Per-conv temporal cache threaded through a chunked decode: each slot holds the last `kt−1` frames
+/// of that conv's input from the previous chunk. `idx` resets to 0 each chunk and advances once per
+/// conv in the fixed traversal order, so slots stay aligned (the [`crate::vae`] decode body is a
+/// straight-line sequence, so the order is fixed). Mirrors the z48 Wan VAE's `FeatCache` idiom, and
+/// the `conv_cache` diffusers threads through `AutoencoderKLMochi`'s own framewise decode.
+///
+/// **Why a cache and not overlap+blend.** Every op in this decoder is either per-frame (the
+/// `GroupNorm(32)` is per-frame; silu/residual/proj are elementwise or per-position) or a causal conv,
+/// so feeding a chunk the previous chunk's real trailing frames reproduces the single-shot decode
+/// *exactly* — no seams to blend away. That matters here because the decoder's temporal receptive
+/// field is **~45 latent frames** (38 stacked `kt=3` causal convs: 12 + 24 latent-rate frames through
+/// `block_in`/`up_blocks[0]`, +5.3 at 3× and +4 at 6×) — *wider than a whole 5 s clip* (26 latent
+/// frames). The repo's shared `mlx_gen::tiling` gives causal tiles a **1**-frame left context, which
+/// would leave every tile after the first missing ~45 frames of history: not a boundary seam that a
+/// trapezoidal blend can hide, but a wrong tile. See `tests/chunked_decode.rs`.
+pub struct FrameCache {
+    slots: Vec<Option<Array>>,
+    idx: usize,
+}
+
+impl FrameCache {
+    /// A cache with one slot per causal conv, all empty (chunk 0 falls back to the replicate pad).
+    fn new(n: usize) -> Self {
+        Self {
+            slots: vec![None; n],
+            idx: 0,
+        }
+    }
+}
 
 /// A 3-D causal conv (`CogVideoXCausalConv3d`, `pad_mode="replicate"`). NCTHW I/O; the stored weight is
 /// already transposed to the mlx `[out, kt, kh, kw, in]` layout at load. Spatial padding is symmetric
@@ -66,32 +132,80 @@ impl CausalConv3d {
         })
     }
 
-    fn forward(&self, x_ncthw: &Array) -> Result<Array> {
+    /// `x_ncthw` → conv output (same T). `cache` threads the chunked decode: when its slot for this
+    /// conv is populated (every chunk after the first) the previous chunk's real trailing frames stand
+    /// in for the causal front-pad, which is what makes chunked == single-shot. `None` (or an empty
+    /// slot) falls back to the reference replicate pad.
+    fn forward(&self, x_ncthw: &Array, cache: Option<&mut FrameCache>) -> Result<Array> {
         let time_pad = self.kt - 1;
+
+        // Temporal context: real history when chunking, else the causal replicate pad of frame 0.
+        let xt = if time_pad == 0 {
+            x_ncthw.clone()
+        } else {
+            match cache.as_ref().and_then(|c| c.slots[c.idx].clone()) {
+                Some(prev) => concatenate_axis(&[&prev, x_ncthw], 2)?,
+                None => pad(
+                    x_ncthw,
+                    &[(0, 0), (0, 0), (time_pad, 0), (0, 0), (0, 0)][..],
+                    None,
+                    Some(PadMode::Edge),
+                )?,
+            }
+        };
+
+        // Hand the next chunk this conv's trailing frames (taken post-concat, as diffusers does, so a
+        // chunk shorter than `time_pad` still carries forward the right history), then advance the slot.
+        if let Some(c) = cache {
+            if time_pad > 0 {
+                let tail = last_frames(&xt, time_pad)?;
+                // Materialize the slice NOW. Left lazy it is a view onto `xt`, so the slot would pin
+                // this conv's whole padded input — and its producing subgraph — alive until the
+                // end-of-chunk eval, forcing all 38 convs' inputs to be live at once. That pinning,
+                // not the working set, dominates the peak. Measured at 848×480/151 frames: it is worth
+                // 61.00 → 37.69 GiB at chunk=2 and 35.01 → 24.70 GiB at chunk=1, for ~1.5× decode
+                // wall-clock (the eval serializes on a GPU sync per conv). The decode runs once per
+                // generation, after minutes of denoise, so the memory is the better side of that trade.
+                mlx_rs::transforms::eval([&tail])?;
+                c.slots[c.idx] = Some(tail);
+            }
+            c.idx += 1;
+        }
+
+        // Spatial replicate pad is symmetric and chunk-independent. NCTHW axes: 2=T, 3=H, 4=W.
         let h_pad = (self.kh - 1) / 2;
         let w_pad = (self.kw - 1) / 2;
-        let x = if time_pad > 0 || h_pad > 0 || w_pad > 0 {
-            // Replicate (edge) pad: T front-only (causal), H/W symmetric. NCTHW axes: 2=T, 3=H, 4=W.
+        let xp = if h_pad > 0 || w_pad > 0 {
             pad(
-                x_ncthw,
-                &[
-                    (0, 0),
-                    (0, 0),
-                    (time_pad, 0),
-                    (h_pad, h_pad),
-                    (w_pad, w_pad),
-                ][..],
+                &xt,
+                &[(0, 0), (0, 0), (0, 0), (h_pad, h_pad), (w_pad, w_pad)][..],
                 None,
                 Some(PadMode::Edge),
             )?
         } else {
-            x_ncthw.clone()
+            xt
         };
+
         // NCTHW -> NDHWC, conv (valid), back to NCTHW.
-        let x = x.transpose_axes(&[0, 2, 3, 4, 1])?;
-        let y = mlx_gen::nn::conv3d(&x, &self.w, Some(&self.b), (1, 1, 1), (0, 0, 0))?;
+        let xp = xp.transpose_axes(&[0, 2, 3, 4, 1])?;
+        let y = mlx_gen::nn::conv3d(&xp, &self.w, Some(&self.b), (1, 1, 1), (0, 0, 0))?;
         Ok(y.transpose_axes(&[0, 4, 1, 2, 3])?)
     }
+}
+
+/// The last `n` frames along the NCTHW temporal axis.
+fn last_frames(x: &Array, n: i32) -> Result<Array> {
+    let t = x.shape()[2];
+    let idx: Vec<i32> = (t - n..t).collect();
+    let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+    Ok(x.take_axis(&idx, 2)?)
+}
+
+/// Frames `[start, end)` along the NCTHW temporal axis.
+fn slice_frames(x: &Array, start: i32, end: i32) -> Result<Array> {
+    let idx: Vec<i32> = (start..end).collect();
+    let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+    Ok(x.take_axis(&idx, 2)?)
 }
 
 /// `MochiChunkedGroupNorm3D` — per-frame `GroupNorm(32)` over a NCTHW tensor. Reshapes `[B,C,T,H,W]` to
@@ -148,9 +262,13 @@ impl ResnetBlock {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let h = self.conv1.forward(&silu(&self.norm1.forward(x)?)?)?;
-        let h = self.conv2.forward(&silu(&self.norm2.forward(&h)?)?)?;
+    fn forward(&self, x: &Array, mut cache: Option<&mut FrameCache>) -> Result<Array> {
+        let h = self
+            .conv1
+            .forward(&silu(&self.norm1.forward(x)?)?, cache.as_deref_mut())?;
+        let h = self
+            .conv2
+            .forward(&silu(&self.norm2.forward(&h)?)?, cache)?;
         Ok(add(&h, x)?)
     }
 }
@@ -173,10 +291,10 @@ impl MidBlock {
         Ok(Self { resnets })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array, mut cache: Option<&mut FrameCache>) -> Result<Array> {
         let mut x = x.clone();
         for r in &self.resnets {
-            x = r.forward(&x)?;
+            x = r.forward(&x, cache.as_deref_mut())?;
         }
         Ok(x)
     }
@@ -222,10 +340,10 @@ impl UpBlock {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array, mut cache: Option<&mut FrameCache>) -> Result<Array> {
         let mut x = x.clone();
         for r in &self.resnets {
-            x = r.forward(&x)?;
+            x = r.forward(&x, cache.as_deref_mut())?;
         }
         // Channel-last proj: NCTHW -> [B,T,H,W,C] -> Linear -> [B,T,H,W,C_out·t·s²] -> NCTHW.
         let x = x.transpose_axes(&[0, 2, 3, 4, 1])?;
@@ -260,6 +378,10 @@ pub struct MochiVaeDecoder {
     latents_std: Array,
     scaling_factor: f32,
     temporal_ratio: i32,
+    /// `∏ spatial_expansions` (8) — with `temporal_ratio`, sizes the decode's largest intermediate.
+    spatial_ratio: i32,
+    /// `decoder_block_out_channels[0]` (128) — the width `block_out` runs at full output resolution.
+    first_block_channels: i32,
     dtype: Dtype,
 }
 
@@ -334,6 +456,8 @@ impl MochiVaeDecoder {
             latents_std,
             scaling_factor: cfg.scaling_factor,
             temporal_ratio: cfg.temporal_compression_ratio() as i32,
+            spatial_ratio: cfg.spatial_compression_ratio() as i32,
+            first_block_channels: cfg.decoder_block_out_channels[0] as i32,
             dtype,
         })
     }
@@ -346,29 +470,158 @@ impl MochiVaeDecoder {
         Ok(add(&scaled, &self.latents_mean)?)
     }
 
-    /// Decode an **already-de-normalized** latent `[B, C, T_lat, H_lat, W_lat]` → video
-    /// `[B, out_channels, F, H, W]` (`F = (T_lat − 1)·temporal_ratio + 1`, spatial ×8). Teacher-forced
-    /// entry point (the vae_parity gate feeds the golden's `denormalized_latents`).
-    pub fn decode_denormalized(&self, latents: &Array) -> Result<Array> {
-        let x = latents.as_dtype(self.dtype)?;
-        let mut x = self.conv_in.forward(&x)?;
-        x = self.block_in.forward(&x)?;
-        for up in &self.up_blocks {
-            x = up.forward(&x)?;
+    /// Elements in the decode's largest intermediate — `block_out`'s spatially-padded conv input, which
+    /// runs `first_block_channels` at the full output resolution — for `t_lat` latent frames.
+    fn peak_tensor_elems(&self, t_lat: i32, h_lat: i32, w_lat: i32) -> i64 {
+        let t = (self.temporal_ratio as i64) * (t_lat as i64) + 2; // +2: causal front-pad (kt−1)
+        let h = (h_lat as i64) * (self.spatial_ratio as i64) + 2; // +2: symmetric spatial pad
+        let w = (w_lat as i64) * (self.spatial_ratio as i64) + 2;
+        (self.first_block_channels as i64) * t * h * w
+    }
+
+    /// The largest chunk, in latent frames, whose decode keeps every intermediate under
+    /// [`MAX_TENSOR_ELEMS`] at this latent geometry. 0 when even a single frame would exceed it (only
+    /// reachable at resolutions far above Mochi's 848×480 design point).
+    pub fn max_safe_chunk_frames(&self, h_lat: i32, w_lat: i32) -> usize {
+        let per_frame_row =
+            self.peak_tensor_elems(1, h_lat, w_lat) - self.peak_tensor_elems(0, h_lat, w_lat);
+        if per_frame_row <= 0 {
+            return 1;
         }
-        x = self.block_out.forward(&x)?;
+        let headroom = MAX_TENSOR_ELEMS - self.peak_tensor_elems(0, h_lat, w_lat);
+        (headroom / per_frame_row).max(0) as usize
+    }
+
+    /// The decode body, **without** the leading-frame drop: de-normalized latent → raw `6·T_lat`-frame
+    /// video. `cache` is `None` for a single-shot decode and `Some` for one chunk of a chunked decode.
+    fn decode_body(&self, latents: &Array, mut cache: Option<&mut FrameCache>) -> Result<Array> {
+        // Refuse a decode whose intermediates would exceed the element ceiling. MLX does not error on
+        // this — it returns plausible-looking wrong pixels — so an explicit error is the only way the
+        // caller ever learns. See [`MAX_TENSOR_ELEMS`].
+        let sh = latents.shape();
+        let elems = self.peak_tensor_elems(sh[2], sh[3], sh[4]);
+        if elems > MAX_TENSOR_ELEMS {
+            return Err(Error::Msg(format!(
+                "mochi vae: a {}-latent-frame decode at {}×{} needs a {elems}-element intermediate, \
+                 over the {MAX_TENSOR_ELEMS} ceiling above which MLX silently returns wrong pixels. \
+                 Decode in chunks of ≤{} latent frames (decode_chunked / decode_denormalized_chunked).",
+                sh[2],
+                sh[3] * self.spatial_ratio,
+                sh[4] * self.spatial_ratio,
+                self.max_safe_chunk_frames(sh[3], sh[4]),
+            )));
+        }
+
+        let x = latents.as_dtype(self.dtype)?;
+        let mut x = self.conv_in.forward(&x, cache.as_deref_mut())?;
+        x = self.block_in.forward(&x, cache.as_deref_mut())?;
+        for up in &self.up_blocks {
+            x = up.forward(&x, cache.as_deref_mut())?;
+        }
+        x = self.block_out.forward(&x, cache)?;
         x = silu(&x)?;
         // Channel-last proj_out: NCTHW -> [B,T,H,W,C] -> Linear(C->out) -> NCTHW.
         let x = x.transpose_axes(&[0, 2, 3, 4, 1])?;
         let x = linear(&x, &self.proj_out_w, &self.proj_out_b)?;
-        let x = x.transpose_axes(&[0, 4, 1, 2, 3])?;
+        Ok(x.transpose_axes(&[0, 4, 1, 2, 3])?)
+    }
+
+    /// One `FrameCache` slot per causal conv, in decode-body traversal order.
+    fn conv_count(&self) -> usize {
+        1 + 2
+            * (self.block_in.resnets.len()
+                + self.block_out.resnets.len()
+                + self
+                    .up_blocks
+                    .iter()
+                    .map(|u| u.resnets.len())
+                    .sum::<usize>())
+    }
+
+    /// Decode an **already-de-normalized** latent `[B, C, T_lat, H_lat, W_lat]` → video
+    /// `[B, out_channels, F, H, W]` (`F = (T_lat − 1)·temporal_ratio + 1`, spatial ×8) in a single
+    /// pass. Teacher-forced entry point (the vae_parity gate feeds the golden's
+    /// `denormalized_latents`), and the reference [`decode_denormalized_chunked`] is gated against.
+    ///
+    /// Peak scales linearly in `T_lat`; prefer [`decode_chunked`](Self::decode_chunked) in production.
+    pub fn decode_denormalized(&self, latents: &Array) -> Result<Array> {
+        let x = self.decode_body(latents, None)?;
         self.drop_last_temporal_frames(&x)
     }
 
-    /// De-normalize then decode a raw latent → video (the production entry point).
+    /// As [`decode_denormalized`](Self::decode_denormalized), but decoding `chunk_frames` latent frames
+    /// at a time and threading a [`FrameCache`] so each chunk sees the previous one's real trailing
+    /// frames instead of a replicate pad. **Numerically identical** to the single-shot decode (every op
+    /// is per-frame or causal), so there are no tile seams to blend — see [`FrameCache`].
+    ///
+    /// Peak memory becomes ~independent of clip length: a fixed conv cache plus a working set sized by
+    /// `chunk_frames`, in place of a `block_out` tensor that grows with the whole clip.
+    pub fn decode_denormalized_chunked(
+        &self,
+        latents: &Array,
+        chunk_frames: usize,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let sh = latents.shape();
+        let (t_lat, h_lat, w_lat) = (sh[2], sh[3], sh[4]);
+        // Clamp to what the element ceiling allows: a too-large chunk would not merely use more memory,
+        // it would silently corrupt (see [`MAX_TENSOR_ELEMS`]). `decode_body` still errors if even one
+        // frame is too big, so the clamp never masks an impossible geometry.
+        let safe = self.max_safe_chunk_frames(h_lat, w_lat).max(1);
+        let chunk = chunk_frames.clamp(1, safe) as i32;
+        if chunk >= t_lat {
+            return self.decode_denormalized(latents);
+        }
+
+        let mut cache = FrameCache::new(self.conv_count());
+        let mut chunks: Vec<Array> = Vec::new();
+        let mut start = 0i32;
+        while start < t_lat {
+            if cancel.is_some_and(|c| c.is_cancelled()) {
+                return Err(Error::Canceled);
+            }
+            let end = (start + chunk).min(t_lat);
+            cache.idx = 0;
+            let v = self.decode_body(&slice_frames(latents, start, end)?, Some(&mut cache))?;
+            // The full decode drops the leading `ratio − 1` frames of the whole video; chunk 0 owns
+            // them (it always yields `ratio` ≥ 5 frames), and later chunks concatenate untouched.
+            let v = if start == 0 {
+                self.drop_last_temporal_frames(&v)?
+            } else {
+                v
+            };
+            chunks.push(v);
+            // Materialize the chunk + the carried cache: without this the lazy graph would hold every
+            // chunk's full-resolution intermediates at once and defeat the chunking entirely.
+            let mut ev: Vec<&Array> = cache.slots.iter().flatten().collect();
+            ev.push(chunks.last().expect("just pushed"));
+            mlx_rs::transforms::eval(ev)?;
+            start = end;
+        }
+
+        let refs: Vec<&Array> = chunks.iter().collect();
+        Ok(concatenate_axis(&refs, 2)?)
+    }
+
+    /// De-normalize then decode a raw latent → video, in a single pass.
     pub fn decode(&self, latents: &Array) -> Result<Array> {
         let denorm = self.denormalize(latents)?;
         self.decode_denormalized(&denorm)
+    }
+
+    /// De-normalize then chunk-decode a raw latent → video (the production entry point). See
+    /// [`decode_denormalized_chunked`](Self::decode_denormalized_chunked); `chunk_frames` of
+    /// [`DEFAULT_DECODE_CHUNK_FRAMES`] is the shipped default.
+    pub fn decode_chunked(
+        &self,
+        latents: &Array,
+        chunk_frames: usize,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        // De-normalization is per-element on the *latent*, so doing it once up front costs a latent-
+        // sized tensor (12 ch), not a decode-sized one.
+        let denorm = self.denormalize(latents)?;
+        self.decode_denormalized_chunked(&denorm, chunk_frames, cancel)
     }
 
     /// Drop the leading `temporal_ratio − 1` decoded frames (`drop_last_temporal_frames=True`), which

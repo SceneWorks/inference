@@ -14,6 +14,38 @@
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 
+/// Per-conv temporal cache threaded through a chunked decode: each slot holds the last `kt−1` frames
+/// of that conv's input from the previous chunk. `idx` resets to 0 each chunk and advances once per
+/// conv in the fixed traversal order, so slots stay aligned. Mirrors the MLX port's `FrameCache` and
+/// the `conv_cache` diffusers threads through `AutoencoderKLMochi`'s framewise decode.
+///
+/// **Why a cache and not overlap+blend.** Every op in this decoder is per-frame (`GroupNorm(32)` is
+/// per-frame; silu/residual/proj are elementwise or per-position) or a causal conv, so feeding a chunk
+/// the previous chunk's real trailing frames reproduces the single-shot decode *exactly* — no seams to
+/// blend. The decoder's temporal receptive field is **~45 latent frames** (38 stacked `kt=3` causal
+/// convs), *wider than a whole 5 s clip* (26 latent frames), so a tile given the 1 frame of left
+/// context that `gen_core::tiling`'s causal path allows is wrong throughout, not merely seamed. The
+/// MLX port measures both claims in `mlx-gen-mochi/tests/chunked_decode.rs`.
+pub struct FrameCache {
+    slots: Vec<Option<Tensor>>,
+    pub idx: usize,
+}
+
+impl FrameCache {
+    /// A cache with one slot per causal conv, all empty (chunk 0 falls back to the replicate pad).
+    pub fn new(n: usize) -> Self {
+        Self {
+            slots: vec![None; n],
+            idx: 0,
+        }
+    }
+
+    /// Reset the slot cursor to the start of the traversal (called once per chunk).
+    pub fn rewind(&mut self) {
+        self.idx = 0;
+    }
+}
+
 /// A 3-D causal conv loaded from a `[O, I, kt, kh, kw]` weight (channels + kernel dims ride on the
 /// weight, not a config). Temporal stride is always 1; spatial padding is "same" replicate
 /// (`(kh−1)/2`); temporal padding is front-only replicate (`kt−1`).
@@ -46,17 +78,37 @@ impl CausalConv3d {
     }
 
     /// `x`: `[B, C, T, H, W]` → `[B, O, T, H, W]` (spatial "same" replicate, temporal front-replicate).
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    ///
+    /// `cache` threads the chunked decode: when its slot for this conv is populated (every chunk after
+    /// the first) the previous chunk's real trailing frames stand in for the causal front-pad, which is
+    /// what makes chunked == single-shot. `None` (or an empty slot) falls back to the replicate pad.
+    pub fn forward(&self, x: &Tensor, cache: Option<&mut FrameCache>) -> Result<Tensor> {
         let (b, c, t, h, w) = x.dims5()?;
 
-        // Temporal front replicate-pad by (kt−1) (causal): repeat the first frame.
+        // Temporal context: real history when chunking, else the causal replicate pad of frame 0.
         let xt = if self.kt > 1 {
-            let first = x.narrow(2, 0, 1)?;
-            let front = repeat_along(&first, 2, self.kt - 1)?;
-            Tensor::cat(&[&front, x], 2)?
+            match cache.as_ref().and_then(|cc| cc.slots[cc.idx].clone()) {
+                Some(prev) => Tensor::cat(&[&prev, x], 2)?,
+                None => {
+                    let first = x.narrow(2, 0, 1)?;
+                    let front = repeat_along(&first, 2, self.kt - 1)?;
+                    Tensor::cat(&[&front, x], 2)?
+                }
+            }
         } else {
             x.clone()
         };
+
+        // Hand the next chunk this conv's trailing frames (taken post-concat, as diffusers does, so a
+        // chunk shorter than `kt−1` still carries forward the right history), then advance the slot.
+        if let Some(cc) = cache {
+            if self.kt > 1 {
+                let n = xt.dim(2)?;
+                cc.slots[cc.idx] =
+                    Some(xt.narrow(2, n - (self.kt - 1), self.kt - 1)?.contiguous()?);
+            }
+            cc.idx += 1;
+        }
 
         // conv2d taps over the temporal kernel; each tap replicate-pads H/W then convolves (padding 0).
         let mut acc: Option<Tensor> = None;
@@ -144,7 +196,7 @@ mod tests {
         let vb = VarBuilder::from_tensors(map, DType::F32, &dev);
         let conv = CausalConv3d::load(&vb, "c").unwrap();
         let x = Tensor::ones((1, 3, 4, 5, 6), DType::F32, &dev).unwrap();
-        let y = conv.forward(&x).unwrap();
+        let y = conv.forward(&x, None).unwrap();
         // [B, O=2, T=4, H=5, W=6]; each output = sum over 3 input channels of 1·1 = 3.
         assert_eq!(y.dims(), &[1, 2, 4, 5, 6]);
         let v = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();

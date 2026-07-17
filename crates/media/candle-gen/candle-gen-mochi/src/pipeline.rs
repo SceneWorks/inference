@@ -25,7 +25,7 @@ use crate::config::{MochiConfig, MochiVaeConfig};
 use crate::scheduler::{cfg_combine, MochiScheduler};
 use crate::text_encoder::{encode_prompt, MochiT5};
 use crate::transformer::{load_transformer_var_builder, MochiDitConfig, MochiTransformer3DModel};
-use crate::vae::MochiVaeDecoder;
+use crate::vae::{MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
 use crate::{DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_GUIDANCE, DEFAULT_STEPS, DIT_DTYPE};
 
 /// AsymmVAE latent channels fed to the DiT / seeded as init noise.
@@ -149,7 +149,12 @@ impl Pipeline {
         )?;
 
         on_progress(Progress::Decoding);
-        let video = comps.vae.decode(&latents)?; // [1, 3, F, H, W], ~[-1, 1]
+        // Chunked decode: an untiled decode holds the 128-channel `block_out` stage at full output
+        // resolution for the whole clip, so its peak grows with clip length (sc-12291). Chunking is
+        // exact here — not a blended tiling — so the decoded video is unchanged.
+        let video = comps
+            .vae
+            .decode_chunked(&latents, DEFAULT_DECODE_CHUNK_FRAMES)?; // [1, 3, F, H, W], ~[-1, 1]
         let frames_arr = to_uint8_frames(&video)?; // [F, H, W, 3] u8
         let images = frames_to_images(&frames_arr)?;
         Ok((images, req.fps.unwrap_or(DEFAULT_FPS)))
