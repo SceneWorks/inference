@@ -113,7 +113,9 @@ fn cuda_upscale_smoke() {
     let lr = synth_lr(src);
 
     let t_gen = std::time::Instant::now();
-    let out = pipe.generate(&lr, tgt, tgt, 42, 0.0, None).expect("generate");
+    let out = pipe
+        .generate(&lr, tgt, tgt, 42, 0.0, None)
+        .expect("generate");
     eprintln!(
         "[seedvr2-smoke] {src}->{tgt} in {:?} -> {}x{}",
         t_gen.elapsed(),

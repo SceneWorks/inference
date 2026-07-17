@@ -81,7 +81,9 @@ fn cuda_hires_upscale_not_black() {
     // regressed to pure black before sc-10083; both must now be real, non-black, faithful upscales.
     for (src, tgt) in [(768usize, 1536usize), (1024, 2048)] {
         let lr = synth_lr(src);
-        let out = pipe.generate(&lr, tgt, tgt, 42, 0.0, None).expect("generate");
+        let out = pipe
+            .generate(&lr, tgt, tgt, 42, 0.0, None)
+            .expect("generate");
         assert_eq!((out.width, out.height), (tgt as u32, tgt as u32));
 
         let black = out.pixels.iter().filter(|&&v| v == 0).count() as f64 / out.pixels.len() as f64;
