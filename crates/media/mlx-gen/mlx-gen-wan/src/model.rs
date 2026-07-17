@@ -29,7 +29,7 @@ use crate::adapters::{
     apply_wan_adapters_additive, merge_wan_adapters, reject_loha_on_packed, warn_skipped_adapters,
     WanLoraReport,
 };
-use crate::config::WanModelConfig;
+use crate::config::{WanModelConfig, MIN_SIZE};
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z,
     build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames, decode_to_frames_22, denoise,
@@ -109,9 +109,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lokr: true,
             samplers: wan_samplers(),
             schedulers: Vec::new(),
-            // H/W align to patch×vae_stride = 32; cap the long edge at 1280 (max_area 704×1280).
+            // H/W align to patch×vae_stride = 32 (`reject_off_grid`); floor each side at MIN_SIZE = 480
+            // (= 15·32 — the z48 vae22 renders garbage below a 15×15 latent grid, sc-10306/sc-12636),
+            // matching candle; cap the long edge at 1280 (max_area 704×1280).
             supported_guidance_methods: vec![],
-            min_size: 32,
+            min_size: MIN_SIZE,
             max_size: 1280,
             max_count: 1,
             mac_only: true,
@@ -257,9 +259,11 @@ impl Wan {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
     /// lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        // Shared capability floor: size range (the advertised `min_size` = patch×vae_stride = 32 is
-        // the sub-tile lower bound; `max_size` caps the long edge), count, guidance/negative/true_cfg,
-        // sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and conditioning (`Reference`/`Keyframe`).
+        // Shared capability floor: size range (the advertised `min_size` = MIN_SIZE = 480 is the
+        // 5B coherence floor below which the z48 vae22 renders garbage, sc-10306/sc-12636 — NOT the
+        // 32-px grid stride, which `reject_off_grid` enforces below; `max_size` caps the long edge),
+        // count, guidance/negative/true_cfg, sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and
+        // conditioning (`Reference`/`Keyframe`).
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
@@ -1302,6 +1306,32 @@ mod tests {
         assert!(err.contains("multiples of 32"), "unexpected: {err}");
         // Off-grid on the height axis is rejected the same way.
         assert!(wan.validate_impl(&req(704, 500)).is_err());
+    }
+
+    /// sc-12636 — the 5B's z48 vae22 renders rainbow garbage below a 15×15 latent grid (`< 480` px per
+    /// side), so candle floors its descriptor `min_size` at [`MIN_SIZE`] = 480 and mlx must match, or an
+    /// on-grid sub-480 request that candle *rejects* is instead *rendered as garbage* on mlx. This is a
+    /// SEPARATE axis from the 32-px grid stride above: the sizes here are all on-grid (multiples of 32),
+    /// so only the `min_size` range check (`gen_core::Capabilities::validate_request`) can reject them.
+    /// Mutation guard: revert the descriptor `min_size` to 32 (or drop [`MIN_SIZE`] below 480) and
+    /// `req(384, 384)` / `req(480, 320)` validate — the `unwrap_err` / `is_err` below then panic.
+    #[test]
+    fn validate_rejects_below_min_size_floor_5b() {
+        use crate::config::{MIN_SIZE, SIZE_MULTIPLE};
+        let wan = wan_5b();
+        // At the floor: 480 = 15·32, on-grid, well under the 901 120 px cap → validates.
+        assert!(wan.validate_impl(&req(480, 480)).is_ok());
+        // 384 = 12·32 is on-grid but below the 480 coherence floor → rejected by the range check.
+        let err = wan.validate_impl(&req(384, 384)).unwrap_err().to_string();
+        assert!(
+            err.contains("outside supported range") && err.contains(&MIN_SIZE.to_string()),
+            "expected a min_size range rejection naming {MIN_SIZE}, got: {err}"
+        );
+        // Sub-floor on a single axis (320 = 10·32) is rejected too — both sides must clear the floor.
+        assert!(wan.validate_impl(&req(480, 320)).is_err());
+        // The rejected sizes are on-grid, so it is the floor — not the stride — doing the rejecting.
+        assert_eq!(384 % SIZE_MULTIPLE, 0);
+        assert_eq!(320 % SIZE_MULTIPLE, 0);
     }
 
     /// sc-12607 — the 14B family renders on a 16-px grid (`SIZE_MULTIPLE_14B`); same reject-not-refit

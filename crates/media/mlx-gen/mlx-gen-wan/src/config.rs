@@ -43,6 +43,20 @@ pub const MAX_AREA_5B: usize = 1280 * 704;
 /// `pinned_engine_geometry` tie (sc-12587) can anchor the 5B stride on the macos lane, the same way
 /// [`SIZE_MULTIPLE_14B`] anchors the 14B family (sc-12409).
 pub const SIZE_MULTIPLE: u32 = 32;
+/// Minimum spatial size **per side** (px) for a coherent **TI2V-5B** render — the descriptor
+/// `min_size`, enforced by `gen_core::Capabilities::validate_request`. The z48 vae22 gives an
+/// effective pixel→DiT-token stride of `vae_stride_spatial (16) × patch (2) = 32` (= [`SIZE_MULTIPLE`]),
+/// so the DiT denoises over a `width/32 × height/32` latent-token grid. Below a 15×15 grid the
+/// 720P-class 5B can't converge and the VAE decodes the residual noise as rainbow garbage —
+/// **shift-independent** (flow-shift 1.0–5.0 all glitch at 320²/384²), so a latent-geometry floor,
+/// not a sampler knob. `480 = 15·32` keeps the floor itself [`SIZE_MULTIPLE`]-aligned. Distinct from
+/// [`SIZE_MULTIPLE`]: the stride (32) is the *grid* an on-menu size must land on (`reject_off_grid`);
+/// this is the *lower bound* below which even an on-grid size renders garbage (the `min_size` range
+/// check). Mirrors candle's `candle_gen_wan::config::MIN_SIZE` (both = 480), symmetric so both
+/// backends refuse the same sub-480 request instead of one rejecting and one glitching (sc-12636).
+/// The 14B family has no such floor — its z16 VAE converges down to [`SIZE_MULTIPLE_14B`] = 16, and
+/// candle's 14B/VACE descriptors advertise `min_size: 16` to match. (sc-10306)
+pub const MIN_SIZE: u32 = 480;
 
 /// CFG guidance scale. Dense models (5B, Wan2.1) use a single scalar; the Wan2.2 dual-expert MoE
 /// models select `low` below the timestep boundary and `high` at/above it (`generate_wan.py`).

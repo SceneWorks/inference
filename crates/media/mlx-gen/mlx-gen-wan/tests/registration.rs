@@ -155,8 +155,12 @@ fn wan_is_registered() {
             "curated sampler {s:?} should be advertised"
         );
     }
-    // H/W align to patch×vae_stride = 32 for the z48 vae22 (spatial stride 16).
-    assert_eq!(d.capabilities.min_size, 32);
+    // The advertised `min_size` is the 5B coherence floor (MIN_SIZE = 480), NOT the 32-px grid
+    // stride — the z48 vae22 renders rainbow garbage below a 15×15 latent grid, so candle floors at
+    // 480 and mlx must match (sc-10306/sc-12636). Pin the const *value* so a revert to the old 32
+    // (or any drift off candle's 480) fails here, not just silently re-opens the garbage-render path.
+    assert_eq!(d.capabilities.min_size, mlx_gen_wan::config::MIN_SIZE);
+    assert_eq!(d.capabilities.min_size, 480);
 }
 
 #[test]
@@ -281,8 +285,12 @@ fn wan_t2v_14b_is_registered() {
     assert!(d.capabilities.samplers.contains(&"uni_pc"));
     assert!(d.capabilities.samplers.contains(&"dpmpp_2m"));
     assert!(d.capabilities.samplers.contains(&"unipc"));
-    // H/W align to patch×vae_stride = 16 for the z16 VAE (vs 32 for the 5B's z48).
+    // H/W align to patch×vae_stride = 16 for the z16 VAE (vs 32 for the 5B's z48). The 14B has NO
+    // 480 coherence floor — its z16 VAE converges down to the 16-px grid — so its `min_size` is the
+    // grid stride, deliberately below the 5B's MIN_SIZE. candle's 14B descriptor advertises the same
+    // `min_size: 16`, so the two backends agree on this axis (sc-12636 confirmed while flooring the 5B).
     assert_eq!(d.capabilities.min_size, 16);
+    assert!(d.capabilities.min_size < mlx_gen_wan::config::MIN_SIZE);
 }
 
 #[test]
@@ -475,7 +483,9 @@ fn wan_i2v_14b_is_registered() {
     // LoRA (sc-2683) + LoKr (sc-2393) in generate, per-expert merge.
     assert!(d.capabilities.supports_lora);
     assert!(d.capabilities.supports_lokr);
+    // z16 grid stride, no 480 coherence floor (sc-12636) — agrees with candle's I2V-14B `min_size: 16`.
     assert_eq!(d.capabilities.min_size, 16);
+    assert!(d.capabilities.min_size < mlx_gen_wan::config::MIN_SIZE);
 }
 
 /// A tiny solid-color RGB reference image for I2V validate tests.
@@ -695,6 +705,11 @@ fn wan_vace_is_registered() {
     assert!(d.capabilities.samplers.contains(&"uni_pc"));
     assert!(d.capabilities.samplers.contains(&"dpmpp_2m"));
     assert!(d.capabilities.samplers.contains(&"unipc"));
+    // VACE rides the z16 VAE — a 16-px grid stride and NO 480 coherence floor, so its `min_size`
+    // stays the stride, deliberately below the 5B's MIN_SIZE. candle's VACE descriptor advertises
+    // the same `min_size: 16`, so the backends agree on this axis too (sc-12636).
+    assert_eq!(d.capabilities.min_size, 16);
+    assert!(d.capabilities.min_size < mlx_gen_wan::config::MIN_SIZE);
 }
 
 #[test]
