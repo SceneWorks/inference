@@ -1589,14 +1589,6 @@ mod cuda_impl {
         Ok(())
     }
 
-    /// NVFP4 operand-K / N alignment (sc-11039 handoff item (b)). The NVFP4 block is 16 elements and
-    /// cuBLASLt's FP4 block-scaled path requires the contraction dim `K` a multiple of the scale-factor
-    /// atom's K-extent. The sc-11040 packer pads its **scale tensor** to 4 blocks (`SF_ATOM_COLS`) =
-    /// **64 elements** along K, so a K that is a multiple of 64 always has a fully-populated scale atom
-    /// and is unconditionally safe; the live-GPU probe (`nvfp4_k_alignment_probe`) reports the actual
-    /// minimum cuBLASLt accepts. `N` (out) must be a multiple of 16. Enforced at K a multiple of 64 —
-    /// the conservative bound that matches the packer's padded scale-atom width and never trips
-    /// `CUBLAS_STATUS_NOT_SUPPORTED` on a partial scale atom.
     /// The required padded-K multiple for the NVFP4 cuBLASLt path (sc-11039 handoff item (b),
     /// GPU-confirmed on the RTX PRO 6000). The `nvfp4_k_alignment_probe` swept K on live hardware:
     /// K∈{32,64,128} are ACCEPTED (bit-accurate), K∈{16,48} return `CUBLAS_STATUS_NOT_SUPPORTED` — so

@@ -20,6 +20,8 @@ use crate::error::{Error, Result};
 const GGUF_MAGIC: u32 = 0x4655_4747;
 /// Default tensor-data alignment when `general.alignment` is absent.
 const DEFAULT_ALIGNMENT: u64 = 32;
+/// Hard cap for pre-allocation from untrusted GGUF count fields.
+const MAX_CONTAINER_ITEMS: usize = 1 << 20;
 
 // GGUF metadata value-type tags.
 const T_UINT8: u32 = 0;
@@ -197,7 +199,8 @@ impl GgufFile {
         let tensor_count = c.u64()? as usize;
         let metadata_count = c.u64()? as usize;
 
-        let mut metadata = HashMap::with_capacity(metadata_count);
+        let mut metadata =
+            HashMap::with_capacity(metadata_count.min(MAX_CONTAINER_ITEMS).min(bytes.len()));
         for _ in 0..metadata_count {
             let key = c.string()?;
             let vtype = c.u32()?;
@@ -205,7 +208,8 @@ impl GgufFile {
             metadata.insert(key, value);
         }
 
-        let mut tensors = Vec::with_capacity(tensor_count);
+        let mut tensors =
+            Vec::with_capacity(tensor_count.min(MAX_CONTAINER_ITEMS).min(bytes.len()));
         for _ in 0..tensor_count {
             let name = c.string()?;
             let n_dims = c.u32()? as usize;
@@ -369,7 +373,7 @@ impl<'a> Cursor<'a> {
                     return Err(Error::Unsupported("gguf: nested metadata arrays".into()));
                 }
                 let len = self.u64()? as usize;
-                let mut items = Vec::with_capacity(len.min(1 << 20));
+                let mut items = Vec::with_capacity(len.min(MAX_CONTAINER_ITEMS));
                 for _ in 0..len {
                     items.push(self.value(elem_type)?);
                 }
@@ -462,6 +466,17 @@ mod tests {
         b.extend_from_slice(&0u64.to_le_bytes());
         b.extend_from_slice(&0u64.to_le_bytes());
         assert!(matches!(GgufFile::parse(b), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn oversized_header_count_returns_a_typed_error_without_unbounded_preallocation() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&u64::MAX.to_le_bytes()); // tensor_count
+        b.extend_from_slice(&0u64.to_le_bytes()); // metadata_count
+
+        assert!(matches!(GgufFile::parse(b), Err(Error::Msg(_))));
     }
 
     #[test]

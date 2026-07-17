@@ -114,7 +114,8 @@ pub struct TextLlmRequest {
 }
 
 impl TextLlmRequest {
-    /// A simple single-user-turn text request with greedy defaults aside from the given sampling.
+    /// A request over the given messages with the default sampling policy (temperature `0.7`, top-p
+    /// `0.9`), which is stochastic rather than greedy.
     pub fn new(messages: Vec<Message>, max_new_tokens: u32) -> Self {
         Self {
             messages,
@@ -138,6 +139,20 @@ impl TextLlmRequest {
     /// [`RenderOptions`](crate::template::RenderOptions).
     pub fn enable_thinking_kwarg(&self) -> Option<bool> {
         self.thinking.enable_thinking_kwarg()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_uses_the_documented_default_sampling() {
+        let request = TextLlmRequest::new(Vec::new(), 32);
+
+        assert_eq!(request.sampling.temperature, 0.7);
+        assert_eq!(request.sampling.top_p, 0.9);
+        assert!(!request.sampling.is_greedy());
     }
 }
 

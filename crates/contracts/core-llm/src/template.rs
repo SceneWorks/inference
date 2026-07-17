@@ -7,6 +7,7 @@
 //! vision image-placeholder splice is the backend VLM path's concern (story 7157).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use minijinja::{Environment, Value};
@@ -119,21 +120,32 @@ impl ChatTemplate for ChatMlTemplate {
 /// `add_generation_prompt`, and `bos_token` / `eos_token`. Python str methods (`.strip()`, …) work
 /// via pycompat, `raise_exception(msg)` errors the render, and `strftime_now(fmt)` supplies the date
 /// some templates inject. The environment uses `trim_blocks` + `lstrip_blocks` like transformers.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JinjaChatTemplate {
     source: String,
     bos_token: String,
     eos_token: String,
+    // `Environment` owns the parsed template and is immutable after construction, so clones share
+    // the same compiled template rather than reparsing it on every render.
+    environment: Arc<Environment<'static>>,
+    template_error: Option<String>,
+}
+
+impl std::fmt::Debug for JinjaChatTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JinjaChatTemplate")
+            .field("source", &self.source)
+            .field("bos_token", &self.bos_token)
+            .field("eos_token", &self.eos_token)
+            .field("template_error", &self.template_error)
+            .finish_non_exhaustive()
+    }
 }
 
 impl JinjaChatTemplate {
     /// From a raw `chat_template` string (no special tokens).
     pub fn new(source: impl Into<String>) -> Self {
-        Self {
-            source: source.into(),
-            bos_token: String::new(),
-            eos_token: String::new(),
-        }
+        Self::with_tokens(source, String::new(), String::new())
     }
 
     /// From a `chat_template` string plus the model's BOS/EOS token strings.
@@ -142,10 +154,14 @@ impl JinjaChatTemplate {
         bos_token: impl Into<String>,
         eos_token: impl Into<String>,
     ) -> Self {
+        let source = source.into();
+        let (environment, template_error) = jinja_environment(source.clone());
         Self {
-            source: source.into(),
+            source,
             bos_token: bos_token.into(),
             eos_token: eos_token.into(),
+            environment: Arc::new(environment),
+            template_error,
         }
     }
 
@@ -187,18 +203,10 @@ impl ChatTemplate for JinjaChatTemplate {
     }
 
     fn render_with(&self, messages: &[Message], opts: &RenderOptions<'_>) -> Result<String> {
-        let mut env = Environment::new();
-        // Match transformers' Jinja environment (ImmutableSandboxedEnvironment, trim/lstrip blocks).
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_function("raise_exception", |msg: String| -> std::result::Result<Value, minijinja::Error> {
-            Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
-        });
-        env.add_function("strftime_now", strftime_now);
-        env.add_template_owned("chat", self.source.clone())
-            .map_err(jinja_err)?;
-        let tmpl = env.get_template("chat").map_err(jinja_err)?;
+        if let Some(error) = &self.template_error {
+            return Err(Error::Msg(error.clone()));
+        }
+        let tmpl = self.environment.get_template("chat").map_err(jinja_err)?;
 
         // Each message is a JSON object so a turn can carry structured fields (`tool_calls`) beyond
         // the flat `role`/`content` strings — the same shape `transformers` passes the template.
@@ -248,6 +256,29 @@ impl ChatTemplate for JinjaChatTemplate {
         }
         tmpl.render(ctx).map_err(jinja_err)
     }
+}
+
+fn jinja_environment(source: String) -> (Environment<'static>, Option<String>) {
+    let mut environment = Environment::new();
+    // Match transformers' Jinja environment (ImmutableSandboxedEnvironment, trim/lstrip blocks).
+    environment.set_trim_blocks(true);
+    environment.set_lstrip_blocks(true);
+    environment.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    environment.add_function(
+        "raise_exception",
+        |msg: String| -> std::result::Result<Value, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        },
+    );
+    environment.add_function("strftime_now", strftime_now);
+    let template_error = environment
+        .add_template_owned("chat", source)
+        .err()
+        .map(|error| jinja_err(error).to_string());
+    (environment, template_error)
 }
 
 fn jinja_err(e: minijinja::Error) -> Error {
@@ -795,6 +826,20 @@ mod tests {
         });
         let t = JinjaChatTemplate::from_tokenizer_config(&cfg).unwrap();
         assert_eq!(t.render(&[Message::user("hi")], false).unwrap(), "<s>user:hi</s>");
+    }
+
+    #[test]
+    fn cloned_jinja_template_reuses_the_compiled_environment() {
+        let template = JinjaChatTemplate::new("{% for m in messages %}{{ m.content }}{% endfor %}");
+        let clone = template.clone();
+        let messages = [Message::user("hello")];
+
+        assert!(std::sync::Arc::ptr_eq(
+            &template.environment,
+            &clone.environment
+        ));
+        assert_eq!(template.render(&messages, false).unwrap(), "hello");
+        assert_eq!(clone.render(&messages, false).unwrap(), "hello");
     }
 
     #[test]
