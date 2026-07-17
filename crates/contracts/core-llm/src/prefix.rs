@@ -137,11 +137,8 @@ impl PrefixIndex {
             }
         }
         let (idx, matched_len) = best?;
-        let entry = self.touch(idx);
-        Some(PrefixMatch {
-            id: entry.id,
-            matched_len,
-        })
+        let id = self.touch(idx);
+        Some(PrefixMatch { id, matched_len })
     }
 
     /// Store `tokens` for future reuse, returning its handle and any evicted entries.
@@ -151,9 +148,9 @@ impl PrefixIndex {
     /// prompt+generation without leaking a slot.
     pub fn insert(&mut self, tokens: Vec<i32>) -> InsertOutcome {
         if let Some(idx) = self.entries.iter().position(|e| e.tokens == tokens) {
-            let entry = self.touch(idx);
+            let id = self.touch(idx);
             return InsertOutcome {
-                id: entry.id,
+                id,
                 evicted: Vec::new(),
             };
         }
@@ -169,12 +166,13 @@ impl PrefixIndex {
         InsertOutcome { id, evicted }
     }
 
-    /// Move the entry at deque index `idx` to the back (most-recently-used) and return a copy of its
-    /// header (id is `Copy`). `idx` must be in range.
-    fn touch(&mut self, idx: usize) -> Entry {
+    /// Move the entry at deque index `idx` to the back (most-recently-used) and return its id. `idx`
+    /// must be in range.
+    fn touch(&mut self, idx: usize) -> PrefixId {
         let entry = self.entries.remove(idx).expect("index in range");
-        self.entries.push_back(entry.clone());
-        entry
+        let id = entry.id;
+        self.entries.push_back(entry);
+        id
     }
 }
 
@@ -279,6 +277,18 @@ mod tests {
         assert_eq!(out.evicted, vec![b], "the now-LRU entry b is evicted, not the refreshed a");
         assert!(idx.contains(a));
         assert!(!idx.contains(b));
+    }
+
+    #[test]
+    fn a_match_keeps_its_id_when_reinserted() {
+        let mut idx = PrefixIndex::new(2);
+        let stored = idx.insert(vec![1, 2, 3]).id;
+
+        let matched = idx.longest_match(&[1, 2, 3, 4]).unwrap();
+        let reinserted = idx.insert(vec![1, 2, 3]);
+
+        assert_eq!(matched.id, stored);
+        assert_eq!(reinserted.id, matched.id);
     }
 
     #[test]
