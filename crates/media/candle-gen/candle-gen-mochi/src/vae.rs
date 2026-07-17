@@ -318,7 +318,7 @@ impl MochiVaeDecoder {
     /// Decode an **already-de-normalized** latent `[B, C, T_lat, H_lat, W_lat]` → video
     /// `[B, out_channels, F, H, W]` (`F = (T_lat − 1)·temporal_ratio + 1`, spatial ×8) in a single
     /// pass. Teacher-forced entry point (the `vae_parity` gate feeds the golden's
-    /// `denormalized_latents`), and the reference [`decode_denormalized_chunked`] is gated against.
+    /// `denormalized_latents`), and the reference [`decode_denormalized_chunked`](Self::decode_denormalized_chunked) is gated against.
     ///
     /// Peak scales linearly in `T_lat`; prefer [`decode_chunked`](Self::decode_chunked) in production.
     pub fn decode_denormalized(&self, latents: &Tensor) -> Result<Tensor> {

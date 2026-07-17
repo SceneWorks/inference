@@ -26,6 +26,7 @@ use mlx_rs::ops::{add, concatenate_axis, pad, PadMode};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{group_norm, linear, silu};
+use mlx_gen::tiling::MAX_WRITABLE_ELEMS;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::{CancelFlag, Error, Result};
 
@@ -35,30 +36,6 @@ use crate::config::MochiVaeConfig;
 const GROUP_NORM_EPS: f32 = 1e-5;
 /// `MochiChunkedGroupNorm3D` group count.
 const NUM_GROUPS: i32 = 32;
-
-/// The element-count bound for a single decode intermediate, above which this decoder is **measured to
-/// produce wrong pixels** and therefore refuses to run.
-///
-/// **What is measured** (sc-12291, real AsymmVAE weights, 848×480): an untiled decode is exact through
-/// `T_lat = 6` (`block_out` = 1.88e9 elements) and silently returns wrong values — no error,
-/// deterministically, two runs byte-identical — from `T_lat = 7` (2.19e9) on: ±2.67 where a valid video
-/// is ~[-1, 1]. The chunked decode returns ±0.50 on the same latents. The boundary falls on `i32::MAX`.
-///
-/// **What is NOT established: the mechanism.** Do not read this constant as "MLX is wrong above 2^31
-/// elements" — a direct probe contradicts that. A 3×3×3 `conv3d` over a 2.19e9-element input is
-/// *correct*, while an elementwise op over a tensor of exactly `block_out`'s T_lat=7 size
-/// (2,188,247,040) disagrees with the same computation done in halves. The decoder's silu / residual
-/// adds run elementwise at exactly that size, which fits — but "which op, and why" is open, and the
-/// probe's reading at 2× the bound is untrustworthy because the comparison is itself that large.
-/// So: an **empirical safety bound for this decoder**, not a characterized MLX law. sc-12349 carries
-/// the open characterization and the (currently unevidenced) repo-wide question.
-///
-/// The failure is invisible to the `vae_parity` golden, dumped at 64×64/7 frames (6.3e6 elements, ~340×
-/// under); the shipped 848×480/151-frame default is 8.13e9, ~3.8× **over**. Chunking keeps every
-/// intermediate far below the line ([`DEFAULT_DECODE_CHUNK_FRAMES`] → 4.2e8 at 848×480, ~5× under),
-/// which is why the chunked decode is not merely cheaper but *correct where the untiled one is not*.
-/// The guards built on this constant make the failure an error rather than a silent one.
-const MAX_TENSOR_ELEMS: i64 = i32::MAX as i64;
 
 /// Latent frames per chunk for [`MochiVaeDecoder::decode_chunked`].
 ///
@@ -88,7 +65,7 @@ const MAX_TENSOR_ELEMS: i64 = i32::MAX as i64;
 /// the sweep above shares one process; treat ~24 GiB as the figure and the 1.03× as the claim.)
 ///
 /// `decode_denormalized_chunked` clamps this to [`MochiVaeDecoder::max_safe_chunk_frames`] (6 at
-/// 848×480), above which this decoder is measured to return wrong pixels — see [`MAX_TENSOR_ELEMS`].
+/// 848×480), above which this decoder is measured to return wrong pixels — see [`MAX_WRITABLE_ELEMS`].
 pub const DEFAULT_DECODE_CHUNK_FRAMES: usize = 1;
 
 /// Per-conv temporal cache threaded through a chunked decode: each slot holds the last `kt−1` frames
@@ -499,15 +476,27 @@ impl MochiVaeDecoder {
     }
 
     /// The largest chunk, in latent frames, whose decode keeps every intermediate under
-    /// [`MAX_TENSOR_ELEMS`] at this latent geometry. 0 when even a single frame would exceed it (only
-    /// reachable at resolutions far above Mochi's 848×480 design point).
+    /// [`MAX_WRITABLE_ELEMS`] at this latent geometry — **6** at 848×480. 0 when even a single frame
+    /// would exceed it (only reachable at resolutions far above Mochi's 848×480 design point).
+    ///
+    /// This decoder is where that bound was found (sc-12291). Measured on real AsymmVAE weights at
+    /// 848×480, varying only clip length: an untiled decode is exact through `T_lat = 6` (`block_out` =
+    /// 1.88e9 elements) and silently returns wrong values — no error, deterministic, two runs
+    /// byte-identical — from `T_lat = 7` (2.19e9) on: **±2.67 where a valid video is ~[-1, 1]**, against
+    /// ±0.50 from the chunked path on the same latents. `block_out` writes 128 channels at the full
+    /// output resolution, which is what puts it over the line.
+    ///
+    /// The failure is invisible to the `vae_parity` golden, dumped at 64×64/7 frames (6.3e6 elements,
+    /// ~340× under); the shipped 848×480/151-frame default is 8.13e9, ~3.8× **over**. Chunking keeps
+    /// every intermediate far below it ([`DEFAULT_DECODE_CHUNK_FRAMES`] → 4.2e8, ~5× under), which is
+    /// why the chunked decode is not merely cheaper but *correct where the untiled one is not*.
     pub fn max_safe_chunk_frames(&self, h_lat: i32, w_lat: i32) -> usize {
         let per_frame_row =
             self.peak_tensor_elems(1, h_lat, w_lat) - self.peak_tensor_elems(0, h_lat, w_lat);
         if per_frame_row <= 0 {
             return 1;
         }
-        let headroom = MAX_TENSOR_ELEMS - self.peak_tensor_elems(0, h_lat, w_lat);
+        let headroom = MAX_WRITABLE_ELEMS - self.peak_tensor_elems(0, h_lat, w_lat);
         (headroom / per_frame_row).max(0) as usize
     }
 
@@ -516,13 +505,13 @@ impl MochiVaeDecoder {
     fn decode_body(&self, latents: &Array, mut cache: Option<&mut FrameCache>) -> Result<Array> {
         // Refuse a decode whose intermediates would exceed the element ceiling. MLX does not error on
         // this — it returns plausible-looking wrong pixels — so an explicit error is the only way the
-        // caller ever learns. See [`MAX_TENSOR_ELEMS`].
+        // caller ever learns. See [`MAX_WRITABLE_ELEMS`].
         let sh = latents.shape();
         let elems = self.peak_tensor_elems(sh[2], sh[3], sh[4]);
-        if elems > MAX_TENSOR_ELEMS {
+        if elems > MAX_WRITABLE_ELEMS {
             return Err(Error::Msg(format!(
                 "mochi vae: a {}-latent-frame decode at {}×{} needs a {elems}-element intermediate, \
-                 over the {MAX_TENSOR_ELEMS} ceiling above which MLX silently returns wrong pixels. \
+                 over the {MAX_WRITABLE_ELEMS} ceiling above which MLX silently returns wrong pixels. \
                  Decode in chunks of ≤{} latent frames (decode_chunked / decode_denormalized_chunked).",
                 sh[2],
                 sh[3] * self.spatial_ratio,
@@ -560,7 +549,7 @@ impl MochiVaeDecoder {
     /// Decode an **already-de-normalized** latent `[B, C, T_lat, H_lat, W_lat]` → video
     /// `[B, out_channels, F, H, W]` (`F = (T_lat − 1)·temporal_ratio + 1`, spatial ×8) in a single
     /// pass. Teacher-forced entry point (the vae_parity gate feeds the golden's
-    /// `denormalized_latents`), and the reference [`decode_denormalized_chunked`] is gated against.
+    /// `denormalized_latents`), and the reference [`decode_denormalized_chunked`](Self::decode_denormalized_chunked) is gated against.
     ///
     /// Peak scales linearly in `T_lat`; prefer [`decode_chunked`](Self::decode_chunked) in production.
     pub fn decode_denormalized(&self, latents: &Array) -> Result<Array> {
@@ -584,7 +573,7 @@ impl MochiVaeDecoder {
         let sh = latents.shape();
         let (t_lat, h_lat, w_lat) = (sh[2], sh[3], sh[4]);
         // Clamp to what the element ceiling allows: a too-large chunk would not merely use more memory,
-        // it would silently corrupt (see [`MAX_TENSOR_ELEMS`]). `decode_body` still errors if even one
+        // it would silently corrupt (see [`MAX_WRITABLE_ELEMS`]). `decode_body` still errors if even one
         // frame is too big, so the clamp never masks an impossible geometry.
         let safe = self.max_safe_chunk_frames(h_lat, w_lat).max(1);
         let chunk = chunk_frames.clamp(1, safe) as i32;
@@ -629,7 +618,7 @@ impl MochiVaeDecoder {
     }
 
     /// De-normalize then chunk-decode a raw latent → video (the production entry point). See
-    /// [`decode_denormalized_chunked`](Self::decode_denormalized_chunked); `chunk_frames` of
+    /// [`decode_denormalized_chunked`](Self::decode_denormalized_chunked)(Self::decode_denormalized_chunked); `chunk_frames` of
     /// [`DEFAULT_DECODE_CHUNK_FRAMES`] is the shipped default.
     pub fn decode_chunked(
         &self,
