@@ -24,9 +24,9 @@ use serde_json::Value;
 
 use core_llm::{
     Channel, ChatTemplate, Content, Error as CoreError, FinishReason as CoreFinish,
-    JinjaChatTemplate, Llama3Template, LoadSpec, Message, Quantize, Result as CoreResult, Sampling,
-    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, Tokenizer, Usage,
+    IncrementalDetok, JinjaChatTemplate, Llama3Template, LoadSpec, Message, Quantize,
+    Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
+    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -547,18 +547,18 @@ impl TextLlm for LlavaProvider {
         let max_new = req.max_new_tokens as usize;
 
         // Stream contract token events via incremental detokenization (re-decode, emit new suffix).
+        // The `IncrementalDetok` guard holds back lossy U+FFFD placeholders so a multi-byte
+        // character split across BPE tokens streams intact (no mid-char slice panic) — sc-12452.
         let tokenizer = &self.tokenizer;
         let mut acc: Vec<u32> = Vec::new();
-        let mut shown = 0usize;
+        let mut detok = IncrementalDetok::new();
         let mut on_token = |id: i32, step: usize| {
             acc.push(id as u32);
             if let Ok(text) = tokenizer.decode(&acc, true) {
-                if text.len() > shown {
-                    let delta = text[shown..].to_string();
-                    shown = text.len();
+                if let Some(delta) = detok.push(&text) {
                     on_event(CoreEvent::Token {
                         id: id as u32,
-                        text: delta,
+                        text: delta.to_string(),
                         index: step,
                         channel: Channel::Content,
                     });

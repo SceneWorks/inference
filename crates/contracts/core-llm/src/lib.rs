@@ -19,6 +19,8 @@
 //! - [`Constraint`] + [`JsonState`] — constrained-decoding policy (generic JSON grammar).
 //! - [`Tokenizer`] + [`ChatTemplate`] — host-side text policy.
 //! - [`StopMatcher`] — backend-neutral request stop-string matching over decoded text.
+//! - [`IncrementalDetok`] — backend-neutral streaming-detokenization delta guard (holds back
+//!   lossy U+FFFD placeholders for multi-byte characters split across BPE tokens).
 //! - [`ThinkingSegmenter`] — backend-neutral reasoning/answer segmentation (`<think>…</think>`),
 //!   paired with the [`ThinkingMode`] request control and `supports_thinking` capability.
 //! - [`ToolSpec`] / [`ToolCall`] / [`ToolCallSegmenter`] — backend-neutral tool ("function") calling:
@@ -40,6 +42,7 @@
 pub mod cancel;
 pub mod capabilities;
 pub mod constraint;
+pub mod detok;
 pub mod error;
 pub mod message;
 pub mod output;
@@ -60,6 +63,7 @@ pub mod tool;
 pub use cancel::CancelFlag;
 pub use capabilities::{TextLlmCapabilities, TextLlmDescriptor};
 pub use constraint::{Constraint, ConstraintDecodeTable, JsonConstraint, JsonState};
+pub use detok::IncrementalDetok;
 pub use error::{Error, Result};
 pub use message::{Content, ImageRef, Message, Role, VideoRef};
 pub use output::{Channel, FinishReason, StreamEvent, TextLlmOutput, Usage};

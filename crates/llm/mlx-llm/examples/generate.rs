@@ -64,17 +64,18 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stop_tokens,
     };
 
-    // Incremental detokenization: re-decode the running sequence and print the new suffix.
+    // Incremental detokenization: re-decode the running sequence and print the new suffix. The
+    // `IncrementalDetok` guard holds back lossy U+FFFD placeholders so a multi-byte character
+    // split across BPE tokens prints intact (no mid-char slice panic) — sc-12452.
     let mut acc: Vec<u32> = Vec::new();
-    let mut shown = 0usize;
+    let mut detok = core_llm::IncrementalDetok::new();
     let out = generate(&model, &prompt_ids, &config, &CancelFlag::new(), &mut |event| {
         if let StreamEvent::Token { id, .. } = event {
             acc.push(id as u32);
             if let Ok(full) = tokenizer.decode(&acc, true) {
-                if full.len() > shown {
-                    print!("{}", &full[shown..]);
+                if let Some(delta) = detok.push(&full) {
+                    print!("{delta}");
                     let _ = std::io::stdout().flush();
-                    shown = full.len();
                 }
             }
         }
