@@ -1,5 +1,5 @@
 //! Shared **budgeted video-VAE tiling machinery** (sc-9006 / F-026) — the single home for the
-//! tile/narrow/blend/pad-accumulate/normalize DRIVER and the VRAM-budget selector that were copied
+//! tile/narrow/blend/slice-accumulate/normalize DRIVER and the VRAM-budget selector that were copied
 //! byte-near-identically between `candle-gen-wan`'s z48 vae22 decode and `candle-gen-ltx`'s LTX
 //! decode (and echoed in `candle-gen-seedvr2`).
 //!
@@ -8,8 +8,8 @@
 //! duplicated is the candle-side *execution* of a plan:
 //!
 //!  - [`decode_tiled`] — split a latent into the plan's overlapping tiles, decode each through a
-//!    caller-supplied closure, trapezoidally blend the results into the full output by
-//!    pad-and-accumulate, and normalize by the summed blend weight. ~80 lines, identical in both.
+//!    caller-supplied closure, trapezoidally blend the results into full output slices, and normalize
+//!    by the summed blend weight. ~80 lines, identical in both.
 //!  - [`safe_budget_gib`] — the `<PREFIX>_VAE_BUDGET_GIB` env override → `nvidia-smi` total × safe-frac
 //!    → default-fallback resolver (0.85 safe-frac, 16 GiB default in both).
 //!  - [`plan_tiling`] — feed a per-VAE candidate grid + cost model to [`budgeted_plan`] and map the
@@ -26,8 +26,8 @@
 //!  - the env-var name / label used in budget resolution + error strings.
 //!
 //! The driver's tiling **decisions and numerics are unchanged** from the two hand-copied bodies: same
-//! narrow offsets, same trapezoidal outer-product blend, same `pad_with_zeros` placement, same
-//! `maximum(1e-8)` normalize — so decoded output is byte-identical for a given plan + decode closure.
+//! narrow offsets, same trapezoidal outer-product blend, same `maximum(1e-8)` normalize — so decoded
+//! output is byte-identical for a given plan + decode closure.
 
 use candle_core::{Error, Result, Tensor};
 
@@ -47,11 +47,9 @@ use gen_core::tiling::{
 ///    is single-pass) — it MUST return `[B, 3, out_f, out_h, out_w]` for the tile's latent extent.
 ///
 /// When `cfg` does not fire for these latent dims ([`TilingConfig::needs_tiling`] is false) the whole
-/// latent is decoded in one `decode_fn` call (no tiling), exactly as the per-crate copies did.
-///
-/// The tile loop, narrow offsets, `[1,1,at,ah,aw]` trapezoidal outer-product blend, `pad_with_zeros`
-/// placement, and `maximum(1e-8)` weight normalize are byte-for-byte the prior hand-copied logic, so
-/// output is unchanged for a given `plan` + `decode_fn`.
+/// latent is decoded in one `decode_fn` call (no tiling), exactly as the per-crate copies did. The
+/// tile loop, narrow offsets, blend arithmetic, and normalization are unchanged; only placement now
+/// updates the destination slice instead of padding each tile to the full output volume.
 pub fn decode_tiled<F>(
     vae: VaeTiling,
     label: &str,
@@ -70,7 +68,7 @@ where
     blend_plan(label, latent, &plan, decode_fn)
 }
 
-/// The pure pad-and-accumulate tile blender (split out of [`decode_tiled`] so unit tests can drive a
+/// The pure slice-and-accumulate tile blender (split out of [`decode_tiled`] so unit tests can drive a
 /// known `plan` + synthetic decode closure without a [`TilingConfig`]). Loops `plan.t × plan.h ×
 /// plan.w`, narrows each latent tile, decodes it, blends via the trapezoidal outer-product mask, and
 /// accumulates into the full-output `output`/`weights` buffers, finally normalizing.
@@ -80,8 +78,9 @@ where
 {
     let dev = latent.device();
 
-    // Full-size accumulators (pad-and-accumulate each tile). `output` carries the batch; `weights`
-    // stays `b=1` and broadcasts on the final divide.
+    // Full-size accumulators. `output` carries the batch; `weights` stays `b=1` and broadcasts on
+    // the final divide. Each tile only reads/adds its destination slice before `slice_assign`
+    // replaces that region, avoiding three full-volume pads for both the data and blend mask.
     let mut output: Option<Tensor> = None; // [B, 3, out_f, out_h, out_w]
     let mut weights: Option<Tensor> = None; // [1, 1, out_f, out_h, out_w]
 
@@ -107,35 +106,54 @@ where
                 let dec = dec.narrow(2, 0, at)?.narrow(3, 0, ah)?.narrow(4, 0, aw)?;
                 let weighted = dec.broadcast_mul(&blend)?;
 
-                // Place each tile at its output offset by zero-padding to the full output shape.
-                // `out_start + a* <= out_stop <= out_*`, so the right pad never underflows.
-                let (pt0, pt1) = (
-                    t.out_start as usize,
-                    plan.out_f as usize - (t.out_start as usize + at),
-                );
-                let (ph0, ph1) = (
-                    hh.out_start as usize,
-                    plan.out_h as usize - (hh.out_start as usize + ah),
-                );
-                let (pw0, pw1) = (
-                    ww.out_start as usize,
-                    plan.out_w as usize - (ww.out_start as usize + aw),
-                );
-                let pad5 = |x: &Tensor| -> Result<Tensor> {
-                    x.pad_with_zeros(2, pt0, pt1)?
-                        .pad_with_zeros(3, ph0, ph1)?
-                        .pad_with_zeros(4, pw0, pw1)
-                };
-                let weighted_full = pad5(&weighted)?;
-                let blend_full = pad5(&blend)?;
+                let (b, c, _, _, _) = weighted.dims5()?;
+                let pt0 = t.out_start as usize;
+                let ph0 = hh.out_start as usize;
+                let pw0 = ww.out_start as usize;
+                let output_ranges = [0..b, 0..c, pt0..pt0 + at, ph0..ph0 + ah, pw0..pw0 + aw];
+                let weight_ranges = [0..1, 0..1, pt0..pt0 + at, ph0..ph0 + ah, pw0..pw0 + aw];
 
                 output = Some(match output {
-                    None => weighted_full,
-                    Some(acc) => acc.add(&weighted_full)?,
+                    None => Tensor::zeros(
+                        (
+                            b,
+                            c,
+                            plan.out_f as usize,
+                            plan.out_h as usize,
+                            plan.out_w as usize,
+                        ),
+                        weighted.dtype(),
+                        dev,
+                    )?
+                    .slice_assign(&output_ranges, &weighted)?,
+                    Some(acc) => {
+                        let prior = acc
+                            .narrow(2, pt0, at)?
+                            .narrow(3, ph0, ah)?
+                            .narrow(4, pw0, aw)?;
+                        acc.slice_assign(&output_ranges, &prior.add(&weighted)?)?
+                    }
                 });
                 weights = Some(match weights {
-                    None => blend_full,
-                    Some(acc) => acc.add(&blend_full)?,
+                    None => Tensor::zeros(
+                        (
+                            1,
+                            1,
+                            plan.out_f as usize,
+                            plan.out_h as usize,
+                            plan.out_w as usize,
+                        ),
+                        blend.dtype(),
+                        dev,
+                    )?
+                    .slice_assign(&weight_ranges, &blend)?,
+                    Some(acc) => {
+                        let prior = acc
+                            .narrow(2, pt0, at)?
+                            .narrow(3, ph0, ah)?
+                            .narrow(4, pw0, aw)?;
+                        acc.slice_assign(&weight_ranges, &prior.add(&blend)?)?
+                    }
                 });
             }
         }

@@ -277,6 +277,9 @@ const LTX_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 // tile's output volume (the single-pass anchors imply ≈635 B/voxel for the decoder's 1024-channel
 // stack). Constants are rounded to the **conservative** (over-predicting) side so the budgeted selector
 // never picks a tile that OOMs — the model reproduces every anchor at ratio 1.12–1.65× (never under).
+// sc-12474 removed the pad-to-full tile transients. We intentionally retain these pre-change
+// constants as conservative upper bounds: slice accumulation cannot raise the measured peak, and the
+// anchor regression below still proves that the selector does not under-predict any calibrated row.
 // The placeholders (40/300) under-predicted single-pass by ~1.9×; re-run the sweep after a decoder or
 // candle-allocator change. See the `ltx_decode_peak_matches_cuda_anchors` regression test below.
 const LTX_VAE_FIXED_BYTES: f64 = 2.7e9;
