@@ -22,7 +22,8 @@
 //!      proving the tile partition + feather assembly is numerically sound.
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::{imageops, Image};
+use candle_gen::gen_core::{imageops, CancelFlag, Image};
+use candle_gen::CandleError;
 use candle_gen_seedvr2::config::DitConfig;
 use candle_gen_seedvr2::pipeline::Seedvr2Pipeline;
 use candle_gen_seedvr2::video;
@@ -302,7 +303,7 @@ fn cuda_video_identical_frames_smoke() {
     let (src, tgt) = (256usize, 512usize);
     let frame = synth_frame(src, 0, 0);
     let img = pipe
-        .generate(&frame, tgt, tgt, 11, 0.0)
+        .generate(&frame, tgt, tgt, 11, 0.0, None)
         .expect("T=1 baseline");
     let clip: Vec<Image> = (0..8).map(|_| frame.clone()).collect();
     let vid = pipe
@@ -339,7 +340,7 @@ fn cuda_video_hd_tiling_smoke() {
     let frame = synth_frame(src, 0, 0);
 
     let untiled = pipe
-        .generate(&frame, tgt, tgt, 7, 0.0)
+        .generate(&frame, tgt, tgt, 7, 0.0, None)
         .expect("single-pass");
 
     let processed = {
@@ -349,7 +350,7 @@ fn cuda_video_hd_tiling_smoke() {
     };
     let t0 = std::time::Instant::now();
     let decoded = pipe
-        .run_frame_tiled(&processed, 7, 256, 64)
+        .run_frame_tiled(&processed, 7, 256, 64, None)
         .expect("run_frame_tiled");
     eprintln!(
         "[seedvr2-video] HD tiling {tgt}² (256-px tiles) in {:?} -> {:?}",
@@ -382,5 +383,32 @@ fn cuda_video_hd_tiling_smoke() {
     assert!(
         corr > 0.9,
         "spatial tiling diverges from the single-pass upscale (corr={corr:.4}) — feather/partition bug"
+    );
+}
+
+/// sc-12465 / F-013: the real spatial-tile loop honours a tripped cancel flag **before** running a
+/// tile — a pre-cancelled flag must surface the typed `Canceled` from `run_frame_tiled` without
+/// touching the model (the weight-free per-tile placement/counting contract is pinned by
+/// `pipeline::tests::spatial_tile_loop_cancels_between_tiles`).
+#[test]
+#[ignore = "needs SEEDVR2_CKPT weights + a CUDA build"]
+fn cuda_tiled_cancel_stops_before_first_tile() {
+    let Some((pipe, _dt)) = load_pipe() else {
+        return;
+    };
+    let frame = synth_frame(256, 0, 0);
+    let processed = pipe
+        .preprocess(&frame, 512, 512, 0.0)
+        .expect("preprocess")
+        .unsqueeze(2)
+        .expect("add T axis");
+    let flag = CancelFlag::new();
+    flag.cancel();
+    let err = pipe
+        .run_frame_tiled(&processed, 7, 256, 64, Some(&flag))
+        .expect_err("pre-cancelled flag must abort the tiled upscale");
+    assert!(
+        matches!(err, CandleError::Canceled),
+        "expected the typed Canceled, got: {err:?}"
     );
 }

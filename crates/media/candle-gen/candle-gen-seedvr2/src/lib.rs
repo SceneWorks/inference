@@ -236,12 +236,16 @@ impl Generator for Seedvr2Generator {
                 current: 1,
                 total: 1,
             });
+            // `&req.cancel` is threaded so a tiled still (up to 9 full encode→DiT→decode tile
+            // passes above 1536² / over budget) honors a mid-image cancel per tile (sc-12465),
+            // not just the per-image check above.
             let img = pipe.generate(
                 image,
                 req.width as usize,
                 req.height as usize,
                 seed,
                 softness,
+                Some(&req.cancel),
             )?;
             on_progress(Progress::Decoding);
             Ok(img)

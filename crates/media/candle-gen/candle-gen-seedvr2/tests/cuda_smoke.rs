@@ -113,7 +113,7 @@ fn cuda_upscale_smoke() {
     let lr = synth_lr(src);
 
     let t_gen = std::time::Instant::now();
-    let out = pipe.generate(&lr, tgt, tgt, 42, 0.0).expect("generate");
+    let out = pipe.generate(&lr, tgt, tgt, 42, 0.0, None).expect("generate");
     eprintln!(
         "[seedvr2-smoke] {src}->{tgt} in {:?} -> {}x{}",
         t_gen.elapsed(),
@@ -202,10 +202,10 @@ fn seedvr2_image_path_tiles_when_over_budget() {
 
     // Huge ceiling → one-pass still path; tiny ceiling → OverBudget → spatial-tiled path.
     let single = pipe
-        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e9)
+        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e9, None)
         .expect("single-pass still path");
     let tiled = pipe
-        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e-6)
+        .generate_budgeted(&lr, w, h, 7, 0.0, 1.0e-6, None)
         .expect("spatial-tiled path");
 
     assert_eq!(

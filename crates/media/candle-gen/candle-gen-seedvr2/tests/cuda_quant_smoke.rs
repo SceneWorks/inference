@@ -100,7 +100,7 @@ fn dtype() -> DType {
 
 /// Run a `src→tgt` upscale and return the RGB8 pixels as f32.
 fn upscale(pipe: &Seedvr2Pipeline, lr: &Image, tgt: usize, seed: u64) -> Vec<f32> {
-    let out = pipe.generate(lr, tgt, tgt, seed, 0.0).expect("generate");
+    let out = pipe.generate(lr, tgt, tgt, seed, 0.0, None).expect("generate");
     assert_eq!((out.width, out.height), (tgt as u32, tgt as u32));
     out.pixels.iter().map(|&v| v as f32).collect()
 }
