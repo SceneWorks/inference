@@ -14,16 +14,23 @@
 //!  3. applies **tanh-gated** dual residuals (`MochiModulatedRMSNorm`) and a SwiGLU FFN per stream.
 //!
 //! The final block is `context_pre_only` — it drops the text-stream output path (no `to_add_out` /
-//! `ff_context`, and `norm1_context` is a `MochiLayerNormContinuous` instead). The whole model runs in
-//! **f32** here (the reference runs bf16; f32 is the high-precision truth the bf16 goldens are a
-//! rounding of — the same stance as the T5 `te_parity`), with RoPE/norms already f32 in the reference.
+//! `ff_context`, and `norm1_context` is a `MochiLayerNormContinuous` instead).
+//!
+//! **Compute precision.** The model runs at a *compute dtype* threaded in as the `dtype` argument to
+//! `from_weights` (the weights load at that dtype). Production loads **bf16** — the reference's native
+//! precision and the Wan/LTX production path — while the parity suites load **f32** (the high-precision
+//! truth the bf16 goldens are a rounding of). The discipline mirrors Wan: the residual / modulation /
+//! norm / RoPE stream stays **f32** (`rms_*` and RoPE upcast internally), and each tensor is cast to the
+//! compute dtype only at the **matmul / conv / SDPA boundary** (via [`MochiLinear::forward`] and the
+//! explicit casts around the joint SDPA + patch conv). Because every such cast keys off the *local weight
+//! dtype*, the f32 path is a no-op cast at every site and stays bit-identical to the goldens.
 
 use std::path::Path;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, concatenate_axis, matmul, maximum, mean_axis, multiply, quantized_matmul, rsqrt, split,
-    sum_axis, tanh,
+    add, concatenate_axis, log, matmul, maximum, mean_axis, multiply, quantized_matmul, rsqrt,
+    split, sum_axis, tanh,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -166,7 +173,8 @@ pub enum MochiLinear {
     /// previous raw-`Array` path (f32 activations make `addmm == matmul + add`).
     Dense { w: Array, b: Option<Array> },
     /// Quantized base — `quantized_matmul` (fp32-accumulate) over the packed weight, then optional
-    /// dense-bias add. Activations feed in AS-IS (Mochi's f32 compute), matching the Wan path.
+    /// dense-bias add. Activations are cast to `compute` before the matmul, matching the Wan path
+    /// (bf16 activations × quantized weights in production; f32 in the parity suites).
     Quant {
         wq: Array,
         scales: Array,
@@ -174,6 +182,9 @@ pub enum MochiLinear {
         b: Option<Array>,
         group: i32,
         bits: i32,
+        /// Activation compute dtype (the `dtype` passed to [`MochiLinear::load`]). The packed
+        /// weight is dtype-free (u32 codes); the activation is cast to this before `quantized_matmul`.
+        compute: Dtype,
     },
 }
 
@@ -205,6 +216,7 @@ impl MochiLinear {
                 b,
                 group: q.group,
                 bits: q.bits,
+                compute: dtype,
             });
         }
         let b = if bias {
@@ -218,12 +230,27 @@ impl MochiLinear {
         })
     }
 
+    /// The activation compute dtype this Linear expects at its matmul boundary — the weight dtype for a
+    /// dense Linear, the stored `compute` for a quantized one. Callers cast joint-attention q/k/v (which
+    /// leave the f32 RoPE/norm stream) to this before the shared SDPA.
+    pub fn compute_dtype(&self) -> Dtype {
+        match self {
+            MochiLinear::Dense { w, .. } => w.dtype(),
+            MochiLinear::Quant { compute, .. } => *compute,
+        }
+    }
+
     pub fn forward(&self, x: &Array) -> Result<Array> {
         match self {
-            MochiLinear::Dense { w, b } => match b {
-                Some(b) => linear_b(x, w, b),
-                None => linear_nb(x, w),
-            },
+            // Cast the (f32-stream) activation to the weight dtype so the matmul runs at the compute
+            // precision (bf16 in production; a no-op in the f32 parity path — weight is f32 there).
+            MochiLinear::Dense { w, b } => {
+                let x = x.as_dtype(w.dtype())?;
+                match b {
+                    Some(b) => linear_b(&x, w, b),
+                    None => linear_nb(&x, w),
+                }
+            }
             MochiLinear::Quant {
                 wq,
                 scales,
@@ -231,8 +258,10 @@ impl MochiLinear {
                 b,
                 group,
                 bits,
+                compute,
             } => {
-                let mut y = quantized_matmul(x, wq, scales, biases, true, *group, *bits)?;
+                let x = x.as_dtype(*compute)?;
+                let mut y = quantized_matmul(&x, wq, scales, biases, true, *group, *bits)?;
                 if let Some(b) = b {
                     y = add(&y, b)?;
                 }
@@ -396,14 +425,17 @@ impl MochiAttention {
         let eq = rms_weighted(&eq, &self.norm_added_q, QK_NORM_EPS)?;
         let ek = rms_weighted(&ek, &self.norm_added_k, QK_NORM_EPS)?;
 
-        // → [B, heads, S, head_dim]; concat visual + text along the sequence axis.
-        let t = |a: &Array| -> Result<Array> { Ok(a.transpose_axes(&[0, 2, 1, 3])?) };
+        // → [B, heads, S, head_dim]; concat visual + text along the sequence axis. q/k left the f32
+        // RoPE/norm stream and v is at the compute dtype — cast all three (and the mask) to the compute
+        // dtype so the SDPA runs at bf16 in production (a no-op in the f32 parity path).
+        let cd = self.to_v.compute_dtype();
+        let t = |a: &Array| -> Result<Array> { Ok(a.transpose_axes(&[0, 2, 1, 3])?.as_dtype(cd)?) };
         let full_q = concatenate_axis(&[&t(&q)?, &t(&eq)?], 2)?;
         let full_k = concatenate_axis(&[&t(&k)?, &t(&ek)?], 2)?;
         let full_v = concatenate_axis(&[&t(&v)?, &t(&ev)?], 2)?;
 
         // Additive key-padding mask [B, 1, 1, Sv+St]: 0 for visual + valid text, −inf for padded text.
-        let mask = build_joint_mask(enc_mask, sv)?;
+        let mask = build_joint_mask(enc_mask, sv, cd)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
         let out = scaled_dot_product_attention(&full_q, &full_k, &full_v, scale, &mask, None)?;
 
@@ -427,12 +459,17 @@ impl MochiAttention {
     }
 }
 
-/// Build the additive joint attention mask `[B, 1, 1, num_visual + St]`: `0` for the visual keys and
-/// valid text keys, `−inf` for padded text keys (`enc_mask == 0`). Broadcasts over query + heads. This
-/// is the joint-SDPA equivalent of the reference's gather-valid-keys path: padded keys get softmax
-/// weight 0, so the valid query rows are identical (padded text *query* rows differ — masked out of
-/// the parity gate for `block_out.1`).
-fn build_joint_mask(enc_mask: &Array, num_visual: i32) -> Result<Array> {
+/// Build the additive joint attention mask `[B, 1, 1, num_visual + St]` at dtype `cd`: `0` for the
+/// visual keys and valid text keys, `−inf` for padded text keys (`enc_mask == 0`). Broadcasts over
+/// query + heads. This is the joint-SDPA equivalent of the reference's gather-valid-keys path: padded
+/// keys get softmax weight 0, so the valid query rows are identical (padded text *query* rows differ —
+/// masked out of the parity gate for `block_out.1`).
+///
+/// Built **on-device** (no host `as_slice` round-trip): the text-key additive term is `log(enc_mask)`,
+/// which maps `1 → 0` and `0 → −∞` exactly (bit-identical additive mask to the old host loop), and the
+/// visual keys are a zero pad. Called per attention block, so keeping it lazy/on-device avoids a
+/// per-block pipeline stall.
+fn build_joint_mask(enc_mask: &Array, num_visual: i32, cd: Dtype) -> Result<Array> {
     let sh = enc_mask.shape();
     if sh.len() != 2 {
         return Err(Error::Msg(format!(
@@ -440,21 +477,12 @@ fn build_joint_mask(enc_mask: &Array, num_visual: i32) -> Result<Array> {
         )));
     }
     let (b, st) = (sh[0], sh[1]);
-    let m: Vec<f32> = enc_mask
-        .as_dtype(Dtype::Float32)?
-        .as_slice::<f32>()
-        .to_vec();
-    let total = num_visual + st;
-    let mut data = vec![0f32; (b * total) as usize];
-    for bi in 0..b {
-        for j in 0..st {
-            // valid iff mask == 1; padded text key → −inf.
-            if m[(bi * st + j) as usize] == 0.0 {
-                data[(bi * total + num_visual + j) as usize] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    Ok(Array::from_slice(&data, &[b, 1, 1, total]))
+    // Text keys: log(1) = 0 (valid), log(0) = −inf (padded).
+    let text = log(&enc_mask.as_dtype(cd)?)?; // [B, St]
+                                              // Visual keys: always valid → 0.
+    let visual = Array::zeros::<f32>(&[b, num_visual])?.as_dtype(cd)?;
+    let full = concatenate_axis(&[&visual, &text], 1)?; // [B, num_visual + St]
+    Ok(full.reshape(&[b, 1, 1, num_visual + st])?)
 }
 
 // ---------------------------------------------------------------------------- block
@@ -554,9 +582,14 @@ impl MochiTransformerBlock {
     ) -> Result<(Array, Array)> {
         let eps = self.eps;
         let silu_temb = silu(&temb.as_dtype(Dtype::Float32)?)?;
+        // The adaLN modulation projections run at the compute dtype; the f32 SiLU(temb) is cast in at
+        // the matmul boundary (a no-op in the f32 parity path). The chunked scales/gates then promote
+        // the residual back to f32 via the `(1 + scale)` / `tanh(gate)` arithmetic below.
+        let cd = self.norm1_w.dtype();
+        let silu_temb_cd = silu_temb.as_dtype(cd)?;
 
         // norm1 (visual): (scale_msa, gate_msa, scale_mlp, gate_mlp).
-        let emb = linear_b(&silu_temb, &self.norm1_w, &self.norm1_b)?;
+        let emb = linear_b(&silu_temb_cd, &self.norm1_w, &self.norm1_b)?;
         let c = chunk_last(&emb, 4)?;
         let (scale_msa, gate_msa, scale_mlp, gate_mlp) = (&c[0], &c[1], &c[2], &c[3]);
         let norm_h = multiply(
@@ -567,7 +600,7 @@ impl MochiTransformerBlock {
         // norm1_context (text).
         let (norm_e, ctx_gates) = match &self.norm1_context {
             NormContext::Zero { lin_w, lin_b } => {
-                let emb_c = linear_b(&silu_temb, lin_w, lin_b)?;
+                let emb_c = linear_b(&silu_temb_cd, lin_w, lin_b)?;
                 let cc = chunk_last(&emb_c, 4)?;
                 let norm_e = multiply(
                     &rms_weightless(enc, eps)?,
@@ -576,7 +609,7 @@ impl MochiTransformerBlock {
                 (norm_e, Some((cc[1].clone(), cc[2].clone(), cc[3].clone())))
             }
             NormContext::Continuous { lin_w, lin_b } => {
-                let scale_c = linear_b(&silu_temb, lin_w, lin_b)?;
+                let scale_c = linear_b(&silu_temb_cd, lin_w, lin_b)?;
                 let norm_e = multiply(
                     &rms_weightless(enc, eps)?,
                     &add(&unsqueeze1(&scale_c)?, Array::from_f32(1.0))?,
@@ -675,22 +708,29 @@ impl AttentionPool {
         })
     }
 
-    /// `x [B, L, D]`, `mask [B, L]` (0/1) → pooled `[B, output_dim]`.
+    /// `x [B, L, D]`, `mask [B, L]` (0/1) → pooled `[B, output_dim]`. The masked-mean pooling stays f32
+    /// (a small precision-sensitive reduction over the raw T5 tokens); the kv/q/o projections + SDPA run
+    /// at the compute dtype `cd` (bf16 in production, f32 in parity).
     fn forward(&self, x: &Array, mask: &Array) -> Result<Array> {
         let sh = x.shape();
         let (b, l, d) = (sh[0], sh[1], sh[2]);
         let head_dim = self.embed_dim / self.num_heads;
+        let cd = self.to_kv_w.dtype();
 
-        // pool_tokens: weighted mean over valid tokens → the query "class" token.
+        // pool_tokens: weighted mean over valid tokens → the query "class" token (f32).
         let m = mask.as_dtype(Dtype::Float32)?.reshape(&[b, l, 1])?;
         let denom = maximum(&sum_axis(&m, 1, true)?, Array::from_f32(1.0))?; // [B,1,1] clamp≥1
         let mnorm = mlx_rs::ops::divide(&m, &denom)?;
-        let x_pool = sum_axis(&multiply(x, &mnorm)?, 1, true)?; // [B, 1, D]
+        let x_pool = sum_axis(&multiply(&x.as_dtype(Dtype::Float32)?, &mnorm)?, 1, true)?; // [B, 1, D]
 
-        // Concat pooled + tokens; KV over all, Q from the pooled token only.
-        let xcat = concatenate_axis(&[&x_pool, x], 1)?; // [B, 1+L, D]
-        let kv = linear_b(&xcat, &self.to_kv_w, &self.to_kv_b)?; // [B, 1+L, 2D]
-        let q = linear_b(&x_pool.reshape(&[b, d])?, &self.to_q_w, &self.to_q_b)?; // [B, D]
+        // Concat pooled + tokens; KV over all, Q from the pooled token only (cast in at the matmul).
+        let xcat = concatenate_axis(&[&x_pool, &x.as_dtype(Dtype::Float32)?], 1)?; // [B, 1+L, D]
+        let kv = linear_b(&xcat.as_dtype(cd)?, &self.to_kv_w, &self.to_kv_b)?; // [B, 1+L, 2D]
+        let q = linear_b(
+            &x_pool.reshape(&[b, d])?.as_dtype(cd)?,
+            &self.to_q_w,
+            &self.to_q_b,
+        )?; // [B, D]
 
         // Heads: kv [B, 1+L, 2, H, hd] → [B, H, 2, 1+L, hd] → k, v.
         let lk = l + 1;
@@ -702,22 +742,16 @@ impl AttentionPool {
         let v = parts[1].reshape(&[b, self.num_heads as i32, lk, head_dim as i32])?;
         let q = q.reshape(&[b, self.num_heads as i32, 1, head_dim as i32])?; // [B, H, 1, hd]
 
-        // Additive mask [B, 1, 1, 1+L]: key 0 (pooled) always valid; text keys 0/−inf per `mask`.
-        let mvals: Vec<f32> = mask.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
-        let mut mdata = vec![0f32; (b * lk) as usize];
-        for bi in 0..b {
-            for j in 0..l {
-                if mvals[(bi * l + j) as usize] == 0.0 {
-                    mdata[(bi * lk + 1 + j) as usize] = f32::NEG_INFINITY;
-                }
-            }
-        }
-        let attn_mask = Array::from_slice(&mdata, &[b, 1, 1, lk]);
+        // Additive mask [B, 1, 1, 1+L] at `cd`, on-device: key 0 (pooled) always valid → 0; text keys
+        // log(mask) (0 valid / −inf padded, bit-identical additive mask to the old host loop).
+        let pooled_key = Array::zeros::<f32>(&[b, 1])?.as_dtype(cd)?;
+        let text = log(&mask.as_dtype(cd)?)?; // [B, L]
+        let attn_mask = concatenate_axis(&[&pooled_key, &text], 1)?.reshape(&[b, 1, 1, lk])?;
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let out = scaled_dot_product_attention(&q, &k, &v, scale, &attn_mask, None)?; // [B,H,1,hd]
         let out = out.reshape(&[b, self.embed_dim as i32])?; // squeeze(2).flatten(1,2)
-        linear_b(&out, &self.to_out_w, &self.to_out_b)
+        linear_b(&out.as_dtype(cd)?, &self.to_out_w, &self.to_out_b)
     }
 }
 
@@ -754,19 +788,21 @@ impl TimeEmbed {
     }
 
     fn forward(&self, timestep: &Array, enc: &Array, enc_mask: &Array) -> Result<(Array, Array)> {
-        // Timesteps(flip_sin_to_cos=True, downscale_freq_shift=0.0) → [B, time_embed_dim].
+        // Timesteps(flip_sin_to_cos=True, downscale_freq_shift=0.0) → [B, time_embed_dim] (f32 sincos,
+        // cast in at the matmul boundary). The MLP + caption projection run at the compute dtype.
+        let cd = self.ts_lin1_w.dtype();
         let time_proj = timestep_sincos(
             &timestep.as_dtype(Dtype::Float32)?,
             self.time_embed_dim,
             10000.0,
             0.0,
         )?;
-        let te = linear_b(&time_proj, &self.ts_lin1_w, &self.ts_lin1_b)?;
+        let te = linear_b(&time_proj.as_dtype(cd)?, &self.ts_lin1_w, &self.ts_lin1_b)?;
         let te = silu(&te)?;
-        let te = linear_b(&te, &self.ts_lin2_w, &self.ts_lin2_b)?; // [B, inner]
+        let te = linear_b(&te.as_dtype(cd)?, &self.ts_lin2_w, &self.ts_lin2_b)?; // [B, inner]
 
         let pooled = self.pooler.forward(enc, enc_mask)?; // [B, inner]
-        let caption = linear_b(enc, &self.caption_w, &self.caption_b)?; // [B, L, pooled]
+        let caption = linear_b(&enc.as_dtype(cd)?, &self.caption_w, &self.caption_b)?; // [B, L, pooled]
         let temb = add(&te, &pooled)?;
         Ok((temb, caption))
     }
@@ -842,9 +878,11 @@ impl MochiTransformer3DModel {
         // Time / caption embedding (raw T5 → temb + 1536-dim text stream).
         let (temb, mut enc_stream) = self.time_embed.forward(timestep, enc, enc_mask)?;
 
-        // Patchify: [B, C, F, H, W] → [B·F, H, W, C] (NHWC) → Conv2d(patch) → [B, F·ph·pw, inner].
+        // Patchify: [B, C, F, H, W] → [B·F, H, W, C] (NHWC) → Conv2d(patch) → [B, F·ph·pw, inner]. The
+        // patch conv runs at the compute dtype (bf16 in production; f32 in parity — the weight dtype).
+        let cd = self.patch_w.dtype();
         let x = hidden
-            .as_dtype(Dtype::Float32)?
+            .as_dtype(cd)?
             .transpose_axes(&[0, 2, 1, 3, 4])? // [B, F, C, H, W]
             .reshape(&[b * f, c, h, wd])?
             .transpose_axes(&[0, 2, 3, 1])?; // NHWC
@@ -862,8 +900,13 @@ impl MochiTransformer3DModel {
             enc_stream = e_new;
         }
 
-        // AdaLayerNormContinuous (layer_norm, no affine) → proj_out.
-        let emb = linear_b(&silu(&temb)?, &self.norm_out_w, &self.norm_out_b)?;
+        // AdaLayerNormContinuous (layer_norm, no affine) → proj_out. The two projections run at the
+        // compute dtype; the f32 residual `hs` and modulation are cast in at each matmul boundary.
+        let emb = linear_b(
+            &silu(&temb)?.as_dtype(self.norm_out_w.dtype())?,
+            &self.norm_out_w,
+            &self.norm_out_b,
+        )?;
         let so = chunk_last(&emb, 2)?;
         let (scale, shift) = (&so[0], &so[1]);
         let normed = layer_norm(&hs, None, None, 1e-6)?;
@@ -871,7 +914,11 @@ impl MochiTransformer3DModel {
             &multiply(&normed, &add(&unsqueeze1(scale)?, Array::from_f32(1.0))?)?,
             &unsqueeze1(shift)?,
         )?;
-        let hs = linear_b(&hs, &self.proj_out_w, &self.proj_out_b)?; // [B, seq, p²·out_ch]
+        let hs = linear_b(
+            &hs.as_dtype(self.proj_out_w.dtype())?,
+            &self.proj_out_w,
+            &self.proj_out_b,
+        )?; // [B, seq, p²·out_ch]
 
         // Unpatchify: [B, F, ph, pw, p, p, out_ch] → [B, out_ch, F, H, W].
         let out_ch = c; // out_channels == in_channels (12)
@@ -886,7 +933,7 @@ impl MochiTransformer3DModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::{max as mx_max, quantize, subtract};
+    use mlx_rs::ops::{abs, max as mx_max, quantize, subtract};
 
     /// Weightless packer round-trip: quantize a synthetic bf16 Linear, consume it through
     /// [`MochiLinear::load`] (the `.scales` probe), and check the packed forward is finite,
@@ -1178,6 +1225,54 @@ mod tests {
         .unwrap()
         .item::<f32>();
         assert_eq!(d, 0.0, "forward is deterministic");
+    }
+
+    /// The **bf16 production path** must run end-to-end and track the f32 truth. This is the guard for
+    /// the mixed-precision cast discipline (residual/norm/RoPE f32; matmul/conv/SDPA operands at the
+    /// compute dtype): a *missed* cast leaves an f32 activation feeding a bf16 weight, and MLX's matmul
+    /// rejects the mismatch — so a forward that merely *completes* at `Dtype::Bfloat16` proves every
+    /// matmul/SDPA/conv boundary lines up. It must also stay finite (no NaN from the `log`-built mask or
+    /// a bad reduction) and stay a bounded rounding of the f32 velocity field (not a structural break).
+    #[test]
+    fn full_model_forward_bf16_runs_and_tracks_f32() {
+        let cfg = tiny_full_cfg();
+        let w = tiny_full_weights(&cfg);
+        let model_f32 = MochiTransformer3DModel::from_weights(&w, &cfg, Dtype::Float32).unwrap();
+        let model_bf16 = MochiTransformer3DModel::from_weights(&w, &cfg, Dtype::Bfloat16).unwrap();
+
+        let hidden = rnd(&[2, 4, 1, 4, 4], 300);
+        let enc = rnd(&[2, 3, 16], 301);
+        let timestep = Array::from_slice(&[0.0f32, 25.0], &[2]);
+        let enc_mask = Array::from_slice(&[1.0f32, 1.0, 0.0, 1.0, 0.0, 0.0], &[2, 3]);
+
+        let out_f32 = model_f32
+            .forward(&hidden, &enc, &timestep, &enc_mask)
+            .unwrap();
+        // The bf16 forward must complete (every matmul operand dtype lines up) and stay finite.
+        let out_bf16 = model_bf16
+            .forward(&hidden, &enc, &timestep, &enc_mask)
+            .unwrap();
+        assert_eq!(out_bf16.dtype(), Dtype::Bfloat16, "bf16 path stays bf16");
+        let out_bf16 = out_bf16.as_dtype(Dtype::Float32).unwrap();
+        assert_eq!(out_bf16.shape(), out_f32.shape());
+        assert!(
+            out_bf16.as_slice::<f32>().iter().all(|x| x.is_finite()),
+            "bf16 forward produced a non-finite value"
+        );
+
+        // bf16 tracks f32 within a bounded relative error — the same velocity field, not bit-exact.
+        let num = mx_max(abs(subtract(&out_bf16, &out_f32).unwrap()).unwrap(), None)
+            .unwrap()
+            .item::<f32>();
+        let den = mx_max(abs(&out_f32).unwrap(), None)
+            .unwrap()
+            .item::<f32>()
+            .max(1e-6);
+        let rel = num / den;
+        assert!(
+            rel < 0.2,
+            "bf16 vs f32 rel {rel:.3e} exceeds 0.2 — structural divergence"
+        );
     }
 
     #[test]

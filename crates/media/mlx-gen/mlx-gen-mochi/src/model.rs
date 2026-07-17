@@ -17,7 +17,7 @@ use mlx_rs::{random, Dtype};
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, Progress, Result, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, WeightsSource,
 };
 use mlx_gen_flux::T5TextEncoder;
 
@@ -106,8 +106,9 @@ pub struct Mochi {
 }
 
 /// Assemble the full Mochi 1 model from a snapshot directory (T5-XXL text encoder + AsymmDiT
-/// transformer + AsymmVAE decoder). The DiT is loaded at f32 compute precision (its on-disk shards are
-/// bf16; the port upcasts them — the parity-verified regime, see `tests/dit_parity.rs`).
+/// transformer + AsymmVAE decoder). The DiT compute precision follows `spec.precision`: `Bf16` (the
+/// default) loads the bf16 on-disk shards as-is for the production-speed path; `Fp32` upcasts them to
+/// the parity-verified f32 regime (see `tests/dit_parity.rs`). The AsymmVAE decode stays f32 either way.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let root =
         match &spec.weights {
@@ -160,10 +161,21 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         ..Default::default()
     };
 
+    // DiT compute precision. `Precision::Bf16` (the LoadSpec default) → **bf16** — the reference's
+    // native precision and the Wan/LTX production-speed path; loading the ~10 B-param AsymmDiT at f32
+    // would double its resident weights (~40 GB) and force swap on all but the largest Macs.
+    // `Precision::Fp32` → the f32 high-precision path the parity goldens are captured against. Both are
+    // driven through the same `from_weights(w, cfg, dtype)` seam (every matmul/SDPA casts to `dtype`);
+    // the VAE decode stays f32 in both (a post-sampling quality island — the Wan/LTX stance).
+    let compute_dtype = match spec.precision {
+        Precision::Bf16 => Dtype::Bfloat16,
+        Precision::Fp32 => Dtype::Float32,
+    };
+
     let tokenizer = load_tokenizer()?;
     let t5 = load_t5_encoder(&te_root)?;
     let dit_w = load_transformer_weights(&root)?;
-    let transformer = MochiTransformer3DModel::from_weights(&dit_w, &dit_cfg, Dtype::Float32)?;
+    let transformer = MochiTransformer3DModel::from_weights(&dit_w, &dit_cfg, compute_dtype)?;
     let vae = load_vae_decoder(&vae_root)?;
 
     Ok(Box::new(Mochi {
