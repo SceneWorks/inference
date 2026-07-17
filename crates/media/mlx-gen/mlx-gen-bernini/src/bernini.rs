@@ -56,7 +56,7 @@ use mlx_gen_wan::{WanTransformer, WanVae};
 
 use crate::assembly::{concat_with_zero_init, format_mllm_inputs_embeds};
 use crate::clip_diff::DiffLossFm;
-use crate::config::BerniniKnobs;
+use crate::config::{validate_bernini_geometry, BerniniKnobs};
 use crate::connector::MlpConnector;
 use crate::forward::{PackedForward, VitGuidanceParams, VitMode};
 use crate::mar::{
@@ -616,13 +616,11 @@ impl Bernini {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
-        if let Some(frames) = req.frames {
-            if frames % 4 != 1 {
-                return Err(Error::Msg(format!(
-                    "bernini: num_frames must be 1 + 4·k (got {frames})"
-                )));
-            }
-        }
+        // Shared geometry guard (sc-12454/F-003 + sc-12500/F-040): the sc-12308 14B video-only area
+        // cap, the 16-px grid rejection (replacing the silent `align_dim` refit), and the
+        // `1 + 4·k` frame rule — mirrored from candle's `validate_bernini_geometry` so the same
+        // request gets the same rejection on both backends.
+        validate_bernini_geometry(self.descriptor.id, req)?;
         validate_conditioning_video_clips(req)?;
         Ok(())
     }
@@ -643,8 +641,16 @@ impl Bernini {
             .unwrap_or(FullDefaults::NUM_FRAMES)
             .max(1);
         let out_video = frames > 1;
+        // sc-12500 (F-040): `validate_impl` rejects any off-grid width/height, so the reference's
+        // align-down is a no-op here — assert that instead of silently refitting the request
+        // (1000×1000 used to render 992×992 with no diagnostic while candle errored).
         let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
         let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
+        debug_assert_eq!(
+            (width, height),
+            (req.width, req.height),
+            "bernini: off-grid request survived validate"
+        );
         let steps = req.steps.map(|s| s as usize).unwrap_or(FullDefaults::STEPS);
         let seed = req.seed.unwrap_or(42);
         let neg = req.negative_prompt.clone().unwrap_or_default();
