@@ -31,7 +31,7 @@ use crate::decode::stream::{
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::input_ids;
-use crate::primitives::kv_cache::{ContiguousKvCache, SEQ_AXIS};
+use crate::primitives::kv_cache::{ContiguousKvCache, KvCache, SEQ_AXIS};
 use crate::primitives::sampler::SplitMix64;
 
 /// Cumulative reuse accounting for a [`PrefixCache`] — the measurable payoff of story 7256.
@@ -94,11 +94,18 @@ impl PrefixCache {
     fn seed_for(&mut self, prompt: &[i32]) -> Result<Option<(ContiguousKvCache, usize)>> {
         self.stats.lookups += 1;
         let prompt_len = prompt.len();
-        let hit = self
-            .index
-            .longest_match(prompt)
-            .map(|m| (m.id, m.matched_len.min(prompt_len.saturating_sub(1))))
-            .filter(|&(id, len)| len > 0 && self.kv.contains_key(&id));
+        let hit = self.index.longest_match(prompt).and_then(|m| {
+            let layers = self.kv.get(&m.id)?;
+            // Clamp by the query (a whole-prompt match recomputes only the final token) AND by the
+            // sequence length the stored tensors actually hold — defence in depth against an index
+            // entry that over-states its KV (the budget-finish off-by-one of sc-12455). The query
+            // clamp alone is a no-op for a prompt that *extends* the stored sequence.
+            let len = m
+                .matched_len
+                .min(prompt_len.saturating_sub(1))
+                .min(stored_seq_len(layers));
+            (len > 0).then_some((m.id, len))
+        });
 
         match hit {
             Some((id, len)) => {
@@ -137,8 +144,9 @@ impl PrefixCache {
 ///
 /// On each call: look up the longest cached prefix of `prompt_ids`, seed the KV cache with it and
 /// prefill only the remaining suffix (a miss prefills the whole prompt cold), decode to a stop token
-/// / the budget / a mid-stream cancel, then store the request's full `prompt + generated` KV for
-/// future reuse. The output is **token-for-token identical** to a cold
+/// / the budget / a mid-stream cancel, then store the `prompt + generated` KV the cache holds for
+/// future reuse (on a budget finish the last generated token's KV is never fed, so the stored entry
+/// excludes that token). The output is **token-for-token identical** to a cold
 /// [`generate`](crate::decode::generate) of the same prompt.
 ///
 /// Returns [`Error::Canceled`] if `cancel` is already set before any inference.
@@ -179,20 +187,39 @@ pub fn generate_cached(
         None,
     )?;
 
-    // Store the full sequence (prompt + generated) so the next shared-prefix request reuses it.
+    // Store the sequence whose KV the cache actually holds, so the next shared-prefix request
+    // reuses it. On a budget (`MaxTokens`) finish, `decode_loop` breaks *before* feeding the last
+    // generated token's KV, so the cache holds one position fewer than `prompt + generated`;
+    // truncating to `cache.offset()` keeps the index entry and the stored tensors aligned so a
+    // later prompt extending this sequence can never match past the KV (sc-12455).
     let mut full = prompt_ids.to_vec();
     full.extend_from_slice(&out.tokens);
+    full.truncate(cache.offset() as usize);
     prefix_cache.store(full, &cache);
 
     Ok(out)
 }
 
+/// The sequence length (axis [`SEQ_AXIS`]) the stored per-layer KV actually holds — layer 0 speaks
+/// for all (layers advance in lockstep), `0` for an empty layer list.
+fn stored_seq_len(stored: &[(Tensor, Tensor)]) -> usize {
+    stored.first().map_or(0, |(k, _)| k.dims()[SEQ_AXIS])
+}
+
 /// Slice each layer's `(keys, values)` to the first `len` sequence positions (axis [`SEQ_AXIS`]).
-/// When `len` already equals the stored length the tensors are cloned as-is (no gather).
+/// When `len` already equals the stored length the tensors are cloned as-is (no gather). `len`
+/// beyond a stored tensor's sequence length is a typed error — [`PrefixCache::seed_for`] clamps
+/// before calling, so hitting it means the index/KV alignment invariant broke.
 fn slice_layers(stored: &[(Tensor, Tensor)], len: usize) -> Result<Vec<(Tensor, Tensor)>> {
     let mut out = Vec::with_capacity(stored.len());
     for (k, v) in stored {
-        if k.dims()[SEQ_AXIS] == len {
+        let stored_len = k.dims()[SEQ_AXIS];
+        if stored_len < len {
+            return Err(Error::Msg(format!(
+                "prefix cache: requested {len} positions but the stored KV holds only {stored_len}"
+            )));
+        }
+        if stored_len == len {
             out.push((k.clone(), v.clone()));
         } else {
             // `narrow` keeps positions `0..len` along the sequence axis without a gather kernel.
@@ -200,4 +227,55 @@ fn slice_layers(stored: &[(Tensor, Tensor)], len: usize) -> Result<Vec<(Tensor, 
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_core::{DType, Device};
+
+    use super::*;
+
+    fn kv(seq: usize) -> Vec<(Tensor, Tensor)> {
+        let t = || Tensor::zeros((1, 1, seq, 2), DType::F32, &Device::Cpu).unwrap();
+        vec![(t(), t())]
+    }
+
+    /// Defence in depth (sc-12455): asking for more positions than the stored tensors hold is a
+    /// typed error, never an out-of-bounds slice.
+    #[test]
+    fn slice_layers_rejects_len_past_stored() {
+        let err = slice_layers(&kv(4), 5).unwrap_err();
+        assert!(
+            err.to_string().contains("stored KV holds only 4"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn slice_layers_narrows_and_clones() {
+        let narrowed = slice_layers(&kv(4), 3).unwrap();
+        assert_eq!(narrowed[0].0.dims()[SEQ_AXIS], 3);
+        let cloned = slice_layers(&kv(4), 4).unwrap();
+        assert_eq!(cloned[0].0.dims()[SEQ_AXIS], 4);
+    }
+
+    /// Defence in depth (sc-12455): if an index entry ever over-states its KV again (the pre-fix
+    /// budget-finish state), `seed_for` clamps the match to the positions the tensors actually
+    /// hold instead of failing the request.
+    #[test]
+    fn seed_for_clamps_match_to_stored_kv() {
+        let mut pc = PrefixCache::new(4);
+        // Manufacture the inconsistent state directly: 6 indexed tokens, 5 positions of KV.
+        let tokens: Vec<i32> = vec![1, 2, 3, 4, 5, 6];
+        let out = pc.index.insert(tokens.clone());
+        pc.kv.insert(out.id, kv(5));
+
+        // An extending prompt matches all 6 indexed tokens; the seed must clamp to the 5 stored.
+        let mut prompt = tokens;
+        prompt.extend_from_slice(&[7, 8]);
+        let (cache, len) = pc.seed_for(&prompt).unwrap().expect("hit");
+        assert_eq!(len, 5);
+        assert_eq!(cache.offset(), 5);
+        assert_eq!(pc.stats().reused_prefix_tokens, 5);
+    }
 }
