@@ -35,6 +35,7 @@ use mlx_llm::core_llm::{self, CancelFlag, Error as CoreError, LoadSpec, Quantize
 /// legitimate client writing a request (even by hand over a slow link) while bounding how long one
 /// idle connection can monopolise the serving thread.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const INTERNAL_ERROR_MESSAGE: &str = "internal server error";
 
 fn main() {
     if let Err(e) = run() {
@@ -224,7 +225,7 @@ fn handle_chat(
                 write_json(stream, 200, &body)
             }
             Err(CoreError::Canceled) => Ok(()), // client vanished mid-generation
-            Err(e) => write_json(stream, 500, &openai::error_body(&e.to_string(), "server_error")),
+            Err(e) => write_json(stream, 500, &server_error_body(&e)),
         }
     }
 }
@@ -282,7 +283,7 @@ fn stream_chat(
         }
         Err(CoreError::Canceled) => return Ok(()),
         Err(e) => {
-            let _ = sse(stream, &openai::error_body(&e.to_string(), "server_error"));
+            let _ = sse(stream, &server_error_body(&e));
         }
     }
     let _ = stream.write_all(b"data: [DONE]\n\n");
@@ -304,6 +305,13 @@ fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()>
 /// Write a fixed-length plain-text response.
 fn write_text(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
     write_response(stream, status, "text/plain; charset=utf-8", body.as_bytes())
+}
+
+/// Keep backend diagnostics (which may contain local paths or model details) on the server side.
+/// The reference server may be exposed with `--host`, so 500 responses are generic on every bind.
+fn server_error_body(error: &CoreError) -> String {
+    eprintln!("generation error: {error}");
+    openai::error_body(INTERNAL_ERROR_MESSAGE, "server_error")
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> io::Result<()> {
@@ -428,5 +436,13 @@ mod tests {
 
         let resp2 = get_health(addr);
         assert!(resp2.starts_with("HTTP/1.1 200"), "unexpected response: {resp2:?}");
+    }
+
+    #[test]
+    fn internal_error_body_does_not_expose_backend_detail() {
+        let secret = "/Users/private/models/checkpoint.safetensors";
+        let body = server_error_body(&CoreError::Msg(secret.into()));
+        assert!(body.contains(INTERNAL_ERROR_MESSAGE));
+        assert!(!body.contains(secret));
     }
 }
