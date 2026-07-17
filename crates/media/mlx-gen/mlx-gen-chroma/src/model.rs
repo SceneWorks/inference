@@ -232,6 +232,12 @@ pub struct Chroma {
 /// at load time to build the [`PidEngine`]; shared by all three Chroma variants (hd/base/flash).
 pub const PID_BACKBONE: &str = "flux";
 
+/// Chroma is a FLUX.1 derivative whose VAE downsamples by 8 and the DiT packs a 2×2 patch, so both
+/// image dims must be multiples of **16** for a clean latent-image-id grid. Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised Chroma image bucket to (sc-12612).
+/// `validate_impl` enforces exactly this value, so the const cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
+
 /// FluxPosEmbed image position ids `[h2·w2, 3]` (axis 1 = row, axis 2 = col), row-major over the
 /// packed `(height/16, width/16)` grid — diffusers `_prepare_latent_image_ids`.
 fn latent_image_ids(h2: usize, w2: usize) -> Array {
@@ -680,9 +686,9 @@ impl Chroma {
                 self.descriptor.id
             )));
         }
-        if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
+        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
             return Err(Error::Msg(format!(
-                "{}: width and height must be multiples of 16, got {}x{}",
+                "{}: width and height must be multiples of {SIZE_MULTIPLE}, got {}x{}",
                 self.descriptor.id, req.width, req.height
             )));
         }
@@ -862,6 +868,36 @@ mod tests {
         let mut nop = |_p: Progress| {};
         let err = model.generate(&req, &mut nop).unwrap_err();
         assert!(matches!(err, gen_core::Error::Canceled), "got: {err}");
+    }
+
+    #[test]
+    fn validate_ties_size_multiple_to_pinned_stride() {
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Chroma
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 8 but not
+        // SIZE_MULTIPLE (16) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let model = weightless(ChromaVariant::Hd);
+        let off_stride = model
+            .validate_impl(&GenerationRequest {
+                prompt: "a fox".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                height: 1024,
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(model
+            .validate_impl(&GenerationRequest {
+                prompt: "a fox".into(),
+                width: 1024, // 64×16 — on-stride
+                height: 1024,
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     // ── sc-10840: weight-free, default-run proof that Chroma's dispatch HONORS `offload_policy`.

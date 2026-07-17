@@ -121,8 +121,11 @@ pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
 pub const FLUX1_DEV_ID: &str = "flux1_dev";
 
 /// FLUX works in the VAE's /8 latent and the DiT packs that 2×2, so both image dims must be multiples
-/// of **16** for a clean pack. Enforced in [`validate`](Generator::validate).
-const SIZE_MULTIPLE: u32 = 16;
+/// of **16** for a clean pack. Enforced in [`validate`](Generator::validate). Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised FLUX image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`; the control / IP-Adapter sibling providers import this same
+/// crate-root const so no copy can drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
 
 /// The two FLUX.1 variants. Carries the parity-critical per-variant metadata (id, step/guidance
 /// defaults, T5 length, checkpoint filename) as primitives so `lib.rs` stays candle-light — the
@@ -535,6 +538,30 @@ mod tests {
         assert!(!descriptor_dev()
             .capabilities
             .accepts(ConditioningKind::Reference));
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised FLUX bucket
+        // to. Pin the value and mutation-check that a multiple of 8 that is not SIZE_MULTIPLE (16) is
+        // rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = dev
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(dev
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     /// LoRA adapters / quantization / control overlays are rejected at load as typed `Unsupported`

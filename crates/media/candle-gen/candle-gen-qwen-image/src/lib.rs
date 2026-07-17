@@ -106,8 +106,12 @@ const PID_BACKBONE: &str = "qwenimage";
 
 use config::{
     TextEncoderConfig, TransformerConfig, DEFAULT_GUIDANCE, DEFAULT_STEPS, MODEL_ID,
-    NEGATIVE_FALLBACK, SIZE_MULTIPLE,
+    NEGATIVE_FALLBACK,
 };
+/// The pinned image-lane stride (16), re-exported at the crate root so the SceneWorks worker can tie
+/// each advertised Qwen-Image bucket to the real engine stride instead of a hand-copied literal
+/// (sc-12612). `validate` enforces exactly this value, so the const cannot drift from the check.
+pub use config::SIZE_MULTIPLE;
 use text_encoder::QwenTextEncoder;
 use transformer::QwenTransformer;
 use vae::QwenVae;
@@ -993,6 +997,31 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Qwen-Image
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 8 (a lower
+        // divisor) but not SIZE_MULTIPLE (16) is still rejected with the stride error, and an
+        // on-stride in-range size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     /// sc-9046 (F-076): the base txt2img path is a non-distilled 20B model, so an omitted `steps`

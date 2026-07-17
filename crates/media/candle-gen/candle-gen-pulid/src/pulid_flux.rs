@@ -51,8 +51,10 @@ const LATENT_CHANNELS: usize = 16;
 // parity-critical schedule constants rather than maintaining a third copy.
 
 /// FLUX packs the /8 VAE latent 2×2, so both render dims must be multiples of 16 (the flux1 txt2img /
-/// IP-Adapter / control size floor).
-const SIZE_MULTIPLE: u32 = 16;
+/// IP-Adapter / control size floor). Exposed as the pinned-engine stride SceneWorks ties each
+/// advertised PuLID-FLUX image bucket to (sc-12612), mirroring `wan::config::SIZE_MULTIPLE_14B`.
+/// `reject_below_floor` enforces exactly this value, so the const cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
 
 /// Reject a below-floor request loudly before any tensor work. Without it `get_schedule(0, …)` returns
 /// `[NaN]` — zero sampler steps, so the pure seeded noise is decoded and returned as a "success",
@@ -439,6 +441,26 @@ mod tests {
         assert!(err.to_string().contains("multiples of 16"), "{err}");
 
         assert!(reject_below_floor(&base).is_ok());
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised PuLID-FLUX
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE
+        // scale) but not SIZE_MULTIPLE (16) is still rejected with the stride error, and on-stride passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = reject_below_floor(&PulidFluxRequest {
+            width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+            ..base.clone()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(reject_below_floor(&PulidFluxRequest {
+            width: 1024, // 64×16 — on-stride
+            ..base.clone()
+        })
+        .is_ok());
     }
 
     /// The request defaults match the PuLID-FLUX dev knobs (1024², 25 steps, guidance 4.0, id 1.0).

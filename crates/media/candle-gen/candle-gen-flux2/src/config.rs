@@ -28,6 +28,9 @@ pub const DEFAULT_STEPS_DEV: u32 = 28;
 pub const DEFAULT_GUIDANCE_DEV: f32 = 4.0;
 
 /// Both image dims must be multiples of 16 (VAE /8 then the DiT's 2×2 patch) for a clean pack.
+/// Exposed as the pinned-engine stride SceneWorks ties each advertised FLUX.2 image bucket to
+/// (sc-12612), mirroring `wan::config::SIZE_MULTIPLE_14B`. `validate` enforces exactly this value
+/// (txt2img, control, and edit all reference this const), so the const cannot drift from the check.
 pub const SIZE_MULTIPLE: u32 = 16;
 
 /// A pre-quantized-snapshot manifest (the candle twin of mlx sc-5917): the `quantization` block

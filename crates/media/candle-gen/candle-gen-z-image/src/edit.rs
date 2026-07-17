@@ -59,8 +59,9 @@ use crate::common::{self, ResizePolicy, ENC_DTYPE, PATCH_SIZE, SPATIAL_SCALE};
 const DTYPE: DType = DType::BF16;
 
 /// Z-Image works at /8 then patchifies /2, so both image dims must be multiples of 16 for a clean
-/// patchify (the txt2img `validate` floor).
-const SIZE_MULTIPLE: u32 = 16;
+/// patchify (the txt2img `validate` floor). Single source of truth = the crate-root
+/// [`crate::SIZE_MULTIPLE`] (sc-12612).
+use crate::SIZE_MULTIPLE;
 
 /// Z-Image-Turbo is guidance-distilled to a fixed 4-step schedule (the txt2img default).
 const DEFAULT_STEPS: usize = 4;

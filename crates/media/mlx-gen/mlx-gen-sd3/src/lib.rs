@@ -72,7 +72,7 @@ pub mod training;
 pub mod transformer;
 pub mod vae;
 
-pub use model::{Sd3Large, MEDIUM_MODEL_ID, MODEL_ID, TURBO_MODEL_ID};
+pub use model::{Sd3Large, MEDIUM_MODEL_ID, MODEL_ID, SIZE_MULTIPLE, TURBO_MODEL_ID};
 
 pub use config::{
     Sd3Arch, Sd3Variant, DEFAULT_GUIDANCE_LARGE, DEFAULT_GUIDANCE_MEDIUM, DEFAULT_GUIDANCE_TURBO,

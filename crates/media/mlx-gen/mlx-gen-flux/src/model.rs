@@ -30,6 +30,12 @@ const DEFAULT_IP_SCALE: f32 = 0.7;
 const TRUE_CFG_MIN: f32 = 1.0;
 const TRUE_CFG_MAX: f32 = 10.0;
 
+/// FLUX packs the /8 VAE latent 2×2, so both request dims must be multiples of 16. Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised FLUX image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`; both the txt2img `validate_request` and the control lane enforce
+/// exactly this value, so the const cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
+
 /// PiD backbone (latent-space) tag for FLUX.1 (epic 7840, sc-7846). Resolves to the `flux` 16-ch
 /// student in `mlx_gen_pid::registry`; used only at load time to build the [`PidEngine`]. Shared by
 /// both FLUX.1 variants (dev + schnell) — they share the FLUX.1 VAE latent space.
@@ -623,9 +629,9 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             )));
         }
     }
-    if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
-            "{}: width and height must be multiples of 16, got {}x{}",
+            "{}: width and height must be multiples of {SIZE_MULTIPLE}, got {}x{}",
             desc.id, req.width, req.height
         )));
     }
@@ -761,6 +767,8 @@ mod tests {
 
     #[test]
     fn rejects_non_multiple_of_16() {
+        // sc-12612: pin the exported stride so it cannot drift from the check SceneWorks ties to.
+        assert_eq!(SIZE_MULTIPLE, 16);
         let model = Flux1::new_for_tests(FluxVariant::Dev);
         let req = GenerationRequest {
             prompt: "a red fox".into(),
@@ -769,6 +777,25 @@ mod tests {
         };
         let err = model.validate(&req).unwrap_err().to_string();
         assert!(err.contains("multiples of 16"));
+        // A multiple of 8 that is NOT a multiple of SIZE_MULTIPLE (16) is still rejected.
+        let off8 = GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1000, // 125×8
+            ..Default::default()
+        };
+        assert!(model
+            .validate(&off8)
+            .unwrap_err()
+            .to_string()
+            .contains("multiples of 16"));
+        // An on-stride in-range size (default 1024×1024) is accepted.
+        let on = GenerationRequest {
+            prompt: "a red fox".into(),
+            guidance: Some(3.5),
+            width: 1024,
+            ..Default::default()
+        };
+        assert!(model.validate(&on).is_ok());
     }
 
     #[test]

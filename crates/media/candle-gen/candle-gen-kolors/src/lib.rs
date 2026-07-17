@@ -276,6 +276,30 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Kolors
+        // bucket to. Pin the value and mutation-check that a size which is a multiple of 4 but not
+        // SIZE_MULTIPLE (8) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 8);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 8"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 128×8 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     /// sc-7124: the curated ε/DDPM menu is advertised, so `validate` accepts a curated sampler +

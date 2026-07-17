@@ -31,7 +31,7 @@ use std::path::Path;
 
 use crate::caption_upsample;
 use crate::chunk::MemoryConfig;
-use crate::config::Flux2Variant;
+use crate::config::{Flux2Variant, SIZE_MULTIPLE};
 use crate::kv_cache::{CacheMode, Flux2KvCache};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
@@ -997,9 +997,9 @@ pub(crate) fn validate_request(
     // copy and adds the previously-missing scheduler validation).
     desc.capabilities.validate_request(desc.id, req)?;
     // FLUX.2-specific: latent dims must be a multiple of 16 (VAE 8× × patch 2).
-    if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
-            "{}: width and height must be multiples of 16, got {}x{}",
+            "{}: width and height must be multiples of {SIZE_MULTIPLE}, got {}x{}",
             desc.id, req.width, req.height
         )));
     }
@@ -1203,6 +1203,30 @@ mod tests {
         };
         let err = model.validate(&req).unwrap_err().to_string();
         assert!(err.contains("multiples of 16"));
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised FLUX.2 bucket
+        // to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE scale) but
+        // not SIZE_MULTIPLE (16) is still rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = model
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        model
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .unwrap();
     }
 
     #[test]

@@ -195,7 +195,10 @@ impl Variant {
 /// VAE spatial compression (8×) and latent channels (16) — shared with Qwen-Image.
 pub const VAE_COMPRESSION: u32 = 8;
 pub const VAE_CHANNELS: usize = 16;
-/// patchify + VAE alignment: `vae(8) · patch(2) = 16` — W/H must be a multiple of this.
+/// patchify + VAE alignment: `vae(8) · patch(2) = 16` — W/H must be a multiple of this. Exposed as
+/// the pinned-engine stride SceneWorks ties each advertised Anima image bucket to (sc-12612),
+/// mirroring `wan::config::SIZE_MULTIPLE_14B`. `validate` enforces exactly this value, so the const
+/// cannot drift from the check.
 pub const RES_MULTIPLE: u32 = 16;
 /// FlowMatchEuler static time-shift (`FlowMatchEulerDiscreteScheduler(shift=3.0)`).
 pub const SIGMA_SHIFT: f32 = 3.0;

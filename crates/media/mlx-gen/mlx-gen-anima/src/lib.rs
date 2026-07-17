@@ -42,7 +42,7 @@ pub mod vae;
 
 pub use adapters::{apply_anima_adapters, AnimaAdapterHost};
 pub use conditioner::AnimaTextConditioner;
-pub use config::{ConditionerConfig, DitConfig, Qwen3Config, Variant};
+pub use config::{ConditionerConfig, DitConfig, Qwen3Config, Variant, RES_MULTIPLE};
 pub use convert::{is_dit_quant_target, quantize_anima_dit};
 pub use loader::{load_conditioning_at_dtype, split_anima_keys, AnimaComponents};
 pub use model::{

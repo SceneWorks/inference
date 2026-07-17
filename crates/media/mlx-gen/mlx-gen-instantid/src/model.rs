@@ -68,6 +68,11 @@ fn validate_kps(kps: &[(f32, f32)]) -> Result<()> {
     Ok(())
 }
 
+/// Both image dims must be multiples of **8** — the SDXL UNet/VAE downsample factor. Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised InstantID image bucket to (sc-12612).
+/// `validate_request_params` enforces exactly this value, so the const cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 8;
+
 /// Default `ip_adapter_scale` (the vendored pipeline's `set_ip_adapter_scale(0.8)`).
 pub const DEFAULT_IP_SCALE: f32 = 0.8;
 /// Default IdentityNet `controlnet_conditioning_scale` (the vendored default 0.8).
@@ -448,9 +453,9 @@ impl InstantId {
                 req.width, req.height
             )));
         }
-        if !req.width.is_multiple_of(8) || !req.height.is_multiple_of(8) {
+        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
             return Err(Error::Msg(format!(
-                "instantid: width and height must be multiples of 8 (SDXL UNet/VAE), got {}x{}",
+                "instantid: width and height must be multiples of {SIZE_MULTIPLE} (SDXL UNet/VAE), got {}x{}",
                 req.width, req.height
             )));
         }
@@ -924,5 +929,29 @@ mod tests {
         // Exactly 5 (and more) is accepted.
         assert!(validate_kps(&[(0.0, 0.0); FACE_KP_COUNT]).is_ok());
         assert!(validate_kps(&[(0.0, 0.0); FACE_KP_COUNT + 1]).is_ok());
+    }
+
+    #[test]
+    fn validate_request_params_pins_size_multiple_stride() {
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised InstantID
+        // image bucket to. Pin the value and mutation-check that a size which is a multiple of 4 (a
+        // lower divisor) but not SIZE_MULTIPLE (8) is still rejected with the stride error, and an
+        // on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 8);
+        let off_stride = InstantId::validate_request_params(&InstantIdRequest {
+            width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            off_stride.contains("multiples of 8"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(InstantId::validate_request_params(&InstantIdRequest {
+            width: 1024, // 128×8 — on-stride
+            ..Default::default()
+        })
+        .is_ok());
     }
 }

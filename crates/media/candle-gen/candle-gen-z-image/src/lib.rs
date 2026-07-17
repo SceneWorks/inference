@@ -127,8 +127,11 @@ use pipeline::{Components, Pipeline, DEFAULT_STEPS};
 pub const MODEL_ID: &str = "z_image_turbo";
 
 /// Z-Image works in latent space at /8 and the DiT patchifies that at /2, so both image dims must be
-/// multiples of **16** for a clean patchify. Enforced in [`validate`](Generator::validate).
-pub(crate) const SIZE_MULTIPLE: u32 = 16;
+/// multiples of **16** for a clean patchify. Enforced in [`validate`](Generator::validate). Exposed as
+/// the pinned-engine stride SceneWorks ties each advertised Z-Image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`; the base + edit modules import this same crate-root const so no
+/// copy can drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
 
 /// Process-global accelerated-attention runtime toggle (the Z-Image analogue of the SDXL flash-attn
 /// switch, sc-3674). This switch was designed to decide whether a capable build actually *uses* the
@@ -565,6 +568,30 @@ mod tests {
         assert!(!descriptor()
             .capabilities
             .accepts(ConditioningKind::MultiReference));
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Z-Image
+        // bucket to. Pin the value and mutation-check that a multiple of 8 which is not SIZE_MULTIPLE
+        // (16) is rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 64×16 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     /// Quantization / control overlays are rejected at load as typed `Unsupported`, so the worker

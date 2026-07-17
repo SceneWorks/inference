@@ -42,7 +42,7 @@ use mlx_rs::{Array, Dtype};
 use crate::config::{FLUX1_DEV_CONTROL_ID, HYPER_SAMPLER};
 use crate::control_transformer::FluxControlTransformer;
 use crate::loader;
-use crate::model::{load_flux_text, FluxTextOwned};
+use crate::model::{load_flux_text, FluxTextOwned, SIZE_MULTIPLE};
 use crate::pipeline::{build_sigmas_with, create_noise, pack_latents, unpack_latents};
 use crate::transformer::DitImageInjector;
 use mlx_gen_z_image::vae::Vae;
@@ -345,9 +345,9 @@ impl Flux1DevControl {
         self.descriptor
             .capabilities
             .validate_request(FLUX1_DEV_CONTROL_ID, req)?;
-        if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
+        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
             return Err(Error::Msg(format!(
-                "{FLUX1_DEV_CONTROL_ID}: width and height must be multiples of 16, got {}x{}",
+                "{FLUX1_DEV_CONTROL_ID}: width and height must be multiples of {SIZE_MULTIPLE}, got {}x{}",
                 req.width, req.height
             )));
         }

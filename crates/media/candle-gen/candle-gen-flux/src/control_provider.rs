@@ -59,8 +59,9 @@ const LABEL: &str = "flux1 control";
 const DTYPE: DType = DType::BF16;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
 const LATENT_CHANNELS: usize = 16;
-/// FLUX latent geometry requires both image dims to be multiples of 16 for a clean 2×2 pack.
-const SIZE_MULTIPLE: u32 = 16;
+/// FLUX latent geometry requires both image dims to be multiples of 16 for a clean 2×2 pack. Single
+/// source of truth = the crate-root [`crate::SIZE_MULTIPLE`] (sc-12612).
+use crate::SIZE_MULTIPLE;
 
 /// Default control-conditioning scale — the Shakker Union-Pro-2.0 README recommends ≈ 0.7. Used only when
 /// the request leaves `control_scale` **absent** (`None`); an explicit `Some(x)` always wins, including

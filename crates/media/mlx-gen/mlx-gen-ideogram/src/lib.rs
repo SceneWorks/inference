@@ -40,7 +40,7 @@ pub use adapters::apply_ideogram_adapters;
 pub use config::{
     Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_HEIGHT,
     DEFAULT_STEPS, DEFAULT_TURBO_STEPS, DEFAULT_WIDTH, EXTRACTED_LAYERS, IDEOGRAM_4_FP8_REPO,
-    IDEOGRAM_4_ID, IDEOGRAM_4_TURBO_ID, TURBO_LORA_FILE, TURBO_LORA_SCALE,
+    IDEOGRAM_4_ID, IDEOGRAM_4_TURBO_ID, RES_MULTIPLE, TURBO_LORA_FILE, TURBO_LORA_SCALE,
 };
 pub use loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_unconditional_transformer, load_vae,

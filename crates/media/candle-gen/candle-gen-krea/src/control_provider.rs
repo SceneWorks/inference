@@ -48,7 +48,8 @@ const SPATIAL_SCALE: u32 = 8;
 /// Latent channel count (Qwen-Image VAE).
 const LATENT_CHANNELS: usize = 16;
 /// Width/height must be a multiple of this (VAE 8× × 2×2 patchify), matching the base txt2img guard.
-const SIZE_MULTIPLE: u32 = 16;
+/// Single source of truth = the crate-root [`crate::SIZE_MULTIPLE`] (sc-12612).
+use crate::SIZE_MULTIPLE;
 
 /// Default `control_scale` for the distilled CFG-free Turbo base. The S0 spike found the usable band
 /// ~0.5–0.75 (widening to ~0.7–0.9 with more data); ship a comfortable mid default and hard-cap the

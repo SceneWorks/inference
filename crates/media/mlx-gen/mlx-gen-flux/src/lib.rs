@@ -33,6 +33,7 @@ pub use loader::{
 };
 pub use model::{
     descriptor_dev, descriptor_for, descriptor_schnell, load_dev, load_schnell, Flux1,
+    SIZE_MULTIPLE,
 };
 pub use model_control::{descriptor_dev_control, load_dev_control, Flux1DevControl};
 pub use pipeline::{

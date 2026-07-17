@@ -50,8 +50,9 @@ const LATENT_CHANNELS: usize = 16;
 pub const DEFAULT_IP_SCALE: f32 = 0.7;
 
 /// FLUX packs the /8 VAE latent 2×2, so both render dims must be multiples of 16 (matching the flux1
-/// txt2img `validate` and the control/edit siblings).
-const SIZE_MULTIPLE: u32 = 16;
+/// txt2img `validate` and the control/edit siblings). Single source of truth = the crate-root
+/// [`crate::SIZE_MULTIPLE`] (sc-12612).
+use crate::SIZE_MULTIPLE;
 
 /// Paths to the FLUX IP-Adapter checkpoints.
 pub struct IpAdapterFluxPaths {

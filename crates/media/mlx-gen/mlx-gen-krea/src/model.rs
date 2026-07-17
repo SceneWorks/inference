@@ -49,8 +49,11 @@ const RES_MIN: u32 = 256;
 /// `pub(crate)` so the pose-control lane's load-time branch-quant gate (sc-11748) can size its
 /// worst-case-resolution estimate against the largest render the model can serve.
 pub(crate) const RES_MAX: u32 = 2048;
-/// patch_size(2)·vae_downsample(8) = 16 — patchify requires W/H divisible by this.
-const RES_MULTIPLE: u32 = 16;
+/// patch_size(2)·vae_downsample(8) = 16 — patchify requires W/H divisible by this. Exposed as the
+/// pinned-engine stride SceneWorks ties each advertised Krea image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`. `validate_request` enforces exactly this value, so the const
+/// cannot drift from the check.
+pub const RES_MULTIPLE: u32 = 16;
 
 /// Turbo defaults: the TDM-distilled few-step student renders CFG-free at 8 steps (reference
 /// `is_distilled` + `guidance_scale 0`). Consumed by `generate` (`req.steps.unwrap_or(DEFAULT_STEPS)`);
@@ -955,6 +958,19 @@ mod tests {
             raw_descriptor().capabilities.conditioning,
             vec![ConditioningKind::Reference]
         );
+    }
+
+    /// sc-12612: `RES_MULTIPLE` is the pinned stride SceneWorks ties every advertised Krea bucket to.
+    /// Pin the value and mutation-check that an off-stride (multiple of 8 not 16) in-range size is
+    /// rejected with the stride error, and an on-stride size passes.
+    #[test]
+    fn size_multiple_is_the_pinned_stride() {
+        assert_eq!(RES_MULTIPLE, 16);
+        let off = validate_request(&descriptor(), &req(1000, 1024))
+            .unwrap_err()
+            .to_string();
+        assert!(off.contains("multiple of 16"), "got: {off}");
+        assert!(validate_request(&descriptor(), &req(1024, 1024)).is_ok());
     }
 
     #[test]

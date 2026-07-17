@@ -354,6 +354,21 @@ mod tests {
         assert!(validate_request(&descriptor_base(), &req(2048, 2048)).is_err()); // above max
         assert!(validate_request(&descriptor_base(), &req(1024, 1024)).is_ok());
         assert!(validate_request(&descriptor_base(), &req(1536, 1536)).is_ok());
+
+        // sc-12612: `RES_MULTIPLE` is the pinned stride SceneWorks ties every advertised Anima bucket
+        // to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE scale) but
+        // not RES_MULTIPLE (16) — 1000 = 125×8, in range [512, 1536] — is rejected with the stride
+        // error, and an on-stride in-range size passes.
+        assert_eq!(RES_MULTIPLE, 16);
+        let off_stride = validate_request(&descriptor_base(), &req(1000, 1024))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiple of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(validate_request(&descriptor_base(), &req(1024, 1024)).is_ok());
+
         // Turbo rejects guidance / negative (CFG-free).
         assert!(validate_request(
             &descriptor_turbo(),

@@ -180,8 +180,11 @@ use pipeline::{Components, Pipeline};
 /// `mlx-gen-sdxl` — this crate registers a SINGLE descriptor under `"sdxl"`.
 pub const MODEL_ID: &str = "sdxl";
 
-/// SDXL works in latent space at /8: both dims must be multiples of 8.
-const SIZE_MULTIPLE: u32 = 8;
+/// SDXL works in latent space at /8: both dims must be multiples of 8. Exposed as the pinned-engine
+/// stride SceneWorks ties each advertised SDXL image bucket to (sc-12612), mirroring
+/// `wan::config::SIZE_MULTIPLE_14B`. `validate` enforces exactly this value, so the const cannot drift
+/// from the check; the bespoke edit provider imports this same crate-root const.
+pub const SIZE_MULTIPLE: u32 = 8;
 
 /// Process-global flash-attention runtime toggle (sc-3674). This switch was designed to decide
 /// whether a flash-attn-capable build actually *uses* the fused kernels, so the SceneWorks UI can
@@ -674,6 +677,30 @@ mod tests {
         assert!(!descriptor()
             .capabilities
             .accepts(ConditioningKind::Reference));
+
+        // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SDXL bucket
+        // to. Pin the value and mutation-check that a size which is a multiple of 4 but not
+        // SIZE_MULTIPLE (8) is rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 8);
+        let off_stride = g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiples of 8"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                width: 1024, // 128×8 — on-stride
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     /// sc-6128: `validate` accepts the advertised `lightning` sampler (the worker forces it for

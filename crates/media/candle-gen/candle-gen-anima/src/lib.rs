@@ -43,7 +43,7 @@ pub mod transformer;
 pub mod vae;
 
 pub use conditioner::AnimaTextConditioner;
-pub use config::{ConditionerConfig, DitConfig, Qwen3Config, Variant};
+pub use config::{ConditionerConfig, DitConfig, Qwen3Config, Variant, RES_MULTIPLE};
 pub use loader::{detect_dit_prefix, AnimaComponents};
 pub use pipeline::{anima_sigmas, AnimaPipeline, GenOptions, DEFAULT_SAMPLER};
 pub use text_encoder::AnimaQwen3;
@@ -57,8 +57,6 @@ use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, Quant, WeightsSource,
 };
-
-use crate::config::RES_MULTIPLE;
 
 /// The candle quant tiers Anima advertises — Q4 + Q8 (the counterpart of MLX sc-10517). The DiT loads
 /// packed (dequant-dense per step, CPU-capable); the conditioner / Qwen3 TE / VAE stay dense bf16.
@@ -429,6 +427,20 @@ mod tests {
         assert!(err.to_string().contains("steps must be >= 1"), "{err}");
         assert!(validate_request(&descriptor_base(), &req(1024, 1024)).is_ok());
         assert!(validate_request(&descriptor_base(), &req(1536, 1536)).is_ok());
+
+        // sc-12612: `RES_MULTIPLE` is the pinned stride SceneWorks ties every advertised Anima bucket
+        // to. Pin the value and mutation-check that a size which is a multiple of 8 (the VAE scale) but
+        // not RES_MULTIPLE (16) — 1000 = 125×8, in range [512, 1536] — is rejected with the stride
+        // error, and an on-stride in-range size passes.
+        assert_eq!(RES_MULTIPLE, 16);
+        let off_stride = validate_request(&descriptor_base(), &req(1000, 1024))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            off_stride.contains("multiple of 16"),
+            "expected the stride error, got: {off_stride}"
+        );
+        assert!(validate_request(&descriptor_base(), &req(1024, 1024)).is_ok());
     }
 
     /// Write a minimal **dense** DiT split_files layout (one anchor tensor, NO `.scales` codes) so the

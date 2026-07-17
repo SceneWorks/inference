@@ -390,8 +390,11 @@ impl Sd3Large {
     }
 }
 
-/// Required divisor for requested image dims: VAE downsample (8) × transformer patch (2) = 16.
-const SIZE_MULTIPLE: u32 = 16;
+/// Required divisor for requested image dims: VAE downsample (8) × transformer patch (2) = 16. Exposed
+/// as the pinned-engine stride SceneWorks ties each advertised SD3.5 image bucket to (sc-12612),
+/// mirroring `wan::config::SIZE_MULTIPLE_14B`. `validate_request` enforces exactly this value, so the
+/// const cannot drift from the check.
+pub const SIZE_MULTIPLE: u32 = 16;
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded weights.
 pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
@@ -523,6 +526,36 @@ mod tests {
         assert!(validate_request(&descriptor(), &ref_req(1, Some(0.5))).is_ok());
         assert!(validate_request(&turbo_descriptor(), &ref_req(1, Some(0.4))).is_ok());
         assert!(validate_request(&medium_descriptor(), &ref_req(1, None)).is_ok());
+    }
+
+    /// sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SD3.5 bucket to.
+    /// Pin the value and mutation-check that a multiple of 8 which is not SIZE_MULTIPLE (16) is rejected
+    /// with the stride error, and an on-stride in-range size passes.
+    #[test]
+    fn size_multiple_is_the_pinned_stride() {
+        assert_eq!(SIZE_MULTIPLE, 16);
+        let off = validate_request(
+            &descriptor(),
+            &GenerationRequest {
+                prompt: "a fox".into(),
+                width: 1000, // 125×8 — a multiple of 8 but not SIZE_MULTIPLE
+                height: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(off.contains("multiple of 16"), "got: {off}");
+        assert!(validate_request(
+            &descriptor(),
+            &GenerationRequest {
+                prompt: "a fox".into(),
+                width: 1024,
+                height: 1024,
+                ..Default::default()
+            }
+        )
+        .is_ok());
     }
 
     #[test]

@@ -54,7 +54,7 @@ pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::{DcAeDecoder, DcAeEncoder};
 pub use model::{
     descriptor as sana_descriptor, load as load_sana, sprint_descriptor, Sana, MODEL_ID,
-    SPRINT_MODEL_ID,
+    RES_MULTIPLE, SPRINT_MODEL_ID,
 };
 pub use pipeline::{denoise_sprint, SanaGenerateRequest, SanaPipeline};
 pub use scm::ScmScheduler;
