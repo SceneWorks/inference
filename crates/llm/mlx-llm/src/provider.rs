@@ -15,7 +15,7 @@ use std::path::Path;
 use core_llm::{
     Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Content, Error as CoreError,
     FinishReason as CoreFinish, ImageRef, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
-    Message, Quantize, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
+    IncrementalDetok, Message, Quantize, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
     StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
     TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
@@ -705,20 +705,21 @@ impl TextLlm for LlamaProvider {
 
         // Drive the internal loop; translate token-id events to contract text-delta events via
         // incremental detokenization (re-decode the running sequence, emit the new suffix). The
-        // segmenter (when active) splits each delta into reasoning vs answer; answer text then feeds
-        // the stop matcher so a stop string is trimmed and halts generation.
+        // `IncrementalDetok` guard holds back lossy U+FFFD placeholders so a multi-byte character
+        // split across BPE tokens streams intact (and never panics a mid-char slice) — sc-12452.
+        // The segmenter (when active) splits each delta into reasoning vs answer; answer text then
+        // feeds the stop matcher so a stop string is trimmed and halts generation.
         let tokenizer = &self.tokenizer;
         let out = {
             let mut acc: Vec<u32> = Vec::new();
-            let mut shown = 0usize;
+            let mut detok = IncrementalDetok::new();
             let mut sink = |ev: StreamEvent| {
                 if let StreamEvent::Token { id, .. } = ev {
                     let id = id as u32;
                     acc.push(id);
                     if let Ok(text) = tokenizer.decode(&acc, true) {
-                        if text.len() > shown {
-                            let delta = text[shown..].to_string();
-                            shown = text.len();
+                        if let Some(delta) = detok.push(&text) {
+                            let delta = delta.to_string();
                             match segmenter.as_mut() {
                                 Some(seg) => {
                                     for span in seg.push(&delta) {
@@ -890,6 +891,9 @@ impl TextLlm for LlamaProvider {
         // which means the streamed channel is the authoritative answer with markup removed);
         // otherwise the original decode-all-tokens path (byte-identical to before). Reasoning and
         // tool calls, if the model produced any, are reported separately (markup excluded from text).
+        // `streamed` accumulates only `IncrementalDetok`-released deltas, so it carries no
+        // transient U+FFFD placeholders; a character truncated by end-of-generation is dropped
+        // rather than surfaced as U+FFFD (sc-12452).
         let text = if stop_active || thinking_active || tools_active {
             streamed
         } else {
