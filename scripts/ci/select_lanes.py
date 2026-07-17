@@ -98,7 +98,9 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             )
             continue
 
-        if _under(path, "crates/contracts/gen-core"):
+        if _under(path, "crates/contracts/gen-core") or _under(
+            path, "crates/contracts/gen-core-testkit"
+        ):
             lanes.update(
                 contracts=True,
                 candle_cpu=True,
