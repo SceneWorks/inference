@@ -34,8 +34,8 @@ use crate::pipeline::{
     align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z,
     build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames, decode_to_frames_22, denoise,
     denoise_curated, denoise_moe, denoise_moe_curated, denoise_ti2v, frames_to_images,
-    latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image, reject_over_area,
-    resolve_sampler_knobs, seq_len, ti2v_blend_init, Expert,
+    latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image, reject_off_grid,
+    reject_over_area, resolve_sampler_knobs, seq_len, ti2v_blend_init, Expert,
 };
 use crate::text_encoder::encode_text_staged;
 use crate::transformer::WanTransformer;
@@ -271,9 +271,12 @@ impl Wan {
                 )));
             }
         }
-        // sc-12308: reject over-area rather than silently refitting it. The 5B keeps its OWN
-        // 901 120 budget — its 32-px grid makes 1280×704 the geometry it genuinely renders.
+        // Reject an off-grid or over-area geometry rather than silently align-down refitting it — one
+        // request means one geometry on both backends. sc-12607: the 32-px grid stride (candle rejects
+        // via `is_multiple_of(SIZE_MULTIPLE)`). sc-12308: the 5B's OWN 901 120 area budget — its 32-px
+        // grid makes 1280×704 the geometry it genuinely renders.
         let (dw, dh) = grid(&self.config);
+        reject_off_grid(MODEL_ID, req, dw, dh)?;
         reject_over_area(MODEL_ID, req, dw, dh, self.config.max_area)?;
         // The TI2V mask-blend path (the `ti2v = Some(_)` branch of `generate_impl`) is entered by
         // Keyframe conditioning OR a Reference image — the contract checks below must cover both.
@@ -796,9 +799,12 @@ impl Wan14b {
                 )));
             }
         }
-        // sc-12308: reject over-area rather than silently refitting it (T2V was uncapped entirely;
-        // I2V refit 1280×720 → 1264×704). Both A14B variants share the 14B family's 921 600 budget.
+        // Reject an off-grid or over-area geometry rather than silently align-down refitting it.
+        // sc-12607: the 16-px grid stride (candle rejects via `is_multiple_of(SIZE_MULTIPLE_14B)`).
+        // sc-12308: the area cap (T2V was uncapped entirely; I2V refit 1280×720 → 1264×704). Both A14B
+        // variants share the 14B family's 921 600 budget.
         let (dw, dh) = grid(&self.config);
+        reject_off_grid(id, req, dw, dh)?;
         reject_over_area(id, req, dw, dh, self.config.max_area)?;
         // I2V channel-concat requires a single reference image (the first conditioning frame), and
         // does not support `trim_first_frames` (the reference builds `y` from `num_frames`, so an
@@ -1109,6 +1115,10 @@ fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
 /// handing back a geometry the caller never asked for. The cap is now enforced in `validate_impl` by
 /// rejecting instead, so by the time this runs the area is already within budget — and since the
 /// alignment here only ever rounds *down*, it cannot push a validated request back over.
+///
+/// **sc-12607:** `validate_impl` now *also* rejects an off-grid `width`/`height` (via
+/// [`reject_off_grid`], matching candle), so a validated request is already grid-aligned and this
+/// rounding is a defensive identity — it never silently snaps a geometry the caller chose.
 fn resolve_capped_dims(req: &GenerationRequest, cfg: &WanModelConfig) -> (u32, u32) {
     let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
     let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
@@ -1256,6 +1266,77 @@ mod tests {
         let a14b = WanModelConfig::wan22_i2v_14b();
         assert_eq!(resolve_capped_dims(&req(1280, 720), &a14b), (1280, 720));
         assert_eq!(1280 * 720, a14b.max_area);
+    }
+
+    fn wan_5b() -> Wan {
+        Wan {
+            descriptor: descriptor(),
+            config: WanModelConfig::wan22_ti2v_5b(),
+            root: PathBuf::new(),
+            adapters: vec![],
+            quant: None,
+        }
+    }
+
+    fn wan_t2v_14b() -> Wan14b {
+        Wan14b {
+            descriptor: descriptor_t2v_14b(),
+            config: WanModelConfig::wan22_t2v_14b(),
+            root: PathBuf::new(),
+            adapters: vec![],
+            quant: None,
+        }
+    }
+
+    /// sc-12607 — the 5B's z48 VAE renders on a 32-px grid; candle rejects an off-32 request, so mlx
+    /// must too (it used to silently align it *down* to the nearest tile). Mutation guard: delete the
+    /// `reject_off_grid` call and `req(720, 480)` validates (720 is in range, its aligned area fits) —
+    /// this `unwrap_err` then panics.
+    #[test]
+    fn validate_rejects_off_grid_size_5b() {
+        let wan = wan_5b();
+        // On-grid, in range, under the 901 120 px cap → validates.
+        assert!(wan.validate_impl(&req(704, 480)).is_ok());
+        // 720 is off the 32-px grid (720 = 22.5·32) — rejected, not snapped to 704.
+        let err = wan.validate_impl(&req(720, 480)).unwrap_err().to_string();
+        assert!(err.contains("multiples of 32"), "unexpected: {err}");
+        // Off-grid on the height axis is rejected the same way.
+        assert!(wan.validate_impl(&req(704, 500)).is_err());
+    }
+
+    /// sc-12607 — the 14B family renders on a 16-px grid (`SIZE_MULTIPLE_14B`); same reject-not-refit
+    /// contract as candle. Exercised on the T2V variant (no Reference required).
+    #[test]
+    fn validate_rejects_off_grid_size_14b() {
+        let wan = wan_t2v_14b();
+        // On-grid (240 = 15·16, 176 = 11·16), well under the 921 600 px cap → validates.
+        assert!(wan.validate_impl(&req(240, 176)).is_ok());
+        // 170 is off the 16-px grid (170 = 10.625·16) — rejected.
+        let err = wan.validate_impl(&req(240, 170)).unwrap_err().to_string();
+        assert!(err.contains("multiples of 16"), "unexpected: {err}");
+        // Off-grid on the width axis too.
+        assert!(wan.validate_impl(&req(250, 176)).is_err());
+    }
+
+    /// sc-12607/sc-12409/sc-12587 — the worker's `pinned_engine_geometry` tie reads these `pub const`s
+    /// to assert each model's manifest stride. They must equal the lattice `validate`/`resolve_capped_dims`
+    /// actually enforce (the config-derived `grid`), or the tie would anchor a stride the engine doesn't
+    /// use. Mutation guard: change `SIZE_MULTIPLE` to 16 (or the config's `vae_stride`) and this fails.
+    #[test]
+    fn pinned_stride_consts_match_the_enforced_lattice() {
+        use crate::config::{SIZE_MULTIPLE, SIZE_MULTIPLE_14B};
+        assert_eq!(
+            grid(&WanModelConfig::wan22_ti2v_5b()),
+            (SIZE_MULTIPLE, SIZE_MULTIPLE)
+        );
+        assert_eq!(
+            grid(&WanModelConfig::wan22_t2v_14b()),
+            (SIZE_MULTIPLE_14B, SIZE_MULTIPLE_14B)
+        );
+        assert_eq!(
+            grid(&WanModelConfig::wan22_i2v_14b()),
+            (SIZE_MULTIPLE_14B, SIZE_MULTIPLE_14B)
+        );
     }
 
     // ---- sc-12459: `dit_resident_bytes` shard-dir sizing must match `Weights::from_dir` ----------

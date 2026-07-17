@@ -74,6 +74,30 @@ pub fn reject_over_area(
     Ok(())
 }
 
+/// Reject a request whose `width`/`height` is **not a multiple of** the model's `patch · vae_stride`
+/// grid — the lattice `dw`/`dh` that [`align_dim`] rounds *down* to. An off-grid request is refused
+/// here rather than silently snapped to the nearest tile, so the caller gets the geometry it asked for
+/// or a clear error, never one it never chose. Every wan grid is square (`patch_size.1 == .2`,
+/// symmetric spatial `vae_stride`), so `dw == dh` and the message reports the single stride.
+///
+/// **sc-12607 — this closes the last "reject (candle) vs silently refit (mlx)" gap on the wan family.**
+/// candle hard-errors an off-grid `width`/`height` (`candle_gen_wan`'s `is_multiple_of(SIZE_MULTIPLE)` /
+/// `SIZE_MULTIPLE_14B`); mlx used to only `align_dim` it down inside `resolve_capped_dims`, so the same
+/// request produced an error on one backend and a snapped render on the other. Rejecting here makes one
+/// manifest entry mean one thing on both backends — the sibling of [`reject_over_area`]'s sc-12308 fix,
+/// one axis over (the spatial stride instead of the area cap). `dw`/`dh` come from the caller's
+/// `grid(&config)`, the same source `align_dim`/`resolve_capped_dims` use, so `validate` can never
+/// accept a size the pipeline would then refit.
+pub fn reject_off_grid(id: &str, req: &GenerationRequest, dw: u32, dh: u32) -> Result<()> {
+    if !req.width.is_multiple_of(dw) || !req.height.is_multiple_of(dh) {
+        return Err(Error::Msg(format!(
+            "{id}: width/height must be multiples of {dw} (got {}×{})",
+            req.width, req.height
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve the sampler-loop knobs shared **byte-identically** by every Wan generate path (dense 5B,
 /// A14B MoE, single- and dual-expert VACE): the step count, scheduler shift, solver kind, and seed
 /// (F-010). Each falls back to the config default when the request leaves it unset; an unset sampler
