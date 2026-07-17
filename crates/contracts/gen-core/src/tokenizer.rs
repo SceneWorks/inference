@@ -246,42 +246,26 @@ impl TextTokenizer {
     }
 
     /// Build the per-token-id decode table grammar-constrained decoding needs (sc-6585): for every
-    /// id in `0..vocab_size`, the literal text the token contributes, plus the set of special/added
+    /// id in `0..vocab_size`, the literal text the token contributes, plus the set of special
     /// token ids. Decodes every vocab entry, so a caller runs this once and caches it.
     ///
-    /// `pieces[id]` is empty for special/added tokens (BOS/EOS/turn markers) — they carry no JSON
-    /// content and the listed `special` set lets the sampler forbid them outright (except the stop
-    /// token when the grammar permits stopping). Ordinary byte-level tokens that are a partial UTF-8
-    /// sequence decode to U+FFFD, which the JSON grammar accepts only inside string content — exactly
-    /// where such bytes occur — so the final whole-sequence detokenize still reconstructs them.
+    /// Delegates to [`core_llm::tokenizer::build_constraint_decode_table`] — the single
+    /// decode-table special-token policy in the workspace (sc-12467): only added tokens flagged
+    /// `special == true` (BOS/EOS/turn markers) are masked and blanked; non-special *added* tokens
+    /// are ordinary content and keep their decoded text. **Compatibility note:** this module's
+    /// former private implementation marked ALL added tokens special and blanked their pieces,
+    /// which over-masked valid content; external consumers of `sceneworks-gen-core` now get the
+    /// (more correct) core-llm policy, and [`ConstraintDecodeTable`] is now nominally
+    /// `core_llm::ConstraintDecodeTable` (same public fields).
     pub fn constraint_decode_table(&self) -> ConstraintDecodeTable {
-        let vocab = self.inner.get_vocab_size(true) as u32;
-        let special: std::collections::HashSet<u32> = self
-            .inner
-            .get_added_tokens_decoder()
-            .keys()
-            .copied()
-            .collect();
-        let mut pieces: Vec<String> = Vec::with_capacity(vocab as usize);
-        for id in 0..vocab {
-            if special.contains(&id) {
-                pieces.push(String::new());
-            } else {
-                pieces.push(self.inner.decode(&[id], false).unwrap_or_default());
-            }
-        }
-        ConstraintDecodeTable { pieces, special }
+        core_llm::tokenizer::build_constraint_decode_table(&self.inner)
     }
 }
 
 /// A per-token-id decode table for grammar-constrained decoding (sc-6585); see
-/// [`TextTokenizer::constraint_decode_table`].
-pub struct ConstraintDecodeTable {
-    /// `pieces[id]` = the literal text token `id` contributes (empty for special/added tokens).
-    pub pieces: Vec<String>,
-    /// Special/added token ids (BOS/EOS/turn markers) — never valid as literal JSON content.
-    pub special: std::collections::HashSet<u32>,
-}
+/// [`TextTokenizer::constraint_decode_table`]. Re-exported from `core-llm`, the one live
+/// implementation (sc-12467) — the fields (`pieces`, `special`) are unchanged.
+pub use core_llm::ConstraintDecodeTable;
 
 #[cfg(test)]
 mod tests {
@@ -315,6 +299,50 @@ mod tests {
         let r = ChatTemplate::QwenImage.render("a red fox");
         assert!(r.starts_with("<|im_start|>system\nDescribe the image by detailing"));
         assert!(r.ends_with("<|im_start|>user\na red fox<|im_end|>\n<|im_start|>assistant\n"));
+    }
+
+    /// Pins that gen-core's table delegates to the single core-llm policy (sc-12467): a
+    /// NON-special added token (id 5) is content — not masked, text preserved — while a special
+    /// added token (id 4) is masked. The pre-sc-12467 private copy here marked BOTH as special.
+    #[test]
+    fn constraint_table_uses_core_llm_special_token_policy() {
+        const ADDED_TOKENS_JSON: &str = r#"{
+            "version": "1.0",
+            "added_tokens": [
+                { "id": 4, "content": "<eos>", "single_word": false, "lstrip": false,
+                  "rstrip": false, "normalized": false, "special": true },
+                { "id": 5, "content": "wombat", "single_word": false, "lstrip": false,
+                  "rstrip": false, "normalized": false, "special": false }
+            ],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "<unk>": 0, "hello": 1, "world": 2, "foo": 3 },
+                "unk_token": "<unk>"
+            }
+        }"#;
+        let t = TextTokenizer::from_json_str(
+            ADDED_TOKENS_JSON,
+            TokenizerConfig {
+                max_length: 16,
+                pad_token_id: 0,
+                chat_template: ChatTemplate::None,
+                pad_to_max_length: false,
+            },
+        )
+        .unwrap();
+        let table = t.constraint_decode_table();
+        assert_eq!(table.pieces.len(), 6);
+        assert!(table.special.contains(&4), "special added token is masked");
+        assert_eq!(table.pieces[4], "");
+        assert!(
+            !table.special.contains(&5),
+            "non-special added token must NOT be masked (core-llm policy)"
+        );
+        assert_eq!(table.pieces[5], "wombat");
     }
 
     #[test]
