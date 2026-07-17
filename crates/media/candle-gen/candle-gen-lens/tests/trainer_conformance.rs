@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::gen_core::{self, LoadSpec, TrainingItem, WeightsSource};
+use candle_gen::gen_core::{LoadSpec, TrainingItem, WeightsSource};
 use gen_core_testkit::TrainerProfile;
 
 /// The `microsoft/Lens` base snapshot dir — `LENS_BASE_SNAPSHOT` or the first HF-cache snapshot.

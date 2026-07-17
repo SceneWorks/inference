@@ -28,6 +28,8 @@ cargo test --locked -j 1 -p candle-llm --test conformance
 cargo test --locked --lib --tests -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
 
 # Candle CUDA lane (Windows self-hosted; needs vcvars64 + CUDA_COMPUTE_CAP)
+# CUDA 12.9's nvcc rejects MSVC 14.51+ — use the VS2022 BuildTools vcvars64, not a VS18 one.
+cargo clippy --locked -p candle-llm -p 'candle-gen*' -p runtime-cuda --all-targets --features cuda -- -D warnings
 cargo test --locked --lib --tests -p candle-llm -p 'candle-gen*' -p runtime-cuda --features cuda
 
 # LLM-only composition profile of any bundle (no media provider graph compiled)
