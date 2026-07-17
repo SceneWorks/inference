@@ -34,6 +34,11 @@ use crate::vae::{load_vae_decoder, MochiVaeDecoder};
 /// Public provider id: `"mochi_1"`.
 pub const MODEL_ID: &str = "mochi_1";
 
+/// The request width/height multiple `validate_request` enforces (Mochi's AsymmVAE spatial grid).
+/// Exposed as the pinned-engine stride SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587);
+/// mirrors candle's `candle_gen_mochi::SIZE_MULTIPLE` and `wan::config::SIZE_MULTIPLE_14B`.
+pub const SIZE_MULTIPLE: u32 = 16;
+
 /// AsymmVAE latent channels fed to the DiT / seeded as init noise.
 const LATENT_CHANNELS: i32 = 12;
 /// Resolution `shift` for the flow-match schedule — Mochi config `shift = 1.0` (no shift).
@@ -70,7 +75,7 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: Vec::new(),
             schedulers: Vec::new(),
             supported_guidance_methods: Vec::new(),
-            // Width/height must be divisible by 16 (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
+            // Width/height must be divisible by SIZE_MULTIPLE (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
             min_size: 16,
             max_size: 1280,
             max_count: 1,
@@ -195,9 +200,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         return Err(Error::Msg("mochi_1: prompt must not be empty".into()));
     }
     caps.validate_request(MODEL_ID, req)?;
-    if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
-            "mochi_1: width/height must be divisible by 16 (got {}x{})",
+            "mochi_1: width/height must be divisible by {SIZE_MULTIPLE} (got {}x{})",
             req.width, req.height
         )));
     }
@@ -347,11 +352,18 @@ mod tests {
     #[test]
     fn validate_rejects_misaligned_size() {
         let caps = descriptor().capabilities;
+        // 72 is a multiple of 8 but not `SIZE_MULTIPLE` (16); it must be rejected and the error must
+        // name the stride — this is the pinned value SceneWorks ties `requiresDimensionsMultipleOf`
+        // to (sc-12587), so pin it and mutation-check the rejection rather than a bare `is_err`.
+        assert_eq!(SIZE_MULTIPLE, 16);
         let req = GenerationRequest {
-            width: 72, // not a multiple of 16
+            width: 72, // multiple of 8, not of SIZE_MULTIPLE
             ..base_req()
         };
-        assert!(validate_request(&caps, &req).is_err());
+        let err = validate_request(&caps, &req)
+            .expect_err("a non-SIZE_MULTIPLE width must be rejected")
+            .to_string();
+        assert!(err.contains("divisible by 16"), "got: {err}");
     }
 
     #[test]

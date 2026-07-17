@@ -124,5 +124,7 @@ pub const DEFAULT_FRAMES: u32 = 25;
 pub const DEFAULT_CONDITIONING_FPS: u32 = 7;
 /// VAE spatial compression (8×).
 pub const VAE_SCALE: u32 = 8;
-/// Output `width`/`height` must be divisible by this: VAE 8× × UNet 8× (3 stride-2 stages).
+/// Output `width`/`height` must be divisible by this: VAE 8× × UNet 8× (3 stride-2 stages). Exposed
+/// as the pinned-engine stride SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors
+/// mlx's `mlx_gen_svd::SIZE_ALIGN` (same `= 64` on both backends).
 pub const SIZE_ALIGN: u32 = VAE_SCALE * 8;

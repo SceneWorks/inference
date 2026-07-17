@@ -135,6 +135,13 @@ const TEMPORAL_SCALE: u32 = 8;
 const MAX_FRAMES: u32 = 1025;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
 const SPATIAL_SCALE: u32 = 32;
+/// The request width/height multiple `validate_request` enforces: `2 × SPATIAL_SCALE` (= 64).
+/// Stage-1 renders at half resolution (`latent_dims` divides by `2 · SPATIAL_SCALE`), so a request
+/// dimension must be a multiple of *twice* the 32× VAE spatial compression for that division to be
+/// exact. This is the pinned-engine stride SceneWorks ties `requiresDimensionsMultipleOf` to
+/// (sc-12587), mirroring `wan::config::SIZE_MULTIPLE_14B`. Divergent by backend on purpose: candle's
+/// single-stage `ltx_2_3_distilled` uses `SIZE_MULTIPLE = SPATIAL_SCALE` (= 32).
+pub const SIZE_MULTIPLE: u32 = 2 * SPATIAL_SCALE;
 /// The folded denoise-step total surfaced as `Progress::Step.total` (F-050): stage-1 (`STAGE1_SIGMAS`,
 /// 8 steps) + stage-2 (`STAGE2_SIGMAS`, 3 steps) of the baked distilled schedule.
 const TOTAL_STEPS: u32 = (STAGE1_SIGMAS.len() + STAGE2_SIGMAS.len() - 2) as u32;
@@ -232,7 +239,7 @@ pub fn descriptor() -> ModelDescriptor {
             // (per-token σ + post-step blend) stay native.
             samplers: curated_sampler_names(),
             schedulers: Vec::new(),
-            // height/width must be divisible by 64 (stage-1 runs at //2//32).
+            // height/width must be divisible by SIZE_MULTIPLE (= 2×SPATIAL_SCALE; stage-1 runs at //2//32).
             supported_guidance_methods: vec![],
             min_size: 64,
             max_size: 1280,
@@ -552,13 +559,13 @@ impl Ltx {
 
     /// Latent dims `(frames, stage1_h, stage1_w, stage2_h, stage2_w)` for a request.
     pub(crate) fn latent_dims(req: &GenerationRequest) -> (usize, usize, usize, usize, usize) {
-        // Precondition: `validate_request`'s 64-divisibility check runs before any generate, so the
+        // Precondition: `validate_request`'s `SIZE_MULTIPLE`-divisibility check runs before any generate, so the
         // integer divisions below (`h/2/SPATIAL_SCALE`, `h/SPATIAL_SCALE`) are exact and lose no rows.
         // Make that implicit dependency explicit so a future direct caller that skips validation trips
         // here in debug/test instead of silently truncating the latent grid (Info/L-E).
         debug_assert!(
-            req.height.is_multiple_of(64) && req.width.is_multiple_of(64),
-            "ltx latent_dims: {}×{} is not 64-aligned — validate_request must run first",
+            req.height.is_multiple_of(SIZE_MULTIPLE) && req.width.is_multiple_of(SIZE_MULTIPLE),
+            "ltx latent_dims: {}×{} is not {SIZE_MULTIPLE}-aligned — validate_request must run first",
             req.width,
             req.height
         );
@@ -1044,9 +1051,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         return Err(Error::Msg("ltx_2_3: prompt must not be empty".into()));
     }
     caps.validate_request(MODEL_ID, req)?;
-    if !req.width.is_multiple_of(64) || !req.height.is_multiple_of(64) {
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
-            "ltx_2_3: width/height must be divisible by 64 (got {}x{})",
+            "ltx_2_3: width/height must be divisible by {SIZE_MULTIPLE} (got {}x{})",
             req.width, req.height
         )));
     }
@@ -1317,6 +1324,32 @@ mod tests {
             }
         )
         .is_err());
+        // The pinned stride is `SIZE_MULTIPLE` (= 64 = 2×SPATIAL_SCALE), NOT the bare 32× VAE scale:
+        // a size that is a multiple of SPATIAL_SCALE but not SIZE_MULTIPLE must still be rejected, and
+        // the error must name the stride (sc-12587 — this is the value SceneWorks ties to).
+        assert_eq!(SIZE_MULTIPLE, 64);
+        let off_stride = validate_request(
+            &caps,
+            &GenerationRequest {
+                width: 480, // 15×32 — a multiple of SPATIAL_SCALE but not SIZE_MULTIPLE
+                ..base.clone()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            off_stride.contains("divisible by 64"),
+            "expected the stride error, got: {off_stride}"
+        );
+        // A different in-range multiple of SIZE_MULTIPLE is accepted.
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                width: 448, // 7×64
+                ..base.clone()
+            }
+        )
+        .is_ok());
         assert!(validate_request(
             &caps,
             &GenerationRequest {

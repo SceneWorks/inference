@@ -683,6 +683,14 @@ mod tests {
             .is_err());
         // Unaligned size (not a multiple of 64).
         assert!(g.validate(&ref_req(700, 704)).is_err());
+        // sc-12587: `SIZE_ALIGN` is the pinned stride SceneWorks ties `requiresDimensionsMultipleOf`
+        // to. A multiple of 32 that is not a multiple of SIZE_ALIGN (64) is still rejected — pin the
+        // value and mutation-check it (the stride is VAE 8× × UNet 8×, not the bare VAE scale).
+        assert_eq!(SIZE_ALIGN, 64);
+        // 736 = 23×32 — a multiple of 32 but not SIZE_ALIGN (64).
+        let off_align = g.validate(&ref_req(736, 576)).unwrap_err().to_string();
+        assert!(off_align.contains("multiple of 64"), "got: {off_align}");
+
         // Out-of-range frames.
         assert!(g
             .validate(&GenerationRequest {
