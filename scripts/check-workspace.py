@@ -45,6 +45,11 @@ FORBIDDEN_GRAPH_PACKAGES = {
     # make linker participation part of the supported runtime graph again.
     "inventory",
 }
+# Directory names whose subtrees are not part of this checkout's single workspace: the git store
+# and build output (.git, target), plus agent tooling that nests its own gitignored worktrees --
+# each a separate checkout carrying its own Cargo.lock/manifest (.claude, .codex). They must not
+# be swept into the single-lockfile / single-manifest invariants below.
+IGNORED_TREE_PARTS = frozenset({".git", "target", ".claude", ".codex"})
 
 
 def fail(message: str) -> None:
@@ -70,18 +75,28 @@ def cargo_metadata(offline: bool) -> dict:
     return json.loads(result.stdout.decode("utf-8"))
 
 
+def _within_workspace(path: Path) -> bool:
+    """True when a discovered path belongs to this checkout's own workspace tree.
+
+    The check is on the path RELATIVE to ROOT, so running the gate from inside a nested worktree
+    (whose own absolute path contains e.g. ``.claude/worktrees/...``) still counts that worktree's
+    own root Cargo.lock/manifest -- only subtrees *below* ROOT named in IGNORED_TREE_PARTS drop out.
+    """
+    return IGNORED_TREE_PARTS.isdisjoint(path.relative_to(ROOT).parts)
+
+
 def check_filesystem() -> None:
     lockfiles = sorted(
         path.relative_to(ROOT)
         for path in ROOT.rglob("Cargo.lock")
-        if ".git" not in path.parts and "target" not in path.parts
+        if _within_workspace(path)
     )
     if lockfiles != [Path("Cargo.lock")]:
         fail(f"expected only the root Cargo.lock, found: {lockfiles}")
 
     workspace_manifests = []
     for manifest in ROOT.rglob("Cargo.toml"):
-        if ".git" in manifest.parts or "target" in manifest.parts:
+        if not _within_workspace(manifest):
             continue
         if any(
             line.strip() == "[workspace]"
