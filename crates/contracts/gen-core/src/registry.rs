@@ -300,7 +300,7 @@ impl ProviderRegistry {
             return Ok(());
         };
         match self.rejected_quants.iter().find(|(q, _)| *q == quant) {
-            Some((_, reason)) => Err(Error::Msg(format!(
+            Some((_, reason)) => Err(Error::Unsupported(format!(
                 "quant tier {quant:?} is not implemented by this runtime's backend \
                  (requested for '{id}'): {reason}. Refusing to load rather than silently \
                  serving a different tier's numerics."
@@ -1049,13 +1049,15 @@ mod tests {
             .load("dummy_test_model", &spec)
             .err()
             .expect("a rejected tier must not reach the provider");
-        let error = error.to_string();
-        assert!(error.contains("Nvfp4"), "{error}");
-        assert!(error.contains("dummy_test_model"), "{error}");
-        assert!(
-            error.contains("no FP4 quantizer on this backend"),
-            "{error}"
-        );
+        match error {
+            Error::Unsupported(message) => assert_eq!(
+                message,
+                "quant tier Nvfp4 is not implemented by this runtime's backend \
+                 (requested for 'dummy_test_model'): no FP4 quantizer on this backend. Refusing to \
+                 load rather than silently serving a different tier's numerics."
+            ),
+            other => panic!("a rejected quant tier is a capability gap, got {other:?}"),
+        }
     }
 
     /// The guard is scoped to the declared tiers: an unrejected tier (and a dense, `None` load) still
