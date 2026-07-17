@@ -326,22 +326,43 @@ fn decode_without_history_is_materially_wrong() {
 /// reports no error, a single-shot decode over that line must refuse rather than return garbage, and a
 /// chunk size that would cross it must be clamped down instead of honored.
 ///
-/// This runs on shape arithmetic alone (no decode), so it holds the production geometry in CI, which is
-/// exactly what the `vae_parity` golden (64×64/7 frames, ~340× under the ceiling) cannot do.
+/// This runs on **shape arithmetic alone — no decode** — so it can hold the real production geometry in
+/// CI, which is exactly what the `vae_parity` golden (64×64/7 frames, ~340× under) cannot do. Decoding a
+/// real 848×480 clip here would allocate tens of GiB and OOM a CI runner; the clamp's *behaviour* is
+/// covered separately at a cheap geometry by [`an_over_large_chunk_is_clamped_not_honored`].
 #[test]
-fn element_ceiling_guard_refuses_or_clamps_at_production_geometry() {
+fn element_ceiling_guard_holds_at_production_geometry() {
     let (_cfg, dec) = real_geometry_decoder();
-    // Mochi's shipped 848×480 → latent 60×106. The decoder's channel widths do not enter the bound
-    // (block_out is always `decoder_block_out_channels[0]`), but this synthetic decoder is 32-wide, so
-    // scale the assertion to its own reported safe chunk rather than hardcoding the real 128-ch answer.
+    // Mochi's shipped 848×480 → latent 60×106. This synthetic decoder is 32-wide where the real one is
+    // 128, so assert the *relationship* rather than hardcoding a width-specific answer.
     let (h_lat, w_lat) = (60, 106);
     let safe = dec.max_safe_chunk_frames(h_lat, w_lat);
-    eprintln!("max safe chunk at 848×480 (this decoder's width): {safe} latent frames");
+    eprintln!("max safe chunk at 848×480 (this decoder is 32-wide): {safe} latent frames");
     assert!(safe >= 1, "a single latent frame must fit at 848×480");
 
-    // A 5 s clip is 26 latent frames. Ask for the whole clip in one chunk: the request must be clamped
-    // to `safe`, not honored, and the result must still equal a known-safe small-chunk decode.
-    let latent = rnd(&[1, 12, 26, h_lat, w_lat], 3);
+    // The bound must be driven by the geometry: 4× the pixels ⇒ ~¼ the frames.
+    let quarter = dec.max_safe_chunk_frames(h_lat * 2, w_lat * 2);
+    assert!(
+        quarter < safe && quarter >= safe / 5,
+        "the cap must scale with output area: {safe} at 848×480 vs {quarter} at 1696×960"
+    );
+
+    // The real 128-wide decoder is 4× this one, so its cap at 848×480 is ~6 — under a 5 s clip's 26
+    // latent frames. That is the whole point: at production geometry the single pass is NOT available.
+    assert!(
+        safe / 4 < 26,
+        "a 128-wide decoder must NOT be able to single-pass a 5 s clip at 848×480 (this 32-wide \
+         decoder caps at {safe}, so the real one caps at ~{})",
+        safe / 4
+    );
+}
+
+/// The clamp's behaviour, at a geometry cheap enough for CI: an over-large chunk must be clamped down
+/// rather than honored, and the result must still be exact.
+#[test]
+fn an_over_large_chunk_is_clamped_not_honored() {
+    let (_cfg, dec) = real_geometry_decoder();
+    let latent = rnd(&[1, 12, 13, 2, 2], 3);
     let asked_too_big = dec
         .decode_denormalized_chunked(&latent, 1_000_000, None)
         .expect("an over-large chunk must be clamped, not corrupt or fail");
@@ -360,8 +381,14 @@ fn element_ceiling_guard_refuses_or_clamps_at_production_geometry() {
 #[test]
 fn single_shot_decode_refuses_over_the_element_ceiling() {
     let (_cfg, dec) = real_geometry_decoder();
-    // Pick a latent geometry far over the ceiling: 26 latent frames at 4× Mochi's spatial size.
-    let latent = rnd(&[1, 12, 26, 240, 424], 1);
+    // Just over the bound, not far over: 26 latent frames at 90² latent is ~2.6e9 elements for this
+    // 32-wide decoder. The guard is shape-only and fires before any compute, so keep the allocation
+    // small — a CI runner has to hold this.
+    let latent = rnd(&[1, 12, 26, 90, 90], 1);
+    assert!(
+        dec.max_safe_chunk_frames(90, 90) < 26,
+        "test precondition: 26 latent frames at 90² must be over the bound"
+    );
     match dec.decode_denormalized(&latent) {
         Err(mlx_gen::Error::Msg(m)) => {
             assert!(
