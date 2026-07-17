@@ -1050,16 +1050,46 @@ pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
 /// load is *either* a dense bf16 snapshot with `spec.quantize` set (the bf16 file size is scaled down
 /// by `ratio`) *or* a pre-packed Q4/Q8 snapshot with `quant == None` (the file is already the final
 /// packed size, `ratio == 1.0`) — never a packed file scaled by a quant ratio again.
-fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64 {
+///
+/// A path may also be a **shard directory** (the VACE lanes load `transformer/` /`transformer_2/`
+/// diffusers shard dirs, sc-12459): its contents are summed under exactly the `Weights::from_dir`
+/// selection — non-recursive, `*.safetensors` only, hidden entries (macOS AppleDouble
+/// `._model.safetensors` sidecars) skipped via [`is_hidden_file`] — so the sizing matches what the
+/// loader will actually map. Each entry is sized through `std::fs::metadata`, which **traverses
+/// symlinks**: linked snapshots (the `assemble_wan_vace_*` `link == true` layout, convert.rs — the
+/// default for local dev / the gated e2e) and HF-hub caches store every shard as a symlink into
+/// `blobs/`, and sizing the link itself (`DirEntry::metadata`, ~dozens of bytes) would make the
+/// preflight see none of the 27–54 GB expert weights and wave through requests that then die by
+/// SIGKILL mid-load — the original F-008 failure mode. `pub(crate)` so the sc-12459 VACE preflight
+/// reuses it.
+///
+/// [`is_hidden_file`]: mlx_gen::gen_core::weightsmeta::is_hidden_file
+pub(crate) fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64 {
+    fn weight_bytes_at(p: &std::path::Path) -> u64 {
+        match std::fs::metadata(p) {
+            Ok(m) if m.is_dir() => std::fs::read_dir(p)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|ext| ext == "safetensors"))
+                        .filter(|p| !mlx_gen::gen_core::weightsmeta::is_hidden_file(p))
+                        // `std::fs::metadata`, NOT `DirEntry::metadata`: the latter does not
+                        // traverse symlinks, and linked snapshots / HF-hub caches store shards
+                        // as symlinks into blobs/ — the link's own length is ~14 bytes.
+                        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                        .sum()
+                })
+                .unwrap_or(0),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        }
+    }
     let ratio = match quant.map(|q| q.bits()) {
         Some(4) => 0.30, // 4-bit affine: ~0.5 B/param + scales vs bf16 2 B/param
         Some(8) => 0.55, // 8-bit affine: ~1 B/param + scales
         _ => 1.0,
     };
-    let raw: u64 = files
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum();
+    let raw: u64 = files.iter().map(|p| weight_bytes_at(p)).sum();
     (raw as f64 * ratio) as u64
 }
 
@@ -1226,6 +1256,66 @@ mod tests {
         let a14b = WanModelConfig::wan22_i2v_14b();
         assert_eq!(resolve_capped_dims(&req(1280, 720), &a14b), (1280, 720));
         assert_eq!(1280 * 720, a14b.max_area);
+    }
+
+    // ---- sc-12459: `dit_resident_bytes` shard-dir sizing must match `Weights::from_dir` ----------
+
+    /// A fresh, empty scratch dir for one sizing test (recreated per run; RUST_TEST_THREADS=1 is
+    /// forced repo-wide, so no cross-test races on the shared temp root).
+    fn sizing_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join("mlx_gen_wan_dit_sizing").join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Pins the symlink traversal (adversarial-review issue on sc-12459): the `link == true`
+    /// assembled snapshots (convert.rs, the default local-dev / gated-e2e layout) and HF-hub caches
+    /// store each shard as a symlink into `blobs/`. `DirEntry::metadata` does NOT traverse the link
+    /// (a symlinked shard would sum as ~14 bytes → the preflight sees none of the expert weights and
+    /// the load dies by SIGKILL, the original F-008 failure); `std::fs::metadata` must size the
+    /// blob target instead.
+    #[test]
+    fn dit_resident_bytes_dir_sums_symlinked_shards_at_target_size() {
+        let root = sizing_dir("symlinked_shards");
+        let blobs = root.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let blob = blobs.join("blob0");
+        std::fs::write(&blob, vec![0u8; 4096]).unwrap();
+
+        let shard_dir = root.join("transformer");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        // One symlinked shard (the linked-snapshot / HF-cache layout) + one regular shard.
+        std::os::unix::fs::symlink(&blob, shard_dir.join("model-00001-of-00002.safetensors"))
+            .unwrap();
+        std::fs::write(
+            shard_dir.join("model-00002-of-00002.safetensors"),
+            vec![0u8; 2048],
+        )
+        .unwrap();
+
+        assert_eq!(
+            dit_resident_bytes(&[shard_dir], None),
+            4096 + 2048,
+            "symlinked shard must size as its blob target, not the link"
+        );
+    }
+
+    /// The dir branch applies the exact `Weights::from_dir` selection: hidden AppleDouble sidecars
+    /// (`._model.safetensors` — extension-only filters admit them) and non-`.safetensors` files
+    /// contribute nothing, so the sizing matches what the loader will actually map.
+    #[test]
+    fn dit_resident_bytes_dir_skips_hidden_sidecars_and_non_safetensors() {
+        let shard_dir = sizing_dir("hidden_sidecars");
+        std::fs::write(shard_dir.join("model.safetensors"), vec![0u8; 1024]).unwrap();
+        std::fs::write(shard_dir.join("._model.safetensors"), vec![0u8; 999]).unwrap();
+        std::fs::write(shard_dir.join("config.json"), b"{}").unwrap();
+
+        assert_eq!(
+            dit_resident_bytes(&[shard_dir], None),
+            1024,
+            "only the real shard `Weights::from_dir` maps may be counted"
+        );
     }
 
     // ---- sc-10045: adapter routing at the two merge_adapters SITES (5B `Wan` + A14B `Wan14b`) ------
