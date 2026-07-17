@@ -152,7 +152,7 @@ impl ZImageHeavyOwned {
 /// full memory saving and fork-matching output (sc-2532). An fp32 precision override is not wired
 /// (the validated dense path is bf16) and is rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let (tokenizer, residency) = load_residency(spec, PRECISION_MSG, FILE_MSG)?;
+    let (tokenizer, residency) = load_residency(spec, MODEL_ID, PRECISION_MSG, FILE_MSG)?;
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
         tokenizer,
@@ -167,30 +167,40 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// the text encoder → denoise/decode) to bound peak memory to `max(text-encoder, DiT+VAE)`. Both use
 /// the same per-phase loaders, so the components are byte-identical.
 ///
-/// `pub(crate)` and parameterized by the two per-id error strings (precision override / single-file
-/// rejection) so the **base** `z_image` sibling ([`crate::model_base`]) shares the identical policy
-/// routing rather than re-deriving it (sc-11124, F-172 — before which the base always loaded
-/// `Resident`, silently OOMing a fit-gated Sequential request).
+/// `pub(crate)` and parameterized by `model_id` + the two per-id error strings (precision override /
+/// single-file rejection) so the **base** `z_image` sibling ([`crate::model_base`]) shares the
+/// identical policy routing rather than re-deriving it (sc-11124, F-172 — before which the base
+/// always loaded `Resident`, silently OOMing a fit-gated Sequential request). The tier guard and the
+/// F-181 warn name the actual variant via `model_id`.
 pub(crate) fn load_residency(
     spec: &LoadSpec,
+    model_id: &'static str,
     precision_msg: &'static str,
     file_msg: &'static str,
 ) -> Result<(TextTokenizer, Residency<TextEncoder, ZImageHeavyOwned>)> {
     // Precision + snapshot-dir guard up front for BOTH policies (fail fast), then the always-warm
     // tokenizer; the heavy component dispatch is the shared [`build_residency`] seam below.
     let root = resolve_precision_and_root(spec, precision_msg, file_msg)?;
-    // F-181: a `Sequential` + load-time (re)quant over a *dense* snapshot re-quantizes the whole model
-    // on every generate. An already-packed turnkey loads packed (no re-quant); `Resident` quantizes
-    // once. So warn only for the Sequential-over-dense combination that actually pays the repeated cost.
     if let Some(q) = spec.quantize {
-        if matches!(spec.offload_policy, OffloadPolicy::Sequential)
-            && loader::needs_load_time_quant(root, q.bits(), MODEL_ID)?
-        {
-            mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
+        // F-009 (sc-12461): run the tier guard for BOTH residency policies, before any component
+        // load — a Q4 request over a pre-quantized Q8 turnkey hard-errors here instead of silently
+        // serving Q8 (`quantize()` is a no-op on packed weights). Before this fix only the
+        // Sequential warn gate below evaluated it, so the DEFAULT `Resident` load skipped the guard
+        // entirely; `load_heavy` re-checks for the Sequential per-generate reload path.
+        let load_time_quant = loader::needs_load_time_quant(root, q.bits(), model_id)?;
+        // F-181: a `Sequential` + load-time (re)quant over a *dense* snapshot re-quantizes the whole
+        // model on every generate. An already-packed turnkey loads packed (no re-quant); `Resident`
+        // quantizes once. So warn only for the Sequential-over-dense combination that actually pays
+        // the repeated cost.
+        if load_time_quant && matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+            mlx_gen::residency::warn_sequential_requantize(model_id, q.bits());
         }
     }
     let tokenizer = loader::load_tokenizer(root)?;
-    Ok((tokenizer, build_residency(spec, precision_msg, file_msg)?))
+    Ok((
+        tokenizer,
+        build_residency(spec, model_id, precision_msg, file_msg)?,
+    ))
 }
 
 /// The policy→[`Residency`] dispatch every Z-Image variant shares (sc-11126, F-180), routed through
@@ -203,6 +213,7 @@ pub(crate) fn load_residency(
 /// the residency unit test's "Sequential defers" assertion.
 pub(crate) fn build_residency(
     spec: &LoadSpec,
+    model_id: &'static str,
     precision_msg: &'static str,
     file_msg: &'static str,
 ) -> Result<Residency<TextEncoder, ZImageHeavyOwned>> {
@@ -216,7 +227,7 @@ pub(crate) fn build_residency(
         },
         move |use_pid| {
             let root = resolve_precision_and_root(&spec_heavy, precision_msg, file_msg)?;
-            load_heavy(&spec_heavy, root, use_pid)
+            load_heavy(&spec_heavy, root, use_pid, model_id)
         },
     )
 }
@@ -261,7 +272,22 @@ fn load_text_encoder_only(root: &Path, quant: Option<Quant>) -> Result<TextEncod
 /// `max(text-encoder, DiT+VAE)`). Quantize-then-adapters order matches the pre-sc-10839
 /// resident composition; the components are independent of the text encoder (separate weight files,
 /// deterministic RNG-free quant), so the `Resident` composition below is byte-identical.
-fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<ZImageHeavyOwned> {
+fn load_heavy(
+    spec: &LoadSpec,
+    root: &Path,
+    load_pid: bool,
+    model_id: &str,
+) -> Result<ZImageHeavyOwned> {
+    // F-009 (sc-12461): the tier guard runs here too, BEFORE the dense loads, so it fires on both
+    // residency policies — `Resident` eager-loads through here at load time and `Sequential`
+    // re-loads through here on every generate. A requested-vs-packed mismatch (e.g. Q4 over a
+    // pre-quantized Q8 turnkey) hard-errors instead of falling through to the no-op `quantize()`
+    // below and silently serving the packed tier. On a matching packed turnkey the quantizes below
+    // are documented no-ops (`AdaptableLinear::quantize` on a packed base); on a dense snapshot
+    // they do the load-time quant — either way the request stands, so no gating on the bool.
+    if let Some(q) = spec.quantize {
+        loader::needs_load_time_quant(root, q.bits(), model_id)?;
+    }
     let mut transformer = loader::load_transformer(root)?;
     let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
@@ -700,6 +726,7 @@ mod tests {
     fn build_residency_sequential_defers_all_component_loads() {
         let res = build_residency(
             &missing_snapshot_spec(OffloadPolicy::Sequential),
+            MODEL_ID,
             PRECISION_MSG,
             FILE_MSG,
         )
@@ -710,10 +737,67 @@ mod tests {
         );
     }
 
+    // ── F-009 (sc-12461): the tier-mismatch guard must fire on the DEFAULT `Resident` policy, not
+    // just `Sequential`. Before the fix, `needs_load_time_quant` only ran behind the Sequential
+    // F-181 warn gate, so a Resident Q4 request over a pre-quantized Q8 turnkey silently served Q8
+    // (`quantize()` is a no-op on packed weights). Weight-free: the fixture is only the packed
+    // `transformer/config.json` marker, and the guard errors before any component weights load.
+    #[test]
+    fn tier_mismatch_errors_on_resident_and_sequential_load() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let root = loader::packed_snapshot_fixture("model-load", 8);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_quant(mlx_gen::Quant::Q4)
+                .with_offload_policy(policy);
+            let err = load(&spec).err().expect("expected an error").to_string();
+            assert!(
+                err.contains("pre-quantized Q8"),
+                "policy {policy:?}: Q4 over a packed Q8 turnkey must hard-error, got: {err}"
+            );
+            assert!(
+                err.contains(MODEL_ID),
+                "policy {policy:?}: the error must name the model id, got: {err}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn load_heavy_runs_tier_guard_before_weights() {
+        // F-009 (sc-12461): the heavy loader itself re-checks the tier guard — this is the seam the
+        // Sequential path re-loads through on every generate, and the defense-in-depth for any
+        // composition that reaches `load_heavy` without the `load_residency` entry guard. The
+        // fixture has no weights at all, so reaching the transformer load would fail with a
+        // missing-weights error instead — asserting on the tier message proves the guard runs first.
+        let root = loader::packed_snapshot_fixture("model-heavy", 8);
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(mlx_gen::Quant::Q4);
+        let err = load_heavy(&spec, &root, false, MODEL_ID)
+            .err()
+            .expect("expected a tier-mismatch error")
+            .to_string();
+        assert!(err.contains("pre-quantized Q8"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn matching_packed_tier_passes_the_guard() {
+        // A Q8 request over a Q8-packed turnkey must get PAST the guard (and fail later on the
+        // missing component weights, not on the tier) — the guard rejects mismatches only.
+        let root = loader::packed_snapshot_fixture("model-match", 8);
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(mlx_gen::Quant::Q8);
+        let err = load(&spec).err().expect("expected an error").to_string();
+        assert!(
+            !err.contains("pre-quantized"),
+            "a matching packed tier must not trip the mismatch guard, got: {err}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
         let err = build_residency(
             &missing_snapshot_spec(OffloadPolicy::Resident),
+            MODEL_ID,
             PRECISION_MSG,
             FILE_MSG,
         )

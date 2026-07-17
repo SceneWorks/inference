@@ -124,6 +124,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // per-id error text (precision override / single-file rejection) differs.
     let (tokenizer, residency) = crate::model::load_residency(
         spec,
+        MODEL_ID,
         "z_image: only dense bf16 is wired in the Rust port; the text encoder already runs f32 \
          internally (drop the precision override)",
         "z_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
@@ -388,6 +389,7 @@ mod tests {
     fn build_residency_sequential_defers_all_component_loads() {
         let res = crate::model::build_residency(
             &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
+            MODEL_ID,
             BASE_PRECISION_MSG,
             BASE_FILE_MSG,
         )
@@ -402,6 +404,7 @@ mod tests {
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
         let err = crate::model::build_residency(
             &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
+            MODEL_ID,
             BASE_PRECISION_MSG,
             BASE_FILE_MSG,
         )
