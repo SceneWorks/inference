@@ -63,31 +63,49 @@ impl Tokenizer {
     }
 
     /// Build the per-vocab decode table for constrained decoding: the literal text of each token id
-    /// (empty for special/added ids), plus the special-id set. Run once and cache — this decodes
-    /// every id in the vocabulary.
+    /// (empty for special ids), plus the special-id set. Run once and cache — this decodes
+    /// every id in the vocabulary. Delegates to [`build_constraint_decode_table`], the single
+    /// decode-table policy in the workspace.
     pub fn constraint_decode_table(&self) -> ConstraintDecodeTable {
-        let vocab = self.vocab_size() as u32;
-        let special: HashSet<u32> = self
-            .inner
-            .get_added_tokens_decoder()
-            .into_iter()
-            .filter(|(_, tok)| tok.special)
-            .map(|(id, _)| id)
-            .collect();
-
-        let pieces = (0..vocab)
-            .map(|id| {
-                if special.contains(&id) {
-                    String::new()
-                } else {
-                    // Partial-UTF-8 byte tokens decode to U+FFFD; acceptable inside JSON strings.
-                    self.inner.decode(&[id], false).unwrap_or_default()
-                }
-            })
-            .collect();
-
-        ConstraintDecodeTable { pieces, special }
+        build_constraint_decode_table(&self.inner)
     }
+}
+
+/// Build a [`ConstraintDecodeTable`] from a raw HF [`tokenizers::Tokenizer`].
+///
+/// This is **the single decode-table special-token policy for the workspace** (sc-12467): only
+/// added tokens flagged `special == true` (BOS/EOS/turn markers) enter `special` and get an empty
+/// `pieces[id]`. Added tokens that are *not* special (ordinary vocabulary words added post-hoc)
+/// are regular content — they decode to their literal text and may appear in constrained JSON
+/// output like any other token. `sceneworks-gen-core`'s `TextTokenizer::constraint_decode_table`
+/// delegates here; its former private copy marked *all* added tokens special (and blanked their
+/// pieces), which over-masked valid content — external consumers of that crate now see this
+/// (more correct) policy.
+///
+/// Public-dependency note: the parameter type ties this signature to the workspace's pinned
+/// `tokenizers` 0.21 line (the deliberate 0.21/0.22 split is enforced by
+/// `scripts/check-workspace.py`); bumping that pin is a semver-visible change here.
+pub fn build_constraint_decode_table(inner: &tokenizers::Tokenizer) -> ConstraintDecodeTable {
+    let vocab = inner.get_vocab_size(true) as u32;
+    let special: HashSet<u32> = inner
+        .get_added_tokens_decoder()
+        .into_iter()
+        .filter(|(_, tok)| tok.special)
+        .map(|(id, _)| id)
+        .collect();
+
+    let pieces = (0..vocab)
+        .map(|id| {
+            if special.contains(&id) {
+                String::new()
+            } else {
+                // Partial-UTF-8 byte tokens decode to U+FFFD; acceptable inside JSON strings.
+                inner.decode(&[id], false).unwrap_or_default()
+            }
+        })
+        .collect();
+
+    ConstraintDecodeTable { pieces, special }
 }
 
 #[cfg(test)]
@@ -127,6 +145,56 @@ mod tests {
         let t = tiny();
         let table = t.constraint_decode_table();
         assert_eq!(table.pieces.len(), t.vocab_size());
+        assert_eq!(table.pieces[1], "hello");
+    }
+
+    // Like TINY_JSON but with added tokens: id 4 is a special added token (an EOS marker), id 5 is
+    // a NON-special added token (an ordinary word added to the vocab post-hoc).
+    const ADDED_TOKENS_JSON: &str = r#"{
+        "version": "1.0",
+        "added_tokens": [
+            { "id": 4, "content": "<eos>", "single_word": false, "lstrip": false,
+              "rstrip": false, "normalized": false, "special": true },
+            { "id": 5, "content": "wombat", "single_word": false, "lstrip": false,
+              "rstrip": false, "normalized": false, "special": false }
+        ],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "WordLevel",
+            "vocab": { "<unk>": 0, "hello": 1, "world": 2, "foo": 3 },
+            "unk_token": "<unk>"
+        }
+    }"#;
+
+    /// Pins the workspace decode-table special-token policy (sc-12467): only `special == true`
+    /// added tokens are masked; non-special added tokens keep their literal text and are usable
+    /// as JSON content. (The pre-sc-12467 gen-core copy marked ALL added tokens special, which
+    /// this fixture would have caught.)
+    #[test]
+    fn constraint_table_masks_only_special_added_tokens() {
+        let t = Tokenizer::from_json(ADDED_TOKENS_JSON).unwrap();
+        let table = t.constraint_decode_table();
+        assert_eq!(table.pieces.len(), 6, "vocab includes both added tokens");
+
+        // Special added token: in the special set, no decode text.
+        assert!(table.special.contains(&4), "<eos> (special=true) is masked");
+        assert_eq!(table.pieces[4], "", "special tokens carry no JSON content");
+
+        // Non-special added token: NOT masked, decodes to its literal text.
+        assert!(
+            !table.special.contains(&5),
+            "non-special added token must not be masked as special"
+        );
+        assert_eq!(
+            table.pieces[5], "wombat",
+            "non-special added token keeps its decoded text"
+        );
+
+        // Ordinary vocab tokens are untouched.
+        assert!(!table.special.contains(&1));
         assert_eq!(table.pieces[1], "hello");
     }
 }

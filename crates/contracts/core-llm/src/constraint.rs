@@ -7,8 +7,10 @@
 //! rest can be masked, and gates the stop token on [`JsonState::can_stop`]. Wiring this to the
 //! backend's logit masking is story 7166; the policy lives here.
 //!
-//! The [`JsonState`] machine is ported verbatim from the proven gen-core implementation (it is pure
-//! and tensor-free) and cross-checked against `serde_json`.
+//! The [`JsonState`] machine was ported verbatim from the proven gen-core implementation (it is pure
+//! and tensor-free) and cross-checked against `serde_json`. As of sc-12467 this is the **single**
+//! implementation in the workspace: `sceneworks-gen-core` re-exports it (`gen_core::JsonState`)
+//! instead of keeping its historical duplicate.
 
 use std::collections::HashSet;
 
@@ -21,13 +23,18 @@ pub enum Constraint {
 }
 
 /// Per-vocab decode table for constrained sampling: the literal text of each token id, plus the set
-/// of special/added ids (never valid as JSON content). Build once via
+/// of special ids (never valid as JSON content). Build once via
 /// [`Tokenizer::constraint_decode_table`](crate::Tokenizer::constraint_decode_table) and cache.
+///
+/// Special-token policy (sc-12467, workspace-wide): `special` holds only added tokens flagged
+/// `special == true` (BOS/EOS/turn markers). Added tokens that are NOT special are ordinary
+/// content — they keep their decoded text in `pieces` and are maskable/allowable like any base
+/// vocab token. See [`tokenizer::build_constraint_decode_table`](crate::tokenizer::build_constraint_decode_table).
 #[derive(Clone, Debug)]
 pub struct ConstraintDecodeTable {
-    /// `pieces[id]` is the literal decoded text of token `id` (empty for special/added ids).
+    /// `pieces[id]` is the literal decoded text of token `id` (empty for special ids).
     pub pieces: Vec<String>,
-    /// Special / added token ids, never valid as JSON content.
+    /// Special token ids (added tokens with `special == true`), never valid as JSON content.
     pub special: HashSet<u32>,
 }
 
