@@ -242,6 +242,7 @@ impl Generator for KreaGenerator {
         let reference = img2img_reference(req);
         let images = self.residency.run(
             &req.cancel,
+            &self.device,
             req.use_pid,
             on_progress,
             |text| match text {

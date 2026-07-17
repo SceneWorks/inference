@@ -209,6 +209,7 @@ impl Krea2Control {
         validate_request(req)?;
         self.residency.run(
             &req.cancel,
+            &self.device,
             false,
             on_progress,
             |text| text.encode(req),
