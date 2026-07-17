@@ -1050,16 +1050,35 @@ pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
 /// load is *either* a dense bf16 snapshot with `spec.quantize` set (the bf16 file size is scaled down
 /// by `ratio`) *or* a pre-packed Q4/Q8 snapshot with `quant == None` (the file is already the final
 /// packed size, `ratio == 1.0`) — never a packed file scaled by a quant ratio again.
-fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64 {
+///
+/// A path may also be a **shard directory** (the VACE lanes load `transformer/` /`transformer_2/`
+/// diffusers shard dirs, sc-12459): its non-recursive `*.safetensors` contents are summed, matching
+/// what `Weights::from_dir` will actually map. `pub(crate)` so the sc-12459 VACE preflight reuses it.
+pub(crate) fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64 {
+    fn weight_bytes_at(p: &std::path::Path) -> u64 {
+        match std::fs::metadata(p) {
+            Ok(m) if m.is_dir() => std::fs::read_dir(p)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .is_some_and(|ext| ext == "safetensors")
+                        })
+                        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                        .sum()
+                })
+                .unwrap_or(0),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        }
+    }
     let ratio = match quant.map(|q| q.bits()) {
         Some(4) => 0.30, // 4-bit affine: ~0.5 B/param + scales vs bf16 2 B/param
         Some(8) => 0.55, // 8-bit affine: ~1 B/param + scales
         _ => 1.0,
     };
-    let raw: u64 = files
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum();
+    let raw: u64 = files.iter().map(|p| weight_bytes_at(p)).sum();
     (raw as f64 * ratio) as u64
 }
 

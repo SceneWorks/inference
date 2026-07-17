@@ -14,7 +14,7 @@ use mlx_gen::{
     Modality, Precision, Quant, ReplacementMode, WeightsSource,
 };
 
-use mlx_gen_wan::{MODEL_ID, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, MODEL_ID_VACE};
+use mlx_gen_wan::{MODEL_ID, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, MODEL_ID_VACE, MODEL_ID_VACE_FUN};
 
 /// The 5B's serialized `config.json` (the `convert_wan.py` schema; model_type ti2v + dim 3072).
 const TI2V_5B_CONFIG: &str = r#"{
@@ -734,6 +734,65 @@ fn wan_vace_load_reads_config_and_validates() {
         "frames/mask length mismatch must error"
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// sc-12459 (F-008): both VACE lanes enforce a **real** control-clip frame ceiling (1025, mirroring
+/// LTX's `MAX_FRAMES`) — the gen-core capability floor alone only rejects a pathological 1 000 000.
+#[test]
+fn wan_vace_lanes_reject_over_cap_control_clip_frames() {
+    let dir = temp_model_dir_with("vace_frame_cap", VACE_CONFIG);
+    for id in [MODEL_ID_VACE, MODEL_ID_VACE_FUN] {
+        let g = mlx_gen_wan::provider_registry()
+            .unwrap()
+            .load(id, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+            .expect("load reads config.json only");
+        // 1029 = 1 + 4·257 satisfies the 1+4k grid but exceeds the ceiling.
+        let err = g
+            .validate(&control_clip_request(1029))
+            .expect_err("1029-frame control clip must be rejected");
+        assert!(
+            err.to_string().contains("exceeds the maximum 1025"),
+            "{id}: unexpected error: {err}"
+        );
+        // The ceiling itself (1025 = 1 + 4·256) still validates.
+        assert!(g.validate(&control_clip_request(1025)).is_ok(), "{id}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// sc-12459 (F-008): both VACE lanes run the sc-4986 preflight denoise memory guard **before any
+/// heavy load**. Under a tiny pinned MLX budget, an over-budget request (640×640 × 101 frames →
+/// ~4.3 GiB of estimated denoise activations vs a 2 GiB budget) returns the **catchable** guard
+/// error. The snapshot dir holds only `config.json` — no UMT5/VAE/DiT weights — so reaching any
+/// load stage would fail with a missing-file error instead; the guard's message proves it fired
+/// first (instead of the OS SIGKILL / Metal command-buffer abort mid-denoise, sc-4986).
+#[test]
+fn wan_vace_lanes_preflight_denoise_memory_before_any_load() {
+    use mlx_rs::memory::set_memory_limit;
+    let dir = temp_model_dir_with("vace_preflight", VACE_CONFIG);
+    let mut req = control_clip_request(101);
+    req.width = 640;
+    req.height = 640;
+    for id in [MODEL_ID_VACE, MODEL_ID_VACE_FUN] {
+        let g = mlx_gen_wan::provider_registry()
+            .unwrap()
+            .load(id, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+            .expect("load reads config.json only");
+        // Pin a deterministic 2 GiB budget so the threshold is exercised on any machine; restore
+        // after (set_memory_limit returns the previous value).
+        let prev = set_memory_limit(2 << 30);
+        let res = g.generate(&req, &mut |_| {});
+        set_memory_limit(prev);
+        let err = res
+            .err()
+            .unwrap_or_else(|| panic!("{id}: over-budget VACE request must fail preflight"))
+            .to_string();
+        assert!(
+            err.contains("denoise step"),
+            "{id}: expected the sc-4986 preflight guard error (not a weight-load error): {err}"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

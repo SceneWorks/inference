@@ -36,9 +36,11 @@ use mlx_rs::{random, Array, Dtype};
 
 use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
 use crate::config::{WanModelConfig, WanVaceConfig};
+use crate::model::dit_resident_bytes;
 use crate::pipeline::{
-    align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, preprocess_i2v_image,
-    reject_over_area, resolve_sampler_knobs,
+    align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, latent_shape,
+    preflight_denoise_memory_guard, preprocess_i2v_image, reject_over_area, resolve_sampler_knobs,
+    seq_len,
 };
 use crate::scheduler::SolverKind;
 use crate::text_encoder::encode_text_staged;
@@ -54,6 +56,15 @@ pub const MODEL_ID_VACE: &str = "wan_vace";
 /// The Wan z16 VAE strides (the VACE checkpoints are Wan2.1-based): temporal 4, spatial 8, patch 2.
 const VAE_T: usize = 4;
 const VAE_S: usize = 8;
+
+/// Upper bound on the control-clip frame count (sc-12459 / F-008): `vace_prep` sizes the control
+/// video, mask, control-latent, and init-noise tensors directly from `clip.frames.len()`, so an
+/// unbounded count (the gen-core capability floor only rejects a pathological 1 000 000) would drive
+/// enormous allocations before any typed error. `1025` (= 1 + 4·256, ~64 s at Wan's 16 fps — far
+/// above the 81/121-frame lengths the Wan checkpoints are trained on) mirrors the LTX lane's real
+/// `MAX_FRAMES = 1025` ceiling; realistic-but-large requests below it are still bounded by the
+/// sc-4986 [`preflight_denoise_memory_guard`] both VACE `generate_impl`s now run.
+const MAX_CONTROL_FRAMES: usize = 1025;
 
 /// Drop the leading `num_ref` reference latent frames along the temporal axis (axis 1) — the diffusers
 /// `latents[:, :, num_reference_images:]` slice both VACE variants apply after denoise, before the VAE
@@ -88,6 +99,28 @@ struct VacePrep {
     scales: Vec<f32>,
     init_noise: Array,
     num_ref: usize,
+}
+
+/// Attention-token count of one VACE denoise forward, computed **from the request alone** (sc-12459
+/// / F-008 — before the UMT5 encode, the VAE conditioning encode, or any weight load): the
+/// control-latent grid `vace_prep` will materialize is `[·, t_lat + num_ref, H/8, W/8]` (the
+/// `1 + (F−1)/4` z16 temporal latents plus one prepended latent frame per `Reference` image,
+/// `prepare_video_latents`), and the init noise matches it — so the dense lanes' [`seq_len`] over
+/// that grid is exactly the per-forward token count the denoise loop runs.
+fn vace_denoise_tokens(config: &WanVaceConfig, req: &GenerationRequest) -> Result<usize> {
+    let base = &config.base;
+    // Same alignment `vace_prep` applies (round down to patch · VAE_S) — never larger than requested.
+    let width = align_dim(req.width, base.patch_size.2, VAE_S);
+    let height = align_dim(req.height, base.patch_size.1, VAE_S);
+    let frames = req.control_clip().map(|c| c.frames.len()).unwrap_or(1);
+    let num_ref = req
+        .conditioning
+        .iter()
+        .filter(|c| matches!(c, mlx_gen::Conditioning::Reference { .. }))
+        .count();
+    let mut lat = latent_shape(frames, height, width, base.vae_z_dim, (VAE_T, VAE_S, VAE_S))?;
+    lat[1] += num_ref as i32; // reference images prepend latent frames
+    Ok(seq_len(lat, base.patch_size))
 }
 
 /// Run the shared VACE pre-DiT setup (Stages 1–2 + noise seeding). `cfg_disabled` is the caller's
@@ -373,6 +406,19 @@ impl WanVace {
         self.validate(req)?;
         let base = &self.config.base;
 
+        // sc-4986 / sc-12459 (F-008) — fail fast (catchable) if the DiT-denoise stage won't fit,
+        // BEFORE the UMT5 encode, the VAE conditioning encode, and the VACE DiT load — the same
+        // preflight the dense lanes run (model.rs). Batch factor 1 (`cfg_enabled: false`): VACE CFG
+        // runs cond/uncond as two sequential B=1 forwards (vace.rs F-073), not the dense lanes'
+        // batched B=2, so one forward's working set is the activation peak.
+        preflight_denoise_memory_guard(
+            self.descriptor.id,
+            dit_resident_bytes(&[vace_transformer_weights_path(&self.root)], self.quantize),
+            vace_denoise_tokens(&self.config, req)?,
+            base.dim,
+            false,
+        )?;
+
         // Single-expert guidance: a scalar request `guidance` overrides the config; CFG off ⇒ ≤ 1.0.
         let guidance = base.sample_guide_scale.resolve_single(req.guidance);
         let cfg_disabled = guidance <= 1.0;
@@ -423,16 +469,32 @@ impl WanVace {
     }
 }
 
-/// Load the VACE transformer weights (diffusers layout) — a consolidated `model.safetensors` or a
-/// sharded `transformer/` dir, whichever the snapshot provides.
-fn load_vace_transformer_weights(root: &std::path::Path) -> Result<Weights> {
+/// Resolve where the VACE transformer weights live (diffusers layout) — the consolidated
+/// `model.safetensors` when present, else the sharded `transformer/` dir. Shared by the loader and
+/// the sc-12459 preflight's [`dit_resident_bytes`] so the two can't disagree on precedence; a
+/// missing snapshot resolves to the (absent) single-file path, which sizes to 0 bytes at preflight
+/// (the guard under-counts rather than spuriously firing) and errors loudly at the actual load.
+fn vace_transformer_weights_path(root: &std::path::Path) -> PathBuf {
     let single = root.join("model.safetensors");
     if single.exists() {
-        return Weights::from_file(single);
+        return single;
     }
     let shard_dir = root.join("transformer");
     if shard_dir.is_dir() {
-        return Weights::from_dir(shard_dir);
+        return shard_dir;
+    }
+    single
+}
+
+/// Load the VACE transformer weights (diffusers layout) — a consolidated `model.safetensors` or a
+/// sharded `transformer/` dir, whichever the snapshot provides.
+fn load_vace_transformer_weights(root: &std::path::Path) -> Result<Weights> {
+    let path = vace_transformer_weights_path(root);
+    if path.is_file() {
+        return Weights::from_file(path);
+    }
+    if path.is_dir() {
+        return Weights::from_dir(path);
     }
     Err(Error::Msg(format!(
         "wan_vace: no transformer weights at {} (expected model.safetensors or a transformer/ dir)",
@@ -547,6 +609,25 @@ impl WanVaceFun {
         self.validate(req)?;
         let base = &self.config.base;
 
+        // sc-4986 / sc-12459 (F-008) — fail fast (catchable) if the DiT-denoise stage won't fit,
+        // BEFORE the UMT5 encode, the VAE conditioning encode, and the 27–54 GB dual-expert load.
+        // Both experts stay resident through the denoise (mirroring the dense A14B, model.rs), so
+        // their weight files are summed. Batch factor 1 (`cfg_enabled: false`): VACE CFG runs
+        // cond/uncond as two sequential B=1 forwards (vace.rs F-073), not the dense lanes' B=2.
+        preflight_denoise_memory_guard(
+            self.descriptor.id,
+            dit_resident_bytes(
+                &[
+                    vace_fun_expert_weights_path(&self.root, MoeExpert::High),
+                    vace_fun_expert_weights_path(&self.root, MoeExpert::Low),
+                ],
+                self.quantize,
+            ),
+            vace_denoise_tokens(&self.config, req)?,
+            base.dim,
+            false,
+        )?;
+
         // A scalar request `guidance` overrides both experts; otherwise the config (low, high) pair.
         let (low_gs, high_gs) = base.sample_guide_scale.resolve_dual(req.guidance);
         let cfg_disabled = low_gs <= 1.0 && high_gs <= 1.0;
@@ -618,23 +699,45 @@ impl WanVaceFun {
 /// base-A14B converter writes — model.rs:806), else the raw diffusers shard dir (`transformer/` for
 /// high, `transformer_2/` for low). Errors loudly when neither is present (no silent fallback).
 fn load_vace_fun_expert_weights(root: &std::path::Path, expert: MoeExpert) -> Result<Weights> {
-    let (label, single, dir) = match expert {
-        MoeExpert::High => ("high", "high_noise_model.safetensors", "transformer"),
-        MoeExpert::Low => ("low", "low_noise_model.safetensors", "transformer_2"),
-    };
-    let consolidated = root.join(single);
-    if consolidated.exists() {
-        return Weights::from_file(consolidated);
+    let path = vace_fun_expert_weights_path(root, expert);
+    if path.is_file() {
+        return Weights::from_file(path);
     }
-    let shard_dir = root.join(dir);
-    if shard_dir.is_dir() {
-        return Weights::from_dir(shard_dir);
+    if path.is_dir() {
+        return Weights::from_dir(path);
     }
+    let (label, single, dir) = vace_fun_expert_names(expert);
     Err(Error::Msg(format!(
         "wan2_2_vace_fun_14b: no {label}-noise expert weights at {} (expected {single} or a {dir}/ \
          dir)",
         root.display()
     )))
+}
+
+/// The `(label, consolidated-file, shard-dir)` names for one VACE-Fun expert (the base-A14B
+/// converter's names / the raw diffusers layout — see [`load_vace_fun_expert_weights`]).
+fn vace_fun_expert_names(expert: MoeExpert) -> (&'static str, &'static str, &'static str) {
+    match expert {
+        MoeExpert::High => ("high", "high_noise_model.safetensors", "transformer"),
+        MoeExpert::Low => ("low", "low_noise_model.safetensors", "transformer_2"),
+    }
+}
+
+/// Resolve where one VACE-Fun expert's weights live — consolidated file first, else the shard dir.
+/// Shared by the loader and the sc-12459 preflight's [`dit_resident_bytes`] (same missing-snapshot
+/// contract as [`vace_transformer_weights_path`]: resolves to the absent file → 0 preflight bytes,
+/// loud error at the actual load).
+fn vace_fun_expert_weights_path(root: &std::path::Path, expert: MoeExpert) -> PathBuf {
+    let (_, single, dir) = vace_fun_expert_names(expert);
+    let consolidated = root.join(single);
+    if consolidated.exists() {
+        return consolidated;
+    }
+    let shard_dir = root.join(dir);
+    if shard_dir.is_dir() {
+        return shard_dir;
+    }
+    consolidated
 }
 
 /// Shared control-clip validation for both VACE generators (single + dual expert): the capability
@@ -670,10 +773,104 @@ fn validate_vace_clip(
             clip.frames.len()
         )));
     }
+    // sc-12459 (F-008): a real frame ceiling (the gen-core floor only rejects a pathological
+    // 1 000 000) — see [`MAX_CONTROL_FRAMES`].
+    if clip.frames.len() > MAX_CONTROL_FRAMES {
+        return Err(Error::Msg(format!(
+            "{id}: control clip frame count {} exceeds the maximum {MAX_CONTROL_FRAMES}",
+            clip.frames.len()
+        )));
+    }
     Ok(())
 }
 
 // Explicit registration for the dual-expert VACE-Fun variant.
 mlx_gen::register_generators! {
     pub(crate) const VACE_FUN_REGISTRATION = descriptor_vace_fun => load_vace_fun
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::{Conditioning, ReplacementMode};
+
+    fn test_config() -> WanVaceConfig {
+        // The 14B-defaults fallback config (dim 5120, patch (1,2,2), z16 / stride (4,8,8)) — the
+        // same one `from_model_dir` returns for an empty dir.
+        WanVaceConfig::from_model_dir(std::path::Path::new("/nonexistent-sc12459")).unwrap()
+    }
+
+    fn img() -> Image {
+        Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128u8; 64 * 64 * 3],
+        }
+    }
+
+    fn clip_request(frames: usize, width: u32, height: u32, num_ref: usize) -> GenerationRequest {
+        let mut conditioning = vec![Conditioning::ControlClip {
+            frames: (0..frames).map(|_| img()).collect(),
+            mask: (0..frames).map(|_| img()).collect(),
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: ReplacementMode::FaceOnly,
+        }];
+        for _ in 0..num_ref {
+            conditioning.push(Conditioning::Reference {
+                image: img(),
+                strength: None,
+            });
+        }
+        GenerationRequest {
+            prompt: "x".into(),
+            width,
+            height,
+            frames: Some(frames as u32),
+            conditioning,
+            ..Default::default()
+        }
+    }
+
+    /// sc-12459 — the preflight token count matches the control-latent grid `vace_prep`
+    /// materializes: `[·, (F−1)/4 + 1 + num_ref, H/8, W/8]` through the dense lanes' `seq_len`.
+    #[test]
+    fn vace_denoise_tokens_matches_control_latent_grid() {
+        let cfg = test_config();
+        // 64×64, 5 frames, no refs: h_lat = w_lat = 8, t_lat = 2 → 8·8·2 / (2·2) = 32 tokens.
+        assert_eq!(vace_denoise_tokens(&cfg, &clip_request(5, 64, 64, 0)).unwrap(), 32);
+        // A reference image prepends one latent frame: t = 3 → 48 tokens.
+        assert_eq!(vace_denoise_tokens(&cfg, &clip_request(5, 64, 64, 1)).unwrap(), 48);
+        // Dims align DOWN to the patch·VAE_S = 16 grid before the latent divide (never larger):
+        // 79 → 64. And the frame axis follows 1 + 4·k: 9 frames → t_lat = 3.
+        assert_eq!(vace_denoise_tokens(&cfg, &clip_request(9, 79, 64, 0)).unwrap(), 48);
+    }
+
+    /// sc-12459 — `validate_vace_clip` enforces the real frame ceiling (the gen-core floor only
+    /// rejects a pathological 1 000 000).
+    #[test]
+    fn validate_vace_clip_rejects_over_cap_frame_count() {
+        let cfg = test_config();
+        // 1029 = 1 + 4·257 satisfies the 1+4k grid but exceeds MAX_CONTROL_FRAMES = 1025.
+        let req = clip_request(1029, 64, 64, 0);
+        let err = validate_vace_clip(&descriptor_vace(), MODEL_ID_VACE, &cfg, &req)
+            .expect_err("1029 frames must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds the maximum 1025"),
+            "unexpected error: {msg}"
+        );
+        // The ceiling itself (1025 = 1 + 4·256) still validates.
+        assert!(validate_vace_clip(
+            &descriptor_vace(),
+            MODEL_ID_VACE,
+            &cfg,
+            &clip_request(1025, 64, 64, 0)
+        )
+        .is_ok());
+        // The dual-expert lane shares the same validator + ceiling.
+        let err = validate_vace_clip(&descriptor_vace_fun(), MODEL_ID_VACE_FUN, &cfg, &req)
+            .expect_err("dual-expert: 1029 frames must be rejected");
+        assert!(err.to_string().contains("exceeds the maximum 1025"));
+    }
 }
