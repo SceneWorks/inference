@@ -1,5 +1,5 @@
 //! Shared leaf helpers (mirrors `mlx-gen-sam3`'s `util`): weight-key joining, torch→MLX
-//! conv-weight permutes, and a NHWC bilinear resize (the DPT neck/head upsamples).
+//! conv-weight permutes, and shared device/host bilinear resizers.
 
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
@@ -90,4 +90,55 @@ pub(crate) fn bilinear_resize(
 ) -> Result<Array> {
     let y = resample_axis(x, 1, out_h, align_corners)?;
     resample_axis(&y, 2, out_w, align_corners)
+}
+
+/// Host RGB8 HWC bilinear resize using half-pixel centers (`align_corners = false`) and clamped
+/// edges. Returns interpolated channel values in the source byte range `[0, 255]`; callers retain
+/// their own post-processing (unit scaling for model input or rounded RGB8 output).
+pub(crate) fn bilinear_resize_rgb8_f32(
+    rgb: &[u8],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; out_h * out_w * 3];
+    let sx = in_w as f32 / out_w as f32;
+    let sy = in_h as f32 / out_h as f32;
+    for oy in 0..out_h {
+        let fy = ((oy as f32 + 0.5) * sy - 0.5).max(0.0);
+        let y0 = (fy.floor() as usize).min(in_h - 1);
+        let y1 = (y0 + 1).min(in_h - 1);
+        let wy = fy - y0 as f32;
+        for ox in 0..out_w {
+            let fx = ((ox as f32 + 0.5) * sx - 0.5).max(0.0);
+            let x0 = (fx.floor() as usize).min(in_w - 1);
+            let x1 = (x0 + 1).min(in_w - 1);
+            let wx = fx - x0 as f32;
+            for c in 0..3 {
+                let p = |y: usize, x: usize| rgb[(y * in_w + x) * 3 + c] as f32;
+                let top = p(y0, x0) * (1.0 - wx) + p(y0, x1) * wx;
+                let bot = p(y1, x0) * (1.0 - wx) + p(y1, x1) * wx;
+                out[(oy * out_w + ox) * 3 + c] = top * (1.0 - wy) + bot * wy;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bilinear_resize_rgb8_f32;
+
+    #[test]
+    fn host_bilinear_uses_half_pixel_centers_and_clamped_edges() {
+        let rgb = [0, 0, 0, 10, 10, 10, 20, 20, 20, 30, 30, 30];
+        let out = bilinear_resize_rgb8_f32(&rgb, 2, 2, 4, 4);
+        let at = |y: usize, x: usize| out[(y * 4 + x) * 3];
+        assert_eq!(at(0, 0), 0.0);
+        assert_eq!(at(1, 1), 7.5);
+        assert_eq!(at(2, 2), 22.5);
+        assert_eq!(at(3, 3), 30.0);
+        assert!(out.chunks_exact(3).all(|px| px[0] == px[1] && px[1] == px[2]));
+    }
 }

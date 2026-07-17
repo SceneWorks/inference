@@ -132,29 +132,10 @@ fn resize_control_rgb8(
     if in_h == out_h && in_w == out_w {
         return rgb.to_vec();
     }
-    let mut out = vec![0u8; out_h * out_w * 3];
-    let sx = in_w as f32 / out_w as f32;
-    let sy = in_h as f32 / out_h as f32;
-    for oy in 0..out_h {
-        let fy = ((oy as f32 + 0.5) * sy - 0.5).max(0.0);
-        let y0 = (fy.floor() as usize).min(in_h - 1);
-        let y1 = (y0 + 1).min(in_h - 1);
-        let wy = fy - y0 as f32;
-        for ox in 0..out_w {
-            let fx = ((ox as f32 + 0.5) * sx - 0.5).max(0.0);
-            let x0 = (fx.floor() as usize).min(in_w - 1);
-            let x1 = (x0 + 1).min(in_w - 1);
-            let wx = fx - x0 as f32;
-            for c in 0..3 {
-                let p = |y: usize, x: usize| rgb[(y * in_w + x) * 3 + c] as f32;
-                let top = p(y0, x0) * (1.0 - wx) + p(y0, x1) * wx;
-                let bot = p(y1, x0) * (1.0 - wx) + p(y1, x1) * wx;
-                out[(oy * out_w + ox) * 3 + c] =
-                    (top * (1.0 - wy) + bot * wy).round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-    out
+    util::bilinear_resize_rgb8_f32(rgb, in_h, in_w, out_h, out_w)
+        .into_iter()
+        .map(|value| value.round().clamp(0.0, 255.0) as u8)
+        .collect()
 }
 
 #[cfg(test)]
