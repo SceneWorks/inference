@@ -45,10 +45,6 @@ use crate::primitives::{input_ids, Weights};
 /// The registry id of the LLaVA provider.
 pub const PROVIDER_ID: &str = "candle-llava";
 
-/// Llama-3's end tokens (`<|end_of_text|>`, `<|eom_id|>`, `<|eot_id|>`) — the JoyCaption stop set,
-/// also a safe default for any Llama-3-tokenized LLaVA.
-pub const LLAMA3_STOP_TOKENS: &[i32] = &[128001, 128008, 128009];
-
 /// How the decoder selects rows from the vision tower's chosen hidden state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectStrategy {
@@ -428,12 +424,8 @@ impl LlavaProvider {
         let device = select_device().map_err(to_core)?;
         let model = LlavaModel::from_dir_with(dir, &device, requested).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+        // `eos_token_ids` always returns a non-empty model-specific set or the Llama-3 fallback.
         let stop_tokens = crate::provider::eos_token_ids(dir);
-        let stop_tokens = if stop_tokens.is_empty() {
-            LLAMA3_STOP_TOKENS.to_vec()
-        } else {
-            stop_tokens
-        };
         Ok(Self {
             descriptor: descriptor(),
             model,
