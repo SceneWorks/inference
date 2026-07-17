@@ -206,6 +206,89 @@ impl FaceAnalysis {
         Ok(self)
     }
 
+    /// **Test-only** degenerate instance (sc-12463): a weightless stack built from zero *scalar*
+    /// arrays for every key [`Scrfd::from_weights`] / [`ArcFace::from_weights`] `require` — the
+    /// loaders only clone arrays (no shape validation), so scalars suffice for an instance that
+    /// exists but is never forwarded. Mirrors `Flux1::new_for_tests` (mlx-gen-flux): consumers use
+    /// it to construct their full generator without any real weights and exercise pre-weight paths
+    /// (validation, capability floors). Any `detect`/`embed`/`analyze` call would fail on the first
+    /// conv shape mismatch. If a loader's key schema changes, this fixture fails loudly at
+    /// construction with the missing key — keep the enumeration below in lockstep.
+    pub fn new_for_tests() -> Result<Self> {
+        fn zeros(keys: Vec<String>) -> Weights {
+            let mut w = Weights::empty();
+            for k in keys {
+                w.insert(k, Array::from_f32(0.0));
+            }
+            w
+        }
+        fn conv(prefix: &str) -> [String; 2] {
+            [format!("{prefix}.weight"), format!("{prefix}.bias")]
+        }
+
+        // SCRFD schema (`Scrfd::from_weights`): stem + STAGE_BLOCKS [3,4,2,3] backbone (stages 2-4
+        // block 0 carry a downsample) + PAFPN neck + per-stride heads {8,16,32}.
+        let mut scrfd: Vec<String> = Vec::new();
+        for p in [
+            "stem.conv0",
+            "stem.conv1",
+            "stem.conv2",
+            "neck.lateral0",
+            "neck.lateral1",
+            "neck.lateral2",
+            "neck.fpn0",
+            "neck.fpn1",
+            "neck.fpn2",
+            "neck.down0",
+            "neck.down1",
+            "neck.pafpn0",
+            "neck.pafpn1",
+        ] {
+            scrfd.extend(conv(p));
+        }
+        for (l, nb) in [(1usize, 3usize), (2, 4), (3, 2), (4, 3)] {
+            for b in 0..nb {
+                scrfd.extend(conv(&format!("stage{l}.{b}.conv1")));
+                scrfd.extend(conv(&format!("stage{l}.{b}.conv2")));
+                if b == 0 && l > 1 {
+                    scrfd.extend(conv(&format!("stage{l}.{b}.downsample")));
+                }
+            }
+        }
+        for stride in [8, 16, 32] {
+            let p = format!("head{stride}");
+            scrfd.push(format!("{p}.scale"));
+            for c in ["stem0", "stem1", "stem2", "cls", "reg", "kps"] {
+                scrfd.extend(conv(&format!("{p}.{c}")));
+            }
+        }
+
+        // ArcFace schema (`ArcFace::from_weights`): LAYERS [3,13,30,3] IBasicBlocks (block 0 of
+        // each layer carries a downsample) + stem / bn2 / fc / features.
+        let mut arc: Vec<String> = vec!["stem.prelu.weight".into()];
+        arc.extend(conv("stem.conv"));
+        arc.extend(conv("fc"));
+        for a in ["bn2", "features"] {
+            arc.push(format!("{a}.scale"));
+            arc.push(format!("{a}.shift"));
+        }
+        for (l, nb) in [(1usize, 3usize), (2, 13), (3, 30), (4, 3)] {
+            for b in 0..nb {
+                let p = format!("layer{l}.{b}");
+                arc.push(format!("{p}.bn1.scale"));
+                arc.push(format!("{p}.bn1.shift"));
+                arc.push(format!("{p}.prelu.weight"));
+                arc.extend(conv(&format!("{p}.conv1")));
+                arc.extend(conv(&format!("{p}.conv2")));
+                if b == 0 {
+                    arc.extend(conv(&format!("{p}.downsample")));
+                }
+            }
+        }
+
+        Self::load(&zeros(scrfd), &zeros(arc))
+    }
+
     /// Detect every face in an RGB `u8` image and return the detections sorted **largest-first**
     /// (insightface `app.get()` order). No ArcFace recognition forward is run — consumers that need
     /// only the box/landmarks (e.g. InstantID's `restore_face`, or picking the largest face before
