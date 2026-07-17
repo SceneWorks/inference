@@ -38,7 +38,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, PerComponentBytes, Progress,
+    WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -73,21 +74,7 @@ impl Components {
     /// too — see the rationale below). The experimental fp16/bf16 paths are opt-in via `SVD_FORCE_F16` /
     /// `SVD_FORCE_BF16`.
     fn load(root: &Path, device: &Device) -> CResult<Self> {
-        // The UNet + image encoder run **f32** (the VAE always does). SVD ships an fp16 checkpoint, but
-        // the candle GPU dtype story is a tradeoff this provider can't yet square at fp16: fp16's narrow
-        // exponent range overflows to NaN in the deep spatio-temporal UNet (max-abs climbs to Inf at the
-        // last up-block — candle accumulates fp16 conv/matmul in fp16 where torch's cudnn/cublas use
-        // f32), while bf16's 8-bit mantissa is too coarse for the wide-σ (700→0.002) EDM denoise and
-        // collapses to noise. f32 is the only dtype that produces correct video today. The fp16 path with
-        // targeted f32-upcast of the overflowing ops (so native-res clips fit in VRAM) is the sc-5493
-        // GPU follow-up. `SVD_FORCE_F16` / `SVD_FORCE_BF16` reach those paths for that work.
-        let dense = if std::env::var("SVD_FORCE_F16").is_ok() {
-            DType::F16
-        } else if std::env::var("SVD_FORCE_BF16").is_ok() {
-            DType::BF16
-        } else {
-            DType::F32
-        };
+        let dense = dense_dtype();
         let vae = SvdVae::new(
             &VaeConfig::default(),
             component_vb(root, "vae", "diffusion_pytorch_model", DType::F32, device)?,
@@ -108,15 +95,39 @@ impl Components {
     }
 }
 
-/// Build a `VarBuilder` over a component subdir's safetensors, preferring the on-disk `.fp16` variant
-/// when loading at `DType::F16` (half the load IO).
-fn component_vb(
-    root: &Path,
-    sub: &str,
-    stem: &str,
-    dtype: DType,
-    device: &Device,
-) -> CResult<VarBuilder<'static>> {
+/// The dtype the UNet + image encoder load at.
+///
+/// The UNet + image encoder run **f32** (the VAE always does). SVD ships an fp16 checkpoint, but the
+/// candle GPU dtype story is a tradeoff this provider can't yet square at fp16: fp16's narrow exponent
+/// range overflows to NaN in the deep spatio-temporal UNet (max-abs climbs to Inf at the last up-block —
+/// candle accumulates fp16 conv/matmul in fp16 where torch's cudnn/cublas use f32), while bf16's 8-bit
+/// mantissa is too coarse for the wide-σ (700→0.002) EDM denoise and collapses to noise. f32 is the only
+/// dtype that produces correct video today. The fp16 path with targeted f32-upcast of the overflowing ops
+/// (so native-res clips fit in VRAM) is the sc-5493 GPU follow-up. `SVD_FORCE_F16` / `SVD_FORCE_BF16`
+/// reach those paths for that work.
+///
+/// Read by BOTH the load path and [`component_footprint`], so the footprint sizes the file the loader
+/// will actually pick — including under the env escapes (sc-12397).
+fn dense_dtype() -> DType {
+    if std::env::var("SVD_FORCE_F16").is_ok() {
+        DType::F16
+    } else if std::env::var("SVD_FORCE_BF16").is_ok() {
+        DType::BF16
+    } else {
+        DType::F32
+    }
+}
+
+/// Resolve the ONE `.safetensors` a component loads, preferring the on-disk `.fp16` variant when loading
+/// at [`DType::F16`] (half the load IO), else the full-precision file.
+///
+/// **The single source of truth for which file a component reads** — [`component_vb`] mmaps whatever this
+/// returns and [`component_footprint`] sizes it (sc-12397). Keeping the selection here is the whole point:
+/// the upstream `stabilityai/stable-video-diffusion-img2vid-xt` snapshot ships `{stem}.safetensors` AND
+/// `{stem}.fp16.safetensors` side by side in every component dir, so a consumer that sums the DIRECTORY
+/// roughly DOUBLES the model and can false-reject a card that runs it fine. Only the provider knows which
+/// of the pair loads, which is exactly what `gen_core::PerComponentBytes` exists to let it say.
+fn component_file(root: &Path, sub: &str, stem: &str, dtype: DType) -> CResult<PathBuf> {
     let dir = root.join(sub);
     if !dir.is_dir() {
         return Err(CandleError::Msg(format!(
@@ -127,21 +138,70 @@ fn component_vb(
     }
     let fp16 = dir.join(format!("{stem}.fp16.safetensors"));
     let full = dir.join(format!("{stem}.safetensors"));
-    let path = if dtype == DType::F16 && fp16.exists() {
-        fp16
+    if dtype == DType::F16 && fp16.exists() {
+        Ok(fp16)
     } else if full.exists() {
-        full
+        Ok(full)
     } else if fp16.exists() {
-        fp16
+        Ok(fp16)
     } else {
-        return Err(CandleError::Msg(format!(
+        Err(CandleError::Msg(format!(
             "svd_xt: no {stem}.safetensors in {sub}/ (at {})",
             dir.display()
-        )));
-    };
+        )))
+    }
+}
+
+/// Build a `VarBuilder` over the component file [`component_file`] resolves.
+fn component_vb(
+    root: &Path,
+    sub: &str,
+    stem: &str,
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    let path = component_file(root, sub, stem, dtype)?;
     // Shared audited unsafe-mmap surface (sc-8999 / F-019). The `{stem}.fp16`/`.safetensors`
-    // resolution above is a genuine per-site variation, so only the mmap is shared.
+    // resolution is a genuine per-site variation, so only the mmap is shared.
     candle_gen::mmap_var_builder(&[path], dtype, device)
+}
+
+/// The provider-owned per-component on-disk footprint (sc-12397, epic 1788) — the size of the exact
+/// files [`Components::load`] will mmap, NOT a directory sum.
+///
+/// Lets a pre-load fit gate size an SVD job honestly. The consumer (`sceneworks-worker`'s candle video
+/// VRAM gate) cannot compute this itself: each component dir ships both a full-precision and an `.fp16`
+/// file, and only this crate knows the [`dense_dtype`] + [`component_file`] rules that pick one.
+///
+/// Mapping onto [`PerComponentBytes`]' three slots: `text_encoder` = the OpenCLIP ViT-H **image**
+/// encoder. SVD is image-conditioned and has no prompt encoder, but `image_encoder/` is the phase-A
+/// conditioning encoder — it runs once over the driving frame before the denoise — which is the slot's
+/// role. It is NOT a claim that the component is droppable: this engine advertises
+/// `supports_sequential_offload: false`, so no staged residency is ever selected for it.
+///
+/// A component whose file cannot be resolved contributes `0` rather than erroring: the footprint is a
+/// pre-load ADMISSION signal, and reporting no signal (⇒ the caller admits) is always safer than
+/// refusing a job over an unreadable path. `Components::load` reports the real error moments later.
+pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerComponentBytes> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(p) => p
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| p.clone()),
+    };
+    let dense = dense_dtype();
+    let bytes = |sub: &str, stem: &str, dtype: DType| -> u64 {
+        component_file(&root, sub, stem, dtype)
+            .map(gen_core::safetensors_path_bytes)
+            .unwrap_or(0)
+    };
+    Ok(PerComponentBytes {
+        text_encoder: bytes("image_encoder", "model", dense),
+        dit: bytes("unet", "diffusion_pytorch_model", dense),
+        // The VAE always loads f32 (`force_upcast=True`), regardless of the dense dtype.
+        vae: bytes("vae", "diffusion_pytorch_model", DType::F32),
+    })
 }
 
 /// Upper bound on a `Reference` image's dimensions (caps host allocations on the input buffer + the
@@ -526,7 +586,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
-candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
+candle_gen::register_generators! {
+    pub(crate) const REGISTRATION = descriptor => load;
+    footprint = component_footprint
+}
 
 /// Add the Candle SVD provider to an explicit media registry builder.
 pub fn register_providers(
@@ -651,5 +714,68 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/w.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("checkpoint directory"), "got: {err}");
+    }
+
+    /// sc-12397: the footprint must size the ONE file per component that [`component_vb`] mmaps — NOT the
+    /// directory.
+    ///
+    /// This is the whole reason SVD owns its own footprint rather than letting the consumer sum subdirs.
+    /// The upstream `stabilityai/stable-video-diffusion-img2vid-xt` snapshot ships `X.safetensors` AND
+    /// `X.fp16.safetensors` side by side in every component dir, so a directory sum roughly DOUBLES a
+    /// ~8.9 GiB model — enough for a pre-load VRAM gate to false-reject a card that renders it fine today.
+    ///
+    /// Kills the mutation that matters: swapping `component_file` for a `safetensors_dir_bytes(dir)` sum
+    /// makes every field here read `full + fp16` and the assert fails.
+    #[test]
+    fn component_footprint_sizes_the_selected_file_not_the_whole_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "sc12397_svd_footprint_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        // Both dtype variants side by side, as the real snapshot ships them.
+        for (sub, stem, full, fp16) in [
+            ("unet", "diffusion_pytorch_model", 6_000_u64, 3_000_u64),
+            ("vae", "diffusion_pytorch_model", 400, 200),
+            ("image_encoder", "model", 2_500, 1_250),
+        ] {
+            let dir = root.join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, len) in [
+                (format!("{stem}.safetensors"), full),
+                (format!("{stem}.fp16.safetensors"), fp16),
+            ] {
+                std::fs::File::create(dir.join(name))
+                    .unwrap()
+                    .set_len(len)
+                    .unwrap();
+            }
+        }
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let fp = component_footprint(&spec).expect("footprint");
+        // Default dtype is F32 ⇒ every component takes the FULL file, never the fp16 sibling…
+        assert_eq!(fp.dit, 6_000, "unet: the f32 file, not full+fp16 (9_000)");
+        assert_eq!(fp.vae, 400, "vae: always f32");
+        assert_eq!(fp.text_encoder, 2_500, "image_encoder: the f32 file");
+        // …so the total is the load, not the directory. A dir sum would read 13_350.
+        assert_eq!(fp.text_encoder + fp.dit + fp.vae, 8_900);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A component the loader cannot resolve contributes `0`, and never errors: the footprint is a
+    /// pre-load ADMISSION signal, so "no signal" (⇒ the caller admits) beats refusing a job over an
+    /// unreadable path. `Components::load` surfaces the real error moments later.
+    #[test]
+    fn component_footprint_reports_no_signal_rather_than_failing() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-svd-snapshot".into()));
+        let fp = component_footprint(&spec).expect("a missing snapshot is not a footprint error");
+        assert_eq!(
+            (fp.text_encoder, fp.dit, fp.vae),
+            (0, 0, 0),
+            "an unreadable snapshot must read as no signal"
+        );
     }
 }
