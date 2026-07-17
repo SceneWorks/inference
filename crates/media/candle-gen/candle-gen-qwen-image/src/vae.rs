@@ -234,6 +234,8 @@ const TAIL_TILING: VaeTiling = VaeTiling {
     spatial_scale: 8,
     temporal_scale: 1,
     causal_temporal: false,
+    // 96 ch at full resolution. At T=1 this cannot approach MAX_WRITABLE_ELEMS below ~4730x4730.
+    full_res_channels: 96,
 };
 
 /// The Qwen-Image VAE (decode-only).

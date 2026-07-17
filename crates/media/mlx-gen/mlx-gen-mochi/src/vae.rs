@@ -36,25 +36,35 @@ const GROUP_NORM_EPS: f32 = 1e-5;
 /// `MochiChunkedGroupNorm3D` group count.
 const NUM_GROUPS: i32 = 32;
 
-/// The element-count ceiling for a single decode intermediate.
+/// The element-count bound for a single decode intermediate, above which this decoder is **measured to
+/// produce wrong pixels** and therefore refuses to run.
 ///
-/// **Measured (sc-12291), not assumed:** on real AsymmVAE weights at 848×480 an untiled decode is exact
-/// through `T_lat = 6` (`block_out` = 1.88e9 elements) and silently returns *wrong values* — no error,
-/// deterministically — from `T_lat = 7` (2.19e9) on. The break sits exactly on `i32::MAX`, so MLX is
-/// evidently indexing these tensors with 32-bit arithmetic somewhere below the Rust API. The failure is
-/// invisible to the `vae_parity` golden, which is dumped at 64×64/7 frames (6.3e6 elements, ~340× under
-/// the ceiling); the shipped 848×480/151-frame default is 8.13e9 elements, ~3.8× **over** it.
+/// **What is measured** (sc-12291, real AsymmVAE weights, 848×480): an untiled decode is exact through
+/// `T_lat = 6` (`block_out` = 1.88e9 elements) and silently returns wrong values — no error,
+/// deterministically, two runs byte-identical — from `T_lat = 7` (2.19e9) on: ±2.67 where a valid video
+/// is ~[-1, 1]. The chunked decode returns ±0.50 on the same latents. The boundary falls on `i32::MAX`.
 ///
-/// Chunking keeps every intermediate far below this line ([`DEFAULT_DECODE_CHUNK_FRAMES`] → 4.2e8 at
-/// 848×480, ~5× under), which is why the chunked decode is not merely cheaper but *correct where the
-/// untiled one is not*. The guards built on this constant make the failure an error, not a silent one.
+/// **What is NOT established: the mechanism.** Do not read this constant as "MLX is wrong above 2^31
+/// elements" — a direct probe contradicts that. A 3×3×3 `conv3d` over a 2.19e9-element input is
+/// *correct*, while an elementwise op over a tensor of exactly `block_out`'s T_lat=7 size
+/// (2,188,247,040) disagrees with the same computation done in halves. The decoder's silu / residual
+/// adds run elementwise at exactly that size, which fits — but "which op, and why" is open, and the
+/// probe's reading at 2× the bound is untrustworthy because the comparison is itself that large.
+/// So: an **empirical safety bound for this decoder**, not a characterized MLX law. sc-12349 carries
+/// the open characterization and the (currently unevidenced) repo-wide question.
+///
+/// The failure is invisible to the `vae_parity` golden, dumped at 64×64/7 frames (6.3e6 elements, ~340×
+/// under); the shipped 848×480/151-frame default is 8.13e9, ~3.8× **over**. Chunking keeps every
+/// intermediate far below the line ([`DEFAULT_DECODE_CHUNK_FRAMES`] → 4.2e8 at 848×480, ~5× under),
+/// which is why the chunked decode is not merely cheaper but *correct where the untiled one is not*.
+/// The guards built on this constant make the failure an error rather than a silent one.
 const MAX_TENSOR_ELEMS: i64 = i32::MAX as i64;
 
 /// Latent frames per chunk for [`MochiVaeDecoder::decode_chunked`].
 ///
 /// The decode peak is dominated by `block_out`, which runs 128 channels at the **full** output
 /// resolution, so the working set scales with the chunk. **Measured** (848×480/151 frames, real
-/// weights, `get_peak_memory`, VAE weights included):
+/// weights, `get_peak_memory`, VAE weights included, one warm process):
 ///
 /// | chunk | decode peak |
 /// |---|---|
@@ -64,12 +74,21 @@ const MAX_TENSOR_ELEMS: i64 = i32::MAX as i64;
 ///
 /// 1 is the floor, and this knob exists to lower the floor: ~13 GiB below chunk=2 is the difference
 /// between Mochi fitting a 64 GB Mac with room and fitting it barely. A larger chunk trades that back
-/// for fewer per-chunk syncs; raise it if decode wall-clock ever matters more than reach. Whatever the
-/// value, the peak stays ~flat in clip length (37.08→37.75 GiB over 19→163 frames at chunk=2) — that
-/// flatness, not the absolute number, is what [`decode_denormalized_chunked`] buys.
+/// for fewer per-chunk syncs; raise it if decode wall-clock ever matters more than reach.
+///
+/// The point is the **flatness in clip length**, not the absolute number. Measured at chunk=1 in a cold
+/// process (`decode_peak_is_flat_in_clip_length`):
+///
+/// | frames | 19 | 61 | 151 | 163 |
+/// |---|---|---|---|---|
+/// | peak GiB | 23.09 | 23.28 | 23.70 | 23.75 |
+/// | secs | 16.8 | 45.2 | 127.4 | 427.2 |
+///
+/// 8.6× the frames for 1.03× the memory. (23.70 vs the table's 24.70 at 151 frames is process warmth —
+/// the sweep above shares one process; treat ~24 GiB as the figure and the 1.03× as the claim.)
 ///
 /// `decode_denormalized_chunked` clamps this to [`MochiVaeDecoder::max_safe_chunk_frames`] (6 at
-/// 848×480), above which MLX silently corrupts — see [`MAX_TENSOR_ELEMS`].
+/// 848×480), above which this decoder is measured to return wrong pixels — see [`MAX_TENSOR_ELEMS`].
 pub const DEFAULT_DECODE_CHUNK_FRAMES: usize = 1;
 
 /// Per-conv temporal cache threaded through a chunked decode: each slot holds the last `kt−1` frames

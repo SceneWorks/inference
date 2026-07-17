@@ -181,8 +181,13 @@ pub fn safe_budget_gib(env_var: &str, safe_frac: f64, default_gib: f64) -> f64 {
 /// `Ok(None)` → a single-pass decode already fits the budget; `Ok(Some(cfg))` → the largest tiling
 /// that fits; `Err` → an over-budget signal returned **before** the decode (a catchable error, not an
 /// OOM). This is the generic form of the identical `plan_wan22_tiling` / `plan_ltx_tiling` bodies.
+///
+/// `vae` carries the decoder's geometry **and** its `full_res_channels`, which bounds how much a single
+/// pass may write — a correctness limit the memory budget cannot see. See `budgeted_plan`.
+#[allow(clippy::too_many_arguments)] // label + vae + 3 dims + budget + candidates + cost model
 pub fn plan_tiling<F>(
     label: &str,
+    vae: VaeTiling,
     height: i32,
     width: i32,
     out_frames: i32,
@@ -193,7 +198,16 @@ pub fn plan_tiling<F>(
 where
     F: Fn(i64, i64, i64, i64, i64, i64) -> f64,
 {
-    budgeted_plan(height, width, out_frames, safe_gib, candidates, cost_fn).map_err(|e| match e {
+    budgeted_plan(
+        vae,
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        cost_fn,
+    )
+    .map_err(|e| match e {
         TilingBudgetError::AccumulatorsExceedBudget {
             projected_gib,
             safe_gib,
@@ -283,22 +297,32 @@ mod tests {
             temporal: &FR,
         };
 
+        // This test is about the MEMORY selector, so use a VAE narrow enough that the write bound
+        // (`MAX_WRITABLE_ELEMS`) never binds at these geometries — otherwise it would decide the
+        // outcome and the budget arithmetic below would go untested. A real 96-channel VAE at 1024²
+        // caps at 21 output frames, so `VaeTiling::WAN` here would (correctly) tile regardless of
+        // budget; the write bound has its own coverage in `gen_core::tiling`.
+        let narrow = VaeTiling {
+            full_res_channels: 1,
+            ..VaeTiling::WAN
+        };
+
         // For 1024²×49: accumulator floor (zero tile) ≈ 0.48 GiB; single-pass ≈ 1.46 GiB. So a
         // budget above single-pass returns None; between floor and single-pass forces a spatial tile;
         // below the floor is a catchable Err.
         // Huge budget → single-pass fits → None.
-        let none = plan_tiling("t", 1024, 1024, 49, 1e6, cand(), cost).unwrap();
+        let none = plan_tiling("t", narrow, 1024, 1024, 49, 1e6, cand(), cost).unwrap();
         assert!(none.is_none(), "huge budget should not tile");
 
         // Between the accumulator floor and single-pass → tiles (Some, spatial set, no temporal).
-        let some = plan_tiling("t", 1024, 1024, 49, 1.0, cand(), cost)
+        let some = plan_tiling("t", narrow, 1024, 1024, 49, 1.0, cand(), cost)
             .unwrap()
             .expect("mid budget must tile");
         assert!(some.spatial.is_some());
         assert!(some.temporal.is_none(), "no temporal candidates supplied");
 
         // Impossible budget (accumulator floor alone exceeds it) → catchable Err, not a panic/OOM.
-        assert!(plan_tiling("t", 4096, 4096, 257, 0.001, cand(), cost).is_err());
+        assert!(plan_tiling("t", narrow, 4096, 4096, 257, 0.001, cand(), cost).is_err());
     }
 
     #[test]

@@ -9,16 +9,18 @@
 //! **Two things it pins that no golden can.** The `vae_parity` golden is dumped at 64×64/7 frames
 //! (6.3e6 elements); production is 848×480/151 frames (8.13e9). That gap hid a real bug:
 //!  1. the untiled decode's peak grows with clip length (the story's premise), and
-//!  2. above `i32::MAX` elements per tensor MLX silently returns *wrong pixels* — so the untiled decode
-//!     is only correct through `T_lat = 6` (31 frames, ~1 s) at 848×480. See sc-12349.
+//!  2. the untiled decode returns *wrong pixels* past `T_lat = 6` (31 frames, ~1 s) at 848×480 — the
+//!     boundary where `block_out` crosses `i32::MAX` elements. The mechanism is **not** established
+//!     (a conv3d at that size is fine; an elementwise op at exactly that size is not), so treat it as
+//!     a measured property of this decoder, not an MLX law. See sc-12349.
 //!
 //! Measured 2026-07-16 on an M5 Max / 137 GB (MLX limit 121.6 GiB), 848×480, f32:
 //!
 //! | path | 19 f | 61 f | 151 f | 163 f |
 //! |---|---|---|---|---|
-//! | untiled | 65.21 | 145.89 | *(wrong pixels — over the element ceiling)* | *(wrong)* |
-//! | chunked (chunk=1) | — | — | **24.70** | — |
-//! | chunked (chunk=2) | 37.08 | 37.25 | 37.69 | 37.75 |
+//! | untiled | 65.21 | 145.89 | *(wrong pixels — past the bound)* | *(wrong)* |
+//! | chunked (chunk=1, cold) | 23.09 | 23.28 | **23.70** | 23.75 |
+//! | chunked (chunk=2, warm) | 37.08 | 37.25 | 37.69 | 37.75 |
 //!
 //! ⚠️ **These allocate tens of GiB and can SIGKILL the host.** The untiled arm costs ~11.5 GiB per
 //! latent frame and is deliberately capped at [`MAX_UNTILED_T_LAT`] (~65 GiB); even so, run them
@@ -212,13 +214,13 @@ fn chunked_matches_untiled_on_real_weights() {
 }
 
 /// **The chunked decode is correct where the untiled one cannot even be attempted** (sc-12349). A 5 s
-/// clip (T_lat 26) is 8.13e9 elements untiled — 3.8× over the ceiling — so `decode_denormalized`
-/// refuses it, while the chunked path decodes it to a sane video.
+/// clip (T_lat 26) is 8.13e9 elements untiled — 3.8× past the bound — so `decode_denormalized` refuses
+/// it, while the chunked path decodes it to a sane video.
 ///
-/// This is the *reachable* half of the ceiling finding. The raw corruption (untiled at T_lat 7 →
-/// ±2.67 instead of ±0.50) is no longer observable through the public API precisely because the guard
-/// now refuses it, and reproducing it costs ~111 GiB — see sc-12349, which carries the measurement and
-/// the method for re-checking it against a future MLX bump (temporarily drop the guard).
+/// This is the *reachable* half of the finding. The raw corruption (untiled at T_lat 7 → ±2.67 instead
+/// of ±0.50) is no longer observable through the public API precisely because the guard now refuses it,
+/// and reproducing it costs ~111 GiB — see sc-12349, which carries the measurement and the method for
+/// re-checking it against a future MLX bump (temporarily drop the guard).
 #[test]
 #[ignore = "needs $MOCHI_SNAPSHOT (real AsymmVAE weights) + a large-memory Metal Mac"]
 fn untiled_refuses_the_shipped_default_that_chunked_decodes() {
