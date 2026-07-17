@@ -25,6 +25,7 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::imageops::{resize_bicubic_u8, resize_lanczos_u8};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::quant::Int8Context;
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::PidEngine;
 use candle_gen_qwen_image::vae::QwenVae;
@@ -394,12 +395,17 @@ pub fn load_components_convrot(
     convrot_dit: &Path,
     device: &Device,
 ) -> Result<Components> {
-    ensure_int8_floor(device)?;
+    // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
+    // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
+    // building 32 MiB of workspace, reading two integers off it, and dropping it.
+    let int8 = ensure_int8_floor(device)?;
 
     let text = load_text(root, device)?;
 
     let cfg = Krea2Config::from_snapshot(root)?;
-    let dit_w = Weights::from_convrot_file(convrot_dit, device, DIT_DTYPE)?;
+    // Seeded with the floor probe's handle: every int8 projection `Krea2Transformer::load` detects below
+    // shares this ONE handle rather than building its own (the sc-12301 defect).
+    let dit_w = Weights::from_convrot_file(convrot_dit, device, DIT_DTYPE)?.with_int8_context(int8);
     crate::convert::validate_transformer(&dit_w, &cfg)?;
     let dit = Krea2Transformer::load(&dit_w, &cfg)?;
 
@@ -417,14 +423,23 @@ pub fn load_components_convrot(
     })
 }
 
-/// Enforce the INT8-ConvRot sm_89 compute-capability floor (locked decision 7). Reuses the sc-9299
-/// cuBLASLt compute-cap probe (`meets_fp8_floor` ⇔ capability ≥ 8.9). A non-CUDA device is allowed (the
-/// CPU dequant path is test-only). On CUDA below the floor this errors with the marketing contract.
+/// Enforce the INT8-ConvRot sm_89 compute-capability floor (locked decision 7), **returning the handle
+/// the probe had to build** as the trunk's shared [`Int8Context`] (sc-12301 scope 5).
+///
+/// Reuses the sc-9299 cuBLASLt compute-cap probe (`meets_fp8_floor` ⇔ capability ≥ 8.9). A non-CUDA
+/// device is allowed and yields an empty context (the CPU dequant path is test-only). On CUDA below the
+/// floor this errors with the marketing contract — and the handle is dropped with the context, since no
+/// projection will be built.
+///
+/// The floor stays **sm_89 and stays here**: `Int8Context::new` deliberately does not gate on it, so the
+/// context type is reusable by any int8 caller, and reusing NVFP4's sm_120 `Nvfp4Context` would wrongly
+/// deny int8 on sm_89..sm_120 cards.
 #[cfg(feature = "cuda")]
-fn ensure_int8_floor(device: &Device) -> Result<()> {
+fn ensure_int8_floor(device: &Device) -> Result<Int8Context> {
+    let ctx = Int8Context::new(device)
+        .map_err(|e| CandleError::Msg(format!("krea convrot: cublasLt probe: {e}")))?;
     if device.is_cuda() {
-        let lt = candle_gen::quant::CublasLt::new(device)
-            .map_err(|e| CandleError::Msg(format!("krea convrot: cublasLt probe: {e}")))?;
+        let lt = ctx.handle_for(device)?;
         if !lt
             .meets_fp8_floor()
             .map_err(|e| CandleError::Msg(format!("krea convrot: compute-cap probe: {e}")))?
@@ -437,13 +452,14 @@ fn ensure_int8_floor(device: &Device) -> Result<()> {
             )));
         }
     }
-    Ok(())
+    Ok(ctx)
 }
 
-/// Non-CUDA build: the int8 floor is vacuous (the CPU dequant-dense fallback is test-only).
+/// Non-CUDA build: the int8 floor is vacuous (the CPU dequant-dense fallback is test-only), and the
+/// shared context is empty — there is no handle to share.
 #[cfg(not(feature = "cuda"))]
-fn ensure_int8_floor(_device: &Device) -> Result<()> {
-    Ok(())
+fn ensure_int8_floor(_device: &Device) -> Result<Int8Context> {
+    Ok(Int8Context::none())
 }
 
 /// Render the **Turbo** (CFG-free, few-step rectified-flow Euler) text-to-image path for `req`.

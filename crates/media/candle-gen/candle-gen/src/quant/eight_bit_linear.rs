@@ -10,6 +10,13 @@
 //!
 //! Both are `#[cfg(feature = "cuda")]` — they own a `CublasLt` handle. The weight-quant / act-quant
 //! helpers they build on are pure candle ops (see [`super::cublaslt`]) and compile everywhere.
+//!
+//! **Both take their handle by injection** (`Arc<CublasLt>`) — deliberately, so a trunk loader can build
+//! **one** handle and share it across all ~224 int8 projections instead of paying its eager 32 MiB
+//! workspace per layer. [`Int8Context`](super::cublaslt::Int8Context) is that shared handle; it lives in
+//! [`super::cublaslt`] rather than here because this module is cuda-only while the context must be
+//! cfg-neutral. `from_device` below is the private-handle convenience twin — correct for a one-off layer
+//! or a test, **wrong in a loader** (sc-12301, and sc-12274 for the NVFP4 lane: 32.00 MiB × N).
 
 use super::cublaslt::{
     quantize_activation_fp8, quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
