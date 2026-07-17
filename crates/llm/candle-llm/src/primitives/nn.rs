@@ -130,11 +130,6 @@ pub fn input_ids_batch(rows: &[&[i32]], device: &Device) -> Result<Tensor> {
     Ok(Tensor::from_vec(flat, (batch, len), device)?)
 }
 
-/// Convert a logits/last-position `Tensor` to a host `f32` vector (e.g. for host-side sampling).
-pub fn to_f32_host(x: &Tensor) -> Result<Vec<f32>> {
-    Ok(x.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
