@@ -179,12 +179,13 @@ impl CheckpointMeta {
 /// bytes (the few-KB header overhead is negligible for a memory budget), touches no tensor data, and
 /// makes **zero** MLX allocation.
 ///
-/// Symlinks are followed (the HF cache stores each shard as a symlink into `blobs/`, so `metadata()` —
-/// which follows the link — is used for both the kind check and the length). AppleDouble `._*` sidecars
-/// and other hidden entries are skipped ([`is_hidden_file`]) — a `._model.safetensors` masquerades as a
-/// shard and would double-count. Returns `0` when `dir` is missing or holds no weights, so an absent
-/// component contributes nothing. This is the same accounting the worker's whole-model sum uses, so a
-/// component's bytes and the whole-model total stay directly comparable (`rest = total − text_encoder`).
+/// File symlinks are followed (the HF cache stores each shard as a symlink into `blobs/`), while
+/// directory symlinks are skipped to prevent a malformed snapshot from creating a recursive cycle.
+/// AppleDouble `._*` sidecars and other hidden entries are skipped ([`is_hidden_file`]) — a
+/// `._model.safetensors` masquerades as a shard and would double-count. Returns `0` when `dir` is
+/// missing or holds no weights, so an absent component contributes nothing. This is the same
+/// accounting the worker's whole-model sum uses, so a component's bytes and the whole-model total
+/// stay directly comparable (`rest = total − text_encoder`).
 pub fn safetensors_dir_bytes(dir: impl AsRef<Path>) -> u64 {
     fn walk(dir: &Path, total: &mut u64) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -192,12 +193,19 @@ pub fn safetensors_dir_bytes(dir: impl AsRef<Path>) -> u64 {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            // `metadata()` follows symlinks (HF blobs); resolve the target kind + length through it.
+            // Recurse only into real directories. `metadata()` still follows file symlinks so HF blob
+            // links contribute their target length, but a directory link cannot form a cycle here.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                walk(&path, total);
+                continue;
+            }
             let Ok(meta) = std::fs::metadata(&path) else {
                 continue;
             };
             if meta.is_dir() {
-                walk(&path, total);
                 continue;
             }
             let is_safetensors = path
@@ -935,6 +943,26 @@ mod tests {
         assert_eq!(safetensors_dir_bytes(root.join("transformer")), 2000);
         // Missing dir ⇒ 0 (no signal).
         assert_eq!(safetensors_dir_bytes(root.join("nope")), 0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safetensors_dir_bytes_skips_directory_symlink_cycles_but_follows_file_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("gencore_dirbytes_cycle_{}", std::process::id()));
+        let blobs = root.join("blobs");
+        let model = root.join("model");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(blobs.join("weight"), vec![0u8; 123]).unwrap();
+        symlink(blobs.join("weight"), model.join("model.safetensors")).unwrap();
+        symlink(&root, model.join("cycle")).unwrap();
+
+        assert_eq!(safetensors_dir_bytes(&root), 123);
 
         std::fs::remove_dir_all(&root).ok();
     }
