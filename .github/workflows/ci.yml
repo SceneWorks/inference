@@ -202,11 +202,18 @@ jobs:
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos
-      - name: Check Candle Metal packages
+      # The metal twin of the cuda gate on `windows-cuda-check`. This was a bare `cargo check` and so
+      # had two holes, both of the sc-11990 shape: it never linted `#[cfg(feature = "metal")]` code
+      # (no lane passes --features metal to Clippy), and without --all-targets it did not even
+      # *compile* metal-gated test targets — which is exactly where that story's break lived. The
+      # cuda twin found four such breaks the moment it was switched on (sc-12379), all in cfg-gated
+      # test targets no lane had ever compiled. Keep this package set aligned with the CPU and cuda
+      # Clippy lanes.
+      - name: Clippy Candle Metal packages
         run: >-
-          cargo check --locked
+          cargo clippy --locked
           -p candle-llm -p 'candle-gen*'
-          --features metal
+          --all-targets --features metal -- -D warnings
 
   macos-nax:
     name: runtime-macos NAX (macOS 26.2, manual)
