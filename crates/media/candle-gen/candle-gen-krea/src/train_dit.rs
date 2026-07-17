@@ -51,7 +51,7 @@ use candle_gen::quant::QLinear as SharedQLinear;
 use crate::loader::{linear, rms_scale_weight, Weights};
 use crate::transformer::block::{RmsScale, SwiGlu, TextFusionTransformer};
 use crate::transformer::rope::{apply_interleaved_rope, RopeTables};
-use crate::transformer::{patchify, temb, unpatchify};
+use crate::transformer::{patchify, temb, unpatchify, RopeCache, ROPE_CACHE_CAP};
 
 /// Default LoRA target suffixes — the single-stream blocks' attention projections (`to_out.0` is the
 /// first element of diffusers' `to_out` `ModuleList`, so the suffix literally carries the `.0`). With
@@ -392,6 +392,9 @@ pub struct KreaTrainDit {
     final_norm: Tensor, // f32, scale + 1
     final_linear: LoraLinear,
     final_sstable: Tensor, // [1, 2, hidden]
+    /// The control/training front-end sees fixed `(caption, height, width)` geometry throughout a
+    /// denoise loop, so share the same bounded RoPE cache used by the inference DiT.
+    rope_cache: RopeCache<(usize, usize, usize), (Tensor, Tensor)>,
 }
 
 impl KreaTrainDit {
@@ -467,6 +470,21 @@ impl KreaTrainDit {
             final_norm: rms_scale_weight(w, "final_layer.norm.weight")?,
             final_linear: proj(w, "final_layer.linear", true)?,
             final_sstable,
+            rope_cache: RopeCache::new(ROPE_CACHE_CAP),
+        })
+    }
+
+    fn rope_tables(&self, cap_len: usize, ht: usize, wt: usize) -> Result<(Tensor, Tensor)> {
+        self.rope_cache.get_or_build((cap_len, ht, wt), || {
+            let rope = RopeTables::build_t2i(
+                cap_len,
+                ht,
+                wt,
+                self.cfg.axes_dims_rope,
+                self.cfg.rope_theta as f64,
+                &self.device,
+            )?;
+            Ok(rope.joint())
         })
     }
 
@@ -506,15 +524,7 @@ impl KreaTrainDit {
             .forward(&self.txt_in_l1.forward(&ctx)?.gelu()?)?;
 
         let combined = Tensor::cat(&[&ctx, &img], 1)?;
-        let rope = RopeTables::build_t2i(
-            cap_len,
-            ht,
-            wt,
-            cfg.axes_dims_rope,
-            cfg.rope_theta as f64,
-            &self.device,
-        )?;
-        let (rcos, rsin) = rope.joint();
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt)?;
         Ok((
             combined,
             MainCtx {
@@ -661,5 +671,44 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
          down) across the single-stream transformer_blocks and text_fusion blocks, plus the front-end \
          (img_in|time_embed.linear_1/2|txt_in.linear_1/2|final_layer.linear) projections. The pose \
          control branch is never adapted; conv-layer / text-encoder adapters are out of surface"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn control_rope_cache_builds_once_and_matches_fresh_tables() -> Result<()> {
+        let dev = Device::Cpu;
+        let key = (3usize, 2usize, 2usize);
+        let axes = [4usize, 6usize, 6usize];
+        let cache: RopeCache<(usize, usize, usize), (Tensor, Tensor)> =
+            RopeCache::new(ROPE_CACHE_CAP);
+        let builds = Cell::new(0usize);
+        let build = || {
+            builds.set(builds.get() + 1);
+            Ok(RopeTables::build_t2i(key.0, key.1, key.2, axes, 1000.0, &dev)?.joint())
+        };
+
+        let first = cache.get_or_build(key, build)?;
+        let second = cache.get_or_build(key, build)?;
+        let fresh = RopeTables::build_t2i(key.0, key.1, key.2, axes, 1000.0, &dev)?.joint();
+
+        assert_eq!(builds.get(), 1, "fixed denoise geometry must build once");
+        assert_eq!(
+            first.0.flatten_all()?.to_vec1::<f32>()?,
+            fresh.0.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            first.1.flatten_all()?.to_vec1::<f32>()?,
+            fresh.1.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            second.0.flatten_all()?.to_vec1::<f32>()?,
+            first.0.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
     }
 }
