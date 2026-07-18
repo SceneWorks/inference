@@ -76,6 +76,7 @@ fn render_and_measure(
     model_dir: &std::path::Path,
     model_id: &str,
     policy: OffloadPolicy,
+    sampler: &str,
     conditioning: Vec<Conditioning>,
 ) -> (Vec<Image>, usize) {
     let gen = mlx_gen_wan::provider_registry()
@@ -94,7 +95,7 @@ fn render_and_measure(
         frames: Some(5),
         steps: Some(6),
         seed: Some(42),
-        sampler: Some("unipc".into()),
+        sampler: Some(sampler.into()),
         conditioning,
         ..Default::default()
     };
@@ -178,15 +179,46 @@ fn t2v_expert_swap_drops_the_peak_and_preserves_output() {
         &model_dir,
         MODEL_ID_T2V_14B,
         OffloadPolicy::Resident,
+        "unipc",
         vec![],
     );
     let seq = render_and_measure(
         &model_dir,
         MODEL_ID_T2V_14B,
         OffloadPolicy::Sequential,
+        "unipc",
         vec![],
     );
     assert_swap_wins("t2v", &res, &seq);
+}
+
+#[test]
+#[ignore = "needs a converted Wan2.2-T2V-A14B snapshot tier (WAN_A14B_MODEL_DIR); GPU-heavy"]
+fn t2v_curated_heun_swap_drops_the_peak_and_preserves_output() {
+    let model_dir = match env_path("WAN_A14B_MODEL_DIR") {
+        Some(p) => p,
+        None => {
+            eprintln!("skip: set WAN_A14B_MODEL_DIR to a converted T2V-A14B snapshot tier dir");
+            return;
+        }
+    };
+    // Heun evaluates twice per non-terminal step. A boundary-straddling step therefore proves that
+    // the swap is routed per evaluation, not naively once per outer step.
+    let res = render_and_measure(
+        &model_dir,
+        MODEL_ID_T2V_14B,
+        OffloadPolicy::Resident,
+        "heun",
+        vec![],
+    );
+    let seq = render_and_measure(
+        &model_dir,
+        MODEL_ID_T2V_14B,
+        OffloadPolicy::Sequential,
+        "heun",
+        vec![],
+    );
+    assert_swap_wins("t2v-curated-heun", &res, &seq);
 }
 
 #[test]
@@ -211,12 +243,14 @@ fn i2v_expert_swap_drops_the_peak_and_preserves_output() {
         &model_dir,
         MODEL_ID_I2V_14B,
         OffloadPolicy::Resident,
+        "unipc",
         reference(),
     );
     let seq = render_and_measure(
         &model_dir,
         MODEL_ID_I2V_14B,
         OffloadPolicy::Sequential,
+        "unipc",
         reference(),
     );
     assert_swap_wins("i2v", &res, &seq);
