@@ -1012,6 +1012,69 @@ pub fn denoise_moe_curated(
     )
 }
 
+/// Sequential-residency twin of [`denoise_moe_curated`]. The curated solver remains in control of
+/// every model evaluation (including Heun / DPM++ SDE sub-evaluations); this wrapper changes only
+/// which expert is resident for that evaluation. Curated sigma trajectories are monotonically
+/// descending, so there is at most one high→low transition. On that transition the outgoing expert
+/// is dropped and its MLX buffers are flushed before the incoming expert is loaded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_moe_curated_swapped(
+    boundary_timestep: f32,
+    sampler_name: &str,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    init_noise: &Array,
+    y: Option<&Array>,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut load: impl FnMut(bool) -> Result<(WanTransformer, Array, Option<Array>, f32)>,
+) -> Result<Array> {
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+    let (transformer, cond, uncond, guidance) = load(true)?;
+    let grid = transformer.patch_grid(init_noise);
+    let cache = build_cache(&transformer, &cond, uncond.as_ref(), grid)?;
+    // The first shifted Wan sigma is always above the configured A14B boundary. Keeping the
+    // initially loaded high expert here avoids a second load before the first evaluation.
+    let mut active = Some((transformer, cache, guidance, true));
+    let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+    let nt = num_train_timesteps as f32;
+    let result = mlx_gen::run_flow_sampler(
+        Some(sampler_name),
+        mlx_gen::TimestepConvention::Sigma,
+        &sigmas,
+        init_noise.clone(),
+        seed,
+        cancel,
+        on_progress,
+        |x, sigma| {
+            let t = (sigma * nt).trunc();
+            let wants_high = t >= boundary_timestep;
+            let has_high = active.as_ref().is_some_and(|(_, _, _, high)| *high);
+            if wants_high != has_high {
+                // A descending sigma schedule may cross high→low once, never low→high.
+                if wants_high {
+                    return Err(Error::Msg(
+                        "wan: curated sampler timestep increased across the MoE boundary".into(),
+                    ));
+                }
+                drop(active.take());
+                mlx_rs::memory::clear_cache();
+                let (transformer, cond, uncond, guidance) = load(false)?;
+                let cache = build_cache(&transformer, &cond, uncond.as_ref(), grid)?;
+                active = Some((transformer, cache, guidance, false));
+            }
+            let (transformer, cache, guidance, _) =
+                active.as_ref().expect("curated expert is loaded");
+            predict(transformer, x, t, cache, *guidance, y)
+        },
+    );
+    drop(active);
+    mlx_rs::memory::clear_cache();
+    result
+}
+
 /// Drive the A14B high→low MoE expert swap so the two ~8-9 GB experts are **never co-resident**
 /// (sc-12736, epic 12732 — the mlx Pillar-1 win, the residency twin of candle's `staged_expert_swap`):
 /// load the high expert, `use_high` it over steps `0..k`, DROP it + `evict`, then load the low expert
@@ -1403,6 +1466,52 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin the actual callback order for all four curated samplers. Heun and DPM++ SDE add
+    /// intermediate evaluations, but their sigma streams still cross the expert boundary exactly
+    /// once and never return to the high expert.
+    #[test]
+    fn every_wan_curated_sampler_crosses_the_expert_boundary_once_per_eval() {
+        use mlx_gen::gen_core::sampling::{sampler_by_name, CpuLatentOps, FlowModelSampling};
+        use mlx_gen::TimestepConvention;
+
+        let sigmas = compute_sigmas(6, 5.0, 1000);
+        let boundary = 875.0_f32;
+        let ops = CpuLatentOps;
+        let model = FlowModelSampling::new(TimestepConvention::Sigma);
+        for name in ["euler_ancestral", "heun", "dpmpp_sde", "ddim"] {
+            let sampler = sampler_by_name::<CpuLatentOps>(name).expect("curated sampler");
+            let mut routed_high = Vec::new();
+            let mut denoise = |_x: &Vec<f32>, sigma: f32| {
+                routed_high.push((sigma * 1000.0).trunc() >= boundary);
+                Ok(vec![0.0])
+            };
+            sampler
+                .sample(&ops, &model, &mut denoise, vec![1.0], &sigmas, 42)
+                .unwrap();
+
+            assert!(
+                routed_high.contains(&true),
+                "{name} must evaluate the high expert"
+            );
+            assert!(
+                routed_high.contains(&false),
+                "{name} must evaluate the low expert"
+            );
+            let transitions = routed_high
+                .windows(2)
+                .filter(|pair| pair[0] != pair[1])
+                .count();
+            assert_eq!(
+                transitions, 1,
+                "{name} must make exactly one high-to-low swap"
+            );
+            assert!(
+                routed_high.windows(2).all(|pair| pair[0] || !pair[1]),
+                "{name} must never route low-to-high"
+            );
+        }
+    }
 
     // ── sc-12736: the A14B expert-swap residency contract (mlx Pillar-1). ────────────────────────
 
