@@ -172,6 +172,7 @@ impl CausalConv3d {
         kernel: (usize, usize, usize),
         vb: VarBuilder,
     ) -> Result<Self> {
+        crate::quant::guard_dense(&vb)?;
         let (kd, kh, kw) = kernel;
         let weight = vb.get((out_c, in_c, kd, kh, kw), "weight")?.contiguous()?;
         let bias = vb.get(out_c, "bias")?.reshape((1, out_c, 1, 1, 1))?;
@@ -267,6 +268,8 @@ impl CausalConv3d {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use candle_gen::candle_core::{DType, Device};
 
@@ -362,7 +365,14 @@ mod tests {
     fn causal_conv3d_loads_weights_at_varbuilder_dtype() -> Result<()> {
         let dev = Device::Cpu;
         for dt in [DType::F32, DType::BF16] {
-            let vb = candle_gen::candle_nn::VarBuilder::zeros(dt, &dev);
+            let tensors = HashMap::from([
+                (
+                    "conv.weight".to_owned(),
+                    Tensor::zeros((5, 3, 3, 3, 3), dt, &dev)?,
+                ),
+                ("conv.bias".to_owned(), Tensor::zeros(5, dt, &dev)?),
+            ]);
+            let vb = candle_gen::candle_nn::VarBuilder::from_tensors(tensors, dt, &dev);
             let conv = CausalConv3d::load(3, 5, (3, 3, 3), vb.pp("conv"))?;
             assert_eq!(
                 conv.weight.dtype(),

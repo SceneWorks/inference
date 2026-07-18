@@ -35,7 +35,7 @@ pub use positions::get_positions;
 pub use rope::MochiRope;
 pub use scheduler::{cfg_combine, linear_quadratic_schedule, MochiScheduler};
 pub use text_encoder::{encode_prompt, load_t5_encoder, MochiTextConditioning};
-pub use tokenizer::{load_tokenizer, load_tokenizer_with_max_len};
+pub use tokenizer::{load_tokenizer, load_tokenizer_with_max_len, MochiTokenizer};
 pub use transformer::{
     load_transformer_weights, MochiAttention, MochiDitConfig, MochiLinear, MochiQuant,
     MochiTransformer3DModel, MochiTransformerBlock,

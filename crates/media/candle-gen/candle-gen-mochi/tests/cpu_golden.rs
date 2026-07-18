@@ -54,3 +54,16 @@ fn empty_prompt_is_eos_then_pad() {
     assert_eq!(mask[0], 1, "EOS is a real token");
     assert!(mask[1..].iter().all(|&m| m == 0));
 }
+
+#[test]
+fn long_prompt_reserves_the_final_slot_for_eos() {
+    let dev = Device::Cpu;
+    let tok = load_tokenizer().unwrap();
+    let prompt = "hello ".repeat(MAX_SEQUENCE_LENGTH * 2);
+    let (ids, mask) = tokenize(&tok, &prompt, &dev).unwrap();
+    let ids = ids.flatten_all().unwrap().to_vec1::<u32>().unwrap();
+
+    assert_eq!(ids.len(), MAX_SEQUENCE_LENGTH);
+    assert_eq!(ids[MAX_SEQUENCE_LENGTH - 1], 1, "final token must be EOS");
+    assert!(mask.iter().all(|&m| m == 1), "truncated row has no padding");
+}

@@ -24,7 +24,7 @@ use candle_gen::{CandleError, Result};
 use candle_gen_flux::packed_te::{PackedT5Encoder, T5Config};
 use tokenizers::Tokenizer;
 
-use crate::tokenizer::{MAX_SEQUENCE_LENGTH, PAD_TOKEN_ID};
+use crate::tokenizer::{EOS_TOKEN_ID, MAX_SEQUENCE_LENGTH, PAD_TOKEN_ID};
 
 /// Large negative added to padded keys in the T5 self-attention (softmax → ~0 weight). Matches the
 /// MLX port's `T5_MASK_NEG`; the HF reference uses `finfo(dtype).min`, but any value that drives the
@@ -141,7 +141,8 @@ pub fn tokenize(
     let mut ids: Vec<u32> = enc.get_ids().to_vec();
     let max = MAX_SEQUENCE_LENGTH;
     if ids.len() > max {
-        ids.truncate(max);
+        ids.truncate(max - 1);
+        ids.push(EOS_TOKEN_ID);
     }
     let nv = ids.len();
     let mut mask = vec![1u32; nv];

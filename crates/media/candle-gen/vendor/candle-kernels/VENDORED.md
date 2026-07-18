@@ -15,7 +15,7 @@ into the build via a `[patch]` in the workspace `Cargo.toml`:
 candle-kernels = { path = "vendor/candle-kernels" }
 ```
 
-## The only change vs upstream
+## Changes vs upstream
 
 There are **two** changes vs upstream:
 

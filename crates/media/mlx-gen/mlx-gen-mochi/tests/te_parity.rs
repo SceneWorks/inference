@@ -102,6 +102,20 @@ fn empty_prompt_is_eos_then_pad() {
     assert!(out.ids[1..].iter().all(|&id| id == 0), "then all pad");
 }
 
+#[test]
+fn long_prompt_reserves_the_final_slot_for_eos() {
+    let tok = load_tokenizer().unwrap();
+    let prompt = "hello ".repeat(512);
+    let out = tok.tokenize(&prompt).unwrap();
+
+    assert_eq!(out.ids.len(), 256);
+    assert_eq!(out.ids[255], 1, "final token must be EOS");
+    assert!(
+        out.mask.iter().all(|&m| m == 1),
+        "truncated row has no padding"
+    );
+}
+
 // ------------------------------------------------------------- real-weight golden gate
 
 #[test]

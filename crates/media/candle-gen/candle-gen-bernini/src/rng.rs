@@ -194,58 +194,6 @@ pub fn torch_step_noise(schedule: &[Vec<i32>], in_channels: usize, seed: u32) ->
         .collect()
 }
 
-// --- Legacy deterministic host RNG (splitmix64 → Box–Muller) --------------------------------------
-// The pre-sc-11671 seed-stable host RNG. Retained as an injectable, backend-free fallback (no torch/numpy
-// parity) for callers that only need a stable, reproducible order/noise rather than the reference draw.
-
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-fn legacy_uniform(state: &mut u64) -> f64 {
-    (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
-}
-
-fn legacy_gaussian(state: &mut u64) -> f32 {
-    let u1 = legacy_uniform(state).max(1e-12);
-    let u2 = legacy_uniform(state);
-    ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
-}
-
-/// Legacy fallback reveal permutation (argsort of seeded normal noise). Not torch/numpy parity.
-#[allow(dead_code)]
-pub fn legacy_permutation(n: i32, seed: u64) -> Vec<i32> {
-    let mut state = seed ^ 0x4d_a4;
-    let vals: Vec<f32> = (0..n).map(|_| legacy_gaussian(&mut state)).collect();
-    let mut idx: Vec<i32> = (0..n).collect();
-    idx.sort_by(|&a, &b| {
-        vals[a as usize]
-            .partial_cmp(&vals[b as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    idx
-}
-
-/// Legacy fallback per-step noise (independent splitmix draw per step). Not torch parity.
-#[allow(dead_code)]
-pub fn legacy_step_noise(schedule: &[Vec<i32>], in_channels: usize, seed: u64) -> Vec<Vec<f32>> {
-    schedule
-        .iter()
-        .enumerate()
-        .map(|(s, revealed)| {
-            let np = revealed.len().max(1);
-            let mut state = seed ^ 0x9e37 ^ ((s as u64).wrapping_mul(0x100_0001));
-            (0..np * in_channels)
-                .map(|_| legacy_gaussian(&mut state))
-                .collect()
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,18 +222,5 @@ mod tests {
         for (i, &e) in expect.iter().enumerate() {
             assert!((r[i] - e).abs() < 1e-6, "randn[{i}] {} vs {e}", r[i]);
         }
-    }
-
-    /// The legacy fallback is deterministic + covers `[0, n)` exactly once.
-    #[test]
-    fn legacy_permutation_is_stable_permutation() {
-        let a = legacy_permutation(32, 7);
-        assert_eq!(a, legacy_permutation(32, 7));
-        let mut sorted = a.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..32).collect::<Vec<_>>());
-        let noise = legacy_step_noise(&[vec![1, 2], vec![]], 8, 7);
-        assert_eq!(noise[0].len(), 16);
-        assert_eq!(noise[1].len(), 8, "empty reveal still shaped by max(1,np)");
     }
 }

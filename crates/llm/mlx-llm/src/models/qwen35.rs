@@ -21,7 +21,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, rsqrt, sigmoid, split_section
 use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
-use crate::models::deepstack::deepstack_fused_decoder_layers;
+use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
@@ -658,43 +658,16 @@ impl Qwen35Model {
         vision_features: &Array,
         placeholder_tokens: &[i32],
     ) -> Result<Array> {
-        let hidden = self.cfg.hidden_size;
-        let s = embeds.shape()[1] as usize;
-        let feats = vision_features.as_dtype(COMPUTE_DTYPE)?;
-        let is_vis = |id: i32| placeholder_tokens.contains(&id);
-        let num_vis = input_ids.iter().filter(|&&x| is_vis(x)).count() as i32;
-        if num_vis != feats.shape()[0] {
-            return Err(Error::Msg(format!(
-                "qwen3_5 splice: {num_vis} vision tokens != {} feature rows",
-                feats.shape()[0]
-            )));
-        }
-        if num_vis == 0 {
-            return Ok(embeds.clone());
-        }
-        // Stitch text spans (from `embeds`) and vision spans (from `feats`) in order — no scatter.
-        let mut pieces: Vec<Array> = Vec::new();
-        let mut feat_off = 0i32;
-        let mut i = 0usize;
-        while i < s {
-            let vis = is_vis(input_ids[i]);
-            let mut j = i;
-            while j < s && is_vis(input_ids[j]) == vis {
-                j += 1;
-            }
-            let n = (j - i) as i32;
-            if vis {
-                let idx = Array::from_slice(&(feat_off..feat_off + n).collect::<Vec<_>>(), &[n]);
-                pieces.push(feats.take_axis(&idx, 0)?.reshape(&[1, n, hidden])?);
-                feat_off += n;
-            } else {
-                let idx = Array::from_slice(&(i as i32..j as i32).collect::<Vec<_>>(), &[n]);
-                pieces.push(embeds.take_axis(&idx, 1)?);
-            }
-            i = j;
-        }
-        let refs: Vec<&Array> = pieces.iter().collect();
-        Ok(concatenate_axis(&refs, 1)?)
+        // Invalid-input diagnostics use the shared helper's `vlm splice` prefix; successful output
+        // is byte-identical to the former Qwen3.5-local implementation.
+        deepstack::splice_vision_features(
+            embeds,
+            input_ids,
+            vision_features,
+            placeholder_tokens,
+            self.cfg.hidden_size,
+            COMPUTE_DTYPE,
+        )
     }
 
     /// Compute the interleaved M-RoPE 3-D position rows (`get_rope_index`, B=1) for `input_ids`
@@ -746,75 +719,16 @@ impl Qwen35Model {
         video_token_id: i32,
         spatial_merge_size: i32,
     ) -> Result<MropePositions> {
-        let merge = spatial_merge_size.max(1);
-        // Per-frame video blocks: `[t, h, w]` → `t × [1, h, w]` (the timestamp frame-split). Image
-        // blocks pass through unchanged (always `gt = 1`).
-        let mut video_frames: Vec<[i32; 3]> = Vec::new();
-        for &[t, h, w] in video_grid_thw {
-            if t <= 0 {
-                return Err(Error::Msg(format!("qwen3_5 mrope: bad video grid {:?}", [t, h, w])));
-            }
-            for _ in 0..t {
-                video_frames.push([1, h, w]);
-            }
-        }
-
-        let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
-        let mut cur = 0i32;
-        let (mut img_i, mut vid_i) = (0usize, 0usize);
-        let mut i = 0usize;
-        while i < input_ids.len() {
-            let id = input_ids[i];
-            let is_image = id == image_token_id;
-            // `image_token_id == video_token_id` would be ambiguous; the configs always differ, and
-            // an image run is matched first.
-            let is_video = !is_image && id == video_token_id;
-            if is_image || is_video {
-                let (grid, label): ([i32; 3], &str) = if is_image {
-                    let g = *image_grid_thw.get(img_i).ok_or_else(|| {
-                        Error::Msg("qwen3_5 mrope: more image runs than image_grid_thw entries".into())
-                    })?;
-                    img_i += 1;
-                    (g, "image")
-                } else {
-                    let g = *video_frames.get(vid_i).ok_or_else(|| {
-                        Error::Msg("qwen3_5 mrope: more video frame runs than video_grid_thw frames".into())
-                    })?;
-                    vid_i += 1;
-                    (g, "video")
-                };
-                let (gt, gh, gw) = (grid[0], grid[1] / merge, grid[2] / merge);
-                if gt <= 0 || gh <= 0 || gw <= 0 {
-                    return Err(Error::Msg(format!("qwen3_5 mrope: bad {label} grid {grid:?}")));
-                }
-                let count = (gt * gh * gw) as usize;
-                let tok = id;
-                let run = input_ids[i..].iter().take_while(|&&x| x == tok).count();
-                if run != count {
-                    return Err(Error::Msg(format!(
-                        "qwen3_5 mrope: {label} run length {run} != grid tokens {count}"
-                    )));
-                }
-                let frame = gh * gw;
-                for k in 0..count as i32 {
-                    t.push(k / frame + cur);
-                    let rem = k % frame;
-                    h.push(rem / gw + cur);
-                    w.push(rem % gw + cur);
-                }
-                cur += gt.max(gh).max(gw);
-                i += count;
-            } else {
-                t.push(cur);
-                h.push(cur);
-                w.push(cur);
-                cur += 1;
-                i += 1;
-            }
-        }
-        let maxpos = t.iter().chain(h.iter()).chain(w.iter()).copied().max().unwrap_or(-1);
-        let delta = maxpos + 1 - input_ids.len() as i32;
-        Ok((t, h, w, delta))
+        // Invalid-input diagnostics use the shared helper's `vlm mrope` prefix; successful position
+        // rows and continuation delta are identical to the former Qwen3.5-local implementation.
+        deepstack::mrope_positions_mm(
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            video_grid_thw,
+            video_token_id,
+            spatial_merge_size,
+        )
     }
 
     /// Run the decoder over precomputed input `embeds` `[1, S, hidden]` (text embeds with image

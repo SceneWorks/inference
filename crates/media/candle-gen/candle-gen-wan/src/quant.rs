@@ -53,17 +53,22 @@ pub const GROUP_SIZE: usize = candle_gen::quant::MLX_GROUP_SIZE; // 64
 /// *unmerged*.
 pub use candle_gen::quant::AdaptLinear as QLinear;
 
-/// Guard a **dense** VarBuilder sub-tree against an unexpected MLX-packed weight: error loudly if
-/// `{base}.scales` is present under `vb` (sc-10025, the qwen `guard_dense` precedent). The Wan MLX tiers
-/// keep the z16 3-D-conv VAE dense (only the DiT experts pack), so the VAE loaders read `{base}.weight`
+/// Guard a **dense** VarBuilder leaf against an unexpected MLX-packed weight: error loudly if
+/// `scales` is present under `vb` (sc-10025, the qwen `guard_dense` precedent). The Wan MLX tiers
+/// keep the 3-D-conv VAEs dense (only the DiT experts pack), so the VAE loaders read `weight`
 /// as their float dtype; if a future tier ever packed a conv, that u32 code stream would be silently
 /// reinterpreted as garbage. This makes that a hard load error naming the offending key.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn guard_dense(vb: &VarBuilder, base: &str) -> Result<()> {
-    if vb.contains_tensor(&format!("{base}.scales")) {
+pub fn guard_dense(vb: &VarBuilder) -> Result<()> {
+    if vb.contains_tensor("scales") {
+        let prefix = vb.prefix();
+        let scales = if prefix.is_empty() {
+            "scales".to_owned()
+        } else {
+            format!("{prefix}.scales")
+        };
         candle_gen::candle_core::bail!(
-            "wan: `{base}.scales` present — this weight is MLX-packed, but the loader here is the dense \
-             z16 VAE path (the Wan MLX tiers keep the 3-D-conv VAE dense; only the DiT experts pack). \
+            "wan: `{scales}` present — this weight is MLX-packed, but the loader here is a dense VAE \
+             path (the Wan MLX tiers keep the 3-D-conv VAEs dense; only the DiT experts pack). \
              Reading its u32 codes as a float would be silent garbage. A tier that packs the VAE must \
              add a real packed path (sc-10025)."
         );
@@ -323,11 +328,17 @@ mod tests {
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
 
+        let err = match crate::conv3d::CausalConv3d::load(64, 16, (1, 1, 1), vb.pp("conv_in")) {
+            Ok(_) => candle_gen::candle_core::bail!(
+                "production dense-conv loader accepted a `.scales` sibling"
+            ),
+            Err(err) => err,
+        };
         assert!(
-            guard_dense(&vb, "conv_in").is_err(),
-            "guard must error on a `.scales` sibling where a dense conv is expected"
+            err.to_string().contains("conv_in.scales"),
+            "hard load error must name the packed key: {err}"
         );
-        guard_dense(&vb, "conv_out")?; // clean dense leaf passes
+        guard_dense(&vb.pp("conv_out"))?; // clean dense leaf passes
 
         std::fs::remove_file(&tmp).ok();
         Ok(())
