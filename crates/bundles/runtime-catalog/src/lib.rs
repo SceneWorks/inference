@@ -74,8 +74,10 @@ impl RuntimeCatalog {
     ///
     /// `audio_backend` is the single tensor backend every provider in the audio registry must use.
     /// It may equal the bundle's media `backend` (the Candle bundles) or differ from it (the `mlx`
-    /// macOS bundle carrying `candle` audio) — see [`AudioSection`]. The audio registry is
-    /// generators-only at this release; registering any other provider kind in it fails validation.
+    /// macOS bundle carrying `candle` audio) — the sanctioned cross-backend seam described by
+    /// [`Self::audio_backend`] and `docs/architecture/audio-backend-strategy.md`. The audio
+    /// registry is generators-only at this release; registering any other provider kind in it
+    /// fails validation.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_audio(
         platform: &'static str,
