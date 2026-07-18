@@ -5,15 +5,18 @@ Default (prepare):    compute the next runtime-YYYY.MM.patch-rc.N from existing 
                       main, record it in release/VERSION, commit, push, and open a PR for approval.
 --release (execute):  read the approved version from release/VERSION, build + verify the release
                       bundle, then create and push the immutable tag.
+--promote (execute):  promote that rc to its final tag -- rebuild from the rc's exact revision and
+                      create/push the bare runtime-YYYY.MM.patch tag (rc -> release).
 
 The version lives only in the git tag (see release/README.md); release/VERSION is the in-repo
 record of the version being prepared, so the approval PR has a reviewable diff and the release step
 cuts exactly the approved version. Patch increments within a calendar month and resets on a new
 month; a candidate is `-rc.N`, promoted to the bare final tag later from the same revision.
 
-Safety: preview any run with --dry-run. --release pushes an immutable tag (never moved or reused)
-and requires --yes. This script builds the source bundle + SBOM and tags/pushes; it does NOT run
-the multi-platform or real-weight release gates -- those are CI's job per release/README.md.
+Safety: preview any run with --dry-run. --release/--promote push an immutable tag (never moved or
+reused) and require --yes; --promote also requires --gates-passed. This script builds the source
+bundle + SBOM and tags/pushes; it does NOT run the multi-platform or real-weight release gates --
+those are CI's job per release/README.md.
 """
 
 from __future__ import annotations
@@ -112,6 +115,16 @@ def next_candidate(
     return Version(year, month, top_patch, max_rc + 1), f"re-spin {label} -> rc.{max_rc + 1}"
 
 
+def promote_target(rc_tag: str) -> str:
+    """The final tag a candidate promotes to (strip -rc.N). Raise if it isn't a candidate."""
+    version = parse(rc_tag)
+    if version is None:
+        raise ValueError(f"{rc_tag!r} is not a runtime release tag")
+    if version.rc is None:
+        raise ValueError(f"{rc_tag} is already a final release; nothing to promote")
+    return Version(version.year, version.month, version.patch, None).format()
+
+
 # --- derived artifacts (pure) ---------------------------------------------------------------
 
 
@@ -195,6 +208,24 @@ def plan_release(tag: str, *, offline: bool = False) -> list[Step]:
     ]
 
 
+def plan_promote(rc_tag: str, final_tag: str, revision: str, *, offline: bool = False) -> list[Step]:
+    # Rebuild the final bundle from the candidate's EXACT revision (source unchanged), then create
+    # and push the final tag at that same revision. Build first so a build failure never leaves a
+    # dangling local tag.
+    build = [sys.executable, str(BUILD_RELEASE), "--tag", final_tag, "--source-ref", revision]
+    verify = [sys.executable, str(VERIFY_RELEASE), "dist/release"]
+    if offline:
+        build.append("--offline")
+        verify.append("--offline")
+    return [
+        Command(f"build release bundle for {final_tag} from {rc_tag} ({revision})", build),
+        Command("verify release bundle", verify),
+        Command(f"create final tag {final_tag} at {rc_tag}'s revision",
+                ["git", "tag", "-a", final_tag, revision, "-m", f"Runtime release {final_tag}"]),
+        Command(f"push tag {final_tag}", ["git", "push", "origin", final_tag]),
+    ]
+
+
 def execute(steps: list[Step], *, dry_run: bool) -> int:
     for step in steps:
         print(f"• {step.description}")
@@ -237,6 +268,15 @@ def working_tree_dirty() -> bool:
 
 def tag_exists(tag: str) -> bool:
     return bool(_git("tag", "--list", tag).strip())
+
+
+def resolve_commit(ref: str) -> str | None:
+    """The commit a ref points at, or None if the ref does not exist (non-raising)."""
+    result = subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", f"{ref}^{{commit}}"],
+        cwd=ROOT, check=False, capture_output=True, encoding="utf-8",
+    )
+    return result.stdout.strip() or None
 
 
 def read_prepared_version() -> str:
@@ -289,12 +329,61 @@ def run_release(args: argparse.Namespace) -> int:
     return execute(plan_release(tag, offline=args.offline), dry_run=args.dry_run)
 
 
+def print_gate_checklist(rc_tag: str) -> None:
+    print(
+        f"Release gates that MUST be green on {rc_tag}'s revision before promoting "
+        "(see release/README.md):\n"
+        "  1. CI lanes: workspace, contracts, affected backend/platform, docs, supply-chain\n"
+        "  2. Required real-weight profiles (these run in CI, not here)\n"
+        "  3. verify_release.py passed on the rc bundle (no --allow-dirty/--skip-smoke)\n"
+        "  4. Uploaded artifact hashes match SHA256SUMS\n",
+        file=sys.stderr,
+    )
+
+
+def run_promote(args: argparse.Namespace) -> int:
+    rc_tag = read_prepared_version()
+    try:
+        final_tag = promote_target(rc_tag)
+    except ValueError as error:
+        print(f"cut_release: {error}", file=sys.stderr)
+        return 1
+    print(f"promoting {rc_tag}  ->  {final_tag}\n")
+    print_gate_checklist(rc_tag)
+
+    revision = resolve_commit(rc_tag)
+    if not args.dry_run:
+        if not args.gates_passed:
+            print(f"cut_release: confirm the gates above passed on {rc_tag}, then re-run with "
+                  "--gates-passed.", file=sys.stderr)
+            return 1
+        if not args.yes:
+            print("cut_release: --promote pushes an immutable final tag; re-run with --yes.", file=sys.stderr)
+            return 1
+        if revision is None:
+            print(f"cut_release: candidate tag {rc_tag} not found; cut it first with --release.", file=sys.stderr)
+            return 1
+        if tag_exists(final_tag):
+            print(f"cut_release: final tag {final_tag} already exists and is never reused; refusing.", file=sys.stderr)
+            return 1
+        if working_tree_dirty():
+            print("cut_release: working tree is dirty; promote from a clean checkout.", file=sys.stderr)
+            return 1
+    plan = plan_promote(rc_tag, final_tag, revision or f"<{rc_tag} revision>", offline=args.offline)
+    return execute(plan, dry_run=args.dry_run)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--release", action="store_true",
-                        help="execute the release for the version in release/VERSION (default: prepare a PR)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--release", action="store_true",
+                      help="execute the release for the rc in release/VERSION (default: prepare a PR)")
+    mode.add_argument("--promote", action="store_true",
+                      help="promote the rc in release/VERSION to its final tag (rc -> release)")
     parser.add_argument("--dry-run", action="store_true", help="print the plan and change nothing")
-    parser.add_argument("--yes", action="store_true", help="required to actually push the immutable tag in --release")
+    parser.add_argument("--yes", action="store_true", help="required to actually push the immutable tag (--release/--promote)")
+    parser.add_argument("--gates-passed", action="store_true",
+                        help="acknowledge the release gates passed on the rc (required by --promote)")
     parser.add_argument("--base", default=DEFAULT_BASE, help=f"PR base branch (default: {DEFAULT_BASE})")
     parser.add_argument("--no-fetch", action="store_true", help="skip fetching tags/base first (local may be stale)")
     parser.add_argument("--offline", action="store_true", help="pass --offline to the release build/verify")
@@ -303,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--new-patch", action="store_true", help="prepare: start a new patch even if the top rc isn't final")
     args = parser.parse_args(argv)
 
+    if args.promote:
+        return run_promote(args)
     return run_release(args) if args.release else run_prepare(args)
 
 

@@ -11,8 +11,10 @@ from scripts.release.cut_release import (
     next_candidate,
     parse,
     plan_prepare,
+    plan_promote,
     plan_release,
     pr_title,
+    promote_target,
     version_file_content,
 )
 
@@ -113,6 +115,39 @@ class ReleasePlanTests(unittest.TestCase):
 
     def test_offline_propagates_to_build_and_verify(self) -> None:
         joined = [" ".join(s.argv) for s in plan_release(self.TAG, offline=True)]
+        self.assertTrue(all("--offline" in j for j in joined if "release.py" in j))
+
+
+class PromoteTests(unittest.TestCase):
+    RC = "runtime-2026.07.8-rc.0"
+    FINAL = "runtime-2026.07.8"
+    REV = "0123456789abcdef0123456789abcdef01234567"
+
+    def test_promote_target_strips_the_rc_suffix(self) -> None:
+        self.assertEqual(promote_target(self.RC), self.FINAL)
+        self.assertEqual(promote_target("runtime-2026.07.8-rc.3"), self.FINAL)
+
+    def test_promote_target_rejects_a_final_or_non_tag(self) -> None:
+        with self.assertRaises(ValueError):
+            promote_target(self.FINAL)  # already final
+        with self.assertRaises(ValueError):
+            promote_target("v1.2.3")
+
+    def test_plan_builds_from_the_rc_revision_then_tags_and_pushes(self) -> None:
+        joined = [" ".join(s.argv) for s in plan_promote(self.RC, self.FINAL, self.REV)]
+        build = next(i for i, j in enumerate(joined) if "build_release.py" in j)
+        verify = next(i for i, j in enumerate(joined) if "verify_release.py" in j)
+        tag = next(i for i, j in enumerate(joined) if j.startswith("git tag -a"))
+        push = next(i for i, j in enumerate(joined) if j == f"git push origin {self.FINAL}")
+        self.assertLess(build, verify)
+        self.assertLess(verify, tag)   # build first so a failure leaves no dangling tag
+        self.assertLess(tag, push)
+        # the final bundle + tag are pinned to the rc's exact revision, using the FINAL tag name
+        self.assertIn(f"--tag {self.FINAL} --source-ref {self.REV}", joined[build])
+        self.assertIn(f"git tag -a {self.FINAL} {self.REV}", joined[tag])
+
+    def test_offline_propagates(self) -> None:
+        joined = [" ".join(s.argv) for s in plan_promote(self.RC, self.FINAL, self.REV, offline=True)]
         self.assertTrue(all("--offline" in j for j in joined if "release.py" in j))
 
 
