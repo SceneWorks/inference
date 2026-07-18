@@ -22,14 +22,24 @@
 //! 2. **Output parity preserved.** The two runs produce **bit-identical** frames (`clear_cache` changes
 //!    residency/lifetime, never numerics). And the **active** peak is ≈ equal (staging already bounds it).
 //!
+//! **sc-12831 addition — the quantized-tier active-peak floor.** sc-12796 found that on the quantized 5B
+//! the residual ~12 GiB active peak *is* the f32 UMT5 TE encode stage, which no further offload could
+//! lower. sc-12831 packs the UMT5 projections (Q8 — the near-lossless floor; `encode_text_staged` →
+//! `model::effective_te_quant`, keyed on the on-disk `config.quantization` manifest), so on a
+//! **quantized** tier the encode no longer holds ~11 GB of bf16 TE and the whole-generation active peak
+//! drops to ~7.7 GiB. [`assert_quantized_te_active_peak_floor`] asserts that new floor (< 10 GiB) — the
+//! third acceptance criterion, discriminating (a bf16 TE returns the peak to ~11.8 GiB). It is a no-op on
+//! a bf16 tier (nothing packs the TE there).
+//!
 //! Both the **T2V** (pure noise, no VAE encode) and **TI2V** (a `Reference` image → the z48 VAE-encoder
 //! staged, then flushed) paths are covered.
 //!
 //! `#[ignore]` + env-gated (needs the converted TI2V-5B snapshot), GPU-heavy. Point
 //! `WAN_TI2V_5B_MODEL_DIR` at a converted snapshot **tier** dir (q4 / q8 / bf16 — each has
 //! `model.safetensors` + `t5_encoder.safetensors` + `vae.safetensors` + `config.json` +
-//! `tokenizer.json`). The TE is f32-compute (~11 GB weights) regardless of the DiT tier, so the flush
-//! win is ~the TE at every tier.
+//! `tokenizer.json`). The TE weights are ~11 GB bf16 on disk at **every** tier; on a quantized tier they
+//! are packed at load, on the bf16 tier they stay dense (so the offload footprint win is ~the TE at every
+//! tier, while the sc-12831 active-peak floor applies only to the quantized tiers).
 //!
 //! ```text
 //! WAN_TI2V_5B_MODEL_DIR=~/.cache/huggingface/hub/models--SceneWorks--wan2.2-ti2v-5b-mlx/snapshots/<hash>/q4 \
@@ -62,6 +72,56 @@ fn env_path(var: &str) -> Option<PathBuf> {
 
 fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// The whole-generation **active** peak floor a **quantized** tier must clear (sc-12831). With the UMT5
+/// projections packed (Q8 in production — the near-lossless floor; see `model::effective_te_quant`), the
+/// Stage-1 encode no longer holds ~11 GB of bf16 f32-TE — the component sc-12796 measured as the 5B's
+/// residual ~12 GiB active peak — so the peak drops to ~7.7 GiB (the isolated Q8 TE-encode measures 7.72
+/// GiB; the whole generation is ~that). 10 GiB is a **discriminating** ceiling: above the real Q8 peak
+/// with margin, far below the ~11.8 GiB an un-packed bf16 TE reaches. Revert the TE quant (the
+/// `text_encoder.rs` packing or the `effective_te_quant` plumbing) and this assertion goes red.
+const QUANTIZED_TE_ACTIVE_PEAK_FLOOR: f64 = 10.0; // GiB
+
+/// True when the snapshot tier at `model_dir` is pre-quantized — its `config.json` carries a
+/// `"quantization"` block, the case in which `encode_text_staged` packs the UMT5 TE (the footprint
+/// harness loads with no `spec.quantize`, so the on-disk manifest is the only TE-quant trigger). A bf16
+/// tier keeps the dense ~12 GiB f32-TE encode peak, so the floor does not apply.
+fn tier_is_quantized(model_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(model_dir.join("config.json"))
+        .map(|s| s.contains("\"quantization\""))
+        .unwrap_or(false)
+}
+
+/// Assert the sc-12831 acceptance on a quantized tier: every measured active peak is below
+/// [`QUANTIZED_TE_ACTIVE_PEAK_FLOOR`] (the packed UMT5 TE retired the ~12 GiB f32-TE encode peak). No-op
+/// on a bf16 tier (nothing packs the TE there — the peak stays ~12 GiB by design). Mutation guard: leave
+/// the TE bf16 and the peak returns to ~12 GiB, failing this.
+fn assert_quantized_te_active_peak_floor(
+    label: &str,
+    model_dir: &std::path::Path,
+    profiles: &[&Profile],
+) {
+    if !tier_is_quantized(model_dir) {
+        println!(
+            "[{label}] bf16 tier — TE stays dense; active-peak floor N/A (peak stays ~12 GiB)"
+        );
+        return;
+    }
+    for p in profiles {
+        assert!(
+            gib(p.peak_active) < QUANTIZED_TE_ACTIVE_PEAK_FLOOR,
+            "{label}: quantized-tier active peak {:.2} GiB is NOT below the sc-12831 floor {:.1} GiB — \
+             the packed UMT5 TE should have dropped the ~12 GiB f32-TE encode peak; is the TE actually \
+             quantized (effective_te_quant / Umt5Encoder::from_weights_quantized)?",
+            gib(p.peak_active),
+            QUANTIZED_TE_ACTIVE_PEAK_FLOOR
+        );
+    }
+    println!(
+        "[{label}] quantized-tier active peak below the {:.1} GiB sc-12831 floor ✓ (packed UMT5 TE)",
+        QUANTIZED_TE_ACTIVE_PEAK_FLOOR
+    );
 }
 
 /// A small non-flat RGB gradient — the TI2V `Reference` (first-frame) conditioning image.
@@ -236,6 +296,8 @@ fn t2v_5b_offload_drops_the_footprint_and_preserves_output() {
     let res = render_and_measure(&model_dir, OffloadPolicy::Resident, vec![]);
     let seq = render_and_measure(&model_dir, OffloadPolicy::Sequential, vec![]);
     assert_offload_wins("t2v", &res, &seq);
+    // sc-12831: on a quantized tier the packed UMT5 TE must have dropped the active peak below ~8 GiB.
+    assert_quantized_te_active_peak_floor("t2v", &model_dir, &[&res, &seq]);
 }
 
 #[test]
@@ -259,4 +321,6 @@ fn ti2v_5b_offload_drops_the_footprint_and_preserves_output() {
     let res = render_and_measure(&model_dir, OffloadPolicy::Resident, reference());
     let seq = render_and_measure(&model_dir, OffloadPolicy::Sequential, reference());
     assert_offload_wins("ti2v", &res, &seq);
+    // sc-12831: on a quantized tier the packed UMT5 TE must have dropped the active peak below ~8 GiB.
+    assert_quantized_te_active_peak_floor("ti2v", &model_dir, &[&res, &seq]);
 }
