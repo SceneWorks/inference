@@ -106,6 +106,55 @@ const SUFFIXES: [(&str, Role); 9] = [
     (".alpha", Role::Alpha),
 ];
 
+/// Surface inventory of the LoRA **targets a file carries** (sc-13019): unique normalized module
+/// paths with BOTH a down and an up factor, split into `(video, audio_or_cross_modal)`. The
+/// audio/cross bucket is classified textually from the LTX module namespace (`audio*` blocks,
+/// `av_ca`/`a2v` cross-modal attention) — the same classification the reference's video-only skip
+/// behavior produces.
+///
+/// This is the file-derived half of the structural adapter gates: the tests assert the *routing
+/// report* (what [`apply_ltx_adapters`] resolved on a given model) against this *key-inventory*
+/// expectation, so the counts follow whatever lora is under test instead of hardcoding one training
+/// recipe's shape (the old gates baked in one character lora's 576/1632 counts, making the suites
+/// un-runnable without that exact asset), while a routing regression that drops modules still trips
+/// the comparison.
+///
+/// Scope notes: orphan down/up factors and `.alpha`-only keys are counted by NEITHER bucket (the
+/// gates assume a well-formed lora; the apply path surfaces such keys as `skipped`, so a malformed
+/// file fails the skipped-exact asserts rather than passing silently). Flattened kohya keys (no
+/// dots) are inventoried as-is but resolve to no module — same failure direction.
+pub fn lora_target_inventory(w: &Weights) -> (Vec<String>, Vec<String>) {
+    use std::collections::BTreeSet;
+    let mut downs: BTreeSet<String> = BTreeSet::new();
+    let mut ups: BTreeSet<String> = BTreeSet::new();
+    for key in w.keys() {
+        let Some((stem, role)) = SUFFIXES
+            .iter()
+            .find_map(|(suf, role)| key.strip_suffix(suf).map(|s| (s, *role)))
+        else {
+            continue;
+        };
+        match role {
+            Role::Down => {
+                downs.insert(normalize_ltx_key(stem));
+            }
+            Role::Up => {
+                ups.insert(normalize_ltx_key(stem));
+            }
+            Role::Alpha => {}
+        }
+    }
+    let (mut video, mut audio) = (Vec::new(), Vec::new());
+    for path in downs.intersection(&ups) {
+        if path.contains("audio") || path.contains("av_ca") || path.contains("a2v") {
+            audio.push(path.clone());
+        } else {
+            video.push(path.clone());
+        }
+    }
+    (video, audio)
+}
+
 /// Read a scalar `.alpha` as f32 regardless of on-disk dtype (real files ship it bf16; a direct
 /// `as_slice::<f32>()` would panic on a dtype mismatch). A `[]`- or `[1]`-shaped scalar both read.
 fn read_alpha(a: &Array) -> Result<f32> {
@@ -337,6 +386,47 @@ pub fn apply_ltx_adapters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-13019: the file-derived inventory the `#[ignore]`d multi-surface gates assert against —
+    /// synthetic keys so the pairing/normalization/classification logic itself runs in CI.
+    #[test]
+    fn lora_target_inventory_pairs_normalizes_and_classifies() {
+        let mut w = Weights::empty();
+        let t = || Array::zeros::<f32>(&[2, 2]).unwrap();
+        // PEFT pair on a video attn leaf → one video target.
+        w.insert("diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight", t());
+        w.insert("diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight", t());
+        // kohya + `.default` infix pair, with `to_out.0` normalization collapsing to `to_out`.
+        w.insert("diffusion_model.transformer_blocks.1.attn2.to_out.0.lora_down.default.weight", t());
+        w.insert("diffusion_model.transformer_blocks.1.attn2.to_out.0.lora_up.default.weight", t());
+        // Audio-block pair → audio bucket.
+        w.insert("diffusion_model.transformer_blocks.0.audio_attn1.to_v.lora_A.weight", t());
+        w.insert("diffusion_model.transformer_blocks.0.audio_attn1.to_v.lora_B.weight", t());
+        // Cross-modal (a2v) pair → audio bucket.
+        w.insert("diffusion_model.transformer_blocks.0.video_to_audio_attn.to_k.lora_A.weight", t());
+        w.insert("diffusion_model.transformer_blocks.0.video_to_audio_attn.to_k.lora_B.weight", t());
+        // Orphan down (no up) and a bare `.alpha` — counted by neither bucket.
+        w.insert("diffusion_model.transformer_blocks.2.attn1.to_k.lora_A.weight", t());
+        w.insert("diffusion_model.transformer_blocks.0.attn1.to_q.alpha", t());
+        // Non-lora key — ignored.
+        w.insert("diffusion_model.transformer_blocks.0.attn1.to_q.weight", t());
+
+        let (video, audio) = lora_target_inventory(&w);
+        assert_eq!(
+            video,
+            vec![
+                "transformer_blocks.0.attn1.to_q".to_string(),
+                "transformer_blocks.1.attn2.to_out".to_string(),
+            ]
+        );
+        assert_eq!(
+            audio,
+            vec![
+                "transformer_blocks.0.audio_attn1.to_v".to_string(),
+                "transformer_blocks.0.video_to_audio_attn.to_k".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn normalize_strips_prefix_and_renames_to_out_and_ff() {
