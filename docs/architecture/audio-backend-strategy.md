@@ -188,7 +188,14 @@ first WAV (Kokoro's Candle precedent exists) with none of the debt.
 
 > Landed: items 1–3 shipped in sc-12835 (`crates/audio/`, the per-bundle
 > `audio_lane()` under the additive `audio` feature, and the tightened
-> `validate_audio` modality rules). Item 4 is the sc-12836 scope.
+> `validate_audio` modality rules). Item 4 landed in sc-12836
+> (`candle-audio-kokoro`, registered as `kokoro_82m` in every bundle's audio
+> lane), with one deviation from the sketch below: the weights load as the
+> upstream **pickle** checkpoint (`kokoro-v1_0.pth` + `voices/*.pt`, read via
+> candle's native pickle loader at a pinned commit SHA) rather than a
+> safetensors conversion — hexgrad publishes no official safetensors, and an
+> unofficial conversion would add a second provenance to pin for zero
+> functional gain.
 
 Build the Candle audio lane as a sibling of the existing media families:
 

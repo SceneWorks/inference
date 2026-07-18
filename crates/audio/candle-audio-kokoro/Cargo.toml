@@ -1,0 +1,49 @@
+[package]
+name = "candle-audio-kokoro"
+version = "0.0.0"
+edition = "2021"
+description = "Kokoro-82M TTS provider for the SceneWorks Candle audio lane (sc-12836) — the first real audio Generator: StyleTTS2-derived acoustic model + iSTFT-Net vocoder ported natively onto the pinned candle revision, with a pure-Rust misaki G2P front-end (no espeak, no Python)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "tts", "kokoro", "audio", "speech"]
+categories = ["science"]
+
+[dependencies]
+# The shared candle audio commons (device seam, pinned-SHA hub resolution, host DSP, WAV encode,
+# `AudioError → gen_core::Error` bridge). Re-exports `gen_core` and `candle_core`, so this crate
+# resolves the SAME candle build + gen-core rev as the catalog it registers into.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (Conv1d/ConvTranspose1d/LSTM/VarBuilder).
+candle-nn = { workspace = true }
+# Snapshot-preparer contract types for the audio lane's Kokoro-aware preparer probe
+# (`SnapshotPreparerRegistration` lives in core-llm; composed by candle-audio-catalog).
+core-llm = { workspace = true }
+# Pure-Rust misaki G2P (MIT): the embedded gold+silver misaki lexicons + POS tagger, the same
+# phonemization lineage Kokoro-82M was trained with. `default-features = false` is LOAD-BEARING:
+# the default `espeak` feature links espeak-ng (GPL) through espeak-rs — never enable it here.
+misaki-rs = { version = "0.3.0", default-features = false }
+# config.json parsing (vocab / istftnet / plbert blocks).
+serde_json = { workspace = true }
+# Seeded RNG for the vocoder's harmonic-source noise (the reproducibility law: same request+seed
+# ⇒ byte-identical samples). Same crate the media providers use for seeded noise draws.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# Voice style-vector `.pt` files are torch zip containers holding ONE bare tensor — a shape the
+# pinned candle pickle reader does not expose (it reads state-dict zips only), so the raw
+# little-endian f32 storage entry is read directly. Same zip version candle-core itself uses.
+zip = { version = "7.2", default-features = false }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# The backend-neutral generator conformance suite (validate-honesty, progress, typed
+# cancellation, seed determinism) the real-weight test runs against the loaded provider.
+sceneworks-gen-core-testkit = { workspace = true }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default` (the audio
+# lane ships CPU-first everywhere; see docs/architecture/audio-backend-strategy.md).
+metal = ["candle-audio/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda"]
