@@ -73,6 +73,7 @@ struct SpatialDown {
 
 impl SpatialDown {
     fn load(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
+        crate::quant::guard_dense(&vb)?;
         Ok(Self {
             w: vb.get((out_c, in_c, 3, 3), "weight")?.contiguous()?,
             b: vb.get(out_c, "bias")?.reshape((1, out_c, 1, 1))?,
@@ -110,6 +111,7 @@ struct TemporalDown {
 
 impl TemporalDown {
     fn load(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
+        crate::quant::guard_dense(&vb)?;
         Ok(Self {
             w: vb.get((out_c, in_c, 3, 1, 1), "weight")?.contiguous()?,
             b: vb.get(out_c, "bias")?.reshape((1, out_c, 1, 1, 1))?,

@@ -80,6 +80,7 @@ impl Conv2dW {
         pad: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
+        crate::quant::guard_dense(&vb)?;
         Ok(Self {
             w: vb.get((out_c, in_c, k, k), "weight")?.contiguous()?,
             b: vb.get(out_c, "bias")?.reshape((1, out_c, 1, 1))?,
