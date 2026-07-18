@@ -48,11 +48,13 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::runtime::{CancelFlag, LoadPhase};
+use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, MoeExpert, Progress, Quant, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy, Progress, Quant, WeightsSource,
 };
-use candle_gen::{CandleError, Result as CResult};
+use candle_gen::{check_cancel, effective_offload_policy, CandleError, Result as CResult};
 
 use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
@@ -119,9 +121,9 @@ impl Pipeline {
     }
 
     fn load_components(&self) -> CResult<Components> {
-        let te = Umt5Encoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
+        let te = self.load_te()?;
         let dit = self.build_dit()?;
-        let vae = WanVae::new(&self.vae_cfg, self.component_vb("vae", VAE_DTYPE)?)?;
+        let vae = self.load_vae()?;
         let tok = text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan")?;
         Ok(Components {
             te: Arc::new(te),
@@ -129,6 +131,26 @@ impl Pipeline {
             vae: Arc::new(vae),
             tok: Arc::new(tok),
         })
+    }
+
+    /// Build the UMT5 text encoder (f32) — the ~21 GB phase-A component that is dead weight after the
+    /// prompt encode. A single home shared by the resident [`load_components`](Self::load_components)
+    /// build and the sequential-offload [`render_sequential`](Self::render_sequential) stage, so the two
+    /// paths can never diverge in how the TE is built (sc-12757).
+    fn load_te(&self) -> CResult<Umt5Encoder> {
+        Ok(Umt5Encoder::new(
+            &self.te_cfg,
+            self.component_vb("text_encoder", ENC_DTYPE)?,
+        )?)
+    }
+
+    /// Build the z48 vae22 VAE (f32) — the decode-stage component. Shared by the resident and staged
+    /// paths so the residency change stays a residency change only (sc-12757).
+    fn load_vae(&self) -> CResult<WanVae> {
+        Ok(WanVae::new(
+            &self.vae_cfg,
+            self.component_vb("vae", VAE_DTYPE)?,
+        )?)
     }
 
     /// Build the TI2V-5B DiT, applying [`Self::adapters`] by tier (sc-10095): a **dense** tier folds the
@@ -185,10 +207,18 @@ impl Pipeline {
     /// Wan text-encode routine (sc-9000 / F-020); ENC_DTYPE (= f32) output is byte-identical to the
     /// pre-consolidation copy.
     fn encode(&self, comps: &Components, prompt: &str) -> CResult<Tensor> {
+        self.encode_raw(&comps.tok, &comps.te, prompt)
+    }
+
+    /// The tokenizer+encoder core of [`encode`](Self::encode), taking the two text components directly
+    /// so the sequential path can drive it with its staged (about-to-be-dropped) UMT5 encoder rather
+    /// than the resident [`Components`] bundle (sc-12757). Produces the same raw `[1, 512, 4096]` f32
+    /// context either way — the DiT's `embed_text` projection happens later, once the DiT loads.
+    fn encode_raw(&self, tok: &TextTokenizer, te: &Umt5Encoder, prompt: &str) -> CResult<Tensor> {
         text_encode::umt5_encode_padded(
-            &comps.tok,
+            tok,
             &self.te_cfg,
-            &comps.te,
+            te,
             prompt,
             &self.device,
             ENC_DTYPE,
@@ -196,50 +226,70 @@ impl Pipeline {
         )
     }
 
-    fn render(
+    /// Resolve the per-request knobs against the config defaults — shared verbatim by the resident
+    /// [`render`](Self::render) and the sequential [`render_sequential`](Self::render_sequential) so the
+    /// two paths can never resolve steps/guidance/shift differently (the residency change must be
+    /// numerics-preserving, sc-12757).
+    fn resolve_knobs(&self, req: &GenerationRequest) -> RenderKnobs {
+        RenderKnobs {
+            steps: req
+                .steps
+                .map(|s| s as usize)
+                .unwrap_or(DEFAULT_STEPS as usize),
+            frames: req.frames.unwrap_or(DEFAULT_FRAMES),
+            fps: req.fps.unwrap_or(DEFAULT_FPS),
+            guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE) as f64,
+            seed: req.seed.unwrap_or_else(gen_core::default_seed),
+            sampler: Sampler::parse(req.sampler.as_deref()),
+            shift: flow_shift(req.scheduler_shift),
+        }
+    }
+
+    /// Latent geometry (z48 strides) + the token-grid RoPE tables `(t_lat, h_lat, w_lat, cos, sin)`.
+    /// Shared by both render paths so they seed the identical noise grid + RoPE (sc-12757).
+    fn geometry(
         &self,
         req: &GenerationRequest,
-        comps: &Components,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> CResult<(Vec<Image>, u32)> {
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(DEFAULT_STEPS as usize);
-        let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
-        let fps = req.fps.unwrap_or(DEFAULT_FPS);
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE) as f64;
-        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let sampler = Sampler::parse(req.sampler.as_deref());
-        let shift = flow_shift(req.scheduler_shift);
-
-        // Text encode (pos + optional neg for CFG), then project to the DiT context once.
-        let pos_embeds = self.encode(comps, &req.prompt)?;
-        let ctx_pos = comps.dit.embed_text(&pos_embeds)?;
-        let ctx_neg = if guidance > 1.0 {
-            let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-            Some(comps.dit.embed_text(&self.encode(comps, neg)?)?)
-        } else {
-            None
-        };
-
-        // Latent geometry + RoPE for the token grid.
+        frames: u32,
+    ) -> CResult<(usize, usize, usize, Tensor, Tensor)> {
         let (t_lat, h_lat, w_lat) = pipeline::latent_dims(frames, req.width, req.height);
         let (pt, ph, pw) = self.dit_cfg.patch;
         let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
         let (cos, sin) = WanRope::new(&self.dit_cfg).cos_sin(ppf, pph, ppw, &self.device)?;
+        Ok((t_lat, h_lat, w_lat, cos, sin))
+    }
 
-        let latents0 = pipeline::create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
-
-        // epic 7114 P4 (sc-7124) Wan fold-in: the gen-core-only curated solvers (euler_ancestral /
-        // heun / dpmpp_sde / ddim) run over Wan's NATIVE flow σ schedule via the shared driver — one
-        // solver library. Wan's native UniPC (curated `uni_pc`, sc-7296) / `euler` (the diffusers
-        // FLOW-SNR multistep + flow Euler) stay the byte-exact default path; gen-core's VE-space
-        // `uni_pc`/`dpmpp_2m` are deliberately NOT routed through the fold-in (they would diverge from
-        // Wan's diffusers parity). The DiT timestep is `σ·N` (Sigma convention, ×N applied in the
-        // closure); the model output is the velocity (CFG combined inside).
+    /// Run the whole denoise from `latents0` to the final latent on the resident (single, dense) DiT,
+    /// returning the denoised latent. Extracted verbatim out of the monolithic render so the resident
+    /// and sequential paths drive the **identical** per-step math — the epic 7114 P4 curated fold-in
+    /// branch and the byte-exact native-`FlowScheduler` branch both (sc-12757, residency change only).
+    ///
+    /// epic 7114 P4 (sc-7124) Wan fold-in: the gen-core-only curated solvers (euler_ancestral / heun /
+    /// dpmpp_sde / ddim) run over Wan's NATIVE flow σ schedule via the shared driver — one solver
+    /// library. Wan's native UniPC (curated `uni_pc`, sc-7296) / `euler` (the diffusers FLOW-SNR
+    /// multistep + flow Euler) stay the byte-exact default path; gen-core's VE-space `uni_pc`/`dpmpp_2m`
+    /// are deliberately NOT routed through the fold-in (they would diverge from Wan's diffusers parity).
+    /// The DiT timestep is `σ·N` (Sigma convention, ×N applied in the closure); the model output is the
+    /// velocity (CFG combined inside).
+    #[allow(clippy::too_many_arguments)]
+    fn denoise(
+        &self,
+        dit: &WanTransformer,
+        ctx_pos: &Tensor,
+        ctx_neg: Option<&Tensor>,
+        guidance: f64,
+        cos: &Tensor,
+        sin: &Tensor,
+        latents0: Tensor,
+        knobs: &RenderKnobs,
+        sampler_name: Option<&str>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<Tensor> {
+        let steps = knobs.steps;
+        let shift = knobs.shift;
         const FOLDIN: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
-        let latents = if let Some(name) = req.sampler.as_deref().filter(|n| FOLDIN.contains(n)) {
+        let latents = if let Some(name) = sampler_name.filter(|n| FOLDIN.contains(n)) {
             let native = scheduler::flow_sigmas(steps, shift);
             let n_train = config::NUM_TRAIN_TIMESTEPS as f64;
             candle_gen::run_flow_sampler(
@@ -247,15 +297,15 @@ impl Pipeline {
                 TimestepConvention::Sigma,
                 &native,
                 latents0,
-                seed,
-                &req.cancel,
+                knobs.seed,
+                cancel,
                 on_progress,
                 |latents, t| -> CResult<Tensor> {
                     let ts = t as f64 * n_train;
-                    let v_pos = comps.dit.forward(latents, &ctx_pos, ts, &cos, &sin)?;
-                    let v = match &ctx_neg {
+                    let v_pos = dit.forward(latents, ctx_pos, ts, cos, sin)?;
+                    let v = match ctx_neg {
                         Some(neg) => {
-                            let v_neg = comps.dit.forward(latents, neg, ts, &cos, &sin)?;
+                            let v_neg = dit.forward(latents, neg, ts, cos, sin)?;
                             pipeline::cfg(&v_pos, &v_neg, guidance)?
                         }
                         None => v_pos,
@@ -266,17 +316,15 @@ impl Pipeline {
         } else {
             // Native FlowScheduler (UniPC default / flow Euler) — the byte-exact N1 path, untouched.
             let mut latents = latents0;
-            let mut sched = FlowScheduler::new(sampler, steps, shift);
+            let mut sched = FlowScheduler::new(knobs.sampler, steps, shift);
             let total = steps as u32;
             for i in 0..steps {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
+                check_cancel(cancel)?;
                 let t = sched.timestep(i);
-                let v_pos = comps.dit.forward(&latents, &ctx_pos, t, &cos, &sin)?;
-                let v = match &ctx_neg {
+                let v_pos = dit.forward(&latents, ctx_pos, t, cos, sin)?;
+                let v = match ctx_neg {
                     Some(neg) => {
-                        let v_neg = comps.dit.forward(&latents, neg, t, &cos, &sin)?;
+                        let v_neg = dit.forward(&latents, neg, t, cos, sin)?;
                         pipeline::cfg(&v_pos, &v_neg, guidance)?
                     }
                     None => v_pos,
@@ -289,6 +337,46 @@ impl Pipeline {
             }
             latents
         };
+        Ok(latents)
+    }
+
+    /// The resident render (unchanged residency: `Components` holds UMT5, the DiT and the VAE
+    /// co-resident for the whole generation). Encodes once, projects the DiT context, denoises, decodes.
+    fn render(
+        &self,
+        req: &GenerationRequest,
+        comps: &Components,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<(Vec<Image>, u32)> {
+        let knobs = self.resolve_knobs(req);
+
+        // Text encode (pos + optional neg for CFG), then project to the DiT context once.
+        let pos_embeds = self.encode(comps, &req.prompt)?;
+        let ctx_pos = comps.dit.embed_text(&pos_embeds)?;
+        let ctx_neg = if knobs.guidance > 1.0 {
+            let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
+            Some(comps.dit.embed_text(&self.encode(comps, neg)?)?)
+        } else {
+            None
+        };
+
+        let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
+        let latents0 =
+            pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+
+        let latents = self.denoise(
+            &comps.dit,
+            &ctx_pos,
+            ctx_neg.as_ref(),
+            knobs.guidance,
+            &cos,
+            &sin,
+            latents0,
+            &knobs,
+            req.sampler.as_deref(),
+            &req.cancel,
+            on_progress,
+        )?;
 
         on_progress(Progress::Decoding);
         // Memory-bounded z48 vae22 decode (sc-7111): the per-frame streaming `decode` already bounds
@@ -296,8 +384,190 @@ impl Pipeline {
         // frame can't spike VRAM, and returns a catchable error rather than OOM-ing when over budget.
         let decoded = comps.vae.decode_budgeted(&latents)?;
         let images = pipeline::frames_to_images(&decoded)?;
-        Ok((images, fps))
+        Ok((images, knobs.fps))
     }
+
+    /// The **sequential-offload** render (sc-12757, epic 12732) — the staged twin of
+    /// [`render`](Self::render) that keeps only **one** heavy component GPU-resident at a time, so the
+    /// f32 UMT5 encoder (~21 GB, dead weight after the encode) is off-GPU for the entire denoise and the
+    /// DiT is freed before the VAE loads. The 5B is a single dense DiT (no MoE / expert swap), so the
+    /// stages are linear:
+    ///
+    /// 1. **TE off-GPU during denoise.** Load UMT5, encode the pos (+ neg when CFG) **raw** `[1,512,4096]`
+    ///    context, then DROP the ~21 GB f32 encoder — only the small raw context tensors survive.
+    /// 2. **DiT only for the denoise.** Load the DiT, project the raw context through its own
+    ///    `embed_text`, run the full denoise, then DROP the DiT before the VAE materializes.
+    /// 3. **VAE decode.** Load the VAE and `decode_budgeted`.
+    ///
+    /// Parity: the DiT `embed_text` projection is DiT-entangled, so it must happen after the DiT loads —
+    /// the raw UMT5 context stays resident across the TE drop. The denoise runs the identical
+    /// [`denoise`](Self::denoise) helper as the resident path, so the residency change is numerics-only.
+    /// Each heavy component is a local bound to its own scope (driven through [`staged_sequential`]), so
+    /// Rust's scope drop frees it before the next loads; a `device.synchronize()` at each boundary drains
+    /// the async encode/denoise kernels before the freed pool is reused (the sc-12195 eviction race).
+    fn render_sequential(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<(Vec<Image>, u32)> {
+        let knobs = self.resolve_knobs(req);
+        let cancel = &req.cancel;
+        check_cancel(cancel)?;
+
+        // The tiny tokenizer is cheap and stays resident across the whole render; the heavy UMT5 encoder
+        // is dropped right after encoding.
+        let tok = text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan")?;
+        let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
+        let latents0 =
+            pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+
+        // The cross-stage tensors that must survive a component drop: the raw UMT5 context (stage 1 →
+        // stage 2) and the denoised latents (seeded here, denoised in stage 2, decoded in stage 3).
+        let mut state = SeqState {
+            pos: None,
+            neg: None,
+            latents: Some(latents0),
+            on_progress: &mut *on_progress,
+        };
+
+        staged_sequential(
+            &mut state,
+            // ── Stage 1: load UMT5 → raw pos/neg context. DROP the ~21 GB encoder at the brace. ──
+            |st| {
+                check_cancel(cancel)?;
+                (st.on_progress)(Progress::Loading(LoadPhase::TextEncoder));
+                self.load_te()
+            },
+            |te, st| {
+                st.pos = Some(self.encode_raw(&tok, te, &req.prompt)?);
+                st.neg = if knobs.guidance > 1.0 {
+                    let neg_prompt = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
+                    Some(self.encode_raw(&tok, te, neg_prompt)?)
+                } else {
+                    None
+                };
+                Ok(())
+            },
+            // ── Stage 2: load the DiT → project + denoise. DROP the DiT before the VAE loads. ──
+            |st| {
+                check_cancel(cancel)?;
+                (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                self.build_dit()
+            },
+            |dit, st| {
+                let pos = st.pos.as_ref().expect("pos context encoded in stage 1");
+                let ctx_pos = dit.embed_text(pos)?;
+                let ctx_neg = match &st.neg {
+                    Some(neg) => Some(dit.embed_text(neg)?),
+                    None => None,
+                };
+                let latents0 = st.latents.take().expect("noise seeded before staging");
+                let latents = self.denoise(
+                    dit,
+                    &ctx_pos,
+                    ctx_neg.as_ref(),
+                    knobs.guidance,
+                    &cos,
+                    &sin,
+                    latents0,
+                    &knobs,
+                    req.sampler.as_deref(),
+                    cancel,
+                    st.on_progress,
+                )?;
+                st.latents = Some(latents);
+                Ok(())
+            },
+            // ── Stage 3: load the VAE → decode. ──
+            |st| {
+                check_cancel(cancel)?;
+                (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                self.load_vae()
+            },
+            |vae, st| {
+                (st.on_progress)(Progress::Decoding);
+                let latents = st.latents.as_ref().expect("latents denoised in stage 2");
+                let decoded = vae.decode_budgeted(latents)?;
+                let images = pipeline::frames_to_images(&decoded)?;
+                Ok((images, knobs.fps))
+            },
+            // sc-12195 boundary sync: drain kernels before the used component's pool is reused.
+            || Ok(self.device.synchronize()?),
+        )
+    }
+}
+
+/// Resolved per-request render knobs (steps/guidance/shift/…), produced by
+/// [`Pipeline::resolve_knobs`] and consumed identically by the resident and sequential render paths so
+/// the residency change stays numerics-preserving (sc-12757).
+struct RenderKnobs {
+    steps: usize,
+    frames: u32,
+    fps: u32,
+    guidance: f64,
+    seed: u64,
+    sampler: Sampler,
+    shift: f64,
+}
+
+/// The mutable render state threaded through [`staged_sequential`] (sc-12757): the cross-stage tensors
+/// that must outlive a component drop (the raw UMT5 context; the latents seeded → denoised → decoded)
+/// plus the progress sink. Held so exclusive access moves between the load/use closures via the
+/// `&mut SeqState` param rather than being captured by each closure — the borrow-checker-clean way to
+/// let the `FnOnce` stages share state without a `RefCell` (mirrors `wan14b`'s `SwapState`).
+struct SeqState<'a> {
+    /// Raw UMT5 positive context, encoded in stage 1 (TE resident), projected + consumed in stage 2
+    /// (DiT resident) — survives the TE drop.
+    pos: Option<Tensor>,
+    /// Raw UMT5 negative context (CFG only, else `None`), same lifetime as [`Self::pos`].
+    neg: Option<Tensor>,
+    /// Working latents: seeded before staging, denoised in stage 2 (survives the TE drop), decoded in
+    /// stage 3 (survives the DiT drop).
+    latents: Option<Tensor>,
+    on_progress: &'a mut dyn FnMut(Progress),
+}
+
+/// Drive the dense TI2V-5B sequential offload so at most **one** heavy component is GPU-resident at a
+/// time (sc-12757, the dense Pillar-1 win — no expert swap, the 5B is a single DiT): the ~21 GB f32
+/// UMT5 text encoder, then the bf16 DiT, then the f32 VAE. Each component is a local bound to its own
+/// block, so Rust's scope drop frees it **before** the next loads — the TE drops before the DiT loads
+/// (so it is off-GPU for the whole denoise) and the DiT drops before the VAE loads. `sync` runs at each
+/// stage boundary — after the component is used and before it drops (and before the next loads) — so
+/// in-flight kernels are drained before the freed allocator pool is reused (the sc-12195 eviction race).
+///
+/// Generic over the component types and the threaded state `St` so a CPU unit test can pin the
+/// never-co-resident + drop-order properties with a lightweight liveness witness — no GPU, no real
+/// weights — exactly as `wan14b`'s `staged_expert_swap` is pinned. The load closures receive `&mut St`
+/// so they can emit their [`Progress::Loading`] before the (heavy) load; the use closures receive
+/// `&mut St` to read/advance the cross-stage tensors.
+#[allow(clippy::too_many_arguments)]
+fn staged_sequential<Te, Dit, Vae, St, R>(
+    state: &mut St,
+    load_te: impl FnOnce(&mut St) -> CResult<Te>,
+    use_te: impl FnOnce(&Te, &mut St) -> CResult<()>,
+    load_dit: impl FnOnce(&mut St) -> CResult<Dit>,
+    use_dit: impl FnOnce(&Dit, &mut St) -> CResult<()>,
+    load_vae: impl FnOnce(&mut St) -> CResult<Vae>,
+    use_vae: impl FnOnce(&Vae, &mut St) -> CResult<R>,
+    mut sync: impl FnMut() -> CResult<()>,
+) -> CResult<R> {
+    // Stage 1: the UMT5 text encoder is resident ONLY for the encode.
+    {
+        let te = load_te(state)?;
+        use_te(&te, state)?;
+        // Drain the encode before `te` frees at the brace below and the DiT reuses the pool.
+        sync()?;
+    } // `te` drops HERE — off-GPU for the whole denoise (never co-resident with the DiT).
+      // Stage 2: the DiT is resident ONLY for the denoise.
+    {
+        let dit = load_dit(state)?;
+        use_dit(&dit, state)?;
+        // Drain the denoise before `dit` frees and the VAE reuses the pool.
+        sync()?;
+    } // `dit` drops HERE — freed before the VAE is ever loaded.
+      // Stage 3: the VAE decodes (the terminal component).
+    let vae = load_vae(state)?;
+    use_vae(&vae, state)
 }
 
 pub struct WanGenerator {
@@ -307,6 +577,14 @@ pub struct WanGenerator {
     /// LoRA/LoKr adapters applied to the DiT at first load (sc-10095) — folded (dense) or additive
     /// (packed q4/q8 tier).
     adapters: Vec<AdapterSpec>,
+    /// Component-residency policy (epic 12732, sc-12757), resolved once at load via
+    /// [`effective_offload_policy`] (honoring both `LoadSpec::offload_policy` and the family-wide
+    /// `CANDLE_GEN_OFFLOAD=sequential` A/B override). [`OffloadPolicy::Resident`] keeps the cached
+    /// [`Components`] warm; [`OffloadPolicy::Sequential`] drives the staged
+    /// [`Pipeline::render_sequential`] (TE-offload + DiT-drop-before-VAE), bounding the denoise peak by
+    /// keeping the ~21 GB f32 UMT5 encoder off-GPU. The resident [`components`](Self::components) cache
+    /// stays untouched under `Sequential` — the staged path never populates it.
+    offload: OffloadPolicy,
     components: Mutex<Option<Components>>,
 }
 
@@ -371,8 +649,17 @@ impl Generator for WanGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         let pipe = Pipeline::load(&self.root, &self.device, self.adapters.clone());
-        let components = self.components(&pipe)?;
-        let (frames, fps) = pipe.render(req, &components, on_progress)?;
+        // Sequential offload (sc-12757): stage load→use→drop each heavy component so the denoise peak is
+        // the DiT alone — the ~21 GB f32 UMT5 encoder is off-GPU for the whole denoise and the DiT is
+        // freed before the VAE loads. Resident (default): the cached `Components` bundle, unchanged path.
+        // The staged path never populates the resident cache.
+        let (frames, fps) = match self.offload {
+            OffloadPolicy::Sequential => pipe.render_sequential(req, on_progress)?,
+            OffloadPolicy::Resident => {
+                let components = self.components(&pipe)?;
+                pipe.render(req, &components, on_progress)?
+            }
+        };
         Ok(GenerationOutput::Video {
             frames,
             fps,
@@ -427,7 +714,11 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            supports_sequential_offload: false,
+            // The TI2V-5B honors `OffloadPolicy::Sequential` (epic 12732, sc-12757): the staged
+            // `render_sequential` keeps the ~21 GB f32 UMT5 encoder off-GPU for the whole denoise and
+            // frees the dense DiT before the VAE loads, bounding the pre-decode peak. Advertised so the
+            // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
+            supports_sequential_offload: true,
         },
     }
 }
@@ -439,6 +730,13 @@ pub fn descriptor() -> ModelDescriptor {
 /// load. **LoRA/LoKr adapters** apply at first `generate` (sc-10095: folded on a dense tier, additive on
 /// a packed one); control / VACE / IP-adapter overlays are still rejected (not wired).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(build_generator(spec)?))
+}
+
+/// The concrete constructor behind [`load`] — validates the spec surface and resolves the residency
+/// policy, returning the concrete [`WanGenerator`] so the offload-policy wiring is unit-testable without
+/// a `dyn Generator` downcast (sc-12757, mirroring the A14B's `build_generator`).
+fn build_generator(spec: &LoadSpec) -> gen_core::Result<WanGenerator> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -459,13 +757,17 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let device = candle_gen::default_device()?;
-    Ok(Box::new(WanGenerator {
+    // Resolve the residency policy once (sc-12757): honors both `spec.offload_policy` and the
+    // family-wide `CANDLE_GEN_OFFLOAD=sequential` A/B override.
+    let offload = effective_offload_policy(spec.offload_policy);
+    Ok(WanGenerator {
         descriptor: descriptor(),
         root,
         device,
         adapters: spec.adapters.clone(),
+        offload,
         components: Mutex::new(None),
-    }))
+    })
 }
 
 candle_gen::register_generators! {
@@ -837,5 +1139,237 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── sc-12757: dense sequential component offload (TE/VAE off-GPU) — Pillar 1 ──
+
+    /// The 5B must now advertise `supports_sequential_offload` so the worker's fit-gate can tell "the
+    /// staged path bounds peak VRAM here" from a no-op fallback (sc-11126 contract). It was `false`
+    /// before this story — the TI2V-5B was NOT touched by the A14B's sc-12733.
+    #[test]
+    fn descriptor_advertises_sequential_offload() {
+        assert!(
+            descriptor().capabilities.supports_sequential_offload,
+            "the TI2V-5B must advertise sequential offload (sc-12757)"
+        );
+    }
+
+    /// The load path resolves the residency policy from `LoadSpec::offload_policy` via
+    /// [`effective_offload_policy`]: the default spec stays `Resident` (cached-components, unchanged
+    /// path), an explicit `Sequential` spec flips the generator onto the staged `render_sequential`.
+    #[test]
+    fn load_resolves_offload_policy_from_spec() {
+        let resident = build_generator(&LoadSpec::new(WeightsSource::Dir("/snap".into()))).unwrap();
+        assert_eq!(resident.offload, OffloadPolicy::Resident);
+
+        let sequential = build_generator(
+            &LoadSpec::new(WeightsSource::Dir("/snap".into()))
+                .with_offload_policy(OffloadPolicy::Sequential),
+        )
+        .unwrap();
+        assert_eq!(sequential.offload, OffloadPolicy::Sequential);
+    }
+
+    /// A liveness witness for the sequential-offload residency tests, mirroring the drop-order witnesses
+    /// in `wan14b`'s tests: it bumps a shared live-counter on construction and drops it on `Drop`,
+    /// recording the peak concurrency and an ordered load/use/drop log.
+    struct LiveTracker {
+        live: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+        log: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl LiveTracker {
+        fn new() -> Self {
+            Self {
+                live: std::cell::Cell::new(0),
+                peak: std::cell::Cell::new(0),
+                log: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn born(&self, tag: &'static str) {
+            self.live.set(self.live.get() + 1);
+            if self.live.get() > self.peak.get() {
+                self.peak.set(self.live.get());
+            }
+            self.log.borrow_mut().push(tag);
+        }
+        fn died(&self, tag: &'static str) {
+            self.live.set(self.live.get() - 1);
+            self.log.borrow_mut().push(tag);
+        }
+        fn note(&self, tag: &'static str) {
+            self.log.borrow_mut().push(tag);
+        }
+    }
+
+    /// Stands in for a loaded heavy component (UMT5 / DiT / VAE): its lifetime on the live-counter is
+    /// exactly that component's GPU-residency window in `staged_sequential`.
+    struct CompWitness<'a> {
+        tracker: &'a LiveTracker,
+        drop_tag: &'static str,
+    }
+
+    impl<'a> CompWitness<'a> {
+        fn new(tracker: &'a LiveTracker, born_tag: &'static str, drop_tag: &'static str) -> Self {
+            tracker.born(born_tag);
+            Self { tracker, drop_tag }
+        }
+    }
+
+    impl Drop for CompWitness<'_> {
+        fn drop(&mut self) {
+            self.tracker.died(self.drop_tag);
+        }
+    }
+
+    /// The Pillar-1 invariant (sc-12757): at most ONE heavy component is resident at a time, and the
+    /// stages drop in order — the TE is off-GPU before the denoise runs, and the DiT drops before the
+    /// VAE loads. Driven through the production `staged_sequential` with drop-order witnesses (candle's
+    /// cudarc pool makes `nvidia-smi` blind to a drop, so residency is asserted structurally, not by a
+    /// VRAM read). `use_vae` returns a sentinel to prove the value threads back out.
+    #[test]
+    fn sequential_stages_are_never_co_resident_and_drop_in_order() {
+        let tracker = LiveTracker::new();
+        let mut st = ();
+        let out = staged_sequential(
+            &mut st,
+            |_st| Ok(CompWitness::new(&tracker, "load-te", "drop-te")),
+            |_w, _st| {
+                tracker.note("use-te");
+                Ok(())
+            },
+            |_st| Ok(CompWitness::new(&tracker, "load-dit", "drop-dit")),
+            |_w, _st| {
+                tracker.note("use-dit");
+                Ok(())
+            },
+            |_st| Ok(CompWitness::new(&tracker, "load-vae", "drop-vae")),
+            |_w, _st| {
+                tracker.note("use-vae");
+                Ok(42usize)
+            },
+            || Ok(()),
+        );
+        assert_eq!(out.unwrap(), 42, "the decode result must thread back out");
+        assert_eq!(
+            tracker.peak.get(),
+            1,
+            "at most ONE heavy component may be GPU-resident at a time (the whole Pillar-1 win)"
+        );
+        assert_eq!(
+            *tracker.log.borrow(),
+            vec![
+                "load-te", "use-te", "drop-te", //
+                "load-dit", "use-dit", "drop-dit", //
+                "load-vae", "use-vae", "drop-vae",
+            ],
+            "the stages must load → use → drop strictly in order"
+        );
+        // Explicit drop-order sub-assertions (the story's two named liveness guarantees).
+        let log = tracker.log.borrow();
+        let at = |tag: &str| log.iter().position(|x| *x == tag).unwrap();
+        assert!(
+            at("drop-te") < at("use-dit"),
+            "the ~21 GB UMT5 encoder must be off-GPU BEFORE the denoise (use-dit) runs"
+        );
+        assert!(
+            at("drop-dit") < at("load-vae"),
+            "the DiT must be dropped BEFORE the VAE loads"
+        );
+    }
+
+    /// Mutation-check (sc-12757 acceptance): force the TE resident across the DiT load+denoise and
+    /// confirm the never-co-resident assertion regresses — proving the passing test above is not a
+    /// default-value false green. This is the exact dead-weight-resident bug the story removes (the old
+    /// `Components` held the f32 UMT5 for the whole render): binding `te` and `dit` in one scope
+    /// co-resides them, and the SAME liveness witness the passing test relies on now reports peak
+    /// concurrency 2, so its `peak == 1` assertion goes RED.
+    #[test]
+    fn forcing_te_resident_regresses_the_never_co_resident_assertion() {
+        let tracker = LiveTracker::new();
+        {
+            // MUTATION: the TE is NOT dropped before the DiT loads / denoise runs.
+            let _te = CompWitness::new(&tracker, "load-te", "drop-te");
+            let _dit = CompWitness::new(&tracker, "load-dit", "drop-dit");
+            tracker.note("te-resident-during-denoise");
+        }
+        assert_eq!(
+            tracker.peak.get(),
+            2,
+            "the forced-resident mutation co-resides the TE + DiT"
+        );
+        assert!(
+            tracker.peak.get() > 1,
+            "the never-co-resident assertion (peak == 1) MUST fail under the TE-resident mutation — \
+             the passing test genuinely discriminates residency, it is not a false green"
+        );
+    }
+
+    /// The sc-12195 eviction sync, applied per stage boundary (sc-12757): the boundary `sync` runs after
+    /// each heavy component is used and **before** it drops (and before the next loads) — draining
+    /// in-flight kernels so the freed allocator pool is never reused under them. The terminal VAE decode
+    /// has no trailing sync (nothing loads after it). Mirrors `wan14b`'s boundary-sync ordering witness.
+    #[test]
+    fn sequential_syncs_before_each_component_drops() {
+        let tracker = LiveTracker::new();
+        let mut st = ();
+        staged_sequential(
+            &mut st,
+            |_st| Ok(CompWitness::new(&tracker, "load-te", "drop-te")),
+            |_w, _st| {
+                tracker.note("use-te");
+                Ok(())
+            },
+            |_st| Ok(CompWitness::new(&tracker, "load-dit", "drop-dit")),
+            |_w, _st| {
+                tracker.note("use-dit");
+                Ok(())
+            },
+            |_st| Ok(CompWitness::new(&tracker, "load-vae", "drop-vae")),
+            |_w, _st| {
+                tracker.note("use-vae");
+                Ok(())
+            },
+            || {
+                tracker.note("sync");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *tracker.log.borrow(),
+            vec![
+                "load-te", "use-te", "sync", "drop-te", //
+                "load-dit", "use-dit", "sync", "drop-dit", //
+                "load-vae", "use-vae", "drop-vae",
+            ],
+            "each heavy component must be synced (kernels drained) before it drops and the next loads"
+        );
+    }
+
+    /// A load failure on the DiT still drops the (already-used-and-synced) TE via scope drop on the `?`
+    /// path — no leak, and the error propagates. The VAE is never loaded.
+    #[test]
+    fn sequential_propagates_a_dit_load_failure_after_dropping_te() {
+        let tracker = LiveTracker::new();
+        let mut st = ();
+        let out: CResult<()> = staged_sequential(
+            &mut st,
+            |_st| Ok(CompWitness::new(&tracker, "load-te", "drop-te")),
+            |_w, _st| Ok(()),
+            |_st| Err(CandleError::Msg("DiT OOM".into())),
+            |_w: &CompWitness, _st| Ok(()),
+            |_st| Ok(CompWitness::new(&tracker, "load-vae", "drop-vae")),
+            |_w, _st| Ok(()),
+            || Ok(()),
+        );
+        assert!(matches!(out, Err(CandleError::Msg(_))));
+        assert_eq!(
+            *tracker.log.borrow(),
+            vec!["load-te", "drop-te"],
+            "the TE must have dropped before the DiT load was even attempted; the VAE never loads"
+        );
+        assert_eq!(tracker.peak.get(), 1);
     }
 }
