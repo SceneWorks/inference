@@ -463,7 +463,7 @@ impl AdaptLinear {
     /// [`Self::forward`] for a **storage-dtype ≠ compute-dtype** site (sc-12828): the dense base weight
     /// is upcast to `x`'s dtype per call, so a bf16-resident projection runs against f32 activations
     /// without materializing the whole weight at f32 (only the one weight in flight is transient). The
-    /// additive residuals already cast their factors to `x`'s dtype ([`Adapter::residual`]), so they are
+    /// additive residuals already cast their factors to `x`'s dtype (`Adapter::residual`), so they are
     /// unchanged. Inert (byte-identical to [`Self::forward`], an `Arc` clone with no copy) when `x`
     /// already matches the base dtype — the f32-store training/control paths. Used by the Qwen3-VL text
     /// encoders (krea/boogu), whose bf16-stored projections run against an f32 hidden state.

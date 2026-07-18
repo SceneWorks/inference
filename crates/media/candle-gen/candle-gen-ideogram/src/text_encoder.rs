@@ -20,7 +20,7 @@
 //! its weights are **stored bf16** (sc-12828). The Qwen3-VL-8B weights ship bf16 on disk, so an f32
 //! store only widens them (~16 GB resident to carry no extra precision). The embedding is upcast to f32
 //! and each projection runs [`QLinear::forward_upcast`] (bf16 weight → f32 per matmul), with the
-//! RMSNorm weights loaded f32 ([`rms_norm_f32`]), so the forward is bit-identical to an f32 store at
+//! RMSNorm weights loaded f32 (`rms_norm_f32`), so the forward is bit-identical to an f32 store at
 //! half the resident footprint.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
@@ -360,7 +360,7 @@ mod tests {
     /// The parity gate (sc-12828): a bf16 weight **store** with f32 **compute** is bit-identical to an
     /// f32 store — the disk weights are bf16, so an f32 store only widens them and every matmul still
     /// runs f32 (the projections upcast via `QLinear::forward_upcast`, the RMSNorm weights load f32 via
-    /// [`rms_norm_f32`], and the embedding is upcast to f32). Reverting any of those makes the bf16 path
+    /// `rms_norm_f32`, and the embedding is upcast to f32). Reverting any of those makes the bf16 path
     /// a dtype-mismatch error, so this goes RED — it is not a tautology that passes with the win ripped
     /// out. CPU-runnable precisely because the compute never leaves f32.
     #[test]
