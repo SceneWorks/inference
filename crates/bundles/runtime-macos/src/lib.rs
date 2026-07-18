@@ -101,9 +101,9 @@ mod tests {
         assert_eq!(snapshot.text_llm_ids, ["mlx-llama", "mlx-joycaption"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
         // The audio lane is declared Candle-native on this mlx bundle (sc-12901) — the
-        // sanctioned cross-backend seam. Its ordered id surface is the audio catalog's — first
-        // shipped provider: kokoro_82m (sc-12836); later stories extend this exact assertion in
-        // catalog order. The lane carries the composed candle preparer (sc-12835/sc-12836)
+        // sanctioned cross-backend seam. Its ordered id surface is the audio catalog's —
+        // shipped providers: kokoro_82m (sc-12836), moss_sfx_v2 (sc-12841); later stories
+        // extend in catalog order. The lane carries the composed candle preparer (sc-12835/sc-12836)
         // while the main preparer registry stays mlx-only.
         #[cfg(feature = "audio")]
         {
@@ -111,7 +111,7 @@ mod tests {
                 snapshot.audio_backend.as_deref(),
                 Some(super::AUDIO_BACKEND)
             );
-            assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m"]);
+            assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m", "moss_sfx_v2"]);
             assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         }
         #[cfg(not(feature = "audio"))]
@@ -190,7 +190,10 @@ mod tests {
         assert!(matches!(descriptor.modality, gen_core::Modality::Audio));
         let snapshot = catalog.snapshot();
         assert!(snapshot.generator_ids.len() > 50);
-        assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m", "dummy-audio"]);
+        assert_eq!(
+            snapshot.audio_generator_ids,
+            ["kokoro_82m", "moss_sfx_v2", "dummy-audio"]
+        );
         assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
     }

@@ -47,6 +47,24 @@ environment = ["KOKORO_SNAPSHOT"]
 expected_files = ["config.json", "kokoro-v1_0.pth", "voices/af_heart.pt"]
 
 [[models]]
+key = "moss-soundeffect-v2"
+repository = "OpenMOSS-Team/MOSS-SoundEffect-v2.0"
+revision = "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MOSS_SFX_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "text_encoder/model.safetensors.index.json",
+    "tokenizer/tokenizer.json",
+    "vae/vae_128d_48k.pth",
+]
+
+[[models]]
 key = "mochi-1-preview"
 repository = "genmo/mochi-1-preview"
 revision = "14be5fcea23095ed330cb214647916a451e38b6e"

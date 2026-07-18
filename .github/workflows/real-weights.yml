@@ -66,18 +66,22 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, real-weights]
     env:
       KOKORO_SNAPSHOT: ${{ vars.KOKORO_SNAPSHOT }}
+      MOSS_SFX_SNAPSHOT: ${{ vars.MOSS_SFX_SNAPSHOT }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
         run: rustc --version && cargo --version
-      - name: Materialize and verify immutable snapshot
+      - name: Materialize and verify immutable snapshots
         run: |
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-soundeffect-v2 --snapshot "$MOSS_SFX_SNAPSHOT"
       - name: Run provider conformance
         run: |
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_wav_conformance -- --ignored --nocapture
+          cargo test --locked -p candle-audio-moss-sfx --test conformance moss_sfx_conformance -- --ignored --nocapture
+          cargo test --locked -p candle-audio-moss-sfx --test conformance moss_sfx_wav_conformance -- --ignored --nocapture
       # Regression fixture (sc-12854): the validation harness's committed metric envelope +
       # PCM repeatability hash; this runner IS the fixture's canonical platform
       # (macos/aarch64), so the exact-hash check gates here.
