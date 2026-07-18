@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Dump S1 parity fixtures from the `mlx_video` Wan reference: UMT5-XXL prompt embeddings, plus the
+
+sc-12896: fixtures now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320 +
+PYTHONPATH=<mlx_video src>); the SceneWorks-venv instructions below are the original recipe.
+
 cleaned text + token ids, for the Rust port to gate against.
 
 Run with the SceneWorks venv that has `mlx_video` + torch + ftfy + transformers installed:

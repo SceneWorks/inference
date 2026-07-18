@@ -20,12 +20,24 @@ Default-running tests only depend on committed inputs; anything needing un-commi
 
 ## Regenerating
 
+> **sc-12896 (MLX 0.32.0): use the version-matched NON-NAX env.** Goldens must be dumped with
+> **mlx 0.32.0 built from source at `MACOSX_DEPLOYMENT_TARGET=15.0`** into a venv carrying the
+> ORIGINAL reference stack (python 3.12, diffusers 0.37.1, transformers 5.10.1, torch 2.12.0) —
+> the canonical one is `~/Repos/mflux/.venv-0320`. The pip wheel is NOT a valid reference on
+> M3-class-or-newer hosts for every kernel: 0.32.0 gates NAX kernels on the build's deployment
+> target AND gates the affine-quant `qmv_wide` kernel on **GPU generation >= 15** (a hardware gate
+> no build flag can flip — see `mlx-gen-mochi/tools/dump_mochi_quant_fixtures.py` for the one
+> committed golden this poisons). Also note (sc-12896): 0.32.0 broke cross-stack f32/dense-bf16
+> bit-identity between the Python reference and the Rust port (shape-dependent kernel-variant
+> selection), so the bit-exact suites now gate with tight measured bounds instead of `== 0.0`
+> where the mode demands it — each affected test documents its own contract.
+
 Goldens are produced by running the dump scripts **from the frozen Python `mflux` fork** (which has
-the reference implementation + its `.venv`), pointed at this repo's `tools/`:
+the reference implementation), pointed at this repo's `tools/`:
 
 ```sh
 cd ~/repos/mflux
-uv run python /path/to/mlx-gen/tools/dump_<name>.py        # writes into this dir
+PYTHONPATH=~/Repos/mflux/src ~/Repos/mflux/.venv-0320/bin/python /path/to/mlx-gen/tools/dump_<name>.py
 ```
 
 Each script writes into `tools/golden/` next to itself (paths are `__file__`-relative, so this

@@ -1,5 +1,9 @@
 """LTX-2.3 LoRA-in-generate golden (sc-2687).
 
+sc-12896: goldens now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320); the old
+/tmp/mlx312 (0.31.2) instructions below are retained for provenance only.
+
 Applies a real LTX-2.3 LoRA to the shipped `ltx_2_3_base_q8` transformer via the reference's
 **forward-time residual** (`mlx_video/lora/apply.py::LoRALinear` — `out + scale·strength·(x·Aᵀ·Bᵀ)`,
 NOT the merge path), then runs the **native bf16 + Q8** 2-stage distilled denoise → frames. This is

@@ -28,7 +28,8 @@ use mlx_gen::{
 use mlx_gen_sdxl::{apply_sdxl_adapters, load_unet};
 
 // Production runs fp16 (sc-2721); the render gate uses the `float16=True` vendored-merge golden,
-// dumped on MLX 0.31.2. Build: FLOAT16=1 <mlx-0.31.2 python> tools/dump_sdxl_lora_golden.py
+// dumped on MLX 0.32.0 (re-dumped sc-12896 on the non-NAX from-source env; verified 0.000% px>8).
+// Build: FLOAT16=1 <0.32.0-non-NAX python> tools/dump_sdxl_lora_golden.py
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/sdxl_lora_fp16_golden.safetensors"

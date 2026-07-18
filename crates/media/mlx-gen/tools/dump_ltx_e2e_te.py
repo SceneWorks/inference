@@ -1,5 +1,9 @@
 """LTX-2.3 e2e golden — PHASE A: reference text encoder (sc-2679 S6).
 
+sc-12896: goldens now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320); the old
+/tmp/mlx312 (0.31.2) instructions below are retained for provenance only.
+
 Tokenizes a fixed prompt with the Gemma-3 `AutoTokenizer` (left-pad, `max_length`, `add_special_
 tokens`) and runs the reference TE (Gemma backbone → per-token-RMS feature extractor → connector) →
 `video_embeddings`. The TE is pure dense, so this runs in the **mflux venv (0.31.0)** (it has

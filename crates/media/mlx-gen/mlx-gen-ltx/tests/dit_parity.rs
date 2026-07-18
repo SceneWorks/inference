@@ -7,14 +7,20 @@
 //!
 //! **The golden MUST match the Rust build's MLX — now 0.32.0** (epic 12742, `pmetal-mlx-rs`
 //! 932beb4e): `quantized_matmul` changed 0.31.0→0.31.2 (a 0.31.0 golden mismatches by ~5e-4/op) and
-//! again by a 1–2 ULP-f32 bug-fix class on 0.31.2→0.32.0 (sc-12744/sc-12747). The committed golden is
-//! still a 0.31.2 dump; **re-dump it on the 0.32.0 env** (`tools/dump_ltx_dit_golden.py`) before this
-//! `#[ignore]`d gate is run on the new pin. At the matched version the **full 48-layer velocity is
-//! bit-exact** (peak_rel = mean_rel = 0.0). It was not until sc-2842: the adaLN timestep sinusoid was
-//! tabulated on the host in f64 then cast to f32 (the reference `get_timestep_embedding` builds it in
-//! MLX f32), a ~1e-7/elem seed that — fed into the f32 adaLN modulating every block — compounded over
-//! the 48-layer residual to ~0.9% mean_rel. Building the table in MLX f32 makes it bit-exact. Honors
-//! "divergence is not rounding": the residual was a real, named, fixed op, not f32 accumulation.
+//! again on 0.31.2→0.32.0 (sc-12744/sc-12747; the whole-forward velocity moved peak_rel ≈ 1.1e-1 —
+//! per-op ULP drift chaos-amplified over 48 layers). The committed golden was re-dumped on the
+//! **0.32.0 non-NAX env** (sc-12896: mlx 0.32.0 built from source at `MACOSX_DEPLOYMENT_TARGET=15.0`
+//! into `~/Repos/mflux/.venv-0320`; see `tools/dump_ltx_dit_golden.py`).
+//!
+//! **Contract on 0.32.0 (sc-12896):** the **bf16-activation path stays bit-exact** (peak_rel =
+//! mean_rel = 0.0, asserted). The **f32-activation path is no longer cross-stack bit-exact**: 0.32.0's
+//! rewritten steel/quant kernels select shape-dependent variants, so the Python reference and the Rust
+//! port (which fuse/batch some Linears differently) accumulate ~1-ULP per-op differences over the
+//! 48-layer residual — measured peak_rel 6.228e-5 / mean_rel 4.383e-5 at matched 0.32.0 (both stacks
+//! provably non-NAX, byte-identical weights + inputs; the output head alone is still 0.0, isolating
+//! the drift to in-block accumulation). The f32 gate therefore uses the tight measured bounds below.
+//! History (sc-2842): a host-f64 timestep table once seeded a real ~0.9% divergence — that class
+//! (named, fixable op bugs) lands orders of magnitude above these bounds and is still caught.
 //!
 //! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test dit_parity -- --ignored --nocapture`
 
@@ -29,6 +35,15 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/ltx_dit_golden.safetensors"
 );
+
+/// sc-12896: cross-stack (Python-reference vs Rust-port) bound for the **f32-activation × Q8**
+/// whole-DiT forward at matched MLX 0.32.0. Measured peak_rel 6.228e-5 / mean_rel 4.383e-5
+/// (2026-07-18, both stacks non-NAX dt15.0, byte-identical weights/inputs, fresh 0.32.0 golden);
+/// bounds are ~4× the measurement. A real regression (wrong op/scale/routing — e.g. the sc-2842
+/// timestep-table bug at ~0.9%, or a stale/requantized checkpoint at ~1e-1) lands far above.
+/// bf16 stays exact — do NOT reuse these for the bf16 gate.
+const DIT_F32_XSTACK_PEAK_REL: f32 = 2.5e-4;
+const DIT_F32_XSTACK_MEAN_REL: f32 = 1.5e-4;
 /// The reference's **native bf16+Q8** velocity golden (`LTX_BF16=1 dump_ltx_dit_golden.py`) — the
 /// production-precision target for [`Precision::quant_bf16`].
 const GOLDEN_BF16: &str = concat!(
@@ -126,18 +141,19 @@ fn dit_velocity_matches_reference() {
         "sc-7141: epoch-path velocity must be byte-identical to the content path"
     );
     assert!(
-        pr == 0.0,
-        "dit velocity peak_rel {pr:.3e} must be bit-exact"
+        pr <= DIT_F32_XSTACK_PEAK_REL,
+        "dit velocity peak_rel {pr:.3e} exceeds the 0.32.0 cross-stack f32 bound {DIT_F32_XSTACK_PEAK_REL:.1e} (sc-12896)"
     );
     assert!(
-        mr == 0.0,
-        "dit velocity mean_rel {mr:.3e} must be bit-exact"
+        mr <= DIT_F32_XSTACK_MEAN_REL,
+        "dit velocity mean_rel {mr:.3e} exceeds the 0.32.0 cross-stack f32 bound {DIT_F32_XSTACK_MEAN_REL:.1e} (sc-12896)"
     );
 }
 
 /// The reference's **native bf16+Q8** per-forward — the production-speed path ([`Precision::quant_bf16`]).
-/// Bit-exact at matched mlx 0.31.2 (the distilled stage-1 sampler is chaos-sensitive, so the bf16
-/// per-forward must be as tight as the f32 one). The same sc-2842 timestep-table fix applies, plus
+/// Bit-exact at matched MLX — verified 0.0 on 0.32.0 non-NAX (sc-12896; the distilled stage-1 sampler
+/// is chaos-sensitive, so the bf16 per-forward stays asserted exact). The same sc-2842 timestep-table
+/// fix applies, plus
 /// the `timestep × 1000` scaling must run in the **input (bf16) dtype** — `denoise_av` feeds a bf16
 /// timestep, so a pre-upcast-to-f32 would round differently (`f32(σ)·1000` ≠ `bf16(σ·1000)`).
 #[test]

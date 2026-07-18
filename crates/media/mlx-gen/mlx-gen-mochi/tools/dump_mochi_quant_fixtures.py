@@ -25,14 +25,20 @@ and the non-NAX path (deployment-target 15.0, hosted PR CI) differ ~1-2 ULP-f32 
 `biases` (and `x`/`w`) are byte-identical across 0.31.2->0.32.0 AND across NAX/non-NAX. On 0.31.2 both
 Metal paths were bit-identical, so one golden served both; 0.32.0's NAX quant fixes broke that tie.
 
-**The committed golden must be the NON-NAX (CI-matching) value**, which is identical to the original
-0.31.2 dump (the non-NAX path did not move on the bump). The Rust gate (`tests/quant_parity.rs`)
-compares against it with a tight relative ULP tolerance (`MOCHI_QUANT_GOLDEN_ULP_TOL`) so the
-self-hosted NAX runner passes too. DO NOT re-dump this fixture on a NAX host (M-series at dt26.2) and
-commit it — that captures the NAX value and re-breaks non-NAX CI (sc-12747). Regenerate only on a
-non-NAX MLX build (hosted-CI-class Metal, dt15.0), or leave the 0.31.2-equivalent golden in place:
+**The committed golden must be the CI-matching value**, which is identical to the original
+0.31.2 dump. The Rust gate (`tests/quant_parity.rs`) compares against it with a tight relative ULP
+tolerance (`MOCHI_QUANT_GOLDEN_ULP_TOL`) so newer hosts pass too.
 
-    uv run --with "mlx==0.32.0" python tools/dump_mochi_quant_fixtures.py   # ONLY on a non-NAX host
+**sc-12896 CORRECTION — the divergence is a GPU-GENERATION dispatch gate, not NAX/deployment-target.**
+MLX 0.32.0's `use_qmv_wide` (quantized.cpp) routes affine quant matmuls with M in [2..8] (this
+fixture's B=5) to the new qmv_wide kernel only on architecture gen >= 15 (M3-class and newer). CI's
+hosted runners (gen <= 14) keep the old qmv path — unchanged from 0.31.2. NO build flag can flip a
+hardware gate: an M5 at dt15.0 with a provably non-NAX from-source build still produces the qmv_wide
+value byte-for-byte (verified sc-12896 by disassembly + byte-compare). Therefore: DO NOT re-dump this
+fixture on ANY gen>=15 host (any M3/M4/M5-class Mac, any build config, wheel or source). Regenerate
+only on gen<=14 hardware (hosted-CI-class), or leave the committed 0.31.2-equivalent golden in place:
+
+    uv run --with "mlx==0.32.0" python tools/dump_mochi_quant_fixtures.py   # ONLY on a gen<=14 host
 
 Writes (committed; ~0.3 MB):
   tests/fixtures/mochi_quant_slice.safetensors

@@ -4,10 +4,11 @@
 //! goldens (`tests/fixtures/ltx_av_dit_golden{,_bf16}.safetensors`, from
 //! `tools/dump_ltx_av_dit_golden.py`) hold the reference video + audio velocities over synthetic
 //! joint inputs; this test loads the SAME Q8 weights into the Rust `AvDiT` and checks BOTH velocities
-//! reproduce — bit-exact, like the video-only gate (the distilled sampler is chaos-sensitive, so the
-//! cross-modal dual-stream forward must be as tight as the video-only one).
+//! reproduce — the bf16 path bit-exact, the f32 path within the tight cross-stack bounds below (the
+//! distilled sampler is chaos-sensitive, so the dual-stream forward stays as tight as attainable).
 //!
-//! **The goldens MUST be mlx 0.31.2** (the Rust build): `quantized_matmul` changed 0.31.0→0.31.2.
+//! **The goldens MUST match the Rust build's MLX — now 0.32.0** (re-dumped sc-12896 on the non-NAX
+//! from-source env; see `dit_parity.rs` for the full 0.32.0 cross-stack contract rationale).
 //!
 //! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test av_dit_parity -- --ignored --nocapture`
 
@@ -26,6 +27,15 @@ const GOLDEN_BF16: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/ltx_av_dit_golden_bf16.safetensors"
 );
+
+/// sc-12896: cross-stack f32 bounds at matched MLX 0.32.0 (see `dit_parity.rs` for the mechanism).
+/// Measured (2026-07-18, non-NAX dt15.0, fresh goldens): video peak_rel 3.553e-5 / mean_rel
+/// 3.248e-5; audio peak_rel 1.525e-6 / mean_rel 9.679e-7. Bounds ~4-6× the measurements; the bf16
+/// path stays asserted exact (0.0).
+const AV_F32_XSTACK_VIDEO_PEAK_REL: f32 = 2.0e-4;
+const AV_F32_XSTACK_VIDEO_MEAN_REL: f32 = 1.5e-4;
+const AV_F32_XSTACK_AUDIO_PEAK_REL: f32 = 1.0e-5;
+const AV_F32_XSTACK_AUDIO_MEAN_REL: f32 = 1.0e-5;
 
 fn base_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("LTX_BASE_DIR") {
@@ -121,15 +131,26 @@ fn run(bf16: bool, golden: &str) {
         "sc-7141: epoch-path audio velocity must be byte-identical to the content path"
     );
 
-    // Bit-exact, matching the video-only sc-2842 gate.
-    assert!(
-        pvr == 0.0 && mvr == 0.0,
-        "video velocity not bit-exact (peak {pvr:.3e} mean {mvr:.3e})"
-    );
-    assert!(
-        par == 0.0 && mar == 0.0,
-        "audio velocity not bit-exact (peak {par:.3e} mean {mar:.3e})"
-    );
+    // bf16 stays bit-exact; f32 uses the sc-12896 cross-stack bounds (see dit_parity.rs).
+    if bf16 {
+        assert!(
+            pvr == 0.0 && mvr == 0.0,
+            "bf16 video velocity not bit-exact (peak {pvr:.3e} mean {mvr:.3e})"
+        );
+        assert!(
+            par == 0.0 && mar == 0.0,
+            "bf16 audio velocity not bit-exact (peak {par:.3e} mean {mar:.3e})"
+        );
+    } else {
+        assert!(
+            pvr <= AV_F32_XSTACK_VIDEO_PEAK_REL && mvr <= AV_F32_XSTACK_VIDEO_MEAN_REL,
+            "f32 video velocity exceeds the 0.32.0 cross-stack bounds (peak {pvr:.3e} mean {mvr:.3e}, sc-12896)"
+        );
+        assert!(
+            par <= AV_F32_XSTACK_AUDIO_PEAK_REL && mar <= AV_F32_XSTACK_AUDIO_MEAN_REL,
+            "f32 audio velocity exceeds the 0.32.0 cross-stack bounds (peak {par:.3e} mean {mar:.3e}, sc-12896)"
+        );
+    }
 }
 
 #[test]

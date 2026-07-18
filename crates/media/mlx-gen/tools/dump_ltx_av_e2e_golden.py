@@ -1,5 +1,9 @@
 """LTX-2.3 AudioVideo e2e pipeline golden — reference joint 2-stage denoise + decode (sc-2684 S5).
 
+sc-12896: goldens now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320); the old
+/tmp/mlx312 (0.31.2) instructions below are retained for provenance only.
+
 Composes the verified stages end-to-end through the REFERENCE: builds the AV `LTXModel` (Q8) +
 upsampler + video VAE decoder + audio VAE decoder (attn OFF, the config-correct decode) + vocoder
 (VocoderWithBWE), injects deterministic synthetic video+audio embeddings + per-stage noise, and runs

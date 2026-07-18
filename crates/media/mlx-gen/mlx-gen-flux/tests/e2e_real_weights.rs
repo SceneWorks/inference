@@ -563,9 +563,12 @@ fn e2e_denoise_loop_matches_golden() {
         "denoise final_latents: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
         latents.shape()
     );
-    // Bit-exact (sc-2787): with the transformer + sigmas bit-exact, the full denoise loop on the
-    // fork's own embeds reproduces the fork latents exactly (0.000e0). Tiny margin for safety.
-    assert!(mr < 1e-3, "denoise loop diverged: mean_rel {mr:.3e}");
+    // Was bit-exact at 0.31.2 (sc-2787: 0.000e0). sc-12896 (MLX 0.32.0, goldens re-dumped on the
+    // matched non-NAX env): the cross-stack dense-bf16 per-forward drift (see mlx-gen-ltx
+    // dit_parity.rs) chaos-amplifies over the free-running loop — measured mean_rel 3.538e-3 (dev)
+    // / 8.377e-3 (schnell). Envelope ~3× the worst measurement; the per-forward transformer gates
+    // stay the tight protection (a wiring/table bug lands O(1e-1+), the pre-sc-2787 states).
+    assert!(mr < 3e-2, "denoise loop diverged: mean_rel {mr:.3e} (sc-12896 envelope)");
 
     // Decode these (golden-embed) latents to pixels — isolates transformer+denoise+VAE px>8 from the
     // text-encoder f32-vs-bf16 contribution that the full-pipeline test additionally includes.
@@ -635,10 +638,12 @@ fn e2e_single_stack_injected_matches_golden() {
 ///
 /// Post-sc-2787 this is a genuine PIXEL-PARITY gate. With bf16 TE/conditioning matching the fork's
 /// mixed precision + the RoPE/time_proj/sigma host→MLX fixes + the vendored CLIP tokenizer, and
-/// goldens dumped on the version-matched MLX (0.31.2; the Rust build is now 0.32.0 — epic 12742,
-/// `pmetal-mlx-rs` 932beb4e — so re-dump these on the 0.32.0 env, sc-12747), every stage is bit-exact (T5/CLIP/v0/all
-/// transformer substages/denoise = 0.000e0 — see the other tests), so the public render lands at the
-/// VAE's tiny cross-build floor: **schnell ~0.007% / dev ~0.026% px>8**.
+/// goldens dumped on the version-matched MLX (now 0.32.0 — re-dumped sc-12896 on the non-NAX
+/// from-source env; recipe in `tools/golden/README.md`), the historical 0.31.2 state had every stage
+/// bit-exact (T5/CLIP/v0/all transformer substages/denoise = 0.000e0), landing the public render at
+/// the VAE's tiny cross-build floor: **schnell ~0.007% / dev ~0.026% px>8**. On 0.32.0 the cross-stack
+/// f32/bf16 kernel-variant drift (sc-12896; see mlx-gen-ltx `dit_parity.rs`) can nudge the per-stage
+/// numbers off exact zero — the tolerance gates in this suite absorb that class.
 ///
 /// Historical note: this used to sit at ~32–42% px>8 and was rationalized as "FLUX is precision
 /// chaotic." That was wrong — the gap was three host-vs-MLX tables (RoPE freqs, time_proj freqs,
@@ -712,12 +717,15 @@ fn e2e_full_pipeline_matches_fork() {
         img.pixels.len(),
         out_path.display()
     );
-    // Pixel-parity: every stage is bit-exact, so only the VAE's tiny cross-build residual remains
-    // (observed schnell ~0.007% / dev ~0.026% px>8). 0.5% is a generous parity bound that still
-    // catches any real regression (the old broken/chaotic states were 32–95%).
+    // Pixel-parity envelope. At 0.31.2 every stage was bit-exact and only the VAE's cross-build
+    // residual remained (schnell ~0.007% / dev ~0.026% px>8). sc-12896 (MLX 0.32.0): the
+    // cross-stack per-forward drift chaos-amplifies through the free-running sampler — measured
+    // 0.084% (dev, 20 steps) / 0.640% (schnell — the distilled 4-step sampler is more
+    // chaos-sensitive per step). Envelope ~3× the worst measurement; the old broken/chaotic states
+    // were 32–95%, so discrimination is retained.
     assert!(
-        frac < 5e-3,
-        "full pipeline regressed from pixel-parity ({:.3}% px>8) — a stage is no longer bit-exact",
+        frac < 2e-2,
+        "full pipeline regressed from pixel-parity ({:.3}% px>8) — beyond the sc-12896 envelope",
         frac * 100.0
     );
     println!(

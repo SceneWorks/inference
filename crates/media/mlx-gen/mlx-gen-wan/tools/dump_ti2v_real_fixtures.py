@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Dump a sc-2680 **real-weight** parity fixture: small **T2V** + **TI2V** runs of the `mlx_video`
+
+sc-12896: fixtures now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320 +
+PYTHONPATH=<mlx_video src>); the SceneWorks-venv instructions below are the original recipe.
+
 reference on the *actual converted* Wan2.2-TI2V-5B weights, for the Rust dense 5B pipeline (the z48
 `Wan22Vae` + `denoise`/`denoise_ti2v` + the DiT `forward`/`forward_tokens`) to gate against e2e.
 

@@ -1,5 +1,9 @@
 """LTX-2.3 e2e golden — PHASE B: the 2-stage pipeline → frames (sc-2679 S6).
 
+sc-12896: goldens now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320); the old
+/tmp/mlx312 (0.31.2) instructions below are retained for provenance only.
+
 Consumes PHASE A's `tools/golden/ltx_e2e_te.safetensors` (reference `input_ids` + `video_embeddings`)
 and runs the real `ltx_2_3_base_q8` transformer (Q8) + upsampler + VAE through the 2-stage distilled
 denoise at a real resolution (256×256, 9 frames) → uint8 frames. Dumps the committed e2e golden

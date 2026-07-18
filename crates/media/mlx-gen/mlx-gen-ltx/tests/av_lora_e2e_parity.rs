@@ -11,6 +11,15 @@
 //!
 //! `#[ignore]`d: needs the real `ltx_2_3_base_q8` weights (~20 GB) + the LoRA. Run:
 //! `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test av_lora_e2e_parity -- --ignored --nocapture`
+//!
+//! **sc-12896 (MLX 0.32.0) — NOT re-baselined: the committed golden is still a 0.31.2 dump.** The
+//! `Samantha_ltx2.3` full-surface LoRA asset was not present on the re-dump host, and substituting a
+//! different LoRA would silently rewrite the structural expectations (1632 targets) this suite and
+//! `lora_real_weights.rs`'s multi-surface tests encode. On 0.32.0 this gate will fail against the
+//! stale golden (the f32 e2e path moved — see `e2e_parity.rs`). To re-baseline: on a machine with the
+//! Samantha asset, re-dump via `tools/dump_ltx_av_lora_e2e_golden.py` on the 0.32.0 non-NAX env
+//! (recipe in that script's header) after re-dumping the base AV e2e golden, then convert the two
+//! `== 0.0` gates below to the envelope pattern used by `lora_real_weights::lora_frames_match_reference`.
 
 use mlx_rs::ops::{abs, gt, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};
