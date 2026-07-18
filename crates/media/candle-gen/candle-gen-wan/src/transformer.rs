@@ -326,6 +326,19 @@ pub struct WanTransformer {
     cfg: TransformerConfig,
     device: Device,
     dtype: DType,
+    /// When set, the block stack drains the CUDA stream (`device.synchronize()`) after **each** DiT
+    /// block during the denoise forward. Off (fully async) by default — the resident render never sets
+    /// it. The **sequential-offload** render (sc-12733) sets it on each staged expert: that path frees
+    /// the ~21 GB UMT5 encoder and the inactive expert into candle's in-process cudarc caching pool
+    /// (which never returns pages to the driver) and then reuses that churned pool for the next expert's
+    /// weights + the full-res denoise activations. Left fully async, the deep unsynced kernel pipeline
+    /// racing against that pool's free→realloc **deterministically faults with a CUDA illegal-memory
+    /// access at the A14B 720p geometry** (S ≈ 75 600 tokens) — a hard exit, no Rust panic — right at the
+    /// high→low expert-swap boundary; the resident co-resident pool (nothing freed mid-render) never
+    /// trips it, and small geometries stay under the collision size. Draining per block bounds the
+    /// in-flight set so the reuse is ordered. Numerically inert: `synchronize()` changes only ordering,
+    /// never a value (sc-12768).
+    bounded_offload: bool,
 }
 
 impl WanTransformer {
@@ -393,7 +406,18 @@ impl WanTransformer {
             cfg: *cfg,
             device: src.device(),
             dtype: src.dtype(),
+            bounded_offload: false,
         })
+    }
+
+    /// Enable per-block CUDA-stream draining for the **sequential-offload** denoise (sc-12768). The
+    /// resident render leaves this off (fully async); the staged A14B render sets it on each expert
+    /// right after loading it, before the denoise forward — draining the stream after each DiT block so
+    /// the deep async pipeline cannot race candle's churned cudarc caching pool (the TE + inactive-expert
+    /// frees that path reuses), which otherwise faults with a CUDA illegal-memory access at the 720p
+    /// A14B geometry. Ordering-only, so it never changes a denoised value.
+    pub fn set_bounded_offload(&mut self, on: bool) {
+        self.bounded_offload = on;
     }
 
     /// Project UMT5 prompt embeds `[B,S,4096]` → cross-attn context `[B,S,dim]` (constant across the
@@ -482,6 +506,14 @@ impl WanTransformer {
         let mut hidden = tokens.clone();
         for blk in &self.blocks {
             hidden = blk.forward(&hidden, &temb6, context, cos, sin)?;
+            // sc-12768: on the sequential-offload path, drain the stream after each block so the deep
+            // async denoise pipeline cannot race candle's churned cudarc caching pool (the freed TE /
+            // inactive-expert pages the next expert's weights + full-res activations reuse) — the
+            // illegal-memory access at the A14B 720p geometry. No-op (untouched, fully async) on the
+            // resident path. Ordering-only; the denoised value is unchanged.
+            if self.bounded_offload {
+                self.device.synchronize()?;
+            }
         }
 
         // Head: norm_out (non-affine) modulated by scale_shift_table + temb.
