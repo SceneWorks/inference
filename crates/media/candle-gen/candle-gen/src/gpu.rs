@@ -83,20 +83,48 @@ pub fn resolve_nvidia_smi() -> Option<&'static Path> {
 /// This is the shared implementation the SeedVR2 / Wan / LTX budget probes route through (the F-030
 /// de-dup that had been tracked as a follow-up).
 pub fn nvidia_smi_min_total_gib() -> Option<f64> {
+    query_min_gib("memory.total")
+}
+
+/// **Free** VRAM (GiB) of the least-free visible CUDA device — what is ACTUALLY unallocated on the
+/// device *right now*, read from the same trusted absolute `nvidia-smi` (never a bare `PATH` lookup;
+/// sc-9014 / F-030). Because `nvidia-smi memory.free` is the driver's live `total − used`, this value
+/// already nets out **resident model weights + the cudarc pool + anything else on the device**, i.e.
+/// it IS `(total − resident)`. A decode tiler can therefore budget against it instead of `0.85×TOTAL`
+/// and stop over-budgeting on top of what the denoise left resident (sc-12734).
+///
+/// The MIN across devices is conservative on a heterogeneous box. `None` when no trusted `nvidia-smi`
+/// exists or the query fails — the caller then falls back to its env override / conservative default.
+///
+/// NOTE: on Windows WDDM the driver reports **device-level** used/free (per-process is `[N/A]`), so a
+/// large *other* allocation on the same GPU shrinks this. That is the intended behaviour: the tiler
+/// should fit whatever is genuinely free, not an optimistic per-process figure.
+pub fn nvidia_smi_min_free_gib() -> Option<f64> {
+    query_min_gib("memory.free")
+}
+
+/// Run the trusted-absolute `nvidia-smi` for a single `--query-gpu=<field>` (one MiB value per line,
+/// one line per GPU) and reduce to the MIN across GPUs in GiB. Shared by the total and free probes so
+/// the trusted-path resolution + parsing lives in exactly one place.
+fn query_min_gib(field: &str) -> Option<f64> {
     let exe = resolve_nvidia_smi()?;
     let out = Command::new(exe)
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            &format!("--query-gpu={field}"),
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    parse_min_total_gib(&String::from_utf8_lossy(&out.stdout))
+    parse_min_mib_line_gib(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Parse the `--query-gpu=memory.total --format=csv,noheader,nounits` output (one MiB value per
-/// line, one line per GPU) into the MIN total across GPUs, in GiB. Split out for unit testing.
-fn parse_min_total_gib(text: &str) -> Option<f64> {
+/// Parse `--query-gpu=<memory field> --format=csv,noheader,nounits` output (one MiB value per line,
+/// one line per GPU) into the MIN across GPUs, in GiB. Field-agnostic (used for both `memory.total`
+/// and `memory.free`). Split out for unit testing.
+fn parse_min_mib_line_gib(text: &str) -> Option<f64> {
     let min_mb = text
         .lines()
         .filter_map(|line| line.trim().parse::<f64>().ok())
@@ -159,17 +187,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_min_total_gib_takes_min_across_gpus() {
-        // Two GPUs: 24576 MiB and 49152 MiB → min = 24576 MiB = 24 GiB.
-        let got = parse_min_total_gib("24576\n49152\n").expect("parses");
+    fn parse_min_mib_line_gib_takes_min_across_gpus() {
+        // Two GPUs: 24576 MiB and 49152 MiB → min = 24576 MiB = 24 GiB. (Same reducer for total and
+        // free: the MIN is the conservative choice for both — smallest total / least-free device.)
+        let got = parse_min_mib_line_gib("24576\n49152\n").expect("parses");
         assert!((got - 24.0).abs() < 1e-9, "expected 24.0 GiB, got {got}");
     }
 
     #[test]
-    fn parse_min_total_gib_none_on_empty_or_garbage() {
-        assert_eq!(parse_min_total_gib(""), None);
-        assert_eq!(parse_min_total_gib("no gpus\n\n"), None);
+    fn parse_min_mib_line_gib_none_on_empty_or_garbage() {
+        assert_eq!(parse_min_mib_line_gib(""), None);
+        assert_eq!(parse_min_mib_line_gib("no gpus\n\n"), None);
         // Zero/negative are filtered out (a driver quirk) → None, not 0.
-        assert_eq!(parse_min_total_gib("0\n"), None);
+        assert_eq!(parse_min_mib_line_gib("0\n"), None);
     }
 }
