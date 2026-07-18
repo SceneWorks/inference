@@ -39,7 +39,20 @@ impl ChanNorm {
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let l2 = x.sqr()?.sum_keepdim(1)?.sqrt()?.clamp(NORM_EPS, 1e30)?;
+        // Channel-L2 reduction in f32 for bf16 stability — a **no-op when `x` is already f32** (the two
+        // `to_dtype` calls collapse to bit-identical copies), so the z48 f32 decode is byte-for-byte
+        // unchanged. Under the A14B's bf16 z16 VAE (sc-12818) this L2 sum runs over up to 384 channels;
+        // bf16's 8-bit mantissa loses too much there, so reduce in f32 and apply the per-position norm
+        // scalar back in the working dtype — the UMT5 RMS-norm idiom (sc-12778). The activation itself
+        // stays bf16 for the VRAM win; only the reduction transits f32.
+        let dt = x.dtype();
+        let l2 = x
+            .to_dtype(DType::F32)?
+            .sqr()?
+            .sum_keepdim(1)?
+            .sqrt()?
+            .clamp(NORM_EPS, 1e30)?
+            .to_dtype(dt)?;
         let normed = (x.broadcast_div(&l2)? * self.sqrt_c)?;
         let c = self.gamma.dim(0)?;
         let gshape = match x.rank() {
@@ -167,7 +180,11 @@ impl MidAttn {
         let v = qkv.narrow(3, 2 * c, c)?.contiguous()?;
         let scale = (self.channels as f64).powf(-0.5);
         let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
-        let attn = softmax_last_dim(&scores)?;
+        // Softmax reduction in f32 for bf16 stability (a no-op at f32 — bit-identical z48 path). The
+        // exp/sum over the H·W keys is the attention "variance" the story flags (sc-12818); the bf16
+        // QK/AV matmuls already accumulate in f32 on the tensor cores, so only the softmax needs the
+        // explicit upcast.
+        let attn = softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(scores.dtype())?;
         let o = attn.matmul(&v)?; // [BT,1,HW,C]
         let o = o
             .squeeze(1)?
@@ -848,5 +865,84 @@ mod budget_tests {
                 "over-predicts {ow}x{oh}x{of} tile {tw}x{th}: est {est:.2} > 2.5x measured {measured:.2} GiB"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod norm_tests {
+    //! sc-12818: `ChanNorm` (the shared channel-L2 norm) reduces in f32 so it stays stable under the
+    //! A14B's bf16 z16 VAE, applying the per-position scalar back in the working dtype (so the bf16
+    //! activation stays bf16). These pin (a) the f32-reduction keeps a bf16 forward close to the f32
+    //! reference over a wide channel count, and (b) the forward preserves the input activation dtype.
+    //! candle's CPU backend has bf16 *storage* + elementwise/reductions (only matmul/conv are missing),
+    //! so both run on CPU.
+    use super::ChanNorm;
+    use candle_gen::candle_core::{DType, Device, Result, Tensor};
+    use candle_gen::candle_nn::VarBuilder;
+    use std::collections::HashMap;
+
+    fn build(gamma: &Tensor, c: usize, dt: DType, dev: &Device) -> Result<ChanNorm> {
+        let mut map = HashMap::new();
+        map.insert("gamma".to_string(), gamma.to_dtype(dt)?);
+        ChanNorm::new(c, VarBuilder::from_tensors(map, dt, dev))
+    }
+
+    #[test]
+    fn chan_norm_bf16_stays_close_to_f32_and_preserves_dtype() -> Result<()> {
+        let dev = Device::Cpu;
+        let c = 384usize; // the z16 mid width — a wide channel-L2 where a naive bf16 sum would drift
+        let gamma = Tensor::randn(0f32, 1.0, c, &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (1, c, 1, 4, 4), &dev)?;
+
+        let out_f32 = build(&gamma, c, DType::F32, &dev)?.forward(&x)?;
+        let out_bf16 = build(&gamma, c, DType::BF16, &dev)?.forward(&x.to_dtype(DType::BF16)?)?;
+
+        // The bf16 forward keeps a bf16 activation (the VRAM win — only the reduction transits f32).
+        assert_eq!(
+            out_bf16.dtype(),
+            DType::BF16,
+            "bf16 input must yield a bf16 activation"
+        );
+
+        let a = out_f32.flatten_all()?.to_vec1::<f32>()?;
+        let b = out_bf16
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max_rel = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs() / x.abs().max(1e-2))
+            .fold(0f32, f32::max);
+        // bf16 has ~7 mantissa bits ⇒ ~1% per-element rounding; the f32 channel-L2 reduction keeps the
+        // whole norm well inside a loose 5% band (a naive bf16 sum over 384 channels would blow this).
+        assert!(
+            max_rel < 0.05,
+            "bf16 ChanNorm drifted from the f32 reference: max relative diff {max_rel}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chan_norm_f32_forward_is_unchanged() -> Result<()> {
+        // The f32 path must be byte-for-byte what it always was (the z48 5B decode still runs f32): the
+        // two `to_dtype(F32)` casts collapse to identity, so recompute the exact pre-sc-12818 formula
+        // and require bit-equality.
+        let dev = Device::Cpu;
+        let c = 96usize;
+        let gamma = Tensor::randn(0f32, 1.0, c, &dev)?;
+        let x = Tensor::randn(0f32, 1.0, (1, c, 2, 3, 3), &dev)?;
+        let cn = build(&gamma, c, DType::F32, &dev)?;
+        let got = cn.forward(&x)?;
+
+        // The exact pre-change reduction: x.sqr().sum_keepdim(1).sqrt().clamp(1e-12, 1e30).
+        let l2 = x.sqr()?.sum_keepdim(1)?.sqrt()?.clamp(1e-12, 1e30)?;
+        let normed = (x.broadcast_div(&l2)? * (c as f64).sqrt())?;
+        let expected = normed.broadcast_mul(&gamma.reshape((1, c, 1, 1, 1))?)?;
+
+        let g = got.flatten_all()?.to_vec1::<f32>()?;
+        let e = expected.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(g, e, "the f32 ChanNorm forward must be bit-identical to pre-sc-12818");
+        Ok(())
     }
 }
