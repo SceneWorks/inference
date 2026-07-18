@@ -49,8 +49,9 @@ fn gb(bytes: usize) -> f64 {
 }
 
 /// `WAN_SWEEP_LIMIT_GB` pins the MLX memory limit before tile selection, so a 128 GB machine can
-/// simulate the smaller tier the budgeted plan must protect (`auto_tiling_budgeted` reads the
-/// limit). The limit is soft, so the decode still runs — but the chosen tile + peak reflect the
+/// simulate the smaller tier the budgeted plan must protect. Since sc-12737 the budget is **free-aware**
+/// (`free = limit − resident`, then × 0.85), so pinning the limit lowers the ceiling the free budget is
+/// derived from. The limit is soft, so the decode still runs — but the chosen tile + peak reflect the
 /// smaller budget. No-op when the env var is unset.
 fn pin_limit_from_env() {
     if let Ok(lim) = std::env::var("WAN_SWEEP_LIMIT_GB") {
