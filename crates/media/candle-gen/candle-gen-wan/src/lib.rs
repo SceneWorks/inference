@@ -11,8 +11,11 @@
 //! interleaved RoPE, AdaLN modulation, cross-attention to text, classifier-free guidance, UniPC) →
 //! the temporal VAE decoder, emitting `GenerationOutput::Video`. Registered under `"wan2_2_ti2v_5b"`.
 //!
-//! **Dtypes:** UMT5 + VAE run **f32**; the 5B DiT runs **bf16** (its native dtype), norms/modulation
-//! upcast to f32. `backend = "candle"`, `mac_only = false`.
+//! **Dtypes:** the 5B DiT runs **bf16** (its native dtype), norms/modulation upcast to f32; the UMT5
+//! encoder runs **bf16** (sc-12778 — halving the f32 encoder resident + its ~24 GB ENCODE-stage
+//! transient, the 5B sequential-offload <16 GB lever, epic sc-12732; the DiT `embed_text` already
+//! casts the context to bf16, so this REMOVES the old f32→bf16 boundary); the VAE runs **f32**.
+//! `backend = "candle"`, `mac_only = false`.
 //!
 //! **First-slice surface:** txt2video only. The mlx provider's image-conditioning (TI2V / I2V),
 //! VACE, LoRA, and quantization surface is **deferred**. The z48 vae22 decode is memory-bounded:
@@ -72,9 +75,12 @@ use text_encoder::Umt5Encoder;
 use transformer::WanTransformer;
 use vae::WanVae;
 
-/// The 5B DiT runs bf16 (native checkpoint dtype); the UMT5 encoder and the VAE run f32.
+/// The 5B DiT runs bf16 (native checkpoint dtype); the UMT5 encoder runs bf16 (sc-12778 — halving the
+/// f32 encoder's ~24 GB ENCODE-stage transient to ~12 GB, the 5B sequential <16 GB lever, epic
+/// sc-12732; the DiT's `embed_text` already casts the context to bf16, so this REMOVES the old
+/// f32→bf16 boundary rather than adding one); the VAE runs f32.
 const DIT_DTYPE: DType = DType::BF16;
-const ENC_DTYPE: DType = DType::F32;
+const ENC_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
 const Z_DIM: usize = 48;
 
@@ -138,10 +144,12 @@ impl Pipeline {
         })
     }
 
-    /// Build the UMT5 text encoder (f32) — the ~21 GB phase-A component that is dead weight after the
-    /// prompt encode. A single home shared by the resident [`load_components`](Self::load_components)
-    /// build and the sequential-offload [`render_sequential`](Self::render_sequential) stage, so the two
-    /// paths can never diverge in how the TE is built (sc-12757).
+    /// Build the UMT5 text encoder (bf16, sc-12778) — the ~11 GB phase-A component (was ~21 GB f32) that
+    /// is dead weight after the prompt encode; bf16 also halves its ~24 GB f32 ENCODE-stage transient
+    /// (~12 GB), the residual peak sc-12757 measured. A single home shared by the resident
+    /// [`load_components`](Self::load_components) build and the sequential-offload
+    /// [`render_sequential`](Self::render_sequential) stage, so the two paths can never diverge in how
+    /// the TE is built (sc-12757).
     fn load_te(&self) -> CResult<Umt5Encoder> {
         Ok(Umt5Encoder::new(
             &self.te_cfg,
@@ -229,9 +237,9 @@ impl Pipeline {
         Ok(map)
     }
 
-    /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (f32, zero-padded to `max_length`). Shared
-    /// Wan text-encode routine (sc-9000 / F-020); ENC_DTYPE (= f32) output is byte-identical to the
-    /// pre-consolidation copy.
+    /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (bf16, zero-padded to `max_length`). Shared
+    /// Wan text-encode routine (sc-9000 / F-020); ENC_DTYPE is bf16 (sc-12778) so the encoder resident +
+    /// its ENCODE-stage transient halve, and the DiT `embed_text` bf16 cast is now a no-op.
     fn encode(&self, comps: &Components, prompt: &str) -> CResult<Tensor> {
         self.encode_raw(&comps.tok, &comps.te, prompt)
     }
@@ -415,12 +423,15 @@ impl Pipeline {
 
     /// The **sequential-offload** render (sc-12757, epic 12732) — the staged twin of
     /// [`render`](Self::render) that keeps only **one** heavy component GPU-resident at a time, so the
-    /// f32 UMT5 encoder (~21 GB, dead weight after the encode) is off-GPU for the entire denoise and the
-    /// DiT is freed before the VAE loads. The 5B is a single dense DiT (no MoE / expert swap), so the
-    /// stages are linear:
+    /// bf16 UMT5 encoder (~11 GB, dead weight after the encode) is off-GPU for the entire denoise and the
+    /// DiT is freed before the VAE loads. sc-12757 measured the residual sequential peak at the UMT5
+    /// **ENCODE-stage transient** (the f32 encoder's ~24 GB, in stage 1 before the drop — NOT the denoise
+    /// or decode), so sc-12778 runs the encoder in bf16 to halve that transient (~12 GB), landing the 5B
+    /// sequential peak under the epic's 16 GB target. The 5B is a single dense DiT (no MoE / expert swap),
+    /// so the stages are linear:
     ///
     /// 1. **TE off-GPU during denoise.** Load UMT5, encode the pos (+ neg when CFG) **raw** `[1,512,4096]`
-    ///    context, then DROP the ~21 GB f32 encoder — only the small raw context tensors survive.
+    ///    context, then DROP the ~11 GB bf16 encoder — only the small raw context tensors survive.
     /// 2. **DiT only for the denoise.** Load the DiT, project the raw context through its own
     ///    `embed_text`, run the full denoise, then DROP the DiT before the VAE materializes.
     /// 3. **VAE decode.** Load the VAE and `decode_budgeted`.
@@ -440,8 +451,8 @@ impl Pipeline {
         let cancel = &req.cancel;
         check_cancel(cancel)?;
 
-        // The tiny tokenizer is cheap and stays resident across the whole render; the heavy UMT5 encoder
-        // is dropped right after encoding.
+        // The tiny tokenizer is cheap and stays resident across the whole render; the heavy bf16 UMT5
+        // encoder (~11 GB, sc-12778) is dropped right after encoding.
         let tok = text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan")?;
         let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
         let latents0 =
@@ -458,7 +469,7 @@ impl Pipeline {
 
         staged_sequential(
             &mut state,
-            // ── Stage 1: load UMT5 → raw pos/neg context. DROP the ~21 GB encoder at the brace. ──
+            // ── Stage 1: load UMT5 → raw pos/neg context. DROP the ~11 GB bf16 encoder at the brace. ──
             |st| {
                 check_cancel(cancel)?;
                 (st.on_progress)(Progress::Loading(LoadPhase::TextEncoder));
@@ -554,8 +565,8 @@ struct SeqState<'a> {
 }
 
 /// Drive the dense TI2V-5B sequential offload so at most **one** heavy component is GPU-resident at a
-/// time (sc-12757, the dense Pillar-1 win — no expert swap, the 5B is a single DiT): the ~21 GB f32
-/// UMT5 text encoder, then the bf16 DiT, then the f32 VAE. Each component is a local bound to its own
+/// time (sc-12757, the dense Pillar-1 win — no expert swap, the 5B is a single DiT): the ~11 GB bf16
+/// UMT5 text encoder (sc-12778), then the bf16 DiT, then the f32 VAE. Each component is a local bound to its own
 /// block, so Rust's scope drop frees it **before** the next loads — the TE drops before the DiT loads
 /// (so it is off-GPU for the whole denoise) and the DiT drops before the VAE loads. `sync` runs at each
 /// stage boundary — after the component is used and before it drops (and before the next loads) — so
@@ -608,7 +619,7 @@ pub struct WanGenerator {
     /// `CANDLE_GEN_OFFLOAD=sequential` A/B override). [`OffloadPolicy::Resident`] keeps the cached
     /// [`Components`] warm; [`OffloadPolicy::Sequential`] drives the staged
     /// [`Pipeline::render_sequential`] (TE-offload + DiT-drop-before-VAE), bounding the denoise peak by
-    /// keeping the ~21 GB f32 UMT5 encoder off-GPU. The resident [`components`](Self::components) cache
+    /// keeping the ~11 GB bf16 UMT5 encoder (sc-12778) off-GPU. The resident [`components`](Self::components) cache
     /// stays untouched under `Sequential` — the staged path never populates it.
     offload: OffloadPolicy,
     components: Mutex<Option<Components>>,
@@ -676,7 +687,7 @@ impl Generator for WanGenerator {
         self.validate(req)?;
         let pipe = Pipeline::load(&self.root, &self.device, self.adapters.clone());
         // Sequential offload (sc-12757): stage load→use→drop each heavy component so the denoise peak is
-        // the DiT alone — the ~21 GB f32 UMT5 encoder is off-GPU for the whole denoise and the DiT is
+        // the DiT alone — the ~11 GB bf16 UMT5 encoder is off-GPU for the whole denoise and the DiT is
         // freed before the VAE loads. Resident (default): the cached `Components` bundle, unchanged path.
         // The staged path never populates the resident cache.
         let (frames, fps) = match self.offload {
@@ -741,7 +752,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // The TI2V-5B honors `OffloadPolicy::Sequential` (epic 12732, sc-12757): the staged
-            // `render_sequential` keeps the ~21 GB f32 UMT5 encoder off-GPU for the whole denoise and
+            // `render_sequential` keeps the ~11 GB bf16 UMT5 encoder off-GPU for the whole denoise and
             // frees the dense DiT before the VAE loads, bounding the pre-decode peak. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
@@ -1297,7 +1308,7 @@ mod tests {
         let at = |tag: &str| log.iter().position(|x| *x == tag).unwrap();
         assert!(
             at("drop-te") < at("use-dit"),
-            "the ~21 GB UMT5 encoder must be off-GPU BEFORE the denoise (use-dit) runs"
+            "the ~11 GB bf16 UMT5 encoder must be off-GPU BEFORE the denoise (use-dit) runs"
         );
         assert!(
             at("drop-dit") < at("load-vae"),

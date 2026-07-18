@@ -15,8 +15,10 @@
 //! **Snapshot layout** (diffusers): `transformer/` (the VACE DiT, diffusers tensor names), `text_encoder/`
 //! (UMT5-XXL), `vae/` (the z16 Wan VAE — needs the encoder for the control encode), `tokenizer/`.
 //!
-//! **Dtypes:** UMT5 + VAE run **f32**; the VACE DiT runs **bf16** (norms/modulation upcast to f32) —
-//! the candle Wan regime. LoRA / on-the-fly quantization are **deferred** (rejected at load).
+//! **Dtypes:** the VACE DiT runs **bf16** (norms/modulation upcast to f32); UMT5 runs **bf16**
+//! (sc-12778 — halving the f32 encoder resident + its ENCODE-stage transient; the DiT `embed_text`
+//! already casts the context to bf16, removing the old f32→bf16 boundary); the VAE runs **f32** — the
+//! candle Wan regime. LoRA / on-the-fly quantization are **deferred** (rejected at load).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -45,7 +47,9 @@ use crate::vae16::WanVae16;
 use crate::wan14b::preprocess_i2v_image;
 
 const DIT_DTYPE: DType = DType::BF16;
-const ENC_DTYPE: DType = DType::F32;
+// UMT5 runs bf16 (sc-12778 — halving the f32 encoder resident + its ENCODE-stage transient; the DiT
+// `embed_text` already casts the context to bf16, so this removes the old f32→bf16 boundary).
+const ENC_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
 const Z_DIM: usize = 16;
 const VAE_T: usize = VAE16_STRIDE_TEMPORAL as usize;
@@ -106,8 +110,8 @@ impl Pipeline {
         })
     }
 
-    /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (f32), zero-padded to `max_length` (the DiT
-    /// cross-attends over the 512-padded context — the same rule as the base Wan). Shared Wan
+    /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (bf16, sc-12778), zero-padded to `max_length`
+    /// (the DiT cross-attends over the 512-padded context — the same rule as the base Wan). Shared Wan
     /// text-encode routine (sc-9000 / F-020).
     fn encode(&self, comps: &Components, prompt: &str) -> CResult<Tensor> {
         crate::text_encode::umt5_encode_padded(
