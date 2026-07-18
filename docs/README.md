@@ -18,6 +18,9 @@ Documentation for the SceneWorks inference workspace.
   the repositories were consolidated, why provider discovery is explicit, the alternatives
   considered, the accepted tradeoffs, and the invariants future changes must preserve. The
   *why* behind everything above.
+- **[Audio Backend Strategy](architecture/audio-backend-strategy.md)** — why audio generation
+  is Candle-native on every platform (no ONNX/third backend), and how the runtime catalog's
+  dedicated audio section carries a `candle` audio lane inside the mlx macOS bundle.
 
 ## Migration records
 
