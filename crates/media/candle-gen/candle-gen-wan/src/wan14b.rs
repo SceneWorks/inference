@@ -25,12 +25,14 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::runtime::{CancelFlag, LoadPhase};
+use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Progress,
-    Quant, WeightsSource,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
+    OffloadPolicy, Progress, Quant, WeightsSource,
 };
-use candle_gen::{CandleError, Result as CResult};
+use candle_gen::{check_cancel, effective_offload_policy, CandleError, Result as CResult};
 
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FPS_14B, DEFAULT_FRAMES_14B,
@@ -280,59 +282,97 @@ impl Pipeline {
         Ok(map)
     }
 
-    fn load_components(&self) -> CResult<Components> {
-        // In-place ComfyUI mode (sc-10909): read the UMT5 TE from the tree when the caller passed it
-        // (scaled-fp8 dequant), else the snapshot `text_encoder/`.
-        let te = match self.comfyui.as_ref().and_then(|c| c.te_file.as_deref()) {
-            Some(te_file) => self.build_te_comfyui(te_file)?,
-            None => Umt5Encoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?,
-        };
-        // transformer/ = high-noise expert, transformer_2/ = low-noise expert (diffusers WanPipeline).
-        // In-place ComfyUI mode (sc-10671): build both experts from the user's files (remap + dequant);
-        // no adapters (the ComfyUI base lane does not fold LoRAs), so the zero-match guard below is inert.
-        let (high, high_applied, low, low_applied) = match &self.comfyui {
-            Some(experts) => (
-                self.build_expert_comfyui(&experts.high_file)?,
-                None,
-                self.build_expert_comfyui(&experts.low_file)?,
-                None,
-            ),
-            None => {
-                let (high, high_applied) = self.build_expert("transformer", MoeExpert::High)?;
-                let (low, low_applied) = self.build_expert("transformer_2", MoeExpert::Low)?;
-                (high, high_applied, low, low_applied)
+    /// Build the UMT5 text encoder (f32) — the ~21 GB phase-A component. In-place ComfyUI mode
+    /// (sc-10909) reads it from the user's tree (scaled-fp8 dequant); else the snapshot `text_encoder/`.
+    /// A single home shared by the resident [`load_components`](Self::load_components) build and the
+    /// sequential-offload [`render_sequential`](Self::render_sequential) stage (sc-12733).
+    fn load_te(&self) -> CResult<Umt5Encoder> {
+        match self.comfyui.as_ref().and_then(|c| c.te_file.as_deref()) {
+            Some(te_file) => self.build_te_comfyui(te_file),
+            None => Ok(Umt5Encoder::new(
+                &self.te_cfg,
+                self.component_vb("text_encoder", ENC_DTYPE)?,
+            )?),
+        }
+    }
+
+    /// Build one 14B expert (~8-9 GB bf16) from either the in-place ComfyUI file (sc-10671) or the
+    /// snapshot subdir (`transformer/` = high, `transformer_2/` = low). Returns the transformer plus the
+    /// packed-tier applied-residual count (`Some` iff packed, for the cross-expert zero-match guard;
+    /// `None` on the dense/comfyui paths, which self-guard). Shared by the resident and staged paths so
+    /// the two never diverge in how an expert is built (sc-12733).
+    fn load_expert_staged(&self, expert: MoeExpert) -> CResult<(WanTransformer, Option<usize>)> {
+        match &self.comfyui {
+            Some(experts) => {
+                let file = match expert {
+                    MoeExpert::High => &experts.high_file,
+                    MoeExpert::Low => &experts.low_file,
+                };
+                // The ComfyUI base lane folds no adapters, so `None` (zero-match guard inert).
+                Ok((self.build_expert_comfyui(file)?, None))
             }
-        };
-        // Packed-tier zero-match guard (sc-10095): on the additive path a non-empty adapter set that
-        // attached NO residual across either expert is a format/prefix misconfiguration (the dense fold
-        // path self-guards inside `merge_adapters`, so it returns `None` here and is exempt). Both experts
-        // share a tier, so this is `Some` iff packed.
-        if !self.adapters.is_empty() {
-            if let (Some(h), Some(l)) = (high_applied, low_applied) {
-                if h + l == 0 {
-                    return Err(CandleError::Msg(format!(
-                        "{}: {} LoRA adapter file(s) matched no projection on either packed expert — \
-                         check the key format (expected PEFT `<path>.lora_A/B.weight` or kohya \
-                         `lora_unet_<flat>` targeting the DiT attention/FFN Linears)",
-                        self.variant.id(),
-                        self.adapters.len()
-                    )));
-                }
+            None => {
+                let sub = match expert {
+                    MoeExpert::High => "transformer",
+                    MoeExpert::Low => "transformer_2",
+                };
+                self.build_expert(sub, expert)
             }
         }
-        // In-place ComfyUI mode (sc-10909): read the Wan VAE from the tree when the caller passed it
-        // (native→diffusers key remap), else the snapshot `vae/`. I2V needs the VAE encoder either way.
-        let vae = match self.comfyui.as_ref().and_then(|c| c.vae_file.as_deref()) {
-            Some(vae_file) => self.build_vae_comfyui(vae_file)?,
+    }
+
+    /// Build the z16 VAE (f32). In-place ComfyUI mode (sc-10909) reads it from the user's tree
+    /// (native→diffusers key remap); else the snapshot `vae/`. I2V builds the encoder too (the
+    /// conditioning image's first-frame latent). Shared by the resident and staged paths (sc-12733).
+    fn load_vae(&self) -> CResult<WanVae16> {
+        match self.comfyui.as_ref().and_then(|c| c.vae_file.as_deref()) {
+            Some(vae_file) => self.build_vae_comfyui(vae_file),
             None => {
                 let vae_vb = self.component_vb("vae", VAE_DTYPE)?;
                 match self.variant {
                     // I2V needs the VAE encoder (the conditioning image's first-frame latent).
-                    Variant::I2v => WanVae16::new_with_encoder(&self.vae_cfg, vae_vb)?,
-                    Variant::T2v => WanVae16::new(&self.vae_cfg, vae_vb)?,
+                    Variant::I2v => Ok(WanVae16::new_with_encoder(&self.vae_cfg, vae_vb)?),
+                    Variant::T2v => Ok(WanVae16::new(&self.vae_cfg, vae_vb)?),
                 }
             }
-        };
+        }
+    }
+
+    /// Packed-tier zero-match guard (sc-10095): on the additive path a non-empty adapter set that
+    /// attached NO residual across **either** packed expert is a format/prefix misconfiguration (the
+    /// dense fold path self-guards inside `merge_adapters`, so it reports `None` and is exempt). Both
+    /// experts share a tier, so each count is `Some` iff packed; the guard fires only when both experts
+    /// were built (both `Some`) and neither matched — the staged path (which builds one expert at a time)
+    /// runs it once both experts have loaded.
+    fn adapter_zero_match_guard(
+        &self,
+        high_applied: Option<usize>,
+        low_applied: Option<usize>,
+    ) -> CResult<()> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        if let (Some(h), Some(l)) = (high_applied, low_applied) {
+            if h + l == 0 {
+                return Err(CandleError::Msg(format!(
+                    "{}: {} LoRA adapter file(s) matched no projection on either packed expert — \
+                     check the key format (expected PEFT `<path>.lora_A/B.weight` or kohya \
+                     `lora_unet_<flat>` targeting the DiT attention/FFN Linears)",
+                    self.variant.id(),
+                    self.adapters.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn load_components(&self) -> CResult<Components> {
+        let te = self.load_te()?;
+        // transformer/ = high-noise expert, transformer_2/ = low-noise expert (diffusers WanPipeline).
+        let (high, high_applied) = self.load_expert_staged(MoeExpert::High)?;
+        let (low, low_applied) = self.load_expert_staged(MoeExpert::Low)?;
+        self.adapter_zero_match_guard(high_applied, low_applied)?;
+        let vae = self.load_vae()?;
         let tok = crate::text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan-14b")?;
         Ok(Components {
             te: Arc::new(te),
@@ -347,10 +387,18 @@ impl Pipeline {
     /// cross-attends over the 512-padded context — the same rule as the 5B, sc-3697). Shared Wan
     /// text-encode routine (sc-9000 / F-020).
     fn encode(&self, comps: &Components, prompt: &str) -> CResult<Tensor> {
+        self.encode_raw(&comps.tok, &comps.te, prompt)
+    }
+
+    /// The tokenizer+encoder core of [`encode`](Self::encode), taking the two text components directly
+    /// so the sequential path can drive it with its staged (about-to-be-dropped) UMT5 encoder rather
+    /// than the resident [`Components`] bundle (sc-12733). Produces the same raw `[1, 512, 4096]` f32
+    /// context either way — the per-expert `embed_text` projection happens later, at the expert.
+    fn encode_raw(&self, tok: &TextTokenizer, te: &Umt5Encoder, prompt: &str) -> CResult<Tensor> {
         crate::text_encode::umt5_encode_padded(
-            &comps.tok,
+            tok,
             &self.te_cfg,
-            &comps.te,
+            te,
             prompt,
             &self.device,
             ENC_DTYPE,
@@ -399,20 +447,15 @@ impl Pipeline {
         Ok(Tensor::cat(&[&mask, &z_video], 1)?) // [1, 20, t_lat, h_lat, w_lat]
     }
 
-    fn render(
-        &self,
-        req: &GenerationRequest,
-        comps: &Components,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> CResult<(Vec<Image>, u32)> {
+    /// Resolve the per-request knobs against the variant/config defaults — shared verbatim by the
+    /// resident [`render`](Self::render) and the sequential [`render_sequential`](Self::render_sequential)
+    /// so the two paths can never resolve steps/guidance/boundary differently (the residency change must
+    /// be numerics-preserving, sc-12733).
+    fn resolve_knobs(&self, req: &GenerationRequest) -> RenderKnobs {
         let steps = req
             .steps
             .map(|s| s as usize)
             .unwrap_or(DEFAULT_STEPS_14B as usize);
-        let frames = req.frames.unwrap_or(DEFAULT_FRAMES_14B);
-        let fps = req.fps.unwrap_or(DEFAULT_FPS_14B);
-        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let sampler = Sampler::parse(req.sampler.as_deref());
         let (boundary, default_shift, gl, gh) = self.variant.moe_knobs();
         let shift = req
             .scheduler_shift
@@ -423,6 +466,109 @@ impl Pipeline {
             Some(g) => (g as f64, g as f64),
             None => (gl as f64, gh as f64),
         };
+        RenderKnobs {
+            steps,
+            frames: req.frames.unwrap_or(DEFAULT_FRAMES_14B),
+            fps: req.fps.unwrap_or(DEFAULT_FPS_14B),
+            seed: req.seed.unwrap_or_else(gen_core::default_seed),
+            sampler: Sampler::parse(req.sampler.as_deref()),
+            shift,
+            boundary_ts: boundary * NUM_TRAIN_TIMESTEPS as f64,
+            g_low,
+            g_high,
+        }
+    }
+
+    /// Latent geometry (z16 strides) + the shared-token-grid RoPE tables `(t_lat, h_lat, w_lat, cos,
+    /// sin)`. Shared by both render paths (sc-12733).
+    fn geometry(
+        &self,
+        req: &GenerationRequest,
+        frames: u32,
+    ) -> CResult<(usize, usize, usize, Tensor, Tensor)> {
+        let t_lat = ((frames - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
+        let h_lat = (req.height / VAE16_STRIDE_SPATIAL) as usize;
+        let w_lat = (req.width / VAE16_STRIDE_SPATIAL) as usize;
+        let (pt, ph, pw) = self.dit_cfg.patch;
+        let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
+        let (cos, sin) = WanRope::new(&self.dit_cfg).cos_sin(ppf, pph, ppw, &self.device)?;
+        Ok((t_lat, h_lat, w_lat, cos, sin))
+    }
+
+    /// The shared UMT5 negative-context prompt when either expert has CFG active — `None` at
+    /// guidance ≤ 1.0 (sc-8993, the encode-time gate mirrored from [`cfg_active`]).
+    fn negative_prompt<'a>(
+        &self,
+        req: &'a GenerationRequest,
+        knobs: &RenderKnobs,
+    ) -> Option<&'a str> {
+        if cfg_active(knobs.g_high) || cfg_active(knobs.g_low) {
+            Some(req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK))
+        } else {
+            None
+        }
+    }
+
+    /// Run the denoise steps `range` on a single expert, advancing the (shared, continuous) scheduler
+    /// and mutating `latents` in place. Extracted so the resident MoE loop and the staged expert-swap
+    /// drive the **identical** per-step math over their respective step ranges — the prefix/suffix split
+    /// is bit-exact to the resident per-step `t ≥ boundary` choice because the same `sched` advances
+    /// through every step in order (sc-12733).
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_range(
+        &self,
+        expert: &WanTransformer,
+        ctx_pos: &Tensor,
+        ctx_neg: Option<&Tensor>,
+        guidance: f64,
+        y: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        sched: &mut FlowScheduler,
+        latents: &mut Tensor,
+        range: std::ops::Range<usize>,
+        total: u32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<()> {
+        for i in range {
+            check_cancel(cancel)?;
+            let t = sched.timestep(i);
+            // I2V: concat the conditioning `y` onto the noise latent (→ in_dim 36) before the forward.
+            let x = match y {
+                Some(y) => Tensor::cat(&[&*latents, y], 1)?,
+                None => latents.clone(),
+            };
+            let v_pos = expert.forward(&x, ctx_pos, t, cos, sin)?;
+            // Negative branch (and CFG combine) only when this expert's guidance enables it; `ctx_neg`
+            // is `Some` iff that guidance > 1.0 (sc-8993).
+            let v = match ctx_neg {
+                Some(ctx_neg) if cfg_active(guidance) => {
+                    let v_neg = expert.forward(&x, ctx_neg, t, cos, sin)?;
+                    cfg(&v_pos, &v_neg, guidance)?
+                }
+                _ => v_pos,
+            };
+            *latents = sched.step(&v, latents)?; // 16-channel latent (out_dim 16)
+            on_progress(Progress::Step {
+                current: i as u32 + 1,
+                total,
+            });
+        }
+        Ok(())
+    }
+
+    /// The resident MoE render (unchanged residency: `Components` holds UMT5, **both** experts and the
+    /// VAE co-resident for the whole generation). Encodes once, projects both experts' contexts, then
+    /// splits the denoise at the boundary-crossing index and drives each half through
+    /// [`denoise_range`](Self::denoise_range).
+    fn render(
+        &self,
+        req: &GenerationRequest,
+        comps: &Components,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<(Vec<Image>, u32)> {
+        let knobs = self.resolve_knobs(req);
 
         // Text encode (pos always) once; project to each expert's context (per-expert text_embedder).
         // The negative branch is only used at guidance > 1.0, and the two experts can have distinct
@@ -433,28 +579,20 @@ impl Pipeline {
         let high_pos = comps.high.embed_text(&pos)?;
         let low_pos = comps.low.embed_text(&pos)?;
         // Shared UMT5 negative encode, computed once if either expert has CFG active.
-        let neg = if cfg_active(g_high) || cfg_active(g_low) {
-            let neg_prompt = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-            Some(self.encode(comps, neg_prompt)?)
-        } else {
-            None
+        let neg = match self.negative_prompt(req, &knobs) {
+            Some(neg_prompt) => Some(self.encode(comps, neg_prompt)?),
+            None => None,
         };
         let high_neg = match &neg {
-            Some(neg) if cfg_active(g_high) => Some(comps.high.embed_text(neg)?),
+            Some(neg) if cfg_active(knobs.g_high) => Some(comps.high.embed_text(neg)?),
             _ => None,
         };
         let low_neg = match &neg {
-            Some(neg) if cfg_active(g_low) => Some(comps.low.embed_text(neg)?),
+            Some(neg) if cfg_active(knobs.g_low) => Some(comps.low.embed_text(neg)?),
             _ => None,
         };
 
-        // Latent geometry (z16 strides) + RoPE for the shared token grid.
-        let t_lat = ((frames - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
-        let h_lat = (req.height / VAE16_STRIDE_SPATIAL) as usize;
-        let w_lat = (req.width / VAE16_STRIDE_SPATIAL) as usize;
-        let (pt, ph, pw) = self.dit_cfg.patch;
-        let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
-        let (cos, sin) = WanRope::new(&self.dit_cfg).cos_sin(ppf, pph, ppw, &self.device)?;
+        let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
 
         // I2V: build the constant channel-concat conditioning `y` (needs the VAE encoder).
         let y = match self.variant {
@@ -465,55 +603,299 @@ impl Pipeline {
                         self.variant.id()
                     ))
                 })?;
-                Some(self.build_i2v_y(&comps.vae, image, frames, req.width, req.height)?)
+                Some(self.build_i2v_y(&comps.vae, image, knobs.frames, req.width, req.height)?)
             }
             Variant::T2v => None,
         };
 
-        let mut latents = create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
-        let mut sched = FlowScheduler::new(sampler, steps, shift);
-        let boundary_ts = boundary * NUM_TRAIN_TIMESTEPS as f64;
-        let total = steps as u32;
-
-        for i in 0..steps {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let t = sched.timestep(i);
-            // MoE: high-noise expert at/above the boundary timestep, low-noise below — switching the
-            // transformer, its context, and its guidance together.
-            let (expert, ctx_pos, ctx_neg, guidance) = if t >= boundary_ts {
-                (&comps.high, &high_pos, high_neg.as_ref(), g_high)
-            } else {
-                (&comps.low, &low_pos, low_neg.as_ref(), g_low)
-            };
-            // I2V: concat the conditioning `y` onto the noise latent (→ in_dim 36) before the forward.
-            let x = match &y {
-                Some(y) => Tensor::cat(&[&latents, y], 1)?,
-                None => latents.clone(),
-            };
-            let v_pos = expert.forward(&x, ctx_pos, t, &cos, &sin)?;
-            // Negative branch (and CFG combine) only when this expert's guidance enables it; `ctx_neg`
-            // is `Some` iff that guidance > 1.0 (sc-8993).
-            let v = match ctx_neg {
-                Some(ctx_neg) if cfg_active(guidance) => {
-                    let v_neg = expert.forward(&x, ctx_neg, t, &cos, &sin)?;
-                    cfg(&v_pos, &v_neg, guidance)?
-                }
-                _ => v_pos,
-            };
-            latents = sched.step(&v, &latents)?; // 16-channel latent (out_dim 16)
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
+        let mut latents = create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+        let mut sched = FlowScheduler::new(knobs.sampler, knobs.steps, knobs.shift);
+        let total = knobs.steps as u32;
+        // MoE: high-noise expert at/above the boundary timestep, low-noise below. Flow-match timesteps
+        // are monotonically decreasing, so the crossing is a single prefix/suffix split (sc-12733).
+        let k = crossing_index(&sched, knobs.steps, knobs.boundary_ts);
+        self.denoise_range(
+            &comps.high,
+            &high_pos,
+            high_neg.as_ref(),
+            knobs.g_high,
+            y.as_ref(),
+            &cos,
+            &sin,
+            &mut sched,
+            &mut latents,
+            0..k,
+            total,
+            &req.cancel,
+            on_progress,
+        )?;
+        self.denoise_range(
+            &comps.low,
+            &low_pos,
+            low_neg.as_ref(),
+            knobs.g_low,
+            y.as_ref(),
+            &cos,
+            &sin,
+            &mut sched,
+            &mut latents,
+            k..knobs.steps,
+            total,
+            &req.cancel,
+            on_progress,
+        )?;
 
         on_progress(Progress::Decoding);
         let decoded = comps.vae.decode(&latents)?;
         let images = frames_to_images(&decoded)?;
-        Ok((images, fps))
+        Ok((images, knobs.fps))
     }
+
+    /// The **sequential-offload** MoE render (sc-12733, epic 12732) — the staged twin of
+    /// [`render`](Self::render) that keeps only one heavy component resident at a time, dropping the
+    /// pre-decode (denoise) peak on a 24 GB card:
+    ///
+    /// 1. **TE off-GPU during denoise.** Load UMT5, encode the pos (+ neg when CFG) **raw** `[1,512,4096]`
+    ///    context, then DROP the ~21 GB f32 encoder — only the small context tensors survive.
+    /// 2. **VAE staged (I2V).** Load the VAE (with encoder), build the channel-concat `y`, drop it before
+    ///    denoise; the encoder is only needed to build `y`.
+    /// 3. **Expert swap.** Hold only the **active** expert: load high, project its context, run steps
+    ///    `0..k` (`t ≥ boundary`), DROP high; then load low, project, run `k..steps`. At most one swap
+    ///    (one boundary crossing) — the two ~8-9 GB experts are **never co-resident**.
+    /// 4. **VAE decode.** Reload the VAE and decode.
+    ///
+    /// Parity: the per-expert `embed_text` projection runs through **each expert's own** `text_embedder`
+    /// (entangled), so the projection must happen after that expert loads — the raw UMT5 context stays
+    /// resident across the swap. One [`FlowScheduler`] advances continuously across the swap, so the
+    /// prefix/suffix split reproduces the resident per-step choice bit-for-bit. Each heavy component is a
+    /// local bound to its own scope, so Rust's scope drop frees the inactive one before the next loads;
+    /// a `device.synchronize()` at each boundary drains the async encode/denoise kernels before the freed
+    /// pool is reused (the sc-12195 eviction race, applied here per-swap rather than once).
+    fn render_sequential(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<(Vec<Image>, u32)> {
+        let knobs = self.resolve_knobs(req);
+        let cancel = &req.cancel;
+        check_cancel(cancel)?;
+
+        // The tiny tokenizer is cheap and stays resident across the whole render; the heavy UMT5 encoder
+        // is dropped right after encoding.
+        let tok = crate::text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan-14b")?;
+
+        // ── Stage 1: UMT5 text encode → raw pos/neg context → DROP the encoder (~21 GB f32). ──
+        let (pos, neg) = {
+            on_progress(Progress::Loading(LoadPhase::TextEncoder));
+            let te = self.load_te()?;
+            let pos = self.encode_raw(&tok, &te, &req.prompt)?;
+            let neg = match self.negative_prompt(req, &knobs) {
+                Some(neg_prompt) => Some(self.encode_raw(&tok, &te, neg_prompt)?),
+                None => None,
+            };
+            // sc-12195: the encode kernels are async — drain before `te` frees at the brace below, or
+            // the next heavy load reuses the freed allocator pool under in-flight kernels.
+            self.device.synchronize()?;
+            (pos, neg)
+        };
+        check_cancel(cancel)?;
+
+        let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
+
+        // ── Stage 1b (I2V only): load the VAE (with encoder), build `y`, DROP the VAE before denoise. ──
+        let y = match self.variant {
+            Variant::I2v => {
+                on_progress(Progress::Loading(LoadPhase::Renderer));
+                let vae = self.load_vae()?;
+                let image = i2v_reference(req).ok_or_else(|| {
+                    CandleError::Msg(format!(
+                        "{}: image-to-video requires a Reference conditioning image",
+                        self.variant.id()
+                    ))
+                })?;
+                let y = self.build_i2v_y(&vae, image, knobs.frames, req.width, req.height)?;
+                self.device.synchronize()?; // drain the encode before the VAE frees at the brace.
+                Some(y)
+            }
+            Variant::T2v => None,
+        };
+        check_cancel(cancel)?;
+
+        let mut latents = create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+        let mut sched = FlowScheduler::new(knobs.sampler, knobs.steps, knobs.shift);
+        let total = knobs.steps as u32;
+        // The single high→low crossing: high runs `0..k` (`t ≥ boundary`), low runs `k..steps`.
+        let k = crossing_index(&sched, knobs.steps, knobs.boundary_ts);
+
+        // ── Stage 2: the expert swap — hold only the ACTIVE expert (the two are NEVER co-resident). ──
+        // Load high, project + denoise `0..k`, DROP high; then load low, project + denoise `k..steps`.
+        // Driven through [`staged_expert_swap`], whose block-scoping frees the inactive expert before the
+        // next loads; the `sync` boundary drains in-flight kernels before the freed pool is reused. The
+        // high expert's applied-residual count is carried past its drop in a `Cell` (a `usize`, not the
+        // expert) so the cross-expert zero-match guard runs once both have loaded.
+        let high_applied: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
+        let mut swap_state = SwapState {
+            sched: &mut sched,
+            latents: &mut latents,
+            // Reborrow so `on_progress` is usable again for Stage 3 after `swap_state` dies.
+            on_progress: &mut *on_progress,
+        };
+        staged_expert_swap(
+            k,
+            knobs.steps,
+            &mut swap_state,
+            // load high
+            |st| {
+                check_cancel(cancel)?;
+                (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                let (high, applied) = self.load_expert_staged(MoeExpert::High)?;
+                high_applied.set(applied);
+                Ok(high)
+            },
+            // use high over `0..k`
+            |high, st| {
+                let high_pos = high.embed_text(&pos)?;
+                let high_neg = match &neg {
+                    Some(neg) if cfg_active(knobs.g_high) => Some(high.embed_text(neg)?),
+                    _ => None,
+                };
+                self.denoise_range(
+                    high,
+                    &high_pos,
+                    high_neg.as_ref(),
+                    knobs.g_high,
+                    y.as_ref(),
+                    &cos,
+                    &sin,
+                    st.sched,
+                    st.latents,
+                    0..k,
+                    total,
+                    cancel,
+                    st.on_progress,
+                )
+            },
+            // load low
+            |st| {
+                check_cancel(cancel)?;
+                (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                let (low, low_applied) = self.load_expert_staged(MoeExpert::Low)?;
+                // Both experts have now loaded (whenever both own steps) → the cross-expert guard is exact.
+                self.adapter_zero_match_guard(high_applied.get(), low_applied)?;
+                Ok(low)
+            },
+            // use low over `k..steps`
+            |low, st| {
+                let low_pos = low.embed_text(&pos)?;
+                let low_neg = match &neg {
+                    Some(neg) if cfg_active(knobs.g_low) => Some(low.embed_text(neg)?),
+                    _ => None,
+                };
+                self.denoise_range(
+                    low,
+                    &low_pos,
+                    low_neg.as_ref(),
+                    knobs.g_low,
+                    y.as_ref(),
+                    &cos,
+                    &sin,
+                    st.sched,
+                    st.latents,
+                    k..knobs.steps,
+                    total,
+                    cancel,
+                    st.on_progress,
+                )
+            },
+            // sc-12195 boundary sync: drain kernels before the dropped expert's pool is reused.
+            || Ok(self.device.synchronize()?),
+        )?;
+        check_cancel(cancel)?;
+
+        // ── Stage 3: reload the VAE and decode. ──
+        on_progress(Progress::Loading(LoadPhase::Renderer));
+        let vae = self.load_vae()?;
+        on_progress(Progress::Decoding);
+        let decoded = vae.decode(&latents)?;
+        let images = frames_to_images(&decoded)?;
+        Ok((images, knobs.fps))
+    }
+}
+
+/// Resolved per-request render knobs (steps/guidance/boundary/…), produced by
+/// [`Pipeline::resolve_knobs`] and consumed identically by the resident and sequential render paths so
+/// the residency change stays numerics-preserving (sc-12733).
+struct RenderKnobs {
+    steps: usize,
+    frames: u32,
+    fps: u32,
+    seed: u64,
+    sampler: Sampler,
+    shift: f64,
+    /// Boundary timestep `boundary · num_train_timesteps` (T2V 875, I2V 900).
+    boundary_ts: f64,
+    g_low: f64,
+    g_high: f64,
+}
+
+/// First step index whose flow-match timestep drops **below** `boundary_ts` — the single high→low MoE
+/// crossing. Steps `0..k` run the high-noise expert (`t ≥ boundary_ts`), `k..steps` the low-noise
+/// expert. Flow-match timesteps are monotonically decreasing, so this prefix/suffix split is exactly the
+/// per-step `t ≥ boundary_ts` choice (returns `steps` if the boundary is never crossed → all high; `0`
+/// if it is crossed at the first step → all low). Pure and GPU-free, so both render paths share it and a
+/// unit test can pin the split against the per-step rule (sc-12733).
+fn crossing_index(sched: &FlowScheduler, steps: usize, boundary_ts: f64) -> usize {
+    (0..steps)
+        .find(|&i| sched.timestep(i) < boundary_ts)
+        .unwrap_or(steps)
+}
+
+/// The mutable denoise state threaded through [`staged_expert_swap`] (sc-12733). Held as `&mut`
+/// references so exclusive access moves between the load/use closures via the `&mut SwapState` param
+/// rather than being captured by each closure — the borrow-checker-clean way to let two `FnOnce`
+/// stages share the scheduler/latents without a `RefCell`.
+struct SwapState<'a> {
+    sched: &'a mut FlowScheduler,
+    latents: &'a mut Tensor,
+    on_progress: &'a mut dyn FnMut(Progress),
+}
+
+/// Drive the A14B high→low MoE expert swap so the two ~8-9 GB experts are **never co-resident**
+/// (sc-12733, the Pillar-1 win): load the high expert, `use_high` it over steps `0..k`, DROP it, then
+/// load the low expert and `use_low` it over `k..steps`. Each expert is a local bound to its own block,
+/// so Rust's scope drop frees the inactive one **before** the next loads; an expert whose step range is
+/// empty (`k == 0` all-low, or `k == steps` all-high) is skipped entirely — a single boundary crossing,
+/// at most one swap. `sync` runs at each swap boundary to drain in-flight kernels before the dropped
+/// expert's allocator pool is reused (the sc-12195 eviction race, applied per-swap).
+///
+/// Generic over the expert type `E` and the threaded state `St` so a CPU unit test can pin the
+/// never-co-resident property with a lightweight liveness witness — no GPU, no real weights — exactly as
+/// `candle_gen::residency`'s `run_sequential` is pinned. The load closures receive `&mut St` so they can
+/// emit their [`Progress::Loading`] before the (heavy) load; the use closures receive `&mut St` to
+/// advance the shared scheduler/latents.
+#[allow(clippy::too_many_arguments)]
+fn staged_expert_swap<E, St>(
+    k: usize,
+    steps: usize,
+    state: &mut St,
+    load_high: impl FnOnce(&mut St) -> CResult<E>,
+    use_high: impl FnOnce(&E, &mut St) -> CResult<()>,
+    load_low: impl FnOnce(&mut St) -> CResult<E>,
+    use_low: impl FnOnce(&E, &mut St) -> CResult<()>,
+    mut sync: impl FnMut() -> CResult<()>,
+) -> CResult<()> {
+    if k > 0 {
+        let high = load_high(state)?;
+        use_high(&high, state)?;
+        // Drain before `high` frees at the brace below and `low` reuses the pool.
+        sync()?;
+    } // `high` drops HERE — freed before `low` is ever loaded (the never-co-resident invariant).
+    if k < steps {
+        let low = load_low(state)?;
+        use_low(&low, state)?;
+        sync()?;
+    } // `low` drops here.
+    Ok(())
 }
 
 /// The single conditioning reference image for I2V (the first video frame), if present.
@@ -602,6 +984,14 @@ pub struct Wan14bGenerator {
     /// these files, the UMT5 TE + VAE in place when their files are set (sc-10909) else from
     /// [`Self::root`], and the tiny tokenizer always from [`Self::root`]; `None` on the registry path.
     comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiExperts>>,
+    /// Component-residency policy (epic 12732, sc-12733), resolved once at load via
+    /// [`effective_offload_policy`] (honoring both `LoadSpec::offload_policy` and the family-wide
+    /// `CANDLE_GEN_OFFLOAD=sequential` A/B override). [`OffloadPolicy::Resident`] keeps the cached
+    /// [`Components`] warm; [`OffloadPolicy::Sequential`] drives the staged
+    /// [`Pipeline::render_sequential`] (TE-offload + expert-swap + VAE-staging), bounding the denoise
+    /// peak on a 24 GB card. The resident [`components`](Self::components) cache stays untouched under
+    /// `Sequential` — the staged path never populates it.
+    offload: OffloadPolicy,
     components: Mutex<Option<Components>>,
 }
 
@@ -681,8 +1071,16 @@ impl Generator for Wan14bGenerator {
                 self.adapters.clone(),
             ),
         };
-        let components = self.components(&pipe)?;
-        let (frames, fps) = pipe.render(req, &components, on_progress)?;
+        // Sequential offload (sc-12733): stage load→use→drop each heavy component so the denoise peak is
+        // one expert instead of TE + both experts + VAE co-resident. Resident (default): the cached
+        // `Components` bundle, unchanged path. The staged path never populates the resident cache.
+        let (frames, fps) = match self.offload {
+            OffloadPolicy::Sequential => pipe.render_sequential(req, on_progress)?,
+            OffloadPolicy::Resident => {
+                let components = self.components(&pipe)?;
+                pipe.render(req, &components, on_progress)?
+            }
+        };
         Ok(GenerationOutput::Video {
             frames,
             fps,
@@ -724,7 +1122,11 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            supports_sequential_offload: false,
+            // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12733): the staged
+            // `render_sequential` offloads UMT5 during denoise and holds only the ACTIVE MoE expert
+            // resident (never both), dropping the pre-decode peak on a 24 GB card. Advertised so the
+            // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
+            supports_sequential_offload: true,
         },
     }
 }
@@ -740,6 +1142,13 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
 }
 
 fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(build_generator(spec, variant)?))
+}
+
+/// The concrete registry-path constructor behind [`load_variant`] — validates the spec surface and
+/// resolves the residency policy, returning the concrete [`Wan14bGenerator`] so the offload-policy
+/// wiring is unit-testable without a `dyn Generator` downcast (sc-12733).
+fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14bGenerator> {
     let id = variant.id();
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -761,15 +1170,19 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         )));
     }
     let device = candle_gen::default_device()?;
-    Ok(Box::new(Wan14bGenerator {
+    // Resolve the residency policy once (sc-12733): honors both `spec.offload_policy` and the
+    // family-wide `CANDLE_GEN_OFFLOAD=sequential` A/B override.
+    let offload = effective_offload_policy(spec.offload_policy);
+    Ok(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
         root,
         device,
         adapters: spec.adapters.clone(),
         comfyui: None,
+        offload,
         components: Mutex::new(None),
-    }))
+    })
 }
 
 /// Construct a lazy candle Wan2.2 A14B generator that reads its **two DiT experts in place** from an
@@ -794,6 +1207,9 @@ pub fn load_from_comfyui_experts(
 ) -> gen_core::Result<Box<dyn Generator>> {
     let variant = if i2v { Variant::I2v } else { Variant::T2v };
     let device = candle_gen::default_device()?;
+    // The ComfyUI lane carries no `LoadSpec`, so the residency policy comes purely from the family-wide
+    // `CANDLE_GEN_OFFLOAD=sequential` A/B override (default resident) — sc-12733.
+    let offload = effective_offload_policy(OffloadPolicy::Resident);
     Ok(Box::new(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
@@ -806,6 +1222,7 @@ pub fn load_from_comfyui_experts(
             te_file,
             vae_file,
         })),
+        offload,
         components: Mutex::new(None),
     }))
 }
@@ -1069,5 +1486,317 @@ mod tests {
         // pre-quantized, so `spec.quantize` no longer rejects; both experts load packed at ingestion.
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
         assert!(load_i2v_14b(&quant).is_ok());
+    }
+
+    // ── sc-12733: sequential component offload + expert swap (Pillar 1) ──
+
+    /// Both A14B variants must now advertise `supports_sequential_offload` so the worker's fit-gate can
+    /// tell "the staged path bounds peak VRAM here" from a no-op fallback (sc-11126 contract).
+    #[test]
+    fn descriptor_advertises_sequential_offload() {
+        for d in [descriptor_t2v_14b(), descriptor_i2v_14b()] {
+            assert!(
+                d.capabilities.supports_sequential_offload,
+                "A14B must advertise sequential offload (sc-12733)"
+            );
+        }
+    }
+
+    /// The load path resolves the residency policy from `LoadSpec::offload_policy` via
+    /// [`effective_offload_policy`]: the default spec stays `Resident` (cached-components, unchanged
+    /// path), an explicit `Sequential` spec flips the generator onto the staged expert-swap render.
+    #[test]
+    fn load_resolves_offload_policy_from_spec() {
+        let resident = build_generator(
+            &LoadSpec::new(WeightsSource::Dir("/snap".into())),
+            Variant::T2v,
+        )
+        .unwrap();
+        assert_eq!(resident.offload, OffloadPolicy::Resident);
+
+        let sequential = build_generator(
+            &LoadSpec::new(WeightsSource::Dir("/snap".into()))
+                .with_offload_policy(OffloadPolicy::Sequential),
+            Variant::I2v,
+        )
+        .unwrap();
+        assert_eq!(sequential.offload, OffloadPolicy::Sequential);
+    }
+
+    /// Parity guard for the residency change (sc-12733): the precomputed boundary-crossing index `k`
+    /// reproduces the resident per-step `t ≥ boundary_ts` expert choice **exactly**. Flow-match
+    /// timesteps are monotonically decreasing, so steps `0..k` (high) and `k..steps` (low) are the same
+    /// split the resident loop makes step-by-step — the whole justification for driving the swap as one
+    /// continuous scheduler. Checked against the real `FlowScheduler` sigma table for both samplers and
+    /// both variants' boundaries.
+    #[test]
+    fn crossing_index_matches_the_per_step_boundary_choice() {
+        let steps = 20;
+        for sampler in [Sampler::UniPC, Sampler::Euler] {
+            let sched = FlowScheduler::new(sampler, steps, T2V_14B_FLOW_SHIFT);
+            // Precondition: strictly decreasing timesteps (else the prefix/suffix split is unsound).
+            for i in 1..steps {
+                assert!(
+                    sched.timestep(i) < sched.timestep(i - 1),
+                    "flow-match timesteps must be monotonically decreasing"
+                );
+            }
+            for boundary in [T2V_14B_BOUNDARY, I2V_14B_BOUNDARY] {
+                let boundary_ts = boundary * NUM_TRAIN_TIMESTEPS as f64;
+                let k = crossing_index(&sched, steps, boundary_ts);
+                for i in 0..steps {
+                    assert_eq!(
+                        i < k,
+                        sched.timestep(i) >= boundary_ts,
+                        "step {i}: prefix/suffix split must equal the per-step `t >= boundary_ts` \
+                         choice (k={k}, boundary_ts={boundary_ts})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The boundary extremes collapse the swap to a single expert (never load one that owns no steps):
+    /// a boundary above every timestep ⇒ all-low (`k == 0`, high skipped); below every timestep ⇒
+    /// all-high (`k == steps`, low skipped).
+    #[test]
+    fn crossing_index_handles_boundary_extremes() {
+        let steps = 12;
+        let sched = FlowScheduler::new(Sampler::UniPC, steps, T2V_14B_FLOW_SHIFT);
+        assert_eq!(
+            crossing_index(&sched, steps, f64::INFINITY),
+            0,
+            "a boundary above every timestep ⇒ all-low (k == 0)"
+        );
+        assert_eq!(
+            crossing_index(&sched, steps, f64::NEG_INFINITY),
+            steps,
+            "a boundary below every timestep ⇒ all-high (k == steps)"
+        );
+    }
+
+    /// A liveness witness for the expert-swap residency tests, mirroring the drop-order witnesses in
+    /// `candle_gen::residency`'s tests: it bumps a shared live-counter on construction and drops it on
+    /// `Drop`, recording the peak concurrency and an ordered load/drop log.
+    struct LiveTracker {
+        live: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+        log: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl LiveTracker {
+        fn new() -> Self {
+            Self {
+                live: std::cell::Cell::new(0),
+                peak: std::cell::Cell::new(0),
+                log: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn born(&self, tag: &'static str) {
+            self.live.set(self.live.get() + 1);
+            if self.live.get() > self.peak.get() {
+                self.peak.set(self.live.get());
+            }
+            self.log.borrow_mut().push(tag);
+        }
+        fn died(&self, tag: &'static str) {
+            self.live.set(self.live.get() - 1);
+            self.log.borrow_mut().push(tag);
+        }
+        fn note(&self, tag: &'static str) {
+            self.log.borrow_mut().push(tag);
+        }
+    }
+
+    /// Stands in for a loaded 14B expert: its lifetime on the live-counter is exactly the expert's GPU
+    /// residency window in `staged_expert_swap`.
+    struct ExpertWitness<'a> {
+        tracker: &'a LiveTracker,
+        drop_tag: &'static str,
+    }
+
+    impl<'a> ExpertWitness<'a> {
+        fn new(tracker: &'a LiveTracker, born_tag: &'static str, drop_tag: &'static str) -> Self {
+            tracker.born(born_tag);
+            Self { tracker, drop_tag }
+        }
+    }
+
+    impl Drop for ExpertWitness<'_> {
+        fn drop(&mut self) {
+            self.tracker.died(self.drop_tag);
+        }
+    }
+
+    /// The Pillar-1 invariant (sc-12733): the two experts are **never co-resident**. Driven through the
+    /// production `staged_expert_swap` with `0 < k < steps` (a real swap), the peak live-expert count is
+    /// 1 and the high expert drops before the low expert loads — a drop-order witness, not a VRAM read
+    /// (candle's cudarc pool makes `nvidia-smi` blind to the drop, so residency is asserted structurally).
+    #[test]
+    fn expert_swap_is_never_co_resident_and_high_drops_before_low_loads() {
+        let tracker = LiveTracker::new();
+        let mut state = ();
+        let out = staged_expert_swap(
+            3, // k: 0 < k < steps → both experts own steps → a genuine swap
+            8, // steps
+            &mut state,
+            |_st| Ok(ExpertWitness::new(&tracker, "load-high", "drop-high")),
+            |_w, _st| Ok(()),
+            |_st| Ok(ExpertWitness::new(&tracker, "load-low", "drop-low")),
+            |_w, _st| Ok(()),
+            || Ok(()),
+        );
+        assert!(out.is_ok());
+        assert_eq!(
+            tracker.peak.get(),
+            1,
+            "the two 14B experts must NEVER be co-resident (the whole Pillar-1 win)"
+        );
+        assert_eq!(
+            *tracker.log.borrow(),
+            vec!["load-high", "drop-high", "load-low", "drop-low"],
+            "the high expert must be dropped before the low expert loads"
+        );
+    }
+
+    /// Mutation-check (sc-12733 acceptance): force both experts resident and confirm the
+    /// never-co-resident assertion regresses — proving the passing test above is not a default-value
+    /// false green. This is the exact both-resident bug the story removes (the old `Components` held both
+    /// experts for the whole render): binding `high` and `low` in one scope co-resides them, and the SAME
+    /// liveness witness the passing test relies on now reports peak concurrency 2, so its `peak == 1`
+    /// assertion goes RED.
+    #[test]
+    fn forcing_both_experts_resident_regresses_the_never_co_resident_assertion() {
+        let tracker = LiveTracker::new();
+        {
+            // MUTATION: the inactive expert is NOT dropped before the next loads.
+            let _high = ExpertWitness::new(&tracker, "load-high", "drop-high");
+            let _low = ExpertWitness::new(&tracker, "load-low", "drop-low");
+            tracker.note("both-resident-denoise");
+        }
+        assert_eq!(
+            tracker.peak.get(),
+            2,
+            "the forced-both-resident mutation co-resides the two experts"
+        );
+        assert!(
+            tracker.peak.get() > 1,
+            "the never-co-resident assertion (peak == 1) MUST fail under the both-resident mutation — \
+             the passing test genuinely discriminates co-residence, it is not a false green"
+        );
+    }
+
+    /// `staged_expert_swap` skips loading the expert whose step range is empty (memory-optimal single
+    /// crossing): `k == 0` loads only the low expert, `k == steps` loads only the high expert.
+    #[test]
+    fn expert_swap_skips_the_expert_that_owns_no_steps() {
+        // k == 0 → all-low: the high loader is never called.
+        let low_only = LiveTracker::new();
+        let mut st = ();
+        staged_expert_swap(
+            0,
+            8,
+            &mut st,
+            |_st| Ok(ExpertWitness::new(&low_only, "load-high", "drop-high")),
+            |_w, _st| Ok(()),
+            |_st| Ok(ExpertWitness::new(&low_only, "load-low", "drop-low")),
+            |_w, _st| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            *low_only.log.borrow(),
+            vec!["load-low", "drop-low"],
+            "k == 0 must load ONLY the low expert"
+        );
+
+        // k == steps → all-high: the low loader is never called.
+        let high_only = LiveTracker::new();
+        let mut st = ();
+        staged_expert_swap(
+            8,
+            8,
+            &mut st,
+            |_st| Ok(ExpertWitness::new(&high_only, "load-high", "drop-high")),
+            |_w, _st| Ok(()),
+            |_st| Ok(ExpertWitness::new(&high_only, "load-low", "drop-low")),
+            |_w, _st| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            *high_only.log.borrow(),
+            vec!["load-high", "drop-high"],
+            "k == steps must load ONLY the high expert"
+        );
+    }
+
+    /// The sc-12195 eviction sync, applied per-swap (sc-12733): the boundary `sync` runs after each
+    /// expert is used and **before** it drops (and before the next loads) — draining in-flight kernels
+    /// so the freed allocator pool is never reused under them. Mirrors residency.rs's boundary-sync
+    /// ordering witness.
+    #[test]
+    fn expert_swap_syncs_before_each_expert_drops() {
+        let tracker = LiveTracker::new();
+        let mut st = ();
+        staged_expert_swap(
+            3,
+            8,
+            &mut st,
+            |_st| Ok(ExpertWitness::new(&tracker, "load-high", "drop-high")),
+            |_w, _st| {
+                tracker.note("use-high");
+                Ok(())
+            },
+            |_st| Ok(ExpertWitness::new(&tracker, "load-low", "drop-low")),
+            |_w, _st| {
+                tracker.note("use-low");
+                Ok(())
+            },
+            || {
+                tracker.note("sync");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *tracker.log.borrow(),
+            vec![
+                "load-high",
+                "use-high",
+                "sync",
+                "drop-high", //
+                "load-low",
+                "use-low",
+                "sync",
+                "drop-low",
+            ],
+            "each expert must be synced (kernels drained) before it drops and the next loads"
+        );
+    }
+
+    /// A load failure on the low expert still drops the (already-used-and-synced) high expert via scope
+    /// drop on the `?` path — no leak, and the error propagates.
+    #[test]
+    fn expert_swap_propagates_a_low_load_failure_after_dropping_high() {
+        let tracker = LiveTracker::new();
+        let mut st = ();
+        let out: CResult<()> = staged_expert_swap(
+            3,
+            8,
+            &mut st,
+            |_st| Ok(ExpertWitness::new(&tracker, "load-high", "drop-high")),
+            |_w, _st| Ok(()),
+            |_st| Err(CandleError::Msg("low expert OOM".into())),
+            |_w: &ExpertWitness, _st| Ok(()),
+            || Ok(()),
+        );
+        assert!(matches!(out, Err(CandleError::Msg(_))));
+        assert_eq!(
+            *tracker.log.borrow(),
+            vec!["load-high", "drop-high"],
+            "high must have dropped before the low load was even attempted"
+        );
+        assert_eq!(tracker.peak.get(), 1);
     }
 }
