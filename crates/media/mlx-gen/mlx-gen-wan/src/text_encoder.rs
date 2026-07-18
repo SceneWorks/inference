@@ -588,6 +588,29 @@ pub(crate) fn encode_text_staged(
     Ok((context, context_null))
 }
 
+/// Production tier-aware UMT5 staging shared by the dense, A14B, VACE, and VACE-Fun providers.
+///
+/// Exposed only so the real-weight acceptance gate can measure the exact production selection path;
+/// callers should normally use a Wan provider rather than this probe seam.
+#[doc(hidden)]
+pub fn encode_text_staged_for_tier(
+    root: &std::path::Path,
+    cfg: &WanModelConfig,
+    prompt: &str,
+    neg_prompt: &str,
+    skip_neg: bool,
+    load_quant: Option<mlx_gen::Quant>,
+) -> Result<(Array, Option<Array>)> {
+    encode_text_staged(
+        root,
+        cfg,
+        prompt,
+        neg_prompt,
+        skip_neg,
+        crate::model::effective_te_quant(cfg, load_quant),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

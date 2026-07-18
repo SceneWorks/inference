@@ -39,7 +39,7 @@ use crate::pipeline::{
     ti2v_blend_init, Expert,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
-use crate::text_encoder::encode_text_staged;
+use crate::text_encoder::encode_text_staged_for_tier;
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;
@@ -446,13 +446,13 @@ impl Wan {
             auto_tiling_budgeted(height as i32, width as i32, gen_frames as i32, true)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
-        let (context, context_null) = encode_text_staged(
+        let (context, context_null) = encode_text_staged_for_tier(
             &self.root,
             cfg,
             &req.prompt,
             &neg_prompt,
             cfg_disabled,
-            effective_te_quant(cfg, self.quant),
+            self.quant,
         )?;
         // sc-12796: `encode_text_staged` already drops the UMT5 encoder before returning (only the small
         // `[L, dim]` contexts survive — the DiT projects them through its own `text_embedding` below).
@@ -1215,13 +1215,13 @@ impl Wan14b {
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         // A14B always encodes both prompts (the dual-expert default), so `skip_neg = false`; unwrap
         // the always-present negative context back to the `Array` the MoE denoise expects.
-        let (context, context_null) = encode_text_staged(
+        let (context, context_null) = encode_text_staged_for_tier(
             &self.root,
             cfg,
             &req.prompt,
             &neg_prompt,
             false,
-            effective_te_quant(cfg, self.quant),
+            self.quant,
         )?;
         let context_null = context_null.expect("a14b always encodes the negative context");
         // sc-12736: `encode_text_staged` already drops the UMT5 encoder before returning (only the
