@@ -1,5 +1,9 @@
 """LTX-2.3 AudioVideo **LoRA** e2e golden (sc-2687) — the production joint denoise WITH a LoRA.
 
+sc-12896: goldens now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320); the old
+/tmp/mlx312 (0.31.2) instructions below are retained for provenance only.
+
 Belt-and-suspenders for the AvDiT LoRA path: applies a full-surface LTX LoRA (video + audio +
 cross-modal) to the reference AV `LTXModel` via the forward-time residual
 (`mlx_video/lora/apply.py::LoRALinear`, the same strategy the Rust port uses), then runs the

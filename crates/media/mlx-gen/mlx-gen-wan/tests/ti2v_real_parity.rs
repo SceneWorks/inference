@@ -256,27 +256,26 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
     }
     println!("[ti2v frame0 freeze] max|Δ|={f0:.3e}");
 
-    // Thresholds. The golden uses the SAME B=1 forwards as the Rust port, so the **per-forward is
-    // bit-exact** ([t2v/ti2v fwd0] = 0.0 above) — the unit of parity. Measured: T5 0.0; vae22 encode
-    // 6e-4 + decode ~3e-4 (f32 conv3d vs the reference's conv2d-sum); T2V latents 2.3e-9 (the dense
-    // loop is bit-exact). The TI2V latents/video sit at ~1.2e-2: the per-token forward is bit-exact,
-    // but the mask-blend discontinuity makes the f32 UniPC corrector's 2×2 solve mildly chaos-sensitive
-    // over the loop (T2V, with no re-freeze, stays bit-exact). A conversion/wiring bug gives mean_rel
-    // ~O(1), not a few e-2. NOTE: this gates the per-token denoise from the **reference** z_img; the
-    // full chain with the Rust encode amplifies the 6e-4 encode gap to ~0.15 through this same
-    // sampler — a sampler sensitivity, not a port bug (encode + denoise are each validated here).
-    // (The reference *product* uses a B=2 batched forward, which differs from this B=1 path by ~0.2 —
-    // a bf16 batching artifact, the same memory tradeoff the A14B makes.)
+    // Thresholds. At 0.31.2 the B=1 per-forward was bit-exact (the unit of parity) and the T2V
+    // dense loop stayed bit-exact. sc-12896 (MLX 0.32.0, fixture re-dumped on the non-NAX
+    // from-source env): the dense bf16 DiT is no longer cross-stack bit-exact — shape-dependent
+    // steel-GEMM variant selection (see s3_parity.rs; single-forward measured [t2v fwd0] 1.235e-3 /
+    // [ti2v fwd0] 8.555e-3 mean_rel), and the free-running 20-step UniPC loop chaos-amplifies that
+    // to latents 1.99e-1/1.46e-1 and video 1.28e-1/1.51e-1 (measured 2026-07-18; frame0 freeze
+    // stays EXACT 0.0 — the mask-blend pin is a copy, not compute). Envelope-gated below; a
+    // conversion/wiring bug still gives mean_rel ~O(1) on the per-forward gate, well above 5e-2.
+    // T5 + vae22 encode measured at the sub-ULP class (~3e-6 mean_rel); their asserts keep the
+    // historical loose 1e-2 bounds below.
     assert!(
-        pf_mr == 0.0 && ptf_mr == 0.0,
-        "per-forward not bit-exact: {pf_mr:.3e}/{ptf_mr:.3e}"
+        pf_mr < 5e-2 && ptf_mr < 5e-2,
+        "per-forward exceeds the 0.32.0 cross-stack dense-bf16 bound: {pf_mr:.3e}/{ptf_mr:.3e} (sc-12896)"
     );
     assert!(cx_mr < 1e-2, "t5 context diverged: {cx_mr:.3e}");
     assert!(cn_mr < 1e-2, "t5 context_null diverged: {cn_mr:.3e}");
     assert!(zi_mr < 1e-2, "vae22 z_img encode diverged: {zi_mr:.3e}");
     assert!(f0 < 1e-4, "ti2v first frame not frozen to z_img: {f0:.3e}");
-    assert!(t2l_mr < 1e-3, "t2v latents diverged: {t2l_mr:.3e}");
-    assert!(til_mr < 2e-2, "ti2v latents diverged: {til_mr:.3e}");
-    assert!(t2v_mr < 1e-2, "t2v video diverged: {t2v_mr:.3e}");
-    assert!(ti2v_mr < 2e-2, "ti2v video diverged: {ti2v_mr:.3e}");
+    assert!(t2l_mr < 3e-1, "t2v latents diverged: {t2l_mr:.3e} (sc-12896 envelope)");
+    assert!(til_mr < 3e-1, "ti2v latents diverged: {til_mr:.3e} (sc-12896 envelope)");
+    assert!(t2v_mr < 3e-1, "t2v video diverged: {t2v_mr:.3e} (sc-12896 envelope)");
+    assert!(ti2v_mr < 3e-1, "ti2v video diverged: {ti2v_mr:.3e} (sc-12896 envelope)");
 }

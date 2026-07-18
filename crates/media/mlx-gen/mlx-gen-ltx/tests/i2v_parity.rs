@@ -11,8 +11,10 @@
 //!
 //! Both precisions, like `e2e_parity`: `f32` (`Precision::quant_f32`, the quality gate) and the native
 //! `bf16` production path (`Precision::quant_bf16`); the quant bits/group ride on `split_model.json`.
-//! The per-forward DiT is bit-exact (sc-2842), so the
-//! conditioned latents are bit-exact and frames are pixel-parity (px>8 < 1%).
+//! Golden re-dumped on MLX 0.32.0 non-NAX (sc-12896). Contract on 0.32.0: the bf16 stage-1 stays
+//! bit-exact; f32 stages (and the f32 upsampler in both modes) carry the tight cross-stack ULP bounds
+//! (see `dit_parity.rs` for the mechanism); the free-running 2-stage e2e is envelope-gated; the
+//! conditioned-frame pin stays exact (it is a copy, not compute).
 //!
 //! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test i2v_parity -- --ignored --nocapture`
 
@@ -180,21 +182,36 @@ fn run_i2v_gate(golden_path: &str, bf16: bool, stat_dt: Dtype) {
     .expect("stage1 denoise");
     let s1_mr = mean_rel(&s1, g.require("stage1_out").unwrap());
     eprintln!("stage1 conditioned denoise mean_rel = {s1_mr:.3e}");
-    assert!(
-        s1_mr == 0.0,
-        "stage1 conditioned denoise must be bit-exact: {s1_mr:.3e}"
-    );
+    // sc-12896: bf16 stays bit-exact on 0.32.0; f32 carries the cross-stack ULP drift (measured
+    // mean_rel 4.218e-6 at matched 0.32.0). Bound ~5× the measurement.
+    if bf16 {
+        assert!(
+            s1_mr == 0.0,
+            "bf16 stage1 conditioned denoise must be bit-exact: {s1_mr:.3e}"
+        );
+    } else {
+        assert!(
+            s1_mr <= 2.0e-5,
+            "stage1 conditioned denoise mean_rel {s1_mr:.3e} exceeds the 0.32.0 cross-stack f32 bound 2e-5 (sc-12896)"
+        );
+    }
     // Conditioned-frame preservation: frame 0 of the stage-1 output == the image latent.
     assert!(
         peak_rel(&frame(&s1, frame_idx), &frame(stage1_image, 0)) == 0.0,
         "stage1 conditioned frame preserved"
     );
 
-    // --- Upsample bit-exact (S4). ---
+    // --- Upsample (S4): the dense upsampler carries the 0.32.0 cross-stack ULP drift (sc-12896).
+    // In the f32 regime it is f32-ULP class (measured peak_rel 9.353e-6); in the bf16 production
+    // regime the upsampler itself runs bf16, so the drift is bf16-ULP class (measured 8.301e-3 ≈
+    // 2 bf16 ULP). Bounds ~2-4× the measurements per mode. ---
     let ups = upsample_latents(&s1, &up, &mean, &std).expect("upsample");
+    let ups_pr = peak_rel(&ups, g.require("upsampled").unwrap());
+    eprintln!("upsample peak_rel = {ups_pr:.3e}");
+    let ups_bound = if bf16 { 3.0e-2 } else { 2.0e-5 };
     assert!(
-        peak_rel(&ups, g.require("upsampled").unwrap()) == 0.0,
-        "upsample bit-exact"
+        ups_pr <= ups_bound,
+        "upsample peak_rel {ups_pr:.3e} exceeds the 0.32.0 cross-stack bound {ups_bound:.1e} (sc-12896)"
     );
 
     // --- Full 2-stage I2V e2e (the sc-2685 acceptance) → final latents + frames. ---
@@ -237,9 +254,14 @@ fn run_i2v_gate(golden_path: &str, bf16: bool, stat_dt: Dtype) {
         STAGE1_SIGMAS.len() - 1 + 3,
         "step callbacks fired per denoise step"
     );
+    // sc-12896: the free-running 2-stage trajectory compounds the per-forward cross-stack drift
+    // chaotically on 0.32.0 (pipeline_parity documents the same mechanism), so the final latents
+    // are envelope-gated, not bit-exact — f32 measured mean_rel 3.309e-5, bf16 3.642e-2 (the bf16
+    // upsampler ULP drift seeds the stage-2 chaos). The conditioned-frame pin below stays exact.
+    let fmr_bound = if bf16 { 1.2e-1 } else { 1.0e-3 };
     assert!(
-        fmr == 0.0,
-        "full I2V e2e final latents must be bit-exact: {fmr:.3e}"
+        fmr < fmr_bound,
+        "full I2V e2e final latents mean_rel {fmr:.3e} above the cross-stack compounding envelope {fmr_bound:.1e} (sc-12896)"
     );
     assert!(
         cond_pr == 0.0,

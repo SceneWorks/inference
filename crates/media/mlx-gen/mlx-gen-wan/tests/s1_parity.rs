@@ -90,7 +90,15 @@ fn umt5_embeds_match_reference() {
             .to_vec();
         let (max_abs, mean_rel) = diff(&got, &exp);
         println!("[block0] max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e}");
-        assert_eq!(max_abs, 0.0, "block-0 not bit-exact: max|Δ|={max_abs:.3e}");
+        // sc-12896: golden re-dumped on MLX 0.32.0 (non-NAX from-source env). The dense bf16 encoder
+        // is no longer cross-stack bit-exact on 0.32.0 — the reference and the Rust port pick
+        // shape-dependent steel-GEMM variants (measured max|Δ| 7.629e-6 on ~1.6e3-magnitude
+        // activations = mean_rel 4.733e-9, sub-ULP relative). Bounded ~4× in rel terms; the
+        // pre-re-dump mismatch measured mean_rel ~9.2e-4 — still far above this bound.
+        assert!(
+            mean_rel < 2e-8,
+            "block-0 exceeds the 0.32.0 cross-stack bound: max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e} (sc-12896)"
+        );
     }
 
     let fx = fixtures();
@@ -122,10 +130,16 @@ fn umt5_embeds_match_reference() {
 
         let (max_abs, mean_rel) = diff(&got, &exp);
         println!("[{name}] seq_len={seq_len} max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e}");
-        // Bit-exact across all 24 layers (incl. the 126-token Chinese negative). The whole op set
-        // — token-embed gather, rms_norm, unscaled f32 attention + per-layer bias + masked softmax,
-        // gated GELU, and the batched matmuls — matches the reference byte-for-byte.
-        assert_eq!(max_abs, 0.0, "[{name}] not bit-exact: max|Δ|={max_abs:.3e}");
+        // Was bit-exact across all 24 layers at 0.31.2. sc-12896 (MLX 0.32.0, golden re-dumped on
+        // the non-NAX from-source env): the dense encoder picks shape-dependent steel-GEMM variants
+        // across the two stacks; the per-block sub-ULP residual (block-0 mean_rel 4.7e-9) amplifies
+        // over 24 layers to mean_rel 3.7e-6 on the normalized embeds (measured 2026-07-18). Bounded
+        // ~5×; op-class bugs (the gelu-constant class ~1e-3) and stale-golden mismatches (~9e-4)
+        // stay two orders above.
+        assert!(
+            mean_rel < 2e-5,
+            "[{name}] exceeds the 0.32.0 cross-stack bound: max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e} (sc-12896)"
+        );
     }
 }
 

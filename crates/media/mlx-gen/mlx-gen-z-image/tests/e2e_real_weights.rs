@@ -87,9 +87,11 @@ fn assert_golden_schedule_is_production(
             (gs - ps).abs() < 1e-4,
             "STALE GOLDEN (sc-3007): golden sigma[{i}]={gs} != production for_static_shift({steps}, \
              3.0)[{i}]={ps}. The golden was dumped at a different schedule than the public `generate` \
-             path uses — re-dump it with the current `tools/dump_z_image_golden.py` (mlx 0.31.2), e.g. \
+             path uses — re-dump it with the current `tools/dump_z_image_golden.py` on the \
+             version-matched 0.32.0 NON-NAX env (sc-12896; mlx 0.32.0 built from source at \
+             MACOSX_DEPLOYMENT_TARGET=15.0, e.g. ~/Repos/mflux/.venv-0320), e.g. \
              `ZIMAGE_W={w} ZIMAGE_H={h} ZIMAGE_STEPS={steps} ZIMAGE_SEED={seed} ZIMAGE_PROMPT=\"{prompt}\" \
-             [QUANTIZE=N] <mflux-0.31.2-venv>/bin/python tools/dump_z_image_golden.py`"
+             [QUANTIZE=N] PYTHONPATH=~/Repos/mflux/src ~/Repos/mflux/.venv-0320/bin/python tools/dump_z_image_golden.py`"
         );
     }
 }
@@ -190,7 +192,10 @@ fn e2e_denoise_loop_matches_golden() {
         out.shape()
     );
     // bf16 accumulation over 4 iterative steps (each feeding the next) compounds; the decoded
-    // image is near-pixel-perfect, so this peak-relative latent drift is benign.
+    // image is near-pixel-perfect, so this peak-relative latent drift is benign. sc-12896 (MLX
+    // 0.32.0, golden re-dumped on the matched non-NAX env at the canonical 1024²): measured
+    // peak_rel 4.43e-2 — within the historical bound. NB a 256² dense golden inflates this to
+    // ~3.2e-1 (small-tensor peak sensitivity); dump the dense golden at 1024² like the Q goldens.
     assert!(pr < 1e-1, "final latents diverged: peak_rel {pr:.2e}");
     println!("✓ denoise loop matches golden (peak-rel {pr:.2e})");
 }

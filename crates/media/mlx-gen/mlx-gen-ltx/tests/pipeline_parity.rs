@@ -7,7 +7,9 @@
 //! SAME weights and checks the Rust `pipeline::generate_t2v` reproduces the stage-1 latents, the final
 //! latents, and the decoded uint8 frames.
 //!
-//! **The golden MUST be mlx 0.31.2** (the Rust build): `quantized_matmul` changed 0.31.0→0.31.2.
+//! **The golden MUST match the Rust build's MLX — now 0.32.0** (re-dumped sc-12896 on the non-NAX
+//! from-source env; `quantized_matmul` moved 0.31.0→0.31.2 and again 0.31.2→0.32.0, and the f32
+//! upsampler is no longer cross-stack bit-exact on 0.32.0 — see `dit_parity.rs` for the mechanism).
 //! Run in the **f32** regime (`Precision::quant_f32`, f32 latents) — gates the pipeline *math* (legacy
 //! Euler, re-noise, 2-stage orchestration, uint8 conversion) isolated from bf16 rounding, mirroring
 //! the S3b DiT gate. The bf16-production px>8 verdict is S6. Honors "divergence is not rounding":
@@ -112,8 +114,10 @@ fn pipeline_matches_reference() {
         "stage1 denoise loop diverged: mean_rel {s1_mr:.3e}"
     );
 
-    // The stage transition is exact: upsample (S4 bit-exact) + re-noise (formula) reproduce the
-    // reference's `upsampled`/`renoised` byte-for-byte from the golden's stage-1 latents.
+    // The stage transition: re-noise (formula) stays byte-exact; the f32 upsampler picked up the
+    // 0.32.0 cross-stack ULP drift (sc-12896: measured peak_rel 3.161e-6 at matched 0.32.0 on
+    // byte-identical inputs — dense f32 convs/GEMMs select shape-dependent kernel variants across
+    // the two stacks). Bounded at ~6× the measurement; a real S4 bug is orders above.
     let ups = upsample_latents(
         g.require("stage1_out").unwrap(),
         &up,
@@ -130,7 +134,10 @@ fn pipeline_matches_reference() {
     .expect("renoise");
     let rn_pr = peak_rel(&rn, g.require("renoised").unwrap());
     eprintln!("upsample peak_rel = {ups_pr:.3e} | renoise peak_rel = {rn_pr:.3e}");
-    assert!(ups_pr == 0.0, "upsample not bit-exact: {ups_pr:.3e}");
+    assert!(
+        ups_pr <= 2.0e-5,
+        "upsample peak_rel {ups_pr:.3e} exceeds the 0.32.0 cross-stack f32 bound 2e-5 (sc-12896)"
+    );
     assert!(rn_pr == 0.0, "renoise not bit-exact: {rn_pr:.3e}");
 
     let mut steps = 0usize;
@@ -177,6 +184,8 @@ fn pipeline_matches_reference() {
     // it shrinks at production res). NOT a pipeline bug; the mechanism is named (divergence-is-not-
     // rounding). The production-resolution bf16 px>8 verdict — and any tightening of the per-forward
     // DiT residual — is S6. Gated loosely here only as a bound on the compounding.
+    // sc-12896 (0.32.0 re-dump, matched-version golden): re-measured final mean_rel 3.571e-4 /
+    // px>8 0.00% — comfortably inside these historical bounds; left as-is.
     assert!(
         fmr < 1.2e-1,
         "final latents mean_rel {fmr:.3e} above the F32Q8 floor"

@@ -1,5 +1,9 @@
 """LTX-2.3 **I2V** golden — the single-image conditioning path, both stages (sc-2685).
 
+sc-12896: goldens now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320); the old
+/tmp/mlx312 (0.31.2) instructions below are retained for provenance only.
+
 Runs the reference `generate.py` / `generate_av.py` *video* I2V conditioning end-to-end: inject a
 clean image latent at frame 0 (`apply_conditioning` + a per-frame denoise mask), seed each stage via
 the noiser, and run the conditioned `denoise(..., state=...)` (per-token σ·mask + `apply_denoise_mask`)

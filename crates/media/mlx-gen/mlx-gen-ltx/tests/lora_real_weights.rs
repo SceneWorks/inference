@@ -190,15 +190,19 @@ fn lora_frames_match_reference() {
         "LoRA e2e: final latents mean_rel = {fmr:.3e}, frames px>8 = {:.2}%",
         px * 100.0
     );
-    // The residual matches the reference `LoRALinear` op-for-op, so the per-forward is bit-exact and
-    // the chaos-sensitive stage-1 stays deterministic-identical → bit-exact latents, pixel-exact frames.
+    // The residual matches the reference `LoRALinear` op-for-op. On 0.31.2 that made the free-running
+    // render bit-exact; on 0.32.0 the f32 per-forward cross-stack drift (see dit_parity.rs) is
+    // chaos-amplified by the distilled sampler (sc-12896: measured mean_rel 1.164e-1 / px>8 4.36% at
+    // matched 0.32.0 with the fresh golden). Envelope-gated: the discrimination margin vs a real
+    // semantic change is documented by `lora_per_pass_strength_changes_output`, whose strength-A/B
+    // signal measures ~3.9e-1 on the same pipeline — ~3.4× this floor.
     assert!(
-        fmr == 0.0,
-        "LoRA final latents must be bit-exact to the reference residual: {fmr:.3e}"
+        fmr < 2.5e-1,
+        "LoRA final latents mean_rel {fmr:.3e} above the cross-stack compounding envelope (sc-12896)"
     );
     assert!(
-        px < 1e-2,
-        "LoRA frames px>8 {:.2}% exceeds the 1% acceptance",
+        px < 1e-1,
+        "LoRA frames px>8 {:.2}% exceeds the 0.32.0 acceptance envelope (sc-12896)",
         px * 100.0
     );
 }

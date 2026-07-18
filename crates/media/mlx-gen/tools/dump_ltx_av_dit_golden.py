@@ -1,5 +1,9 @@
 """LTX-2.3 AudioVideo DiT golden — reference joint `LTXModel(video, audio)` velocities (sc-2684 S2).
 
+sc-12896: goldens now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320); the old
+/tmp/mlx312 (0.31.2) instructions below are retained for provenance only.
+
 Builds the reference **AudioVideo** `LTXModel` (the dual-modality DiT: 48 layers, video dim 4096 +
 audio dim 2048 + bidirectional cross-modal attention), loads the real `ltx_2_3_base_q8`
 `transformer.safetensors` (the WHOLE model — video + audio + `av_ca`/`a2v`/`v2a` cross modules),

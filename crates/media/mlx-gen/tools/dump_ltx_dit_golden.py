@@ -10,14 +10,17 @@ must reproduce the velocity.
 f32 activations are the port's quality target; the Q8 weights are kept (no dense bf16 transformer
 exists). The audio + cross-modal weights are filtered out so the VideoOnly model loads cleanly.
 
-**The golden MUST be generated with mlx 0.31.2** (matching the Rust build): `quantized_matmul`
-changed 0.31.0→0.31.2, so a 0.31.0 golden mismatches the Rust quant path by ~5e-4/op (the dense
-S0–S2 ops are bit-identical across the two, which is why only the DiT exposed it). The mflux venv is
-0.31.0; use a 0.31.2 env.
+**The golden MUST be generated with the version-matched MLX — now 0.32.0 (sc-12896)** and a
+**non-NAX build**: install mlx 0.32.0 **from source** with `MACOSX_DEPLOYMENT_TARGET=15.0` (e.g. the
+`~/Repos/mflux/.venv-0320` env: python 3.12 + diffusers 0.37.1 / transformers 5.10.1 / torch 2.12.0).
+Do NOT use the pip wheel as-is on newer silicon: 0.32.0 gates some affine-quant kernels on the GPU
+generation (`use_qmv_wide`, gen>=15) and NAX on the build's deployment target — see sc-12896 for the
+full adjudication. History: `quantized_matmul` changed 0.31.0→0.31.2 (~5e-4/op) and again
+0.31.2→0.32.0 (ULP-class per op, chaos-amplified over the 48 layers).
 
-Run (mlx 0.31.2 env + mlx_video source):
+Run (0.32.0 non-NAX env + mlx_video source):
     MLX_VIDEO_SRC=~/.cache/uv/archive-v0/DtG1XO51ABFxUGHg \
-      /tmp/mlx312/bin/python tools/dump_ltx_dit_golden.py
+      ~/Repos/mflux/.venv-0320/bin/python tools/dump_ltx_dit_golden.py
 Output (committed): mlx-gen-ltx/tests/fixtures/ltx_dit_golden.safetensors
 """
 

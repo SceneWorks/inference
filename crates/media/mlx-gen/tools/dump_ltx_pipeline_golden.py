@@ -1,5 +1,9 @@
 """LTX-2.3 two-stage T2V pipeline golden — reference `generate_av.py` video path (sc-2679 S5).
 
+sc-12896: goldens now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
+built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320); the old
+/tmp/mlx312 (0.31.2) instructions below are retained for provenance only.
+
 Runs the **real** `ltx_2_3_base_q8` transformer (Q8) + upsampler + VAE decoder through the reference
 2-stage distilled denoise — stage-1 denoise (8 steps) → 2× spatial upsample → re-noise → stage-2
 denoise (3 steps) → VAE decode → uint8 frames — over deterministic **injected** inputs (initial
