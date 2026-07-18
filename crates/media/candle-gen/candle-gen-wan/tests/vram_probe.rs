@@ -73,11 +73,23 @@ use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
     MoeExpert, Progress, WeightsSource,
 };
-use candle_gen::testkit::VramProbe;
+use candle_gen::testkit::{
+    cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water, VramProbe,
+};
 
 /// Max idle-baseline VRAM (GB) tolerated before the sampled peak is considered contaminated by
 /// another process. Matches the flux2 harness's `assert_trustworthy(1.0)`.
 const MAX_BASELINE_GB: f64 = 1.0;
+
+/// The **logical** CUDA device candle renders on (`cuda:0`). The driver API respects
+/// `CUDA_VISIBLE_DEVICES`, so logical 0 is the physical card candle uses — NOT the physical nvidia-smi
+/// ordinal (`probe_gpu`). The `USED_MEM_HIGH` mempool probe (sc-12818) reads this device's default pool.
+const CANDLE_LOGICAL_DEVICE: i32 = 0;
+
+/// Bytes → GiB (base-2, the unit the campaign quotes the concurrent-live peak in).
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / 1_073_741_824.0
+}
 
 /// A render whose middle frame is flatter than this is degenerate (black / uniform), which means the
 /// engine failed silently and the peak describes a broken run. Mirrors `smoke_support`'s
@@ -292,6 +304,19 @@ fn measure(engine_id: &str) {
     // CUDA_VISIBLE_DEVICES — a multi-GPU box must not render on one card and sample another).
     let mut probe = VramProbe::start_rendered();
 
+    // sc-12818: reset the driver mempool USED_MEM_HIGH watermark up front so the DENOISE-phase read
+    // (at Progress::Decoding) captures the load+denoise true concurrent-live peak from a clean slate.
+    // This is the accurate number — nvidia-smi's ~40 ms polling under-samples the brief attention /
+    // im2col / decode transients ~2× — and it is split into denoise vs decode below (each reported
+    // alongside the nvidia-smi peak) to ATTRIBUTE the peak: the campaign's fixed ~30 GiB A14B floor is
+    // owned by the denoise attention, not the VAE decode (so a bf16 VAE, sc-12818, does not move it).
+    if !reset_cuda_mempool_high_water(CANDLE_LOGICAL_DEVICE) {
+        eprintln!(
+            "[wan-vram] WARNING: could not reset the driver mempool USED_MEM_HIGH watermark; \
+             the *MemHighGib numbers still read the pool high-water (fresh process ⇒ starts at 0)"
+        );
+    }
+
     // Bracketed separately even though Wan's load is lazy, so the report PROVES load-peak ~0 rather
     // than assuming it.
     let load_phase = probe.phase();
@@ -311,6 +336,8 @@ fn measure(engine_id: &str) {
     // about the measuring card (sc-12402).
     let gpu = candle_gen::testkit::probe_gpu();
     let pre_decode_mib = std::sync::atomic::AtomicU64::new(0);
+    // sc-12818: the denoise-phase USED_MEM_HIGH, captured at the decode boundary (0 = not captured).
+    let denoise_high_bytes = std::sync::atomic::AtomicU64::new(0);
     let generate_phase = probe.phase();
     let t0 = std::time::Instant::now();
     let output = generator
@@ -321,10 +348,17 @@ fn measure(engine_id: &str) {
             Progress::Decoding => {
                 let mib = candle_gen::testkit::used_mib(gpu).unwrap_or(0);
                 pre_decode_mib.store(mib, std::sync::atomic::Ordering::Relaxed);
+                // sc-12818: read the driver's true DENOISE-phase concurrent-live peak (accurate where
+                // the nvidia-smi `mib` above under-samples the attention transient), then RESET the
+                // watermark so the remaining work (the VAE decode) is measured in isolation.
+                let dh = cuda_mempool_used_high_bytes(CANDLE_LOGICAL_DEVICE).unwrap_or(0);
+                denoise_high_bytes.store(dh, std::sync::atomic::Ordering::Relaxed);
+                reset_cuda_mempool_high_water(CANDLE_LOGICAL_DEVICE);
                 eprintln!(
-                    "\n[wan-vram] denoise done, decode starts — device high-water here: {mib} MiB \
-                     ({:.1} GiB) = weights + denoise",
-                    mib as f64 * 1048576.0 / 1073741824.0
+                    "\n[wan-vram] denoise done, decode starts — nvidia-smi high-water here: {mib} MiB \
+                     ({:.1} GiB) | denoise USED_MEM_HIGH {:.2} GiB (true concurrent-live)",
+                    mib as f64 * 1048576.0 / 1073741824.0,
+                    gib(dh),
                 );
             }
             Progress::Loading(_) => {}
@@ -332,6 +366,15 @@ fn measure(engine_id: &str) {
         .unwrap_or_else(|e| panic!("{engine_id} ({tier}) generate: {e}"));
     probe.end_gen(generate_phase);
     let secs = t0.elapsed().as_secs_f32();
+    // sc-12818: the driver's honest concurrent-live peaks (GiB, base-2) — the accurate re-baseline for
+    // the campaign's ~2×-understated nvidia-smi numbers. `decode_high` is measured from the reset at the
+    // decode boundary (⇒ the isolated VAE-decode true peak, incl. resident weights/latent); `denoise_high`
+    // was captured there. The overall true peak is the max — and attributes which stage owns the floor.
+    let denoise_high = denoise_high_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let decode_high = cuda_mempool_used_high_bytes(CANDLE_LOGICAL_DEVICE).unwrap_or(0);
+    let denoise_high_gib = gib(denoise_high);
+    let decode_high_gib = gib(decode_high);
+    let true_mem_high_gib = denoise_high_gib.max(decode_high_gib);
     let pre_decode_gb =
         pre_decode_mib.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1048576.0 / 1.0e9;
 
@@ -355,15 +398,21 @@ fn measure(engine_id: &str) {
     // it), when it dominates the peak is a fact about this card's VRAM, not about the model.
     let decode_gb = (report.peak_gb - pre_decode_gb).max(0.0);
     eprintln!(
-        "\n[wan-vram] {engine_id} {tier}: {report} | pre-decode {pre_decode_gb:.1} GB \
-         (weights+denoise) | decode adds {decode_gb:.1} GB | {} frames in {secs:.0}s | \
-         middle-frame std {std:.1}",
+        "\n[wan-vram] {engine_id} {tier}: {report} | TRUE concurrent-live peak (USED_MEM_HIGH) \
+         {true_mem_high_gib:.2} GiB = max(denoise {denoise_high_gib:.2}, decode {decode_high_gib:.2}) \
+         | pre-decode {pre_decode_gb:.1} GB | decode adds (nvidia-smi) {decode_gb:.1} GB | {} frames in \
+         {secs:.0}s | middle-frame std {std:.1}",
         out_frames.len()
     );
-    // Machine-parseable — scrape `[[WAN_VRAM]]`.
+    // Machine-parseable — scrape `[[WAN_VRAM]]`. `peakGb` is the nvidia-smi high-water (base-10 GB, the
+    // manifest unit); `trueMemHighGib` is the driver mempool USED_MEM_HIGH concurrent-live peak (base-2
+    // GiB, sc-12818) — the accurate number the nvidia-smi poll under-samples ~2× — split into
+    // `denoiseMemHighGib` / `decodeMemHighGib` so the owning stage is attributable.
     println!(
         "[[WAN_VRAM]] {{\"model\":\"{engine_id}\",\"tier\":\"{tier}\",\"peakGb\":{:.1},\
-         \"preDecodeGb\":{pre_decode_gb:.1},\"decodeGb\":{decode_gb:.1},\"vaeBudgetGib\":\"{}\",\
+         \"trueMemHighGib\":{true_mem_high_gib:.2},\"denoiseMemHighGib\":{denoise_high_gib:.2},\
+         \"decodeMemHighGib\":{decode_high_gib:.2},\"preDecodeGb\":{pre_decode_gb:.1},\
+         \"decodeGb\":{decode_gb:.1},\"vaeBudgetGib\":\"{}\",\
          \"steadyGb\":{:.1},\"loadPeakGb\":{:.1},\"baselineGb\":{:.2},\"frames\":{},\
          \"width\":{width},\"height\":{height},\"steps\":{steps},\"seconds\":{secs:.0}}}",
         report.peak_gb,
@@ -395,3 +444,4 @@ fn wan_vram_t2v_14b() {
 fn wan_vram_i2v_14b() {
     measure("wan2_2_i2v_14b");
 }
+

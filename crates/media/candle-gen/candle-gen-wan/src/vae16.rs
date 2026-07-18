@@ -14,7 +14,15 @@
 //! `Upsampler`, `causal`) and the from-scratch [`CausalConv3d`](crate::conv3d) — only the encoder's
 //! stride-2 spatial/temporal downsamplers are new here. Decode **streams one latent frame at a time**
 //! (the sc-5176 fix, bit-equivalent to a single pass via the causal `feat_cache`); encode mirrors the
-//! diffusers **chunked** causal encode (frame 0 alone, then 4-frame chunks). Everything runs **f32**.
+//! diffusers **chunked** causal encode (frame 0 alone, then 4-frame chunks).
+//!
+//! **Dtype (sc-12818):** the decoder runs in the loaded weight dtype ([`WanVae16::dtype`]) — the A14B
+//! loads it **bf16**, ~halving the z16 decode's fixed VRAM floor (weights + the un-tileable f32
+//! activations) so the 1280×720/81f A14B decode fits a 24 GiB card; the 5B z48 path and the CPU tests
+//! stay f32. The channel-L2 `ChanNorm` and the `MidAttn` softmax reduce in f32 regardless (bf16's
+//! 8-bit mantissa is too coarse for those sums), applying the result back in the working dtype so the
+//! activation itself stays bf16 — the UMT5 RMS-norm idiom (sc-12778). candle's **CPU** backend has no
+//! bf16 matmul, so the bf16 decode is CUDA-only; CPU tests exercise the f32 reference forward.
 
 use std::sync::Mutex;
 
@@ -312,6 +320,11 @@ pub struct WanVae16 {
     conv_out: CausalConv3d,
     encoder: Option<(Encoder, CausalConv3d)>, // (encoder, quant_conv)
     z_dim: usize,
+    /// The dtype the weights loaded at (the [`VarBuilder`] dtype), i.e. the dtype the decode runs in.
+    /// The A14B loads this **bf16** (sc-12818, ~halving the z16 decode's fixed VRAM floor); the 5B z48
+    /// path and the CPU tests load f32. [`Self::unnormalize`] casts the (f32-computed) unnormalized
+    /// latent to this so the decoder convs see a matching-dtype activation.
+    dtype: DType,
 }
 
 impl WanVae16 {
@@ -327,6 +340,7 @@ impl WanVae16 {
 
     fn build(cfg: &Vae16Config, vb: VarBuilder, with_encoder: bool) -> Result<Self> {
         let device = vb.device();
+        let dtype = vb.dtype();
         let z = cfg.z_dim;
         let mean = Tensor::from_vec(LATENTS16_MEAN.to_vec(), (1, z, 1, 1, 1), device)?;
         let std = Tensor::from_vec(LATENTS16_STD.to_vec(), (1, z, 1, 1, 1), device)?;
@@ -401,7 +415,15 @@ impl WanVae16 {
             conv_out,
             encoder,
             z_dim: z,
+            dtype,
         })
+    }
+
+    /// The dtype the VAE weights loaded at (and the decode runs in) — **bf16** for the A14B (sc-12818),
+    /// f32 for the CPU/test path. Exposed so a CUDA parity harness can assert the weights really loaded
+    /// bf16 (the VRAM-floor win) before comparing the bf16 vs f32 decode.
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// Decode latents `[B,16,T,H,W]` → RGB frames `[B,3, 1+(T-1)·4, 8H, 8W]` in `[-1,1]`. **Streams one
@@ -455,7 +477,15 @@ impl WanVae16 {
         // `candle_gen::vae_tiling::decode_tiled`; what stays z16-specific is the `WAN_Z16` geometry and
         // the per-frame-streaming `decode` closure. With a spatial-only `cfg`, `plan.t` is a single
         // full-extent temporal tile, so each `decode` call streams the whole clip (temporal bound kept).
-        vae_tiling::decode_tiled(WAN_Z16, "wan z16 vae", z, cfg, |tile| self.decode(tile))
+        //
+        // Each tile is decoded in the VAE's working dtype (bf16 on the A14B, sc-12818 — where the
+        // per-tile im2col/conv activations, the decode's dominant transient, get the VRAM win), then
+        // upcast to f32 so the shared seam-blend accumulates against its f32 trapezoidal mask (the
+        // accumulator is small vs. the per-tile activations, so f32 there costs little and keeps the
+        // stitch precise). A no-op cast on the f32 path.
+        vae_tiling::decode_tiled(WAN_Z16, "wan z16 vae", z, cfg, |tile| {
+            self.decode(tile)?.to_dtype(DType::F32)
+        })
     }
 
     /// **Free-aware budgeted** decode (sc-12758): derive the decoded output dims from the z16 latent
@@ -524,17 +554,24 @@ impl WanVae16 {
         encoder.reset_cache();
         assert!(!chunks.is_empty(), "encode needs >= 1 frame");
         let out = Tensor::cat(&chunks, 2)?;
-        // quant_conv (1×1×1) over the full moments, take the mean (first z channels), normalize.
+        // quant_conv (1×1×1) over the full moments, take the mean (first z channels), normalize. The
+        // moments run in the VAE dtype (bf16 on the A14B, sc-12818); upcast to f32 for the per-channel
+        // normalize (`mean`/`std` are f32) so the returned conditioning latent stays f32 exactly as
+        // before — a no-op cast on the f32 path.
         let moments = quant_conv.forward(&out, &Ctx::single_pass())?;
-        let mu = moments.narrow(1, 0, self.z_dim)?;
+        let mu = moments.narrow(1, 0, self.z_dim)?.to_dtype(DType::F32)?;
         mu.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
     }
 
-    /// `z_pixel = z·std + mean` in f32 (the inverse of the encoder's per-channel normalize).
+    /// `z_pixel = z·std + mean` (the inverse of the encoder's per-channel normalize). The affine is
+    /// computed in **f32** (`mean`/`std` are f32) for precision, then cast to the VAE's working
+    /// [`dtype`](Self::dtype) so the decoder convs get a matching-dtype activation — bf16 for the A14B
+    /// (sc-12818), a no-op f32 clone for the 5B/test path.
     fn unnormalize(&self, z: &Tensor) -> Result<Tensor> {
         z.to_dtype(DType::F32)?
             .broadcast_mul(&self.std)?
-            .broadcast_add(&self.mean)
+            .broadcast_add(&self.mean)?
+            .to_dtype(self.dtype)
     }
 
     fn reset_caches(&self) {
@@ -550,6 +587,15 @@ impl WanVae16 {
 }
 
 // --- sc-12758: free-aware budgeted z16 spatial-tiling for the A14B decode ------------------------
+//
+// **sc-12818 — tiling is NOT the A14B memory lever.** Re-measured with the driver's accurate
+// concurrent-live peak (`CU_MEMPOOL_ATTR_USED_MEM_HIGH`, which the nvidia-smi poll under-sampled ~2×),
+// the sequential A14B q4 @1280×720/81f decode's true peak was a **FIXED ~30.1 GiB floor, independent of
+// the VAE tile budget** (budget 20 → 30.1; budget 10 / 192 px tile → still 30.1) — the floor is the VAE
+// weights + the un-tileable f32 decode activations, not something spatial tiling shrinks. The lever that
+// lands it under 24 GiB is running the z16 VAE **bf16** (`WanVae16::dtype`), which ~halves that floor.
+// This tiling machinery stays as the candle conv2d **im2col-safety** cap (`WAN_Z16_VAE_IM2COL_SAFE_PX`)
+// and the big-VRAM correctness bound — not as the 24 GiB fit mechanism.
 //
 // The z16 twin of the z48 budgeted tiler (`crate::vae`, sc-7111/sc-12734). It reuses the shared
 // budgeted-tiling DRIVER + free-aware budget resolver + selector in `candle_gen::vae_tiling`, supplying

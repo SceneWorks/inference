@@ -21,8 +21,13 @@ pub use candle_gen_catalog::nvfp4_quant_tiers;
 
 /// Platform label for this bundle; matches `RuntimeCatalog::platform`.
 pub const PLATFORM: &str = "cuda";
-/// The single tensor backend every provider in this bundle uses.
+/// The single tensor backend every media, LLM, and snapshot-preparer provider in this bundle uses.
 pub const BACKEND: &str = "candle";
+/// The single tensor backend of this bundle's audio lane (sc-12901,
+/// `docs/architecture/audio-backend-strategy.md`). Audio is Candle-native on every platform, so
+/// here it matches `BACKEND`; the lane is still composed through the catalog's dedicated audio
+/// section (owned by the audio composition root, sc-12835) rather than `candle-gen-catalog`.
+pub const AUDIO_BACKEND: &str = "candle";
 /// Target triples this bundle is supported on.
 pub const SUPPORTED_TARGET_TRIPLES: &[&str] =
     &["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"];
@@ -41,15 +46,40 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     }
 }
 
+/// The bundle's explicit audio registry. Empty until the Candle audio composition root lands
+/// (sc-12835/12836) — its `register_providers` call slots in here, exactly like the media
+/// catalog's.
+#[cfg(feature = "media")]
+fn audio_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    gen_core::ProviderRegistryBuilder::new().build()
+}
+
 /// Build the complete validated CUDA runtime composition.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
-    RuntimeCatalog::try_new(
-        PLATFORM,
-        BACKEND,
-        media_registry(),
-        candle_llm::text_registry(),
-        candle_llm::snapshot_preparer_registry(),
-    )
+    #[cfg(feature = "media")]
+    {
+        RuntimeCatalog::try_new_with_audio(
+            PLATFORM,
+            BACKEND,
+            media_registry(),
+            candle_llm::text_registry(),
+            candle_llm::snapshot_preparer_registry(),
+            AUDIO_BACKEND,
+            audio_registry(),
+        )
+    }
+
+    // The LLM-only composition profile ships neither the media nor the audio graph.
+    #[cfg(not(feature = "media"))]
+    {
+        RuntimeCatalog::try_new(
+            PLATFORM,
+            BACKEND,
+            media_registry(),
+            candle_llm::text_registry(),
+            candle_llm::snapshot_preparer_registry(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -65,6 +95,15 @@ mod tests {
         assert!(snapshot.generator_ids.is_empty());
         assert_eq!(snapshot.text_llm_ids, ["candle-llama", "candle-llava"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
+        // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend; its
+        // provider surface stays empty until sc-12835/12836 register the real audio catalog.
+        #[cfg(feature = "media")]
+        {
+            assert_eq!(snapshot.audio_backend.as_deref(), Some(super::AUDIO_BACKEND));
+            assert!(snapshot.audio_generator_ids.is_empty());
+        }
+        #[cfg(not(feature = "media"))]
+        assert_eq!(snapshot.audio_backend, None);
         #[cfg(feature = "media")]
         assert_eq!(candle_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);
         assert_eq!(snapshot.to_json()["platform"], "cuda");

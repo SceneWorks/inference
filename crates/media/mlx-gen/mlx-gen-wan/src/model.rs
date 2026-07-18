@@ -29,7 +29,7 @@ use crate::adapters::{
     apply_wan_adapters_additive, merge_wan_adapters, reject_loha_on_packed, warn_skipped_adapters,
     WanLoraReport,
 };
-use crate::config::{WanModelConfig, MIN_SIZE};
+use crate::config::{WanModelConfig, WanQuant, MIN_SIZE};
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z,
     build_ti2v_mask, build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22,
@@ -138,6 +138,35 @@ pub fn descriptor() -> ModelDescriptor {
             supports_sequential_offload: true,
         },
     }
+}
+
+/// The projection width the UMT5 text encoder packs to on a quantized tier: **Q8** (sc-12831). Q8 is
+/// near-lossless for this drift-sensitive encoder — measured prompt-embedding cosine **0.9998** vs the
+/// bf16 baseline on the real 5B TE, vs **0.976** at Q4 (a visible ~12° shift; the "biggest numeric-drift
+/// risk" the candle sc-12757 finding flagged). Q8 already cuts the TE-encode active peak **11.83 → 7.72
+/// GiB** — well under the epic's <16 GB-with-margin target — so we floor the TE at Q8 even when the DiT
+/// tier is Q4: the user's Q4 *DiT* creative choice is untouched, and the TE stays regression-free (the
+/// extra ~2 GiB a Q4 TE would save is not needed and not worth the drift).
+const TE_QUANT_BITS: i32 = 8;
+
+/// The effective UMT5 text-encoder quantization for a Wan tier (sc-12831). The DiT is packed on an
+/// MLX-affine tier iff a pre-quantized snapshot manifest is present (`config.quantization`) **or** a
+/// load-time `Q4`/`Q8` `spec.quantize` was requested (`Nvfp4` is candle-only and never reaches the MLX
+/// Wan path — excluded so its `bits()` = 4 is not routed through `mlx quantize`). On such a tier the TE
+/// packs to [`TE_QUANT_BITS`] (Q8), retiring the residual ~12 GiB f32-TE-encode active peak (sc-12796)
+/// that no further component offload could lower — the epic's binding 5B constraint. On the bf16 tier
+/// this is `None` (the TE stays dense / bit-exact). Shared by the 5B [`Wan`], the A14B [`Wan14b`], and
+/// the VACE paths (`model_vace.rs`).
+pub(crate) fn effective_te_quant(
+    config: &WanModelConfig,
+    load_quant: Option<Quant>,
+) -> Option<WanQuant> {
+    let dit_affine_quantized =
+        config.quantization.is_some() || matches!(load_quant, Some(Quant::Q4) | Some(Quant::Q8));
+    dit_affine_quantized.then_some(WanQuant {
+        bits: TE_QUANT_BITS,
+        group_size: mlx_gen::quant::DEFAULT_GROUP_SIZE,
+    })
 }
 
 /// The loaded Wan2.2 TI2V-5B (dense). Holds the resolved config + the snapshot directory; the heavy
@@ -412,8 +441,14 @@ impl Wan {
             auto_tiling_budgeted(height as i32, width as i32, gen_frames as i32, true)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
-        let (context, context_null) =
-            encode_text_staged(&self.root, cfg, &req.prompt, &neg_prompt, cfg_disabled)?;
+        let (context, context_null) = encode_text_staged(
+            &self.root,
+            cfg,
+            &req.prompt,
+            &neg_prompt,
+            cfg_disabled,
+            effective_te_quant(cfg, self.quant),
+        )?;
         // sc-12796: `encode_text_staged` already drops the UMT5 encoder before returning (only the small
         // `[L, dim]` contexts survive — the DiT projects them through its own `text_embedding` below).
         // Under `Sequential`, flush its ~11 GB bf16 weights (f32 activations — text_encoder.rs) out of
@@ -1170,8 +1205,14 @@ impl Wan14b {
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         // A14B always encodes both prompts (the dual-expert default), so `skip_neg = false`; unwrap
         // the always-present negative context back to the `Array` the MoE denoise expects.
-        let (context, context_null) =
-            encode_text_staged(&self.root, cfg, &req.prompt, &neg_prompt, false)?;
+        let (context, context_null) = encode_text_staged(
+            &self.root,
+            cfg,
+            &req.prompt,
+            &neg_prompt,
+            false,
+            effective_te_quant(cfg, self.quant),
+        )?;
         let context_null = context_null.expect("a14b always encodes the negative context");
         // sc-12736: `encode_text_staged` already drops the UMT5 encoder before returning (only the
         // small `[1, L, dim]` raw contexts survive — each expert projects them through its own
@@ -1599,6 +1640,35 @@ mod tests {
         let five_b = WanModelConfig::wan22_ti2v_5b();
         assert_eq!(resolve_capped_dims(&req(720, 720), &five_b), (704, 704));
         assert_eq!(resolve_capped_dims(&req(512, 512), &five_b), (512, 512));
+    }
+
+    #[test]
+    fn effective_te_quant_floors_at_q8_when_dit_is_quantized() {
+        // sc-12831: the UMT5 TE packs to Q8 (the near-lossless floor) whenever the DiT is on an
+        // MLX-affine quantized tier, and stays dense (None) otherwise. Pins the NON-default width (Q8,
+        // not the DiT's) so tier-matching the DiT to Q4 — or dropping the Nvfp4 exclusion — goes red.
+        let expect_q8 = Some(WanQuant {
+            bits: 8,
+            group_size: mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        });
+        let mut dense = WanModelConfig::wan22_ti2v_5b();
+        dense.quantization = None; // a dense bf16 snapshot
+
+        // bf16 tier (dense snapshot, no load-time quant) → TE stays dense.
+        assert_eq!(effective_te_quant(&dense, None), None);
+        // Dense snapshot + a load-time Q4/Q8 `spec.quantize` → TE packs, ALWAYS at Q8 (not the DiT's 4).
+        assert_eq!(effective_te_quant(&dense, Some(Quant::Q4)), expect_q8);
+        assert_eq!(effective_te_quant(&dense, Some(Quant::Q8)), expect_q8);
+        // Nvfp4 is candle-only (never an MLX affine width) → excluded, TE stays dense.
+        assert_eq!(effective_te_quant(&dense, Some(Quant::Nvfp4)), None);
+
+        // A pre-quantized q4 snapshot (`config.quantization` = bits 4) → the TE STILL floors at Q8, not 4.
+        let mut prequant_q4 = dense.clone();
+        prequant_q4.quantization = Some(WanQuant {
+            bits: 4,
+            group_size: 64,
+        });
+        assert_eq!(effective_te_quant(&prequant_q4, None), expect_q8);
     }
 
     /// sc-12308 — this replaces `resolve_capped_dims_enforces_max_area_cap`, which asserted that an

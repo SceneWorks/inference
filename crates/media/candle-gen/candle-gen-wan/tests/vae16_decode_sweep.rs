@@ -33,7 +33,9 @@ use std::time::Instant;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tiling::TilingConfig;
-use candle_gen::testkit::{used_mib, PeakSampler};
+use candle_gen::testkit::{
+    cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water, used_mib, PeakSampler,
+};
 use candle_gen_wan::config::Vae16Config;
 use candle_gen_wan::vae16::{auto_tiling_budgeted_wan_z16, WanVae16};
 
@@ -42,6 +44,16 @@ fn env_usize(var: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// The VAE weight dtype for the sweep: `WAN_VAE_DTYPE=bf16` loads the A14B's shipped bf16 z16 VAE
+/// (sc-12818); anything else (default) loads f32. The bf16-vs-f32 pair isolates whether running the
+/// VAE bf16 shrinks the *decode's own* concurrent-live peak — independent of the denoise.
+fn vae_dtype() -> DType {
+    match std::env::var("WAN_VAE_DTYPE").ok().as_deref() {
+        Some("bf16") | Some("BF16") => DType::BF16,
+        _ => DType::F32,
+    }
 }
 
 fn gib(bytes: f64) -> f64 {
@@ -58,7 +70,7 @@ fn load_vae(gpu: usize) -> Option<(WanVae16, Device)> {
         .join("diffusion_pytorch_model.safetensors");
     // SAFETY: mmap of a read-only, process-owned weight file resolved from `$WAN_VAE16_SNAPSHOT`; not
     // mutated behind the mapping — the standard candle loading path.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[f], DType::F32, &dev).unwrap() };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[f], vae_dtype(), &dev).unwrap() };
     let vae = WanVae16::new(&Vae16Config::wan21(), vb).unwrap();
     Some((vae, dev))
 }
@@ -133,12 +145,18 @@ fn wan_z16_vae_decode_sweep() {
     let frame_px = tile_h * tile_w;
 
     let baseline_mib = used_mib(gpu).unwrap_or(0);
+    let dtype = vae_dtype();
     println!(
         "\n=== wan z16 sweep [gpu {gpu}]: out {out_w}x{out_h}x{out_f}  latent[z16,T{t_lat},{h_lat},{w_lat}]  \
-         tiled={}  cfg={cfg:?}  baseline={baseline_mib} MiB ===",
+         tiled={}  cfg={cfg:?}  dtype={dtype:?}  baseline={baseline_mib} MiB ===",
         cfg.is_some(),
     );
 
+    // sc-12818: measure the decode's TRUE concurrent-live peak via the driver mempool USED_MEM_HIGH
+    // (accurate where the nvidia-smi sampler under-samples the im2col transients ~2×), reset right
+    // before the decode so it isolates the decode's own working set. The nvidia-smi PeakSampler runs
+    // alongside for the historical anchor line.
+    reset_cuda_mempool_high_water(gpu as i32);
     let sampler = PeakSampler::start(gpu);
     let t = Instant::now();
     let video = match &cfg {
@@ -148,9 +166,18 @@ fn wan_z16_vae_decode_sweep() {
     dev.synchronize().unwrap();
     let secs = t.elapsed().as_secs_f64();
     let peak_mib = sampler.stop();
+    let decode_high_bytes = cuda_mempool_used_high_bytes(gpu as i32).unwrap_or(0);
+    let decode_high_gib = gib(decode_high_bytes as f64);
 
-    // Finiteness / range / shape (cheap sanity — the parity bound lives in vae16_tiling_cuda.rs).
-    let v = video.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    // Finiteness / range / shape (cheap sanity — the parity bound lives in vae16_tiling_cuda.rs). Cast
+    // to f32 on host: a bf16 decode (WAN_VAE_DTYPE=bf16) cannot `to_vec1::<f32>` directly.
+    let v = video
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
     assert!(
         v.iter().all(|x| x.is_finite()),
         "decode produced non-finite values"
@@ -164,14 +191,16 @@ fn wan_z16_vae_decode_sweep() {
     let peak_bytes = (peak_mib as f64) * 1024.0 * 1024.0;
     let peak_gib = gib(peak_bytes);
     println!(
-        "[WAN z16 decode] -> {:?}  {secs:.1}s  peak={peak_gib:.2} GiB ({peak_mib} MiB)",
+        "[WAN z16 decode] dtype={dtype:?} -> {:?}  {secs:.1}s  nvidia-smi peak={peak_gib:.2} GiB \
+         ({peak_mib} MiB) | USED_MEM_HIGH true peak={decode_high_gib:.2} GiB",
         video.dims()
     );
     // Parse-friendly anchor line (grep `^ANCHOR`): peak vs out voxels (ACCUM floor) and per-frame px
-    // (the streaming per-tile FRAME term).
+    // (the streaming per-tile FRAME term). `true_peak_gib` is the accurate USED_MEM_HIGH number.
     println!(
-        "ANCHOR wanz16 out_vox={out_vox} frame_px={frame_px} peak_gib={peak_gib:.4} peak_mib={peak_mib} \
-         baseline_mib={baseline_mib} bytes_per_out_vox={:.2} bytes_per_frame_px={:.2}",
+        "ANCHOR wanz16 dtype={dtype:?} out_vox={out_vox} frame_px={frame_px} peak_gib={peak_gib:.4} \
+         true_peak_gib={decode_high_gib:.4} peak_mib={peak_mib} baseline_mib={baseline_mib} \
+         bytes_per_out_vox={:.2} bytes_per_frame_px={:.2}",
         peak_bytes / out_vox as f64,
         peak_bytes / frame_px as f64,
     );

@@ -354,6 +354,26 @@ mod tests {
         Ok(())
     }
 
+    /// sc-12818: the A14B loads its z16 VAE at **bf16** (the decode-floor win). A `CausalConv3d` built
+    /// from a bf16 [`VarBuilder`] must carry bf16 weights — `VarBuilder::get` casts each tensor to the
+    /// builder's dtype. Loading only reshapes (no matmul), so this exercises bf16 *storage* on the CPU
+    /// backend, which has bf16 tensors even though it lacks a bf16 matmul (the bf16 forward is CUDA-only).
+    #[test]
+    fn causal_conv3d_loads_weights_at_varbuilder_dtype() -> Result<()> {
+        let dev = Device::Cpu;
+        for dt in [DType::F32, DType::BF16] {
+            let vb = candle_gen::candle_nn::VarBuilder::zeros(dt, &dev);
+            let conv = CausalConv3d::load(3, 5, (3, 3, 3), vb.pp("conv"))?;
+            assert_eq!(
+                conv.weight.dtype(),
+                dt,
+                "CausalConv3d weight must load at the VarBuilder dtype ({dt:?})"
+            );
+            assert_eq!(conv.bias.dtype(), dt, "bias must load at the VarBuilder dtype");
+        }
+        Ok(())
+    }
+
     /// At or below [`IM2COL_BUDGET`] `chunked_conv2d` must run a *single un-chunked* `conv2d` — the low-res
     /// VAE decode path is byte-for-byte unchanged (the whole point of budgeting: only the hi-res convs
     /// that would overflow candle's im2col get chunked).

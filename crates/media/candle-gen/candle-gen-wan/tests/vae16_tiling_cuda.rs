@@ -26,8 +26,9 @@ use candle_gen::gen_core::tiling::TilingConfig;
 use candle_gen_wan::config::Vae16Config;
 use candle_gen_wan::vae16::WanVae16;
 
-/// Load just the z16 VAE from `$WAN_VAE16_SNAPSHOT/vae` onto CUDA:0, or `None` if the env var is unset.
-fn load_vae() -> Option<(WanVae16, Device)> {
+/// Load just the z16 VAE from `$WAN_VAE16_SNAPSHOT/vae` onto CUDA:0 at `dtype`, or `None` if the env
+/// var is unset.
+fn load_vae_dtype(dtype: DType) -> Option<(WanVae16, Device)> {
     let snap = std::env::var("WAN_VAE16_SNAPSHOT").ok()?;
     let dev = Device::new_cuda(0).expect("cuda:0");
     let f = PathBuf::from(snap)
@@ -35,9 +36,14 @@ fn load_vae() -> Option<(WanVae16, Device)> {
         .join("diffusion_pytorch_model.safetensors");
     // SAFETY: mmap of a read-only, process-owned weight file resolved from `$WAN_VAE16_SNAPSHOT`; not
     // mutated behind the mapping — the standard candle loading path.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[f], DType::F32, &dev).unwrap() };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[f], dtype, &dev).unwrap() };
     let vae = WanVae16::new(&Vae16Config::wan21(), vb).unwrap();
     Some((vae, dev))
+}
+
+/// The f32 VAE — the existing tiling tests' loader (the A14B ships bf16; see the sc-12818 parity test).
+fn load_vae() -> Option<(WanVae16, Device)> {
+    load_vae_dtype(DType::F32)
 }
 
 fn assert_finite_and_in_range(t: &Tensor, label: &str) {
@@ -77,6 +83,47 @@ fn psnr_and_maxdiff(a: &Tensor, b: &Tensor) -> (f64, f32) {
         10.0 * (4.0 / mse).log10()
     };
     (psnr, maxd)
+}
+
+/// sc-12818 acceptance gate: the **bf16** z16 VAE decode must match the **f32** decode of the same
+/// latent within the seam-free tolerance (~35 dB PSNR). Running the z16 VAE bf16 is the lever that
+/// halves the A14B decode's otherwise-fixed ~30 GiB VRAM floor so it fits a 24 GiB card; the VAE is the
+/// sensitive part, so if bf16 degraded the decode below tolerance it would NOT be viable and a different
+/// lever would be needed. Uses the untiled streaming [`WanVae16::decode`] on a moderate 512²×21f latent
+/// so the comparison isolates the bf16-vs-f32 decode numerics from the tiling approximation.
+#[test]
+#[ignore = "needs WAN_VAE16_SNAPSHOT + CUDA; the bf16-VAE acceptance gate (sc-12818)"]
+fn wan_z16_bf16_vs_f32_decode_parity() {
+    let Some((vae_f32, dev)) = load_vae_dtype(DType::F32) else {
+        eprintln!("WAN_VAE16_SNAPSHOT unset — skipping");
+        return;
+    };
+    let (vae_bf16, _) = load_vae_dtype(DType::BF16).unwrap();
+
+    // The bf16 VAE really loaded bf16 weights (the VRAM-floor win); the f32 baseline stayed f32.
+    assert_eq!(
+        vae_bf16.dtype(),
+        DType::BF16,
+        "the A14B z16 VAE must load bf16 weights (sc-12818)"
+    );
+    assert_eq!(vae_f32.dtype(), DType::F32);
+
+    // 512²×21f output (64×64 latent, 6 latent frames) — under the im2col cap, so a single untiled pass.
+    let z = Tensor::randn(0f32, 1f32, (1, 16, 6, 64, 64), &dev).unwrap();
+    let dec_f32 = vae_f32.decode(&z).unwrap();
+    // candle's CPU has no bf16 matmul, but this decode runs on CUDA; cast to f32 on host for comparison.
+    let dec_bf16 = vae_bf16.decode(&z).unwrap().to_dtype(DType::F32).unwrap();
+    assert_eq!(dec_f32.dims(), &[1, 3, 21, 512, 512], "unexpected output shape");
+    assert_eq!(dec_bf16.dims(), dec_f32.dims());
+    assert_finite_and_in_range(&dec_bf16, "bf16 decode");
+
+    let (psnr, maxd) = psnr_and_maxdiff(&dec_f32, &dec_bf16);
+    eprintln!("[sc-12818] bf16-VAE vs f32-VAE decode: PSNR={psnr:.2} dB  max_abs_diff={maxd:.4}");
+    assert!(
+        psnr > 35.0,
+        "bf16 VAE decode degrades vs f32 below the seam-free tolerance: PSNR={psnr:.2} dB (need >35) \
+         — bf16 VAE would not be viable and a different VRAM lever would be required"
+    );
 }
 
 #[test]
