@@ -94,7 +94,7 @@ fn px_gt8(got: &Array, want: &Array) -> f32 {
 }
 
 #[test]
-#[ignore = "needs ltx_2_3_base_q8 weights (~20 GB) + the multi-surface LoRA (~3 GB)"]
+#[ignore = "needs ltx_2_3_base_q8 weights (~20 GB) + the golden's multi-surface LoRA (~2 GB)"]
 fn av_lora_e2e_matches_reference() {
     let g = Weights::from_file(GOLDEN).expect("golden");
     let lora = lora_path(&g);
@@ -142,6 +142,16 @@ fn av_lora_e2e_matches_reference() {
         "no target skipped: {:?}",
         report.skipped
     );
+    // Three-way agreement: the REFERENCE dump must also have applied everything the file carries
+    // (its `applied` count is recorded in the golden metadata at dump time).
+    if let Some(dumped) = g.metadata("applied") {
+        assert_eq!(
+            dumped,
+            (video_n + audio_n).to_string(),
+            "the reference dump applied a different target count than the lora file carries — \
+             stale golden or reference/port routing divergence"
+        );
+    }
 
     let upsampler = LatentUpsampler::from_weights(
         &Weights::from_file(dir.join("upsampler.safetensors")).expect("upsampler"),

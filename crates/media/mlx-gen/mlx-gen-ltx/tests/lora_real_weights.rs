@@ -237,7 +237,7 @@ fn lora_multi_surface_skips_audio_without_error() {
     // the "full capability, no silent error" property: loading a production LoRA must not blow up.
     // sc-13019: expectations derive from the file's key inventory, so the gate follows whatever
     // multi-surface lora is provided (historically Samantha: 576 video / 1056 audio+cross; the
-    // DR34ML4Y default: 480 video (attn+ff, no gates) / 960 audio+cross).
+    // DR34ML4Y default: 480 video (attn1/attn2 × q/k/v/out/gate — no ff) / 960 audio+cross).
     let (video_n, audio_n) = multi_lora_expected();
     let dir = base_dir();
     let (_dit, report) = dit_with_adapters(
@@ -258,13 +258,15 @@ fn lora_multi_surface_skips_audio_without_error() {
         audio_n,
         "every audio/cross-modal target is skipped (reported, not errored)"
     );
-    // Every skipped path is an audio / cross-modal target (none of the video surface leaked in).
-    assert!(
-        report
-            .skipped
-            .iter()
-            .all(|p| p.contains("audio") || p.contains("av_ca") || p.contains("a2v")),
-        "skipped set must be exactly the audio/cross-modal targets"
+    // The skipped SET equals the file's audio/cross-modal inventory exactly (stronger than a count:
+    // none of the video surface leaked into skips, and nothing outside the inventory appeared).
+    let lw = Weights::from_file(multi_lora_path()).expect("multi-surface lora file");
+    let (_, audio_paths) = lora_target_inventory(&lw);
+    let mut skipped = report.skipped.clone();
+    skipped.sort();
+    assert_eq!(
+        skipped, audio_paths,
+        "skipped set must be exactly the file's audio/cross-modal targets"
     );
 }
 
