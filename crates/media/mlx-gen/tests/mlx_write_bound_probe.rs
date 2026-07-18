@@ -11,6 +11,8 @@
 //! and above the bound). The old 0.31.2 *corruption* claim inverted here; the conv-stage write-guard
 //! retirement it justified is done in sc-12748. Every op the tiled/untiled decode touches above the
 //! bound (conv3d, pad, concat, reshape, as_slice, elementwise) is now probe-verified int64-safe.
+//! **sc-12926:** `conv3d_128ch_input_across_i32max` closes the read-side gap — a conv whose INPUT
+//! (not just output) crosses 2^31, Mochi's real over-bound geometry (`cin=128` padded full-res).
 //! Run explicitly:
 //!
 //! ```text
@@ -118,6 +120,109 @@ fn conv3d_8to128_output_across_i32max() {
         "conv ABOVE the bound CORRUPTED (first bad offset {af}) — MLX 0.32.0's #3524 conv fix has \
          regressed on this pin. Re-instate the conv-stage write guard (writable_frame_cap / Mochi \
          decode guard) and re-open sc-12748."
+    );
+}
+
+/// sc-12926 — the READ-side complement to [`conv3d_8to128_output_across_i32max`]: a `conv3d` whose
+/// **INPUT crosses `i32::MAX`**. That sibling probe drives an over-bound OUTPUT from an under-bound
+/// `cin=8` input, but Mochi's real over-bound conv reads a padded full-resolution `cin=128`
+/// activation — input AND output both straddle the bound — previously validated only by the
+/// end-to-end Mochi acceptance render, not at op level.
+///
+/// Geometry: `[1,41,480,848,128]` = 2_136_145_920 elems (just under 2^31, `from_slice`-able), then
+/// `pad` the frame axis at the FRONT (`(1,0)`) so the LAST real frame's data sits at flat offsets
+/// crossing 2^31 (a back-pad would leave only pad zeros above the bound — the read side would go
+/// unexercised). Building the over-bound input uses `pad`, whose above-bound exactness is itself
+/// probe-verified by [`pad_story_geometry_128x42x480x848`]. A pointwise 128→128 **shifted**
+/// permutation weight (`out[..,co] = in[..,(co+1)%128]`, not the identity) keeps every element
+/// predictable while catching a channel-index misread. Probe rules as the module doc: position-
+/// dependent data, per-element host comparison at sampled offsets, `as_slice` read-back.
+#[test]
+#[ignore = "sc-12926 heavy MLX conv over-bound-INPUT probe (~27 GB); run with --ignored on Metal"]
+fn conv3d_128ch_input_across_i32max() {
+    let (h, w): (i64, i64) = (480, 848);
+    let ch: i64 = 128;
+    let d: i64 = 41;
+    let in_elems = d * h * w * ch; // 2_136_145_920
+    assert!(in_elems < I32_MAX, "pre-pad input must stay under the bound (from_slice)");
+    let xhost: Vec<f32> = (0..in_elems).map(pv).collect();
+    let x = Array::from_slice(&xhost, &[1, d as i32, h as i32, w as i32, ch as i32]);
+    x.eval().unwrap();
+    drop(xhost);
+    // Front-pad the frame axis: XP[0,0,..] = 0, XP[0,dd,..] = X[0,dd-1,..] for dd ≥ 1. The padded
+    // input is 42·480·848·128 = 2_188_247_040 > 2^31, with REAL data (frames 40→dd=41) above it.
+    let xp = pad(&x, &[(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)][..], None, None).unwrap();
+    xp.eval().unwrap();
+    drop(x);
+    let din = d + 1;
+    assert!(din * h * w * ch > I32_MAX, "padded conv INPUT must cross the bound");
+
+    // weight [cout,1,1,1,cin]: W[co,ci] = 1 iff ci == (co+1)%ch → out[..,co] = in[..,(co+1)%ch].
+    let mut wbuf = vec![0f32; (ch * ch) as usize];
+    for co in 0..ch {
+        wbuf[(co * ch + (co + 1) % ch) as usize] = 1.0;
+    }
+    let weight = Array::from_slice(&wbuf, &[ch as i32, 1, 1, 1, ch as i32]);
+    weight.eval().unwrap();
+
+    let y = conv3d(&xp, &weight, (1, 1, 1), (0, 0, 0), (1, 1, 1), 1).unwrap();
+    y.eval().unwrap();
+    assert_eq!(
+        y.shape(),
+        &[1, din as i32, h as i32, w as i32, ch as i32],
+        "conv output shape"
+    );
+    let ys = y.as_slice::<f32>();
+
+    // Expected: Y[0,dd,hh,ww,co] = XP[0,dd,hh,ww,(co+1)%ch] = pv((((dd−1)·h+hh)·w+ww)·ch + (co+1)%ch)
+    // for dd ≥ 1, else 0 (the front pad frame). At dd=41 (the last real frame) the input read offsets
+    // pass 2^31 from hh ≈ 104 — those samples are the read-side proof this probe exists for.
+    let mut first_bad = -1i64;
+    let mut checked = 0i64;
+    let mut above_input_reads = 0i64;
+    let mut max_abs = 0f32;
+    for dd in [0i64, 1, din / 2, din - 2, din - 1] {
+        for hh in [0i64, h / 2, h - 1] {
+            for ww in [0i64, w / 2, w - 1] {
+                for co in [0i64, 1, 63, 126, 127] {
+                    let off = ((dd * h + hh) * w + ww) * ch + co;
+                    let in_off = ((dd * h + hh) * w + ww) * ch + (co + 1) % ch;
+                    let want = if dd >= 1 {
+                        pv((((dd - 1) * h + hh) * w + ww) * ch + (co + 1) % ch)
+                    } else {
+                        0.0
+                    };
+                    if dd >= 1 && in_off > I32_MAX {
+                        above_input_reads += 1;
+                    }
+                    let got = ys[off as usize];
+                    checked += 1;
+                    let err = (got - want).abs();
+                    if err > max_abs {
+                        max_abs = err;
+                    }
+                    if err > 1e-3 && first_bad < 0 {
+                        first_bad = off;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[conv cin=128 over-bound INPUT] in_elems={} (={:.4}× 2^31)  checked={checked}  \
+         above_2^31_real_input_reads={above_input_reads}  max_abs={max_abs:e}  first_bad_offset={first_bad}",
+        din * h * w * ch,
+        (din * h * w * ch) as f64 / I32_MAX as f64,
+    );
+    assert!(
+        above_input_reads > 0,
+        "probe must sample REAL-data conv reads at input offsets above 2^31, or the read side is untested"
+    );
+    assert!(
+        first_bad < 0,
+        "conv reading an over-bound INPUT corrupted (first bad output offset {first_bad}, \
+         max_abs={max_abs:e}) — the #3524 int64 conv fix does not cover the input/read side on this \
+         pin. Re-instate the conv-stage guards and re-open sc-12748/sc-12926."
     );
 }
 

@@ -657,7 +657,8 @@ impl LtxVideoVae {
                     // `mlx-gen/tests/mlx_write_bound_probe.rs`). So a decode whose assembled RGB output
                     // crosses the bound now RENDERS instead of erroring — validated on real LTX weights in
                     // `vae_decode_sweep::over_bound_output_matches_below_bound_reference`. `from_slice`
-                    // remains i32-capped (`check_output_writable` backstop) but this loop never takes it.
+                    // remains i32-capped but this loop never takes it (`check_output_writable` is retained
+                    // as an uncalled latent tripwire for future code that would — sc-12926).
                     let at = ds[2].min(t.out_stop - t.out_start);
                     let ah = ds[3].min(hh.out_stop - hh.out_start);
                     let aw = ds[4].min(ww.out_stop - ww.out_start);

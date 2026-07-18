@@ -47,7 +47,9 @@
 ///    `output`/`weights` accumulators a tiled decode builds by `pad`-and-add and reads back via
 ///    `reshape`+`as_slice`. Every one of those ops is now int64-safe (rows above), so the sc-12438
 ///    **refusal is lifted** — an over-bound assembled output now RENDERS. `check_output_writable` is kept
-///    as a narrow backstop for the one residual, a `from_slice` host materialization the decode never does.
+///    as a narrow backstop for the one residual, a `from_slice` host materialization the decode never
+///    does — a retained latent tripwire with **no production caller** today (sc-12926), ready to wire
+///    if future code from_slices an output-scale host buffer.
 ///  - **Mochi's decode guard** (`mlx-gen-mochi`'s `decode_body`): its over-bound write is `block_out`'s
 ///    conv3d, now EXACT — the refusal is lifted; chunking is retained for **peak memory** only.
 ///
