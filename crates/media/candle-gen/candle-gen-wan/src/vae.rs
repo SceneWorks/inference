@@ -589,9 +589,11 @@ impl WanVae {
 // per-output-voxel (the whole tile) as in the mlx vae22 model.
 
 const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
-/// Env override read by the shared [`vae_tiling::safe_budget_gib`] resolver.
+/// Env override read by the shared [`vae_tiling::free_aware_safe_budget_gib`] resolver.
 const WAN22_VAE_BUDGET_ENV: &str = "WAN_VAE_BUDGET_GIB";
-/// Fraction of total VRAM treated as safe (matches the candle-gen-ltx 0.85 / seedvr2 convention).
+/// Fraction of **FREE** VRAM treated as safe (sc-12734). The decode runs *after* the denoise, so the
+/// fraction is applied to what the denoise LEFT free (`total − resident`), not `0.85×TOTAL` — see
+/// [`wan22_vae_safe_budget_gib`]. The 0.85 headroom itself matches the ltx / seedvr2 convention.
 const WAN22_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
 /// Fallback budget when neither the env override nor `nvidia-smi` yields a value.
 const WAN22_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
@@ -651,13 +653,20 @@ fn estimated_wan22_decode_peak_gib(
         / GIB_F64
 }
 
-/// The safe peak-GiB budget for the z48 vae22 decode tiler. Resolved in order: `WAN_VAE_BUDGET_GIB`
-/// env override (positive float — the deterministic injection point for the worker/tests) → total VRAM
-/// × `WAN22_VAE_BUDGET_SAFE_FRAC` (via the shared trusted-path `nvidia-smi` probe
-/// [`candle_gen::gpu::nvidia_smi_min_total_gib`] — an absolute System32/CUDA_PATH binary, never a bare
-/// `PATH` lookup; sc-9014 / F-030) → `WAN22_VAE_DEFAULT_BUDGET_GIB`.
+/// The safe peak-GiB budget for the z48 vae22 decode tiler — **free-aware** (sc-12734). The decode
+/// runs after the denoise, so it budgets against **FREE** VRAM, not `0.85×TOTAL`; over-budgeting on
+/// top of the resident weights + cudarc pool is exactly what drove the q8 / i2v-q4 OOMs into the
+/// decode. Resolved in order: `WAN_VAE_BUDGET_GIB` env override (positive float — the deterministic
+/// injection point for the worker/tests) → **free** VRAM × `WAN22_VAE_BUDGET_SAFE_FRAC` (via the live
+/// trusted-path `nvidia-smi memory.free` probe
+/// [`candle_gen::gpu::nvidia_smi_min_free_gib`] — `total − used`, i.e. already `(total − resident)`;
+/// an absolute System32/CUDA_PATH binary, never a bare `PATH` lookup; sc-9014 / F-030) →
+/// `WAN22_VAE_DEFAULT_BUDGET_GIB`.
+///
+/// Blast radius: this opts the Wan tiler into the free-aware sibling resolver; the LTX tiler keeps the
+/// total-based [`vae_tiling::safe_budget_gib`] unchanged.
 pub fn wan22_vae_safe_budget_gib() -> f64 {
-    vae_tiling::safe_budget_gib(
+    vae_tiling::free_aware_safe_budget_gib(
         WAN22_VAE_BUDGET_ENV,
         WAN22_VAE_BUDGET_SAFE_FRAC,
         WAN22_VAE_DEFAULT_BUDGET_GIB,
@@ -752,6 +761,61 @@ mod budget_tests {
         std::env::set_var("WAN_VAE_BUDGET_GIB", "42.5");
         assert_eq!(wan22_vae_safe_budget_gib(), 42.5);
         std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    }
+
+    #[test]
+    fn wan22_free_aware_budget_picks_smaller_tile_than_total() {
+        // sc-12734 core AC: with N GB left resident by the denoise, the FREE-aware budget picks a
+        // strictly smaller decode tile than `0.85×TOTAL` would. Same 96 GiB card, same 1280²×49 clip.
+        let total = 96.0;
+        let frac = WAN22_VAE_BUDGET_SAFE_FRAC; // 0.85
+        let resident = 60.0; // weights + cudarc pool the denoise left resident
+
+        // What the OLD total-based budget resolves to (== safe_budget_gib on a GPU box): total × frac.
+        let total_budget = total * frac;
+        // The NEW free-aware budget: (total − resident) × frac, via the shared pure helper.
+        let free_budget = vae_tiling::free_aware_budget_gib(total - resident, frac);
+        assert!(
+            free_budget < total_budget,
+            "resident weights must shrink the budget: free {free_budget:.1} !< total {total_budget:.1}"
+        );
+
+        let big = plan_wan22_tiling(1280, 1280, 49, total_budget)
+            .unwrap()
+            .expect("total-based budget still tiles this high-res frame")
+            .spatial
+            .expect("spatial tile")
+            .tile_px;
+        let small = plan_wan22_tiling(1280, 1280, 49, free_budget)
+            .unwrap()
+            .expect("free-aware budget tiles")
+            .spatial
+            .expect("spatial tile")
+            .tile_px;
+        assert!(
+            small < big,
+            "free-aware selection must pick a strictly smaller tile: {small} !< {big}"
+        );
+        // …but NO smaller than needed: it takes the largest tile that fits, not the floor candidate
+        // (budgeted_plan never over-tiles past the speed cliff).
+        let smallest_candidate = *WAN22_VAE_SPATIAL_PX.last().unwrap();
+        assert!(
+            small > smallest_candidate,
+            "must not over-tile to the smallest candidate {smallest_candidate} when a larger tile fits"
+        );
+    }
+
+    #[test]
+    fn wan22_free_aware_budget_respects_accumulator_floor() {
+        // If the denoise leaves so little free that even the full-output accumulator floor won't fit,
+        // the tiler returns a catchable Err (AccumulatorsExceedBudget) rather than tiling BELOW the
+        // floor into a guaranteed OOM. 1280²×49's accumulator floor is ~12 GiB; a ~6.8 GiB free budget
+        // (8 GiB free × 0.85) is under it.
+        let tiny_free = vae_tiling::free_aware_budget_gib(8.0, WAN22_VAE_BUDGET_SAFE_FRAC);
+        assert!(
+            plan_wan22_tiling(1280, 1280, 49, tiny_free).is_err(),
+            "a below-floor free budget must be a catchable Err, not a sub-floor tile"
+        );
     }
 
     /// sc-7148: the calibrated streaming cost model must stay **conservative** against the real CUDA

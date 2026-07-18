@@ -192,6 +192,62 @@ pub fn safe_budget_gib(env_var: &str, safe_frac: f64, default_gib: f64) -> f64 {
     }
 }
 
+/// **Free-aware** safe-budget resolver — the opt-in sibling of [`safe_budget_gib`] that budgets a
+/// decode tiler against **FREE** VRAM instead of `total × safe_frac` (sc-12734).
+///
+/// Why: [`safe_budget_gib`] resolves `total × 0.85`, which IGNORES the model weights the denoise left
+/// resident + the cudarc pool. The Wan decode tiler runs *after* the denoise, so it must budget
+/// against what is genuinely free — otherwise the q8 / i2v-q4 OOMs land in the decode, on top of the
+/// resident weights. This resolver reads the live `nvidia-smi memory.free` MIN across devices
+/// ([`crate::gpu::nvidia_smi_min_free_gib`]), which is the driver's `total − used`, i.e. already
+/// `(total − resident)`; the returned budget is `free × safe_frac`.
+///
+/// Resolved in order (mirrors [`safe_budget_gib`] so `env_var` stays the deterministic test/worker
+/// injection point):
+///  1. the `env_var` override (a positive float — e.g. `WAN_VAE_BUDGET_GIB`);
+///  2. `free VRAM × safe_frac` via the live [`crate::gpu::nvidia_smi_min_free_gib`] probe;
+///  3. `default_gib` when no trusted `nvidia-smi` is present.
+///
+/// **Opt-in / blast radius:** this is a *separate* entry point; [`safe_budget_gib`] (used by the LTX
+/// tiler) is untouched and still resolves `total × safe_frac`. Only the Wan caller opts in here.
+pub fn free_aware_safe_budget_gib(env_var: &str, safe_frac: f64, default_gib: f64) -> f64 {
+    resolve_free_aware_budget(
+        env_var,
+        safe_frac,
+        default_gib,
+        crate::gpu::nvidia_smi_min_free_gib,
+    )
+}
+
+/// Pure `free VRAM × safe_frac` (clamped at 0). Split out so the free-aware budget arithmetic is
+/// unit-testable with an injected `free_gib` (`= total − resident`) and no GPU — the
+/// "N GB artificially resident ⇒ smaller budget" seam the acceptance criteria call for.
+pub fn free_aware_budget_gib(free_gib: f64, safe_frac: f64) -> f64 {
+    free_gib.max(0.0) * safe_frac
+}
+
+/// Core of [`free_aware_safe_budget_gib`] with the free-VRAM probe injected, so the env-override
+/// precedence + the probe→default fallback are unit-testable without a real GPU. The live entry point
+/// passes [`crate::gpu::nvidia_smi_min_free_gib`]; tests pass a stub closure.
+fn resolve_free_aware_budget(
+    env_var: &str,
+    safe_frac: f64,
+    default_gib: f64,
+    free_probe: impl Fn() -> Option<f64>,
+) -> f64 {
+    if let Ok(raw) = std::env::var(env_var) {
+        if let Ok(gib) = raw.trim().parse::<f64>() {
+            if gib > 0.0 {
+                return gib;
+            }
+        }
+    }
+    match free_probe() {
+        Some(free) => free_aware_budget_gib(free, safe_frac),
+        None => default_gib,
+    }
+}
+
 /// Route a per-VAE `candidates` grid + `cost_fn` cost model through the shared [`budgeted_plan`]
 /// selector and map the [`TilingBudgetError`] into a human-readable, catchable [`candle_core::Error`]
 /// tagged with `label` (e.g. `"wan z48 vae22 decode"`). Caller passes the **output** dims.
@@ -352,5 +408,56 @@ mod tests {
         // With no env + (on a CPU/CI box) no nvidia-smi, falls back to the default.
         // (On a GPU box this returns total×frac; either way it is > 0.)
         assert!(safe_budget_gib("CG_TEST_VAE_BUDGET_GIB_UNSET", 0.85, 16.0) > 0.0);
+    }
+
+    // ---- sc-12734: free-aware budgeting ---------------------------------------------------------
+
+    #[test]
+    fn free_aware_budget_gib_is_free_times_frac_clamped() {
+        // The pure arithmetic: `(total − resident) × frac`. With 24 GiB resident on a 96 GiB card,
+        // free = 72; at frac 0.85 the budget is 61.2 GiB — strictly below the total-based 96×0.85.
+        let frac = 0.85;
+        let (total, resident) = (96.0, 24.0);
+        let free = total - resident;
+        assert!((free_aware_budget_gib(free, frac) - free * frac).abs() < 1e-9);
+        assert!(
+            free_aware_budget_gib(free, frac) < total * frac,
+            "resident weights must shrink the budget vs 0.85×TOTAL"
+        );
+        // Never negative even if resident somehow exceeds total (defensive clamp).
+        assert_eq!(free_aware_budget_gib(-5.0, frac), 0.0);
+    }
+
+    #[test]
+    fn free_aware_resolver_uses_free_probe_and_env_override_wins() {
+        // With N GB resident the free probe reports (total − resident); the resolver returns
+        // free × frac, strictly smaller than the total-based budget for the same card.
+        let frac = 0.85;
+        let (total, resident) = (96.0, 30.0);
+        let stub_free = move || Some(total - resident);
+        let free_budget =
+            resolve_free_aware_budget("CG_TEST_FREE_BUDGET_UNSET", frac, 16.0, stub_free);
+        assert!((free_budget - (total - resident) * frac).abs() < 1e-9);
+        assert!(free_budget < safe_budget_gib_from_total(total, frac));
+
+        // The env override still wins over the live free probe (the deterministic injection point).
+        std::env::set_var("CG_TEST_FREE_BUDGET", "42.5");
+        assert_eq!(
+            resolve_free_aware_budget("CG_TEST_FREE_BUDGET", frac, 16.0, || Some(1.0)),
+            42.5
+        );
+        std::env::remove_var("CG_TEST_FREE_BUDGET");
+
+        // No env + no probe (None) → conservative default, exactly like the total-based resolver.
+        assert_eq!(
+            resolve_free_aware_budget("CG_TEST_FREE_BUDGET_UNSET", frac, 16.0, || None),
+            16.0
+        );
+    }
+
+    /// Local mirror of the total-based budget (no GPU) so the free-vs-total comparison above is
+    /// self-contained: `total × frac`, the value [`safe_budget_gib`] returns on a GPU box.
+    fn safe_budget_gib_from_total(total: f64, frac: f64) -> f64 {
+        total * frac
     }
 }
