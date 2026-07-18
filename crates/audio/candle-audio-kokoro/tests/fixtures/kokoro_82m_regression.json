@@ -1,0 +1,25 @@
+{
+  "_doc": "Kokoro-82M regression fixture (sc-12854): deterministic request -> metric envelope + PCM repeatability hash. Numbers only — generated media stays out of git. Envelope bands were set from real measured runs on the canonical platform (macos/aarch64, Candle CPU); the committed pcm_sha256 is asserted exactly on that platform and reported (with intra-process repeatability still asserted) elsewhere. Regenerate by running the test with --nocapture and reviewing the printed measurements.",
+  "_measured_reference": "4 independent processes x 3 runs each on macos/aarch64 (Candle CPU, debug profile), 2026-07-18: duration 3.175s, -25.93 LUFS, -9.50 dBTP, 0 clipped, identical hash in all 12 runs; first-run latency 3.96-4.03s, steady 3.19-3.27s, warmup overhead ~0.74-0.78s, peak RSS ~1007-1011 MiB.",
+  "model": "kokoro_82m",
+  "script": "The quick brown fox jumps over the lazy dog.",
+  "voice": "af_heart",
+  "language": "en",
+  "seed": 42,
+  "runs": 3,
+  "envelope": {
+    "sample_rate": 24000,
+    "channels": 1,
+    "min_duration_secs": 2.8,
+    "max_duration_secs": 3.6,
+    "min_integrated_lufs": -28.0,
+    "max_integrated_lufs": -23.5,
+    "max_true_peak_dbtp": -7.0,
+    "max_clipped_samples": 0
+  },
+  "repeatability": {
+    "pcm_sha256": "e358255a6058b8490bd73c7799ad12a1b0d3a20f7393278983f30e77831076a3",
+    "os": "macos",
+    "arch": "aarch64"
+  }
+}

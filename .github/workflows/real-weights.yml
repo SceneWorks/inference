@@ -78,6 +78,11 @@ jobs:
         run: |
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_wav_conformance -- --ignored --nocapture
+      # Regression fixture (sc-12854): the validation harness's committed metric envelope +
+      # PCM repeatability hash; this runner IS the fixture's canonical platform
+      # (macos/aarch64), so the exact-hash check gates here.
+      - name: Run regression fixture
+        run: cargo test --locked -p candle-audio-kokoro --test regression kokoro_regression_fixture -- --ignored --nocapture
 
   candle-llm:
     name: Candle LLM real weights (CUDA)

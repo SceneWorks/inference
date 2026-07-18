@@ -25,6 +25,11 @@
 //!   front-ends (reference-audio conditioning, model preprocessing parity).
 //! - [`wav`] — 16-bit PCM WAV encoding of a [`gen_core::AudioTrack`], the audio
 //!   sibling of the media families' image/video encode step.
+//! - [`harness`] — the audio validation & quality harness (sc-12854): per-run
+//!   latency/warmup/peak-memory/duration/clipping/LUFS/true-peak measurement (loudness
+//!   meters reused from `gen_core::audio_dsp`, never reimplemented), the PCM
+//!   repeatability hash, and the [`harness::MetricEnvelope`] the per-model regression
+//!   fixtures assert against.
 //!
 //! Scope discipline (sc-12835): these modules are exactly what the first shipped
 //! provider (Kokoro, sc-12836) needs — no speculative surface. Grow this crate
@@ -44,6 +49,7 @@ pub use candle_core;
 use thiserror::Error;
 
 pub mod dsp;
+pub mod harness;
 pub mod hub;
 pub mod mel;
 pub mod wav;
