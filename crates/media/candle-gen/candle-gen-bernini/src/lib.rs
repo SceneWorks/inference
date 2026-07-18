@@ -59,6 +59,8 @@ pub mod process;
 pub mod qwen2_5_vl;
 pub mod rng;
 pub mod template;
+#[cfg(test)]
+mod testfix;
 pub mod vision;
 pub mod vit_guidance;
 pub mod vit_preprocess;

@@ -550,82 +550,8 @@ pub fn vit_one_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testfix::{tiny_cfg, tiny_dit};
     use candle_gen::candle_core::{DType, Device, Tensor};
-    use candle_gen::candle_nn::VarBuilder;
-    use std::collections::HashMap;
-
-    /// A tiny dense DiT config filled by the synthetic weights below (dim 16 = 2 heads × head_dim 8, z16
-    /// in/out, patch (1,2,2)) — the packed geometry without real weights, runnable on CPU.
-    fn tiny_cfg() -> TransformerConfig {
-        TransformerConfig {
-            in_channels: 16,
-            out_channels: 16,
-            num_layers: 2,
-            num_heads: 2,
-            head_dim: 8,
-            dim: 16,
-            ffn_dim: 32,
-            freq_dim: 16,
-            text_dim: 16,
-            patch: (1, 2, 2),
-            eps: 1e-6,
-            rope_theta: 10000.0,
-            rope_max_seq_len: 64,
-        }
-    }
-
-    fn tiny_dit(cfg: &TransformerConfig, dev: &Device) -> WanTransformer {
-        let mut m: HashMap<String, Tensor> = HashMap::new();
-        let mut put = |k: &str, shape: &[usize]| {
-            m.insert(
-                k.to_string(),
-                Tensor::randn(0f32, 0.2f32, shape, dev).unwrap(),
-            );
-        };
-        let (pt, ph, pw) = cfg.patch;
-        let d = cfg.dim;
-        put("patch_embedding.weight", &[d, cfg.in_channels, pt, ph, pw]);
-        put("patch_embedding.bias", &[d]);
-        put(
-            "condition_embedder.text_embedder.linear_1.weight",
-            &[d, cfg.text_dim],
-        );
-        put("condition_embedder.text_embedder.linear_1.bias", &[d]);
-        put("condition_embedder.text_embedder.linear_2.weight", &[d, d]);
-        put("condition_embedder.text_embedder.linear_2.bias", &[d]);
-        put(
-            "condition_embedder.time_embedder.linear_1.weight",
-            &[d, cfg.freq_dim],
-        );
-        put("condition_embedder.time_embedder.linear_1.bias", &[d]);
-        put("condition_embedder.time_embedder.linear_2.weight", &[d, d]);
-        put("condition_embedder.time_embedder.linear_2.bias", &[d]);
-        put("condition_embedder.time_proj.weight", &[6 * d, d]);
-        put("condition_embedder.time_proj.bias", &[6 * d]);
-        for i in 0..cfg.num_layers {
-            let b = format!("blocks.{i}");
-            put(&format!("{b}.scale_shift_table"), &[1, 6, d]);
-            for attn in ["attn1", "attn2"] {
-                for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
-                    put(&format!("{b}.{attn}.{leaf}.weight"), &[d, d]);
-                    put(&format!("{b}.{attn}.{leaf}.bias"), &[d]);
-                }
-                put(&format!("{b}.{attn}.norm_q.weight"), &[d]);
-                put(&format!("{b}.{attn}.norm_k.weight"), &[d]);
-            }
-            put(&format!("{b}.norm2.weight"), &[d]);
-            put(&format!("{b}.norm2.bias"), &[d]);
-            put(&format!("{b}.ffn.net.0.proj.weight"), &[cfg.ffn_dim, d]);
-            put(&format!("{b}.ffn.net.0.proj.bias"), &[cfg.ffn_dim]);
-            put(&format!("{b}.ffn.net.2.weight"), &[d, cfg.ffn_dim]);
-            put(&format!("{b}.ffn.net.2.bias"), &[d]);
-        }
-        put("proj_out.weight", &[cfg.out_channels * pt * ph * pw, d]);
-        put("proj_out.bias", &[cfg.out_channels * pt * ph * pw]);
-        put("scale_shift_table", &[1, 2, d]);
-        let vb = VarBuilder::from_tensors(m, DType::F32, dev);
-        WanTransformer::new(cfg, vb).unwrap()
-    }
 
     fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
         (a - b)
