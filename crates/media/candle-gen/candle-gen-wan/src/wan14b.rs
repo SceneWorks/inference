@@ -748,7 +748,10 @@ impl Pipeline {
             |st| {
                 check_cancel(cancel)?;
                 (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
-                let (high, applied) = self.load_expert_staged(MoeExpert::High)?;
+                let (mut high, applied) = self.load_expert_staged(MoeExpert::High)?;
+                // sc-12768: bound the async denoise pipeline (per-block stream drain) so it can't race
+                // the churned cudarc pool this staged path reuses — the full-res illegal-memory access.
+                high.set_bounded_offload(true);
                 high_applied.set(applied);
                 Ok(high)
             },
@@ -779,7 +782,10 @@ impl Pipeline {
             |st| {
                 check_cancel(cancel)?;
                 (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
-                let (low, low_applied) = self.load_expert_staged(MoeExpert::Low)?;
+                let (mut low, low_applied) = self.load_expert_staged(MoeExpert::Low)?;
+                // sc-12768: same per-block stream drain as the high expert — this is the expert whose
+                // full-res forward faulted at the swap boundary without it.
+                low.set_bounded_offload(true);
                 // Both experts have now loaded (whenever both own steps) → the cross-expert guard is exact.
                 self.adapter_zero_match_guard(high_applied.get(), low_applied)?;
                 Ok(low)
@@ -891,6 +897,14 @@ fn staged_expert_swap<E, St>(
         sync()?;
     } // `high` drops HERE — freed before `low` is ever loaded (the never-co-resident invariant).
     if k < steps {
+        // sc-12768: drain AGAIN now that `high` has dropped its weights back into candle's in-process
+        // cudarc caching pool, BEFORE `low` loads and reuses those pages. The free→realloc across the
+        // swap must be fully ordered — an un-drained reuse of the churned pool by the low expert's
+        // full-res weights/activations faults with a CUDA illegal-memory access at the 720p A14B
+        // geometry (`load_low`/`use_low` share this pool with the just-freed high expert).
+        if k > 0 {
+            sync()?;
+        }
         let low = load_low(state)?;
         use_low(&low, state)?;
         sync()?;
@@ -1731,10 +1745,11 @@ mod tests {
         );
     }
 
-    /// The sc-12195 eviction sync, applied per-swap (sc-12733): the boundary `sync` runs after each
-    /// expert is used and **before** it drops (and before the next loads) — draining in-flight kernels
-    /// so the freed allocator pool is never reused under them. Mirrors residency.rs's boundary-sync
-    /// ordering witness.
+    /// The sc-12195 eviction sync, applied per-swap (sc-12733), plus the sc-12768 **post-drop** sync: the
+    /// boundary `sync` runs after each expert is used and **before** it drops, AND again after the high
+    /// expert has dropped and **before** the low expert loads — so the churned cudarc caching pool's
+    /// free→realloc is fully ordered before the low expert reuses it (the full-res illegal-memory-access
+    /// fix). Mirrors residency.rs's boundary-sync ordering witness.
     #[test]
     fn expert_swap_syncs_before_each_expert_drops() {
         let tracker = LiveTracker::new();
@@ -1766,12 +1781,13 @@ mod tests {
                 "use-high",
                 "sync",
                 "drop-high", //
+                "sync",      // sc-12768: drain the churned pool AFTER high drops, before low loads
                 "load-low",
                 "use-low",
                 "sync",
                 "drop-low",
             ],
-            "each expert must be synced (kernels drained) before it drops and the next loads"
+            "each expert is synced before it drops; the churned pool is drained again before low loads"
         );
     }
 
