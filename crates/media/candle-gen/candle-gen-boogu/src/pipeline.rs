@@ -406,7 +406,8 @@ pub(crate) fn render_edit(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     // Each reference is VAE-encoded at its own dimensions; the latent must be patchify-able (p=2 over
-    // an /8 latent ⇒ multiple of 16), matching the mlx twin's `validate_multiple_of_16(reference)`.
+    // an /8 latent ⇒ multiple of 16), matching the mlx twin's
+    // `validate_multiple_of(reference, RES_MULTIPLE)`.
     for (i, r) in references.iter().enumerate() {
         if !r.width.is_multiple_of(crate::SIZE_MULTIPLE)
             || !r.height.is_multiple_of(crate::SIZE_MULTIPLE)
