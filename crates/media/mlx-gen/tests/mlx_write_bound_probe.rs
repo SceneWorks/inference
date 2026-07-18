@@ -4,11 +4,14 @@
 //! boundary. They exist to establish — on *this* pinned runtime (MLX core 0.32.0 via pmetal-mlx-rs
 //! `932beb4e`) — the exact per-operation behaviour the tiling fix depends on. On this pin the
 //! `pad`/`concat` copy-gate overflow is FIXED (sc-12746, pad-copy-int64.patch): those probes now
-//! assert EXACT writes above 2^31, not merely below. NOTE: `conv3d_8to128_output_across_i32max`
-//! still encodes the 0.31.2 above-bound *corruption* claim — MLX 0.32.0 also fixes the conv
-//! overflow (upstream #3524), so that probe's above-bound assertion is expected to invert on this
-//! pin; its re-derivation + the conv-stage write-guard retirement are tracked in sc-12748 (slice 6),
-//! not here. Run explicitly:
+//! assert EXACT writes above 2^31, not merely below. **sc-12748 (slice 6):**
+//! `conv3d_8to128_output_across_i32max` now asserts the FIXED behaviour too — MLX 0.32.0 fixes the
+//! conv output-offset overflow (upstream #3524 promoted the per-thread offset to `size_t`), so on
+//! this pin conv3d is EXACT above 2^31 (measured `first_bad_offset=-1`, 216 positions checked below
+//! and above the bound). The old 0.31.2 *corruption* claim inverted here; the conv-stage write-guard
+//! retirement it justified is done in sc-12748. Every op the tiled/untiled decode touches above the
+//! bound (conv3d, pad, concat, reshape, as_slice, elementwise) is now probe-verified int64-safe.
+//! Run explicitly:
 //!
 //! ```text
 //! cargo test -p mlx-gen --test mlx_write_bound_probe -- --ignored --nocapture --test-threads=1
@@ -32,14 +35,16 @@ fn pv(i: i64) -> f32 {
     (i % 251) as f32
 }
 
-/// **The core claim.** `conv3d` 8→128 whose OUTPUT crosses `i32::MAX` on MLX 0.31.2 (the story's exact
+/// **The core claim.** `conv3d` 8→128 whose OUTPUT crosses `i32::MAX` (the story's exact
 /// `128×D×480×848` geometry, D=41 below / D=42 above). A pointwise (1×1×1) conv with a permutation
-/// weight makes `out[..,co] = in[..,co%8]`, so every output element is predictable. Below the bound the
-/// decode must be exact; above it, MLX 0.31.2's per-thread output offset overflows int32 (fixed upstream
-/// by MLX PR #3524 in 0.32.0) → this is what justifies keeping the convolution-stage write guard while
-/// pinned to 0.31.2.
+/// weight makes `out[..,co] = in[..,co%8]`, so every output element is predictable. On MLX 0.31.2 the
+/// per-thread output offset overflowed int32 and this conv corrupted above the bound; MLX 0.32.0's
+/// upstream #3524 promotes that offset to `size_t`, so **on this pin (0.32.0 fork `932beb4e`) the conv
+/// is EXACT both below AND above the bound** (sc-12748). This probe therefore now asserts the *fixed*
+/// behaviour — the inversion of the 0.31.2 corruption claim — which is what retires the conv-stage
+/// write guard (`writable_frame_cap` / Mochi's decode guard).
 #[test]
-#[ignore = "sc-12438 heavy MLX conv write probe (~9 GB); run with --ignored on Metal"]
+#[ignore = "sc-12438/sc-12748 heavy MLX conv write probe (~9 GB); run with --ignored on Metal"]
 fn conv3d_8to128_output_across_i32max() {
     let (h, w): (i64, i64) = (480, 848);
     let (cin, cout): (i64, i64) = (8, 128);
@@ -104,15 +109,15 @@ fn conv3d_8to128_output_across_i32max() {
         bf < 0,
         "conv BELOW the bound must be exact — corruption at offset {bf} breaks the premise"
     );
+    // sc-12748: on MLX 0.32.0 (#3524) the conv is EXACT above the bound too. `first_bad < 0` means no
+    // corruption was found at any sampled above-2^31 position (measured `af == -1`, 216 positions).
+    // A regression to 0.31.2's behaviour — a future MLX bump re-breaking the size_t offset — would
+    // set `af >= 0` and re-fail this, the signal to re-instate the conv-stage write guard.
     assert!(
-        af >= 0,
-        "conv ABOVE the bound was EXACT on this runtime — MLX 0.31.2 conv did NOT corrupt at \
-         128×42×480×848. If so, the convolution write guard's premise no longer holds here and must \
-         be re-derived from measurement."
-    );
-    assert!(
-        af >= I32_MAX,
-        "conv corruption began BELOW 2^31 (offset {af}) — not the int32 output-index boundary"
+        af < 0,
+        "conv ABOVE the bound CORRUPTED (first bad offset {af}) — MLX 0.32.0's #3524 conv fix has \
+         regressed on this pin. Re-instate the conv-stage write guard (writable_frame_cap / Mochi \
+         decode guard) and re-open sc-12748."
     );
 }
 

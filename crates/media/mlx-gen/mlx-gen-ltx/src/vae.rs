@@ -649,22 +649,15 @@ impl LtxVideoVae {
 
                     let ds = dec.shape();
 
-                    // sc-12438: on the first tile, refuse before building the accumulators if the full
-                    // `[b, 3, out_f, out_h, out_w]` output would cross the write bound. No tiling shrinks
-                    // it, and past the bound the `pad`/`add` below silently corrupt — a catchable error
-                    // instead of wrong pixels. Shared with the Wan/Qwen loop
-                    // ([`mlx_gen::vae_tiling::check_output_writable`]).
-                    if output.is_none() {
-                        let full_elems = ds[0] as i64
-                            * ds[1] as i64
-                            * plan.out_f as i64
-                            * plan.out_h as i64
-                            * plan.out_w as i64;
-                        mlx_gen::vae_tiling::check_output_writable(
-                            full_elems, plan.out_f, plan.out_h, plan.out_w,
-                        )?;
-                    }
-
+                    // sc-12748: the sc-12438 over-bound refusal is RETIRED here (as in the shared
+                    // `mlx_gen::vae_tiling::tiled_decode`). The `[b, 3, out_f, out_h, out_w]` output is
+                    // assembled with `pad`+`add`+`divide` and read back via `contiguous`'s `reshape`
+                    // (+`as_slice`) — all probe-verified int64-safe above `i32::MAX` on this pin (MLX
+                    // 0.32.0 #3524 conv + the sc-12746 pad/concat copy-gate patch;
+                    // `mlx-gen/tests/mlx_write_bound_probe.rs`). So a decode whose assembled RGB output
+                    // crosses the bound now RENDERS instead of erroring — validated on real LTX weights in
+                    // `vae_decode_sweep::over_bound_output_matches_below_bound_reference`. `from_slice`
+                    // remains i32-capped (`check_output_writable` backstop) but this loop never takes it.
                     let at = ds[2].min(t.out_stop - t.out_start);
                     let ah = ds[3].min(hh.out_stop - hh.out_start);
                     let aw = ds[4].min(ww.out_stop - ww.out_start);

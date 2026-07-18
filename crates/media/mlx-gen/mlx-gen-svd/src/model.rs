@@ -500,11 +500,15 @@ fn frames_to_images(decoded: &Array) -> Result<Vec<Image>> {
     let x = round(&multiply(&x, mlx_gen::array::scalar(255.0))?, 0)?;
     let sh = x.shape();
     let (f, h, w) = (sh[1], sh[2], sh[3]);
-    // Flatten via -1 and size `per` in i64 — bounded by current caps, but a raw i32 dim product is a
-    // latent overflow footgun at large frame/resolution counts (F-076).
-    let flat = x.reshape(&[-1])?;
-    let data = flat.as_slice::<f32>();
+    // sc-12748: reshape to the frame-major `[F, H·W·3]` — the natural per-frame layout (batch is 1).
+    // Collapsing H/W/C forces the contiguous logical-order copy `as_slice` needs, while `f` stays its
+    // own dim so the full `f·h·w·3` product is never formed (the F-076 i32 overflow footgun). Retires
+    // the `reshape(-1)` workaround: MLX 0.32.0 reshape is int64-safe past `i32::MAX` (verified in
+    // `mlx-gen/tests/mlx_write_bound_probe.rs`), so large frame/resolution decodes render instead of
+    // overflowing. Byte-identical to the old reshape below-bound.
     let per = (h as i64 * w as i64 * 3) as usize;
+    let flat = x.reshape(&[f, h * w * 3])?;
+    let data = flat.as_slice::<f32>();
     let mut frames = Vec::with_capacity(f as usize);
     for fi in 0..f as usize {
         let start = fi * per;

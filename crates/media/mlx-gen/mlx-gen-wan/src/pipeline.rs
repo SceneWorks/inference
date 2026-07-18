@@ -1130,15 +1130,16 @@ pub fn decode_to_frames_22(
 pub fn frames_to_images(frames_u8: &Array) -> Result<Vec<Image>> {
     let sh = frames_u8.shape(); // [F, H, W, 3]
     let (f, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
-    // F-070: previously `let total: i32 = f * h * w * c;` then `reshape(&[total])`. frames is
-    // unbounded and T2V-14B has max_area == 0, so f·h·w·3 > i32::MAX is reachable (1920×1088@349f
-    // ≈ 2.19e9; 4K@89f): the i32 product overflowed in release (wrapping) → a baffling reshape
-    // error; debug panicked. The reshape target is the full flattened buffer, so use the dynamic
-    // `-1` (the four sibling implementations — ltx/svd/seedvr2/scail2 — already do this; this copy
-    // was missed).
-    let flat = frames_u8.reshape(&[-1])?; // materialize logical NHWC order
+    // sc-12748: reshape to the frame-major `[F, H·W·C]` — the natural per-frame layout. This collapses
+    // the (transpose-strided) H/W/C axes, which forces a contiguous logical-order copy (`as_slice`
+    // returns the physical buffer), and it never forms the full `f·h·w·c` product — `f` stays its own
+    // dim and the inner `h·w·c` is a single frame (≤ ~1e8 even at 8K, well within i32). This retires
+    // the F-070 `reshape(-1)` workaround: on MLX 0.32.0 reshape is int64-safe past `i32::MAX`
+    // (verified in `mlx-gen/tests/mlx_write_bound_probe.rs`), so `f·h·w·3 > i32::MAX` (1920×1088@349f
+    // ≈ 2.19e9; 4K@89f) now renders rather than overflowing. Byte-identical to the old reshape below-bound.
+    let per = (h as i64 * w as i64 * c as i64) as usize;
+    let flat = frames_u8.reshape(&[f, h * w * c])?;
     let bytes = flat.as_slice::<u8>();
-    let per = (h * w * c) as usize;
     let mut out = Vec::with_capacity(f as usize);
     for i in 0..f as usize {
         out.push(Image {

@@ -9,10 +9,12 @@
 //! **Two things it pins that no golden can.** The `vae_parity` golden is dumped at 64×64/7 frames
 //! (6.3e6 elements); production is 848×480/151 frames (8.13e9). That gap hid a real bug:
 //!  1. the untiled decode's peak grows with clip length (the story's premise), and
-//!  2. the untiled decode returns *wrong pixels* past `T_lat = 6` (31 frames, ~1 s) at 848×480 — the
-//!     boundary where `block_out` crosses `i32::MAX` elements. The mechanism is **not** established
-//!     (a conv3d at that size is fine; an elementwise op at exactly that size is not), so treat it as
-//!     a measured property of this decoder, not an MLX law. See sc-12349.
+//!  2. on **MLX 0.31.2** the untiled decode returned *wrong pixels* past `T_lat = 6` (31 frames, ~1 s)
+//!     at 848×480 — the boundary where `block_out` crosses `i32::MAX`. **sc-12748: FIXED on MLX
+//!     0.32.0.** The over-bound write is `block_out`'s conv3d; #3524 promotes its output offset to
+//!     `size_t` (probe-verified), and this decoder is attention-free, so the untiled decode is now
+//!     correct past the ceiling — see `untiled_matches_chunked_past_the_bound`. Chunking is retained as
+//!     a **memory** tool (point 1), no longer a correctness one. (Originally sc-12349.)
 //!
 //! Measured 2026-07-16 on an M5 Max / 137 GB (MLX limit 121.6 GiB), 848×480, f32:
 //!
@@ -36,13 +38,17 @@
 //!   -- --ignored --nocapture --exact decode_peak_is_flat_in_clip_length
 //! ```
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 use mlx_rs::ops::{abs, max, subtract};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
-use mlx_gen_mochi::{load_vae_decoder, MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
+use mlx_gen::weights::Weights;
+use mlx_gen_mochi::{
+    load_vae_decoder, MochiVaeConfig, MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES,
+};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -52,9 +58,11 @@ const H: i32 = 480;
 
 /// The largest clip this suite will decode **untiled** at 848×480.
 ///
-/// Two separate ceilings bound this, and the memory one binds first:
+/// Two separate ceilings bound this, and (sc-12748) only the memory one now binds:
 ///  - *correctness*: `block_out` (`128 × 6·T_lat × 480 × 848`) crosses `i32::MAX` between T_lat 6 and
-///    7, and `decode_denormalized` now refuses past that rather than return wrong pixels;
+///    7. On MLX 0.31.2 the untiled decode returned wrong pixels past that; on **0.32.0 it is correct**
+///    (#3524), so this is no longer a bound — the past-the-bound decode is exercised at bf16 in
+///    `untiled_matches_chunked_past_the_bound`;
 ///  - *memory*: the untiled peak runs ~11.5 GiB per latent frame (measured: 65.21 GiB at T_lat 4,
 ///    110.77 at 7, 145.89 at 11). T_lat 6 is ~88 GiB, which exceeds this machine class's wired ceiling
 ///    (~63% of RAM) and gets the process **SIGKILL**ed rather than an error — observed while writing
@@ -65,9 +73,46 @@ const H: i32 = 480;
 const MAX_UNTILED_T_LAT: i32 = 4;
 
 fn snapshot_dir() -> std::path::PathBuf {
-    std::env::var("MOCHI_SNAPSHOT")
-        .expect("set MOCHI_SNAPSHOT to the mochi-1-preview snapshot dir")
-        .into()
+    if let Ok(p) = std::env::var("MOCHI_SNAPSHOT") {
+        return p.into();
+    }
+    discover_snapshot().expect(
+        "set MOCHI_SNAPSHOT to a mochi snapshot dir (no genmo/mochi-1-preview or SceneWorks/mochi-1-mlx \
+         snapshot with a vae/ dir found under the HF cache)",
+    )
+}
+
+/// Auto-discover a Mochi snapshot whose `vae/` dir holds the AsymmVAE weights: the genmo
+/// `mochi-1-preview` cache first, then the `SceneWorks/mochi-1-mlx` mirror.
+fn discover_snapshot() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let hub = PathBuf::from(home).join(".cache/huggingface/hub");
+    for repo in [
+        "models--genmo--mochi-1-preview",
+        "models--SceneWorks--mochi-1-mlx",
+    ] {
+        let snaps = hub.join(repo).join("snapshots");
+        let Ok(rd) = std::fs::read_dir(&snaps) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let dir = entry.path();
+            if dir.join("vae").is_dir() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// Load the AsymmVAE decoder at **bf16** compute precision (the [`load_vae_decoder`] default is f32).
+/// bf16 halves the untiled decode's ~11.5 GiB/latent-frame peak, which is what lets the past-the-bound
+/// geometry (`T_lat = 7`, ~55 GiB bf16 vs ~110 GiB f32) fit under a 128 GB machine's wired ceiling.
+fn load_bf16() -> MochiVaeDecoder {
+    let root = snapshot_dir();
+    let cfg = MochiVaeConfig::from_model_dir(&root).expect("mochi vae config");
+    let w = Weights::from_dir(root.join("vae")).expect("read vae weights");
+    MochiVaeDecoder::from_weights_dtype(&w, &cfg, Dtype::Bfloat16).expect("bf16 vae decoder")
 }
 
 fn rnd(shape: &[i32], seed: u64) -> Array {
@@ -213,41 +258,66 @@ fn chunked_matches_untiled_on_real_weights() {
     }
 }
 
-/// **The chunked decode is correct where the untiled one cannot even be attempted** (sc-12349). A 5 s
-/// clip (T_lat 26) is 8.13e9 elements untiled — 3.8× past the bound — so `decode_denormalized` refuses
-/// it, while the chunked path decodes it to a sane video.
+/// **sc-12748 — THE PAYOFF: the untiled decode is now correct PAST the element ceiling on MLX 0.32.0.**
 ///
-/// This is the *reachable* half of the finding. The raw corruption (untiled at T_lat 7 → ±2.67 instead
-/// of ±0.50) is no longer observable through the public API precisely because the guard now refuses it,
-/// and reproducing it costs ~111 GiB — see sc-12349, which carries the measurement and the method for
-/// re-checking it against a future MLX bump (temporarily drop the guard).
+/// On MLX 0.31.2 an untiled decode whose `block_out` crossed `i32::MAX` returned ±2.67 garbage
+/// (sc-12291), and sc-12349 added a refusal so the corruption could not reach a caller. That refusal is
+/// **retired here**: MLX 0.32.0's #3524 fixes the conv output-offset overflow that caused it
+/// (probe-verified in `mlx-gen/tests/mlx_write_bound_probe.rs::conv3d_8to128_output_across_i32max`), and
+/// this decoder is attention-free, so conv + elementwise (both int64-safe on this pin) are its only
+/// over-bound writes.
+///
+/// This is the sc-12349 "re-check against a future MLX bump" method made a standing test: decode
+/// `T_lat = 7` (`block_out ≈ 2.31e9`, 1.07× the ceiling) **untiled** and compare it to the chunked
+/// reference (every chunk stays far below the ceiling). Mochi's chunked decode is *numerically
+/// identical* to the untiled one (per-frame + causal, no blend), so a correct untiled decode must match
+/// it **exactly** — and be a sane video (±~[-1, 1]), not the ±2.67 corruption. Run at bf16 so the
+/// ~11.5 GiB/latent-frame untiled peak (~55 GiB at `T_lat = 7`) fits a 128 GB machine.
 #[test]
-#[ignore = "needs $MOCHI_SNAPSHOT (real AsymmVAE weights) + a large-memory Metal Mac"]
-fn untiled_refuses_the_shipped_default_that_chunked_decodes() {
-    let dec = load();
-    let latent = latent_for(151); // the shipped 5 s default
-    let elems = 128i64 * (6 * latent_frames(151)) as i64 * H as i64 * W as i64;
+#[ignore = "sc-12748 real AsymmVAE untiled-past-the-bound decode; auto-discovers snapshot, ~55 GiB bf16"]
+fn untiled_matches_chunked_past_the_bound() {
+    let dec = load_bf16();
+    let t_lat = 7i32; // block_out ≈ 128·(6·7)·480·848 = 2.19e9 > i32::MAX (1.02×), the exact probe class
+
+    // Precondition: this untiled decode genuinely crosses the ceiling the guard used to refuse.
+    let elems = 128i64 * (6 * t_lat) as i64 * H as i64 * W as i64;
     assert!(
         elems > i32::MAX as i64,
-        "the 151-frame default should be over the element ceiling ({elems} elements)"
+        "T_lat={t_lat}: block_out {elems} must exceed i32::MAX ({}) to exercise the retired guard",
+        i32::MAX
     );
 
-    match dec.decode_denormalized(&latent) {
-        Err(mlx_gen::Error::Msg(m)) => println!("untiled @151f correctly refused: {m}"),
-        Err(e) => panic!("expected an element-ceiling Msg error, got {e}"),
-        Ok(_) => panic!(
-            "untiled decode of the 151-frame default ({elems} elements) must refuse — MLX returns \
-             wrong pixels here without a guard. If MLX fixed this, update MAX_TENSOR_ELEMS + sc-12349."
-        ),
-    }
+    let latent = rnd(&[1, 12, t_lat, H / 8, W / 8], 7);
 
+    // Untiled — the path sc-12349 refused; must now RENDER (no error), measured for peak + wall-clock.
+    let (peak, secs, single) = measure(|| {
+        dec.decode_denormalized(&latent)
+            .expect("untiled decode past the bound must now succeed (sc-12748), not refuse")
+    });
+    let out_frames = (t_lat - 1) * 6 + 1;
+    let signal = max_abs(&single);
+    println!(
+        "[sc-12748] untiled @ {W}×{H} T_lat={t_lat} ({out_frames}f, block_out≈{elems} = {:.3}× i32::MAX): \
+         ±{signal:.4}  peak={peak:.2} GiB  {secs:.1}s",
+        elems as f64 / i32::MAX as f64
+    );
+    assert!(
+        (1e-3..1.6).contains(&signal),
+        "untiled past-the-bound decode range ±{signal:.3} is not a sane video — it looks like the \
+         0.31.2 ±2.67 corruption, i.e. MLX's conv fix regressed. Re-instate the Mochi decode guard."
+    );
+
+    // Chunked reference — every intermediate stays below the ceiling; numerically identical to untiled.
     let chunked = dec
         .decode_denormalized_chunked(&latent, DEFAULT_DECODE_CHUNK_FRAMES, None)
-        .expect("chunked must decode the shipped default");
-    let c = max_abs(&chunked);
-    println!("chunked @151f: ±{c:.4} (a valid video is ~[-1, 1])");
+        .expect("chunked reference decode");
+    assert_eq!(chunked.shape(), single.shape(), "shape");
+    let d = max_abs(&subtract(&chunked, &single).unwrap());
+    println!("[sc-12748] untiled vs chunked max|Δ| = {d:.3e} (a valid video is ~[-1, 1])");
     assert!(
-        (1e-3..1.6).contains(&c),
-        "the chunked decode of the shipped default must be a sane video, got ±{c:.4}"
+        d < 1e-2,
+        "T_lat={t_lat}: the untiled past-the-bound decode diverged from the below-bound chunked \
+         reference by {d:.3e} — the >i32::MAX path is NOT correct. (bf16 tolerance; the f32 path is \
+         bit-exact — see chunked_matches_untiled_on_real_weights.)"
     );
 }
