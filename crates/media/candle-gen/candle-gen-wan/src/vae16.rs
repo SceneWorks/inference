@@ -20,6 +20,8 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::vae_tiling;
 
 use crate::config::{Vae16Config, LATENTS16_MEAN, LATENTS16_STD};
 use crate::conv3d::{CausalConv3d, Ctx};
@@ -428,6 +430,49 @@ impl WanVae16 {
             .clamp(-1f32, 1f32)
     }
 
+    /// Decode with **spatial tiling** for the memory-bounded A14B decode (sc-12758) — the z16 twin of the
+    /// z48 [`WanVae::decode_tiled`](crate::vae::WanVae::decode_tiled).
+    ///
+    /// Like the z48 path, [`decode`](Self::decode) already **streams one latent frame at a time**, so the
+    /// temporal axis is memory-bounded (peak ≈ one frame's decode). The only remaining spike is a single
+    /// **high-resolution frame** through the z16 decoder — GPU-measured at 42 GB for a 1280×720/81f A14B
+    /// T2V decode (sc-12771), the sole thing keeping the 14B off a 24 GB card. Spatial tiling caps that.
+    ///
+    /// Shares the pure [`gen_core::tiling`](candle_gen::gen_core::tiling) geometry + the seam-free
+    /// blend/stitch DRIVER ([`vae_tiling::decode_tiled`]) with the z48/LTX halves, but with the **z16**
+    /// geometry (`WAN_Z16`: ×8 spatial — not the z48's ×16 — ×4 **causal** temporal): each spatial tile
+    /// is decoded via the per-frame streaming `decode`, then trapezoidally blended into the full video.
+    /// Because the z16 `MidAttn` is **global per-frame spatial attention**, a tile attends only within
+    /// itself, so this is an *approximation* softened by the overlapping blend (seam-free ≈ PSNR ~35 dB,
+    /// not bit-exact) — exactly the z48 tradeoff. Falls back to a single streaming `decode` when `cfg`
+    /// does not fire for these dims. `cfg` is expected to carry **spatial** tiling only.
+    pub fn decode_tiled(&self, z: &Tensor, cfg: &TilingConfig) -> Result<Tensor> {
+        // The tile/narrow/blend/slice-accumulate/normalize DRIVER is the shared
+        // `candle_gen::vae_tiling::decode_tiled`; what stays z16-specific is the `WAN_Z16` geometry and
+        // the per-frame-streaming `decode` closure. With a spatial-only `cfg`, `plan.t` is a single
+        // full-extent temporal tile, so each `decode` call streams the whole clip (temporal bound kept).
+        vae_tiling::decode_tiled(WAN_Z16, "wan z16 vae", z, cfg, |tile| self.decode(tile))
+    }
+
+    /// **Free-aware budgeted** decode (sc-12758): derive the decoded output dims from the z16 latent
+    /// geometry (×8 spatial, ×4 **causal** temporal ⇒ `out_f = 1 + (T_lat−1)·4`), pick a budgeted
+    /// **spatial** tiling via [`auto_tiling_budgeted_wan_z16`] (which budgets against **FREE** VRAM, the
+    /// sc-12734 resolver), and run [`decode_tiled`](Self::decode_tiled) — or the streaming
+    /// [`decode`](Self::decode) when a single high-res frame already fits the budget (behavior-identical
+    /// to plain `decode` when the budget is ample). An over-budget decode returns a **catchable** error
+    /// here instead of OOM-ing the worker. The z16 analogue of the z48
+    /// [`WanVae::decode_budgeted`](crate::vae::WanVae::decode_budgeted).
+    pub fn decode_budgeted(&self, z: &Tensor) -> Result<Tensor> {
+        let (_b, _c, f, h, w) = z.dims5()?;
+        let out_f = 1 + (f as i32 - 1) * WAN_Z16.temporal_scale; // causal ×4
+        let out_h = h as i32 * WAN_Z16.spatial_scale; // ×8
+        let out_w = w as i32 * WAN_Z16.spatial_scale;
+        match auto_tiling_budgeted_wan_z16(out_h, out_w, out_f)? {
+            Some(cfg) => self.decode_tiled(z, &cfg),
+            None => self.decode(z),
+        }
+    }
+
     fn decode_inner(&self, z: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         let mut h = self.post_quant_conv.forward(z, ctx)?;
         h = self.conv_in.forward(&h, ctx)?;
@@ -495,6 +540,299 @@ impl WanVae16 {
             ub.reset_cache();
         }
         self.conv_out.reset_cache();
+    }
+}
+
+// --- sc-12758: free-aware budgeted z16 spatial-tiling for the A14B decode ------------------------
+//
+// The z16 twin of the z48 budgeted tiler (`crate::vae`, sc-7111/sc-12734). It reuses the shared
+// budgeted-tiling DRIVER + free-aware budget resolver + selector in `candle_gen::vae_tiling`, supplying
+// only the **z16-specific** geometry, cost constants, and candidate grid. Two axes make z16 its OWN
+// path, not a reuse of the z48 `WAN22` constants (the story's explicit ask):
+//   - **×8 spatial** (3 up-stages), not the z48's ×16 (4 up-stages + 2×2 unpatchify): for a given output
+//     resolution the z16 latent is 2× larger per side, and the decoder is far narrower (base_dim 96,
+//     stage dims ≤384 vs the z48's base 256, ≤1024) — so the per-output-pixel activation is smaller.
+//   - **16-ch, non-residual, no patchify** — a different activation profile, so `FRAME` is recalibrated.
+//
+// **Structural match to z48** (why this is a spatial-only mirror): the candle `decode` STREAMS one
+// latent frame at a time, so the temporal axis is already memory-bounded — peak ≈ one frame's decode,
+// not the whole clip. So the candidate grid carries **no temporal candidates** and the cost model's
+// per-tile term is per-output-**pixel** (one streamed frame's activations), not per-voxel.
+
+/// z16 tiling geometry for the **candle causal streaming decode**: ×8 spatial, ×4 **causal** temporal
+/// (`out_f = 1 + (f−1)·4`), `full_res_channels 96` (the materialized full-res res-block width before
+/// `conv_out` drops 96→3). Distinct from the shared [`VaeTiling::WAN`], which is the **mlx** z16
+/// preset and is **non-causal** (`out_f = f·4`) — the candle decode is causal, so the plan's `out_f`
+/// must match `decode`'s frame count. Kept local (not a new `gen_core` preset) to keep this the z16's
+/// own path with zero blast radius on the shared contract.
+const WAN_Z16: VaeTiling = VaeTiling {
+    spatial_scale: 8,
+    temporal_scale: 4,
+    causal_temporal: true,
+    full_res_channels: 96,
+};
+
+const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
+/// Env override read by the shared [`vae_tiling::free_aware_safe_budget_gib`] resolver — the SAME
+/// deterministic injection point as the z48 tiler (only one Wan VAE runs per process), per sc-12758.
+const WAN_Z16_VAE_BUDGET_ENV: &str = "WAN_VAE_BUDGET_GIB";
+/// Fraction of **FREE** VRAM treated as safe (sc-12734). The decode runs *after* the denoise (and in
+/// the sequential path *after* the experts+TE are offloaded), so the fraction is applied to what is
+/// genuinely free (`total − resident`), not `0.85×TOTAL`. 0.85 matches the z48 / ltx / seedvr2 headroom.
+const WAN_Z16_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
+/// Fallback budget when neither the env override nor `nvidia-smi` yields a value.
+const WAN_Z16_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
+
+// Cost-model constants — **CUDA-calibrated (sc-12758)** from real-weight peak-VRAM anchors measured by
+// `tests/vae16_decode_sweep.rs` on this RTX PRO 6000 Blackwell (sm_120, CUDA 12.9, f32, device-level
+// `nvidia-smi` peak, ~0.8 GB baseline) over the real Wan2.2-T2V-A14B z16 VAE. Anchors (output 1280×720×81
+// / largest spatial tile → measured decode peak) — see the `wan_z16_decode_peak_matches_cuda_anchors`
+// test:
+//   single-pass (full 1280×720 frame) → 48.10 GiB   (the untiled A14B T2V spike; cf. sc-12771's 42 GB
+//                                                     render-context delta — the isolated decode peaks higher)
+//   tiled 512px                       → 19.82 GiB
+//   tiled 256px                       →  5.85 GiB    (accumulator-dominated ⇒ the ACCUM floor)
+// Because `decode` STREAMS one latent frame at a time, the per-tile activation spike scales with ONE
+// output frame's area (`tile_h·tile_w`), not the whole tile's volume — so the model is `ACCUM·out_vox +
+// FRAME·frame_px`. `ACCUM` is the full-output accumulator floor (the shared blend `output`/`weights`
+// buffers + the streaming per-tile `cat`); the z16 floor measures ~17 B/voxel (near the naive 3+1-ch f32
+// blend buffers) — far below the z48's 160, since the z16 blend holds fewer full-output transients.
+// `FRAME` is one full-res z16 frame's decoder activations. The real per-px cost RISES for smaller tiles
+// (worse per-px decoder amortization: ~56 kB/px at full-frame, effectively higher tiled), so a single
+// linear model cannot be tight on all three anchors — the constants are rounded to the **conservative**
+// (over-predicting) side (ratios 1.14× / 1.14× / 1.86× for single / 512 / 256) so the selector never OKs
+// a tile / single-pass that OOMs. Over-prediction also serves the "fit as small as we can go" directive
+// (it errs toward smaller tiles). Re-run the sweep after a decoder or candle-allocator change.
+const WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 100.0;
+const WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX: f64 = 64_000.0;
+
+/// Candidate spatial tile sizes (output px, multiples of the z16 ×8 scale, overlap 64). Coarser at the
+/// top (fewer tiles = faster) down to a 192 px floor (past which per-tile decoder overhead amortizes
+/// worse — the speed cliff). All are multiples of 8.
+const WAN_Z16_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
+/// **No temporal candidates** — the candle z16 decode is already temporally streaming-bounded, so the
+/// budgeted selector only ever tiles the spatial axes (see the module note above).
+const WAN_Z16_VAE_TEMPORAL_FR: [(i32, i32); 0] = [];
+
+/// Estimated concurrent VRAM peak (GiB) of the streaming z16 decode while assembling an `out_*` video,
+/// the largest spatial tile spanning `tile_h·tile_w` output px. `ACCUM·out_voxels` is the unavoidable
+/// full-output accumulator floor; `FRAME·tile_h·tile_w` is one streamed frame's decoder activations
+/// (independent of `out_f`/`tile_f` — the temporal axis streams). Single-pass is `tile_* == out_*`; a
+/// zero tile yields the accumulator-only floor (the `budgeted_plan` contract). `tile_f` is unused.
+fn estimated_wan_z16_decode_peak_gib(
+    out_f: i64,
+    out_h: i64,
+    out_w: i64,
+    _tile_f: i64,
+    tile_h: i64,
+    tile_w: i64,
+) -> f64 {
+    let out_voxels = (out_f * out_h * out_w) as f64;
+    let frame_px = (tile_h * tile_w) as f64;
+    (WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels
+        + WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX * frame_px)
+        / GIB_F64
+}
+
+/// The safe peak-GiB budget for the z16 decode tiler — **free-aware** (sc-12734/sc-12758). The decode
+/// runs after the denoise, so it budgets against **FREE** VRAM, not `0.85×TOTAL`. Resolved in order:
+/// `WAN_VAE_BUDGET_GIB` env override (positive float — the deterministic test/worker injection point) →
+/// **free** VRAM × `WAN_Z16_VAE_BUDGET_SAFE_FRAC` (via the live `nvidia-smi memory.free` probe
+/// [`candle_gen::gpu::nvidia_smi_min_free_gib`], i.e. `total − used`) → `WAN_Z16_VAE_DEFAULT_BUDGET_GIB`.
+pub fn wan_z16_vae_safe_budget_gib() -> f64 {
+    vae_tiling::free_aware_safe_budget_gib(
+        WAN_Z16_VAE_BUDGET_ENV,
+        WAN_Z16_VAE_BUDGET_SAFE_FRAC,
+        WAN_Z16_VAE_DEFAULT_BUDGET_GIB,
+    )
+}
+
+/// **Memory-budgeted** spatial tiling for the z16 decode — routes the shared `budgeted_plan` selector
+/// through the z16 cost model. Caller passes the **output** dims. `Ok(None)` → a single high-res frame
+/// already fits (streaming single-pass); `Ok(Some)` → the largest spatial tile that fits; `Err` → a
+/// catchable over-budget signal returned before the decode (not an OOM).
+pub fn auto_tiling_budgeted_wan_z16(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<TilingConfig>> {
+    plan_wan_z16_tiling(height, width, out_frames, wan_z16_vae_safe_budget_gib())
+}
+
+/// Pure z16 spatial tile selector (the `safe_gib` ceiling injected so it is unit-testable without a
+/// GPU). Supplies the z16 candidate grid + cost model to the shared [`vae_tiling::plan_tiling`]; same
+/// `Ok(None)` / `Ok(Some)` / catchable-`Err` contract as the z48 half.
+fn plan_wan_z16_tiling(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+) -> Result<Option<TilingConfig>> {
+    let candidates = TileCandidates {
+        spatial_px: &WAN_Z16_VAE_SPATIAL_PX,
+        spatial_overlap_px: 64,
+        temporal: &WAN_Z16_VAE_TEMPORAL_FR,
+    };
+    vae_tiling::plan_tiling(
+        "wan z16 vae decode",
+        WAN_Z16,
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        estimated_wan_z16_decode_peak_gib,
+    )
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn wan_z16_tiling_single_pass_when_small() {
+        // A short, low-res clip fits a single streaming decode → no tiling.
+        assert!(plan_wan_z16_tiling(256, 256, 25, 60.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn wan_z16_tiling_bounds_high_res_frame_peak() {
+        // The GPU-measured A14B T2V spike: 1280×720×81 single-pass adds ~42 GB (sc-12771). Emulate a
+        // ~24 GB card (budget ≈ 20 GiB) and require the selector to tile spatially and keep the
+        // recomputed peak under the safe ceiling (bounded/catchable), driving the decode toward the
+        // "fit as small as we can go" target.
+        let safe = 20.0;
+        let cfg = plan_wan_z16_tiling(720, 1280, 81, safe)
+            .unwrap()
+            .expect("the 42 GB high-res A14B frame must tile spatially under a 20 GiB budget");
+        // Spatial-only: the selector never tiles the temporal axis here (candle decode streams).
+        assert!(cfg.spatial.is_some(), "expected a spatial tile");
+        assert!(
+            cfg.temporal.is_none(),
+            "candle z16 decode streams temporally — no temporal tiling"
+        );
+        let th = cfg.spatial.map(|s| (s.tile_px as i64).min(720)).unwrap();
+        let tw = cfg.spatial.map(|s| (s.tile_px as i64).min(1280)).unwrap();
+        let peak = estimated_wan_z16_decode_peak_gib(81, 720, 1280, 81, th, tw);
+        assert!(peak <= safe, "chosen peak {peak:.1} over safe {safe:.1}");
+        // …and strictly below the single-pass spike it replaces.
+        let single = estimated_wan_z16_decode_peak_gib(81, 720, 1280, 81, 720, 1280);
+        assert!(peak < single, "tiling must lower the peak ({peak:.1} vs {single:.1})");
+    }
+
+    #[test]
+    fn wan_z16_tiling_errors_when_unfittable() {
+        // 4K × 257 frames under 8 GiB: the output accumulators alone blow it → catchable, not an OOM.
+        assert!(plan_wan_z16_tiling(2160, 3840, 257, 8.0).is_err());
+    }
+
+    #[test]
+    fn wan_z16_budget_env_override_wins() {
+        // The deterministic injection point the worker/tests use — the same env as the z48 tiler.
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "37.5");
+        assert_eq!(wan_z16_vae_safe_budget_gib(), 37.5);
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    }
+
+    #[test]
+    fn wan_z16_free_aware_budget_picks_smaller_tile_than_total() {
+        // sc-12734 core AC (z16 half): with N GB left resident, the FREE-aware budget picks a strictly
+        // smaller decode tile than `0.85×TOTAL` would. 1280²×49 (not the 720p/81f render) so the ×8
+        // write bound stays loose enough that the *budget*, not the write cap, is the deciding lever.
+        let total = 96.0;
+        let frac = WAN_Z16_VAE_BUDGET_SAFE_FRAC; // 0.85
+        let resident = 70.0; // weights + cudarc pool the denoise left resident
+
+        let total_budget = total * frac;
+        let free_budget = vae_tiling::free_aware_budget_gib(total - resident, frac);
+        assert!(
+            free_budget < total_budget,
+            "resident weights must shrink the budget: free {free_budget:.1} !< total {total_budget:.1}"
+        );
+
+        let big = plan_wan_z16_tiling(1280, 1280, 49, total_budget)
+            .unwrap()
+            .expect("total-based budget still tiles this high-res frame")
+            .spatial
+            .expect("spatial tile")
+            .tile_px;
+        let small = plan_wan_z16_tiling(1280, 1280, 49, free_budget)
+            .unwrap()
+            .expect("free-aware budget tiles")
+            .spatial
+            .expect("spatial tile")
+            .tile_px;
+        assert!(
+            small < big,
+            "free-aware selection must pick a strictly smaller tile: {small} !< {big}"
+        );
+        // …but NO smaller than needed: it takes the largest tile that fits, not the floor candidate
+        // (budgeted_plan never over-tiles past the speed cliff).
+        let smallest_candidate = *WAN_Z16_VAE_SPATIAL_PX.last().unwrap();
+        assert!(
+            small > smallest_candidate,
+            "must not over-tile to the smallest candidate {smallest_candidate} when a larger tile fits"
+        );
+    }
+
+    #[test]
+    fn wan_z16_free_aware_budget_respects_accumulator_floor() {
+        // If the denoise leaves so little free that even the full-output accumulator floor won't fit,
+        // the tiler returns a catchable Err (AccumulatorsExceedBudget) rather than tiling BELOW the
+        // floor into a guaranteed OOM. 1280×720×81's accumulator floor is ~11 GiB (ACCUM·out_vox); a
+        // ~6.8 GiB free budget (8 GiB free × 0.85) is under it.
+        let tiny_free = vae_tiling::free_aware_budget_gib(8.0, WAN_Z16_VAE_BUDGET_SAFE_FRAC);
+        assert!(
+            plan_wan_z16_tiling(720, 1280, 81, tiny_free).is_err(),
+            "a below-floor free budget must be a catchable Err, not a sub-floor tile"
+        );
+    }
+
+    #[test]
+    fn wan_z16_tiling_plan_for_a14b_720p() {
+        // Plan-level check for the real A14B T2V dims (1280×720/81f). Under a ~24 GB-card budget the
+        // selector must tile spatially, keep the temporal axis whole, and the chosen tile must be
+        // strictly smaller than the full 1280 spatial extent (so the decode footprint drops).
+        let cfg = plan_wan_z16_tiling(720, 1280, 81, 20.0)
+            .unwrap()
+            .expect("A14B 720p/81f must tile at a 20 GiB budget");
+        let s = cfg.spatial.expect("spatial tile");
+        assert!(cfg.temporal.is_none(), "no temporal tiling for the streaming z16 decode");
+        assert!(
+            (s.tile_px as i64) < 1280,
+            "the chosen tile {} must be smaller than the 1280 spatial extent",
+            s.tile_px
+        );
+    }
+
+    /// sc-12758: the calibrated streaming cost model must stay **conservative** against the real CUDA
+    /// peak-VRAM anchors (RTX PRO 6000 Blackwell, sm_120, f32, real Wan2.2-T2V-A14B z16 weights) it was
+    /// fit from — `estimated ≥ measured` for every anchor (never under-predict ⇒ the selector never OKs
+    /// a tile / single-pass that OOMs), and not absurdly over (≤ 2.5×). Regenerate the tiled anchors with
+    /// `cargo test -p candle-gen-wan --features cuda --release --test vae16_decode_sweep -- --ignored
+    /// --nocapture` after a decoder or candle-allocator change.
+    #[test]
+    fn wan_z16_decode_peak_matches_cuda_anchors() {
+        // (out_f, out_h, out_w, tile_h, tile_w, measured_peak_gib). `tile_f` is unused by the streaming
+        // model (passed as out_f). Single-pass ⇒ tile == out (the full-frame spike). All three are the
+        // real `vae16_decode_sweep` CUDA measurements on the A14B z16 VAE (sc-12758) that pin ACCUM vs
+        // FRAME; the single-pass 48.10 GiB is the isolated-decode analogue of sc-12771's 42 GB render delta.
+        let anchors: [(i64, i64, i64, i64, i64, f64); 3] = [
+            (81, 720, 1280, 720, 1280, 48.10), // single-pass A14B T2V spike (vae16_decode_sweep)
+            (81, 720, 1280, 512, 512, 19.82),  // tiled 512px (vae16_decode_sweep)
+            (81, 720, 1280, 256, 256, 5.85),   // tiled 256px (vae16_decode_sweep, accumulator-dominated)
+        ];
+        for (of, oh, ow, th, tw, measured) in anchors {
+            let est = estimated_wan_z16_decode_peak_gib(of, oh, ow, of, th, tw);
+            assert!(
+                est >= measured,
+                "under-predicts {ow}x{oh}x{of} tile {tw}x{th}: est {est:.2} < measured {measured:.2} GiB"
+            );
+            assert!(
+                est <= measured * 2.5,
+                "over-predicts {ow}x{oh}x{of} tile {tw}x{th}: est {est:.2} > 2.5x measured {measured:.2} GiB"
+            );
+        }
     }
 }
 
