@@ -635,7 +635,8 @@ fn e2e_single_stack_injected_matches_golden() {
 ///
 /// Post-sc-2787 this is a genuine PIXEL-PARITY gate. With bf16 TE/conditioning matching the fork's
 /// mixed precision + the RoPE/time_proj/sigma host→MLX fixes + the vendored CLIP tokenizer, and
-/// goldens dumped on the version-matched mlx 0.31.2, every stage is bit-exact (T5/CLIP/v0/all
+/// goldens dumped on the version-matched MLX (0.31.2; the Rust build is now 0.32.0 — epic 12742,
+/// `pmetal-mlx-rs` 932beb4e — so re-dump these on the 0.32.0 env, sc-12747), every stage is bit-exact (T5/CLIP/v0/all
 /// transformer substages/denoise = 0.000e0 — see the other tests), so the public render lands at the
 /// VAE's tiny cross-build floor: **schnell ~0.007% / dev ~0.026% px>8**.
 ///

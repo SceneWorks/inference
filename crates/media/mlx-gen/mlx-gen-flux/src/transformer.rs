@@ -1603,7 +1603,15 @@ mod tests {
         set_compile_glue(true);
         let c = gelu_ffn(&h).unwrap();
         set_compile_glue(false);
-        assert_eq!(max_abs(&c, &e), 0.0, "gelu_ffn compiled vs eager");
+        // sc-12747: under MLX 0.32.0 the compiled tanh-GELU FFN rounds ~1 ULP-f32 differently from
+        // eager (0-ULP on the prior 0.31.2 pin). This is the FLUX main-stream dtype (f32) with no
+        // fp16/bf16 exact path, so it takes the shared re-baselined f32 tolerance.
+        let rel = mlx_gen::nn::max_rel_diff(&c, &e);
+        assert!(
+            rel <= mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL,
+            "gelu_ffn compiled vs eager: rel|Δ|={rel:e} exceeds {:e}",
+            mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL
+        );
 
         // rope_rotate: f32 complex rotation (RoPE runs in f32).
         let half = 64i32;

@@ -5,8 +5,11 @@
 //! the reference **f32-activation × Q8** velocity over synthetic inputs; this test loads the SAME Q8
 //! weights (kept quantized → `quantized_matmul`) and checks the Rust `LtxDiT` reproduces it.
 //!
-//! **The golden MUST be mlx 0.31.2** (the Rust build): `quantized_matmul` changed 0.31.0→0.31.2, so
-//! a 0.31.0 golden mismatches by ~5e-4/op. At matched 0.31.2 the **full 48-layer velocity is
+//! **The golden MUST match the Rust build's MLX — now 0.32.0** (epic 12742, `pmetal-mlx-rs`
+//! 932beb4e): `quantized_matmul` changed 0.31.0→0.31.2 (a 0.31.0 golden mismatches by ~5e-4/op) and
+//! again by a 1–2 ULP-f32 bug-fix class on 0.31.2→0.32.0 (sc-12744/sc-12747). The committed golden is
+//! still a 0.31.2 dump; **re-dump it on the 0.32.0 env** (`tools/dump_ltx_dit_golden.py`) before this
+//! `#[ignore]`d gate is run on the new pin. At the matched version the **full 48-layer velocity is
 //! bit-exact** (peak_rel = mean_rel = 0.0). It was not until sc-2842: the adaLN timestep sinusoid was
 //! tabulated on the host in f64 then cast to f32 (the reference `get_timestep_embedding` builds it in
 //! MLX f32), a ~1e-7/elem seed that — fed into the f32 adaLN modulating every block — compounded over

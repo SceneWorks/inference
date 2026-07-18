@@ -1,8 +1,14 @@
-//! sc-12438 — empirical MLX large-output write probes (RUN ON METAL, MLX 0.31.2).
+//! sc-12438 / sc-12746 — empirical MLX large-output write probes (RUN ON METAL, MLX 0.32.0).
 //!
 //! `#[ignore]`d: each allocates multi-GB single-buffer arrays straddling the `i32::MAX`-element
-//! boundary. They exist to establish — on *this* pinned runtime (MLX core 0.31.2 via pmetal-mlx-rs
-//! `38e1cc17`) — the exact per-operation behaviour the tiling fix depends on. Run explicitly:
+//! boundary. They exist to establish — on *this* pinned runtime (MLX core 0.32.0 via pmetal-mlx-rs
+//! `932beb4e`) — the exact per-operation behaviour the tiling fix depends on. On this pin the
+//! `pad`/`concat` copy-gate overflow is FIXED (sc-12746, pad-copy-int64.patch): those probes now
+//! assert EXACT writes above 2^31, not merely below. NOTE: `conv3d_8to128_output_across_i32max`
+//! still encodes the 0.31.2 above-bound *corruption* claim — MLX 0.32.0 also fixes the conv
+//! overflow (upstream #3524), so that probe's above-bound assertion is expected to invert on this
+//! pin; its re-derivation + the conv-stage write-guard retirement are tracked in sc-12748 (slice 6),
+//! not here. Run explicitly:
 //!
 //! ```text
 //! cargo test -p mlx-gen --test mlx_write_bound_probe -- --ignored --nocapture --test-threads=1
@@ -134,9 +140,15 @@ fn pad_story_geometry_128x42x480x848() {
     assert!(out_elems > I32_MAX, "padded output must cross the bound");
     let ys = y.as_slice::<f32>();
 
-    // expected Y[cc,dd,hh,ww] = X[cc,dd,hh,ww] if dd<d else 0.
+    // expected Y[cc,dd,hh,ww] = X[cc,dd,hh,ww] if dd<d else 0. sc-12746: on the copy-gate-fixed pin
+    // (pmetal-mlx-rs 932beb4e, pad-copy-int64.patch) pad must be EXACT above 2^31 too — not merely
+    // below — so this loop now also tracks the above-bound region (first_bad_above / above_checked)
+    // and max_abs.
     let mut first_bad = -1i64;
+    let mut first_bad_above = -1i64;
     let mut bad = 0i64;
+    let mut above_checked = 0i64;
+    let mut max_abs = 0f32;
     let mut checked = 0i64;
     for cc in [0i64, 64, 120, 125, 126, 127] {
         for dd in [0i64, d / 2, d - 1, d /* = pad row (zeros) */] {
@@ -149,34 +161,129 @@ fn pad_story_geometry_128x42x480x848() {
                 };
                 let got = ys[off as usize];
                 checked += 1;
-                if (got - want).abs() > 1e-3 {
+                let err = (got - want).abs();
+                if err > max_abs {
+                    max_abs = err;
+                }
+                if off >= I32_MAX {
+                    above_checked += 1;
+                }
+                if err > 1e-3 {
                     bad += 1;
                     if first_bad < 0 {
                         first_bad = off;
+                    }
+                    if off >= I32_MAX && first_bad_above < 0 {
+                        first_bad_above = off;
                     }
                 }
             }
         }
     }
     eprintln!(
-        "[pad 128×42×480×848] out_elems={out_elems} (={:.4}× 2^31)  checked={checked}  bad={bad}  \
-         first_bad_offset={first_bad} (={:.4}× 2^31)",
+        "[pad 128×42×480×848] out_elems={out_elems} (={:.4}× 2^31)  checked={checked}  \
+         above_2^31_checked={above_checked}  bad={bad}  max_abs={max_abs:e}  \
+         first_bad_offset={first_bad}  first_bad_above={first_bad_above}",
         out_elems as f64 / I32_MAX as f64,
-        if first_bad < 0 {
-            0.0
-        } else {
-            first_bad as f64 / I32_MAX as f64
-        }
     );
-    // Stable regression assertion: whatever pad does ABOVE the bound (geometry-dependent — an earlier
-    // 2200×1024×1024 pad at 1.074× was exact), it must be exact for every sampled position BELOW 2^31.
-    // This is the invariant `check_output_writable` relies on (pad is safe under the bound), and it holds
-    // regardless of whether this particular geometry corrupts above it.
+    // sc-12746: on the copy-gate-fixed pin, pad is exact across the WHOLE output. Below 2^31 was always
+    // safe (check_output_writable's premise). Above 2^31 is now also exact — pad-copy-int64.patch bases
+    // the copy dispatch on the addressable span (offset+Σ(shape-1)·|stride|), turning the int32
+    // dst-offset overflow (unpatched 0.32.0 here: bad=24, first_bad_above=2_153_241_600) into an int64
+    // copy. Both invariants must hold.
+    assert!(above_checked > 0, "pad probe must sample positions above 2^31 to prove the fix");
     assert!(
         !(0..I32_MAX).contains(&first_bad),
         "pad corrupted a BELOW-2^31 position (offset {first_bad}) — the write-index boundary is not at \
          2^31 and check_output_writable's 'pad is safe under the bound' premise is broken"
     );
+    assert_eq!(
+        first_bad_above, -1,
+        "pad corrupted an ABOVE-2^31 position (offset {first_bad_above}); max_abs={max_abs:e} — the \
+         pad-copy-int64 gate did not cover this geometry"
+    );
+    assert!(bad == 0, "pad had {bad} corrupted sample(s); max_abs={max_abs:e}");
+}
+
+/// sc-12746 companion to the pad probe: `concatenate` hits the SAME `copy_gpu_inplace`
+/// slice-VIEW bug. Concatenate two `[128,21,480,848]` arrays along the frame axis (1) →
+/// `[128,42,480,848]` (2.188e9 > 2^31). Each input is copied into a strided slice-view of the
+/// output whose true dst span is 2_179_699_199 > 2^31 while `out_slice.data_size()` = 1_094_123_520
+/// < 2^31 — so the unpatched int32 `gg` kernel overflows above 2^31, and `pad-copy-int64.patch`
+/// (true-span gate → int64 kernel) makes it exact. Same probe rules as the pad probe.
+#[test]
+#[ignore = "sc-12746 heavy MLX concat write probe (~18 GB); run with --ignored on Metal"]
+fn concat_story_geometry_128x42x480x848() {
+    use mlx_rs::ops::concatenate_axis;
+    let (c, dh, h, w): (i64, i64, i64, i64) = (128, 21, 480, 848);
+    let in_elems = c * dh * h * w;
+    assert!(in_elems < I32_MAX, "each input must stay under the bound (from_slice)");
+    // Position-dependent, and DISTINCT per input so a scrambled index is caught: input k's flat
+    // element j holds pv(j + k*OFFSET). We reconstruct the same value on the host for comparison.
+    let off_b: i64 = 500_000_009; // shift so the two inputs don't alias mod 251
+    let mk = |k: i64| -> Array {
+        let host: Vec<f32> = (0..in_elems).map(|j| pv(j + k * off_b)).collect();
+        let a = Array::from_slice(&host, &[c as i32, dh as i32, h as i32, w as i32]);
+        a.eval().unwrap();
+        a
+    };
+    let a0 = mk(0);
+    let a1 = mk(1);
+    let y = concatenate_axis(&[a0, a1], 1).unwrap();
+    y.eval().unwrap();
+    let dout = 2 * dh; // 42
+    assert_eq!(y.shape(), &[c as i32, dout as i32, h as i32, w as i32]);
+    let out_elems = c * dout * h * w;
+    assert!(out_elems > I32_MAX, "concatenated output must cross the bound");
+    let ys = y.as_slice::<f32>();
+
+    // Y[cc,dd,hh,ww] = input_k[cc, dd-k*dh, hh, ww] with k = dd/dh; its flat index within input k
+    // is j = ((cc*dh + (dd - k*dh))*h + hh)*w + ww, value = pv(j + k*off_b).
+    let mut first_bad = -1i64;
+    let mut first_bad_above = -1i64;
+    let mut bad = 0i64;
+    let mut above_checked = 0i64;
+    let mut max_abs = 0f32;
+    let mut checked = 0i64;
+    for cc in [0i64, 64, 120, 126, 127] {
+        for dd in [0i64, dh - 1, dh, dh + 1, dout - 1] {
+            for &(hh, ww) in &[(0i64, 0i64), (h / 2, w / 2), (h - 1, w - 1)] {
+                let off = ((cc * dout + dd) * h + hh) * w + ww;
+                let k = dd / dh;
+                let din = dd - k * dh;
+                let j = ((cc * dh + din) * h + hh) * w + ww;
+                let want = pv(j + k * off_b);
+                let got = ys[off as usize];
+                checked += 1;
+                let err = (got - want).abs();
+                if err > max_abs {
+                    max_abs = err;
+                }
+                if off >= I32_MAX {
+                    above_checked += 1;
+                }
+                if err > 1e-3 {
+                    bad += 1;
+                    if first_bad < 0 {
+                        first_bad = off;
+                    }
+                    if off >= I32_MAX && first_bad_above < 0 {
+                        first_bad_above = off;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[concat 128×42×480×848] out_elems={out_elems} (={:.4}× 2^31)  checked={checked}  \
+         above_2^31_checked={above_checked}  bad={bad}  max_abs={max_abs:e}  \
+         first_bad_offset={first_bad}  first_bad_above={first_bad_above}",
+        out_elems as f64 / I32_MAX as f64,
+    );
+    assert!(above_checked > 0, "probe must sample positions above 2^31 to prove the fix");
+    assert!(!(0..I32_MAX).contains(&first_bad), "concat corrupted a BELOW-2^31 position (offset {first_bad})");
+    assert_eq!(first_bad_above, -1, "concat corrupted an ABOVE-2^31 position (offset {first_bad_above})");
+    assert!(bad == 0, "concat had {bad} corrupted sample(s); max_abs={max_abs:e}");
 }
 
 /// Does creating / reshaping a >i32::MAX array through the mlx-rs wrappers stay intact? `from_slice`

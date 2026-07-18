@@ -109,13 +109,19 @@ mod sc2963 {
             crate::set_compile_glue(false);
             assert_eq!(c.dtype(), dt, "swiglu dtype {dt:?}");
             assert_eq!(e.dtype(), dt, "eager swiglu dtype {dt:?}");
-            let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&c, &e).unwrap()).unwrap();
-            let m = mlx_rs::ops::max(&d, None)
-                .unwrap()
-                .as_dtype(Dtype::Float32)
-                .unwrap()
-                .item::<f32>();
-            assert_eq!(m, 0.0, "swiglu compiled vs eager {dt:?}");
+            // sc-12747: under MLX 0.32.0 the compiled SwiGLU (`silu(h1)·h3`) rounds ~1 ULP-f32
+            // differently from eager (0-ULP on the prior 0.31.2 pin); bf16 stays bit-identical. f32
+            // takes the shared re-baselined tolerance; bf16 stays exact.
+            let tol = if dt == Dtype::Float32 {
+                mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL
+            } else {
+                0.0
+            };
+            let rel = mlx_gen::nn::max_rel_diff(&c, &e);
+            assert!(
+                rel <= tol,
+                "swiglu compiled vs eager {dt:?}: rel|Δ|={rel:e} exceeds {tol:e}"
+            );
         }
     }
 }

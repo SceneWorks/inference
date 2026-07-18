@@ -25,8 +25,11 @@ use mlx_gen_sdxl::{
 use mlx_rs::{Array, Dtype};
 
 // The production path runs **fp16** (sc-2721), so the e2e gate uses the `float16=True` golden, dumped
-// on MLX 0.31.2 (the version mlx-gen links — the compiled erf-gelu kernel differs on 0.31.0). Build:
-//   FLOAT16=1 <mlx-0.31.2 python> tools/dump_sdxl_golden.py
+// on the version mlx-gen links — now **MLX 0.32.0** (epic 12742, `pmetal-mlx-rs` 932beb4e). The
+// compiled erf-gelu kernel differs on 0.31.0, and the fused f32 glue drifts 1–2 ULP on 0.31.2→0.32.0
+// (sc-12744/sc-12747); the committed golden is still a 0.31.2 dump, so re-dump it on the 0.32.0 env
+// before running this `#[ignore]`d gate on the new pin. Build:
+//   FLOAT16=1 <mlx-0.32.0 python> tools/dump_sdxl_golden.py
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/sdxl_fp16_golden.safetensors"
