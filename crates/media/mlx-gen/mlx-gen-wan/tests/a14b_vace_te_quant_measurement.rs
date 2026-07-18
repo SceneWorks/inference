@@ -55,8 +55,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 fn encode(root: &Path, cfg: &WanModelConfig, quantized: bool) -> (Vec<f32>, usize) {
     clear_cache();
     reset_peak_memory();
-    let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.text_len).expect("tokenizer");
-    let encoder = if quantized {
+    if quantized {
         let (embedding, _) = encode_text_staged_for_tier(
             root,
             cfg,
@@ -68,7 +67,9 @@ fn encode(root: &Path, cfg: &WanModelConfig, quantized: bool) -> (Vec<f32>, usiz
         .expect("production quantized-tier UMT5 stage");
         let peak = get_peak_memory();
         return (embedding.as_slice::<f32>().to_vec(), peak);
-    } else {
+    }
+    let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.text_len).expect("tokenizer");
+    let encoder = {
         let weights =
             Weights::from_file(root.join("t5_encoder.safetensors")).expect("UMT5 weights");
         Umt5Encoder::from_weights(&weights, cfg).expect("bf16 UMT5")
