@@ -47,6 +47,11 @@ use crate::vae22::Wan22Vae;
 /// The curated unified solvers (epic 7114, sc-7121) every Wan generator exposes ADDITIVELY beyond its
 /// native solvers — the gen-core-only solvers, routed through `run_flow_sampler` over Wan's own flow-σ
 /// schedule ([`crate::pipeline::denoise_curated`] / [`denoise_moe_curated`]).
+///
+/// A14B residency note (sc-12736): on the A14B MoE, `denoise_moe_curated` picks the expert **per eval**
+/// (inside the predict closure) rather than as a prefix/suffix step split, so ALL of these keep BOTH
+/// experts resident — the expert swap (`denoise_moe_swapped`) applies to the native solvers only, and
+/// [`moe_denoise_resident_bytes`] budgets both experts for a curated Sequential job accordingly.
 const WAN_CURATED_SAMPLERS: [&str; 4] = ["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
 
 /// Wan's native flow-SNR solvers ([`crate::scheduler::SolverKind`]), advertised under the curated
@@ -782,8 +787,11 @@ impl Wan14b {
     /// split reproduces the resident per-step `t ≥ boundary` choice bit-for-bit — only residency /
     /// lifetime changes. Each expert projects the raw UMT5 `context`/`context_null` through its **own**
     /// `text_embedder` after it loads (the entangled per-expert projection), so the small raw contexts
-    /// stay resident across the swap. **Native solvers only** — the caller routes curated multi-eval
-    /// solvers (whose per-step sub-evals can straddle the boundary) to the resident path.
+    /// stay resident across the swap. **Native solvers only** — the caller routes **every** curated
+    /// solver ([`WAN_CURATED_SAMPLERS`]: `euler_ancestral`, `heun`, `dpmpp_sde`, `ddim`) to the resident
+    /// path, because those run through `denoise_moe_curated`, which selects the expert **per eval** (not
+    /// as a prefix/suffix step split), so both experts must stay resident — a structural constraint, not
+    /// just the multi-eval (`heun`/`dpmpp_sde`) straddle case.
     #[allow(clippy::too_many_arguments)]
     fn denoise_moe_swapped(
         &self,
@@ -1083,15 +1091,24 @@ impl Wan14b {
         let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
-        // The MoE keeps BOTH experts resident, and always runs cond+uncond (batch 2).
+        // sc-12736: the resident-expert count is policy + sampler dependent. Under `Sequential` + a
+        // native solver the expert swap keeps only ONE expert resident, so budget one; under `Resident`
+        // or ANY curated solver (`denoise_moe_curated` picks the expert per-eval → both stay resident)
+        // budget BOTH — so the guard rejects a both-resident job that won't fit instead of OOMing. The
+        // denoise always runs cond+uncond (batch 2).
+        let low_bytes =
+            dit_resident_bytes(&[self.root.join("low_noise_model.safetensors")], self.quant);
+        let high_bytes = dit_resident_bytes(
+            &[self.root.join("high_noise_model.safetensors")],
+            self.quant,
+        );
         preflight_denoise_memory_guard(
             self.descriptor.id,
-            dit_resident_bytes(
-                &[
-                    self.root.join("low_noise_model.safetensors"),
-                    self.root.join("high_noise_model.safetensors"),
-                ],
-                self.quant,
+            moe_denoise_resident_bytes(
+                self.offload_policy,
+                req.sampler.as_deref(),
+                low_bytes,
+                high_bytes,
             ),
             seq_len(lat, cfg.patch_size),
             cfg.dim,
@@ -1147,9 +1164,10 @@ impl Wan14b {
 
         // --- Stage 2: dual-expert MoE denoise (→ freed). Under `Sequential` with a NATIVE solver this
         // is the EXPERT SWAP — only the active expert is resident at a time (sc-12736). Otherwise
-        // (`Resident`, or a curated multi-eval solver whose per-step sub-evals can straddle the boundary
-        // and so can't be cleanly prefix/suffix-split without a parity risk) both experts stay
-        // co-resident for the loop; under `Sequential` the TE/VAE were still freed above. ---
+        // (`Resident`, or ANY curated solver — `denoise_moe_curated` picks the expert per-eval, not as a
+        // prefix/suffix step split, so both must stay resident) both experts stay co-resident for the
+        // loop; under `Sequential` the TE/VAE were still freed above (and the preflight guard budgeted
+        // for both — see `moe_denoise_resident_bytes`). ---
         let latents = if sequential && !is_wan_curated(req.sampler.as_deref()) {
             let boundary_timestep = cfg.boundary * cfg.num_train_timesteps as f32;
             self.denoise_moe_swapped(
@@ -1346,6 +1364,37 @@ pub(crate) fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64
     };
     let raw: u64 = files.iter().map(|p| weight_bytes_at(p)).sum();
     (raw as f64 * ratio) as u64
+}
+
+/// The resident transformer bytes the sc-4986 [`preflight_denoise_memory_guard`] must budget for the
+/// **A14B MoE denoise**, made policy + sampler aware (sc-12736). `low_bytes` / `high_bytes` are the two
+/// experts' resident sizes ([`dit_resident_bytes`] per expert).
+///
+/// * **Expert swap** — `Sequential` policy AND a **native** (non-curated) solver, the one path that
+///   actually swaps (`denoise_moe_swapped`): only the ACTIVE expert is resident at the denoise peak, so
+///   budget ONE expert (the larger of the two, conservatively). Without this the guard sums both and
+///   **false-rejects** the swappable default job on exactly the one-expert-sized machines the worker
+///   selects `Sequential` for — defeating the whole Pillar-1 win at the gate.
+/// * **Both resident** — `Resident` policy, OR **any** curated solver. A curated solver runs through
+///   `denoise_moe_curated`, which picks the expert **per eval** (a multi-eval step can touch both
+///   experts, and even single-eval curated steps flip experts across the boundary within one resident
+///   loop), so BOTH stay resident for the whole denoise. Summing both here makes the guard correctly
+///   **reject** a both-resident job that won't fit — a catchable error before the load, not a SIGKILL
+///   mid-denoise.
+fn moe_denoise_resident_bytes(
+    offload: OffloadPolicy,
+    sampler: Option<&str>,
+    low_bytes: u64,
+    high_bytes: u64,
+) -> u64 {
+    let swaps = offload == OffloadPolicy::Sequential && !is_wan_curated(sampler);
+    if swaps {
+        // One resident expert (the swap). Take the larger so the guard never under-budgets.
+        low_bytes.max(high_bytes)
+    } else {
+        // Both experts co-resident for the whole denoise.
+        low_bytes + high_bytes
+    }
 }
 
 /// The single conditioning reference image for I2V (the first video frame), if present.
@@ -1545,6 +1594,60 @@ mod tests {
         );
     }
 
+    /// sc-12736: the sc-4986 pre-flight denoise guard's expert-byte accounting must track the ACTUAL
+    /// resident-expert count of the path it guards — one under the native `Sequential` swap, two under
+    /// `Resident` or ANY curated solver (which keep both experts resident). Getting this wrong either
+    /// false-rejects the swappable job on a one-expert machine (summing when it should be one) or waves
+    /// through a both-resident curated job that then OOMs (one when it should be two). Distinct per-
+    /// expert sizes (`lo < hi`) so `max` vs `sum` can't alias.
+    #[test]
+    fn preflight_guard_budgets_one_expert_only_for_the_native_sequential_swap() {
+        use OffloadPolicy::{Resident, Sequential};
+        let (lo, hi) = (8_000_000_000u64, 9_000_000_000u64);
+
+        // Resident → BOTH experts, whatever the sampler (native or curated).
+        for s in [Some("uni_pc"), Some("heun"), None] {
+            assert_eq!(
+                moe_denoise_resident_bytes(Resident, s, lo, hi),
+                lo + hi,
+                "Resident must budget both experts for sampler {s:?}"
+            );
+        }
+
+        // Sequential + NATIVE solver (the swap) → ONE expert (the larger). `None` ⇒ default uni_pc.
+        for s in [
+            Some("uni_pc"),
+            Some("euler"),
+            Some("dpmpp_2m"),
+            Some("unipc"),
+            Some("dpmpp2m"),
+            None,
+        ] {
+            assert_eq!(
+                moe_denoise_resident_bytes(Sequential, s, lo, hi),
+                hi,
+                "native Sequential must budget ONE expert for sampler {s:?}"
+            );
+        }
+
+        // Sequential + CURATED solver → BOTH experts (per-eval expert pick keeps both resident). Pin
+        // every curated name so dropping the carve-out for any of them regresses.
+        for s in WAN_CURATED_SAMPLERS {
+            assert_eq!(
+                moe_denoise_resident_bytes(Sequential, Some(s), lo, hi),
+                lo + hi,
+                "curated Sequential must keep BOTH experts resident: {s}"
+            );
+        }
+
+        // Discriminator: the swap budgets strictly less than the both-resident path (the whole point).
+        assert!(
+            moe_denoise_resident_bytes(Sequential, Some("uni_pc"), lo, hi)
+                < moe_denoise_resident_bytes(Resident, Some("uni_pc"), lo, hi),
+            "the swap must budget strictly less than both-resident"
+        );
+    }
+
     fn wan_5b() -> Wan {
         Wan {
             descriptor: descriptor(),
@@ -1648,9 +1751,7 @@ mod tests {
     /// A fresh, empty scratch dir for one sizing test (recreated per run; RUST_TEST_THREADS=1 is
     /// forced repo-wide, so no cross-test races on the shared temp root).
     fn sizing_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join("mlx_gen_wan_dit_sizing")
-            .join(name);
+        let d = std::env::temp_dir().join("mlx_gen_wan_dit_sizing").join(name);
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
