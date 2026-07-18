@@ -1,5 +1,8 @@
-//! **UMT5-XXL** text encoder (`google/umt5-xxl`, `UMT5EncoderModel`) — Wan's prompt encoder, run in
-//! f32. Three deviations from vanilla HF T5 the port honors:
+//! **UMT5-XXL** text encoder (`google/umt5-xxl`, `UMT5EncoderModel`) — Wan's prompt encoder. The
+//! inference providers load it at **bf16** (sc-12778 — halving the f32 resident + the ENCODE-stage
+//! transient; the RMS `t5_norm` still reduces in f32 internally for stability). This module is
+//! dtype-agnostic: the encoder runs at whatever dtype its [`VarBuilder`] loads the weights at.
+//! Three deviations from vanilla HF T5 the port honors:
 //! 1. **Per-layer** relative-position bias (`shared_pos = False`): every block owns its own
 //!    `[num_buckets, num_heads]` bucket table (`encoder.block.{i}.layer.0.SelfAttention.relative_attention_bias`).
 //! 2. **Gated-GELU** FFN (`DenseReluDense.{wi_0, wi_1, wo}`): `wo(gelu(wi_0(x)) · wi_1(x))`.
@@ -193,14 +196,80 @@ impl Umt5Encoder {
         Tensor::from_vec(idx, s * s, &self.device)
     }
 
-    /// `input_ids`: `[1, S]` (u32) → prompt embeds `[1, S, d_model]` in f32.
+    /// `input_ids`: `[1, S]` (u32) → prompt embeds `[1, S, d_model]` at the encoder's load dtype
+    /// (bf16 for the inference providers, sc-12778; the RMS norms reduce in f32 internally).
     pub fn encode(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (_b, s) = input_ids.dims2()?;
         let bucket_idx = self.bucket_grid(s)?;
-        let mut x = self.shared.forward(input_ids)?; // [1,S,d_model] f32
+        let mut x = self.shared.forward(input_ids)?; // [1,S,d_model] at the load dtype
         for blk in &self.blocks {
             x = blk.forward(&x, &bucket_idx, s, self.cfg.eps)?;
         }
         t5_norm(&x, &self.final_norm, self.cfg.eps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_nn::{VarBuilder, VarMap};
+
+    /// A deliberately tiny UMT5 config (1 layer, small dims) — enough to exercise the full
+    /// embed → block → final-norm forward without a real checkpoint.
+    fn tiny_cfg() -> TextEncoderConfig {
+        TextEncoderConfig {
+            vocab_size: 16,
+            d_model: 8,
+            d_ff: 16,
+            d_kv: 4,
+            num_heads: 2,
+            num_layers: 1,
+            num_buckets: 8,
+            max_distance: 128,
+            eps: 1e-6,
+            max_length: 512,
+            pad_token_id: 0,
+        }
+    }
+
+    /// Build a tiny encoder whose weights are loaded at `dtype`. A `VarMap` backend (not
+    /// `VarBuilder::zeros`) so the packed-detect probe (`{key}.scales` via `contains_tensor`) sees only
+    /// the dense leaves the encoder actually `get`s — every leaf takes the dense arm, exactly as the
+    /// hosted Wan tier does.
+    fn build_at(dtype: DType) -> Umt5Encoder {
+        let cfg = tiny_cfg();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, dtype, &Device::Cpu);
+        Umt5Encoder::new(&cfg, vb).expect("tiny encoder")
+    }
+
+    #[test]
+    fn encoder_weights_load_at_bf16() {
+        // sc-12778: the inference providers load the UMT5 encoder at bf16 — the footprint lever is that
+        // the WEIGHTS load bf16 (halving the ~21 GB f32 resident to ~11 GB), not merely an output cast.
+        // Prove the loaded weights are bf16 by inspecting a dense leaf the encoder `get`s at build.
+        //
+        // NB: the FULL bf16 forward runs on CUDA only — candle's CPU backend has no bf16 matmul
+        // (`unsupported dtype BF16 for op matmul`), the known "bf16 GPU vs f32 CPU" split — so the bf16
+        // encode→embed_text parity is a downstream GPU-validation step, not a CPU unit test.
+        let te = build_at(DType::BF16);
+        assert_eq!(
+            te.final_norm.dtype(),
+            DType::BF16,
+            "the bf16-loaded encoder must hold bf16 weights (the footprint win)"
+        );
+    }
+
+    #[test]
+    fn f32_encode_runs_and_is_finite() {
+        // The encoder stays dtype-agnostic; the CPU-golden / reference path is f32 (CPU has no bf16
+        // matmul). An f32 load runs the full embed → attn → FFN → norm forward to a finite f32 embed.
+        let te = build_at(DType::F32);
+        let ids = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &Device::Cpu).unwrap();
+        let out = te.encode(&ids).expect("f32 encode");
+        assert_eq!(out.dtype(), DType::F32);
+        assert_eq!(out.dims3().unwrap(), (1, 3, 8));
+        let flat: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(flat.iter().all(|v| v.is_finite()), "f32 encode must be finite");
     }
 }

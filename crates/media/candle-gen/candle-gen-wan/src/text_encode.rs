@@ -86,9 +86,11 @@ pub(crate) fn build_umt5_tokenizer(
 /// - `label` prefixes the tokenize error text (e.g. `"wan"`, `"wan-14b"`, `"wan-vace"`,
 ///   `"wan trainer"`).
 /// - `out_dtype` is the dtype of the returned embeds **and** the zero-pad. The three inference
-///   providers run the encoder at f32 and pass `ENC_DTYPE` (= f32), so the cast is a no-op and the
-///   pad is f32 — byte-identical to the pre-consolidation copies. The trainer loads the encoder at
-///   **bf16** and passes f32, reproducing its (previously drifted) `.to_dtype(F32)` upcast exactly.
+///   providers run the encoder at **bf16** (sc-12778) and pass `ENC_DTYPE` (= bf16), so the cast is a
+///   no-op, the pad is bf16, and the downstream DiT `embed_text` bf16 cast is also a no-op — the bf16
+///   encoder halves the f32 resident + its ENCODE-stage transient (the 5B <16 GB lever, epic
+///   sc-12732). The trainer loads the encoder at bf16 and passes f32, reproducing its (previously
+///   drifted) `.to_dtype(F32)` upcast exactly.
 ///
 /// See the module docs for the two load-bearing invariants (512-pad sc-3697, empty-prompt guard
 /// sc-7078) this routine guards.
