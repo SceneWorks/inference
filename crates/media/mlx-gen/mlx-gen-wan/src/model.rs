@@ -86,7 +86,7 @@ pub(crate) fn wan_native_samplers() -> Vec<&'static str> {
 
 /// Whether `req.sampler` selects a curated gen-core solver (routed through `run_flow_sampler`) rather
 /// than a native Wan solver (handled by `scheduler.rs`). Used to branch the denoise dispatch.
-fn is_wan_curated(name: Option<&str>) -> bool {
+pub(crate) fn is_wan_curated(name: Option<&str>) -> bool {
     matches!(name, Some(n) if WAN_CURATED_SAMPLERS.contains(&n))
 }
 
@@ -1484,7 +1484,7 @@ pub(crate) fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64
 ///   loop), so BOTH stay resident for the whole denoise. Summing both here makes the guard correctly
 ///   **reject** a both-resident job that won't fit — a catchable error before the load, not a SIGKILL
 ///   mid-denoise.
-fn moe_denoise_resident_bytes(
+pub(crate) fn moe_denoise_resident_bytes(
     offload: OffloadPolicy,
     sampler: Option<&str>,
     low_bytes: u64,
@@ -1891,7 +1891,9 @@ mod tests {
     /// A fresh, empty scratch dir for one sizing test (recreated per run; RUST_TEST_THREADS=1 is
     /// forced repo-wide, so no cross-test races on the shared temp root).
     fn sizing_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join("mlx_gen_wan_dit_sizing").join(name);
+        let d = std::env::temp_dir()
+            .join("mlx_gen_wan_dit_sizing")
+            .join(name);
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
