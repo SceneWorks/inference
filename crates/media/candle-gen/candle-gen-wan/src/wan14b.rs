@@ -48,9 +48,13 @@ use crate::text_encoder::Umt5Encoder;
 use crate::transformer::WanTransformer;
 use crate::vae16::WanVae16;
 
-/// The experts run bf16 (the diffusers fp32 weights load as bf16, the 5B regime); UMT5 + VAE run f32.
+/// The experts run bf16 (the diffusers fp32 weights load as bf16, the 5B regime); UMT5 runs bf16
+/// (sc-12778 — halving the f32 encoder resident + its ENCODE-stage transient; the DiT `embed_text`
+/// already casts the context to bf16, so this removes the old f32→bf16 boundary. The A14B is
+/// decode-bound so the peak win is smaller than the 5B's, but the resident encoder still halves);
+/// the VAE runs f32.
 const DIT_DTYPE: DType = DType::BF16;
-const ENC_DTYPE: DType = DType::F32;
+const ENC_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
 const Z_DIM: usize = 16;
 
@@ -184,7 +188,8 @@ impl Pipeline {
     /// Build the UMT5 text encoder from an in-place ComfyUI file (sc-10909): load its native tensor map
     /// on CPU, dequant the companion scaled-fp8 weights ([`crate::comfyui::dequant_comfyui_umt5`], no
     /// key remap — the ComfyUI file already carries the HF `UMT5EncoderModel` keys), then build via
-    /// `VarBuilder::from_tensors` at [`ENC_DTYPE`] (f32, matching the snapshot TE).
+    /// `VarBuilder::from_tensors` at [`ENC_DTYPE`] (bf16, sc-12778 — matching the snapshot TE; the
+    /// scaled-fp8 dequant computes in f32 then casts to the bf16 target, as the DiT experts already do).
     fn build_te_comfyui(&self, file: &Path) -> CResult<Umt5Encoder> {
         let map = cst::load(file, &Device::Cpu)?;
         let map = crate::comfyui::dequant_comfyui_umt5(map, ENC_DTYPE)?;
@@ -282,8 +287,9 @@ impl Pipeline {
         Ok(map)
     }
 
-    /// Build the UMT5 text encoder (f32) — the ~21 GB phase-A component. In-place ComfyUI mode
-    /// (sc-10909) reads it from the user's tree (scaled-fp8 dequant); else the snapshot `text_encoder/`.
+    /// Build the UMT5 text encoder (bf16, sc-12778) — the ~11 GB phase-A component (was ~21 GB f32).
+    /// In-place ComfyUI mode (sc-10909) reads it from the user's tree (scaled-fp8 dequant); else the
+    /// snapshot `text_encoder/`.
     /// A single home shared by the resident [`load_components`](Self::load_components) build and the
     /// sequential-offload [`render_sequential`](Self::render_sequential) stage (sc-12733).
     fn load_te(&self) -> CResult<Umt5Encoder> {
@@ -383,9 +389,9 @@ impl Pipeline {
         })
     }
 
-    /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (f32), zero-padded to `max_length` (the DiT
-    /// cross-attends over the 512-padded context — the same rule as the 5B, sc-3697). Shared Wan
-    /// text-encode routine (sc-9000 / F-020).
+    /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (bf16, sc-12778), zero-padded to `max_length`
+    /// (the DiT cross-attends over the 512-padded context — the same rule as the 5B, sc-3697). Shared
+    /// Wan text-encode routine (sc-9000 / F-020).
     fn encode(&self, comps: &Components, prompt: &str) -> CResult<Tensor> {
         self.encode_raw(&comps.tok, &comps.te, prompt)
     }
@@ -659,7 +665,8 @@ impl Pipeline {
     /// pre-decode (denoise) peak on a 24 GB card:
     ///
     /// 1. **TE off-GPU during denoise.** Load UMT5, encode the pos (+ neg when CFG) **raw** `[1,512,4096]`
-    ///    context, then DROP the ~21 GB f32 encoder — only the small context tensors survive.
+    ///    context, then DROP the ~11 GB bf16 encoder (sc-12778, was ~21 GB f32) — only the small context
+    ///    tensors survive.
     /// 2. **VAE staged (I2V).** Load the VAE (with encoder), build the channel-concat `y`, drop it before
     ///    denoise; the encoder is only needed to build `y`.
     /// 3. **Expert swap.** Hold only the **active** expert: load high, project its context, run steps
@@ -687,7 +694,7 @@ impl Pipeline {
         // is dropped right after encoding.
         let tok = crate::text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan-14b")?;
 
-        // ── Stage 1: UMT5 text encode → raw pos/neg context → DROP the encoder (~21 GB f32). ──
+        // ── Stage 1: UMT5 text encode → raw pos/neg context → DROP the encoder (~11 GB bf16, sc-12778). ──
         let (pos, neg) = {
             on_progress(Progress::Loading(LoadPhase::TextEncoder));
             let te = self.load_te()?;
