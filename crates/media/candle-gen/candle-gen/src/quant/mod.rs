@@ -468,6 +468,26 @@ impl QLinear {
         Self::from_packed_gs(wq, scales, biases, bias, MLX_GROUP_SIZE, device)
     }
 
+    /// Build a `Quantized` projection from an **already-resident native GGUF k-quant** [`QTensor`]
+    /// (`Q4_K`/`Q5_K`/`Q6_K`/`Q8_0`/…), keeping the weight **quantized-resident** and dequantizing it
+    /// per-forward — the [`MatmulStrategy::DequantDense`] (sc-7702-safe) path, matching ComfyUI-GGUF's
+    /// dequant-on-matmul. Unlike [`Self::from_packed`] (an MLX affine *triple* → lossless `Q4_1` repack),
+    /// this ingests a native GGUF `QTensor` **directly**: the k-quant loader (the Wan sc-12735 loader)
+    /// opens `gguf_file::Content::tensor(...)` and hands the resident `QTensor` here **without**
+    /// dequantizing it to a dense `[out,in]` weight at load (the whole 24 GB lever — dequant happens on
+    /// the matmul, never at load). `bias` is the optional dense bias, kept full-precision. The `Arc` lets
+    /// a loader share one resident weight across projections without a copy.
+    pub fn from_qtensor_dequant(qtensor: std::sync::Arc<QTensor>, bias: Option<Tensor>) -> Self {
+        Self::Quantized {
+            weight: QuantWeight::Dequant(qtensor),
+            bias,
+            fwd: QuantForward {
+                flatten_leading: false,
+                cast_back: true,
+            },
+        }
+    }
+
     /// As [`Self::from_packed`], but at an explicit MLX `group_size` (sc-9410) — the boogu tier packs
     /// at group 32 (the z-image / flux tiers at the default 64). The group size is not recoverable from
     /// the packed shapes alone (see [`repack`]), so a non-64 tier must pass it (from its component
@@ -758,6 +778,16 @@ impl QLinear {
     /// Whether this projection loaded (or was folded) to a quantized weight.
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized { .. })
+    }
+
+    /// The GGUF block type of a quantized projection's resident weight (`None` when dense) — lets a
+    /// consumer assert a native-GGUF k-quant (`Q4_K` etc.) survived load **quantized-resident** rather
+    /// than being dequantized to a dense `[out,in]` weight (sc-12735, the resident-not-dense guarantee).
+    pub fn quant_dtype(&self) -> Option<GgmlDType> {
+        match self {
+            Self::Quantized { weight, .. } => Some(weight.dtype()),
+            Self::Dense(_) => None,
+        }
     }
 
     /// The [`MatmulStrategy`] of a quantized projection (`None` when dense) — used by tests to assert a
@@ -1072,6 +1102,41 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &dense.forward(&x)?);
         assert!(cos > 0.99999, "packed vs dense-grid cosine {cos:.6}");
+        Ok(())
+    }
+
+    /// [`QLinear::from_qtensor_dequant`] (sc-12735) ingests a **native GGUF k-quant** `QTensor` and keeps
+    /// it **quantized-resident**: the block type survives ([`QLinear::quant_dtype`] is `Some(Q4K)`, NOT
+    /// dequantized to a dense weight at load), the forward is the sc-7702-safe
+    /// [`MatmulStrategy::DequantDense`] path (dequant-on-matmul, not int8-fast), and it approximates the
+    /// dense weight it was quantized from (Q4_K tolerance). The resident-not-dense guarantee at the core.
+    #[test]
+    fn from_qtensor_dequant_keeps_kquant_resident_and_forwards() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 256usize); // Q4_K needs `in` a multiple of 256.
+        let w = Tensor::randn(0f32, 0.1f32, (out_dim, in_dim), &dev)?;
+        let bias = Tensor::randn(0f32, 1f32, (out_dim,), &dev)?;
+        // A resident k-quant QTensor — the shape a native GGUF loader hands over WITHOUT dequantizing.
+        let qt = std::sync::Arc::new(QTensor::quantize(&w, GgmlDType::Q4K)?);
+
+        let ql = QLinear::from_qtensor_dequant(qt, Some(bias.clone()));
+        assert!(ql.is_quantized(), "the ingested QTensor must load quantized, not dense");
+        assert_eq!(
+            ql.quant_dtype(),
+            Some(GgmlDType::Q4K),
+            "the resident weight must stay Q4_K (never dequantized to a dense [out,in] at load)"
+        );
+        assert_eq!(
+            ql.matmul_strategy(),
+            Some(MatmulStrategy::DequantDense),
+            "the forward must dequant-on-matmul (sc-7702-safe), not candle's int8 fast path"
+        );
+
+        // The dequant-on-forward output approximates the dense weight it was quantized from + bias.
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let dense = Linear::new(w, Some(bias));
+        let cos = cosine(&ql.forward(&x)?, &dense.forward(&x)?);
+        assert!(cos > 0.99, "Q4_K dequant-forward vs dense cosine {cos:.5}");
         Ok(())
     }
 
