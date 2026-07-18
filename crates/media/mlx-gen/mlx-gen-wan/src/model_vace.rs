@@ -35,8 +35,8 @@ use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
 
 use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
-use crate::config::{WanModelConfig, WanVaceConfig};
-use crate::model::dit_resident_bytes;
+use crate::config::{WanModelConfig, WanQuant, WanVaceConfig};
+use crate::model::{dit_resident_bytes, effective_te_quant};
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, latent_shape,
     preflight_denoise_memory_guard, preprocess_i2v_image, reject_off_grid, reject_over_area,
@@ -132,6 +132,7 @@ fn vace_prep(
     config: &WanVaceConfig,
     req: &GenerationRequest,
     cfg_disabled: bool,
+    te_quant: Option<WanQuant>,
 ) -> Result<VacePrep> {
     let base = &config.base;
     let clip = req.control_clip().expect("validated present");
@@ -169,7 +170,7 @@ fn vace_prep(
 
     // --- Stage 1: UMT5 text encode ---
     let (context, context_null) =
-        encode_text_staged(root, base, &req.prompt, &neg_prompt, cfg_disabled)?;
+        encode_text_staged(root, base, &req.prompt, &neg_prompt, cfg_disabled, te_quant)?;
 
     // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
     let control = {
@@ -432,7 +433,13 @@ impl WanVace {
         let cfg_disabled = guidance <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the dual-expert path, F-072).
-        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled)?;
+        let prep = vace_prep(
+            &self.root,
+            &self.config,
+            req,
+            cfg_disabled,
+            effective_te_quant(&self.config.base, self.quantize),
+        )?;
 
         // --- Stage 3: load the VACE DiT, embed contexts, CFG denoise ---
         let latents = {
@@ -647,7 +654,13 @@ impl WanVaceFun {
         let cfg_disabled = low_gs <= 1.0 && high_gs <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the single-expert path, F-072).
-        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled)?;
+        let prep = vace_prep(
+            &self.root,
+            &self.config,
+            req,
+            cfg_disabled,
+            effective_te_quant(&self.config.base, self.quantize),
+        )?;
 
         // --- Stage 3: load BOTH experts, embed contexts per expert, dual-expert MoE VACE denoise ---
         let latents = {
