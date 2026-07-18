@@ -22,18 +22,6 @@ LANES = (
     "real_weights",
 )
 
-BUILD_LANES = {
-    "workspace",
-    "contracts",
-    "candle_cpu",
-    "macos_metal",
-    "windows_cuda",
-    "supply_chain",
-    "release",
-    "real_weights",
-}
-
-
 def _under(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
 
