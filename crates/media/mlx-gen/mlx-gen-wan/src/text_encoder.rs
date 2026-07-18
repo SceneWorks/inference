@@ -554,10 +554,12 @@ pub fn load_tokenizer(path: impl AsRef<std::path::Path>, text_len: usize) -> Res
 /// the A14B caller passes `skip_neg = false` to keep its always-both behavior (F-010).
 ///
 /// `te_quant` (sc-12831) packs the UMT5 projections to the DiT tier's bits — `Some` on a quantized
-/// tier (each caller resolves its effective quant: the pre-quantized snapshot's `config.quantization`,
-/// else the load-time `spec.quantize`), `None` on the bf16 tier (the encoder stays dense / bit-exact).
+/// tier, `None` on the bf16 tier (the encoder stays dense / bit-exact). Private on purpose
+/// (sc-12914): every caller must come through [`encode_text_staged_for_tier`], which resolves the
+/// effective quant (the pre-quantized snapshot's `config.quantization`, else the load-time
+/// `spec.quantize`) — so a provider cannot compile a TE stage that skips the tier resolution.
 /// This is what retires the residual ~12 GiB f32-TE-encode active peak (sc-12796) on the quantized 5B.
-pub(crate) fn encode_text_staged(
+fn encode_text_staged(
     root: &std::path::Path,
     cfg: &WanModelConfig,
     prompt: &str,
@@ -586,6 +588,29 @@ pub(crate) fn encode_text_staged(
         None => mlx_rs::transforms::eval([&context])?,
     }
     Ok((context, context_null))
+}
+
+/// Production tier-aware UMT5 staging shared by the dense, A14B, VACE, and VACE-Fun providers.
+///
+/// Exposed only so the real-weight acceptance gate can measure the exact production selection path;
+/// callers should normally use a Wan provider rather than this probe seam.
+#[doc(hidden)]
+pub fn encode_text_staged_for_tier(
+    root: &std::path::Path,
+    cfg: &WanModelConfig,
+    prompt: &str,
+    neg_prompt: &str,
+    skip_neg: bool,
+    load_quant: Option<mlx_gen::Quant>,
+) -> Result<(Array, Option<Array>)> {
+    encode_text_staged(
+        root,
+        cfg,
+        prompt,
+        neg_prompt,
+        skip_neg,
+        crate::model::effective_te_quant(cfg, load_quant),
+    )
 }
 
 #[cfg(test)]

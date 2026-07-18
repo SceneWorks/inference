@@ -91,6 +91,8 @@ pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,
     WanScheduler,
 };
+#[doc(hidden)]
+pub use text_encoder::encode_text_staged_for_tier;
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};
 pub use training::{load_trainer, WanMoeTrainer};
 pub use transformer::WanTransformer;

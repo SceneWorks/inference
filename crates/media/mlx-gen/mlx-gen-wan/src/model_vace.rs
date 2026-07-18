@@ -35,17 +35,15 @@ use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
 
 use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
-use crate::config::{WanModelConfig, WanQuant, WanVaceConfig};
-use crate::model::{
-    dit_resident_bytes, effective_te_quant, is_wan_curated, moe_denoise_resident_bytes,
-};
+use crate::config::{WanModelConfig, WanVaceConfig};
+use crate::model::{dit_resident_bytes, is_wan_curated, moe_denoise_resident_bytes};
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, crossing_index, decode_to_frames, frames_to_images,
     latent_shape, preflight_denoise_memory_guard, preprocess_i2v_image, reject_off_grid,
     reject_over_area, resolve_sampler_knobs, seq_len, staged_expert_swap,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
-use crate::text_encoder::encode_text_staged;
+use crate::text_encoder::encode_text_staged_for_tier;
 use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_range, prepare_masks,
     prepare_video_latents, WanVaceTransformer,
@@ -134,7 +132,7 @@ fn vace_prep(
     config: &WanVaceConfig,
     req: &GenerationRequest,
     cfg_disabled: bool,
-    te_quant: Option<WanQuant>,
+    load_quant: Option<Quant>,
 ) -> Result<VacePrep> {
     let base = &config.base;
     let clip = req.control_clip().expect("validated present");
@@ -171,8 +169,14 @@ fn vace_prep(
     let num_ref = references.len();
 
     // --- Stage 1: UMT5 text encode ---
-    let (context, context_null) =
-        encode_text_staged(root, base, &req.prompt, &neg_prompt, cfg_disabled, te_quant)?;
+    let (context, context_null) = encode_text_staged_for_tier(
+        root,
+        base,
+        &req.prompt,
+        &neg_prompt,
+        cfg_disabled,
+        load_quant,
+    )?;
 
     // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
     let control = {
@@ -440,13 +444,7 @@ impl WanVace {
         let cfg_disabled = guidance <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the dual-expert path, F-072).
-        let prep = vace_prep(
-            &self.root,
-            &self.config,
-            req,
-            cfg_disabled,
-            effective_te_quant(&self.config.base, self.quantize),
-        )?;
+        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled, self.quantize)?;
 
         // --- Stage 3: load the VACE DiT, embed contexts, CFG denoise ---
         let latents = {
@@ -796,13 +794,7 @@ impl WanVaceFun {
         let cfg_disabled = low_gs <= 1.0 && high_gs <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the single-expert path, F-072).
-        let prep = vace_prep(
-            &self.root,
-            &self.config,
-            req,
-            cfg_disabled,
-            effective_te_quant(&self.config.base, self.quantize),
-        )?;
+        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled, self.quantize)?;
 
         if sequential {
             // `vace_prep` materializes the raw text contexts and control latent before returning;
