@@ -1,0 +1,19 @@
+[package]
+name = "candle-audio-catalog"
+version = "0.0.0"
+edition = "2021"
+description = "Explicit complete provider catalog for the SceneWorks Candle audio lane — the audio composition root every runtime bundle's audio section consumes."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[dependencies]
+# Family core crate — re-exports gen_core + candle, so every audio provider links exactly one
+# gen-core / candle build (the same single-resolution discipline as candle-gen-catalog).
+candle-audio = { path = "../candle-audio" }
+
+[features]
+default = []
+# Pass the backend selection through so a bundle's `--features metal`/`cuda` on this catalog
+# selects the matching candle backend across the whole audio family (mirrors candle-gen-catalog).
+metal = ["candle-audio/metal"]
+cuda = ["candle-audio/cuda"]

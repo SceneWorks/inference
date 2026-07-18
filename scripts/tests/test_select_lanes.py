@@ -51,6 +51,27 @@ class SelectLanesTests(unittest.TestCase):
         self.assertTrue(lanes["windows_cuda"])
         self.assertFalse(lanes["contracts"])
 
+    def test_audio_family_is_candle_classified(self) -> None:
+        # The Candle audio lane (sc-12835) runs on every platform: CPU/CUDA natively and macOS
+        # through the mlx bundle's audio section — never fail-safe-to-all as an unknown path.
+        for path in (
+            "crates/audio/candle-audio/src/lib.rs",
+            "crates/audio/candle-audio-catalog/src/lib.rs",
+        ):
+            with self.subTest(path=path):
+                lanes = select_lanes([path])
+                selected = {lane for lane, enabled in lanes.items() if enabled}
+                self.assertEqual(
+                    selected,
+                    {
+                        "workspace",
+                        "candle_cpu",
+                        "macos_metal",
+                        "windows_cuda",
+                        "real_weights",
+                    },
+                )
+
     def test_shared_runtime_catalog_fans_out_to_every_platform(self) -> None:
         lanes = select_lanes(["crates/bundles/runtime-catalog/src/lib.rs"])
         for lane in (

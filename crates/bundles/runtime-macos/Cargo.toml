@@ -9,10 +9,22 @@ repository = "https://github.com/SceneWorks/inference"
 [dependencies]
 runtime-catalog = { workspace = true }
 mlx-gen-catalog = { workspace = true, optional = true }
+# The Candle audio lane (sc-12835): the sanctioned cross-backend seam — the mlx macOS bundle
+# carries its audio generators on candle through the catalog's dedicated audio section
+# (docs/architecture/audio-backend-strategy.md). Candle-CPU on this platform today.
+candle-audio-catalog = { workspace = true, optional = true }
+# The candle snapshot preparer, carried in the audio lane (never in the mlx-only main preparer
+# registry) so audio model snapshots are preparable on macOS — the same
+# `snapshot_preparer_registry()` wiring runtime-cpu/cuda use for their main registries.
+candle-llm = { workspace = true, optional = true }
 mlx-llm = { workspace = true }
 
 [features]
-default = ["media"]
+default = ["media", "audio"]
 # SceneWorks consumes the complete bundle. LLM-only products can disable default features without
 # falling back to separate backend dependencies or linker-driven provider discovery.
 media = ["dep:mlx-gen-catalog"]
+# The Candle audio lane (sc-12835, docs/architecture/audio-backend-strategy.md). A separate
+# additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
+# text + TTS via `--no-default-features --features audio` without the mlx media provider graph.
+audio = ["dep:candle-audio-catalog", "dep:candle-llm"]

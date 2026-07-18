@@ -122,7 +122,7 @@ jobs:
       - name: Clippy Candle packages
         run: >-
           cargo clippy --locked
-          -p candle-llm -p 'candle-gen*' -p runtime-cpu
+          -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
           --all-targets -- -D warnings
       - name: Reclaim Clippy artifacts before linking tests
         # The complete all-target Clippy graph and the test graph do not fit concurrently on the
@@ -146,18 +146,24 @@ jobs:
           cargo doc --locked --no-deps
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
-          -p candle-llm -p 'candle-gen*'
+          -p candle-llm -p 'candle-gen*' -p 'candle-audio*'
           -p runtime-cpu -p runtime-catalog
       - name: Test Candle packages
         # All-target Clippy above checks every integration and real-weight target. Execute the
         # package unit/catalog suites one linker at a time: concurrently linking several provider
         # test binaries exceeds the hosted runner's memory-backed linker capacity and crashes lld
         # with SIGBUS even after the Clippy target tree has been reclaimed.
-        run: cargo test --locked --lib -j 1 -p candle-llm -p 'candle-gen*' -p runtime-cpu
+        run: >-
+          cargo test --locked --lib -j 1
+          -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
       - name: Test Candle LLM conformance
         run: cargo test --locked -j 1 -p candle-llm --test conformance
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu
+      # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
+      # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
+      - name: Test LLM+audio CPU bundle
+        run: cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
       - name: Guard poison-tolerant shared locks
         run: bash crates/media/candle-gen/scripts/check-lock-poison.sh
       - name: Self-test the gen-core skew verdict
@@ -216,6 +222,11 @@ jobs:
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos
+      # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
+      # LLM+audio composition (mlx LLM + candle audio lane, no mlx media graph) is a supported
+      # profile — and this is the one platform where that combination is cross-backend.
+      - name: Test LLM+audio macOS bundle
+        run: cargo test --locked --no-default-features --features audio --lib -p runtime-macos
       # The metal twin of the cuda gate on `windows-cuda-check`. This was a bare `cargo check` and so
       # had two holes, both of the sc-11990 shape: it never linted `#[cfg(feature = "metal")]` code
       # (no lane passes --features metal to Clippy), and without --all-targets it did not even
@@ -226,7 +237,7 @@ jobs:
       - name: Clippy Candle Metal packages
         run: >-
           cargo clippy --locked
-          -p candle-llm -p 'candle-gen*'
+          -p candle-llm -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
 
   macos-nax:
@@ -292,7 +303,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda --no-run
+          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
       # The lint twin of the compile check above. The `candle-cpu` lane already Clippies this same
       # package set with --all-targets, but it has no CUDA toolkit and so cannot pass --features cuda:
       # every `#[cfg(feature = "cuda")]` target is invisible to it and reaches main unlinted. That is
@@ -306,7 +317,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo clippy --locked --all-targets -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda -- -D warnings
+          cargo clippy --locked --all-targets -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
       # The doc twin of the compile check above. The hosted rustdoc gate cannot pass --features cuda
       # (no CUDA toolkit), so `#[cfg(feature = "cuda")]` docs need this lane. Keep this doc package
       # set aligned with the compile check above; together with the hosted gate, the CPU and CUDA
@@ -320,7 +331,7 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: |
           call "%VCVARS%"
-          cargo doc --locked --no-deps -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
+          cargo doc --locked --no-deps -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
 
   windows-cuda:
     name: Candle CUDA packages (Windows, manual)
@@ -348,17 +359,24 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo build --locked -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
+          cargo build --locked -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
       - name: Test Candle CUDA packages
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p runtime-cuda --features cuda
+          cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
       - name: Test LLM-only CUDA bundle
         shell: cmd
         run: |
           call "%VCVARS%"
           cargo test --locked --no-default-features --lib -p runtime-cuda
+      # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
+      # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
+      - name: Test LLM+audio CUDA bundle
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
 
   supply-chain:
     name: dependency policy + advisories

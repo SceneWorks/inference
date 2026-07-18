@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/audio/candle-audio",
+    "crates/audio/candle-audio-catalog",
     "crates/contracts/core-llm",
     "crates/contracts/core-llm/core-llm-testkit",
     "crates/contracts/gen-core",
@@ -29,6 +31,7 @@ sceneworks-gen-core-testkit = { path = "crates/contracts/gen-core-testkit" }
 runtime-catalog = { path = "crates/bundles/runtime-catalog" }
 mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
+candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 
 # MLX fork pinned by commit SHA. rev 932beb4e = MLX 0.32.0 bump + pad/concat >i32::MAX copy-gate fix
 # + regenerated patches (epic 12742). See crates/media/mlx-gen/Cargo.toml for the full SHA lineage.
